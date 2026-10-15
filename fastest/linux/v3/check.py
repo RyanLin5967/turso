@@ -126,6 +126,10 @@ REFUSALS = {
     # and unknown-key rules had no plant
     "R_reg_dupkey": "is given twice",
     "R_reg_unknownkey": "is not frame_arm or a d0_threshold",
+    # V3 review 13 item 12: the d0-threshold value rule's own text (it had no plant; e454c84bd printed the generic
+    # byte/shape text for both)
+    "R_reg_d0bad": "is not a plain decimal threshold above 1",
+    "R_reg_d0edge": "is not a plain decimal threshold above 1",
 }
 # run.sh refusals: tag -> the refusing rule's own reason PREFIX (rc 2, no out dir, no probe run). Every planted
 # verdict also carries "planted", so a bare word ("plan", "cell", "arch") would match whatever rule fired (fresh

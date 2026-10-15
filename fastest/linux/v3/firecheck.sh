@@ -308,12 +308,16 @@ printf 'frame_arm\tow4k\tDECISIONS \xe2\x80\xa6 (PREREG \xc2\xa74)\n' > "$OUT/F4
 # V3 review 12 item 2: the duplicate-key and unknown-key rules, each with its own refusal text
 printf 'frame_arm\tow4k\tplanted\nframe_arm\tow64k\tplanted again\n' > "$OUT/F4/reg_dupkey.tsv"
 printf 'frame_arms\tow4k\tplanted\n' > "$OUT/F4/reg_unknownkey.tsv"
+# V3 review 13 item 12: the d0-threshold value rule (reg_value_ok, the only guard since main's re-check was deleted)
+# had no plant: an exponent form and a bare trailing dot (strtod reads 1.0, not above 1)
+printf 'd0_threshold/ext4/wb/vm\t1e1\tplanted\n' > "$OUT/F4/reg_d0bad.tsv"
+printf 'd0_threshold/ext4/wb/vm\t1.\tplanted\n' > "$OUT/F4/reg_d0edge.tsv"
 refuse R_rental_noreg "$V3" --dir "$W" --out "$(o R_rental_noreg)" --n 5 --arms append25,nosync25 --plp no --require-registered
 for t in noframe:reg_noframe novariant:reg_ow64k; do
   refuse "R_rental_${t%%:*}" "$V3" --dir "$W" --out "$(o "R_rental_${t%%:*}")" --n 5 --arms append25,nosync25 --plp no \
     --registered "$OUT/F4/${t#*:}.tsv" --require-registered
 done
-for t in frame25 nonascii longline dupkey unknownkey; do
+for t in frame25 nonascii longline dupkey unknownkey d0bad d0edge; do
   refuse "R_reg_$t" "$V3" --dir "$W" --out "$(o "R_reg_$t")" --n 5 --arms append25,nosync25 --plp no --registered "$OUT/F4/reg_$t.tsv"
 done
 # items 9, 10, 12, 15, 1(a): fixtures
