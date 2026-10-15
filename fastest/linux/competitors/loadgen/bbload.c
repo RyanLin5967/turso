@@ -115,6 +115,7 @@ static inline void c1b_ack(c1b_client *c, uint64_t op, const char *l) { (void)c;
 #include <errno.h>
 #include <hdr/hdr_histogram.h>
 #include <libpq-fe.h>
+#include <limits.h>
 #ifdef __APPLE__
 #include <mach/mach_time.h>
 #endif
@@ -406,6 +407,14 @@ big:
 
 /* ---------- connections ---------- */
 typedef struct { char k[64][64]; char v[64][256]; int n; } kv_t;
+
+/* A spec-policy violation voids the whole cell, including with --allow-errors
+ * and when a templated step connect first exposes it after warm-up. */
+_Noreturn static void conn_refuse(const char *why) {
+    fprintf(stderr, "bbload: REFUSED: %s\n", why);
+    _exit(2);
+}
+
 static int kv_parse(const char *s, kv_t *kv, char *why) {
     char buf[4096], *save = NULL;
     snprintf(buf, sizeof buf, "%s", s);
@@ -440,11 +449,46 @@ static int conn_open(conn_t *x, const char *base, const char *over, char *why, s
                 if (!p->val) continue;
                 int i;
                 for (i = 0; i < kv.n; i++) if (!strcmp(kv.k[i], p->keyword)) break;
-                if (i == kv.n) kv.n++;
+                if (i == kv.n) {
+                    if (kv.n == 64) { PQconninfoFree(o); conn_refuse("conninfo has too many keys"); }
+                    kv.n++;
+                }
+                if (strlen(p->keyword) >= sizeof kv.k[i] || strlen(p->val) >= sizeof kv.v[i]) {
+                    PQconninfoFree(o);
+                    conn_refuse("conninfo key or value is too long");
+                }
                 snprintf(kv.k[i], 64, "%s", p->keyword);
                 snprintf(kv.v[i], 256, "%s", p->val);
             }
             PQconninfoFree(o);
+        }
+        /* Port the macOS forcing after the merge. Missing keys override libpq's
+         * environment/service defaults; explicit contrary values refuse first. */
+        const char *forced[3][2] = {{"sslmode", "disable"}, {"gssencmode", "disable"},
+                                    {"connect_timeout", "30"}};
+        for (int f = 0; f < 3; f++) {
+            int i;
+            for (i = 0; i < kv.n; i++) if (!strcmp(kv.k[i], forced[f][0])) break;
+            if (i < kv.n) {
+                if (f < 2 && strcmp(kv.v[i], "disable")) {
+                    char reason[128];
+                    snprintf(reason, sizeof reason, "merged conninfo requires %s=disable", forced[f][0]);
+                    conn_refuse(reason);
+                }
+                if (f == 2) {
+                    char *end;
+                    errno = 0;
+                    long seconds = strtol(kv.v[i], &end, 10);
+                    if (errno || !kv.v[i][0] || *end || seconds <= 0 || seconds > INT_MAX)
+                        conn_refuse("merged conninfo requires connect_timeout=positive integer seconds");
+                    continue; /* the macOS port preserves a spec's bounded timeout */
+                }
+            } else {
+                if (kv.n == 64) conn_refuse("conninfo has too many keys for transport policy");
+                kv.n++;
+            }
+            snprintf(kv.k[i], 64, "%s", forced[f][0]);
+            snprintf(kv.v[i], 256, "%s", forced[f][1]);
         }
         const char *keys[65], *vals[65];
         for (int i = 0; i < kv.n; i++) { keys[i] = kv.k[i]; vals[i] = kv.v[i]; }
@@ -455,6 +499,11 @@ static int conn_open(conn_t *x, const char *base, const char *over, char *why, s
             PQfinish(x->pg);
             x->pg = NULL;
             return -1;
+        }
+        if (PQsslInUse(x->pg) || PQgssEncInUse(x->pg)) {
+            PQfinish(x->pg);
+            x->pg = NULL;
+            conn_refuse("connected with SSL or GSS encryption despite disabled transport policy");
         }
         return 0;
     }
