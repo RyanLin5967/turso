@@ -5167,7 +5167,10 @@ mod tests {
     /// client's identifier. `SHOW "synchronous = off"` set the session's sync mode and `SHOW
     /// "fullfsync = off"` turned F_FULLFSYNC into fsync on Apple, both while compiling (a Describe
     /// too), and `SHOW wal_checkpoint` checkpointed: each is 42704 now, and the trunk connection's
-    /// settings read the same before and after.
+    /// settings read the same before and after. This D0 session already holds synchronous and
+    /// fullfsync off, so the SHOWs name the values it does not hold (full, on), and a premise says
+    /// so: a SHOW of the held value could change nothing, and the pin could not fail (ruled
+    /// c9c821dd8d, P8).
     #[test]
     fn show_cannot_change_an_engine_setting() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -5186,10 +5189,15 @@ mod tests {
                 .and_then(|mut stmt| stmt.run_collect_rows().ok())
         };
         let before = (pragma("synchronous"), pragma("fullfsync"));
-        assert!(before.0.is_some(), "premise: PRAGMA synchronous reads");
+        let off = Some(vec![vec![Value::from_i64(0)]]);
+        assert_eq!(
+            before,
+            (off.clone(), off),
+            "premise: the D0 session holds synchronous and fullfsync off, values the SHOWs differ from"
+        );
         for sql in [
-            "SHOW \"synchronous = off\"",
-            "SHOW \"fullfsync = off\"",
+            "SHOW \"synchronous = full\"",
+            "SHOW \"fullfsync = on\"",
             "SHOW wal_checkpoint",
             "SHOW synchronous",
         ] {
