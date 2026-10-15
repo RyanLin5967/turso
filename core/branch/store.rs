@@ -7703,6 +7703,12 @@ impl BranchStore {
         self.group.confirm_notifies.load(Ordering::Relaxed)
     }
 
+    /// Test builds (lead ruling f329b0d2a8): the group's `confirm_done` key.
+    #[cfg(test)]
+    pub(crate) fn confirm_done_for_test(&self) -> u64 {
+        self.group.confirm_done.load(Ordering::Acquire)
+    }
+
     /// Test builds (C15 ruling, exception (b)'s plant): the log header's raised-class field is
     /// stale, so the next write that takes it rewrites it (`Journal::stale_header_for_test`).
     #[cfg(test)]

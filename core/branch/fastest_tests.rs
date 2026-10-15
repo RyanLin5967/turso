@@ -5598,6 +5598,42 @@ fn a_confirmation_that_cannot_be_written_fails_no_flight() {
     }
 }
 
+/// Lead ruling f329b0d2a8 (order 2, 2026-10-15T07:29:43Z; gates ultrareview row 1), reversing
+/// review 6 #1: a confirmation word that cannot be written FAIL-STOPS the store, the rule of a
+/// failed WAL sync, and `confirm_done` is raised only once a word is written. Injected
+/// (`ConfirmWriteFails`): after the failed write is counted, `confirm_done` still names the last
+/// word written, and the next create is refused. The create whose word failed was acknowledged
+/// before its word was due (the word follows its sync), so it is not the claim.
+#[test]
+fn a_confirmation_that_cannot_be_written_fail_stops_the_store() {
+    let _s = serial();
+    let _q = ConfirmQuiet::set(1);
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("confirmstop.db"), opts(catalog, SyncClass::FullFsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let _first = trunk.fork_branch().unwrap().into_id();
+        eventually(&format!("catalog={catalog}: premise: no confirmation word was written"), || {
+            db.branch_confirm_counts()[0] >= 1
+        });
+        let done = db.branches.confirm_done_for_test();
+        assert_ne!(done, 0, "catalog={catalog}: premise: a written word left confirm_done at 0");
+        db.branch_failpoint(Some(BranchFailpoint::ConfirmWriteFails));
+        let _ = trunk.fork_branch().map(|b| b.into_id());
+        eventually(&format!("catalog={catalog}: premise: the failed confirmation was not counted"), || {
+            db.branch_confirm_counts()[1] == 1
+        });
+        assert_eq!(
+            db.branches.confirm_done_for_test(),
+            done,
+            "CLAIM: catalog={catalog}: confirm_done was raised over a word whose write failed"
+        );
+        let after = trunk.fork_branch().map(|b| b.into_id());
+        assert!(after.is_err(), "CLAIM: catalog={catalog}: a create was acknowledged after a confirmation word failed: {after:?}");
+    }
+}
+
 /// Review 6 #1: on Apple a plain fsync does not drain the device's cache, so a D1 flight proves
 /// nothing reached stable storage and is not confirmed while the store runs. A clean close makes
 /// the log stable with a full flush and then confirms its last flight.
