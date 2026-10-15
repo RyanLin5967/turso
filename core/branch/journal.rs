@@ -5391,6 +5391,75 @@ mod tests {
         );
     }
 
+    // Codex C25 (artie frontier/codex/reports/C25.md, raw C25-journal-probes.txt 93f203ac6c), HIGH 1
+    // and HIGH 2: its two journal-level reproductions, adopted as this lane's reds (names and claim
+    // texts made the lane's; the schedules unchanged). HIGH 1: a background compaction's cut, taken
+    // after an inline compaction replaced the log, applied the old capture's offset to the new
+    // incarnation and installed the older generation over it: the fork flushed in between was lost.
+    // HIGH 2: a cut's catch-up copied a flight raised to FullFsync and synced it only in the prep's
+    // Fsync, and the install added no stronger sync.
+    #[test]
+    fn a_stale_background_cut_keeps_a_fork_flushed_after_an_inline_compaction() {
+        for stale_cut in [false, true] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+            {
+                let mut journal = Journal::create(&files, 512, SyncClass::Fsync).unwrap();
+                let mut arena = Arena::new(512);
+                let bg = journal.begin_bg_compaction(&SnapshotState::default(), &arena).unwrap();
+                journal.flush(&mut arena).unwrap();
+                bg.sync_snapshot().unwrap();
+                assert!(journal.install_bg_snapshot(&bg).unwrap());
+                // The background worker is between snapshot installation and taking its cut source.
+                journal.compact(&SnapshotState::default(), &mut arena, false).unwrap();
+                assert_eq!(journal.generation, 2);
+                // Clock and Checkpoint have equal frame lengths: bg.from is a valid boundary in
+                // this NEW log, while referring to a different incarnation and snapshot.
+                journal.buffer(&Record::Clock { now_ms: 1 }).unwrap();
+                assert_eq!(journal.mark(), bg.from());
+                journal.buffer(&Record::Fork { child: 7, parent: 0 }).unwrap();
+                journal.flush(&mut arena).unwrap();
+                bg.sync_dir().unwrap();
+                if stale_cut {
+                    let src = journal.bg_cut_source(&bg).unwrap().expect("stale source was accepted");
+                    let prep = Journal::prepare_cut(src, bg.from(), bg.generation()).unwrap();
+                    assert!(journal.cut_usable(&prep, bg.from(), bg.generation()));
+                    journal.finish_cut(prep, bg.from(), bg.generation()).unwrap();
+                }
+                bg.discard();
+            }
+            let recovered = Journal::recover(&files, SyncClass::Fsync).unwrap().unwrap();
+            let forks: Vec<_> = recovered.records.iter().filter_map(|r| match r {
+                Record::Fork { child, .. } => Some(*child), _ => None,
+            }).collect();
+            eprintln!("stale_cut={stale_cut}: recovered forks={forks:?}");
+            assert_eq!(forks, vec![7], "CLAIM: stale_cut={stale_cut}: an acknowledged fork flushed after an inline compaction was lost to a stale background cut");
+        }
+    }
+
+    #[test]
+    fn a_cut_catch_up_keeps_a_raised_flights_sync_class() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = BranchFiles::for_db(dir.path().join("db").to_str().unwrap());
+        let mut journal = Journal::create(&files, 512, SyncClass::Fsync).unwrap();
+        let mut arena = Arena::new(512);
+        journal.buffer(&Record::Fork { child: 1, parent: 0 }).unwrap();
+        journal.flush(&mut arena).unwrap();
+        let from = journal.len;
+        let src = journal.cut_source(from).unwrap().unwrap();
+        let mut prep = Journal::prepare_cut(src, from, 1).unwrap();
+        journal.buffer(&Record::Fork { child: 2, parent: 0 }).unwrap();
+        journal.raise_pending_class(SyncClass::FullFsync);
+        journal.take_flight(&mut arena, SyncClass::Fsync, false).unwrap().write().unwrap();
+        assert_eq!(journal.rewrite_class(), SyncClass::FullFsync);
+        let before = CLASS_SYNCS.with(|c| [c[0].get(), c[1].get()]);
+        Journal::extend_cut(&mut prep, journal.len, false).unwrap();
+        journal.finish_cut(prep, from, 1).unwrap();
+        let after = CLASS_SYNCS.with(|c| [c[0].get(), c[1].get()]);
+        eprintln!("replacement syncs: Fsync={}, FullFsync={}", after[0]-before[0], after[1]-before[1]);
+        assert!(after[1] > before[1], "CLAIM: a FullFsync flight was replaced using only the old Fsync class");
+    }
+
     /// L2 slice (budget create_allocates_at_most_once_under_the_store_mutex): buffering a record
     /// into a `pending` buffer with room allocates nothing, since the record is encoded in place
     /// (adbf8b607). Counted with the test allocator (`budget_probe::thread_allocs`, exact per
