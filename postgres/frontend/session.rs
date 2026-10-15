@@ -115,16 +115,8 @@ impl PgConnection {
     /// [`crate::result_types::aggregate_types`]; `None`, or a short list, where the engine types
     /// the column), and for each parameter its context types (see
     /// [`crate::result_types::parameter_types`]).
-    /// `bound`: a Bind supplies the statement's parameters (the extended protocol).
-    pub fn prepare_typed(
-        &self,
-        sql: impl AsRef<str>,
-        bound: bool,
-    ) -> Result<(Statement, StatementTypes)> {
-        let mut types = StatementTypes {
-            bound,
-            ..StatementTypes::default()
-        };
+    pub fn prepare_typed(&self, sql: impl AsRef<str>) -> Result<(Statement, StatementTypes)> {
+        let mut types = StatementTypes::default();
         let stmt = prepare_statement_typed(&self.inner, sql.as_ref(), Some(&mut types))?;
         Ok((stmt, types))
     }
@@ -137,10 +129,7 @@ impl PgConnection {
         &self,
         sql: impl AsRef<str>,
     ) -> Result<Option<(Statement, StatementTypes)>> {
-        let mut types = StatementTypes {
-            bound: true,
-            ..StatementTypes::default()
-        };
+        let mut types = StatementTypes::default();
         let stmt = prepare_statement_inner(&self.inner, sql.as_ref(), Some(&mut types), true)?;
         Ok(stmt.map(|stmt| (stmt, types)))
     }
@@ -543,22 +532,21 @@ fn prepare_statement_checked(
     }
     // A statement this prepare performs, or whose prerequisites it runs (a SERIAL column's
     // sequence), reads no parameter: one holding a $n is refused before anything of it runs,
-    // 42P02 when nothing binds it (as PostgreSQL answers the simple protocol), 0A000 when a Bind
-    // would. `COPY ... WHERE v = $1` ran inside the prepare before any guard saw it and imported
-    // every row (wire review 13 item 9).
-    let bound = types.as_deref().is_some_and(|t| t.bound);
-    let first_param = used.first().copied();
-    let parameter_refused = |n: u32| {
-        LimboError::ParseError(if bound {
-            format!(
-                "a parameter (${n}) in a statement performed while it is prepared is not supported"
-            )
-        } else {
-            format!("there is no parameter ${n}")
-        })
-    };
-    if let Some(n) = first_param.filter(|_| performs_at_prepare(&parse_result)) {
-        return Err(parameter_refused(n));
+    // 42P02 "there is no parameter $n" on both protocols, as PostgreSQL answers a utility
+    // statement's $n (it parses one with no parameter hook, utility.c; parse_expr.c raises
+    // ERRCODE_UNDEFINED_PARAMETER), a Bind's values notwithstanding: the Bind counted its values
+    // against the parameters Parse declared, and one sent for a $n here was refused there (08P01).
+    // `COPY ... WHERE v = $1` ran inside the prepare before any guard saw it and imported every
+    // row (wire review 13 item 9); a Bind's then answered an invented 0A000 (wire review 17 item
+    // 4, the lead's ruling).
+    if let Some(n) = used
+        .first()
+        .copied()
+        .filter(|_| performs_at_prepare(&parse_result))
+    {
+        return Err(LimboError::ParseError(format!(
+            "there is no parameter ${n}"
+        )));
     }
     if let Some(stmt) = try_prepare_special(pg_conn, &parse_result)? {
         return Ok(Some(stmt));
