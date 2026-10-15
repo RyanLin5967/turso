@@ -117,41 +117,60 @@ const SHUTDOWN_JOIN: std::time::Duration = std::time::Duration::from_secs(30);
 /// One statement's waits on a lock another session holds: SQLite's default busy schedule (1, 2,
 /// 5, 10, 15, 20, 25, 25, 25, 50, 50 ms, then 100 ms) up to the server's lock wait. The clock is
 /// first read at the first wait, so a statement that meets no lock reads it not at all (wire
-/// review 5 item 20: every create read it).
-struct Backoff {
+/// review 5 item 20: every create read it). A wait is the session's: its cancel or
+/// statement_timeout ends it, which the engine's progress handler cannot see while no statement
+/// steps (ultrareview of fastest-wire, finding 9).
+struct Backoff<'a> {
     lock_wait: std::time::Duration,
     deadline: Option<std::time::Instant>,
     attempt: usize,
+    interrupts: Option<&'a Interrupts>,
 }
 
-impl Backoff {
-    fn new(lock_wait: std::time::Duration) -> Self {
+impl<'a> Backoff<'a> {
+    fn new(lock_wait: std::time::Duration, interrupts: &'a Interrupts) -> Self {
         Self {
             lock_wait,
             deadline: None,
             attempt: 0,
+            interrupts: Some(interrupts),
         }
     }
 
     /// A Backoff that never waits: its statement is never stepped again or run anew.
     fn never() -> Self {
-        Self::new(std::time::Duration::ZERO)
+        Self {
+            lock_wait: std::time::Duration::ZERO,
+            deadline: None,
+            attempt: 0,
+            interrupts: None,
+        }
     }
 
     /// Sleep the schedule's next delay and say so, or say false, without sleeping, when the delay
-    /// would end past the lock wait: then the next attempt is the last.
-    fn wait(&mut self) -> bool {
+    /// would end past the lock wait: then the next attempt is the last. Err(Interrupt) when the
+    /// session's cancel or statement_timeout stops the statement, before or after the sleep.
+    fn wait(&mut self) -> turso_core::Result<bool> {
         const DELAYS_MS: [u64; 12] = [1, 2, 5, 10, 15, 20, 25, 25, 25, 50, 50, 100];
+        self.stop_if_interrupted()?;
         let now = std::time::Instant::now();
         let deadline = *self.deadline.get_or_insert(now + self.lock_wait);
         let delay =
             std::time::Duration::from_millis(DELAYS_MS[self.attempt.min(DELAYS_MS.len() - 1)]);
         self.attempt += 1;
         if now + delay > deadline {
-            return false;
+            return Ok(false);
         }
         std::thread::sleep(delay);
-        true
+        self.stop_if_interrupted()?;
+        Ok(true)
+    }
+
+    fn stop_if_interrupted(&self) -> turso_core::Result<()> {
+        match self.interrupts {
+            Some(interrupts) if interrupts.should_stop() => Err(LimboError::Interrupt),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -167,12 +186,16 @@ impl Backoff {
 /// is the statement's.
 fn run_waiting(
     stmt: &mut turso_core::Statement,
-    backoff: &mut Backoff,
+    backoff: &mut Backoff<'_>,
     mut row: impl FnMut(&turso_core::Row) -> turso_core::Result<()>,
 ) -> turso_core::Result<()> {
     loop {
         match stmt.run_with_row_callback(&mut row) {
-            Err(LimboError::Busy) if stmt.n_change() > 0 && backoff.wait() => {}
+            Err(LimboError::Busy) if stmt.n_change() > 0 => {
+                if !backoff.wait()? {
+                    return Err(LimboError::Busy);
+                }
+            }
             r => return r,
         }
     }
@@ -2034,7 +2057,7 @@ impl Session {
         let mut backoff = if ends_block {
             Backoff::never()
         } else {
-            Backoff::new(self.lock_wait())
+            Backoff::new(self.lock_wait(), &self.interrupts)
         };
         // The last attempt, once the lock wait is spent, goes through the same rules as every
         // other: it returned unchecked, past the backstop (wire review 14 item 7).
@@ -2065,8 +2088,15 @@ impl Session {
                         && f.rerunnable
                         && (f.info.code == "55P03" || (!in_tx && f.info.code == "40001")) =>
                 {
-                    if !backoff.wait() {
-                        last = true;
+                    match backoff.wait() {
+                        Ok(true) => {}
+                        Ok(false) => last = true,
+                        Err(e) => {
+                            return Err(StatementFailure {
+                                info: engine_info(&e),
+                                ..f
+                            })
+                        }
                     }
                 }
                 r => return r,
@@ -2080,7 +2110,7 @@ impl Session {
         sql: &str,
         portal: Option<&Portal<Parsed>>,
         format: &Format,
-        backoff: &mut Backoff,
+        backoff: &mut Backoff<'_>,
     ) -> Result<Response, StatementFailure> {
         let unprepared = |info: Box<ErrorInfo>| StatementFailure {
             prepared: false,
@@ -2362,17 +2392,17 @@ impl Session {
 
     /// `f` run again while `busy` says its failure was a lock another session holds, on the
     /// schedule of [`Session::waiting`], up to the server's lock wait; the attempt after the
-    /// deadline is final.
-    fn retrying<T, E>(
+    /// deadline is final. The session's cancel or statement_timeout ends the wait (57014).
+    fn retrying<T>(
         &self,
-        mut f: impl FnMut() -> Result<T, E>,
-        busy: impl Fn(&E) -> bool,
-    ) -> Result<T, E> {
-        let mut backoff = Backoff::new(self.lock_wait());
+        mut f: impl FnMut() -> turso_core::Result<T>,
+        busy: impl Fn(&LimboError) -> bool,
+    ) -> turso_core::Result<T> {
+        let mut backoff = Backoff::new(self.lock_wait(), &self.interrupts);
         loop {
             match f() {
                 Err(e) if busy(&e) => {
-                    if !backoff.wait() {
+                    if !backoff.wait()? {
                         return f();
                     }
                 }
@@ -4353,7 +4383,7 @@ fn create_with_keys(
     stmt: &mut turso_core::Statement,
     sql: &str,
     table: &str,
-    backoff: &mut Backoff,
+    backoff: &mut Backoff<'_>,
 ) -> PgWireResult<Response> {
     let own = conn.inner().get_auto_commit();
     conn.in_own_transaction("__turso_create_keys", "CREATE TABLE", || {
@@ -4383,7 +4413,7 @@ fn execute_query(
     format: &Format,
     columns: &[Type],
     schema: &turso_core::schema::Schema,
-    backoff: &mut Backoff,
+    backoff: &mut Backoff<'_>,
 ) -> PgWireResult<Response> {
     let header =
         Arc::new(field_info(stmt, format, |i| columns[i].clone()).map_err(PgWireError::UserError)?);
@@ -4593,7 +4623,7 @@ fn no_binary(val: &Value, t: &Type) -> PgWireError {
 fn execute_non_query(
     stmt: &mut turso_core::Statement,
     query: &str,
-    backoff: &mut Backoff,
+    backoff: &mut Backoff<'_>,
     simple: bool,
 ) -> PgWireResult<Response> {
     let executing = turso_pg::phase::enter(turso_pg::phase::Phase::Execute);
