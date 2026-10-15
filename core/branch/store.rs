@@ -522,6 +522,7 @@ struct GroupState {
     /// past the hard limit with the writer behind, with no writer, or in a sharp catalog store. An
     /// exception counter (`BranchStore::exception_counters`): an operation that paid it is not
     /// credited.
+    #[cfg(test)]
     background_compactions: u64,
     inline_compaction_syncs: u64,
     /// Fuzzy checkpoints that failed Busy at `settle_ordered`'s bound (engine review 18 MED 4;
@@ -5551,7 +5552,10 @@ impl BranchStore {
             #[cfg(test)]
             pause_at(Some(&group.confirm_hold), HOLD_COMPACT_LOCKED);
             if inner.cat.is_none() && inner.journal.as_ref().is_some_and(Journal::wants_compaction) {
-                group.lock().background_compactions += 1;
+                #[cfg(test)]
+                {
+                    group.lock().background_compactions += 1;
+                }
                 if let Err(e) = Self::compact_snapshot(&mut inner, group, false) {
                     tracing::warn!("branch store compaction failed: {e}");
                     if let Some(journal) = inner.journal.as_mut() {
