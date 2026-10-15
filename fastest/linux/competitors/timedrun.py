@@ -384,17 +384,44 @@ CAP = 1800  # the registered per-run cap the fixtures' runs were bounded by
 # the last warm-up claim before it (warmup_last_claim_ns; null with no warm-up op): here 1500 ops claimed, the last at
 # 9.9998 s (OPS met, S not yet), and the 1501st claim at 10.0005 s ends it done. warmup_backsteps: the claims judged
 # with an older time than the claim judged before them (0: every claim was judged in time order, as claim_op's are);
-# loop: the run's loop mode, closed (each claim's time read under the claim lock) or open (each client's own intended
-# times, decided in lock order).
+# loop: the run's loop mode, closed (each claim's time read under the claim lock) or open (the next arrival of the
+# run's one Poisson stream, taken under the claim lock, as the macOS claim_op at 4010ff3b06 takes it; competitors
+# review 2 item 14). claim_op's window on the run's clock (t0_ns, tm0_ns at the ending warm-up claim, tm1_ns 5 s
+# later), the clock itself, the mode, rate, clients and seed both runs of a cell must share, and the open-loop
+# lateness record (null in closed loop) -- competitors review 2 items 1, 2, 3, 8, 10 and 13.
+T0 = 1_000_000_000_000
 RUN = {"warmup_ops": 1500, "warmup_s": 10.0005, "warmup_capped": False, "warmup_end_ns": 10_000_500_000,
        "warmup_last_claim_ns": 9_999_800_000, "warmup_backsteps": 0, "loop": "closed", "max_window_s": 1800.0,
-       "window_s": 5.0}
+       "window_s": 5.0, "t0_ns": T0, "tm0_ns": T0 + 10_000_500_000, "tm1_ns": T0 + 15_000_500_000,
+       "clock": "CLOCK_MONOTONIC", "mode": "closed", "rate": 0.0, "clients": 1, "seed": 1, "send_late_us": None,
+       "pool_late_us": None, "max_send_late_us": 100.0}
+# An open-loop run's own fields (bbload --mode open --rate 100): its mode and loop, and its lateness record within the
+# 100 us bound; a fixture puts these in BOTH runs of a cell
+OPEN = {"loop": "open", "mode": "open", "rate": 100.0, "send_late_us": {"p50": 5.0, "p99": 20.0, "max": 40.0},
+        "pool_late_us": {"p50": 5.0, "p99": 20.0, "max": 40.0}}
+
+
+def raw_tsv(sm, extra_rows=(), drop_warm=0):
+    """A raw.tsv agreeing with summary SM: warmup_ops warm-up rows intended from t0 on, measured_ops measured rows
+    intended from tm0 on (all before tm1), then EXTRA_ROWS (phase, intended_ns); DROP_WARM warm-up rows left out."""
+    out = ["client\tseq\tphase\tok\tarrival\tintended_ns\tlat_ns\n"]
+    wo, mo, t0, tm0 = sm.get("warmup_ops"), sm.get("measured_ops"), sm.get("t0_ns"), sm.get("tm0_ns")
+    rows = []
+    if isinstance(wo, int) and isinstance(t0, int):
+        rows += [("warmup", t0 + i) for i in range(max(0, wo - drop_warm))]
+    if isinstance(mo, int) and isinstance(tm0, int):
+        rows += [("measure", tm0 + i) for i in range(mo)]
+    rows += list(extra_rows)
+    for i, (ph, t) in enumerate(rows):
+        out.append(f"0\t{i}\t{ph}\t1\t{i}\t{t}\t1000\n")
+    return "".join(out)
 
 
 def fixture(root, name, n=200, timed=True, rc=0, timed_ops=None, tracer=None, lab_rule=RULE, timed_rule=RULE,
             lab_ops=None, capped=False, live="held", self_tp=(0, 0), window=(100.1, 100.3), lab=True, raw=True,
-            rc_file=None, lab_extra=None, timed_extra=None):
-    """One cell; lab_extra / timed_extra override single summary fields (MED 6: one defect per case)."""
+            rc_file=None, lab_extra=None, timed_extra=None, timed_raw=None):
+    """One cell; lab_extra / timed_extra override single summary fields (MED 6: one defect per case). Each run's
+    raw.tsv agrees with its summary (raw_tsv) unless TIMED_RAW gives the timed one's text (one defect per case)."""
     d = os.path.join(root, name)
     os.makedirs(os.path.join(d, "bb"))
     if live == "held":
@@ -410,6 +437,8 @@ def fixture(root, name, n=200, timed=True, rc=0, timed_ops=None, tracer=None, la
         ls.update(lab_extra or {})
         with open(os.path.join(d, "bb", "summary.json"), "w") as f:
             json.dump(ls, f)
+        with open(os.path.join(d, "bb", "raw.tsv"), "w") as f:
+            f.write(raw_tsv(ls))
     if timed:
         os.makedirs(os.path.join(d, "timed"))
         to = n if timed_ops is None else timed_ops
@@ -424,7 +453,7 @@ def fixture(root, name, n=200, timed=True, rc=0, timed_ops=None, tracer=None, la
             json.dump(sm, f)
         if raw:
             with open(os.path.join(d, "timed", "raw.tsv"), "w") as f:
-                f.write("client\tseq\tphase\tok\tlat_ns\n0\t0\tmeasure\t1\t1000\n")
+                f.write(raw_tsv(sm) if timed_raw is None else timed_raw)
         with open(os.path.join(d, "timed.rc"), "w") as f:
             f.write(f"{rc if rc_file is None else rc_file}\n")
     if tracer is not None:
@@ -553,20 +582,26 @@ def selftest():
         # claim_op at 4010ff3b06, draws every open-loop arrival from ONE run-wide stream under the claim lock, so its
         # claims are judged in arrival order and backsteps are 0 in both loop modes; the port now draws that stream.
         # The loop field stays in the record; the two order checks apply in both modes again.
+        # Competitors review 2 items 10-12: an open-loop cell is open in BOTH runs (the labelling and timed runs are one
+        # command line), and one defect per case: the closed-loop duplicate of the backsteps case and the open-loop
+        # case that planted backsteps AND a late last claim are gone (each caught nothing the others miss)
         ("A23: an open-loop record with backsteps is refused (one shared arrival stream: 0 backsteps in both modes)",
-         dict(tracer=clean, timed_extra={"loop": "open", "warmup_backsteps": 3}), False),
-        ("A23: the same record in closed loop is refused",
-         dict(tracer=clean, timed_extra={"loop": "closed", "warmup_backsteps": 3}), False),
-        ("A23: open loop, the ending claim's intended time older than the last warm-up claim's: refused",
-         dict(tracer=clean, timed_extra={"loop": "open", "warmup_backsteps": 1, "warmup_ops": 1000,
-                                         "warmup_last_claim_ns": 10_000_600_000}), False),
+         dict(tracer=clean, lab_extra=OPEN, timed_extra=dict(OPEN, warmup_backsteps=3)), False),
         ("A23: open loop, the last warm-up claim after the ending claim even with backsteps 0: refused",
-         dict(tracer=clean, timed_extra={"loop": "open", "warmup_ops": 1000, "warmup_last_claim_ns": 10_000_600_000}),
+         dict(tracer=clean, lab_extra=OPEN, timed_extra=dict(OPEN, warmup_ops=1000, warmup_last_claim_ns=10_000_600_000)),
          False),
         ("A23: a shared-stream open-loop record (0 backsteps, claims in arrival order) is accepted",
-         dict(tracer=clean, timed_extra={"loop": "open", "warmup_backsteps": 0}), True),
-        ("A23: no loop mode in the record", dict(tracer=clean, timed_extra={"loop": None}), False),
-        ("A23: a loop mode that is neither closed nor open", dict(tracer=clean, timed_extra={"loop": "b1"}), False),
+         dict(tracer=clean, lab_extra=OPEN, timed_extra=dict(OPEN, warmup_backsteps=0)), True),
+        ("A23: open loop, no warmup_backsteps record: refused (the closed-loop twin is above)",
+         dict(tracer=clean, lab_extra=OPEN, timed_extra=dict(OPEN, warmup_backsteps=None)), False),
+        ("A23: open loop, a warm-up that left before S and before MAX_S: refused",
+         dict(tracer=clean, lab_extra=OPEN, timed_extra=dict(OPEN, warmup_ops=1000, warmup_s=1.0,
+                                                             warmup_end_ns=1_000_000_000, warmup_last_claim_ns=999_000_000)),
+         False),
+        ("A23: no loop mode in the record (both runs)",
+         dict(tracer=clean, lab_extra={"loop": None}, timed_extra={"loop": None}), False),
+        ("A23: a loop mode that is neither closed nor open (both runs)",
+         dict(tracer=clean, lab_extra={"loop": "b1"}, timed_extra={"loop": "b1"}), False),
         ("the labelling run's warm-up left early",
          dict(tracer=clean, lab_extra={"warmup_ops": 1000, "warmup_s": 1.0, "warmup_end_ns": 1_000_000_000,
                                        "warmup_last_claim_ns": 999_000_000}), False),
@@ -593,6 +628,44 @@ def selftest():
                                                                              "timed_before": LIVE, "timed_after": LIVE}),
          False),
     ]
+    # Competitors review 2 items 1, 2, 3, 8, 10, 13 and review 1 LOW 17: what the record says against what the raw rows
+    # and the other run say (each case one defect; the controls must pass every check)
+    tm1 = RUN["tm1_ns"]
+    cases += [
+        ("a measured row intended at tm1 (the window is closed in intended time at tm1)",
+         dict(tracer=clean, timed_raw=raw_tsv(dict(RUN, measured_ops=200), extra_rows=[("measure", tm1)])), False),
+        ("control: a drain row intended after tm1 is not a measured one",
+         dict(tracer=clean, timed_raw=raw_tsv(dict(RUN, measured_ops=200), extra_rows=[("drain", tm1 + 5)])), True),
+        ("no tm1_ns in the timed summary", dict(tracer=clean, timed_extra={"tm1_ns": None}), False),
+        ("the raw rows hold one warm-up op fewer than warmup_ops (LOW 17: the summary is not trusted)",
+         dict(tracer=clean, timed_raw=raw_tsv(dict(RUN, measured_ops=200), drop_warm=1)), False),
+        ("an uncapped run whose window ran past its bound (LOW 17)",
+         dict(tracer=clean, timed_extra={"window_s": 1800.5}), False),
+        ("the timed run used another seed (review 2 item 2)", dict(tracer=clean, timed_extra={"seed": 2}), False),
+        ("the timed run used another rate", dict(tracer=clean, lab_extra=OPEN, timed_extra=dict(OPEN, rate=200.0)), False),
+        ("the timed run used another client count", dict(tracer=clean, timed_extra={"clients": 4}), False),
+        ("labelling closed, timed open (review 2 item 10: the control used to accept this mixed cell)",
+         dict(tracer=clean, timed_extra=OPEN), False),
+        ("a clock that can step back (CLOCK_REALTIME; review 2 item 8)",
+         dict(tracer=clean, lab_extra={"clock": "CLOCK_REALTIME"}, timed_extra={"clock": "CLOCK_REALTIME"}), False),
+        ("no clock recorded", dict(tracer=clean, lab_extra={"clock": None}, timed_extra={"clock": None}), False),
+        ("control: CLOCK_BOOTTIME is accepted",
+         dict(tracer=clean, lab_extra={"clock": "CLOCK_BOOTTIME"}, timed_extra={"clock": "CLOCK_BOOTTIME"}), True),
+        ("loop closed but mode open (review 2 item 13: loop must repeat bbload's mode)",
+         dict(tracer=clean, lab_extra={"mode": "open"}, timed_extra={"mode": "open"}), False),
+        ("control: clonebench's mode b1 with loop closed",
+         dict(tracer=clean, lab_extra={"mode": "b1"}, timed_extra={"mode": "b1"}), True),
+        ("clonebench's mode b1 with loop open",
+         dict(tracer=clean, lab_extra=dict(OPEN, mode="b1"), timed_extra=dict(OPEN, mode="b1")), False),
+        ("open loop, a p99 send lateness over max_send_late_us (review 2 item 3: VOID)",
+         dict(tracer=clean, lab_extra=OPEN,
+              timed_extra=dict(OPEN, send_late_us={"p50": 5.0, "p99": 150.0, "max": 300.0})), False),
+        ("open loop, a p99 pool lateness over max_send_late_us",
+         dict(tracer=clean, lab_extra=OPEN,
+              timed_extra=dict(OPEN, pool_late_us={"p50": 5.0, "p99": 101.0, "max": 300.0})), False),
+        ("open loop with no lateness record", dict(tracer=clean, lab_extra=OPEN, timed_extra=dict(OPEN, send_late_us=None)),
+         False),
+    ]
     bad = n = 0
 
     def ok(cond, line):  # counts its own cases (LOW 27: the total came from padding `cases` with None)
@@ -611,16 +684,49 @@ def selftest():
             ok(got == want, f"{name} -> {'ok' if got else '; '.join(why)}")
     # gate-6 review, t3run item 12: ops is ONE total per run for every system; FT_OPS_TOTAL overrides N1/N4 for all C
     for args, want in (((1, 200, 300, ""), 200), ((4, 200, 300, ""), 300), ((4, 200, 300, "5000"), 5000),
-                       ((1, 200, 300, "5000"), 5000), ((1, 200, 300, "x"), None), ((1, 200, 300, "0"), None)):
+                       ((1, 200, 300, "5000"), 5000), ((1, 200, 300, "x"), None), ((1, 200, 300, "0"), None),
+                       # comp review 1 LOW 16: C is validated even when FT_OPS_TOTAL is given
+                       (("x", 200, 300, "5000"), None), ((0, 200, 300, "5000"), None)):
         got = ops(*args)
         ok(got == want, f"ops{args} = {got!r}, want {want!r}")
+
+    def fv(*a):  # final_verdict, its arity named in the case (comp review 1 LOW 15 adds DRY)
+        try:
+            return final_verdict(*a)
+        except TypeError as e:
+            return f"TypeError: {e}"
     # MED 7: the verdict is computed against the registered rule at the cap, rule(CAP), never the run's own: a clean
-    # cell that warmed up by any other rule (the CI smoke 1000:10:2) is 'ok-smoke-warmup', never 'ok'
-    for why_in, rule_in, cap_in, want in (([], "1000:10:180", "1800", "ok"), ([], "1000:10:2", "1800", "ok-smoke-warmup"),
-                                          ([], "1000:10:6", "60", "ok"), (["x"], "1000:10:180", "1800", "REFUSED: x"),
-                                          ([], "1000:10:180.0", "1800", "ok-smoke-warmup")):
-        got = final_verdict(why_in, rule_in, cap_in)
-        ok(got == want, f"final_verdict({why_in}, {rule_in}, cap {cap_in}) = {got!r}, want {want!r}")
+    # cell that warmed up by any other rule (the CI smoke 1000:10:2) is 'ok-smoke-warmup', never 'ok'. Comp review 1
+    # LOW 15: a smoke run (DRY 1) is 'ok-smoke' whatever its rule, so a smoke run can never read 'ok'; a real run (DRY
+    # 0) is judged by the rule; any other DRY is refused.
+    for why_in, rule_in, cap_in, dry_in, want in (
+            ([], "1000:10:180", "1800", "0", "ok"), ([], "1000:10:2", "1800", "0", "ok-smoke-warmup"),
+            ([], "1000:10:6", "60", "0", "ok"), (["x"], "1000:10:180", "1800", "0", "REFUSED: x"),
+            ([], "1000:10:180.0", "1800", "0", "ok-smoke-warmup"),
+            ([], "1000:10:180", "1800", "1", "ok-smoke"), ([], "1000:10:2", "1800", "1", "ok-smoke"),
+            (["x"], "1000:10:180", "1800", "1", "REFUSED: x"),
+            ([], "1000:10:180", "1800", "", "REFUSED: FT_DRY [''] is neither 0 nor 1"),
+            ([], "1000:10:180", "1800", "yes", "REFUSED: FT_DRY ['yes'] is neither 0 nor 1")):
+        got = fv(why_in, rule_in, cap_in, dry_in)
+        ok(got == want, f"final_verdict({why_in}, {rule_in}, cap {cap_in}, dry {dry_in!r}) = {got!r}, want {want!r}")
+    # The warm-up of one run dir, as run_system.sh's live plants judge it (timedrun.py warm-check OUTDIR RULE: the A23
+    # record, the record's own fields and its raw rows)
+    wc = globals().get("warm_check")
+    with tempfile.TemporaryDirectory() as root:
+        for name, sm_extra, raw_kw, want in (
+                ("warm-check: a clean run", {}, {}, True),
+                ("warm-check: raw warm-up rows one short of warmup_ops", {}, {"drop_warm": 1}, False),
+                ("warm-check: a backstep", {"warmup_backsteps": 1}, {}, False),
+                ("warm-check: a clock that steps back", {"clock": "CLOCK_TAI"}, {}, False)):
+            dd = os.path.join(root, name.replace(" ", "_").replace(":", ""))
+            os.makedirs(dd)
+            sm = dict(RUN, measured_ops=50, warmup_rule=RULE, **sm_extra)
+            with open(os.path.join(dd, "summary.json"), "w") as f:
+                json.dump(sm, f)
+            with open(os.path.join(dd, "raw.tsv"), "w") as f:
+                f.write(raw_tsv(sm, **raw_kw))
+            why = wc(dd, RULE) if wc else ["no warm_check() in timedrun.py"]
+            ok((not why) == want, f"{name} -> {'ok' if not why else '; '.join(why)}")
     # MED 5: the tier of a capped run, at the registered boundaries (one owner: tier())
     for ok_ops, capped, want in ((1000, True, "complete"), (999, True, "p50_only"), (100, True, "p50_only"),
                                  (99, True, None), (0, True, None), (200, False, "complete")):
