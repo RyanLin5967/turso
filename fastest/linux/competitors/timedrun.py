@@ -4,8 +4,10 @@
 PREREG :173: timed T3 runs carry no tracer. Every cell therefore has TWO runs of the identical bbload/clonebench
 command: the traced LABELLING run (CELLDIR/bb/, strace attached: the flush counts, never a latency) and the untraced
 TIMED run (CELLDIR/timed/: the only latency file a summary may use). The driver (trace.sh timed_run) sweeps the
-TracerPid of every task of the command's process tree and the server's at the start, every 0.05 s and at the end,
-appending to CELLDIR/timed.tracer.tsv (tracer_sweep's format), and writes the run's exit status to CELLDIR/timed.rc;
+TracerPid of every task of the command's process tree and the server's at the start, every 0.1 s and at the end,
+appending to CELLDIR/timed.tracer.tsv (tracer_sweep's format), from a sweeper subshell at nice 19 that records its own
+utime+stime per sweep (comp review 1 MED 12: timed.json sweeper_cpu_s, its CPU over the window, a cost ours does not
+carry), and writes the run's exit status to CELLDIR/timed.rc;
 the load generator records its own TracerPid at the window's start and end (summary.json tracerpid_tm0/tm1).
 
   timedrun.py warm-check OUTDIR RULE
@@ -60,7 +62,50 @@ def load(path):
         return None
 
 
-GAP_S = 0.25  # the longest stretch of the timed run allowed without a tracer sweep (trace.sh sweeps every 0.05 s)
+GAP_S = 0.25  # the longest stretch of the timed run allowed without a tracer sweep (trace.sh sweeps every 0.1 s)
+SWEEPER_NICE = 19  # comp review 1 MED 12: trace.sh's sweeper runs at nice 19, beside the competitors' timed runs only
+
+
+def sweeper_record(lines, summary):
+    """Comp review 1 MED 12: the tracer sweeper's own record in trace.sh's timed.tracer.tsv -- its header ("sweeper
+    pid=P nice=N clk_tck=K") and, per sweep, the utime+stime ticks it read from its own /proc stat (cpu=T) -- and its
+    CPU between the sweeps bracketing the measured window [tm0, tm1] (the last at or before tm0, the first at or after
+    tm1), the cost the competitors' timed runs carry and ours does not (t3run.sh has no such sweeper). Returns
+    ({"sweeper_cpu_s", "sweeper_cpu_span_s", "sweeper_nice", "sweeper_clk_tck"} or None, the reasons it is unknown or
+    refused): no header, a nice other than SWEEPER_NICE, a sweep with no cpu=, CPU that went backwards, no bracket."""
+    hdr = next((ln.split()[1:] for ln in lines if ln.startswith("sweeper ")), None)
+    kv = dict(x.split("=", 1) for x in hdr or [] if "=" in x)
+    nice, clk = kv.get("nice", ""), kv.get("clk_tck", "")
+    if hdr is None or not nice.lstrip("-").isdigit() or not clk.isdigit() or int(clk) <= 0:
+        return None, [f"the tracer record has no sweeper header with its nice and clk_tck ({hdr!r})"]
+    why = []
+    if int(nice) != SWEEPER_NICE:
+        why.append(f"the sweeper ran at nice {int(nice)}, not {SWEEPER_NICE}")
+    pts = []
+    for ln in lines:
+        p = ln.split()
+        if p and p[0] == "SWEEP":
+            c = next((x[4:] for x in p[5:] if x.startswith("cpu=")), None)
+            if c is None or not c.isdigit():
+                return None, why + [f"sweep line {ln!r} has no sweeper CPU (cpu=)"]
+            try:
+                pts.append((float(p[2]), int(c)))
+            except (IndexError, ValueError):
+                return None, why + [f"unreadable sweep line {ln!r}"]
+    if any(b[1] < a[1] for a, b in zip(pts, pts[1:])):  # file order is sweep order (the record is append-only)
+        why.append(f"the sweeper's CPU went backwards between sweeps: {pts[:12]}")
+    sm = summary or {}
+    t0, t1 = sm.get("tm0_realtime_s"), sm.get("tm1_realtime_s")
+    num = all(isinstance(t, (int, float)) and not isinstance(t, bool) for t in (t0, t1))
+    before = [q for q in pts if num and q[0] <= t0]
+    after = [q for q in pts if num and q[0] >= t1]
+    if not before or not after:
+        why.append("no sweeps bracket the measured window, so the sweeper's CPU over it is unknown")
+    if why:
+        return None, why
+    a, b, k = max(before), min(after), int(clk)
+    return {"sweeper_cpu_s": (b[1] - a[1]) / k, "sweeper_cpu_span_s": [a[0], b[0]], "sweeper_nice": int(nice),
+            "sweeper_clk_tck": k}, []
 
 
 def tracer_problems(path, summary):
@@ -125,6 +170,7 @@ def tracer_problems(path, summary):
     for k in ("tracerpid_tm0", "tracerpid_tm1"):
         if sm.get(k) != 0:
             why.append(f"the load generator's own {k} is {sm.get(k)!r}, not 0")
+    why += sweeper_record(lines, summary)[1]  # comp review 1 MED 12: the sweeper's own cost must be known
     return why
 
 
@@ -478,6 +524,13 @@ def write_verdict(celldir, n, why, warm_rule, cap, dry):
         out["live_branches"] = dict(ln.split() for ln in open(os.path.join(celldir, "live.tsv")) if len(ln.split()) == 2)
     except OSError:
         out["live_branches"] = None
+    # comp review 1 MED 12: the tracer sweeper's own CPU over the window (null only in a cell check() refused)
+    try:
+        tl = open(os.path.join(celldir, "timed.tracer.tsv")).read().splitlines()
+    except OSError:
+        tl = []
+    rec, _ = sweeper_record(tl, t)
+    out.update(rec or {"sweeper_cpu_s": None, "sweeper_cpu_span_s": None, "sweeper_nice": None, "sweeper_clk_tck": None})
     # LOW 15: the timed run's own template waits (PG; run_system.sh's timed.template_waits.txt), recorded and FLAGGED
     # like the labelling run's in cell.json, never dropped
     tw = os.path.join(celldir, "timed.template_waits.txt")
@@ -1020,6 +1073,10 @@ def selftest():
         got = (tj.get("sweeper_cpu_s"), tj.get("sweeper_cpu_span_s"), tj.get("sweeper_nice"))
         ok(isinstance(got[0], float) and abs(got[0] - 0.04) < 1e-12 and got[1] == [100.1, 100.3] and got[2] == 19,
            f"timed.json sweeper_cpu_s, sweeper_cpu_span_s, sweeper_nice = {got!r}, want (0.04, [100.1, 100.3], 19)")
+    # ... and the bracket guard alone (in a cell, tracer_problems' own "no sweep before the window" refuses first)
+    rec, why = sweeper_record(clean.splitlines(), {"tm0_realtime_s": 99.0, "tm1_realtime_s": 100.3})
+    ok(rec is None and any("no sweeps bracket the measured window" in w for w in why),
+       f"sweeper_record with no sweep at or before tm0 -> {rec!r}, {why!r} (want None and the bracket reason)")
     # gate-6 review, t3run item 12: ops is ONE total per run for every system; FT_OPS_TOTAL overrides N1/N4 for all C
     for args, want in (((1, 200, 300, ""), 200), ((4, 200, 300, ""), 300), ((4, 200, 300, "5000"), 5000),
                        ((1, 200, 300, "5000"), 5000), ((1, 200, 300, "x"), None), ((1, 200, 300, "0"), None),

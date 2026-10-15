@@ -14,7 +14,7 @@ from pathlib import Path
 SOURCE = Path(__file__).with_name("timedrun.py")
 # (+ the comp branch's guards, merged at 407b164a3: each run's own record, its raw rows, its after-step record)
 FUNCTIONS = {"tracer_problems", "warm_problems", "run_problems", "check", "real_problem", "record_problems",
-             "raw_problems", "after_problems"}
+             "raw_problems", "after_problems", "sweeper_record"}
 
 
 def candidates(tree):
