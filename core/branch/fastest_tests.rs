@@ -4765,6 +4765,50 @@ fn a_d0_open_of_a_synced_log_leads_no_upgrade_on_a_create() {
     }
 }
 
+/// Engine review 20 MED 5, RULED (a) (DECISIONS afd0e67f81): a D1 process over a log a D2 run
+/// wrote freed what its Release, only fsynced, made durable. On Apple a power cut can lose that
+/// Release while the D2 records naming the slot survive, so a slot a new branch reused would come
+/// back under a D2-acknowledged branch: D1 breaking D2's promise. The free class held frees only in
+/// D0 (`!self.sync.syncs()`), so the synced base was never read in D1. Here x, written at D2, is
+/// reaped by a D1 reopen: a new branch reuses none of x's slots until durable(FullFsync) covers
+/// the Release (no upgrade runs here: the bound is not reached). Both stores. Mutant
+/// `free_hold_d0_only`.
+#[test]
+fn a_d1_open_of_a_d2_log_holds_frees_until_a_full_flush() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let what = format!("catalog={catalog}");
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("d1-over-d2.db");
+        let (id, slots, incarnation) = {
+            let db = open_at(&path, opts(catalog, SyncClass::FullFsync));
+            let trunk = db.connect().unwrap();
+            seed_wide(&trunk);
+            let x = trunk.fork_branch().unwrap();
+            write_v(&x.connect().unwrap(), 3, "x");
+            write_v(&x.connect().unwrap(), 40, "x");
+            let slots = x.owned_slots();
+            assert!(!slots.is_empty(), "{what}: premise: x's writes took slots");
+            (x.into_id(), slots, db.incarnation)
+        };
+        let db = reopen(&path, opts(catalog, SyncClass::Fsync), incarnation);
+        assert_eq!(
+            db.branches.synced_base_for_test(),
+            SyncClass::FullFsync,
+            "{what}: premise: the D1 open decided the D2 run's class"
+        );
+        let trunk = db.connect().unwrap();
+        db.branch(id).unwrap().reap().unwrap();
+        let release = db.branches.last_release_lsn_for_test();
+        assert!(release > 0, "{what}: premise: x's Release is logged");
+        let took = reused_by_a_new_branch(&trunk, &slots);
+        assert!(
+            took.is_empty() || db.branches.durable_for_test(SyncClass::FullFsync) >= release,
+            "{what}: slots {took:?} were reused before a full flush covered the Release that freed them"
+        );
+    }
+}
+
 /// Engine review 18 HIGH 1 (review 19 MED 5): the held-free upgrade was led off the
 /// acknowledgement paths (engine review 13 MED 2) but still as an ordinary group flight: it took
 /// everything buffered and the group's one flight slot (`flushing`), so every D0 create, connect,

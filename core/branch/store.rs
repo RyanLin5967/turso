@@ -6883,6 +6883,13 @@ impl BranchStore {
         self.group.durable(class)
     }
 
+    /// Test builds: the class recovery decided the kept log was synced in (`Journal::synced_base`;
+    /// engine review 20 MED 5's premise).
+    #[cfg(test)]
+    pub(crate) fn synced_base_for_test(&self) -> SyncClass {
+        self.inner.lock().journal.as_ref().map_or(SyncClass::Off, Journal::synced_base)
+    }
+
     /// Test builds: whether a slot was written since the arena's last sync (engine review 21 MED
     /// 4: a premise that an upgrade has the arena to sync).
     #[cfg(test)]
