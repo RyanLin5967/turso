@@ -3377,11 +3377,13 @@ impl Cursor {
             Self::Pseudo(_) => {}
             // Permanently null; the flag is a no-op.
             Self::NullRow => {}
-            // The FTS side of an outer join: columns are decoded from the
-            // base-table cursor (which receives its own NullRow), never from
-            // the index-method cursor, so there is no column state to null
-            // out here.
-            Self::IndexMethod(_) => {}
+            // The FTS side of an outer join (#7531). Base-table columns are
+            // decoded from the table cursor, which receives its own NullRow,
+            // but Column/RowId/IdxRowId can also read the index-method cursor
+            // itself (e.g. a score column or its rowid), so the cursor records
+            // the flag and the executor substitutes NULL while it is set; Next
+            // and IndexMethodQuery clear it, as for BTree cursors.
+            Self::IndexMethod(cursor) => cursor.set_null_flag(flag),
             _ => {
                 mark_unlikely();
                 panic!("set_null_flag on unexpected cursor type");

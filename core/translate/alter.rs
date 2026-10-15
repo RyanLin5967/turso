@@ -902,6 +902,24 @@ pub fn translate_alter_table(
         crate::bail_parse_error!("ALTER TABLE is only supported for BTree tables");
     };
 
+    // Recipe backfill (lane k1-recipe-build, see `crate::recipe`): a recipe names columns by
+    // name and reads records by position, so only a plain ADD COLUMN keeps both valid. Every
+    // other ALTER of a recipe table is refused rather than approximated.
+    if let ast::AlterTableBody::AddColumn(def) = &alter_table {
+        if normalize_ident(def.col_name.as_str()).eq_ignore_ascii_case(crate::recipe::GEN_COLUMN) {
+            crate::bail_parse_error!("column {} is reserved", crate::recipe::GEN_COLUMN);
+        }
+    }
+    if original_btree.recipes.is_some() {
+        let plain_add = matches!(&alter_table, ast::AlterTableBody::AddColumn(def)
+            if !def.constraints.iter().any(|c| matches!(c.constraint, ast::ColumnConstraint::Generated { .. })));
+        if !plain_add {
+            crate::bail_parse_error!(
+                "ALTER TABLE {table_name} is refused: the table has recipe backfills"
+            );
+        }
+    }
+
     // Check if this table has dependent materialized views
     let dependent_views = resolver.with_schema(database_id, |s| {
         s.get_dependent_materialized_views(table_name)
@@ -1155,7 +1173,7 @@ pub fn translate_alter_table(
 
             btree.columns_mut().remove(dropped_index);
 
-            let sql = escape_sql_string_literal(&btree.to_sql());
+            let sql = escape_sql_string_literal(&connection.dialect().format_altered_table_sql(&btree)?);
 
             let escaped_table_name = escape_sql_string_literal(table_name);
             let stmt = format!(
@@ -1430,7 +1448,7 @@ pub fn translate_alter_table(
             // visible to the empty-table check below.
             column = btree.columns().last().unwrap().clone();
 
-            let escaped = escape_sql_string_literal(&btree.to_sql());
+            let escaped = escape_sql_string_literal(&connection.dialect().format_altered_table_sql(&btree)?);
             let escaped_table_name = escape_sql_string_literal(table_name);
             let stmt = format!(
                 r#"

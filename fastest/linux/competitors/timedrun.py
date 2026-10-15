@@ -497,7 +497,7 @@ RULE = "1000:10:180"  # the registered warm-up at a 1800 s cap
 LIVE = 21  # PREBRANCH 20 live branches + Dolt's main
 
 
-def trace_rec(sweeps=None, traced=(), roles="cmd=500 srv=100"):
+def trace_rec(sweeps=None, traced=(), roles="cmd=500 srv=100 tree=children"):
     """A timed.tracer.tsv in trace.sh's tracer_sweep format (MED 4): one "SWEEP phase t cmd=N:MAX srv=N:MAX" line per
     sweep, a "TRACED phase role pid tid tracerpid" line per traced task. Default: start 100.00, a sweep every 0.05 s
     to 100.40, end 100.45, every task untraced, around a window [100.1, 100.3]."""
@@ -636,7 +636,7 @@ def selftest():
          dict(tracer=trace_rec(sw[:6] + [("end", 100.28, 0, 0, 12, 0)])), False),
         ("B1: no server role; the command's tree sampled throughout",
          dict(tracer=trace_rec([(p, t, n, m, 0, 0) for p, t, n, m, _, _ in sw] + [("end", 100.45, 0, 0, 0, 0)],
-                               roles="cmd=500 srv=none")), True),
+                               roles="cmd=500 srv=none tree=children")), True),
         ("a server role whose start sweep found no task",
          dict(tracer=trace_rec([("start", 100.0, 3, 0, 0, 0)] + sw[1:] + [("end", 100.45, 0, 0, 12, 0)])), False),
         ("no roles header", dict(tracer="".join(ln for ln in clean.splitlines(True) if not ln.startswith("roles"))),
@@ -772,6 +772,16 @@ def selftest():
         ("a live-branch count that is not a count", dict(tracer=clean, live={"label_before": LIVE, "label_after": "x",
                                                                              "timed_before": LIVE, "timed_after": LIVE}),
          False),
+        ("process trees unavailable", dict(tracer=trace_rec(roles="cmd=500 srv=100 tree=none")), False),
+        ("TracerPid in a sweep without a TRACED line",
+         dict(tracer=trace_rec(sw + [("end", 100.45, 0, 0, 12, 4242)])), False),
+        ("command start sweep found zero tasks",
+         dict(tracer=trace_rec([("start", 100.0, 0, 0, 12, 0)] + sw[1:] + [("end", 100.45, 0, 0, 12, 0)])), False),
+        ("roles present but no tracer sweeps", dict(tracer=trace_rec(sweeps=[])), False),
+        ("unreadable sweep line", dict(tracer=clean + "SWEEP mid bad cmd=x srv=12:0\n"), False),
+        ("missing measured window", dict(tracer=clean, timed_extra={"tm0_realtime_s": None}), False),
+        ("warm-up capped before MAX_S",
+         dict(tracer=clean, timed_extra={"warmup_ops": 500, "warmup_capped": True}), False),
     ]
     # Competitors review 2 items 1, 2, 3, 8, 10, 13 and review 1 LOW 17: what the record says against what the raw rows
     # and the other run say (each case one defect; the controls must pass every check)
@@ -841,6 +851,122 @@ def selftest():
          dict(tracer=clean, lab_extra={"mode": "b1", "after_steps": None, "skip_after": None, "tput_unit": None},
               timed_extra={"mode": "b1", "after_steps": None, "skip_after": None, "tput_unit": None}), True),
     ]
+    refusal_reasons = {
+        "a server task traced at the end of the timed run": ("traced during the timed run", "a sweep saw a TracerPid"),
+        "a server task traced at its start": ("traced during the timed run", "a sweep saw a TracerPid"),
+        "no timed run: only the traced labelling run's latency file": ("no timed run (timed/summary.json",),
+        "no tracer samples": ("tracer record has no roles header",),
+        "no sample at the end": ("no end sweep of the server's tasks",),
+        "tracer record missing": ("tracer record timed.tracer.tsv missing or unreadable",),
+        "a tracer attached mid-run and detached before the end (seen by a mid sweep)":
+            ("traced during the timed run", "a sweep saw a TracerPid"),
+        "a TRACED line whose sweep line says 0 (the line alone refuses)": ("traced during the timed run",),
+        "a blind second mid-run (a gap longer than the 0.25 s allowed)": ("stretch with no sweep",),
+        "no sweep before the window opened": ("no sweep before the window opened",),
+        "no sweep after the window closed": ("no sweep after the window closed",),
+        "a server role whose start sweep found no task": ("no start sweep of the server's tasks",),
+        "no roles header": ("tracer record has no roles header",),
+        "the load generator itself traced at tm0 (its own record)": ("the load generator's own tracerpid_tm0",),
+        "no own tracer record in the timed summary":
+            ("the load generator's own tracerpid_tm0", "the load generator's own tracerpid_tm1"),
+        "timed run failed": ("timed run verdict fail rc 3", "timed run exit status 3"),
+        "timed run measured another N": ("timed run measured 150 ops, not N=200",),
+        "timed run warmed up by another rule": ("timed run warm-up rule '20:0:0', not the registered",),
+        "labelling run warmed up by another rule": ("labelling run warm-up rule '1000:10:60', not the registered",),
+        "no warm-up rule recorded":
+            ("labelling run warm-up rule None, not the registered", "timed run warm-up rule None, not the registered"),
+        "capped at 99 ok ops: failed, cause cap": ("timed run capped with 99 ok ops",),
+        "the labelling run capped at 99 ok ops": ("labelling run capped with 99 ok ops",),
+        "an uncapped run short of N": ("labelling run measured 1200 ops, not N=5000", "timed run measured 1500 ops, not N=5000"),
+        "no labelling run summary": ("no labelling run summary",),
+        "the labelling run measured another N": ("labelling run measured 150 ops, not N=200",),
+        "the timed run's raw.tsv missing (summary present)": ("no timed run (timed/summary.json",),
+        "the timed summary says fail with rc 0": ("timed run verdict fail rc 0",),
+        "the timed summary says ok with rc 3": ("timed run verdict ok rc 3",),
+        "the timed run's exit status file says 1": ("timed run exit status 1",),
+        "capped with 1200 ops but 50 ok (the tier counts ok ops)": ("timed run capped with 50 ok ops",),
+        "a warm-up that left before S and before MAX_S (1000 ops, 1.0 s of 10 s)": ("timed run left its warm-up early",),
+        "a warm-up that left before OPS and before MAX_S (500 ops, 12 s)": ("timed run left its warm-up early",),
+        "A23: a warm-up op claimed at or after MAX_S (500 ops, the last at 180.0 s)": ("at or after MAX_S",),
+        "A23: no warmup_capped in the record": ("timed run has no A23 warm-up record",),
+        "A23: says capped although OPS and S were met at the ending claim (done wins)": ("done wins",),
+        "A23: says done, but ended by MAX_S before OPS": ("timed run left its warm-up early",),
+        "A23: the warm-up should have ended at its last claim (OPS and S already met there)":
+            ("warm-up should have ended at its last claim",),
+        "A23: warmup_s is not the ending claim's time": ("is not its ending claim's time",),
+        "A23: the last warm-up claim after the ending claim (1000 ops, so OPS was not met at that claim)":
+            ("is after its ending claim",),
+        "A23: warm-up ops but no last claim time": ("warm-up record is inconsistent",),
+        "A23: a claim judged with an older time than the claim judged before it (warmup_backsteps 1)":
+            ("with an older time than the claim judged before them",),
+        "A23: no warmup_backsteps in the record": ("has no warmup_backsteps record",),
+        "A23: an open-loop record with backsteps is refused (one shared arrival stream: 0 backsteps in both modes)":
+            ("with an older time than the claim judged before them",),
+        "A23: open loop, the last warm-up claim after the ending claim even with backsteps 0: refused":
+            ("is after its ending claim",),
+        "the labelling run's warm-up left early": ("labelling run left its warm-up early",),
+        "a window bound that is not the registered cap": ("is not the cap",),
+        "capped although the window was shorter than its bound": ("is shorter than its bound",),
+        "no warm-up record": ("timed run has no A23 warm-up record",),
+        "the labelling run at N=20, the timed run at N=1020": ("live-branch count not held at 21",),
+        "N grew by the run's creates inside the timed run (no delete)": ("live-branch count not held at 21",),
+        "no live-branch record": ("no live-branch record live.tsv",),
+        "a live-branch count missing": ("live-branch count not held at 21",),
+        "a live-branch count that is not a count": ("live-branch count not held at 21",),
+        "process trees unavailable": ("the process trees could not be walked",),
+        "TracerPid in a sweep without a TRACED line": ("a sweep saw a TracerPid",),
+        "command start sweep found zero tasks": ("no start sweep of the command's tasks",),
+        "roles present but no tracer sweeps": ("no tracer sweeps",),
+        "unreadable sweep line": ("unreadable sweep line",),
+        "missing measured window": ("summary has no measured window",),
+        "warm-up capped before MAX_S": ("before MAX_S",),
+    }
+    # The comp branch's refusal cases, each pinned to its own guard's reason as C01 pins main's (the merge of fork main
+    # ae41319fe; the four keys of cases that competitors review 2 items 10-12 deleted or renamed are dropped above)
+    refusal_reasons.update({
+        "A23: open loop, no warmup_backsteps record: refused (the closed-loop twin is above)":
+            ("timed run has no warmup_backsteps record",),
+        "A23: open loop, a warm-up that left before S and before MAX_S: refused": ("timed run left its warm-up early",),
+        "A23: no loop mode in the record (both runs)":
+            ("labelling run's loop mode None is neither closed nor open", "timed run's loop mode None is neither closed nor open"),
+        "A23: a loop mode that is neither closed nor open (both runs)":
+            ("labelling run's loop mode 'b1' is neither closed nor open", "timed run's loop mode 'b1' is neither closed nor open"),
+        "a measured row intended at tm1 (the window is closed in intended time at tm1)":
+            ("timed run measured 1 op(s) intended at or after tm1",),
+        "no tm1_ns in the timed summary": ("timed run has no tm1_ns",),
+        "the raw rows hold one warm-up op fewer than warmup_ops (LOW 17: the summary is not trusted)":
+            ("timed run's raw.tsv holds 1499 warm-up rows, its summary warmup_ops 1500",),
+        "an uncapped run whose window ran past its bound (LOW 17)": ("timed run says not capped but its window 1800.5 s",),
+        "the timed run used another seed (review 2 item 2)": ("the labelling and timed runs differ in seed",),
+        "the timed run used another rate": ("the labelling and timed runs differ in rate",),
+        "the timed run used another client count": ("the labelling and timed runs differ in clients",),
+        "labelling closed, timed open (review 2 item 10: the control used to accept this mixed cell)":
+            ("the labelling and timed runs differ in loop", "the labelling and timed runs differ in mode"),
+        "a clock that can step back (CLOCK_REALTIME; review 2 item 8)":
+            ("timed run's clock 'CLOCK_REALTIME' is not one that never steps back",),
+        "no clock recorded": ("timed run's clock None is not one that never steps back",),
+        "loop closed but mode open (review 2 item 13: loop must repeat bbload's mode)":
+            ("timed run's loop 'closed' does not repeat its mode 'open'",),
+        "clonebench's mode b1 with loop open": ("timed run is clonebench (mode 'b1'), closed loop only",),
+        "open loop, a p99 send lateness over max_send_late_us (review 2 item 3: VOID)":
+            ("timed run's send_late_us p99 150.0 us is over its bound 100.0 us: VOID",),
+        "open loop, a p99 pool lateness over max_send_late_us":
+            ("timed run's pool_late_us p99 101.0 us is over its bound 100.0 us: VOID",),
+        "open loop with no lateness record": ("timed run is open loop with no send_late_us p99",),
+        "a bbload run with after-steps but no after<k>_ns columns":
+            ("timed run ran 2 after-step(s) (after_steps 2, skip_after False) but its raw.tsv's after columns are none",),
+        "a bbload run with after-steps and only after1_ns of 2": ("after columns are ['after1_ns'], not",),
+        "a bbload run with no tput_unit": ("timed run's tput_unit None is not 'cycle'",),
+        "a bbload cycle run that says tput_unit op": ("timed run's tput_unit 'op' is not 'cycle'",),
+        "a bbload run with no after_steps record": ("timed run has no after_steps record",),
+        "a bbload run with no skip_after record": ("timed run has no skip_after record",),
+        "a bbload run with no after-steps that says tput_unit cycle": ("timed run's tput_unit 'cycle' is not 'op'",),
+        "a bbload run with an after3_ns column past its 2 after-steps":
+            ("after columns are ['after1_ns', 'after2_ns', 'after3_ns'], not",),
+        "a --skip-after run with after<k>_ns columns":
+            ("timed run ran 0 after-step(s) (after_steps 2, skip_after True) but its raw.tsv's after columns are "
+             "['after1_ns', 'after2_ns'], not none",),
+    })
     bad = n = 0
 
     def ok(cond, line):  # counts its own cases (LOW 27: the total came from padding `cases` with None)
@@ -857,6 +983,10 @@ def selftest():
             why = check(d, n_check, RULE, LIVE, CAP)
             got = not why
             ok(got == want, f"{name} -> {'ok' if got else '; '.join(why)}")
+            if not want:
+                expected = refusal_reasons.get(name, ())
+                ok(bool(expected) and all(any(reason in line for line in why) for reason in expected),
+                   f"reason: {name} -> expected {expected!r}; got {why!r}")
     # gate-6 review, t3run item 12: ops is ONE total per run for every system; FT_OPS_TOTAL overrides N1/N4 for all C
     for args, want in (((1, 200, 300, ""), 200), ((4, 200, 300, ""), 300), ((4, 200, 300, "5000"), 5000),
                        ((1, 200, 300, "5000"), 5000), ((1, 200, 300, "x"), None), ((1, 200, 300, "0"), None),
@@ -864,6 +994,9 @@ def selftest():
                        (("x", 200, 300, "5000"), None), ((0, 200, 300, "5000"), None)):
         got = ops(*args)
         ok(got == want, f"ops{args} = {got!r}, want {want!r}")
+    why = warm_problems("timed", RUN, "unreadable")
+    ok(any("warm-up rule 'unreadable' unreadable" in line for line in why),
+       f"reason: unreadable warm-up rule -> {why!r}")
 
     def fv(*a):  # final_verdict, its arity named in the case (comp review 1 LOW 15 adds DRY)
         try:
@@ -933,6 +1066,15 @@ def selftest():
             ("1000:10:180", wrec(1500, 10_000_500_000, False, None), False, "warm-up ops, no last claim time")):
         why = run_problems("timed", rec, rule_in, None)
         ok((not why) == want, f"A23 run_problems {what} ({rule_in}) -> {'accepted' if not why else why}")
+        if not want:
+            expected = {
+                "MAX_S 0 read as no limit (1000 ops, 1.2 s) is refused": "at or after MAX_S",
+                "1 ns before S is not done": "left its warm-up early",
+                "... and capped there is refused": "done wins",
+                "no warm-up op, yet a last claim time": "warm-up record is inconsistent",
+                "warm-up ops, no last claim time": "warm-up record is inconsistent",
+            }[what]
+            ok(any(expected in line for line in why), f"reason: A23 {what}: expected {expected!r}, got {why!r}")
     # Lead ruling (artie DECISIONS 6b0bef481b): the CI smoke warm-up cap is for smoke runs only; a REAL run (FT_DRY=0)
     # takes the registered cap and PREREG :210's rule at it, and refuses anything else.
     # Both values are compared as EXACT strings (review of e11a3c993, finding 5: "1.8e3" passed a numeric check and then
@@ -954,6 +1096,14 @@ def selftest():
         why = real_problem(cap, warm)
         got = why is None
         ok(got == want, f"real run cap={cap!r} warmup={warm!r} -> {'accepted' if got else f'refused: {why}'}")
+        if not want:
+            expected = []
+            if cap != "1800":
+                expected.append("is not the registered '1800' s")
+            if warm != "1000:10:180":
+                expected.append("is not PREREG :210's rule at the registered cap")
+            ok(bool(expected) and all(reason in (why or "") for reason in expected),
+               f"reason: real cap={cap!r} warmup={warm!r}: expected {expected!r}, got {why!r}")
     print(f"timedrun selftest: {n - bad}/{n}")
     return 1 if bad else 0
 

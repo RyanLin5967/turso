@@ -135,15 +135,18 @@ static inline void c1b_ack(c1b_client *c, uint64_t op, const char *l) { (void)c;
 #include <errno.h>
 #include <hdr/hdr_histogram.h>
 #include <libpq-fe.h>
+#include <limits.h>
 #ifdef __APPLE__
 #include <mach/mach_time.h>
 #endif
 #include <math.h>
 #include <mysql.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <sys/resource.h>
+#include <sys/socket.h>
 #include <time.h>
 #ifdef __linux__
 #include <sys/prctl.h> /* PR_SET_TIMERSLACK for the open-loop clients (competitors review 2 item 3) */
@@ -202,6 +205,7 @@ static spec_t S;
 static int C = 1, OPEN_LOOP = 0, ALLOW_ERR = 0;
 static int SKIP_AFTER = 0; /* --skip-after: run no after-step (the driver's designated branches, which must stay) */
 static double RATE = 0, WARM_S = 0, WARM_MAX_S = 0, DUR_S = 0, MAXWIN_S = 3600, STALL_S = 120, MAX_SEND_LATE_US = 100;
+static const double CLOSE_TIMEOUT_S = 5;
 static char WARM_RULE[64] = "";
 static uint64_t WARM_OPS = 0, MIN_OPS = 0, MAX_OPS = 0, SEED = 1, MARKB = 0;
 static uint64_t DUR_NS, MAXWIN_NS; /* DUR_S and MAXWIN_S truncated to ns once, as the warm-up's seconds are */
@@ -445,6 +449,14 @@ big:
 
 /* ---------- connections ---------- */
 typedef struct { char k[64][64]; char v[64][256]; int n; } kv_t;
+
+/* A spec-policy violation voids the whole cell, including with --allow-errors
+ * and when a templated step connect first exposes it after warm-up. */
+_Noreturn static void conn_refuse(const char *why) {
+    fprintf(stderr, "bbload: REFUSED: %s\n", why);
+    _exit(2);
+}
+
 static int kv_parse(const char *s, kv_t *kv, char *why) {
     char buf[4096], *save = NULL;
     snprintf(buf, sizeof buf, "%s", s);
@@ -479,11 +491,46 @@ static int conn_open(conn_t *x, const char *base, const char *over, char *why, s
                 if (!p->val) continue;
                 int i;
                 for (i = 0; i < kv.n; i++) if (!strcmp(kv.k[i], p->keyword)) break;
-                if (i == kv.n) kv.n++;
+                if (i == kv.n) {
+                    if (kv.n == 64) { PQconninfoFree(o); conn_refuse("conninfo has too many keys"); }
+                    kv.n++;
+                }
+                if (strlen(p->keyword) >= sizeof kv.k[i] || strlen(p->val) >= sizeof kv.v[i]) {
+                    PQconninfoFree(o);
+                    conn_refuse("conninfo key or value is too long");
+                }
                 snprintf(kv.k[i], 64, "%s", p->keyword);
                 snprintf(kv.v[i], 256, "%s", p->val);
             }
             PQconninfoFree(o);
+        }
+        /* Port the macOS forcing after the merge. Missing keys override libpq's
+         * environment/service defaults; explicit contrary values refuse first. */
+        const char *forced[3][2] = {{"sslmode", "disable"}, {"gssencmode", "disable"},
+                                    {"connect_timeout", "30"}};
+        for (int f = 0; f < 3; f++) {
+            int i;
+            for (i = 0; i < kv.n; i++) if (!strcmp(kv.k[i], forced[f][0])) break;
+            if (i < kv.n) {
+                if (f < 2 && strcmp(kv.v[i], "disable")) {
+                    char reason[128];
+                    snprintf(reason, sizeof reason, "merged conninfo requires %s=disable", forced[f][0]);
+                    conn_refuse(reason);
+                }
+                if (f == 2) {
+                    char *end;
+                    errno = 0;
+                    long seconds = strtol(kv.v[i], &end, 10);
+                    if (errno || !kv.v[i][0] || *end || seconds <= 0 || seconds > INT_MAX)
+                        conn_refuse("merged conninfo requires connect_timeout=positive integer seconds");
+                    continue; /* the macOS port preserves a spec's bounded timeout */
+                }
+            } else {
+                if (kv.n == 64) conn_refuse("conninfo has too many keys for transport policy");
+                kv.n++;
+            }
+            snprintf(kv.k[i], 64, "%s", forced[f][0]);
+            snprintf(kv.v[i], 256, "%s", forced[f][1]);
         }
         const char *keys[65], *vals[65];
         for (int i = 0; i < kv.n; i++) { keys[i] = kv.k[i]; vals[i] = kv.v[i]; }
@@ -494,6 +541,11 @@ static int conn_open(conn_t *x, const char *base, const char *over, char *why, s
             PQfinish(x->pg);
             x->pg = NULL;
             return -1;
+        }
+        if (PQsslInUse(x->pg) || PQgssEncInUse(x->pg)) {
+            PQfinish(x->pg);
+            x->pg = NULL;
+            conn_refuse("connected with SSL or GSS encryption despite disabled transport policy");
         }
         return 0;
     }
@@ -518,12 +570,39 @@ static int conn_open(conn_t *x, const char *base, const char *over, char *why, s
     return 0;
 }
 
-static void conn_close(conn_t *x) {
-    if (x->pg) PQfinish(x->pg);
-    if (x->my) mysql_close(x->my);
+/* Verbatim from artie 4010ff3b06: wait for backend exit before a following DROP. */
+static int conn_close_sync(conn_t *x, char *why, size_t wsz) {
+    int s = -1, rc = 0;
+    if (x->pg) { int fd = PQsocket(x->pg); if (fd >= 0) s = dup(fd); PQfinish(x->pg); }
+    if (x->my) { int fd = (int)mysql_get_socket(x->my); if (fd >= 0) s = dup(fd); mysql_close(x->my); }
     x->pg = NULL;
     x->my = NULL;
+    if (s < 0) return 0;
+    uint64_t dl = now_ns() + (uint64_t)(CLOSE_TIMEOUT_S * 1e9);
+    char b[512];
+    for (;;) {
+        uint64_t n = now_ns();
+        if (n >= dl) { snprintf(why, wsz, "close: the server did not close the connection within %.1f s", CLOSE_TIMEOUT_S); rc = -1; break; }
+        struct pollfd pf = {s, POLLIN, 0};
+        int pr = poll(&pf, 1, (int)((dl - n) / 1000000 + 1));
+        if (pr < 0) { if (errno == EINTR) continue; snprintf(why, wsz, "close: poll: %s", strerror(errno)); rc = -1; break; }
+        if (pr == 0) continue;
+        ssize_t r = read(s, b, sizeof b);
+        if (r == 0) break;
+        if (r < 0) {
+            if (errno == EINTR || errno == EAGAIN) continue;
+            if (errno == ECONNRESET) break; /* the server reset it: closed all the same */
+            snprintf(why, wsz, "close: read: %s", strerror(errno));
+            rc = -1;
+            break;
+        }
+    }
+    struct linger lg = {1, 0};
+    setsockopt(s, SOL_SOCKET, SO_LINGER, &lg, sizeof lg);
+    close(s);
+    return rc;
 }
+static void conn_close(conn_t *x) { char w[256]; (void)conn_close_sync(x, w, sizeof w); }
 static int conn_alive(conn_t *x) {
     if (x->proto == P_PG) return x->pg && PQstatus(x->pg) == CONNECTION_OK;
     return x->my != NULL;
@@ -577,12 +656,15 @@ static void note_backend(client_t *c, uint32_t seq, uint8_t kind, conn_t *x) {
 static int run_step(client_t *c, conn_t *cur, int *have_branch, const step_t *st, ctx_t *x, char *why, size_t wsz) {
     char text[8192], w[256];
     if (st->k == K_CLOSE) {
-        if (*have_branch) { conn_close(cur); *have_branch = 0; }
+        if (*have_branch) { *have_branch = 0; return conn_close_sync(cur, why, wsz); }
         return 0;
     }
     if (expand(st->t, x, text, sizeof text, w) != 0) { snprintf(why, wsz, "%s", w); return -1; }
     if (st->k == K_CONNECT) {
-        if (*have_branch) conn_close(cur);
+        if (*have_branch) {
+            *have_branch = 0;
+            if (conn_close_sync(cur, why, wsz) != 0) return -1;
+        }
         *have_branch = 0;
         char ci[4096];
         if (expand(S.connect, x, ci, sizeof ci, w) != 0) { snprintf(why, wsz, "%s", w); return -1; }
@@ -910,7 +992,10 @@ static void *client_main(void *arg) {
                 int e = err_index(w);
                 if (r.ok) { r.ok = 0; r.err = (int16_t)(1000 + e); } /* the op succeeded; its after-step did not */
             }
-        if (have_branch) conn_close(&cur);
+        if (have_branch && conn_close_sync(&cur, w, sizeof w) != 0) {
+            int e = err_index(w);
+            if (r.ok) { r.ok = 0; r.err = (int16_t)(1000 + e); }
+        }
         r.after_end = now_ns();
         if (!conn_alive(&c->home)) reconnect_home(c);
         record(c, &r);

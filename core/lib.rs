@@ -34,6 +34,7 @@ mod multiprocess_tests;
 pub mod mvcc;
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub mod numeric;
+pub mod recipe;
 pub mod schema;
 pub mod skiplist;
 pub mod state_machine;
@@ -133,7 +134,7 @@ pub use database::{
 #[cfg(test)]
 pub(crate) use database::{DatabaseKey, RegistryEntry, DATABASE_MANAGER};
 pub use dialect::{Dialect, SqliteDialect};
-pub use error::{io_error, CompletionError, LimboError};
+pub use error::{io_error, BranchOp, CompletionError, LimboError};
 pub use function::ContextCollationFunction;
 #[cfg(feature = "io_memory_yield")]
 pub use io::MemoryYieldIO;

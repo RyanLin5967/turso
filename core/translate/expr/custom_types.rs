@@ -19,7 +19,16 @@ pub(super) fn operator_to_str(op: &ast::Operator) -> Option<&'static str> {
 }
 
 /// Emit bytecode for a resolved custom type operator call.
-/// Handles argument swapping, literal encoding, and result negation.
+/// Handles argument swapping and result negation.
+///
+/// The operands reach the operator as they are: a custom-type column is read decoded (its
+/// user-facing value, `emit_user_facing_column_value`), and the other operand is a value of the
+/// type's input, which the type's operator functions take as given (numeric's take integer, real,
+/// text and blob). It is not encoded with the column's parameters, which would truncate or refuse
+/// it as if it were stored (engine review 14 HIGH 1: 6b (a) did so to every bound parameter, in
+/// arithmetic too, and sent a NULL one into an ENCODE that raises). Mutant
+/// `operand_keeps_column_typmod` (test builds only): encoded with the column's parameters, as
+/// literals were before.
 pub(super) fn emit_custom_type_operator(
     program: &mut ProgramBuilder,
     referenced_tables: Option<&TableReferences>,
@@ -39,11 +48,14 @@ pub(super) fn emit_custom_type_operator(
         (e1, e2)
     };
 
-    // When encoding a literal operand, we must use separate registers for the
-    // function call arguments. translate_expr may place literals in preamble
-    // registers (constant optimization), and encoding in-place would clobber
-    // that register — breaking subsequent loop iterations.
-    let func_start = if let Some(ref encode_info) = resolved.encode_info {
+    // The mutant's encoding uses separate registers for the function call arguments:
+    // translate_expr may place literals in preamble registers (constant optimization), and
+    // encoding in-place would clobber that register, breaking subsequent loop iterations.
+    let encoded = resolved
+        .encode_info
+        .as_ref()
+        .filter(|_| crate::branch::store::fe_mutant("operand_keeps_column_typmod"));
+    let func_start = if let Some(encode_info) = encoded {
         if let Some(encode_expr) = encode_info.type_def.encode() {
             // Translate operands into temporary registers first.
             let tmp1 = program.alloc_register();
@@ -75,7 +87,7 @@ pub(super) fn emit_custom_type_operator(
                 dst_reg: col_dst,
                 extra_amount: 0,
             });
-            // Encode the literal into the fresh function arg slot.
+            // Encode the operand into the fresh function arg slot.
             emit_type_expr(
                 program,
                 encode_expr,
@@ -94,7 +106,7 @@ pub(super) fn emit_custom_type_operator(
             arg_reg
         }
     } else {
-        // No encoding needed; translate directly into arg slots.
+        // The operands as they are, in the call's argument slots.
         let arg_reg = program.alloc_registers(2);
         translate_expr(program, referenced_tables, first, arg_reg, resolver)?;
         translate_expr(program, referenced_tables, second, arg_reg + 1, resolver)?;
@@ -105,6 +117,55 @@ pub(super) fn emit_custom_type_operator(
     program.emit_insn(Insn::Function {
         constant_mask: 0,
         start_reg: func_start,
+        dest: result_reg,
+        func: FuncCtx { func, arg_count: 2 },
+    });
+    if resolved.negate {
+        program.emit_insn(Insn::Not {
+            reg: result_reg,
+            dest: result_reg,
+        });
+    }
+    Ok(result_reg)
+}
+
+/// `emit_custom_type_operator` for operands already in registers: `lhs_reg` holds `e1` and
+/// `rhs_reg` holds `e2` of the pair `find_custom_type_operator` resolved, each as the operator
+/// takes it (a custom-type column decoded, the other operand as given). Used by an IN list, which
+/// translates its left side once and each element once (engine review 14 LOW 14). Returns the
+/// result's register.
+pub(super) fn emit_custom_type_operator_on_regs(
+    program: &mut ProgramBuilder,
+    lhs_reg: usize,
+    rhs_reg: usize,
+    resolved: &ResolvedOperator,
+    resolver: &Resolver,
+) -> Result<usize> {
+    let func = resolver
+        .resolve_function(&resolved.func_name, 2)?
+        .ok_or_else(|| {
+            LimboError::InternalError(format!("function not found: {}", resolved.func_name))
+        })?;
+    let (first, second) = if resolved.swap_args {
+        (rhs_reg, lhs_reg)
+    } else {
+        (lhs_reg, rhs_reg)
+    };
+    let args = program.alloc_registers(2);
+    program.emit_insn(Insn::Copy {
+        src_reg: first,
+        dst_reg: args,
+        extra_amount: 0,
+    });
+    program.emit_insn(Insn::Copy {
+        src_reg: second,
+        dst_reg: args + 1,
+        extra_amount: 0,
+    });
+    let result_reg = program.alloc_register();
+    program.emit_insn(Insn::Function {
+        constant_mask: 0,
+        start_reg: args,
         dest: result_reg,
         func: FuncCtx { func, arg_count: 2 },
     });
@@ -182,19 +243,30 @@ pub(super) fn literal_compatible_with_value_type(
         || literal_type.eq_ignore_ascii_case(value_input_type)
 }
 
-/// Which operand of a binary expression needs encoding before the operator call.
+/// Which operand of a binary expression is the one that is not the custom type column.
 pub(super) enum EncodeArg {
-    /// Encode the first argument (e1 is a literal, e2 is the custom type column)
+    /// The first argument (e1 is the operand, e2 is the custom type column)
     First,
-    /// Encode the second argument (e1 is the custom type column, e2 is a literal)
+    /// The second argument (e1 is the custom type column, e2 is the operand)
     Second,
 }
 
-/// Info needed to encode a literal argument for an operator call.
+/// The column an operand meets, and which operand it is (only mutant
+/// `operand_keeps_column_typmod` encodes the operand with it).
 pub(super) struct OperatorEncodeInfo {
     column: Column,
     type_def: Arc<TypeDef>,
     which: EncodeArg,
+}
+
+/// The column an operand meets, for mutant `operand_keeps_column_typmod` alone: built in test
+/// builds only (engine review 16 #22: a `Column` clone per prepare that production never read).
+fn encode_info(column: &Column, type_def: &Arc<TypeDef>, which: EncodeArg) -> Option<OperatorEncodeInfo> {
+    cfg!(test).then(|| OperatorEncodeInfo {
+        column: column.clone(),
+        type_def: type_def.clone(),
+        which,
+    })
 }
 
 /// Result of resolving a custom type operator. May be a direct match or derived
@@ -203,7 +275,7 @@ pub(super) struct ResolvedOperator {
     func_name: String,
     swap_args: bool,
     negate: bool,
-    /// If a literal operand needs encoding before the operator call.
+    /// When one operand is not a custom type column: which, and the column it meets.
     encode_info: Option<OperatorEncodeInfo>,
 }
 
@@ -211,11 +283,13 @@ pub(super) struct ResolvedOperator {
 ///
 /// Operators fire when:
 /// 1. Both operands are columns of the same custom type, OR
-/// 2. One operand is a custom type column and the other is a literal whose type
-///    is compatible with the custom type's `value` input type.
+/// 2. One operand is a custom type column and the other a compatible operand
+///    (`operand_compatible`): a literal (through parentheses and a sign) or a CAST
+///    whose type is compatible with the custom type's `value` input type, or a bound
+///    parameter. Any other operand gets the standard comparison.
 ///
-/// When case 2 applies, the literal is encoded before being passed to the operator
-/// function so both arguments are in the same (encoded) representation.
+/// Both arguments reach the function as user-facing values: the column decoded, the
+/// operand as given (`emit_custom_type_operator`).
 pub(super) fn find_custom_type_operator(
     e1: &ast::Expr,
     e2: &ast::Expr,
@@ -276,47 +350,140 @@ pub(super) fn find_custom_type_operator(
         return None;
     }
 
-    // Case 2: LHS is custom type, RHS is a compatible literal.
+    // Case 2: LHS is custom type, RHS is a constant operand.
     if let Some(ref lhs) = lhs_info {
-        if let Some(lit_type) = literal_type_name(e2) {
-            if literal_compatible_with_value_type(lit_type, lhs.type_def.value_input_type()) {
-                if let Some((func_name, swap_args, negate)) = find_in_type_def(&lhs.type_def) {
-                    return Some(ResolvedOperator {
-                        func_name,
-                        swap_args,
-                        negate,
-                        encode_info: Some(OperatorEncodeInfo {
-                            column: lhs.column.clone(),
-                            type_def: lhs.type_def.clone(),
-                            which: EncodeArg::Second,
-                        }),
-                    });
-                }
+        if operand_compatible(e2, lhs.type_def.value_input_type(), resolver) {
+            if let Some((func_name, swap_args, negate)) = find_in_type_def(&lhs.type_def) {
+                return Some(ResolvedOperator {
+                    func_name,
+                    swap_args,
+                    negate,
+                    encode_info: encode_info(&lhs.column, &lhs.type_def, EncodeArg::Second),
+                });
             }
         }
     }
 
-    // Case 3: RHS is custom type, LHS is a compatible literal (reversed).
+    // Case 3: RHS is custom type, LHS is a constant operand (reversed).
     if let Some(ref rhs) = rhs_info {
-        if let Some(lit_type) = literal_type_name(e1) {
-            if literal_compatible_with_value_type(lit_type, rhs.type_def.value_input_type()) {
-                if let Some((func_name, swap_args, negate)) = find_in_type_def(&rhs.type_def) {
-                    return Some(ResolvedOperator {
-                        func_name,
-                        swap_args,
-                        negate,
-                        encode_info: Some(OperatorEncodeInfo {
-                            column: rhs.column.clone(),
-                            type_def: rhs.type_def.clone(),
-                            which: EncodeArg::First,
-                        }),
-                    });
-                }
+        if operand_compatible(e1, rhs.type_def.value_input_type(), resolver) {
+            if let Some((func_name, swap_args, negate)) = find_in_type_def(&rhs.type_def) {
+                return Some(ResolvedOperator {
+                    func_name,
+                    swap_args,
+                    negate,
+                    encode_info: encode_info(&rhs.column, &rhs.type_def, EncodeArg::First),
+                });
             }
         }
     }
 
     None
+}
+
+/// The function a custom type's '=' calls: `find_custom_type_operator`'s direct match, the type's
+/// first '=' operator (None when that one is naked, or when there is none).
+pub(crate) fn type_eq_function(type_def: &TypeDef) -> Option<&str> {
+    type_def
+        .operators()
+        .iter()
+        .find(|op_def| op_def.op == "=")
+        .and_then(|op_def| op_def.func_name.as_deref())
+}
+
+/// The '=' function that checks an index seek on a column of this type (engine review 16 HIGH 2):
+/// for a type with a function '=', the seek key's ENCODE runs in a catch region and must round-trip
+/// under that function, or the seek is empty (`main_loop/seek.rs`), and the equality's WHERE term
+/// stays unconsumed, so the type's operator re-checks every row the seek returns
+/// (`optimizer::mark_seek_constraints_consumed`): a seek answers as a scan does. None for a type
+/// whose '=' is naked or absent: its seek keys by the encoding alone, as before. Mutant
+/// `seek_key_encodes_raising` (test builds only): None for every type, so the key is ENCODEd in
+/// place, raising and losing precision, and the term is consumed.
+pub(crate) fn seek_key_eq_function(type_def: &TypeDef) -> Option<&str> {
+    let eq = type_eq_function(type_def);
+    if eq.is_none() || crate::branch::store::fe_mutant("seek_key_encodes_raising") {
+        return None;
+    }
+    eq
+}
+
+/// Whether `expr` is passed to an operator of a custom type whose `value` input type is
+/// `value_input_type`: an operand whose type is known before it runs and is compatible
+/// (`typed_operand_compatible`: a literal, through its parentheses and sign, or a CAST to a
+/// compatible type), or a bound parameter, whose value's type is known only when it runs
+/// (fastest-wire, wire review 2 item 3: a parameter got the plain comparison, so `code = $1` from
+/// every extended-protocol client missed what the literal finds). A type whose input is `any`
+/// (numeric) takes any constant but a COLLATE one: there is no type to check. Anything else, a
+/// function call, a concatenation, a COLLATE operand, takes the plain comparison, as an
+/// incompatible literal does (engine review 16 MED 10: 2fa04254c passed every constant
+/// unchecked, so `v = ('abc')` raised in
+/// the operator where `v = 'abc'` compared plainly, and a COLLATE was dropped). Mutant
+/// `param_skips_type_operator` (test builds only): a parameter is not one, as before 6b. Mutant
+/// `operand_any_constant` (test builds only): any constant is one, as 2fa04254c had it.
+fn operand_compatible(expr: &ast::Expr, value_input_type: &str, resolver: &Resolver) -> bool {
+    if matches!(expr, ast::Expr::Variable(_)) {
+        return !crate::branch::store::fe_mutant("param_skips_type_operator");
+    }
+    typed_operand_compatible(expr, value_input_type)
+        || (value_input_type.eq_ignore_ascii_case("any")
+            && !matches!(expr, ast::Expr::Literal(_) | ast::Expr::Collate(..))
+            && expr.is_constant(resolver))
+        || (crate::branch::store::fe_mutant("operand_any_constant")
+            && !matches!(expr, ast::Expr::Literal(_))
+            && expr.is_constant(resolver))
+}
+
+/// Whether an operand whose type is known before it runs is of a type compatible with a custom
+/// type's `value` input type: a literal (`literal_type_name`), the same through parentheses
+/// around one expression, a sign on a numeric literal, or a CAST, by its target type
+/// (`cast_type_compatible`). False for everything else (engine review 16 MED 10).
+fn typed_operand_compatible(expr: &ast::Expr, value_input_type: &str) -> bool {
+    match expr {
+        ast::Expr::Literal(_) => literal_type_name(expr)
+            .is_some_and(|t| literal_compatible_with_value_type(t, value_input_type)),
+        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
+            typed_operand_compatible(&exprs[0], value_input_type)
+        }
+        ast::Expr::Unary(ast::UnaryOperator::Negative | ast::UnaryOperator::Positive, inner) => {
+            is_signed_numeric_literal(inner) && typed_operand_compatible(inner, value_input_type)
+        }
+        ast::Expr::Cast {
+            type_name: Some(type_name),
+            ..
+        } => cast_type_compatible(&type_name.name, value_input_type),
+        _ => false,
+    }
+}
+
+/// A numeric literal, possibly parenthesized or signed: what a sign keeps the literal's type for
+/// (`-'abc'` is not text, so a sign on anything else qualifies nothing).
+fn is_signed_numeric_literal(expr: &ast::Expr) -> bool {
+    match expr {
+        ast::Expr::Literal(ast::Literal::Numeric(_)) => true,
+        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => is_signed_numeric_literal(&exprs[0]),
+        ast::Expr::Unary(ast::UnaryOperator::Negative | ast::UnaryOperator::Positive, inner) => {
+            is_signed_numeric_literal(inner)
+        }
+        _ => false,
+    }
+}
+
+/// Whether a CAST to `cast_type` yields a value of a custom type's `value` input type: the input
+/// is `any`, or names the CAST's type, or names the class of the CAST's affinity (INT -> integer,
+/// VARCHAR -> text, DOUBLE -> real, BLOB -> blob). A NUMERIC CAST has no single class.
+fn cast_type_compatible(cast_type: &str, value_input_type: &str) -> bool {
+    if value_input_type.eq_ignore_ascii_case("any") || cast_type.eq_ignore_ascii_case(value_input_type)
+    {
+        return true;
+    }
+    let class = match crate::vdbe::affinity::Affinity::affinity(cast_type) {
+        crate::vdbe::affinity::Affinity::Integer => "integer",
+        crate::vdbe::affinity::Affinity::Text => "text",
+        crate::vdbe::affinity::Affinity::Real => "real",
+        crate::vdbe::affinity::Affinity::Blob => "blob",
+        _ => return false,
+    };
+    class.eq_ignore_ascii_case(value_input_type)
 }
 
 /// Evaluate an expression-index expression in a DML context (INSERT/UPDATE/UPSERT).
@@ -602,4 +769,710 @@ pub(crate) fn emit_trigger_decode_registers(
         })
         .chain(std::iter::once(Ok(rowid_reg)))
         .collect::<Result<Vec<usize>>>()
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Database, DatabaseOpts, MemoryIO, OpenFlags, SqliteDialect, Value, IO};
+    use std::sync::Arc;
+
+    fn open() -> Arc<crate::Connection> {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file_with_flags(
+            io,
+            ":memory:",
+            OpenFlags::Create,
+            DatabaseOpts::new().with_custom_types(true),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        db.connect().unwrap()
+    }
+
+    fn count(conn: &Arc<crate::Connection>, sql: &str, param: Option<Value>) -> crate::Result<i64> {
+        let mut stmt = conn.prepare(sql)?;
+        if let Some(value) = param {
+            stmt.bind_at(1.try_into().unwrap(), value)?;
+        }
+        let rows = stmt.run_collect_rows()?;
+        Ok(rows[0][0].as_int().expect("a count"))
+    }
+
+    /// fastest-wire (wire review 2 item 3, 6b (a)): a bound parameter compared with a custom-type
+    /// column got the plain comparison, not the type's operator, so a numeric column (stored
+    /// encoded) never equalled `?1` bound to the very value a literal finds. A parameter is treated
+    /// as a literal of the type's value input type: passed to the operator as given (2fa04254c;
+    /// engine review 16 #20). The `maxlen IS NULL` arm of the ENCODE below is vestigial since then,
+    /// no operand being encoded, and stays as written. Mutant `param_skips_type_operator`.
+    #[test]
+    fn a_parameter_compared_with_a_custom_type_column_uses_its_operator() {
+        let conn = open();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x numeric(10, 2)) STRICT")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 1.5)").unwrap();
+        assert_eq!(
+            count(&conn, "SELECT count(*) FROM t WHERE x = 1.5", None).unwrap(),
+            1,
+            "premise: the literal finds the row"
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT count(*) FROM t WHERE x = ?1",
+                Some(Value::from_f64(1.5))
+            )
+            .unwrap(),
+            1,
+            "a bound parameter did not find the row the same literal finds"
+        );
+    }
+
+    /// fastest-wire (6b (b)): a comparison operand was encoded with the column's own parameters,
+    /// so a value longer than a length-checked type's length raised 'value too long' where
+    /// PostgreSQL compares (a comparison operand is coerced to the type with no typmod) and answers
+    /// false. The operand now reaches the type's operator as given, never encoded (engine review 14
+    /// HIGH 1). The type's '=' is `instr`, which finds what a plain '=' does not ('b' in 'abc'), so
+    /// the test sees that a literal and a parameter reach it. Mutant `operand_keeps_column_typmod`.
+    #[test]
+    fn an_over_length_comparison_operand_compares_instead_of_raising() {
+        let conn = open();
+        conn.execute(
+            "CREATE TYPE tag(value text, maxlen integer) BASE text ENCODE CASE WHEN maxlen IS NULL \
+             THEN value WHEN length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long \
+             for type tag') END DECODE value OPERATOR '=' instr",
+        )
+        .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v tag(3)) STRICT")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'abc')").unwrap();
+        assert!(
+            conn.execute("INSERT INTO t VALUES (2, 'abcdef')").is_err(),
+            "premise: the column's own length check refuses an over-length value"
+        );
+        assert_eq!(
+            count(&conn, "SELECT count(*) FROM t WHERE v = 'abc'", None).unwrap(),
+            1,
+            "premise: equal finds it"
+        );
+        assert_eq!(
+            count(&conn, "SELECT count(*) FROM t WHERE v = 'b'", None).unwrap(),
+            1,
+            "premise: a literal reaches the type's '=' (instr), where a plain '=' finds nothing"
+        );
+        let inner = count(
+            &conn,
+            "SELECT count(*) FROM t WHERE v = ?1",
+            Some(Value::build_text("b")),
+        );
+        assert!(
+            matches!(inner, Ok(1)),
+            "premise: a parameter reaches the type's '=': {inner:?}"
+        );
+        let literal = count(&conn, "SELECT count(*) FROM t WHERE v = 'abcdef'", None);
+        assert!(
+            matches!(literal, Ok(0)),
+            "an over-length literal raised or matched: {literal:?}"
+        );
+        let param = count(
+            &conn,
+            "SELECT count(*) FROM t WHERE v = ?1",
+            Some(Value::build_text("abcdef")),
+        );
+        assert!(
+            matches!(param, Ok(0)),
+            "an over-length parameter raised or matched: {param:?}"
+        );
+    }
+
+    fn exec(conn: &Arc<crate::Connection>, sql: &str, params: &[Value]) -> crate::Result<()> {
+        let mut stmt = conn.prepare(sql)?;
+        for (i, value) in params.iter().enumerate() {
+            stmt.bind_at((i + 1).try_into().unwrap(), value.clone())?;
+        }
+        stmt.run_ignore_rows()
+    }
+
+    /// Engine review 16 #21, rewritten for engine review 20 HIGH 2 (FLAGGED, review-directed): a
+    /// blob operand reaches numeric's operators as given, and they read a blob as the type's
+    /// internal encoding, so `x = <blob>` compared the column with a value no INSERT could have
+    /// stored (INSERT refuses every blob). It must be refused as that INSERT is, literal and bound.
+    /// The first version used X'00', which `blob_to_bigdecimal` refuses as too short (under 14
+    /// bytes), so it passed at its own sha and could not discriminate; this one uses a well-formed
+    /// 18-byte encoding of 10.00 (version 1, scale 2, one limb of 1000), which the decoder accepts,
+    /// so `x = <it>` matches row 1 unless the operand is refused. X'00' stays only as a premise.
+    #[test]
+    fn a_blob_operand_of_numeric_is_refused_as_its_insert_is() {
+        const TEN: [u8; 18] = [1, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0xE8, 3, 0, 0];
+        assert!(
+            crate::numeric::decimal::blob_to_bigdecimal(&TEN).is_ok(),
+            "premise: the blob is a well-formed numeric encoding"
+        );
+        assert!(
+            crate::numeric::decimal::blob_to_bigdecimal(&[0]).is_err(),
+            "premise: X'00' is refused by the decoder itself"
+        );
+        let conn = open();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x numeric(10, 2)) STRICT")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 10.00)").unwrap();
+        let insert = conn.execute("INSERT INTO t VALUES (2, X'0100020000000000000001000000E8030000')");
+        assert!(insert.is_err(), "premise: numeric refuses to store a blob, even its own encoding");
+        for (sql, param) in [
+            ("x = X'0100020000000000000001000000E8030000'", None),
+            ("x = ?1", Some(Value::from_slice(&TEN).unwrap())),
+        ] {
+            let got = count(&conn, &format!("SELECT count(*) FROM t WHERE {sql}"), param);
+            assert!(
+                got.is_err(),
+                "CLAIM: {sql} with a blob operand gave {got:?}, where an INSERT of that blob is refused"
+            );
+        }
+    }
+
+    /// Engine review 14 HIGH 1: 6b (a) encoded every bound operand of a custom type's operator
+    /// with the COLUMN's parameters, so on numeric(10, 2) a parameter was truncated to two places
+    /// and refused past ten digits, in arithmetic as well as comparisons: `x * ?1` with 1.075
+    /// stored 10.70, `x / ?1` with 0.001 divided by zero, `x = ?1` with 1.509 matched 1.50, and
+    /// `x < ?1` with 1e9 raised. The operator takes its operand as given (the column reaches it
+    /// decoded). Mutant `operand_keeps_column_typmod`.
+    #[test]
+    fn a_numeric_operand_keeps_its_own_precision() {
+        let conn = open();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x numeric(10, 2)) STRICT")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 10.00), (2, 12.34), (3, 1.50)")
+            .unwrap();
+        let at = |id: i64, literal: &str| {
+            count(
+                &conn,
+                &format!("SELECT count(*) FROM t WHERE id = {id} AND x = {literal}"),
+                None,
+            )
+        };
+        assert!(matches!(at(3, "1.50"), Ok(1)), "premise: a literal finds row 3");
+        let mul = exec(&conn, "UPDATE t SET x = x * ?1 WHERE id = 1", &[Value::from_f64(1.075)]);
+        assert!(
+            mul.is_ok() && matches!(at(1, "10.75"), Ok(1)),
+            "x * ?1 with 1.075 did not store 10.75: {mul:?}"
+        );
+        let div = exec(&conn, "UPDATE t SET x = x / ?1 WHERE id = 2", &[Value::from_f64(0.001)]);
+        assert!(
+            div.is_ok() && matches!(at(2, "12340"), Ok(1)),
+            "x / ?1 with 0.001 did not store 12340: {div:?}"
+        );
+        for (sql, param, want) in [
+            ("x = ?1", 1.509, 0),
+            ("x >= ?1", 1.501, 0),
+            ("x < ?1", 1e9, 1),
+        ] {
+            let got = count(
+                &conn,
+                &format!("SELECT count(*) FROM t WHERE id = 3 AND {sql}"),
+                Some(Value::from_f64(param)),
+            );
+            assert!(
+                matches!(got, Ok(n) if n == want),
+                "{sql} with {param} on 1.50 gave {got:?}, not {want}"
+            );
+        }
+    }
+
+    /// The `EXPLAIN QUERY PLAN` lines of `sql`, for a premise on the plan the planner chose.
+    fn plan(conn: &Arc<crate::Connection>, sql: &str) -> Vec<String> {
+        conn.prepare(format!("EXPLAIN QUERY PLAN {sql}"))
+            .and_then(|mut stmt| stmt.run_collect_rows())
+            .expect("premise: the plan is explained")
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect()
+    }
+
+    /// Whether `sql` searches `table` through `index`.
+    fn seeks(conn: &Arc<crate::Connection>, sql: &str, table: &str, index: &str) -> bool {
+        plan(conn, sql).iter().any(|line| {
+            line.contains(&format!("SEARCH {table} USING")) && line.contains(&format!("INDEX {index}"))
+        })
+    }
+
+    /// Whether `sql` scans `table`.
+    fn scans(conn: &Arc<crate::Connection>, sql: &str, table: &str) -> bool {
+        plan(conn, sql)
+            .iter()
+            .any(|line| line.contains(&format!("SCAN {table}")))
+    }
+
+    /// Each `(predicate, parameter, rows)` answers `rows` through a seek of `index` and through a
+    /// scan (NOT INDEXED) of `table`, each plan asserted as a premise.
+    fn answers_by_both_plans(
+        conn: &Arc<crate::Connection>,
+        table: &str,
+        index: &str,
+        cases: &[(&str, Option<Value>, i64)],
+    ) {
+        for (pred, param, want) in cases {
+            let seek = format!("SELECT count(*) FROM {table} WHERE {pred}");
+            let scan = format!("SELECT count(*) FROM {table} NOT INDEXED WHERE {pred}");
+            assert!(
+                seeks(conn, &seek, table, index),
+                "premise: {seek} seeks index {index}: {:?}",
+                plan(conn, &seek)
+            );
+            assert!(
+                scans(conn, &scan, table),
+                "premise: {scan} scans: {:?}",
+                plan(conn, &scan)
+            );
+            let by_scan = count(conn, &scan, param.clone());
+            assert!(
+                matches!(by_scan, Ok(n) if n == *want),
+                "premise: the scan answers {want} for {pred} ({param:?}): {by_scan:?}"
+            );
+            let by_seek = count(conn, &seek, param.clone());
+            assert!(
+                matches!(by_seek, Ok(n) if n == *want),
+                "the seek of {index} answered {by_seek:?} for {pred} ({param:?}), the scan {want}"
+            );
+        }
+    }
+
+    /// Engine review 16 HIGH 2 (review 14 MED 6): the seek path ENCODEs an equality's key with the
+    /// column's parameters and consumes the term, so the type's operator never re-checks a row the
+    /// seek returns, while a scan passes the operand to the operator as given (2fa04254c). On
+    /// numeric(10, 2) with an index on x, `x = 1.501` matched 1.50 through the seek (the key was cut
+    /// to the scale), and `x = ?1` bound to 1e9 raised "numeric value out of range"; a scan answers
+    /// 0 for both, which is PostgreSQL's answer. The index arm of
+    /// `a_numeric_operand_keeps_its_own_precision`. Mutant `seek_key_encodes_raising`.
+    #[test]
+    fn an_indexed_numeric_equality_answers_as_a_scan_does() {
+        let conn = open();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x numeric(10, 2)) STRICT")
+            .unwrap();
+        conn.execute("CREATE INDEX tx ON t(x)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 10.00), (2, 12.34), (3, 1.50)")
+            .unwrap();
+        answers_by_both_plans(
+            &conn,
+            "t",
+            "tx",
+            &[
+                ("x = 1.50", None, 1),
+                ("x = ?1", Some(Value::from_f64(1.5)), 1),
+                ("x = 1.501", None, 0),
+                ("x = ?1", Some(Value::from_f64(1.509)), 0),
+                ("x = 1e9", None, 0),
+                ("x = ?1", Some(Value::from_f64(1e9)), 0),
+            ],
+        );
+    }
+
+    /// Register the type `sql` creates as a built-in type, as the wire registers its bpchar.
+    fn register_built_in(conn: &Arc<crate::Connection>, sql: &str) {
+        let mut parser = turso_parser::parser::Parser::new(sql.as_bytes());
+        let Ok(Some(turso_parser::ast::Cmd::Stmt(turso_parser::ast::Stmt::CreateType {
+            type_name, body, ..
+        }))) = parser.next_cmd()
+        else {
+            panic!("premise: the type parses");
+        };
+        let def = crate::schema::TypeDef::from_create_type(&type_name, &body, true, sql.to_string())
+            .unwrap();
+        conn.with_schema_mut(|schema| {
+            schema
+                .type_registry
+                .insert(type_name.to_lowercase(), Arc::new(def))
+        })
+        .unwrap();
+    }
+
+    /// Engine review 16 HIGH 2 (review 14 MED 6): a length-checked type with a function '=' and a
+    /// UNIQUE index on the column: the seek ENCODEs an over-length key with the column's length and
+    /// raises 'value too long', where a scan compares it, false, and answers 0 rows (the wire's
+    /// `code = $1` shape). The UNIQUE v arm of
+    /// `an_over_length_comparison_operand_compares_instead_of_raising` (a user type, t) and of
+    /// `a_built_in_length_checked_type_compares_an_over_length_operand` (registered built-in, u).
+    /// Mutant `seek_key_encodes_raising`. FLAGGED TEST EDIT (engine review 20 HIGH 3, as review 14
+    /// MED 6 prescribed): both types gained a bare `OPERATOR '<'`, without which no index can be
+    /// created on them (index.rs refuses it), so the test panicked at its CREATE INDEX at its
+    /// parent and at its fix alike; the CREATE INDEX is now an asserted premise.
+    #[test]
+    fn an_indexed_length_checked_type_compares_an_over_length_operand() {
+        let conn = open();
+        conn.execute(
+            "CREATE TYPE tag(value text, maxlen integer) BASE text ENCODE CASE WHEN maxlen IS NULL \
+             THEN value WHEN length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long \
+             for type tag') END DECODE value OPERATOR '<' OPERATOR '=' instr",
+        )
+        .unwrap();
+        register_built_in(
+            &conn,
+            "CREATE TYPE bpc(value text, maxlen integer) BASE text ENCODE CASE WHEN length(value) \
+             <= maxlen THEN value ELSE RAISE(ABORT, 'value too long for type bpc') END DECODE \
+             value OPERATOR '<' OPERATOR '=' instr",
+        );
+        for (table, ty, index) in [("t", "tag(3)", "tv"), ("u", "bpc(3)", "uv")] {
+            conn.execute(format!(
+                "CREATE TABLE {table}(id INTEGER PRIMARY KEY, v {ty}) STRICT"
+            ))
+            .unwrap();
+            let indexed = conn.execute(format!("CREATE UNIQUE INDEX {index} ON {table}(v)"));
+            assert!(
+                indexed.is_ok(),
+                "premise: {ty} takes an index (a bare OPERATOR '<' orders it): {indexed:?}"
+            );
+            conn.execute(format!("INSERT INTO {table} VALUES (1, 'abc')"))
+                .unwrap();
+            assert!(
+                conn.execute(format!("INSERT INTO {table} VALUES (2, 'abcdef')"))
+                    .is_err(),
+                "premise: {ty}'s own length check refuses an over-length value"
+            );
+            answers_by_both_plans(
+                &conn,
+                table,
+                index,
+                &[
+                    ("v = 'abc'", None, 1),
+                    ("v = ?1", Some(Value::build_text("abc")), 1),
+                    ("v = 'abcdef'", None, 0),
+                    ("v = ?1", Some(Value::build_text("abcdef")), 0),
+                ],
+            );
+        }
+    }
+
+    /// Engine review 14 HIGH 2: 6b (b) bound every user type's parameters to NULL when encoding a
+    /// comparison operand, on a contract nothing states: the documented length-check ENCODE then
+    /// raised on every comparison, a user copy of numeric raised "precision must be an integer",
+    /// and a substr-shaped ENCODE turned the operand into NULL and matched nothing. A user type
+    /// keeps its parameters' meaning; its operator's operand is not encoded at all (HIGH 1).
+    #[test]
+    fn a_user_types_operator_does_not_unbind_its_parameters() {
+        let conn = open();
+        conn.execute(
+            "CREATE TYPE tag2(value text, maxlen integer) BASE text ENCODE CASE WHEN \
+             length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long for type tag2') \
+             END DECODE value OPERATOR '=' instr",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TYPE money(value any, precision integer, scale integer) BASE blob ENCODE \
+             numeric_encode(value, precision, scale) DECODE numeric_decode(value) OPERATOR '+' \
+             numeric_add OPERATOR '<' numeric_lt OPERATOR '=' numeric_eq",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TYPE short(value text, len integer) BASE text ENCODE substr(value, 1, len) \
+             DECODE value OPERATOR '=' instr",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, v tag2(3), m money(10, 2), s short(3)) STRICT",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'abc', 1.5, 'abcdef')")
+            .unwrap();
+        let tag = count(&conn, "SELECT count(*) FROM t WHERE v = 'abc'", None);
+        assert!(matches!(tag, Ok(1)), "a length-checked user type's comparison gave {tag:?}");
+        let eq = count(&conn, "SELECT count(*) FROM t WHERE m = 1.5", None);
+        assert!(matches!(eq, Ok(1)), "a user numeric's m = 1.5 gave {eq:?}");
+        let lt = count(&conn, "SELECT count(*) FROM t WHERE m < ?1", Some(Value::from_f64(2.0)));
+        assert!(matches!(lt, Ok(1)), "a user numeric's m < ?1 gave {lt:?}");
+        let add = conn.prepare("SELECT m + 1 FROM t").and_then(|mut s| s.run_collect_rows());
+        assert!(add.is_ok(), "a user numeric's m + 1 raised: {add:?}");
+        let short = count(&conn, "SELECT count(*) FROM t WHERE s = 'abc'", None);
+        assert!(matches!(short, Ok(1)), "a substr-encoded user type's comparison gave {short:?}");
+    }
+
+    /// Engine review 14 HIGH 3: a type registered as built-in (the wire's bpchar: a length check
+    /// and a function '=') never took 6b (b)'s unconstrained path, and 6b (a) sent a bound
+    /// parameter through its length-checking ENCODE too: an over-length parameter raised 'value
+    /// too long' where PostgreSQL, and this code before 6b, answer no rows. Both an over-length
+    /// literal and parameter compare, false.
+    #[test]
+    fn a_built_in_length_checked_type_compares_an_over_length_operand() {
+        let conn = open();
+        let sql = "CREATE TYPE bpc(value text, maxlen integer) BASE text ENCODE CASE WHEN \
+                   length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long for type \
+                   bpc') END DECODE value OPERATOR '=' instr";
+        let mut parser = turso_parser::parser::Parser::new(sql.as_bytes());
+        let Ok(Some(turso_parser::ast::Cmd::Stmt(turso_parser::ast::Stmt::CreateType {
+            type_name, body, ..
+        }))) = parser.next_cmd()
+        else {
+            panic!("premise: the type parses");
+        };
+        let def = crate::schema::TypeDef::from_create_type(&type_name, &body, true, sql.to_string())
+            .unwrap();
+        conn.with_schema_mut(|schema| {
+            schema
+                .type_registry
+                .insert(type_name.to_lowercase(), Arc::new(def))
+        })
+        .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v bpc(3)) STRICT")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'abc')").unwrap();
+        assert!(
+            conn.execute("INSERT INTO t VALUES (2, 'abcdef')").is_err(),
+            "premise: the built-in type's own length check refuses an over-length value"
+        );
+        let literal = count(&conn, "SELECT count(*) FROM t WHERE v = 'abcdef'", None);
+        assert!(matches!(literal, Ok(0)), "an over-length literal gave {literal:?}");
+        let param = count(
+            &conn,
+            "SELECT count(*) FROM t WHERE v = ?1",
+            Some(Value::build_text("abcdef")),
+        );
+        assert!(matches!(param, Ok(0)), "an over-length parameter gave {param:?}");
+    }
+
+    /// Engine review 14 HIGH 4: NULL bypasses ENCODE and DECODE (create-type.mdx), as the INSERT
+    /// and seek paths keep it, but 6b (a) sent a NULL parameter into the operator path's ENCODE
+    /// unguarded: any ENCODE ending in `ELSE RAISE` raised on `col < ?1` bound NULL, where the
+    /// comparison is NULL and selects no row. Kept as a regression guard.
+    #[test]
+    fn a_null_parameter_never_reaches_a_types_encode() {
+        let conn = open();
+        conn.execute(
+            "CREATE TYPE pint(value integer) BASE integer ENCODE CASE WHEN value > 0 THEN value \
+             ELSE RAISE(ABORT, 'pint must be positive') END DECODE value OPERATOR '<' numeric_lt",
+        )
+        .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v pint) STRICT")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 5)").unwrap();
+        assert!(
+            matches!(count(&conn, "SELECT count(*) FROM t WHERE v < 7", None), Ok(1)),
+            "premise: the type's operator compares"
+        );
+        for sql in ["v < ?1", "v >= ?1"] {
+            let got = count(
+                &conn,
+                &format!("SELECT count(*) FROM t WHERE {sql}"),
+                Some(Value::Null),
+            );
+            assert!(matches!(got, Ok(0)), "{sql} bound NULL gave {got:?}");
+        }
+    }
+
+    /// Engine review 16 MED 10: since 2fa04254c an operand qualifies for a custom type's operator
+    /// if it is a compatible literal or ANY constant, so only a bare literal is type-checked:
+    /// `v = ('abc')`, `v = CAST('abc' AS TEXT)` and `v = 'ab' || 'c'` reach numeric_eq on an
+    /// integer-valued type and raise, where `v = 'abc'` (a text literal, not the type's value
+    /// input) takes the plain comparison and answers no row; and `w = 'ABC' COLLATE NOCASE` reaches
+    /// the type's operator, which drops the collation. An operand is checked through its
+    /// parentheses, its sign and a CAST's target type; a COLLATE operand takes the plain
+    /// comparison, which honours it. Mutant `operand_any_constant`.
+    #[test]
+    fn an_operand_qualifies_for_a_types_operator_by_its_own_type() {
+        let conn = open();
+        conn.execute(
+            "CREATE TYPE pint(value integer) BASE integer ENCODE value DECODE value OPERATOR '=' \
+             numeric_eq",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TYPE tag(value text, maxlen integer) BASE text ENCODE CASE WHEN maxlen IS NULL \
+             THEN value WHEN length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long \
+             for type tag') END DECODE value OPERATOR '=' instr",
+        )
+        .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v pint, w tag(3)) STRICT")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 5, 'abc')").unwrap();
+        let plain = count(&conn, "SELECT count(*) FROM t WHERE v = 'abc'", None);
+        assert!(
+            matches!(plain, Ok(0)),
+            "premise: a text literal takes the plain comparison: {plain:?}"
+        );
+        for operand in ["('abc')", "(('abc'))", "CAST('abc' AS TEXT)", "'ab' || 'c'"] {
+            let got = count(
+                &conn,
+                &format!("SELECT count(*) FROM t WHERE v = {operand}"),
+                None,
+            );
+            assert!(
+                matches!(got, Ok(0)),
+                "v = {operand} answered {got:?}, where v = 'abc' answers Ok(0)"
+            );
+        }
+        assert!(
+            matches!(count(&conn, "SELECT count(*) FROM t WHERE w = 'b'", None), Ok(1)),
+            "premise: a text literal reaches tag's '=' (instr), which finds 'b' in 'abc'"
+        );
+        let collated = count(
+            &conn,
+            "SELECT count(*) FROM t WHERE w = 'ABC' COLLATE NOCASE",
+            None,
+        );
+        assert!(
+            matches!(collated, Ok(1)),
+            "w = 'ABC' COLLATE NOCASE answered {collated:?}: the collation was dropped"
+        );
+    }
+
+    /// Engine review 16 MED 10's other half: the type check must not shut out an operand of the
+    /// type's value input type that is not a bare literal. A signed literal (`v = -1`, `v = (+7)`)
+    /// and a CAST to the value input type reach the type's operator; here '=' is `max`, which a
+    /// plain comparison is not (5 = -1 is false; max(5, -1) is 5, true). And numeric's operator
+    /// still compares `x = -1.5` with -1.50.
+    #[test]
+    fn a_signed_or_cast_operand_still_reaches_a_types_operator() {
+        let conn = open();
+        conn.execute(
+            "CREATE TYPE pmax(value integer) BASE integer ENCODE value DECODE value OPERATOR '=' \
+             max",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, v pmax, x numeric(10, 2)) STRICT",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 5, -1.50)").unwrap();
+        assert!(
+            matches!(count(&conn, "SELECT count(*) FROM t WHERE v = 1", None), Ok(1)),
+            "premise: a bare literal reaches pmax's '=' (max(5, 1) is true)"
+        );
+        for operand in ["-1", "(-1)", "(+7)", "- 3", "CAST(7 AS INTEGER)"] {
+            let got = count(
+                &conn,
+                &format!("SELECT count(*) FROM t WHERE v = {operand}"),
+                None,
+            );
+            assert!(
+                matches!(got, Ok(1)),
+                "v = {operand} answered {got:?}: it did not reach pmax's operator"
+            );
+        }
+        for (pred, want) in [("x = -1.5", 1), ("x = -1.509", 0), ("x = (-1.50)", 1)] {
+            let got = count(&conn, &format!("SELECT count(*) FROM t WHERE {pred}"), None);
+            assert!(
+                matches!(got, Ok(n) if n == want),
+                "{pred} on -1.50 answered {got:?}, not {want}"
+            );
+        }
+    }
+
+    /// Engine review 14 LOW 14: an IN list never consulted a custom type's operator (condition.rs
+    /// `translate_in_list` compares each element with a plain Eq), so `w IN ('b')` and
+    /// `x IN (?1)` answered differently from `w = 'b'` and `x = ?1`, for literals and parameters
+    /// alike. An IN list answers as the OR of its elements' `=`: on tag (whose '=' is instr)
+    /// `w IN ('b')` finds 'abc' as `w = 'b'` does, NOT IN inverts it, and numeric's IN agrees
+    /// with its '='. Mutant `in_list_skips_type_operator`.
+    #[test]
+    fn an_in_list_compares_with_the_types_operator() {
+        let conn = open();
+        conn.execute(
+            "CREATE TYPE tag(value text, maxlen integer) BASE text ENCODE CASE WHEN maxlen IS NULL \
+             THEN value WHEN length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long \
+             for type tag') END DECODE value OPERATOR '=' instr",
+        )
+        .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x numeric(10, 2), w tag(3)) STRICT")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 1.5, 'abc')").unwrap();
+        for (eq, in_list, param) in [
+            ("w = 'b'", "w IN ('b')", None),
+            ("w = 'b'", "w IN ('zz', 'b')", None),
+            ("w = ?1", "w IN (?1)", Some(Value::build_text("b"))),
+            ("NOT (w = 'b')", "w NOT IN ('b')", None),
+            ("x = ?1", "x IN (?1)", Some(Value::from_f64(1.5))),
+            ("x = 1.5", "x IN (7, 1.5)", None),
+            ("x = 1.501", "x IN (1.501)", None),
+        ] {
+            let by_eq = count(
+                &conn,
+                &format!("SELECT count(*) FROM t WHERE {eq}"),
+                param.clone(),
+            );
+            let by_in = count(
+                &conn,
+                &format!("SELECT count(*) FROM t WHERE {in_list}"),
+                param.clone(),
+            );
+            assert!(by_eq.is_ok(), "premise: {eq} answers: {by_eq:?}");
+            assert!(
+                matches!((&by_in, &by_eq), (Ok(a), Ok(b)) if a == b),
+                "{in_list} answered {by_in:?}, where {eq} answers {by_eq:?}"
+            );
+        }
+        assert!(
+            matches!(count(&conn, "SELECT count(*) FROM t WHERE w = 'b'", None), Ok(1)),
+            "premise: tag's '=' (instr) finds 'b' in 'abc'"
+        );
+    }
+
+    /// Engine review 16 MED 9: with the operand passed to numeric's operators as given
+    /// (2fa04254c), arithmetic with a literal takes the literal's own scale: 10.00 * 3 is 30.00
+    /// (PostgreSQL's scale, the sum of the operands'), not 30.0000 from the literal encoded as
+    /// 3.00; and 100.00 / 10 is 10.00, not 10. The UPDATE arms of
+    /// `a_numeric_operand_keeps_its_own_precision` store into numeric(10, 2), which hides the
+    /// result's scale; this reads it in the SELECT list. Division keeps the dividend's scale here,
+    /// where PostgreSQL answers 10.0000000000000000: a known divergence (fastest DECISIONS).
+    /// Mutant `operand_keeps_column_typmod`.
+    #[test]
+    fn numeric_arithmetic_in_the_select_list_keeps_the_operands_scale() {
+        let conn = open();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x numeric(10, 2)) STRICT")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 10), (2, 100), (3, -5)")
+            .unwrap();
+        for (sql, param, want) in [
+            ("SELECT x * 3 FROM t WHERE id = 1", None, "30.00"),
+            ("SELECT x * 3 FROM t WHERE id = 3", None, "-15.00"),
+            ("SELECT x / 10 FROM t WHERE id = 2", None, "10.00"),
+            ("SELECT x - 2 FROM t WHERE id = 2", None, "98.00"),
+            (
+                "SELECT x * ?1 FROM t WHERE id = 1",
+                Some(Value::from_f64(1.075)),
+                "10.75000",
+            ),
+        ] {
+            let got = conn.prepare(sql).and_then(|mut stmt| {
+                if let Some(value) = param {
+                    stmt.bind_at(1.try_into().unwrap(), value)?;
+                }
+                stmt.run_collect_rows()
+            });
+            assert!(
+                matches!(&got, Ok(rows) if rows.len() == 1 && rows[0][0].to_text() == Some(want)),
+                "{sql} gave {got:?}, not {want}"
+            );
+        }
+    }
+
+    /// Lead ruling 2026-10-09 on e52f01422 (a FIX item): numeric division takes PostgreSQL's
+    /// result scale (`select_div_scale` in numeric.c: at least NUMERIC_MIN_SIG_DIGITS = 16
+    /// significant digits, never below either operand's display scale, rounded half away from
+    /// zero), not bigdecimal's. The expectations are DERIVED from PostgreSQL's select_div_scale by
+    /// reading its source, not from our output (100.00 / 10: the first base-10000 digits give a
+    /// quotient weight of 0, so 16 decimal places; 1.00 / 3: 1 <= 3 lowers the weight to -1, so
+    /// 20). LOUD-OWED: replace each expectation by PostgreSQL 18's output for the same query,
+    /// verbatim. Mutant `div_scale_bigdecimal`.
+    #[test]
+    fn numeric_division_takes_postgresqls_result_scale() {
+        let conn = open();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x numeric(10, 2)) STRICT")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 100), (2, 30), (3, 1), (4, -2)")
+            .unwrap();
+        for (sql, want) in [
+            ("SELECT x / 10 FROM t WHERE id = 1", "10.0000000000000000"),
+            ("SELECT x / 10 FROM t WHERE id = 2", "3.0000000000000000"),
+            ("SELECT x / 3 FROM t WHERE id = 3", "0.33333333333333333333"),
+            ("SELECT x / 3 FROM t WHERE id = 4", "-0.66666666666666666667"),
+        ] {
+            let got = conn.prepare(sql).and_then(|mut stmt| stmt.run_collect_rows());
+            assert!(
+                matches!(&got, Ok(rows) if rows.len() == 1 && rows[0][0].to_text() == Some(want)),
+                "CLAIM: {sql} gave {got:?}, not PostgreSQL's {want}"
+            );
+        }
+    }
 }

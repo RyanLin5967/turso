@@ -281,6 +281,10 @@ pub struct ProgramBuilder {
     /// When set, `Expr::Id("value")` resolves to the register holding the input value,
     /// and type parameter names resolve to registers holding their concrete values.
     pub id_register_overrides: HashMap<String, usize>,
+    /// While an expression is translated inside a catch region ([Insn::CatchBegin]), the region's
+    /// target: a RAISE(ABORT|FAIL|ROLLBACK) jumps there instead of halting, so the refusal it
+    /// stands for leaves the statement running, as a function's refused value does.
+    pub catch_raise_target: Option<BranchOffset>,
     /// Hash join build signatures keyed by hash table id.
     hash_build_signatures: HashMap<usize, HashBuildSignature>,
     /// Hash tables to keep open across subplans (e.g. materialization).
@@ -730,6 +734,7 @@ impl ProgramBuilder {
             trigger_conflict_override: None,
             cursor_overrides: HashMap::default(),
             id_register_overrides: HashMap::default(),
+            catch_raise_target: None,
             hash_build_signatures: HashMap::default(),
             hash_tables_to_keep_open: BitSet::default(),
             subquery_result_regs: HashMap::default(),
@@ -1692,6 +1697,9 @@ impl ProgramBuilder {
                 Insn::ResetOnce { region_end, .. } => {
                     resolve(region_end, "ResetOnce")?;
                 }
+                Insn::CatchBegin { target_pc } => {
+                    resolve(target_pc, "CatchBegin")?;
+                }
                 Insn::Prev { pc_if_prev, .. } => {
                     resolve(pc_if_prev, "Prev")?;
                 }
@@ -2184,50 +2192,15 @@ impl ProgramBuilder {
             _ => column,
         };
 
-        let default = 'value: {
-            let default = match cursor_type {
-                CursorType::BTreeTable(btree) => &btree.columns()[column].default,
-                CursorType::BTreeIndex(index) => &index.columns[column].default,
-                CursorType::MaterializedView(btree, _) => &btree.columns()[column].default,
-                _ => break 'value None,
-            };
-
-            let Some(ref default_expr) = default else {
-                break 'value None;
-            };
-
-            // Try to constant-fold the default expression into a Value for the
-            // Column instruction. Non-constant defaults (e.g. DEFAULT (ABS(-5)))
-            // can't be folded and yield None here — that's correct: they are
-            // evaluated at INSERT time via translate_expr. The Column default
-            // only matters for pre-existing rows after ALTER TABLE ADD COLUMN,
-            // and ALTER TABLE already validates that the default is constant.
-            let mut value = match crate::translate::alter::eval_constant_default_value(default_expr)
-            {
-                Ok(v) => v,
-                Err(_) => break 'value None,
-            };
-
-            // Apply column affinity to the default value, matching SQLite's
-            // sqlite3ColumnDefault which calls sqlite3ValueFromExpr with
-            // pCol->affinity. This ensures e.g. ALTER TABLE ADD COLUMN c TEXT
-            // DEFAULT 0 returns text "0" rather than integer 0 for pre-existing rows.
-            let affinity = match cursor_type {
-                CursorType::BTreeTable(btree) => btree.columns()[column].affinity(),
-                CursorType::MaterializedView(btree, _) => btree.columns()[column].affinity(),
-                _ => Affinity::Blob,
-            };
-            if let Some(converted) = affinity.convert(&value) {
-                value = match converted {
-                    either::Either::Left(ValueRef::Numeric(numeric)) => Value::from(numeric),
-                    either::Either::Left(_) => {
-                        unreachable!("affinity conversion returned an unexpected borrowed value")
-                    }
-                    either::Either::Right(val) => val,
-                };
+        let default = match cursor_type {
+            CursorType::BTreeTable(btree) => btree_column_read_default(&btree.columns()[column]),
+            CursorType::BTreeIndex(index) => {
+                column_read_default(&index.columns[column].default, Affinity::Blob)
             }
-
-            Some(value)
+            CursorType::MaterializedView(btree, _) => {
+                btree_column_read_default(&btree.columns()[column])
+            }
+            _ => None,
         };
 
         let default = if self.flags.suppress_column_default() {
@@ -2299,6 +2272,42 @@ impl ProgramBuilder {
         let prepared = self.build_prepared_program(prepare_context, change_cnt_on, sql)?;
         Ok(Program::from_prepared(Arc::new(prepared), connection))
     }
+}
+
+/// The value a short record reads for a table column (the `Column` instruction's default): the
+/// constant DEFAULT folded, with the column's affinity applied. Shared by `emit_column` and the
+/// recipe read path (`crate::recipe`), so the two cannot disagree.
+pub(crate) fn btree_column_read_default(column: &crate::schema::Column) -> Option<Value> {
+    column_read_default(&column.default, column.affinity())
+}
+
+fn column_read_default(
+    default: &Option<Box<turso_parser::ast::Expr>>,
+    affinity: Affinity,
+) -> Option<Value> {
+    let default_expr = default.as_ref()?;
+    // Try to constant-fold the default expression into a Value for the
+    // Column instruction. Non-constant defaults (e.g. DEFAULT (ABS(-5)))
+    // can't be folded and yield None here — that's correct: they are
+    // evaluated at INSERT time via translate_expr. The Column default
+    // only matters for pre-existing rows after ALTER TABLE ADD COLUMN,
+    // and ALTER TABLE already validates that the default is constant.
+    let mut value = crate::translate::alter::eval_constant_default_value(default_expr).ok()?;
+
+    // Apply column affinity to the default value, matching SQLite's
+    // sqlite3ColumnDefault which calls sqlite3ValueFromExpr with
+    // pCol->affinity. This ensures e.g. ALTER TABLE ADD COLUMN c TEXT
+    // DEFAULT 0 returns text "0" rather than integer 0 for pre-existing rows.
+    if let Some(converted) = affinity.convert(&value) {
+        value = match converted {
+            either::Either::Left(ValueRef::Numeric(numeric)) => Value::from(numeric),
+            either::Either::Left(_) => {
+                unreachable!("affinity conversion returned an unexpected borrowed value")
+            }
+            either::Either::Right(val) => val,
+        };
+    }
+    Some(value)
 }
 
 pub(crate) trait CursorTypeExt {

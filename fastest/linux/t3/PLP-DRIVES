@@ -1,0 +1,3 @@
+# fastest/linux/t3/PLP-DRIVES -- drives a real T3 run may declare --plp yes for: one line per drive,
+# "<sysfs device/model, trimmed><TAB><sysfs device/firmware_rev, trimmed>". APPEND-ONLY, each line added by a lead
+# ruling that names the evidence of power-loss protection (vendor datasheet, smartctl text). Empty until then.

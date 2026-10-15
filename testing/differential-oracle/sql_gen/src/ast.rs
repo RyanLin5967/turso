@@ -73,6 +73,29 @@ impl fmt::Display for Stmt {
 }
 
 impl Stmt {
+    /// See `SelectStmt::has_top_level_limit`.
+    pub fn has_top_level_limit(&self) -> bool {
+        match self {
+            Stmt::Select(s) => s.has_top_level_limit(),
+            _ => false,
+        }
+    }
+
+    pub fn has_nested_unordered_limit(&self) -> bool {
+        match self {
+            Stmt::Select(s) => s.has_nested_unordered_limit(),
+            _ => false,
+        }
+    }
+
+    /// See `SelectStmt::has_top_level_unordered_limit`.
+    pub fn has_top_level_unordered_limit(&self) -> bool {
+        match self {
+            Stmt::Select(s) => s.has_top_level_unordered_limit(),
+            _ => false,
+        }
+    }
+
     /// Returns true if this statement contains any SELECT with LIMIT but no ORDER BY,
     /// including in subqueries within expressions.
     pub fn has_unordered_limit(&self) -> bool {
@@ -120,6 +143,60 @@ impl Stmt {
 }
 
 impl SelectStmt {
+    /// Whether this select has a LIMIT of its own, ordered or not.
+    ///
+    /// This, not "is the LIMIT unordered", is what makes a row COUNT predictable:
+    /// `LIMIT n` yields `min(n, count)` on any engine whatever its ORDER BY. Keying the
+    /// oracle's count rule on unorderedness left the largest category --
+    /// `LIMIT n ORDER BY <non-unique column>` -- still excused.
+    pub fn has_top_level_limit(&self) -> bool {
+        self.limit.is_some()
+    }
+
+    /// Whether an unordered LIMIT appears anywhere BELOW this select — a CTE body, a
+    /// subquery in a column or the WHERE clause, a compound arm.
+    ///
+    /// A nested unordered LIMIT can legitimately change the outer row count: the subquery
+    /// picks a different row on each engine and the outer filter then keeps a different
+    /// number of rows. So the oracle's count rule must not apply when one is present.
+    ///
+    /// This has to be its own traversal, not `has_unordered_limit() &&
+    /// !has_top_level_unordered_limit()`. That subtraction is structurally blind whenever
+    /// the top-level LIMIT is itself unordered: `unordered_limit_reason` returns at the
+    /// top-level check before it ever reaches the subqueries, so both halves are true and
+    /// the difference is always false. It reported "no nesting" for every `LIMIT n` without
+    /// an `ORDER BY`, which is precisely the case the count rule then fires on.
+    pub fn has_nested_unordered_limit(&self) -> bool {
+        self.nested_unordered_limit_reason().is_some()
+    }
+
+    /// `unordered_limit_reason` with this select's OWN limit skipped. Everything below is
+    /// reached exactly as the full version reaches it, so the two cannot drift.
+    fn nested_unordered_limit_reason(&self) -> Option<&'static str> {
+        let mut without_own_limit = self.clone();
+        without_own_limit.limit = None;
+        without_own_limit.unordered_limit_reason()
+    }
+
+    /// Whether THIS select's own LIMIT is unordered — no recursion into CTEs or
+    /// subqueries.
+    ///
+    /// A top-level unordered LIMIT leaves *which* rows come back undefined but not *how
+    /// many*: `LIMIT n` still yields `min(n, count)` on any engine. A LIMIT nested inside
+    /// a subquery is different — it can legitimately change the outer row count too — so
+    /// the oracle's row-count rule applies only to the first.
+    pub fn has_top_level_unordered_limit(&self) -> bool {
+        if self.limit.is_none() {
+            return false;
+        }
+        if self.order_by.is_empty() {
+            return true;
+        }
+        self.order_by
+            .iter()
+            .all(|item| !item.expr.contains_column_ref())
+    }
+
     /// Returns true if this SELECT or any nested subquery has a potentially
     /// non-deterministic LIMIT result set.
     ///
@@ -1741,15 +1818,18 @@ impl fmt::Display for Literal {
         match self {
             Literal::Null => write!(f, "NULL"),
             Literal::Integer(i) => write!(f, "{i}"),
+            // `{r:?}` rather than `{r}`: Display drops the decimal point on an integral
+            // f64, so 1.0 would reach SQL as `1` and typeof() would say 'integer'. Debug
+            // keeps the point and uses exponent notation, which also stops 5e-324 from
+            // becoming a 326-character literal.
             Literal::Real(r) => {
                 if r.is_infinite() || r.is_nan() {
                     write!(f, "NULL")
                 } else {
-                    write!(f, "{r}")
+                    write!(f, "{r:?}")
                 }
             }
             Literal::Text(s) => {
-                // Escape single quotes
                 let escaped = s.replace('\'', "''");
                 write!(f, "'{escaped}'")
             }
@@ -2298,6 +2378,54 @@ mod tests {
         assert_eq!(Literal::Text("hello".to_string()).to_string(), "'hello'");
         assert_eq!(Literal::Text("it's".to_string()).to_string(), "'it''s'");
         assert_eq!(Literal::Blob(vec![0xDE, 0xAD]).to_string(), "X'DEAD'");
+    }
+
+    /// A real must reach SQL still looking like a real. Display drops the decimal point on
+    /// an integral f64, which turns the literal into an INTEGER the moment it is parsed --
+    /// silently deleting every integral entry of the boundary table, negative zero included.
+    #[test]
+    fn integral_reals_keep_their_decimal_point() {
+        assert_eq!(Literal::Real(0.0).to_string(), "0.0");
+        assert_eq!(Literal::Real(-0.0).to_string(), "-0.0");
+        assert_eq!(Literal::Real(1.0).to_string(), "1.0");
+        assert_eq!(Literal::Real(-1.0).to_string(), "-1.0");
+        assert_eq!(Literal::Real(2.0).to_string(), "2.0");
+        assert_eq!(Literal::Real(1e15).to_string(), "1000000000000000.0");
+        assert_eq!(
+            Literal::Real(9007199254740993.0).to_string(),
+            "9007199254740992.0"
+        );
+    }
+
+    /// The same rendering keeps extreme reals short. Display expands them positionally:
+    /// 5e-324 becomes 326 characters, and every statement, state dump and shrink artifact
+    /// that draws one carries all of them.
+    #[test]
+    fn extreme_reals_render_in_exponent_form() {
+        assert_eq!(Literal::Real(1e-300).to_string(), "1e-300");
+        assert_eq!(Literal::Real(1e300).to_string(), "1e300");
+        assert_eq!(Literal::Real(5e-324).to_string(), "5e-324");
+        assert_eq!(Literal::Real(1e16).to_string(), "1e16");
+        assert_eq!(
+            Literal::Real(2.2250738585072014e-308).to_string(),
+            "2.2250738585072014e-308"
+        );
+        assert_eq!(
+            Literal::Real(f64::MAX).to_string(),
+            "1.7976931348623157e308"
+        );
+        assert_eq!(
+            Literal::Real(9223372036854775807.0).to_string(),
+            "9.223372036854776e18"
+        );
+    }
+
+    /// SQL has no literal for either, so they become NULL rather than an unparseable `inf`.
+    #[test]
+    fn non_finite_reals_render_as_null() {
+        assert_eq!(Literal::Real(f64::INFINITY).to_string(), "NULL");
+        assert_eq!(Literal::Real(f64::NEG_INFINITY).to_string(), "NULL");
+        assert_eq!(Literal::Real(f64::NAN).to_string(), "NULL");
     }
 
     #[test]
@@ -3083,6 +3211,62 @@ mod tests {
         assert_eq!(
             outer.non_unique_order_by_reason(&schema),
             Some("limit_non_unique_order_by")
+        );
+    }
+
+    /// Build a bare `SELECT <expr> FROM t` with the given LIMIT.
+    fn select_with(where_clause: Option<Expr>, limit: Option<u64>) -> SelectStmt {
+        SelectStmt {
+            with_clause: None,
+            distinct: false,
+            columns: vec![SelectColumn {
+                expr: Expr::ColumnRef(ColumnRef {
+                    table: None,
+                    column: "a".to_string(),
+                }),
+                alias: None,
+            }],
+            from: Some(FromClause {
+                table: "t".to_string(),
+                alias: None,
+            }),
+            joins: vec![],
+            where_clause,
+            group_by: None,
+            compounds: vec![],
+            order_by: vec![],
+            limit,
+            offset: None,
+        }
+    }
+
+    /// The predicate the oracle's row-count rule turns on, tested on the shape that broke it.
+    ///
+    /// An earlier version derived nesting as `has_unordered_limit() &&
+    /// !has_top_level_unordered_limit()`. That is always false when the top-level LIMIT is
+    /// itself unordered, because `unordered_limit_reason` returns at the top-level check
+    /// before reaching any subquery — so it reported "nothing nested" for every `LIMIT n`
+    /// without an `ORDER BY`, which is exactly where the count rule fires.
+    #[test]
+    fn a_nested_limit_is_seen_even_when_the_outer_limit_is_also_unordered() {
+        let inner = select_with(None, Some(1));
+        let outer = select_with(Some(Expr::Subquery(Box::new(inner))), Some(10));
+
+        assert!(outer.has_top_level_limit(), "the outer LIMIT is present");
+        assert!(
+            outer.has_unordered_limit(),
+            "the outer LIMIT has no ORDER BY, so this is true and used to mask the nesting"
+        );
+        assert!(
+            outer.has_nested_unordered_limit(),
+            "the inner LIMIT 1 must be seen even though the outer LIMIT is unordered too"
+        );
+
+        let bare = select_with(None, Some(10));
+        assert!(bare.has_top_level_limit());
+        assert!(
+            !bare.has_nested_unordered_limit(),
+            "a bare top-level LIMIT has nothing nested below it"
         );
     }
 }

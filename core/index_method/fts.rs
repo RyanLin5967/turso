@@ -1952,6 +1952,8 @@ pub struct FtsCursor {
     /// write lease). See [`FtsWriterSlot`].
     holds_writer_slot: bool,
     runtime_stats: Arc<FtsRuntimeStats>,
+    /// Outer-join null-row flag. See [`IndexMethodCursor::set_null_flag`].
+    null_flag: bool,
 }
 
 impl FtsCursor {
@@ -2005,6 +2007,7 @@ impl FtsCursor {
             opening_for_write: false,
             holds_writer_slot: false,
             runtime_stats: Arc::clone(&attachment.runtime_stats),
+            null_flag: false,
         }
     }
 
@@ -4329,6 +4332,14 @@ impl IndexMethodCursor for FtsCursor {
         }
         let (_, _, rowid) = self.current_hits[self.hit_pos];
         Ok(IOResult::Done(Some(rowid)))
+    }
+
+    fn set_null_flag(&mut self, flag: bool) {
+        self.null_flag = flag;
+    }
+
+    fn get_null_flag(&self) -> bool {
+        self.null_flag
     }
 
     /// Flushes pending writes before transaction commit.

@@ -1,0 +1,37 @@
+# Transactions, ROLLBACK and SAVEPOINT around an install.
+CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)
+INSERT INTO t(a, b) VALUES (1, 'x'), (2, 'y')
+BEGIN
+UPDATE t SET b = 'r1'
+SELECT * FROM t ORDER BY id
+ROLLBACK
+SELECT * FROM t ORDER BY id
+SELECT count(*) FROM sqlite_schema WHERE type = 'recipe'
+BEGIN
+SAVEPOINT s1
+UPDATE t SET b = 's1'
+INSERT INTO t(a, b) VALUES (3, 'z')
+ROLLBACK TO s1
+SELECT * FROM t ORDER BY id
+UPDATE t SET b = b || '-after'
+RELEASE s1
+COMMIT
+SELECT * FROM t ORDER BY id
+BEGIN
+UPDATE t SET a = a + 10
+INSERT INTO t(a, b) VALUES (4, 'w')
+UPDATE t SET a = a * 2
+UPDATE t SET b = 'pt' WHERE id = 1
+SAVEPOINT s2
+UPDATE t SET a = a + 1000
+ROLLBACK TO s2
+UPDATE t SET b = b || '!'
+COMMIT
+SELECT * FROM t ORDER BY id
+BEGIN
+UPDATE t SET a = 0
+INSERT INTO t(a, b) VALUES (5, 'v')
+ROLLBACK
+SELECT * FROM t ORDER BY id
+UPDATE t SET a = a + 1
+SELECT * FROM t ORDER BY id

@@ -434,6 +434,8 @@ turso_status_code_t turso_statement_execute(
 turso_status_code_t turso_statement_step(const turso_statement_t *self, const char **error_opt_out);
 
 /** Execute one iteration of underlying IO backend after TURSO_IO status code
+ * When that TURSO_IO stood for a busy handler's backoff, this waits the backoff out instead,
+ * so a step / run_io loop does not spin a core for the whole busy timeout
  * This function either return some ERROR status or TURSO_OK
  */
 turso_status_code_t turso_statement_run_io(const turso_statement_t *self, const char **error_opt_out);

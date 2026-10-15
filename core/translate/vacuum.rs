@@ -25,6 +25,15 @@ pub fn translate_vacuum(
     connection: Arc<Connection>,
 ) -> Result<()> {
     let schema_name = schema_name.map_or_else(|| "main".to_string(), |n| n.as_str().to_string());
+    // Recipe backfill (lane k1-recipe-build, see `crate::recipe`): VACUUM copies records raw and
+    // re-creates the schema from its rows; a recipe table is refused rather than risked.
+    if connection.schema.read().tables.values().any(|t| {
+        t.btree().is_some_and(|b| b.recipes.is_some())
+    }) {
+        return Err(LimboError::ParseError(
+            "VACUUM is refused: a table has recipe backfills".to_string(),
+        ));
+    }
     match into {
         Some(dest_expr) => {
             // VACUUM INTO 'path' - create compacted copy at destination

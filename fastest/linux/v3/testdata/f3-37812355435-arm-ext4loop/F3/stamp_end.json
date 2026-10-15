@@ -1,0 +1,725 @@
+{
+ "utc": "2026-10-08T18:28:39Z",
+ "epoch": 1791484119.9200494,
+ "monotonic_raw_ns": 183044562256,
+ "problems": [],
+ "loadavg": [
+  "1.82",
+  "0.66",
+  "0.25"
+ ],
+ "psi": {
+  "cpu": "some avg10=0.35 avg60=0.48 avg300=0.32 total=1936388\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n",
+  "io": "some avg10=41.32 avg60=22.45 avg300=7.12 total=25227398\nfull avg10=41.15 avg60=22.29 avg300=7.02 total=24740994\n",
+  "memory": "some avg10=0.00 avg60=0.00 avg300=0.00 total=2\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=2\n"
+ },
+ "stat_cpu": {
+  "total": 72606,
+  "idle": 64945
+ },
+ "diskstats": {
+  "loop0": {
+   "reads": 211,
+   "writes": 159749,
+   "sectors_written": 11596800,
+   "io_ms": 24917,
+   "discards": 5,
+   "flushes": 87423,
+   "flush_ms": 23278
+  },
+  "loop1": {
+   "reads": 254,
+   "writes": 84,
+   "sectors_written": 237992,
+   "io_ms": 15,
+   "discards": 3,
+   "flushes": 3,
+   "flush_ms": 8
+  },
+  "loop2": {
+   "reads": 364,
+   "writes": 88,
+   "sectors_written": 136138,
+   "io_ms": 7,
+   "discards": 1,
+   "flushes": 9,
+   "flush_ms": 1
+  },
+  "loop3": {
+   "reads": 277,
+   "writes": 78,
+   "sectors_written": 136080,
+   "io_ms": 5,
+   "discards": 1,
+   "flushes": 2,
+   "flush_ms": 1
+  },
+  "loop4": {
+   "reads": 202,
+   "writes": 27,
+   "sectors_written": 99648,
+   "io_ms": 8,
+   "discards": 2,
+   "flushes": 4,
+   "flush_ms": 2
+  },
+  "loop5": {
+   "reads": 210,
+   "writes": 36,
+   "sectors_written": 99784,
+   "io_ms": 7,
+   "discards": 2,
+   "flushes": 3,
+   "flush_ms": 2
+  },
+  "loop6": {
+   "reads": 197,
+   "writes": 68,
+   "sectors_written": 100768,
+   "io_ms": 90,
+   "discards": 2,
+   "flushes": 24,
+   "flush_ms": 83
+  },
+  "loop7": {
+   "reads": 209,
+   "writes": 28,
+   "sectors_written": 50072,
+   "io_ms": 13,
+   "discards": 2,
+   "flushes": 6,
+   "flush_ms": 8
+  },
+  "sda": {
+   "reads": 20152,
+   "writes": 148822,
+   "sectors_written": 21302892,
+   "io_ms": 42961,
+   "discards": 1821,
+   "flushes": 0,
+   "flush_ms": 0
+  },
+  "sda1": {
+   "reads": 19128,
+   "writes": 148736,
+   "sectors_written": 21185736,
+   "io_ms": 44104,
+   "discards": 1803,
+   "flushes": 0,
+   "flush_ms": 0
+  },
+  "sda15": {
+   "reads": 191,
+   "writes": 2,
+   "sectors_written": 2,
+   "io_ms": 36,
+   "discards": 1,
+   "flushes": 0,
+   "flush_ms": 0
+  },
+  "sda16": {
+   "reads": 392,
+   "writes": 79,
+   "sectors_written": 117050,
+   "io_ms": 1006,
+   "discards": 17,
+   "flushes": 0,
+   "flush_ms": 0
+  },
+  "loop8": {
+   "reads": 209,
+   "writes": 36,
+   "sectors_written": 99768,
+   "io_ms": 9,
+   "discards": 2,
+   "flushes": 6,
+   "flush_ms": 5
+  },
+  "loop9": {
+   "reads": 263,
+   "writes": 290,
+   "sectors_written": 111664,
+   "io_ms": 107,
+   "discards": 2,
+   "flushes": 132,
+   "flush_ms": 101
+  },
+  "loop10": {
+   "reads": 305,
+   "writes": 136,
+   "sectors_written": 62248,
+   "io_ms": 108,
+   "discards": 2,
+   "flushes": 60,
+   "flush_ms": 105
+  },
+  "loop11": {
+   "reads": 299,
+   "writes": 61,
+   "sectors_written": 51656,
+   "io_ms": 103,
+   "discards": 2,
+   "flushes": 24,
+   "flush_ms": 97
+  },
+  "loop12": {
+   "reads": 259,
+   "writes": 25,
+   "sectors_written": 78976,
+   "io_ms": 80,
+   "discards": 2,
+   "flushes": 6,
+   "flush_ms": 77
+  },
+  "loop13": {
+   "reads": 203,
+   "writes": 38,
+   "sectors_written": 99792,
+   "io_ms": 21,
+   "discards": 2,
+   "flushes": 8,
+   "flush_ms": 14
+  },
+  "loop14": {
+   "reads": 340,
+   "writes": 82,
+   "sectors_written": 960,
+   "io_ms": 3,
+   "discards": 1,
+   "flushes": 6,
+   "flush_ms": 1
+  },
+  "loop15": {
+   "reads": 261,
+   "writes": 7,
+   "sectors_written": 135175,
+   "io_ms": 16,
+   "discards": 1,
+   "flushes": 4,
+   "flush_ms": 12
+  },
+  "loop16": {
+   "reads": 253,
+   "writes": 46,
+   "sectors_written": 262248,
+   "io_ms": 16,
+   "discards": 2,
+   "flushes": 9,
+   "flush_ms": 13
+  },
+  "loop17": {
+   "reads": 260,
+   "writes": 30,
+   "sectors_written": 34144,
+   "io_ms": 9,
+   "discards": 2,
+   "flushes": 4,
+   "flush_ms": 1
+  },
+  "loop18": {
+   "reads": 364,
+   "writes": 53,
+   "sectors_written": 9336,
+   "io_ms": 23,
+   "discards": 1,
+   "flushes": 16,
+   "flush_ms": 18
+  },
+  "loop19": {
+   "reads": 204,
+   "writes": 29,
+   "sectors_written": 8280,
+   "io_ms": 11,
+   "discards": 1,
+   "flushes": 11,
+   "flush_ms": 7
+  },
+  "loop20": {
+   "reads": 156,
+   "writes": 36,
+   "sectors_written": 99768,
+   "io_ms": 6,
+   "discards": 2,
+   "flushes": 4,
+   "flush_ms": 2
+  },
+  "ram0": {
+   "reads": 0,
+   "writes": 0,
+   "sectors_written": 0,
+   "io_ms": 0,
+   "discards": 0,
+   "flushes": 0,
+   "flush_ms": 0
+  },
+  "ram1": {
+   "reads": 0,
+   "writes": 0,
+   "sectors_written": 0,
+   "io_ms": 0,
+   "discards": 0,
+   "flushes": 0,
+   "flush_ms": 0
+  },
+  "loop21": {
+   "reads": 321,
+   "writes": 37,
+   "sectors_written": 99768,
+   "io_ms": 7,
+   "discards": 2,
+   "flushes": 7,
+   "flush_ms": 3
+  },
+  "dm-0": {
+   "reads": 216,
+   "writes": 181,
+   "sectors_written": 99768,
+   "io_ms": 6,
+   "discards": 2,
+   "flushes": 0,
+   "flush_ms": 0
+  },
+  "loop22": {
+   "reads": 254,
+   "writes": 44,
+   "sectors_written": 99808,
+   "io_ms": 4,
+   "discards": 2,
+   "flushes": 9,
+   "flush_ms": 3
+  },
+  "sdb": {
+   "reads": 109,
+   "writes": 18,
+   "sectors_written": 66128,
+   "io_ms": 241,
+   "discards": 0,
+   "flushes": 4,
+   "flush_ms": 150
+  }
+ },
+ "clocksource": "arch_sys_counter",
+ "clocksource_available": "arch_sys_counter",
+ "cpufreq": {
+  "present": false,
+  "cpus": {
+   "cpu0": null,
+   "cpu1": null,
+   "cpu2": null,
+   "cpu3": null
+  }
+ },
+ "cpuidle": {
+  "off": "0",
+  "driver": "none",
+  "governor": "menu",
+  "cpus": {
+   "cpu0": null,
+   "cpu1": null,
+   "cpu2": null,
+   "cpu3": null
+  },
+  "per_cpu_present": false
+ },
+ "block": {
+  "dm-0": {
+   "write_cache": "write back",
+   "fua": "0"
+  },
+  "loop0": {
+   "write_cache": "write back",
+   "fua": "0"
+  },
+  "loop1": {
+   "write_cache": "write back",
+   "fua": "0"
+  },
+  "loop10": {
+   "write_cache": "write back",
+   "fua": "0"
+  },
+  "loop11": {
+   "write_cache": "write back",
+   "fua": "0"
+  },
+  "loop12": {
+   "write_cache": "write back",
+   "fua": "0"
+  },
+  "loop13": {
+   "write_cache": "write back",
+   "fua": "0"
+  },
+  "loop14": {
+   "write_cache": "write back",
+   "fua": "0"
+  },
+  "loop15": {
+   "write_cache": "write back",
+   "fua": "0"
+  },
+  "loop16": {
+   "write_cache": "write back",
+   "fua": "0"
+  },
+  "loop17": {
+   "write_cache": "write back",
+   "fua": "0"
+  },
+  "loop18": {
+   "write_cache": "write back",
+   "fua": "0"
+  },
+  "loop19": {
+   "write_cache": "write back",
+   "fua": "0"
+  },
+  "loop2": {
+   "write_cache": "write back",
+   "fua": "0"
+  },
+  "loop20": {
+   "write_cache": "write through",
+   "fua": "0"
+  },
+  "loop21": {
+   "write_cache": "write back",
+   "fua": "0"
+  },
+  "loop22": {
+   "write_cache": "write back",
+   "fua": "0"
+  },
+  "loop3": {
+   "write_cache": "write back",
+   "fua": "0"
+  },
+  "loop4": {
+   "write_cache": "write back",
+   "fua": "0"
+  },
+  "loop5": {
+   "write_cache": "write back",
+   "fua": "0"
+  },
+  "loop6": {
+   "write_cache": "write back",
+   "fua": "0"
+  },
+  "loop7": {
+   "write_cache": "write back",
+   "fua": "0"
+  },
+  "loop8": {
+   "write_cache": "write back",
+   "fua": "0"
+  },
+  "loop9": {
+   "write_cache": "write back",
+   "fua": "0"
+  },
+  "ram0": {
+   "write_cache": "write through",
+   "fua": "0"
+  },
+  "ram1": {
+   "write_cache": "write through",
+   "fua": "0"
+  },
+  "sda": {
+   "write_cache": "write through",
+   "fua": "0"
+  },
+  "sdb": {
+   "write_cache": "write back",
+   "fua": "1"
+  }
+ },
+ "dir": "/mnt/fastest-v3-ext4loop/work",
+ "free_bytes": 7903993856,
+ "mount": "/dev/loop0 ext4   rw,relatime,noinit_itable",
+ "window_s": 2.327467203140259,
+ "void_rule": "none registered for Linux: record only",
+ "cpu_busy_frac": 0.08315334773218143,
+ "diskstats_delta": {
+  "loop0": {
+   "reads": 0,
+   "writes": 4369,
+   "sectors_written": 1253088,
+   "io_ms": 1719,
+   "discards": 0,
+   "flushes": 2806,
+   "flush_ms": 1608
+  },
+  "loop1": {
+   "reads": 0,
+   "writes": 6,
+   "sectors_written": 96,
+   "io_ms": 0,
+   "discards": 0,
+   "flushes": 0,
+   "flush_ms": 0
+  },
+  "loop2": {
+   "reads": 0,
+   "writes": 2,
+   "sectors_written": 3,
+   "io_ms": 0,
+   "discards": 0,
+   "flushes": 2,
+   "flush_ms": 0
+  },
+  "loop3": {
+   "reads": 0,
+   "writes": 0,
+   "sectors_written": 0,
+   "io_ms": 0,
+   "discards": 0,
+   "flushes": 0,
+   "flush_ms": 0
+  },
+  "loop4": {
+   "reads": 0,
+   "writes": 0,
+   "sectors_written": 0,
+   "io_ms": 0,
+   "discards": 0,
+   "flushes": 0,
+   "flush_ms": 0
+  },
+  "loop5": {
+   "reads": 0,
+   "writes": 0,
+   "sectors_written": 0,
+   "io_ms": 0,
+   "discards": 0,
+   "flushes": 0,
+   "flush_ms": 0
+  },
+  "loop6": {
+   "reads": 0,
+   "writes": 0,
+   "sectors_written": 0,
+   "io_ms": 0,
+   "discards": 0,
+   "flushes": 0,
+   "flush_ms": 0
+  },
+  "loop7": {
+   "reads": 0,
+   "writes": 0,
+   "sectors_written": 0,
+   "io_ms": 0,
+   "discards": 0,
+   "flushes": 0,
+   "flush_ms": 0
+  },
+  "sda": {
+   "reads": 5,
+   "writes": 4760,
+   "sectors_written": 1283096,
+   "io_ms": 1495,
+   "discards": 1,
+   "flushes": 0,
+   "flush_ms": 0
+  },
+  "sda1": {
+   "reads": 5,
+   "writes": 4760,
+   "sectors_written": 1283096,
+   "io_ms": 1502,
+   "discards": 1,
+   "flushes": 0,
+   "flush_ms": 0
+  },
+  "sda15": {
+   "reads": 0,
+   "writes": 0,
+   "sectors_written": 0,
+   "io_ms": 0,
+   "discards": 0,
+   "flushes": 0,
+   "flush_ms": 0
+  },
+  "sda16": {
+   "reads": 0,
+   "writes": 0,
+   "sectors_written": 0,
+   "io_ms": 0,
+   "discards": 0,
+   "flushes": 0,
+   "flush_ms": 0
+  },
+  "loop8": {
+   "reads": 0,
+   "writes": 0,
+   "sectors_written": 0,
+   "io_ms": 0,
+   "discards": 0,
+   "flushes": 0,
+   "flush_ms": 0
+  },
+  "loop9": {
+   "reads": 0,
+   "writes": 0,
+   "sectors_written": 0,
+   "io_ms": 0,
+   "discards": 0,
+   "flushes": 0,
+   "flush_ms": 0
+  },
+  "loop10": {
+   "reads": 0,
+   "writes": 0,
+   "sectors_written": 0,
+   "io_ms": 0,
+   "discards": 0,
+   "flushes": 0,
+   "flush_ms": 0
+  },
+  "loop11": {
+   "reads": 0,
+   "writes": 0,
+   "sectors_written": 0,
+   "io_ms": 0,
+   "discards": 0,
+   "flushes": 0,
+   "flush_ms": 0
+  },
+  "loop12": {
+   "reads": 0,
+   "writes": 0,
+   "sectors_written": 0,
+   "io_ms": 0,
+   "discards": 0,
+   "flushes": 0,
+   "flush_ms": 0
+  },
+  "loop13": {
+   "reads": 0,
+   "writes": 0,
+   "sectors_written": 0,
+   "io_ms": 0,
+   "discards": 0,
+   "flushes": 0,
+   "flush_ms": 0
+  },
+  "loop14": {
+   "reads": 0,
+   "writes": 0,
+   "sectors_written": 0,
+   "io_ms": 0,
+   "discards": 0,
+   "flushes": 0,
+   "flush_ms": 0
+  },
+  "loop15": {
+   "reads": 0,
+   "writes": 0,
+   "sectors_written": 0,
+   "io_ms": 0,
+   "discards": 0,
+   "flushes": 0,
+   "flush_ms": 0
+  },
+  "loop16": {
+   "reads": 0,
+   "writes": 0,
+   "sectors_written": 0,
+   "io_ms": 0,
+   "discards": 0,
+   "flushes": 0,
+   "flush_ms": 0
+  },
+  "loop17": {
+   "reads": 0,
+   "writes": 0,
+   "sectors_written": 0,
+   "io_ms": 0,
+   "discards": 0,
+   "flushes": 0,
+   "flush_ms": 0
+  },
+  "loop18": {
+   "reads": 0,
+   "writes": 0,
+   "sectors_written": 0,
+   "io_ms": 0,
+   "discards": 0,
+   "flushes": 0,
+   "flush_ms": 0
+  },
+  "loop19": {
+   "reads": 0,
+   "writes": 0,
+   "sectors_written": 0,
+   "io_ms": 0,
+   "discards": 0,
+   "flushes": 0,
+   "flush_ms": 0
+  },
+  "loop20": {
+   "reads": 0,
+   "writes": 0,
+   "sectors_written": 0,
+   "io_ms": 0,
+   "discards": 0,
+   "flushes": 0,
+   "flush_ms": 0
+  },
+  "ram0": {
+   "reads": 0,
+   "writes": 0,
+   "sectors_written": 0,
+   "io_ms": 0,
+   "discards": 0,
+   "flushes": 0,
+   "flush_ms": 0
+  },
+  "ram1": {
+   "reads": 0,
+   "writes": 0,
+   "sectors_written": 0,
+   "io_ms": 0,
+   "discards": 0,
+   "flushes": 0,
+   "flush_ms": 0
+  },
+  "loop21": {
+   "reads": 0,
+   "writes": 0,
+   "sectors_written": 0,
+   "io_ms": 0,
+   "discards": 0,
+   "flushes": 0,
+   "flush_ms": 0
+  },
+  "dm-0": {
+   "reads": 0,
+   "writes": 0,
+   "sectors_written": 0,
+   "io_ms": 0,
+   "discards": 0,
+   "flushes": 0,
+   "flush_ms": 0
+  },
+  "loop22": {
+   "reads": 0,
+   "writes": 0,
+   "sectors_written": 0,
+   "io_ms": 0,
+   "discards": 0,
+   "flushes": 0,
+   "flush_ms": 0
+  },
+  "sdb": {
+   "reads": 0,
+   "writes": 0,
+   "sectors_written": 0,
+   "io_ms": 0,
+   "discards": 0,
+   "flushes": 0,
+   "flush_ms": 0
+  }
+ }
+}

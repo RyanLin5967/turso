@@ -227,6 +227,23 @@ fn value_to_bigdecimal(val: &Value) -> Result<bigdecimal::BigDecimal> {
     }
 }
 
+/// An argument of numeric's operator functions as a decimal (engine review 16 #21, review 20
+/// HIGH 2). Their operands reach them as user-facing values (a numeric column read decoded, as
+/// text; the other operand as given: `emit_custom_type_operator`), so a blob can only be an operand
+/// given as one, which numeric's INSERT refuses (`numeric_encode`). It is refused here with that
+/// same error rather than read as the type's internal encoding, which made `x = <blob>` match a
+/// value no INSERT could have stored. The sort comparator still reads stored encodings
+/// (`value_to_bigdecimal`). Mutant `numeric_operator_reads_blob` (test builds only): read as an
+/// encoding, as before.
+fn numeric_operand(val: &Value) -> Result<bigdecimal::BigDecimal> {
+    if matches!(val, Value::Blob(_)) && !crate::branch::store::fe_mutant("numeric_operator_reads_blob") {
+        return Err(LimboError::Constraint(format!(
+            "invalid input for type numeric: \"{val}\""
+        )));
+    }
+    value_to_bigdecimal(val)
+}
+
 /// Create a sort comparator closure from a SortComparatorType enum.
 fn make_sort_comparator(
     cmp_type: &SortComparatorType,
@@ -700,6 +717,13 @@ pub fn op_checkpoint(
         Ok(IOResult::IO(io)) => Ok(InsnFunctionStepResult::IO(io)),
         Err(err) => {
             tracing::debug!("PRAGMA wal_checkpoint failed: {err:?}");
+            // A trunk sync the pager noted (the database file's) that failed after it yielded is a
+            // failed drain of the device, acted on before the row reports busy (engine review 17
+            // HIGH 1; the WAL's own syncs are acted on where they fail). Mutant
+            // `pragma_checkpoint_failure_cleared` (test builds only): cleared unchecked, as before.
+            if !crate::branch::store::fe_mutant("pragma_checkpoint_failure_cleared") {
+                pager.check_noted_syncs();
+            }
             pager.clear_checkpoint_state();
             state.explicit_checkpoint_guard = None;
             state.registers[*dest].set_int(1);
@@ -1224,6 +1248,9 @@ pub fn op_open_read(
         },
         insn
     );
+    // Recipe backfill: a cursor reopened on a b-tree is no longer ephemeral, and its cached row
+    // belongs to what it read before.
+    state.recipe_exec.set_ephemeral(*cursor_id, false);
 
     invalidate_deferred_seeks_for_cursor(state, *cursor_id);
 
@@ -1854,6 +1881,7 @@ pub fn op_column(
             dest: *dest,
             default,
         },
+        _pager,
     )
 }
 
@@ -1881,6 +1909,7 @@ pub fn op_column_range(
             dest: *dest,
             defaults,
         },
+        _pager,
     )
 }
 
@@ -1919,18 +1948,27 @@ impl ColumnFetch<'_> {
         program: &Program,
         state: &mut ProgramState,
         cursor_id: usize,
+        pager: &Arc<Pager>,
     ) -> Result<InsnFunctionStepResult> {
         match *self {
             ColumnFetch::Single {
                 column,
                 dest,
                 default,
-            } => op_column_fetch(program, state, cursor_id, column, dest, default),
+            } => op_column_fetch(program, state, cursor_id, column, dest, default, pager),
             ColumnFetch::Range {
                 start_column,
                 dest,
                 defaults,
-            } => op_column_range_fetch(program, state, cursor_id, start_column, dest, defaults),
+            } => op_column_range_fetch(
+                program,
+                state,
+                cursor_id,
+                start_column,
+                dest,
+                defaults,
+                pager,
+            ),
         }
     }
 }
@@ -1941,13 +1979,14 @@ fn op_column_impl(
     state: &mut ProgramState,
     cursor_id: usize,
     fetch: ColumnFetch<'_>,
+    pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     // Fast path: no deferred seek pending and no suspended state machine. The
     // column fetch either completes or yields IO with nothing persisted, so the
     // op-state slot (enum write + drop on clear) is bypassed entirely. On IO
     // resume the slot is still idle and this path re-executes.
     if state.active_op_state.is_idle() && state.deferred_seeks[cursor_id].is_none() {
-        let result = fetch.fetch(program, state, cursor_id)?;
+        let result = fetch.fetch(program, state, cursor_id, pager)?;
         if matches!(result, InsnFunctionStepResult::Step) {
             state.pc += 1;
         }
@@ -2012,7 +2051,7 @@ fn op_column_impl(
                 *state.active_op_state.column() = OpColumnState::GetColumn;
             }
             OpColumnState::GetColumn => {
-                let result = fetch.fetch(program, state, cursor_id)?;
+                let result = fetch.fetch(program, state, cursor_id, pager)?;
                 if !matches!(result, InsnFunctionStepResult::Step) {
                     // IO yield: the slot stays at GetColumn so the resume
                     // re-enters this arm.
@@ -2036,7 +2075,21 @@ fn op_column_fetch(
     column: usize,
     dest: usize,
     default: &Option<Value>,
+    pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    // Recipe backfill (lane k1-recipe-build): every column read of a table b-tree passes here, so
+    // a stale record's logical value is computed here and nowhere else (see `crate::recipe`).
+    if let Some((_, CursorType::BTreeTable(table))) = program.cursor_ref.get(cursor_id) {
+        if let Some(rs) = table.recipes.as_ref() {
+            match crate::recipe::column_fetch(
+                program, state, cursor_id, table, rs, column, dest, pager,
+            )? {
+                IOResult::IO(io) => return Ok(InsnFunctionStepResult::IO(io)),
+                IOResult::Done(true) => return Ok(InsnFunctionStepResult::Step),
+                IOResult::Done(false) => {}
+            }
+        }
+    }
     // First check if this is a MaterializedViewCursor
     {
         let cursor = state.get_cursor(cursor_id);
@@ -2160,8 +2213,13 @@ fn op_column_fetch(
                 .as_mut()
                 .expect("cursor should exist");
             let cursor = cursor.as_index_method_mut();
-            let value = return_if_io!(cursor.query_column(column));
-            state.registers[dest].set_value(value);
+            // In an outer join, a NullRow'd cursor returns NULL for every column.
+            if cursor.get_null_flag() {
+                state.registers[dest].set_null();
+            } else {
+                let value = return_if_io!(cursor.query_column(column));
+                state.registers[dest].set_value(value);
+            }
         }
         CursorType::VirtualTable(_) => {
             panic!("Insn:Column on virtual table cursor, use Insn:VColumn instead");
@@ -2196,11 +2254,34 @@ fn op_column_range_fetch(
     start_column: usize,
     dest: usize,
     defaults: &[Option<Value>],
+    pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     let (_, cursor_type) = program
         .cursor_ref
         .get(cursor_id)
         .expect("cursor_id should exist in cursor_ref");
+
+    // Recipe backfill: a range over a recipe table is read one column at a time through the
+    // single-column path, so the range cannot bypass the choke point.
+    if let CursorType::BTreeTable(table) = cursor_type {
+        if table.recipes.is_some() {
+            for (i, default) in defaults.iter().enumerate() {
+                match op_column_fetch(
+                    program,
+                    state,
+                    cursor_id,
+                    start_column + i,
+                    dest + i,
+                    default,
+                    pager,
+                )? {
+                    InsnFunctionStepResult::Step => {}
+                    other => return Ok(other),
+                }
+            }
+            return Ok(InsnFunctionStepResult::Step);
+        }
+    }
 
     if !cursor_type.accepts_column_range_fusing() {
         crate::bail_parse_error!(
@@ -3347,8 +3428,15 @@ pub fn op_next(
             }
             Cursor::IndexMethod(_) => {
                 let cursor = cursor.as_index_method_mut();
-                let has_more = return_if_io!(cursor.query_next());
-                !has_more
+                // A NullRow'd cursor (outer join with no match) has no real row to advance to;
+                // report exhaustion and clear the flag, mirroring the BTree branch above.
+                if cursor.get_null_flag() {
+                    cursor.set_null_flag(false);
+                    true // is_empty = true
+                } else {
+                    let has_more = return_if_io!(cursor.query_next());
+                    !has_more
+                }
             }
             _ => panic!("Next on non-btree/materialized-view cursor"),
         }
@@ -4807,6 +4895,33 @@ pub fn op_transaction_inner(
     }
 }
 
+/// SQLite's OP_AutoCommit on SQLITE_BUSY (vdbe.c: `db->autoCommit = 1-desiredAutoCommit`): a COMMIT
+/// whose `commit_txn` returned Busy with `commit_state` still `Ready` and nothing of it committed
+/// (the trunk's copy-decision pass refused it before any frame) has committed nothing, so its
+/// transition is undone. The
+/// transaction is explicit again in the gap (siblings, BEGIN, ROLLBACK and `get_auto_commit` all
+/// see it open), and the re-stepped COMMIT makes the transition anew with every guard
+/// (StatementsInProgress, the poison mark, deferred FKs). Engine review 16 HIGH 1, which replaces
+/// 795295c09's commit-started flag. Mutant `busy_commit_keeps_autocommit` (test builds only): the
+/// transition stays, so the re-step reads "no transaction is active".
+///
+/// Never once a part of the COMMIT has committed (`ProgramState::commit_published`; engine review
+/// 19 HIGH 2): main's half is durable when an attached pager's decision pass refuses, and a
+/// reopened transaction would let ROLLBACK report a durable half as rolled back. On the WAL path
+/// such a COMMIT is in `CommittingAttached` already (its re-step finishes the attached half), so
+/// this check is reached only with `commit_state` `Ready` after a part committed: an attached MVCC
+/// commit refused after main's (`commit_txn_mvcc` phase 2), reachability unverified and no red.
+fn undo_commit_transition_after_busy(conn: &Connection, state: &mut ProgramState) {
+    if crate::branch::store::fe_mutant("busy_commit_keeps_autocommit") {
+        return;
+    }
+    if state.commit_published {
+        return;
+    }
+    conn.auto_commit.store(false, Ordering::SeqCst);
+    state.auto_txn_cleanup = TxnCleanup::None;
+}
+
 pub fn op_auto_commit(
     program: &Program,
     state: &mut ProgramState,
@@ -4837,6 +4952,13 @@ pub fn op_auto_commit(
         let res = program
             .commit_txn(pager.clone(), state, mv_store.as_ref(), *rollback)
             .map(Into::into);
+        // A resumed commit (after a view merge's yield) refused before its pager commit began.
+        if matches!(res, Err(LimboError::Busy))
+            && !*rollback
+            && matches!(state.commit_state, CommitState::Ready)
+        {
+            undo_commit_transition_after_busy(&conn, state);
+        }
         // Only clear after a final, successful non-rollback COMMIT.
         if fk_on
             && !*rollback
@@ -4968,17 +5090,26 @@ pub fn op_auto_commit(
     // Index-method staging is a per-statement Halt responsibility (each
     // statement stages its writes at its own halt and hands its cursors to
     // the connection), so the COMMIT program has nothing to stage here. A
-    // yield point at this spot would also be unsafe: `conn.auto_commit` was
-    // already flipped above, and re-entering this opcode from the top after
-    // an IO yield would then fail `valid_transition` with a torn-down
-    // transaction.
+    // yield point here, between the transition above and `commit_txn`, would
+    // be unsafe: it records no `commit_state`, so the re-entry would judge
+    // the COMMIT anew while `conn.auto_commit` is already flipped and fail
+    // `valid_transition`.
 
     let res = match program
         .commit_txn(pager.clone(), state, mv_store.as_ref(), *rollback)
-        .map(Into::<InsnFunctionStepResult>::into)?
+        .map(Into::<InsnFunctionStepResult>::into)
     {
-        res @ (InsnFunctionStepResult::Done | InsnFunctionStepResult::Step) => res,
-        res @ (InsnFunctionStepResult::IO(_) | InsnFunctionStepResult::Row) => return Ok(res),
+        Ok(res @ (InsnFunctionStepResult::Done | InsnFunctionStepResult::Step)) => res,
+        // Every IO yield inside `commit_txn` records its `commit_state` (a view merge's as
+        // `ApplyingViewDeltas`), so the re-entry is driven by the block at the top.
+        Ok(res @ (InsnFunctionStepResult::IO(_) | InsnFunctionStepResult::Row)) => return Ok(res),
+        Err(LimboError::Busy) => {
+            if !*rollback && matches!(state.commit_state, CommitState::Ready) {
+                undo_commit_transition_after_busy(&conn, state);
+            }
+            return Err(LimboError::Busy);
+        }
+        Err(err) => return Err(err),
     };
 
     if mv_store.is_none() {
@@ -5661,6 +5792,16 @@ pub fn op_row_data(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(RowData { cursor_id, dest }, insn);
 
+    // Recipe backfill: a raw copy of a stale record would carry pre-recipe values. Refused.
+    if let Some((_, CursorType::BTreeTable(table))) = program.cursor_ref.get(*cursor_id) {
+        if return_if_io!(crate::recipe::row_is_stale(state, *cursor_id, table, _pager)) {
+            return Err(LimboError::InternalError(format!(
+                "RowData: refused a raw copy of a recipe-stale row of {}",
+                table.name
+            )));
+        }
+    }
+
     // Copy the row into the destination register's spent record buffer: one
     // payload copy, no allocation once the buffer has grown to the row size.
     let buf = state.registers[*dest].take_buf();
@@ -5804,7 +5945,9 @@ pub fn op_row_id(
                     .get_mut(*cursor_id)
                     .expect("cursor_id should be valid")
                 {
-                    if let Some(rowid) = return_if_io!(cursor.query_rowid()) {
+                    if cursor.get_null_flag() {
+                        state.registers[*dest].set_null();
+                    } else if let Some(rowid) = return_if_io!(cursor.query_rowid()) {
                         state.registers[*dest].set_int(rowid);
                     } else {
                         state.registers[*dest].set_null();
@@ -5842,6 +5985,9 @@ pub fn op_idx_row_id(
 
     let rowid = match cursor {
         Cursor::BTree(cursor) => return_if_io!(cursor.rowid()),
+        // In an outer join, a NullRow'd index-method cursor must report a NULL rowid
+        // rather than the (stale) rowid of whatever row it last pointed at.
+        Cursor::IndexMethod(cursor) if cursor.get_null_flag() => None,
         Cursor::IndexMethod(cursor) => return_if_io!(cursor.query_rowid()),
         Cursor::NullRow => None,
         _ => panic!("unexpected cursor type"),
@@ -10493,8 +10639,8 @@ pub fn op_function(
                 let result = match (&lhs_val, &rhs_val) {
                     (Value::Null, _) | (_, Value::Null) => Value::Null,
                     _ => {
-                        let a = value_to_bigdecimal(&lhs_val)?;
-                        let b = value_to_bigdecimal(&rhs_val)?;
+                        let a = numeric_operand(&lhs_val)?;
+                        let b = numeric_operand(&rhs_val)?;
                         let res = match scalar_func {
                             ScalarFunc::NumericAdd => a + b,
                             ScalarFunc::NumericSub => a - b,
@@ -10506,7 +10652,14 @@ pub fn op_function(
                                         "division by zero".to_string(),
                                     ));
                                 }
-                                a / b
+                                // PostgreSQL's result scale (lead ruling 2026-10-09 on
+                                // e52f01422). Mutant `div_scale_bigdecimal` (test builds
+                                // only): bigdecimal's own, as before.
+                                if crate::branch::store::fe_mutant("div_scale_bigdecimal") {
+                                    a / b
+                                } else {
+                                    crate::numeric::decimal::pg_numeric_div(&a, &b)
+                                }
                             }
                             _ => unreachable!(),
                         };
@@ -10522,8 +10675,8 @@ pub fn op_function(
                 match (&lhs_val, &rhs_val) {
                     (Value::Null, _) | (_, Value::Null) => state.registers[*dest].set_null(),
                     _ => {
-                        let a = value_to_bigdecimal(&lhs_val)?;
-                        let b = value_to_bigdecimal(&rhs_val)?;
+                        let a = numeric_operand(&lhs_val)?;
+                        let b = numeric_operand(&rhs_val)?;
                         let cmp_result = match scalar_func {
                             ScalarFunc::NumericLt => a < b,
                             ScalarFunc::NumericEq => a == b,
@@ -11752,9 +11905,20 @@ pub fn op_insert(
             OpInsertSubState::MaybeCaptureRecord => {
                 let has_dependent_views = {
                     let schema = program.connection.schema.read();
-                    !schema
+                    let has = !schema
                         .get_dependent_materialized_views(table_name)
-                        .is_empty()
+                        .is_empty();
+                    // Recipe backfill: the view maintenance below reads the raw old record.
+                    if has
+                        && schema
+                            .get_btree_table(table_name)
+                            .is_some_and(|t| t.recipes.is_some())
+                    {
+                        return Err(LimboError::InternalError(format!(
+                            "materialized view maintenance on recipe table {table_name} is refused"
+                        )));
+                    }
+                    has
                 };
                 // If there are no dependent views, we don't need to capture the old record.
                 // We also don't need to do it if the rowid of the UPDATEd row was changed, because
@@ -12132,6 +12296,15 @@ pub fn op_delete(
                 if dependent_views.is_empty() {
                     state.active_op_state.delete().sub_state = OpDeleteSubState::Delete;
                     continue;
+                }
+                // Recipe backfill: the view maintenance below reads the raw record. Refused.
+                if schema
+                    .get_btree_table(table_name)
+                    .is_some_and(|t| t.recipes.is_some())
+                {
+                    return Err(LimboError::InternalError(format!(
+                        "materialized view maintenance on recipe table {table_name} is refused"
+                    )));
                 }
 
                 let deleted_record = {
@@ -12989,6 +13162,7 @@ pub fn op_open_write(
         insn
     );
     invalidate_deferred_seeks_for_cursor(state, *cursor_id);
+    state.recipe_exec.set_ephemeral(*cursor_id, false);
     if program.connection.is_readonly(*db) {
         return Err(LimboError::ReadOnly);
     }
@@ -13350,6 +13524,9 @@ pub fn op_index_method_query(
         .as_mut()
         .expect("cursor should exist");
     let cursor = cursor.as_index_method_mut();
+    // Repositioning the cursor clears any outer-join null-row flag left over from a previous
+    // outer row that had no match (mirrors BTree clearing its null flag on seek/rewind).
+    cursor.set_null_flag(false);
     let has_rows =
         return_if_io!(cursor.query_start(&state.registers[*start_reg..*start_reg + *count_reg]));
     if !has_rows {
@@ -15338,6 +15515,9 @@ pub fn op_open_ephemeral(
         Insn::OpenAutoindex { cursor_id } => (*cursor_id, false),
         _ => unreachable!("unexpected Insn {:?}", insn),
     };
+    // Recipe backfill: an ephemeral table typed as a recipe table holds the statement's own
+    // records, never the table's stale rows (see `crate::recipe::current_row`).
+    state.recipe_exec.set_ephemeral(cursor_id, true);
     let mv_store = program.connection.mv_store();
     match state.active_op_state.open_ephemeral() {
         OpOpenEphemeralState::Start => {
@@ -15534,6 +15714,9 @@ pub fn op_open_dup(
         },
         insn
     );
+    // Recipe backfill: a duplicate of an ephemeral cursor is ephemeral (see `crate::recipe`).
+    let dup_ephemeral = state.recipe_exec.is_ephemeral(*original_cursor_id);
+    state.recipe_exec.set_ephemeral(*new_cursor_id, dup_ephemeral);
     let mv_store = program.connection.mv_store();
 
     let original_cursor = state.get_cursor(*original_cursor_id);
@@ -15660,6 +15843,33 @@ pub fn op_reset_once(
     let start = state.pc;
     let end = region_end.as_offset_int();
     state.once.retain(|pc| *pc <= start || *pc >= end);
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Execute the [Insn::CatchBegin] instruction: until [Insn::CatchEnd], a catchable value error
+/// jumps to `target_pc` (`Program::normal_step`).
+pub fn op_catch_begin(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(CatchBegin { target_pc }, insn);
+    assert!(target_pc.is_offset());
+    state.catch_target = Some(target_pc.as_offset_int());
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Execute the [Insn::CatchEnd] instruction: close the catch region.
+pub fn op_catch_end(
+    _program: &Program,
+    state: &mut ProgramState,
+    _insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    state.catch_target = None;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -16498,6 +16708,44 @@ pub fn op_add_column(
         Ok(())
     })??;
 
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// The in-memory half of a recipe backfill (lane k1-recipe-build, see `crate::recipe`): the
+/// `sqlite_schema` rows are already written; this attaches the recipe to the table and counts the
+/// rows the read-only pass matched as the UPDATE's changes.
+pub fn op_recipe_install(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(RecipeInstall { data }, insn);
+    if data.empty {
+        crate::recipe::count(crate::recipe::counter::EMPTY_MATCH, 1);
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+    let conn = program.connection.clone();
+    conn.with_database_schema_mut(crate::MAIN_DB_ID, |schema| {
+        crate::recipe::install_in_schema(
+            schema,
+            &data.table,
+            data.generation,
+            &data.sql,
+            data.add_gen_col,
+        )
+    })??;
+    let matched = match state.registers[data.count_reg].get_value() {
+        Value::Numeric(crate::numeric::Numeric::Integer(n)) if *n >= 0 => *n,
+        other => {
+            return Err(LimboError::InternalError(format!(
+                "RecipeInstall: matched-row count is {other:?}"
+            )))
+        }
+    };
+    state.record_statement_changes(matched);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }

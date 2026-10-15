@@ -18,6 +18,10 @@ fn index_seek_affinities(seek_def: &SeekDef, seek_key: &SeekKey) -> String {
         .collect()
 }
 
+/// ENCODE each custom-type key component of an index seek in place, as the index stores it. For a
+/// type with a function '=' (`seek_key_eq_function`), `emit_seek_key_encode_or_empty`: a key the
+/// ENCODE refuses or does not keep exactly makes the seek empty (a jump to `loop_end`).
+#[allow(clippy::too_many_arguments)]
 fn encode_seek_keys_for_custom_types(
     program: &mut ProgramBuilder,
     tables: &TableReferences,
@@ -25,6 +29,7 @@ fn encode_seek_keys_for_custom_types(
     start_reg: usize,
     num_keys: usize,
     idx_col_offset: usize,
+    loop_end: BranchOffset,
     resolver: &Resolver<'_>,
 ) -> crate::Result<()> {
     let table = tables
@@ -62,17 +67,151 @@ fn encode_seek_keys_for_custom_types(
             reg,
             target_pc: skip_label,
         });
-        crate::translate::expr::emit_type_expr(
-            program,
-            encode_expr,
-            reg,
-            reg,
-            table_col,
-            type_def,
-            resolver,
-        )?;
+        if let Some(eq_func) = crate::translate::expr::seek_key_eq_function(type_def) {
+            emit_seek_key_encode_or_empty(
+                program,
+                SeekKeyEncode {
+                    encode_expr,
+                    reg,
+                    column: table_col,
+                    type_def: &**type_def,
+                    eq_func,
+                    loop_end,
+                    done: skip_label,
+                },
+                resolver,
+            )?;
+        } else {
+            crate::translate::expr::emit_type_expr(
+                program,
+                encode_expr,
+                reg,
+                reg,
+                table_col,
+                type_def,
+                resolver,
+            )?;
+        }
         program.preassign_label_to_next_insn(skip_label);
     }
+    Ok(())
+}
+
+/// One seek key component of a custom type with a function '=' (`emit_seek_key_encode_or_empty`).
+struct SeekKeyEncode<'a> {
+    encode_expr: &'a turso_parser::ast::Expr,
+    /// Holds the key as given; holds its encoding once the code below falls through to `done`.
+    reg: usize,
+    column: &'a crate::schema::Column,
+    type_def: &'a crate::schema::TypeDef,
+    eq_func: &'a str,
+    /// The seek's loop end: an empty seek.
+    loop_end: BranchOffset,
+    /// Past the key's encoding.
+    done: BranchOffset,
+}
+
+/// Engine review 16 HIGH 2: an index seek's key never goes through an ENCODE that can raise or
+/// lose precision. The ENCODE runs inside a catch region (`Insn::CatchBegin`; a RAISE in it jumps
+/// too, `ProgramBuilder::catch_raise_target`), into a register of its own; the encoding is decoded
+/// and compared with the key under the type's own '='. A key the ENCODE refuses (numeric's "out of
+/// range", a length check's 'value too long') or does not keep (1.501 cut to numeric(10, 2)'s 1.50)
+/// equals no stored value, so the seek is empty: what a scan, which passes the operand to the
+/// operator as given, answers. Otherwise the key becomes its encoding, and the WHERE term stays for
+/// the type's operator to re-check each row (`seek_key_eq_function`).
+///
+/// ```text
+///   CatchBegin refused
+///   encoded = ENCODE(key)          ; RAISE -> Goto refused
+///   args[0] = DECODE(encoded)
+///   args[1] = key
+///   equal   = eq_func(args)
+///   CatchEnd
+///   IfNot equal -> loop_end        ; NULL too
+///   key = encoded
+///   Goto done
+/// refused:
+///   CatchEnd
+///   Goto loop_end
+/// ```
+fn emit_seek_key_encode_or_empty(
+    program: &mut ProgramBuilder,
+    key: SeekKeyEncode<'_>,
+    resolver: &Resolver<'_>,
+) -> crate::Result<()> {
+    let func = resolver.resolve_function(key.eq_func, 2)?.ok_or_else(|| {
+        crate::LimboError::InternalError(format!("function not found: {}", key.eq_func))
+    })?;
+    let refused = program.allocate_label();
+    let encoded = program.alloc_register();
+    let args = program.alloc_registers(2);
+    let equal = program.alloc_register();
+    program.emit_insn(Insn::CatchBegin { target_pc: refused });
+    let outer = program.catch_raise_target.replace(refused);
+    let round_trip = crate::translate::expr::emit_type_expr(
+        program,
+        key.encode_expr,
+        key.reg,
+        encoded,
+        key.column,
+        key.type_def,
+        resolver,
+    )
+    .and_then(|_| match key.type_def.decode() {
+        Some(decode_expr) => crate::translate::expr::emit_type_expr(
+            program,
+            decode_expr,
+            encoded,
+            args,
+            key.column,
+            key.type_def,
+            resolver,
+        )
+        .map(|_| ()),
+        None => {
+            program.emit_insn(Insn::Copy {
+                src_reg: encoded,
+                dst_reg: args,
+                extra_amount: 0,
+            });
+            Ok(())
+        }
+    });
+    program.catch_raise_target = outer;
+    round_trip?;
+    program.emit_insn(Insn::Copy {
+        src_reg: key.reg,
+        dst_reg: args + 1,
+        extra_amount: 0,
+    });
+    program.emit_insn(Insn::Function {
+        constant_mask: 0,
+        start_reg: args,
+        dest: equal,
+        func: crate::function::FuncCtx {
+            func,
+            arg_count: 2,
+        },
+    });
+    program.emit_insn(Insn::CatchEnd);
+    program.emit_insn(Insn::IfNot {
+        reg: equal,
+        target_pc: key.loop_end,
+        jump_if_null: true,
+    });
+    program.emit_insn(Insn::Copy {
+        src_reg: encoded,
+        dst_reg: key.reg,
+        extra_amount: 0,
+    });
+    program.emit_insn(Insn::Goto {
+        target_pc: key.done,
+    });
+    program.preassign_label_to_next_insn(refused);
+    program.emit_insn(Insn::CatchEnd);
+    program.emit_insn(Insn::Goto {
+        target_pc: key.loop_end,
+    });
     Ok(())
 }
 
@@ -217,6 +356,7 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                 self.start_reg,
                 num_regs,
                 0,
+                self.loop_end,
                 &self.t_ctx.resolver,
             )?;
             let affinities = index_seek_affinities(self.seek_def, &self.seek_def.start);
@@ -344,6 +484,7 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                         last_reg,
                         1,
                         self.seek_def.prefix.len(),
+                        self.loop_end,
                         &self.t_ctx.resolver,
                     )?;
                     let affinities = index_seek_affinities(self.seek_def, &self.seek_def.end);

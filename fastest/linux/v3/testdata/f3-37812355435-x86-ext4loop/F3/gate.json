@@ -1,0 +1,76 @@
+{
+ "cell": "ext4loop",
+ "d0_control": "pass (nosync25 p50 3.0 us < 50 us)",
+ "flush_gate": {
+  "blkflush_leaf_gate": {
+   "arms": {
+    "append25": {
+     "windows_without_a_flush_carrying_request": {
+      "layer 0 (loop0)": 0,
+      "layer 1 (nvme0n1)": 0
+     }
+    },
+    "append64": {
+     "windows_without_a_flush_carrying_request": {
+      "layer 0 (loop0)": 0,
+      "layer 1 (nvme0n1)": 0
+     }
+    },
+    "cfr2b": {
+     "windows_without_a_flush_carrying_request": {
+      "layer 0 (loop0)": 0,
+      "layer 1 (nvme0n1)": 0
+     }
+    },
+    "fdatasync4k": {
+     "windows_without_a_flush_carrying_request": {
+      "layer 0 (loop0)": 0,
+      "layer 1 (nvme0n1)": 0
+     }
+    },
+    "ow1m": {
+     "windows_without_a_flush_carrying_request": {
+      "layer 0 (loop0)": 0,
+      "layer 1 (nvme0n1)": 0
+     }
+    },
+    "ow4k": {
+     "windows_without_a_flush_carrying_request": {
+      "layer 0 (loop0)": 0,
+      "layer 1 (nvme0n1)": 0
+     }
+    },
+    "ow64k": {
+     "windows_without_a_flush_carrying_request": {
+      "layer 0 (loop0)": 0,
+      "layer 1 (nvme0n1)": 0
+     }
+    }
+   },
+   "outcome": "pass"
+  },
+  "gated_arms_run": [
+   "append25",
+   "append64",
+   "cfr2b",
+   "fdatasync4k",
+   "ow1m",
+   "ow4k",
+   "ow64k"
+  ],
+  "instrument": "/proc/diskstats fields 19-20 (flush requests completed), stamp_end - stamp_start; a lower bound (other processes' flushes pad it)",
+  "leaf": "nvme0n1",
+  "leaf_class": "wb",
+  "leaf_flushes_completed": 2813,
+  "n": 200,
+  "outcome": "pass",
+  "required_flushes": 1400,
+  "voids": []
+ },
+ "mode": "smoke",
+ "rc": 0,
+ "refusals": [],
+ "timing_control": "pass",
+ "verdict": null,
+ "voids": []
+}

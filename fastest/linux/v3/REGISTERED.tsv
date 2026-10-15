@@ -1,0 +1,19 @@
+# REGISTERED.tsv -- the V3 probe's registered values (annex ruling A17; gate-6 review MED 5). One line per value:
+#   key<TAB>value<TAB>registration ref (the DECISIONS stamp that registered it)
+# Keys:
+#   d0_threshold/<fstype>/<wb|wt|brd>/<vm|bare|nr>   the append25 / nosync25 p50 ratio the timing control needs (A17)
+#   frame_arm                                        the frame arm (PREREG section 4; fixed in the Registration annex)
+# The probe reads this file (run.sh passes --registered); a key with no line here is "provisional 10" (thresholds) or
+# "none" (frame arm), recorded as such, and run.sh refuses either in rental mode (V3_REQUIRE_T3=1). Lines are added
+# ONLY by a registration (the lead), never by the lane; a changed line changes check.py's harness hash, so every
+# verdict made before it stops binding.
+#
+# CANDIDATES (not registered; the derivation the registration can take, from banked fire-checks, check.py's rule:
+# the geometric mean of the class's largest mutant ratio (F2b, no fsync) and smallest real ratio (F3), when they
+# separate). Hosted runners only: the T3 hosts' classes (bare) have no banked cell yet; their first fire-check
+# records d0_threshold_derivation in its verdict, and the registration is made from that, before any timed batch.
+#   d0_threshold/btrfs/wb/vm   cells 3  max mutant 1.01  min real 93.90  candidate 9.74
+#   d0_threshold/ext4/wb/vm    cells 7  max mutant 1.01  min real 56.40  candidate 7.55
+#   d0_threshold/xfs/wb/vm     cells 4  max mutant 1.22  min real 78.40  candidate 9.78
+#   (write-through and brd classes: the timing control is not applicable, A14; no threshold needed)
+#   frame_arm                  candidate ow4k (the smallest registered M0 arm >= a ~60 B create frame, unverified)

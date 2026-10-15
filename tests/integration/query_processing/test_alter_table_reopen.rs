@@ -263,3 +263,45 @@ fn test_alter_table_add_column_preserves_collation_on_reopen() {
         conn.close().unwrap();
     }
 }
+
+#[test]
+fn test_alter_table_add_column_keeps_implicit_foreign_key_reference_on_reopen() {
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir.path().join("alter_add_col_implicit_fk_ref.db");
+
+    {
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE u(k INTEGER PRIMARY KEY)")
+            .unwrap();
+        conn.execute("CREATE TABLE t(x REFERENCES u)").unwrap();
+        conn.execute("INSERT INTO u VALUES (1)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        conn.execute("ALTER TABLE t ADD COLUMN s").unwrap();
+
+        let sql: Vec<(String,)> = conn.exec_rows("SELECT sql FROM sqlite_schema WHERE name = 't'");
+        assert_eq!(
+            sql,
+            vec![("CREATE TABLE t (x, s, FOREIGN KEY (x) REFERENCES u)".to_string(),)]
+        );
+
+        conn.close().unwrap();
+    }
+
+    {
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+
+        let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+        assert_eq!(integrity, vec![("ok".to_string(),)]);
+
+        let fk: Vec<(String, String)> =
+            conn.exec_rows("SELECT \"table\", \"from\" FROM pragma_foreign_key_list('t')");
+        assert_eq!(fk, vec![("u".to_string(), "x".to_string())]);
+
+        let rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM t");
+        assert_eq!(rows, vec![(1,)]);
+
+        conn.close().unwrap();
+    }
+}

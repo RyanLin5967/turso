@@ -1763,4 +1763,106 @@ mod tests {
             turso_database_deinit(db);
         }
     }
+
+    /// Engine review 11 MED 4, the C API half of the busy-timeout spin (DECISIONS f8eb23bca): in
+    /// async mode (async_io=1: the Go driver with async=1, the Python sync driver, React Native's
+    /// synced database, dotnet) a busy handler's `StepResult::Sleep` comes back as TURSO_IO, and
+    /// the caller's answer to TURSO_IO, turso_statement_run_io, stepped the IO backend, which
+    /// returns at once when nothing is in flight (the syscall backend always). So the caller's
+    /// execute / run_io loop spun a core for the whole busy timeout. Here a C caller's loop waits
+    /// out a 500 ms busy timeout behind another connection's open write transaction, and the
+    /// waiting thread's CPU time over the wait must be a small fraction of it.
+    #[cfg(unix)]
+    #[test]
+    pub fn a_c_api_async_busy_wait_sleeps_rather_than_spins() {
+        /// A C caller's loop over one statement: execute, and run_io after every TURSO_IO.
+        fn execute_to_end(statement: *mut c::turso_statement_t) -> turso_status_code_t {
+            loop {
+                let status = unsafe {
+                    turso_statement_execute(statement, std::ptr::null_mut(), std::ptr::null_mut())
+                };
+                if status != turso_status_code_t::TURSO_IO {
+                    return status;
+                }
+                let status = unsafe { turso_statement_run_io(statement, std::ptr::null_mut()) };
+                assert_eq!(status, turso_status_code_t::TURSO_OK, "run_io failed");
+            }
+        }
+        fn prepare(
+            connection: *mut c::turso_connection_t,
+            sql: &CStr,
+        ) -> *mut c::turso_statement_t {
+            let mut statement = std::ptr::null_mut();
+            let status = unsafe {
+                turso_connection_prepare_single(
+                    connection,
+                    sql.as_ptr(),
+                    &mut statement,
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_eq!(status, turso_status_code_t::TURSO_OK);
+            statement
+        }
+        unsafe {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = CString::new(dir.path().join("busy.db").to_str().unwrap()).unwrap();
+            let config = c::turso_database_config_t {
+                path: path.as_ptr(),
+                async_io: 1,
+                ..Default::default()
+            };
+            let mut db = std::ptr::null();
+            let status = turso_database_new(&config, &mut db, std::ptr::null_mut());
+            assert_eq!(status, turso_status_code_t::TURSO_OK);
+            // An async open is driven by opening again; the syscall backend completes each read
+            // inside the call that issues it.
+            loop {
+                let status = turso_database_open(db, std::ptr::null_mut());
+                if status == turso_status_code_t::TURSO_OK {
+                    break;
+                }
+                assert_eq!(status, turso_status_code_t::TURSO_IO, "open failed");
+            }
+
+            let mut holder = std::ptr::null_mut();
+            let status = turso_database_connect(db, &mut holder, std::ptr::null_mut());
+            assert_eq!(status, turso_status_code_t::TURSO_OK);
+            for sql in [c"CREATE TABLE t(x)", c"BEGIN", c"INSERT INTO t VALUES (1)"] {
+                let statement = prepare(holder, sql);
+                assert_eq!(execute_to_end(statement), turso_status_code_t::TURSO_DONE);
+                turso_statement_deinit(statement);
+            }
+            let mut waiter = std::ptr::null_mut();
+            let status = turso_database_connect(db, &mut waiter, std::ptr::null_mut());
+            assert_eq!(status, turso_status_code_t::TURSO_OK);
+            c::turso_connection_set_busy_timeout_ms(waiter, 500);
+
+            let insert = prepare(waiter, c"INSERT INTO t VALUES (2)");
+            let (wall, cpu) = (std::time::Instant::now(), crate::thread_cpu());
+            let refused = execute_to_end(insert);
+            let (waited, spent) = (wall.elapsed(), crate::thread_cpu() - cpu);
+            assert_eq!(
+                refused,
+                turso_status_code_t::TURSO_BUSY,
+                "premise: the second writer is refused busy"
+            );
+            assert!(
+                waited >= std::time::Duration::from_millis(450),
+                "premise: the busy timeout was waited out (waited {waited:?})"
+            );
+            assert!(
+                spent < std::time::Duration::from_millis(100),
+                "the busy wait spent {spent:?} of CPU over {waited:?}: it spun"
+            );
+            turso_statement_deinit(insert);
+
+            let commit = prepare(holder, c"COMMIT");
+            assert_eq!(execute_to_end(commit), turso_status_code_t::TURSO_DONE);
+            turso_statement_deinit(commit);
+            turso_connection_deinit(waiter);
+            turso_connection_deinit(holder);
+            turso_database_deinit(db);
+        }
+    }
 }

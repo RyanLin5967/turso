@@ -859,6 +859,15 @@ pub struct LiteralConfig {
     /// Character set for generated strings.
     pub string_charset: StringCharset,
 
+    /// Probability [0.0, 1.0] that a numeric literal comes from the boundary-value table
+    /// instead of a uniform draw over the int/real window.
+    ///
+    /// A minority share on purpose: the uniform draw keeps seeds diverse, and the aim is to
+    /// make boundaries REACHABLE, not dominant. The table deliberately ignores
+    /// int_min/int_max, since the values worth testing sit outside any sensible
+    /// ordinary-value window; set this to 0.0 to opt out entirely.
+    pub boundary_value_probability: f64,
+
     /// Weights for literal types.
     pub type_weights: LiteralTypeWeights,
 
@@ -882,6 +891,7 @@ impl Default for LiteralConfig {
             blob_min_size: 1,
             blob_max_size: 100,
             string_charset: StringCharset::Alphanumeric,
+            boundary_value_probability: 0.25,
             type_weights: LiteralTypeWeights::default(),
             array_min_size: 0,
             array_max_size: 10,
@@ -891,23 +901,32 @@ impl Default for LiteralConfig {
 
 impl LiteralConfig {
     /// Create config for small integer ranges (useful for testing).
+    ///
+    /// Opts out of the boundary table: a caller asking for small integers wants small
+    /// integers, and the table ignores the window by design.
     pub fn small_integers() -> Self {
         Self {
             int_min: -100,
             int_max: 100,
             real_min: -100.0,
             real_max: 100.0,
+            boundary_value_probability: 0.0,
             ..Default::default()
         }
     }
 
     /// Create config for positive integers only.
+    ///
+    /// Opts out of the boundary table, like `small_integers`: that table ignores the
+    /// configured window by design and contains negative values, so a config promising
+    /// non-negative numbers would otherwise return them about a quarter of the time.
     pub fn positive_integers() -> Self {
         Self {
             int_min: 0,
             int_max: 1_000_000,
             real_min: 0.0,
             real_max: 1_000_000.0,
+            boundary_value_probability: 0.0,
             ..Default::default()
         }
     }

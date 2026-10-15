@@ -251,6 +251,39 @@ pub enum BranchDurability {
     Catalog { sync: SyncClass },
 }
 
+/// How a catalog store checkpoints (lead review 1 item 7). `Fuzzy` (the default): the capture is
+/// taken under the store mutex and everything else — the catalog write and its flushes — runs on a
+/// thread of its own, so no operation waits for it. `Sharp`: capture, write and install all under
+/// the store mutex, inside the operation that crossed the threshold (the base's checkpoint, which
+/// keeps the log under the threshold plus one operation's records). A snapshot store's compaction
+/// is always sharp; the F7 splice arm takes `Sharp` unless asked otherwise (and refuses `Fuzzy`,
+/// r13-compose S-12). `R11_CKPT=fuzzy|sharp` sets the mode an open does not name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BranchCheckpoint {
+    Fuzzy,
+    Sharp,
+}
+
+impl BranchCheckpoint {
+    /// The mode an open uses: `asked`, else `R11_CKPT`, else fuzzy (sharp in the splice arm).
+    /// `R11_CKPT` names it exactly, "fuzzy" or "sharp"; any other value refuses the open, where it
+    /// silently meant fuzzy (review 4 #8).
+    pub(crate) fn resolve(asked: Option<BranchCheckpoint>, splice: bool) -> crate::Result<BranchCheckpoint> {
+        if let Some(asked) = asked {
+            return Ok(asked);
+        }
+        match std::env::var("R11_CKPT") {
+            Ok(v) if v == "fuzzy" => Ok(BranchCheckpoint::Fuzzy),
+            Ok(v) if v == "sharp" => Ok(BranchCheckpoint::Sharp),
+            Err(std::env::VarError::NotPresent) if splice => Ok(BranchCheckpoint::Sharp),
+            Err(std::env::VarError::NotPresent) => Ok(BranchCheckpoint::Fuzzy),
+            other => Err(crate::LimboError::InvalidArgument(format!(
+                "R11_CKPT={other:?}: the branch checkpoint mode is \"fuzzy\" or \"sharp\""
+            ))),
+        }
+    }
+}
+
 impl BranchDurability {
     /// The flush class of a durable store; `None` for a volatile one.
     pub fn sync_class(&self) -> Option<SyncClass> {
@@ -318,8 +351,8 @@ impl SyncClass {
 }
 
 /// Every sync this process issued through the branch store's files or the platform IO backend, by
-/// primitive (fastest-engine instrument V1-in-process; observing only): `fsync(2)` calls and
-/// `fcntl(F_FULLFSYNC)` calls. A cross-check of the DYLD syscall shim, never a substitute for it:
+/// primitive (fastest-engine instrument V1-in-process; observing only): `fsync(2)` calls,
+/// `fcntl(F_FULLFSYNC)` calls and `fcntl(F_BARRIERFSYNC)` calls. A cross-check of the DYLD syscall shim, never a substitute for it:
 /// a sync issued by anything else (the catalog's own IO is the platform backend, so it IS counted)
 /// does not appear.
 #[doc(hidden)]
@@ -327,6 +360,10 @@ impl SyncClass {
 pub struct SyncCounts {
     pub fsync: u64,
     pub full_fsync: u64,
+    pub barrier: u64,
+    /// `fcntl(F_BARRIERFSYNC)` calls the file system refused as unsupported, each replaced by a
+    /// full sync (counted in `full_fsync` too; review 3 #4).
+    pub barrier_fallback: u64,
 }
 
 /// A distribution of lock holds, in nanoseconds (fastest-engine M1 item 5; observing only): the
@@ -408,6 +445,8 @@ pub fn sync_counts() -> SyncCounts {
     SyncCounts {
         fsync: crate::io::SYNC_COUNTS[0].load(Relaxed),
         full_fsync: crate::io::SYNC_COUNTS[1].load(Relaxed),
+        barrier: crate::io::SYNC_COUNTS[2].load(Relaxed),
+        barrier_fallback: crate::io::SYNC_COUNTS[3].load(Relaxed),
     }
 }
 
@@ -440,6 +479,37 @@ pub enum BranchFailpoint {
     /// carries an early-released operation's records — fails as an I/O error would, after the
     /// operation was applied.
     GroupFlightFails,
+    /// The next group flight cannot even be taken: duplicating the log's descriptor for it fails,
+    /// as EMFILE would, after the operation was applied (fastest-engine review B-F1).
+    GroupFlightTakeFails,
+    /// The next trunk commit's copy-decision pass returns `Busy` after its first decision, as a
+    /// catalog read refused by the catalog's lock would; the statement retries the commit
+    /// (fastest-engine review A-F2).
+    TrunkDecisionBusy,
+    /// The next catalog probe that dates a trunk page's last write (`trunk_written_known`) returns
+    /// `Busy`, as a catalog read refused by the catalog's lock would (review 3 #2).
+    TrunkProbeBusy,
+    /// The next arena sync a compaction (snapshot store) or a catalog checkpoint makes fails as an
+    /// I/O error would (review 3 #5).
+    ArenaSyncFails,
+    /// The next fuzzy checkpoint's capture fails at its read snapshot, as a catalog error would
+    /// (review 4 #2).
+    CaptureFails,
+    /// The next fuzzy checkpoint's thread cannot be spawned (review 4 #2).
+    SpawnFails,
+    /// The confirmation word of the next group flight fails to reach the log's header, as an I/O
+    /// error would (review 6 #1).
+    ConfirmWriteFails,
+    /// The next sync of a temp file that is to replace a branch file (a cut's or rewrite's new
+    /// log, a reset log, a compaction's snapshot) fails as an I/O error would (review 6 #2).
+    ReplacementSyncFails,
+    /// The next capture that takes a handle on the arena file to sync it (a sharp catalog
+    /// checkpoint over unsynced slots) cannot duplicate it, as `dup` failing would (engine review 8
+    /// #3: the capture's other fallible step, beside its read snapshot).
+    ArenaHandleFails,
+    /// The next held-free upgrade's sync (`BranchStore::sync_upgrade`) fails as an I/O error would
+    /// (engine review 21 MED 4: nothing could fail it before).
+    UpgradeSyncFails,
 }
 
 /// A live branch: an isolated, writable view of the database as it was when the branch was forked.
@@ -552,6 +622,12 @@ pub struct BranchOpenStats {
     /// of the tail, a release or the expiry pass touched the branch).
     pub parked_records: u64,
     pub parked_applied: u64,
+    /// Snapshot stores (engine review 7 #4): copies of the recovered snapshot state made at the
+    /// open, and replays of snapshot and log (a second one when the last flight's check failed),
+    /// and the slots the last flight's check read.
+    pub snapshot_copies: u64,
+    pub replays: u64,
+    pub checked_slots: u64,
 }
 
 /// The Merger's work since open (r13-compose, the Merger port; observing only). Every field is an
@@ -818,9 +894,13 @@ impl Branch {
         store::take_counted_hold();
         // Early release (fastest-engine M1 item 2): the fork is applied and every lock released;
         // the branch is handed out only once its records are durable.
-        let forked = store
-            .fork_branch(self.id, None)
-            .and_then(|(id, lsn)| store.wait_durable(lsn, store.sync_class()).map(|()| id));
+        let forked = store.fork_branch(self.id, None).and_then(|(id, lsn)| {
+            store.wait_durable(lsn, store.sync_class()).inspect_err(|_| {
+                // Not handed out, so released (review item 11).
+                let _ = store.release_handle(id);
+            })?;
+            Ok(id)
+        });
         let held = store::take_counted_hold();
         let id = forked?;
         store.record_fork(held, None);
@@ -952,8 +1032,17 @@ impl Connection {
         // Early release (fastest-engine M1 item 2): the fork is applied and every lock is released,
         // the trunk's WAL write lock included; the branch is handed out only once its records are
         // durable.
-        let forked = forked.and_then(|(id, wal, lsn)| {
-            store.wait_durable(lsn, store.sync_class()).map(|()| (id, wal))
+        let forked = forked.and_then(|(id, wal, lsn)| match store.wait_durable(lsn, store.sync_class()) {
+            Ok(()) => Ok((id, wal)),
+            Err(e) => {
+                // Not handed out, so released (review item 11): on a live store the Release rides
+                // the next flight; a fail-stopped one keeps it pending (`release_handle`).
+                // fastest-engine mutant `fork_failure_kept` (test builds only) keeps it.
+                if !store::fe_mutant("fork_failure_kept") {
+                    let _ = store.release_handle(id);
+                }
+                Err(e)
+            }
         });
         let held = store::take_counted_hold();
         let (id, wal) = forked?;
@@ -965,9 +1054,10 @@ impl Connection {
     /// the epoch there (see `BranchStore::begin_trunk_commit`), so a fork needs no WAL write lock:
     /// it takes a read snapshot and registers in the branch store at once; a commit decided since
     /// its snapshot makes it fork after that commit, and one still in flight is waited out before
-    /// the branch is handed out (`BranchStore::fork_trunk`). It never waits out a write
-    /// transaction, never retries, and never serialises with another fork on the WAL (F-L,
-    /// r11-forklock 573642f19, on the durable store).
+    /// the branch is handed out, and by any other opener before it reads anything
+    /// (`BranchStore::settle`; review A-F3). It never waits out a write transaction, never retries,
+    /// and never serialises with another fork on the WAL (F-L, r11-forklock 573642f19, on the
+    /// durable store).
     ///
     /// The trunk's first live child is forked under the WAL write lock instead: a writer that saw no
     /// child captured no pre-images, so no child may appear before its commit.
@@ -984,9 +1074,18 @@ impl Connection {
         match forked? {
             store::TrunkFork::Forked { id, lsn, after } => {
                 // A trunk commit in flight at the registration: the child forks after it, and is
-                // handed out only once it is published.
+                // handed out only once it is published (its other openers wait in `settle`). The
+                // wait comes before the fork's own flight, which then does not contend with that
+                // commit's WAL flush (lead review 1, item 42). A fork that is not handed out is
+                // released (review item 11).
                 if let Some(c) = after {
-                    store.wait_trunk_commit_published(c)?;
+                    if let Err(e) = store.wait_trunk_commit_published(c) {
+                        // fastest-engine mutant `fork_failure_kept` (test builds only).
+                        if !store::fe_mutant("fork_failure_kept") {
+                            let _ = store.release_handle(id);
+                        }
+                        return Err(e);
+                    }
                 }
                 Ok((id, store::WalHold::default(), lsn))
             }
@@ -1047,19 +1146,60 @@ impl Connection {
         seen: Option<u64>,
         name: Option<&str>,
     ) -> Result<store::TrunkFork> {
+        #[cfg(test)]
+        crate::branch::budget_probe::fork_registration();
         let cookie = pager
             .io
             .block(|| pager.with_header(|header| header.schema_cookie.get()))?;
         // The branch starts with the schema that matches the committed pages it will read. The
-        // connection's own snapshot or the shared one is that schema whenever the cookie agrees;
-        // if neither does, a DDL commit is between publishing its pages and its schema, and the
-        // caller retries rather than fork a branch whose schema disagrees with its pages.
-        let schema = [self.schema.read().clone(), self.db.clone_schema()]
+        // connection's own snapshot or the shared one is that schema whenever the cookie agrees.
+        // If neither does, a DDL commit is between publishing its pages and its schema, and the
+        // child is registered with none: it reads its own from its pages at its first connection,
+        // as any fork after a trunk commit does (engine 2b: refused, a create failed whenever it
+        // met that window; engine review 16 MED 8: re-read here, the whole schema into the
+        // forker's connection, sometimes under the WAL write lock). Mutants (test builds only):
+        // `fork_refuses_schema_window` (refused with SchemaUpdated, as before 2b) and
+        // `fork_rereads_schema_window` (re-read here, as before MED 8).
+        let in_hand = [self.schema.read().clone(), self.db.clone_schema()]
             .into_iter()
-            .find(|schema| schema.schema_version == cookie)
-            .ok_or(LimboError::SchemaUpdated)?;
+            .find(|schema| schema.schema_version == cookie);
+        #[cfg(test)]
+        if in_hand.is_none() {
+            crate::branch::budget_probe::schema_window_met();
+        }
+        let schema = match in_hand {
+            Some(schema) => Some(schema),
+            None if store::fe_mutant("fork_refuses_schema_window") => {
+                return Err(LimboError::SchemaUpdated)
+            }
+            None if store::fe_mutant("fork_rereads_schema_window") => Some(self.reread_schema_at_snapshot(cookie)?),
+            None => None,
+        };
         let page_size = pager.get_page_size_unchecked().get() as usize;
         self.db.branches.fork_trunk(schema, page_size, seen, name)
+    }
+
+    /// The schema this connection's open read snapshot holds, re-read from its pages into the
+    /// connection: mutant `fork_rereads_schema_window`'s path only (engine review 16 MED 8 moved
+    /// the read to the child's first connection). A failed re-read leaves the connection the
+    /// schema it had.
+    fn reread_schema_at_snapshot(
+        self: &Arc<Connection>,
+        cookie: u32,
+    ) -> Result<Arc<crate::schema::Schema>> {
+        let kept = self.schema.read().clone();
+        self.set_tx_state(TransactionState::Read);
+        let reread = self.reparse_schema();
+        self.set_tx_state(TransactionState::None);
+        let schema = self.schema.read().clone();
+        match reread {
+            Ok(()) if schema.schema_version == cookie => Ok(schema),
+            other => {
+                *self.schema.write() = kept;
+                other?;
+                Err(LimboError::SchemaUpdated)
+            }
+        }
     }
 
     /// The branch this connection is open on, if any.
@@ -1091,6 +1231,27 @@ impl Database {
     #[doc(hidden)]
     pub fn branch_catalog_counters(&self) -> (u64, u64, u64, u64) {
         self.branches.catalog_counters()
+    }
+
+    /// Wait until the catalog store's name filter is built after open (lead review 1 item 2), so a
+    /// test can count what a named create costs once it is.
+    #[doc(hidden)]
+    pub fn branch_wait_name_filter(&self) {
+        self.branches.wait_name_filter();
+    }
+
+    /// The checkpoint mode this database's branch store resolved at open (review 4 #8): what a
+    /// harness reports as its arm, rather than what it asked for.
+    #[doc(hidden)]
+    pub fn branch_checkpoint_mode(&self) -> BranchCheckpoint {
+        self.branches.checkpoint_mode()
+    }
+
+    /// The name filter (observation, review 3 #7): `(built, entries, the most entries one insert
+    /// moved, builds installed, failed catalog scans)`.
+    #[doc(hidden)]
+    pub fn branch_name_filter_stats(&self) -> (bool, u64, u64, u64, u64) {
+        self.branches.name_filter_stats()
     }
 
     /// What this open's prewarm did (r12-catload instrument, `R12_PREWARM`): `(mode, files warmed in
@@ -1218,7 +1379,8 @@ impl Database {
     }
 
     /// Re-attach a detached branch — one whose handle went through [`Branch::into_id`], or any
-    /// unreleased branch after a reopen.
+    /// unreleased branch after a reopen. A named server branch takes no handle: connect to it with
+    /// [`Database::connect_named`], release it with [`Database::drop_branch`].
     pub fn branch(self: &Arc<Database>, id: BranchId) -> Result<Branch> {
         self.branches.attach(id)?;
         Ok(Branch::new(self.clone(), id))
@@ -1230,24 +1392,57 @@ impl Database {
     }
 
     /// A connection on the branch named `name`, which needs no handle (fastest-engine M1 item 4).
+    /// Refused with `LimboError::NoSuchBranch` when no unreleased branch has the name, and with
+    /// `LimboError::BranchInUse` while the branch already has a connection.
     pub fn connect_named(self: &Arc<Database>, name: &str) -> Result<Arc<Connection>> {
         let id = self
             .branches
             .branch_named(name)?
-            .ok_or_else(|| LimboError::InvalidArgument(format!("no branch is named {name:?}")))?;
-        self.connect_branch(id)
+            .ok_or_else(|| store::untyped_branch_error(LimboError::NoSuchBranch(name.to_string())))?;
+        self.branches.pause_connect_looked_up();
+        // A drop that lands between the lookup and the open leaves the open an untyped error (the
+        // branch gone, or reaped): the name no longer names an unreleased branch, which is
+        // NoSuchBranch, as the lookup would now answer (engine review 14 MED 9). Error path only:
+        // the success path is unchanged. Mutant `connect_race_untyped` (test builds only): the
+        // open's own error, as before.
+        self.connect_branch(id).map_err(|e| {
+            if crate::branch::store::fe_mutant("connect_race_untyped")
+                || matches!(e, LimboError::NoSuchBranch(_))
+                || !self.branches.is_gone_or_released(id)
+            {
+                e
+            } else {
+                store::untyped_branch_error(LimboError::NoSuchBranch(name.to_string()))
+            }
+        })
     }
 
     /// Release the branch named `name` (fastest-engine M1 item 4); its name is free from here on.
+    /// Refused with `LimboError::NoSuchBranch` when no unreleased branch has the name, and with
+    /// `LimboError::BranchInUse` while the branch has an open connection (fastest-wire: a server
+    /// refuses to drop a database in use; a `Branch` handle's release instead keeps the branch
+    /// whole until its connection closes).
     pub fn drop_branch(&self, name: &str) -> Result<Reaped> {
         let id = self
             .branches
             .branch_named(name)?
-            .ok_or_else(|| LimboError::InvalidArgument(format!("no branch is named {name:?}")))?;
+            .ok_or_else(|| store::untyped_branch_error(LimboError::NoSuchBranch(name.to_string())))?;
         // A concurrent drop and re-create of the same name between the lookup and the release can
-        // only make this release the OLD branch twice, which is refused as reaped: the new branch
-        // is never touched (its id differs).
-        self.branches.release_handle(id)
+        // only make this release the OLD branch twice: the second release reports success once
+        // the first one's Release is durable (both callers wanted it gone, and it is), and the new
+        // branch is never touched (its id differs). A connect between the lookup and the release
+        // is refused by the release's own open check, made under the same store-mutex hold as the
+        // release (engine review 14 MED 7). Mutant `drop_check_separate_hold` (test builds only):
+        // the open check in a hold of its own before that window, the release unchecked after it.
+        let separate = crate::branch::store::fe_mutant("drop_check_separate_hold");
+        if separate {
+            self.branches.refuse_if_open(id)?;
+        }
+        self.branches.pause_drop_looked_up();
+        if separate {
+            return self.branches.release_handle(id);
+        }
+        self.branches.release_named(id)
     }
 
     /// Every unreleased branch, attached or not. Refused on a read-only handle of a database with
@@ -1299,6 +1494,17 @@ impl Database {
         self.branches.compact_now()
     }
 
+    /// A branch catalog checkpoint for a client that asks for one (a wire CHECKPOINT; wire review
+    /// 18 HIGH 3), which leaves the store mutex free while it writes, so no create, switch or
+    /// connect waits for it: a catalog store's fuzzy checkpoint, retried with back-off while one is
+    /// in flight, until `deadline`, then waited for. A store with no catalog compacts as
+    /// [`Database::branch_compact_now`] does. `Ok(true)`: a checkpoint installed; `Ok(false)`: none
+    /// did before the deadline. A fail-stopped store refuses.
+    #[doc(hidden)]
+    pub fn branch_checkpoint_now(&self, deadline: std::time::Duration) -> Result<bool> {
+        self.branches.checkpoint_now(deadline)
+    }
+
     /// Catalog checkpoint and settle counters (r11-restart-r2 instrument): `[checkpoints
     /// installed, fuzzy flights started, store-mutex hold ns inside checkpoints (sum, max), writer
     /// ns without the mutex, catalog statements under the mutex, settle batches, settle loads, most
@@ -1306,6 +1512,20 @@ impl Database {
     #[doc(hidden)]
     pub fn branch_checkpoint_counters(&self) -> [u64; 9] {
         self.branches.checkpoint_counters()
+    }
+
+    /// Fuzzy branch catalog checkpoint starts that failed and backed off (engine review 8 #3;
+    /// observing only).
+    #[doc(hidden)]
+    pub fn branch_checkpoint_start_failures(&self) -> u64 {
+        self.branches.checkpoint_start_failures()
+    }
+
+    /// Confirmation words written into the branch log's header, and those whose write failed
+    /// (review 6 #1; observing only).
+    #[doc(hidden)]
+    pub fn branch_confirm_counts(&self) -> [u64; 2] {
+        self.branches.confirm_counts()
     }
 
     /// Start a fuzzy catalog checkpoint now (F-FZ): its write runs on a thread of its own. `false`:
@@ -1398,13 +1618,15 @@ impl Database {
 /// journal locks until it exits, and a neighbour that drops a store and relocks its log inside that
 /// window fails. In a process that runs one test there is no neighbour.
 ///
-/// GATE: `cfg(unix)`, and nothing narrower is needed. The tests close no descriptors (the fresh
-/// process has no neighbour whose lock a child could hold), so `getdtablesize`, which Android's
-/// libc lacks, is no longer called anywhere. Every libc call they make — `fork`, `waitpid`,
-/// `WIFEXITED`/`WEXITSTATUS`, `kill`, `_exit` — is declared for every unix target in libc 0.2.186,
-/// Android included (READ: `src/unix/mod.rs`'s unconditional `extern` block, and
-/// `src/unix/linux_like/mod.rs`).
-#[cfg(all(test, unix))]
+/// GATE: `alone` and `finished` need only `std::process`, so every test build has them: a test that
+/// runs alone for a process-wide hook (`R11_CKPT`, `CUT_PANICS`) runs on every target (engine
+/// review 7 #13's judge). `exit_code` is `cfg(unix)`, and nothing narrower is needed. The tests
+/// close no descriptors (the fresh process has no neighbour whose lock a child could hold), so
+/// `getdtablesize`, which Android's libc lacks, is no longer called anywhere. Every libc call they
+/// make — `fork`, `waitpid`, `WIFEXITED`/`WEXITSTATUS`, `kill`, `_exit` — is declared for every unix
+/// target in libc 0.2.186, Android included (READ: `src/unix/mod.rs`'s unconditional `extern`
+/// block, and `src/unix/linux_like/mod.rs`).
+#[cfg(test)]
 pub(crate) mod fork_driver {
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
@@ -1451,6 +1673,7 @@ pub(crate) mod fork_driver {
 
     /// The exit code of a forked child. Waits at most 60 s; on the deadline it SIGKILLs and reaps
     /// the child and fails.
+    #[cfg(unix)]
     pub(crate) fn exit_code(pid: libc::pid_t) -> i32 {
         let mut status = 0;
         let deadline = Instant::now() + Duration::from_secs(60);
@@ -1496,6 +1719,15 @@ mod fastest_tests;
 
 #[cfg(all(test, feature = "fs"))]
 mod crash_tests;
+
+// fastest-budgets' test-only counters and their hook lines, carried here so its tree merges this one
+// cleanly (its d1230e45d); its suite (`budget_tests`) stays in its own tree and reads the rest.
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) mod budget_probe;
+
+#[cfg(all(test, feature = "fs"))]
+mod budget_tests;
 
 #[cfg(test)]
 mod tests {

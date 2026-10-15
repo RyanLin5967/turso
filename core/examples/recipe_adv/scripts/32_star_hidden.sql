@@ -1,0 +1,36 @@
+# k1-adv2. Every star expansion and RETURNING * after a recipe added the hidden generation column.
+CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b TEXT)
+CREATE TABLE u(id INTEGER PRIMARY KEY, x INTEGER)
+INSERT INTO t(a, b) VALUES (1, 'x'), (2, 'y')
+INSERT INTO u(x) VALUES (10), (20)
+CREATE VIEW v AS SELECT * FROM t
+CREATE VIEW vt AS SELECT t.* FROM t
+UPDATE t SET b = 'r' || a
+SELECT * FROM v ORDER BY id
+SELECT * FROM vt ORDER BY id
+SELECT t.* FROM t ORDER BY id
+SELECT * FROM t JOIN u USING (id) ORDER BY id
+SELECT * FROM t, u WHERE t.id = u.id ORDER BY t.id
+SELECT u.*, t.* FROM t JOIN u ON t.id = u.id ORDER BY t.id
+SELECT * FROM (SELECT * FROM t) ORDER BY id
+WITH c AS (SELECT * FROM t) SELECT * FROM c ORDER BY id
+WITH c AS MATERIALIZED (SELECT * FROM t) SELECT * FROM c ORDER BY id
+SELECT * FROM t WHERE id IN (SELECT id FROM t) ORDER BY id
+INSERT INTO t(a, b) VALUES (3, 'n') RETURNING *
+UPDATE t SET a = a + 1 WHERE id = 1 RETURNING *
+DELETE FROM t WHERE id = 2 RETURNING *
+INSERT INTO t(id, a) VALUES (1, 9) ON CONFLICT(id) DO UPDATE SET a = excluded.a RETURNING *
+SELECT * FROM t ORDER BY id
+CREATE VIEW v2 AS SELECT * FROM t
+SELECT * FROM v2 ORDER BY id
+SELECT * FROM t NATURAL JOIN u ORDER BY id
+SELECT * FROM pragma_table_info('t')
+SELECT count(*) FROM pragma_table_info('t')
+SELECT * FROM t AS x JOIN t AS y USING (id) ORDER BY id
+SELECT * FROM t UNION ALL SELECT * FROM t ORDER BY 1
+SELECT json_group_array(json_array(id, a, b)) FROM t
+CREATE TABLE copy2 AS SELECT t.* FROM t
+SELECT * FROM copy2 ORDER BY id
+PRAGMA table_info(copy2)
+INSERT INTO u SELECT t.id + 10, t.a FROM t
+SELECT * FROM u ORDER BY id

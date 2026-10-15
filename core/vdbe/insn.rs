@@ -307,6 +307,21 @@ pub struct AddColumnData {
     pub foreign_keys: Vec<Arc<ForeignKey>>,
 }
 
+/// Data for RecipeInstall (lane k1-recipe-build, see `crate::recipe`): the in-memory half of a
+/// recipe backfill, after its `sqlite_schema` rows are written.
+#[derive(Debug, Clone)]
+pub struct RecipeInstallData {
+    pub table: String,
+    pub generation: u64,
+    pub sql: String,
+    /// The table's first recipe also appends the hidden generation column.
+    pub add_gen_col: bool,
+    /// Rows the read-only pass matched: added to changes() and total_changes().
+    pub count_reg: usize,
+    /// The read-only pass matched no row: nothing is installed (only counted).
+    pub empty: bool,
+}
+
 /// Data for IntegrityCk instruction (boxed to keep Insn small).
 #[derive(Debug, Clone)]
 pub struct IntegrityCkData {
@@ -1810,6 +1825,17 @@ pub enum Insn {
     ResetOnce {
         region_end: BranchOffset,
     },
+    /// Open a catch region: until the next [Insn::CatchEnd], a value error an instruction raises
+    /// (a function's refusal, a conversion; `LimboError::is_catchable_value_error`) jumps to
+    /// `target_pc` instead of failing the statement. Brackets an expression that may refuse a
+    /// value with no effect but its registers, such as a seek key's ENCODE (engine review 16
+    /// HIGH 2). A RAISE translated inside such a region jumps to `target_pc` itself
+    /// (`ProgramBuilder::catch_raise_target`).
+    CatchBegin {
+        target_pc: BranchOffset,
+    },
+    /// Close the catch region [Insn::CatchBegin] opened.
+    CatchEnd,
     /// Search for a record in the index cursor.
     /// If any entry for which the key is a prefix exists, jump to target_pc.
     /// Otherwise, continue to the next instruction.
@@ -1872,6 +1898,10 @@ pub enum Insn {
     },
     AddColumn {
         data: Box<AddColumnData>,
+    },
+    /// Install a recipe backfill in the in-memory schema (see `crate::recipe`).
+    RecipeInstall {
+        data: Box<RecipeInstallData>,
     },
     AlterColumn {
         db: usize,
@@ -2304,6 +2334,8 @@ impl InsnVariants {
             InsnVariants::OpenEphemeral | InsnVariants::OpenAutoindex => execute::op_open_ephemeral,
             InsnVariants::Once => execute::op_once,
             InsnVariants::ResetOnce => execute::op_reset_once,
+            InsnVariants::CatchBegin => execute::op_catch_begin,
+            InsnVariants::CatchEnd => execute::op_catch_end,
             InsnVariants::Found | InsnVariants::NotFound => execute::op_found,
             InsnVariants::Affinity => execute::op_affinity,
             InsnVariants::IdxDelete => execute::op_idx_delete,
@@ -2312,6 +2344,7 @@ impl InsnVariants {
             InsnVariants::RenameTable => execute::op_rename_table,
             InsnVariants::DropColumn => execute::op_drop_column,
             InsnVariants::AddColumn => execute::op_add_column,
+            InsnVariants::RecipeInstall => execute::op_recipe_install,
             InsnVariants::AlterColumn => execute::op_alter_column,
             InsnVariants::MaxPgcnt => execute::op_max_pgcnt,
             InsnVariants::JournalMode => execute::op_journal_mode,
@@ -2409,6 +2442,7 @@ impl Insn {
             | Self::RenameTable { .. }
             | Self::DropColumn { .. }
             | Self::AddColumn { .. }
+            | Self::RecipeInstall { .. }
             | Self::AlterColumn { .. }
             | Self::JournalMode { .. }
             | Self::Vacuum { .. } => false,

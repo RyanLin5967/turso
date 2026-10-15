@@ -62,6 +62,17 @@ pub fn translate_update(
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> crate::Result<()> {
+    // The recipe generation column is written only by the engine (see `crate::recipe`).
+    if body.sets.iter().any(|set| {
+        set.col_names
+            .iter()
+            .any(|n| normalize_ident(n.as_str()).eq_ignore_ascii_case(crate::recipe::GEN_COLUMN))
+    }) {
+        bail_parse_error!("column {} is reserved", crate::recipe::GEN_COLUMN);
+    }
+    if crate::recipe::translate_update_as_recipe(&body, resolver, program, connection)? {
+        return Ok(());
+    }
     let plan = prepare_and_optimize_update_plan(program, resolver, body, connection, false, None)?;
     let Plan::Update(ref update_plan) = plan else {
         unreachable!("prepare_and_optimize_update_plan must return Plan::Update");

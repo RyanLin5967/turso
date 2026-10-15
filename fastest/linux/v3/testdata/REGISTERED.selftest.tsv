@@ -1,0 +1,2 @@
+# a fixed, empty registry for check.py --self-test (eighth review M7): the self-test never reads the live
+# REGISTERED.tsv, so registering a value cannot change its expectations

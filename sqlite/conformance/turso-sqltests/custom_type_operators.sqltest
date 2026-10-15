@@ -290,9 +290,9 @@ test op-numeric-mul-literal-multi-row {
     SELECT id, val * 3 FROM t1 ORDER BY id;
 }
 expect {
-    1|30.0000
-    2|9.0000
-    3|-15.0000
+    1|30.00
+    2|9.00
+    3|-15.00
 }
 
 @requires strict "uses STRICT tables"

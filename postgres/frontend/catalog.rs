@@ -14,6 +14,11 @@ use turso_parser::ast::RefAct;
 const USER_TABLE_OID_START: i64 = 16384;
 const PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX: &str = "sqlite_autoindex_";
 const STORED_PG_SCHEMA_PREFIX: &str = "/* turso_frontend:postgres */ ";
+/// The mark on a PostgreSQL table's canonical SQLite text after ALTER TABLE ADD or DROP COLUMN
+/// rewrote it (`format_altered_table_sql`): the text is SQLite's, parsed as such, and the table is
+/// still this frontend's, so its rowid alias stays NOT NULL across a reparse (fastest-engine;
+/// engine review 20 HIGH 1). A reader unaware of it sees a leading comment and SQLite text.
+const STORED_PG_ALTERED_PREFIX: &str = "/* turso_frontend:postgres sqlite */ ";
 
 #[derive(Debug)]
 pub struct PostgresDialect;
@@ -50,6 +55,13 @@ impl Dialect for PostgresDialect {
     }
 
     fn parse_table_sql(&self, sql: &str, root_page: i64) -> Result<BTreeTable> {
+        // This frontend's table, rewritten by ALTER as canonical SQLite text: parsed as SQLite,
+        // its key still NOT NULL (engine review 20 HIGH 1).
+        if let Some(altered) = sql.strip_prefix(STORED_PG_ALTERED_PREFIX) {
+            let mut table = BTreeTable::from_sql(altered, root_page)?;
+            table.rowid_alias_not_null = true;
+            return Ok(table);
+        }
         // Schema rows written by internal SQLite paths (e.g. sqlite_sequence)
         // carry no frontend marker and are plain SQLite SQL.
         let Some(raw_sql) = decode_stored_pg_schema_sql(sql) else {
@@ -64,7 +76,13 @@ impl Dialect for PostgresDialect {
             .map_err(|e| LimboError::ParseError(e.to_string()))?;
         match stmt {
             turso_parser::ast::Stmt::CreateTable { tbl_name, body, .. } => {
-                BTreeTable::from_create_table_ast(&tbl_name, &body, root_page)
+                let mut table = BTreeTable::from_create_table_ast(&tbl_name, &body, root_page)?;
+                // Every PostgreSQL primary key is NOT NULL: an explicit NULL (a literal or a bound
+                // parameter) into an integer key, which is the table's rowid alias, raises 23502
+                // instead of taking a new rowid. An omitted key still takes one (serial's
+                // DEFAULT path), and the key stays the rowid alias (fastest-engine 4c).
+                table.rowid_alias_not_null = true;
+                Ok(table)
             }
             _ => Err(LimboError::ParseError(
                 "expected CREATE TABLE statement".to_string(),
@@ -73,6 +91,9 @@ impl Dialect for PostgresDialect {
     }
 
     fn parse_table_sql_ast(&self, sql: &str) -> Result<turso_parser::ast::Stmt> {
+        if let Some(altered) = sql.strip_prefix(STORED_PG_ALTERED_PREFIX) {
+            return turso_core::dialect::sqlite::parse_table_sql_ast(altered);
+        }
         // Schema rows written by internal SQLite paths (e.g. sqlite_sequence)
         // carry no frontend marker and are plain SQLite SQL.
         let Some(raw_sql) = decode_stored_pg_schema_sql(sql) else {
@@ -94,6 +115,9 @@ impl Dialect for PostgresDialect {
     }
 
     fn table_sql_for_replay(&self, sql: &str) -> Result<String> {
+        if let Some(altered) = sql.strip_prefix(STORED_PG_ALTERED_PREFIX) {
+            return turso_core::dialect::sqlite::table_sql_for_replay(altered);
+        }
         let Some(raw_sql) = decode_stored_pg_schema_sql(sql) else {
             return turso_core::dialect::sqlite::table_sql_for_replay(sql);
         };
@@ -136,10 +160,26 @@ impl Dialect for PostgresDialect {
         Ok(encode_pg_schema_sql(input))
     }
 
+    fn format_altered_table_sql(&self, table: &BTreeTable) -> Result<String> {
+        // Only this frontend's own tables carry the NOT NULL key (`parse_table_sql`); a table an
+        // internal SQLite path wrote keeps its plain text.
+        if table.rowid_alias_not_null {
+            Ok(format!("{STORED_PG_ALTERED_PREFIX}{}", table.to_sql()))
+        } else {
+            Ok(table.to_sql())
+        }
+    }
+
     fn register_catalog(&self, schema: &mut Schema, enable_custom_types: bool) -> Result<()> {
         turso_core::dialect::sqlite::register_builtin_catalog(schema, enable_custom_types)?;
         for vtab in pg_catalog_virtual_tables() {
             schema.add_virtual_table(vtab)?;
+        }
+        for vtab in crate::information_schema::virtual_tables() {
+            schema.add_virtual_table(vtab)?;
+        }
+        if enable_custom_types {
+            register_bpchar(schema)?;
         }
         Ok(())
     }
@@ -158,6 +198,44 @@ impl Dialect for PostgresDialect {
     fn requires_custom_types(&self) -> bool {
         true
     }
+}
+
+/// PostgreSQL's blank-padded `character(n)`: stored without its trailing blanks (they never count
+/// in PostgreSQL: not in comparisons, not in length, not when cast to text), so the engine's own
+/// comparisons and functions see PostgreSQL's values; a value longer than n once trailing blanks are
+/// dropped is refused. The wire server pads a bpchar column back to n characters on output.
+/// `=` and `<` (and the `<>`, `>`, `<=`, `>=` the engine derives from them) are bpchareq and
+/// bpcharlt (functions.rs), which ignore trailing blanks on both sides, so a scan agrees with an
+/// index seek, whose key is encoded (wire review 2 item 3). Two engine limits remain (COMPAT.md):
+/// the engine applies a type's operators only against a column or a literal, not a bound
+/// parameter, and it encodes the literal with the column's length check, so comparing with a
+/// literal longer than n raises 'value too long' where PostgreSQL answers false.
+const BPCHAR_TYPE_SQL: &str = "CREATE TYPE bpchar(value text, maxlen integer) BASE text \
+    ENCODE CASE WHEN length(rtrim(value, ' ')) <= maxlen THEN rtrim(value, ' ') \
+    ELSE RAISE(ABORT, 'value too long for type character') END DECODE value \
+    OPERATOR '=' bpchareq OPERATOR '<' bpcharlt";
+
+fn register_bpchar(schema: &mut Schema) -> Result<()> {
+    use turso_parser::ast::{Cmd, Stmt};
+    let mut parser = turso_parser::parser::Parser::new(BPCHAR_TYPE_SQL.as_bytes());
+    let Ok(Some(Cmd::Stmt(Stmt::CreateType {
+        type_name, body, ..
+    }))) = parser.next_cmd()
+    else {
+        return Err(LimboError::InternalError(
+            "the built-in bpchar type definition does not parse".to_string(),
+        ));
+    };
+    let def = turso_core::schema::TypeDef::from_create_type(
+        &type_name,
+        &body,
+        true,
+        BPCHAR_TYPE_SQL.to_string(),
+    )?;
+    schema
+        .type_registry
+        .insert(type_name.to_lowercase(), Arc::new(def));
+    Ok(())
 }
 
 pub fn is_catalog_table_name(name: &str) -> bool {
@@ -189,6 +267,7 @@ pub fn is_catalog_table_name(name: &str) -> bool {
             | "pg_input_error_info"
             | "pg_get_tabledef"
             | "pg_tables"
+            | "pg_indexes"
     )
 }
 
@@ -202,7 +281,7 @@ pub fn decode_stored_pg_schema_sql(sql: &str) -> Option<&str> {
 
 /// Returns an iterator of (table_name, table_ref) for user tables in deterministic order.
 /// Both pg_class and pg_attribute must use this function to ensure consistent OID assignment.
-fn user_tables_sorted(schema: &Schema) -> Vec<(&String, &Arc<Table>)> {
+pub(crate) fn user_tables_sorted(schema: &Schema) -> Vec<(&String, &Arc<Table>)> {
     let mut tables: Vec<_> = schema
         .tables
         .iter()
@@ -225,7 +304,7 @@ fn user_tables_sorted(schema: &Schema) -> Vec<(&String, &Arc<Table>)> {
 
 /// Map a SQLite type string to a PostgreSQL type OID.
 /// Strips parenthesized parameters (e.g. `varchar(100)` -> `VARCHAR`) before matching.
-fn sqlite_type_to_pg_oid(ty_str: &str) -> i64 {
+pub(crate) fn sqlite_type_to_pg_oid(ty_str: &str) -> i64 {
     let base = match ty_str.find('(') {
         Some(pos) => &ty_str[..pos],
         None => ty_str,
@@ -237,6 +316,7 @@ fn sqlite_type_to_pg_oid(ty_str: &str) -> i64 {
         "TINYINT" | "MEDIUMINT" => 23,
         "TEXT" => 25,
         "VARCHAR" | "CHAR" | "CLOB" | "NCHAR" | "NVARCHAR" | "CHARACTER VARYING" => 1043,
+        "BPCHAR" => 1042,
         "REAL" | "DOUBLE" | "DOUBLE PRECISION" | "FLOAT" | "FLOAT8" => 701,
         "FLOAT4" => 700,
         "BLOB" | "BYTEA" => 17,
@@ -774,7 +854,12 @@ impl PgAttributeCursor {
                 let col_name = col.name.clone().unwrap_or_default();
                 let type_oid = sqlite_type_to_pg_oid(&col.ty_str);
                 let attnum = (i + 1) as i64; // 1-based
-                let notnull = if col.notnull() { 1i64 } else { 0i64 };
+                                             // A key column is NOT NULL (see information_schema's is_nullable).
+                let notnull = if col.notnull() || col.primary_key() {
+                    1i64
+                } else {
+                    0i64
+                };
                 let has_def = if col.default.is_some() { 1i64 } else { 0i64 };
 
                 self.rows.push(vec![
@@ -3332,7 +3417,11 @@ impl PgGetTableDefCursor {
             let postgres_ddl = match sql_map.get(table_name) {
                 Some(schema_sql) => decode_stored_pg_schema_sql(schema_sql)
                     .map(str::to_string)
-                    .unwrap_or_else(|| self.convert_to_postgres_ddl(schema_sql)),
+                    .unwrap_or_else(|| {
+                        // An altered table's SQLite text, its mark dropped (engine review 20 HIGH 1).
+                        let sqlite_sql = schema_sql.strip_prefix(STORED_PG_ALTERED_PREFIX).unwrap_or(schema_sql);
+                        self.convert_to_postgres_ddl(sqlite_sql)
+                    }),
                 None => self.convert_to_postgres_ddl(&btree_table.to_sql()),
             };
 

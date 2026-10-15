@@ -8370,7 +8370,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     header_result,
                     checkpoint_result,
                 } => {
-                    return_if_io!(wal.truncate_wal(checkpoint_result, pager.get_sync_type()));
+                    return_if_io!(wal.truncate_wal(checkpoint_result, pager.get_sync_type(), &pager));
                     if let HeaderReadResult::Valid(header) = header_result {
                         self.storage.set_header(header.clone());
                     }
@@ -8508,7 +8508,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     }
                 },
                 CompleteCheckpointState::DriveFinalTruncate { checkpoint_result } => {
-                    match wal.truncate_wal(checkpoint_result, pager.get_sync_type()) {
+                    match wal.truncate_wal(checkpoint_result, pager.get_sync_type(), &pager) {
                         Ok(IOResult::Done(())) => {
                             self.storage.on_checkpoint_end(Ok(checkpoint_result))?;
                         }
