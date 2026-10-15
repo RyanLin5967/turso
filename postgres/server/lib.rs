@@ -166,6 +166,15 @@ impl<'a> Backoff<'a> {
         Ok(true)
     }
 
+    /// [`Backoff::wait`] that no cancel or statement_timeout ends, for a statement that changed
+    /// rows (see [`run_waiting`]).
+    fn wait_uninterrupted(&mut self) -> bool {
+        let interrupts = self.interrupts.take();
+        let waited = self.wait();
+        self.interrupts = interrupts;
+        waited.expect("a wait with no interrupts never stops")
+    }
+
     fn stop_if_interrupted(&self) -> turso_core::Result<()> {
         match self.interrupts {
             Some(interrupts) if interrupts.should_stop() => Err(LimboError::Interrupt),
@@ -191,8 +200,11 @@ fn run_waiting(
 ) -> turso_core::Result<()> {
     loop {
         match stmt.run_with_row_callback(&mut row) {
+            // Not stopped by a cancel or statement_timeout: the statement changed rows, and
+            // dropped here the engine's reset commits them, so a 57014 would report a write that
+            // was committed (fresh-context review of the ultrareview fixes).
             Err(LimboError::Busy) if stmt.n_change() > 0 => {
-                if !backoff.wait()? {
+                if !backoff.wait_uninterrupted() {
                     return Err(LimboError::Busy);
                 }
             }
@@ -7061,6 +7073,41 @@ mod tests {
             vec![vec![Value::from_i64(1)]],
             "the INSERT was applied more than once"
         );
+    }
+
+    /// A write whose commit meets Busy after its rows went out is stepped again to its end even
+    /// when its statement_timeout passes during the wait: dropped there, a write with RETURNING is
+    /// committed by the engine's reset, so the 57014 it answered reported as cancelled a write that
+    /// was stored (measured: 57014 with its row stored; fresh-context review of the ultrareview
+    /// fixes, on finding 9's Backoff).
+    #[test]
+    fn a_write_whose_commit_meets_busy_is_not_cancelled_by_its_timeout() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = session(&dir);
+        ok(&s, "CREATE TABLE t(id INT, v TEXT)");
+        ok(&s, "INSERT INTO t VALUES (1, 'a')");
+        ok(&s, "SELECT turso_branch_create('c')");
+        ok(&s, "SET statement_timeout = 1");
+        s.shared
+            .db
+            .branch_failpoint(Some(turso_core::branch::BranchFailpoint::TrunkDecisionBusy));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let replies = s.simple("INSERT INTO t VALUES (9, 'x') RETURNING id");
+        let conn = s.shared.db.connect().unwrap();
+        let count = conn
+            .prepare("SELECT count(*) FROM t WHERE id = 9")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        match replies.as_slice() {
+            [Response::Query(_)] => {}
+            [Response::Error(e)] => panic!(
+                "the write answered {} {} with {count:?} rows of it stored",
+                e.code, e.message
+            ),
+            other => panic!("{} replies", other.len()),
+        }
+        assert_eq!(count, vec![vec![Value::from_i64(1)]], "the write was not applied once");
     }
 
     /// A COMMIT that meets Busy at the trunk's commit is not run again: the failed COMMIT already
