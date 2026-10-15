@@ -31,8 +31,8 @@ which does not fail the package. Competitor runs are not the turso engine and ca
 The shared sweeper (the lead's MED 12 ruling, DECISIONS 2026-10-15T04:21:48Z): every measured run's timed.json
 records sweeper_cpu_s (ours: t3lib.sh ours_timed_record, re-derived here from the run's own timed.tracer.tsv by
 gates/sweeper_record.py; a competitor: each timed.json timedrun.py wrote); a missing or refused one is a parity
-refusal. sweeper_creditable is true only when every measured run's sweeper window is its measured one: ours' is its
-whole process until fastest_profile stamps its windows (Rust, HELD), a loud_owed line until then.
+refusal. sweeper_creditable is true only when every measured run's sweeper window is its measured one (ours' since
+fastest_profile stamps its measured span, bb96279f3: summary.json tm0/tm1_realtime_s).
 A block is OK when both its V3 batches (before, after) pass blockgate.py (review 2 item 5, rulings A14 and A16; every
 VOID fails), the A16 plants re-derived on its real BEFORE record all fire (blockgate-plants.json stored and
 re-run), the before-to-after drift was taken (batchgate.py drift; REFUSED fails; a VOID is published, not a gate on
@@ -361,7 +361,9 @@ def ours_sweeper(d, adapter_rc=None):
     (no TRACED line or TracerPid, trees walked, no gap over its GAP_S, the window bracketed), over ours' window; its
     two checks of the load generator's own TracerPid at tm0 and tm1 are not asked of ours (fastest_profile records
     none: Rust, HELD), so they are dropped by their field names (a reworded refusal there fails closed, as a refusal).
-    timed.json's t0, t1 and rc must be t3lib.sh's own timed.window record, and its rc the cell's adapter rc.
+    The window is fastest_profile's MEASURED span (bb96279f3): timed.json's t0/t1 are its result/summary.json
+    tm0/tm1_realtime_s, inside the wrapper's process window, which timed.json carries as process_t0/process_t1 and which
+    must be t3lib.sh's own timed.window record (t0, t1, rc); its rc is the cell's adapter rc.
     Returns (sweeper_cpu_s or None, sweeper_window or None, the refusals)."""
     try:
         tj = json.load(open(os.path.join(d, "timed.json")))
@@ -377,9 +379,23 @@ def ours_sweeper(d, adapter_rc=None):
         tw = None
     if adapter_rc is not None and tj.get("rc") != adapter_rc:
         return None, win, [f"timed.json's rc {tj.get('rc')!r} is not the cell's adapter rc {adapter_rc}"]
-    if tw is None or (tj.get("t0"), tj.get("t1"), tj.get("rc")) != tw:
-        return None, win, [f"timed.json's window and rc {(tj.get('t0'), tj.get('t1'), tj.get('rc'))!r} are not "
-                           f"timed.window's {tw!r}"]
+    if tw is None or (tj.get("process_t0"), tj.get("process_t1"), tj.get("rc")) != tw:
+        return None, win, [f"timed.json's process window and rc {(tj.get('process_t0'), tj.get('process_t1'), tj.get('rc'))!r}"
+                           f" are not timed.window's {tw!r}"]
+    if win != "measured":
+        return None, win, [f"timed.json names the sweeper window {win!r}, not 'measured' (fastest_profile's measured "
+                           "span, its summary.json tm0/tm1_realtime_s)"]
+    try:
+        sj = json.load(open(os.path.join(d, "result", "summary.json")))
+        tm = (sj["tm0_realtime_s"], sj["tm1_realtime_s"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None, win, ["result/summary.json carries no tm0_realtime_s/tm1_realtime_s: the measured span is unknown"]
+    if (tj.get("t0"), tj.get("t1")) != tm:
+        return None, win, [f"timed.json's window {(tj.get('t0'), tj.get('t1'))!r} is not summary.json's measured span "
+                           f"tm0_realtime_s/tm1_realtime_s {tm!r}"]
+    num = all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in tm)
+    if not num or not tw[0] <= tm[0] <= tm[1] <= tw[1]:
+        return None, win, [f"the measured span {tm!r} lies outside the wrapper's process window {tw[:2]!r}"]
     saved = list(sys.path)  # timedrun inserts its own gates path at import: restore the whole list, not a slice
     try:
         sys.path[:0] = [GATES, COMPETITORS]
@@ -402,8 +418,6 @@ def ours_sweeper(d, adapter_rc=None):
     if tj.get("sweeper_cpu_s") != r["sweeper_cpu_s"]:
         bad.append(f"timed.json says sweeper_cpu_s {tj.get('sweeper_cpu_s')!r}, its own record gives "
                    f"{r['sweeper_cpu_s']!r}")
-    if win != "process":
-        bad.append(f"timed.json names the sweeper window {win!r}; ours' timed run sweeps its whole process ('process')")
     return (r["sweeper_cpu_s"] if not bad else None), win, bad
 
 
@@ -635,15 +649,9 @@ def summarize(out, sha, dry, manifest):
     summary["loud_owed"] = (["the three-driver warm-up conformance run (PREREG annex A23), on this package's own "
                              "bbload, clonebench and fastest_profile"] if conf else [])
     # MED 12 ruling: an ours-vs-competitor timed ratio credits only when every measured run's sweeper_cpu_s is known
-    # over the same kind of window. Ours' spans fastest_profile's whole process until it stamps its measured windows'
-    # realtime bounds (Rust, HELD), so while any run's window is "process" nothing credits and the gap is loud
+    # over the same kind of window, its measured one (ours_sweeper refuses any other window for ours)
     wins = [x for r in runs if r["measured"] for x in r.get("sweeper_windows") or [None]]
     summary["sweeper_creditable"] = bool(wins) and not sweeper_bad and all(x == "measured" for x in wins)
-    if "process" in wins:
-        summary["loud_owed"].append("ours' sweeper_cpu_s spans fastest_profile's whole process (setup and warm-up "
-                                    "included), not its measured windows as the competitors' does: fastest_profile "
-                                    "must stamp those windows' realtime bounds (Rust, HELD) before an "
-                                    "ours-vs-competitor timed ratio credits (MED 12 ruling)")
     # the lead's ruling on f2abbc8cb: until fastest_profile emits the counters every ours run is refused above, and the
     # gap is owed here, beside the window stamps, from the record's absence (a structural flag, not the refusal text)
     if any(r.get("exception_counters_absent") for r in runs if r["measured"]):
