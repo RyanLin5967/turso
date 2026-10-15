@@ -2293,6 +2293,32 @@ fn startup_announces_the_settings_show_answers() {
     }
 }
 
+/// `SELECT turso_branch_delete(varchar $1)` is 42601, as PostgreSQL 18 answers `type $n`, a form
+/// only libpg_query's grammar accepts, and the branch the value names is not deleted. It ran as a
+/// branch call, so Bind 'prod' deleted prod (wire review 14 item 14). Over the extended protocol,
+/// $1 declared text.
+#[test]
+fn a_type_name_before_a_parameter_is_refused() {
+    let dir = Scratch::new("typedparam");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    a.q("SELECT turso_branch_create('prod')").ok("prod");
+    for sql in [
+        "SELECT turso_branch_delete(varchar $1)",
+        "SELECT varchar $1",
+    ] {
+        let r = a.xt(sql, &[(25, 0, b"prod")]);
+        assert_eq!(
+            r.error.as_ref().map(|e| e.code.as_str()),
+            Some("42601"),
+            "{sql}: rows {:?}",
+            r.rows
+        );
+    }
+    a.q("SELECT turso_branch_switch('prod')")
+        .ok("prod was not deleted");
+}
+
 /// A refused CREATE TABLE leaves nothing behind, its SERIAL column's sequence included, as in
 /// PostgreSQL: one whose key onto itself does not resolve (42830, after the CREATE), and one whose
 /// table already exists. The sequence's `CREATE SEQUENCE IF NOT EXISTS` ran and committed at prepare,

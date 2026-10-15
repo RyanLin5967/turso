@@ -2544,6 +2544,27 @@ mod tests {
         );
     }
 
+    /// `type $n` (libpg_query's extension of PostgreSQL 17's grammar; PostgreSQL 18 answers 42601)
+    /// is no branch call on either path, so `turso_branch_delete(varchar $1)` bound with 'prod'
+    /// cannot delete prod: the slow path read it as a cast to varchar of $1 (wire review 14 item
+    /// 14). `$1::varchar`, the cast PostgreSQL has, is still a call (the control).
+    #[test]
+    fn a_type_name_before_a_parameter_is_no_branch_call() {
+        for sql in [
+            "SELECT turso_branch_delete(varchar $1)",
+            "SELECT turso_branch_create(text $1)",
+            "SELECT turso_branch_switch(pg_catalog.text $1)",
+        ] {
+            assert_eq!(fast_branch_call(sql), None, "fast path, {sql:?}");
+            assert_eq!(branch_call(sql), None, "branch_call, {sql:?}");
+        }
+        assert_eq!(
+            branch_call("SELECT turso_branch_delete($1::varchar)"),
+            call("turso_branch_delete", vec![PgBranchArg::Param(1)]),
+            "control"
+        );
+    }
+
     /// A `$n` outside 1..=MAX_PARAMETER names no parameter, so no branch call holds one: on both
     /// paths the statement is no call, and the ordinary prepare refuses it (42P02). Both paths took
     /// any n above 0, and Describe sized the call's parameter list by it: a capacity-overflow panic
