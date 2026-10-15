@@ -5018,6 +5018,9 @@ mod tests {
     fn an_extended_statement_is_classified_once_at_parse() {
         let dir = tempfile::TempDir::new().unwrap();
         let s = session(&dir);
+        // The engine refuses to branch an empty database (no committed page 1): a table first
+        // (ruled c9c821dd8d, P2).
+        ok(&s, "CREATE TABLE t(id INT)");
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();

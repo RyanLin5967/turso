@@ -2151,6 +2151,9 @@ fn a_checkpoint_checkpoints_the_branch_store() {
     let dir = Scratch::new("storeckpt");
     let server = Server::start(&dir.db(), &[]);
     let mut a = server.connect();
+    // The engine refuses to branch an empty database (no committed page 1): a table first (ruled
+    // c9c821dd8d, P1).
+    a.q("CREATE TABLE t(id INT)").ok("t");
     for i in 0..8 {
         a.q(&format!("SELECT turso_branch_create('c{i}')"))
             .ok("create");
