@@ -2456,6 +2456,35 @@ fn and_chain_answers_as_postgresql_in_implicit_and_failed_blocks() {
     }
 }
 
+/// Arrays in a result as far as this server can answer them right (PostgreSQL 18.6 recorded, artie
+/// raw loud-20261015/pg18-diff/pg18-arrres.out): `ARRAY[1, 2]` is announced int4[] (1007) and
+/// `ARRAY['a', 'b']` text[] (1009), with PostgreSQL's text, on both protocols (both were announced
+/// text). A cast to an array type is refused, 0A000: the engine casts by the element's scalar
+/// affinity, so `'{1,2}'::int[]` answered 0 (int4) and `$1::text[]` the engine's record bytes
+/// (text), silent wrong answers, where PostgreSQL answers the array. A divergence (COMPAT), not
+/// PostgreSQL's answer: it holds until the engine casts to arrays.
+#[test]
+fn array_results_are_typed_or_refused() {
+    let dir = Scratch::new("arrayresults");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let t = |s: &str| Some(s.to_string());
+    for (sql, oid, text) in [
+        ("SELECT ARRAY[1, 2]", 1007, "{1,2}"),
+        ("SELECT ARRAY['a', 'b']", 1009, "{a,b}"),
+    ] {
+        let r = a.q(sql).ok(sql);
+        assert_eq!((r.oids, r.rows), (Some(vec![oid]), vec![vec![t(text)]]), "{sql}");
+        let r = a.xt(sql, &[]).ok(sql);
+        assert_eq!((r.oids, r.rows), (Some(vec![oid]), vec![vec![t(text)]]), "{sql}: extended");
+    }
+    for sql in ["SELECT '{1,2}'::int[]", "SELECT '{a,b}'::text[]", "SELECT CAST('{1}' AS int[])"] {
+        assert_eq!(a.q(sql).err(sql).code, "0A000", "{sql}");
+    }
+    let r = a.xt("SELECT $1::text[]", &[(1009, 0, b"{a,b}")]);
+    assert_eq!(r.err("a bound array cast").code, "0A000");
+}
+
 /// Portals as PostgreSQL 18.6 keeps them (recorded, artie raw loud-20261015/pg18-diff/
 /// pg18-r15.out; wire review 15 items 16, 17 and 20):
 /// - an unnamed portal suspended by a row limit continues at its next Execute, in a block, after
