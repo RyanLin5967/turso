@@ -1071,6 +1071,11 @@ impl Catalog {
 
     /// A PASSIVE checkpoint of the catalog's WAL: backfill what no reader's mark holds back, block
     /// nobody (F-FZ phase 4, before the TRUNCATE attempt).
+    /// The catalog WAL file's length (0 when it does not exist): a stat, no query.
+    pub(crate) fn wal_len(&self) -> u64 {
+        std::fs::metadata(self._db.wal_path()).map_or(0, |m| m.len())
+    }
+
     pub(crate) fn wal_passive(&mut self) -> Result<()> {
         self.conn
             .prepare("PRAGMA wal_checkpoint(PASSIVE)")?

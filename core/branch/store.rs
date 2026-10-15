@@ -2999,7 +2999,7 @@ struct Captured {
     child_keys: Vec<(u64, u64)>,
     child_removed: Vec<(u64, u64)>,
     /// A handle on the arena file: synced, in `arena_sync`, before the catalog names the slots.
-    arena: Option<std::fs::File>,
+    arena: Option<Arc<std::fs::File>>,
     arena_sync: SyncClass,
     /// fastest-engine M1 item 4: names released since the last checkpoint (rows deleted first),
     /// then names created since (rows written), as swapped out of the index at the capture.
@@ -3143,6 +3143,36 @@ fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU
 /// catalog syncs in FullFsync, or any sync off Apple), and goes through this store's at-risk
 /// decision (`Group::drain_failed`; engine review 17 MED 3). Mutant `catalog_sync_failure_logged`
 /// (test builds only): logged only, as before.
+/// The catalog WAL length from which a fuzzy checkpoint's phase 4 backfills and truncates it
+/// (checkpoint FIX, budget a_checkpoint_flushes_at_most_three_times). That phase cost 4 full flushes
+/// (PASSIVE: the WAL barrier and the database file's sync; TRUNCATE: the truncation's sync and the
+/// next commit's new WAL header), measured by red 39507c379 (artie raw l16-ckpt_3fb66f4ef.txt), and
+/// it ran after EVERY checkpoint. Bounded by size instead, as SQLite's and Turso's own
+/// auto-checkpoints are (1000 pages): the WAL stays under about this much plus one checkpoint's
+/// commit. Test builds: `CATALOG_WAL_TRUNCATE_AT_FORCED` (0: the constant; the tests that hold a
+/// checkpoint inside its truncation force every one with `CatalogWalTruncateAlways`).
+const CATALOG_WAL_TRUNCATE_AT: u64 = 4 << 20;
+
+#[cfg(test)]
+pub(crate) static CATALOG_WAL_TRUNCATE_AT_FORCED: AtomicU64 = AtomicU64::new(0);
+
+fn catalog_wal_truncate_at() -> u64 {
+    #[cfg(test)]
+    {
+        let forced = CATALOG_WAL_TRUNCATE_AT_FORCED.load(Ordering::Acquire);
+        if forced > 0 {
+            return forced;
+        }
+    }
+    CATALOG_WAL_TRUNCATE_AT
+}
+
+/// Whether phase 4 runs: the catalog WAL has reached `catalog_wal_truncate_at()`. Mutant
+/// `catalog_wal_truncated_every_checkpoint` (test builds only): always, as before.
+fn catalog_wal_due(catalog: &Catalog) -> bool {
+    fe_mutant("catalog_wal_truncated_every_checkpoint") || catalog.wal_len() >= catalog_wal_truncate_at()
+}
+
 fn truncate_catalog_wal(catalog: &mut Catalog, group: &Group, hold: Option<&AtomicU8>) {
     #[cfg(not(test))]
     let _ = hold;
@@ -3172,6 +3202,22 @@ fn truncate_catalog_wal(catalog: &mut Catalog, group: &Group, hold: Option<&Atom
 /// counters are process-wide, so a test reading them runs nothing else meanwhile.
 #[cfg(test)]
 pub(crate) static CKPT_PHASES: std::sync::Mutex<Vec<(&'static str, u64, u64)>> = std::sync::Mutex::new(Vec::new());
+
+/// Test builds (budget a_checkpoint_issues_at_most_two_syscalls_under_the_store_mutex: 52 over 3
+/// checkpoints, budget 2 each): the task's syscall count (`budget_probe::unix_syscalls`, every
+/// thread, and the reading is itself one call) at points inside a checkpoint's two store-mutex holds,
+/// the capture's (`start_flight`) and the install's. Observation only.
+#[cfg(test)]
+pub(crate) static CKPT_HELD_SYSCALLS: std::sync::Mutex<Vec<(&'static str, u64)>> = std::sync::Mutex::new(Vec::new());
+
+fn ckpt_held(label: &'static str) {
+    #[cfg(test)]
+    if let Some(n) = super::budget_probe::unix_syscalls() {
+        CKPT_HELD_SYSCALLS.lock().unwrap_or_else(|e| e.into_inner()).push((label, n));
+    }
+    #[cfg(not(test))]
+    let _ = label;
+}
 
 fn ckpt_phase(label: &'static str) {
     #[cfg(test)]
@@ -3285,6 +3331,7 @@ fn run_flight(
     ckpt_phase("cut");
     let installed = {
         let mut guard = inner.lock();
+        ckpt_held("install.locked");
         // The install cuts the log: no group flight may be writing it (fastest-engine M1 item 2),
         // and none starts while this holds the store mutex.
         drop(group.quiesce());
@@ -3293,7 +3340,9 @@ fn run_flight(
         // the one read now, which a raised flight since may have strengthened (engine review 15 MED
         // 2). Mutant `fuzzy_committed_class_at_install` (test builds only): read now.
         let (deferred_lsn, committed_class, committed) = (cap.deferred_lsn, cap.arena_sync, written.is_ok());
+        ckpt_held("install.quiesced");
         let installed = guard.checkpoint_install(cap, written, cut.as_ref().and_then(|c| c.take()));
+        ckpt_held("install.installed");
         if let Some(journal) = guard.journal.as_ref() {
             // The catalog's commit made everything the capture covers durable in the class it
             // synced in, even if the cut failed after it: a raised D0 store's held frees up to the
@@ -3326,6 +3375,7 @@ fn run_flight(
             cat.ckpt.hold(hold_ns);
             cat.ckpt.flight_ns += write_ns;
         }
+        ckpt_held("install.marked");
         // Set under the store mutex, so no capture can slip in before the truncation.
         truncating.store(installed.is_ok(), Ordering::Release);
         over_hard.store(false, Ordering::Release);
@@ -3340,6 +3390,11 @@ fn run_flight(
     // Phase 4 takes only the writer, never the store mutex again: `start_flight` may join this
     // thread while holding the store mutex. (Its time is not counted in `flight_ns`.)
     match installed {
+        Ok(()) if !catalog_wal_due(&writer.lock()) => {
+            truncating.store(false, Ordering::Release);
+            // The phase's end, skipped (the instrument's last point either way).
+            ckpt_phase("truncated");
+        }
         Ok(()) => {
             #[cfg(test)]
             pause_at(Some(&*hold), HOLD_BEFORE_WAL_TRUNCATE);
@@ -3583,6 +3638,14 @@ fn held_trace(label: &'static str) {
     });
     #[cfg(not(test))]
     let _ = label;
+}
+
+/// A branch page's reservation (`BranchStore::first_write_branch`): its slot and, for a file arena,
+/// where the commit writes it, so `commit_pages` can write it before it takes the store mutex.
+#[derive(Clone)]
+pub(crate) struct Reserved {
+    slot: Slot,
+    io: Option<(Arc<std::fs::File>, u64)>,
 }
 
 /// fastest-engine C1 (the SIGKILL crash harness, PREREG v1 §8): a named code point a crash test
@@ -5488,6 +5551,7 @@ impl BranchStore {
     /// first, at most `SETTLE_BATCH` branches per call, and the checkpoint waits for the next call
     /// while any remain. Returns whether a checkpoint started, or why not.
     fn start_flight(&self, inner: &mut StoreInner) -> FlightStart {
+        ckpt_held("capture.begin");
         match inner.cat.as_ref() {
             None => return FlightStart::NotCatalog,
             Some(c) if c.flight => return FlightStart::InFlight,
@@ -5548,6 +5612,7 @@ impl BranchStore {
         let q0 = inner.cat.as_ref().map_or(0, |c| c.catalog.counters.queries);
         // Read only for mutant `checkpoint_own_arena_sync`: a fuzzy capture takes no arena handle.
         let flight_in_air = fe_mutant("checkpoint_own_arena_sync") && self.group.lock().flushing;
+        ckpt_held("capture.matured");
         let cap = match inner.checkpoint_capture_mode(false, true, flight_in_air) {
             Ok(cap) => cap,
             Err(e) => {
@@ -5555,6 +5620,7 @@ impl BranchStore {
                 return FlightStart::Failed;
             }
         };
+        ckpt_held("capture.captured");
         let cat = inner.cat.as_mut().expect("captured above");
         cat.ckpt.hold(ns(t));
         cat.ckpt.stmts_locked += cat.catalog.counters.queries - q0;
@@ -6765,8 +6831,9 @@ impl BranchStore {
     }
 
     /// The copy decision for a branch's first write to `page` in a transaction: reserve the fresh
-    /// slot the commit will write the page into. Nothing is published until then.
-    pub(crate) fn first_write_branch(&self, id: BranchId, page: u32) -> Result<()> {
+    /// slot the commit will write the page into. Nothing is published until then. Returns the
+    /// reservation, for the commit to write holding no lock (`Reserved`).
+    pub(crate) fn first_write_branch(&self, id: BranchId, page: u32) -> Result<Reserved> {
         let mut inner = self.inner.lock();
         // Covered deferred frees first, so this reservation can reuse them (group commit).
         self.mature(&mut inner);
@@ -6789,12 +6856,15 @@ impl BranchStore {
                 id.0
             )));
         }
-        if let std::collections::hash_map::Entry::Vacant(e) = st.pending.entry(page) {
-            e.insert(arena.alloc());
-            // F-W2: this branch may hold a reserved slot at the next checkpoint.
-            pending_holders.insert(id);
-        }
-        Ok(())
+        let slot = match st.pending.entry(page) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                // F-W2: this branch may hold a reserved slot at the next checkpoint.
+                pending_holders.insert(id);
+                *e.insert(arena.alloc())
+            }
+            std::collections::hash_map::Entry::Occupied(e) => *e.get(),
+        };
+        Ok(Reserved { slot, io: arena.slot_io(slot) })
     }
 
     /// The copy decisions of one trunk commit, taken at its serialization point: after its frames
@@ -7398,6 +7468,36 @@ impl BranchStore {
     /// A commit whose wait fails leaves the branch in doubt: refused from then on (lead review 1
     /// item 11).
     pub(crate) fn commit_pages(&self, id: BranchId, pages: &[PageRef]) -> Result<()> {
+        self.commit_pages_reserved(id, pages, &HashMap::new())
+    }
+
+    /// `commit_pages`, with the connection's reservations (`BranchBinding::reserved`): when every
+    /// page has a file-arena reservation, the pages are written into their slots BEFORE the store
+    /// mutex is taken (L2 slice, budget first_write_issues_no_syscall_under_the_store_mutex: the
+    /// slot pwrite was a syscall under it). Safe: a reservation is this writer's until its commit
+    /// or abort, both on this connection, so nothing frees or reuses the slot meanwhile; the arena
+    /// is marked dirty in the same hold that buffers the Commit record, so the flight that carries
+    /// the record syncs the slots first, as before. Mutant `commit_slots_under_mutex` (test builds
+    /// only): written under the mutex, as before.
+    pub(crate) fn commit_pages_reserved(&self, id: BranchId, pages: &[PageRef], reserved: &HashMap<u32, Reserved>) -> Result<()> {
+        let prewritten = !pages.is_empty()
+            && !fe_mutant("commit_slots_under_mutex")
+            && !self.group.poisoned()
+            && pages
+                .iter()
+                .all(|p| reserved.get(&(p.get().id as u32)).is_some_and(|r| r.io.is_some()));
+        // Made before the mutex too: no allocation under it for the entries.
+        let mut entries: Vec<(u32, Slot, u32)> = Vec::with_capacity(pages.len());
+        if prewritten {
+            for page in pages {
+                let no = page.get().id as u32;
+                let r = &reserved[&no];
+                let (file, offset) = r.io.as_ref().expect("checked above");
+                let bytes = page.get_contents().as_slice();
+                super::journal::write_at(file, bytes, *offset)?;
+                entries.push((no, r.slot, crc32c::crc32c(bytes)));
+            }
+        }
         // F-FZ back-pressure: dropped after the guard below.
         let _backpressure = Backpressure(self);
         let mut inner = self.inner.lock();
@@ -7421,8 +7521,7 @@ impl BranchStore {
                 return Err(reaped(id));
             }
             let arena = arena.as_mut().expect("a branch exists, so the arena does");
-            let mut entries = Vec::with_capacity(pages.len());
-            for page in pages {
+            for (i, page) in pages.iter().enumerate() {
                 let no = page.get().id as u32;
                 let slot = st.pending.remove(&no).ok_or_else(|| {
                     LimboError::InternalError(format!(
@@ -7430,9 +7529,23 @@ impl BranchStore {
                         id.0
                     ))
                 })?;
-                let bytes = page.get_contents().as_slice();
-                arena.write_slot(slot, bytes)?;
-                entries.push((no, slot, crc32c::crc32c(bytes)));
+                if prewritten {
+                    if entries[i].1 != slot {
+                        return Err(LimboError::InternalError(format!(
+                            "branch {} page {no}: written into slot {} off the mutex, reserved {slot}",
+                            id.0, entries[i].1
+                        )));
+                    }
+                } else {
+                    let bytes = page.get_contents().as_slice();
+                    arena.write_slot(slot, bytes)?;
+                    entries.push((no, slot, crc32c::crc32c(bytes)));
+                }
+            }
+            if prewritten {
+                // The slots were written off the mutex: the flight that carries this record syncs
+                // them (rule 1), as a write_slot under it marked them.
+                arena.mark_unsynced();
             }
             // A reservation whose page is not dirty at commit was never written: free it.
             for (_, slot) in st.pending.drain() {
@@ -9975,6 +10088,7 @@ impl StoreInner {
         };
         let q0 = cat.catalog.counters.queries;
         cat.catalog.end_read_snapshot();
+        ckpt_held("install.snapshot_ended");
         cat.flight = false;
         if let Err(e) = written {
             // D-T2's mutant r13_install_err_drops_dirty: a failed write forgets the captured dirt.
@@ -10020,7 +10134,12 @@ impl StoreInner {
         // A failure before its rename leaves the old log in use, whose checkpoint marker says
         // where recovery cuts it: correct, only longer. The install below must happen either way.
         let rewritten = match prepared {
-            Some(prep) => journal.finish_cut(prep, cap.log_from, cap.generation),
+            Some(prep) => {
+                ckpt_held("install.before_cut");
+                let cut = journal.finish_cut(prep, cap.log_from, cap.generation);
+                ckpt_held("install.cut_finished");
+                cut
+            }
             None => journal.rewrite_from(cap.log_from, cap.generation),
         };
         if rewritten.is_err() {

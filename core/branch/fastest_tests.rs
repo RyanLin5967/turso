@@ -6031,6 +6031,23 @@ fn open_failing_wal(path: &Path, opts: DatabaseOpts) -> (Arc<Database>, Arc<std:
     (db, armed)
 }
 
+/// Every fuzzy checkpoint runs its phase 4 (the catalog WAL's backfill and truncation) while this
+/// lives: `CATALOG_WAL_TRUNCATE_AT_FORCED` at 1 byte, restored on drop.
+struct CatalogWalTruncateAlways;
+
+impl CatalogWalTruncateAlways {
+    fn set() -> Self {
+        super::store::CATALOG_WAL_TRUNCATE_AT_FORCED.store(1, std::sync::atomic::Ordering::Release);
+        Self
+    }
+}
+
+impl Drop for CatalogWalTruncateAlways {
+    fn drop(&mut self) {
+        super::store::CATALOG_WAL_TRUNCATE_AT_FORCED.store(0, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// `what` was refused because the store is fail-stopped.
 fn assert_fail_stopped<T: std::fmt::Debug>(got: crate::Result<T>, what: &str) {
     match got {
@@ -7405,6 +7422,11 @@ fn a_failed_drain_with_nothing_undrained_leaves_a_d0_store_running() {
 fn a_failed_catalog_wal_sync_fail_stops_a_store_with_an_undrained_record() {
     use std::sync::atomic::Ordering as O;
     let _s = serial();
+    // FLAGGED TEST EDIT (fixture reaching its path; for the lead's ruling): phase 4 runs only once
+    // the catalog WAL reaches CATALOG_WAL_TRUNCATE_AT (fa0897b69); this test fails phase 4's WAL sync,
+    // so it forces every checkpoint's (measured: its premise failed at 5344a5878, artie raw
+    // l17-branch_5344a5878.txt). No assertion changed.
+    let _always = CatalogWalTruncateAlways::set();
     let dir = tempfile::TempDir::new().unwrap();
     let armed = Arc::new(std::sync::atomic::AtomicU8::new(0));
     // FLAGGED TEST EDIT (engine review 21 LOW 21, fixture only): the hook is keyed by the catalog's path.
@@ -7459,6 +7481,10 @@ fn a_failed_catalog_wal_sync_fail_stops_a_store_with_an_undrained_record() {
 fn a_failed_catalog_wal_sync_fail_stops_a_d2_store_with_a_flight_in_the_air() {
     use std::sync::atomic::Ordering as O;
     let _s = serial();
+    // FLAGGED TEST EDIT (fixture reaching its path; for the lead's ruling): phase 4 now runs only
+    // once the catalog WAL reaches CATALOG_WAL_TRUNCATE_AT (checkpoint FIX); this test holds a
+    // checkpoint inside it, so it forces every checkpoint's. No assertion changed.
+    let _always = CatalogWalTruncateAlways::set();
     let dir = tempfile::TempDir::new().unwrap();
     let armed = Arc::new(std::sync::atomic::AtomicU8::new(0));
     // FLAGGED TEST EDIT (engine review 21 LOW 21, fixture only): the hook is keyed by the catalog's path.
@@ -7510,6 +7536,10 @@ fn a_failed_catalog_wal_sync_fail_stops_a_d2_store_with_a_flight_in_the_air() {
 fn a_failed_catalog_wal_sync_is_decided_before_a_flight_in_the_air_lands() {
     use std::sync::atomic::Ordering as O;
     let _s = serial();
+    // FLAGGED TEST EDIT (fixture reaching its path; for the lead's ruling): phase 4 now runs only
+    // once the catalog WAL reaches CATALOG_WAL_TRUNCATE_AT (checkpoint FIX); this test holds a
+    // checkpoint inside it, so it forces every checkpoint's. No assertion changed.
+    let _always = CatalogWalTruncateAlways::set();
     let dir = tempfile::TempDir::new().unwrap();
     let armed = Arc::new(std::sync::atomic::AtomicU8::new(0));
     // FLAGGED TEST EDIT (engine review 21 LOW 21, fixture only): the hook is keyed by the catalog's path.
@@ -8671,6 +8701,57 @@ fn a_d1_flight_after_a_fuzzy_cut_syncs_the_log_directory() {
     let before = dirs();
     let _ = trunk.fork_branch().unwrap().into_id();
     assert!(dirs() > before, "CLAIM: the first D1 flight after a fuzzy cut synced no directory: the cut's rename is not durable under it");
+}
+
+/// Checkpoint FIX (budget a_checkpoint_issues_at_most_two_syscalls_under_the_store_mutex: 52 over 3
+/// checkpoints in ckpt_n10, budget 2 each): a fuzzy checkpoint's syscalls inside its two store-mutex
+/// holds, the capture's and the install's, attributed to points (`store::CKPT_HELD_SYSCALLS`, the
+/// task's count: every thread, each reading one call itself, subtracted here). A D2 catalog store,
+/// three checkpoints after 30 creates each; nothing else runs but the store's own threads.
+#[test]
+fn a_fuzzy_checkpoint_issues_at_most_two_syscalls_under_the_store_mutex() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("ckpt-held.db"), opts(true, SyncClass::FullFsync));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let mut over = Vec::new();
+    for round in 0..3 {
+        for _ in 0..30 {
+            let _ = trunk.fork_branch().unwrap().into_id();
+        }
+        super::store::CKPT_HELD_SYSCALLS.lock().unwrap().clear();
+        assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: round {round}: a fuzzy checkpoint started");
+        db.branch_checkpoint_wait();
+        let points = super::store::CKPT_HELD_SYSCALLS.lock().unwrap().clone();
+        let at = |label: &str| points.iter().find(|(l, _)| *l == label).map(|(_, n)| *n);
+        let span = |a: &str, b: &str| match (at(a), at(b)) {
+            (Some(x), Some(y)) => (y - x).saturating_sub(1),
+            _ => u64::MAX,
+        };
+        let capture = (span("capture.begin", "capture.matured"), span("capture.matured", "capture.captured"));
+        let install = (
+            span("install.locked", "install.quiesced"),
+            span("install.quiesced", "install.installed"),
+            span("install.installed", "install.marked"),
+        );
+        let total = capture.0 + capture.1 + install.0 + install.1 + install.2;
+        // Inside the install: the catalog read snapshot's end, and the cut's finish (each point a
+        // call of its own, subtracted).
+        let inside = (
+            span("install.quiesced", "install.snapshot_ended"),
+            span("install.snapshot_ended", "install.before_cut"),
+            span("install.before_cut", "install.cut_finished"),
+            span("install.cut_finished", "install.installed"),
+        );
+        if total > 2 {
+            over.push(format!(
+                "round {round}: {total} syscalls held: capture [to matured {}, capture {}], install [quiesce {}, install {} (snapshot end {}, to cut {}, cut {}, after {}), mark {}]",
+                capture.0, capture.1, install.0, install.1, inside.0, inside.1, inside.2, inside.3, install.2
+            ));
+        }
+    }
+    assert!(over.is_empty(), "CLAIM: a fuzzy checkpoint issued more than two syscalls under the store mutex: {over:?}");
 }
 
 /// Checkpoint FIX (budget a_checkpoint_flushes_at_most_three_times: 20 full flushes over 3

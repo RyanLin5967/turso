@@ -3428,7 +3428,8 @@ impl Pager {
             pages
         };
         crate::recipe::count(crate::recipe::counter::BRANCH_DIRTY, dirty.len() as u64);
-        branch.store.commit_pages(branch.id, &dirty)?;
+        let reserved = std::mem::take(&mut *branch.reserved.lock().unwrap_or_else(|e| e.into_inner()));
+        branch.store.commit_pages_reserved(branch.id, &dirty, &reserved)?;
         if schema_did_change {
             branch
                 .store
@@ -3885,7 +3886,9 @@ impl Pager {
         }
         let page_no = page.get().id as u32;
         if let Some(branch) = self.branch.get() {
-            return branch.store.first_write_branch(branch.id, page_no);
+            let reserved = branch.store.first_write_branch(branch.id, page_no)?;
+            branch.reserved.lock().unwrap_or_else(|e| e.into_inner()).insert(page_no, reserved);
+            return Ok(());
         }
         if let Some(store) = self.branch_store.get() {
             if store.trunk_has_children() {
@@ -6469,6 +6472,7 @@ impl Pager {
             self.clear_page_cache(clear_dirty);
             self.dirty_pages.write().clear();
             if let Some(branch) = self.branch.get() {
+                branch.reserved.lock().unwrap_or_else(|e| e.into_inner()).clear();
                 branch.store.abort_write(branch.id);
             }
         } else {
