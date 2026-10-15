@@ -1946,7 +1946,7 @@ mod tests {
     /// from zero, and a value that rounds past the precision is PostgreSQL's 22003 "numeric field
     /// overflow". PG 18.6's answers for this exact SQL (artie raw frontier/fastest/lanes/engine/raw/
     /// pg18-numeric-typmod-round.txt b4512c63d5): 1.005, -1.005, 1.004, 2.675 into numeric(10, 2)
-    /// read 1.01, -1.01, 1.00, 2.68; CAST('-0.125' AS numeric(4, 2)) is -0.13; 99999999.995 into
+    /// read 1.01, -1.01, 1.00, 2.68; '-0.125' into numeric(4, 2) is -0.13; 99999999.995 into
     /// numeric(10, 2) overflows; 99999999.994 reads 99999999.99.
     #[test]
     fn a_numeric_typmod_rounds_half_away_from_zero_as_postgresql_does() {
@@ -1965,7 +1965,16 @@ mod tests {
             (table("(1, '2.675')", "SELECT CAST(x AS TEXT) FROM r"), Ok("2.68")),
             (table("(1, '99999999.994')", "SELECT CAST(x AS TEXT) FROM r"), Ok("99999999.99")),
             (table("(1, '99999999.995')", "SELECT CAST(x AS TEXT) FROM r"), Err("numeric field overflow")),
-            (vec!["SELECT CAST(CAST('-0.125' AS numeric(4, 2)) AS TEXT)".to_string()], Ok("-0.13")),
+            // Through a numeric(4, 2) column (PG 18.6: -0.13, raw acf4b78d7f): a CAST to numeric here
+            // yields its ENCODE's blob, not a decoded value, so the CAST form cannot be read back.
+            (
+                vec![
+                    "CREATE TABLE q(id INTEGER PRIMARY KEY, x numeric(4, 2)) STRICT".to_string(),
+                    "INSERT INTO q VALUES (1, '-0.125')".to_string(),
+                    "SELECT CAST(x AS TEXT) FROM q".to_string(),
+                ],
+                Ok("-0.13"),
+            ),
         ] {
             let got = run_bounded(steps.clone());
             let ok = match (&got, &want) {
@@ -1978,6 +1987,34 @@ mod tests {
             }
         }
         assert!(bad.is_empty(), "CLAIM: a numeric typmod rounded or overflowed unlike PostgreSQL: {bad:?}");
+    }
+
+    /// Class (a) (DECISIONS 994f7d41e0), the typmod's other DDL: ALTER TABLE ADD COLUMN declared a
+    /// numeric(p, s) column with no check at all (CREATE TABLE at least counted the parameters).
+    /// PG 18.6 refuses numeric(1001, 0) and numeric(1000, 1001) there with its 22023 messages and
+    /// adds numeric(10, 2) (artie raw pg18-numeric-typmod-round.txt 048831ffdf, appended).
+    #[test]
+    fn alter_table_add_column_refuses_a_numeric_typmod_outside_postgresqls_range() {
+        let base = || vec!["CREATE TABLE al(id INTEGER PRIMARY KEY) STRICT".to_string()];
+        let mut bad = Vec::new();
+        for (col, want) in [
+            ("y numeric(1001, 0)", Err("NUMERIC precision 1001 must be between 1 and 1000")),
+            ("z numeric(1000, 1001)", Err("NUMERIC scale 1001 must be between -1000 and 1000")),
+            ("w numeric(10, 2)", Ok(())),
+        ] {
+            let mut steps = base();
+            steps.push(format!("ALTER TABLE al ADD COLUMN {col}"));
+            let got = run_bounded(steps);
+            let ok = match (&got, &want) {
+                (Ok(_), Ok(())) => true,
+                (Err(m), Err(w)) => m.contains(w),
+                _ => false,
+            };
+            if !ok {
+                bad.push(format!("ADD COLUMN {col} gave {got:?}, not PostgreSQL 18's {want:?}"));
+            }
+        }
+        assert!(bad.is_empty(), "CLAIM: ALTER TABLE ADD COLUMN took a numeric typmod unlike PostgreSQL: {bad:?}");
     }
 
     /// Review 0e8b1cf18..0a4a127a1 numeric MED 1 (DECISIONS d1a8dcb982): a product's scale was the sum
