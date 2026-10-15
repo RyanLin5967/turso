@@ -121,7 +121,9 @@ pub struct StatementTypes {
     pub rolls_back: bool,
     /// The table a CREATE TABLE creates with foreign keys: the server resolves every key once the
     /// table exists, in the CREATE's own transaction, and refuses the CREATE (42830) if one does
-    /// not (turso_pg::check_table_keys; wire review 13 item 2).
+    /// not (turso_pg::check_table_keys; wire review 13 item 2). None for one the frontend performed
+    /// whole at prepare, keys resolved, because it has prerequisites (a SERIAL column's sequence;
+    /// wire review 16 item 15).
     pub new_table_keys: Option<String>,
 }
 

@@ -849,8 +849,15 @@ fn prepare_statement_checked(
         .translate_with_prereqs(&parse_result)
         .map_err(|e| LimboError::ParseError(e.to_string()))?;
     reject_catalog_dml(translated.cmd.stmt())?;
+    // A statement with prerequisites (a CREATE TABLE's SERIAL sequences) is performed below, keys
+    // and all, so the server has no keys left to resolve.
+    let performs = !translated.prereqs.is_empty();
     if let Some(types) = types {
-        types.new_table_keys = new_table_keys;
+        types.new_table_keys = if performs {
+            None
+        } else {
+            new_table_keys.clone()
+        };
         types.commits = matches!(translated.cmd.stmt(), ast::Stmt::Commit { .. });
         types.rolls_back = matches!(
             translated.cmd.stmt(),
@@ -874,18 +881,35 @@ fn prepare_statement_checked(
             unqualified_database_search_path: if path.is_empty() { None } else { Some(path) },
         }
     };
-    for prereq in translated.prereqs {
-        let input = prereq.to_string();
-        let mut stmt = pg_conn
+    if !performs {
+        return pg_conn
             .conn
-            .prepare_translated_stmt_with_options(prereq, &input, &options)?;
-        stmt.run_ignore_rows()?;
+            .prepare_translated_cmd_with_options(translated.cmd, sql, &options)
+            .map(Some);
     }
-
-    pg_conn
-        .conn
-        .prepare_translated_cmd_with_options(translated.cmd, sql, &options)
-        .map(Some)
+    // Performed here, whole, in a transaction of its own (own_transaction): the prerequisites, the
+    // statement, and for a table with foreign keys their resolution (42830 if one does not
+    // resolve). The prerequisites ran and committed first, on their own, so a refused CREATE TABLE
+    // left its sequences, which PostgreSQL never creates (wire review 16 item 15). Its Execute
+    // steps a no-op; a Describe declined it above.
+    own_transaction(pg_conn, "__turso_create_prereqs", "CREATE TABLE", || {
+        for prereq in translated.prereqs {
+            let input = prereq.to_string();
+            pg_conn
+                .conn
+                .prepare_translated_stmt_with_options(prereq, &input, &options)?
+                .run_ignore_rows()?;
+        }
+        pg_conn
+            .conn
+            .prepare_translated_cmd_with_options(translated.cmd, sql, &options)?
+            .run_ignore_rows()?;
+        match new_table_keys.as_deref() {
+            Some(table) => check_table_keys(&pg_conn.conn, table),
+            None => Ok(()),
+        }
+    })?;
+    noop_statement(&pg_conn.conn).map(Some)
 }
 
 fn reject_catalog_dml(stmt: &ast::Stmt) -> Result<()> {
