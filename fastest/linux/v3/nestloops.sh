@@ -59,6 +59,22 @@ nestloops_self_test() {
   t "canned: nbx's backing /mnt/v3fx/nb/x.img alone matches nothing" \
     "$(printf '/dev/loop0 /mnt/v3fx/nb/x.img\n' | nest_match /mnt/v3fx | xargs)" ""
   t "canned: an empty listing matches nothing" "$(printf '' | nest_match /mnt/v3fx | xargs)" ""
+  # V3 review 13 item 20: teardown_nest's per-level sweep kept its own prefix matcher; it is nest_level_match now.
+  # Under a level's directory, anchored on DIR/ (n10/, n1x/ and v3fxn1/ are not n1; a trailing slash on DIR is the same)
+  local lvl='/dev/loop2 /mnt/v3fx/n1/x.img
+/dev/loop5 /mnt/v3fx/n10/x.img
+/dev/loop8 /mnt/v3fx/n1/stray.img
+/dev/loop9 /mnt/v3fxn1/x.img
+/dev/loop14 /mnt/v3fx/n1x/a.img
+/dev/loop15 /mnt/v3fx/n1
+/dev/loop0 /mnt/v3fx/nb/x.img
+/dev/loop6 /mnt/v3fx/nbx.img'
+  t "level: nest_level_match /mnt/v3fx/n1 -> the files under n1/ only (not n10/, n1x/, v3fxn1/, nor n1 itself)" \
+    "$(printf '%s\n' "$lvl" | nest_level_match /mnt/v3fx/n1 | xargs)" "/dev/loop2 /dev/loop8"
+  t "level: a trailing slash on DIR is the same level" \
+    "$(printf '%s\n' "$lvl" | nest_level_match /mnt/v3fx/n1/ | xargs)" "/dev/loop2 /dev/loop8"
+  t "level: nest_level_match /mnt/v3fx/nb -> nb/x.img, not nbx.img" \
+    "$(printf '%s\n' "$lvl" | nest_level_match /mnt/v3fx/nb | xargs)" "/dev/loop0"
   td=$(mktemp -d) || { echo "FAIL mktemp"; return 1; }
   printf '#!/bin/sh\necho "losetup: cannot open /dev/loop-control" >&2\nexit 1\n' > "$td/losetup"
   chmod +x "$td/losetup"
