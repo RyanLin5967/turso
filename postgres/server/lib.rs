@@ -5024,7 +5024,10 @@ mod tests {
 
     /// One execution of the unnamed statement through the session's own handlers: Bind (with
     /// `param`, if any), Describe of the statement and of the portal when asked, Execute and Sync.
-    /// Returns the libpg_query calls it made; an ErrorResponse fails the test.
+    /// Returns the libpg_query calls it made; an ErrorResponse fails the test, and so does a round
+    /// that did not run: it must answer BindComplete, a ParameterDescription and a RowDescription
+    /// when described, one DataRow and `CommandComplete SELECT 1`, so an Execute that returned
+    /// early cannot pass as zero calls (wire review 16 item 25).
     async fn execute_unnamed(
         s: &Session,
         c: &mut MemClient,
@@ -5049,10 +5052,24 @@ mod tests {
         s.on_execute(c, Execute::new(None, 0)).await.unwrap();
         s.on_sync(c, PgSync::new()).await.unwrap();
         let calls = turso_pg_parser::libpg_query_calls() - before;
+        let (mut bound, mut params, mut rows_described, mut rows, mut tags) = (0, 0, 0, 0, vec![]);
         for reply in c.replies.drain(..) {
-            if let PgWireBackendMessage::ErrorResponse(e) = reply {
-                panic!("an error in the round: {e:?}");
+            match reply {
+                PgWireBackendMessage::ErrorResponse(e) => panic!("an error in the round: {e:?}"),
+                PgWireBackendMessage::BindComplete(_) => bound += 1,
+                PgWireBackendMessage::ParameterDescription(_) => params += 1,
+                PgWireBackendMessage::RowDescription(_) => rows_described += 1,
+                PgWireBackendMessage::DataRow(_) => rows += 1,
+                PgWireBackendMessage::CommandComplete(done) => tags.push(done.tag),
+                _ => {}
             }
+        }
+        assert_eq!(bound, 1, "the round's BindComplete");
+        assert_eq!(rows, 1, "the round's one row");
+        assert_eq!(tags, vec!["SELECT 1".to_string()], "the round's CommandComplete");
+        if describe {
+            assert_eq!(params, 1, "the statement Describe's ParameterDescription");
+            assert_eq!(rows_described, 2, "a RowDescription per Describe");
         }
         calls
     }
@@ -5106,6 +5123,13 @@ mod tests {
                         calls, per_execution,
                         "{sql:?}: libpg_query calls in execution {round}"
                     );
+                    // A create that answered without creating cannot pass as zero calls.
+                    if param {
+                        assert!(
+                            s.shared.db.branch_named(&name).unwrap().is_some(),
+                            "{sql:?}: execution {round} created no branch {name}"
+                        );
+                    }
                 }
             }
         });
