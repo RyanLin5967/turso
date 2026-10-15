@@ -814,13 +814,15 @@ def self_test():
          lambda s: s.get("warmup_creditable") is False and any("rc 3" in x for x in s["parity_refusals"])),
         ("MED 6: a record whose fastest_profile sha256 is not the package's refuses, naming it", {"conformance": "badsha"},
          False, lambda s: any("fastest_profile" in x and "sha256" in x for x in s["parity_refusals"])),
+        # TEST EDIT, flagged (review 7 / C21 finding 7; a strengthening): each backstep negative also requires
+        # warmup_creditable false, as A23 and the field's docstring say; it read true while the backstep refused
         ("MED 6: a competitor timed run with a warm-up backstep refuses", {"cell": "comp", "backsteps": 1}, False,
-         lambda s: any("backstep" in x for x in s["parity_refusals"])),
+         lambda s: any("backstep" in x for x in s["parity_refusals"]) and s.get("warmup_creditable") is False),
         ("MED 6: a backstep refuses in open loop too (loop is only reported)", {"cell": "comp", "backsteps": 2,
                                                                                "loop": "open"}, False,
-         lambda s: any("backstep" in x for x in s["parity_refusals"])),
+         lambda s: any("backstep" in x for x in s["parity_refusals"]) and s.get("warmup_creditable") is False),
         ("MED 6: a competitor timed run that records no warmup_backsteps refuses", {"cell": "comp", "backsteps": None},
-         False, lambda s: any("backstep" in x for x in s["parity_refusals"])),
+         False, lambda s: any("backstep" in x for x in s["parity_refusals"]) and s.get("warmup_creditable") is False),
         ("MED 6: a clean competitor run (closed loop, 0 backsteps) passes and reports its loop", {"cell": "comp"}, True,
          lambda s: s["runs"][0].get("warmup_loops") == ["closed", "closed"]),
     ]:
