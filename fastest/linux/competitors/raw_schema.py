@@ -16,7 +16,9 @@ import os
 import re
 import sys
 
-CORE = ("client", "seq", "phase", "ok", "intended_ns", "start_ns", "end_ns", "lat_ns", "after_ns", "err")
+CORE = ("client", "seq", "phase", "ok", "claim_ns", "intended_ns", "start_ns", "end_ns", "lat_ns", "after_ns", "err")
+# (the lead's ruling: one meaning per field -- claim_ns is the time claim_op read under the claim lock, which orders an op
+# against tm1; intended_ns keeps its registered meaning, the intended start, and lat_ns is unchanged)
 PHASES = ("warmup", "measure", "drain")
 HERE = os.path.dirname(os.path.abspath(__file__))
 # the producers, by source: the header literal starts with client\tseq\tphase
