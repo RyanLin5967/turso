@@ -8399,3 +8399,34 @@ fn a_failed_raw_frame_header_sync_is_reported_once() {
         assert_eq!(reported, 1, "{what}: one failed raw WAL header sync was reported {reported} times");
     }
 }
+
+/// Engine review 19 MED 4 (a regression): every fresh D0 store starts with its directory marked
+/// unsynced (`reset_log` at its creation, a class that syncs nothing), and its first syncing flight
+/// (here a trunk commit under synchronous FULL that keeps a pre-image for a live child) then opened
+/// the log's directory as a file to sync it. Off unix that open fails (Windows needs
+/// FILE_FLAG_BACKUP_SEMANTICS; recalled, not run) and nothing there syncs a directory anyway
+/// (`fsync_dir_of` is a no-op), so the flight fail-stopped the store: the commit failed, and so did
+/// every later fork. Off unix only (the Windows CI arm). Mutant `dir_opened_off_unix`.
+#[cfg(not(unix))]
+#[test]
+fn a_fresh_d0_stores_first_syncing_flight_off_unix_does_not_fail_stop_it() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let what = format!("catalog={catalog}");
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("dir-off-unix.db"), opts(catalog, SyncClass::Off));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        trunk.execute("PRAGMA synchronous = FULL").unwrap();
+        let x = trunk.fork_branch().unwrap();
+        let committed = trunk.execute("UPDATE t SET v = 'new' WHERE id = 3");
+        assert!(committed.is_ok(), "{what}: the first trunk commit that keeps a pre-image failed: {committed:?}");
+        assert!(
+            db.branches.rewrite_class_for_test().syncs(),
+            "{what}: premise: that commit's flight synced (it raised the log)"
+        );
+        let forked = trunk.fork_branch().map(|y| y.into_id());
+        assert!(forked.is_ok(), "{what}: a fork after the first syncing flight failed: {forked:?}");
+        assert_eq!(read_v(&x.connect().unwrap(), 3), "trunk-3", "{what}: x reads its fork point");
+    }
+}
