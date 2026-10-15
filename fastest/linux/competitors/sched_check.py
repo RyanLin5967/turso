@@ -175,6 +175,26 @@ def selftest():
         ok("after-tm1: a measured row at tm1 is refused",
            check_after_tm1(run("late", good_rows, dict(sm, tm1_ns=t0 + offs[-1]))) != [])
         ok("after-tm1: no tm1_ns is refused", check_after_tm1(run("notm1", good_rows, {"t0_ns": t0})) != [])
+        # the lead's claim_ns ruling, the same rule as timedrun.py raw_problems: closed loop judges the claim (claim_ns),
+        # open loop the arrival's intended time
+        def run_c(name, rows, sm_):
+            p = os.path.join(d, name)
+            os.makedirs(p)
+            with open(os.path.join(p, "summary.json"), "w") as f:
+                json.dump(sm_, f)
+            with open(os.path.join(p, "raw.tsv"), "w") as f:
+                f.write("client\tseq\tphase\tok\tarrival\tclaim_ns\tintended_ns\n")
+                for r in rows:
+                    f.write("\t".join(str(v) for v in r) + "\n")
+            return p
+        tm1c = t0 + 10 ** 9
+        closed = {"t0_ns": t0, "tm1_ns": tm1c, "loop": "closed"}
+        ok("after-tm1, closed loop: a row claimed before tm1 that started after it is accepted",
+           check_after_tm1(run_c("c_ok", [(0, 0, "measure", 1, 0, tm1c - 1, tm1c + 900)], closed)) == [])
+        ok("after-tm1, closed loop: a row claimed at tm1 is refused",
+           check_after_tm1(run_c("c_late", [(0, 0, "measure", 1, 0, tm1c, tm1c + 900)], closed)) != [])
+        ok("after-tm1, open loop: a row intended at tm1 but claimed before it is refused",
+           check_after_tm1(run_c("o_late", [(0, 0, "measure", 1, 0, tm1c - 900, tm1c)], dict(closed, loop="open"))) != [])
     print(f"sched_check selftest: {n - bad}/{n}")
     return 1 if bad else 0
 
