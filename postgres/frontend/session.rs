@@ -1931,6 +1931,33 @@ fn aside_name_for(table: &str, n: usize) -> String {
     format!("{}{suffix}", &table[..cut])
 }
 
+#[cfg(feature = "failpoints")]
+thread_local! {
+    static UNDO_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test failpoint (feature `failpoints`, never in a credited build): the next undo of a transaction
+/// a statement or an implicit block opened, on this thread, fails before it runs, as a ROLLBACK the
+/// engine refused would (wire review 16 item 14's red).
+#[cfg(feature = "failpoints")]
+pub fn fail_next_undo() {
+    UNDO_FAILS.with(|f| f.set(true));
+}
+
+/// Where [`fail_next_undo`] strikes: an error once after it, else Ok. Without the `failpoints`
+/// feature it is always Ok and compiles to nothing.
+#[doc(hidden)]
+#[inline]
+pub fn undo_failpoint() -> Result<()> {
+    #[cfg(feature = "failpoints")]
+    if UNDO_FAILS.with(|f| f.replace(false)) {
+        return Err(LimboError::InternalError(
+            "failpoint: the undo failed".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// The start of the error text of a statement whose undo failed too. The server ends the session on
 /// [`PgConnection::is_broken`], which is set with it, never on this text (wire review 5 item 4).
 pub const CONNECTION_BROKEN: &str = "connection broken";

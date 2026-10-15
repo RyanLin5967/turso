@@ -1243,7 +1243,8 @@ impl Session {
             st.aborted = false;
             if let Ok(conn) = self.current(&mut st) {
                 if !conn.inner().get_auto_commit() {
-                    let _ = engine_tx(&conn, TxStmt::Rollback);
+                    let _ = turso_pg::undo_failpoint()
+                        .and_then(|()| engine_tx(&conn, TxStmt::Rollback));
                 }
             }
         } else if TxVerb::of(sql) != TxVerb::Begin {
@@ -3691,12 +3692,14 @@ fn create_with_keys(
         Ok(_) => engine_tx(conn, TxStmt::Release(SAVEPOINT)).map_err(engine_error),
         Err(_) => {
             if !conn.inner().get_auto_commit() {
-                let _ = if own {
-                    engine_tx(conn, TxStmt::Rollback)
-                } else {
-                    engine_tx(conn, TxStmt::RollbackTo(SAVEPOINT))
-                        .and_then(|()| engine_tx(conn, TxStmt::Release(SAVEPOINT)))
-                };
+                let _ = turso_pg::undo_failpoint().and_then(|()| {
+                    if own {
+                        engine_tx(conn, TxStmt::Rollback)
+                    } else {
+                        engine_tx(conn, TxStmt::RollbackTo(SAVEPOINT))
+                            .and_then(|()| engine_tx(conn, TxStmt::Release(SAVEPOINT)))
+                    }
+                });
             }
             Ok(())
         }
@@ -4789,6 +4792,100 @@ mod tests {
         );
         ok(&s, "SELECT turso_branch_switch('h')");
         assert_eq!(on(&s), old, "the switch left the session's branch");
+    }
+
+    /// The errors `sql` answers, as (code, severity).
+    fn errors(session: &Session, sql: &str) -> Vec<(String, String)> {
+        session
+            .simple(sql)
+            .into_iter()
+            .filter_map(|r| match r {
+                Response::Error(e) => Some((e.code.clone(), e.severity.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Whether table `name` is committed, read by a connection of its own.
+    fn committed_table(s: &Session, name: &str) -> bool {
+        let conn = s.shared.db.connect().unwrap();
+        let rows = conn
+            .prepare(format!(
+                "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = '{name}'"
+            ))
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        rows != vec![vec![Value::from_i64(0)]]
+    }
+
+    const FATAL: (&str, &str) = ("08006", "FATAL");
+
+    /// Wire review 16 item 14: an undo that fails is never swallowed. A CREATE TABLE whose key onto
+    /// itself does not resolve (42830 after the CREATE) is undone in the transaction it ran in;
+    /// when that undo fails (the failpoint), the engine still holds the table in an open
+    /// transaction, so the connection is broken: FATAL 08006, and the session ends rather than
+    /// serve the next statement, which joined that transaction (`let _ = rollback`: the client's
+    /// next COMMIT committed the refused table). In autocommit (the statement's own BEGIN), and in a
+    /// client's block (its savepoint).
+    #[test]
+    fn a_failed_undo_of_a_refused_create_breaks_the_connection() {
+        let refused = "CREATE TABLE c(id INT, x INT REFERENCES c(id))";
+        for in_block in [false, true] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let s = session(&dir);
+            ok(&s, "CREATE TABLE z(id INT)");
+            assert_eq!(
+                errors(&s, refused),
+                vec![("42830".to_string(), "ERROR".to_string())],
+                "premise: the key onto c(id), which is not unique, is refused after the CREATE"
+            );
+            assert!(!committed_table(&s, "c"), "premise: the refused c was undone");
+            if in_block {
+                ok(&s, "BEGIN");
+            }
+            turso_pg::fail_next_undo();
+            let got = errors(&s, refused);
+            let fatal = vec![(FATAL.0.to_string(), FATAL.1.to_string())];
+            assert_eq!(got, fatal, "in_block={in_block}: the failed undo was swallowed");
+            assert_eq!(
+                errors(&s, "COMMIT"),
+                fatal,
+                "in_block={in_block}: the session served a statement after its undo failed"
+            );
+            assert!(
+                !committed_table(&s, "c"),
+                "in_block={in_block}: the refused table was committed"
+            );
+        }
+    }
+
+    /// Wire review 16 item 14, the implicit block's half: a multi-statement query whose second
+    /// statement fails is rolled back whole; when that rollback fails (the failpoint), the engine
+    /// still holds the block's transaction, so the connection is broken and the next statement is
+    /// FATAL 08006, never run inside it (`let _ = engine_tx(Rollback)`: the next COMMIT committed
+    /// the block's first statement).
+    #[test]
+    fn a_failed_rollback_of_an_implicit_block_breaks_the_connection() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = session(&dir);
+        ok(&s, "CREATE TABLE p(id INT PRIMARY KEY)");
+        ok(&s, "INSERT INTO p VALUES (1)");
+        turso_pg::fail_next_undo();
+        let got = errors(&s, "CREATE TABLE kept(id INT); INSERT INTO p VALUES (1)");
+        assert!(
+            got.iter().any(|(code, _)| code == "23505"),
+            "premise: the second statement fails: {got:?}"
+        );
+        assert_eq!(
+            errors(&s, "COMMIT"),
+            vec![(FATAL.0.to_string(), FATAL.1.to_string())],
+            "the session served a statement after its block's rollback failed"
+        );
+        assert!(
+            !committed_table(&s, "kept"),
+            "the failed block's first statement was committed"
+        );
     }
 
     /// An extended-protocol statement is prepared once: Execute runs the statement its Describe
