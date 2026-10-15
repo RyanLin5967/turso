@@ -662,6 +662,13 @@ def cell(a):
     if ops <= 0:
         res["verdict"] = "REFUSED: zero ops in the load window"
         return res
+    # comp review 1 LOW 22: the delete's durability the system is registered with: d2 (a durable delete, at least one
+    # flush per cycle in the delete phase), d0 (none), or none (the spec deletes nothing: select1)
+    dd = a.get("delete-durable", "none")
+    if dd not in ("d2", "d0", "none"):
+        res["verdict"] = f"REFUSED: delete-durable {dd!r} is neither d2, d0 nor none"
+        return res
+    res["delete_durable"] = dd
     keys = list(load["flush_by_syscall"]) + ["sync_file_range", "copy_file_range_calls", "ficlone"]
     res["load"] = {k: load["flush_by_syscall"].get(k, load.get(k, 0)) for k in keys}
     res["idle"] = {k: idle["flush_by_syscall"].get(k, idle.get(k, 0)) for k in keys}
@@ -690,6 +697,17 @@ def cell(a):
             per[k] = round((ph[k] - rate * pt.get(k, 0.0)) / ops, 4) if rate is not None else None
         res["phase_split"] = {"counts": ph, "time_s": pt, "rule": "C=1 only: each flush placed by its start stamp "
                               "against the load generator's op times (create [start, end], delete (end, end + after])"}
+    dbad = []  # LOW 22: the delete's durability, checkable only where the flushes split by phase (C=1)
+    if dd != "none" and isinstance(ph, dict):
+        dr = ph["delete"] / ops
+        if dd == "d2" and dr < 1:
+            dbad.append(f"delete not durable: {round(dr, 4)} flushes per cycle in the delete phase, want >= 1 for a "
+                        f"D2 delete")
+        if dd == "d0" and ph["delete"] > 0:
+            dbad.append(f"a D0 delete flushed: {ph['delete']} flushes in the delete phase, want 0")
+        res["delete_check"] = "checked at C=1 by op phase"
+    elif dd != "none":
+        res["delete_check"] = "not checked: no phase split (C>1 ops overlap)"
     res["per_op"] = per
     res["load_by_role"] = load.get("by_role", {})
     res["idle_by_role"] = idle.get("by_role", {})
@@ -732,6 +750,7 @@ def cell(a):
         bad.append(res["deferred"]["verdict"])
     if res["ops_ok"] != ops:
         bad.append(f"{ops - res['ops_ok']} of {ops} ops failed")
+    bad += dbad
     res["verdict"] = ("NOT CLEAN: " + " | ".join(bad)) if bad else "ok"
     return res
 
@@ -841,6 +860,28 @@ def selftest():
            (pc.get("flushes"), pc.get("create"), pc.get("delete"), pc.get("between_raw")) == (1.3333, 0.6667, 0.3333,
                                                                                                0.3333),
            (pc.get("flushes"), pc.get("create"), pc.get("delete"), pc.get("between_raw")))
+        # comp review 1 LOW 22: a cell names its delete's durability (delete-durable): a D2 delete must flush at least
+        # once per cycle in the delete phase, a D0 one never. The plant's delete phase holds 1 flush over 3 cycles.
+        for dd, want, why in (("d2", False, "delete not durable"), ("d0", False, "a D0 delete flushed")):
+            cd = cell({"name": "plant/dd", "load": lj, "idle": "none", "ops": "3", "load-s": "1", "idle-s": "0",
+                       "delete-durable": dd})
+            ok(f"delete-durable {dd}: 1 delete-phase flush over 3 cycles is refused ({why})",
+               cd.get("verdict", "").startswith("NOT CLEAN") and why in cd.get("verdict", ""), cd.get("verdict"))
+        r3d = dict(r, flush_by_phase={"create": 2, "delete": 3, "between": 1})
+        json.dump(r3d, open(lj + ".d2", "w"))
+        cd = cell({"name": "plant/dd2", "load": lj + ".d2", "idle": "none", "ops": "3", "load-s": "1", "idle-s": "0",
+                   "delete-durable": "d2"})
+        ok("control: delete-durable d2 with one delete-phase flush per cycle is ok", cd.get("verdict") == "ok",
+           cd.get("verdict"))
+        r0d = dict(r, flush_by_phase={"create": 2, "delete": 0, "between": 1})
+        json.dump(r0d, open(lj + ".d0", "w"))
+        cd = cell({"name": "plant/dd0", "load": lj + ".d0", "idle": "none", "ops": "3", "load-s": "1", "idle-s": "0",
+                   "delete-durable": "d0"})
+        ok("control: delete-durable d0 with no delete-phase flush is ok", cd.get("verdict") == "ok", cd.get("verdict"))
+        cd = cell({"name": "plant/ddx", "load": lj, "idle": "none", "ops": "3", "load-s": "1", "idle-s": "0",
+                   "delete-durable": "d1"})
+        ok("a delete-durable that is neither d2, d0 nor none is refused", cd.get("verdict", "").startswith("REFUSED"),
+           cd.get("verdict"))
         r2 = count(tr, [], "/x", w)
         ok("no split unless asked", "flush_by_phase" not in r2, r2.get("flush_by_phase"))
         open(p, "w").write(raw(rows + [(1, 0, "measure", 1, 0, 1, 2, 1, 1, -1)]))
@@ -850,8 +891,14 @@ def selftest():
         # LOW 16: a window's fields are read from their own lines, never from the launch command's text (cmd=)
         good = open(w).read()
         w2 = os.path.join(d, "c2.window")
-        open(w2, "w").write(good.replace("cmd=planted", "cmd=planted --tag strace_rc=0").replace("strace_rc=0\n",
-                                                                                                  "strace_rc=1\n"))
+        # comp review 1 LOW 18: the window's own line is changed FIRST and by its line-start form only, then the cmd=
+        # token added (the old unbounded replace turned the cmd= token into strace_rc=1 too, so c2 could not fail at
+        # 5b9d0395f, the unanchored search's base: both lines read 1)
+        open(w2, "w").write(good.replace("\nstrace_rc=0\n", "\nstrace_rc=1\n").replace("cmd=planted",
+                                                                                     "cmd=planted --tag strace_rc=0"))
+        ok("c2's premise: the cmd= line says strace_rc=0 and the window's own line strace_rc=1",
+           open(w2).read().startswith("cmd=planted --tag strace_rc=0\n") and "\nstrace_rc=1\n" in open(w2).read(),
+           open(w2).read())
         r4 = count(tr, [], "/x", w2)
         ok("c2: strace_rc=0 in the cmd= line does not mask the window's strace_rc=1",
            r4.get("verdict", "").startswith("REFUSED") and "strace_rc=1" in r4.get("verdict", ""), r4.get("verdict"))

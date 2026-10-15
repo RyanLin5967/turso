@@ -42,6 +42,7 @@ on:
     branches: [fastest-branching, fastest-linux-comp]
     paths:
       - "fastest/linux/competitors/**"
+      - "fastest/linux/gates/**"
       - "fastest/linux/hw/**"
       - "fastest/linux/fs/**"
       - ".github/workflows/fastest-competitors.yml"
@@ -84,6 +85,8 @@ jobs:
           timeout 120 python3 -B fastest/linux/competitors/fthelp.py selftest | tail -1  # MED 9: the GC verdict
           timeout 120 python3 -B fastest/linux/competitors/pins.py selftest | tail -1    # LOW 20: CI never ran it
           timeout 120 python3 -B fastest/linux/competitors/smoke_table.py selftest | tail -1  # LOW 25: version labels
+          timeout 120 python3 -B fastest/linux/competitors/spec_lint.py selftest | tail -1    # comp review 1 MED 6
+          timeout 120 python3 -B fastest/linux/gates/sweeper_record.py selftest | tail -1  # MED 12: the shared reader
           timeout 600 bash fastest/linux/competitors/plant_real.sh "$RUNNER_TEMP/plant-real"
           # the drive class (SMOKE erratum E3): known answers, then drive.py live on this runner's own disk, kept with
           # the build's hardware record. Not a gate: the cells' disk is each run job's, recorded and refused there.
@@ -121,6 +124,14 @@ jobs:
           timeout 300 python3 -B fastest/linux/gates/warmup_conformance.py run --bbload dist/bbload \
             --clonebench dist/clonebench || rc=$?
           [ "$rc" = 3 ] || { echo "warm-up conformance rc=$rc, want 3 (both drivers match every case)"; exit 1; }
+      # Competitors review 2 (f6c2dbb2f..12f79726b) items 2, 4, 5 and 7: the built binaries' refusals (open loop with
+      # after-steps or a branch connection; strict --rate, --seed and the other numbers) and the live decision replayed
+      # with a step back (--warmup-decide), no server needed; sched_check.py's model of the open-loop arrival stream
+      - name: Binary plants (refusals, --warmup-decide) and sched_check.py selftest
+        run: |
+          timeout 120 python3 -B fastest/linux/competitors/sched_check.py selftest | tail -1
+          timeout 600 bash fastest/linux/competitors/bin_plants.sh dist "$RUNNER_TEMP/bin-plants"
+          timeout 300 bash fastest/linux/competitors/fetch_dolt_plant.sh "$RUNNER_TEMP/fetch-dolt-plant"  # comp review 1 LOW 38
       - uses: actions/upload-artifact@v4
         with:
           name: competitor-tools-${{ matrix.runner }}
@@ -157,9 +168,10 @@ jobs:
       # add ~30 min and ~9 GB per WAL_LOG cell here); every run records the rule it used. An empty input also gives
       # 1000:10:2 (the `||` default); pass 1000:10:180 for the registered rule. That cap is accepted for SMOKE only
       # (lead ruling, artie DECISIONS 6b0bef481b): these jobs say so with FT_DRY=1, and run_system.sh refuses the cap
-      # on a real run (FT_DRY=0, its default; the build job's plant proves it). A clean cell warmed up by any rule but
-      # rule(FT_CAP_S) gets timed.json verdict 'ok-smoke-warmup', never 'ok', and reduce.py accepts it only from a
-      # dry=1 job (lead review 62430d8bf..b49fb656a MED 7).
+      # on a real run (FT_DRY=0, its default; the build job's plant proves it). A clean cell of a smoke job gets
+      # timed.json verdict 'ok-smoke' whatever its rule, never 'ok', and reduce.py accepts 'ok-smoke' only from a dry=1
+      # job and 'ok' only from a dry=0 one, and refuses a run whose jobs mix them (lead review 62430d8bf..b49fb656a
+      # MED 7; comp review 1 LOW 15).
       FT_CAP_S: ${{ inputs.cap_s || '1800' }}
       FT_WARMUP: ${{ inputs.warmup || '1000:10:2' }}
       FT_DRY: "1"
@@ -190,7 +202,8 @@ jobs:
           # step's bash -e stops on that.
           pgv=$(python3 -B fastest/linux/competitors/pins.py get postgresql any pgdg_package)
           [ -n "$pgv" ] || { echo "no postgresql row in versions.tsv"; exit 1; }
-          sudo apt-get install -y -q "postgresql-18=$pgv" "postgresql-client-18=$pgv" "libpq5=$pgv" mariadb-client libmariadb3 strace xfsprogs btrfs-progs fio lsof
+          # comp review 1 LOW 37: postgresql-18-jit, which postgresql-18 pulls in, is pinned to the same build
+          sudo apt-get install -y -q "postgresql-18=$pgv" "postgresql-18-jit=$pgv" "postgresql-client-18=$pgv" "libpq5=$pgv" mariadb-client libmariadb3 strace xfsprogs btrfs-progs fio lsof
           sudo systemctl stop postgresql || true
           pg_lsclusters || true
       # The servers' ports (PG 55432, Doltgres 55433, Dolt 53306) lie inside the ephemeral range 32768-60999, so a
@@ -203,7 +216,7 @@ jobs:
       - name: Run info
         run: |
           mkdir -p "$RAW"
-          chmod +x dist/bbload dist/clonebench dist/sqlite3
+          chmod +x dist/bbload dist/clonebench dist/sqlite3 dist/bbload-plant-claim-early dist/clonebench-plant-claim-early
           { echo "git_sha=$GITHUB_SHA run=$GITHUB_RUN_ID attempt=$GITHUB_RUN_ATTEMPT runner=${{ matrix.runner }} fs=${{ matrix.fs }} system=${{ matrix.system }}";
             echo "image=${ImageOS:-?} ${ImageVersion:-?} runner_name=$RUNNER_NAME";
             echo "n1=$FT_N1 n4=$FT_N4 rows=$FT_ROWS idle_s=$FT_IDLE_S cap_s=$FT_CAP_S warmup=$FT_WARMUP dry=$FT_DRY (smoke, uncredited) age=$FT_AGE prebranch=$FT_PREBRANCH";
@@ -237,12 +250,56 @@ jobs:
           FT_CLONEBENCH: ${{ github.workspace }}/dist/clonebench
           FT_SQLITE3: ${{ github.workspace }}/dist/sqlite3
           FT_FIRECHECK: ${{ github.workspace }}/fastest-raw/firecheck/firecheck.txt
-        # LOW 14: the job's budget, derived from this step's own timeout so no cell can be cut mid-way: a cell not
-        # started by 12600 - 2 x (cap + 600) - 600 s is recorded "NOT RUN: budget" (at the 1800 s cap: 7200 s)
+        # LOW 14: the job's budget, derived from this step's own timeout: run_system.sh starts a cell only while the
+        # budget, 12600 - 2 x (cap + 600) - 600 s (at the 1800 s cap: 7200 s), still holds the longest cell it has run
+        # (comp review 1 LOW 32); the rest of the step's time is for a cell longer than all before it and for the work
+        # after the cells. A cell this step's timeout does cut fails the job and reads MISSING in reduce.
         run: |
           export FT_BUDGET_S=$(( 12600 - 2 * (${FT_CAP_S%.*} + 600) - 600 ))
           [ "$FT_BUDGET_S" -gt 0 ] || { echo "the cap leaves no budget under the 12600 s step timeout"; exit 1; }
           timeout 12600 bash fastest/linux/competitors/run_system.sh ${{ matrix.system }} "$MNT" "$RAW/run"
+      # Comp review 1 LOW 33's plant: a server init that fails (here pg18.sh's shared_buffers step, through an FT_PY
+      # that fails pins.py shared-buffers) must fail the run AS an init failure, not surface later as a start failure
+      - name: Init plant (pg18-d2, a failing shared-buffers step)
+        if: ${{ !cancelled() && matrix.system == 'pg18-d2' && steps.fs.outcome == 'success' && steps.fc.outcome == 'success' }}
+        env:
+          FT_BBLOAD: ${{ github.workspace }}/dist/bbload
+          FT_CLONEBENCH: ${{ github.workspace }}/dist/clonebench
+          FT_SQLITE3: ${{ github.workspace }}/dist/sqlite3
+          FT_FIRECHECK: ${{ github.workspace }}/fastest-raw/firecheck/firecheck.txt
+        run: |
+          mkdir -p "$MNT/init-plant" "$RUNNER_TEMP/init-plant-bin"
+          stub="$RUNNER_TEMP/init-plant-bin/py"
+          printf '#!/bin/sh\ncase "$*" in *pins.py\\ shared-buffers*) echo "planted shared-buffers failure" >&2; exit 1 ;; esac\nexec python3 "$@"\n' >"$stub"
+          chmod +x "$stub"
+          rc=0
+          FT_PY="$stub" timeout 1800 bash fastest/linux/competitors/run_system.sh pg18-d2 "$MNT/init-plant" \
+            "$RAW/init-plant" >"$RAW/init-plant.txt" 2>&1 || rc=$?
+          echo "init plant: rc $rc; $(grep -c 'FAIL server init' "$RAW/init-plant/functional.txt" 2>/dev/null) server-init FAIL line(s)"
+          [ "$rc" != 0 ] && grep -q '^FAIL server init' "$RAW/init-plant/functional.txt"
+      # Comp review 1 LOW 32's plant: a budget of 1 s must leave every B1 cell "NOT RUN: budget" and fail the run (the
+      # budget path had never run). Its own directory on the same filesystem, so the measured run above is untouched.
+      - name: Budget plant (b1, FT_BUDGET_S=1)
+        if: ${{ !cancelled() && matrix.system == 'b1' && steps.fs.outcome == 'success' && steps.fc.outcome == 'success' }}
+        env:
+          FT_BBLOAD: ${{ github.workspace }}/dist/bbload
+          FT_CLONEBENCH: ${{ github.workspace }}/dist/clonebench
+          FT_SQLITE3: ${{ github.workspace }}/dist/sqlite3
+          FT_FIRECHECK: ${{ github.workspace }}/fastest-raw/firecheck/firecheck.txt
+        run: |
+          mkdir -p "$MNT/budget-plant"
+          rc=0
+          FT_BUDGET_S=1 timeout 3600 bash fastest/linux/competitors/run_system.sh b1 "$MNT/budget-plant" "$RAW/budget-plant" \
+            >"$RAW/budget-plant.txt" 2>&1 || rc=$?
+          n=0 bad=0
+          for cj in "$RAW"/budget-plant/cells/*/cell.json; do
+            [ -e "$cj" ] || continue
+            n=$((n + 1))
+            python3 -B -c 'import json, sys; sys.exit(0 if json.load(open(sys.argv[1]))["verdict"].startswith("NOT RUN: budget") else 1)' "$cj" ||
+              { echo "budget plant: $cj is not NOT RUN: budget"; bad=$((bad + 1)); }
+          done
+          echo "budget plant: rc $rc, $n cells, $bad not 'NOT RUN: budget'"
+          [ "$rc" != 0 ] && [ "$n" -gt 0 ] && [ "$bad" = 0 ]
       - name: Compress traces
         if: always()
         run: find "$RAW" -name '*.strace' -exec gzip -9 {} + || true

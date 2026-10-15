@@ -9,7 +9,7 @@
 #                                   database "bench" in DATA/dbs/bench; cfg in DATA/cfg
 #   dolt.sh start DATA [V1RUN]      `dolt sql-server -H 127.0.0.1 -P PORT --data-dir DATA/dbs --doltcfg-dir DATA/cfg
 #                                   --max-connections 1100`, cwd DATA, detached; pid -> DATA.ftpid, log -> DATA.log
-#   dolt.sh seed  DATA ROWS [AGE]   bench.t(ROWS rows), DOLT_COMMIT on main; AGE>0: aged, DOLT_COMMIT, DOLT_GC
+#   dolt.sh seed  DATA ROWS [AGE]   bench.t(ROWS rows), DOLT_COMMIT on main, aged by AGE (0: none), DOLT_COMMIT, DOLT_GC (always)
 #   dolt.sh sql   DATA SQL          one statement through the MariaDB client
 #   dolt.sh stop  DATA              SIGTERM to the recorded pid only; waits for exit
 # Branch ops (specs in ../loadgen/specs): CALL DOLT_CHECKOUT('-b', b) [BranchBench's create], or DOLT_BRANCH + checkout.
@@ -59,6 +59,8 @@ seed)
   # then DOLT_GC. The server's GC settings are recorded beside it.
   my -N bench -e "CALL DOLT_COMMIT('-am', 'age', '--allow-empty')" >/dev/null
   my -N bench -e "SHOW VARIABLES LIKE '%gc%'" >"$DATA.gc-settings.txt" 2>&1 || echo "rc=$? (not read)" >>"$DATA.gc-settings.txt"
+  # comp review 1 LOW 28: the record is judged (empty, failed or GC-less is refused); run_system.sh fails the job on it
+  "$FT_PY" -B "$FT_HERE/fthelp.py" gcsettings "$DATA.gc-settings.txt" >"$DATA.gc-settings.verdict" || true
   # DOLT_GC, judged by an allowlist (lead review 62430d8bf..b49fb656a MED 9: the old check exempted a lost
   # connection, which is what a recovered panic or a failed handshake looks like; in 2.4.1 DOLT_GC does not end the
   # calling session): client rc 0, its output exactly the status 0, and no panic in the server log written since the
@@ -72,6 +74,7 @@ seed)
     die "REFUSED: DOLT_GC: $(cat "$DATA.gc.verdict")"
   echo "gc_store_bytes before=$gc_before after=$(du -sB1 "$DATA/dbs/bench" | cut -f1)"
   echo "maintenance: DOLT_COMMIT seed; aged $AGE; DOLT_COMMIT age; DOLT_GC"
+  echo "evidence: gc_verdict=$(head -1 "$DATA.gc.verdict" | tr -d ' ')"  # comp review 1 LOW 24: the GC's outcome
   echo "seeded bench.t rows=$(my -N bench -e 'SELECT count(*) FROM t') branch=$(my -N bench -e 'SELECT active_branch()')"
   ;;
 sql)

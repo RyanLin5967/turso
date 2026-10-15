@@ -12,7 +12,10 @@ from pathlib import Path
 
 
 SOURCE = Path(__file__).with_name("timedrun.py")
-FUNCTIONS = {"tracer_problems", "warm_problems", "run_problems", "check", "real_problem"}
+# (+ the comp branch's guards, merged at 407b164a3: each run's own record, its raw rows, its after-step record; the
+# sweeper's reader is gates/sweeper_record.py, shared with t3run.sh, whose own selftest plants each of its refusals)
+FUNCTIONS = {"tracer_problems", "warm_problems", "run_problems", "check", "real_problem", "record_problems",
+             "raw_problems", "after_problems"}
 
 
 def candidates(tree):

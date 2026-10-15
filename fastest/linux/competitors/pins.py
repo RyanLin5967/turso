@@ -88,20 +88,37 @@ def shared_buffers_mb(meminfo_text):
     return kb // 4 // 1024
 
 
+def shared_buffers_bytes(settings_tsv_text):
+    """(bytes, None) of shared_buffers from a pg18.sh settings dump (name, setting, unit, source), or (None, why): the
+    setting is in 8kB pages, and any other or missing unit is refused rather than guessed (LOW 21: the old dump had no
+    unit column, and a dict keyed by the source column fell back to 8 kB for every value). The ONE reader: check_pg and
+    smoke_table.py (comp review 1 LOW 34: it multiplied by 8 kB whatever the unit)."""
+    row = next((ln.split("\t") for ln in settings_tsv_text.splitlines() if ln.split("\t")[0] == "shared_buffers"), None)
+    if row is None or len(row) < 2 or not row[1].isdigit():
+        return None, "no shared_buffers row in pg_settings"
+    if len(row) < 3 or row[2] != "8kB":
+        return None, f"shared_buffers unit {row[2] if len(row) > 2 else None!r} is not 8kB"
+    return int(row[1]) * 8 * 1024, None
+
+
+D2_SETTINGS = {"wal_sync_method": "fdatasync", "file_copy_method": "clone", "fsync": "on", "synchronous_commit": "on",
+               "full_page_writes": "on"}  # pg18.sh init's MODE d2 (comp review 1 LOW 36: all five, read back)
+
+
+def check_d2(settings_tsv_text):
+    """Why the running server's pg_settings dump is not the registered D2 configuration ([] = it is)."""
+    got = {ln.split("\t")[0]: (ln.split("\t") + [""])[1] for ln in settings_tsv_text.splitlines() if "\t" in ln}
+    return [f"{k} is {got.get(k)!r}, not {v!r}" for k, v in D2_SETTINGS.items() if got.get(k) != v]
+
+
 def check_pg(settings_tsv_text, meminfo_text):
     why = []
     if mem_total_kb(meminfo_text) is None:
         return ["no MemTotal in meminfo: 25% cannot be computed"]
     want_mb = shared_buffers_mb(meminfo_text)
-    row = next((ln.split("\t") for ln in settings_tsv_text.splitlines() if ln.split("\t")[0] == "shared_buffers"), None)
-    if row is None or len(row) < 2 or not row[1].isdigit():
-        return ["no shared_buffers row in pg_settings"]
-    # pg18.sh settings dumps (name, setting, unit, source) (LOW 21: the old dump had no unit column, and a dict keyed
-    # by the source column fell back to 8 kB for every value); shared_buffers is reported in 8kB pages, and any other
-    # or missing unit is refused rather than guessed
-    if len(row) < 3 or row[2] != "8kB":
-        return [f"shared_buffers unit {row[2] if len(row) > 2 else None!r} is not 8kB"]
-    got = int(row[1]) * 8 * 1024
+    got, w = shared_buffers_bytes(settings_tsv_text)
+    if w:
+        return [w]
     if got != want_mb << 20:
         why.append(f"shared_buffers {got >> 20} MB, not 25% of MemTotal = {want_mb} MB")
     return why
@@ -173,7 +190,30 @@ def selftest():
        check_pg("shared_buffers\t511616\tkB\tconfiguration file\n", mem) != [])
     ok("check-pg: no unit column refused", check_pg("shared_buffers\t511616\n", mem) != [])
     ok("check-pg: no shared_buffers row refused", check_pg("fsync\ton\t\tdefault\n", mem) != [])
+    # comp review 1 LOW 34: ONE reader of shared_buffers' size, shared by check_pg and smoke_table (which guessed 8 kB)
+    sbb = globals().get("shared_buffers_bytes")
+    for name, text, want in (("8kB pages", good, (511616 * 8192, None)),
+                             ("a kB unit is not guessed", "shared_buffers\t511616\tkB\tconfiguration file\n", (None, "unit")),
+                             ("no unit column", "shared_buffers\t511616\n", (None, "unit")),
+                             ("no row", "fsync\ton\t\tdefault\n", (None, "no shared_buffers row"))):
+        got = sbb(text) if sbb else (None, "no shared_buffers_bytes() in pins.py")
+        ok(f"shared_buffers_bytes: {name} -> {got!r}",
+           got[0] == want[0] and (want[1] is None) == (got[1] is None) and (want[1] is None or want[1] in got[1]))
     ok("check-pg: no MemTotal refused", check_pg(good, "MemFree: 1 kB\n") != [])
+    # comp review 1 LOW 36: all five D2 settings read back from the running server, not two
+    d2 = "".join(f"{k}\t{v}\t\tconfiguration file\n" for k, v in (
+        ("wal_sync_method", "fdatasync"), ("file_copy_method", "clone"), ("fsync", "on"), ("synchronous_commit", "on"),
+        ("full_page_writes", "on")))
+    cd2 = globals().get("check_d2")
+    ok("check-d2: the five registered D2 settings accepted", cd2 is not None and cd2(d2) == [])
+    for k, bad_v in (("fsync", "off"), ("synchronous_commit", "local"), ("full_page_writes", "off"),
+                     ("wal_sync_method", "open_datasync"), ("file_copy_method", "copy")):
+        planted = "".join((f"{k}\t{bad_v}\t\tconfiguration file\n" if ln.startswith(k + "\t") else ln)
+                          for ln in d2.splitlines(True))
+        ok(f"check-d2: {k}={bad_v} refused", cd2 is not None and any(k in w for w in cd2(planted)))
+    ok("check-d2: a missing fsync row refused",
+       cd2 is not None and any("fsync" in w for w in cd2("".join(ln for ln in d2.splitlines(True)
+                                                                 if not ln.startswith("fsync\t")))))
     print(f"pins selftest: {n - bad}/{n}")
     return 1 if bad else 0
 
@@ -194,6 +234,10 @@ if __name__ == "__main__":
             sys.exit(f"pins.py: no version for {a[1]}")
         print(v)
         sys.exit(0)
+    if len(a) == 2 and a[0] == "check-d2":  # TSV: the running server's five D2 settings (comp review 1 LOW 36)
+        why = check_d2(open(a[1], errors="replace").read())
+        print("ok: " + " ".join(f"{k}={v}" for k, v in D2_SETTINGS.items()) if not why else "REFUSED: " + "; ".join(why))
+        sys.exit(0 if not why else 1)
     if len(a) == 3 and a[0] == "check-version":
         t = open(a[2], errors="replace").read()
         if check_version(a[1], t):

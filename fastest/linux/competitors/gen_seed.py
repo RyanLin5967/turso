@@ -11,18 +11,22 @@ SQLite; INSERTs in batches of 1000 rows.
                                           K random single-row UPDATEs, one statement each (autocommit: each committed),
                                           the same ids and values for every system (PREREG §7 / amendment 52 ages with
                                           1e5); deterministic for (R, K, S); K = 0 writes nothing
-  gen_seed.py expect --rows R [--updates K] [--seed S]
-                                          'count|sum|row_hash' the engine must read back from t
   gen_seed.py readback-sql --dialect pg|mysql
-                                          the engine's own read-back query of that triple (pg: PostgreSQL, Doltgres)
+                                          the engine's own read-back query of 'count|sum|row_hash' from t (pg:
+                                          PostgreSQL, Doltgres), which fixture.py write compares with facts()
   gen_seed.py readback-sqlite FILE        the same triple read from an SQLite file
   gen_seed.py sum --rows R [--updates K] [--seed S]
-                                          sum(v) over t after the aging (0 fresh): what isolation checks expect
+                                          sum(v) over t after the aging (0 fresh): what isolation checks expect; it
+                                          walks the aging only
   gen_seed.py selftest
-fixture.json's gen_seed_sha256 (the sha256 of the parent stream, then the aging) is digest(), taken by facts() in the
-same pass as everything else fixture.py records.
+Everything fixture.py records about the generator (gen_seed_sha256, the stream digests, the expected read-back) is
+facts(), ONE pass over the parent stream; a job generates the parent twice, the seed's stream and that pass (comp
+review 1 MED 10: the old `expect` subcommand was a third).
 """
+import glob
 import hashlib
+import os
+import re
 import sys
 
 ALPHA = "abcdefghijklmnopqrstuvwxyz0123456789"
@@ -35,12 +39,16 @@ def xorshift32(x):
     return x
 
 
+# The parent's schema line, the stream's first (fixture.py records its sha256 by itself, MED 11). INTEGER PRIMARY KEY
+# (lead review 62430d8bf..b49fb656a MED 11): in SQLite only this spelling makes id the rowid, so B1's parent has no
+# separate sqlite_autoindex_t_1 that every first write searches; PostgreSQL, Dolt and Doltgres read INTEGER as INT, so
+# one stream still serves every system. (cd88722e0..MED 11 loaded INT PRIMARY KEY.)
+SCHEMA = "CREATE TABLE t (id INTEGER PRIMARY KEY, v INT NOT NULL, pad VARCHAR(120) NOT NULL);"
+
+
 def sql_lines(rows):
     """The parent, as `gen_seed.py sql` prints it (one pad stream across batches)."""
-    # INTEGER PRIMARY KEY (lead review 62430d8bf..b49fb656a MED 11): in SQLite only this spelling makes id the rowid, so
-    # B1's parent has no separate sqlite_autoindex_t_1 that every first write searches; PostgreSQL, Dolt and Doltgres
-    # read INTEGER as INT, so one stream still serves every system. (cd88722e0..MED 11 loaded INT PRIMARY KEY.)
-    yield "CREATE TABLE t (id INTEGER PRIMARY KEY, v INT NOT NULL, pad VARCHAR(120) NOT NULL);"
+    yield SCHEMA
     x = 2463534242
     for start in range(1, rows + 1, 1000):
         vals = []
@@ -64,57 +72,25 @@ def age_lines(rows, updates, seed=1):
         yield "UPDATE t SET v = %d WHERE id = %d;" % (x % 1000000, i)
 
 
-def aged_sum(rows, updates=0, seed=1):
-    """sum(v) over t after the aging: the isolation checks' expected parent value (0 when fresh)."""
+def aged_values(aging):
+    """{id: v} after the aging lines AGING (the last write to each id wins): O(aged rows), never the parent."""
     last = {}
-    for ln in age_lines(rows, updates, seed):
+    for ln in aging:
         v, i = ln[len("UPDATE t SET v = "):-1].split(" WHERE id = ")
         last[int(i)] = int(v)
-    return sum(last.values())
+    return last
 
 
-def digest(rows, updates=0, seed=1):
-    h = hashlib.sha256()
-    for ln in sql_lines(rows):
-        h.update(ln.encode() + b"\n")
-    for ln in age_lines(rows, updates, seed):
-        h.update(ln.encode() + b"\n")
-    return h.hexdigest()
+def aged_sum(rows, updates=0, seed=1):
+    """sum(v) over t after the aging: the isolation checks' expected parent value (0 when fresh). It walks the aging
+    only, never the parent stream, so `gen_seed.py sum` (run_system.sh's PSUM) is not a generator pass."""
+    return sum(aged_values(age_lines(rows, updates, seed)).values())
 
 
 # ---- what the engine must READ BACK (lead review 62430d8bf..b49fb656a MED 3: the fixture guard compared its own
 # inputs; now each job records the digest of the bytes it actually piped and the engine's own read-back of t)
-def stream_digests(rows, updates=0, seed=1):
-    """sha256 of each stream exactly as `gen_seed.py sql` and `gen_seed.py age` write it (every line + "\\n")."""
-    out = {}
-    for k, lines in (("sql", sql_lines(rows)), ("age", age_lines(rows, updates, seed))):
-        h = hashlib.sha256()
-        for ln in lines:
-            h.update(ln.encode() + b"\n")
-        out[k] = h.hexdigest()
-    return out
-
-
 def hash_row(i, v, pad):
     return int(hashlib.md5(f"{i}:{v}:{pad}".encode()).hexdigest()[:6], 16)
-
-
-def row_hash(rows, updates=0, seed=1):
-    """The order-independent row hash: sum over t of the first 6 hex digits of md5("id:v:pad") (exact in every engine:
-    a 24-bit term, so 5e8 rows stay below 2^53, where Dolt's SUM is a double). Streams the parent once, holding only
-    the aged rows' final values (O(K) memory, not O(rows))."""
-    last = {}
-    for ln in age_lines(rows, updates, seed):
-        v, i = ln[len("UPDATE t SET v = "):-1].split(" WHERE id = ")
-        last[int(i)] = int(v)
-    total = 0
-    for ln in sql_lines(rows):
-        if ln.startswith("INSERT"):
-            for tup in ln[ln.index("VALUES ") + 7:-1].split("),("):
-                i, v, pad = tup.strip("()").split(",", 2)
-                i = int(i)
-                total += hash_row(i, last.get(i, int(v)), pad.strip("'"))
-    return total
 
 
 def readback_sql(dialect):
@@ -125,25 +101,27 @@ def readback_sql(dialect):
         return ("SELECT count(*), CAST(SUM(v) AS DECIMAL(20,0)), "
                 "CAST(SUM(CONV(SUBSTR(MD5(CONCAT(id, ':', v, ':', pad)), 1, 6), 16, 10)) AS DECIMAL(20,0)) FROM t")
     if dialect == "pg":
-        h = "md5(id::text || ':' || v::text || ':' || pad)"
-
+        # comp review 1 LOW 27: each row's md5 once, in an OFFSET 0 subquery (which the planner does not flatten), not
+        # twelve times in the digit sum; the same triple (re-pinning it on PG 18, Doltgres 1.4.0 and Dolt is owed)
         def dig(k):
-            c = f"ascii(substr({h}, {k}, 1))"
+            c = f"ascii(substr(h, {k}, 1))"
             return f"(CASE WHEN {c} > 57 THEN {c} - 87 ELSE {c} - 48 END)"
         expr = " + ".join(f"{dig(k)} * {16 ** (6 - k)}" for k in range(1, 7))
-        return f"SELECT count(*), sum(v), sum({expr}) FROM t"
+        return (f"SELECT count(*), sum(v), sum({expr}) FROM "
+                f"(SELECT v, md5(id::text || ':' || v::text || ':' || pad) AS h FROM t OFFSET 0) s")
     raise ValueError(f"unknown dialect {dialect}")
 
 
 def facts(rows, updates=0, seed=1):
     """Everything a fixture records about the generator, in ONE pass over the parent stream (MED 12: at the 10 GiB
-    tier each pass takes about 30 min): {"count", "sum", "row_hash", "streams": {"sql", "age"}, "digest"} -- the same
-    values as aged_sum, row_hash, stream_digests and digest, with O(aged rows) memory."""
+    tier each pass takes about 30 min), with O(aged rows) memory: {"count", "sum", "row_hash", "streams": {"sql",
+    "age"}, "digest"}. row_hash is the order-independent read-back hash, sum over t of the first 6 hex digits of
+    md5("id:v:pad") (exact in every engine: a 24-bit term, so 5e8 rows stay below 2^53, where Dolt's SUM is a double);
+    the streams' digests frame each line as `gen_seed.py sql` / `age` write it (line + "\\n"), and digest is the
+    sha256 of the parent stream then the aging (fixture.json gen_seed_sha256). The ONLY implementation of these values
+    (comp review 1 MED 10: expect, row_hash, stream_digests and digest each streamed the parent again)."""
     aging = list(age_lines(rows, updates, seed))  # K lines (1e5 at most registered): small
-    last = {}
-    for ln in aging:
-        v, i = ln[len("UPDATE t SET v = "):-1].split(" WHERE id = ")
-        last[int(i)] = int(v)
+    last = aged_values(aging)
     hs, ha, hc = hashlib.sha256(), hashlib.sha256(), hashlib.sha256()
     total = 0
     for ln in sql_lines(rows):
@@ -163,9 +141,15 @@ def facts(rows, updates=0, seed=1):
             "streams": {"sql": hs.hexdigest(), "age": ha.hexdigest()}, "digest": hc.hexdigest()}
 
 
-def expect(rows, updates=0, seed=1):
-    """'count|sum|row_hash' the engine must read back from t after loading these streams."""
-    return f"{rows}|{aged_sum(rows, updates, seed)}|{row_hash(rows, updates, seed)}"
+# The subcommands the drivers may call (comp review 1 MED 10): the seed's two streams (sql, age), the aged sum (PSUM;
+# it walks the aging only), and the engines' read-back queries; anything else would be a further generator pass
+SUBCMDS = {"sql", "age", "sum", "readback-sql", "readback-sqlite"}
+
+
+def driver_subcommands(text):
+    """Every gen_seed.py subcommand a shell script's non-comment lines call, as `"$X/gen_seed.py" <cmd>`."""
+    return {m.group(1) for ln in text.splitlines() if not ln.lstrip().startswith("#")
+            for m in re.finditer(r'gen_seed\.py"\s+([a-z][a-z-]*)', ln)}
 
 
 def selftest():
@@ -191,10 +175,12 @@ def selftest():
     ok("aging is deterministic for (rows, updates, seed) (and not empty)", len(g) == 300 and g == list(age_lines(2500, 300, 7)))
     ok("aging ids stay in 1..rows", all(1 <= int(x.rsplit("= ", 1)[1].rstrip(";")) <= 2500 for x in g) if g else False)
     ok("another seed ages differently", g != list(age_lines(2500, 300, 8)))
-    d0, d1 = digest(2500), digest(2500, 300, 7)
+    # comp review 1 MED 10: facts() is the one implementation of what a fixture records, so the digest, row hash and
+    # stream digests below are its values (digest, row_hash, stream_digests and expect are gone)
+    d0, d1 = facts(2500)["digest"], facts(2500, 300, 7)["digest"]
     ok("digest: 64 hex", len(d0) == 64 and all(c in "0123456789abcdef" for c in d0))
-    ok("digest covers the aging", d0 != d1 and d1 == digest(2500, 300, 7))
-    ok("digest covers the row count", d0 != digest(2501))
+    ok("digest covers the aging", d0 != d1 and d1 == facts(2500, 300, 7)["digest"])
+    ok("digest covers the row count", d0 != facts(2501)["digest"])
     # The value SQLite itself reported after loading this stream (fixture.py sqlite, 2500 rows, 300 updates, seed 1,
     # SQLite 3.53 on the Mac, 2026-10-08): count|sum = 2500|131727070. Not computed by the subject.
     ok("aged sum(v) = what SQLite read back after the same stream", aged_sum(2500, 300, 1) == 131727070)
@@ -202,9 +188,8 @@ def selftest():
     # MED 3: the order-independent row hash, sum over t of the first 6 hex digits of md5("id:v:pad"), as Dolt 2.4.1,
     # Doltgres 1.4.0 and PostgreSQL 18 READ IT BACK after loading this stream (2500 rows, aged 300, seed 1; local probe
     # 2026-10-09, all three: 2500|131727070|21429546430). Not computed by the subject.
-    ok("row hash = what three engines read back after the same stream", row_hash(2500, 300, 1) == 21429546430)
-    ok("expect() = count|sum|row_hash", expect(2500, 300, 1) == "2500|131727070|21429546430")
-    sd = stream_digests(2500, 300, 1)
+    ok("row hash = what three engines read back after the same stream", facts(2500, 300, 1)["row_hash"] == 21429546430)
+    sd = facts(2500, 300, 1)["streams"]
     # MED 11: the table's key is INTEGER PRIMARY KEY, a rowid alias in SQLite (INT PRIMARY KEY gave B1's parent an
     # extra sqlite_autoindex_t_1 that every first write searched); every other byte of the parent stream is still the
     # generator's of 62430d8bf, pinned (LOW 17) by putting the old CREATE line back: 351af3d4... at 10000 rows
@@ -216,7 +201,7 @@ def selftest():
        hashlib.sha256("".join(ln + "\n" for ln in [OLD_CREATE] + s10[1:]).encode()).hexdigest() ==
        "351af3d4e0eca98b1ccdda69b548d7337357b0cba56fc4851fb928cf85e1f26a")
     ok("stream digests: an empty aging stream hashes as empty",
-       stream_digests(2500, 0, 1)["age"] == hashlib.sha256(b"").hexdigest())
+       facts(2500, 0, 1)["streams"]["age"] == hashlib.sha256(b"").hexdigest())
     import sqlite3
     db = sqlite3.connect(":memory:")
     db.executescript("\n".join(list(sql_lines(2500)) + list(age_lines(2500, 300, 1))))
@@ -226,17 +211,40 @@ def selftest():
     ok(f"SQLite: the M1 statement searches t by its INTEGER PRIMARY KEY ({plan})", "INTEGER PRIMARY KEY" in plan)
     cnt, sv = db.execute("SELECT count(*), sum(v) FROM t").fetchone()
     rh = sum(hash_row(i, v, p) for i, v, p in db.execute("SELECT id, v, pad FROM t"))
-    ok("SQLite read back the generator's triple", f"{cnt}|{sv}|{rh}" == expect(2500, 300, 1))
+    ok("SQLite read back the engines' triple (2500|131727070|21429546430)", f"{cnt}|{sv}|{rh}" == "2500|131727070|21429546430")
     db.close()
-    ok("stream digests differ between aged and fresh", sd["age"] != stream_digests(2500, 0, 1)["age"])
+    ok("stream digests differ between aged and fresh", sd["age"] != facts(2500, 0, 1)["streams"]["age"])
     # MED 12: everything a fixture records about the generator in ONE pass over the stream (the 10 GiB tier makes each
     # pass ~30 min), against the pinned known answers above
     fx = facts(2500, 300, 1)
     ok("facts(): count, sum, row hash = the engines' read-back (2500|131727070|21429546430)",
        (fx.get("count"), fx.get("sum"), fx.get("row_hash")) == (2500, 131727070, 21429546430))
     f10 = facts(10000)
+    # the stream as `gen_seed.py sql` writes it (every line + "\n"); a fresh parent's aging stream is empty, so the
+    # combined digest is the parent stream's
+    s10d = hashlib.sha256("".join(ln + "\n" for ln in s10).encode()).hexdigest()
     ok("facts(): the stream digests and the combined digest in the same pass",
-       f10.get("streams") == stream_digests(10000) and f10.get("digest") == digest(10000))
+       f10.get("streams") == {"sql": s10d, "age": hashlib.sha256(b"").hexdigest()} and f10.get("digest") == s10d)
+    # comp review 1 MED 10: one implementation (the old expect, row_hash, stream_digests and digest each streamed the
+    # parent again, and each job ran expect beside facts: three generator passes, against the seed plus facts)
+    gone = [nm for nm in ("expect", "row_hash", "stream_digests", "digest") if nm in globals()]
+    ok(f"facts() is the only implementation: no second one ({gone or 'none'})", not gone)
+    # ... and no driver calls a generator pass beyond the seed's sql and age streams: every `gen_seed.py" <cmd>` in
+    # this directory's shell scripts is one of SUBCMDS, all of them used (an allowlist: a new pass is refused until
+    # it is listed here); the scanner first fires on a planted `expect` call
+    plant = 'x=$(python3 -B "$HERE/gen_seed.py" expect --rows "$ROWS")\n  # "$HERE/gen_seed.py" like a comment\n'
+    ok("driver scan fires on a planted gen_seed.py expect call", driver_subcommands(plant) == {"expect"})
+    here = os.path.dirname(os.path.abspath(__file__))
+    found = set()
+    for p in sorted(glob.glob(os.path.join(here, "*.sh"))):
+        found |= driver_subcommands(open(p).read())
+    ok(f"the drivers' gen_seed.py calls are exactly {sorted(SUBCMDS)} (found {sorted(found)})", found == SUBCMDS)
+    # comp review 1 LOW 27: the pg read-back hashes each row ONCE (an OFFSET 0 subquery is not flattened, so md5 runs
+    # once per row there, not twelve times in the hex-digit sum), and the mysql one already does
+    for dial in ("pg", "mysql"):
+        q = readback_sql(dial)
+        ok(f"read-back ({dial}) names md5 exactly once ({q.lower().count('md5(')} times)", q.lower().count("md5(") == 1)
+    ok("the pg read-back's hash is in an OFFSET 0 subquery", "offset 0" in readback_sql("pg").lower())
     # The CI default fixture (ROWS 10000, AGE 200, seed 1): what PG 18.6, Doltgres 1.4.0 and SQLite read back in run
     # 37841577896 (every pg18, doltgres and b1 job's functional.txt: parent count|sum(v) = 10000|89963830; Dolt 2.4.1
     # printed the same value as 8.996383e+07, review of 62430d8bf..b49fb656a, HIGH 2). Not computed by the subject.
@@ -278,8 +286,6 @@ if __name__ == "__main__":
         if "--digest-out" in av:
             with open(av[av.index("--digest-out") + 1], "w") as f:
                 f.write(h.hexdigest() + "\n")
-    elif cmd == "expect":
-        print(expect(arg(av, "--rows"), arg(av, "--updates", 0), arg(av, "--seed", 1)))
     elif cmd == "readback-sql":
         print(readback_sql(arg(av, "--dialect", conv=str)))
     elif cmd == "readback-sqlite" and len(av) == 2:

@@ -9,7 +9,7 @@
 #                                     to the cwd, and with no config it serves $HOME/doltgres/databases)
 #   doltgres.sh start DATA [V1RUN]    run `doltgres -config DATA/config.yaml` with cwd DATA, detached; pid ->
 #                                     DATA.ftpid, log -> DATA.log; waits until SELECT 1 answers
-#   doltgres.sh seed  DATA ROWS [AGE] t(ROWS rows) in database postgres, dolt_commit; AGE>0: aged, dolt_commit, dolt_gc
+#   doltgres.sh seed  DATA ROWS [AGE] t(ROWS rows) in database postgres, dolt_commit, aged by AGE (0: none), dolt_commit, dolt_gc (always)
 #   doltgres.sh sql   DATA SQL        one statement through psql
 #   doltgres.sh stop  DATA            SIGTERM to the recorded pid only; waits for exit
 # Branch ops (specs in ../loadgen/specs): dolt_checkout('-b', b) [BranchBench's create, includes the switch], or
@@ -72,6 +72,8 @@ seed)
   psqlc -At -c "SELECT dolt_commit('-am', 'age', '--allow-empty')"
   psqlc -At -c "SELECT name, setting FROM pg_settings WHERE name LIKE '%gc%'" >"$DATA.gc-settings.txt" 2>&1 ||
     echo "rc=$? (not read)" >>"$DATA.gc-settings.txt"
+  # comp review 1 LOW 28: the record is judged (empty, failed or GC-less is refused); run_system.sh fails the job on it
+  "$FT_PY" -B "$FT_HERE/fthelp.py" gcsettings "$DATA.gc-settings.txt" >"$DATA.gc-settings.verdict" || true
   # dolt_gc, judged by an allowlist (lead review 62430d8bf..b49fb656a MED 9: the old check exempted any error text
   # matching lost|terminat, which hides real errors): client rc 0, its output exactly the status (0 or {0}), and no
   # panic in the server log written since the CALL (fthelp.py gcverdict); the store size on both sides of it.
@@ -84,6 +86,7 @@ seed)
     die "REFUSED: dolt_gc: $(cat "$DATA.gc.verdict")"
   echo "gc_store_bytes before=$gc_before after=$(du -sB1 "$DATA/databases" | cut -f1)"
   echo "maintenance: dolt_commit seed; aged $AGE; dolt_commit age; dolt_gc"
+  echo "evidence: gc_verdict=$(head -1 "$DATA.gc.verdict" | tr -d ' ')"  # comp review 1 LOW 24: the GC's outcome
   echo "seeded t rows=$(psqlc -At -c 'SELECT count(*) FROM t') branch=$(psqlc -At -c 'SELECT active_branch()')"
   ;;
 sql)
