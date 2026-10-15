@@ -811,14 +811,27 @@ fn confirm(cell: &str, db: &Arc<Database>, base: Option<u64>, k: u64, out: &mut 
     hold_word(false);
 }
 
-/// The clients per burst of the confirmation writer's load arm (`confirm_load`).
-const CONFIRM_LOAD_CS: [u64; 3] = [1, 8, 64];
+/// The confirmation writer's load arms (`confirm_load`): `(C clients per burst, the parent's delay in ms after the burst before it
+/// reads the burst's counts)`. The delayed arm (review C08 #1) is a scheduling control: a parent
+/// descheduled past the 5 ms quiet period after the last create must not turn the idle tail's
+/// honest word into a word "while flights overlapped".
+const CONFIRM_LOAD_ARMS: [(u64, u64); 4] = [(1, 0), (8, 0), (64, 0), (8, 20)];
+
+/// The line name of a load arm.
+fn load_arm(c: u64, delay_ms: u64) -> String {
+    if delay_ms == 0 {
+        format!("load_c{c}")
+    } else {
+        format!("load_c{c}_delayed")
+    }
+}
 
 /// Review 2 H1: the confirmation writer under load, with the shipped quiet period (the word NOT
-/// held). For each C in `CONFIRM_LOAD_CS`, C clients make back-to-back creates (`shared_rounds(C)`
-/// each, started together), then the cell waits out the idle tail: at most 1 s for the word the tail
-/// owes, and 20 ms more for a second one that must not come (wall time only to settle; nothing timed
-/// is measured). One line per C (`load_c{C}`): acknowledgements, flights (`group_counters()[0]`),
+/// held). For each arm of `CONFIRM_LOAD_ARMS`, C clients make back-to-back creates
+/// (`shared_rounds(C)` each, started together), then the cell waits out the idle tail: at most 1 s
+/// for the word the tail owes, and 20 ms more for a second one that must not come (wall time only to
+/// settle; nothing timed is measured). One line per arm (`load_c{C}`, `load_c{C}_delayed`):
+/// acknowledgements, flights (`group_counters()[0]`),
 /// words written during the burst (`confirms_burst`) and by the end of the tail
 /// (`confirms_total`), and the writer's wake-ups with a word pending
 /// (`confirm_wakeups_for_test`) during the burst.
@@ -834,7 +847,7 @@ fn confirm_load(cell: &str, db: &Arc<Database>, out: &mut String) {
     };
     // The population's own tail word is written before the first burst starts.
     settle(words());
-    for c in CONFIRM_LOAD_CS {
+    for (c, delay_ms) in CONFIRM_LOAD_ARMS {
         let rounds = shared_rounds(c);
         let (w0, k0, f0) = (words(), db.branches.confirm_wakeups_for_test(), db.branches.group_counters()[0]);
         let go = std::sync::atomic::AtomicBool::new(false);
@@ -865,6 +878,8 @@ fn confirm_load(cell: &str, db: &Arc<Database>, out: &mut String) {
                 h.join().unwrap();
             }
         });
+        // The delayed arm's parent, descheduled on purpose (review C08 #1's schedule).
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
         let (w1, k1, f1) = (words(), db.branches.confirm_wakeups_for_test(), db.branches.group_counters()[0]);
         settle(w1);
         let w2 = words();
@@ -875,7 +890,7 @@ fn confirm_load(cell: &str, db: &Arc<Database>, out: &mut String) {
         m.insert("confirms_burst", delta(w0, w1));
         m.insert("confirms_total", delta(w0, w2));
         m.insert("wakeups_burst", delta(k0, k1));
-        line(out, cell, &format!("load_c{c}"), 0, &m);
+        line(out, cell, &load_arm(c, delay_ms), 0, &m);
     }
     hold_word(true);
 }
@@ -3523,20 +3538,20 @@ fn the_confirmation_writer_under_load_writes_no_word_while_flights_overlap() {
     let data = cell("confirm_load");
     let mut failures = String::new();
     let mut seen = String::new();
-    for c in CONFIRM_LOAD_CS {
-        let op = format!("load_c{c}");
+    for (c, delay_ms) in CONFIRM_LOAD_ARMS {
+        let op = load_arm(c, delay_ms);
         let s = data.ops.get(&op).and_then(|v| v.first()).unwrap_or_else(|| panic!("confirm_load: no {op} line"));
         let (flights, burst, total, wakes) = (s["flights"], s["confirms_burst"], s["confirms_total"], s["wakeups_burst"]);
         assert!(flights > 0, "confirm_load: {op}: no flight counted: the instrument saw nothing");
-        let _ = write!(seen, " C={c}: {} acks, {flights} flights, words {burst} in the burst and {total} by the tail's end, {wakes} wake-ups;", s["acks"]);
+        let _ = write!(seen, " {op}: {} acks, {flights} flights, words {burst} in the burst and {total} by the tail's end, {wakes} wake-ups;", s["acks"]);
         if c >= 8 && burst != 0 {
-            let _ = writeln!(failures, "  C={c}: {burst} confirmation words written while flights overlapped; budget 0");
+            let _ = writeln!(failures, "  {op}: {burst} confirmation words written while flights overlapped; budget 0");
         }
         if total - burst > 1 {
-            let _ = writeln!(failures, "  C={c}: {} words in the idle tail after the burst; budget <= 1", total - burst);
+            let _ = writeln!(failures, "  {op}: {} words in the idle tail after the burst; budget <= 1", total - burst);
         }
         if wakes > 2 * flights {
-            let _ = writeln!(failures, "  C={c}: {wakes} writer wake-ups over {flights} flights; budget <= 2 per flight");
+            let _ = writeln!(failures, "  {op}: {wakes} writer wake-ups over {flights} flights; budget <= 2 per flight");
         }
     }
     assert!(failures.is_empty(), "the confirmation writer under load (all:{seen}):\n{failures}");
