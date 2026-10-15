@@ -81,6 +81,8 @@ fn encode_seek_keys_for_custom_types(
                 },
                 resolver,
             )?;
+        } else if !crate::branch::store::fe_mutant("seek_key_encodes_raising_plain") {
+            emit_seek_key_encode_or_empty_plain(program, encode_expr, reg, table_col, type_def, loop_end, resolver)?;
         } else {
             crate::translate::expr::emit_type_expr(
                 program,
@@ -237,6 +239,55 @@ fn emit_seek_key_encode_or_empty(
     program.emit_insn(Insn::Goto {
         target_pc: key.loop_end,
     });
+    Ok(())
+}
+
+/// Engine review 20 item 9: a seek key of a custom type with no function '=' (varchar(n),
+/// smallint, the date/time types: a RAISE in the ENCODE, a bare '<'), ENCODEd inside a catch region
+/// into a register of its own (`Insn::CatchBegin`; a RAISE jumps too). A key the ENCODE refuses
+/// ('value too long', 'out of range') equals no stored value, so the seek is empty: what the scan
+/// and PostgreSQL answer, where it raised. Otherwise the key becomes its encoding, as before.
+/// Mutant `seek_key_encodes_raising_plain` (test builds only): ENCODEd in place, as before.
+///
+/// ```text
+///   CatchBegin refused
+///   encoded = ENCODE(key)          ; RAISE -> Goto refused
+///   CatchEnd
+///   key = encoded
+///   Goto done
+/// refused:
+///   CatchEnd
+///   Goto loop_end
+/// done:
+/// ```
+fn emit_seek_key_encode_or_empty_plain(
+    program: &mut ProgramBuilder,
+    encode_expr: &turso_parser::ast::Expr,
+    reg: usize,
+    column: &crate::schema::Column,
+    type_def: &crate::schema::TypeDef,
+    loop_end: BranchOffset,
+    resolver: &Resolver<'_>,
+) -> crate::Result<()> {
+    let refused = program.allocate_label();
+    let done = program.allocate_label();
+    let encoded = program.alloc_register();
+    program.emit_insn(Insn::CatchBegin { target_pc: refused });
+    let outer = program.catch_raise_target.replace(refused);
+    let encode = crate::translate::expr::emit_type_expr(program, encode_expr, reg, encoded, column, type_def, resolver);
+    program.catch_raise_target = outer;
+    encode?;
+    program.emit_insn(Insn::CatchEnd);
+    program.emit_insn(Insn::Copy {
+        src_reg: encoded,
+        dst_reg: reg,
+        extra_amount: 0,
+    });
+    program.emit_insn(Insn::Goto { target_pc: done });
+    program.preassign_label_to_next_insn(refused);
+    program.emit_insn(Insn::CatchEnd);
+    program.emit_insn(Insn::Goto { target_pc: loop_end });
+    program.preassign_label_to_next_insn(done);
     Ok(())
 }
 
