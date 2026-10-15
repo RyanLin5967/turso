@@ -1387,7 +1387,10 @@ impl Session {
                 // made the engine roll the whole transaction back, savepoints and all (a failed
                 // block is otherwise still open in the engine): the savepoint does not exist, as
                 // PostgreSQL says of one that does not, and the block stays failed. It was XX000
-                // "no such savepoint" from the engine (wire review 3 item 10).
+                // "no such savepoint" from the engine (wire review 3 item 10). No statement known
+                // today reaches this state over the wire (the sum() overflow that did no longer
+                // rolls the transaction back); a_rollback_to_in_a_block_the_engine_ended_is_3b001
+                // builds it directly.
                 TxVerb::RollbackTo if !in_tx => {
                     return Err(error(
                         "3B001",
@@ -4852,6 +4855,51 @@ mod tests {
                 "ready: {msg:?}"
             );
         }
+    }
+
+    /// The 3B001 arm of a failed block (Session::run): a block failed by an error that made the
+    /// engine roll the WHOLE transaction back, savepoints with it, so the engine holds no
+    /// transaction while the session's block is still failed. ROLLBACK TO a savepoint of that
+    /// block is 3B001 (it does not exist, as PostgreSQL says of one that does not), the block stays
+    /// failed (25P02), and ROLLBACK ends it. No statement known today brings the engine there (the
+    /// sum() overflow that did no longer rolls the transaction back: wire 3b9d4900e, ruled
+    /// c9c821dd8d P7), so the state is built directly: the engine's transaction is rolled back
+    /// behind the session, and the block marked failed. A pin of the arm, which no other test
+    /// reached (the lead's ruling on P7's finding); its mutant, the arm deleted, sends the ROLLBACK
+    /// TO to the engine, XX000.
+    #[test]
+    fn a_rollback_to_in_a_block_the_engine_ended_is_3b001() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = session(&dir);
+        ok(&s, "CREATE TABLE t(id INT)");
+        ok(&s, "BEGIN");
+        ok(&s, "INSERT INTO t VALUES (1)");
+        ok(&s, "SAVEPOINT s");
+        {
+            let mut st = s.state();
+            let conn = s.current(&mut st).unwrap();
+            conn.engine_tx(TxStmt::Rollback)
+                .expect("premise: the engine rolls its transaction back");
+            assert!(
+                conn.inner().get_auto_commit(),
+                "premise: the engine holds no transaction"
+            );
+            st.aborted = true;
+        }
+        assert_eq!(
+            errors(&s, "ROLLBACK TO s"),
+            vec![("3B001".to_string(), "ERROR".to_string())]
+        );
+        assert_eq!(
+            errors(&s, "SELECT 1"),
+            vec![("25P02".to_string(), "ERROR".to_string())],
+            "the block stays failed"
+        );
+        assert!(errors(&s, "ROLLBACK").is_empty(), "ROLLBACK ends the block");
+        assert!(
+            matches!(s.transaction_status(), TransactionStatus::Idle),
+            "the session is idle after the ROLLBACK"
+        );
     }
 
     /// The errors `sql` answers, as (code, severity).
