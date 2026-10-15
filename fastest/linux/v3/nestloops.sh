@@ -2,28 +2,26 @@
 # nestloops.sh -- THE nest-chain loop matcher (V3 review 12 item 1), sourced by mkfixtures.sh and firecheck.sh. Run it
 # directly with --self-test to check it on canned listings (expectations written here, by hand).
 #
-#   loop_list          print `losetup --list -n -O NAME,BACK-FILE`; return 2 when losetup fails, its stderr kept on
-#                      ours. A failing losetup is an error, never "nothing attached" (the copies before this
-#                      discarded its errors into awk).
+#   loop_list          print `losetup --list -n -O NAME,BACK-FILE`; return 2 when losetup fails, its own stderr
+#                      passing straight through. A failing losetup is an error, never "nothing attached" (the copies
+#                      before this discarded its errors into awk).
 #   nest_match BASE    a filter: reads "DEV BACKFILE" lines, prints DEV for each whose backing file is under
 #                      BASE/n1/ .. BASE/n4/ (a level of the chain, anchored on the level's digit and its slash: nbx's
 #                      BASE/nb/x.img is NOT the chain, nor is BASE/n10/), or is an image named v3fx-n1.img (the chain's
 #                      first image, on whatever directory, " (deleted)" or not).
-#   nest_loops BASE    loop_list | nest_match BASE; returns 2 when loop_list fails.
+#   nest_loops BASE    loop_list | nest_match BASE; returns 2 when loop_list fails or the filter does (V3 review 13
+#                      item 10: a filter that failed returned its own status, and an empty output reads as nothing).
 #   nest_level_match DIR  a filter like nest_match: prints DEV for each backing file under DIR/ (anchored on DIR and its
 #                      slash, a trailing slash on DIR the same: /mnt/v3fx/n1 does not match n10/, n1x/ or a file named
 #                      n1 itself). teardown_nest's per-level sweep (V3 review 13 item 20: it kept its own copy).
 # BLIND SPOT, stated: a backing path holding runs of spaces is compared with single spaces (awk rebuilds the field).
 loop_list() {
-  local err out rc
-  err=$(mktemp) || return 2
-  out=$(losetup --list -n -O NAME,BACK-FILE 2> "$err"); rc=$?
+  local out rc
+  out=$(losetup --list -n -O NAME,BACK-FILE); rc=$?  # losetup's stderr is ours (V3 review 13 item 10)
   if [ "$rc" -ne 0 ]; then
-    echo "loop_list: losetup --list failed (rc $rc): $(cat "$err")" >&2
-    rm -f "$err"
+    echo "loop_list: losetup --list failed (rc $rc)" >&2
     return 2
   fi
-  rm -f "$err"
   [ -z "$out" ] || printf '%s\n' "$out"
 }
 nest_match() {
@@ -37,7 +35,8 @@ nest_level_match() {
 nest_loops() {
   local l
   l=$(loop_list) || return 2
-  [ -z "$l" ] || printf '%s\n' "$l" | nest_match "$1"
+  [ -z "$l" ] && return 0
+  printf '%s\n' "$l" | nest_match "$1" || return 2  # the filter's status is its own (the pipeline's last command)
 }
 
 nestloops_self_test() {
