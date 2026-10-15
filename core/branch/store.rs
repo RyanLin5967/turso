@@ -522,6 +522,10 @@ struct GroupState {
     /// credited.
     background_compactions: u64,
     inline_compaction_syncs: u64,
+    /// Fuzzy checkpoints that failed Busy at `settle_ordered`'s bound (engine review 18 MED 4;
+    /// observation only, `BranchStore::settle_timeouts`): each lost its install for a threshold of
+    /// log. A run of creates and first writes expects 0.
+    settle_timeouts: u64,
     /// The C15 ruling's two counted exceptions (2026-10-15T04:15:07Z; `BranchStore::
     /// exception_counters`): held-free upgrades a freeing operation led past the hard cap
     /// (`upgrade_if_overdue`), and upgrades that took the flight slot to raise the header's class
@@ -4639,7 +4643,13 @@ impl BranchStore {
             if g.durable[full] >= lsn.min(g.ordered) || g.pending_full.is_none() {
                 return Ok(());
             }
-            let Some(left) = pending_full_wait().checked_sub(started.elapsed()) else {
+            // Mutant `settle_ordered_busy_at_once` (test builds only; engine review 18 MED 4): Busy
+            // without waiting, which the bound alone could not tell from a wait.
+            let Some(left) = pending_full_wait()
+                .checked_sub(started.elapsed())
+                .filter(|_| !fe_mutant("settle_ordered_busy_at_once"))
+            else {
+                g.settle_timeouts += 1;
                 return Err(LimboError::Busy);
             };
             #[cfg(test)]
@@ -5559,6 +5569,12 @@ impl BranchStore {
             g.inline_compaction_syncs,
             self.inner.compaction_waits.load(Ordering::Relaxed),
         ]
+    }
+
+    /// Fuzzy checkpoints that failed Busy at the settle bound (engine review 18 MED 4; observation
+    /// only).
+    pub(crate) fn settle_timeouts(&self) -> u64 {
+        self.group.lock().settle_timeouts
     }
 
     /// Test builds: compactions the background writer led (DECISIONS c9c821dd8d; observation only).

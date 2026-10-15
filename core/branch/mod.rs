@@ -1529,6 +1529,14 @@ impl Database {
         self.branches.exception_counters()
     }
 
+    /// Fuzzy branch catalog checkpoints that failed Busy waiting for an ordered flight's WAL flush
+    /// past the settle bound (engine review 18 MED 4; observing only): each lost its install for a
+    /// threshold of log. A create-plus-first-write run expects 0.
+    #[doc(hidden)]
+    pub fn branch_checkpoint_settle_timeouts(&self) -> u64 {
+        self.branches.settle_timeouts()
+    }
+
     /// Fuzzy branch catalog checkpoint starts that failed and backed off (engine review 8 #3;
     /// observing only).
     #[doc(hidden)]

@@ -9168,3 +9168,99 @@ fn a_trunk_commit_does_not_wait_on_a_checkpoint_that_waits_on_its_flush() {
         "the checkpoint never installed: it failed at the settle bound"
     );
 }
+
+/// Engine review 18 MED 4, the success arm the review 11 MED 8 red lacked: with the trunk commit's
+/// WAL flush NOT failing, a raised D0 fuzzy checkpoint whose capture covers the commit's ordered
+/// flight does not commit before that flush (it is still held at 50 ms), and installs once the
+/// commit is released, with no settle timeout. Mutants `settle_ignores_ordered` (it commits early)
+/// and `settle_ordered_busy_at_once` (it never installs).
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_raised_d0_fuzzy_checkpoint_installs_once_the_ordered_flush_lands() {
+    use std::sync::atomic::Ordering as O;
+    let _s = serial();
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            super::store::PENDING_FULL_WAIT_MS.store(0, O::Release);
+        }
+    }
+    let _restore = Restore;
+    super::store::PENDING_FULL_WAIT_MS.store(60_000, O::Release);
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("settle-lands.db"), opts(true, SyncClass::Off));
+    let trunk = db.connect().unwrap();
+    seed_wide(&trunk);
+    trunk.execute("PRAGMA synchronous = FULL").unwrap();
+    trunk.execute("PRAGMA fullfsync = ON").unwrap();
+    let _x = trunk.fork_branch().unwrap().into_id();
+    write_v(&trunk, 3, "raised");
+    assert!(db.branches.rewrite_class_for_test().syncs(), "premise: the trunk commit raised the log");
+    let (installed, timeouts) = (db.branch_checkpoint_counters()[0], db.branch_checkpoint_settle_timeouts());
+    let hold = db.branches.trunk_commit_hold.clone();
+    hold.store(super::store::HOLD_TRUNK_BARRIER_DONE, O::Release);
+    let committing = std::thread::spawn(move || trunk.execute("UPDATE t SET v = 'ordered' WHERE id = 40").map(|_| ()));
+    wait_hold(&hold, super::store::HOLD_TRUNK_BARRIER_DONE);
+    db.branch_checkpoint_hold(super::store::HOLD_AFTER_COMMIT);
+    assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: a fuzzy checkpoint started");
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let early = db.branch_checkpoint_held() == super::store::HOLD_AFTER_COMMIT | super::store::HOLD_ARRIVED;
+    hold.store(0, O::Release);
+    let got = committing.join().unwrap();
+    let t = std::time::Instant::now();
+    let mut committed = false;
+    while t.elapsed() < std::time::Duration::from_secs(10) {
+        if db.branch_checkpoint_held() == super::store::HOLD_AFTER_COMMIT | super::store::HOLD_ARRIVED {
+            committed = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    db.branch_checkpoint_hold(0);
+    db.branch_checkpoint_wait();
+    assert!(got.is_ok(), "premise: the trunk commit committed: {got:?}");
+    assert!(!early, "CLAIM: the checkpoint committed the catalog before the ordered flight's WAL flush");
+    assert!(committed, "CLAIM: the checkpoint never committed once the ordered flight's WAL flush landed");
+    assert_eq!(db.branch_checkpoint_counters()[0], installed + 1, "CLAIM: the checkpoint did not install");
+    assert_eq!(db.branch_checkpoint_settle_timeouts(), timeouts, "the settle timed out");
+}
+
+/// Engine review 18 MED 4, the bound arm: with the bound at 20 ms and the trunk commit held past
+/// it before its WAL flush, the checkpoint fails Busy, installs nothing, and the timeout is counted
+/// (`branch_checkpoint_settle_timeouts`).
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_raised_d0_fuzzy_checkpoint_fails_at_the_settle_bound_and_counts_it() {
+    use std::sync::atomic::Ordering as O;
+    let _s = serial();
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            super::store::PENDING_FULL_WAIT_MS.store(0, O::Release);
+        }
+    }
+    let _restore = Restore;
+    super::store::PENDING_FULL_WAIT_MS.store(20, O::Release);
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("settle-bound.db"), opts(true, SyncClass::Off));
+    let trunk = db.connect().unwrap();
+    seed_wide(&trunk);
+    trunk.execute("PRAGMA synchronous = FULL").unwrap();
+    trunk.execute("PRAGMA fullfsync = ON").unwrap();
+    let _x = trunk.fork_branch().unwrap().into_id();
+    write_v(&trunk, 3, "raised");
+    assert!(db.branches.rewrite_class_for_test().syncs(), "premise: the trunk commit raised the log");
+    let (installed, timeouts) = (db.branch_checkpoint_counters()[0], db.branch_checkpoint_settle_timeouts());
+    let hold = db.branches.trunk_commit_hold.clone();
+    hold.store(super::store::HOLD_TRUNK_BARRIER_DONE, O::Release);
+    let committing = std::thread::spawn(move || trunk.execute("UPDATE t SET v = 'ordered' WHERE id = 40").map(|_| ()));
+    wait_hold(&hold, super::store::HOLD_TRUNK_BARRIER_DONE);
+    assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: a fuzzy checkpoint started");
+    db.branch_checkpoint_wait();
+    let (after_installed, after_timeouts) = (db.branch_checkpoint_counters()[0], db.branch_checkpoint_settle_timeouts());
+    hold.store(0, O::Release);
+    let got = committing.join().unwrap();
+    assert!(got.is_ok(), "premise: the trunk commit committed: {got:?}");
+    assert_eq!(after_installed, installed, "a checkpoint installed over an ordered flight whose flush was still to come");
+    assert_eq!(after_timeouts, timeouts + 1, "CLAIM: the settle bound's Busy was not counted once");
+}
