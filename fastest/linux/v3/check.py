@@ -2614,7 +2614,7 @@ def check_real(o3, rc, kv, leaf):
             if ua.get("foreign_fd") != 0:
                 dbad.append(("a sync by the probe on an fd no overlapping window's arm owns",
                              sy.get("unattributed")))
-        dbad += sync_fds_problems(sj, rows, n, rd(os.path.join(OUT, "F1b", "real-all.trace.gz")))
+        dbad += sync_fds_problems(sj, rows, n, rd(os.path.join(OUT, "F1b", "real-all.trace.gz")), kv.get("work", ""))
         rec["device_flushes_per_op"] = dfp
         rec["layer_device_flushes_per_op"] = (merged or {}).get("layer_device_flushes_per_op")
         rec["shared_devices"] = shared
@@ -2718,18 +2718,26 @@ def nest_plant_problems(before, after, mounted):
     return probs
 
 
-def f1b_window_syncs(text):
+def f1b_window_syncs(text, rows, work):
     """eleventh review MED 2: the fsync and fdatasync calls INSIDE the timed windows of an F1b strace -f -y trace, read
     through parse_trace and sliced as sequence_problems slices them (V3 review 12 item 15: this was a second strace
     parser, whose split-line and parity branches no trace F1b:real-all accepts can reach): a window is the calls
     between its opening and closing clock_gettime, the only clock reads the loop makes. Setup and teardown syncs are
     outside every window. A split (<unfinished ...>) line is not a call (parse_trace keeps it in `other`, which
-    F1b:real-all refuses). The arm is the synced path's: <work>/<arm>, <work>/<arm>.clones or <work>/<arm>.clones/c<i>,
-    for an arm this probe has; any other in-window sync path (<work>/cfr2b.src, the work directory) is returned in odd
-    (review 12 item 11). An odd number of clock reads, or an in-window sync whose first argument is not fd<path>, is a
-    problem. -> (seen {arm: fds}, problems, odd paths)"""
+    F1b:real-all refuses). The arm is the synced path's: exactly <work>/<arm>, <work>/<arm>.clones or
+    <work>/<arm>.clones/c<i>, for an arm in ROWS (the arms that ran) and <work> the run's work directory; any other
+    in-window sync path (<work>/cfr2b.src, the work directory, an arm that did not run here, a path off <work>) is
+    returned in odd (review 12 item 11; V3 review 13 item 18: it keyed by ALL and by basename, so clone2b's syncs on an
+    ext4 cell were dropped and /tmp/q/cfr2b.clones/c7 keyed as cfr2b). An odd number of clock reads, an in-window sync
+    whose first argument is not fd<path>, or no work directory, is a problem. -> (seen {arm: fds}, problems, odd)
+    Stated limit: strace -y prints the kernel's path for each fd, so <work> (info.txt's work=, firecheck's W, a path on
+    the cell's mount) must be written canonically; one reached through a symlink would put every sync in odd, a false
+    red, never a pass."""
     seen, probs, odd, fdmap = {}, [], [], {}
-    known = set(ALL.split(","))
+    known = set(rows)
+    wd = os.path.normpath(work) if work else ""
+    if not wd.startswith("/"):
+        return {}, ["no work directory (info.txt work=%r): the F1b syncs cannot be placed" % (work,)], []
     calls, _other, _pids = parse_trace(text, fdmap)
     clocks = [k for k, (name, _) in enumerate(calls) if name == "clock_gettime"]
     if not clocks or len(clocks) % 2:
@@ -2743,13 +2751,17 @@ def f1b_window_syncs(text):
             if fdmap.get(k) is None or not pm:
                 probs.append("an in-window sync without fd<path>: " + t[:120])
                 continue
-            path, base = pm.group(1), os.path.basename(pm.group(1))
-            if re.fullmatch(r"c\d+", base):
-                par = os.path.basename(os.path.dirname(path))
-                arm = par[:-len(".clones")] if par.endswith(".clones") else None
-            else:
-                arm = base[:-len(".clones")] if base.endswith(".clones") else base
-            if arm not in known:
+            path = pm.group(1)
+            d, base = os.path.split(os.path.normpath(path))
+            arm = None
+            if d == wd:  # <work>/<arm> or <work>/<arm>.clones
+                a = base[:-len(".clones")] if base.endswith(".clones") else base
+                arm = a if a in known else None
+            elif os.path.dirname(d) == wd and re.fullmatch(r"c\d+", base):  # <work>/<arm>.clones/c<i>
+                par = os.path.basename(d)
+                a = par[:-len(".clones")] if par.endswith(".clones") else None
+                arm = a if a in known else None
+            if arm is None:
                 odd.append(path)
                 continue
             seen.setdefault(arm, set()).add(fdmap[k])
@@ -2776,7 +2788,7 @@ def sync_fds_def_problems(sj, rows, n):
     return bad
 
 
-def sync_fds_problems(sj, rows, n, f1b_trace):
+def sync_fds_problems(sj, rows, n, f1b_trace, work):
     """tenth review HIGH 1: the probe's sync_fds (the fds each arm's ops synced, the key blkflush attributes by) must
     match the arm definitions (check.OP: the syncs per op, one fd per synced file: the clone and the directory for
     clone2b and cfr2b, the directory for clone1b, the arm's own file otherwise, none for nosync25) and EQUAL, per arm,
@@ -2791,7 +2803,7 @@ def sync_fds_problems(sj, rows, n, f1b_trace):
     if f1b_trace is None:
         bad.append(("no F1b real-all trace: sync_fds cannot be cross-checked", os.path.join("F1b", "real-all.trace.gz")))
         return bad
-    seen, probs, odd = f1b_window_syncs(f1b_trace)
+    seen, probs, odd = f1b_window_syncs(f1b_trace, rows, work)
     if probs:
         bad.append(("the F1b trace's timed windows cannot be read", probs[:3]))
         return bad
