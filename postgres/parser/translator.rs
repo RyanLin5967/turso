@@ -3062,6 +3062,18 @@ impl PostgreSQLTranslator {
                         )),
                     };
                 }
+                // A string literal cast to a float type is read here, as float8in / float4in read
+                // it: the engine casts text by affinity, so 'Infinity' (and any malformed text)
+                // was 0 (PostgreSQL 18.6 differential, 2026-10-15).
+                if let (Some(pg_query::protobuf::node::Node::AConst(c)), Some(t)) =
+                    (arg.node.as_ref(), type_cast.type_name.as_ref())
+                {
+                    if let (Some(pg_query::protobuf::a_const::Val::Sval(text)), Some(float)) =
+                        (c.val.as_ref(), float_type_name(t))
+                    {
+                        return float_literal(&text.sval, float);
+                    }
+                }
                 // `type $n` is libpg_query's extension of PostgreSQL 17's grammar, a cast with no
                 // location; PostgreSQL 18 refuses it as a syntax error (wire review 14 item 14).
                 if type_cast.location < 0 {
@@ -5177,6 +5189,65 @@ fn translate_create_enum(
 
 /// Convert a pg_query TypeName to a Turso AST Type for use in CAST expressions.
 /// Maps PG types to their base SQLite storage types.
+/// The PostgreSQL name of a float type a cast names (`float8`, `double precision`, `float4`,
+/// `real`: libpg_query spells them pg_catalog.float8 / float4), None for any other or an array.
+fn float_type_name(t: &pg_query::protobuf::TypeName) -> Option<&'static str> {
+    if !t.array_bounds.is_empty() {
+        return None;
+    }
+    match t.names.last()?.node.as_ref()? {
+        pg_query::protobuf::node::Node::String(s) => match s.sval.as_str() {
+            "float8" => Some("double precision"),
+            "float4" => Some("real"),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// A string literal cast to a float type, as PostgreSQL's float8in / float4in read it: blanks
+/// around it, `[+-]inf` / `[+-]infinity` in any case for the infinities, else a decimal number;
+/// anything else is 22P02 "invalid input syntax for type ...", and a finite spelling past the
+/// type's range 22003. NaN is refused 0A000: the engine holds no NaN. The value goes to the engine
+/// as a numeric literal (an infinity as 9e999, which it reads as one).
+fn float_literal(text: &str, type_name: &str) -> Result<ast::Expr, ParseError> {
+    let trimmed = text.trim_matches(|c: char| c.is_ascii() && crate::pg_space(c as u8));
+    let lower = trimmed.to_ascii_lowercase();
+    let unsigned = lower.trim_start_matches(['+', '-']);
+    let negative = lower.starts_with('-');
+    let literal = |s: String| Ok(ast::Expr::Literal(ast::Literal::Numeric(s)));
+    if (unsigned == "inf" || unsigned == "infinity") && lower.len() - unsigned.len() <= 1 {
+        return literal(if negative { "-9e999" } else { "9e999" }.to_string());
+    }
+    if unsigned == "nan" && lower.len() - unsigned.len() == 0 {
+        return Err(ParseError::ParseError(
+            "NaN is not supported: the engine holds no NaN".to_string(),
+        ));
+    }
+    let invalid = || {
+        ParseError::ParseError(format!(
+            "invalid input syntax for type {type_name}: \"{text}\""
+        ))
+    };
+    // Rust's parser takes the infinity and NaN words too, which are handled above, and nothing
+    // PostgreSQL refuses but those.
+    if unsigned.starts_with(|c: char| c.is_ascii_alphabetic()) {
+        return Err(invalid());
+    }
+    let v: f64 = trimmed.parse().map_err(|_| invalid())?;
+    let in_type = if type_name == "real" {
+        trimmed.parse::<f32>().map_or(v, f64::from)
+    } else {
+        v
+    };
+    if in_type.is_infinite() {
+        return Err(ParseError::ParseError(format!(
+            "\"{text}\" is out of range for type {type_name}"
+        )));
+    }
+    literal(format!("{v:e}"))
+}
+
 /// A numeric literal as libpg_query hands it (an integer past int4 arrives as text, not Ival), in
 /// the decimal form the engine's literal parser reads: PostgreSQL 16+'s base-2, -8 and -16 integers
 /// (`0b..`, `0o..`, `0x..`) and underscores between digits become decimal digits. The engine's

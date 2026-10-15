@@ -2868,6 +2868,14 @@ fn sqlstate(e: &LimboError) -> &'static str {
         LimboError::Constraint(m) if m == "division by zero" => "22012",
         LimboError::Constraint(_) => "23000",
         LimboError::ParseError(m) if m.starts_with("Invalid statement:") => "42601",
+        // The translator's own reading of a cast literal (float_literal): PostgreSQL's codes,
+        // matched by the producers' fixed prefixes, never by words a client's value supplies.
+        LimboError::ParseError(m) if m.starts_with("invalid input syntax for type ") => "22P02",
+        LimboError::ParseError(m)
+            if m.starts_with('"') && m.contains("\" is out of range for type ") =>
+        {
+            "22003"
+        }
         // The fail-closed refusal of a parse tree whose parameters cannot be read (turso_pg_parser
         // checked_param_numbers): an internal failure, never a client's syntax error, so it is not
         // 42601, the code of PostgreSQL's "parameter number too large" beside it (wire review 14
