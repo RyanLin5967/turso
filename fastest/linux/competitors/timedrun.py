@@ -599,6 +599,9 @@ def selftest():
          dict(tracer=trace_rec([("start", 100.0, 0, 0, 12, 0)] + sw[1:] + [("end", 100.45, 0, 0, 12, 0)])), False),
         ("roles present but no tracer sweeps", dict(tracer=trace_rec(sweeps=[])), False),
         ("unreadable sweep line", dict(tracer=clean + "SWEEP mid bad cmd=x srv=12:0\n"), False),
+        ("missing measured window", dict(tracer=clean, timed_extra={"tm0_realtime_s": None}), False),
+        ("warm-up capped before MAX_S",
+         dict(tracer=clean, timed_extra={"warmup_ops": 500, "warmup_capped": True}), False),
     ]
     refusal_reasons = {
         "a server task traced at the end of the timed run": ("traced during the timed run", "a sweep saw a TracerPid"),
@@ -672,6 +675,8 @@ def selftest():
         "command start sweep found zero tasks": ("no start sweep of the command's tasks",),
         "roles present but no tracer sweeps": ("no tracer sweeps",),
         "unreadable sweep line": ("unreadable sweep line",),
+        "missing measured window": ("summary has no measured window",),
+        "warm-up capped before MAX_S": ("before MAX_S",),
     }
     bad = n = 0
 
@@ -698,6 +703,9 @@ def selftest():
                        ((1, 200, 300, "5000"), 5000), ((1, 200, 300, "x"), None), ((1, 200, 300, "0"), None)):
         got = ops(*args)
         ok(got == want, f"ops{args} = {got!r}, want {want!r}")
+    why = warm_problems("timed", RUN, "unreadable")
+    ok(any("warm-up rule 'unreadable' unreadable" in line for line in why),
+       f"reason: unreadable warm-up rule -> {why!r}")
     # MED 7: the verdict is computed against the registered rule at the cap, rule(CAP), never the run's own: a clean
     # cell that warmed up by any other rule (the CI smoke 1000:10:2) is 'ok-smoke-warmup', never 'ok'
     for why_in, rule_in, cap_in, want in (([], "1000:10:180", "1800", "ok"), ([], "1000:10:2", "1800", "ok-smoke-warmup"),
@@ -736,6 +744,15 @@ def selftest():
             ("1000:10:180", wrec(1500, 10_000_500_000, False, None), False, "warm-up ops, no last claim time")):
         why = run_problems("timed", rec, rule_in, None)
         ok((not why) == want, f"A23 run_problems {what} ({rule_in}) -> {'accepted' if not why else why}")
+        if not want:
+            expected = {
+                "MAX_S 0 read as no limit (1000 ops, 1.2 s) is refused": "at or after MAX_S",
+                "1 ns before S is not done": "left its warm-up early",
+                "... and capped there is refused": "done wins",
+                "no warm-up op, yet a last claim time": "warm-up record is inconsistent",
+                "warm-up ops, no last claim time": "warm-up record is inconsistent",
+            }[what]
+            ok(any(expected in line for line in why), f"reason: A23 {what}: expected {expected!r}, got {why!r}")
     # Lead ruling (artie DECISIONS 6b0bef481b): the CI smoke warm-up cap is for smoke runs only; a REAL run (FT_DRY=0)
     # takes the registered cap and PREREG :210's rule at it, and refuses anything else.
     # Both values are compared as EXACT strings (review of e11a3c993, finding 5: "1.8e3" passed a numeric check and then
@@ -757,6 +774,14 @@ def selftest():
         why = real_problem(cap, warm)
         got = why is None
         ok(got == want, f"real run cap={cap!r} warmup={warm!r} -> {'accepted' if got else f'refused: {why}'}")
+        if not want:
+            expected = []
+            if cap != "1800":
+                expected.append("is not the registered '1800' s")
+            if warm != "1000:10:180":
+                expected.append("is not PREREG :210's rule at the registered cap")
+            ok(bool(expected) and all(reason in (why or "") for reason in expected),
+               f"reason: real cap={cap!r} warmup={warm!r}: expected {expected!r}, got {why!r}")
     print(f"timedrun selftest: {n - bad}/{n}")
     return 1 if bad else 0
 
