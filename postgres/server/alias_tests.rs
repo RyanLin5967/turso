@@ -4,11 +4,13 @@
 
 use super::*;
 
-/// Three PostgreSQL connections on one database register the aliases at most once between them,
-/// a plain engine connection made after the open already resolves `now()` (the aliases are the
-/// Database's), and each PgConnection's own allocations are printed with the per-thread counter
-/// (`counters::thread_allocations`). Expected RED before the Database-level registration: three
-/// registrations, and a plain connection that has no `now()`.
+/// The open registers the aliases once for its database, three PostgreSQL connections on it register
+/// nothing more, a plain engine connection made after the open already resolves `now()` (the aliases
+/// are the Database's), and each PgConnection's own allocations are printed with the per-thread
+/// counter (`counters::thread_allocations`). Expected RED before the Database-level registration:
+/// three registrations, and a plain connection that has no `now()`. The registrations are counted on
+/// the Database (`static_extension_registrations`, lead 2026-10-15: the first count was
+/// process-wide, so servers opened by tests running in parallel moved it).
 #[test]
 fn the_pg_time_aliases_are_registered_once_per_database() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -17,7 +19,8 @@ fn the_pg_time_aliases_are_registered_once_per_database() {
         sync: turso_core::branch::SyncClass::Off,
     });
     let (_io, db) = turso_pg::open_database(&path, None, turso_core::OpenFlags::default(), opts).unwrap();
-    let before = turso_pg::alias_registrations();
+    let before = db.static_extension_registrations();
+    assert_eq!(before, 1, "the open registered the aliases {before} times for its database");
     let mut allocs = Vec::new();
     for _ in 0..3 {
         let conn = db.connect().unwrap();
@@ -27,8 +30,8 @@ fn the_pg_time_aliases_are_registered_once_per_database() {
         drop(pg);
     }
     println!("PgConnection::new allocations: {allocs:?}");
-    let registrations = turso_pg::alias_registrations() - before;
-    assert!(registrations <= 1, "3 connections registered the aliases {registrations} times");
+    let registrations = db.static_extension_registrations() - before;
+    assert_eq!(registrations, 0, "3 connections registered static extensions {registrations} times on their database");
     let plain = db.connect().unwrap();
     let rows = plain.prepare("SELECT typeof(now())").unwrap().run_collect_rows().unwrap();
     assert_eq!(rows, vec![vec![Value::build_text("text")]], "a plain engine connection resolves now()");
