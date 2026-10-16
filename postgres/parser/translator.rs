@@ -863,17 +863,8 @@ impl PostgreSQLTranslator {
                         SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, "identity column sequence options are not supported"),
                     ));
                 }
-                // The engine holds no stored generated column; dropped, the column read NULL.
-                ConstrType::ConstrGenerated
-                    if self.virtual_generated.borrow().contains(&constraint.location) => {
-                    generated = constraint.raw_expr.as_ref()
-                        .map(|expr| self.translate_expr(expr))
-                        .transpose()?;
-                }
                 ConstrType::ConstrGenerated => {
-                    return Err(ParseError::ParseError(
-                        SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, "generated columns are not supported"),
-                    ));
+                    generated = Some(self.generated_column_constraint(constraint)?);
                 }
                 // A column constraint's deferral arrives as attribute nodes after it in the raw
                 // parse (wire review 3 item 6); those after the foreign key set its deferral.
@@ -927,13 +918,8 @@ impl PostgreSQLTranslator {
         // Build constraints list
         let mut constraints = Vec::new();
 
-        if let Some(expr) = generated {
-            constraints.push(ast::NamedColumnConstraint {
-                name: None,
-                constraint: ast::ColumnConstraint::Generated {
-                    expr: Box::new(expr), typ: Some(ast::GeneratedColumnType::Virtual),
-                },
-            });
+        if let Some(constraint) = generated {
+            constraints.push(ast::NamedColumnConstraint { name: None, constraint });
         }
 
         // For serial columns, add DEFAULT nextval('tablename_colname_seq')
@@ -1327,6 +1313,7 @@ impl PostgreSQLTranslator {
                     conflict_clause: None,
                 }),
                 ConstrType::ConstrUnique => Some(ast::ColumnConstraint::Unique(None)),
+                ConstrType::ConstrGenerated => Some(self.generated_column_constraint(constraint)?),
                 ConstrType::ConstrDefault => match constraint.raw_expr.as_ref() {
                     Some(raw_expr) => Some(ast::ColumnConstraint::Default(Box::new(
                         self.translate_expr(raw_expr)?,
@@ -1347,6 +1334,23 @@ impl PostgreSQLTranslator {
             col_name,
             col_type,
             constraints,
+        })
+    }
+
+    fn generated_column_constraint(
+        &self,
+        constraint: &pg_query::protobuf::Constraint,
+    ) -> Result<ast::ColumnConstraint, ParseError> {
+        if !self.virtual_generated.borrow().contains(&constraint.location) {
+            return Err(ParseError::ParseError(SqlErrorMessage::classified(
+                SqlErrorKind::FeatureNotSupported, "generated columns are not supported")));
+        }
+        let expression = constraint.raw_expr.as_ref().ok_or_else(|| {
+            ParseError::ParseError("generated column has no expression".into())
+        })?;
+        Ok(ast::ColumnConstraint::Generated {
+            expr: Box::new(self.translate_expr(expression)?),
+            typ: Some(ast::GeneratedColumnType::Virtual),
         })
     }
 
