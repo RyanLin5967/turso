@@ -13912,3 +13912,39 @@ fn c52_view_generated_output_contracts_survive_repeated_rename_and_reopen() {
     }
     assert_eq!(w.q("SELECT pg_typeof(flag) FROM c52_contract_nested_name").single("shared inferred type"), "boolean");
 }
+
+// Fresh independent PG18.6 recording: pg18/c52-scalar-context.{sql,txt}.
+#[test]
+fn c52_scalar_context_keeps_recorded_operand_order() {
+    let dir = Scratch::new("c52scalarorder");
+    let server = Server::start(&dir.db(), &[]);
+    let mut w = server.connect();
+    let left = w.describe_statement("SELECT $1::int4 = (SELECT $1 WHERE $1=1)")
+        .ok("prior operand cast supplies scalar context");
+    assert_eq!(left.params, Some(vec![23]));
+    assert_eq!(left.oids, Some(vec![16]));
+    let right = w.describe_statement("SELECT (SELECT $1 WHERE $1=1) = $1::int4");
+    assert_eq!(right.error.map(|error| error.code), Some("42P08".into()));
+    for sql in ["SELECT $1=(SELECT 1)", "SELECT $1=(WITH q AS (SELECT 1 AS n) SELECT n FROM q)"] {
+        let reply = w.describe_statement(sql).ok("scalar output supplies comparison context");
+        assert_eq!(reply.params, Some(vec![23]));
+        assert_eq!(reply.oids, Some(vec![16]));
+    }
+    let order = w.describe_statement("SELECT (SELECT $1),$1::int4")
+        .ok("completed scalar output resolves its unknown parameter");
+    assert_eq!(order.params, Some(vec![25]));
+    assert_eq!(order.oids, Some(vec![25,23]));
+}
+
+#[test]
+fn c52_scalar_set_and_cte_outputs_share_the_select_inference() {
+    let dir = Scratch::new("c52scalarbody");
+    let server = Server::start(&dir.db(), &[]);
+    let mut w = server.connect();
+    for sql in [
+        "SELECT pg_typeof(abs((SELECT 1::numeric UNION SELECT 1::numeric)))::text",
+        "SELECT pg_typeof((WITH q AS (SELECT 1::numeric AS n) SELECT n FROM q))::text",
+    ] {
+        assert_eq!(w.q(sql).single("recorded scalar SELECT output type"), "numeric");
+    }
+}

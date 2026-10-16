@@ -2248,4 +2248,22 @@ mod c52_tests {
         };
         assert_eq!(walked.expressions.get(target.val.as_deref().unwrap()), Some(INT4));
     }
+
+    #[test]
+    fn c52_scalar_select_inference_work_stays_linear() {
+        let count = |depth: usize| {
+            let sql = format!("SELECT {}1{}", "(SELECT ".repeat(depth), ")".repeat(depth));
+            let parse = turso_pg_parser::parse(&sql).unwrap();
+            let schema = std::sync::Arc::new(Schema::default());
+            let attached = Attached { names: &[], holds: &|_, _| false };
+            let walked = parameter_types(&parse, &schema, &[], &Default::default(),
+                &attached, &Default::default()).unwrap();
+            assert_eq!(walked.columns, vec![Some(INT4)]);
+            walked.work
+        };
+        let short = count(16);
+        let long = count(32);
+        assert!(long <= 3 * short, "nested scalar work: depth16={short}, depth32={long}");
+    }
+
 }
