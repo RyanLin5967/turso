@@ -958,7 +958,7 @@ def self_test():
              ours_fixture="plan", comp_info="plan", expected=("c1-create", "c1-m1"), verdict_text=None,
              boundary_bins=None, garbage_v3l=None, v3l_plants_record=None, conformance="match", backsteps=0,
              loop="closed", v3l_mode="dry", ours_sweeper="ok", comp_sweeper=0.04, ours_counters="ok", ours_tm="ok", ours_tp="ok",
-             stamp=None, mode_dry="1", fire_na=None):
+             stamp=None, mode_dry="1", fire_na=None, enospc=None, dryvirt="auto"):
         out = os.path.join(root, "out")
         conformance_files(out, conformance)
         w(f"{out}/stages.tsv", "stage\tstart_utc\tend_utc\tseconds\trc\nfs-xfs\ta\tb\t5\t0\nTOTAL\ta\tb\t9\t0\n")
@@ -972,6 +972,14 @@ def self_test():
         w(f"{out}/fslist.txt", fslist + "\n")
         w(f"{out}/mode.txt", f"dry={mode_dry}\nblock={block}\nplant=\nplp={plp}\n"
           + (f"stamp={stamp}\n" if stamp is not None else ""))
+        # TEST EDIT, flagged (the lead's DATA_GIB ruling, DECISIONS 2026-10-16): a DRY-VIRT run discloses how it differs
+        # from the T3 box (dry-virt.txt, t3run --dry-block); "auto" writes it for a DRY-VIRT stamp
+        if (dryvirt == "auto" and stamp == "DRY-VIRT") or dryvirt is True:
+            w(f"{out}/dry-virt.txt", "data device: vdb, 17179869184 bytes (16 GiB, the VM's DATA_GIB); the T3 box's is its "
+                                     "NVMe's full size\n")
+        # ENOSPC (the same ruling): ENOSPC=(relative path under fs-xfs, text) plants an out-of-space line in the block
+        if enospc is not None:
+            w(f"{out}/fs-xfs/{enospc[0]}", enospc[1])
         if rule is not None:
             w(f"{out}/warmup.txt", f"warm-up rule {rule} (cap 1800s)\n")
         f = f"{out}/fs-xfs"
@@ -1320,6 +1328,25 @@ def self_test():
         ("rule-3 (b) control: a fire-check verdict with no N/A rule lists none and adds no N/A credit refusal",
          {"fire_na": "none"}, True,
          lambda s: s.get("na_rules") == [] and not any("N/A" in x for x in s.get("credit_refusals") or [])),
+        # the lead's DATA_GIB ruling (DECISIONS 2026-10-16): the VM's data device is 16 GiB, so any ENOSPC or btrfs
+        # allocation failure in any step REFUSES the block (never credited, never retried smaller); and a DRY-VIRT run
+        # discloses its differences from the T3 box
+        ("DATA_GIB: a cell whose adapter says 'No space left on device' refuses the block, naming ENOSPC",
+         {"enospc": ("cells/ours-full-c1-r1/a1/adapter.txt", "fio: write: No space left on device\n")}, False,
+         lambda s: any("ENOSPC" in x and "adapter.txt" in x for x in s["failed_blocks"])),
+        ("DATA_GIB: a block kernel log with a btrfs allocation failure (errno=-28) refuses the block",
+         {"enospc": ("kernel-log.txt", "BTRFS: error (device vdb state A) in btrfs_alloc_chunk: errno=-28 No space left\n")},
+         False, lambda s: any("ENOSPC" in x and "kernel-log.txt" in x for x in s["failed_blocks"])),
+        ("DATA_GIB: a strace line returning ENOSPC refuses the block",
+         {"enospc": ("cells/ours-full-c1-r1/a1/load.strace", "4100 pwrite64(3, \"\"..., 4096, 0) = -1 ENOSPC (No space left on device)\n")},
+         False, lambda s: any("ENOSPC" in x for x in s["failed_blocks"])),
+        ("DATA_GIB control: words that only name the condition (a count of 0, 'enospc_count') do not refuse",
+         {"enospc": ("cells/ours-full-c1-r1/a1/notes.txt", "enospc_count=0 retries_on_space=0\n")}, True, None),
+        ("DATA_GIB: a DRY-VIRT run discloses its data device size (dry_virt_differences)", {"stamp": "DRY-VIRT"}, True,
+         lambda s: any("16 GiB" in x for x in s.get("dry_virt_differences") or [])),
+        ("DATA_GIB: a DRY-VIRT run with no dry-virt.txt fails, its differences undisclosed",
+         {"stamp": "DRY-VIRT", "dryvirt": False}, False,
+         lambda s: any("dry-virt.txt" in x for x in s.get("mode_refusals") or [])),
         ("dry-block: a DRY-VIRT dry package passes as a dry run and is refused for credit, naming DRY-VIRT",
          {"stamp": "DRY-VIRT"}, True, lambda s: s.get("stamp") == "DRY-VIRT" and s.get("creditable") is False
          and any("DRY-VIRT" in x for x in s.get("credit_refusals") or [])),
@@ -1430,6 +1457,29 @@ def self_test():
             cases.append((name, good, s["failed_blocks"] + s["parity_refusals"] + s["incomplete"]))
         finally:
             shutil.rmtree(root)
+    # DATA_GIB's refusal fired by a REAL out-of-space error, not a typed string: a write to /dev/full fails with the
+    # kernel's own ENOSPC, its text goes into a cell's adapter.txt, and the block must refuse (Linux only: macOS has no
+    # /dev/full, so the case is N/A there, never a pass)
+    if sys.platform.startswith("linux") and os.path.exists("/dev/full"):
+        try:
+            fd = os.open("/dev/full", os.O_WRONLY)
+            try:
+                os.write(fd, b"x")
+                real = None
+            finally:
+                os.close(fd)
+        except OSError as e:
+            real = f"write /dev/full: {e}\n"
+        root = tempfile.mkdtemp(prefix="summarize-st-")
+        try:
+            s_, ok_ = summarize(make(root, enospc=("cells/ours-full-c1-r1/a1/adapter.txt", real or "")), "sha", "1", "m")
+            cases.append(("DATA_GIB fired by a real ENOSPC (/dev/full): the kernel's own error text refuses the block",
+                          real is not None and not ok_ and any("ENOSPC" in x for x in s_["failed_blocks"]),
+                          [real] + s_["failed_blocks"]))
+        finally:
+            shutil.rmtree(root)
+    else:
+        print(f"N/A-on-{sys.platform}: DATA_GIB fired by a real ENOSPC (/dev/full is Linux's)", flush=True)
     # the owed ours fixture record: ONE parent for every system in a block (gen_seed's rows and digest), so ours at
     # fastest_profile's old default 1000 rows beside the competitors' 10000 fails (run 11 measured exactly that)
     for name, ofx, cfx, want in (
