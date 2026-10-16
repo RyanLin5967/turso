@@ -13681,3 +13681,32 @@ fn c52_nullif_integer_comparison_keeps_the_left_operand_width() {
     assert_eq!(reply.oids, Some(vec![25, 21]));
     assert_eq!(reply.rows, vec![vec![Some("smallint".into()), Some("1".into())]]);
 }
+
+
+// Independent PG18.6 capture: pg18/c52-inference-boundaries.sql and .txt.
+#[test]
+fn c52_recorded_unknown_parameter_chains_are_refused() {
+    let dir = Scratch::new("c52chainrefusal");
+    let server = Server::start(&dir.db(), &[]);
+    let mut w = server.connect();
+    let mut codes = Vec::new();
+    for sql in [
+        "SELECT $1 WHERE $1=abs($2) AND $2=$3",
+        "SELECT $1 WHERE $1=$2 AND $2=$3",
+    ] {
+        let reply = w.xt(sql, &[(0, 0, b"1"), (0, 0, b"1"), (23, 0, b"1")]);
+        codes.push(reply.error.map(|error| error.code));
+    }
+    assert_eq!(codes, vec![Some("42P08".into()), Some("42883".into())]);
+}
+
+#[test]
+fn c52_recorded_negative_integer_literals_keep_their_narrow_type() {
+    let dir = Scratch::new("c52negativeliteral");
+    let server = Server::start(&dir.db(), &[]);
+    let mut w = server.connect();
+    let sql = "SELECT pg_typeof(-2147483648)::text, pg_typeof(-9223372036854775808)::text, -2147483648, -9223372036854775808";
+    let reply = w.q(sql).ok("folded negative literal types");
+    assert_eq!(reply.oids, Some(vec![25, 25, 23, 20]));
+    assert_eq!(reply.rows, vec![vec![Some("integer".into()), Some("bigint".into()), Some("-2147483648".into()), Some("-9223372036854775808".into())]]);
+}

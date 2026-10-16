@@ -2209,24 +2209,25 @@ mod c52_tests {
         let schema = std::sync::Arc::new(Schema::default());
         let attached = Attached { names: &[], holds: &|_, _| false };
         let walked = parameter_types(&parse, &schema, &[], &Default::default(),
-            &attached, &std::collections::BTreeMap::from([(COUNT, INT4)])).unwrap();
+            &attached, &(1..=COUNT).map(|n| (n, INT4)).collect()).unwrap();
         assert_eq!(walked.params.len(), COUNT as usize);
         assert!(walked.params.values().all(|oid| *oid == INT4));
         assert_eq!(walked.columns, vec![Some(INT4)]);
-        // Count tree visits instead of wall time: repeated whole-tree propagation
-        // would exceed this generous linear bound on the reversed dependency chain.
+        // Count tree visits instead of wall time; the accepted, fully declared
+        // chain must remain within a generous linear work bound.
         assert!(walked.work < 100 * COUNT as usize, "{} inference visits", walked.work);
     }
 
     #[test]
     fn c52_publishes_parameter_columns_and_expressions_from_the_same_solution() {
-        // Internal consistency control: a later parameter constraint must not leave an
-        // earlier occurrence's published annotation behind the final parameter map.
+        // Corrected from the independent PG18.6 recording: unknown reverse chains
+        // are refused, so this consistency control declares all accepted types.
+        // The exact unknown-chain refusals are exercised by the wire control.
         let parse = turso_pg_parser::parse("SELECT $1, $2 WHERE $1=$2 AND $2=$3").unwrap();
         let schema = std::sync::Arc::new(Schema::default());
         let attached = Attached { names: &[], holds: &|_, _| false };
         let walked = parameter_types(&parse, &schema, &[], &Default::default(),
-            &attached, &std::collections::BTreeMap::from([(3, INT4)])).unwrap();
+            &attached, &std::collections::BTreeMap::from([(1, INT4), (2, INT4), (3, INT4)])).unwrap();
         assert_eq!(walked.params.get(&1), Some(&INT4));
         assert_eq!(walked.columns, vec![Some(INT4), Some(INT4)]);
         let Some(Node::SelectStmt(select)) = parse.protobuf.stmts[0].stmt.as_ref().unwrap().node.as_ref() else {
