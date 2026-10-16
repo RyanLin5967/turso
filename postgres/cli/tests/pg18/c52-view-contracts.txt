@@ -1,0 +1,97 @@
+\set VERBOSITY verbose
+SELECT version();
+                                                            version                                                            
+-------------------------------------------------------------------------------------------------------------------------------
+ PostgreSQL 18.6 (Homebrew) on aarch64-apple-darwin25.6.0, compiled by Apple clang version 21.0.0 (clang-2100.1.1.101), 64-bit
+(1 row)
+
+CREATE TABLE c52_contract_t(a integer,b integer);
+CREATE TABLE
+INSERT INTO c52_contract_t VALUES(1,2);
+INSERT 0 1
+CREATE VIEW c52_contract_partial AS SELECT q.b FROM c52_contract_t AS q(x);
+CREATE VIEW
+CREATE VIEW c52_contract_nested AS SELECT s.b FROM (SELECT b::int4 FROM c52_contract_t) s;
+CREATE VIEW
+CREATE VIEW c52_contract_coalesce AS SELECT COALESCE(TRUE,FALSE);
+CREATE VIEW
+CREATE VIEW c52_contract_nested_name AS SELECT d.coalesce AS flag FROM (SELECT COALESCE(TRUE,FALSE)) d;
+CREATE VIEW
+SELECT b,pg_typeof(b) FROM c52_contract_partial;
+ b | pg_typeof 
+---+-----------
+ 2 | integer
+(1 row)
+
+SELECT b,pg_typeof(b) FROM c52_contract_nested;
+ b | pg_typeof 
+---+-----------
+ 2 | integer
+(1 row)
+
+SELECT coalesce,pg_typeof(coalesce) FROM c52_contract_coalesce;
+ coalesce | pg_typeof 
+----------+-----------
+ t        | boolean
+(1 row)
+
+SELECT flag,pg_typeof(flag) FROM c52_contract_nested_name;
+ flag | pg_typeof 
+------+-----------
+ t    | boolean
+(1 row)
+
+ALTER TABLE c52_contract_t RENAME COLUMN b TO c;
+ALTER TABLE
+SELECT b,pg_typeof(b) FROM c52_contract_partial;
+ b | pg_typeof 
+---+-----------
+ 2 | integer
+(1 row)
+
+SELECT b,pg_typeof(b) FROM c52_contract_nested;
+ b | pg_typeof 
+---+-----------
+ 2 | integer
+(1 row)
+
+ALTER TABLE c52_contract_t RENAME COLUMN c TO d;
+ALTER TABLE
+SELECT b,pg_typeof(b) FROM c52_contract_partial;
+ b | pg_typeof 
+---+-----------
+ 2 | integer
+(1 row)
+
+SELECT b,pg_typeof(b) FROM c52_contract_nested;
+ b | pg_typeof 
+---+-----------
+ 2 | integer
+(1 row)
+
+VACUUM;
+VACUUM
+SELECT b,pg_typeof(b) FROM c52_contract_partial;
+ b | pg_typeof 
+---+-----------
+ 2 | integer
+(1 row)
+
+SELECT b,pg_typeof(b) FROM c52_contract_nested;
+ b | pg_typeof 
+---+-----------
+ 2 | integer
+(1 row)
+
+SELECT coalesce,pg_typeof(coalesce) FROM c52_contract_coalesce;
+ coalesce | pg_typeof 
+----------+-----------
+ t        | boolean
+(1 row)
+
+SELECT flag,pg_typeof(flag) FROM c52_contract_nested_name;
+ flag | pg_typeof 
+------+-----------
+ t    | boolean
+(1 row)
+

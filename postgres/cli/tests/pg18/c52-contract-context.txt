@@ -1,0 +1,247 @@
+\set VERBOSITY verbose
+SELECT version();
+                                                            version                                                            
+-------------------------------------------------------------------------------------------------------------------------------
+ PostgreSQL 18.6 (Homebrew) on aarch64-apple-darwin25.6.0, compiled by Apple clang version 21.0.0 (clang-2100.1.1.101), 64-bit
+(1 row)
+
+SELECT pg_typeof(1::int2 + 0::float4),pg_typeof(1::int4 + 0::float4),pg_typeof(1::int8 + 0::float4),pg_typeof(1::numeric + 0::float4),pg_typeof(1::float4 + 0::float4),pg_typeof(1::float4 + 0::float8);
+    pg_typeof     |    pg_typeof     |    pg_typeof     |    pg_typeof     | pg_typeof |    pg_typeof     
+------------------+------------------+------------------+------------------+-----------+------------------
+ double precision | double precision | double precision | double precision | real      | double precision
+(1 row)
+
+SELECT 16777217 + 0::float4,16777217::numeric + 0::float4;
+ ?column? | ?column? 
+----------+----------
+ 16777217 | 16777217
+(1 row)
+
+SELECT 1e100::numeric + 0::float4;
+ ?column? 
+----------
+   1e+100
+(1 row)
+
+SELECT (1e100::float8)::float4;
+psql:/private/tmp/codex-20261015/C50-contract-red3/C50-pg-float-types2.sql:6: ERROR:  22003: value out of range: overflow
+LOCATION:  float_overflow_error, float.c:90
+SELECT (1e-100::float8)::float4;
+psql:/private/tmp/codex-20261015/C50-contract-red3/C50-pg-float-types2.sql:7: ERROR:  22003: value out of range: underflow
+LOCATION:  float_underflow_error, float.c:98
+SELECT 1::int2/0::int2;
+psql:/private/tmp/codex-20261015/C50-contract-red3/C50-pg-float-types2.sql:8: ERROR:  22012: division by zero
+LOCATION:  int2div, int.c:988
+SELECT 1::int4/0::int4;
+psql:/private/tmp/codex-20261015/C50-contract-red3/C50-pg-float-types2.sql:9: ERROR:  22012: division by zero
+LOCATION:  int4div, int.c:872
+SELECT 1::int8/0::int8;
+psql:/private/tmp/codex-20261015/C50-contract-red3/C50-pg-float-types2.sql:10: ERROR:  22012: division by zero
+LOCATION:  int8div, int8.c:514
+SELECT 1::float4/0::float4;
+psql:/private/tmp/codex-20261015/C50-contract-red3/C50-pg-float-types2.sql:11: ERROR:  22012: division by zero
+LOCATION:  float_zero_divide_error, float.c:106
+SELECT 1::float8/0::float8;
+psql:/private/tmp/codex-20261015/C50-contract-red3/C50-pg-float-types2.sql:12: ERROR:  22012: division by zero
+LOCATION:  float_zero_divide_error, float.c:106
+SELECT 'NaN'::float4/0::float4;
+ ?column? 
+----------
+      NaN
+(1 row)
+
+SELECT 'NaN'::float8/0::float8;
+ ?column? 
+----------
+      NaN
+(1 row)
+
+SELECT 'Infinity'::float8/0::float8;
+psql:/private/tmp/codex-20261015/C50-contract-red3/C50-pg-float-types2.sql:15: ERROR:  22012: division by zero
+LOCATION:  float_zero_divide_error, float.c:106
+SELECT NULL::int4/0::int4,NULL::float8/0::float8;
+ ?column? | ?column? 
+----------+----------
+          |         
+(1 row)
+
+SELECT sum(v) OVER(ORDER BY n ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM (VALUES(1,'Infinity'::float8),(2,1::float8),(3,2::float8))t(n,v);
+   sum    
+----------
+ Infinity
+ Infinity
+        3
+(3 rows)
+
+SELECT sum(v) OVER(ORDER BY n ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM (VALUES(1,'Infinity'::float4),(2,1::float4),(3,2::float4))t(n,v);
+   sum    
+----------
+ Infinity
+ Infinity
+        3
+(3 rows)
+
+SELECT sum(v) OVER(ORDER BY n ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM (VALUES(1,1e20::float8),(2,1::float8),(3,2::float8))t(n,v);
+  sum  
+-------
+ 1e+20
+ 1e+20
+     3
+(3 rows)
+
+SELECT sum(v) OVER(ORDER BY n ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM (VALUES(1,1e20::float4),(2,1::float4),(3,2::float4))t(n,v);
+  sum  
+-------
+ 1e+20
+ 1e+20
+     3
+(3 rows)
+
+SELECT '0x7FFFFFFF'::int4,'1_000'::int4;
+    int4    | int4 
+------------+------
+ 2147483647 | 1000
+(1 row)
+
+SELECT '0x80000000'::int4;
+psql:/private/tmp/codex-20261015/C50-contract-red3/C50-pg-float-types2.sql:22: ERROR:  22003: value "0x80000000" is out of range for type integer
+LINE 1: SELECT '0x80000000'::int4;
+               ^
+LOCATION:  pg_strtoint32_safe, numutils.c:612
+SELECT '-0x80000000'::int4,'0o77_777'::int2,'0b0111_1111_1111_1111'::int2;
+    int4     | int2  | int2  
+-------------+-------+-------
+ -2147483648 | 32767 | 32767
+(1 row)
+
+SELECT '-0x8000000000000000'::int8;
+         int8         
+----------------------
+ -9223372036854775808
+(1 row)
+
+SELECT '0x8000000000000000'::int8;
+psql:/private/tmp/codex-20261015/C50-contract-red3/C50-pg-float-types2.sql:25: ERROR:  22003: value "0x8000000000000000" is out of range for type bigint
+LINE 1: SELECT '0x8000000000000000'::int8;
+               ^
+LOCATION:  pg_strtoint64_safe, numutils.c:873
+SELECT '0x_7fff'::int2;
+ int2  
+-------
+ 32767
+(1 row)
+
+SELECT '1__2'::int4;
+psql:/private/tmp/codex-20261015/C50-contract-red3/C50-pg-float-types2.sql:27: ERROR:  22P02: invalid input syntax for type integer: "1__2"
+LINE 1: SELECT '1__2'::int4;
+               ^
+LOCATION:  pg_strtoint32_safe, numutils.c:618
+SELECT '1_'::int4;
+psql:/private/tmp/codex-20261015/C50-contract-red3/C50-pg-float-types2.sql:28: ERROR:  22P02: invalid input syntax for type integer: "1_"
+LINE 1: SELECT '1_'::int4;
+               ^
+LOCATION:  pg_strtoint32_safe, numutils.c:618
+SELECT '_1'::int4;
+psql:/private/tmp/codex-20261015/C50-contract-red3/C50-pg-float-types2.sql:29: ERROR:  22P02: invalid input syntax for type integer: "_1"
+LINE 1: SELECT '_1'::int4;
+               ^
+LOCATION:  pg_strtoint32_safe, numutils.c:618
+SELECT '0x8000'::int2;
+psql:/private/tmp/codex-20261015/C50-contract-red3/C50-pg-float-types2.sql:30: ERROR:  22003: value "0x8000" is out of range for type smallint
+LINE 1: SELECT '0x8000'::int2;
+               ^
+LOCATION:  pg_strtoint16_safe, numutils.c:351
+PREPARE c52_order_good AS SELECT $1::int4,$1;
+PREPARE
+PREPARE c52_order_bad AS SELECT $1,$1::int4;
+psql:/private/tmp/codex-20261015/C50-contract-red3/C50-pg-float-types2.sql:32: ERROR:  42P08: inconsistent types deduced for parameter $1
+LINE 1: PREPARE c52_order_bad AS SELECT $1,$1::int4;
+                                        ^
+DETAIL:  integer versus text
+LOCATION:  variable_coerce_param_hook, parse_param.c:227
+PREPARE c52_order_good_func AS SELECT abs($1),$1;
+PREPARE
+SELECT name,parameter_types FROM pg_prepared_statements WHERE name LIKE 'c52_order_%' ORDER BY name;
+        name         |   parameter_types    
+---------------------+----------------------
+ c52_order_good      | {integer}
+ c52_order_good_func | {"double precision"}
+(2 rows)
+
+SELECT E'\0131\013'::int4,E'\0131.5\013'::numeric,E'\0131.5\013'::float8;
+ int4 | numeric | float8 
+------+---------+--------
+    1 |     1.5 |    1.5
+(1 row)
+
+PREPARE c52_concat AS SELECT $1=$2,$1||1;
+PREPARE
+SELECT pg_typeof(abs((SELECT 1::numeric UNION SELECT 1::numeric)))::text;
+ pg_typeof 
+-----------
+ numeric
+(1 row)
+
+SELECT * FROM pg_input_error_info('0x8000','smallint');
+                     message                      | detail | hint | sql_error_code 
+--------------------------------------------------+--------+------+----------------
+ value "0x8000" is out of range for type smallint |        |      | 22003
+(1 row)
+
+SELECT * FROM pg_input_error_info('0x80000000','integer');
+                       message                       | detail | hint | sql_error_code 
+-----------------------------------------------------+--------+------+----------------
+ value "0x80000000" is out of range for type integer |        |      | 22003
+(1 row)
+
+SELECT * FROM pg_input_error_info('0x8000000000000000','bigint');
+                          message                           | detail | hint | sql_error_code 
+------------------------------------------------------------+--------+------+----------------
+ value "0x8000000000000000" is out of range for type bigint |        |      | 22003
+(1 row)
+
+SELECT * FROM pg_input_error_info('1__2','integer');
+                    message                    | detail | hint | sql_error_code 
+-----------------------------------------------+--------+------+----------------
+ invalid input syntax for type integer: "1__2" |        |      | 22P02
+(1 row)
+
+SELECT * FROM pg_input_error_info('1_000','integer');
+ message | detail | hint | sql_error_code 
+---------+--------+------+----------------
+         |        |      | 
+(1 row)
+
+SELECT pg_input_is_valid('0x7fff','smallint'),pg_input_is_valid('1_000','integer'),pg_input_is_valid('-0x8000000000000000','bigint');
+ pg_input_is_valid | pg_input_is_valid | pg_input_is_valid 
+-------------------+-------------------+-------------------
+ t                 | t                 | t
+(1 row)
+
+SELECT '999999999999999999999999999999999999999x'::int8;
+psql:/private/tmp/codex-20261015/C50-contract-red3/C50-pg-float-types2.sql:44: ERROR:  22003: value "999999999999999999999999999999999999999x" is out of range for type bigint
+LINE 1: SELECT '999999999999999999999999999999999999999x'::int8;
+               ^
+LOCATION:  pg_strtoint64_safe, numutils.c:873
+SELECT '999999999999999999999999999999999999999_'::int8;
+psql:/private/tmp/codex-20261015/C50-contract-red3/C50-pg-float-types2.sql:45: ERROR:  22003: value "999999999999999999999999999999999999999_" is out of range for type bigint
+LINE 1: SELECT '999999999999999999999999999999999999999_'::int8;
+               ^
+LOCATION:  pg_strtoint64_safe, numutils.c:873
+SELECT '0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFg'::int8;
+psql:/private/tmp/codex-20261015/C50-contract-red3/C50-pg-float-types2.sql:46: ERROR:  22003: value "0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFg" is out of range for type bigint
+LINE 1: SELECT '0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFg'::int8;
+               ^
+LOCATION:  pg_strtoint64_safe, numutils.c:873
+SELECT * FROM pg_input_error_info('999999999999999999999999999999999999999x','bigint');
+                                     message                                      | detail | hint | sql_error_code 
+----------------------------------------------------------------------------------+--------+------+----------------
+ value "999999999999999999999999999999999999999x" is out of range for type bigint |        |      | 22003
+(1 row)
+
+SELECT * FROM pg_input_error_info('0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFg','bigint');
+                                     message                                     | detail | hint | sql_error_code 
+---------------------------------------------------------------------------------+--------+------+----------------
+ value "0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFg" is out of range for type bigint |        |      | 22003
+(1 row)
+

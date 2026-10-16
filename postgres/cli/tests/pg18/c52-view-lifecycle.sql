@@ -1,0 +1,28 @@
+\set VERBOSITY verbose
+SELECT version();
+CREATE DOMAIN c52_view_domain AS integer CHECK (VALUE > 0);
+CREATE TABLE c52_view_t(a integer);
+CREATE TABLE c52_view_u(a integer);
+INSERT INTO c52_view_t VALUES (2);
+INSERT INTO c52_view_u VALUES (3);
+CREATE VIEW c52_vsource(flag,n) AS SELECT true,a::c52_view_domain FROM c52_view_t;
+CREATE VIEW c52_valias(flag) AS SELECT q.x > 0 FROM c52_view_t AS q(x);
+CREATE VIEW c52_vscope(q,untouched,literal,yes) AS SELECT t.a,(SELECT a FROM c52_view_u LIMIT 1),'a'::text,true FROM c52_view_t t;
+CREATE VIEW c52_vdependent(flag,n) AS SELECT flag,n FROM c52_vsource;
+ALTER TABLE c52_view_t RENAME COLUMN a TO b;
+SELECT flag,n::int4 FROM c52_vsource;
+SELECT flag FROM c52_valias;
+SELECT q,untouched,literal,yes FROM c52_vscope;
+SELECT flag,n::int4 FROM c52_vdependent;
+VACUUM;
+SELECT flag,n::int4 FROM c52_vsource;
+CREATE TABLE c52_join_t(a integer);
+CREATE TABLE c52_join_u(a integer);
+INSERT INTO c52_join_t VALUES(1);
+INSERT INTO c52_join_u VALUES(1);
+CREATE VIEW c52_using(a) AS SELECT a FROM c52_join_t JOIN c52_join_u USING(a);
+ALTER TABLE c52_join_t RENAME COLUMN a TO b;
+SELECT count(*) FROM c52_using;
+CREATE VIEW c52_table_rename(a) AS SELECT a FROM c52_join_u;
+ALTER TABLE c52_join_u RENAME TO c52_join_renamed;
+SELECT count(*) FROM c52_table_rename;
