@@ -13928,6 +13928,7 @@ fn c52_nullif_integer_comparison_keeps_the_left_operand_width() {
     let reply = w.q(sql).ok("integer comparison overload");
     assert_eq!(reply.oids, Some(vec![25, 21]));
     assert_eq!(reply.rows, vec![vec![Some("smallint".into()), Some("1".into())]]);
+}
 
 #[test]
 fn c54_derived_column_lists_rename_positions() {
