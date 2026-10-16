@@ -273,7 +273,7 @@ mod tests {
             assert_eq!(name, "test_add_one");
             let crate::Value::Numeric(crate::numeric::Numeric::Integer(v)) = args[0] else {
                 return Err(crate::LimboError::InvalidArgument(
-                    "test_add_one expects an integer".to_string(),
+                    "test_add_one expects an integer".to_string().into(),
                 ));
             };
             Ok(crate::Value::Numeric(crate::numeric::Numeric::Integer(

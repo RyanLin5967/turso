@@ -221,10 +221,8 @@ mod tests {
         for (orig, predicate) in cases {
             let kind = limbo_error_to_kind(orig);
             let msg = match orig {
-                LimboError::ParseError(s)
-                | LimboError::TxError(s)
-                | LimboError::DatabaseFull(s)
-                | LimboError::Corrupt(s) => s.clone(),
+                LimboError::ParseError(s) | LimboError::TxError(s) => s.to_string(),
+                LimboError::DatabaseFull(s) | LimboError::Corrupt(s) => s.clone(),
                 _ => String::new(),
             };
             let reconstructed = error_kind_to_limbo_error(kind, &msg);

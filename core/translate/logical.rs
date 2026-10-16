@@ -2552,15 +2552,15 @@ mod tests {
         let mut parser = Parser::new(sql.as_bytes());
         let cmd = parser
             .next()
-            .ok_or_else(|| LimboError::ParseError("Empty statement".to_string()))?
-            .map_err(|e| LimboError::ParseError(e.to_string()))?;
+            .ok_or_else(|| LimboError::ParseError("Empty statement".to_string().into()))?
+            .map_err(|e| LimboError::ParseError(e.to_string().into()))?;
         match cmd {
             ast::Cmd::Stmt(stmt) => {
                 let mut builder = LogicalPlanBuilder::new(schema);
                 builder.build_statement(&stmt)
             }
             _ => Err(LimboError::ParseError(
-                "Only SQL statements are supported".to_string(),
+                "Only SQL statements are supported".to_string().into(),
             )),
         }
     }
