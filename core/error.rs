@@ -26,7 +26,7 @@ pub enum LimboError {
     #[diagnostic(transparent)]
     LexerError(turso_parser::error::Error),
     /// A recursive entry of the parser or the engine found its thread's stack nearly spent
-    /// (`turso_stack_guard::NestGuard`, the stack-guard class): the statement nests too deeply for the
+    /// (`turso_stack_guard::NestGuard`): the statement nests too deeply for the
     /// thread running it, and is refused rather than overflowing the thread, which would abort the
     /// process. PostgreSQL's 54001 stack_depth_limit_exceeded, in its words.
     #[error("stack depth limit exceeded")]

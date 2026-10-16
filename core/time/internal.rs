@@ -251,8 +251,8 @@ impl Time {
         }
     }
 
-    /// `years`, `months` and `days` after this time. Every step is checked (unchecked, the u32
-    /// month span and the day sum panicked inside an extern "C" scalar): a year or month count
+    /// `years`, `months` and `days` after this time. Every step is checked (before the checks, the
+    /// u32 month span and the day sum panicked inside an extern "C" scalar): a year or month count
     /// outside i32, a span past u32 months, or a result past chrono's range is `CreationError`.
     pub fn time_add_date(self, years: i64, months: i64, days: i64) -> Result<Self> {
         let mut dt: NaiveDateTime = self.into();

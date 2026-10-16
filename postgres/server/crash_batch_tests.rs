@@ -74,7 +74,7 @@ fn alive(s: &Session) {
 /// answers or is refused 54001 (a debug build refuses it at 8 MiB; a release build, with smaller
 /// frames, may answer), at whichever statement first plans too deep, and never overflows. A shallow
 /// chain still answers. The depth sweep
-/// (`every_depth_of_a_view_chain_answers_or_is_refused_never_overflows`) is its oracle.
+/// (`every_depth_of_a_view_chain_answers_or_is_refused_never_overflows`) checks every depth.
 #[test]
 fn a_ninety_view_chain_answers_or_is_refused_with_54001() {
     on_session(|s| {
@@ -184,7 +184,7 @@ fn find_killer() {
     let text: String = text
         .lines()
         // Meta-commands and whole-line comments go; a statement after a comment block stays
-        // (find_killer.py dropped such a statement whole, so a script's first CREATE never ran).
+        // (dropping such a statement whole meant a script's first CREATE never ran).
         .filter(|l| !l.starts_with('\\') && !l.trim_start().starts_with("--"))
         .collect::<Vec<_>>()
         .join("\n");
@@ -421,10 +421,10 @@ fn every_depth_of_a_view_chain_answers_or_is_refused_never_overflows() {
 
 /// `generate_series` with an infinite bound: an infinite stop saturated to i64::MAX and the session
 /// thread spun through ~10^18 rows while the client got nothing more, so any client could wedge a
-/// session thread; an infinite step answered 1 row. PostgreSQL refuses each with 22023 ("stop value
-/// cannot be infinity", "step size ...", "start value ..."). Each must be refused 22023 within 10 s
-/// (a wedged session fails here at the deadline instead of hanging the test), and a finite series
-/// still answers.
+/// session thread; an infinite step answered 1 row. PostgreSQL 18.6 refuses each with 22023 ("stop
+/// value cannot be infinity", "step size ...", "start value ..."). Each must be refused 22023
+/// within 10 s (a wedged session fails here at the deadline instead of hanging the test), and a
+/// finite series still answers.
 #[test]
 fn an_infinite_generate_series_bound_is_refused_22023_promptly() {
     let (tx, rx) = std::sync::mpsc::channel();
