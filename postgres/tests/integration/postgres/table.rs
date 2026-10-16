@@ -367,3 +367,28 @@ fn test_postgres_vacuum_keeps_a_public_tables_definition(db: TempDatabase) {
     };
     assert_eq!(v.as_str(), "one");
 }
+
+/// A three-part column reference through public names the main database's relation, as the
+/// two-part relation name does (wire review 18 item 21): `public.t.name` reads main's t, with t in
+/// FROM unqualified or as public.t. The column reference kept public as a database name, so it was
+/// "no such column" while `FROM public.t` worked (594edd413 mapped relation names only).
+#[turso_macros::test]
+fn test_postgres_three_part_public_column(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'pen')").unwrap();
+    for sql in [
+        "SELECT public.t.name FROM t WHERE public.t.id = 1",
+        "SELECT public.t.name FROM public.t WHERE public.t.id = 1",
+    ] {
+        let mut rows = conn
+            .query(sql)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+            .unwrap();
+        let StepResult::Row = rows.step().unwrap() else {
+            panic!("{sql}: no row");
+        };
+        assert_eq!(rows.row().unwrap().get_value(0).to_string(), "pen", "{sql}");
+    }
+}

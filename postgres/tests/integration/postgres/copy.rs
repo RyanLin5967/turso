@@ -757,3 +757,29 @@ fn test_copy_from_stdin_unsupported(db: TempDatabase) {
     // STDIN is not supported — should produce an error
     assert!(result.is_err());
 }
+
+/// COPY resolves its table as every other statement does (wire review 18 item 22): an unqualified
+/// name through the search path, so under `search_path TO s, public` `COPY t` fills s.t, and
+/// `COPY public.t` fills the main database's t whatever the path. COPY's INSERT was prepared with
+/// no path, so `COPY t` filled public.t, and `COPY public.t` landed there only because its
+/// qualifier was dropped.
+#[turso_macros::test]
+fn test_copy_from_follows_the_search_path(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t (id INTEGER, name TEXT)")
+        .unwrap();
+    conn.execute("CREATE SCHEMA s").unwrap();
+    conn.execute("CREATE TABLE s.t (id INTEGER, name TEXT)")
+        .unwrap();
+    conn.execute("SET search_path TO s, public").unwrap();
+    let tsv = write_temp_file("1\tAlice\n");
+    let count = |sql: &str| query_all(&conn, sql).len();
+    conn.execute(&format!("COPY t FROM '{}'", tsv.path().display()))
+        .unwrap();
+    assert_eq!(count("SELECT * FROM s.t"), 1, "COPY t under s, public");
+    assert_eq!(count("SELECT * FROM public.t"), 0, "COPY t under s, public");
+    conn.execute(&format!("COPY public.t FROM '{}'", tsv.path().display()))
+        .unwrap();
+    assert_eq!(count("SELECT * FROM public.t"), 1, "COPY public.t");
+    assert_eq!(count("SELECT * FROM s.t"), 1, "COPY public.t");
+}
