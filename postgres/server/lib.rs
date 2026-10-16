@@ -2771,7 +2771,9 @@ impl Session {
     fn missing_or(&self, name: &str, e: &LimboError, severity: &str) -> Box<ErrorInfo> {
         let mut info = match self.shared.db.branch_named(name) {
             Ok(None) => error("3D000", format!("branch \"{name}\" does not exist")),
-            Ok(Some(_)) if e.to_string().contains("already has an open connection") => {
+            // By the engine's typed error, never its text (C44-M1: the one SQLSTATE still chosen
+            // from a message).
+            Ok(Some(_)) if matches!(e, LimboError::BranchInUse { .. }) => {
                 let mut info = error(
                     "55006",
                     format!("branch \"{name}\" is in use by another session"),
@@ -6771,6 +6773,31 @@ mod tests {
                 }
             }
         });
+    }
+
+    /// C44-M1: a branch the engine refuses as in use is 55006 by the engine's typed error
+    /// (LimboError::BranchInUse), whatever its text; another error on an existing branch is not
+    /// 55006, and a missing branch is 3D000. The wire tests reach the session's own in-use map
+    /// first, never this arm (planted: the arm turned off, all four 55006 wire tests still pass).
+    #[test]
+    fn a_branch_the_engine_refuses_as_in_use_is_55006_by_its_type() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = session(&dir);
+        ok(&s, "CREATE TABLE t(id INT)");
+        s.open_trunk().unwrap().inner().create_branch("held").unwrap();
+        let in_use = LimboError::BranchInUse {
+            name: Some("held".to_string()),
+            id: 1,
+            op: turso_core::BranchOp::Drop,
+        };
+        assert_eq!(s.missing_or("held", &in_use, "ERROR").code, "55006");
+        let other = LimboError::InternalError("already has an open connection".to_string());
+        assert_ne!(
+            s.missing_or("held", &other, "ERROR").code,
+            "55006",
+            "a text match, not the type"
+        );
+        assert_eq!(s.missing_or("nosuch", &in_use, "ERROR").code, "3D000");
     }
 
     /// C40 review LOW 6 (C49): a Parse makes at most ONE libpg_query call, whatever its text:
