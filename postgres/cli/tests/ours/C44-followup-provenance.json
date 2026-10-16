@@ -1,0 +1,13 @@
+{
+  "kind": "observed dependency integration capture, not seeded validation",
+  "base": "9251af1fb72e428c7c31fcd7d07bbd0629265085",
+  "original_c44": "6c089e58e6886065dd5abf8f558fd7849349d3d2",
+  "lane_dependency": "eb2bdf6c7",
+  "capture_head": "c34f83499f3380a9e9084705adfd413a8184f248",
+  "capture_source_patch_sha256": "90c246e0e97e4b2fab9976da6950f57f57fdec5c1d4684e5a45998ab312d663c",
+  "temporary_seed": "This new include_str fixture alone initially used PG text to compile a capture. That run was not validation. The seed was replaced verbatim from actual server replies before committing; existing C55 ours and PG fixtures are unchanged.",
+  "file": "pg18-c53-dropnotice.out",
+  "sha256": "7bb1a4ded802f10b7d0ce9251d1c51765603e112f22c9588ad3a91c5a2afa89e",
+  "capture_command": "C44_FOLLOWUP_CAPTURE=... cargo test -p tursopg --test wire_sessions _replays_as_postgresql_answered -- --test-threads=1",
+  "validation": "Run the committed exact-pin replay after capture; dependency partial answers remain registered to their original pins and intentionally fail rather than silently accepting changed replies."
+}
