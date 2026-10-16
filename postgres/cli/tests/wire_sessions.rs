@@ -14005,3 +14005,15 @@ fn c50_class4_float_moving_sums_recompute_each_frame() {
         }
     }
 }
+
+
+#[test]
+fn c50_class4_numeric_inputs_use_postgresql_whitespace() {
+    let dir = Scratch::new("c50-input-whitespace");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let sql = r"SELECT E'\0131\013'::int4,E'\0131.5\013'::numeric,E'\0131.5\013'::float8";
+    let r = a.q(sql).ok(sql);
+    assert_eq!(r.oids, Some(vec![23, 1700, 701]));
+    assert_eq!(r.rows, vec![vec![Some("1".into()), Some("1.5".into()), Some("1.5".into())]]);
+}
