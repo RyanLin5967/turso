@@ -25,6 +25,8 @@ from collections import Counter
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import v3cell  # noqa: E402
+sys.path.insert(0, os.path.join(os.path.dirname(HERE), "gates"))
+import hostbin  # noqa: E402  every "bash" here is hostbin's bash 4+, never the caller's PATH's (the platform class)
 
 
 def current_f3_sync_record(sy):
@@ -1064,6 +1066,25 @@ def find_leaf_class():
 
 
 # ---- main -------------------------------------------------------------------------------------------------------
+def leaf_remote_ok(rc, txt, what, prem, out_exists, f3):
+    """F4:R_leaf_remote's verdict -> (ok, why). The plant (firecheck.sh) fakes an sd leaf's SCSI host as tcm_loopback or
+    an NVMe controller's transport as tcp, and the probe must refuse it (rc 2) by its allowlist, with no out dir. A
+    virtio_blk leaf has no host or transport to fake: there it is NOT APPLICABLE, but only when the F3 record's leaf is
+    virtio_blk AND the probe ruled the run virtualized (such a leaf is never credited; the lead's gate item 6
+    amendment, a --dry-block run on a VM's virtual disk). Every other leaf the plant could not reach fails."""
+    kind = what.split(" ")[0].split("=", 1)[-1]  # firecheck.sh writes "faked=<sd_host|nvme_transport> <host|ctrl>"
+    exp = {"sd_host": ("proc_name=tcm_loopback", "is on SCSI host 'tcm_loopback'"),
+           "nvme_transport": ("transport=tcp", "has transport 'tcp', not pcie")}.get(kind)
+    if exp is not None:
+        ok = rc == 2 and exp[0] in prem and exp[1] in txt and not out_exists
+        return ok, "the plant's rule (rc 2, the allowlist's text, no out dir)"
+    leaf = (f3 or {}).get("leaf") or {}
+    virt = ((f3 or {}).get("virtualization") or {}).get("virtualized")
+    if "neither sd nor nvme" in txt and leaf.get("driver") == "virtio_blk" and virt is True:
+        return True, "not applicable: a virtio_blk leaf has no SCSI host or NVMe transport, and the probe ruled it virtualized"
+    return False, f"no plant ran (leaf driver {leaf.get('driver')!r}, virtualized {virt!r})"
+
+
 def self_test():
     """The checker's own rules on planted records, expectations by hand (fifth review M3)."""
     res = []
@@ -1088,6 +1109,23 @@ def self_test():
                      ("a scsi_debug kind", dict(sd, kind="scsi_debug", creditable=False)), ("driver dm", dict(nv, driver="dm"))):
         chk("leaf refused: %s" % name, leaf_problems(lf, False) != [], lf)
     chk("leaf refused: a drive leaf on a brd cell", leaf_problems(sd, True) != [])
+    # the lead's gate item 6 amendment (a --dry-block run on a VM's virtio disk, 2026-10-15): F4:R_leaf_remote plants a
+    # remote sd host or NVMe transport, so on a virtio_blk leaf there is nothing to plant. It is not applicable there
+    # ONLY when the F3 leaf is virtio_blk AND the probe ruled the run virtualized (a virtualized leaf is never
+    # credited); every other "neither sd nor nvme" stays a failure, and an sd or NVMe leaf keeps the plant's rule
+    vio = {"leaf": {"driver": "virtio_blk", "kind": "drive"}, "virtualization": {"virtualized": True}}
+    neither = ("missing", "the leaf disk vdb is neither sd nor nvme\n", "", "", False)
+    chk("leaf remote: a virtio_blk leaf the probe ruled virtualized is not applicable (passes, saying why)",
+        leaf_remote_ok(*neither, vio)[0] and "not applicable" in leaf_remote_ok(*neither, vio)[1])
+    chk("leaf remote: a virtio_blk leaf NOT ruled virtualized fails",
+        not leaf_remote_ok(*neither, dict(vio, virtualization={"virtualized": None}))[0])
+    chk("leaf remote: another driver with no plant fails (brd, dm: neither sd nor nvme)",
+        not leaf_remote_ok(*neither, dict(vio, leaf={"driver": "brd"}))[0])
+    chk("leaf remote: a virtio_blk leaf whose plant somehow ran is judged by the plant's rule (rc 0: fails)",
+        not leaf_remote_ok(0, "", "faked=sd_host host0", "", False, vio)[0])
+    chk("leaf remote: an sd plant refused as wanted passes (the old rule)",
+        leaf_remote_ok(2, "the leaf sda is on SCSI host 'tcm_loopback'", "faked=sd_host host0",
+                       "proc_name=tcm_loopback", False, {"leaf": {"driver": "sd"}})[0])
     ev = ["leaf: drive model 'Virtual Disk' names 'Virtual'"]
     chk("virt: a VM with evidence and detect-virt microsoft passes",
         virt_problems({"virtualized": True, "evidence": ev}, "microsoft", "aarch64") == [])
@@ -1367,10 +1405,15 @@ def self_test():
     # `awk -v b="$mp/"`; that sweep now calls nestloops.sh's nest_level_match, pinned by its canned cases above]
     import subprocess as _sp12
     nl = os.path.join(HERE, "nestloops.sh")
-    r12 = _sp12.run(["bash", nl, "--self-test"], capture_output=True, text=True, timeout=120) if os.path.exists(nl) else None
-    chk("nestloops.sh --self-test: the one anchored nest-chain matcher on canned listings (nb/x.img is not the chain; a "
-        "failing losetup is an error)", r12 is not None and r12.returncode == 0 and "NESTLOOPS SELF-TEST" in r12.stdout
-        and " PASS" in r12.stdout, (r12.returncode, r12.stdout[-300:], r12.stderr[-200:]) if r12 else "nestloops.sh absent")
+    # Linux-only (gates/platforms.tsv: GNU readlink -m, and a /var that is not a symlink): off Linux it is N/A, never a
+    # pass (the platform-inheritance class, 2026-10-15); on Linux it must pass as before
+    if not sys.platform.startswith("linux"):
+        print(f"N/A-on-{sys.platform}: nestloops.sh --self-test (GNU readlink -m, and a /var that is not a symlink)", flush=True)
+    else:
+        r12 = _sp12.run([hostbin.bash(), nl, "--self-test"], capture_output=True, text=True, timeout=120) if os.path.exists(nl) else None
+        chk("nestloops.sh --self-test: the one anchored nest-chain matcher on canned listings (nb/x.img is not the chain; a "
+            "failing losetup is an error)", r12 is not None and r12.returncode == 0 and "NESTLOOPS SELF-TEST" in r12.stdout
+            and " PASS" in r12.stdout, (r12.returncode, r12.stdout[-300:], r12.stderr[-200:]) if r12 else "nestloops.sh absent")
     # V3 review 13 item 8: teardown_nest's OUTCOME check (no loop still backed by the chain at the end) had never fired
     # alone, and item 13's red was not isolating. mkfixtures.sh --teardown-nest runs here on a temp BASE with PATH
     # shims (nestloops.sh's technique): sudo runs its command, mountpoint and findmnt say nothing is mounted, and
@@ -1412,7 +1455,7 @@ def self_test():
             open(loops8, "w").write("/dev/loopfake9 /elsewhere/v3fx-n1.img\n")
             env8 = dict(os.environ, PATH=sh8 + os.pathsep + os.environ.get("PATH", ""), FAKE_LOOPS=loops8,
                         FAKE_DETACH=detach)
-            r8 = _sp12.run(["bash", script, "--teardown-nest", base8], capture_output=True, text=True, env=env8,
+            r8 = _sp12.run([hostbin.bash(), script, "--teardown-nest", base8], capture_output=True, text=True, env=env8,
                            timeout=120)
             return r8.returncode, r8.stdout + r8.stderr
         t1 = td_run(mk8, "0", "t1")
@@ -2376,14 +2419,12 @@ def fourth_review_plants(arch, box):
     txt = rd(os.path.join(f4, "R_leaf_remote.txt")) or ""
     what = (rd(os.path.join(f4, "R_leaf_remote.what")) or "").strip()
     prem = rd(os.path.join(f4, "R_leaf_remote.premise")) or ""
-    kind = what.split(" ")[0].split("=", 1)[-1]  # firecheck.sh writes "faked=<sd_host|nvme_transport> <host|ctrl>"
-    exp = {"sd_host": ("proc_name=tcm_loopback", "is on SCSI host 'tcm_loopback'"),
-           "nvme_transport": ("transport=tcp", "has transport 'tcp', not pcie")}.get(kind)
-    check("F4:R_leaf_remote", exp is not None and rc == 2 and exp[0] in prem and exp[1] in txt
-          and not os.path.exists(os.path.join(f4, "R_leaf_remote.out")),
-          {"rc": rc, "faked": what, "premise": prem.strip(), "text": txt[-300:]},
+    f3r = rj(os.path.join(OUT, "F3", "summary.probe.json")) or rj(os.path.join(OUT, "F3", "summary.json")) or {}
+    lr_ok, lr_why = leaf_remote_ok(rc, txt, what, prem, os.path.exists(os.path.join(f4, "R_leaf_remote.out")), f3r)
+    check("F4:R_leaf_remote", lr_ok, {"rc": rc, "faked": what, "premise": prem.strip(), "text": txt[-300:], "why": lr_why},
           "the cell's leaf disk with its SCSI host named tcm_loopback (sd) or its NVMe transport tcp, read back inside a "
-          "private mount namespace: refused by the host or transport allowlist (rc 2)")
+          "private mount namespace: refused by the host or transport allowlist (rc 2); not applicable on a virtio_blk "
+          "leaf the probe ruled virtualized (no host or transport to plant)")
     # gate-6 review v3 #1 (A14): the mutant (no fsync: the fastest possible "fsync") on scsi_debug, write-back without
     # PLP -> the timing control voids it; the same declared PLP -> not applicable; write-through -> not applicable
     for tag, lc, plp, want, wrc in (("R_tc_wb", "wb", "no", "FAIL: run void (append25 ratio", 3),

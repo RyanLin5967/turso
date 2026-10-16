@@ -249,6 +249,9 @@ def selftest():
     # 37841577896 (every pg18, doltgres and b1 job's functional.txt: parent count|sum(v) = 10000|89963830; Dolt 2.4.1
     # printed the same value as 8.996383e+07, review of 62430d8bf..b49fb656a, HIGH 2). Not computed by the subject.
     ok("aged sum(v) at the CI default = what three servers read back", aged_sum(10000, 200, 1) == 89963830)
+    # comp review 1 LOW 27's re-pin (readback_repin.sh, artie runs/loud-20261015/readback-repin): PG 18.6, Dolt 2.4.1 and
+    # Doltgres 1.4.0 each read back 10000|89963830|84362189621 with the OFFSET 0 query form. Not computed by the subject.
+    ok("row hash at the CI default = what three engines read back", facts(10000, 200, 1)["row_hash"] == 84362189621)
     print(f"gen_seed selftest: {n - bad}/{n}")
     return 1 if bad else 0
 

@@ -342,7 +342,9 @@ def after_problems(nm, sm, cols):
         why.append(f"{nm} run has no skip_after record ({skip!r})")
     if why:
         return why
-    k = 0 if skip else na
+    # (na is a count here; the guard keeps the columns check from raising when the refusal above is deleted, so a
+    # timedrun_mutants.py mutant of it reads as a clean verdict -- a crash is not a kill)
+    k = 0 if skip or not _count(na) else na
     got = {c for c in cols if re.fullmatch(r"after\d+_ns", c)}
     want = {f"after{i + 1}_ns" for i in range(k)}
     if got != want:
@@ -356,8 +358,8 @@ def after_problems(nm, sm, cols):
 
 def raw_problems(nm, d, sm):
     """What the run's raw.tsv says against its summary (comp review 1 LOW 17: the summary was trusted): one warm-up row
-    per warm-up op, (competitors review 2 item 1) no measured row intended at or after tm1_ns, the window's end as
-    claim_op stamped it in intended time, and (comp review 1 MED 9) a bbload run's after columns and tput_unit
+    per warm-up op, (competitors review 2 item 1) no measured row claimed (claim_ns; intended_ns when the raw has no
+    claim_ns) at or after tm1_ns, the window's end as claim_op stamped it, and (comp review 1 MED 9) a bbload run's after columns and tput_unit
     (after_problems)."""
     p = os.path.join(d, "raw.tsv")
     try:
@@ -378,12 +380,18 @@ def raw_problems(nm, d, sm):
     if not _count(tm1) or not tm1:
         why.append(f"{nm} run has no tm1_ns: its window's end in intended time is unknown")
     else:
+        # the lead's claim_ns ruling: the window is judged on the field claim_op stamped tm1 with. Closed loop: the
+        # claim's clock reading (claim_ns); intended_ns is the op's start there, which at C > 1 can fall after tm1 for an
+        # op claimed before it (a false refusal). Open loop: the claimed arrival's intended time (intended_ns), whatever
+        # the claim's clock read (a backlogged client claims late, a free one early). Without claim_ns, intended_ns.
+        closed = sm.get("loop") == "closed"
+        key, word = ("claim_ns", "claimed") if closed and "claim_ns" in cols else ("intended_ns", "intended")
         try:
-            late = sum(1 for r in rows if r["phase"] == "measure" and int(r["intended_ns"]) >= tm1)
-        except ValueError:
-            return why + [f"{nm} run's raw.tsv has an intended_ns that is not a count"]
+            late = sum(1 for r in rows if r["phase"] == "measure" and int(r[key]) >= tm1)
+        except (ValueError, TypeError):
+            return why + [f"{nm} run's raw.tsv has an {key} that is not a count"]
         if late:
-            why.append(f"{nm} run measured {late} op(s) intended at or after tm1 {tm1}")
+            why.append(f"{nm} run measured {late} op(s) {word} at or after tm1 {tm1}")
     return why
 
 
@@ -604,13 +612,26 @@ OPEN = {"loop": "open", "mode": "open", "rate": 100.0, "send_late_us": {"p50": 5
 BB = {"spec": "pg18-m1c.spec", "after_steps": 2, "skip_after": False, "tput_unit": "cycle"}
 
 
-def raw_tsv(sm, extra_rows=(), drop_warm=0, after_cols=None):
+def raw_tsv(sm, extra_rows=(), drop_warm=0, after_cols=None, claimed_rows=None):
     """A raw.tsv agreeing with summary SM: warmup_ops warm-up rows intended from t0 on, measured_ops measured rows
     intended from tm0 on (all before tm1), then EXTRA_ROWS (phase, intended_ns); DROP_WARM warm-up rows left out;
-    AFTER_COLS after<k>_ns columns (default: the summary's after_steps when they ran, as bbload writes them)."""
+    AFTER_COLS after<k>_ns columns (default: the summary's after_steps when they ran, as bbload writes them).
+    CLAIMED_ROWS (a list, possibly empty) adds a claim_ns column, each row claimed at its intended time, then those
+    rows (phase, claim_ns, intended_ns) (the lead's claim_ns ruling: one meaning per field)."""
     if after_cols is None:
         na = sm.get("after_steps")
         after_cols = na if isinstance(na, int) and sm.get("skip_after") is not True else 0
+    if claimed_rows is not None:
+        base = raw_tsv(sm, extra_rows, drop_warm, after_cols).splitlines()
+        tail = "".join("\t10" for _ in range(after_cols))
+        out = [base[0].replace("\tintended_ns", "\tclaim_ns\tintended_ns") + "\n"]
+        for ln in base[1:]:
+            f = ln.split("\t")
+            out.append("\t".join(f[:5] + [f[5]] + f[5:]) + "\n")
+        n = len(base) - 1
+        for i, (ph, c, t) in enumerate(claimed_rows):
+            out.append(f"0\t{n + i}\t{ph}\t1\t{n + i}\t{c}\t{t}\t1000{tail}\n")
+        return "".join(out)
     out = ["client\tseq\tphase\tok\tarrival\tintended_ns\tlat_ns" + "".join(f"\tafter{k + 1}_ns" for k in range(after_cols))
            + "\n"]
     tail = "".join("\t10" for _ in range(after_cols))
@@ -859,6 +880,20 @@ def selftest():
          dict(tracer=clean, timed_raw=raw_tsv(dict(RUN, measured_ops=200), extra_rows=[("measure", tm1)])), False),
         ("control: a drain row intended after tm1 is not a measured one",
          dict(tracer=clean, timed_raw=raw_tsv(dict(RUN, measured_ops=200), extra_rows=[("drain", tm1 + 5)])), True),
+        # the lead's claim_ns ruling (comp lane's find): closed loop at C > 1, intended_ns is the op's START, so a measured
+        # op CLAIMED before tm1 can start after it; the window is judged at the claim (claim_ns), when the raw has one
+        ("claim_ns: a measured row claimed before tm1 that started after it (closed loop at C > 1) is in the window",
+         dict(tracer=clean, timed_raw=raw_tsv(dict(RUN, measured_ops=199), claimed_rows=[("measure", tm1 - 1, tm1 + 900)])), True),
+        ("claim_ns: a measured row claimed at tm1 (the window is closed at the claim)",
+         dict(tracer=clean, timed_raw=raw_tsv(dict(RUN, measured_ops=199), claimed_rows=[("measure", tm1, tm1 + 900)])), False),
+        # open loop: claim_op stamps tm1 at the claimed ARRIVAL's intended time, not at the claim's clock reading, so the
+        # window is in intended time there whatever claim_ns says (a backlogged client claims late; a free one early)
+        ("claim_ns, open loop: a measured row intended before tm1 and claimed after it (a backlog) is in the window",
+         dict(tracer=clean, lab_extra=OPEN, timed_extra=OPEN,
+              timed_raw=raw_tsv(dict(RUN, measured_ops=199, **OPEN), claimed_rows=[("measure", tm1 + 900, tm1 - 1)])), True),
+        ("claim_ns, open loop: a measured row intended at tm1 and claimed before it",
+         dict(tracer=clean, lab_extra=OPEN, timed_extra=OPEN,
+              timed_raw=raw_tsv(dict(RUN, measured_ops=199, **OPEN), claimed_rows=[("measure", tm1 - 900, tm1)])), False),
         ("no tm1_ns in the timed summary", dict(tracer=clean, timed_extra={"tm1_ns": None}), False),
         ("the raw rows hold one warm-up op fewer than warmup_ops (LOW 17: the summary is not trusted)",
          dict(tracer=clean, timed_raw=raw_tsv(dict(RUN, measured_ops=200), drop_warm=1)), False),
@@ -1020,6 +1055,10 @@ def selftest():
         "A23: a loop mode that is neither closed nor open (both runs)":
             ("labelling run's loop mode 'b1' is neither closed nor open", "timed run's loop mode 'b1' is neither closed nor open"),
         "a measured row intended at tm1 (the window is closed in intended time at tm1)":
+            ("timed run measured 1 op(s) intended at or after tm1",),
+        "claim_ns: a measured row claimed at tm1 (the window is closed at the claim)":
+            ("timed run measured 1 op(s) claimed at or after tm1",),
+        "claim_ns, open loop: a measured row intended at tm1 and claimed before it":
             ("timed run measured 1 op(s) intended at or after tm1",),
         "no tm1_ns in the timed summary": ("timed run has no tm1_ns",),
         "the raw rows hold one warm-up op fewer than warmup_ops (LOW 17: the summary is not trusted)":

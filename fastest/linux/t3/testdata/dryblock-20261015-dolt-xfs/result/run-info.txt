@@ -1,0 +1,8 @@
+system=dolt kind=dolt mnt=/mnt/t3-xfs/work-xfs-dolt-c1-r1-a1 fstype=xfs rows=10000 n1=200 n4=200 idle_s=30 clients=[1] cap_s=1800 warmup=1000:10:180 dry=1 ops_total=c1=30 age=200 prebranch=20 prebranch_c=4 prebranch_s=1800 parent_sum=89963830
+drive_class=write-back-no-fua flush_reaches_drive=yes disks=vdb() chain=vdb
+strace=strace -- version 6.8 kernel=6.8.0-134-generic arch=aarch64
+## df (the loop backing file lives on / or /mnt)
+Filesystem       1B-blocks        Used   Available Use% Mounted on
+/dev/vda1      40483942400 10161041408 30306123776  26% /
+/dev/vda1      40483942400 10161041408 30306123776  26% /
+/dev/vdb       64357400576  1266266112 63091134464   2% /mnt/t3-xfs

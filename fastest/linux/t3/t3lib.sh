@@ -131,7 +131,18 @@ dev_unmoved() { # dev_unmoved PATH REAL
 t3_first_line() { [ -r "$1" ] && awk 'NR == 1 { gsub(/^[ \t]+|[ \t]+$/, ""); print }' "$1"; }
 
 dev_identity() { # dev_identity SYS DEV
-  local b=$1/block/$2 d=$1/block/$2/device wwid dev model serial fw f
+  local b=$1/block/$2 d=$1/block/$2/device wwid dev model serial fw f seq
+  # a DRY-VIRT run's virtual disk (t3run sets T3_IDENTITY_MODE=virtio in its --dry-block branch alone, and drops any
+  # inherited value first): virtio-blk exposes no wwid, model, serial or firmware, so it is identified by the diskseq
+  # the kernel gives each disk it attaches and does not reuse while it runs, beside its MAJ:MIN and the virtio vendor
+  if [ "${T3_IDENTITY_MODE:-}" = virtio ] && [[ $(t3_first_line "$d/modalias") == virtio:d00000002* ]]; then
+    seq=$(t3_first_line "$b/diskseq"); dev=$(t3_first_line "$b/dev")
+    [[ $seq =~ ^[0-9]+$ ]] || { echo "REFUSED: cannot read $2's diskseq under $1/block/$2 (a virtio disk's identity)" >&2; return 2; }
+    [ -n "$dev" ] || { echo "REFUSED: cannot read $2's dev under $1/block/$2" >&2; return 2; }
+    printf 'wwid=virtio-diskseq:%s\ndev=%s\nmodel=virtio-blk %s\nserial=diskseq-%s\nfirmware=virtio\n' "$seq" "$dev" \
+      "$(t3_first_line "$d/vendor")" "$seq"
+    return 0
+  fi
   wwid=$(t3_first_line "$b/wwid"); [ -n "$wwid" ] || wwid=$(t3_first_line "$d/wwid")
   dev=$(t3_first_line "$b/dev")
   model=$(t3_first_line "$d/model")
@@ -232,7 +243,13 @@ _device_make() { # _device_make PATH REAL SYS DEV ID PLP REG FS UUID MNT MADE
   t3_devguard "$real" || { echo "REFUSED: devguard refuses $real before mkfs"; return 2; }
   # after devguard, so whatever happened while it ran is seen before mkfs (review 6 LOW 4)
   dev_unchanged "$path" "$real" "$sys" "$dev" "$id" || return 2
-  registered_ok "$sys" "$reg" "$dev" "$plp" "$fs" || return 2
+  # REG = DRY-VIRT: a --dry-block run on a VM's virtual disk (never credited: stamped DRY-VIRT, which summarize refuses
+  # for credit); only the A17 registration is skipped, every other step and refusal stands
+  if [ "$reg" = DRY-VIRT ]; then
+    echo "DRY-VIRT: the A17 registration is not asked of a dry run on a virtual disk ($dev, $fs)"
+  else
+    registered_ok "$sys" "$reg" "$dev" "$plp" "$fs" || return 2
+  fi
   printf '%s %s\n' "$fs" "$uuid" > "$made" || { echo "cannot record what this block makes in $made"; return 1; }
   t3_mkfs "$fs" "$real" "$uuid" || { echo "mkfs.$fs failed on $real"; return 1; }
   fs_probe_is "$real" "$fs" "$uuid" || return 2
@@ -244,6 +261,24 @@ _device_make() { # _device_make PATH REAL SYS DEV ID PLP REG FS UUID MNT MADE
 }
 
 device_make() { t3_pinned "$2" _device_make "$@"; }
+
+virt_ok() { # virt_ok MODE VIRT: MODE real refuses any virtualization (gate-6 review 8: what a flush reaches behind a
+  # hypervisor is unknown, so a T3 box must be bare metal); MODE dryblock allows it (a --dry-block run on a VM's
+  # virtual disk, stamped DRY-VIRT). Any other mode refuses. Returns 2 on a refusal
+  case $1 in
+    real) [ "$2" = none ] || { echo "REFUSED: systemd-detect-virt says '${2:-unknown}': a T3 box must be bare metal"; return 2; } ;;
+    dryblock) return 0 ;;
+    *) echo "REFUSED: virt_ok mode '$1' is neither real nor dryblock"; return 2 ;;
+  esac
+}
+
+HOST_MIN_FREE_GB=35  # the lead's --dry-block ruling: no VM dry run builds while the Mac host has less free
+host_room_ok() { # host_room_ok FREE_KB [MIN_GB]: the host has at least MIN_GB (35) GiB free. Returns 2 otherwise
+  local free=$1 min=${2:-$HOST_MIN_FREE_GB}
+  [[ $free =~ ^[0-9]+$ ]] || { echo "REFUSED: the host's free space reads '$free', not a number of KiB"; return 2; }
+  [ "$free" -ge $((min * 1024 * 1024)) ] ||
+    { echo "REFUSED: the host has $((free / 1024 / 1024)) GiB free, under the $min GiB a VM dry run needs"; return 2; }
+}
 
 _device_wipe() { # _device_wipe PATH REAL SYS DEV ID FS UUID
   dev_unchanged "$1" "$2" "$3" "$4" "$5" || return 2
@@ -339,4 +374,65 @@ with open(os.path.join(d, "timed.json"), "w") as f:
 print("timed.json: sweeper_cpu_s", rec["sweeper_cpu_s"], rec["sweeper_refused"] or "")
 sys.exit(0 if rec["sweeper_cpu_s"] is not None else 1)
 EOF
+}
+
+# host_quiet REC / host_unquiet REC -- the class "the host acts during a measured window" (second full --dry-block
+# run, 2026-10-15: apt-daily.timer's unattended-upgrade voided a cell as foreign CPU; lima-guestagent's SyncTime
+# stepped CLOCK_REALTIME every 10-20 s and stracecount refused the windows). Before the first cell, host_quiet stops
+# EVERY active systemd timer (no allowlist: nothing scheduled may start mid-run), the service each one activates when
+# it is running, and every active clock adjuster in T3_CLOCK_ADJUSTERS, recording each as "<kind>\t<unit>" in REC.
+# Then it judges the OUTCOME, not the list: CLOCK_REALTIME minus CLOCK_MONOTONIC (T3_CLOCKDELTA) must move by at most
+# T3_QUIET_MAX_S over a watch of T3_QUIET_WATCH_S, or it refuses, naming the movement; so an adjuster nobody listed
+# is caught by its effect. Refuses (rc 1) also when list-timers fails, a stopped unit is still active, or a clock
+# sample is unreadable. host_unquiet starts the recorded timers and clock adjusters again (a timer starts its own
+# service). Blind spots, stated: cron and anacron jobs and non-systemd daemons are seen only by foreign_cpu.py
+# (VOID). A slew (adjtime, the kernel PLL) moves CLOCK_REALTIME and CLOCK_MONOTONIC together, so it is invisible here
+# and equally to stracecount's realtime-against-monotonic check; only a step (clock_settime, ADJ_SETOFFSET) moves the
+# difference, and that is what both refuse.
+T3_CLOCK_ADJUSTERS=${T3_CLOCK_ADJUSTERS:-"systemd-timesyncd chrony chronyd ntp ntpd ntpsec openntpd lima-guestagent"}
+t3_clockdelta() { # CLOCK_REALTIME minus CLOCK_MONOTONIC, in seconds: the default sampler (T3_CLOCKDELTA overrides it)
+  python3 -B -c 'import time; print(time.clock_gettime(time.CLOCK_REALTIME) - time.clock_gettime(time.CLOCK_MONOTONIC))'
+}
+host_quiet() {
+  local rec=$1 sc=${T3_SYSTEMCTL:-sudo -n systemctl} timers u svc bad="" d0 d1
+  local clk=${T3_CLOCKDELTA:-t3_clockdelta}
+  : > "$rec" || return 1
+  timers=$(${sc} list-timers --all --no-legend --plain) || { echo "REFUSED: host_quiet: systemctl list-timers failed"; return 1; }
+  while read -r u svc; do
+    [ -n "$u" ] || continue
+    if [ "$(${sc} is-active "$u" 2> /dev/null)" = active ]; then
+      ${sc} stop "$u"; printf 'timer\t%s\n' "$u" >> "$rec"
+    fi
+    if [ -n "$svc" ] && [ "$(${sc} is-active "$svc" 2> /dev/null)" = active ]; then
+      ${sc} stop "$svc"; printf 'service\t%s\n' "$svc" >> "$rec"
+    fi
+  done < <(printf '%s\n' "$timers" | awk '{ for (i = 1; i <= NF; i++) if ($i ~ /\.timer$/) { print $i, $(i + 1); break } }')
+  for u in $T3_CLOCK_ADJUSTERS; do
+    if [ "$(${sc} is-active "$u" 2> /dev/null)" = active ]; then
+      ${sc} stop "$u"; printf 'clock\t%s\n' "$u" >> "$rec"
+    fi
+  done
+  while IFS=$'\t' read -r _ u; do
+    [ "$(${sc} is-active "$u" 2> /dev/null)" = active ] && bad="$bad $u"
+  done < "$rec"
+  [ -z "$bad" ] || { echo "REFUSED: host_quiet: still active after stop:$bad"; return 1; }
+  d0=$($clk) && sleep "${T3_QUIET_WATCH_S:-30}" && d1=$($clk) && [ -n "$d0" ] && [ -n "$d1" ] ||
+    { echo "REFUSED: host_quiet: cannot sample the clocks ('${d0:-}' then '${d1:-}')"; return 1; }
+  python3 -B -c 'import sys
+d0, d1, w, m = float(sys.argv[1]), float(sys.argv[2]), sys.argv[3], float(sys.argv[4])
+if abs(d1 - d0) > m:
+    sys.exit(f"REFUSED: host_quiet: CLOCK_REALTIME moved {d1 - d0:+.6f} s against CLOCK_MONOTONIC in {w} s with every"
+             f" timer and listed clock adjuster stopped (limit {m} s): something still adjusts the clock")
+print(f"host_quiet: CLOCK_REALTIME - CLOCK_MONOTONIC held within {abs(d1 - d0):.6f} s over {w} s")' \
+    "$d0" "$d1" "${T3_QUIET_WATCH_S:-30}" "${T3_QUIET_MAX_S:-0.002}" 2>&1 || return 1
+  echo "host_quiet: stopped $(grep -c . "$rec") unit(s) (recorded in $rec)"
+}
+
+host_unquiet() {
+  local rec=$1 sc=${T3_SYSTEMCTL:-sudo -n systemctl} kind u rc=0
+  [ -f "$rec" ] || return 0
+  while IFS=$'\t' read -r kind u; do
+    case $kind in timer|clock) ${sc} start "$u" || rc=1 ;; esac
+  done < "$rec"
+  return $rc
 }

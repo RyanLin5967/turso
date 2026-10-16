@@ -32,6 +32,9 @@ init)
   dolt_quiet_root "$DATA/root"
   cat >"$CONF" <<EOF
 log_level: warning
+behavior:
+  auto_gc_behavior:
+    enable: true
 user:
   name: postgres
   password: password
@@ -70,15 +73,16 @@ seed)
   # The maintenance runs whether or not the parent was aged (lead review 62430d8bf..b49fb656a MED 10): the age commit
   # (--allow-empty: nothing changed at AGE=0), then dolt_gc; the server's GC-related settings are recorded beside it.
   psqlc -At -c "SELECT dolt_commit('-am', 'age', '--allow-empty')"
-  psqlc -At -c "SELECT name, setting FROM pg_settings WHERE name LIKE '%gc%'" >"$DATA.gc-settings.txt" 2>&1 ||
-    echo "rc=$? (not read)" >>"$DATA.gc-settings.txt"
+  # (the probe: Doltgres 1.4.0's pg_settings holds no GC row at all, so the record is read through SHOW)
+  { gcv=$(psqlc -At -c "SHOW dolt_auto_gc_enabled" 2>&1) && echo "dolt_auto_gc_enabled|$gcv"; } >"$DATA.gc-settings.txt" ||
+    echo "rc=$? (not read): $gcv" >>"$DATA.gc-settings.txt"
   # comp review 1 LOW 28: the record is judged (empty, failed or GC-less is refused); run_system.sh fails the job on it
   "$FT_PY" -B "$FT_HERE/fthelp.py" gcsettings "$DATA.gc-settings.txt" >"$DATA.gc-settings.verdict" || true
   # dolt_gc, judged by an allowlist (lead review 62430d8bf..b49fb656a MED 9: the old check exempted any error text
   # matching lost|terminat, which hides real errors): client rc 0, its output exactly the status (0 or {0}), and no
   # panic in the server log written since the CALL (fthelp.py gcverdict); the store size on both sides of it.
   gc_before=$(du -sB1 "$DATA/databases" | cut -f1)
-  gc_log0=$(stat -c %s "$LOG")
+  gc_log0=$(file_size "$LOG")
   gcrc=0
   psqlc -At -c "SELECT dolt_gc()" >"$DATA.gc.txt" 2>&1 || gcrc=$?
   tail -c +$((gc_log0 + 1)) "$LOG" >"$DATA.gc.log"

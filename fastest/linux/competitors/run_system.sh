@@ -393,6 +393,12 @@ timedrun_check() {
   # the lead's LOW 21 ruling: the cell's prebranch (N, clients, bound) goes into timed.json; beyond 1,000 it is
   # exploratory, never credited
   echo "prebranch=$PREBRANCH prebranch_c=$PREBRANCH_C prebranch_s=$PREBRANCH_S" >"$1/prebranch.txt"
+  # the one raw.tsv schema (raw_schema.py; VM --dry-block defect 2), checked on what each run actually wrote
+  local rs
+  for rs in "$1/bb/raw.tsv" "$1/timed/raw.tsv"; do
+    [ -e "$rs" ] || continue
+    python3 -B "$HERE/raw_schema.py" header "$rs" >"$rs.schema.txt" 2>&1 || fail "$3: $rs: $(tail -1 "$rs.schema.txt")"
+  done
   python3 "$HERE/timedrun.py" check "$1" "$2" "$WARMUP" "${LIVE0:-unknown}" "$CAP_S" "$DRY" >"$1/timed.check.txt" 2>&1 || fail "$3 timed run: $(tail -c 400 "$1/timed.check.txt")"
   if [ -d "$1/timed" ] && python3 "$FH" ops "$1/timed" 1 >"$1/timed.ops.txt" 2>"$1/timed.ops.err" &&
     ops_line_ok "$1/timed.ops.txt"; then :; else  # LOW 26: three counts, or the job FAILS
@@ -422,7 +428,7 @@ run_server_cell() { # run_server_cell SPEC C
   if [ "$KIND" = pg ]; then template_idle || fail "$spec-c$c: a backend stayed on template p for 30 s"; fi
   used0=$(fsused)
   local log0 log1
-  log0=$(stat -c %s "$DATA.log")
+  log0=$(file_size "$DATA.log")
   live_mark "$d" label_before
   strace_attach "$d/load" "$(server_pid)" || { fail "$spec-c$c load attach"; return; }
   rc=0
@@ -430,7 +436,7 @@ run_server_cell() { # run_server_cell SPEC C
   # Nothing but a stat between the ops and the window's end (tsplit for PG, the detach otherwise): fsused's
   # `sync -f` and df ran inside the window and stretched load_s (third review, finding 5); it now runs after it. The
   # end stamp itself is a pipe round-trip to trace.sh's stamper, not an interpreter start (clock_pair).
-  log1=$(stat -c %s "$DATA.log")
+  log1=$(file_size "$DATA.log")
   local defer=() tw=()
   if [ "$KIND" = pg ]; then
     # The deferred window is part of a PG cell (for WAL_LOG it holds most of the cost). It runs INSIDE the load
@@ -470,9 +476,9 @@ run_server_cell() { # run_server_cell SPEC C
   bb_args "$spec" "$c" "$n" "$d/timed"
   live_mark "$d" timed_before
   local tlog0 tlog1
-  tlog0=$(stat -c %s "$DATA.log")
+  tlog0=$(file_size "$DATA.log")
   timed_run "$d/timed" "$(server_pid)" -- "${BBA[@]}" >/dev/null || true
-  tlog1=$(stat -c %s "$DATA.log")
+  tlog1=$(file_size "$DATA.log")
   live_mark "$d" timed_after
   # LOW 15: the timed run's own server log and, for PG, its template waits (amendment 14 section 6's flag covered only
   # the labelling run): recorded in timed.template_waits.txt, read into timed.json, and FLAGGED like the labelling run's

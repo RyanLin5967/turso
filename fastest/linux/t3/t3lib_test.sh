@@ -4,6 +4,10 @@
 # t3run's selftests stage runs it. Exit 0 iff every case holds.
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
+# TEST EDIT, flagged (the first --dry-block run, 2026-10-15: t3run exports T3_IDENTITY_MODE=virtio and its selftests
+# stage ran this file under it, so the default-refusal case saw the virtio identity): every case starts from no mode,
+# and the cases that need it set it themselves
+unset T3_IDENTITY_MODE
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
 source "$HERE/t3lib.sh"
@@ -60,6 +64,10 @@ check "a model-only line does not list a drive" '! plp_listed "$T/sys" nvme0n1 "
 # devguard round-2 attack LOW 4: every mkfs and wipefs reaches the device preflight checked, by its resolved path.
 # A refusal is rc 2 exactly, so a missing function (127) or a crash cannot pass as one.
 refuses2() { "$@"; [ $? = 2 ]; }
+# a case that needs Linux (/proc, Linux device numbers, mkfs.ext4 with sudo) says so: off Linux it is N/A-on-<platform>,
+# printed and never counted as a pass (gates/platforms.tsv, the platform-inheritance class, 2026-10-15)
+na=0
+linux_check() { if [ "$(uname -s)" = Linux ]; then check "$@"; else na=$((na + 1)); echo "T3LIB self-test N/A-on-$(uname -s | tr A-Z a-z): $1"; fi; }
 mkdir -p "$T/dev"; : > "$T/dev/nvme1n1"; : > "$T/dev/nvme2n1"
 REAL1=$(readlink -f "$T/dev/nvme1n1")
 ln -sfn "$T/dev/nvme1n1" "$T/dev/by-id-x"
@@ -113,6 +121,25 @@ echo "ST4000NM" > "$T/sys/block/sdc/device/model"; echo "SN04" > "$T/sys/block/s
 printf '\000\200\000\010ZC10XYZ9' > "$T/sys/block/sdc/device/vpd_pg80"
 check "MED 3: a SCSI disk's identity takes the device wwid, the printable vpd_pg80 serial and rev" \
   '[ "$(dev_identity "$T/sys" sdc)" = "wwid=naa.5000c500${NL}dev=8:32${NL}model=ST4000NM${NL}serial=ZC10XYZ9${NL}firmware=SN04" ]'
+# --dry-block on a VM (its first probe, 2026-10-15, lima vz): a virtio-blk disk has no wwid, model, serial or firmware
+# in sysfs (block/serial is empty), so dev_identity refuses it. Under T3_IDENTITY_MODE=virtio, which t3run sets only
+# for a DRY-VIRT run, a virtio-blk disk (device/modalias virtio:d00000002...) is identified by its diskseq, which the
+# kernel gives each disk it attaches and never reuses while it runs, plus its MAJ:MIN and the virtio vendor
+mkdir -p "$T/sys/block/vdb/device"; echo 253:16 > "$T/sys/block/vdb/dev"; echo 10 > "$T/sys/block/vdb/diskseq"
+: > "$T/sys/block/vdb/serial"; echo 0x1af4 > "$T/sys/block/vdb/device/vendor"
+echo "virtio:d00000002v00001AF4" > "$T/sys/block/vdb/device/modalias"
+check "dry-block: a virtio-blk disk with no wwid still refuses by default (rc 2, naming wwid): a real run is unchanged" \
+  'refuses2 dev_identity "$T/sys" vdb && grep -q wwid "$T/out.txt"'
+check "dry-block: under T3_IDENTITY_MODE=virtio a virtio-blk disk is its diskseq, MAJ:MIN and vendor" \
+  '[ "$(T3_IDENTITY_MODE=virtio dev_identity "$T/sys" vdb)" = "wwid=virtio-diskseq:10${NL}dev=253:16${NL}model=virtio-blk 0x1af4${NL}serial=diskseq-10${NL}firmware=virtio" ]'
+mkdir -p "$T/sys/block/sdz/device"; echo 8:96 > "$T/sys/block/sdz/dev"; echo 11 > "$T/sys/block/sdz/diskseq"
+check "dry-block: under T3_IDENTITY_MODE=virtio a disk that is not virtio-blk still refuses (rc 2)" \
+  'refuses2 env T3_IDENTITY_MODE=virtio bash -c "source \"$HERE/t3lib.sh\"; dev_identity \"$T/sys\" sdz"'
+check "dry-block: under T3_IDENTITY_MODE=virtio a virtio-blk disk with no diskseq refuses (rc 2)" \
+  'mv "$T/sys/block/vdb/diskseq" "$T/vdb-diskseq"; refuses2 env T3_IDENTITY_MODE=virtio bash -c "source \"$HERE/t3lib.sh\"; dev_identity \"$T/sys\" vdb"; r=$?; mv "$T/vdb-diskseq" "$T/sys/block/vdb/diskseq"; [ $r = 0 ]'
+check "dry-block: a re-attached virtio disk (diskseq 10 -> 12) is not the recorded one: dev_unchanged's identity check refuses" \
+  'T3_IDENTITY_MODE=virtio dev_identity "$T/sys" vdb > "$T/idv.txt" && echo 12 > "$T/sys/block/vdb/diskseq" &&
+   now=$(T3_IDENTITY_MODE=virtio dev_identity "$T/sys" vdb) && [ "$now" != "$(cat "$T/idv.txt")" ]; r=$?; echo 10 > "$T/sys/block/vdb/diskseq"; [ $r = 0 ]'
 ident nvme6n1 "" 259:6 PM9A3 S2 GDC5
 check "MED 3: an empty wwid refuses (rc 2)" 'refuses2 dev_identity "$T/sys" nvme6n1 && grep -q wwid "$T/out.txt"'
 ident nvme7n1 eui.0007 259:7 PM9A3 "" GDC5
@@ -137,7 +164,7 @@ FAKE_RDEV=259:9
 check "LOW 5: the node's own MAJ:MIN (259:9) is not the recorded dev=259:5: refuses (rc 2), naming dev=" \
   'refuses2 dev_unchanged "$T/dev/nvme5n1" "$REAL5" "$T/sys" nvme5n1 "$T/id5.txt" && grep -q "dev=259:5" "$T/out.txt"'
 FAKE_RDEV=""
-check "LOW 5: production t3_rdev reads a real node's MAJ:MIN in decimal (/dev/null is 1:3)" \
+linux_check "LOW 5: production t3_rdev reads a real node's MAJ:MIN in decimal (/dev/null is 1:3)" \
   '( source "$HERE/t3lib.sh"; [ "$(t3_rdev /dev/null)" = 1:3 ] )'
 # review 6 LOW 21: vpd_pg80's 4-byte header (its length byte is printable for a 32-126 byte serial) is not the serial
 mkdir -p "$T/sys/block/sdd/device"; echo 8:48 > "$T/sys/block/sdd/dev"; echo "naa.5000c501" > "$T/sys/block/sdd/device/wwid"
@@ -189,6 +216,30 @@ FAKE_MKFS_UUID=u-other
 check "LOW 6: a mkfs that did not take the given UUID refuses before mount, and the made record names what was asked" \
   'refuses2 dm && grep -q UUID "$T/out.txt" && [ "$(steps)" = "$P$G$M$U" ] && [ "$(cat "$T/made.txt")" = "xfs U-1" ]'
 FAKE_MKFS_UUID=""
+# the lead's --dry-block ruling (DECISIONS, 2026-10-15): a dry run on a VM's virtual disk passes REG = DRY-VIRT, which
+# skips the A17 registration (a dry run is never credited; t3run passes it only under --dry-block, and the stamp is
+# refused for credit by summarize); every other step and refusal of device_make is unchanged
+echo "write back" > "$T/sys/block/nvme5n1/queue/write_cache"
+dmv() { : > "$HL"; rm -f "$T/made.txt"; FAKE_TYPE="" FAKE_UUID="" FAKE_MOUNTED=""
+        device_make "$T/dev/nvme5n1" "$REAL5" "$T/sys" nvme5n1 "$T/id5.txt" no DRY-VIRT xfs U-1 /mnt/t3-xfs "$T/made.txt"; }
+check "dry-block: device_make with REG DRY-VIRT on a write-back drive with nothing registered makes and mounts it, in order" \
+  'dmv && [ "$(steps)" = "$P$G${M}mount xfs $REAL5 /mnt/t3-xfs,$U" ] && grep -q "DRY-VIRT" "$T/out.txt"'
+ident nvme5n1 eui.0099 259:5 PM9A3 S1 GDC5
+check "dry-block: DRY-VIRT keeps the identity refusal (a changed wwid refuses, rc 2, no mkfs)" \
+  'refuses2 dmv && grep -q wwid "$T/out.txt" && [ "$(steps)" = "$P$G$U" ]'
+ident nvme5n1 eui.0001 259:5 PM9A3 S1 GDC5
+echo "write through" > "$T/sys/block/nvme5n1/queue/write_cache"
+# virt_ok MODE VIRT: a real run refuses any virtualization (gate-6 review 8, unchanged); --dry-block allows it
+check "dry-block: virt_ok real none passes" 'virt_ok real none'
+for v in apple kvm qemu microsoft vmware ""; do
+  check "dry-block: virt_ok real '$v' refuses (rc 2), naming bare metal" "refuses2 virt_ok real '$v' && grep -q 'bare metal' \"\$T/out.txt\""
+done
+check "dry-block: virt_ok dryblock apple passes (the VM is the point)" 'virt_ok dryblock apple'
+check "dry-block: virt_ok with an unknown mode refuses (rc 2)" 'refuses2 virt_ok frobnicate none'
+# host_room_ok FREE_KB [MIN_GB]: the Mac host must have at least 35 GiB free before a VM dry run builds
+check "dry-block: host_room_ok 35 GiB free passes" 'host_room_ok $((35 * 1024 * 1024))'
+check "dry-block: host_room_ok 1 KiB under 35 GiB refuses (rc 2), naming 35" 'refuses2 host_room_ok $((35 * 1024 * 1024 - 1)) && grep -q 35 "$T/out.txt"'
+check "dry-block: host_room_ok on a reading that is no number refuses (rc 2)" 'refuses2 host_room_ok "n/a"'
 FAKE_MKFS="ident nvme5n1 eui.0099 259:5 PM9A3 S9 GDC5"
 check "MED 1: the drive changes between mkfs and mount: refuses (rc 2), no mount" 'refuses2 dm && [ "$(steps)" = "$P$G$M$U" ]'
 FAKE_MKFS=""; ident nvme5n1 eui.0001 259:5 PM9A3 S1 GDC5
@@ -231,7 +282,7 @@ check "LOW 4: production t3_pin on a node it cannot open refuses (rc 2) and leav
   '( source "$HERE/t3lib.sh"; sudo() { shift; "$@"; }; t3_pin "$T/no-such-node"; [ $? = 2 ] && [ -z "${T3PIN_PID:-}" ] )'
 # the real probe on a real filesystem (review 6 LOW 6: the test replaced t3_blkid outright, so its body never ran)
 U6=0b9e2d6c-3f1a-4c7e-9a55-0d3c6a1f2e47
-check "LOW 6: production t3_blkid reads TYPE and UUID from a real ext4 image (needs mkfs.ext4 and sudo -n)" \
+linux_check "LOW 6: production t3_blkid reads TYPE and UUID from a real ext4 image (needs mkfs.ext4 and sudo -n)" \
   '( source "$HERE/t3lib.sh"; command -v mkfs.ext4 > /dev/null || { echo "mkfs.ext4 missing"; exit 1; }
      truncate -s 8M "$T/img" && mkfs.ext4 -q -F -U "$U6" "$T/img" &&
      [ "$(t3_blkid TYPE "$T/img")" = ext4 ] && [ "$(t3_blkid UUID "$T/img")" = "$U6" ] )'
@@ -248,11 +299,11 @@ swrun() { local d=$T/sw$1; shift; mkdir -p "$d"; ( source "$SW" && ours_timed_ru
 swnums() { awk '{for (i = 1; i <= NF; i++) { split($i, kv, "="); if (kv[1] == "t0") a = kv[2]; if (kv[1] == "t1") b = kv[2] }}
                 END { print a, b }' "$1/timed.window"; awk '$1 == "SWEEP" { if (f == "") f = $3; l = $3 } END { print f, l }' \
                 "$1/timed.tracer.tsv"; }
-check "MED 12: ours_timed_run returns the command's rc (3) and records its window, t0 < t1, both inside the sweeps" \
+linux_check "MED 12: ours_timed_run returns the command's rc (3) and records its window, t0 < t1, both inside the sweeps" \
   'swrun 1 bash -c "sleep 0.5; exit 3"; [ $? = 3 ] && grep -q "^sweeper pid=[0-9]* nice=19 " "$T/sw1/timed.tracer.tsv" &&
    grep -q " rc=3$" "$T/sw1/timed.window" &&
    swnums "$T/sw1" | tr "\n" " " | awk "{ exit !(\$1 < \$2 && \$3 <= \$1 && \$2 <= \$4) }"'
-check "MED 12: the one reader accepts that record over that window (sweeper_record.py record, rc 0)" \
+linux_check "MED 12: the one reader accepts that record over that window (sweeper_record.py record, rc 0)" \
   'python3 -B "$SR" record "$T/sw1/timed.tracer.tsv" $(swnums "$T/sw1" | head -1)'
 # TEST EDIT, flagged as a SPEC CHANGE (bb96279f3: fastest_profile stamps its measured span): the record is read over
 # result/summary.json's tm0/tm1_realtime_s, here the wrapper's own bounds (inside the sweeps), not the process window
@@ -260,7 +311,7 @@ swsum() { mkdir -p "$1/result"; awk '{for (i = 1; i <= NF; i++) { split($i, kv, 
           if (kv[1] == "t1") b = kv[2] }} END { printf "{\"tm0_realtime_s\": %s, \"tm1_realtime_s\": %s}\n", a, b }' \
           "$1/timed.window" > "$1/result/summary.json"; }
 swsum "$T/sw1"
-check "MED 12: ours_timed_record writes timed.json: sweeper_cpu_s a number over the MEASURED span, the reader's own value" \
+linux_check "MED 12: ours_timed_record writes timed.json: sweeper_cpu_s a number over the MEASURED span, the reader's own value" \
   '( source "$HERE/t3lib.sh"; ours_timed_record "$T/sw1" "$SR" ) && python3 -B -c "
 import json, sys; sys.path.insert(0, \"$HERE/../gates\"); import sweeper_record as s
 j = json.load(open(\"$T/sw1/timed.json\")); m = json.load(open(\"$T/sw1/result/summary.json\"))
@@ -275,7 +326,7 @@ check "MED 12: a sweeper whose start sweep never comes: refused (rc 2) within it
   '( mkdir -p "$T/sw3"; source "$SW"; sweeper_start() { SWEEPER_PID=""; }; sweeper_wait() { :; }
      ours_timed_run "$T/sw3" touch "$T/sw3/ran" ); [ $? = 2 ] && [ ! -e "$T/sw3/ran" ] &&
    grep -q "no start sweep" "$T/sw3/timed.window"'
-check "MED 12: a record the reader refuses (the sweeper at nice 0) gives timed.json sweeper_cpu_s null and the reason" \
+linux_check "MED 12: a record the reader refuses (the sweeper at nice 0) gives timed.json sweeper_cpu_s null and the reason" \
   'mkdir -p "$T/sw4" && sed "s/ nice=19 / nice=0 /" "$T/sw1/timed.tracer.tsv" > "$T/sw4/timed.tracer.tsv" &&
    cp "$T/sw1/timed.window" "$T/sw4/" && swsum "$T/sw4" && ! ( source "$HERE/t3lib.sh"; ours_timed_record "$T/sw4" "$SR" ) &&
    python3 -B -c "import json, sys; j = json.load(open(\"$T/sw4/timed.json\"))
@@ -289,7 +340,7 @@ cat > "$T/sw6-env.sh" << 'EOF'
 p=$(awk '$1 == "sweeper" { sub(/^pid=/, "", $2); print $2 }' "$1/timed.tracer.tsv")
 [ -n "$p" ] && tr '\0' '\n' < "/proc/$p/environ" | grep -qx "FASTEST_CELL=$2"
 EOF
-check "MED 12: ours_timed_exec's sweeper carries the exported FASTEST_CELL in its exec-time environ (sut, as theirs)" \
+linux_check "MED 12: ours_timed_exec's sweeper carries the exported FASTEST_CELL in its exec-time environ (sut, as theirs)" \
   '( export FASTEST_CELL=sw6-cell; ours_timed_exec "$T/sw6" bash "$T/sw6-env.sh" "$T/sw6" sw6-cell ) &&
    grep -q " rc=0$" "$T/sw6/timed.window"'
 check "MED 12: ours_timed_exec with no gates/sweeper.sh beside t3lib.sh refuses (rc 2), the command never ran" \
@@ -299,7 +350,7 @@ check "MED 12 fix 7: ours_timed_exec whose gates/sweeper.sh fails to source refu
   'mkdir -p "$T/lib8/t3" "$T/lib8/gates" "$T/sw8" && cp "$HERE/t3lib.sh" "$T/lib8/t3/" &&
    echo "return 1" > "$T/lib8/gates/sweeper.sh" &&
    ( source "$T/lib8/t3/t3lib.sh"; ours_timed_exec "$T/sw8" touch "$T/sw8/ran" ); [ $? = 2 ] && [ ! -e "$T/sw8/ran" ]'
-check "MED 12: no window (the run never stamped one) gives timed.json sweeper_cpu_s null, naming the window" \
+linux_check "MED 12: no window (the run never stamped one) gives timed.json sweeper_cpu_s null, naming the window" \
   'mkdir -p "$T/sw5" && cp "$T/sw1/timed.tracer.tsv" "$T/sw5/" && ! ( source "$HERE/t3lib.sh"; ours_timed_record "$T/sw5" "$SR" ) &&
    python3 -B -c "import json, sys; j = json.load(open(\"$T/sw5/timed.json\"))
 sys.exit(not (j[\"sweeper_cpu_s\"] is None and \"window\" in (j[\"sweeper_refused\"] or \"\")))"'
@@ -328,5 +379,73 @@ check "measured span: a span ending after the process window gives sweeper_cpu_s
 j = json.load(open(\"$T/rec3/timed.json\"))
 sys.exit(not (j[\"sweeper_cpu_s\"] is None and \"outside\" in (j[\"sweeper_refused\"] or \"\")))"'
 
-echo "T3LIB SELF-TEST $pass/$((pass + fail)) $([ $fail = 0 ] && echo PASS || echo FAIL)"
+# CLASS: the host acts during a measured window (the second full --dry-block run, 2026-10-15, btrfs pg18: an
+# unattended-upgrade, started by apt-daily.timer, voided attempt 1 as foreign CPU; lima-guestagent's SyncTime stepped
+# CLOCK_REALTIME every 10-20 s, "drift was 117.942399ms" in its journal, and stracecount refused the windows). The one
+# design change: host_quiet stops every active systemd timer and every known clock adjuster before the first cell,
+# then MEASURES the outcome (CLOCK_REALTIME minus CLOCK_MONOTONIC must hold still over a watch) and refuses
+# otherwise; host_unquiet restarts what it stopped. Faked here: systemctl (T3_SYSTEMCTL) and the clock (T3_CLOCKDELTA)
+mkdir -p "$T/sc/active" "$T/sc/sticky"
+cat > "$T/systemctl" <<'SC'
+#!/bin/bash
+D=$(dirname "$0")/sc
+echo "$*" >> "$D/calls.txt"
+case $1 in
+  list-timers) [ -f "$D/timers.broken" ] && exit 1; cat "$D/timers.txt" ;;
+  is-active) if [ -e "$D/active/$2" ]; then echo active; else echo inactive; exit 3; fi ;;
+  stop) [ -e "$D/sticky/$2" ] || rm -f "$D/active/$2" ;;
+  start) touch "$D/active/$2" ;;
+  *) exit 2 ;;
+esac
+SC
+chmod +x "$T/systemctl"
+cat > "$T/clockdelta" <<'CD'
+#!/bin/bash
+f=$(dirname "$0")/clock.n; n=$(cat "$f" 2>/dev/null || echo 0); echo $((n + 1)) > "$f"
+sed -n "$((n + 1))p" "$(dirname "$0")/clock.txt"
+CD
+chmod +x "$T/clockdelta"
+quiet_setup() { # quiet_setup "ACTIVE UNITS" "STICKY UNITS" "CLOCK VALUES"
+  rm -rf "$T/sc/active" "$T/sc/sticky" "$T/sc/calls.txt" "$T/sc/timers.broken" "$T/clock.n" "$T/quiet.tsv"
+  mkdir -p "$T/sc/active" "$T/sc/sticky"
+  local u; for u in $1; do touch "$T/sc/active/$u"; done; for u in $2; do touch "$T/sc/sticky/$u"; done
+  printf '%s\n' $3 > "$T/clock.txt"
+  printf '%s\n' \
+    "Fri 2026-10-16 06:14:21 EDT 10h Thu 2026-10-15 09:29:18 EDT - apt-daily-upgrade.timer apt-daily-upgrade.service" \
+    "Fri 2026-10-16 16:06:44 EDT 20h Thu 2026-10-15 18:55:34 EDT 21min ago apt-daily.timer apt-daily.service" \
+    "- - - - snapd.snap-repair.timer snapd.snap-repair.service" > "$T/sc/timers.txt"
+}
+QENV='T3_SYSTEMCTL=$T/systemctl T3_CLOCKDELTA=$T/clockdelta T3_QUIET_WATCH_S=0'
+quiet_setup "apt-daily.timer apt-daily.service apt-daily-upgrade.timer systemd-timesyncd lima-guestagent" "" "0.5 0.5"
+check "host_quiet stops each active timer, its running service and each active clock adjuster, records them, rc 0" \
+  "env $QENV \"$BASH\" -c 'source \"\$0\"; host_quiet \"\$1\"' \"$HERE/t3lib.sh\" \"$T/quiet.tsv\" &&
+   [ -z \"\$(ls \"$T/sc/active\")\" ] && grep -qx \"timer${TAB}apt-daily.timer\" \"$T/quiet.tsv\" &&
+   grep -qx \"service${TAB}apt-daily.service\" \"$T/quiet.tsv\" && grep -qx \"clock${TAB}lima-guestagent\" \"$T/quiet.tsv\" &&
+   grep -qx \"clock${TAB}systemd-timesyncd\" \"$T/quiet.tsv\" && ! grep -q snap-repair \"$T/quiet.tsv\""
+check "host_unquiet restarts exactly the timers and clock adjusters it stopped (a timer starts its service itself)" \
+  "env $QENV \"$BASH\" -c 'source \"\$0\"; host_unquiet \"\$1\"' \"$HERE/t3lib.sh\" \"$T/quiet.tsv\" &&
+   [ \"\$(ls \"$T/sc/active\" | tr '\n' ' ')\" = 'apt-daily-upgrade.timer apt-daily.timer lima-guestagent systemd-timesyncd ' ]"
+quiet_setup "apt-daily.timer" "apt-daily.timer" "0.5 0.5"
+check "a timer still active after its stop refuses, naming it" \
+  "! env $QENV \"$BASH\" -c 'source \"\$0\"; host_quiet \"\$1\"' \"$HERE/t3lib.sh\" \"$T/quiet.tsv\" && grep -q 'apt-daily.timer' \"$T/out.txt\""
+quiet_setup "chrony" "chrony" "0.5 0.5"
+check "a clock adjuster still active after its stop refuses, naming it" \
+  "! env $QENV \"$BASH\" -c 'source \"\$0\"; host_quiet \"\$1\"' \"$HERE/t3lib.sh\" \"$T/quiet.tsv\" && grep -q chrony \"$T/out.txt\""
+quiet_setup "" "" "0.5 0.62"
+check "the outcome: CLOCK_REALTIME moving 0.12 s against MONOTONIC over the watch, every adjuster stopped, refuses" \
+  "! env $QENV \"$BASH\" -c 'source \"\$0\"; host_quiet \"\$1\"' \"$HERE/t3lib.sh\" \"$T/quiet.tsv\" && grep -q CLOCK_REALTIME \"$T/out.txt\""
+quiet_setup "" "" "0.5"
+check "an unreadable clock sample refuses (never a pass)" \
+  "! env $QENV \"$BASH\" -c 'source \"\$0\"; host_quiet \"\$1\"' \"$HERE/t3lib.sh\" \"$T/quiet.tsv\""
+quiet_setup "" "" ""
+# dry run 10 (2026-10-16): the stage refused "cannot sample the clocks ('' then '')" -- every case above fakes the
+# clock, so none ran the default sampler, whose quoting had broken. This one runs the real sampler (python3's
+# CLOCK_REALTIME and CLOCK_MONOTONIC, both on macOS and Linux)
+check "the DEFAULT clock sampler (no T3_CLOCKDELTA) samples, and a still clock passes" \
+  "env -u T3_CLOCKDELTA T3_SYSTEMCTL=$T/systemctl T3_QUIET_WATCH_S=0 T3_QUIET_MAX_S=0.05 \"\$BASH\" -c 'source \"\$0\"; host_quiet \"\$1\"' \"$HERE/t3lib.sh\" \"$T/quiet.tsv\""
+quiet_setup "" "" "0.5 0.5"; touch "$T/sc/timers.broken"
+check "systemctl list-timers failing refuses (the guard cannot read its input)" \
+  "! env $QENV \"$BASH\" -c 'source \"\$0\"; host_quiet \"\$1\"' \"$HERE/t3lib.sh\" \"$T/quiet.tsv\""
+
+echo "T3LIB SELF-TEST $pass/$((pass + fail)) $([ $fail = 0 ] && echo PASS || echo FAIL)$([ $na = 0 ] || echo " ($na N/A-on-$(uname -s | tr A-Z a-z))")"
 [ $fail = 0 ]
