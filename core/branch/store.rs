@@ -1940,6 +1940,8 @@ struct CatState {
     /// row, relinking only around its own changes. Not kept across opens: an older build may have
     /// checkpointed in between, so every open fills again from the first row.
     links_prefilled: bool,
+    /// Link fill threads this store started (observing only; links adversary 3 L2).
+    links_fill_starts: u64,
     /// Checkpoint and settle counters (observing only).
     ckpt: CkptCounters,
     /// The part of `trunk_probes`/`trunk_rows` made by `trunk_written_known`'s once-per-page probe
@@ -2252,6 +2254,7 @@ impl CatState {
             filling: false,
             links_cursor: None,
             links_prefilled: false,
+            links_fill_starts: 0,
             ckpt: CkptCounters::default(),
             catalog,
             dirty: HashMap::new(),
@@ -3728,7 +3731,19 @@ fn run_links_fill(shared: &StoreMutex, writer: &Mutex<Catalog>, group: &Group) {
         };
         let batch = {
             let mut w = writer.lock();
-            let done = w.begin().and_then(|()| w.upgrade_links_batch(cursor, super::catalog::UPGRADE_BATCH)).and_then(|next| {
+            #[cfg(test)]
+            let failed = LINKS_FILL_FAILS.load(Ordering::Acquire);
+            #[cfg(not(test))]
+            let failed = false;
+            let done = w
+                .begin()
+                .and_then(|()| {
+                    if failed {
+                        return Err(LimboError::InternalError("test hook: the link fill's batch failed".to_string()));
+                    }
+                    w.upgrade_links_batch(cursor, super::catalog::UPGRADE_BATCH)
+                })
+                .and_then(|next| {
                 w.commit()?;
                 Ok(next)
             });
@@ -3740,6 +3755,13 @@ fn run_links_fill(shared: &StoreMutex, writer: &Mutex<Catalog>, group: &Group) {
         };
         if batch.is_ok() {
             kill_point("ckpt.upgrade.batch");
+            #[cfg(test)]
+            {
+                let ms = LINKS_FILL_PAUSE_MS.load(Ordering::Acquire);
+                if ms > 0 {
+                    std::thread::sleep(Duration::from_millis(ms));
+                }
+            }
         }
         if matches!(batch, Ok(None)) && !fe_mutant("l4_fill_wal_left") {
             truncate_catalog_wal(&mut writer.lock(), group, None);
@@ -3764,6 +3786,14 @@ fn run_links_fill(shared: &StoreMutex, writer: &Mutex<Catalog>, group: &Group) {
         }
     }
 }
+
+/// Test builds (links adversary 3; knobs, read by the fill thread): a pause after each of its
+/// batches (a slow fill, so a session can close before it ends), and a failure of its batches. Set
+/// only in a test's own child process.
+#[cfg(test)]
+pub(crate) static LINKS_FILL_PAUSE_MS: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+pub(crate) static LINKS_FILL_FAILS: AtomicBool = AtomicBool::new(false);
 
 /// A fuzzy checkpoint's cut, after its catalog commit and before its install, holding no lock but
 /// briefly the store mutex (lead review 1 item 7, review 2 #5): wait — not holding the mutex — for
@@ -6121,6 +6151,7 @@ impl BranchStore {
         match spawned {
             Ok(handle) => {
                 *self.links_fill.lock() = Some(handle);
+                cat.links_fill_starts += 1;
                 true
             }
             Err(e) => {
@@ -8989,6 +9020,12 @@ impl BranchStore {
         let known = inner.branches.iter().filter(|(_, st)| st.links.is_some()).count() as u64;
         let format = inner.cat.as_mut().and_then(|c| c.catalog.meta().ok().flatten()).map(|m| m.format);
         (known, format)
+    }
+
+    /// Test builds (links adversary 3): `(filling, prefilled, fill threads started)`.
+    #[cfg(test)]
+    pub(crate) fn links_fill_state_for_test(&self) -> (bool, bool, u64) {
+        self.inner.lock().cat.as_ref().map_or((false, false, 0), |c| (c.filling, c.links_prefilled, c.links_fill_starts))
     }
 
     /// Test builds (links adversary L1): the child index's splice records, `moved` and `relinked`,

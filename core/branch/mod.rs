@@ -1827,6 +1827,10 @@ mod format_authority_tests;
 #[cfg(all(test, feature = "fs"))]
 mod l4_nested_tests;
 
+// Links adversary 3 (DECISIONS 65eb410760): the bounded fill's progress across sessions and under pressure.
+#[cfg(all(test, feature = "fs"))]
+mod links_sessions_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
