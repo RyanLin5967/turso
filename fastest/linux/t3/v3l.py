@@ -1336,6 +1336,15 @@ def self_test():
          _ok(lambda: _plant(plants(rec(delta=20003))[0], "wb-layer-half").get("fired") is True
              and _has(_plant(plants(rec(delta=20003))[0], "wb-layer-half")["got"], "write-back loop layer",
                       "per fsync the labelling run showed"))),
+        # the C27 MED fix's caller (found re-summarizing dry run 11's real records, 2026-10-16): a plant whose base adds
+        # a loop layer must sync it in EVERY sync record the gates now read, the A27 pair's included, or the base
+        # fails and the plant reports NOT-RUN; every plant must run on a record carrying a pair, as real ones do
+        ("C27 caller: plant wb-layer-half fires on a record carrying an A27 pair (its sync covers the planted layer)",
+         _ok(lambda: _plant(plants(_lab(rec(delta=20003, mode="real", pair=(20004, 20004)), 20004))[0],
+                            "wb-layer-half").get("fired") is True)),
+        ("C27 caller: on a record carrying an A27 pair no plant is NOT-RUN",
+         _ok(lambda: not [p_ for p_ in plants(_lab(rec(delta=20003, mode="real", pair=(20004, 20004)), 20004))[0]
+                          if str(p_.get("why", "")).startswith("NOT-RUN")])),
         ("item 4: plant wb-layer-half fires on a record with a real write-back loop layer",
          _ok(lambda: _plant(plants(_lab(rec(delta=20003, layers=[{"name": "loop3", "write_cache": "write back",
                                                                   "flush_ios_delta": 20003,
