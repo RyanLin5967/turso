@@ -147,12 +147,23 @@ impl<'a> Backoff<'a> {
         }
     }
 
-    /// Sleep the schedule's next delay and say so, or say false, without sleeping, when the delay
-    /// would end past the lock wait: then the next attempt is the last. Err(Interrupt) when the
-    /// session's cancel or statement_timeout stops the statement, before or after the sleep.
     fn wait(&mut self) -> turso_core::Result<bool> {
+        let Some(interrupts) = self.interrupts else {
+            return Ok(false);
+        };
+        self.wait_in(WaitMode::Statement(interrupts))
+    }
+
+    /// A post-write Busy must finish: dropping it can commit its rows, so reporting 57014
+    /// would tell the client a committed write failed (C37 M2, lead ruling for C42).
+    fn wait_for_commit_completion(&mut self) -> bool {
+        self.wait_in(WaitMode::CommitCompletion)
+            .expect("commit completion does not check statement interrupts")
+    }
+
+    fn wait_in(&mut self, mode: WaitMode<'_>) -> turso_core::Result<bool> {
         const DELAYS_MS: [u64; 12] = [1, 2, 5, 10, 15, 20, 25, 25, 25, 50, 50, 100];
-        self.stop_if_interrupted()?;
+        mode.check()?;
         let now = std::time::Instant::now();
         let deadline = *self.deadline.get_or_insert(now + self.lock_wait);
         let delay =
@@ -161,25 +172,12 @@ impl<'a> Backoff<'a> {
         if now + delay > deadline {
             return Ok(false);
         }
-        std::thread::sleep(delay);
-        self.stop_if_interrupted()?;
+        let waits = &self
+            .interrupts
+            .expect("a waiting backoff has a session")
+            .waits;
+        drop(waits.wait_while(waits.uses(), now + delay, mode, |_| true)?);
         Ok(true)
-    }
-
-    /// [`Backoff::wait`] that no cancel or statement_timeout ends, for a statement that changed
-    /// rows (see [`run_waiting`]).
-    fn wait_uninterrupted(&mut self) -> bool {
-        let interrupts = self.interrupts.take();
-        let waited = self.wait();
-        self.interrupts = interrupts;
-        waited.expect("a wait with no interrupts never stops")
-    }
-
-    fn stop_if_interrupted(&self) -> turso_core::Result<()> {
-        match self.interrupts {
-            Some(interrupts) if interrupts.should_stop() => Err(LimboError::Interrupt),
-            _ => Ok(()),
-        }
     }
 }
 
@@ -204,7 +202,7 @@ fn run_waiting(
             // dropped here the engine's reset commits them, so a 57014 would report a write that
             // was committed (fresh-context review of the ultrareview fixes).
             Err(LimboError::Busy) if stmt.n_change() > 0 => {
-                if !backoff.wait_uninterrupted() {
+                if !backoff.wait_for_commit_completion() {
                     return Err(LimboError::Busy);
                 }
             }
@@ -222,15 +220,8 @@ struct Shared {
     lock_wait: std::time::Duration,
     /// Sessions admitted and not yet ended.
     live: AtomicUsize,
-    /// The named branches a session is on, or that a delete is releasing: a delete is refused
-    /// while a session is on the branch (55006, as PostgreSQL refuses DROP DATABASE of a database in
-    /// use), and a switch while the branch is being deleted. One hash operation under the lock per
-    /// switch, per leave and two per delete; no engine call is made under it.
-    in_use: Mutex<std::collections::HashMap<compact_str::CompactString, BranchUse>>,
-    /// Signalled when an entry leaves `in_use`, for a delete waiting on a session that is closing.
-    in_use_freed: std::sync::Condvar,
-    /// Threads waiting on `in_use_freed`: a release signals only when there is one, so an
-    /// uncontended switch or delete wakes nobody.
+    waits: Arc<SessionWaits>,
+    /// A branch release signals only if a branch wait is active.
     in_use_waiters: AtomicUsize,
     /// How long a claim or a delete waits on `in_use`: IN_USE_WAIT (a field so a unit test can
     /// shorten it).
@@ -286,6 +277,7 @@ impl SessionSockets {
 /// (every PROGRESS_OPS virtual-machine steps), and stops the statement with an interrupt (57014).
 /// A cancel that arrives between statements is dropped, as PostgreSQL drops it.
 struct Interrupts {
+    waits: Arc<SessionWaits>,
     cancel: std::sync::atomic::AtomicBool,
     /// The running statement's deadline, in microseconds since `base`; 0 none.
     deadline_us: AtomicU64,
@@ -302,8 +294,9 @@ thread_local! {
 }
 
 impl Interrupts {
-    fn new() -> Self {
+    fn new(waits: Arc<SessionWaits>) -> Self {
         Self {
+            waits,
             cancel: std::sync::atomic::AtomicBool::new(false),
             deadline_us: AtomicU64::new(0),
             base: std::time::Instant::now(),
@@ -322,6 +315,14 @@ impl Interrupts {
         self.deadline_us.store(deadline, Ordering::Relaxed);
         INTERRUPT_CAUSE.with(|c| c.set(0));
         InterruptsArmed(self)
+    }
+
+    fn request_cancel(&self) {
+        // Hold the wait's mutex across flag + notification so its check-to-sleep transition
+        // cannot lose this wakeup.
+        let _uses = self.waits.uses();
+        self.cancel.store(true, Ordering::Relaxed);
+        self.waits.changed.notify_all();
     }
 
     /// The progress handler's question: stop the running statement?
@@ -366,7 +367,7 @@ impl pgwire::api::cancel::CancelHandler for CancelSessions {
             .get(&(request.pid, secret))
             .and_then(std::sync::Weak::upgrade);
         if let Some(interrupts) = target {
-            interrupts.cancel.store(true, Ordering::Relaxed);
+            interrupts.request_cancel();
         }
     }
 }
@@ -376,8 +377,6 @@ impl pgwire::api::cancel::CancelHandler for CancelSessions {
 /// 50 x 100 ms).
 const IN_USE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// How often a statement's in-use wait looks at its cancel and statement_timeout.
-const IN_USE_SLICE: std::time::Duration = std::time::Duration::from_millis(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BranchUse {
@@ -398,8 +397,7 @@ impl Shared {
             max_connections,
             lock_wait,
             live: AtomicUsize::new(0),
-            in_use: Mutex::new(std::collections::HashMap::new()),
-            in_use_freed: std::sync::Condvar::new(),
+            waits: Arc::new(SessionWaits::default()),
             in_use_waiters: AtomicUsize::new(0),
             in_use_wait: IN_USE_WAIT,
             cancels: Mutex::new(std::collections::HashMap::new()),
@@ -409,22 +407,19 @@ impl Shared {
         }
     }
 
-    fn uses(&self) -> MutexGuard<'_, std::collections::HashMap<compact_str::CompactString, BranchUse>> {
-        self.in_use.lock().unwrap_or_else(|e| e.into_inner())
+    fn uses(
+        &self,
+    ) -> MutexGuard<'_, std::collections::HashMap<compact_str::CompactString, BranchUse>> {
+        self.waits.uses()
     }
 
-    /// The map once `name` is in none of `states` there, or at the wait's end: what a closing session
-    /// or a running delete leaves behind is waited out, not refused (wire review 3 item 4). The wait
-    /// is its session's statement's: with `interrupts`, a cancel or statement_timeout ends it with
-    /// 57014, checked every IN_USE_SLICE (Claude C37 M1: both were ignored for the whole wait, the
-    /// class of ultrareview finding 9).
     #[allow(clippy::type_complexity)]
     fn wait_while<'a>(
         &'a self,
-        mut uses: MutexGuard<'a, std::collections::HashMap<compact_str::CompactString, BranchUse>>,
+        uses: MutexGuard<'a, std::collections::HashMap<compact_str::CompactString, BranchUse>>,
         name: &str,
         states: &[BranchUse],
-        interrupts: Option<&Interrupts>,
+        interrupts: &Interrupts,
     ) -> SqlResult<MutexGuard<'a, std::collections::HashMap<compact_str::CompactString, BranchUse>>>
     {
         let held = |uses: &std::collections::HashMap<compact_str::CompactString, BranchUse>| {
@@ -433,31 +428,15 @@ impl Shared {
         if !held(&uses) {
             return Ok(uses);
         }
-        let stopped = || interrupts.is_some_and(Interrupts::should_stop);
         self.in_use_waiters.fetch_add(1, Ordering::SeqCst);
-        let deadline = std::time::Instant::now() + self.in_use_wait;
-        let mut interrupted = false;
-        while held(&uses) {
-            if stopped() {
-                interrupted = true;
-                break;
-            }
-            let left = deadline.saturating_duration_since(std::time::Instant::now());
-            if left.is_zero() {
-                break;
-            }
-            let slice = if interrupts.is_some() { left.min(IN_USE_SLICE) } else { left };
-            uses = self
-                .in_use_freed
-                .wait_timeout(uses, slice)
-                .unwrap_or_else(|e| e.into_inner())
-                .0;
-        }
+        let result = self.waits.wait_while(
+            uses,
+            std::time::Instant::now() + self.in_use_wait,
+            WaitMode::Statement(interrupts),
+            held,
+        );
         self.in_use_waiters.fetch_sub(1, Ordering::SeqCst);
-        if interrupted {
-            return Err(engine_info(&LimboError::Interrupt));
-        }
-        Ok(uses)
+        result.map_err(|e| engine_info(&e))
     }
 
     /// Claim `name` for a session about to connect to it. One session per branch: a branch another
@@ -465,12 +444,13 @@ impl Shared {
     /// waits, then refused with 55006. Refused at once, a reconnect right after a close met 55006
     /// whenever the closed session's thread had not yet released the branch (wire review 6 item
     /// 5); only a refusal pays the wait (lead ruling).
+    #[cfg(test)]
     fn claim(&self, name: &str, severity: &str) -> SqlResult<()> {
-        self.claim_for(name, severity, None)
+        self.claim_for(name, severity, &Interrupts::new(self.waits.clone()))
     }
 
     /// [`Shared::claim`] for a statement: its cancel or statement_timeout ends the wait.
-    fn claim_for(&self, name: &str, severity: &str, interrupts: Option<&Interrupts>) -> SqlResult<()> {
+    fn claim_for(&self, name: &str, severity: &str, interrupts: &Interrupts) -> SqlResult<()> {
         let mut uses =
             self.wait_while(self.uses(), name, &[BranchUse::Held, BranchUse::Deleting], interrupts)?;
         if let Some(u) = uses.get(name) {
@@ -487,7 +467,7 @@ impl Shared {
     fn release(&self, name: &str) {
         self.uses().remove(name);
         if self.in_use_waiters.load(Ordering::SeqCst) > 0 {
-            self.in_use_freed.notify_all();
+            self.waits.changed.notify_all();
         }
     }
 
@@ -495,11 +475,11 @@ impl Shared {
     /// closing releases it within that), then refused with 55006.
     #[cfg(test)]
     fn begin_delete(&self, name: &str) -> SqlResult<()> {
-        self.begin_delete_for(name, None)
+        self.begin_delete_for(name, &Interrupts::new(self.waits.clone()))
     }
 
     /// [`Shared::begin_delete`] for a statement: its cancel or statement_timeout ends the wait.
-    fn begin_delete_for(&self, name: &str, interrupts: Option<&Interrupts>) -> SqlResult<()> {
+    fn begin_delete_for(&self, name: &str, interrupts: &Interrupts) -> SqlResult<()> {
         let mut uses =
             self.wait_while(self.uses(), name, &[BranchUse::Held, BranchUse::Deleting], interrupts)?;
         if let Some(u) = uses.get(name) {
@@ -507,6 +487,81 @@ impl Shared {
         }
         uses.insert(name.into(), BranchUse::Deleting);
         Ok(())
+    }
+}
+
+#[derive(Default)]
+struct SessionWaits {
+    // This is the existing branch-use mutex and condition variable, shared with backoff and
+    // cancellation. No engine operation runs while the map is locked.
+    in_use: Mutex<std::collections::HashMap<compact_str::CompactString, BranchUse>>,
+    changed: std::sync::Condvar,
+}
+
+impl SessionWaits {
+    fn uses(
+        &self,
+    ) -> MutexGuard<'_, std::collections::HashMap<compact_str::CompactString, BranchUse>> {
+        self.in_use.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn wait_while<'a>(
+        &self,
+        mut uses: MutexGuard<'a, std::collections::HashMap<compact_str::CompactString, BranchUse>>,
+        deadline: std::time::Instant,
+        mode: WaitMode<'_>,
+        mut waiting: impl FnMut(
+            &std::collections::HashMap<compact_str::CompactString, BranchUse>,
+        ) -> bool,
+    ) -> turso_core::Result<
+        MutexGuard<'a, std::collections::HashMap<compact_str::CompactString, BranchUse>>,
+    > {
+        loop {
+            mode.check()?;
+            if !waiting(&uses) {
+                return Ok(uses);
+            }
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return Ok(uses);
+            }
+            let left = mode.remaining(left);
+            uses = self
+                .changed
+                .wait_timeout(uses, left)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum WaitMode<'a> {
+    Statement(&'a Interrupts),
+    /// Only after a statement changed rows: reset may commit them, so finishing avoids
+    /// returning 57014 for a write that committed.
+    CommitCompletion,
+}
+
+impl WaitMode<'_> {
+    fn check(self) -> turso_core::Result<()> {
+        match self {
+            Self::Statement(interrupts) if interrupts.should_stop() => Err(LimboError::Interrupt),
+            _ => Ok(()),
+        }
+    }
+
+    fn remaining(self, own: std::time::Duration) -> std::time::Duration {
+        if let Self::Statement(interrupts) = self {
+            let deadline = interrupts.deadline_us.load(Ordering::Relaxed);
+            if deadline != 0 {
+                let elapsed = interrupts.base.elapsed().as_micros().min(u64::MAX as u128) as u64;
+                return own.min(std::time::Duration::from_micros(
+                    deadline.saturating_sub(elapsed),
+                ));
+            }
+        }
+        own
     }
 }
 
@@ -557,7 +612,7 @@ impl TursoPgServer {
             .values()
             .filter_map(std::sync::Weak::upgrade)
         {
-            interrupts.cancel.store(true, Ordering::Relaxed);
+            interrupts.request_cancel();
         }
         let shut = self.shared.sessions.shut_all();
         let threads = std::mem::take(&mut *self.threads.lock().unwrap_or_else(|e| e.into_inner()));
@@ -1324,7 +1379,7 @@ static CHECKPOINTS_SKIPPED: AtomicU64 = AtomicU64::new(0);
 
 impl Session {
     fn new(shared: Arc<Shared>) -> Self {
-        let interrupts = Arc::new(Interrupts::new());
+        let interrupts = Arc::new(Interrupts::new(shared.waits.clone()));
         let pid = shared.next_pid.fetch_add(1, Ordering::Relaxed);
         // The secret from the OS's CSPRNG (one draw per session): only a client that read the
         // BackendKeyData can cancel the session, and a CancelRequest must name both. A session
@@ -1501,7 +1556,7 @@ impl Session {
             return Ok(());
         }
         self.shared
-            .claim(branch, "FATAL")
+            .claim_for(branch, "FATAL", &self.interrupts)
             .map_err(PgWireError::UserError)?;
         let conn = match self.waiting(|| self.shared.db.connect_named(branch)) {
             Ok(conn) => conn,
@@ -2540,7 +2595,7 @@ impl Session {
                     // Dropping the branch's connection closes the branch for connections.
                     st.branch.take()
                 } else {
-                    self.shared.claim_for(&name, "ERROR", Some(&self.interrupts))?;
+                    self.shared.claim_for(&name, "ERROR", &self.interrupts)?;
                     let opened = match self.waiting(|| self.shared.db.connect_named(&name)) {
                         Ok(opened) => opened,
                         Err(e) => {
@@ -2569,7 +2624,7 @@ impl Session {
                 ),
             )),
             _ => {
-                self.shared.begin_delete_for(&name, Some(&self.interrupts))?;
+                self.shared.begin_delete_for(&name, &self.interrupts)?;
                 let dropped = self.waiting(|| self.shared.db.drop_branch(&name));
                 self.shared.release(&name);
                 match dropped {
@@ -7783,3 +7838,6 @@ mod tests {
         assert_eq!(s.in_use_waiters.load(Ordering::SeqCst), 0);
     }
 }
+
+#[cfg(test)]
+mod wait_tests;
