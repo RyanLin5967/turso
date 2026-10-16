@@ -13315,3 +13315,17 @@ fn c54_information_schema_lists_not_null_as_check() {
     assert_eq!(r.oids, Some(vec![1043]));
     assert_eq!(a.q("SELECT count(*) FROM information_schema.key_column_usage WHERE table_name='s'").single("only key columns"), "3");
 }
+
+#[test]
+fn c54_settings_metadata_is_explicitly_unsupported() {
+    let dir = Scratch::new("c54-settings-metadata");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in ["SELECT name, boot_val, reset_val, source FROM pg_settings", "SELECT name, boot_val, reset_val, source FROM pg_catalog.pg_settings"] {
+        assert_eq!(a.q(sql).err(sql).code, "0A000", "{sql}");
+    }
+    assert_eq!(a.q("WITH pg_settings AS (SELECT 1 AS value) SELECT value FROM pg_settings").single("CTE shadows catalog"), "1");
+    a.q("CREATE TABLE pg_settings(value INT); INSERT INTO public.pg_settings VALUES (7)").ok("public relation");
+    assert_eq!(a.q("SELECT value FROM public.pg_settings").single("explicit public relation"), "7");
+    assert_eq!(a.q("SHOW client_encoding").single("existing settings"), "UTF8");
+}
