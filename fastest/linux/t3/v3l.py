@@ -1046,11 +1046,35 @@ def _runs_box(lab1, lab2, calls, bad_second=None):
     box.update({"subprocess": types.SimpleNamespace(run=run, CompletedProcess=subprocess.CompletedProcess,
                                                     TimeoutExpired=subprocess.TimeoutExpired),
                 "flush_ios": flush, "sectors_written": lambda _d: 0,
-                "sync_record": lambda **_k: {"ran": True, "rc": 0, "layers": [{"path": "/fs0", "rc": 0, "secs": 0.0}]}})
+                # TEST EDIT, flagged (C27 MED): the fake sync covers exactly the paths it is asked to sync (it named /fs0
+                # whatever it was given); measure() now judges the second labelling sync's coverage before that run
+                "sync_record": lambda paths=(), **_k: {"ran": True, "rc": 0,
+                                                       "layers": [{"path": p, "rc": 0, "secs": 0.0} for p in paths]}})
     return box
 
 
 _LEAF = {"leaf": {"disk": "nvme1n1", "drive_reports": "write back"}, "virtualization": {"virtualized": False}}
+
+
+def _lab2sync(r, sy):
+    """R with its A27 pair's sync record (the sync before the second labelling run) replaced by SY (None: removed)"""
+    lp = r["arms"]["fsync"]["lab_pair"]
+    lp.pop("sync", None)
+    if sy is not None:
+        lp["sync"] = sy
+    return r
+
+
+def _sync_fails_at(box, k):
+    """BOX whose K-th sync_record call (1-based) returns a sync that did not run (rc 1, no layers); measure() makes
+    them in order: the fsync arm's labelling sync (1), its A27 second labelling sync (2), its timed sync (3)"""
+    n, ok = [0], box["sync_record"]
+
+    def sr(**kw):
+        n[0] += 1
+        return {"ran": False, "rc": 1, "layers": []} if n[0] == k else ok(**kw)
+    box["sync_record"] = sr
+    return box
 
 
 def _with_global(name, value, f):
@@ -1156,6 +1180,10 @@ def self_test():
         if pair is not None:
             fa = r["arms"]["fsync"]
             fa["lab_pair"] = {"first": pair[0], "second": pair[1], "problem": pair[2] if len(pair) > 2 else None}
+            # TEST EDIT, flagged (C27 MED): the pair carries the sync before its second labelling run, as measure()
+            # records it, at its passing value (a copy of the labelling run's); gates() now judges it
+            if sync is not None:
+                fa["lab_pair"]["sync"] = json.loads(json.dumps(dict(sync)))
             fa["v1l_2"], fa["labelling_fio_2"] = dict(fa["v1l"]), dict(fa["labelling_fio"])
         return r
 
@@ -1517,6 +1545,25 @@ def self_test():
                           "drive nvme1n1:", "annex A27"))),
         ("finding 4: a real record with a bound pair (20004/20004, its labelling count) is VALID",
          _ok(lambda: gates(_lab(rec(delta=20003, mode="real", pair=(20004, 20004)), 20004)) == [])),
+        # C27 MED (annex A24/A24-AM1 on A27's second labelling run): the sync before it is judged like the others
+        ("C27: a real record whose A27 second labelling sync never ran (rc 1) VOIDs, naming the second labelling run",
+         _ok(lambda: _has(gates(_lab2sync(_lab(rec(delta=20003, mode="real", pair=(20004, 20004)), 20004),
+                                          {"ran": False, "rc": 1, "layers": []})),
+                          "drive nvme1n1:", "A27 second labelling"))),
+        ("C27 plant: a second labelling sync whose sync -f covered /elsewhere, not /fs0, VOIDs naming it",
+         _ok(lambda: _has(gates(_lab2sync(_lab(rec(delta=20003, mode="real", pair=(20004, 20004)), 20004),
+                                          {"ran": True, "rc": 0, "layers": [{"path": "/elsewhere", "rc": 0, "secs": 0.0}]})),
+                          "drive nvme1n1:", "A27 second labelling", "/elsewhere"))),
+        ("C27: a record whose pair carries no sync record VOIDs",
+         _ok(lambda: _has(gates(_lab2sync(_lab(rec(delta=20003, mode="real", pair=(20004, 20004)), 20004), None)),
+                          "drive nvme1n1:", "no sync record for the A27 second labelling"))),
+        ("C27: measure(), real, the second labelling run's sync fails: refuses naming it, before that run (1 run made)",
+         _ok(lambda: (lambda calls: (lambda r: r[0] is not None and "A27 second labelling" in r[0] and len(calls) == 1)(
+             _measure_with(_sync_fails_at(_runs_box(20000, 20000, calls), 2), env={"V3L_REAL": "1"}, leaf=_LEAF)))([]))),
+        ("C27: measure(), dry, the same failed sync is recorded and the record VOIDs naming the second labelling run",
+         _ok(lambda: (lambda r: r[0] is None and r[2] is not None
+                      and any("A27 second labelling" in x for x in gates(r[2])))(
+             _measure_with(_sync_fails_at(_runs_box(20000, 20000, []), 2), env={"V3L_REAL": "0"}, leaf=_LEAF)))),
         ("finding 4: a real record whose pair's first count (19000) is not its labelling count (20004) VOIDs",
          _ok(lambda: _has(gates(_lab(rec(delta=20003, mode="real", pair=(19000, 19000)), 20004)),
                           "drive nvme1n1:", "is not its labelling count"))),
