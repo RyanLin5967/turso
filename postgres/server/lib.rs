@@ -3918,7 +3918,9 @@ impl SimpleQueryHandler for Session {
                 }
                 Response::Error(e) => {
                     // A query that failed while running: its RowDescription and rows first.
-                    if let Some(started) = self.state().started.take() {
+                    // Taken before the awaits: the session state's guard is not Send.
+                    let started = self.state().started.take();
+                    if let Some(started) = started {
                         let fields = started.header.iter().map(Into::into).collect();
                         client
                             .feed(PgWireBackendMessage::RowDescription(RowDescription::new(
@@ -4249,7 +4251,9 @@ impl ExtendedQueryHandler for Session {
                 // PostgreSQL sends them (an Execute sends no RowDescription; Describe did, when it
                 // was asked).
                 if done.is_err() {
-                    if let Some(started) = self.state().started.take() {
+                    // Taken before the awaits: the session state's guard is not Send.
+                    let started = self.state().started.take();
+                    if let Some(started) = started {
                         for row in started.rows {
                             client.feed(PgWireBackendMessage::DataRow(row)).await?;
                         }
@@ -7890,4 +7894,5 @@ mod tests {
 
 #[cfg(test)]
 mod wait_tests;
+#[cfg(test)]
 mod shutdown_tests;
