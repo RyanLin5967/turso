@@ -885,7 +885,7 @@ def self_test():
              ours_fixture="plan", comp_info="plan", expected=("c1-create", "c1-m1"), verdict_text=None,
              boundary_bins=None, garbage_v3l=None, v3l_plants_record=None, conformance="match", backsteps=0,
              loop="closed", v3l_mode="dry", ours_sweeper="ok", comp_sweeper=0.04, ours_counters="ok", ours_tm="ok", ours_tp="ok",
-             stamp=None, mode_dry="1"):
+             stamp=None, mode_dry="1", fire_na=None):
         out = os.path.join(root, "out")
         conformance_files(out, conformance)
         w(f"{out}/stages.tsv", "stage\tstart_utc\tend_utc\tseconds\trc\nfs-xfs\ta\tb\t5\t0\nTOTAL\ta\tb\t9\t0\n")
@@ -971,6 +971,13 @@ def self_test():
                 w(f"{f}/v3-firecheck/verdict.json", vt)
                 w(f"{f}/v3-{when}/binary.txt", f"v3floor_sha256={'e' * 64}\nbound=fire-checked: /runner/fs-xfs/v3-firecheck/"
                                                f"verdict.json\nverdict_sha256={hashlib.sha256(vt.encode()).hexdigest()}\n")
+        if fire_na is not None:  # the V3 fire-check's verdict, one rule marked N/A when fire_na names it (rule-3 (b))
+            chk_ = [{"id": "F1b:real-all", "pass": True}, {"id": "F4:R_leaf_remote", "pass": True}]
+            for c_ in chk_:
+                if c_["id"] == fire_na:
+                    c_.update(na=True, detail={"why": "not applicable: a virtio_blk leaf has no SCSI host or NVMe "
+                                                      "transport, and the probe ruled it virtualized"})
+            w(f"{f}/v3-firecheck/verdict.json", json.dumps({"v3floor_sha256": "e" * 64, "checks": chk_}))
         if drift is not None:
             d = round(a25_after - 300.0, 1) if drift_json_us is None else drift_json_us
             dj = {"outcome": drift, "arms": {"append25": {"start_p50_us": 300.0, "end_p50_us": a25_after, "drift_us": d}},
@@ -1192,6 +1199,15 @@ def self_test():
         # the lead's --dry-block ruling (DECISIONS, 2026-10-15): a dry run on a VM's virtual disk is stamped DRY-VIRT, and
         # summarize refuses it for credit; every dry run is uncreditable, and a DRY-VIRT stamp on a run that says it
         # is real is a contradiction that fails the package
+        # the lead's rule-3 condition (b), 2026-10-15: a fire-check rule judged not applicable (F4:R_leaf_remote on a
+        # virtio_blk leaf the probe ruled virtualized) is marked N/A in the package (na_rules) and refuses credit
+        ("rule-3 (b): a fire-check verdict holding an N/A rule lists it in na_rules and refuses credit, naming it",
+         {"fire_na": "F4:R_leaf_remote"}, True,
+         lambda s: s.get("na_rules") == ["xfs: F4:R_leaf_remote"] and s.get("creditable") is False
+         and any("N/A" in x and "F4:R_leaf_remote" in x for x in s.get("credit_refusals") or [])),
+        ("rule-3 (b) control: a fire-check verdict with no N/A rule lists none and adds no N/A credit refusal",
+         {"fire_na": "none"}, True,
+         lambda s: s.get("na_rules") == [] and not any("N/A" in x for x in s.get("credit_refusals") or [])),
         ("dry-block: a DRY-VIRT dry package passes as a dry run and is refused for credit, naming DRY-VIRT",
          {"stamp": "DRY-VIRT"}, True, lambda s: s.get("stamp") == "DRY-VIRT" and s.get("creditable") is False
          and any("DRY-VIRT" in x for x in s.get("credit_refusals") or [])),

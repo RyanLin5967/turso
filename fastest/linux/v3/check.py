@@ -1123,6 +1123,20 @@ def self_test():
         not leaf_remote_ok(*neither, dict(vio, leaf={"driver": "brd"}))[0])
     chk("leaf remote: a virtio_blk leaf whose plant somehow ran is judged by the plant's rule (rc 0: fails)",
         not leaf_remote_ok(0, "", "faked=sd_host host0", "", False, vio)[0])
+    # the lead's rule-3 condition (a), 2026-10-15: the rule still FAILS for an unplantable leaf on a box NOT ruled
+    # virtualized (bare metal: virtualized False, as well as not ruled out: None) and for a leaf that is not virtio
+    chk("rule-3 (a): an unplantable virtio_blk leaf on a box ruled NOT virtualized (False) fails",
+        not leaf_remote_ok(*neither, dict(vio, virtualization={"virtualized": False}))[0])
+    for drv in ("sd", "nvme", "brd", "dm", None):
+        chk("rule-3 (a): an unplanted non-virtio leaf (%r) on a box ruled virtualized fails" % (drv,),
+            not leaf_remote_ok(*neither, dict(vio, leaf={"driver": drv}))[0])
+    # condition (b): the not-applicable verdict is marked as such, so the package can refuse credit for it
+    chk("rule-3 (b): only the not-applicable verdict carries na True",
+        leaf_remote_ok(*neither, vio)[2] is True and leaf_remote_ok(*neither, dict(vio, leaf={"driver": "sd"}))[2] is False
+        and leaf_remote_ok(2, "the leaf sda is on SCSI host 'tcm_loopback'", "faked=sd_host host0",
+                           "proc_name=tcm_loopback", False, {"leaf": {"driver": "sd"}})[2] is False)
+    chk("rule-3 (b): the verdict lists its N/A rules",
+        na_rules([{"id": "A", "pass": True}, {"id": "F4:R_leaf_remote", "pass": True, "na": True}]) == ["F4:R_leaf_remote"])
     chk("leaf remote: an sd plant refused as wanted passes (the old rule)",
         leaf_remote_ok(2, "the leaf sda is on SCSI host 'tcm_loopback'", "faked=sd_host host0",
                        "proc_name=tcm_loopback", False, {"leaf": {"driver": "sd"}})[0])
