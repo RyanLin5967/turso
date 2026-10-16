@@ -2304,24 +2304,28 @@ const MAIN: [&str; 3] = ["n10_small", "n1e4_small", "n10_large"];
 
 type Map = BTreeMap<String, u64>;
 
-/// `op`'s quiet samples in `c`. Refuses when there are none, or when fewer than half are quiet: a
-/// budget read from a few samples is not one.
+/// Whether a sample is decided: its quiet flag is 1. A sample without the flag is refused, never
+/// taken as quiet (DECISIONS 994f7d41e0, the MEASUREMENT class).
+fn decided(c: &CellData, op: &str, s: &Map) -> bool {
+    *s.get("quiet").unwrap_or_else(|| panic!("{}: {op}: a sample has no quiet flag", c.name)) == 1
+}
+
+/// `op`'s samples in `c`, every one of them decided. C58 / probe-adversary-2 H1 (DECISIONS
+/// 5fba71112e: a budget verdict needs EVERY sample decided): a budget read from the decided subset
+/// passed while the refused samples were exactly the expensive ones (plant4: every third create
+/// over budget, refused because it also woke a thread). So ANY refused sample makes the budget
+/// REFUSED, a failure reported as such and never green; a run gives a verdict only in the regime
+/// where no foreign thread runs in a window. No samples at all is refused too.
 fn quiet<'a>(c: &'a CellData, op: &str) -> Vec<&'a Map> {
     let all = c.ops.get(op).map(Vec::as_slice).unwrap_or_default();
-    // DECISIONS 994f7d41e0 (the MEASUREMENT class): a sample without its quiet flag is refused, not
-    // taken as quiet.
-    let quiet: Vec<&Map> = all
-        .iter()
-        .filter(|s| *s.get("quiet").unwrap_or_else(|| panic!("{}: {op}: a sample has no quiet flag", c.name)) == 1)
-        .collect();
+    let refused = all.iter().filter(|s| !decided(c, op, s)).count();
     assert!(
-        !quiet.is_empty() && 2 * quiet.len() >= all.len(),
-        "{}: {op}: {} of {} samples quiet: not enough to read a budget from",
+        !all.is_empty() && refused == 0,
+        "REFUSED (no verdict): {}: {op}: {refused} of {} samples refused; a budget verdict needs every sample decided (C58)",
         c.name,
-        quiet.len(),
         all.len()
     );
-    quiet
+    all.iter().collect()
 }
 
 /// `key` in every sample; refuses when one lacks it (a counter the run did not produce is not a
@@ -3819,15 +3823,19 @@ fn leap_l4_an_open_holds_the_store_mutex_for_no_o_n_work() {
 /// The confirm arm's rounds as pairs `(a, reference)` of the same round, both quiet (review 2 H6: the
 /// rounds are paired by index and the LARGEST difference is budgeted; comparing two minimums hid a
 /// cost paid in all but one round). Samples are kept in the order they were measured, one of each op
-/// per round, so the j-th of each op is the j-th round. Refused when fewer than half the pairs are
-/// quiet, as `quiet` refuses.
+/// per round, so the j-th of each op is the j-th round. REFUSED when any pair has a refused sample,
+/// as `quiet` refuses (C58: every sample decided).
 fn confirm_pairs<'a>(c: &'a CellData, op: &str) -> Vec<(&'a Map, &'a Map)> {
     let (a, r) = (&c.ops[op], &c.ops["confirm_reference"]);
     assert_eq!(a.len(), r.len(), "{}: {op} and confirm_reference rounds differ", c.name);
-    let q = |s: &Map| *s.get("quiet").unwrap_or_else(|| panic!("{}: {op}: a round has no quiet flag", c.name)) == 1;
-    let pairs: Vec<(&Map, &Map)> = a.iter().zip(r).filter(|(x, y)| q(x) && q(y)).collect();
-    assert!(!pairs.is_empty() && 2 * pairs.len() >= a.len(), "{}: {op}: {} of {} round pairs quiet", c.name, pairs.len(), a.len());
-    pairs
+    let refused = a.iter().zip(r).filter(|(x, y)| !(decided(c, op, x) && decided(c, "confirm_reference", y))).count();
+    assert!(
+        !a.is_empty() && refused == 0,
+        "REFUSED (no verdict): {}: {op}: {refused} of {} round pairs have a refused sample; a budget verdict needs every sample decided (C58)",
+        c.name,
+        a.len()
+    );
+    a.iter().zip(r).collect()
 }
 
 /// The largest `x[k] - y[k]` over the pairs, as a signed number.
