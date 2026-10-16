@@ -5606,6 +5606,9 @@ fn is_create_table_as(upper: &str) -> bool {
 #[cfg(test)]
 mod crash_batch_tests;
 
+#[cfg(test)]
+mod sqlstate_tests;
+
 /// This crate's tests count allocations per thread (the per-statement allocation budget's
 /// in-process tests).
 #[cfg(test)]
