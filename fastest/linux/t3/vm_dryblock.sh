@@ -4,7 +4,7 @@
 # stamped DRY-VIRT, which summarize refuses for credit. Item 6 is MET only when this passes end to end on xfs AND btrfs.
 #
 # Refuses (exit 2), before anything is created or started:
-#   - the Mac host has under 35 GiB free (t3lib.sh host_room_ok; the lead's floor);
+#   - the Mac host has under VM_HOST_MIN_GIB free (default 35, t3lib.sh host_room_ok; never under HOST_STOP_GIB);
 #   - the VM asks for more than 8 GiB of memory or 4 CPUs (the ruled ceiling);
 #   - limactl is missing.
 # Then: the VM fl-t3 (Ubuntu 24.04, made if absent) gets the data disk t3data (qcow2, sparse, DATA_GIB, made if
@@ -24,8 +24,14 @@ CPUS=${VM_CPUS:-4} MEM=${VM_MEM_GIB:-8} DATA=${DATA_GIB:-60} ROOT_MIN=${ROOT_MIN
 command -v limactl > /dev/null || { echo "vm_dryblock: REFUSED: limactl is not installed"; exit 2; }
 [[ $CPUS =~ ^[0-9]+$ && $MEM =~ ^[0-9]+$ ]] && [ "$CPUS" -le 4 ] && [ "$MEM" -le 8 ] ||
   { echo "vm_dryblock: REFUSED: the VM may have at most 4 CPUs and 8 GiB (asked $CPUS CPUs, $MEM GiB)"; exit 2; }
+# the launch guard, VM_HOST_MIN_GIB (default t3lib's 35; the lead's derived guard for run 12 was 32.7, so 33): never
+# below the in-run stop (HOST_STOP_GIB, 30), or the run would launch straight into its own stop. (An env
+# HOST_MIN_FREE_GB was silently overwritten by t3lib.sh's assignment: the guard is passed as host_room_ok's argument.)
+GUARD=${VM_HOST_MIN_GIB:-$HOST_MIN_FREE_GB}
+[[ $GUARD =~ ^[0-9]+$ ]] && [ "$GUARD" -ge "${HOST_STOP_GIB:-30}" ] ||
+  { echo "vm_dryblock: REFUSED: VM_HOST_MIN_GIB [$GUARD] is not a whole GiB at or above the in-run stop (${HOST_STOP_GIB:-30})"; exit 2; }
 free_kb=$(df -k / | awk 'NR == 2 { print $4 }')
-host_room_ok "$free_kb" || exit 2
+host_room_ok "$free_kb" "$GUARD" || exit 2
 mkdir -p "$OUTDIR" || exit 2
 # the same self-tests on THIS platform first, from the commit the VM will run (gates/run_everywhere.py over a git
 # archive of SHA): the Mac half of "every gate runs on both Mac and Linux"; t3run's selftests stage is the Linux half
