@@ -16826,6 +16826,7 @@ pub fn op_alter_column(
                         &target_db_name,
                         &old_column_name,
                         &new_name,
+                        conn.dialect().as_ref(),
                     )? {
                         rewrites.push((*db, view_name.clone(), rewritten));
                     }
@@ -16847,6 +16848,7 @@ pub fn op_alter_column(
                             &target_db_name,
                             &old_column_name,
                             &new_name,
+                            conn.dialect().as_ref(),
                         )? {
                             rewrites.push((crate::TEMP_DB_ID, view_name.clone(), rewritten));
                         }

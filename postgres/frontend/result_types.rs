@@ -222,7 +222,7 @@ pub struct Attached<'a> {
     pub holds: &'a dyn Fn(&str, &str) -> bool,
 }
 
-fn parameter_types_with(
+pub(crate) fn parameter_types_with(
     parse: &ParseResult,
     schema: &Schema,
     search_path: &[String],
@@ -973,7 +973,14 @@ impl Infer<'_> {
                     .collect(),
             )
         };
-        let sql = crate::catalog::decode_stored_pg_schema_sql(&view.sql).unwrap_or(&view.sql);
+        // The schema loader consumed the executable derivative; the existing
+        // inference authority reads original frontend source after types load.
+        let source = match crate::catalog::stored_view_source(&view.sql) {
+            Ok(source) => source.map(|(source, _)| source),
+            Err(_) => return None,
+        };
+        let sql = source.as_deref().unwrap_or_else(||
+            crate::catalog::decode_stored_pg_schema_sql(&view.sql).unwrap_or(&view.sql));
         let parsed = match turso_pg_parser::parse(sql) {
             Ok(parsed) => parsed,
             Err(turso_pg_parser::ParseError::StackDepthLimitExceeded) => {
@@ -1020,7 +1027,15 @@ impl Infer<'_> {
             missing_rte: Default::default(),
         };
         let columns = walk.select(query, &Vec::new());
-        Some(rename(columns, &v.aliases))
+        // Public view names come from its persisted schema contract, including
+        // implicit names and names fixed before a base-column rename. Inference
+        // supplies only their types. Never truncate or shift a mismatched shape.
+        if columns.len() != view.columns.len() || columns.iter().any(|(name, _)| name == STAR) {
+            return Some(view.columns.iter()
+                .map(|column| (column.name.clone().unwrap_or_default(), None)).collect());
+        }
+        Some(view.columns.iter().zip(columns).map(|(column, (_, ty))|
+            (column.name.clone().unwrap_or_default(), ty)).collect())
     }
 
     /// The relations a list of FROM items brings into scope, walking the subqueries, functions and
@@ -1582,7 +1597,16 @@ impl Infer<'_> {
                     }
                     self.expr(val, scope);
                     let name = if t.name.is_empty() {
-                        target_name(val)
+                        match turso_pg_parser::translator::figure_colname(val) {
+                            Ok(name) => name,
+                            Err(_) => {
+                                // FigureColname has only the shared depth refusal.
+                                // The enclosing inference reports that same error;
+                                // this placeholder is never published as metadata.
+                                self.stack_limited.set(true);
+                                "?column?".to_owned()
+                            }
+                        }
                     } else {
                         t.name.clone()
                     };
@@ -2104,24 +2128,6 @@ impl Infer<'_> {
         self.subselects.borrow().get(&(s as *const SelectStmt as usize)).copied().flatten()
     }
 
-}
-
-/// A target's output name when it has no alias, as PostgreSQL names it: a column reference's last
-/// field, a function's name, else "?column?".
-fn target_name(val: &PgNode) -> String {
-    match val.node.as_ref() {
-        Some(Node::ColumnRef(c)) => c
-            .fields
-            .last()
-            .and_then(|f| match f.node.as_ref() {
-                Some(Node::String(s)) => Some(s.sval.clone()),
-                _ => None,
-            })
-            .unwrap_or_else(|| "?column?".to_string()),
-        Some(Node::FuncCall(f)) => func_name(f).unwrap_or_else(|| "?column?".to_string()),
-        Some(Node::TypeCast(c)) => c.arg.as_deref().map_or("?column?".to_string(), target_name),
-        _ => "?column?".to_string(),
-    }
 }
 
 /// Columns renamed by an alias's column list (`AS d(a, b)`), the rest keeping their names.

@@ -306,6 +306,8 @@ pub fn translate_inner(
             temporary,
             if_not_exists,
             program,
+            input,
+            connection.dialect().as_ref(),
         )?,
         ast::Stmt::CreateMaterializedView {
             view_name,

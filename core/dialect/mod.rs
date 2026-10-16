@@ -89,6 +89,45 @@ pub trait Dialect: Send + Sync + 'static {
         body: &turso_parser::ast::CreateTableBody,
     ) -> crate::Result<String>;
 
+    /// Store a view's frontend source together with its canonical executable SQL.
+    /// SQLite keeps the prior canonical representation. Dialects can preserve
+    /// source that carries semantics absent from the executable representation.
+    fn format_view_sql(&self, _input: &str, canonical: &str) -> crate::Result<String> {
+        Ok(canonical.to_owned())
+    }
+
+    /// Read a persisted view's executable AST. This runs during schema loading,
+    /// before custom type definitions may be loaded, and must not infer types.
+    fn parse_view_sql_ast(&self, sql: &str) -> crate::Result<Option<turso_parser::ast::Cmd>> {
+        sqlite::parse(sql).map(|(cmd, _)| cmd)
+    }
+
+    /// Recover a persisted view for replay. Unlike fresh user SQL, an older
+    /// schema row may contain canonical executable text only. The dialect must
+    /// preserve that distinction when replay creates the new schema row.
+    fn view_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
+        Ok(sql.to_owned())
+    }
+
+    /// Prepare a view for the engine's existing scoped rename walker. A frontend
+    /// may annotate identifiers with source origins here, after schema loading.
+    /// The returned source must describe the returned AST: a dialect may make
+    /// implicit output contracts explicit before assigning identifier origins.
+    fn parse_view_sql_for_rewrite(
+        &self, sql: &str, _schema: &crate::schema::Schema,
+    ) -> crate::Result<(Option<turso_parser::ast::Cmd>, String)> {
+        Ok((self.parse_view_sql_ast(sql)?, sql.to_owned()))
+    }
+
+    /// Persist the scoped walker's rewritten view. A frontend uses preserved
+    /// identifier origins to update its source and executable form together.
+    fn format_rewritten_view_sql(
+        &self, _original: &str, rewritten: &turso_parser::ast::Stmt,
+        _renames: &[turso_parser::ast::NameRename],
+    ) -> crate::Result<String> {
+        Ok(rewritten.to_string())
+    }
+
     /// Produce stored SQL after the engine rewrites a `CREATE TABLE` AST.
     ///
     /// Schema rewrites cannot reuse the original frontend text because it no

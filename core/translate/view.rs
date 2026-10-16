@@ -318,6 +318,8 @@ pub fn translate_create_view(
     temporary: bool,
     if_not_exists: bool,
     program: &mut ProgramBuilder,
+    input: &str,
+    dialect: &dyn crate::dialect::Dialect,
 ) -> Result<()> {
     // TEMP views always live in the temp schema. The parser rejects
     // CREATE TEMP VIEW with a database name other than "temp".
@@ -376,8 +378,10 @@ pub fn translate_create_view(
 
     crate::util::validate_select_for_views(select_stmt, view_name.db_name.as_ref())?;
 
-    // Reconstruct the SQL string
-    let sql = create_view_to_str(&view_name.name.as_ident(), columns, select_stmt);
+    // The dialect retains original frontend semantics; the canonical form is
+    // still the executable schema representation, including during reload.
+    let canonical = create_view_to_str(&view_name.name.as_ident(), columns, select_stmt);
+    let sql = dialect.format_view_sql(input, &canonical)?;
 
     // Open cursor to sqlite_schema table
     let table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();

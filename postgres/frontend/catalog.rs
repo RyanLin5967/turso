@@ -20,6 +20,9 @@ const STORED_PG_SCHEMA_PREFIX: &str = "/* turso_frontend:postgres */ ";
 /// still this frontend's, so its rowid alias stays NOT NULL across a reparse (fastest-engine;
 /// engine review 20 HIGH 1). A reader unaware of it sees a leading comment and SQLite text.
 const STORED_PG_ALTERED_PREFIX: &str = "/* turso_frontend:postgres sqlite */ ";
+/// Transient replay input, never persisted: this view predates original-source
+/// storage and its SQL is only the executable SQLite definition.
+const REPLAY_PG_LEGACY_VIEW_PREFIX: &str = "/* turso_frontend:postgres view-sqlite-replay */ ";
 
 #[derive(Debug)]
 pub struct PostgresDialect;
@@ -30,6 +33,15 @@ impl Dialect for PostgresDialect {
     }
 
     fn parse(&self, sql: &str) -> Result<(Option<turso_parser::ast::Cmd>, usize)> {
+        if let Some(executable) = sql.strip_prefix(REPLAY_PG_LEGACY_VIEW_PREFIX) {
+            return turso_core::dialect::sqlite::parse(executable)
+                .map(|(cmd, consumed)| (cmd, REPLAY_PG_LEGACY_VIEW_PREFIX.len() + consumed));
+        }
+        if let Some((_, executable)) = stored_view_source(sql)? {
+            let prefix_len = sql.len() - executable.len();
+            return turso_core::dialect::sqlite::parse(executable)
+                .map(|(cmd, consumed)| (cmd, prefix_len + consumed));
+        }
         // Engine-generated helper statements and pragmas are canonical SQLite
         // text that pg_query rejects, so anything the PostgreSQL parser cannot
         // handle falls back to SQLite parsing.
@@ -166,6 +178,103 @@ impl Dialect for PostgresDialect {
         _body: &turso_parser::ast::CreateTableBody,
     ) -> Result<String> {
         Ok(encode_pg_schema_sql(input))
+    }
+
+    fn format_view_sql(&self, input: &str, canonical: &str) -> Result<String> {
+        if let Some(legacy) = input.strip_prefix(REPLAY_PG_LEGACY_VIEW_PREFIX) {
+            // Do not invent original PG source for an older executable-only row.
+            // Preserve its exact representation, including comments and quoting.
+            return Ok(legacy.to_owned());
+        }
+        // VACUUM replays the stored executable form through this same method.
+        // Reuse its source rather than treating the derivative as fresh input.
+        let source = stored_view_source(input)?.map(|(source, _)| source);
+        Ok(encode_view_source(source.as_deref().unwrap_or(input), canonical))
+    }
+
+    fn parse_view_sql_ast(&self, stored: &str) -> Result<Option<turso_parser::ast::Cmd>> {
+        let executable = stored_view_source(stored)?.map_or(stored, |(_, sql)| sql);
+        turso_core::dialect::sqlite::parse(executable).map(|(cmd, _)| cmd)
+    }
+
+    fn view_sql_for_replay(&self, stored: &str) -> Result<String> {
+        if stored_view_source(stored)?.is_some() {
+            Ok(stored.to_owned())
+        } else {
+            Ok(format!("{REPLAY_PG_LEGACY_VIEW_PREFIX}{stored}"))
+        }
+    }
+
+    fn parse_view_sql_for_rewrite(
+        &self, stored: &str, schema: &Schema,
+    ) -> Result<(Option<turso_parser::ast::Cmd>, String)> {
+        let Some((source, _)) = stored_view_source(stored)? else {
+            return Ok((self.parse_view_sql_ast(stored)?, stored.to_owned()));
+        };
+        turso_pg_parser::with_preparation_stack(&source, || {
+            let mut parsed = turso_pg_parser::parse(&source).map_err(crate::session::pg_parse_error)?;
+            // A view's output names are fixed when it is created, including names
+            // implicit in its original SELECT. Base-column rename must not rename
+            // those public view columns. Supply that existing schema contract to
+            // the same scoped rewriter as an explicit view column list.
+            if let Some(turso_pg_parser::pg_query::protobuf::node::Node::ViewStmt(view)) =
+                parsed.protobuf.stmts.first_mut().and_then(|stmt| stmt.stmt.as_mut())
+                    .and_then(|stmt| stmt.node.as_mut())
+            {
+                let existing = view.view.as_ref().and_then(|name| schema.get_view(&name.relname));
+                if let Some(existing) = existing {
+                    view.aliases = existing.columns.iter().filter_map(|column| column.name.as_ref())
+                        .map(|name| turso_pg_parser::pg_query::protobuf::Node {
+                            node: Some(turso_pg_parser::pg_query::protobuf::node::Node::String(
+                                turso_pg_parser::pg_query::protobuf::String { sval: name.clone() })),
+                        }).collect();
+                }
+            }
+            // Preserve every generated output contract before the existing
+            // scoped walker changes base names. Normalization uses the same
+            // translator decisions that made the executable view, not a second
+            // name resolver. Its source and AST travel together to the formatter.
+            let translator = view_rewrite_translator(&parsed, schema)?;
+            let source = translator.normalize_view_source_for_rewrite(&mut parsed)
+                .map_err(crate::session::pg_parse_error)?;
+            // Native addresses and source locations changed: infer once more
+            // from this new owning tree rather than reusing stale annotations.
+            let mut parsed = turso_pg_parser::parse(&source).map_err(crate::session::pg_parse_error)?;
+            let translator = view_rewrite_translator(&parsed, schema)?;
+            let stmt = translator.translate_view_for_rewrite(&mut parsed)
+                .map_err(crate::session::pg_parse_error)?;
+            let rewrite_source = encode_view_source(&source, &stmt.to_string());
+            Ok((Some(turso_parser::ast::Cmd::Stmt(stmt)), rewrite_source))
+        })
+    }
+
+    fn format_rewritten_view_sql(
+        &self, stored: &str, rewritten: &turso_parser::ast::Stmt,
+        renames: &[turso_parser::ast::NameRename],
+    ) -> Result<String> {
+        let Some((source, _)) = stored_view_source(stored)? else {
+            return Ok(rewritten.to_string());
+        };
+        turso_pg_parser::with_preparation_stack(&source, || {
+            let mut parsed = turso_pg_parser::parse(&source).map_err(crate::session::pg_parse_error)?;
+            turso_pg_parser::translator::apply_view_name_renames(&mut parsed, renames)
+                .map_err(crate::session::pg_parse_error)?;
+            if let turso_parser::ast::Stmt::CreateView { columns, .. } = rewritten {
+                if let Some(turso_pg_parser::pg_query::protobuf::node::Node::ViewStmt(view)) =
+                    parsed.protobuf.stmts.first_mut().and_then(|stmt| stmt.stmt.as_mut())
+                        .and_then(|stmt| stmt.node.as_mut())
+                {
+                    // Alias fields are outside the source-identifier registry, so
+                    // pinning the public output contract does not change origin IDs.
+                    view.aliases = columns.iter().map(|column| turso_pg_parser::pg_query::protobuf::Node {
+                        node: Some(turso_pg_parser::pg_query::protobuf::node::Node::String(
+                            turso_pg_parser::pg_query::protobuf::String { sval: column.col_name.as_str().to_owned() })),
+                    }).collect();
+                }
+            }
+            let source = turso_pg_parser::deparse(&parsed.protobuf).map_err(crate::session::pg_parse_error)?;
+            Ok(encode_view_source(&source, &rewritten.to_string()))
+        })
     }
 
     fn format_altered_table_sql(&self, table: &BTreeTable) -> Result<String> {
@@ -314,6 +423,71 @@ pub fn is_catalog_table_name(name: &str) -> bool {
             | "pg_tables"
             | "pg_indexes"
     )
+}
+
+/// Construct the existing translator from the same scoped inference and
+/// declared schema metadata used for normal frontend preparation.
+fn view_rewrite_translator(
+    parsed: &turso_pg_parser::ParseResult, schema: &Schema,
+) -> Result<turso_pg_parser::translator::PostgreSQLTranslator> {
+            let attached = crate::result_types::Attached { names: &[], holds: &|_, _| false };
+            let walked = crate::result_types::parameter_types_with(
+                parsed, schema, &["public".to_owned()], &Default::default(),
+                &attached, &Default::default(),
+            )?;
+            // Reuse declared schema columns for the translator's existing alias
+            // expansion. No connection or catalog query is needed while rewriting.
+            let mut columns: std::collections::HashMap<String, Vec<String>> = schema.tables.iter()
+                .map(|(name, table)| (name.to_ascii_lowercase(), table.columns().iter()
+                    .filter(|column| !column.hidden()).filter_map(|column| column.name.clone()).collect()))
+                .collect();
+            columns.extend(schema.views.iter().map(|(name, view)|
+                (name.to_ascii_lowercase(), view.columns.iter().filter_map(|column| column.name.clone()).collect())));
+            Ok(turso_pg_parser::translator::PostgreSQLTranslator::new()
+                .with_expression_types(walked.expressions)
+                .with_known_types(schema.type_registry.keys().cloned().collect())
+                .with_columns(move |namespace, table| match turso_pg_parser::schema_qualifier(namespace) {
+                    turso_pg_parser::SchemaQualifier::Main
+                    | turso_pg_parser::SchemaQualifier::Unqualified
+                    | turso_pg_parser::SchemaQualifier::PgCatalog => columns.get(&table.to_ascii_lowercase()).cloned(),
+                    _ => None,
+                }))
+}
+
+const STORED_PG_VIEW_SOURCE: &str = "/* view-source-v1:";
+
+/// One persisted view contains its original frontend source and the executable
+/// derivative. The source is encoded inside a comment, so it cannot interfere
+/// with parsing the canonical SQLite definition during schema loading.
+fn encode_view_source(source: &str, executable: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(source.len() * 2);
+    for byte in source.bytes() {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 15) as usize] as char);
+    }
+    format!("{STORED_PG_SCHEMA_PREFIX}{STORED_PG_VIEW_SOURCE}{encoded} */ {executable}")
+}
+
+pub(crate) fn stored_view_source(stored: &str) -> Result<Option<(String, &str)>> {
+    let Some(body) = stored.strip_prefix(STORED_PG_SCHEMA_PREFIX)
+        .and_then(|body| body.strip_prefix(STORED_PG_VIEW_SOURCE)) else { return Ok(None); };
+    let invalid = || LimboError::Corrupt("invalid stored PostgreSQL view source".to_owned());
+    let (encoded, executable) = body.split_once(" */ ").ok_or_else(invalid)?;
+    if encoded.len() % 2 != 0 { return Err(invalid()); }
+    let digit = |byte| match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    };
+    let mut bytes = Vec::with_capacity(encoded.len() / 2);
+    for pair in encoded.as_bytes().chunks_exact(2) {
+        let high = digit(pair[0]).ok_or_else(invalid)?;
+        let low = digit(pair[1]).ok_or_else(invalid)?;
+        bytes.push(high * 16 + low);
+    }
+    let source = String::from_utf8(bytes).map_err(|_| invalid())?;
+    Ok(Some((source, executable)))
 }
 
 pub fn encode_pg_schema_sql(sql: &str) -> String {
@@ -4479,5 +4653,55 @@ mod c52_view_replay_tests {
         let rows = conn.prepare("SELECT flag FROM v").unwrap().run_collect_rows().unwrap();
         assert_eq!(rows, vec![vec![turso_core::Value::from_i64(1)]]);
         conn.close().unwrap();
+    }
+}
+
+
+#[cfg(test)]
+mod c52_view_source_tests {
+    use super::*;
+
+    #[test]
+    fn c52_view_envelope_preserves_source_and_replay() {
+        let source = "CREATE VIEW v AS SELECT true AS flag, '*/ λ' AS quoted";
+        let executable = "CREATE VIEW v AS SELECT 1 AS flag, '*/ λ' AS quoted";
+        let stored = encode_view_source(source, executable);
+        let decoded = stored_view_source(&stored).unwrap().unwrap();
+        assert_eq!(decoded, (source.to_owned(), executable));
+        assert_eq!(PostgresDialect.format_view_sql(&stored, executable).unwrap(), stored);
+        let (parsed, consumed) = PostgresDialect.parse(&stored).unwrap();
+        assert!(matches!(parsed, Some(turso_parser::ast::Cmd::Stmt(turso_parser::ast::Stmt::CreateView { .. }))));
+        assert_eq!(consumed, stored.len());
+        assert!(matches!(PostgresDialect.parse_view_sql_ast(&stored).unwrap(),
+            Some(turso_parser::ast::Cmd::Stmt(turso_parser::ast::Stmt::CreateView { .. }))));
+    }
+
+    #[test]
+    fn c52_legacy_view_replay_remains_executable_only() {
+        // This is the pre-C52 schema representation of PG `b IS TRUE`.
+        // The `IS 1` expression is canonical SQLite, not PostgreSQL source.
+        let legacy = "CREATE VIEW v AS SELECT b IS 1 AS truth FROM t";
+        assert!(turso_pg_parser::parse(legacy).is_err());
+        let replay = PostgresDialect.view_sql_for_replay(legacy).unwrap();
+        let (parsed, consumed) = PostgresDialect.parse(&replay).unwrap();
+        assert_eq!(consumed, replay.len());
+        let Some(turso_parser::ast::Cmd::Stmt(stmt)) = parsed else {
+            panic!("expected executable legacy CREATE VIEW");
+        };
+        let stored = PostgresDialect.format_view_sql(&replay, &stmt.to_string()).unwrap();
+        assert_eq!(stored, legacy);
+        assert!(stored_view_source(&stored).unwrap().is_none());
+        assert!(PostgresDialect.parse_view_sql_ast(&stored).unwrap().is_some());
+        let replay_again = PostgresDialect.view_sql_for_replay(&stored).unwrap();
+        assert_eq!(replay_again, replay);
+    }
+
+    #[test]
+    fn c52_view_envelope_refuses_malformed_source() {
+        for encoded in ["0", "gg", "ff"] {
+            let stored = format!("{STORED_PG_SCHEMA_PREFIX}{STORED_PG_VIEW_SOURCE}{encoded} */ CREATE VIEW v AS SELECT 1");
+            assert!(stored_view_source(&stored).is_err());
+        }
+        assert!(stored_view_source("CREATE VIEW v AS SELECT 1").unwrap().is_none());
     }
 }

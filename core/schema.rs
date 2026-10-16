@@ -2283,14 +2283,16 @@ impl Schema {
             "view" => {
                 use crate::schema::View;
                 use turso_parser::ast::{Cmd, Stmt};
-                use turso_parser::parser::Parser;
 
                 let sql = maybe_sql.expect("sql should be present for view");
                 let view_name = name.to_string();
 
-                // Parse the SQL to determine if it's a regular or materialized view
-                let mut parser = Parser::new(sql.as_bytes());
-                let parsed = parser.next_cmd();
+                // Reload the executable view form without frontend type analysis:
+                // custom types may only be loaded after the schema-row scan.
+                let parsed = dialect.parse_view_sql_ast(sql);
+                if matches!(&parsed, Err(LimboError::StackDepthLimitExceeded)) {
+                    return Err(LimboError::StackDepthLimitExceeded);
+                }
                 if !matches!(&parsed, Ok(Some(Cmd::Stmt(_)))) {
                     // Tolerate view rows whose stored SQL no longer parses
                     // (e.g. older versions wrote view column lists without

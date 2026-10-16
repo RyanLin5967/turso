@@ -2060,6 +2060,7 @@ pub fn translate_alter_table(
                             &target_db_name,
                             from,
                             col_name,
+                            connection.dialect().as_ref(),
                         )? {
                             rewrites.push((database_id, view_name.clone(), rewritten.sql));
                         }
@@ -2080,6 +2081,7 @@ pub fn translate_alter_table(
                                     &target_db_name,
                                     from,
                                     col_name,
+                                    connection.dialect().as_ref(),
                                 )? {
                                     rewrites.push((
                                         crate::TEMP_DB_ID,

@@ -1159,6 +1159,16 @@ pub struct GroupBy {
 pub struct Name {
     quote: Option<char>,
     value: String,
+    // Temporary dialect rewrite provenance; never part of SQL identity or serde.
+    source_origin: Option<std::num::NonZeroU32>,
+}
+
+/// One decision from an existing SQL binding-aware rename walker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NameRename {
+    pub origin: std::num::NonZeroU32,
+    pub before: String,
+    pub after: String,
 }
 
 impl PartialEq for Name {
@@ -1209,12 +1219,38 @@ impl<'de> serde::Deserialize<'de> for Name {
 }
 
 impl Name {
+    /// Attach an ID owned by one temporary dialect source registry.
+    pub fn with_source_origin(mut self, origin: std::num::NonZeroU32) -> Self {
+        self.source_origin = Some(origin);
+        self
+    }
+
+    pub fn source_origin(&self) -> Option<std::num::NonZeroU32> {
+        self.source_origin
+    }
+
+    /// Keep provenance when the existing scoped rewriter changes a name.
+    /// Resets quoting exactly as replacing the value with Name::exact did.
+    /// Synthesized names still change normally, but produce no source edit.
+    pub fn rename(&mut self, new: String) -> Option<NameRename> {
+        if self.value == new { return None; }
+        let edit = self.source_origin.map(|origin| NameRename {
+            origin,
+            before: self.value.clone(),
+            after: new.clone(),
+        });
+        self.value = new;
+        self.quote = None;
+        edit
+    }
+
     /// Create name which will have exactly the value of given string
     /// (e.g. if s = "\"str\"" - the name value will contain quotes and translation to SQL will give us """str""")
     pub fn exact(s: String) -> Self {
         Self {
             value: s,
             quote: None,
+            source_origin: None,
         }
     }
     /// Parse name from the bytes (e.g. handle quoting and handle escaped quotes)
@@ -1225,6 +1261,7 @@ impl Name {
         Self {
             value: String::new(),
             quote: None,
+            source_origin: None,
         }
     }
     /// Create a name parsed from a bracket-quoted identifier (`[name]`),
@@ -1233,6 +1270,7 @@ impl Name {
         Self {
             value: s,
             quote: Some('['),
+            source_origin: None,
         }
     }
     /// Parse name from the string (e.g. handle quoting and handle escaped quotes)
@@ -1256,6 +1294,7 @@ impl Name {
             Name {
                 value: s,
                 quote: Some(bytes[0] as char),
+                source_origin: None,
             }
         } else if bytes[0] == b'[' {
             assert!(s.len() >= 2);

@@ -980,7 +980,12 @@ pub(crate) fn vacuum_target_build_step(
 
                 let entry_ordinal = state.post_data_entries[idx];
                 let entry = &state.schema_entries[entry_ordinal];
-                let target_stmt = state.target_conn.prepare(&entry.sql)?;
+                let replay_sql = if entry.entry_type == SchemaEntryType::View {
+                    state.target_conn.dialect().view_sql_for_replay(&entry.sql)?
+                } else {
+                    entry.sql.clone()
+                };
+                let target_stmt = state.target_conn.prepare(&replay_sql)?;
                 state.phase = VacuumTargetBuildPhase::StepPostData {
                     target_schema_stmt: Box::new(target_stmt),
                     idx,

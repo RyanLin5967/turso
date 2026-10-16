@@ -2481,6 +2481,7 @@ mod rename_column_view {
         target_db_name: &str,
         old_column: &str,
         new_column: &str,
+        dialect: &dyn crate::dialect::Dialect,
     ) -> Result<Option<RewrittenView>> {
         let mut visiting_views = HashSet::default();
         rewrite_view_sql_for_column_rename_inner(
@@ -2490,6 +2491,7 @@ mod rename_column_view {
             target_db_name,
             old_column,
             new_column,
+            dialect,
             &mut visiting_views,
         )
     }
@@ -2501,12 +2503,10 @@ mod rename_column_view {
         target_db_name: &str,
         old_column: &str,
         new_column: &str,
+        dialect: &dyn crate::dialect::Dialect,
         visiting_views: &mut HashSet<String>,
     ) -> Result<Option<RewrittenView>> {
-        let mut parser = Parser::new(view_sql.as_bytes());
-        let cmd = parser
-            .next_cmd()
-            .map_err(|e| LimboError::ParseError(format!("failed to parse view SQL: {e}").into()))?;
+        let (cmd, rewrite_source) = dialect.parse_view_sql_for_rewrite(view_sql, schema)?;
         let Some(ast::Cmd::Stmt(ast::Stmt::CreateView {
             temporary,
             if_not_exists,
@@ -2531,7 +2531,7 @@ mod rename_column_view {
                 view_columns_from_select(&original_select, schema, &view_columns)?;
 
             let ctx =
-                ViewRewriteCtx::new(schema, target_table, target_db_name, old_column, new_column);
+                ViewRewriteCtx::new(schema, target_table, target_db_name, old_column, new_column, dialect);
             let sql_changed =
                 rewrite_view_select_for_column_rename(&mut select, &ctx, &[], visiting_views)?;
 
@@ -2558,7 +2558,7 @@ mod rename_column_view {
                     columns: view_columns,
                     select: select.clone(),
                 };
-                new_stmt.to_string()
+                dialect.format_rewritten_view_sql(&rewrite_source, &new_stmt, &ctx.renames.borrow())?
             } else {
                 view_sql.to_string()
             };
@@ -2659,6 +2659,8 @@ mod rename_column_view {
 
     struct ViewRewriteCtx<'a> {
         schema: &'a Schema,
+        dialect: &'a dyn crate::dialect::Dialect,
+        renames: std::cell::RefCell<Vec<ast::NameRename>>,
         target_table: &'a str,
         target_table_norm: String,
         target_db_norm: String,
@@ -2674,9 +2676,12 @@ mod rename_column_view {
             target_db_name: &'a str,
             old_column: &'a str,
             new_column: &'a str,
+            dialect: &'a dyn crate::dialect::Dialect,
         ) -> Self {
             Self {
                 schema,
+                dialect,
+                renames: Default::default(),
                 target_table,
                 target_table_norm: normalize_ident(target_table),
                 target_db_norm: normalize_ident(target_db_name),
@@ -2955,6 +2960,7 @@ mod rename_column_view {
                             right_source,
                             &ctx.old_column_norm,
                             ctx.new_column,
+                            &ctx.renames,
                         );
                     }
                 }
@@ -3018,6 +3024,7 @@ mod rename_column_view {
                             &ctx.target_db_norm,
                             ctx.old_column,
                             ctx.new_column,
+                            ctx.dialect,
                             visiting_views,
                         )? {
                             rename_map = build_rename_map_from_columns(
@@ -3156,6 +3163,7 @@ mod rename_column_view {
                 &ctx.target_db_norm,
                 &ctx.old_column_norm,
                 ctx.new_column,
+                &ctx.renames,
             ) {
                 *changed = true;
             }
@@ -3194,6 +3202,7 @@ mod rename_column_view {
         target_db_norm: &str,
         old_column_norm: &str,
         new_column: &str,
+        renames: &std::cell::RefCell<Vec<ast::NameRename>>,
     ) -> bool {
         let apply_rename = |source: &ViewSourceInfo, set_name: &mut dyn FnMut(String)| {
             if source.is_target_table {
@@ -3217,7 +3226,7 @@ mod rename_column_view {
                     resolve_qualified(sources, &ns_norm, target_db_norm);
                 if let Some(source) = source {
                     return apply_rename(source, &mut |name| {
-                        *col = ast::Name::exact(name);
+                        if let Some(edit) = col.rename(name) { renames.borrow_mut().push(edit); }
                     });
                 }
                 if local_ambiguous {
@@ -3227,7 +3236,7 @@ mod rename_column_view {
                     let (source, ambiguous) = resolve_qualified(scope, &ns_norm, target_db_norm);
                     if let Some(source) = source {
                         return apply_rename(source, &mut |name| {
-                            *col = ast::Name::exact(name);
+                            if let Some(edit) = col.rename(name) { renames.borrow_mut().push(edit); }
                         });
                     }
                     if ambiguous {
@@ -3247,7 +3256,7 @@ mod rename_column_view {
                 let (source, local_ambiguous) = resolve_qualified(sources, &ns_norm, &schema_norm);
                 if let Some(source) = source {
                     return apply_rename(source, &mut |name| {
-                        *col = ast::Name::exact(name);
+                        if let Some(edit) = col.rename(name) { renames.borrow_mut().push(edit); }
                     });
                 }
                 if local_ambiguous {
@@ -3257,7 +3266,7 @@ mod rename_column_view {
                     let (source, ambiguous) = resolve_qualified(scope, &ns_norm, &schema_norm);
                     if let Some(source) = source {
                         return apply_rename(source, &mut |name| {
-                            *col = ast::Name::exact(name);
+                            if let Some(edit) = col.rename(name) { renames.borrow_mut().push(edit); }
                         });
                     }
                     if ambiguous {
@@ -3270,10 +3279,13 @@ mod rename_column_view {
                     return false;
                 }
                 let col_norm = normalize_ident(col.as_str());
+                let original = col.clone();
                 let (source, local_ambiguous) = resolve_unqualified(sources, &col_norm);
                 if let Some(source) = source {
                     return apply_rename(source, &mut |name| {
-                        *expr = ast::Expr::Id(ast::Name::exact(name));
+                        let mut renamed = original.clone();
+                        if let Some(edit) = renamed.rename(name) { renames.borrow_mut().push(edit); }
+                        *expr = ast::Expr::Id(renamed);
                     });
                 }
                 if local_ambiguous {
@@ -3283,7 +3295,9 @@ mod rename_column_view {
                     let (source, ambiguous) = resolve_unqualified(scope, &col_norm);
                     if let Some(source) = source {
                         return apply_rename(source, &mut |name| {
-                            *expr = ast::Expr::Id(ast::Name::exact(name));
+                            let mut renamed = original.clone();
+                        if let Some(edit) = renamed.rename(name) { renames.borrow_mut().push(edit); }
+                        *expr = ast::Expr::Id(renamed);
                         });
                     }
                     if ambiguous {
@@ -3336,6 +3350,7 @@ mod rename_column_view {
         right: &ViewSourceInfo,
         old_column_norm: &str,
         new_column: &str,
+        renames: &std::cell::RefCell<Vec<ast::NameRename>>,
     ) -> bool {
         let mut changed = false;
         let left_map = left_sources
@@ -3355,7 +3370,7 @@ mod rename_column_view {
 
         for col in cols {
             if col.as_str().eq_ignore_ascii_case(old_column_norm) {
-                *col = ast::Name::exact(replacement.to_string());
+                if let Some(edit) = col.rename(replacement.to_string()) { renames.borrow_mut().push(edit); }
                 changed = true;
             }
         }
@@ -5156,7 +5171,7 @@ pub mod tests {
         let view_sql = "CREATE VIEW v AS SELECT s.x FROM (SELECT b AS x FROM t) AS s";
 
         let rewritten =
-            rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c")
+            rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c", &crate::dialect::SqliteDialect)
                 .unwrap()
                 .expect("view should be rewritten");
 
@@ -5169,7 +5184,7 @@ pub mod tests {
         let view_sql = "CREATE VIEW v AS SELECT s.b FROM (t) AS s";
 
         let rewritten =
-            rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c")
+            rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c", &crate::dialect::SqliteDialect)
                 .unwrap()
                 .expect("view should be rewritten");
 
@@ -5183,7 +5198,7 @@ pub mod tests {
             "CREATE VIEW v AS SELECT j.value FROM t JOIN json_each(json_array(t.b)) AS j";
 
         let rewritten =
-            rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c")
+            rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c", &crate::dialect::SqliteDialect)
                 .unwrap()
                 .expect("view should be rewritten");
 
@@ -5196,7 +5211,7 @@ pub mod tests {
         let view_sql = "CREATE VIEW v AS SELECT b FROM t UNION ALL SELECT b FROM t ORDER BY b";
 
         let rewritten =
-            rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c")
+            rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c", &crate::dialect::SqliteDialect)
                 .unwrap()
                 .expect("view should be rewritten");
 
@@ -5211,7 +5226,7 @@ pub mod tests {
         let view_sql = "CREATE VIEW v AS WITH cte AS (SELECT b FROM t) SELECT b FROM cte";
 
         let rewritten =
-            rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c")
+            rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c", &crate::dialect::SqliteDialect)
                 .unwrap()
                 .expect("view should be rewritten");
 
@@ -5233,7 +5248,7 @@ pub mod tests {
         let view_sql = "CREATE VIEW v AS WITH cte(x) AS (SELECT b FROM t) SELECT x FROM cte";
 
         let rewritten =
-            rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c")
+            rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c", &crate::dialect::SqliteDialect)
                 .unwrap()
                 .expect("view should be rewritten");
 
@@ -5377,7 +5392,7 @@ pub mod tests {
         let view_sql = "CREATE VIEW v AS SELECT t.a FROM t JOIN u ON t.b = u.b";
 
         let rewritten =
-            rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c")
+            rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c", &crate::dialect::SqliteDialect)
                 .unwrap()
                 .expect("view should be rewritten");
 
@@ -5394,7 +5409,7 @@ pub mod tests {
         // after the rename t has no b. SQLite refuses the ALTER, so the
         // rewrite must error rather than emit a view that can never be
         // queried again.
-        let err = rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c")
+        let err = rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c", &crate::dialect::SqliteDialect)
             .unwrap_err();
         assert!(
             err.to_string().contains("cannot join using column"),
@@ -5408,7 +5423,7 @@ pub mod tests {
         let view_sql = "CREATE VIEW v AS SELECT b FROM t GROUP BY b HAVING b > 0";
 
         let rewritten =
-            rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c")
+            rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c", &crate::dialect::SqliteDialect)
                 .unwrap()
                 .expect("view should be rewritten");
 
@@ -5427,7 +5442,7 @@ pub mod tests {
         let view_sql = "CREATE VIEW v AS SELECT sum(a) OVER (PARTITION BY b ORDER BY b) FROM t";
 
         let rewritten =
-            rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c")
+            rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c", &crate::dialect::SqliteDialect)
                 .unwrap()
                 .expect("view should be rewritten");
 
@@ -5451,7 +5466,7 @@ pub mod tests {
         let view_sql = "CREATE VIEW v AS SELECT a FROM t LIMIT b OFFSET b";
 
         let rewritten =
-            rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c")
+            rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c", &crate::dialect::SqliteDialect)
                 .unwrap()
                 .expect("view should be rewritten");
 
@@ -5467,7 +5482,7 @@ pub mod tests {
         let view_sql = "CREATE VIEW v AS VALUES ((SELECT b FROM t LIMIT 1))";
 
         let rewritten =
-            rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c")
+            rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c", &crate::dialect::SqliteDialect)
                 .unwrap()
                 .expect("view should be rewritten");
 

@@ -110,6 +110,10 @@ impl ExpressionTypes {
 /// Translates a PostgreSQL query into Turso's AST
 #[derive(Default)]
 pub struct PostgreSQLTranslator {
+    /// Used only by the preliminary view-source output-contract pass.
+    source_contracts: std::cell::RefCell<Option<ViewSourceOutputContracts>>,
+    /// Set only by translate_view_for_rewrite, restored before it returns.
+    source_origins: std::cell::RefCell<Option<ViewSourceOrigins>>,
     expression_types: std::sync::Arc<ExpressionTypes>,
     /// The scope of each SELECT being translated, innermost last: the names its FROM items are
     /// known by, with the columns those names stand for that the engine does not have under them.
@@ -415,7 +419,7 @@ impl PostgreSQLTranslator {
         range_var: &pg_query::protobuf::RangeVar,
     ) -> ast::QualifiedName {
         let mapped_name = self.map_table_name(&range_var.relname);
-        let name = ast::Name::from_string(mapped_name);
+        let name = self.mapped_source_name(&range_var.relname, mapped_name);
         let alias = range_var
             .alias
             .as_ref()
@@ -2684,6 +2688,7 @@ impl PostgreSQLTranslator {
                 rename_columns(&mut renamed, &a.colnames);
                 renamed
             };
+            self.record_range_output_contract(range_var, &renamed);
             let columns = declared
                 .iter()
                 .zip(&renamed)
@@ -3247,7 +3252,7 @@ impl PostgreSQLTranslator {
                 .iter()
                 .filter_map(|node| match &node.node {
                     Some(pg_query::protobuf::node::Node::String(s)) => {
-                        Some(ast::Name::from_string(&s.sval))
+                        Some(self.source_name(&s.sval))
                     }
                     _ => None,
                 })
@@ -3306,7 +3311,7 @@ impl PostgreSQLTranslator {
                                                 Some(columns) => result_columns.extend(columns),
                                                 None => result_columns.push(
                                                     ast::ResultColumn::TableStar(
-                                                        ast::Name::from_string(&s.sval),
+                                                        self.source_name(&s.sval),
                                                     ),
                                                 ),
                                             }
@@ -3328,6 +3333,7 @@ impl PostgreSQLTranslator {
                             } else {
                                 Some(ast::As::Elided(ast::Name::from_string(&res_target.name)))
                             };
+                            self.record_target_output_contract(res_target, &alias)?;
                             result_columns.push(ast::ResultColumn::Expr(Box::new(expr), alias));
                         } else {
                             let expr = self.translate_expr(val)?;
@@ -3336,10 +3342,11 @@ impl PostgreSQLTranslator {
                             let alias: Option<ast::As> = if res_target.name.is_empty() {
                                 Some(ast::As::Elided(ast::Name::from_string(figure_colname(
                                     val,
-                                ))))
+                                )?)))
                             } else {
                                 Some(ast::As::Elided(ast::Name::from_string(&res_target.name)))
                             };
+                            self.record_target_output_contract(res_target, &alias)?;
                             result_columns.push(ast::ResultColumn::Expr(Box::new(expr), alias));
                         }
                     }
@@ -3381,7 +3388,7 @@ impl PostgreSQLTranslator {
                                         s.sval
                                     ).into()));
                                 }
-                                Ok(ast::Expr::Id(ast::Name::from_string(s.sval.clone())))
+                                Ok(ast::Expr::Id(self.source_name(&s.sval)))
                             } else {
                                 // Qualified column reference (table.column)
                                 let mut parts = vec![];
@@ -3389,7 +3396,7 @@ impl PostgreSQLTranslator {
                                     if let Some(pg_query::protobuf::node::Node::String(s)) =
                                         &field.node
                                     {
-                                        parts.push(s.sval.clone());
+                                        parts.push(&s.sval);
                                     }
                                 }
                                 match parts.len() {
@@ -3401,17 +3408,17 @@ impl PostgreSQLTranslator {
                                     3 => Ok(match schema_qualifier(&parts[0]) {
                                         SchemaQualifier::Main => ast::Expr::DoublyQualified(
                                             ast::Name::from_string("main"),
-                                            ast::Name::from_string(parts[1].clone()),
-                                            ast::Name::from_string(parts[2].clone()),
+                                            self.source_name(parts[1]),
+                                            self.source_name(parts[2]),
                                         ),
                                         SchemaQualifier::PgCatalog => ast::Expr::Qualified(
-                                            ast::Name::from_string(parts[1].clone()),
-                                            ast::Name::from_string(parts[2].clone()),
+                                            self.source_name(parts[1]),
+                                            self.source_name(parts[2]),
                                         ),
                                         _ => ast::Expr::DoublyQualified(
-                                            ast::Name::from_string(parts[0].clone()),
-                                            ast::Name::from_string(parts[1].clone()),
-                                            ast::Name::from_string(parts[2].clone()),
+                                            self.source_name(parts[0]),
+                                            self.source_name(parts[1]),
+                                            self.source_name(parts[2]),
                                         ),
                                     }),
                                     2 => match self.lateral_column(&parts[0], &parts[1]) {
@@ -3421,12 +3428,12 @@ impl PostgreSQLTranslator {
                                         }
                                         // table.column
                                         None => Ok(ast::Expr::Qualified(
-                                            ast::Name::from_string(parts[0].clone()),
-                                            ast::Name::from_string(parts[1].clone()),
+                                            self.source_name(parts[0]),
+                                            self.source_name(parts[1]),
                                         )),
                                     },
                                     _ => {
-                                        Ok(ast::Expr::Id(ast::Name::from_string(parts[0].clone())))
+                                        Ok(ast::Expr::Id(self.source_name(parts[0])))
                                     }
                                 }
                             }
@@ -3783,7 +3790,7 @@ impl PostgreSQLTranslator {
                                         ))
                                     }
                                 },
-                                ast::Name::from_string(s.sval.clone()),
+                                self.source_name(&s.sval),
                             );
                         }
                         other => {
@@ -5443,15 +5450,18 @@ impl PostgreSQLTranslator {
 /// The name PostgreSQL gives a result column with no alias (FigureColname, parser/parse_target.c,
 /// recalled from its source and checked against PG 18.6's names, pg18-colnames.out): `?column?`
 /// when nothing names it.
-fn figure_colname(node: &pg_query::protobuf::Node) -> String {
-    figure_colname_strength(node)
+pub fn figure_colname(node: &pg_query::protobuf::Node) -> Result<String, ParseError> {
+    Ok(figure_colname_strength(node)?
         .map(|(name, _)| name)
-        .unwrap_or_else(|| "?column?".to_string())
+        .unwrap_or_else(|| "?column?".to_string()))
 }
 
 /// FigureColnameInternal: the name and its strength, 2 for a column, function or keyword, 1 for a
 /// cast's type name or CASE, which a stronger name inside them overrides; None for none.
-fn figure_colname_strength(node: &pg_query::protobuf::Node) -> Option<(String, u8)> {
+/// Translation and frontend inference use this same naming authority and depth guard.
+fn figure_colname_strength(node: &pg_query::protobuf::Node) -> Result<Option<(String, u8)>, ParseError> {
+    let _guard = turso_stack_guard::NestGuard::enter()
+        .map_err(|_| ParseError::StackDepthLimitExceeded)?;
     use pg_query::protobuf::node::Node;
     use pg_query::protobuf::{AExprKind, MinMaxOp, SubLinkType};
     let last = |names: &[pg_query::protobuf::Node]| {
@@ -5461,56 +5471,69 @@ fn figure_colname_strength(node: &pg_query::protobuf::Node) -> Option<(String, u
         })
     };
     let strong = |name: &str| Some((name.to_string(), 2));
-    match node.node.as_ref()? {
-        Node::ColumnRef(c) => match c.fields.last()?.node.as_ref()? {
-            Node::String(s) => Some((s.sval.clone(), 2)),
+    let Some(value) = node.node.as_ref() else { return Ok(None); };
+    Ok(match value {
+        Node::ColumnRef(c) => match c.fields.last().and_then(|field| field.node.as_ref()) {
+            Some(Node::String(s)) => Some((s.sval.clone(), 2)),
             _ => None,
         },
         Node::AIndirection(i) => match i.indirection.last().and_then(|n| n.node.as_ref()) {
             Some(Node::String(s)) => Some((s.sval.clone(), 2)),
-            _ => i.arg.as_deref().and_then(figure_colname_strength),
+            _ => match i.arg.as_deref() {
+                Some(arg) => figure_colname_strength(arg)?,
+                None => None,
+            },
         },
-        Node::FuncCall(f) => Some((last(&f.funcname)?, 2)),
+        Node::FuncCall(f) => last(&f.funcname).map(|name| (name, 2)),
         Node::AExpr(e) if AExprKind::try_from(e.kind) == Ok(AExprKind::AexprNullif) => {
             strong("nullif")
         }
         Node::TypeCast(c) => {
-            let inner = c.arg.as_deref().and_then(figure_colname_strength);
+            let inner = match c.arg.as_deref() {
+                Some(arg) => figure_colname_strength(arg)?,
+                None => None,
+            };
             match inner {
                 Some((_, 2)) => inner,
-                _ => c
-                    .type_name
-                    .as_ref()
-                    .and_then(|t| last(&t.names))
-                    .map(|name| (name, 1))
-                    .or(inner),
+                _ => c.type_name.as_ref().and_then(|t| last(&t.names))
+                    .map(|name| (name, 1)).or(inner),
             }
         }
-        Node::CollateClause(c) => c.arg.as_deref().and_then(figure_colname_strength),
+        Node::CollateClause(c) => match c.arg.as_deref() {
+            Some(arg) => figure_colname_strength(arg)?,
+            None => None,
+        },
         Node::GroupingFunc(_) => strong("grouping"),
         Node::SubLink(l) => match SubLinkType::try_from(l.sub_link_type) {
             Ok(SubLinkType::ExistsSublink) => strong("exists"),
             Ok(SubLinkType::ArraySublink) => strong("array"),
             Ok(SubLinkType::ExprSublink) => {
                 let Some(Node::SelectStmt(q)) = l.subselect.as_ref().and_then(|s| s.node.as_ref())
-                else {
-                    return None;
-                };
+                else { return Ok(None); };
                 let Some(Node::ResTarget(t)) = q.target_list.first().and_then(|t| t.node.as_ref())
-                else {
-                    return None;
-                };
+                else { return Ok(None); };
                 if !t.name.is_empty() {
-                    return Some((t.name.clone(), 2));
+                    Some((t.name.clone(), 2))
+                } else {
+                    let name = match t.val.as_deref() {
+                        Some(value) => figure_colname(value)?,
+                        None => "?column?".to_owned(),
+                    };
+                    Some((name, 2))
                 }
-                Some((t.val.as_deref().map_or("?column?".to_string(), figure_colname), 2))
             }
             _ => None,
         },
-        Node::CaseExpr(c) => match c.defresult.as_deref().and_then(figure_colname_strength) {
-            Some((name, 2)) => Some((name, 2)),
-            _ => Some(("case".to_string(), 1)),
-        },
+        Node::CaseExpr(c) => {
+            let inner = match c.defresult.as_deref() {
+                Some(arg) => figure_colname_strength(arg)?,
+                None => None,
+            };
+            match inner {
+                Some((name, 2)) => Some((name, 2)),
+                _ => Some(("case".to_string(), 1)),
+            }
+        }
         Node::AArrayExpr(_) => strong("array"),
         Node::RowExpr(_) => strong("row"),
         Node::CoalesceExpr(_) => strong("coalesce"),
@@ -5521,7 +5544,7 @@ fn figure_colname_strength(node: &pg_query::protobuf::Node) -> Option<(String, u
         },
         Node::SqlvalueFunction(_) => derived_column_name(node).map(|name| (name, 2)),
         _ => None,
-    }
+    })
 }
 
 /// PostgreSQL derives a name for result columns without an explicit alias
@@ -10080,5 +10103,366 @@ mod tests {
             })
             .collect();
         assert_eq!(names, vec![Some("n".to_string()), Some("k".to_string())]);
+    }
+}
+
+/// A source-field registry lives only during translate_view_for_rewrite. Addresses
+/// are opaque equality keys, never dereferenced. IDs are assigned by the original
+/// native tree's field order, before translation synthesizes or clones core nodes.
+#[derive(Default)]
+struct ViewSourceOrigins {
+    fields: std::collections::HashMap<usize, std::num::NonZeroU32>,
+}
+
+impl ViewSourceOrigins {
+    fn new(parse: &mut crate::ParseResult) -> Result<Self, ParseError> {
+        let mut fields = std::collections::HashMap::new();
+        walk_view_source_names(&mut parse.protobuf, &mut |id, name| {
+            fields.insert(name as *const String as usize, id);
+            Ok(())
+        })?;
+        Ok(Self { fields })
+    }
+
+    fn get(&self, source: &String) -> Option<std::num::NonZeroU32> {
+        self.fields.get(&(source as *const String as usize)).copied()
+    }
+}
+
+impl PostgreSQLTranslator {
+    /// The caller keeps the whole operation on with_preparation_stack(original_sql).
+    /// The owned ParseResult supplies its normal protected drop on every return.
+    /// No registry is retained after this call, including an error or unwind.
+    pub fn translate_view_for_rewrite(
+        &self,
+        parse: &mut crate::ParseResult,
+    ) -> Result<ast::Stmt, ParseError> {
+        let origins = ViewSourceOrigins::new(parse)?;
+        struct Restore<'a> {
+            slot: &'a std::cell::RefCell<Option<ViewSourceOrigins>>,
+            old: Option<ViewSourceOrigins>,
+        }
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                self.slot.replace(self.old.take());
+            }
+        }
+        let old = self.source_origins.replace(Some(origins));
+        let _restore = Restore { slot: &self.source_origins, old };
+        self.translate(parse)
+    }
+
+    /// Native parser String fields already hold decoded identifiers. In this
+    /// temporary origin-aware path, use exact() rather than reparsing their quote
+    /// characters. The regular translation path retains its existing behavior.
+    fn source_name(&self, source: &String) -> ast::Name {
+        if let Some(id) = self.source_origins.borrow().as_ref().and_then(|m| m.get(source)) {
+            ast::Name::exact(source.clone()).with_source_origin(id)
+        } else {
+            ast::Name::from_string(source)
+        }
+    }
+
+    /// Mapped catalog names are derived names, not identifiers to write back.
+    fn mapped_source_name(&self, source: &String, mapped: String) -> ast::Name {
+        if mapped == *source {
+            self.source_name(source)
+        } else {
+            ast::Name::from_string(mapped)
+        }
+    }
+}
+
+fn view_origin_error(text: &str) -> ParseError {
+    ParseError::ParseError(SqlErrorMessage::classified(SqlErrorKind::InternalError, text))
+}
+
+/// Apply the decisions of the engine's existing scoped rename walker. This does
+/// not resolve SQL names. A fresh parse of the same original source has the same
+/// IDs; native pointers are neither transferred nor reconstructed.
+///
+/// Collect/validate the complete edit set before changing any field. Repeated
+/// appearances of one core Name (e.g. LATERAL inlining) must agree. Only String
+/// contents change; vectors and tree topology remain intact.
+pub fn apply_view_name_renames(
+    parse: &mut crate::ParseResult,
+    edits: &[ast::NameRename],
+) -> Result<(), ParseError> {
+    let mut by_id = std::collections::HashMap::new();
+    for edit in edits {
+        if let Some(previous) = by_id.insert(edit.origin, edit) {
+            if previous.before != edit.before || previous.after != edit.after {
+                return Err(view_origin_error("view source received inconsistent identifier edits"));
+            }
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    walk_view_source_names(&mut parse.protobuf, &mut |id, name| {
+        if let Some(edit) = by_id.get(&id) {
+            if *name != edit.before {
+                return Err(view_origin_error("view source identifier does not match its edit"));
+            }
+            seen.insert(id);
+        }
+        Ok(())
+    })?;
+    if seen.len() != by_id.len() {
+        return Err(view_origin_error("view source identifier edit was not found"));
+    }
+    walk_view_source_names(&mut parse.protobuf, &mut |id, name| {
+        if let Some(edit) = by_id.get(&id) {
+            name.clone_from(&edit.after);
+        }
+        Ok(())
+    })
+}
+
+/// Deterministic field walk, shared by registry and mutation. It is deliberately
+/// not pg_query::nodes_mut(): that upstream convenience walk omits query fields.
+/// Aliases, type/function/operator names and literal values are not renameable
+/// column/relation fields. USING strings have IDs despite having no location.
+///
+/// Unknown native query nodes refuse instead of silently dropping provenance.
+/// Any newly supported translator node needs its child traversal added here.
+fn walk_view_source_names(
+    parse: &mut pg_query::protobuf::ParseResult,
+    action: &mut dyn FnMut(std::num::NonZeroU32, &mut String) -> Result<(), ParseError>,
+) -> Result<(), ParseError> {
+    walk_view_source(parse, action, None)
+}
+
+fn walk_view_source<'a>(
+    parse: &mut pg_query::protobuf::ParseResult,
+    action: &'a mut dyn FnMut(std::num::NonZeroU32, &mut String) -> Result<(), ParseError>,
+    contracts: Option<&'a mut ViewSourceOutputContracts>,
+) -> Result<(), ParseError> {
+    use pg_query::protobuf::node::Node;
+    if parse.stmts.len() != 1 {
+        return Err(view_origin_error("view source must contain one statement"));
+    }
+    let Some(Node::ViewStmt(view)) = parse.stmts[0].stmt.as_mut().and_then(|n| n.node.as_mut()) else {
+        return Err(view_origin_error("view source must contain CREATE VIEW"));
+    };
+    let query = view.query.as_deref_mut().ok_or_else(|| view_origin_error("view source has no query"))?;
+    let mut walker = ViewSourceWalk { next: 1, action, contracts };
+    walker.node(query)
+}
+
+struct ViewSourceWalk<'a> {
+    contracts: Option<&'a mut ViewSourceOutputContracts>,
+    next: u32,
+    action: &'a mut dyn FnMut(std::num::NonZeroU32, &mut String) -> Result<(), ParseError>,
+}
+
+impl ViewSourceWalk<'_> {
+    fn name(&mut self, value: &mut String) -> Result<(), ParseError> {
+        let id = std::num::NonZeroU32::new(self.next)
+            .ok_or_else(|| view_origin_error("view source has too many identifier fields"))?;
+        self.next = self.next.checked_add(1)
+            .ok_or_else(|| view_origin_error("view source has too many identifier fields"))?;
+        (self.action)(id, value)
+    }
+
+    fn optional(&mut self, node: &mut Option<Box<pg_query::protobuf::Node>>) -> Result<(), ParseError> {
+        if let Some(node) = node { self.node(node)?; }
+        Ok(())
+    }
+
+    fn nodes(&mut self, nodes: &mut [pg_query::protobuf::Node]) -> Result<(), ParseError> {
+        for node in nodes { self.node(node)?; }
+        Ok(())
+    }
+
+    fn select(&mut self, node: &mut pg_query::protobuf::SelectStmt) -> Result<(), ParseError> {
+        let _nest = crate::nest()?;
+        // Order follows native SelectStmt field order, independent of translation.
+        self.nodes(&mut node.distinct_clause)?;
+        self.nodes(&mut node.target_list)?;
+        self.nodes(&mut node.from_clause)?;
+        self.optional(&mut node.where_clause)?;
+        self.nodes(&mut node.group_clause)?;
+        self.optional(&mut node.having_clause)?;
+        self.nodes(&mut node.window_clause)?;
+        self.nodes(&mut node.values_lists)?;
+        self.nodes(&mut node.sort_clause)?;
+        self.optional(&mut node.limit_offset)?;
+        self.optional(&mut node.limit_count)?;
+        self.nodes(&mut node.locking_clause)?;
+        if let Some(with) = &mut node.with_clause { self.nodes(&mut with.ctes)?; }
+        if let Some(left) = &mut node.larg { self.select(left)?; }
+        if let Some(right) = &mut node.rarg { self.select(right)?; }
+        Ok(())
+    }
+
+    fn window(&mut self, node: &mut pg_query::protobuf::WindowDef) -> Result<(), ParseError> {
+        let _nest = crate::nest()?;
+        self.nodes(&mut node.partition_clause)?;
+        self.nodes(&mut node.order_clause)?;
+        self.optional(&mut node.start_offset)?;
+        self.optional(&mut node.end_offset)
+    }
+
+    fn node(&mut self, wrapper: &mut pg_query::protobuf::Node) -> Result<(), ParseError> {
+        use pg_query::protobuf::node::Node;
+        let _nest = crate::nest()?;
+        let Some(node) = wrapper.node.as_mut() else { return Ok(()); };
+        match node {
+            Node::SelectStmt(n) => self.select(n)?,
+            Node::RangeVar(n) => {
+                if let Some(columns) = self.contracts.as_mut().and_then(|contracts|
+                    contracts.range_aliases.remove(&(n as *const _ as usize))) {
+                    let alias = n.alias.as_mut()
+                        .ok_or_else(|| view_origin_error("view range alias is missing"))?;
+                    alias.colnames = columns.into_iter().map(|sval| pg_query::protobuf::Node {
+                        node: Some(Node::String(pg_query::protobuf::String { sval })),
+                    }).collect();
+                }
+                self.name(&mut n.relname)?;
+            }
+            Node::ColumnRef(n) => {
+                for part in &mut n.fields {
+                    if let Some(Node::String(s)) = &mut part.node { self.name(&mut s.sval)?; }
+                }
+            }
+            Node::JoinExpr(n) => {
+                self.optional(&mut n.larg)?;
+                self.optional(&mut n.rarg)?;
+                for part in &mut n.using_clause {
+                    if let Some(Node::String(s)) = &mut part.node { self.name(&mut s.sval)?; }
+                }
+                self.optional(&mut n.quals)?;
+            }
+            Node::RangeSubselect(n) => self.optional(&mut n.subquery)?,
+            Node::RangeFunction(n) => self.nodes(&mut n.functions)?,
+            Node::ResTarget(n) => {
+                if let Some(name) = self.contracts.as_mut().and_then(|contracts|
+                    contracts.target_aliases.remove(&(n.as_ref() as *const _ as usize))) {
+                    n.name = name;
+                }
+                self.nodes(&mut n.indirection)?;
+                self.optional(&mut n.val)?;
+            }
+            Node::List(n) => self.nodes(&mut n.items)?,
+            Node::AExpr(n) => { self.optional(&mut n.lexpr)?; self.optional(&mut n.rexpr)?; }
+            Node::BoolExpr(n) => self.nodes(&mut n.args)?,
+            Node::FuncCall(n) => {
+                self.nodes(&mut n.args)?;
+                self.nodes(&mut n.agg_order)?;
+                self.optional(&mut n.agg_filter)?;
+                if let Some(over) = &mut n.over { self.window(over)?; }
+            }
+            Node::CaseExpr(n) => {
+                self.optional(&mut n.arg)?;
+                self.nodes(&mut n.args)?;
+                self.optional(&mut n.defresult)?;
+            }
+            Node::CaseWhen(n) => { self.optional(&mut n.expr)?; self.optional(&mut n.result)?; }
+            Node::CollateClause(n) => self.optional(&mut n.arg)?,
+            Node::TypeCast(n) => self.optional(&mut n.arg)?,
+            Node::SubLink(n) => { self.optional(&mut n.testexpr)?; self.optional(&mut n.subselect)?; }
+            Node::NullTest(n) => self.optional(&mut n.arg)?,
+            Node::BooleanTest(n) => self.optional(&mut n.arg)?,
+            Node::CoalesceExpr(n) => self.nodes(&mut n.args)?,
+            Node::MinMaxExpr(n) => self.nodes(&mut n.args)?,
+            Node::AArrayExpr(n) => self.nodes(&mut n.elements)?,
+            Node::AIndirection(n) => {
+                self.optional(&mut n.arg)?;
+                for part in &mut n.indirection {
+                    match &mut part.node {
+                        Some(Node::String(s)) => self.name(&mut s.sval)?,
+                        _ => self.node(part)?,
+                    }
+                }
+            }
+            Node::AIndices(n) => { self.optional(&mut n.lidx)?; self.optional(&mut n.uidx)?; }
+            Node::RowExpr(n) => self.nodes(&mut n.args)?,
+            Node::SortBy(n) => self.optional(&mut n.node)?,
+            Node::WindowDef(n) => self.window(n)?,
+            Node::CommonTableExpr(n) => self.optional(&mut n.ctequery)?,
+            Node::GroupingSet(n) => self.nodes(&mut n.content)?,
+            Node::NamedArgExpr(n) => self.optional(&mut n.arg)?,
+            // These leaves contain no source relation/column-reference children.
+            Node::AConst(_) | Node::ParamRef(_) | Node::SqlvalueFunction(_)
+            | Node::SetToDefault(_) | Node::AStar(_) | Node::String(_)
+            | Node::Integer(_) | Node::Float(_) | Node::Boolean(_) | Node::BitString(_)
+            | Node::LockingClause(_) => {}
+            _ => return Err(ParseError::ParseError(SqlErrorMessage::classified(
+                SqlErrorKind::FeatureNotSupported,
+                "view source identifier traversal does not support this query node",
+            ))),
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct ViewSourceOutputContracts {
+    range_aliases: std::collections::HashMap<usize, Vec<String>>,
+    target_aliases: std::collections::HashMap<usize, String>,
+}
+
+impl PostgreSQLTranslator {
+    /// Materialize output contracts chosen by the existing translator in the
+    /// native view source, before assigning rename-origin IDs.
+    ///
+    /// The caller runs on with_preparation_stack(source), then parses the returned
+    /// source afresh and reruns Infer before translate_view_for_rewrite. Inference
+    /// annotations for the input parse cannot be reused after deparse/reparse.
+    /// This translator is temporary; its provisional core AST is discarded here.
+    pub fn normalize_view_source_for_rewrite(
+        &self,
+        parse: &mut crate::ParseResult,
+    ) -> Result<String, ParseError> {
+        if self.source_origins.borrow().is_some() || self.source_contracts.borrow().is_some() {
+            return Err(view_origin_error("view source normalization is already active"));
+        }
+        // Validate the supported native shape before running the translation.
+        walk_view_source_names(&mut parse.protobuf, &mut |_, _| Ok(()))?;
+        struct Clear<'a>(&'a std::cell::RefCell<Option<ViewSourceOutputContracts>>);
+        impl Drop for Clear<'_> {
+            fn drop(&mut self) { self.0.replace(None); }
+        }
+        self.source_contracts.replace(Some(ViewSourceOutputContracts::default()));
+        let _clear = Clear(&self.source_contracts);
+        drop(self.translate(parse)?);
+        let mut contracts = self.source_contracts.borrow_mut().take()
+            .expect("the normalization collector is present until it is taken");
+        walk_view_source(&mut parse.protobuf, &mut |_, _| Ok(()), Some(&mut contracts))?;
+        if !contracts.range_aliases.is_empty() || !contracts.target_aliases.is_empty() {
+            return Err(view_origin_error("view source output contract was not found"));
+        }
+        crate::deparse(&parse.protobuf)
+    }
+
+    fn record_range_output_contract(
+        &self,
+        source: &pg_query::protobuf::RangeVar,
+        columns: &[String],
+    ) {
+        if let Some(contracts) = self.source_contracts.borrow_mut().as_mut() {
+            contracts.range_aliases.insert(source as *const _ as usize, columns.to_vec());
+        }
+    }
+
+    fn record_target_output_contract(
+        &self,
+        source: &pg_query::protobuf::ResTarget,
+        alias: &Option<ast::As>,
+    ) -> Result<(), ParseError> {
+        if !source.name.is_empty() || self.source_contracts.borrow().is_none() {
+            return Ok(());
+        }
+        // The caller only invokes this for one expression output, never a star.
+        // Reuse the actual alias selected by translate_target_list where present;
+        // otherwise use the same FigureColname authority for a plain reference.
+        let name = match alias {
+            Some(alias) => alias.name().as_str().to_owned(),
+            None => figure_colname(source.val.as_deref()
+                .ok_or_else(|| view_origin_error("view target has no expression"))?)?,
+        };
+        if let Some(contracts) = self.source_contracts.borrow_mut().as_mut() {
+            contracts.target_aliases.insert(source as *const _ as usize, name);
+        }
+        Ok(())
     }
 }
