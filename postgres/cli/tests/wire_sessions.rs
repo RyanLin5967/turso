@@ -14018,3 +14018,144 @@ fn c50_class4_numeric_inputs_use_postgresql_whitespace() {
     assert_eq!(r.oids, Some(vec![23, 1700, 701]));
     assert_eq!(r.rows, vec![vec![Some("1".into()), Some("1.5".into()), Some("1.5".into())]]);
 }
+
+// PG18.6 c50-pg18-integer-precedence.txt records the point where each width's
+// accumulating overflow takes precedence over a later invalid input byte.
+const C50_INTEGER_INPUT_CASES: &[(&str, u32, &str, &str)] = &[
+    ("smallint", 21, "32767x", "22P02"),
+    ("smallint", 21, "32768x", "22P02"),
+    ("smallint", 21, "327680x", "22003"),
+    ("smallint", 21, "327680_", "22003"),
+    ("smallint", 21, "0x8000g", "22P02"),
+    ("smallint", 21, "0x80000g", "22003"),
+    ("integer", 23, "2147483647x", "22P02"),
+    ("integer", 23, "2147483648x", "22P02"),
+    ("integer", 23, "21474836480x", "22003"),
+    ("integer", 23, "21474836480_", "22003"),
+    ("integer", 23, "0x80000000g", "22P02"),
+    ("integer", 23, "0x800000000g", "22003"),
+    ("bigint", 20, "9223372036854775807x", "22P02"),
+    ("bigint", 20, "9223372036854775808x", "22P02"),
+    ("bigint", 20, "92233720368547758080x", "22003"),
+    ("bigint", 20, "92233720368547758080_", "22003"),
+    ("bigint", 20, "0x8000000000000000g", "22P02"),
+    ("bigint", 20, "0x80000000000000000g", "22003"),
+];
+
+fn c50_integer_input_message(ty: &str, input: &str, code: &str) -> String {
+    if code == "22003" {
+        format!("value \"{input}\" is out of range for type {ty}")
+    } else {
+        format!("invalid input syntax for type {ty}: \"{input}\"")
+    }
+}
+
+#[test]
+fn c50_class5_integer_cast_error_precedence_uses_target_width() {
+    let dir = Scratch::new("c50-input-cast-precedence");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for &(ty, _, input, code) in C50_INTEGER_INPUT_CASES {
+        let sql = format!("SELECT '{input}'::{ty}");
+        let e = a.q(&sql).err(&sql);
+        assert_eq!(e.code, code, "{sql}");
+        assert_eq!(e.message, c50_integer_input_message(ty, input, code), "{sql}");
+    }
+}
+
+#[test]
+fn c50_class5_integer_bind_error_precedence_matches_input_function() {
+    let dir = Scratch::new("c50-input-bind-precedence");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for &(ty, oid, input, code) in C50_INTEGER_INPUT_CASES {
+        let sql = format!("SELECT $1::{ty}");
+        let e = a.xt(&sql, &[(oid, 0, input.as_bytes())]).err(&sql);
+        assert_eq!(e.code, code, "{input}::{ty}");
+        assert_eq!(e.message, c50_integer_input_message(ty, input, code), "{input}::{ty}");
+    }
+}
+
+#[test]
+fn c50_class5_integer_input_validation_keeps_recorded_messages_and_codes() {
+    let dir = Scratch::new("c50-input-validation");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for &(ty, _, input, code) in C50_INTEGER_INPUT_CASES {
+        let sql = format!("SELECT message,sql_error_code FROM pg_input_error_info('{input}','{ty}')");
+        let r = a.q(&sql).ok(&sql);
+        assert_eq!(r.rows, vec![vec![Some(c50_integer_input_message(ty, input, code)), Some(code.into())]], "{sql}");
+    }
+    for (input, ty) in [("0x8000", "smallint"), ("0x80000000", "integer"), ("0x8000000000000000", "bigint")] {
+        let sql = format!("SELECT message,sql_error_code FROM pg_input_error_info('{input}','{ty}')");
+        let r = a.q(&sql).ok(&sql);
+        assert_eq!(r.rows, vec![vec![Some(c50_integer_input_message(ty, input, "22003")), Some("22003".into())]], "{sql}");
+    }
+    let sql = "SELECT message,sql_error_code FROM pg_input_error_info('1_000','integer')";
+    assert_eq!(a.q(sql).ok(sql).rows, vec![vec![None, None]]);
+    let sql = "SELECT pg_input_is_valid('0x7fff','smallint'),pg_input_is_valid('1_000','integer'),pg_input_is_valid('-0x8000000000000000','bigint')";
+    assert_eq!(a.q(sql).ok(sql).rows, vec![vec![Some("t".into()), Some("t".into()), Some("t".into())]]);
+}
+
+#[test]
+fn c50_class5_numeric_moving_sum_drops_the_outgoing_scale() {
+    let dir = Scratch::new("c50-numeric-window-scale");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE c50_sum_scale(n integer,v numeric)").ok("table");
+    for (values, expected) in [
+        ("(1,1.00),(2,2),(3,3)", vec!["1.00", "3.00", "5"]),
+        ("(1,1.00),(2,2),(3,NULL),(4,3)", vec!["1.00", "3.00", "2", "3"]),
+    ] {
+        a.q(&format!("INSERT INTO c50_sum_scale VALUES{values}")).ok("values");
+        let sql = "SELECT sum(v) OVER(ORDER BY n ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM c50_sum_scale";
+        let r = a.q(sql).ok(sql);
+        assert_eq!(r.oids, Some(vec![1700]));
+        let expected: Vec<Vec<Option<String>>> = expected.into_iter().map(|v| vec![Some(v.into())]).collect();
+        assert_eq!(r.rows, expected, "{values}");
+        a.q("DELETE FROM c50_sum_scale").ok("clear");
+    }
+}
+
+#[test]
+fn c50_class5_mixed_real_arithmetic_keeps_double_precision_values() {
+    let dir = Scratch::new("c50-mixed-real-values");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let sql = "SELECT 16777217 + 0::float4,16777217::numeric + 0::float4";
+    assert_eq!(a.q(sql).ok(sql).rows, vec![vec![Some("16777217".into()), Some("16777217".into())]]);
+    let sql = "SELECT 1e100::numeric + 0::float4";
+    assert_eq!(a.q(sql).single(sql), "1e+100");
+}
+
+#[test]
+fn c50_class5_float_narrowing_uses_range_diagnostics() {
+    let dir = Scratch::new("c50-float-cast-message");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for (value, message) in [("1e100", "value out of range: overflow"), ("1e-100", "value out of range: underflow")] {
+        let sql = format!("SELECT ({value}::float8)::float4");
+        let e = a.q(&sql).err(&sql);
+        assert_eq!(e.code, "22003");
+        assert_eq!(e.message, message);
+    }
+}
+
+#[test]
+fn c50_class5_division_zero_uses_the_existing_typed_error() {
+    let dir = Scratch::new("c50-divide-zero");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for ty in ["int2", "int4", "int8", "float4", "float8"] {
+        let sql = format!("SELECT 1::{ty}/0::{ty}");
+        let e = a.q(&sql).err(&sql);
+        assert_eq!(e.code, "22012", "{sql}");
+        assert_eq!(e.message, "division by zero", "{sql}");
+    }
+    let sql = "SELECT 'Infinity'::float8/0::float8";
+    let e = a.q(sql).err(sql);
+    assert_eq!(e.code, "22012");
+    assert_eq!(e.message, "division by zero");
+    let sql = "SELECT NULL::int4/0::int4,NULL::float8/0::float8";
+    assert_eq!(a.q(sql).ok(sql).rows, vec![vec![None, None]]);
+}
