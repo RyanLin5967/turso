@@ -994,7 +994,7 @@ pub(crate) fn thread_allocs() -> (u64, u64, u64, u64) {
 
 fn user_counts() -> Snapshot {
     let get = |c: &'static std::thread::LocalKey<Cell<u64>>| c.with(|c| c.get());
-    let syncs = crate::branch::sync_counts();
+    let syncs = crate::branch::store::own_sync_counts();
     Snapshot {
         instructions: None,
         allocs: ALLOCS.load(Relaxed),
@@ -1019,7 +1019,7 @@ fn user_counts() -> Snapshot {
         held_unattributed: HELD_UNATTRIBUTED.load(Relaxed),
         foreign: 0,
         attributed_syscalls: None,
-        held_syncs: crate::branch::store::syncs_under_store_mutex(),
+        held_syncs: crate::branch::store::own_test_counts().syncs_under_store_mutex,
         fsync: syncs.fsync,
         full_fsync: syncs.full_fsync,
         barrier: syncs.barrier,

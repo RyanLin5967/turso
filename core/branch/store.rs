@@ -1619,10 +1619,62 @@ fn count_in_scope(field: impl Fn(&StoreCounts) -> &AtomicU64, n: u64) {
 }
 
 /// Test builds: a branch file's sync (`journal::fsync_file` and its kin), kind as in
-/// `StoreCounts::syncs`: the innermost store's.
+/// `StoreCounts::syncs`: the innermost store's. In no store's scope (a test syncing a bare file,
+/// or a gap), it is this thread's own (`OWN_BARE_SYNCS`) and a gap (`UNSCOPED`).
 #[cfg(test)]
 pub(crate) fn note_branch_sync(kind: usize) {
+    if SCOPE.with(|s| s.borrow().is_empty()) {
+        OWN_BARE_SYNCS.with(|b| b[kind].set(b[kind].get() + 1));
+    }
     count_in_scope(|c| &c.syncs[kind], 1);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The stores this thread opened (test builds): a test's own (`own_sync_counts`).
+    static OWN_STORES: std::cell::RefCell<Vec<Arc<StoreCounts>>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Syncs this thread made of branch files no store owns, by kind (test builds).
+    static OWN_BARE_SYNCS: [std::cell::Cell<u64>; 4] = const { [const { std::cell::Cell::new(0) }; 4] };
+}
+
+/// Test builds: the syncs of the stores this thread opened (each store's branch files, catalog and
+/// trunk database, on any thread), plus this thread's own syncs of bare files: what a test's own work
+/// synced, never another test's (the per-store counter class, lead ruling d9cf2b609b).
+#[cfg(test)]
+pub(crate) fn own_sync_counts() -> super::SyncCounts {
+    let mut k = [0u64; 4];
+    OWN_STORES.with(|stores| {
+        for c in stores.borrow().iter() {
+            for (i, v) in k.iter_mut().enumerate() {
+                *v += c.syncs[i].load(Ordering::Relaxed);
+            }
+        }
+    });
+    OWN_BARE_SYNCS.with(|b| {
+        for (i, v) in k.iter_mut().enumerate() {
+            *v += b[i].get();
+        }
+    });
+    super::SyncCounts { fsync: k[0], full_fsync: k[1], barrier: k[2], barrier_fallback: k[3] }
+}
+
+/// Test builds: `StoreTestCounts` summed over the stores this thread opened.
+#[cfg(test)]
+pub(crate) fn own_test_counts() -> StoreTestCounts {
+    let mut t = StoreTestCounts::default();
+    OWN_STORES.with(|stores| {
+        for c in stores.borrow().iter() {
+            let get = |a: &AtomicU64| a.load(Ordering::Relaxed);
+            t.capture_entered += get(&c.capture_entered);
+            t.capture_arena_handles += get(&c.capture_arena_handles);
+            t.capture_rows_built += get(&c.capture_rows_built);
+            t.frozen_rows_written += get(&c.frozen_rows_written);
+            t.install_cuts += get(&c.install_cuts);
+            t.install_rewrites += get(&c.install_rewrites);
+            t.syncs_under_store_mutex += get(&c.syncs_under_store_mutex);
+        }
+    });
+    t
 }
 
 #[cfg(test)]
@@ -4799,6 +4851,8 @@ impl BranchStore {
         let counts = Arc::new(StoreCounts::default());
         #[cfg(test)]
         let _scope = CountScope::enter(&counts);
+        #[cfg(test)]
+        OWN_STORES.with(|s| s.borrow_mut().push(counts.clone()));
         #[cfg(test)]
         if !crate::is_memory_like(db_path) {
             register_path(db_path, &counts);

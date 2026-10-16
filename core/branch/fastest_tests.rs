@@ -55,9 +55,9 @@ fn seed(conn: &Arc<Connection>) {
 
 /// The syncs `f` issued, as `(fsync, F_FULLFSYNC)`.
 fn syncs_of(f: impl FnOnce()) -> (u64, u64) {
-    let before = sync_counts();
+    let before = super::store::own_sync_counts();
     f();
-    let after = sync_counts();
+    let after = super::store::own_sync_counts();
     (after.fsync - before.fsync, after.full_fsync - before.full_fsync)
 }
 
@@ -219,9 +219,9 @@ fn a_full_fsync_trunk_connection_raises_the_pre_image_barrier() {
         seed(&trunk);
         let b = trunk.fork_branch().unwrap();
         trunk.execute("PRAGMA fullfsync = ON").unwrap();
-        let before = sync_counts();
+        let before = super::store::own_sync_counts();
         trunk.execute("UPDATE t SET v = 'new' WHERE id = 7").unwrap();
-        let after = sync_counts();
+        let after = super::store::own_sync_counts();
         let counted = (
             after.fsync - before.fsync,
             after.full_fsync - before.full_fsync,
@@ -2246,9 +2246,9 @@ fn the_sync_counter_counts_a_barrier_under_its_own_primitive() {
     let file = super::journal::open_rw(&dir.path().join("f"), true).unwrap();
     super::journal::write_at(&file, b"x", 0).unwrap();
     let counted = |class| {
-        let before = sync_counts();
+        let before = super::store::own_sync_counts();
         super::journal::barrier_file(&file, class).unwrap();
-        let after = sync_counts();
+        let after = super::store::own_sync_counts();
         (after.fsync - before.fsync, after.full_fsync - before.full_fsync, after.barrier - before.barrier)
     };
     assert_eq!(counted(SyncClass::Off), (0, 0, 0), "D0 ordered a branch file");
@@ -2272,9 +2272,9 @@ fn a_d2_first_write_orders_its_slots_with_one_barrier() {
         seed(&trunk);
         let b = trunk.fork_branch().unwrap();
         let bc = b.connect().unwrap();
-        let before = sync_counts();
+        let before = super::store::own_sync_counts();
         write_v(&bc, 3, "mine");
-        let after = sync_counts();
+        let after = super::store::own_sync_counts();
         assert_eq!(after.fsync - before.fsync, 1, "catalog={catalog}: the slots were not synced");
         assert_eq!(after.barrier - before.barrier, 0, "catalog={catalog}");
         assert_eq!(after.full_fsync - before.full_fsync, 1, "catalog={catalog}");
@@ -2513,9 +2513,9 @@ fn a_retaining_d2_trunk_commit_barriers_its_slot_and_its_record() {
         let trunk = db.connect().unwrap();
         seed(&trunk);
         let _b = trunk.fork_branch().unwrap();
-        let before = sync_counts();
+        let before = super::store::own_sync_counts();
         write_v(&trunk, 7, "new");
-        let after = sync_counts();
+        let after = super::store::own_sync_counts();
         assert_eq!(after.barrier - before.barrier, 2, "catalog={catalog}: the slot's and the record's barriers");
     }
 }
@@ -2641,14 +2641,14 @@ fn a_checkpoint_issues_no_sync_inside_the_store_mutex() {
         let _first = trunk.fork_branch().unwrap().into_id();
         let _t = Threshold::set(8 << 10);
         let installed = db.branch_checkpoint_counters()[0];
-        let before = super::store::syncs_under_store_mutex();
+        let before = super::store::own_test_counts().syncs_under_store_mutex;
         for i in 0..pairs {
             let b = trunk.fork_branch().unwrap();
             write_v(&b.connect().unwrap(), 1 + (i as i64 % 50), "w");
             let _ = b.into_id();
         }
         db.branch_checkpoint_wait();
-        let under = super::store::syncs_under_store_mutex() - before;
+        let under = super::store::own_test_counts().syncs_under_store_mutex - before;
         let ran = db.branch_checkpoint_counters()[0] - installed;
         assert!(ran >= 3, "class={class:?}: premise: at least three checkpoints ran ({ran})");
         assert_eq!(under, 0, "class={class:?}: {ran} checkpoints issued {under} syncs inside the store mutex");
@@ -2803,9 +2803,9 @@ fn a_d2_first_write_is_one_full_fsync_and_one_plain_fsync() {
         seed(&trunk);
         let b = trunk.fork_branch().unwrap();
         let bc = b.connect().unwrap();
-        let before = sync_counts();
+        let before = super::store::own_sync_counts();
         write_v(&bc, 3, "mine");
-        let after = sync_counts();
+        let after = super::store::own_sync_counts();
         assert_eq!(
             (
                 after.fsync - before.fsync,
@@ -3274,12 +3274,12 @@ fn a_logged_release_is_durable_in_the_trunks_class_before_the_next_trunk_commit(
             let x = trunk.fork_branch().unwrap().into_id();
             db.branch_lease_clock_advance(std::time::Duration::from_secs(3600));
             assert!(db.expire_branches().unwrap().reaped.contains(&x), "premise: the lease expired");
-            let before = all(sync_counts());
+            let before = all(super::store::own_sync_counts());
             write_v(&trunk, 7, "new");
-            let first = all(sync_counts()) - before;
-            let before = all(sync_counts());
+            let first = all(super::store::own_sync_counts()) - before;
+            let before = all(super::store::own_sync_counts());
             write_v(&trunk, 8, "new");
-            let second = all(sync_counts()) - before;
+            let second = all(super::store::own_sync_counts()) - before;
             assert!(second >= 1, "catalog={catalog} store={store:?}: premise: the trunk commit synced its WAL");
             assert!(
                 first > second,
@@ -3322,9 +3322,9 @@ fn a_failed_barrier_fail_stops_and_only_an_unsupported_one_falls_back() {
             let b = trunk.fork_branch().unwrap();
             trunk.execute("PRAGMA fullfsync = ON").unwrap();
             super::journal::fail_next_barrier(errno);
-            let before = sync_counts();
+            let before = super::store::own_sync_counts();
             let committed = trunk.execute("UPDATE t SET v = 'new' WHERE id = 7");
-            let after = sync_counts();
+            let after = super::store::own_sync_counts();
             assert_eq!(
                 super::journal::barrier_errno_pending(),
                 0,
@@ -3467,9 +3467,9 @@ fn ordered_trunk_mode_trusts_only_a_full_fsync_of_the_branch_files_device() {
             seed(&trunk);
             let b = trunk.fork_branch().unwrap();
             trunk.execute("PRAGMA fullfsync = ON").unwrap();
-            let before = sync_counts();
+            let before = super::store::own_sync_counts();
             trunk.execute("UPDATE t SET v = 'new' WHERE id = 7").unwrap();
-            let after = sync_counts();
+            let after = super::store::own_sync_counts();
             let (full, barrier) = (after.full_fsync - before.full_fsync, after.barrier - before.barrier);
             let wal = u64::from(!noop_sync);
             if arm == "control" {
@@ -5353,12 +5353,12 @@ fn a_held_free_upgrade_syncs_the_arena_and_the_log() {
         eventually(&format!("{what}: premise: the background writer never found the upgrade due"), || {
             db.branches.confirm_held_for_test() == super::store::HOLD_UPGRADE_DUE | super::store::HOLD_ARRIVED
         });
-        let before = sync_counts();
+        let before = super::store::own_sync_counts();
         db.branches.confirm_hold_for_test(0);
         eventually(&format!("{what}: the held slots never came free"), || {
             slots.iter().all(|&s| db.branch_slot_is_free(s))
         });
-        let after = sync_counts();
+        let after = super::store::own_sync_counts();
         assert_eq!(
             (after.fsync - before.fsync, after.full_fsync - before.full_fsync),
             (2, 0),
@@ -5459,7 +5459,7 @@ fn a_checkpoint_that_cannot_start_is_not_retried_by_the_next_create() {
         let _first = trunk.fork_branch().unwrap().into_id();
         let _t = Threshold::set(8 << 10);
         db.branch_failpoint(Some(fp));
-        let entered = || super::store::CAPTURE_ENTERED.load(std::sync::atomic::Ordering::Relaxed);
+        let entered = || super::store::own_test_counts().capture_entered;
         let before = entered();
         let t = std::time::Instant::now();
         while entered() == before {
@@ -5471,6 +5471,9 @@ fn a_checkpoint_that_cannot_start_is_not_retried_by_the_next_create() {
         for _ in 0..5 {
             let _ = trunk.fork_branch().unwrap().into_id();
         }
+        // The L2(d) review's LOW 4: a retry runs on the checkpoint worker, so it is waited for
+        // before the count is read; without the wait the mutant was caught only by timing.
+        db.branch_checkpoint_wait();
         assert_eq!(entered(), after, "{fp:?}: the next creates retried the checkpoint's capture");
     }
 }
@@ -5490,7 +5493,7 @@ fn a_capture_that_fails_appends_no_checkpoint_marker() {
     seed(&trunk);
     let _first = trunk.fork_branch().unwrap().into_id();
     db.branch_failpoint(Some(BranchFailpoint::CaptureFails));
-    let entered = || super::store::CAPTURE_ENTERED.load(std::sync::atomic::Ordering::Relaxed);
+    let entered = || super::store::own_test_counts().capture_entered;
     let (lsn, before) = (db.branches.log_lsn_for_test(), entered());
     assert!(!db.branch_checkpoint_fuzzy_now().unwrap(), "a checkpoint started through the failpoint");
     assert_eq!(entered(), before + 1, "premise: the capture was entered");
@@ -5521,7 +5524,7 @@ fn a_failed_checkpoint_start_backs_off_for_one_threshold_and_no_longer() {
         seed(&trunk);
         let _first = trunk.fork_branch().unwrap().into_id();
         let _t = Threshold::set(threshold);
-        let entered = || super::store::CAPTURE_ENTERED.load(std::sync::atomic::Ordering::Relaxed);
+        let entered = || super::store::own_test_counts().capture_entered;
         let len = || db.branches.log_len_for_test();
         let fork = || {
             let _ = trunk.fork_branch().unwrap().into_id();
@@ -5582,7 +5585,7 @@ fn a_capture_whose_arena_handle_fails_appends_no_checkpoint_marker() {
     let dir = tempfile::TempDir::new().unwrap();
     let (db, _trunk, _keep) = raised_d0_with_an_unsynced_slot(dir.path());
     db.branch_failpoint(Some(BranchFailpoint::ArenaHandleFails));
-    let entered = || super::store::CAPTURE_ENTERED.load(std::sync::atomic::Ordering::Relaxed);
+    let entered = || super::store::own_test_counts().capture_entered;
     let (lsn, before) = (db.branches.log_lsn_for_test(), entered());
     assert!(db.branch_compact_now().is_err(), "premise: the capture's arena handle failed");
     assert_eq!(entered(), before + 1, "premise: the capture was entered");
@@ -6253,9 +6256,9 @@ fn a_failed_trunk_wal_sync_under_an_ordered_barrier_fail_stops_the_store() {
                 trunk.execute("PRAGMA data_sync_retry = 1").unwrap();
             }
             armed.store(mode, std::sync::atomic::Ordering::Release);
-            let before = sync_counts();
+            let before = super::store::own_sync_counts();
             let failed = trunk.execute("UPDATE t SET v = 'new' WHERE id = 7");
-            let after = sync_counts();
+            let after = super::store::own_sync_counts();
             assert_eq!(armed.load(std::sync::atomic::Ordering::Acquire), 0, "{what}: premise: the WAL's sync was reached");
             assert!(failed.is_err(), "{what}: premise: the failed WAL sync failed the commit");
             assert!(after.barrier > before.barrier, "{what}: premise: the commit's pre-image was ordered, not flushed");
@@ -6307,11 +6310,11 @@ fn every_trunk_wal_sync_failure_site_fail_stops_on_its_own() {
                 trunk.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
             }
             armed.store(mode, std::sync::atomic::Ordering::Release);
-            let before = sync_counts();
+            let before = super::store::own_sync_counts();
             let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 trunk.execute("UPDATE t SET v = 'new' WHERE id = 7")
             }));
-            let after = sync_counts();
+            let after = super::store::own_sync_counts();
             assert_eq!(armed.load(std::sync::atomic::Ordering::Acquire), 0, "{what}: premise: the WAL's sync was reached");
             match failed {
                 Ok(r) => assert!(r.is_err(), "{what}: premise: the failed WAL sync failed the commit"),
@@ -6620,9 +6623,9 @@ fn a_frameless_trunk_commit_that_ordered_a_release_stalls_no_waiter() {
         let release = std::thread::spawn(move || x.reap().map(|_| ()));
         wait_hold(&hold, super::store::HOLD_RELEASE_BUFFERED);
         super::store::PENDING_FULL_WAIT_MS.store(60_000, std::sync::atomic::Ordering::Release);
-        let before = sync_counts();
+        let before = super::store::own_sync_counts();
         trunk.execute("UPDATE t SET v = v WHERE id = -1").unwrap();
-        let after = sync_counts();
+        let after = super::store::own_sync_counts();
         let t = std::time::Instant::now();
         hold.store(0, std::sync::atomic::Ordering::Release);
         release.join().unwrap().unwrap();
@@ -6724,7 +6727,7 @@ fn a_fuzzy_checkpoint_takes_no_arena_handle_of_its_own() {
             r
         });
         wait_hold(&hold, super::store::HOLD_FLIGHT_TAKEN);
-        let handles = || super::store::CAPTURE_ARENA_HANDLES.load(std::sync::atomic::Ordering::Relaxed);
+        let handles = || super::store::own_test_counts().capture_arena_handles;
         let before = handles();
         let started = db.branch_checkpoint_fuzzy_now();
         hold.store(0, std::sync::atomic::Ordering::Release);
@@ -6972,9 +6975,9 @@ fn a_failed_barrier_on_a_kernel_that_promotes_it_fail_stops_whatever_its_errno()
             let b = trunk.fork_branch().unwrap();
             trunk.execute("PRAGMA fullfsync = ON").unwrap();
             super::journal::fail_next_barrier(errno);
-            let before = sync_counts();
+            let before = super::store::own_sync_counts();
             let committed = trunk.execute("UPDATE t SET v = 'new' WHERE id = 7");
-            let after = sync_counts();
+            let after = super::store::own_sync_counts();
             assert_eq!(
                 super::journal::barrier_errno_pending(),
                 0,
@@ -7267,7 +7270,7 @@ fn a_retried_checkpoint_does_not_stall_every_operation() {
         let _first = trunk.fork_branch().unwrap().into_id();
         let _t = Threshold::set(8 << 10);
         db.branch_failpoint(Some(fp));
-        let entered = || super::store::CAPTURE_ENTERED.load(std::sync::atomic::Ordering::Relaxed);
+        let entered = || super::store::own_test_counts().capture_entered;
         let failed_at = entered();
         let t = std::time::Instant::now();
         while entered() == failed_at {
@@ -7326,8 +7329,8 @@ fn a_failed_capture_builds_no_row() {
     // FLAGGED instrument change (L2(d) slice 2): a fuzzy capture builds no row since 94b34fa3b;
     // its rows are encoded on the writer's thread (`FROZEN_ROWS_WRITTEN`), so both counters are
     // read: the capture's own (this thread) and the writer's. The claim is unchanged.
-    let rows = || super::store::CAPTURE_ROWS_BUILT.load(std::sync::atomic::Ordering::Relaxed) + super::store::FROZEN_ROWS_WRITTEN.load(std::sync::atomic::Ordering::Relaxed);
-    let entered = || super::store::CAPTURE_ENTERED.load(std::sync::atomic::Ordering::Relaxed);
+    let rows = || super::store::own_test_counts().capture_rows_built + super::store::own_test_counts().frozen_rows_written;
+    let entered = || super::store::own_test_counts().capture_entered;
     db.branch_failpoint(Some(BranchFailpoint::CaptureFails));
     let (rows0, entered0) = (rows(), entered());
     assert!(!db.branch_checkpoint_fuzzy_now().unwrap(), "premise: the capture failed");
@@ -8098,9 +8101,9 @@ fn a_damaged_slot_of_an_ordered_last_flight_is_refused_when_read() {
             trunk.execute("PRAGMA fullfsync = ON").unwrap();
             let x = trunk.fork_branch().unwrap();
             let before: std::collections::HashSet<u32> = db.branch_slots_in_use().into_iter().collect();
-            let barriers = sync_counts().barrier;
+            let barriers = super::store::own_sync_counts().barrier;
             write_v(&trunk, 3, "new");
-            assert!(sync_counts().barrier > barriers, "catalog={catalog}: premise: the trunk commit's pre-image was ordered");
+            assert!(super::store::own_sync_counts().barrier > barriers, "catalog={catalog}: premise: the trunk commit's pre-image was ordered");
             let kept: Vec<u32> = db.branch_slots_in_use().into_iter().filter(|s| !before.contains(s)).collect();
             assert_eq!(kept.len(), 1, "catalog={catalog}: premise: the trunk commit kept one pre-image for x");
             let arena = arena_path(&db);
@@ -8151,9 +8154,9 @@ fn a_damaged_slot_of_an_unconfirmed_ordered_last_flight_is_refused_when_read() {
             trunk.execute("PRAGMA fullfsync = ON").unwrap();
             let x = trunk.fork_branch().unwrap();
             let before: std::collections::HashSet<u32> = db.branch_slots_in_use().into_iter().collect();
-            let barriers = sync_counts().barrier;
+            let barriers = super::store::own_sync_counts().barrier;
             write_v(&trunk, 3, "new");
-            assert!(sync_counts().barrier > barriers, "catalog={catalog}: premise: the trunk commit's pre-image was ordered");
+            assert!(super::store::own_sync_counts().barrier > barriers, "catalog={catalog}: premise: the trunk commit's pre-image was ordered");
             let kept: Vec<u32> = db.branch_slots_in_use().into_iter().filter(|s| !before.contains(s)).collect();
             assert_eq!(kept.len(), 1, "catalog={catalog}: premise: the trunk commit kept one pre-image for x");
             let arena = arena_path(&db);
@@ -8226,10 +8229,10 @@ fn a_damaged_slot_an_ordered_upgrade_made_durable_is_refused_when_read() {
             });
             // z's commit leads a D0 flight in the window: it carries the trunk commit's TrunkRetain.
             write_v(&zc, 40, "z");
-            let barriers = sync_counts().barrier;
+            let barriers = super::store::own_sync_counts().barrier;
             hold.store(0, O::Release);
             let trunk = committing.join().unwrap();
-            assert!(sync_counts().barrier > barriers, "catalog={catalog}: premise: the trunk commit's barrier was ordered");
+            assert!(super::store::own_sync_counts().barrier > barriers, "catalog={catalog}: premise: the trunk commit's barrier was ordered");
             let z_slots: std::collections::HashSet<u32> = z.owned_slots().into_iter().collect();
             let kept: Vec<u32> = db
                 .branch_slots_in_use()
@@ -8592,11 +8595,11 @@ fn unconfirmed_workload(path: &Path, out: &Path, catalog: bool, class: SyncClass
         !db.branches.arena_dirty_for_test(),
         "{what}: premise: the trunk commit's barrier finds the arena's mark taken"
     );
-    let barriers = sync_counts().barrier;
+    let barriers = super::store::own_sync_counts().barrier;
     let written = db.branches.confirm_counts()[0];
     hold.store(0, O::Release);
     let trunk = committing.join().unwrap();
-    assert!(sync_counts().barrier > barriers, "{what}: premise: the trunk commit's barrier was ordered");
+    assert!(super::store::own_sync_counts().barrier > barriers, "{what}: premise: the trunk commit's barrier was ordered");
     assert_eq!(read_v(&trunk, 3), "new", "{what}: premise: the trunk commit was acknowledged");
     let t = std::time::Instant::now();
     while db.branches.confirm_counts()[0] == written && t.elapsed() < std::time::Duration::from_secs(2) {
@@ -8695,11 +8698,11 @@ fn a_damaged_slot_an_ordered_upgrade_made_durable_is_refused_after_a_cut() {
         });
         // z's commit leads a D0 flight in the window: it carries the trunk commit's TrunkRetain.
         write_v(&zc, 40, "z");
-        let barriers = sync_counts().barrier;
+        let barriers = super::store::own_sync_counts().barrier;
         let len = db.branches.log_len_for_test();
         hold.store(0, O::Release);
         let trunk = committing.join().unwrap();
-        assert!(sync_counts().barrier > barriers, "premise: the trunk commit's barrier was ordered");
+        assert!(super::store::own_sync_counts().barrier > barriers, "premise: the trunk commit's barrier was ordered");
         assert!(
             db.branches.log_len_for_test() > len,
             "premise: the ordered upgrade closed z's flight with an empty end frame"
@@ -8878,16 +8881,16 @@ fn a_d1_flight_after_a_fuzzy_cut_syncs_the_log_directory() {
         let _ = trunk.fork_branch().unwrap().into_id();
     }
     let len = db.branches.log_len_for_test();
-    let cuts = super::store::INSTALL_CUTS.load(std::sync::atomic::Ordering::Relaxed);
+    let cuts = super::store::own_test_counts().install_cuts;
     assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: a fuzzy checkpoint started");
     db.branch_checkpoint_wait();
     assert!(db.branches.log_len_for_test() < len, "premise: the checkpoint cut the log");
     // Strengthened (my own test, 0ac4f207d, unaccepted): the shortening must be a CUT (a prepared
     // cut finished at the install), not the install's fallback rewrite, which also shortens it.
     assert!(
-        super::store::INSTALL_CUTS.load(std::sync::atomic::Ordering::Relaxed) > cuts,
+        super::store::own_test_counts().install_cuts > cuts,
         "premise: the checkpoint finished a prepared cut (it fell back to a rewrite: {} rewrites so far)",
-        super::store::INSTALL_REWRITES.load(std::sync::atomic::Ordering::Relaxed)
+        super::store::own_test_counts().install_rewrites
     );
     let dirs = || super::journal::DIR_SYNCS.with(|c| c.get());
     let before = dirs();
@@ -11069,10 +11072,10 @@ fn a_raised_d0_cut_tail_is_copied_without_a_counted_sync() {
     let len = db.branches.log_len_for_test();
     let _ = trunk.fork_branch().unwrap().into_id();
     assert!(db.branches.log_len_for_test() > len, "premise: a create's flight wrote past the prepared cut");
-    let under = super::store::syncs_under_store_mutex();
+    let under = super::store::own_test_counts().syncs_under_store_mutex;
     db.branches.confirm_hold_for_test(0);
     eventually("the background compaction never completed", || !db.branches.compaction_owed_for_test());
-    let synced_under = super::store::syncs_under_store_mutex() - under;
+    let synced_under = super::store::own_test_counts().syncs_under_store_mutex - under;
     let after = db.branch_exception_counters();
     assert!(db.branches.log_len_for_test() < len, "premise: the log was cut");
     assert_eq!(synced_under, 0, "CLAIM: the cut synced {synced_under} times under the store mutex for a tail of only-written flights");
@@ -11097,9 +11100,9 @@ fn a_frameless_full_commit_after_a_synced_one_syncs_nothing() {
         trunk.execute("PRAGMA fullfsync = ON").unwrap();
         write_v(&trunk, 1, "a");
         write_v(&trunk, 2, "b");
-        let before = sync_counts();
+        let before = super::store::own_sync_counts();
         trunk.execute("UPDATE t SET v = v WHERE id = -1").unwrap();
-        let after = sync_counts();
+        let after = super::store::own_sync_counts();
         assert_eq!(
             (after.fsync - before.fsync, after.full_fsync - before.full_fsync),
             (0, 0),

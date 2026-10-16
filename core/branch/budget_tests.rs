@@ -455,7 +455,7 @@ fn hold_word(held: bool) {
 /// 25 ms spin, and a thread state that read "waiting" mid-pwrite. Whether the work since `s0`
 /// synced, and whether the writer settled.
 fn absorb_confirm(db: &Arc<Database>, s0: &probe::Snapshot) -> (bool, bool) {
-    let now = sync_counts();
+    let now = super::store::own_sync_counts();
     let synced = now.full_fsync != s0.full_fsync || now.fsync != s0.fsync;
     (synced, writer_settled(db, std::time::Duration::from_secs(1)))
 }
@@ -768,7 +768,7 @@ fn shared(cell: &str, db: &Arc<Database>, c: u64, out: &mut String) {
         // cannot leave the others parked for ever.
         let go = std::sync::atomic::AtomicBool::new(false);
         let e0 = exceptions(db);
-        let s0 = sync_counts();
+        let s0 = super::store::own_sync_counts();
         // Per client, from its start to its last acknowledgement: the store's condition-variable
         // waits (`store::thread_waits`, one per wait call, so a futile wake-up that waits again
         // counts again), and the most any one acknowledgement waited (review 2 H5: a sum is a mean,
@@ -865,7 +865,7 @@ fn shared(cell: &str, db: &Arc<Database>, c: u64, out: &mut String) {
             }
             per
         });
-        let s1 = sync_counts();
+        let s1 = super::store::own_sync_counts();
         let e1 = exceptions(db);
         let mut m = Sample::new();
         put_exceptions(&mut m, e0, e1);
@@ -1248,9 +1248,9 @@ fn open_once(path: &Path, log: &Path) -> Sample {
     let (m0, confirmed) = (std::fs::metadata(log).unwrap(), log_confirmed(log));
     let classes = || super::journal::CLASS_SYNCS.with(|c| [c[0].get(), c[1].get()]);
     let dirs = || super::journal::DIR_SYNCS.with(|c| c.get());
-    let (s0, c0, d0) = (sync_counts(), classes(), dirs());
+    let (s0, c0, d0) = (super::store::own_sync_counts(), classes(), dirs());
     let db = open_at(path);
-    let (s1, c1, d1) = (sync_counts(), classes(), dirs());
+    let (s1, c1, d1) = (super::store::own_sync_counts(), classes(), dirs());
     let m1 = std::fs::metadata(log).unwrap();
     // Counted since this open (`Outside::zero`).
     let exc = exceptions(&db);
@@ -1552,9 +1552,9 @@ fn first_create(cell: &str, out: &mut String) {
             };
             let trunk = db.connect().unwrap();
             let e0 = exceptions(&db);
-            let (c0, f0) = (probe::sql_counts(), sync_counts());
+            let (c0, f0) = (probe::sql_counts(), super::store::own_sync_counts());
             trunk.create_branch("m-0000").unwrap();
-            let (c1, f1) = (probe::sql_counts(), sync_counts());
+            let (c1, f1) = (probe::sql_counts(), super::store::own_sync_counts());
             let mut s = sql_sample(&c0, &c1);
             put_exceptions(&mut s, e0, exceptions(&db));
             s.insert("full_fsync", f1.full_fsync - f0.full_fsync);
