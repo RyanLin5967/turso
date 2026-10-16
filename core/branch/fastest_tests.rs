@@ -2749,6 +2749,47 @@ fn a_capture_neither_waits_for_nor_frees_a_release_in_the_air() {
     }
 }
 
+/// Review REVIEW-claude-engine-L2d M1 (DECISIONS 07c88bb280): every operation that owes a fuzzy
+/// checkpoint gets it started. Since 969e7a370 `maybe_compact` only owes the start, and only the
+/// paths that called `start_owed_flight` sent it; an expiry pass (`expire_branches`, `set_lease`,
+/// `open_conn`, the open's expiry, an erroring create) owed one that never started, so a workload of
+/// leases and expiries grew the log without bound. Here 1,000 leased branches expire in one
+/// `expire_branches`, whose Releases cross the 8 KiB threshold: a checkpoint must start after it,
+/// with no other operation. Mutant `flight_start_inline` (as before 969e7a370) is green too.
+#[test]
+fn an_expiry_that_crosses_the_threshold_starts_a_checkpoint() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(
+        &dir.path().join("expiry-owes.db"),
+        opts(true, SyncClass::Fsync).with_branch_checkpoint(super::BranchCheckpoint::Fuzzy),
+    );
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let _t = Threshold::set(8 << 10);
+    let mut held = Vec::new();
+    for _ in 0..1000 {
+        let b = trunk.fork_branch().unwrap();
+        b.lease(std::time::Duration::from_secs(60)).unwrap();
+        held.push(b);
+    }
+    db.branch_checkpoint_wait();
+    let started = db.branch_checkpoint_counters()[1];
+    db.branch_lease_clock_advance(std::time::Duration::from_secs(3600));
+    let expired = db.expire_branches().unwrap();
+    assert!(expired.reaped.len() >= 1000, "premise: the expiry reaped {} of 1,000 leased branches", expired.reaped.len());
+    let t = std::time::Instant::now();
+    while db.branch_checkpoint_counters()[1] == started && t.elapsed() < std::time::Duration::from_secs(10) {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    db.branch_checkpoint_wait();
+    assert!(
+        db.branch_checkpoint_counters()[1] > started,
+        "CLAIM: an expiry whose Releases crossed the threshold started no checkpoint ({started} started before it, as many after)"
+    );
+    drop(held);
+}
+
 /// Review 2 #5: a checkpoint that failed is not retried by the very next operation — the log is
 /// past the threshold still, so without a back-off every create would start (and pay for) another
 /// one: it waits for another threshold's worth of log.
