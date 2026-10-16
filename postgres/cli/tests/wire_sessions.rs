@@ -13483,3 +13483,111 @@ c52_recorded_types!(c52_expression_columns_have_pg_types, "pg18-colnames.out", [
 c52_recorded_types!(c52_numeric_literal_has_pg_type, "pg18-colnames.out", [7]);
 c52_recorded_types!(c52_catalog_columns_have_pg_types, "pg18-audit2-pg_indexes_and_pg_database_size_answer.out", [1, 2, 3, 4]);
 c52_recorded_types!(c52_pg_typeof_reads_the_inferred_type, "pg18-random.out", [1]);
+
+// C50 class cases recorded unchanged in C50-fix3/pg-class.out on PG 18.6.
+#[test]
+fn c50_class_expression_types_preserve_ranges_and_precision() {
+    let dir = Scratch::new("c50-class-types");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for (sql, expected) in [
+        ("SELECT coalesce(NULL::smallint,32767::integer)+1::smallint", "32768"),
+        ("SELECT CAST(CASE WHEN true THEN 0.5 ELSE 0.5 END AS int4)", "1"),
+        ("SELECT CAST(9007199254740993.0 + 0 AS bigint)", "9007199254740993"),
+        ("SELECT '32766.5'::numeric::int2", "32767"),
+        ("SELECT '32766.5'::float8::int2", "32766"),
+    ] { assert_eq!(a.q(sql).single(sql), expected, "{sql}"); }
+}
+
+#[test]
+fn c50_class_all_integer_widths_share_checked_operations() {
+    let dir = Scratch::new("c50-class-ops");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for (sql, message) in [
+        ("SELECT 2147483647::int4 - (-1)::int4", "integer out of range"),
+        ("SELECT 32767::int2 * 2::int2", "smallint out of range"),
+        ("SELECT '-32768'::int2 / (-1)::int2", "smallint out of range"),
+        ("SELECT '-2147483648'::int4 / (-1)::int4", "integer out of range"),
+        ("SELECT '-9223372036854775808'::int8 / (-1)::int8", "bigint out of range"),
+        ("SELECT -('-32768'::int2)", "smallint out of range"),
+        ("SELECT abs('-32768'::int2)", "smallint out of range"),
+        ("SELECT abs('-2147483648'::int4)", "integer out of range"),
+        ("SELECT '32767.5'::numeric::int2", "smallint out of range"),
+    ] {
+        let e = a.q(sql).err(sql);
+        assert_eq!((e.code.as_str(), e.message.as_str()), ("22003", message), "{sql}");
+    }
+}
+
+#[test]
+fn c50_class_numeric_assignment_retains_source_kind() {
+    let dir = Scratch::new("c50-class-writes");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE class_i(a smallint, b integer, c bigint)").ok("table");
+    let r = a.q("INSERT INTO class_i VALUES ('1.5'::numeric, '-1.5'::numeric, '9007199254740993.0'::numeric) RETURNING *").ok("insert");
+    assert_eq!(r.rows, vec![vec![Some("2".into()),Some("-2".into()),Some("9007199254740993".into())]]);
+    let r = a.q("UPDATE class_i SET a='2.5'::numeric, b='-2.5'::numeric, c=42.5 RETURNING *").ok("update");
+    assert_eq!(r.rows, vec![vec![Some("3".into()),Some("-3".into()),Some("43".into())]]);
+    for (sql,message) in [
+        ("INSERT INTO class_i VALUES ('32768'::numeric,0,0)","smallint out of range"),
+        ("UPDATE class_i SET b=2147483648","integer out of range"),
+    ] { let e=a.q(sql).err(sql); assert_eq!((e.code.as_str(),e.message.as_str()),("22003",message)); }
+}
+
+#[test]
+fn c50_class_integer_primary_key_checks_its_width() {
+    let dir=Scratch::new("c50-class-key"); let server=Server::start(&dir.db(),&[]); let mut a=server.connect();
+    a.q("CREATE TABLE class_pk(a integer PRIMARY KEY)").ok("table");
+    let e=a.q("INSERT INTO class_pk VALUES (2147483648)").err("overflow");
+    assert_eq!((e.code.as_str(),e.message.as_str()),("22003","integer out of range"));
+}
+
+#[test]
+fn c50_class_oid_cast_keeps_unsigned_range() {
+    let dir=Scratch::new("c50-class-oid"); let server=Server::start(&dir.db(),&[]); let mut a=server.connect();
+    assert_eq!(a.q("SELECT '4294967295'::oid").single("oid"),"4294967295");
+}
+
+#[test]
+fn c50_class_domain_cast_checks_base_width() {
+    let dir=Scratch::new("c50-class-domain"); let server=Server::start(&dir.db(),&[]); let mut a=server.connect();
+    a.q("CREATE DOMAIN class_small AS smallint").ok("domain");
+    let e=a.q("SELECT '32768'::class_small").err("overflow");
+    assert_eq!((e.code.as_str(),e.message.as_str()),("22003","value \"32768\" is out of range for type smallint"));
+    assert_eq!(a.q("SELECT '1.5'::numeric::class_small").single("rounded"),"2");
+}
+
+#[test]
+fn c50_class_numeric_special_cast_refusals() {
+    let dir=Scratch::new("c50-class-special-cast"); let server=Server::start(&dir.db(),&[]); let mut a=server.connect();
+    for (sql,message) in [
+        ("SELECT 'NaN'::numeric::int8","cannot convert NaN to bigint"),
+        ("SELECT 'Infinity'::numeric::int4","cannot convert infinity to integer"),
+    ] { let e=a.q(sql).err(sql); assert_eq!((e.code.as_str(),e.message.as_str()),("0A000",message)); }
+}
+
+#[test]
+fn c50_class_numeric_typmod_cast_retains_range_and_rounding() {
+    let dir=Scratch::new("c50-class-typmod"); let server=Server::start(&dir.db(),&[]); let mut a=server.connect();
+    assert_eq!(a.q("SELECT CAST('123.45' AS numeric(4,1))").single("round"),"123.5");
+    let e=a.q("SELECT CAST('123.45' AS numeric(3,1))").err("overflow");
+    assert_eq!((e.code.as_str(),e.message.as_str()),("22003","numeric field overflow"));
+}
+
+#[test]
+fn c50_class_numeric_special_comparisons() {
+    let dir=Scratch::new("c50-class-special-order"); let server=Server::start(&dir.db(),&[]); let mut a=server.connect();
+    let sql="SELECT '-Infinity'::numeric < 0::numeric, 'Infinity'::numeric < 'NaN'::numeric, 'NaN'::numeric = 'NaN'::numeric";
+    assert_eq!(a.q(sql).ok(sql).rows,vec![vec![Some("t".into()),Some("t".into()),Some("t".into())]]);
+}
+
+#[test]
+fn c50_class_sum_windows_keep_exact_total_and_remove_nan() {
+    let dir=Scratch::new("c50-class-sum-window"); let server=Server::start(&dir.db(),&[]); let mut a=server.connect();
+    for (sql,expected) in [
+        ("SELECT sum(x) OVER (ORDER BY n ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM (VALUES (1,9223372036854775807::int8),(2,1),(3,2))t(n,x)",vec!["9223372036854775807","9223372036854775808","3"]),
+        ("SELECT sum(x) OVER (ORDER BY n ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM (VALUES (1,'NaN'::numeric),(2,1),(3,2))t(n,x)",vec!["NaN","NaN","3"]),
+    ] { assert_eq!(a.q(sql).ok(sql).rows,expected.into_iter().map(|x|vec![Some(x.to_string())]).collect::<Vec<_>>()); }
+}
