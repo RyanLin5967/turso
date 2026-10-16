@@ -1,0 +1,70 @@
+>> Q DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public
+   C DROP SCHEMA
+   C CREATE SCHEMA
+   Z I
+>> Q CREATE TABLE t(i integer)
+   C CREATE TABLE
+   Z I
+>> Q DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public
+   N S=NOTICE C=00000 M=drop cascades to table t
+   C DROP SCHEMA
+   C CREATE SCHEMA
+   Z I
+>> Q CREATE TABLE p(i integer)
+   C CREATE TABLE
+   Z I
+>> Q DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public
+   N S=NOTICE C=00000 M=drop cascades to table p
+   C DROP SCHEMA
+   C CREATE SCHEMA
+   Z I
+>> Q CREATE TABLE s(i integer)
+   C CREATE TABLE
+   Z I
+>> Q DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public
+   N S=NOTICE C=00000 M=drop cascades to table s
+   C DROP SCHEMA
+   C CREATE SCHEMA
+   Z I
+>> Q CREATE TABLE first(i integer)
+   C CREATE TABLE
+   Z I
+>> Q CREATE TABLE second(i integer)
+   C CREATE TABLE
+   Z I
+>> Q DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public
+   N S=NOTICE C=00000 M=drop cascades to 2 other objects
+   C DROP SCHEMA
+   C CREATE SCHEMA
+   Z I
+>> Q CREATE TABLE first(i integer)
+   C CREATE TABLE
+   Z I
+>> Q CREATE TABLE second(i integer)
+   C CREATE TABLE
+   Z I
+>> Q CREATE TABLE third(i integer)
+   C CREATE TABLE
+   Z I
+>> Q DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public
+   N S=NOTICE C=00000 M=drop cascades to 3 other objects
+   C DROP SCHEMA
+   C CREATE SCHEMA
+   Z I
+>> Q CREATE TABLE first(i integer)
+   C CREATE TABLE
+   Z I
+>> Q CREATE TABLE second(i integer)
+   C CREATE TABLE
+   Z I
+>> Q CREATE TABLE third(i integer)
+   C CREATE TABLE
+   Z I
+>> Q CREATE TABLE fourth(i integer)
+   C CREATE TABLE
+   Z I
+>> Q DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public
+   N S=NOTICE C=00000 M=drop cascades to 4 other objects
+   C DROP SCHEMA
+   C CREATE SCHEMA
+   Z I

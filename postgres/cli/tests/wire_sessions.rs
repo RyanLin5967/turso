@@ -12276,6 +12276,12 @@ mod recorded {
         assert!(report.is_empty(), "{report}");
     }
 
+    #[test]
+    fn c56_reset_notices_follow_the_existing_public_objects() {
+        let recording = include_str!("c56-pg18-schema-reset-controls.out");
+        replay("c56-reset-controls", recording, recording, &[]);
+    }
+
     /// Replay an unchanged sequence of commands selected from a committed PG recording.
     pub(super) fn replay_selected(name: &str, recording: &str, ordinals: &[usize]) {
         let commands = parse(recording);
