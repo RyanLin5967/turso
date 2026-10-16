@@ -60,8 +60,8 @@ const CKPT_ROUNDS: u64 = 960;
 /// The shared-flight arm's client counts (lead, 2026-10-06: "creates per F_FULLFSYNC rising with C
 /// at C = 1, 8, 64, 256, 1024").
 const SHARED_CS: [u64; 5] = [1, 8, 64, 256, 1024];
-/// "Hold the confirmation word back": a quiet period no run reaches (2^40 ms, about 34.8 years).
-const CONFIRM_HELD_MS: u64 = 1 << 40;
+// "Hold the confirmation word back": a quiet period no run reaches (2^40 ms, about 34.8 years).
+use super::store::CONFIRM_HELD_MS;
 /// The memory cells' live branches: 10^4 (`N_LARGE`) and this.
 const N_HUGE: u64 = 100_000;
 /// Every measured branch name is this long (`m-0000`), so every create logs the same bytes.
@@ -309,6 +309,8 @@ fn sample_of(s0: &probe::Snapshot, s1: &probe::Snapshot, o0: &Outside, o1: &Outs
     s.insert("foreign_threads", s1.foreign);
     // Probe-adversary item 1: every sample records the probe's mode and the shim's lost count.
     s.insert("shim_loaded", u64::from(s1.shim_loaded));
+    // probe-adversary-2 L4: why a count was refused (`probe::Refusal`, 0 when it was not).
+    s.insert("refusal", s1.refusal as u64);
     s.insert("shim_lost", s1.shim_lost);
     s.insert("held_unattributed", delta(s0.held_unattributed, s1.held_unattributed));
     s.insert("held_syncs", delta(s0.held_syncs, s1.held_syncs));
@@ -1764,34 +1766,156 @@ fn run_instruments(cell: &str) -> String {
             }),
         );
     }
-    // (d) More threads than the 48 the table has room for: refused in every mode.
+    // (d) More threads than the 48 the table has room for: refused in every mode. The threads the
+    // table has no room for make calls inside the window (probe-adversary-2 M2: with none, the
+    // mutant `probe_full_table_trusted` kept the window's own 3, the truth, and died only of the
+    // refusal rule; with them it keeps a wrong count).
     {
-        use std::sync::atomic::{AtomicBool, Ordering::{Acquire, Release}};
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::{Acquire, Release}};
         let stop = Arc::new(AtomicBool::new(false));
+        let ids: Arc<std::sync::Mutex<Vec<u64>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let unlisted: Arc<std::sync::Mutex<std::collections::HashSet<u64>>> = Arc::default();
+        let roles = Arc::new(AtomicBool::new(false));
+        let go = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicU64::new(0));
+        // Listed workers park (no CPU time in the window); the unlisted ones spin on `go` with no
+        // call, then make 10 each: invisible to a table read as complete.
         let parked: Vec<_> = (0..50)
             .map(|_| {
-                let stop = stop.clone();
+                let (stop, ids, unlisted, roles, go, done) = (stop.clone(), ids.clone(), unlisted.clone(), roles.clone(), go.clone(), done.clone());
                 std::thread::spawn(move || {
+                    let mut me = 0u64;
+                    // SAFETY: this thread's own id into a local.
+                    unsafe { libc::pthread_threadid_np(0, &mut me) };
+                    ids.lock().unwrap().push(me);
+                    while !roles.load(Acquire) {
+                        std::thread::park_timeout(std::time::Duration::from_millis(1));
+                    }
+                    if unlisted.lock().unwrap().contains(&me) {
+                        while !go.load(Acquire) {
+                            std::hint::spin_loop();
+                        }
+                        for _ in 0..10 {
+                            // SAFETY: as above.
+                            unsafe { libc::close(-1) };
+                        }
+                        done.fetch_add(1, Release);
+                    }
                     while !stop.load(Acquire) {
-                        std::thread::park_timeout(std::time::Duration::from_millis(50));
+                        std::thread::park();
                     }
                 })
             })
             .collect();
-        put(
-            "fc_too_many_threads",
-            &window(&mut || {
-                for _ in 0..3 {
-                    // SAFETY: as above.
-                    unsafe { libc::close(-1) };
-                }
-            }),
-        );
+        while ids.lock().unwrap().len() < 50 {
+            std::thread::yield_now();
+        }
+        // The workers the thread table lists past its 48 slots.
+        let mut table = [probe::ThreadCpu::EMPTY; 128];
+        let n = probe::thread_table(&mut table).unwrap_or(0);
+        let mine: std::collections::HashSet<u64> = ids.lock().unwrap().iter().copied().collect();
+        let past: std::collections::HashSet<u64> = table[48.min(n)..n.min(128)].iter().map(|t| t.id).filter(|id| mine.contains(id)).collect();
+        let n_past = past.len() as u64;
+        *unlisted.lock().unwrap() = past;
+        roles.store(true, Release);
+        // The listed workers back in `park()` before the window opens.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut r = window(&mut || {
+            for _ in 0..3 {
+                // SAFETY: as above.
+                unsafe { libc::close(-1) };
+            }
+            go.store(true, Release);
+            while done.load(Acquire) < n_past {
+                std::hint::spin_loop();
+            }
+        });
+        r.insert("unlisted_callers", n_past);
+        put("fc_too_many_threads", &r);
         stop.store(true, Release);
         for t in parked {
             t.thread().unpark();
             t.join().unwrap();
         }
+    }
+    // (e) probe-adversary-2 M1: a thread the window spawns that is still running at its end makes
+    // more calls after it; the window is refused (it was Some(own + the thread's calls so far)).
+    {
+        use std::sync::atomic::{AtomicBool, Ordering::{Acquire, Release}};
+        let release = Arc::new(AtomicBool::new(false));
+        let r2 = release.clone();
+        let mut handle = None;
+        put(
+            "fc_spawned_outlives",
+            &window(&mut || {
+                let r2 = r2.clone();
+                handle = Some(std::thread::spawn(move || {
+                    for _ in 0..5 {
+                        // SAFETY: as above.
+                        unsafe { libc::close(-1) };
+                    }
+                    while !r2.load(Acquire) {
+                        std::thread::park_timeout(std::time::Duration::from_millis(1));
+                    }
+                    for _ in 0..10 {
+                        // SAFETY: as above.
+                        unsafe { libc::close(-1) };
+                    }
+                }));
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }),
+        );
+        release.store(true, Release);
+        if let Some(h) = handle {
+            h.join().unwrap();
+        }
+    }
+    // (f) probe-adversary-2 M3: a foreign thread makes ONE call the shim cannot see (syscall(2)) and
+    // none it can, while the window makes 5 it can: every foreign shim delta is 0 and only the sum
+    // check refuses (5 against the kernel's 6). Mutant `probe_sum_unchecked`.
+    {
+        use std::sync::atomic::{AtomicBool, Ordering::{Acquire, Release}};
+        let go = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicBool::new(false));
+        let ready = Arc::new(AtomicBool::new(false));
+        let (g, d, rd) = (go.clone(), done.clone(), ready.clone());
+        let h = std::thread::spawn(move || {
+            rd.store(true, Release);
+            while !g.load(Acquire) {
+                std::hint::spin_loop();
+            }
+            // SAFETY: getppid (BSD syscall 39) through syscall(2): one call the shim cannot see.
+            #[allow(deprecated)]
+            unsafe {
+                libc::syscall(39)
+            };
+            d.store(true, Release);
+            while g.load(Acquire) {
+                std::hint::spin_loop();
+            }
+        });
+        while !ready.load(Acquire) {
+            std::hint::spin_loop();
+        }
+        put(
+            "fc_shim_unseen_foreign",
+            &window(&mut || {
+                for _ in 0..5 {
+                    // SAFETY: as above.
+                    unsafe { libc::close(-1) };
+                }
+                go.store(true, Release);
+                while !done.load(Acquire) {
+                    std::hint::spin_loop();
+                }
+                let t = std::time::Instant::now();
+                while t.elapsed() < std::time::Duration::from_millis(30) {
+                    std::hint::spin_loop();
+                }
+            }),
+        );
+        go.store(false, Release);
+        h.join().unwrap();
     }
     put(
         "fc_close_37",
@@ -2635,9 +2759,18 @@ fn the_budget_syscall_counts_are_attributed_by_thread() {
     } else {
         assert!(quiet.get("syscalls").is_none(), "CLAIM: a window another thread ran in kept a count with no shim: {quiet:?}");
     }
-    for op in ["fc_shim_compensation", "fc_gone_thread", "fc_too_many_threads"] {
+    for op in ["fc_shim_compensation", "fc_gone_thread", "fc_too_many_threads", "fc_spawned_outlives", "fc_shim_unseen_foreign"] {
         let r = row(op);
         assert!(r.get("syscalls").is_none(), "CLAIM: {op} kept a syscall count (counter loaded: {shim}): {r:?}");
+    }
+    // Each refused for its own reason (probe-adversary-2 L4: `probe::Refusal`).
+    let reason = |op: &str| row(op)["refusal"];
+    assert!(row("fc_too_many_threads")["unlisted_callers"] >= 1, "premise: no thread past the table's 48 slots made a call");
+    assert_eq!(reason("fc_too_many_threads"), probe::Refusal::Table as u64, "CLAIM: fc_too_many_threads refused for another reason");
+    assert_eq!(reason("fc_gone_thread"), probe::Refusal::ThreadGone as u64, "CLAIM: fc_gone_thread refused for another reason");
+    assert_eq!(reason("fc_spawned_outlives"), probe::Refusal::ThreadNew as u64, "CLAIM: fc_spawned_outlives refused for another reason");
+    if shim {
+        assert_eq!(reason("fc_shim_unseen_foreign"), probe::Refusal::SumMismatch as u64, "CLAIM: fc_shim_unseen_foreign refused for another reason");
     }
     let spinner = row("fc_spinner_window");
     assert_eq!(spinner.get("syscalls").copied(), Some(7), "CLAIM: a declared spinner made the window foreign, or the count moved: {spinner:?}");

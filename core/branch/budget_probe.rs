@@ -85,6 +85,8 @@ pub(crate) struct HoldRec {
 pub(crate) static AUDIT: AtomicBool = AtomicBool::new(false);
 pub(crate) static AUDIT_LOG: std::sync::Mutex<Vec<HoldRec>> = std::sync::Mutex::new(Vec::new());
 pub(crate) static AUDIT_LOST: AtomicU64 = AtomicU64::new(0);
+/// Holds `attribute` refused (any thread), observation only.
+pub(crate) static HOLD_REFUSALS: AtomicU64 = AtomicU64::new(0);
 /// Threads that declared themselves syscall-free while they spin (`spinning`): their CPU time does
 /// not make a window or a hold foreign. At most 8 at once; 0 is a free slot.
 static SPINNERS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
@@ -499,7 +501,14 @@ pub(crate) fn store_unlocked() {
             // the mirror of the start's order (see `store_locked_at`).
             let c1 = HOLD_T0.with(|t0| t0.try_borrow().map(|t0| shim_counts(&t0[..])).unwrap_or([0; 48]));
             let lost1 = shim_lost();
-            if let Some(now) = unix_syscalls() {
+            // probe-adversary-2 L1: a hold whose end count cannot be read is unattributable, never
+            // silently dropped from both counts.
+            let now = unix_syscalls();
+            if now.is_none() {
+                HELD_UNATTRIBUTED.fetch_add(1, Relaxed);
+                bump(&T_HELD_UNATTRIBUTED, 1);
+            }
+            if let Some(now) = now {
                 let held = now.wrapping_sub(since) & u64::from(u32::MAX);
                 let mut t1 = [ThreadCpu::EMPTY; 48];
                 let n1 = thread_table(&mut t1);
@@ -509,6 +518,9 @@ pub(crate) fn store_unlocked() {
                         .ok()
                         .and_then(|t0| attribute(held, &t0[..], &HOLD_C0.with(|c| c.get()), &t1, &c1, ends, &[], false).0)
                 });
+                if attributed.is_none() {
+                    HOLD_REFUSALS.fetch_add(1, Relaxed);
+                }
                 if let Some(held) = attributed {
                     HELD_SYSCALLS.fetch_add(held, Relaxed);
                     bump(&T_HELD_SYSCALLS, held);
@@ -637,6 +649,8 @@ pub(crate) struct Snapshot {
     /// adversary item 1: every sample records its mode).
     pub(crate) shim_loaded: bool,
     pub(crate) shim_lost: u64,
+    /// Why `attributed_syscalls` is `None`, if it is (`Refusal`).
+    pub(crate) refusal: Refusal,
 }
 
 /// Take a snapshot to open a window (see [`Snapshot`]): every thread's CPU time is read just
@@ -736,53 +750,107 @@ struct Ends {
     lost1: u64,
 }
 
+/// Why a span has no count (`attribute`), recorded in every sample (probe-adversary-2 L4: a refused
+/// table and a foreign thread used to look the same, `foreign_threads = 1`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(crate) enum Refusal {
+    #[default]
+    None = 0,
+    /// The thread table could not be read, or held more than the 48 threads it has room for.
+    Table = 1,
+    /// A thread present at the start is gone at the end.
+    ThreadGone = 2,
+    /// A thread not present at the start is still there at the end (one the span spawned that
+    /// outlives it, or any new thread during a hold).
+    ThreadNew = 3,
+    /// Another thread ran, and there is no shim to tell its calls apart.
+    ForeignNoShim = 4,
+    /// The shim lost a call (`feshim_lost`).
+    ShimLost = 5,
+    /// Another thread made calls in the span.
+    ForeignCalls = 6,
+    /// The shim's deltas do not sum to the kernel's count.
+    SumMismatch = 7,
+    /// The kernel's count could not be read.
+    NoKernelCount = 8,
+}
+
 /// Class (b)'s attribution, one rule for windows and holds: `kernel` is the task's count over the
 /// span; `(t0, c0)` every thread's CPU time and shim count at its start, `t1` every thread's CPU
 /// time at its end and `c1` the shim counts at its end of the threads in `t0`, in `t0`'s order.
+/// Returns the count (or `None`), the foreign threads, and why a count was refused (`Refusal`).
 ///
-/// Refused on both paths (`None`, probe-adversary item 4): a thread table that could not be read or
-/// holds more than the 48 threads it has room for (a 49th thread is invisible), and a thread present
-/// at the start that is gone at the end (its calls, its exit included, would be charged to the span).
+/// Refused on both paths (probe-adversary items 4, probe-adversary-2 M1): a thread table that could
+/// not be read or holds more than the 48 threads it has room for (a 49th thread is invisible); a
+/// thread present at the start that is gone at the end (its calls, its exit included, would be
+/// charged to the span); and a thread new at the end, still running (a thread the window spawned
+/// that outlives it would have its later calls dropped: probe-adversary-2 row 11, Some(7) against
+/// truth 22. This also covers a persistent store thread the operation spawned, which the callers'
+/// `threads()` checks do not see, since `threads()` leaves out `PERSISTENT_LIVE`).
 ///
 /// With no other thread running (`foreign` 0), the kernel count is the span's own: the EXCLUSION
-/// path, trusted as an upper bound (probe-adversary: it can only overcount).
+/// path, trusted as an upper bound (it can only overcount).
 ///
 /// With some, the SHIM path, which may only accept a span in which no thread but its own made a
-/// call (probe-adversary items 2 and 3: a shim count can undercount and still pass a check on the
-/// total, rows 4 and 6). It refuses when: the shim is not loaded; it lost a call (`feshim_lost`
-/// above 0, or moved in the span); any thread is new at the end (a thread's creation and exit make
-/// calls the shim does not see); any thread other than the span's own (the reading thread, and for a
-/// window those named in `owned`) has a shim delta above 0, whatever the budget would say of it; or
-/// the shim's deltas do not sum to `kernel`. Then every call the kernel counted is the span's own,
-/// and the span's count is `kernel`.
+/// call (probe-adversary items 2 and 3). It refuses when: the shim is not loaded; it lost a call
+/// (`feshim_lost` above 0); any thread other than the span's own (the reading thread, and for a
+/// window those named in `owned`) has a shim delta above 0; or the shim's deltas do not sum to
+/// `kernel` (a foreign thread's call the shim cannot see). An accepted span's count is `kernel`,
+/// so the shim path too can only overcount.
 ///
-/// Blind spot (probe-adversary row 2c): a thread's CPU time is read in 1 µs steps, so a foreign
-/// thread that ran for less than 1 µs in the span is not seen as running; on the exclusion path its
-/// calls, if any, are charged to the span (an overcount, never an undercount).
-fn attribute(kernel: u64, t0: &[ThreadCpu], c0: &[u64; 48], t1: &[ThreadCpu], c1: &[u64; 48], ends: Ends, owned: &[&str], window: bool) -> (Option<u64>, u64) {
-    // Mutants (test builds only), each a rule this replaced: `probe_full_table_trusted` (a table
-    // past its room is read as complete), `probe_gone_thread_charged` (a thread gone at the end is
-    // ignored), `probe_shim_excludes_foreign` (the shim path as before: the own threads' deltas,
-    // a foreign thread's calls excluded, only the total checked).
+/// BLIND SPOTS, measured (probe-adversary rows 2c and 9, probe-adversary-2 rows 5-14, and
+/// artie frontier/fastest/lanes/wire/budget/scshim/probe_contended.c):
+/// - A thread's CPU time is stale while it runs: a continuously spinning foreign thread read as
+///   not running in 346 of 500 windows (probe-adversary-2 row 14), and its resolution is 1 µs. Such a
+///   thread is not foreign, and on the exclusion path its calls, if any, are charged to the span:
+///   an overcount, never an undercount.
+/// - Calls the kernel counts and the shim does not: `syscall(2)` and a raw `svc` (10 of 10), the
+///   `posix_spawn` call, a thread's creation (2 unseen calls) and its exit (1 unseen); lock waits
+///   (`__psynch_*`) ARE seen (probe_contended: 2449 of 2452 kernel calls seen with two threads
+///   contending a mutex, 3 uncovered against the uncontended control's 2). They can only cause
+///   refusals.
+/// - Calls the shim counts and the kernel does not: `kdebug_trace`, `kdebug_trace_string` and
+///   `kdebug_typefilter` after its first call (tracing off: shim +10, kernel 0), so the sum check
+///   can be balanced by one of them against an unseen call (probe-adversary-2 rows 6-7: a span
+///   holding a foreign call accepted, at one over the truth). The count is still the kernel's, so
+///   the error is OVER only, a false red. A call whose shim increment lands before the end's shim
+///   read and whose kernel entry after the kernel's read does the same (source-only).
+/// - Work done by a child process (posix_spawn, vfork) is counted by neither counter: it is
+///   another task. Mach traps are not BSD syscalls and are counted by neither.
+fn attribute(kernel: u64, t0: &[ThreadCpu], c0: &[u64; 48], t1: &[ThreadCpu], c1: &[u64; 48], ends: Ends, owned: &[&str], window: bool) -> (Option<u64>, u64, Refusal) {
+    // Mutants (test builds only), each a rule this replaced or a check it makes:
+    // `probe_full_table_trusted` (a table past its room is read as complete),
+    // `probe_gone_thread_charged` (a thread gone at the end is ignored), `probe_new_thread_kept`
+    // (a thread new at the end refused on the shim path only, as before probe-adversary-2 M1),
+    // `probe_shim_excludes_foreign` (the shim path as before: the own threads' deltas, a foreign
+    // thread's calls excluded, only the total checked), `probe_sum_unchecked` (no sum check).
     let mutant = |m: &str| crate::branch::store::fe_mutant(m);
     let room = t0.len().min(t1.len());
     match (ends.n0, ends.n1) {
         (Some(n0), Some(n1)) if (n0 <= room && n1 <= room) || mutant("probe_full_table_trusted") => {}
-        _ => return (None, 1),
+        _ => return (None, 0, Refusal::Table),
     }
     let present = |t: &[ThreadCpu], id: u64| t.iter().any(|x| x.id == id);
     if t0.iter().any(|x| x.id != 0 && !present(t1, x.id)) && !mutant("probe_gone_thread_charged") {
-        return (None, 1);
+        return (None, 0, Refusal::ThreadGone);
+    }
+    let new_at_end = t1.iter().any(|x| x.id != 0 && !present(t0, x.id));
+    let keep_new = mutant("probe_new_thread_kept");
+    if new_at_end && !keep_new {
+        return (None, 0, Refusal::ThreadNew);
     }
     let foreign = foreign_threads(t0, t1, owned, !window);
     if foreign == 0 {
-        return (Some(kernel), 0);
+        return (Some(kernel), 0, Refusal::None);
     }
-    if shim().is_none() || ends.lost0 != 0 || ends.lost1 != 0 {
-        return (None, foreign);
+    if shim().is_none() {
+        return (None, foreign, Refusal::ForeignNoShim);
     }
-    if t1.iter().any(|x| x.id != 0 && !present(t0, x.id)) {
-        return (None, foreign);
+    if ends.lost0 != 0 || ends.lost1 != 0 {
+        return (None, foreign, Refusal::ShimLost);
+    }
+    if new_at_end {
+        return (None, foreign, Refusal::ThreadNew);
     }
     let me = t1.iter().find(|t| t.me).map_or(0, |t| t.id);
     let owned_name = |t: &ThreadCpu| {
@@ -796,17 +864,17 @@ fn attribute(kernel: u64, t0: &[ThreadCpu], c0: &[u64; 48], t1: &[ThreadCpu], c1
         let d = c1[i].wrapping_sub(c0[i]);
         let own = t.id == me || (window && owned_name(t));
         if d > 0 && !own && !excludes {
-            return (None, foreign);
+            return (None, foreign, Refusal::ForeignCalls);
         }
         if own {
             own_sum = own_sum.wrapping_add(d);
         }
         all = all.wrapping_add(d);
     }
-    if all == kernel {
-        (Some(if excludes { own_sum } else { kernel }), foreign)
+    if all == kernel || mutant("probe_sum_unchecked") {
+        (Some(if excludes { own_sum } else { kernel }), foreign, Refusal::None)
     } else {
-        (None, foreign)
+        (None, foreign, Refusal::SumMismatch)
     }
 }
 
@@ -832,15 +900,16 @@ pub(crate) fn end_owning(owned: &[&str]) -> Snapshot {
     let mut t1 = [ThreadCpu::EMPTY; 48];
     let n1 = thread_table(&mut t1);
     let ends = Ends { n0: WINDOW_N0.with(|n| n.get()), n1, lost0: WINDOW_LOST0.with(|l| l.get()), lost1 };
-    let (attributed, foreign) = match (WINDOW_S0.with(|c| c.get()), syscalls) {
+    let (attributed, foreign, refusal) = match (WINDOW_S0.with(|c| c.get()), syscalls) {
         (Some(s0), Some(s1)) => {
             let kernel = s1.wrapping_sub(s0) & u64::from(u32::MAX);
             WINDOW_T0.with(|t0| attribute(kernel, &t0.borrow()[..], &WINDOW_C0.with(|c| c.get()), &t1, &c1, ends, owned, true))
         }
-        _ => (None, 1),
+        _ => (None, 0, Refusal::NoKernelCount),
     };
     let mut s = user_counts();
     s.foreign = foreign;
+    s.refusal = refusal;
     s.syscalls = syscalls;
     s.attributed_syscalls = attributed;
     s.shim_loaded = shim().is_some();
@@ -949,6 +1018,7 @@ fn user_counts() -> Snapshot {
         syscalls: None,
         shim_loaded: false,
         shim_lost: 0,
+        refusal: Refusal::None,
     }
 }
 
