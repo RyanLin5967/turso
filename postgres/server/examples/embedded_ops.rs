@@ -92,6 +92,9 @@ struct Probe {
     confirms: u64,
     /// This thread's own allocations (counters::thread_allocations; 0 without alloc-count).
     thread_allocations: u64,
+    /// Every other thread's CPU so far, read last (counters::foreign_thread_cpu_ns; 0 where not
+    /// counted), as turso_branch_work() reads it.
+    foreign_cpu_ns: u64,
 }
 
 impl Probe {
@@ -105,6 +108,7 @@ impl Probe {
         let thread_instructions = turso_pg_server::counters::thread_counters().map_or(0, |c| c.0);
         let confirms = db.branch_confirm_counts()[0];
         let thread_allocations = turso_pg_server::counters::thread_allocations();
+        let foreign_cpu_ns = turso_pg_server::counters::foreign_thread_cpu_ns().unwrap_or(0);
         Self {
             ns: now_ns(),
             cpu_ns: thread_cpu_ns(),
@@ -112,6 +116,7 @@ impl Probe {
             allocations,
             thread_instructions,
             confirms,
+            foreign_cpu_ns,
             thread_allocations,
         }
     }
@@ -221,7 +226,7 @@ fn main() {
     let mut out = std::io::BufWriter::new(std::fs::File::create(&a.out).unwrap());
     writeln!(
         out,
-        "seq\tphase\tstep\tstart_ns\tend_ns\tcpu_ns\tunix_syscalls\tinstructions\tbranch\tallocations\tthread_instructions\tconfirms\tthread_allocations"
+        "seq\tphase\tstep\tstart_ns\tend_ns\tcpu_ns\tunix_syscalls\tinstructions\tbranch\tallocations\tthread_instructions\tconfirms\tthread_allocations\tforeign_cpu_ns"
     )
     .unwrap();
     let prefix = a.name_prefix.clone();
@@ -239,7 +244,7 @@ fn main() {
         };
         writeln!(
             out,
-            "{seq}\t{phase}\t{step}\t{}\t{}\t{}\t{}\t{}\t{prefix}{seq}\t{allocations}\t{}\t{}\t{}",
+            "{seq}\t{phase}\t{step}\t{}\t{}\t{}\t{}\t{}\t{prefix}{seq}\t{allocations}\t{}\t{}\t{}\t{}",
             t0.ns,
             t1.ns,
             t1.cpu_ns - t0.cpu_ns,
@@ -247,10 +252,18 @@ fn main() {
             i1 - i0,
             t1.thread_instructions - t0.thread_instructions,
             t1.confirms - t0.confirms,
-            t1.thread_allocations - t0.thread_allocations
+            t1.thread_allocations - t0.thread_allocations,
+            t1.foreign_cpu_ns - t0.foreign_cpu_ns
         )
         .unwrap();
     };
+    // As the server says it (budget.py --verdict full-word-held reads it from this stderr).
+    if turso_core::branch::measure_word_hold_compiled() {
+        eprintln!(
+            "MEASURE word-hold: compiled (TURSO_MEASURE_WORD_HOLD={})",
+            std::env::var("TURSO_MEASURE_WORD_HOLD").unwrap_or_default()
+        );
+    }
     let mut control = std::io::stdin().lines();
     if a.stepwise {
         println!("ready");

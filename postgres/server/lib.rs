@@ -684,6 +684,15 @@ impl TursoPgServer {
             "PostgreSQL server listening on {} (database: {}, at most {} sessions)",
             self.address, self.shared.db_file, self.shared.max_connections
         );
+        // The word-held FULL verdict (budget.py --verdict full-word-held) refuses a server that
+        // does not say this: a build with the measure-word-hold feature, its hold asked for by
+        // TURSO_MEASURE_WORD_HOLD=1 in the server's environment.
+        if turso_core::branch::measure_word_hold_compiled() {
+            println!(
+                "MEASURE word-hold: compiled (TURSO_MEASURE_WORD_HOLD={})",
+                std::env::var("TURSO_MEASURE_WORD_HOLD").unwrap_or_default()
+            );
+        }
         // The budget harness refuses a --plant split-reply run whose server does not say this.
         #[cfg(feature = "budget-plant-split-reply")]
         println!(
@@ -3391,25 +3400,27 @@ fn int_text(value: i64, buf: &mut [u8; 20]) -> &[u8] {
 }
 
 #[cfg(not(feature = "phase-count"))]
-const WORK_COLUMNS: [&str; 6] = [
+const WORK_COLUMNS: [&str; 7] = [
     "unix_syscalls",
     "instructions",
     "allocations",
     "thread_instructions",
     "confirms_written",
     "thread_allocations",
+    "foreign_cpu_ns",
 ];
 /// A phase build (feature phase-count, a diagnostic: budget.py work --phases) adds this session
 /// thread's instructions per statement phase (turso_pg::phase::NAMES), so the default build's row
 /// is unchanged.
 #[cfg(feature = "phase-count")]
-const WORK_COLUMNS: [&str; 14] = [
+const WORK_COLUMNS: [&str; 15] = [
     "unix_syscalls",
     "instructions",
     "allocations",
     "thread_instructions",
     "confirms_written",
     "thread_allocations",
+    "foreign_cpu_ns",
     "phase_session",
     "phase_read",
     "phase_parse",
@@ -3450,7 +3461,12 @@ fn work_row(format: &Format, db: &Database) -> SqlResult<Response> {
         .and_then(|()| encoder.encode_field(&(db.branch_confirm_counts()[0] as i64)))
         // This session thread's own allocations (counters::thread_allocations; 0 without the
         // alloc-count feature): the work budget judges every counter by the operation's own thread.
-        .and_then(|()| encoder.encode_field(&(counters::thread_allocations() as i64)));
+        .and_then(|()| encoder.encode_field(&(counters::thread_allocations() as i64)))
+        // Every other thread's CPU so far (counters::foreign_thread_cpu_ns), read last: a window
+        // whose two readings differ had a foreign thread run inside it.
+        .and_then(|()| {
+            encoder.encode_field(&counters::foreign_thread_cpu_ns().map(|n| n as i64))
+        });
     #[cfg(feature = "phase-count")]
     let row = row.and_then(|()| {
         let phases = turso_pg::phase::totals().unwrap_or_default();

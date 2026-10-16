@@ -161,3 +161,67 @@ pub fn thread_counters() -> Option<(u64, u64)> {
         None
     }
 }
+
+/// The CPU time, in nanoseconds, every OTHER thread of this process has used so far (user plus
+/// system, `proc_pidinfo(PROC_PIDTHREADID64INFO)` of each thread `PROC_PIDLISTTHREADIDS` lists,
+/// the calling thread skipped by its id). Read at both ends of a budget window, a difference above
+/// zero is a foreign thread that ran inside it: the exclusion the word-held FULL verdict rests on,
+/// and the re-judgment's off-thread guard. The instruction gap it replaces (process-wide rusage less
+/// this thread's thread_selfcounts) disagreed by about +/-10k instructions at random, below zero as
+/// often as above, so it said nothing about other threads (DECISIONS 308c3232a3). A thread that
+/// started and ended between the two reads is not listed at either: BLIND SPOT, stated. `None` off
+/// Apple platforms or when the kernel refuses a read.
+pub fn foreign_thread_cpu_ns() -> Option<u64> {
+    #[cfg(target_vendor = "apple")]
+    {
+        const PROC_PIDLISTTHREADIDS: libc::c_int = 28;
+        const PROC_PIDTHREADID64INFO: libc::c_int = 15;
+        extern "C" {
+            fn pthread_threadid_np(thread: libc::pthread_t, id: *mut u64) -> libc::c_int;
+        }
+        let pid = std::process::id() as libc::c_int;
+        let mut me = 0u64;
+        if unsafe { pthread_threadid_np(0 as libc::pthread_t, &mut me) } != 0 {
+            return None;
+        }
+        let mut ids = [0u64; 256];
+        let bytes = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                PROC_PIDLISTTHREADIDS,
+                0,
+                ids.as_mut_ptr().cast(),
+                std::mem::size_of_val(&ids) as libc::c_int,
+            )
+        };
+        if bytes <= 0 {
+            return None;
+        }
+        let n = bytes as usize / std::mem::size_of::<u64>();
+        let mut total = 0u64;
+        for &id in &ids[..n.min(ids.len())] {
+            if id == me {
+                continue;
+            }
+            let mut info: libc::proc_threadinfo = unsafe { std::mem::zeroed() };
+            let got = unsafe {
+                libc::proc_pidinfo(
+                    pid,
+                    PROC_PIDTHREADID64INFO,
+                    id,
+                    (&mut info as *mut libc::proc_threadinfo).cast(),
+                    std::mem::size_of::<libc::proc_threadinfo>() as libc::c_int,
+                )
+            };
+            // A thread that ended after the listing reads nothing: it is not counted.
+            if got as usize == std::mem::size_of::<libc::proc_threadinfo>() {
+                total += info.pth_user_time + info.pth_system_time;
+            }
+        }
+        Some(total)
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        None
+    }
+}

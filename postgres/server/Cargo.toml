@@ -19,6 +19,9 @@ budget-plant-split-reply = []
 alloc-count = []
 # The L5 phase table (turso_pg's phase.rs; turso_branch_phases()): a diagnostic build only.
 phase-count = ["turso_pg/phase-count"]
+# MEASUREMENT ONLY (budget.py --verdict full-word-held): turso_core's confirmation-word hold, asked
+# for by TURSO_MEASURE_WORD_HOLD=1. Never in a credited or shipped build.
+measure-word-hold = ["turso_core/measure-word-hold"]
 
 [dependencies]
 anyhow.workspace = true
