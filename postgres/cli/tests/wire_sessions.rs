@@ -13857,6 +13857,32 @@ fn c54_virtual_batch_keeps_trailing_generated_identifier() {
     assert_eq!(a.q(sql).single(sql), "1");
 }
 
+// PG18.6: c54-pg18-boundaries.out, commands 9, 10, 11, 12.
+#[test]
+fn c54_virtual_normalization_preserves_the_shared_depth_refusal() {
+    let dir = Scratch::new("c54-virtual-rewrite-depth");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let expression = format!("{}a{}", "abs(".repeat(3000), ")".repeat(3000));
+    let sql = format!("CREATE TABLE vd_bound(a INT,b INT GENERATED ALWAYS AS({expression}) VIRTUAL)");
+    let create = a.q(&sql);
+    if let Some(error) = create.error {
+        assert_eq!(error.code, "54001", "normalized CREATE: {error:?}");
+    } else {
+        assert_eq!(create.tags, vec!["CREATE TABLE".to_string()]);
+        let insert = "INSERT INTO vd_bound(a) VALUES(-3)";
+        assert_eq!(a.q(insert).ok(insert).tags, vec!["INSERT 0 1".to_string()]);
+        let select = "SELECT a,b FROM vd_bound";
+        let reply = a.q(select).ok(select);
+        // The first abs turns -3 into 3; every subsequent abs leaves 3 unchanged.
+        assert_eq!(reply.oids, Some(vec![23, 23]));
+        assert_eq!(reply.rows, vec![vec![Some("-3".into()), Some("3".into())]]);
+        assert_eq!(reply.tags, vec!["SELECT 1".to_string()]);
+    }
+    assert_eq!(a.q("SELECT 1").single("same session survives"), "1");
+    assert_eq!(server.connect().q("SELECT 1").single("server survives"), "1");
+}
+
 /// PG18.6 preserves the row at depth 1000 (c54-pg18-depth.out). Our shared stack
 /// bound may refuse that depth, but an accepted CREATE must remain safe when a
 /// much shorter ALTER clones and deparses its retained definition.
