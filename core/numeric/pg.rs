@@ -476,3 +476,19 @@ fn unresolved_type() -> LimboError {
         "could not determine PostgreSQL numeric operand type",
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn c50_missing_operand_type_refuses_instead_of_sqlite_fallback() {
+        let error = execute(PgNumericOp::Add, PgNumericType::Dynamic,
+            &Value::from_i64(i64::MAX), Some(&Value::from_i64(1))).unwrap_err();
+        assert_eq!(error.sql_error_kind(), SqlErrorKind::FeatureNotSupported);
+        assert_eq!(error.to_string(), "could not determine PostgreSQL numeric operand type");
+        let mut state = vec![Value::Null, Value::from_i64(0), Value::from_i64(0), Value::from_i64(0), Value::from_i64(0)];
+        let error = sum_update(PgNumericType::Dynamic, &Value::from_i64(1), &mut state, false).unwrap_err();
+        assert_eq!(error.sql_error_kind(), SqlErrorKind::FeatureNotSupported);
+    }
+}

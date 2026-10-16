@@ -13484,7 +13484,7 @@ c52_recorded_types!(c52_numeric_literal_has_pg_type, "pg18-colnames.out", [7]);
 c52_recorded_types!(c52_catalog_columns_have_pg_types, "pg18-audit2-pg_indexes_and_pg_database_size_answer.out", [1, 2, 3, 4]);
 c52_recorded_types!(c52_pg_typeof_reads_the_inferred_type, "pg18-random.out", [1]);
 
-// C50 class cases recorded unchanged in C50-fix3/pg-class.out on PG 18.6.
+// C50 class cases recorded unchanged in c50-pg18-class1.txt on PG 18.6.
 #[test]
 fn c50_class_expression_types_preserve_ranges_and_precision() {
     let dir = Scratch::new("c50-class-types");

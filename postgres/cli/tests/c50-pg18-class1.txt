@@ -1,0 +1,160 @@
+\set VERBOSITY verbose
+SELECT version();
+                                                            version                                                            
+-------------------------------------------------------------------------------------------------------------------------------
+ PostgreSQL 18.6 (Homebrew) on aarch64-apple-darwin25.6.0, compiled by Apple clang version 21.0.0 (clang-2100.1.1.101), 64-bit
+(1 row)
+
+SELECT coalesce(NULL::smallint,32767::integer)+1::smallint;
+ ?column? 
+----------
+    32768
+(1 row)
+
+SELECT CAST(CASE WHEN true THEN 0.5 ELSE 0.5 END AS int4);
+ int4 
+------
+    1
+(1 row)
+
+SELECT CAST(9007199254740993.0 + 0 AS bigint);
+       int8       
+------------------
+ 9007199254740993
+(1 row)
+
+SELECT '4294967295'::oid;
+    oid     
+------------
+ 4294967295
+(1 row)
+
+SELECT 'true'::bool, 'false'::bool;
+ bool | bool 
+------+------
+ t    | f
+(1 row)
+
+SELECT '-Infinity'::numeric < 0::numeric, 'Infinity'::numeric < 'NaN'::numeric, 'NaN'::numeric = 'NaN'::numeric;
+ ?column? | ?column? | ?column? 
+----------+----------+----------
+ t        | t        | t
+(1 row)
+
+SELECT CAST('123.45' AS numeric(4,1));
+ numeric 
+---------
+   123.5
+(1 row)
+
+SELECT CAST('123.45' AS numeric(3,1));
+psql:/private/tmp/codex-20261015/C50-class.sql:10: ERROR:  22003: numeric field overflow
+DETAIL:  A field with precision 3, scale 1 must round to an absolute value less than 10^2.
+LOCATION:  apply_typmod, numeric.c:8129
+SELECT 2147483647::int4 - (-1)::int4;
+psql:/private/tmp/codex-20261015/C50-class.sql:11: ERROR:  22003: integer out of range
+LOCATION:  int4mi, int.c:843
+SELECT 32767::int2 * 2::int2;
+psql:/private/tmp/codex-20261015/C50-class.sql:12: ERROR:  22003: smallint out of range
+LOCATION:  int2mul, int.c:972
+SELECT '-32768'::int2 / (-1)::int2;
+psql:/private/tmp/codex-20261015/C50-class.sql:13: ERROR:  22003: smallint out of range
+LOCATION:  int2div, int.c:1004
+SELECT '-2147483648'::int4 / (-1)::int4;
+psql:/private/tmp/codex-20261015/C50-class.sql:14: ERROR:  22003: integer out of range
+LOCATION:  int4div, int.c:888
+SELECT '-9223372036854775808'::int8 / (-1)::int8;
+psql:/private/tmp/codex-20261015/C50-class.sql:15: ERROR:  22003: bigint out of range
+LOCATION:  int8div, int8.c:530
+SELECT -('-32768'::int2);
+psql:/private/tmp/codex-20261015/C50-class.sql:16: ERROR:  22003: smallint out of range
+LOCATION:  int2um, int.c:922
+SELECT abs('-32768'::int2);
+psql:/private/tmp/codex-20261015/C50-class.sql:17: ERROR:  22003: smallint out of range
+LOCATION:  int2abs, int.c:1242
+SELECT abs('-2147483648'::int4);
+psql:/private/tmp/codex-20261015/C50-class.sql:18: ERROR:  22003: integer out of range
+LOCATION:  int4abs, int.c:1228
+SELECT '32767.5'::numeric::int2;
+psql:/private/tmp/codex-20261015/C50-class.sql:19: ERROR:  22003: smallint out of range
+LOCATION:  numeric_int2, numeric.c:4708
+SELECT '32766.5'::numeric::int2, '32766.5'::float8::int2;
+ int2  | int2  
+-------+-------
+ 32767 | 32766
+(1 row)
+
+SELECT 'NaN'::numeric::int8;
+psql:/private/tmp/codex-20261015/C50-class.sql:21: ERROR:  0A000: cannot convert NaN to bigint
+LOCATION:  numeric_int8_opt_error, numeric.c:4630
+SELECT 'Infinity'::numeric::int4;
+psql:/private/tmp/codex-20261015/C50-class.sql:22: ERROR:  0A000: cannot convert infinity to integer
+LOCATION:  numeric_int4_opt_error, numeric.c:4546
+CREATE TABLE class_i(a smallint, b integer, c bigint);
+CREATE TABLE
+INSERT INTO class_i VALUES ('1.5'::numeric, '-1.5'::numeric, '9007199254740993.0'::numeric) RETURNING *;
+ a | b  |        c         
+---+----+------------------
+ 2 | -2 | 9007199254740993
+(1 row)
+
+INSERT 0 1
+UPDATE class_i SET a='2.5'::numeric, b='-2.5'::numeric, c=42.5 RETURNING *;
+ a | b  | c  
+---+----+----
+ 3 | -3 | 43
+(1 row)
+
+UPDATE 1
+INSERT INTO class_i VALUES ('32768'::numeric, 0, 0);
+psql:/private/tmp/codex-20261015/C50-class.sql:26: ERROR:  22003: smallint out of range
+LOCATION:  numeric_int2, numeric.c:4708
+UPDATE class_i SET b=2147483648;
+psql:/private/tmp/codex-20261015/C50-class.sql:27: ERROR:  22003: integer out of range
+LOCATION:  int84, int8.c:1286
+CREATE TABLE class_pk(a integer PRIMARY KEY);
+CREATE TABLE
+INSERT INTO class_pk VALUES (2147483648);
+psql:/private/tmp/codex-20261015/C50-class.sql:29: ERROR:  22003: integer out of range
+LOCATION:  int84, int8.c:1286
+CREATE DOMAIN class_small AS smallint;
+CREATE DOMAIN
+SELECT '32768'::class_small;
+psql:/private/tmp/codex-20261015/C50-class.sql:31: ERROR:  22003: value "32768" is out of range for type smallint
+LINE 1: SELECT '32768'::class_small;
+               ^
+LOCATION:  pg_strtoint16_safe, numutils.c:351
+SELECT '1.5'::numeric::class_small;
+ class_small 
+-------------
+           2
+(1 row)
+
+SELECT sum(x), pg_typeof(sum(x)) FROM (VALUES (2147483647::int4),(1)) t(x);
+    sum     | pg_typeof 
+------------+-----------
+ 2147483648 | bigint
+(1 row)
+
+SELECT sum(x), pg_typeof(sum(x)) FROM (VALUES (9223372036854775807::int8),(1)) t(x);
+         sum         | pg_typeof 
+---------------------+-----------
+ 9223372036854775808 | numeric
+(1 row)
+
+SELECT sum(x) OVER (ORDER BY n ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM (VALUES (1,9223372036854775807::int8),(2,1),(3,2))t(n,x);
+         sum         
+---------------------
+ 9223372036854775807
+ 9223372036854775808
+                   3
+(3 rows)
+
+SELECT sum(x) OVER (ORDER BY n ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM (VALUES (1,'NaN'::numeric),(2,1),(3,2))t(n,x);
+ sum 
+-----
+ NaN
+ NaN
+   3
+(3 rows)
+
