@@ -418,7 +418,8 @@ pub fn emit_columns_to_destination(
                 program.preassign_label_to_next_insn(skip_seen_row);
             }
         }
-        QueryDestination::CoroutineYield { yield_reg, .. } => {
+        QueryDestination::CoroutineYield { yield_reg, pg_coercions, .. } => {
+            super::expr::emit_pg_result_coercions(program, pg_coercions, start_reg);
             program.emit_insn(Insn::Yield {
                 yield_reg: *yield_reg,
                 end_offset: BranchOffset::Offset(0),

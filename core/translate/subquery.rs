@@ -1078,6 +1078,7 @@ fn recollect_aggregates(plan: &mut SelectPlan, resolver: &Resolver) -> Result<()
         resolve_window_and_aggregate_functions(
             &rc.expr,
             resolver,
+            Some(&plan.table_references),
             &mut new_aggregates,
             None,
             &mut [],
@@ -1091,6 +1092,7 @@ fn recollect_aggregates(plan: &mut SelectPlan, resolver: &Resolver) -> Result<()
                 resolve_window_and_aggregate_functions(
                     expr,
                     resolver,
+                    Some(&plan.table_references),
                     &mut new_aggregates,
                     None,
                     &mut [],
@@ -1101,7 +1103,7 @@ fn recollect_aggregates(plan: &mut SelectPlan, resolver: &Resolver) -> Result<()
 
     // Collect from ORDER BY
     for (expr, _, _) in &plan.order_by {
-        resolve_window_and_aggregate_functions(expr, resolver, &mut new_aggregates, None, &mut [])?;
+        resolve_window_and_aggregate_functions(expr, resolver, Some(&plan.table_references), &mut new_aggregates, None, &mut [])?;
     }
 
     plan.aggregates = new_aggregates;
@@ -1605,6 +1607,7 @@ pub fn emit_from_clause_subquery(
         Some(QueryDestination::CoroutineYield {
             yield_reg: y,
             coroutine_implementation_start,
+            ..
         }) => {
             // The parent query will use this register to jump to/from the subquery.
             *y = yield_reg;

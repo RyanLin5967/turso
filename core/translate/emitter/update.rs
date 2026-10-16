@@ -879,6 +879,9 @@ fn emit_update_column_values<'a>(
                         rowid_set_clause_reg,
                         &t_ctx.resolver,
                     )?;
+                    let source = set_clauses.iter().find(|clause| clause.column_index == idx).and_then(|clause| clause.pg_source_type)
+                        .unwrap_or(crate::numeric::pg::PgNumericType::Dynamic);
+                    crate::translate::expr::emit_pg_assignment(program, &t_ctx.resolver, table_column, rowid_set_clause_reg, source);
 
                     emit_rowid_alias_not_null_check(
                         program,
@@ -955,6 +958,9 @@ fn emit_update_column_values<'a>(
                             };
                             program.target_union_type = prev_union;
                             translate_result?;
+                            let source = set_clauses.iter().find(|clause| clause.column_index == idx).and_then(|clause| clause.pg_source_type)
+                                .unwrap_or(crate::numeric::pg::PgNumericType::Dynamic);
+                            crate::translate::expr::emit_pg_assignment(program, &t_ctx.resolver, table_column, target_reg, source);
                             if table_column.notnull() && !skip_notnull_checks {
                                 let notnull_conflict = if program.flags.has_statement_conflict() {
                                     or_conflict
@@ -1579,6 +1585,7 @@ fn emit_update_insns<'a>(
     {
         let columns = target_table.table.columns();
         for (idx, col) in columns.iter().enumerate() {
+            crate::translate::expr::record_pg_column_type(&mut t_ctx.resolver, col, layout.to_register(start, idx));
             t_ctx
                 .resolver
                 .register_affinities
@@ -2710,6 +2717,7 @@ fn emit_update_insns<'a>(
     program.preassign_label_to_next_insn(trigger_ignore_jump_label);
 
     t_ctx.resolver.register_affinities.clear();
+    t_ctx.resolver.register_pg_types.clear();
     t_ctx.resolver.register_collations.clear();
     Ok(())
 }

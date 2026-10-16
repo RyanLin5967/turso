@@ -20,6 +20,7 @@ pub enum PgNumericOp {
     Divide,
     Negate,
     Abs,
+    Equal, NotEqual, Less, LessEqual, Greater, GreaterEqual,
     Cast { source: PgNumericType },
 }
 
@@ -57,6 +58,14 @@ impl PgNumericType {
             Self::Float8 => "double precision",
             Self::Numeric => "numeric",
             Self::Dynamic => "numeric",
+        }
+    }
+
+    pub fn sum_type(self) -> Self {
+        match self {
+            Self::Int2 | Self::Int4 => Self::Int8,
+            Self::Int8 | Self::Numeric => Self::Numeric,
+            other => other,
         }
     }
 
@@ -101,14 +110,22 @@ pub fn execute(op: PgNumericOp, ty: PgNumericType, lhs: &Value, rhs: Option<&Val
     if let PgNumericOp::Cast { source } = op {
         return cast(lhs, source, ty);
     }
-    let ty = if ty == PgNumericType::Dynamic {
-        if matches!(lhs, Value::Numeric(Numeric::Integer(_)))
-            && rhs.is_none_or(|v| matches!(v, Value::Numeric(Numeric::Integer(_))))
-        { PgNumericType::Int8 } else { PgNumericType::Float8 }
-    } else { ty };
+    if ty == PgNumericType::Dynamic {
+        return Err(unresolved_type());
+    }
     if ty == PgNumericType::Numeric {
         let a = numeric(lhs)?;
         let b = rhs.map(numeric).transpose()?;
+        if matches!(op, PgNumericOp::Equal | PgNumericOp::NotEqual | PgNumericOp::Less | PgNumericOp::LessEqual | PgNumericOp::Greater | PgNumericOp::GreaterEqual) {
+            let b = b.as_ref().expect("binary argument");
+            let yes = match op {
+                PgNumericOp::Equal => a == *b, PgNumericOp::NotEqual => a != *b,
+                PgNumericOp::Less => a < *b, PgNumericOp::LessEqual => a <= *b,
+                PgNumericOp::Greater => a > *b, PgNumericOp::GreaterEqual => a >= *b,
+                _ => unreachable!(),
+            };
+            return Ok(Value::from_i64(i64::from(yes)));
+        }
         let result = match op {
             PgNumericOp::Add => a.add(b.as_ref().expect("binary argument"))?,
             PgNumericOp::Subtract => a.sub(b.as_ref().expect("binary argument"))?,
@@ -116,7 +133,7 @@ pub fn execute(op: PgNumericOp, ty: PgNumericType, lhs: &Value, rhs: Option<&Val
             PgNumericOp::Divide => a.div(b.as_ref().expect("binary argument"))?,
             PgNumericOp::Negate => a.negate(),
             PgNumericOp::Abs => if a.is_negative() { a.negate() } else { a },
-            PgNumericOp::Cast { .. } => unreachable!(),
+            _ => unreachable!("operation already handled"),
         };
         return Ok(Value::build_text(result.format()));
     }
@@ -134,7 +151,7 @@ pub fn execute(op: PgNumericOp, ty: PgNumericType, lhs: &Value, rhs: Option<&Val
             }
             PgNumericOp::Negate => a.checked_neg(),
             PgNumericOp::Abs => a.checked_abs(),
-            PgNumericOp::Cast { .. } => unreachable!(),
+            _ => unreachable!("operation already handled"),
         }.ok_or_else(|| ty.overflow())?;
         return Ok(Value::from_i64(ty.checked_integer(result)?));
     }
@@ -151,7 +168,7 @@ pub fn execute(op: PgNumericOp, ty: PgNumericType, lhs: &Value, rhs: Option<&Val
         }
         PgNumericOp::Negate => -a,
         PgNumericOp::Abs => a.abs(),
-        PgNumericOp::Cast { .. } => unreachable!(),
+        _ => unreachable!("operation already handled"),
     };
     if result.is_infinite() && a.is_finite() && b.is_none_or(f64::is_finite) {
         return Err(range_error("value out of range: overflow"));
@@ -185,9 +202,9 @@ fn integer(value: &Value, target: PgNumericType, source: PgNumericType) -> Resul
             f as i64
         }
         Value::Text(t) if source == PgNumericType::Numeric => {
-            super::decimal::PgNumeric::parse(t.as_str())
-                .ok_or_else(|| invalid_text(target, t.as_str()))??
-                .rounded_i64().ok_or_else(|| target.overflow())?
+            let numeric = super::decimal::PgNumeric::parse(t.as_str())
+                .ok_or_else(|| invalid_text(target, t.as_str()))??;
+            numeric_integer(&numeric, target)?
         }
         Value::Text(t) => {
             let text = t.as_str().trim_matches(|c: char| c.is_ascii_whitespace());
@@ -197,9 +214,6 @@ fn integer(value: &Value, target: PgNumericType, source: PgNumericType) -> Resul
             }
             let i = text.parse::<i64>().ok().filter(|i| target.checked_integer(*i).is_ok());
             return i.ok_or_else(|| range_error(format!("value \"{}\" is out of range for type {}", t.as_str(), target.name())));
-        }
-        Value::Blob(b) if source == PgNumericType::Numeric => {
-            super::decimal::PgNumeric::from_blob(b)?.rounded_i64().ok_or_else(|| target.overflow())?
         }
         _ => return Err(invalid_text(target, &value.to_string())),
     };
@@ -255,7 +269,74 @@ pub fn numeric(value: &Value) -> Result<super::decimal::PgNumeric> {
         Value::Numeric(Numeric::Integer(i)) => Ok(PgNumeric::from_i64(*i)),
         Value::Numeric(Numeric::Float(f)) => PgNumeric::parse(&f.to_string()).expect("float displays numeric") ,
         Value::Text(text) => PgNumeric::parse(text.as_str()).ok_or_else(|| invalid_text(PgNumericType::Numeric, text.as_str()))?,
-        Value::Blob(blob) => PgNumeric::from_blob(blob),
+        Value::Blob(_) => Err(invalid_text(PgNumericType::Numeric, &value.to_string())),
         _ => Err(invalid_text(PgNumericType::Numeric, &value.to_string())),
     }
+}
+
+/// Shared PG sum transition for grouped and window aggregation. Numeric special values have
+/// separate counts so a moving frame can remove NaN/infinity and recover its finite sum.
+/// Payload: [finite sum, non-NULL count, NaN count, +infinity count, -infinity count].
+pub fn sum_update(ty: PgNumericType, arg: &Value, state: &mut [Value], inverse: bool) -> Result<()> {
+    use super::decimal::PgNumeric;
+    if matches!(arg, Value::Null) { return Ok(()); }
+    if ty == PgNumericType::Dynamic { return Err(unresolved_type()); }
+    let delta = if inverse { -1 } else { 1 };
+    let count = state[1].as_int().expect("PG sum count") + delta;
+    state[1] = Value::from_i64(count);
+    if ty == PgNumericType::Numeric {
+        let value = numeric(arg)?;
+        let special = match value {
+            PgNumeric::NaN => Some(2),
+            PgNumeric::Infinity => Some(3),
+            PgNumeric::NegInfinity => Some(4),
+            PgNumeric::Finite(_) => None,
+        };
+        if let Some(slot) = special {
+            state[slot] = Value::from_i64(state[slot].as_int().expect("PG sum special count") + delta);
+        } else {
+            let sum = if matches!(state[0], Value::Null) { PgNumeric::from_i64(0) } else { sum_numeric(&state[0])? };
+            let result = if inverse { sum.sub(&value)? } else { sum.add(&value)? };
+            state[0] = Value::Blob(result.to_blob());
+        }
+    } else if count == 0 {
+        state[0] = Value::Null;
+    } else if matches!(state[0], Value::Null) {
+        state[0] = cast(arg, PgNumericType::Dynamic, ty)?;
+    } else {
+        state[0] = execute(if inverse { PgNumericOp::Subtract } else { PgNumericOp::Add }, ty, &state[0], Some(arg))?;
+    }
+    Ok(())
+}
+
+pub fn sum_final(ty: PgNumericType, state: &[Value]) -> Result<Value> {
+    use super::decimal::PgNumeric;
+    if state[1].as_int() == Some(0) { return Ok(Value::Null); }
+    if ty != PgNumericType::Numeric { return Ok(state[0].clone()); }
+    let has = |slot: usize| state[slot].as_int().is_some_and(|n| n > 0);
+    let result = if has(2) || (has(3) && has(4)) { PgNumeric::NaN }
+        else if has(3) { PgNumeric::Infinity }
+        else if has(4) { PgNumeric::NegInfinity }
+        else if matches!(state[0], Value::Null) { PgNumeric::from_i64(0) }
+        else { sum_numeric(&state[0])? };
+    Ok(Value::build_text(result.format()))
+}
+
+fn numeric_integer(value: &super::decimal::PgNumeric, target: PgNumericType) -> Result<i64> {
+    use super::decimal::PgNumeric;
+    let special = match value { PgNumeric::NaN => Some("NaN"), PgNumeric::Infinity | PgNumeric::NegInfinity => Some("infinity"), _ => None };
+    if let Some(special) = special {
+        return Err(LimboError::InvalidArgument(SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported,
+            format!("cannot convert {special} to {}", target.name()))));
+    }
+    value.rounded_i64().ok_or_else(|| target.overflow())
+}
+
+fn sum_numeric(value: &Value) -> Result<super::decimal::PgNumeric> {
+    match value { Value::Blob(blob) => super::decimal::PgNumeric::from_blob(blob), other => numeric(other) }
+}
+
+fn unresolved_type() -> LimboError {
+    LimboError::InvalidArgument(SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported,
+        "could not determine PostgreSQL numeric operand type"))
 }

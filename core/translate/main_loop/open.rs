@@ -185,6 +185,7 @@ impl OpenLoop {
                                 Some(QueryDestination::CoroutineYield {
                                     yield_reg,
                                     coroutine_implementation_start,
+                                    ..
                                 }) => {
                                     turso_assert_eq!(
                                         *iter_dir,

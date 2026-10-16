@@ -713,6 +713,18 @@ pub(crate) fn emit_type_expr(
     type_def: &TypeDef,
     resolver: &Resolver,
 ) -> Result<usize> {
+    // The existing numeric representation also serves unconstrained NUMERIC. Its
+    // one-argument encoder applies PostgreSQL's global bounds without a typmod.
+    let mut unbounded_numeric;
+    let expr = if type_def.is_builtin && type_def.name.eq_ignore_ascii_case("numeric") && column.ty_params.is_empty() {
+        if let ast::Expr::FunctionCall { name, .. } = expr {
+            if name.as_str().eq_ignore_ascii_case("numeric_encode") {
+                unbounded_numeric = expr.clone();
+                if let ast::Expr::FunctionCall { args, .. } = &mut unbounded_numeric { args.truncate(1); }
+                &unbounded_numeric
+            } else { expr }
+        } else { expr }
+    } else { expr };
     // Set up value override
     program.id_register_overrides.insert("value", value_reg);
 

@@ -1081,7 +1081,8 @@ fn result_on_empty_input(plan: &SelectPlan) -> Option<EmptyInputValue> {
             | AggFunc::Max
             | AggFunc::Min
             | AggFunc::StringAgg
-            | AggFunc::Sum => Some(EmptyInputValue::Null),
+            | AggFunc::Sum
+            | AggFunc::PgSum(_) => Some(EmptyInputValue::Null),
             _ => None,
         };
     }
@@ -1100,6 +1101,7 @@ fn is_null_on_empty_input(expr: &Expr, aggregates: &[crate::translate::plan::Agg
                     | AggFunc::Min
                     | AggFunc::StringAgg
                     | AggFunc::Sum
+                    | AggFunc::PgSum(_)
             )
     }) {
         return true;

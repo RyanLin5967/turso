@@ -550,7 +550,7 @@ pub fn translate_aggregation_step(
 
             target_register
         }
-        AggFunc::Sum => {
+        AggFunc::Sum | AggFunc::PgSum(_) => {
             if num_args != 1 {
                 crate::bail_parse_error!("sum bad number of arguments");
             }
@@ -561,7 +561,7 @@ pub fn translate_aggregation_step(
                     acc_reg: target_register,
                     col: expr_reg,
                     delimiter: 0,
-                    func: AccumulatorFunc::Agg(AggFunc::Sum),
+                    func: AccumulatorFunc::Agg(func.clone()),
                     comparator: None,
                     collation: None,
                 }),

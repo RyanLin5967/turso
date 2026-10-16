@@ -70,6 +70,7 @@ pub fn emit_select_plan(
     connection: &Arc<crate::Connection>,
 ) -> Result<usize> {
     optimize_plan(program, &mut plan, resolver)?;
+    super::expr::prepare_pg_result_coercions(&mut plan, resolver)?;
     let num_result_cols;
     let opts = match &plan {
         Plan::Select(select) => {
@@ -602,6 +603,7 @@ fn prepare_one_select_plan(
                             let contains_aggregates = resolve_window_and_aggregate_functions(
                                 &expr,
                                 resolver,
+                                Some(&plan.table_references),
                                 &mut aggregate_expressions,
                                 Some(&mut windows),
                                 &mut named_windows,
@@ -752,6 +754,7 @@ fn prepare_one_select_plan(
                     let had_agg = resolve_window_and_aggregate_functions(
                         &o.expr,
                         resolver,
+                        Some(&plan.table_references),
                         &mut plan.aggregates,
                         Some(&mut windows),
                         &mut named_windows,
@@ -1897,6 +1900,7 @@ fn process_having_clause(
         resolve_window_and_aggregate_functions(
             expr,
             resolver,
+            Some(table_references),
             aggregate_expressions,
             None,
             &mut [],

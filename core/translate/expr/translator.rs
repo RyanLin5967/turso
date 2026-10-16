@@ -549,17 +549,26 @@ pub fn translate_expr(
                 if let Some(resolved) = resolver.schema().resolve_type_unchecked(&tn.name)? {
                     // Build ty_params from AST TypeSize so parametric types
                     // (e.g. numeric(10,2)) get their parameters passed through.
-                    let ty_params: Vec<Box<ast::Expr>> = match &tn.size {
+                    let mut ty_params: Vec<Box<ast::Expr>> = match &tn.size {
                         Some(ast::TypeSize::MaxSize(e)) => vec![e.clone()],
                         Some(ast::TypeSize::TypeSize(e1, e2)) => {
                             vec![e1.clone(), e2.clone()]
                         }
                         None => Vec::new(),
                     };
+                    if resolver.dialect.name() == "postgres" && tn.name.eq_ignore_ascii_case("numeric") && ty_params.len() == 1 {
+                        ty_params.push(Box::new(ast::Expr::Literal(ast::Literal::Numeric("0".into()))));
+                    }
 
                     // Domains: apply parent encode chain, then validate constraints
                     // on the encoded value (domain CHECK sees the stored representation).
                     if resolved.is_domain() {
+                        if resolver.dialect.name() == "postgres" {
+                            if let Some(ty) = pg_type_name(&tn.name, resolver).filter(|t| t.is_integer() || matches!(t, crate::numeric::pg::PgNumericType::Float4 | crate::numeric::pg::PgNumericType::Float8)) {
+                                let source = pg_numeric_type(expr, referenced_tables, resolver)?;
+                                emit_pg_numeric(program, crate::numeric::pg::PgNumericOp::Cast { source }, ty, target_register, None, target_register);
+                            }
+                        }
                         // Apply encode from parent custom types (domain itself has encode: None)
                         let cast_col = Column::new(
                             None,
@@ -637,6 +646,14 @@ pub fn translate_expr(
                                 type_def,
                                 resolver,
                             )?;
+                            // A PostgreSQL cast returns a numeric SQL value. Decode only this
+                            // known private representation; arbitrary bytea remains invalid
+                            // numeric input at the checked-operation boundary.
+                            if resolver.dialect.name() == "postgres" && type_def.is_builtin && type_def.name.eq_ignore_ascii_case("numeric") {
+                                if let Some(decode_expr) = type_def.decode() {
+                                    emit_type_expr(program, decode_expr, target_register, target_register, &cast_col, type_def, resolver)?;
+                                }
+                            }
                         } else {
                             // A BASE-only type (no ENCODE, e.g. float4/float8) casts as its
                             // primitive base does (C32 MED: nothing was emitted, so the value kept

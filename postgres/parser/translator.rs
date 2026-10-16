@@ -3335,6 +3335,24 @@ impl PostgreSQLTranslator {
     fn translate_expr(&self, node: &pg_query::protobuf::Node) -> Result<ast::Expr, ParseError> {
         // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
         let _nest = crate::nest()?;
+        let expr = self.translate_expr_inner(node)?;
+        let target = match self.expression_type(node) {
+            Some(21) => Some("smallint"), Some(23) => Some("integer"), Some(20) => Some("bigint"),
+            Some(700) => Some("float4"), Some(701) => Some("float8"), Some(1700) => Some("numeric"),
+            _ => None,
+        };
+        // Columns already carry schema types; retaining their shape also preserves custom
+        // comparison/index operators. Explicit casts and numeric literals carry their own type.
+        if let Some(name) = target.filter(|_| !matches!(node.node.as_ref(), Some(
+            pg_query::protobuf::node::Node::ColumnRef(_) | pg_query::protobuf::node::Node::TypeCast(_)
+            | pg_query::protobuf::node::Node::AConst(_)))) {
+            Ok(ast::Expr::Cast { expr: Box::new(expr), type_name: Some(ast::Type {
+                name: name.into(), size: None, array_dimensions: 0,
+            }) })
+        } else { Ok(expr) }
+    }
+
+    fn translate_expr_inner(&self, node: &pg_query::protobuf::Node) -> Result<ast::Expr, ParseError> {
         match &node.node {
             Some(pg_query::protobuf::node::Node::ColumnRef(col_ref)) => {
                 if let Some((table, _)) = self.series_column(col_ref)? {
@@ -5622,9 +5640,9 @@ pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
             return match params {
                 [p, s] => Some(PgTypeMapping::with_params("numeric", vec![*p, *s])),
                 [p] => Some(PgTypeMapping::with_params("numeric", vec![*p, 0])),
-                // Stored FLOAT8, so it keeps the float8 it was announced as (a REAL declaration
-                // reads as float4).
-                _ => Some(PgTypeMapping::scalar("FLOAT8")),
+                // No typmod: retain the existing exact numeric representation and its
+                // PostgreSQL global bounds, including NaN and infinities.
+                _ => Some(PgTypeMapping::scalar("numeric")),
             };
         }
 
@@ -5904,7 +5922,8 @@ fn pg_type_name_to_ast_type(type_name: &pg_query::protobuf::TypeName) -> Option<
     let pg_type = parts.join(" ");
 
     let name = match pg_type.to_uppercase().as_str() {
-        "INTEGER" | "INT" | "INT4" | "SERIAL" | "OID" | "REGCLASS" | "REGTYPE" => "INTEGER",
+        "INTEGER" | "INT" | "INT4" | "SERIAL" => "INTEGER",
+        "OID" | "REGCLASS" | "REGTYPE" => "OID",
         "SMALLINT" | "INT2" | "SMALLSERIAL" => "smallint",
         "BIGINT" | "INT8" | "BIGSERIAL" => "bigint",
         "REAL" | "FLOAT4" => "FLOAT4",
@@ -5913,7 +5932,7 @@ fn pg_type_name_to_ast_type(type_name: &pg_query::protobuf::TypeName) -> Option<
         "MONEY" => "REAL",
         // For CAST expressions, map all text-like PG types to TEXT and
         // boolean to INTEGER for SQLite VDBE compatibility
-        "BOOLEAN" | "BOOL" => "INTEGER",
+        "BOOLEAN" | "BOOL" => "BOOLEAN",
         "TEXT" | "VARCHAR" | "CHAR" | "BPCHAR" | "NAME" | "UUID" | "DATE" | "TIME" | "TIMETZ"
         | "TIMESTAMP" | "TIMESTAMPTZ" | "INTERVAL" | "INET" | "JSON" | "JSONB" | "XML" | "CIDR"
         | "MACADDR" | "BIT" | "VARBIT" | "TSVECTOR" | "TSQUERY" => "TEXT",
@@ -5921,9 +5940,22 @@ fn pg_type_name_to_ast_type(type_name: &pg_query::protobuf::TypeName) -> Option<
         _ => return None,
     };
 
+    let params = type_name.typmods.iter().filter_map(|node| match &node.node {
+        Some(Node::Integer(i)) => Some(i.ival),
+        Some(Node::AConst(a)) => match &a.val { Some(pg_query::protobuf::a_const::Val::Ival(i)) => Some(i.ival), _ => None },
+        _ => None,
+    }).collect::<Vec<_>>();
+    let param = |n: i32| Box::new(ast::Expr::Literal(ast::Literal::Numeric(n.to_string())));
+    let size = if name == "numeric" {
+        match params.as_slice() {
+            [p] => Some(ast::TypeSize::TypeSize(param(*p), param(0))),
+            [p, s] => Some(ast::TypeSize::TypeSize(param(*p), param(*s))),
+            _ => None,
+        }
+    } else { None };
     Some(ast::Type {
         name: name.to_string(),
-        size: None,
+        size,
         array_dimensions: 0,
     })
 }

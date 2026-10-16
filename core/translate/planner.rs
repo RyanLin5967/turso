@@ -509,6 +509,7 @@ pub const ROWID_STRS: [&str; 3] = ["rowid", "_rowid_", "oid"];
 pub fn resolve_window_and_aggregate_functions(
     top_level_expr: &Expr,
     resolver: &Resolver,
+    tables: Option<&TableReferences>,
     aggs: &mut Vec<Aggregate>,
     mut windows: Option<&mut Vec<Window>>,
     named_windows: &mut [crate::translate::plan::NamedWindowDef],
@@ -566,6 +567,11 @@ pub fn resolve_window_and_aggregate_functions(
 
                 match Func::resolve_function(name.as_str(), args_count)? {
                     Some(Func::Agg(f)) => {
+                        let f = if f == AggFunc::Sum && resolver.dialect.name() == "postgres" {
+                            let input = args.first().map(|arg| super::expr::pg_numeric_type(arg, tables, resolver)).transpose()?
+                                .unwrap_or(crate::numeric::pg::PgNumericType::Dynamic);
+                            AggFunc::PgSum(input.sum_type())
+                        } else { f };
                         if let Some(over_clause) = filter_over.over_clause.as_ref() {
                             link_with_window(
                                 windows.as_deref_mut(),
@@ -926,6 +932,7 @@ fn resolve_effective_frame(
         func,
         AccumulatorFunc::Agg(
             AggFunc::Sum
+                | AggFunc::PgSum(_)
                 | AggFunc::Total
                 | AggFunc::Count
                 | AggFunc::Count0

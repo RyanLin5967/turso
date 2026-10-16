@@ -838,7 +838,8 @@ fn validate(
                                     None => 0,
                                 };
                                 let expected = td.user_params().count();
-                                if provided != expected {
+                                let unbounded_numeric = provided == 0 && td.is_builtin && td.name.eq_ignore_ascii_case("numeric");
+                                if provided != expected && !unbounded_numeric {
                                     bail_parse_error!(
                                         "type \"{}\" requires {} parameter(s), got {}",
                                         type_name,
@@ -1025,6 +1026,7 @@ fn emit_ctas_insert(
     *dest = QueryDestination::CoroutineYield {
         yield_reg,
         coroutine_implementation_start: halt_label,
+        pg_coercions: Vec::new(),
     };
 
     let num_result_cols =

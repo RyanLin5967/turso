@@ -1194,6 +1194,12 @@ fn optimize_update_plan(
     resolver: &Resolver,
 ) -> Result<()> {
     let schema = resolver.schema();
+    if resolver.dialect.name() == "postgres" {
+        let scope = plan.build_read_scope_tables();
+        for clause in &mut plan.set_clauses {
+            clause.pg_source_type = Some(super::expr::pg_numeric_type(&clause.expr, Some(&scope), resolver)?);
+        }
+    }
     let is_update_from = !plan.from_tables.joined_tables().is_empty();
     if is_update_from {
         plan.safety.require(DmlSafetyReason::UpdateFrom);

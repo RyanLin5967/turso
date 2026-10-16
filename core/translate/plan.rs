@@ -585,6 +585,8 @@ pub enum QueryDestination {
         yield_reg: usize,
         /// The index of the first instruction in the bytecode that implements the coroutine.
         coroutine_implementation_start: BranchOffset,
+        /// PG assignment casts, resolved before sorting or compound materialization.
+        pg_coercions: Vec<super::expr::PgCoercion>,
     },
     /// The results of the query are stored in an ephemeral index,
     /// later used by the parent query.
@@ -654,6 +656,7 @@ impl QueryDestination {
         QueryDestination::CoroutineYield {
             yield_reg: usize::MAX, // will be set later in bytecode emission
             coroutine_implementation_start: BranchOffset::Placeholder, // will be set later in bytecode emission
+            pg_coercions: Vec::new(),
         }
     }
 }
@@ -925,6 +928,7 @@ pub struct UpdateSetClause {
     /// the collection phase. That column in the scratch table contains the evaluated result
     /// of s.x + 1.
     pub update_from_result: Option<Box<ast::Expr>>,
+    pub pg_source_type: Option<crate::numeric::pg::PgNumericType>,
 }
 
 impl UpdateSetClause {
@@ -933,6 +937,7 @@ impl UpdateSetClause {
             column_index,
             expr,
             update_from_result: None,
+            pg_source_type: None,
         }
     }
 

@@ -70,6 +70,21 @@ pub(super) fn emit_binary_expr_scalar(
     resolver: &Resolver,
     emit_mode: BinaryEmitMode,
 ) -> Result<usize> {
+    if resolver.dialect.name() == "postgres" {
+        let a = pg_numeric_type(e1, referenced_tables, resolver)?;
+        let b = pg_numeric_type(e2, referenced_tables, resolver)?;
+        if let Some((op, ty)) = pg_binary_operation(op, a, b) {
+            let lhs = program.alloc_register();
+            let rhs = program.alloc_register();
+            translate_expr(program, referenced_tables, e1, lhs, resolver)?;
+            translate_expr(program, referenced_tables, e2, rhs, resolver)?;
+            emit_pg_numeric(program, op, ty, lhs, Some(rhs), target_register);
+            if let BinaryEmitMode::Condition(metadata) = emit_mode {
+                emit_cond_jump(program, metadata, target_register);
+            }
+            return Ok(target_register);
+        }
+    }
     // Check if both sides of the expression are equivalent and reuse the same register if so
     if exprs_are_equivalent(e1, e2) {
         let shared_reg = program.alloc_register();

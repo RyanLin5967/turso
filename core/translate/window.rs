@@ -35,6 +35,7 @@ const SUBQUERY_DATABASE_ID: usize = 0;
 
 struct WindowSubqueryContext<'a> {
     resolver: &'a Resolver<'a>,
+    tables: &'a TableReferences,
     subquery_order_by: &'a mut Vec<(Box<Expr>, SortOrder, Option<turso_parser::ast::NullsOrder>)>,
     subquery_result_columns: &'a mut Vec<ResultSetColumn>,
     subquery_id: &'a TableInternalId,
@@ -160,8 +161,10 @@ fn prepare_window_subquery(
         current_window.name = Some(format!("window_{processed_window_count}"));
     }
 
+    let source_tables = outer_plan.table_references.clone();
     let mut ctx = WindowSubqueryContext {
         resolver,
+        tables: &source_tables,
         subquery_order_by: &mut subquery_order_by,
         subquery_result_columns: &mut subquery_result_columns,
         subquery_id: &subquery_id,
@@ -297,6 +300,7 @@ fn append_order_by(
     let contains_aggregates = resolve_window_and_aggregate_functions(
         expr,
         ctx.resolver,
+        Some(ctx.tables),
         &mut plan.aggregates,
         None,
         &mut [],
@@ -404,7 +408,7 @@ fn push_into_source_subquery(
     ctx: &mut WindowSubqueryContext,
 ) -> crate::Result<()> {
     let contains_aggregates =
-        resolve_window_and_aggregate_functions(expr, ctx.resolver, aggregates, None, &mut [])?;
+        resolve_window_and_aggregate_functions(expr, ctx.resolver, Some(ctx.tables), aggregates, None, &mut [])?;
     if expr_contains_nondeterministic_scalar_function(expr, ctx.resolver)? {
         push_new_subquery_column(expr, ctx, contains_aggregates);
     } else {

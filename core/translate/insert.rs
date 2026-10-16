@@ -641,6 +641,9 @@ pub fn translate_insert(
     }
 
     program.preassign_label_to_next_insn(ctx.key_labels.key_ready_for_check);
+    if let Some(alias) = ctx.table.columns().iter().find(|column| column.is_rowid_alias()) {
+        crate::translate::expr::emit_pg_assignment(program, resolver, alias, insertion.key_register(), crate::numeric::pg::PgNumericType::Int8);
+    }
 
     crate::translate::expr::emit_pg_column_coercions(program, resolver, ctx.table.columns(),
         insertion.first_col_register(), None, &ColumnLayout::from_columns(ctx.table.columns())?);
@@ -877,12 +880,16 @@ pub fn translate_insert(
     // wrong index entries. Collations likewise: a rewritten reference to a
     // NOCASE column must keep comparing case-insensitively.
     for cm in &insertion.col_mappings {
+        crate::translate::expr::record_pg_column_type(resolver, cm.column, cm.register);
         resolver
             .register_affinities
             .insert(cm.register, cm.column.affinity());
         resolver
             .register_collations
             .insert(cm.register, cm.column.collation());
+    }
+    if let InsertionKey::RowidAlias(key) = &insertion.key {
+        crate::translate::expr::record_pg_column_type(resolver, key.column, key.register);
     }
     resolver
         .register_affinities
@@ -941,6 +948,7 @@ pub fn translate_insert(
     }
 
     resolver.register_affinities.clear();
+    resolver.register_pg_types.clear();
     resolver.register_collations.clear();
 
     let mut insert_flags = InsertFlags::new();
@@ -2252,6 +2260,7 @@ fn init_source_emission<'a>(
                 let query_destination = QueryDestination::CoroutineYield {
                     yield_reg,
                     coroutine_implementation_start: ctx.halt_label,
+                    pg_coercions: crate::translate::expr::pg_insert_coercions(table, columns, resolver),
                 };
                 let num_result_cols = program.nested(|program| {
                     translate_select(select, resolver, program, query_destination, connection)
@@ -2760,6 +2769,15 @@ fn translate_rows_single(
                 resolver,
                 NoConstantOptReason::RegisterReuse,
             )?;
+            if resolver.dialect.name() == "postgres" {
+                let column = match &insertion.key {
+                    InsertionKey::RowidAlias(key) if key.value_index == Some(value_index) => Some(key.column),
+                    _ => insertion.col_mappings.iter().find(|c| c.value_index == Some(value_index)).map(|c| c.column),
+                };
+                if let Some(column) = column {
+                    crate::translate::expr::emit_pg_assignment_expr(prg, resolver, column, &value[value_index], None, column_register)?;
+                }
+            }
             Ok(())
         };
     translate_rows_base(program, insertion, translate_value_fn, resolver, is_strict)
@@ -2842,6 +2860,7 @@ fn translate_column(
     resolver: &Resolver,
     is_strict: bool,
 ) -> Result<()> {
+    let mut pg_source = crate::numeric::pg::PgNumericType::Dynamic;
     if let Some(value_index) = value_index {
         // Save/restore target_union_type so union_value() resolves tags
         // against this column's union type. See ProgramBuilder::target_union_type.
@@ -2869,6 +2888,9 @@ fn translate_column(
         match (column.default.as_ref(), crate::recipe::mutant()) {
             (Some(default_expr), m) if m != crate::recipe::Mutant::M2 => {
                 translate_expr(program, None, default_expr, column_register, resolver)?;
+                if resolver.dialect.name() == "postgres" {
+                    pg_source = crate::translate::expr::pg_numeric_type(default_expr, None, resolver)?;
+                }
             }
             _ => {
                 program.emit_insn(Insn::Integer {
@@ -2884,9 +2906,15 @@ fn translate_column(
         });
     } else if let Some(default_expr) = column.default.as_ref() {
         translate_expr(program, None, default_expr, column_register, resolver)?;
+        if resolver.dialect.name() == "postgres" {
+            pg_source = crate::translate::expr::pg_numeric_type(default_expr, None, resolver)?;
+        }
     } else if let Ok(Some(resolved)) = resolver.schema().resolve_type(&column.ty_str, is_strict) {
         if let Some(default_expr) = resolved.default_expr() {
             translate_expr(program, None, default_expr, column_register, resolver)?;
+            if resolver.dialect.name() == "postgres" {
+                pg_source = crate::translate::expr::pg_numeric_type(default_expr, None, resolver)?;
+            }
         } else {
             program.emit_insn(Insn::Null {
                 dest: column_register,
@@ -2898,6 +2926,9 @@ fn translate_column(
             dest: column_register,
             dest_end: None,
         });
+    }
+    if resolver.dialect.name() == "postgres" {
+        crate::translate::expr::emit_pg_assignment(program, resolver, column, column_register, pg_source);
     }
     Ok(())
 }

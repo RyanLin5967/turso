@@ -616,10 +616,12 @@ pub fn emit_upsert(
             continue;
         }
         let reg = layout.to_register(expr_current_start, idx);
+        crate::translate::expr::record_pg_column_type(resolver, col, reg);
         resolver.register_affinities.insert(reg, col.affinity());
         resolver.register_collations.insert(reg, col.collation());
         if let Some(decoded_start) = excluded_decoded_start {
             let excluded_reg = layout.to_register(decoded_start, idx);
+            crate::translate::expr::record_pg_column_type(resolver, col, excluded_reg);
             resolver
                 .register_affinities
                 .insert(excluded_reg, col.affinity());
@@ -627,6 +629,9 @@ pub fn emit_upsert(
                 .register_collations
                 .insert(excluded_reg, col.collation());
         }
+    }
+    if let Some(column) = table.columns().iter().find(|column| column.is_rowid_alias()) {
+        crate::translate::expr::record_pg_column_type(resolver, column, ctx.conflict_rowid_reg);
     }
     resolver
         .register_affinities
@@ -688,6 +693,7 @@ pub fn emit_upsert(
         );
         program.target_union_type = prev_union;
         translate_result?;
+        crate::translate::expr::emit_pg_assignment_expr(program, resolver, col, expr, None, layout.to_register(new_start, *col_idx))?;
         if col.notnull() && !col.is_rowid_alias() {
             program.emit_insn(Insn::HaltIfNull {
                 target_reg: layout.to_register(new_start, *col_idx),

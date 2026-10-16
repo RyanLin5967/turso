@@ -6972,6 +6972,10 @@ fn kbn_init_from_int(acc: &mut Value, i: i64, state: &mut SumAggState) {
 fn init_agg_payload(func: &AggFunc, payload: &mut crate::alloc::Vec<Value>) -> Result<()> {
     match func {
         AggFunc::Count | AggFunc::Count0 => payload.push(Value::from_i64(0)),
+        AggFunc::PgSum(_) => {
+            payload.push(Value::Null);
+            for _ in 0..4 { payload.push(Value::from_i64(0)); }
+        }
         AggFunc::Sum | AggFunc::Total => {
             let acc = if matches!(func, AggFunc::Total) {
                 Value::from_f64(0.0)
@@ -7074,6 +7078,7 @@ fn update_agg_payload(
     comparator: impl FnOnce() -> Result<Option<crate::vdbe::sorter::SortComparator>>,
 ) -> Result<()> {
     match func {
+        AggFunc::PgSum(ty) => crate::numeric::pg::sum_update(*ty, arg, payload, false)?,
         AggFunc::Count => {
             // COUNT(column) increments only when arg is not NULL. Empty args treated as non-NULL
             // (would indicate a bug in query translation, but matches SQLite behavior of counting).
@@ -7441,6 +7446,7 @@ fn update_agg_payload(
 /// - **JsonGroup***: Parses accumulated raw JSONB bytes into proper JSON output
 fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
     let val = match func {
+        AggFunc::PgSum(ty) => crate::numeric::pg::sum_final(*ty, payload)?,
         AggFunc::Count | AggFunc::Count0 => payload[0].clone(),
         AggFunc::Avg => {
             // Payload: [sum, r_err, count]
@@ -8325,6 +8331,7 @@ fn kbn_step_int_neg(acc: &mut Value, i: i64, state: &mut SumAggState) {
 /// xInverse implementations at `func.c:1859-1986`.
 fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut [Value]) -> Result<()> {
     match func {
+        AggFunc::PgSum(ty) => crate::numeric::pg::sum_update(*ty, &arg, payload, true)?,
         AggFunc::Count => {
             if !matches!(arg, Value::Null) {
                 let Value::Numeric(Numeric::Integer(i)) = &mut payload[0] else {
@@ -10596,16 +10603,15 @@ pub fn op_function(
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::NumericEncode => {
-                check_arg_count!(arg_count, 3);
+                if arg_count != 1 { check_arg_count!(arg_count, 3); }
                 let val = &state.registers[*start_reg];
-                let precision_reg = &state.registers[*start_reg + 1];
-                let scale_reg = &state.registers[*start_reg + 2];
                 let result = match val.get_value() {
                     Value::Null => Value::Null,
                     other => {
                         use crate::numeric::decimal::{NumericTypmod, PgNumeric};
 
-                        let precision = match precision_reg.get_value() {
+                        let typmod = if arg_count == 1 { None } else {
+                        let precision = match state.registers[*start_reg + 1].get_value() {
                             Value::Numeric(Numeric::Integer(i)) => *i,
                             _ => {
                                 return Err(LimboError::Constraint(
@@ -10613,7 +10619,7 @@ pub fn op_function(
                                 ));
                             }
                         };
-                        let scale = match scale_reg.get_value() {
+                        let scale = match state.registers[*start_reg + 2].get_value() {
                             Value::Numeric(Numeric::Integer(i)) => *i,
                             _ => {
                                 return Err(LimboError::Constraint(
@@ -10623,7 +10629,8 @@ pub fn op_function(
                         };
                         // The typmod first, before any value is parsed or rescaled: a CAST or a
                         // column whose typmod CREATE TABLE never saw is bounded here too.
-                        let typmod = NumericTypmod::new(precision, scale)?;
+                        Some(NumericTypmod::new(precision, scale)?)
+                        };
                         let value = match other {
                             Value::Numeric(Numeric::Integer(i)) => PgNumeric::from_i64(*i),
                             Value::Numeric(Numeric::Float(f)) => PgNumeric::parse(&f.to_string())
@@ -10644,7 +10651,8 @@ pub fn op_function(
                                 ))));
                             }
                         };
-                        Value::from_blob(value.with_typmod(typmod)?.to_blob())
+                        let value = if let Some(typmod) = typmod { value.with_typmod(typmod)? } else { value };
+                        Value::from_blob(value.to_blob())
                     }
                 };
                 state.registers[*dest].set_value(result);

@@ -2379,6 +2379,9 @@ impl<'a> LogicalPlanBuilder<'a> {
             LogicalExpr::AggregateFunction { fun, .. } => match fun {
                 AggFunc::Count | AggFunc::Count0 => Ok(Type::Integer),
                 AggFunc::Sum | AggFunc::Avg | AggFunc::Total => Ok(Type::Real),
+                AggFunc::PgSum(ty) => Ok(if ty.is_integer() { Type::Integer }
+                    else if *ty == crate::numeric::pg::PgNumericType::Numeric { Type::Text }
+                    else { Type::Real }),
                 AggFunc::Min | AggFunc::Max => Ok(Type::Text),
                 AggFunc::GroupConcat | AggFunc::StringAgg => Ok(Type::Text),
                 AggFunc::ArrayAgg => Ok(Type::Blob),

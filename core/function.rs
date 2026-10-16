@@ -430,6 +430,9 @@ pub enum AggFunc {
     Min,
     StringAgg,
     Sum,
+    /// PostgreSQL sum with its resolved accumulator/result type.
+    #[strum(disabled)]
+    PgSum(crate::numeric::pg::PgNumericType),
     Total,
     #[cfg(feature = "json")]
     JsonbGroupArray,
@@ -688,6 +691,7 @@ impl PartialEq for AggFunc {
             | (Self::Mode, Self::Mode)
             | (Self::PercentileCont, Self::PercentileCont)
             | (Self::PercentileDisc, Self::PercentileDisc) => true,
+            (Self::PgSum(a), Self::PgSum(b)) => a == b,
             (Self::External(a), Self::External(b)) => Arc::ptr_eq(a, b),
             _ => false,
         }
@@ -715,7 +719,7 @@ impl AggFunc {
             Self::Max => 1,
             Self::Min => 1,
             Self::StringAgg => 2,
-            Self::Sum => 1,
+            Self::Sum | Self::PgSum(_) => 1,
             Self::Total => 1,
             Self::ArrayAgg => 1,
             // Ordered-set aggregates: args are rewritten by the planner to
@@ -744,7 +748,7 @@ impl AggFunc {
             Self::Max => &[1],
             Self::Min => &[1],
             Self::StringAgg => &[2],
-            Self::Sum => &[1],
+            Self::Sum | Self::PgSum(_) => &[1],
             Self::Total => &[1],
             Self::ArrayAgg => &[1],
             Self::Mode => &[1],
@@ -766,7 +770,7 @@ impl AggFunc {
             Self::Max => "max",
             Self::Min => "min",
             Self::StringAgg => "string_agg",
-            Self::Sum => "sum",
+            Self::Sum | Self::PgSum(_) => "sum",
             Self::Total => "total",
             Self::ArrayAgg => "array_agg",
             Self::Mode => "mode",
@@ -1316,7 +1320,7 @@ impl ScalarFunc {
             | Self::NumericDiv
             | Self::NumericLt
             | Self::NumericEq => &[2],
-            Self::NumericEncode => &[3],
+            Self::NumericEncode => &[1, 3],
             // Array construction / element access
             Self::Array => &[-1], // variable arity
             Self::ArrayElement => &[2],

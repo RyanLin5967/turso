@@ -73,6 +73,7 @@ fn emit_values_when_single_row(
             NoConstantOptReason::RegisterReuse,
         )?;
     }
+    super::expr::emit_pg_values_coercions(program, plan, first_row, start_reg, &t_ctx.resolver)?;
     emit_values_to_destination(program, plan, t_ctx, start_reg, row_len, end_label)?;
     program.preassign_label_to_next_insn(end_label);
     Ok(start_reg)
@@ -163,6 +164,7 @@ fn emit_values_in_subquery(
                 NoConstantOptReason::RegisterReuse,
             )?;
         }
+        super::expr::emit_pg_values_coercions(program, plan, value, start_reg, &t_ctx.resolver)?;
         program.emit_insn(Insn::Yield {
             yield_reg,
             end_offset: BranchOffset::Offset(0),
