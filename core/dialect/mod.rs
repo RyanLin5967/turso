@@ -187,6 +187,15 @@ pub trait Dialect: Send + Sync + 'static {
     fn check_table_function_args(&self, _name: &str, _idx_num: i64, _args: &[crate::Value]) -> crate::Result<()> {
         Ok(())
     }
+
+    /// PostgreSQL 18's casts to a type over bytea (a blob base): the function that encodes an
+    /// integer of `width` bytes (2, 4 or 8) as its big-endian two's complement (PostgreSQL's
+    /// int2send, int4send and int8send). `None`, the default, keeps SQLite's CAST unchanged;
+    /// `Some` also refuses a numeric, float or boolean source (42846: PostgreSQL has no such cast;
+    /// lead DECISIONS 60ddcb6f8f).
+    fn integer_to_bytea(&self, _width: u8) -> Option<crate::Func> {
+        None
+    }
 }
 
 #[cfg(test)]

@@ -207,6 +207,12 @@ impl Dialect for PostgresDialect {
         true
     }
 
+    /// PostgreSQL 18 casts an integer to bytea as its big-endian two's complement at its type's
+    /// width: int2send, int4send, int8send (lead DECISIONS 60ddcb6f8f; PG 18 strings.out).
+    fn integer_to_bytea(&self, width: u8) -> Option<Func> {
+        matches!(width, 2 | 4 | 8).then(|| Func::Dialect(format!("int{width}send")))
+    }
+
     /// PostgreSQL's float input reads 'Infinity', '-Infinity', 'inf' and '-inf' in any case, with
     /// surrounding blanks, as the infinities, where SQLite's rules read 0 (the crash batch,
     /// 2026-10-15). The engine has no NaN value, so 'NaN' is refused 0A000, as the translator's

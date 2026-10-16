@@ -93,10 +93,13 @@ pub fn resolve_expr(
 /// A CAST to a type with no ENCODE anywhere in its chain (a domain's included) converts as its
 /// primitive base does, as PostgreSQL 18 casts to a domain by its underlying type: an integer or
 /// real base by its affinity, a text base to TEXT (review of 96b69304b, F4: CAST(10 AS dt) over text
-/// stayed the integer 10). Over a blob base (bytea) a numeric source is refused as PostgreSQL
-/// refuses it, 42846 "cannot cast type integer to bytea"; any other source is left as it is (a text
-/// is not read in bytea's input format: a DIVERGENCE, stated). Other bases (any) are left as
-/// they are.
+/// stayed the integer 10; the text is SQLite's rendering of the value, not PostgreSQL's output
+/// function's, registered PGDIV-CAST-TEXT-RENDERING). Over a blob base (bytea) the dialect decides
+/// ([`crate::dialect::Dialect::integer_to_bytea`]): the SQLite dialect keeps SQLite's CAST
+/// unchanged (integrate-reviewer-2 L3); PostgreSQL's encodes an integer as its big-endian two's
+/// complement at its type's width, refuses a numeric, float or boolean source 42846 naming its
+/// type, and casts any other source to BLOB (lead DECISIONS 60ddcb6f8f). Other bases (any) are
+/// left as they are.
 fn emit_cast_by_base_without_encode(
     program: &mut ProgramBuilder,
     referenced_tables: Option<&TableReferences>,
@@ -115,9 +118,26 @@ fn emit_cast_by_base_without_encode(
                 affinity,
             });
         }
-        Affinity::Blob => {
-            if let Some(source_type) = numeric_source_type(source, referenced_tables, resolver) {
-                crate::bail_parse_error!(SqlErrorKind::CannotCoerce; "cannot cast type {source_type} to {ty}");
+        Affinity::Blob if resolver.dialect.integer_to_bytea(8).is_some() => {
+            match bytea_source(source, referenced_tables, resolver) {
+                ByteaSource::Integer(width) => {
+                    let func = resolver.dialect.integer_to_bytea(width).expect("the dialect encodes 2, 4 and 8 bytes");
+                    program.emit_insn(Insn::Function {
+                        constant_mask: 0,
+                        start_reg: target_register,
+                        dest: target_register,
+                        func: FuncCtx { func, arg_count: 1 },
+                    });
+                }
+                ByteaSource::NoCast(source_type) => {
+                    crate::bail_parse_error!(SqlErrorKind::CannotCoerce; "cannot cast type {source_type} to {ty}");
+                }
+                ByteaSource::Other => {
+                    program.emit_insn(Insn::Cast {
+                        reg: target_register,
+                        affinity: Affinity::Blob,
+                    });
+                }
             }
         }
         _ => {}
@@ -125,28 +145,76 @@ fn emit_cast_by_base_without_encode(
     Ok(())
 }
 
-/// The PostgreSQL name of a numeric source's type (a numeric literal, or an expression of integer
-/// or real affinity), for a refused cast; None for any other source.
-fn numeric_source_type(
-    source: &ast::Expr,
-    referenced_tables: Option<&TableReferences>,
-    resolver: &Resolver,
-) -> Option<&'static str> {
+/// What a cast to bytea does with its source, by the source's PostgreSQL type.
+enum ByteaSource {
+    /// An integer of this many bytes: encoded.
+    Integer(u8),
+    /// A type PostgreSQL 18 has no cast to bytea from (numeric, float, boolean): refused, named.
+    NoCast(&'static str),
+    /// Anything else (text, bytea, NULL, a parameter): cast to BLOB.
+    Other,
+}
+
+/// A source's PostgreSQL type for a cast to bytea: a numeric literal is int4 if it fits, else
+/// int8, else numeric (PostgreSQL's rule for a constant); a column or a cast by its declared type
+/// name; any other expression by its affinity, an integer one taken as int8 (BLIND SPOT, stated:
+/// PostgreSQL gives an expression its own type, `int4 + int4` is int4; registered
+/// PGDIV-BYTEA-INT-EXPR-WIDTH).
+fn bytea_source(source: &ast::Expr, referenced_tables: Option<&TableReferences>, resolver: &Resolver) -> ByteaSource {
+    fn literal(text: &str) -> ByteaSource {
+        let (neg, digits) = match text.strip_prefix('-') {
+            Some(d) => (true, d),
+            None => (false, text),
+        };
+        let value = match digits.strip_prefix("0x").or_else(|| digits.strip_prefix("0X")) {
+            Some(hex) => i128::from_str_radix(hex, 16).ok(),
+            None => digits.parse::<i128>().ok(),
+        };
+        match value.map(|v| if neg { -v } else { v }) {
+            Some(v) if i32::try_from(v).is_ok() => ByteaSource::Integer(4),
+            Some(v) if i64::try_from(v).is_ok() => ByteaSource::Integer(8),
+            _ => ByteaSource::NoCast("numeric"),
+        }
+    }
+    fn by_name(name: &str) -> Option<ByteaSource> {
+        let base = name.split('(').next().unwrap_or(name).trim().to_ascii_lowercase();
+        Some(match base.as_str() {
+            "smallint" | "int2" => ByteaSource::Integer(2),
+            "integer" | "int" | "int4" => ByteaSource::Integer(4),
+            "bigint" | "int8" => ByteaSource::Integer(8),
+            "boolean" | "bool" => ByteaSource::NoCast("boolean"),
+            "real" | "float4" => ByteaSource::NoCast("real"),
+            "double precision" | "float8" | "double" | "float" => ByteaSource::NoCast("double precision"),
+            "numeric" | "decimal" => ByteaSource::NoCast("numeric"),
+            _ => return None,
+        })
+    }
     match source {
-        ast::Expr::Literal(ast::Literal::Numeric(n)) => {
-            Some(if n.parse::<i64>().is_ok() { "integer" } else { "numeric" })
-        }
-        ast::Expr::Unary(ast::UnaryOperator::Negative | ast::UnaryOperator::Positive, inner) => {
-            numeric_source_type(inner, referenced_tables, resolver)
-        }
-        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
-            numeric_source_type(&exprs[0], referenced_tables, resolver)
-        }
-        _ => match super::affinity::get_expr_affinity(source, referenced_tables, Some(resolver)) {
-            Affinity::Integer => Some("integer"),
-            Affinity::Real => Some("double precision"),
-            _ => None,
+        ast::Expr::Literal(ast::Literal::Numeric(n)) => literal(n),
+        ast::Expr::Unary(ast::UnaryOperator::Negative, inner) => match inner.as_ref() {
+            ast::Expr::Literal(ast::Literal::Numeric(n)) => literal(&format!("-{n}")),
+            _ => bytea_source(inner, referenced_tables, resolver),
         },
+        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => bytea_source(&exprs[0], referenced_tables, resolver),
+        ast::Expr::Cast { type_name: Some(t), .. } => by_name(&t.name).unwrap_or(ByteaSource::Other),
+        ast::Expr::Column { table, column, .. } => {
+            let declared = referenced_tables
+                .and_then(|tables| tables.find_table_by_internal_id(*table))
+                .and_then(|(_, table_ref)| table_ref.get_column_at(*column).map(|c| c.ty_str.clone()));
+            declared
+                .as_deref()
+                .and_then(by_name)
+                .unwrap_or_else(|| by_affinity(source, referenced_tables, resolver))
+        }
+        _ => by_affinity(source, referenced_tables, resolver),
+    }
+}
+
+fn by_affinity(source: &ast::Expr, referenced_tables: Option<&TableReferences>, resolver: &Resolver) -> ByteaSource {
+    match super::affinity::get_expr_affinity(source, referenced_tables, Some(resolver)) {
+        Affinity::Integer => ByteaSource::Integer(8),
+        Affinity::Real => ByteaSource::NoCast("double precision"),
+        _ => ByteaSource::Other,
     }
 }
 

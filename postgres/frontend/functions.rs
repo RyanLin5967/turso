@@ -22,7 +22,10 @@ pub(crate) fn resolve_scalar(name: &str, arg_count: usize) -> bool {
         | "quote_ident"
         | "quote_literal"
         | "pg_database_size"
-        | "current_schemas" => &[1],
+        | "current_schemas"
+        | "int2send"
+        | "int4send"
+        | "int8send" => &[1],
         "format_type" | "pg_get_constraintdef" | "pg_get_indexdef" | "obj_description" => &[1, 2],
         "pg_get_expr" => &[2, 3],
         "to_char" | "pg_input_is_valid" | "booleq" | "boolne" | "col_description" | "bpchareq"
@@ -56,6 +59,7 @@ pub(crate) fn exec_scalar(conn: &Connection, name: &str, args: &[Value]) -> Resu
         "pg_encoding_to_char" => Ok(exec_pg_encoding_to_char(int_arg(0, 0))),
         "format_type" => Ok(exec_pg_format_type(int_arg(0, 0), int_arg(1, -1))),
         "encode" => exec_encode(args),
+        "int2send" | "int4send" | "int8send" => exec_int_send(name, args.first().unwrap_or(&Value::Null)),
         "to_char" => Ok(exec_to_char(
             args.first().unwrap_or(&Value::Null),
             &text_arg(1),
@@ -297,6 +301,31 @@ fn exec_pg_get_expr(args: &[Value]) -> Result<Value> {
 /// bytea input reads it: `\x` followed by hex digits, else its bytes. It was "no such function"
 /// (42883), so a client reading a bytea column as hex could not (found by the cloud run of
 /// bind_reads_each_parameter_in_its_format, 2026-10-10).
+/// PostgreSQL's int2send, int4send and int8send: the integer's big-endian two's complement in 2,
+/// 4 or 8 bytes, which is also PostgreSQL 18's cast of that integer type to bytea (strings.out,
+/// "conversions between bytea and integer types"). A value outside the width is PostgreSQL's
+/// 22003, as its int2 or int4 input refuses it.
+fn exec_int_send(name: &str, value: &Value) -> Result<Value> {
+    let v = match value {
+        Value::Null => return Ok(Value::Null),
+        other => other.as_int().ok_or_else(|| {
+            LimboError::InvalidArgument(format!("{name} takes an integer").into())
+        })?,
+    };
+    let out_of_range = |ty: &str| {
+        LimboError::Constraint(SqlErrorMessage::classified(
+            SqlErrorKind::NumericValueOutOfRange,
+            format!("{ty} out of range"),
+        ))
+    };
+    let bytes = match name {
+        "int2send" => i16::try_from(v).map_err(|_| out_of_range("smallint"))?.to_be_bytes().to_vec(),
+        "int4send" => i32::try_from(v).map_err(|_| out_of_range("integer"))?.to_be_bytes().to_vec(),
+        _ => v.to_be_bytes().to_vec(),
+    };
+    Ok(Value::Blob(bytes))
+}
+
 fn exec_encode(args: &[Value]) -> Result<Value> {
     let (Some(data), Some(format)) = (args.first(), args.get(1)) else {
         return Err(LimboError::InvalidArgument(
