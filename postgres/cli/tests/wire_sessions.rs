@@ -2582,6 +2582,37 @@ fn describe_statement_reports_undeclared_parameters() {
     }
 }
 
+/// Wire review 18 item 14, the deep arm: over v1..v1000, each reading the one before, a Describe
+/// of `SELECT * FROM v1000 WHERE x = $1` types `$1` int4, cold and again, and the server still
+/// answers after (a stack overflow on a session thread aborts the whole process). The
+/// parameter-type walk cut every view nested 32 deep, so the cold Describe was 42P18. The engine's
+/// own reading of the chain, at CREATE VIEW and at prepare, is core's and has not been run at this
+/// depth: if this arm dies there, the finding is the engine's.
+#[test]
+fn a_thousand_view_chain_is_typed_and_the_server_survives() {
+    let dir = Scratch::new("viewchain");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE t(id INT PRIMARY KEY)").ok("t");
+    let views = (1..=1000)
+        .map(|k| match k {
+            1 => "CREATE VIEW v1 AS SELECT id AS x FROM t".to_string(),
+            k => format!("CREATE VIEW v{k} AS SELECT x FROM v{p}", p = k - 1),
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    a.q(&views).ok("the chain");
+    let sql = "SELECT * FROM v1000 WHERE x = $1";
+    for round in ["cold", "warm"] {
+        let r = a.describe_statement(sql).ok(sql);
+        assert_eq!(r.params, Some(vec![23]), "{round}");
+    }
+    server
+        .connect()
+        .q("SELECT 1")
+        .ok("the server still answers");
+}
+
 /// Aggregates have PostgreSQL's result types, the same over both protocols and whatever the rows
 /// hold: count bigint, sum(int4) bigint, min/max(int4) integer, avg(int4) numeric (PostgreSQL's
 /// aggregate signatures, docs "Aggregate Functions"; the re-recording from PG18 with record_pg.sh is
