@@ -1138,6 +1138,8 @@ pub(crate) fn confirm_quiet_for_test() -> Duration {
 /// (`BranchStore::lead_upgrade`), each one sync holding no flight slot, and returns the frees each
 /// covers under the store mutex (engine review 13 MED 2, review 18 HIGH 1 and #12).
 fn run_confirm_writer(group: Arc<Group>, store: Arc<StoreMutex>) {
+    #[cfg(test)]
+    let _scope = CountScope::enter(&store.counts);
     let _exit = WriterExit(&group);
     let mut g = group.lock();
     loop {
@@ -1427,6 +1429,9 @@ thread_local! {
 /// instrument — a flush inside the store mutex stalls every operation behind it).
 struct StoreMutex {
     inner: Mutex<StoreInner>,
+    /// Test builds: this store's counters (the per-store counter class, `StoreCounts`).
+    #[cfg(test)]
+    counts: Arc<StoreCounts>,
     /// Odd while the background compaction holds, or is about to take, this mutex for a step that
     /// may sync under it (DECISIONS c9c821dd8d, bd0d845f97: only its cut's last pass, `Compacting`,
     /// and the whole compaction under mutant `compaction_syncs_under_mutex`): set before it locks
@@ -1447,6 +1452,8 @@ impl StoreMutex {
             inner: Mutex::new(inner),
             compacting: AtomicU64::new(0),
             compaction_waits: AtomicU64::new(0),
+            #[cfg(test)]
+            counts: Arc::new(StoreCounts::default()),
         }
     }
 
@@ -1487,6 +1494,8 @@ impl StoreMutex {
         let guard = self.inner.lock();
         #[cfg(test)]
         STORE_HELD.with(|held| held.set(held.get() + 1));
+        #[cfg(test)]
+        SCOPE.with(|s| s.borrow_mut().push(self.counts.clone()));
         // fastest-budgets instrument (test builds): acquisitions, and what is done while held.
         #[cfg(test)]
         super::budget_probe::store_locked_at(site);
@@ -1513,6 +1522,7 @@ impl std::ops::DerefMut for StoreGuard<'_> {
 impl Drop for StoreGuard<'_> {
     fn drop(&mut self) {
         STORE_HELD.with(|held| held.set(held.get() - 1));
+        SCOPE.with(|s| s.borrow_mut().pop());
         super::budget_probe::store_unlocked();
     }
 }
@@ -1541,6 +1551,100 @@ pub(crate) fn note_sync() {
     THREAD_SYNCS.with(|n| n.set(n.get() + 1));
     if STORE_HELD.with(|held| held.get()) > 0 {
         SYNCS_UNDER_STORE_MUTEX.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // The held store's: a guard's scope is the innermost while it is held.
+        #[cfg(test)]
+        count_in_scope(|c| &c.syncs_under_store_mutex, 1);
+    }
+}
+
+/// Test builds: ONE store's counters (the per-store counter class, lead ruling d9cf2b609b; the
+/// L2(d) review's LOW 4). The process-wide statics above stay as they were for their old readers;
+/// a budget or test reads these, which another store's work on another thread cannot move.
+/// Attribution: work done while a store's mutex is held, or on one of its own threads (its
+/// confirmation writer and checkpoint jobs), or in one of its calls that writes outside the mutex
+/// (`CountScope`), is that store's; a sync of a file the platform IO opened is the store's whose
+/// database path the file's path is, or begins with followed by `-` (`note_path_sync`), so a trunk
+/// database's and a catalog's are their store's on any thread. A count made in no scope goes to
+/// `UNSCOPED` (a coverage gap, which `every_store_count_has_a_store` refuses).
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct StoreCounts {
+    capture_entered: AtomicU64,
+    capture_arena_handles: AtomicU64,
+    capture_rows_built: AtomicU64,
+    frozen_rows_written: AtomicU64,
+    install_cuts: AtomicU64,
+    install_rewrites: AtomicU64,
+    syncs_under_store_mutex: AtomicU64,
+    /// `[fsync(2), F_FULLFSYNC, F_BARRIERFSYNC, barrier fallbacks]`, as `crate::io::SYNC_COUNTS`.
+    syncs: [AtomicU64; 4],
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The stores whose work this thread is doing, innermost last (test builds).
+    static SCOPE: std::cell::RefCell<Vec<Arc<StoreCounts>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Test builds: counts made in no store's scope (a coverage gap, never expected).
+#[cfg(test)]
+pub(crate) static UNSCOPED: AtomicU64 = AtomicU64::new(0);
+
+/// Test builds: this thread works for the store `counts` belongs to until the guard drops.
+#[cfg(test)]
+pub(crate) struct CountScope;
+
+#[cfg(test)]
+impl CountScope {
+    pub(crate) fn enter(counts: &Arc<StoreCounts>) -> Self {
+        SCOPE.with(|s| s.borrow_mut().push(counts.clone()));
+        CountScope
+    }
+}
+
+#[cfg(test)]
+impl Drop for CountScope {
+    fn drop(&mut self) {
+        SCOPE.with(|s| s.borrow_mut().pop());
+    }
+}
+
+/// Test builds: add `n` to one counter of the innermost store this thread works for.
+#[cfg(test)]
+fn count_in_scope(field: impl Fn(&StoreCounts) -> &AtomicU64, n: u64) {
+    let counted = SCOPE.with(|s| s.borrow().last().map(|c| field(c).fetch_add(n, Ordering::Relaxed)).is_some());
+    if !counted {
+        UNSCOPED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Test builds: a branch file's sync (`journal::fsync_file` and its kin), kind as in
+/// `StoreCounts::syncs`: the innermost store's.
+#[cfg(test)]
+pub(crate) fn note_branch_sync(kind: usize) {
+    count_in_scope(|c| &c.syncs[kind], 1);
+}
+
+#[cfg(test)]
+static PATHS: std::sync::Mutex<Vec<(String, std::sync::Weak<StoreCounts>)>> = std::sync::Mutex::new(Vec::new());
+
+/// Test builds: files under `db_path` (it, and `db_path-*`) are this store's from now on.
+#[cfg(test)]
+fn register_path(db_path: &str, counts: &Arc<StoreCounts>) {
+    let mut paths = PATHS.lock().unwrap_or_else(|e| e.into_inner());
+    paths.retain(|(p, w)| p != db_path && w.strong_count() > 0);
+    paths.push((db_path.to_string(), Arc::downgrade(counts)));
+}
+
+/// Test builds: a platform-IO file's sync (`io/unix.rs`), kind as in `StoreCounts::syncs`: the
+/// store's whose database path `path` is or begins with followed by `-`. A file no store owns (a
+/// test's own database with no branch store) is nobody's and is not a gap.
+#[cfg(test)]
+pub(crate) fn note_path_sync(path: &str, kind: usize) {
+    let paths = PATHS.lock().unwrap_or_else(|e| e.into_inner());
+    let owner = paths.iter().rev().find(|(p, _)| path == p || path.strip_prefix(p.as_str()).is_some_and(|r| r.starts_with('-')));
+    if let Some(c) = owner.and_then(|(_, w)| w.upgrade()) {
+        c.syncs[kind].fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -3434,6 +3538,8 @@ fn capture_rows(branches: &BranchTable<BranchState>, dirty: &BTreeMap<BranchId, 
         .collect();
     #[cfg(test)]
     CAPTURE_ROWS_BUILT.fetch_add(rows.len() as u64, Ordering::Relaxed);
+    #[cfg(test)]
+    count_in_scope(|c| &c.capture_rows_built, rows.len() as u64);
     rows
 }
 
@@ -3831,6 +3937,8 @@ fn settle_start(over_hard: &AtomicBool, inner: &mut StoreInner, started: FlightS
 /// itself on this same thread (it is the worker already). Nothing if the log no longer wants a
 /// checkpoint (a start that failed since backed it off, or one ran).
 fn run_owed_start(ctx: FlightCtx) {
+    #[cfg(test)]
+    let _scope = CountScope::enter(&ctx.inner.counts);
     let flight = {
         let mut inner = ctx.inner.lock();
         if !inner.journal.as_ref().is_some_and(|j| j.wants_compaction()) {
@@ -3903,6 +4011,8 @@ fn run_flight(
     truncating: Arc<AtomicBool>,
     installs: Arc<(std::sync::Mutex<u64>, std::sync::Condvar)>,
 ) {
+    #[cfg(test)]
+    let _scope = CountScope::enter(&inner.counts);
     let ns = |t: Instant| u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
     let t = Instant::now();
     ckpt_phase("start");
@@ -3939,6 +4049,8 @@ fn run_flight(
         }
         #[cfg(test)]
         FROZEN_ROWS_WRITTEN.fetch_add(rows.len() as u64, Ordering::Relaxed);
+        #[cfg(test)]
+        count_in_scope(|c| &c.frozen_rows_written, rows.len() as u64);
         cap.rows = rows;
     }
     ckpt_phase("rows");
@@ -4344,8 +4456,7 @@ fn guard_mutant(which: &str) -> bool {
 }
 
 /// Test builds: the counters a test reads for ONE store (the per-store counter class, lead ruling
-/// d9cf2b609b). At this red they are still the process's (`CAPTURE_*`, `FROZEN_ROWS_WRITTEN`,
-/// `INSTALL_*`, `SYNCS_UNDER_STORE_MUTEX`), which another store's work on another thread moves.
+/// d9cf2b609b): `StoreCounts` read once.
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct StoreTestCounts {
@@ -4361,15 +4472,24 @@ pub(crate) struct StoreTestCounts {
 #[cfg(test)]
 impl BranchStore {
     pub(crate) fn test_counts(&self) -> StoreTestCounts {
+        let c = &self.inner.counts;
+        let get = |a: &AtomicU64| a.load(Ordering::Relaxed);
         StoreTestCounts {
-            capture_entered: CAPTURE_ENTERED.load(Ordering::Relaxed),
-            capture_arena_handles: CAPTURE_ARENA_HANDLES.load(Ordering::Relaxed),
-            capture_rows_built: CAPTURE_ROWS_BUILT.load(Ordering::Relaxed),
-            frozen_rows_written: FROZEN_ROWS_WRITTEN.load(Ordering::Relaxed),
-            install_cuts: INSTALL_CUTS.load(Ordering::Relaxed),
-            install_rewrites: INSTALL_REWRITES.load(Ordering::Relaxed),
-            syncs_under_store_mutex: syncs_under_store_mutex(),
+            capture_entered: get(&c.capture_entered),
+            capture_arena_handles: get(&c.capture_arena_handles),
+            capture_rows_built: get(&c.capture_rows_built),
+            frozen_rows_written: get(&c.frozen_rows_written),
+            install_cuts: get(&c.install_cuts),
+            install_rewrites: get(&c.install_rewrites),
+            syncs_under_store_mutex: get(&c.syncs_under_store_mutex),
         }
+    }
+
+    /// Test builds: this store's syncs (its branch files, its catalog's, its trunk database's).
+    pub(crate) fn sync_counts(&self) -> super::SyncCounts {
+        let s = &self.inner.counts.syncs;
+        let get = |i: usize| s[i].load(Ordering::Relaxed);
+        super::SyncCounts { fsync: get(0), full_fsync: get(1), barrier: get(2), barrier_fallback: get(3) }
     }
 }
 
@@ -4674,6 +4794,15 @@ impl BranchStore {
         fuzzy: bool,
         db_path: &str,
     ) -> Result<Self> {
+        // Test builds: the store's counters exist from here, so its recovery's syncs are its own.
+        #[cfg(test)]
+        let counts = Arc::new(StoreCounts::default());
+        #[cfg(test)]
+        let _scope = CountScope::enter(&counts);
+        #[cfg(test)]
+        if !crate::is_memory_like(db_path) {
+            register_path(db_path, &counts);
+        }
         let format = super::journal::format_version(splice);
         // S-12 (r13-compose, A4.G: stands): the splice arm and fuzzy checkpoints are refused
         // together at construction, as fl_refusal does for its switch pairs (8976dc691): a splice's
@@ -4888,7 +5017,15 @@ impl BranchStore {
             trunk_children: AtomicUsize::new(inner.trunk.lineage.n_children as usize),
             trunk_commits: AtomicU64::new(0),
             gate_closed: (std::sync::Mutex::new(()), std::sync::Condvar::new()),
-            inner: Arc::new(StoreMutex::new(inner)),
+            inner: Arc::new({
+                #[allow(unused_mut)]
+                let mut m = StoreMutex::new(inner);
+                #[cfg(test)]
+                {
+                    m.counts = counts.clone();
+                }
+                m
+            }),
             prewarm: warmed,
             ckpt_worker: Mutex::new(None),
             start_due: AtomicBool::new(false),
@@ -5532,6 +5669,10 @@ impl BranchStore {
         lsn: u64,
         class: SyncClass,
     ) -> Result<()> {
+        // Mutant `store_counts_unscoped_lead` (test builds only): the leader's write, outside the
+        // mutex, counted in no store's scope (`every_store_count_has_a_store`'s fire-check).
+        #[cfg(test)]
+        let _scope = (!fe_mutant("store_counts_unscoped_lead")).then(|| CountScope::enter(&store.counts));
         #[cfg(not(test))]
         let _ = hold;
         // Mutant M-c (PREREG v1 amendment 36): the operation is acknowledged before its records
@@ -5822,6 +5963,8 @@ impl BranchStore {
     /// the free class, taking what is buffered and holding the flight slot, as before engine
     /// review 18 HIGH 1.
     fn lead_upgrade(store: &StoreMutex, group: &Group) -> bool {
+        #[cfg(test)]
+        let _scope = CountScope::enter(&store.counts);
         let due = group.upgrade_due.load(Ordering::Acquire);
         if due == 0
             || due == UPGRADE_IN_AIR
@@ -6663,6 +6806,8 @@ impl BranchStore {
     /// (test builds only): the whole compaction under the store mutex, as at c9c821dd8d, with every
     /// operation arriving meanwhile counted (`compaction_waits`).
     fn lead_compaction(store: &StoreMutex, group: &Group) {
+        #[cfg(test)]
+        let _scope = CountScope::enter(&store.counts);
         if group
             .compact_due
             .compare_exchange(COMPACT_DUE, COMPACT_RUNNING, Ordering::AcqRel, Ordering::Acquire)
@@ -8239,6 +8384,8 @@ impl BranchStore {
     /// (`trunk_wal_synced`). Called by that commit, holding the WAL write lock, so it is the only
     /// trunk commit in flight; the flight it leads is marked pending until its WAL is synced.
     fn order_for_trunk(&self, lsn: u64) -> Result<()> {
+        #[cfg(test)]
+        let _scope = CountScope::enter(&self.inner.counts);
         let full = class_index(SyncClass::FullFsync);
         // An ordered flight barriers the arena: not taken while a checkpoint syncs it (engine
         // review 9 #8). Mutant `arena_sync_ungated`.
@@ -9730,6 +9877,8 @@ impl Drop for BranchStore {
     /// (A crash loses the time since the last stamp, which extends leases and never shortens one.)
     /// A fuzzy checkpoint in flight is finished first: its thread holds the store's files.
     fn drop(&mut self) {
+        #[cfg(test)]
+        let _scope = CountScope::enter(&self.inner.counts.clone());
         self.flight_hold.store(0, Ordering::Release);
         #[cfg(test)]
         self.group.confirm_hold.store(0, Ordering::Release);
@@ -10914,6 +11063,8 @@ impl StoreInner {
     ) -> Result<Box<Captured>> {
         #[cfg(test)]
         CAPTURE_ENTERED.fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        count_in_scope(|c| &c.capture_entered, 1);
         if fuzzy && self.splice && !guard_mutant("c") {
             return Err(LimboError::InvalidArgument(
                 "fuzzy capture refused: splice arm (r13-compose S-12)".to_string(),
@@ -11003,6 +11154,8 @@ impl StoreInner {
         #[cfg(test)]
         if arena_file.is_some() {
             CAPTURE_ARENA_HANDLES.fetch_add(1, Ordering::Relaxed);
+            #[cfg(test)]
+            count_in_scope(|c| &c.capture_arena_handles, 1);
         }
         let snapshot = if self.failpoint.take_if(|f| *f == BranchFailpoint::CaptureFails).is_some() {
             Err(LimboError::InternalError("failpoint: the capture's read snapshot failed".to_string()))
@@ -11287,6 +11440,8 @@ impl StoreInner {
             Some(prep) => {
                 #[cfg(test)]
                 INSTALL_CUTS.fetch_add(1, Ordering::Relaxed);
+                #[cfg(test)]
+                count_in_scope(|c| &c.install_cuts, 1);
                 ckpt_held("install.before_cut");
                 let cut = journal.finish_cut(prep, cap.log_from, cap.generation);
                 ckpt_held("install.cut_finished");
@@ -11295,6 +11450,8 @@ impl StoreInner {
             None => {
                 #[cfg(test)]
                 INSTALL_REWRITES.fetch_add(1, Ordering::Relaxed);
+                #[cfg(test)]
+                count_in_scope(|c| &c.install_rewrites, 1);
                 journal.rewrite_from(cap.log_from, cap.generation)
             }
         };

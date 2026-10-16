@@ -4810,6 +4810,8 @@ pub(crate) fn fsync_file(file: &File, class: SyncClass) -> Result<()> {
                 return Err(io_error(std::io::Error::last_os_error(), "F_FULLFSYNC branch file"));
             }
             crate::io::count_sync(true);
+            #[cfg(test)]
+            super::store::note_branch_sync(1);
             return Ok(());
         }
         // SAFETY: the descriptor is owned by `file` and open for the duration of the call.
@@ -4817,6 +4819,8 @@ pub(crate) fn fsync_file(file: &File, class: SyncClass) -> Result<()> {
             return Err(io_error(std::io::Error::last_os_error(), "fsync branch file"));
         }
         crate::io::count_sync(false);
+        #[cfg(test)]
+        super::store::note_branch_sync(0);
         Ok(())
     }
     #[cfg(not(unix))]
@@ -4850,6 +4854,8 @@ pub(crate) fn barrier_file(file: &File, class: SyncClass) -> Result<()> {
         // SAFETY: the descriptor is owned by `file` and open for the duration of the call.
         if injected == 0 && unsafe { libc::fcntl(file.as_raw_fd(), libc::F_BARRIERFSYNC) } != -1 {
             crate::io::count_barrier();
+            #[cfg(test)]
+            super::store::note_branch_sync(2);
             return Ok(());
         }
         let e = match injected {
@@ -4875,6 +4881,8 @@ pub(crate) fn barrier_file(file: &File, class: SyncClass) -> Result<()> {
         ) && (darwin_major() < 23 || super::store::fe_mutant("barrier_retries_on_new_kernel"));
         if unsupported || super::store::fe_mutant("barrier_retries_any") {
             crate::io::count_barrier_fallback();
+            #[cfg(test)]
+            super::store::note_branch_sync(3);
             return fsync_file(file, class);
         }
         return Err(io_error(e, "F_BARRIERFSYNC branch file"));

@@ -439,12 +439,12 @@ pub struct ForkHolds {
     pub locked_trunk_forks: u64,
 }
 
-/// Test builds: the syncs a test reads for `db`'s work (the per-store counter class; at this red,
-/// still the process's, `sync_counts`).
+/// Test builds: the syncs a test reads for `db`'s work (the per-store counter class, lead ruling
+/// d9cf2b609b): its branch files', its catalog's and its trunk database's, on any thread
+/// (`store::StoreCounts`), never another database's.
 #[cfg(test)]
 pub(crate) fn sync_counts_of(db: &crate::Database) -> SyncCounts {
-    let _ = db;
-    sync_counts()
+    db.branches.sync_counts()
 }
 
 #[doc(hidden)]
