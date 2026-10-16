@@ -13777,3 +13777,42 @@ fn c54_virtual_generated_survives_alter_and_reload() {
     assert_eq!(r.oids, Some(vec![23, 23, 25]));
     assert_eq!(r.rows, vec![vec![Some("3".into()), Some("6".into()), Some("generated always as(a) virtual".into())]]);
 }
+
+
+#[test]
+fn c54_virtual_generated_retains_storage_during_constraint_rebuild() {
+    let dir = Scratch::new("c54-virtual-rebuild");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE vr(a INT,b INT GENERATED ALWAYS AS(a*2) VIRTUAL)").ok("fixture");
+    a.q("INSERT INTO vr(a) VALUES(3)").ok("base write");
+    a.q("ALTER TABLE vr ADD CONSTRAINT ck CHECK(a>0)").ok("rebuild");
+    let r = a.q("SELECT a,b FROM vr").ok("retained generated value");
+    assert_eq!(r.oids, Some(vec![23, 23]));
+    assert_eq!(r.rows, vec![vec![Some("3".into()), Some("6".into())]]);
+    let sql = "INSERT INTO vr(a) VALUES(-1)";
+    assert_eq!(a.q(sql).err(sql).code, "23514");
+    assert_eq!(a.q("SELECT a,b FROM vr").ok("failed write preserves row").rows, r.rows);
+}
+
+#[test]
+fn c54_virtual_generated_named_constraint_and_batch_identifier() {
+    let dir = Scratch::new("c54-virtual-names");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE vn(a INT,b INT CONSTRAINT vg GENERATED ALWAYS AS(a*2) VIRTUAL)").ok("named generated constraint");
+    a.q("INSERT INTO vn(a) VALUES(3)").ok("base write");
+    let r = a.q("SELECT a,b FROM vn").ok("named generated value");
+    assert_eq!(r.rows, vec![vec![Some("3".into()), Some("6".into())]]);
+    let sql = "CREATE TABLE vm(a INT,b INT GENERATED ALWAYS AS(a*2) VIRTUAL); SELECT 1 AS generated";
+    assert_eq!(a.q(sql).single(sql), "1");
+}
+
+#[test]
+fn c54_virtual_batch_keeps_trailing_generated_identifier() {
+    let dir = Scratch::new("c54-virtual-batch");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let sql = "CREATE TABLE vm(a INT,b INT GENERATED ALWAYS AS(a*2) VIRTUAL); SELECT 1 AS generated";
+    assert_eq!(a.q(sql).single(sql), "1");
+}
