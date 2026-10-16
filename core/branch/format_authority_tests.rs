@@ -703,6 +703,26 @@ fn the_first_checkpoint_of_an_18_store_holds_the_store_mutex_for_no_o_n_upgrade_
     );
 }
 
+/// L4, bytes: the same first checkpoint's largest store-mutex hold allocates as much at 10^4
+/// branches as at 10^3 (+ 32 KiB). A store this build made reads 225,033 B at both (the control,
+/// `diag_first_checkpoint_hold_bytes_with_and_without_the_upgrade`, raw l4u-diag_3bdf90ccc); the 18
+/// store read 490,795 and 804,099 at 3bdf90ccc: work under the mutex the row count does not see
+/// (the probe counts statements, not pragmas).
+#[test]
+fn the_first_checkpoint_of_an_18_store_allocates_no_o_n_bytes_under_the_store_mutex() {
+    if std::env::var_os("FE_FA_HOLD_N").is_some() {
+        return;
+    }
+    let (_, ba, fa) = upgrade_hold(1_000);
+    let (_, bb, fb) = upgrade_hold(10_000);
+    println!("L4 upgrade hold bytes: 10^3 {ba}; 10^4 {bb}");
+    assert_eq!((fa.as_str(), fb.as_str()), ("Some(22)", "Some(22)"), "premise: the checkpoint upgraded both stores");
+    assert!(
+        bb <= ba + 32 * 1024,
+        "the first checkpoint's largest store-mutex hold allocates {ba} B at 10^3 branches and {bb} B at 10^4: upgrade work under the mutex grows with N"
+    );
+}
+
 /// The child of the upgrade kill tests: this build opens the older store at `FE_FA_KILL_DIR` and
 /// checkpoints it, killed by the parent's FE_KILL_AT.
 #[test]
