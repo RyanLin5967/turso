@@ -12096,6 +12096,195 @@ mod recorded {
         }
     }
 
+    #[test]
+    fn c56_audit1_schema_reset_matches_pg18_replies() {
+        let recording =
+            include_str!("pg18/pg18-audit1-lib-parameters_decode_at_postgresqls_edges.out");
+        let commands = parse(recording);
+        let command = &commands[0];
+        let dir = Scratch::new("c56-audit1-schema-reset");
+        let server = Server::start(&dir.db(), &[]);
+        let got = send(&mut server.connect(), &mut Vec::new(), &command.text);
+        assert!(
+            same(&command.want, &got),
+            "{}\nPG: {:?}\nours: {got:?}",
+            command.text,
+            command.want
+        );
+    }
+
+    #[test]
+    fn c56_schema_lifecycle_matches_pg18_replies() {
+        let commands = parse(include_str!("c56-pg18-schema.out"));
+        let dir = Scratch::new("c56-schema-lifecycle");
+        let server = Server::start(&dir.db(), &[]);
+        let mut wire = server.connect();
+        let mut report = String::new();
+        for (i, command) in commands.iter().enumerate() {
+            let got = send(&mut wire, &mut Vec::new(), &command.text);
+            if !same(&command.want, &got) {
+                report.push_str(&format!(
+                    "#{} {}\nPG: {:?}\nours: {got:?}\n",
+                    i + 1,
+                    command.text,
+                    command.want
+                ));
+            }
+        }
+        assert!(report.is_empty(), "{report}");
+    }
+
+    #[test]
+    fn c56_schema_drop_is_visible_to_other_connections_and_after_restart() {
+        let commands = parse(include_str!("c56-pg18-schema.out"));
+        let drop_empty_schema = &commands[20];
+        let absent_namespace = &commands[5];
+        let create_schema = &commands[10];
+        let dir = Scratch::new("c56-schema-persistence");
+        {
+            let server = Server::start(&dir.db(), &[]);
+            let mut first = server.connect();
+            let mut existing = server.connect();
+            for (wire, command) in [
+                (&mut first, drop_empty_schema),
+                (&mut existing, absent_namespace),
+                (&mut server.connect(), absent_namespace),
+            ] {
+                let got = send(wire, &mut Vec::new(), &command.text);
+                assert!(
+                    same(&command.want, &got),
+                    "{}\nPG: {:?}\nours: {got:?}",
+                    command.text,
+                    command.want
+                );
+            }
+        }
+        let server = Server::start(&dir.db(), &[]);
+        let mut wire = server.connect();
+        for command in [absent_namespace, create_schema] {
+            let got = send(&mut wire, &mut Vec::new(), &command.text);
+            assert!(
+                same(&command.want, &got),
+                "{}\nPG: {:?}\nours: {got:?}",
+                command.text,
+                command.want
+            );
+        }
+    }
+
+    #[test]
+    fn c56_schema_savepoints_and_catalog_match_pg18_replies() {
+        let commands = parse(include_str!("c56-pg18-schema-extra.out"));
+        let dir = Scratch::new("c56-schema-savepoints");
+        let server = Server::start(&dir.db(), &[]);
+        let mut wire = server.connect();
+        let mut report = String::new();
+        for (i, command) in commands.iter().enumerate() {
+            let got = send(&mut wire, &mut Vec::new(), &command.text);
+            if !same(&command.want, &got) {
+                report.push_str(&format!(
+                    "#{} {}\nPG: {:?}\nours: {got:?}\n",
+                    i + 1,
+                    command.text,
+                    command.want
+                ));
+            }
+        }
+        assert!(report.is_empty(), "{report}");
+    }
+
+    #[test]
+    fn c56_types_require_an_existing_creation_schema() {
+        let commands = parse(include_str!("c56-pg18-schema-types.out"));
+        let dir = Scratch::new("c56-schema-types");
+        let server = Server::start(&dir.db(), &[]);
+        let mut wire = server.connect();
+        let mut report = String::new();
+        for (i, command) in commands.iter().enumerate() {
+            let got = send(&mut wire, &mut Vec::new(), &command.text);
+            if !same(&command.want, &got) {
+                report.push_str(&format!(
+                    "#{} {}\nPG: {:?}\nours: {got:?}\n",
+                    i + 1,
+                    command.text,
+                    command.want
+                ));
+            }
+        }
+        assert!(report.is_empty(), "{report}");
+    }
+
+    #[test]
+    fn c56_schema_membership_uses_literal_internal_prefixes() {
+        let commands = parse(include_str!("c56-pg18-schema-membership.out"));
+        let dir = Scratch::new("c56-schema-membership");
+        let server = Server::start(&dir.db(), &[]);
+        let mut wire = server.connect();
+        let mut pending = Vec::new();
+        let mut report = String::new();
+        for (i, command) in commands.iter().enumerate() {
+            let got = send(&mut wire, &mut pending, &command.text);
+            if !same(&command.want, &got) {
+                report.push_str(&format!(
+                    "#{} {}\nPG: {:?}\nours: {got:?}\n",
+                    i + 1,
+                    command.text,
+                    command.want
+                ));
+            }
+        }
+        assert!(report.is_empty(), "{report}");
+    }
+
+    #[test]
+    fn c56_retained_statement_observes_schema_drop_and_recreation() {
+        let commands = parse(include_str!("c56-pg18-schema-prepared.out"));
+        let dir = Scratch::new("c56-schema-prepared");
+        let server = Server::start(&dir.db(), &[]);
+        let mut wire = server.connect();
+        let mut pending = Vec::new();
+        let mut report = String::new();
+        for (i, command) in commands.iter().enumerate() {
+            let got = send(&mut wire, &mut pending, &command.text);
+            if !same(&command.want, &got) {
+                report.push_str(&format!(
+                    "#{} {}\nPG: {:?}\nours: {got:?}\n",
+                    i + 1,
+                    command.text,
+                    command.want
+                ));
+            }
+        }
+        assert!(report.is_empty(), "{report}");
+    }
+
+    #[test]
+    fn c56_single_schema_objects_match_pg18_notices() {
+        let commands = parse(include_str!("c56-pg18-schema-single-objects.out"));
+        let dir = Scratch::new("c56-schema-single-objects");
+        let server = Server::start(&dir.db(), &[]);
+        let mut wire = server.connect();
+        let mut report = String::new();
+        for (i, command) in commands.iter().enumerate() {
+            let got = send(&mut wire, &mut Vec::new(), &command.text);
+            if !same(&command.want, &got) {
+                report.push_str(&format!(
+                    "#{} {}\nPG: {:?}\nours: {got:?}\n",
+                    i + 1,
+                    command.text,
+                    command.want
+                ));
+            }
+        }
+        assert!(report.is_empty(), "{report}");
+    }
+
+    #[test]
+    fn c56_reset_notices_follow_the_existing_public_objects() {
+        let recording = include_str!("c56-pg18-schema-reset-controls.out");
+        replay("c56-reset-controls", recording, recording, &[]);
+    }
+
     /// Replay an unchanged sequence of commands selected from a committed PG recording.
     pub(super) fn replay_selected(name: &str, recording: &str, ordinals: &[usize]) {
         let commands = parse(recording);
@@ -12254,30 +12443,25 @@ replays_postgresql!(
 replays_postgresql!(
     pg18_audit1_lib_a_bytea_parameter_with_a_non_ascii_digit_is_refused_replays_as_postgresql_answered,
     "pg18-audit1-lib-a_bytea_parameter_with_a_non_ascii_digit_is_refused.out",
-    [
-        (1, "PGDIV-PUBLIC-SCHEMA-NOOP refusal [wire]: DROP SCHEMA public CASCADE drops tables, but CREATE SCHEMA public is unconditionally refused 42601; PostgreSQL recreates it (C56)"),
-    ]
+    []
 );
 replays_postgresql!(
     pg18_audit1_lib_parameters_decode_at_postgresqls_edges_replays_as_postgresql_answered,
     "pg18-audit1-lib-parameters_decode_at_postgresqls_edges.out",
     [
-        (1, "PGDIV-PUBLIC-SCHEMA-NOOP refusal [wire]: DROP SCHEMA public CASCADE drops tables, but CREATE SCHEMA public is unconditionally refused 42601; PostgreSQL recreates it (C56)"),
         (12, "PGDIV-NUMERIC-AS-FLOAT value [engine]: SILENT: numeric param 1e-400 answers '0' where PG answers the exact 0.(399 zeros)1; the numeric decode underflows"),
     ]
 );
 replays_postgresql!(
     pg18_audit1_ws_a_bytea_parameter_with_a_non_ascii_digit_is_refused_replays_as_postgresql_answered,
     "pg18-audit1-ws-a_bytea_parameter_with_a_non_ascii_digit_is_refused.out",
-    [
-        (1, "PGDIV-PUBLIC-SCHEMA-NOOP refusal [wire]: DROP SCHEMA public CASCADE drops tables, but CREATE SCHEMA public is unconditionally refused 42601; PostgreSQL recreates it (C56)"),
-    ]
+    []
 );
 replays_postgresql!(
     pg18_audit1_ws_a_chained_or_read_only_transaction_is_refused_replays_as_postgresql_answered,
     "pg18-audit1-ws-a_chained_or_read_only_transaction_is_refused.out",
     [
-        (1, "PGDIV-PUBLIC-SCHEMA-NOOP refusal [wire]: DROP SCHEMA public CASCADE drops tables, but CREATE SCHEMA public is unconditionally refused 42601; PostgreSQL recreates it (C56)"),
+        (1, "PGDIV-CLUSTER-SCHEMA-CONTENTS value [cluster]: the audit1 recording begins with public containing 2 other objects; this replay starts a fresh database, so the reset has no cascade notice; both DROP SCHEMA and CREATE SCHEMA succeed"),
         (9, "PGDIV-COMMIT-AND-CHAIN ours-only [ours-only]: COMMIT AND CHAIN in a block refused 0A000 and aborts it (PG: COMMIT, Z T)"),
         (11, "PGDIV-COMMIT-AND-CHAIN cascade [ours-only]: count(*) id=2 is 0 vs 1 because #9 refused the COMMIT AND CHAIN so #10 ROLLBACK discarded row 2 (cascade of #9)"),
         (12, "PGDIV-READ-ONLY-TX ours-only [ours-only]: BEGIN READ ONLY refused 0A000 (PG: BEGIN, Z T)"),
@@ -12290,7 +12474,7 @@ replays_postgresql!(
     pg18_audit1_ws_a_correlated_generate_series_column_is_scoped_to_its_select_replays_as_postgresql_answered,
     "pg18-audit1-ws-a_correlated_generate_series_column_is_scoped_to_its_select.out",
     [
-        (1, "PGDIV-PUBLIC-SCHEMA-NOOP refusal [wire]: DROP SCHEMA public CASCADE drops tables, but CREATE SCHEMA public is unconditionally refused 42601; PostgreSQL recreates it (C56)"),
+        (1, "PGDIV-CLUSTER-SCHEMA-CONTENTS value [cluster]: the audit1 recording begins with public containing table t; this replay starts a fresh database, so the reset has no cascade notice; both DROP SCHEMA and CREATE SCHEMA succeed"),
         (12, "PGDIV-FUNC-ALIAS-CORRELATED value [wire]: bare function alias g referenced from a correlated EXISTS (w.k = g): ours errors 42703 'no such column: g' where PG answers 3 rows (g.g in #11 works)"),
         (16, "PGDIV-EXPR-TYPE-TEXT value [wire]: (SELECT sum(g) FROM c) over a CTE typed 25 text in RowDescription; PG 20 int8 (rows agree)"),
         (20, "PGDIV-PARSE-PREFIX error-text [wire]: 42702 both; ours prefixes 'Parse error: '"),
@@ -12300,7 +12484,7 @@ replays_postgresql!(
     pg18_audit1_ws_a_dump_headers_settings_are_accepted_replays_as_postgresql_answered,
     "pg18-audit1-ws-a_dump_headers_settings_are_accepted.out",
     [
-        (1, "PGDIV-PUBLIC-SCHEMA-NOOP refusal [wire]: DROP SCHEMA public CASCADE drops tables, but CREATE SCHEMA public is unconditionally refused 42601; PostgreSQL recreates it (C56)"),
+        (1, "PGDIV-CLUSTER-SCHEMA-CONTENTS value [cluster]: the audit1 recording begins with public containing 4 other objects; this replay starts a fresh database, so the reset has no cascade notice; both DROP SCHEMA and CREATE SCHEMA succeed"),
         (14, "PGDIV-SET-REFUSED ours-only [ours-only]: SET xmloption = document refused 0A000 (PG: SET)"),
         (15, "PGDIV-SET-REFUSED ours-only [ours-only]: SET transaction_timeout = '5s' refused 0A000 (PG: SET)"),
         (16, "PGDIV-SET-REFUSED error-code [wire]: SET default_tablespace = 'fast': PG 22023 invalid value for parameter; ours 0A000 not supported"),
@@ -12314,22 +12498,18 @@ replays_postgresql!(
 replays_postgresql!(
     pg18_audit1_ws_a_parameter_is_typed_by_every_kind_of_from_item_replays_as_postgresql_answered,
     "pg18-audit1-ws-a_parameter_is_typed_by_every_kind_of_from_item.out",
-    [
-        (1, "PGDIV-PUBLIC-SCHEMA-NOOP refusal [wire]: DROP SCHEMA public CASCADE drops tables, but CREATE SCHEMA public is unconditionally refused 42601; PostgreSQL recreates it (C56)"),
-    ]
+    []
 );
 replays_postgresql!(
     pg18_audit1_ws_a_parameter_over_the_simple_protocol_is_refused_replays_as_postgresql_answered,
     "pg18-audit1-ws-a_parameter_over_the_simple_protocol_is_refused.out",
-    [
-        (1, "PGDIV-PUBLIC-SCHEMA-NOOP refusal [wire]: DROP SCHEMA public CASCADE drops tables, but CREATE SCHEMA public is unconditionally refused 42601; PostgreSQL recreates it (C56)"),
-    ]
+    []
 );
 replays_postgresql!(
     pg18_audit1_ws_a_read_only_begin_inside_a_block_is_refused_replays_as_postgresql_answered,
     "pg18-audit1-ws-a_read_only_begin_inside_a_block_is_refused.out",
     [
-        (1, "PGDIV-PUBLIC-SCHEMA-NOOP refusal [wire]: DROP SCHEMA public CASCADE drops tables, but CREATE SCHEMA public is unconditionally refused 42601; PostgreSQL recreates it (C56)"),
+        (1, "PGDIV-CLUSTER-SCHEMA-CONTENTS value [cluster]: the audit1 recording begins with public containing table p; this replay starts a fresh database, so the reset has no cascade notice; both DROP SCHEMA and CREATE SCHEMA succeed"),
         (5, "PGDIV-READ-ONLY-TX ours-only [ours-only]: BEGIN READ ONLY inside a block: ours 0A000 aborts the block (Z E); PG warns 25001 and makes it read-only (Z T)"),
         (6, "PGDIV-READ-ONLY-TX cascade [ours-only]: INSERT: PG 25006 read-only; ours 25P02 because #5 aborted the block (cascade of #5)"),
         (8, "PGDIV-READ-ONLY-TX ours-only [ours-only]: multi-statement: BEGIN READ ONLY refused 0A000 (Z I) where PG opens it and INSERT fails 25006 (Z E)"),
@@ -12341,7 +12521,7 @@ replays_postgresql!(
     pg18_audit1_ws_a_three_part_reference_resolves_through_its_schema_replays_as_postgresql_answered,
     "pg18-audit1-ws-a_three_part_reference_resolves_through_its_schema.out",
     [
-        (1, "PGDIV-PUBLIC-SCHEMA-NOOP refusal [wire]: DROP SCHEMA public CASCADE drops tables, but CREATE SCHEMA public is unconditionally refused 42601; PostgreSQL recreates it (C56)"),
+        (1, "PGDIV-CLUSTER-SCHEMA-CONTENTS value [cluster]: the audit1 recording begins with public containing table t; this replay starts a fresh database, so the reset has no cascade notice; both DROP SCHEMA and CREATE SCHEMA succeed"),
         (3, "PGDIV-DESCRIBE-PARAM-TYPE value [wire]: Describe types $1 in pg_class.relname = $1 as 25 text; PG 19 name"),
         (4, "PGDIV-DESCRIBE-PARAM-TYPE value [wire]: Describe types $1 in pg_catalog.pg_class.relname = $1 as 25 text; PG 19 name"),
         (5, "PGDIV-PARSE-REFUSAL-STEP protocol [wire]: public.t.c with t aliased x: PG refuses at Parse (no ParseComplete) 'invalid reference to FROM-clause entry'; ours ParseComplete then 'Parse error: missing FROM-clause entry' (same 42P01)"),
@@ -12351,7 +12531,7 @@ replays_postgresql!(
     pg18_audit1_ws_aggregates_have_postgres_types_on_both_protocols_replays_as_postgresql_answered,
     "pg18-audit1-ws-aggregates_have_postgres_types_on_both_protocols.out",
     [
-        (1, "PGDIV-PUBLIC-SCHEMA-NOOP refusal [wire]: DROP SCHEMA public CASCADE drops tables, but CREATE SCHEMA public is unconditionally refused 42601; PostgreSQL recreates it (C56)"),
+        (1, "PGDIV-CLUSTER-SCHEMA-CONTENTS value [cluster]: the audit1 recording begins with public containing table t; this replay starts a fresh database, so the reset has no cascade notice; both DROP SCHEMA and CREATE SCHEMA succeed"),
         (6, "PGDIV-AVG-SCALE value [engine]: SILENT: avg(int) over simple protocol is '1.5'; PG '1.5000000000000000' (numeric display scale 16)"),
         (7, "PGDIV-AVG-SCALE value [engine]: SILENT: avg(int) over extended protocol is '1.5'; PG '1.5000000000000000'"),
     ]
@@ -12360,21 +12540,21 @@ replays_postgresql!(
     pg18_audit1_ws_checkpoint_inside_a_block_keeps_the_block_replays_as_postgresql_answered,
     "pg18-audit1-ws-checkpoint_inside_a_block_keeps_the_block.out",
     [
-        (1, "PGDIV-PUBLIC-SCHEMA-NOOP refusal [wire]: DROP SCHEMA public CASCADE drops tables, but CREATE SCHEMA public is unconditionally refused 42601; PostgreSQL recreates it (C56)"),
+        (1, "PGDIV-CLUSTER-SCHEMA-CONTENTS value [cluster]: the audit1 recording begins with public containing 2 other objects; this replay starts a fresh database, so the reset has no cascade notice; both DROP SCHEMA and CREATE SCHEMA succeed"),
     ]
 );
 replays_postgresql!(
     pg18_audit1_ws_delete_using_deletes_only_the_joined_rows_replays_as_postgresql_answered,
     "pg18-audit1-ws-delete_using_deletes_only_the_joined_rows.out",
     [
-        (1, "PGDIV-PUBLIC-SCHEMA-NOOP refusal [wire]: DROP SCHEMA public CASCADE drops tables, but CREATE SCHEMA public is unconditionally refused 42601; PostgreSQL recreates it (C56)"),
+        (1, "PGDIV-CLUSTER-SCHEMA-CONTENTS value [cluster]: the audit1 recording begins with public containing table t; this replay starts a fresh database, so the reset has no cascade notice; both DROP SCHEMA and CREATE SCHEMA succeed"),
     ]
 );
 replays_postgresql!(
     pg18_audit1_ws_delete_using_reads_one_namespace_replays_as_postgresql_answered,
     "pg18-audit1-ws-delete_using_reads_one_namespace.out",
     [
-        (1, "PGDIV-PUBLIC-SCHEMA-NOOP refusal [wire]: DROP SCHEMA public CASCADE drops tables, but CREATE SCHEMA public is unconditionally refused 42601; PostgreSQL recreates it (C56)"),
+        (1, "PGDIV-CLUSTER-SCHEMA-CONTENTS value [cluster]: the audit1 recording begins with public containing 2 other objects; this replay starts a fresh database, so the reset has no cascade notice; both DROP SCHEMA and CREATE SCHEMA succeed"),
         (6, "PGDIV-SQLITE-NAME-MESSAGE error-text [wire]: 42702 both; ours 'Parse error: ambiguous column name: id' vs PG 'column reference \"id\" is ambiguous'"),
         (8, "PGDIV-PARSE-PREFIX error-text [wire]: 42712 both; ours prefixes 'Parse error: '"),
     ]
@@ -12383,7 +12563,7 @@ replays_postgresql!(
     pg18_audit1_ws_delete_using_returning_a_using_column_is_refused_replays_as_postgresql_answered,
     "pg18-audit1-ws-delete_using_returning_a_using_column_is_refused.out",
     [
-        (1, "PGDIV-PUBLIC-SCHEMA-NOOP refusal [wire]: DROP SCHEMA public CASCADE drops tables, but CREATE SCHEMA public is unconditionally refused 42601; PostgreSQL recreates it (C56)"),
+        (1, "PGDIV-CLUSTER-SCHEMA-CONTENTS value [cluster]: the audit1 recording begins with public containing 2 other objects; this replay starts a fresh database, so the reset has no cascade notice; both DROP SCHEMA and CREATE SCHEMA succeed"),
         (6, "PGDIV-DELETE-USING-RETURNING ours-only [ours-only]: DELETE ... USING k RETURNING k.flag refused 0A000; PG deletes row 2 and returns 't'"),
         (7, "PGDIV-DELETE-USING-RETURNING cascade [ours-only]: count(*) 2 vs 1 (cascade of #6)"),
         (8, "PGDIV-DELETE-USING-RETURNING ours-only [ours-only]: RETURNING d.v, j.* refused 0A000; PG DELETE 0"),
@@ -12399,7 +12579,7 @@ replays_postgresql!(
     pg18_audit1_ws_delete_using_returning_resolves_a_bare_name_over_both_replays_as_postgresql_answered,
     "pg18-audit1-ws-delete_using_returning_resolves_a_bare_name_over_both.out",
     [
-        (1, "PGDIV-PUBLIC-SCHEMA-NOOP refusal [wire]: DROP SCHEMA public CASCADE drops tables, but CREATE SCHEMA public is unconditionally refused 42601; PostgreSQL recreates it (C56)"),
+        (1, "PGDIV-CLUSTER-SCHEMA-CONTENTS value [cluster]: the audit1 recording begins with public containing 2 other objects; this replay starts a fresh database, so the reset has no cascade notice; both DROP SCHEMA and CREATE SCHEMA succeed"),
         (6, "PGDIV-PARSE-PREFIX error-text [wire]: 42702 both; ours prefixes 'Parse error: '"),
         (8, "PGDIV-DELETE-USING-RETURNING ours-only [ours-only]: DELETE ... USING ... RETURNING flag (a USING column) refused 0A000; PG deletes 2 rows"),
         (9, "PGDIV-DELETE-USING-RETURNING cascade [ours-only]: count(*) 3 vs 1: #8 refused so rows 2,3 were not deleted (cascade of #8)"),
@@ -12416,7 +12596,7 @@ replays_postgresql!(
     pg18_audit1_ws_generate_series_may_read_the_row_it_joins_replays_as_postgresql_answered,
     "pg18-audit1-ws-generate_series_may_read_the_row_it_joins.out",
     [
-        (1, "PGDIV-PUBLIC-SCHEMA-NOOP refusal [wire]: DROP SCHEMA public CASCADE drops tables, but CREATE SCHEMA public is unconditionally refused 42601; PostgreSQL recreates it (C56)"),
+        (1, "PGDIV-CLUSTER-SCHEMA-CONTENTS value [cluster]: the audit1 recording begins with public containing 2 other objects; this replay starts a fresh database, so the reset has no cascade notice; both DROP SCHEMA and CREATE SCHEMA succeed"),
         (6, "PGDIV-WITH-ORDINALITY ours-only [ours-only]: generate_series(...) WITH ORDINALITY refused 0A000"),
     ]
 );
@@ -12424,7 +12604,7 @@ replays_postgresql!(
     pg18_audit1_ws_set_honours_or_refuses_each_parameter_replays_as_postgresql_answered,
     "pg18-audit1-ws-set_honours_or_refuses_each_parameter.out",
     [
-        (1, "PGDIV-PUBLIC-SCHEMA-NOOP refusal [wire]: DROP SCHEMA public CASCADE drops tables, but CREATE SCHEMA public is unconditionally refused 42601; PostgreSQL recreates it (C56)"),
+        (1, "PGDIV-CLUSTER-SCHEMA-CONTENTS value [cluster]: the audit1 recording begins with public containing table s; this replay starts a fresh database, so the reset has no cascade notice; both DROP SCHEMA and CREATE SCHEMA succeed"),
         (5, "PGDIV-READ-ONLY-TX ours-only [ours-only]: SET transaction_read_only = on in a block refused 0A000 and aborts it"),
         (6, "PGDIV-READ-ONLY-TX cascade [ours-only]: INSERT: PG 25006 read-only; ours 25P02 because #5 aborted the block (cascade of #5)"),
         (9, "PGDIV-READ-ONLY-TX ours-only [ours-only]: SET default_transaction_read_only = on refused 0A000"),
@@ -12439,7 +12619,7 @@ replays_postgresql!(
     pg18_audit1_ws_set_operations_keep_their_grouping_and_clauses_replays_as_postgresql_answered,
     "pg18-audit1-ws-set_operations_keep_their_grouping_and_clauses.out",
     [
-        (1, "PGDIV-PUBLIC-SCHEMA-NOOP refusal [wire]: DROP SCHEMA public CASCADE drops tables, but CREATE SCHEMA public is unconditionally refused 42601; PostgreSQL recreates it (C56)"),
+        (1, "PGDIV-CLUSTER-SCHEMA-CONTENTS value [cluster]: the audit1 recording begins with public containing table t; this replay starts a fresh database, so the reset has no cascade notice; both DROP SCHEMA and CREATE SCHEMA succeed"),
         (13, "PGDIV-DERIVED-COLUMN-BYTEA value [wire]: CTE column x in WITH ... UNION ALL typed 17 bytea; PG 23 int4 (rows agree)"),
         (14, "PGDIV-DERIVED-COLUMN-BYTEA value [wire]: CTE column id in WITH ... UNION ALL typed 17 bytea; PG 23 int4 (rows agree)"),
     ]
@@ -12448,7 +12628,7 @@ replays_postgresql!(
     pg18_audit1_ws_untyped_contexts_type_their_parameters_replays_as_postgresql_answered,
     "pg18-audit1-ws-untyped_contexts_type_their_parameters.out",
     [
-        (1, "PGDIV-PUBLIC-SCHEMA-NOOP refusal [wire]: DROP SCHEMA public CASCADE drops tables, but CREATE SCHEMA public is unconditionally refused 42601; PostgreSQL recreates it (C56)"),
+        (1, "PGDIV-CLUSTER-SCHEMA-CONTENTS value [cluster]: the audit1 recording begins with public containing 3 other objects; this replay starts a fresh database, so the reset has no cascade notice; both DROP SCHEMA and CREATE SCHEMA succeed"),
         (18, "PGDIV-DERIVED-COLUMN-BYTEA value [wire]: Describe: derived-table column c = count(*) typed 17 bytea in RowDescription; PG 20 int8"),
         (19, "PGDIV-DERIVED-COLUMN-BYTEA value [wire]: derived-table count(*) column typed 17 bytea in RowDescription (row '3' agrees); PG 20"),
         (26, "PGDIV-EXPR-TYPE-TEXT value [wire]: Describe: sum(n) OVER (PARTITION BY n > $1) typed 25 text in RowDescription; PG 20 int8 (param 23 agrees)"),
@@ -12700,15 +12880,15 @@ replays_postgresql!(
     [
         (1, "PGDIV-SCHEMA-REFUSED refusal [ours-only]: DROP SCHEMA IF EXISTS s; DROP SCHEMA public: ours refuses the whole query 0A000"),
         (4, "PGDIV-SCHEMA-REFUSED refusal [ours-only]: CREATE SCHEMA s refused 0A000 (recording relies on a schema s)"),
-        (5, "PGDIV-MISSING-SCHEMA-CODE cascade [wire]: CREATE TABLE s.t fails because #4 made no schema s (cascade of #4); our code XX000 'no such database: s' is itself not PG's 3F000; missing-schema XX000 rather than 3F000 is a frontend defect (C56)"),
-        (6, "PGDIV-MISSING-SCHEMA-CODE cascade [wire]: INSERT INTO s.t: XX000 no such database: s after BindComplete (cascade of #4); missing-schema XX000 rather than 3F000 is a frontend defect (C56)"),
-        (7, "PGDIV-MISSING-SCHEMA-CODE cascade [wire]: SELECT FROM s.t: XX000 no such database: s (cascade of #4); missing-schema XX000 rather than 3F000 is a frontend defect (C56)"),
-        (8, "PGDIV-MISSING-SCHEMA-CODE cascade [wire]: INSERT INTO s.t ON CONFLICT: XX000 (cascade of #4); missing-schema XX000 rather than 3F000 is a frontend defect (C56)"),
-        (9, "PGDIV-MISSING-SCHEMA-CODE cascade [wire]: UPDATE s.t: XX000 after BindComplete (cascade of #4); missing-schema XX000 rather than 3F000 is a frontend defect (C56)"),
-        (10, "PGDIV-MISSING-SCHEMA-CODE cascade [wire]: SELECT FROM s.t: XX000 (cascade of #4); missing-schema XX000 rather than 3F000 is a frontend defect (C56)"),
-        (11, "PGDIV-MISSING-SCHEMA-CODE cascade [wire]: INSERT ... ON CONFLICT DO UPDATE into s.t: XX000 (cascade of #4); missing-schema XX000 rather than 3F000 is a frontend defect (C56)"),
-        (12, "PGDIV-MISSING-SCHEMA-CODE cascade [wire]: SELECT FROM s.t: XX000 (cascade of #4); missing-schema XX000 rather than 3F000 is a frontend defect (C56)"),
-        (15, "PGDIV-MISSING-SCHEMA-CODE cascade [wire]: SELECT FROM s.t: XX000 (cascade of #4); missing-schema XX000 rather than 3F000 is a frontend defect (C56)"),
+        (5, "PGDIV-SCHEMA-REFUSED cascade [ours-only]: #4 CREATE SCHEMA s is intentionally refused 0A000; this command correctly reports 3F000 for the absent schema, as fresh PG18.6 does without schema s"),
+        (6, "PGDIV-SCHEMA-REFUSED cascade [ours-only]: #4 CREATE SCHEMA s is intentionally refused 0A000; this command correctly reports 42P01 for the absent relation, as fresh PG18.6 does without schema s"),
+        (7, "PGDIV-SCHEMA-REFUSED cascade [ours-only]: #4 CREATE SCHEMA s is intentionally refused 0A000; this command correctly reports 42P01 for the absent relation, as fresh PG18.6 does without schema s"),
+        (8, "PGDIV-SCHEMA-REFUSED cascade [ours-only]: #4 CREATE SCHEMA s is intentionally refused 0A000; this command correctly reports 42P01 for the absent relation, as fresh PG18.6 does without schema s"),
+        (9, "PGDIV-SCHEMA-REFUSED cascade [ours-only]: #4 CREATE SCHEMA s is intentionally refused 0A000; this command correctly reports 42P01 for the absent relation, as fresh PG18.6 does without schema s"),
+        (10, "PGDIV-SCHEMA-REFUSED cascade [ours-only]: #4 CREATE SCHEMA s is intentionally refused 0A000; this command correctly reports 42P01 for the absent relation, as fresh PG18.6 does without schema s"),
+        (11, "PGDIV-SCHEMA-REFUSED cascade [ours-only]: #4 CREATE SCHEMA s is intentionally refused 0A000; this command correctly reports 42P01 for the absent relation, as fresh PG18.6 does without schema s"),
+        (12, "PGDIV-SCHEMA-REFUSED cascade [ours-only]: #4 CREATE SCHEMA s is intentionally refused 0A000; this command correctly reports 42P01 for the absent relation, as fresh PG18.6 does without schema s"),
+        (15, "PGDIV-SCHEMA-REFUSED cascade [ours-only]: #4 CREATE SCHEMA s is intentionally refused 0A000; this command correctly reports 42P01 for the absent relation, as fresh PG18.6 does without schema s"),
         (18, "PGDIV-PARSE-REFUSAL-STEP protocol [wire]: s.t.c with only t in FROM: PG refuses at Parse 'invalid reference to FROM-clause entry for table \"t\"'; ours ParseComplete then 'Parse error: missing FROM-clause entry' (42P01 both)"),
     ]
 );
@@ -12750,11 +12930,11 @@ replays_postgresql!(
     [
         (1, "PGDIV-SCHEMA-REFUSED refusal [ours-only]: DROP SCHEMA IF EXISTS s; DROP SCHEMA public: ours refuses the whole query 0A000"),
         (3, "PGDIV-SCHEMA-REFUSED refusal [ours-only]: CREATE SCHEMA s refused 0A000 (recording relies on schema s)"),
-        (4, "PGDIV-MISSING-SCHEMA-CODE cascade [wire]: CREATE TABLE s.t: XX000 no such database: s (cascade of #3); missing-schema XX000 rather than 3F000 is a frontend defect (C56)"),
-        (5, "PGDIV-MISSING-SCHEMA-CODE cascade [wire]: INSERT INTO s.t: XX000 (cascade of #3); missing-schema XX000 rather than 3F000 is a frontend defect (C56)"),
-        (11, "PGDIV-MISSING-SCHEMA-CODE cascade [wire]: SELECT ... FROM s.t: XX000 (cascade of #3); missing-schema XX000 rather than 3F000 is a frontend defect (C56)"),
+        (4, "PGDIV-SCHEMA-REFUSED cascade [ours-only]: #3 CREATE SCHEMA s is intentionally refused 0A000; this command correctly reports 3F000 for the absent schema, as fresh PG18.6 does without schema s"),
+        (5, "PGDIV-SCHEMA-REFUSED cascade [ours-only]: #3 CREATE SCHEMA s is intentionally refused 0A000; this command correctly reports 42P01 for the absent relation, as fresh PG18.6 does without schema s"),
+        (11, "PGDIV-SCHEMA-REFUSED cascade [ours-only]: #3 CREATE SCHEMA s is intentionally refused 0A000; this command correctly reports 42P01 for the absent relation, as fresh PG18.6 does without schema s"),
         (15, "PGDIV-SQLITE-NAME-MESSAGE error-text [wire]: SELECT * FROM public.t, 42P01 both; ours 'Parse error: no such table: main.t' (leaks SQLite schema name main) vs PG 'relation \"public.t\" does not exist'"),
-        (16, "PGDIV-MISSING-SCHEMA-CODE cascade [wire]: SELECT count(*) FROM s.t: XX000 (cascade of #3); missing-schema XX000 rather than 3F000 is a frontend defect (C56)"),
+        (16, "PGDIV-SCHEMA-REFUSED cascade [ours-only]: #3 CREATE SCHEMA s is intentionally refused 0A000; this command correctly reports 42P01 for the absent relation, as fresh PG18.6 does without schema s"),
     ]
 );
 replays_postgresql!(
@@ -12763,12 +12943,12 @@ replays_postgresql!(
     [
         (1, "PGDIV-SCHEMA-REFUSED refusal [ours-only]: DROP SCHEMA IF EXISTS s (PG had s.t); DROP SCHEMA public: ours refuses the whole query 0A000"),
         (3, "PGDIV-SCHEMA-REFUSED refusal [ours-only]: CREATE SCHEMA s refused 0A000 (recording relies on schema s)"),
-        (4, "PGDIV-MISSING-SCHEMA-CODE cascade [wire]: CREATE TABLE s.t: XX000 no such database: s (cascade of #3; XX000 is not PG's 3F000); missing-schema XX000 rather than 3F000 is a frontend defect (C56)"),
-        (5, "PGDIV-MISSING-SCHEMA-CODE cascade [wire]: CREATE UNIQUE INDEX su ON s.t: XX000 (cascade of #3); missing-schema XX000 rather than 3F000 is a frontend defect (C56)"),
-        (6, "PGDIV-MISSING-SCHEMA-CODE cascade [wire]: INSERT INTO s.t: XX000 (cascade of #3); missing-schema XX000 rather than 3F000 is a frontend defect (C56)"),
-        (7, "PGDIV-MISSING-SCHEMA-CODE cascade [wire]: INSERT INTO s.t duplicate: XX000 instead of PG 23505 on su (cascade of #3); missing-schema XX000 rather than 3F000 is a frontend defect (C56)"),
+        (4, "PGDIV-SCHEMA-REFUSED cascade [ours-only]: #3 CREATE SCHEMA s is intentionally refused 0A000; this command correctly reports 3F000 for the absent schema, as fresh PG18.6 does without schema s"),
+        (5, "PGDIV-SCHEMA-REFUSED cascade [ours-only]: #3 CREATE SCHEMA s is intentionally refused 0A000; this command correctly reports 3F000 for the absent schema, as fresh PG18.6 does without schema s"),
+        (6, "PGDIV-SCHEMA-REFUSED cascade [ours-only]: #3 CREATE SCHEMA s is intentionally refused 0A000; this command correctly reports 42P01 for the absent relation, as fresh PG18.6 does without schema s"),
+        (7, "PGDIV-SCHEMA-REFUSED cascade [ours-only]: #3 CREATE SCHEMA s is intentionally refused 0A000; this command correctly reports 42P01 for the absent relation, as fresh PG18.6 does without schema s"),
         (12, "PGDIV-CONSTRAINT-MESSAGE error-text [wire]: 23505 both; ours 'UNIQUE constraint failed: t.c' vs PG '... unique constraint \"pu\"'"),
-        (13, "PGDIV-MISSING-SCHEMA-CODE cascade [wire]: SELECT count(*) FROM s.t: XX000 (cascade of #3); missing-schema XX000 rather than 3F000 is a frontend defect (C56)"),
+        (13, "PGDIV-SCHEMA-REFUSED cascade [ours-only]: #3 CREATE SCHEMA s is intentionally refused 0A000; this command correctly reports 42P01 for the absent relation, as fresh PG18.6 does without schema s"),
     ]
 );
 replays_postgresql!(
@@ -12784,7 +12964,7 @@ replays_postgresql!(
     [
         (1, "PGDIV-SCHEMA-REFUSED refusal [ours-only]: DROP SCHEMA IF EXISTS s; DROP SCHEMA public: ours refuses the whole query 0A000"),
         (4, "PGDIV-SCHEMA-REFUSED refusal [ours-only]: CREATE SCHEMA s refused 0A000 (recording relies on schema s)"),
-        (5, "PGDIV-MISSING-SCHEMA-CODE cascade [wire]: CREATE TABLE s.u: XX000 no such database: s (cascade of #4); missing-schema XX000 rather than 3F000 is a frontend defect (C56)"),
+        (5, "PGDIV-SCHEMA-REFUSED cascade [ours-only]: #4 CREATE SCHEMA s is intentionally refused 0A000; this command correctly reports 3F000 for the absent schema, as fresh PG18.6 does without schema s"),
         (6, "PGDIV-PARSE-REFUSAL-STEP protocol [wire]: Describe UPDATE u (u only in s): PG refuses 42P01 at Parse 'relation \"u\" does not exist'; ours ParseComplete then 'Parse error: no such table: u'"),
     ]
 );
@@ -13087,7 +13267,7 @@ replays_postgresql!(
     "pg18.out",
     [
         (6, "PGDIV-SCHEMA-REFUSED refusal [ours-only]: CREATE SCHEMA s refused 0A000 (recording relies on schema s)"),
-        (7, "PGDIV-MISSING-SCHEMA-CODE cascade [wire]: CREATE TABLE s.t: XX000 no such database: s (cascade of #6); missing-schema XX000 rather than 3F000 is a frontend defect (C56)"),
+        (7, "PGDIV-SCHEMA-REFUSED cascade [ours-only]: #6 CREATE SCHEMA s is intentionally refused 0A000; this command correctly reports 3F000 for the absent schema, as fresh PG18.6 does without schema s"),
         (14, "PGDIV-SUM-INT8-NUMERIC value [engine]: sum(bigint) past int8 inside a savepoint block: ours 22003 'integer overflow' and aborts (Z E); PG answers numeric 9223372036854775808 (Z T)"),
         (15, "PGDIV-SUM-INT8-NUMERIC cascade [engine]: SELECT 1/0: ours 25P02 because #14 aborted the block; PG 22012 (cascade of #14)"),
         (20, "PGDIV-PARSE-PREFIX error-text [wire]: COPY ... WHERE v = $1 over Q: 42P02 both; ours prefixes 'Parse error: '"),

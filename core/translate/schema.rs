@@ -1143,6 +1143,7 @@ pub fn translate_create_table(
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
     input: &str,
+    internal_root: bool,
 ) -> Result<()> {
     // For CTAS, extract the SELECT, determine column info, and convert to a
     // regular ColumnsAndConstraints body + separate SELECT for data insertion.
@@ -1201,7 +1202,8 @@ pub fn translate_create_table(
     let opts = ProgramBuilderOpts::new(1, 30, 1);
     program.extend(&opts);
 
-    if !connection.is_mvcc_bootstrap_connection()
+    if !internal_root
+        && !connection.is_mvcc_bootstrap_connection()
         && RESERVED_TABLE_PREFIXES
             .iter()
             .any(|prefix| normalized_tbl_name.starts_with(prefix))
@@ -1832,8 +1834,9 @@ fn validate_drop_table(
     database_id: usize,
     tbl_name: &str,
     connection: &Arc<Connection>,
+    internal_root: bool,
 ) -> Result<()> {
-    if !connection.is_nested_stmt()
+    if !internal_root && !connection.is_nested_stmt()
         && crate::schema::is_system_table(tbl_name)
         // special case, allow dropping `sqlite_stat1`
         && !tbl_name.eq_ignore_ascii_case(STATS_TABLE)
@@ -1855,6 +1858,7 @@ pub fn translate_drop_table(
     if_exists: bool,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
+    internal_root: bool,
 ) -> Result<()> {
     let database_id = resolver.resolve_existing_table_database_id_qualified(&tbl_name)?;
     let name = tbl_name.name.as_str();
@@ -1873,7 +1877,7 @@ pub fn translate_drop_table(
             crate::util::table_name_for_error(&tbl_name)
         );
     };
-    validate_drop_table(resolver, database_id, name, connection)?;
+    validate_drop_table(resolver, database_id, name, connection, internal_root)?;
     // Check if foreign keys are enabled and if this table is referenced by foreign keys
     // Fire FK actions (CASCADE, SET NULL, SET DEFAULT) or check for violations (RESTRICT, NO ACTION)
     if connection.foreign_keys_enabled()

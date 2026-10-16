@@ -1,0 +1,42 @@
+>> Q CREATE TABLE c56_prepared(n integer)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO c56_prepared VALUES (1)
+   C INSERT 0 1
+   Z I
+>> P c56_read SELECT n FROM public.c56_prepared
+>> S
+   ParseComplete
+   Z I
+>> B - c56_read
+>> E - 0
+>> S
+   BindComplete
+   D ['1']
+   C SELECT 1
+   Z I
+>> Q DROP SCHEMA public CASCADE
+   N S=NOTICE C=00000 M=drop cascades to table c56_prepared
+   C DROP SCHEMA
+   Z I
+>> B - c56_read
+>> E - 0
+>> S
+   E S=ERROR C=42P01 M=relation "public.c56_prepared" does not exist
+   Z I
+>> Q CREATE SCHEMA public
+   C CREATE SCHEMA
+   Z I
+>> Q CREATE TABLE c56_prepared(n integer)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO c56_prepared VALUES (2)
+   C INSERT 0 1
+   Z I
+>> B - c56_read
+>> E - 0
+>> S
+   BindComplete
+   D ['2']
+   C SELECT 1
+   Z I

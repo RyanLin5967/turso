@@ -1,6 +1,6 @@
 >> Q DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public
    C DROP SCHEMA
-   E S=ERROR C=42601 M=Parse error: schema "public" already exists
+   C CREATE SCHEMA
    Z I
 >> Q SET statement_timeout = 0
    C SET

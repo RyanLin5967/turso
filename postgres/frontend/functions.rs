@@ -101,14 +101,20 @@ pub(crate) fn exec_scalar(conn: &Connection, name: &str, args: &[Value]) -> Resu
         "current_database" => Ok(Value::build_text(crate::catalog::db_name_from_path(
             conn.db_file_path(),
         ))),
-        // pg_catalog presents every user object under the hardcoded "public"
-        // namespace, so that is always the current schema.
-        "current_schema" => Ok(Value::build_text("public")),
-        // The search path as an array literal, with the implicit pg_catalog first when asked.
+        "current_schema" => Ok(if crate::session::public_schema_exists(conn) {
+            Value::build_text("public")
+        } else {
+            Value::Null
+        }),
         "current_schemas" => Ok(Value::build_text(
-            match args.first().and_then(|v| v.as_int()) {
-                Some(0) => "{public}",
-                _ => "{pg_catalog,public}",
+            match (
+                args.first().and_then(|v| v.as_int()) != Some(0),
+                crate::session::public_schema_exists(conn),
+            ) {
+                (false, false) => "{}",
+                (false, true) => "{public}",
+                (true, false) => "{pg_catalog}",
+                (true, true) => "{pg_catalog,public}",
             },
         )),
         "pg_backend_pid" => Ok(Value::from_i64(std::process::id() as i64)),
