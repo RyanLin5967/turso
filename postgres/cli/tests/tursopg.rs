@@ -952,7 +952,33 @@ fn copy_from_file_not_found_repl() {
 /// then fails mid-test when the winner tears it down. Instead, ask the kernel
 /// for a free ephemeral port and verify our own child is the process that
 /// came up on it, retrying with a fresh port if the child dies on bind.
-fn start_tursopg_server() -> (Child, u16) {
+/// A started server, killed and reaped when dropped, so a test that panics leaves no server
+/// behind (found 2026-10-16: 28 `tursopg :memory: --server` processes from this file's servers,
+/// re-parented to launchd and running for over a day). BLIND SPOT: a test binary killed by a
+/// signal runs no Drop, and its servers outlive it.
+struct ServerChild(Child);
+
+impl std::ops::Deref for ServerChild {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ServerChild {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.0
+    }
+}
+
+impl Drop for ServerChild {
+    fn drop(&mut self) {
+        self.0.kill().ok();
+        self.0.wait().ok();
+    }
+}
+
+fn start_tursopg_server() -> (ServerChild, u16) {
     for _ in 0..10 {
         let port = TcpListener::bind("127.0.0.1:0")
             .unwrap()
@@ -960,7 +986,7 @@ fn start_tursopg_server() -> (Child, u16) {
             .unwrap()
             .port();
         if let Some(child) = start_tursopg_server_on(port) {
-            return (child, port);
+            return (ServerChild(child), port);
         }
     }
     panic!("tursopg server did not start");
