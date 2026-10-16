@@ -13816,3 +13816,16 @@ fn c54_virtual_batch_keeps_trailing_generated_identifier() {
     let sql = "CREATE TABLE vm(a INT,b INT GENERATED ALWAYS AS(a*2) VIRTUAL); SELECT 1 AS generated";
     assert_eq!(a.q(sql).single(sql), "1");
 }
+
+
+#[test]
+fn c54_nested_function_relation_does_not_hide_outer_series_column() {
+    let dir = Scratch::new("c54-function-scope");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE s(x INT); INSERT INTO s VALUES(1),(2)").ok("fixture");
+    let sql = "SELECT g FROM s,generate_series(1,s.x)g WHERE EXISTS(SELECT 1 FROM generate_series(1,1)h WHERE h=1 AND g=1) ORDER BY g";
+    let r = a.q(sql).ok(sql);
+    assert_eq!(r.oids, Some(vec![23]));
+    assert_eq!(r.rows, vec![vec![Some("1".into())], vec![Some("1".into())]]);
+}
