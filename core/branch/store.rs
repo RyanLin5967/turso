@@ -1945,6 +1945,8 @@ struct CatState {
     links_prefilled: bool,
     /// Link fill threads this store started (observing only; links adversary 3 L2).
     links_fill_starts: u64,
+    /// A fill batch committed on this catalog, so its link columns and the cursor's table exist.
+    links_columns_made: bool,
     /// Checkpoint and settle counters (observing only).
     ckpt: CkptCounters,
     /// The part of `trunk_probes`/`trunk_rows` made by `trunk_written_known`'s once-per-page probe
@@ -2258,6 +2260,7 @@ impl CatState {
             links_cursor: None,
             links_prefilled: false,
             links_fill_starts: 0,
+            links_columns_made: false,
             ckpt: CkptCounters::default(),
             catalog,
             dirty: HashMap::new(),
@@ -3744,6 +3747,7 @@ fn run_links_fill(shared: &StoreMutex, writer: &Mutex<Catalog>, group: &Group) {
         Ok(Some((g, at, done))) if g == generation => {
             let mut inner = shared.lock();
             if let Some(cat) = inner.cat.as_mut().filter(|c| c.filling) {
+                cat.links_columns_made = true;
                 if done {
                     cat.links_prefilled = true;
                     cat.filling = false;
@@ -3806,6 +3810,9 @@ fn run_links_fill(shared: &StoreMutex, writer: &Mutex<Catalog>, group: &Group) {
         let Some(cat) = inner.cat.as_mut() else {
             return;
         };
+        if batch.is_ok() {
+            cat.links_columns_made = true;
+        }
         match batch {
             Ok(Some(next)) if cat.filling => cat.links_cursor = Some(next),
             Ok(None) if cat.filling => {
@@ -6178,7 +6185,10 @@ impl BranchStore {
         let Some(cat) = inner.cat.as_mut() else {
             return false;
         };
-        if past_hard && !fe_mutant("l4_fill_waits_past_hard_limit") {
+        // Only once a batch has made the link columns (and the cursor's table): the checkpoint then
+        // changes no schema, which in a fuzzy flight would fail the store's pinned reads ("Database
+        // schema changed", the oracle's in-flight check, raw ls-green2_131f8832a).
+        if past_hard && cat.links_columns_made && !fe_mutant("l4_fill_waits_past_hard_limit") {
             cat.filling = false;
             return false;
         }
