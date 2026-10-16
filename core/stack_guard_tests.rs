@@ -79,33 +79,36 @@ fn nested_scalar_subqueries(depth: usize) -> String {
     format!("SELECT {sql}")
 }
 
-/// Red first (lead order): a 2-level scalar subquery on a 256 KiB thread overflowed the stack and
-/// aborted the process. It must be refused with 54001 (`LimboError::StackDepthLimitExceeded`), and
-/// the same statement on an 8 MiB thread (the main thread's size) must still answer 1, the control.
+/// A 2-level scalar subquery on a 256 KiB thread overflowed the stack and aborted the process. A
+/// statement too deep for its thread must be refused with 54001
+/// (`LimboError::StackDepthLimitExceeded`), and the same statement on an 8 MiB thread (the main
+/// thread's size) must still answer, the control. Nested deeper until the 256 KiB thread refuses
+/// it: a debug build refuses at depth 2, and a release build's smaller frames answer depth 8
+/// there (`diag_stack_needed_per_nesting_level`, release).
 #[test]
 fn a_statement_too_deep_for_its_stack_is_refused_with_54001_not_a_crash() {
     if run_child() {
         return;
     }
     let test = "stack_guard_tests::a_statement_too_deep_for_its_stack_is_refused_with_54001_not_a_crash";
-    let sql = nested_scalar_subqueries(2);
-    let control = in_child(test, 8 * 1024, &sql);
-    assert!(control.starts_with("ok [[Numeric(Integer(1))]]") || control.contains("Integer(1)"), "premise: {sql} on 8 MiB gave {control}");
-    let small = in_child(test, 256, &sql);
-    // A debug build's frames need about 128-256 KiB a level (diag_stack_needed_per_nesting_level),
-    // so this is refused there; a release build's levels fit 256 KiB, and it answers. Either way it
-    // never kills the process (FLAGGED: the lead's red was measured in debug; release asserts the
-    // class, not the refusal).
-    #[cfg(not(debug_assertions))]
-    assert!(
-        small.starts_with("ok") || small.starts_with("err StackDepthLimitExceeded"),
-        "CLAIM: {sql} on a 256 KiB thread neither answered nor was refused with 54001: {small}"
-    );
-    #[cfg(debug_assertions)]
-    assert!(
-        small.starts_with("err StackDepthLimitExceeded"),
-        "CLAIM: {sql} on a 256 KiB thread was not refused with 54001 (stack_depth_limit_exceeded): {small}"
-    );
+    let mut answered = Vec::new();
+    for depth in [2usize, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64] {
+        let sql = nested_scalar_subqueries(depth);
+        let small = in_child(test, 256, &sql);
+        if small.starts_with("ok") {
+            answered.push(depth);
+            continue;
+        }
+        assert!(
+            small.starts_with("err StackDepthLimitExceeded"),
+            "CLAIM: {depth} nested scalar subqueries on a 256 KiB thread were not refused with 54001 (stack_depth_limit_exceeded): {small}"
+        );
+        let control = in_child(test, 8 * 1024, &sql);
+        assert!(control.starts_with("ok [[Numeric(Integer(1))]]"), "premise: {sql} on 8 MiB gave {control}");
+        println!("FE_STACK_REFUSED at depth {depth} on 256 KiB (answered {answered:?})");
+        return;
+    }
+    panic!("premise: a 256 KiB thread answered every depth tried ({answered:?}), so nothing was refused");
 }
 
 /// Diagnostic (prints; asserts nothing): which nesting depth each thread stack size survives, to
