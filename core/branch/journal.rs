@@ -200,8 +200,19 @@ pub(crate) fn reads_at(version: u32, recorded: u32) -> bool {
 /// The version this build writes for the arm of a file read at `version` (17, 19, 21 -> 21; 18, 20,
 /// 22 -> 22; test builds' `CREATE_LEGACY` keeps making the legacy one).
 pub(crate) fn current_format_of(version: u32) -> u32 {
-    let splice = matches!(version, 18 | 20 | 22);
-    format_version(splice)
+    format_version(splice_arm(version) == Some(true))
+}
+
+/// Whether `version` is a splice arm's (18, 20, 22) or the plain arm's (17, 19, 21); `None` for a
+/// version this build does not read.
+fn splice_arm(version: u32) -> Option<bool> {
+    if version == FORMAT_VERSION || OLDER_FORMATS.contains(&version) {
+        Some(false)
+    } else if version == SPLICE_FORMAT_VERSION || OLDER_SPLICE_FORMATS.contains(&version) {
+        Some(true)
+    } else {
+        None
+    }
 }
 
 /// Whether a catalog of format `format` has the sibling-link columns (21, 22).
@@ -4206,17 +4217,12 @@ fn parse_log_header(bytes: &[u8], format: u32) -> Result<Option<(u32, u64, u32)>
 /// What a refused format version is (review 2 #13): the other arm's, or one written before the log
 /// nonce (format 11), or before flight framing (format 9), which this build cannot read.
 pub(crate) fn version_hint(version: u32, format: u32) -> String {
-    // The arm of a version this build knows (17 to 22); the hint before this fix took any version
-    // but `format`'s pair for the other arm's (links adversary H1: 21 under a 17 record).
-    let arm = |v: u32| match v {
-        17 | 19 | 21 => Some(false),
-        18 | 20 | 22 => Some(true),
-        _ => None,
-    };
+    // The hint before links adversary H1 took any version but `format`'s pair for the other arm's
+    // (21 under a 17 record).
     let newest = FORMAT_VERSION.max(SPLICE_FORMAT_VERSION);
-    if arm(version).is_some() && arm(format).is_some() && arm(version) != arm(format) {
+    if matches!((splice_arm(version), splice_arm(format)), (Some(a), Some(b)) if a != b) {
         format!(" ({version} is the other F7 splice arm's: open with that arm's DatabaseOpts::with_branch_splice)")
-    } else if arm(version).is_some() && version > format {
+    } else if splice_arm(version).is_some() && version > format {
         format!(
             " (newer than the store's recorded version {format}: no build writes a file ahead of its \
              store's record, so these files are not one store's, or are damaged)"

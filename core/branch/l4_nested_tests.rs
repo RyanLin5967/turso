@@ -57,7 +57,7 @@ impl Rng {
 
 const N: usize = 30;
 
-/// One nested history. Returns (deletes released, oracle checks run).
+/// One nested history. Returns the deletes released.
 fn history(seed: u64, steps: u32, splice: bool, legacy: bool) -> u64 {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("adv.db");
@@ -76,7 +76,6 @@ fn history(seed: u64, steps: u32, splice: bool, legacy: bool) -> u64 {
     model.insert(first, trunk_model.clone());
     live.push(first);
     let mut releases = 0u64;
-    let mut checks = 0u64;
     let mut legacy_steps = if legacy { 40 } else { 0 };
     macro_rules! op {
         ($k:expr, $step:expr) => {{
@@ -157,7 +156,6 @@ fn history(seed: u64, steps: u32, splice: bool, legacy: bool) -> u64 {
         if let Err(e) = db.branches.l4_facts_check_for_test() {
             panic!("seed {seed} step {step} (splice {splice}, legacy {legacy}): oracle: {e}");
         }
-        checks += 1;
         if step % 10 == 9 {
             assert_eq!(rows(&trunk), trunk_model, "seed {seed} step {step}: trunk");
             for &id in &live {
@@ -171,7 +169,6 @@ fn history(seed: u64, steps: u32, splice: bool, legacy: bool) -> u64 {
             panic!("seed {seed} step {step} (splice {splice}, legacy {legacy}): crosscheck: {m}");
         }
     }
-    let _ = checks;
     releases
 }
 
