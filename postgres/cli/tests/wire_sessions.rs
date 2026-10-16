@@ -12360,3 +12360,6 @@ replays_postgresql!(
     []
 );
 replays_postgresql!(pg18_replays_as_postgresql_answered, "pg18.out", []);
+
+#[path = "c45_regressions.rs"]
+mod c45_regressions;
