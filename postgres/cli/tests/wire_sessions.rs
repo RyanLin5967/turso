@@ -13757,3 +13757,23 @@ fn c54_sqlite_table_functions_are_undefined() {
         assert_eq!(a.q(sql).err(sql).code, "42883", "{sql}");
     }
 }
+
+
+#[test]
+fn c54_virtual_generated_survives_alter_and_reload() {
+    let dir = Scratch::new("c54-virtual-alter");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE va(a INT)").ok("fixture");
+    a.q("ALTER TABLE va ADD COLUMN b INT GENERATED ALWAYS AS(a*2) VIRTUAL").ok("add generated");
+    a.q("INSERT INTO va(a) VALUES(3)").ok("base write");
+    let r = a.q("SELECT a,b FROM va").ok("generated after alter");
+    assert_eq!(r.oids, Some(vec![23, 23]));
+    assert_eq!(r.rows, vec![vec![Some("3".into()), Some("6".into())]]);
+    a.q("ALTER TABLE va ADD COLUMN c TEXT DEFAULT 'generated always as(a) virtual'").ok("preserve storage and literal");
+    drop(a);
+    let mut b = server.connect();
+    let r = b.q("SELECT a,b,c FROM va").ok("reload generated expression");
+    assert_eq!(r.oids, Some(vec![23, 23, 25]));
+    assert_eq!(r.rows, vec![vec![Some("3".into()), Some("6".into()), Some("generated always as(a) virtual".into())]]);
+}
