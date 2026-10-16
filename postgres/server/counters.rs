@@ -162,15 +162,22 @@ pub fn thread_counters() -> Option<(u64, u64)> {
     }
 }
 
-/// The CPU time, in nanoseconds, every OTHER thread of this process has used so far (user plus
-/// system, `proc_pidinfo(PROC_PIDTHREADID64INFO)` of each thread `PROC_PIDLISTTHREADIDS` lists,
-/// the calling thread skipped by its id). Read at both ends of a budget window, a difference above
-/// zero is a foreign thread that ran inside it: the exclusion the word-held FULL verdict rests on,
-/// and the re-judgment's off-thread guard. The instruction gap it replaces (process-wide rusage less
-/// this thread's thread_selfcounts) disagreed by about +/-10k instructions at random, below zero as
-/// often as above, so it said nothing about other threads (DECISIONS 308c3232a3). A thread that
-/// started and ended between the two reads is not listed at either: BLIND SPOT, stated. `None` off
-/// Apple platforms or when the kernel refuses a read.
+/// The CPU time, in nanoseconds, every OTHER thread of this process has used so far, the dead ones
+/// included (user plus system): the CPU of the threads that have ended (`task_info
+/// (MACH_TASK_BASIC_INFO)`, the kernel's total for terminated threads, in microseconds) plus that of
+/// every live thread `PROC_PIDLISTTHREADIDS` lists but the calling one (`proc_pidinfo
+/// (PROC_PIDTHREADID64INFO)`, skipped by its id). That is the process's CPU less the calling
+/// thread's, without reading two counters at two moments (the instruction gap that did so
+/// disagreed by about +/-10k at random, DECISIONS 308c3232a3). Read at both ends of a budget window,
+/// a difference above zero is foreign work inside it, including a thread born and ended between the
+/// reads (wire-verdict-adversary HIGH, DECISIONS 2923cc91b5: the branch-name-filter growth thread
+/// ran in 4 of 4 real windows while the live-threads-only sum read 0), and a thread that exits
+/// inside the window no longer takes its earlier CPU out of the sum. The terminated total is read
+/// before and after the listing, and the read is retried while a thread ended in between. BLIND
+/// SPOT: a thread's CPU is in the terminated total only once the kernel accounts its end, so a
+/// window holding an exit can read low and the next one high; [`thread_lifecycle`] counts the exit
+/// itself, which the budget refuses. `None` off Apple platforms, when the kernel refuses a read, when
+/// more than 256 threads exist, or when every retry raced an exit.
 pub fn foreign_thread_cpu_ns() -> Option<u64> {
     #[cfg(target_vendor = "apple")]
     {
@@ -179,49 +186,154 @@ pub fn foreign_thread_cpu_ns() -> Option<u64> {
         extern "C" {
             fn pthread_threadid_np(thread: libc::pthread_t, id: *mut u64) -> libc::c_int;
         }
+        fn terminated_ns() -> Option<u64> {
+            let mut info: libc::mach_task_basic_info = unsafe { std::mem::zeroed() };
+            let mut count = libc::MACH_TASK_BASIC_INFO_COUNT;
+            let rc = unsafe {
+                apple::task_info(
+                    apple::mach_task_self_,
+                    libc::MACH_TASK_BASIC_INFO as i32,
+                    (&mut info as *mut libc::mach_task_basic_info).cast(),
+                    &mut count,
+                )
+            };
+            let us = |t: libc::time_value_t| t.seconds as u64 * 1_000_000 + t.microseconds as u64;
+            (rc == 0).then(|| (us(info.user_time) + us(info.system_time)) * 1000)
+        }
         let pid = std::process::id() as libc::c_int;
         let mut me = 0u64;
         if unsafe { pthread_threadid_np(0 as libc::pthread_t, &mut me) } != 0 {
             return None;
         }
-        let mut ids = [0u64; 256];
-        let bytes = unsafe {
-            libc::proc_pidinfo(
-                pid,
-                PROC_PIDLISTTHREADIDS,
-                0,
-                ids.as_mut_ptr().cast(),
-                std::mem::size_of_val(&ids) as libc::c_int,
-            )
-        };
-        if bytes <= 0 {
-            return None;
-        }
-        let n = bytes as usize / std::mem::size_of::<u64>();
-        let mut total = 0u64;
-        for &id in &ids[..n.min(ids.len())] {
-            if id == me {
-                continue;
-            }
-            let mut info: libc::proc_threadinfo = unsafe { std::mem::zeroed() };
-            let got = unsafe {
+        for _ in 0..16 {
+            let dead = terminated_ns()?;
+            let mut ids = [0u64; 256];
+            let bytes = unsafe {
                 libc::proc_pidinfo(
                     pid,
-                    PROC_PIDTHREADID64INFO,
-                    id,
-                    (&mut info as *mut libc::proc_threadinfo).cast(),
-                    std::mem::size_of::<libc::proc_threadinfo>() as libc::c_int,
+                    PROC_PIDLISTTHREADIDS,
+                    0,
+                    ids.as_mut_ptr().cast(),
+                    std::mem::size_of_val(&ids) as libc::c_int,
                 )
             };
-            // A thread that ended after the listing reads nothing: it is not counted.
-            if got as usize == std::mem::size_of::<libc::proc_threadinfo>() {
-                total += info.pth_user_time + info.pth_system_time;
+            if bytes <= 0 || bytes as usize >= std::mem::size_of_val(&ids) {
+                return None;
+            }
+            let n = bytes as usize / std::mem::size_of::<u64>();
+            let mut live = 0u64;
+            for &id in &ids[..n] {
+                if id == me {
+                    continue;
+                }
+                let mut info: libc::proc_threadinfo = unsafe { std::mem::zeroed() };
+                let got = unsafe {
+                    libc::proc_pidinfo(
+                        pid,
+                        PROC_PIDTHREADID64INFO,
+                        id,
+                        (&mut info as *mut libc::proc_threadinfo).cast(),
+                        std::mem::size_of::<libc::proc_threadinfo>() as libc::c_int,
+                    )
+                };
+                // A thread that ended after the listing reads nothing; its CPU moved into the
+                // terminated total, which the second read below sees moved, and the read retries.
+                if got as usize == std::mem::size_of::<libc::proc_threadinfo>() {
+                    live += info.pth_user_time + info.pth_system_time;
+                }
+            }
+            if terminated_ns()? == dead {
+                return Some(dead + live);
             }
         }
-        Some(total)
+        None
     }
     #[cfg(not(target_vendor = "apple"))]
     {
         None
     }
+}
+
+static THREAD_STARTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static THREAD_EXITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LIFECYCLE_INSTALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(target_vendor = "apple")]
+mod lifecycle {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    pub(super) type Hook = unsafe extern "C" fn(
+        event: libc::c_uint,
+        thread: libc::pthread_t,
+        addr: *mut libc::c_void,
+        size: libc::size_t,
+    );
+    extern "C" {
+        pub(super) fn pthread_introspection_hook_install(hook: Option<Hook>) -> Option<Hook>;
+    }
+    // pthread/introspection.h.
+    const PTHREAD_INTROSPECTION_THREAD_START: libc::c_uint = 2;
+    const PTHREAD_INTROSPECTION_THREAD_TERMINATE: libc::c_uint = 3;
+    /// The hook installed before this one (0: none), called after the count.
+    pub(super) static PREVIOUS: AtomicUsize = AtomicUsize::new(0);
+
+    pub(super) unsafe extern "C" fn count(
+        event: libc::c_uint,
+        thread: libc::pthread_t,
+        addr: *mut libc::c_void,
+        size: libc::size_t,
+    ) {
+        match event {
+            PTHREAD_INTROSPECTION_THREAD_START => {
+                super::THREAD_STARTS.fetch_add(1, Ordering::Relaxed);
+            }
+            PTHREAD_INTROSPECTION_THREAD_TERMINATE => {
+                super::THREAD_EXITS.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+        let previous = PREVIOUS.load(Ordering::Acquire);
+        if previous != 0 {
+            let previous: Hook = unsafe { std::mem::transmute(previous) };
+            unsafe { previous(event, thread, addr, size) };
+        }
+    }
+}
+
+/// Installs the thread start and exit counter ([`thread_lifecycle`]): libpthread's introspection
+/// hook (`pthread_introspection_hook_install`, chained to any hook installed before), which runs on
+/// each thread as it starts and as it terminates. A measurement binary calls it first thing in
+/// `main`, before any thread exists (tursopg and embedded_ops, in builds with `alloc-count`); a
+/// thread started before the call is not counted when it starts, only when it exits. Idempotent;
+/// does nothing off Apple platforms.
+pub fn install_thread_lifecycle_counter() {
+    #[cfg(target_vendor = "apple")]
+    {
+        use std::sync::atomic::Ordering;
+        if LIFECYCLE_INSTALLED
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        // A thread may start between the install and the store of the previous hook: it then
+        // skips the previous hook once, never the count.
+        let previous =
+            unsafe { lifecycle::pthread_introspection_hook_install(Some(lifecycle::count)) };
+        lifecycle::PREVIOUS.store(previous.map_or(0, |h| h as usize), Ordering::Release);
+    }
+}
+
+/// The threads this process has started and that have exited since
+/// [`install_thread_lifecycle_counter`] (`None` before it, or off Apple platforms). Read at both
+/// ends of a budget window, any difference is a thread born or ended inside it: the budget refuses
+/// every such window (DECISIONS 2923cc91b5 (a)), whatever CPU the thread used.
+pub fn thread_lifecycle() -> Option<(u64, u64)> {
+    use std::sync::atomic::Ordering;
+    LIFECYCLE_INSTALLED.load(Ordering::Acquire).then(|| {
+        (
+            THREAD_STARTS.load(Ordering::Relaxed),
+            THREAD_EXITS.load(Ordering::Relaxed),
+        )
+    })
 }

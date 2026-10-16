@@ -145,3 +145,32 @@ fn a_thread_exiting_inside_a_window_does_not_hide_one_that_runs() {
         after - before
     );
 }
+
+/// FIRE-CHECK of counters::thread_lifecycle (DECISIONS 2923cc91b5 (a): any window with a thread born
+/// or ended inside it refuses), both ways: a thread born and joined inside the window moves both
+/// counts, one that exits inside it moves the exits, and a window with every other thread parked
+/// moves neither.
+#[test]
+fn the_thread_lifecycle_counter_sees_a_birth_and_an_exit_and_a_parked_window_moves_neither() {
+    use turso_pg_server::counters::{install_thread_lifecycle_counter, thread_lifecycle};
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    install_thread_lifecycle_counter();
+    let (go, wait) = std::sync::mpsc::channel::<()>();
+    let early = std::thread::spawn(move || {
+        wait.recv().ok();
+    });
+    // The harness's threads of finished tests end after they let the lock go: let them.
+    std::thread::sleep(Duration::from_millis(50));
+    let (s0, e0) = thread_lifecycle().expect("installed");
+    std::thread::spawn(|| spin(1)).join().unwrap();
+    let (s1, e1) = thread_lifecycle().unwrap();
+    assert!(s1 > s0 && e1 > e0, "a thread born and joined in the window: starts {s0}->{s1}, exits {e0}->{e1}");
+    drop(go);
+    early.join().unwrap();
+    let (s2, e2) = thread_lifecycle().unwrap();
+    assert!(e2 > e1, "a thread that exited in the window: exits {e1}->{e2}");
+    assert_eq!(s2, s1, "no thread was born in the exit window");
+    let quiet0 = thread_lifecycle().unwrap();
+    spin(20);
+    assert_eq!(thread_lifecycle().unwrap(), quiet0, "thread counts moved with every other thread parked");
+}

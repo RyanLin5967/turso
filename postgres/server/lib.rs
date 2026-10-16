@@ -3411,7 +3411,7 @@ fn int_text(value: i64, buf: &mut [u8; 20]) -> &[u8] {
 }
 
 #[cfg(not(feature = "phase-count"))]
-const WORK_COLUMNS: [&str; 7] = [
+const WORK_COLUMNS: [&str; 9] = [
     "unix_syscalls",
     "instructions",
     "allocations",
@@ -3419,12 +3419,14 @@ const WORK_COLUMNS: [&str; 7] = [
     "confirms_written",
     "thread_allocations",
     "foreign_cpu_ns",
+    "thread_starts",
+    "thread_exits",
 ];
 /// A phase build (feature phase-count, a diagnostic: budget.py work --phases) adds this session
 /// thread's instructions per statement phase (turso_pg::phase::NAMES), so the default build's row
 /// is unchanged.
 #[cfg(feature = "phase-count")]
-const WORK_COLUMNS: [&str; 15] = [
+const WORK_COLUMNS: [&str; 17] = [
     "unix_syscalls",
     "instructions",
     "allocations",
@@ -3432,6 +3434,8 @@ const WORK_COLUMNS: [&str; 15] = [
     "confirms_written",
     "thread_allocations",
     "foreign_cpu_ns",
+    "thread_starts",
+    "thread_exits",
     "phase_session",
     "phase_read",
     "phase_parse",
@@ -3477,6 +3481,15 @@ fn work_row(format: &Format, db: &Database) -> SqlResult<Response> {
         // whose two readings differ had a foreign thread run inside it.
         .and_then(|()| {
             encoder.encode_field(&counters::foreign_thread_cpu_ns().map(|n| n as i64))
+        })
+        // The threads started and exited so far (counters::thread_lifecycle; NULL unless the
+        // binary installed the counter): a window whose readings differ had a thread born or ended
+        // inside it, which the budget refuses (DECISIONS 2923cc91b5 (a)).
+        .and_then(|()| {
+            let lifecycle = counters::thread_lifecycle();
+            encoder
+                .encode_field(&lifecycle.map(|c| c.0 as i64))
+                .and_then(|()| encoder.encode_field(&lifecycle.map(|c| c.1 as i64)))
         });
     #[cfg(feature = "phase-count")]
     let row = row.and_then(|()| {
