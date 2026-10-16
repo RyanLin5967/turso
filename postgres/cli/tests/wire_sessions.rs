@@ -13954,3 +13954,54 @@ fn c54_derived_column_lists_rename_positions() {
     assert_eq!(r.oids, Some(vec![23, 25]));
     assert_eq!(r.rows, vec![vec![Some("1".into()), Some("one".into())]]);
 }
+
+
+// PostgreSQL integer input grammar is recorded in conformance/upstream/int4.out;
+// C50's fresh oracle batch repeats these boundaries before the producer change.
+#[test]
+fn c50_class4_integer_text_input_keeps_radix_and_underscore_ranges() {
+    let dir = Scratch::new("c50-integer-input");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for (sql, expected) in [
+        ("SELECT '0x7FFFFFFF'::int4", "2147483647"),
+        ("SELECT '-0x80000000'::int4", "-2147483648"),
+        ("SELECT '1_000'::int4", "1000"),
+        ("SELECT '0o77_777'::int2", "32767"),
+        ("SELECT '0b0111_1111_1111_1111'::int2", "32767"),
+        ("SELECT '-0x8000000000000000'::int8", "-9223372036854775808"),
+        ("SELECT '0x_7fff'::int2", "32767"),
+    ] {
+        assert_eq!(a.q(sql).single(sql), expected);
+    }
+    for (sql, input, ty) in [
+        ("SELECT '0x8000'::int2", "0x8000", "smallint"),
+        ("SELECT '0x80000000'::int4", "0x80000000", "integer"),
+        ("SELECT '0x8000000000000000'::int8", "0x8000000000000000", "bigint"),
+    ] {
+        let e = a.q(sql).err(sql);
+        assert_eq!(e.code, "22003", "{sql}");
+        assert_eq!(e.message, format!("value \"{input}\" is out of range for type {ty}"), "{sql}");
+    }
+}
+
+// upstream/window.sql explicitly forbids floating inverse transitions because the
+// departing value's subtraction cannot reconstruct contributions lost to rounding.
+#[test]
+fn c50_class4_float_moving_sums_recompute_each_frame() {
+    let dir = Scratch::new("c50-float-window");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for (table, ty, oid) in [("c50_fw4", "real", 700), ("c50_fw8", "double precision", 701)] {
+        a.q(&format!("CREATE TABLE {table}(n integer,v {ty})")).ok("table");
+        for first in ["1e20", "Infinity"] {
+            a.q(&format!("INSERT INTO {table} VALUES(1,'{first}'),(2,1),(3,2)")).ok("values");
+            let sql = format!("SELECT sum(v) OVER(ORDER BY n ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM {table}");
+            let r = a.q(&sql).ok(&sql);
+            let first = if first == "1e20" { "1e+20" } else { first };
+            assert_eq!(r.oids, Some(vec![oid]));
+            assert_eq!(r.rows, vec![vec![Some(first.into())], vec![Some(first.into())], vec![Some("3".into())]]);
+            a.q(&format!("DELETE FROM {table}")).ok("clear values");
+        }
+    }
+}
