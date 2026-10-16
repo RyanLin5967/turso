@@ -13844,7 +13844,12 @@ fn c54_deep_virtual_definition_survives_short_constraint_rebuild() {
             assert_eq!(error.code, "54001", "{stage}: {error:?}");
             eprintln!("C54 deep virtual {stage}: typed 54001");
             completed = false;
-            break;
+            // An accepted CREATE retains its definition even if INSERT reaches
+            // the stack bound; the short ALTER must still exercise that owner.
+            if stage != "insert" {
+                break;
+            }
+            continue;
         }
         eprintln!("C54 deep virtual {stage}: accepted");
     }
