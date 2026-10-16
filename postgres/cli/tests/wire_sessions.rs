@@ -12453,7 +12453,6 @@ replays_postgresql!(
     "pg18-audit2-a_refused_create_table_leaves_no_sequence.out",
     [
         (3, "PGDIV-PARSE-PREFIX error-text [wire]: 42830 both; ours prefixes 'Parse error: '"),
-        (5, "PGDIV-RELATION-EXISTS-CODE error-code [wire]: CREATE TABLE of an existing name: PG 42P07 'relation \"p\" already exists'; ours 42601 'Parse error: table p already exists'"),
     ]
 );
 replays_postgresql!(
