@@ -9291,6 +9291,54 @@ fn a_named_create_allocates_nothing_in_the_name_filter_as_it_grows() {
     assert!(builds > builds0, "premise: the name filter never grew past the table it was built with ({builds0} -> {builds} builds)");
 }
 
+/// Class (e)'s delete site (release_checked: 657 allocations and 4 catalog statements in one hold at
+/// 10^4 and 10^6, raws l104, l103): the delete the audit makes, traced span by span (`held_trace`:
+/// allocations and catalog statements at each point), at 10^4 named branches populated at D0, at
+/// D2. Prints each of 20 deletes' spans.
+#[test]
+#[ignore = "diagnostic: run by name with --ignored --nocapture"]
+fn diag_the_delete_hold_by_span() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("del.db");
+    let incarnation = {
+        let db = open_at(&path, opts(true, SyncClass::Off));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        for i in 0..10_000u32 {
+            trunk.create_branch(&format!("pop-{i:07}")).unwrap();
+        }
+        db.branch_compact_now().unwrap();
+        db.incarnation
+    };
+    let db = reopen(&path, opts(true, SyncClass::FullFsync), incarnation);
+    db.branch_wait_name_filter();
+    let trunk = db.connect().unwrap();
+    for i in 0..20u32 {
+        let name = format!("a-{i:03}");
+        trunk.create_branch(&name).unwrap();
+        let c = db.connect_named(&name).unwrap();
+        c.execute(&format!("UPDATE t SET v = 'a{i}' WHERE id = {}", 1 + i % 50)).unwrap();
+        drop(c);
+        let a0 = super::budget_probe::thread_allocs().2;
+        let s0 = super::budget_probe::thread_cat_stmts();
+        super::store::HELD_TRACE.with(|t| *t.borrow_mut() = Some(Vec::with_capacity(64)));
+        db.drop_branch(&name).unwrap();
+        let trace = super::store::HELD_TRACE.with(|t| t.borrow_mut().take()).unwrap_or_default();
+        let (mut la, mut ls) = (a0, s0);
+        let steps: Vec<String> = trace
+            .iter()
+            .map(|(l, a, st)| {
+                let r = format!("{l}+{}a/{}s", a - la, st - ls);
+                la = *a;
+                ls = *st;
+                r
+            })
+            .collect();
+        println!("FE_DELETE {name}: [{}]", steps.join(" "));
+    }
+}
+
 /// Diagnostic for the 10^6 audit arm's population (it timed out at D0 in 90 min, raw l96): the wall
 /// time of each 20,000 named creates at durability OFF into a catalog store, up to `FE_POP_N`
 /// (default 200,000), so the cost per create and its slope in N are measured, not guessed. Prints.
@@ -9666,7 +9714,7 @@ fn a_steady_create_allocates_at_most_once_under_the_store_mutex() {
         let mut last = before;
         let steps: Vec<String> = trace
             .iter()
-            .map(|(label, n)| {
+            .map(|(label, n, _)| {
                 let d = n - last;
                 last = *n;
                 format!("{label}+{d}")
@@ -9704,7 +9752,7 @@ fn diag_the_create_hold_stall_is_a_checkpoint_start() {
     let db = reopen(&path, opts(true, SyncClass::FullFsync), incarnation);
     db.branch_wait_name_filter();
     let trunk = db.connect().unwrap();
-    let mut worst: (u64, String, Vec<(&'static str, u64)>, u64) = (0, String::new(), Vec::new(), 0);
+    let mut worst: (u64, String, Vec<(&'static str, u64, u64)>, u64) = (0, String::new(), Vec::new(), 0);
     let mut over_64 = 0u32;
     let mut started_in_a_create = 0u32;
     for i in 0..16_384u32 {
@@ -9713,11 +9761,11 @@ fn diag_the_create_hold_stall_is_a_checkpoint_start() {
         super::store::HELD_TRACE.with(|t| *t.borrow_mut() = Some(Vec::with_capacity(64)));
         trunk.create_branch(&name).unwrap();
         let trace = super::store::HELD_TRACE.with(|t| t.borrow_mut().take()).unwrap_or_default();
-        let total = trace.last().map_or(0, |(_, n)| n - before);
+        let total = trace.last().map_or(0, |(_, n, _)| n - before);
         if total > 64 {
             over_64 += 1;
         }
-        if trace.iter().any(|(l, _)| *l == "compact.flight_starting" || l.starts_with("capture.")) {
+        if trace.iter().any(|(l, _, _)| *l == "compact.flight_starting" || l.starts_with("capture.")) {
             started_in_a_create += 1;
         }
         if total > worst.0 {
@@ -9729,7 +9777,7 @@ fn diag_the_create_hold_stall_is_a_checkpoint_start() {
     let mut in_start = 0;
     let steps: Vec<String> = trace
         .iter()
-        .map(|(label, n)| {
+        .map(|(label, n, _)| {
             let d = n - last;
             last = *n;
             if *label == "compact.flight_start_returned" {

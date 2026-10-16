@@ -4394,7 +4394,7 @@ pub(crate) fn fe_mutant(name: &str) -> bool {
 // recording. Observation only.
 #[cfg(test)]
 thread_local! {
-    pub(crate) static HELD_TRACE: std::cell::RefCell<Option<Vec<(&'static str, u64)>>> = const { std::cell::RefCell::new(None) };
+    pub(crate) static HELD_TRACE: std::cell::RefCell<Option<Vec<(&'static str, u64, u64)>>> = const { std::cell::RefCell::new(None) };
 }
 
 #[inline]
@@ -4403,7 +4403,7 @@ fn held_trace(label: &'static str) {
     HELD_TRACE.with(|t| {
         if let Some(v) = t.borrow_mut().as_mut() {
             if v.len() < v.capacity() {
-                v.push((label, super::budget_probe::thread_allocs().2));
+                v.push((label, super::budget_probe::thread_allocs().2, super::budget_probe::thread_cat_stmts()));
             }
         }
     });
@@ -7297,7 +7297,9 @@ impl BranchStore {
         // F-FZ back-pressure: dropped after the guard below.
         let _backpressure = Backpressure(self);
         let mut inner = self.inner.lock();
+        held_trace("release.locked");
         inner.ensure(id)?;
+        held_trace("release.ensured");
         // Released already — by a racing drop of the same name, say — and possibly collected: the
         // Release may still be in the air, so this reports only once everything buffered so far is
         // durable (review B-F2).
@@ -7341,6 +7343,7 @@ impl BranchStore {
             return Err(in_use(id, st.name.as_deref(), op));
         }
         let record = inner.release_record(id);
+        held_trace("release.recorded");
         let (fork_lsn, name) = (st.fork_lsn, st.name.clone());
         // Early release (fastest-engine M1 item 2): buffered and applied under the mutex, durable
         // by `wait_durable` after it; the slots it frees wait for that (rule 2).
@@ -7366,6 +7369,7 @@ impl BranchStore {
                 )));
             }
         };
+        held_trace("release.buffered");
         self.last_release_lsn.fetch_max(lsn, Ordering::AcqRel);
         // Until it is durable, a stopped store must still report the branch (engine review 7 #3).
         inner.releases_in_air.push_back(ReleaseInAir { lsn, id, fork_lsn, name });
@@ -7374,10 +7378,12 @@ impl BranchStore {
             Ok(spliced) => spliced,
             Err(e) => return Err(inner.fatal(e)),
         };
+        held_trace("release.applied");
         let freed_pages = freed.len();
         inner.defer_frees(lsn, freed);
         self.sync_trunk_children(&inner);
         self.sync_lease_flag(&inner);
+        held_trace("release.deferred");
         // Kept for a live child is decided now: the checkpoint `maybe_compact` may run can evict the
         // released state under a resident cap, which would report it as freed (second review).
         let deferred = spliced || inner.branches.contains_key(&id);
@@ -11709,14 +11715,18 @@ impl StoreInner {
             }
             let catalog_mode = self.cat.is_some();
             let catalog = self.cat.as_mut().map(|c| &mut c.catalog);
+            held_trace("collect.released_all");
             let (listed, lo, hi) = self.children.remove(catalog, parent, f, catalog_mode)?;
+            held_trace("collect.children_removed");
             crate::turso_assert!(listed, "detached a child the parent does not list");
             if parent.is_trunk() {
                 // In memory: every version (eager), or those retained since the last checkpoint
                 // (catalog), whose garbage F2's walk finds as before. Catalog stores add the
                 // catalog's garbage, read in place (C-P).
                 self.trunk.lineage.child_gone(f, lo, hi, freed, &mut self.work);
+                held_trace("collect.trunk_gone_mem");
                 self.trunk_catalog_garbage(f, lo, hi, freed)?;
+                held_trace("collect.trunk_gone_catalog");
                 return Ok(false);
             }
             if !self.ensure(parent)? {
