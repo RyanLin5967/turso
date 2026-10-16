@@ -7323,7 +7323,10 @@ fn a_failed_capture_builds_no_row() {
     for _ in 0..20 {
         let _ = trunk.fork_branch().unwrap().into_id();
     }
-    let rows = || super::store::CAPTURE_ROWS_BUILT.with(|c| c.get());
+    // FLAGGED instrument change (L2(d) slice 2): a fuzzy capture builds no row since 94b34fa3b;
+    // its rows are encoded on the writer's thread (`FROZEN_ROWS_WRITTEN`), so both counters are
+    // read: the capture's own (this thread) and the writer's. The claim is unchanged.
+    let rows = || super::store::CAPTURE_ROWS_BUILT.with(|c| c.get()) + super::store::FROZEN_ROWS_WRITTEN.load(std::sync::atomic::Ordering::Relaxed);
     let entered = || super::store::CAPTURE_ENTERED.with(|c| c.get());
     db.branch_failpoint(Some(BranchFailpoint::CaptureFails));
     let (rows0, entered0) = (rows(), entered());

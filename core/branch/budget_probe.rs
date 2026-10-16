@@ -817,6 +817,9 @@ pub(crate) enum Refusal {
 ///   read and whose kernel entry after the kernel's read does the same (source-only).
 /// - Work done by a child process (posix_spawn, vfork) is counted by neither counter: it is
 ///   another task. Mach traps are not BSD syscalls and are counted by neither.
+/// - A thread the span spawned that is BLOCKED at its end is accepted (the open's persistent
+///   threads, parked): work it does after waking is not the span's count, even when the span queued
+///   it. Only a spawned thread still running at the end is refused.
 fn attribute(kernel: u64, t0: &[ThreadCpu], c0: &[u64; 48], t1: &[ThreadCpu], c1: &[u64; 48], ends: Ends, owned: &[&str], window: bool) -> (Option<u64>, u64, Refusal) {
     // Mutants (test builds only), each a rule this replaced or a check it makes:
     // `probe_full_table_trusted` (a table past its room is read as complete),
@@ -834,9 +837,14 @@ fn attribute(kernel: u64, t0: &[ThreadCpu], c0: &[u64; 48], t1: &[ThreadCpu], c1
     if t0.iter().any(|x| x.id != 0 && !present(t1, x.id)) && !mutant("probe_gone_thread_charged") {
         return (None, 0, Refusal::ThreadGone);
     }
+    // A thread new at the end and still RUNNING then: its work goes on past the end, so the span
+    // would miss it. One the span spawned that is blocked at the end (a persistent store thread
+    // parked, the open's confirmation writer) is the span's, and what it does later is a later
+    // span's work.
     let new_at_end = t1.iter().any(|x| x.id != 0 && !present(t0, x.id));
+    let new_running = t1.iter().any(|x| x.id != 0 && !x.waiting && !present(t0, x.id));
     let keep_new = mutant("probe_new_thread_kept");
-    if new_at_end && !keep_new {
+    if new_running && !keep_new {
         return (None, 0, Refusal::ThreadNew);
     }
     let foreign = foreign_threads(t0, t1, owned, !window);
@@ -1293,10 +1301,12 @@ pub(crate) struct ThreadCpu {
     pub(crate) cpu_ns: u64,
     pub(crate) me: bool,
     pub(crate) name: [u8; 32],
+    /// The kernel's `TH_STATE_WAITING` for it when read (blocked: parked, sleeping, or in a wait).
+    pub(crate) waiting: bool,
 }
 
 impl ThreadCpu {
-    pub(crate) const EMPTY: ThreadCpu = ThreadCpu { id: 0, cpu_ns: 0, me: false, name: [0; 32] };
+    pub(crate) const EMPTY: ThreadCpu = ThreadCpu { id: 0, cpu_ns: 0, me: false, name: [0; 32], waiting: false };
 
     pub(crate) fn name(&self) -> String {
         let end = self.name.iter().position(|b| *b == 0).unwrap_or(self.name.len());
@@ -1353,6 +1363,7 @@ pub(crate) fn thread_table(out: &mut [ThreadCpu]) -> Option<usize> {
                     cpu_ns: if kr == 0 { ext.pth_user_time + ext.pth_system_time } else { 0 },
                     me: port == me,
                     name,
+                    waiting: kr == 0 && ext.pth_run_state == libc::TH_STATE_WAITING as i32,
                 };
             }
             // SAFETY: as `each_thread`.

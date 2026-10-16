@@ -1854,8 +1854,10 @@ fn run_instruments(cell: &str) -> String {
                         // SAFETY: as above.
                         unsafe { libc::close(-1) };
                     }
+                    // Still RUNNING at the window's end (a spin, no call): a spawned thread blocked
+                    // at the end is the window's (`probe::attribute`).
                     while !r2.load(Acquire) {
-                        std::thread::park_timeout(std::time::Duration::from_millis(1));
+                        std::hint::spin_loop();
                     }
                     for _ in 0..10 {
                         // SAFETY: as above.

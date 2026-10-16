@@ -3774,6 +3774,8 @@ fn run_flight(
                 }
             }
         }
+        #[cfg(test)]
+        FROZEN_ROWS_WRITTEN.fetch_add(rows.len() as u64, Ordering::Relaxed);
         cap.rows = rows;
     }
     ckpt_phase("rows");
@@ -4181,6 +4183,12 @@ thread_local! {
     /// Engine review 8 #2: catalog rows captures on this thread built.
     pub(crate) static CAPTURE_ROWS_BUILT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
+
+/// Test builds: catalog rows fuzzy checkpoints' writers took from the copy-on-write (L2(d): a fuzzy
+/// capture builds none, `BranchTable::freeze`; its rows are encoded on the writer's thread and by
+/// the table, so they are counted here, by any thread).
+#[cfg(test)]
+pub(crate) static FROZEN_ROWS_WRITTEN: AtomicU64 = AtomicU64::new(0);
 
 /// r13-compose's registered mutants (PREREG §5, A6): `R13_MUTANT` names one deliberate defect, so
 /// each red test can be shown to fail on its mutant from the same test binary. Unset, every mutant is
