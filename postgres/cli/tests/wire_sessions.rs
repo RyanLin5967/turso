@@ -13719,3 +13719,30 @@ fn c52_view_of_integer_constant_retains_its_type() {
     assert_eq!(reply.oids, Some(vec![23]));
     assert_eq!(reply.rows, vec![vec![Some("1".into())]]);
 }
+
+
+#[test]
+fn c54_derived_column_lists_rename_positions() {
+    let dir = Scratch::new("c54-derived-alias");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for (sql, rows) in [
+        ("SELECT n,x FROM(VALUES(1,10),(2,20))t(n,x) ORDER BY n", vec![vec!["1", "10"], vec!["2", "20"]]),
+        ("SELECT a,b FROM(SELECT 1 AS x,2 AS x)t(a,b)", vec![vec!["1", "2"]]),
+        ("SELECT n,column2 FROM(VALUES(1,10))t(n)", vec![vec!["1", "10"]]),
+        ("SELECT a,b FROM(SELECT 1,2 UNION ALL SELECT 3,4)t(a,b) ORDER BY a", vec![vec!["1", "2"], vec!["3", "4"]]),
+        ("SELECT a,b FROM(SELECT 1 AS x,2 AS y ORDER BY x)t(a,b)", vec![vec!["1", "2"]]),
+    ] {
+        let r = a.q(sql).ok(sql);
+        assert_eq!(r.oids, Some(vec![23, 23]), "{sql}");
+        let expected: Vec<Vec<Option<String>>> = rows.into_iter()
+            .map(|row| row.into_iter().map(|value| Some(value.into())).collect()).collect();
+        assert_eq!(r.rows, expected, "{sql}");
+    }
+    let sql = "SELECT * FROM(VALUES(1))t(a,b)";
+    assert_eq!(a.q(sql).err(sql).code, "42P10");
+    a.q("CREATE TABLE t(id INT,v TEXT); INSERT INTO t VALUES(1,'one')").ok("star fixture");
+    let r = a.q("SELECT a,b FROM(SELECT * FROM t)t2(a,b)").ok("star aliases");
+    assert_eq!(r.oids, Some(vec![23, 25]));
+    assert_eq!(r.rows, vec![vec![Some("1".into()), Some("one".into())]]);
+}
