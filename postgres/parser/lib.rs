@@ -27,8 +27,8 @@ pub enum ParseError {
 /// The bound is the text's length, which needs no work: a statement it fits in the stack the
 /// thread has left runs there, and one it gives at most `PG_QUERY_SCAN_ABOVE` runs on a segment of
 /// that size, as before. A longer statement is scanned (libpg_query's scanner does not recurse) and
-/// bounded by its nesting: the deepest run of open brackets plus every token that is no bracket,
-/// comma, name or constant, since a name or a constant is a leaf and a list is walked in a loop.
+/// bounded by its nesting ([`nesting_bound`]): a name or a constant is a leaf, and a list is walked
+/// in a loop.
 /// So a long flat statement (a bulk `INSERT ... VALUES`) runs on the thread's own stack, where
 /// sizing from its length took a segment of up to 256 MiB on every call.
 fn pg_query_stack(sql: &str) -> Result<usize, ParseError> {
@@ -51,23 +51,36 @@ fn stack_for_levels(levels: usize) -> usize {
 }
 
 /// See [`pg_query_stack`]; `None` where the text does not scan (the parser then refuses it).
+///
+/// The bound follows one path down the tree: the elements of a list (split by commas, and by AND
+/// and OR, whose chains PostgreSQL's grammar flattens into one list) are siblings and do not add
+/// up, while every bracket opens a level and every other token that is no name or constant counts
+/// one within its element. Two levels are added for a mix of AND and OR, which precedence nests
+/// at most that deep without brackets.
 fn nesting_bound(sql: &str) -> Option<usize> {
     use pg_query::protobuf::Token;
     count_libpg_query_call();
     let scanned = pg_query::scan(sql).ok()?;
-    let (mut open, mut deepest, mut levels) = (0usize, 0usize, 0usize);
+    let mut enclosing: Vec<usize> = Vec::new();
+    let (mut element, mut above, mut deepest) = (0usize, 0usize, 0usize);
+    let mut previous: Option<Token> = None;
     let mut tokens = scanned.tokens.iter().map(|t| Token::try_from(t.token).ok()).peekable();
     while let Some(token) = tokens.next() {
         match token {
             Some(Token::Ascii40 | Token::Ascii91) => {
-                open += 1;
-                deepest = deepest.max(open);
+                enclosing.push(element);
+                above += element + 1;
+                element = 0;
             }
-            Some(Token::Ascii41 | Token::Ascii93) => open = open.saturating_sub(1),
+            Some(Token::Ascii41 | Token::Ascii93) => {
+                if let Some(outer) = enclosing.pop() {
+                    above -= outer + 1;
+                    element = outer;
+                }
+            }
+            Some(Token::Ascii44 | Token::Ascii59 | Token::And | Token::Or) => element = 0,
             Some(
-                Token::Ascii44
-                | Token::Ascii59
-                | Token::Ident
+                Token::Ident
                 | Token::Uident
                 | Token::Iconst
                 | Token::Fconst
@@ -83,12 +96,41 @@ fn nesting_bound(sql: &str) -> Option<usize> {
                 | Token::SqlComment
                 | Token::CComment,
             ) => {}
-            // A minus sign before a number is folded into the constant (the grammar's doNegate).
-            Some(Token::Ascii45) if matches!(tokens.peek(), Some(Some(Token::Iconst | Token::Fconst))) => {}
-            _ => levels += 1,
+            // A sign before a number is folded into the constant (the grammar's doNegate); a minus
+            // after an operand is a subtraction, a level like any operator.
+            Some(Token::Ascii45)
+                if !previous.is_some_and(is_operand)
+                    && matches!(tokens.peek(), Some(Some(Token::Iconst | Token::Fconst))) => {}
+            _ => element += 1,
+        }
+        deepest = deepest.max(above + element);
+        if !matches!(token, Some(Token::SqlComment | Token::CComment)) {
+            previous = token;
         }
     }
-    Some(deepest + levels)
+    Some(deepest + 2)
+}
+
+/// A token that ends an operand, so a minus after it subtracts.
+fn is_operand(token: pg_query::protobuf::Token) -> bool {
+    use pg_query::protobuf::Token;
+    matches!(
+        token,
+        Token::Ascii41
+            | Token::Ascii93
+            | Token::Ident
+            | Token::Uident
+            | Token::Iconst
+            | Token::Fconst
+            | Token::Sconst
+            | Token::Usconst
+            | Token::Bconst
+            | Token::Xconst
+            | Token::Param
+            | Token::NullP
+            | Token::TrueP
+            | Token::FalseP
+    )
 }
 
 /// The stack one level of `nesting_bound` may take in libpg_query's recursion: over twice the most
@@ -607,6 +649,8 @@ mod tests {
             ("CTE chain", format!("WITH c0 AS (SELECT 1 AS x){ctes} SELECT x FROM c{}", depth.saturating_sub(1))),
             ("NOTs", format!("SELECT {}true", "NOT ".repeat(depth))),
             ("minus signs", format!("SELECT {}x", "- ".repeat(depth))),
+            ("subtractions", format!("SELECT {}", chain("1", "-"))),
+            ("subtracted negatives", format!("SELECT {}", chain("-1", "-"))),
             ("casts", format!("SELECT 1{}", "::int".repeat(depth))),
             ("arrays", format!("SELECT {}", wrap("1", &|s| format!("ARRAY[{s}]")))),
             ("IS NULL", format!("SELECT x{}", " IS NULL".repeat(depth))),
@@ -686,18 +730,23 @@ mod tests {
     }
 
     /// A long flat statement is bounded by its nesting, not its length: a bulk INSERT of about
-    /// 300 KB needs no more than the base on the thread's own stack, where sizing it from its
-    /// length took a 256 MiB segment on every call.
+    /// 300 KB, 40,000 rows with a cast each, and 20,000 ORed comparisons each need no more than the
+    /// base and a few levels, on the thread's own stack, where sizing them from their length took a
+    /// 256 MiB segment on every call, and adding every counted token up refused them.
     #[test]
     fn a_long_flat_statement_runs_on_the_threads_own_stack() {
         std::thread::Builder::new()
             .stack_size(8 << 20)
             .spawn(|| {
-                let (_, sql) = nesting_shapes(2500).pop().expect("the bulk INSERT");
-                assert!(sql.len() > 300_000, "premise: a statement of {} B", sql.len());
-                let needs = pg_query_stack(&sql).unwrap();
-                assert!(needs <= stack_for_levels(64), "a {} B flat statement needs {needs} B", sql.len());
-                assert!(parse(&sql).is_ok(), "the bulk INSERT did not parse");
+                let (_, bulk) = nesting_shapes(2500).pop().expect("the bulk INSERT");
+                assert!(bulk.len() > 300_000, "premise: a statement of {} B", bulk.len());
+                let casts = (0..40_000).map(|i| format!("({i}::int, -{i})")).collect::<Vec<_>>().join(", ");
+                let ors = (1..=20_000).map(|i| format!("id = ${i} + 1")).collect::<Vec<_>>().join(" OR ");
+                for sql in [bulk, format!("INSERT INTO t VALUES {casts}"), format!("SELECT 1 FROM t WHERE {ors}")] {
+                    let needs = pg_query_stack(&sql).unwrap();
+                    assert!(needs <= stack_for_levels(64), "a {} B flat statement needs {needs} B", sql.len());
+                    assert!(parse(&sql).is_ok(), "a {} B flat statement did not parse", sql.len());
+                }
             })
             .unwrap()
             .join()

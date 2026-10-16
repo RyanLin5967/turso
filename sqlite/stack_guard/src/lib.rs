@@ -155,11 +155,20 @@ pub fn stack_size() -> Option<usize> {
 }
 
 /// The stack a checked step must find left on this thread: [`STACK_MARGIN`], or a quarter of a
-/// smaller thread's whole stack ([`UNKNOWN_STACK`] where the platform does not say), never less
-/// than [`LEVEL_COST`].
+/// smaller thread's whole stack ([`UNKNOWN_STACK`] where the stack is estimated), never less than
+/// [`LEVEL_COST`].
 pub fn margin() -> usize {
-    let size = if forced_unknown() { None } else { stack_size() };
-    STACK_MARGIN.min(size.unwrap_or(UNKNOWN_STACK) / 4).max(LEVEL_COST)
+    let size = match stack_size() {
+        Some(size) if !forced_unknown() => Some(size),
+        _ if estimated() => Some(UNKNOWN_STACK),
+        _ => None,
+    };
+    size.map_or(STACK_MARGIN, |size| STACK_MARGIN.min(size / 4).max(LEVEL_COST))
+}
+
+/// Whether `remaining_stack` estimates on this thread: neither pthread nor `stacker` reports it.
+fn estimated() -> bool {
+    forced_unknown() || (stack_size().is_none() && stacker::remaining_stack().is_none())
 }
 
 /// One recursive step (an expression or a SELECT parsed, a view expanded, a subquery planned,
@@ -174,7 +183,9 @@ impl NestGuard {
     pub fn enter() -> Result<Self, StackDepthExceeded> {
         let depth = DEPTH.with(|d| d.get());
         let checked = depth > 0 || EXECUTING.with(|e| e.get()) > 0;
-        if checked && remaining_stack() < margin() {
+        // Read on every step, the outermost too: an estimated stack counts from the highest one.
+        let left = remaining_stack();
+        if checked && left < margin() {
             return Err(StackDepthExceeded);
         }
         #[cfg(any(test, feature = "test-hooks"))]
