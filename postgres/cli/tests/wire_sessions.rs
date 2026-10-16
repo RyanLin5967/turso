@@ -12519,7 +12519,6 @@ replays_postgresql!(
     "pg18-audit2-char_n_is_blank_padded_as_in_postgres.out",
     [
         (5, "PGDIV-EXPR-TYPE-TEXT value [wire]: length(char(n)) typed 25 text in RowDescription; PG 23 int4 (value 3 agrees)"),
-        (6, "PGDIV-CHAR-OVERFLOW-CODE error-code [wire]: char(6) overflow: PG 22001 'value too long for type character(6)'; ours XX000 'value too long for type character'"),
     ]
 );
 replays_postgresql!(

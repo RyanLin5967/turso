@@ -256,7 +256,7 @@ impl Dialect for PostgresDialect {
 /// literal longer than n raises 'value too long' where PostgreSQL answers false.
 const BPCHAR_TYPE_SQL: &str = "CREATE TYPE bpchar(value text, maxlen integer) BASE text \
     ENCODE CASE WHEN length(rtrim(value, ' ')) <= maxlen THEN rtrim(value, ' ') \
-    ELSE RAISE(ABORT, 'value too long for type character') END DECODE value \
+    ELSE RAISE(ABORT, __turso_bpchar_truncation(maxlen)) END DECODE value \
     OPERATOR '=' bpchareq OPERATOR '<' bpcharlt";
 
 fn register_bpchar(schema: &mut Schema) -> Result<()> {

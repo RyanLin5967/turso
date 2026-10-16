@@ -28,6 +28,7 @@ pub(crate) fn resolve_scalar(name: &str, arg_count: usize) -> bool {
         "to_char" | "pg_input_is_valid" | "booleq" | "boolne" | "col_description" | "bpchareq"
         | "encode" | "bpcharlt" => &[2],
         "version" | "current_database" | "current_schema" | "pg_backend_pid" => &[0],
+        "__turso_bpchar_truncation" => &[1],
         "make_date" => &[3],
         "make_timestamp" => &[6],
         _ => return false,
@@ -47,6 +48,17 @@ pub(crate) fn exec_scalar(conn: &Connection, name: &str, args: &[Value]) -> Resu
         // PostgreSQL refuses a date past the range (22008) where the SQLite dialect answers NULL.
         "make_date" => turso_core::make_date_or_refuse(args),
         "make_timestamp" => turso_core::make_timestamp_or_refuse(args),
+        // This is evaluated only by bpchar's RAISE message. The RAISE compiler still skips
+        // it in a type-encoding catch region, preserving the existing seek-key behavior.
+        "__turso_bpchar_truncation" => Err(LimboError::Raise(
+            turso_parser::ast::ResolveType::Abort,
+            SqlErrorMessage::classified(
+                SqlErrorKind::StringDataRightTruncation,
+                "value too long for type character",
+            ).with_protocol_text(format!(
+                "value too long for type character({})", int_arg(0, 1)
+            )),
+        )),
         "pg_get_userbyid" => Ok(exec_pg_get_user_by_id(int_arg(0, 0))),
         "pg_table_is_visible" | "pg_function_is_visible" | "pg_type_is_visible" => {
             Ok(exec_pg_is_visible(int_arg(0, 0)))
