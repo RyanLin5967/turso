@@ -35,6 +35,9 @@ use crate::{LimboError, Numeric, Result, Value};
 
 #[macro_use]
 mod metadata;
+mod pg;
+use pg::*;
+pub(crate) use pg::{emit_pg_column_coercions, pg_numeric_type};
 
 mod affinity;
 mod arrays;

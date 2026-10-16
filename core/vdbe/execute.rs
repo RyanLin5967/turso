@@ -439,6 +439,20 @@ pub fn op_init(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_pg_numeric(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(PgNumeric { op, ty, lhs, rhs, dest }, insn);
+    let value = crate::numeric::pg::execute(*op, *ty,
+        state.registers[*lhs].get_value(), rhs.map(|reg| state.registers[reg].get_value()))?;
+    state.registers[*dest].set_value(value);
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_add(
     _program: &Program,
     state: &mut ProgramState,

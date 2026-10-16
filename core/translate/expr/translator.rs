@@ -182,6 +182,11 @@ pub fn translate_expr(
         return Ok(target_register);
     }
 
+    if translate_pg_numeric(program, referenced_tables, expr, target_register, resolver)? {
+        if let Some(span) = constant_span { program.constant_span_end(span); }
+        return Ok(target_register);
+    }
+
     match expr {
         ast::Expr::SubqueryResult {
             lhs,

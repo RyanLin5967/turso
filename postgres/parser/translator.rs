@@ -3449,7 +3449,11 @@ impl PostgreSQLTranslator {
                     if let (Some(pg_query::protobuf::a_const::Val::Sval(text)), Some(float)) =
                         (c.val.as_ref(), float_type_name(t))
                     {
-                        return float_literal(&text.sval, float);
+                        float_literal(&text.sval, float)?;
+                        return Ok(ast::Expr::Cast {
+                            expr: Box::new(self.translate_expr(arg)?),
+                            type_name: pg_type_name_to_ast_type(t),
+                        });
                     }
                 }
                 // `type $n` is libpg_query's extension of PostgreSQL 17's grammar, a cast with no
@@ -4460,8 +4464,11 @@ impl PostgreSQLTranslator {
 
         // PG type-cast functions: float8(x) → CAST(x AS REAL), int4(x) → CAST(x AS INTEGER), etc.
         let cast_type = match func_name.to_uppercase().as_str() {
-            "FLOAT8" | "FLOAT4" => Some("REAL"),
-            "INT4" | "INT2" | "INT8" => Some("INTEGER"),
+            "FLOAT8" => Some("FLOAT8"),
+            "FLOAT4" => Some("FLOAT4"),
+            "INT4" => Some("INTEGER"),
+            "INT2" => Some("smallint"),
+            "INT8" => Some("bigint"),
             "BOOL" => Some("BOOLEAN"),
             "TEXT" => Some("TEXT"),
             _ => None,
@@ -5852,11 +5859,13 @@ fn pg_type_name_to_ast_type(type_name: &pg_query::protobuf::TypeName) -> Option<
     let pg_type = parts.join(" ");
 
     let name = match pg_type.to_uppercase().as_str() {
-        "INTEGER" | "INT" | "INT4" | "SMALLINT" | "INT2" | "BIGINT" | "INT8" | "SERIAL"
-        | "BIGSERIAL" | "SMALLSERIAL" | "OID" | "REGCLASS" | "REGTYPE" => "INTEGER",
-        "REAL" | "FLOAT4" | "DOUBLE PRECISION" | "FLOAT8" | "NUMERIC" | "DECIMAL" | "MONEY" => {
-            "REAL"
-        }
+        "INTEGER" | "INT" | "INT4" | "SERIAL" | "OID" | "REGCLASS" | "REGTYPE" => "INTEGER",
+        "SMALLINT" | "INT2" | "SMALLSERIAL" => "smallint",
+        "BIGINT" | "INT8" | "BIGSERIAL" => "bigint",
+        "REAL" | "FLOAT4" => "FLOAT4",
+        "DOUBLE PRECISION" | "FLOAT8" => "FLOAT8",
+        "NUMERIC" | "DECIMAL" => "numeric",
+        "MONEY" => "REAL",
         // For CAST expressions, map all text-like PG types to TEXT and
         // boolean to INTEGER for SQLite VDBE compatibility
         "BOOLEAN" | "BOOL" => "INTEGER",

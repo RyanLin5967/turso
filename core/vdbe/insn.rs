@@ -426,6 +426,13 @@ pub enum Insn {
         rhs: usize,
         dest: usize,
     },
+    PgNumeric {
+        op: crate::numeric::pg::PgNumericOp,
+        ty: crate::numeric::pg::PgNumericType,
+        lhs: usize,
+        rhs: Option<usize>,
+        dest: usize,
+    },
     /// Subtract rhs from lhs and store in dest
     Subtract {
         lhs: usize,
@@ -2174,6 +2181,7 @@ impl InsnVariants {
             InsnVariants::BeginSubrtn => execute::op_null,
             InsnVariants::NullRow => execute::op_null_row,
             InsnVariants::Add => execute::op_add,
+            InsnVariants::PgNumeric => execute::op_pg_numeric,
             InsnVariants::Subtract => execute::op_subtract,
             InsnVariants::Multiply => execute::op_multiply,
             InsnVariants::Divide => execute::op_divide,

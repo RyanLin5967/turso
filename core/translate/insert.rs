@@ -642,6 +642,8 @@ pub fn translate_insert(
 
     program.preassign_label_to_next_insn(ctx.key_labels.key_ready_for_check);
 
+    crate::translate::expr::emit_pg_column_coercions(program, resolver, ctx.table.columns(),
+        insertion.first_col_register(), None, &ColumnLayout::from_columns(ctx.table.columns())?);
     if ctx.table.is_strict {
         // Pre-encode TypeCheck: validate input types match the custom type's
         // declared value type BEFORE encoding. This catches type mismatches

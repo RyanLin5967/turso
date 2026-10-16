@@ -322,7 +322,12 @@ fn format_numeric(bd: &BigDecimal) -> String {
 /// numeric(p, s)), `to_blob` and `format`. The expected values of its tests are PG 18.6's (artie
 /// raws pg18-numeric-*.txt).
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct PgNumeric(BigDecimal);
+pub enum PgNumeric {
+    NegInfinity,
+    Finite(BigDecimal),
+    Infinity,
+    NaN,
+}
 
 /// PostgreSQL's display-scale cap on a product (numeric.c `mul_var`'s rscale is at most
 /// NUMERIC_DSCALE_MAX).
@@ -338,9 +343,9 @@ impl PgNumeric {
         }
         let (int, scale) = v.as_bigint_and_exponent();
         if int.sign() == Sign::NoSign && scale < 0 && !crate::branch::store::fe_mutant("numeric_zero_unbounded") {
-            return Ok(Self(BigDecimal::new(BigInt::from(0), 0)));
+            return Ok(Self::Finite(BigDecimal::new(BigInt::from(0), 0)));
         }
-        Ok(Self(v))
+        Ok(Self::Finite(v))
     }
 
     /// Numeric input text, or `None` for text that is not a number (the caller words the refusal).
@@ -352,6 +357,12 @@ impl PgNumeric {
         use std::str::FromStr;
         const PG_MAX_EXPONENT: i128 = (i32::MAX / 2) as i128;
         let trimmed = text.trim();
+        match trimmed.to_ascii_lowercase().as_str() {
+            "nan" => return Some(Ok(Self::NaN)),
+            "inf" | "+inf" | "infinity" | "+infinity" => return Some(Ok(Self::Infinity)),
+            "-inf" | "-infinity" => return Some(Ok(Self::NegInfinity)),
+            _ => {}
+        }
         if let Some(at) = trimmed.find(['e', 'E']) {
             let (mantissa, exp) = (&trimmed[..at], &trimmed[at + 1..]);
             let digits = exp.strip_prefix(['+', '-']).unwrap_or(exp);
@@ -367,44 +378,71 @@ impl PgNumeric {
     }
 
     pub fn from_i64(i: i64) -> Self {
-        Self(BigDecimal::from(i))
+        Self::Finite(BigDecimal::from(i))
     }
 
     /// A stored value, refused if its blob holds one outside the range.
     pub fn from_blob(blob: &[u8]) -> crate::Result<Self> {
-        Self::new(blob_to_bigdecimal(blob)?)
+        match blob {
+            [2, 0] => Ok(Self::NegInfinity),
+            [2, 1] => Ok(Self::Infinity),
+            [2, 2] => Ok(Self::NaN),
+            _ => Self::new(blob_to_bigdecimal(blob)?),
+        }
     }
 
     pub fn to_blob(&self) -> ValueBlob {
-        bigdecimal_to_blob(&self.0)
+        match self {
+            Self::Finite(v) => bigdecimal_to_blob(v),
+            Self::NegInfinity => [2, 0].as_slice().into(),
+            Self::Infinity => [2, 1].as_slice().into(),
+            Self::NaN => [2, 2].as_slice().into(),
+        }
     }
 
     pub fn format(&self) -> String {
-        format_numeric(&self.0)
+        match self {
+            Self::Finite(v) => format_numeric(v),
+            Self::NegInfinity => "-Infinity".into(),
+            Self::Infinity => "Infinity".into(),
+            Self::NaN => "NaN".into(),
+        }
     }
 
     pub fn is_zero(&self) -> bool {
-        self.0.as_bigint_and_exponent().0.sign() == Sign::NoSign
+        matches!(self, Self::Finite(v) if v.as_bigint_and_exponent().0.sign() == Sign::NoSign)
     }
 
     /// The display scale: the scale, at least 0.
     fn dscale(&self) -> i64 {
-        self.0.as_bigint_and_exponent().1.max(0)
+        match self { Self::Finite(v) => v.as_bigint_and_exponent().1.max(0), _ => 0 }
     }
 
     pub fn add(&self, other: &Self) -> crate::Result<Self> {
-        Self::new(&self.0 + &other.0)
+        match (self, other) {
+            (Self::Finite(a), Self::Finite(b)) => Self::new(a + b),
+            (Self::NaN, _) | (_, Self::NaN)
+            | (Self::Infinity, Self::NegInfinity) | (Self::NegInfinity, Self::Infinity) => Ok(Self::NaN),
+            (Self::Infinity, _) | (_, Self::Infinity) => Ok(Self::Infinity),
+            (Self::NegInfinity, _) | (_, Self::NegInfinity) => Ok(Self::NegInfinity),
+        }
     }
 
     pub fn sub(&self, other: &Self) -> crate::Result<Self> {
-        Self::new(&self.0 - &other.0)
+        self.add(&other.negate())
     }
 
     /// PostgreSQL's product: at the sum of the display scales, at most 16383, rounded half away from
     /// zero (a rescale up only appends zeros). Mutant `mul_scale_bigdecimal` (test builds only):
     /// bigdecimal's own product; `product_scale_uncapped`: the sum not capped.
     pub fn mul(&self, other: &Self) -> crate::Result<Self> {
-        let product = &self.0 * &other.0;
+        let (Self::Finite(a), Self::Finite(b)) = (self, other) else {
+            if matches!(self, Self::NaN) || matches!(other, Self::NaN) || self.is_zero() || other.is_zero() {
+                return Ok(Self::NaN);
+            }
+            return Ok(if self.is_negative() == other.is_negative() { Self::Infinity } else { Self::NegInfinity });
+        };
+        let product = a * b;
         if crate::branch::store::fe_mutant("mul_scale_bigdecimal") {
             return Self::new(product);
         }
@@ -418,10 +456,46 @@ impl PgNumeric {
     /// PostgreSQL's quotient (`pg_numeric_div`); `other` must not be zero. Mutant
     /// `div_scale_bigdecimal` (test builds only): bigdecimal's own quotient.
     pub fn div(&self, other: &Self) -> crate::Result<Self> {
-        if crate::branch::store::fe_mutant("div_scale_bigdecimal") {
-            return Self::new(&self.0 / &other.0);
+        if matches!(self, Self::NaN) || matches!(other, Self::NaN) {
+            return Ok(Self::NaN);
         }
-        Self::new(pg_numeric_div(&self.0, &other.0)?)
+        if other.is_zero() {
+            return Err(LimboError::InvalidArgument(SqlErrorMessage::classified(SqlErrorKind::DivisionByZero, "division by zero")));
+        }
+        match (self, other) {
+            (Self::Finite(a), Self::Finite(b)) => {
+                if crate::branch::store::fe_mutant("div_scale_bigdecimal") { Self::new(a / b) }
+                else { Self::new(pg_numeric_div(a, b)?) }
+            }
+            (Self::Finite(_), _) => Ok(Self::from_i64(0)),
+            (_, Self::Finite(_)) => Ok(if self.is_negative() == other.is_negative() { Self::Infinity } else { Self::NegInfinity }),
+            _ => Ok(Self::NaN),
+        }
+    }
+
+    pub fn negate(&self) -> Self {
+        match self {
+            Self::Finite(value) => Self::Finite(-value),
+            Self::Infinity => Self::NegInfinity,
+            Self::NegInfinity => Self::Infinity,
+            Self::NaN => Self::NaN,
+        }
+    }
+
+    pub fn is_negative(&self) -> bool {
+        match self {
+            Self::Finite(value) => value.as_bigint_and_exponent().0.sign() == Sign::Minus,
+            Self::NegInfinity => true,
+            _ => false,
+        }
+    }
+
+    pub fn rounded_i64(&self) -> Option<i64> {
+        use bigdecimal::ToPrimitive;
+        match self {
+            Self::Finite(value) => value.with_scale_round(0, bigdecimal::RoundingMode::HalfUp).to_i64(),
+            _ => None,
+        }
     }
 
     /// This value in `typmod` (numeric.c `apply_typmod`): rounded half away from zero to its scale,
@@ -431,10 +505,14 @@ impl PgNumeric {
     /// bigdecimal's `with_scale` did before.
     pub fn with_typmod(&self, typmod: NumericTypmod) -> crate::Result<Self> {
         let NumericTypmod { precision, scale } = typmod;
+        let Self::Finite(value) = self else {
+            return if matches!(self, Self::NaN) { Ok(Self::NaN) }
+            else { Err(LimboError::InvalidArgument(SqlErrorMessage::classified(SqlErrorKind::NumericValueOutOfRange, "numeric field overflow"))) };
+        };
         let rounded = if crate::branch::store::fe_mutant("typmod_truncates") {
-            self.0.with_scale(scale)
+            value.with_scale(scale)
         } else {
-            self.0.with_scale_round(scale, bigdecimal::RoundingMode::HalfUp)
+            value.with_scale_round(scale, bigdecimal::RoundingMode::HalfUp)
         };
         if !self.is_zero() {
             let (bigint, _) = rounded.as_bigint_and_exponent();
@@ -495,7 +573,10 @@ impl NumericTypmod {
 #[cfg(test)]
 fn validate_precision_scale(val: &BigDecimal, precision: i64, scale: i64) -> crate::Result<BigDecimal> {
     let typmod = NumericTypmod::new(precision, scale)?;
-    Ok(PgNumeric::new(val.clone())?.with_typmod(typmod)?.0)
+    match PgNumeric::new(val.clone())?.with_typmod(typmod)? {
+        PgNumeric::Finite(value) => Ok(value),
+        _ => unreachable!("finite typmod input stays finite"),
+    }
 }
 
 #[cfg(test)]

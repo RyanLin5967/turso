@@ -2413,6 +2413,10 @@ pub fn insn_to_row(
                 0,
                 format!("r[{}] = data", *dest),
             ),
+            Insn::PgNumeric { op, ty, lhs, rhs, dest } => (
+                "PgNumeric", *lhs as i64, rhs.unwrap_or(0) as i64, *dest as i64,
+                Value::build_text(""), 0, format!("{op:?} {ty:?}"),
+            ),
             Insn::Cast { reg, affinity } => (
                 "Cast",
                 *reg as i64,

@@ -1733,6 +1733,8 @@ fn emit_update_insns<'a>(
                 .map(|set_clause| set_clause.column_index)
                 .try_collect()?;
 
+            crate::translate::expr::emit_pg_column_coercions(program, &t_ctx.resolver, btree_table.columns(),
+                start, Some(&set_col_indices), &layout);
             // Pre-encode TypeCheck: validate SET column input types.
             // Non-SET columns hold encoded values from disk, so skip them (ANY).
             program.emit_insn(Insn::TypeCheck {

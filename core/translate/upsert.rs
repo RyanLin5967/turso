@@ -741,6 +741,8 @@ pub fn emit_upsert(
 
     if let Some(bt) = table.btree() {
         if bt.is_strict {
+            crate::translate::expr::emit_pg_column_coercions(program, resolver, bt.columns(), new_start,
+                None, &layout);
             // Pre-encode TypeCheck: all columns are decoded (user-facing) at this point.
             program.emit_insn(Insn::TypeCheck {
                 start_reg: new_start,
