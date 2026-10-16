@@ -2719,6 +2719,7 @@ fn has_generate_series(parse: &turso_pg_parser::pg_query::ParseResult) -> bool {
             if matches!(call.funcname.last().and_then(|name| name.node.as_ref()),
                 Some(Node::String(name)) if name.sval == "generate_series"))
     })
+}
 
 /// Whether the statement holds an INSERT with no column list whose VALUES lists hold DEFAULT.
 fn is_positional_insert_default(sql: &str, parse: &turso_pg_parser::pg_query::ParseResult) -> bool {
