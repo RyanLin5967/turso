@@ -398,6 +398,12 @@ pub(crate) struct Group {
     /// `GroupState::durable`, readable without the group's lock (lead review 1 item 10): written
     /// under it, after the state, by `set_durable`.
     durable_now: [AtomicU64; 3],
+    /// Callers inside `wait_durable_on` now (waiting for a flight, or leading one): while any is,
+    /// the group is not idle, and the confirmation writer writes no word (the registered red
+    /// the_confirmation_writer_under_load: at 64 clients a leader waiting for the store mutex left
+    /// no flight in the air for 5 ms in the middle of a burst, and the writer took that for the idle
+    /// tail, 4, 4 and 5 words in 3 runs, raw l94). Counted without the group's lock.
+    awaiting: AtomicU64,
     /// The store's fail-stop flag, shared with its journal (`StoreInner::fail_stop`).
     failed: Arc<AtomicBool>,
     /// The confirmation last WRITTEN (`Confirm::key`, 0 for none; raised by `fetch_max`, as keys
@@ -640,6 +646,7 @@ impl Group {
             cv: std::sync::Condvar::new(),
             confirm_cv: std::sync::Condvar::new(),
             durable_now: [AtomicU64::new(durable), AtomicU64::new(durable), AtomicU64::new(durable)],
+            awaiting: AtomicU64::new(0),
             failed,
             confirm_done: AtomicU64::new(0),
             confirms_written: AtomicU64::new(0),
@@ -1187,8 +1194,17 @@ fn run_confirm_writer(group: Arc<Group>, store: Arc<StoreMutex>) {
             }
             continue;
         }
-        if idle < confirm_quiet() || g.flushing || g.cutting {
-            let wait = confirm_quiet().saturating_sub(idle).max(Duration::from_micros(100));
+        // Mutant `confirm_ignores_waiters` (test builds only): a caller waiting for durability or
+        // leading a flight does not keep the group busy, as before (`Group::awaiting`).
+        let awaited = group.awaiting.load(Ordering::Acquire) > 0 && !fe_mutant("confirm_ignores_waiters");
+        if idle < confirm_quiet() || g.flushing || g.cutting || awaited {
+            // A caller still awaiting durability: one more quiet period, not a poll (its flight's
+            // landing wakes the writer sooner).
+            let wait = if awaited {
+                confirm_quiet()
+            } else {
+                confirm_quiet().saturating_sub(idle).max(Duration::from_micros(100))
+            };
             #[cfg(test)]
             group.confirm_wait_entered(&mut g, CONFIRM_PARK_QUIET);
             g = group.confirm_cv.wait_timeout(g, wait).unwrap_or_else(|e| e.into_inner()).0;
@@ -5310,6 +5326,15 @@ impl BranchStore {
         if lsn == 0 || fe_mutant("ack_before_pwrite") {
             return Ok(());
         }
+        // Counted in `Group::awaiting` until it returns, on every path.
+        struct Awaiting<'a>(&'a Group);
+        impl Drop for Awaiting<'_> {
+            fn drop(&mut self) {
+                self.0.awaiting.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        group.awaiting.fetch_add(1, Ordering::AcqRel);
+        let _awaiting = Awaiting(group);
         let need = class_index(class);
         let mut first = true;
         // Whether the flight this would lead syncs, so must not be taken while a checkpoint syncs

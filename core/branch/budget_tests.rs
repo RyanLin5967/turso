@@ -2347,7 +2347,9 @@ fn budget_child() {
         let mut built = build(&spec, n, large, named);
         // Review 2 L7: the shared-flight cells read no held-syscall count, so they run unarmed (two
         // Mach traps per hold inside the measured mutex otherwise).
-        probe::arm(!spec.starts_with("shared_"));
+        // `FE_BUDGET_UNARMED` (diagnostic): any cell unarmed, to tell the probe's own per-hold reads
+        // from the code's cost.
+        probe::arm(!spec.starts_with("shared_") && std::env::var_os("FE_BUDGET_UNARMED").is_none());
         let opens = if spec.starts_with("n") { 5 } else { 1 };
         if spec.starts_with("mem_") {
             memory(&spec, &mut built, &mut text);
