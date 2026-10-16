@@ -590,6 +590,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn c50_sqlite_division_by_zero_stays_null() {
+        let db = Database::open_file(
+            Arc::new(MemoryIO::new()),
+            ":memory:",
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+        for sql in ["SELECT 1/0", "SELECT 1.0/0.0"] {
+            let rows = conn.prepare(sql).unwrap().run_collect_rows().unwrap();
+            assert_eq!(rows[0][0], crate::Value::Null, "{sql}");
+        }
+    }
+
     /// Verify that REGEXP produces the correct error when no regexp function is registered.
     #[test]
     fn test_regexp_no_function_registered() {
