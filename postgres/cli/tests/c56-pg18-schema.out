@@ -1,0 +1,121 @@
+>> Q CREATE SCHEMA public
+   E S=ERROR C=42P06 M=schema "public" already exists
+   Z I
+>> Q CREATE VIEW c56_v AS SELECT 1 AS n
+   C CREATE VIEW
+   Z I
+>> Q DROP SCHEMA public RESTRICT
+   E S=ERROR C=2BP01 M=cannot drop schema public because other objects depend on it
+   Z I
+>> Q SELECT n FROM c56_v
+   T oids=[23] names=['n']
+   D ['1']
+   C SELECT 1
+   Z I
+>> Q DROP SCHEMA public CASCADE
+   N S=NOTICE C=00000 M=drop cascades to view c56_v
+   C DROP SCHEMA
+   Z I
+>> Q SELECT count(*) FROM pg_namespace WHERE nspname = 'public'
+   T oids=[20] names=['count']
+   D ['0']
+   C SELECT 1
+   Z I
+>> Q CREATE TABLE public.c56_t(n int)
+   E S=ERROR C=3F000 M=schema "public" does not exist
+   Z I
+>> Q CREATE TABLE c56_t(n int)
+   E S=ERROR C=3F000 M=no schema has been selected to create in
+   Z I
+>> Q CREATE VIEW public.c56_v AS SELECT 1 AS n
+   E S=ERROR C=3F000 M=schema "public" does not exist
+   Z I
+>> Q DROP SCHEMA public
+   E S=ERROR C=3F000 M=schema "public" does not exist
+   Z I
+>> Q CREATE SCHEMA public
+   C CREATE SCHEMA
+   Z I
+>> Q CREATE TABLE c56_t(n int)
+   C CREATE TABLE
+   Z I
+>> Q CREATE VIEW c56_v AS SELECT n FROM c56_t
+   C CREATE VIEW
+   Z I
+>> Q DROP SCHEMA public CASCADE
+   N S=NOTICE C=00000 M=drop cascades to 2 other objects
+   C DROP SCHEMA
+   Z I
+>> Q CREATE SCHEMA public
+   C CREATE SCHEMA
+   Z I
+>> Q SELECT count(*) FROM pg_class WHERE relname IN ('c56_t', 'c56_v')
+   T oids=[20] names=['count']
+   D ['0']
+   C SELECT 1
+   Z I
+>> Q BEGIN
+   C BEGIN
+   Z T
+>> Q DROP SCHEMA public
+   C DROP SCHEMA
+   Z T
+>> Q ROLLBACK
+   C ROLLBACK
+   Z I
+>> Q CREATE SCHEMA public
+   E S=ERROR C=42P06 M=schema "public" already exists
+   Z I
+>> Q DROP SCHEMA public
+   C DROP SCHEMA
+   Z I
+>> Q BEGIN
+   C BEGIN
+   Z T
+>> Q CREATE SCHEMA public
+   C CREATE SCHEMA
+   Z T
+>> Q ROLLBACK
+   C ROLLBACK
+   Z I
+>> Q CREATE TABLE public.c56_t(n int)
+   E S=ERROR C=3F000 M=schema "public" does not exist
+   Z I
+>> Q CREATE SCHEMA public
+   C CREATE SCHEMA
+   Z I
+>> Q CREATE TABLE c56_missing.t(n int)
+   E S=ERROR C=3F000 M=schema "c56_missing" does not exist
+   Z I
+>> Q CREATE VIEW c56_missing.v AS SELECT 1 AS n
+   E S=ERROR C=3F000 M=schema "c56_missing" does not exist
+   Z I
+>> Q SELECT * FROM c56_missing.t
+   E S=ERROR C=42P01 M=relation "c56_missing.t" does not exist
+   Z I
+>> Q INSERT INTO c56_missing.t VALUES (1)
+   E S=ERROR C=42P01 M=relation "c56_missing.t" does not exist
+   Z I
+>> Q UPDATE c56_missing.t SET n = 1
+   E S=ERROR C=42P01 M=relation "c56_missing.t" does not exist
+   Z I
+>> Q DELETE FROM c56_missing.t
+   E S=ERROR C=42P01 M=relation "c56_missing.t" does not exist
+   Z I
+>> Q CREATE INDEX c56_i ON c56_missing.t(n)
+   E S=ERROR C=3F000 M=schema "c56_missing" does not exist
+   Z I
+>> Q CREATE SCHEMA IF NOT EXISTS public
+   N S=NOTICE C=42P06 M=schema "public" already exists, skipping
+   C CREATE SCHEMA
+   Z I
+>> Q DROP SCHEMA public
+   C DROP SCHEMA
+   Z I
+>> Q DROP SCHEMA IF EXISTS public
+   N S=NOTICE C=00000 M=schema "public" does not exist, skipping
+   C DROP SCHEMA
+   Z I
+>> Q CREATE SCHEMA public
+   C CREATE SCHEMA
+   Z I
