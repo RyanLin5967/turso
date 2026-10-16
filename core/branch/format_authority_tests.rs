@@ -620,3 +620,172 @@ fn a_spliced_child_deleted_before_a_checkpoint_leaves_no_splice_record() {
     db.branches.l4_facts_check_for_test().unwrap_or_else(|e| panic!("{e}"));
     let _ = p.into_id();
 }
+
+// ---- links adversary L4 (ruled a FIX, class f398de1ff0: mutex work growing with N): the upgrade's
+// fill runs in bounded batches with the store mutex free between them; the meta row flips in the
+// checkpoint transaction that commits the last of it ----
+
+/// The child of `the_first_checkpoint_of_an_18_store_holds_the_store_mutex_for_no_o_n_upgrade_work`:
+/// an 18 store of `FE_FA_HOLD_N` branches made by the older build, then this build's first
+/// checkpoint, with the largest single store-mutex hold measured around it (any thread).
+#[test]
+fn fa_upgrade_hold_child() {
+    let (Ok(dir), Ok(n)) = (std::env::var("FE_FA_HOLD_DIR"), std::env::var("FE_FA_HOLD_N")) else {
+        return;
+    };
+    let n: usize = n.parse().unwrap();
+    let path = std::path::Path::new(&dir).join("h.db");
+    stand_in(Some(18));
+    {
+        let db = open_arm(&path, SyncClass::Off, 18).unwrap();
+        let trunk = db.connect().unwrap();
+        trunk.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+        for _ in 0..n {
+            let _ = trunk.fork_branch().unwrap().into_id();
+        }
+        db.branch_compact_now().unwrap();
+        assert_eq!(catalog_version(&db), Some(18), "premise: an 18 catalog");
+    }
+    stand_in(None);
+    let db = open_arm(&path, SyncClass::Off, 18).unwrap();
+    db.branch_wait_name_filter();
+    let _ = super::budget_probe::take_hold_maxima();
+    db.branch_compact_now().unwrap();
+    db.branch_checkpoint_wait();
+    let m = super::budget_probe::take_hold_maxima();
+    println!("FA-HOLD n={n} rows={} bytes={} format={:?}", m.all.1, m.all.0, catalog_version(&db));
+}
+
+fn upgrade_hold(n: usize) -> (u64, u64, String) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["branch::format_authority_tests::fa_upgrade_hold_child", "--exact", "--test-threads=1", "--nocapture"])
+        .env("FE_FA_HOLD_DIR", dir.path())
+        .env("FE_FA_HOLD_N", n.to_string())
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(out.status.success(), "the hold child at {n} failed:\n{text}{}", String::from_utf8_lossy(&out.stderr));
+    let line = text.lines().find(|l| l.starts_with("FA-HOLD ")).unwrap_or_else(|| panic!("no reading at {n}:\n{text}"));
+    let field = |k: &str| line.split_whitespace().find_map(|w| w.strip_prefix(k)).unwrap().to_string();
+    (field("rows=").parse().unwrap(), field("bytes=").parse().unwrap(), field("format="))
+}
+
+/// L4: the first checkpoint of an 18 store (the splice arm, whose checkpoints are sharp) upgrades
+/// it, and no single store-mutex hold does work that grows with the store: the largest hold
+/// touches as many catalog rows at 10^4 branches as at 10^3 (+ 256), where one transaction filling
+/// every row's links under the mutex touched about five per branch. 10^3, not 10, as the smaller
+/// cell: a bounded batch is not smaller than a store of 10.
+#[test]
+fn the_first_checkpoint_of_an_18_store_holds_the_store_mutex_for_no_o_n_upgrade_work() {
+    if std::env::var_os("FE_FA_HOLD_N").is_some() {
+        return;
+    }
+    let (ra, ba, fa) = upgrade_hold(1_000);
+    let (rb, bb, fb) = upgrade_hold(10_000);
+    println!("L4 upgrade hold: 10^3 rows {ra} bytes {ba}; 10^4 rows {rb} bytes {bb}");
+    assert_eq!((fa.as_str(), fb.as_str()), ("Some(22)", "Some(22)"), "premise: the checkpoint upgraded both stores");
+    assert!(
+        rb <= ra + 256,
+        "the first checkpoint's largest store-mutex hold touches {ra} catalog rows at 10^3 branches and {rb} at 10^4: upgrade work under the mutex grows with N"
+    );
+}
+
+/// The child of the upgrade kill tests: this build opens the older store at `FE_FA_KILL_DIR` and
+/// checkpoints it, killed by the parent's FE_KILL_AT.
+#[test]
+fn fa_upgrade_kill_child() {
+    let (Ok(dir), Ok(version)) = (std::env::var("FE_FA_KILL_DIR"), std::env::var("FE_FA_VERSION")) else {
+        return;
+    };
+    let version: u32 = version.parse().unwrap();
+    let db = open_arm(&std::path::Path::new(&dir).join("k.db"), SyncClass::Fsync, version).unwrap();
+    db.branch_wait_name_filter();
+    db.branch_compact_now().unwrap();
+    db.branch_checkpoint_wait();
+    std::process::exit(3);
+}
+
+/// An older store of 200 branches (several upgrade batches), this build's first checkpoint killed at
+/// `point`: the store is still `version` (meta row and log), the older build still opens it, and
+/// this build then finishes the upgrade, every branch kept and every link true.
+#[cfg(unix)]
+fn a_killed_upgrade_leaves_an_older_store(version: u32, point: &str) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("k.db");
+    stand_in(Some(version));
+    let ids: Vec<BranchId> = {
+        let db = open_arm(&path, SyncClass::Fsync, version).unwrap();
+        let trunk = db.connect().unwrap();
+        trunk.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+        let ids: Vec<BranchId> = (0..200).map(|_| trunk.fork_branch().unwrap().into_id()).collect();
+        db.branch_compact_now().unwrap();
+        db.branch_checkpoint_wait();
+        assert_eq!(catalog_version(&db), Some(version), "premise: a {version} catalog");
+        ids
+    };
+    stand_in(None);
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["branch::format_authority_tests::fa_upgrade_kill_child", "--exact", "--test-threads=1", "--nocapture"])
+        .env("FE_FA_KILL_DIR", dir.path())
+        .env("FE_FA_VERSION", version.to_string())
+        .env("FE_KILL_AT", point)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), None, "premise: this build's upgrade was killed at {point} ({status:?})");
+    let img = dir.path().join("img.db");
+    image(&path, &img);
+    {
+        let db = open_arm(&path, SyncClass::Fsync, version).unwrap();
+        db.branch_wait_name_filter();
+        assert_eq!(catalog_version(&db), Some(version), "{version} {point}: the kill left the catalog at another version");
+        assert_eq!(log_version(&path), version, "{version} {point}: the kill left the log at another version");
+        assert_eq!(db.branches.links_known_and_catalog_format_for_test().0, 0, "{version} {point}: links of an unfinished upgrade were read");
+    }
+    stand_in(Some(version));
+    let older = open_arm(&img, SyncClass::Fsync, version).map(|db| {
+        for &id in &ids {
+            let _ = db.branch(id).unwrap_or_else(|e| panic!("{version} {point}: the older build lost branch {}: {e}", id.0)).into_id();
+        }
+    });
+    stand_in(None);
+    older.unwrap_or_else(|e| panic!("{version} {point}: the older build no longer opens the store: {e}"));
+    {
+        let db = open_arm(&path, SyncClass::Fsync, version).unwrap();
+        db.branch_wait_name_filter();
+        db.branch_compact_now().unwrap();
+        db.branch_checkpoint_wait();
+        assert_eq!(catalog_version(&db), Some(current_of(version)), "{version} {point}: the upgrade was not finished");
+    }
+    let db = open_arm(&path, SyncClass::Fsync, version).unwrap();
+    for &id in &ids {
+        let _ = db.branch(id).unwrap_or_else(|e| panic!("{version} {point}: branch {} lost: {e}", id.0)).into_id();
+    }
+    db.branches.l4_facts_check_for_test().unwrap_or_else(|e| panic!("{version} {point}: {e}"));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_kill_between_upgrade_batches_leaves_an_18_store_that_finishes_later() {
+    a_killed_upgrade_leaves_an_older_store(18, "ckpt.upgrade.batch:2");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_kill_between_upgrade_batches_leaves_a_17_store_that_finishes_later() {
+    a_killed_upgrade_leaves_an_older_store(17, "ckpt.upgrade.batch:2");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_kill_at_the_upgrade_flip_leaves_an_18_store_that_finishes_later() {
+    a_killed_upgrade_leaves_an_older_store(18, "ckpt.upgrade.flip:1");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_kill_at_the_upgrade_flip_leaves_a_17_store_that_finishes_later() {
+    a_killed_upgrade_leaves_an_older_store(17, "ckpt.upgrade.flip:1");
+}
