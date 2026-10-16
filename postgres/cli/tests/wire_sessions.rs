@@ -2885,6 +2885,42 @@ fn an_unqualified_relation_is_resolved_as_the_engine_resolves_it() {
     );
 }
 
+/// A foreign key in a schema other than public is refused (0A000), and no table is made: the key
+/// checks read public's catalog alone, so `CREATE TABLE s.c(x INT REFERENCES s.p(id))` was refused
+/// 42P01 with no public p, refused 42830 naming "<unknown>" with a public p but no public c (and
+/// the table rolled back), or committed with its key checked against public's p and never against
+/// s.p, every later INSERT then failing "foreign key mismatch" (wire review 16 item 11; DECISIONS:
+/// a schema is branched or refused). As ALTER TABLE ADD CONSTRAINT refuses outside public. Schema
+/// s is made by the non-server CLI before the server starts.
+#[test]
+fn a_foreign_key_outside_public_is_refused() {
+    let dir = Scratch::new("schemakeys");
+    let mut cli = Command::new(env!("CARGO_BIN_EXE_tursopg"))
+        .arg(dir.db())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the CLI");
+    cli.stdin
+        .take()
+        .unwrap()
+        .write_all(b"CREATE SCHEMA s;\nCREATE TABLE s.p(id INT PRIMARY KEY);\n")
+        .unwrap();
+    assert!(
+        cli.wait().unwrap().success(),
+        "premise: the CLI made the schema"
+    );
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let sql = "CREATE TABLE s.c(x INT REFERENCES s.p(id))";
+    assert_eq!(a.q(sql).err(sql).code, "0A000", "no public p");
+    a.q("CREATE TABLE p(id INT PRIMARY KEY)").ok("a public p");
+    assert_eq!(a.q(sql).err(sql).code, "0A000", "with a public p");
+    let r = a.q("SELECT count(*) FROM s.c");
+    assert!(r.error.is_some(), "s.c was made: {:?}", r.rows);
+}
+
 /// An explicit `public.` names public's relation whatever the search path, as in PostgreSQL. With
 /// public.t(c int) and s.t(c text) under `SET search_path TO s, public`, a literal INSERT, an UPDATE,
 /// a DELETE and an INSERT of an undeclared '007' (typed int4 from public.t, stored 7) all reach
