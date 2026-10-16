@@ -521,7 +521,7 @@ impl PgNumeric {
                 return Err(LimboError::Constraint(SqlErrorMessage::classified(SqlErrorKind::NumericValueOutOfRange, format!(
                     "numeric field overflow: a field with precision {precision}, scale {scale} must round to an absolute value less than 10^{}",
                     precision - scale
-                ))));
+                )).with_protocol_text("numeric field overflow")));
             }
         }
         Self::new(rounded)

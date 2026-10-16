@@ -613,6 +613,15 @@ pub fn translate_expr(
                             target_register,
                             resolver,
                         )?;
+                        if resolver.dialect.name() == "postgres" && pg_type_name(&tn.name, resolver) == Some(crate::numeric::pg::PgNumericType::Numeric) {
+                            for td in resolved.chain.iter().rev() {
+                                if td.is_builtin && td.name.eq_ignore_ascii_case("numeric") {
+                                    if let Some(decode_expr) = td.decode() {
+                                        emit_type_expr(program, decode_expr, target_register, target_register, &cast_col, td, resolver)?;
+                                    }
+                                }
+                            }
+                        }
                         return Ok(target_register);
                     }
 

@@ -5844,6 +5844,8 @@ fn float_literal(text: &str, type_name: &str) -> Result<ast::Expr, ParseError> {
     let unsigned = lower.trim_start_matches(['+', '-']);
     let negative = lower.starts_with('-');
     let literal = |s: String| Ok(ast::Expr::Literal(ast::Literal::Numeric(s)));
+    let diagnostic = |kind, message: String| ParseError::ParseError(
+        SqlErrorMessage::classified(kind, message.clone()).with_protocol_text(message));
     if (unsigned == "inf" || unsigned == "infinity") && lower.len() - unsigned.len() <= 1 {
         return literal(if negative { "-9e999" } else { "9e999" }.to_string());
     }
@@ -5853,10 +5855,10 @@ fn float_literal(text: &str, type_name: &str) -> Result<ast::Expr, ParseError> {
         ));
     }
     let invalid = || {
-        ParseError::ParseError(SqlErrorMessage::classified(
+        diagnostic(
             SqlErrorKind::InvalidTextRepresentation,
             format!("invalid input syntax for type {type_name}: \"{text}\""),
-        ))
+        )
     };
     // Rust's parser takes the infinity and NaN words too, which are handled above, and nothing
     // PostgreSQL refuses but those.
@@ -5870,9 +5872,9 @@ fn float_literal(text: &str, type_name: &str) -> Result<ast::Expr, ParseError> {
         v
     };
     if in_type.is_infinite() {
-        return Err(ParseError::ParseError(SqlErrorMessage::classified(SqlErrorKind::NumericValueOutOfRange, format!(
+        return Err(diagnostic(SqlErrorKind::NumericValueOutOfRange, format!(
             "\"{text}\" is out of range for type {type_name}"
-        ))));
+        )));
     }
     literal(format!("{v:e}"))
 }

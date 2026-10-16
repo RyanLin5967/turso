@@ -293,68 +293,6 @@ pub(crate) fn prepare_pg_result_coercions(plan: &mut Plan, resolver: &Resolver) 
     let sources = (0..count)
         .map(|i| pg_plan_column_type(plan, i, resolver))
         .collect::<Result<Vec<_>>>()?;
-    // Materialize the common source type before UNION sorting/deduplication and before
-    // assignment. Otherwise numeric 0.5 in a float8 UNION would round as numeric (1)
-    // instead of as the UNION's float8 (0).
-    fn normalize(
-        select: &mut crate::translate::plan::SelectPlan,
-        sources: &[PgNumericType],
-        resolver: &Resolver,
-    ) -> Result<()> {
-        fn cast(
-            expr: &mut Expr,
-            target: PgNumericType,
-            tables: &TableReferences,
-            resolver: &Resolver,
-        ) -> Result<()> {
-            if target != PgNumericType::Dynamic
-                && pg_numeric_type(expr, Some(tables), resolver)? != target
-            {
-                let old = std::mem::replace(expr, Expr::Literal(ast::Literal::Null));
-                *expr = Expr::Cast {
-                    expr: Box::new(old),
-                    type_name: Some(ast::Type {
-                        name: target.name().into(),
-                        size: None,
-                        array_dimensions: 0,
-                    }),
-                };
-            }
-            Ok(())
-        }
-        for (column, source) in select.result_columns.iter_mut().zip(sources) {
-            cast(
-                &mut column.expr,
-                *source,
-                &select.table_references,
-                resolver,
-            )?;
-        }
-        for row in &mut select.values {
-            for (expr, source) in row.iter_mut().zip(sources) {
-                cast(expr, *source, &select.table_references, resolver)?;
-            }
-        }
-        if let QueryDestination::CoroutineYield { pg_coercions, .. } = &mut select.query_destination
-        {
-            for (coercion, source) in pg_coercions.iter_mut().zip(sources) {
-                coercion.source = *source;
-            }
-        }
-        Ok(())
-    }
-    match plan {
-        Plan::CompoundSelect {
-            left, right_most, ..
-        } => {
-            for (select, _) in left {
-                normalize(select, &sources, resolver)?;
-            }
-            normalize(right_most, &sources, resolver)?;
-        }
-        Plan::Select(select) if select.values.len() > 1 => normalize(select, &sources, resolver)?,
-        _ => {}
-    }
     if let Some(QueryDestination::CoroutineYield { pg_coercions, .. }) =
         plan.select_query_destination_mut()
     {
@@ -363,6 +301,94 @@ pub(crate) fn prepare_pg_result_coercions(plan: &mut Plan, resolver: &Resolver) 
         }
     }
     Ok(())
+}
+
+// Materialize the common source type before UNION sorting/deduplication and before
+// assignment. Otherwise numeric 0.5 in a float8 UNION would round as numeric (1)
+// instead of as the UNION's float8 (0).
+fn normalize_pg_select(
+    select: &mut crate::translate::plan::SelectPlan,
+    sources: &[PgNumericType],
+    resolver: &Resolver,
+) -> Result<()> {
+    fn cast(
+        expr: &mut Expr,
+        target: PgNumericType,
+        tables: &TableReferences,
+        resolver: &Resolver,
+    ) -> Result<()> {
+        if target != PgNumericType::Dynamic
+            && pg_numeric_type(expr, Some(tables), resolver)? != target
+        {
+            let old = std::mem::replace(expr, Expr::Literal(ast::Literal::Null));
+            *expr = Expr::Cast {
+                expr: Box::new(old),
+                type_name: Some(ast::Type {
+                    name: target.name().into(),
+                    size: None,
+                    array_dimensions: 0,
+                }),
+            };
+        }
+        Ok(())
+    }
+    for (column, source) in select.result_columns.iter_mut().zip(sources) {
+        cast(
+            &mut column.expr,
+            *source,
+            &select.table_references,
+            resolver,
+        )?;
+    }
+    for row in &mut select.values {
+        for (expr, source) in row.iter_mut().zip(sources) {
+            cast(expr, *source, &select.table_references, resolver)?;
+        }
+    }
+    if let QueryDestination::CoroutineYield { pg_coercions, .. } = &mut select.query_destination {
+        for (coercion, source) in pg_coercions.iter_mut().zip(sources) {
+            coercion.source = *source;
+        }
+    }
+    Ok(())
+}
+
+/// Coerce every compound arm at planning time, including FROM and CTE subqueries.
+pub(crate) fn prepare_pg_compound_source_types(plan: &mut Plan, resolver: &Resolver) -> Result<()> {
+    if resolver.dialect.name() != "postgres" {
+        return Ok(());
+    }
+    let sources = (0..plan.select_result_columns().len())
+        .map(|i| pg_plan_column_type(plan, i, resolver))
+        .collect::<Result<Vec<_>>>()?;
+    if let Plan::CompoundSelect {
+        left, right_most, ..
+    } = plan
+    {
+        for (select, _) in left {
+            normalize_pg_select(select, &sources, resolver)?;
+        }
+        normalize_pg_select(right_most, &sources, resolver)?;
+    }
+    Ok(())
+}
+
+/// INSERT VALUES has a target context per cell. A VALUES relation instead has a common
+/// source type per column, just as each arm of a compound SELECT does.
+pub(crate) fn prepare_pg_values_source_types(
+    plan: &mut crate::translate::plan::SelectPlan,
+    resolver: &Resolver,
+) -> Result<()> {
+    if resolver.dialect.name() != "postgres"
+        || matches!(&plan.query_destination,
+        QueryDestination::CoroutineYield { pg_coercions, .. } if !pg_coercions.is_empty())
+    {
+        return Ok(());
+    }
+    let sources = (0..plan.result_columns.len())
+        .map(|i| pg_select_column_type(plan, i, resolver))
+        .collect::<Result<Vec<_>>>()?;
+    normalize_pg_select(plan, &sources, resolver)
 }
 
 pub(crate) fn emit_pg_result_coercions(

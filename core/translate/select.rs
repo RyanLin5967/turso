@@ -274,13 +274,15 @@ pub(crate) fn prepare_select_plan_from_arms(
         .collect();
     let order_by = resolve_compound_order_by(&order_by, &all_plans, resolver)?;
 
-    Ok(Plan::CompoundSelect {
+    let mut plan = Plan::CompoundSelect {
         left,
         right_most: Box::new(last),
         limit,
         offset,
         order_by,
-    })
+    };
+    super::expr::prepare_pg_compound_source_types(&mut plan, resolver)?;
+    Ok(plan)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -927,7 +929,7 @@ fn prepare_one_select_plan(
                 connection,
             )?;
 
-            let plan = SelectPlan {
+            let mut plan = SelectPlan {
                 join_order: vec![],
                 table_references,
                 result_columns,
@@ -953,6 +955,7 @@ fn prepare_one_select_plan(
                 phantom_params: vec![],
             };
 
+            super::expr::prepare_pg_values_source_types(&mut plan, resolver)?;
             validate_expr_correct_column_counts(&plan)?;
 
             Ok(plan)

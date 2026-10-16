@@ -37,7 +37,7 @@ use crate::{LimboError, Numeric, Result, Value};
 mod metadata;
 mod pg;
 use pg::*;
-pub(crate) use pg::{emit_pg_assignment_expr, record_pg_column_type, emit_pg_assignment, emit_pg_column_coercions, emit_pg_result_coercions, emit_pg_values_coercions, pg_insert_coercions, pg_numeric_type, prepare_pg_result_coercions, PgCoercion};
+pub(crate) use pg::{emit_pg_assignment_expr, record_pg_column_type, emit_pg_assignment, emit_pg_column_coercions, emit_pg_result_coercions, emit_pg_values_coercions, pg_insert_coercions, pg_numeric_type, prepare_pg_result_coercions, prepare_pg_compound_source_types, prepare_pg_values_source_types, PgCoercion};
 
 mod affinity;
 mod arrays;
