@@ -1,0 +1,16 @@
+{
+  "postgres": "18.6",
+  "oracle_bundle_sha256": "fa6aeee4e5f93019afdb31e2c3b03ca623985e661c58008718c24357fc1221be",
+  "files": [
+    {
+      "path": "postgres/cli/tests/pg18/c52-scalar-children.sql",
+      "source": "/private/tmp/codex-20261015/C52-scalar-red/pg-scalar-children.sql",
+      "sha256": "e6dc43412b55a951277d603799bd4ac26f0f2a1686d8cc2ad74e596b71feed50"
+    },
+    {
+      "path": "postgres/cli/tests/pg18/c52-scalar-children.txt",
+      "source": "/private/tmp/codex-20261015/C52-scalar-red/pg-scalar-children.out",
+      "sha256": "024db7094e0d93460b5fb8316416886c209feca50338e020b07d077021e9eab0"
+    }
+  ]
+}

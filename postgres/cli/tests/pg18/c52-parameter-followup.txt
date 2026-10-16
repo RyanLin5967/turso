@@ -1,0 +1,48 @@
+\set VERBOSITY verbose
+SELECT version();
+                                                            version                                                            
+-------------------------------------------------------------------------------------------------------------------------------
+ PostgreSQL 18.6 (Homebrew) on aarch64-apple-darwin25.6.0, compiled by Apple clang version 21.0.0 (clang-2100.1.1.101), 64-bit
+(1 row)
+
+PREPARE c52_target AS SELECT $1 WHERE $1=1;
+psql:/private/tmp/codex-20261015/C50-pg-followup.sql:3: ERROR:  42P08: inconsistent types deduced for parameter $1
+LINE 1: PREPARE c52_target AS SELECT $1 WHERE $1=1;
+                                     ^
+DETAIL:  integer versus text
+LOCATION:  variable_coerce_param_hook, parse_param.c:227
+PREPARE c52_abs AS SELECT $1 WHERE $1=abs($2);
+psql:/private/tmp/codex-20261015/C50-pg-followup.sql:4: ERROR:  42P08: inconsistent types deduced for parameter $1
+LINE 1: PREPARE c52_abs AS SELECT $1 WHERE $1=abs($2);
+                                  ^
+DETAIL:  double precision versus text
+LOCATION:  variable_coerce_param_hook, parse_param.c:227
+PREPARE c52_abs_only AS SELECT abs($1);
+PREPARE
+PREPARE c52_eq AS SELECT $1=$2;
+PREPARE
+SELECT name,parameter_types FROM pg_prepared_statements ORDER BY name;
+     name     |   parameter_types    
+--------------+----------------------
+ c52_abs_only | {"double precision"}
+ c52_eq       | {text,text}
+(2 rows)
+
+SELECT 16777217 - 16777216::float4;
+ ?column? 
+----------
+        1
+(1 row)
+
+SELECT 1e100::numeric * 0::float4;
+ ?column? 
+----------
+        0
+(1 row)
+
+SELECT '1e-100'::numeric * 'Infinity'::float4;
+ ?column? 
+----------
+ Infinity
+(1 row)
+

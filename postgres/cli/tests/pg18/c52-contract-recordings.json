@@ -1,0 +1,47 @@
+{
+  "source_bundle_sha256": "6b79f6b292c2333d2afab6d69fd40c38323206538a43990ff42209b8e72cd75f",
+  "canonical_artie_commit": "b5359d5e26",
+  "recording": "PostgreSQL 18.6 independent C50-contract-red3 oracle; bytes preserved",
+  "files": [
+    {
+      "path": "postgres/cli/tests/pg18/c52-view-lifecycle.sql",
+      "source_path": "/private/tmp/codex-20261015/C50-contract-red3/C52-pg-view-lifecycle.sql",
+      "sha256": "40f0a7c92a8d3b097815f7a61e8de7d42c2a674aebe9da16af743115722bc6f7"
+    },
+    {
+      "path": "postgres/cli/tests/pg18/c52-view-lifecycle.txt",
+      "source_path": "/private/tmp/codex-20261015/C50-contract-red3/C52-pg-view-lifecycle.out",
+      "sha256": "e639912e51babdbf4dffb2a1f742943319d40d99c7bb2370142b4872e9b243bd"
+    },
+    {
+      "path": "postgres/cli/tests/pg18/c52-view-aliases.sql",
+      "source_path": "/private/tmp/codex-20261015/C50-contract-red3/C52-pg-view-aliases.sql",
+      "sha256": "6f3d379f679c229c38d94cfb35bd92f6adc889d0abaf724927cb9223ad9aea38"
+    },
+    {
+      "path": "postgres/cli/tests/pg18/c52-view-aliases.txt",
+      "source_path": "/private/tmp/codex-20261015/C50-contract-red3/C52-pg-view-aliases.out",
+      "sha256": "82162f459fcec9f5500e1f5514b6c5333785ec5fe158d75c326b357e3db0428b"
+    },
+    {
+      "path": "postgres/cli/tests/pg18/c52-view-contracts.sql",
+      "source_path": "/private/tmp/codex-20261015/C50-contract-red3/C52-pg-view-contracts.sql",
+      "sha256": "3fd6fb078ea7ae14ad3475425c2137a7b62ff9e34d2e4fdc454d4a8c2bf2e710"
+    },
+    {
+      "path": "postgres/cli/tests/pg18/c52-view-contracts.txt",
+      "source_path": "/private/tmp/codex-20261015/C50-contract-red3/C52-pg-view-contracts.out",
+      "sha256": "54523974abd5ccd305b66b694dfa30c6f87f7b57bef459d30e9f8aab9dbb38a9"
+    },
+    {
+      "path": "postgres/cli/tests/pg18/c52-contract-context.sql",
+      "source_path": "/private/tmp/codex-20261015/C50-contract-red3/C50-pg-float-types2.sql",
+      "sha256": "1d1dc74c9c27bb48f1eee13f8e5c2e82f98a8a68656f1c93bb79dfa726550524"
+    },
+    {
+      "path": "postgres/cli/tests/pg18/c52-contract-context.txt",
+      "source_path": "/private/tmp/codex-20261015/C50-contract-red3/C50-pg-float-types2.out",
+      "sha256": "424d8a6d9aa67d9f42fb5d2e2828ccce8a5b77ff4d918aacfa566801aa140d66"
+    }
+  ]
+}

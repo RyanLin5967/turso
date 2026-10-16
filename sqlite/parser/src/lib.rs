@@ -2,6 +2,7 @@ pub mod ast;
 pub mod error;
 pub mod lexer;
 pub mod parser;
+pub mod pg_types;
 pub mod sql_error;
 pub mod token;
 

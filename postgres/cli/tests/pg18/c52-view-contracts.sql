@@ -1,0 +1,23 @@
+\set VERBOSITY verbose
+SELECT version();
+CREATE TABLE c52_contract_t(a integer,b integer);
+INSERT INTO c52_contract_t VALUES(1,2);
+CREATE VIEW c52_contract_partial AS SELECT q.b FROM c52_contract_t AS q(x);
+CREATE VIEW c52_contract_nested AS SELECT s.b FROM (SELECT b::int4 FROM c52_contract_t) s;
+CREATE VIEW c52_contract_coalesce AS SELECT COALESCE(TRUE,FALSE);
+CREATE VIEW c52_contract_nested_name AS SELECT d.coalesce AS flag FROM (SELECT COALESCE(TRUE,FALSE)) d;
+SELECT b,pg_typeof(b) FROM c52_contract_partial;
+SELECT b,pg_typeof(b) FROM c52_contract_nested;
+SELECT coalesce,pg_typeof(coalesce) FROM c52_contract_coalesce;
+SELECT flag,pg_typeof(flag) FROM c52_contract_nested_name;
+ALTER TABLE c52_contract_t RENAME COLUMN b TO c;
+SELECT b,pg_typeof(b) FROM c52_contract_partial;
+SELECT b,pg_typeof(b) FROM c52_contract_nested;
+ALTER TABLE c52_contract_t RENAME COLUMN c TO d;
+SELECT b,pg_typeof(b) FROM c52_contract_partial;
+SELECT b,pg_typeof(b) FROM c52_contract_nested;
+VACUUM;
+SELECT b,pg_typeof(b) FROM c52_contract_partial;
+SELECT b,pg_typeof(b) FROM c52_contract_nested;
+SELECT coalesce,pg_typeof(coalesce) FROM c52_contract_coalesce;
+SELECT flag,pg_typeof(flag) FROM c52_contract_nested_name;
