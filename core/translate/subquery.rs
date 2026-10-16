@@ -1,3 +1,4 @@
+use crate::error::SqlErrorKind;
 use std::sync::Arc;
 
 use crate::alloc::{TryClone, TursoSliceExt};
@@ -237,6 +238,8 @@ pub fn plan_subqueries_from_select_plan(
     resolver: &Resolver,
     connection: &Arc<Connection>,
 ) -> Result<()> {
+    // Stack-guard class (fastest-engine): a recursive entry is a nested step (`stack::NestGuard`).
+    let _nest = crate::stack::NestGuard::enter("a recursive step")?;
     // Common-subexpression elimination for scalar subqueries shared by GROUP BY and the SELECT
     // list (e.g. `SELECT (subq) AS rs ... GROUP BY rs`, where the GROUP BY term is a copy of the
     // result column): plan and evaluate the subquery once instead of once per use.
@@ -694,7 +697,7 @@ fn get_subquery_parser<'a>(
     let handle_unsupported_correlation =
         |correlated: bool, position: SubqueryPosition, allow_correlated: bool| -> Result<()> {
             if correlated && !allow_correlated {
-                crate::bail_parse_error!(
+                crate::bail_parse_error!(SqlErrorKind::FeatureNotSupported;
                     "correlated subqueries in {} clause are not supported yet",
                     position.name()
                 );
@@ -735,7 +738,7 @@ fn get_subquery_parser<'a>(
                     connection,
                 )?;
                 let Plan::Select(mut plan) = plan else {
-                    crate::bail_parse_error!(
+                    crate::bail_parse_error!(SqlErrorKind::FeatureNotSupported;
                         "compound SELECT queries not supported yet in WHERE clause subqueries"
                     );
                 };
@@ -826,7 +829,7 @@ fn get_subquery_parser<'a>(
                     connection,
                 )?;
                 let Plan::Select(mut plan) = plan else {
-                    crate::bail_parse_error!(
+                    crate::bail_parse_error!(SqlErrorKind::FeatureNotSupported;
                         "compound SELECT queries not supported yet in WHERE clause subqueries"
                     );
                 };
@@ -1897,6 +1900,8 @@ pub fn emit_non_from_clause_subquery(
     is_correlated: bool,
     preserve_outer_expr_cache: bool,
 ) -> Result<()> {
+    // Stack-guard class (fastest-engine): a recursive entry is a nested step (`stack::NestGuard`).
+    let _nest = crate::stack::NestGuard::enter("a recursive step")?;
     program.nested(|program| {
         let subquery_id = program.next_subquery_eqp_id();
         match query_type {
@@ -2083,6 +2088,9 @@ pub fn emit_non_from_clause_subqueries_for_eval_at(
     eval_at: EvalAt,
     should_emit: impl FnMut(&NonFromClauseSubquery) -> bool,
 ) -> Result<()> {
+    // Stack-guard class (fastest-engine): a check between emit_query and translate_expr, which
+    // were 143,456 B apart in debug (core stack::tests::two_consecutive_nested_checks_...).
+    let _nest = crate::stack::NestGuard::enter("emission")?;
     emit_non_from_clause_subqueries_for_phase(
         program,
         resolver,

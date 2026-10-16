@@ -1074,7 +1074,7 @@ fn find_best_access_method_for_vtab(
                     "Constraint usage count mismatch (expected {}, got {})",
                     vtab_constraints.len(),
                     index_info.constraint_usages.len()
-                )));
+                ).into()));
             }
             let has_row_estimate = index_info.estimated_rows != u32::MAX;
             let estimated_rows_per_outer_row = if has_row_estimate {

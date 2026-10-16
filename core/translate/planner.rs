@@ -1,3 +1,4 @@
+use crate::error::SqlErrorKind;
 use crate::sync::Arc;
 use crate::{turso_assert, turso_assert_greater_than_or_equal};
 
@@ -556,7 +557,7 @@ pub fn resolve_window_and_aggregate_functions(
                 }
 
                 if !order_by.is_empty() {
-                    crate::bail_parse_error!(
+                    crate::bail_parse_error!(SqlErrorKind::FeatureNotSupported;
                         "ORDER BY clause is not supported yet in aggregate functions"
                     );
                 }
@@ -740,7 +741,7 @@ pub fn resolve_window_and_aggregate_functions(
                                 return Ok(WalkControl::SkipChildren);
                             }
                         } else {
-                            crate::bail_parse_error!("no such function: {}", name.as_str());
+                            crate::bail_parse_error!(SqlErrorKind::UndefinedFunction; "no such function: {}", name.as_str());
                         }
                     }
                 }
@@ -780,7 +781,7 @@ fn link_with_window(
         crate::bail_parse_error!("{} may not be used as a window function", name);
     }
     if distinctness.is_distinct() {
-        crate::bail_parse_error!("DISTINCT is not supported for window functions");
+        crate::bail_parse_error!(SqlErrorKind::FeatureNotSupported; "DISTINCT is not supported for window functions");
     }
     // FILTER decides which input rows contribute to a running aggregate, so
     // it is only meaningful for aggregating window functions. Non-aggregate
@@ -831,7 +832,7 @@ fn link_with_window(
                         .iter()
                         .rfind(|d| d.name == window_name)
                         .ok_or_else(|| {
-                            crate::LimboError::ParseError(format!("no such window: {window_name}"))
+                            crate::LimboError::ParseError(format!("no such window: {window_name}").into())
                         })?;
                     // `bound` may already be `None` (taken on an earlier
                     // attachment), but the def's order_by length we
@@ -1058,7 +1059,7 @@ fn resolve_window<'a>(
                 .iter_mut()
                 .rfind(|d| d.name == window_name)
                 .ok_or_else(|| {
-                    crate::LimboError::ParseError(format!("no such window: {window_name}"))
+                    crate::LimboError::ParseError(format!("no such window: {window_name}").into())
                 })?;
             // First attachment under this name takes ownership of the
             // bound exprs. Subsequent distinct-frame
@@ -1135,7 +1136,7 @@ fn build_ordered_set_aggregate(
     ordered_set_func: Option<AggFunc>,
 ) -> Result<OrderedSetAggregate> {
     let Some(func) = ordered_set_func else {
-        crate::bail_parse_error!(
+        crate::bail_parse_error!(SqlErrorKind::FeatureNotSupported;
             "WITHIN GROUP is not supported for function {}()",
             name.as_str()
         );
@@ -1147,7 +1148,7 @@ fn build_ordered_set_aggregate(
         );
     }
     if distinctness.is_some() {
-        crate::bail_parse_error!(
+        crate::bail_parse_error!(SqlErrorKind::FeatureNotSupported;
             "DISTINCT is not supported for ordered-set aggregate {}()",
             name.as_str()
         );
@@ -1166,7 +1167,7 @@ fn build_ordered_set_aggregate(
     }
     let sort_col = &within_group[0];
     if matches!(sort_col.order, Some(ast::SortOrder::Desc)) || sort_col.nulls.is_some() {
-        crate::bail_parse_error!(
+        crate::bail_parse_error!(SqlErrorKind::FeatureNotSupported;
             "DESC and NULLS ordering inside WITHIN GROUP are not supported yet"
         );
     }
@@ -1199,6 +1200,9 @@ fn plan_cte(
     connection: &Arc<crate::Connection>,
     validate_explicit_column_count: bool,
 ) -> Result<JoinedTable> {
+    // Stack-guard class (fastest-engine): a CTE plans the CTEs it reads, recursively (found by
+    // the class test: a 60-CTE chain overflowed 512 KiB in plan_cte).
+    let _nest = crate::stack::NestGuard::enter("CTEs")?;
     let cte_definition = &cte_definitions[cte_definition_index];
     if program.is_cte_being_defined(&cte_definition.name) {
         crate::bail_parse_error!("circular reference: {}", cte_definition.name);
@@ -1307,7 +1311,7 @@ fn plan_cte(
             )
         }
         Plan::Delete(_) | Plan::Update(_) => {
-            crate::bail_parse_error!("DELETE/UPDATE queries are not supported in CTEs")
+            crate::bail_parse_error!(SqlErrorKind::FeatureNotSupported; "DELETE/UPDATE queries are not supported in CTEs")
         }
     }
 }
@@ -1319,6 +1323,9 @@ fn prepare_recursive_cte_plan(
     outer_query_refs: &[OuterQueryReference],
     connection: &Arc<crate::Connection>,
 ) -> Result<Plan> {
+    // Stack-guard class (fastest-engine): a CTE plans the CTEs it reads, recursively (found by
+    // the class test: a 60-CTE chain overflowed 512 KiB in plan_cte).
+    let _nest = crate::stack::NestGuard::enter("CTEs")?;
     let select = &cte_definition.select;
     let mut first_recursive_query_index = None;
     let ref_counter = RecursiveRefCounter {
@@ -1500,7 +1507,7 @@ fn reject_aggregates_and_windows_in_recursive_query(query: &Plan) -> Result<()> 
     match query {
         Plan::Select(select) => {
             if !select.aggregates.is_empty() || select.group_by.is_some() {
-                crate::bail_parse_error!("recursive aggregate queries not supported");
+                crate::bail_parse_error!(SqlErrorKind::FeatureNotSupported; "recursive aggregate queries not supported");
             }
             if select.window.is_some() {
                 crate::bail_parse_error!("cannot use window functions in recursive queries");
@@ -1515,7 +1522,7 @@ fn reject_aggregates_and_windows_in_recursive_query(query: &Plan) -> Result<()> 
                 || !right_most.aggregates.is_empty()
                 || right_most.group_by.is_some()
             {
-                crate::bail_parse_error!("recursive aggregate queries not supported");
+                crate::bail_parse_error!(SqlErrorKind::FeatureNotSupported; "recursive aggregate queries not supported");
             }
             if left.iter().any(|(select, _)| select.window.is_some()) || right_most.window.is_some()
             {
@@ -1652,7 +1659,7 @@ fn parse_from_clause_table(
             match &subplan {
                 Plan::Select(_) | Plan::CompoundSelect { .. } | Plan::RecursiveCte(_) => {}
                 Plan::Delete(_) | Plan::Update(_) => {
-                    crate::bail_parse_error!(
+                    crate::bail_parse_error!(SqlErrorKind::FeatureNotSupported;
                         "DELETE/UPDATE queries are not supported in FROM clause subqueries"
                     );
                 }
@@ -1685,7 +1692,7 @@ fn parse_from_clause_table(
             connection,
         ),
         ast::SelectTable::Sub(..) => {
-            crate::bail_parse_error!("Parenthesized FROM clause subqueries are not supported")
+            crate::bail_parse_error!(SqlErrorKind::FeatureNotSupported; "Parenthesized FROM clause subqueries are not supported")
         }
     }
 }
@@ -1860,7 +1867,7 @@ fn parse_table(
             Table::BTree(table.clone())
         } else {
             return Err(crate::LimboError::InvalidArgument(
-                "Table type not supported".to_string(),
+                "Table type not supported".to_string().into(),
             ));
         };
         table_references.add_joined_table(JoinedTable {
@@ -2048,7 +2055,7 @@ fn parse_table(
         );
     }
 
-    crate::bail_parse_error!(
+    crate::bail_parse_error!(SqlErrorKind::UndefinedTable;
         "no such table: {}",
         crate::util::table_name_for_error(qualified_name)
     );
@@ -2093,7 +2100,7 @@ fn transform_args_into_where_terms(
             table.get_name(),
             hidden_count,
             hidden_count + 1 + args_iter.count()
-        )));
+        ).into()));
     }
 
     Ok(())
@@ -2130,6 +2137,8 @@ pub fn parse_from(
     table_references: &mut TableReferences,
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
+    // Stack-guard class (fastest-engine): a recursive entry is a nested step (`stack::NestGuard`).
+    let _nest = crate::stack::NestGuard::enter("a recursive step")?;
     let mut cte_definitions = Vec::new();
     let mut shadowed_outer_ctes = Vec::new();
 
@@ -2853,7 +2862,7 @@ where
         .any(|s| s.eq_ignore_ascii_case(column_name))
     {
         if fn_check() {
-            crate::bail_parse_error!("ROWID is ambiguous");
+            crate::bail_parse_error!(SqlErrorKind::AmbiguousColumn; "ROWID is ambiguous");
         }
 
         return Ok(Some(Expr::RowId {

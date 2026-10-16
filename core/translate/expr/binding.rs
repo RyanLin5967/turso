@@ -1,3 +1,4 @@
+use crate::error::{SqlErrorKind, SqlErrorMessage};
 use super::*;
 
 /// The precedence of binding identifiers to columns.
@@ -62,7 +63,7 @@ pub(super) fn resolve_qualified_on_ref(
     if let Table::BTree(btree) = table {
         if parse_row_id(normalized_id, internal_id, || false)?.is_some() {
             if !btree.has_rowid {
-                crate::bail_parse_error!("no such column: {}", normalized_id);
+                crate::bail_parse_error!(SqlErrorKind::UndefinedColumn; "no such column: {}", normalized_id);
             }
             return Ok(Some(QualifiedMatch::RowId));
         }
@@ -82,6 +83,8 @@ pub fn bind_and_rewrite_expr<'a>(
     resolver: &Resolver<'_>,
     binding_behavior: BindingBehavior,
 ) -> Result<()> {
+    // Stack-guard class (fastest-engine): a recursive entry is a nested step (`stack::NestGuard`).
+    let _nest = crate::stack::NestGuard::enter("a recursive step")?;
     walk_expr_mut(
         top_level_expr,
         &mut |expr: &mut ast::Expr| -> Result<WalkControl> {
@@ -92,7 +95,7 @@ pub fn bind_and_rewrite_expr<'a>(
                         if binding_behavior == BindingBehavior::AllowUnboundIdentifiers {
                             return Ok(WalkControl::Continue);
                         }
-                        crate::bail_parse_error!("no such column: {}", id.as_str());
+                        crate::bail_parse_error!(SqlErrorKind::UndefinedColumn; "no such column: {}", id.as_str());
                     };
                     let normalized_id = normalize_ident(id.as_str());
 
@@ -131,7 +134,7 @@ pub fn bind_and_rewrite_expr<'a>(
                                     }
                                 }
                                 if !ok {
-                                    crate::bail_parse_error!(
+                                    crate::bail_parse_error!(SqlErrorKind::AmbiguousColumn;
                                         "ambiguous column name: {}",
                                         id.as_str()
                                     );
@@ -153,7 +156,7 @@ pub fn bind_and_rewrite_expr<'a>(
                                 })?
                             {
                                 if !btree.has_rowid {
-                                    crate::bail_parse_error!("no such column: {}", id.as_str());
+                                    crate::bail_parse_error!(SqlErrorKind::UndefinedColumn; "no such column: {}", id.as_str());
                                 }
                                 *expr = row_id_expr;
                                 return Ok(WalkControl::Continue);
@@ -201,7 +204,7 @@ pub fn bind_and_rewrite_expr<'a>(
                                     continue;
                                 }
                                 if match_result.is_some() {
-                                    crate::bail_parse_error!(
+                                    crate::bail_parse_error!(SqlErrorKind::AmbiguousColumn;
                                         "ambiguous column name: {}",
                                         id.as_str()
                                     );
@@ -244,7 +247,7 @@ pub fn bind_and_rewrite_expr<'a>(
                         *expr = Expr::Literal(ast::Literal::String(id.as_literal()));
                         return Ok(WalkControl::Continue);
                     } else {
-                        crate::bail_parse_error!("no such column: {}", id.as_str())
+                        crate::bail_parse_error!(SqlErrorKind::UndefinedColumn; "no such column: {}", id.as_str())
                     }
                 }
                 Expr::Qualified(tbl, id) => {
@@ -264,7 +267,7 @@ pub fn bind_and_rewrite_expr<'a>(
                         if binding_behavior == BindingBehavior::AllowUnboundIdentifiers {
                             return Ok(WalkControl::Continue);
                         }
-                        crate::bail_parse_error!(
+                        crate::bail_parse_error!(SqlErrorKind::UndefinedColumn;
                             "no such column: {}.{}",
                             tbl.as_str(),
                             id.as_str()
@@ -281,11 +284,11 @@ pub fn bind_and_rewrite_expr<'a>(
                     let mut identifier_matched = false;
 
                     let ambiguous = || -> LimboError {
-                        LimboError::ParseError(format!(
+                        LimboError::ParseError(SqlErrorMessage::classified(SqlErrorKind::AmbiguousColumn, format!(
                             "ambiguous column name: {}.{}",
                             tbl.as_str(),
                             id.as_str()
-                        ))
+                        )))
                     };
 
                     // --- Stage 1: search the current scope's FROM tables. ---
@@ -404,7 +407,7 @@ pub fn bind_and_rewrite_expr<'a>(
                                         || outer_ref.cte_select.is_some())
                             });
                         if is_definition_only_cte {
-                            crate::bail_parse_error!(
+                            crate::bail_parse_error!(SqlErrorKind::UndefinedColumn;
                                 "no such column: {}.{}",
                                 tbl.as_str(),
                                 id.as_str()
@@ -440,12 +443,12 @@ pub fn bind_and_rewrite_expr<'a>(
                             referenced_tables.mark_column_used(m.table_id, m.col_idx);
                             return Ok(WalkControl::Continue);
                         }
-                        crate::bail_parse_error!("no such table: {}", normalized_table_name);
+                        crate::bail_parse_error!(SqlErrorKind::UndefinedTable; "no such table: {}", normalized_table_name);
                     }
                     // Identifier matched somewhere but no column/rowid binding was
                     // produced — the table exists, the column doesn't.
                     let Some((tbl_id, binding)) = resolved else {
-                        crate::bail_parse_error!("no such column: {}", normalized_id);
+                        crate::bail_parse_error!(SqlErrorKind::UndefinedColumn; "no such column: {}", normalized_id);
                     };
 
                     match binding {
@@ -487,7 +490,7 @@ pub fn bind_and_rewrite_expr<'a>(
                         if binding_behavior == BindingBehavior::AllowUnboundIdentifiers {
                             return Ok(WalkControl::Continue);
                         }
-                        crate::bail_parse_error!(
+                        crate::bail_parse_error!(SqlErrorKind::UndefinedColumn;
                             "no such column: {}.{}.{}",
                             db_name_str,
                             tbl_name_str,
@@ -544,7 +547,7 @@ pub fn bind_and_rewrite_expr<'a>(
                                     return Err(LimboError::ParseError(format!(
                                         "table {normalized_tbl_name} is not in FROM clause — \
                                          cross-database column references require the table to be explicitly joined"
-                                    )));
+                                    ).into()));
                                 }
                             }
                         }
@@ -584,7 +587,7 @@ pub fn bind_and_rewrite_expr<'a>(
                                     return Err(LimboError::ParseError(format!(
                                         "column '{normalized_col}' is not a STRUCT or UNION type; \
                                          cannot access field '{field_name}'"
-                                    )));
+                                    ).into()));
                                 }
                             }
                         }
@@ -607,9 +610,9 @@ pub fn bind_and_rewrite_expr<'a>(
                             *expr = nested_expr;
                             referenced_tables.mark_column_used(tbl_id, col_idx);
                         } else {
-                            return Err(LimboError::ParseError(format!(
+                            return Err(LimboError::ParseError(SqlErrorMessage::classified(SqlErrorKind::UndefinedColumn, format!(
                                 "no such column: {db_name_str}.{tbl_name_str}.{col_name_str}"
-                            )));
+                            ))));
                         }
                     }
                 }

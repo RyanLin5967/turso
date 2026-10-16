@@ -1,3 +1,4 @@
+use crate::error::{SqlErrorKind, SqlErrorMessage};
 use crate::alloc::TursoIteratorExt;
 use crate::sync::Arc;
 use crate::{bail_parse_error, schema::BTreeTable, turso_assert_eq};
@@ -431,7 +432,7 @@ pub(crate) fn literal_default_value(literal: &ast::Literal) -> Result<Value> {
         ast::Literal::CurrentTime => Ok(Value::from_text("CURRENT_TIME")),
         ast::Literal::CurrentTimestamp => Ok(Value::from_text("CURRENT_TIMESTAMP")),
         ast::Literal::Keyword(_) => Err(LimboError::ParseError(
-            "Cannot add a column with non-constant default".to_string(),
+            "Cannot add a column with non-constant default".to_string().into(),
         )),
     }
 }
@@ -465,12 +466,12 @@ pub(crate) fn eval_constant_default_value(expr: &ast::Expr) -> Result<Value> {
                 eval_constant_default_value(&exprs[0])
             } else {
                 Err(LimboError::ParseError(
-                    "Cannot add a column with non-constant default".to_string(),
+                    "Cannot add a column with non-constant default".to_string().into(),
                 ))
             }
         }
         _ => Err(LimboError::ParseError(
-            "Cannot add a column with non-constant default".to_string(),
+            "Cannot add a column with non-constant default".to_string().into(),
         )),
     }
 }
@@ -597,15 +598,17 @@ fn emit_add_virtual_column_validation(
 
     let mut resolved_table = table.clone();
     resolved_table.prepare_generated_columns()?;
-    let new_column_name = column
-        .name
-        .as_deref()
-        .ok_or_else(|| LimboError::ParseError("generated column name is missing".to_string()))?;
+    let new_column_name = column.name.as_deref().ok_or_else(|| {
+        LimboError::ParseError("generated column name is missing".to_string().into())
+    })?;
     let (new_column_idx, _) = resolved_table.get_column(new_column_name).ok_or_else(|| {
-        LimboError::ParseError(format!(
-            "new generated column unexpectedly missing from table {}",
-            resolved_table.name
-        ))
+        LimboError::ParseError(
+            format!(
+                "new generated column unexpectedly missing from table {}",
+                resolved_table.name
+            )
+            .into(),
+        )
     })?;
 
     let mut original_table = table.clone();
@@ -890,10 +893,10 @@ pub fn translate_alter_table(
     });
 
     let Some(table) = resolver.with_schema(database_id, |s| s.get_table(table_name)) else {
-        return Err(LimboError::ParseError(format!(
+        return Err(LimboError::ParseError(SqlErrorMessage::classified(SqlErrorKind::UndefinedTable, format!(
             "no such table: {}",
             crate::util::table_name_for_error(&qualified_name)
-        )));
+        ))));
     };
     if let Some(tbl) = table.virtual_table() {
         if let ast::AlterTableBody::RenameTo(new_name) = &alter_table {
@@ -939,7 +942,7 @@ pub fn translate_alter_table(
         return Err(LimboError::ParseError(format!(
             "cannot alter table \"{table_name}\": it has dependent materialized view(s): {}",
             dependent_views.join(", ")
-        )));
+        ).into()));
     }
 
     let mut btree = (*original_btree).clone();
@@ -954,11 +957,11 @@ pub fn translate_alter_table(
             if btree.columns().len() == 1 {
                 return Err(LimboError::ParseError(format!(
                     "cannot drop column \"{column_name}\": no other columns exist"
-                )));
+                ).into()));
             }
 
             let (dropped_index, column) = btree.get_column(column_name).ok_or_else(|| {
-                LimboError::ParseError(format!("no such column: \"{column_name}\""))
+                LimboError::ParseError(SqlErrorMessage::classified(SqlErrorKind::UndefinedColumn, format!("no such column: \"{column_name}\"")))
             })?;
 
             // Column cannot be dropped if:
@@ -975,7 +978,7 @@ pub fn translate_alter_table(
             if column.primary_key() {
                 return Err(LimboError::ParseError(format!(
                     "cannot drop column \"{column_name}\": PRIMARY KEY"
-                )));
+                ).into()));
             }
 
             if column.unique()
@@ -987,7 +990,7 @@ pub fn translate_alter_table(
             {
                 return Err(LimboError::ParseError(format!(
                     "cannot drop column \"{column_name}\": UNIQUE"
-                )));
+                ).into()));
             }
 
             let col_normalized = normalize_ident(column_name);
@@ -1002,7 +1005,7 @@ pub fn translate_alter_table(
                     return Err(LimboError::ParseError(format!(
                         "cannot drop column \"{column_name}\": it is referenced in the index {}; position in index is {pos_in_index}, position in table is {}",
                         index.name, indexed_col.pos_in_table
-                    )));
+                    ).into()));
                 }
                 // Referenced in expression index
                 for idx_col in &index.columns {
@@ -1011,7 +1014,7 @@ pub fn translate_alter_table(
                             return Err(LimboError::ParseError(format!(
                                 "error in index {} after drop column: no such column: {column_name}",
                                 index.name
-                            )));
+                            ).into()));
                         }
                     }
                 }
@@ -1037,7 +1040,7 @@ pub fn translate_alter_table(
                         .bind_where_expr(Some(&mut table_references), resolver)?
                         .ok_or_else(|| {
                             LimboError::ParseError(
-                                "index where clause unexpectedly missing".to_string(),
+                                "index where clause unexpectedly missing".to_string().into(),
                             )
                         })?;
                     let mut column_referenced = false;
@@ -1063,7 +1066,7 @@ pub fn translate_alter_table(
                     if column_referenced {
                         return Err(LimboError::ParseError(format!(
                             "cannot drop column \"{column_name}\": indexed"
-                        )));
+                        ).into()));
                     }
                 }
             }
@@ -1080,7 +1083,7 @@ pub fn translate_alter_table(
                 if check_expr_references_column(&check.expr, &col_normalized) {
                     return Err(LimboError::ParseError(format!(
                         "error in table {table_name} after drop column: no such column: {column_name}"
-                    )));
+                    ).into()));
                 }
             }
             // Remove column-level CHECK constraints for the dropped column
@@ -1097,7 +1100,7 @@ pub fn translate_alter_table(
                 if fk.child_columns.contains(&column_name_norm) {
                     return Err(LimboError::ParseError(format!(
                         "error in table {table_name} after drop column: unknown column \"{column_name}\" in foreign key definition"
-                    )));
+                    ).into()));
                 }
             }
 
@@ -1112,7 +1115,7 @@ pub fn translate_alter_table(
                 if remaining_non_generated == 0 {
                     return Err(LimboError::ParseError(format!(
                         "error in table {table_name} after drop column: must have at least one non-generated column"
-                    )));
+                    ).into()));
                 }
             }
 
@@ -1123,7 +1126,7 @@ pub fn translate_alter_table(
                     if idx != dropped_index && btree.columns()[idx].is_virtual_generated() {
                         return Err(LimboError::ParseError(format!(
                             "error in table {table_name} after drop column: no such column: {column_name}"
-                        )));
+                        ).into()));
                     }
                 }
             }
@@ -1152,7 +1155,7 @@ pub fn translate_alter_table(
                     return Err(LimboError::ParseError(format!(
                         "error in trigger {}: no such table: {}",
                         trigger_entry.trigger.name, missing_table
-                    )));
+                    ).into()));
                 }
                 if let Some(bad_col) = validate_trigger_columns_after_drop(
                     &trigger_entry.trigger,
@@ -1165,7 +1168,7 @@ pub fn translate_alter_table(
                     return Err(LimboError::ParseError(format!(
                         "error in trigger {}: no such column: {}",
                         trigger_entry.trigger.name, bad_col
-                    )));
+                    ).into()));
                 }
                 if let Some(bad_col) = validate_trigger_columns_after_drop(
                     &trigger_entry.trigger,
@@ -1178,7 +1181,7 @@ pub fn translate_alter_table(
                     return Err(LimboError::ParseError(format!(
                         "error in trigger {} after drop column: no such column: {}",
                         trigger_entry.trigger.name, bad_col
-                    )));
+                    ).into()));
                 }
             }
 
@@ -1197,11 +1200,11 @@ pub fn translate_alter_table(
 
             let mut parser = Parser::new(stmt.as_bytes());
             let cmd = parser.next_cmd().map_err(|e| {
-                LimboError::ParseError(format!("failed to parse generated UPDATE statement: {e}"))
+                LimboError::ParseError(format!("failed to parse generated UPDATE statement: {e}").into())
             })?;
             let Some(ast::Cmd::Stmt(ast::Stmt::Update(update))) = cmd else {
                 return Err(LimboError::ParseError(
-                    "generated UPDATE statement did not parse as expected".to_string(),
+                    "generated UPDATE statement did not parse as expected".to_string().into(),
                 ));
             };
 
@@ -1275,7 +1278,7 @@ pub fn translate_alter_table(
             });
             if is_stored {
                 return Err(LimboError::ParseError(
-                    "cannot add a STORED column".to_string(),
+                    "cannot add a STORED column".to_string().into(),
                 ));
             }
             if is_generated && !connection.experimental_generated_columns_enabled() {
@@ -1295,12 +1298,12 @@ pub fn translate_alter_table(
 
             let new_column_name = column.name.clone().ok_or_else(|| {
                 LimboError::ParseError(
-                    "column name is missing in ALTER TABLE ADD COLUMN".to_string(),
+                    "column name is missing in ALTER TABLE ADD COLUMN".to_string().into(),
                 )
             })?;
             if btree.get_column(&new_column_name).is_some() {
                 return Err(LimboError::ParseError(
-                    "duplicate column name: ".to_string() + &new_column_name,
+                    ("duplicate column name: ".to_string() + &new_column_name).into(),
                 ));
             }
 
@@ -1310,7 +1313,7 @@ pub fn translate_alter_table(
                 if btree.is_strict && ty.is_empty() {
                     return Err(LimboError::ParseError(format!(
                         "missing datatype for {table_name}.{new_column_name}"
-                    )));
+                    ).into()));
                 }
                 let is_builtin = ty.is_empty()
                     || ty.eq_ignore_ascii_case("INT")
@@ -1329,7 +1332,7 @@ pub fn translate_alter_table(
                         if td.is_domain {
                             return Err(LimboError::ParseError(format!(
                                 "domain type columns require STRICT tables: {table_name}.{new_column_name}"
-                            )));
+                            ).into()));
                         }
                     }
                 }
@@ -1341,11 +1344,11 @@ pub fn translate_alter_table(
                     if type_def.is_none() {
                         return Err(LimboError::ParseError(format!(
                             "unknown datatype for {table_name}.{new_column_name}: \"{ty}\""
-                        )));
+                        ).into()));
                     }
                 }
                 // The typmod as CREATE TABLE bounds it (class (a), DECISIONS 994f7d41e0).
-                super::schema::check_numeric_typmod(ty, &column.ty_params)?;
+                super::schema::check_numeric_typmod(ty, &column.ty_params, btree.is_strict)?;
 
                 default_type_mismatch = strict_default_type_mismatch(&column)?;
             }
@@ -1378,7 +1381,7 @@ pub fn translate_alter_table(
                             return Err(LimboError::ParseError(format!(
                                 "foreign key on {new_column_name} should reference only one column of table {}",
                                 clause.tbl_name.as_str()
-                            )));
+                            ).into()));
                         }
                         let decl_order = btree
                             .foreign_keys
@@ -1473,11 +1476,11 @@ pub fn translate_alter_table(
 
             let mut parser = Parser::new(stmt.as_bytes());
             let cmd = parser.next_cmd().map_err(|e| {
-                LimboError::ParseError(format!("failed to parse generated UPDATE statement: {e}"))
+                LimboError::ParseError(format!("failed to parse generated UPDATE statement: {e}").into())
             })?;
             let Some(ast::Cmd::Stmt(ast::Stmt::Update(update))) = cmd else {
                 return Err(LimboError::ParseError(
-                    "generated UPDATE statement did not parse as expected".to_string(),
+                    "generated UPDATE statement did not parse as expected".to_string().into(),
                 ));
             };
 
@@ -1601,7 +1604,7 @@ pub fn translate_alter_table(
             }) {
                 return Err(LimboError::ParseError(format!(
                     "there is already another table or index with this name: {new_name}"
-                )));
+                ).into()));
             };
 
             for trigger_entry in collect_triggers_for_alter_target(resolver, database_id) {
@@ -1615,7 +1618,7 @@ pub fn translate_alter_table(
                     return Err(LimboError::ParseError(format!(
                         "error in trigger {}: no such table: {}",
                         trigger_entry.trigger.name, missing_table
-                    )));
+                    ).into()));
                 }
                 if trigger_entry.database_id == crate::TEMP_DB_ID {
                     let temp_trigger_targets_renamed_table =
@@ -1662,7 +1665,7 @@ pub fn translate_alter_table(
             let sqlite_schema = resolver
                 .with_schema(database_id, |s| s.get_btree_table(SQLITE_TABLEID))
                 .ok_or_else(|| {
-                    LimboError::ParseError("sqlite_schema table not found in schema".to_string())
+                    LimboError::ParseError("sqlite_schema table not found in schema".to_string().into())
                 })?;
 
             let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(sqlite_schema.clone()));
@@ -1785,12 +1788,12 @@ pub fn translate_alter_table(
                 let cmd = parser.next_cmd().map_err(|e| {
                     LimboError::ParseError(format!(
                         "failed to parse trigger update SQL for {trigger_name}: {e}"
-                    ))
+                    ).into())
                 })?;
                 let Some(ast::Cmd::Stmt(ast::Stmt::Update(update))) = cmd else {
                     return Err(LimboError::ParseError(format!(
                         "failed to parse trigger update SQL for {trigger_name}",
-                    )));
+                    ).into()));
                 };
 
                 translate_update_for_schema_change(
@@ -1856,15 +1859,15 @@ pub fn translate_alter_table(
             let col_name = col_name.as_str();
 
             let Some((column_index, _)) = btree.get_column(from) else {
-                return Err(LimboError::ParseError(format!(
+                return Err(LimboError::ParseError(SqlErrorMessage::classified(SqlErrorKind::UndefinedColumn, format!(
                     "no such column: \"{from}\""
-                )));
+                ))));
             };
 
             if btree.get_column(col_name).is_some() {
                 return Err(LimboError::ParseError(format!(
                     "duplicate column name: \"{col_name}\""
-                )));
+                ).into()));
             };
 
             if definition
@@ -1873,7 +1876,7 @@ pub fn translate_alter_table(
                 .any(|c| matches!(c.constraint, ast::ColumnConstraint::PrimaryKey { .. }))
             {
                 return Err(LimboError::ParseError(
-                    "PRIMARY KEY constraint cannot be altered".to_string(),
+                    "PRIMARY KEY constraint cannot be altered".to_string().into(),
                 ));
             }
 
@@ -1883,7 +1886,7 @@ pub fn translate_alter_table(
                 .any(|c| matches!(c.constraint, ast::ColumnConstraint::Unique { .. }))
             {
                 return Err(LimboError::ParseError(
-                    "UNIQUE constraint cannot be altered".to_string(),
+                    "UNIQUE constraint cannot be altered".to_string().into(),
                 ));
             }
 
@@ -1939,7 +1942,7 @@ pub fn translate_alter_table(
                 });
                 if is_stored {
                     return Err(LimboError::ParseError(
-                        "cannot add a STORED column".to_string(),
+                        "cannot add a STORED column".to_string().into(),
                     ));
                 }
 
@@ -1958,7 +1961,7 @@ pub fn translate_alter_table(
 
                 if non_generated_count == 0 {
                     return Err(LimboError::ParseError(
-                        "must have at least one non-generated column".to_string(),
+                        "must have at least one non-generated column".to_string().into(),
                     ));
                 }
             }
@@ -1995,7 +1998,7 @@ pub fn translate_alter_table(
                         return Err(LimboError::ParseError(format!(
                             "error in trigger {}: no such table: {}",
                             trigger_entry.trigger.name, missing_table
-                        )));
+                        ).into()));
                     }
                     match rewrite_trigger_sql_for_column_rename(
                         &trigger_entry.trigger.sql,
@@ -2016,9 +2019,9 @@ pub fn translate_alter_table(
                             }
                         }
                         Err(LimboError::ParseError(message)) => {
-                            let message = message.strip_prefix("Parse error: ").unwrap_or(&message);
+                            let text = message.strip_prefix("Parse error: ").unwrap_or(&message);
                             let error =
-                                if let Some(column) = message.strip_prefix("no such column: ") {
+                                if let Some(column) = text.strip_prefix("no such column: ") {
                                     format!(
                                         "error in trigger {} after rename: no such column: {}",
                                         trigger_entry.trigger.name, column
@@ -2026,17 +2029,17 @@ pub fn translate_alter_table(
                                 } else {
                                     format!(
                                         "error in trigger {} after rename column: {}",
-                                        trigger_entry.trigger.name, message
+                                        trigger_entry.trigger.name, text
                                     )
                                 };
-                            return Err(LimboError::ParseError(error));
+                            return Err(LimboError::ParseError(message.with_text(error)));
                         }
                         Err(e) => {
                             // If we can't rewrite the trigger, fail the ALTER TABLE operation
                             return Err(LimboError::ParseError(format!(
                                 "error in trigger {} after rename column: {}",
                                 trigger_entry.trigger.name, e
-                            )));
+                            ).into()));
                         }
                     }
                 }
@@ -2107,7 +2110,7 @@ pub fn translate_alter_table(
             let sqlite_schema = resolver
                 .with_schema(database_id, |s| s.get_btree_table(SQLITE_TABLEID))
                 .ok_or_else(|| {
-                    LimboError::ParseError("sqlite_schema table not found in schema".to_string())
+                    LimboError::ParseError("sqlite_schema table not found in schema".to_string().into())
                 })?;
 
             let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(sqlite_schema.clone()));
@@ -2200,12 +2203,12 @@ pub fn translate_alter_table(
                 let cmd = parser.next_cmd().map_err(|e| {
                     LimboError::ParseError(format!(
                         "failed to parse trigger update SQL for {trigger_name}: {e}"
-                    ))
+                    ).into())
                 })?;
                 let Some(ast::Cmd::Stmt(ast::Stmt::Update(update))) = cmd else {
                     return Err(LimboError::ParseError(format!(
                         "failed to parse trigger update SQL for {trigger_name}",
-                    )));
+                    ).into()));
                 };
 
                 translate_update_for_schema_change(
@@ -2234,12 +2237,12 @@ pub fn translate_alter_table(
                 let cmd = parser.next_cmd().map_err(|e| {
                     LimboError::ParseError(format!(
                         "failed to parse view update SQL for {view_name}: {e}"
-                    ))
+                    ).into())
                 })?;
                 let Some(ast::Cmd::Stmt(ast::Stmt::Update(update))) = cmd else {
                     return Err(LimboError::ParseError(format!(
                         "failed to parse view update SQL for {view_name}",
-                    )));
+                    ).into()));
                 };
 
                 translate_update_for_schema_change(
@@ -2445,7 +2448,7 @@ fn translate_rename_virtual_table(
         .schema()
         .get_btree_table(SQLITE_TABLEID)
         .ok_or_else(|| {
-            LimboError::ParseError("sqlite_schema table not found in schema".to_string())
+            LimboError::ParseError("sqlite_schema table not found in schema".to_string().into())
         })?;
 
     let schema_cur = program.alloc_cursor_id(CursorType::BTreeTable(sqlite_schema.clone()));
@@ -2556,7 +2559,7 @@ fn rewrite_trigger_sql_for_table_rename(
     let mut parser = Parser::new(trigger_sql.as_bytes());
     let cmd = parser
         .next_cmd()
-        .map_err(|e| LimboError::ParseError(format!("failed to parse trigger SQL: {e}")))?;
+        .map_err(|e| LimboError::ParseError(format!("failed to parse trigger SQL: {e}").into()))?;
     let Some(ast::Cmd::Stmt(ast::Stmt::CreateTrigger {
         temporary,
         if_not_exists,
@@ -2571,7 +2574,7 @@ fn rewrite_trigger_sql_for_table_rename(
     else {
         return Err(LimboError::ParseError(format!(
             "failed to parse trigger SQL: {trigger_sql}"
-        )));
+        ).into()));
     };
 
     // Only rewrite when this trigger's `tbl_name` actually targets the
@@ -2636,7 +2639,7 @@ fn rewrite_trigger_sql_for_column_rename(
     let mut parser = Parser::new(trigger_sql.as_bytes());
     let cmd = parser
         .next_cmd()
-        .map_err(|e| LimboError::ParseError(format!("failed to parse trigger SQL: {e}")))?;
+        .map_err(|e| LimboError::ParseError(format!("failed to parse trigger SQL: {e}").into()))?;
     let Some(ast::Cmd::Stmt(ast::Stmt::CreateTrigger {
         temporary,
         if_not_exists,
@@ -2651,7 +2654,7 @@ fn rewrite_trigger_sql_for_column_rename(
     else {
         return Err(LimboError::ParseError(format!(
             "failed to parse trigger SQL: {trigger_sql}"
-        )));
+        ).into()));
     };
 
     let old_col_norm = normalize_ident(old_column_name);
@@ -2665,7 +2668,7 @@ fn rewrite_trigger_sql_for_column_rename(
             schema.get_btree_table(&trigger_table_name)
         })
         .ok_or_else(|| {
-            LimboError::ParseError(format!("trigger table not found: {trigger_table_name}"))
+            LimboError::ParseError(format!("trigger table not found: {trigger_table_name}").into())
         })?;
 
     // Check if this trigger references the column being renamed
@@ -2679,7 +2682,7 @@ fn rewrite_trigger_sql_for_column_rename(
     {
         return Err(LimboError::ParseError(format!(
             "target table not found: {target_table_name}"
-        )));
+        ).into()));
     }
 
     // Rewrite UPDATE OF column list if renaming a column in the trigger's owning table
@@ -2753,7 +2756,7 @@ fn rewrite_trigger_sql_for_column_rename(
                 "error in trigger {}: no such column: {}",
                 trigger_name.name.as_str(),
                 old_col_norm
-            )));
+            ).into()));
         }
     }
 
@@ -2841,7 +2844,7 @@ fn rewrite_trigger_sql_for_column_rename(
                 "error in trigger {}: no such column: {}",
                 trigger_name.name.as_str(),
                 bad_column
-            )));
+            ).into()));
         }
     }
 
@@ -2870,7 +2873,10 @@ enum ColumnRenameExprTraversal {
 }
 
 fn no_such_column_error(column_ref: &str) -> LimboError {
-    LimboError::ParseError(format!("no such column: {column_ref}"))
+    LimboError::ParseError(SqlErrorMessage::classified(
+        SqlErrorKind::UndefinedColumn,
+        format!("no such column: {column_ref}"),
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3029,7 +3035,7 @@ fn apply_expr_for_column_rename(
         let is_renaming = ctx_name_norm == *target_table_name;
         let table = resolve_trigger_command_table_for_alter(resolver, database_id, &ctx_name_norm)
             .ok_or_else(|| {
-                LimboError::ParseError(format!("context table not found: {ctx_name_norm}"))
+                LimboError::ParseError(format!("context table not found: {ctx_name_norm}").into())
             })?;
         Some((table, ctx_name_norm, is_renaming))
     } else {

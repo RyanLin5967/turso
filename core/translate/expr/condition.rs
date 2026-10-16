@@ -1,3 +1,4 @@
+use crate::error::SqlErrorKind;
 use super::*;
 
 /// Core implementation of IN expression logic that can be used in both conditional and expression contexts.
@@ -263,6 +264,9 @@ pub fn translate_condition_expr(
     condition_metadata: ConditionMetadata,
     resolver: &Resolver,
 ) -> Result<()> {
+    // Stack-guard class (fastest-engine): a check between emit_query and translate_expr, which
+    // were 143,456 B apart in debug (core stack::tests::two_consecutive_nested_checks_...).
+    let _nest = crate::stack::NestGuard::enter("emission")?;
     match expr {
         ast::Expr::SubqueryResult { query_type, .. } => match query_type {
             SubqueryType::Exists { result_reg } => {
@@ -289,7 +293,7 @@ pub fn translate_condition_expr(
             );
         }
         ast::Expr::Collate(_, _) => {
-            crate::bail_parse_error!("Collate in WHERE clause is not supported");
+            crate::bail_parse_error!(SqlErrorKind::FeatureNotSupported; "Collate in WHERE clause is not supported");
         }
         ast::Expr::DoublyQualified(_, _, _) | ast::Expr::Id(_) | ast::Expr::Qualified(_, _) => {
             crate::bail_parse_error!(
@@ -302,22 +306,22 @@ pub fn translate_condition_expr(
             );
         }
         ast::Expr::Exists(_) => {
-            crate::bail_parse_error!("EXISTS in WHERE clause is not supported");
+            crate::bail_parse_error!(SqlErrorKind::FeatureNotSupported; "EXISTS in WHERE clause is not supported");
         }
         ast::Expr::Subquery(_) => {
-            crate::bail_parse_error!("Subquery in WHERE clause is not supported");
+            crate::bail_parse_error!(SqlErrorKind::FeatureNotSupported; "Subquery in WHERE clause is not supported");
         }
         ast::Expr::InSelect { .. } => {
-            crate::bail_parse_error!("IN (...subquery) in WHERE clause is not supported");
+            crate::bail_parse_error!(SqlErrorKind::FeatureNotSupported; "IN (...subquery) in WHERE clause is not supported");
         }
         ast::Expr::InTable { .. } => {
-            crate::bail_parse_error!("Table expression in WHERE clause is not supported");
+            crate::bail_parse_error!(SqlErrorKind::FeatureNotSupported; "Table expression in WHERE clause is not supported");
         }
         ast::Expr::FunctionCallStar { .. } => {
-            crate::bail_parse_error!("FunctionCallStar in WHERE clause is not supported");
+            crate::bail_parse_error!(SqlErrorKind::FeatureNotSupported; "FunctionCallStar in WHERE clause is not supported");
         }
         ast::Expr::Raise(_, _) => {
-            crate::bail_parse_error!("RAISE in WHERE clause is not supported");
+            crate::bail_parse_error!(SqlErrorKind::FeatureNotSupported; "RAISE in WHERE clause is not supported");
         }
         ast::Expr::Between { .. } => {
             let between_result_reg = program.alloc_register();
@@ -336,7 +340,7 @@ pub fn translate_condition_expr(
             emit_cond_jump(program, condition_metadata, reg);
         }
         ast::Expr::Name(_) => {
-            crate::bail_parse_error!("Name as a direct predicate in WHERE clause is not supported");
+            crate::bail_parse_error!(SqlErrorKind::FeatureNotSupported; "Name as a direct predicate in WHERE clause is not supported");
         }
         ast::Expr::Binary(lhs, ast::Operator::And, rhs) => {
             // In a binary AND, never jump to the parent 'jump_target_when_true' label on the first condition, because

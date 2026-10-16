@@ -1,6 +1,8 @@
 use pg_query::ParseResult;
 use thiserror::Error;
 
+pub use turso_parser::sql_error::{SqlErrorKind, SqlErrorMessage};
+
 pub mod translator;
 
 /// libpg_query's bindings, for callers that edit a parse tree (the frontend's table rebuild).
@@ -9,7 +11,60 @@ pub use pg_query;
 #[derive(Debug, Error)]
 pub enum ParseError {
     #[error("{0}")]
-    ParseError(String),
+    ParseError(SqlErrorMessage),
+    /// A recursive entry of the translator found its thread's stack nearly spent
+    /// (`turso_stack_guard::NestGuard`): PostgreSQL's 54001, which the frontend reports as the engine's
+    /// `LimboError::StackDepthLimitExceeded`.
+    #[error("stack depth limit exceeded")]
+    StackDepthLimitExceeded,
+}
+
+impl From<ParseError> for SqlErrorMessage {
+    fn from(error: ParseError) -> Self {
+        match error {
+            ParseError::ParseError(message) => message,
+            ParseError::StackDepthLimitExceeded => SqlErrorMessage::classified(
+                SqlErrorKind::StatementTooComplex, "stack depth limit exceeded"),
+        }
+    }
+}
+
+/// The stack libpg_query's calls on `sql` run with (`turso_stack_guard::with_stack`). Its C code
+/// recurses over the tree with no check: the protobuf output functions (`_outNode`) overflowed an
+/// 8 MiB session thread at 3,000 nested scalar subqueries (stack-guard class, lldb), where
+/// PostgreSQL 18 answers 54001 (raw artie pg18-nesting-depth.txt). The tree's depth is bounded by
+/// the text's length (each level takes at least one byte), so the stack is sized from it:
+/// `PG_QUERY_BASE` plus `PG_QUERY_PER_BYTE` per byte, at most `PG_QUERY_MAX` (bison refuses past
+/// 10,000 levels, "memory exhausted"). A statement of a few KiB needs less than a session thread
+/// has, so only a long one runs on a segment of its own. The base holds the protobuf decode of the
+/// tree, which prost bounds at 100 nested messages but which overflowed a 1 MiB thread at 56 in a
+/// debug build (about 18 KiB a message).
+fn pg_query_stack(sql: &str) -> usize {
+    PG_QUERY_BASE.saturating_add(sql.len().saturating_mul(PG_QUERY_PER_BYTE)).min(PG_QUERY_MAX)
+}
+const PG_QUERY_BASE: usize = 4 << 20;
+const PG_QUERY_PER_BYTE: usize = 1 << 10;
+const PG_QUERY_MAX: usize = 256 << 20;
+
+/// A deparse walks a tree this crate decoded, at most prost's recursion limit (100 messages) deep.
+const PG_DEPARSE_STACK: usize = 4 << 20;
+
+/// libpg_query's refusals of a statement nested too deeply, in PostgreSQL's class (54001): prost's
+/// recursion limit on the decode of the tree (PostgreSQL answers some of these: a REGISTERED
+/// DIVERGENCE, it answers 1,000 nested scalar subqueries and the decode refuses past about 24), and
+/// the C parser's own stack check.
+fn pg_query_error(e: pg_query::Error) -> ParseError {
+    let text = e.to_string();
+    if text.contains("recursion limit reached") || text.contains("stack depth limit exceeded") {
+        ParseError::StackDepthLimitExceeded
+    } else {
+        ParseError::ParseError(text.into())
+    }
+}
+
+/// One of the translator's recursive steps (`turso_stack_guard::NestGuard`), held for the step.
+pub(crate) fn nest() -> Result<turso_stack_guard::NestGuard, ParseError> {
+    turso_stack_guard::NestGuard::enter().map_err(|_| ParseError::StackDepthLimitExceeded)
 }
 
 thread_local! {
@@ -30,13 +85,13 @@ fn count_libpg_query_call() {
 /// Parse a PostgreSQL SQL statement using pg_query
 pub fn parse(sql: &str) -> Result<ParseResult, ParseError> {
     count_libpg_query_call();
-    pg_query::parse(sql).map_err(|e| ParseError::ParseError(e.to_string()))
+    turso_stack_guard::with_stack(pg_query_stack(sql), || pg_query::parse(sql)).map_err(pg_query_error)
 }
 
 /// Deparse a parse tree back to SQL text (libpg_query's deparser).
 pub fn deparse(protobuf: &pg_query::protobuf::ParseResult) -> Result<String, ParseError> {
     count_libpg_query_call();
-    pg_query::deparse(protobuf).map_err(|e| ParseError::ParseError(e.to_string()))
+    turso_stack_guard::with_stack(PG_DEPARSE_STACK, || pg_query::deparse(protobuf)).map_err(pg_query_error)
 }
 
 /// The highest parameter number a statement may hold: Bind counts parameters in 16 bits. A `$n`
@@ -60,9 +115,10 @@ pub const MAX_PARAMETER: u32 = 65535;
 /// tree whose parameters cannot be read, is refused (fail closed).
 pub fn checked_param_numbers(parse: &ParseResult, sql: &str) -> Result<Vec<i32>, ParseError> {
     let unreadable = || {
-        ParseError::ParseError(
+        ParseError::ParseError(SqlErrorMessage::classified(
+            SqlErrorKind::InternalError,
             "could not read the statement's parameters from its parse tree".to_string(),
-        )
+        ))
     };
     let mut numbers = Vec::new();
     for (number, location) in param_refs(parse).ok_or_else(unreadable)? {
@@ -86,7 +142,7 @@ pub fn checked_param_numbers(parse: &ParseResult, sql: &str) -> Result<Vec<i32>,
             _ => {
                 return Err(ParseError::ParseError(format!(
                     "parameter number too large at or near \"${text}\""
-                )))
+                ).into()))
             }
         }
     }
@@ -299,7 +355,7 @@ pub fn skip_blank(b: &[u8], mut i: usize) -> Option<usize> {
 pub fn split_statements(sql: &str) -> Result<Vec<String>, ParseError> {
     count_libpg_query_call();
     let parts =
-        pg_query::split_with_parser(sql).map_err(|e| ParseError::ParseError(e.to_string()))?;
+        turso_stack_guard::with_stack(pg_query_stack(sql), || pg_query::split_with_parser(sql)).map_err(pg_query_error)?;
     Ok(parts
         .into_iter()
         .map(|s| pg_trim(s).to_string())
@@ -318,7 +374,7 @@ pub fn split_statements(sql: &str) -> Result<Vec<String>, ParseError> {
 pub fn split_statements_lenient(sql: &str) -> Result<Vec<String>, ParseError> {
     count_libpg_query_call();
     let found =
-        pg_query::split_with_scanner(sql).map_err(|e| ParseError::ParseError(e.to_string()))?;
+        turso_stack_guard::with_stack(pg_query_stack(sql), || pg_query::split_with_scanner(sql)).map_err(pg_query_error)?;
     let b = sql.as_bytes();
     let blank = |gap: &[u8]| skip_blank(gap, 0) == Some(gap.len());
     let mut parts = Vec::with_capacity(found.len());
@@ -330,7 +386,7 @@ pub fn split_statements_lenient(sql: &str) -> Result<Vec<String>, ParseError> {
             .checked_sub(sql.as_ptr() as usize)
             .filter(|start| *start >= at && *start + part.len() <= b.len())
             .ok_or_else(|| {
-                ParseError::ParseError("the scanner split lost its place".to_string())
+                ParseError::ParseError("the scanner split lost its place".to_string().into())
             })?;
         if !blank(&b[at..start]) {
             parts.push(&sql[at..start]);
@@ -361,15 +417,15 @@ pub fn get_tables(sql: &str) -> Result<Vec<String>, ParseError> {
 /// Normalize a query (replace constants with $1, $2, etc.)
 pub fn normalize(sql: &str) -> Result<String, ParseError> {
     count_libpg_query_call();
-    pg_query::normalize(sql).map_err(|e| ParseError::ParseError(e.to_string()))
+    turso_stack_guard::with_stack(pg_query_stack(sql), || pg_query::normalize(sql)).map_err(pg_query_error)
 }
 
 /// Get a fingerprint for a query (for caching/deduplication)
 pub fn fingerprint(sql: &str) -> Result<String, ParseError> {
     count_libpg_query_call();
-    pg_query::fingerprint(sql)
+    turso_stack_guard::with_stack(pg_query_stack(sql), || pg_query::fingerprint(sql))
         .map(|fp| fp.hex)
-        .map_err(|e| ParseError::ParseError(e.to_string()))
+        .map_err(pg_query_error)
 }
 
 /// What a schema qualifier names in this frontend: the one rule every reader of a relation's or a

@@ -553,6 +553,8 @@ pub fn optimize_plan(
     plan: &mut Plan,
     resolver: &Resolver,
 ) -> Result<()> {
+    // Stack-guard class (fastest-engine): a recursive entry is a nested step (`stack::NestGuard`).
+    let _nest = crate::stack::NestGuard::enter("a recursive step")?;
     let resources_before = subquery_resources(plan);
     match plan {
         Plan::Select(plan) => optimize_select_plan(plan, resolver)?,
@@ -787,7 +789,7 @@ fn transform_match_to_fts_match(
 
     if match_without_fts {
         return Err(LimboError::ParseError(
-            "unable to use function MATCH in the requested context".to_string(),
+            "unable to use function MATCH in the requested context".to_string().into(),
         ));
     }
 
@@ -882,7 +884,7 @@ struct SubqueryPlanCache {
  * Make a few passes over the plan to optimize it.
  * TODO: these could probably be done in less passes,
  * but having them separate makes them easier to understand
- */
+*/
 #[turso_macros::trace_stack]
 pub fn optimize_select_plan(plan: &mut SelectPlan, resolver: &Resolver) -> Result<()> {
     let mut cache = SubqueryPlanCache::default();
@@ -3111,7 +3113,7 @@ fn build_vtab_scan_op(
             "Constraint usage count mismatch (expected {}, got {})",
             vtab_constraints.len(),
             constraint_usages.len()
-        )));
+        ).into()));
     }
 
     let mut constraints = vec![None; constraint_usages.len()];
@@ -3126,7 +3128,7 @@ fn build_vtab_scan_op(
                     "argv_index {} is out of valid range [1..{}]",
                     idx,
                     constraint_usages.len()
-                )));
+                ).into()));
             }
             None => continue,
         };
@@ -3135,7 +3137,7 @@ fn build_vtab_scan_op(
         if constraints[zero_based_argv_index].is_some() {
             return Err(LimboError::ExtensionError(format!(
                 "duplicate argv_index {argv_index}"
-            )));
+            ).into()));
         }
 
         let constraint = &table_constraints.constraints[vtab_constraint.index];
@@ -3157,7 +3159,7 @@ fn build_vtab_scan_op(
                 LimboError::ExtensionError(format!(
                     "argv_index values must form contiguous sequence starting from 1, missing index {}",
                     i + 1
-                ))
+                ).into())
             })
         })
         .collect::<Result<Vec<_>>>()?;

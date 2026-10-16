@@ -9,6 +9,7 @@
 
 use crate::catalog::sqlite_type_to_pg_oid;
 use turso_core::schema::{Column, Schema};
+use turso_parser::sql_error::{SqlErrorKind, SqlErrorMessage};
 use turso_pg_parser::pg_query::protobuf::{node::Node, Node as PgNode, SelectStmt};
 use turso_pg_parser::pg_query::ParseResult;
 
@@ -594,7 +595,7 @@ pub fn parameter_types(
     search_path: &[String],
     cache: &parking_lot::Mutex<ViewCache>,
     attached: &Attached<'_>,
-) -> Result<Walked, String> {
+) -> Result<Walked, SqlErrorMessage> {
     let memo = {
         let mut cache = cache.lock();
         let same = cache
@@ -645,7 +646,7 @@ fn parameter_types_with(
     search_path: &[String],
     view_memo: &std::rc::Rc<std::cell::RefCell<ViewMemo>>,
     attached: &Attached<'_>,
-) -> Result<Walked, String> {
+) -> Result<Walked, SqlErrorMessage> {
     let mut infer = Infer {
         schema,
         types: std::collections::BTreeMap::new(),
@@ -761,7 +762,7 @@ struct Infer<'a> {
     /// A column reference that names no FROM entry (`s.t.c` with no relation s.t in scope),
     /// PostgreSQL's errorMissingRTE (42P01): the statement is refused with it. Shared with the walks
     /// of the statement's own subqueries, not with a view's (wire review 17 item 5).
-    missing_rte: std::rc::Rc<std::cell::RefCell<Option<String>>>,
+    missing_rte: std::rc::Rc<std::cell::RefCell<Option<SqlErrorMessage>>>,
 }
 
 /// The stack a view's reading starts with, and the stack grown for it when less is left: each view
@@ -1870,7 +1871,10 @@ impl Infer<'_> {
                     Some(Rel::Unknown { .. }) => Some(None),
                     _ => {
                         self.missing_rte.borrow_mut().get_or_insert_with(|| {
-                            format!("missing FROM-clause entry for table \"{table}\"")
+                            SqlErrorMessage::classified(
+                                SqlErrorKind::UndefinedTable,
+                                format!("missing FROM-clause entry for table \"{table}\""),
+                            )
                         });
                         Some(None)
                     }

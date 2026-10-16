@@ -3,6 +3,7 @@
 // This module translates pg_query's PostgreSQL AST into Turso's SQL AST
 // representation, handling the semantic differences between PostgreSQL and SQLite.
 
+use turso_parser::sql_error::{SqlErrorKind, SqlErrorMessage};
 use crate::{schema_qualifier, ParseError, SchemaQualifier};
 use pg_query::protobuf::JoinType as PgJoinType;
 use pg_query::{NodeRef, ParseResult};
@@ -317,8 +318,8 @@ impl PostgreSQLTranslator {
         };
         if reads_lateral {
             return Err(ParseError::ParseError(
-                "* over a LATERAL subquery is not supported: name its columns as alias.column"
-                    .into(),
+                SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, "* over a LATERAL subquery is not supported: name its columns as alias.column"
+                    ),
             ));
         }
         Ok(())
@@ -479,7 +480,7 @@ impl PostgreSQLTranslator {
         let translated = self.translate_with_prereqs(parse_result)?;
         let ast::Cmd::Stmt(stmt) = translated.cmd else {
             return Err(ParseError::ParseError(
-                "expected a PostgreSQL statement".to_string(),
+                "expected a PostgreSQL statement".to_string().into(),
             ));
         };
         Ok(stmt)
@@ -492,7 +493,7 @@ impl PostgreSQLTranslator {
         parse_result: &ParseResult,
     ) -> Result<TranslateResult, ParseError> {
         if parse_result.protobuf.nodes().is_empty() {
-            return Err(ParseError::ParseError("No statements found".to_string()));
+            return Err(ParseError::ParseError("No statements found".to_string().into()));
         }
 
         let node = &parse_result.protobuf.nodes()[0];
@@ -518,6 +519,8 @@ impl PostgreSQLTranslator {
     }
 
     fn translate_node(&self, node: NodeRef<'_>) -> Result<ast::Stmt, ParseError> {
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = crate::nest()?;
         Ok(match node {
             NodeRef::SelectStmt(select) => {
                 // Top-level SELECT ... INTO is PG's legacy spelling of
@@ -544,15 +547,15 @@ impl PostgreSQLTranslator {
             NodeRef::CreateDomainStmt(domain) => self.translate_create_domain(domain)?,
             NodeRef::CopyStmt(_) => {
                 return Err(ParseError::ParseError(
-                    "COPY is handled at the postgres frontend layer".to_string(),
+                    "COPY is handled at the postgres frontend layer".to_string().into(),
                 ))
             }
             NodeRef::CreateSeqStmt(seq) => self.translate_create_sequence(seq)?,
             _ => {
-                return Err(ParseError::ParseError(format!(
+                return Err(ParseError::ParseError(SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, format!(
                     "{} is not supported",
                     node_ref_name(&node)
-                )))
+                ))))
             }
         })
     }
@@ -563,14 +566,16 @@ impl PostgreSQLTranslator {
     ) -> Result<ast::Cmd, ParseError> {
         if !explain.options.is_empty() {
             return Err(ParseError::ParseError(
-                "EXPLAIN options are not supported".to_string(),
+                SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, "EXPLAIN options are not supported".to_string()),
             ));
         }
         let query = explain
             .query
             .as_ref()
             .and_then(|query| query.node.as_ref())
-            .ok_or_else(|| ParseError::ParseError("EXPLAIN missing statement".to_string()))?;
+            .ok_or_else(|| {
+                ParseError::ParseError("EXPLAIN missing statement".to_string().into())
+            })?;
         Ok(ast::Cmd::ExplainQueryPlan {
             stmt: self.translate_node(query.to_ref())?,
             format: ast::EqpFormat::Text,
@@ -598,7 +603,7 @@ impl PostgreSQLTranslator {
         // columns alone (PG 18.6 recorded, pg18-inherits.out).
         if !create.inh_relations.is_empty() {
             return Err(ParseError::ParseError(
-                "CREATE TABLE ... INHERITS and PARTITION OF are not supported".into(),
+                SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, "CREATE TABLE ... INHERITS and PARTITION OF are not supported"),
             ));
         }
 
@@ -712,7 +717,7 @@ impl PostgreSQLTranslator {
                 // dropped, leaving a table without them (and an engine panic on a later DROP).
                 Node::TableLikeClause(_) => {
                     return Err(ParseError::ParseError(
-                        "CREATE TABLE ... (LIKE ...) is not supported".into(),
+                        SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, "CREATE TABLE ... (LIKE ...) is not supported"),
                     ));
                 }
                 _ => {}
@@ -787,7 +792,7 @@ impl PostgreSQLTranslator {
         let is_serial = is_serial_type(&pg_type) || is_identity;
 
         let mapping = map_pg_type(&pg_type, &typmods).ok_or_else(|| {
-            ParseError::ParseError(format!("unsupported PostgreSQL type: {pg_type}"))
+            ParseError::ParseError(format!("unsupported PostgreSQL type: {pg_type}").into())
         })?;
 
         // Serial does NOT imply PRIMARY KEY in PostgreSQL
@@ -848,13 +853,13 @@ impl PostgreSQLTranslator {
                 // (428C9: COMPAT).
                 ConstrType::ConstrIdentity if !constraint.options.is_empty() => {
                     return Err(ParseError::ParseError(
-                        "identity column sequence options are not supported".into(),
+                        SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, "identity column sequence options are not supported"),
                     ));
                 }
                 // The engine holds no stored generated column; dropped, the column read NULL.
                 ConstrType::ConstrGenerated => {
                     return Err(ParseError::ParseError(
-                        "generated columns are not supported".into(),
+                        SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, "generated columns are not supported"),
                     ));
                 }
                 // A column constraint's deferral arrives as attribute nodes after it in the raw
@@ -1073,11 +1078,11 @@ impl PostgreSQLTranslator {
         });
         if read_only {
             return Err(ParseError::ParseError(
-                "READ ONLY transactions are not supported".into(),
+                SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, "READ ONLY transactions are not supported"),
             ));
         }
         if txn.chain {
-            return Err(ParseError::ParseError("AND CHAIN is not supported".into()));
+            return Err(ParseError::ParseError(SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, "AND CHAIN is not supported")));
         }
         match TransactionStmtKind::try_from(txn.kind) {
             Ok(TransactionStmtKind::TransStmtBegin | TransactionStmtKind::TransStmtStart) => {
@@ -1101,10 +1106,10 @@ impl PostgreSQLTranslator {
                 tx_name: None,
                 savepoint_name: Some(ast::Name::from_string(&txn.savepoint_name)),
             }),
-            _ => Err(ParseError::ParseError(format!(
+            _ => Err(ParseError::ParseError(SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, format!(
                 "Unsupported transaction statement kind: {}",
                 txn.kind
-            ))),
+            )))),
         }
     }
 
@@ -1186,29 +1191,29 @@ impl PostgreSQLTranslator {
             }
             AlterTableType::AtColumnDefault => {
                 return Err(ParseError::ParseError(
-                    "ALTER COLUMN SET/DROP DEFAULT is not supported".into(),
+                    SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, "ALTER COLUMN SET/DROP DEFAULT is not supported"),
                 ));
             }
             AlterTableType::AtDropNotNull => {
                 return Err(ParseError::ParseError(
-                    "ALTER COLUMN DROP NOT NULL is not supported".into(),
+                    SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, "ALTER COLUMN DROP NOT NULL is not supported"),
                 ));
             }
             AlterTableType::AtSetNotNull => {
                 return Err(ParseError::ParseError(
-                    "ALTER COLUMN SET NOT NULL is not supported".into(),
+                    SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, "ALTER COLUMN SET NOT NULL is not supported"),
                 ));
             }
             AlterTableType::AtAddConstraint => {
                 return Err(ParseError::ParseError(
-                    "ALTER TABLE ADD CONSTRAINT is not supported".into(),
+                    SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, "ALTER TABLE ADD CONSTRAINT is not supported"),
                 ));
             }
             _ => {
-                return Err(ParseError::ParseError(format!(
+                return Err(ParseError::ParseError(SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, format!(
                     "ALTER TABLE {} is not supported",
                     alter_subtype_name(subtype)
-                )));
+                ))));
             }
         };
 
@@ -1246,9 +1251,9 @@ impl PostgreSQLTranslator {
                     body: ast::AlterTableBody::RenameColumn { old, new },
                 }))
             }
-            _ => Err(ParseError::ParseError(format!(
+            _ => Err(ParseError::ParseError(SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, format!(
                 "Unsupported RENAME type: {rename_type:?}"
-            ))),
+            )))),
         }
     }
 
@@ -1265,7 +1270,7 @@ impl PostgreSQLTranslator {
         let pg_type = extract_type_name(col_def)?;
         let typmods = extract_integer_typmods(col_def);
         let mapping = map_pg_type(&pg_type, &typmods).ok_or_else(|| {
-            ParseError::ParseError(format!("unsupported PostgreSQL type: {pg_type}"))
+            ParseError::ParseError(format!("unsupported PostgreSQL type: {pg_type}").into())
         })?;
         let size = match mapping.type_params.as_slice() {
             [p, s] => Some(ast::TypeSize::TypeSize(
@@ -1490,10 +1495,10 @@ impl PostgreSQLTranslator {
                 if_exists: drop.missing_ok,
                 seq_name: qualified_name,
             }),
-            _ => Err(ParseError::ParseError(format!(
+            _ => Err(ParseError::ParseError(SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, format!(
                 "DROP {} is not supported",
                 drop_object_type_name(remove_type)
-            ))),
+            )))),
         }
     }
 
@@ -1589,21 +1594,20 @@ impl PostgreSQLTranslator {
             }
         };
 
-        let into_clause = ctas
-            .into
-            .as_ref()
-            .ok_or_else(|| ParseError::ParseError(format!("{label}: missing INTO clause")))?;
+        let into_clause = ctas.into.as_ref().ok_or_else(|| {
+            ParseError::ParseError(format!("{label}: missing INTO clause").into())
+        })?;
 
         let query_node = ctas
             .query
             .as_ref()
-            .ok_or_else(|| ParseError::ParseError(format!("{label}: missing query")))?;
+            .ok_or_else(|| ParseError::ParseError(format!("{label}: missing query").into()))?;
         let select_stmt = match &query_node.node {
             Some(pg_query::protobuf::node::Node::SelectStmt(s)) => s,
             _ => {
                 return Err(ParseError::ParseError(format!(
                     "{label}: expected SELECT statement"
-                )));
+                ).into()));
             }
         };
 
@@ -1661,7 +1665,7 @@ impl PostgreSQLTranslator {
         // column list rather than silently misname columns.
         if !into_clause.col_names.is_empty() {
             return Err(ParseError::ParseError(
-                "CREATE TABLE AS: explicit column list is not supported".into(),
+                SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, "CREATE TABLE AS: explicit column list is not supported"),
             ));
         }
 
@@ -1796,8 +1800,8 @@ impl PostgreSQLTranslator {
                 // one column left.
                 let declared = self.columns_of(relation).ok_or_else(|| {
                     ParseError::ParseError(
-                        "DEFAULT in a VALUES list without a column list is not supported here"
-                            .into(),
+                        SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, "DEFAULT in a VALUES list without a column list is not supported here"
+                            ),
                     )
                 })?;
                 if width > declared.len() {
@@ -2092,17 +2096,17 @@ impl PostgreSQLTranslator {
                 from_item_refnames(item, &mut names);
             }
             if names.iter().any(|n| n == target) {
-                return Err(ParseError::ParseError(format!(
+                return Err(ParseError::ParseError(SqlErrorMessage::classified(SqlErrorKind::DuplicateAlias, format!(
                     "table name \"{target}\" specified more than once"
-                )));
+                ))));
             }
             // With no column lookup (core's dialect parse) the target's row has no name that is
             // known not to be a declared column: refused, never the bare rowid a declared column
             // of that name shadows (wire review 16 item 21; review 13 item 5's bug).
             if self.columns.is_none() {
                 return Err(ParseError::ParseError(
-                    "DELETE ... USING is not supported here: the target's columns cannot be read"
-                        .into(),
+                    SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, "DELETE ... USING is not supported here: the target's columns cannot be read"
+                        ),
                 ));
             }
             let target_columns = self.columns_of(relation);
@@ -2121,10 +2125,10 @@ impl PostgreSQLTranslator {
                 .into_iter()
                 .find(|name| !declared(*name))
                 .ok_or_else(|| {
-                    ParseError::ParseError(format!(
+                    ParseError::ParseError(SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, format!(
                         "DELETE ... USING on \"{target}\", which declares columns named rowid, \
                          _rowid_ and oid, is not supported: no name is left for its rows"
-                    ))
+                    )))
                 })?;
             let mut items = vec![pg_query::protobuf::Node {
                 node: Some(pg_query::protobuf::node::Node::RangeVar(relation.clone())),
@@ -2182,6 +2186,8 @@ impl PostgreSQLTranslator {
         &self,
         select: &pg_query::protobuf::SelectStmt,
     ) -> Result<ast::Select, ParseError> {
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = crate::nest()?;
         self.in_cte_scope(&select.with_clause, || {
             self.translate_select_in_scope(select)
         })
@@ -2214,7 +2220,7 @@ impl PostgreSQLTranslator {
             for row_node in &select.values_lists {
                 let Some(pg_query::protobuf::node::Node::List(list)) = &row_node.node else {
                     return Err(ParseError::ParseError(
-                        "VALUES: expected list node".to_string(),
+                        "VALUES: expected list node".to_string().into(),
                     ));
                 };
                 let mut exprs = Vec::new();
@@ -2250,7 +2256,7 @@ impl PostgreSQLTranslator {
             let target_list = &select.target_list;
             if target_list.is_empty() {
                 return Err(ParseError::ParseError(
-                    "SELECT requires at least one column or expression".to_string(),
+                    "SELECT requires at least one column or expression".to_string().into(),
                 ));
             }
 
@@ -2306,6 +2312,8 @@ impl PostgreSQLTranslator {
         &self,
         select: &pg_query::protobuf::SelectStmt,
     ) -> Result<ast::Select, ParseError> {
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = crate::nest()?;
         // The left spine of the tree flattens into a list the engine runs left to right, which is
         // PostgreSQL's order for it: pg_query represents A UNION B UNION C, and A INTERSECT B UNION
         // C, as SetOp(SetOp(A, B), C). Anything else is an arm of its own, a subquery
@@ -2321,7 +2329,7 @@ impl PostgreSQLTranslator {
         Self::flatten_set_operation(select, &mut parts)?;
 
         if parts.is_empty() {
-            return Err(ParseError::ParseError("Empty set operation".to_string()));
+            return Err(ParseError::ParseError("Empty set operation".to_string().into()));
         }
 
         // First part becomes the primary select
@@ -2332,7 +2340,7 @@ impl PostgreSQLTranslator {
         let mut compounds = Vec::new();
         for (op, stmt, wrap) in parts.iter().skip(1) {
             let operator =
-                op.ok_or_else(|| ParseError::ParseError("Missing compound operator".to_string()))?;
+                op.ok_or_else(|| ParseError::ParseError("Missing compound operator".to_string().into()))?;
             compounds.push(ast::CompoundSelect {
                 operator,
                 select: self.translate_set_arm(stmt, *wrap)?,
@@ -2363,6 +2371,8 @@ impl PostgreSQLTranslator {
         stmt: &pg_query::protobuf::SelectStmt,
         wrap: bool,
     ) -> Result<ast::OneSelect, ParseError> {
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = crate::nest()?;
         if !wrap {
             return self.translate_one_select(stmt);
         }
@@ -2419,7 +2429,7 @@ impl PostgreSQLTranslator {
             // dropping the duplicates PostgreSQL keeps (wire review 11 item 14).
             (SetOperation::SetopIntersect | SetOperation::SetopExcept, true) => {
                 return Err(ParseError::ParseError(
-                    "INTERSECT ALL and EXCEPT ALL are not supported".into(),
+                    SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, "INTERSECT ALL and EXCEPT ALL are not supported"),
                 ))
             }
             (SetOperation::SetopIntersect, false) => ast::CompoundOperator::Intersect,
@@ -2454,6 +2464,8 @@ impl PostgreSQLTranslator {
         &self,
         select: &pg_query::protobuf::SelectStmt,
     ) -> Result<ast::OneSelect, ParseError> {
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = crate::nest()?;
         // Compound-select leaves carry their own IntoClause. PG allows INTO
         // only on the first leaf of a top-level compound; reject all of them
         // rather than implement that form.
@@ -2473,7 +2485,7 @@ impl PostgreSQLTranslator {
             let target_list = &select.target_list;
             if target_list.is_empty() {
                 return Err(ParseError::ParseError(
-                    "SELECT requires at least one column or expression".to_string(),
+                    "SELECT requires at least one column or expression".to_string().into(),
                 ));
             }
 
@@ -2512,6 +2524,8 @@ impl PostgreSQLTranslator {
         &self,
         from_items: &[pg_query::protobuf::Node],
     ) -> Result<ast::FromClause, ParseError> {
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = crate::nest()?;
         let mut from_clause = self.translate_from_clause(&from_items[0])?;
         // Additional FROM items are comma-joins (implicit cross join)
         for item in &from_items[1..] {
@@ -2532,9 +2546,9 @@ impl PostgreSQLTranslator {
                     self.translate_range_subselect(range_sub)?
                 }
                 other => {
-                    return Err(ParseError::ParseError(format!(
+                    return Err(ParseError::ParseError(SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, format!(
                         "Unsupported FROM item type: {other:?}"
-                    )));
+                    ))));
                 }
             };
             from_clause.joins.push(ast::JoinedSelectTable {
@@ -2550,6 +2564,8 @@ impl PostgreSQLTranslator {
         &self,
         from_item: &pg_query::protobuf::Node,
     ) -> Result<ast::FromClause, ParseError> {
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = crate::nest()?;
         match &from_item.node {
             Some(pg_query::protobuf::node::Node::RangeVar(range_var)) => {
                 let select_table = self.translate_range_var(range_var)?;
@@ -2576,10 +2592,10 @@ impl PostgreSQLTranslator {
                     joins: vec![],
                 })
             }
-            _ => Err(ParseError::ParseError(format!(
+            _ => Err(ParseError::ParseError(SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, format!(
                 "Unsupported FROM clause type: {:?}",
                 from_item.node
-            ))),
+            )))),
         }
     }
 
@@ -2633,12 +2649,12 @@ impl PostgreSQLTranslator {
                     })?,
             };
             if a.colnames.len() > declared.len() {
-                return Err(ParseError::ParseError(format!(
+                return Err(ParseError::ParseError(SqlErrorMessage::classified(SqlErrorKind::InvalidColumnReference, format!(
                     "table \"{}\" has {} columns available but {} columns specified",
                     a.aliasname,
                     declared.len(),
                     a.colnames.len()
-                )));
+                ))));
             }
             let renamed = {
                 let mut renamed = declared.clone();
@@ -2751,21 +2767,22 @@ impl PostgreSQLTranslator {
         &self,
         range_sub: &pg_query::protobuf::RangeSubselect,
     ) -> Result<ast::SelectTable, ParseError> {
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = crate::nest()?;
         if range_sub.lateral {
             return Err(ParseError::ParseError(
                 "LATERAL is supported only as CROSS JOIN LATERAL of a subquery of expressions"
                     .into(),
             ));
         }
-        let subquery_node = range_sub
-            .subquery
-            .as_ref()
-            .ok_or_else(|| ParseError::ParseError("RangeSubselect missing subquery".to_string()))?;
+        let subquery_node = range_sub.subquery.as_ref().ok_or_else(|| {
+            ParseError::ParseError("RangeSubselect missing subquery".to_string().into())
+        })?;
         let select_stmt = match &subquery_node.node {
             Some(pg_query::protobuf::node::Node::SelectStmt(s)) => s,
             _ => {
                 return Err(ParseError::ParseError(
-                    "RangeSubselect subquery is not a SelectStmt".to_string(),
+                    "RangeSubselect subquery is not a SelectStmt".to_string().into(),
                 ));
             }
         };
@@ -2786,12 +2803,12 @@ impl PostgreSQLTranslator {
     ) -> Result<ast::SelectTable, ParseError> {
         if range_func.lateral {
             return Err(ParseError::ParseError(
-                "LATERAL is not supported on a function in FROM".into(),
+                SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, "LATERAL is not supported on a function in FROM"),
             ));
         }
         if range_func.ordinality {
             return Err(ParseError::ParseError(
-                "WITH ORDINALITY is not supported on a function in FROM".into(),
+                SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, "WITH ORDINALITY is not supported on a function in FROM"),
             ));
         }
         // RangeFunction.functions is a list of function-call items.
@@ -2819,10 +2836,10 @@ impl PostgreSQLTranslator {
             }
             Some(pg_query::protobuf::node::Node::FuncCall(fc)) => fc,
             _ => {
-                return Err(ParseError::ParseError(format!(
+                return Err(ParseError::ParseError(SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, format!(
                     "Unsupported RangeFunction item: {:?}",
                     func_item.node
-                )));
+                ))));
             }
         };
 
@@ -2950,9 +2967,9 @@ impl PostgreSQLTranslator {
                 let mut scopes = self.lateral_scopes.borrow_mut();
                 let scope = scopes.last_mut().ok_or_else(|| {
                     ParseError::ParseError(
-                        "generate_series reading another FROM item's columns is not supported \
+                        SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, "generate_series reading another FROM item's columns is not supported \
                          outside a SELECT"
-                            .into(),
+                            ),
                     )
                 })?;
                 scope.series.push((table_name.clone(), column_name));
@@ -2998,9 +3015,9 @@ impl PostgreSQLTranslator {
         // The engine names a table function's columns itself; a column list would rename them, and
         // dropping it silently would answer under the wrong names.
         if colnames > 0 {
-            return Err(ParseError::ParseError(format!(
+            return Err(ParseError::ParseError(SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, format!(
                 "column aliases are not supported on function {func_name} in FROM"
-            )));
+            ))));
         }
         Ok(ast::SelectTable::TableCall(
             ast::QualifiedName::single(ast::Name::from_string(func_name)),
@@ -3034,9 +3051,9 @@ impl PostgreSQLTranslator {
                 let mut tables = scope.series.iter().filter(|(_, c)| *c == column);
                 match (tables.next(), tables.next()) {
                     (Some((table, _)), None) => Ok(Some((table.clone(), column))),
-                    (Some(_), Some(_)) => Err(ParseError::ParseError(format!(
+                    (Some(_), Some(_)) => Err(ParseError::ParseError(SqlErrorMessage::classified(SqlErrorKind::AmbiguousColumn, format!(
                         "column reference \"{column}\" is ambiguous"
-                    ))),
+                    )))),
                     _ => Ok(None),
                 }
             }
@@ -3080,6 +3097,8 @@ impl PostgreSQLTranslator {
         &self,
         join_expr: &pg_query::protobuf::JoinExpr,
     ) -> Result<ast::FromClause, ParseError> {
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = crate::nest()?;
         if join_expr.is_natural || !join_expr.using_clause.is_empty() {
             if let Some(scope) = self.lateral_scopes.borrow_mut().last_mut() {
                 scope.merged = true;
@@ -3113,15 +3132,15 @@ impl PostgreSQLTranslator {
                     self.translate_range_subselect(range_sub)?
                 }
                 _ => {
-                    return Err(ParseError::ParseError(format!(
+                    return Err(ParseError::ParseError(SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, format!(
                         "Unsupported left side of JOIN: {:?}",
                         larg.node
-                    )));
+                    ))));
                 }
             }
         } else {
             return Err(ParseError::ParseError(
-                "Missing left side of JOIN".to_string(),
+                "Missing left side of JOIN".to_string().into(),
             ));
         };
 
@@ -3166,15 +3185,15 @@ impl PostgreSQLTranslator {
                     self.translate_range_subselect(range_sub)?
                 }
                 _ => {
-                    return Err(ParseError::ParseError(format!(
+                    return Err(ParseError::ParseError(SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, format!(
                         "Unsupported right side of JOIN: {:?}",
                         rarg.node
-                    )));
+                    ))));
                 }
             }
         } else {
             return Err(ParseError::ParseError(
-                "Missing right side of JOIN".to_string(),
+                "Missing right side of JOIN".to_string().into(),
             ));
         };
 
@@ -3304,7 +3323,7 @@ impl PostgreSQLTranslator {
                 }
                 _ => {
                     return Err(ParseError::ParseError(
-                        "Unsupported target list item".to_string(),
+                        SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, "Unsupported target list item".to_string()),
                     ));
                 }
             }
@@ -3314,6 +3333,8 @@ impl PostgreSQLTranslator {
     }
 
     fn translate_expr(&self, node: &pg_query::protobuf::Node) -> Result<ast::Expr, ParseError> {
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = crate::nest()?;
         match &node.node {
             Some(pg_query::protobuf::node::Node::ColumnRef(col_ref)) => {
                 if let Some((table, _)) = self.series_column(col_ref)? {
@@ -3335,7 +3356,7 @@ impl PostgreSQLTranslator {
                                         "column \"{}\" of a LATERAL subquery must be qualified \
                                          by the subquery's alias",
                                         s.sval
-                                    )));
+                                    ).into()));
                                 }
                                 Ok(ast::Expr::Id(ast::Name::from_string(s.sval.clone())))
                             } else {
@@ -3391,15 +3412,15 @@ impl PostgreSQLTranslator {
                             // SELECT * case - should be handled in translate_target_list, not here
                             Err(ParseError::ParseError(
                                 "AStar should be handled in target list, not as expression"
-                                    .to_string(),
+                                    .to_string().into(),
                             ))
                         }
                         other => Err(ParseError::ParseError(format!(
                             "Invalid column reference, expected String or AStar but got: {other:?}"
-                        ))),
+                        ).into())),
                     }
                 } else {
-                    Err(ParseError::ParseError("Empty column reference".to_string()))
+                    Err(ParseError::ParseError("Empty column reference".to_string().into()))
                 }
             }
             Some(pg_query::protobuf::node::Node::AConst(a_const)) => self.translate_const(a_const),
@@ -3419,7 +3440,7 @@ impl PostgreSQLTranslator {
                     self.translate_expr(arg)
                 } else {
                     Err(ParseError::ParseError(
-                        "COLLATE clause missing inner expression".to_string(),
+                        "COLLATE clause missing inner expression".to_string().into(),
                     ))
                 }
             }
@@ -3444,7 +3465,7 @@ impl PostgreSQLTranslator {
                     // (the PostgreSQL regression corpus, domain.sql).
                     if pg_type_name_to_ast_type(t).is_none() {
                         return Err(ParseError::ParseError(
-                            "a cast to an array of this type is not supported".into(),
+                            SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, "a cast to an array of this type is not supported"),
                         ));
                     }
                     return match arg.node.as_ref() {
@@ -3458,9 +3479,9 @@ impl PostgreSQLTranslator {
                             | pg_query::protobuf::node::Node::AArrayExpr(_),
                         ) => self.translate_expr(arg),
                         _ => Err(ParseError::ParseError(
-                            "a cast of this expression to an array type is not supported: the \
+                            SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, "a cast of this expression to an array type is not supported: the \
                              engine would cast it by the element's scalar type"
-                                .into(),
+                                ),
                         )),
                     };
                 }
@@ -3483,7 +3504,7 @@ impl PostgreSQLTranslator {
                         return Err(ParseError::ParseError(format!(
                             "syntax error at or near \"${}\"",
                             p.number
-                        )));
+                        ).into()));
                     }
                 }
                 let expr = Box::new(self.translate_expr(arg)?);
@@ -3501,7 +3522,7 @@ impl PostgreSQLTranslator {
                 let arg = null_test
                     .arg
                     .as_ref()
-                    .ok_or_else(|| ParseError::ParseError("NullTest missing arg".to_string()))?;
+                    .ok_or_else(|| ParseError::ParseError("NullTest missing arg".to_string().into()))?;
                 let expr = self.translate_expr(arg)?;
                 match null_test.nulltesttype() {
                     NullTestType::IsNotNull => Ok(ast::Expr::NotNull(Box::new(expr))),
@@ -3644,10 +3665,10 @@ impl PostgreSQLTranslator {
                             over_clause: None,
                         },
                     }),
-                    _ => Err(ParseError::ParseError(format!(
+                    _ => Err(ParseError::ParseError(SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, format!(
                         "Unsupported SqlValueFunction op: {}",
                         svf.op
-                    ))),
+                    )))),
                 }
             }
             Some(pg_query::protobuf::node::Node::SetToDefault(_)) => {
@@ -3743,9 +3764,9 @@ impl PostgreSQLTranslator {
                             );
                         }
                         other => {
-                            return Err(ParseError::ParseError(format!(
+                            return Err(ParseError::ParseError(SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, format!(
                                 "Unsupported indirection step: {other:?}"
-                            )));
+                            ))));
                         }
                     }
                 }
@@ -3764,13 +3785,13 @@ impl PostgreSQLTranslator {
             Some(pg_query::protobuf::node::Node::AStar(_)) => {
                 // SELECT * - this should be handled as ResultColumn::Star in translate_target_list
                 Err(ParseError::ParseError(
-                    "AStar should not be translated as expression".to_string(),
+                    "AStar should not be translated as expression".to_string().into(),
                 ))
             }
-            _ => Err(ParseError::ParseError(format!(
+            _ => Err(ParseError::ParseError(SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, format!(
                 "Unsupported expression type: {:?}",
                 node.node
-            ))),
+            )))),
         }
     }
 
@@ -3801,12 +3822,15 @@ impl PostgreSQLTranslator {
                         if b.boolval { "1" } else { "0" }.to_string(),
                     )))
                 }
-                _ => Err(ParseError::ParseError(
+                _ => Err(ParseError::ParseError(SqlErrorMessage::classified(
+                    SqlErrorKind::FeatureNotSupported,
                     "Unsupported constant type".to_string(),
-                )),
+                ))),
             }
         } else {
-            Err(ParseError::ParseError("Empty constant value".to_string()))
+            Err(ParseError::ParseError(
+                "Empty constant value".to_string().into(),
+            ))
         }
     }
 
@@ -3814,6 +3838,8 @@ impl PostgreSQLTranslator {
         &self,
         a_expr: &pg_query::protobuf::AExpr,
     ) -> Result<ast::Expr, ParseError> {
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = crate::nest()?;
         use pg_query::protobuf::AExprKind;
 
         match &a_expr.kind() {
@@ -3948,10 +3974,10 @@ impl PostgreSQLTranslator {
                     escape: None,
                 })
             }
-            _ => Err(ParseError::ParseError(format!(
+            _ => Err(ParseError::ParseError(SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, format!(
                 "Unsupported AExpr kind: {:?}",
                 a_expr.kind()
-            ))),
+            )))),
         }
     }
 
@@ -3969,7 +3995,7 @@ impl PostgreSQLTranslator {
                 Some(pg_query::protobuf::node::Node::String(s)) => Some(s.sval.as_str()),
                 _ => None,
             })
-            .ok_or_else(|| ParseError::ParseError("Missing operator name".to_string()))?;
+            .ok_or_else(|| ParseError::ParseError("Missing operator name".to_string().into()))?;
 
         // Handle unary operators (no left expression)
         if a_expr.lexpr.is_none() {
@@ -3991,9 +4017,9 @@ impl PostgreSQLTranslator {
                     ast::UnaryOperator::BitwiseNot,
                     Box::new(operand),
                 )),
-                _ => Err(ParseError::ParseError(format!(
+                _ => Err(ParseError::ParseError(SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, format!(
                     "Unsupported unary operator: {op_name}"
-                ))),
+                )))),
             };
         }
 
@@ -4004,7 +4030,7 @@ impl PostgreSQLTranslator {
             Box::new(self.translate_expr(rexpr)?)
         } else {
             return Err(ParseError::ParseError(
-                "Missing right expression".to_string(),
+                "Missing right expression".to_string().into(),
             ));
         };
 
@@ -4094,9 +4120,9 @@ impl PostgreSQLTranslator {
                 });
             }
             _ => {
-                return Err(ParseError::ParseError(format!(
+                return Err(ParseError::ParseError(SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, format!(
                     "Unsupported operator: {op_name}"
-                )));
+                ))));
             }
         };
 
@@ -4112,7 +4138,7 @@ impl PostgreSQLTranslator {
             Box::new(self.translate_expr(lexpr)?)
         } else {
             return Err(ParseError::ParseError(
-                "Missing left expression for IN operator".to_string(),
+                "Missing left expression for IN operator".to_string().into(),
             ));
         };
 
@@ -4128,13 +4154,13 @@ impl PostgreSQLTranslator {
                 }
                 _ => {
                     return Err(ParseError::ParseError(
-                        "Expected list for IN operator right side".to_string(),
+                        "Expected list for IN operator right side".to_string().into(),
                     ));
                 }
             }
         } else {
             return Err(ParseError::ParseError(
-                "Missing right expression for IN operator".to_string(),
+                "Missing right expression for IN operator".to_string().into(),
             ));
         };
 
@@ -4168,27 +4194,27 @@ impl PostgreSQLTranslator {
                 Some(pg_query::protobuf::node::Node::String(s)) => Some(s.sval.as_str()),
                 _ => None,
             })
-            .ok_or_else(|| ParseError::ParseError(format!("{kw}: missing operator name")))?;
+            .ok_or_else(|| ParseError::ParseError(format!("{kw}: missing operator name").into()))?;
 
         // The PG lexer rewrites != to <>.
         let not = match (op_name, is_all) {
             ("=", false) => false,
             ("<>", true) => true,
             _ => {
-                return Err(ParseError::ParseError(format!(
+                return Err(ParseError::ParseError(SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, format!(
                     "{op_name} {kw} (array) is not supported"
-                )));
+                ))));
             }
         };
 
         let lhs_node = a_expr
             .lexpr
             .as_ref()
-            .ok_or_else(|| ParseError::ParseError(format!("{kw}: missing lhs")))?;
+            .ok_or_else(|| ParseError::ParseError(format!("{kw}: missing lhs").into()))?;
         let rhs_node = a_expr
             .rexpr
             .as_ref()
-            .ok_or_else(|| ParseError::ParseError(format!("{kw}: missing rhs")))?;
+            .ok_or_else(|| ParseError::ParseError(format!("{kw}: missing rhs").into()))?;
         let lhs = self.translate_expr(lhs_node)?;
 
         if let Some(pg_query::protobuf::node::Node::AArrayExpr(arr)) = &rhs_node.node {
@@ -4233,13 +4259,13 @@ impl PostgreSQLTranslator {
                 Some(pg_query::protobuf::node::Node::String(s)) => &s.sval,
                 _ => {
                     return Err(ParseError::ParseError(
-                        "Invalid LIKE operator name".to_string(),
+                        "Invalid LIKE operator name".to_string().into(),
                     ));
                 }
             }
         } else {
             return Err(ParseError::ParseError(
-                "Missing LIKE operator name".to_string(),
+                "Missing LIKE operator name".to_string().into(),
             ));
         };
 
@@ -4248,9 +4274,9 @@ impl PostgreSQLTranslator {
             "~~" => false, // LIKE
             "!~~" => true, // NOT LIKE
             _ => {
-                return Err(ParseError::ParseError(format!(
+                return Err(ParseError::ParseError(SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, format!(
                     "Unsupported LIKE operator: {op_name}"
-                )));
+                ))));
             }
         };
 
@@ -4259,7 +4285,7 @@ impl PostgreSQLTranslator {
             Box::new(self.translate_expr(lexpr)?)
         } else {
             return Err(ParseError::ParseError(
-                "Missing left expression for LIKE operator".to_string(),
+                "Missing left expression for LIKE operator".to_string().into(),
             ));
         };
 
@@ -4267,7 +4293,7 @@ impl PostgreSQLTranslator {
             Box::new(self.translate_expr(rexpr)?)
         } else {
             return Err(ParseError::ParseError(
-                "Missing right expression for LIKE operator".to_string(),
+                "Missing right expression for LIKE operator".to_string().into(),
             ));
         };
 
@@ -4292,15 +4318,17 @@ impl PostgreSQLTranslator {
                 Some(pg_query::protobuf::node::Node::String(s)) => Some(s.sval.as_str()),
                 _ => None,
             })
-            .ok_or_else(|| ParseError::ParseError("Missing ILIKE operator name".to_string()))?;
+            .ok_or_else(|| {
+                ParseError::ParseError("Missing ILIKE operator name".to_string().into())
+            })?;
 
         let not = match op_name {
             "~~*" => false, // ILIKE
             "!~~*" => true, // NOT ILIKE
             _ => {
-                return Err(ParseError::ParseError(format!(
+                return Err(ParseError::ParseError(SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, format!(
                     "Unsupported ILIKE operator: {op_name}"
-                )));
+                ))));
             }
         };
 
@@ -4308,7 +4336,7 @@ impl PostgreSQLTranslator {
             self.translate_expr(lexpr)?
         } else {
             return Err(ParseError::ParseError(
-                "Missing left expression for ILIKE".to_string(),
+                "Missing left expression for ILIKE".to_string().into(),
             ));
         };
 
@@ -4316,7 +4344,7 @@ impl PostgreSQLTranslator {
             self.translate_expr(rexpr)?
         } else {
             return Err(ParseError::ParseError(
-                "Missing right expression for ILIKE".to_string(),
+                "Missing right expression for ILIKE".to_string().into(),
             ));
         };
 
@@ -4398,6 +4426,8 @@ impl PostgreSQLTranslator {
         &self,
         func_call: &pg_query::protobuf::FuncCall,
     ) -> Result<ast::Expr, ParseError> {
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = crate::nest()?;
         // Extract function name
         let func_name = func_call
             .funcname
@@ -4410,7 +4440,7 @@ impl PostgreSQLTranslator {
                 }
             })
             .next_back()
-            .ok_or_else(|| ParseError::ParseError("Missing function name".to_string()))?;
+            .ok_or_else(|| ParseError::ParseError("Missing function name".to_string().into()))?;
 
         // Translate FILTER clause
         let filter_clause = if let Some(ref filter) = func_call.agg_filter {
@@ -4731,6 +4761,8 @@ impl PostgreSQLTranslator {
         &self,
         case_expr: &pg_query::protobuf::CaseExpr,
     ) -> Result<ast::Expr, ParseError> {
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = crate::nest()?;
         // Translate optional base expression (CASE <expr> WHEN ...)
         let base = if let Some(arg) = &case_expr.arg {
             Some(Box::new(self.translate_expr(arg)?))
@@ -4747,21 +4779,21 @@ impl PostgreSQLTranslator {
                         Box::new(self.translate_expr(expr)?)
                     } else {
                         return Err(ParseError::ParseError(
-                            "CASE WHEN missing condition".to_string(),
+                            "CASE WHEN missing condition".to_string().into(),
                         ));
                     };
                     let then_expr = if let Some(result) = &case_when.result {
                         Box::new(self.translate_expr(result)?)
                     } else {
                         return Err(ParseError::ParseError(
-                            "CASE WHEN missing THEN result".to_string(),
+                            "CASE WHEN missing THEN result".to_string().into(),
                         ));
                     };
                     when_then_pairs.push((when_expr, then_expr));
                 }
                 _ => {
                     return Err(ParseError::ParseError(
-                        "Expected CaseWhen node in CASE expression".to_string(),
+                        "Expected CaseWhen node in CASE expression".to_string().into(),
                     ));
                 }
             }
@@ -4811,17 +4843,18 @@ impl PostgreSQLTranslator {
         &self,
         sub_link: &pg_query::protobuf::SubLink,
     ) -> Result<ast::Expr, ParseError> {
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = crate::nest()?;
         use pg_query::protobuf::SubLinkType;
 
-        let subselect_node = sub_link
-            .subselect
-            .as_ref()
-            .ok_or_else(|| ParseError::ParseError("SubLink missing subselect".to_string()))?;
+        let subselect_node = sub_link.subselect.as_ref().ok_or_else(|| {
+            ParseError::ParseError("SubLink missing subselect".to_string().into())
+        })?;
         let select_stmt = match &subselect_node.node {
             Some(pg_query::protobuf::node::Node::SelectStmt(s)) => s,
             _ => {
                 return Err(ParseError::ParseError(
-                    "SubLink subselect is not a SelectStmt".to_string(),
+                    "SubLink subselect is not a SelectStmt".to_string().into(),
                 ));
             }
         };
@@ -4833,7 +4866,7 @@ impl PostgreSQLTranslator {
             SubLinkType::AnySublink => {
                 // ANY/IN subquery: testexpr IN (SELECT ...)
                 let test_node = sub_link.testexpr.as_ref().ok_or_else(|| {
-                    ParseError::ParseError("ANY SubLink missing testexpr".to_string())
+                    ParseError::ParseError("ANY SubLink missing testexpr".to_string().into())
                 })?;
                 let lhs = self.translate_expr(test_node)?;
                 Ok(ast::Expr::InSelect {
@@ -4842,9 +4875,9 @@ impl PostgreSQLTranslator {
                     rhs: select,
                 })
             }
-            other => Err(ParseError::ParseError(format!(
+            other => Err(ParseError::ParseError(SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, format!(
                 "Unsupported SubLink type: {other:?}",
-            ))),
+            )))),
         }
     }
 
@@ -4852,6 +4885,8 @@ impl PostgreSQLTranslator {
         &self,
         with_clause: &Option<pg_query::protobuf::WithClause>,
     ) -> Result<Option<ast::With>, ParseError> {
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = crate::nest()?;
         use pg_query::protobuf::node::Node;
 
         let with_clause = match with_clause {
@@ -4877,12 +4912,12 @@ impl PostgreSQLTranslator {
             // a CYCLE clause is often what makes the query terminate at all).
             if cte.search_clause.is_some() {
                 return Err(ParseError::ParseError(
-                    "SEARCH clause on a common table expression is not supported".into(),
+                    SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, "SEARCH clause on a common table expression is not supported"),
                 ));
             }
             if cte.cycle_clause.is_some() {
                 return Err(ParseError::ParseError(
-                    "CYCLE clause on a common table expression is not supported".into(),
+                    SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, "CYCLE clause on a common table expression is not supported"),
                 ));
             }
 
@@ -5092,7 +5127,7 @@ impl PostgreSQLTranslator {
                         Box::new(self.translate_expr(sort_node)?)
                     } else {
                         return Err(ParseError::ParseError(
-                            "Missing sort expression".to_string(),
+                            "Missing sort expression".to_string().into(),
                         ));
                     };
 
@@ -5123,10 +5158,10 @@ impl PostgreSQLTranslator {
                     sorted_columns.push(ast::SortedColumn { expr, order, nulls });
                 }
                 _ => {
-                    return Err(ParseError::ParseError(format!(
+                    return Err(ParseError::ParseError(SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, format!(
                         "Unsupported ORDER BY clause item: {:?}",
                         node.node
-                    )));
+                    ))));
                 }
             }
         }
@@ -5137,11 +5172,13 @@ impl PostgreSQLTranslator {
         &self,
         bool_expr: &pg_query::protobuf::BoolExpr,
     ) -> Result<ast::Expr, ParseError> {
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = crate::nest()?;
         use pg_query::protobuf::BoolExprType;
 
         if bool_expr.args.is_empty() {
             return Err(ParseError::ParseError(
-                "BoolExpr must have at least 1 argument".to_string(),
+                "BoolExpr must have at least 1 argument".to_string().into(),
             ));
         }
 
@@ -5151,7 +5188,7 @@ impl PostgreSQLTranslator {
                 // NOT is unary, handle differently
                 if bool_expr.args.len() != 1 {
                     return Err(ParseError::ParseError(
-                        "NOT expression must have exactly 1 argument".to_string(),
+                        "NOT expression must have exactly 1 argument".to_string().into(),
                     ));
                 }
                 let operand = Box::new(self.translate_expr(&bool_expr.args[0])?);
@@ -5160,7 +5197,7 @@ impl PostgreSQLTranslator {
             BoolExprType::AndExpr => {
                 if bool_expr.args.len() < 2 {
                     return Err(ParseError::ParseError(
-                        "AND expression must have at least 2 arguments".to_string(),
+                        "AND expression must have at least 2 arguments".to_string().into(),
                     ));
                 }
                 // Combine all arguments into a binary tree with AND
@@ -5175,7 +5212,7 @@ impl PostgreSQLTranslator {
             BoolExprType::OrExpr => {
                 if bool_expr.args.len() < 2 {
                     return Err(ParseError::ParseError(
-                        "OR expression must have at least 2 arguments".to_string(),
+                        "OR expression must have at least 2 arguments".to_string().into(),
                     ));
                 }
                 // Combine all arguments into a binary tree with OR
@@ -5187,10 +5224,10 @@ impl PostgreSQLTranslator {
                 }
                 Ok(result)
             }
-            _ => Err(ParseError::ParseError(format!(
+            _ => Err(ParseError::ParseError(SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, format!(
                 "Unsupported BoolExpr type: {:?}",
                 bool_expr.boolop()
-            ))),
+            )))),
         }
     }
 
@@ -5244,7 +5281,7 @@ impl PostgreSQLTranslator {
                             if cache < 1 {
                                 return Err(ParseError::ParseError(format!(
                                     "CACHE ({cache}) must be greater than zero"
-                                )));
+                                ).into()));
                             }
                         }
                     }
@@ -5757,12 +5794,13 @@ fn float_literal(text: &str, type_name: &str) -> Result<ast::Expr, ParseError> {
     }
     if unsigned == "nan" && lower.len() - unsigned.len() == 0 {
         return Err(ParseError::ParseError(
-            "NaN is not supported: the engine holds no NaN".to_string(),
+            SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, "NaN is not supported: the engine holds no NaN".to_string()),
         ));
     }
     let invalid = || {
-        ParseError::ParseError(format!(
-            "invalid input syntax for type {type_name}: \"{text}\""
+        ParseError::ParseError(SqlErrorMessage::classified(
+            SqlErrorKind::InvalidTextRepresentation,
+            format!("invalid input syntax for type {type_name}: \"{text}\""),
         ))
     };
     // Rust's parser takes the infinity and NaN words too, which are handled above, and nothing
@@ -5777,9 +5815,9 @@ fn float_literal(text: &str, type_name: &str) -> Result<ast::Expr, ParseError> {
         v
     };
     if in_type.is_infinite() {
-        return Err(ParseError::ParseError(format!(
+        return Err(ParseError::ParseError(SqlErrorMessage::classified(SqlErrorKind::NumericValueOutOfRange, format!(
             "\"{text}\" is out of range for type {type_name}"
-        )));
+        ))));
     }
     literal(format!("{v:e}"))
 }
@@ -6001,9 +6039,9 @@ fn extract_key_columns(keys: &[pg_query::protobuf::Node]) -> Result<Vec<String>,
 fn refuse_match_full(constraint: &pg_query::protobuf::Constraint) -> Result<(), ParseError> {
     if constraint.fk_matchtype == "f" && constraint.fk_attrs.len() > 1 {
         return Err(ParseError::ParseError(
-            "MATCH FULL foreign keys over more than one column are not supported: the engine \
+            SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, "MATCH FULL foreign keys over more than one column are not supported: the engine \
              enforces MATCH SIMPLE"
-                .into(),
+                ),
         ));
     }
     Ok(())
@@ -6287,7 +6325,7 @@ pub struct PgCopyFromStmt {
     /// Why its options are refused, before the file is read: an option PostgreSQL knows that this
     /// COPY does not implement ("... is not supported", 0A000), or one PostgreSQL does not know or
     /// given twice (42601), as ProcessCopyOptions answers (wire review 17 item 6).
-    pub refused: Option<String>,
+    pub refused: Option<SqlErrorMessage>,
     pub table_name: String,
     pub schema_name: Option<String>,
     pub columns: Option<Vec<String>>,
@@ -6357,16 +6395,21 @@ pub fn try_extract_copy_from(parse_result: &ParseResult) -> Option<PgCopyFromStm
         };
         let name = def.defname.as_str();
         if seen.contains(&name) {
-            refused = Some("conflicting or redundant options".to_string());
+            refused = Some("conflicting or redundant options".to_string().into());
             break;
         }
         seen.push(name);
-        let unsupported = |what: &str| Some(format!("COPY {what} is not supported"));
+        let unsupported = |what: &str| {
+            Some(SqlErrorMessage::classified(
+                SqlErrorKind::FeatureNotSupported,
+                format!("COPY {what} is not supported"),
+            ))
+        };
         match name {
             "format" => match def_elem_string_val(def) {
                 Some(val) if val.eq_ignore_ascii_case("text") => {}
                 Some(val) => refused = unsupported(&format!("format \"{val}\"")),
-                None => refused = Some("COPY format requires a value".to_string()),
+                None => refused = Some("COPY format requires a value".to_string().into()),
             },
             "delimiter" => delimiter = def_elem_string_val(def),
             "null" => null_string = def_elem_string_val(def),
@@ -6386,11 +6429,11 @@ pub fn try_extract_copy_from(parse_result: &ParseResult) -> Option<PgCopyFromStm
                         "match" => refused = unsupported("HEADER MATCH"),
                         _ => {
                             refused =
-                                Some("header requires a Boolean value or \"match\"".to_string())
+                                Some("header requires a Boolean value or \"match\"".to_string().into())
                         }
                     }
                 }
-                _ => refused = Some("header requires a Boolean value or \"match\"".to_string()),
+                _ => refused = Some("header requires a Boolean value or \"match\"".to_string().into()),
             },
             "freeze"
             | "quote"
@@ -6404,7 +6447,7 @@ pub fn try_extract_copy_from(parse_result: &ParseResult) -> Option<PgCopyFromStm
             | "reject_limit"
             | "log_verbosity"
             | "default" => refused = unsupported(&format!("option \"{name}\"")),
-            _ => refused = Some(format!("option \"{name}\" not recognized")),
+            _ => refused = Some(format!("option \"{name}\" not recognized").into()),
         }
         if refused.is_some() {
             break;
@@ -6904,11 +6947,11 @@ fn check_using_returning(
     use pg_query::protobuf::node::Node;
     use pg_query::NodeRef;
     let unsupported = || {
-        ParseError::ParseError(
+        ParseError::ParseError(SqlErrorMessage::classified(
+            SqlErrorKind::FeatureNotSupported,
             "DELETE ... USING with a RETURNING of `*` or of a USING relation's columns is not \
-             supported: return the target's columns"
-                .into(),
-        )
+                 supported: return the target's columns",
+        ))
     };
     let has = |columns: &[String], name: &str| columns.iter().any(|c| c.eq_ignore_ascii_case(name));
     for target in returning {
@@ -6954,9 +6997,9 @@ fn check_using_returning(
                     let using_unknown = using.iter().any(|(_, cols)| cols.is_none());
                     let whole_row = using.iter().any(|(n, _)| n == name);
                     if in_target && using_has {
-                        return Err(ParseError::ParseError(format!(
+                        return Err(ParseError::ParseError(SqlErrorMessage::classified(SqlErrorKind::AmbiguousColumn, format!(
                             "column reference \"{name}\" is ambiguous"
-                        )));
+                        ))));
                     }
                     if using_unknown || (!in_target && (using_has || whole_row)) {
                         return Err(unsupported());
@@ -9966,4 +10009,3 @@ mod tests {
         assert_eq!(names, vec![Some("n".to_string()), Some("k".to_string())]);
     }
 }
-

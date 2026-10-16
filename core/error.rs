@@ -1,5 +1,7 @@
 use thiserror::Error;
 
+pub use turso_parser::sql_error::{SqlErrorKind, SqlErrorMessage};
+
 use crate::storage::page_cache::CacheError;
 
 #[derive(Debug, Clone, Error, miette::Diagnostic)]
@@ -21,16 +23,22 @@ pub enum LimboError {
     #[error("Database is full: {0}")]
     DatabaseFull(String),
     #[error("Parse error: {0}")]
-    ParseError(String),
+    ParseError(SqlErrorMessage),
     #[error(transparent)]
     #[diagnostic(transparent)]
-    LexerError(#[from] turso_parser::error::Error),
+    LexerError(turso_parser::error::Error),
+    /// A recursive entry of the parser or the engine found its thread's stack nearly spent
+    /// (`turso_stack_guard::NestGuard`, the stack-guard class): the statement nests too deeply for the
+    /// thread running it, and is refused rather than overflowing the thread, which would abort the
+    /// process. PostgreSQL's 54001 stack_depth_limit_exceeded, in its words.
+    #[error("stack depth limit exceeded")]
+    StackDepthLimitExceeded,
     #[error("Conversion error: {0}")]
     ConversionError(String),
     #[error("Env variable error: {0}")]
     EnvVarError(#[from] std::env::VarError),
     #[error("Transaction error: {0}")]
-    TxError(String),
+    TxError(SqlErrorMessage),
     #[error(transparent)]
     CompletionError(#[from] CompletionError),
     #[error("Locking error: {0}")]
@@ -70,21 +78,21 @@ pub enum LimboError {
     #[error("Modifier parsing error: {0}")]
     InvalidModifier(String),
     #[error("{0}")]
-    InvalidArgument(String),
+    InvalidArgument(SqlErrorMessage),
     #[error("Invalid formatter supplied: {0}")]
     InvalidFormatter(String),
     #[error("{0}")]
-    Constraint(String),
+    Constraint(SqlErrorMessage),
     #[error("{0}")]
     /// We need to specify for ROLLBACK|FAIL resolve types when to roll the tx back
     /// so instead of matching on the string, we introduce a specific ForeignKeyConstraint error
     ForeignKeyConstraint(String),
     #[error("{1}")]
-    Raise(turso_parser::ast::ResolveType, String),
+    Raise(turso_parser::ast::ResolveType, SqlErrorMessage),
     #[error("RaiseIgnore")]
     RaiseIgnore,
     #[error("Extension error: {0}")]
-    ExtensionError(String),
+    ExtensionError(SqlErrorMessage),
     #[error("integer overflow")]
     IntegerOverflow,
     #[error("string or blob too big")]
@@ -176,6 +184,30 @@ fn branch_op_reason(op: &BranchOp) -> &'static str {
 }
 
 impl LimboError {
+    /// The SQL condition chosen by the producer, independent of the diagnostic's wording.
+    /// Engine handling still uses this error's existing variant (constraint resolution,
+    /// catchability, retry rules and the SQLite result code are unchanged).
+    pub fn sql_error_kind(&self) -> SqlErrorKind {
+        use SqlErrorKind::*;
+        match self {
+            Self::Constraint(message) => message.kind().unwrap_or(IntegrityConstraintViolation),
+            Self::ParseError(message) => message.kind().unwrap_or(SyntaxError),
+            Self::TxError(message)
+            | Self::ExtensionError(message)
+            | Self::InvalidArgument(message)
+            | Self::Raise(_, message) => message.kind().unwrap_or(InternalError),
+            Self::Busy => LockNotAvailable,
+            Self::BusySnapshot => SerializationFailure,
+            Self::ForeignKeyConstraint(_) => ForeignKeyViolation,
+            Self::IntegerOverflow => NumericValueOutOfRange,
+            Self::StackDepthLimitExceeded => StatementTooComplex,
+            Self::ReadOnly => ReadOnlyTransaction,
+            Self::DatabaseFull(_) => DiskFull,
+            Self::Interrupt => QueryCanceled,
+            _ => InternalError,
+        }
+    }
+
     /// The primary SQLite result code for this error, e.g. what the sqlite3
     /// shell appends after a runtime error message ("... (19)").
     pub fn sqlite_result_code(&self) -> i32 {
@@ -329,8 +361,13 @@ pub(crate) const fn cold_return<T>(v: T) -> T {
 
 #[macro_export]
 macro_rules! bail_parse_error {
+    ($kind:path; $($arg:tt)*) => {
+        return $crate::error::cold_return(Err($crate::error::LimboError::ParseError(
+            $crate::error::SqlErrorMessage::classified($kind, format!($($arg)*))
+        )))
+    };
     ($($arg:tt)*) => {
-        return $crate::error::cold_return(Err($crate::error::LimboError::ParseError(format!($($arg)*))))
+        return $crate::error::cold_return(Err($crate::error::LimboError::ParseError(format!($($arg)*).into())))
     };
 }
 
@@ -372,14 +409,19 @@ macro_rules! assert_or_bail_corrupt {
 
 #[macro_export]
 macro_rules! bail_constraint_error {
+    ($kind:path; $($arg:tt)*) => {
+        return $crate::error::cold_return(Err($crate::error::LimboError::Constraint(
+            $crate::error::SqlErrorMessage::classified($kind, format!($($arg)*))
+        )))
+    };
     ($($arg:tt)*) => {
-        return $crate::error::cold_return(Err($crate::error::LimboError::Constraint(format!($($arg)*))))
+        return $crate::error::cold_return(Err($crate::error::LimboError::Constraint(format!($($arg)*).into())))
     };
 }
 
 impl From<turso_ext::ResultCode> for LimboError {
     fn from(err: turso_ext::ResultCode) -> Self {
-        cold_return(LimboError::ExtensionError(err.to_string()))
+        cold_return(LimboError::ExtensionError(err.to_string().into()))
     }
 }
 
@@ -404,3 +446,15 @@ pub const SQLITE_CONSTRAINT_UNIQUE: usize = 2067;
 // op_sequence_commit_inner_tx.
 #[allow(dead_code)]
 pub const SQLITE_BUSY: usize = 5;
+
+/// The parser's errors, with its stack-guard refusal made the engine's own
+/// (`LimboError::StackDepthLimitExceeded`), so a caller sees one error for one condition whichever
+/// layer met it.
+impl From<turso_parser::error::Error> for LimboError {
+    fn from(e: turso_parser::error::Error) -> Self {
+        match e {
+            turso_parser::error::Error::StackDepthLimitExceeded => LimboError::StackDepthLimitExceeded,
+            e => LimboError::LexerError(e),
+        }
+    }
+}

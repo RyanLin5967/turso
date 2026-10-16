@@ -67,7 +67,7 @@ pub fn emit_program_for_compound_select(
                         } else {
                             let value = n
                                 .parse::<f64>()
-                                .map_err(|_| LimboError::ParseError("invalid limit".to_string()))?;
+                                .map_err(|_| LimboError::ParseError("invalid limit".to_string().into()))?;
                             program.emit_insn(Insn::Real { value, dest: reg });
                             program.add_comment(program.offset(), "LIMIT counter");
                             program.emit_insn(Insn::MustBeInt {
@@ -103,7 +103,7 @@ pub fn emit_program_for_compound_select(
                             program.emit_insn(Insn::Integer { value, dest: reg });
                         } else {
                             let value = n.parse::<f64>().map_err(|_| {
-                                LimboError::ParseError("invalid offset".to_string())
+                                LimboError::ParseError("invalid offset".to_string().into())
                             })?;
                             program.emit_insn(Insn::Real { value, dest: reg });
                         }
@@ -1018,7 +1018,7 @@ fn emit_compound_order_by(
                     } else {
                         let value = n
                             .parse::<f64>()
-                            .map_err(|_| LimboError::ParseError("invalid limit".to_string()))?;
+                            .map_err(|_| LimboError::ParseError("invalid limit".to_string().into()))?;
                         program.emit_insn(Insn::Real { value, dest: reg });
                         program.add_comment(program.offset(), "LIMIT counter");
                         program.emit_insn(Insn::MustBeInt {
@@ -1050,7 +1050,7 @@ fn emit_compound_order_by(
                     } else {
                         let value = n
                             .parse::<f64>()
-                            .map_err(|_| LimboError::ParseError("invalid offset".to_string()))?;
+                            .map_err(|_| LimboError::ParseError("invalid offset".to_string().into()))?;
                         program.emit_insn(Insn::Real { value, dest: reg });
                     }
                 }

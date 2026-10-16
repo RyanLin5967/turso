@@ -7399,6 +7399,7 @@ dependencies = [
  "turso_ext",
  "turso_macros",
  "turso_parser",
+ "turso_stack_guard",
  "twox-hash",
  "uncased",
  "uuid",
@@ -7464,6 +7465,7 @@ dependencies = [
  "strum_macros",
  "thiserror 2.0.16",
  "turso_macros",
+ "turso_stack_guard",
 ]
 
 [[package]]
@@ -7503,6 +7505,7 @@ dependencies = [
  "smallvec",
  "thiserror 2.0.16",
  "turso_parser",
+ "turso_stack_guard",
 ]
 
 [[package]]
@@ -7645,6 +7648,14 @@ dependencies = [
  "turso_core",
  "turso_ext",
  "vcpkg",
+]
+
+[[package]]
+name = "turso_stack_guard"
+version = "0.8.0-pre.7"
+dependencies = [
+ "libc",
+ "stacker",
 ]
 
 [[package]]

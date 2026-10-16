@@ -223,8 +223,8 @@ fn time_date_or(args: &[Value], none: impl FnOnce() -> Value) -> Value {
     }
 }
 
-/// PostgreSQL's message for a date or timestamp past its range (SQLSTATE 22008, which the
-/// PostgreSQL frontend reads from this prefix).
+/// PostgreSQL's message for a date or timestamp past its range. The PostgreSQL producer
+/// carries DatetimeFieldOverflow separately from these words.
 pub const DATE_OUT_OF_RANGE: &str = "date field value out of range";
 
 /// `make_date` / `make_timestamp`'s answer for arguments that are no date.
@@ -273,8 +273,12 @@ pub fn make_timestamp_or_refuse(args: &[crate::Value]) -> crate::Result<crate::V
 
 fn date_or_refuse(args: &[crate::Value], arity: usize) -> crate::Result<crate::Value> {
     let args: Vec<Value> = args.iter().map(|v| v.to_ffi()).collect();
+    let range_refusal = std::cell::Cell::new(false);
     let date = if args.len() == arity {
-        time_date_or(&args, || out_of_range(&args))
+        time_date_or(&args, || {
+            range_refusal.set(true);
+            out_of_range(&args)
+        })
     } else {
         Value::error(ResultCode::InvalidArgs)
     };
@@ -282,7 +286,15 @@ fn date_or_refuse(args: &[crate::Value], arity: usize) -> crate::Result<crate::V
         // SAFETY: each was made by to_ffi above and is freed once, here.
         unsafe { arg.__free_internal_type() };
     }
-    crate::Value::from_ffi(date)
+    crate::Value::from_ffi(date).map_err(|error| match error {
+        crate::LimboError::ExtensionError(message) if range_refusal.get() => {
+            crate::LimboError::ExtensionError(crate::error::SqlErrorMessage::classified(
+                crate::error::SqlErrorKind::DatetimeFieldOverflow,
+                message.into_string(),
+            ))
+        }
+        other => other,
+    })
 }
 
 #[scalar(name = "time_get", alias = "date_part")]
@@ -762,7 +774,7 @@ fn time_add(args: &[Value]) -> Value {
 
     let d = Duration::from(d);
 
-    t.add_duration(d).into_blob()
+    tri!(t.add_duration(d)).into_blob()
 }
 
 #[scalar(name = "time_add_date")]
@@ -804,7 +816,7 @@ fn time_add_date(args: &[Value]) -> Value {
         days = ok_tri!(args[3].to_integer());
     }
 
-    let t: Time = tri!(t.time_add_date(years as i32, months as i32, days));
+    let t: Time = tri!(t.time_add_date(years, months, days));
 
     t.into_blob()
 }

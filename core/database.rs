@@ -379,13 +379,13 @@ pub(crate) fn sidecar_base(path: &str) -> Result<Option<String>> {
                 LimboError::InvalidArgument(format!(
                     "{path}: its resolved path is not UTF-8, so its WAL and branch files cannot be \
                      named from it"
-                ))
+                ).into())
             }),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(LimboError::InvalidArgument(format!(
                 "cannot resolve {path} ({e}): refusing to name its WAL and branch files from an \
                  unresolved path"
-            ))),
+            ).into())),
         }
     }
     #[cfg(not(unix))]
@@ -419,7 +419,7 @@ pub fn sidecar_mvcc_log_path(path: &str) -> Result<String> {
         .with_extension("db-log")
         .into_os_string()
         .into_string()
-        .map_err(|_| LimboError::InvalidArgument(format!("{path}: its log path is not UTF-8")))
+        .map_err(|_| LimboError::InvalidArgument(format!("{path}: its log path is not UTF-8").into()))
 }
 
 /// `path` made absolute against the working directory NOW, so a later `chdir` cannot move the
@@ -434,7 +434,7 @@ pub(crate) fn absolute_path(path: &str) -> Result<String> {
             .join(given)
     };
     absolute.into_os_string().into_string().map_err(|_| {
-        LimboError::InvalidArgument(format!("{path}: its absolute path is not UTF-8"))
+        LimboError::InvalidArgument(format!("{path}: its absolute path is not UTF-8").into())
     })
 }
 
@@ -470,7 +470,7 @@ fn refuse_sidecars_under_another_name(given: &str, real: &str, custom_wal: bool)
         return Err(LimboError::InvalidArgument(format!(
             "{given} no longer names the file {real} it resolved to: the link changed while the \
              database was being opened"
-        )));
+        ).into()));
     }
     let others = crate::branch::journal::BranchFiles::for_db(given);
     let ours = crate::branch::journal::BranchFiles::for_db(real);
@@ -520,7 +520,7 @@ fn refuse_sidecars_under_another_name(given: &str, real: &str, custom_wal: bool)
                 return Err(LimboError::InvalidArgument(format!(
                     "cannot inspect {} ({e}), which may hold this database's state",
                     other.display()
-                )))
+                ).into()))
             }
         };
         // Nothing in it can be lost: leave it where it is (C3-1).
@@ -534,7 +534,7 @@ fn refuse_sidecars_under_another_name(given: &str, real: &str, custom_wal: bool)
         // header (salts and checksum chain), and MVCC recovery replays the log's records above the
         // database file's replay boundary; neither ties the file to a path. Why only then: frames
         // written before the database changed under another name would overwrite newer pages.
-        return Err(LimboError::InvalidArgument(match holds {
+        return Err(LimboError::InvalidArgument((match holds {
             // "Keep them" needs BOTH conditions (review 8 F1, the lead's decision): {ours} does
             // not exist — any read-write open of {real} by THIS build creates its WAL, and its log
             // only while the database header says MVCC, even empty (review 7 item 4; review 11
@@ -576,7 +576,7 @@ fn refuse_sidecars_under_another_name(given: &str, real: &str, custom_wal: bool)
                 other.display(),
                 ours.display()
             ),
-        }));
+        }).into()));
     }
     Ok(())
 }
@@ -592,7 +592,7 @@ fn same_file(a: &Path, b: &Path) -> Result<bool> {
     use std::os::unix::fs::MetadataExt;
     let identity = |p: &Path| std::fs::metadata(p).map(|m| (m.dev(), m.ino()));
     let a_id = identity(a).map_err(|e| {
-        LimboError::InvalidArgument(format!("cannot inspect {} ({e})", a.display()))
+        LimboError::InvalidArgument(format!("cannot inspect {} ({e})", a.display()).into())
     })?;
     match identity(b) {
         Ok(b_id) => Ok(a_id == b_id),
@@ -600,7 +600,7 @@ fn same_file(a: &Path, b: &Path) -> Result<bool> {
         Err(e) => Err(LimboError::InvalidArgument(format!(
             "cannot inspect {} ({e})",
             b.display()
-        ))),
+        ).into())),
     }
 }
 
@@ -1118,17 +1118,17 @@ impl Database {
         if is_memory_like(path) {
             return Err(LimboError::InvalidArgument(format!(
                 "experimental multiprocess WAL is not supported for in-memory database path '{path}'"
-            )));
+            ).into()));
         }
         if !io.supports_shared_wal_coordination() {
             return Err(LimboError::InvalidArgument(format!(
                 "experimental multiprocess WAL is not supported by the active IO backend for '{path}'"
-            )));
+            ).into()));
         }
         if !Self::path_allows_shared_wal_coordination(Path::new(path))? {
             return Err(LimboError::InvalidArgument(format!(
                 "experimental multiprocess WAL is not supported on the filesystem backing '{path}'"
-            )));
+            ).into()));
         }
 
         if !flags.contains(OpenFlags::ReadOnly) {
@@ -1159,7 +1159,7 @@ impl Database {
         if has_external_page_codec && opts.enable_multiprocess_wal {
             return Err(LimboError::InvalidArgument(
                 "external page codecs are not supported with experimental multiprocess WAL"
-                    .to_string(),
+                    .to_string().into(),
             ));
         }
         Ok(())
@@ -1169,7 +1169,7 @@ impl Database {
         Self::validate_external_page_codec_options(options.db_opts, options.page_codec.is_some())?;
         if options.encryption.is_some() && options.page_codec.is_some() {
             return Err(LimboError::InvalidArgument(
-                "built-in encryption cannot be combined with an external page codec".to_string(),
+                "built-in encryption cannot be combined with an external page codec".to_string().into(),
             ));
         }
         Ok(())
@@ -1313,7 +1313,7 @@ impl Database {
                  branches); a read-write open would receive that instance: close the read-only \
                  handle first",
                 db.path
-            )));
+            ).into()));
         }
         if !flags.contains(OpenFlags::ReadOnly)
             && !for_attach
@@ -1325,7 +1325,7 @@ impl Database {
                  {:?}: it would receive that instance, whose branches are not what it asked for; \
                  close the other handle first, or open with the same branch durability",
                 db.path, db.opts.branch_durability, durability
-            )));
+            ).into()));
         }
         if !flags.contains(OpenFlags::ReadOnly)
             && !for_attach
@@ -1337,7 +1337,7 @@ impl Database {
                  for {:?}: it would receive that instance, whose forks would be leased otherwise \
                  than it asked; close the other handle first, or open with the same branch lease",
                 db.path, db.opts.branch_lease, lease
-            )));
+            ).into()));
         }
         // The checkpoint mode (review 4 #8): a catalog store's, resolved as this open would resolve
         // it. Mutant `registry_ignores_checkpoint` (test builds only).
@@ -1355,7 +1355,7 @@ impl Database {
                      with the same checkpoint mode",
                     db.path,
                     db.branches.checkpoint_mode()
-                )));
+                ).into()));
             }
         }
         if !flags.contains(OpenFlags::ReadOnly)
@@ -1370,7 +1370,7 @@ impl Database {
                 db.path,
                 if db.opts.branch_splice { "on" } else { "off" },
                 if splice { "on" } else { "off" }
-            )));
+            ).into()));
         }
         Ok(())
     }
@@ -1386,7 +1386,7 @@ impl Database {
                 "database is already open with dialect '{}'; requested '{}'",
                 db.dialect.name(),
                 requested_name
-            )));
+            ).into()));
         }
         Ok(())
     }
@@ -1423,7 +1423,7 @@ impl Database {
         let db_is_encrypted = !matches!(db.encryption_cipher_mode.get(), CipherMode::None);
         if db_is_encrypted && encryption_opts.is_none() {
             return Err(LimboError::InvalidArgument(
-                "Database is encrypted but no encryption options provided".to_string(),
+                "Database is encrypted but no encryption options provided".to_string().into(),
             ));
         }
         db.validate_page_codec(page_codec)?;
@@ -1437,14 +1437,14 @@ impl Database {
         match (self.page_codec_id, page_codec) {
             (Some(_), None) => Err(LimboError::InvalidArgument(
                 "Database was opened with an external page codec; reopen with a page codec"
-                    .to_string(),
+                    .to_string().into(),
             )),
             (None, Some(_)) => Err(LimboError::InvalidArgument(
-                "Database is already open without an external page codec".to_string(),
+                "Database is already open without an external page codec".to_string().into(),
             )),
             (Some(expected), Some(codec)) if expected != codec.codec_id() => {
                 Err(LimboError::InvalidArgument(
-                    "page codec identity does not match the existing database".to_string(),
+                    "page codec identity does not match the existing database".to_string().into(),
                 ))
             }
             _ => Ok(()),
@@ -1500,7 +1500,7 @@ impl Database {
                     return Err(LimboError::InvalidArgument(
                         "database already open without custom durable storage; \
                          close the existing instance before reopening with a custom DurableStorage"
-                            .to_string(),
+                            .to_string().into(),
                     ));
                 }
                 Self::check_registry_branch_store(
@@ -1561,7 +1561,7 @@ impl Database {
     ) -> Result<Option<Arc<Database>>> {
         Err(LimboError::InvalidArgument(
             "OpenOptions::storage is required to open a database without the `fs` feature"
-                .to_string(),
+                .to_string().into(),
         ))
     }
 
@@ -1574,7 +1574,7 @@ impl Database {
             return Err(LimboError::InvalidArgument(
                 "OpenOptions::wal_path is only supported by Database::do_open/do_open_async, \
                  which skip the process-wide registry; the registry keys on the default WAL path"
-                    .to_string(),
+                    .to_string().into(),
             ));
         }
         Ok(())
@@ -1631,7 +1631,7 @@ impl Database {
         Self::validate_open_options(options)?;
         let Some(storage) = options.storage.clone() else {
             return Err(LimboError::InvalidArgument(
-                "OpenOptions::storage is required for Database::open_async".to_string(),
+                "OpenOptions::storage is required for Database::open_async".to_string().into(),
             ));
         };
         // Re-derive lock-mode flags from opts: multiprocess WAL must open the
@@ -1665,7 +1665,7 @@ impl Database {
                             if db_is_encrypted && options.encryption.is_none() {
                                 return Err(LimboError::InvalidArgument(
                                     "Database is encrypted but no encryption options provided"
-                                        .to_string(),
+                                        .to_string().into(),
                                 ));
                             }
                             db.validate_page_codec(options.page_codec.as_deref())?;
@@ -1776,7 +1776,7 @@ impl Database {
         Self::validate_open_options(options)?;
         let Some(storage) = options.storage.clone() else {
             return Err(LimboError::InvalidArgument(
-                "OpenOptions::storage is required for Database::do_open_async".to_string(),
+                "OpenOptions::storage is required for Database::do_open_async".to_string().into(),
             ));
         };
         Self::do_open_async_guarded(
@@ -1816,7 +1816,7 @@ impl Database {
         Self::validate_external_page_codec_options(opts, page_codec.is_some())?;
         if encryption_opts.is_some() && page_codec.is_some() {
             return Err(LimboError::InvalidArgument(
-                "built-in encryption cannot be combined with an external page codec".to_string(),
+                "built-in encryption cannot be combined with an external page codec".to_string().into(),
             ));
         }
         let result = Self::do_open_async_internal(
@@ -2148,7 +2148,7 @@ impl Database {
     ) -> Result<IOResult<Pager>> {
         if encryption_key.is_some() && page_codec.is_some() {
             return Err(LimboError::InvalidArgument(
-                "built-in encryption cannot be combined with an external page codec".to_string(),
+                "built-in encryption cannot be combined with an external page codec".to_string().into(),
             ));
         }
         loop {
@@ -2223,13 +2223,13 @@ impl Database {
                                         if decoded_page_size != bootstrap_page_size {
                                             return Err(LimboError::InvalidArgument(format!(
                                             "page codec bootstrap page size {bootstrap_page_size} does not match decoded page-1 size {decoded_page_size}"
-                                        )));
+                                        ).into()));
                                         }
                                         if header.reserved_space != bootstrap_reserved_space {
                                             return Err(LimboError::InvalidArgument(format!(
                                             "page codec bootstrap reserved space {bootstrap_reserved_space} does not match decoded page-1 reserved space {}",
                                             header.reserved_space
-                                        )));
+                                        ).into()));
                                         }
                                         let required_reserved_space =
                                             codec.required_reserved_bytes();
@@ -2237,7 +2237,7 @@ impl Database {
                                             return Err(LimboError::InvalidArgument(format!(
                                             "page codec requires exactly {required_reserved_space} reserved bytes, but decoded page 1 provides {}",
                                             header.reserved_space
-                                        )));
+                                        ).into()));
                                         }
                                     }
                                 }
@@ -2439,7 +2439,7 @@ impl Database {
                     if open_mv_store && page_codec.is_some() {
                         return Err(LimboError::InvalidArgument(
                             "external page codecs are not supported with MVCC databases"
-                                .to_string(),
+                                .to_string().into(),
                         ));
                     }
 
@@ -2452,7 +2452,7 @@ impl Database {
                         return Err(LimboError::InvalidArgument(format!(
                             "cannot open MVCC database '{}' with experimental multiprocess WAL: MVCC does not support multiprocess access",
                             self.path
-                        )));
+                        ).into()));
                     }
 
                     // Now check the Header Version to see which mode the DB file really is on
@@ -2726,7 +2726,7 @@ impl Database {
         if self.page_codec_id.is_some() {
             return Err(LimboError::InvalidArgument(
                 "reloading a WAL after external restore is not supported with an external page codec"
-                    .to_string(),
+                    .to_string().into(),
             ));
         }
         let flags = self.open_flags;
@@ -2832,12 +2832,12 @@ impl Database {
     ) -> Result<Arc<Connection>> {
         if self.page_codec_id.is_some() && page_codec.is_none() {
             return Err(LimboError::InvalidArgument(
-                "database requires an external page codec".to_string(),
+                "database requires an external page codec".to_string().into(),
             ));
         }
         if self.page_codec_id.is_none() && page_codec.is_some() {
             return Err(LimboError::InvalidArgument(
-                "database was opened without an external page codec".to_string(),
+                "database was opened without an external page codec".to_string().into(),
             ));
         }
         if let Some(page_codec) = page_codec.as_deref() {
@@ -3111,10 +3111,9 @@ impl Database {
                 .unwrap_or_else(|| Path::new("."))
         };
         let c_path = CString::new(probe_path.as_os_str().as_bytes()).map_err(|_| {
-            LimboError::InvalidArgument(format!(
-                "path contains interior NUL bytes: {}",
-                probe_path.display()
-            ))
+            LimboError::InvalidArgument(
+                format!("path contains interior NUL bytes: {}", probe_path.display()).into(),
+            )
         })?;
         let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
         let rc = unsafe { libc::statfs(c_path.as_ptr(), stat.as_mut_ptr()) };
@@ -3147,10 +3146,9 @@ impl Database {
                 .unwrap_or_else(|| Path::new("."))
         };
         let c_path = CString::new(probe_path.as_os_str().as_bytes()).map_err(|_| {
-            LimboError::InvalidArgument(format!(
-                "path contains interior NUL bytes: {}",
-                probe_path.display()
-            ))
+            LimboError::InvalidArgument(
+                format!("path contains interior NUL bytes: {}", probe_path.display()).into(),
+            )
         })?;
         let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
         let rc = unsafe { libc::statfs(c_path.as_ptr(), stat.as_mut_ptr()) };
@@ -3260,19 +3258,19 @@ impl Database {
             return Err(LimboError::InvalidArgument(format!(
                 "experimental multiprocess WAL is not supported by the active IO backend for '{}'",
                 self.path
-            )));
+            ).into()));
         }
         if is_memory_like(&self.path) || is_memory_like(&self.wal_path) {
             return Err(LimboError::InvalidArgument(format!(
                 "experimental multiprocess WAL is not supported for in-memory database path '{}'",
                 self.path
-            )));
+            ).into()));
         }
         if !Self::path_allows_shared_wal_coordination(Path::new(&self.path))? {
             return Err(LimboError::InvalidArgument(format!(
                 "experimental multiprocess WAL is not supported on the filesystem backing '{}'",
                 self.path
-            )));
+            ).into()));
         }
         if let Some(authority) = self.shared_wal_coordination.get() {
             return Ok(Some(authority.clone()));
@@ -3461,20 +3459,20 @@ impl Database {
                     LimboError::InvalidArgument(format!(
                         "page codec reported invalid page size {}",
                         header_info.page_size
-                    ))
+                    ).into())
                 })?;
                 let Some(page_size) = PageSize::new(page_size_u32) else {
                     return Err(LimboError::InvalidArgument(format!(
                         "page codec reported invalid page size {}",
                         header_info.page_size
-                    )));
+                    ).into()));
                 };
                 if !page_size.has_valid_reserved_space(header_info.reserved_space) {
                     return Err(LimboError::InvalidArgument(format!(
                         "page codec reported invalid reserved space {} for page size {}",
                         header_info.reserved_space,
                         page_size.get()
-                    )));
+                    ).into()));
                 }
                 (Some(header_info.reserved_space), Some(page_size))
             } else {
@@ -3491,7 +3489,7 @@ impl Database {
             if reserved_bytes != required_reserved_bytes {
                 return Err(LimboError::InvalidArgument(format!(
                     "page codec requires exactly {required_reserved_bytes} reserved bytes, but database provides {reserved_bytes}"
-                )));
+                ).into()));
             }
         }
 
@@ -3592,7 +3590,7 @@ impl Database {
                 "experimental_win_iocp" => Arc::new(WindowsIOCP::new()?),
 
                 other => {
-                    return Err(LimboError::InvalidArgument(format!("no such VFS: {other}")));
+                    return Err(LimboError::InvalidArgument(format!("no such VFS: {other}").into()));
                 }
             },
         };

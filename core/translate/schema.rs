@@ -1,3 +1,4 @@
+use crate::error::SqlErrorKind;
 use crate::sync::Arc;
 use crate::HashMap;
 
@@ -52,22 +53,22 @@ pub(crate) fn validate_check_expr(
                 if !column_names.iter().any(|c| normalize_ident(c) == n)
                     && !ROWID_STRS.iter().any(|r| r.eq_ignore_ascii_case(&n))
                 {
-                    bail_parse_error!("no such column: {}", name.as_str());
+                    bail_parse_error!(SqlErrorKind::UndefinedColumn; "no such column: {}", name.as_str());
                 }
             }
             ast::Expr::Qualified(tbl, col) => {
                 if normalize_ident(tbl.as_str()) != normalized_table {
-                    bail_parse_error!("no such column: {}.{}", tbl.as_str(), col.as_str());
+                    bail_parse_error!(SqlErrorKind::UndefinedColumn; "no such column: {}.{}", tbl.as_str(), col.as_str());
                 }
                 let cn = normalize_ident(col.as_str());
                 if !column_names.iter().any(|c| normalize_ident(c) == cn)
                     && !ROWID_STRS.iter().any(|r| r.eq_ignore_ascii_case(&cn))
                 {
-                    bail_parse_error!("no such column: {}", col.as_str());
+                    bail_parse_error!(SqlErrorKind::UndefinedColumn; "no such column: {}", col.as_str());
                 }
             }
             ast::Expr::DoublyQualified(db, tbl, col) => {
-                bail_parse_error!(
+                bail_parse_error!(SqlErrorKind::UndefinedColumn;
                     "no such column: {}.{}.{}",
                     db.as_str(),
                     tbl.as_str(),
@@ -91,7 +92,7 @@ pub(crate) fn validate_check_expr(
                         bail_parse_error!("misuse of window function {}()", name.as_str());
                     }
                 } else {
-                    bail_parse_error!("no such function: {}", name.as_str());
+                    bail_parse_error!(SqlErrorKind::UndefinedFunction; "no such function: {}", name.as_str());
                 }
             }
             ast::Expr::FunctionCallStar { name, filter_over } => {
@@ -106,7 +107,7 @@ pub(crate) fn validate_check_expr(
                         bail_parse_error!("misuse of window function {}()", name.as_str());
                     }
                 } else {
-                    bail_parse_error!("no such function: {}", name.as_str());
+                    bail_parse_error!(SqlErrorKind::UndefinedFunction; "no such function: {}", name.as_str());
                 }
             }
             ast::Expr::Variable(_) => {
@@ -211,7 +212,7 @@ fn resolve_check_expr_type(
                     return resolve_column_type(col, resolver);
                 }
             }
-            bail_parse_error!("no such column: {}", name.as_str());
+            bail_parse_error!(SqlErrorKind::UndefinedColumn; "no such column: {}", name.as_str());
         }
         ast::Expr::Qualified(_tbl, col) => {
             let cn = normalize_ident(col.as_str());
@@ -223,7 +224,7 @@ fn resolve_check_expr_type(
                     return resolve_column_type(c, resolver);
                 }
             }
-            bail_parse_error!("no such column: {}", col.as_str());
+            bail_parse_error!(SqlErrorKind::UndefinedColumn; "no such column: {}", col.as_str());
         }
         ast::Expr::Literal(lit) => match lit {
             Literal::Numeric(s) => {
@@ -756,7 +757,7 @@ fn validate(
                     ast::ColumnConstraint::Collate { collation_name } => {
                         let collation = resolver.resolve_collation(collation_name.as_str())?;
                         if collation.is_custom() {
-                            bail_parse_error!(
+                            bail_parse_error!(SqlErrorKind::FeatureNotSupported;
                                 "custom collations are not supported in schema definitions"
                             );
                         }
@@ -850,7 +851,7 @@ fn validate(
                                     Some(ast::TypeSize::MaxSize(e)) => vec![e.clone()],
                                     None => vec![],
                                 };
-                                check_numeric_typmod(type_name, &params)?;
+                                check_numeric_typmod(type_name, &params, is_strict)?;
                             }
                             Some(_) => {}
                         }
@@ -887,7 +888,7 @@ fn validate(
                 bail_parse_error!("PRIMARY KEY missing on table {}", table_name);
             }
             if table.unique_sets.iter().any(|us| !us.is_primary_key) {
-                bail_parse_error!(
+                bail_parse_error!(SqlErrorKind::FeatureNotSupported;
                     "secondary UNIQUE constraints on WITHOUT ROWID tables are not supported"
                 );
             }
@@ -1109,8 +1110,11 @@ fn emit_ctas_insert(
 /// declares a column type with parameters (a domain's base type takes none). Parameters that are
 /// not integer literals are left to numeric's ENCODE, which builds the same typmod at every write
 /// and CAST.
-pub(crate) fn check_numeric_typmod(type_name: &str, params: &[Box<ast::Expr>]) -> crate::Result<()> {
-    if !normalize_ident(type_name).eq_ignore_ascii_case("numeric") {
+pub(crate) fn check_numeric_typmod(type_name: &str, params: &[Box<ast::Expr>], is_strict: bool) -> crate::Result<()> {
+    // Only a STRICT table's column uses the numeric custom type; on any other table numeric(p, s)
+    // is a type name with SQLite's affinity, which CREATE TABLE accepts as written (review C38 MED
+    // 1: ALTER TABLE ADD COLUMN refused it there). One predicate for both statements.
+    if !is_strict || !normalize_ident(type_name).eq_ignore_ascii_case("numeric") {
         return Ok(());
     }
     fn literal(e: &ast::Expr) -> Option<i64> {
@@ -1122,7 +1126,7 @@ pub(crate) fn check_numeric_typmod(type_name: &str, params: &[Box<ast::Expr>]) -
     }
     if let [p, s] = params {
         if let (Some(p), Some(s)) = (literal(p), literal(s)) {
-            crate::numeric::decimal::NumericTypmod::new(p, s).map_err(|e| crate::LimboError::ParseError(e.to_string()))?;
+            crate::numeric::decimal::NumericTypmod::new(p, s).map_err(|e| crate::LimboError::ParseError(e.to_string().into()))?;
         }
     }
     Ok(())
@@ -1722,7 +1726,7 @@ pub fn translate_create_virtual_table(
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
     if connection.mvcc_enabled() {
-        bail_parse_error!("Virtual tables are not supported in MVCC mode");
+        bail_parse_error!(SqlErrorKind::FeatureNotSupported; "Virtual tables are not supported in MVCC mode");
     }
     let ast::CreateVirtualTable {
         if_not_exists,
@@ -1863,7 +1867,7 @@ pub fn translate_drop_table(
         if if_exists {
             return Ok(());
         }
-        bail_parse_error!(
+        bail_parse_error!(SqlErrorKind::UndefinedTable;
             "no such table: {}",
             crate::util::table_name_for_error(&tbl_name)
         );
@@ -2135,7 +2139,7 @@ pub fn translate_drop_table(
                 return Err(crate::LimboError::ParseError(format!(
                     "table {} may not be dropped",
                     vtab.name
-                )));
+                ).into()));
             }
             program.emit_insn(Insn::VDestroy {
                 table_name: vtab.name.clone(),
@@ -2966,7 +2970,9 @@ pub fn translate_drop_type(
     let types_table = resolver
         .schema()
         .get_btree_table(TURSO_TYPES_TABLE_NAME)
-        .ok_or_else(|| crate::LimboError::ParseError(format!("no such type: {normalized_name}")))?;
+        .ok_or_else(|| {
+            crate::LimboError::ParseError(format!("no such type: {normalized_name}").into())
+        })?;
     let types_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(types_table.clone()));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: types_cursor_id,

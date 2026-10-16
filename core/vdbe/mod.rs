@@ -39,7 +39,7 @@ pub mod sorter;
 mod statement_lifecycle_tests;
 pub mod vacuum;
 pub mod value;
-#[allow(unused_imports)] // for benchmarks
+#[allow(unused_imports)]// for benchmarks
 pub use crate::translate::collate::CollationSeq;
 use crate::{
     alloc::{DynAllocator, TryClone},
@@ -1820,7 +1820,8 @@ impl Program {
         waker: Option<&Waker>,
     ) -> Result<StepResult> {
         // A statement prepared while this one steps (a schema reparse, a callback running SQL,
-        // a trigger compiled at its first fire) is checked from its outermost step.
+        // a trigger compiled at its first fire) is checked from its outermost step
+        // (`stack::Executing`; fastest-wire 17572da73).
         let _executing = crate::stack::Executing::enter();
         state.execution_state = ProgramExecutionState::Running;
         let result = match query_mode {
@@ -2116,7 +2117,7 @@ impl Program {
                             // whole transaction while returning the real preparation
                             // error to the caller.
                             let rollback_error =
-                                LimboError::Raise(ResolveType::Rollback, prepare_error.to_string());
+                                LimboError::Raise(ResolveType::Rollback, prepare_error.to_string().into());
                             if let Err(abort_err) =
                                 self.abort(pager, Some(&rollback_error), state, true)
                             {

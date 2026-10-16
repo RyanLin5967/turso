@@ -1,3 +1,4 @@
+use crate::error::{SqlErrorKind, SqlErrorMessage};
 use bigdecimal::BigDecimal;
 use num_bigint::{BigInt, Sign};
 
@@ -65,7 +66,7 @@ pub(crate) fn blob_to_bigdecimal(blob: &[u8]) -> crate::Result<BigDecimal> {
     // Minimum size: version(1) + flags(1) + scale(8) + num_limbs(4) = 14
     if blob.len() < 14 {
         return Err(LimboError::Constraint(
-            "invalid numeric blob: too short".to_string(),
+            SqlErrorMessage::classified(SqlErrorKind::InvalidTextRepresentation, "invalid numeric blob: too short".to_string()),
         ));
     }
 
@@ -73,7 +74,7 @@ pub(crate) fn blob_to_bigdecimal(blob: &[u8]) -> crate::Result<BigDecimal> {
     if version != NUMERIC_BLOB_VERSION {
         return Err(LimboError::Constraint(format!(
             "unsupported numeric blob version: {version}"
-        )));
+        ).into()));
     }
 
     let flags = blob[1];
@@ -88,9 +89,9 @@ pub(crate) fn blob_to_bigdecimal(blob: &[u8]) -> crate::Result<BigDecimal> {
 
     // Reject absurd scales from corrupted blobs.
     if !(-MAX_SCALE_MAGNITUDE..=MAX_SCALE_MAGNITUDE).contains(&scale) {
-        return Err(LimboError::Constraint(format!(
+        return Err(LimboError::Constraint(SqlErrorMessage::classified(SqlErrorKind::InvalidTextRepresentation, format!(
             "invalid numeric blob: scale {scale} out of range"
-        )));
+        ))));
     }
 
     // SAFETY: blob[10..14] is exactly 4 bytes (checked by min-length guard above)
@@ -101,22 +102,25 @@ pub(crate) fn blob_to_bigdecimal(blob: &[u8]) -> crate::Result<BigDecimal> {
     // reasonable precision.
     const MAX_LIMBS: usize = 65536;
     if num_limbs > MAX_LIMBS {
-        return Err(LimboError::Constraint(format!(
+        return Err(LimboError::Constraint(SqlErrorMessage::classified(SqlErrorKind::InvalidTextRepresentation, format!(
             "invalid numeric blob: limb count {num_limbs} exceeds maximum {MAX_LIMBS}"
-        )));
+        ))));
     }
 
     let expected_len = num_limbs
         .checked_mul(4)
         .and_then(|n| n.checked_add(14))
         .ok_or_else(|| {
-            LimboError::Constraint("invalid numeric blob: limb count overflow".to_string())
+            LimboError::Constraint(SqlErrorMessage::classified(
+                SqlErrorKind::InvalidTextRepresentation,
+                "invalid numeric blob: limb count overflow".to_string(),
+            ))
         })?;
     if blob.len() != expected_len {
-        return Err(LimboError::Constraint(format!(
+        return Err(LimboError::Constraint(SqlErrorMessage::classified(SqlErrorKind::InvalidTextRepresentation, format!(
             "invalid numeric blob: expected {expected_len} bytes, got {}",
             blob.len()
-        )));
+        ))));
     }
 
     let mut limbs = Vec::with_capacity(num_limbs);
@@ -160,7 +164,7 @@ fn check_numeric_range(v: &BigDecimal) -> crate::Result<()> {
         if i128::from(scale) <= PG_MAX_FRACTION_DIGITS || crate::branch::store::fe_mutant("numeric_zero_unbounded") {
             return Ok(());
         }
-        return Err(LimboError::Constraint("value overflows numeric format".to_string()));
+        return Err(LimboError::Constraint(SqlErrorMessage::classified(SqlErrorKind::NumericValueOutOfRange, "value overflows numeric format".to_string())));
     }
     let scale = i128::from(scale);
     // At most this many decimal digits: bits * log10(2), rounded up.
@@ -169,7 +173,10 @@ fn check_numeric_range(v: &BigDecimal) -> crate::Result<()> {
     if fits(at_most) || fits(int.magnitude().to_string().len() as i128) {
         return Ok(());
     }
-    Err(LimboError::Constraint("value overflows numeric format".to_string()))
+    Err(LimboError::Constraint(SqlErrorMessage::classified(
+        SqlErrorKind::NumericValueOutOfRange,
+        "value overflows numeric format".to_string(),
+    )))
 }
 
 /// `a / b` as PostgreSQL computes it (numeric.c `select_div_scale`, then `div_var` rounding at
@@ -194,7 +201,12 @@ fn pg_numeric_div(a: &BigDecimal, b: &BigDecimal) -> crate::Result<BigDecimal> {
     let (ai, sa) = a.as_bigint_and_exponent();
     let (bi, sb) = b.as_bigint_and_exponent();
     // a / b = (ai / bi) * 10^(sb - sa); the result's integer at `rscale` is that times 10^rscale.
-    let overflow = || LimboError::Constraint("value overflows numeric format".to_string());
+    let overflow = || {
+        LimboError::Constraint(SqlErrorMessage::classified(
+            SqlErrorKind::NumericValueOutOfRange,
+            "value overflows numeric format".to_string(),
+        ))
+    };
     let shift = rscale
         .checked_add(sb)
         .and_then(|s| s.checked_sub(sa))
@@ -332,8 +344,25 @@ impl PgNumeric {
     }
 
     /// Numeric input text, or `None` for text that is not a number (the caller words the refusal).
+    /// PostgreSQL's input exponent bound first (review C38 MED 2; numeric.c `set_var_from_str`): an
+    /// exponent past INT_MAX / 2 either way, or one no integer holds, is 22003 "value overflows
+    /// numeric format", even on a zero (PG 18.6: '0e1073741823' is 0, '0e1073741824' overflows; raw
+    /// pg18-numeric-exponent.txt). Mutant `numeric_exponent_unbounded` (test builds only): no bound.
     pub fn parse(text: &str) -> Option<crate::Result<Self>> {
         use std::str::FromStr;
+        const PG_MAX_EXPONENT: i128 = (i32::MAX / 2) as i128;
+        let trimmed = text.trim();
+        if let Some(at) = trimmed.find(['e', 'E']) {
+            let (mantissa, exp) = (&trimmed[..at], &trimmed[at + 1..]);
+            let digits = exp.strip_prefix(['+', '-']).unwrap_or(exp);
+            let numeric_shape = !mantissa.is_empty() && !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit());
+            if numeric_shape && !crate::branch::store::fe_mutant("numeric_exponent_unbounded") {
+                let bounded = exp.parse::<i128>().ok().filter(|e| (-PG_MAX_EXPONENT..=PG_MAX_EXPONENT).contains(e));
+                if bounded.is_none() && BigDecimal::from_str(&format!("{mantissa}e0")).is_ok() {
+                    return Some(Err(LimboError::Constraint(SqlErrorMessage::classified(SqlErrorKind::NumericValueOutOfRange, "value overflows numeric format"))));
+                }
+            }
+        }
         BigDecimal::from_str(text).ok().map(Self::new)
     }
 
@@ -411,10 +440,10 @@ impl PgNumeric {
             let (bigint, _) = rounded.as_bigint_and_exponent();
             let digits = if bigint.sign() == Sign::NoSign { 0 } else { bigint.magnitude().to_string().len() as i64 };
             if digits > precision {
-                return Err(LimboError::Constraint(format!(
+                return Err(LimboError::Constraint(SqlErrorMessage::classified(SqlErrorKind::NumericValueOutOfRange, format!(
                     "numeric field overflow: a field with precision {precision}, scale {scale} must round to an absolute value less than 10^{}",
                     precision - scale
-                )));
+                ))));
             }
         }
         Self::new(rounded)
@@ -439,23 +468,23 @@ impl NumericTypmod {
             if !(1..=1000).contains(&precision) {
                 return Err(LimboError::Constraint(format!(
                     "NUMERIC precision {precision} must be between 1 and 1000"
-                )));
+                ).into()));
             }
             if !(-1000..=1000).contains(&scale) {
                 return Err(LimboError::Constraint(format!(
                     "NUMERIC scale {scale} must be between -1000 and 1000"
-                )));
+                ).into()));
             }
         }
         if scale < 0 {
             return Err(LimboError::Constraint(format!(
                 "numeric scale must be non-negative, got {scale}"
-            )));
+            ).into()));
         }
         if scale > precision {
             return Err(LimboError::Constraint(format!(
                 "numeric scale ({scale}) must not exceed precision ({precision})"
-            )));
+            ).into()));
         }
         Ok(Self { precision, scale })
     }
@@ -471,6 +500,19 @@ fn validate_precision_scale(val: &BigDecimal, precision: i64, scale: i64) -> cra
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn c50_numeric_special_values_use_the_existing_numeric_representation() {
+        use super::PgNumeric;
+        let nan = PgNumeric::parse("NaN").expect("PG numeric accepts NaN").unwrap();
+        let infinity = PgNumeric::parse("Infinity").expect("PG numeric accepts Infinity").unwrap();
+        for (value, text) in [(&nan, "NaN"), (&infinity, "Infinity")] {
+            assert_eq!(value.format(), text);
+            assert_eq!(PgNumeric::from_blob(&value.to_blob()).unwrap(), *value);
+        }
+        assert_eq!(nan.div(&PgNumeric::from_i64(0)).unwrap().format(), "NaN");
+        assert!(nan > infinity);
+    }
+
     use super::*;
     use bigdecimal::Zero;
     use std::str::FromStr;

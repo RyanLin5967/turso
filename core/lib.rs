@@ -77,6 +77,8 @@ mod regexp;
 #[cfg(feature = "series")]
 mod series;
 mod stack;
+#[cfg(all(test, unix))]
+mod stack_guard_tests;
 mod statement;
 mod stats;
 #[allow(dead_code)]
@@ -265,7 +267,7 @@ impl<'a> QueryRunner<'a> {
                 "",
                 Some(LimboError::ParseError(format!(
                     "invalid UTF-8 in SQL input: {err}"
-                ))),
+                ).into())),
             ),
         };
         Self {
