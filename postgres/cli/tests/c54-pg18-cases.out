@@ -1,0 +1,62 @@
+>> Q CREATE TABLE w(w_id INT PRIMARY KEY, name VARCHAR(10))
+   C CREATE TABLE
+   Z I
+>> Q CREATE TABLE s(s_i_id INT NOT NULL, s_w_id SMALLINT NOT NULL, s_ytd NUMERIC(8, 2), s_data VARCHAR(50), PRIMARY KEY (s_w_id, s_i_id), FOREIGN KEY (s_w_id) REFERENCES w (w_id))
+   C CREATE TABLE
+   Z I
+>> Q SELECT constraint_type FROM information_schema.table_constraints WHERE table_name = 's' ORDER BY constraint_type
+   T oids=[1043] names=['constraint_type']
+   D ['CHECK']
+   D ['CHECK']
+   D ['FOREIGN KEY']
+   D ['PRIMARY KEY']
+   C SELECT 4
+   Z I
+>> Q SELECT constraint_name, constraint_type FROM information_schema.table_constraints WHERE table_name = 's' ORDER BY constraint_name
+   T oids=[19, 1043] names=['constraint_name', 'constraint_type']
+   D ['s_pkey', 'PRIMARY KEY']
+   D ['s_s_i_id_not_null', 'CHECK']
+   D ['s_s_w_id_fkey', 'FOREIGN KEY']
+   D ['s_s_w_id_not_null', 'CHECK']
+   C SELECT 4
+   Z I
+>> Q SELECT count(*) FROM information_schema.key_column_usage WHERE table_name='s'
+   T oids=[20] names=['count']
+   D ['3']
+   C SELECT 1
+   Z I
+>> Q CREATE TABLE named_nn(a int CONSTRAINT named_nn_check NOT NULL)
+   C CREATE TABLE
+   Z I
+>> Q SELECT constraint_name, constraint_type FROM information_schema.table_constraints WHERE table_name = 'named_nn'
+   T oids=[19, 1043] names=['constraint_name', 'constraint_type']
+   D ['named_nn_check', 'CHECK']
+   C SELECT 1
+   Z I
+>> Q SELECT sqlite_version()
+   E S=ERROR C=42883 M=function sqlite_version() does not exist
+   Z I
+>> Q SELECT ifnull(1, 2)
+   E S=ERROR C=42883 M=function ifnull(integer, integer) does not exist
+   Z I
+>> Q SELECT total(1)
+   E S=ERROR C=42883 M=function total(integer) does not exist
+   Z I
+>> Q SELECT hex('abc')
+   E S=ERROR C=42883 M=function hex(unknown) does not exist
+   Z I
+>> Q SELECT * FROM generate_series(0, 'inf'::float8, 10)
+   E S=ERROR C=42883 M=function generate_series(integer, double precision, integer) does not exist
+   Z I
+>> Q SELECT * FROM generate_series(1, 2::numeric, 1)
+   T oids=[1700] names=['generate_series']
+   D ['1']
+   D ['2']
+   C SELECT 2
+   Z I
+>> Q SELECT * FROM generate_series(1::bigint, 2, 1::smallint)
+   T oids=[20] names=['generate_series']
+   D ['1']
+   D ['2']
+   C SELECT 2
+   Z I

@@ -2085,6 +2085,8 @@ fn information_schema_describes_tables_columns_and_keys() {
     assert_eq!(
         r.rows,
         vec![
+            vec![Some("CHECK".into())],
+            vec![Some("CHECK".into())],
             vec![Some("FOREIGN KEY".into())],
             vec![Some("PRIMARY KEY".into())]
         ]
