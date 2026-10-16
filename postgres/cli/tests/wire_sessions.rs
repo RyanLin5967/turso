@@ -12057,11 +12057,6 @@ replays_postgresql!(
     "pg18-audit1-lib-a_bytea_parameter_with_a_non_ascii_digit_is_refused.out",
     [
         (1, "PGDIV-PUBLIC-SCHEMA-NOOP cluster-state [cluster]: DROP SCHEMA IF EXISTS public CASCADE is a no-op for us, so CREATE SCHEMA public fails 'already exists'"),
-        (2, "PGDIV-BIND-REFUSAL-STEP protocol [wire]: bytea param \\x0é0: PG refuses 22023 at Bind; ours BindComplete+RowDescription first (same text)"),
-        (3, "PGDIV-BIND-REFUSAL-STEP protocol [wire]: bytea param \\xé: PG refuses 22023 at Bind; ours BindComplete+RowDescription first"),
-        (4, "PGDIV-BIND-REFUSAL-STEP protocol [wire]: bytea param \\x0😀0: PG refuses 22023 at Bind; ours BindComplete+RowDescription first"),
-        (5, "PGDIV-BIND-REFUSAL-STEP protocol [wire]: bytea param \\xGG: PG refuses 22023 at Bind; ours BindComplete+RowDescription first"),
-        (6, "PGDIV-BIND-REFUSAL-STEP protocol [wire]: bytea param \\x0 (odd digits): PG refuses 22023 at Bind; ours BindComplete+RowDescription first"),
     ]
 );
 replays_postgresql!(
@@ -12069,16 +12064,7 @@ replays_postgresql!(
     "pg18-audit1-lib-parameters_decode_at_postgresqls_edges.out",
     [
         (1, "PGDIV-PUBLIC-SCHEMA-NOOP cluster-state [cluster]: DROP SCHEMA IF EXISTS public CASCADE answers DROP SCHEMA without dropping, so CREATE SCHEMA public fails 42601 'schema \"public\" already exists'"),
-        (3, "PGDIV-BIND-REFUSAL-STEP protocol [wire]: real param 3.5e+38: PG refuses at Bind (no BindComplete); ours sends BindComplete+RowDescription then 22003, text also gains a leading 'value '"),
-        (4, "PGDIV-BIND-REFUSAL-STEP protocol [wire]: float8 param 1e-400: PG refuses at Bind; ours BindComplete+RowDescription then 22003 with extra 'value ' prefix"),
-        (5, "PGDIV-BIND-REFUSAL-STEP protocol [wire]: float8 param -1e-400: PG refuses at Bind; ours BindComplete+RowDescription then 22003 with extra 'value ' prefix"),
-        (6, "PGDIV-BIND-REFUSAL-STEP protocol [wire]: real param 1e-50: PG refuses at Bind; ours BindComplete+RowDescription then 22003 with extra 'value ' prefix"),
         (12, "PGDIV-NUMERIC-AS-FLOAT value [engine]: SILENT: numeric param 1e-400 answers '0' where PG answers the exact 0.(399 zeros)1; the numeric decode underflows"),
-        (15, "PGDIV-BIND-REFUSAL-STEP protocol [wire]: int4 param '_100': PG refuses 22P02 at Bind; ours BindComplete+RowDescription first (same code and text)"),
-        (16, "PGDIV-BIND-REFUSAL-STEP protocol [wire]: int4 param '0x_': PG refuses 22P02 at Bind; ours BindComplete+RowDescription first"),
-        (17, "PGDIV-BIND-REFUSAL-STEP protocol [wire]: int4 param '0b__1': PG refuses 22P02 at Bind; ours BindComplete+RowDescription first"),
-        (18, "PGDIV-BIND-REFUSAL-STEP protocol [wire]: int4 param '0o_': PG refuses 22P02 at Bind; ours BindComplete+RowDescription first"),
-        (19, "PGDIV-BIND-REFUSAL-STEP protocol [wire]: int4 param '100_': PG refuses 22P02 at Bind; ours BindComplete+RowDescription first"),
     ]
 );
 replays_postgresql!(
@@ -12086,8 +12072,6 @@ replays_postgresql!(
     "pg18-audit1-ws-a_bytea_parameter_with_a_non_ascii_digit_is_refused.out",
     [
         (1, "PGDIV-PUBLIC-SCHEMA-NOOP cluster-state [cluster]: DROP SCHEMA public CASCADE no-op for us, CREATE SCHEMA public 'already exists'"),
-        (5, "PGDIV-BIND-REFUSAL-STEP protocol [wire]: INSERT bytea param \\x0é0: PG refuses 22023 at Bind; ours BindComplete+NoData first"),
-        (7, "PGDIV-BIND-REFUSAL-STEP protocol [wire]: INSERT bytea param \\x0😀0: PG refuses 22023 at Bind; ours BindComplete+NoData first"),
     ]
 );
 replays_postgresql!(
@@ -12700,11 +12684,7 @@ replays_postgresql!(
 replays_postgresql!(
     pg18_bytea_replays_as_postgresql_answered,
     "pg18-bytea.out",
-    [
-        (5, "PGDIV-BIND-REFUSAL-STEP protocol [wire]: bytea param a\\qb: PG refuses 22P02 at Bind; ours BindComplete+NoData first (same text)"),
-        (6, "PGDIV-BIND-REFUSAL-STEP protocol [wire]: bytea param a\\1b: PG refuses 22P02 at Bind; ours BindComplete+NoData first"),
-        (7, "PGDIV-BIND-REFUSAL-STEP protocol [wire]: bytea param a\\400b: PG refuses 22P02 at Bind; ours BindComplete+NoData first"),
-    ]
+    []
 );
 replays_postgresql!(
     pg18_c33_engineerr_replays_as_postgresql_answered,
@@ -12893,8 +12873,6 @@ replays_postgresql!(
         (27, "PGDIV-SQLITE-NAME-MESSAGE error-text [wire]: 42P01 both; ours 'Parse error: no such table: nosuch' vs PG 'relation \"nosuch\" does not exist'"),
         (33, "PGDIV-ARRAY-RESULT-BLOB value [wire]: text[] param {\"NUL\\L\"} comes back as blob '\\\\x02154e554c4c' instead of '{\"NULL\"}'"),
         (34, "PGDIV-ARRAY-RESULT-BLOB value [wire]: text[] param {NULL} comes back as blob '\\\\x0200' instead of '{NULL}'"),
-        (35, "PGDIV-BIND-REFUSAL-STEP protocol [wire]: malformed text[] param {a}}: PG refuses 22P02 at Bind; ours BindComplete+RowDescription first"),
-        (36, "PGDIV-BIND-REFUSAL-STEP protocol [wire]: int[] param {1,x}: PG refuses 22P02 at Bind; ours BindComplete+RowDescription first"),
         (37, "PGDIV-ARRAY-RESULT-BLOB value [wire]: text[] param {a,b} comes back as blob '\\\\x030f0f6162' instead of '{a,b}'"),
     ]
 );
@@ -12936,8 +12914,6 @@ replays_postgresql!(
         (21, "PGDIV-PARSE-PREFIX error-text [wire]: COPY ... WHERE v = $1 extended: message sequence agrees (Parse/Bind/NoData then 42P02); ours prefixes 'Parse error: '"),
         (22, "PGDIV-PARSE-REFUSAL-STEP protocol [wire]: COPY ... WHERE v = $1 with param type 0: PG refuses 42P18 at Parse; ours ParseComplete then the same error"),
         (25, "PGDIV-PARSE-REFUSAL-STEP protocol [wire]: s.t.c with only t in FROM: PG refuses at Parse 'invalid reference to FROM-clause entry'; ours ParseComplete then 'Parse error: missing FROM-clause entry' (42P01 both)"),
-        (26, "PGDIV-BIND-REFUSAL-STEP protocol [wire]: $1::float8 param 1e-400: PG refuses at Bind (only ParseComplete); ours BindComplete+RowDescription then 22003 with 'value ' prefix"),
-        (27, "PGDIV-BIND-REFUSAL-STEP protocol [wire]: $1::float4 param 1e-50: PG refuses at Bind; ours BindComplete+RowDescription then 22003 with 'value ' prefix"),
         (31, "PGDIV-PARSE-REFUSAL-STEP protocol [wire]: Describe of SELECT varchar $1: PG refuses 42601 at Parse; ours ParseComplete then 'Parse error: syntax error'"),
         (32, "PGDIV-PARSE-REFUSAL-STEP protocol [wire]: SELECT varchar $1 over Parse/Bind/Execute: PG refuses at Parse; ours ParseComplete+BindComplete then 42601 with prefix"),
         (37, "PGDIV-BOOL-TEXT value [wire]: SILENT: EXISTS (SELECT 1 FROM k WHERE k.flag) in DELETE RETURNING answers '1' typed 25; PG 't' typed 16"),
