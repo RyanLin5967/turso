@@ -8966,28 +8966,30 @@ fn lifecycle_audit(n: u32) {
     let _d = Disarm;
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("audit.db");
+    // The population, before anything is measured, at durability OFF (D0), then checkpointed;
+    // every audited operation runs after a reopen at D2 (lead order 2026-10-16; FLAGGED fixture
+    // change: the 10^6 arm populated one create per F_FULLFSYNC and twice hit its budget still
+    // populating, 90 min and 4 h, raws l70 and l87). What the audit claims is unchanged: the
+    // store-mutex holds of the create path at n LIVE branches.
     let incarnation = {
-        let db = open_at(&path, opts(true, SyncClass::FullFsync));
+        let db = open_at(&path, opts(true, SyncClass::Off));
         let trunk = db.connect().unwrap();
         seed(&trunk);
-        // The population, before anything is measured, by 16 connections at once so that their D2
-        // flushes are shared (FLAGGED fixture change: the 10^6 arm populated one create per
-        // F_FULLFSYNC and twice hit its budget, 90 min and 4 h, still populating: raws l70, l87).
-        // The same n named branches, the same store and sync class.
-        let workers = if n >= 100_000 { 16 } else { 1 };
-        std::thread::scope(|scope| {
-            for w in 0..workers {
-                let db = db.clone();
-                scope.spawn(move || {
-                    let conn = db.connect().unwrap();
-                    for i in (w..n).step_by(workers as usize) {
-                        conn.create_branch(&format!("pop-{i:07}")).unwrap();
-                    }
-                });
-            }
-        });
+        for i in 0..n {
+            trunk.create_branch(&format!("pop-{i:07}")).unwrap();
+        }
+        db.branch_compact_now().unwrap();
         db.incarnation
     };
+    // Premise: the n branches are live after the reopen, and checkpointed (the reopen replays a
+    // short log, not n creates).
+    {
+        let db = reopen(&path, opts(true, SyncClass::FullFsync), incarnation);
+        let live = db.branch_stats().unwrap().live_branches as u64;
+        let replayed = db.branch_open_stats().records;
+        assert!(live >= u64::from(n), "premise: {live} branches live after the population, not {n}");
+        assert!(replayed < 1_000, "premise: the population was not checkpointed: the reopen replayed {replayed} records");
+    }
     {
         let mut log = AUDIT_LOG.lock().unwrap();
         log.clear();
