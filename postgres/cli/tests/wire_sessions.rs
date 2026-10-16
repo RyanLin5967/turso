@@ -13344,3 +13344,4 @@ fn foreign_keys_cannot_be_turned_off_over_pending_deferred_violations() {
     a.q("COMMIT").ok("commit");
     assert_eq!(a.q("SHOW foreign_keys").single("foreign_keys"), "on");
 }
+replays_postgresql!(pg18_c44_m2_sets_replays_as_postgresql_answered, "pg18-c44-m2-sets.out", []);
