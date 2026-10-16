@@ -278,7 +278,7 @@ pub enum TxEvent {
 pub(crate) fn pg_parse_error(e: turso_pg_parser::ParseError) -> LimboError {
     match e {
         turso_pg_parser::ParseError::StackDepthLimitExceeded => LimboError::StackDepthLimitExceeded,
-        e => LimboError::ParseError(e.into()),
+        turso_pg_parser::ParseError::ParseError(message) => LimboError::ParseError(message),
     }
 }
 
@@ -962,6 +962,18 @@ fn prepare_statement_inner(
 fn prepare_statement_checked(
     pg_conn: &Arc<PgConnectionInner>,
     sql: &str,
+    types: Option<&mut StatementTypes>,
+    describe: bool,
+    check_keys: bool,
+) -> Result<Option<Statement>> {
+    turso_pg_parser::with_preparation_stack(sql, || {
+        prepare_statement_on_stack(pg_conn, sql, types, describe, check_keys)
+    })
+}
+
+fn prepare_statement_on_stack(
+    pg_conn: &Arc<PgConnectionInner>,
+    sql: &str,
     mut types: Option<&mut StatementTypes>,
     describe: bool,
     check_keys: bool,
@@ -1111,6 +1123,7 @@ fn prepare_statement_checked(
                 .with_columns(move |schema, table| relation_columns(&pg_conn, schema, table))
         } else if is_positional_insert_default(sql, &parse_result)
             || has_alias_column_list(&parse_result)
+            || has_generate_series(&parse_result)
         {
             let pg_conn = pg_conn.clone();
             PostgreSQLTranslator::new()
@@ -1192,7 +1205,7 @@ fn prepare_statement_checked(
                 .with_expression_types(expression_types.clone())
                 .with_columns(move |schema, table| resident_relation_columns(&lookup_conn, schema, table))
                 .translate_with_prereqs(&parse_result)
-                .map_err(|e| LimboError::ParseError(e.into()))?;
+                .map_err(crate::session::pg_parse_error)?;
             return pg_conn
                 .conn
                 .prepare_translated_cmd_with_options(retried.cmd, sql, &options)
@@ -1898,11 +1911,11 @@ fn handle_pg_add_constraints(
             }
         }
     }
-    let aside_def =
-        turso_pg_parser::deparse(&aside_tree).map_err(crate::session::pg_parse_error)?;
     create.table_elts.extend(add.constraints.iter().cloned());
-    let rebuilt = turso_pg_parser::deparse(&parsed.protobuf)
-        .map_err(crate::session::pg_parse_error)?;
+    let aside_def =
+        turso_pg_parser::deparse_with_metadata(&aside_tree, &parsed).map_err(crate::session::pg_parse_error)?;
+    let rebuilt =
+        turso_pg_parser::deparse_with_metadata(&parsed.protobuf, &parsed).map_err(crate::session::pg_parse_error)?;
     // Every refusal the translator makes of the rebuilt CREATE TABLE (MATCH FULL over several
     // columns among them) is answered here, before anything is copied, dropped or locked: it came
     // from the rebuild's own CREATE, after the BEGIN, the aside copy and the DROP, under the trunk's
@@ -1945,6 +1958,12 @@ fn handle_pg_add_constraints(
     // Whether the table's older keys resolve: if they do, the engine's own resolution after the
     // rebuild can refuse only for a key this ALTER adds, and backs the per-key checks.
     let resolved_before = keys.is_empty() || check_table_keys(conn, table).is_ok();
+    // Virtual columns are recomputed by both tables; INSERT destinations accept only stored values.
+    let stored_columns = conn.current_schema().get_btree_table(table).ok_or_else(|| {
+        LimboError::InternalError("table disappeared before constraint rebuild".into())
+    })?.columns().iter().filter(|column| !column.hidden() && !column.is_generated())
+        .filter_map(|column| column.name.as_ref())
+        .map(|name| turso_pg_parser::quote_identifier(name)).collect::<Vec<_>>().join(", ");
     let enforced = conn.foreign_keys_enabled();
     // In a transaction of its own, under one undo rule (own_transaction): its end, COMMIT or
     // RELEASE, fails into the same undo as its steps (a failed COMMIT returned without it left the
@@ -1956,7 +1975,7 @@ fn handle_pg_add_constraints(
         let rebuild = (|| {
             conn.set_foreign_keys_enabled(false);
             run_pg_statement(pg_conn, &aside_def)?;
-            execute_root(conn, format!("INSERT INTO {aside} SELECT * FROM {quoted}"))?;
+            execute_root(conn, format!("INSERT INTO {aside} ({stored_columns}) SELECT {stored_columns} FROM {quoted}"))?;
             execute_root(conn, format!("DROP TABLE {quoted}"))?;
             run_pg_statement(pg_conn, &rebuilt)?;
             // The copy back checks every row against the new PRIMARY KEY, UNIQUE and CHECK
@@ -1964,7 +1983,7 @@ fn handle_pg_add_constraints(
             // the connection's pending deferred-key count: with keys on it counted the rows again,
             // and a block's deferred orphan was cancelled, or a fixed one counted twice (wire
             // review 6 item 1).
-            execute_root(conn, format!("INSERT INTO {quoted} SELECT * FROM {aside}"))?;
+            execute_root(conn, format!("INSERT INTO {quoted} ({stored_columns}) SELECT {stored_columns} FROM {aside}"))?;
             execute_root(conn, format!("DROP TABLE {aside}"))?;
             for sql in &dependents {
                 match catalog::decode_stored_pg_schema_sql(sql) {
@@ -2701,6 +2720,12 @@ fn has_alias_column_list(parse: &turso_pg_parser::pg_query::ParseResult) -> bool
     })
 }
 
+fn has_generate_series(parse: &turso_pg_parser::pg_query::ParseResult) -> bool {
+    parse.functions.iter().any(|(name, _)| {
+        name.rsplit('.').next() == Some("generate_series")
+    })
+}
+
 /// Whether the statement holds an INSERT with no column list whose VALUES lists hold DEFAULT.
 fn is_positional_insert_default(sql: &str, parse: &turso_pg_parser::pg_query::ParseResult) -> bool {
     sql.as_bytes()
@@ -3087,7 +3112,7 @@ mod tests {
     }
 
     fn slow(sql: &str) -> Option<PgBranchCall> {
-        try_extract_branch_call(&turso_pg_parser::parse(sql).ok()?)
+        try_extract_branch_call(&*turso_pg_parser::parse(sql).ok()?)
     }
 
     fn call(function: &str, args: Vec<PgBranchArg>) -> Option<PgBranchCall> {

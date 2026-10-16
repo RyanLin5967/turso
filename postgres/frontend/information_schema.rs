@@ -191,7 +191,7 @@ fn column_type(col: &turso_core::schema::Column) -> ColumnType {
     (data_type, udt, len, prec, radix, scale)
 }
 
-/// Every PRIMARY KEY, UNIQUE and FOREIGN KEY constraint of `table`: (name, type, columns).
+/// Every key and NOT NULL constraint of `table`: (name, information-schema type, key columns).
 fn constraints(name: &str, table: &BTreeTable) -> Vec<(String, &'static str, Vec<String>)> {
     let mut out = Vec::new();
     let pk_in_sets = table.unique_sets.iter().any(|u| u.is_primary_key);
@@ -220,6 +220,13 @@ fn constraints(name: &str, table: &BTreeTable) -> Vec<(String, &'static str, Vec
             "FOREIGN KEY",
             fk.child_columns.to_vec(),
         ));
+    }
+    for column in table.columns() {
+        if column.notnull() || column.primary_key() {
+            if let Some(column) = &column.name {
+                out.push((format!("{name}_{column}_not_null"), "CHECK", Vec::new()));
+            }
+        }
     }
     out
 }
@@ -428,7 +435,7 @@ pub(crate) fn virtual_tables() -> Vec<Arc<VirtualTable>> {
             name: "information_schema_table_constraints",
             sql: "CREATE TABLE information_schema_table_constraints (constraint_catalog TEXT, \
                   constraint_schema TEXT, constraint_name TEXT, table_catalog TEXT, \
-                  table_schema TEXT, table_name TEXT, constraint_type TEXT, is_deferrable TEXT, \
+                  table_schema TEXT, table_name TEXT, constraint_type VARCHAR, is_deferrable TEXT, \
                   initially_deferred TEXT)",
             load: load_table_constraints,
         },

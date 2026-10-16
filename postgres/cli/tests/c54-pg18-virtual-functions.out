@@ -1,0 +1,153 @@
+>> Q CREATE TABLE gv(a INT, b INT GENERATED ALWAYS AS (a * 2) VIRTUAL)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO gv(a) VALUES(3)
+   C INSERT 0 1
+   Z I
+>> Q SELECT a,b FROM gv
+   T oids=[23, 23] names=['a', 'b']
+   D ['3', '6']
+   C SELECT 1
+   Z I
+>> Q DROP TABLE gv
+   C DROP TABLE
+   Z I
+>> Q CREATE TABLE gv(a INT, b INT GENERATED ALWAYS AS ((a + 1) * 2) /* comment */ VIRTUAL)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO gv(a) VALUES(3)
+   C INSERT 0 1
+   Z I
+>> Q SELECT a,b FROM gv
+   T oids=[23, 23] names=['a', 'b']
+   D ['3', '8']
+   C SELECT 1
+   Z I
+>> Q DROP TABLE gv
+   C DROP TABLE
+   Z I
+>> Q CREATE TABLE ordinary(virtual INT)
+   C CREATE TABLE
+   Z I
+>> Q SELECT 'generated always as (a) virtual'
+   T oids=[25] names=['?column?']
+   D ['generated always as (a) virtual']
+   C SELECT 1
+   Z I
+>> Q SELECT name FROM (VALUES ('abs'), ('acos'), ('acosh'), ('array'), ('array_agg'), ('array_append'), ('array_cat'), ('array_contains'), ('array_contains_all'), ('array_element'), ('array_length'), ('array_overlap'), ('array_overlaps'), ('array_position'), ('array_prepend'), ('array_remove'), ('array_set_element'), ('array_slice'), ('array_to_string'), ('array_upper'), ('asin'), ('asinh'), ('atan'), ('atan2'), ('atanh'), ('avg'), ('bin_record_json_object'), ('boolean_to_int'), ('btrim'), ('ceil'), ('ceiling'), ('changes'), ('char'), ('char_length'), ('character_length'), ('chr'), ('coalesce'), ('concat'), ('concat_ws'), ('conn_txn_id'), ('cos'), ('cosh'), ('count'), ('cume_dist'), ('currval'), ('date'), ('datetime'), ('degrees'), ('dense_rank'), ('exp'), ('first_value'), ('floor'), ('format'), ('fs'), ('fts'), ('fts_highlight'), ('fts_match'), ('fts_score'), ('gcd'), ('get_byte'), ('glob'), ('group_concat'), ('hex'), ('if'), ('ifnull'), ('iif'), ('instr'), ('int_to_boolean'), ('is_autocommit'), ('json'), ('json_array'), ('json_array_length'), ('json_error_position'), ('json_extract'), ('json_group_array'), ('json_group_object'), ('json_insert'), ('json_object'), ('json_patch'), ('json_pretty'), ('json_quote'), ('json_remove'), ('json_replace'), ('json_set'), ('json_type'), ('json_valid'), ('jsonb'), ('jsonb_array'), ('jsonb_extract'), ('jsonb_group_array'), ('jsonb_group_object'), ('jsonb_insert'), ('jsonb_object'), ('jsonb_patch'), ('jsonb_remove'), ('jsonb_replace'), ('jsonb_set'), ('julianday'), ('lag'), ('last_insert_rowid'), ('last_value'), ('lcm'), ('lead'), ('length'), ('like'), ('likelihood'), ('likely'), ('ln'), ('load_extension'), ('log'), ('log10'), ('log2'), ('lower'), ('lpad'), ('ltrim'), ('max'), ('min'), ('mod'), ('nextval'), ('nth_value'), ('ntile'), ('nullif'), ('numeric_add'), ('numeric_decode'), ('numeric_div'), ('numeric_encode'), ('numeric_eq'), ('numeric_lt'), ('numeric_mul'), ('numeric_sub'), ('octet_length'), ('percent_rank'), ('pi'), ('pow'), ('power'), ('printf'), ('quote'), ('radians'), ('random'), ('randomblob'), ('rank'), ('repeat'), ('replace'), ('reverse'), ('round'), ('row_number'), ('rpad'), ('rtrim'), ('sequence_watermark_experimental'), ('set_byte'), ('setval'), ('sign'), ('sin'), ('sinh'), ('soundex'), ('sqlite_source_id'), ('sqlite_version'), ('sqrt'), ('strftime'), ('string_agg'), ('string_reverse'), ('string_to_array'), ('strpos'), ('struct_extract'), ('struct_pack'), ('substr'), ('substring'), ('subtype'), ('sum'), ('table_columns_json_array'), ('tan'), ('tanh'), ('test_helper'), ('test_nondet_counter'), ('test_uint_add'), ('test_uint_decode'), ('test_uint_div'), ('test_uint_encode'), ('test_uint_eq'), ('test_uint_lt'), ('test_uint_mul'), ('test_uint_sub'), ('time'), ('timediff'), ('total'), ('total_changes'), ('trim'), ('trunc'), ('turso_version'), ('typeof'), ('unhex'), ('unicode'), ('union_extract'), ('union_tag'), ('union_value'), ('unistr'), ('unistr_quote'), ('unixepoch'), ('unlikely'), ('upper'), ('validate_ipaddr'), ('vector'), ('vector1bit'), ('vector32'), ('vector32_sparse'), ('vector64'), ('vector8'), ('vector_concat'), ('vector_distance_cos'), ('vector_distance_dot'), ('vector_distance_jaccard'), ('vector_distance_l2'), ('vector_extract'), ('vector_slice'), ('wasm'), ('zeroblob')) AS candidates(name) WHERE NOT EXISTS(SELECT 1 FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='pg_catalog' AND p.proname=candidates.name) ORDER BY name
+   T oids=[25] names=['name']
+   D ['array']
+   D ['array_contains']
+   D ['array_contains_all']
+   D ['array_element']
+   D ['array_overlap']
+   D ['array_overlaps']
+   D ['array_set_element']
+   D ['array_slice']
+   D ['bin_record_json_object']
+   D ['boolean_to_int']
+   D ['changes']
+   D ['coalesce']
+   D ['conn_txn_id']
+   D ['datetime']
+   D ['fs']
+   D ['fts']
+   D ['fts_highlight']
+   D ['fts_match']
+   D ['fts_score']
+   D ['glob']
+   D ['group_concat']
+   D ['hex']
+   D ['if']
+   D ['ifnull']
+   D ['iif']
+   D ['instr']
+   D ['int_to_boolean']
+   D ['is_autocommit']
+   D ['json']
+   D ['json_array']
+   D ['json_error_position']
+   D ['json_extract']
+   D ['json_group_array']
+   D ['json_group_object']
+   D ['json_insert']
+   D ['json_patch']
+   D ['json_pretty']
+   D ['json_quote']
+   D ['json_remove']
+   D ['json_replace']
+   D ['json_set']
+   D ['json_type']
+   D ['json_valid']
+   D ['jsonb']
+   D ['jsonb_array']
+   D ['jsonb_extract']
+   D ['jsonb_group_array']
+   D ['jsonb_group_object']
+   D ['jsonb_patch']
+   D ['jsonb_remove']
+   D ['jsonb_replace']
+   D ['julianday']
+   D ['last_insert_rowid']
+   D ['likelihood']
+   D ['likely']
+   D ['load_extension']
+   D ['log2']
+   D ['nullif']
+   D ['numeric_decode']
+   D ['numeric_encode']
+   D ['printf']
+   D ['quote']
+   D ['randomblob']
+   D ['sequence_watermark_experimental']
+   D ['soundex']
+   D ['sqlite_source_id']
+   D ['sqlite_version']
+   D ['strftime']
+   D ['string_reverse']
+   D ['struct_extract']
+   D ['struct_pack']
+   D ['subtype']
+   D ['table_columns_json_array']
+   D ['test_helper']
+   D ['test_nondet_counter']
+   D ['test_uint_add']
+   D ['test_uint_decode']
+   D ['test_uint_div']
+   D ['test_uint_encode']
+   D ['test_uint_eq']
+   D ['test_uint_lt']
+   D ['test_uint_mul']
+   D ['test_uint_sub']
+   D ['timediff']
+   D ['total']
+   D ['total_changes']
+   D ['trim']
+   D ['turso_version']
+   D ['typeof']
+   D ['unhex']
+   D ['unicode']
+   D ['union_extract']
+   D ['union_tag']
+   D ['union_value']
+   D ['unistr_quote']
+   D ['unixepoch']
+   D ['unlikely']
+   D ['validate_ipaddr']
+   D ['vector']
+   D ['vector1bit']
+   D ['vector32']
+   D ['vector32_sparse']
+   D ['vector64']
+   D ['vector8']
+   D ['vector_concat']
+   D ['vector_distance_cos']
+   D ['vector_distance_dot']
+   D ['vector_distance_jaccard']
+   D ['vector_distance_l2']
+   D ['vector_extract']
+   D ['vector_slice']
+   D ['wasm']
+   D ['zeroblob']
+   C SELECT 113
+   Z I

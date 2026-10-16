@@ -2085,6 +2085,8 @@ fn information_schema_describes_tables_columns_and_keys() {
     assert_eq!(
         r.rows,
         vec![
+            vec![Some("CHECK".into())],
+            vec![Some("CHECK".into())],
             vec![Some("FOREIGN KEY".into())],
             vec![Some("PRIMARY KEY".into())]
         ]
@@ -9695,16 +9697,17 @@ fn a_recursive_ctes_self_reference_types_its_parameter() {
 /// The 42P18 refusal of a parameter compared with something no context types applies only to a
 /// parameter the client left untyped (OID 0, or none declared): one declared in Parse has its
 /// declared type, at Describe and at Execute, as in PostgreSQL. The refusal was made at prepare,
-/// from the text alone, before the declared OIDs were read: `typeof(v) = $1` declared text was
-/// 42P18 at Describe and at Execute alike, so it could never run, and inside a block its Describe
-/// failed the block (wire review 11 item 1, a regression from 935586643).
+/// from the text alone, before the declared OIDs were read, so it could never run, and inside a
+/// block its Describe failed the block (wire review 11 item 1). `$1 IS NOT NULL` exercises this
+/// PostgreSQL-valid typing boundary; the original typeof() fixture is undefined in PostgreSQL
+/// and is independently checked by c54_sqlite_functions_are_undefined_in_postgresql.
 #[test]
 fn a_declared_parameter_is_never_refused_as_untyped() {
     const TEXT: u32 = 25;
     let dir = Scratch::new("declared42p18");
     let server = Server::start(&dir.db(), &[]);
     let mut a = seeded(&server);
-    let sql = "SELECT id FROM t WHERE typeof(v) = $1";
+    let sql = "SELECT id FROM t WHERE $1 IS NOT NULL";
     // Parse declaring `oid`, Describe the statement, Sync.
     let describe = |a: &mut Wire, oid: u32| -> Reply {
         let mut parse = vec![0u8];
@@ -9911,13 +9914,11 @@ fn untyped_contexts_type_their_parameters() {
     if n != "11" {
         wrong.push(format!("ON CONFLICT SET n = $1 left n = {n}"));
     }
-    // Compared with something no context types (a function the engine has, which the walk does not
-    // type): exactly 42P18, the lead's fail-closed rule, where the base served it as text; a
-    // function that does not exist is the engine's 42883. ENGINE-ONLY: PostgreSQL has no typeof
-    // and answers 42883 for the first row too, so a PG18 re-recording of E5-QUEUE P7 must not
-    // "correct" it; it is the only fail-closed probe here (wire review 15 item 27).
+    // IS NOT NULL supplies no parameter type: PostgreSQL refuses its undeclared $1 with
+    // 42P18. Both absent PostgreSQL functions are 42883, independently of parameter typing.
     for (sql, code) in [
-        ("SELECT id FROM p WHERE typeof(name) = $1", "42P18"),
+        ("SELECT id FROM p WHERE $1 IS NOT NULL", "42P18"),
+        ("SELECT id FROM p WHERE typeof(name) = $1", "42883"),
         ("SELECT id FROM p WHERE no_such_typing(name) = $1", "42883"),
     ] {
         let r = a.describe_statement(sql);
@@ -13242,6 +13243,143 @@ fn c44_lock_timeout_int32_max_is_accepted() {
     assert_eq!(a.q("SHOW lock_timeout").single("timeout"), "2147483647ms");
 }
 
+// PG18.6: c54-pg18-boundaries.out, commands 1, 2, 3, 4, 5.
+#[test]
+fn c54_series_arity_has_no_sqlite_defaults() {
+    let dir = Scratch::new("c54-series-arity");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "SELECT * FROM generate_series() LIMIT 1",
+        "SELECT * FROM generate_series(1) LIMIT 1",
+        "SELECT * FROM generate_series(1,2,1,1) LIMIT 1",
+    ] {
+        assert_eq!(a.q(sql).err(sql).code, "42883", "{sql}");
+    }
+    for sql in ["SELECT * FROM generate_series(1,2) LIMIT 1", "SELECT * FROM generate_series(1,2,1) LIMIT 1"] {
+        let reply = a.q(sql).ok(sql);
+        assert_eq!(reply.oids, Some(vec![23]));
+        assert_eq!(reply.rows, vec![vec![Some("1".into())]]);
+    }
+}
+
+#[test]
+fn c54_generate_series_rejects_float_arguments() {
+    let dir = Scratch::new("c54-series-types");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let sql = "SELECT * FROM generate_series(0, 'inf'::float8, 10)";
+    assert_eq!(a.q(sql).err(sql).code, "42883");
+    assert_eq!(a.q("SELECT count(*) FROM generate_series(1, 5)").single("integer series"), "5");
+}
+
+#[test]
+fn c54_sqlite_functions_are_undefined_in_postgresql() {
+    let dir = Scratch::new("c54-sqlite-function");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE leak(name TEXT)").ok("fixture");
+    let sql = "SELECT * FROM leak WHERE typeof(name) = $1";
+    assert_eq!(a.describe_statement(sql).err(sql).code, "42883");
+    for sql in ["SELECT sqlite_version()", "SELECT ifnull(1, 2)", "SELECT total(1)", "SELECT hex('abc')"] {
+        assert_eq!(a.q(sql).err(sql).code, "42883", "{sql}");
+    }
+    assert_eq!(a.q("SELECT coalesce(NULL, 2)").single("PG function"), "2");
+}
+
+#[test]
+fn c54_bare_series_alias_resolves_in_correlated_subqueries() {
+    let dir = Scratch::new("c54-series-alias");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE s(x INT); INSERT INTO s VALUES (1), (2)").ok("series input");
+    a.q("CREATE TABLE w(k INT); INSERT INTO w VALUES (1), (2)").ok("inner relation");
+    let sql = "SELECT g FROM s, generate_series(1, s.x) AS g WHERE EXISTS (SELECT 1 FROM w WHERE w.k = g) ORDER BY g";
+    let r = a.q(sql).ok(sql);
+    assert_eq!(r.oids, Some(vec![23]));
+    assert_eq!(r.rows, vec![vec![Some("1".into())], vec![Some("1".into())], vec![Some("2".into())]]);
+    a.q("CREATE TABLE u(g INT); INSERT INTO u VALUES (10)").ok("shadowing column");
+    assert_eq!(a.q("SELECT count(*) FROM s, generate_series(1, s.x) AS g WHERE EXISTS (SELECT 1 FROM u WHERE g = 10)").single("inner column shadows series"), "3");
+}
+
+#[test]
+fn c54_full_join_merged_columns_are_explicitly_unsupported() {
+    let dir = Scratch::new("c54-full-using");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE j1(i INT); CREATE TABLE j2(i INT)").ok("join tables");
+    for sql in ["SELECT * FROM j1 FULL JOIN j2 USING(i)", "SELECT i FROM j1 FULL JOIN j2 USING(i)", "SELECT * FROM j1 NATURAL FULL JOIN j2"] {
+        assert_eq!(a.q(sql).err(sql).code, "0A000", "{sql}");
+    }
+    a.q("SELECT j1.i, j2.i FROM j1 FULL JOIN j2 ON j1.i = j2.i").ok("supported full join");
+    a.q("SELECT * FROM j1 LEFT JOIN j2 USING(i)").ok("supported using");
+    a.q("INSERT INTO j1 VALUES(1); INSERT INTO j2 VALUES(2)").ok("unmatched join rows");
+    assert_eq!(a.q("SELECT * FROM j1 LEFT JOIN j2 USING(i)").single("left using value"), "1");
+    assert_eq!(a.q("SELECT * FROM j1 RIGHT JOIN j2 USING(i)").single("right using value"), "2");
+    assert_eq!(a.q("SELECT j1.i,j2.i FROM j1 FULL JOIN j2 ON j1.i=j2.i ORDER BY j1.i NULLS LAST")
+        .ok("full on unmatched values").rows,
+        vec![vec![Some("1".into()), None], vec![None, Some("2".into())]]);
+}
+
+#[test]
+fn c54_composite_output_is_explicitly_unsupported() {
+    let dir = Scratch::new("c54-row-output");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in ["SELECT ROW(1, 2)", "SELECT (1, 2)", "SELECT coalesce(ROW(1, 2), ROW(3, 4))"] {
+        assert_eq!(a.q(sql).err(sql).code, "0A000", "{sql}");
+    }
+    assert_eq!(a.q("SELECT (1, 2) < (2, 1)").single("row comparison"), "t");
+}
+
+#[test]
+fn c54_virtual_generated_columns_compute_their_expression() {
+    let dir = Scratch::new("c54-virtual-generated");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for (sql, expected) in [
+        ("CREATE TABLE gv(a INT, b INT GENERATED ALWAYS AS (a * 2) VIRTUAL)", "6"),
+        ("CREATE TABLE gv(a INT, b INT GENERATED ALWAYS AS ((a + 1) * 2) /* comment */ VIRTUAL)", "8"),
+    ] {
+        a.q(sql).ok(sql);
+        a.q("INSERT INTO gv(a) VALUES(3)").ok("base column write");
+        let r = a.q("SELECT a,b FROM gv").ok("generated value");
+        assert_eq!(r.oids, Some(vec![23, 23]));
+        assert_eq!(r.rows, vec![vec![Some("3".into()), Some(expected.into())]]);
+        a.q("DROP TABLE gv").ok("next expression");
+    }
+    a.q("CREATE TABLE ordinary(virtual INT)").ok("virtual is an identifier");
+    a.q("SELECT 'generated always as (a) virtual'").ok("quoted text");
+}
+
+#[test]
+fn c54_information_schema_lists_not_null_as_check() {
+    let dir = Scratch::new("c54-notnull-catalog");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE w(w_id INT PRIMARY KEY)").ok("parent");
+    a.q("CREATE TABLE s(s_i_id INT NOT NULL, s_w_id SMALLINT NOT NULL, PRIMARY KEY(s_w_id,s_i_id), FOREIGN KEY(s_w_id) REFERENCES w(w_id))").ok("child");
+    let sql = "SELECT constraint_type FROM information_schema.table_constraints WHERE table_name = 's' ORDER BY constraint_type";
+    let r = a.q(sql).ok(sql);
+    assert_eq!(r.rows, vec![vec![Some("CHECK".into())], vec![Some("CHECK".into())], vec![Some("FOREIGN KEY".into())], vec![Some("PRIMARY KEY".into())]]);
+    assert_eq!(r.oids, Some(vec![1043]));
+    assert_eq!(a.q("SELECT count(*) FROM information_schema.key_column_usage WHERE table_name='s'").single("only key columns"), "3");
+}
+
+#[test]
+fn c54_settings_metadata_is_explicitly_unsupported() {
+    let dir = Scratch::new("c54-settings-metadata");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in ["SELECT name, boot_val, reset_val, source FROM pg_settings", "SELECT name, boot_val, reset_val, source FROM pg_catalog.pg_settings"] {
+        assert_eq!(a.q(sql).err(sql).code, "0A000", "{sql}");
+    }
+    assert_eq!(a.q("WITH pg_settings AS (SELECT 1 AS value) SELECT value FROM pg_settings").single("CTE shadows catalog"), "1");
+    a.q("CREATE TABLE pg_settings(value INT); INSERT INTO public.pg_settings VALUES (7)").ok("public relation");
+    assert_eq!(a.q("SELECT value FROM public.pg_settings").single("explicit public relation"), "7");
+    assert_eq!(a.q("SHOW client_encoding").single("existing settings"), "UTF8");
+}
+
 // C50: each row is recorded in pg18/pg18-c33-intrange.out.
 #[test]
 fn c50_int8_cast_before_negation() {
@@ -13853,6 +13991,190 @@ fn c50_class3_serial_aliases_retain_integer_widths() {
         let r=a.q(&format!("INSERT INTO {table}(s,b) VALUES (1,9223372036854775807) RETURNING s,b,pg_typeof(s),pg_typeof(b)")).ok("bigserial max");
         assert_eq!(r.rows,vec![vec![Some("1".into()),Some("9223372036854775807".into()),Some("smallint".into()),Some("bigint".into())]]);
         assert_eq!(r.oids,Some(vec![21,20,2206,2206]));
+    }
+}
+
+// PG18.6: c54-pg18-boundaries.out, commands 6, 7, 8.
+#[test]
+fn c54_derived_alias_wrapper_does_not_shadow_case_folded_table_names() {
+    let dir = Scratch::new("c54-derived-alias-name");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE \"__TURSO_PG_DERIVED_COLUMNS\"(v INT)").ok("fixture");
+    a.q("INSERT INTO \"__TURSO_PG_DERIVED_COLUMNS\" VALUES(7)").ok("fixture row");
+    let sql = "SELECT a FROM(SELECT v FROM \"__TURSO_PG_DERIVED_COLUMNS\")t(a)";
+    let reply = a.q(sql).ok(sql);
+    assert_eq!(reply.oids, Some(vec![23]));
+    assert_eq!(reply.rows, vec![vec![Some("7".into())]]);
+}
+
+
+
+
+#[test]
+fn c54_sqlite_table_functions_are_undefined() {
+    let dir = Scratch::new("c54-sqlite-table-function");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in ["SELECT * FROM pragma_table_info('t')", "SELECT \"TYPEOF\"(1)"] {
+        assert_eq!(a.q(sql).err(sql).code, "42883", "{sql}");
+    }
+}
+
+
+#[test]
+fn c54_virtual_generated_survives_alter_and_reload() {
+    let dir = Scratch::new("c54-virtual-alter");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE va(a INT)").ok("fixture");
+    a.q("ALTER TABLE va ADD COLUMN b INT GENERATED ALWAYS AS(a*2) VIRTUAL").ok("add generated");
+    a.q("INSERT INTO va(a) VALUES(3)").ok("base write");
+    let r = a.q("SELECT a,b FROM va").ok("generated after alter");
+    assert_eq!(r.oids, Some(vec![23, 23]));
+    assert_eq!(r.rows, vec![vec![Some("3".into()), Some("6".into())]]);
+    a.q("ALTER TABLE va ADD COLUMN c TEXT DEFAULT 'generated always as(a) virtual'").ok("preserve storage and literal");
+    drop(a);
+    let mut b = server.connect();
+    let r = b.q("SELECT a,b,c FROM va").ok("reload generated expression");
+    assert_eq!(r.oids, Some(vec![23, 23, 25]));
+    assert_eq!(r.rows, vec![vec![Some("3".into()), Some("6".into()), Some("generated always as(a) virtual".into())]]);
+}
+
+
+#[test]
+fn c54_virtual_generated_retains_storage_during_constraint_rebuild() {
+    let dir = Scratch::new("c54-virtual-rebuild");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE vr(a INT,b INT GENERATED ALWAYS AS(a*2) VIRTUAL)").ok("fixture");
+    a.q("INSERT INTO vr(a) VALUES(3)").ok("base write");
+    a.q("ALTER TABLE vr ADD CONSTRAINT ck CHECK(a>0)").ok("rebuild");
+    let r = a.q("SELECT a,b FROM vr").ok("retained generated value");
+    assert_eq!(r.oids, Some(vec![23, 23]));
+    assert_eq!(r.rows, vec![vec![Some("3".into()), Some("6".into())]]);
+    let sql = "INSERT INTO vr(a) VALUES(-1)";
+    assert_eq!(a.q(sql).err(sql).code, "23514");
+    assert_eq!(a.q("SELECT a,b FROM vr").ok("failed write preserves row").rows, r.rows);
+}
+
+#[test]
+fn c54_virtual_generated_named_constraint_and_batch_identifier() {
+    let dir = Scratch::new("c54-virtual-names");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE vn(a INT,b INT CONSTRAINT vg GENERATED ALWAYS AS(a*2) VIRTUAL)").ok("named generated constraint");
+    a.q("INSERT INTO vn(a) VALUES(3)").ok("base write");
+    let r = a.q("SELECT a,b FROM vn").ok("named generated value");
+    assert_eq!(r.rows, vec![vec![Some("3".into()), Some("6".into())]]);
+    let sql = "CREATE TABLE vm(a INT,b INT GENERATED ALWAYS AS(a*2) VIRTUAL); SELECT 1 AS generated";
+    assert_eq!(a.q(sql).single(sql), "1");
+}
+
+#[test]
+fn c54_virtual_batch_keeps_trailing_generated_identifier() {
+    let dir = Scratch::new("c54-virtual-batch");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let sql = "CREATE TABLE vm(a INT,b INT GENERATED ALWAYS AS(a*2) VIRTUAL); SELECT 1 AS generated";
+    assert_eq!(a.q(sql).single(sql), "1");
+}
+
+// PG18.6: c54-pg18-boundaries.out, commands 9, 10, 11, 12.
+#[test]
+fn c54_virtual_normalization_preserves_the_shared_depth_refusal() {
+    let dir = Scratch::new("c54-virtual-rewrite-depth");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let expression = format!("{}a{}", "abs(".repeat(3000), ")".repeat(3000));
+    let sql = format!("CREATE TABLE vd_bound(a INT,b INT GENERATED ALWAYS AS({expression}) VIRTUAL)");
+    let create = a.q(&sql);
+    if let Some(error) = create.error {
+        assert_eq!(error.code, "54001", "normalized CREATE: {error:?}");
+    } else {
+        assert_eq!(create.tags, vec!["CREATE TABLE".to_string()]);
+        let insert = "INSERT INTO vd_bound(a) VALUES(-3)";
+        assert_eq!(a.q(insert).ok(insert).tags, vec!["INSERT 0 1".to_string()]);
+        let select = "SELECT a,b FROM vd_bound";
+        let reply = a.q(select).ok(select);
+        // The first abs turns -3 into 3; every subsequent abs leaves 3 unchanged.
+        assert_eq!(reply.oids, Some(vec![23, 23]));
+        assert_eq!(reply.rows, vec![vec![Some("-3".into()), Some("3".into())]]);
+        assert_eq!(reply.tags, vec!["SELECT 1".to_string()]);
+    }
+    assert_eq!(a.q("SELECT 1").single("same session survives"), "1");
+    assert_eq!(server.connect().q("SELECT 1").single("server survives"), "1");
+}
+
+/// PG18.6 preserves the row at depth 1000 (c54-pg18-depth.out). Our shared stack
+/// bound may refuse that depth, but an accepted CREATE must remain safe when a
+/// much shorter ALTER clones and deparses its retained definition.
+#[test]
+fn c54_deep_virtual_definition_survives_short_constraint_rebuild() {
+    let dir = Scratch::new("c54-virtual-depth");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let expression = format!("{}a{}", "abs(".repeat(1000), ")".repeat(1000));
+    let create = format!("CREATE TABLE vd(a INT,b INT GENERATED ALWAYS AS({expression}) VIRTUAL)");
+    let mut completed = true;
+    for (stage, sql) in [
+        ("create", create.as_str()),
+        ("insert", "INSERT INTO vd(a) VALUES(3)"),
+        ("rebuild", "ALTER TABLE vd ADD CONSTRAINT ck CHECK(a>=0)"),
+    ] {
+        let reply = a.q(sql);
+        if let Some(error) = reply.error {
+            assert_eq!(error.code, "54001", "{stage}: {error:?}");
+            eprintln!("C54 deep virtual {stage}: typed 54001");
+            completed = false;
+            // An accepted CREATE retains its definition even if INSERT reaches
+            // the stack bound; the short ALTER must still exercise that owner.
+            if stage != "insert" {
+                break;
+            }
+            continue;
+        }
+        eprintln!("C54 deep virtual {stage}: accepted");
+    }
+    if completed {
+        let reply = a.q("SELECT a,b FROM vd");
+        if let Some(error) = reply.error {
+            assert_eq!(error.code, "54001", "deep generated value: {error:?}");
+        } else {
+            assert_eq!(reply.oids, Some(vec![23, 23]));
+            assert_eq!(reply.rows, vec![vec![Some("3".into()), Some("3".into())]]);
+        }
+    }
+    assert_eq!(a.q("SELECT 1").single("same session survives"), "1");
+    assert_eq!(server.connect().q("SELECT 1").single("server survives"), "1");
+}
+
+
+#[test]
+fn c54_nested_function_relation_does_not_hide_outer_series_column() {
+    let dir = Scratch::new("c54-function-scope");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE s(x INT); INSERT INTO s VALUES(1),(2)").ok("fixture");
+    let sql = "SELECT g FROM s,generate_series(1,s.x)g WHERE EXISTS(SELECT 1 FROM generate_series(1,1)h WHERE h=1 AND g=1) ORDER BY g";
+    let r = a.q(sql).ok(sql);
+    assert_eq!(r.oids, Some(vec![23]));
+    assert_eq!(r.rows, vec![vec![Some("1".into())], vec![Some("1".into())]]);
+}
+
+
+#[test]
+fn c54_series_signatures_reject_text_and_boolean_arguments() {
+    let dir = Scratch::new("c54-series-signatures");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in ["SELECT * FROM generate_series(1::text,2,1)", "SELECT * FROM generate_series(true,2,1)"] {
+        assert_eq!(a.q(sql).err(sql).code, "42883", "{sql}");
+    }
+    for (sql, oid) in [("SELECT * FROM generate_series(1::smallint,2::bigint,1)", 20), ("SELECT * FROM generate_series(1,2::numeric,1)", 1700)] {
+        let r = a.q(sql).ok(sql);
+        assert_eq!(r.oids, Some(vec![oid]));
+        assert_eq!(r.rows, vec![vec![Some("1".into())], vec![Some("2".into())]]);
     }
 }
 

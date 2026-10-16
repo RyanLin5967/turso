@@ -190,6 +190,7 @@ impl LimboError {
     pub fn sql_error_kind(&self) -> SqlErrorKind {
         use SqlErrorKind::*;
         match self {
+            Self::StackDepthLimitExceeded => StatementTooComplex,
             Self::Constraint(message) => message.kind().unwrap_or(IntegrityConstraintViolation),
             Self::ParseError(message) => message.kind().unwrap_or(SyntaxError),
             Self::TxError(message)
@@ -200,7 +201,6 @@ impl LimboError {
             Self::BusySnapshot => SerializationFailure,
             Self::ForeignKeyConstraint(_) => ForeignKeyViolation,
             Self::IntegerOverflow => NumericValueOutOfRange,
-            Self::StackDepthLimitExceeded => StatementTooComplex,
             Self::ReadOnly => ReadOnlyTransaction,
             Self::DatabaseFull(_) => DiskFull,
             Self::Interrupt => QueryCanceled,

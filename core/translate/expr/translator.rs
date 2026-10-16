@@ -663,13 +663,17 @@ pub fn translate_expr(
                                     emit_type_expr(program, decode_expr, target_register, target_register, &cast_col, type_def, resolver)?;
                                 }
                             }
-                        } else {
-                            // A BASE-only type (no ENCODE, e.g. float4/float8) casts as its
-                            // primitive base does (C32 MED: nothing was emitted, so the value kept
-                            // its own type).
+                            return Ok(target_register);
+                        }
+                        // A numeric base with no ENCODE (bigint, float4, float8) converts as
+                        // its base does: left a no-op, CAST('1.5' AS float8) stayed text where
+                        // SQLite's name rule ("FLOA") makes it REAL.
+                        if let Some(base) =
+                            super::arrays::numeric_base_without_encode(resolver, &tn.name)
+                        {
                             program.emit_insn(Insn::Cast {
                                 reg: target_register,
-                                affinity: Affinity::affinity(&resolved.primitive),
+                                affinity: Affinity::affinity(base),
                             });
                         }
                         return Ok(target_register);

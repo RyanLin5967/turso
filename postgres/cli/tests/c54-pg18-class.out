@@ -1,0 +1,97 @@
+>> Q CREATE TABLE vr(a INT,b INT GENERATED ALWAYS AS(a*2) VIRTUAL)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO vr(a) VALUES(3)
+   C INSERT 0 1
+   Z I
+>> Q ALTER TABLE vr ADD CONSTRAINT ck CHECK(a>0)
+   C ALTER TABLE
+   Z I
+>> Q SELECT a,b FROM vr
+   T oids=[23, 23] names=['a', 'b']
+   D ['3', '6']
+   C SELECT 1
+   Z I
+>> Q INSERT INTO vr(a) VALUES(-1)
+   E S=ERROR C=23514 M=new row for relation "vr" violates check constraint "ck"
+   Z I
+>> Q SELECT a,b FROM vr
+   T oids=[23, 23] names=['a', 'b']
+   D ['3', '6']
+   C SELECT 1
+   Z I
+>> Q CREATE TABLE vn(a INT,b INT CONSTRAINT vg GENERATED ALWAYS AS(a*2) VIRTUAL)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO vn(a) VALUES(3)
+   C INSERT 0 1
+   Z I
+>> Q SELECT a,b FROM vn
+   T oids=[23, 23] names=['a', 'b']
+   D ['3', '6']
+   C SELECT 1
+   Z I
+>> Q CREATE TABLE vm(a INT,b INT GENERATED ALWAYS AS(a*2) VIRTUAL); SELECT 1 AS generated
+   C CREATE TABLE
+   T oids=[23] names=['generated']
+   D ['1']
+   C SELECT 1
+   Z I
+>> Q CREATE TABLE s(x INT)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO s VALUES(1),(2)
+   C INSERT 0 2
+   Z I
+>> Q SELECT g FROM s,generate_series(1,s.x)g WHERE EXISTS(SELECT 1 FROM generate_series(1,1)h WHERE h=1 AND g=1) ORDER BY g
+   T oids=[23] names=['g']
+   D ['1']
+   D ['1']
+   C SELECT 2
+   Z I
+>> Q SELECT * FROM generate_series(1::text,2,1)
+   E S=ERROR C=42883 M=function generate_series(text, integer, integer) does not exist
+   Z I
+>> Q SELECT * FROM generate_series(true,2,1)
+   E S=ERROR C=42883 M=function generate_series(boolean, integer, integer) does not exist
+   Z I
+>> Q SELECT * FROM generate_series(1::smallint,2::bigint,1)
+   T oids=[20] names=['generate_series']
+   D ['1']
+   D ['2']
+   C SELECT 2
+   Z I
+>> Q SELECT * FROM generate_series(1,2::numeric,1)
+   T oids=[1700] names=['generate_series']
+   D ['1']
+   D ['2']
+   C SELECT 2
+   Z I
+>> Q CREATE TABLE j1(i INT)
+   C CREATE TABLE
+   Z I
+>> Q CREATE TABLE j2(i INT)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO j1 VALUES(1)
+   C INSERT 0 1
+   Z I
+>> Q INSERT INTO j2 VALUES(2)
+   C INSERT 0 1
+   Z I
+>> Q SELECT * FROM j1 RIGHT JOIN j2 USING(i)
+   T oids=[23] names=['i']
+   D ['2']
+   C SELECT 1
+   Z I
+>> Q SELECT * FROM j1 LEFT JOIN j2 USING(i)
+   T oids=[23] names=['i']
+   D ['1']
+   C SELECT 1
+   Z I
+>> Q SELECT j1.i,j2.i FROM j1 FULL JOIN j2 ON j1.i=j2.i ORDER BY j1.i NULLS LAST
+   T oids=[23, 23] names=['i', 'i']
+   D ['1', None]
+   D [None, '2']
+   C SELECT 2
+   Z I
