@@ -13351,3 +13351,6 @@ fn foreign_keys_cannot_be_turned_off_over_pending_deferred_violations() {
     assert_eq!(a.q("SHOW foreign_keys").single("foreign_keys"), "on");
 }
 replays_postgresql!(pg18_c44_m2_sets_replays_as_postgresql_answered, "pg18-c44-m2-sets.out", []);
+// Review c39799c5d..9e24b455d MED 2: a TimeZone value naming a host path (or a zone-directory file that
+// is not a zone) is PostgreSQL's 22023, so no answer tells a client which host files exist.
+replays_postgresql!(pg18_rev_c39_tzpath_replays_as_postgresql_answered, "pg18-rev-c39-tzpath.out", []);

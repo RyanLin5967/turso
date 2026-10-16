@@ -1,0 +1,24 @@
+>> Q SET TimeZone = '/etc/passwd'
+   E S=ERROR C=22023 M=invalid value for parameter "TimeZone": "/etc/passwd"
+   Z I
+>> Q SET TimeZone = '/etc/nosuch'
+   E S=ERROR C=22023 M=invalid value for parameter "TimeZone": "/etc/nosuch"
+   Z I
+>> Q SET TimeZone = 'zone.tab'
+   E S=ERROR C=22023 M=invalid value for parameter "TimeZone": "zone.tab"
+   Z I
+>> Q SET TimeZone = 'tzdata.zi'
+   E S=ERROR C=22023 M=invalid value for parameter "TimeZone": "tzdata.zi"
+   Z I
+>> Q SET TimeZone = '../../../etc/passwd'
+   E S=ERROR C=22023 M=invalid value for parameter "TimeZone": "../../../etc/passwd"
+   Z I
+>> Q SET TimeZone = 'posixrules'
+   E S=ERROR C=22023 M=invalid value for parameter "TimeZone": "posixrules"
+   Z I
+>> Q SET TimeZone = 'America/New_York'
+   C SET
+   Z I
+>> Q SET TimeZone = 'UTC'
+   C SET
+   Z I
