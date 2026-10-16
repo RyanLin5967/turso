@@ -2269,6 +2269,7 @@ impl PostgreSQLTranslator {
         // a LATERAL scope of its own. The WITH clause, translated after it, is outside: a CTE does
         // not see this SELECT's FROM items.
         let (select_body, order_by, limit) = self.in_select_scope(|| {
+            self.note_relations(&select.from_clause);
             let from_clause = if !select.from_clause.is_empty() {
                 Some(self.translate_from_items(&select.from_clause)?)
             } else {
@@ -2498,11 +2499,7 @@ impl PostgreSQLTranslator {
         }
         // Each leaf in a LATERAL scope of its own (wire review 2 item 6).
         self.in_select_scope(|| {
-            let mut relations = Vec::new();
-            for item in &select.from_clause {
-                self.using_relations(item, &mut relations);
-            }
-            self.lateral_scopes.borrow_mut().last_mut().unwrap().relations = relations;
+            self.note_relations(&select.from_clause);
             let from_clause = if !select.from_clause.is_empty() {
                 Some(self.translate_from_items(&select.from_clause)?)
             } else {
@@ -2543,6 +2540,16 @@ impl PostgreSQLTranslator {
                 window_clause,
             })
         })
+    }
+
+    fn note_relations(&self, from: &[pg_query::protobuf::Node]) {
+        let mut relations = Vec::new();
+        for item in from {
+            self.using_relations(item, &mut relations);
+        }
+        if let Some(scope) = self.lateral_scopes.borrow_mut().last_mut() {
+            scope.relations = relations;
+        }
     }
 
     /// Translate multiple FROM items. The first becomes the primary table,
