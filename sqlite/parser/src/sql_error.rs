@@ -34,6 +34,27 @@ pub enum SqlErrorKind {
     ReadOnlyTransaction,
     DiskFull,
     QueryCanceled,
+    // The wire server's own conditions (C44-M3: every SQLSTATE it sends comes from one table).
+    ConnectionFailure,
+    ProtocolViolation,
+    NullValueNotAllowed,
+    CharacterNotInRepertoire,
+    InvalidBinaryRepresentation,
+    ActiveSqlTransaction,
+    NoActiveSqlTransaction,
+    InFailedSqlTransaction,
+    InvalidCursorName,
+    InvalidCatalogName,
+    DatatypeMismatch,
+    ReservedName,
+    DuplicateCursor,
+    DuplicateDatabase,
+    IndeterminateDatatype,
+    ObjectNotInPrerequisiteState,
+    ObjectInUse,
+    TooManyConnections,
+    Warning,
+    SuccessfulCompletion,
 }
 
 /// A diagnostic's text and optional, explicitly assigned SQL condition.

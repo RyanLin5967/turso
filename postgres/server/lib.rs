@@ -597,10 +597,10 @@ impl WaitMode<'_> {
 fn in_use_error(name: &str, u: BranchUse) -> Box<ErrorInfo> {
     match u {
         BranchUse::Held => error(
-            "55006",
+            SqlErrorKind::ObjectInUse,
             format!("branch \"{name}\" is in use by another session"),
         ),
-        BranchUse::Deleting => error("55006", format!("branch \"{name}\" is being deleted")),
+        BranchUse::Deleting => error(SqlErrorKind::ObjectInUse, format!("branch \"{name}\" is being deleted")),
     }
 }
 
@@ -880,7 +880,7 @@ fn refused_before_startup(
     starting.then(|| {
         ErrorInfo::new(
             "FATAL".to_string(),
-            "08P01".to_string(),
+            kind_code(SqlErrorKind::ProtocolViolation).to_string(),
             format!("invalid frontend message before startup completed: {refused}"),
         )
     })
@@ -964,7 +964,7 @@ async fn serve_session(
                 error!("invalid frontend message: {}", e);
                 let info = ErrorInfo::new(
                     "FATAL".to_string(),
-                    "08P01".to_string(),
+                    kind_code(SqlErrorKind::ProtocolViolation).to_string(),
                     format!("invalid frontend message: {e}"),
                 );
                 let _ = socket
@@ -1198,7 +1198,7 @@ impl StartupHandler for Refusal {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         if let PgWireFrontendMessage::Startup(_) = message {
-            return Err(fatal("53300", "sorry, too many clients already"));
+            return Err(fatal(SqlErrorKind::TooManyConnections, "sorry, too many clients already"));
         }
         Ok(())
     }
@@ -1295,7 +1295,7 @@ impl Parsed {
         match fix_or_first_change(&self.params, params) {
             None => Ok(()),
             Some(i) => Err(error(
-                "0A000",
+                SqlErrorKind::FeatureNotSupported,
                 format!(
                     "cached plan must not change the type of parameter ${}",
                     i + 1
@@ -1313,7 +1313,7 @@ impl Parsed {
         match fix_or_first_change(&self.columns, columns) {
             None => Ok(()),
             Some(_) => Err(error(
-                "0A000",
+                SqlErrorKind::FeatureNotSupported,
                 "cached plan must not change result type".to_string(),
             )),
         }
@@ -1927,7 +1927,7 @@ impl Session {
         // ending the session, never joining that transaction (wire review 16 item 14).
         if conn.is_broken() {
             return Err(broken_fatal(error(
-                "08006",
+                SqlErrorKind::ConnectionFailure,
                 format!(
                     "{}: an earlier undo failed; the connection is closed",
                     turso_pg::CONNECTION_BROKEN
@@ -1965,7 +1965,7 @@ impl Session {
                 // builds it directly.
                 TxVerb::RollbackTo if !in_tx => {
                     return Err(error(
-                        "3B001",
+                        SqlErrorKind::InvalidSavepointSpecification,
                         "savepoint does not exist: the error that failed this transaction block \
                          rolled the whole transaction back, its savepoints with it; end the block \
                          with ROLLBACK"
@@ -2002,7 +2002,7 @@ impl Session {
         // transaction in progress, for the client (wire review 14 item 20).
         if in_tx && st.implicit && matches!(verb, TxVerb::Commit | TxVerb::Rollback) {
             st.notices
-                .push(warning("25P01", "there is no transaction in progress"));
+                .push(warning(SqlErrorKind::NoActiveSqlTransaction, "there is no transaction in progress"));
         }
         match verb {
             // PostgreSQL warns and carries on for these; the engine would refuse them. A BEGIN in
@@ -2016,13 +2016,13 @@ impl Session {
                 if begins_read_only(sql) {
                     st.aborted = true;
                     return Err(error(
-                        "0A000",
+                        SqlErrorKind::FeatureNotSupported,
                         "READ ONLY transactions are not supported".to_string(),
                     ));
                 }
                 if !st.implicit {
                     st.notices.push(warning(
-                        "25001",
+                        SqlErrorKind::ActiveSqlTransaction,
                         "there is already a transaction in progress",
                     ));
                 }
@@ -2040,13 +2040,13 @@ impl Session {
                     "ROLLBACK AND CHAIN"
                 };
                 return Err(error(
-                    "25P01",
+                    SqlErrorKind::NoActiveSqlTransaction,
                     format!("{what} can only be used in transaction blocks"),
                 ));
             }
             TxVerb::Commit | TxVerb::Rollback if !in_tx => {
                 st.notices
-                    .push(warning("25P01", "there is no transaction in progress"));
+                    .push(warning(SqlErrorKind::NoActiveSqlTransaction, "there is no transaction in progress"));
                 let tag = if verb == TxVerb::Commit {
                     "COMMIT"
                 } else {
@@ -2067,7 +2067,7 @@ impl Session {
                     _ => "SAVEPOINT",
                 };
                 return Err(error(
-                    "25P01",
+                    SqlErrorKind::NoActiveSqlTransaction,
                     format!("{what} can only be used in transaction blocks"),
                 ));
             }
@@ -2091,14 +2091,14 @@ impl Session {
             None if is_checkpoint(sql) => self.checkpoint(&mut st, in_tx),
             // A chain in a block: refused, which fails the block, as any error in it does.
             None if matches!(verb, TxVerb::Chain { .. }) => Err(error(
-                "0A000",
+                SqlErrorKind::FeatureNotSupported,
                 "AND CHAIN is not supported: end the block with COMMIT or ROLLBACK, then BEGIN a \
                  new one"
                     .to_string(),
             )),
             None if schema_ddl(sql).is_some_and(|name| !name.eq_ignore_ascii_case("public")) => {
                 Err(error(
-                    "0A000",
+                    SqlErrorKind::FeatureNotSupported,
                     "schemas other than public are not supported by the branch server: its \
                      branches cover the one schema (CREATE SCHEMA and DROP SCHEMA are refused)"
                         .to_string(),
@@ -2188,7 +2188,7 @@ impl Session {
                     CHECKPOINTS_SKIPPED.fetch_add(1, Ordering::Relaxed);
                     st.notices.push(Box::new(ErrorInfo::new(
                         "NOTICE".to_string(),
-                        "00000".to_string(),
+                        kind_code(SqlErrorKind::SuccessfulCompletion).to_string(),
                         "checkpoint skipped: the WAL is busy, and inside a transaction block \
                          CHECKPOINT does not wait (this block may hold the lock it needs); run it \
                          outside the block"
@@ -2419,7 +2419,8 @@ impl Session {
                 Err(f)
                     if !last
                         && f.rerunnable
-                        && (f.info.code == "55P03" || (!in_tx && f.info.code == "40001")) =>
+                        && (f.info.code == kind_code(SqlErrorKind::LockNotAvailable)
+                        || (!in_tx && f.info.code == kind_code(SqlErrorKind::SerializationFailure))) =>
                 {
                     match backoff.wait() {
                         Ok(true) => {}
@@ -2507,7 +2508,7 @@ impl Session {
             None => {
                 if let Some(n) = types.used.first() {
                     return Err(unprepared(error(
-                        "42P02",
+                        SqlErrorKind::UndefinedParameter,
                         format!("there is no parameter ${n}"),
                     )));
                 }
@@ -2572,7 +2573,7 @@ impl Session {
         // 22023 where an engine SELECT answers 08P01 (wire review 17 item 9).
         let bad_code =
             |st: &SessionState| match portal.and_then(|p| st.bad_result_codes.get(&p.name)) {
-                Some(code) => Err(error("22023", format!("unsupported format code: {code}"))),
+                Some(code) => Err(error(SqlErrorKind::InvalidParameterValue, format!("unsupported format code: {code}"))),
                 None => Ok(()),
             };
         let f = &*call.function;
@@ -2612,7 +2613,7 @@ impl Session {
             "turso_branch_create" | "turso_branch_switch" | "turso_branch_delete"
         ) {
             return Err(error(
-                "42883",
+                SqlErrorKind::UndefinedFunction,
                 format!("function {f} does not exist; the branch functions are turso_branch_create(name), turso_branch_switch(name), turso_branch_delete(name), turso_branch_current(), turso_branch_stats(), turso_branch_allocations() and turso_branch_work()"),
             ));
         }
@@ -2626,7 +2627,7 @@ impl Session {
         // engine refuses a fork there too; a switch would abandon the transaction.
         if !conn.inner().get_auto_commit() {
             return Err(error(
-                "25001",
+                SqlErrorKind::ActiveSqlTransaction,
                 format!("{f} cannot run inside a transaction block"),
             ));
         }
@@ -2634,7 +2635,7 @@ impl Session {
             "turso_branch_create" => {
                 if name == TRUNK {
                     return Err(error(
-                        "42939",
+                        SqlErrorKind::ReservedName,
                         format!("branch name \"{TRUNK}\" is reserved for the trunk"),
                     ));
                 }
@@ -2695,7 +2696,7 @@ impl Session {
                 branch_text(f, &name, portal.is_some(), format)
             }
             _ if st.branch.as_ref().is_some_and(|(on, _)| *on == name) => Err(error(
-                "55006",
+                SqlErrorKind::ObjectInUse,
                 format!(
                     "cannot delete branch \"{name}\": this session is on it; switch to another \
                      branch first"
@@ -2756,7 +2757,7 @@ impl Session {
     /// engine's own refusal. Classified by looking the name up, on the error path only.
     fn create_error(&self, name: &str, e: &LimboError) -> Box<ErrorInfo> {
         match self.shared.db.branch_named(name) {
-            Ok(Some(_)) => error("42P04", format!("branch \"{name}\" already exists")),
+            Ok(Some(_)) => error(SqlErrorKind::DuplicateDatabase, format!("branch \"{name}\" already exists")),
             _ => engine_info(e),
         }
     }
@@ -2770,12 +2771,12 @@ impl Session {
     /// the error path only.
     fn missing_or(&self, name: &str, e: &LimboError, severity: &str) -> Box<ErrorInfo> {
         let mut info = match self.shared.db.branch_named(name) {
-            Ok(None) => error("3D000", format!("branch \"{name}\" does not exist")),
+            Ok(None) => error(SqlErrorKind::InvalidCatalogName, format!("branch \"{name}\" does not exist")),
             // By the engine's typed error, never its text (C44-M1: the one SQLSTATE still chosen
             // from a message).
             Ok(Some(_)) if matches!(e, LimboError::BranchInUse { .. }) => {
                 let mut info = error(
-                    "55006",
+                    SqlErrorKind::ObjectInUse,
                     format!("branch \"{name}\" is in use by another session"),
                 );
                 info.detail = Some(e.to_string());
@@ -3174,7 +3175,7 @@ fn tx_modes(mut w: &[&str]) -> bool {
 /// A broken connection's answer (an undo failed; turso_pg's PgConnection::is_broken): FATAL 08006,
 /// which serve_session ends the session on.
 fn broken_fatal(mut info: Box<ErrorInfo>) -> Box<ErrorInfo> {
-    info.code = "08006".to_string();
+    info.code = kind_code(SqlErrorKind::ConnectionFailure).to_string();
     info.severity = "FATAL".to_string();
     info
 }
@@ -3190,7 +3191,7 @@ fn broken_fatal(mut info: Box<ErrorInfo>) -> Box<ErrorInfo> {
 /// is visible (Connection::is_in_write_tx); a stranded read transaction is not.
 fn commit_failed(conn: &PgConnection, mut info: Box<ErrorInfo>) -> Box<ErrorInfo> {
     if conn.inner().get_auto_commit() && conn.inner().is_in_write_tx() {
-        info.code = "08006".to_string();
+        info.code = kind_code(SqlErrorKind::ConnectionFailure).to_string();
         info.severity = "FATAL".to_string();
         info.message = format!(
             "the transaction could not be ended after its COMMIT failed ({}); the connection is \
@@ -3199,8 +3200,10 @@ fn commit_failed(conn: &PgConnection, mut info: Box<ErrorInfo>) -> Box<ErrorInfo
         );
         return info;
     }
-    if matches!(info.code.as_str(), "55P03" | "40001") {
-        info.code = "40001".to_string();
+    if info.code == kind_code(SqlErrorKind::LockNotAvailable)
+        || info.code == kind_code(SqlErrorKind::SerializationFailure)
+    {
+        info.code = kind_code(SqlErrorKind::SerializationFailure).to_string();
         info.message = format!(
             "could not serialize access: the transaction was rolled back ({})",
             info.message
@@ -3255,7 +3258,7 @@ fn arity(call: &PgBranchCall, n: usize) -> SqlResult<()> {
         return Ok(());
     }
     Err(error(
-        "42883",
+        SqlErrorKind::UndefinedFunction,
         format!(
             "function {}() takes {n} argument{}, not {}",
             call.function,
@@ -3273,19 +3276,19 @@ fn text_arg<'a>(
     match arg {
         // Borrowed: a literal name costs the call no copy (L5).
         PgBranchArg::Text(s) => Ok(std::borrow::Cow::Borrowed(s.as_str())),
-        PgBranchArg::Null => Err(error("22004", "a branch name must not be null".to_string())),
-        PgBranchArg::Bool(_) => Err(error("42804", "a branch name is text".to_string())),
+        PgBranchArg::Null => Err(error(SqlErrorKind::NullValueNotAllowed, "a branch name must not be null".to_string())),
+        PgBranchArg::Bool(_) => Err(error(SqlErrorKind::DatatypeMismatch, "a branch name is text".to_string())),
         PgBranchArg::Param(n) => {
             // Over the simple protocol nothing binds one (wire review 9 item 3).
             let portal =
-                portal.ok_or_else(|| error("42P02", format!("there is no parameter ${n}")))?;
+                portal.ok_or_else(|| error(SqlErrorKind::UndefinedParameter, format!("there is no parameter ${n}")))?;
             // A parameter declared as another type is not a name, whatever its bytes spell. A text
             // or varchar value (or one of unspecified type, which PostgreSQL resolves to the
             // function's text) is its bytes in either format: textrecv reads binary text as is.
             if let Some(Some(ty)) = portal.statement.parameter_types.get(n - 1) {
                 if ![Type::TEXT, Type::VARCHAR, Type::UNKNOWN].contains(ty) {
                     return Err(error(
-                        "42804",
+                        SqlErrorKind::DatatypeMismatch,
                         format!("a branch name is text, and parameter ${n} is {ty}"),
                     ));
                 }
@@ -3293,13 +3296,13 @@ fn text_arg<'a>(
             let bytes = portal
                 .parameters
                 .get(n - 1)
-                .ok_or_else(|| error("08P01", format!("parameter ${n} is not bound")))?;
+                .ok_or_else(|| error(SqlErrorKind::ProtocolViolation, format!("parameter ${n} is not bound")))?;
             let Some(bytes) = bytes else {
-                return Err(error("22004", "a branch name must not be null".to_string()));
+                return Err(error(SqlErrorKind::NullValueNotAllowed, "a branch name must not be null".to_string()));
             };
             String::from_utf8(bytes.to_vec())
                 .map(std::borrow::Cow::Owned)
-                .map_err(|e| error("22021", format!("invalid UTF-8 in parameter ${n}: {e}")))
+                .map_err(|e| error(SqlErrorKind::CharacterNotInRepertoire, format!("invalid UTF-8 in parameter ${n}: {e}")))
         }
     }
 }
@@ -3562,7 +3565,7 @@ fn result_format(format: &Format, i: usize, columns: usize) -> SqlResult<FieldFo
         Format::Individual(codes) => match codes.get(i) {
             Some(code) if codes.len() == columns => Ok(FieldFormat::from(*code)),
             _ => Err(error(
-                "08P01",
+                SqlErrorKind::ProtocolViolation,
                 format!(
                     "bind message has {} result formats but query has {columns} columns",
                     codes.len()
@@ -3636,10 +3639,10 @@ fn branch_call_fields(call: &PgBranchCall, format: &Format) -> SqlResult<Vec<Fie
 /// A statement's failure, boxed: an `ErrorInfo` is ~280 bytes and failure is the rare path.
 type SqlResult<T> = Result<T, Box<ErrorInfo>>;
 
-fn error(code: &str, message: String) -> Box<ErrorInfo> {
+fn error(kind: SqlErrorKind, message: String) -> Box<ErrorInfo> {
     Box::new(ErrorInfo::new(
         "ERROR".to_string(),
-        code.to_string(),
+        kind_code(kind).to_string(),
         message,
     ))
 }
@@ -3648,7 +3651,7 @@ fn error(code: &str, message: String) -> Box<ErrorInfo> {
 /// PortalNotFound is 26000, a statement's code).
 fn portal_not_found(name: &str) -> Box<ErrorInfo> {
     let name = if name == DEFAULT_NAME { "" } else { name };
-    error("34000", format!("portal \"{name}\" does not exist"))
+    error(SqlErrorKind::InvalidCursorName, format!("portal \"{name}\" does not exist"))
 }
 
 /// A statement with nothing in it: only PostgreSQL's whitespace, semicolons and comments, the text
@@ -3662,26 +3665,26 @@ fn is_blank(sql: &str) -> bool {
 }
 
 /// A WARNING notice, as PostgreSQL sends for a transaction verb that changes nothing.
-fn warning(code: &str, message: &str) -> Box<ErrorInfo> {
+fn warning(kind: SqlErrorKind, message: &str) -> Box<ErrorInfo> {
     Box::new(ErrorInfo::new(
         "WARNING".to_string(),
-        code.to_string(),
+        kind_code(kind).to_string(),
         message.to_string(),
     ))
 }
 
 fn aborted_error() -> Box<ErrorInfo> {
     error(
-        "25P02",
+        SqlErrorKind::InFailedSqlTransaction,
         "current transaction is aborted, commands ignored until end of transaction block"
             .to_string(),
     )
 }
 
-fn fatal(code: &str, message: &str) -> PgWireError {
+fn fatal(kind: SqlErrorKind, message: &str) -> PgWireError {
     PgWireError::UserError(Box::new(ErrorInfo::new(
         "FATAL".to_string(),
-        code.to_string(),
+        kind_code(kind).to_string(),
         message.to_string(),
     )))
 }
@@ -3694,16 +3697,22 @@ fn engine_info(e: &LimboError) -> Box<ErrorInfo> {
             2 => "canceling statement due to statement timeout",
             _ => "canceling statement due to user request",
         };
-        return error(sqlstate(e), message.to_string());
+        return error(e.sql_error_kind(), message.to_string());
     }
-    error(sqlstate(e), e.to_string())
+    error(e.sql_error_kind(), e.to_string())
 }
 
 /// PostgreSQL's SQLSTATE for the condition selected by the error's producer. Diagnostic text
 /// has no role here: rewording it preserves the code and the engine's error handling.
 fn sqlstate(e: &LimboError) -> &'static str {
+    kind_code(e.sql_error_kind())
+}
+
+/// THE table: the SQLSTATE of each condition, the engine's and this server's own alike (C44; C44-M3
+/// moved the server's literal codes here: `every_sqlstate_the_server_sends_comes_from_the_table`).
+fn kind_code(kind: SqlErrorKind) -> &'static str {
     use SqlErrorKind::*;
-    match e.sql_error_kind() {
+    match kind {
         SyntaxError => "42601",
         FeatureNotSupported => "0A000",
         InvalidTextRepresentation => "22P02",
@@ -3733,13 +3742,33 @@ fn sqlstate(e: &LimboError) -> &'static str {
         ReadOnlyTransaction => "25006",
         DiskFull => "53100",
         QueryCanceled => "57014",
+        ConnectionFailure => "08006",
+        ProtocolViolation => "08P01",
+        NullValueNotAllowed => "22004",
+        CharacterNotInRepertoire => "22021",
+        InvalidBinaryRepresentation => "22P03",
+        ActiveSqlTransaction => "25001",
+        NoActiveSqlTransaction => "25P01",
+        InFailedSqlTransaction => "25P02",
+        InvalidCursorName => "34000",
+        InvalidCatalogName => "3D000",
+        DatatypeMismatch => "42804",
+        ReservedName => "42939",
+        DuplicateCursor => "42P03",
+        DuplicateDatabase => "42P04",
+        IndeterminateDatatype => "42P18",
+        ObjectNotInPrerequisiteState => "55000",
+        ObjectInUse => "55006",
+        TooManyConnections => "53300",
+        Warning => "01000",
+        SuccessfulCompletion => "00000",
     }
 }
 
 fn wire_info(e: PgWireError) -> Box<ErrorInfo> {
     match e {
         PgWireError::UserError(info) => info,
-        other => error("XX000", other.to_string()),
+        other => error(SqlErrorKind::InternalError, other.to_string()),
     }
 }
 
@@ -3897,7 +3926,7 @@ impl SimpleQueryHandler for Session {
                 // This server answers COPY FROM a file itself and never streams COPY.
                 Response::CopyIn(_) | Response::CopyOut(_) | Response::CopyBoth(_) => {
                     return Err(PgWireError::UserError(error(
-                        "0A000",
+                        SqlErrorKind::FeatureNotSupported,
                         "COPY over the protocol is not supported".to_string(),
                     )));
                 }
@@ -4067,7 +4096,7 @@ impl ExtendedQueryHandler for Session {
         if portal.name != DEFAULT_NAME && client.portal_store().get_portal(&portal.name).is_some()
         {
             return Err(PgWireError::UserError(error(
-                "42P03",
+                SqlErrorKind::DuplicateCursor,
                 format!("cursor \"{}\" already exists", portal.name),
             )));
         }
@@ -4186,7 +4215,7 @@ impl ExtendedQueryHandler for Session {
         // item 5).
         if self.state().done_portals.contains(name) {
             return Err(PgWireError::UserError(error(
-                "55000",
+                SqlErrorKind::ObjectNotInPrerequisiteState,
                 format!("portal \"{name}\" cannot be run"),
             )));
         }
@@ -4244,14 +4273,14 @@ impl ExtendedQueryHandler for Session {
                     // The fast path encodes a simple Query's reply alone (branch, portal None).
                     Response::Inline(_) => {
                         return Err(PgWireError::UserError(error(
-                            "XX000",
+                            SqlErrorKind::InternalError,
                             "internal error: an inline reply reached an Execute".to_string(),
                         )));
                     }
                     // This server answers COPY FROM a file itself and never streams COPY.
                     Response::CopyIn(_) | Response::CopyOut(_) | Response::CopyBoth(_) => {
                         return Err(PgWireError::UserError(error(
-                            "0A000",
+                            SqlErrorKind::FeatureNotSupported,
                             "COPY over the protocol is not supported".to_string(),
                         )));
                     }
@@ -4500,7 +4529,7 @@ where
                 // PostgreSQL's printtup refuses it (wire review 13 item 10).
                 if let Some(code) = refuse {
                     return Err(PgWireError::UserError(error(
-                        "22023",
+                        SqlErrorKind::InvalidParameterValue,
                         format!("unsupported format code: {code}"),
                     )));
                 }
@@ -4739,7 +4768,7 @@ fn execute_query(
         .find(|f| f.format() == FieldFormat::Binary && !BINARY_ENCODED.contains(f.datatype()))
     {
         return Err(unstarted(PgWireError::UserError(error(
-            "0A000",
+            SqlErrorKind::FeatureNotSupported,
             format!(
                 "binary format for column \"{}\" of type {} is not supported; ask for text format",
                 f.name(),
@@ -4888,7 +4917,7 @@ fn encode_binary(encoder: &mut DataRowEncoder, val: &Value, pg_type: &Type) -> P
     use turso_core::Numeric;
     let range = |_| {
         PgWireError::UserError(error(
-            "22003",
+            SqlErrorKind::NumericValueOutOfRange,
             format!("value out of range for type {pg_type}"),
         ))
     };
@@ -4934,7 +4963,7 @@ fn no_binary(val: &Value, t: &Type) -> PgWireError {
         Value::Blob(_) => "blob",
     };
     PgWireError::UserError(error(
-        "0A000",
+        SqlErrorKind::FeatureNotSupported,
         format!(
             "binary format for a {class} value in a column of type {t} is not supported; ask for \
              text format"
@@ -5015,7 +5044,7 @@ fn parameter_types(types: &StatementTypes, declared: &[Option<Type>]) -> SqlResu
             if types.used.binary_search(&(n as u32)).is_err() || types.untyped.contains(&(n as u32))
             {
                 return Err(error(
-                    "42P18",
+                    SqlErrorKind::IndeterminateDatatype,
                     format!("could not determine data type of parameter ${n}"),
                 ));
             }
@@ -5062,7 +5091,7 @@ fn decode_portal_parameters(portal: &Portal<Parsed>, types: &[Type]) -> PgWireRe
     // 23).
     if types.len() != portal.parameters.len() {
         return Err(PgWireError::UserError(error(
-            "XX000",
+            SqlErrorKind::InternalError,
             format!(
                 "internal error: {} parameter types for {} values",
                 types.len(),
@@ -5099,7 +5128,7 @@ fn check_bind(bind: &Bind) -> SqlResult<()> {
     let (codes, values) = (bind.parameter_format_codes.len(), bind.parameters.len());
     if codes > 1 && codes != values {
         return Err(error(
-            "08P01",
+            SqlErrorKind::ProtocolViolation,
             format!("bind message has {codes} parameter formats but {values} parameters"),
         ));
     }
@@ -5118,7 +5147,7 @@ fn check_parameter_codes(bind: &Bind) -> SqlResult<()> {
         .iter()
         .find(|c| !matches!(c, 0 | 1))
     {
-        Some(code) => Err(error("22023", format!("unsupported format code: {code}"))),
+        Some(code) => Err(error(SqlErrorKind::InvalidParameterValue, format!("unsupported format code: {code}"))),
         None => Ok(()),
     }
 }
@@ -5135,7 +5164,7 @@ fn check_bind_arity(values: usize, statement: &str, required: usize) -> SqlResul
         statement
     };
     Err(error(
-        "08P01",
+        SqlErrorKind::ProtocolViolation,
         format!(
             "bind message supplies {values} parameters, but prepared statement \"{name}\" \
              requires {required}"
@@ -5153,7 +5182,7 @@ fn check_bind_arity(values: usize, statement: &str, required: usize) -> SqlResul
 fn pg_binary_to_value(bytes: &[u8], pg_type: &Type, n: usize) -> PgWireResult<Value> {
     let bad = || {
         PgWireError::UserError(error(
-            "22P03",
+            SqlErrorKind::InvalidBinaryRepresentation,
             format!("incorrect binary data format in bind parameter {n} (type {pg_type})"),
         ))
     };
@@ -5162,7 +5191,7 @@ fn pg_binary_to_value(bytes: &[u8], pg_type: &Type, n: usize) -> PgWireResult<Va
             .map(|s| Value::from_text(s.to_owned()))
             .map_err(|e| {
                 PgWireError::UserError(error(
-                    "22021",
+                    SqlErrorKind::CharacterNotInRepertoire,
                     format!("invalid UTF-8 in bind parameter {n}: {e}"),
                 ))
             })
@@ -5213,7 +5242,7 @@ fn pg_binary_to_value(bytes: &[u8], pg_type: &Type, n: usize) -> PgWireResult<Va
         text(bytes)
     } else {
         Err(PgWireError::UserError(error(
-            "0A000",
+            SqlErrorKind::FeatureNotSupported,
             format!(
                 "binary format for bind parameter {n} of type {t} is not supported; send it in \
                  text format"
@@ -5230,7 +5259,7 @@ fn pg_binary_to_value(bytes: &[u8], pg_type: &Type, n: usize) -> PgWireResult<Va
 fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
     let text = std::str::from_utf8(bytes).map_err(|e| {
         PgWireError::UserError(error(
-            "22021",
+            SqlErrorKind::CharacterNotInRepertoire,
             format!("invalid byte sequence for encoding \"UTF8\" in parameter: {e}"),
         ))
     })?;
@@ -5239,13 +5268,13 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
     }
     let syntax = |name: &str| {
         PgWireError::UserError(error(
-            "22P02",
+            SqlErrorKind::InvalidTextRepresentation,
             format!("invalid input syntax for type {name}: \"{text}\""),
         ))
     };
     let out_of_range = |name: &str| {
         PgWireError::UserError(error(
-            "22003",
+            SqlErrorKind::NumericValueOutOfRange,
             format!("value \"{text}\" is out of range for type {name}"),
         ))
     };
@@ -5253,7 +5282,7 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
     // pg18-audit1-lib-parameters_decode_at_postgresqls_edges.out).
     let float_out_of_range = |name: &str| {
         PgWireError::UserError(error(
-            "22003",
+            SqlErrorKind::NumericValueOutOfRange,
             format!("\"{text}\" is out of range for type {name}"),
         ))
     };
@@ -5314,7 +5343,7 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
             // PostgreSQL text format for bytea uses \x hex encoding
             if let Some(hex_str) = text.strip_prefix("\\x") {
                 let data =
-                    decode_hex(hex_str).map_err(|e| PgWireError::UserError(error("22023", e)))?;
+                    decode_hex(hex_str).map_err(|e| PgWireError::UserError(error(SqlErrorKind::InvalidParameterValue, e)))?;
                 Ok(Value::from_blob(data))
             } else {
                 // byteain's escape format: `\\` one backslash, `\ooo` (first digit 0-3) one
@@ -5322,7 +5351,7 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
                 // bytes, backslashes included (wire review 13 item 15).
                 decode_bytea_escape(bytes).map(Value::from_blob).ok_or_else(|| {
                     PgWireError::UserError(error(
-                        "22P02",
+                        SqlErrorKind::InvalidTextRepresentation,
                         "invalid input syntax for type bytea".to_string(),
                     ))
                 })
@@ -5346,7 +5375,7 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
 fn pg_array_to_value(text: &str, element: &Type) -> PgWireResult<Value> {
     let malformed = || {
         PgWireError::UserError(error(
-            "22P02",
+            SqlErrorKind::InvalidTextRepresentation,
             format!("malformed array literal: \"{text}\""),
         ))
     };
@@ -5356,7 +5385,7 @@ fn pg_array_to_value(text: &str, element: &Type) -> PgWireResult<Value> {
     let s = text.trim_matches(blank);
     if s.starts_with('[') {
         return Err(PgWireError::UserError(error(
-            "0A000",
+            SqlErrorKind::FeatureNotSupported,
             "array parameters with dimension information are not supported".to_string(),
         )));
     }
@@ -5390,7 +5419,7 @@ fn pg_array_to_value(text: &str, element: &Type) -> PgWireResult<Value> {
                     match c {
                         '{' => {
                             return Err(PgWireError::UserError(error(
-                                "0A000",
+                                SqlErrorKind::FeatureNotSupported,
                                 "multidimensional array parameters are not supported".to_string(),
                             )))
                         }
@@ -6773,6 +6802,32 @@ mod tests {
                 }
             }
         });
+    }
+
+    /// C44-M3: every SQLSTATE this server sends comes from the one table (kind_code): its own
+    /// refusals name a SqlErrorKind, never a code literal. Read from this file's source outside
+    /// the table and the tests (a test's expected code is a literal by design); a code is five
+    /// characters of digits and capitals with at least one digit.
+    #[test]
+    fn every_sqlstate_the_server_sends_comes_from_the_table() {
+        let source = include_str!("lib.rs");
+        let code_end = source.find("\n#[cfg(test)]\nmod tests").expect("the tests module");
+        let product = &source[..code_end];
+        let table_start = product.find("fn kind_code(kind: SqlErrorKind)").expect("the table");
+        let table_end = table_start + product[table_start..].find("\n}\n").expect("its end");
+        let outside = format!("{}{}", &product[..table_start], &product[table_end..]);
+        // Every `"` followed by five characters and a `"`: a quoted token, found wherever it sits,
+        // so no quote parity elsewhere (an escaped quote in a message) can hide one.
+        let b = outside.as_bytes();
+        let literals: Vec<&str> = (0..b.len().saturating_sub(6))
+            .filter(|&i| b[i] == b'"' && b[i + 6] == b'"')
+            .map(|i| &outside[i + 1..i + 6])
+            .filter(|s| {
+                s.bytes().all(|c| c.is_ascii_digit() || c.is_ascii_uppercase())
+                    && s.bytes().any(|c| c.is_ascii_digit())
+            })
+            .collect();
+        assert!(literals.is_empty(), "SQLSTATE literals outside the table: {literals:?}");
     }
 
     /// C44-M1: a branch the engine refuses as in use is 55006 by the engine's typed error
