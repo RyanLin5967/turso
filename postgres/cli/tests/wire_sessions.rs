@@ -13335,13 +13335,50 @@ fn foreign_keys_cannot_be_turned_off_over_pending_deferred_violations() {
     a.q("CREATE TABLE p(id INT PRIMARY KEY)").ok("p");
     a.q("CREATE TABLE c(id INT PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED)")
         .ok("c");
-    a.q("BEGIN").ok("begin");
-    a.q("INSERT INTO c VALUES (1, 99)").ok("the orphan, deferred");
-    let r = a.q("SET LOCAL foreign_keys = off");
-    assert!(r.error.is_some(), "foreign_keys turned off over a pending violation: {:?}", r.tags);
-    assert_eq!(r.status, b'E', "the refused SET did not fail the block");
-    assert_eq!(a.q("COMMIT").ok("commit").tags, ["ROLLBACK"]);
-    assert_eq!(a.q("SELECT count(*) FROM c").single("rows"), "0", "the orphan committed");
+    // Every way the effective value can change (review c39799c5d..9e24b455d MED 3: a fix keyed on
+    // SET LOCAL left plain SET open): each arm runs and records what went wrong, so every arm is
+    // shown red, not only the first.
+    let mut wrong = Vec::new();
+    for set in [
+        "SET LOCAL foreign_keys = off",
+        "SET foreign_keys = off",
+        "SET SESSION foreign_keys = off",
+    ] {
+        a.q("BEGIN").ok("begin");
+        a.q("INSERT INTO c VALUES (1, 99)").ok("the orphan, deferred");
+        let r = a.q(set);
+        if r.error.is_none() {
+            wrong.push(format!("{set}: accepted over a pending violation"));
+        } else if r.status != b'E' {
+            wrong.push(format!("{set}: refused, but the block is not failed"));
+        }
+        let end = a.q("COMMIT");
+        if end.error.is_some() || end.tags != ["ROLLBACK"] {
+            wrong.push(format!("{set}: COMMIT answered {:?} {:?}", end.tags, end.error));
+        }
+        if a.q("SELECT count(*) FROM c").single("rows") != "0" {
+            wrong.push(format!("{set}: the orphan committed"));
+            a.q("DELETE FROM c").ok("reset");
+        }
+        if a.q("SHOW foreign_keys").single("foreign_keys") != "on" {
+            wrong.push(format!("{set}: foreign_keys is off after the block"));
+            a.q("SET foreign_keys = on").ok("reset");
+        }
+    }
+    // An implicit block: the orphan and the SET in one multi-statement query.
+    let r = a.q("INSERT INTO c VALUES (1, 99); SET foreign_keys = off; SELECT 1");
+    if r.error.is_none() {
+        wrong.push("implicit block: the SET was accepted over a pending violation".to_string());
+    }
+    if a.q("SELECT count(*) FROM c").single("rows") != "0" {
+        wrong.push("implicit block: the orphan committed".to_string());
+        a.q("DELETE FROM c").ok("reset");
+    }
+    if a.q("SHOW foreign_keys").single("foreign_keys") != "on" {
+        wrong.push("implicit block: foreign_keys is off after it".to_string());
+        a.q("SET foreign_keys = on").ok("reset");
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
     a.q("INSERT INTO p VALUES (1)").ok("the next write");
     a.q("INSERT INTO c VALUES (2, 1)").ok("a valid child");
     // The control: nothing pending, the SET LOCAL is accepted and ends with its block.
