@@ -1901,6 +1901,43 @@ mod tests {
         }
     }
 
+    // PG18.6: postgres/cli/tests/c50-pg18-literal-scale.txt. The ordinary
+    // SQLite and hexadecimal controls keep their existing numeric value semantics.
+    #[test]
+    fn c50_custom_numeric_literals_preserve_recorded_scale() {
+        let conn = open();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, x numeric(10, 2)) STRICT")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+        for (expr, want) in [
+            ("1.50 * x", "15.0000"),
+            ("x * -(1.50)", "-15.0000"),
+            ("(-(-1.50)) * x", "15.0000"),
+            ("x * +(1.50)", "15.0000"),
+            ("x * 1.500e0", "15.00000"),
+            ("x * 1_0.50", "105.0000"),
+            ("x * 9007199254740993", "90071992547409930.00"),
+            ("x * 0.000", "0.00000"),
+            ("x + 1.5000", "11.5000"),
+            ("x - 1.5000", "8.5000"),
+            ("x / 1.50", "6.6666666666666667"),
+            ("x * 0xFFFFFFFFFFFFFFFF", "-10.00"),
+        ] {
+            let sql = format!("SELECT {expr} FROM t WHERE id = 1");
+            let rows = conn.prepare(&sql).unwrap().run_collect_rows().unwrap();
+            assert_eq!(rows.len(), 1, "{sql}");
+            assert_eq!(rows[0][0].to_text(), Some(want), "{sql}");
+        }
+        let rows = conn
+            .prepare("SELECT typeof(1.50), typeof(1.50 * 2), 1.50 * 2")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(rows[0][0].to_text(), Some("real"));
+        assert_eq!(rows[0][1].to_text(), Some("real"));
+        assert_eq!(rows[0][2], Value::from_f64(3.0));
+    }
+
     /// Engine review 21 MED 10: a numeric operand's scale was bounded only by i64, so
     /// `x / '1e-2000000000'` built 10^(2*10^9) inside one division, with no interrupt point, and
     /// `'1e9223372036854775807' / x` overflowed i64 (a panic in a debug build, a wrapped value in a
