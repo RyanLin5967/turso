@@ -336,6 +336,28 @@ def self_test():
         ("tie: a live rule other than the summary's fails", tie(rec(), LIVE | {"rule": "10:0:30"}) != []),
         ("tie: no live record (None) fails", tie(rec(), None) != []),
     ]
+    # the owed ours fixture record (2026-10-16): under --seed-sql/--age-sql/--live the driver's own record of the
+    # parent it built must say what was asked, as measured: gen_seed's stream lines (1 + ceil(R/1000) parent lines, K
+    # aging lines), the trunk's count, and the live branches it MEASURED after the prebranch
+    FX = {"seed_lines": 11, "age_lines": 200, "prebranch": 20, "live_branches": 20, "trunk_count": 10000,
+          "trunk_sum": 5}
+    fj = {"rows": 10000, "fixture": FX}
+    cases += [
+        ("fixture: the asked parent, as measured, passes", fixture_problems(fj, 10000, 200, 20) == []),
+        ("fixture: no fixture record fails", fixture_problems({"rows": 10000}, 10000, 200, 20) != []),
+        ("fixture: 19 live branches measured for a prebranch of 20 fails",
+         fixture_problems(fj | {"fixture": FX | {"live_branches": 19}}, 10000, 200, 20) != []),
+        ("fixture: a prebranch other than the asked live fails", fixture_problems(fj, 10000, 200, 10) != []),
+        ("fixture: a trunk of 9999 rows for --rows 10000 fails",
+         fixture_problems(fj | {"fixture": FX | {"trunk_count": 9999}}, 10000, 200, 20) != []),
+        ("fixture: 199 aging lines for an age of 200 fails",
+         fixture_problems(fj | {"fixture": FX | {"age_lines": 199}}, 10000, 200, 20) != []),
+        ("fixture: 10 parent lines for 10000 rows (gen_seed writes 11: the schema and 10 batches) fails",
+         fixture_problems(fj | {"fixture": FX | {"seed_lines": 10}}, 10000, 200, 20) != []),
+        ("fixture: the summary's rows other than asked fails", fixture_problems(fj | {"rows": 1000}, 10000, 200, 20) != []),
+        ("fixture: a count that is not an int fails",
+         fixture_problems(fj | {"fixture": FX | {"trunk_count": "10000"}}, 10000, 200, 20) != []),
+    ]
     bad = [n for n, ok in cases if not ok]
     for n, ok in cases:
         print(f"DRIVER-CONTRACT self-test {'PASS' if ok else 'FAIL'}: {n}")
