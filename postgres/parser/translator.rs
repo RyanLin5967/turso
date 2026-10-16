@@ -112,6 +112,7 @@ impl ExpressionTypes {
 pub struct PostgreSQLTranslator {
     expression_types: std::sync::Arc<ExpressionTypes>,
     virtual_generated: std::cell::RefCell<std::collections::HashSet<i32>>,
+    has_series: std::cell::Cell<bool>,
     /// The scope of each SELECT being translated, innermost last: the names its FROM items are
     /// known by, with the columns those names stand for that the engine does not have under them.
     /// A reference `alias.column` translates by the innermost SELECT whose FROM names `alias`, so
@@ -534,6 +535,9 @@ impl PostgreSQLTranslator {
         parse_result: &crate::ParseResult,
     ) -> Result<TranslateResult, ParseError> {
         self.virtual_generated.borrow_mut().clone_from(parse_result.virtual_generated_columns());
+        self.has_series.set(parse_result.functions.iter().any(|(name, _)| {
+            name.rsplit('.').next() == Some("generate_series")
+        }));
         if parse_result.protobuf.nodes().is_empty() {
             return Err(ParseError::ParseError("No statements found".to_string().into()));
         }
@@ -2583,6 +2587,9 @@ impl PostgreSQLTranslator {
     }
 
     fn note_relations(&self, from: &[pg_query::protobuf::Node]) {
+        if !self.has_series.get() {
+            return;
+        }
         let mut relations = Vec::new();
         for item in from {
             self.using_relations(item, &mut relations);

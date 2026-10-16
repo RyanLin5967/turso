@@ -2721,11 +2721,8 @@ fn has_alias_column_list(parse: &turso_pg_parser::pg_query::ParseResult) -> bool
 }
 
 fn has_generate_series(parse: &turso_pg_parser::pg_query::ParseResult) -> bool {
-    use turso_pg_parser::pg_query::{protobuf::node::Node, NodeRef};
-    parse.protobuf.nodes().iter().any(|(node, ..)| {
-        matches!(node, NodeRef::FuncCall(call)
-            if matches!(call.funcname.last().and_then(|name| name.node.as_ref()),
-                Some(Node::String(name)) if name.sval == "generate_series"))
+    parse.functions.iter().any(|(name, _)| {
+        name.rsplit('.').next() == Some("generate_series")
     })
 }
 
