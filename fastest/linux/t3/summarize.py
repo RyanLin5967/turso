@@ -468,6 +468,32 @@ def conformance_problems(out):
     return bad
 
 
+def parent_record(d):
+    """the run's result/fixture.json (every system's, in comp's schema), or None when it is missing or not an object"""
+    try:
+        fx = json.load(open(os.path.join(d, "result", "fixture.json")))
+    except (OSError, ValueError):
+        return None
+    return fx if isinstance(fx, dict) else None
+
+
+def one_parent(parents):
+    """ONE parent for every system in a block (gate-6 t3run HIGH 4): PARENTS = [(label, fixture.json or None)] of the
+    block's measured runs; every one that has a record must name the same rows and gen_seed_sha256 as the first.
+    (A run with no record is fixture_check's to report.) Returns the refusals."""
+    have = [(lb, fx) for lb, fx in parents if isinstance(fx, dict)]
+    if not have:
+        return []
+    ref_lb, ref = have[0]
+    bad = []
+    for lb, fx in have[1:]:
+        diff = [k for k in ("rows", "gen_seed_sha256") if fx.get(k) != ref.get(k)]
+        if diff:
+            bad.append(f"{lb}: one parent: " + ", ".join(f"{k} {fx.get(k)!r}, {ref_lb}'s {ref.get(k)!r}" for k in diff)
+                       + " (fixture.json)")
+    return bad
+
+
 def fixture_check(d, system, plan, dry):
     """One parent fixture for every system (gate-6 t3run HIGH 4; comp's gen_seed parent aged by FT_AGE, with
     FT_PREBRANCH live branches) and the package's mode (fourth lane review LOW 15): what the run itself recorded must
@@ -476,14 +502,20 @@ def fixture_check(d, system, plan, dry):
     if plan.get("age") is None or plan.get("live") is None:
         return ["the plan row has no age/live columns"]
     if system == "ours":
-        try:
-            fx = json.load(open(os.path.join(d, "result", "summary.json"))).get("fixture")
-        except (OSError, ValueError, AttributeError):  # AttributeError: a summary.json that is not an object
-            fx = None
+        # ours writes result/fixture.json in the competitors' schema (fastest_profile --seed-sql/--age-sql/--live):
+        # gen_seed's parent, aged, with the live branches made before the cells, its live count MEASURED
+        fx = parent_record(d)
         if not isinstance(fx, dict):
-            return ["ours records no fixture record (fastest_profile does not yet build the plan's parent: gen_seed "
-                    "rows, the age's single-row UPDATEs, the live branches)"]
-        got = {"age": fx.get("age"), "live": fx.get("live")}
+            return ["ours records no fixture record (result/fixture.json: fastest_profile builds the plan's parent "
+                    "only under --seed-sql, --age-sql and --live)"]
+        for k in ("rows", "age_updates", "prebranch", "live_branches"):
+            if type(fx.get(k)) is not int or fx[k] < 0:
+                bad.append(f"fixture.json {k} {fx.get(k)!r} is not a count")
+        if bad:
+            return bad
+        if fx["live_branches"] != fx["prebranch"]:
+            bad.append(f"fixture.json live_branches {fx['live_branches']} (measured), prebranch {fx['prebranch']}")
+        got = {"age": fx["age_updates"], "live": fx["prebranch"]}
     else:
         try:
             line = open(os.path.join(d, "result", "run-info.txt")).readline()
@@ -529,6 +561,7 @@ def summarize(out, sha, dry, manifest):
     rule = wtext[2] if len(wtext) > 2 and wtext[:2] == ["warm-up", "rule"] else None
     runs, incomplete, failed_checks, parity, fixture = [], [], [], [], []
     warm = []  # every warm-up refusal (A23): the credit field is derived from all of them (review 7 finding 7)
+    parents = {}  # block -> [(label, fixture.json)] of its measured runs, for the one-parent rule
     uncredited = []  # every nonzero exception-counter delta inside a window: labels its cell uncredited
     sweeper_bad = []  # every sweeper refusal (MED 12 ruling): sweeper_creditable is derived from them and the windows
     for fs, cell, system in planned:
@@ -612,9 +645,12 @@ def summarize(out, sha, dry, manifest):
                                 "order (PREREG annex A23; refused in either loop mode)")
                     parity.append(warm[-1])
             fixture += [f"{fs}/{cell}: {x}" for x in fixture_check(d, system, prow.get((fs, cell)) or {}, dry)]
+            parents.setdefault(fs, []).append((f"{fs}/{cell}", parent_record(d)))
         runs.append(r)
         if not result:
             incomplete.append(f"{fs}/{cell}: {why}")
+    for fs_ in sorted(parents):
+        fixture += one_parent(parents[fs_])
     # No cross-system equal-total rule (fourth lane review HIGH 2; the PREREG sizes n_run per system from that
     # system's own t-hat, overriding gate-6 item 12): each run is held to its own plan row above, nothing more.
     fl = os.path.join(out, "fslist.txt")
