@@ -9156,6 +9156,18 @@ impl BranchStore {
         self.inner.lock().names.filter.held_moved_max
     }
 
+    /// Test builds: the next named create starts a growth of a `Ready` name filter now, as one
+    /// past half full would (the 10^6 audit arm's growth phase: a natural growth there needs about
+    /// 10^6 more creates, each a D2 F_FULLFSYNC, raw l96).
+    #[cfg(test)]
+    pub(crate) fn force_name_filter_growth_for_test(&self) {
+        let mut inner = self.inner.lock();
+        let f = &mut inner.names.filter;
+        if matches!(f.state, FilterState::Ready { .. }) && f.owed.is_none() {
+            f.owed = Some(FilterWork::Grow);
+        }
+    }
+
     /// Test builds: the name filter's own answer for `name` ("absent, ask no catalog"), the step
     /// `name_lookup` takes after the resident names (`names.map`) miss.
     #[cfg(test)]

@@ -9029,6 +9029,14 @@ fn lifecycle_audit(n: u32) {
     }
     mark(&mut marks, "filter_growth");
     let (_, entries0, _, builds0, _) = db.branches.name_filter_stats();
+    // FLAGGED fixture change (2026-10-16): at n >= 10^5 the growth is owed by the test hook, not
+    // by about n more D2 creates filling the table (the 10^6 arm timed out in this loop at D0
+    // population too, raw l96; the D0 population itself costs about 0.7 ms a create in debug, raw
+    // l102). Its creates, and its growth's holds, are the same; only how it is started differs.
+    let force = n >= 100_000;
+    if force {
+        db.branches.force_name_filter_growth_for_test();
+    }
     let mut k = 0u32;
     while db.branches.name_filter_stats().3 == builds0 && k < 4 * n.max(1024) {
         trunk.create_branch(&format!("g-{k:07}")).unwrap();
@@ -9038,6 +9046,9 @@ fn lifecycle_audit(n: u32) {
     mark(&mut marks, "filter_rebuild");
     super::store::FILTER_DRAIN_FAILS.store(true, Release);
     let rebuilds0 = db.branches.name_filter_state_for_test().1;
+    if force {
+        db.branches.force_name_filter_growth_for_test();
+    }
     let mut r = 0u32;
     while db.branches.name_filter_state_for_test().1 == rebuilds0 && r < 8 * n.max(1024) {
         trunk.create_branch(&format!("r-{r:07}")).unwrap();
@@ -9278,6 +9289,28 @@ fn a_named_create_allocates_nothing_in_the_name_filter_as_it_grows() {
     let (built, entries, _, builds, _) = db.branches.name_filter_stats();
     assert!(built && entries >= 18_000, "the name filter stopped answering, or lost names, as it grew: built {built}, {entries} entries");
     assert!(builds > builds0, "premise: the name filter never grew past the table it was built with ({builds0} -> {builds} builds)");
+}
+
+/// Diagnostic for the 10^6 audit arm's population (it timed out at D0 in 90 min, raw l96): the wall
+/// time of each 20,000 named creates at durability OFF into a catalog store, up to `FE_POP_N`
+/// (default 200,000), so the cost per create and its slope in N are measured, not guessed. Prints.
+#[test]
+#[ignore = "diagnostic: run by name with --ignored --nocapture"]
+fn diag_d0_population_rate() {
+    let _s = serial();
+    let n: u32 = std::env::var("FE_POP_N").ok().and_then(|v| v.parse().ok()).unwrap_or(200_000);
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("pop.db"), opts(true, SyncClass::Off));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let mut t = std::time::Instant::now();
+    for i in 0..n {
+        trunk.create_branch(&format!("pop-{i:07}")).unwrap();
+        if (i + 1) % 20_000 == 0 {
+            println!("FE_POP {} creates: last 20,000 in {:.1} s ({:.0} us each)", i + 1, t.elapsed().as_secs_f64(), t.elapsed().as_secs_f64() * 1e6 / 20_000.0);
+            t = std::time::Instant::now();
+        }
+    }
 }
 
 /// Lead order (2026-10-15, attribution item 1): `a_fuzzy_checkpoint_issues_at_most_two_syscalls_under_
