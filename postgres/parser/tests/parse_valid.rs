@@ -496,6 +496,14 @@ fn scan_params_reads_parameters_as_the_lexer_does() {
         ("COPY t FROM STDIN WHERE v = $1", Some(1), false),
         ("BEGIN", Some(0), false),
         ("", Some(0), false),
+        // C40's three shapes (C49 LOW 4): empty statements before the first word, and an E-string
+        // continued across a newline in its own escape mode, whose escaped quote hides `$2`.
+        (";SELECT $1::int", Some(1), true),
+        (" ; /* c */ ; SELECT $1::int", Some(1), true),
+        ("SELECT E'one'\n'\\'$2' || $1::text", Some(1), true),
+        // A lexical error: no count is taken from it (None), and it is not read as needing none.
+        ("SELECT $1, 'abc", None, true),
+        ("SELECT $1::int /* unterminated", None, true),
     ] {
         let scan = scan_params(sql);
         assert_eq!(
@@ -503,6 +511,38 @@ fn scan_params_reads_parameters_as_the_lexer_does() {
             (highest, analysed),
             "{sql:?}"
         );
+    }
+}
+
+/// The server's Parse reads a statement's parameters from its one parse tree (C53, C40 LOW 6), and
+/// the lexer's count above was the reviewed one (C40): for every text that parses, the tree's
+/// highest `$n` (checked_param_numbers) is the lexer's (scan_params), so moving the count from the
+/// lexer to the tree changed no statement's count.
+#[test]
+fn the_parse_trees_parameters_are_the_lexers() {
+    use turso_pg_parser::{checked_param_numbers, parse, scan_params};
+    for sql in [
+        "SELECT $1, $12",
+        "SELECT '$3'",
+        "SELECT a$3 FROM t",
+        "SELECT $q$ $9 $q$, $2",
+        "SELECT E'\\' $5 '",
+        "/* a /* $1 */ b */ SELECT $2",
+        "WITH x AS (SELECT $1) SELECT * FROM x",
+        "insert into t values ($2, $1)",
+        "CREATE TABLE c AS SELECT $1",
+        ";SELECT $1::int",
+        " ; /* c */ ; SELECT $1::int",
+        "SELECT E'one'\n'\\'$2' || $1::text",
+        "SELECT v FROM t WHERE false AND id = $3",
+    ] {
+        let tree = parse(sql).unwrap_or_else(|e| panic!("{sql:?}: {e}"));
+        let from_tree = checked_param_numbers(&tree, sql)
+            .unwrap_or_else(|e| panic!("{sql:?}: {e}"))
+            .into_iter()
+            .max()
+            .unwrap_or(0) as u32;
+        assert_eq!(Some(from_tree), scan_params(sql).highest, "{sql:?}");
     }
 }
 
