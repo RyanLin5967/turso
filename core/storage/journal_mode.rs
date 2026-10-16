@@ -78,7 +78,7 @@ pub fn open_mv_store(
         if encryption_ctx.is_some() && storage.encryption_ctx().is_none() {
             return Err(LimboError::InvalidArgument(
                     "encrypted MVCC requires the custom DurableStorage to be configured with encryption"
-                        .to_string(),
+                        .to_string().into(),
                 ));
         }
     }

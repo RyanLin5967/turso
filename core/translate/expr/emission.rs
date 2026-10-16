@@ -1,3 +1,4 @@
+use crate::error::SqlErrorKind;
 use super::*;
 use crate::alloc::TursoIteratorExt;
 
@@ -51,7 +52,7 @@ pub fn emit_literal(
             Ok(target_register)
         }
         ast::Literal::Keyword(_) => {
-            crate::bail_parse_error!("Keyword in WHERE clause is not supported")
+            crate::bail_parse_error!(SqlErrorKind::FeatureNotSupported; "Keyword in WHERE clause is not supported")
         }
         ast::Literal::Null => {
             program.emit_insn(Insn::Null {

@@ -1,5 +1,6 @@
 //! Translation of VACUUM statements to VDBE bytecode.
 
+use crate::error::SqlErrorKind;
 use crate::vdbe::builder::ProgramBuilder;
 use crate::vdbe::insn::Insn;
 use crate::{bail_parse_error, Connection, Result};
@@ -31,7 +32,7 @@ pub fn translate_vacuum(
         t.btree().is_some_and(|b| b.recipes.is_some())
     }) {
         return Err(LimboError::ParseError(
-            "VACUUM is refused: a table has recipe backfills".to_string(),
+            "VACUUM is refused: a table has recipe backfills".to_string().into(),
         ));
     }
     match into {
@@ -48,18 +49,18 @@ pub fn translate_vacuum(
             if !connection.experimental_vacuum_enabled() {
                 return Err(LimboError::ParseError(
                     "VACUUM is an experimental feature. Enable with --experimental-vacuum flag"
-                        .to_string(),
+                        .to_string().into(),
                 ));
             }
             if connection.experimental_multiprocess_wal_enabled() {
                 return Err(LimboError::ParseError(
-                    "VACUUM is incompatible with experimental multiprocess WAL".to_string(),
+                    "VACUUM is incompatible with experimental multiprocess WAL".to_string().into(),
                 ));
             }
 
             // Schema-qualified VACUUM is not supported yet.
             if schema_name != "main" {
-                bail_parse_error!(
+                bail_parse_error!(SqlErrorKind::FeatureNotSupported;
                     "VACUUM is only supported for the main database; schema '{}' is not supported yet",
                     schema_name
                 );

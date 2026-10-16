@@ -4765,7 +4765,7 @@ pub(crate) fn refuse_links(files: &BranchFiles, catalog: bool) -> Result<()> {
                 files.log.display(),
                 files.arena.display(),
                 state.display()
-            )));
+            ).into()));
         }
     }
     Ok(())
@@ -4781,7 +4781,7 @@ pub(crate) fn one_device(log: Option<u64>, arena: Option<u64>) -> Result<()> {
         (log, arena) => Err(LimboError::InvalidArgument(format!(
             "the branch log (device {log:?}) and the branch arena (device {arena:?}) must be on one \
              device: the log's flush is what makes the arena durable"
-        ))),
+        ).into())),
     }
 }
 
