@@ -930,6 +930,23 @@ pub(crate) fn end_owning(owned: &[&str]) -> Snapshot {
     s.shim_loaded = shim().is_some();
     s.shim_lost = lost1;
     s.instructions = instructions();
+    // Diagnostics only (FE_BUDGET_NEW_NAMES names a file): a window refused for a thread new at its
+    // end appends the names of the threads in the end table that were not in the start one, after
+    // every count of the window is taken.
+    if let Some(file) = std::env::var_os("FE_BUDGET_NEW_NAMES").filter(|_| refusal == Refusal::ThreadNew) {
+        WINDOW_T0.with(|t0| {
+            let t0 = t0.borrow();
+            let name = |t: &ThreadCpu| {
+                let end = t.name.iter().position(|c| *c == 0).unwrap_or(t.name.len());
+                String::from_utf8_lossy(&t.name[..end]).to_string()
+            };
+            let new: Vec<String> = t1.iter().filter(|t| t.id != 0 && !t0.iter().any(|a| a.id == t.id)).map(name).collect();
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&file) {
+                let _ = std::io::Write::write_all(&mut f, format!("thread_new {new:?}
+").as_bytes());
+            }
+        });
+    }
     // Diagnostics only (FE_BUDGET_FOREIGN_NAMES set): name the foreign threads on stderr, after every
     // count of the window is taken.
     if foreign > 0 && std::env::var_os("FE_BUDGET_FOREIGN_NAMES").is_some() {
