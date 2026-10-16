@@ -115,7 +115,12 @@ pub fn remaining_stack() -> Option<usize> {
     let here = 0u8;
     let sp = std::ptr::addr_of!(here) as usize;
     STACK_BOUNDS
-        .with(|b| b.and_then(|(bottom, _)| sp.checked_sub(bottom)))
+        .with(|b| {
+            b.and_then(|(bottom, size)| {
+                let left = sp.checked_sub(bottom)?;
+                (left < size).then_some(left)
+            })
+        })
         .or_else(stacker::remaining_stack)
 }
 
@@ -183,10 +188,20 @@ impl Drop for Executing {
 
 /// Run `f` with at least `needs` bytes of stack: on this thread's stack when it has that much
 /// left, otherwise on a new stack segment of `needs` bytes (`stacker::maybe_grow`). For code with
-/// no `NestGuard` of ours inside it whose depth is bounded but large (libpg_query's C tree walks
-/// and its protobuf decode), where a refusal cannot be placed.
+/// bounded but potentially large foreign tree walks and tree destruction, where a refusal
+/// cannot be placed. Recursive Rust phases on the segment still use `NestGuard`.
 pub fn with_stack<R>(needs: usize, f: impl FnOnce() -> R) -> R {
     stacker::maybe_grow(needs, needs, f)
+}
+
+/// Provision only an outer preparation. A re-entrant prepare must consume the current
+/// stack, so growing a fresh segment cannot reset the shared nesting authority.
+pub fn with_preparation_stack<R>(needs: usize, f: impl FnOnce() -> R) -> R {
+    if DEPTH.with(|d| d.get()) == 0 && EXECUTING.with(|e| e.get()) == 0 {
+        with_stack(needs, f)
+    } else {
+        f()
+    }
 }
 
 /// Test hooks, compiled in every build (each is a thread-local read when unarmed): the levels a
@@ -198,6 +213,7 @@ pub mod test_hooks {
         static ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         static LEFT_AT: std::cell::RefCell<Vec<(usize, &'static std::panic::Location<'static>)>> = const { std::cell::RefCell::new(Vec::new()) };
         static WORST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        static MOST_USED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
         static WORST_AT: std::cell::Cell<Option<(&'static std::panic::Location<'static>, &'static std::panic::Location<'static>)>> = const { std::cell::Cell::new(None) };
         static REENTERED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
         static OUTERMOST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -237,6 +253,11 @@ pub mod test_hooks {
         take_worst_at().0
     }
 
+    /// Most stack used below an outermost checked entry, while this hook was armed.
+    pub fn take_most_used() -> usize {
+        MOST_USED.with(|used| used.replace(0))
+    }
+
     /// `take_worst`, with the two checks (outer, inner) it was measured between.
     pub fn take_worst_at() -> (usize, Option<(&'static std::panic::Location<'static>, &'static std::panic::Location<'static>)>) {
         LEFT_AT.with(|at| at.borrow_mut().clear());
@@ -263,6 +284,9 @@ pub mod test_hooks {
                 });
             } else if depth == 0 {
                 OUTERMOST.with(|o| o.set(o.get() + 1));
+            }
+            if let Some(&(first, _)) = at.first() {
+                MOST_USED.with(|used| used.set(used.get().max(first.saturating_sub(left))));
             }
             if let Some(&(outer, outer_site)) = at.last() {
                 let gap = outer.saturating_sub(left);

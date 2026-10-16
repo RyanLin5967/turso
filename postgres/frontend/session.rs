@@ -962,6 +962,18 @@ fn prepare_statement_inner(
 fn prepare_statement_checked(
     pg_conn: &Arc<PgConnectionInner>,
     sql: &str,
+    types: Option<&mut StatementTypes>,
+    describe: bool,
+    check_keys: bool,
+) -> Result<Option<Statement>> {
+    turso_pg_parser::with_preparation_stack(sql, || {
+        prepare_statement_on_stack(pg_conn, sql, types, describe, check_keys)
+    })
+}
+
+fn prepare_statement_on_stack(
+    pg_conn: &Arc<PgConnectionInner>,
+    sql: &str,
     mut types: Option<&mut StatementTypes>,
     describe: bool,
     check_keys: bool,
@@ -3083,7 +3095,7 @@ mod tests {
     }
 
     fn slow(sql: &str) -> Option<PgBranchCall> {
-        try_extract_branch_call(&turso_pg_parser::parse(sql).ok()?)
+        try_extract_branch_call(&*turso_pg_parser::parse(sql).ok()?)
     }
 
     fn call(function: &str, args: Vec<PgBranchArg>) -> Option<PgBranchCall> {

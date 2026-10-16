@@ -24,6 +24,27 @@ fn run_child() -> bool {
     let outcome = std::thread::Builder::new()
         .stack_size(kib * 1024)
         .spawn(move || {
+            if let Ok(phase) = std::env::var("C47_PARSE_PHASE") {
+                return match turso_pg_parser::parse(&sql) {
+                    Ok(parsed) => {
+                        let outcome = match phase.as_str() {
+                            "drop" => "ok parsed".to_string(),
+                            "deparse" => match turso_pg_parser::deparse(&parsed.protobuf) {
+                                Ok(text) => format!("ok deparsed {} selects", text.matches("SELECT").count()),
+                                Err(e) => format!("err {e:?}"),
+                            },
+                            "parameters" => match turso_pg_parser::checked_param_numbers(&parsed, &sql) {
+                                Ok(numbers) => format!("ok parameters {numbers:?}"),
+                                Err(e) => format!("err {e:?}"),
+                            },
+                            _ => panic!("unknown parse lifecycle phase"),
+                        };
+                        drop(parsed);
+                        outcome
+                    }
+                    Err(e) => format!("err {e:?}"),
+                };
+            }
             let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::MemoryIO::new());
             let got = open_database_with_io(io, ":memory:", turso_core::OpenFlags::Create, turso_core::DatabaseOpts::new())
                 .and_then(|db| db.connect())
@@ -44,14 +65,22 @@ fn run_child() -> bool {
 }
 
 fn in_child(test: &str, kib: usize, sql: &str) -> String {
+    in_child_phase(test, kib, sql, None)
+}
+
+fn in_child_phase(test: &str, kib: usize, sql: &str, phase: Option<&str>) -> String {
     let dir = tempfile::TempDir::new().unwrap();
     let file = dir.path().join("outcome");
-    let out = std::process::Command::new(std::env::current_exe().unwrap())
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
         .args([test, "--exact", "--include-ignored", "--nocapture", "--test-threads=1"])
         .env(CHILD_ENV, format!("{kib}|{sql}"))
         .env("FE_STACK_OUT", &file)
-        .output()
-        .unwrap();
+        .env_remove("C47_PARSE_PHASE");
+    if let Some(phase) = phase {
+        command.env("C47_PARSE_PHASE", phase);
+    }
+    let out = command.output().unwrap();
     match std::fs::read_to_string(&file) {
         Ok(line) if out.status.success() => line,
         _ => {
@@ -123,6 +152,8 @@ fn no_nesting_shape_kills_the_process_on_the_postgresql_route() {
             let got = in_child(test, 8 * 1024, &sql);
             if got.starts_with("died") {
                 died.push(format!("{shape} at depth {depth} ({} bytes of SQL) on 8 MiB: {got}", sql.len()));
+            } else if got.contains("StackDepthLimitExceeded") || got.contains("stack depth limit exceeded") {
+                refused += 1;
             }
         }
     }
@@ -146,4 +177,135 @@ fn diag_postgresql_route_refusals_by_depth() {
             println!("FE_STACK_DIAG depth {depth} {shape}: {}", &got[..got.len().min(160)]);
         }
     }
+}
+
+/// PG 18.6 answers this statement: the protobuf codec must not add its own smaller limit.
+#[test]
+fn a_thousand_nested_scalar_subqueries_answer_one() {
+    if run_child() {
+        return;
+    }
+    let test = "stack_guard_tests::a_thousand_nested_scalar_subqueries_answer_one";
+    let sql = format!("SELECT {}1{}", "(SELECT ".repeat(1000), ")".repeat(1000));
+    let got = in_child(test, 8 * 1024, &sql);
+    assert_eq!(
+        got, "ok [[Numeric(Integer(1))]]",
+        "PG 18.6 answers 1 at depth 1000"
+    );
+}
+
+#[test]
+fn three_thousand_nested_scalar_subqueries_keep_the_stack_refusal() {
+    if run_child() {
+        return;
+    }
+    let test = "stack_guard_tests::three_thousand_nested_scalar_subqueries_keep_the_stack_refusal";
+    let sql = format!("SELECT {}1{}", "(SELECT ".repeat(3000), ")".repeat(3000));
+    let got = in_child(test, 8 * 1024, &sql);
+    assert_eq!(
+        got, "err StackDepthLimitExceeded",
+        "PG 18.6 gives SQLSTATE 54001 at depth 3000"
+    );
+}
+
+#[test]
+fn ten_thousand_nested_scalar_subqueries_keep_the_parser_refusal() {
+    if run_child() {
+        return;
+    }
+    let test = "stack_guard_tests::ten_thousand_nested_scalar_subqueries_keep_the_parser_refusal";
+    let sql = format!("SELECT {}1{}", "(SELECT ".repeat(10000), ")".repeat(10000));
+    let got = in_child(test, 8 * 1024, &sql);
+    assert!(
+        got.starts_with("err ParseError(") && got.contains("memory exhausted"),
+        "PG 18.6 gives SQLSTATE 42601 at depth 10000: {got}"
+    );
+}
+
+/// A left-associated tree can grow while the shift/reduce parser's own stack stays small.
+#[test]
+fn a_long_left_associated_expression_keeps_a_bounded_outcome() {
+    if run_child() {
+        return;
+    }
+    let test = "stack_guard_tests::a_long_left_associated_expression_keeps_a_bounded_outcome";
+    let sql = format!("SELECT {}1", "1 + ".repeat(12000));
+    let got = in_child(test, 8 * 1024, &sql);
+    assert!(
+        got == "ok [[Numeric(Integer(12001))]]" || got == "err StackDepthLimitExceeded",
+        "a deep expression must answer correctly or reach the shared stack guard: {got}"
+    );
+}
+
+#[test]
+fn a_deep_parse_tree_can_be_dropped_after_an_early_return() {
+    if run_child() {
+        return;
+    }
+    let sql = format!("SELECT {}1{}", "(SELECT ".repeat(1000), ")".repeat(1000));
+    assert_eq!(
+        in_child_phase(
+            "stack_guard_tests::a_deep_parse_tree_can_be_dropped_after_an_early_return",
+            256,
+            &sql,
+            Some("drop")
+        ),
+        "ok parsed"
+    );
+}
+
+#[test]
+fn a_deep_parse_tree_keeps_its_parameter_metadata() {
+    if run_child() {
+        return;
+    }
+    let sql = format!("SELECT {}$1{}", "(SELECT ".repeat(1000), ")".repeat(1000));
+    assert_eq!(
+        in_child_phase(
+            "stack_guard_tests::a_deep_parse_tree_keeps_its_parameter_metadata",
+            256,
+            &sql,
+            Some("parameters")
+        ),
+        "ok parameters [1]"
+    );
+}
+
+#[test]
+fn a_deep_parse_tree_can_be_deparsed() {
+    if run_child() {
+        return;
+    }
+    let sql = format!("SELECT {}1{}", "(SELECT ".repeat(1000), ")".repeat(1000));
+    assert_eq!(
+        in_child_phase(
+            "stack_guard_tests::a_deep_parse_tree_can_be_deparsed",
+            256,
+            &sql,
+            Some("deparse")
+        ),
+        "ok deparsed 1001 selects"
+    );
+}
+
+#[test]
+fn refusing_a_later_deep_sibling_safely_drops_the_completed_sibling() {
+    if run_child() {
+        return;
+    }
+    let sql = format!(
+        "SELECT {}1{}, {}1",
+        "(SELECT ".repeat(1000),
+        ")".repeat(1000),
+        "1 + ".repeat(12000)
+    );
+    assert_eq!(
+        in_child_phase(
+            "stack_guard_tests::refusing_a_later_deep_sibling_safely_drops_the_completed_sibling",
+            256,
+            &sql,
+            Some("drop")
+        ),
+        "err StackDepthLimitExceeded"
+    );
 }
