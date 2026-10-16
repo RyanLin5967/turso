@@ -328,7 +328,7 @@ impl IncrementalView {
             ),
             _ => Err(LimboError::ParseError(format!(
                 "View is not a CREATE MATERIALIZED VIEW statement: {sql}"
-            ))),
+            ).into())),
         }
     }
 
@@ -485,7 +485,7 @@ impl IncrementalView {
             } else {
                 return Err(LimboError::ParseError(format!(
                     "Table '{table_name}' not found in schema"
-                )));
+                ).into()));
             }
         }
         Ok(())
@@ -700,7 +700,7 @@ impl IncrementalView {
     ) -> crate::Result<Vec<String>> {
         if referenced_tables.is_empty() {
             return Err(LimboError::ParseError(
-                "No tables to populate from".to_string(),
+                "No tables to populate from".to_string().into(),
             ));
         }
 

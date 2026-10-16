@@ -1088,7 +1088,7 @@ fn parse_field_weights(weights_str: &str, columns: &[IndexColumn]) -> Result<Has
         let (col_name, weight_str) = part.split_once('=').ok_or_else(|| {
             LimboError::ParseError(format!(
                 "invalid weight format '{part}'. Expected 'column=weight' (e.g., 'title=2.0')",
-            ))
+            ).into())
         })?;
 
         let col_name = col_name.trim();
@@ -1104,18 +1104,18 @@ fn parse_field_weights(weights_str: &str, columns: &[IndexColumn]) -> Result<Has
                     .map(|c| c.name.as_str())
                     .collect::<Vec<_>>()
                     .join(", ")
-            )));
+            ).into()));
         }
 
         let weight: f32 = weight_str.parse().map_err(|_| {
             LimboError::ParseError(format!(
                 "invalid weight value '{weight_str}' for column '{col_name}'. Expected a number (e.g., 2.0)",
-            ))
+            ).into())
         })?;
         if weight <= 0.0 {
             return Err(LimboError::ParseError(format!(
                 "weight for column '{col_name}' must be positive, got {weight}",
-            )));
+            ).into()));
         }
 
         weights.insert(col_name.to_string(), weight);
@@ -1442,12 +1442,12 @@ impl FtsIndexAttachment {
                     "unsupported FTS WITH parameter '{}'. Supported parameters: {}",
                     key,
                     SUPPORTED_WITH_KEYS.join(", ")
-                )));
+                ).into()));
             }
             if parameters.insert(normalized, value).is_some() {
                 return Err(LimboError::ParseError(format!(
                     "duplicate FTS WITH parameter '{key}'"
-                )));
+                ).into()));
             }
         }
 
@@ -1472,7 +1472,7 @@ impl FtsIndexAttachment {
                 "unsupported FTS tokenizer '{}'. Supported tokenizers: {}",
                 tokenizer_name,
                 SUPPORTED_TOKENIZERS.join(", ")
-            )));
+            ).into()));
         }
 
         // Parse the ngram window: WITH (tokenizer = 'ngram', min_gram = 1, max_gram = 3)
@@ -1486,7 +1486,7 @@ impl FtsIndexAttachment {
                 }
                 _ => Err(LimboError::ParseError(format!(
                     "FTS WITH parameter '{key}' must be a positive integer"
-                ))),
+                ).into())),
             }
         };
         let min_gram = parse_gram("min_gram")?;
@@ -1494,7 +1494,7 @@ impl FtsIndexAttachment {
         if (min_gram.is_some() || max_gram.is_some()) && tokenizer_name != "ngram" {
             return Err(LimboError::ParseError(format!(
                 "FTS WITH parameters 'min_gram' and 'max_gram' require tokenizer = 'ngram', got tokenizer = '{tokenizer_name}'"
-            )));
+            ).into()));
         }
         let ngram_window = (
             min_gram.unwrap_or(DEFAULT_NGRAM_WINDOW.0),
@@ -1504,7 +1504,7 @@ impl FtsIndexAttachment {
             return Err(LimboError::ParseError(format!(
                 "FTS ngram window is invalid: min_gram ({}) is greater than max_gram ({})",
                 ngram_window.0, ngram_window.1
-            )));
+            ).into()));
         }
 
         // Parse field weights from WITH clause: weights='body=2.0,title=1.0'
@@ -2043,7 +2043,7 @@ impl FtsCursor {
                         "statement already has an open writer on this FTS index; \
                          a trigger cannot write the FTS-indexed table its firing \
                          statement is writing"
-                            .to_string(),
+                            .to_string().into(),
                     ));
                 }
                 // A claim from another (or dead) connection: cross-connection
@@ -4060,7 +4060,7 @@ impl IndexMethodCursor for FtsCursor {
                     _ => None,
                 };
                 coerced
-                    .ok_or_else(|| LimboError::Constraint("datatype mismatch (19)".to_string()))?
+                    .ok_or_else(|| LimboError::Constraint("datatype mismatch (19)".to_string().into()))?
             } else {
                 return Err(LimboError::InternalError(
                     "FTS query_start: LIMIT pattern selected but no limit value captured"

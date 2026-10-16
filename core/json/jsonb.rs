@@ -988,10 +988,10 @@ impl Jsonb {
         for size in sizes {
             end = end
                 .checked_add(*size)
-                .ok_or_else(|| LimboError::ParseError("malformed JSON".to_string()))?;
+                .ok_or_else(|| LimboError::ParseError("malformed JSON".to_string().into()))?;
         }
         if end > self.data.len() {
-            return Err(LimboError::ParseError("malformed JSON".to_string()));
+            return Err(LimboError::ParseError("malformed JSON".to_string().into()));
         }
         Ok(end)
     }
@@ -1033,13 +1033,14 @@ impl Jsonb {
         // near usize::MAX, so the end must be computed without overflow.
         let payload_end = header_size
             .checked_add(len)
-            .ok_or_else(|| LimboError::ParseError("malformed JSON".to_string()))?;
+            .ok_or_else(|| LimboError::ParseError("malformed JSON".to_string().into()))?;
         let payload = self
             .data
             .get(header_size..payload_end)
-            .ok_or_else(|| LimboError::ParseError("malformed JSON".to_string()))?;
-        let text = from_utf8(payload)
-            .map_err(|_| LimboError::ParseError("Failed to serialize string!".to_string()))?;
+            .ok_or_else(|| LimboError::ParseError("malformed JSON".to_string().into()))?;
+        let text = from_utf8(payload).map_err(|_| {
+            LimboError::ParseError("Failed to serialize string!".to_string().into())
+        })?;
         Ok(unescape_string(text))
     }
 
@@ -1224,7 +1225,7 @@ impl Jsonb {
         match kind {
             ElementType::TEXT | ElementType::TEXTRAW | ElementType::TEXTJ => {
                 let word = from_utf8(word_slice).map_err(|_| {
-                    LimboError::ParseError("Failed to serialize string!".to_string())
+                    LimboError::ParseError("Failed to serialize string!".to_string().into())
                 })?;
 
                 let mut last_end = 0;
@@ -1405,7 +1406,7 @@ impl Jsonb {
             bail_parse_error!("Invalid JSONB: number extends beyond data");
         }
         let num_slice = from_utf8(&self.data[cursor..current_cursor])
-            .map_err(|_| LimboError::ParseError("Failed to parse integer".to_string()))?;
+            .map_err(|_| LimboError::ParseError("Failed to parse integer".to_string().into()))?;
 
         match kind {
             ElementType::INT | ElementType::FLOAT => {
@@ -1463,7 +1464,7 @@ impl Jsonb {
                 value = value * 16 + ch.to_digit(16).unwrap_or(0) as u64;
             }
             write!(string, "{value}")
-                .map_err(|_| LimboError::ParseError("Error writing string to json!".to_string()))?;
+                .map_err(|_| LimboError::ParseError("Error writing string to json!".to_string().into()))?;
         } else if !hex_str.is_empty() && hex_str.bytes().all(|b| b.is_ascii_digit()) {
             // Plain unsigned integer - output as-is
             string.push_str(hex_str);
@@ -2576,7 +2577,7 @@ impl Jsonb {
 
         let end = header_skip
             .checked_add(header.1)
-            .ok_or_else(|| LimboError::ParseError("malformed JSON".to_string()))?;
+            .ok_or_else(|| LimboError::ParseError("malformed JSON".to_string().into()))?;
         let mut count = 0;
         let mut pos = header_skip;
         while pos < end {
@@ -3231,14 +3232,14 @@ impl Jsonb {
             }
         };
 
-        Err(LimboError::ParseError("Not found".to_string()))
+        Err(LimboError::ParseError("Not found".to_string().into()))
     }
 
     fn skip_element(&self, pos: usize) -> Result<usize> {
         let (header, skip_header) = self.read_header(pos)?;
         pos.checked_add(skip_header)
             .and_then(|p| p.checked_add(header.1))
-            .ok_or_else(|| LimboError::ParseError("malformed JSON".to_string()))
+            .ok_or_else(|| LimboError::ParseError("malformed JSON".to_string().into()))
     }
 
     // TODO Primitive implementation could be optimized.
@@ -3276,7 +3277,7 @@ impl Jsonb {
             while patch_key_cursor < patch_end {
                 let (key_header, key_header_size) = patch.read_header(patch_key_cursor)?;
                 if !key_header.0.is_valid_key() {
-                    return Err(LimboError::ParseError("Invalid key type".to_string()));
+                    return Err(LimboError::ParseError("Invalid key type".to_string().into()));
                 }
 
                 let key_start = patch_key_cursor + key_header_size;
@@ -3566,7 +3567,7 @@ fn read_text_payload(data: &[u8], start: usize, len: usize) -> Result<&str> {
     let Some(bytes) = data.get(start..end) else {
         bail_parse_error!("malformed JSON: text payload extends beyond data");
     };
-    from_utf8(bytes).map_err(|_| LimboError::ParseError("malformed JSON".to_string()))
+    from_utf8(bytes).map_err(|_| LimboError::ParseError("malformed JSON".to_string().into()))
 }
 
 /// Picks the element type for an object key created from a path label.

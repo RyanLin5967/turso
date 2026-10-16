@@ -24,6 +24,7 @@
 
 pub mod counters;
 
+use turso_parser::sql_error::SqlErrorKind;
 use std::num::NonZero;
 use std::sync::{
     atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -3457,136 +3458,45 @@ fn engine_info(e: &LimboError) -> Box<ErrorInfo> {
             2 => "canceling statement due to statement timeout",
             _ => "canceling statement due to user request",
         };
-        return error("57014", message.to_string());
+        return error(sqlstate(e), message.to_string());
     }
     error(sqlstate(e), e.to_string())
 }
 
-/// PostgreSQL's SQLSTATE (errcodes.txt) for an engine error, so a driver raises the right class
-/// (wire review 1 item 7). The engine types a constraint failure's kind only in SQLite's fixed
-/// message forms ("UNIQUE constraint failed: ..."), and a statement it cannot compile only as a
-/// ParseError whose text comes from libpg_query ("Invalid statement: ...", always a grammar
-/// error), the translator ("... not supported ...") or the planner ("no such table: ..."); those
-/// forms are read here. Anything unrecognised stays XX000, internal_error.
+/// PostgreSQL's SQLSTATE for the condition selected by the error's producer. Diagnostic text
+/// has no role here: rewording it preserves the code and the engine's error handling.
 fn sqlstate(e: &LimboError) -> &'static str {
-    match e {
-        LimboError::Busy => "55P03",
-        LimboError::BusySnapshot => "40001",
-        LimboError::ForeignKeyConstraint(_) => "23503",
-        LimboError::Constraint(m) if m.starts_with("UNIQUE constraint failed") => "23505",
-        LimboError::Constraint(m) if m.starts_with("NOT NULL constraint failed") => "23502",
-        LimboError::Constraint(m) if m.starts_with("CHECK constraint failed") => "23514",
-        LimboError::Constraint(m) if m.starts_with("invalid ") => "22P02",
-        // The engine's NUMERIC divide refuses a zero divisor as a constraint error in PostgreSQL's
-        // words, which is 22012, never an integrity violation (wire review 16 item 2).
-        LimboError::Constraint(m) if m == "division by zero" => "22012",
-        LimboError::Constraint(_) => "23000",
-        LimboError::ParseError(m) if m.starts_with("Invalid statement:") => "42601",
-        // The translator's own reading of a cast literal (float_literal): PostgreSQL's codes,
-        // matched by the producers' fixed prefixes, never by words a client's value supplies.
-        LimboError::ParseError(m) if m.starts_with("invalid input syntax for type ") => "22P02",
-        LimboError::ParseError(m)
-            if m.starts_with('"') && m.contains("\" is out of range for type ") =>
-        {
-            "22003"
-        }
-        // The fail-closed refusal of a parse tree whose parameters cannot be read (turso_pg_parser
-        // checked_param_numbers): an internal failure, never a client's syntax error, so it is not
-        // 42601, the code of PostgreSQL's "parameter number too large" beside it (wire review 14
-        // item 18).
-        LimboError::ParseError(m)
-            if m.contains("could not read the statement's parameters from its parse tree") =>
-        {
-            "XX000"
-        }
-        // The crash batch (2026-10-15): views nested past the planner's limit, refused where they
-        // overflowed the stack (statement_too_complex, PostgreSQL's stack depth limit); and a
-        // make_date / make_timestamp past the date range, which aborted the process.
-        LimboError::ParseError(m) if m.starts_with("stack depth limit exceeded") => "54001",
-        // The translator's alias column list longer than its table (PostgreSQL's 42P10).
-        LimboError::ParseError(m)
-            if m.starts_with("table \"") && m.contains(" columns available but ") =>
-        {
-            "42P10"
-        }
-        LimboError::ExtensionError(m) if m.starts_with("date field value out of range") => "22008",
-        // An infinite generate_series bound, refused by the PostgreSQL dialect in PostgreSQL's
-        // words (the crash batch, 2026-10-15): invalid_parameter_value.
-        LimboError::ExtensionError(m) if m.ends_with(" cannot be infinity") => "22023",
-        LimboError::ParseError(m)
-            if m.starts_with("no such table")
-                || m.starts_with("no such view")
-                || m.starts_with("missing FROM-clause entry for table")
-                || (m.starts_with("relation \"") && m.ends_with("\" does not exist")) =>
-        {
-            "42P01"
-        }
-        // A foreign key's parent key is not one (an ALTER's added key; wire review 11 item 5).
-        // The engine's own refusal of a key's arity, in a CREATE TABLE (wire review 13 item 4).
-        LimboError::ParseError(m)
-            if m.starts_with("there is no unique constraint matching given keys")
-                || m.starts_with("there is no primary key for referenced table")
-                || m.starts_with("number of referencing and referenced columns")
-                || (m.starts_with("foreign key on \"") && m.contains(" child column(s) but ")) =>
-        {
-            "42830"
-        }
-        // A foreign key's column that does not exist (wire review 13 item 3).
-        LimboError::ParseError(m)
-            if m.starts_with("column \"")
-                && m.ends_with("\" referenced in foreign key constraint does not exist") =>
-        {
-            "42703"
-        }
-        LimboError::ParseError(m) if m.starts_with("no such column") => "42703",
-        // A SET of a parameter PostgreSQL does not know (wire review 15 item 2).
-        LimboError::ParseError(m) if m.starts_with("unrecognized configuration parameter") => {
-            "42704"
-        }
-        LimboError::ParseError(m) if m.starts_with("there is no parameter") => "42P02",
-        // A savepoint name that names none (wire review 6 item 6).
-        LimboError::TxError(m) if m.starts_with("no such savepoint") => "3B001",
-        // Matched by their producers' whole shapes, never by words anywhere: the message can embed
-        // a client's value, and `SET bytea_output = 'is ambiguous'` answered 42702 (wire review 16
-        // item 20). The producers: the translator's `column reference "c" is ambiguous` and `table
-        // name "t" specified more than once`, core's `ROWID is ambiguous` and `ambiguous column
-        // name`.
-        LimboError::ParseError(m)
-            if (m.starts_with("column reference \"") && m.ends_with("\" is ambiguous"))
-                || m == "ROWID is ambiguous"
-                || m.starts_with("ambiguous column name") =>
-        {
-            "42702"
-        }
-        LimboError::ParseError(m) if m.starts_with("no such function") => "42883",
-        LimboError::ParseError(m)
-            if m.starts_with("table name \"") && m.ends_with("\" specified more than once") =>
-        {
-            "42712"
-        }
-        // Blind spot: refusals reach here as text from some thirty producers in core, the
-        // translator and the frontend, so this arm matches words, and a message that embeds a
-        // client's text holding them (an identifier the engine quotes) answers 0A000 instead of
-        // the arm after. Errors that carry their code would close it; that needs a variant in
-        // core's LimboError.
-        LimboError::ParseError(m) if m.contains("not supported") || m.contains("Unsupported") => {
-            "0A000"
-        }
-        LimboError::ParseError(_) => "42601",
-        LimboError::IntegerOverflow => "22003",
-        // encode()'s unknown format (functions.rs exec_encode), PostgreSQL's
-        // invalid_parameter_value.
-        LimboError::InvalidArgument(m)
-            if m.starts_with("unrecognized encoding")
-                || m.starts_with("invalid value for parameter")
-                || (m.starts_with("SET ") && m.ends_with(" takes only one argument")) =>
-        {
-            "22023"
-        }
-        LimboError::ReadOnly => "25006",
-        LimboError::DatabaseFull(_) => "53100",
-        LimboError::Interrupt => "57014",
-        _ => "XX000",
+    use SqlErrorKind::*;
+    match e.sql_error_kind() {
+        SyntaxError => "42601",
+        FeatureNotSupported => "0A000",
+        InvalidTextRepresentation => "22P02",
+        NumericValueOutOfRange => "22003",
+        DivisionByZero => "22012",
+        IntegrityConstraintViolation => "23000",
+        UniqueViolation => "23505",
+        NotNullViolation => "23502",
+        CheckViolation => "23514",
+        ForeignKeyViolation => "23503",
+        InvalidColumnReference => "42P10",
+        DatetimeFieldOverflow => "22008",
+        InvalidParameterValue => "22023",
+        UndefinedTable => "42P01",
+        InvalidForeignKey => "42830",
+        UndefinedColumn => "42703",
+        UndefinedObject => "42704",
+        UndefinedParameter => "42P02",
+        InvalidSavepointSpecification => "3B001",
+        AmbiguousColumn => "42702",
+        UndefinedFunction => "42883",
+        DuplicateAlias => "42712",
+        StatementTooComplex => "54001",
+        InternalError => "XX000",
+        SerializationFailure => "40001",
+        LockNotAvailable => "55P03",
+        ReadOnlyTransaction => "25006",
+        DiskFull => "53100",
+        QueryCanceled => "57014",
     }
 }
 

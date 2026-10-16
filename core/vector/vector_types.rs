@@ -299,7 +299,7 @@ impl<'a> Vector<'a> {
                     return Err(LimboError::InvalidArgument(format!(
                         "f32 dense vector unexpected data length: {}",
                         data.len(),
-                    )));
+                    ).into()));
                 }
                 Ok(Vector {
                     vector_type,
@@ -313,7 +313,7 @@ impl<'a> Vector<'a> {
                     return Err(LimboError::InvalidArgument(format!(
                         "f64 dense vector unexpected data length: {}",
                         data.len(),
-                    )));
+                    ).into()));
                 }
                 Ok(Vector {
                     vector_type,
@@ -327,7 +327,7 @@ impl<'a> Vector<'a> {
                     return Err(LimboError::InvalidArgument(format!(
                         "f32 sparse vector unexpected data length: {}",
                         data.len(),
-                    )));
+                    ).into()));
                 }
                 let original_len = data.len();
                 let dims_bytes = &data[original_len - 4..];
@@ -347,7 +347,7 @@ impl<'a> Vector<'a> {
                     if index >= dims {
                         return Err(LimboError::InvalidArgument(format!(
                             "f32 sparse vector index {index} out of range for {dims} dims"
-                        )));
+                        ).into()));
                     }
                 }
                 let owned = owned.map(|mut x| {
@@ -370,7 +370,7 @@ impl<'a> Vector<'a> {
                         data.len(),
                         expected_len,
                         explicit_dims,
-                    )));
+                    ).into()));
                 }
                 Ok(Vector {
                     vector_type,
@@ -384,7 +384,7 @@ impl<'a> Vector<'a> {
                     return Err(LimboError::InvalidArgument(format!(
                         "f8 vector data too short: {}",
                         data.len(),
-                    )));
+                    ).into()));
                 }
                 let expected_len = Self::align4(explicit_dims) + 8;
                 if explicit_dims == 0 || data.len() != expected_len {
@@ -393,7 +393,7 @@ impl<'a> Vector<'a> {
                         data.len(),
                         expected_len,
                         explicit_dims,
-                    )));
+                    ).into()));
                 }
                 Ok(Vector {
                     vector_type,

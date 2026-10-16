@@ -115,12 +115,12 @@ pub fn limbo_error_to_message(err: &LimboError) -> String {
         LimboError::DatabaseFull(s)
         | LimboError::Corrupt(s)
         | LimboError::InternalError(s)
-        | LimboError::ParseError(s)
-        | LimboError::TxError(s)
-        | LimboError::InvalidArgument(s)
-        | LimboError::Constraint(s)
         | LimboError::Conflict(s)
         | LimboError::CheckpointFailed(s) => s.clone(),
+        LimboError::ParseError(s)
+        | LimboError::TxError(s)
+        | LimboError::InvalidArgument(s)
+        | LimboError::Constraint(s) => s.to_string(),
         other => other.to_string(),
     }
 }
@@ -161,16 +161,16 @@ fn error_kind_to_limbo_error(kind: &str, message: &str) -> LimboError {
         "SchemaUpdated" => LimboError::SchemaUpdated,
         "SchemaConflict" => LimboError::SchemaConflict,
         "TableLocked" => LimboError::TableLocked,
-        "InvalidArgument" => LimboError::InvalidArgument(message.to_string()),
-        "Constraint" => LimboError::Constraint(message.to_string()),
+        "InvalidArgument" => LimboError::InvalidArgument(message.to_string().into()),
+        "Constraint" => LimboError::Constraint(message.to_string().into()),
         "Corrupt" => LimboError::Corrupt(message.to_string()),
         "ReadOnly" => LimboError::ReadOnly,
         "Interrupt" => LimboError::Interrupt,
         "InternalError" => LimboError::InternalError(message.to_string()),
         "Conflict" => LimboError::Conflict(message.to_string()),
         "CheckpointFailed" => LimboError::CheckpointFailed(message.to_string()),
-        "ParseError" => LimboError::ParseError(message.to_string()),
-        "TxError" => LimboError::TxError(message.to_string()),
+        "ParseError" => LimboError::ParseError(message.to_string().into()),
+        "TxError" => LimboError::TxError(message.to_string().into()),
         "DatabaseFull" => LimboError::DatabaseFull(message.to_string()),
         "OutOfMemory" => LimboError::OutOfMemory,
         _ => LimboError::InternalError(format!("{kind}: {message}")),

@@ -1,3 +1,4 @@
+use crate::error::SqlErrorKind;
 use super::emitter::{emit_program, TranslateCtx};
 use super::plan::{
     select_star, Distinctness, InSeekSource, JoinOrderMember, NamedWindowBound, NamedWindowDef,
@@ -543,7 +544,7 @@ fn prepare_one_select_plan(
                                     .and_then(|c| c.name.as_ref())
                                     .map(|n| n.as_str())
                                     .unwrap_or("?");
-                                crate::bail_parse_error!(
+                                crate::bail_parse_error!(SqlErrorKind::AmbiguousColumn;
                                     "ambiguous column name: {}.{}",
                                     name.as_str(),
                                     col_name
@@ -556,7 +557,7 @@ fn prepare_one_select_plan(
                                 .find(|t| t.identifier == name_normalized);
 
                             if referenced_table.is_none() {
-                                crate::bail_parse_error!("no such table: {}", name.as_str());
+                                crate::bail_parse_error!(SqlErrorKind::UndefinedTable; "no such table: {}", name.as_str());
                             }
                             let table = referenced_table.unwrap();
                             let num_columns = table.columns().len();
@@ -1057,7 +1058,7 @@ fn reject_outer_query_refs_in_group_by_expr(
                         .expect(
                             "bound outer-scope Expr::Column must point to a named column in schema",
                         );
-                    crate::bail_parse_error!(
+                    crate::bail_parse_error!(SqlErrorKind::UndefinedColumn;
                         "no such column: {}.{}",
                         outer_ref.identifier,
                         normalize_ident(column_name)
@@ -1068,7 +1069,7 @@ fn reject_outer_query_refs_in_group_by_expr(
                 if let Some(outer_ref) =
                     table_references.find_outer_query_ref_by_internal_id(*table)
                 {
-                    crate::bail_parse_error!("no such column: {}.rowid", outer_ref.identifier);
+                    crate::bail_parse_error!(SqlErrorKind::UndefinedColumn; "no such column: {}.rowid", outer_ref.identifier);
                 }
             }
             Expr::SubqueryResult { subquery_id, .. } => {
@@ -1143,14 +1144,14 @@ fn reject_outer_scope_refs_inside_select_plan(
                 .get(col_idx)
                 .and_then(|col| col.name.as_deref())
                 .expect("bound outer-scope Expr::Column must point to a named column in schema");
-            crate::bail_parse_error!(
+            crate::bail_parse_error!(SqlErrorKind::UndefinedColumn;
                 "no such column: {}.{}",
                 outer_ref.identifier,
                 normalize_ident(column_name)
             );
         }
         if outer_ref.rowid_referenced {
-            crate::bail_parse_error!("no such column: {}.rowid", outer_ref.identifier);
+            crate::bail_parse_error!(SqlErrorKind::UndefinedColumn; "no such column: {}.rowid", outer_ref.identifier);
         }
         unreachable!("used outer query reference must reference at least one column or rowid");
     }

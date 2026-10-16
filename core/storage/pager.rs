@@ -1880,7 +1880,7 @@ impl Pager {
                 } else {
                     "while branches of this database exist"
                 }
-            )));
+            ).into()));
         }
         Ok(())
     }
@@ -2980,7 +2980,7 @@ impl Pager {
                     size.get(),
                     reserved_space,
                     PageSize::MIN_USABLE_SPACE
-                )));
+                ).into()));
             }
         }
         let IOResult::Done(mut header) = self.with_header(|header| *header)? else {
@@ -4075,7 +4075,7 @@ impl Pager {
         if self.branch.get().is_some() {
             return Err(LimboError::InvalidArgument(
                 "cacheflush writes dirty pages to the WAL; a branch's pages never go there"
-                    .to_string(),
+                    .to_string().into(),
             ));
         }
         let wal = self
@@ -5364,7 +5364,7 @@ impl Pager {
         if self.branch.get().is_some() {
             return Err(LimboError::InvalidArgument(
                 "checkpoint is the trunk's WAL maintenance; run it on a trunk connection"
-                    .to_string(),
+                    .to_string().into(),
             ));
         }
         let Some(wal) = self.wal.as_ref() else {
@@ -6608,7 +6608,7 @@ impl Pager {
             if reserved_space != required_reserved_space {
                 return Err(LimboError::InvalidArgument(format!(
                     "page codec requires exactly {required_reserved_space} reserved bytes, but database provides {reserved_space}"
-                )));
+                ).into()));
             }
         } else {
             if let Some(page_size) = self.get_page_size() {
@@ -6618,7 +6618,7 @@ impl Pager {
                         required_reserved_space,
                         PageSize::MIN_USABLE_SPACE,
                         page_size.get()
-                    )));
+                    ).into()));
                 }
             }
             self.set_reserved_space(required_reserved_space);

@@ -1,3 +1,4 @@
+use crate::error::SqlErrorKind;
 use crate::schema::{BTreeTable, Trigger};
 use crate::sync::Arc;
 use crate::translate::expr::WalkControl;
@@ -445,7 +446,7 @@ fn rewrite_trigger_expr_single_for_subprogram(
                             );
                             return Ok(());
                         } else {
-                            crate::bail_parse_error!("no such column: {}.{}", ns, col);
+                            crate::bail_parse_error!(SqlErrorKind::UndefinedColumn; "no such column: {}.{}", ns, col);
                         }
                     }
                     // Handle NEW.rowid
@@ -457,7 +458,7 @@ fn rewrite_trigger_expr_single_for_subprogram(
                         );
                         return Ok(());
                     }
-                    bail_parse_error!("no such column: {}.{}", ns, col);
+                    bail_parse_error!(SqlErrorKind::UndefinedColumn; "no such column: {}.{}", ns, col);
                 } else {
                     bail_parse_error!(
                         "NEW references are only valid in INSERT and UPDATE triggers"
@@ -487,7 +488,7 @@ fn rewrite_trigger_expr_single_for_subprogram(
                             );
                             return Ok(());
                         } else {
-                            crate::bail_parse_error!("no such column: {}.{}", ns, col)
+                            crate::bail_parse_error!(SqlErrorKind::UndefinedColumn; "no such column: {}.{}", ns, col)
                         }
                     }
                     // Handle OLD.rowid
@@ -499,7 +500,7 @@ fn rewrite_trigger_expr_single_for_subprogram(
                         );
                         return Ok(());
                     }
-                    bail_parse_error!("no such column: {}.{}", ns, col);
+                    bail_parse_error!(SqlErrorKind::UndefinedColumn; "no such column: {}.{}", ns, col);
                 } else {
                     bail_parse_error!(
                         "OLD references are only valid in UPDATE and DELETE triggers"
@@ -1326,7 +1327,7 @@ fn rewrite_trigger_expr_single_for_when_clause(
             if table.get_column(&ident).is_some()
                 || ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(&ident))
             {
-                crate::bail_parse_error!("no such column: {}", ident);
+                crate::bail_parse_error!(SqlErrorKind::UndefinedColumn; "no such column: {}", ident);
             }
             return Ok(());
         }
@@ -1369,7 +1370,7 @@ fn rewrite_trigger_expr_single_for_when_clause(
                         );
                         return Ok(());
                     }
-                    bail_parse_error!("no such column in NEW: {}", col);
+                    bail_parse_error!(SqlErrorKind::UndefinedColumn; "no such column in NEW: {}", col);
                 } else {
                     bail_parse_error!(
                         "NEW references are only valid in INSERT and UPDATE triggers"
@@ -1397,7 +1398,7 @@ fn rewrite_trigger_expr_single_for_when_clause(
                         );
                         return Ok(());
                     }
-                    bail_parse_error!("no such column in OLD: {}", col);
+                    bail_parse_error!(SqlErrorKind::UndefinedColumn; "no such column in OLD: {}", col);
                 } else {
                     bail_parse_error!(
                         "OLD references are only valid in UPDATE and DELETE triggers"
@@ -1406,7 +1407,7 @@ fn rewrite_trigger_expr_single_for_when_clause(
             }
 
             if !allow_non_trigger_qualified {
-                bail_parse_error!("no such column: {ns}.{col}");
+                bail_parse_error!(SqlErrorKind::UndefinedColumn; "no such column: {ns}.{col}");
             }
         }
         _ => {}

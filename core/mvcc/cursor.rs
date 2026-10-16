@@ -1,3 +1,4 @@
+use crate::error::SqlErrorKind;
 use crate::alloc::{ConcurrentAllocator, TryReserveError, TursoAllocator};
 use crate::skiplist::{comparator::BasicComparator, map::Entry};
 use crate::turso_assert;
@@ -1490,7 +1491,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                             }
                         }
                     } else {
-                        crate::bail_parse_error!("Indexes without rowid are not supported in MVCC");
+                        crate::bail_parse_error!(SqlErrorKind::FeatureNotSupported; "Indexes without rowid are not supported in MVCC");
                     }
                 }
             },
