@@ -565,7 +565,7 @@ fn recover(cell: &str, built: &mut Built, opens: u64, out: &mut String) -> (Arc<
         // Class (b): a recovery window is the opening thread's and the threads the open spawned;
         // another thread that ran inside it makes it unattributable (`probe::end`).
         // L3 (probe-adversary-2): and no hold another thread made syscalls in (`held_unattributed`).
-        let held_ok = |m: &Map| m.get("held_unattributed") == Some(&0);
+        let held_ok = |m: &Sample| m.get("held_unattributed") == Some(&0);
         let open_ok = held_ok(&a);
         a.insert("quiet", u64::from(t0 == base && t_open == base && s_open.attributed_syscalls.is_some() && open_ok));
         line(out, cell, "recovery_open", r, &a);
