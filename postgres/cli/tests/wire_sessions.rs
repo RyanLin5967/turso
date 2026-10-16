@@ -13311,6 +13311,12 @@ fn c54_full_join_merged_columns_are_explicitly_unsupported() {
     }
     a.q("SELECT j1.i, j2.i FROM j1 FULL JOIN j2 ON j1.i = j2.i").ok("supported full join");
     a.q("SELECT * FROM j1 LEFT JOIN j2 USING(i)").ok("supported using");
+    a.q("INSERT INTO j1 VALUES(1); INSERT INTO j2 VALUES(2)").ok("unmatched join rows");
+    assert_eq!(a.q("SELECT * FROM j1 LEFT JOIN j2 USING(i)").single("left using value"), "1");
+    assert_eq!(a.q("SELECT * FROM j1 RIGHT JOIN j2 USING(i)").single("right using value"), "2");
+    assert_eq!(a.q("SELECT j1.i,j2.i FROM j1 FULL JOIN j2 ON j1.i=j2.i ORDER BY j1.i NULLS LAST")
+        .ok("full on unmatched values").rows,
+        vec![vec![Some("1".into()), None], vec![None, Some("2".into())]]);
 }
 
 #[test]
