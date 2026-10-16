@@ -177,7 +177,6 @@ fn diag_postgresql_route_refusals_by_depth() {
     }
 }
 
-
 /// PG 18.6 answers this statement: the protobuf codec must not add its own smaller limit.
 #[test]
 fn a_thousand_nested_scalar_subqueries_answer_one() {
@@ -187,7 +186,10 @@ fn a_thousand_nested_scalar_subqueries_answer_one() {
     let test = "stack_guard_tests::a_thousand_nested_scalar_subqueries_answer_one";
     let sql = format!("SELECT {}1{}", "(SELECT ".repeat(1000), ")".repeat(1000));
     let got = in_child(test, 8 * 1024, &sql);
-    assert_eq!(got, "ok [[Numeric(Integer(1))]]", "PG 18.6 answers 1 at depth 1000");
+    assert_eq!(
+        got, "ok [[Numeric(Integer(1))]]",
+        "PG 18.6 answers 1 at depth 1000"
+    );
 }
 
 #[test]
@@ -198,7 +200,10 @@ fn three_thousand_nested_scalar_subqueries_keep_the_stack_refusal() {
     let test = "stack_guard_tests::three_thousand_nested_scalar_subqueries_keep_the_stack_refusal";
     let sql = format!("SELECT {}1{}", "(SELECT ".repeat(3000), ")".repeat(3000));
     let got = in_child(test, 8 * 1024, &sql);
-    assert_eq!(got, "err StackDepthLimitExceeded", "PG 18.6 gives SQLSTATE 54001 at depth 3000");
+    assert_eq!(
+        got, "err StackDepthLimitExceeded",
+        "PG 18.6 gives SQLSTATE 54001 at depth 3000"
+    );
 }
 
 #[test]
@@ -209,7 +214,10 @@ fn ten_thousand_nested_scalar_subqueries_keep_the_parser_refusal() {
     let test = "stack_guard_tests::ten_thousand_nested_scalar_subqueries_keep_the_parser_refusal";
     let sql = format!("SELECT {}1{}", "(SELECT ".repeat(10000), ")".repeat(10000));
     let got = in_child(test, 8 * 1024, &sql);
-    assert!(got.starts_with("err ParseError(") && got.contains("memory exhausted"), "PG 18.6 gives SQLSTATE 42601 at depth 10000: {got}");
+    assert!(
+        got.starts_with("err ParseError(") && got.contains("memory exhausted"),
+        "PG 18.6 gives SQLSTATE 42601 at depth 10000: {got}"
+    );
 }
 
 /// A left-associated tree can grow while the shift/reduce parser's own stack stays small.
@@ -227,31 +235,75 @@ fn a_long_left_associated_expression_keeps_a_bounded_outcome() {
     );
 }
 
-
 #[test]
 fn a_deep_parse_tree_can_be_dropped_after_an_early_return() {
-    if run_child() { return; }
+    if run_child() {
+        return;
+    }
     let sql = format!("SELECT {}1{}", "(SELECT ".repeat(1000), ")".repeat(1000));
-    assert_eq!(in_child_phase("stack_guard_tests::a_deep_parse_tree_can_be_dropped_after_an_early_return", 256, &sql, Some("drop")), "ok parsed");
+    assert_eq!(
+        in_child_phase(
+            "stack_guard_tests::a_deep_parse_tree_can_be_dropped_after_an_early_return",
+            256,
+            &sql,
+            Some("drop")
+        ),
+        "ok parsed"
+    );
 }
 
 #[test]
 fn a_deep_parse_tree_keeps_its_parameter_metadata() {
-    if run_child() { return; }
+    if run_child() {
+        return;
+    }
     let sql = format!("SELECT {}$1{}", "(SELECT ".repeat(1000), ")".repeat(1000));
-    assert_eq!(in_child_phase("stack_guard_tests::a_deep_parse_tree_keeps_its_parameter_metadata", 256, &sql, Some("parameters")), "ok parameters [1]");
+    assert_eq!(
+        in_child_phase(
+            "stack_guard_tests::a_deep_parse_tree_keeps_its_parameter_metadata",
+            256,
+            &sql,
+            Some("parameters")
+        ),
+        "ok parameters [1]"
+    );
 }
 
 #[test]
 fn a_deep_parse_tree_can_be_deparsed() {
-    if run_child() { return; }
+    if run_child() {
+        return;
+    }
     let sql = format!("SELECT {}1{}", "(SELECT ".repeat(1000), ")".repeat(1000));
-    assert_eq!(in_child_phase("stack_guard_tests::a_deep_parse_tree_can_be_deparsed", 256, &sql, Some("deparse")), "ok deparsed 1001 selects");
+    assert_eq!(
+        in_child_phase(
+            "stack_guard_tests::a_deep_parse_tree_can_be_deparsed",
+            256,
+            &sql,
+            Some("deparse")
+        ),
+        "ok deparsed 1001 selects"
+    );
 }
 
 #[test]
 fn refusing_a_later_deep_sibling_safely_drops_the_completed_sibling() {
-    if run_child() { return; }
-    let sql = format!("SELECT {}1{}, {}1", "(SELECT ".repeat(1000), ")".repeat(1000), "1 + ".repeat(12000));
-    assert_eq!(in_child_phase("stack_guard_tests::refusing_a_later_deep_sibling_safely_drops_the_completed_sibling", 256, &sql, Some("drop")), "err StackDepthLimitExceeded");
+    if run_child() {
+        return;
+    }
+    let sql = format!(
+        "SELECT {}1{}, {}1",
+        "(SELECT ".repeat(1000),
+        ")".repeat(1000),
+        "1 + ".repeat(12000)
+    );
+    assert_eq!(
+        in_child_phase(
+            "stack_guard_tests::refusing_a_later_deep_sibling_safely_drops_the_completed_sibling",
+            256,
+            &sql,
+            Some("drop")
+        ),
+        "err StackDepthLimitExceeded"
+    );
 }

@@ -16,6 +16,7 @@ path = "lib.rs"
 
 [dependencies]
 pg_query = "6.1"
+prost = { version = "0.13", features = ["no-recursion-limit", "turso-stack-guard"] }
 miette = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

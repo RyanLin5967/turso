@@ -54,7 +54,7 @@ members = [
     "testing/differential-oracle/fuzzer",
     "testing/sqltest"
 ]
-exclude = ["perf/latency/limbo", "postgres/vendor/pgwire"]
+exclude = ["perf/latency/limbo", "postgres/vendor/pgwire", "postgres/vendor/prost"]
 
 default-members = [
     "bindings/java",
@@ -180,6 +180,7 @@ shuttle = { version = "0.8.1" }
 # pgwire 0.36.3, vendored for its frontend-message decoders: postgres/vendor/pgwire/VENDORED.md.
 [patch.crates-io]
 pgwire = { path = "postgres/vendor/pgwire" }
+prost = { path = "postgres/vendor/prost" }
 
 [profile.dev.package.similar]
 opt-level = 3

@@ -4797,11 +4797,10 @@ dependencies = [
 [[package]]
 name = "prost"
 version = "0.13.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2796faa41db3ec313a31f7624d9286acf277b52de526150b7e69f3debf891ee5"
 dependencies = [
  "bytes",
  "prost-derive 0.13.5",
+ "turso_stack_guard",
 ]
 
 [[package]]
@@ -7497,6 +7496,7 @@ dependencies = [
  "criterion",
  "miette",
  "pg_query",
+ "prost 0.13.5",
  "serde_json",
  "thiserror 2.0.16",
  "turso_parser",
