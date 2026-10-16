@@ -55,6 +55,8 @@ type StepResult = vdbe::StepResult;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StatementOrigin {
     Root,
+    /// Trusted engine metadata SQL with an ordinary root transaction lifecycle.
+    InternalRoot,
     InternalHelper,
     Subprogram,
 }
@@ -70,6 +72,10 @@ pub enum StatementStatusCounter {
 }
 
 impl StatementOrigin {
+    pub(crate) const fn is_root(self) -> bool {
+        matches!(self, Self::Root | Self::InternalRoot)
+    }
+
     pub(crate) const fn needs_nested_guard(self) -> bool {
         matches!(self, Self::InternalHelper)
     }
@@ -562,7 +568,7 @@ impl Statement {
     }
 
     fn _step(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
-        if !self.counted_as_active_root && matches!(self.origin, StatementOrigin::Root) {
+        if !self.counted_as_active_root && self.origin.is_root() {
             self.program.connection.start_root_statement()?;
             self.counted_as_active_root = true;
             // After the root count, so the checkpoint guard's subtraction
@@ -1742,6 +1748,74 @@ mod tests {
             Arc::new(SqliteDialect),
         )?;
         db.connect()
+    }
+
+    #[test]
+    fn c56_internal_metadata_keeps_root_lifecycle_and_reprepare_origin() -> crate::Result<()> {
+        let conn = open_test_connection()?;
+        let create = "CREATE TABLE __turso_internal_c56_metadata(v INTEGER)";
+        let drop_sql = "DROP TABLE __turso_internal_c56_metadata";
+        assert!(
+            conn.prepare(create).is_err(),
+            "ordinary CREATE accepted a reserved name"
+        );
+        let mut metadata = conn.prepare_internal_root(create)?;
+        assert!(!conn.is_nested_stmt());
+        conn.prepare("CREATE TABLE c56_other(v INTEGER)")?
+            .run_ignore_rows()?;
+        metadata.run_ignore_rows()?;
+        assert!(metadata.stmt_status(StatementStatusCounter::Reprepare) > 0);
+        assert!(conn.get_auto_commit());
+        assert_eq!(conn.n_active_root_statements.load(Ordering::SeqCst), 0);
+        assert!(
+            conn.prepare(drop_sql).is_err(),
+            "ordinary DROP accepted a reserved name"
+        );
+        assert!(conn
+            .current_schema()
+            .get_table("__turso_internal_c56_metadata")
+            .is_some());
+
+        conn.prepare("BEGIN")?.run_ignore_rows()?;
+        conn.prepare_internal_root(drop_sql)?.run_ignore_rows()?;
+        assert!(conn
+            .current_schema()
+            .get_table("__turso_internal_c56_metadata")
+            .is_none());
+        conn.prepare("ROLLBACK")?.run_ignore_rows()?;
+        assert!(conn
+            .current_schema()
+            .get_table("__turso_internal_c56_metadata")
+            .is_some());
+
+        conn.prepare("SAVEPOINT c56_metadata")?.run_ignore_rows()?;
+        conn.prepare_internal_root(drop_sql)?.run_ignore_rows()?;
+        conn.prepare("ROLLBACK TO c56_metadata")?
+            .run_ignore_rows()?;
+        assert!(conn
+            .current_schema()
+            .get_table("__turso_internal_c56_metadata")
+            .is_some());
+        conn.prepare("RELEASE c56_metadata")?.run_ignore_rows()?;
+        assert!(conn.get_auto_commit());
+
+        let mut reading = conn.prepare_internal_root("SELECT 1")?;
+        assert!(matches!(reading.step()?, StepResult::Row));
+        assert_eq!(conn.n_active_root_statements.load(Ordering::SeqCst), 1);
+        assert!(!conn.is_nested_stmt());
+        drop(reading);
+        assert_eq!(conn.n_active_root_statements.load(Ordering::SeqCst), 0);
+        let mut stale_drop = conn.prepare_internal_root(drop_sql)?;
+        conn.prepare_internal_root(drop_sql)?.run_ignore_rows()?;
+        assert!(stale_drop.run_ignore_rows().is_err());
+        assert_eq!(conn.n_active_root_statements.load(Ordering::SeqCst), 0);
+        assert!(!conn.is_nested_stmt());
+        assert!(conn.prepare(create).is_err());
+        assert!(conn
+            .current_schema()
+            .get_table("__turso_internal_c56_metadata")
+            .is_none());
+        Ok(())
     }
 
     #[test]

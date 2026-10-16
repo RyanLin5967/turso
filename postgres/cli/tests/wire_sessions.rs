@@ -12095,13 +12095,19 @@ mod recorded {
 
     #[test]
     fn c56_audit1_schema_reset_matches_pg18_replies() {
-        let recording = include_str!("pg18/pg18-audit1-lib-parameters_decode_at_postgresqls_edges.out");
+        let recording =
+            include_str!("pg18/pg18-audit1-lib-parameters_decode_at_postgresqls_edges.out");
         let commands = parse(recording);
         let command = &commands[0];
         let dir = Scratch::new("c56-audit1-schema-reset");
         let server = Server::start(&dir.db(), &[]);
         let got = send(&mut server.connect(), &mut Vec::new(), &command.text);
-        assert!(same(&command.want, &got), "{}\nPG: {:?}\nours: {got:?}", command.text, command.want);
+        assert!(
+            same(&command.want, &got),
+            "{}\nPG: {:?}\nours: {got:?}",
+            command.text,
+            command.want
+        );
     }
 
     #[test]
@@ -12114,7 +12120,12 @@ mod recorded {
         for (i, command) in commands.iter().enumerate() {
             let got = send(&mut wire, &mut Vec::new(), &command.text);
             if !same(&command.want, &got) {
-                report.push_str(&format!("#{} {}\nPG: {:?}\nours: {got:?}\n", i + 1, command.text, command.want));
+                report.push_str(&format!(
+                    "#{} {}\nPG: {:?}\nours: {got:?}\n",
+                    i + 1,
+                    command.text,
+                    command.want
+                ));
             }
         }
         assert!(report.is_empty(), "{report}");
@@ -12137,14 +12148,24 @@ mod recorded {
                 (&mut server.connect(), absent_namespace),
             ] {
                 let got = send(wire, &mut Vec::new(), &command.text);
-                assert!(same(&command.want, &got), "{}\nPG: {:?}\nours: {got:?}", command.text, command.want);
+                assert!(
+                    same(&command.want, &got),
+                    "{}\nPG: {:?}\nours: {got:?}",
+                    command.text,
+                    command.want
+                );
             }
         }
         let server = Server::start(&dir.db(), &[]);
         let mut wire = server.connect();
         for command in [absent_namespace, create_schema] {
             let got = send(&mut wire, &mut Vec::new(), &command.text);
-            assert!(same(&command.want, &got), "{}\nPG: {:?}\nours: {got:?}", command.text, command.want);
+            assert!(
+                same(&command.want, &got),
+                "{}\nPG: {:?}\nours: {got:?}",
+                command.text,
+                command.want
+            );
         }
     }
 

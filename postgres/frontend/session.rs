@@ -9,11 +9,11 @@ use crate::result_types::StatementTypes;
 use turso_core::{Connection, LimboError, PrepareOptions, Result, Statement, Value};
 use turso_parser::ast::{self};
 use turso_pg_parser::translator::{
-    is_checkpoint, is_comment_on, is_refresh_matview, try_extract_add_constraints,
-    try_extract_branch_call, try_extract_copy_from, try_extract_create_schema,
-    try_extract_drop_objects, try_extract_drop_schema, try_extract_set, try_extract_show,
-    PgAddConstraints, PgBranchArg, PgBranchCall, PgCopyFromStmt, PgCreateSchemaStmt, PgDropKind,
-    PgDropObjectsStmt, PgDropSchemaStmt, PgSetStmt, PgSetValue,
+    extract_drop_objects, is_checkpoint, is_comment_on, is_refresh_matview,
+    try_extract_add_constraints, try_extract_branch_call, try_extract_copy_from,
+    try_extract_create_schema, try_extract_drop_objects, try_extract_drop_schema, try_extract_set,
+    try_extract_show, PgAddConstraints, PgBranchArg, PgBranchCall, PgCopyFromStmt,
+    PgCreateSchemaStmt, PgDropKind, PgDropObjectsStmt, PgDropSchemaStmt, PgSetStmt, PgSetValue,
     PgShowStmt, PostgreSQLTranslator, BRANCH_FUNCTION_PREFIX,
 };
 
@@ -1160,6 +1160,7 @@ fn prepare_statement_parsed(
     if let Some(n) = first_param.filter(|_| performs) {
         return Err(parameter_refused(n));
     }
+    validate_schema_references(pg_conn, &parse_result)?;
     if let Some(stmt) = try_prepare_special(pg_conn, special)? {
         return Ok(Some(stmt));
     }
@@ -1409,7 +1410,7 @@ fn try_prepare_special(
         Special::Set(set_stmt) => handle_pg_set(pg_conn, &set_stmt)?,
         Special::Show(show_stmt) => handle_pg_show(pg_conn, &show_stmt)?,
         Special::CreateSchema(stmt) => {
-            handle_pg_create_schema(&pg_conn.conn, &stmt)?;
+            handle_pg_create_schema(pg_conn, &stmt)?;
             noop_statement(&pg_conn.conn)?
         }
         Special::DropSchema(stmt) => {
@@ -1797,24 +1798,31 @@ fn handle_pg_show(pg_conn: &Arc<PgConnectionInner>, show: &PgShowStmt) -> Result
     ))
 }
 
-fn handle_pg_create_schema(conn: &Arc<Connection>, stmt: &PgCreateSchemaStmt) -> Result<()> {
+fn handle_pg_create_schema(
+    pg_conn: &Arc<PgConnectionInner>,
+    stmt: &PgCreateSchemaStmt,
+) -> Result<()> {
+    let conn = &pg_conn.conn;
     let name = stmt.name.to_lowercase();
-    if name == "public" {
-        if stmt.if_not_exists {
-            return Ok(());
-        }
-        return Err(LimboError::ParseError(format!(
-            "schema \"{name}\" already exists"
-        ).into()));
-    }
-
     if schema_exists(conn, &name)? {
         if stmt.if_not_exists {
+            pg_conn.warnings.lock().push((
+                "NOTICE",
+                "42P06",
+                format!("schema \"{name}\" already exists, skipping"),
+            ));
             return Ok(());
         }
-        return Err(LimboError::ParseError(format!(
-            "schema \"{name}\" already exists"
-        ).into()));
+        return Err(schema_diagnostic(
+            SqlErrorKind::DuplicateSchema,
+            format!("schema \"{name}\" already exists"),
+        ));
+    }
+    if name == "public" {
+        return own_transaction(pg_conn, "__turso_create_schema", "CREATE SCHEMA", || {
+            conn.prepare_internal_root(format!("DROP TABLE {PUBLIC_SCHEMA_DROPPED}"))?
+                .run_ignore_rows()
+        });
     }
 
     let path = schema_file_path(conn, &name);
@@ -1822,6 +1830,111 @@ fn handle_pg_create_schema(conn: &Arc<Connection>, stmt: &PgCreateSchemaStmt) ->
         conn,
         format!("ATTACH '{}' AS \"{}\"", path.replace('\'', "''"), name),
     )?;
+    Ok(())
+}
+
+fn validate_schema_references(
+    pg_conn: &Arc<PgConnectionInner>,
+    parse: &turso_pg_parser::pg_query::ParseResult,
+) -> Result<()> {
+    use turso_pg_parser::{
+        pg_query::{protobuf::node::Node, NodeRef},
+        SchemaQualifier,
+    };
+    let conn = &pg_conn.conn;
+    let exists = |name: &str| match turso_pg_parser::schema_qualifier(name) {
+        SchemaQualifier::Main => public_schema_exists(conn),
+        SchemaQualifier::PgCatalog | SchemaQualifier::InformationSchema => true,
+        SchemaQualifier::Attached(name) => conn.attached_database_names().iter().any(|n| n == name),
+        SchemaQualifier::Unqualified => true,
+    };
+    let nodes = parse.protobuf.nodes();
+    let target = nodes.first().and_then(|(node, ..)| match node {
+        NodeRef::CreateStmt(s) => s.relation.as_ref(),
+        NodeRef::ViewStmt(s) => s.view.as_ref(),
+        NodeRef::IndexStmt(s) => s.relation.as_ref(),
+        NodeRef::CreateSeqStmt(s) => s.sequence.as_ref(),
+        NodeRef::CreateTableAsStmt(s) => s.into.as_ref().and_then(|into| into.rel.as_ref()),
+        NodeRef::SelectStmt(s) => s.into_clause.as_ref().and_then(|into| into.rel.as_ref()),
+        _ => None,
+    });
+    let is_index = nodes
+        .first()
+        .is_some_and(|(node, ..)| matches!(node, NodeRef::IndexStmt(_)));
+    let creation = target
+        .map(|target| (target.schemaname.as_str(), target.relpersistence == "t"))
+        .or_else(|| {
+            let names = match nodes.first()?.0 {
+                NodeRef::CreateEnumStmt(stmt) => &stmt.type_name,
+                NodeRef::CreateDomainStmt(stmt) => &stmt.domainname,
+                _ => return None,
+            };
+            let schema = if names.len() > 1 {
+                match names[names.len() - 2].node.as_ref()? {
+                    Node::String(name) => name.sval.as_str(),
+                    _ => return None,
+                }
+            } else {
+                ""
+            };
+            Some((schema, false))
+        });
+    if let Some((schema, temporary)) = creation {
+        if !schema.is_empty() && !exists(schema) {
+            return Err(schema_diagnostic(
+                SqlErrorKind::InvalidSchemaName,
+                format!("schema \"{schema}\" does not exist"),
+            ));
+        }
+        if !is_index && schema.is_empty() && !temporary {
+            let path = pg_conn.session_state.lock().search_path.clone();
+            let has_schema = if path.is_empty() {
+                public_schema_exists(conn)
+            } else {
+                path.iter().any(|name| exists(name))
+            };
+            if !has_schema {
+                return Err(schema_diagnostic(
+                    SqlErrorKind::InvalidSchemaName,
+                    "no schema has been selected to create in".to_string(),
+                ));
+            }
+        }
+    }
+    if let Some(drop) = extract_drop_objects(parse).filter(|drop| !drop.missing_ok) {
+        for (schema, name) in drop.objects {
+            if let Some(schema) = schema.filter(|schema| !exists(schema)) {
+                let schema = if schema == "main" { "public" } else { &schema };
+                return Err(schema_diagnostic(
+                    SqlErrorKind::InvalidSchemaName,
+                    format!("schema \"{schema}\" does not exist"),
+                ));
+            }
+            if name.eq_ignore_ascii_case(PUBLIC_SCHEMA_DROPPED) {
+                return Err(schema_diagnostic(
+                    SqlErrorKind::UndefinedTable,
+                    format!("{} \"{name}\" does not exist", drop.kind.word()),
+                ));
+            }
+        }
+    }
+    for (node, ..) in nodes {
+        if let NodeRef::RangeVar(relation) = node {
+            if relation.relname.eq_ignore_ascii_case(PUBLIC_SCHEMA_DROPPED)
+                || (!relation.schemaname.is_empty() && !exists(&relation.schemaname))
+            {
+                let name = if relation.schemaname.is_empty() {
+                    relation.relname.clone()
+                } else {
+                    format!("{}.{}", relation.schemaname, relation.relname)
+                };
+                return Err(schema_diagnostic(
+                    SqlErrorKind::UndefinedTable,
+                    format!("relation \"{name}\" does not exist"),
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1841,27 +1954,36 @@ fn schema_file_path(conn: &Connection, schema_name: &str) -> String {
 fn handle_pg_drop_schema(pg_conn: &Arc<PgConnectionInner>, stmt: &PgDropSchemaStmt) -> Result<()> {
     let conn = &pg_conn.conn;
     let name = stmt.name.to_lowercase();
-    if name == "public" {
-        return handle_pg_drop_schema_public(conn, stmt.cascade);
-    }
-
     if !schema_exists(conn, &name)? {
         if stmt.if_exists {
-            // PostgreSQL's notice for the missing schema (recorded, pg18-c53-dropnotice.out).
             skipping_notice(pg_conn, "schema", &stmt.name);
             return Ok(());
         }
-        return Err(LimboError::ParseError(format!(
-            "schema \"{name}\" does not exist"
-        ).into()));
+        return Err(schema_diagnostic(
+            SqlErrorKind::InvalidSchemaName,
+            format!("schema \"{name}\" does not exist"),
+        ));
     }
-
-    if stmt.cascade {
-        drop_all_tables_in_schema(conn, &name)?;
+    if name == "public" {
+        return own_transaction(pg_conn, "__turso_drop_schema", "DROP SCHEMA", || {
+            drop_schema_relations(pg_conn, &name, None, stmt.cascade)?;
+            // The marker is ordinary transactional schema state, so rollback, other connections,
+            // reopen and branch snapshots all use the same persisted authority.
+            conn.prepare_internal_root(format!(
+                "CREATE TABLE {PUBLIC_SCHEMA_DROPPED}(unused INTEGER)"
+            ))?
+            .run_ignore_rows()
+        });
     }
-
+    drop_schema_relations(pg_conn, &name, Some(&name), stmt.cascade)?;
     execute_sqlite_internal(conn, format!("DETACH \"{name}\""))?;
     Ok(())
+}
+
+fn schema_diagnostic(kind: SqlErrorKind, message: String) -> LimboError {
+    LimboError::ParseError(
+        SqlErrorMessage::classified(kind, message.clone()).with_protocol_text(message),
+    )
 }
 
 /// PostgreSQL's NOTICE for an object DROP ... IF EXISTS did not find: `<kind> "<name>" does not
@@ -1888,16 +2010,28 @@ fn handle_pg_drop_objects(pg_conn: &Arc<PgConnectionInner>, stmt: &PgDropObjects
     let quote = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
     let mut found = Vec::with_capacity(stmt.objects.len());
     for (schema, name) in &stmt.objects {
-        if let Some(schema) = schema.as_deref().filter(|s| *s != "main") {
+        if let Some(schema) = schema.as_deref() {
+            let schema = if schema == "main" { "public" } else { schema };
             if !schema_exists(conn, schema)? {
                 if stmt.missing_ok {
                     skipping_notice(pg_conn, "schema", schema);
                     continue;
                 }
-                return Err(LimboError::ParseError(format!(
-                    "schema \"{schema}\" does not exist"
-                ).into()));
+                return Err(schema_diagnostic(
+                    SqlErrorKind::InvalidSchemaName,
+                    format!("schema \"{schema}\" does not exist"),
+                ));
             }
+        }
+        if name.eq_ignore_ascii_case(PUBLIC_SCHEMA_DROPPED) {
+            if stmt.missing_ok {
+                skipping_notice(pg_conn, stmt.kind.word(), name);
+                continue;
+            }
+            return Err(schema_diagnostic(
+                SqlErrorKind::UndefinedTable,
+                format!("{} \"{name}\" does not exist", stmt.kind.word()),
+            ));
         }
         // A type is named unqualified in the engine (the translator's DROP TYPE kept the last name).
         let unqualified = matches!(stmt.kind, PgDropKind::Type | PgDropKind::Domain);
@@ -1972,25 +2106,37 @@ fn drop_refused_as_missing(kind: PgDropKind, e: &LimboError) -> bool {
     }
 }
 
-fn handle_pg_drop_schema_public(conn: &Arc<Connection>, cascade: bool) -> Result<()> {
-    let table_names = list_user_tables(conn, None)?;
-    if !cascade && !table_names.is_empty() {
-        return Err(LimboError::ParseError(
-            "cannot drop schema \"public\" because other objects depend on it".to_string().into(),
+fn drop_schema_relations(
+    pg_conn: &Arc<PgConnectionInner>,
+    name: &str,
+    database: Option<&str>,
+    cascade: bool,
+) -> Result<()> {
+    let objects = list_schema_objects(&pg_conn.conn, database)?;
+    if !cascade && !objects.is_empty() {
+        return Err(schema_diagnostic(
+            SqlErrorKind::DependentObjectsStillExist,
+            format!("cannot drop schema {name} because other objects depend on it"),
         ));
     }
-
-    for table_name in table_names {
-        let mut stmt = conn.prepare(format!("DROP TABLE \"{table_name}\""))?;
-        stmt.run_ignore_rows()?;
+    let notice = match objects.as_slice() {
+        [] => None,
+        [(kind, object)] => Some(format!(
+            "drop cascades to {kind} {}",
+            turso_pg_parser::quote_identifier(object),
+        )),
+        _ => Some(format!("drop cascades to {} other objects", objects.len())),
+    };
+    for (kind, object) in objects {
+        let quote = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+        let object = match database {
+            Some(database) => format!("{}.{}", quote(database), quote(&object)),
+            None => quote(&object),
+        };
+        execute_root(&pg_conn.conn, format!("DROP {kind} {object}"))?;
     }
-    Ok(())
-}
-
-fn drop_all_tables_in_schema(conn: &Arc<Connection>, schema_name: &str) -> Result<()> {
-    for table_name in list_user_tables(conn, Some(schema_name))? {
-        let mut stmt = conn.prepare(format!("DROP TABLE \"{schema_name}\".\"{table_name}\"",))?;
-        stmt.run_ignore_rows()?;
+    if let Some(notice) = notice {
+        pg_conn.warnings.lock().push(("NOTICE", "00000", notice));
     }
     Ok(())
 }
@@ -3070,24 +3216,84 @@ fn get_table_columns(
         .collect())
 }
 
-fn list_user_tables(conn: &Arc<Connection>, schema_name: Option<&str>) -> Result<Vec<String>> {
-    let filter = "type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso_internal_%'";
-    let sql = match schema_name {
-        Some(name) => format!("SELECT name FROM \"{name}\".sqlite_schema WHERE {filter}"),
-        None => format!("SELECT name FROM sqlite_schema WHERE {filter}"),
+fn list_schema_objects(
+    conn: &Arc<Connection>,
+    database: Option<&str>,
+) -> Result<Vec<(String, String)>> {
+    let filter = "type IN ('table', 'view')";
+    let catalog = match database {
+        Some(name) => format!("\"{}\".sqlite_schema", name.replace('"', "\"\"")),
+        None => "sqlite_schema".to_string(),
     };
+    let sql = format!("SELECT type, name FROM {catalog} WHERE {filter} ORDER BY CASE type WHEN 'view' THEN 0 ELSE 1 END, rowid DESC");
     let mut stmt = conn.prepare_internal(&sql)?;
     let rows = stmt.run_collect_rows()?;
-    Ok(rows
+    let mut objects: Vec<_> = rows
         .into_iter()
-        .filter_map(|row| match row.first() {
-            Some(Value::Text(t)) => Some(t.as_str().to_string()),
+        .filter_map(|row| match (row.first(), row.get(1)) {
+            (Some(Value::Text(kind)), Some(Value::Text(name)))
+                if !name.as_str().starts_with("sqlite_")
+                    && !name.as_str().starts_with("__turso_internal_") =>
+            {
+                Some((kind.as_str().to_string(), name.as_str().to_string()))
+            }
             _ => None,
         })
-        .collect())
+        .collect();
+    if database.is_none() {
+        let schema = conn.current_schema();
+        let mut sequences: Vec<_> = schema
+            .sequences
+            .keys()
+            .filter(|name| !name.starts_with("__turso_internal_"))
+            .cloned()
+            .collect();
+        sequences.sort();
+        objects.extend(
+            sequences
+                .into_iter()
+                .map(|name| ("sequence".to_string(), name)),
+        );
+        let mut types: Vec<_> = schema
+            .type_registry
+            .values()
+            .filter(|definition| !definition.is_builtin)
+            .collect();
+        types.sort_by(|a, b| a.name.cmp(&b.name));
+        while !types.is_empty() {
+            let index = types
+                .iter()
+                .position(|definition| !types.iter().any(|other| other.base() == definition.name))
+                .ok_or_else(|| {
+                    LimboError::InternalError("cycle in schema type dependencies".to_string())
+                })?;
+            let definition = types.remove(index);
+            objects.push((
+                if definition.is_domain {
+                    "domain"
+                } else {
+                    "type"
+                }
+                .to_string(),
+                definition.name.clone(),
+            ));
+        }
+    }
+    Ok(objects)
+}
+
+pub(crate) const PUBLIC_SCHEMA_DROPPED: &str = "__turso_internal_pg_public_dropped";
+
+pub(crate) fn public_schema_exists(conn: &Connection) -> bool {
+    conn.current_schema()
+        .get_table(PUBLIC_SCHEMA_DROPPED)
+        .is_none()
 }
 
 fn schema_exists(conn: &Arc<Connection>, schema_name: &str) -> Result<bool> {
+    if schema_name == "public" {
+        return Ok(public_schema_exists(conn));
+    }
     let sql = format!(
         "SELECT 1 FROM pragma_database_list WHERE name = '{}'",
         schema_name.replace('\'', "''")

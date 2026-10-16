@@ -1029,6 +1029,16 @@ impl Connection {
         self.prepare_with_origin(sql, StatementOrigin::Root)
     }
 
+    /// Prepare trusted metadata SQL as a root statement. Unlike `prepare_internal`, this
+    /// opens its own read/write transaction and does not require a running parent statement.
+    #[doc(hidden)]
+    pub fn prepare_internal_root(
+        self: &Arc<Connection>,
+        sql: impl AsRef<str>,
+    ) -> Result<Statement> {
+        self.prepare_with_origin(sql, StatementOrigin::InternalRoot)
+    }
+
     #[doc(hidden)]
     pub fn prepare_internal(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
         self.prepare_with_origin(sql, StatementOrigin::InternalHelper)

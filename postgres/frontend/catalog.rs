@@ -331,7 +331,8 @@ pub(crate) fn user_tables_sorted(schema: &Schema) -> Vec<(&String, &Arc<Table>)>
         .iter()
         .filter(|(name, table)| {
             // Skip system tables
-            if name.starts_with("sqlite_")
+            if name.as_str() == crate::session::PUBLIC_SCHEMA_DROPPED
+                || name.starts_with("sqlite_")
                 || name.starts_with("pg_")
                 || name.starts_with("pragma_")
                 || name.starts_with("json_")
@@ -744,6 +745,10 @@ impl PgNamespaceCursor {
                 Value::Null,                              // nspacl
             ],
         ];
+
+        if !crate::session::public_schema_exists(&self.conn) {
+            self.rows.retain(|row| row[0] != Value::from_i64(2200));
+        }
 
         // Add attached schemas (CREATE SCHEMA creates attached databases)
         let schema_names = self.conn.attached_database_names();
@@ -3448,7 +3453,8 @@ impl PgGetTableDefCursor {
 
         for (table_name, table) in &schema.tables {
             // Skip system tables
-            if table_name.starts_with("sqlite_")
+            if table_name.as_str() == crate::session::PUBLIC_SCHEMA_DROPPED
+                || table_name.starts_with("sqlite_")
                 || table_name == "sqlite_master"
                 || table_name == "sqlite_schema"
             {

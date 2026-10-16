@@ -120,7 +120,11 @@ pub fn translate(
         // Engine-generated helper statements are always SQLite text and
         // must resolve functions with SQLite semantics regardless of the
         // database's dialect — the same invariant as unmarked schema rows.
-        if matches!(origin, crate::statement::StatementOrigin::InternalHelper) {
+        if matches!(
+            origin,
+            crate::statement::StatementOrigin::InternalHelper
+                | crate::statement::StatementOrigin::InternalRoot
+        ) {
             Arc::new(crate::dialect::SqliteDialect) as Arc<dyn crate::dialect::Dialect>
         } else {
             connection.dialect()
@@ -142,7 +146,14 @@ pub fn translate(
                 &mut program,
             )?;
         }
-        stmt => translate_inner(stmt, &mut resolver, &mut program, &connection, input)?,
+        stmt => translate_inner(
+            stmt,
+            &mut resolver,
+            &mut program,
+            &connection,
+            input,
+            origin,
+        )?,
     };
 
     program.epilogue(schema);
@@ -160,6 +171,7 @@ pub fn translate_inner(
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
     input: &str,
+    origin: crate::statement::StatementOrigin,
 ) -> Result<()> {
     let is_write = matches!(
         stmt,
@@ -247,6 +259,7 @@ pub fn translate_inner(
             program,
             connection,
             input,
+            origin == crate::statement::StatementOrigin::InternalRoot,
         )?,
         ast::Stmt::CreateTrigger {
             temporary,
@@ -348,7 +361,14 @@ pub fn translate_inner(
         ast::Stmt::DropTable {
             if_exists,
             tbl_name,
-        } => translate_drop_table(tbl_name, resolver, if_exists, program, connection)?,
+        } => translate_drop_table(
+            tbl_name,
+            resolver,
+            if_exists,
+            program,
+            connection,
+            origin == crate::statement::StatementOrigin::InternalRoot,
+        )?,
         ast::Stmt::DropTrigger {
             if_exists,
             trigger_name,
