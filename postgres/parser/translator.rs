@@ -3101,6 +3101,15 @@ impl PostgreSQLTranslator {
         join_expr: &pg_query::protobuf::JoinExpr,
         joins: &mut Vec<ast::JoinedSelectTable>,
     ) -> Result<ast::SelectTable, ParseError> {
+        // FULL needs the engine's hash join, which cannot merge USING/NATURAL columns.
+        if join_expr.jointype() == PgJoinType::JoinFull
+            && (join_expr.is_natural || !join_expr.using_clause.is_empty())
+        {
+            return Err(ParseError::ParseError(SqlErrorMessage::classified(
+                SqlErrorKind::FeatureNotSupported,
+                "FULL JOIN with USING or NATURAL is not supported",
+            )));
+        }
         // Recursively process the left side
         let primary_table = if let Some(larg) = &join_expr.larg {
             match &larg.node {
