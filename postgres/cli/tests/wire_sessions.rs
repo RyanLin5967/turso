@@ -1061,11 +1061,19 @@ fn a_domain_check_failure_is_23514_with_postgresqls_message_on_every_path() {
 /// domain with its underlying type's casts (CREATE CAST: "Casting to or from a domain uses the casts
 /// associated with its underlying type"), so CAST(10 AS dt) is the text '10', which passes CHECK
 /// (VALUE >= '0') and sorts above '9'. The CAST was a no-op, so the integer 10 failed that CHECK
-/// (an integer sorts below every text) and sorted below 9 (review of 96b69304b, F4). Over bytea a
-/// non-text source is refused as PostgreSQL refuses it, 42846 "cannot cast type integer to
-/// bytea"; a text source is not.
+/// (an integer sorts below every text) and sorted below 9 (review of 96b69304b, F4).
+///
+/// Over bytea, PostgreSQL 18 casts an integer as its big-endian two's complement at its type's
+/// width (int2 2 bytes, int4 4, int8 8; a literal is int4 if it fits, else int8): the three
+/// conversions of the PG 18 regression expected output (postgres/conformance/upstream/strings.out,
+/// "conversions between bytea and integer types"), a domain over bytea, and int2/int4/int8 columns.
+/// numeric, float and boolean sources are refused 42846, naming the source's type.
+///
+/// LEAD-RULED SPEC CHANGE, FLAGGED (DECISIONS 60ddcb6f8f, reversing cc4653c2d3's bytea half): this
+/// test first asserted 42846 for CAST(10 AS bytea) and CAST(10 AS dby), a premise PG 18 does not
+/// hold; those rows now carry strings.out's values, and the non-integer refusal rows stay.
 #[test]
-fn a_cast_to_a_type_over_text_converts_and_over_bytea_refuses_a_non_text_source() {
+fn a_cast_to_a_type_over_text_converts_and_over_bytea_encodes_an_integer() {
     let dir = Scratch::new("castbase");
     let server = Server::start(&dir.db(), &[]);
     let mut a = server.connect();
@@ -1075,13 +1083,40 @@ fn a_cast_to_a_type_over_text_converts_and_over_bytea_refuses_a_non_text_source(
     let sql = "SELECT x FROM (SELECT CAST(10 AS du) AS x UNION ALL SELECT CAST(9 AS du) AS x) s ORDER BY x";
     let rows = a.q(sql).ok(sql).rows;
     assert_eq!(rows, vec![vec![Some("10".to_string())], vec![Some("9".to_string())]], "{sql}");
-    for sql in ["SELECT CAST(10 AS bytea)", "SELECT CAST(1.5 AS bytea)"] {
+    // strings.out, conversions between bytea and integer types (PG 18 expected output).
+    let row = |a: &mut Wire, sql: &str| -> Vec<Option<String>> {
+        let rows = a.q(sql).ok(sql).rows;
+        assert_eq!(rows.len(), 1, "{sql}: {rows:?}");
+        rows[0].clone()
+    };
+    let s = |v: &[&str]| v.iter().map(|x| Some(x.to_string())).collect::<Vec<_>>();
+    assert_eq!(row(&mut a, "SELECT 0x1234::int2::bytea, (-0x1234)::int2::bytea"), s(&["\\x1234", "\\xedcc"]));
+    assert_eq!(row(&mut a, "SELECT 0x12345678::int4::bytea, (-0x12345678)::int4::bytea"), s(&["\\x12345678", "\\xedcba988"]));
+    assert_eq!(
+        row(&mut a, "SELECT 0x1122334455667788::int8::bytea, (-0x1122334455667788)::int8::bytea"),
+        s(&["\\x1122334455667788", "\\xeeddccbbaa998878"])
+    );
+    // A literal is int4 when it fits, int8 when only that fits.
+    assert_eq!(row(&mut a, "SELECT CAST(10 AS bytea), CAST(4294967296 AS bytea)"), s(&["\\x0000000a", "\\x0000000100000000"]));
+    a.q("CREATE DOMAIN dby AS bytea").ok("CREATE DOMAIN dby");
+    assert_eq!(row(&mut a, "SELECT CAST(10 AS dby)"), s(&["\\x0000000a"]));
+    a.q("CREATE TABLE tib(a int2, b int4, c int8)").ok("CREATE TABLE tib");
+    a.q("INSERT INTO tib VALUES (4660, -305419896, 1234605616436508552)").ok("INSERT INTO tib");
+    assert_eq!(
+        row(&mut a, "SELECT a::bytea, b::bytea, c::bytea FROM tib"),
+        s(&["\\x1234", "\\xedcba988", "\\x1122334455667788"])
+    );
+    // numeric, float and boolean have no cast to bytea in PG 18: 42846, naming the source's type.
+    for (sql, source) in [
+        ("SELECT CAST(1.5 AS bytea)", "numeric"),
+        ("SELECT CAST(1.5::float8 AS bytea)", "double precision"),
+        ("SELECT CAST(true AS bytea)", "boolean"),
+        ("SELECT CAST(1.5 AS dby)", "numeric"),
+    ] {
         let e = a.q(sql).err(sql);
         assert_eq!(e.code, "42846", "{sql}: {e:?}");
+        assert!(e.message.starts_with(&format!("cannot cast type {source} to ")), "{sql}: {e:?}");
     }
-    a.q("CREATE DOMAIN dby AS bytea").ok("CREATE DOMAIN dby");
-    let e = a.q("SELECT CAST(10 AS dby)").err("SELECT CAST(10 AS dby)");
-    assert_eq!(e.code, "42846", "SELECT CAST(10 AS dby): {e:?}");
     // Control: a text source to bytea is no refusal.
     a.q("SELECT CAST('ab' AS bytea)").ok("SELECT CAST('ab' AS bytea)");
 }

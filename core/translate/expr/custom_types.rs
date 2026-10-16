@@ -1219,10 +1219,19 @@ mod tests {
     }
 
     /// A CAST to a BASE-only type over text (not a domain) converts to text, as PostgreSQL 18 casts
-    /// by the underlying type; over blob (bytea) a numeric source is refused, 42846 (CannotCoerce),
-    /// and a text source is not (review of 96b69304b, F4: the CAST was a no-op).
+    /// by the underlying type (review of 96b69304b, F4: the CAST was a no-op). FLAGGED: a change
+    /// the SQLite dialect sees too, for a custom type over text only (custom types are opt-in).
+    ///
+    /// Over bytea the SQLite dialect keeps SQLite's CAST unchanged (integrate-reviewer-2 L3; lead
+    /// DECISIONS 60ddcb6f8f): a number stays the number, as sqlite3 3.51.0 answers `SELECT
+    /// typeof(CAST(10 AS bytea)), CAST(10 AS bytea), typeof(CAST(1.5 AS bytea))` with
+    /// `integer|10|real` (/usr/bin/sqlite3, 2026-10-16). PostgreSQL 18's integer-to-bytea encoding
+    /// and its 42846 refusals are the PostgreSQL dialect's, asserted over the wire
+    /// (wire_sessions a_cast_to_a_type_over_text_converts_and_over_bytea_encodes_an_integer).
+    /// LEAD-RULED SPEC CHANGE, FLAGGED (DECISIONS 60ddcb6f8f): this test first asserted 42846 for
+    /// integer sources here, the reversed premise.
     #[test]
-    fn a_cast_to_a_base_only_type_over_text_converts_and_over_blob_refuses_a_number() {
+    fn a_cast_to_a_base_only_type_over_text_converts_and_over_blob_keeps_sqlites_cast() {
         let conn = open();
         conn.execute("CREATE TYPE ttext(value text) BASE text").unwrap();
         let rows = conn
@@ -1231,14 +1240,15 @@ mod tests {
             .run_collect_rows()
             .unwrap();
         assert_eq!(rows, vec![vec![Value::build_text("text"), Value::build_text("10")]]);
-        for sql in ["SELECT CAST(10 AS bytea)", "SELECT CAST(1.5 AS bytea)", "SELECT CAST(CAST('1' AS integer) AS bytea)"] {
-            let got = conn.prepare(sql).and_then(|mut s| s.run_collect_rows());
-            assert!(
-                matches!(&got, Err(e) if format!("{:?}", e.sql_error_kind()) == "CannotCoerce"),
-                "{sql}: {got:?}"
-            );
-        }
-        conn.prepare("SELECT CAST('ab' AS bytea)").unwrap().run_collect_rows().unwrap();
+        let rows = conn
+            .prepare("SELECT typeof(CAST(10 AS bytea)), CAST(10 AS bytea), typeof(CAST(1.5 AS bytea))")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![vec![Value::build_text("integer"), Value::from_i64(10), Value::build_text("real")]]
+        );
     }
 
     /// Engine review 20 item 9: 1d8bf442e's catch region covered only types with a function '=', so
