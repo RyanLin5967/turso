@@ -13250,3 +13250,18 @@ fn c54_sqlite_functions_are_undefined_in_postgresql() {
     }
     assert_eq!(a.q("SELECT coalesce(NULL, 2)").single("PG function"), "2");
 }
+
+#[test]
+fn c54_bare_series_alias_resolves_in_correlated_subqueries() {
+    let dir = Scratch::new("c54-series-alias");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE s(x INT); INSERT INTO s VALUES (1), (2)").ok("series input");
+    a.q("CREATE TABLE w(k INT); INSERT INTO w VALUES (1), (2)").ok("inner relation");
+    let sql = "SELECT g FROM s, generate_series(1, s.x) AS g WHERE EXISTS (SELECT 1 FROM w WHERE w.k = g) ORDER BY g";
+    let r = a.q(sql).ok(sql);
+    assert_eq!(r.oids, Some(vec![23]));
+    assert_eq!(r.rows, vec![vec![Some("1".into())], vec![Some("1".into())], vec![Some("2".into())]]);
+    a.q("CREATE TABLE u(g INT); INSERT INTO u VALUES (10)").ok("shadowing column");
+    assert_eq!(a.q("SELECT count(*) FROM s, generate_series(1, s.x) AS g WHERE EXISTS (SELECT 1 FROM u WHERE g = 10)").single("inner column shadows series"), "3");
+}
