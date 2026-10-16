@@ -46,8 +46,7 @@ fn c45_delete_using_an_unnamed_expression_returns_the_target_column() {
     assert_eq!(a.q("SELECT id FROM d").single("remaining row"), "1");
 }
 
-#[test]
-fn c45_partial_startup_logs_its_timeout() {
+fn partial_startup_logs_its_timeout(partial: &[u8]) {
     let dir = Scratch::new("c45startuplog");
     let trace = dir.0.join("trace.log");
     let server = Server::start(
@@ -61,8 +60,7 @@ fn c45_partial_startup_logs_its_timeout() {
     );
     let mut slow = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
     slow.set_read_timeout(Some(Duration::from_secs(4))).unwrap();
-    // A partial length word leaves the codec waiting for the rest of the startup frame.
-    slow.write_all(&[0, 0, 4]).unwrap();
+    slow.write_all(partial).unwrap();
     let mut received = Vec::new();
     let _ = slow.read_to_end(&mut received);
     drop(server);
@@ -75,4 +73,15 @@ fn c45_partial_startup_logs_its_timeout() {
         !log.contains("invalid frontend message"),
         "timeout classified as a malformed message: {log}"
     );
+}
+
+#[test]
+fn c45_partial_startup_logs_its_timeout() {
+    partial_startup_logs_its_timeout(&[0, 0, 4]);
+}
+
+#[test]
+fn c45_partial_startup_body_logs_its_timeout() {
+    // A complete length word and version leave a partial startup body in the codec.
+    partial_startup_logs_its_timeout(&[0, 0, 4, 0, 0, 3, 0, 0, b'u']);
 }
