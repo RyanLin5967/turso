@@ -195,6 +195,55 @@ mod tests {
         assert!(bad.is_empty(), "CLAIM: a statement's subquery step was entered as an outermost, unchecked step: {bad:?}");
     }
 
+    /// A connection with no temp database still answers for its temp schema where the stack
+    /// guard refuses every step: both callers that build it (`Connection::empty_temp_schema` and
+    /// the resolver's lookup of `temp`) cannot return an error, so building it parses nothing (it
+    /// parsed the built-in definitions, and a refusal there was an `.expect` that aborted the
+    /// process).
+    #[test]
+    fn the_temp_schema_is_built_where_the_stack_guard_refuses_every_step() {
+        #[inline(never)]
+        fn below_margin(conn: &std::sync::Arc<crate::Connection>) -> (usize, usize) {
+            if turso_stack_guard::remaining_stack() >= turso_stack_guard::margin() {
+                let mut frame = [0u8; 1 << 10];
+                std::hint::black_box(&mut frame);
+                return below_margin(conn);
+            }
+            let _executing = turso_stack_guard::Executing::enter();
+            assert!(turso_stack_guard::NestGuard::enter().is_err(), "premise: a step here is refused");
+            let built = conn.empty_temp_schema().tables.len();
+            let syms = conn.syms.read();
+            let schema = conn.schema.read().clone();
+            let resolver = crate::translate::emitter::Resolver::new(
+                &schema,
+                conn.database_schemas(),
+                &conn.temp.database,
+                conn.attached_databases(),
+                &syms,
+                conn.experimental_custom_types_enabled(),
+                conn.get_dqs_dml().into(),
+                conn.dialect(),
+                conn.db.empty_schemas.dialect.clone(),
+                &None,
+            );
+            let resolved = resolver.with_schema(crate::TEMP_DB_ID, |temp| temp.tables.len());
+            (built, resolved)
+        }
+        std::thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn(|| {
+                let io: std::sync::Arc<dyn crate::IO> = std::sync::Arc::new(crate::MemoryIO::new());
+                let db = crate::Database::open_file(io, ":memory:", std::sync::Arc::new(crate::SqliteDialect)).unwrap();
+                let conn = db.connect().unwrap();
+                assert!(conn.temp.database.read().is_none(), "premise: the connection has no temp database");
+                let (built, resolved) = below_margin(&conn);
+                assert!(built > 0 && resolved > 0, "the temp schema lost its built-in tables: {built}, {resolved}");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
     /// A real re-entry: a CREATE TABLE's schema reparse prepares a statement inside
     /// `Program::step` (op_parse_schema), and that statement's outermost step is seen as entered
     /// while a statement steps; a flat SELECT is not (fastest-wire 17572da73).

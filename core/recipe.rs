@@ -1088,6 +1088,7 @@ impl CompiledRecipe {
             conn.experimental_custom_types_enabled(),
             conn.get_dqs_dml().into(),
             Arc::new(crate::dialect::SqliteDialect),
+            conn.db.empty_schemas.sqlite.clone(),
             &None,
         );
         let columns = table.columns();

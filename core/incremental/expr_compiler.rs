@@ -333,6 +333,7 @@ impl CompiledExpression {
             true,
             DoubleQuotedDml::Enabled,
             std::sync::Arc::new(crate::dialect::SqliteDialect),
+            connection.db.empty_schemas.sqlite.clone(),
             &None,
         );
 

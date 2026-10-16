@@ -639,12 +639,13 @@ impl Connection {
     }
 
     pub(crate) fn empty_temp_schema(&self) -> Arc<Schema> {
-        // with_options only fails if built-in type SQL is malformed (programmer bug).
-        let mut schema = Schema::with_options(
-            self.db.experimental_custom_types_enabled(),
-            self.db.dialect().as_ref(),
-        )
-        .expect("built-in type definitions are malformed");
+        let mut schema = self
+            .db
+            .empty_schemas
+            .dialect
+            .as_ref()
+            .try_clone()
+            .expect("out of memory copying the empty schema");
         schema.generated_columns_enabled = self.db.experimental_generated_columns_enabled();
         Arc::new(schema)
     }

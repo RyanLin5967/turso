@@ -857,6 +857,11 @@ pub struct Database<A: alloc::ConcurrentAllocator = alloc::DynAllocator> {
     /// and shared by all connections because the parsed [`Schema`] is
     /// shared per database.
     dialect: Arc<dyn Dialect>,
+    /// Schemas holding only the built-in objects, built at open, for a connection's temp schema
+    /// before it has a temp database: building one parses the built-in definitions, which a stack
+    /// check can refuse when it happens in the middle of a statement, where the callers cannot
+    /// return the error.
+    pub(crate) empty_schemas: EmptySchemas,
     pub(crate) opts: DatabaseOpts,
     pub(crate) n_connections: AtomicUsize,
     /// Process-unique id minted at construction. Unlike the `Arc`'s heap
@@ -883,6 +888,30 @@ pub struct Database<A: alloc::ConcurrentAllocator = alloc::DynAllocator> {
 // SAFETY: This needs to be audited for thread safety.
 // See: https://github.com/tursodatabase/turso/issues/1552
 crate::assert::assert_send_sync!(Database);
+
+/// See [`Database::empty_schemas`].
+pub(crate) struct EmptySchemas {
+    /// Under the database's dialect.
+    pub(crate) dialect: Arc<Schema>,
+    /// Under SQLite's, for engine-generated helper statements, which are SQLite text whatever the
+    /// database's dialect.
+    pub(crate) sqlite: Arc<Schema>,
+}
+
+impl EmptySchemas {
+    fn new(enable_custom_types: bool, dialect: &dyn Dialect) -> Result<Self> {
+        let in_dialect = Arc::new(Schema::with_options(enable_custom_types, dialect)?);
+        let sqlite = if dialect.name() == crate::dialect::SqliteDialect.name() {
+            in_dialect.clone()
+        } else {
+            Arc::new(Schema::with_options(enable_custom_types, &crate::dialect::SqliteDialect)?)
+        };
+        Ok(Self {
+            dialect: in_dialect,
+            sqlite,
+        })
+    }
+}
 
 impl fmt::Debug for Database {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1010,6 +1039,7 @@ impl Database {
                 s.generated_columns_enabled = opts.enable_generated_columns;
                 s
             }))),
+            empty_schemas: EmptySchemas::new(enable_custom_types, dialect.as_ref())?,
             _shared_page_cache: shared_page_cache,
             shared_wal,
             #[cfg(host_shared_wal)]

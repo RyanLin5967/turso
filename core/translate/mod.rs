@@ -125,6 +125,11 @@ pub fn translate(
         } else {
             connection.dialect()
         },
+        if matches!(origin, crate::statement::StatementOrigin::InternalHelper) {
+            connection.db.empty_schemas.sqlite.clone()
+        } else {
+            connection.db.empty_schemas.dialect.clone()
+        },
         &prepare_options.unqualified_database_search_path,
     );
     // A branch merge applying row images compiles with no triggers (see `branch::merge`).
