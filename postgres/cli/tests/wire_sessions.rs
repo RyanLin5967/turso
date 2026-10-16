@@ -12093,6 +12093,20 @@ mod recorded {
         }
     }
 
+    /// Replay an unchanged sequence of commands selected from a committed PG recording.
+    pub(super) fn replay_selected(name: &str, recording: &str, ordinals: &[usize]) {
+        let commands = parse(recording);
+        let mut selected = String::new();
+        for &ordinal in ordinals {
+            let command = &commands[ordinal - 1];
+            selected.push_str(&format!(">> {}\n", command.text));
+            for line in &command.want {
+                selected.push_str(&format!("   {line}\n"));
+            }
+        }
+        replay(name, &selected, &selected, &[]);
+    }
+
     /// Replay `recording` on a fresh server and check that the commands answering otherwise than
     /// PostgreSQL are exactly `divergences`, with each registered answer pinned by `ours`.
     pub(super) fn replay(name: &str, recording: &str, ours: &str, divergences: &[(usize, &str)]) {
@@ -13451,3 +13465,21 @@ fn c50_numeric_specials_from_colnames_recording() {
     assert_eq!(r.oids, Some(vec![23, 1700, 1700, 1700, 20, 25]));
     assert_eq!(r.rows, vec![vec![Some("2".into()), Some("NaN".into()), Some("Infinity".into()), Some("42".into()), Some("1".into()), Some("x".into())]]);
 }
+// C52: expectations are selected unchanged from the committed PG 18.6 recordings.
+macro_rules! c52_recorded_types {
+    ($test:ident, $file:literal, [$($n:literal),+]) => {
+        #[test]
+        fn $test() {
+            recorded::replay_selected($file, include_str!(concat!("pg18/", $file)), &[$($n),+]);
+        }
+    };
+}
+
+c52_recorded_types!(c52_boolean_returning_uses_pg_type, "pg18.out", [33, 34, 35, 36, 37, 38, 39, 40, 41]);
+c52_recorded_types!(c52_array_parameters_return_pg_text, "pg18-arrres.out", [1, 2, 3]);
+c52_recorded_types!(c52_parameter_description_uses_oid_array, "pg18-arrays.out", [1, 5]);
+c52_recorded_types!(c52_derived_count_has_pg_type, "pg18-audit1-ws-untyped_contexts_type_their_parameters.out", [2, 3, 18, 19]);
+c52_recorded_types!(c52_expression_columns_have_pg_types, "pg18-colnames.out", [2, 3, 5, 8]);
+c52_recorded_types!(c52_numeric_literal_has_pg_type, "pg18-colnames.out", [7]);
+c52_recorded_types!(c52_catalog_columns_have_pg_types, "pg18-audit2-pg_indexes_and_pg_database_size_answer.out", [1, 2, 3, 4]);
+c52_recorded_types!(c52_pg_typeof_reads_the_inferred_type, "pg18-random.out", [1]);
