@@ -970,8 +970,9 @@ def self_test():
                 # a dict overrides its fields; None writes none
                 fx = None
                 if ours_fixture is not None:
+                    # (and the read-back and stream digests beside the generator's, as fixture.py write records them)
                     fx = {"system": "ours", "rows": 10000, "age_updates": age, "prebranch": live, "live_branches": live,
-                          "gen_seed_sha256": "d" * 64}
+                          "gen_seed_sha256": "d" * 64, "readback": {"count": 10000, "sum": 7, "row_hash": 9}, "expected_readback": {"count": 10000, "sum": 7, "row_hash": 9}, "stream_sha256": {"sql": "a", "age": "b"}, "expected_streams": {"sql": "a", "age": "b"}}
                     if ours_fixture != "plan":
                         fx.update(ours_fixture)
                     w(f"{a1}/result/fixture.json", json.dumps(fx))
@@ -1000,7 +1001,7 @@ def self_test():
                 info = f"dry=1 age={age} prebranch={live}" if comp_info == "plan" else comp_info
                 w(f"{a1}/result/fixture.json", json.dumps({"system": "dolt", "rows": 10000, "age_updates": age,
                                                            "prebranch": live, "live_branches": live,
-                                                           "gen_seed_sha256": "d" * 64}))
+                                                           "gen_seed_sha256": "d" * 64, "readback": {"count": 10000, "sum": 7, "row_hash": 9}, "expected_readback": {"count": 10000, "sum": 7, "row_hash": 9}, "stream_sha256": {"sql": "a", "age": "b"}, "expected_streams": {"sql": "a", "age": "b"}}))
                 if info is not None:
                     w(f"{a1}/result/run-info.txt", f"system=dolt kind=dolt rows=10000 cap_s=1800 warmup={RULE} {info} "
                                                    "parent_sum=1\n")
@@ -1186,6 +1187,16 @@ def self_test():
         ("ours fixture: a measured live_branches 19 under a planned prebranch of 20 fails, naming live_branches",
          {"ours_fixture": {"live_branches": 19}}, False,
          lambda s: any("live_branches" in x for x in s["fixture_refusals"])),
+        # fixture.py write records the engine's read-back and the fed streams' digests beside the generator's; summarize
+        # reads that comparison for every system rather than trusting write's exit code
+        ("ours fixture: a read-back that differs from the generator's fails, naming the read-back",
+         {"ours_fixture": {"readback": {"count": 10000, "sum": 8, "row_hash": 9}}}, False,
+         lambda s: any("read back" in x for x in s["fixture_refusals"])),
+        ("ours fixture: no read-back fails, naming it", {"ours_fixture": {"readback": None}}, False,
+         lambda s: any("read back" in x for x in s["fixture_refusals"])),
+        ("ours fixture: stream digests that are not the generator's fail, naming them",
+         {"ours_fixture": {"stream_sha256": {"sql": "a", "age": "x"}}}, False,
+         lambda s: any("stream" in x for x in s["fixture_refusals"])),
         ("ours fixture: a fixture.json that is not an object fails as no fixture record",
          {"ours_fixture": {"rows": None}}, False, lambda s: any("rows" in x for x in s["fixture_refusals"])),
         ("HIGH 4: a competitor whose run-info age differs from its plan row fails",
@@ -1422,7 +1433,7 @@ def self_test():
                                            "prebranch=20 parent_sum=1\n")
             w(f"{a1}/result/fixture.json", json.dumps({"system": "dolt", "rows": 10000, "age_updates": 200,
                                                        "prebranch": 20, "live_branches": 20,
-                                                       "gen_seed_sha256": "d" * 64} | cfx))
+                                                       "gen_seed_sha256": "d" * 64, "readback": {"count": 10000, "sum": 7, "row_hash": 9}, "expected_readback": {"count": 10000, "sum": 7, "row_hash": 9}, "stream_sha256": {"sql": "a", "age": "b"}, "expected_streams": {"sql": "a", "age": "b"}} | cfx))
             s, _ok = summarize(out, "sha", "1", "m")
             fr = s["fixture_refusals"]
             good = (fr == []) if not want else any("one parent" in x and all(k in x for k in want) for x in fr)
