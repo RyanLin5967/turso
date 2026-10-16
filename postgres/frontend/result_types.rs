@@ -1925,6 +1925,16 @@ impl Infer<'_> {
                     {
                         Some(a)
                     }
+                    (Some(a), Some(b))
+                        if matches!(kind, AExprKind::AexprOp)
+                            && matches!(op, Some("+" | "-" | "*" | "/")) =>
+                    {
+                        // Arithmetic overload selection differs from common-type
+                        // selection: real plus an integer/numeric uses float8.
+                        // Engine execution consumes this same shared OID rule.
+                        Some(turso_parser::pg_types::numeric_arithmetic_result_oid(a, b)
+                            .unwrap_or_else(|| wider(a, b)))
+                    }
                     (Some(a), Some(b)) => Some(wider(a, b)),
                     (Some(a), None) if param(e.rexpr.as_deref()) => Some(a),
                     (None, Some(b)) if param(e.lexpr.as_deref()) => Some(b),
