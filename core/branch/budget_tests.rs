@@ -564,10 +564,14 @@ fn recover(cell: &str, built: &mut Built, opens: u64, out: &mut String) -> (Arc<
         let mut a = sample_of(&s0, &s_open, &Outside::zero(log0), &o1);
         // Class (b): a recovery window is the opening thread's and the threads the open spawned;
         // another thread that ran inside it makes it unattributable (`probe::end`).
-        a.insert("quiet", u64::from(t0 == base && t_open == base && s_open.attributed_syscalls.is_some()));
+        // L3 (probe-adversary-2): and no hold another thread made syscalls in (`held_unattributed`).
+        let held_ok = |m: &Map| m.get("held_unattributed") == Some(&0);
+        let open_ok = held_ok(&a);
+        a.insert("quiet", u64::from(t0 == base && t_open == base && s_open.attributed_syscalls.is_some() && open_ok));
         line(out, cell, "recovery_open", r, &a);
         let mut b = sample_of(&s0, &s_all, &Outside::zero(log0), &o1);
-        b.insert("quiet", u64::from(t0 == base && settled && s_all.attributed_syscalls.is_some()));
+        let all_ok = held_ok(&b);
+        b.insert("quiet", u64::from(t0 == base && settled && s_all.attributed_syscalls.is_some() && all_ok));
         line(out, cell, "recovery", r, &b);
         db = Some(opened);
     }
@@ -2376,19 +2380,28 @@ const MAIN: [&str; 3] = ["n10_small", "n1e4_small", "n10_large"];
 
 type Map = BTreeMap<String, u64>;
 
-/// `op`'s quiet samples in `c`. Refuses when there are none, or when fewer than half are quiet: a
-/// budget read from a few samples is not one.
+/// Whether a sample is decided: its quiet flag is 1. A sample without the flag is refused, never
+/// taken as quiet (DECISIONS 994f7d41e0, the MEASUREMENT class).
+fn decided(c: &CellData, op: &str, s: &Map) -> bool {
+    *s.get("quiet").unwrap_or_else(|| panic!("{}: {op}: a sample has no quiet flag", c.name)) == 1
+}
+
+/// `op`'s samples in `c`, every one of them decided. Probe-adversary-2 H1 (ruling: a budget verdict
+/// needs EVERY sample decided): a budget read from the decided subset passed while the refused
+/// samples were exactly the expensive ones (plant4: every third create over budget, and the probe
+/// refused those, since it also woke a thread). So ANY refused sample makes the budget REFUSED, a
+/// failure reported as such and never green; a run gives a verdict only in the regime where no
+/// foreign thread runs in a window. None at all is refused too.
 fn quiet<'a>(c: &'a CellData, op: &str) -> Vec<&'a Map> {
     let all = c.ops.get(op).map(Vec::as_slice).unwrap_or_default();
-    let quiet: Vec<&Map> = all.iter().filter(|s| s.get("quiet").copied().unwrap_or(1) == 1).collect();
+    let refused = all.iter().filter(|s| !decided(c, op, s)).count();
     assert!(
-        !quiet.is_empty() && 2 * quiet.len() >= all.len(),
-        "{}: {op}: {} of {} samples quiet: not enough to read a budget from",
+        !all.is_empty() && refused == 0,
+        "REFUSED (no verdict): {}: {op}: {refused} of {} samples refused by the probe; a budget verdict needs every sample decided (probe-adversary-2 H1)",
         c.name,
-        quiet.len(),
         all.len()
     );
-    quiet
+    all.iter().collect()
 }
 
 /// `key` in every sample; refuses when one lacks it (a counter the run did not produce is not a
@@ -3338,7 +3351,7 @@ fn checkpoint_excess_of(spec: &str, quiet_only: bool) -> (u64, BTreeMap<&'static
         let calm: Vec<&&Map> = samples.iter().filter(|s| s["ckpt_started"] == 0).collect();
         assert!(calm.len() * 2 >= samples.len(), "{spec}: {op}: most operations started a checkpoint");
         for s in all.iter().filter(|s| s["ckpt_started"] > 0) {
-            let quiet = s.get("quiet").copied().unwrap_or(1) == 1;
+            let quiet = decided(&c, op, s);
             if quiet {
                 attributable += 1;
             } else {
@@ -3757,15 +3770,19 @@ fn leap_l4_an_open_holds_the_store_mutex_for_no_o_n_work() {
 /// The confirm arm's rounds as pairs `(a, reference)` of the same round, both quiet (review 2 H6: the
 /// rounds are paired by index and the LARGEST difference is budgeted; comparing two minimums hid a
 /// cost paid in all but one round). Samples are kept in the order they were measured, one of each op
-/// per round, so the j-th of each op is the j-th round. Refused when fewer than half the pairs are
-/// quiet, as `quiet` refuses.
+/// per round, so the j-th of each op is the j-th round. REFUSED when any pair has a sample the
+/// probe refused, as `quiet` refuses (probe-adversary-2 H1: every sample decided).
 fn confirm_pairs<'a>(c: &'a CellData, op: &str) -> Vec<(&'a Map, &'a Map)> {
     let (a, r) = (&c.ops[op], &c.ops["confirm_reference"]);
     assert_eq!(a.len(), r.len(), "{}: {op} and confirm_reference rounds differ", c.name);
-    let q = |s: &Map| s.get("quiet").copied().unwrap_or(1) == 1;
-    let pairs: Vec<(&Map, &Map)> = a.iter().zip(r).filter(|(x, y)| q(x) && q(y)).collect();
-    assert!(!pairs.is_empty() && 2 * pairs.len() >= a.len(), "{}: {op}: {} of {} round pairs quiet", c.name, pairs.len(), a.len());
-    pairs
+    let refused = a.iter().zip(r).filter(|(x, y)| !(decided(c, op, x) && decided(c, "confirm_reference", y))).count();
+    assert!(
+        !a.is_empty() && refused == 0,
+        "REFUSED (no verdict): {}: {op}: {refused} of {} round pairs have a refused sample; a budget verdict needs every sample decided (probe-adversary-2 H1)",
+        c.name,
+        a.len()
+    );
+    a.iter().zip(r).collect()
 }
 
 /// The largest `x[k] - y[k]` over the pairs, as a signed number.
