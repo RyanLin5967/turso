@@ -13313,3 +13313,34 @@ fn rollback_and_chain_ends_the_settings_of_the_failed_block() {
     a.x("COMMIT", &[]).ok("commit");
     assert_eq!(show(&mut a, "lock_timeout"), "0", "the rolled-back SET survived the extended chain");
 }
+
+/// A change to the effective foreign_keys while the block holds deferred foreign-key violations is
+/// refused (C41-H1, the lead's fix): `SET LOCAL foreign_keys = off` before COMMIT turned the
+/// engine's check off for the COMMIT, so an orphan row under a DEFERRABLE INITIALLY DEFERRED key
+/// committed, and the count left behind broke the next write. PostgreSQL has no foreign_keys setting
+/// (its SET answers 42704), so the expected behaviour is this server's own: the SET fails, which
+/// fails the block; COMMIT answers ROLLBACK; the orphan is absent; the next write succeeds. With no
+/// violation pending the SET is accepted (the control).
+#[test]
+fn foreign_keys_cannot_be_turned_off_over_pending_deferred_violations() {
+    let dir = Scratch::new("fkdeferredoff");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE p(id INT PRIMARY KEY)").ok("p");
+    a.q("CREATE TABLE c(id INT PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED)")
+        .ok("c");
+    a.q("BEGIN").ok("begin");
+    a.q("INSERT INTO c VALUES (1, 99)").ok("the orphan, deferred");
+    let r = a.q("SET LOCAL foreign_keys = off");
+    assert!(r.error.is_some(), "foreign_keys turned off over a pending violation: {:?}", r.tags);
+    assert_eq!(r.status, b'E', "the refused SET did not fail the block");
+    assert_eq!(a.q("COMMIT").ok("commit").tags, ["ROLLBACK"]);
+    assert_eq!(a.q("SELECT count(*) FROM c").single("rows"), "0", "the orphan committed");
+    a.q("INSERT INTO p VALUES (1)").ok("the next write");
+    a.q("INSERT INTO c VALUES (2, 1)").ok("a valid child");
+    // The control: nothing pending, the SET LOCAL is accepted and ends with its block.
+    a.q("BEGIN").ok("begin");
+    a.q("SET LOCAL foreign_keys = off").ok("no violation pending");
+    a.q("COMMIT").ok("commit");
+    assert_eq!(a.q("SHOW foreign_keys").single("foreign_keys"), "on");
+}
