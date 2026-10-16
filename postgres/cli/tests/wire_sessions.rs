@@ -4414,7 +4414,7 @@ fn a_fatal_startup_error_ends_the_session() {
     let mut a = seeded(&server);
     let s = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    let mut w = Wire { s };
+    let mut w = Wire { s, parameters: Vec::new() };
     let mut body = Vec::new();
     body.extend_from_slice(&196608i32.to_be_bytes());
     for (k, v) in [("user", "postgres"), ("database", "postgres/nosuch")] {
