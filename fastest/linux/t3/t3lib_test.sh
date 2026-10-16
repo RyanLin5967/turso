@@ -447,5 +447,42 @@ quiet_setup "" "" "0.5 0.5"; touch "$T/sc/timers.broken"
 check "systemctl list-timers failing refuses (the guard cannot read its input)" \
   "! env $QENV \"$BASH\" -c 'source \"\$0\"; host_quiet \"\$1\"' \"$HERE/t3lib.sh\" \"$T/quiet.tsv\""
 
+# the owed ours fixture record (2026-10-16): ours times against gen_seed's parent, as every competitor does, and its
+# fixture.json is comp's fixture.py write over ours' own read-back (fastest_profile --dump-trunk). The driver's part is
+# faked here by its outputs: summary.json's fixture.live_branches and a dump made from gen_seed's own stream
+mkdir -p "$T/fx"
+check "ours_parent writes gen_seed's two streams and their digests, as the competitors' seeds feed them" \
+  '( source "$HERE/t3lib.sh"; ours_parent "$T/fx/d/parent" 300 7 ) && [ "$(grep -c "" "$T/fx/d/parent/age.sql")" = 7 ] &&
+   head -1 "$T/fx/d/parent/seed.sql" | grep -q "^CREATE TABLE t " && [ -s "$T/fx/d/parent/sql.sha256" ] &&
+   [ -s "$T/fx/d/parent/age.sha256" ]'
+fxdump() { # fxdump D ROWS AGE: D/parent/trunk.tsv as the aged parent's rows, from gen_seed's own lines
+  python3 -B -c 'import sys; sys.path.insert(0, sys.argv[1]); import gen_seed as g
+r, k = int(sys.argv[2]), int(sys.argv[3]); t = {}
+for ln in g.sql_lines(r):
+    if ln.startswith("INSERT"):
+        for tup in ln[ln.index("VALUES ") + 7:-1].split("),("):
+            i, v, pad = tup.strip("()").split(",", 2); t[int(i)] = [int(v), pad.strip(chr(39))]
+for ln in g.age_lines(r, k, 1):
+    v, i = ln[len("UPDATE t SET v = "):-1].split(" WHERE id = "); t[int(i)][0] = int(v)
+sys.stdout.write("".join("%d\t%d\t%s\n" % (i, v, p) for i, (v, p) in sorted(t.items())))' "$HERE/../competitors" "$2" "$3" \
+    > "$1/parent/trunk.tsv"; }
+mkdir -p "$T/fx/d/result" "$T/fx/store"
+printf '{"fixture": {"live_branches": 4, "prebranch": 4}}\n' > "$T/fx/d/result/summary.json"
+fxdump "$T/fx/d" 300 7
+check "ours_fixture_record writes fixture.json: comp's schema, the MEASURED live count, ours' read-back equal to the generator's" \
+  '( source "$HERE/t3lib.sh"; ours_fixture_record "$T/fx/d" 300 7 4 "$T/fx/store" ) && python3 -B -c "import json, sys
+j = json.load(open(\"$T/fx/d/result/fixture.json\"))
+sys.exit(not (j[\"system\"] == \"ours\" and j[\"rows\"] == 300 and j[\"age_updates\"] == 7 and j[\"prebranch\"] == 4
+              and j[\"live_branches\"] == 4 and j[\"readback\"] == j[\"expected_readback\"]
+              and j[\"stream_sha256\"] == j[\"expected_streams\"] and len(j[\"gen_seed_sha256\"]) == 64))"'
+awk -F '\t' -v OFS='\t' 'NR == 1 { $2 = $2 + 1 } { print }' "$T/fx/d/parent/trunk.tsv" > "$T/fx/t.tsv" &&
+  mv "$T/fx/t.tsv" "$T/fx/d/parent/trunk.tsv"  # one row's v moved: another parent than the generator's
+check "ours_fixture_record refuses (rc != 0) when ours read back another parent, and still writes the record" \
+  '! ( source "$HERE/t3lib.sh"; ours_fixture_record "$T/fx/d" 300 7 4 "$T/fx/store" ) && python3 -B -c "import json, sys
+j = json.load(open(\"$T/fx/d/result/fixture.json\")); sys.exit(not (j[\"readback\"] != j[\"expected_readback\"]))"'
+printf '{"windows": []}\n' > "$T/fx/d/result/summary.json"
+check "ours_fixture_record refuses a summary.json with no fixture record (the driver ran without the parent)" \
+  '! ( source "$HERE/t3lib.sh"; ours_fixture_record "$T/fx/d" 300 7 4 "$T/fx/store" ) && grep -q "no fixture" "$T/out.txt"'
+
 echo "T3LIB SELF-TEST $pass/$((pass + fail)) $([ $fail = 0 ] && echo PASS || echo FAIL)$([ $na = 0 ] || echo " ($na N/A-on-$(uname -s | tr A-Z a-z))")"
 [ $fail = 0 ]
