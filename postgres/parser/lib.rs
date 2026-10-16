@@ -600,22 +600,22 @@ mod tests {
         }
     }
 
-    /// The C side's own stack refusal, `Error::Parse("stack depth limit exceeded")` from
-    /// check_stack_depth() (libpg_query's max_stack_depth is 100 kB), is the stack refusal (54001)
-    /// on every call that can meet it: normalize and fingerprint walk the raw tree
-    /// (raw_expression_tree_walker) and meet it on a long left-deep expression. Premise: libpg_query
-    /// itself answers that variant with that message, so the Parse arm of `pg_query_error` is the
-    /// one exercised (integrate-reviewer-2 L5: only the Decode arm had a test; a mutant without the
-    /// Parse arm passed every test).
+    /// `pg_query_error`'s arms other than Decode, by pg_query's own variants (integrate-reviewer-2
+    /// L4, L5): a Parse or Split error whose whole message is check_stack_depth()'s is the stack
+    /// refusal; the same words quoted inside a syntax error are not. The arms are tested on
+    /// constructed errors because libpg_query 6.1.1 never raises them: its check_stack_depth()
+    /// fires only once stack_base_ptr is set (src_backend_tcop_postgres.c stack_is_too_deep), and
+    /// no libpg_query entry point sets it (no match in its src/pg_query*.c); measured, normalize of
+    /// a 20,000-term left-deep sum succeeds (the premise of fc1932403's version, run 22:01Z).
+    /// A mutant without the Parse arm, or without the Split arm, turns this red.
     #[test]
-    fn the_c_parsers_stack_refusal_is_the_stack_refusal() {
-        let sql = format!("SELECT {}", vec!["1"; 20_000].join(" + "));
-        let raw = turso_stack_guard::with_stack(pg_query_stack(&sql), || pg_query::normalize(&sql));
-        assert!(
-            matches!(&raw, Err(pg_query::Error::Parse(m)) if m == "stack depth limit exceeded"),
-            "premise: libpg_query refuses the walk with its stack message: {raw:?}"
-        );
-        assert!(matches!(normalize(&sql), Err(ParseError::StackDepthLimitExceeded)), "{:?}", normalize(&sql));
-        assert!(matches!(fingerprint(&sql), Err(ParseError::StackDepthLimitExceeded)), "{:?}", fingerprint(&sql));
+    fn a_whole_stack_message_is_the_stack_refusal_and_a_quoted_one_is_not() {
+        let msg = turso_stack_guard::MESSAGE.to_string();
+        assert!(matches!(pg_query_error(pg_query::Error::Parse(msg.clone())), ParseError::StackDepthLimitExceeded));
+        assert!(matches!(pg_query_error(pg_query::Error::Split(msg.clone())), ParseError::StackDepthLimitExceeded));
+        let quoted = format!("syntax error at or near \"'{msg}'\"");
+        assert!(matches!(pg_query_error(pg_query::Error::Parse(quoted.clone())), ParseError::ParseError(_)));
+        assert!(matches!(pg_query_error(pg_query::Error::Split(quoted)), ParseError::ParseError(_)));
+        assert!(matches!(pg_query_error(pg_query::Error::Scan(msg)), ParseError::ParseError(_)));
     }
 }
