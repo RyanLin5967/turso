@@ -20,9 +20,28 @@ pub struct TranslateResult {
     pub cmd: ast::Cmd,
 }
 
+/// PostgreSQL expression OIDs from the frontend's one inference over this parsed tree.
+/// Keys identify nodes only while that same parse tree remains alive; cloned or reparsed nodes
+/// have no annotation and must be inferred again. No pointer is dereferenced.
+#[derive(Debug, Clone, Default)]
+pub struct ExpressionTypes {
+    oids: std::collections::HashMap<usize, u32>,
+}
+
+impl ExpressionTypes {
+    pub fn insert(&mut self, node: &pg_query::protobuf::Node, oid: u32) {
+        self.oids.insert(node as *const _ as usize, oid);
+    }
+
+    pub fn get(&self, node: &pg_query::protobuf::Node) -> Option<u32> {
+        self.oids.get(&(node as *const _ as usize)).copied()
+    }
+}
+
 /// Translates a PostgreSQL query into Turso's AST
 #[derive(Default)]
 pub struct PostgreSQLTranslator {
+    expression_types: std::sync::Arc<ExpressionTypes>,
     /// The scope of each SELECT being translated, innermost last: the names its FROM items are
     /// known by, with the columns those names stand for that the engine does not have under them.
     /// A reference `alias.column` translates by the innermost SELECT whose FROM names `alias`, so
@@ -77,6 +96,16 @@ struct LateralScope {
 impl PostgreSQLTranslator {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Share the frontend's inferred OIDs instead of inferring a second time during translation.
+    pub fn with_expression_types(mut self, types: std::sync::Arc<ExpressionTypes>) -> Self {
+        self.expression_types = types;
+        self
+    }
+
+    pub fn expression_type(&self, node: &pg_query::protobuf::Node) -> Option<u32> {
+        self.expression_types.get(node)
     }
 
     /// The translator, able to read a relation's declared columns, which a DELETE ... USING
