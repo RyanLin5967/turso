@@ -13236,3 +13236,17 @@ fn c54_generate_series_rejects_float_arguments() {
     assert_eq!(a.q(sql).err(sql).code, "42883");
     assert_eq!(a.q("SELECT count(*) FROM generate_series(1, 5)").single("integer series"), "5");
 }
+
+#[test]
+fn c54_sqlite_functions_are_undefined_in_postgresql() {
+    let dir = Scratch::new("c54-sqlite-function");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE leak(name TEXT)").ok("fixture");
+    let sql = "SELECT * FROM leak WHERE typeof(name) = $1";
+    assert_eq!(a.describe_statement(sql).err(sql).code, "42883");
+    for sql in ["SELECT sqlite_version()", "SELECT ifnull(1, 2)", "SELECT total(1)", "SELECT hex('abc')"] {
+        assert_eq!(a.q(sql).err(sql).code, "42883", "{sql}");
+    }
+    assert_eq!(a.q("SELECT coalesce(NULL, 2)").single("PG function"), "2");
+}
