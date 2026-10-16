@@ -182,3 +182,18 @@ fn ten_thousand_nested_scalar_subqueries_keep_the_parser_refusal() {
     let got = in_child(test, 8 * 1024, &sql);
     assert!(got.starts_with("err ParseError(") && got.contains("memory exhausted"), "PG 18.6 gives SQLSTATE 42601 at depth 10000: {got}");
 }
+
+/// A left-associated tree can grow while the shift/reduce parser's own stack stays small.
+#[test]
+fn a_long_left_associated_expression_keeps_a_bounded_outcome() {
+    if run_child() {
+        return;
+    }
+    let test = "stack_guard_tests::a_long_left_associated_expression_keeps_a_bounded_outcome";
+    let sql = format!("SELECT {}1", "1 + ".repeat(12000));
+    let got = in_child(test, 8 * 1024, &sql);
+    assert!(
+        got == "ok [[Numeric(Integer(12001))]]" || got == "err StackDepthLimitExceeded",
+        "a deep expression must answer correctly or reach the shared stack guard: {got}"
+    );
+}
