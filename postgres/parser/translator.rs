@@ -2900,6 +2900,8 @@ impl PostgreSQLTranslator {
             .next_back()
             .ok_or_else(|| ParseError::ParseError("RangeFunction: missing function name".into()))?;
 
+        self.check_function_surface(func_call, func_name)?;
+
         // Translate arguments
         let args: Vec<Box<ast::Expr>> = func_call
             .args
@@ -4527,6 +4529,8 @@ impl PostgreSQLTranslator {
             .next_back()
             .ok_or_else(|| ParseError::ParseError("Missing function name".to_string().into()))?;
 
+        self.check_function_surface(func_call, &func_name)?;
+
         // Translate FILTER clause
         let filter_clause = if let Some(ref filter) = func_call.agg_filter {
             Some(Box::new(self.translate_expr(filter)?))
@@ -4681,6 +4685,34 @@ impl PostgreSQLTranslator {
     /// Translate a WindowDef used as an OVER clause on a function call.
     /// If the WindowDef is just a reference to a named window (OVER w),
     /// returns Over::Name. Otherwise returns Over::Window with the full spec.
+    fn check_function_surface(
+        &self,
+        call: &pg_query::protobuf::FuncCall,
+        name: &str,
+    ) -> Result<(), ParseError> {
+        if sqlite_only_function(name) {
+            return Err(self.undefined_function(call));
+        }
+        Ok(())
+    }
+
+    fn undefined_function(&self, call: &pg_query::protobuf::FuncCall) -> ParseError {
+        let name = call.funcname.iter().filter_map(|node| match node.node.as_ref() {
+            Some(pg_query::protobuf::node::Node::String(name)) => Some(name.sval.as_str()),
+            _ => None,
+        }).collect::<Vec<_>>().join(".");
+        let args = call.args.iter().map(|arg| {
+            diagnostic_type_name(self.expression_type(arg).unwrap_or(705))
+        }).collect::<Option<Vec<_>>>();
+        let message = match args {
+            Some(args) => format!("function {name}({}) does not exist", args.join(", ")),
+            None => format!("function {name} does not exist"),
+        };
+        ParseError::ParseError(SqlErrorMessage::classified(
+            SqlErrorKind::UndefinedFunction, message.clone(),
+        ).with_protocol_text(message))
+    }
+
     fn translate_window_def(
         &self,
         window_def: &pg_query::protobuf::WindowDef,
@@ -6956,6 +6988,136 @@ pub fn branch_function_name(name: &str) -> std::borrow::Cow<'static, str> {
         Some(f) => std::borrow::Cow::Borrowed(f),
         None => std::borrow::Cow::Owned(name.to_ascii_lowercase()),
     }
+}
+
+// Engine-only names, recorded against PG18.6 pg_catalog.pg_proc in
+// cli/tests/c54-pg18-virtual-functions.out. This sees raw FuncCall nodes only;
+// SQL grammar forms and internal calls emitted by translation keep their own paths.
+fn sqlite_only_function(name: &str) -> bool {
+    matches!(name,
+        "array"
+        | "array_contains"
+        | "array_contains_all"
+        | "array_element"
+        | "array_overlap"
+        | "array_overlaps"
+        | "array_set_element"
+        | "array_slice"
+        | "bin_record_json_object"
+        | "boolean_to_int"
+        | "changes"
+        | "coalesce"
+        | "conn_txn_id"
+        | "datetime"
+        | "fts_highlight"
+        | "fts_match"
+        | "fts_score"
+        | "glob"
+        | "group_concat"
+        | "hex"
+        | "if"
+        | "ifnull"
+        | "iif"
+        | "instr"
+        | "int_to_boolean"
+        | "is_autocommit"
+        | "json"
+        | "json_array"
+        | "json_error_position"
+        | "json_extract"
+        | "json_group_array"
+        | "json_group_object"
+        | "json_insert"
+        | "json_patch"
+        | "json_pretty"
+        | "json_quote"
+        | "json_remove"
+        | "json_replace"
+        | "json_set"
+        | "json_type"
+        | "json_valid"
+        | "jsonb"
+        | "jsonb_array"
+        | "jsonb_extract"
+        | "jsonb_group_array"
+        | "jsonb_group_object"
+        | "jsonb_patch"
+        | "jsonb_remove"
+        | "jsonb_replace"
+        | "julianday"
+        | "last_insert_rowid"
+        | "likelihood"
+        | "likely"
+        | "load_extension"
+        | "log2"
+        | "nullif"
+        | "numeric_decode"
+        | "numeric_encode"
+        | "printf"
+        | "quote"
+        | "randomblob"
+        | "sequence_watermark_experimental"
+        | "soundex"
+        | "sqlite_source_id"
+        | "sqlite_version"
+        | "strftime"
+        | "string_reverse"
+        | "struct_extract"
+        | "struct_pack"
+        | "subtype"
+        | "table_columns_json_array"
+        | "test_nondet_counter"
+        | "test_uint_add"
+        | "test_uint_decode"
+        | "test_uint_div"
+        | "test_uint_encode"
+        | "test_uint_eq"
+        | "test_uint_lt"
+        | "test_uint_mul"
+        | "test_uint_sub"
+        | "timediff"
+        | "total"
+        | "total_changes"
+        | "trim"
+        | "turso_version"
+        | "typeof"
+        | "unhex"
+        | "unicode"
+        | "union_extract"
+        | "union_tag"
+        | "union_value"
+        | "unistr_quote"
+        | "unixepoch"
+        | "unlikely"
+        | "validate_ipaddr"
+        | "vector"
+        | "vector1bit"
+        | "vector32"
+        | "vector32_sparse"
+        | "vector64"
+        | "vector8"
+        | "vector_concat"
+        | "vector_distance_cos"
+        | "vector_distance_dot"
+        | "vector_distance_jaccard"
+        | "vector_distance_l2"
+        | "vector_extract"
+        | "vector_slice"
+        | "zeroblob"
+    )
+}
+
+fn diagnostic_type_name(oid: u32) -> Option<&'static str> {
+    Some(match oid {
+        16 => "boolean", 17 => "bytea", 18 => "\"char\"", 19 => "name",
+        20 => "bigint", 21 => "smallint", 23 => "integer", 25 => "text",
+        26 => "oid", 114 => "json", 700 => "real", 701 => "double precision",
+        705 => "unknown", 1042 => "character", 1043 => "character varying",
+        1082 => "date", 1083 => "time without time zone", 1114 => "timestamp without time zone",
+        1184 => "timestamp with time zone", 1186 => "interval", 1700 => "numeric",
+        2278 => "void", 3802 => "jsonb",
+        _ => return None,
+    })
 }
 
 /// Rename `columns` by an alias's column list, the first ones in order; the rest keep their names.
