@@ -3712,8 +3712,12 @@ impl Drop for CutGate<'_> {
 /// untouched: a kill between batches leaves the store at its version, with link columns its meta
 /// row says nothing about (L2: not read), which the next open fills again. The store mutex is taken
 /// only to read and move the cursor. No checkpoint starts while it runs (`CatState::filling`), so
-/// no row changes under it; the next one flips the meta row (`checkpoint_write`).
-fn run_links_fill(shared: &StoreMutex, writer: &Mutex<Catalog>) {
+/// no row changes under it; the next one flips the meta row (`checkpoint_write`). After the last
+/// batch the catalog's WAL, which holds every batch's pages, is backfilled and truncated here, on
+/// the writer only: left to the flipping checkpoint, that work (O(rows), a pragma the probe's row
+/// count does not see) ran under the store mutex in a sharp store (red a722957c4). Mutant
+/// `l4_fill_wal_left` (test builds only): not truncated here.
+fn run_links_fill(shared: &StoreMutex, writer: &Mutex<Catalog>, group: &Group) {
     loop {
         let cursor = {
             let inner = shared.lock();
@@ -3736,6 +3740,9 @@ fn run_links_fill(shared: &StoreMutex, writer: &Mutex<Catalog>) {
         };
         if batch.is_ok() {
             kill_point("ckpt.upgrade.batch");
+        }
+        if matches!(batch, Ok(None)) && !fe_mutant("l4_fill_wal_left") {
+            truncate_catalog_wal(&mut writer.lock(), group, None);
         }
         let mut inner = shared.lock();
         let Some(cat) = inner.cat.as_mut() else {
@@ -6107,10 +6114,10 @@ impl BranchStore {
         }
         cat.filling = true;
         cat.links_cursor = None;
-        let (shared, writer) = (self.inner.clone(), cat.writer.clone());
+        let (shared, writer, group) = (self.inner.clone(), cat.writer.clone(), self.group.clone());
         let spawned = crate::thread::Builder::new()
             .name("branch-links-fill".to_string())
-            .spawn(move || run_links_fill(&shared, &writer));
+            .spawn(move || run_links_fill(&shared, &writer, &group));
         match spawned {
             Ok(handle) => {
                 *self.links_fill.lock() = Some(handle);
