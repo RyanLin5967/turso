@@ -2981,11 +2981,80 @@ struct ChildIndex {
     /// (parent, fork epoch) -> (nearest live sibling below, above) when it was removed. Ordered, so
     /// that a spliced-out parent's links are one range (`relink`).
     removed: BTreeMap<(u64, u64), (Option<u64>, Option<u64>)>,
+    /// What a checkpoint's capture froze of `map` and `removed` (L2(d), O(1): swapped in, not
+    /// copied; 262 KB copied at 16k children since the last checkpoint, raw l104). Every query
+    /// reads both generations until the install, which drops the frozen one (its keys are catalog
+    /// rows then, and its links' rows are deleted); a capture that is not written merges it back.
+    frozen: BTreeMap<(u64, u64), BranchId>,
+    frozen_removed: BTreeMap<(u64, u64), (Option<u64>, Option<u64>)>,
+    /// The frozen generation an install let go of, freed after the store mutex.
+    retired: Option<(BTreeMap<(u64, u64), BranchId>, BTreeMap<(u64, u64), (Option<u64>, Option<u64>)>)>,
 }
 
 impl ChildIndex {
     fn insert(&mut self, parent: BranchId, f: u64, child: BranchId) {
         self.map.insert((parent.0, f), child);
+    }
+
+    /// A capture: the live generation becomes the frozen one (O(1)). One flight at a time, so
+    /// nothing is frozen already; if something were, it is merged into the new frozen generation
+    /// rather than lost.
+    fn freeze(&mut self) {
+        let mut map = std::mem::take(&mut self.map);
+        let mut removed = std::mem::take(&mut self.removed);
+        if !self.frozen.is_empty() || !self.frozen_removed.is_empty() {
+            map.append(&mut self.frozen);
+            removed.append(&mut self.frozen_removed);
+        }
+        self.frozen = map;
+        self.frozen_removed = removed;
+    }
+
+    /// The install: the catalog holds the frozen generation now; it is let go of, freed later
+    /// (`take_retired`).
+    fn retire_frozen(&mut self) {
+        let map = std::mem::take(&mut self.frozen);
+        let removed = std::mem::take(&mut self.frozen_removed);
+        self.retired = Some((map, removed));
+    }
+
+    /// A capture that is not written: the frozen generation goes back into the live one (an entry
+    /// added since wins; the epochs are never reused, so no key is in both).
+    fn unfreeze(&mut self) {
+        let mut map = std::mem::take(&mut self.frozen);
+        let mut removed = std::mem::take(&mut self.frozen_removed);
+        map.append(&mut self.map);
+        removed.append(&mut self.removed);
+        self.map = map;
+        self.removed = removed;
+    }
+
+    fn take_retired(&mut self) -> Option<impl Drop> {
+        self.retired.take().map(Box::new)
+    }
+
+    fn contains(&self, k: &(u64, u64)) -> bool {
+        self.map.contains_key(k) || self.frozen.contains_key(k)
+    }
+
+    fn link(&self, k: &(u64, u64)) -> Option<(Option<u64>, Option<u64>)> {
+        self.removed.get(k).or_else(|| self.frozen_removed.get(k)).copied()
+    }
+
+    /// The greatest in-memory key of `p` in `range`, over both generations (and the least).
+    fn mem_last(&self, p: u64, from: u64, to_excl: u64) -> Option<u64> {
+        let a = self.map.range((p, from)..(p, to_excl)).next_back().map(|(&(_, e), _)| e);
+        let b = self.frozen.range((p, from)..(p, to_excl)).next_back().map(|(&(_, e), _)| e);
+        a.max(b)
+    }
+
+    fn mem_first(&self, p: u64, from: u64, to_incl: u64) -> Option<u64> {
+        let a = self.map.range((p, from)..=(p, to_incl)).next().map(|(&(_, e), _)| e);
+        let b = self.frozen.range((p, from)..=(p, to_incl)).next().map(|(&(_, e), _)| e);
+        match (a, b) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     /// Remove the child `parent` forked at `f`, and return its nearest live siblings below and
@@ -2998,7 +3067,7 @@ impl ChildIndex {
         f: u64,
         catalog: bool,
     ) -> Result<(bool, Option<u64>, Option<u64>)> {
-        let listed = self.map.remove(&(parent.0, f)).is_some();
+        let listed = self.map.remove(&(parent.0, f)).is_some() | self.frozen.remove(&(parent.0, f)).is_some();
         if !catalog {
             // An eager store holds every child in `map`: no links are needed, or kept.
             if !listed {
@@ -3007,7 +3076,7 @@ impl ChildIndex {
             return Ok((true, self.below(None, parent, f)?, self.above(None, parent, f)?));
         }
         // Mark it removed before looking for its neighbours, so neither lookup returns it.
-        let fresh = self.removed.insert((parent.0, f), (None, None)).is_none();
+        let fresh = self.removed.insert((parent.0, f), (None, None)).is_none() && !self.frozen_removed.contains_key(&(parent.0, f));
         let lo = self.below(cat.as_deref_mut(), parent, f)?;
         let hi = self.above(cat, parent, f)?;
         self.removed.insert((parent.0, f), (lo, hi));
@@ -3017,9 +3086,9 @@ impl ChildIndex {
     /// Follow the removal links from `e` downward (or upward) to a live child.
     fn resolve(&self, p: u64, mut e: Option<u64>, down: bool) -> Option<u64> {
         while let Some(x) = e {
-            match self.removed.get(&(p, x)) {
+            match self.link(&(p, x)) {
                 None => return Some(x),
-                Some(&(lo, hi)) => e = if down { lo } else { hi },
+                Some((lo, hi)) => e = if down { lo } else { hi },
             }
         }
         None
@@ -3028,7 +3097,7 @@ impl ChildIndex {
     /// The nearest live child of `p` below `f`.
     fn below(&self, cat: Option<&mut Catalog>, parent: BranchId, f: u64) -> Result<Option<u64>> {
         let p = parent.0;
-        let mem = self.map.range((p, 0)..(p, f)).next_back().map(|(&(_, e), _)| e);
+        let mem = self.mem_last(p, 0, f);
         let Some(cat) = cat else {
             return Ok(mem);
         };
@@ -3039,11 +3108,7 @@ impl ChildIndex {
     /// The nearest live child of `p` above `f`.
     fn above(&self, cat: Option<&mut Catalog>, parent: BranchId, f: u64) -> Result<Option<u64>> {
         let p = parent.0;
-        let mem = self
-            .map
-            .range((p, f.saturating_add(1))..=(p, u64::MAX))
-            .next()
-            .map(|(&(_, e), _)| e);
+        let mem = if f == u64::MAX { None } else { self.mem_first(p, f + 1, u64::MAX) };
         let Some(cat) = cat else {
             return Ok(mem);
         };
@@ -3059,7 +3124,7 @@ impl ChildIndex {
     /// one copy remains.)
     fn lowest(&self, cat: Option<&mut Catalog>, parent: BranchId) -> Result<Option<u64>> {
         let p = parent.0;
-        let mem = self.map.range((p, 0)..=(p, u64::MAX)).next().map(|(&(_, e), _)| e);
+        let mem = self.mem_first(p, 0, u64::MAX);
         let Some(cat) = cat else {
             return Ok(mem);
         };
@@ -3074,11 +3139,11 @@ impl ChildIndex {
     /// the last checkpoint re-keyed it here, while the catalog still lists the spliced-out parent
     /// under this key until that checkpoint), else the catalog's.
     fn child_at(&self, cat: Option<&mut Catalog>, parent: BranchId, f: u64) -> Result<Option<BranchId>> {
-        if let Some(&id) = self.map.get(&(parent.0, f)) {
+        if let Some(&id) = self.map.get(&(parent.0, f)).or_else(|| self.frozen.get(&(parent.0, f))) {
             return Ok(Some(id));
         }
         match cat {
-            Some(cat) if !self.removed.contains_key(&(parent.0, f)) => {
+            Some(cat) if self.link(&(parent.0, f)).is_none() => {
                 Ok(cat.child_at(parent.0, f)?.map(BranchId))
             }
             _ => Ok(None),
@@ -3091,17 +3156,16 @@ impl ChildIndex {
     /// since no query names it as a parent again.
     fn relink(&mut self, zombie: BranchId, f: u64, parent: BranchId, zf: u64, child: BranchId) {
         self.map.remove(&(zombie.0, f));
+        self.frozen.remove(&(zombie.0, f));
         self.map.insert((parent.0, zf), child);
-        let links: Vec<(u64, u64)> = self
-            .removed
-            .range((zombie.0, 0)..=(zombie.0, u64::MAX))
-            .map(|(&k, _)| k)
-            .collect();
-        for k in links {
-            self.removed.remove(&k);
+        for links in [&mut self.removed, &mut self.frozen_removed] {
+            let keys: Vec<(u64, u64)> = links.range((zombie.0, 0)..=(zombie.0, u64::MAX)).map(|(&k, _)| k).collect();
+            for k in keys {
+                links.remove(&k);
+            }
         }
         crate::turso_assert!(
-            !self.removed.contains_key(&(parent.0, zf)),
+            self.link(&(parent.0, zf)).is_none(),
             "a removal link names the key a spliced child now holds"
         );
     }
@@ -3113,7 +3177,7 @@ impl ChildIndex {
             return Ok(false);
         }
         let p = parent.0;
-        if self.map.range((p, from)..(p, to)).next().is_some() {
+        if self.map.range((p, from)..(p, to)).next().is_some() || self.frozen.range((p, from)..(p, to)).next().is_some() {
             return Ok(true);
         }
         let Some(cat) = cat else {
@@ -3459,9 +3523,7 @@ struct Captured {
     /// commit, and set when the checkpoint's arena sync or its commit fails (review 4 #1).
     fail_stop: Arc<AtomicBool>,
     meta: Meta,
-    /// `ChildIndex` keys (children forked, and removal links) as of the capture.
-    child_keys: Vec<(u64, u64)>,
-    child_removed: Vec<(u64, u64)>,
+
     /// A handle on the arena file: synced, in `arena_sync`, before the catalog names the slots.
     arena: Option<Arc<std::fs::File>>,
     arena_sync: SyncClass,
@@ -3974,8 +4036,8 @@ fn run_flight(
         ckpt_held("install.installed");
         // The cut's retired handles are closed after the store mutex (`Journal::take_retired`).
         let retired = guard.journal.as_mut().and_then(Journal::take_retired);
-        // And the names the install let go of, freed after it too (L2(d), `NameIndex`).
-        let retired_names = guard.names.retired.take();
+        // And the names and child keys the install let go of, freed after it too (L2(d)).
+        let retired_names = (guard.names.retired.take(), guard.children.take_retired());
         if let Some(journal) = guard.journal.as_ref() {
             // The catalog's commit made everything the capture covers durable in the class it
             // synced in, even if the cut failed after it: a raised D0 store's held frees up to the
@@ -10428,6 +10490,7 @@ impl StoreInner {
     /// names and rows go back (L2(d), `NameIndex::unfreeze`, `BranchTable::unfreeze`).
     fn unfreeze_capture(&mut self) {
         self.names.unfreeze();
+        self.children.unfreeze();
         let back = self.branches.unfreeze(|row| BranchId(row.id));
         if let Some(cat) = self.cat.as_mut() {
             for (id, what) in back {
@@ -11045,8 +11108,8 @@ impl StoreInner {
             && self.failpoint.take_if(|f| *f == BranchFailpoint::ArenaSyncFails).is_some();
         let free_list = arena.free_list().to_vec();
         held_trace("capture.free_list");
-        let child_keys: Vec<(u64, u64)> = self.children.map.keys().copied().collect();
-        let child_removed: Vec<(u64, u64)> = self.children.removed.keys().copied().collect();
+        // O(1): the child index's generation is frozen, not copied (`ChildIndex::freeze`).
+        self.children.freeze();
         held_trace("capture.child_keys");
         // O(1): swapped, not copied (see `NameIndex`). A capture never runs with a frozen generation
         // left (one flight at a time, and the install or a failed write ends it).
@@ -11071,6 +11134,7 @@ impl StoreInner {
                     }
                 }
                 self.names.unfreeze();
+                self.children.unfreeze();
                 return Err(LimboError::InternalError(
                     "a fuzzy capture while another's rows are still frozen".to_string(),
                 ));
@@ -11098,8 +11162,7 @@ impl StoreInner {
             deferred,
             deferred_lsn,
             meta,
-            child_keys,
-            child_removed,
+
             arena: arena_file,
             // Every record the catalog takes over stays as durable as it was (review B-F3).
             arena_sync: commit_class,
@@ -11151,6 +11214,7 @@ impl StoreInner {
                 }
             }
             self.names.unfreeze();
+            self.children.unfreeze();
             // Not retried before another threshold's worth of log (review 2 #5).
             if let Some(journal) = self.journal.as_mut() {
                 journal.defer_compaction();
@@ -11218,12 +11282,7 @@ impl StoreInner {
         }
         // Children forked before the capture have rows now; links of children removed before it
         // pointed at rows that are deleted now.
-        for key in &cap.child_keys {
-            self.children.map.remove(key);
-        }
-        for key in &cap.child_removed {
-            self.children.removed.remove(key);
-        }
+        self.children.retire_frozen();
         // The free list: every slot the checkpoint listed free in the catalog leaves the in-memory
         // list if it is still there; one that is not is in use (or reserved) now, and is taken.
         // Slots freed since the capture stay on the list: the catalog does not hold them. (The
@@ -12313,7 +12372,7 @@ impl StoreInner {
                     )))?
                     .lineage
             };
-            if self.children.map.contains_key(&(parent.0, f)) {
+            if self.children.contains(&(parent.0, f)) {
                 return Err(LimboError::Corrupt(format!(
                     "branch snapshot: two children at fork epoch {f} of branch {}",
                     parent.0
