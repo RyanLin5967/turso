@@ -241,10 +241,23 @@ impl PostgreSQLTranslator {
                     columns.or_else(|| alias_columns(&r.alias)),
                 ));
             }
-            Some(Node::RangeFunction(r)) => out.push((
-                alias_name(&r.alias).unwrap_or_default(),
-                alias_columns(&r.alias),
-            )),
+            Some(Node::RangeFunction(r)) => {
+                let call = r.functions.first().and_then(|item| match item.node.as_ref() {
+                    Some(Node::FuncCall(call)) => Some(call.as_ref()),
+                    Some(Node::List(items)) => items.items.first().and_then(|item| match item.node.as_ref() {
+                        Some(Node::FuncCall(call)) => Some(call.as_ref()), _ => None,
+                    }),
+                    _ => None,
+                });
+                let name = call.and_then(|call| call.funcname.last()).and_then(|name| match name.node.as_ref() {
+                    Some(Node::String(name)) => Some(name.sval.as_str()), _ => None,
+                });
+                let table = alias_name(&r.alias).unwrap_or_else(|| name.unwrap_or_default().to_owned());
+                let columns = alias_columns(&r.alias).or_else(|| {
+                    (name == Some("generate_series")).then(|| vec![table.clone()])
+                });
+                out.push((table, columns));
+            }
             Some(Node::JoinExpr(j)) => {
                 for side in [&j.larg, &j.rarg].into_iter().flatten() {
                     self.using_relations(side, out);
