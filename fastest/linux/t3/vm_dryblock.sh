@@ -11,6 +11,8 @@
 # absent, never formatted by lima), starts, and runs t3run.sh from a clone of the fork at SHA with --dry-block on the
 # one unmounted virtio disk of DATA_GIB. The VM's own root must have ROOT_MIN_GIB free for the build. The package
 # (<out>.tar.gz and its sha256) is copied to OUTDIR. The VM is stopped afterwards; nothing is deleted.
+# OUTDIR/host-disk.tsv traces the host's free space and the VM images every 30 s; under HOST_STOP_GIB (30) free the
+# VM is stopped mid-run and the exit is 3.
 # Environment (bounded, never above the ruling): VM_CPUS (default 4), VM_MEM_GIB (8), DATA_GIB (60), ROOT_MIN_GIB (25).
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -53,6 +55,25 @@ timeout 300 limactl stop "$VM" > /dev/null 2>&1 || true
 timeout 120 limactl edit "$VM" --set ".cpus=$CPUS | .memory=\"${MEM}GiB\" | .additionalDisks=[{\"name\":\"$DISK\",\"format\":false}]" ||
   { echo "vm_dryblock: cannot configure $VM"; exit 1; }
 timeout 900 limactl start "$VM" || { echo "vm_dryblock: $VM did not start"; exit 1; }
+# the host-disk trace (the lead's derived guard, 2026-10-16: run 11 recorded no host peak, only host_free_kb at its
+# start): every 30 s the host's free KiB and the VM's root and data images' allocated KiB, so the next run's guard is
+# 28 GiB (buildslot's floor) + the MEASURED peak growth + 2. And an in-run stop, an outcome guard on the fleet's room:
+# when the host's free space falls under HOST_STOP_GIB (default 30: buildslot's 28 + 2), the VM is stopped and the run
+# ends there, recorded as STOP in the trace
+STOP_GIB=${HOST_STOP_GIB:-30}
+( printf 'utc\tfree_kb\troot_img_kb\tdata_img_kb\n'
+  while :; do
+    f=$(df -k / | awk 'NR == 2 { print $4 }')
+    printf '%s\t%s\t%s\t%s\n' "$(date -u +%FT%TZ)" "$f" "$(du -sk "$HOME/.lima/$VM" | cut -f1)" \
+      "$(du -sk "$HOME/.lima/_disks/$DISK" | cut -f1)"
+    if [[ $f =~ ^[0-9]+$ ]] && [ "$f" -lt $((STOP_GIB * 1024 * 1024)) ]; then
+      echo "STOP: host free $((f / 1024 / 1024)) GiB under $STOP_GIB GiB: stopping $VM"
+      timeout 300 limactl stop -f "$VM" > /dev/null 2>&1
+      break
+    fi
+    sleep 30
+  done ) > "$OUTDIR/host-disk.tsv" 2>&1 &
+watch=$!
 rc=0
 timeout 43200 limactl shell "$VM" -- bash -s "$SHA" "$FSL" "$DATA" "$ROOT_MIN" << 'VMEOF' || rc=$?
 set -uo pipefail
@@ -71,6 +92,8 @@ git clone -q --filter=blob:none https://github.com/RyanLin5967/turso ~/t3-out.sr
   { echo "vm_dryblock (VM): cannot check out $SHA"; exit 2; }
 T3RUN_INSIDE=1 bash ~/t3-out.src/fastest/linux/t3/t3run.sh --sha "$SHA" --out ~/t3-out --dry-block "$dev" --fs "$FSL"
 VMEOF
+kill "$watch" 2> /dev/null; wait "$watch" 2> /dev/null
+grep -q '^STOP' "$OUTDIR/host-disk.tsv" && { echo "vm_dryblock: STOPPED by the host-disk guard ($OUTDIR/host-disk.tsv)"; rc=3; }
 echo "vm_dryblock: t3run in $VM rc=$rc"
 timeout 600 limactl copy "$VM:t3-out.tar.gz" "$OUTDIR/" && timeout 60 limactl copy "$VM:t3-out.tar.gz.sha256" "$OUTDIR/" ||
   echo "vm_dryblock: no package to copy back"
