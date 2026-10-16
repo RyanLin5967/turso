@@ -9008,7 +9008,8 @@ fn lifecycle_audit(n: u32) {
     probe::arm(true);
     // FLAGGED fixture change (the per-store counter class, d9cf2b609b): the audit records only this
     // store's holds, so another test's holds neither fill its log nor enter its claim.
-    *super::budget_probe::AUDIT_PATH.lock().unwrap() = Some(path.to_str().unwrap().to_string());
+    // The store's own path is the real one (`Database`'s base: symlinks resolved).
+    *super::budget_probe::AUDIT_PATH.lock().unwrap() = Some(std::fs::canonicalize(&path).unwrap().to_str().unwrap().to_string());
     AUDIT.store(true, Release);
     mark(&mut marks, "open");
     let db = reopen(&path, opts(true, SyncClass::FullFsync), incarnation);
