@@ -1336,7 +1336,15 @@ impl PostgreSQLTranslator {
         let remove_type = ObjectType::try_from(drop.remove_type)
             .map_err(|_| ParseError::ParseError("Invalid object type in DROP".into()))?;
 
-        // Extract the first qualified name from drop.objects
+        // One object: a DROP of several of a kind the frontend does not drop itself
+        // (try_extract_drop_objects) is refused, never cut to its first object, which dropped
+        // that one and kept the rest (C53).
+        if drop.objects.len() > 1 {
+            return Err(ParseError::ParseError(format!(
+                "DROP {} of more than one object is not supported",
+                drop_object_type_name(remove_type)
+            )));
+        }
         let obj_node = drop
             .objects
             .first()
@@ -6165,6 +6173,113 @@ pub fn try_extract_drop_schema(parse_result: &ParseResult) -> Option<PgDropSchem
         name,
         if_exists: drop.missing_ok,
         cascade,
+    })
+}
+
+/// The kind of relation a [`PgDropObjectsStmt`] drops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PgDropKind {
+    Table,
+    View,
+    Index,
+    Sequence,
+    Type,
+    Domain,
+}
+
+impl PgDropKind {
+    /// The kind's keyword, as DROP spells it.
+    pub fn keyword(self) -> &'static str {
+        match self {
+            PgDropKind::Table => "TABLE",
+            PgDropKind::View => "VIEW",
+            PgDropKind::Index => "INDEX",
+            PgDropKind::Sequence => "SEQUENCE",
+            PgDropKind::Type => "TYPE",
+            PgDropKind::Domain => "DOMAIN",
+        }
+    }
+
+    /// The kind as PostgreSQL's notices name it: a domain is a type there (recorded,
+    /// pg18-c53-dropnotice.out).
+    pub fn word(self) -> &'static str {
+        match self {
+            PgDropKind::Table => "table",
+            PgDropKind::View => "view",
+            PgDropKind::Index => "index",
+            PgDropKind::Sequence => "sequence",
+            PgDropKind::Type | PgDropKind::Domain => "type",
+        }
+    }
+}
+
+/// `DROP TABLE | VIEW | INDEX | SEQUENCE | TYPE | DOMAIN` with IF EXISTS or more than one object: each object as its schema
+/// (as written: None unqualified; Some("main") for public) and name. PostgreSQL resolves every
+/// object before it drops any (RemoveRelations), sends a NOTICE for each missing one under IF
+/// EXISTS, and drops all or none. The translator's DROP took the first object alone, so
+/// `DROP TABLE a, b` dropped a and kept b, and IF EXISTS sent no notice (C53, recorded
+/// pg18-c53-dropnotice.out). None for anything else, which the translator keeps: a single object
+/// without IF EXISTS, another kind, a catalog schema, or a three-part name.
+#[derive(Debug, Clone)]
+pub struct PgDropObjectsStmt {
+    pub kind: PgDropKind,
+    pub objects: Vec<(Option<String>, String)>,
+    pub missing_ok: bool,
+}
+
+pub fn try_extract_drop_objects(parse_result: &ParseResult) -> Option<PgDropObjectsStmt> {
+    use pg_query::protobuf::node::Node;
+    use pg_query::protobuf::ObjectType;
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    let NodeRef::DropStmt(drop) = &nodes.first()?.0 else {
+        return None;
+    };
+    let kind = match ObjectType::try_from(drop.remove_type).ok()? {
+        ObjectType::ObjectTable => PgDropKind::Table,
+        ObjectType::ObjectView => PgDropKind::View,
+        ObjectType::ObjectIndex => PgDropKind::Index,
+        ObjectType::ObjectSequence => PgDropKind::Sequence,
+        ObjectType::ObjectType => PgDropKind::Type,
+        ObjectType::ObjectDomain => PgDropKind::Domain,
+        _ => return None,
+    };
+    if !drop.missing_ok && drop.objects.len() < 2 {
+        return None;
+    }
+    let mut objects = Vec::with_capacity(drop.objects.len());
+    for obj in &drop.objects {
+        // A relation's name is a List of Strings; a type's or a domain's a TypeName.
+        let items = match &obj.node {
+            Some(Node::List(list)) => &list.items,
+            Some(Node::TypeName(tn)) => &tn.names,
+            _ => return None,
+        };
+        let names: Vec<&str> = items
+            .iter()
+            .filter_map(|item| match &item.node {
+                Some(Node::String(s)) => Some(s.sval.as_str()),
+                _ => None,
+            })
+            .collect();
+        if names.is_empty() || names.len() != items.len() {
+            return None;
+        }
+        match names.as_slice() {
+            [name] => objects.push((None, name.to_string())),
+            [schema, name] => match schema_qualifier(schema) {
+                SchemaQualifier::Main => objects.push((Some("main".to_string()), name.to_string())),
+                SchemaQualifier::Attached(s) => objects.push((Some(s.to_string()), name.to_string())),
+                _ => return None,
+            },
+            _ => return None,
+        }
+    }
+    Some(PgDropObjectsStmt {
+        kind,
+        objects,
+        missing_ok: drop.missing_ok,
     })
 }
 

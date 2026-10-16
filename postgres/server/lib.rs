@@ -1737,8 +1737,12 @@ impl Session {
             let warnings = conn.take_warnings();
             if !warnings.is_empty() {
                 let mut st = self.state();
-                for (code, message) in warnings {
-                    st.notices.push(warning(code, &message));
+                for (severity, code, message) in warnings {
+                    st.notices.push(Box::new(ErrorInfo::new(
+                        severity.to_string(),
+                        code.to_string(),
+                        message,
+                    )));
                 }
             }
         }
@@ -2313,7 +2317,7 @@ impl Session {
                 // PostgreSQL answers them: the query path's default was SELECT n, and drivers read
                 // the affected count from the tag (found by the PG 18 differential, 2026-10-15).
                 Response::Query(mut results) => {
-                    if let Some(tag) = returning_tag(sql) {
+                    if let Some(tag) = query_tag(sql) {
                         results.set_command_tag(tag);
                     }
                     Response::Query(results)
@@ -3704,7 +3708,7 @@ impl SimpleQueryHandler for Session {
                     }
                     client
                         .feed(PgWireBackendMessage::CommandComplete(
-                            Tag::new(&tag).with_rows(rows).into(),
+                            query_complete(&tag, rows).into(),
                         ))
                         .await?;
                 }
@@ -4086,7 +4090,7 @@ impl ExtendedQueryHandler for Session {
                     .unwrap_or_else(|| "SELECT".to_string());
                 client
                     .feed(PgWireBackendMessage::CommandComplete(
-                        Tag::new(&tag).with_rows(0).into(),
+                        query_complete(&tag, 0).into(),
                     ))
                     .await?;
             }
@@ -4319,7 +4323,7 @@ where
             None => {
                 client
                     .feed(PgWireBackendMessage::CommandComplete(
-                        Tag::new(&tag).with_rows(rows).into(),
+                        query_complete(&tag, rows).into(),
                     ))
                     .await?;
                 return Ok(false);
@@ -5440,7 +5444,10 @@ fn is_pg_non_query(sql: &str) -> bool {
     let upper = sql.trim().to_uppercase();
     upper.starts_with("COPY")
         || upper.starts_with("CREATE SCHEMA")
-        || upper.starts_with("DROP SCHEMA")
+        // Every DROP: none returns rows, and one the frontend performs while preparing it (DROP
+        // SCHEMA, DROP TABLE | VIEW | INDEX of several objects or IF EXISTS) is answered from a
+        // no-op SELECT that must not complete as one (C53).
+        || upper.starts_with("DROP")
         || upper.starts_with("REFRESH MATERIALIZED VIEW")
         || upper.starts_with("COMMENT")
         || upper.starts_with("CHECKPOINT")
@@ -5453,7 +5460,10 @@ fn is_pg_non_query(sql: &str) -> bool {
 /// (RETURNING), read from the statement's first token as [`command_tag`] reads it: `INSERT 0`,
 /// `UPDATE`, `DELETE`; None for any other statement, whose rows keep the query tag (SELECT n).
 /// Blind spot, as command_tag's: a data-modifying statement behind WITH keeps SELECT n.
-fn returning_tag(query: &str) -> Option<&'static str> {
+/// The completion tag of a statement that returns rows, when it is not SELECT's: a DML statement's
+/// RETURNING completes with its verb's, and SHOW with `SHOW` (the frontend answers SHOW with a
+/// one-row SELECT, which completed as `SELECT 1`: C53, recorded pg18-c53-dropnotice.out).
+fn query_tag(query: &str) -> Option<&'static str> {
     let start = skip_blank(query.as_bytes(), 0)?;
     let word: String = query[start..]
         .chars()
@@ -5463,7 +5473,21 @@ fn returning_tag(query: &str) -> Option<&'static str> {
         "INSERT" => Some("INSERT 0"),
         "UPDATE" => Some("UPDATE"),
         "DELETE" => Some("DELETE"),
+        "SHOW" => Some(SHOW_TAG),
         _ => None,
+    }
+}
+
+/// SHOW's completion tag, which PostgreSQL sends with no row count.
+const SHOW_TAG: &str = "SHOW";
+
+/// A query's CommandComplete after `rows` rows: the tag with the count, except SHOW's, which has
+/// none in PostgreSQL.
+fn query_complete(tag: &str, rows: usize) -> Tag {
+    if tag == SHOW_TAG {
+        Tag::new(tag)
+    } else {
+        Tag::new(tag).with_rows(rows)
     }
 }
 

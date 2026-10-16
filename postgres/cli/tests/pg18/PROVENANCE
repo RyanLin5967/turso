@@ -95,4 +95,4 @@ pg18-tablestar.out 7c3441ba06 28c54c97e937f685
 pg18-types.out 4094e40129 bc0abe3b539ca322
 pg18.out 45da3581e3 4ed1743d425ef722
 pg18-c33-intrange.out a4459caf09 0e2e330d554eff20
-pg18-c53-dropnotice.out  d97a2445c2a51060
+pg18-c53-dropnotice.out 21c74c0dcc d97a2445c2a51060

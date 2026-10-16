@@ -12806,6 +12806,7 @@ replays_postgresql!(
         (6, "PGDIV-VIRTUAL-GENERATED value [wire]: create table with b ... GENERATED ALWAYS AS (a * 2) VIRTUAL: ours errors 42601 syntax error at \"virtual\" where PG creates it (a refusal should be 0A000)"),
         (7, "PGDIV-VIRTUAL-GENERATED cascade [wire]: insert into gv: 42P01 no such table (cascade of #6)"),
         (10, "PGDIV-VIRTUAL-GENERATED cascade [wire]: select * from gv: 42P01 no such table (cascade of #6)"),
+        (11, "PGDIV-VIRTUAL-GENERATED cascade [wire]: DROP TABLE idt, idb, gv: gv was never created (#6), so the DROP refuses 42P01 and drops none, as PostgreSQL would; it dropped idt alone before C53 (the translator kept the first object)"),
     ]
 );
 replays_postgresql!(
@@ -12968,4 +12969,13 @@ replays_postgresql!(
         (20, "PGDIV-SUM-INT8-NUMERIC value [engine]: sum(bigint) past int8: ours 22003 'integer overflow'; PG sum(int8) is numeric and answers 9223372036854775808 typed 1700"),
     ]
 );
-replays_postgresql!(pg18_c53_dropnotice_replays_as_postgresql_answered, "pg18-c53-dropnotice.out", []);
+replays_postgresql!(
+    pg18_c53_dropnotice_replays_as_postgresql_answered,
+    "pg18-c53-dropnotice.out",
+    [
+        (9, "PGDIV-SCHEMA-REFUSED ours-only [ours-only]: DROP SCHEMA IF EXISTS dsch1: PG sends NOTICE 'schema \"dsch1\" does not exist, skipping'; the branch server refuses every schema statement but public's with 0A000"),
+        (14, "PGDIV-WRONG-KIND-CODE error-code [wire]: DROP TABLE IF EXISTS of a view: PG 42809 '\"dv2\" is not a table'; ours the same text as 42601 with the 'Parse error: ' prefix"),
+        (17, "PGDIV-CLUSTER-SETTINGS cluster-state [cluster]: SHOW DateStyle: the recording cluster's config set 'ISO, YMD'; ours the built-in 'ISO, MDY'"),
+        (24, "PGDIV-SQLITE-NAME-MESSAGE error-text [wire]: DROP TABLE dm1, dmmissing: PG 42P01 'table \"dmmissing\" does not exist'; ours 42P01 'Parse error: no such table: dmmissing' (nothing dropped on either)"),
+    ]
+);

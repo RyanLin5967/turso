@@ -10,8 +10,9 @@ use turso_parser::ast::{self};
 use turso_pg_parser::translator::{
     is_checkpoint, is_comment_on, is_refresh_matview, try_extract_add_constraints,
     try_extract_branch_call, try_extract_copy_from, try_extract_create_schema,
-    try_extract_drop_schema, try_extract_set, try_extract_show, PgAddConstraints, PgBranchArg,
-    PgBranchCall, PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt, PgSetStmt, PgSetValue,
+    try_extract_drop_objects, try_extract_drop_schema, try_extract_set, try_extract_show,
+    PgAddConstraints, PgBranchArg, PgBranchCall, PgCopyFromStmt, PgCreateSchemaStmt, PgDropKind,
+    PgDropObjectsStmt, PgDropSchemaStmt, PgSetStmt, PgSetValue,
     PgShowStmt, PostgreSQLTranslator, BRANCH_FUNCTION_PREFIX,
 };
 
@@ -51,9 +52,10 @@ struct PgConnectionInner {
     /// server tells it ([`PgConnection::set_explicit_block`]); an implicit block (a multi-statement
     /// query's, a pipeline's) is not one. Read by SET ([`handle_pg_set`]).
     explicit_block: std::sync::atomic::AtomicBool,
-    /// Warnings a statement raised for the client ((SQLSTATE, message)), which the server sends as
-    /// WARNING notices ([`PgConnection::take_warnings`]).
-    warnings: parking_lot::Mutex<Vec<(&'static str, String)>>,
+    /// Notices a statement raised for the client ((severity, SQLSTATE, message): a WARNING, or a
+    /// NOTICE such as DROP ... IF EXISTS's for a missing object), which the server sends before
+    /// the statement's result ([`PgConnection::take_warnings`]).
+    warnings: parking_lot::Mutex<Vec<(&'static str, &'static str, String)>>,
 }
 
 /// The source of [`PgConnectionInner::search_path_stamp`]'s values.
@@ -562,8 +564,8 @@ impl PgConnection {
         self.inner.publish(effective);
     }
 
-    /// The warnings the last statements raised for the client, as (SQLSTATE, message).
-    pub fn take_warnings(&self) -> Vec<(&'static str, String)> {
+    /// The notices the last statements raised for the client, as (severity, SQLSTATE, message).
+    pub fn take_warnings(&self) -> Vec<(&'static str, &'static str, String)> {
         std::mem::take(&mut *self.inner.warnings.lock())
     }
 }
@@ -862,6 +864,7 @@ enum Special {
     Show(PgShowStmt),
     CreateSchema(PgCreateSchemaStmt),
     DropSchema(PgDropSchemaStmt),
+    DropObjects(PgDropObjectsStmt),
     RefreshMatview,
     CommentOn,
     Checkpoint,
@@ -882,6 +885,9 @@ impl Special {
         }
         if let Some(stmt) = try_extract_drop_schema(parse_result) {
             return Some(Special::DropSchema(stmt));
+        }
+        if let Some(stmt) = try_extract_drop_objects(parse_result) {
+            return Some(Special::DropObjects(stmt));
         }
         if is_refresh_matview(parse_result) {
             return Some(Special::RefreshMatview);
@@ -909,6 +915,7 @@ impl Special {
             Special::Set(_)
                 | Special::CreateSchema(_)
                 | Special::DropSchema(_)
+                | Special::DropObjects(_)
                 | Special::AddConstraints(_)
                 | Special::CopyFrom(_)
         )
@@ -1265,7 +1272,11 @@ fn try_prepare_special(
             noop_statement(&pg_conn.conn)?
         }
         Special::DropSchema(stmt) => {
-            handle_pg_drop_schema(&pg_conn.conn, &stmt)?;
+            handle_pg_drop_schema(pg_conn, &stmt)?;
+            noop_statement(&pg_conn.conn)?
+        }
+        Special::DropObjects(stmt) => {
+            handle_pg_drop_objects(pg_conn, &stmt)?;
             noop_statement(&pg_conn.conn)?
         }
         Special::RefreshMatview | Special::CommentOn => noop_statement(&pg_conn.conn)?,
@@ -1363,6 +1374,7 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
     let in_block = !pg_conn.conn.get_auto_commit();
     if scoped && set_stmt.is_local && !in_block {
         pg_conn.warnings.lock().push((
+            "WARNING",
             "25P01",
             "SET LOCAL can only be used in transaction blocks".to_string(),
         ));
@@ -1679,7 +1691,8 @@ fn schema_file_path(conn: &Connection, schema_name: &str) -> String {
     }
 }
 
-fn handle_pg_drop_schema(conn: &Arc<Connection>, stmt: &PgDropSchemaStmt) -> Result<()> {
+fn handle_pg_drop_schema(pg_conn: &Arc<PgConnectionInner>, stmt: &PgDropSchemaStmt) -> Result<()> {
+    let conn = &pg_conn.conn;
     let name = stmt.name.to_lowercase();
     if name == "public" {
         return handle_pg_drop_schema_public(conn, stmt.cascade);
@@ -1687,6 +1700,8 @@ fn handle_pg_drop_schema(conn: &Arc<Connection>, stmt: &PgDropSchemaStmt) -> Res
 
     if !schema_exists(conn, &name)? {
         if stmt.if_exists {
+            // PostgreSQL's notice for the missing schema (recorded, pg18-c53-dropnotice.out).
+            skipping_notice(pg_conn, "schema", &stmt.name);
             return Ok(());
         }
         return Err(LimboError::ParseError(format!(
@@ -1700,6 +1715,114 @@ fn handle_pg_drop_schema(conn: &Arc<Connection>, stmt: &PgDropSchemaStmt) -> Res
 
     execute_sqlite_internal(conn, format!("DETACH \"{name}\""))?;
     Ok(())
+}
+
+/// PostgreSQL's NOTICE for an object DROP ... IF EXISTS did not find: `<kind> "<name>" does not
+/// exist, skipping`, the name as written, without its schema (recorded, pg18-c53-dropnotice.out).
+fn skipping_notice(pg_conn: &Arc<PgConnectionInner>, kind: &str, name: &str) {
+    pg_conn.warnings.lock().push((
+        "NOTICE",
+        "00000",
+        format!("{kind} \"{name}\" does not exist, skipping"),
+    ));
+}
+
+/// [`PgDropObjectsStmt`] as PostgreSQL's RemoveRelations drops it: every object resolved first,
+/// each missing one a NOTICE under IF EXISTS (else the engine's own refusal, before anything is
+/// dropped), then every found one dropped, all or none. An object is found when the engine can
+/// prepare its DROP without IF EXISTS: the engine's own name resolution (search path, attached
+/// schemas) decides, so this never disagrees with the DROP that follows. A schema that is not
+/// attached is missing too, with PostgreSQL's schema notice. A table that is a view, or a view that
+/// is a table, is refused as PostgreSQL refuses it (`"v" is not a table`), never skipped. BLIND
+/// SPOT: "missing" is read from the engine's refusal text ([`drop_refused_as_missing`]); a refusal
+/// worded otherwise propagates as an error, never as a skip.
+fn handle_pg_drop_objects(pg_conn: &Arc<PgConnectionInner>, stmt: &PgDropObjectsStmt) -> Result<()> {
+    let conn = &pg_conn.conn;
+    let quote = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+    let mut found = Vec::with_capacity(stmt.objects.len());
+    for (schema, name) in &stmt.objects {
+        if let Some(schema) = schema.as_deref().filter(|s| *s != "main") {
+            if !schema_exists(conn, schema)? {
+                if stmt.missing_ok {
+                    skipping_notice(pg_conn, "schema", schema);
+                    continue;
+                }
+                return Err(LimboError::ParseError(format!(
+                    "schema \"{schema}\" does not exist"
+                )));
+            }
+        }
+        // A type is named unqualified in the engine (the translator's DROP TYPE kept the last name).
+        let unqualified = matches!(stmt.kind, PgDropKind::Type | PgDropKind::Domain);
+        let target = match schema.as_deref() {
+            Some(schema) if !(unqualified && schema == "main") => {
+                format!("{}.{}", quote(schema), quote(name))
+            }
+            _ => quote(name),
+        };
+        let drop = |keyword: &str| format!("DROP {keyword} {target}");
+        let sql = drop(stmt.kind.keyword());
+        match conn.prepare(&sql) {
+            Ok(_) => found.push(sql),
+            Err(e) if drop_refused_as_missing(stmt.kind, &e) => {
+                // The other relation kind of the name: PostgreSQL refuses the wrong kind.
+                let other = match stmt.kind {
+                    PgDropKind::Table => Some(PgDropKind::View),
+                    PgDropKind::View => Some(PgDropKind::Table),
+                    _ => None,
+                };
+                if let Some(other) = other {
+                    if conn.prepare(drop(other.keyword())).is_ok() {
+                        return Err(LimboError::ParseError(format!(
+                            "\"{name}\" is not a {}",
+                            stmt.kind.word()
+                        )));
+                    }
+                }
+                if !stmt.missing_ok {
+                    return Err(e);
+                }
+                skipping_notice(pg_conn, stmt.kind.word(), name);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    // All or none: several drops run inside a savepoint of their own (in the session's
+    // transaction, or as one of their own).
+    if found.len() < 2 {
+        return found
+            .iter()
+            .try_for_each(|sql| conn.prepare(sql)?.run_ignore_rows());
+    }
+    execute_sqlite_internal(conn, "SAVEPOINT turso_pg_drop_objects")?;
+    let dropped = found
+        .iter()
+        .try_for_each(|sql| conn.prepare(sql)?.run_ignore_rows());
+    match dropped {
+        Ok(()) => execute_sqlite_internal(conn, "RELEASE turso_pg_drop_objects"),
+        Err(e) => {
+            let _ = execute_sqlite_internal(conn, "ROLLBACK TO turso_pg_drop_objects");
+            let _ = execute_sqlite_internal(conn, "RELEASE turso_pg_drop_objects");
+            Err(e)
+        }
+    }
+}
+
+/// Whether the engine refused a DROP of `kind` without IF EXISTS because the object is missing,
+/// by the engine's own words for it (core translate: drop_table, drop_view, drop_index, sequence,
+/// drop_type).
+fn drop_refused_as_missing(kind: PgDropKind, e: &LimboError) -> bool {
+    match (kind, e) {
+        (PgDropKind::Table, LimboError::ParseError(m)) => m.starts_with("no such table"),
+        (PgDropKind::View, LimboError::ParseError(m)) => m.starts_with("no such view"),
+        (PgDropKind::Index, LimboError::InvalidArgument(m)) => m.starts_with("No such index"),
+        (PgDropKind::Sequence, LimboError::ParseError(m)) => {
+            m.starts_with("sequence \"") && m.ends_with("\" does not exist")
+        }
+        (PgDropKind::Type, LimboError::ParseError(m)) => m.starts_with("no such type"),
+        (PgDropKind::Domain, LimboError::ParseError(m)) => m.starts_with("no such domain"),
+        _ => false,
+    }
 }
 
 fn handle_pg_drop_schema_public(conn: &Arc<Connection>, cascade: bool) -> Result<()> {
