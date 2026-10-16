@@ -240,6 +240,9 @@ pub(crate) struct BranchStore {
     /// and joined at `Drop`; `flight_jobs` counts the checkpoints handed to it and finished, for
     /// `join_flights` (F-FZ: `compact_now` and `Drop` wait for every one started so far).
     ckpt_worker: Mutex<Option<CkptWorker>>,
+    /// A fuzzy checkpoint an operation owes, for the worker to start once it has let the store
+    /// mutex go (`maybe_compact`, `start_owed_flight`; L2(d)).
+    start_due: AtomicBool,
     flight_jobs: Arc<(std::sync::Mutex<(u64, u64)>, std::sync::Condvar)>,
     /// The confirmation writer (`run_confirm_writer`; review 6 #1) and the process that started it
     /// (a fork(2) child has no such thread to join): `None` for a volatile or trunk-only store, and
@@ -3736,6 +3739,95 @@ fn ckpt_phase(label: &'static str) {
 /// mutex, and the sharp path (which takes the store mutex, then the writer) refuses while a capture
 /// is in flight, so the two cannot deadlock.
 #[allow(clippy::too_many_arguments)]
+/// What a start's result means for the store (`maybe_compact`, `run_owed_start`): a start that
+/// failed (settle, capture or spawn) backs off as a failed write does (review 4 #2): not retried by
+/// every operation until another threshold's worth of log (mutant `start_failure_retried`, test
+/// builds only); one refused for a flight in the air past the hard limit makes the operations wait
+/// for its install.
+fn settle_start(over_hard: &AtomicBool, inner: &mut StoreInner, started: FlightStart) {
+    match started {
+        FlightStart::Failed => {
+            if let Some(cat) = inner.cat.as_mut() {
+                cat.ckpt.start_failures += 1;
+            }
+            if let Some(journal) = inner.journal.as_mut().filter(|_| !fe_mutant("start_failure_retried")) {
+                journal.defer_compaction();
+            }
+        }
+        FlightStart::InFlight if inner.journal.as_ref().is_some_and(|j| j.past_hard_limit()) => {
+            over_hard.store(true, Ordering::Release);
+        }
+        _ => {}
+    }
+}
+
+/// The checkpoint worker's start of an owed fuzzy checkpoint (`BranchStore::start_owed_flight`):
+/// its capture in a store-mutex hold of the worker's own, then, with the mutex let go, the flight
+/// itself on this same thread (it is the worker already). Nothing if the log no longer wants a
+/// checkpoint (a start that failed since backed it off, or one ran).
+fn run_owed_start(ctx: FlightCtx) {
+    let flight = {
+        let mut inner = ctx.inner.lock();
+        if !inner.journal.as_ref().is_some_and(|j| j.wants_compaction()) {
+            return;
+        }
+        let mut job: Option<CkptJob> = None;
+        let started = BranchStore::start_flight_with(&ctx, &mut inner, None, &mut |j| {
+            job = Some(j);
+            Ok(())
+        });
+        settle_start(&ctx.over_hard, &mut inner, started);
+        job
+    };
+    if let Some(job) = flight {
+        job();
+    }
+}
+
+/// The store's parts a fuzzy checkpoint's start and flight use (`BranchStore::flight_ctx`).
+struct FlightCtx {
+    inner: Arc<StoreMutex>,
+    group: Arc<Group>,
+    class: SyncClass,
+    flight_hold: Arc<AtomicU8>,
+    over_hard: Arc<AtomicBool>,
+    truncating: Arc<AtomicBool>,
+    installs: Arc<(std::sync::Mutex<u64>, std::sync::Condvar)>,
+}
+
+/// `BranchStore::mature`, given the store's group and class.
+fn mature_with(group: &Group, store_class: SyncClass, inner: &mut StoreInner) {
+    // Releases durable now no longer need reporting by a stopped store (engine review 7 #3).
+    if !inner.releases_in_air.is_empty() {
+        let durable = group.durable(store_class);
+        while inner.releases_in_air.front().is_some_and(|r| r.lsn <= durable) {
+            inner.releases_in_air.pop_front();
+        }
+    }
+    if inner.pending_free.is_empty() {
+        return;
+    }
+    // Durable in the free class (review 5 #18, engine review 8 #5): the store's, where an
+    // ordered landing reaches durable(Off) and is durable only when the trunk's WAL flush
+    // returns; a raised D0 store's rewrite class. Mutant `free_at_off` (test builds only):
+    // durable(Off), as before review 5 #18.
+    let class = if fe_mutant("free_at_off") { SyncClass::Off } else { inner.free_class() };
+    inner.mature_frees(group.durable(class));
+    // The bound (engine review 8 #5): a raised D0 store that then runs D0 alone would hold
+    // its frees for ever. Past `hold_bound()` held slots one upgrade flight in the free class
+    // is owed: one sync per bound's worth of frees, led by the store's background writer, off
+    // every acknowledgement path (engine review 13 MED 2), and armed only when none is in the
+    // air (mutant `upgrade_rearms_in_air`, test builds only: re-armed while one is). Past the
+    // hard cap the next freeing operation leads it too. Mutant `hold_unbounded` (test builds
+    // only).
+    if class != store_class && inner.pending_free_slots > hold_bound() && !fe_mutant("hold_unbounded") {
+        if let Some(&(lsn, _)) = inner.pending_free.back() {
+            let overdue = inner.pending_free_slots > hold_bound().saturating_mul(UPGRADE_HARD_CAP);
+            group.arm_upgrade(lsn, overdue);
+        }
+    }
+}
+
 fn run_flight(
     inner: Arc<StoreMutex>,
     group: Arc<Group>,
@@ -4383,6 +4475,7 @@ impl BranchStore {
             inner: Arc::new(StoreMutex::new(StoreInner::fresh(None, SyncClass::Off, None))),
             prewarm: PrewarmStats::default(),
             ckpt_worker: Mutex::new(None),
+            start_due: AtomicBool::new(false),
             flight_jobs: Arc::new((std::sync::Mutex::new((0, 0)), std::sync::Condvar::new())),
             confirm_writer: Mutex::new(None),
             name_filter_build: Mutex::new(Vec::new()),
@@ -4687,6 +4780,7 @@ impl BranchStore {
             inner: Arc::new(StoreMutex::new(inner)),
             prewarm: warmed,
             ckpt_worker: Mutex::new(None),
+            start_due: AtomicBool::new(false),
             flight_jobs: Arc::new((std::sync::Mutex::new((0, 0)), std::sync::Condvar::new())),
             confirm_writer: Mutex::new(None),
             name_filter_build: Mutex::new(Vec::new()),
@@ -5585,35 +5679,7 @@ impl BranchStore {
 
     /// Return the deferred frees a flight has covered (called under the store mutex).
     fn mature(&self, inner: &mut StoreInner) {
-        // Releases durable now no longer need reporting by a stopped store (engine review 7 #3).
-        if !inner.releases_in_air.is_empty() {
-            let durable = self.group.durable(self.class);
-            while inner.releases_in_air.front().is_some_and(|r| r.lsn <= durable) {
-                inner.releases_in_air.pop_front();
-            }
-        }
-        if inner.pending_free.is_empty() {
-            return;
-        }
-        // Durable in the free class (review 5 #18, engine review 8 #5): the store's, where an
-        // ordered landing reaches durable(Off) and is durable only when the trunk's WAL flush
-        // returns; a raised D0 store's rewrite class. Mutant `free_at_off` (test builds only):
-        // durable(Off), as before review 5 #18.
-        let class = if fe_mutant("free_at_off") { SyncClass::Off } else { inner.free_class() };
-        inner.mature_frees(self.group.durable(class));
-        // The bound (engine review 8 #5): a raised D0 store that then runs D0 alone would hold
-        // its frees for ever. Past `hold_bound()` held slots one upgrade flight in the free class
-        // is owed: one sync per bound's worth of frees, led by the store's background writer, off
-        // every acknowledgement path (engine review 13 MED 2), and armed only when none is in the
-        // air (mutant `upgrade_rearms_in_air`, test builds only: re-armed while one is). Past the
-        // hard cap the next freeing operation leads it too. Mutant `hold_unbounded` (test builds
-        // only).
-        if class != self.class && inner.pending_free_slots > hold_bound() && !fe_mutant("hold_unbounded") {
-            if let Some(&(lsn, _)) = inner.pending_free.back() {
-                let overdue = inner.pending_free_slots > hold_bound().saturating_mul(UPGRADE_HARD_CAP);
-                self.group.arm_upgrade(lsn, overdue);
-            }
-        }
+        mature_with(&self.group, self.class, inner);
     }
 
     /// Free what an operation that logged its Release through `log_all` freed (an expiry pass, a
@@ -6117,27 +6183,38 @@ impl BranchStore {
         // cleared by the install under the same mutex, so it is never left set with no flight.
         // (During a WAL truncation no checkpoint starts and none waits: the log can pass twice the
         // threshold by what that truncation's time appends.)
+        // L2(d) (ASYNC-DESIGN R1.3, superseding §6.2's start here): the operation that crossed
+        // the threshold starts no checkpoint inside its own hold; it owes one, and once it has let
+        // the mutex go the checkpoint worker starts it (`start_owed_flight`, `run_owed_start`),
+        // in a hold of its own. Before, one create in 16,384 paid the capture in its hold (raws
+        // l82, l92). Mutant `flight_start_inline` (test builds only): started here, as before.
+        if !fe_mutant("flight_start_inline") {
+            if inner.cat.as_ref().is_some_and(|c| c.flight) {
+                if inner.journal.as_ref().is_some_and(|j| j.past_hard_limit()) {
+                    self.over_hard.store(true, Ordering::Release);
+                }
+                return;
+            }
+            self.start_due.store(true, Ordering::Release);
+            return;
+        }
         held_trace("compact.flight_starting");
         let started = self.start_flight(inner);
         held_trace("compact.flight_start_returned");
-        match started {
-            // A start that failed (settle, capture or spawn) backs off as a failed write does
-            // (review 4 #2): not retried, under this mutex, by every operation until another
-            // threshold's worth of log. Mutant `start_failure_retried` (test builds only).
-            FlightStart::Failed => {
-                if let Some(cat) = inner.cat.as_mut() {
-                    cat.ckpt.start_failures += 1;
-                }
-                if let Some(journal) = inner.journal.as_mut().filter(|_| !fe_mutant("start_failure_retried")) {
-                    journal.defer_compaction();
-                }
-            }
-            FlightStart::InFlight
-                if inner.journal.as_ref().is_some_and(|j| j.past_hard_limit()) =>
-            {
-                self.over_hard.store(true, Ordering::Release);
-            }
-            _ => {}
+        settle_start(&self.over_hard, inner, started);
+    }
+
+    /// The checkpoint an operation owed (`maybe_compact`), started by the checkpoint worker once
+    /// that operation has let the store mutex go: called after the unlock, by every operation that
+    /// can owe one. Nothing is done unless one is owed.
+    fn start_owed_flight(&self) {
+        if !self.start_due.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        let ctx = self.flight_ctx();
+        if let Err(e) = self.dispatch_flight(Box::new(move || run_owed_start(ctx))) {
+            // No worker: the next operation over the threshold owes it again.
+            tracing::warn!("branch catalog checkpoint not started (no worker): {e}");
         }
     }
 
@@ -6145,6 +6222,33 @@ impl BranchStore {
     /// first, at most `SETTLE_BATCH` branches per call, and the checkpoint waits for the next call
     /// while any remain. Returns whether a checkpoint started, or why not.
     fn start_flight(&self, inner: &mut StoreInner) -> FlightStart {
+        let ctx = self.flight_ctx();
+        Self::start_flight_with(&ctx, inner, Some(self), &mut |job| self.dispatch_flight(job))
+    }
+
+    /// What a fuzzy checkpoint's start needs of its store (L2(d)): Arc clones only, so the
+    /// checkpoint worker can run the start itself, off every operation's hold
+    /// (`start_owed_flight`; ASYNC-DESIGN R1.3, superseding §6.2's start in `maybe_compact`).
+    fn flight_ctx(&self) -> FlightCtx {
+        FlightCtx {
+            inner: self.inner.clone(),
+            group: self.group.clone(),
+            class: self.class,
+            flight_hold: self.flight_hold.clone(),
+            over_hard: self.over_hard.clone(),
+            truncating: self.truncating.clone(),
+            installs: self.installs.clone(),
+        }
+    }
+
+    /// `start_flight` given its context: `store` for the one mutant that needs the whole store
+    /// (`settle_at_capture`; `None` on the worker), and `dispatch` to send the flight's job.
+    fn start_flight_with(
+        ctx: &FlightCtx,
+        inner: &mut StoreInner,
+        store: Option<&BranchStore>,
+        dispatch: &mut dyn FnMut(CkptJob) -> std::io::Result<()>,
+    ) -> FlightStart {
         ckpt_held("capture.begin");
         match inner.cat.as_ref() {
             None => return FlightStart::NotCatalog,
@@ -6154,7 +6258,7 @@ impl BranchStore {
         if inner.poisoned() {
             return FlightStart::Poisoned;
         }
-        if self.truncating.load(Ordering::Acquire) {
+        if ctx.truncating.load(Ordering::Acquire) {
             return FlightStart::Truncating;
         }
         // G-b (r13-compose A4.G): every fuzzy path reaches here; a splice-arm store is refused and
@@ -6185,27 +6289,27 @@ impl BranchStore {
         // free in the catalog and taken out of memory only at the install (`Captured::deferred`).
         // Mutant `settle_at_capture` (test builds only): the flush under the mutex, as before.
         if fe_mutant("settle_at_capture") {
-            if let Err(e) = self.settle_durable(inner) {
+            if let Err(e) = store.map_or(Ok(()), |store| store.settle_durable(inner)) {
                 tracing::warn!("branch catalog checkpoint not started: {e}");
                 return FlightStart::Failed;
             }
         }
-        self.mature(inner);
+        mature_with(&ctx.group, ctx.class, inner);
         // Mutant `capture_waits_bounded` (test builds only; review 7 #7's flagged-edit judge): the
         // capture waits, at most 3 s, for a flight in the air: a bounded wait a deadline-only
         // check lets pass.
         #[cfg(test)]
         if fe_mutant("capture_waits_bounded") {
-            let g = self.group.lock();
+            let g = ctx.group.lock();
             if g.flushing {
                 note_wait();
-                let _ = self.group.cv.wait_timeout(g, Duration::from_secs(3));
+                let _ = ctx.group.cv.wait_timeout(g, Duration::from_secs(3));
             }
         }
         let t = Instant::now();
         let q0 = inner.cat.as_ref().map_or(0, |c| c.catalog.counters.queries);
         // Read only for mutant `checkpoint_own_arena_sync`: a fuzzy capture takes no arena handle.
-        let flight_in_air = fe_mutant("checkpoint_own_arena_sync") && self.group.lock().flushing;
+        let flight_in_air = fe_mutant("checkpoint_own_arena_sync") && ctx.group.lock().flushing;
         ckpt_held("capture.matured");
         let cap = match inner.checkpoint_capture_mode(false, true, flight_in_air) {
             Ok(cap) => cap,
@@ -6224,16 +6328,16 @@ impl BranchStore {
         // of a create's 6,288 held allocations when the create started a checkpoint, raw l90).
         let slot: Arc<std::sync::Mutex<Option<Box<Captured>>>> = Arc::new(std::sync::Mutex::new(Some(cap)));
         let job_slot = slot.clone();
-        let shared = self.inner.clone();
-        let group = self.group.clone();
-        let hold = self.flight_hold.clone();
-        let over_hard = self.over_hard.clone();
-        let truncating = self.truncating.clone();
-        let installs = self.installs.clone();
+        let shared = ctx.inner.clone();
+        let group = ctx.group.clone();
+        let hold = ctx.flight_hold.clone();
+        let over_hard = ctx.over_hard.clone();
+        let truncating = ctx.truncating.clone();
+        let installs = ctx.installs.clone();
         let spawned = if inner.failpoint.take_if(|f| *f == BranchFailpoint::SpawnFails).is_some() {
             Err(std::io::Error::other("failpoint: the checkpoint thread was not spawned"))
         } else {
-            self.dispatch_flight(Box::new(move || {
+            dispatch(Box::new(move || {
                 let cap = job_slot.lock().unwrap_or_else(|e| e.into_inner()).take();
                 if let Some(cap) = cap {
                     run_flight(shared, group, writer, cap, hold, over_hard, truncating, installs)
@@ -6859,6 +6963,7 @@ impl BranchStore {
         held_trace("fork.done");
         let work = inner.names.filter.take_owed();
         drop(inner);
+        self.start_owed_flight();
         self.start_filter_work(work);
         Ok(TrunkFork::Forked { id, lsn, after })
     }
@@ -6941,6 +7046,7 @@ impl BranchStore {
         self.maybe_compact(&mut inner);
         let work = inner.names.filter.take_owed();
         drop(inner);
+        self.start_owed_flight();
         self.start_filter_work(work);
         Ok((id, lsn))
     }
@@ -7197,6 +7303,7 @@ impl BranchStore {
         self.maybe_compact(&mut inner);
         let class = inner.sync;
         drop(inner);
+        self.start_owed_flight();
         kill_point("release.applied");
         #[cfg(test)]
         pause_at(Some(&*self.trunk_commit_hold), HOLD_RELEASE_BUFFERED);
@@ -7970,6 +8077,7 @@ impl BranchStore {
                 self.unsynced.store(false, Ordering::Release);
                 self.maybe_compact(&mut inner);
                 drop(inner);
+                self.start_owed_flight();
                 kill_point("trunk.barrier_done");
                 #[cfg(test)]
                 pause_at(Some(&*self.trunk_commit_hold), HOLD_TRUNK_BARRIER_DONE);
@@ -8273,6 +8381,7 @@ impl BranchStore {
         self.maybe_compact(&mut inner);
         let class = inner.sync;
         drop(inner);
+        self.start_owed_flight();
         kill_point("commit.applied");
         let durable = self.wait_durable(lsn, class);
         // fastest-engine mutant `commit_doubt_ignored` (test builds only).

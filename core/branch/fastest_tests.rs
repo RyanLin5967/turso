@@ -9673,6 +9673,7 @@ fn diag_the_create_hold_stall_is_a_checkpoint_start() {
     let trunk = db.connect().unwrap();
     let mut worst: (u64, String, Vec<(&'static str, u64)>, u64) = (0, String::new(), Vec::new(), 0);
     let mut over_64 = 0u32;
+    let mut started_in_a_create = 0u32;
     for i in 0..16_384u32 {
         let name = format!("r-{i:07}");
         let before = super::budget_probe::thread_allocs().2;
@@ -9682,6 +9683,9 @@ fn diag_the_create_hold_stall_is_a_checkpoint_start() {
         let total = trace.last().map_or(0, |(_, n)| n - before);
         if total > 64 {
             over_64 += 1;
+        }
+        if trace.iter().any(|(l, _)| *l == "compact.flight_starting" || l.starts_with("capture.")) {
+            started_in_a_create += 1;
         }
         if total > worst.0 {
             worst = (total, name, trace, before);
@@ -9706,8 +9710,13 @@ fn diag_the_create_hold_stall_is_a_checkpoint_start() {
     // checkpoint start. After L2(d) slice 1 (raw l92) the worst create allocates 60 (the capture's
     // read snapshot 26, its rows 14, its hand-off 12) and none of 16,384 passes 64; the claim is now
     // that bound, which the rows and the snapshot (slices 2-3) must bring to 0.
-    let _ = in_start;
-    assert_eq!(over_64, 0, "CLAIM: {over_64} creates allocated more than 64 times under the store mutex (worst {total}: [{}])", steps.join(" "));
+    // After L2(d)'s owed start the claim is structural: no create's hold runs any part of a
+    // checkpoint's start (no `compact.flight_starting` or `capture.*` trace point in any of the
+    // 16,384 holds). Mutant `flight_start_inline` (the start back in the create's hold) puts them
+    // back. The worst create's allocations are printed, not bounded here (17 measured: its own
+    // apply, raw l100).
+    let _ = (in_start, over_64);
+    assert_eq!(started_in_a_create, 0, "CLAIM: {started_in_a_create} creates ran a checkpoint's start in their store-mutex hold (worst: [{}])", steps.join(" "));
 }
 
 /// Codex C25 HIGH 1 at the store (lead order 00: its "crash arm"): the background writer held after
