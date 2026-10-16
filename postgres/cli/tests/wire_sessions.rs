@@ -1151,6 +1151,50 @@ fn an_ssl_request_flood_that_never_reads_does_not_hold_the_slot() {
     panic!("8 s after the flood began the slot is still held: {last:?}");
 }
 
+/// Bytes a client pipelines after an SSLRequest, before it reads the 'N' (another SSLRequest, or
+/// its StartupMessage), are refused as PostgreSQL 18.6 refuses them (recorded, artie
+/// lanes/wire/raw/loud-20261015/pg18-diff/pg18-ssl3.out, ssl3.py): the 'N', then FATAL 08P01
+/// "received unencrypted data after SSL request", and the connection closes. PostgreSQL refuses
+/// them so that bytes sent before the encryption answer can never be read as the session's
+/// (wire-rev-h1c33 LOW). The pipelined second SSLRequest got 0A000, and the pipelined
+/// StartupMessage was served.
+#[test]
+fn data_pipelined_after_an_ssl_request_is_refused_as_postgresql_refuses_it() {
+    let dir = Scratch::new("sslpipelined");
+    let server = Server::start(&dir.db(), &[]);
+    let ssl = || {
+        let mut b = 8i32.to_be_bytes().to_vec();
+        b.extend_from_slice(&80877103i32.to_be_bytes());
+        b
+    };
+    let startup = {
+        let mut body = 196608i32.to_be_bytes().to_vec();
+        body.extend_from_slice(b"user\0postgres\0database\0postgres\0\0");
+        let mut m = ((body.len() + 4) as i32).to_be_bytes().to_vec();
+        m.extend_from_slice(&body);
+        m
+    };
+    for (case, then) in [("SSL then SSL", ssl()), ("SSL then StartupMessage", startup)] {
+        let mut s = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut both = ssl();
+        both.extend_from_slice(&then);
+        s.write_all(&both).unwrap();
+        let mut got = Vec::new();
+        let _ = s.read_to_end(&mut got);
+        assert_eq!(got.first(), Some(&b'N'), "{case}: the SSLRequest's answer");
+        assert_eq!(got.get(1), Some(&b'E'), "{case}: {:?}", String::from_utf8_lossy(&got));
+        let len = i32::from_be_bytes(got[2..6].try_into().unwrap()) as usize - 4;
+        let e = error_fields(&got[6..6 + len]);
+        assert_eq!(
+            (e.code.as_str(), e.message.as_str()),
+            ("08P01", "received unencrypted data after SSL request"),
+            "{case}"
+        );
+        assert_eq!(got.len(), 6 + len, "{case}: the connection closes after the FATAL");
+    }
+}
+
 /// A second SSLRequest on one connection is refused as PostgreSQL 18.6 refuses it (recorded,
 /// artie lanes/wire/raw/loud-20261015/pg18-diff/pg18-ssl2.out, ssl2.py): 'N' to the first, then
 /// FATAL 0A000 "unsupported frontend protocol 1234.5679: server supports 3.0 to 3.2", and the
