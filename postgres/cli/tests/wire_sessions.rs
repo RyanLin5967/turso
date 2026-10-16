@@ -13301,3 +13301,17 @@ fn c54_virtual_generated_columns_are_explicitly_unsupported() {
     a.q("CREATE TABLE ordinary(virtual INT)").ok("virtual is an identifier");
     a.q("SELECT 'generated always as (a) virtual'").ok("quoted text");
 }
+
+#[test]
+fn c54_information_schema_lists_not_null_as_check() {
+    let dir = Scratch::new("c54-notnull-catalog");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE w(w_id INT PRIMARY KEY)").ok("parent");
+    a.q("CREATE TABLE s(s_i_id INT NOT NULL, s_w_id SMALLINT NOT NULL, PRIMARY KEY(s_w_id,s_i_id), FOREIGN KEY(s_w_id) REFERENCES w(w_id))").ok("child");
+    let sql = "SELECT constraint_type FROM information_schema.table_constraints WHERE table_name = 's' ORDER BY constraint_type";
+    let r = a.q(sql).ok(sql);
+    assert_eq!(r.rows, vec![vec![Some("CHECK".into())], vec![Some("CHECK".into())], vec![Some("FOREIGN KEY".into())], vec![Some("PRIMARY KEY".into())]]);
+    assert_eq!(r.oids, Some(vec![1043]));
+    assert_eq!(a.q("SELECT count(*) FROM information_schema.key_column_usage WHERE table_name='s'").single("only key columns"), "3");
+}
