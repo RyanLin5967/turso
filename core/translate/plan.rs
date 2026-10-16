@@ -1,3 +1,4 @@
+use crate::error::SqlErrorKind;
 use crate::{
     alloc::{self, TursoIteratorExt, TursoVecExt},
     function::{AccumulatorFunc, AggFunc},
@@ -1107,7 +1108,7 @@ pub fn select_star(
                 if let Some(col_name) = &col.name {
                     let in_using = using_cols.iter().any(|u| u.eq_ignore_ascii_case(col_name));
                     if !in_using {
-                        crate::bail_parse_error!(
+                        crate::bail_parse_error!(SqlErrorKind::AmbiguousColumn;
                             "ambiguous column name: {}.{}",
                             table.identifier,
                             col_name

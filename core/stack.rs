@@ -89,8 +89,8 @@ pub(crate) fn trace_scope_with_detail(_label: &'static str, _detail: &'static st
 #[inline]
 pub(crate) fn trace_remaining(_label: &'static str) {}
 
-/// PostgreSQL's message for a statement nested past what its stack allows (SQLSTATE 54001, which the
-/// PostgreSQL frontend reads from this prefix).
+/// PostgreSQL's message for a statement nested past what its stack allows. The guard carries
+/// StatementTooComplex separately, so rewording this message preserves SQLSTATE 54001.
 pub(crate) const STACK_DEPTH_EXCEEDED: &str = "stack depth limit exceeded";
 
 /// The stack a recursive step of planning, optimizing or emitting a nested query may still need
@@ -204,7 +204,7 @@ impl NestGuard {
             None => depth > 0 || EXECUTING.with(|e| e.get()) > 0,
         };
         if refuse {
-            crate::bail_parse_error!("{STACK_DEPTH_EXCEEDED}: {what} nested too deep for this thread's stack");
+            crate::bail_parse_error!(crate::error::SqlErrorKind::StatementTooComplex; "{STACK_DEPTH_EXCEEDED}: {what} nested too deep for this thread's stack");
         }
         #[cfg(test)]
         level_cost::record(depth);

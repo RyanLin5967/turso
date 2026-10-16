@@ -537,7 +537,7 @@ fn update_pragma(
             {
                 return Err(LimboError::InvalidArgument(
                     "Autovacuum is not enabled. Use --experimental-autovacuum flag to enable it."
-                        .to_string(),
+                        .to_string().into(),
                 ));
             }
 
@@ -549,7 +549,7 @@ fn update_pragma(
 
             let Some(auto_vacuum_mode) = requested_mode else {
                 return Err(LimboError::InvalidArgument(
-                    "invalid auto vacuum mode".to_string(),
+                    "invalid auto vacuum mode".to_string().into(),
                 ));
             };
             pager.persist_auto_vacuum_mode(auto_vacuum_mode)?;
@@ -908,7 +908,7 @@ fn query_pragma(
                 Some(ast::Expr::Name(name)) => {
                     let mode_name = normalize_ident(name.as_str());
                     let mode = CheckpointMode::from_str(&mode_name).map_err(|e| {
-                        LimboError::ParseError(format!("Unknown Checkpoint Mode: {e}"))
+                        LimboError::ParseError(format!("Unknown Checkpoint Mode: {e}").into())
                     })?;
                     if matches!(mode, CheckpointMode::Passive { .. }) && !passive_allowed {
                         return Err(LimboError::InvalidArgument(
@@ -1532,7 +1532,7 @@ fn query_pragma(
                         .map_err(|_| {
                             LimboError::ParseError(format!(
                                 "Invalid numeric value for PRAGMA query_only: {i}"
-                            ))
+                            ).into())
                         })?,
                     ast::Expr::Literal(Literal::String(..)) | ast::Expr::Name(..) => {
                         let s = match &value_expr {
@@ -1548,7 +1548,7 @@ fn query_pragma(
                     _ => {
                         return Err(LimboError::ParseError(format!(
                             "Invalid value for PRAGMA query_only: {value_expr:?}"
-                        )));
+                        ).into()));
                     }
                 };
                 connection.set_query_only(is_query_only);

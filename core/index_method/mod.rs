@@ -420,11 +420,11 @@ pub(crate) fn ensure_mvcc_support(
         (IndexMethodMvccSupport::Unsupported, _) => Err(LimboError::ParseError(format!(
             "index method '{}' does not support MVCC",
             definition.method_name
-        ))),
+        ).into())),
         (IndexMethodMvccSupport::ReadOnly, true) => Err(LimboError::ParseError(format!(
             "index method '{}' is read-only in MVCC",
             definition.method_name
-        ))),
+        ).into())),
         (
             IndexMethodMvccSupport::ReadOnly
             | IndexMethodMvccSupport::TransactionalBackingStore
@@ -780,13 +780,13 @@ pub(crate) fn parse_patterns(patterns: &[&str]) -> Result<Vec<ast::Select>> {
         let Some(ast) = parser.next() else {
             return Err(LimboError::ParseError(format!(
                 "unable to parse pattern statement: {pattern}",
-            )));
+            ).into()));
         };
         let ast = ast?;
         let ast::Cmd::Stmt(ast::Stmt::Select(select)) = ast else {
             return Err(LimboError::ParseError(format!(
                 "only select patterns are allowed: {pattern}",
-            )));
+            ).into()));
         };
         parsed.push(select);
     }

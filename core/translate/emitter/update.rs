@@ -1,3 +1,4 @@
+use crate::error::SqlErrorKind;
 use super::gencol::compute_virtual_columns;
 use super::TranslateCtx;
 use crate::alloc::{TryClone, TursoIteratorExt};
@@ -1169,12 +1170,12 @@ fn emit_update_insns<'a>(
             (None, false)
         }
         Operation::HashJoin(_) => {
-            crate::bail_parse_error!(
+            crate::bail_parse_error!(SqlErrorKind::FeatureNotSupported;
                 "access through HashJoin is not supported for update operations"
             )
         }
         Operation::MultiIndexScan(_) => {
-            crate::bail_parse_error!(
+            crate::bail_parse_error!(SqlErrorKind::FeatureNotSupported;
                 "access through MultiIndexScan is not supported for update operations"
             )
         }

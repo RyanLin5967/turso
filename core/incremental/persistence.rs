@@ -49,7 +49,7 @@ impl ReadRecord {
                                 Ok((AggregateState::default(), vec![]))
                             }
                             _ => Err(LimboError::ParseError(
-                                "Value in aggregator not blob or null".to_string(),
+                                "Value in aggregator not blob or null".to_string().into(),
                             )),
                         }?;
                         *self = ReadRecord::Done {

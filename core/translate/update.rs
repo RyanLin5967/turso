@@ -1,3 +1,4 @@
+use crate::error::SqlErrorKind;
 use crate::sync::Arc;
 use rustc_hash::FxHashMap as HashMap;
 
@@ -257,7 +258,7 @@ fn prepare_update_plan(
     let target_name = &body.tbl_name.name;
     let table = match resolver.with_schema(database_id, |s| s.get_table(target_name.as_str())) {
         Some(table) => table,
-        None => bail_parse_error!(
+        None => bail_parse_error!(SqlErrorKind::UndefinedTable;
             "no such table: {}",
             crate::util::table_name_for_error(&body.tbl_name)
         ),
@@ -269,7 +270,7 @@ fn prepare_update_plan(
         );
     }
     if table.btree().is_some_and(|bt| !bt.has_rowid) {
-        bail_parse_error!("UPDATE of WITHOUT ROWID tables is not supported");
+        bail_parse_error!(SqlErrorKind::FeatureNotSupported; "UPDATE of WITHOUT ROWID tables is not supported");
     }
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
@@ -493,7 +494,7 @@ fn collect_update_set_clauses(
                     .enumerate()
                     .find(|(_i, c)| c.is_rowid_alias())
                     .map_or(ROWID_SENTINEL, |(idx, _col)| idx),
-                None => crate::bail_parse_error!("no such column: {}.{}", table_name, col_name),
+                None => crate::bail_parse_error!(SqlErrorKind::UndefinedColumn; "no such column: {}.{}", table_name, col_name),
             };
 
             match set_clauses
@@ -653,7 +654,7 @@ fn check_update_from_column_ambiguity(
             let db_name = connection
                 .get_database_name_by_index(table.database_id)
                 .unwrap_or_else(|| "main".to_string());
-            bail_parse_error!(
+            bail_parse_error!(SqlErrorKind::AmbiguousColumn;
                 "ambiguous column name: {db_name}.{}._ROWID_",
                 table.identifier
             );
@@ -698,7 +699,7 @@ fn check_update_from_column_ambiguity(
                 }
             }
             if found_count > 1 {
-                bail_parse_error!("ambiguous column name: {}", using_col.as_str());
+                bail_parse_error!(SqlErrorKind::AmbiguousColumn; "ambiguous column name: {}", using_col.as_str());
             }
         }
     }

@@ -197,7 +197,7 @@ fn connection_at(
     connection_idx: usize,
 ) -> turso_core::Result<Arc<Connection>> {
     connections.get(connection_idx).cloned().ok_or_else(|| {
-        LimboError::InvalidArgument(format!("invalid connection index {connection_idx}"))
+        LimboError::InvalidArgument(format!("invalid connection index {connection_idx}").into())
     })
 }
 

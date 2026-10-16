@@ -739,8 +739,8 @@ impl Value {
                     return Ok(Value::Null);
                 };
                 match err {
-                    (_, Some(msg)) => Err(LimboError::ExtensionError(msg)),
-                    (code, None) => Err(LimboError::ExtensionError(code.to_string())),
+                    (_, Some(msg)) => Err(LimboError::ExtensionError(msg.into())),
+                    (code, None) => Err(LimboError::ExtensionError(code.to_string().into())),
                 }
             }
         }
@@ -869,7 +869,7 @@ impl<T> Sealed for Option<T> {}
 mod sealed {
     pub trait Sealed {}
 }
-#[allow(unused_imports)] //used in doc comments
+#[allow(unused_imports)]//used in doc comments
 use crate::vdbe::insn::Insn;
 use sealed::Sealed;
 

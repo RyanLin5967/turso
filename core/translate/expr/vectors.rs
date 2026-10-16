@@ -1,3 +1,4 @@
+use crate::error::SqlErrorKind;
 use super::*;
 
 /// Get the number of values returned by an expression
@@ -103,10 +104,10 @@ pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
             1
         }
         Expr::InSelect { .. } => {
-            crate::bail_parse_error!("InSelect is not supported in this position")
+            crate::bail_parse_error!(SqlErrorKind::FeatureNotSupported; "InSelect is not supported in this position")
         }
         Expr::InTable { .. } => {
-            crate::bail_parse_error!("InTable is not supported in this position")
+            crate::bail_parse_error!(SqlErrorKind::FeatureNotSupported; "InTable is not supported in this position")
         }
         Expr::IsNull(expr) => {
             let evs_expr = expr_vector_size(expr)?;
@@ -141,7 +142,7 @@ pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
         Expr::FieldAccess { .. } => 1,
         Expr::Raise(..) => 1,
         Expr::Subquery(_) => {
-            crate::bail_parse_error!("Scalar subquery is not supported in this context")
+            crate::bail_parse_error!(SqlErrorKind::FeatureNotSupported; "Scalar subquery is not supported in this context")
         }
         Expr::Unary(_, expr) => {
             let evs_expr = expr_vector_size(expr)?;

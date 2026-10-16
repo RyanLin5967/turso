@@ -1,3 +1,4 @@
+use crate::error::SqlErrorKind;
 use crate::alloc::{TryClone, TursoIteratorExt, TursoVecExt};
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::Func;
@@ -149,13 +150,13 @@ pub fn translate_create_index(
         let db_name = resolver
             .get_database_name_by_index(database_id)
             .unwrap_or_else(|| "main".to_string());
-        crate::bail_parse_error!("no such table: {}.{}", db_name, original_tbl_name.as_str());
+        crate::bail_parse_error!(SqlErrorKind::UndefinedTable; "no such table: {}.{}", db_name, original_tbl_name.as_str());
     };
     let Some(tbl) = table.btree() else {
         crate::bail_parse_error!("virtual tables may not be indexed");
     };
     if !tbl.has_rowid {
-        bail_parse_error!("CREATE INDEX on WITHOUT ROWID tables is not supported");
+        bail_parse_error!(SqlErrorKind::FeatureNotSupported; "CREATE INDEX on WITHOUT ROWID tables is not supported");
     }
     let columns = resolve_sorted_columns_with_resolver(&tbl, &columns, Some(resolver))?;
 
@@ -633,7 +634,7 @@ pub fn translate_reindex(
     connection: &Arc<crate::Connection>,
 ) -> crate::Result<()> {
     if connection.mvcc_enabled() {
-        bail_parse_error!("REINDEX is not supported in MVCC mode");
+        bail_parse_error!(SqlErrorKind::FeatureNotSupported; "REINDEX is not supported in MVCC mode");
     }
 
     let opts = ProgramBuilderOpts::new(5, 40, 5);
@@ -662,12 +663,12 @@ pub fn translate_reindex(
             .as_ref()
             .is_some_and(|m| !m.definition().backing_btree)
         {
-            bail_parse_error!(
+            bail_parse_error!(SqlErrorKind::FeatureNotSupported;
                 "REINDEX is not supported for custom index methods without a backing btree"
             );
         }
         if !table.has_rowid {
-            bail_parse_error!("REINDEX on WITHOUT ROWID tables is not supported");
+            bail_parse_error!(SqlErrorKind::FeatureNotSupported; "REINDEX on WITHOUT ROWID tables is not supported");
         }
         let index_cursor_id = program.alloc_cursor_index(None, &index)?;
         emit_refill_index(
@@ -975,7 +976,7 @@ fn extract_collation<'a>(
                         None => CollationSeq::new(seq.as_str())?,
                     };
                     if collation.is_custom() {
-                        crate::bail_parse_error!("custom collations are not supported in indexes");
+                        crate::bail_parse_error!(SqlErrorKind::FeatureNotSupported; "custom collations are not supported in indexes");
                     }
                     coll = Some(collation);
                 }
@@ -1234,7 +1235,7 @@ pub fn translate_drop_index(
             return Err(crate::error::LimboError::InvalidArgument(format!(
                 "No such index: {}",
                 &idx_name
-            )));
+            ).into()));
         }
     }
     // Return an error if the index is an auto-generated constraint-backing index.
@@ -1246,7 +1247,7 @@ pub fn translate_drop_index(
         {
             return Err(crate::error::LimboError::InvalidArgument(
                 "index associated with UNIQUE or PRIMARY KEY constraint cannot be dropped"
-                    .to_string(),
+                    .to_string().into(),
             ));
         }
     }
@@ -1453,7 +1454,7 @@ pub fn translate_optimize(
         if !found {
             return Err(LimboError::InvalidArgument(format!(
                 "No such index: {idx_name}"
-            )));
+            ).into()));
         }
     } else {
         // Optimize all index method indexes across all visible databases.

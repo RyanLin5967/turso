@@ -56,7 +56,7 @@ impl std::error::Error for Error {}
 impl From<Error> for crate::LimboError {
     fn from(err: Error) -> Self {
         match err {
-            Error::Message { msg, .. } => crate::LimboError::ParseError(msg),
+            Error::Message { msg, .. } => crate::LimboError::ParseError(msg.into()),
             Error::OutOfMemory => crate::LimboError::OutOfMemory,
         }
     }

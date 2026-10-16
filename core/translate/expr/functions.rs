@@ -1,3 +1,4 @@
+use crate::error::SqlErrorKind;
 use super::*;
 use crate::translate::sequence::emit_sequence_descriptor_literals;
 use crate::vdbe::builder::CursorType;
@@ -98,7 +99,7 @@ pub(super) fn translate_like_base(
             }
             let func = resolver.resolve_function("regexp", 2)?;
             let Some(func) = func else {
-                crate::bail_parse_error!("no such function: regexp");
+                crate::bail_parse_error!(SqlErrorKind::UndefinedFunction; "no such function: regexp");
             };
             let arg_count = 2;
             let start_reg = program.alloc_registers(arg_count);
@@ -231,7 +232,7 @@ pub(super) fn translate_sequence_function(
                 .get_attached_database(&schema_norm)
                 .map(|(idx, _)| idx)
                 .ok_or_else(|| {
-                    LimboError::InvalidArgument(format!("no such database: {schema_norm}"))
+                    LimboError::InvalidArgument(format!("no such database: {schema_norm}").into())
                 })?,
         };
         (db_id, normalize_ident(name))
@@ -253,7 +254,7 @@ pub(super) fn translate_sequence_function(
     let seq_arc = resolver
         .with_schema(database_id, |s| s.get_sequence(&normalized_name).cloned())
         .ok_or_else(|| {
-            LimboError::ParseError(format!("sequence \"{seq_name_raw}\" does not exist"))
+            LimboError::ParseError(format!("sequence \"{seq_name_raw}\" does not exist").into())
         })?;
 
     let start_reg = program.alloc_registers(args.len());
