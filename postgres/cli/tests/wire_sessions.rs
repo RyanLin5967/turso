@@ -1113,6 +1113,25 @@ fn a_syntax_error_quoting_the_stack_message_is_42601_and_a_deep_statement_54001(
     assert_eq!(e.code, "54001", "premise: 200 nested scalar subqueries are refused 54001: {e:?}");
 }
 
+/// A numeric typmod outside PostgreSQL's range is 22023, as PostgreSQL 18 refuses it ("NUMERIC
+/// precision 1001 must be between 1 and 1000", invalid_parameter_value): the DDL's check dropped the
+/// condition and sent 42601 (review of 96b69304b, F8). numeric(p) is numeric(p, 0).
+#[test]
+fn a_numeric_typmod_out_of_range_is_22023() {
+    let dir = Scratch::new("typmod22023");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE TABLE tp1(x numeric(1001))",
+        "CREATE TABLE tp2(x numeric(1001, 2))",
+        "CREATE TABLE tp3(x numeric(0, 0))",
+    ] {
+        let e = a.q(sql).err(sql);
+        assert_eq!(e.code, "22023", "{sql}: {e:?}");
+    }
+    a.q("CREATE TABLE tp4(x numeric(1000, 2))").ok("premise: numeric(1000, 2) is accepted");
+}
+
 /// A client that floods SSLRequests and never reads cannot hold its session, nor the server's one
 /// slot, past the authentication timeout (Codex/Claude C37 H1: the server answered every repeated
 /// SSLRequest with 'N' and blocked for good in a write with no deadline; a second client got
