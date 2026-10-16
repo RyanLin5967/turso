@@ -38,8 +38,8 @@ const PG_QUERY_MAX: usize = 256 << 20;
 const PG_DEPARSE_STACK: usize = 4 << 20;
 
 /// libpg_query's refusals of a statement nested too deeply, in PostgreSQL's class (54001): prost's
-/// recursion limit on the decode of the tree (PostgreSQL answers some of these: a REGISTERED
-/// DIVERGENCE, it answers 1,000 nested scalar subqueries and the decode refuses past about 24), and
+/// recursion limit on the decode of the tree (PostgreSQL answers some of these: a known
+/// divergence, it answers 1,000 nested scalar subqueries and the decode refuses past about 24), and
 /// the C parser's own stack check.
 fn pg_query_error(e: pg_query::Error) -> ParseError {
     let text = e.to_string();

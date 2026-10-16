@@ -4400,7 +4400,7 @@ const EXC_KEYS: [&str; 4] = ["exc_hardcap_upgrades", "exc_header_raise_exclusive
 /// counted exceptions, so every window of every engine cell carries all four keys. Checked here on
 /// the cells of each producer (the per-operation rounds, recovery, the checkpoint arm, the
 /// confirmation arm and the writer under load, a shared-flight arm, the first create, an open).
-/// Expected RED at this commit: no window records them. WRITTEN NOT RUN.
+/// It fails while any window does not record them. WRITTEN NOT RUN.
 #[test]
 fn every_window_records_the_four_exception_counters() {
     if in_child() {
@@ -4430,8 +4430,8 @@ fn every_window_records_the_four_exception_counters() {
 /// a create compacts inline and the engine counts it (`inline_compaction_syncs`; store.rs
 /// `maybe_compact`: a catalog store that is not fuzzy compacts on the operation). Its refusal must
 /// name `exc_inline_compaction_syncs` as moved (not as missing). The negative control is every other
-/// cell: refused only when one of its windows moved one. Expected RED at this commit: the child knows
-/// no cell `exc_sharp`, and nothing refuses a moved counter. WRITTEN NOT RUN.
+/// cell: refused only when one of its windows moved one. It fails while the child knows
+/// no cell `exc_sharp`, or while nothing refuses a moved counter. WRITTEN NOT RUN.
 #[test]
 fn a_cell_whose_window_moved_an_exception_counter_is_not_credited() {
     if in_child() {

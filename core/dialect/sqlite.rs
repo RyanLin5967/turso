@@ -171,7 +171,7 @@ pub fn register_builtin_catalog(
 
 /// Build a `VirtualTable` for each PRAGMA table-valued function. The schemas are fixed and parse,
 /// but the parse can still be refused by the stack guard on a thread with almost no stack left
-/// (the stack-guard class: it panicked here on a 128 KiB thread), so the refusal is returned.
+/// (it panicked here on a 128 KiB thread), so the refusal is returned.
 fn pragma_vtabs() -> crate::Result<Vec<Arc<VirtualTable>>> {
     PragmaVirtualTable::functions()
         .into_iter()
