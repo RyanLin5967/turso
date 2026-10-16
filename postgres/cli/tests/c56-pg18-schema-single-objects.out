@@ -1,0 +1,39 @@
+>> Q CREATE DOMAIN c56_domain AS integer
+   C CREATE DOMAIN
+   Z I
+>> Q DROP SCHEMA public RESTRICT
+   E S=ERROR C=2BP01 M=cannot drop schema public because other objects depend on it
+   Z I
+>> Q DROP SCHEMA public CASCADE
+   N S=NOTICE C=00000 M=drop cascades to type c56_domain
+   C DROP SCHEMA
+   Z I
+>> Q CREATE SCHEMA public
+   C CREATE SCHEMA
+   Z I
+>> Q CREATE TYPE c56_enum AS ENUM ('a')
+   C CREATE TYPE
+   Z I
+>> Q DROP SCHEMA public RESTRICT
+   E S=ERROR C=2BP01 M=cannot drop schema public because other objects depend on it
+   Z I
+>> Q DROP SCHEMA public CASCADE
+   N S=NOTICE C=00000 M=drop cascades to type c56_enum
+   C DROP SCHEMA
+   Z I
+>> Q CREATE SCHEMA public
+   C CREATE SCHEMA
+   Z I
+>> Q CREATE SEQUENCE c56_seq
+   C CREATE SEQUENCE
+   Z I
+>> Q DROP SCHEMA public RESTRICT
+   E S=ERROR C=2BP01 M=cannot drop schema public because other objects depend on it
+   Z I
+>> Q DROP SCHEMA public CASCADE
+   N S=NOTICE C=00000 M=drop cascades to sequence c56_seq
+   C DROP SCHEMA
+   Z I
+>> Q CREATE SCHEMA public
+   C CREATE SCHEMA
+   Z I

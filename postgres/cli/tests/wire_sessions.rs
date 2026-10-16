@@ -12255,6 +12255,27 @@ mod recorded {
         assert!(report.is_empty(), "{report}");
     }
 
+    #[test]
+    fn c56_single_schema_objects_match_pg18_notices() {
+        let commands = parse(include_str!("c56-pg18-schema-single-objects.out"));
+        let dir = Scratch::new("c56-schema-single-objects");
+        let server = Server::start(&dir.db(), &[]);
+        let mut wire = server.connect();
+        let mut report = String::new();
+        for (i, command) in commands.iter().enumerate() {
+            let got = send(&mut wire, &mut Vec::new(), &command.text);
+            if !same(&command.want, &got) {
+                report.push_str(&format!(
+                    "#{} {}\nPG: {:?}\nours: {got:?}\n",
+                    i + 1,
+                    command.text,
+                    command.want
+                ));
+            }
+        }
+        assert!(report.is_empty(), "{report}");
+    }
+
     /// Replay an unchanged sequence of commands selected from a committed PG recording.
     pub(super) fn replay_selected(name: &str, recording: &str, ordinals: &[usize]) {
         let commands = parse(recording);
