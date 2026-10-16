@@ -2589,6 +2589,18 @@ impl PostgreSQLTranslator {
         &self,
         range_var: &pg_query::protobuf::RangeVar,
     ) -> Result<ast::SelectTable, ParseError> {
+        if range_var.relname == "pg_settings"
+            && matches!(
+                schema_qualifier(&range_var.schemaname),
+                SchemaQualifier::Unqualified | SchemaQualifier::PgCatalog
+            )
+            && self.cte_in_scope(range_var).is_none()
+        {
+            return Err(ParseError::ParseError(SqlErrorMessage::classified(
+                SqlErrorKind::FeatureNotSupported,
+                "pg_settings is not supported: setting source and reset metadata are unavailable",
+            )));
+        }
         // The FROM item's alias is the SelectTable's own; left on the name as well, it is written
         // twice ("v1 AS a a") wherever the statement is turned back into SQL, as a view's stored
         // definition is, and the view can never be loaded again.
