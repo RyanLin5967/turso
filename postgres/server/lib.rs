@@ -234,25 +234,38 @@ struct Shared {
     /// How long a client has to complete its startup (TursoPgServer::with_startup_timeout).
     startup_timeout: std::time::Duration,
     /// Every live session's socket, for the shutdown that ends them.
-    sessions: SessionSockets,
+    sessions: Arc<SessionSockets>,
+    #[cfg(test)]
+    before_session: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    fail_socket_clone: std::sync::atomic::AtomicBool,
 }
 
 /// A handle on each live session's socket (a dup of its descriptor), so the server's shutdown can
 /// shut them: a session thread blocked reading its socket then reads the stream's end and ends.
 #[derive(Default)]
 struct SessionSockets {
+    stopping: std::sync::atomic::AtomicBool,
     next: AtomicU64,
     open: Mutex<std::collections::HashMap<u64, std::net::TcpStream>>,
 }
 
 impl SessionSockets {
-    fn register(&self, socket: std::net::TcpStream) -> u64 {
+    fn register(&self, socket: std::net::TcpStream) -> Option<u64> {
+        let mut open = self.open.lock().unwrap_or_else(|e| e.into_inner());
+        // Registration and the final drain hold the same mutex: once shutdown wins,
+        // a worker that has not started cannot add a socket the drain missed.
+        if self.is_stopping() {
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+            return None;
+        }
         let id = self.next.fetch_add(1, Ordering::Relaxed);
-        self.open
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(id, socket);
-        id
+        open.insert(id, socket);
+        Some(id)
+    }
+
+    fn is_stopping(&self) -> bool {
+        self.stopping.load(Ordering::Acquire)
     }
 
     fn deregister(&self, id: u64) {
@@ -265,6 +278,7 @@ impl SessionSockets {
     /// Shut every live session's socket both ways; returns how many.
     fn shut_all(&self) -> usize {
         let open = self.open.lock().unwrap_or_else(|e| e.into_inner());
+        self.stopping.store(true, Ordering::Release);
         for socket in open.values() {
             let _ = socket.shutdown(std::net::Shutdown::Both);
         }
@@ -278,6 +292,7 @@ impl SessionSockets {
 /// A cancel that arrives between statements is dropped, as PostgreSQL drops it.
 struct Interrupts {
     waits: Arc<SessionWaits>,
+    sessions: Arc<SessionSockets>,
     cancel: std::sync::atomic::AtomicBool,
     /// The running statement's deadline, in microseconds since `base`; 0 none.
     deadline_us: AtomicU64,
@@ -294,9 +309,10 @@ thread_local! {
 }
 
 impl Interrupts {
-    fn new(waits: Arc<SessionWaits>) -> Self {
+    fn new(waits: Arc<SessionWaits>, sessions: Arc<SessionSockets>) -> Self {
         Self {
             waits,
+            sessions,
             cancel: std::sync::atomic::AtomicBool::new(false),
             deadline_us: AtomicU64::new(0),
             base: std::time::Instant::now(),
@@ -327,7 +343,7 @@ impl Interrupts {
 
     /// The progress handler's question: stop the running statement?
     fn should_stop(&self) -> bool {
-        if self.cancel.load(Ordering::Relaxed) {
+        if self.sessions.is_stopping() || self.cancel.load(Ordering::Relaxed) {
             INTERRUPT_CAUSE.with(|c| c.set(1));
             return true;
         }
@@ -403,8 +419,20 @@ impl Shared {
             cancels: Mutex::new(std::collections::HashMap::new()),
             next_pid: std::sync::atomic::AtomicI32::new(1),
             startup_timeout: std::time::Duration::from_secs(DEFAULT_AUTHENTICATION_TIMEOUT_S),
-            sessions: SessionSockets::default(),
+            sessions: Arc::new(SessionSockets::default()),
+            #[cfg(test)]
+            before_session: Mutex::new(None),
+            #[cfg(test)]
+            fail_socket_clone: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    fn clone_session_socket(&self, socket: &std::net::TcpStream) -> std::io::Result<std::net::TcpStream> {
+        #[cfg(test)]
+        if self.fail_socket_clone.load(Ordering::Relaxed) {
+            return Err(std::io::Error::other("test socket duplication failure"));
+        }
+        socket.try_clone()
     }
 
     fn uses(
@@ -446,7 +474,7 @@ impl Shared {
     /// 5); only a refusal pays the wait (lead ruling).
     #[cfg(test)]
     fn claim(&self, name: &str, severity: &str) -> SqlResult<()> {
-        self.claim_for(name, severity, &Interrupts::new(self.waits.clone()))
+        self.claim_for(name, severity, &Interrupts::new(self.waits.clone(), self.sessions.clone()))
     }
 
     /// [`Shared::claim`] for a statement: its cancel or statement_timeout ends the wait.
@@ -475,7 +503,7 @@ impl Shared {
     /// closing releases it within that), then refused with 55006.
     #[cfg(test)]
     fn begin_delete(&self, name: &str) -> SqlResult<()> {
-        self.begin_delete_for(name, &Interrupts::new(self.waits.clone()))
+        self.begin_delete_for(name, &Interrupts::new(self.waits.clone(), self.sessions.clone()))
     }
 
     /// [`Shared::begin_delete`] for a statement: its cancel or statement_timeout ends the wait.
@@ -604,6 +632,15 @@ impl TursoPgServer {
     /// each session's socket is shut, so a thread blocked reading it reads the stream's end and
     /// ends. Waits up to SHUTDOWN_JOIN; returns (sessions shut, threads joined, threads left).
     fn end_sessions(&self) -> (usize, usize, usize) {
+        let shut = self.shared.sessions.shut_all();
+        // A session blocked in a wait (the branch-in-use wait, C42's helper) reads `stopping` only
+        // when woken: wake every waiter now, under the wait's mutex as a cancel does, so none sleeps
+        // past the stop with the flag already set (C42 x C43 review: the store was made outside the
+        // wait mutex and only a cancel entry woke a waiter).
+        {
+            let _uses = self.shared.waits.uses();
+            self.shared.waits.changed.notify_all();
+        }
         for interrupts in self
             .shared
             .cancels
@@ -614,7 +651,6 @@ impl TursoPgServer {
         {
             interrupts.request_cancel();
         }
-        let shut = self.shared.sessions.shut_all();
         let threads = std::mem::take(&mut *self.threads.lock().unwrap_or_else(|e| e.into_inner()));
         let deadline = std::time::Instant::now() + SHUTDOWN_JOIN;
         let (mut joined, mut left) = (0, 0);
@@ -689,6 +725,9 @@ impl TursoPgServer {
 
     /// Start a session thread for `socket`, or refuse it with 53300 when the server is full.
     fn admit(&self, socket: tokio::net::TcpStream, addr: std::net::SocketAddr) {
+        if self.shared.sessions.is_stopping() {
+            return;
+        }
         let Some(slot) = SessionSlot::take(&self.shared) else {
             // As PostgreSQL does: the client gets FATAL 53300 at startup. The refusal is cheap and
             // runs here, on the accept thread.
@@ -704,11 +743,29 @@ impl TursoPgServer {
                 return;
             }
         };
+        let handle = match self.shared.clone_session_socket(&socket) {
+            Ok(handle) => handle,
+            Err(e) => {
+                error!("Error registering a session socket for {}: {}", addr, e);
+                return;
+            }
+        };
+        let Some(registered) = Registered::new(self.shared.sessions.clone(), handle) else {
+            return;
+        };
         let shared = self.shared.clone();
+        #[cfg(test)]
+        let before_session = shared.before_session.lock().unwrap().take();
         let spawned = std::thread::Builder::new()
             .name("pg-session".to_string())
             .stack_size(SESSION_STACK)
-            .spawn(move || run_session(shared, socket, addr, slot));
+            .spawn(move || {
+                #[cfg(test)]
+                if let Some(before_session) = before_session {
+                    before_session();
+                }
+                run_session(shared, socket, addr, slot, registered)
+            });
         match spawned {
             Ok(handle) => {
                 let mut threads = self.threads.lock().unwrap_or_else(|e| e.into_inner());
@@ -754,14 +811,8 @@ fn run_session(
     socket: std::net::TcpStream,
     addr: std::net::SocketAddr,
     _slot: SessionSlot,
+    _registered: Registered<Arc<SessionSockets>>,
 ) {
-    // A handle on the socket for the server's shutdown, which shuts it so a blocked read returns.
-    // Given back by a guard, so a session that panics (an unwinding build) does not leak the dup
-    // (Claude C37 M3).
-    let _registered = socket
-        .try_clone()
-        .ok()
-        .map(|handle| Registered::new(&shared.sessions, handle));
     let session = Arc::new(Session::new(shared.clone()));
     if let Err(e) = futures::executor::block_on(serve_session(socket, session)) {
         error!("Error processing connection from {}: {}", addr, e);
@@ -769,21 +820,19 @@ fn run_session(
 }
 
 /// A session's socket held in [`SessionSockets`] until the guard drops, however the session ends.
-struct Registered<'a> {
-    sockets: &'a SessionSockets,
+struct Registered<S: std::ops::Deref<Target = SessionSockets>> {
+    sockets: S,
     id: u64,
 }
 
-impl<'a> Registered<'a> {
-    fn new(sockets: &'a SessionSockets, socket: std::net::TcpStream) -> Self {
-        Self {
-            id: sockets.register(socket),
-            sockets,
-        }
+impl<S: std::ops::Deref<Target = SessionSockets>> Registered<S> {
+    fn new(sockets: S, socket: std::net::TcpStream) -> Option<Self> {
+        let id = sockets.register(socket)?;
+        Some(Self { id, sockets })
     }
 }
 
-impl Drop for Registered<'_> {
+impl<S: std::ops::Deref<Target = SessionSockets>> Drop for Registered<S> {
     fn drop(&mut self) {
         self.sockets.deregister(self.id);
     }
@@ -1379,7 +1428,7 @@ static CHECKPOINTS_SKIPPED: AtomicU64 = AtomicU64::new(0);
 
 impl Session {
     fn new(shared: Arc<Shared>) -> Self {
-        let interrupts = Arc::new(Interrupts::new(shared.waits.clone()));
+        let interrupts = Arc::new(Interrupts::new(shared.waits.clone(), shared.sessions.clone()));
         let pid = shared.next_pid.fetch_add(1, Ordering::Relaxed);
         // The secret from the OS's CSPRNG (one draw per session): only a client that read the
         // BackendKeyData can cancel the session, and a CancelRequest must name both. A session
@@ -7841,3 +7890,4 @@ mod tests {
 
 #[cfg(test)]
 mod wait_tests;
+mod shutdown_tests;
