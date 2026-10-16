@@ -230,7 +230,7 @@ impl PostgreSQLTranslator {
             )),
             Some(Node::RangeSubselect(r)) => {
                 let mut columns = match r.subquery.as_deref().and_then(|q| q.node.as_ref()) {
-                    Some(Node::SelectStmt(q)) => select_output_names(q),
+                    Some(Node::SelectStmt(q)) => self.subquery_column_names(q),
                     _ => None,
                 };
                 if let (Some(columns), Some(a)) = (columns.as_mut(), &r.alias) {
@@ -2832,7 +2832,14 @@ impl PostgreSQLTranslator {
                 ));
             }
         };
-        let select = self.translate_select(select_stmt)?;
+        let mut select = self.translate_select(select_stmt)?;
+        if let Some(alias) = range_sub.alias.as_ref().filter(|alias| !alias.colnames.is_empty()) {
+            let columns = self.subquery_column_names(select_stmt).ok_or_else(|| {
+                ParseError::ParseError(SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported,
+                    "a derived alias column list requires known output columns"))
+            })?;
+            select = alias_select_columns(select, columns, alias)?;
+        }
         if let Some(a) = &range_sub.alias {
             self.note_from_name(&a.aliasname);
         }
@@ -2841,6 +2848,43 @@ impl PostgreSQLTranslator {
             .as_ref()
             .map(|a| ast::As::Elided(ast::Name::from_string(a.aliasname.clone())));
         Ok(ast::SelectTable::Select(select, alias))
+    }
+
+    fn subquery_column_names(&self, select: &pg_query::protobuf::SelectStmt) -> Option<Vec<String>> {
+        use pg_query::protobuf::node::Node;
+        let _nest = crate::nest().ok()?;
+        if let Some(left) = &select.larg { return self.subquery_column_names(left); }
+        if select.target_list.is_empty() { return cte_output_names(select); }
+        self.in_cte_scope(&select.with_clause, || {
+            let mut columns = Vec::new();
+            for target in &select.target_list {
+                let Some(Node::ResTarget(target)) = target.node.as_ref() else { return None; };
+                if !target.name.is_empty() { columns.push(target.name.clone()); continue; }
+                let value = target.val.as_ref()?;
+                if let Some(Node::ColumnRef(reference)) = value.node.as_ref() {
+                    if matches!(reference.fields.last()?.node.as_ref(), Some(Node::AStar(_))) {
+                        let mut relations = Vec::new();
+                        for item in &select.from_clause { self.using_relations(item, &mut relations); }
+                        if reference.fields.len() == 1 {
+                            // The engine merges USING columns in a different order than PostgreSQL;
+                            // do not apply positional aliases over an output order we cannot promise.
+                            if select.from_clause.iter().any(|item| item.node.as_ref().is_some_and(|node| {
+                                node.nodes().iter().any(|(node, ..)| matches!(node,
+                                    pg_query::NodeRef::JoinExpr(join) if join.is_natural || !join.using_clause.is_empty()))
+                            })) { return None; }
+                            for (_, names) in relations { columns.extend(names?); }
+                        } else {
+                            let Some(Node::String(table)) = reference.fields.first()?.node.as_ref() else { return None; };
+                            let (_, names) = relations.into_iter().find(|(name, _)| name == &table.sval)?;
+                            columns.extend(names?);
+                        }
+                        continue;
+                    }
+                }
+                columns.push(figure_colname(value));
+            }
+            Some(columns)
+        })
     }
 
     fn translate_range_function(
@@ -7155,6 +7199,45 @@ fn diagnostic_type_name(oid: u32) -> Option<&'static str> {
         1184 => "timestamp with time zone", 1186 => "interval", 1700 => "numeric",
         2278 => "void", 3802 => "jsonb",
         _ => return None,
+    })
+}
+
+// A CTE's explicit column list binds positions, including duplicate source names, and keeps
+// inner ORDER BY names in their original scope. Selecting by source names would read the first
+// duplicate twice; changing target aliases would break that ORDER BY.
+fn alias_select_columns(
+    select: ast::Select,
+    mut columns: Vec<String>,
+    alias: &pg_query::protobuf::Alias,
+) -> Result<ast::Select, ParseError> {
+    if alias.colnames.len() > columns.len() {
+        let message = format!("table \"{}\" has {} columns available but {} columns specified",
+            alias.aliasname, columns.len(), alias.colnames.len());
+        return Err(ParseError::ParseError(SqlErrorMessage::classified(
+            SqlErrorKind::InvalidColumnReference, message.clone()).with_protocol_text(message)));
+    }
+    rename_columns(&mut columns, &alias.colnames);
+    let source_sql = select.to_string();
+    let mut name = "__turso_pg_derived_columns".to_string();
+    while source_sql.contains(&name) { name.push('_'); }
+    let name = ast::Name::from_string(name);
+    Ok(ast::Select {
+        with: Some(ast::With { recursive: false, ctes: vec![ast::CommonTableExpr {
+            tbl_name: name.clone(),
+            columns: columns.into_iter().map(|name| ast::IndexedColumn {
+                col_name: ast::Name::from_string(name), collate: None, order: None,
+            }).collect(),
+            materialized: ast::Materialized::Any,
+            select,
+        }] }),
+        body: ast::SelectBody {
+            select: ast::OneSelect::Select {
+                distinctness: None, columns: vec![ast::ResultColumn::Star],
+                from: Some(ast::FromClause { select: Box::new(ast::SelectTable::Table(
+                    ast::QualifiedName::single(name), None, None)), joins: vec![] }),
+                where_clause: None, group_by: None, window_clause: vec![],
+            }, compounds: vec![],
+        }, order_by: vec![], limit: None,
     })
 }
 

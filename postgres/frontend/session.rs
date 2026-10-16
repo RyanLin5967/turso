@@ -2706,7 +2706,11 @@ fn is_delete_using(sql: &str, parse: &turso_pg_parser::pg_query::ParseResult) ->
 fn has_alias_column_list(parse: &turso_pg_parser::pg_query::ParseResult) -> bool {
     use turso_pg_parser::pg_query::NodeRef;
     parse.protobuf.nodes().iter().any(|(n, ..)| {
-        matches!(n, NodeRef::RangeVar(rv) if rv.alias.as_ref().is_some_and(|a| !a.colnames.is_empty()))
+        match n {
+            NodeRef::RangeVar(rv) => rv.alias.as_ref().is_some_and(|a| !a.colnames.is_empty()),
+            NodeRef::RangeSubselect(subquery) => subquery.alias.as_ref().is_some_and(|a| !a.colnames.is_empty()),
+            _ => false,
+        }
     })
 }
 
