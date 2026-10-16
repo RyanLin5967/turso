@@ -13746,3 +13746,14 @@ fn c54_derived_column_lists_rename_positions() {
     assert_eq!(r.oids, Some(vec![23, 25]));
     assert_eq!(r.rows, vec![vec![Some("1".into()), Some("one".into())]]);
 }
+
+
+#[test]
+fn c54_sqlite_table_functions_are_undefined() {
+    let dir = Scratch::new("c54-sqlite-table-function");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in ["SELECT * FROM pragma_table_info('t')", "SELECT \"TYPEOF\"(1)"] {
+        assert_eq!(a.q(sql).err(sql).code, "42883", "{sql}");
+    }
+}
