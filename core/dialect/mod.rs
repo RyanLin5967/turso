@@ -448,6 +448,28 @@ mod tests {
     }
 
     #[test]
+    fn c52_sqlite_view_source_and_values_survive_reopen() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        for create in [true, false] {
+            let db = open_db(&io, "c52-sqlite-view.db", Arc::new(SqliteDialect)).unwrap();
+            let conn = db.connect().unwrap();
+            if create {
+                conn.execute("CREATE TABLE t(a INTEGER)").unwrap();
+                conn.execute("INSERT INTO t VALUES(7)").unwrap();
+                conn.execute("CREATE VIEW v AS SELECT a + 1 AS n FROM t").unwrap();
+                conn.execute("ALTER TABLE t RENAME COLUMN a TO b").unwrap();
+            }
+            let rows = conn.prepare("SELECT n FROM v").unwrap().run_collect_rows().unwrap();
+            assert_eq!(rows, vec![vec![crate::Value::from_i64(8)]]);
+            let stored = conn.prepare("SELECT sql FROM sqlite_schema WHERE name='v'")
+                .unwrap().run_collect_rows().unwrap();
+            assert_eq!(stored.len(), 1);
+            assert!(!stored[0][0].to_string().contains("turso_frontend:postgres"));
+            conn.close().unwrap();
+        }
+    }
+
+    #[test]
     fn schema_load_routes_through_dialect() {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         {

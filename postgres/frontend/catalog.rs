@@ -4392,3 +4392,92 @@ mod tests {
         }
     }
 }
+
+
+#[cfg(test)]
+mod c52_view_replay_tests {
+    use super::*;
+    #[test]
+    fn c52_legacy_view_vacuum_keeps_sql_and_later_rename_working() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy-view.db");
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let original;
+        {
+            // Build the executable-only representation that older frontend versions
+            // persisted, without passing it through the new PG source formatter.
+            let db = turso_core::Database::open_file_with_flags(
+                io.clone(), path.to_str().unwrap(), turso_core::OpenFlags::default(),
+                turso_core::DatabaseOpts::new(), None, Arc::new(turso_core::SqliteDialect),
+            ).unwrap();
+            let conn = db.connect().unwrap();
+            conn.execute("CREATE TABLE t(b INTEGER)").unwrap();
+            conn.execute("INSERT INTO t VALUES(1)").unwrap();
+            conn.execute("CREATE VIEW v AS SELECT b IS 1 AS truth FROM t").unwrap();
+            original = conn.prepare("SELECT sql FROM sqlite_schema WHERE name='v'")
+                .unwrap().run_collect_rows().unwrap();
+            assert_eq!(original.len(), 1);
+            conn.close().unwrap();
+        }
+        {
+            let db = crate::session::open_database_with_io(
+                io.clone(), path.to_str().unwrap(), turso_core::OpenFlags::default(),
+                turso_core::DatabaseOpts::new(),
+            ).unwrap();
+            let conn = db.connect().unwrap();
+            conn.execute("VACUUM").unwrap();
+            let replayed = conn.prepare("SELECT sql FROM sqlite_schema WHERE name='v'")
+                .unwrap().run_collect_rows().unwrap();
+            assert_eq!(replayed, original, "legacy SQL must remain byte-equivalent");
+            conn.execute("ALTER TABLE t RENAME COLUMN b TO c").unwrap();
+            let rows = conn.prepare("SELECT truth FROM v").unwrap().run_collect_rows().unwrap();
+            assert_eq!(rows, vec![vec![turso_core::Value::from_i64(1)]]);
+            conn.close().unwrap();
+        }
+        let db = crate::session::open_database_with_io(
+            io, path.to_str().unwrap(), turso_core::OpenFlags::default(),
+            turso_core::DatabaseOpts::new(),
+        ).unwrap();
+        let conn = db.connect().unwrap();
+        let rows = conn.prepare("SELECT truth FROM v").unwrap().run_collect_rows().unwrap();
+        assert_eq!(rows, vec![vec![turso_core::Value::from_i64(1)]]);
+        conn.close().unwrap();
+    }
+
+    #[test]
+    fn c52_original_view_vacuum_keeps_paired_source_byte_equivalent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("original-view.db");
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let original;
+        {
+            let db = crate::session::open_database_with_io(
+                io.clone(), path.to_str().unwrap(), turso_core::OpenFlags::default(),
+                turso_core::DatabaseOpts::new(),
+            ).unwrap();
+            let conn = db.connect().unwrap();
+            conn.execute("CREATE VIEW v AS SELECT true AS flag, '*/ λ' AS quoted").unwrap();
+            original = conn.prepare("SELECT sql FROM sqlite_schema WHERE name='v'")
+                .unwrap().run_collect_rows().unwrap();
+            assert_eq!(original.len(), 1);
+            for _ in 0..2 {
+                conn.execute("VACUUM").unwrap();
+                let replayed = conn.prepare("SELECT sql FROM sqlite_schema WHERE name='v'")
+                    .unwrap().run_collect_rows().unwrap();
+                assert_eq!(replayed, original, "both source and executable SQL must remain stable");
+            }
+            conn.close().unwrap();
+        }
+        let db = crate::session::open_database_with_io(
+            io, path.to_str().unwrap(), turso_core::OpenFlags::default(),
+            turso_core::DatabaseOpts::new(),
+        ).unwrap();
+        let conn = db.connect().unwrap();
+        let replayed = conn.prepare("SELECT sql FROM sqlite_schema WHERE name='v'")
+            .unwrap().run_collect_rows().unwrap();
+        assert_eq!(replayed, original);
+        let rows = conn.prepare("SELECT flag FROM v").unwrap().run_collect_rows().unwrap();
+        assert_eq!(rows, vec![vec![turso_core::Value::from_i64(1)]]);
+        conn.close().unwrap();
+    }
+}
