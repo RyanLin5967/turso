@@ -2790,6 +2790,43 @@ fn an_expiry_that_crosses_the_threshold_starts_a_checkpoint() {
     drop(held);
 }
 
+/// Review REVIEW-claude-engine-M1 MED-1 (lead order after c1809b546): no checkpoint worker
+/// exists after a store closes. A thread that outlives the store's close with its own handle on
+/// the store mutex (the name filter's and the confirmation writer's do) sends a start it owed;
+/// held between the starter's `closing` check and its dispatch while the store closes, at
+/// c1809b546 it then found the worker slot empty and started a NEW worker, unjoined, holding the
+/// store's files after the close. Here the send must hand no job out.
+#[test]
+fn a_start_sent_after_the_store_closed_starts_no_worker() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(
+        &dir.path().join("closed-starter.db"),
+        opts(true, SyncClass::Fsync).with_branch_checkpoint(super::BranchCheckpoint::Fuzzy),
+    );
+    let probe = db.branches.starter_probe();
+    probe.hold();
+    let sender = {
+        let probe = probe.clone();
+        std::thread::spawn(move || probe.owe())
+    };
+    let t = std::time::Instant::now();
+    while !probe.arrived() && t.elapsed() < std::time::Duration::from_secs(10) {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(probe.arrived(), "premise: the owed start reached the starter's hold");
+    let before = probe.handed_out();
+    drop(db);
+    assert!(probe.closed(), "premise: the store closed while the start was held");
+    probe.release();
+    sender.join().unwrap();
+    assert_eq!(
+        probe.handed_out(),
+        before,
+        "CLAIM: a start sent after the store closed was handed to a checkpoint worker"
+    );
+}
+
 /// Review 2 #5: a checkpoint that failed is not retried by the very next operation — the log is
 /// past the threshold still, so without a back-off every create would start (and pay for) another
 /// one: it waits for another threshold's worth of log.

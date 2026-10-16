@@ -1446,6 +1446,9 @@ struct StoreMutex {
     /// sent and the next owing operation owes it again.
     start_due: AtomicBool,
     starter: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
+    /// Test builds: the starter's hold (`HOLD_STARTER_SENDING`), per store.
+    #[cfg(test)]
+    starter_hold: AtomicU8,
 }
 
 impl StoreMutex {
@@ -1453,6 +1456,8 @@ impl StoreMutex {
         Self {
             start_due: AtomicBool::new(false),
             starter: std::sync::OnceLock::new(),
+            #[cfg(test)]
+            starter_hold: AtomicU8::new(0),
             inner: Mutex::new(inner),
             compacting: AtomicU64::new(0),
             compaction_waits: AtomicU64::new(0),
@@ -2106,6 +2111,10 @@ pub(crate) const HOLD_BEFORE_SETTLE: u8 = 15;
 /// change to a frozen state meanwhile goes through the table's copy-on-write.
 #[cfg(test)]
 pub(crate) const HOLD_BEFORE_ROWS: u8 = 21;
+/// The starter of an owed checkpoint, held before it hands the start to the checkpoint worker
+/// (review REVIEW-claude-engine-M1 MED-1: a store closing meanwhile).
+#[cfg(test)]
+pub(crate) const HOLD_STARTER_SENDING: u8 = 22;
 /// Test builds: compare every fuzzy checkpoint's copy-on-write rows with the capture's own
 /// (`verify_frozen_rows`), as `FE_CAPTURE_VERIFY` does for a whole run; and the differences found.
 #[cfg(test)]
@@ -4251,6 +4260,41 @@ impl CkptWorker {
     }
 }
 
+/// Test builds: `BranchStore::starter_probe`.
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct StarterProbe {
+    store: Arc<StoreMutex>,
+    jobs: Arc<(std::sync::Mutex<(u64, u64)>, std::sync::Condvar)>,
+    closing: Arc<AtomicBool>,
+}
+
+#[cfg(test)]
+impl StarterProbe {
+    /// A hold that owes a checkpoint start, as `maybe_compact` leaves one: its unlock sends it.
+    pub(crate) fn owe(&self) {
+        let guard = self.store.lock();
+        self.store.start_due.store(true, Ordering::Release);
+        drop(guard);
+    }
+    pub(crate) fn hold(&self) {
+        self.store.starter_hold.store(HOLD_STARTER_SENDING, Ordering::Release);
+    }
+    pub(crate) fn arrived(&self) -> bool {
+        self.store.starter_hold.load(Ordering::Acquire) == HOLD_STARTER_SENDING | HOLD_ARRIVED
+    }
+    pub(crate) fn release(&self) {
+        self.store.starter_hold.store(0, Ordering::Release);
+    }
+    /// Checkpoint jobs handed to a worker so far.
+    pub(crate) fn handed_out(&self) -> u64 {
+        self.jobs.0.lock().unwrap_or_else(|e| e.into_inner()).0
+    }
+    pub(crate) fn closed(&self) -> bool {
+        self.closing.load(Ordering::Acquire)
+    }
+}
+
 /// A cut being prepared (`begin_cut`): holds the group's `cutting` until dropped, so no group flight
 /// writes the log while its kept part is copied, however the checkpoint ends.
 struct CutGate<'a> {
@@ -6387,6 +6431,8 @@ impl BranchStore {
             let Some(inner) = shared.upgrade() else {
                 return;
             };
+            #[cfg(test)]
+            pause_at(Some(&inner.starter_hold), HOLD_STARTER_SENDING);
             let ctx = FlightCtx {
                 inner,
                 group: group.clone(),
@@ -6400,6 +6446,13 @@ impl BranchStore {
                 tracing::warn!("branch catalog checkpoint not started (no worker): {e}");
             }
         }));
+    }
+
+    /// Test builds: a handle on this store's starter that outlives the store (review
+    /// REVIEW-claude-engine-M1 MED-1), as a filter or confirmation thread's `Arc` does.
+    #[cfg(test)]
+    pub(crate) fn starter_probe(&self) -> StarterProbe {
+        StarterProbe { store: self.inner.clone(), jobs: self.flight_jobs.clone(), closing: self.closing.clone() }
     }
 
     /// F-FZ: start a fuzzy checkpoint unless one is in flight. Parked Commits (C-R) are settled
