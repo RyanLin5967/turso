@@ -821,6 +821,13 @@ def as_state(rec, wc):
             d["lab_flush_ios_delta"] = d.get("flush_ios_delta")
 
     put(r["arms"]["fsync"]["timed"], rec["leaf"].get("write_cache"))
+    # the A27 pair counts the same drive's flushes over the two labelling runs: a derived drive's pair is derived with
+    # it (both runs at the synthesised labelling count), or a real-mode base fails A27 ("the pair's first count is not
+    # its labelling count") and every plant of the other state is NOT-RUN (found 2026-10-16 by the C27 caller case)
+    lp = r["arms"]["fsync"].get("lab_pair")
+    if rec["leaf"].get("write_cache") != wc and isinstance(lp, dict):
+        lp["first"] = lp["second"] = r["arms"]["fsync"]["timed"]["lab_flush_ios_delta"]
+        lp["problem"] = None
     r["leaf"]["write_cache"] = wc
     # the report the gate wants for this state: 'none (RAM)' on brd (fourth lane review HIGH 3)
     r["leaf"]["drive_reports"] = drive_report_for(r["leaf"].get("disk"), wc)
@@ -877,7 +884,8 @@ def plants(rec):
         r["leaf"].setdefault("layers", []).append({"name": "loop-plant", "write_cache": "write back",
                                                    "flush_ios_delta": 2 * N, "lab_flush_ios_delta": 2 * N})
         # and its backing filesystem synced and expected, as a real loop's would be (annex A24-AM1's coverage rule)
-        for y in (r["arms"]["fsync"].get("sync") or {}).values():
+        # every sync record the gates read, the A27 pair's included (lab2_sync; a caller the C27 MED fix missed)
+        for y in list((r["arms"]["fsync"].get("sync") or {}).values()) + list((lab2_sync(r["arms"]["fsync"]) or {}).values()):
             if isinstance(y, dict) and isinstance(y.get("layers"), list):
                 y["layers"].append({"path": "/plant/loop-plant.img", "rc": 0, "secs": 0.0})
         if isinstance(r["leaf"].get("sync_paths"), list):
