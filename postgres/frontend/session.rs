@@ -1104,6 +1104,7 @@ fn prepare_statement_checked(
                 .with_columns(move |schema, table| relation_columns(&pg_conn, schema, table))
         } else if is_positional_insert_default(sql, &parse_result)
             || has_alias_column_list(&parse_result)
+            || has_generate_series(&parse_result)
         {
             let pg_conn = pg_conn.clone();
             PostgreSQLTranslator::new()
@@ -2687,6 +2688,14 @@ fn has_alias_column_list(parse: &turso_pg_parser::pg_query::ParseResult) -> bool
         matches!(n, NodeRef::RangeVar(rv) if rv.alias.as_ref().is_some_and(|a| !a.colnames.is_empty()))
     })
 }
+
+fn has_generate_series(parse: &turso_pg_parser::pg_query::ParseResult) -> bool {
+    use turso_pg_parser::pg_query::{protobuf::node::Node, NodeRef};
+    parse.protobuf.nodes().iter().any(|(node, ..)| {
+        matches!(node, NodeRef::FuncCall(call)
+            if matches!(call.funcname.last().and_then(|name| name.node.as_ref()),
+                Some(Node::String(name)) if name.sval == "generate_series"))
+    })
 
 /// Whether the statement holds an INSERT with no column list whose VALUES lists hold DEFAULT.
 fn is_positional_insert_default(sql: &str, parse: &turso_pg_parser::pg_query::ParseResult) -> bool {
