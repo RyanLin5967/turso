@@ -90,6 +90,8 @@
 set -uo pipefail
 # the virtio disk identity (t3lib.sh dev_identity) is a DRY-VIRT run's alone: never inherited, set below only by --dry-block
 unset T3_IDENTITY_MODE
+# host_quiet's test hooks (a faked systemctl or clock) and knobs never reach a run from the caller's environment
+unset T3_SYSTEMCTL T3_CLOCKDELTA T3_QUIET_WATCH_S T3_QUIET_MAX_S T3_CLOCK_ADJUSTERS
 REPO_URL=https://github.com/RyanLin5967/turso
 SHA="" OUT="" DRY=0 MANIFEST="" FSLIST="" DEVICE="" DESTROY="" SEED=20261005 BLOCK="" PLANT="" PLP="" DEV_REAL=""
 DRY_BLOCK="" DRYB_GIVEN="" STAMP=""
