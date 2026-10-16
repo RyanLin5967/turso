@@ -2271,6 +2271,30 @@ fn startup_announces_the_settings_show_answers() {
     }
 }
 
+/// SET reads every value it is given, as PostgreSQL does: a setting PostgreSQL reads as one value
+/// takes one, so `SET client_encoding TO UTF8, LATIN1` and `SET TimeZone TO UTC, GMT` are 22023
+/// "SET <name> takes only one argument" (its flatten_set_variable_args, guc_funcs.c:233, read),
+/// and DateStyle, a list there, is read whole: `SET DateStyle TO ISO, DMY` is 0A000 and `SET
+/// DateStyle TO ISO, MDY` keeps `ISO, MDY`. Only the first value was read, so each of these
+/// answered SET on its first (wire review 18 item 19).
+#[test]
+fn set_reads_every_value_it_is_given() {
+    let dir = Scratch::new("setvalues");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "SET client_encoding TO UTF8, LATIN1",
+        "SET TimeZone TO UTC, GMT",
+    ] {
+        assert_eq!(a.q(sql).err(sql).code, "22023", "{sql}");
+    }
+    let sql = "SET DateStyle TO ISO, DMY";
+    assert_eq!(a.q(sql).err(sql).code, "0A000", "{sql}");
+    a.q("SET DateStyle TO ISO, MDY")
+        .ok("a list that keeps ISO, MDY");
+    assert_eq!(a.q("SHOW DateStyle").single("DateStyle"), "ISO, MDY");
+}
+
 /// encode(bytea, format) answers as PostgreSQL's does: 'abc' in hex is 616263 and 'ab' in base64
 /// YWI=, a NULL argument is NULL, and an unknown format is 22023 "unrecognized encoding". It was no
 /// function at all (42883), found by the cloud run of bind_reads_each_parameter_in_its_format.
