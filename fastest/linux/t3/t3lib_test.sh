@@ -437,6 +437,12 @@ check "the outcome: CLOCK_REALTIME moving 0.12 s against MONOTONIC over the watc
 quiet_setup "" "" "0.5"
 check "an unreadable clock sample refuses (never a pass)" \
   "! env $QENV \"$BASH\" -c 'source \"\$0\"; host_quiet \"\$1\"' \"$HERE/t3lib.sh\" \"$T/quiet.tsv\""
+quiet_setup "" "" ""
+# dry run 10 (2026-10-16): the stage refused "cannot sample the clocks ('' then '')" -- every case above fakes the
+# clock, so none ran the default sampler, whose quoting had broken. This one runs the real sampler (python3's
+# CLOCK_REALTIME and CLOCK_MONOTONIC, both on macOS and Linux)
+check "the DEFAULT clock sampler (no T3_CLOCKDELTA) samples, and a still clock passes" \
+  "env -u T3_CLOCKDELTA T3_SYSTEMCTL=$T/systemctl T3_QUIET_WATCH_S=0 T3_QUIET_MAX_S=0.05 \"\$BASH\" -c 'source \"\$0\"; host_quiet \"\$1\"' \"$HERE/t3lib.sh\" \"$T/quiet.tsv\""
 quiet_setup "" "" "0.5 0.5"; touch "$T/sc/timers.broken"
 check "systemctl list-timers failing refuses (the guard cannot read its input)" \
   "! env $QENV \"$BASH\" -c 'source \"\$0\"; host_quiet \"\$1\"' \"$HERE/t3lib.sh\" \"$T/quiet.tsv\""
