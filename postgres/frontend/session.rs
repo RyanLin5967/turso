@@ -508,6 +508,7 @@ impl PgConnection {
         &self,
         sql: &str,
         msg: &mut ParseMessage,
+        declared: &[Option<u32>],
     ) -> Result<Option<(Statement, StatementTypes)>> {
         use turso_pg_parser::pg_query::NodeRef;
         let analysed = msg.parse.as_ref().is_some_and(|parse| {
@@ -525,7 +526,7 @@ impl PgConnection {
         if !analysed || msg.call.is_some() {
             return Ok(None);
         }
-        let mut types = StatementTypes::default();
+        let mut types = StatementTypes::from_declared(declared);
         let stmt = prepare_statement_parsed(
             &self.inner,
             sql,

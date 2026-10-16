@@ -1249,7 +1249,7 @@ struct SessionState {
     /// (see [`Session::begin_implicit`]).
     implicit: bool,
     /// The statement the last Describe prepared, for the Execute that follows it to run instead of
-    /// preparing it again (see [`Session::describe_prepare`]); cleared at Sync.
+    /// preparing it again (see [`Session::describe_prepare_with_params`]); cleared at Sync.
     described: Option<Described>,
     /// Notices the session's statements raised and the client has not been sent yet: the simple
     /// protocol sends each before its statement's result, the extended one before ReadyForQuery.
@@ -2080,7 +2080,7 @@ impl Session {
 
     /// The Parse step's analysis ([`PgConnection::parse_step`]): a statement PostgreSQL analyses
     /// at Parse is prepared now, from the Parse's one parse, and kept for the round's Bind,
-    /// Describe and Execute ([`Session::describe_prepare`] finds it), its parameters typed now as
+    /// Describe and Execute ([`Session::describe_prepare_with_params`] finds it), its parameters typed now as
     /// PostgreSQL types them at Parse (42P18 for one it cannot type). Any other statement's
     /// declared parameters must each have a type (42P18), as there; it is prepared when it runs.
     fn parse_step(
@@ -2095,12 +2095,14 @@ impl Session {
         let conn = self
             .current(&mut self.state())
             .map_err(PgWireError::UserError)?;
-        match conn.parse_step(&parsed.sql, msg).map_err(engine_error)? {
+        let declared_oids: Vec<_> = declared.iter().map(|ty| ty.as_ref().map(Type::oid)).collect();
+        match conn.parse_step(&parsed.sql, msg, &declared_oids).map_err(engine_error)? {
             Some((stmt, types)) => {
                 parameter_types(&types, declared).map_err(PgWireError::UserError)?;
                 self.state().described = Some(Described {
                     conn: conn.inner().clone(),
                     sql: parsed.sql.clone(),
+                    declared: declared_oids,
                     stmt,
                     types,
                 });
@@ -2176,7 +2178,7 @@ impl Session {
         }
     }
 
-    /// The result columns of the statement [`Session::describe_prepare`] kept, a bare parameter's
+    /// The result columns of the statement [`Session::describe_prepare_with_params`] kept, a bare parameter's
     /// typed by the parameter's type (`declared`, else inferred: [`result_column_types`]).
     fn described_fields(
         &self,
@@ -2188,7 +2190,7 @@ impl Session {
         })
     }
 
-    /// The parameter types of the statement [`Session::describe_prepare`] kept (see
+    /// The parameter types of the statement [`Session::describe_prepare_with_params`] kept (see
     /// [`parameter_types`]); only the declared ones when it kept none.
     fn described_parameters(&self, declared: &[Option<Type>]) -> SqlResult<Vec<Type>> {
         let st = self.state();
@@ -3857,7 +3859,10 @@ impl ExtendedQueryHandler for Session {
         // (Describe's prepare, kept for the Describe and Execute that follow, so a round prepares
         // once as before); a branch call's are text, read by the call itself.
         if portal.statement.statement.call.is_none() && !portal.parameters.is_empty() {
-            self.describe_prepare(&portal.statement.statement.sql)?;
+            self.describe_prepare_with_params(
+                &portal.statement.statement.sql,
+                &portal.statement.parameter_types,
+            )?;
             let params = self
                 .described_parameters(&portal.statement.parameter_types)
                 .map_err(PgWireError::UserError)?;
