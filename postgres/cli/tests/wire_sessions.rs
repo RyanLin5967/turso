@@ -13293,12 +13293,20 @@ fn c54_composite_output_is_explicitly_unsupported() {
 }
 
 #[test]
-fn c54_virtual_generated_columns_are_explicitly_unsupported() {
+fn c54_virtual_generated_columns_compute_their_expression() {
     let dir = Scratch::new("c54-virtual-generated");
     let server = Server::start(&dir.db(), &[]);
     let mut a = server.connect();
-    for sql in ["CREATE TABLE gv(a INT, b INT GENERATED ALWAYS AS (a * 2) VIRTUAL)", "CREATE TABLE gv(a INT, b INT GENERATED ALWAYS AS ((a + 1) * 2) /* comment */ VIRTUAL)"] {
-        assert_eq!(a.q(sql).err(sql).code, "0A000", "{sql}");
+    for (sql, expected) in [
+        ("CREATE TABLE gv(a INT, b INT GENERATED ALWAYS AS (a * 2) VIRTUAL)", "6"),
+        ("CREATE TABLE gv(a INT, b INT GENERATED ALWAYS AS ((a + 1) * 2) /* comment */ VIRTUAL)", "8"),
+    ] {
+        a.q(sql).ok(sql);
+        a.q("INSERT INTO gv(a) VALUES(3)").ok("base column write");
+        let r = a.q("SELECT a,b FROM gv").ok("generated value");
+        assert_eq!(r.oids, Some(vec![23, 23]));
+        assert_eq!(r.rows, vec![vec![Some("3".into()), Some(expected.into())]]);
+        a.q("DROP TABLE gv").ok("next expression");
     }
     a.q("CREATE TABLE ordinary(virtual INT)").ok("virtual is an identifier");
     a.q("SELECT 'generated always as (a) virtual'").ok("quoted text");
