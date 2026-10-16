@@ -12068,19 +12068,46 @@ fn python_repr_matches_pgproto_for_the_cases_recordings_hold() {
     }
 }
 
+/// The replays this file declares, read from its own source: each `replays_postgresql!` invocation's
+/// recording file and the IDs its register entries cite (the first word of each entry's reason).
+/// Only the invocations are read: an ID or a file name in a comment, a doc or any other string
+/// counts for nothing (wire-rev-h1c33 MED B: the scan read every string of the file).
+fn declared_replays() -> Vec<(&'static str, Vec<&'static str>)> {
+    let source = include_str!("wire_sessions.rs");
+    let mut out = Vec::new();
+    let mut rest = source;
+    while let Some(at) = rest.find("\nreplays_postgresql!(") {
+        let body_start = at + "\nreplays_postgresql!(".len();
+        let body_len = rest[body_start..]
+            .find(");\n")
+            .expect("an invocation ends with `);` at a line's end");
+        let body = &rest[body_start..body_start + body_len];
+        // The strings of the body: the recording file first, then one reason per entry.
+        let strings: Vec<&str> = body.split('"').skip(1).step_by(2).collect();
+        let (file, reasons) = strings.split_first().expect("an invocation names its recording");
+        let ids = reasons
+            .iter()
+            .map(|r| r.split_whitespace().next().unwrap_or(""))
+            .collect();
+        out.push((*file, ids));
+        rest = &rest[body_start + body_len..];
+    }
+    out
+}
+
 /// Every ID in COMPAT.md's recorded-divergence table is cited by some replay's register, and every
 /// cited ID is in the table: the two cannot drift apart (the lead's condition on the register,
-/// 2026-10-15: every registered divergence has a COMPAT entry and its PostgreSQL recording).
+/// 2026-10-15: every registered divergence has a COMPAT entry and its PostgreSQL recording). Cited
+/// means in a `replays_postgresql!` register ([`declared_replays`]), nowhere else.
 #[test]
 fn every_recorded_divergence_has_its_compat_entry_and_every_entry_is_cited() {
     let ids = recorded::compat_ids();
     assert!(!ids.is_empty(), "refused: COMPAT.md's divergence table has no row");
-    let source = include_str!("wire_sessions.rs");
-    let cited: std::collections::BTreeSet<&str> = source
-        .split('"')
-        .filter(|s| s.starts_with("PGDIV-"))
-        .filter_map(|s| s.split_whitespace().next())
-        .filter(|id| id.len() > "PGDIV-".len())
+    let replays = declared_replays();
+    assert!(!replays.is_empty(), "refused: no replays_postgresql! invocation read");
+    let cited: std::collections::BTreeSet<&str> = replays
+        .iter()
+        .flat_map(|(_, ids)| ids.iter().copied())
         .collect();
     let table: std::collections::BTreeSet<&str> = ids.iter().copied().collect();
     let uncited: Vec<_> = table.difference(&cited).collect();
@@ -12089,6 +12116,26 @@ fn every_recorded_divergence_has_its_compat_entry_and_every_entry_is_cited() {
         uncited.is_empty() && missing.is_empty(),
         "COMPAT.md rows no register cites: {uncited:?}; register IDs with no COMPAT.md row: {missing:?}"
     );
+}
+
+/// The class's scope is the pgproto recordings: every file in tests/pg18 is replayed by exactly one
+/// `replays_postgresql!` here, and every replay names a file there, so a recording copied in and
+/// never replayed cannot pass for covered (wire-rev-h1c33 MED B). Recordings made with other
+/// drivers (pgraw.py, raw3.py, the startup and settings scripts) are not in tests/pg18 and are not
+/// replayed; their cases stay with the hand-written tests that cite them.
+#[test]
+fn every_pg18_recording_has_one_replay() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pg18");
+    let mut files: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|f| f.ends_with(".out"))
+        .collect();
+    files.sort();
+    assert!(!files.is_empty(), "refused: no recording in {}", dir.display());
+    let mut replayed: Vec<String> = declared_replays().into_iter().map(|(f, _)| f.to_string()).collect();
+    replayed.sort();
+    assert_eq!(files, replayed, "the recordings in tests/pg18 against the replays declared here");
 }
 
 macro_rules! replays_postgresql {
