@@ -634,8 +634,11 @@ fn fa_upgrade_hold_child() {
         return;
     };
     let n: usize = n.parse().unwrap();
+    // The store's version: 18 (the older build's, upgraded by the checkpoint), or 22 (this build's
+    // own, the control: no upgrade).
+    let version: u32 = std::env::var("FE_FA_HOLD_VERSION").map_or(18, |v| v.parse().unwrap());
     let path = std::path::Path::new(&dir).join("h.db");
-    stand_in(Some(18));
+    stand_in((version == 18).then_some(18));
     {
         let db = open_arm(&path, SyncClass::Off, 18).unwrap();
         let trunk = db.connect().unwrap();
@@ -644,7 +647,7 @@ fn fa_upgrade_hold_child() {
             let _ = trunk.fork_branch().unwrap().into_id();
         }
         db.branch_compact_now().unwrap();
-        assert_eq!(catalog_version(&db), Some(18), "premise: an 18 catalog");
+        assert_eq!(catalog_version(&db), Some(version), "premise: a {version} catalog");
     }
     stand_in(None);
     let db = open_arm(&path, SyncClass::Off, 18).unwrap();
@@ -657,11 +660,16 @@ fn fa_upgrade_hold_child() {
 }
 
 fn upgrade_hold(n: usize) -> (u64, u64, String) {
+    upgrade_hold_at(n, 18)
+}
+
+fn upgrade_hold_at(n: usize, version: u32) -> (u64, u64, String) {
     let dir = tempfile::TempDir::new().unwrap();
     let out = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["branch::format_authority_tests::fa_upgrade_hold_child", "--exact", "--test-threads=1", "--nocapture"])
         .env("FE_FA_HOLD_DIR", dir.path())
         .env("FE_FA_HOLD_N", n.to_string())
+        .env("FE_FA_HOLD_VERSION", version.to_string())
         .output()
         .unwrap();
     let text = String::from_utf8_lossy(&out.stdout).to_string();
@@ -792,4 +800,20 @@ fn a_kill_at_the_upgrade_flip_leaves_an_18_store_that_finishes_later() {
 #[test]
 fn a_kill_at_the_upgrade_flip_leaves_a_17_store_that_finishes_later() {
     a_killed_upgrade_leaves_an_older_store(17, "ckpt.upgrade.flip:1");
+}
+
+/// Diagnostic (no verdict): the same first checkpoint's largest hold for a store this build made
+/// (22, no upgrade), beside the 18 store's, to place the hold BYTES the L4 red reads beside its
+/// rows (522,955 at 10^3, 868,707 at 10^4 at 3582a98b5): the upgrade's, or every first checkpoint's.
+#[test]
+fn diag_first_checkpoint_hold_bytes_with_and_without_the_upgrade() {
+    if std::env::var_os("FE_FA_HOLD_N").is_some() {
+        return;
+    }
+    for version in [22, 18] {
+        for n in [1_000, 10_000] {
+            let (rows, bytes, fmt) = upgrade_hold_at(n, version);
+            println!("DIAG hold version={version} n={n} rows={rows} bytes={bytes} format={fmt}");
+        }
+    }
 }
