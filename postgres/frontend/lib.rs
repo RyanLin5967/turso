@@ -1,4 +1,6 @@
 mod aliases;
+#[cfg(test)]
+mod c54_table_lifecycle_tests;
 mod catalog;
 #[cfg(test)]
 mod c52_view_lifecycle_tests;
