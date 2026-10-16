@@ -152,6 +152,8 @@ fn no_nesting_shape_kills_the_process_on_the_postgresql_route() {
             let got = in_child(test, 8 * 1024, &sql);
             if got.starts_with("died") {
                 died.push(format!("{shape} at depth {depth} ({} bytes of SQL) on 8 MiB: {got}", sql.len()));
+            } else if got.contains("StackDepthLimitExceeded") || got.contains("stack depth limit exceeded") {
+                refused += 1;
             }
         }
     }
