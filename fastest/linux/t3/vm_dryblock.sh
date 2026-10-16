@@ -13,14 +13,17 @@
 # (<out>.tar.gz and its sha256) is copied to OUTDIR. The VM is stopped afterwards; nothing is deleted.
 # OUTDIR/host-disk.tsv traces the host's free space and the VM images every 30 s; under HOST_STOP_GIB (30) free the
 # VM is stopped mid-run and the exit is 3.
-# Environment (bounded, never above the ruling): VM_CPUS (default 4), VM_MEM_GIB (8), DATA_GIB (60), ROOT_MIN_GIB (25).
+# Environment (bounded, never above the ruling): VM_CPUS (default 4), VM_MEM_GIB (8), DATA_GIB (16), ROOT_MIN_GIB (25).
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 source "$HERE/t3lib.sh"
 SHA=${1:?SHA} OUTDIR=${2:?OUTDIR}; shift 2
 FSL=${*:-xfs btrfs}
 VM=fl-t3 DISK=t3data
-CPUS=${VM_CPUS:-4} MEM=${VM_MEM_GIB:-8} DATA=${DATA_GIB:-60} ROOT_MIN=${ROOT_MIN_GIB:-25}
+# DATA_GIB 16 (the lead's ruling, DECISIONS 2026-10-16): a btrfs block's copy-on-write fsyncs leave every touched
+# block allocated in the sparse image (run 15: 8.6 GiB in one minute), so the device size is the bound on the host's
+# data image; any ENOSPC this causes refuses the block (summarize enospc_problems), never retried smaller
+CPUS=${VM_CPUS:-4} MEM=${VM_MEM_GIB:-8} DATA=${DATA_GIB:-16} ROOT_MIN=${ROOT_MIN_GIB:-25}
 command -v limactl > /dev/null || { echo "vm_dryblock: REFUSED: limactl is not installed"; exit 2; }
 [[ $CPUS =~ ^[0-9]+$ && $MEM =~ ^[0-9]+$ ]] && [ "$CPUS" -le 4 ] && [ "$MEM" -le 8 ] ||
   { echo "vm_dryblock: REFUSED: the VM may have at most 4 CPUs and 8 GiB (asked $CPUS CPUs, $MEM GiB)"; exit 2; }

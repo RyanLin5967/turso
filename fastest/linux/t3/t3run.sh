@@ -187,6 +187,13 @@ exec > >(tee -a "$OUT/t3run.log") 2>&1
 echo "# t3run sha=$SHA src=$SRC out=$OUT dry=$DRY block=$BLOCK plant=${PLANT:-none} manifest=$MANIFEST seed=$SEED start=$(date -u +%FT%TZ)"
 printf 'dry=%s\nblock=%s\nplant=%s\nplp=%s\nstamp=%s\n' "$DRY" "$BLOCK" "$PLANT" "$PLP" "$STAMP" > "$OUT/mode.txt"
 [ -z "$STAMP" ] || echo "$STAMP" > "$OUT/STAMP"
+# the lead's DATA_GIB ruling (2026-10-16): a DRY-VIRT run discloses how it differs from the T3 box (summarize reads
+# dry-virt.txt into dry_virt_differences and refuses a DRY-VIRT package without it). Today: the data device's size
+if [ "$STAMP" = DRY-VIRT ]; then
+  b=$(lsblk -bdn -o SIZE "$DEVICE" 2>/dev/null | tr -d ' ')
+  printf 'data device: %s, %s bytes (%s GiB, the VM disk vm_dryblock.sh made, DATA_GIB); the T3 box runs on its NVMe at the drive'"'"'s full size\n' \
+    "$DEVICE" "${b:-unreadable}" "$([ -n "$b" ] && echo $((b / 1073741824)) || echo '?')" > "$OUT/dry-virt.txt"
+fi
 
 stage() { # stage <name> <function>: time it, record rc; a failed stage ends the run (rc 1)
   local name=$1 s e rc
@@ -827,9 +834,14 @@ for FS_NOW in $FSLIST; do
   BLOCKNO=$((BLOCKNO + 1))
   PLANT_NOW=""; [ $BLOCKNO = 1 ] && PLANT_NOW=$PLANT
   s=$(date +%s)
+  BLOCK_T0=$s  # the kernel log's start; fs_block's own code may reuse s
   echo "== stage fs-$FS_NOW $(date -u +%FT%TZ)${PLANT_NOW:+ (plant $PLANT_NOW)}"
   fs_block
   rc=$?
+  # the kernel's log over the block, so a btrfs allocation failure or an ENOSPC the kernel reports is in the package
+  # (summarize's enospc_problems refuses the block on one: the lead's DATA_GIB ruling)
+  sudo -n journalctl -k -o short-iso --no-pager --since "@$BLOCK_T0" > "$OUT/fs-$FS_NOW/kernel-log.txt" 2>&1 ||
+    sudo -n dmesg > "$OUT/fs-$FS_NOW/kernel-log.txt" 2>&1
   # the root's share of the run's disk (DECISIONS 18f492601b: run 14's root image grew 4.3 GiB over one block, which
   # the data filesystem's space.txt cannot see): the root filesystem and this run's out dir at each block's end, so a
   # package states its own disk cost beside the host trace vm_dryblock keeps
