@@ -4717,8 +4717,11 @@ fn a_dump_headers_settings_are_accepted() {
     for (sql, code) in [
         ("SET xmloption = document", "0A000"),
         ("SET transaction_timeout = '5s'", "0A000"),
-        ("SET default_tablespace = 'fast'", "0A000"),
-        ("SET default_table_access_method = columnar", "0A000"),
+        // PostgreSQL 18.6 refuses these values itself, 22023 (recorded,
+        // pg18-audit1-ws-a_dump_headers_settings_are_accepted.out #16, #17). FLAGGED TEST EDIT
+        // (C44-M2): they were pinned at this server's 0A000.
+        ("SET default_tablespace = 'fast'", "22023"),
+        ("SET default_table_access_method = columnar", "22023"),
         ("SET geqo_threshold = 12", "0A000"),
         ("SHOW geqo_threshold", "0A000"),
         ("SET no_such_parameter = 1", "42704"),
@@ -12285,8 +12288,6 @@ replays_postgresql!(
         (1, "PGDIV-PUBLIC-SCHEMA-NOOP cluster-state [cluster]: DROP SCHEMA public CASCADE: PG drops 4 leftover objects (NOTICE) and recreates; ours no-op then CREATE SCHEMA public 'already exists'"),
         (14, "PGDIV-SET-REFUSED ours-only [ours-only]: SET xmloption = document refused 0A000 (PG: SET)"),
         (15, "PGDIV-SET-REFUSED ours-only [ours-only]: SET transaction_timeout = '5s' refused 0A000 (PG: SET)"),
-        (16, "PGDIV-SET-REFUSED error-code [wire]: SET default_tablespace = 'fast': PG 22023 invalid value for parameter; ours 0A000 not supported"),
-        (17, "PGDIV-SET-REFUSED error-code [wire]: SET default_table_access_method = columnar: PG 22023 invalid value; ours 0A000 not supported"),
         (18, "PGDIV-SET-REFUSED ours-only [ours-only]: SET geqo_threshold = 12 refused 0A000 (PG: SET)"),
         (19, "PGDIV-SET-REFUSED ours-only [ours-only]: SHOW geqo_threshold refused 0A000 (PG: '12'; would also cascade from #18)"),
         (20, "PGDIV-PARSE-PREFIX error-text [wire]: 42704 both; ours prefixes the message with 'Parse error: '"),

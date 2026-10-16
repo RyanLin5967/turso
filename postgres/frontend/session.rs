@@ -1592,11 +1592,27 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
             format!("SET {name} = {text} is not supported: {what}"),
         )))
     };
-    let invalid = || {
+    // A value PostgreSQL itself refuses is its 22023 with its message, under its spelling of the
+    // name; one it accepts and this server does not act on is 0A000 (`unsupported`). Every refused
+    // value was 0A000 (C44-M2; recorded, pg18-c44-m2-sets.out).
+    let pg_name = pg_parameter_name(&name);
+    let refused = |message: String| {
         Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
             SqlErrorKind::InvalidParameterValue,
-            format!("invalid value for parameter \"{name}\": \"{text}\""),
+            message,
         )))
+    };
+    let invalid = || refused(format!("invalid value for parameter \"{pg_name}\": \"{text}\""));
+    let not_boolean = || refused(format!("parameter \"{pg_name}\" requires a Boolean value"));
+    // A timeout PostgreSQL reads as a number of milliseconds outside 0 .. i32::MAX.
+    let out_of_range_ms = || {
+        let digits = text.trim();
+        match digits.parse::<i64>() {
+            Ok(n) => refused(format!(
+                "{n} ms is outside the valid range for parameter \"{pg_name}\" (0 ms .. 2147483647 ms)"
+            )),
+            Err(_) => invalid(),
+        }
     };
     let accepted = match name.as_str() {
         "foreign_keys" => {
@@ -1619,7 +1635,7 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
         // this server does not enforce are accepted at 0 alone.
         "lock_timeout" => {
             let Some(ms) = setting_ms(&text) else {
-                return invalid();
+                return out_of_range_ms();
             };
             assign(&|session, local, is_local| {
                 if is_local {
@@ -1648,7 +1664,7 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
         // The server stops a statement running past it (57014).
         "statement_timeout" => {
             let Some(ms) = setting_ms(&text) else {
-                return invalid();
+                return out_of_range_ms();
             };
             assign(&|session, local, is_local| {
                 if is_local {
@@ -1672,12 +1688,19 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
         // A pg_dump header's settings, each accepted at the value that changes nothing here (wire
         // review 16 item 17): XML values are content (this server has no XML type), the default
         // tablespace is none and every table is the engine's own.
-        "xmloption" => lower == "content",
-        "default_tablespace" => text.is_empty(),
-        "default_table_access_method" => lower == "heap",
+        "xmloption" => match lower.as_str() {
+            "content" => true,
+            "document" => false,
+            _ => return invalid(),
+        },
+        // PostgreSQL refuses a tablespace or an access method that does not exist (22023), and
+        // this server has none but the default ones.
+        "default_tablespace" => text.is_empty() || return invalid(),
+        "default_table_access_method" => lower == "heap" || return invalid(),
         "transaction_read_only" | "default_transaction_read_only" => match pg_bool(&text) {
             Some(false) => true,
-            _ => {
+            None => return not_boolean(),
+            Some(true) => {
                 return Err(LimboError::ParseError(
                     SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, "READ ONLY transactions are not supported".to_string()),
                 ))
@@ -1685,9 +1708,15 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
         },
         "client_encoding" => {
             let clean: String = lower.chars().filter(char::is_ascii_alphanumeric).collect();
+            if !PG_ENCODINGS.contains(&clean.as_str()) {
+                return invalid();
+            }
             clean == "utf8" || clean == "unicode"
         }
-        "standard_conforming_strings" => pg_bool(&text) == Some(true),
+        "standard_conforming_strings" => match pg_bool(&text) {
+            Some(on) => on,
+            None => return not_boolean(),
+        },
         "bytea_output" => match lower.as_str() {
             "hex" => true,
             "escape" => false,
@@ -1697,15 +1726,54 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
         // DEFAULT, PostgreSQL's ISO, MDY: what SHOW gives stays true. DMY, YMD and the SQL,
         // Postgres and German output styles are refused, as this server reads and writes ISO
         // dates alone; `ISO, DMY` was accepted and SHOW still said MDY (wire review 18 item 19).
-        "datestyle" => lower.split(',').map(str::trim).all(|part| {
-            matches!(part, "iso" | "mdy" | "us" | "default") || part.starts_with("noneuro")
-        }),
-        "intervalstyle" => lower == "postgres",
-        "timezone" => matches!(
-            lower.as_str(),
-            "utc" | "gmt" | "etc/utc" | "etc/gmt" | "z" | "zulu" | "uct" | "universal" | "0"
-        ),
-        "extra_float_digits" => lower.parse::<i32>().is_ok_and(|d| d >= 1),
+        "datestyle" => {
+            let parts: Vec<&str> = lower.split(',').map(str::trim).collect();
+            // PostgreSQL's check_datestyle words; any other is 22023.
+            let known = |p: &str| {
+                matches!(
+                    p,
+                    "iso" | "sql" | "postgres" | "german" | "ymd" | "dmy" | "mdy" | "us"
+                        | "european" | "default"
+                ) || p.starts_with("noneuro")
+                    || p.starts_with("euro")
+            };
+            if !parts.iter().all(|p| known(p)) {
+                return invalid();
+            }
+            parts.iter().all(|part| {
+                matches!(*part, "iso" | "mdy" | "us" | "default") || part.starts_with("noneuro")
+            })
+        }
+        "intervalstyle" => match lower.as_str() {
+            "postgres" => true,
+            "postgres_verbose" | "sql_standard" | "iso_8601" => false,
+            _ => return invalid(),
+        },
+        "timezone" => {
+            let utc = matches!(
+                lower.as_str(),
+                "utc" | "gmt" | "etc/utc" | "etc/gmt" | "z" | "zulu" | "uct" | "universal" | "0"
+            );
+            // A zone PostgreSQL would know: a numeric offset or a name in the host's zone
+            // database, which PostgreSQL's own tz database mirrors. BLIND SPOT: a host whose zone
+            // database lacks a name PostgreSQL knows answers 22023 for it, not 0A000.
+            let numeric = lower.trim_start_matches(['+', '-']).parse::<f64>().is_ok();
+            let zoned = !text.contains("..")
+                && std::path::Path::new("/usr/share/zoneinfo").join(&text).is_file();
+            if !(utc || numeric || zoned) {
+                return invalid();
+            }
+            utc
+        }
+        "extra_float_digits" => match lower.parse::<i32>() {
+            Ok(d) if (-15..=3).contains(&d) => d >= 1,
+            Ok(d) => {
+                return refused(format!(
+                    "{d} is outside the valid range for parameter \"extra_float_digits\" (-15 .. 3)"
+                ))
+            }
+            Err(_) => return invalid(),
+        },
         n if NOOP_PARAMETERS.contains(&n) || n.starts_with("enable_") => true,
         n if n.contains('.') => {
             return unsupported("custom configuration parameters are not supported")
@@ -1727,6 +1795,33 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
         unsupported("this server answers only by its own setting of it")
     }
 }
+
+/// PostgreSQL's spelling of a parameter name, as its errors quote it (`DateStyle`, not `datestyle`).
+fn pg_parameter_name(name: &str) -> &str {
+    match name {
+        "datestyle" => "DateStyle",
+        "intervalstyle" => "IntervalStyle",
+        "timezone" => "TimeZone",
+        other => other,
+    }
+}
+
+/// PostgreSQL's encoding names and aliases, letters and digits only (pg_wchar.c's table, as
+/// client_encoding accepts them): any other is 22023.
+const PG_ENCODINGS: &[&str] = &[
+    "sqlascii", "utf8", "unicode", "eucjp", "euccn", "euckr", "euctw", "eucjis2004",
+    "muleinternal", "latin1", "latin2", "latin3", "latin4", "latin5", "latin6", "latin7",
+    "latin8", "latin9", "latin10", "win1256", "win1258", "win866", "win874", "koi8r", "koi8",
+    "win1251", "win1252", "iso88595", "iso88596", "iso88597", "iso88598", "win1250", "win1253",
+    "win1254", "win1255", "win1257", "koi8u", "sjis", "big5", "gbk", "uhc", "gb18030", "johab",
+    "shiftjis2004", "alt", "win", "mskanji", "shiftjis", "tcvn", "tcvn5712", "vscii", "abc",
+    "iso885910", "iso885913", "iso885914", "iso885915", "iso885916", "iso88591", "iso88592",
+    "iso88593", "iso88594", "iso88599", "cp1250", "cp1251", "cp1252", "cp1253", "cp1254",
+    "cp1255", "cp1256", "cp1257", "cp1258", "cp866", "cp874", "cp932", "cp936", "cp949", "cp950",
+    "windows1250", "windows1251", "windows1252", "windows1253", "windows1254", "windows1255",
+    "windows1256", "windows1257", "windows1258", "windows866", "windows874", "windows932",
+    "windows936", "windows949", "windows950",
+];
 
 /// SHOW of `show`'s parameter, from the settings SET keeps (see [`handle_pg_set`]; wire review 16
 /// item 4), one text row under PostgreSQL's name for it: search_path from the session's own path,
