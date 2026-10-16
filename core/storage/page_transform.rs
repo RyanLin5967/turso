@@ -23,7 +23,7 @@ impl PageCodecHeaderInfo {
                 "page codec bootstrap requires at least {} bytes, got {}",
                 Self::SQLITE_BOOTSTRAP_HEADER_LEN,
                 raw_page1_prefix.len()
-            )));
+            ).into()));
         }
         // SQLite stores the two-byte page size at offsets 16..18 and the
         // per-page reserved-space byte at offset 20.

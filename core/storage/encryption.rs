@@ -92,7 +92,7 @@ impl EncryptionKey {
     pub fn from_hex_string(s: &str) -> Result<Self> {
         let hex_str = s.trim();
         let bytes = hex::decode(hex_str)
-            .map_err(|e| LimboError::InvalidArgument(format!("Invalid hex string: {e}")))?;
+            .map_err(|e| LimboError::InvalidArgument(format!("Invalid hex string: {e}").into()))?;
 
         match bytes.len() {
             16 => {
@@ -106,7 +106,7 @@ impl EncryptionKey {
             _ => Err(LimboError::InvalidArgument(format!(
                 "Hex string must decode to exactly 16 or 32 bytes, got {}",
                 bytes.len()
-            ))),
+            ).into())),
         }
     }
 
@@ -436,9 +436,9 @@ impl TryFrom<&str> for CipherMode {
             b"aegis128x4" | b"aegis-128x4" | b"aegis_128x4" => Ok(CipherMode::Aegis128X4),
             b"aegis256x2" | b"aegis-256x2" | b"aegis_256x2" => Ok(CipherMode::Aegis256X2),
             b"aegis256x4" | b"aegis-256x4" | b"aegis_256x4" => Ok(CipherMode::Aegis256X4),
-            _ => Err(LimboError::InvalidArgument(format!(
-                "Unknown cipher name: {s}"
-            ))),
+            _ => Err(LimboError::InvalidArgument(
+                format!("Unknown cipher name: {s}").into()
+            )),
         })
     }
 }
@@ -539,7 +539,7 @@ impl CipherMode {
             8 => Ok(CipherMode::Aegis128X4),
             _ => Err(LimboError::InvalidArgument(format!(
                 "Unknown cipher ID: {id}"
-            ))),
+            ).into())),
         }
     }
 }
@@ -587,7 +587,7 @@ impl EncryptionContext {
                 cipher_mode,
                 required_size,
                 key.len()
-            )));
+            ).into()));
         }
 
         let cipher = match cipher_mode {

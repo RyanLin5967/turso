@@ -1,3 +1,4 @@
+use crate::error::SqlErrorKind;
 use std::sync::Arc;
 
 use crate::alloc::{TryClone, TursoSliceExt};
@@ -694,7 +695,7 @@ fn get_subquery_parser<'a>(
     let handle_unsupported_correlation =
         |correlated: bool, position: SubqueryPosition, allow_correlated: bool| -> Result<()> {
             if correlated && !allow_correlated {
-                crate::bail_parse_error!(
+                crate::bail_parse_error!(SqlErrorKind::FeatureNotSupported;
                     "correlated subqueries in {} clause are not supported yet",
                     position.name()
                 );
@@ -735,7 +736,7 @@ fn get_subquery_parser<'a>(
                     connection,
                 )?;
                 let Plan::Select(mut plan) = plan else {
-                    crate::bail_parse_error!(
+                    crate::bail_parse_error!(SqlErrorKind::FeatureNotSupported;
                         "compound SELECT queries not supported yet in WHERE clause subqueries"
                     );
                 };
@@ -826,7 +827,7 @@ fn get_subquery_parser<'a>(
                     connection,
                 )?;
                 let Plan::Select(mut plan) = plan else {
-                    crate::bail_parse_error!(
+                    crate::bail_parse_error!(SqlErrorKind::FeatureNotSupported;
                         "compound SELECT queries not supported yet in WHERE clause subqueries"
                     );
                 };

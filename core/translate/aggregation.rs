@@ -654,7 +654,7 @@ pub fn translate_aggregation_step(
         AggFunc::External(ref func) => {
             let registered_argc = func.agg_args().map_err(|_| {
                 LimboError::ExtensionError(
-                    "External aggregate function called with wrong number of arguments".to_string(),
+                    "External aggregate function called with wrong number of arguments".to_string().into(),
                 )
             })?;
             if registered_argc >= 0 && registered_argc as usize != num_args {

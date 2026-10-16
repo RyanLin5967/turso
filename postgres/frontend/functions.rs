@@ -1,3 +1,4 @@
+use turso_parser::sql_error::{SqlErrorKind, SqlErrorMessage};
 use std::sync::Arc;
 use turso_core::schema::{Schema, Table};
 use turso_core::{Connection, LimboError, Result, Value};
@@ -118,7 +119,7 @@ pub(crate) fn exec_scalar(conn: &Connection, name: &str, args: &[Value]) -> Resu
         | "pg_get_function_arguments"
         | "obj_description"
         | "col_description" => Ok(Value::Null),
-        _ => Err(LimboError::ParseError(format!("no such function: {name}"))),
+        _ => Err(LimboError::ParseError(SqlErrorMessage::classified(SqlErrorKind::UndefinedFunction, format!("no such function: {name}")))),
     }
 }
 
@@ -299,7 +300,7 @@ fn exec_pg_get_expr(args: &[Value]) -> Result<Value> {
 fn exec_encode(args: &[Value]) -> Result<Value> {
     let (Some(data), Some(format)) = (args.first(), args.get(1)) else {
         return Err(LimboError::InvalidArgument(
-            "encode takes two arguments".to_string(),
+            "encode takes two arguments".to_string().into(),
         ));
     };
     let format = match format {
@@ -319,7 +320,7 @@ fn exec_encode(args: &[Value]) -> Result<Value> {
                     .ok()
                     .filter(|_| digits.len() % 2 == 0)
                     .ok_or_else(|| {
-                        LimboError::Constraint("invalid input syntax for type bytea".to_string())
+                        LimboError::Constraint(SqlErrorMessage::classified(SqlErrorKind::InvalidTextRepresentation, "invalid input syntax for type bytea".to_string()))
                     })?;
                 &hex_input
             }
@@ -368,9 +369,9 @@ fn exec_encode(args: &[Value]) -> Result<Value> {
             out
         }
         other => {
-            return Err(LimboError::InvalidArgument(format!(
+            return Err(LimboError::InvalidArgument(SqlErrorMessage::classified(SqlErrorKind::InvalidParameterValue, format!(
                 "unrecognized encoding: \"{other}\""
-            )))
+            ))))
         }
     };
     Ok(Value::build_text(encoded))

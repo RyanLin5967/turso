@@ -20,7 +20,7 @@ pub fn translate_attach(
 ) -> Result<()> {
     if !connection.experimental_attach_enabled() {
         return Err(crate::LimboError::ParseError(
-            "ATTACH is an experimental feature. Enable with --experimental-attach flag".to_string(),
+            "ATTACH is an experimental feature. Enable with --experimental-attach flag".to_string().into(),
         ));
     }
 
@@ -124,7 +124,7 @@ pub fn translate_detach(
 ) -> Result<()> {
     if !connection.experimental_attach_enabled() {
         return Err(crate::LimboError::ParseError(
-            "DETACH is an experimental feature. Enable with --experimental-attach flag".to_string(),
+            "DETACH is an experimental feature. Enable with --experimental-attach flag".to_string().into(),
         ));
     }
     // SQLite treats DETACH as a function call to sqlite_detach(dbname)

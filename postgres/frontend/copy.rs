@@ -40,7 +40,7 @@ pub fn parse_copy_text_format(
                 line_num + 1,
                 num_columns,
                 fields.len()
-            )));
+            ).into()));
         }
 
         let row: CopyRow = fields

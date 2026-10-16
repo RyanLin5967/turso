@@ -1,3 +1,4 @@
+use crate::error::SqlErrorKind;
 use rustc_hash::FxHashMap as HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -1568,7 +1569,7 @@ pub fn collect_set_clauses_for_upsert(
         }
         for (cn, e) in set.col_names.iter().zip(values.into_iter()) {
             let Some(idx) = lookup.get(&normalize_ident(cn.as_str())) else {
-                bail_parse_error!("no such column: {}", cn);
+                bail_parse_error!(SqlErrorKind::UndefinedColumn; "no such column: {}", cn);
             };
             // cannot upsert generated column
             table.columns()[*idx].ensure_not_generated("UPDATE", cn.as_str())?;
@@ -1716,7 +1717,7 @@ fn rewrite_expr_to_registers(
                                     *expr = Expr::Register(cm.register);
                                 }
                             } else {
-                                bail_parse_error!("no such column in EXCLUDED: {}", c);
+                                bail_parse_error!(SqlErrorKind::UndefinedColumn; "no such column in EXCLUDED: {}", c);
                             }
                         }
                         // If insertion is None, leave EXCLUDED.* untouched.
@@ -1729,7 +1730,7 @@ fn rewrite_expr_to_registers(
                             if let Some(r) = col_reg_from_row_image(&c) {
                                 *expr = Expr::Register(r);
                             } else {
-                                bail_parse_error!("no such column: {}.{}", ns, c);
+                                bail_parse_error!(SqlErrorKind::UndefinedColumn; "no such column: {}.{}", ns, c);
                             }
                             return Ok(WalkControl::Continue);
                         }
@@ -1740,7 +1741,7 @@ fn rewrite_expr_to_registers(
                     // invalid. Return a graceful error instead of leaving it
                     // unresolved (which would panic later in translate_expr).
                     if allow_excluded {
-                        bail_parse_error!("no such column: {}.{}", ns, c);
+                        bail_parse_error!(SqlErrorKind::UndefinedColumn; "no such column: {}.{}", ns, c);
                     }
                 }
                 // Unqualified id -> row image (CURRENT/NEW depending on caller)
