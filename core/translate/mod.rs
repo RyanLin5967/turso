@@ -578,7 +578,12 @@ mod tests {
 
     #[test]
     fn c50_sqlite_integer_overflow_stays_real() {
-        let db = Database::open_file(Arc::new(MemoryIO::new()), ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let db = Database::open_file(
+            Arc::new(MemoryIO::new()),
+            ":memory:",
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
         let conn = db.connect().unwrap();
         for sql in [
             "SELECT typeof(9223372036854775807 + 1)",

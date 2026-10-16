@@ -1,5 +1,5 @@
-use crate::error::SqlErrorKind;
 use crate::alloc::TursoIteratorExt;
+use crate::error::SqlErrorKind;
 use crate::numeric::StrToF64;
 use crate::schema::ColDef;
 use crate::translate::emitter::TransactionMode;
@@ -422,7 +422,9 @@ pub fn module_args_from_sql(sql: &str) -> Result<Vec<turso_ext::Value>> {
                                 chars.next();
                             } else {
                                 return Err(LimboError::InvalidArgument(
-                                    "Unexpected characters after quoted argument".to_string().into(),
+                                    "Unexpected characters after quoted argument"
+                                        .to_string()
+                                        .into(),
                                 ));
                             }
                         }
@@ -453,7 +455,9 @@ pub fn module_args_from_sql(sql: &str) -> Result<Vec<turso_ext::Value>> {
 
     if in_quotes {
         return Err(LimboError::InvalidArgument(
-            "Unterminated string literal in module arguments".to_string().into(),
+            "Unterminated string literal in module arguments"
+                .to_string()
+                .into(),
         ));
     }
 
@@ -1010,7 +1014,9 @@ pub fn columns_from_create_table_body(
 ) -> crate::Result<Vec<Column>> {
     let CreateTableBody::ColumnsAndConstraints { columns, .. } = body else {
         return Err(crate::LimboError::ParseError(
-            "CREATE TABLE body must contain columns and constraints".to_string().into(),
+            "CREATE TABLE body must contain columns and constraints"
+                .to_string()
+                .into(),
         ));
     };
 
@@ -1139,9 +1145,10 @@ impl<'a> OpenOptions<'a> {
 
             // sqlite allows only `localhost` or empty authority.
             if !(authority.is_empty() || authority == "localhost") {
-                return Err(LimboError::InvalidArgument(format!(
-                    "Invalid authority '{authority}'. Only '' or 'localhost' allowed."
-                ).into()));
+                return Err(LimboError::InvalidArgument(
+                    format!("Invalid authority '{authority}'. Only '' or 'localhost' allowed.")
+                        .into(),
+                ));
             }
             opts.authority = if authority.is_empty() {
                 None
@@ -1168,7 +1175,9 @@ impl<'a> OpenOptions<'a> {
         // Only use modeof if we're in a mode that can create files
         if self.mode != OpenMode::ReadWriteCreate && self.modeof.is_some() {
             return Err(LimboError::InvalidArgument(
-                "modeof is not applicable without mode=rwc".to_string().into(),
+                "modeof is not applicable without mode=rwc"
+                    .to_string()
+                    .into(),
             ));
         }
         // If modeof is not applicable or file doesn't exist, use default flags
@@ -1457,9 +1466,9 @@ pub fn parse_numeric_literal(text: &str) -> Result<Value> {
         if value == i64::MIN {
             // Negating i64::MIN overflows. SQLite's codeInteger rejects this at
             // prepare time with "hex literal too big"; do the same.
-            return Err(LimboError::ParseError(format!(
-                "hex literal too big: {text}"
-            ).into()));
+            return Err(LimboError::ParseError(
+                format!("hex literal too big: {text}").into(),
+            ));
         }
         return Ok(Value::from_i64(-value));
     }
@@ -1471,9 +1480,9 @@ pub fn parse_numeric_literal(text: &str) -> Result<Value> {
     let Some(StrToF64::Fractional(float) | StrToF64::Decimal(float)) =
         crate::numeric::str_to_f64(text.as_ref())
     else {
-        return Err(LimboError::ParseError(format!(
-            "malformed numeric literal: {text}"
-        ).into()));
+        return Err(LimboError::ParseError(
+            format!("malformed numeric literal: {text}").into(),
+        ));
     };
     Ok(Value::Numeric(crate::numeric::Numeric::Float(float)))
 }
@@ -1503,11 +1512,15 @@ pub fn parse_signed_number(expr: &Expr) -> Result<Value> {
                 parse_numeric_literal(num)
             }
             _ => Err(LimboError::InvalidArgument(
-                "signed-number must follow the format: ([+|-] numeric-literal)".to_string().into(),
+                "signed-number must follow the format: ([+|-] numeric-literal)"
+                    .to_string()
+                    .into(),
             )),
         },
         _ => Err(LimboError::InvalidArgument(
-            "signed-number must follow the format: ([+|-] numeric-literal)".to_string().into(),
+            "signed-number must follow the format: ([+|-] numeric-literal)"
+                .to_string()
+                .into(),
         )),
     }
 }
@@ -1515,9 +1528,9 @@ pub fn parse_signed_number(expr: &Expr) -> Result<Value> {
 pub fn parse_string(expr: &Expr) -> Result<String> {
     match expr {
         Expr::Name(name) if name.quoted_with('\'') => Ok(name.as_str().to_string()),
-        _ => Err(LimboError::InvalidArgument(format!(
-            "string parameter expected, got {expr:?} instead"
-        ).into())),
+        _ => Err(LimboError::InvalidArgument(
+            format!("string parameter expected, got {expr:?} instead").into(),
+        )),
     }
 }
 
@@ -1540,7 +1553,8 @@ pub fn parse_pragma_bool(expr: &Expr) -> Result<bool> {
     }
     Err(LimboError::InvalidArgument(
         "boolean pragma value must be either 0|1 integer or yes|true|on|no|false|off token"
-            .to_string().into(),
+            .to_string()
+            .into(),
     ))
 }
 
@@ -1843,9 +1857,10 @@ fn reject_cross_db_qualified_name(
             None => !table_db_name.as_str().eq_ignore_ascii_case("main"),
         };
         if is_cross_db {
-            return Err(crate::LimboError::ParseError(format!(
-                "view cannot reference table in attached database: {qualified_name}"
-            ).into()));
+            return Err(crate::LimboError::ParseError(
+                format!("view cannot reference table in attached database: {qualified_name}")
+                    .into(),
+            ));
         }
     }
     Ok(())
@@ -2077,7 +2092,9 @@ fn view_sources_from_clause(
         let merged = if natural {
             if join.constraint.is_some() {
                 return Err(LimboError::ParseError(
-                    "a NATURAL join may not have an ON or USING clause".to_string().into(),
+                    "a NATURAL join may not have an ON or USING clause"
+                        .to_string()
+                        .into(),
                 ));
             }
             right
@@ -2108,10 +2125,13 @@ fn view_sources_from_clause(
                     .filter_map(view_column_name)
                     .any(|column| column.eq_ignore_ascii_case(&normalized));
                 if !in_left || !in_right {
-                    return Err(LimboError::ParseError(format!(
-                        "cannot join using column {} - column not present in both tables",
-                        name.as_str()
-                    ).into()));
+                    return Err(LimboError::ParseError(
+                        format!(
+                            "cannot join using column {} - column not present in both tables",
+                            name.as_str()
+                        )
+                        .into(),
+                    ));
                 }
                 merged.push(normalized);
             }
@@ -2520,9 +2540,9 @@ mod rename_column_view {
 
         let current_view_name = normalize_ident(view_name.name.as_str());
         if !visiting_views.insert(current_view_name.clone()) {
-            return Err(LimboError::ParseError(format!(
-                "view {current_view_name} is circularly defined"
-            ).into()));
+            return Err(LimboError::ParseError(
+                format!("view {current_view_name} is circularly defined").into(),
+            ));
         }
 
         let rewrite_result = (|| -> Result<Option<RewrittenView>> {
@@ -2530,8 +2550,14 @@ mod rename_column_view {
             let original_columns =
                 view_columns_from_select(&original_select, schema, &view_columns)?;
 
-            let ctx =
-                ViewRewriteCtx::new(schema, target_table, target_db_name, old_column, new_column, dialect);
+            let ctx = ViewRewriteCtx::new(
+                schema,
+                target_table,
+                target_db_name,
+                old_column,
+                new_column,
+                dialect,
+            );
             let sql_changed =
                 rewrite_view_select_for_column_rename(&mut select, &ctx, &[], visiting_views)?;
 
@@ -2558,7 +2584,11 @@ mod rename_column_view {
                     columns: view_columns,
                     select: select.clone(),
                 };
-                dialect.format_rewritten_view_sql(&rewrite_source, &new_stmt, &ctx.renames.borrow())?
+                dialect.format_rewritten_view_sql(
+                    &rewrite_source,
+                    &new_stmt,
+                    &ctx.renames.borrow(),
+                )?
             } else {
                 view_sql.to_string()
             };
@@ -3226,7 +3256,9 @@ mod rename_column_view {
                     resolve_qualified(sources, &ns_norm, target_db_norm);
                 if let Some(source) = source {
                     return apply_rename(source, &mut |name| {
-                        if let Some(edit) = col.rename(name) { renames.borrow_mut().push(edit); }
+                        if let Some(edit) = col.rename(name) {
+                            renames.borrow_mut().push(edit);
+                        }
                     });
                 }
                 if local_ambiguous {
@@ -3236,7 +3268,9 @@ mod rename_column_view {
                     let (source, ambiguous) = resolve_qualified(scope, &ns_norm, target_db_norm);
                     if let Some(source) = source {
                         return apply_rename(source, &mut |name| {
-                            if let Some(edit) = col.rename(name) { renames.borrow_mut().push(edit); }
+                            if let Some(edit) = col.rename(name) {
+                                renames.borrow_mut().push(edit);
+                            }
                         });
                     }
                     if ambiguous {
@@ -3256,7 +3290,9 @@ mod rename_column_view {
                 let (source, local_ambiguous) = resolve_qualified(sources, &ns_norm, &schema_norm);
                 if let Some(source) = source {
                     return apply_rename(source, &mut |name| {
-                        if let Some(edit) = col.rename(name) { renames.borrow_mut().push(edit); }
+                        if let Some(edit) = col.rename(name) {
+                            renames.borrow_mut().push(edit);
+                        }
                     });
                 }
                 if local_ambiguous {
@@ -3266,7 +3302,9 @@ mod rename_column_view {
                     let (source, ambiguous) = resolve_qualified(scope, &ns_norm, &schema_norm);
                     if let Some(source) = source {
                         return apply_rename(source, &mut |name| {
-                            if let Some(edit) = col.rename(name) { renames.borrow_mut().push(edit); }
+                            if let Some(edit) = col.rename(name) {
+                                renames.borrow_mut().push(edit);
+                            }
                         });
                     }
                     if ambiguous {
@@ -3284,7 +3322,9 @@ mod rename_column_view {
                 if let Some(source) = source {
                     return apply_rename(source, &mut |name| {
                         let mut renamed = original.clone();
-                        if let Some(edit) = renamed.rename(name) { renames.borrow_mut().push(edit); }
+                        if let Some(edit) = renamed.rename(name) {
+                            renames.borrow_mut().push(edit);
+                        }
                         *expr = ast::Expr::Id(renamed);
                     });
                 }
@@ -3296,8 +3336,10 @@ mod rename_column_view {
                     if let Some(source) = source {
                         return apply_rename(source, &mut |name| {
                             let mut renamed = original.clone();
-                        if let Some(edit) = renamed.rename(name) { renames.borrow_mut().push(edit); }
-                        *expr = ast::Expr::Id(renamed);
+                            if let Some(edit) = renamed.rename(name) {
+                                renames.borrow_mut().push(edit);
+                            }
+                            *expr = ast::Expr::Id(renamed);
                         });
                     }
                     if ambiguous {
@@ -3370,7 +3412,9 @@ mod rename_column_view {
 
         for col in cols {
             if col.as_str().eq_ignore_ascii_case(old_column_norm) {
-                if let Some(edit) = col.rename(replacement.to_string()) { renames.borrow_mut().push(edit); }
+                if let Some(edit) = col.rename(replacement.to_string()) {
+                    renames.borrow_mut().push(edit);
+                }
                 changed = true;
             }
         }
@@ -5120,7 +5164,10 @@ pub mod tests {
         assert_eq!(parse_numeric_literal("12").unwrap(), Value::from_i64(12));
         assert_eq!(parse_numeric_literal("1.5").unwrap(), Value::from_f64(1.5));
         // SQLite allows one underscore between digits.
-        assert_eq!(parse_numeric_literal("1_000").unwrap(), Value::from_i64(1000));
+        assert_eq!(
+            parse_numeric_literal("1_000").unwrap(),
+            Value::from_i64(1000)
+        );
     }
 
     #[test]
@@ -5170,10 +5217,17 @@ pub mod tests {
         let schema = schema_with_table("CREATE TABLE t (a, b)");
         let view_sql = "CREATE VIEW v AS SELECT s.x FROM (SELECT b AS x FROM t) AS s";
 
-        let rewritten =
-            rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c", &crate::dialect::SqliteDialect)
-                .unwrap()
-                .expect("view should be rewritten");
+        let rewritten = rewrite_view_sql_for_column_rename(
+            view_sql,
+            &schema,
+            "t",
+            "main",
+            "b",
+            "c",
+            &crate::dialect::SqliteDialect,
+        )
+        .unwrap()
+        .expect("view should be rewritten");
 
         assert!(rewritten.sql.contains("SELECT c AS x FROM t"));
     }
@@ -5183,10 +5237,17 @@ pub mod tests {
         let schema = schema_with_table("CREATE TABLE t (a, b)");
         let view_sql = "CREATE VIEW v AS SELECT s.b FROM (t) AS s";
 
-        let rewritten =
-            rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c", &crate::dialect::SqliteDialect)
-                .unwrap()
-                .expect("view should be rewritten");
+        let rewritten = rewrite_view_sql_for_column_rename(
+            view_sql,
+            &schema,
+            "t",
+            "main",
+            "b",
+            "c",
+            &crate::dialect::SqliteDialect,
+        )
+        .unwrap()
+        .expect("view should be rewritten");
 
         assert!(!rewritten.sql.contains("s.b"), "{}", rewritten.sql);
     }
@@ -5197,10 +5258,17 @@ pub mod tests {
         let view_sql =
             "CREATE VIEW v AS SELECT j.value FROM t JOIN json_each(json_array(t.b)) AS j";
 
-        let rewritten =
-            rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c", &crate::dialect::SqliteDialect)
-                .unwrap()
-                .expect("view should be rewritten");
+        let rewritten = rewrite_view_sql_for_column_rename(
+            view_sql,
+            &schema,
+            "t",
+            "main",
+            "b",
+            "c",
+            &crate::dialect::SqliteDialect,
+        )
+        .unwrap()
+        .expect("view should be rewritten");
 
         assert!(!rewritten.sql.contains("t.b"), "{}", rewritten.sql);
     }
@@ -5210,10 +5278,17 @@ pub mod tests {
         let schema = schema_with_table("CREATE TABLE t (a, b)");
         let view_sql = "CREATE VIEW v AS SELECT b FROM t UNION ALL SELECT b FROM t ORDER BY b";
 
-        let rewritten =
-            rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c", &crate::dialect::SqliteDialect)
-                .unwrap()
-                .expect("view should be rewritten");
+        let rewritten = rewrite_view_sql_for_column_rename(
+            view_sql,
+            &schema,
+            "t",
+            "main",
+            "b",
+            "c",
+            &crate::dialect::SqliteDialect,
+        )
+        .unwrap()
+        .expect("view should be rewritten");
 
         assert_eq!(rewritten.sql.matches("SELECT c FROM t").count(), 2);
         assert!(!rewritten.sql.contains("ORDER BY b"), "{}", rewritten.sql);
@@ -5225,10 +5300,17 @@ pub mod tests {
         let schema = schema_with_table("CREATE TABLE t (a, b)");
         let view_sql = "CREATE VIEW v AS WITH cte AS (SELECT b FROM t) SELECT b FROM cte";
 
-        let rewritten =
-            rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c", &crate::dialect::SqliteDialect)
-                .unwrap()
-                .expect("view should be rewritten");
+        let rewritten = rewrite_view_sql_for_column_rename(
+            view_sql,
+            &schema,
+            "t",
+            "main",
+            "b",
+            "c",
+            &crate::dialect::SqliteDialect,
+        )
+        .unwrap()
+        .expect("view should be rewritten");
 
         assert!(
             rewritten.sql.contains("WITH cte AS (SELECT c FROM t)"),
@@ -5247,10 +5329,17 @@ pub mod tests {
         let schema = schema_with_table("CREATE TABLE t (a, b)");
         let view_sql = "CREATE VIEW v AS WITH cte(x) AS (SELECT b FROM t) SELECT x FROM cte";
 
-        let rewritten =
-            rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c", &crate::dialect::SqliteDialect)
-                .unwrap()
-                .expect("view should be rewritten");
+        let rewritten = rewrite_view_sql_for_column_rename(
+            view_sql,
+            &schema,
+            "t",
+            "main",
+            "b",
+            "c",
+            &crate::dialect::SqliteDialect,
+        )
+        .unwrap()
+        .expect("view should be rewritten");
 
         assert!(
             rewritten.sql.contains("WITH cte(x)") || rewritten.sql.contains("WITH cte (x)"),
@@ -5391,10 +5480,17 @@ pub mod tests {
         let schema = schema_with_tables(&["CREATE TABLE t (a, b)", "CREATE TABLE u (b)"]);
         let view_sql = "CREATE VIEW v AS SELECT t.a FROM t JOIN u ON t.b = u.b";
 
-        let rewritten =
-            rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c", &crate::dialect::SqliteDialect)
-                .unwrap()
-                .expect("view should be rewritten");
+        let rewritten = rewrite_view_sql_for_column_rename(
+            view_sql,
+            &schema,
+            "t",
+            "main",
+            "b",
+            "c",
+            &crate::dialect::SqliteDialect,
+        )
+        .unwrap()
+        .expect("view should be rewritten");
 
         assert!(!rewritten.sql.contains("t.b"), "{}", rewritten.sql);
         assert!(rewritten.sql.contains("t.c = u.b"), "{}", rewritten.sql);
@@ -5409,8 +5505,16 @@ pub mod tests {
         // after the rename t has no b. SQLite refuses the ALTER, so the
         // rewrite must error rather than emit a view that can never be
         // queried again.
-        let err = rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c", &crate::dialect::SqliteDialect)
-            .unwrap_err();
+        let err = rewrite_view_sql_for_column_rename(
+            view_sql,
+            &schema,
+            "t",
+            "main",
+            "b",
+            "c",
+            &crate::dialect::SqliteDialect,
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("cannot join using column"),
             "{err}"
@@ -5422,10 +5526,17 @@ pub mod tests {
         let schema = schema_with_table("CREATE TABLE t (a, b)");
         let view_sql = "CREATE VIEW v AS SELECT b FROM t GROUP BY b HAVING b > 0";
 
-        let rewritten =
-            rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c", &crate::dialect::SqliteDialect)
-                .unwrap()
-                .expect("view should be rewritten");
+        let rewritten = rewrite_view_sql_for_column_rename(
+            view_sql,
+            &schema,
+            "t",
+            "main",
+            "b",
+            "c",
+            &crate::dialect::SqliteDialect,
+        )
+        .unwrap()
+        .expect("view should be rewritten");
 
         assert!(
             rewritten
@@ -5441,10 +5552,17 @@ pub mod tests {
         let schema = schema_with_table("CREATE TABLE t (a, b)");
         let view_sql = "CREATE VIEW v AS SELECT sum(a) OVER (PARTITION BY b ORDER BY b) FROM t";
 
-        let rewritten =
-            rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c", &crate::dialect::SqliteDialect)
-                .unwrap()
-                .expect("view should be rewritten");
+        let rewritten = rewrite_view_sql_for_column_rename(
+            view_sql,
+            &schema,
+            "t",
+            "main",
+            "b",
+            "c",
+            &crate::dialect::SqliteDialect,
+        )
+        .unwrap()
+        .expect("view should be rewritten");
 
         assert!(
             !rewritten.sql.contains("PARTITION BY b"),
@@ -5465,10 +5583,17 @@ pub mod tests {
         let schema = schema_with_table("CREATE TABLE t (a, b)");
         let view_sql = "CREATE VIEW v AS SELECT a FROM t LIMIT b OFFSET b";
 
-        let rewritten =
-            rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c", &crate::dialect::SqliteDialect)
-                .unwrap()
-                .expect("view should be rewritten");
+        let rewritten = rewrite_view_sql_for_column_rename(
+            view_sql,
+            &schema,
+            "t",
+            "main",
+            "b",
+            "c",
+            &crate::dialect::SqliteDialect,
+        )
+        .unwrap()
+        .expect("view should be rewritten");
 
         assert!(!rewritten.sql.contains("LIMIT b"), "{}", rewritten.sql);
         assert!(!rewritten.sql.contains("OFFSET b"), "{}", rewritten.sql);
@@ -5481,10 +5606,17 @@ pub mod tests {
         let schema = schema_with_table("CREATE TABLE t (a, b)");
         let view_sql = "CREATE VIEW v AS VALUES ((SELECT b FROM t LIMIT 1))";
 
-        let rewritten =
-            rewrite_view_sql_for_column_rename(view_sql, &schema, "t", "main", "b", "c", &crate::dialect::SqliteDialect)
-                .unwrap()
-                .expect("view should be rewritten");
+        let rewritten = rewrite_view_sql_for_column_rename(
+            view_sql,
+            &schema,
+            "t",
+            "main",
+            "b",
+            "c",
+            &crate::dialect::SqliteDialect,
+        )
+        .unwrap()
+        .expect("view should be rewritten");
 
         assert!(
             rewritten.sql.contains("VALUES ((SELECT c FROM t LIMIT 1))"),

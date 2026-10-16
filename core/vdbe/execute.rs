@@ -1,10 +1,10 @@
-use crate::error::{SqlErrorKind, SqlErrorMessage};
 use crate::alloc::{
     DynAllocator, TryClone, TursoAllocExt, TursoIteratorExt, TursoSliceExt,
     TursoTryWithCapacityExt, TursoVecExt,
 };
 use crate::cdc::TURSO_CDC_VERSION_TABLE_NAME;
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
+use crate::error::{SqlErrorKind, SqlErrorMessage};
 use crate::function::{AccumulatorFunc, AlterTableFunc, WindowFunc};
 use crate::io::TempFile;
 use crate::mvcc::cursor::{MvccCursorType, NextRowidResult};
@@ -217,14 +217,24 @@ fn value_to_numeric(val: &Value) -> Result<crate::numeric::decimal::PgNumeric> {
     use crate::numeric::decimal::PgNumeric;
     match val {
         Value::Numeric(Numeric::Integer(i)) => Ok(PgNumeric::from_i64(*i)),
-        Value::Numeric(Numeric::Float(f)) => PgNumeric::parse(&f.to_string())
-            .unwrap_or_else(|| Err(LimboError::Constraint(SqlErrorMessage::classified(SqlErrorKind::InvalidTextRepresentation, format!("invalid numeric value: {f}"))))),
-        Value::Text(t) => PgNumeric::parse(&t.value)
-            .unwrap_or_else(|| Err(LimboError::Constraint(SqlErrorMessage::classified(SqlErrorKind::InvalidTextRepresentation, format!("invalid numeric value: \"{}\"", t.value))))),
+        Value::Numeric(Numeric::Float(f)) => {
+            PgNumeric::parse(&f.to_string()).unwrap_or_else(|| {
+                Err(LimboError::Constraint(SqlErrorMessage::classified(
+                    SqlErrorKind::InvalidTextRepresentation,
+                    format!("invalid numeric value: {f}"),
+                )))
+            })
+        }
+        Value::Text(t) => PgNumeric::parse(&t.value).unwrap_or_else(|| {
+            Err(LimboError::Constraint(SqlErrorMessage::classified(
+                SqlErrorKind::InvalidTextRepresentation,
+                format!("invalid numeric value: \"{}\"", t.value),
+            )))
+        }),
         Value::Blob(b) => PgNumeric::from_blob(b),
-        _ => Err(LimboError::Constraint(format!(
-            "cannot convert to numeric: \"{val}\""
-        ).into())),
+        _ => Err(LimboError::Constraint(
+            format!("cannot convert to numeric: \"{val}\"").into(),
+        )),
     }
 }
 
@@ -238,10 +248,13 @@ fn value_to_numeric(val: &Value) -> Result<crate::numeric::decimal::PgNumeric> {
 /// encoding, as before. The range (review 21 MED 10) and the zero's exponent (Codex C25 HIGH 3)
 /// are the type's own (`PgNumeric::new`).
 fn numeric_operand(val: &Value) -> Result<crate::numeric::decimal::PgNumeric> {
-    if matches!(val, Value::Blob(_)) && !crate::branch::store::fe_mutant("numeric_operator_reads_blob") {
-        return Err(LimboError::Constraint(SqlErrorMessage::classified(SqlErrorKind::InvalidTextRepresentation, format!(
-            "invalid input for type numeric: \"{val}\""
-        ))));
+    if matches!(val, Value::Blob(_))
+        && !crate::branch::store::fe_mutant("numeric_operator_reads_blob")
+    {
+        return Err(LimboError::Constraint(SqlErrorMessage::classified(
+            SqlErrorKind::InvalidTextRepresentation,
+            format!("invalid input for type numeric: \"{val}\""),
+        )));
     }
     value_to_numeric(val)
 }
@@ -1358,9 +1371,10 @@ pub fn op_open_read(
         CursorType::BTreeTable(table) => {
             // Regular table
             if !table.has_rowid && program.connection.get_mv_tx_id_for_db(*db).is_some() {
-                return Err(LimboError::ParseError(
-                    SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, "WITHOUT ROWID tables are not supported in MVCC mode".to_string()),
-                ));
+                return Err(LimboError::ParseError(SqlErrorMessage::classified(
+                    SqlErrorKind::FeatureNotSupported,
+                    "WITHOUT ROWID tables are not supported in MVCC mode".to_string(),
+                )));
             }
             let btree_cursor: Box<dyn CursorTrait> = if table.has_rowid {
                 Box::new(BTreeCursor::new_table(
@@ -1509,10 +1523,11 @@ pub fn op_vfilter(
         // A dialect may refuse a table-valued function's arguments SQLite takes (PostgreSQL's
         // infinite generate_series bound).
         if let Some((_, CursorType::VirtualTable(vtab))) = program.cursor_ref.get(*cursor_id) {
-            program
-                .connection
-                .dialect()
-                .check_table_function_args(&vtab.name, *idx_num as i64, &args)?;
+            program.connection.dialect().check_table_function_args(
+                &vtab.name,
+                *idx_num as i64,
+                &args,
+            )?;
         }
         let idx_str = if let Some(idx_str) = idx_str {
             Some(state.registers[*idx_str].get_value().to_string())
@@ -1644,9 +1659,9 @@ pub fn op_vupdate(
         Err(e) => {
             // virtual table update failed
             mark_unlikely();
-            return Err(LimboError::ExtensionError(format!(
-                "Virtual table update failed: {e}"
-            ).into()));
+            return Err(LimboError::ExtensionError(
+                format!("Virtual table update failed: {e}").into(),
+            ));
         }
     }
     Ok(InsnFunctionStepResult::Step)
@@ -3598,24 +3613,25 @@ pub fn halt(
     // Determine the constraint error (if any) based on error code
     let constraint_error = match err_code {
         0 => None,
-        SQLITE_CONSTRAINT_PRIMARYKEY => Some(LimboError::Constraint(SqlErrorMessage::classified(SqlErrorKind::UniqueViolation, format!(
-            "UNIQUE constraint failed: {description}"
-        )))),
-        SQLITE_CONSTRAINT_CHECK => Some(LimboError::Constraint(SqlErrorMessage::classified(SqlErrorKind::CheckViolation, format!(
-            "CHECK constraint failed: {description}"
-        )))),
+        SQLITE_CONSTRAINT_PRIMARYKEY => Some(LimboError::Constraint(SqlErrorMessage::classified(
+            SqlErrorKind::UniqueViolation,
+            format!("UNIQUE constraint failed: {description}"),
+        ))),
+        SQLITE_CONSTRAINT_CHECK => Some(LimboError::Constraint(SqlErrorMessage::classified(
+            SqlErrorKind::CheckViolation,
+            format!("CHECK constraint failed: {description}"),
+        ))),
         crate::error::SQLITE_CONSTRAINT_CHECK_DOMAIN => Some(LimboError::Constraint(
-            SqlErrorMessage::classified(
-                SqlErrorKind::CheckViolation,
-                description,
-            ),
+            SqlErrorMessage::classified(SqlErrorKind::CheckViolation, description),
         )),
-        SQLITE_CONSTRAINT_NOTNULL => Some(LimboError::Constraint(SqlErrorMessage::classified(SqlErrorKind::NotNullViolation, format!(
-            "NOT NULL constraint failed: {description}"
-        )))),
-        SQLITE_CONSTRAINT_UNIQUE => Some(LimboError::Constraint(SqlErrorMessage::classified(SqlErrorKind::UniqueViolation, format!(
-            "UNIQUE constraint failed: {description}"
-        )))),
+        SQLITE_CONSTRAINT_NOTNULL => Some(LimboError::Constraint(SqlErrorMessage::classified(
+            SqlErrorKind::NotNullViolation,
+            format!("NOT NULL constraint failed: {description}"),
+        ))),
+        SQLITE_CONSTRAINT_UNIQUE => Some(LimboError::Constraint(SqlErrorMessage::classified(
+            SqlErrorKind::UniqueViolation,
+            format!("UNIQUE constraint failed: {description}"),
+        ))),
         SQLITE_CONSTRAINT_FOREIGNKEY => {
             Some(LimboError::ForeignKeyConstraint(description.to_string()))
         }
@@ -3625,9 +3641,9 @@ pub fn halt(
         // SqlError displays bare like sqlite3_errmsg and abort() doesn't apply
         // ON CONFLICT resolution to it.
         SQLITE_ERROR => Some(LimboError::SqlError(description.to_string())),
-        _ => Some(LimboError::Constraint(format!(
-            "undocumented halt error code {description}"
-        ).into())),
+        _ => Some(LimboError::Constraint(
+            format!("undocumented halt error code {description}").into(),
+        )),
     };
 
     // Handle constraint errors
@@ -4489,7 +4505,8 @@ pub fn op_transaction_inner(
                                 mark_unlikely();
                                 return Err(LimboError::TxError(
                                     "Cannot start CONCURRENT transaction after BEGIN DEFERRED"
-                                        .to_string().into(),
+                                        .to_string()
+                                        .into(),
                                 ));
                             }
                             // Use the same tx_mode as the main DB's active
@@ -4569,7 +4586,8 @@ pub fn op_transaction_inner(
                             state.auto_txn_cleanup = TxnCleanup::None;
                             return Err(LimboError::TxError(
                                 "Cannot start CONCURRENT transaction after BEGIN DEFERRED"
-                                    .to_string().into(),
+                                    .to_string()
+                                    .into(),
                             ));
                         }
 
@@ -4654,7 +4672,8 @@ pub fn op_transaction_inner(
                         mark_unlikely();
                         return Err(LimboError::TxError(
                             "Concurrent transaction mode is only supported when MVCC is enabled"
-                                .to_string().into(),
+                                .to_string()
+                                .into(),
                         ));
                     }
                     // For attached databases without MVCC, always start read/write
@@ -5070,7 +5089,9 @@ pub fn op_auto_commit(
                     // whole transaction and reports the abandoned write.
                     conn.rollback_manual_txn_cleanup(pager, true);
                     return Err(LimboError::TxError(
-                        "cannot commit - an unfinished write statement was abandoned".to_string().into(),
+                        "cannot commit - an unfinished write statement was abandoned"
+                            .to_string()
+                            .into(),
                     ));
                 }
                 // Pre-check deferred FKs; leave tx open and do NOT clear violations
@@ -5090,13 +5111,19 @@ pub fn op_auto_commit(
     } else {
         return match &tx_op {
             TxOp::Begin => Err(LimboError::TxError(
-                "cannot start a transaction within a transaction".to_string().into(),
+                "cannot start a transaction within a transaction"
+                    .to_string()
+                    .into(),
             )),
             TxOp::Commit => Err(LimboError::TxError(
-                "cannot commit - no transaction is active".to_string().into(),
+                "cannot commit - no transaction is active"
+                    .to_string()
+                    .into(),
             )),
             TxOp::Rollback => Err(LimboError::TxError(
-                "cannot rollback - no transaction is active".to_string().into(),
+                "cannot rollback - no transaction is active"
+                    .to_string()
+                    .into(),
             )),
         };
     }
@@ -5311,7 +5338,10 @@ pub fn op_savepoint(
             match release_result {
                 SavepointResult::NotFound => {
                     mark_unlikely();
-                    return Err(LimboError::TxError(SqlErrorMessage::classified(SqlErrorKind::InvalidSavepointSpecification, format!("no such savepoint: {name}"))));
+                    return Err(LimboError::TxError(SqlErrorMessage::classified(
+                        SqlErrorKind::InvalidSavepointSpecification,
+                        format!("no such savepoint: {name}"),
+                    )));
                 }
                 SavepointResult::Release => {
                     let _ = conn.release_named_savepoint_frame(name);
@@ -5350,7 +5380,10 @@ pub fn op_savepoint(
 
             let Some(deferred_fk_snapshot) = deferred_fk_snapshot else {
                 mark_unlikely();
-                return Err(LimboError::TxError(SqlErrorMessage::classified(SqlErrorKind::InvalidSavepointSpecification, format!("no such savepoint: {name}"))));
+                return Err(LimboError::TxError(SqlErrorMessage::classified(
+                    SqlErrorKind::InvalidSavepointSpecification,
+                    format!("no such savepoint: {name}"),
+                )));
             };
             let frame_info = conn.rollback_named_savepoint_frame(name);
             mirror_named_savepoint_to_active_non_main_databases(
@@ -5814,7 +5847,9 @@ pub fn op_row_data(
 
     // Recipe backfill: a raw copy of a stale record would carry pre-recipe values. Refused.
     if let Some((_, CursorType::BTreeTable(table))) = program.cursor_ref.get(*cursor_id) {
-        if return_if_io!(crate::recipe::row_is_stale(state, *cursor_id, table, _pager)) {
+        if return_if_io!(crate::recipe::row_is_stale(
+            state, *cursor_id, table, _pager
+        )) {
             return Err(LimboError::InternalError(format!(
                 "RowData: refused a raw copy of a recipe-stale row of {}",
                 table.name
@@ -9597,7 +9632,9 @@ pub fn op_function(
                 if arg_count != 2 {
                     mark_unlikely();
                     return Err(LimboError::ParseError(
-                        "wrong number of arguments to function GLOB()".to_string().into(),
+                        "wrong number of arguments to function GLOB()"
+                            .to_string()
+                            .into(),
                     ));
                 }
                 let pattern_reg = &state.registers[*start_reg];
@@ -9676,7 +9713,9 @@ pub fn op_function(
                                 let c = chars.next();
                                 if c.is_none() || chars.next().is_some() {
                                     return Err(LimboError::Constraint(
-                                        "ESCAPE expression must be a single character".to_string().into(),
+                                        "ESCAPE expression must be a single character"
+                                            .to_string()
+                                            .into(),
                                     ));
                                 }
                                 escape_char = c;
@@ -9741,9 +9780,12 @@ pub fn op_function(
                         state.registers[*dest].set_value(Value::from_i64(val));
                     }
                     None => {
-                        return Err(crate::LimboError::ParseError(format!(
+                        return Err(crate::LimboError::ParseError(
+                            format!(
                             "currval of sequence \"{seq_name}\" is not yet defined in this session",
-                        ).into()));
+                        )
+                            .into(),
+                        ));
                     }
                 }
             }
@@ -9785,15 +9827,20 @@ pub fn op_function(
                         .is_none()
                 {
                     return Err(crate::LimboError::ParseError(
-                        "setval() requires an integer is_called argument".to_string().into(),
+                        "setval() requires an integer is_called argument"
+                            .to_string()
+                            .into(),
                     ));
                 }
                 let seq = program.connection.find_sequence(&seq_name)?;
                 if value < seq.min_value || value > seq.max_value {
-                    return Err(crate::LimboError::ParseError(format!(
-                        "setval: value {} is out of bounds for sequence \"{}\" ({}..{})",
-                        value, seq.name, seq.min_value, seq.max_value
-                    ).into()));
+                    return Err(crate::LimboError::ParseError(
+                        format!(
+                            "setval: value {} is out of bounds for sequence \"{}\" ({}..{})",
+                            value, seq.name, seq.min_value, seq.max_value
+                        )
+                        .into(),
+                    ));
                 }
                 state.registers[*dest].set_value(Value::from_i64(value));
             }
@@ -10068,7 +10115,8 @@ pub fn op_function(
                 {
                     return Err(LimboError::InvalidArgument(
                         "table_columns_json_array: turso must be compiled with JSON support"
-                            .to_string().into(),
+                            .to_string()
+                            .into(),
                     ));
                 }
                 #[cfg(feature = "json")]
@@ -10079,7 +10127,8 @@ pub fn op_function(
                     let Value::Text(table) = table else {
                         return Err(LimboError::InvalidArgument(
                             "table_columns_json_array: function argument must be of type TEXT"
-                                .to_string().into(),
+                                .to_string()
+                                .into(),
                         ));
                     };
                     let table = {
@@ -10087,9 +10136,12 @@ pub fn op_function(
                         match schema.get_table(table.as_str()) {
                             Some(table) => table,
                             None => {
-                                return Err(LimboError::InvalidArgument(format!(
-                                    "table_columns_json_array: table {table} doesn't exists"
-                                ).into()));
+                                return Err(LimboError::InvalidArgument(
+                                    format!(
+                                        "table_columns_json_array: table {table} doesn't exists"
+                                    )
+                                    .into(),
+                                ));
                             }
                         }
                     };
@@ -10120,7 +10172,8 @@ pub fn op_function(
                 {
                     return Err(LimboError::InvalidArgument(
                         "bin_record_json_object: turso must be compiled with JSON support"
-                            .to_string().into(),
+                            .to_string()
+                            .into(),
                     ));
                 }
                 #[cfg(feature = "json")]
@@ -10208,7 +10261,9 @@ pub fn op_function(
 
                 let Value::Text(dbname_str) = dbname else {
                     return Err(LimboError::InvalidArgument(
-                        "attach: database name argument must be text".to_string().into(),
+                        "attach: database name argument must be text"
+                            .to_string()
+                            .into(),
                     ));
                 };
 
@@ -10234,7 +10289,9 @@ pub fn op_function(
 
                 let Value::Text(dbname_str) = dbname else {
                     return Err(LimboError::InvalidArgument(
-                        "detach: database name argument must be text".to_string().into(),
+                        "detach: database name argument must be text"
+                            .to_string()
+                            .into(),
                     ));
                 };
 
@@ -10526,9 +10583,10 @@ pub fn op_function(
                         0 => Value::from_i64(0),
                         1 => Value::from_i64(1),
                         _ => {
-                            return Err(LimboError::Constraint(SqlErrorMessage::classified(SqlErrorKind::InvalidTextRepresentation, format!(
-                                "invalid input for type boolean: \"{i}\""
-                            ))));
+                            return Err(LimboError::Constraint(SqlErrorMessage::classified(
+                                SqlErrorKind::InvalidTextRepresentation,
+                                format!("invalid input for type boolean: \"{i}\""),
+                            )));
                         }
                     },
                     Value::Text(t) => {
@@ -10537,16 +10595,18 @@ pub fn op_function(
                             "true" | "t" | "yes" | "on" | "1" => Value::from_i64(1),
                             "false" | "f" | "no" | "off" | "0" => Value::from_i64(0),
                             _ => {
-                                return Err(LimboError::Constraint(SqlErrorMessage::classified(SqlErrorKind::InvalidTextRepresentation, format!(
-                                    "invalid input for type boolean: \"{v}\""
-                                ))));
+                                return Err(LimboError::Constraint(SqlErrorMessage::classified(
+                                    SqlErrorKind::InvalidTextRepresentation,
+                                    format!("invalid input for type boolean: \"{v}\""),
+                                )));
                             }
                         }
                     }
                     other => {
-                        return Err(LimboError::Constraint(SqlErrorMessage::classified(SqlErrorKind::InvalidTextRepresentation, format!(
-                            "invalid input for type boolean: \"{other}\""
-                        ))));
+                        return Err(LimboError::Constraint(SqlErrorMessage::classified(
+                            SqlErrorKind::InvalidTextRepresentation,
+                            format!("invalid input for type boolean: \"{other}\""),
+                        )));
                     }
                 };
                 state.registers[*dest].set_value(result);
@@ -10569,14 +10629,18 @@ pub fn op_function(
                     Value::Text(t) => {
                         let v = &t.value;
                         v.parse::<std::net::IpAddr>().map_err(|_| {
-                            LimboError::Constraint(SqlErrorMessage::classified(SqlErrorKind::InvalidTextRepresentation, format!("invalid input for type inet: \"{v}\"")))
+                            LimboError::Constraint(SqlErrorMessage::classified(
+                                SqlErrorKind::InvalidTextRepresentation,
+                                format!("invalid input for type inet: \"{v}\""),
+                            ))
                         })?;
                         val.get_value().clone()
                     }
                     other => {
-                        return Err(LimboError::Constraint(SqlErrorMessage::classified(SqlErrorKind::InvalidTextRepresentation, format!(
-                            "invalid input for type inet: \"{other}\""
-                        ))));
+                        return Err(LimboError::Constraint(SqlErrorMessage::classified(
+                            SqlErrorKind::InvalidTextRepresentation,
+                            format!("invalid input for type inet: \"{other}\""),
+                        )));
                     }
                 };
                 state.registers[*dest].set_value(result);
@@ -10595,7 +10659,9 @@ pub fn op_function(
                             Value::Numeric(Numeric::Integer(i)) => *i,
                             _ => {
                                 return Err(LimboError::Constraint(
-                                    "numeric_encode: precision must be an integer".to_string().into(),
+                                    "numeric_encode: precision must be an integer"
+                                        .to_string()
+                                        .into(),
                                 ));
                             }
                         };
@@ -10603,7 +10669,9 @@ pub fn op_function(
                             Value::Numeric(Numeric::Integer(i)) => *i,
                             _ => {
                                 return Err(LimboError::Constraint(
-                                    "numeric_encode: scale must be an integer".to_string().into(),
+                                    "numeric_encode: scale must be an integer"
+                                        .to_string()
+                                        .into(),
                                 ));
                             }
                         };
@@ -10614,20 +10682,22 @@ pub fn op_function(
                             Value::Numeric(Numeric::Integer(i)) => PgNumeric::from_i64(*i),
                             Value::Numeric(Numeric::Float(f)) => PgNumeric::parse(&f.to_string())
                                 .unwrap_or_else(|| {
-                                    Err(LimboError::Constraint(SqlErrorMessage::classified(SqlErrorKind::InvalidTextRepresentation, format!(
-                                        "invalid input for type numeric: \"{f}\""
-                                    ))))
-                                })?,
+                                Err(LimboError::Constraint(SqlErrorMessage::classified(
+                                    SqlErrorKind::InvalidTextRepresentation,
+                                    format!("invalid input for type numeric: \"{f}\""),
+                                )))
+                            })?,
                             Value::Text(t) => PgNumeric::parse(&t.value).unwrap_or_else(|| {
-                                Err(LimboError::Constraint(SqlErrorMessage::classified(SqlErrorKind::InvalidTextRepresentation, format!(
-                                    "invalid input for type numeric: \"{}\"",
-                                    t.value
-                                ))))
+                                Err(LimboError::Constraint(SqlErrorMessage::classified(
+                                    SqlErrorKind::InvalidTextRepresentation,
+                                    format!("invalid input for type numeric: \"{}\"", t.value),
+                                )))
                             })?,
                             _ => {
-                                return Err(LimboError::Constraint(SqlErrorMessage::classified(SqlErrorKind::InvalidTextRepresentation, format!(
-                                    "invalid input for type numeric: \"{other}\""
-                                ))));
+                                return Err(LimboError::Constraint(SqlErrorMessage::classified(
+                                    SqlErrorKind::InvalidTextRepresentation,
+                                    format!("invalid input for type numeric: \"{other}\""),
+                                )));
                             }
                         };
                         Value::from_blob(value.with_typmod(typmod)?.to_blob())
@@ -10640,13 +10710,13 @@ pub fn op_function(
                 let val = &state.registers[*start_reg];
                 let result = match val.get_value() {
                     Value::Null => Value::Null,
-                    Value::Blob(b) => {
-                        Value::build_text(crate::numeric::decimal::PgNumeric::from_blob(b)?.format())
-                    }
+                    Value::Blob(b) => Value::build_text(
+                        crate::numeric::decimal::PgNumeric::from_blob(b)?.format(),
+                    ),
                     other => {
-                        return Err(LimboError::Constraint(format!(
-                            "numeric_decode: expected blob, got \"{other}\""
-                        ).into()));
+                        return Err(LimboError::Constraint(
+                            format!("numeric_decode: expected blob, got \"{other}\"").into(),
+                        ));
                     }
                 };
                 state.registers[*dest].set_value(result);
@@ -10670,7 +10740,10 @@ pub fn op_function(
                             ScalarFunc::NumericDiv => {
                                 if b.is_zero() {
                                     return Err(LimboError::Constraint(
-                                        SqlErrorMessage::classified(SqlErrorKind::DivisionByZero, "division by zero".to_string()),
+                                        SqlErrorMessage::classified(
+                                            SqlErrorKind::DivisionByZero,
+                                            "division by zero".to_string(),
+                                        ),
                                     ));
                                 }
                                 a.div(&b)?
@@ -11613,7 +11686,9 @@ pub fn op_function(
                     // Minimum: fts_match(text, query) = 2 args
                     if arg_count < 2 {
                         return Err(LimboError::InvalidArgument(
-                            "fts_match requires at least 2 arguments: text, query".to_string().into(),
+                            "fts_match requires at least 2 arguments: text, query"
+                                .to_string()
+                                .into(),
                         ));
                     }
 
@@ -12642,9 +12717,10 @@ pub fn op_idx_insert(
                     if flags.has(IdxInsertFlags::NO_OP_DUPLICATE) {
                         break 'i true;
                     }
-                    return Err(LimboError::Constraint(
-                        SqlErrorMessage::classified(SqlErrorKind::UniqueViolation, "UNIQUE constraint failed: duplicate key"),
-                    ));
+                    return Err(LimboError::Constraint(SqlErrorMessage::classified(
+                        SqlErrorKind::UniqueViolation,
+                        "UNIQUE constraint failed: duplicate key",
+                    )));
                 }
 
                 false
@@ -13303,9 +13379,10 @@ pub fn op_open_write(
             if matches!(cursor_type, CursorType::BTreeTable(table_rc) if !table_rc.has_rowid)
                 && program.connection.get_mv_tx_id_for_db(*db).is_some()
             {
-                return Err(LimboError::ParseError(
-                    SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, "WITHOUT ROWID tables are not supported in MVCC mode".to_string()),
-                ));
+                return Err(LimboError::ParseError(SqlErrorMessage::classified(
+                    SqlErrorKind::FeatureNotSupported,
+                    "WITHOUT ROWID tables are not supported in MVCC mode".to_string(),
+                )));
             }
             let num_columns = match cursor_type {
                 CursorType::BTreeTable(table_rc) => table_rc.columns().len(),
@@ -13907,7 +13984,9 @@ pub fn op_sequence_compute_next(
         Value::Text(t) => t.as_str().to_string(),
         _ => {
             return Err(crate::LimboError::ParseError(
-                "SequenceComputeNext: seq_name_reg must be text".to_string().into(),
+                "SequenceComputeNext: seq_name_reg must be text"
+                    .to_string()
+                    .into(),
             ));
         }
     };
@@ -14023,7 +14102,9 @@ pub fn op_set_sequence_currval(
         Value::Text(t) => t.as_str().to_string(),
         _ => {
             return Err(crate::LimboError::ParseError(
-                "SetSequenceCurrval: seq_name_reg must be text".to_string().into(),
+                "SetSequenceCurrval: seq_name_reg must be text"
+                    .to_string()
+                    .into(),
             ));
         }
     };
@@ -14066,7 +14147,9 @@ pub fn op_sequence_track_allocation(
         Value::Text(t) => t.as_str().to_string(),
         _ => {
             return Err(crate::LimboError::ParseError(
-                "SequenceTrackAllocation: seq_name_reg must be text".to_string().into(),
+                "SequenceTrackAllocation: seq_name_reg must be text"
+                    .to_string()
+                    .into(),
             ));
         }
     };
@@ -14090,7 +14173,9 @@ pub fn op_sequence_track_allocation(
             .connection
             .with_schema(*db, |s| s.get_sequence(&normalized_seq_name).cloned())
             .ok_or_else(|| {
-                crate::LimboError::ParseError(format!("sequence \"{seq_name}\" does not exist").into())
+                crate::LimboError::ParseError(
+                    format!("sequence \"{seq_name}\" does not exist").into(),
+                )
             })?;
         let current_watermark =
             crate::mvcc::database::first_unsafe_sequence_watermark(&seq, value, true);
@@ -14158,7 +14243,9 @@ pub fn op_sequence_register_allocation(
         Value::Text(t) => t.as_str().to_string(),
         _ => {
             return Err(crate::LimboError::ParseError(
-                "SequenceRegisterAllocation: seq_name_reg must be text".to_string().into(),
+                "SequenceRegisterAllocation: seq_name_reg must be text"
+                    .to_string()
+                    .into(),
             ));
         }
     };
@@ -15730,7 +15817,9 @@ pub fn op_open_dup(
     );
     // Recipe backfill: a duplicate of an ephemeral cursor is ephemeral (see `crate::recipe`).
     let dup_ephemeral = state.recipe_exec.is_ephemeral(*original_cursor_id);
-    state.recipe_exec.set_ephemeral(*new_cursor_id, dup_ephemeral);
+    state
+        .recipe_exec
+        .set_ephemeral(*new_cursor_id, dup_ephemeral);
     let mv_store = program.connection.mv_store();
 
     let original_cursor = state.get_cursor(*original_cursor_id);
@@ -15754,9 +15843,10 @@ pub fn op_open_dup(
     match cursor_type {
         CursorType::BTreeTable(table) => {
             if !table.has_rowid && program.connection.get_mv_tx_id().is_some() {
-                return Err(LimboError::ParseError(
-                    SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, "WITHOUT ROWID tables are not supported in MVCC mode".to_string()),
-                ));
+                return Err(LimboError::ParseError(SqlErrorMessage::classified(
+                    SqlErrorKind::FeatureNotSupported,
+                    "WITHOUT ROWID tables are not supported in MVCC mode".to_string(),
+                )));
             }
             let cursor: Box<dyn CursorTrait> = if table.has_rowid {
                 Box::new(BTreeCursor::new_table(
@@ -16354,10 +16444,13 @@ fn rewrite_trigger_for_column_rename(
         rewrite_trigger_cmd_column_refs(cmd, table_name, &trigger_tbl, old_col, new_col);
     }
     if trigger_still_references_renamed_column(trigger, table_name, old_col) {
-        return Err(LimboError::ParseError(format!(
-            "error in trigger {} after rename: no such column: {}",
-            trigger.name, old_col
-        ).into()));
+        return Err(LimboError::ParseError(
+            format!(
+                "error in trigger {} after rename: no such column: {}",
+                trigger.name, old_col
+            )
+            .into(),
+        ));
     }
     // Keep trigger.sql in sync with the rewritten in-memory AST so a subsequent
     // RENAME COLUMN sees the current column name (the translate step uses the
@@ -16637,9 +16730,9 @@ pub fn op_drop_column(
                     .iter()
                     .any(|column| column.pos_in_table == *column_index)
                 {
-                    return Err(LimboError::ParseError(format!(
-                        "cannot drop column \"{column_name}\": indexed"
-                    ).into()));
+                    return Err(LimboError::ParseError(
+                        format!("cannot drop column \"{column_name}\": indexed").into(),
+                    ));
                 }
             }
         }
@@ -16682,10 +16775,13 @@ pub fn op_drop_column(
         for (view_name, view) in schema.views.iter() {
             let view_select_sql = format!("SELECT * FROM {view_name}");
             let _ = conn.prepare(view_select_sql.as_str()).map_err(|e| {
-                LimboError::ParseError(format!(
-                    "cannot drop column \"{}\": referenced in VIEW {view_name}: {}. {e}",
-                    column_name, view.sql,
-                ).into())
+                LimboError::ParseError(
+                    format!(
+                        "cannot drop column \"{}\": referenced in VIEW {view_name}: {}. {e}",
+                        column_name, view.sql,
+                    )
+                    .into(),
+                )
             })?;
         }
         Ok(())
@@ -17054,10 +17150,13 @@ pub fn op_alter_column(
                 for (view_name, view) in schema.views.iter() {
                     let view_select_sql = format!("SELECT * FROM {view_name}");
                     let _ = conn.prepare(view_select_sql.as_str()).map_err(|e| {
-                        LimboError::ParseError(format!(
+                        LimboError::ParseError(
+                            format!(
                             "cannot rename column \"{}\": referenced in VIEW {view_name}: {}. {e}",
                             old_column_name, view.sql,
-                        ).into())
+                        )
+                            .into(),
+                        )
                     })?;
                 }
                 Ok(())
@@ -18423,7 +18522,8 @@ fn op_journal_mode_inner(
                 {
                     return Err(LimboError::InvalidArgument(
                         "cannot change journal_mode while branches of this database exist"
-                            .to_string().into(),
+                            .to_string()
+                            .into(),
                     ));
                 }
 
@@ -18470,7 +18570,9 @@ fn op_journal_mode_inner(
                     && pager.has_external_page_codec()
                 {
                     return Err(LimboError::InvalidArgument(
-                        "external page codecs are not supported with MVCC databases".to_string().into(),
+                        "external page codecs are not supported with MVCC databases"
+                            .to_string()
+                            .into(),
                     ));
                 }
 
@@ -18915,7 +19017,9 @@ fn op_vacuum_into_inner(
                 // as vacuum cannot be run inside a transaction
                 if !program.connection.auto_commit.load(Ordering::SeqCst) {
                     return Err(LimboError::TxError(
-                        "cannot VACUUM INTO from within a transaction".to_string().into(),
+                        "cannot VACUUM INTO from within a transaction"
+                            .to_string()
+                            .into(),
                     ));
                 }
                 // This VACUUM INTO statement itself is the one active root
@@ -18928,15 +19032,17 @@ fn op_vacuum_into_inner(
                     != 1
                 {
                     return Err(LimboError::TxError(
-                        "cannot VACUUM - SQL statements in progress".to_string().into(),
+                        "cannot VACUUM - SQL statements in progress"
+                            .to_string()
+                            .into(),
                     ));
                 }
 
                 // we always vacuum into a new file, so check if it exists
                 if std::path::Path::new(dest_path).exists() {
-                    return Err(LimboError::ParseError(format!(
-                        "output file already exists: {dest_path}"
-                    ).into()));
+                    return Err(LimboError::ParseError(
+                        format!("output file already exists: {dest_path}").into(),
+                    ));
                 }
 
                 // Pin source metadata before building the output database. The

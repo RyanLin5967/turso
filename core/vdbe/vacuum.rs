@@ -981,7 +981,10 @@ pub(crate) fn vacuum_target_build_step(
                 let entry_ordinal = state.post_data_entries[idx];
                 let entry = &state.schema_entries[entry_ordinal];
                 let replay_sql = if entry.entry_type == SchemaEntryType::View {
-                    state.target_conn.dialect().view_sql_for_replay(&entry.sql)?
+                    state
+                        .target_conn
+                        .dialect()
+                        .view_sql_for_replay(&entry.sql)?
                 } else {
                     entry.sql.clone()
                 };
@@ -1748,7 +1751,9 @@ fn vacuum_in_place_step(
                 // 2. No other active root statements on this connection.
                 if connection.n_active_root_statements.load(Ordering::SeqCst) != 1 {
                     return Err(LimboError::TxError(
-                        "cannot VACUUM - SQL statements in progress".to_string().into(),
+                        "cannot VACUUM - SQL statements in progress"
+                            .to_string()
+                            .into(),
                     ));
                 }
                 // 3. Reject readonly database, well you cannot edit a readonly db ^_^

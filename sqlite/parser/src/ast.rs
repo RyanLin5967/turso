@@ -1233,7 +1233,9 @@ impl Name {
     /// Resets quoting exactly as replacing the value with Name::exact did.
     /// Synthesized names still change normally, but produce no source edit.
     pub fn rename(&mut self, new: String) -> Option<NameRename> {
-        if self.value == new { return None; }
+        if self.value == new {
+            return None;
+        }
         let edit = self.source_origin.map(|origin| NameRename {
             origin,
             before: self.value.clone(),

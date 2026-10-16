@@ -1,4 +1,3 @@
-use turso_parser::sql_error::{SqlErrorKind, SqlErrorMessage};
 use crate::functions::validate_pg_input;
 use parking_lot::RwLock;
 use rustc_hash::FxHashMap as HashMap;
@@ -10,6 +9,7 @@ use turso_core::{
 };
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
 use turso_parser::ast::RefAct;
+use turso_parser::sql_error::{SqlErrorKind, SqlErrorMessage};
 
 /// Starting OID for user tables (matches PostgreSQL convention)
 const USER_TABLE_OID_START: i64 = 16384;
@@ -189,7 +189,10 @@ impl Dialect for PostgresDialect {
         // VACUUM replays the stored executable form through this same method.
         // Reuse its source rather than treating the derivative as fresh input.
         let source = stored_view_source(input)?.map(|(source, _)| source);
-        Ok(encode_view_source(source.as_deref().unwrap_or(input), canonical))
+        Ok(encode_view_source(
+            source.as_deref().unwrap_or(input),
+            canonical,
+        ))
     }
 
     fn parse_view_sql_ast(&self, stored: &str) -> Result<Option<turso_parser::ast::Cmd>> {
@@ -206,28 +209,42 @@ impl Dialect for PostgresDialect {
     }
 
     fn parse_view_sql_for_rewrite(
-        &self, stored: &str, schema: &Schema,
+        &self,
+        stored: &str,
+        schema: &Schema,
     ) -> Result<(Option<turso_parser::ast::Cmd>, String)> {
         let Some((source, _)) = stored_view_source(stored)? else {
             return Ok((self.parse_view_sql_ast(stored)?, stored.to_owned()));
         };
         turso_pg_parser::with_preparation_stack(&source, || {
-            let mut parsed = turso_pg_parser::parse(&source).map_err(crate::session::pg_parse_error)?;
+            let mut parsed =
+                turso_pg_parser::parse(&source).map_err(crate::session::pg_parse_error)?;
             // A view's output names are fixed when it is created, including names
             // implicit in its original SELECT. Base-column rename must not rename
             // those public view columns. Supply that existing schema contract to
             // the same scoped rewriter as an explicit view column list.
-            if let Some(turso_pg_parser::pg_query::protobuf::node::Node::ViewStmt(view)) =
-                parsed.protobuf.stmts.first_mut().and_then(|stmt| stmt.stmt.as_mut())
-                    .and_then(|stmt| stmt.node.as_mut())
+            if let Some(turso_pg_parser::pg_query::protobuf::node::Node::ViewStmt(view)) = parsed
+                .protobuf
+                .stmts
+                .first_mut()
+                .and_then(|stmt| stmt.stmt.as_mut())
+                .and_then(|stmt| stmt.node.as_mut())
             {
-                let existing = view.view.as_ref().and_then(|name| schema.get_view(&name.relname));
+                let existing = view
+                    .view
+                    .as_ref()
+                    .and_then(|name| schema.get_view(&name.relname));
                 if let Some(existing) = existing {
-                    view.aliases = existing.columns.iter().filter_map(|column| column.name.as_ref())
+                    view.aliases = existing
+                        .columns
+                        .iter()
+                        .filter_map(|column| column.name.as_ref())
                         .map(|name| turso_pg_parser::pg_query::protobuf::Node {
                             node: Some(turso_pg_parser::pg_query::protobuf::node::Node::String(
-                                turso_pg_parser::pg_query::protobuf::String { sval: name.clone() })),
-                        }).collect();
+                                turso_pg_parser::pg_query::protobuf::String { sval: name.clone() },
+                            )),
+                        })
+                        .collect();
                 }
             }
             // Preserve every generated output contract before the existing
@@ -235,13 +252,16 @@ impl Dialect for PostgresDialect {
             // translator decisions that made the executable view, not a second
             // name resolver. Its source and AST travel together to the formatter.
             let translator = view_rewrite_translator(&parsed, schema)?;
-            let source = translator.normalize_view_source_for_rewrite(&mut parsed)
+            let source = translator
+                .normalize_view_source_for_rewrite(&mut parsed)
                 .map_err(crate::session::pg_parse_error)?;
             // Native addresses and source locations changed: infer once more
             // from this new owning tree rather than reusing stale annotations.
-            let mut parsed = turso_pg_parser::parse(&source).map_err(crate::session::pg_parse_error)?;
+            let mut parsed =
+                turso_pg_parser::parse(&source).map_err(crate::session::pg_parse_error)?;
             let translator = view_rewrite_translator(&parsed, schema)?;
-            let stmt = translator.translate_view_for_rewrite(&mut parsed)
+            let stmt = translator
+                .translate_view_for_rewrite(&mut parsed)
                 .map_err(crate::session::pg_parse_error)?;
             let rewrite_source = encode_view_source(&source, &stmt.to_string());
             Ok((Some(turso_parser::ast::Cmd::Stmt(stmt)), rewrite_source))
@@ -249,30 +269,44 @@ impl Dialect for PostgresDialect {
     }
 
     fn format_rewritten_view_sql(
-        &self, stored: &str, rewritten: &turso_parser::ast::Stmt,
+        &self,
+        stored: &str,
+        rewritten: &turso_parser::ast::Stmt,
         renames: &[turso_parser::ast::NameRename],
     ) -> Result<String> {
         let Some((source, _)) = stored_view_source(stored)? else {
             return Ok(rewritten.to_string());
         };
         turso_pg_parser::with_preparation_stack(&source, || {
-            let mut parsed = turso_pg_parser::parse(&source).map_err(crate::session::pg_parse_error)?;
+            let mut parsed =
+                turso_pg_parser::parse(&source).map_err(crate::session::pg_parse_error)?;
             turso_pg_parser::translator::apply_view_name_renames(&mut parsed, renames)
                 .map_err(crate::session::pg_parse_error)?;
             if let turso_parser::ast::Stmt::CreateView { columns, .. } = rewritten {
                 if let Some(turso_pg_parser::pg_query::protobuf::node::Node::ViewStmt(view)) =
-                    parsed.protobuf.stmts.first_mut().and_then(|stmt| stmt.stmt.as_mut())
+                    parsed
+                        .protobuf
+                        .stmts
+                        .first_mut()
+                        .and_then(|stmt| stmt.stmt.as_mut())
                         .and_then(|stmt| stmt.node.as_mut())
                 {
                     // Alias fields are outside the source-identifier registry, so
                     // pinning the public output contract does not change origin IDs.
-                    view.aliases = columns.iter().map(|column| turso_pg_parser::pg_query::protobuf::Node {
-                        node: Some(turso_pg_parser::pg_query::protobuf::node::Node::String(
-                            turso_pg_parser::pg_query::protobuf::String { sval: column.col_name.as_str().to_owned() })),
-                    }).collect();
+                    view.aliases = columns
+                        .iter()
+                        .map(|column| turso_pg_parser::pg_query::protobuf::Node {
+                            node: Some(turso_pg_parser::pg_query::protobuf::node::Node::String(
+                                turso_pg_parser::pg_query::protobuf::String {
+                                    sval: column.col_name.as_str().to_owned(),
+                                },
+                            )),
+                        })
+                        .collect();
                 }
             }
-            let source = turso_pg_parser::deparse(&parsed.protobuf).map_err(crate::session::pg_parse_error)?;
+            let source = turso_pg_parser::deparse(&parsed.protobuf)
+                .map_err(crate::session::pg_parse_error)?;
             Ok(encode_view_source(&source, &rewritten.to_string()))
         })
     }
@@ -336,7 +370,10 @@ impl Dialect for PostgresDialect {
         for (what, v) in present.zip(args) {
             // An integer is finite; only a float can be an infinity (the engine has no NaN).
             if !v.to_float_or_zero().is_finite() {
-                return Err(LimboError::ExtensionError(SqlErrorMessage::classified(SqlErrorKind::InvalidParameterValue, format!("{what} cannot be infinity"))));
+                return Err(LimboError::ExtensionError(SqlErrorMessage::classified(
+                    SqlErrorKind::InvalidParameterValue,
+                    format!("{what} cannot be infinity"),
+                )));
             }
         }
         Ok(())
@@ -346,9 +383,12 @@ impl Dialect for PostgresDialect {
         match text.trim().to_ascii_lowercase().as_str() {
             "infinity" | "+infinity" | "inf" | "+inf" => Some(Ok(f64::INFINITY)),
             "-infinity" | "-inf" => Some(Ok(f64::NEG_INFINITY)),
-            "nan" | "+nan" | "-nan" => Some(Err(LimboError::ParseError(SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, format!(
-                "NaN is not supported by this engine: {text:?}"
-            ))))),
+            "nan" | "+nan" | "-nan" => {
+                Some(Err(LimboError::ParseError(SqlErrorMessage::classified(
+                    SqlErrorKind::FeatureNotSupported,
+                    format!("NaN is not supported by this engine: {text:?}"),
+                ))))
+            }
             _ => None,
         }
     }
@@ -428,30 +468,60 @@ pub fn is_catalog_table_name(name: &str) -> bool {
 /// Construct the existing translator from the same scoped inference and
 /// declared schema metadata used for normal frontend preparation.
 fn view_rewrite_translator(
-    parsed: &turso_pg_parser::ParseResult, schema: &Schema,
+    parsed: &turso_pg_parser::ParseResult,
+    schema: &Schema,
 ) -> Result<turso_pg_parser::translator::PostgreSQLTranslator> {
-            let attached = crate::result_types::Attached { names: &[], holds: &|_, _| false };
-            let walked = crate::result_types::parameter_types_with(
-                parsed, schema, &["public".to_owned()], &Default::default(),
-                &attached, &Default::default(),
-            )?;
-            // Reuse declared schema columns for the translator's existing alias
-            // expansion. No connection or catalog query is needed while rewriting.
-            let mut columns: std::collections::HashMap<String, Vec<String>> = schema.tables.iter()
-                .map(|(name, table)| (name.to_ascii_lowercase(), table.columns().iter()
-                    .filter(|column| !column.hidden()).filter_map(|column| column.name.clone()).collect()))
-                .collect();
-            columns.extend(schema.views.iter().map(|(name, view)|
-                (name.to_ascii_lowercase(), view.columns.iter().filter_map(|column| column.name.clone()).collect())));
-            Ok(turso_pg_parser::translator::PostgreSQLTranslator::new()
-                .with_expression_types(walked.expressions)
-                .with_known_types(schema.type_registry.keys().cloned().collect())
-                .with_columns(move |namespace, table| match turso_pg_parser::schema_qualifier(namespace) {
-                    turso_pg_parser::SchemaQualifier::Main
-                    | turso_pg_parser::SchemaQualifier::Unqualified
-                    | turso_pg_parser::SchemaQualifier::PgCatalog => columns.get(&table.to_ascii_lowercase()).cloned(),
-                    _ => None,
-                }))
+    let attached = crate::result_types::Attached {
+        names: &[],
+        holds: &|_, _| false,
+    };
+    let walked = crate::result_types::parameter_types_with(
+        parsed,
+        schema,
+        &["public".to_owned()],
+        &Default::default(),
+        &attached,
+        &Default::default(),
+    )?;
+    // Reuse declared schema columns for the translator's existing alias
+    // expansion. No connection or catalog query is needed while rewriting.
+    let mut columns: std::collections::HashMap<String, Vec<String>> = schema
+        .tables
+        .iter()
+        .map(|(name, table)| {
+            (
+                name.to_ascii_lowercase(),
+                table
+                    .columns()
+                    .iter()
+                    .filter(|column| !column.hidden())
+                    .filter_map(|column| column.name.clone())
+                    .collect(),
+            )
+        })
+        .collect();
+    columns.extend(schema.views.iter().map(|(name, view)| {
+        (
+            name.to_ascii_lowercase(),
+            view.columns
+                .iter()
+                .filter_map(|column| column.name.clone())
+                .collect(),
+        )
+    }));
+    Ok(turso_pg_parser::translator::PostgreSQLTranslator::new()
+        .with_expression_types(walked.expressions)
+        .with_known_types(schema.type_registry.keys().cloned().collect())
+        .with_columns(
+            move |namespace, table| match turso_pg_parser::schema_qualifier(namespace) {
+                turso_pg_parser::SchemaQualifier::Main
+                | turso_pg_parser::SchemaQualifier::Unqualified
+                | turso_pg_parser::SchemaQualifier::PgCatalog => {
+                    columns.get(&table.to_ascii_lowercase()).cloned()
+                }
+                _ => None,
+            },
+        ))
 }
 
 const STORED_PG_VIEW_SOURCE: &str = "/* view-source-v1:";
@@ -470,11 +540,17 @@ fn encode_view_source(source: &str, executable: &str) -> String {
 }
 
 pub(crate) fn stored_view_source(stored: &str) -> Result<Option<(String, &str)>> {
-    let Some(body) = stored.strip_prefix(STORED_PG_SCHEMA_PREFIX)
-        .and_then(|body| body.strip_prefix(STORED_PG_VIEW_SOURCE)) else { return Ok(None); };
+    let Some(body) = stored
+        .strip_prefix(STORED_PG_SCHEMA_PREFIX)
+        .and_then(|body| body.strip_prefix(STORED_PG_VIEW_SOURCE))
+    else {
+        return Ok(None);
+    };
     let invalid = || LimboError::Corrupt("invalid stored PostgreSQL view source".to_owned());
     let (encoded, executable) = body.split_once(" */ ").ok_or_else(invalid)?;
-    if encoded.len() % 2 != 0 { return Err(invalid()); }
+    if encoded.len() % 2 != 0 {
+        return Err(invalid());
+    }
     let digit = |byte| match byte {
         b'0'..=b'9' => Some(byte - b'0'),
         b'a'..=b'f' => Some(byte - b'a' + 10),
@@ -528,92 +604,154 @@ pub(crate) fn catalog_column_oid(relation: &str, column: &str) -> Option<u32> {
     let relation = relation.to_ascii_lowercase();
     let column = column.to_ascii_lowercase();
     Some(match (relation.as_str(), column.as_str()) {
-        ("information_schema_columns", "table_catalog" | "table_schema" | "table_name" | "column_name" | "udt_catalog" | "udt_schema" | "udt_name") => 19, // name
+        (
+            "information_schema_columns",
+            "table_catalog" | "table_schema" | "table_name" | "column_name" | "udt_catalog"
+            | "udt_schema" | "udt_name",
+        ) => 19, // name
         ("information_schema_columns", "column_default" | "is_nullable" | "data_type") => 1043, // varchar
-        ("information_schema_key_column_usage", "constraint_catalog" | "constraint_schema" | "constraint_name" | "table_catalog" | "table_schema" | "table_name" | "column_name") => 19, // name
-        ("information_schema_table_constraints", "constraint_catalog" | "constraint_schema" | "constraint_name" | "table_catalog" | "table_schema" | "table_name") => 19, // name
-        ("information_schema_table_constraints", "constraint_type" | "is_deferrable" | "initially_deferred") => 1043, // varchar
+        (
+            "information_schema_key_column_usage",
+            "constraint_catalog" | "constraint_schema" | "constraint_name" | "table_catalog"
+            | "table_schema" | "table_name" | "column_name",
+        ) => 19, // name
+        (
+            "information_schema_table_constraints",
+            "constraint_catalog" | "constraint_schema" | "constraint_name" | "table_catalog"
+            | "table_schema" | "table_name",
+        ) => 19, // name
+        (
+            "information_schema_table_constraints",
+            "constraint_type" | "is_deferrable" | "initially_deferred",
+        ) => 1043, // varchar
         ("information_schema_tables", "table_catalog" | "table_schema" | "table_name") => 19, // name
         ("information_schema_tables", "table_type") => 1043, // varchar
-        ("pg_am", "amtype") => 18, // char
-        ("pg_am", "amname") => 19, // name
-        ("pg_am", "oid") => 26, // oid
-        ("pg_attrdef", "adnum") => 21, // int2
-        ("pg_attrdef", "oid" | "adrelid") => 26, // oid
-        ("pg_attribute", "attbyval" | "attnotnull" | "atthasdef" | "atthasmissing" | "attisdropped" | "attislocal") => 16, // bool
+        ("pg_am", "amtype") => 18,                           // char
+        ("pg_am", "amname") => 19,                           // name
+        ("pg_am", "oid") => 26,                              // oid
+        ("pg_attrdef", "adnum") => 21,                       // int2
+        ("pg_attrdef", "oid" | "adrelid") => 26,             // oid
+        (
+            "pg_attribute",
+            "attbyval" | "attnotnull" | "atthasdef" | "atthasmissing" | "attisdropped"
+            | "attislocal",
+        ) => 16, // bool
         ("pg_attribute", "attstorage" | "attalign" | "attidentity" | "attgenerated") => 18, // char
-        ("pg_attribute", "attname") => 19, // name
+        ("pg_attribute", "attname") => 19,                   // name
         ("pg_attribute", "attstattarget" | "attlen" | "attnum" | "attndims" | "attinhcount") => 21, // int2
         ("pg_attribute", "attrelid" | "atttypid" | "attcollation") => 26, // oid
-        ("pg_class", "relhasindex" | "relisshared" | "relhasrules" | "relhastriggers" | "relhassubclass" | "relrowsecurity" | "relforcerowsecurity" | "relispopulated" | "relispartition") => 16, // bool
+        (
+            "pg_class",
+            "relhasindex"
+            | "relisshared"
+            | "relhasrules"
+            | "relhastriggers"
+            | "relhassubclass"
+            | "relrowsecurity"
+            | "relforcerowsecurity"
+            | "relispopulated"
+            | "relispartition",
+        ) => 16, // bool
         ("pg_class", "relpersistence" | "relkind" | "relreplident") => 18, // char
-        ("pg_class", "relname") => 19, // name
-        ("pg_class", "relnatts" | "relchecks") => 21, // int2
-        ("pg_class", "oid" | "relnamespace" | "reltype" | "reloftype" | "relowner" | "relam" | "relfilenode" | "reltablespace" | "reltoastrelid" | "relrewrite") => 26, // oid
-        ("pg_collation", "collisdeterministic") => 16, // bool
-        ("pg_collation", "collprovider") => 18, // char
-        ("pg_collation", "collname") => 19, // name
-        ("pg_collation", "oid" | "collnamespace" | "collowner") => 26, // oid
-        ("pg_constraint", "condeferrable" | "condeferred" | "convalidated" | "conislocal" | "connoinherit") => 16, // bool
+        ("pg_class", "relname") => 19,                                    // name
+        ("pg_class", "relnatts" | "relchecks") => 21,                     // int2
+        (
+            "pg_class",
+            "oid" | "relnamespace" | "reltype" | "reloftype" | "relowner" | "relam" | "relfilenode"
+            | "reltablespace" | "reltoastrelid" | "relrewrite",
+        ) => 26, // oid
+        ("pg_collation", "collisdeterministic") => 16,                    // bool
+        ("pg_collation", "collprovider") => 18,                           // char
+        ("pg_collation", "collname") => 19,                               // name
+        ("pg_collation", "oid" | "collnamespace" | "collowner") => 26,    // oid
+        (
+            "pg_constraint",
+            "condeferrable" | "condeferred" | "convalidated" | "conislocal" | "connoinherit",
+        ) => 16, // bool
         ("pg_constraint", "contype" | "confupdtype" | "confdeltype" | "confmatchtype") => 18, // char
-        ("pg_constraint", "conname") => 19, // name
+        ("pg_constraint", "conname") => 19,     // name
         ("pg_constraint", "coninhcount") => 21, // int2
-        ("pg_constraint", "oid" | "connamespace" | "conrelid" | "contypid" | "conindid" | "conparentid" | "confrelid") => 26, // oid
+        (
+            "pg_constraint",
+            "oid" | "connamespace" | "conrelid" | "contypid" | "conindid" | "conparentid"
+            | "confrelid",
+        ) => 26, // oid
         ("pg_database", "datistemplate" | "datallowconn") => 16, // bool
         ("pg_database", "datlocprovider") => 18, // char
-        ("pg_database", "datname") => 19, // name
+        ("pg_database", "datname") => 19,       // name
         ("pg_database", "oid" | "datdba" | "dattablespace") => 26, // oid
         ("pg_description", "objoid" | "classoid") => 26, // oid
         ("pg_foreign_table", "ftrelid" | "ftserver") => 26, // oid
-        ("pg_index", "indisunique" | "indisprimary" | "indisexclusion" | "indimmediate" | "indisclustered" | "indisvalid" | "indcheckxmin" | "indisready" | "indislive" | "indisreplident") => 16, // bool
+        (
+            "pg_index",
+            "indisunique" | "indisprimary" | "indisexclusion" | "indimmediate" | "indisclustered"
+            | "indisvalid" | "indcheckxmin" | "indisready" | "indislive" | "indisreplident",
+        ) => 16, // bool
         ("pg_index", "indnatts" | "indnkeyatts") => 21, // int2
         ("pg_index", "indexrelid" | "indrelid") => 26, // oid
         ("pg_indexes", "schemaname" | "tablename" | "indexname" | "tablespace") => 19, // name
         ("pg_inherits", "inhdetachpending") => 16, // bool
         ("pg_inherits", "inhrelid" | "inhparent") => 26, // oid
-        ("pg_namespace", "nspname") => 19, // name
+        ("pg_namespace", "nspname") => 19,      // name
         ("pg_namespace", "oid" | "nspowner") => 26, // oid
         ("pg_partitioned_table", "partstrat") => 18, // char
         ("pg_partitioned_table", "partnatts") => 21, // int2
         ("pg_partitioned_table", "partrelid" | "partdefid") => 26, // oid
-        ("pg_policy", "polpermissive") => 16, // bool
-        ("pg_policy", "polcmd") => 18, // char
-        ("pg_policy", "polname") => 19, // name
+        ("pg_policy", "polpermissive") => 16,   // bool
+        ("pg_policy", "polcmd") => 18,          // char
+        ("pg_policy", "polname") => 19,         // name
         ("pg_policy", "oid" | "polrelid") => 26, // oid
         ("pg_proc", "prosecdef" | "proleakproof" | "proisstrict" | "proretset") => 16, // bool
         ("pg_proc", "prokind" | "provolatile" | "proparallel") => 18, // char
-        ("pg_proc", "proname") => 19, // name
+        ("pg_proc", "proname") => 19,           // name
         ("pg_proc", "pronargs" | "pronargdefaults") => 21, // int2
-        ("pg_proc", "oid" | "pronamespace" | "proowner" | "prolang" | "provariadic" | "prorettype") => 26, // oid
-        ("pg_publication", "puballtables" | "pubinsert" | "pubupdate" | "pubdelete" | "pubtruncate" | "pubviaroot") => 16, // bool
-        ("pg_publication", "pubname") => 19, // name
+        (
+            "pg_proc",
+            "oid" | "pronamespace" | "proowner" | "prolang" | "provariadic" | "prorettype",
+        ) => 26, // oid
+        (
+            "pg_publication",
+            "puballtables" | "pubinsert" | "pubupdate" | "pubdelete" | "pubtruncate" | "pubviaroot",
+        ) => 16, // bool
+        ("pg_publication", "pubname") => 19,    // name
         ("pg_publication", "oid" | "pubowner") => 26, // oid
         ("pg_publication_namespace", "oid" | "pnpubid" | "pnnspid") => 26, // oid
         ("pg_publication_rel", "oid" | "prpubid" | "prrelid") => 26, // oid
-        ("pg_rewrite", "is_instead") => 16, // bool
+        ("pg_rewrite", "is_instead") => 16,     // bool
         ("pg_rewrite", "ev_type" | "ev_enabled") => 18, // char
-        ("pg_rewrite", "rulename") => 19, // name
+        ("pg_rewrite", "rulename") => 19,       // name
         ("pg_rewrite", "oid" | "ev_class") => 26, // oid
-        ("pg_roles", "rolsuper" | "rolinherit" | "rolcreaterole" | "rolcreatedb" | "rolcanlogin" | "rolreplication" | "rolbypassrls") => 16, // bool
-        ("pg_roles", "rolname") => 19, // name
-        ("pg_roles", "oid") => 26, // oid
-        ("pg_sequences", "cycle") => 16, // bool
+        (
+            "pg_roles",
+            "rolsuper" | "rolinherit" | "rolcreaterole" | "rolcreatedb" | "rolcanlogin"
+            | "rolreplication" | "rolbypassrls",
+        ) => 16, // bool
+        ("pg_roles", "rolname") => 19,          // name
+        ("pg_roles", "oid") => 26,              // oid
+        ("pg_sequences", "cycle") => 16,        // bool
         ("pg_sequences", "schemaname" | "sequencename" | "sequenceowner") => 19, // name
-        ("pg_statistic_ext", "stxname") => 19, // name
+        ("pg_statistic_ext", "stxname") => 19,  // name
         ("pg_statistic_ext", "stxstattarget") => 21, // int2
         ("pg_statistic_ext", "oid" | "stxrelid" | "stxnamespace" | "stxowner") => 26, // oid
         ("pg_tables", "hasindexes" | "hasrules" | "hastriggers" | "rowsecurity") => 16, // bool
         ("pg_tables", "schemaname" | "tablename" | "tableowner" | "tablespace") => 19, // name
         ("pg_trigger", "tgisinternal" | "tgdeferrable" | "tginitdeferred") => 16, // bool
-        ("pg_trigger", "tgenabled") => 18, // char
+        ("pg_trigger", "tgenabled") => 18,      // char
         ("pg_trigger", "tgname" | "tgoldtable" | "tgnewtable") => 19, // name
         ("pg_trigger", "tgtype" | "tgnargs") => 21, // int2
-        ("pg_trigger", "oid" | "tgrelid" | "tgfoid" | "tgconstrrelid" | "tgconstrindid" | "tgconstraint") => 26, // oid
+        (
+            "pg_trigger",
+            "oid" | "tgrelid" | "tgfoid" | "tgconstrrelid" | "tgconstrindid" | "tgconstraint",
+        ) => 26, // oid
         ("pg_type", "typbyval" | "typispreferred" | "typisdefined" | "typnotnull") => 16, // bool
         ("pg_type", "typtype" | "typcategory" | "typdelim" | "typalign" | "typstorage") => 18, // char
         ("pg_type", "typname") => 19, // name
-        ("pg_type", "typlen") => 21, // int2
-        ("pg_type", "oid" | "typnamespace" | "typowner" | "typrelid" | "typelem" | "typarray" | "typbasetype" | "typcollation") => 26, // oid
+        ("pg_type", "typlen") => 21,  // int2
+        (
+            "pg_type",
+            "oid" | "typnamespace" | "typowner" | "typrelid" | "typelem" | "typarray"
+            | "typbasetype" | "typcollation",
+        ) => 26, // oid
         _ => return None,
     })
 }
@@ -3764,7 +3902,9 @@ impl PgGetTableDefCursor {
                     .map(str::to_string)
                     .unwrap_or_else(|| {
                         // An altered table's SQLite text, its mark dropped (engine review 20 HIGH 1).
-                        let sqlite_sql = schema_sql.strip_prefix(STORED_PG_ALTERED_PREFIX).unwrap_or(schema_sql);
+                        let sqlite_sql = schema_sql
+                            .strip_prefix(STORED_PG_ALTERED_PREFIX)
+                            .unwrap_or(schema_sql);
                         self.convert_to_postgres_ddl(sqlite_sql)
                     }),
                 None => self.convert_to_postgres_ddl(&btree_table.to_sql()),
@@ -4567,7 +4707,6 @@ mod tests {
     }
 }
 
-
 #[cfg(test)]
 mod c52_view_replay_tests {
     use super::*;
@@ -4581,39 +4720,65 @@ mod c52_view_replay_tests {
             // Build the executable-only representation that older frontend versions
             // persisted, without passing it through the new PG source formatter.
             let db = turso_core::Database::open_file_with_flags(
-                io.clone(), path.to_str().unwrap(), turso_core::OpenFlags::default(),
-                turso_core::DatabaseOpts::new(), None, Arc::new(turso_core::SqliteDialect),
-            ).unwrap();
+                io.clone(),
+                path.to_str().unwrap(),
+                turso_core::OpenFlags::default(),
+                turso_core::DatabaseOpts::new(),
+                None,
+                Arc::new(turso_core::SqliteDialect),
+            )
+            .unwrap();
             let conn = db.connect().unwrap();
             conn.execute("CREATE TABLE t(b INTEGER)").unwrap();
             conn.execute("INSERT INTO t VALUES(1)").unwrap();
-            conn.execute("CREATE VIEW v AS SELECT b IS 1 AS truth FROM t").unwrap();
-            original = conn.prepare("SELECT sql FROM sqlite_schema WHERE name='v'")
-                .unwrap().run_collect_rows().unwrap();
+            conn.execute("CREATE VIEW v AS SELECT b IS 1 AS truth FROM t")
+                .unwrap();
+            original = conn
+                .prepare("SELECT sql FROM sqlite_schema WHERE name='v'")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap();
             assert_eq!(original.len(), 1);
             conn.close().unwrap();
         }
         {
             let db = crate::session::open_database_with_io(
-                io.clone(), path.to_str().unwrap(), turso_core::OpenFlags::default(),
+                io.clone(),
+                path.to_str().unwrap(),
+                turso_core::OpenFlags::default(),
                 turso_core::DatabaseOpts::new().with_vacuum(true),
-            ).unwrap();
+            )
+            .unwrap();
             let conn = db.connect().unwrap();
             conn.execute("VACUUM").unwrap();
-            let replayed = conn.prepare("SELECT sql FROM sqlite_schema WHERE name='v'")
-                .unwrap().run_collect_rows().unwrap();
+            let replayed = conn
+                .prepare("SELECT sql FROM sqlite_schema WHERE name='v'")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap();
             assert_eq!(replayed, original, "legacy SQL must remain byte-equivalent");
             conn.execute("ALTER TABLE t RENAME COLUMN b TO c").unwrap();
-            let rows = conn.prepare("SELECT truth FROM v").unwrap().run_collect_rows().unwrap();
+            let rows = conn
+                .prepare("SELECT truth FROM v")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap();
             assert_eq!(rows, vec![vec![turso_core::Value::from_i64(1)]]);
             conn.close().unwrap();
         }
         let db = crate::session::open_database_with_io(
-            io, path.to_str().unwrap(), turso_core::OpenFlags::default(),
+            io,
+            path.to_str().unwrap(),
+            turso_core::OpenFlags::default(),
             turso_core::DatabaseOpts::new(),
-        ).unwrap();
+        )
+        .unwrap();
         let conn = db.connect().unwrap();
-        let rows = conn.prepare("SELECT truth FROM v").unwrap().run_collect_rows().unwrap();
+        let rows = conn
+            .prepare("SELECT truth FROM v")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
         assert_eq!(rows, vec![vec![turso_core::Value::from_i64(1)]]);
         conn.close().unwrap();
     }
@@ -4626,36 +4791,58 @@ mod c52_view_replay_tests {
         let original;
         {
             let db = crate::session::open_database_with_io(
-                io.clone(), path.to_str().unwrap(), turso_core::OpenFlags::default(),
+                io.clone(),
+                path.to_str().unwrap(),
+                turso_core::OpenFlags::default(),
                 turso_core::DatabaseOpts::new().with_vacuum(true),
-            ).unwrap();
+            )
+            .unwrap();
             let conn = db.connect().unwrap();
-            conn.execute("CREATE VIEW v AS SELECT true AS flag, '*/ λ' AS quoted").unwrap();
-            original = conn.prepare("SELECT sql FROM sqlite_schema WHERE name='v'")
-                .unwrap().run_collect_rows().unwrap();
+            conn.execute("CREATE VIEW v AS SELECT true AS flag, '*/ λ' AS quoted")
+                .unwrap();
+            original = conn
+                .prepare("SELECT sql FROM sqlite_schema WHERE name='v'")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap();
             assert_eq!(original.len(), 1);
             for _ in 0..2 {
                 conn.execute("VACUUM").unwrap();
-                let replayed = conn.prepare("SELECT sql FROM sqlite_schema WHERE name='v'")
-                    .unwrap().run_collect_rows().unwrap();
-                assert_eq!(replayed, original, "both source and executable SQL must remain stable");
+                let replayed = conn
+                    .prepare("SELECT sql FROM sqlite_schema WHERE name='v'")
+                    .unwrap()
+                    .run_collect_rows()
+                    .unwrap();
+                assert_eq!(
+                    replayed, original,
+                    "both source and executable SQL must remain stable"
+                );
             }
             conn.close().unwrap();
         }
         let db = crate::session::open_database_with_io(
-            io, path.to_str().unwrap(), turso_core::OpenFlags::default(),
+            io,
+            path.to_str().unwrap(),
+            turso_core::OpenFlags::default(),
             turso_core::DatabaseOpts::new(),
-        ).unwrap();
+        )
+        .unwrap();
         let conn = db.connect().unwrap();
-        let replayed = conn.prepare("SELECT sql FROM sqlite_schema WHERE name='v'")
-            .unwrap().run_collect_rows().unwrap();
+        let replayed = conn
+            .prepare("SELECT sql FROM sqlite_schema WHERE name='v'")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
         assert_eq!(replayed, original);
-        let rows = conn.prepare("SELECT flag FROM v").unwrap().run_collect_rows().unwrap();
+        let rows = conn
+            .prepare("SELECT flag FROM v")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
         assert_eq!(rows, vec![vec![turso_core::Value::from_i64(1)]]);
         conn.close().unwrap();
     }
 }
-
 
 #[cfg(test)]
 mod c52_view_source_tests {
@@ -4668,12 +4855,26 @@ mod c52_view_source_tests {
         let stored = encode_view_source(source, executable);
         let decoded = stored_view_source(&stored).unwrap().unwrap();
         assert_eq!(decoded, (source.to_owned(), executable));
-        assert_eq!(PostgresDialect.format_view_sql(&stored, executable).unwrap(), stored);
+        assert_eq!(
+            PostgresDialect
+                .format_view_sql(&stored, executable)
+                .unwrap(),
+            stored
+        );
         let (parsed, consumed) = PostgresDialect.parse(&stored).unwrap();
-        assert!(matches!(parsed, Some(turso_parser::ast::Cmd::Stmt(turso_parser::ast::Stmt::CreateView { .. }))));
+        assert!(matches!(
+            parsed,
+            Some(turso_parser::ast::Cmd::Stmt(
+                turso_parser::ast::Stmt::CreateView { .. }
+            ))
+        ));
         assert_eq!(consumed, stored.len());
-        assert!(matches!(PostgresDialect.parse_view_sql_ast(&stored).unwrap(),
-            Some(turso_parser::ast::Cmd::Stmt(turso_parser::ast::Stmt::CreateView { .. }))));
+        assert!(matches!(
+            PostgresDialect.parse_view_sql_ast(&stored).unwrap(),
+            Some(turso_parser::ast::Cmd::Stmt(
+                turso_parser::ast::Stmt::CreateView { .. }
+            ))
+        ));
     }
 
     #[test]
@@ -4688,10 +4889,15 @@ mod c52_view_source_tests {
         let Some(turso_parser::ast::Cmd::Stmt(stmt)) = parsed else {
             panic!("expected executable legacy CREATE VIEW");
         };
-        let stored = PostgresDialect.format_view_sql(&replay, &stmt.to_string()).unwrap();
+        let stored = PostgresDialect
+            .format_view_sql(&replay, &stmt.to_string())
+            .unwrap();
         assert_eq!(stored, legacy);
         assert!(stored_view_source(&stored).unwrap().is_none());
-        assert!(PostgresDialect.parse_view_sql_ast(&stored).unwrap().is_some());
+        assert!(PostgresDialect
+            .parse_view_sql_ast(&stored)
+            .unwrap()
+            .is_some());
         let replay_again = PostgresDialect.view_sql_for_replay(&stored).unwrap();
         assert_eq!(replay_again, replay);
     }
@@ -4702,6 +4908,8 @@ mod c52_view_source_tests {
             let stored = format!("{STORED_PG_SCHEMA_PREFIX}{STORED_PG_VIEW_SOURCE}{encoded} */ CREATE VIEW v AS SELECT 1");
             assert!(stored_view_source(&stored).is_err());
         }
-        assert!(stored_view_source("CREATE VIEW v AS SELECT 1").unwrap().is_none());
+        assert!(stored_view_source("CREATE VIEW v AS SELECT 1")
+            .unwrap()
+            .is_none());
     }
 }
