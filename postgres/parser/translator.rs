@@ -20,21 +20,66 @@ pub struct TranslateResult {
     pub cmd: ast::Cmd,
 }
 
-/// PostgreSQL expression OIDs from the frontend's one inference over this parsed tree.
-/// Keys identify nodes only while that same parse tree remains alive; cloned or reparsed nodes
-/// have no annotation and must be inferred again. No pointer is dereferenced.
+/// PostgreSQL expression OIDs from the frontend's one inference over this parsed statement.
+/// Direct node identities are the fast path; source locations preserve annotations when a
+/// translator rewrite clones a subtree. This map must never be reused for a different statement.
 #[derive(Debug, Clone, Default)]
 pub struct ExpressionTypes {
     oids: std::collections::HashMap<usize, u32>,
+    locations: std::collections::HashMap<(u8, i32), Option<u32>>,
 }
 
 impl ExpressionTypes {
     pub fn insert(&mut self, node: &pg_query::protobuf::Node, oid: u32) {
         self.oids.insert(node as *const _ as usize, oid);
+        if let Some(location) = Self::location(node) {
+            self.locations
+                .entry(location)
+                .and_modify(|known| {
+                    if *known != Some(oid) {
+                        *known = None;
+                    }
+                })
+                .or_insert(Some(oid));
+        }
     }
 
     pub fn get(&self, node: &pg_query::protobuf::Node) -> Option<u32> {
-        self.oids.get(&(node as *const _ as usize)).copied()
+        self.oids
+            .get(&(node as *const _ as usize))
+            .copied()
+            .or_else(|| {
+                Self::location(node).and_then(|key| self.locations.get(&key).copied().flatten())
+            })
+    }
+
+    fn location(node: &pg_query::protobuf::Node) -> Option<(u8, i32)> {
+        use pg_query::protobuf::node::Node;
+        let key = match node.node.as_ref()? {
+            Node::AConst(n) => (0, n.location),
+            Node::ColumnRef(n) => (1, n.location),
+            Node::ParamRef(n) => (2, n.location),
+            Node::FuncCall(n) => (3, n.location),
+            Node::TypeCast(n) => (
+                4,
+                if n.location >= 0 {
+                    n.location
+                } else {
+                    n.type_name.as_ref().map_or(-1, |ty| ty.location)
+                },
+            ),
+            Node::AExpr(n) => (5, n.location),
+            Node::BoolExpr(n) => (6, n.location),
+            Node::NullTest(n) => (7, n.location),
+            Node::BooleanTest(n) => (8, n.location),
+            Node::CaseExpr(n) => (9, n.location),
+            Node::CoalesceExpr(n) => (10, n.location),
+            Node::MinMaxExpr(n) => (11, n.location),
+            Node::AArrayExpr(n) => (12, n.location),
+            Node::SubLink(n) => (13, n.location),
+            _ => return None,
+        };
+        (key.1 >= 0).then_some(key)
     }
 }
 
