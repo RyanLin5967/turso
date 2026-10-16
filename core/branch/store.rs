@@ -1087,14 +1087,31 @@ fn rewrite_class_marked(before: Option<SyncClass>, journal: &Journal) -> SyncCla
 const CONFIRM_QUIET: Duration = Duration::from_millis(5);
 
 fn confirm_quiet() -> Duration {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "measure-word-hold"))]
     {
+        // A measuring binary may also hold it from its environment (`TURSO_MEASURE_WORD_HOLD=1`),
+        // read once; only a build with the feature reads it.
+        #[cfg(feature = "measure-word-hold")]
+        {
+            static FROM_ENV: std::sync::Once = std::sync::Once::new();
+            FROM_ENV.call_once(|| {
+                if std::env::var_os("TURSO_MEASURE_WORD_HOLD").is_some_and(|v| v == "1") {
+                    CONFIRM_QUIET_MS.store(CONFIRM_HELD_MS, Ordering::Release);
+                }
+            });
+        }
         let ms = CONFIRM_QUIET_MS.load(Ordering::Acquire);
         if ms > 0 {
             return Duration::from_millis(ms);
         }
     }
     CONFIRM_QUIET
+}
+
+/// Test builds: `confirm_quiet` (the word-hold feature's test).
+#[cfg(test)]
+pub(crate) fn confirm_quiet_for_test() -> Duration {
+    confirm_quiet()
 }
 
 /// The confirmation writer, one thread per durable store (review 6 #1; listed in the PREREG annex
@@ -2069,11 +2086,17 @@ const PENDING_FULL_WAIT: Duration = Duration::from_millis(100);
 #[cfg(test)]
 pub(crate) static PENDING_FULL_WAIT_MS: AtomicU64 = AtomicU64::new(0);
 
-/// Test builds: how long the group must stay idle before the confirmation word of its last flight
-/// is written, in milliseconds when set (0: the default), so a test can hold the word back or have
-/// it written at once (review 6 #1).
-#[cfg(test)]
+/// Test builds, and builds with the default-off `measure-word-hold` feature: how long the group must
+/// stay idle before the confirmation word of its last flight is written, in milliseconds when set
+/// (0: the default), so a test or a measuring binary can hold the word back or have it written at
+/// once (review 6 #1; `super::measure_word_hold`).
+#[cfg(any(test, feature = "measure-word-hold"))]
 pub(crate) static CONFIRM_QUIET_MS: AtomicU64 = AtomicU64::new(0);
+
+/// The quiet period that holds the word for good (the budget tests' `CONFIRM_HELD_MS`): woken by
+/// the first landing only, then asleep with the word pending.
+#[cfg(any(test, feature = "measure-word-hold"))]
+pub(crate) const CONFIRM_HELD_MS: u64 = 1 << 40;
 
 fn pending_full_wait() -> Duration {
     #[cfg(test)]
