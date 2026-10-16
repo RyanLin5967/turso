@@ -666,7 +666,11 @@ fn upgrade_hold(n: usize) -> (u64, u64, String) {
         .unwrap();
     let text = String::from_utf8_lossy(&out.stdout).to_string();
     assert!(out.status.success(), "the hold child at {n} failed:\n{text}{}", String::from_utf8_lossy(&out.stderr));
-    let line = text.lines().find(|l| l.starts_with("FA-HOLD ")).unwrap_or_else(|| panic!("no reading at {n}:\n{text}"));
+    // libtest prints the child's line after its own "test ... " prefix.
+    let line = text
+        .lines()
+        .find_map(|l| l.find("FA-HOLD ").map(|i| &l[i..]))
+        .unwrap_or_else(|| panic!("no reading at {n}:\n{text}"));
     let field = |k: &str| line.split_whitespace().find_map(|w| w.strip_prefix(k)).unwrap().to_string();
     (field("rows=").parse().unwrap(), field("bytes=").parse().unwrap(), field("format="))
 }
