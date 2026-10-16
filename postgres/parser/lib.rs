@@ -62,7 +62,11 @@ const PG_DEPARSE_STACK: usize = 4 << 20;
 ///   libpg_query's own output; a corrupt buffer would be reported 54001 too.
 /// - `Error::Parse` or `Error::Split` whose whole message is the C parser's check_stack_depth() message: a syntax
 ///   error's message starts "syntax error at or near" (or names the unterminated token), so no
-///   user text makes it equal.
+///   user text makes it equal. CURRENTLY UNREACHABLE: libpg_query 6.1.1 never raises
+///   check_stack_depth(), whose stack_is_too_deep() answers false while stack_base_ptr is NULL, and
+///   no libpg_query entry point sets it (measured: normalize of a 20,000-term sum succeeds). The
+///   arms are kept so an upgrade that sets it stays 54001, and are tested on constructed errors
+///   (lead ruling: L5 accepted).
 fn pg_query_error(e: pg_query::Error) -> ParseError {
     match e {
         pg_query::Error::Decode(_) => ParseError::StackDepthLimitExceeded,
