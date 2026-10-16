@@ -13591,3 +13591,18 @@ fn c50_class_sum_windows_keep_exact_total_and_remove_nan() {
         ("SELECT sum(x) OVER (ORDER BY n ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM (VALUES (1,'NaN'::numeric),(2,1),(3,2))t(n,x)",vec!["NaN","NaN","3"]),
     ] { assert_eq!(a.q(sql).ok(sql).rows,expected.into_iter().map(|x|vec![Some(x.to_string())]).collect::<Vec<_>>()); }
 }
+
+// Same PG18-recorded operands and answers as the VALUES-window test, using real tables so
+// arithmetic also runs independently of derived VALUES alias translation.
+#[test]
+fn c50_class_sum_windows_on_typed_tables() {
+    let dir=Scratch::new("c50-class-sum-table"); let server=Server::start(&dir.db(),&[]); let mut a=server.connect();
+    a.q("CREATE TABLE cw(n integer, v bigint)").ok("table");
+    a.q("INSERT INTO cw VALUES (1,9223372036854775807),(2,1),(3,2)").ok("rows");
+    let r=a.q("SELECT sum(v) OVER (ORDER BY n ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM cw").ok("sum window");
+    assert_eq!(r.rows, vec![vec![Some("9223372036854775807".into())],vec![Some("9223372036854775808".into())],vec![Some("3".into())]]);
+    a.q("CREATE TABLE cwn(n integer, v numeric)").ok("numeric table");
+    a.q("INSERT INTO cwn VALUES (1,'NaN'),(2,1),(3,2)").ok("numeric rows");
+    let r=a.q("SELECT sum(v) OVER (ORDER BY n ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM cwn").ok("numeric window");
+    assert_eq!(r.rows,vec![vec![Some("NaN".into())],vec![Some("NaN".into())],vec![Some("3".into())]]);
+}
