@@ -4422,7 +4422,7 @@ mod c52_view_replay_tests {
         {
             let db = crate::session::open_database_with_io(
                 io.clone(), path.to_str().unwrap(), turso_core::OpenFlags::default(),
-                turso_core::DatabaseOpts::new(),
+                turso_core::DatabaseOpts::new().with_vacuum(true),
             ).unwrap();
             let conn = db.connect().unwrap();
             conn.execute("VACUUM").unwrap();
@@ -4453,7 +4453,7 @@ mod c52_view_replay_tests {
         {
             let db = crate::session::open_database_with_io(
                 io.clone(), path.to_str().unwrap(), turso_core::OpenFlags::default(),
-                turso_core::DatabaseOpts::new(),
+                turso_core::DatabaseOpts::new().with_vacuum(true),
             ).unwrap();
             let conn = db.connect().unwrap();
             conn.execute("CREATE VIEW v AS SELECT true AS flag, '*/ λ' AS quoted").unwrap();
