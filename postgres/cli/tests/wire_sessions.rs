@@ -9697,16 +9697,17 @@ fn a_recursive_ctes_self_reference_types_its_parameter() {
 /// The 42P18 refusal of a parameter compared with something no context types applies only to a
 /// parameter the client left untyped (OID 0, or none declared): one declared in Parse has its
 /// declared type, at Describe and at Execute, as in PostgreSQL. The refusal was made at prepare,
-/// from the text alone, before the declared OIDs were read: `typeof(v) = $1` declared text was
-/// 42P18 at Describe and at Execute alike, so it could never run, and inside a block its Describe
-/// failed the block (wire review 11 item 1, a regression from 935586643).
+/// from the text alone, before the declared OIDs were read, so it could never run, and inside a
+/// block its Describe failed the block (wire review 11 item 1). `$1 IS NOT NULL` exercises this
+/// PostgreSQL-valid typing boundary; the original typeof() fixture is undefined in PostgreSQL
+/// and is independently checked by c54_sqlite_functions_are_undefined_in_postgresql.
 #[test]
 fn a_declared_parameter_is_never_refused_as_untyped() {
     const TEXT: u32 = 25;
     let dir = Scratch::new("declared42p18");
     let server = Server::start(&dir.db(), &[]);
     let mut a = seeded(&server);
-    let sql = "SELECT id FROM t WHERE typeof(v) = $1";
+    let sql = "SELECT id FROM t WHERE $1 IS NOT NULL";
     // Parse declaring `oid`, Describe the statement, Sync.
     let describe = |a: &mut Wire, oid: u32| -> Reply {
         let mut parse = vec![0u8];
@@ -9913,13 +9914,11 @@ fn untyped_contexts_type_their_parameters() {
     if n != "11" {
         wrong.push(format!("ON CONFLICT SET n = $1 left n = {n}"));
     }
-    // Compared with something no context types (a function the engine has, which the walk does not
-    // type): exactly 42P18, the lead's fail-closed rule, where the base served it as text; a
-    // function that does not exist is the engine's 42883. ENGINE-ONLY: PostgreSQL has no typeof
-    // and answers 42883 for the first row too, so a PG18 re-recording of E5-QUEUE P7 must not
-    // "correct" it; it is the only fail-closed probe here (wire review 15 item 27).
+    // IS NOT NULL supplies no parameter type: PostgreSQL refuses its undeclared $1 with
+    // 42P18. Both absent PostgreSQL functions are 42883, independently of parameter typing.
     for (sql, code) in [
-        ("SELECT id FROM p WHERE typeof(name) = $1", "42P18"),
+        ("SELECT id FROM p WHERE $1 IS NOT NULL", "42P18"),
+        ("SELECT id FROM p WHERE typeof(name) = $1", "42883"),
         ("SELECT id FROM p WHERE no_such_typing(name) = $1", "42883"),
     ] {
         let r = a.describe_statement(sql);
