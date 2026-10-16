@@ -663,7 +663,8 @@ def summarize(out, sha, dry, manifest):
     # review 5 MED 6: the warm-up is creditable only with a bound three-driver conformance record (PREREG annex A23)
     conf = conformance_problems(out)
     parity += [f"warm-up (A23): {x}" for x in conf]
-    # creditable only when NO warm-up refusal stands: the conformance binding and every backstep (review 7 finding 7)
+    # creditable only when NO warm-up refusal stands: the conformance binding, every backstep (review 7 finding 7) and
+    # every warm-up rule refusal (C27 LOW)
     summary["warmup_creditable"] = not conf and not warm
     summary["loud_owed"] = (["the three-driver warm-up conformance run (PREREG annex A23), on this package's own "
                              "bbload, clonebench and fastest_profile"] if conf else [])
