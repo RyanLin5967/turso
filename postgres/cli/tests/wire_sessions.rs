@@ -13226,3 +13226,13 @@ fn c44_lock_timeout_int32_max_is_accepted() {
     a.q("SET lock_timeout=2147483647").ok("maximum accepted timeout");
     assert_eq!(a.q("SHOW lock_timeout").single("timeout"), "2147483647ms");
 }
+
+#[test]
+fn c54_generate_series_rejects_float_arguments() {
+    let dir = Scratch::new("c54-series-types");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let sql = "SELECT * FROM generate_series(0, 'inf'::float8, 10)";
+    assert_eq!(a.q(sql).err(sql).code, "42883");
+    assert_eq!(a.q("SELECT count(*) FROM generate_series(1, 5)").single("integer series"), "5");
+}
