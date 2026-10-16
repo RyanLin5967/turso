@@ -13710,3 +13710,45 @@ fn c52_recorded_negative_integer_literals_keep_their_narrow_type() {
     assert_eq!(reply.oids, Some(vec![25, 25, 23, 20]));
     assert_eq!(reply.rows, vec![vec![Some("integer".into()), Some("bigint".into()), Some("-2147483648".into()), Some("-9223372036854775808".into())]]);
 }
+
+#[test]
+fn c52_original_view_types_survive_reconnect_and_reopen() {
+    let dir = Scratch::new("c52viewsources");
+    {
+        let server = Server::start(&dir.db(), &[]);
+        {
+            let mut w = server.connect();
+            w.q("CREATE VIEW c52_vbool AS SELECT true AS flag, 1::int8 AS n").ok("typed view");
+        }
+        let mut w = server.connect();
+        let reply = w.q("SELECT flag,n FROM c52_vbool").ok("reconnected view");
+        assert_eq!(reply.oids, Some(vec![16, 20]));
+        assert_eq!(reply.rows, vec![vec![Some("t".into()), Some("1".into())]]);
+    }
+    let server = Server::start(&dir.db(), &[]);
+    let mut w = server.connect();
+    let reply = w.q("SELECT flag,n FROM c52_vbool").ok("reopened view");
+    assert_eq!(reply.oids, Some(vec![16, 20]));
+    assert_eq!(reply.rows, vec![vec![Some("t".into()), Some("1".into())]]);
+    let described = w.describe_statement("SELECT 1 FROM c52_vbool WHERE flag=$1").ok("reopened view parameter");
+    assert_eq!(described.params, Some(vec![16]));
+}
+
+// Independent follow-up capture: pg18/c52-parameter-followup.sql and .txt.
+#[test]
+fn c52_recorded_parameter_context_order_and_preferred_overloads() {
+    let dir = Scratch::new("c52paramorder");
+    let server = Server::start(&dir.db(), &[]);
+    let mut w = server.connect();
+    let mut codes = Vec::new();
+    for sql in ["SELECT $1 WHERE $1=1", "SELECT $1 WHERE $1=abs($2)"] {
+        codes.push(w.describe_statement(sql).error.map(|error| error.code));
+    }
+    assert_eq!(codes, vec![Some("42P08".into()), Some("42P08".into())]);
+    let abs = w.describe_statement("SELECT abs($1)").ok("preferred numeric overload");
+    assert_eq!(abs.params, Some(vec![701]));
+    assert_eq!(abs.oids, Some(vec![701]));
+    let eq = w.describe_statement("SELECT $1=$2").ok("unknown comparison");
+    assert_eq!(eq.params, Some(vec![25, 25]));
+    assert_eq!(eq.oids, Some(vec![16]));
+}
