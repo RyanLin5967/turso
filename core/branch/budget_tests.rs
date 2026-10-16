@@ -3627,6 +3627,7 @@ fn the_first_install_after_the_mirror_allocates_at_most_one_chunk_for_it() {
 /// the mutex (cells `mem_n1e4`, `mem_n1e5`, line `mirror_install`). Expected RED: the mirror's arena,
 /// built exactly, doubles under the mutex at that insert.
 #[test]
+#[ignore = "non-discriminating whole-hold instrument; the verdict is mirror_install_bytes, DECISIONS bdb4887cfa"]
 fn the_first_install_after_the_mirror_grows_nothing_under_the_store_mutex() {
     if in_child() {
         return;
@@ -3634,6 +3635,8 @@ fn the_first_install_after_the_mirror_grows_nothing_under_the_store_mutex() {
     let (a, b) = (cell("mem_n1e4"), cell("mem_n1e5"));
     let (sa, sb) = (&a.ops["mirror_install"][0], &b.ops["mirror_install"][0]);
     let (ha, hb) = (sa["max_hold_alloc_bytes"], sb["max_hold_alloc_bytes"]);
+    // A diagnostic since DECISIONS bdb4887cfa: its reading swings by about 500 KB both ways.
+    println!("whole-hold diagnostic: largest install hold allocates {ha} B at {N_LARGE}, {hb} B at {N_HUGE}");
     assert!(
         hb <= ha + 4096,
         "the first install after the mirror's build: largest hold allocates {ha} B at {N_LARGE}, {hb} B at {N_HUGE}; budget the same + 4 KiB"
