@@ -94,3 +94,54 @@ fn a_microsecond_foreign_wake_is_seen_in_every_window() {
         "a woken foreign thread was seen in {seen} of 100 windows; deltas {deltas:?}"
     );
 }
+
+/// Spins this thread for `ms` milliseconds of wall time.
+fn spin(ms: u64) {
+    let t = Instant::now();
+    let mut x = 0u64;
+    while t.elapsed() < Duration::from_millis(ms) {
+        x = x.wrapping_add(std::hint::black_box(1));
+    }
+    std::hint::black_box(x);
+}
+
+/// wire-verdict-adversary HIGH (ii) (DECISIONS 2923cc91b5, order (a)): a thread that starts and ends
+/// between the two reads (the branch-name-filter growth thread's shape) is foreign work inside the
+/// window, and must be counted: it is listed at neither read.
+#[test]
+fn a_thread_that_starts_and_ends_inside_a_window_is_seen() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let before = foreign_thread_cpu_ns().expect("foreign CPU readable") as i128;
+    std::thread::spawn(|| spin(20)).join().unwrap();
+    let after = foreign_thread_cpu_ns().unwrap() as i128;
+    assert!(
+        after - before >= 10_000_000,
+        "a 20 ms spin on a thread born and joined inside the window read as {} ns",
+        after - before
+    );
+}
+
+/// wire-verdict-adversary MED (order (a)): a thread that ran before the window and exits inside it
+/// must not take its earlier CPU out of the sum, which hid another thread running inside the window.
+#[test]
+fn a_thread_exiting_inside_a_window_does_not_hide_one_that_runs() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let (go, wait) = std::sync::mpsc::channel::<()>();
+    let early = std::thread::spawn(move || {
+        spin(50);
+        // Parked until the window opens, then it exits.
+        wait.recv().ok();
+    });
+    std::thread::sleep(Duration::from_millis(80));
+    let before = foreign_thread_cpu_ns().expect("foreign CPU readable") as i128;
+    drop(go);
+    early.join().unwrap();
+    let runner = std::thread::spawn(|| spin(10));
+    runner.join().unwrap();
+    let after = foreign_thread_cpu_ns().unwrap() as i128;
+    assert!(
+        after - before >= 5_000_000,
+        "a 10 ms spin inside the window, beside a thread that exited in it, read as {} ns",
+        after - before
+    );
+}
