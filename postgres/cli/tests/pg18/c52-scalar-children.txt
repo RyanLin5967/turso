@@ -1,0 +1,40 @@
+\set VERBOSITY verbose
+SELECT version();
+                                                            version                                                            
+-------------------------------------------------------------------------------------------------------------------------------
+ PostgreSQL 18.6 (Homebrew) on aarch64-apple-darwin25.6.0, compiled by Apple clang version 21.0.0 (clang-2100.1.1.101), 64-bit
+(1 row)
+
+PREPARE c52_scalar_union_param AS SELECT $1 UNION SELECT 1;
+PREPARE
+PREPARE c52_scalar_window_order AS SELECT row_number() OVER (ORDER BY (SELECT $1::int4));
+PREPARE
+PREPARE c52_scalar_aggregate_order AS SELECT array_agg(1 ORDER BY (SELECT $1::int4));
+PREPARE
+PREPARE c52_scalar_frame AS SELECT sum(1) OVER (ORDER BY 1 ROWS (SELECT $1::int8) PRECEDING);
+PREPARE
+PREPARE c52_scalar_index AS SELECT (ARRAY[1,2])[(SELECT $1::int4)];
+PREPARE
+PREPARE c52_scalar_common AS SELECT COALESCE((SELECT $1),1);
+psql:/private/tmp/codex-20261015/C52-scalar-red/pg-scalar-children.sql:8: ERROR:  42804: COALESCE types text and integer cannot be matched
+LINE 1: PREPARE c52_scalar_common AS SELECT COALESCE((SELECT $1),1);
+                                                                 ^
+LOCATION:  select_common_type, parse_coerce.c:1425
+PREPARE c52_scalar_array_common AS SELECT ARRAY[(SELECT $1),1];
+psql:/private/tmp/codex-20261015/C52-scalar-red/pg-scalar-children.sql:9: ERROR:  42804: ARRAY types text and integer cannot be matched
+LINE 1: ...PARE c52_scalar_array_common AS SELECT ARRAY[(SELECT $1),1];
+                                                                    ^
+LOCATION:  select_common_type, parse_coerce.c:1425
+PREPARE c52_scalar_case_order AS SELECT CASE WHEN true THEN $1::int4 WHEN (SELECT $1 WHERE $1=1)=1 THEN 2 ELSE 3 END;
+PREPARE
+SELECT name,parameter_types FROM pg_prepared_statements WHERE name LIKE 'c52_scalar_%' ORDER BY name;
+            name            | parameter_types 
+----------------------------+-----------------
+ c52_scalar_aggregate_order | {integer}
+ c52_scalar_case_order      | {integer}
+ c52_scalar_frame           | {bigint}
+ c52_scalar_index           | {integer}
+ c52_scalar_union_param     | {integer}
+ c52_scalar_window_order    | {integer}
+(6 rows)
+

@@ -14224,3 +14224,281 @@ fn c50_class6_moving_numeric_scales_handle_cancellation_specials_and_empty_frame
         ]
     );
 }
+
+// Independent PG18.6 capture: pg18/c52-inference-boundaries.sql and .txt.
+#[test]
+fn c52_recorded_unknown_parameter_chains_are_refused() {
+    let dir = Scratch::new("c52chainrefusal");
+    let server = Server::start(&dir.db(), &[]);
+    let mut w = server.connect();
+    let mut codes = Vec::new();
+    for sql in [
+        "SELECT $1 WHERE $1=abs($2) AND $2=$3",
+        "SELECT $1 WHERE $1=$2 AND $2=$3",
+    ] {
+        let reply = w.xt(sql, &[(0, 0, b"1"), (0, 0, b"1"), (23, 0, b"1")]);
+        codes.push(reply.error.map(|error| error.code));
+    }
+    assert_eq!(codes, vec![Some("42P08".into()), Some("42883".into())]);
+}
+
+#[test]
+fn c52_recorded_negative_integer_literals_keep_their_narrow_type() {
+    let dir = Scratch::new("c52negativeliteral");
+    let server = Server::start(&dir.db(), &[]);
+    let mut w = server.connect();
+    let sql = "SELECT pg_typeof(-2147483648)::text, pg_typeof(-9223372036854775808)::text, -2147483648, -9223372036854775808";
+    let reply = w.q(sql).ok("folded negative literal types");
+    assert_eq!(reply.oids, Some(vec![25, 25, 23, 20]));
+    assert_eq!(reply.rows, vec![vec![Some("integer".into()), Some("bigint".into()), Some("-2147483648".into()), Some("-9223372036854775808".into())]]);
+}
+
+#[test]
+fn c52_original_view_types_survive_reconnect_and_reopen() {
+    let dir = Scratch::new("c52viewsources");
+    {
+        let server = Server::start(&dir.db(), &[]);
+        {
+            let mut w = server.connect();
+            w.q("CREATE VIEW c52_vbool AS SELECT true AS flag, 1::int8 AS n").ok("typed view");
+        }
+        let mut w = server.connect();
+        let reply = w.q("SELECT flag,n FROM c52_vbool").ok("reconnected view");
+        assert_eq!(reply.oids, Some(vec![16, 20]));
+        assert_eq!(reply.rows, vec![vec![Some("t".into()), Some("1".into())]]);
+    }
+    let server = Server::start(&dir.db(), &[]);
+    let mut w = server.connect();
+    let reply = w.q("SELECT flag,n FROM c52_vbool").ok("reopened view");
+    assert_eq!(reply.oids, Some(vec![16, 20]));
+    assert_eq!(reply.rows, vec![vec![Some("t".into()), Some("1".into())]]);
+    let described = w.describe_statement("SELECT 1 FROM c52_vbool WHERE flag=$1").ok("reopened view parameter");
+    assert_eq!(described.params, Some(vec![16]));
+}
+
+// Independent follow-up capture: pg18/c52-parameter-followup.sql and .txt.
+#[test]
+fn c52_recorded_parameter_context_order_and_preferred_overloads() {
+    let dir = Scratch::new("c52paramorder");
+    let server = Server::start(&dir.db(), &[]);
+    let mut w = server.connect();
+    let mut codes = Vec::new();
+    for sql in ["SELECT $1 WHERE $1=1", "SELECT $1 WHERE $1=abs($2)"] {
+        codes.push(w.describe_statement(sql).error.map(|error| error.code));
+    }
+    assert_eq!(codes, vec![Some("42P08".into()), Some("42P08".into())]);
+    let abs = w.describe_statement("SELECT abs($1)").ok("preferred numeric overload");
+    assert_eq!(abs.params, Some(vec![701]));
+    assert_eq!(abs.oids, Some(vec![701]));
+    let eq = w.describe_statement("SELECT $1=$2").ok("unknown comparison");
+    assert_eq!(eq.params, Some(vec![25, 25]));
+    assert_eq!(eq.oids, Some(vec![16]));
+}
+
+// Independent PG18.6 recording: pg18/c52-contract-context.sql and .txt.
+#[test]
+fn c52_recorded_target_order_concat_and_numeric_subquery_keep_their_context() {
+    let dir = Scratch::new("c52targetcontracts");
+    let server = Server::start(&dir.db(), &[]);
+    let mut w = server.connect();
+    let good = w.describe_statement("SELECT $1::int4,$1").ok("prior cast context");
+    assert_eq!(good.params, Some(vec![23]));
+    assert_eq!(good.oids, Some(vec![23,23]));
+    assert_eq!(w.describe_statement("SELECT $1,$1::int4").error.map(|e| e.code), Some("42P08".into()));
+    let abs = w.describe_statement("SELECT abs($1),$1").ok("prior overload context");
+    assert_eq!(abs.params, Some(vec![701]));
+    assert_eq!(abs.oids, Some(vec![701,701]));
+    w.describe_statement("SELECT $1=$2,$1||1").ok("comparison and concatenation");
+    assert_eq!(w.q("SELECT pg_typeof(abs((SELECT 1::numeric UNION SELECT 1::numeric)))::text")
+        .single("numeric subquery overload"), "numeric");
+}
+
+#[test]
+fn c52_recorded_mixed_float4_arithmetic_uses_operator_types() {
+    let dir = Scratch::new("c52floatoperators");
+    let server = Server::start(&dir.db(), &[]);
+    let mut w = server.connect();
+    let described = w.describe_statement("SELECT 1::int2 + 0::float4,1::int4 + 0::float4,1::int8 + 0::float4,1::numeric + 0::float4,1::float4 + 0::float4,1::float4 + 0::float8")
+        .ok("recorded numeric operator results");
+    assert_eq!(described.oids, Some(vec![701,701,701,701,700,701]));
+    let types = w.q("SELECT pg_typeof(1::int2 + 0::float4),pg_typeof(1::int4 + 0::float4),pg_typeof(1::int8 + 0::float4),pg_typeof(1::numeric + 0::float4),pg_typeof(1::float4 + 0::float4),pg_typeof(1::float4 + 0::float8)")
+        .ok("same operator types in pg_typeof");
+    assert_eq!(types.rows, vec![vec![Some("double precision".into()),Some("double precision".into()),Some("double precision".into()),Some("double precision".into()),Some("real".into()),Some("double precision".into())]]);
+}
+
+// Independent PG18.6 recordings: pg18/c52-view-lifecycle and c52-view-aliases.
+// Inputs/raw replies are preserved byte-for-byte; metadata follows recorded types.
+#[test]
+fn c52_view_source_domain_alias_and_scoped_rename_survive_reopen() {
+    let dir = Scratch::new("c52viewlifecycle");
+    {
+        let server = Server::start(&dir.db(), &[]);
+        let mut w = server.connect();
+        for sql in [
+            "CREATE DOMAIN c52_view_domain AS integer CHECK (VALUE > 0)",
+            "CREATE TABLE c52_view_t(a integer)",
+            "CREATE TABLE c52_view_u(a integer)",
+            "INSERT INTO c52_view_t VALUES (2)",
+            "INSERT INTO c52_view_u VALUES (3)",
+            "CREATE VIEW c52_vsource(flag,n) AS SELECT true,a::c52_view_domain FROM c52_view_t",
+            "CREATE VIEW c52_valias(flag) AS SELECT q.x > 0 FROM c52_view_t AS q(x)",
+            "CREATE VIEW c52_vscope(q,untouched,literal,yes) AS SELECT t.a,(SELECT a FROM c52_view_u LIMIT 1),'a'::text,true FROM c52_view_t t",
+            "CREATE VIEW c52_vdependent(flag,n) AS SELECT flag,n FROM c52_vsource",
+            "CREATE VIEW c52_vimplicit AS SELECT a,true AS flag FROM c52_view_t",
+            "CREATE VIEW c52_vcorrelated(n) AS SELECT (SELECT a WHERE c52_view_t.a > 0) FROM c52_view_t",
+        ] { w.q(sql).ok(sql); }
+        w.q("ALTER TABLE c52_view_t RENAME COLUMN a TO b").ok("scoped rename");
+        let source = w.q("SELECT flag,n::int4 FROM c52_vsource").ok("source view");
+        assert_eq!(source.oids, Some(vec![16,23]));
+        assert_eq!(source.rows, vec![vec![Some("t".into()), Some("2".into())]]);
+        let alias = w.q("SELECT flag FROM c52_valias").ok("table column alias");
+        assert_eq!(alias.oids, Some(vec![16]));
+        assert_eq!(alias.rows, vec![vec![Some("t".into())]]);
+        let scoped = w.q("SELECT q,untouched,literal,yes FROM c52_vscope").ok("nested scope");
+        assert_eq!(scoped.oids, Some(vec![23,23,25,16]));
+        assert_eq!(scoped.rows, vec![vec![Some("2".into()),Some("3".into()),Some("a".into()),Some("t".into())]]);
+        assert_eq!(w.q("SELECT n FROM c52_vcorrelated").single("outer bare correlation"), "2");
+        let implicit = w.q("SELECT a,flag FROM c52_vimplicit").ok("fixed implicit output names");
+        assert_eq!(implicit.oids, Some(vec![23,16]));
+        assert_eq!(implicit.rows, vec![vec![Some("2".into()),Some("t".into())]]);
+        w.q("VACUUM").ok("view source replay");
+    }
+    let server = Server::start(&dir.db(), &[]);
+    let mut w = server.connect();
+    for sql in ["SELECT flag,n::int4 FROM c52_vsource", "SELECT flag,n::int4 FROM c52_vdependent"] {
+        let reply = w.q(sql).ok("reopened source");
+        assert_eq!(reply.oids, Some(vec![16,23]));
+        assert_eq!(reply.rows, vec![vec![Some("t".into()),Some("2".into())]]);
+    }
+    let implicit = w.q("SELECT a,flag FROM c52_vimplicit").ok("reopened fixed output names");
+    assert_eq!(implicit.oids, Some(vec![23,16]));
+    assert_eq!(implicit.rows, vec![vec![Some("2".into()),Some("t".into())]]);
+    let described = w.describe_statement("SELECT 1 FROM c52_vsource WHERE flag=$1").ok("reopened inferred parameter");
+    assert_eq!(described.params, Some(vec![16]));
+}
+
+// Strict controls for pre-existing engine rewrite paths. Keep them visible even
+// if a baseline comparison routes their defects outside C52's source producer.
+#[test]
+fn c52_view_baseline_asymmetric_using_rename_preserves_bound_join() {
+    let dir = Scratch::new("c52viewusing");
+    let server = Server::start(&dir.db(), &[]);
+    let mut w = server.connect();
+    for sql in [
+        "CREATE TABLE c52_join_t(a integer)",
+        "CREATE TABLE c52_join_u(a integer)",
+        "INSERT INTO c52_join_t VALUES(1)",
+        "INSERT INTO c52_join_u VALUES(1)",
+        "CREATE VIEW c52_using(a) AS SELECT a FROM c52_join_t JOIN c52_join_u USING(a)",
+        "ALTER TABLE c52_join_t RENAME COLUMN a TO b",
+    ] { w.q(sql).ok(sql); }
+    assert_eq!(w.q("SELECT count(*) FROM c52_using").single("bound join"), "1");
+}
+
+#[test]
+fn c52_view_baseline_table_rename_preserves_bound_relation() {
+    let dir = Scratch::new("c52viewtablerename");
+    let server = Server::start(&dir.db(), &[]);
+    let mut w = server.connect();
+    for sql in [
+        "CREATE TABLE c52_join_u(a integer)",
+        "INSERT INTO c52_join_u VALUES(1)",
+        "CREATE VIEW c52_table_rename(a) AS SELECT a FROM c52_join_u",
+        "ALTER TABLE c52_join_u RENAME TO c52_join_renamed",
+    ] { w.q(sql).ok(sql); }
+    assert_eq!(w.q("SELECT count(*) FROM c52_table_rename").single("bound relation"), "1");
+}
+
+// Independent PG18.6 recording: pg18/c52-view-contracts.sql and .txt.
+// Repeated renames and VACUUM preserve both output names and recorded types.
+#[test]
+fn c52_view_generated_output_contracts_survive_repeated_rename_and_reopen() {
+    let dir = Scratch::new("c52viewcontracts");
+    {
+        let server = Server::start(&dir.db(), &[]);
+        let mut w = server.connect();
+        for sql in [
+            "CREATE TABLE c52_contract_t(a integer,b integer)",
+            "INSERT INTO c52_contract_t VALUES(1,2)",
+            "CREATE VIEW c52_contract_partial AS SELECT q.b FROM c52_contract_t AS q(x)",
+            "CREATE VIEW c52_contract_nested AS SELECT s.b FROM (SELECT b::int4 FROM c52_contract_t) s",
+            "CREATE VIEW c52_contract_coalesce AS SELECT COALESCE(TRUE,FALSE)",
+            "CREATE VIEW c52_contract_nested_name AS SELECT d.coalesce AS flag FROM (SELECT COALESCE(TRUE,FALSE)) d",
+        ] { w.q(sql).ok(sql); }
+        for sql in ["SELECT coalesce FROM c52_contract_coalesce", "SELECT flag FROM c52_contract_nested_name"] {
+            let reply = w.q(sql).ok("initial implicit names");
+            assert_eq!(reply.oids, Some(vec![16]));
+            assert_eq!(reply.rows, vec![vec![Some("t".into())]]);
+        }
+        for rename in ["ALTER TABLE c52_contract_t RENAME COLUMN b TO c", "ALTER TABLE c52_contract_t RENAME COLUMN c TO d"] {
+            w.q(rename).ok(rename);
+            for sql in ["SELECT b FROM c52_contract_partial", "SELECT b FROM c52_contract_nested"] {
+                let reply = w.q(sql).ok("generated output contract");
+                assert_eq!(reply.oids, Some(vec![23]));
+                assert_eq!(reply.rows, vec![vec![Some("2".into())]]);
+            }
+        }
+        w.q("VACUUM").ok("normalized source replay");
+    }
+    let server = Server::start(&dir.db(), &[]);
+    let mut w = server.connect();
+    for sql in ["SELECT b FROM c52_contract_partial", "SELECT b FROM c52_contract_nested"] {
+        let reply = w.q(sql).ok("reopened generated output contract");
+        assert_eq!(reply.oids, Some(vec![23]));
+        assert_eq!(reply.rows, vec![vec![Some("2".into())]]);
+    }
+    for sql in ["SELECT coalesce FROM c52_contract_coalesce", "SELECT flag FROM c52_contract_nested_name"] {
+        let reply = w.q(sql).ok("reopened implicit names");
+        assert_eq!(reply.oids, Some(vec![16]));
+        assert_eq!(reply.rows, vec![vec![Some("t".into())]]);
+    }
+    assert_eq!(w.q("SELECT pg_typeof(flag) FROM c52_contract_nested_name").single("shared inferred type"), "boolean");
+}
+
+// Fresh independent PG18.6 recording: pg18/c52-scalar-context.{sql,txt}.
+#[test]
+fn c52_scalar_context_keeps_recorded_operand_order() {
+    let dir = Scratch::new("c52scalarorder");
+    let server = Server::start(&dir.db(), &[]);
+    let mut w = server.connect();
+    let left = w.describe_statement("SELECT $1::int4 = (SELECT $1 WHERE $1=1)")
+        .ok("prior operand cast supplies scalar context");
+    assert_eq!(left.params, Some(vec![23]));
+    assert_eq!(left.oids, Some(vec![16]));
+    let right = w.describe_statement("SELECT (SELECT $1 WHERE $1=1) = $1::int4");
+    assert_eq!(right.error.map(|error| error.code), Some("42P08".into()));
+    for sql in ["SELECT $1=(SELECT 1)", "SELECT $1=(WITH q AS (SELECT 1 AS n) SELECT n FROM q)"] {
+        let reply = w.describe_statement(sql).ok("scalar output supplies comparison context");
+        assert_eq!(reply.params, Some(vec![23]));
+        assert_eq!(reply.oids, Some(vec![16]));
+    }
+    let order = w.describe_statement("SELECT (SELECT $1),$1::int4")
+        .ok("completed scalar output resolves its unknown parameter");
+    assert_eq!(order.params, Some(vec![25]));
+    assert_eq!(order.oids, Some(vec![25,23]));
+}
+
+#[test]
+fn c52_scalar_set_and_cte_outputs_share_the_select_inference() {
+    let dir = Scratch::new("c52scalarbody");
+    let server = Server::start(&dir.db(), &[]);
+    let mut w = server.connect();
+    for sql in [
+        "SELECT pg_typeof(abs((SELECT 1::numeric UNION SELECT 1::numeric)))::text",
+        "SELECT pg_typeof((WITH q AS (SELECT 1::numeric AS n) SELECT n FROM q))::text",
+    ] {
+        assert_eq!(w.q(sql).single("recorded scalar SELECT output type"), "numeric");
+    }
+}
+
+// Completed scalar outputs have TEXT type, not an unknown literal to coerce.
+// Independent PG18.6 recording: pg18/c52-scalar-children.{sql,txt}.
+#[test]
+fn c52_scalar_completed_text_is_refused_by_numeric_common_contexts() {
+    let dir = Scratch::new("c52scalarcommon");
+    let server = Server::start(&dir.db(), &[]);
+    let mut w = server.connect();
+    let codes: Vec<_> = ["SELECT COALESCE((SELECT $1),1)", "SELECT ARRAY[(SELECT $1),1]"]
+        .into_iter().map(|sql| w.describe_statement(sql).error.map(|error| error.code)).collect();
+    assert_eq!(codes, vec![Some("42804".into()),Some("42804".into())]);
+}

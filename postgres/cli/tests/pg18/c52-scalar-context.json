@@ -1,0 +1,17 @@
+{
+  "postgres": "18.6",
+  "canonical_bundle": "frontier/codex/reports/C52-final-red3-bundle.json",
+  "bundle_sha256": "df758d0efa4b8817434ec59fa33ea40e306e9a9bf8a8d93b2a0b306d66c172d8",
+  "files": [
+    {
+      "path": "postgres/cli/tests/pg18/c52-scalar-context.sql",
+      "source": "/private/tmp/codex-20261015/C52-final-red3/pg-scalar-context.sql",
+      "sha256": "b6c29c070fe03f0d017db5a888e78c62173b842046421eac909e20de3e828a92"
+    },
+    {
+      "path": "postgres/cli/tests/pg18/c52-scalar-context.txt",
+      "source": "/private/tmp/codex-20261015/C52-final-red3/pg-scalar-context.out",
+      "sha256": "d030be4d0bc4cdcf333b309008ce4241bcfc22d78cbc654398df28e58f85e406"
+    }
+  ]
+}
