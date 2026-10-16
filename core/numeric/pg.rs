@@ -78,6 +78,21 @@ impl PgNumericType {
         matches!(self, Self::Int2 | Self::Int4 | Self::Int8)
     }
 
+    pub fn arithmetic_type(self, rhs: Self) -> Self {
+        let oid = |ty| match ty {
+            Self::Int2 => 21,
+            Self::Int4 => 23,
+            Self::Int8 => 20,
+            Self::Float4 => 700,
+            Self::Float8 => 701,
+            Self::Numeric => 1700,
+            Self::Dynamic => 0,
+        };
+        turso_parser::pg_types::numeric_arithmetic_result_oid(oid(self), oid(rhs))
+            .and_then(Self::from_oid)
+            .unwrap_or_else(|| self.wider(rhs))
+    }
+
     pub fn wider(self, rhs: Self) -> Self {
         fn rank(ty: PgNumericType) -> u8 {
             match ty {
@@ -98,16 +113,20 @@ impl PgNumericType {
     }
 
     fn checked_integer(self, value: i64) -> Result<i64> {
-        let fits = match self {
-            Self::Int2 => i16::try_from(value).is_ok(),
-            Self::Int4 => i32::try_from(value).is_ok(),
-            Self::Int8 => true,
-            _ => unreachable!("integer range on a non-integer type"),
-        };
-        if fits {
+        let (min, max) = self.integer_bounds();
+        if (min..=max).contains(&value) {
             Ok(value)
         } else {
             Err(self.overflow())
+        }
+    }
+
+    fn integer_bounds(self) -> (i64, i64) {
+        match self {
+            Self::Int2 => (i64::from(i16::MIN), i64::from(i16::MAX)),
+            Self::Int4 => (i64::from(i32::MIN), i64::from(i32::MAX)),
+            Self::Int8 => (i64::MIN, i64::MAX),
+            _ => unreachable!("integer range on a non-integer type"),
         }
     }
 
@@ -184,7 +203,7 @@ pub fn execute(
             PgNumericOp::Divide => {
                 let b = b.expect("binary argument");
                 if b == 0 {
-                    return Ok(Value::Null);
+                    return Err(division_by_zero());
                 }
                 a.checked_div(b)
             }
@@ -203,8 +222,8 @@ pub fn execute(
         PgNumericOp::Multiply => a * b.expect("binary argument"),
         PgNumericOp::Divide => {
             let b = b.expect("binary argument");
-            if b == 0.0 {
-                return Ok(Value::Null);
+            if b == 0.0 && !a.is_nan() {
+                return Err(division_by_zero());
             }
             a / b
         }
@@ -241,7 +260,12 @@ pub fn cast(value: &Value, source: PgNumericType, target: PgNumericType) -> Resu
     } else {
         value.clone()
     };
-    float_value(value_float, target, Some(&rendered))
+    let input = if matches!(source, PgNumericType::Float4 | PgNumericType::Float8) {
+        None
+    } else {
+        Some(&rendered)
+    };
+    float_value(value_float, target, input)
 }
 
 fn integer(value: &Value, target: PgNumericType, source: PgNumericType) -> Result<i64> {
@@ -260,15 +284,9 @@ fn integer(value: &Value, target: PgNumericType, source: PgNumericType) -> Resul
             numeric_integer(&numeric, target)?
         }
         Value::Text(t) => {
-            let text = t.as_str().trim_matches(|c: char| c.is_ascii_whitespace());
-            let digits = text.strip_prefix(['+', '-']).unwrap_or(text);
-            if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-                return Err(invalid_text(target, t.as_str()));
-            }
-            let i = text
-                .parse::<i64>()
-                .ok()
-                .filter(|i| target.checked_integer(*i).is_ok());
+            let (min, max) = target.integer_bounds();
+            let i = turso_parser::pg_input::pg_integer(t.as_str(), min, max)
+                .ok_or_else(|| invalid_text(target, t.as_str()))?;
             return i.ok_or_else(|| {
                 range_error(format!(
                     "value \"{}\" is out of range for type {}",
@@ -287,7 +305,9 @@ fn float(value: &Value, target: PgNumericType) -> Result<f64> {
         Value::Numeric(Numeric::Integer(i)) => Ok(*i as f64),
         Value::Numeric(Numeric::Float(f)) => Ok(f64::from(*f)),
         Value::Text(t) => {
-            let text = t.as_str().trim_matches(|c: char| c.is_ascii_whitespace());
+            let text = t
+                .as_str()
+                .trim_matches(|c: char| c.is_ascii() && turso_parser::pg_input::pg_space(c as u8));
             let f = text
                 .parse::<f64>()
                 .map_err(|_| invalid_text(target, t.as_str()))?;
@@ -345,6 +365,13 @@ fn range_error(message: impl Into<String>) -> LimboError {
     ))
 }
 
+pub(super) fn division_by_zero() -> LimboError {
+    LimboError::InvalidArgument(SqlErrorMessage::classified(
+        SqlErrorKind::DivisionByZero,
+        "division by zero",
+    ))
+}
+
 fn invalid_text(target: PgNumericType, text: &str) -> LimboError {
     LimboError::InvalidArgument(SqlErrorMessage::classified(
         SqlErrorKind::InvalidTextRepresentation,
@@ -371,11 +398,12 @@ pub fn numeric(value: &Value) -> Result<super::decimal::PgNumeric> {
 
 /// Shared PG sum transition for grouped and window aggregation. Numeric special values have
 /// separate counts so a moving frame can remove NaN/infinity and recover its finite sum.
-/// Payload: [finite sum, non-NULL count, NaN count, +infinity count, -infinity count].
+/// Payload: [finite sum, non-NULL count, NaN count, +infinity count, -infinity count,
+/// (finite display scale, count)...]. Only scales still in the frame occupy the tail.
 pub fn sum_update(
     ty: PgNumericType,
     arg: &Value,
-    state: &mut [Value],
+    state: &mut crate::alloc::Vec<Value>,
     inverse: bool,
 ) -> Result<()> {
     use super::decimal::PgNumeric;
@@ -386,7 +414,16 @@ pub fn sum_update(
         return Err(unresolved_type());
     }
     let delta = if inverse { -1 } else { 1 };
-    let count = state[1].as_int().expect("PG sum count") + delta;
+    let count = state[1]
+        .as_int()
+        .expect("PG sum count")
+        .checked_add(delta)
+        .ok_or(LimboError::IntegerOverflow)?;
+    if count < 0 {
+        return Err(LimboError::InternalError(
+            "PG sum inverse without an input".into(),
+        ));
+    }
     state[1] = Value::from_i64(count);
     if ty == PgNumericType::Numeric {
         let value = numeric(arg)?;
@@ -400,6 +437,7 @@ pub fn sum_update(
             state[slot] =
                 Value::from_i64(state[slot].as_int().expect("PG sum special count") + delta);
         } else {
+            sum_scale_update(state, value.dscale(), inverse)?;
             let sum = if matches!(state[0], Value::Null) {
                 PgNumeric::from_i64(0)
             } else {
@@ -410,7 +448,11 @@ pub fn sum_update(
             } else {
                 sum.add(&value)?
             };
-            state[0] = Value::Blob(result.to_blob());
+            state[0] = if state.len() == 5 {
+                Value::Null
+            } else {
+                Value::Blob(result.to_blob())
+            };
         }
     } else if count == 0 {
         state[0] = Value::Null;
@@ -449,9 +491,45 @@ pub fn sum_final(ty: PgNumericType, state: &[Value]) -> Result<Value> {
     } else if matches!(state[0], Value::Null) {
         PgNumeric::from_i64(0)
     } else {
-        sum_numeric(&state[0])?
+        let scale = state[5..]
+            .chunks_exact(2)
+            .map(|pair| pair[0].as_int().expect("PG sum scale"))
+            .max()
+            .expect("finite PG sum has a scale");
+        sum_numeric(&state[0])?.with_exact_scale(scale)?
     };
     Ok(Value::build_text(result.format()))
+}
+
+fn sum_scale_update(state: &mut crate::alloc::Vec<Value>, scale: i64, inverse: bool) -> Result<()> {
+    let slot = state[5..]
+        .chunks_exact(2)
+        .position(|pair| pair[0].as_int() == Some(scale))
+        .map(|index| 5 + 2 * index);
+    match (slot, inverse) {
+        (Some(slot), _) => {
+            let count = state[slot + 1].as_int().expect("PG sum scale count");
+            if inverse && count == 1 {
+                state.drain(slot..slot + 2);
+            } else {
+                let count = count
+                    .checked_add(if inverse { -1 } else { 1 })
+                    .ok_or(LimboError::IntegerOverflow)?;
+                state[slot + 1] = Value::from_i64(count);
+            }
+        }
+        (None, false) => {
+            state.try_reserve(2)?;
+            state.push(Value::from_i64(scale));
+            state.push(Value::from_i64(1));
+        }
+        (None, true) => {
+            return Err(LimboError::InternalError(
+                "PG sum inverse without its scale".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn numeric_integer(value: &super::decimal::PgNumeric, target: PgNumericType) -> Result<i64> {
@@ -502,7 +580,7 @@ mod tests {
             error.to_string(),
             "could not determine PostgreSQL numeric operand type"
         );
-        let mut state = vec![
+        let mut state = crate::alloc::vec![
             Value::Null,
             Value::from_i64(0),
             Value::from_i64(0),

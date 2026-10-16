@@ -356,7 +356,8 @@ impl PgNumeric {
     pub fn parse(text: &str) -> Option<crate::Result<Self>> {
         use std::str::FromStr;
         const PG_MAX_EXPONENT: i128 = (i32::MAX / 2) as i128;
-        let trimmed = text.trim_matches(|c: char| c.is_ascii_whitespace());
+        let trimmed =
+            text.trim_matches(|c: char| c.is_ascii() && turso_parser::pg_input::pg_space(c as u8));
         match trimmed.to_ascii_lowercase().as_str() {
             "nan" => return Some(Ok(Self::NaN)),
             "inf" | "+inf" | "infinity" | "+infinity" => return Some(Ok(Self::Infinity)),
@@ -414,8 +415,28 @@ impl PgNumeric {
     }
 
     /// The display scale: the scale, at least 0.
-    fn dscale(&self) -> i64 {
+    pub(super) fn dscale(&self) -> i64 {
         match self { Self::Finite(v) => v.as_bigint_and_exponent().1.max(0), _ => 0 }
+    }
+
+    /// An inverse sum can retain zeros at an outgoing operand's scale. Removing
+    /// those zeros must preserve the value, never round the surviving frame.
+    pub(super) fn with_exact_scale(&self, scale: i64) -> crate::Result<Self> {
+        let Self::Finite(value) = self else {
+            return Ok(self.clone());
+        };
+        if !(0..=PG_MAX_DSCALE).contains(&scale) {
+            return Err(LimboError::InternalError(
+                "PG sum scale outside numeric bounds".into(),
+            ));
+        }
+        let rescaled = value.with_scale(scale);
+        if rescaled != *value {
+            return Err(LimboError::InternalError(
+                "PG sum scale would change its value".into(),
+            ));
+        }
+        Self::new(rescaled)
     }
 
     pub fn add(&self, other: &Self) -> crate::Result<Self> {
@@ -460,7 +481,7 @@ impl PgNumeric {
             return Ok(Self::NaN);
         }
         if other.is_zero() {
-            return Err(LimboError::InvalidArgument(SqlErrorMessage::classified(SqlErrorKind::DivisionByZero, "division by zero")));
+            return Err(super::pg::division_by_zero());
         }
         match (self, other) {
             (Self::Finite(a), Self::Finite(b)) => {

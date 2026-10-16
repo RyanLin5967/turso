@@ -60,7 +60,8 @@ pub(crate) fn pg_numeric_type(
                     | ast::Operator::Divide
             ) =>
         {
-            pg_numeric_type(a, tables, resolver)?.wider(pg_numeric_type(b, tables, resolver)?)
+            pg_numeric_type(a, tables, resolver)?
+                .arithmetic_type(pg_numeric_type(b, tables, resolver)?)
         }
         Expr::FunctionCall { name, args, .. } => {
             let first = args
@@ -442,7 +443,17 @@ pub(super) fn pg_binary_operation(
     a: PgNumericType,
     b: PgNumericType,
 ) -> Option<(PgNumericOp, PgNumericType)> {
-    let ty = a.wider(b);
+    let ty = if matches!(
+        op,
+        ast::Operator::Add
+            | ast::Operator::Subtract
+            | ast::Operator::Multiply
+            | ast::Operator::Divide
+    ) {
+        a.arithmetic_type(b)
+    } else {
+        a.wider(b)
+    };
     let op = match op {
         ast::Operator::Add => PgNumericOp::Add,
         ast::Operator::Subtract => PgNumericOp::Subtract,

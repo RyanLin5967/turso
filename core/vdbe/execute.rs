@@ -8265,7 +8265,7 @@ pub fn op_agg_inverse(
             *acc_reg
         )));
     };
-    let payload = agg.payload_mut();
+    let payload = agg.payload_vec_mut();
     inverse_agg_payload(func, arg, payload)?;
 
     state.pc += 1;
@@ -8329,9 +8329,13 @@ fn kbn_step_int_neg(acc: &mut Value, i: i64, state: &mut SumAggState) {
 /// Subtract the contribution of a single row from the aggregate state,
 /// undoing a previous `update_agg_payload` call. Mirrors SQLite's
 /// xInverse implementations at `func.c:1859-1986`.
-fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut [Value]) -> Result<()> {
+fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut crate::alloc::Vec<Value>) -> Result<()> {
+    if let AggFunc::PgSum(ty) = func {
+        return crate::numeric::pg::sum_update(*ty, &arg, payload, true);
+    }
+    let payload = payload.as_mut_slice();
     match func {
-        AggFunc::PgSum(ty) => crate::numeric::pg::sum_update(*ty, &arg, payload, true)?,
+        AggFunc::PgSum(_) => unreachable!("PG sum handled above"),
         AggFunc::Count => {
             if !matches!(arg, Value::Null) {
                 let Value::Numeric(Numeric::Integer(i)) = &mut payload[0] else {

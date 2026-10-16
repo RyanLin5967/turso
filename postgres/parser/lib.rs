@@ -182,14 +182,7 @@ pub fn pg_trim(s: &str) -> &str {
     s.trim_matches(|c: char| c.is_ascii() && pg_space(c as u8))
 }
 
-/// One byte of PostgreSQL's whitespace (its lexer's `space`): space, tab, newline, carriage return,
-/// form feed and vertical tab (which `is_ascii_whitespace` omits), and no byte of a multi-byte
-/// character, which PostgreSQL lexes as an identifier byte (wire review 13 item 1). The one
-/// definition the server's verb reader, empty-statement test and CHECKPOINT test and the
-/// branch-call fast path read (wire review 14 item 6).
-pub fn pg_space(c: u8) -> bool {
-    matches!(c, b' ' | b'\t' | b'\n' | b'\r' | 0x0c | 0x0b)
-}
+pub use turso_parser::pg_input::pg_space;
 
 /// The length of the SQL comment at the start of `b`, as PostgreSQL's lexer reads one (`--` to the
 /// line's end, `/* */` nested): None if none starts there, Some(None) for one that never ends.

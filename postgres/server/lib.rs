@@ -4939,16 +4939,14 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
 
     match *pg_type {
         Type::INT2 | Type::INT4 | Type::INT8 => {
-            let (name, min, max) = match *pg_type {
-                Type::INT2 => ("smallint", i64::from(i16::MIN), i64::from(i16::MAX)),
-                Type::INT4 => ("integer", i64::from(i32::MIN), i64::from(i32::MAX)),
-                _ => ("bigint", i64::MIN, i64::MAX),
-            };
-            match pg_integer(text) {
-                Some(Some(i)) if (min..=max).contains(&i) => Ok(Value::from_i64(i)),
-                Some(_) => Err(out_of_range(name)),
-                None => Err(syntax(name)),
-            }
+            use turso_core::{pg_numeric_cast, PgNumericType};
+            let target = PgNumericType::from_oid(pg_type.oid()).expect("integer parameter type");
+            pg_numeric_cast(
+                &Value::build_text(text.to_owned()),
+                PgNumericType::Dynamic,
+                target,
+            )
+            .map_err(|e| PgWireError::UserError(engine_info(&e)))
         }
         Type::FLOAT4 | Type::FLOAT8 | Type::NUMERIC => {
             let name = match *pg_type {
@@ -5114,62 +5112,6 @@ fn pg_array_to_value(text: &str, element: &Type) -> PgWireResult<Value> {
     let record = turso_core::types::ImmutableRecord::from_values(values.as_slice(), values.len())
         .map_err(|e| PgWireError::UserError(engine_info(&e)))?;
     Ok(Value::Blob(record.into_payload()))
-}
-
-/// An integer as PostgreSQL's integer input functions read one (pg_strtoint64_safe, PostgreSQL 16
-/// and later): blanks around it, an optional sign, then decimal digits, or 0x / 0o / 0b and that
-/// base's digits, with one underscore allowed between two digits, or between the prefix and the
-/// first digit. `Some(None)` for a well-formed
-/// integer past i64 (out of range), `None` for bad syntax.
-fn pg_integer(text: &str) -> Option<Option<i64>> {
-    let s = text.trim_matches(|c: char| c.is_ascii() && pg_space(c as u8));
-    let (negative, s) = match s.as_bytes().first() {
-        Some(b'-') => (true, &s[1..]),
-        Some(b'+') => (false, &s[1..]),
-        _ => (false, s),
-    };
-    let (radix, digits) = match s.get(..2).map(|p| p.to_ascii_lowercase()).as_deref() {
-        Some("0x") => (16, &s[2..]),
-        Some("0o") => (8, &s[2..]),
-        Some("0b") => (2, &s[2..]),
-        _ => (10, s),
-    };
-    // An underscore may follow a base prefix ('0b_10_0101' is 37), never begin a decimal
-    // (wire review 16 item 23: it was refused in every base).
-    if digits.is_empty() || (radix == 10 && digits.starts_with('_')) || digits.ends_with('_') {
-        return None;
-    }
-    let mut magnitude: u128 = 0;
-    let mut previous_underscore = false;
-    for c in digits.chars() {
-        if c == '_' {
-            if previous_underscore {
-                return None;
-            }
-            previous_underscore = true;
-            continue;
-        }
-        previous_underscore = false;
-        let d = c.to_digit(radix)?;
-        // Saturates past every i64 magnitude, which is all an out-of-range verdict needs.
-        magnitude = magnitude
-            .saturating_mul(u128::from(radix))
-            .saturating_add(u128::from(d));
-    }
-    let limit = if negative {
-        u128::from(i64::MIN.unsigned_abs())
-    } else {
-        i64::MAX as u128
-    };
-    if magnitude > limit {
-        return Some(None);
-    }
-    let value = if negative {
-        (magnitude as i128).wrapping_neg() as i64
-    } else {
-        magnitude as i64
-    };
-    Some(Some(value))
 }
 
 /// PostgreSQL's escape-format bytea text, as its byteain reads it (PostgreSQL 18.6 recorded,

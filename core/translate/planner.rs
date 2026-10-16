@@ -912,7 +912,7 @@ fn resolve_effective_frame(
         }
     }
 
-    let Some(frame) = user_frame else {
+    let Some(mut frame) = user_frame else {
         return Ok(Frame {
             mode: FrameMode::Range,
             start: FrameBoundary::UnboundedPreceding,
@@ -962,6 +962,20 @@ fn resolve_effective_frame(
         frame.start,
         crate::translate::plan::FrameBoundary::UnboundedPreceding
     );
+    // Floating addition cannot be reversed by subtraction after cancellation or
+    // infinity. Reuse the full-frame path, retaining exactly the user's rows.
+    if moving_start
+        && frame.exclude.is_none()
+        && matches!(
+            func,
+            AccumulatorFunc::Agg(AggFunc::PgSum(
+                crate::numeric::pg::PgNumericType::Float4
+                    | crate::numeric::pg::PgNumericType::Float8
+            ))
+        )
+    {
+        frame.exclude = Some(turso_parser::ast::FrameExclude::NoOthers);
+    }
     if moving_start && frame.exclude.is_none() && !supports_sliding {
         crate::bail_parse_error!(
             "{}() does not yet support window frames with a moving start; \

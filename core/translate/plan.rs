@@ -3565,7 +3565,8 @@ pub struct Frame {
     pub mode: ast::FrameMode,
     pub start: FrameBoundary,
     pub end: FrameBoundary,
-    /// The EXCLUDE clause the user wrote, or `None` if they wrote none.
+    /// The effective EXCLUDE clause. The planner can use `Some(NoOthers)`
+    /// when an aggregate must recompute a moving frame instead of subtracting.
     ///
     /// `Some(NoOthers)` (an explicit `EXCLUDE NO OTHERS`) excludes
     /// nothing, so it returns the same rows as `None`. We keep the two
