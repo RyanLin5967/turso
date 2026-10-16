@@ -4696,6 +4696,12 @@ impl PostgreSQLTranslator {
         {
             return Err(self.undefined_function(call));
         }
+        // PostgreSQL has integer, bigint and numeric overloads, but no floating-point series.
+        if name.eq_ignore_ascii_case("generate_series")
+            && call.args.iter().any(|arg| matches!(self.expression_type(arg), Some(700 | 701)))
+        {
+            return Err(self.undefined_function(call));
+        }
         Ok(())
     }
 
