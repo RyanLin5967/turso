@@ -25,6 +25,8 @@ pub enum SqlErrorKind {
     UndefinedParameter,
     InvalidSavepointSpecification,
     AmbiguousColumn,
+    AmbiguousParameter,
+    DatatypeMismatch,
     UndefinedFunction,
     DuplicateAlias,
     StatementTooComplex,

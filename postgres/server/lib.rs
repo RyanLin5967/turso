@@ -3512,6 +3512,8 @@ fn sqlstate(e: &LimboError) -> &'static str {
         UndefinedParameter => "42P02",
         InvalidSavepointSpecification => "3B001",
         AmbiguousColumn => "42702",
+        AmbiguousParameter => "42P08",
+        DatatypeMismatch => "42804",
         UndefinedFunction => "42883",
         DuplicateAlias => "42712",
         StatementTooComplex => "54001",
