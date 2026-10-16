@@ -3378,9 +3378,16 @@ fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU
         let mut links = Vec::new();
         let flip = super::journal::carries_links(cap.meta.format) && !catalog.links_valid();
         let upgraded = flip;
-        if flip && !(cap.links_prefilled && catalog.links()) {
+        let whole = flip && !(cap.links_prefilled && catalog.links());
+        if whole {
             catalog.upgrade_links()?;
-        } else if (catalog.links_valid() || flip) && !fe_mutant("l4_stale_sibling_link") {
+        }
+        if flip {
+            // The fill cursor's table is the upgrade's own scaffolding (links adversary 3 H1): it
+            // goes in the transaction that completes the upgrade.
+            catalog.drop_fill_cursor()?;
+        }
+        if !whole && (catalog.links_valid() || flip) && !fe_mutant("l4_stale_sibling_link") {
             if flip {
                 kill_point("ckpt.upgrade.flip");
             }
