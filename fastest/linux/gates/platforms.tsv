@@ -27,6 +27,7 @@ profile/analyze.py	--self-test	any	pure Python over profile records
 t3/blockgate.py	self-test	any	pure Python over V3 records (testdata)
 t3/devguard.py	self-test	any	fake sysfs and lsblk; its fake device major is one the platform's dev_t keeps
 t3/foreign_cpu.py	self-test	linux	samples /proc for live processes
+t3/ours_readback.py	self-test	any	pure Python over a dump and gen_seed's own lines
 t3/settle_test.sh		linux	settle.sh reads date +%s%N and Linux block-device stat layouts
 t3/summarize.py	self-test	any	pure Python over packages
 t3/t3lib_test.sh		any	fake sysfs and hooks; its Linux-only cases (/proc, mkfs.ext4, Linux device numbers) say so themselves

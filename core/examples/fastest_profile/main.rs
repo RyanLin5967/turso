@@ -6,6 +6,19 @@
 //!   fastest_profile --dir DIR [--class full|fsync|off|async] [--catalog] [--clients C]
 //!       [--ops N | --ops-total T] [--warmup W | --warmup OPS:S:MAX_S] [--rows R] [--mode phases|cycle] [--out DIR]
 //!       [--perf-ctl CTL_FIFO,ACK_FIFO [--perf-only WINDOW]] [--mark] [--phases K]
+//!       [--seed-sql FILE --age-sql FILE [--live L] [--dump-trunk FILE]]
+//!
+//! * `--seed-sql FILE --age-sql FILE` (the T3 runner's parent, the one every system times against: comp's
+//!   gen_seed.py `sql --rows R` and `age --rows R --updates K` streams): the trunk is built from FILE's statements,
+//!   each one autocommitted as the competitors' seeds feed them, then aged by the age stream's single-row UPDATEs, each
+//!   autocommitted; `--rows R` must equal the rows loaded. The first write is then the competitors' M1 op,
+//!   `UPDATE t SET v = v + 1 WHERE id = <random>`, and the trunk check is its count and sum(v) unchanged by the run.
+//!   `--live L` makes L live branches after the aging (prebranch: each created, connected and given one M1 write,
+//!   untimed) that every cell runs at; their MEASURED count is recorded, and they are the only branches left after
+//!   the deletes. `--dump-trunk FILE` writes the trunk's t as `id\tv\tpad` lines after the prebranch, for the read-back
+//!   (comp's fixture.py write --readback). summary.json's `fixture` records the stream lines applied, the measured
+//!   live count and the trunk's count and sum. Without these flags the trunk is the profiling job's own seed (R rows of
+//!   `v TEXT`) and the first write sets `v = 'w-<branch>'`, as before.
 //!
 //! One op per client is the cycle: `trunk.create_branch(name)` (create), `db.connect_named(name)`
 //! (connect), one autocommit UPDATE of a random existing row of `t` (first write: it copies a
@@ -101,7 +114,14 @@ struct Args {
     perf_only: Option<String>,
     mark: bool,
     phases: usize,
+    seed_sql: Option<PathBuf>,
+    age_sql: Option<PathBuf>,
+    live: usize,
+    dump_trunk: Option<PathBuf>,
 }
+
+/// Set when the trunk is gen_seed's parent (`--seed-sql`): the first write is then the competitors' M1 op.
+static GEN_SEED_PARENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// `--warmup OPS:S:MAX_S` that does not parse (a function, not a closure: one closure has one return type, so
 /// reusing it across the usize and f64 parses did not compile, E0308; fourth lane review HIGH 1).
@@ -146,6 +166,10 @@ fn parse_args() -> Args {
         perf_only: None,
         mark: false,
         phases: 4,
+        seed_sql: None,
+        age_sql: None,
+        live: 0,
+        dump_trunk: None,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -209,6 +233,10 @@ fn parse_args() -> Args {
             "--perf-only" => a.perf_only = Some(val(&mut i)),
             "--mark" => a.mark = true,
             "--phases" => a.phases = num(val(&mut i), "--phases"),
+            "--seed-sql" => a.seed_sql = Some(PathBuf::from(val(&mut i))),
+            "--age-sql" => a.age_sql = Some(PathBuf::from(val(&mut i))),
+            "--live" => a.live = num(val(&mut i), "--live"),
+            "--dump-trunk" => a.dump_trunk = Some(PathBuf::from(val(&mut i))),
             x => not_a_result(&format!("unknown argument {x}")),
         }
         i += 1;
@@ -227,6 +255,12 @@ fn parse_args() -> Args {
     }
     if !(1..=4).contains(&a.phases) || (a.phases < 4 && a.mode == Mode::Cycle) {
         not_a_result("--phases is 1-4, and below 4 only in phases mode");
+    }
+    if a.seed_sql.is_some() != a.age_sql.is_some() {
+        not_a_result("--seed-sql and --age-sql go together (the parent and its aging)");
+    }
+    if a.seed_sql.is_none() && (a.live > 0 || a.dump_trunk.is_some()) {
+        not_a_result("--live and --dump-trunk need the gen_seed parent (--seed-sql, --age-sql)");
     }
     if ops_given && a.ops_total.is_some() {
         not_a_result("--ops (per client) and --ops-total (the run's total) are exclusive");
@@ -515,7 +549,11 @@ pub fn fastest_phase_connect(db: &Arc<Database>, name: &str) -> Arc<Connection> 
 #[inline(never)]
 pub fn fastest_phase_write(conn: &Arc<Connection>, id: i64, name: &str) {
     retry(2, &format!("first write on {name}"), || {
-        conn.execute(format!("UPDATE t SET v = 'w-{name}' WHERE id = {id}"))
+        if GEN_SEED_PARENT.load(Ordering::Relaxed) {
+            conn.execute(format!("UPDATE t SET v = v + 1 WHERE id = {id}"))
+        } else {
+            conn.execute(format!("UPDATE t SET v = 'w-{name}' WHERE id = {id}"))
+        }
     });
 }
 
@@ -620,6 +658,22 @@ fn seed(trunk: &Arc<Connection>, rows: i64) {
     }
 }
 
+/// The statements of a gen_seed.py stream, one per line, each executed (autocommitted) on the trunk; the count.
+fn feed(trunk: &Arc<Connection>, path: &Path) -> usize {
+    let text = std::fs::read_to_string(path).unwrap_or_else(|e| not_a_result(&format!("{}: {e}", path.display())));
+    let mut n = 0;
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        retry(0, &format!("{}: line {}", path.display(), n + 1), || trunk.execute(line));
+        n += 1;
+    }
+    n
+}
+
+/// The trunk's (count, sum(v)) of t, the parent's read-back halves the run must leave unchanged.
+fn count_sum(trunk: &Arc<Connection>) -> (i64, i64) {
+    (scalar(trunk, "SELECT count(*) FROM t"), scalar(trunk, "SELECT coalesce(sum(v), 0) FROM t"))
+}
+
 /// One integer from a one-row, one-column query.
 fn scalar(conn: &Arc<Connection>, sql: &str) -> i64 {
     let rows = conn
@@ -666,10 +720,63 @@ fn main() {
     std::fs::create_dir_all(&a.dir).unwrap_or_else(|e| not_a_result(&format!("mkdir: {e}")));
     let db = open_db(&a.dir.join("profile.db"), &a);
     let trunk = db.connect().unwrap_or_else(|e| not_a_result(&format!("connect: {e}")));
-    seed(&trunk, a.rows);
+    // (seed lines, age lines) applied, and the trunk's count and sum after them: the gen_seed parent, or none
+    let parent = match (&a.seed_sql, &a.age_sql) {
+        (Some(sq), Some(ag)) => {
+            GEN_SEED_PARENT.store(true, Ordering::Relaxed);
+            let (ns, na) = (feed(&trunk, sq), feed(&trunk, ag));
+            let (count, sum) = count_sum(&trunk);
+            if count != a.rows {
+                not_a_result(&format!("the parent holds {count} rows, --rows {}", a.rows));
+            }
+            Some((ns, na, count, sum))
+        }
+        _ => {
+            seed(&trunk, a.rows);
+            None
+        }
+    };
     // The store's files are made by the first fork: one unmeasured create and delete.
     fastest_phase_create(&trunk, "setup-0");
     fastest_phase_delete(&db, "setup-0");
+    // prebranch: the live branches every cell runs at, each with one private M1 write, untimed; then their MEASURED
+    // count (main excluded), and the trunk's t for the read-back
+    let mut prng = Rng(0x5EED_0000_0000_0001);
+    for i in 0..a.live {
+        let name = format!("live-{i}");
+        retry(0, &format!("prebranch create {name}"), || trunk.create_branch(&name));
+        let conn = retry(1, &format!("prebranch connect {name}"), || db.connect_named(&name));
+        let row = 1 + prng.below(a.rows as u64) as i64;
+        retry(2, &format!("prebranch write on {name}"), || conn.execute(format!("UPDATE t SET v = v + 1 WHERE id = {row}")));
+        drop(conn);
+    }
+    let live_measured = db.branch_ids().unwrap_or_else(|e| not_a_result(&format!("branch_ids: {e}"))).len();
+    if live_measured != a.live {
+        not_a_result(&format!("{live_measured} branches live after the prebranch of {}", a.live));
+    }
+    if let Some((_, _, count, sum)) = parent {
+        if count_sum(&trunk) != (count, sum) {
+            not_a_result("the prebranch's writes reached the trunk");
+        }
+    }
+    if let Some(path) = &a.dump_trunk {
+        let rows = trunk
+            .prepare("SELECT id, v, pad FROM t ORDER BY id")
+            .and_then(|mut s| s.run_collect_rows())
+            .unwrap_or_else(|e| not_a_result(&format!("dump the trunk: {e}")));
+        let mut text = String::with_capacity(rows.len() * 120);
+        for r in &rows {
+            let (Some(id), Some(v), Some(pad)) = (
+                r.first().and_then(|x| x.as_int()),
+                r.get(1).and_then(|x| x.as_int()),
+                r.get(2).and_then(|x| x.to_text()),
+            ) else {
+                not_a_result("dump the trunk: a row that is not (int, int, text)")
+            };
+            text.push_str(&format!("{id}\t{v}\t{pad}\n"));
+        }
+        std::fs::write(path, text).unwrap_or_else(|e| not_a_result(&format!("{}: {e}", path.display())));
+    }
     let mut fence = Fence::open(&a);
 
     let windows_wanted: Vec<&str> = match a.mode {
@@ -751,15 +858,20 @@ fn main() {
     // What the run must have left: every branch deleted, the trunk's rows all there and untouched
     // by any branch's first write.
     let live = db.branch_ids().unwrap_or_else(|e| not_a_result(&format!("branch_ids: {e}")));
-    if a.phases == 4 && !live.is_empty() {
-        not_a_result(&format!("{} branches still live after every delete", live.len()));
+    if a.phases == 4 && live.len() != a.live {
+        not_a_result(&format!("{} branches live after every delete, the prebranch's {}", live.len(), a.live));
     }
     if a.phases < 4 {
         eprintln!("note: --phases {}: {} branches left live by design; the delete check was skipped", a.phases, live.len());
     }
-    if scalar(&trunk, "SELECT count(*) FROM t") != a.rows
-        || scalar(&trunk, "SELECT count(*) FROM t WHERE v LIKE 'w-%'") != 0
-    {
+    let changed = match parent {
+        Some((_, _, count, sum)) => count_sum(&trunk) != (count, sum),
+        None => {
+            scalar(&trunk, "SELECT count(*) FROM t") != a.rows
+                || scalar(&trunk, "SELECT count(*) FROM t WHERE v LIKE 'w-%'") != 0
+        }
+    };
+    if changed {
         not_a_result("the trunk changed: a branch's write reached it, or rows were lost");
     }
 
@@ -832,7 +944,14 @@ fn main() {
             fields.join(",")
         ));
     }
-    json.push_str("],\"phases\":{");
+    json.push(']');
+    if let Some((ns, na, count, sum)) = parent {
+        json.push_str(&format!(
+            ",\"fixture\":{{\"seed_lines\":{ns},\"age_lines\":{na},\"prebranch\":{},\"live_branches\":{live_measured},\"trunk_count\":{count},\"trunk_sum\":{sum}}}",
+            a.live
+        ));
+    }
+    json.push_str(",\"phases\":{");
     let mut tsv = String::from("client\top\tphase\tns\n");
     let reported = if a.mode == Mode::Cycle { 4 } else { a.phases };
     for (p, name) in PHASES[..reported].iter().enumerate() {

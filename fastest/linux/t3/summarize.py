@@ -468,6 +468,32 @@ def conformance_problems(out):
     return bad
 
 
+def parent_record(d):
+    """the run's result/fixture.json (every system's, in comp's schema), or None when it is missing or not an object"""
+    try:
+        fx = json.load(open(os.path.join(d, "result", "fixture.json")))
+    except (OSError, ValueError):
+        return None
+    return fx if isinstance(fx, dict) else None
+
+
+def one_parent(parents):
+    """ONE parent for every system in a block (gate-6 t3run HIGH 4): PARENTS = [(label, fixture.json or None)] of the
+    block's measured runs; every one that has a record must name the same rows and gen_seed_sha256 as the first.
+    (A run with no record is fixture_check's to report.) Returns the refusals."""
+    have = [(lb, fx) for lb, fx in parents if isinstance(fx, dict)]
+    if not have:
+        return []
+    ref_lb, ref = have[0]
+    bad = []
+    for lb, fx in have[1:]:
+        diff = [k for k in ("rows", "gen_seed_sha256") if fx.get(k) != ref.get(k)]
+        if diff:
+            bad.append(f"{lb}: one parent: " + ", ".join(f"{k} {fx.get(k)!r}, {ref_lb}'s {ref.get(k)!r}" for k in diff)
+                       + " (fixture.json)")
+    return bad
+
+
 def fixture_check(d, system, plan, dry):
     """One parent fixture for every system (gate-6 t3run HIGH 4; comp's gen_seed parent aged by FT_AGE, with
     FT_PREBRANCH live branches) and the package's mode (fourth lane review LOW 15): what the run itself recorded must
@@ -476,14 +502,20 @@ def fixture_check(d, system, plan, dry):
     if plan.get("age") is None or plan.get("live") is None:
         return ["the plan row has no age/live columns"]
     if system == "ours":
-        try:
-            fx = json.load(open(os.path.join(d, "result", "summary.json"))).get("fixture")
-        except (OSError, ValueError, AttributeError):  # AttributeError: a summary.json that is not an object
-            fx = None
+        # ours writes result/fixture.json in the competitors' schema (fastest_profile --seed-sql/--age-sql/--live):
+        # gen_seed's parent, aged, with the live branches made before the cells, its live count MEASURED
+        fx = parent_record(d)
         if not isinstance(fx, dict):
-            return ["ours records no fixture record (fastest_profile does not yet build the plan's parent: gen_seed "
-                    "rows, the age's single-row UPDATEs, the live branches)"]
-        got = {"age": fx.get("age"), "live": fx.get("live")}
+            return ["ours records no fixture record (result/fixture.json: fastest_profile builds the plan's parent "
+                    "only under --seed-sql, --age-sql and --live)"]
+        for k in ("rows", "age_updates", "prebranch", "live_branches"):
+            if type(fx.get(k)) is not int or fx[k] < 0:
+                bad.append(f"fixture.json {k} {fx.get(k)!r} is not a count")
+        if bad:
+            return bad
+        if fx["live_branches"] != fx["prebranch"]:
+            bad.append(f"fixture.json live_branches {fx['live_branches']} (measured), prebranch {fx['prebranch']}")
+        got = {"age": fx["age_updates"], "live": fx["prebranch"]}
     else:
         try:
             line = open(os.path.join(d, "result", "run-info.txt")).readline()
@@ -497,6 +529,24 @@ def fixture_check(d, system, plan, dry):
     for k in ("age", "live"):
         if got[k] != plan[k]:
             bad.append(f"fixture {k} {got[k]!r}, planned {plan[k]!r}")
+    return bad + readback_problems(parent_record(d))
+
+
+def readback_problems(fx):
+    """fixture.py write's own comparison, judged here from its record (every system): the engine's read-back of t
+    (count|sum|row_hash) must equal the generator's facts and the fed streams' digests the generator's; a missing
+    record or field is a refusal, never a pass"""
+    if not isinstance(fx, dict):
+        return ["no fixture.json (the parent's read-back is unknown)"]
+    bad = []
+    rb, want = fx.get("readback"), fx.get("expected_readback")
+    if not isinstance(rb, dict) or not isinstance(want, dict):
+        bad.append(f"fixture.json has no read back of t ({rb!r}) beside the generator's ({want!r})")
+    elif rb != want:
+        bad.append(f"the engine read back {rb}, the generator wrote {want} (fixture.json)")
+    st, est = fx.get("stream_sha256"), fx.get("expected_streams")
+    if not isinstance(st, dict) or st != est:
+        bad.append(f"fed stream digests {st!r} are not the generator's {est!r} (fixture.json)")
     return bad
 
 
@@ -529,6 +579,7 @@ def summarize(out, sha, dry, manifest):
     rule = wtext[2] if len(wtext) > 2 and wtext[:2] == ["warm-up", "rule"] else None
     runs, incomplete, failed_checks, parity, fixture = [], [], [], [], []
     warm = []  # every warm-up refusal (A23): the credit field is derived from all of them (review 7 finding 7)
+    parents = {}  # block -> [(label, fixture.json)] of its measured runs, for the one-parent rule
     uncredited = []  # every nonzero exception-counter delta inside a window: labels its cell uncredited
     sweeper_bad = []  # every sweeper refusal (MED 12 ruling): sweeper_creditable is derived from them and the windows
     for fs, cell, system in planned:
@@ -612,9 +663,12 @@ def summarize(out, sha, dry, manifest):
                                 "order (PREREG annex A23; refused in either loop mode)")
                     parity.append(warm[-1])
             fixture += [f"{fs}/{cell}: {x}" for x in fixture_check(d, system, prow.get((fs, cell)) or {}, dry)]
+            parents.setdefault(fs, []).append((f"{fs}/{cell}", parent_record(d)))
         runs.append(r)
         if not result:
             incomplete.append(f"{fs}/{cell}: {why}")
+    for fs_ in sorted(parents):
+        fixture += one_parent(parents[fs_])
     # No cross-system equal-total rule (fourth lane review HIGH 2; the PREREG sizes n_run per system from that
     # system's own t-hat, overriding gate-6 item 12): each run is held to its own plan row above, nothing more.
     fl = os.path.join(out, "fslist.txt")
@@ -929,7 +983,17 @@ def self_test():
             if settle is not None:
                 w(f"{a1}/settle.txt", f"dev=loop0 settle_s=2.2 {settle} inflight=0 dirty_kb=10 writes/discards/flushes=1/0/1\n")
             if system == "ours":
-                fx = {"age": age, "live": live} if ours_fixture == "plan" else ours_fixture
+                # TEST EDIT, flagged (the owed ours fixture record, 2026-10-16): ours writes result/fixture.json in the
+                # competitors' schema (one parent for every system), so "plan" writes it there at the plan's values;
+                # a dict overrides its fields; None writes none
+                fx = None
+                if ours_fixture is not None:
+                    # (and the read-back and stream digests beside the generator's, as fixture.py write records them)
+                    fx = {"system": "ours", "rows": 10000, "age_updates": age, "prebranch": live, "live_branches": live,
+                          "gen_seed_sha256": "d" * 64, "readback": {"count": 10000, "sum": 7, "row_hash": 9}, "expected_readback": {"count": 10000, "sum": 7, "row_hash": 9}, "stream_sha256": {"sql": "a", "age": "b"}, "expected_streams": {"sql": "a", "age": "b"}}
+                    if ours_fixture != "plan":
+                        fx.update(ours_fixture)
+                    w(f"{a1}/result/fixture.json", json.dumps(fx))
                 # TEST EDIT, flagged (the lead's routing ruling, DECISIONS 2026-10-15T05:16:51Z): ours' summary.json
                 # gains its windows with the four exception counters, a new required record at its passing value
                 w(f"{a1}/result/summary.json", "[]" if ours_counters == "notobject" else json.dumps(
@@ -943,7 +1007,7 @@ def self_test():
                     # the competitors' load generator records it (the checks summarize used to drop for ours)
                     | ({} if ours_tp == "absent" else {"tracerpid_tm0": 0,
                                                        "tracerpid_tm1": 4321 if ours_tp == "traced" else 0})
-                    | ({"fixture": fx} if fx is not None else {})))
+                    ))
                 w(f"{a1}/adapter.txt", "NOT AVAILABLE: no async class\n" if cell == "na" else "")
                 # TEST EDIT, flagged (the lead's MED 12 ruling, DECISIONS 2026-10-15T04:21:48Z): ours' timed run now
                 # leaves the shared sweeper's record and timed.json; a new required record at its passing value
@@ -953,6 +1017,9 @@ def self_test():
                                            else "PASS F1\nVERDICT PASS (dolt)\n")
                 w(f"{a1}/result/functional.txt", verdict)
                 info = f"dry=1 age={age} prebranch={live}" if comp_info == "plan" else comp_info
+                w(f"{a1}/result/fixture.json", json.dumps({"system": "dolt", "rows": 10000, "age_updates": age,
+                                                           "prebranch": live, "live_branches": live,
+                                                           "gen_seed_sha256": "d" * 64, "readback": {"count": 10000, "sum": 7, "row_hash": 9}, "expected_readback": {"count": 10000, "sum": 7, "row_hash": 9}, "stream_sha256": {"sql": "a", "age": "b"}, "expected_streams": {"sql": "a", "age": "b"}}))
                 if info is not None:
                     w(f"{a1}/result/run-info.txt", f"system=dolt kind=dolt rows=10000 cap_s=1800 warmup={RULE} {info} "
                                                    "parent_sum=1\n")
@@ -1132,7 +1199,24 @@ def self_test():
         ("HIGH 4 (fixture parity): ours recording no fixture fails", {"ours_fixture": None}, False,
          lambda s: any("no fixture record" in x for x in s["fixture_refusals"])),
         ("HIGH 4: ours whose fixture differs from its plan row (live 10 vs 20) fails",
-         {"ours_fixture": {"age": 200, "live": 10}}, False, lambda s: any("live" in x for x in s["fixture_refusals"])),
+         {"ours_fixture": {"prebranch": 10, "live_branches": 10}}, False,
+         lambda s: any("live" in x for x in s["fixture_refusals"])),
+        # the owed ours fixture record: ours' fixture.json, in the competitors' schema, holds its MEASURED live count
+        ("ours fixture: a measured live_branches 19 under a planned prebranch of 20 fails, naming live_branches",
+         {"ours_fixture": {"live_branches": 19}}, False,
+         lambda s: any("live_branches" in x for x in s["fixture_refusals"])),
+        # fixture.py write records the engine's read-back and the fed streams' digests beside the generator's; summarize
+        # reads that comparison for every system rather than trusting write's exit code
+        ("ours fixture: a read-back that differs from the generator's fails, naming the read-back",
+         {"ours_fixture": {"readback": {"count": 10000, "sum": 8, "row_hash": 9}}}, False,
+         lambda s: any("read back" in x for x in s["fixture_refusals"])),
+        ("ours fixture: no read-back fails, naming it", {"ours_fixture": {"readback": None}}, False,
+         lambda s: any("read back" in x for x in s["fixture_refusals"])),
+        ("ours fixture: stream digests that are not the generator's fail, naming them",
+         {"ours_fixture": {"stream_sha256": {"sql": "a", "age": "x"}}}, False,
+         lambda s: any("stream" in x for x in s["fixture_refusals"])),
+        ("ours fixture: a fixture.json that is not an object fails as no fixture record",
+         {"ours_fixture": {"rows": None}}, False, lambda s: any("rows" in x for x in s["fixture_refusals"])),
         ("HIGH 4: a competitor whose run-info age differs from its plan row fails",
          {"cell": "comp", "comp_info": "dry=1 age=0 prebranch=20"}, False,
          lambda s: any("age" in x for x in s["fixture_refusals"])),
@@ -1344,6 +1428,34 @@ def self_test():
             s, ok = summarize(make(root, **kw), "sha", "1", "m")
             good = ok == want_ok and (extra is None or bool(extra(s)))
             cases.append((name, good, s["failed_blocks"] + s["parity_refusals"] + s["incomplete"]))
+        finally:
+            shutil.rmtree(root)
+    # the owed ours fixture record: ONE parent for every system in a block (gen_seed's rows and digest), so ours at
+    # fastest_profile's old default 1000 rows beside the competitors' 10000 fails (run 11 measured exactly that)
+    for name, ofx, cfx, want in (
+            ("one parent: ours and a competitor with the same rows and gen_seed digest pass", {}, {}, []),
+            ("one parent: ours at 1000 rows beside a competitor's 10000 fails, naming the rows", {"rows": 1000}, {},
+             ["rows"]),
+            ("one parent: another gen_seed digest fails, naming it", {}, {"gen_seed_sha256": "e" * 64},
+             ["gen_seed_sha256"])):
+        root = tempfile.mkdtemp(prefix="summarize-st-")
+        try:
+            out = make(root, ours_fixture=ofx or "plan")
+            with open(f"{out}/fs-xfs/plan.tsv", "a") as fh:
+                fh.write("dolt-full-c1-r1\tdolt\t1\t200\t1\tfull\t1\t200\t20\n")
+            with open(f"{out}/cells.tsv", "a") as fh:
+                fh.write("xfs\tdolt-full-c1-r1\tdolt\t1\t1\t0\tVALID\n")
+            a1 = f"{out}/fs-xfs/cells/dolt-full-c1-r1/a1"
+            w(f"{a1}/result/functional.txt", "VERDICT PASS (dolt)\n")
+            w(f"{a1}/result/run-info.txt", f"system=dolt kind=dolt rows=10000 cap_s=1800 warmup={RULE} dry=1 age=200 "
+                                           "prebranch=20 parent_sum=1\n")
+            w(f"{a1}/result/fixture.json", json.dumps({"system": "dolt", "rows": 10000, "age_updates": 200,
+                                                       "prebranch": 20, "live_branches": 20,
+                                                       "gen_seed_sha256": "d" * 64, "readback": {"count": 10000, "sum": 7, "row_hash": 9}, "expected_readback": {"count": 10000, "sum": 7, "row_hash": 9}, "stream_sha256": {"sql": "a", "age": "b"}, "expected_streams": {"sql": "a", "age": "b"}} | cfx))
+            s, _ok = summarize(out, "sha", "1", "m")
+            fr = s["fixture_refusals"]
+            good = (fr == []) if not want else any("one parent" in x and all(k in x for k in want) for x in fr)
+            cases.append((name, good, fr))
         finally:
             shutil.rmtree(root)
     # the cross-system rule needs two systems in one block: ours and a competitor planned other totals

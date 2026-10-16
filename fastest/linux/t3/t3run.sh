@@ -224,7 +224,7 @@ finish() {
 
 # Every file this run calls, by path in the commit (an allowlist: a missing one refuses here with its name,
 # not hours later; review 2 item 18 found the competitors absent from the runner's home branch).
-NEEDS="t3/hwid.sh t3/foreign_cpu.py t3/cells.py t3/summarize.py t3/v3l.py t3/blockgate.py t3/devguard.py t3/PLP-DRIVES t3/testdata
+NEEDS="t3/hwid.sh t3/foreign_cpu.py t3/ours_readback.py t3/cells.py t3/summarize.py t3/v3l.py t3/blockgate.py t3/devguard.py t3/PLP-DRIVES t3/testdata
   t3/settle.sh t3/settle_test.sh t3/t3lib.sh t3/t3lib_test.sh t3/v3l_mutants.py gates/warmup_conformance.py
   gates/sweeper.sh gates/sweeper_record.py
   hw/record.sh fs/mkloop.sh
@@ -243,6 +243,8 @@ preflight() {
   for f in $NEEDS; do git -C "$SRC" cat-file -e "${head}:fastest/linux/$f" 2>/dev/null || miss="$miss fastest/linux/$f"; done
   [ -z "$miss" ] || { echo "REFUSED: commit $head lacks files the run calls:$miss"; return 2; }
   # the shared sweeper is loaded, not only committed (MED 12 ruling): every timed run, ours included, runs under it
+  declare -F ours_parent ours_fixture_record > /dev/null ||
+    { echo "REFUSED: t3lib.sh's ours_parent / ours_fixture_record is not defined: ours would run without the one parent"; return 2; }
   declare -F host_quiet host_unquiet > /dev/null ||
     { echo "REFUSED: t3lib.sh's host_quiet / host_unquiet is not defined: the quiet stage would not run"; return 2; }
   declare -F sweeper_start sweeper_wait ours_timed_run ours_timed_exec ours_timed_record > /dev/null ||
@@ -518,6 +520,9 @@ v3l() { # v3l bK MNT
 # cells, V3L and V3 after.
 FS_NOW="" V3CELL="" PLANT_NOW=""
 RUN_CAP_S=1800  # the registered per-run cap (30 min); the warm-up is at most 10% of it
+# the parent's rows, ONE value for every system (gen_seed.py's table t; comp run_system.sh FT_ROWS, whose default it
+# is, and fastest_profile --rows with the gen_seed parent): run 11 ran ours at fastest_profile's own 1000 beside it
+ROWS=10000
 fs_block() {
   local fs=$FS_NOW mnt=/mnt/t3-$FS_NOW o=$OUT/fs-$FS_NOW
   mkdir -p "$o"
@@ -660,18 +665,30 @@ run_cell() {
         # runs under its own); timeout signals its own process group, which holds the wrapper and the sweeper. The
         # inner timeout makes a group of its own, so it escalates to KILL (-k 30) rather than wait on a fastest_profile
         # that ignores TERM
-        timeout 7300 bash -c 'source "$1" || { echo "REFUSED: $1 failed to source"; exit 2; }
-          shift; ours_timed_exec "$@"' ours-exec "$L/t3/t3lib.sh" \
-          "$d" timeout -k 30 7200 "$DIST/fastest_profile" --dir "$mnt/work-$id" --class "$class" \
-          --clients "$clients" --ops-total "$ops" --warmup "$WARMUP" --mode phases --out "$d/result" \
-          > "$d/adapter.txt" 2>&1 ;;
+        # ONE parent for every system (t3lib.sh ours_parent, ours_fixture_record): gen_seed's streams for the plan's
+        # age, fed by fastest_profile, its prebranch of the plan's live branches, and fixture.json through comp's
+        # fixture.py write over ours' own read-back of the trunk
+        if ours_parent "$d/parent" "$ROWS" "$age" > "$d/adapter.txt" 2>&1; then
+          timeout 7300 bash -c 'source "$1" || { echo "REFUSED: $1 failed to source"; exit 2; }
+            shift; ours_timed_exec "$@"' ours-exec "$L/t3/t3lib.sh" \
+            "$d" timeout -k 30 7200 "$DIST/fastest_profile" --dir "$mnt/work-$id" --class "$class" \
+            --clients "$clients" --ops-total "$ops" --warmup "$WARMUP" --mode phases --out "$d/result" \
+            --rows "$ROWS" --seed-sql "$d/parent/seed.sql" --age-sql "$d/parent/age.sql" --live "$live" \
+            --dump-trunk "$d/parent/trunk.tsv" >> "$d/adapter.txt" 2>&1
+          rc=$?
+          [ $rc = 0 ] && { ours_fixture_record "$d" "$ROWS" "$age" "$live" "$mnt/work-$id" >> "$d/adapter.txt" 2>&1 ||
+                           echo "ours_fixture_record rc $? (fixture.json written; summarize judges it)" >> "$d/adapter.txt"; }
+          (exit $rc)
+        else
+          echo "ours_parent failed: no gen_seed parent for this run" >> "$d/adapter.txt"; false
+        fi ;;
       pg18-d2|dolt|doltgres|b1)
         # Each attempt gets its own directory on the filesystem under test (run_system.sh keeps its
         # servers' data under MNT/<system>.noindex, which a replacement run must not find in place).
         mkdir -p "$mnt/work-$id"
         # the plan's run total, fixture (age, live branches) and mode: comp's run_system.sh refuses a real run
         # (FT_DRY=0, its default) given any of them by default (comp d8fef669b, 76242a76a)
-        FT_CLIENTS=$clients FT_OPS_TOTAL=$ops FT_AGE=$age FT_PREBRANCH=$live FT_DRY=$DRY FT_CAP_S=$RUN_CAP_S FT_WARMUP=$WARMUP \
+        FT_ROWS=$ROWS FT_CLIENTS=$clients FT_OPS_TOTAL=$ops FT_AGE=$age FT_PREBRANCH=$live FT_DRY=$DRY FT_CAP_S=$RUN_CAP_S FT_WARMUP=$WARMUP \
           FT_BBLOAD=$DIST/bbload FT_CLONEBENCH=$DIST/clonebench \
           FT_SQLITE3=$DIST/sqlite3 FT_FIRECHECK=$o/strace-firecheck/firecheck.txt FT_BIN=$DIST/dolt-bin \
           timeout 10800 bash "$L/competitors/run_system.sh" "$system" "$mnt/work-$id" "$d/result" > "$d/adapter.txt" 2>&1 ;;
