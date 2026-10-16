@@ -929,15 +929,6 @@ impl Catalog {
         Ok(Some((get(row, 0)?, key, get(row, 3)? != 0)))
     }
 
-    /// The upgrade is complete (the flip's transaction): the fill cursor's table goes with it, so an
-    /// upgraded catalog holds nothing the fill left.
-    pub(crate) fn drop_fill_cursor(&mut self) -> Result<()> {
-        self.fill_get = None;
-        self.fill_put = None;
-        self.conn.execute("DROP TABLE IF EXISTS link_fill")?;
-        Ok(())
-    }
-
     /// Record, in the caller's transaction (a fill batch's), where the fill got to (`fill_cursor`).
     pub(crate) fn put_fill_cursor(&mut self, generation: u64, at: Option<(u64, u64)>, done: bool) -> Result<()> {
         let stmt = match self.fill_put.as_mut() {
