@@ -3475,6 +3475,11 @@ impl Optimizable for ast::Expr {
     }
     /// Returns true if the expression is a constant i.e. does not depend on columns and can be evaluated only once during the execution
     fn is_constant(&self, resolver: &Resolver<'_>) -> bool {
+        // This optional analysis cannot prove constancy when another recursive step
+        // would exceed the shared stack margin. Translation retains its typed refusal.
+        let Ok(_nest) = crate::stack::NestGuard::enter() else {
+            return false;
+        };
         match self {
             Expr::SubqueryResult { .. } => false,
             Expr::Between {
