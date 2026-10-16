@@ -323,6 +323,11 @@ def gates(rec):
             bad += write_gate(rec["leaf"].get("disk"), rec["arms"]["fsync"]["timed"])
         bad += sync_gate(rec["leaf"].get("disk"), rec["arms"]["fsync"].get("sync"))
         bad += sync_cover_gate(rec["leaf"], rec["arms"]["fsync"].get("sync"))
+        # C27 MED: wherever a record carries an A27 pair, the sync before its second labelling run is judged too
+        l2 = lab2_sync(rec["arms"]["fsync"])
+        if l2 is not None:
+            bad += sync_gate(rec["leaf"].get("disk"), l2, runs=(A27_LAB2,))
+            bad += sync_cover_gate(rec["leaf"], l2, runs=(A27_LAB2,))
         bad += a27_problems(rec)
     return bad
 
@@ -337,12 +342,22 @@ def iostats_problem(v):
     return None
 
 
-def sync_gate(disk, sy):
+A27_LAB2 = "A27 second labelling"  # the sync record's run name for annex A27's second labelling run (C27 MED)
+
+
+def lab2_sync(fa):
+    """the sync before annex A27's second labelling run as a sync record ({A27_LAB2: lab_pair.sync}), or None when
+    the arm carries no pair; sync_gate and sync_cover_gate judge it as they judge the timed and labelling runs'"""
+    lp = fa.get("lab_pair")
+    return {A27_LAB2: lp.get("sync")} if isinstance(lp, dict) else None
+
+
+def sync_gate(disk, sy, runs=("timed", "labelling")):
     """Annex A24: each fsync run on a drive was preceded by a sync that ran and exited 0, as its record says, and
     (A24-AM1) each filesystem's sync -f in it exited 0; without that, earlier dirty data may have been written back
     inside the window and padded the write count."""
     bad = []
-    for run in ("timed", "labelling"):
+    for run in runs:
         r = sy.get(run) if isinstance(sy, dict) else None
         if not isinstance(r, dict):
             bad.append(f"drive {disk}: no sync record for the {run} fsync run (annex A24)")
@@ -358,7 +373,7 @@ def sync_gate(disk, sy):
     return bad
 
 
-def sync_cover_gate(leaf, sy):
+def sync_cover_gate(leaf, sy, runs=("timed", "labelling")):
     """Annex A24-AM1: the sync before each fsync run reached every filesystem under DIR, one sync -f each, IN ORDER:
     the entries' paths are exactly leaf.sync_paths (DIR, then each loop layer's backing file, as resolve_leaf named
     them; 1 + the loop layers), so a buffered loop's dirty pages in its backing file's cache are not written back
@@ -372,7 +387,7 @@ def sync_cover_gate(leaf, sy):
     if len(exp) != want:
         bad.append(f"drive {leaf.get('disk')}: leaf.sync_paths names {len(exp)} filesystems, the chain has {want} "
                    "(annex A24-AM1)")
-    for run in ("timed", "labelling"):
+    for run in runs:
         r = sy.get(run) if isinstance(sy, dict) else None
         if not isinstance(r, dict):  # a missing record is sync_gate's to report
             continue
@@ -622,6 +637,12 @@ def measure(d, out, leafrec=None):
             cmd2 = V1L + ["-o", tr2] + fio_cmd(f"v3l-{arm}", f, fs, lj2)
             rec["argv"][f"{arm}/labelling-2"] = cmd2
             sy_lab2 = sync_record(paths=sync_paths)
+            # C27 MED: a real run refuses here, before the second labelling run's counters are taken, when that sync
+            # did not run clean or did not cover leaf.sync_paths in order; a dry run records it, and gates() VOIDs it
+            sync_bad = sync_gate(disk, {A27_LAB2: sy_lab2}, runs=(A27_LAB2,)) + \
+                sync_cover_gate(rec["leaf"], {A27_LAB2: sy_lab2}, runs=(A27_LAB2,))
+            if sync_bad and os.environ.get("V3L_REAL") == "1":
+                raise RuntimeError("; ".join(sync_bad))
             h0 = flush_ios(disk)
             r2 = subprocess.run(cmd2, capture_output=True, text=True, timeout=3600)
             h1 = flush_ios(disk)
