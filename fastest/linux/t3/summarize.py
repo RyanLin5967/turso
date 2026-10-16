@@ -697,6 +697,22 @@ def summarize(out, sha, dry, manifest):
     for k in ("warmup_creditable", "sweeper_creditable", "counters_creditable"):
         if summary.get(k) is not True:
             credit.append(f"{k} is {summary.get(k)!r}")
+    # the lead's rule-3 condition (b): a V3 fire-check rule judged NOT APPLICABLE (v3/check.py check(..., na=True); today
+    # only F4:R_leaf_remote on a virtio_blk leaf the probe ruled virtualized) is marked in the package and refuses credit.
+    # An unreadable verdict is not read here: blockgate binds the verdict, and refuses the block without it
+    na = []
+    for fs_ in sorted(os.listdir(out)):
+        vp = os.path.join(out, fs_, "v3-firecheck", "verdict.json")
+        if fs_.startswith("fs-") and os.path.isfile(vp):
+            try:
+                checks_ = json.load(open(vp)).get("checks") or []
+            except (OSError, ValueError, AttributeError):
+                continue
+            na += [f"{fs_[3:]}: {c['id']}" for c in checks_ if isinstance(c, dict) and c.get("na") is True]
+    summary["na_rules"] = na
+    if na:
+        credit.append(f"the V3 fire-check judged {len(na)} rule(s) N/A, and a package holding an N/A rule is never "
+                      f"credited: {', '.join(na)}")
     summary["credit_refusals"], summary["creditable"] = credit, not credit
     ok = bool(planned) and not incomplete and not failed and not failed_blocks and not failed_checks \
         and summary["measured_runs"] > 0 and not parity and not fixture and not normaliser and not unquiet \

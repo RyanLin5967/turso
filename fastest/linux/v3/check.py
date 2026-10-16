@@ -382,8 +382,10 @@ OUT = CELL = KIND = W = None
 results = []
 
 
-def check(cid, ok, detail, desc=""):
-    results.append({"id": cid, "check": desc or cid, "pass": bool(ok), "detail": detail})
+def check(cid, ok, detail, desc="", na=False):
+    """na: the rule was judged NOT APPLICABLE on this box (it passes, and the verdict lists it in na_rules, so the
+    package that binds this verdict refuses credit for it: the lead's rule-3 condition (b))"""
+    results.append({"id": cid, "check": desc or cid, "pass": bool(ok), "detail": detail} | ({"na": True} if na else {}))
     print(("PASS " if ok else "FAIL ") + cid + (" -- " + desc if desc else "") + ("" if ok else ": " + json.dumps(detail)[:900]),
           flush=True)
 
@@ -1066,8 +1068,13 @@ def find_leaf_class():
 
 
 # ---- main -------------------------------------------------------------------------------------------------------
+def na_rules(results):
+    """the ids of the rules judged not applicable (check(..., na=True)), in order"""
+    return [r["id"] for r in results if r.get("na")]
+
+
 def leaf_remote_ok(rc, txt, what, prem, out_exists, f3):
-    """F4:R_leaf_remote's verdict -> (ok, why). The plant (firecheck.sh) fakes an sd leaf's SCSI host as tcm_loopback or
+    """F4:R_leaf_remote's verdict -> (ok, why, na), na True only for the not-applicable verdict. The plant (firecheck.sh) fakes an sd leaf's SCSI host as tcm_loopback or
     an NVMe controller's transport as tcp, and the probe must refuse it (rc 2) by its allowlist, with no out dir. A
     virtio_blk leaf has no host or transport to fake: there it is NOT APPLICABLE, but only when the F3 record's leaf is
     virtio_blk AND the probe ruled the run virtualized (such a leaf is never credited; the lead's gate item 6
@@ -1077,12 +1084,12 @@ def leaf_remote_ok(rc, txt, what, prem, out_exists, f3):
            "nvme_transport": ("transport=tcp", "has transport 'tcp', not pcie")}.get(kind)
     if exp is not None:
         ok = rc == 2 and exp[0] in prem and exp[1] in txt and not out_exists
-        return ok, "the plant's rule (rc 2, the allowlist's text, no out dir)"
+        return ok, "the plant's rule (rc 2, the allowlist's text, no out dir)", False
     leaf = (f3 or {}).get("leaf") or {}
     virt = ((f3 or {}).get("virtualization") or {}).get("virtualized")
     if "neither sd nor nvme" in txt and leaf.get("driver") == "virtio_blk" and virt is True:
-        return True, "not applicable: a virtio_blk leaf has no SCSI host or NVMe transport, and the probe ruled it virtualized"
-    return False, f"no plant ran (leaf driver {leaf.get('driver')!r}, virtualized {virt!r})"
+        return True, "not applicable: a virtio_blk leaf has no SCSI host or NVMe transport, and the probe ruled it virtualized", True
+    return False, f"no plant ran (leaf driver {leaf.get('driver')!r}, virtualized {virt!r})", False
 
 
 def self_test():
@@ -2319,7 +2326,8 @@ def main(argv):
                          "P_runsh_t3_rc": rc_of(os.path.join(OUT, "F4", "P_runsh_t3.rc")),
                          "note": "recorded, not a check: only some runners expose cpufreq on 'performance'"},
          "box": {"virt": box["virt"], "flip": box["flip"], "plp": box["plp"]},
-         "unplanted_refusals": unplanted(arch, leaf, box), "harness_sha256": harness_sha256(), "checks": results}
+         "unplanted_refusals": unplanted(arch, leaf, box), "harness_sha256": harness_sha256(),
+         "na_rules": na_rules(results), "checks": results}
     with open(os.path.join(OUT, "verdict.json"), "w") as f:
         json.dump(v, f, indent=1)
     # the binding check (firecheck.sh's last step) is pending for this verdict; check.py --bind replaces this record
@@ -2434,11 +2442,11 @@ def fourth_review_plants(arch, box):
     what = (rd(os.path.join(f4, "R_leaf_remote.what")) or "").strip()
     prem = rd(os.path.join(f4, "R_leaf_remote.premise")) or ""
     f3r = rj(os.path.join(OUT, "F3", "summary.probe.json")) or rj(os.path.join(OUT, "F3", "summary.json")) or {}
-    lr_ok, lr_why = leaf_remote_ok(rc, txt, what, prem, os.path.exists(os.path.join(f4, "R_leaf_remote.out")), f3r)
+    lr_ok, lr_why, lr_na = leaf_remote_ok(rc, txt, what, prem, os.path.exists(os.path.join(f4, "R_leaf_remote.out")), f3r)
     check("F4:R_leaf_remote", lr_ok, {"rc": rc, "faked": what, "premise": prem.strip(), "text": txt[-300:], "why": lr_why},
           "the cell's leaf disk with its SCSI host named tcm_loopback (sd) or its NVMe transport tcp, read back inside a "
           "private mount namespace: refused by the host or transport allowlist (rc 2); not applicable on a virtio_blk "
-          "leaf the probe ruled virtualized (no host or transport to plant)")
+          "leaf the probe ruled virtualized (no host or transport to plant)", na=lr_na)
     # gate-6 review v3 #1 (A14): the mutant (no fsync: the fastest possible "fsync") on scsi_debug, write-back without
     # PLP -> the timing control voids it; the same declared PLP -> not applicable; write-through -> not applicable
     for tag, lc, plp, want, wrc in (("R_tc_wb", "wb", "no", "FAIL: run void (append25 ratio", 3),
