@@ -1,0 +1,115 @@
+>> Q DROP SCHEMA public
+   C DROP SCHEMA
+   Z I
+>> Q SELECT current_schema()::text, current_schemas(false)::text, current_schemas(true)::text
+   T oids=[25, 25, 25] names=['current_schema', 'current_schemas', 'current_schemas']
+   D [None, '{}', '{pg_catalog}']
+   C SELECT 1
+   Z I
+>> Q SELECT * FROM __turso_internal_pg_public_dropped
+   E S=ERROR C=42P01 M=relation "__turso_internal_pg_public_dropped" does not exist
+   Z I
+>> Q DROP TABLE IF EXISTS __turso_internal_pg_public_dropped
+   N S=NOTICE C=00000 M=table "__turso_internal_pg_public_dropped" does not exist, skipping
+   C DROP TABLE
+   Z I
+>> Q BEGIN
+   C BEGIN
+   Z T
+>> Q SAVEPOINT c56
+   C SAVEPOINT
+   Z T
+>> Q CREATE SCHEMA public
+   C CREATE SCHEMA
+   Z T
+>> Q ROLLBACK TO c56
+   C ROLLBACK
+   Z T
+>> Q SELECT count(*) FROM pg_namespace WHERE nspname = 'public'
+   T oids=[20] names=['count']
+   D ['0']
+   C SELECT 1
+   Z T
+>> Q RELEASE c56
+   C RELEASE
+   Z T
+>> Q COMMIT
+   C COMMIT
+   Z I
+>> Q CREATE SCHEMA public
+   C CREATE SCHEMA
+   Z I
+>> Q CREATE TABLE c56_saved(n int)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO c56_saved VALUES (7)
+   C INSERT 0 1
+   Z I
+>> Q CREATE VIEW c56_saved_view AS SELECT n FROM c56_saved
+   C CREATE VIEW
+   Z I
+>> Q BEGIN
+   C BEGIN
+   Z T
+>> Q SAVEPOINT c56
+   C SAVEPOINT
+   Z T
+>> Q DROP SCHEMA public CASCADE
+   N S=NOTICE C=00000 M=drop cascades to 2 other objects
+   C DROP SCHEMA
+   Z T
+>> Q ROLLBACK TO c56
+   C ROLLBACK
+   Z T
+>> Q SELECT count(*) FROM pg_namespace WHERE nspname = 'public'
+   T oids=[20] names=['count']
+   D ['1']
+   C SELECT 1
+   Z T
+>> Q SELECT n FROM c56_saved_view
+   T oids=[23] names=['n']
+   D ['7']
+   C SELECT 1
+   Z T
+>> Q RELEASE c56
+   C RELEASE
+   Z T
+>> Q COMMIT
+   C COMMIT
+   Z I
+>> Q DROP SCHEMA public CASCADE
+   N S=NOTICE C=00000 M=drop cascades to 2 other objects
+   C DROP SCHEMA
+   Z I
+>> Q CREATE SCHEMA public
+   C CREATE SCHEMA
+   Z I
+>> Q CREATE SEQUENCE c56_seq
+   C CREATE SEQUENCE
+   Z I
+>> Q CREATE DOMAIN c56_domain AS int CHECK (VALUE > 0)
+   C CREATE DOMAIN
+   Z I
+>> Q DROP SCHEMA public RESTRICT
+   E S=ERROR C=2BP01 M=cannot drop schema public because other objects depend on it
+   Z I
+>> Q DROP SCHEMA public CASCADE
+   N S=NOTICE C=00000 M=drop cascades to 2 other objects
+   C DROP SCHEMA
+   Z I
+>> Q CREATE SCHEMA public
+   C CREATE SCHEMA
+   Z I
+>> Q CREATE SEQUENCE c56_seq
+   C CREATE SEQUENCE
+   Z I
+>> Q CREATE DOMAIN c56_domain AS int CHECK (VALUE > 0)
+   C CREATE DOMAIN
+   Z I
+>> Q DROP SCHEMA public CASCADE
+   N S=NOTICE C=00000 M=drop cascades to 2 other objects
+   C DROP SCHEMA
+   Z I
+>> Q CREATE SCHEMA public
+   C CREATE SCHEMA
+   Z I
