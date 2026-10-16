@@ -7,6 +7,24 @@ set -uo pipefail
 CB=$1 SQ3=$2 S=$3
 HERE="$(cd "$(dirname "$0")" && pwd)"
 [ -e "$S" ] && { echo "REFUSED: $S exists" >&2; exit 2; }
+# clonebench's own directory rule (baselines/clonebench.c), checked here first so a wrong SCRATCH is refused naming
+# why, not reported as "clonebench rc 2" (2026-10-16: a brief sent this to a VM's ext4 /tmp): a *.noindex path
+# component, and a clone-capable filesystem: APFS on macOS (clonefile), xfs or btrfs on Linux (FICLONE)
+case "/$S/" in */*.noindex/*) ;; *)
+  echo "REFUSED: SCRATCH $S has no *.noindex path component: clonebench needs FICLONE on xfs/btrfs (APFS clonefile on macOS) under *.noindex" >&2
+  exit 2 ;; esac
+P=$(dirname "$S")
+case $(uname -s) in
+  Linux) fs=$(stat -f -c %T "$P" 2>/dev/null)
+         case $fs in xfs|btrfs) ;; *)
+           echo "REFUSED: SCRATCH's filesystem is ${fs:-unreadable} ($P): clonebench needs FICLONE on xfs/btrfs under *.noindex" >&2
+           exit 2 ;; esac ;;
+  Darwin) fs=$(diskutil info "$(df "$P" | awk 'NR == 2 { print $1 }')" 2>/dev/null | awk -F: '/Type \(Bundle\)/ { gsub(/ /, "", $2); print $2 }')
+          [ "$fs" = apfs ] || {
+            echo "REFUSED: SCRATCH's filesystem is ${fs:-unreadable} ($P): clonebench needs APFS clonefile on macOS under *.noindex" >&2
+            exit 2; } ;;
+  *) echo "REFUSED: $(uname -s): clonebench runs on Linux (xfs/btrfs) or macOS (APFS) only" >&2; exit 2 ;;
+esac
 mkdir -p "$S/branches" || exit 2
 python3 -B "$HERE/fixture.py" sqlite "$S/parent.db" --rows 2000 --age 0 --sqlite3 "$SQ3" >"$S/parent.json" || exit 2
 bad=0
