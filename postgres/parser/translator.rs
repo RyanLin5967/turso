@@ -7442,9 +7442,10 @@ mod tests {
             map_pg_type("NUMERIC", &[10]),
             Some(PgTypeMapping::with_params("numeric", vec![10, 0]))
         );
-        // RULED TEST CHANGE (2026-10-15T07:40:59Z): a bare numeric is stored FLOAT8, so it keeps
-        // the float8 it was announced as (a REAL declaration now reads float4).
-        assert_eq!(map_pg_type("NUMERIC", no_params), Some(s("FLOAT8")));
+        // C50/C51's newer exact-numeric requirements supersede the old FLOAT8 storage mapping.
+        // Scoped correction under Ryan's authorization, proved by PG18.6 c50-pg18-class2.txt
+        // SHA256 54d3c589f9505aec6e0d845e914759b68b46ea605d6c4740b2cbba674772707c.
+        assert_eq!(map_pg_type("NUMERIC", no_params), Some(s("numeric")));
 
         // Network types → custom types
         assert_eq!(map_pg_type("CIDR", no_params), Some(s("cidr")));
