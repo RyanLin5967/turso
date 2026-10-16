@@ -1104,6 +1104,15 @@ def self_test():
          lambda s: "no timed.json" in first(s, "parity_refusals")),
         ("MED 3: no package warm-up rule (warmup.txt) fails (parity)", {"rule": None}, False,
          lambda s: "the package's None" in first(s, "parity_refusals")),
+        # C27 LOW: warmup_creditable is derived from EVERY warm-up refusal (review 7 finding 7), the rule's included:
+        # it read True while "warm-up rule X, the package's Y" stood (ours, a competitor, no warmup.txt rule)
+        ("C27 LOW: ours recording another warm-up rule makes warmup_creditable False",
+         {"ours_rule": "1000:10:999"}, False, lambda s: s.get("warmup_creditable") is False
+         and "warm-up rule '1000:10:999'" in first(s, "parity_refusals")),
+        ("C27 LOW: a competitor whose rule is not the package's makes warmup_creditable False",
+         {"cell": "comp", "rule": "1000:10:999"}, False, lambda s: s.get("warmup_creditable") is False),
+        ("C27 LOW: no package warm-up rule (warmup.txt) makes warmup_creditable False",
+         {"rule": None}, False, lambda s: s.get("warmup_creditable") is False),
         ("MED 3: ours planned 150 ops, asked and measured 150 passes", {"plan_ops": [150], "ours_ops": (150, 150)}, True, None),
         # TEST EDIT, flagged (fourth lane review MED 5 / T3 runner review item 9, gating chosen by the lane): this case
         # said a run that did not settle is "listed, not gated" (ok True); it now fails the package, still listed
