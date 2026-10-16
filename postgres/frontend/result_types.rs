@@ -2004,3 +2004,29 @@ fn column_oid(schema: &Schema, col: &Column, is_strict: bool) -> Option<u32> {
         Some(base)
     }
 }
+
+
+#[cfg(test)]
+mod c52_tests {
+    use super::*;
+
+    #[test]
+    fn c52_publishes_parameter_columns_and_expressions_from_the_same_solution() {
+        // Internal consistency control: a later parameter constraint must not leave an
+        // earlier occurrence's published annotation behind the final parameter map.
+        let parse = turso_pg_parser::parse("SELECT $1, $2 WHERE $1=$2 AND $2=$3").unwrap();
+        let schema = std::sync::Arc::new(Schema::default());
+        let attached = Attached { names: &[], holds: &|_, _| false };
+        let walked = parameter_types(&parse, &schema, &[], &Default::default(),
+            &attached, &std::collections::BTreeMap::from([(3, INT4)])).unwrap();
+        assert_eq!(walked.params.get(&1), Some(&INT4));
+        assert_eq!(walked.columns, vec![Some(INT4), Some(INT4)]);
+        let Some(Node::SelectStmt(select)) = parse.protobuf.stmts[0].stmt.as_ref().unwrap().node.as_ref() else {
+            panic!("SELECT tree");
+        };
+        let Some(Node::ResTarget(target)) = select.target_list[0].node.as_ref() else {
+            panic!("result target");
+        };
+        assert_eq!(walked.expressions.get(target.val.as_deref().unwrap()), Some(INT4));
+    }
+}

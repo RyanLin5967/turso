@@ -7353,6 +7353,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn c52_cloned_expression_uses_the_current_annotation() {
+        let original = pg_query::protobuf::Node {
+            node: Some(pg_query::protobuf::node::Node::ParamRef(
+                pg_query::protobuf::ParamRef { number: 1, location: 7 },
+            )),
+        };
+        let rewritten = original.clone();
+        let mut types = ExpressionTypes::default();
+        types.insert(&original, 705);
+        types.insert(&original, 23);
+        assert_eq!(types.get(&original), Some(23));
+        assert_eq!(types.get(&rewritten), Some(23));
+        let distinct_source = original.clone();
+        types.insert(&distinct_source, 25);
+        assert_eq!(types.get(&rewritten), None, "different source nodes disagree");
+        types.insert(&distinct_source, 23);
+        assert_eq!(types.get(&rewritten), Some(23), "all source annotations agree again");
+    }
+
+    #[test]
     fn test_type_mapping() {
         let no_params: &[i64] = &[];
         let s = PgTypeMapping::scalar;
