@@ -13289,3 +13289,15 @@ fn c54_composite_output_is_explicitly_unsupported() {
     }
     assert_eq!(a.q("SELECT (1, 2) < (2, 1)").single("row comparison"), "t");
 }
+
+#[test]
+fn c54_virtual_generated_columns_are_explicitly_unsupported() {
+    let dir = Scratch::new("c54-virtual-generated");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in ["CREATE TABLE gv(a INT, b INT GENERATED ALWAYS AS (a * 2) VIRTUAL)", "CREATE TABLE gv(a INT, b INT GENERATED ALWAYS AS ((a + 1) * 2) /* comment */ VIRTUAL)"] {
+        assert_eq!(a.q(sql).err(sql).code, "0A000", "{sql}");
+    }
+    a.q("CREATE TABLE ordinary(virtual INT)").ok("virtual is an identifier");
+    a.q("SELECT 'generated always as (a) virtual'").ok("quoted text");
+}
