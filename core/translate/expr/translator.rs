@@ -90,6 +90,66 @@ pub fn resolve_expr(
     translate_expr(program, referenced_tables, expr, dest_reg, resolver)
 }
 
+/// A CAST to a type with no ENCODE anywhere in its chain (a domain's included) converts as its
+/// primitive base does, as PostgreSQL 18 casts to a domain by its underlying type: an integer or
+/// real base by its affinity, a text base to TEXT (review of 96b69304b, F4: CAST(10 AS dt) over text
+/// stayed the integer 10). Over a blob base (bytea) a numeric source is refused as PostgreSQL
+/// refuses it, 42846 "cannot cast type integer to bytea"; any other source is left as it is (a text
+/// is not read in bytea's input format: a DIVERGENCE, stated). Other bases (any) are left as
+/// they are.
+fn emit_cast_by_base_without_encode(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    source: &ast::Expr,
+    ty: &str,
+    target_register: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    let Some(base) = super::arrays::base_without_encode(resolver, ty) else {
+        return Ok(());
+    };
+    match Affinity::affinity(base) {
+        affinity @ (Affinity::Integer | Affinity::Real | Affinity::Text) => {
+            program.emit_insn(Insn::Cast {
+                reg: target_register,
+                affinity,
+            });
+        }
+        Affinity::Blob => {
+            if let Some(source_type) = numeric_source_type(source, referenced_tables, resolver) {
+                crate::bail_parse_error!(SqlErrorKind::CannotCoerce; "cannot cast type {source_type} to {ty}");
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// The PostgreSQL name of a numeric source's type (a numeric literal, or an expression of integer
+/// or real affinity), for a refused cast; None for any other source.
+fn numeric_source_type(
+    source: &ast::Expr,
+    referenced_tables: Option<&TableReferences>,
+    resolver: &Resolver,
+) -> Option<&'static str> {
+    match source {
+        ast::Expr::Literal(ast::Literal::Numeric(n)) => {
+            Some(if n.parse::<i64>().is_ok() { "integer" } else { "numeric" })
+        }
+        ast::Expr::Unary(ast::UnaryOperator::Negative | ast::UnaryOperator::Positive, inner) => {
+            numeric_source_type(inner, referenced_tables, resolver)
+        }
+        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
+            numeric_source_type(&exprs[0], referenced_tables, resolver)
+        }
+        _ => match super::affinity::get_expr_affinity(source, referenced_tables, Some(resolver)) {
+            Affinity::Integer => Some("integer"),
+            Affinity::Real => Some("double precision"),
+            _ => None,
+        },
+    }
+}
+
 /// Translate an expression into bytecode.
 #[turso_macros::trace_stack]
 pub fn translate_expr(
@@ -579,18 +639,12 @@ pub fn translate_expr(
                             }
                         }
 
-                        // A domain over a numeric base with no ENCODE converts as that base
-                        // before its CHECKs read it: left text, CAST('0.5' AS d) passed a CHECK
-                        // (value > 1), text sorting above every number (fresh-context review of
-                        // the ultrareview fixes).
-                        if let Some(base) =
-                            super::arrays::numeric_base_without_encode(resolver, &tn.name)
-                        {
-                            program.emit_insn(Insn::Cast {
-                                reg: target_register,
-                                affinity: Affinity::affinity(base),
-                            });
-                        }
+                        // A domain over a base with no ENCODE converts as that base before its
+                        // CHECKs read it: left text, CAST('0.5' AS d) passed a CHECK (value > 1),
+                        // text sorting above every number (fresh-context review of the ultrareview
+                        // fixes); left a number, CAST(10 AS dt) over text failed CHECK (VALUE >=
+                        // '0') (review of 96b69304b, F4).
+                        emit_cast_by_base_without_encode(program, referenced_tables, expr, &tn.name, target_register, resolver)?;
 
                         // Validate domain constraints on the encoded value
                         emit_domain_cast_constraints(
@@ -634,17 +688,10 @@ pub fn translate_expr(
                             )?;
                             return Ok(target_register);
                         }
-                        // A numeric base with no ENCODE (bigint, float4, float8) converts as
-                        // its base does: left a no-op, CAST('1.5' AS float8) stayed text where
-                        // SQLite's name rule ("FLOA") makes it REAL.
-                        if let Some(base) =
-                            super::arrays::numeric_base_without_encode(resolver, &tn.name)
-                        {
-                            program.emit_insn(Insn::Cast {
-                                reg: target_register,
-                                affinity: Affinity::affinity(base),
-                            });
-                        }
+                        // A base with no ENCODE converts as that base does: left a no-op,
+                        // CAST('1.5' AS float8) stayed text where SQLite's name rule ("FLOA")
+                        // makes it REAL, and CAST(10 AS a type over text) stayed a number.
+                        emit_cast_by_base_without_encode(program, referenced_tables, expr, &tn.name, target_register, resolver)?;
                         return Ok(target_register);
                     }
                 }

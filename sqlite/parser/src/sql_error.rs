@@ -28,6 +28,7 @@ pub enum SqlErrorKind {
     UndefinedFunction,
     DuplicateAlias,
     StatementTooComplex,
+    CannotCoerce,
     InternalError,
     SerializationFailure,
     LockNotAvailable,

@@ -3736,6 +3736,7 @@ fn kind_code(kind: SqlErrorKind) -> &'static str {
         UndefinedFunction => "42883",
         DuplicateAlias => "42712",
         StatementTooComplex => "54001",
+        CannotCoerce => "42846",
         InternalError => "XX000",
         SerializationFailure => "40001",
         LockNotAvailable => "55P03",
