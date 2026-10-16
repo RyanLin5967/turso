@@ -2,6 +2,7 @@ use super::*;
 
 /// Get the number of values returned by an expression
 pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
+    let _nest = crate::stack::NestGuard::enter()?;
     Ok(match unwrap_parens(expr)? {
         Expr::Between {
             lhs, start, end, ..
