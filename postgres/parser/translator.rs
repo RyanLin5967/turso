@@ -3797,15 +3797,11 @@ impl PostgreSQLTranslator {
                 }
                 Ok(expr)
             }
-            // A row constructor, `(a, b)` or `ROW(a, b)`: the engine's row value, which comparisons
-            // take element-wise (`(a, b) >= (1, 2)`), as PostgreSQL's do.
-            Some(pg_query::protobuf::node::Node::RowExpr(row)) => {
-                let items = row
-                    .args
-                    .iter()
-                    .map(|arg| Ok(Box::new(self.translate_expr(arg)?)))
-                    .collect::<Result<Vec<_>, ParseError>>()?;
-                Ok(ast::Expr::Parenthesized(items))
+            Some(pg_query::protobuf::node::Node::RowExpr(_)) => {
+                Err(ParseError::ParseError(SqlErrorMessage::classified(
+                    SqlErrorKind::FeatureNotSupported,
+                    "composite row values are not supported outside row comparisons",
+                )))
             }
             Some(pg_query::protobuf::node::Node::AStar(_)) => {
                 // SELECT * - this should be handled as ResultColumn::Star in translate_target_list
@@ -3818,6 +3814,19 @@ impl PostgreSQLTranslator {
                 node.node
             )))),
         }
+    }
+
+    fn translate_row_operand(
+        &self,
+        node: &pg_query::protobuf::Node,
+    ) -> Result<ast::Expr, ParseError> {
+        let Some(pg_query::protobuf::node::Node::RowExpr(row)) = node.node.as_ref() else {
+            return self.translate_expr(node);
+        };
+        let items = row.args.iter()
+            .map(|arg| self.translate_expr(arg).map(Box::new))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ast::Expr::Parenthesized(items))
     }
 
     fn translate_const(
@@ -3901,9 +3910,9 @@ impl PostgreSQLTranslator {
                     .as_ref()
                     .ok_or_else(|| ParseError::ParseError("DISTINCT FROM: missing rhs".into()))?;
                 Ok(ast::Expr::Binary(
-                    Box::new(self.translate_expr(lhs)?),
+                    Box::new(self.translate_row_operand(lhs)?),
                     ast::Operator::IsNot,
-                    Box::new(self.translate_expr(rhs)?),
+                    Box::new(self.translate_row_operand(rhs)?),
                 ))
             }
             AExprKind::AexprNotDistinct => {
@@ -3915,9 +3924,9 @@ impl PostgreSQLTranslator {
                     ParseError::ParseError("NOT DISTINCT FROM: missing rhs".into())
                 })?;
                 Ok(ast::Expr::Binary(
-                    Box::new(self.translate_expr(lhs)?),
+                    Box::new(self.translate_row_operand(lhs)?),
                     ast::Operator::Is,
-                    Box::new(self.translate_expr(rhs)?),
+                    Box::new(self.translate_row_operand(rhs)?),
                 ))
             }
             AExprKind::AexprNullif => {
@@ -4046,11 +4055,17 @@ impl PostgreSQLTranslator {
             };
         }
 
-        // Translate left and right expressions
-        let left = Box::new(self.translate_expr(a_expr.lexpr.as_ref().unwrap())?);
+        let operand = |node: &pg_query::protobuf::Node| {
+            if matches!(op_name, "=" | "!=" | "<>" | "<" | "<=" | ">" | ">=") {
+                self.translate_row_operand(node)
+            } else {
+                self.translate_expr(node)
+            }
+        };
+        let left = Box::new(operand(a_expr.lexpr.as_ref().unwrap())?);
 
         let right = if let Some(rexpr) = &a_expr.rexpr {
-            Box::new(self.translate_expr(rexpr)?)
+            Box::new(operand(rexpr)?)
         } else {
             return Err(ParseError::ParseError(
                 "Missing right expression".to_string().into(),
@@ -4158,7 +4173,7 @@ impl PostgreSQLTranslator {
     ) -> Result<ast::Expr, ParseError> {
         // Get the left expression (the column/expression being tested)
         let lhs = if let Some(lexpr) = &a_expr.lexpr {
-            Box::new(self.translate_expr(lexpr)?)
+            Box::new(self.translate_row_operand(lexpr)?)
         } else {
             return Err(ParseError::ParseError(
                 "Missing left expression for IN operator".to_string().into(),
@@ -4171,7 +4186,7 @@ impl PostgreSQLTranslator {
                 Some(pg_query::protobuf::node::Node::List(list)) => {
                     let mut values = Vec::new();
                     for item in &list.items {
-                        values.push(Box::new(self.translate_expr(item)?));
+                        values.push(Box::new(self.translate_row_operand(item)?));
                     }
                     values
                 }
@@ -4415,7 +4430,7 @@ impl PostgreSQLTranslator {
             .lexpr
             .as_ref()
             .ok_or_else(|| ParseError::ParseError("BETWEEN: missing test expression".into()))?;
-        let lhs = self.translate_expr(lhs)?;
+        let lhs = self.translate_row_operand(lhs)?;
 
         let rexpr = a_expr
             .rexpr
@@ -4434,8 +4449,8 @@ impl PostgreSQLTranslator {
                 "BETWEEN: expected exactly 2 range bounds".into(),
             ));
         }
-        let start = self.translate_expr(&items[0])?;
-        let end = self.translate_expr(&items[1])?;
+        let start = self.translate_row_operand(&items[0])?;
+        let end = self.translate_row_operand(&items[1])?;
 
         Ok(ast::Expr::Between {
             lhs: Box::new(lhs),
@@ -4885,7 +4900,7 @@ impl PostgreSQLTranslator {
                 let test_node = sub_link.testexpr.as_ref().ok_or_else(|| {
                     ParseError::ParseError("ANY SubLink missing testexpr".to_string().into())
                 })?;
-                let lhs = self.translate_expr(test_node)?;
+                let lhs = self.translate_row_operand(test_node)?;
                 Ok(ast::Expr::InSelect {
                     lhs: Box::new(lhs),
                     not: false,
