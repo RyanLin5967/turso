@@ -12401,7 +12401,6 @@ replays_postgresql!(
     [
         (1, "PGDIV-PUBLIC-SCHEMA-NOOP refusal [wire]: DROP SCHEMA public CASCADE drops tables, but CREATE SCHEMA public is unconditionally refused 42601; PostgreSQL recreates it (C56)"),
         (6, "PGDIV-WITH-ORDINALITY ours-only [ours-only]: generate_series(...) WITH ORDINALITY refused 0A000"),
-        (7, "PGDIV-COLUMN-ALIAS-COUNT-CODE error-code [wire]: AS g(a, b) over a 1-column function: PG 42P10 'table \"g\" has 1 columns available but 2 columns specified'; ours 42601 'too many column aliases'"),
     ]
 );
 replays_postgresql!(

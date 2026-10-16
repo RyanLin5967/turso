@@ -2854,8 +2854,15 @@ impl PostgreSQLTranslator {
         // its column are translated to `value` instead (`series_column`).
         if func_name.eq_ignore_ascii_case("generate_series") {
             if colnames > 1 {
+                let alias = range_func.alias.as_ref().expect("column aliases have an alias");
                 return Err(ParseError::ParseError(
-                    "too many column aliases specified for function generate_series".into(),
+                    SqlErrorMessage::classified(
+                        SqlErrorKind::InvalidColumnReference,
+                        "too many column aliases specified for function generate_series",
+                    ).with_protocol_text(format!(
+                        "table \"{}\" has 1 columns available but {} columns specified",
+                        alias.aliasname, colnames,
+                    )),
                 ));
             }
             let range_alias = range_func.alias.as_ref();
