@@ -4690,7 +4690,10 @@ impl PostgreSQLTranslator {
         call: &pg_query::protobuf::FuncCall,
         name: &str,
     ) -> Result<(), ParseError> {
-        if sqlite_only_function(name) {
+        if sqlite_only_function(name)
+            || (name.bytes().any(|byte| byte.is_ascii_uppercase())
+                && sqlite_only_function(&name.to_ascii_lowercase()))
+        {
             return Err(self.undefined_function(call));
         }
         Ok(())
