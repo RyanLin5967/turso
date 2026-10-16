@@ -929,7 +929,16 @@ def self_test():
             if settle is not None:
                 w(f"{a1}/settle.txt", f"dev=loop0 settle_s=2.2 {settle} inflight=0 dirty_kb=10 writes/discards/flushes=1/0/1\n")
             if system == "ours":
-                fx = {"age": age, "live": live} if ours_fixture == "plan" else ours_fixture
+                # TEST EDIT, flagged (the owed ours fixture record, 2026-10-16): ours writes result/fixture.json in the
+                # competitors' schema (one parent for every system), so "plan" writes it there at the plan's values;
+                # a dict overrides its fields; None writes none
+                fx = None
+                if ours_fixture is not None:
+                    fx = {"system": "ours", "rows": 10000, "age_updates": age, "prebranch": live, "live_branches": live,
+                          "gen_seed_sha256": "d" * 64}
+                    if ours_fixture != "plan":
+                        fx.update(ours_fixture)
+                    w(f"{a1}/result/fixture.json", json.dumps(fx))
                 # TEST EDIT, flagged (the lead's routing ruling, DECISIONS 2026-10-15T05:16:51Z): ours' summary.json
                 # gains its windows with the four exception counters, a new required record at its passing value
                 w(f"{a1}/result/summary.json", "[]" if ours_counters == "notobject" else json.dumps(
@@ -943,7 +952,7 @@ def self_test():
                     # the competitors' load generator records it (the checks summarize used to drop for ours)
                     | ({} if ours_tp == "absent" else {"tracerpid_tm0": 0,
                                                        "tracerpid_tm1": 4321 if ours_tp == "traced" else 0})
-                    | ({"fixture": fx} if fx is not None else {})))
+                    ))
                 w(f"{a1}/adapter.txt", "NOT AVAILABLE: no async class\n" if cell == "na" else "")
                 # TEST EDIT, flagged (the lead's MED 12 ruling, DECISIONS 2026-10-15T04:21:48Z): ours' timed run now
                 # leaves the shared sweeper's record and timed.json; a new required record at its passing value
@@ -953,6 +962,9 @@ def self_test():
                                            else "PASS F1\nVERDICT PASS (dolt)\n")
                 w(f"{a1}/result/functional.txt", verdict)
                 info = f"dry=1 age={age} prebranch={live}" if comp_info == "plan" else comp_info
+                w(f"{a1}/result/fixture.json", json.dumps({"system": "dolt", "rows": 10000, "age_updates": age,
+                                                           "prebranch": live, "live_branches": live,
+                                                           "gen_seed_sha256": "d" * 64}))
                 if info is not None:
                     w(f"{a1}/result/run-info.txt", f"system=dolt kind=dolt rows=10000 cap_s=1800 warmup={RULE} {info} "
                                                    "parent_sum=1\n")
@@ -1132,7 +1144,14 @@ def self_test():
         ("HIGH 4 (fixture parity): ours recording no fixture fails", {"ours_fixture": None}, False,
          lambda s: any("no fixture record" in x for x in s["fixture_refusals"])),
         ("HIGH 4: ours whose fixture differs from its plan row (live 10 vs 20) fails",
-         {"ours_fixture": {"age": 200, "live": 10}}, False, lambda s: any("live" in x for x in s["fixture_refusals"])),
+         {"ours_fixture": {"prebranch": 10, "live_branches": 10}}, False,
+         lambda s: any("live" in x for x in s["fixture_refusals"])),
+        # the owed ours fixture record: ours' fixture.json, in the competitors' schema, holds its MEASURED live count
+        ("ours fixture: a measured live_branches 19 under a planned prebranch of 20 fails, naming live_branches",
+         {"ours_fixture": {"live_branches": 19}}, False,
+         lambda s: any("live_branches" in x for x in s["fixture_refusals"])),
+        ("ours fixture: a fixture.json that is not an object fails as no fixture record",
+         {"ours_fixture": {"rows": None}}, False, lambda s: any("rows" in x for x in s["fixture_refusals"])),
         ("HIGH 4: a competitor whose run-info age differs from its plan row fails",
          {"cell": "comp", "comp_info": "dry=1 age=0 prebranch=20"}, False,
          lambda s: any("age" in x for x in s["fixture_refusals"])),
@@ -1344,6 +1363,34 @@ def self_test():
             s, ok = summarize(make(root, **kw), "sha", "1", "m")
             good = ok == want_ok and (extra is None or bool(extra(s)))
             cases.append((name, good, s["failed_blocks"] + s["parity_refusals"] + s["incomplete"]))
+        finally:
+            shutil.rmtree(root)
+    # the owed ours fixture record: ONE parent for every system in a block (gen_seed's rows and digest), so ours at
+    # fastest_profile's old default 1000 rows beside the competitors' 10000 fails (run 11 measured exactly that)
+    for name, ofx, cfx, want in (
+            ("one parent: ours and a competitor with the same rows and gen_seed digest pass", {}, {}, []),
+            ("one parent: ours at 1000 rows beside a competitor's 10000 fails, naming the rows", {"rows": 1000}, {},
+             ["rows"]),
+            ("one parent: another gen_seed digest fails, naming it", {}, {"gen_seed_sha256": "e" * 64},
+             ["gen_seed_sha256"])):
+        root = tempfile.mkdtemp(prefix="summarize-st-")
+        try:
+            out = make(root, ours_fixture=ofx or "plan")
+            with open(f"{out}/fs-xfs/plan.tsv", "a") as fh:
+                fh.write("dolt-full-c1-r1\tdolt\t1\t200\t1\tfull\t1\t200\t20\n")
+            with open(f"{out}/cells.tsv", "a") as fh:
+                fh.write("xfs\tdolt-full-c1-r1\tdolt\t1\t1\t0\tVALID\n")
+            a1 = f"{out}/fs-xfs/cells/dolt-full-c1-r1/a1"
+            w(f"{a1}/result/functional.txt", "VERDICT PASS (dolt)\n")
+            w(f"{a1}/result/run-info.txt", f"system=dolt kind=dolt rows=10000 cap_s=1800 warmup={RULE} dry=1 age=200 "
+                                           "prebranch=20 parent_sum=1\n")
+            w(f"{a1}/result/fixture.json", json.dumps({"system": "dolt", "rows": 10000, "age_updates": 200,
+                                                       "prebranch": 20, "live_branches": 20,
+                                                       "gen_seed_sha256": "d" * 64} | cfx))
+            s, _ok = summarize(out, "sha", "1", "m")
+            fr = s["fixture_refusals"]
+            good = (fr == []) if not want else any("one parent" in x and all(k in x for k in want) for x in fr)
+            cases.append((name, good, fr))
         finally:
             shutil.rmtree(root)
     # the cross-system rule needs two systems in one block: ours and a competitor planned other totals
