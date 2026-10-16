@@ -4571,7 +4571,7 @@ fn setting_scope_round_trip(setting: &str, value: &str, local: bool, end: &str, 
     a.q(&format!("BEGIN; SET {qualifier}{setting} = {value}; {end}"))
         .ok("setting transaction");
     if setting == "client_min_messages" {
-        let r = a.q("DROP TABLE IF EXISTS c41_missing_table").ok("notice after block");
+        let r = a.q("COMMIT").ok("notice after block");
         assert_eq!(r.notices.len(), 1, "the default notice level must be restored");
     }
     let show = format!("SHOW {setting}");

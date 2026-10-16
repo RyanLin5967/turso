@@ -1,0 +1,6 @@
+postgres (PostgreSQL) 18.6 (Homebrew)
+{"case": "default_drop_notice", "sql": "DROP TABLE IF EXISTS c41_missing_table; SHOW client_min_messages;", "returncode": 0, "stdout": "notice\n", "stderr": "NOTICE:  00000: table \"c41_missing_table\" does not exist, skipping\nLOCATION:  DropErrorMsgNonExistent, tablecmds.c:1506\n"}
+{"case": "rollback_warning_probe", "sql": "BEGIN; SET client_min_messages=error; ROLLBACK; COMMIT; SHOW client_min_messages;", "returncode": 0, "stdout": "notice\n", "stderr": "WARNING:  25P01: there is no transaction in progress\nLOCATION:  EndTransactionBlock, xact.c:4154\n"}
+{"case": "local_warning_probe", "sql": "BEGIN; SET LOCAL client_min_messages=error; COMMIT; COMMIT; SHOW client_min_messages;", "returncode": 0, "stdout": "notice\n", "stderr": "WARNING:  25P01: there is no transaction in progress\nLOCATION:  EndTransactionBlock, xact.c:4154\n"}
+{"case": "error_suppresses_probe", "sql": "SET client_min_messages=error; COMMIT; SHOW client_min_messages;", "returncode": 0, "stdout": "error\n", "stderr": ""}
+private PostgreSQL stopped 0
