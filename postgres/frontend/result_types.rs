@@ -438,6 +438,7 @@ fn scalar_result(name: &str) -> Option<u32> {
         | "quote_ident" | "quote_literal" | "format" | "current_schema" | "current_database"
         | "version" => TEXT,
         "row_number" | "rank" | "dense_rank" | "ntile" | "pg_database_size" | "nextval" | "currval" | "lastval" => INT8,
+        "pg_input_is_valid" => BOOL,
         "current_schemas" => 1003,
         "pg_typeof" => 2206,
         // float8-only in PostgreSQL, whatever numeric argument they are given, and computed as a
