@@ -830,6 +830,11 @@ for FS_NOW in $FSLIST; do
   echo "== stage fs-$FS_NOW $(date -u +%FT%TZ)${PLANT_NOW:+ (plant $PLANT_NOW)}"
   fs_block
   rc=$?
+  # the root's share of the run's disk (DECISIONS 18f492601b: run 14's root image grew 4.3 GiB over one block, which
+  # the data filesystem's space.txt cannot see): the root filesystem and this run's out dir at each block's end, so a
+  # package states its own disk cost beside the host trace vm_dryblock keeps
+  { printf 'utc=%s block=%s\n' "$(date -u +%FT%TZ)" "$FS_NOW"; df -k / | tail -1; du -sk "$OUT"; } \
+    > "$OUT/root-space-$FS_NOW.txt" 2>&1
   cleaned=1
   block_cleanup || { rc=1; cleaned=0; }
   e=$(date +%s)
