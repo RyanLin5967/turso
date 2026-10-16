@@ -25,6 +25,9 @@ fn run_child() -> bool {
         .stack_size(kib * 1024)
         .spawn(move || {
             if let Ok(phase) = std::env::var("C47_PARSE_PHASE") {
+                if phase == "retained-virtual-rebuild" {
+                    return retained_virtual_rebuild(&sql);
+                }
                 return match turso_pg_parser::parse(&sql) {
                     Ok(parsed) => {
                         let outcome = match phase.as_str() {
@@ -64,6 +67,46 @@ fn run_child() -> bool {
     true
 }
 
+// Create under the retained definition's provision, then rebuild from a short statement on
+// the ordinary child stack. An earlier fixture refusal cannot stand in for exercising the rebuild.
+fn retained_virtual_rebuild(sql: &str) -> String {
+    use turso_core::{LimboError, Value};
+    let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::MemoryIO::new());
+    let db = match open_database_with_io(io, ":memory:", turso_core::OpenFlags::Create, turso_core::DatabaseOpts::new()) {
+        Ok(db) => db,
+        Err(error) => return format!("fixture database err {error:?}"),
+    };
+    let conn = PgConnection::new(db.connect().unwrap());
+    let fixture = turso_pg_parser::with_preparation_stack(sql, || {
+        conn.execute(sql).and_then(|_| conn.execute("INSERT INTO vd(a) VALUES(3)"))
+    });
+    let outcome = match fixture {
+        Err(error) => format!("fixture create/insert err {error:?}"),
+        Ok(()) => {
+            eprintln!("C54 retained fixture: CREATE and INSERT accepted; entering short ALTER");
+            let rebuilt = conn.execute("ALTER TABLE vd ADD CONSTRAINT ck CHECK(a>=0)");
+            let result = match rebuilt {
+                Err(LimboError::StackDepthLimitExceeded) => "fixture accepted; rebuild typed 54001".to_string(),
+                Err(error) => format!("fixture accepted; rebuild err {error:?}"),
+                Ok(()) => match conn.prepare("SELECT a,b FROM vd").and_then(|mut statement| statement.run_collect_rows()) {
+                    Ok(rows) if rows == vec![vec![Value::from_i64(3), Value::from_i64(3)]] => "fixture accepted; rebuilt row 3,3".to_string(),
+                    Ok(rows) => format!("fixture accepted; wrong rebuilt rows {rows:?}"),
+                    Err(LimboError::StackDepthLimitExceeded) => "fixture accepted; rebuilt select typed 54001".to_string(),
+                    Err(error) => format!("fixture accepted; rebuilt select err {error:?}"),
+                },
+            };
+            let survival = conn.prepare("SELECT 1").and_then(|mut statement| statement.run_collect_rows());
+            match survival {
+                Ok(rows) if rows == vec![vec![Value::from_i64(1)]] => result,
+                other => format!("{result}; survival failed {other:?}"),
+            }
+        }
+    };
+    // Fixture teardown is distinct from the short statement's retained-definition lifecycle.
+    turso_pg_parser::with_preparation_stack(sql, || drop((conn, db)));
+    outcome
+}
+
 fn in_child(test: &str, kib: usize, sql: &str) -> String {
     in_child_phase(test, kib, sql, None)
 }
@@ -85,7 +128,7 @@ fn in_child_phase(test: &str, kib: usize, sql: &str, phase: Option<&str>) -> Str
         Ok(line) if out.status.success() => line,
         _ => {
             use std::os::unix::process::ExitStatusExt;
-            format!("died ({:?}, signal {:?})", out.status.code(), out.status.signal())
+            format!("died ({:?}, signal {:?}); child stderr: {}", out.status.code(), out.status.signal(), String::from_utf8_lossy(&out.stderr))
         }
     }
 }
@@ -308,4 +351,26 @@ fn refusing_a_later_deep_sibling_safely_drops_the_completed_sibling() {
         ),
         "err StackDepthLimitExceeded"
     );
+}
+
+/// PG18.6: c54-pg18-depth.out. This separate fixture must finish CREATE and INSERT before the
+/// short rebuild can receive credit; the wire depth control may stop earlier with 54001.
+#[test]
+fn a_retained_virtual_definition_uses_its_own_stack_during_rebuild() {
+    if run_child() {
+        return;
+    }
+    let sql = format!("CREATE TABLE vd(a INT,b INT GENERATED ALWAYS AS({}a{}) VIRTUAL)", "abs(".repeat(1000), ")".repeat(1000));
+    let outcome = in_child_phase(
+        "stack_guard_tests::a_retained_virtual_definition_uses_its_own_stack_during_rebuild",
+        256,
+        &sql,
+        Some("retained-virtual-rebuild"),
+    );
+    eprintln!("C54 retained definition outcome: {outcome}");
+    assert!(matches!(outcome.as_str(),
+        "fixture accepted; rebuilt row 3,3" |
+        "fixture accepted; rebuild typed 54001" |
+        "fixture accepted; rebuilt select typed 54001"),
+        "accepted retained definition must produce the recorded row or typed 54001 and survive: {outcome}");
 }
