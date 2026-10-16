@@ -13845,3 +13845,77 @@ fn c54_series_signatures_reject_text_and_boolean_arguments() {
         assert_eq!(r.rows, vec![vec![Some("1".into())], vec![Some("2".into())]]);
     }
 }
+
+#[test]
+fn c52_derived_merged_join_keeps_named_boolean_columns_and_parameters() {
+    let dir = Scratch::new("c52derivedjoined");
+    let server = Server::start(&dir.db(), &[]);
+    let mut w = server.connect();
+    // The key is deliberately not the first left column. Selecting named columns
+    // outside the join avoids relying on the engine's existing star-order gap.
+    w.q("CREATE TABLE c52_left(payload BOOL, id INT)").ok("left");
+    w.q("CREATE TABLE c52_right(id INT, ready BOOL)").ok("right");
+    w.q("INSERT INTO c52_left VALUES(true, 1)").ok("left row");
+    w.q("INSERT INTO c52_right VALUES(1, false)").ok("right row");
+    let sql = "SELECT d.payload,d.id,d.ready FROM (SELECT * FROM c52_left JOIN c52_right USING(id)) d WHERE d.payload=$1";
+    let described = w.describe_statement(sql).ok("derived merged columns");
+    assert_eq!(described.params, Some(vec![16]));
+    assert_eq!(described.oids, Some(vec![16, 23, 16]));
+    let reply = w.x_undeclared(sql, &["true"]).ok("boolean parameter");
+    assert_eq!(reply.rows, vec![vec![Some("t".into()), Some("1".into()), Some("f".into())]]);
+}
+
+#[test]
+fn c52_merged_join_key_has_common_type_but_members_keep_their_types() {
+    let dir = Scratch::new("c52mergedwidth");
+    let server = Server::start(&dir.db(), &[]);
+    let mut w = server.connect();
+    w.q("CREATE TABLE c52_small(id INT4, flag BOOL)").ok("small");
+    w.q("CREATE TABLE c52_big(id INT8, txt TEXT)").ok("big");
+    w.q("INSERT INTO c52_small VALUES(1, true)").ok("small row");
+    w.q("INSERT INTO c52_big VALUES(1, 'big')").ok("big row");
+    let sql = "SELECT id,c52_small.id,c52_big.id,c52_small.*,c52_big.* FROM c52_small JOIN c52_big USING(id) WHERE id=$1";
+    let described = w.describe_statement(sql).ok("common merged key");
+    assert_eq!(described.params, Some(vec![20]));
+    assert_eq!(described.oids, Some(vec![20, 23, 20, 23, 16, 20, 25]));
+    let reply = w.x_undeclared(sql, &["1"]).ok("common key parameter");
+    assert_eq!(reply.rows, vec![vec![Some("1".into()), Some("1".into()), Some("1".into()), Some("1".into()), Some("t".into()), Some("1".into()), Some("big".into())]]);
+}
+
+
+#[test]
+fn c52_common_parameter_contexts_infer_from_the_concrete_arm() {
+    let dir = Scratch::new("c52commonparams");
+    let server = Server::start(&dir.db(), &[]);
+    let mut w = server.connect();
+    let mut observed = Vec::new();
+    for (sql, oid) in [
+        ("SELECT coalesce($1, 1)", 23),
+        ("SELECT CASE WHEN true THEN $1 ELSE 1 END", 23),
+        ("SELECT greatest($1, 1)", 23),
+        ("SELECT ARRAY[$1, 1]", 1007),
+        ("VALUES (1), ($1)", 23),
+    ] {
+        let reply = w.describe_statement(sql);
+        observed.push((reply.params, reply.oids));
+        eprintln!("C52 common parameter context: {sql}, expected parameter23/result{oid}, observed {:?}", observed.last().unwrap());
+    }
+    assert_eq!(observed, vec![
+        (Some(vec![23]), Some(vec![23])),
+        (Some(vec![23]), Some(vec![23])),
+        (Some(vec![23]), Some(vec![23])),
+        (Some(vec![23]), Some(vec![1007])),
+        (Some(vec![23]), Some(vec![23])),
+    ]);
+}
+
+#[test]
+fn c52_nullif_integer_comparison_keeps_the_left_operand_width() {
+    let dir = Scratch::new("c52nullifwidth");
+    let server = Server::start(&dir.db(), &[]);
+    let mut w = server.connect();
+    let sql = "SELECT pg_typeof(NULLIF(1::int2,2::int8))::text, NULLIF(1::int2,2::int8)";
+    let reply = w.q(sql).ok("integer comparison overload");
+    assert_eq!(reply.oids, Some(vec![25, 21]));
+    assert_eq!(reply.rows, vec![vec![Some("smallint".into()), Some("1".into())]]);
+}
