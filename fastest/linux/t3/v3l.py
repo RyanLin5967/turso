@@ -821,6 +821,13 @@ def as_state(rec, wc):
             d["lab_flush_ios_delta"] = d.get("flush_ios_delta")
 
     put(r["arms"]["fsync"]["timed"], rec["leaf"].get("write_cache"))
+    # the A27 pair counts the same drive's flushes over the two labelling runs: a derived drive's pair is derived with
+    # it (both runs at the synthesised labelling count), or a real-mode base fails A27 ("the pair's first count is not
+    # its labelling count") and every plant of the other state is NOT-RUN (found 2026-10-16 by the C27 caller case)
+    lp = r["arms"]["fsync"].get("lab_pair")
+    if rec["leaf"].get("write_cache") != wc and isinstance(lp, dict):
+        lp["first"] = lp["second"] = r["arms"]["fsync"]["timed"]["lab_flush_ios_delta"]
+        lp["problem"] = None
     r["leaf"]["write_cache"] = wc
     # the report the gate wants for this state: 'none (RAM)' on brd (fourth lane review HIGH 3)
     r["leaf"]["drive_reports"] = drive_report_for(r["leaf"].get("disk"), wc)
@@ -877,7 +884,8 @@ def plants(rec):
         r["leaf"].setdefault("layers", []).append({"name": "loop-plant", "write_cache": "write back",
                                                    "flush_ios_delta": 2 * N, "lab_flush_ios_delta": 2 * N})
         # and its backing filesystem synced and expected, as a real loop's would be (annex A24-AM1's coverage rule)
-        for y in (r["arms"]["fsync"].get("sync") or {}).values():
+        # every sync record the gates read, the A27 pair's included (lab2_sync; a caller the C27 MED fix missed)
+        for y in list((r["arms"]["fsync"].get("sync") or {}).values()) + list((lab2_sync(r["arms"]["fsync"]) or {}).values()):
             if isinstance(y, dict) and isinstance(y.get("layers"), list):
                 y["layers"].append({"path": "/plant/loop-plant.img", "rc": 0, "secs": 0.0})
         if isinstance(r["leaf"].get("sync_paths"), list):
@@ -1336,6 +1344,15 @@ def self_test():
          _ok(lambda: _plant(plants(rec(delta=20003))[0], "wb-layer-half").get("fired") is True
              and _has(_plant(plants(rec(delta=20003))[0], "wb-layer-half")["got"], "write-back loop layer",
                       "per fsync the labelling run showed"))),
+        # the C27 MED fix's caller (found re-summarizing dry run 11's real records, 2026-10-16): a plant whose base adds
+        # a loop layer must sync it in EVERY sync record the gates now read, the A27 pair's included, or the base
+        # fails and the plant reports NOT-RUN; every plant must run on a record carrying a pair, as real ones do
+        ("C27 caller: plant wb-layer-half fires on a record carrying an A27 pair (its sync covers the planted layer)",
+         _ok(lambda: _plant(plants(_lab(rec(delta=20003, mode="real", pair=(20004, 20004)), 20004))[0],
+                            "wb-layer-half").get("fired") is True)),
+        ("C27 caller: on a record carrying an A27 pair no plant is NOT-RUN",
+         _ok(lambda: not [p_ for p_ in plants(_lab(rec(delta=20003, mode="real", pair=(20004, 20004)), 20004))[0]
+                          if str(p_.get("why", "")).startswith("NOT-RUN")])),
         ("item 4: plant wb-layer-half fires on a record with a real write-back loop layer",
          _ok(lambda: _plant(plants(_lab(rec(delta=20003, layers=[{"name": "loop3", "write_cache": "write back",
                                                                   "flush_ios_delta": 20003,
