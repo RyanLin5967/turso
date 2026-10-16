@@ -13948,3 +13948,15 @@ fn c52_scalar_set_and_cte_outputs_share_the_select_inference() {
         assert_eq!(w.q(sql).single("recorded scalar SELECT output type"), "numeric");
     }
 }
+
+// Completed scalar outputs have TEXT type, not an unknown literal to coerce.
+// Independent PG18.6 recording: pg18/c52-scalar-children.{sql,txt}.
+#[test]
+fn c52_scalar_completed_text_is_refused_by_numeric_common_contexts() {
+    let dir = Scratch::new("c52scalarcommon");
+    let server = Server::start(&dir.db(), &[]);
+    let mut w = server.connect();
+    let codes: Vec<_> = ["SELECT COALESCE((SELECT $1),1)", "SELECT ARRAY[(SELECT $1),1]"]
+        .into_iter().map(|sql| w.describe_statement(sql).error.map(|error| error.code)).collect();
+    assert_eq!(codes, vec![Some("42804".into()),Some("42804".into())]);
+}

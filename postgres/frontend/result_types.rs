@@ -2253,8 +2253,20 @@ mod c52_tests {
     #[test]
     fn c52_scalar_select_inference_work_stays_linear() {
         let count = |depth: usize| {
-            let sql = format!("SELECT {}1{}", "(SELECT ".repeat(depth), ")".repeat(depth));
-            let parse = turso_pg_parser::parse(&sql).unwrap();
+            // This measures Infer, independently of the native decoder's depth
+            // gate. Build the same SELECT nesting from two shallow parsed trees.
+            let mut parse = turso_pg_parser::parse("SELECT 1").unwrap();
+            let wrapper = turso_pg_parser::parse("SELECT (SELECT 1)").unwrap();
+            let mut query = parse.protobuf.stmts[0].stmt.take().unwrap();
+            for _ in 0..depth {
+                let mut outer = wrapper.protobuf.stmts[0].stmt.clone().unwrap();
+                let Some(Node::SelectStmt(select)) = outer.node.as_mut() else { panic!("SELECT"); };
+                let Some(Node::ResTarget(target)) = select.target_list[0].node.as_mut() else { panic!("target"); };
+                let Some(Node::SubLink(scalar)) = target.val.as_deref_mut().unwrap().node.as_mut() else { panic!("scalar"); };
+                scalar.subselect = Some(query);
+                query = outer;
+            }
+            parse.protobuf.stmts[0].stmt = Some(query);
             let schema = std::sync::Arc::new(Schema::default());
             let attached = Attached { names: &[], holds: &|_, _| false };
             let walked = parameter_types(&parse, &schema, &[], &Default::default(),
@@ -2265,6 +2277,29 @@ mod c52_tests {
         let short = count(16);
         let long = count(32);
         assert!(long <= 3 * short, "nested scalar work: depth16={short}, depth32={long}");
+    }
+
+
+    #[test]
+    fn c52_scalar_children_keep_recorded_parameter_contexts() {
+        // Independent PG18.6 PREPARE output: pg18/c52-scalar-children.txt.
+        let cases = [
+            ("SELECT $1 UNION SELECT 1", INT4),
+            ("SELECT row_number() OVER (ORDER BY (SELECT $1::int4))", INT4),
+            ("SELECT array_agg(1 ORDER BY (SELECT $1::int4))", INT4),
+            ("SELECT sum(1) OVER (ORDER BY 1 ROWS (SELECT $1::int8) PRECEDING)", INT8),
+            ("SELECT (ARRAY[1,2])[(SELECT $1::int4)]", INT4),
+            ("SELECT CASE WHEN true THEN $1::int4 WHEN (SELECT $1 WHERE $1=1)=1 THEN 2 ELSE 3 END", INT4),
+        ];
+        let schema = std::sync::Arc::new(Schema::default());
+        let attached = Attached { names: &[], holds: &|_, _| false };
+        let actual: Vec<_> = cases.iter().map(|(sql, _)| {
+            let parse = turso_pg_parser::parse(sql).unwrap();
+            let walked = parameter_types(&parse, &schema, &[], &Default::default(),
+                &attached, &Default::default()).unwrap();
+            walked.params.get(&1).copied()
+        }).collect();
+        assert_eq!(actual, cases.iter().map(|(_, oid)| Some(*oid)).collect::<Vec<_>>());
     }
 
 }
