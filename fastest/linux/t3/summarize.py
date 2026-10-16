@@ -582,6 +582,8 @@ def summarize(out, sha, dry, manifest):
             for x in r["warmup_rules"] or [None]:
                 if x is None or x != rule:
                     parity.append(f"{fs}/{cell}: warm-up rule {x!r}, the package's {rule!r}")
+                    # C27 LOW: a rule refusal is a warm-up refusal too, so warmup_creditable reads it (finding 7)
+                    warm.append(f"{fs}/{cell}: warm-up rule {x!r}, the package's {rule!r}")
             for x in r["ops_measured"] or [None]:
                 if x is None or x != want:
                     parity.append(f"{fs}/{cell}: measured {x!r} ops, planned {want!r}")
@@ -661,7 +663,8 @@ def summarize(out, sha, dry, manifest):
     # review 5 MED 6: the warm-up is creditable only with a bound three-driver conformance record (PREREG annex A23)
     conf = conformance_problems(out)
     parity += [f"warm-up (A23): {x}" for x in conf]
-    # creditable only when NO warm-up refusal stands: the conformance binding and every backstep (review 7 finding 7)
+    # creditable only when NO warm-up refusal stands: the conformance binding, every backstep (review 7 finding 7) and
+    # every warm-up rule refusal (C27 LOW)
     summary["warmup_creditable"] = not conf and not warm
     summary["loud_owed"] = (["the three-driver warm-up conformance run (PREREG annex A23), on this package's own "
                              "bbload, clonebench and fastest_profile"] if conf else [])
@@ -1104,6 +1107,15 @@ def self_test():
          lambda s: "no timed.json" in first(s, "parity_refusals")),
         ("MED 3: no package warm-up rule (warmup.txt) fails (parity)", {"rule": None}, False,
          lambda s: "the package's None" in first(s, "parity_refusals")),
+        # C27 LOW: warmup_creditable is derived from EVERY warm-up refusal (review 7 finding 7), the rule's included:
+        # it read True while "warm-up rule X, the package's Y" stood (ours, a competitor, no warmup.txt rule)
+        ("C27 LOW: ours recording another warm-up rule makes warmup_creditable False",
+         {"ours_rule": "1000:10:999"}, False, lambda s: s.get("warmup_creditable") is False
+         and "warm-up rule '1000:10:999'" in first(s, "parity_refusals")),
+        ("C27 LOW: a competitor whose rule is not the package's makes warmup_creditable False",
+         {"cell": "comp", "rule": "1000:10:999"}, False, lambda s: s.get("warmup_creditable") is False),
+        ("C27 LOW: no package warm-up rule (warmup.txt) makes warmup_creditable False",
+         {"rule": None}, False, lambda s: s.get("warmup_creditable") is False),
         ("MED 3: ours planned 150 ops, asked and measured 150 passes", {"plan_ops": [150], "ours_ops": (150, 150)}, True, None),
         # TEST EDIT, flagged (fourth lane review MED 5 / T3 runner review item 9, gating chosen by the lane): this case
         # said a run that did not settle is "listed, not gated" (ok True); it now fails the package, still listed

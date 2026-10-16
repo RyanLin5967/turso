@@ -96,11 +96,11 @@ MUTANTS = [
      '        elif r.get("ran") is not True or type(r.get("rc")) is not int or r["rc"] != 0:',
      '        elif r.get("ran") is not True:', "UNRUN (QUIET)"),
     # review 6 LOW 10, review 5 LOW 23-25: checks that could be deleted with the self-test green
+    # TABLE EDIT, flagged (C27 MED): sync_gate's run list is now its runs= default (the A27 second labelling run is
+    # judged by the same function), so the same mutation, the labelling run dropped, targets the default
     ("A24c-labelling-sync-dropped", "review 6 LOW 10: the labelling run's sync is judged too",
-     '    for run in ("timed", "labelling"):\n        r = sy.get(run) if isinstance(sy, dict) else None\n'
-     '        if not isinstance(r, dict):\n',
-     '    for run in ("timed",):\n        r = sy.get(run) if isinstance(sy, dict) else None\n'
-     '        if not isinstance(r, dict):\n', "UNRUN (QUIET)"),
+     'def sync_gate(disk, sy, runs=("timed", "labelling")):\n',
+     'def sync_gate(disk, sy, runs=("timed",)):\n', "KILLED (lane run, 2026-10-16)"),
     ("A24d-no-unsynced-plant", "review 6 LOW 10: the timed run's sync rule is forced to fire (plant)",
      '        arm("unsynced", rec["leaf"]["write_cache"],',
      '        (lambda *a: None)("unsynced", rec["leaf"]["write_cache"],', "UNRUN (QUIET)"),
@@ -135,6 +135,12 @@ MUTANTS = [
     ("A24j-coverage-by-count", "review 7 finding 5: sync coverage is judged by path identity, in order",
      '        elif [x.get("path") if isinstance(x, dict) else None for x in lay] != exp:\n', '        elif False:\n',
      "UNRUN (QUIET)"),
+    # C27 MED: the sync before annex A27's second labelling run is judged, in a real measure() and in gates()
+    ("A27h-lab2-sync-not-refused", "C27 MED: a real run refuses when the second labelling run's sync is not clean",
+     '            if sync_bad and os.environ.get("V3L_REAL") == "1":\n', '            if False:\n',
+     "KILLED (lane run, 2026-10-16)"),
+    ("A27i-lab2-sync-not-gated", "C27 MED: gates() judges the sync before a record's second labelling run",
+     '        if l2 is not None:\n', '        if False:\n', "KILLED (lane run, 2026-10-16)"),
     ("A27b-pair-threshold-slack", "annex A27: the pair's allowance is SLACK/2 of the larger, not SLACK",
      '    if Fraction(abs(first - second)) > SLACK / 2 * big:\n',
      '    if Fraction(abs(first - second)) > SLACK * big:\n', "UNRUN (QUIET)"),
