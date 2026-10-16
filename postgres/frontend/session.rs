@@ -1911,9 +1911,9 @@ fn handle_pg_add_constraints(
             }
         }
     }
+    create.table_elts.extend(add.constraints.iter().cloned());
     let aside_def =
         turso_pg_parser::deparse_with_metadata(&aside_tree, &parsed).map_err(crate::session::pg_parse_error)?;
-    create.table_elts.extend(add.constraints.iter().cloned());
     let rebuilt =
         turso_pg_parser::deparse_with_metadata(&parsed.protobuf, &parsed).map_err(crate::session::pg_parse_error)?;
     // Every refusal the translator makes of the rebuilt CREATE TABLE (MATCH FULL over several
