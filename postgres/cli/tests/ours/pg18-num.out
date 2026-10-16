@@ -1,0 +1,35 @@
+>> Q SELECT 0b10000000000000000000000000000000
+   T oids=[20] names=['?column?']
+   D ['2147483648']
+   C SELECT 1
+   Z I
+>> Q SELECT 0o20000000000
+   T oids=[20] names=['?column?']
+   D ['2147483648']
+   C SELECT 1
+   Z I
+>> Q SELECT 0x80000000
+   T oids=[20] names=['?column?']
+   D ['2147483648']
+   C SELECT 1
+   Z I
+>> Q SELECT 0x_7FFF_FFFF_FFFF_FFFF_F
+   T oids=[701] names=['?column?']
+   D ['1.4757395258967641e+20']
+   C SELECT 1
+   Z I
+>> Q SELECT -0x8000000000000000
+   T oids=[20] names=['?column?']
+   D ['-9223372036854775808']
+   C SELECT 1
+   Z I
+>> Q SELECT 1_000_000
+   T oids=[23] names=['?column?']
+   D ['1000000']
+   C SELECT 1
+   Z I
+>> Q SELECT 0b1_0
+   T oids=[23] names=['?column?']
+   D ['2']
+   C SELECT 1
+   Z I

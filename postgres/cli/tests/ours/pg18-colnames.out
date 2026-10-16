@@ -1,0 +1,33 @@
+>> Q DROP TABLE IF EXISTS cn
+   C DROP TABLE
+   Z I
+>> Q CREATE TABLE cn (a int, b text)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO cn VALUES (1, 'x')
+   C INSERT 0 1
+   Z I
+>> Q SELECT 1 + 1, 'nan'::numeric / '0', 'Infinity'::float8::numeric, '42'::int2::numeric, a::int8, b::text FROM cn
+   E S=ERROR C=0A000 M=Parse error: NaN is not supported by this engine: "nan"
+   Z I
+>> Q SELECT CASE WHEN true THEN 1 END, CASE WHEN true THEN a ELSE a END, coalesce(1, 2), greatest(1, 2), least(1, 2), nullif(1, 2) FROM cn
+   T oids=[23, 25, 23, 23, 23, 23] names=['case', 'a', 'coalesce', 'greatest', 'least', 'nullif']
+   D ['1', '1', '1', '2', '1', '1']
+   C SELECT 1
+   Z I
+>> Q SELECT ARRAY[1], ROW(1, 2), EXISTS (SELECT 1), (SELECT 1 AS q), (SELECT a FROM cn), round(1.5) = 2, -1, NOT true, 1 IS NULL
+   E S=ERROR C=42601 M=Parse error: row value misused
+   Z I
+>> Q SELECT 'abc', 42, 1.5, true, NULL, $$d$$
+   T oids=[25, 23, 701, 16, 25, 25] names=['?column?', '?column?', '?column?', '?column?', '?column?', '?column?']
+   D ['abc', '42', '1.5', 't', None, 'd']
+   C SELECT 1
+   Z I
+>> Q SELECT current_date IS NOT NULL, 'x'::varchar(3), CAST(1 AS integer), a + 0 FROM cn
+   T oids=[16, 25, 23, 23] names=['?column?', 'varchar', 'int4', '?column?']
+   D ['t', 'x', '1', '1']
+   C SELECT 1
+   Z I
+>> Q DROP TABLE cn
+   C DROP TABLE
+   Z I

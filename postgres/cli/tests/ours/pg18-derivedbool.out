@@ -1,0 +1,46 @@
+>> Q DROP TABLE IF EXISTS parent, child
+   C DROP TABLE
+   Z I
+>> Q CREATE TABLE parent (k int primary key, pd int)
+   C CREATE TABLE
+   Z I
+>> Q CREATE TABLE child (k int unique, cd int)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO parent VALUES (1, 10), (2, 20)
+   C INSERT 0 2
+   Z I
+>> Q INSERT INTO child VALUES (1, 100), (4, 400)
+   C INSERT 0 2
+   Z I
+>> Q SELECT linked FROM (SELECT true AS linked) s
+   T oids=[16] names=['linked']
+   D ['t']
+   C SELECT 1
+   Z I
+>> Q SELECT s.b, s.c FROM (SELECT 1 = 1 AS b, 1.5::float4 AS c) s
+   T oids=[16, 700] names=['b', 'c']
+   D ['t', '1.5']
+   C SELECT 1
+   Z I
+>> Q SELECT p.k, linked FROM parent p LEFT JOIN (SELECT c.*, true AS linked FROM child c) AS ss ON (p.k = ss.k) ORDER BY p.k
+   T oids=[23, 16] names=['k', 'linked']
+   D ['1', 't']
+   D ['2', None]
+   C SELECT 2
+   Z I
+>> Q WITH w AS (SELECT k > 1 AS big FROM parent) SELECT big FROM w ORDER BY big
+   T oids=[16] names=['big']
+   D ['f']
+   D ['t']
+   C SELECT 2
+   Z I
+>> Q SELECT * FROM (SELECT k, k = 1 AS one FROM parent) s ORDER BY k
+   T oids=[23, 16] names=['k', 'one']
+   D ['1', 't']
+   D ['2', 'f']
+   C SELECT 2
+   Z I
+>> Q DROP TABLE parent, child
+   C DROP TABLE
+   Z I

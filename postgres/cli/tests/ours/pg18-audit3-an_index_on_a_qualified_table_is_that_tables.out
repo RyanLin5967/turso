@@ -1,0 +1,39 @@
+>> Q DROP SCHEMA IF EXISTS s CASCADE; DROP SCHEMA public CASCADE; CREATE SCHEMA public
+   E S=ERROR C=0A000 M=schemas other than public are not supported by the branch server: its branches cover the one schema (CREATE SCHEMA and DROP SCHEMA are refused)
+   Z I
+>> Q CREATE TABLE t(id INT PRIMARY KEY, c INT)
+   C CREATE TABLE
+   Z I
+>> Q CREATE SCHEMA s
+   E S=ERROR C=0A000 M=schemas other than public are not supported by the branch server: its branches cover the one schema (CREATE SCHEMA and DROP SCHEMA are refused)
+   Z I
+>> Q CREATE TABLE s.t(id INT PRIMARY KEY, c INT)
+   E S=ERROR C=XX000 M=no such database: s
+   Z I
+>> Q CREATE UNIQUE INDEX su ON s.t (c)
+   E S=ERROR C=XX000 M=no such database: s
+   Z I
+>> Q INSERT INTO s.t VALUES (1, 7)
+   E S=ERROR C=XX000 M=no such database: s
+   Z I
+>> Q INSERT INTO s.t VALUES (2, 7)
+   E S=ERROR C=XX000 M=no such database: s
+   Z I
+>> Q INSERT INTO public.t VALUES (1, 7)
+   C INSERT 0 1
+   Z I
+>> Q INSERT INTO public.t VALUES (2, 7)
+   C INSERT 0 1
+   Z I
+>> Q DELETE FROM public.t WHERE id = 2
+   C DELETE 1
+   Z I
+>> Q CREATE UNIQUE INDEX pu ON public.t (c)
+   C CREATE INDEX
+   Z I
+>> Q INSERT INTO public.t VALUES (3, 7)
+   E S=ERROR C=23505 M=UNIQUE constraint failed: t.c
+   Z I
+>> Q SELECT count(*) FROM s.t
+   E S=ERROR C=XX000 M=no such database: s
+   Z I

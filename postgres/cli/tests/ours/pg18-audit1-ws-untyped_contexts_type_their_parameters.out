@@ -1,0 +1,244 @@
+>> Q DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public
+   C DROP SCHEMA
+   E S=ERROR C=42601 M=Parse error: schema "public" already exists
+   Z I
+>> Q CREATE TABLE p(id INT PRIMARY KEY, name TEXT, n INT)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO p VALUES (1, 'abc', 10), (2, 'de', NULL), (3, 'fghi', 30)
+   C INSERT 0 3
+   Z I
+>> D - SELECT id FROM p WHERE length(name) = $1
+   ParseComplete
+   t params=[23]
+   T oids=[23] names=['id']
+   Z I
+>> X 0 SELECT id FROM p WHERE length(name) = $1 ||| 3
+   ParseComplete
+   BindComplete
+   T oids=[23] names=['id']
+   D ['1']
+   C SELECT 1
+   Z I
+>> D - SELECT id FROM p WHERE coalesce(n, 0) = $1
+   ParseComplete
+   t params=[23]
+   T oids=[23] names=['id']
+   Z I
+>> X 0 SELECT id FROM p WHERE coalesce(n, 0) = $1 ||| 0
+   ParseComplete
+   BindComplete
+   T oids=[23] names=['id']
+   D ['2']
+   C SELECT 1
+   Z I
+>> D - SELECT id FROM p WHERE CASE WHEN n IS NULL THEN 0 ELSE n END = $1
+   ParseComplete
+   t params=[23]
+   T oids=[23] names=['id']
+   Z I
+>> X 0 SELECT id FROM p WHERE CASE WHEN n IS NULL THEN 0 ELSE n END = $1 ||| 30
+   ParseComplete
+   BindComplete
+   T oids=[23] names=['id']
+   D ['3']
+   C SELECT 1
+   Z I
+>> D - SELECT id FROM p WHERE (SELECT max(n) FROM p) = $1 ORDER BY id
+   ParseComplete
+   t params=[23]
+   T oids=[23] names=['id']
+   Z I
+>> X 0 SELECT id FROM p WHERE (SELECT max(n) FROM p) = $1 ORDER BY id ||| 30
+   ParseComplete
+   BindComplete
+   T oids=[23] names=['id']
+   D ['1']
+   D ['2']
+   D ['3']
+   C SELECT 3
+   Z I
+>> D - SELECT 1 FROM p HAVING sum(n * 2) > $1
+   ParseComplete
+   t params=[20]
+   T oids=[23] names=['?column?']
+   Z I
+>> X 0 SELECT 1 FROM p HAVING sum(n * 2) > $1 ||| 79
+   ParseComplete
+   BindComplete
+   T oids=[23] names=['?column?']
+   D ['1']
+   C SELECT 1
+   Z I
+>> D - SELECT id FROM p WHERE $1 OR id = 1 ORDER BY id
+   ParseComplete
+   t params=[16]
+   T oids=[23] names=['id']
+   Z I
+>> X 0 SELECT id FROM p WHERE $1 OR id = 1 ORDER BY id ||| true
+   ParseComplete
+   BindComplete
+   T oids=[23] names=['id']
+   D ['1']
+   D ['2']
+   D ['3']
+   C SELECT 3
+   Z I
+>> D - SELECT id FROM p WHERE $1 OR id = 1 ORDER BY id
+   ParseComplete
+   t params=[16]
+   T oids=[23] names=['id']
+   Z I
+>> X 0 SELECT id FROM p WHERE $1 OR id = 1 ORDER BY id ||| false
+   ParseComplete
+   BindComplete
+   T oids=[23] names=['id']
+   D ['1']
+   C SELECT 1
+   Z I
+>> D - SELECT c FROM (SELECT count(*) AS c FROM p) AS d WHERE c > $1
+   ParseComplete
+   t params=[20]
+   T oids=[17] names=['c']
+   Z I
+>> X 0 SELECT c FROM (SELECT count(*) AS c FROM p) AS d WHERE c > $1 ||| 2
+   ParseComplete
+   BindComplete
+   T oids=[17] names=['c']
+   D ['3']
+   C SELECT 1
+   Z I
+>> D - WITH w AS (SELECT n FROM p) SELECT count(*) FROM w WHERE n > $1
+   ParseComplete
+   t params=[23]
+   T oids=[20] names=['count']
+   Z I
+>> X 0 WITH w AS (SELECT n FROM p) SELECT count(*) FROM w WHERE n > $1 ||| 10
+   ParseComplete
+   BindComplete
+   T oids=[20] names=['count']
+   D ['1']
+   C SELECT 1
+   Z I
+>> D - SELECT id FROM p UNION ALL SELECT id FROM p ORDER BY 1 LIMIT $1
+   ParseComplete
+   t params=[20]
+   T oids=[23] names=['id']
+   Z I
+>> X 0 SELECT id FROM p UNION ALL SELECT id FROM p ORDER BY 1 LIMIT $1 ||| 2
+   ParseComplete
+   BindComplete
+   T oids=[23] names=['id']
+   D ['1']
+   D ['1']
+   C SELECT 2
+   Z I
+>> D - SELECT count(*) FROM p GROUP BY n > $1
+   ParseComplete
+   t params=[23]
+   T oids=[20] names=['count']
+   Z I
+>> D - SELECT id FROM p ORDER BY n = $1, id
+   ParseComplete
+   t params=[23]
+   T oids=[23] names=['id']
+   Z I
+>> D - SELECT sum(n) OVER (PARTITION BY n > $1) FROM p
+   ParseComplete
+   t params=[23]
+   T oids=[25] names=['sum']
+   Z I
+>> D - INSERT INTO p VALUES (1, 'x', 0) ON CONFLICT (id) DO UPDATE SET n = excluded.n WHERE excluded.n > $1
+   ParseComplete
+   t params=[23]
+   NoData
+   Z I
+>> D - UPDATE p SET (n, name) = ($1, $2) WHERE id = 1
+   ParseComplete
+   t params=[23, 25]
+   NoData
+   Z I
+>> D - UPDATE p SET (id, n) = ($1, $2) WHERE id = 1
+   ParseComplete
+   t params=[23, 23]
+   NoData
+   Z I
+>> D - SELECT id FROM p WHERE EXISTS (SELECT 1 FROM (SELECT count(*) AS n FROM p) AS q WHERE n = $1)
+   ParseComplete
+   t params=[20]
+   T oids=[23] names=['id']
+   Z I
+>> D - SELECT p.id FROM p JOIN p AS q ON $1 WHERE p.id = 1
+   ParseComplete
+   t params=[16]
+   T oids=[23] names=['id']
+   Z I
+>> D - SELECT id FROM p WHERE $1 AND id = 1
+   ParseComplete
+   t params=[16]
+   T oids=[23] names=['id']
+   Z I
+>> D - SELECT id FROM p WHERE NOT $1
+   ParseComplete
+   t params=[16]
+   T oids=[23] names=['id']
+   Z I
+>> D - SELECT CASE WHEN $1 THEN 1 ELSE 0 END FROM p
+   ParseComplete
+   t params=[16]
+   T oids=[23] names=['case']
+   Z I
+>> D - SELECT id FROM p WHERE $1 IS TRUE
+   ParseComplete
+   t params=[16]
+   T oids=[23] names=['id']
+   Z I
+>> D - SELECT id FROM p ORDER BY id OFFSET $1
+   ParseComplete
+   t params=[20]
+   T oids=[23] names=['id']
+   Z I
+>> D - SELECT id FROM p WHERE n + $1 = 11
+   ParseComplete
+   t params=[23]
+   T oids=[23] names=['id']
+   Z I
+>> D - WITH w(a) AS (SELECT n FROM p) SELECT a FROM w WHERE a = $1
+   ParseComplete
+   t params=[23]
+   T oids=[23] names=['a']
+   Z I
+>> D - SELECT id FROM p WHERE upper($1) = name
+   ParseComplete
+   t params=[25]
+   T oids=[23] names=['id']
+   Z I
+>> D - SELECT id FROM p WHERE greatest(n, 0) = $1
+   ParseComplete
+   t params=[23]
+   T oids=[23] names=['id']
+   Z I
+>> D - INSERT INTO p VALUES (1, 'x', 0) ON CONFLICT (id) DO UPDATE SET n = $1 WHERE $2
+   ParseComplete
+   t params=[23, 16]
+   NoData
+   Z I
+>> X 0,0 INSERT INTO p VALUES (1, 'x', 0) ON CONFLICT (id) DO UPDATE SET n = $1 WHERE $2 ||| 11 ||| true
+   ParseComplete
+   BindComplete
+   NoData
+   C INSERT 0 1
+   Z I
+>> Q SELECT n FROM p WHERE id = 1
+   T oids=[23] names=['n']
+   D ['11']
+   C SELECT 1
+   Z I
+>> D - SELECT id FROM p WHERE typeof(name) = $1
+   ParseComplete
+   E S=ERROR C=42P18 M=could not determine data type of parameter $1
+   Z I
+>> D - SELECT id FROM p WHERE no_such_typing(name) = $1
+   ParseComplete
+   E S=ERROR C=42883 M=Parse error: no such function: no_such_typing
+   Z I

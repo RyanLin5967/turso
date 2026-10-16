@@ -1,0 +1,74 @@
+>> Q DROP TABLE IF EXISTS j1, j2
+   C DROP TABLE
+   Z I
+>> Q CREATE TABLE j1 (i int, j int, t text)
+   C CREATE TABLE
+   Z I
+>> Q CREATE TABLE j2 (i int, k int)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO j1 VALUES (1, 4, 'one'), (2, 3, 'two'), (0, NULL, 'zero')
+   C INSERT 0 3
+   Z I
+>> Q INSERT INTO j2 VALUES (1, -1), (2, 2), (0, NULL), (5, -5)
+   C INSERT 0 4
+   Z I
+>> Q SELECT * FROM j1 AS t1 (a, b, c) ORDER BY a
+   T oids=[23, 23, 25] names=['a', 'b', 'c']
+   D ['0', None, 'zero']
+   D ['1', '4', 'one']
+   D ['2', '3', 'two']
+   C SELECT 3
+   Z I
+>> Q SELECT t1.a, c FROM j1 t1 (a, b, c) ORDER BY a
+   T oids=[23, 25] names=['a', 'c']
+   D ['0', 'zero']
+   D ['1', 'one']
+   D ['2', 'two']
+   C SELECT 3
+   Z I
+>> Q SELECT * FROM j1 t1 (a) ORDER BY a
+   T oids=[23, 23, 25] names=['a', 'j', 't']
+   D ['0', None, 'zero']
+   D ['1', '4', 'one']
+   D ['2', '3', 'two']
+   C SELECT 3
+   Z I
+>> Q SELECT * FROM j1 NATURAL JOIN j2 ORDER BY i
+   T oids=[23, 23, 25, 23] names=['i', 'j', 't', 'k']
+   D ['0', None, 'zero', None]
+   D ['1', '4', 'one', '-1']
+   D ['2', '3', 'two', '2']
+   C SELECT 3
+   Z I
+>> Q SELECT * FROM j1 JOIN j2 USING (i) ORDER BY i
+   T oids=[23, 23, 25, 23] names=['i', 'j', 't', 'k']
+   D ['0', None, 'zero', None]
+   D ['1', '4', 'one', '-1']
+   D ['2', '3', 'two', '2']
+   C SELECT 3
+   Z I
+>> Q SELECT * FROM j1 LEFT JOIN j2 USING (i) ORDER BY i
+   T oids=[23, 23, 25, 23] names=['i', 'j', 't', 'k']
+   D ['0', None, 'zero', None]
+   D ['1', '4', 'one', '-1']
+   D ['2', '3', 'two', '2']
+   C SELECT 3
+   Z I
+>> Q SELECT * FROM j2 RIGHT JOIN j1 USING (i) ORDER BY i
+   T oids=[23, 23, 23, 25] names=['i', 'k', 'j', 't']
+   D ['0', None, None, 'zero']
+   D ['1', '-1', '4', 'one']
+   D ['2', '2', '3', 'two']
+   C SELECT 3
+   Z I
+>> Q SELECT * FROM j1 t1 (a, b, c) NATURAL JOIN j2 t2 (a, d) ORDER BY a
+   T oids=[23, 23, 25, 23] names=['a', 'b', 'c', 'd']
+   D ['0', None, 'zero', None]
+   D ['1', '4', 'one', '-1']
+   D ['2', '3', 'two', '2']
+   C SELECT 3
+   Z I
+>> Q DROP TABLE j1, j2
+   C DROP TABLE
+   Z I

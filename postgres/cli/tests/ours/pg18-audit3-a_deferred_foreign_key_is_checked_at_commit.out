@@ -1,0 +1,64 @@
+>> Q DROP SCHEMA IF EXISTS s CASCADE; DROP SCHEMA public CASCADE; CREATE SCHEMA public
+   E S=ERROR C=0A000 M=schemas other than public are not supported by the branch server: its branches cover the one schema (CREATE SCHEMA and DROP SCHEMA are refused)
+   Z I
+>> Q CREATE TABLE dp(id INT PRIMARY KEY)
+   C CREATE TABLE
+   Z I
+>> Q CREATE TABLE dc1(id INT PRIMARY KEY, pid INT REFERENCES dp(id) DEFERRABLE INITIALLY DEFERRED)
+   C CREATE TABLE
+   Z I
+>> Q CREATE TABLE dc2(id INT PRIMARY KEY, pid INT, FOREIGN KEY (pid) REFERENCES dp(id) DEFERRABLE INITIALLY DEFERRED)
+   C CREATE TABLE
+   Z I
+>> Q BEGIN
+   C BEGIN
+   Z T
+>> Q INSERT INTO dc1 VALUES (1, 99)
+   C INSERT 0 1
+   Z T
+>> Q COMMIT
+   E S=ERROR C=23503 M=deferred foreign key constraint failed on commit
+   Z I
+>> Q SELECT count(*) FROM dc1
+   T oids=[20] names=['count']
+   D ['0']
+   C SELECT 1
+   Z I
+>> Q BEGIN
+   C BEGIN
+   Z T
+>> Q INSERT INTO dc1 VALUES (2, 7)
+   C INSERT 0 1
+   Z T
+>> Q INSERT INTO dp VALUES (7) ON CONFLICT DO NOTHING
+   C INSERT 0 1
+   Z T
+>> Q COMMIT
+   C COMMIT
+   Z I
+>> Q BEGIN
+   C BEGIN
+   Z T
+>> Q INSERT INTO dc2 VALUES (1, 99)
+   C INSERT 0 1
+   Z T
+>> Q COMMIT
+   E S=ERROR C=23503 M=deferred foreign key constraint failed on commit
+   Z I
+>> Q SELECT count(*) FROM dc2
+   T oids=[20] names=['count']
+   D ['0']
+   C SELECT 1
+   Z I
+>> Q BEGIN
+   C BEGIN
+   Z T
+>> Q INSERT INTO dc2 VALUES (2, 7)
+   C INSERT 0 1
+   Z T
+>> Q INSERT INTO dp VALUES (7) ON CONFLICT DO NOTHING
+   C INSERT 0 0
+   Z T
+>> Q COMMIT
+   C COMMIT
+   Z I

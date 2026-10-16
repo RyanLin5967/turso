@@ -1,0 +1,66 @@
+>> Q DROP SCHEMA IF EXISTS s CASCADE; DROP SCHEMA public CASCADE; CREATE SCHEMA public
+   E S=ERROR C=0A000 M=schemas other than public are not supported by the branch server: its branches cover the one schema (CREATE SCHEMA and DROP SCHEMA are refused)
+   Z I
+>> Q CREATE TABLE t(id INT PRIMARY KEY, c INT)
+   C CREATE TABLE
+   Z I
+>> Q CREATE TABLE p(name TEXT)
+   C CREATE TABLE
+   Z I
+>> Q CREATE SCHEMA s
+   E S=ERROR C=0A000 M=schemas other than public are not supported by the branch server: its branches cover the one schema (CREATE SCHEMA and DROP SCHEMA are refused)
+   Z I
+>> Q CREATE TABLE s.t(id INT PRIMARY KEY, c TEXT)
+   E S=ERROR C=XX000 M=no such database: s
+   Z I
+>> X 0 INSERT INTO s.t VALUES (1, $1) ||| 007
+   ParseComplete
+   BindComplete
+   E S=ERROR C=XX000 M=no such database: s
+   Z I
+>> Q SELECT c FROM s.t WHERE id = 1
+   E S=ERROR C=XX000 M=no such database: s
+   Z I
+>> Q INSERT INTO s.t VALUES (2, 'x') ON CONFLICT DO NOTHING
+   E S=ERROR C=XX000 M=no such database: s
+   Z I
+>> X 0 UPDATE s.t SET c = $1 WHERE id = 2 ||| 007
+   ParseComplete
+   BindComplete
+   E S=ERROR C=XX000 M=no such database: s
+   Z I
+>> Q SELECT c FROM s.t WHERE id = 2
+   E S=ERROR C=XX000 M=no such database: s
+   Z I
+>> X 0 INSERT INTO s.t VALUES (2, $1) ON CONFLICT (id) DO UPDATE SET c = excluded.c ||| 007
+   ParseComplete
+   BindComplete
+   E S=ERROR C=XX000 M=no such database: s
+   Z I
+>> Q SELECT c FROM s.t WHERE id = 2
+   E S=ERROR C=XX000 M=no such database: s
+   Z I
+>> Q SET search_path TO s, public
+   C SET
+   Z I
+>> X 0 INSERT INTO t VALUES (3, $1) ||| 007
+   ParseComplete
+   BindComplete
+   NoData
+   C INSERT 0 1
+   Z I
+>> Q SELECT c FROM s.t WHERE id = 3
+   E S=ERROR C=XX000 M=no such database: s
+   Z I
+>> Q SET search_path TO public
+   C SET
+   Z I
+>> D - WITH p AS (SELECT 1 AS name) DELETE FROM p WHERE name = $1
+   ParseComplete
+   t params=[25]
+   NoData
+   Z I
+>> D - SELECT 1 FROM t WHERE s.t.c = $1
+   ParseComplete
+   E S=ERROR C=42P01 M=Parse error: missing FROM-clause entry for table "t"
+   Z I

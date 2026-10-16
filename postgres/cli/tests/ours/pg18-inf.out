@@ -1,0 +1,3 @@
+>> Q SELECT 'Infinity'::float8, '-Infinity'::float8, 'NaN'::float8, 'Infinity'::float4, '-0'::float8
+   E S=ERROR C=0A000 M=Parse error: NaN is not supported: the engine holds no NaN
+   Z I

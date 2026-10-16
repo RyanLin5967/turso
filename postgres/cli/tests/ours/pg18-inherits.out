@@ -1,0 +1,22 @@
+>> Q DROP TABLE IF EXISTS ich, ipa
+   C DROP TABLE
+   Z I
+>> Q CREATE TABLE ipa (a int)
+   C CREATE TABLE
+   Z I
+>> Q CREATE TABLE ich (b text) INHERITS (ipa)
+   E S=ERROR C=0A000 M=Parse error: CREATE TABLE ... INHERITS and PARTITION OF are not supported
+   Z I
+>> Q INSERT INTO ich VALUES (1, 'x')
+   E S=ERROR C=42P01 M=Parse error: no such table: ich
+   Z I
+>> Q SELECT * FROM ich
+   E S=ERROR C=42P01 M=Parse error: no such table: ich
+   Z I
+>> Q SELECT * FROM ipa
+   T oids=[23] names=['a']
+   C SELECT 0
+   Z I
+>> Q DROP TABLE ich, ipa
+   E S=ERROR C=42P01 M=Parse error: no such table: ich
+   Z I

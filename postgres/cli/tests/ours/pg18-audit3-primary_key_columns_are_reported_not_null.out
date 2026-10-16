@@ -1,0 +1,39 @@
+>> Q DROP SCHEMA IF EXISTS s CASCADE; DROP SCHEMA public CASCADE; CREATE SCHEMA public
+   E S=ERROR C=0A000 M=schemas other than public are not supported by the branch server: its branches cover the one schema (CREATE SCHEMA and DROP SCHEMA are refused)
+   Z I
+>> Q CREATE TABLE pk1(id INT PRIMARY KEY, v INT, nn INT NOT NULL)
+   C CREATE TABLE
+   Z I
+>> Q CREATE TABLE pk2(a INT, b INT, v INT, PRIMARY KEY (a, b))
+   C CREATE TABLE
+   Z I
+>> Q CREATE TABLE pk3(id SERIAL PRIMARY KEY, v INT)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO pk2 VALUES (NULL, 1, 1)
+   E S=ERROR C=23502 M=NOT NULL constraint failed: pk2.a (19)
+   Z I
+>> Q SELECT table_name, column_name, is_nullable FROM information_schema.columns WHERE table_name IN ('pk1', 'pk2', 'pk3') ORDER BY table_name, ordinal_position
+   T oids=[25, 25, 25] names=['table_name', 'column_name', 'is_nullable']
+   D ['pk1', 'id', 'NO']
+   D ['pk1', 'v', 'YES']
+   D ['pk1', 'nn', 'NO']
+   D ['pk2', 'a', 'NO']
+   D ['pk2', 'b', 'NO']
+   D ['pk2', 'v', 'YES']
+   D ['pk3', 'id', 'NO']
+   D ['pk3', 'v', 'YES']
+   C SELECT 8
+   Z I
+>> Q SELECT c.relname, a.attname, a.attnotnull FROM pg_attribute a JOIN pg_class c ON a.attrelid = c.oid WHERE c.relname IN ('pk1', 'pk2', 'pk3') AND a.attnum > 0 ORDER BY c.relname, a.attnum
+   T oids=[25, 25, 23] names=['relname', 'attname', 'attnotnull']
+   D ['pk1', 'id', '1']
+   D ['pk1', 'v', '0']
+   D ['pk1', 'nn', '1']
+   D ['pk2', 'a', '1']
+   D ['pk2', 'b', '1']
+   D ['pk2', 'v', '0']
+   D ['pk3', 'id', '1']
+   D ['pk3', 'v', '0']
+   C SELECT 8
+   Z I

@@ -1,0 +1,56 @@
+>> Q DROP SCHEMA IF EXISTS s CASCADE; DROP SCHEMA public CASCADE; CREATE SCHEMA public
+   E S=ERROR C=0A000 M=schemas other than public are not supported by the branch server: its branches cover the one schema (CREATE SCHEMA and DROP SCHEMA are refused)
+   Z I
+>> Q CREATE TABLE t(id INT PRIMARY KEY, v TEXT)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO t VALUES (1, 'trunk')
+   C INSERT 0 1
+   Z I
+>> X 25 SELECT turso_branch_create($4294967297) ||| x
+   ParseComplete
+   BindComplete
+   E S=ERROR C=42601 M=Parse error: parameter number too large at or near "$4294967297"
+   Z I
+>> Q SELECT turso_branch_switch('x')
+   E S=ERROR C=3D000 M=branch "x" does not exist
+   Z I
+>> Q SELECT v FROM t WHERE id = $4294967297
+   E S=ERROR C=42601 M=Parse error: parameter number too large at or near "$4294967297"
+   Z I
+>> X 25 SELECT v FROM t WHERE id = $4294967297 ||| 1
+   ParseComplete
+   BindComplete
+   E S=ERROR C=42601 M=Parse error: parameter number too large at or near "$4294967297"
+   Z I
+>> Q SELECT 1
+   T oids=[23] names=['?column?']
+   D ['1']
+   C SELECT 1
+   Z I
+>> Q SELECT 1 LIMIT $2147483648
+   E S=ERROR C=42601 M=Parse error: parameter number too large at or near "$2147483648"
+   Z I
+>> X 25 SELECT 1 LIMIT $2147483648 ||| 1
+   ParseComplete
+   BindComplete
+   E S=ERROR C=42601 M=Parse error: parameter number too large at or near "$2147483648"
+   Z I
+>> Q SELECT 1
+   T oids=[23] names=['?column?']
+   D ['1']
+   C SELECT 1
+   Z I
+>> Q SELECT turso_branch_create($4295032831)
+   E S=ERROR C=42601 M=Parse error: parameter number too large at or near "$4295032831"
+   Z I
+>> X 25 SELECT turso_branch_create($4295032831) ||| 1
+   ParseComplete
+   BindComplete
+   E S=ERROR C=42601 M=Parse error: parameter number too large at or near "$4295032831"
+   Z I
+>> Q SELECT 1
+   T oids=[23] names=['?column?']
+   D ['1']
+   C SELECT 1
+   Z I

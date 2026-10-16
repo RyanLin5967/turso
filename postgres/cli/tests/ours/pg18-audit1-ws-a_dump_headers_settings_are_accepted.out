@@ -1,0 +1,64 @@
+>> Q DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public
+   C DROP SCHEMA
+   E S=ERROR C=42601 M=Parse error: schema "public" already exists
+   Z I
+>> Q SET statement_timeout = 0
+   C SET
+   Z I
+>> Q SET lock_timeout = 0
+   C SET
+   Z I
+>> Q SET idle_in_transaction_session_timeout = 0
+   C SET
+   Z I
+>> Q SET transaction_timeout = 0
+   C SET
+   Z I
+>> Q SET client_encoding = 'UTF8'
+   C SET
+   Z I
+>> Q SET standard_conforming_strings = on
+   C SET
+   Z I
+>> Q SET check_function_bodies = false
+   C SET
+   Z I
+>> Q SET xmloption = content
+   C SET
+   Z I
+>> Q SET client_min_messages = warning
+   C SET
+   Z I
+>> Q SET row_security = off
+   C SET
+   Z I
+>> Q SET default_tablespace = ''
+   C SET
+   Z I
+>> Q SET default_table_access_method = heap
+   C SET
+   Z I
+>> Q SET xmloption = document
+   E S=ERROR C=0A000 M=Parse error: SET xmloption = document is not supported: this server answers only by its own setting of it
+   Z I
+>> Q SET transaction_timeout = '5s'
+   E S=ERROR C=0A000 M=Parse error: SET transaction_timeout = 5s is not supported: this server enforces no such timeout; 0 is accepted
+   Z I
+>> Q SET default_tablespace = 'fast'
+   E S=ERROR C=0A000 M=Parse error: SET default_tablespace = fast is not supported: this server answers only by its own setting of it
+   Z I
+>> Q SET default_table_access_method = columnar
+   E S=ERROR C=0A000 M=Parse error: SET default_table_access_method = columnar is not supported: this server answers only by its own setting of it
+   Z I
+>> Q SET geqo_threshold = 12
+   E S=ERROR C=0A000 M=Parse error: SET geqo_threshold = 12 is not supported: this server does not act on it
+   Z I
+>> Q SHOW geqo_threshold
+   E S=ERROR C=0A000 M=Parse error: SHOW geqo_threshold is not supported: this server does not act on it
+   Z I
+>> Q SET no_such_parameter = 1
+   E S=ERROR C=42704 M=Parse error: unrecognized configuration parameter "no_such_parameter"
+   Z I
+>> Q SHOW no_such_parameter
+   E S=ERROR C=42704 M=Parse error: unrecognized configuration parameter "no_such_parameter"
+   Z I

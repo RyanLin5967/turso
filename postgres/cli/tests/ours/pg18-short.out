@@ -1,0 +1,29 @@
+>> Q DROP TABLE IF EXISTS s3
+   C DROP TABLE
+   Z I
+>> Q create table s3 (a int, b int, c text default 'd')
+   C CREATE TABLE
+   Z I
+>> Q insert into s3 values (1, 2)
+   C INSERT 0 1
+   Z I
+>> Q insert into s3 values (3)
+   C INSERT 0 1
+   Z I
+>> Q insert into s3 values (4, 5), (6, 7)
+   C INSERT 0 2
+   Z I
+>> Q insert into s3 values (1, 2, 'x', 9)
+   E S=ERROR C=42601 M=Parse error: INSERT has more expressions than target columns
+   Z I
+>> Q select * from s3 order by a
+   T oids=[23, 23, 25] names=['a', 'b', 'c']
+   D ['1', '2', 'd']
+   D ['3', None, 'd']
+   D ['4', '5', 'd']
+   D ['6', '7', 'd']
+   C SELECT 4
+   Z I
+>> Q DROP TABLE s3
+   C DROP TABLE
+   Z I

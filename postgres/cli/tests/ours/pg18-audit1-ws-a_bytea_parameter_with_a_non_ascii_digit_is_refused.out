@@ -1,0 +1,46 @@
+>> Q DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public
+   C DROP SCHEMA
+   E S=ERROR C=42601 M=Parse error: schema "public" already exists
+   Z I
+>> Q CREATE TABLE t(id INT PRIMARY KEY, v TEXT)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO t VALUES (1, 'trunk')
+   C INSERT 0 1
+   Z I
+>> Q CREATE TABLE ty(y BYTEA)
+   C CREATE TABLE
+   Z I
+>> X 17 INSERT INTO ty(y) VALUES ($1) ||| \x0é0
+   ParseComplete
+   BindComplete
+   NoData
+   E S=ERROR C=22023 M=invalid hexadecimal digit: "é"
+   Z I
+>> Q SELECT 1
+   T oids=[23] names=['?column?']
+   D ['1']
+   C SELECT 1
+   Z I
+>> X 17 INSERT INTO ty(y) VALUES ($1) ||| \x0😀0
+   ParseComplete
+   BindComplete
+   NoData
+   E S=ERROR C=22023 M=invalid hexadecimal digit: "😀"
+   Z I
+>> Q SELECT 1
+   T oids=[23] names=['?column?']
+   D ['1']
+   C SELECT 1
+   Z I
+>> X 17 INSERT INTO ty(y) VALUES ($1) ||| \x00ff
+   ParseComplete
+   BindComplete
+   NoData
+   C INSERT 0 1
+   Z I
+>> Q SELECT count(*) FROM ty
+   T oids=[20] names=['count']
+   D ['1']
+   C SELECT 1
+   Z I

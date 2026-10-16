@@ -1,0 +1,26 @@
+>> Q CREATE TABLE p(id INT PRIMARY KEY)
+   C CREATE TABLE
+   Z I
+>> Q CREATE TABLE c(id INT PRIMARY KEY, pid INT REFERENCES p(id) ON DELETE CASCADE)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO p VALUES (1)
+   C INSERT 0 1
+   Z I
+>> Q INSERT INTO c VALUES (10, 1)
+   C INSERT 0 1
+   Z I
+>> Q INSERT INTO c VALUES (11, 99)
+   E S=ERROR C=23503 M=FOREIGN KEY constraint failed
+   Z I
+>> Q INSERT INTO c VALUES (12, 98)
+   E S=ERROR C=23503 M=FOREIGN KEY constraint failed
+   Z I
+>> Q DELETE FROM p WHERE id = 1
+   C DELETE 1
+   Z I
+>> Q SELECT count(*) FROM c
+   T oids=[20] names=['count']
+   D ['0']
+   C SELECT 1
+   Z I

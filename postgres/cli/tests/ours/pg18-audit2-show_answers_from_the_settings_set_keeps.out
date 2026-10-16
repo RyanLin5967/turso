@@ -1,0 +1,63 @@
+>> Q SHOW search_path
+   T oids=[25] names=['search_path']
+   D ['"$user", public']
+   C SELECT 1
+   Z I
+>> Q SET search_path TO s, public
+   C SET
+   Z I
+>> Q SHOW search_path
+   T oids=[25] names=['search_path']
+   D ['s, public']
+   C SELECT 1
+   Z I
+>> Q SHOW client_encoding
+   T oids=[25] names=['client_encoding']
+   D ['UTF8']
+   C SELECT 1
+   Z I
+>> Q SHOW standard_conforming_strings
+   T oids=[25] names=['standard_conforming_strings']
+   D ['on']
+   C SELECT 1
+   Z I
+>> Q SHOW DateStyle
+   T oids=[25] names=['DateStyle']
+   D ['ISO, MDY']
+   C SELECT 1
+   Z I
+>> Q SHOW IntervalStyle
+   T oids=[25] names=['IntervalStyle']
+   D ['postgres']
+   C SELECT 1
+   Z I
+>> Q SHOW TimeZone
+   T oids=[25] names=['TimeZone']
+   D ['UTC']
+   C SELECT 1
+   Z I
+>> Q SHOW bytea_output
+   T oids=[25] names=['bytea_output']
+   D ['hex']
+   C SELECT 1
+   Z I
+>> Q SHOW transaction_read_only
+   T oids=[25] names=['transaction_read_only']
+   D ['off']
+   C SELECT 1
+   Z I
+>> Q SHOW "synchronous = off"
+   E S=ERROR C=42704 M=Parse error: unrecognized configuration parameter "synchronous = off"
+   Z I
+>> Q SHOW wal_checkpoint
+   E S=ERROR C=42704 M=Parse error: unrecognized configuration parameter "wal_checkpoint"
+   Z I
+>> Q SHOW journal_mode
+   E S=ERROR C=42704 M=Parse error: unrecognized configuration parameter "journal_mode"
+   Z I
+>> Q SHOW ALL
+   E S=ERROR C=0A000 M=Parse error: SHOW ALL is not supported
+   Z I
+>> Q SELECT name, boot_val, reset_val, source FROM pg_settings WHERE name IN ('DateStyle', 'TimeZone', 'IntervalStyle', 'client_encoding', 'search_path') ORDER BY name
+   E S=ERROR C=42601 M=Parse error: no such object: pg_settings
+   Z I

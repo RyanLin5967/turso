@@ -1,0 +1,17 @@
+>> Q SET client_encoding TO UTF8, LATIN1
+   E S=ERROR C=22023 M=SET client_encoding takes only one argument
+   Z I
+>> Q SET TimeZone TO UTC, GMT
+   E S=ERROR C=22023 M=SET timezone takes only one argument
+   Z I
+>> Q SET DateStyle TO ISO, DMY
+   E S=ERROR C=0A000 M=Parse error: SET datestyle = iso, dmy is not supported: this server answers only by its own setting of it
+   Z I
+>> Q SET DateStyle TO ISO, MDY
+   C SET
+   Z I
+>> Q SHOW DateStyle
+   T oids=[25] names=['DateStyle']
+   D ['ISO, MDY']
+   C SELECT 1
+   Z I

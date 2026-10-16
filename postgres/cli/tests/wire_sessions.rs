@@ -11931,6 +11931,84 @@ mod recorded {
             })
     }
 
+    fn answer_difference(
+        n: usize,
+        cmd: &Command,
+        got: &[String],
+        registered: Option<(&str, &[String])>,
+    ) -> Option<String> {
+        match (same(&cmd.want, got), registered) {
+            (false, None) => Some(format!(
+                "\n#{n} >> {}\n  PostgreSQL: {:?}\n  ours:       {:?}",
+                cmd.text, cmd.want, got
+            )),
+            (true, Some((why, _))) => Some(format!(
+                "\n#{n} >> {} now AGREES with PostgreSQL; remove its divergence ({why})",
+                cmd.text
+            )),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    mod register_tests {
+        use super::*;
+
+        fn arrres() -> (Command, Vec<String>) {
+            let pg = parse(include_str!("pg18/pg18-arrres.out"));
+            let ours = parse(include_str!("ours/pg18-arrres.out"));
+            (pg.into_iter().next().unwrap(), ours.into_iter().next().unwrap().want)
+        }
+
+        fn check(cmd: &Command, got: &[String], original: &[String]) -> Option<String> {
+            answer_difference(1, cmd, got, Some(("PGDIV-ARRAY-RESULT-BLOB value [wire]", original)))
+        }
+
+        #[test]
+        fn a_registered_answer_changed_to_xx000_is_refused() {
+            let (cmd, ours) = arrres();
+            let got = vec!["E S=ERROR C=XX000 M=recorded regression".into(), "Z I".into()];
+            assert!(check(&cmd, &got, &ours).is_some(), "a registered command changed into an error");
+        }
+
+        #[test]
+        fn a_registered_answer_changed_to_another_wrong_value_is_refused() {
+            let (cmd, ours) = arrres();
+            let mut got = ours.clone();
+            *got.iter_mut().find(|l| l.starts_with("D ")).unwrap() = "D ['{b,a}']".into();
+            assert!(check(&cmd, &got, &ours).is_some(), "a registered wrong answer changed");
+        }
+
+        #[test]
+        fn a_registered_cascade_count_change_is_refused() {
+            let pg = parse(include_str!("pg18/pg18-c33-engineerr.out"));
+            let ours = parse(include_str!("ours/pg18-c33-engineerr.out"));
+            let mut got = ours[16].want.clone();
+            *got.iter_mut().find(|l| l.starts_with("D ")).unwrap() = "D ['5']".into();
+            assert!(answer_difference(17, &pg[16], &got,
+                Some(("PGDIV-INT-RANGE cascade [engine]", &ours[16].want))).is_some(),
+                "a registered cascade count changed from 2 to 5");
+        }
+
+        #[test]
+        fn a_registered_answer_starting_to_agree_is_refused() {
+            let (cmd, ours) = arrres();
+            assert!(check(&cmd, &cmd.want, &ours).unwrap().contains("now AGREES"));
+        }
+
+        #[test]
+        fn an_unregistered_difference_is_refused() {
+            let (cmd, ours) = arrres();
+            assert!(answer_difference(1, &cmd, &ours, None).is_some());
+        }
+
+        #[test]
+        fn the_exact_registered_answer_still_passes() {
+            let (cmd, ours) = arrres();
+            assert!(check(&cmd, &ours, &ours).is_none());
+        }
+    }
+
     /// Replay `recording` on a fresh server and check that the commands answering otherwise than
     /// PostgreSQL are exactly `divergences` (ordinal from 1, reason and owner).
     pub(super) fn replay(name: &str, recording: &str, divergences: &[(usize, &str)]) {
@@ -11950,16 +12028,13 @@ mod recorded {
             if !agrees {
                 differing.push(n);
             }
-            match (agrees, registered) {
-                (false, None) => report.push_str(&format!(
-                    "\n#{n} >> {}\n  PostgreSQL: {:?}\n  ours:       {:?}",
-                    cmd.text, cmd.want, got
-                )),
-                (true, Some((_, why))) => report.push_str(&format!(
-                    "\n#{n} >> {} now AGREES with PostgreSQL; remove its divergence ({why})",
-                    cmd.text
-                )),
-                _ => {}
+            if let Some(problem) = answer_difference(
+                n,
+                cmd,
+                &got,
+                registered.map(|(_, why)| (*why, &[][..])),
+            ) {
+                report.push_str(&problem);
             }
         }
         for (k, why) in divergences {

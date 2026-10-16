@@ -1,0 +1,13 @@
+>> Q SELECT random() >= 0 AND random() < 1, pg_typeof(random())::text
+   E S=ERROR C=42883 M=Parse error: no such function: pg_typeof
+   Z I
+>> Q SELECT random()
+   T oids=[701] names=['random']
+   D ['0.89355282684584']
+   C SELECT 1
+   Z I
+>> Q SELECT (random()*3)::int BETWEEN 0 AND 3
+   T oids=[16] names=['?column?']
+   D ['t']
+   C SELECT 1
+   Z I

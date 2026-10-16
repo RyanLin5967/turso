@@ -1,0 +1,49 @@
+>> Q DROP TABLE IF EXISTS gt
+   C DROP TABLE
+   Z I
+>> Q CREATE TABLE gt (x int)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO gt VALUES (2), (3)
+   C INSERT 0 2
+   Z I
+>> Q select * from generate_series(1, 3) i, generate_series(i, 3) j order by 1, 2
+   T oids=[23, 23] names=['i', 'j']
+   D ['1', '1']
+   D ['1', '2']
+   D ['1', '3']
+   D ['2', '2']
+   D ['2', '3']
+   D ['3', '3']
+   C SELECT 6
+   Z I
+>> Q select * from gt, generate_series(1, gt.x) g order by 1, 2
+   T oids=[23, 23] names=['x', 'g']
+   D ['2', '1']
+   D ['2', '2']
+   D ['3', '1']
+   D ['3', '2']
+   D ['3', '3']
+   C SELECT 5
+   Z I
+>> Q select * from gt, generate_series(1, gt.x) g(n) order by 1, 2
+   T oids=[23, 23] names=['x', 'n']
+   D ['2', '1']
+   D ['2', '2']
+   D ['3', '1']
+   D ['3', '2']
+   D ['3', '3']
+   C SELECT 5
+   Z I
+>> Q select gt.*, g.* from gt, generate_series(1, gt.x) g order by 1, 2
+   T oids=[23, 23] names=['x', 'g']
+   D ['2', '1']
+   D ['2', '2']
+   D ['3', '1']
+   D ['3', '2']
+   D ['3', '3']
+   C SELECT 5
+   Z I
+>> Q DROP TABLE gt
+   C DROP TABLE
+   Z I

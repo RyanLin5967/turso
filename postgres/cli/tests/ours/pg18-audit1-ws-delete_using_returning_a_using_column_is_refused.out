@@ -1,0 +1,79 @@
+>> Q DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public
+   C DROP SCHEMA
+   E S=ERROR C=42601 M=Parse error: schema "public" already exists
+   Z I
+>> Q CREATE TABLE d(id INT PRIMARY KEY, v TEXT)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO d VALUES (1, 'a'), (2, 'b')
+   C INSERT 0 2
+   Z I
+>> Q CREATE TABLE k(id INT, flag BOOLEAN)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO k VALUES (2, true)
+   C INSERT 0 1
+   Z I
+>> Q DELETE FROM d USING k WHERE d.id = k.id RETURNING k.flag
+   E S=ERROR C=0A000 M=Parse error: DELETE ... USING with a RETURNING of `*` or of a USING relation's columns is not supported: return the target's columns
+   Z I
+>> Q SELECT count(*) FROM d
+   T oids=[20] names=['count']
+   D ['2']
+   C SELECT 1
+   Z I
+>> Q DELETE FROM d USING k AS j WHERE d.id = j.id RETURNING d.v, j.*
+   E S=ERROR C=0A000 M=Parse error: DELETE ... USING with a RETURNING of `*` or of a USING relation's columns is not supported: return the target's columns
+   Z I
+>> Q SELECT count(*) FROM d
+   T oids=[20] names=['count']
+   D ['2']
+   C SELECT 1
+   Z I
+>> Q DELETE FROM d USING k WHERE d.id = k.id RETURNING *
+   E S=ERROR C=0A000 M=Parse error: DELETE ... USING with a RETURNING of `*` or of a USING relation's columns is not supported: return the target's columns
+   Z I
+>> Q SELECT count(*) FROM d
+   T oids=[20] names=['count']
+   D ['2']
+   C SELECT 1
+   Z I
+>> Q DELETE FROM d USING k WHERE d.id = k.id RETURNING d.id, v
+   T oids=[23, 25] names=['id', 'v']
+   D ['2', 'b']
+   C DELETE 1
+   Z I
+>> Q DROP TABLE d; CREATE TABLE d(id INT PRIMARY KEY, v TEXT); INSERT INTO d VALUES (1, 'a'), (2, 'b')
+   C DROP TABLE
+   C CREATE TABLE
+   C INSERT 0 2
+   Z I
+>> Q BEGIN
+   C BEGIN
+   Z T
+>> Q DELETE FROM d USING k AS j WHERE d.id = j.id RETURNING d.v, j.*
+   E S=ERROR C=0A000 M=Parse error: DELETE ... USING with a RETURNING of `*` or of a USING relation's columns is not supported: return the target's columns
+   Z E
+>> Q ROLLBACK
+   C ROLLBACK
+   Z I
+>> Q BEGIN
+   C BEGIN
+   Z T
+>> Q DELETE FROM d USING k WHERE d.id = k.id RETURNING *
+   E S=ERROR C=0A000 M=Parse error: DELETE ... USING with a RETURNING of `*` or of a USING relation's columns is not supported: return the target's columns
+   Z E
+>> Q ROLLBACK
+   C ROLLBACK
+   Z I
+>> Q BEGIN
+   C BEGIN
+   Z T
+>> Q DELETE FROM d USING k WHERE d.id = k.id RETURNING d.id, v
+   T oids=[23, 25] names=['id', 'v']
+   D ['2', 'b']
+   C DELETE 1
+   Z T
+>> Q ROLLBACK
+   C ROLLBACK
+   Z I

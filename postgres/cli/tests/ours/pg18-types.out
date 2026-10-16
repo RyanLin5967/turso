@@ -1,0 +1,84 @@
+>> Q CREATE TABLE k(id INT, flag BOOLEAN, r REAL, d DOUBLE PRECISION)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO k VALUES (2, true, 1.5, 2.5)
+   C INSERT 0 1
+   Z I
+>> Q SELECT true, false
+   T oids=[16, 16] names=['?column?', '?column?']
+   D ['t', 'f']
+   C SELECT 1
+   Z I
+>> Q SELECT 1 = 1, 1 <> 1, 1 < 2, 2 >= 3
+   T oids=[16, 16, 16, 16] names=['?column?', '?column?', '?column?', '?column?']
+   D ['t', 'f', 't', 'f']
+   C SELECT 1
+   Z I
+>> Q SELECT EXISTS (SELECT 1), NOT EXISTS (SELECT 1)
+   T oids=[16, 16] names=['exists', '?column?']
+   D ['t', 'f']
+   C SELECT 1
+   Z I
+>> Q SELECT NOT true, true AND false, true OR false
+   T oids=[16, 16, 16] names=['?column?', '?column?', '?column?']
+   D ['f', 'f', 't']
+   C SELECT 1
+   Z I
+>> Q SELECT id > 1, flag, flag = true, id IS NULL, id IS NOT NULL FROM k
+   T oids=[16, 16, 16, 16, 16] names=['?column?', 'flag', '?column?', '?column?', '?column?']
+   D ['t', 't', 't', 'f', 't']
+   C SELECT 1
+   Z I
+>> Q SELECT id IN (1, 2), id BETWEEN 1 AND 3, 'a' LIKE 'a%' FROM k
+   T oids=[16, 16, 16] names=['?column?', '?column?', '?column?']
+   D ['t', 't', 't']
+   C SELECT 1
+   Z I
+>> Q SELECT CASE WHEN id > 1 THEN true ELSE false END FROM k
+   T oids=[16] names=['case']
+   D ['t']
+   C SELECT 1
+   Z I
+>> Q SELECT r, d, r::float8, d::float4, 1.5::float4, 1.5::real, 2.5::float8 FROM k
+   T oids=[700, 701, 701, 700, 700, 700, 701] names=['r', 'd', 'r', 'd', 'float4', 'float4', 'float8']
+   D ['1.5', '2.5', '1.5', '2.5', '1.5', '1.5', '2.5']
+   C SELECT 1
+   Z I
+>> X 700 SELECT $1::float4 ||| 3.4028235e+38
+   ParseComplete
+   BindComplete
+   T oids=[700] names=['float4']
+   D ['3.4028235e+38']
+   C SELECT 1
+   Z I
+>> X 700 SELECT $1 ||| 1.5
+   ParseComplete
+   BindComplete
+   T oids=[700] names=['?column?']
+   D ['1.5']
+   C SELECT 1
+   Z I
+>> X 16 SELECT $1 ||| t
+   ParseComplete
+   BindComplete
+   T oids=[16] names=['?column?']
+   D ['t']
+   C SELECT 1
+   Z I
+>> X 16 SELECT $1::bool ||| true
+   ParseComplete
+   BindComplete
+   T oids=[16] names=['bool']
+   D ['t']
+   C SELECT 1
+   Z I
+>> D - SELECT id > $1 FROM k
+   ParseComplete
+   t params=[23]
+   T oids=[16] names=['?column?']
+   Z I
+>> D - SELECT flag FROM k WHERE id = $1
+   ParseComplete
+   t params=[23]
+   T oids=[16] names=['flag']
+   Z I

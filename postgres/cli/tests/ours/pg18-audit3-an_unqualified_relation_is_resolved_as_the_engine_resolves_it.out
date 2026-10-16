@@ -1,0 +1,77 @@
+>> Q DROP SCHEMA IF EXISTS s CASCADE; DROP SCHEMA public CASCADE; CREATE SCHEMA public
+   E S=ERROR C=0A000 M=schemas other than public are not supported by the branch server: its branches cover the one schema (CREATE SCHEMA and DROP SCHEMA are refused)
+   Z I
+>> Q CREATE TABLE orders(id INT PRIMARY KEY)
+   C CREATE TABLE
+   Z I
+>> Q CREATE TABLE t(id INT PRIMARY KEY, c INT)
+   C CREATE TABLE
+   Z I
+>> Q CREATE SCHEMA s
+   E S=ERROR C=0A000 M=schemas other than public are not supported by the branch server: its branches cover the one schema (CREATE SCHEMA and DROP SCHEMA are refused)
+   Z I
+>> Q CREATE TABLE s.u(id INT PRIMARY KEY, n INT)
+   E S=ERROR C=XX000 M=no such database: s
+   Z I
+>> D - UPDATE u SET n = $1
+   ParseComplete
+   E S=ERROR C=42P01 M=Parse error: no such table: u
+   Z I
+>> P s1 INSERT INTO t VALUES ($1, 7)
+>> B - s1 ||| 3
+>> E - 0
+>> S
+   ParseComplete
+   BindComplete
+   C INSERT 0 1
+   Z I
+>> Q SET search_path TO "$user", public
+   C SET
+   Z I
+>> D - SELECT 1 FROM orders WHERE id = $1
+   ParseComplete
+   t params=[23]
+   T oids=[23] names=['?column?']
+   Z I
+>> B - s1 ||| 25
+>> E - 0
+>> S
+   BindComplete
+   C INSERT 0 1
+   Z I
+>> Q SET search_path TO nosuch, public
+   C SET
+   Z I
+>> D - SELECT 1 FROM orders WHERE id = $1
+   ParseComplete
+   t params=[23]
+   T oids=[23] names=['?column?']
+   Z I
+>> B - s1 ||| 24
+>> E - 0
+>> S
+   BindComplete
+   C INSERT 0 1
+   Z I
+>> Q SET search_path TO s, public
+   C SET
+   Z I
+>> D - SELECT 1 FROM orders WHERE id = $1
+   ParseComplete
+   t params=[23]
+   T oids=[23] names=['?column?']
+   Z I
+>> B - s1 ||| 19
+>> E - 0
+>> S
+   BindComplete
+   C INSERT 0 1
+   Z I
+>> Q SET search_path TO public
+   C SET
+   Z I
+>> Q SELECT count(*) FROM t WHERE c = 7
+   T oids=[20] names=['count']
+   D ['4']
+   C SELECT 1
+   Z I

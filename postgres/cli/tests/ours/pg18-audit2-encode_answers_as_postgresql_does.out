@@ -1,0 +1,18 @@
+>> Q SELECT encode('abc', 'hex')
+   T oids=[25] names=['encode']
+   D ['616263']
+   C SELECT 1
+   Z I
+>> Q SELECT encode('ab', 'base64')
+   T oids=[25] names=['encode']
+   D ['YWI=']
+   C SELECT 1
+   Z I
+>> Q SELECT encode(NULL, 'hex')
+   T oids=[25] names=['encode']
+   D [None]
+   C SELECT 1
+   Z I
+>> Q SELECT encode('abc', 'nosuch')
+   E S=ERROR C=22023 M=unrecognized encoding: "nosuch"
+   Z I
