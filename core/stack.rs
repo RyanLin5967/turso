@@ -233,8 +233,15 @@ mod tests {
 mod fastest_wire_shim {
     pub(super) use turso_stack_guard::{margin, remaining_stack, STACK_MARGIN};
 
-    /// fastest-wire's LEVEL_COST (db2fad5cf core/stack.rs), the level-gap test's bound.
-    pub(super) const LEVEL_COST: usize = 128 << 10;
+    /// fastest-wire's LEVEL_COST (db2fad5cf core/stack.rs), the level-gap test's bound, or the
+    /// crate's where that is tighter (release: 32 KiB), so the copy is never looser than the
+    /// engine's own (integrate-reviewer-2 L8). Measured worst gap, debug, at 1fcb709ff: 121,504 B
+    /// (wire's doc above says 73,584 B, measured before the engine's added checks).
+    pub(super) const LEVEL_COST: usize = if (128 << 10) < turso_stack_guard::LEVEL_COST {
+        128 << 10
+    } else {
+        turso_stack_guard::LEVEL_COST
+    };
 
     pub(super) struct StackBounds;
     impl StackBounds {
@@ -304,7 +311,7 @@ mod fastest_wire_tests {
                 let size = STACK_BOUNDS.with(|b| b.map(|(_, size)| size));
                 assert!(
                     size.is_some_and(|size| size < STACK_MARGIN),
-                    "premise: a known stack under 512 KiB, got {size:?}"
+                    "premise: a known stack under STACK_MARGIN ({STACK_MARGIN} B), got {size:?}"
                 );
                 let outer = NestGuard::enter("outermost");
                 assert!(
