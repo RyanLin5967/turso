@@ -19,8 +19,9 @@
 //!
 //! BLIND SPOTS, stated: (1) a recursion cycle with no `NestGuard` on it is not guarded; the class
 //! tests (core and postgres/frontend `stack_guard_tests`) find only the shapes they run. (2) Where
-//! the platform cannot report the stack (no pthread answer and no `stacker` answer), every nested
-//! step is refused and the outermost one runs unchecked. (3) A thread whose whole stack is under
+//! the platform cannot report the stack (no pthread answer and no `stacker` answer: wasm), the stack
+//! is taken as [`UNKNOWN_STACK`] below the highest point a step or a statement was entered at on the
+//! thread; frames above that point are not counted, and a thread smaller than that overflows. (3) A thread whose whole stack is under
 //! one outermost statement's need overflows before any check (a 64 KiB thread died opening a
 //! database, measured). (4) The margins were sized in debug builds, whose frames are the largest.
 //! (5) [`with_stack`] sizes a segment from a bound its caller states; a wrong bound is an overflow
@@ -53,6 +54,11 @@ pub const LEVEL_COST: usize = 192 << 10;
 #[cfg(not(debug_assertions))]
 pub const LEVEL_COST: usize = 32 << 10;
 
+/// The thread stack assumed where the platform does not report it (wasm): half of the 1 MiB that
+/// Rust's wasm targets give the main stack by default (unverified here), the other half left for
+/// the frames above the first step this crate sees.
+pub const UNKNOWN_STACK: usize = 512 << 10;
+
 /// PostgreSQL's message for 54001, without its hint about `max_stack_depth`.
 pub const MESSAGE: &str = "stack depth limit exceeded";
 
@@ -68,6 +74,13 @@ std::thread_local! {
     static DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Statements stepping on this thread ([`Executing`]).
     static EXECUTING: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Where the platform does not report the stack, the highest stack address a step or a
+    /// statement was entered at on this thread, taken as the top of its stack.
+    static HIGHEST_SEEN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+std::thread_local! {
     /// Test hook: this thread's stack taken as unknown, as on a platform with no answer.
     static FORCE_UNKNOWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -84,7 +97,7 @@ fn stack_bounds() -> Option<(usize, usize)> {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn stack_bounds() -> Option<(usize, usize)> {
     let mut attr = std::mem::MaybeUninit::<libc::pthread_attr_t>::uninit();
     // SAFETY: getattr initializes `attr` on success, which getstack then reads and destroy frees.
@@ -100,23 +113,42 @@ fn stack_bounds() -> Option<(usize, usize)> {
     }
 }
 
-#[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
+#[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
 fn stack_bounds() -> Option<(usize, usize)> {
     None
 }
 
-/// The bytes of stack left on this thread below the caller, where the platform says (the pthread
-/// answer, then `stacker`'s).
+/// The bytes of stack left on this thread below the caller: the pthread answer, then `stacker`'s,
+/// and where neither says, an estimate from [`UNKNOWN_STACK`].
 #[inline]
-pub fn remaining_stack() -> Option<usize> {
-    if FORCE_UNKNOWN.with(|u| u.get()) {
-        return None;
-    }
+pub fn remaining_stack() -> usize {
     let here = 0u8;
     let sp = std::ptr::addr_of!(here) as usize;
-    STACK_BOUNDS
-        .with(|b| b.and_then(|(bottom, _)| sp.checked_sub(bottom)))
-        .or_else(stacker::remaining_stack)
+    if !forced_unknown() {
+        let reported = STACK_BOUNDS
+            .with(|b| b.and_then(|(bottom, _)| sp.checked_sub(bottom)))
+            .or_else(stacker::remaining_stack);
+        if let Some(left) = reported {
+            return left;
+        }
+    }
+    let top = HIGHEST_SEEN.with(|h| {
+        let top = h.get().max(sp);
+        h.set(top);
+        top
+    });
+    UNKNOWN_STACK.saturating_sub(top - sp)
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+fn forced_unknown() -> bool {
+    FORCE_UNKNOWN.with(|u| u.get())
+}
+
+#[cfg(not(any(test, feature = "test-hooks")))]
+#[inline(always)]
+fn forced_unknown() -> bool {
+    false
 }
 
 /// This thread's whole stack, where the platform says.
@@ -125,30 +157,29 @@ pub fn stack_size() -> Option<usize> {
 }
 
 /// The stack a checked step must find left on this thread: [`STACK_MARGIN`], or a quarter of a
-/// smaller thread's whole stack, never less than [`LEVEL_COST`].
+/// smaller thread's whole stack ([`UNKNOWN_STACK`] where the platform does not say), never less
+/// than [`LEVEL_COST`].
 pub fn margin() -> usize {
-    stack_size().map_or(STACK_MARGIN, |size| STACK_MARGIN.min(size / 4).max(LEVEL_COST))
+    let size = if forced_unknown() { None } else { stack_size() };
+    STACK_MARGIN.min(size.unwrap_or(UNKNOWN_STACK) / 4).max(LEVEL_COST)
 }
 
 /// One recursive step (an expression or a SELECT parsed, a view expanded, a subquery planned,
 /// optimized or emitted) in progress: entered only with [`margin`] of stack left, except a
-/// statement's outermost step on a thread where no statement is stepping. Where the stack is
-/// unknown, every checked step but that one is refused. Leaving it, on every exit, pops it.
+/// statement's outermost step on a thread where no statement is stepping. Leaving it, on every
+/// exit, pops it.
 pub struct NestGuard(());
 
 impl NestGuard {
     #[inline]
-    #[track_caller]
+    #[cfg_attr(any(test, feature = "test-hooks"), track_caller)]
     pub fn enter() -> Result<Self, StackDepthExceeded> {
         let depth = DEPTH.with(|d| d.get());
         let checked = depth > 0 || EXECUTING.with(|e| e.get()) > 0;
-        let refuse = match remaining_stack() {
-            Some(left) => checked && left < margin(),
-            None => checked,
-        };
-        if refuse {
+        if checked && remaining_stack() < margin() {
             return Err(StackDepthExceeded);
         }
+        #[cfg(any(test, feature = "test-hooks"))]
         test_hooks::record(depth, std::panic::Location::caller());
         DEPTH.with(|d| d.set(depth + 1));
         Ok(Self(()))
@@ -169,6 +200,8 @@ pub struct Executing(());
 impl Executing {
     #[inline]
     pub fn enter() -> Self {
+        // Where the platform does not report the stack, the estimate counts from here too.
+        remaining_stack();
         EXECUTING.with(|e| e.set(e.get() + 1));
         Self(())
     }
@@ -189,9 +222,10 @@ pub fn with_stack<R>(needs: usize, f: impl FnOnce() -> R) -> R {
     stacker::maybe_grow(needs, needs, f)
 }
 
-/// Test hooks, compiled in every build (each is a thread-local read when unarmed): the levels a
-/// statement's checks were apart, the outermost steps re-entered inside a step, and the stack
-/// taken as unknown. Core's and the frontends' tests read them; nothing else does.
+/// Test hooks, compiled only into this crate's tests and with the `test-hooks` feature (core's
+/// dev-dependency): the levels a statement's checks were apart, the outermost steps re-entered
+/// inside a step, and the stack taken as unknown.
+#[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
 pub mod test_hooks {
     std::thread_local! {
@@ -220,7 +254,7 @@ pub mod test_hooks {
         ARMED.with(|a| a.set(on));
     }
 
-    /// This thread's stack taken as unknown (`remaining_stack` answers `None`).
+    /// This thread's stack taken as unknown (`remaining_stack` estimates from `UNKNOWN_STACK`).
     pub fn force_unknown(on: bool) {
         super::FORCE_UNKNOWN.with(|u| u.set(on));
     }
@@ -248,9 +282,7 @@ pub mod test_hooks {
         if !ARMED.with(|a| a.get()) {
             return;
         }
-        let Some(left) = super::remaining_stack() else {
-            return;
-        };
+        let left = super::remaining_stack();
         LEFT_AT.with(|at| {
             let mut at = at.borrow_mut();
             at.truncate(depth);
@@ -341,7 +373,7 @@ mod tests {
         }
         #[inline(never)]
         fn descend_to(left: usize) -> bool {
-            if remaining_stack().unwrap() > left {
+            if remaining_stack() > left {
                 let mut frame = [0u8; 1 << 10];
                 std::hint::black_box(&mut frame);
                 return descend_to(left);
@@ -375,7 +407,7 @@ mod tests {
     fn a_step_reentered_while_a_statement_steps_is_checked_from_its_first_step() {
         #[inline(never)]
         fn at(left: usize, executing: bool) -> bool {
-            if remaining_stack().unwrap() > left {
+            if remaining_stack() > left {
                 let mut frame = [0u8; 1 << 10];
                 std::hint::black_box(&mut frame);
                 return at(left, executing);
@@ -395,15 +427,28 @@ mod tests {
             .unwrap();
     }
 
-    /// Where the stack is unknown, the outermost step runs and every nested one is refused.
+    /// Where the platform does not report the stack (wasm), nested steps run (a refusal of every
+    /// one refused `SELECT 1` there, ultrareview of ultra-engine), and recursion that never stops
+    /// on its own still ends in the refusal, within UNKNOWN_STACK of where it began: on a 2 MiB
+    /// thread, so overflowing the estimate would not yet overflow the thread.
     #[test]
-    fn an_unknown_stack_refuses_every_nested_step() {
-        test_hooks::force_unknown(true);
-        let outer = NestGuard::enter();
-        let inner = NestGuard::enter().is_ok();
-        test_hooks::force_unknown(false);
-        assert!(outer.is_ok(), "the outermost step was refused on an unknown stack");
-        assert!(!inner, "a nested step was admitted on an unknown stack");
+    fn an_unknown_stack_admits_nested_steps_and_refuses_within_the_assumed_stack() {
+        std::thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn(|| {
+                test_hooks::force_unknown(true);
+                let outer = NestGuard::enter();
+                assert!(outer.is_ok(), "the outermost step was refused on an unknown stack");
+                assert!(NestGuard::enter().is_ok(), "a nested step was refused on an unknown stack");
+                let levels = nest_until_refused(1);
+                test_hooks::force_unknown(false);
+                let most = UNKNOWN_STACK / (16 << 10);
+                assert!(levels >= 2, "only {levels} levels on an unknown stack");
+                assert!(levels <= most, "{levels} levels of 16 KiB on an unknown stack, past the {most} that UNKNOWN_STACK holds");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     /// On an 8 MiB thread the margin is the full STACK_MARGIN.

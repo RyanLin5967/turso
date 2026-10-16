@@ -202,7 +202,8 @@ fn diag_schema_reparse_stack_cost() {
     // The bottom of this thread's stack and its current depth.
     #[inline(never)]
     fn bounds() -> (usize, usize) {
-        let left = turso_stack_guard::remaining_stack().expect("a known stack");
+        assert!(turso_stack_guard::stack_size().is_some(), "premise: a stack the platform reports");
+        let left = turso_stack_guard::remaining_stack();
         let here = 0u8;
         let sp = std::ptr::addr_of!(here) as usize;
         (sp - left, sp)
