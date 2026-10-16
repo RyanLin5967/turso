@@ -15,6 +15,9 @@
             claims, so nothing is counted after the claim that ended the warm-up; review 5 LOW 15).
   driver_contract.py tie SUMMARY.json WARMUP-LIVE.json          the live warm-up record is that run's own warm-up
                                                                 (tie()); exit 0 kept, 1 broken, 2 unreadable
+  driver_contract.py fixture SUMMARY.json ROWS AGE LIVE        the driver's own record of the gen_seed parent it built
+                                                               (--seed-sql/--age-sql/--live) says what was asked, as
+                                                               measured; exit 0 iff it does
   driver_contract.py self-test                                  the checker on synthetic records; exit 0 iff all pass
 
 The fastest-gates release job runs the built driver with rules whose outcome is forced (1000000:0:2 must run to
@@ -90,6 +93,25 @@ def check(j, t, c, rule, by_client=None):
         bad.append(f"warmup.t0_after_ready_ns {rd!r}: the warm-up's start must follow the last client's ready (an int "
                    ">= 0 ns), so no connect or setup counts as warm-up")
     return bad + stamp_problems(j)
+
+
+def fixture_problems(j, rows, age, live):
+    """fastest_profile's own record of the gen_seed parent it built (--seed-sql/--age-sql/--live; the owed ours fixture
+    record): the parent and aging streams' line counts as gen_seed writes them for (ROWS, AGE), the trunk's rows, and
+    the prebranch with its MEASURED live count. A missing record or a count that is not an int is a refusal."""
+    fx = j.get("fixture") if isinstance(j, dict) else None
+    if not isinstance(fx, dict):
+        return ["no fixture record (the driver ran without --seed-sql/--age-sql)"]
+    keys = ("seed_lines", "age_lines", "prebranch", "live_branches", "trunk_count", "trunk_sum")
+    bad = [f"fixture {k} {fx.get(k)!r} is not an integer" for k in keys if type(fx.get(k)) is not int]
+    if bad:
+        return bad
+    want = {"seed_lines": 1 + -(-rows // 1000), "age_lines": age, "prebranch": live, "live_branches": live,
+            "trunk_count": rows}
+    bad += [f"fixture {k} {fx[k]}, asked {v}" for k, v in want.items() if fx[k] != v]
+    if j.get("rows") != rows:
+        bad.append(f"rows {j.get('rows')!r}, asked {rows}")
+    return bad
 
 
 def tie(j, live):
@@ -336,6 +358,28 @@ def self_test():
         ("tie: a live rule other than the summary's fails", tie(rec(), LIVE | {"rule": "10:0:30"}) != []),
         ("tie: no live record (None) fails", tie(rec(), None) != []),
     ]
+    # the owed ours fixture record (2026-10-16): under --seed-sql/--age-sql/--live the driver's own record of the
+    # parent it built must say what was asked, as measured: gen_seed's stream lines (1 + ceil(R/1000) parent lines, K
+    # aging lines), the trunk's count, and the live branches it MEASURED after the prebranch
+    FX = {"seed_lines": 11, "age_lines": 200, "prebranch": 20, "live_branches": 20, "trunk_count": 10000,
+          "trunk_sum": 5}
+    fj = {"rows": 10000, "fixture": FX}
+    cases += [
+        ("fixture: the asked parent, as measured, passes", fixture_problems(fj, 10000, 200, 20) == []),
+        ("fixture: no fixture record fails", fixture_problems({"rows": 10000}, 10000, 200, 20) != []),
+        ("fixture: 19 live branches measured for a prebranch of 20 fails",
+         fixture_problems(fj | {"fixture": FX | {"live_branches": 19}}, 10000, 200, 20) != []),
+        ("fixture: a prebranch other than the asked live fails", fixture_problems(fj, 10000, 200, 10) != []),
+        ("fixture: a trunk of 9999 rows for --rows 10000 fails",
+         fixture_problems(fj | {"fixture": FX | {"trunk_count": 9999}}, 10000, 200, 20) != []),
+        ("fixture: 199 aging lines for an age of 200 fails",
+         fixture_problems(fj | {"fixture": FX | {"age_lines": 199}}, 10000, 200, 20) != []),
+        ("fixture: 10 parent lines for 10000 rows (gen_seed writes 11: the schema and 10 batches) fails",
+         fixture_problems(fj | {"fixture": FX | {"seed_lines": 10}}, 10000, 200, 20) != []),
+        ("fixture: the summary's rows other than asked fails", fixture_problems(fj | {"rows": 1000}, 10000, 200, 20) != []),
+        ("fixture: a count that is not an int fails",
+         fixture_problems(fj | {"fixture": FX | {"trunk_count": "10000"}}, 10000, 200, 20) != []),
+    ]
     bad = [n for n, ok in cases if not ok]
     for n, ok in cases:
         print(f"DRIVER-CONTRACT self-test {'PASS' if ok else 'FAIL'}: {n}")
@@ -356,6 +400,17 @@ def main(a):
         for b in bad:
             print(f"driver contract tie: {a[3]}: {b}")
         print(f"driver contract tie: {a[3]}: {'ok' if not bad else 'BROKEN'}")
+        return 0 if not bad else 1
+    if a[1:2] == ["fixture"] and len(a) == 6:
+        try:
+            j = json.load(open(a[2]))
+        except (OSError, ValueError) as e:
+            print(f"driver contract fixture: REFUSED: {type(e).__name__}: {e}")
+            return 2
+        bad = fixture_problems(j, int(a[3]), int(a[4]), int(a[5]))
+        for b in bad:
+            print(f"driver contract fixture: {a[2]}: {b}")
+        print(f"driver contract fixture: {a[2]}: {'ok' if not bad else 'BROKEN'}")
         return 0 if not bad else 1
     if a[1:2] == ["check"] and len(a) in (6, 7):
         j = json.load(open(a[2]))

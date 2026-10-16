@@ -34,6 +34,21 @@ arm k3 0 "$BIN" --dir "$d/k3" --class full --clients 4 --ops-total 33 --warmup 1
 arm k3-check 0 python3 -B "$C" check "$OUT/contract-k3/summary.json" 33 4 10:1:30 9,8,8,8
 arm k3-live 0 python3 -B "$W" live "$BIN" "$OUT/contract-k3/warmup-live.json"
 arm k3-tie 0 python3 -B "$C" tie "$OUT/contract-k3/summary.json" "$OUT/contract-k3/warmup-live.json"
+# the ONE gen_seed parent (the owed ours fixture record, 2026-10-16): the driver built on comp's gen_seed streams for
+# (2000 rows, 50 aging updates) with 3 live branches; its own record checked against what was asked, and its dump of
+# the trunk read back equal to gen_seed's facts() (ours_readback.py, the read-back fixture.py write compares)
+G=$HERE/../competitors/gen_seed.py
+rm -rf "$OUT/contract-fx"
+python3 -B "$G" sql --rows 2000 > "$d/fx-seed.sql" && python3 -B "$G" age --rows 2000 --updates 50 > "$d/fx-age.sql"
+arm fx 0 "$BIN" --dir "$d/fx" --class full --clients 2 --ops-total 20 --warmup 2 --rows 2000 --seed-sql "$d/fx-seed.sql" \
+  --age-sql "$d/fx-age.sql" --live 3 --dump-trunk "$d/fx-trunk.tsv" --out "$OUT/contract-fx"
+arm fx-check 0 python3 -B "$C" fixture "$OUT/contract-fx/summary.json" 2000 50 3
+arm fx-readback 0 python3 -B -c 'import subprocess, sys
+sys.path.insert(0, sys.argv[1]); import gen_seed
+f = gen_seed.facts(2000, 50, 1)
+got = subprocess.run([sys.executable, "-B", sys.argv[2], sys.argv[3]], capture_output=True, text=True).stdout.strip()
+want = "%d|%d|%d" % (f["count"], f["sum"], f["row_hash"])
+print("readback", got, "generator", want); sys.exit(got != want)' "$HERE/../competitors" "$HERE/../t3/ours_readback.py" "$d/fx-trunk.tsv"
 refuse() { local rc=0; "$BIN" --dir "$d/r$1" "${@:2}" > "$OUT/contract-refuse-$1.txt" 2>&1 || rc=$?
   [ $rc -eq 1 ] && grep -q '^NOT A RESULT' "$OUT/contract-refuse-$1.txt" ||
     { echo "refusal $1 (${*:2}): rc=$rc"; cat "$OUT/contract-refuse-$1.txt"; FAILED="$FAILED refuse-$1"; }; }
