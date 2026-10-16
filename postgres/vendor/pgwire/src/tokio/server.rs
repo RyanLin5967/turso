@@ -348,6 +348,22 @@ fn repeated_negotiation(code: &str) -> PgWireBackendMessage {
     )
 }
 
+/// PostgreSQL's answer to bytes the client sent after a negotiation request and before reading its
+/// answer (ProcessStartupPacket checks pq_buffer_remaining_data after the 'N'): FATAL 08P01, so
+/// nothing sent before the encryption answer is read as the session's (vendored change 11).
+/// Recorded for SSL on PostgreSQL 18.6 (artie pg18-diff/pg18-ssl3.out); the GSS text is from
+/// PostgreSQL's source (a GSSAPI-enabled build answers 'G', so it could not be recorded).
+fn unencrypted_after(request: &str) -> PgWireBackendMessage {
+    PgWireBackendMessage::ErrorResponse(
+        ErrorInfo::new(
+            "FATAL".to_string(),
+            "08P01".to_string(),
+            format!("received unencrypted data after {request}"),
+        )
+        .into(),
+    )
+}
+
 async fn check_ssl_direct_negotiation(tcp_socket: &TcpStream) -> Result<bool, io::Error> {
     let mut buf = [0u8; 1];
     let n = tcp_socket.peek(&mut buf).await?;
@@ -389,6 +405,10 @@ where
                         socket
                             .send(PgWireBackendMessage::SslResponse(SslResponse::Refuse))
                             .await?;
+                        if !socket.read_buffer().is_empty() {
+                            socket.send(unencrypted_after("SSL request")).await?;
+                            return Ok(SslNegotiationType::Repeated);
+                        }
                         ssl_done = true;
 
                         if gss_done {
@@ -411,6 +431,10 @@ where
                     socket
                         .send(PgWireBackendMessage::GssEncResponse(GssEncResponse::Refuse))
                         .await?;
+                    if !socket.read_buffer().is_empty() {
+                        socket.send(unencrypted_after("GSSAPI encryption request")).await?;
+                        return Ok(SslNegotiationType::Repeated);
+                    }
                     gss_done = true;
 
                     if ssl_done {

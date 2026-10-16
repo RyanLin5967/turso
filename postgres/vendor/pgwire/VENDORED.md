@@ -87,3 +87,9 @@ Every change from the crate is listed here, newest last; `diff -r` against the c
     FATAL 0A000 "unsupported frontend protocol 1234.5679 (or 1234.5680): server supports 3.0 to 3.2",
     as PostgreSQL 18.6 does (recorded for SSL: artie pg18-diff/pg18-ssl2.out), and the connection
     ends. It answered every repeat with 'N'.
+11. `tokio/server.rs` (wire-rev-h1c33 LOW): after refusing an SSLRequest or GSSENCRequest,
+    `peek_for_sslrequest` refuses any byte the client already sent (pipelined before reading the
+    answer) with FATAL 08P01 "received unencrypted data after SSL request" (GSS: "after GSSAPI
+    encryption request"), as PostgreSQL 18.6 does (recorded for SSL: artie pg18-diff/pg18-ssl3.out),
+    and the connection ends. A pipelined second SSLRequest got 0A000, and a pipelined
+    StartupMessage was served.
