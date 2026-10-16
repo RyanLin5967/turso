@@ -394,13 +394,14 @@ mod fastest_wire_tests {
             .spawn(|| {
                 let size = STACK_BOUNDS.with(|b| b.map(|(_, size)| size)).unwrap();
                 let short = (size / 4 + LEVEL) / 2;
-                let enough = margin() + FRAME + (8 << 10);
+                let enough = LEVEL + FRAME + (8 << 10);
                 assert!(FRAME > LEVEL, "premise: one synthetic level ({FRAME} B) exceeds LEVEL_COST ({LEVEL} B)");
+                // From the constants alone, not from the margin under test: a guard that lost its
+                // floor admits the step below and overflows on one level (that is the red).
                 assert!(
-                    size / 4 < short && short < margin() && margin() == LEVEL,
-                    "premise: the floor decides: quarter {} < {short} B left < margin {} = LEVEL_COST {LEVEL}",
-                    size / 4,
-                    margin()
+                    size / 4 < short && short < LEVEL,
+                    "premise: the floor decides: quarter {} < {short} B left < LEVEL_COST {LEVEL}",
+                    size / 4
                 );
                 assert!(FRAME > short, "premise: a wrong admission with {short} B left overflows on {FRAME} B");
                 let _outer = NestGuard::enter("outermost").unwrap();
