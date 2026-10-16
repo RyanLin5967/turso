@@ -222,7 +222,8 @@ mod tests {
 /// constants, `margin` and `remaining_stack`; `STACK_BOUNDS` to the crate's stack size (the tests
 /// read only the size); `FORCE_UNKNOWN` to the crate's force-unknown hook; `level_cost` to the
 /// crate's hooks, armed by the first take (the crate records only when armed). No assertion or
-/// input of wire's tests is changed.
+/// input of wire's tests is changed, but three tests' sizes, which are derived from the crate's
+/// constants since review F1 (FLAGGED there, each at its test).
 ///
 /// `LEVEL_COST` is wire's own literal, 128 KiB, not the crate's (192 KiB in debug): it is the bound
 /// of the level-gap test, the one wire test that reads it, and through the crate's constant that
@@ -289,11 +290,16 @@ mod fastest_wire_tests {
     /// outermost step is entered, and nesting is still refused before the stack runs out. The
     /// fixed 512 KiB margin refused the outermost step itself, so no SELECT could prepare there
     /// (ultrareview of fastest-wire, finding 3).
+    ///
+    /// FLAGGED SPEC CHANGE (review of 96b69304b, F1; lead DECISIONS cc4653c2d3): the thread is
+    /// STACK_MARGIN less 32 KiB, the crate's margin of this build (480 KiB in debug, as wire's; 96 KiB
+    /// in release, whose STACK_MARGIN is 128 KiB), so the premise holds in both builds: wire's fixed
+    /// 480 KiB was not under release's margin, and the premise failed there.
     #[cfg(any(target_vendor = "apple", target_os = "linux"))]
     #[test]
     fn a_small_thread_enters_its_outermost_step_and_still_refuses_deep_nesting() {
         std::thread::Builder::new()
-            .stack_size(480 << 10)
+            .stack_size(STACK_MARGIN - (32 << 10))
             .spawn(|| {
                 let size = STACK_BOUNDS.with(|b| b.map(|(_, size)| size));
                 assert!(
@@ -349,12 +355,23 @@ mod fastest_wire_tests {
     /// phase (a debug view expansion, about 93 KiB), so with the quarter-stack margin alone a
     /// nested step was admitted with ~100 KiB left and a 120 KiB level then overflowed (fastest-
     /// engine's review of ed4e4e9a5). Overflowing aborts the test process: that is the red.
+    ///
+    /// FLAGGED SPEC CHANGE (review of 96b69304b, F1; lead DECISIONS cc4653c2d3): every size is
+    /// derived from the crate's constants of this build, so the test can fail in release too (wire's
+    /// literals overflowed there: release's margin on 256 KiB is 64 KiB, and 100 KiB left was
+    /// admitted by design). The thread is 3 x LEVEL_COST, so a quarter of it (0.75 LEVEL_COST) is
+    /// under one level and the floor decides; the step is tried with 0.875 LEVEL_COST left, which
+    /// the floor refuses and the quarter-stack rule alone would admit; one synthetic level is
+    /// LEVEL_COST + 8 KiB, more than LEVEL_COST and more than that, so a wrong admission overflows.
     #[cfg(any(target_vendor = "apple", target_os = "linux"))]
     #[test]
     fn a_small_thread_refuses_a_nested_step_it_cannot_afford_one_level_for() {
+        const LEVEL: usize = turso_stack_guard::LEVEL_COST;
+        const FRAME: usize = LEVEL + (8 << 10);
+        const THREAD: usize = 3 * LEVEL;
         #[inline(never)]
         fn one_level() {
-            let mut frame = [0u8; 120 << 10];
+            let mut frame = [0u8; FRAME];
             std::hint::black_box(&mut frame);
         }
         #[inline(never)]
@@ -373,16 +390,31 @@ mod fastest_wire_tests {
             }
         }
         std::thread::Builder::new()
-            .stack_size(256 << 10)
+            .stack_size(THREAD)
             .spawn(|| {
+                let size = STACK_BOUNDS.with(|b| b.map(|(_, size)| size)).unwrap();
+                let short = (size / 4 + LEVEL) / 2;
+                let enough = margin() + FRAME + (8 << 10);
+                assert!(FRAME > LEVEL, "premise: one synthetic level ({FRAME} B) exceeds LEVEL_COST ({LEVEL} B)");
+                assert!(
+                    size / 4 < short && short < margin() && margin() == LEVEL,
+                    "premise: the floor decides: quarter {} < {short} B left < margin {} = LEVEL_COST {LEVEL}",
+                    size / 4,
+                    margin()
+                );
+                assert!(FRAME > short, "premise: a wrong admission with {short} B left overflows on {FRAME} B");
                 let _outer = NestGuard::enter("outermost").unwrap();
                 assert!(
-                    !descend_to(100 << 10),
-                    "a nested step was admitted with ~100 KiB left"
+                    remaining_stack().unwrap() > enough,
+                    "premise: {enough} B left to start from on a {size} B thread"
                 );
                 assert!(
-                    descend_to(200 << 10),
-                    "premise: a nested step with ~200 KiB left runs"
+                    !descend_to(short),
+                    "a nested step was admitted with {short} B left"
+                );
+                assert!(
+                    descend_to(enough),
+                    "premise: a nested step with {enough} B left runs"
                 );
             })
             .unwrap()
@@ -446,6 +478,11 @@ mod fastest_wire_tests {
     /// with ~100 KiB left (under LEVEL_COST) it is refused, where a flat statement on a quiet
     /// thread is not. It was exempt, so a prepare re-entered deep in the stack went unchecked
     /// (fastest-engine, on the NestGuard margin).
+    ///
+    /// FLAGGED SPEC CHANGE (review of 96b69304b, F1; lead DECISIONS cc4653c2d3): the stack left is
+    /// LEVEL_COST less 8 KiB, the crate's floor of this build, with the premise that it is under the
+    /// thread's margin: wire's 100 KiB is above release's 64 KiB margin on 256 KiB, so it was admitted
+    /// there by design and the assertion failed.
     #[cfg(any(target_vendor = "apple", target_os = "linux"))]
     #[test]
     fn a_prepare_reentered_while_a_statement_steps_is_checked_from_its_first_step() {
@@ -462,12 +499,14 @@ mod fastest_wire_tests {
         std::thread::Builder::new()
             .stack_size(256 << 10)
             .spawn(|| {
+                let short = turso_stack_guard::LEVEL_COST - (8 << 10);
+                assert!(short < margin(), "premise: {short} B left is under the margin {}", margin());
                 assert!(
-                    at(100 << 10, false),
+                    at(short, false),
                     "premise: a quiet thread's outermost step runs"
                 );
                 assert!(
-                    !at(100 << 10, true),
+                    !at(short, true),
                     "a re-entered prepare's first step was exempt"
                 );
             })
