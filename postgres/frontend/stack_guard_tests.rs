@@ -24,6 +24,27 @@ fn run_child() -> bool {
     let outcome = std::thread::Builder::new()
         .stack_size(kib * 1024)
         .spawn(move || {
+            if let Ok(phase) = std::env::var("C47_PARSE_PHASE") {
+                return match turso_pg_parser::parse(&sql) {
+                    Ok(parsed) => {
+                        let outcome = match phase.as_str() {
+                            "drop" => "ok parsed".to_string(),
+                            "deparse" => match turso_pg_parser::deparse(&parsed.protobuf) {
+                                Ok(text) => format!("ok deparsed {} selects", text.matches("SELECT").count()),
+                                Err(e) => format!("err {e:?}"),
+                            },
+                            "parameters" => match turso_pg_parser::checked_param_numbers(&parsed, &sql) {
+                                Ok(numbers) => format!("ok parameters {numbers:?}"),
+                                Err(e) => format!("err {e:?}"),
+                            },
+                            _ => panic!("unknown parse lifecycle phase"),
+                        };
+                        drop(parsed);
+                        outcome
+                    }
+                    Err(e) => format!("err {e:?}"),
+                };
+            }
             let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::MemoryIO::new());
             let got = open_database_with_io(io, ":memory:", turso_core::OpenFlags::Create, turso_core::DatabaseOpts::new())
                 .and_then(|db| db.connect())
@@ -44,14 +65,22 @@ fn run_child() -> bool {
 }
 
 fn in_child(test: &str, kib: usize, sql: &str) -> String {
+    in_child_phase(test, kib, sql, None)
+}
+
+fn in_child_phase(test: &str, kib: usize, sql: &str, phase: Option<&str>) -> String {
     let dir = tempfile::TempDir::new().unwrap();
     let file = dir.path().join("outcome");
-    let out = std::process::Command::new(std::env::current_exe().unwrap())
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
         .args([test, "--exact", "--include-ignored", "--nocapture", "--test-threads=1"])
         .env(CHILD_ENV, format!("{kib}|{sql}"))
         .env("FE_STACK_OUT", &file)
-        .output()
-        .unwrap();
+        .env_remove("C47_PARSE_PHASE");
+    if let Some(phase) = phase {
+        command.env("C47_PARSE_PHASE", phase);
+    }
+    let out = command.output().unwrap();
     match std::fs::read_to_string(&file) {
         Ok(line) if out.status.success() => line,
         _ => {
@@ -196,4 +225,33 @@ fn a_long_left_associated_expression_keeps_a_bounded_outcome() {
         got == "ok [[Numeric(Integer(12001))]]" || got == "err StackDepthLimitExceeded",
         "a deep expression must answer correctly or reach the shared stack guard: {got}"
     );
+}
+
+
+#[test]
+fn a_deep_parse_tree_can_be_dropped_after_an_early_return() {
+    if run_child() { return; }
+    let sql = format!("SELECT {}1{}", "(SELECT ".repeat(1000), ")".repeat(1000));
+    assert_eq!(in_child_phase("stack_guard_tests::a_deep_parse_tree_can_be_dropped_after_an_early_return", 256, &sql, Some("drop")), "ok parsed");
+}
+
+#[test]
+fn a_deep_parse_tree_keeps_its_parameter_metadata() {
+    if run_child() { return; }
+    let sql = format!("SELECT {}$1{}", "(SELECT ".repeat(1000), ")".repeat(1000));
+    assert_eq!(in_child_phase("stack_guard_tests::a_deep_parse_tree_keeps_its_parameter_metadata", 256, &sql, Some("parameters")), "ok parameters [1]");
+}
+
+#[test]
+fn a_deep_parse_tree_can_be_deparsed() {
+    if run_child() { return; }
+    let sql = format!("SELECT {}1{}", "(SELECT ".repeat(1000), ")".repeat(1000));
+    assert_eq!(in_child_phase("stack_guard_tests::a_deep_parse_tree_can_be_deparsed", 256, &sql, Some("deparse")), "ok deparsed 1001 selects");
+}
+
+#[test]
+fn refusing_a_later_deep_sibling_safely_drops_the_completed_sibling() {
+    if run_child() { return; }
+    let sql = format!("SELECT {}1{}, {}1", "(SELECT ".repeat(1000), ")".repeat(1000), "1 + ".repeat(12000));
+    assert_eq!(in_child_phase("stack_guard_tests::refusing_a_later_deep_sibling_safely_drops_the_completed_sibling", 256, &sql, Some("drop")), "err StackDepthLimitExceeded");
 }
