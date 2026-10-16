@@ -136,6 +136,9 @@ pub use database::{
 #[cfg(test)]
 pub(crate) use database::{DatabaseKey, RegistryEntry, DATABASE_MANAGER};
 pub use dialect::{Dialect, SqliteDialect};
+/// An array value's PostgreSQL text form, for the PostgreSQL frontend to render a bound array in a
+/// result (the crash batch, 2026-10-15).
+pub use vdbe::array::serialize_array_from_blob;
 pub use error::{io_error, BranchOp, CompletionError, LimboError};
 pub use function::ContextCollationFunction;
 #[cfg(feature = "io_memory_yield")]

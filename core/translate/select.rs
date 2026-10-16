@@ -42,8 +42,8 @@ pub fn translate_select(
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
 ) -> Result<usize> {
-    // Stack-guard class (fastest-engine): a recursive entry checks the stack left first.
-    crate::error::check_stack()?;
+    // Stack-guard class (fastest-engine): a recursive entry is a nested step (`stack::NestGuard`).
+    let _nest = crate::stack::NestGuard::enter("a recursive step")?;
     let plan = prepare_select_plan(
         select,
         resolver,
@@ -170,8 +170,8 @@ pub fn prepare_select_plan(
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
 ) -> Result<Plan> {
-    // Stack-guard class (fastest-engine): a recursive entry checks the stack left first.
-    crate::error::check_stack()?;
+    // Stack-guard class (fastest-engine): a recursive entry is a nested step (`stack::NestGuard`).
+    let _nest = crate::stack::NestGuard::enter("a recursive step")?;
     prepare_select_plan_from_arms(
         select.body.select,
         select.body.compounds,
@@ -294,6 +294,9 @@ fn prepare_one_select_plan(
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
 ) -> Result<SelectPlan> {
+    // A subquery's plan is prepared by a recursive call: refused with too little stack for one
+    // more level (`stack::NestGuard`; the crash batch, 2026-10-15).
+    let _nest = crate::stack::NestGuard::enter("subqueries")?;
     match select {
         ast::OneSelect::Select {
             columns,
@@ -869,7 +872,13 @@ fn prepare_one_select_plan(
             if limit.is_some() {
                 crate::bail_parse_error!("LIMIT clause is not allowed with VALUES clause");
             }
-            let len = values[0].len();
+            // SQLite's grammar never gives a VALUES with no row, but a translated statement can (the
+            // PostgreSQL frontend's INSERT with more target columns than DEFAULT values; the crash
+            // batch, 2026-10-15): refused, where `values[0]` panicked.
+            let Some(first) = values.first() else {
+                crate::bail_parse_error!("a VALUES list has no row");
+            };
+            let len = first.len();
             if len > SQLITE_MAX_COLUMN {
                 crate::bail_parse_error!("too many columns in result set");
             }

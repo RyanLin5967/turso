@@ -263,6 +263,9 @@ pub fn translate_condition_expr(
     condition_metadata: ConditionMetadata,
     resolver: &Resolver,
 ) -> Result<()> {
+    // Stack-guard class (fastest-engine): a check between emit_query and translate_expr, which
+    // were 143,456 B apart in debug (core stack::tests::two_consecutive_nested_checks_...).
+    let _nest = crate::stack::NestGuard::enter("emission")?;
     match expr {
         ast::Expr::SubqueryResult { query_type, .. } => match query_type {
             SubqueryType::Exists { result_reg } => {

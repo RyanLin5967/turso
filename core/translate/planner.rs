@@ -1201,7 +1201,7 @@ fn plan_cte(
 ) -> Result<JoinedTable> {
     // Stack-guard class (fastest-engine): a CTE plans the CTEs it reads, recursively (found by
     // the class test: a 60-CTE chain overflowed 512 KiB in plan_cte).
-    crate::error::check_stack()?;
+    let _nest = crate::stack::NestGuard::enter("CTEs")?;
     let cte_definition = &cte_definitions[cte_definition_index];
     if program.is_cte_being_defined(&cte_definition.name) {
         crate::bail_parse_error!("circular reference: {}", cte_definition.name);
@@ -1324,7 +1324,7 @@ fn prepare_recursive_cte_plan(
 ) -> Result<Plan> {
     // Stack-guard class (fastest-engine): a CTE plans the CTEs it reads, recursively (found by
     // the class test: a 60-CTE chain overflowed 512 KiB in plan_cte).
-    crate::error::check_stack()?;
+    let _nest = crate::stack::NestGuard::enter("CTEs")?;
     let select = &cte_definition.select;
     let mut first_recursive_query_index = None;
     let ref_counter = RecursiveRefCounter {
@@ -1887,6 +1887,9 @@ fn parse_table(
     let regular_view =
         resolver.with_schema(database_id, |schema| schema.get_view(table_name.as_str()));
     if let Some(view) = regular_view {
+        // Each nested view is planned by a recursive call; with too little stack left for one more,
+        // refused rather than overflowing (the crash batch, 2026-10-15; `stack::NestGuard`).
+        let _depth = crate::stack::NestGuard::enter("views")?;
         // Views are essentially query aliases, so just Expand the view as a subquery
         view.process()?;
         let mut view_select = view.select_stmt.clone();
@@ -2133,8 +2136,8 @@ pub fn parse_from(
     table_references: &mut TableReferences,
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
-    // Stack-guard class (fastest-engine): a recursive entry checks the stack left first.
-    crate::error::check_stack()?;
+    // Stack-guard class (fastest-engine): a recursive entry is a nested step (`stack::NestGuard`).
+    let _nest = crate::stack::NestGuard::enter("a recursive step")?;
     let mut cte_definitions = Vec::new();
     let mut shadowed_outer_ctes = Vec::new();
 

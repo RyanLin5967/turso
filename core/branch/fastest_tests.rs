@@ -9531,6 +9531,69 @@ fn a_steady_create_allocates_at_most_once_under_the_store_mutex() {
     assert!(over.is_empty(), "CLAIM: a steady create allocated more than once under the store mutex: {over:?}");
 }
 
+/// Class (b) step 1 (lead order 2026-10-15): the create-hold stall the hold audit found in its
+/// filter_rebuild run (fork_trunk's hold: 6,408 allocations, 11,088,085 B, 1 catalog statement, raw
+/// l69-audit). Hypothesis under test, as its CLAIM: that hold is a checkpoint STARTED inside the
+/// create's hold (`maybe_compact` -> `start_flight`, its capture), not the filter. The audit's store
+/// (10,000 named branches, catalog, D2) takes 16,384 named creates, each traced (`held_trace`);
+/// the worst create's spans are printed, and the claim is that its allocations fall in
+/// `compact.flight_starting` .. `compact.flight_start_returned`.
+#[test]
+#[ignore = "diagnostic for class (b) step 1: run by name with --ignored --nocapture"]
+fn diag_the_create_hold_stall_is_a_checkpoint_start() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("stall.db");
+    let incarnation = {
+        let db = open_at(&path, opts(true, SyncClass::FullFsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        for i in 0..10_000u32 {
+            trunk.create_branch(&format!("pop-{i:07}")).unwrap();
+        }
+        db.incarnation
+    };
+    let db = reopen(&path, opts(true, SyncClass::FullFsync), incarnation);
+    db.branch_wait_name_filter();
+    let trunk = db.connect().unwrap();
+    let mut worst: (u64, String, Vec<(&'static str, u64)>, u64) = (0, String::new(), Vec::new(), 0);
+    let mut over_64 = 0u32;
+    for i in 0..16_384u32 {
+        let name = format!("r-{i:07}");
+        let before = super::budget_probe::thread_allocs().2;
+        super::store::HELD_TRACE.with(|t| *t.borrow_mut() = Some(Vec::with_capacity(64)));
+        trunk.create_branch(&name).unwrap();
+        let trace = super::store::HELD_TRACE.with(|t| t.borrow_mut().take()).unwrap_or_default();
+        let total = trace.last().map_or(0, |(_, n)| n - before);
+        if total > 64 {
+            over_64 += 1;
+        }
+        if total > worst.0 {
+            worst = (total, name, trace, before);
+        }
+    }
+    let (total, name, trace, before) = worst;
+    let mut last = before;
+    let mut in_start = 0;
+    let steps: Vec<String> = trace
+        .iter()
+        .map(|(label, n)| {
+            let d = n - last;
+            last = *n;
+            if *label == "compact.flight_start_returned" {
+                in_start = d;
+            }
+            format!("{label}+{d}")
+        })
+        .collect();
+    println!("FE_STALL worst create {name}: {total} allocations to its last trace point [{}]; {over_64} of 16384 creates over 64", steps.join(" "));
+    assert!(
+        in_start * 2 > total,
+        "CLAIM: the worst create's allocations are not mostly its checkpoint start: {in_start} of {total} [{}]",
+        steps.join(" ")
+    );
+}
+
 /// Codex C25 HIGH 1 at the store (lead order 00: its "crash arm"): the background writer held after
 /// it installed its snapshot and before it takes its cut (`HOLD_COMPACT_INSTALLED`, store mutex
 /// free), creates go on past the hard limit until one compacts the log INLINE (counted,

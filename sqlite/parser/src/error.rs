@@ -99,7 +99,7 @@ pub enum Error {
     Custom(String),
     #[error("Parse error: {0}")]
     ParseError(String),
-    /// A recursive entry found its thread's stack nearly spent (`turso_stack_guard::check`): the
+    /// A recursive entry found its thread's stack nearly spent (`turso_stack_guard::NestGuard`): the
     /// statement nests too deeply for the thread parsing it. PostgreSQL's 54001.
     #[error("stack depth limit exceeded")]
     StackDepthLimitExceeded,

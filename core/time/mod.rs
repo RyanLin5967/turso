@@ -156,6 +156,13 @@ fn time_now(args: &[Value]) -> Value {
 ///
 /// If `offset_sec` is not 0, the source time is treated as being in a given timezone (with an offset in seconds east of UTC) and converted back to UTC.
 fn time_date_internal(args: &[Value]) -> Value {
+    time_date_or(args, Value::null)
+}
+
+/// [`time_date_internal`], answering `none()` for a value that is no date (out of range, or an
+/// argument past i32): NULL for `time_date`, as before; PostgreSQL's out-of-range error for
+/// `make_date` and `make_timestamp` (22008; the crash batch, 2026-10-15).
+fn time_date_or(args: &[Value], none: impl FnOnce() -> Value) -> Value {
     if args.len() != 3 && args.len() != 6 && args.len() != 7 && args.len() != 8 {
         return Value::error(ResultCode::InvalidArgs);
     }
@@ -188,12 +195,18 @@ fn time_date_internal(args: &[Value]) -> Value {
 
     if args.len() == 8 {
         let offset_sec = ok_tri!(args[7].to_integer()) as i32;
-        seconds -= offset_sec as i64;
+        let Some(shifted) = seconds.checked_sub(offset_sec as i64) else {
+            return none();
+        };
+        seconds = shifted;
     }
 
+    let (Ok(year), Ok(month)) = (i32::try_from(year), i32::try_from(month)) else {
+        return none();
+    };
     let t = Time::time_date(
-        year as i32,
-        month as i32,
+        year,
+        month,
         day,
         hour,
         minutes,
@@ -204,8 +217,21 @@ fn time_date_internal(args: &[Value]) -> Value {
 
     match tri!(t) {
         Some(t) => t.into_blob(),
-        None => Value::null(),
+        None => none(),
     }
+}
+
+/// PostgreSQL's message for a date or timestamp past its range (SQLSTATE 22008, which the
+/// PostgreSQL frontend reads from this prefix).
+pub const DATE_OUT_OF_RANGE: &str = "date field value out of range";
+
+/// `make_date` / `make_timestamp`'s answer for arguments that are no date.
+fn out_of_range(args: &[Value]) -> Value {
+    let parts: Vec<String> = args
+        .iter()
+        .map(|a| a.to_integer().map_or_else(|| "?".to_string(), |v| v.to_string()))
+        .collect();
+    Value::error_with_message(format!("{DATE_OUT_OF_RANGE}: {}", parts.join("-")))
 }
 
 #[scalar(name = "time_date")]
@@ -219,7 +245,7 @@ fn make_date(args: &[Value]) -> Value {
         return Value::error(ResultCode::InvalidArgs);
     }
 
-    time_date_internal(args)
+    time_date_or(args, || out_of_range(args))
 }
 
 #[scalar(name = "make_timestamp")]
@@ -228,7 +254,7 @@ fn make_timestamp(args: &[Value]) -> Value {
         return Value::error(ResultCode::InvalidArgs);
     }
 
-    time_date_internal(args)
+    time_date_or(args, || out_of_range(args))
 }
 
 #[scalar(name = "time_get", alias = "date_part")]
@@ -708,7 +734,7 @@ fn time_add(args: &[Value]) -> Value {
 
     let d = Duration::from(d);
 
-    t.add_duration(d).into_blob()
+    tri!(t.add_duration(d)).into_blob()
 }
 
 #[scalar(name = "time_add_date")]
@@ -750,7 +776,7 @@ fn time_add_date(args: &[Value]) -> Value {
         days = ok_tri!(args[3].to_integer());
     }
 
-    let t: Time = tri!(t.time_add_date(years as i32, months as i32, days));
+    let t: Time = tri!(t.time_add_date(years, months, days));
 
     t.into_blob()
 }

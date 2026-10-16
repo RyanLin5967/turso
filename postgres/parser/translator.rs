@@ -340,8 +340,8 @@ impl PostgreSQLTranslator {
     }
 
     fn translate_node(&self, node: NodeRef<'_>) -> Result<ast::Stmt, ParseError> {
-        // Stack-guard class (fastest-engine): a recursive entry checks the stack left first.
-        crate::check_stack()?;
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = crate::nest()?;
         Ok(match node {
             NodeRef::SelectStmt(select) => {
                 // Top-level SELECT ... INTO is PG's legacy spelling of
@@ -1818,8 +1818,8 @@ impl PostgreSQLTranslator {
         &self,
         select: &pg_query::protobuf::SelectStmt,
     ) -> Result<ast::Select, ParseError> {
-        // Stack-guard class (fastest-engine): a recursive entry checks the stack left first.
-        crate::check_stack()?;
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = crate::nest()?;
         use pg_query::protobuf::SetOperation;
 
         // Top-level SELECT INTO is intercepted (and its IntoClause stripped)
@@ -1935,8 +1935,8 @@ impl PostgreSQLTranslator {
         &self,
         select: &pg_query::protobuf::SelectStmt,
     ) -> Result<ast::Select, ParseError> {
-        // Stack-guard class (fastest-engine): a recursive entry checks the stack left first.
-        crate::check_stack()?;
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = crate::nest()?;
         // The left spine of the tree flattens into a list the engine runs left to right, which is
         // PostgreSQL's order for it: pg_query represents A UNION B UNION C, and A INTERSECT B UNION
         // C, as SetOp(SetOp(A, B), C). Anything else is an arm of its own, a subquery
@@ -1994,8 +1994,8 @@ impl PostgreSQLTranslator {
         stmt: &pg_query::protobuf::SelectStmt,
         wrap: bool,
     ) -> Result<ast::OneSelect, ParseError> {
-        // Stack-guard class (fastest-engine): a recursive entry checks the stack left first.
-        crate::check_stack()?;
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = crate::nest()?;
         if !wrap {
             return self.translate_one_select(stmt);
         }
@@ -2087,8 +2087,8 @@ impl PostgreSQLTranslator {
         &self,
         select: &pg_query::protobuf::SelectStmt,
     ) -> Result<ast::OneSelect, ParseError> {
-        // Stack-guard class (fastest-engine): a recursive entry checks the stack left first.
-        crate::check_stack()?;
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = crate::nest()?;
         // Compound-select leaves carry their own IntoClause. PG allows INTO
         // only on the first leaf of a top-level compound; reject all of them
         // rather than implement that form.
@@ -2147,8 +2147,8 @@ impl PostgreSQLTranslator {
         &self,
         from_items: &[pg_query::protobuf::Node],
     ) -> Result<ast::FromClause, ParseError> {
-        // Stack-guard class (fastest-engine): a recursive entry checks the stack left first.
-        crate::check_stack()?;
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = crate::nest()?;
         let mut from_clause = self.translate_from_clause(&from_items[0])?;
         // Additional FROM items are comma-joins (implicit cross join)
         for item in &from_items[1..] {
@@ -2187,8 +2187,8 @@ impl PostgreSQLTranslator {
         &self,
         from_item: &pg_query::protobuf::Node,
     ) -> Result<ast::FromClause, ParseError> {
-        // Stack-guard class (fastest-engine): a recursive entry checks the stack left first.
-        crate::check_stack()?;
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = crate::nest()?;
         match &from_item.node {
             Some(pg_query::protobuf::node::Node::RangeVar(range_var)) => {
                 let select_table = self.translate_range_var(range_var)?;
@@ -2318,8 +2318,8 @@ impl PostgreSQLTranslator {
         &self,
         range_sub: &pg_query::protobuf::RangeSubselect,
     ) -> Result<ast::SelectTable, ParseError> {
-        // Stack-guard class (fastest-engine): a recursive entry checks the stack left first.
-        crate::check_stack()?;
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = crate::nest()?;
         if range_sub.lateral {
             return Err(ParseError::ParseError(
                 "LATERAL is supported only as CROSS JOIN LATERAL of a subquery of expressions"
@@ -2649,8 +2649,8 @@ impl PostgreSQLTranslator {
         &self,
         join_expr: &pg_query::protobuf::JoinExpr,
     ) -> Result<ast::FromClause, ParseError> {
-        // Stack-guard class (fastest-engine): a recursive entry checks the stack left first.
-        crate::check_stack()?;
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = crate::nest()?;
         // Flatten the left-deep join tree: collect the primary table and all joins
         let mut joins = Vec::new();
         let primary_table = self.flatten_join_tree(join_expr, &mut joins)?;
@@ -2866,8 +2866,8 @@ impl PostgreSQLTranslator {
     }
 
     fn translate_expr(&self, node: &pg_query::protobuf::Node) -> Result<ast::Expr, ParseError> {
-        // Stack-guard class (fastest-engine): a recursive entry checks the stack left first.
-        crate::check_stack()?;
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = crate::nest()?;
         match &node.node {
             Some(pg_query::protobuf::node::Node::ColumnRef(col_ref)) => {
                 if let Some((table, _)) = self.series_column(col_ref)? {
@@ -3296,8 +3296,8 @@ impl PostgreSQLTranslator {
         &self,
         a_expr: &pg_query::protobuf::AExpr,
     ) -> Result<ast::Expr, ParseError> {
-        // Stack-guard class (fastest-engine): a recursive entry checks the stack left first.
-        crate::check_stack()?;
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = crate::nest()?;
         use pg_query::protobuf::AExprKind;
 
         match &a_expr.kind() {
@@ -3882,8 +3882,8 @@ impl PostgreSQLTranslator {
         &self,
         func_call: &pg_query::protobuf::FuncCall,
     ) -> Result<ast::Expr, ParseError> {
-        // Stack-guard class (fastest-engine): a recursive entry checks the stack left first.
-        crate::check_stack()?;
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = crate::nest()?;
         // Extract function name
         let func_name = func_call
             .funcname
@@ -4185,8 +4185,8 @@ impl PostgreSQLTranslator {
         &self,
         case_expr: &pg_query::protobuf::CaseExpr,
     ) -> Result<ast::Expr, ParseError> {
-        // Stack-guard class (fastest-engine): a recursive entry checks the stack left first.
-        crate::check_stack()?;
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = crate::nest()?;
         // Translate optional base expression (CASE <expr> WHEN ...)
         let base = if let Some(arg) = &case_expr.arg {
             Some(Box::new(self.translate_expr(arg)?))
@@ -4267,8 +4267,8 @@ impl PostgreSQLTranslator {
         &self,
         sub_link: &pg_query::protobuf::SubLink,
     ) -> Result<ast::Expr, ParseError> {
-        // Stack-guard class (fastest-engine): a recursive entry checks the stack left first.
-        crate::check_stack()?;
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = crate::nest()?;
         use pg_query::protobuf::SubLinkType;
 
         let subselect_node = sub_link
@@ -4310,8 +4310,8 @@ impl PostgreSQLTranslator {
         &self,
         with_clause: &Option<pg_query::protobuf::WithClause>,
     ) -> Result<Option<ast::With>, ParseError> {
-        // Stack-guard class (fastest-engine): a recursive entry checks the stack left first.
-        crate::check_stack()?;
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = crate::nest()?;
         use pg_query::protobuf::node::Node;
 
         let with_clause = match with_clause {
@@ -4590,8 +4590,8 @@ impl PostgreSQLTranslator {
         &self,
         bool_expr: &pg_query::protobuf::BoolExpr,
     ) -> Result<ast::Expr, ParseError> {
-        // Stack-guard class (fastest-engine): a recursive entry checks the stack left first.
-        crate::check_stack()?;
+        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        let _nest = crate::nest()?;
         use pg_query::protobuf::BoolExprType;
 
         if bool_expr.args.is_empty() {
