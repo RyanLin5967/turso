@@ -50,6 +50,7 @@ PREREG citations as ':N' or 'line N' are lines of artie frontier/fastest/PREREG-
 rulings cite, until PREREG-v1.md is registered (fourth lane review LOW 26).
 """
 import glob
+import gzip
 import hashlib
 import json
 import math
@@ -58,6 +59,7 @@ import re
 import shutil
 import sys
 import tempfile
+import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import blockgate  # noqa: E402
@@ -468,6 +470,35 @@ def conformance_problems(out):
     return bad
 
 
+# an out-of-space failure, as the kernel, libc, fio, strace and btrfs print it: the errno's text, its name, btrfs's
+# errno=-28, and btrfs's allocation failures. Case-sensitive: a record that only names the condition (enospc_count=0)
+# is not one
+ENOSPC_RE = re.compile(r"No space left on device|\bENOSPC\b|errno=-28\b|BTRFS[^\n]*(?:unable to allocate|failed to allocate|allocation failed)")
+
+
+def enospc_problems(out, fs, limit=5):
+    """Every out-of-space line in the block's files (out/fs-<fs>/, .gz read through), as 'path:line: text', at most
+    LIMIT named and the rest counted. The lead's DATA_GIB ruling (2026-10-16): the dry block's device is 16 GiB, so an
+    ENOSPC in any step refuses the block; it is never credited and never retried with a smaller setting."""
+    root = os.path.join(out, f"fs-{fs}")
+    hits, n = [], 0
+    for d, _dirs, files in os.walk(root):
+        for fn in sorted(files):
+            p = os.path.join(d, fn)
+            try:
+                f = gzip.open(p, "rt", errors="replace") if fn.endswith(".gz") else open(p, errors="replace")
+                with f:
+                    for k, ln in enumerate(f, 1):
+                        if ENOSPC_RE.search(ln):
+                            n += 1
+                            if len(hits) < limit:
+                                hits.append(f"{os.path.relpath(p, root)}:{k}: {ln.strip()[:160]}")
+            except (OSError, EOFError, zlib.error):
+                hits.append(f"{os.path.relpath(p, root)}: unreadable while scanning for ENOSPC")
+                n += 1
+    return hits + ([f"... and {n - len(hits)} more"] if n > len(hits) else [])
+
+
 def parent_record(d):
     """the run's result/fixture.json (every system's, in comp's schema), or None when it is missing or not an object"""
     try:
@@ -692,6 +723,9 @@ def summarize(out, sha, dry, manifest):
     unquiet = [f"{r['fs']}/{r['cell']}: " + (r["settle"] or "no settle.txt") for r in runs
                if r["measured"] and (not r["settle"] or "quiet=yes" not in r["settle"].split())]
     failed_blocks = [f"{b['fs']}: " + " | ".join(b["why"]) for b in blocks if not b["ok"]]
+    # the lead's DATA_GIB ruling: any ENOSPC or btrfs allocation failure in any step of a block refuses it
+    for fs in fslist:
+        failed_blocks += [f"{fs}: ENOSPC refuses the block (DATA_GIB ruling): {x}" for x in enospc_problems(out, fs)]
     if not fslist:
         failed_blocks.append("fslist.txt missing or empty: no block was planned")
     mode = {}
@@ -744,6 +778,14 @@ def summarize(out, sha, dry, manifest):
     if stamp == "DRY-VIRT" and (dry != "1" or mode.get("dry") != "1"):
         mode_refusals.append(f"a DRY-VIRT run says dry={mode.get('dry')!r} (package dry={dry!r}): a run on a virtual "
                              "disk is a dry run, never a real one")
+    # the lead's DATA_GIB ruling: a DRY-VIRT run discloses how it differs from the T3 box (t3run --dry-block writes
+    # dry-virt.txt: today the data device's size); a DRY-VIRT run without it has its differences undisclosed
+    if stamp == "DRY-VIRT":
+        dv = os.path.join(out, "dry-virt.txt")
+        lines = [l.strip() for l in open(dv).read().splitlines() if l.strip()] if os.path.exists(dv) else []
+        summary["dry_virt_differences"] = lines
+        if not lines:
+            mode_refusals.append("a DRY-VIRT run with no dry-virt.txt: its differences from the T3 box are undisclosed")
     summary["stamp"], summary["mode_refusals"] = stamp, mode_refusals
     # credit: every reason this package's numbers cannot be credited, so one field answers (False for any dry run)
     credit = []
@@ -977,9 +1019,6 @@ def self_test():
         if (dryvirt == "auto" and stamp == "DRY-VIRT") or dryvirt is True:
             w(f"{out}/dry-virt.txt", "data device: vdb, 17179869184 bytes (16 GiB, the VM's DATA_GIB); the T3 box's is its "
                                      "NVMe's full size\n")
-        # ENOSPC (the same ruling): ENOSPC=(relative path under fs-xfs, text) plants an out-of-space line in the block
-        if enospc is not None:
-            w(f"{out}/fs-xfs/{enospc[0]}", enospc[1])
         if rule is not None:
             w(f"{out}/warmup.txt", f"warm-up rule {rule} (cap 1800s)\n")
         f = f"{out}/fs-xfs"
@@ -1102,6 +1141,10 @@ def self_test():
             os.unlink(f"{f}/{drop}")
         if garbage_v3l:  # an unreadable measurement, written after its plants record
             w(f"{f}/{garbage_v3l}/v3l.json", "{not json")
+        # ENOSPC (the same ruling): ENOSPC=(relative path under fs-xfs, text) plants an out-of-space line in the block,
+        # last, so no record written above overwrites it
+        if enospc is not None:
+            w(f"{out}/fs-xfs/{enospc[0]}", enospc[1])
         return out
 
     def first(s, key):
