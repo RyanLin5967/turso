@@ -384,6 +384,8 @@ pub(crate) struct BranchStore {
 ///   (nothing more is written, the next open recovers from disk), and the slots such operations
 ///   freed are never returned, because no flight will ever cover them.
 pub(crate) struct Group {
+    /// Catalog WAL truncations that returned busy (links adversary 3 L3; observing only).
+    wal_truncate_busy: AtomicU64,
     state: std::sync::Mutex<GroupState>,
     cv: std::sync::Condvar,
     /// Wakes the background writer (`run_confirm_writer`): a landing that left a confirmation to
@@ -626,6 +628,7 @@ fn class_index(class: SyncClass) -> usize {
 impl Group {
     fn new(durable: u64, failed: Arc<AtomicBool>) -> Self {
         Self {
+            wal_truncate_busy: AtomicU64::new(0),
             state: std::sync::Mutex::new(GroupState {
                 durable: [durable; 3],
                 ..GroupState::default()
@@ -3499,6 +3502,12 @@ fn truncate_catalog_wal(catalog: &mut Catalog, group: &Group, hold: Option<&Atom
     pause_at(hold, HOLD_AFTER_WAL_PASSIVE);
     match catalog.truncate_wal() {
         Ok(r) if r.first().copied().unwrap_or(0) != 0 => {
+            // Links adversary 3 L3: a busy truncation leaves the WAL's pages for the next one,
+            // which may backfill them under the store mutex: a counted event. Mutant
+            // `wal_truncate_busy_uncounted` (test builds only).
+            if !fe_mutant("wal_truncate_busy_uncounted") {
+                group.wal_truncate_busy.fetch_add(1, Ordering::Relaxed);
+            }
             tracing::warn!("branch catalog WAL truncation was busy: {r:?}")
         }
         Ok(_) => {}
@@ -3721,6 +3730,31 @@ impl Drop for CutGate<'_> {
 /// count does not see) ran under the store mutex in a sharp store (red a722957c4). Mutant
 /// `l4_fill_wal_left` (test builds only): not truncated here.
 fn run_links_fill(shared: &StoreMutex, writer: &Mutex<Catalog>, group: &Group) {
+    // Links adversary 3 H1: progress is monotone across opens. The cursor committed with the last
+    // batch is resumed while the catalog's generation is still the one it was filled under (no
+    // checkpoint of any build has committed since, so the rows it covers are as they were); else
+    // the fill starts again from the first row. Mutant `l4_fill_cursor_forgotten` (test builds
+    // only): always from the first row, as before.
+    let generation = match shared.lock().cat.as_ref() {
+        Some(c) if c.filling => c.generation,
+        _ => return,
+    };
+    let resumed = if fe_mutant("l4_fill_cursor_forgotten") { Ok(None) } else { writer.lock().fill_cursor() };
+    match resumed {
+        Ok(Some((g, at, done))) if g == generation => {
+            let mut inner = shared.lock();
+            if let Some(cat) = inner.cat.as_mut().filter(|c| c.filling) {
+                if done {
+                    cat.links_prefilled = true;
+                    cat.filling = false;
+                    return;
+                }
+                cat.links_cursor = at;
+            }
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!("branch catalog link fill cursor not read: {e}"),
+    }
     loop {
         let cursor = {
             let inner = shared.lock();
@@ -3741,7 +3775,9 @@ fn run_links_fill(shared: &StoreMutex, writer: &Mutex<Catalog>, group: &Group) {
                     if failed {
                         return Err(LimboError::InternalError("test hook: the link fill's batch failed".to_string()));
                     }
-                    w.upgrade_links_batch(cursor, super::catalog::UPGRADE_BATCH)
+                    let next = w.upgrade_links_batch(cursor, super::catalog::UPGRADE_BATCH)?;
+                    w.put_fill_cursor(generation, next.or(cursor), next.is_none())?;
+                    Ok(next)
                 })
                 .and_then(|next| {
                 w.commit()?;
@@ -3779,8 +3815,13 @@ fn run_links_fill(shared: &StoreMutex, writer: &Mutex<Catalog>, group: &Group) {
             }
             Ok(_) => return,
             Err(e) => {
+                // L2: a failed fill backs off a threshold's worth of log, as a failed checkpoint
+                // does (`defer_compaction`), not restarted by the next operation.
                 tracing::warn!("branch catalog link fill stopped: {e}");
                 cat.filling = false;
+                if let Some(journal) = inner.journal.as_mut() {
+                    journal.defer_compaction();
+                }
                 return;
             }
         }
@@ -6129,9 +6170,18 @@ impl BranchStore {
     /// `l4_upgrade_unbatched` (test builds only): never waits, the whole fill under the mutex.
     fn links_fill_gate(&self, inner: &mut StoreInner) -> bool {
         let format = super::journal::format_version(inner.splice);
+        // Links adversary 3: past the hard log limit no checkpoint waits for the fill. The fill
+        // stops after its batch, and the checkpoint fills the rest on the writer, in its own
+        // transaction (`checkpoint_write`). Mutant `l4_fill_waits_past_hard_limit` (test builds
+        // only): it waits, as before.
+        let past_hard = inner.journal.as_ref().is_some_and(Journal::past_hard_limit);
         let Some(cat) = inner.cat.as_mut() else {
             return false;
         };
+        if past_hard && !fe_mutant("l4_fill_waits_past_hard_limit") {
+            cat.filling = false;
+            return false;
+        }
         if cat.filling {
             return true;
         }
@@ -6174,6 +6224,12 @@ impl BranchStore {
             if handle.join().is_err() {
                 tracing::warn!("the branch catalog's link fill thread panicked");
             }
+        }
+        // L1: another caller took the join handle: wait for the fill it joins to end (bounded
+        // batches; no store mutex held between the looks). Mutant `l4_second_compaction_busy`
+        // (test builds only): no wait, as before.
+        while !fe_mutant("l4_second_compaction_busy") && self.inner.lock().cat.as_ref().is_some_and(|c| c.filling) {
+            std::thread::sleep(Duration::from_millis(1));
         }
     }
 
@@ -9020,6 +9076,12 @@ impl BranchStore {
         let known = inner.branches.iter().filter(|(_, st)| st.links.is_some()).count() as u64;
         let format = inner.cat.as_mut().and_then(|c| c.catalog.meta().ok().flatten()).map(|m| m.format);
         (known, format)
+    }
+
+    /// Test builds: catalog WAL truncations that returned busy (links adversary 3 L3).
+    #[cfg(test)]
+    pub(crate) fn wal_truncate_busy_for_test(&self) -> u64 {
+        self.group.wal_truncate_busy.load(Ordering::Relaxed)
     }
 
     /// Test builds (links adversary 3): `(filling, prefilled, fill threads started)`.

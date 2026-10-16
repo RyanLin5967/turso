@@ -248,3 +248,30 @@ fn a_failed_fill_backs_off_as_a_failed_checkpoint_does() {
     assert!(starts >= 1, "premise: the fill started");
     assert!(starts <= bound, "a failed fill restarted {starts} times over {grown} B of log; a failed checkpoint would retry at most {bound}");
 }
+
+// ---- L3: a busy truncation is counted ----
+
+/// L3: when a reader keeps the catalog's WAL from being truncated, the truncation's busy result is
+/// a counted event (`wal_truncate_busy`), not only a log line.
+#[test]
+fn a_busy_catalog_wal_truncation_is_counted() {
+    if in_child() {
+        return;
+    }
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("t.db");
+    older_store(&path, 300);
+    let db = open(&path);
+    db.branch_wait_name_filter();
+    let before = db.branches.wal_truncate_busy_for_test();
+    // A reader holding a read transaction on the catalog across the fill and the flip.
+    let mut reader = super::catalog::Catalog::open(&std::path::PathBuf::from(format!("{}-branch-cat", path.display())), SyncClass::Off).unwrap();
+    reader.begin().unwrap();
+    let _ = reader.meta().unwrap();
+    db.branch_compact_now().unwrap();
+    db.branch_checkpoint_wait();
+    let busy = db.branches.wal_truncate_busy_for_test() - before;
+    reader.rollback();
+    assert_eq!(meta_version(&path), 21, "premise: the store upgraded");
+    assert!(busy >= 1, "a truncation held busy by a reader was not counted ({busy})");
+}

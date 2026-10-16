@@ -96,6 +96,13 @@ const LEGACY_BRANCH_TABLE: &str = "CREATE TABLE IF NOT EXISTS branch(id INTEGER 
 /// `SETTLE_BATCH` bounds a settle).
 pub(crate) const UPGRADE_BATCH: usize = 64;
 
+/// Links adversary 3 H1: the upgrade fill's progress, one row (k 0), committed with each batch, so a
+/// later open resumes where the last left off while no checkpoint (of any build) has committed
+/// since: every checkpoint moves the catalog's generation, which the row names. An older build
+/// ignores the table.
+const LINK_FILL_TABLE: &str = "CREATE TABLE IF NOT EXISTS link_fill(k INTEGER PRIMARY KEY, generation INTEGER NOT NULL, \
+     parent INTEGER, fork_epoch INTEGER, done INTEGER NOT NULL)";
+
 const LINK_COLUMNS: [&str; 3] = [
     "ALTER TABLE branch ADD COLUMN sib_lo INTEGER",
     "ALTER TABLE branch ADD COLUMN sib_hi INTEGER",
@@ -556,6 +563,9 @@ pub(crate) struct Catalog {
     /// A `put_meta`'s version, recorded at this handle's commit and dropped at its rollback.
     pending_recorded: Option<u32>,
     link_stmts: Option<LinkStmts>,
+    /// The fill cursor's statements (`fill_cursor`, `put_fill_cursor`), prepared once its table exists.
+    fill_get: Option<Stmt>,
+    fill_put: Option<Stmt>,
     /// Rows' (id, parent, fork epoch) in the children index's order, a bounded batch at a time:
     /// the upgrade's fill (`upgrade_links_batch`) from the start, after a key under the same
     /// parent, and under the parents above it.
@@ -698,6 +708,8 @@ impl Catalog {
             links,
             recorded: None,
             pending_recorded: None,
+            fill_get: None,
+            fill_put: None,
             link_stmts: if links { Some(Self::link_stmts(&conn)?) } else { None },
             child_ids_first: p("SELECT id, parent, fork_epoch FROM branch ORDER BY parent, fork_epoch LIMIT ?1")?,
             child_ids_after: p(
@@ -826,6 +838,12 @@ impl Catalog {
     /// writer's rollback of one.
     pub(crate) fn refresh_links(&mut self) -> Result<()> {
         let links = has_link_columns(&self.conn)?;
+        // The fill cursor's table comes and goes with the columns (one transaction): its statements
+        // are prepared again once it exists.
+        if !links {
+            self.fill_get = None;
+            self.fill_put = None;
+        }
         if links != self.links {
             self.branch_get = Stmt { stmt: Box::new(self.conn.prepare(if links { BRANCH_GET_LINKED } else { BRANCH_GET })?) };
             self.link_stmts = if links { Some(Self::link_stmts(&self.conn)?) } else { None };
@@ -857,6 +875,7 @@ impl Catalog {
             for sql in LINK_COLUMNS {
                 self.conn.execute(sql)?;
             }
+            self.conn.execute(LINK_FILL_TABLE)?;
             // Mutant `l4_upgrade_columns_committed_alone` (test builds only): the columns committed
             // in a transaction of their own (the kill test's fire-check: a kill after it leaves 17
             // with them).
@@ -882,6 +901,47 @@ impl Catalog {
         }
         super::store::kill_point("ckpt.upgrade.rows");
         Ok(if keys.len() < n { None } else { keys.last().copied() })
+    }
+
+    /// Links adversary 3 H1: where the fill got to, as committed with its last batch: `(the catalog
+    /// generation it was filled under, the last key filled, whether every row was)`. `None`: no
+    /// fill ever committed a batch here (no table, or no row).
+    pub(crate) fn fill_cursor(&mut self) -> Result<Option<(u64, Option<(u64, u64)>, bool)>> {
+        if !self.links {
+            return Ok(None);
+        }
+        let stmt = match self.fill_get.as_mut() {
+            Some(s) => s,
+            None => {
+                self.conn.execute(LINK_FILL_TABLE)?;
+                self.fill_get = Some(Stmt { stmt: Box::new(self.conn.prepare("SELECT generation, parent, fork_epoch, done FROM link_fill WHERE k = 0")?) });
+                self.fill_get.as_mut().expect("set above")
+            }
+        };
+        let rows = stmt.rows(&[], &mut self.counters)?;
+        let Some(row) = rows.first() else {
+            return Ok(None);
+        };
+        let key = match (get_opt(row, 1)?, get_opt(row, 2)?) {
+            (Some(p), Some(f)) => Some((p, f)),
+            _ => None,
+        };
+        Ok(Some((get(row, 0)?, key, get(row, 3)? != 0)))
+    }
+
+    /// Record, in the caller's transaction (a fill batch's), where the fill got to (`fill_cursor`).
+    pub(crate) fn put_fill_cursor(&mut self, generation: u64, at: Option<(u64, u64)>, done: bool) -> Result<()> {
+        let stmt = match self.fill_put.as_mut() {
+            Some(s) => s,
+            None => {
+                self.conn.execute(LINK_FILL_TABLE)?;
+                self.fill_put = Some(Stmt {
+                    stmt: Box::new(self.conn.prepare("INSERT OR REPLACE INTO link_fill(k, generation, parent, fork_epoch, done) VALUES (0, ?1, ?2, ?3, ?4)")?),
+                });
+                self.fill_put.as_mut().expect("set above")
+            }
+        };
+        stmt.exec(&[int(generation), int_opt(at.map(|k| k.0)), int_opt(at.map(|k| k.1)), int(u64::from(done))], &mut self.counters)
     }
 
     /// Test builds (links adversary L2): add the link columns alone, committed, leaving the meta
