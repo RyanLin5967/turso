@@ -1,0 +1,6 @@
+postgres (PostgreSQL) 18.6 (Homebrew)
+{"case": "self_no_primary_key", "sql": "CREATE TABLE c44_self(id INT, up INT REFERENCES c44_self);", "returncode": 3, "stdout": "", "stderr": "ERROR:  42704: there is no primary key for referenced table \"c44_self\"\nLOCATION:  transformFkeyGetPrimaryKey, tablecmds.c:13461\n"}
+{"case": "other_no_primary_key", "sql": "CREATE TABLE c44_np(id INT); CREATE TABLE c44_child(x INT REFERENCES c44_np);", "returncode": 3, "stdout": "", "stderr": "ERROR:  42704: there is no primary key for referenced table \"c44_np\"\nLOCATION:  transformFkeyGetPrimaryKey, tablecmds.c:13461\n"}
+{"case": "other_table_constraint_no_primary_key", "sql": "CREATE TABLE c44_np_table(id INT); CREATE TABLE c44_child_table(x INT, FOREIGN KEY (x) REFERENCES c44_np_table);", "returncode": 3, "stdout": "", "stderr": "ERROR:  42704: there is no primary key for referenced table \"c44_np_table\"\nLOCATION:  transformFkeyGetPrimaryKey, tablecmds.c:13461\n"}
+{"case": "self_unique_without_primary_key", "sql": "CREATE TABLE c44_self_unique(id INT UNIQUE, up INT REFERENCES c44_self_unique);", "returncode": 3, "stdout": "", "stderr": "ERROR:  42704: there is no primary key for referenced table \"c44_self_unique\"\nLOCATION:  transformFkeyGetPrimaryKey, tablecmds.c:13461\n"}
+private PostgreSQL stopped 0

@@ -1050,7 +1050,7 @@ impl Connection {
         }
         if sql.as_ref().is_empty() {
             return Err(LimboError::InvalidArgument(
-                "The supplied SQL string contains no statements".to_string(),
+                "The supplied SQL string contains no statements".to_string().into(),
             ));
         }
 
@@ -1070,7 +1070,7 @@ impl Connection {
                 Some(cmd) => cmd,
                 None => {
                     return Err(LimboError::InvalidArgument(
-                        "The supplied SQL string contains no statements".to_string(),
+                        "The supplied SQL string contains no statements".to_string().into(),
                     ));
                 }
             };
@@ -1743,7 +1743,7 @@ impl Connection {
         }
         if sql.as_ref().is_empty() {
             return Err(LimboError::InvalidArgument(
-                "The supplied SQL string contains no statements".to_string(),
+                "The supplied SQL string contains no statements".to_string().into(),
             ));
         }
         let sql = sql.as_ref();
@@ -1876,12 +1876,12 @@ impl Connection {
             (Some(cipher), Some(hexkey)) => Some(EncryptionOpts { cipher, hexkey }),
             (Some(_), None) => {
                 return Err(LimboError::InvalidArgument(
-                    "hexkey is required when cipher is provided".to_string(),
+                    "hexkey is required when cipher is provided".to_string().into(),
                 ));
             }
             (None, Some(_)) => {
                 return Err(LimboError::InvalidArgument(
-                    "cipher is required when hexkey is provided".to_string(),
+                    "cipher is required when hexkey is provided".to_string().into(),
                 ));
             }
             (None, None) => None,
@@ -1926,12 +1926,12 @@ impl Connection {
             (Some(cipher), Some(hexkey)) => Some(EncryptionOpts { cipher, hexkey }),
             (Some(_), None) => {
                 return Err(LimboError::InvalidArgument(
-                    "hexkey is required when cipher is provided".to_string(),
+                    "hexkey is required when cipher is provided".to_string().into(),
                 ));
             }
             (None, Some(_)) => {
                 return Err(LimboError::InvalidArgument(
-                    "cipher is required when hexkey is provided".to_string(),
+                    "cipher is required when hexkey is provided".to_string().into(),
                 ));
             }
             (None, None) => None,
@@ -2297,7 +2297,7 @@ impl Connection {
             return Err(LimboError::InvalidArgument(
                 "a raw WAL session cannot begin on a branch connection: a branch's writes never \
                  reach the WAL"
-                    .to_string(),
+                    .to_string().into(),
             ));
         }
         pager.begin_read_tx()?;
@@ -2539,7 +2539,7 @@ impl Connection {
     pub fn publish_schema_after_external_restore(&self) -> Result<()> {
         if self.branch_id().is_some() {
             return Err(LimboError::InvalidArgument(
-                "a branch connection cannot publish its schema as the database's".to_string(),
+                "a branch connection cannot publish its schema as the database's".to_string().into(),
             ));
         }
         if self.get_tx_state() != TransactionState::None {
@@ -3042,6 +3042,85 @@ impl Connection {
             .collect()
     }
 
+    /// The column names `table` declares in `database` (main, temp or an attached database's
+    /// name), read from this connection's in-memory schema with no catalog query. None when there
+    /// is no such database, or no such table in it.
+    pub fn resident_table_columns(&self, database: &str, table: &str) -> Option<Vec<String>> {
+        let database_id = self.get_database_id_by_name(database).ok()?;
+        self.with_schema(database_id, |schema| {
+            schema
+                .get_btree_table(table)
+                .map(|t| t.columns().iter().filter_map(|c| c.name.clone()).collect())
+        })
+    }
+
+    /// The column names of the table an unqualified `table` names, resolved as the engine's
+    /// resolver resolves it (`resolve_unqualified_existing_database_id`): TEMP first when a temp
+    /// schema exists; then, with a search path, each entry naming public (main) or an attached
+    /// database; without one, main and then the attached databases. The first schema holding any
+    /// table-like object of the name decides; None when that object is not a B-tree table (a
+    /// view), or nothing holds the name. Read from the in-memory schemas, no catalog query.
+    pub fn resident_unqualified_table_columns(
+        &self,
+        table: &str,
+        search_path: &[String],
+    ) -> Option<Vec<String>> {
+        let holds = |id| {
+            self.with_schema(id, |schema| {
+                schema.get_table(table).is_some()
+                    || schema.get_view(table).is_some()
+                    || schema.get_materialized_view(table).is_some()
+            })
+        };
+        let columns = |id| {
+            self.with_schema(id, |schema| {
+                schema
+                    .get_btree_table(table)
+                    .map(|t| t.columns().iter().filter_map(|c| c.name.clone()).collect())
+            })
+        };
+        if self.temp.database.read().is_some() && holds(crate::TEMP_DB_ID) {
+            return columns(crate::TEMP_DB_ID);
+        }
+        // Ascending ids, as the resolver's BitSet orders them (the map's own order is a hash's).
+        let attached: Vec<usize> = if search_path.is_empty() {
+            let mut ids: Vec<usize> = self
+                .attached_databases
+                .read()
+                .index_to_data
+                .keys()
+                .copied()
+                .collect();
+            ids.sort_unstable();
+            ids
+        } else {
+            let attached = self.attached_databases.read();
+            search_path
+                .iter()
+                .filter_map(|entry| {
+                    if entry.eq_ignore_ascii_case("public") {
+                        Some(crate::MAIN_DB_ID)
+                    } else {
+                        // The entry as written, as the resolver looks it up: a quoted 'App'
+                        // names no attached app.
+                        attached.get_database_by_name(entry).map(|(id, _)| id)
+                    }
+                })
+                .collect()
+        };
+        let order = search_path
+            .is_empty()
+            .then_some(crate::MAIN_DB_ID)
+            .into_iter()
+            .chain(attached);
+        for id in order {
+            if holds(id) {
+                return columns(id);
+            }
+        }
+        None
+    }
+
     pub fn experimental_views_enabled(&self) -> bool {
         self.db.experimental_views_enabled()
     }
@@ -3290,7 +3369,7 @@ impl Connection {
                 .read()
                 .get_database_by_name(&normalized)
                 .map(|(idx, _)| idx)
-                .ok_or_else(|| LimboError::InvalidArgument(format!("no such database: {name}"))),
+                .ok_or_else(|| LimboError::InvalidArgument(format!("no such database: {name}").into())),
         }
     }
 
@@ -3367,13 +3446,13 @@ impl Connection {
         if is_fresh && Self::database_has_existing_wal_state(db) {
             return Err(LimboError::InvalidArgument(format!(
                 "cannot attach database '{alias}': main database file is uninitialized but WAL state exists"
-            )));
+            ).into()));
         }
 
         if is_fresh && db.is_readonly() {
             return Err(LimboError::InvalidArgument(format!(
                 "cannot attach database '{alias}': fresh read-only databases cannot be initialized during attach"
-            )));
+            ).into()));
         }
         Ok(())
     }
@@ -3393,7 +3472,7 @@ impl Connection {
                 if space < attached_min_reserved_space {
                     return Err(LimboError::InvalidArgument(format!(
                         "cannot attach database '{alias}': reserved space {space} is smaller than attached database minimum {attached_min_reserved_space}"
-                    )));
+                    ).into()));
                 }
                 Some(space)
             }
@@ -3424,7 +3503,7 @@ impl Connection {
             return Err(LimboError::InvalidArgument(format!(
                 "cannot attach database '{alias}': main database uses {main_mode} journal mode \
                  but attached database uses {attached_mode}. Both must use the same journal mode."
-            )));
+            ).into()));
         }
 
         // Reject mismatched page sizes: ephemeral tables and cross-database
@@ -3437,7 +3516,7 @@ impl Connection {
                 return Err(LimboError::InvalidArgument(format!(
                     "cannot attach database '{alias}': page size mismatch \
                      (main={main_ps:?}, attached={attached_ps:?})"
-                )));
+                ).into()));
             }
         }
 
@@ -3457,7 +3536,7 @@ impl Connection {
         {
             return Err(LimboError::InvalidArgument(format!(
                 "cannot attach database '{alias}': fresh MVCC attach does not support inheriting custom durable storage"
-            )));
+            ).into()));
         }
 
         Ok(())
@@ -3472,7 +3551,7 @@ impl Connection {
         _state: &mut AttachDatabaseState,
     ) -> Result<IOResult<()>> {
         Err(LimboError::InvalidArgument(
-            "attach not available in this build (no-fs)".to_string(),
+            "attach not available in this build (no-fs)".to_string().into(),
         ))
     }
 
@@ -3523,25 +3602,25 @@ impl Connection {
                         return Err(LimboError::InvalidArgument(
                             "ATTACH is refused on a branch: an attached database is not branched, \
                              so its writes would be shared by every branch and its parent"
-                                .to_string(),
+                                .to_string().into(),
                         ));
                     }
 
                     if self.is_attached(alias) {
                         return Err(LimboError::InvalidArgument(format!(
                             "database {alias} is already in use"
-                        )));
+                        ).into()));
                     }
 
                     if alias.eq_ignore_ascii_case("main") || alias.eq_ignore_ascii_case("temp") {
                         return Err(LimboError::InvalidArgument(format!(
                             "reserved name {alias} is already in use"
-                        )));
+                        ).into()));
                     }
                     if self.pager.load().has_external_page_codec() {
                         return Err(LimboError::InvalidArgument(
                             "ATTACH is unsupported for connections using an external page codec"
-                                .to_string(),
+                                .to_string().into(),
                         ));
                     }
 
@@ -3714,7 +3793,7 @@ impl Connection {
         if alias == "main" || alias == "temp" {
             return Err(LimboError::InvalidArgument(format!(
                 "cannot detach database: {alias}"
-            )));
+            ).into()));
         }
 
         // Look up the database index first, then rollback any MVCC transaction
@@ -3728,7 +3807,7 @@ impl Connection {
                 None => {
                     return Err(LimboError::InvalidArgument(format!(
                         "no such database: {alias}"
-                    )));
+                    ).into()));
                 }
             }
         };
@@ -3743,7 +3822,7 @@ impl Connection {
         if pager.holds_read_lock() || pager.holds_write_lock() {
             return Err(LimboError::InvalidArgument(format!(
                 "database {alias} is locked"
-            )));
+            ).into()));
         }
 
         if let Some((tx_id, _mode)) = self.get_mv_tx_for_db(database_id) {
@@ -4054,7 +4133,7 @@ impl Connection {
         self.with_schema(db_id, |schema| {
             schema.get_sequence(&seq_name).map(Arc::clone)
         })
-        .ok_or_else(|| LimboError::ParseError(format!("sequence \"{name}\" does not exist")))
+        .ok_or_else(|| LimboError::ParseError(format!("sequence \"{name}\" does not exist").into()))
     }
 
     /// Record that this connection has seen a value from the named sequence (for currval).
@@ -4626,7 +4705,7 @@ impl Connection {
             .get(&collation.id())
             .cloned()
             .ok_or_else(|| {
-                LimboError::ParseError(format!("no such collation sequence: {}", collation.name()))
+                LimboError::ParseError(format!("no such collation sequence: {}", collation.name()).into())
             })
     }
 
@@ -4705,7 +4784,7 @@ impl Connection {
             if reserved_bytes != required_reserved_bytes {
                 return Err(LimboError::InvalidArgument(format!(
                     "page codec requires exactly {required_reserved_bytes} reserved bytes"
-                )));
+                ).into()));
             }
         }
         pager.set_reserved_space_bytes(reserved_bytes);
@@ -4730,19 +4809,19 @@ impl Connection {
         let pager = self.pager.load();
         if pager.is_encryption_ctx_set() {
             return Err(LimboError::InvalidArgument(
-                "cannot reset encryption attributes if already set in the session".to_string(),
+                "cannot reset encryption attributes if already set in the session".to_string().into(),
             ));
         }
         if pager.has_external_page_codec() {
             return Err(LimboError::InvalidArgument(
                 "cannot configure built-in encryption while an external page codec is installed"
-                    .to_string(),
+                    .to_string().into(),
             ));
         }
         if self.db.get_mv_store().is_some() {
             return Err(LimboError::InvalidArgument(
                 "cannot enable encryption after MVCC is active; configure encryption before PRAGMA journal_mode='mvcc'"
-                    .to_string(),
+                    .to_string().into(),
             ));
         }
         Ok(())
@@ -5358,13 +5437,13 @@ pub fn resolve_ext_path(extpath: &str) -> Result<std::path::PathBuf> {
     let path = std::path::Path::new(extpath);
     if !path.exists() {
         if is_shared_library(path) {
-            return Err(LimboError::ExtensionError(format!(
-                "Extension file not found: {extpath}"
-            )));
+            return Err(LimboError::ExtensionError(
+                format!("Extension file not found: {extpath}").into(),
+            ));
         };
         let maybe = path.with_extension(std::env::consts::DLL_EXTENSION);
         maybe.exists().then_some(maybe).ok_or_else(|| {
-            LimboError::ExtensionError(format!("Extension file not found: {extpath}"))
+            LimboError::ExtensionError(format!("Extension file not found: {extpath}").into())
         })
     } else {
         Ok(path.to_path_buf())

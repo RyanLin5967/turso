@@ -77,7 +77,7 @@ pub(crate) struct Targets {
 
 /// `R12_PREWARM` and `R12_PREWARM_FILES`.
 pub(crate) fn from_env() -> Result<(Prewarm, Targets)> {
-    let bad = |what: String| Err(LimboError::InvalidArgument(what));
+    let bad = |what: String| Err(LimboError::InvalidArgument(what.into()));
     let mode = match std::env::var("R12_PREWARM") {
         Err(std::env::VarError::NotPresent) => Prewarm::Off,
         Ok(v) => match v.as_str() {

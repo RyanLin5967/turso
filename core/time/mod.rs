@@ -160,8 +160,10 @@ fn time_date_internal(args: &[Value]) -> Value {
 }
 
 /// [`time_date_internal`], answering `none()` for a value that is no date (out of range, or an
-/// argument past i32): NULL for `time_date`, as before; PostgreSQL's out-of-range error for
-/// `make_date` and `make_timestamp` (22008; the crash batch, 2026-10-15).
+/// argument past i32): NULL for `time_date`, `make_date` and `make_timestamp`, as before;
+/// PostgreSQL's out-of-range error (22008; the crash batch, 2026-10-15) for
+/// [`make_date_or_refuse`] and [`make_timestamp_or_refuse`], which only the PostgreSQL dialect
+/// resolves.
 fn time_date_or(args: &[Value], none: impl FnOnce() -> Value) -> Value {
     if args.len() != 3 && args.len() != 6 && args.len() != 7 && args.len() != 8 {
         return Value::error(ResultCode::InvalidArgs);
@@ -221,8 +223,8 @@ fn time_date_or(args: &[Value], none: impl FnOnce() -> Value) -> Value {
     }
 }
 
-/// PostgreSQL's message for a date or timestamp past its range (SQLSTATE 22008, which the
-/// PostgreSQL frontend reads from this prefix).
+/// PostgreSQL's message for a date or timestamp past its range. The PostgreSQL producer
+/// carries DatetimeFieldOverflow separately from these words.
 pub const DATE_OUT_OF_RANGE: &str = "date field value out of range";
 
 /// `make_date` / `make_timestamp`'s answer for arguments that are no date.
@@ -245,7 +247,7 @@ fn make_date(args: &[Value]) -> Value {
         return Value::error(ResultCode::InvalidArgs);
     }
 
-    time_date_or(args, || out_of_range(args))
+    time_date_internal(args)
 }
 
 #[scalar(name = "make_timestamp")]
@@ -254,7 +256,45 @@ fn make_timestamp(args: &[Value]) -> Value {
         return Value::error(ResultCode::InvalidArgs);
     }
 
-    time_date_or(args, || out_of_range(args))
+    time_date_internal(args)
+}
+
+/// `make_date` refusing arguments that are no date with PostgreSQL's 22008, where the SQLite
+/// dialect's answers NULL (ultrareview of fastest-wire, finding 10: the refusal reached every
+/// dialect). The PostgreSQL dialect resolves `make_date` to it (no per-connection registration).
+pub fn make_date_or_refuse(args: &[crate::Value]) -> crate::Result<crate::Value> {
+    date_or_refuse(args, 3)
+}
+
+/// `make_timestamp` as [`make_date_or_refuse`] is `make_date`.
+pub fn make_timestamp_or_refuse(args: &[crate::Value]) -> crate::Result<crate::Value> {
+    date_or_refuse(args, 6)
+}
+
+fn date_or_refuse(args: &[crate::Value], arity: usize) -> crate::Result<crate::Value> {
+    let args: Vec<Value> = args.iter().map(|v| v.to_ffi()).collect();
+    let range_refusal = std::cell::Cell::new(false);
+    let date = if args.len() == arity {
+        time_date_or(&args, || {
+            range_refusal.set(true);
+            out_of_range(&args)
+        })
+    } else {
+        Value::error(ResultCode::InvalidArgs)
+    };
+    for arg in args {
+        // SAFETY: each was made by to_ffi above and is freed once, here.
+        unsafe { arg.__free_internal_type() };
+    }
+    crate::Value::from_ffi(date).map_err(|error| match error {
+        crate::LimboError::ExtensionError(message) if range_refusal.get() => {
+            crate::LimboError::ExtensionError(crate::error::SqlErrorMessage::classified(
+                crate::error::SqlErrorKind::DatetimeFieldOverflow,
+                message.into_string(),
+            ))
+        }
+        other => other,
+    })
 }
 
 #[scalar(name = "time_get", alias = "date_part")]

@@ -160,10 +160,8 @@ fn column_type(col: &turso_core::schema::Column) -> ColumnType {
         "bpchar" | "char" | "character" => s("character", "bpchar"),
         "text" | "" => s("text", "text"),
         "numeric" | "decimal" => s("numeric", "numeric"),
-        "real" | "float8" | "double precision" | "double" | "float" => {
-            s("double precision", "float8")
-        }
-        "float4" => s("real", "float4"),
+        "float8" | "double precision" | "double" | "float" => s("double precision", "float8"),
+        "real" | "float4" => s("real", "float4"),
         "boolean" | "bool" => s("boolean", "bool"),
         "timestamp" => s("timestamp without time zone", "timestamp"),
         "timestamptz" => s("timestamp with time zone", "timestamptz"),

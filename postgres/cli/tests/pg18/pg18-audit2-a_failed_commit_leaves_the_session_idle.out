@@ -1,0 +1,23 @@
+>> Q CREATE TABLE p(id INT PRIMARY KEY)
+   C CREATE TABLE
+   Z I
+>> Q CREATE TABLE c(id INT PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED)
+   C CREATE TABLE
+   Z I
+>> Q BEGIN
+   C BEGIN
+   Z T
+>> Q INSERT INTO c VALUES (1, 99)
+   C INSERT 0 1
+   Z T
+>> Q COMMIT
+   E S=ERROR C=23503 M=insert or update on table "c" violates foreign key constraint "c_pid_fkey"
+   Z I
+>> Q SELECT count(*) FROM c
+   T oids=[20]
+   D ['0']
+   C SELECT 1
+   Z I
+exit 0
+postgres (PostgreSQL) 18.6 (Homebrew)
+recorded 2026-10-15T21:00:36Z with pgproto.py scenario-audit2-a_failed_commit_leaves_the_session_idle.txt on the 62816 cluster, database audit2, Homebrew PostgreSQL 18.6 (trust auth, TCP 127.0.0.1)

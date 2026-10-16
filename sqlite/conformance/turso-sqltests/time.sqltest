@@ -428,3 +428,14 @@ expect {
     3600000000000
 }
 
+
+# The SQLite dialect answers NULL for make_date / make_timestamp arguments that are no date (a
+# year past chrono's range, or past i32), as time_date does; PostgreSQL's 22008 refusal is the
+# PostgreSQL frontend's alone. The refusal had reached every dialect, so a query over such rows
+# failed whole (ultrareview of fastest-wire, finding 10).
+test make_date_past_the_range_is_null {
+    SELECT make_date(99999999, 1, 1) IS NULL, make_date(2147483648, 1, 1) IS NULL, make_timestamp(99999999, 1, 1, 0, 0, 0) IS NULL, make_date(2020, 2, 29) IS NOT NULL;
+}
+expect {
+    1|1|1|1
+}

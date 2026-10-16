@@ -1,0 +1,20 @@
+>> Q CREATE TABLE t(id INT PRIMARY KEY, v TEXT)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO t VALUES (1, 'trunk')
+   C INSERT 0 1
+   Z I
+>> Q SET search_path TO public
+   C SET
+   Z I
+>> Q TRUNCATE t
+   C TRUNCATE TABLE
+   Z I
+>> Q SELECT count(*) FROM t
+   T oids=[20]
+   D ['0']
+   C SELECT 1
+   Z I
+exit 0
+postgres (PostgreSQL) 18.6 (Homebrew)
+recorded 2026-10-15T21:00:41Z with pgproto.py scenario-audit2-set_and_truncate_report_their_command_tags.txt on the 62816 cluster, database audit2, Homebrew PostgreSQL 18.6 (trust auth, TCP 127.0.0.1)

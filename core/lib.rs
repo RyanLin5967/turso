@@ -84,6 +84,8 @@ mod stats;
 #[allow(dead_code)]
 #[cfg(feature = "time")]
 mod time;
+#[cfg(feature = "time")]
+pub use time::{make_date_or_refuse, make_timestamp_or_refuse};
 mod translate;
 mod util;
 #[cfg(feature = "uuid")]
@@ -265,7 +267,7 @@ impl<'a> QueryRunner<'a> {
                 "",
                 Some(LimboError::ParseError(format!(
                     "invalid UTF-8 in SQL input: {err}"
-                ))),
+                ).into())),
             ),
         };
         Self {

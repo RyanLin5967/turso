@@ -1,0 +1,75 @@
+>> Q DROP TABLE IF EXISTS big
+   N S=NOTICE C=00000 M=table "big" does not exist, skipping
+   C DROP TABLE
+   Z I
+>> Q CREATE TABLE big(v BIGINT, i INT)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO big VALUES (9223372036854775807, 2147483647), (1, 1)
+   C INSERT 0 2
+   Z I
+>> Q SELECT -9223372036854775808::int8
+   E S=ERROR C=22003 M=bigint out of range
+   Z I
+>> Q SELECT abs(-9223372036854775808::int8)
+   E S=ERROR C=22003 M=bigint out of range
+   Z I
+>> Q SELECT '9223372036854775808'::int8
+   E S=ERROR C=22003 M=value "9223372036854775808" is out of range for type bigint
+   Z I
+>> Q SELECT 9223372036854775807 + 1
+   E S=ERROR C=22003 M=bigint out of range
+   Z I
+>> Q SELECT v + 1 FROM big WHERE v > 1
+   T oids=[20] names=['?column?']
+   E S=ERROR C=22003 M=bigint out of range
+   Z I
+>> Q SELECT v * 2 FROM big WHERE v > 1
+   T oids=[20] names=['?column?']
+   E S=ERROR C=22003 M=bigint out of range
+   Z I
+>> Q SELECT -v - 2 FROM big WHERE v > 1
+   T oids=[20] names=['?column?']
+   E S=ERROR C=22003 M=bigint out of range
+   Z I
+>> Q SELECT 2147483647::int4 + 1
+   E S=ERROR C=22003 M=integer out of range
+   Z I
+>> Q SELECT i + 1 FROM big WHERE v > 1
+   T oids=[23] names=['?column?']
+   E S=ERROR C=22003 M=integer out of range
+   Z I
+>> Q SELECT i * 2 FROM big WHERE v > 1
+   T oids=[23] names=['?column?']
+   E S=ERROR C=22003 M=integer out of range
+   Z I
+>> Q SELECT '2147483648'::int4
+   E S=ERROR C=22003 M=value "2147483648" is out of range for type integer
+   Z I
+>> Q SELECT 32767::int2 + 1::int2
+   E S=ERROR C=22003 M=smallint out of range
+   Z I
+>> Q SELECT CAST(9.5e18 AS BIGINT)
+   E S=ERROR C=22003 M=bigint out of range
+   Z I
+>> Q SELECT CAST(3e9 AS INT)
+   E S=ERROR C=22003 M=integer out of range
+   Z I
+>> Q INSERT INTO big VALUES (1, 2147483648)
+   E S=ERROR C=22003 M=integer out of range
+   Z I
+>> Q SELECT sum(i) FROM big
+   T oids=[20] names=['sum']
+   D ['2147483648']
+   C SELECT 1
+   Z I
+>> Q SELECT sum(v) FROM big
+   T oids=[1700] names=['sum']
+   D ['9223372036854775808']
+   C SELECT 1
+   Z I
+>> Q DROP TABLE big
+   C DROP TABLE
+   Z I
+postgres (PostgreSQL) 18.6 (Homebrew)
+2026-10-15T21:49:46Z

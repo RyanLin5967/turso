@@ -1737,13 +1737,13 @@ fn vacuum_in_place_step(
                 // 1. Must be in auto-commit mode (no explicit transaction).
                 if !connection.auto_commit.load(Ordering::SeqCst) {
                     return Err(LimboError::TxError(
-                        "cannot VACUUM from within a transaction".to_string(),
+                        "cannot VACUUM from within a transaction".to_string().into(),
                     ));
                 }
                 // 2. No other active root statements on this connection.
                 if connection.n_active_root_statements.load(Ordering::SeqCst) != 1 {
                     return Err(LimboError::TxError(
-                        "cannot VACUUM - SQL statements in progress".to_string(),
+                        "cannot VACUUM - SQL statements in progress".to_string().into(),
                     ));
                 }
                 // 3. Reject readonly database, well you cannot edit a readonly db ^_^
@@ -1778,7 +1778,7 @@ fn vacuum_in_place_step(
                     let mut guard = MvccVacuumGuard::acquire(connection.clone(), mv_store.clone())?;
                     if mv_store.has_uncheckpointed_log()? {
                         return Err(LimboError::TxError(
-                            "cannot VACUUM an MVCC database with uncheckpointed changes; run PRAGMA wal_checkpoint(TRUNCATE) first".to_string(),
+                            "cannot VACUUM an MVCC database with uncheckpointed changes; run PRAGMA wal_checkpoint(TRUNCATE) first".to_string().into(),
                         ));
                     }
                     if connection.get_mv_tx_id_for_db(db).is_some() {

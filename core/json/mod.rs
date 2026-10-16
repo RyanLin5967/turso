@@ -78,7 +78,7 @@ pub fn jsonb(json_value: &Value, cache: &JsonCacheCell) -> crate::Result<Value> 
             .get_or_insert_with(json_value, json_conv_fn)
             .map_err(|error| match error {
                 LimboError::OutOfMemory => LimboError::OutOfMemory,
-                _ => LimboError::ParseError("malformed JSON".to_string()),
+                _ => LimboError::ParseError("malformed JSON".to_string().into()),
             })?;
     Ok(Value::Blob(jsonbin.data()))
 }
@@ -98,11 +98,11 @@ pub(crate) fn raw_jsonb_element_len(data: &[u8], cursor: usize) -> crate::Result
     let (header, header_len) = JsonbHeader::from_slice(cursor, data)?;
     let element_len = header_len
         .checked_add(header.payload_size())
-        .ok_or_else(|| LimboError::ParseError("malformed JSON".to_string()))?;
+        .ok_or_else(|| LimboError::ParseError("malformed JSON".to_string().into()))?;
     let end = cursor
         .checked_add(element_len)
         .filter(|end| *end <= data.len())
-        .ok_or_else(|| LimboError::ParseError("malformed JSON".to_string()))?;
+        .ok_or_else(|| LimboError::ParseError("malformed JSON".to_string().into()))?;
     debug_assert_eq!(end - cursor, element_len);
     Ok(element_len)
 }
@@ -127,7 +127,7 @@ fn parse_as_json_text(slice: &[u8], mode: Conv) -> crate::Result<Jsonb> {
     let zero_pos = slice.iter().position(|&b| b == 0).unwrap_or(slice.len());
     let truncated = &slice[..zero_pos];
     let str = std::str::from_utf8(truncated)
-        .map_err(|_| LimboError::ParseError("malformed JSON".to_string()))?;
+        .map_err(|_| LimboError::ParseError("malformed JSON".to_string().into()))?;
     Jsonb::from_str_with_mode(str, mode).map_err(Into::into)
 }
 
@@ -138,14 +138,14 @@ fn parse_as_json_text_tracking(slice: &[u8]) -> crate::Result<(Jsonb, ParseInfo)
     let zero_pos = slice.iter().position(|&b| b == 0).unwrap_or(slice.len());
     let truncated = &slice[..zero_pos];
     let str = std::str::from_utf8(truncated)
-        .map_err(|_| LimboError::ParseError("malformed JSON".to_string()))?;
+        .map_err(|_| LimboError::ParseError("malformed JSON".to_string().into()))?;
     Jsonb::from_str_tracking(str).map_err(Into::into)
 }
 
 fn malformed_json_error(error: JsonError) -> LimboError {
     match error {
         JsonError::OutOfMemory => LimboError::OutOfMemory,
-        JsonError::Message { .. } => LimboError::ParseError("malformed JSON".to_string()),
+        JsonError::Message { .. } => LimboError::ParseError("malformed JSON".to_string().into()),
     }
 }
 
@@ -240,7 +240,7 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
                         let total_expected = match header_offset.checked_add(payload_size) {
                             Some(t) => t,
                             None => {
-                                return Err(LimboError::ParseError("malformed JSON".to_string()))
+                                return Err(LimboError::ParseError("malformed JSON".to_string().into()))
                             }
                         };
 
@@ -712,7 +712,7 @@ pub fn json_string_to_db_type(
             // f64, which is exactly what ->> and json_extract return.
             match json_string.parse::<f64>() {
                 Ok(float_val) => Ok(Value::from_f64(float_val)),
-                Err(_) => Err(LimboError::Constraint("malformed JSON".to_string())),
+                Err(_) => Err(LimboError::Constraint("malformed JSON".to_string().into())),
             }
         }
         ElementType::INT | ElementType::INT5 => {
@@ -723,7 +723,7 @@ pub fn json_string_to_db_type(
                 let res = f64::from_str(&json_string);
                 match res {
                     Ok(num) => Ok(Value::from_f64(num)),
-                    Err(_) => Err(LimboError::Constraint("malformed JSON".to_string())),
+                    Err(_) => Err(LimboError::Constraint("malformed JSON".to_string().into())),
                 }
             }
         }

@@ -56,6 +56,12 @@ windows-sys = { workspace = true, features = [
 default = ["io_uring", "mimalloc"]
 io_uring = ["turso_core/io_uring"]
 mimalloc = ["dep:mimalloc"]
+# The wire budget's allocation counter (budget.py work); never in a credited build.
+alloc-count = ["turso_pg_server/alloc-count"]
+# The L5 phase table (turso_branch_phases()); a diagnostic build only, never a verdict.
+phase-count = ["turso_pg_server/phase-count"]
+# MEASUREMENT ONLY: the confirmation-word hold (budget.py --verdict full-word-held).
+measure-word-hold = ["turso_pg_server/measure-word-hold"]
 
 [build-dependencies]
 syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }

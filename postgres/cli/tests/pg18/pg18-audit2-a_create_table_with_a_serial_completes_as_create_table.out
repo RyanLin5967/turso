@@ -1,0 +1,12 @@
+>> Q CREATE TABLE s1(id SERIAL, v INT)
+   C CREATE TABLE
+   Z I
+>> X - CREATE TABLE s2(id SERIAL, v INT)
+   ParseComplete
+   BindComplete
+   NoData
+   C CREATE TABLE
+   Z I
+exit 0
+postgres (PostgreSQL) 18.6 (Homebrew)
+recorded 2026-10-15T21:00:36Z with pgproto.py scenario-audit2-a_create_table_with_a_serial_completes_as_create_table.txt on the 62816 cluster, database audit2, Homebrew PostgreSQL 18.6 (trust auth, TCP 127.0.0.1)

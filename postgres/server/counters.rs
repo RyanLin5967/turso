@@ -86,3 +86,142 @@ pub fn process_counters() -> Option<ProcessCounters> {
         None
     }
 }
+
+/// A global allocator that counts the allocations (alloc, alloc_zeroed and realloc calls) it serves,
+/// over the system allocator, for the per-step allocation budget (budget.py work). A binary installs
+/// it as its `#[global_allocator]` only in a build with the `alloc-count` feature: one relaxed atomic
+/// add per allocation, shared by every thread, which a credited build must not pay.
+pub struct CountingAlloc;
+
+static ALLOCATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+thread_local! {
+    /// The allocations served to this thread (a const-initialized Cell: reading it allocates
+    /// nothing, and it has no destructor to run while the thread ends).
+    static THREAD_ALLOCATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn count() {
+    ALLOCATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let _ = THREAD_ALLOCATIONS.try_with(|n| n.set(n.get() + 1));
+}
+
+/// The allocations [`CountingAlloc`] has served to this thread (0 when it is not the allocator):
+/// for an in-process test of one statement's allocations, which other threads cannot disturb.
+pub fn thread_allocations() -> u64 {
+    THREAD_ALLOCATIONS.try_with(|n| n.get()).unwrap_or(0)
+}
+
+unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        count();
+        unsafe { std::alloc::System.alloc(layout) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        count();
+        unsafe { std::alloc::System.alloc_zeroed(layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        count();
+        unsafe { std::alloc::System.realloc(ptr, layout, new_size) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        unsafe { std::alloc::System.dealloc(ptr, layout) }
+    }
+}
+
+/// The allocations [`CountingAlloc`] has served in this process; None when it is not this process's
+/// allocator (it has served none: every process allocates before it could ask).
+pub fn allocations() -> Option<u64> {
+    match ALLOCATIONS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => None,
+        n => Some(n),
+    }
+}
+
+/// This thread's own instructions retired and cycles (`thread_selfcounts`, the kernel's per-thread
+/// fixed counters; no privilege), so a budget window counts the session's work alone: the engine's
+/// background threads (the branch store's confirm writer) land in windows at random and made the
+/// process-wide counts swing by tens of thousands of instructions. `None` off Apple platforms.
+pub fn thread_counters() -> Option<(u64, u64)> {
+    #[cfg(target_vendor = "apple")]
+    {
+        extern "C" {
+            fn thread_selfcounts(kind: i32, buf: *mut u64, size: usize) -> i32;
+        }
+        let mut c = [0u64; 2];
+        let rc = unsafe { thread_selfcounts(1, c.as_mut_ptr(), std::mem::size_of_val(&c)) };
+        (rc == 0).then_some((c[0], c[1]))
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        None
+    }
+}
+
+/// The CPU time, in nanoseconds, every OTHER thread of this process has used so far (user plus
+/// system, `proc_pidinfo(PROC_PIDTHREADID64INFO)` of each thread `PROC_PIDLISTTHREADIDS` lists,
+/// the calling thread skipped by its id). Read at both ends of a budget window, a difference above
+/// zero is a foreign thread that ran inside it: the exclusion the word-held FULL verdict rests on,
+/// and the re-judgment's off-thread guard. The instruction gap it replaces (process-wide rusage less
+/// this thread's thread_selfcounts) disagreed by about +/-10k instructions at random, below zero as
+/// often as above, so it said nothing about other threads (DECISIONS 308c3232a3). A thread that
+/// started and ended between the two reads is not listed at either: BLIND SPOT, stated. `None` off
+/// Apple platforms or when the kernel refuses a read.
+pub fn foreign_thread_cpu_ns() -> Option<u64> {
+    #[cfg(target_vendor = "apple")]
+    {
+        const PROC_PIDLISTTHREADIDS: libc::c_int = 28;
+        const PROC_PIDTHREADID64INFO: libc::c_int = 15;
+        extern "C" {
+            fn pthread_threadid_np(thread: libc::pthread_t, id: *mut u64) -> libc::c_int;
+        }
+        let pid = std::process::id() as libc::c_int;
+        let mut me = 0u64;
+        if unsafe { pthread_threadid_np(0 as libc::pthread_t, &mut me) } != 0 {
+            return None;
+        }
+        let mut ids = [0u64; 256];
+        let bytes = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                PROC_PIDLISTTHREADIDS,
+                0,
+                ids.as_mut_ptr().cast(),
+                std::mem::size_of_val(&ids) as libc::c_int,
+            )
+        };
+        if bytes <= 0 {
+            return None;
+        }
+        let n = bytes as usize / std::mem::size_of::<u64>();
+        let mut total = 0u64;
+        for &id in &ids[..n.min(ids.len())] {
+            if id == me {
+                continue;
+            }
+            let mut info: libc::proc_threadinfo = unsafe { std::mem::zeroed() };
+            let got = unsafe {
+                libc::proc_pidinfo(
+                    pid,
+                    PROC_PIDTHREADID64INFO,
+                    id,
+                    (&mut info as *mut libc::proc_threadinfo).cast(),
+                    std::mem::size_of::<libc::proc_threadinfo>() as libc::c_int,
+                )
+            };
+            // A thread that ended after the listing reads nothing: it is not counted.
+            if got as usize == std::mem::size_of::<libc::proc_threadinfo>() {
+                total += info.pth_user_time + info.pth_system_time;
+            }
+        }
+        Some(total)
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        None
+    }
+}

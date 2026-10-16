@@ -24,6 +24,7 @@
 
 pub mod counters;
 
+use turso_parser::sql_error::SqlErrorKind;
 use std::num::NonZero;
 use std::sync::{
     atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -37,13 +38,14 @@ use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 use turso_core::{CheckpointMode, Database, LimboError, Value};
 use turso_pg::{
-    attach_schema_files, branch_call, element_of, pg_bool, split_statements, PgBranchArg,
-    PgBranchCall, PgConnection, StatementTypes,
+    attach_schema_files, branch_call, element_of, pg_bool, read_parse_message, single_statement,
+    split_statements, ParseMessage, PgBranchArg, PgBranchCall, PgConnection, StatementTypes,
+    TxStmt,
 };
 use turso_pg_parser::{pg_space, scan_params, skip_blank, sql_comment, ParamScan};
 
 use pgwire::api::auth::noop::NoopStartupHandler;
-use pgwire::api::auth::StartupHandler;
+use pgwire::api::auth::{DefaultServerParameterProvider, StartupHandler};
 use pgwire::api::portal::{Format, Portal, PortalExecutionState};
 use pgwire::api::query::{send_ready_for_query, ExtendedQueryHandler, SimpleQueryHandler};
 use pgwire::api::results::{
@@ -66,6 +68,7 @@ use pgwire::messages::response::{
     EmptyQueryResponse, NoticeResponse, ReadyForQuery, TransactionStatus,
 };
 use pgwire::messages::simplequery::Query;
+use pgwire::messages::startup::ParameterStatus;
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use pgwire::tokio::process_socket;
 use pgwire::types::format::FormatOptions;
@@ -104,46 +107,78 @@ pub struct TursoPgServer {
     address: String,
     shared: Arc<Shared>,
     interrupt_count: Arc<AtomicUsize>,
+    /// Every session thread started and not yet joined; the finished ones are reaped at each
+    /// admission, and the shutdown joins the rest.
+    threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
+
+/// How long the shutdown waits for the session threads it ended to finish.
+const SHUTDOWN_JOIN: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// One statement's waits on a lock another session holds: SQLite's default busy schedule (1, 2,
 /// 5, 10, 15, 20, 25, 25, 25, 50, 50 ms, then 100 ms) up to the server's lock wait. The clock is
 /// first read at the first wait, so a statement that meets no lock reads it not at all (wire
-/// review 5 item 20: every create read it).
-struct Backoff {
+/// review 5 item 20: every create read it). A wait is the session's: its cancel or
+/// statement_timeout ends it, which the engine's progress handler cannot see while no statement
+/// steps (ultrareview of fastest-wire, finding 9).
+struct Backoff<'a> {
     lock_wait: std::time::Duration,
     deadline: Option<std::time::Instant>,
     attempt: usize,
+    interrupts: Option<&'a Interrupts>,
 }
 
-impl Backoff {
-    fn new(lock_wait: std::time::Duration) -> Self {
+impl<'a> Backoff<'a> {
+    fn new(lock_wait: std::time::Duration, interrupts: &'a Interrupts) -> Self {
         Self {
             lock_wait,
             deadline: None,
             attempt: 0,
+            interrupts: Some(interrupts),
         }
     }
 
     /// A Backoff that never waits: its statement is never stepped again or run anew.
     fn never() -> Self {
-        Self::new(std::time::Duration::ZERO)
+        Self {
+            lock_wait: std::time::Duration::ZERO,
+            deadline: None,
+            attempt: 0,
+            interrupts: None,
+        }
     }
 
-    /// Sleep the schedule's next delay and say so, or say false, without sleeping, when the delay
-    /// would end past the lock wait: then the next attempt is the last.
-    fn wait(&mut self) -> bool {
+    fn wait(&mut self) -> turso_core::Result<bool> {
+        let Some(interrupts) = self.interrupts else {
+            return Ok(false);
+        };
+        self.wait_in(WaitMode::Statement(interrupts))
+    }
+
+    /// A post-write Busy must finish: dropping it can commit its rows, so reporting 57014
+    /// would tell the client a committed write failed (C37 M2, lead ruling for C42).
+    fn wait_for_commit_completion(&mut self) -> bool {
+        self.wait_in(WaitMode::CommitCompletion)
+            .expect("commit completion does not check statement interrupts")
+    }
+
+    fn wait_in(&mut self, mode: WaitMode<'_>) -> turso_core::Result<bool> {
         const DELAYS_MS: [u64; 12] = [1, 2, 5, 10, 15, 20, 25, 25, 25, 50, 50, 100];
+        mode.check()?;
         let now = std::time::Instant::now();
         let deadline = *self.deadline.get_or_insert(now + self.lock_wait);
         let delay =
             std::time::Duration::from_millis(DELAYS_MS[self.attempt.min(DELAYS_MS.len() - 1)]);
         self.attempt += 1;
         if now + delay > deadline {
-            return false;
+            return Ok(false);
         }
-        std::thread::sleep(delay);
-        true
+        let waits = &self
+            .interrupts
+            .expect("a waiting backoff has a session")
+            .waits;
+        drop(waits.wait_while(waits.uses(), now + delay, mode, |_| true)?);
+        Ok(true)
     }
 }
 
@@ -159,12 +194,19 @@ impl Backoff {
 /// is the statement's.
 fn run_waiting(
     stmt: &mut turso_core::Statement,
-    backoff: &mut Backoff,
+    backoff: &mut Backoff<'_>,
     mut row: impl FnMut(&turso_core::Row) -> turso_core::Result<()>,
 ) -> turso_core::Result<()> {
     loop {
         match stmt.run_with_row_callback(&mut row) {
-            Err(LimboError::Busy) if stmt.n_change() > 0 && backoff.wait() => {}
+            // Not stopped by a cancel or statement_timeout: the statement changed rows, and
+            // dropped here the engine's reset commits them, so a 57014 would report a write that
+            // was committed (fresh-context review of the ultrareview fixes).
+            Err(LimboError::Busy) if stmt.n_change() > 0 => {
+                if !backoff.wait_for_commit_completion() {
+                    return Err(LimboError::Busy);
+                }
+            }
             r => return r,
         }
     }
@@ -179,25 +221,179 @@ struct Shared {
     lock_wait: std::time::Duration,
     /// Sessions admitted and not yet ended.
     live: AtomicUsize,
-    /// The named branches a session is on, or that a delete is releasing: a delete is refused
-    /// while a session is on the branch (55006, as PostgreSQL refuses DROP DATABASE of a database in
-    /// use), and a switch while the branch is being deleted. One hash operation under the lock per
-    /// switch, per leave and two per delete; no engine call is made under it.
-    in_use: Mutex<std::collections::HashMap<String, BranchUse>>,
-    /// Signalled when an entry leaves `in_use`, for a delete waiting on a session that is closing.
-    in_use_freed: std::sync::Condvar,
-    /// Threads waiting on `in_use_freed`: a release signals only when there is one, so an
-    /// uncontended switch or delete wakes nobody.
+    waits: Arc<SessionWaits>,
+    /// A branch release signals only if a branch wait is active.
     in_use_waiters: AtomicUsize,
     /// How long a claim or a delete waits on `in_use`: IN_USE_WAIT (a field so a unit test can
     /// shorten it).
     in_use_wait: std::time::Duration,
+    /// Each live session's interrupt flags by its BackendKeyData (process id, secret key), for a
+    /// CancelRequest on another connection to stop its statement.
+    cancels: Mutex<std::collections::HashMap<(i32, i32), std::sync::Weak<Interrupts>>>,
+    /// The next session's process id.
+    next_pid: std::sync::atomic::AtomicI32,
+    /// How long a client has to complete its startup (TursoPgServer::with_startup_timeout).
+    startup_timeout: std::time::Duration,
+    /// Every live session's socket, for the shutdown that ends them.
+    sessions: Arc<SessionSockets>,
+    #[cfg(test)]
+    before_session: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    fail_socket_clone: std::sync::atomic::AtomicBool,
+}
+
+/// A handle on each live session's socket (a dup of its descriptor), so the server's shutdown can
+/// shut them: a session thread blocked reading its socket then reads the stream's end and ends.
+#[derive(Default)]
+struct SessionSockets {
+    stopping: std::sync::atomic::AtomicBool,
+    next: AtomicU64,
+    open: Mutex<std::collections::HashMap<u64, std::net::TcpStream>>,
+}
+
+impl SessionSockets {
+    fn register(&self, socket: std::net::TcpStream) -> Option<u64> {
+        let mut open = self.open.lock().unwrap_or_else(|e| e.into_inner());
+        // Registration and the final drain hold the same mutex: once shutdown wins,
+        // a worker that has not started cannot add a socket the drain missed.
+        if self.is_stopping() {
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+            return None;
+        }
+        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        open.insert(id, socket);
+        Some(id)
+    }
+
+    fn is_stopping(&self) -> bool {
+        self.stopping.load(Ordering::Acquire)
+    }
+
+    fn deregister(&self, id: u64) {
+        self.open
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&id);
+    }
+
+    /// Shut every live session's socket both ways; returns how many.
+    fn shut_all(&self) -> usize {
+        let open = self.open.lock().unwrap_or_else(|e| e.into_inner());
+        self.stopping.store(true, Ordering::Release);
+        for socket in open.values() {
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+        }
+        open.len()
+    }
+}
+
+/// A session's requests to stop its running statement: a CancelRequest, and SET statement_timeout's
+/// deadline. The engine reads them through each of the session's connections' progress handler
+/// (every PROGRESS_OPS virtual-machine steps), and stops the statement with an interrupt (57014).
+/// A cancel that arrives between statements is dropped, as PostgreSQL drops it.
+struct Interrupts {
+    waits: Arc<SessionWaits>,
+    sessions: Arc<SessionSockets>,
+    cancel: std::sync::atomic::AtomicBool,
+    /// The running statement's deadline, in microseconds since `base`; 0 none.
+    deadline_us: AtomicU64,
+    base: std::time::Instant,
+}
+
+/// Virtual-machine steps between two reads of a session's [`Interrupts`].
+const PROGRESS_OPS: u64 = 1000;
+
+thread_local! {
+    /// Why this thread's last statement was interrupted: 1 a cancel, 2 statement_timeout (read by
+    /// `engine_info` for PostgreSQL's message).
+    static INTERRUPT_CAUSE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+impl Interrupts {
+    fn new(waits: Arc<SessionWaits>, sessions: Arc<SessionSockets>) -> Self {
+        Self {
+            waits,
+            sessions,
+            cancel: std::sync::atomic::AtomicBool::new(false),
+            deadline_us: AtomicU64::new(0),
+            base: std::time::Instant::now(),
+        }
+    }
+
+    /// A statement starts: earlier cancels are dropped, and its deadline set (0 ms none).
+    fn begin(&self, timeout_ms: u64) -> InterruptsArmed<'_> {
+        self.cancel.store(false, Ordering::Relaxed);
+        let deadline = match timeout_ms {
+            0 => 0,
+            ms => (self.base.elapsed().as_micros() as u64)
+                .saturating_add(ms.saturating_mul(1000))
+                .max(1),
+        };
+        self.deadline_us.store(deadline, Ordering::Relaxed);
+        INTERRUPT_CAUSE.with(|c| c.set(0));
+        InterruptsArmed(self)
+    }
+
+    fn request_cancel(&self) {
+        // Hold the wait's mutex across flag + notification so its check-to-sleep transition
+        // cannot lose this wakeup.
+        let _uses = self.waits.uses();
+        self.cancel.store(true, Ordering::Relaxed);
+        self.waits.changed.notify_all();
+    }
+
+    /// The progress handler's question: stop the running statement?
+    fn should_stop(&self) -> bool {
+        if self.sessions.is_stopping() || self.cancel.load(Ordering::Relaxed) {
+            INTERRUPT_CAUSE.with(|c| c.set(1));
+            return true;
+        }
+        let deadline = self.deadline_us.load(Ordering::Relaxed);
+        if deadline != 0 && self.base.elapsed().as_micros() as u64 >= deadline {
+            INTERRUPT_CAUSE.with(|c| c.set(2));
+            return true;
+        }
+        false
+    }
+}
+
+/// The statement's span: its end drops a cancel that came too late and clears the deadline.
+struct InterruptsArmed<'a>(&'a Interrupts);
+
+impl Drop for InterruptsArmed<'_> {
+    fn drop(&mut self) {
+        self.0.deadline_us.store(0, Ordering::Relaxed);
+        self.0.cancel.store(false, Ordering::Relaxed);
+    }
+}
+
+/// pgwire's CancelRequest handler: the named session's statement is asked to stop.
+struct CancelSessions(Arc<Shared>);
+
+#[async_trait]
+impl pgwire::api::cancel::CancelHandler for CancelSessions {
+    async fn on_cancel_request(&self, request: pgwire::messages::cancel::CancelRequest) {
+        let Some(secret) = request.secret_key.as_i32() else {
+            return;
+        };
+        let target = self
+            .0
+            .cancels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(request.pid, secret))
+            .and_then(std::sync::Weak::upgrade);
+        if let Some(interrupts) = target {
+            interrupts.request_cancel();
+        }
+    }
 }
 
 /// How long a delete waits for the session on its branch to go, and a switch for a delete of its
 /// branch to end: PostgreSQL's DROP DATABASE waits 5 s for exiting backends (CountOtherDBBackends,
 /// 50 x 100 ms).
 const IN_USE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BranchUse {
@@ -218,46 +414,58 @@ impl Shared {
             max_connections,
             lock_wait,
             live: AtomicUsize::new(0),
-            in_use: Mutex::new(std::collections::HashMap::new()),
-            in_use_freed: std::sync::Condvar::new(),
+            waits: Arc::new(SessionWaits::default()),
             in_use_waiters: AtomicUsize::new(0),
             in_use_wait: IN_USE_WAIT,
+            cancels: Mutex::new(std::collections::HashMap::new()),
+            next_pid: std::sync::atomic::AtomicI32::new(1),
+            startup_timeout: std::time::Duration::from_secs(DEFAULT_AUTHENTICATION_TIMEOUT_S),
+            sessions: Arc::new(SessionSockets::default()),
+            #[cfg(test)]
+            before_session: Mutex::new(None),
+            #[cfg(test)]
+            fail_socket_clone: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
-    fn uses(&self) -> MutexGuard<'_, std::collections::HashMap<String, BranchUse>> {
-        self.in_use.lock().unwrap_or_else(|e| e.into_inner())
+    fn clone_session_socket(&self, socket: &std::net::TcpStream) -> std::io::Result<std::net::TcpStream> {
+        #[cfg(test)]
+        if self.fail_socket_clone.load(Ordering::Relaxed) {
+            return Err(std::io::Error::other("test socket duplication failure"));
+        }
+        socket.try_clone()
     }
 
-    /// The map once `name` is in none of `states` there, or at the wait's end: what a closing session
-    /// or a running delete leaves behind is waited out, not refused (wire review 3 item 4).
+    fn uses(
+        &self,
+    ) -> MutexGuard<'_, std::collections::HashMap<compact_str::CompactString, BranchUse>> {
+        self.waits.uses()
+    }
+
+    #[allow(clippy::type_complexity)]
     fn wait_while<'a>(
         &'a self,
-        mut uses: MutexGuard<'a, std::collections::HashMap<String, BranchUse>>,
+        uses: MutexGuard<'a, std::collections::HashMap<compact_str::CompactString, BranchUse>>,
         name: &str,
         states: &[BranchUse],
-    ) -> MutexGuard<'a, std::collections::HashMap<String, BranchUse>> {
-        let held = |uses: &std::collections::HashMap<String, BranchUse>| {
+        interrupts: &Interrupts,
+    ) -> SqlResult<MutexGuard<'a, std::collections::HashMap<compact_str::CompactString, BranchUse>>>
+    {
+        let held = |uses: &std::collections::HashMap<compact_str::CompactString, BranchUse>| {
             uses.get(name).is_some_and(|u| states.contains(u))
         };
         if !held(&uses) {
-            return uses;
+            return Ok(uses);
         }
         self.in_use_waiters.fetch_add(1, Ordering::SeqCst);
-        let deadline = std::time::Instant::now() + self.in_use_wait;
-        while held(&uses) {
-            let left = deadline.saturating_duration_since(std::time::Instant::now());
-            if left.is_zero() {
-                break;
-            }
-            uses = self
-                .in_use_freed
-                .wait_timeout(uses, left)
-                .unwrap_or_else(|e| e.into_inner())
-                .0;
-        }
+        let result = self.waits.wait_while(
+            uses,
+            std::time::Instant::now() + self.in_use_wait,
+            WaitMode::Statement(interrupts),
+            held,
+        );
         self.in_use_waiters.fetch_sub(1, Ordering::SeqCst);
-        uses
+        result.map_err(|e| engine_info(&e))
     }
 
     /// Claim `name` for a session about to connect to it. One session per branch: a branch another
@@ -265,14 +473,22 @@ impl Shared {
     /// waits, then refused with 55006. Refused at once, a reconnect right after a close met 55006
     /// whenever the closed session's thread had not yet released the branch (wire review 6 item
     /// 5); only a refusal pays the wait (lead ruling).
+    #[cfg(test)]
     fn claim(&self, name: &str, severity: &str) -> SqlResult<()> {
-        let mut uses = self.wait_while(self.uses(), name, &[BranchUse::Held, BranchUse::Deleting]);
+        self.claim_for(name, severity, &Interrupts::new(self.waits.clone(), self.sessions.clone()))
+    }
+
+    /// [`Shared::claim`] for a statement: its cancel or statement_timeout ends the wait.
+    fn claim_for(&self, name: &str, severity: &str, interrupts: &Interrupts) -> SqlResult<()> {
+        let mut uses =
+            self.wait_while(self.uses(), name, &[BranchUse::Held, BranchUse::Deleting], interrupts)?;
         if let Some(u) = uses.get(name) {
             let mut e = in_use_error(name, *u);
             e.severity = severity.to_string();
             return Err(e);
         }
-        uses.insert(name.to_string(), BranchUse::Held);
+        // A name of up to 24 bytes is held inline: a claim allocates nothing for it (L5).
+        uses.insert(name.into(), BranchUse::Held);
         Ok(())
     }
 
@@ -280,29 +496,111 @@ impl Shared {
     fn release(&self, name: &str) {
         self.uses().remove(name);
         if self.in_use_waiters.load(Ordering::SeqCst) > 0 {
-            self.in_use_freed.notify_all();
+            self.waits.changed.notify_all();
         }
     }
 
     /// Mark `name` as being deleted. A session on it is waited for (up to `in_use_wait`: one that is
     /// closing releases it within that), then refused with 55006.
+    #[cfg(test)]
     fn begin_delete(&self, name: &str) -> SqlResult<()> {
-        let mut uses = self.wait_while(self.uses(), name, &[BranchUse::Held, BranchUse::Deleting]);
+        self.begin_delete_for(name, &Interrupts::new(self.waits.clone(), self.sessions.clone()))
+    }
+
+    /// [`Shared::begin_delete`] for a statement: its cancel or statement_timeout ends the wait.
+    fn begin_delete_for(&self, name: &str, interrupts: &Interrupts) -> SqlResult<()> {
+        let mut uses =
+            self.wait_while(self.uses(), name, &[BranchUse::Held, BranchUse::Deleting], interrupts)?;
         if let Some(u) = uses.get(name) {
             return Err(in_use_error(name, *u));
         }
-        uses.insert(name.to_string(), BranchUse::Deleting);
+        uses.insert(name.into(), BranchUse::Deleting);
         Ok(())
+    }
+}
+
+#[derive(Default)]
+struct SessionWaits {
+    // This is the existing branch-use mutex and condition variable, shared with backoff and
+    // cancellation. No engine operation runs while the map is locked.
+    in_use: Mutex<std::collections::HashMap<compact_str::CompactString, BranchUse>>,
+    changed: std::sync::Condvar,
+}
+
+impl SessionWaits {
+    fn uses(
+        &self,
+    ) -> MutexGuard<'_, std::collections::HashMap<compact_str::CompactString, BranchUse>> {
+        self.in_use.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn wait_while<'a>(
+        &self,
+        mut uses: MutexGuard<'a, std::collections::HashMap<compact_str::CompactString, BranchUse>>,
+        deadline: std::time::Instant,
+        mode: WaitMode<'_>,
+        mut waiting: impl FnMut(
+            &std::collections::HashMap<compact_str::CompactString, BranchUse>,
+        ) -> bool,
+    ) -> turso_core::Result<
+        MutexGuard<'a, std::collections::HashMap<compact_str::CompactString, BranchUse>>,
+    > {
+        loop {
+            mode.check()?;
+            if !waiting(&uses) {
+                return Ok(uses);
+            }
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return Ok(uses);
+            }
+            let left = mode.remaining(left);
+            uses = self
+                .changed
+                .wait_timeout(uses, left)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum WaitMode<'a> {
+    Statement(&'a Interrupts),
+    /// Only after a statement changed rows: reset may commit them, so finishing avoids
+    /// returning 57014 for a write that committed.
+    CommitCompletion,
+}
+
+impl WaitMode<'_> {
+    fn check(self) -> turso_core::Result<()> {
+        match self {
+            Self::Statement(interrupts) if interrupts.should_stop() => Err(LimboError::Interrupt),
+            _ => Ok(()),
+        }
+    }
+
+    fn remaining(self, own: std::time::Duration) -> std::time::Duration {
+        if let Self::Statement(interrupts) = self {
+            let deadline = interrupts.deadline_us.load(Ordering::Relaxed);
+            if deadline != 0 {
+                let elapsed = interrupts.base.elapsed().as_micros().min(u64::MAX as u128) as u64;
+                return own.min(std::time::Duration::from_micros(
+                    deadline.saturating_sub(elapsed),
+                ));
+            }
+        }
+        own
     }
 }
 
 fn in_use_error(name: &str, u: BranchUse) -> Box<ErrorInfo> {
     match u {
         BranchUse::Held => error(
-            "55006",
+            SqlErrorKind::ObjectInUse,
             format!("branch \"{name}\" is in use by another session"),
         ),
-        BranchUse::Deleting => error("55006", format!("branch \"{name}\" is being deleted")),
+        BranchUse::Deleting => error(SqlErrorKind::ObjectInUse, format!("branch \"{name}\" is being deleted")),
     }
 }
 
@@ -319,7 +617,56 @@ impl TursoPgServer {
             address,
             shared: Arc::new(Shared::new(db, db_file, max_connections, lock_wait)),
             interrupt_count,
+            threads: Mutex::new(Vec::new()),
         }
+    }
+
+    /// How long a client has to complete its startup (PostgreSQL's authentication_timeout).
+    pub fn with_startup_timeout(mut self, timeout: std::time::Duration) -> Self {
+        Arc::get_mut(&mut self.shared)
+            .expect("set before the server runs")
+            .startup_timeout = timeout;
+        self
+    }
+
+    /// End every session and join its thread: each running statement is cancelled (57014) and
+    /// each session's socket is shut, so a thread blocked reading it reads the stream's end and
+    /// ends. Waits up to SHUTDOWN_JOIN; returns (sessions shut, threads joined, threads left).
+    fn end_sessions(&self) -> (usize, usize, usize) {
+        let shut = self.shared.sessions.shut_all();
+        // A session blocked in a wait (the branch-in-use wait, C42's helper) reads `stopping` only
+        // when woken: wake every waiter now, under the wait's mutex as a cancel does, so none sleeps
+        // past the stop with the flag already set (C42 x C43 review: the store was made outside the
+        // wait mutex and only a cancel entry woke a waiter).
+        {
+            let _uses = self.shared.waits.uses();
+            self.shared.waits.changed.notify_all();
+        }
+        for interrupts in self
+            .shared
+            .cancels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .filter_map(std::sync::Weak::upgrade)
+        {
+            interrupts.request_cancel();
+        }
+        let threads = std::mem::take(&mut *self.threads.lock().unwrap_or_else(|e| e.into_inner()));
+        let deadline = std::time::Instant::now() + SHUTDOWN_JOIN;
+        let (mut joined, mut left) = (0, 0);
+        for t in threads {
+            while !t.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            if t.is_finished() {
+                let _ = t.join();
+                joined += 1;
+            } else {
+                left += 1;
+            }
+        }
+        (shut, joined, left)
     }
 
     pub fn run(&self) -> anyhow::Result<()> {
@@ -337,6 +684,15 @@ impl TursoPgServer {
             "PostgreSQL server listening on {} (database: {}, at most {} sessions)",
             self.address, self.shared.db_file, self.shared.max_connections
         );
+        // The word-held FULL verdict (budget.py --verdict full-word-held) refuses a server that
+        // does not say this: a build with the measure-word-hold feature, its hold asked for by
+        // TURSO_MEASURE_WORD_HOLD=1 in the server's environment.
+        if turso_core::branch::measure_word_hold_compiled() {
+            println!(
+                "MEASURE word-hold: compiled (TURSO_MEASURE_WORD_HOLD={})",
+                std::env::var("TURSO_MEASURE_WORD_HOLD").unwrap_or_default()
+            );
+        }
         // The budget harness refuses a --plant split-reply run whose server does not say this.
         #[cfg(feature = "budget-plant-split-reply")]
         println!(
@@ -368,12 +724,20 @@ impl TursoPgServer {
                 break;
             }
         }
-
+        drop(listener);
+        let (shut, joined, left) = self.end_sessions();
+        println!(
+            "PostgreSQL server stopped: {shut} sessions shut, {joined} session threads joined, \
+             {left} still running"
+        );
         Ok(())
     }
 
     /// Start a session thread for `socket`, or refuse it with 53300 when the server is full.
     fn admit(&self, socket: tokio::net::TcpStream, addr: std::net::SocketAddr) {
+        if self.shared.sessions.is_stopping() {
+            return;
+        }
         let Some(slot) = SessionSlot::take(&self.shared) else {
             // As PostgreSQL does: the client gets FATAL 53300 at startup. The refusal is cheap and
             // runs here, on the accept thread.
@@ -389,13 +753,36 @@ impl TursoPgServer {
                 return;
             }
         };
+        let handle = match self.shared.clone_session_socket(&socket) {
+            Ok(handle) => handle,
+            Err(e) => {
+                error!("Error registering a session socket for {}: {}", addr, e);
+                return;
+            }
+        };
+        let Some(registered) = Registered::new(self.shared.sessions.clone(), handle) else {
+            return;
+        };
         let shared = self.shared.clone();
+        #[cfg(test)]
+        let before_session = shared.before_session.lock().unwrap().take();
         let spawned = std::thread::Builder::new()
             .name("pg-session".to_string())
             .stack_size(SESSION_STACK)
-            .spawn(move || run_session(shared, socket, addr, slot));
-        if let Err(e) = spawned {
-            error!("Error starting a session thread for {}: {}", addr, e);
+            .spawn(move || {
+                #[cfg(test)]
+                if let Some(before_session) = before_session {
+                    before_session();
+                }
+                run_session(shared, socket, addr, slot, registered)
+            });
+        match spawned {
+            Ok(handle) => {
+                let mut threads = self.threads.lock().unwrap_or_else(|e| e.into_inner());
+                threads.retain(|t| !t.is_finished());
+                threads.push(handle);
+            }
+            Err(e) => error!("Error starting a session thread for {}: {}", addr, e),
         }
     }
 }
@@ -421,47 +808,83 @@ impl Drop for SessionSlot {
     }
 }
 
-/// The body of a session thread: the protocol on a runtime of this thread alone, until the client
-/// goes. The session's connections close when it returns.
+/// The body of a session thread: the protocol on this thread's own blocking socket, until the
+/// client goes. The session's connections close when it returns.
+///
+/// No runtime (L5 step 3(a), lead 2026-10-15): the socket is a std socket in blocking mode
+/// (vendored pgwire change 9, BlockingTcp) and the protocol's futures run on a plain executor
+/// whose every poll completes, so the thread reads and writes in the system calls themselves.
+/// Under tokio's current-thread runtime the session thread made 6 to 8 kevents in every
+/// statement's window, the empty query's included (scshim, artie DECISIONS 88b959382d).
 fn run_session(
     shared: Arc<Shared>,
     socket: std::net::TcpStream,
     addr: std::net::SocketAddr,
     _slot: SessionSlot,
+    _registered: Registered<Arc<SessionSockets>>,
 ) {
-    // IO and timers only: a signal driver would cost every session a socket pair.
-    let rt = match tokio::runtime::Builder::new_current_thread()
-        .enable_io()
-        .enable_time()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => {
-            error!(
-                "Error starting the runtime of the session from {}: {}",
-                addr, e
-            );
-            return;
-        }
-    };
-    rt.block_on(async move {
-        let socket = match tokio::net::TcpStream::from_std(socket) {
-            Ok(s) => s,
-            Err(e) => {
-                error!("Error attaching connection from {}: {}", addr, e);
-                return;
-            }
-        };
-        let session = Arc::new(Session::new(shared));
-        if let Err(e) = serve_session(socket, session).await {
-            error!("Error processing connection from {}: {}", addr, e);
-        }
-    });
+    let session = Arc::new(Session::new(shared.clone()));
+    if let Err(e) = futures::executor::block_on(serve_session(socket, session)) {
+        error!("Error processing connection from {}: {}", addr, e);
+    }
 }
 
-/// How long a client has to finish its startup, as pgwire's process_socket allows (and
-/// PostgreSQL's authentication_timeout's default).
-const STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// A session's socket held in [`SessionSockets`] until the guard drops, however the session ends.
+struct Registered<S: std::ops::Deref<Target = SessionSockets>> {
+    sockets: S,
+    id: u64,
+}
+
+impl<S: std::ops::Deref<Target = SessionSockets>> Registered<S> {
+    fn new(sockets: S, socket: std::net::TcpStream) -> Option<Self> {
+        let id = sockets.register(socket)?;
+        Some(Self { id, sockets })
+    }
+}
+
+impl<S: std::ops::Deref<Target = SessionSockets>> Drop for Registered<S> {
+    fn drop(&mut self) {
+        self.sockets.deregister(self.id);
+    }
+}
+
+/// How long a client has to finish its startup by default, in seconds, as pgwire's process_socket
+/// allows (and PostgreSQL's authentication_timeout's default); `--authentication-timeout` sets it.
+pub const DEFAULT_AUTHENTICATION_TIMEOUT_S: u64 = 60;
+
+/// Before startup completes the session reads its startup's own messages alone: a malformed
+/// message of any kind, or any extended-protocol message (Parse, Bind, Close, Describe, Execute,
+/// Flush, Sync), is answered FATAL 08P01 and the session ends, as PostgreSQL ends a session that
+/// sends anything but its password response while it authenticates. A malformed P/B/C/D/E/H
+/// reached the extended protocol's skip to Sync, and the next Sync set ReadyForQuery: a session
+/// that served queries it never authenticated (wire review 16 item 22). Unreachable with
+/// NoopStartupHandler, which never waits in AuthenticationInProgress; this holds for the day a
+/// handler does. A well-formed simple Query there is left to the startup handler, as before.
+fn refused_before_startup(
+    state: &PgWireConnectionState,
+    msg: &PgWireFrontendMessage,
+) -> Option<ErrorInfo> {
+    let starting = matches!(
+        state,
+        PgWireConnectionState::AwaitingSslRequest
+            | PgWireConnectionState::AwaitingStartup
+            | PgWireConnectionState::AuthenticationInProgress
+    );
+    let refused = match msg {
+        PgWireFrontendMessage::Malformed(kind, code, message) => {
+            format!("{code}: malformed message of type '{}' ({message})", *kind as char)
+        }
+        msg if msg.is_extended_query() => "an extended-protocol message".to_string(),
+        _ => return None,
+    };
+    starting.then(|| {
+        ErrorInfo::new(
+            "FATAL".to_string(),
+            kind_code(SqlErrorKind::ProtocolViolation).to_string(),
+            format!("invalid frontend message before startup completed: {refused}"),
+        )
+    })
+}
 
 /// pgwire's process_socket, plus the end of a session. pgwire drops a Terminate ('X') and serves
 /// on until the client's socket reaches EOF, so a session, its branch connection and its in-use
@@ -470,24 +893,25 @@ const STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// items 3 and 4). Here a Terminate ends the session, and on every way out the session releases
 /// its branch and its in-use entry BEFORE the socket closes (the socket is dropped on return).
 async fn serve_session(
-    socket: tokio::net::TcpStream,
+    socket: std::net::TcpStream,
     session: Arc<Session>,
 ) -> Result<(), std::io::Error> {
-    let startup_timeout = tokio::time::sleep(STARTUP_TIMEOUT);
-    tokio::pin!(startup_timeout);
+    // The whole startup must end by one deadline: a read that reaches it reads as the stream's end
+    // (BlockingTcp), so a client that never finishes its startup, or trickles it a byte at a time,
+    // cannot hold the thread and its max_connections slot.
+    let startup_deadline = std::time::Instant::now() + session.shared.startup_timeout;
     // Every way a session ends before its startup completes is logged: the client sees only the
     // socket close (the "closed the connection during startup" flake, lead).
-    let socket = tokio::select! {
-        _ = &mut startup_timeout => {
-            warn!("session ended before startup: the startup timeout passed during TLS negotiation");
-            return Ok(());
-        }
-        socket = pgwire::tokio::server::negotiate_tls(socket, None) => socket.inspect_err(|e| {
+    let socket = pgwire::tokio::server::negotiate_blocking(socket, Some(startup_deadline))
+        .await
+        .inspect_err(|e| {
             warn!("session ended before startup: TLS negotiation failed: {}", e);
-        })?,
-    };
+        })?;
     let Some(mut socket) = socket else {
-        warn!("session ended before startup: TLS negotiation returned no socket");
+        warn!(
+            "session ended before startup: a direct TLS handshake, or a repeated SSLRequest or \
+             GSSENCRequest (refused with FATAL 0A000)"
+        );
         return Ok(());
     };
     // The handlers by their concrete types: the session, and pgwire's no-op ones for COPY FROM
@@ -498,19 +922,25 @@ async fn serve_session(
     let simple_query_handler = session.clone();
     let extended_query_handler = session.clone();
     let copy_handler = Arc::new(NoopHandler);
-    let cancel_handler = Arc::new(NoopHandler);
+    let cancel_handler = Arc::new(CancelSessions(session.shared.clone()));
     let error_handler = NoopHandler;
+    let mut started = false;
     let result = loop {
-        let msg = if matches!(
+        let starting = matches!(
             socket.state(),
             PgWireConnectionState::AwaitingStartup
                 | PgWireConnectionState::AuthenticationInProgress
-        ) {
-            tokio::select! {
-                _ = &mut startup_timeout => None,
-                msg = socket.next() => msg,
+        );
+        if !starting && !started {
+            started = true;
+            if let pgwire::tokio::server::MaybeTls::Blocking(io) = socket.get_mut() {
+                io.deadline = None;
+                io.socket.set_read_timeout(None)?;
+                io.socket.set_write_timeout(None)?;
             }
-        } else {
+        }
+        let msg = {
+            let _reading = turso_pg::phase::enter(turso_pg::phase::Phase::Read);
             socket.next().await
         };
         let msg = match msg {
@@ -525,10 +955,16 @@ async fn serve_session(
             // extended protocol, a skip to Sync, as PostgreSQL answers it (wire review 10 item 2;
             // postgres/vendor/pgwire/VENDORED.md).
             Some(Err(e)) => {
+                if starting && matches!(socket.get_ref(),
+                    pgwire::tokio::server::MaybeTls::Blocking(io) if io.timed_out)
+                {
+                    warn!("session ended before startup: the startup timeout passed");
+                    break Ok(());
+                }
                 error!("invalid frontend message: {}", e);
                 let info = ErrorInfo::new(
                     "FATAL".to_string(),
-                    "08P01".to_string(),
+                    kind_code(SqlErrorKind::ProtocolViolation).to_string(),
                     format!("invalid frontend message: {e}"),
                 );
                 let _ = socket
@@ -537,20 +973,25 @@ async fn serve_session(
                 break Ok(());
             }
             None => {
-                if matches!(
-                    socket.state(),
-                    PgWireConnectionState::AwaitingStartup
-                        | PgWireConnectionState::AuthenticationInProgress
-                ) {
-                    warn!(
-                        "session ended before startup: the client's stream ended, or the startup \
-                         timeout passed"
-                    );
+                if starting {
+                    let timed_out = matches!(socket.get_ref(),
+                        pgwire::tokio::server::MaybeTls::Blocking(io) if io.timed_out);
+                    if timed_out {
+                        warn!("session ended before startup: the startup timeout passed");
+                    } else {
+                        warn!("session ended before startup: the client's stream ended");
+                    }
                 }
                 break Ok(());
             }
         };
         if matches!(msg, PgWireFrontendMessage::Terminate(_)) {
+            break Ok(());
+        }
+        if let Some(info) = refused_before_startup(&socket.state(), &msg) {
+            let _ = socket
+                .send(PgWireBackendMessage::ErrorResponse(info.into()))
+                .await;
             break Ok(());
         }
         // A Sync whose body is malformed ends any skip; a simple Query whose body is malformed is
@@ -562,8 +1003,9 @@ async fn serve_session(
         // ReadyForQuery carrying the session's real state, as PostgreSQL answers them. A malformed
         // Sync got no ReadyForQuery, so the client hung; a malformed Query's error never reached
         // the session's block, so COMMIT committed (wire review 12 items 6 and 7). Before startup
-        // completes there is no round: FATAL 08P01 (wire review 15 item 19). A malformed CopyFail
-        // outside COPY is ignored, as PostgreSQL ignores a stray CopyFail.
+        // completes there is no round: refused_before_startup ended the session above (wire
+        // review 15 item 19, review 16 item 22). A malformed CopyFail outside COPY is ignored, as
+        // PostgreSQL ignores a stray CopyFail.
         if let PgWireFrontendMessage::Malformed(kind, code, ref message) = msg {
             let state = socket.state();
             let copying = matches!(state, PgWireConnectionState::CopyInProgress(_));
@@ -575,19 +1017,6 @@ async fn serve_session(
                     code,
                     message: message.clone(),
                 });
-                if matches!(
-                    state,
-                    PgWireConnectionState::AwaitingSslRequest
-                        | PgWireConnectionState::AwaitingStartup
-                        | PgWireConnectionState::AuthenticationInProgress
-                ) {
-                    let mut info = info;
-                    info.severity = "FATAL".to_string();
-                    let _ = socket
-                        .send(PgWireBackendMessage::ErrorResponse(info.into()))
-                        .await;
-                    break Ok(());
-                }
                 session.fail_block();
                 socket.set_state(PgWireConnectionState::ReadyForQuery);
                 let (notices, status) = session.end_round();
@@ -595,6 +1024,7 @@ async fn serve_session(
                 for name in session.ended_portals() {
                     socket.portal_store().rm_portal(&name);
                 }
+                let changed = session.changed_parameters();
                 let sent = async {
                     socket
                         .feed(PgWireBackendMessage::ErrorResponse(info.into()))
@@ -604,6 +1034,11 @@ async fn serve_session(
                             .feed(PgWireBackendMessage::NoticeResponse(NoticeResponse::from(
                                 *notice,
                             )))
+                            .await?;
+                    }
+                    if let Some(changed) = changed {
+                        socket
+                            .feed(PgWireBackendMessage::ParameterStatus(changed))
                             .await?;
                     }
                     socket
@@ -660,6 +1095,18 @@ async fn serve_session(
                     .await;
                 break sent.map_err(std::io::Error::other);
             }
+            // Outside the extended protocol process_error ends the round with ReadyForQuery; a
+            // changed reported setting goes ahead of it, as on_query sends it.
+            if !is_extended_query {
+                if let Some(changed) = session.changed_parameters() {
+                    if let Err(e) = socket
+                        .feed(PgWireBackendMessage::ParameterStatus(changed))
+                        .await
+                    {
+                        break Err(std::io::Error::other(e));
+                    }
+                }
+            }
             if let Err(io) = pgwire::tokio::server::process_error(
                 &mut socket,
                 PgWireError::UserError(Box::new(info)),
@@ -685,9 +1132,8 @@ async fn serve_session(
 }
 
 /// Raise this process's open-file soft limit so `max_connections` sessions fit. A session holds
-/// its socket and its runtime's descriptors (tokio's I/O driver: 4 measured with tokio 1.47 on
-/// macOS, a kqueue among them; 5 per session in all, read with lsof on a live server), so 6 are
-/// budgeted per session. A limit that cannot be raised that far is reported, and the server then
+/// its socket and the shutdown's dup of it (2; with tokio's runtime per session it held 5, read
+/// with lsof on a live server), and 6 stay budgeted per session. A limit that cannot be raised that far is reported, and the server then
 /// refuses connections the kernel cannot open.
 fn raise_open_file_limit(max_connections: usize) {
     const FDS_PER_SESSION: u64 = 6;
@@ -752,7 +1198,7 @@ impl StartupHandler for Refusal {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         if let PgWireFrontendMessage::Startup(_) = message {
-            return Err(fatal("53300", "sorry, too many clients already"));
+            return Err(fatal(SqlErrorKind::TooManyConnections, "sorry, too many clients already"));
         }
         Ok(())
     }
@@ -762,11 +1208,25 @@ impl StartupHandler for Refusal {
 // Sessions
 // ---------------------------------------------------------------------------
 
+/// A simple Query's replies, each with its statement's notices: inline room for one, so a query
+/// of one statement (a branch call's) costs no allocation for its list (L5).
+type Replies = smallvec::SmallVec<[(Vec<Box<ErrorInfo>>, Response); 1]>;
+
 struct Session {
     shared: Arc<Shared>,
     state: Mutex<SessionState>,
     query_parser: Arc<ParsedQueryParser>,
+    /// The session's SET lock_timeout (ms, 0 none) and client_min_messages rank, copied from its
+    /// connection as each statement starts (`run`), so a branch call's wait and the notice drain
+    /// read them without the session's lock (wire review 16 item 12).
+    lock_timeout_ms: AtomicU64,
+    min_messages: std::sync::atomic::AtomicU8,
+    /// The session's stop requests, which its connections' progress handlers read.
+    interrupts: Arc<Interrupts>,
+    /// The session's BackendKeyData: (process id, secret key).
+    key: (i32, i32),
 }
+
 
 /// A statement as Parse stored it: its text, and the branch call the text is, read once, at Parse
 /// ([`branch_call`]). Bind, Describe and Execute read the call from here: each read the text
@@ -790,14 +1250,15 @@ struct Parsed {
     call: Option<PgBranchCall>,
     scan: ParamScan,
     params: OnceLock<Vec<Type>>,
-    columns: OnceLock<Vec<Type>>,
+    columns: OnceLock<Vec<(String, Type)>>,
 }
 
 impl Parsed {
     fn new(sql: String) -> Self {
         let call = branch_call(&sql);
-        // A branch call's parameters are its arguments' (branch_call_types).
-        let scan = if call.is_some() {
+        // A branch call's parameters are its arguments' (branch_call_types). Without a '$'
+        // byte there can be no parameter token; otherwise use the parser's lexer once at Parse.
+        let scan = if call.is_some() || !sql.as_bytes().contains(&b'$') {
             ParamScan::default()
         } else {
             scan_params(&sql)
@@ -811,32 +1272,61 @@ impl Parsed {
         }
     }
 
+    /// A Parse message's statement, from its one parse ([`read_parse_message`]): the branch call
+    /// it is and its parameters as the parse tree holds them (a tree's `$n` are the lexer's
+    /// parameter tokens, for a text that parses; one that does not is refused at Parse).
+    fn from_message(sql: String, msg: &ParseMessage) -> Self {
+        Self {
+            sql,
+            call: msg.call.clone(),
+            scan: ParamScan {
+                highest: msg.highest,
+                analysed: msg.counts_params,
+            },
+            params: OnceLock::new(),
+            columns: OnceLock::new(),
+        }
+    }
+
     /// Fix the statement's parameter types at the first call, and refuse any later call whose
     /// types are others. The same text with the same declared types has the same parameters, so
     /// only their types can differ.
     fn fix_params(&self, params: &[Type]) -> SqlResult<()> {
-        let fixed = self.params.get_or_init(|| params.to_vec());
-        if fixed.as_slice() == params {
-            return Ok(());
+        match fix_or_first_change(&self.params, params) {
+            None => Ok(()),
+            Some(i) => Err(error(
+                SqlErrorKind::FeatureNotSupported,
+                format!(
+                    "cached plan must not change the type of parameter ${}",
+                    i + 1
+                ),
+            )),
         }
-        let n = fixed.iter().zip(params).take_while(|(a, b)| a == b).count() + 1;
-        Err(error(
-            "0A000",
-            format!("cached plan must not change the type of parameter ${n}"),
-        ))
     }
 
-    /// Fix the statement's result column types at the first call, and refuse any later call whose
-    /// types are others, in PostgreSQL's words.
-    fn fix_columns(&self, columns: &[Type]) -> SqlResult<()> {
-        if self.columns.get_or_init(|| columns.to_vec()).as_slice() == columns {
-            return Ok(());
+    /// Fix the statement's result columns, each its name and type, at the first call, and refuse
+    /// any later call whose columns are others, in PostgreSQL's words: its equalRowTypes compares
+    /// names with types, so the same types in another order under other names are another row
+    /// type. Compared by type alone, a SELECT * over (b int, a int) ran under the (a int, b int)
+    /// RowDescription its Describe sent, each value in the other's column (wire review 18 item 9).
+    fn fix_columns(&self, columns: &[(String, Type)]) -> SqlResult<()> {
+        match fix_or_first_change(&self.columns, columns) {
+            None => Ok(()),
+            Some(_) => Err(error(
+                SqlErrorKind::FeatureNotSupported,
+                "cached plan must not change result type".to_string(),
+            )),
         }
-        Err(error(
-            "0A000",
-            "cached plan must not change result type".to_string(),
-        ))
     }
+}
+
+/// [`Parsed::fix_params`] and [`Parsed::fix_columns`]' one comparison (they were the same code
+/// twice; wire review 18 item 23): `now` fixed in `cell` at the first call; at a later one, None
+/// when it is what was fixed, else the index of the first element that differs (the shorter
+/// one's length when one is a prefix of the other).
+fn fix_or_first_change<T: Clone + PartialEq>(cell: &OnceLock<Vec<T>>, now: &[T]) -> Option<usize> {
+    let fixed = cell.get_or_init(|| now.to_vec());
+    (fixed.as_slice() != now).then(|| fixed.iter().zip(now).take_while(|(a, b)| a == b).count())
 }
 
 /// pgwire's query parser for [`Parsed`] statements. This server overrides every handler that
@@ -866,12 +1356,13 @@ struct SessionState {
     /// branch, so switching back to the trunk opens nothing.
     trunk: Option<PgConnection>,
     /// The named branch the session is on, with the branch's connection.
-    branch: Option<(String, PgConnection)>,
+    /// The name inline up to 24 bytes: a switch allocates nothing for it (L5).
+    branch: Option<(compact_str::CompactString, PgConnection)>,
     /// A statement failed inside a transaction block: as in PostgreSQL, everything but the block's
     /// end (or a ROLLBACK TO SAVEPOINT) is refused with 25P02 until then.
     aborted: bool,
     /// The branch a switch just left, released in [`Shared`]'s map when the switch's statement ends.
-    left: Option<String>,
+    left: Option<compact_str::CompactString>,
     /// The session's connection is in the implicit transaction block PostgreSQL wraps a
     /// multi-statement query, or a pipeline up to Sync, in: an engine BEGIN the client did not send
     /// (see [`Session::begin_implicit`]).
@@ -888,10 +1379,22 @@ struct SessionState {
     /// The named portals that ran to completion without rows, or failed: a second Execute of one
     /// is 55000, never a second run (wire review 12 item 5).
     done_portals: std::collections::HashSet<String>,
+    /// The completion tag of each query portal that returned all its rows (its verb's, `SELECT`,
+    /// `INSERT 0`, ...), which a further Execute answers with 0 rows, as PostgreSQL does (wire
+    /// review 15 item 17: it answered SELECT 0 for every portal).
+    finished_tags: std::collections::HashMap<String, String>,
     /// The first result format code other than 0 or 1 each portal was bound with: refused
     /// (22023) when a row is formatted, as PostgreSQL's printtup refuses it, never at the Bind,
     /// so a statement that returns no row succeeds (wire review 13 item 10).
     bad_result_codes: std::collections::HashMap<String, i16>,
+    /// The last statement's columns and rows when it was a query that failed while running: the
+    /// reply sends them before its error, as PostgreSQL has sent them by then (C53,
+    /// PGDIV-ERROR-BEFORE-ROWDESC). Set by every engine statement, taken by the reply.
+    started: Option<Started>,
+    /// The search path last sent in a ParameterStatus, with its connection's stamp then and the
+    /// path as SET gave it ([`Session::changed_parameters`]); None while it is the one startup
+    /// announced.
+    reported_path: Option<(u64, Vec<String>, String)>,
 }
 
 /// An engine statement's failure, with whether it got as far as running: a COMMIT or ROLLBACK that
@@ -907,6 +1410,23 @@ struct StatementFailure {
     /// ([`StatementTypes::rolls_back`]).
     rolls_back: bool,
     info: Box<ErrorInfo>,
+    /// A query that failed while it ran: its columns and the rows it returned before the error,
+    /// which PostgreSQL has sent by then (RowDescription at the executor's start, each row as it is
+    /// made), so the reply is those, then the error (C53, PGDIV-ERROR-BEFORE-ROWDESC).
+    started: Option<Started>,
+}
+
+/// A query's columns and the rows it returned before it failed ([`StatementFailure::started`]).
+struct Started {
+    header: Arc<Vec<FieldInfo>>,
+    rows: Vec<DataRow>,
+}
+
+/// [`execute_query`]'s failure: the error, and what the query had sent when it failed while running
+/// (None when it failed before it ran: its columns refused, or an unencodable row).
+struct QueryFailure {
+    error: PgWireError,
+    started: Option<Started>,
 }
 
 /// A statement Describe prepared: on which engine connection, from which text.
@@ -924,11 +1444,58 @@ static CHECKPOINTS_SKIPPED: AtomicU64 = AtomicU64::new(0);
 
 impl Session {
     fn new(shared: Arc<Shared>) -> Self {
+        let interrupts = Arc::new(Interrupts::new(shared.waits.clone(), shared.sessions.clone()));
+        let pid = shared.next_pid.fetch_add(1, Ordering::Relaxed);
+        // The secret from the OS's CSPRNG (one draw per session): only a client that read the
+        // BackendKeyData can cancel the session, and a CancelRequest must name both. A session
+        // whose secret cannot be drawn is registered for no cancel at all (fail closed); its
+        // BackendKeyData still carries a key, which names nothing.
+        let mut bytes = [0u8; 4];
+        let drawn = getrandom::fill(&mut bytes).is_ok();
+        let secret = i32::from_ne_bytes(bytes);
+        if drawn {
+            shared
+                .cancels
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert((pid, secret), Arc::downgrade(&interrupts));
+        } else {
+            warn!("no cancel key for session {pid}: the OS random source failed");
+        }
         Self {
             shared,
             state: Mutex::new(SessionState::default()),
             query_parser: Arc::new(ParsedQueryParser),
+            lock_timeout_ms: AtomicU64::new(0),
+            min_messages: std::sync::atomic::AtomicU8::new(7),
+            interrupts,
+            key: (pid, secret),
         }
+    }
+
+    /// A connection the session opened stops its statement when the session's [`Interrupts`] ask.
+    fn arm(&self, conn: &Arc<turso_core::Connection>) {
+        let interrupts = self.interrupts.clone();
+        conn.set_progress_handler(PROGRESS_OPS, Some(Box::new(move || interrupts.should_stop())));
+    }
+
+    /// How long a statement waits for a lock: the session's SET lock_timeout, else (unset, or 0,
+    /// PostgreSQL's "no timeout") the server's lock wait.
+    fn lock_wait(&self) -> std::time::Duration {
+        match self.lock_timeout_ms.load(Ordering::Relaxed) {
+            0 => self.shared.lock_wait,
+            ms => std::time::Duration::from_millis(ms),
+        }
+    }
+
+    /// The notices the session's client_min_messages lets through: a NOTICE or WARNING below its
+    /// level is not sent (an INFO is always sent, as in PostgreSQL).
+    fn deliverable(&self, notices: Vec<Box<ErrorInfo>>) -> Vec<Box<ErrorInfo>> {
+        let least = self.min_messages.load(Ordering::Relaxed);
+        notices
+            .into_iter()
+            .filter(|n| turso_pg::message_rank(&n.severity).is_none_or(|rank| rank >= least))
+            .collect()
     }
 
     /// The session's state. Only the session's own thread takes the lock, so it never waits; a
@@ -939,6 +1506,7 @@ impl Session {
 
     fn open_trunk(&self) -> SqlResult<PgConnection> {
         let conn = PgConnection::new(self.shared.db.connect().map_err(|e| engine_info(&e))?);
+        self.arm(conn.inner());
         attach_schema_files(&conn, &self.shared.db_file);
         Ok(conn)
     }
@@ -954,8 +1522,6 @@ impl Session {
         Ok(st.trunk.clone().expect("opened above"))
     }
 
-    /// ReadyForQuery's status, read from the session's state rather than inferred from the
-    /// statements it ran.
     /// A named portal's statement ran to completion without rows, or failed: it does not run again.
     fn portal_done(&self, name: &str) {
         if name != DEFAULT_NAME {
@@ -973,11 +1539,47 @@ impl Session {
             st.described = None;
             std::mem::take(&mut st.notices)
         };
-        (notices, self.transaction_status())
+        (self.deliverable(notices), self.transaction_status())
     }
 
-    /// The named portals of a transaction that has ended, for `serve_session` to drop: none while
-    /// a block is open (wire review 12 item 5).
+    /// The ParameterStatus PostgreSQL sends ahead of a ReadyForQuery for a reported setting
+    /// (GUC_REPORT) whose value changed since it was last sent: here search_path, the one such
+    /// setting SET changes (the others keep the values startup announced, from turso_pg's
+    /// FIXED_SETTINGS). None when the path is as last sent, or before any connection is open, as
+    /// nothing has set one then. A SET search_path changed SHOW's answer and the client's copy
+    /// stayed at the startup value (wire review 18 item 19). Per round: one relaxed load of the
+    /// connection's stamp; the path is read only when the stamp moved.
+    fn changed_parameters(&self) -> Option<ParameterStatus> {
+        let mut st = self.state();
+        let conn = match (&st.branch, &st.trunk) {
+            (Some((_, conn)), _) | (None, Some(conn)) => conn.clone(),
+            (None, None) => return None,
+        };
+        let stamp = conn.search_path_stamp();
+        let (last_stamp, last_path, last_shown) = st
+            .reported_path
+            .get_or_insert_with(|| (0, Vec::new(), turso_pg::DEFAULT_SEARCH_PATH.to_string()));
+        if *last_stamp == stamp {
+            return None;
+        }
+        *last_stamp = stamp;
+        // A branch switch moves the stamp (another connection) and keeps the path (adopted): the
+        // path is compared first, so the switch formats nothing (L5: the shown path was the
+        // switch's one allocation over the empty query's).
+        if conn.search_path_is(last_path) {
+            return None;
+        }
+        *last_path = conn.search_path();
+        let shown = conn.shown_search_path();
+        if *last_shown == shown {
+            return None;
+        }
+        last_shown.clone_from(&shown);
+        Some(ParameterStatus::new("search_path".to_string(), shown))
+    }
+
+    /// The portals of a transaction that has ended, the unnamed one included, for `serve_session`
+    /// to drop: none while a block is open (wire review 12 item 5, review 15 item 16).
     fn ended_portals(&self) -> Vec<String> {
         if !matches!(self.transaction_status(), TransactionStatus::Idle) {
             return Vec::new();
@@ -987,10 +1589,14 @@ impl Session {
         let ended = std::mem::take(&mut st.portals);
         for name in &ended {
             st.bad_result_codes.remove(name);
+            st.finished_tags.remove(name);
         }
         ended
     }
 
+    /// ReadyForQuery's status, read from the session's state rather than inferred from the
+    /// statements it ran (its doc sat on portal_done, inserted between them: wire review 15 item
+    /// 22).
     fn transaction_status(&self) -> TransactionStatus {
         let st = self.state();
         if st.aborted {
@@ -1015,7 +1621,7 @@ impl Session {
             return Ok(());
         }
         self.shared
-            .claim(branch, "FATAL")
+            .claim_for(branch, "FATAL", &self.interrupts)
             .map_err(PgWireError::UserError)?;
         let conn = match self.waiting(|| self.shared.db.connect_named(branch)) {
             Ok(conn) => conn,
@@ -1026,7 +1632,9 @@ impl Session {
                 ));
             }
         };
-        self.state().branch = Some((branch.to_string(), PgConnection::new(conn)));
+        let conn = PgConnection::new(conn);
+        self.arm(conn.inner());
+        self.state().branch = Some((branch.into(), conn));
         Ok(())
     }
 
@@ -1039,21 +1647,29 @@ impl Session {
             .collect()
     }
 
-    /// [`Session::simple`], each result with the notices its statement raised.
-    fn simple_with_notices(&self, query: &str) -> Vec<(Vec<Box<ErrorInfo>>, Response)> {
-        let with_notices = |r: Response| (std::mem::take(&mut self.state().notices), r);
+    /// [`Session::simple`], each result with the notices its statement raised, in [`Replies`].
+    fn simple_with_notices(&self, query: &str) -> Replies {
+        let with_notices = |r: Response| {
+            let notices = std::mem::take(&mut self.state().notices);
+            (self.deliverable(notices), r)
+        };
         // A query that is one branch call goes straight to the engine: no split, no parse (L5).
         // Inside an unsynced pipeline's implicit block it ends the block as any Query does: a
         // refusal rolls it back and leaves the session idle, success commits it. The fast path
         // left the block open, and a refusal left the session failed (wire review 16 item 6);
         // with no block open it costs one look at the session's flag.
-        if let Some(call) = branch_call(query) {
+        let parsing = turso_pg::phase::enter(turso_pg::phase::Phase::Parse);
+        let call = branch_call(query);
+        drop(parsing);
+        if let Some(call) = call {
             let result = self.run(query, Some(call), None, &Format::UnifiedText);
             let open = self.state().implicit;
             if open {
                 self.after_implicit(query, result.is_err());
             }
-            let mut responses = vec![with_notices(result.unwrap_or_else(Response::Error))];
+            // Inline room for the one reply: a branch call's list costs no allocation (L5).
+            let mut responses = Replies::new();
+            responses.push(with_notices(result.unwrap_or_else(Response::Error)));
             if open {
                 if let Err(e) = self.end_implicit() {
                     responses.push(with_notices(Response::Error(e)));
@@ -1061,11 +1677,30 @@ impl Session {
             }
             return responses;
         }
+        // One statement (no separator but a trailing one): run as it stands in the query, with no
+        // split Vec or copy (L5). It is no branch call (read above).
+        let parsing = turso_pg::phase::enter(turso_pg::phase::Phase::Parse);
+        let single = single_statement(query);
+        drop(parsing);
+        if let Some(sql) = single {
+            let result = self.run(sql, None, None, &Format::UnifiedText);
+            self.after_implicit(sql, result.is_err());
+            let mut responses = Replies::new();
+            responses.push(with_notices(result.unwrap_or_else(Response::Error)));
+            if let Err(e) = self.end_implicit() {
+                responses.push(with_notices(Response::Error(e)));
+            }
+            return responses;
+        }
         let statements = match split_statements(query) {
             Ok(s) => s,
-            Err(e) => return vec![(Vec::new(), Response::Error(engine_info(&e)))],
+            Err(e) => {
+                let mut responses = Replies::new();
+                responses.push((Vec::new(), Response::Error(engine_info(&e))));
+                return responses;
+            }
         };
-        let mut responses = Vec::with_capacity(statements.len());
+        let mut responses = Replies::with_capacity(statements.len());
         // More than one statement: one implicit transaction, as in PostgreSQL (wire review 1 item 8).
         let multi = statements.len() > 1;
         for sql in &statements {
@@ -1131,7 +1766,7 @@ impl Session {
         if !conn.inner().get_auto_commit() {
             return Ok(());
         }
-        engine_tx(&conn, TxStmt::Begin).map_err(|e| engine_info(&e))?;
+        conn.engine_tx(TxStmt::Begin).map_err(|e| engine_info(&e))?;
         st.implicit = true;
         Ok(())
     }
@@ -1148,10 +1783,10 @@ impl Session {
         st.implicit = false;
         if failed {
             st.aborted = false;
+            // A rollback that fails breaks the connection, and the next statement ends the
+            // session (run): the block's work is still held (wire review 16 item 14).
             if let Ok(conn) = self.current(&mut st) {
-                if !conn.inner().get_auto_commit() {
-                    let _ = engine_tx(&conn, TxStmt::Rollback);
-                }
+                let _ = conn.roll_back_or_break();
             }
         } else if TxVerb::of(sql) != TxVerb::Begin {
             // The block lasts while the engine holds its transaction: a statement that ended it,
@@ -1183,7 +1818,8 @@ impl Session {
         };
         if implicit {
             st.aborted = false;
-            let _ = engine_tx(&conn, TxStmt::Rollback);
+            // A failed rollback breaks the connection (roll_back_or_break), read by run.
+            let _ = conn.roll_back_or_break();
         } else {
             st.aborted = true;
         }
@@ -1203,22 +1839,80 @@ impl Session {
         // A statement of the block failed where nothing rolled it back (a simple Query inside an
         // unsynced pipeline): the block rolls back, never commits (wire review 13 item 1).
         if std::mem::take(&mut st.aborted) {
-            let _ = engine_tx(&conn, TxStmt::Rollback);
-            return Ok(());
+            return conn
+                .roll_back_or_break()
+                .map_err(|e| broken_fatal(engine_info(&e)));
         }
-        if let Err(e) = engine_tx(&conn, TxStmt::Commit) {
-            if !conn.inner().get_auto_commit() {
-                let _ = engine_tx(&conn, TxStmt::Rollback);
+        if let Err(e) = conn.engine_tx(TxStmt::Commit) {
+            // The same rule as a client's COMMIT (wire review 8 item 1); a rollback that fails
+            // breaks the connection (wire review 16 item 14).
+            if let Err(undo) = conn.roll_back_or_break() {
+                return Err(broken_fatal(engine_info(&undo)));
             }
-            // The same rule as a client's COMMIT (wire review 8 item 1).
             return Err(commit_failed(&conn, engine_info(&e)));
         }
         Ok(())
     }
 
     /// Run one statement on the session, `call` its branch call if it is one (already read), and
-    /// `portal` carrying its bound parameters (extended protocol).
+    /// `portal` carrying its bound parameters (extended protocol). Its transaction-control outcome
+    /// is reported to the connection's settings (turso_pg's GucScope; the C26 MED 3 class): a block
+    /// the statement ended, read from the engine (in a transaction before, in none after), is
+    /// committed only by a COMMIT that succeeded in a block that had not failed; a savepoint verb
+    /// that succeeded is reported as itself. The warnings the frontend raised go out as notices.
     fn run(
+        &self,
+        sql: &str,
+        call: Option<PgBranchCall>,
+        portal: Option<&Portal<Parsed>>,
+        format: &Format,
+    ) -> SqlResult<Response> {
+        let before = {
+            let mut st = self.state();
+            let aborted = st.aborted;
+            self.current(&mut st)
+                .ok()
+                .map(|conn| (conn.clone(), !conn.inner().get_auto_commit(), aborted))
+        };
+        let result = self.run_statement(sql, call, portal, format);
+        if let Some((conn, in_tx, aborted)) = before {
+            let verb = TxVerb::of_leading_keywords(sql).unwrap_or_else(|| TxVerb::of(sql));
+            if in_tx && conn.inner().get_auto_commit() {
+                let committed = result.is_ok() && verb == TxVerb::Commit && !aborted;
+                conn.tx_event(turso_pg::TxEvent::Ended { committed }, sql);
+            } else if in_tx && result.is_ok() && matches!(verb, TxVerb::Chain { .. }) {
+                // AND CHAIN ends the block and opens the next in one statement, so the engine is
+                // never in autocommit between them: the block's end is reported here. The chain
+                // runs only in a failed block, as a ROLLBACK (C41-M1 / C45-M1: a rolled-back SET
+                // and a SET LOCAL lived on in the chained block; recorded, pg18-c41-m1-chain.txt).
+                conn.tx_event(turso_pg::TxEvent::Ended { committed: false }, sql);
+            } else if result.is_ok() {
+                let event = match verb {
+                    TxVerb::Savepoint => Some(turso_pg::TxEvent::Savepoint),
+                    TxVerb::Release => Some(turso_pg::TxEvent::Release),
+                    TxVerb::RollbackTo => Some(turso_pg::TxEvent::RollbackTo),
+                    _ => None,
+                };
+                if let Some(event) = event {
+                    conn.tx_event(event, sql);
+                }
+            }
+            let warnings = conn.take_warnings();
+            if !warnings.is_empty() {
+                let mut st = self.state();
+                for (severity, code, message) in warnings {
+                    st.notices.push(Box::new(ErrorInfo::new(
+                        severity.to_string(),
+                        code.to_string(),
+                        message,
+                    )));
+                }
+            }
+        }
+        result
+    }
+
+    fn run_statement(
         &self,
         sql: &str,
         call: Option<PgBranchCall>,
@@ -1228,7 +1922,29 @@ impl Session {
         let verb = TxVerb::of(sql);
         let mut st = self.state();
         let conn = self.current(&mut st)?;
+        // A connection an undo failed on (a rollback of an implicit block, after its statement
+        // was answered) holds work nobody can name: it serves nothing more, the next statement
+        // ending the session, never joining that transaction (wire review 16 item 14).
+        if conn.is_broken() {
+            return Err(broken_fatal(error(
+                SqlErrorKind::ConnectionFailure,
+                format!(
+                    "{}: an earlier undo failed; the connection is closed",
+                    turso_pg::CONNECTION_BROKEN
+                ),
+            )));
+        }
+        // The session's lock wait and message level, as its last SET left them.
+        self.lock_timeout_ms
+            .store(conn.lock_timeout_ms(), Ordering::Relaxed);
+        // A CancelRequest or statement_timeout stops this statement (dropped at its end).
+        let _interrupts = self.interrupts.begin(conn.statement_timeout_ms());
+        self.min_messages
+            .store(conn.min_messages_rank(), Ordering::Relaxed);
         let in_tx = !conn.inner().get_auto_commit();
+        // Which kind of block the statement runs in, for the settings a ROLLBACK cannot undo here
+        // (turso_pg's handle_pg_set; wire review 16 item 18).
+        conn.set_explicit_block(in_tx && !st.implicit);
         if st.aborted {
             match verb {
                 TxVerb::Commit | TxVerb::Rollback => {
@@ -1243,10 +1959,13 @@ impl Session {
                 // made the engine roll the whole transaction back, savepoints and all (a failed
                 // block is otherwise still open in the engine): the savepoint does not exist, as
                 // PostgreSQL says of one that does not, and the block stays failed. It was XX000
-                // "no such savepoint" from the engine (wire review 3 item 10).
+                // "no such savepoint" from the engine (wire review 3 item 10). No statement known
+                // today reaches this state over the wire (the sum() overflow that did no longer
+                // rolls the transaction back); a_rollback_to_in_a_block_the_engine_ended_is_3b001
+                // builds it directly.
                 TxVerb::RollbackTo if !in_tx => {
                     return Err(error(
-                        "3B001",
+                        SqlErrorKind::InvalidSavepointSpecification,
                         "savepoint does not exist: the error that failed this transaction block \
                          rolled the whole transaction back, its savepoints with it; end the block \
                          with ROLLBACK"
@@ -1254,8 +1973,36 @@ impl Session {
                     ))
                 }
                 TxVerb::RollbackTo => {}
+                // AND CHAIN ends a failed block as its COMMIT or ROLLBACK does, answered
+                // ROLLBACK, and chains a new block, as PostgreSQL does (recorded on 18.6; it was
+                // 25P02, the block left failed: wire review 15 item 23).
+                TxVerb::Chain { .. } => {
+                    if in_tx {
+                        conn.execute("ROLLBACK").map_err(|e| engine_info(&e))?;
+                    }
+                    st.aborted = false;
+                    conn.engine_tx(TxStmt::Begin)
+                        .map_err(|e| engine_info(&e))?;
+                    return Ok(Response::Execution(Tag::new("ROLLBACK")));
+                }
                 _ => return Err(aborted_error()),
             }
+        }
+        // Outside a block the client opened, a savepoint verb is refused (below) by its leading
+        // keywords, whatever its name's spelling (TxVerb::of_leading_keywords; wire review 14
+        // item 15).
+        let verb = match verb {
+            TxVerb::Other if !in_tx || st.implicit => {
+                TxVerb::of_leading_keywords(sql).unwrap_or(TxVerb::Other)
+            }
+            verb => verb,
+        };
+        // A block end inside an implicit block (a multi-statement query's, a pipeline's) ends that
+        // block through the engine, as below, and warns as PostgreSQL warns there: there is no
+        // transaction in progress, for the client (wire review 14 item 20).
+        if in_tx && st.implicit && matches!(verb, TxVerb::Commit | TxVerb::Rollback) {
+            st.notices
+                .push(warning(SqlErrorKind::NoActiveSqlTransaction, "there is no transaction in progress"));
         }
         match verb {
             // PostgreSQL warns and carries on for these; the engine would refuse them. A BEGIN in
@@ -1269,13 +2016,13 @@ impl Session {
                 if begins_read_only(sql) {
                     st.aborted = true;
                     return Err(error(
-                        "0A000",
+                        SqlErrorKind::FeatureNotSupported,
                         "READ ONLY transactions are not supported".to_string(),
                     ));
                 }
                 if !st.implicit {
                     st.notices.push(warning(
-                        "25001",
+                        SqlErrorKind::ActiveSqlTransaction,
                         "there is already a transaction in progress",
                     ));
                 }
@@ -1284,20 +2031,22 @@ impl Session {
             // AND CHAIN outside a block is PostgreSQL's error, not its warning; inside one the
             // chain is not supported (below). It was read as an ordinary COMMIT, which committed
             // and left the session idle (wire review 11 item 7).
-            TxVerb::Chain { commit } if !in_tx => {
+            // In an implicit block too, as PostgreSQL answers there (it was 0A000: wire review 13
+            // item 13); the error rolls the implicit block back.
+            TxVerb::Chain { commit } if !in_tx || st.implicit => {
                 let what = if commit {
                     "COMMIT AND CHAIN"
                 } else {
                     "ROLLBACK AND CHAIN"
                 };
                 return Err(error(
-                    "25P01",
+                    SqlErrorKind::NoActiveSqlTransaction,
                     format!("{what} can only be used in transaction blocks"),
                 ));
             }
             TxVerb::Commit | TxVerb::Rollback if !in_tx => {
                 st.notices
-                    .push(warning("25P01", "there is no transaction in progress"));
+                    .push(warning(SqlErrorKind::NoActiveSqlTransaction, "there is no transaction in progress"));
                 let tag = if verb == TxVerb::Commit {
                     "COMMIT"
                 } else {
@@ -1318,7 +2067,7 @@ impl Session {
                     _ => "SAVEPOINT",
                 };
                 return Err(error(
-                    "25P01",
+                    SqlErrorKind::NoActiveSqlTransaction,
                     format!("{what} can only be used in transaction blocks"),
                 ));
             }
@@ -1328,7 +2077,10 @@ impl Session {
         // or a refusal here is a statement that ran), and whether its translated parse was a
         // COMMIT or a ROLLBACK of the block.
         let mut ran = true;
-        let mut parsed = (false, false);
+        // What a query that failed while running had sent ([`StatementFailure::started`]), for the
+        // reply to send before its error ([`SessionState::started`]).
+        let mut started = None;
+        let mut parsed: Option<TxVerb> = None;
         let result = match call {
             Some(call) => {
                 // A statement a Describe kept holds its connection open: a switch away, or a
@@ -1339,14 +2091,14 @@ impl Session {
             None if is_checkpoint(sql) => self.checkpoint(&mut st, in_tx),
             // A chain in a block: refused, which fails the block, as any error in it does.
             None if matches!(verb, TxVerb::Chain { .. }) => Err(error(
-                "0A000",
+                SqlErrorKind::FeatureNotSupported,
                 "AND CHAIN is not supported: end the block with COMMIT or ROLLBACK, then BEGIN a \
                  new one"
                     .to_string(),
             )),
             None if schema_ddl(sql).is_some_and(|name| !name.eq_ignore_ascii_case("public")) => {
                 Err(error(
-                    "0A000",
+                    SqlErrorKind::FeatureNotSupported,
                     "schemas other than public are not supported by the branch server: its \
                      branches cover the one schema (CREATE SCHEMA and DROP SCHEMA are refused)"
                         .to_string(),
@@ -1357,8 +2109,15 @@ impl Session {
                 let r = self.engine_statement(&conn, sql, verb, portal, format);
                 st = self.state();
                 r.map_err(|f| {
+                    started = f.started;
                     ran = f.prepared;
-                    parsed = (f.commits, f.rolls_back);
+                    parsed = if f.commits {
+                        Some(TxVerb::Commit)
+                    } else if f.rolls_back {
+                        Some(TxVerb::Rollback)
+                    } else {
+                        None
+                    };
                     f.info
                 })
             }
@@ -1368,21 +2127,13 @@ impl Session {
         // more statements on it (wire review 2 item 1). Read from the connection's flag, not the
         // error's text (wire review 5 item 4).
         let result = match result {
-            Err(mut info) if conn.is_broken() => {
-                info.code = "08006".to_string();
-                info.severity = "FATAL".to_string();
-                Err(info)
-            }
+            Err(info) if conn.is_broken() => Err(broken_fatal(info)),
             r => r,
         };
         if result.is_err() {
             // The block's end is read from the verb the reader saw or the parse the engine ran,
             // whichever says COMMIT or ROLLBACK, never from the text alone (wire review 14 item 7).
-            let verb = match parsed {
-                (true, _) => TxVerb::Commit,
-                (_, true) => TxVerb::Rollback,
-                _ => verb,
-            };
+            let verb = parsed.unwrap_or(verb);
             match verb {
                 // A COMMIT that ran and failed ends the block, as in PostgreSQL: whatever the
                 // engine kept of the transaction is rolled back and the session is idle. If that
@@ -1409,6 +2160,7 @@ impl Session {
         if let Some(left) = st.left.take() {
             self.shared.release(&left);
         }
+        st.started = started;
         if result.is_ok() && verb == TxVerb::RollbackTo {
             st.aborted = false;
         }
@@ -1436,7 +2188,7 @@ impl Session {
                     CHECKPOINTS_SKIPPED.fetch_add(1, Ordering::Relaxed);
                     st.notices.push(Box::new(ErrorInfo::new(
                         "NOTICE".to_string(),
-                        "00000".to_string(),
+                        kind_code(SqlErrorKind::SuccessfulCompletion).to_string(),
                         "checkpoint skipped: the WAL is busy, and inside a transaction block \
                          CHECKPOINT does not wait (this block may hold the lock it needs); run it \
                          outside the block"
@@ -1476,6 +2228,45 @@ impl Session {
         Ok(())
     }
 
+    /// The Parse step's analysis ([`PgConnection::parse_step`]): a statement PostgreSQL analyses
+    /// at Parse is prepared now, from the Parse's one parse, and kept for the round's Bind,
+    /// Describe and Execute ([`Session::describe_prepare`] finds it), its parameters typed now as
+    /// PostgreSQL types them at Parse (42P18 for one it cannot type). Any other statement's
+    /// declared parameters must each have a type (42P18), as there; it is prepared when it runs.
+    fn parse_step(
+        &self,
+        parsed: &Parsed,
+        msg: &mut ParseMessage,
+        declared: &[Option<Type>],
+    ) -> PgWireResult<()> {
+        if parsed.call.is_some() || is_blank(&parsed.sql) {
+            return Ok(());
+        }
+        let conn = self
+            .current(&mut self.state())
+            .map_err(PgWireError::UserError)?;
+        match conn.parse_step(&parsed.sql, msg).map_err(engine_error)? {
+            Some((stmt, types)) => {
+                parameter_types(&types, declared).map_err(PgWireError::UserError)?;
+                self.state().described = Some(Described {
+                    conn: conn.inner().clone(),
+                    sql: parsed.sql.clone(),
+                    stmt,
+                    types,
+                });
+            }
+            // A utility statement's declared parameters are its only ones. One PostgreSQL
+            // analyses but this engine prepares only when it runs (CALL, EXPLAIN, DECLARE,
+            // CREATE TABLE ... AS) has its parameters typed then.
+            None if !msg.counts_params => {
+                parameter_types(&StatementTypes::default(), declared)
+                    .map_err(PgWireError::UserError)?;
+            }
+            None => {}
+        }
+        Ok(())
+    }
+
     /// Describe's prepare. In the extended protocol Describe is where a statement first meets the
     /// engine, so a statement that fails to prepare inside a block aborts the block, as its
     /// execution would (wire review 1 item 2).
@@ -1484,6 +2275,12 @@ impl Session {
     /// parse, translation and compile per extended statement, not two): read its columns with
     /// [`Session::described_fields`]. A Describe of the statement already kept prepares nothing.
     fn describe_prepare(&self, sql: &str) -> PgWireResult<()> {
+        // The server performs AND CHAIN when a failed block recovers; translating it here
+        // would reject that supported path before Execute can inspect the block's state.
+        if matches!(TxVerb::of(sql), TxVerb::Chain { .. }) {
+            self.state().described = None;
+            return Ok(());
+        }
         let conn = self
             .current(&mut self.state())
             .map_err(PgWireError::UserError)?;
@@ -1524,10 +2321,15 @@ impl Session {
         }
     }
 
-    /// The result columns of the statement [`Session::describe_prepare`] kept.
-    fn described_fields(&self, format: &Format) -> SqlResult<Vec<FieldInfo>> {
+    /// The result columns of the statement [`Session::describe_prepare`] kept, a bare parameter's
+    /// typed by the parameter's type (`declared`, else inferred: [`result_column_types`]).
+    fn described_fields(
+        &self,
+        format: &Format,
+        declared: &[Option<Type>],
+    ) -> SqlResult<Vec<FieldInfo>> {
         self.state().described.as_ref().map_or(Ok(Vec::new()), |d| {
-            result_fields(&d.stmt, &d.types.columns, format)
+            result_fields(&d.stmt, &result_column_types(&d.types, declared), format)
         })
     }
 
@@ -1588,7 +2390,7 @@ impl Session {
         let mut backoff = if ends_block {
             Backoff::never()
         } else {
-            Backoff::new(self.shared.lock_wait)
+            Backoff::new(self.lock_wait(), &self.interrupts)
         };
         // The last attempt, once the lock wait is spent, goes through the same rules as every
         // other: it returned unchecked, past the backstop (wire review 14 item 7).
@@ -1598,10 +2400,14 @@ impl Session {
             match self.engine_statement_once(conn, sql, portal, format, &mut backoff) {
                 // A COMMIT, as the verb reader or the parse the engine ran says, is settled as a
                 // COMMIT is and never run again. So is the state backstop's case: a statement that
-                // failed after the engine left the block it ran in, which, now that the reader
-                // and the parse agree (wire review 14 item 6), is an error the engine answered by
-                // rolling the whole transaction back: run anew it would run outside the block
-                // (wire review 9 item 7; 476798d89 had dropped f2804f119's state check).
+                // failed after the engine left the block it ran in, which, now that the reader and
+                // the parse agree (wire review 14 item 6), is an error the engine answered by
+                // rolling the whole transaction back. A sum() overflow is one, and there E, the
+                // answer either way, is right; the backstop changes an answer only for a Busy that
+                // also rolled the transaction back, which the retry would otherwise run anew
+                // outside the block, and which no test reaches without a core failpoint (wire
+                // review 9 item 7, review 17 item 19; 476798d89 had dropped f2804f119's state
+                // check).
                 Err(mut f)
                     if verb == TxVerb::Commit
                         || f.commits
@@ -1613,10 +2419,19 @@ impl Session {
                 Err(f)
                     if !last
                         && f.rerunnable
-                        && (f.info.code == "55P03" || (!in_tx && f.info.code == "40001")) =>
+                        && (f.info.code == kind_code(SqlErrorKind::LockNotAvailable)
+                        || (!in_tx && f.info.code == kind_code(SqlErrorKind::SerializationFailure))) =>
                 {
-                    if !backoff.wait() {
-                        last = true;
+                    match backoff.wait() {
+                        Ok(true) => {}
+                        Ok(false) => last = true,
+                        Err(e) => {
+                            return Err(StatementFailure {
+                                info: engine_info(&e),
+                                started: None,
+                                ..f
+                            })
+                        }
                     }
                 }
                 r => return r,
@@ -1630,7 +2445,7 @@ impl Session {
         sql: &str,
         portal: Option<&Portal<Parsed>>,
         format: &Format,
-        backoff: &mut Backoff,
+        backoff: &mut Backoff<'_>,
     ) -> Result<Response, StatementFailure> {
         let unprepared = |info: Box<ErrorInfo>| StatementFailure {
             prepared: false,
@@ -1638,12 +2453,13 @@ impl Session {
             commits: false,
             rolls_back: false,
             info,
+            started: None,
         };
         let described = portal.and_then(|_| self.take_described(conn, sql));
         let (mut stmt, types) = match described {
             Some(kept) => kept,
             None => conn
-                .prepare_typed(sql, portal.is_some())
+                .prepare_typed(sql)
                 .map_err(|e| unprepared(engine_info(&e)))?,
         };
         self.shared.cleanup_dropped_schema_file(sql);
@@ -1652,11 +2468,15 @@ impl Session {
         if types.commits || types.rolls_back {
             *backoff = Backoff::never();
         }
-        let query =
-            types.new_table_keys.is_none() && stmt.num_columns() != 0 && !is_pg_non_query(sql);
+        let query = types.new_table_keys.is_none()
+            && !types.performed
+            && stmt.num_columns() != 0
+            && !is_pg_non_query(sql);
         let columns: Vec<Type> = if query {
+            let declared = portal.map_or(&[][..], |p| p.statement.parameter_types.as_slice());
+            let fixed = result_column_types(&types, declared);
             (0..stmt.num_columns())
-                .map(|i| column_type(&stmt, &types.columns, i))
+                .map(|i| column_type(&stmt, &fixed, i))
                 .collect()
         } else {
             Vec::new()
@@ -1672,7 +2492,12 @@ impl Session {
                     .map_err(unprepared)?;
                 let parsed = &portal.statement.statement;
                 parsed.fix_params(&params).map_err(unprepared)?;
-                parsed.fix_columns(&columns).map_err(unprepared)?;
+                let named: Vec<(String, Type)> = columns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, ty)| (stmt.get_column_name(i).into_owned(), ty.clone()))
+                    .collect();
+                parsed.fix_columns(&named).map_err(unprepared)?;
                 bind_portal_parameters(&mut stmt, portal, &params)
                     .map_err(|e| unprepared(wire_info(e)))?
             }
@@ -1683,16 +2508,20 @@ impl Session {
             None => {
                 if let Some(n) = types.used.first() {
                     return Err(unprepared(error(
-                        "42P02",
+                        SqlErrorKind::UndefinedParameter,
                         format!("there is no parameter ${n}"),
                     )));
                 }
             }
         }
+        let unstarted = |error| QueryFailure {
+            error,
+            started: None,
+        };
         let r = if let Some(table) = types.new_table_keys.as_deref() {
-            create_with_keys(conn, &mut stmt, sql, table, backoff)
+            create_with_keys(conn, &mut stmt, sql, table, backoff).map_err(unstarted)
         } else if !query {
-            execute_non_query(&mut stmt, sql, backoff)
+            execute_non_query(&mut stmt, sql, backoff, portal.is_none()).map_err(unstarted)
         } else {
             // The column types are the statement's alone, so Describe (which runs nothing) and
             // this reply agree on both protocols (wire review 1 item 14).
@@ -1703,13 +2532,27 @@ impl Session {
                 &conn.inner().current_schema(),
                 backoff,
             )
+            .map(|response| match response {
+                // INSERT, UPDATE and DELETE with RETURNING complete with their own verb's tag, as
+                // PostgreSQL answers them: the query path's default was SELECT n, and drivers read
+                // the affected count from the tag (found by the PG 18 differential, 2026-10-15).
+                Response::Query(mut results) => {
+                    if let Some(tag) = query_tag(sql) {
+                        results.set_command_tag(tag);
+                    }
+                    Response::Query(results)
+                }
+                other => other,
+            })
         };
         r.map_err(|e| StatementFailure {
             prepared: true,
             rerunnable: stmt.n_change() == 0 && !(types.commits || types.rolls_back),
             commits: types.commits,
             rolls_back: types.rolls_back,
-            info: wire_info(e),
+            info: wire_info(e.error),
+            // A constant SELECT's error is PostgreSQL's planner's, before RowDescription.
+            started: e.started.filter(|_| !types.folds_at_plan),
         })
     }
 
@@ -1724,40 +2567,67 @@ impl Session {
         format: &Format,
     ) -> SqlResult<Response> {
         // A result format code other than 0 or 1, refused as PostgreSQL refuses it when it formats
-        // the row, which every branch call returns: before the call changes anything (wire review
-        // 13 item 10).
-        if let Some(code) = portal.and_then(|p| st.bad_result_codes.get(&p.name)) {
-            return Err(error("22023", format!("unsupported format code: {code}")));
-        }
-        let f = call.function.as_str();
+        // the row, which every branch call returns: after what an engine statement checks first
+        // (the function's name and arity, 42883; the result-format count, 08P01) and before the
+        // call changes anything (wire review 13 item 10). It came first, so codes [0, 2] answered
+        // 22023 where an engine SELECT answers 08P01 (wire review 17 item 9).
+        let bad_code =
+            |st: &SessionState| match portal.and_then(|p| st.bad_result_codes.get(&p.name)) {
+                Some(code) => Err(error(SqlErrorKind::InvalidParameterValue, format!("unsupported format code: {code}"))),
+                None => Ok(()),
+            };
+        let f = &*call.function;
         if f == "turso_branch_current" {
             arity(call, 0)?;
+            result_format(format, 0, 1)?;
+            bad_code(&*st)?;
             let name = st.branch.as_ref().map_or(TRUNK, |(n, _)| n.as_str());
-            return one_text(f, name, format);
+            return branch_text(f, name, portal.is_some(), format);
         }
         if f == "turso_branch_stats" {
             arity(call, 0)?;
+            result_format(format, 0, STATS_COLUMNS.len())?;
+            bad_code(&*st)?;
             return stats_row(format, &self.shared.db);
+        }
+        // The allocations the server process has made, for the per-step allocation budget
+        // (budget.py work); NULL in a build that counts none (no `alloc-count` feature).
+        if f == "turso_branch_allocations" {
+            arity(call, 0)?;
+            result_format(format, 0, 1)?;
+            bad_code(&*st)?;
+            let n = counters::allocations().map(|n| n as i64);
+            return one_row(f, Type::INT8, format, |e| e.encode_field(&n));
+        }
+        // The work budget's one reading (budget.py work): unix system calls, instructions and
+        // allocations read together, so a window holds one reading statement, as its floor does
+        // (read as two calls, the allocations' call fell inside the next window's system calls).
+        if f == "turso_branch_work" {
+            arity(call, 0)?;
+            result_format(format, 0, WORK_COLUMNS.len())?;
+            bad_code(&*st)?;
+            return work_row(format, &self.shared.db);
         }
         if !matches!(
             f,
             "turso_branch_create" | "turso_branch_switch" | "turso_branch_delete"
         ) {
             return Err(error(
-                "42883",
-                format!("function {f} does not exist; the branch functions are turso_branch_create(name), turso_branch_switch(name), turso_branch_delete(name), turso_branch_current() and turso_branch_stats()"),
+                SqlErrorKind::UndefinedFunction,
+                format!("function {f} does not exist; the branch functions are turso_branch_create(name), turso_branch_switch(name), turso_branch_delete(name), turso_branch_current(), turso_branch_stats(), turso_branch_allocations() and turso_branch_work()"),
             ));
         }
         arity(call, 1)?;
         // The result-format list is checked before the call changes anything: a create refused
         // after it ran would leave its branch behind (wire review 9 item 2).
         result_format(format, 0, 1)?;
+        bad_code(&*st)?;
         let name = text_arg(&call.args[0], portal)?;
         // As PostgreSQL refuses CREATE DATABASE and DROP DATABASE in a transaction block. The
         // engine refuses a fork there too; a switch would abandon the transaction.
         if !conn.inner().get_auto_commit() {
             return Err(error(
-                "25001",
+                SqlErrorKind::ActiveSqlTransaction,
                 format!("{f} cannot run inside a transaction block"),
             ));
         }
@@ -1765,12 +2635,12 @@ impl Session {
             "turso_branch_create" => {
                 if name == TRUNK {
                     return Err(error(
-                        "42939",
+                        SqlErrorKind::ReservedName,
                         format!("branch name \"{TRUNK}\" is reserved for the trunk"),
                     ));
                 }
                 match self.waiting(|| conn.inner().create_branch(&name)) {
-                    Ok(id) => one_int8(f, id.0 as i64, format),
+                    Ok(id) => branch_int8(f, id.0 as i64, portal.is_some(), format),
                     Err(e) => Err(self.create_error(&name, &e)),
                 }
             }
@@ -1788,10 +2658,11 @@ impl Session {
                             .waiting(|| self.shared.db.connect_named(&name))
                             .map_err(|e| self.switch_error(&name, &e, "ERROR"))?;
                         let next = PgConnection::new(opened);
+                        self.arm(next.inner());
                         next.adopt_session_of(conn);
-                        st.branch = Some((name.clone(), next));
+                        st.branch = Some((name.as_ref().into(), next));
                     }
-                    return one_text(f, &name, format);
+                    return branch_text(f, &name, portal.is_some(), format);
                 }
                 let left = if name == TRUNK {
                     let trunk = match st.trunk.take() {
@@ -1803,7 +2674,7 @@ impl Session {
                     // Dropping the branch's connection closes the branch for connections.
                     st.branch.take()
                 } else {
-                    self.shared.claim(&name, "ERROR")?;
+                    self.shared.claim_for(&name, "ERROR", &self.interrupts)?;
                     let opened = match self.waiting(|| self.shared.db.connect_named(&name)) {
                         Ok(opened) => opened,
                         Err(e) => {
@@ -1812,8 +2683,9 @@ impl Session {
                         }
                     };
                     let next = PgConnection::new(opened);
+                    self.arm(next.inner());
                     next.adopt_session_of(conn);
-                    st.branch.replace((name.clone(), next))
+                    st.branch.replace((name.as_ref().into(), next))
                 };
                 // The branch left is free for a delete once its connection is closed: `run`
                 // releases it after the statement's own handle on the connection goes.
@@ -1821,21 +2693,21 @@ impl Session {
                     drop(left_conn);
                     st.left = Some(left);
                 }
-                one_text(f, &name, format)
+                branch_text(f, &name, portal.is_some(), format)
             }
             _ if st.branch.as_ref().is_some_and(|(on, _)| *on == name) => Err(error(
-                "55006",
+                SqlErrorKind::ObjectInUse,
                 format!(
                     "cannot delete branch \"{name}\": this session is on it; switch to another \
                      branch first"
                 ),
             )),
             _ => {
-                self.shared.begin_delete(&name)?;
+                self.shared.begin_delete_for(&name, &self.interrupts)?;
                 let dropped = self.waiting(|| self.shared.db.drop_branch(&name));
                 self.shared.release(&name);
                 match dropped {
-                    Ok(_) => one_text(f, &name, format),
+                    Ok(_) => branch_text(f, &name, portal.is_some(), format),
                     Err(e) => Err(self.missing_or(&name, &e, "ERROR")),
                 }
             }
@@ -1847,6 +2719,7 @@ impl Session {
     /// default busy schedule (1, 2, 5, 10, 15, 20, 25, 25, 25, 50, 50 ms, then 100 ms) for up to
     /// the server's lock wait. Only this session's thread sleeps.
     fn waiting<T>(&self, f: impl FnMut() -> turso_core::Result<T>) -> turso_core::Result<T> {
+        let _executing = turso_pg::phase::enter(turso_pg::phase::Phase::Execute);
         // A schema change committed under the call (SchemaUpdated, which the engine leaves to the
         // caller to retry: fork_trunk_registered; wire review 1 item 11) is waited out on the same
         // schedule and bound: retried 50 times back to back it outran nothing, and the next one
@@ -1861,17 +2734,17 @@ impl Session {
 
     /// `f` run again while `busy` says its failure was a lock another session holds, on the
     /// schedule of [`Session::waiting`], up to the server's lock wait; the attempt after the
-    /// deadline is final.
-    fn retrying<T, E>(
+    /// deadline is final. The session's cancel or statement_timeout ends the wait (57014).
+    fn retrying<T>(
         &self,
-        mut f: impl FnMut() -> Result<T, E>,
-        busy: impl Fn(&E) -> bool,
-    ) -> Result<T, E> {
-        let mut backoff = Backoff::new(self.shared.lock_wait);
+        mut f: impl FnMut() -> turso_core::Result<T>,
+        busy: impl Fn(&LimboError) -> bool,
+    ) -> turso_core::Result<T> {
+        let mut backoff = Backoff::new(self.lock_wait(), &self.interrupts);
         loop {
             match f() {
                 Err(e) if busy(&e) => {
-                    if !backoff.wait() {
+                    if !backoff.wait()? {
                         return f();
                     }
                 }
@@ -1884,7 +2757,7 @@ impl Session {
     /// engine's own refusal. Classified by looking the name up, on the error path only.
     fn create_error(&self, name: &str, e: &LimboError) -> Box<ErrorInfo> {
         match self.shared.db.branch_named(name) {
-            Ok(Some(_)) => error("42P04", format!("branch \"{name}\" already exists")),
+            Ok(Some(_)) => error(SqlErrorKind::DuplicateDatabase, format!("branch \"{name}\" already exists")),
             _ => engine_info(e),
         }
     }
@@ -1898,10 +2771,12 @@ impl Session {
     /// the error path only.
     fn missing_or(&self, name: &str, e: &LimboError, severity: &str) -> Box<ErrorInfo> {
         let mut info = match self.shared.db.branch_named(name) {
-            Ok(None) => error("3D000", format!("branch \"{name}\" does not exist")),
-            Ok(Some(_)) if e.to_string().contains("already has an open connection") => {
+            Ok(None) => error(SqlErrorKind::InvalidCatalogName, format!("branch \"{name}\" does not exist")),
+            // By the engine's typed error, never its text (C44-M1: the one SQLSTATE still chosen
+            // from a message).
+            Ok(Some(_)) if matches!(e, LimboError::BranchInUse { .. }) => {
                 let mut info = error(
-                    "55006",
+                    SqlErrorKind::ObjectInUse,
                     format!("branch \"{name}\" is in use by another session"),
                 );
                 info.detail = Some(e.to_string());
@@ -1932,9 +2807,15 @@ impl Session {
 }
 
 impl Drop for Session {
-    /// The session's branch is free once its connection is closed.
+    /// The session's branch is free once its connection is closed, and a CancelRequest can no
+    /// longer name it.
     fn drop(&mut self) {
         self.end();
+        self.shared
+            .cancels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.key);
     }
 }
 
@@ -1945,7 +2826,12 @@ impl Shared {
         if self.db_file == ":memory:" {
             return;
         }
-        // Simple detection: look for DROP SCHEMA pattern
+        // Simple detection: look for DROP SCHEMA pattern. Every other statement is turned away
+        // before the lowered copy, so a write pays no allocation here (L5).
+        let head = query.trim_start().as_bytes();
+        if head.len() < 4 || !head[..4].eq_ignore_ascii_case(b"drop") {
+            return;
+        }
         let trimmed = query.trim().to_lowercase();
         if !trimmed.starts_with("drop schema") {
             return;
@@ -1985,7 +2871,8 @@ impl Shared {
 }
 
 /// What a statement does to the transaction block, read by the verb's WHOLE grammar (PostgreSQL's
-/// gram.y), after any leading comments:
+/// gram.y), after any leading whitespace, comments and empty statements (`;COMMIT` is COMMIT), and
+/// with any run of `;` after it (`COMMIT;;` is COMMIT and an empty statement; [`tx_words`]):
 /// - Begin: `BEGIN [WORK | TRANSACTION] [modes]`, `START TRANSACTION [modes]`;
 /// - Commit: `COMMIT | END [WORK | TRANSACTION] [AND NO CHAIN]`;
 /// - Rollback: `ROLLBACK | ABORT [WORK | TRANSACTION] [AND NO CHAIN]`;
@@ -1993,14 +2880,14 @@ impl Shared {
 /// - Release: `RELEASE [SAVEPOINT] name`; Savepoint: `SAVEPOINT name`;
 /// - Other: anything else, malformed spellings of the above included, which go to the engine and
 ///   are syntax errors there. Read by two words, `COMMIT garbage` was answered as COMMIT and
-///   `/* c */ ROLLBACK` was not a ROLLBACK (wire review 6 item 4). `AND CHAIN` is Other: the
-///   engine has no chained transactions.
+///   `/* c */ ROLLBACK` was not a ROLLBACK (wire review 6 item 4). A Chain can recover a failed
+///   block; chaining a live block is not supported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TxVerb {
     Begin,
     Commit,
     Rollback,
-    /// COMMIT AND CHAIN or ROLLBACK AND CHAIN (`commit`: which), which the server does not run.
+    /// COMMIT AND CHAIN or ROLLBACK AND CHAIN (`commit`: which); accepted in a failed block.
     Chain {
         commit: bool,
     },
@@ -2062,11 +2949,7 @@ impl TxVerb {
                     TxVerb::Chain { commit: false }
                 } else if is(first, "ROLLBACK") && rest.first().is_some_and(|x| is(x, "TO")) {
                     let rest = &rest[1..];
-                    let rest = if rest.first().is_some_and(|x| is(x, "SAVEPOINT")) {
-                        &rest[1..]
-                    } else {
-                        rest
-                    };
+                    let rest = savepoint_keyword(rest);
                     if name(rest) {
                         TxVerb::RollbackTo
                     } else {
@@ -2077,11 +2960,7 @@ impl TxVerb {
                 }
             }
             [first, rest @ ..] if is(first, "RELEASE") => {
-                let rest = if rest.first().is_some_and(|x| is(x, "SAVEPOINT")) {
-                    &rest[1..]
-                } else {
-                    rest
-                };
+                let rest = savepoint_keyword(rest);
                 if name(rest) {
                     TxVerb::Release
                 } else {
@@ -2093,9 +2972,76 @@ impl TxVerb {
         }
     }
 
+    /// The savepoint verb a statement starts with, read by its leading keywords alone, whatever
+    /// follows: `SAVEPOINT x`, `RELEASE x`, `ROLLBACK [WORK | TRANSACTION] TO x`, x any non-blank
+    /// text. For the refusal outside a block (25P01), where a name the verb reader cannot hold as
+    /// one word (`U&"a"`, one after a \v) made the statement Other, and the engine then opened a
+    /// transaction with no BEGIN for SAVEPOINT, or answered XX000 (wire review 14 item 15).
+    /// Blind spot: a statement PostgreSQL refuses as a syntax error after those keywords
+    /// (`SAVEPOINT 1x`) is answered 25P01 here, a refusal either way.
+    fn of_leading_keywords(sql: &str) -> Option<Self> {
+        // The next word of letters at `*i`, then the blanks and comments after it, never a `;`
+        // (it would end the statement). A fn, not a closure, so its output borrows `sql` alone.
+        fn word<'s>(sql: &'s str, i: &mut usize) -> Option<&'s str> {
+            let b = sql.as_bytes();
+            let start = *i;
+            while *i < b.len() && b[*i].is_ascii_alphabetic() {
+                *i += 1;
+            }
+            let w = &sql[start..*i];
+            loop {
+                while *i < b.len() && pg_space(b[*i]) {
+                    *i += 1;
+                }
+                match sql_comment(&b[*i..]) {
+                    Some(len) => *i += len?,
+                    None => break,
+                }
+            }
+            (!w.is_empty()).then_some(w)
+        }
+        let b = sql.as_bytes();
+        let mut i = skip_blank(b, 0)?;
+        let is = |w: &str, k: &str| w.eq_ignore_ascii_case(k);
+        let verb = match word(sql, &mut i)? {
+            w if is(w, "SAVEPOINT") => TxVerb::Savepoint,
+            w if is(w, "RELEASE") => TxVerb::Release,
+            w if is(w, "ROLLBACK") => {
+                let mut next = word(sql, &mut i)?;
+                if is(next, "WORK") || is(next, "TRANSACTION") {
+                    next = word(sql, &mut i)?;
+                }
+                if !is(next, "TO") {
+                    return None;
+                }
+                TxVerb::RollbackTo
+            }
+            _ => return None,
+        };
+        // A name follows, whatever its spelling.
+        (i < b.len() && b[i] != b';').then_some(verb)
+    }
+
     /// The statements a failed block still accepts.
     fn ends_block(self) -> bool {
-        matches!(self, TxVerb::Commit | TxVerb::Rollback | TxVerb::RollbackTo)
+        matches!(
+            self,
+            TxVerb::Commit | TxVerb::Rollback | TxVerb::RollbackTo | TxVerb::Chain { .. }
+        )
+    }
+}
+
+/// The words after `ROLLBACK ... TO` or `RELEASE`, with an optional SAVEPOINT keyword dropped: the
+/// keyword is dropped only when a name follows it, so `ROLLBACK TO SAVEPOINT` and `RELEASE
+/// SAVEPOINT` name a savepoint called savepoint, as PostgreSQL's grammar reads them (TO ColId,
+/// RELEASE ColId; recorded on PostgreSQL 18.6, wire review 14 item 21). The reader dropped it
+/// always, found no name and read Other, so a failed block refused the statement 25P02.
+fn savepoint_keyword<'a, 's>(rest: &'a [&'s str]) -> &'a [&'s str] {
+    match rest {
+        [first, name, ..] if first.eq_ignore_ascii_case("SAVEPOINT") && !name.is_empty() => {
+            &rest[1..]
+        }
+        _ => rest,
     }
 }
 
@@ -2103,7 +3049,8 @@ impl TxVerb {
 /// wherever it stands (`--` to the line's end, `/* */` nested), as PostgreSQL's lexer reads one, so
 /// it also ends a word; a `"quoted"` name is one word, `,` a word of its own, and `$` continues a
 /// word after its first byte, as in an identifier; a `;` ends the statement, after which only
-/// whitespace and comments may follow. None for a statement that does not start with a
+/// whitespace, comments and more `;` (empty statements) may follow, as whitespace, comments and
+/// empty statements may come before the verb. None for a statement that does not start with a
 /// transaction verb (one word's scan, no allocation), and for text the verbs' grammar cannot hold
 /// (a `'` string, a word starting with `$`, a second statement, an unterminated comment), which is
 /// Other. A comment after the verb made it Other, so `COMMIT -- c` skipped the failed-COMMIT rule
@@ -2225,16 +3172,12 @@ fn tx_modes(mut w: &[&str]) -> bool {
     true
 }
 
-/// A transaction-control statement the client did not send: an implicit block's own, or the
-/// savepoint a statement runs under inside a block ([`create_with_keys`]).
-#[derive(Debug, Clone, Copy)]
-enum TxStmt {
-    Begin,
-    Commit,
-    Rollback,
-    Savepoint(&'static str),
-    Release(&'static str),
-    RollbackTo(&'static str),
+/// A broken connection's answer (an undo failed; turso_pg's PgConnection::is_broken): FATAL 08006,
+/// which serve_session ends the session on.
+fn broken_fatal(mut info: Box<ErrorInfo>) -> Box<ErrorInfo> {
+    info.code = kind_code(SqlErrorKind::ConnectionFailure).to_string();
+    info.severity = "FATAL".to_string();
+    info
 }
 
 /// What a failed COMMIT tells the client, once the engine's transaction is settled: a COMMIT the
@@ -2248,7 +3191,7 @@ enum TxStmt {
 /// is visible (Connection::is_in_write_tx); a stranded read transaction is not.
 fn commit_failed(conn: &PgConnection, mut info: Box<ErrorInfo>) -> Box<ErrorInfo> {
     if conn.inner().get_auto_commit() && conn.inner().is_in_write_tx() {
-        info.code = "08006".to_string();
+        info.code = kind_code(SqlErrorKind::ConnectionFailure).to_string();
         info.severity = "FATAL".to_string();
         info.message = format!(
             "the transaction could not be ended after its COMMIT failed ({}); the connection is \
@@ -2257,59 +3200,16 @@ fn commit_failed(conn: &PgConnection, mut info: Box<ErrorInfo>) -> Box<ErrorInfo
         );
         return info;
     }
-    if matches!(info.code.as_str(), "55P03" | "40001") {
-        info.code = "40001".to_string();
+    if info.code == kind_code(SqlErrorKind::LockNotAvailable)
+        || info.code == kind_code(SqlErrorKind::SerializationFailure)
+    {
+        info.code = kind_code(SqlErrorKind::SerializationFailure).to_string();
         info.message = format!(
             "could not serialize access: the transaction was rolled back ({})",
             info.message
         );
     }
     info
-}
-
-/// Run `tx` on `conn` from the engine's AST: no SQL text is parsed, so an implicit block costs no
-/// libpg_query call (and keeps an_ordinary_statement_is_parsed_once's count).
-fn engine_tx(conn: &PgConnection, tx: TxStmt) -> turso_core::Result<()> {
-    use turso_parser::ast::{Name, Stmt};
-    let (stmt, text) = match tx {
-        TxStmt::Begin => (
-            Stmt::Begin {
-                typ: None,
-                name: None,
-            },
-            "BEGIN".to_string(),
-        ),
-        TxStmt::Commit => (Stmt::Commit { name: None }, "COMMIT".to_string()),
-        TxStmt::Rollback => (
-            Stmt::Rollback {
-                tx_name: None,
-                savepoint_name: None,
-            },
-            "ROLLBACK".to_string(),
-        ),
-        TxStmt::Savepoint(name) => (
-            Stmt::Savepoint {
-                name: Name::from_string(name),
-            },
-            format!("SAVEPOINT {name}"),
-        ),
-        TxStmt::Release(name) => (
-            Stmt::Release {
-                name: Name::from_string(name),
-            },
-            format!("RELEASE SAVEPOINT {name}"),
-        ),
-        TxStmt::RollbackTo(name) => (
-            Stmt::Rollback {
-                tx_name: None,
-                savepoint_name: Some(Name::from_string(name)),
-            },
-            format!("ROLLBACK TO SAVEPOINT {name}"),
-        ),
-    };
-    conn.inner()
-        .prepare_translated_stmt(stmt, &text)?
-        .run_ignore_rows()
 }
 
 /// The schema a CREATE SCHEMA or DROP SCHEMA names (`[IF [NOT] EXISTS] name`, quotes dropped), if
@@ -2337,11 +3237,10 @@ fn schema_ddl(sql: &str) -> Option<&str> {
     Some(name.trim_matches('"'))
 }
 
-/// Whether `sql` is a bare CHECKPOINT (the server runs it itself, see [`Session::checkpoint`]). A
-/// form this does not read, e.g. one behind a comment, reaches the engine's PRAGMA path.
-/// Whether `sql` is CHECKPOINT alone, read as PostgreSQL's lexer reads it: whitespace (a vertical
-/// tab included), comments and empty statements around it. A comment was a second word, so
-/// `CHECKPOINT -- x` went to the engine as text (wire review 14 item 6).
+/// Whether `sql` is CHECKPOINT alone, which the server runs itself ([`Session::checkpoint`]), read
+/// as PostgreSQL's lexer reads it: whitespace (a vertical tab included), comments and empty
+/// statements around it. A comment was a second word, so `CHECKPOINT -- x` went to the engine as
+/// text (wire review 14 item 6).
 fn is_checkpoint(sql: &str) -> bool {
     let b = sql.as_bytes();
     let Some(start) = skip_blank(b, 0) else {
@@ -2359,7 +3258,7 @@ fn arity(call: &PgBranchCall, n: usize) -> SqlResult<()> {
         return Ok(());
     }
     Err(error(
-        "42883",
+        SqlErrorKind::UndefinedFunction,
         format!(
             "function {}() takes {n} argument{}, not {}",
             call.function,
@@ -2370,22 +3269,26 @@ fn arity(call: &PgBranchCall, n: usize) -> SqlResult<()> {
 }
 
 /// A branch name argument: a string literal, or a `$n` bound to text.
-fn text_arg(arg: &PgBranchArg, portal: Option<&Portal<Parsed>>) -> SqlResult<String> {
+fn text_arg<'a>(
+    arg: &'a PgBranchArg,
+    portal: Option<&Portal<Parsed>>,
+) -> SqlResult<std::borrow::Cow<'a, str>> {
     match arg {
-        PgBranchArg::Text(s) => Ok(s.clone()),
-        PgBranchArg::Null => Err(error("22004", "a branch name must not be null".to_string())),
-        PgBranchArg::Bool(_) => Err(error("42804", "a branch name is text".to_string())),
+        // Borrowed: a literal name costs the call no copy (L5).
+        PgBranchArg::Text(s) => Ok(std::borrow::Cow::Borrowed(s.as_str())),
+        PgBranchArg::Null => Err(error(SqlErrorKind::NullValueNotAllowed, "a branch name must not be null".to_string())),
+        PgBranchArg::Bool(_) => Err(error(SqlErrorKind::DatatypeMismatch, "a branch name is text".to_string())),
         PgBranchArg::Param(n) => {
             // Over the simple protocol nothing binds one (wire review 9 item 3).
             let portal =
-                portal.ok_or_else(|| error("42P02", format!("there is no parameter ${n}")))?;
+                portal.ok_or_else(|| error(SqlErrorKind::UndefinedParameter, format!("there is no parameter ${n}")))?;
             // A parameter declared as another type is not a name, whatever its bytes spell. A text
             // or varchar value (or one of unspecified type, which PostgreSQL resolves to the
             // function's text) is its bytes in either format: textrecv reads binary text as is.
             if let Some(Some(ty)) = portal.statement.parameter_types.get(n - 1) {
                 if ![Type::TEXT, Type::VARCHAR, Type::UNKNOWN].contains(ty) {
                     return Err(error(
-                        "42804",
+                        SqlErrorKind::DatatypeMismatch,
                         format!("a branch name is text, and parameter ${n} is {ty}"),
                     ));
                 }
@@ -2393,12 +3296,13 @@ fn text_arg(arg: &PgBranchArg, portal: Option<&Portal<Parsed>>) -> SqlResult<Str
             let bytes = portal
                 .parameters
                 .get(n - 1)
-                .ok_or_else(|| error("08P01", format!("parameter ${n} is not bound")))?;
+                .ok_or_else(|| error(SqlErrorKind::ProtocolViolation, format!("parameter ${n} is not bound")))?;
             let Some(bytes) = bytes else {
-                return Err(error("22004", "a branch name must not be null".to_string()));
+                return Err(error(SqlErrorKind::NullValueNotAllowed, "a branch name must not be null".to_string()));
             };
             String::from_utf8(bytes.to_vec())
-                .map_err(|e| error("22021", format!("invalid UTF-8 in parameter ${n}: {e}")))
+                .map(std::borrow::Cow::Owned)
+                .map_err(|e| error(SqlErrorKind::CharacterNotInRepertoire, format!("invalid UTF-8 in parameter ${n}: {e}")))
         }
     }
 }
@@ -2432,13 +3336,170 @@ fn one_int8(f: &str, value: i64, format: &Format) -> SqlResult<Response> {
     one_row(f, Type::INT8, format, |e| e.encode_field(&value))
 }
 
-const STATS_COLUMNS: [&str; 6] = [
+/// A branch call's one-row, one-column text reply to a simple Query, encoded here into a fixed
+/// buffer: RowDescription (the column named `f`, of `pg_type`, text format), the DataRow holding
+/// `value`'s text, and CommandComplete `SELECT 1`, byte for byte what pgwire encodes for
+/// [`one_row`]'s response (inline_replies_are_the_messages_pgwire_encodes), with no heap
+/// allocation (L5: they cost the wire 7 of its 20 allocations a call). None when they do not fit.
+fn inline_one_row(f: &str, pg_type: &Type, value: &[u8]) -> Option<pgwire::messages::Inline> {
+    let mut m = pgwire::messages::Inline::default();
+    let t_len = 4 + 2 + f.len() + 1 + 4 + 2 + 4 + 2 + 4 + 2;
+    let d_len = 4 + 2 + 4 + value.len();
+    let tag = b"SELECT 1\0";
+    let ok = m.push(b"T")
+        && m.push(&(i32::try_from(t_len).ok()?).to_be_bytes())
+        && m.push(&1i16.to_be_bytes())
+        && m.push(f.as_bytes())
+        && m.push(&[0])
+        && m.push(&0i32.to_be_bytes())
+        && m.push(&0i16.to_be_bytes())
+        && m.push(&pg_type.oid().to_be_bytes())
+        // pgwire's FieldInfo sends type size and modifier 0 (its From<&FieldInfo>), and so must this.
+        && m.push(&0i16.to_be_bytes())
+        && m.push(&0i32.to_be_bytes())
+        && m.push(&0i16.to_be_bytes())
+        && m.push(b"D")
+        && m.push(&(i32::try_from(d_len).ok()?).to_be_bytes())
+        && m.push(&1i16.to_be_bytes())
+        && m.push(&(i32::try_from(value.len()).ok()?).to_be_bytes())
+        && m.push(value)
+        && m.push(b"C")
+        && m.push(&((4 + tag.len()) as i32).to_be_bytes())
+        && m.push(tag);
+    ok.then_some(m)
+}
+
+/// A branch call's text reply: inline to a simple Query (`portal` None, text), else pgwire's.
+fn branch_text(f: &str, value: &str, portal_or_described: bool, format: &Format) -> SqlResult<Response> {
+    if !portal_or_described && matches!(format, Format::UnifiedText) {
+        if let Some(m) = inline_one_row(f, &Type::TEXT, value.as_bytes()) {
+            return Ok(Response::Inline(m));
+        }
+    }
+    one_text(f, value, format)
+}
+
+/// [`branch_text`] for a branch id (int8).
+fn branch_int8(f: &str, value: i64, portal_or_described: bool, format: &Format) -> SqlResult<Response> {
+    if !portal_or_described && matches!(format, Format::UnifiedText) {
+        let mut digits = [0u8; 20];
+        let text = int_text(value, &mut digits);
+        if let Some(m) = inline_one_row(f, &Type::INT8, text) {
+            return Ok(Response::Inline(m));
+        }
+    }
+    one_int8(f, value, format)
+}
+
+/// `value`'s decimal text in `buf`, no allocation.
+fn int_text(value: i64, buf: &mut [u8; 20]) -> &[u8] {
+    let mut n = value.unsigned_abs();
+    let mut at = buf.len();
+    loop {
+        at -= 1;
+        buf[at] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    if value < 0 {
+        at -= 1;
+        buf[at] = b'-';
+    }
+    &buf[at..]
+}
+
+#[cfg(not(feature = "phase-count"))]
+const WORK_COLUMNS: [&str; 7] = [
+    "unix_syscalls",
+    "instructions",
+    "allocations",
+    "thread_instructions",
+    "confirms_written",
+    "thread_allocations",
+    "foreign_cpu_ns",
+];
+/// A phase build (feature phase-count, a diagnostic: budget.py work --phases) adds this session
+/// thread's instructions per statement phase (turso_pg::phase::NAMES), so the default build's row
+/// is unchanged.
+#[cfg(feature = "phase-count")]
+const WORK_COLUMNS: [&str; 15] = [
+    "unix_syscalls",
+    "instructions",
+    "allocations",
+    "thread_instructions",
+    "confirms_written",
+    "thread_allocations",
+    "foreign_cpu_ns",
+    "phase_session",
+    "phase_read",
+    "phase_parse",
+    "phase_translate",
+    "phase_plan",
+    "phase_execute",
+    "phase_encode",
+    "phase_write",
+];
+
+/// turso_branch_work(): this process's system calls and instructions (counters::process_counters),
+/// allocations (counters::allocations, NULL without the alloc-count feature), this session
+/// thread's own instructions (counters::thread_counters) and the branch store's confirmation words
+/// written (its background confirm writer's work, Database::branch_confirm_counts), read at once.
+fn work_row(format: &Format, db: &Database) -> SqlResult<Response> {
+    let fields = WORK_COLUMNS
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            Ok(FieldInfo::new(
+                name.to_string(),
+                None,
+                None,
+                Type::INT8,
+                result_format(format, i, WORK_COLUMNS.len())?,
+            ))
+        })
+        .collect::<SqlResult<Vec<_>>>()?;
+    let header = Arc::new(fields);
+    let mut encoder = DataRowEncoder::new(header.clone());
+    let counters = counters::process_counters();
+    let allocations = counters::allocations();
+    let row = encoder
+        .encode_field(&counters.map(|c| c.unix_syscalls as i64))
+        .and_then(|()| encoder.encode_field(&counters.map(|c| c.instructions as i64)))
+        .and_then(|()| encoder.encode_field(&allocations.map(|n| n as i64)))
+        .and_then(|()| encoder.encode_field(&counters::thread_counters().map(|c| c.0 as i64)))
+        .and_then(|()| encoder.encode_field(&(db.branch_confirm_counts()[0] as i64)))
+        // This session thread's own allocations (counters::thread_allocations; 0 without the
+        // alloc-count feature): the work budget judges every counter by the operation's own thread.
+        .and_then(|()| encoder.encode_field(&(counters::thread_allocations() as i64)))
+        // Every other thread's CPU so far (counters::foreign_thread_cpu_ns), read last: a window
+        // whose two readings differ had a foreign thread run inside it.
+        .and_then(|()| {
+            encoder.encode_field(&counters::foreign_thread_cpu_ns().map(|n| n as i64))
+        });
+    #[cfg(feature = "phase-count")]
+    let row = row.and_then(|()| {
+        let phases = turso_pg::phase::totals().unwrap_or_default();
+        phases
+            .iter()
+            .try_for_each(|n| encoder.encode_field(&(*n as i64)))
+    });
+    let row = row.and_then(|()| encoder.finish());
+    Ok(Response::Query(QueryResponse::new(header, stream::iter(vec![row]))))
+}
+
+const STATS_COLUMNS: [&str; 10] = [
     "unix_syscalls",
     "mach_syscalls",
     "instructions",
     "cycles",
     "checkpoints_skipped",
     "store_checkpoints",
+    "hardcap_upgrades",
+    "header_raise_exclusive",
+    "inline_compaction_syncs",
+    "compaction_waits",
 ];
 
 /// turso_branch_stats(): the server process's counters ([`counters::process_counters`]), read as
@@ -2446,7 +3507,10 @@ const STATS_COLUMNS: [&str; 6] = [
 /// skipped CHECKPOINTs ([`CHECKPOINTS_SKIPPED`]); then the branch store's checkpoints installed
 /// since the database opened (its own count, the first of `branch_checkpoint_counters`; 0 for a
 /// store that is not a catalog store), so a client can count the store checkpoints in a timed
-/// window (PREREG section 5 M2; wire review 14 item 13).
+/// window (PREREG section 5 M2; wire review 14 item 13); then the store's four counted exceptions
+/// to "no create, connect, first write, delete or trunk commit waits on background work"
+/// (Database::branch_exception_counters), so every run prints them and a window in which one
+/// moved is labelled and not credited (DECISIONS 2026-10-15T05:16:51Z).
 fn stats_row(format: &Format, db: &Database) -> SqlResult<Response> {
     let header = Arc::new(stats_fields(format)?);
     let mut encoder = DataRowEncoder::new(header.clone());
@@ -2454,10 +3518,16 @@ fn stats_row(format: &Format, db: &Database) -> SqlResult<Response> {
         .map(|c| [c.unix_syscalls, c.mach_syscalls, c.instructions, c.cycles].map(|v| v as i64));
     let skipped = CHECKPOINTS_SKIPPED.load(Ordering::Relaxed) as i64;
     let store_checkpoints = db.branch_checkpoint_counters()[0] as i64;
+    let exceptions = db.branch_exception_counters().map(|v| v as i64);
     let row = (0..4)
         .try_for_each(|i| encoder.encode_field(&values.map(|v| v[i])))
         .and_then(|()| encoder.encode_field(&skipped))
         .and_then(|()| encoder.encode_field(&store_checkpoints))
+        .and_then(|()| {
+            exceptions
+                .iter()
+                .try_for_each(|v| encoder.encode_field(v))
+        })
         .and_then(|()| encoder.finish());
     Ok(Response::Query(QueryResponse::new(
         header,
@@ -2495,7 +3565,7 @@ fn result_format(format: &Format, i: usize, columns: usize) -> SqlResult<FieldFo
         Format::Individual(codes) => match codes.get(i) {
             Some(code) if codes.len() == columns => Ok(FieldFormat::from(*code)),
             _ => Err(error(
-                "08P01",
+                SqlErrorKind::ProtocolViolation,
                 format!(
                     "bind message has {} result formats but query has {columns} columns",
                     codes.len()
@@ -2534,13 +3604,31 @@ fn branch_call_fields(call: &PgBranchCall, format: &Format) -> SqlResult<Vec<Fie
     if call.function == "turso_branch_stats" {
         return stats_fields(format);
     }
-    let pg_type = if call.function == "turso_branch_create" {
+    if call.function == "turso_branch_work" {
+        return WORK_COLUMNS
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                Ok(FieldInfo::new(
+                    name.to_string(),
+                    None,
+                    None,
+                    Type::INT8,
+                    result_format(format, i, WORK_COLUMNS.len())?,
+                ))
+            })
+            .collect();
+    }
+    let pg_type = if matches!(
+        &*call.function,
+        "turso_branch_create" | "turso_branch_allocations"
+    ) {
         Type::INT8
     } else {
         Type::TEXT
     };
     Ok(vec![FieldInfo::new(
-        call.function.clone(),
+        call.function.to_string(),
         None,
         None,
         pg_type,
@@ -2551,10 +3639,10 @@ fn branch_call_fields(call: &PgBranchCall, format: &Format) -> SqlResult<Vec<Fie
 /// A statement's failure, boxed: an `ErrorInfo` is ~280 bytes and failure is the rare path.
 type SqlResult<T> = Result<T, Box<ErrorInfo>>;
 
-fn error(code: &str, message: String) -> Box<ErrorInfo> {
+fn error(kind: SqlErrorKind, message: String) -> Box<ErrorInfo> {
     Box::new(ErrorInfo::new(
         "ERROR".to_string(),
-        code.to_string(),
+        kind_code(kind).to_string(),
         message,
     ))
 }
@@ -2563,7 +3651,7 @@ fn error(code: &str, message: String) -> Box<ErrorInfo> {
 /// PortalNotFound is 26000, a statement's code).
 fn portal_not_found(name: &str) -> Box<ErrorInfo> {
     let name = if name == DEFAULT_NAME { "" } else { name };
-    error("34000", format!("portal \"{name}\" does not exist"))
+    error(SqlErrorKind::InvalidCursorName, format!("portal \"{name}\" does not exist"))
 }
 
 /// A statement with nothing in it: only PostgreSQL's whitespace, semicolons and comments, the text
@@ -2577,26 +3665,26 @@ fn is_blank(sql: &str) -> bool {
 }
 
 /// A WARNING notice, as PostgreSQL sends for a transaction verb that changes nothing.
-fn warning(code: &str, message: &str) -> Box<ErrorInfo> {
+fn warning(kind: SqlErrorKind, message: &str) -> Box<ErrorInfo> {
     Box::new(ErrorInfo::new(
         "WARNING".to_string(),
-        code.to_string(),
+        kind_code(kind).to_string(),
         message.to_string(),
     ))
 }
 
 fn aborted_error() -> Box<ErrorInfo> {
     error(
-        "25P02",
+        SqlErrorKind::InFailedSqlTransaction,
         "current transaction is aborted, commands ignored until end of transaction block"
             .to_string(),
     )
 }
 
-fn fatal(code: &str, message: &str) -> PgWireError {
+fn fatal(kind: SqlErrorKind, message: &str) -> PgWireError {
     PgWireError::UserError(Box::new(ErrorInfo::new(
         "FATAL".to_string(),
-        code.to_string(),
+        kind_code(kind).to_string(),
         message.to_string(),
     )))
 }
@@ -2604,95 +3692,83 @@ fn fatal(code: &str, message: &str) -> PgWireError {
 /// The SQLSTATE an engine error is reported with. Lock contention is PostgreSQL's
 /// lock_not_available, and a stale snapshot its serialization_failure: both tell a client to retry.
 fn engine_info(e: &LimboError) -> Box<ErrorInfo> {
-    error(sqlstate(e), e.to_string())
+    if let LimboError::Interrupt = e {
+        let message = match INTERRUPT_CAUSE.with(|c| c.get()) {
+            2 => "canceling statement due to statement timeout",
+            _ => "canceling statement due to user request",
+        };
+        return error(e.sql_error_kind(), message.to_string());
+    }
+    error(e.sql_error_kind(), e.to_string())
 }
 
-/// PostgreSQL's SQLSTATE (errcodes.txt) for an engine error, so a driver raises the right class
-/// (wire review 1 item 7). The engine types a constraint failure's kind only in SQLite's fixed
-/// message forms ("UNIQUE constraint failed: ..."), and a statement it cannot compile only as a
-/// ParseError whose text comes from libpg_query ("Invalid statement: ...", always a grammar
-/// error), the translator ("... not supported ...") or the planner ("no such table: ..."); those
-/// forms are read here. Anything unrecognised stays XX000, internal_error.
+/// PostgreSQL's SQLSTATE for the condition selected by the error's producer. Diagnostic text
+/// has no role here: rewording it preserves the code and the engine's error handling.
 fn sqlstate(e: &LimboError) -> &'static str {
-    match e {
-        LimboError::Busy => "55P03",
-        LimboError::BusySnapshot => "40001",
-        LimboError::ForeignKeyConstraint(_) => "23503",
-        LimboError::Constraint(m) if m.starts_with("UNIQUE constraint failed") => "23505",
-        LimboError::Constraint(m) if m.starts_with("NOT NULL constraint failed") => "23502",
-        LimboError::Constraint(m) if m.starts_with("CHECK constraint failed") => "23514",
-        LimboError::Constraint(m) if m.starts_with("invalid ") => "22P02",
-        // The engine's NUMERIC divide refuses a zero divisor as a constraint error in PostgreSQL's
-        // words, which is 22012, never an integrity violation (wire review 16 item 2).
-        LimboError::Constraint(m) if m == "division by zero" => "22012",
-        LimboError::Constraint(_) => "23000",
-        LimboError::ParseError(m) if m.starts_with("Invalid statement:") => "42601",
-        // The crash batch (2026-10-15): views nested past the planner's limit, refused where they
-        // overflowed the stack (statement_too_complex, PostgreSQL's stack depth limit); and a
-        // make_date / make_timestamp past the date range, which aborted the process.
-        LimboError::ParseError(m) if m.starts_with("stack depth limit exceeded") => "54001",
-        LimboError::ExtensionError(m) if m.starts_with("date field value out of range") => "22008",
-        // An infinite generate_series bound, refused by the PostgreSQL dialect in PostgreSQL's
-        // words (the crash batch, 2026-10-15): invalid_parameter_value.
-        LimboError::ExtensionError(m) if m.ends_with(" cannot be infinity") => "22023",
-        LimboError::ParseError(m)
-            if m.starts_with("no such table")
-                || m.starts_with("no such view")
-                || (m.starts_with("relation \"") && m.ends_with("\" does not exist")) =>
-        {
-            "42P01"
-        }
-        // A foreign key's parent key is not one (an ALTER's added key; wire review 11 item 5).
-        // The engine's own refusal of a key's arity, in a CREATE TABLE (wire review 13 item 4).
-        LimboError::ParseError(m)
-            if m.starts_with("there is no unique constraint matching given keys")
-                || m.starts_with("there is no primary key for referenced table")
-                || m.starts_with("number of referencing and referenced columns")
-                || (m.starts_with("foreign key on \"") && m.contains(" child column(s) but ")) =>
-        {
-            "42830"
-        }
-        // A foreign key's column that does not exist (wire review 13 item 3).
-        LimboError::ParseError(m)
-            if m.starts_with("column \"")
-                && m.ends_with("\" referenced in foreign key constraint does not exist") =>
-        {
-            "42703"
-        }
-        LimboError::ParseError(m) if m.starts_with("no such column") => "42703",
-        // A SET of a parameter PostgreSQL does not know (wire review 15 item 2).
-        LimboError::ParseError(m) if m.starts_with("unrecognized configuration parameter") => {
-            "42704"
-        }
-        LimboError::ParseError(m) if m.starts_with("there is no parameter") => "42P02",
-        // A savepoint name that names none (wire review 6 item 6).
-        LimboError::TxError(m) if m.starts_with("no such savepoint") => "3B001",
-        LimboError::ParseError(m)
-            if m.contains("is ambiguous") || m.starts_with("ambiguous column name") =>
-        {
-            "42702"
-        }
-        LimboError::ParseError(m) if m.starts_with("no such function") => "42883",
-        LimboError::ParseError(m) if m.contains("specified more than once") => "42712",
-        LimboError::ParseError(m) if m.contains("not supported") || m.contains("Unsupported") => {
-            "0A000"
-        }
-        LimboError::ParseError(_) => "42601",
-        LimboError::IntegerOverflow => "22003",
-        LimboError::ReadOnly => "25006",
-        LimboError::DatabaseFull(_) => "53100",
-        LimboError::Interrupt => "57014",
-        // The stack-guard class (fastest-engine): a statement nested too deeply for the session's
-        // thread is refused, as PostgreSQL's check_stack_depth() refuses it.
-        LimboError::StackDepthLimitExceeded => "54001",
-        _ => "XX000",
+    kind_code(e.sql_error_kind())
+}
+
+/// THE table: the SQLSTATE of each condition, the engine's and this server's own alike (C44; C44-M3
+/// moved the server's literal codes here: `every_sqlstate_the_server_sends_comes_from_the_table`).
+fn kind_code(kind: SqlErrorKind) -> &'static str {
+    use SqlErrorKind::*;
+    match kind {
+        SyntaxError => "42601",
+        FeatureNotSupported => "0A000",
+        InvalidTextRepresentation => "22P02",
+        NumericValueOutOfRange => "22003",
+        DivisionByZero => "22012",
+        IntegrityConstraintViolation => "23000",
+        UniqueViolation => "23505",
+        NotNullViolation => "23502",
+        CheckViolation => "23514",
+        ForeignKeyViolation => "23503",
+        InvalidColumnReference => "42P10",
+        DatetimeFieldOverflow => "22008",
+        InvalidParameterValue => "22023",
+        UndefinedTable => "42P01",
+        InvalidForeignKey => "42830",
+        UndefinedColumn => "42703",
+        UndefinedObject => "42704",
+        UndefinedParameter => "42P02",
+        InvalidSavepointSpecification => "3B001",
+        AmbiguousColumn => "42702",
+        UndefinedFunction => "42883",
+        DuplicateAlias => "42712",
+        StatementTooComplex => "54001",
+        InternalError => "XX000",
+        SerializationFailure => "40001",
+        LockNotAvailable => "55P03",
+        ReadOnlyTransaction => "25006",
+        DiskFull => "53100",
+        QueryCanceled => "57014",
+        ConnectionFailure => "08006",
+        ProtocolViolation => "08P01",
+        NullValueNotAllowed => "22004",
+        CharacterNotInRepertoire => "22021",
+        InvalidBinaryRepresentation => "22P03",
+        ActiveSqlTransaction => "25001",
+        NoActiveSqlTransaction => "25P01",
+        InFailedSqlTransaction => "25P02",
+        InvalidCursorName => "34000",
+        InvalidCatalogName => "3D000",
+        DatatypeMismatch => "42804",
+        ReservedName => "42939",
+        DuplicateCursor => "42P03",
+        DuplicateDatabase => "42P04",
+        IndeterminateDatatype => "42P18",
+        ObjectNotInPrerequisiteState => "55000",
+        ObjectInUse => "55006",
+        TooManyConnections => "53300",
+        Warning => "01000",
+        SuccessfulCompletion => "00000",
     }
 }
 
 fn wire_info(e: PgWireError) -> Box<ErrorInfo> {
     match e {
         PgWireError::UserError(info) => info,
-        other => error("XX000", other.to_string()),
+        other => error(SqlErrorKind::InternalError, other.to_string()),
     }
 }
 
@@ -2706,6 +3782,31 @@ fn engine_error(e: LimboError) -> PgWireError {
 
 #[async_trait]
 impl NoopStartupHandler for Session {
+    /// The settings SHOW answers, from turso_pg's one table, over pgwire's defaults, which
+    /// announced DateStyle `ISO, YMD`, TimeZone `Etc/UTC` and search_path `public` (wire review 18
+    /// item 19). bytea_output and extra_float_digits are not reported settings in PostgreSQL.
+    fn server_parameters(&self) -> DefaultServerParameterProvider {
+        let mut provider = DefaultServerParameterProvider::default();
+        for &(name, value) in turso_pg::FIXED_SETTINGS {
+            match name {
+                "client_encoding" => provider.client_encoding = Some(value.to_string()),
+                "standard_conforming_strings" => {
+                    provider.standard_conforming_strings = value == "on"
+                }
+                "DateStyle" => provider.date_style = value.to_string(),
+                "IntervalStyle" => provider.interval_style = value.to_string(),
+                "TimeZone" => provider.time_zone = value.to_string(),
+                _ => {}
+            }
+        }
+        provider.search_path = turso_pg::DEFAULT_SEARCH_PATH.to_string();
+        provider
+    }
+
+    fn backend_key(&self) -> Option<(i32, pgwire::messages::startup::SecretKey)> {
+        Some((self.key.0, pgwire::messages::startup::SecretKey::I32(self.key.1)))
+    }
+
     async fn post_startup<C>(
         &self,
         client: &mut C,
@@ -2743,7 +3844,8 @@ impl SimpleQueryHandler for Session {
         let responses = if is_blank(&query.query) {
             // An empty Query ends an unsynced pipeline's implicit block as any Query does
             // (committing it); it left the block open (wire review 16 item 6).
-            let mut responses = vec![(Vec::new(), Response::EmptyQuery)];
+            let mut responses = Replies::new();
+            responses.push((Vec::new(), Response::EmptyQuery));
             if let Err(e) = self.end_implicit() {
                 responses.push((Vec::new(), Response::Error(e)));
             }
@@ -2751,6 +3853,7 @@ impl SimpleQueryHandler for Session {
         } else {
             self.simple_with_notices(&query.query)
         };
+        let encoding = turso_pg::phase::enter(turso_pg::phase::Phase::Encode);
         for (notices, response) in responses {
             for notice in notices {
                 client
@@ -2776,7 +3879,7 @@ impl SimpleQueryHandler for Session {
                     }
                     client
                         .feed(PgWireBackendMessage::CommandComplete(
-                            Tag::new(&tag).with_rows(rows).into(),
+                            query_complete(&tag, rows).into(),
                         ))
                         .await?;
                 }
@@ -2793,6 +3896,20 @@ impl SimpleQueryHandler for Session {
                     return Err(PgWireError::UserError(e));
                 }
                 Response::Error(e) => {
+                    // A query that failed while running: its RowDescription and rows first.
+                    // Taken before the awaits: the session state's guard is not Send.
+                    let started = self.state().started.take();
+                    if let Some(started) = started {
+                        let fields = started.header.iter().map(Into::into).collect();
+                        client
+                            .feed(PgWireBackendMessage::RowDescription(RowDescription::new(
+                                fields,
+                            )))
+                            .await?;
+                        for row in started.rows {
+                            client.feed(PgWireBackendMessage::DataRow(row)).await?;
+                        }
+                    }
                     client
                         .feed(PgWireBackendMessage::ErrorResponse((*e).into()))
                         .await?;
@@ -2804,10 +3921,12 @@ impl SimpleQueryHandler for Session {
                         ))
                         .await?;
                 }
+                // A branch call's reply, encoded by the fast path (inline_one_row).
+                Response::Inline(m) => client.feed(PgWireBackendMessage::Inline(m)).await?,
                 // This server answers COPY FROM a file itself and never streams COPY.
                 Response::CopyIn(_) | Response::CopyOut(_) | Response::CopyBoth(_) => {
                     return Err(PgWireError::UserError(error(
-                        "0A000",
+                        SqlErrorKind::FeatureNotSupported,
                         "COPY over the protocol is not supported".to_string(),
                     )));
                 }
@@ -2821,11 +3940,18 @@ impl SimpleQueryHandler for Session {
         // its one-write-per-statement check must catch (gap review item 2, wire review 5 item 3).
         #[cfg(feature = "budget-plant-split-reply")]
         client.flush().await?;
+        if let Some(changed) = self.changed_parameters() {
+            client
+                .feed(PgWireBackendMessage::ParameterStatus(changed))
+                .await?;
+        }
         client
             .feed(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
                 status,
             )))
             .await?;
+        drop(encoding);
+        let _writing = turso_pg::phase::enter(turso_pg::phase::Phase::Write);
         client.flush().await?;
         Ok(())
     }
@@ -2860,20 +3986,35 @@ impl ExtendedQueryHandler for Session {
         C::Error: std::fmt::Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        // In a failed block only a block exit is parsed, as PostgreSQL's exec_parse_message refuses
+        // anything else (25P02) ahead of parse analysis (postgres.c:1522-1528); a blank query is no
+        // statement there and parses. ParseComplete went out for every statement, and a utility
+        // statement's declared unspecified parameter then answered 42P18 at Bind ahead of the
+        // 25P02 (wire review 17 item 8).
+        if self.state().aborted
+            && !is_blank(&message.query)
+            && !TxVerb::of(&message.query).ends_block()
+        {
+            return Err(PgWireError::UserError(aborted_error()));
+        }
         // The text as it is, and the branch call it is, read here once (wire review 13 item 6).
-        let types = message
+        let types: Vec<Option<Type>> = message
             .type_oids
             .iter()
             .map(|o| Type::from_oid(*o))
             .collect();
+        // PostgreSQL's Parse step (exec_parse_message), in its order, before ParseComplete and
+        // before the statement exists (C53, PGDIV-PARSE-REFUSAL-STEP): the raw parse (a syntax or
+        // lexical error, 42601: C40 review LOW 2), then the analysis of a statement it analyses
+        // (a missing relation, an unknown function, a parameter it cannot type). They were found
+        // at Describe or Execute, after ParseComplete and BindComplete.
+        let mut msg = read_parse_message(&message.query).map_err(engine_error)?;
+        let parsed = Parsed::from_message(message.query, &msg);
+        self.parse_step(&parsed, &mut msg, &types)?;
         let id = message.name.unwrap_or_else(|| DEFAULT_NAME.to_owned());
         client
             .portal_store()
-            .put_statement(Arc::new(StoredStatement::new(
-                id,
-                Parsed::new(message.query),
-                types,
-            )));
+            .put_statement(Arc::new(StoredStatement::new(id, parsed, types)));
         client
             .feed(PgWireBackendMessage::ParseComplete(ParseComplete::new()))
             .await?;
@@ -2934,6 +4075,31 @@ impl ExtendedQueryHandler for Session {
         }
         check_parameter_codes(&message).map_err(PgWireError::UserError)?;
         let portal = Portal::try_new(&message, statement)?;
+        // The values, read by their parameters' types before BindComplete, as exec_bind_message
+        // reads them (C53, PGDIV-BIND-REFUSAL-STEP): they were read at Execute, after BindComplete
+        // and a RowDescription. The types come from the statement's first meeting with the engine
+        // (Describe's prepare, kept for the Describe and Execute that follow, so a round prepares
+        // once as before); a branch call's are text, read by the call itself.
+        if portal.statement.statement.call.is_none() && !portal.parameters.is_empty() {
+            self.describe_prepare(&portal.statement.statement.sql)?;
+            let params = self
+                .described_parameters(&portal.statement.parameter_types)
+                .map_err(PgWireError::UserError)?;
+            if params.len() == portal.parameters.len() {
+                decode_portal_parameters(&portal, &params)?;
+            }
+        }
+        // A named portal lives until its Close or its transaction's end: binding the name again
+        // is 42P03, as PostgreSQL's CreatePortal refuses it. It replaced the portal silently, a
+        // suspended one included (wire review 15 item 20). The unnamed portal is replaced, as
+        // there.
+        if portal.name != DEFAULT_NAME && client.portal_store().get_portal(&portal.name).is_some()
+        {
+            return Err(PgWireError::UserError(error(
+                SqlErrorKind::DuplicateCursor,
+                format!("cursor \"{}\" already exists", portal.name),
+            )));
+        }
         {
             let mut st = self.state();
             match message
@@ -2949,11 +4115,14 @@ impl ExtendedQueryHandler for Session {
                     st.bad_result_codes.remove(&portal.name);
                 }
             }
+            st.finished_tags.remove(&portal.name);
             if portal.name != DEFAULT_NAME {
                 st.done_portals.remove(&portal.name);
-                if !st.portals.contains(&portal.name) {
-                    st.portals.push(portal.name.clone());
-                }
+            }
+            // The unnamed portal too ends with its transaction (it may outlive a Sync, suspended
+            // in a block: wire review 15 item 16).
+            if !st.portals.contains(&portal.name) {
+                st.portals.push(portal.name.clone());
             }
         }
         client.portal_store().put_portal(Arc::new(portal));
@@ -3046,7 +4215,7 @@ impl ExtendedQueryHandler for Session {
         // item 5).
         if self.state().done_portals.contains(name) {
             return Err(PgWireError::UserError(error(
-                "55000",
+                SqlErrorKind::ObjectNotInPrerequisiteState,
                 format!("portal \"{name}\" cannot be run"),
             )));
         }
@@ -3056,12 +4225,27 @@ impl ExtendedQueryHandler for Session {
         let mut state = state.lock().await;
         match &mut *state {
             PortalExecutionState::Initial => {
-                match ExtendedQueryHandler::do_query(self, client, &portal, max_rows).await? {
+                let done = ExtendedQueryHandler::do_query(self, client, &portal, max_rows).await;
+                // A query that failed while running: the rows it made go out before the error, as
+                // PostgreSQL sends them (an Execute sends no RowDescription; Describe did, when it
+                // was asked).
+                if done.is_err() {
+                    // Taken before the awaits: the session state's guard is not Send.
+                    let started = self.state().started.take();
+                    if let Some(started) = started {
+                        for row in started.rows {
+                            client.feed(PgWireBackendMessage::DataRow(row)).await?;
+                        }
+                    }
+                }
+                match done? {
                     Response::Query(mut results) => {
                         let refuse = self.state().bad_result_codes.get(name).copied();
+                        let tag = results.command_tag().to_owned();
                         *state = if feed_rows(client, &mut results, max_rows, refuse).await? {
                             PortalExecutionState::Suspended(results)
                         } else {
+                            self.state().finished_tags.insert(name.to_string(), tag);
                             PortalExecutionState::Finished
                         };
                     }
@@ -3086,33 +4270,55 @@ impl ExtendedQueryHandler for Session {
                             .feed(PgWireBackendMessage::ErrorResponse((*e).into()))
                             .await?;
                     }
+                    // The fast path encodes a simple Query's reply alone (branch, portal None).
+                    Response::Inline(_) => {
+                        return Err(PgWireError::UserError(error(
+                            SqlErrorKind::InternalError,
+                            "internal error: an inline reply reached an Execute".to_string(),
+                        )));
+                    }
                     // This server answers COPY FROM a file itself and never streams COPY.
                     Response::CopyIn(_) | Response::CopyOut(_) | Response::CopyBoth(_) => {
                         return Err(PgWireError::UserError(error(
-                            "0A000",
+                            SqlErrorKind::FeatureNotSupported,
                             "COPY over the protocol is not supported".to_string(),
                         )));
                     }
                 }
             }
             PortalExecutionState::Suspended(results) => {
+                let tag = results.command_tag().to_owned();
                 if !feed_rows(client, results, max_rows, None).await? {
+                    self.state().finished_tags.insert(name.to_string(), tag);
                     *state = PortalExecutionState::Finished;
                 }
             }
-            // A query portal that returned all its rows returns none more: "SELECT 0", as in
-            // PostgreSQL (it answered NoData; wire review 12 item 5).
+            // A query portal that returned all its rows returns none more: its own tag with 0
+            // rows (`SELECT 0`, `INSERT 0 0`, ...), as PostgreSQL copies the portal's tag (it
+            // answered NoData, wire review 12 item 5; then SELECT 0 for every verb, review 15
+            // item 17).
             PortalExecutionState::Finished => {
+                let tag = self
+                    .state()
+                    .finished_tags
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| "SELECT".to_string());
                 client
                     .feed(PgWireBackendMessage::CommandComplete(
-                        Tag::new("SELECT").with_rows(0).into(),
+                        query_complete(&tag, 0).into(),
                     ))
                     .await?;
             }
         }
+        let suspended = matches!(&*state, PortalExecutionState::Suspended(_));
+        drop(state);
         client.set_state(PgWireConnectionState::ReadyForQuery);
-        // As pgwire does: the unnamed portal goes with its execution.
-        if name == DEFAULT_NAME {
+        // As pgwire does: the unnamed portal goes with its execution, unless a row limit
+        // suspended it, when it continues at the next Execute until its transaction ends or the
+        // next unnamed Bind replaces it, as in PostgreSQL (it was removed, so the next Execute was
+        // 34000: wire review 15 item 16).
+        if name == DEFAULT_NAME && !suspended {
             client.portal_store().rm_portal(name);
         }
         Ok(())
@@ -3203,7 +4409,7 @@ impl ExtendedQueryHandler for Session {
         }
         self.describe_prepare(sql)?;
         let fields = self
-            .described_fields(&Format::UnifiedText)
+            .described_fields(&Format::UnifiedText, &target.parameter_types)
             .map_err(PgWireError::UserError)?;
         let params = self
             .described_parameters(&target.parameter_types)
@@ -3246,7 +4452,10 @@ impl ExtendedQueryHandler for Session {
         }
         self.describe_prepare(sql)?;
         let fields = self
-            .described_fields(&portal.result_column_format)
+            .described_fields(
+                &portal.result_column_format,
+                &portal.statement.parameter_types,
+            )
             .map_err(PgWireError::UserError)?;
         // As do_describe_statement: the result types only, which a portal's Describe reports.
         if self.state().described.is_some() {
@@ -3287,6 +4496,11 @@ impl ExtendedQueryHandler for Session {
                 .await?;
         }
         client.set_transaction_status(status);
+        if let Some(changed) = self.changed_parameters() {
+            client
+                .feed(PgWireBackendMessage::ParameterStatus(changed))
+                .await?;
+        }
         send_ready_for_query(client, status).await?;
         Ok(())
     }
@@ -3315,7 +4529,7 @@ where
                 // PostgreSQL's printtup refuses it (wire review 13 item 10).
                 if let Some(code) = refuse {
                     return Err(PgWireError::UserError(error(
-                        "22023",
+                        SqlErrorKind::InvalidParameterValue,
                         format!("unsupported format code: {code}"),
                     )));
                 }
@@ -3325,7 +4539,7 @@ where
             None => {
                 client
                     .feed(PgWireBackendMessage::CommandComplete(
-                        Tag::new(&tag).with_rows(rows).into(),
+                        query_complete(&tag, rows).into(),
                     ))
                     .await?;
                 return Ok(false);
@@ -3338,9 +4552,34 @@ where
     Ok(true)
 }
 
-/// The type of each result column a Describe reported, as [`Parsed::fix_columns`] reads them.
-fn field_types(fields: &[FieldInfo]) -> Vec<Type> {
-    fields.iter().map(|f| f.datatype().clone()).collect()
+/// The name and type of each result column a Describe reported, as [`Parsed::fix_columns`] reads
+/// them.
+fn field_types(fields: &[FieldInfo]) -> Vec<(String, Type)> {
+    fields
+        .iter()
+        .map(|f| (f.name().to_string(), f.datatype().clone()))
+        .collect()
+}
+
+/// The result column types the parse gives (StatementTypes::columns), with each bare-parameter
+/// column (StatementTypes::param_targets) typed as its parameter: the declared type, else the one
+/// inferred ([`parameter_types`]), as PostgreSQL announces `SELECT $1` (it was text). Describe
+/// and Execute read the same list.
+fn result_column_types(types: &StatementTypes, declared: &[Option<Type>]) -> Vec<Option<u32>> {
+    let mut columns = types.columns.clone();
+    if types.param_targets.len() != columns.len() || types.param_targets.iter().all(Option::is_none)
+    {
+        return columns;
+    }
+    let Ok(params) = parameter_types(types, declared) else {
+        return columns;
+    };
+    for (column, target) in columns.iter_mut().zip(&types.param_targets) {
+        if let Some(t) = target.and_then(|n| params.get(n as usize - 1)) {
+            *column = Some(t.oid());
+        }
+    }
+    columns
 }
 
 /// A prepared statement's result columns, typed by [`column_type`]: what Describe reports and what
@@ -3470,55 +4709,35 @@ fn scalar_pg_type_to_array_type(scalar: &Type) -> Type {
 /// that every key is resolved once the table exists, as the engine resolves it for a write, and the
 /// table is undone if one does not resolve (42830, turso_pg::check_table_keys): the parents were
 /// checked at prepare, a key onto the table itself only now. It was created unchecked, and every
-/// INSERT into it then failed 'foreign key mismatch' (wire review 13 item 2). The transaction is
-/// the engine's (engine_tx), so no SQL text is parsed for it.
+/// INSERT into it then failed 'foreign key mismatch' (wire review 13 item 2). The transaction and
+/// its undo are the frontend's one rule (PgConnection::in_own_transaction): an undo that fails
+/// breaks the connection, FATAL 08006 here, where `let _ =` kept the refused table in a transaction
+/// the client's next COMMIT committed (wire review 16 item 14). In its own transaction a lock met
+/// at any step was rolled back with it: 40001, as for a failed COMMIT (commit_failed).
 fn create_with_keys(
     conn: &PgConnection,
     stmt: &mut turso_core::Statement,
     sql: &str,
     table: &str,
-    backoff: &mut Backoff,
+    backoff: &mut Backoff<'_>,
 ) -> PgWireResult<Response> {
-    const SAVEPOINT: &str = "__turso_create_keys";
     let own = conn.inner().get_auto_commit();
-    engine_tx(
-        conn,
-        if own {
-            TxStmt::Begin
-        } else {
-            TxStmt::Savepoint(SAVEPOINT)
-        },
-    )
-    .map_err(engine_error)?;
-    let r = execute_non_query(stmt, sql, backoff).and_then(|response| {
+    conn.in_own_transaction("__turso_create_keys", "CREATE TABLE", || {
+        run_waiting(stmt, backoff, |_| Ok(()))?;
         turso_pg::check_table_keys(conn.inner(), table)
-            .map(|()| response)
-            .map_err(engine_error)
-    });
-    let end = match &r {
-        // The same rule as an implicit block's COMMIT (end_implicit): a block the engine still
-        // holds is rolled back, and a transaction it stranded breaks the connection.
-        Ok(_) if own => engine_tx(conn, TxStmt::Commit).map_err(|e| {
-            let info = commit_failed(conn, engine_info(&e));
-            if !conn.inner().get_auto_commit() {
-                let _ = engine_tx(conn, TxStmt::Rollback);
-            }
-            PgWireError::UserError(info)
-        }),
-        Ok(_) => engine_tx(conn, TxStmt::Release(SAVEPOINT)).map_err(engine_error),
-        Err(_) => {
-            if !conn.inner().get_auto_commit() {
-                let _ = if own {
-                    engine_tx(conn, TxStmt::Rollback)
-                } else {
-                    engine_tx(conn, TxStmt::RollbackTo(SAVEPOINT))
-                        .and_then(|()| engine_tx(conn, TxStmt::Release(SAVEPOINT)))
-                };
-            }
-            Ok(())
+    })
+    .map_err(|e| {
+        let info = engine_info(&e);
+        if conn.is_broken() {
+            broken_fatal(info)
+        } else if own {
+            commit_failed(conn, info)
+        } else {
+            info
         }
-    };
-    end.and(r)
+    })
+    .map_err(PgWireError::UserError)?;
+    Ok(Response::Execution(command_tag(sql, stmt.n_change() as usize)))
 }
 
 /// Execute a query that returns rows and build a Query response. Each column has the type the
@@ -3530,10 +4749,16 @@ fn execute_query(
     format: &Format,
     columns: &[Type],
     schema: &turso_core::schema::Schema,
-    backoff: &mut Backoff,
-) -> PgWireResult<Response> {
-    let header =
-        Arc::new(field_info(stmt, format, |i| columns[i].clone()).map_err(PgWireError::UserError)?);
+    backoff: &mut Backoff<'_>,
+) -> Result<Response, QueryFailure> {
+    let unstarted = |error| QueryFailure {
+        error,
+        started: None,
+    };
+    let header = Arc::new(
+        field_info(stmt, format, |i| columns[i].clone())
+            .map_err(|e| unstarted(PgWireError::UserError(e)))?,
+    );
     // A binary column of a type encode_binary has no encoding for (numeric, date, timestamp,
     // uuid, ...) is refused before the statement runs, by its type alone: refused at its first
     // row, a write's RETURNING was refused after the write (wire review 4 item 1), and a numeric
@@ -3542,14 +4767,14 @@ fn execute_query(
         .iter()
         .find(|f| f.format() == FieldFormat::Binary && !BINARY_ENCODED.contains(f.datatype()))
     {
-        return Err(PgWireError::UserError(error(
-            "0A000",
+        return Err(unstarted(PgWireError::UserError(error(
+            SqlErrorKind::FeatureNotSupported,
             format!(
                 "binary format for column \"{}\" of type {} is not supported; ask for text format",
                 f.name(),
                 f.datatype()
             ),
-        )));
+        ))));
     }
     let pads: Vec<Option<usize>> = (0..stmt.num_columns())
         .map(|i| bpchar_width(stmt, schema, i))
@@ -3574,9 +4799,19 @@ fn execute_query(
         }
     });
     if let Some(e) = unencodable {
-        return Err(e);
+        return Err(unstarted(e));
     }
-    ran.map_err(engine_error)?;
+    // An error while it ran comes after its RowDescription and the rows made before it, as
+    // PostgreSQL sends them (C53, PGDIV-ERROR-BEFORE-ROWDESC).
+    if let Err(e) = ran {
+        return Err(QueryFailure {
+            error: engine_error(e),
+            started: Some(Started {
+                header,
+                rows: rows.into_iter().filter_map(Result::ok).collect(),
+            }),
+        });
+    }
     Ok(Response::Query(QueryResponse::new(
         header,
         stream::iter(rows),
@@ -3682,7 +4917,7 @@ fn encode_binary(encoder: &mut DataRowEncoder, val: &Value, pg_type: &Type) -> P
     use turso_core::Numeric;
     let range = |_| {
         PgWireError::UserError(error(
-            "22003",
+            SqlErrorKind::NumericValueOutOfRange,
             format!("value out of range for type {pg_type}"),
         ))
     };
@@ -3728,7 +4963,7 @@ fn no_binary(val: &Value, t: &Type) -> PgWireError {
         Value::Blob(_) => "blob",
     };
     PgWireError::UserError(error(
-        "0A000",
+        SqlErrorKind::FeatureNotSupported,
         format!(
             "binary format for a {class} value in a column of type {t} is not supported; ask for \
              text format"
@@ -3740,13 +4975,50 @@ fn no_binary(val: &Value, t: &Type) -> PgWireError {
 fn execute_non_query(
     stmt: &mut turso_core::Statement,
     query: &str,
-    backoff: &mut Backoff,
+    backoff: &mut Backoff<'_>,
+    simple: bool,
 ) -> PgWireResult<Response> {
+    let executing = turso_pg::phase::enter(turso_pg::phase::Phase::Execute);
     run_waiting(stmt, backoff, |_| Ok(())).map_err(engine_error)?;
+    drop(executing);
 
     let affected = stmt.n_change();
+    // A simple Query's INSERT, UPDATE or DELETE completes with its tag encoded inline, with no
+    // allocation (L5; inline_dml_completes_are_the_messages_pgwire_encodes).
+    if simple {
+        if let Some(m) = inline_dml_complete(query, affected as usize) {
+            return Ok(Response::Inline(m));
+        }
+    }
     let tag = command_tag(query, affected as usize);
     Ok(Response::Execution(tag))
+}
+
+/// INSERT, UPDATE or DELETE, read from the statement's first token without copying it, as
+/// [`command_tag`] reads it (skip_blank, then the verb in any case); None for any other verb.
+fn dml_verb(query: &str) -> Option<&'static str> {
+    let start = skip_blank(query.as_bytes(), 0).unwrap_or(query.len());
+    let head = query.as_bytes()[start..].trim_ascii_start();
+    ["INSERT", "UPDATE", "DELETE"].into_iter().find(|verb| {
+        head.len() >= verb.len() && head[..verb.len()].eq_ignore_ascii_case(verb.as_bytes())
+    })
+}
+
+/// The CommandComplete of an INSERT (`INSERT 0 n`), UPDATE or DELETE (`UPDATE n`), encoded inline.
+fn inline_dml_complete(query: &str, rows: usize) -> Option<pgwire::messages::Inline> {
+    let verb = dml_verb(query)?;
+    let mut digits = [0u8; 20];
+    let n = int_text(rows as i64, &mut digits);
+    let oid: &[u8] = if verb == "INSERT" { b" 0 " } else { b" " };
+    let len = 4 + verb.len() + oid.len() + n.len() + 1;
+    let mut m = pgwire::messages::Inline::default();
+    let ok = m.push(b"C")
+        && m.push(&(len as i32).to_be_bytes())
+        && m.push(verb.as_bytes())
+        && m.push(oid)
+        && m.push(n)
+        && m.push(&[0]);
+    ok.then_some(m)
 }
 
 /// The type of each parameter, $1 up to the highest the statement holds or the client declared:
@@ -3772,7 +5044,7 @@ fn parameter_types(types: &StatementTypes, declared: &[Option<Type>]) -> SqlResu
             if types.used.binary_search(&(n as u32)).is_err() || types.untyped.contains(&(n as u32))
             {
                 return Err(error(
-                    "42P18",
+                    SqlErrorKind::IndeterminateDatatype,
                     format!("could not determine data type of parameter ${n}"),
                 ));
             }
@@ -3797,15 +5069,7 @@ fn bind_portal_parameters(
     portal: &Portal<Parsed>,
     types: &[Type],
 ) -> PgWireResult<()> {
-    // The format codes were checked at Bind ([`check_bind`]): none, one, or one per value.
-    for (i, (pg_type, sent)) in types.iter().zip(&portal.parameters).enumerate() {
-        let value = match sent {
-            None => Value::Null,
-            Some(bytes) if portal.parameter_format.is_binary(i) => {
-                pg_binary_to_value(bytes, pg_type, i + 1)?
-            }
-            Some(bytes) => pg_bytes_to_value(bytes, pg_type)?,
-        };
+    for (i, value) in decode_portal_parameters(portal, types)?.into_iter().enumerate() {
         let index = NonZero::new(i + 1).expect("i + 1 >= 1");
         // A parameter with no engine slot (declared but unused, or in a clause the engine folds
         // away) binds nothing.
@@ -3815,6 +5079,39 @@ fn bind_portal_parameters(
         }
     }
     Ok(())
+}
+
+/// Every value `portal` holds, read by its parameter's type and format, as PostgreSQL's
+/// exec_bind_message reads them before it answers BindComplete: a value its type cannot read
+/// (22P02, 22003, 22023) refuses the Bind (C53, PGDIV-BIND-REFUSAL-STEP; at [`Session::on_bind`])
+/// and again the Execute that binds them.
+fn decode_portal_parameters(portal: &Portal<Parsed>, types: &[Type]) -> PgWireResult<Vec<Value>> {
+    // check_bind_arity made the counts equal; zipped short, a mismatch bound a value under another's
+    // type or left a parameter unbound (NULL to the engine), so it is refused (wire review 18 item
+    // 23).
+    if types.len() != portal.parameters.len() {
+        return Err(PgWireError::UserError(error(
+            SqlErrorKind::InternalError,
+            format!(
+                "internal error: {} parameter types for {} values",
+                types.len(),
+                portal.parameters.len()
+            ),
+        )));
+    }
+    // The format codes were checked at Bind ([`check_bind`]): none, one, or one per value.
+    types
+        .iter()
+        .zip(&portal.parameters)
+        .enumerate()
+        .map(|(i, (pg_type, sent))| match sent {
+            None => Ok(Value::Null),
+            Some(bytes) if portal.parameter_format.is_binary(i) => {
+                pg_binary_to_value(bytes, pg_type, i + 1)
+            }
+            Some(bytes) => pg_bytes_to_value(bytes, pg_type),
+        })
+        .collect()
 }
 
 /// PostgreSQL's first check of a Bind message (exec_bind_message), made before anything else and
@@ -3831,7 +5128,7 @@ fn check_bind(bind: &Bind) -> SqlResult<()> {
     let (codes, values) = (bind.parameter_format_codes.len(), bind.parameters.len());
     if codes > 1 && codes != values {
         return Err(error(
-            "08P01",
+            SqlErrorKind::ProtocolViolation,
             format!("bind message has {codes} parameter formats but {values} parameters"),
         ));
     }
@@ -3850,7 +5147,7 @@ fn check_parameter_codes(bind: &Bind) -> SqlResult<()> {
         .iter()
         .find(|c| !matches!(c, 0 | 1))
     {
-        Some(code) => Err(error("22023", format!("unsupported format code: {code}"))),
+        Some(code) => Err(error(SqlErrorKind::InvalidParameterValue, format!("unsupported format code: {code}"))),
         None => Ok(()),
     }
 }
@@ -3867,7 +5164,7 @@ fn check_bind_arity(values: usize, statement: &str, required: usize) -> SqlResul
         statement
     };
     Err(error(
-        "08P01",
+        SqlErrorKind::ProtocolViolation,
         format!(
             "bind message supplies {values} parameters, but prepared statement \"{name}\" \
              requires {required}"
@@ -3885,7 +5182,7 @@ fn check_bind_arity(values: usize, statement: &str, required: usize) -> SqlResul
 fn pg_binary_to_value(bytes: &[u8], pg_type: &Type, n: usize) -> PgWireResult<Value> {
     let bad = || {
         PgWireError::UserError(error(
-            "22P03",
+            SqlErrorKind::InvalidBinaryRepresentation,
             format!("incorrect binary data format in bind parameter {n} (type {pg_type})"),
         ))
     };
@@ -3894,7 +5191,7 @@ fn pg_binary_to_value(bytes: &[u8], pg_type: &Type, n: usize) -> PgWireResult<Va
             .map(|s| Value::from_text(s.to_owned()))
             .map_err(|e| {
                 PgWireError::UserError(error(
-                    "22021",
+                    SqlErrorKind::CharacterNotInRepertoire,
                     format!("invalid UTF-8 in bind parameter {n}: {e}"),
                 ))
             })
@@ -3945,7 +5242,7 @@ fn pg_binary_to_value(bytes: &[u8], pg_type: &Type, n: usize) -> PgWireResult<Va
         text(bytes)
     } else {
         Err(PgWireError::UserError(error(
-            "0A000",
+            SqlErrorKind::FeatureNotSupported,
             format!(
                 "binary format for bind parameter {n} of type {t} is not supported; send it in \
                  text format"
@@ -3962,7 +5259,7 @@ fn pg_binary_to_value(bytes: &[u8], pg_type: &Type, n: usize) -> PgWireResult<Va
 fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
     let text = std::str::from_utf8(bytes).map_err(|e| {
         PgWireError::UserError(error(
-            "22021",
+            SqlErrorKind::CharacterNotInRepertoire,
             format!("invalid byte sequence for encoding \"UTF8\" in parameter: {e}"),
         ))
     })?;
@@ -3971,14 +5268,22 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
     }
     let syntax = |name: &str| {
         PgWireError::UserError(error(
-            "22P02",
+            SqlErrorKind::InvalidTextRepresentation,
             format!("invalid input syntax for type {name}: \"{text}\""),
         ))
     };
     let out_of_range = |name: &str| {
         PgWireError::UserError(error(
-            "22003",
+            SqlErrorKind::NumericValueOutOfRange,
             format!("value \"{text}\" is out of range for type {name}"),
+        ))
+    };
+    // float4in and float8in word it without "value" (recorded, pg18.out and
+    // pg18-audit1-lib-parameters_decode_at_postgresqls_edges.out).
+    let float_out_of_range = |name: &str| {
+        PgWireError::UserError(error(
+            SqlErrorKind::NumericValueOutOfRange,
+            format!("\"{text}\" is out of range for type {name}"),
         ))
     };
 
@@ -4008,12 +5313,25 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
                 .trim_start_matches(['+', '-'])
                 .to_ascii_lowercase()
                 .starts_with("inf");
-            let past = match *pg_type {
-                Type::FLOAT4 => f.is_finite() && f.abs() > f64::from(f32::MAX),
-                _ => false,
+            // float4's range is read as float4in reads it, rounded to the nearest float4:
+            // '3.4028235e+38', float4out's own spelling of FLT_MAX, is above f32::MAX as an f64
+            // and was refused (wire review 16 item 23).
+            let in_type = match *pg_type {
+                Type::FLOAT4 => trimmed.parse::<f32>().map_or(f, f64::from),
+                _ => f,
             };
-            if (f.is_infinite() && !infinite_spelled) || past {
-                return Err(out_of_range(name));
+            if in_type.is_infinite() && !infinite_spelled {
+                return Err(float_out_of_range(name));
+            }
+            // A spelling of a nonzero value that underflows the type to zero ('1e-400'), which
+            // float4in and float8in refuse (ERANGE with a zero result; recalled from their source,
+            // not re-read); numeric's range holds it. It bound 0 (wire review 16 item 23).
+            let mantissa = trimmed.split(['e', 'E']).next().unwrap_or("");
+            if in_type == 0.0
+                && *pg_type != Type::NUMERIC
+                && mantissa.bytes().any(|b| (b'1'..=b'9').contains(&b))
+            {
+                return Err(float_out_of_range(name));
             }
             Ok(Value::from_f64(f))
         }
@@ -4025,11 +5343,18 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
             // PostgreSQL text format for bytea uses \x hex encoding
             if let Some(hex_str) = text.strip_prefix("\\x") {
                 let data =
-                    decode_hex(hex_str).map_err(|e| PgWireError::UserError(error("22023", e)))?;
+                    decode_hex(hex_str).map_err(|e| PgWireError::UserError(error(SqlErrorKind::InvalidParameterValue, e)))?;
                 Ok(Value::from_blob(data))
             } else {
-                // Raw bytes as-is
-                Ok(Value::from_blob(bytes.to_vec()))
+                // byteain's escape format: `\\` one backslash, `\ooo` (first digit 0-3) one
+                // byte, any other backslash 22P02, every other byte itself. It stored the raw
+                // bytes, backslashes included (wire review 13 item 15).
+                decode_bytea_escape(bytes).map(Value::from_blob).ok_or_else(|| {
+                    PgWireError::UserError(error(
+                        SqlErrorKind::InvalidTextRepresentation,
+                        "invalid input syntax for type bytea".to_string(),
+                    ))
+                })
             }
         }
         // TEXT, VARCHAR, UNKNOWN and all other types: the text as given (a parameter nothing
@@ -4050,14 +5375,17 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
 fn pg_array_to_value(text: &str, element: &Type) -> PgWireResult<Value> {
     let malformed = || {
         PgWireError::UserError(error(
-            "22P02",
+            SqlErrorKind::InvalidTextRepresentation,
             format!("malformed array literal: \"{text}\""),
         ))
     };
-    let s = text.trim_matches(|c: char| c.is_ascii_whitespace());
+    // PostgreSQL's array_in reads blanks as its scanner does (scanner_isspace, \v included; wire
+    // review 13 item 16: \v was not one).
+    let blank = |c: char| c.is_ascii() && pg_space(c as u8);
+    let s = text.trim_matches(blank);
     if s.starts_with('[') {
         return Err(PgWireError::UserError(error(
-            "0A000",
+            SqlErrorKind::FeatureNotSupported,
             "array parameters with dimension information are not supported".to_string(),
         )));
     }
@@ -4066,14 +5394,14 @@ fn pg_array_to_value(text: &str, element: &Type) -> PgWireResult<Value> {
         .and_then(|r| r.strip_suffix('}'))
         .ok_or_else(malformed)?;
     let mut values = Vec::new();
-    if !inner
-        .trim_matches(|c: char| c.is_ascii_whitespace())
-        .is_empty()
-    {
+    if !inner.trim_matches(blank).is_empty() {
         let mut chars = inner.chars().peekable();
         loop {
-            while chars.next_if(|c| c.is_ascii_whitespace()).is_some() {}
+            while chars.next_if(|c| blank(*c)).is_some() {}
             let mut item = String::new();
+            // An element with any backslash escape is never SQL NULL (`NUL\L` is the string
+            // NULL, as in array_in; it bound NULL: wire review 13 item 16).
+            let mut escaped = false;
             let quoted = chars.next_if_eq(&'"').is_some();
             if quoted {
                 loop {
@@ -4083,26 +5411,30 @@ fn pg_array_to_value(text: &str, element: &Type) -> PgWireResult<Value> {
                         c => item.push(c),
                     }
                 }
-                while chars.next_if(|c| c.is_ascii_whitespace()).is_some() {}
+                while chars.next_if(|c| blank(*c)).is_some() {}
             } else {
                 // Trailing whitespace is dropped, but not an escaped character's.
                 let mut kept = 0;
                 while let Some(c) = chars.next_if(|c| *c != ',') {
                     match c {
-                        '{' | '}' => {
+                        '{' => {
                             return Err(PgWireError::UserError(error(
-                                "0A000",
+                                SqlErrorKind::FeatureNotSupported,
                                 "multidimensional array parameters are not supported".to_string(),
                             )))
                         }
+                        // A `}` with no `{` open is malformed, as array_in answers (22P02; it was
+                        // the multidimensional refusal: wire review 13 item 16).
+                        '}' => return Err(malformed()),
                         '"' => return Err(malformed()),
                         '\\' => {
                             item.push(chars.next().ok_or_else(malformed)?);
                             kept = item.len();
+                            escaped = true;
                         }
                         c => {
                             item.push(c);
-                            if !c.is_ascii_whitespace() {
+                            if !blank(c) {
                                 kept = item.len();
                             }
                         }
@@ -4117,7 +5449,7 @@ fn pg_array_to_value(text: &str, element: &Type) -> PgWireResult<Value> {
             // with its element's input function's: it was always a generic 22P02, so an int4
             // element out of range or a bytea element's bad digit had the wrong code (wire review
             // 13 LOW 17).
-            values.push(if !quoted && item.eq_ignore_ascii_case("null") {
+            values.push(if !quoted && !escaped && item.eq_ignore_ascii_case("null") {
                 Value::Null
             } else {
                 pg_bytes_to_value(item.as_bytes(), element)?
@@ -4136,7 +5468,8 @@ fn pg_array_to_value(text: &str, element: &Type) -> PgWireResult<Value> {
 
 /// An integer as PostgreSQL's integer input functions read one (pg_strtoint64_safe, PostgreSQL 16
 /// and later): blanks around it, an optional sign, then decimal digits, or 0x / 0o / 0b and that
-/// base's digits, with one underscore allowed between two digits. `Some(None)` for a well-formed
+/// base's digits, with one underscore allowed between two digits, or between the prefix and the
+/// first digit. `Some(None)` for a well-formed
 /// integer past i64 (out of range), `None` for bad syntax.
 fn pg_integer(text: &str) -> Option<Option<i64>> {
     let s = text.trim_matches(|c: char| c.is_ascii() && pg_space(c as u8));
@@ -4151,7 +5484,9 @@ fn pg_integer(text: &str) -> Option<Option<i64>> {
         Some("0b") => (2, &s[2..]),
         _ => (10, s),
     };
-    if digits.is_empty() || digits.starts_with('_') || digits.ends_with('_') {
+    // An underscore may follow a base prefix ('0b_10_0101' is 37), never begin a decimal
+    // (wire review 16 item 23: it was refused in every base).
+    if digits.is_empty() || (radix == 10 && digits.starts_with('_')) || digits.ends_with('_') {
         return None;
     }
     let mut magnitude: u128 = 0;
@@ -4185,6 +5520,37 @@ fn pg_integer(text: &str) -> Option<Option<i64>> {
         magnitude as i64
     };
     Some(Some(value))
+}
+
+/// PostgreSQL's escape-format bytea text, as its byteain reads it (PostgreSQL 18.6 recorded,
+/// artie raw loud-20261015/pg18-diff/pg18-bytea.out): `\\` is a backslash, `\` and three octal
+/// digits whose first is 0-3 is that byte, any other backslash is invalid (None).
+fn decode_bytea_escape(bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'\\' {
+            out.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+        match bytes.get(i + 1..i + 4) {
+            _ if bytes.get(i + 1) == Some(&b'\\') => {
+                out.push(b'\\');
+                i += 2;
+            }
+            Some(&[a, b, c])
+                if (b'0'..=b'3').contains(&a)
+                    && (b'0'..=b'7').contains(&b)
+                    && (b'0'..=b'7').contains(&c) =>
+            {
+                out.push(((a - b'0') << 6) | ((b - b'0') << 3) | (c - b'0'));
+                i += 4;
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
 }
 
 /// Decode PostgreSQL's hex bytea text (what follows `\x`) as its byteain reads it: pairs of hex
@@ -4234,6 +5600,11 @@ fn encode_value(
                     .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
             }
         }
+        // A float4 column is written as float4 (float4out's digits and its exponent threshold,
+        // both protocols), a float8 as float8.
+        Value::Numeric(turso_core::Numeric::Float(f)) if *pg_type == Type::FLOAT4 => encoder
+            .encode_field(&(f64::from(*f) as f32))
+            .map_err(|e| turso_core::LimboError::InternalError(e.to_string())),
         Value::Numeric(turso_core::Numeric::Float(f)) => encoder
             .encode_field(&f64::from(*f))
             .map_err(|e| turso_core::LimboError::InternalError(e.to_string())),
@@ -4281,8 +5652,14 @@ fn sqlite_type_to_pg_type(type_str: &str) -> Type {
     match upper.as_str() {
         "INTEGER" | "INT" | "INT4" | "SMALLINT" | "INT2" | "SERIAL" | "SMALLSERIAL" => Type::INT4,
         "BIGINT" | "INT8" | "BIGSERIAL" => Type::INT8,
-        "REAL" | "FLOAT" | "FLOAT4" | "FLOAT8" | "DOUBLE" | "DOUBLE PRECISION" | "NUMERIC"
-        | "DECIMAL" => Type::FLOAT8,
+        // FLOAT4 is a real column's declaration. REAL stays float8: it is also the name the engine's
+        // get_column_type_info gives a computed expression of REAL affinity (`SELECT 2.5`,
+        // random()), which PostgreSQL types float8; an old REAL table column is typed float4 by
+        // the frontend's declared-type walk (catalog's sqlite_type_to_pg_oid) before this.
+        "FLOAT4" => Type::FLOAT4,
+        "REAL" | "FLOAT" | "FLOAT8" | "DOUBLE" | "DOUBLE PRECISION" | "NUMERIC" | "DECIMAL" => {
+            Type::FLOAT8
+        }
         "VARCHAR" | "CHARACTER VARYING" => Type::VARCHAR,
         "TEXT" | "CHAR" | "CHARACTER" | "NAME" => Type::TEXT,
         "BLOB" | "BYTEA" => Type::BYTEA,
@@ -4319,7 +5696,10 @@ fn is_pg_non_query(sql: &str) -> bool {
     let upper = sql.trim().to_uppercase();
     upper.starts_with("COPY")
         || upper.starts_with("CREATE SCHEMA")
-        || upper.starts_with("DROP SCHEMA")
+        // Every DROP: none returns rows, and one the frontend performs while preparing it (DROP
+        // SCHEMA, DROP TABLE | VIEW | INDEX of several objects or IF EXISTS) is answered from a
+        // no-op SELECT that must not complete as one (C53).
+        || upper.starts_with("DROP")
         || upper.starts_with("REFRESH MATERIALIZED VIEW")
         || upper.starts_with("COMMENT")
         || upper.starts_with("CHECKPOINT")
@@ -4328,8 +5708,47 @@ fn is_pg_non_query(sql: &str) -> bool {
         || upper.starts_with("RESET ")
 }
 
+/// The completion tag, before its row count, of an INSERT, UPDATE or DELETE that returns rows
+/// (RETURNING), read from the statement's first token as [`command_tag`] reads it: `INSERT 0`,
+/// `UPDATE`, `DELETE`; None for any other statement, whose rows keep the query tag (SELECT n).
+/// Blind spot, as command_tag's: a data-modifying statement behind WITH keeps SELECT n.
+/// The completion tag of a statement that returns rows, when it is not SELECT's: a DML statement's
+/// RETURNING completes with its verb's, and SHOW with `SHOW` (the frontend answers SHOW with a
+/// one-row SELECT, which completed as `SELECT 1`: C53, recorded pg18-c53-dropnotice.out).
+fn query_tag(query: &str) -> Option<&'static str> {
+    let start = skip_blank(query.as_bytes(), 0)?;
+    let word: String = query[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_alphabetic())
+        .collect();
+    match word.to_ascii_uppercase().as_str() {
+        "INSERT" => Some("INSERT 0"),
+        "UPDATE" => Some("UPDATE"),
+        "DELETE" => Some("DELETE"),
+        "SHOW" => Some(SHOW_TAG),
+        _ => None,
+    }
+}
+
+/// SHOW's completion tag, which PostgreSQL sends with no row count.
+const SHOW_TAG: &str = "SHOW";
+
+/// A query's CommandComplete after `rows` rows: the tag with the count, except SHOW's, which has
+/// none in PostgreSQL.
+fn query_complete(tag: &str, rows: usize) -> Tag {
+    if tag == SHOW_TAG {
+        Tag::new(tag)
+    } else {
+        Tag::new(tag).with_rows(rows)
+    }
+}
+
 fn command_tag(query: &str, affected_rows: usize) -> Tag {
-    let upper = query.trim().to_uppercase();
+    // From the statement's first token, as PostgreSQL's lexer reads it: whitespace, comments and
+    // empty statements before it are skipped (skip_blank, the verb reader's helper), so `;COMMIT`
+    // in an open block is tagged COMMIT, not OK (wire review 17 item 7's pin found it).
+    let start = skip_blank(query.as_bytes(), 0).unwrap_or(query.len());
+    let upper = query[start..].trim().to_uppercase();
     if upper.starts_with("INSERT") {
         Tag::new("INSERT").with_oid(0).with_rows(affected_rows)
     } else if upper.starts_with("UPDATE") {
@@ -4464,8 +5883,36 @@ fn is_create_table_as(upper: &str) -> bool {
 mod crash_batch_tests;
 
 #[cfg(test)]
+mod sqlstate_tests;
+
+/// This crate's tests count allocations per thread (the per-statement allocation budget's
+/// in-process tests).
+#[cfg(test)]
+#[global_allocator]
+static TEST_ALLOC: counters::CountingAlloc = counters::CountingAlloc;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn setting_scope_local_lock_timeout_restores_the_effective_value() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = session(&dir);
+        ok(&s, "BEGIN; SET LOCAL lock_timeout = '100ms'; COMMIT");
+        let conn = s.current(&mut s.state()).unwrap();
+        assert_eq!(conn.lock_timeout_ms(), 0);
+    }
+
+    #[test]
+    fn setting_scope_rollback_restores_the_effective_lock_timeout() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = session(&dir);
+        ok(&s, "BEGIN; SET lock_timeout = '100ms'; ROLLBACK");
+        let conn = s.current(&mut s.state()).unwrap();
+        assert_eq!(conn.lock_timeout_ms(), 0);
+    }
+
 
     /// A session on a fresh database of its own (catalog branch store, D0: no flush slows the test).
     fn session(dir: &tempfile::TempDir) -> Session {
@@ -4481,6 +5928,286 @@ mod tests {
             1,
             std::time::Duration::from_millis(DEFAULT_LOCK_WAIT_MS),
         )))
+    }
+
+    /// The fast path's inline replies are, byte for byte, the messages pgwire encodes for the same
+    /// reply through one_row (RowDescription, DataRow, CommandComplete `SELECT 1`), for a text and
+    /// an int8 column, an empty and a long value (L5, vendored change 8).
+    #[test]
+    fn inline_replies_are_the_messages_pgwire_encodes() {
+        use futures::StreamExt;
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let encoded = |r: Response| -> Vec<u8> {
+            let Response::Query(mut results) = r else {
+                panic!("not a query response")
+            };
+            let mut buf = bytes::BytesMut::new();
+            let fields = results.row_schema().iter().map(Into::into).collect();
+            PgWireBackendMessage::RowDescription(RowDescription::new(fields))
+                .encode(&mut buf)
+                .unwrap();
+            let tag = results.command_tag().to_owned();
+            let mut rows = 0;
+            rt.block_on(async {
+                let data = results.data_rows();
+                while let Some(row) = data.next().await {
+                    PgWireBackendMessage::DataRow(row.unwrap())
+                        .encode(&mut buf)
+                        .unwrap();
+                    rows += 1;
+                }
+            });
+            PgWireBackendMessage::CommandComplete(Tag::new(&tag).with_rows(rows).into())
+                .encode(&mut buf)
+                .unwrap();
+            buf.to_vec()
+        };
+        let long = "x".repeat(150);
+        for (f, value) in [
+            ("turso_branch_current", "main"),
+            ("turso_branch_switch", ""),
+            ("turso_branch_delete", long.as_str()),
+        ] {
+            let inline = inline_one_row(f, &Type::TEXT, value.as_bytes()).expect("fits");
+            let slow = encoded(one_text(f, value, &Format::UnifiedText).unwrap());
+            assert_eq!(inline.bytes(), &slow[..], "{f} {value:?}");
+        }
+        for v in [0i64, 7, 1234567890123, -5] {
+            let mut digits = [0u8; 20];
+            let inline =
+                inline_one_row("turso_branch_create", &Type::INT8, int_text(v, &mut digits)).unwrap();
+            let slow = encoded(one_int8("turso_branch_create", v, &Format::UnifiedText).unwrap());
+            assert_eq!(inline.bytes(), &slow[..], "create {v}");
+        }
+        assert!(inline_one_row("f", &Type::TEXT, &[b'x'; 300]).is_none(), "too long fits");
+    }
+
+    /// The inline CommandComplete of an INSERT, UPDATE or DELETE is, byte for byte, the message
+    /// pgwire encodes for command_tag's Tag of the same statement and count (vendored change 8),
+    /// in any case and after blanks and comments; any other verb has none.
+    #[test]
+    fn inline_dml_completes_are_the_messages_pgwire_encodes() {
+        for (sql, rows) in [
+            ("UPDATE t SET v = 1", 1usize),
+            ("  update t set v = 1", 0),
+            ("/* c */ DELETE FROM t", 12345),
+            ("insert into t values (1)", 1),
+            ("INSERT INTO t SELECT 1", 7),
+        ] {
+            let inline = inline_dml_complete(sql, rows).expect("a DML verb");
+            let mut buf = bytes::BytesMut::new();
+            PgWireBackendMessage::CommandComplete(command_tag(sql, rows).into())
+                .encode(&mut buf)
+                .unwrap();
+            assert_eq!(inline.bytes(), &buf[..], "{sql} {rows}");
+        }
+        for sql in ["SELECT 1", "CREATE TABLE x (a int)", "WITH x AS (SELECT 1) UPDATE t SET v = 1"] {
+            assert!(inline_dml_complete(sql, 1).is_none(), "{sql}");
+        }
+    }
+
+    /// L5's allocation budget in process (lead 2026-10-15; budget.py work's pre-registered rule,
+    /// DECISIONS 2f239db68a, at one statement): a branch call allocates, beyond what the engine's
+    /// own call allocates (create_branch, connect_named, drop_branch; none for current and for a
+    /// switch back to the kept trunk), no more than the empty query does. Counted per thread
+    /// (counters::thread_allocations) around Session::on_query with a client that stores the reply
+    /// messages in reserved room, as the socket's codec encodes them into its reused buffer. At
+    /// 154e357e6 the wire paid 15 to 36 allocations a call over the engine.
+    #[test]
+    fn a_branch_call_allocates_no_more_than_an_empty_query_beyond_the_engine() {
+        let n = counters::thread_allocations;
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = session(&dir);
+        ok(&s, "CREATE TABLE t(id INT PRIMARY KEY, v INT)");
+        ok(&s, "SELECT turso_branch_create('b')");
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let mut c = MemClient::new();
+        c.replies.reserve(64);
+        let mut wire = |sql: &str| {
+            let q = pgwire::messages::simplequery::Query::new(sql.to_string());
+            c.replies.clear();
+            c.info.state = PgWireConnectionState::ReadyForQuery;
+            let a0 = n();
+            rt.block_on(s.on_query(&mut c, q)).unwrap();
+            let used = n() - a0;
+            assert!(
+                !c.replies.iter().any(|m| matches!(m, PgWireBackendMessage::ErrorResponse(_))),
+                "{sql}: {:?}",
+                c.replies
+            );
+            used
+        };
+        // Warm: every statement once, so a first use's one-time setup is not counted.
+        for sql in [
+            ";",
+            "SELECT turso_branch_current()",
+            "SELECT turso_branch_switch('b')",
+            "SELECT turso_branch_switch('main')",
+            "SELECT turso_branch_create('w')",
+            "SELECT turso_branch_delete('w')",
+        ] {
+            wire(sql);
+        }
+        let empty = wire(";");
+        let measure_engine = |f: &dyn Fn()| {
+            let a0 = n();
+            f();
+            n() - a0
+        };
+        let mut over = Vec::new();
+        let mut check = |what: &str, wire_cost: u64, engine_cost: u64| {
+            let excess = wire_cost.saturating_sub(engine_cost);
+            if excess > empty {
+                over.push(format!(
+                    "{what}: wire {wire_cost}, engine {engine_cost}, excess {excess} > the empty query's {empty}"
+                ));
+            }
+        };
+        check("current", wire("SELECT turso_branch_current()"), 0);
+        // The engine's connect first: the session on b would hold it (BranchInUse).
+        let engine_switch = measure_engine(&|| drop(s.shared.db.connect_named("b").unwrap()));
+        check("switch b", wire("SELECT turso_branch_switch('b')"), engine_switch);
+        check("switch main", wire("SELECT turso_branch_switch('main')"), 0);
+        // On the session's own connection, as the wire's create runs (a fresh connection's create
+        // allocated one fewer: the engine's cost is the connection's, and is not the wire's).
+        let own = s.current(&mut s.state()).unwrap();
+        let engine_create = measure_engine(&|| {
+            own.inner().create_branch("e1").unwrap();
+        });
+        let engine_delete = measure_engine(&|| {
+            s.shared.db.drop_branch("e1").unwrap();
+        });
+        check("create", wire("SELECT turso_branch_create('c')"), engine_create);
+        check("delete", wire("SELECT turso_branch_delete('c')"), engine_delete);
+        assert!(over.is_empty(), "over the budget: {over:#?}");
+    }
+
+    /// A session's registered socket dup is given back however the session ends, a panic in an
+    /// unwinding build included (Claude C37 M3: the deregistration ran only on a normal return).
+    #[test]
+    fn a_panicking_session_gives_its_registered_socket_back() {
+        let sockets = SessionSockets::default();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let _client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (socket, _) = listener.accept().unwrap();
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _registered = Registered::new(&sockets, socket);
+            assert_eq!(sockets.open.lock().unwrap().len(), 1, "premise: registered");
+            panic!("the session panics");
+        }));
+        assert!(unwound.is_err(), "premise: the session panicked");
+        assert_eq!(sockets.open.lock().unwrap().len(), 0, "the dup leaked");
+    }
+
+    /// The startup deadline bounds a session's WRITES as well as its reads (C37 H1): a client that
+    /// never reads, so that the server's replies fill its window, cannot hold the session thread
+    /// in a blocking write past the deadline. Here 64 MiB go to a peer that never reads, through
+    /// BlockingTcp with a 300 ms deadline: the write must fail as timed out within 5 s (it blocked
+    /// for good).
+    #[test]
+    fn a_startup_write_to_a_client_that_never_reads_ends_at_the_deadline() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server_side, _) = listener.accept().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut io = pgwire::tokio::server::BlockingTcp {
+                socket: server_side,
+                deadline: Some(std::time::Instant::now() + std::time::Duration::from_millis(300)),
+                timed_out: false,
+            };
+            let big = vec![b'N'; 64 << 20];
+            let r = futures::executor::block_on(tokio::io::AsyncWriteExt::write_all(&mut io, &big));
+            let _ = tx.send((r.map_err(|e| e.kind()), io.timed_out));
+        });
+        let got = rx.recv_timeout(std::time::Duration::from_secs(5));
+        drop(client);
+        match got {
+            Ok((Err(kind), timed_out)) => {
+                assert_eq!(kind, std::io::ErrorKind::TimedOut, "the write's error");
+                assert!(timed_out, "timed_out is set");
+            }
+            Ok((Ok(()), _)) => panic!("64 MiB were written to a peer that never reads"),
+            Err(_) => panic!("the write to a peer that never reads still blocks 5 s after a 300 ms deadline"),
+        }
+    }
+
+    /// L5's allocation budget for a write over the simple protocol (the cycle's write step,
+    /// budget.py work): an UPDATE allocates, beyond the engine's own prepare and run of the same
+    /// statement on the session's connection, no more than the empty query does. At 4f28b42c6 it
+    /// paid 5: the statement split's Vec and String, the command tag's upper-cased copy of the
+    /// query, its Tag String and the CommandComplete's.
+    #[test]
+    fn a_write_allocates_no_more_than_an_empty_query_beyond_the_engine() {
+        let n = counters::thread_allocations;
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = session(&dir);
+        ok(&s, "CREATE TABLE t(id INT PRIMARY KEY, v INT)");
+        ok(&s, "INSERT INTO t VALUES (1, 0)");
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let mut c = MemClient::new();
+        c.replies.reserve(64);
+        let wire = |c: &mut MemClient, sql: &str| {
+            let q = pgwire::messages::simplequery::Query::new(sql.to_string());
+            c.replies.clear();
+            c.info.state = PgWireConnectionState::ReadyForQuery;
+            let a0 = n();
+            rt.block_on(s.on_query(c, q)).unwrap();
+            n() - a0
+        };
+        // Every wire write must have happened, checked outside the counted window (Codex C35 MED 1:
+        // with the UPDATE answered as an empty query, the budget passed): its reply carries exactly
+        // the CommandComplete "UPDATE 1" and no ErrorResponse, and the committed row holds its new
+        // value, read by a connection of its own.
+        let written = |c: &MemClient, want: i64| {
+            let mut tags = Vec::new();
+            for m in &c.replies {
+                match m {
+                    PgWireBackendMessage::ErrorResponse(e) => panic!("the write failed: {e:?}"),
+                    PgWireBackendMessage::CommandComplete(cc) => tags.push(cc.tag.clone()),
+                    PgWireBackendMessage::Inline(m) if m.bytes().first() == Some(&b'C') => {
+                        let b = m.bytes();
+                        tags.push(String::from_utf8_lossy(&b[5..b.len() - 1]).into_owned());
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(tags, ["UPDATE 1"], "the write's CommandComplete: {:?}", c.replies);
+            let rows = s
+                .shared
+                .db
+                .connect()
+                .unwrap()
+                .prepare("SELECT v FROM t WHERE id = 1")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap();
+            assert_eq!(rows, vec![vec![Value::from_i64(want)]], "the row after the write");
+        };
+        let sql = "UPDATE t SET v = v + 1 WHERE id = 1";
+        let mut want = 0;
+        for _ in 0..3 {
+            wire(&mut c, ";");
+            wire(&mut c, sql);
+            want += 1;
+            written(&c, want);
+        }
+        let empty = wire(&mut c, ";");
+        let own = s.current(&mut s.state()).unwrap();
+        let a0 = n();
+        let mut stmt = own.prepare(sql).unwrap();
+        stmt.run_ignore_rows().unwrap();
+        drop(stmt);
+        let engine = n() - a0;
+        want += 1;
+        let write = wire(&mut c, sql);
+        want += 1;
+        written(&c, want);
+        assert!(
+            write.saturating_sub(engine) <= empty,
+            "the write: wire {write}, engine {engine}, excess {} > the empty query's {empty}",
+            write.saturating_sub(engine)
+        );
     }
 
     fn ok(session: &Session, sql: &str) {
@@ -4559,7 +6286,9 @@ mod tests {
     /// the name names: a branch released behind the session (by any path that does not pass this
     /// server's in-use map) and re-created under its name is another branch, and the switch lands
     /// on it. At 472023b72 the switch compared names and stayed on the released branch (wire
-    /// review 1 item 6).
+    /// review 1 item 6). The engine now refuses to drop a branch a connection is open on
+    /// (BranchInUse, op Drop), so this asserts that refusal and that the switch stays on the
+    /// session's branch.
     #[test]
     fn a_switch_to_a_recreated_name_lands_on_the_new_branch() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -4575,21 +6304,206 @@ mod tests {
         };
         let old = on(&s);
         assert!(old.is_some(), "premise: the session is on branch h");
-        s.shared
-            .db
-            .drop_branch("h")
-            .expect("premise: the engine releases a branch a connection is open on");
-        let fresh = s.shared.db.connect().unwrap().create_branch("h").unwrap();
-        assert_ne!(
-            Some(fresh),
-            old,
-            "premise: the re-created h is another branch"
+        // The engine now makes the hazard unrepresentable: a branch a connection is open on cannot
+        // be dropped, so it cannot be re-created behind the session (ruled c9c821dd8d, P3).
+        let refused = s.shared.db.drop_branch("h");
+        assert!(
+            matches!(
+                refused,
+                Err(LimboError::BranchInUse {
+                    op: turso_core::BranchOp::Drop,
+                    ..
+                })
+            ),
+            "the engine dropped a branch a connection is open on: {refused:?}"
         );
         ok(&s, "SELECT turso_branch_switch('h')");
+        assert_eq!(on(&s), old, "the switch left the session's branch");
+    }
+
+    /// Wire review 16 item 22, a pin (no red: NoopStartupHandler never authenticates, so no client
+    /// reaches the state; serve_session's concrete handler types admit no password-requiring stub):
+    /// before startup completes, a malformed message of any kind and every extended-protocol
+    /// message is FATAL 08P01, never the extended skip whose Sync set ReadyForQuery; a simple Query
+    /// is left to the startup handler, and once ready nothing is refused here. LOUD-OWED mutants:
+    /// deleting the guard's call, or its `is_extended_query` arm, must let a session pass.
+    #[test]
+    fn nothing_but_startup_is_read_before_startup_completes() {
+        use PgWireConnectionState as St;
+        let malformed = |kind: u8| PgWireFrontendMessage::Malformed(kind, "08P01", "short".into());
+        let parse = || PgWireFrontendMessage::Parse(Parse::new(None, "SELECT 1".into(), vec![]));
+        let query = || {
+            PgWireFrontendMessage::Query(pgwire::messages::simplequery::Query::new(
+                "SELECT 1".to_string(),
+            ))
+        };
+        for state in [St::AwaitingStartup, St::AuthenticationInProgress] {
+            for msg in [
+                malformed(b'P'),
+                malformed(b'B'),
+                malformed(b'H'),
+                malformed(b'S'),
+                malformed(b'Q'),
+                parse(),
+                PgWireFrontendMessage::Sync(PgSync::new()),
+            ] {
+                let info = refused_before_startup(&state, &msg)
+                    .unwrap_or_else(|| panic!("{state:?}: {msg:?} was not refused"));
+                assert_eq!(
+                    (info.severity.as_str(), info.code.as_str()),
+                    ("FATAL", "08P01"),
+                    "{state:?}: {msg:?}"
+                );
+            }
+            assert!(
+                refused_before_startup(&state, &query()).is_none(),
+                "{state:?}: a simple Query is the startup handler's"
+            );
+        }
+        for msg in [malformed(b'P'), parse(), query()] {
+            assert!(
+                refused_before_startup(&St::ReadyForQuery, &msg).is_none(),
+                "ready: {msg:?}"
+            );
+        }
+    }
+
+    /// The 3B001 arm of a failed block (Session::run): a block failed by an error that made the
+    /// engine roll the WHOLE transaction back, savepoints with it, so the engine holds no
+    /// transaction while the session's block is still failed. ROLLBACK TO a savepoint of that
+    /// block is 3B001 (it does not exist, as PostgreSQL says of one that does not), the block stays
+    /// failed (25P02), and ROLLBACK ends it. No statement known today brings the engine there (the
+    /// sum() overflow that did no longer rolls the transaction back: wire 3b9d4900e, ruled
+    /// c9c821dd8d P7), so the state is built directly: the engine's transaction is rolled back
+    /// behind the session, and the block marked failed. A pin of the arm, which no other test
+    /// reached (the lead's ruling on P7's finding); its mutant, the arm deleted, sends the ROLLBACK
+    /// TO to the engine, XX000.
+    #[test]
+    fn a_rollback_to_in_a_block_the_engine_ended_is_3b001() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = session(&dir);
+        ok(&s, "CREATE TABLE t(id INT)");
+        ok(&s, "BEGIN");
+        ok(&s, "INSERT INTO t VALUES (1)");
+        ok(&s, "SAVEPOINT s");
+        {
+            let mut st = s.state();
+            let conn = s.current(&mut st).unwrap();
+            conn.engine_tx(TxStmt::Rollback)
+                .expect("premise: the engine rolls its transaction back");
+            assert!(
+                conn.inner().get_auto_commit(),
+                "premise: the engine holds no transaction"
+            );
+            st.aborted = true;
+        }
         assert_eq!(
-            on(&s),
-            Some(fresh),
-            "the switch stayed on the released branch"
+            errors(&s, "ROLLBACK TO s"),
+            vec![("3B001".to_string(), "ERROR".to_string())]
+        );
+        assert_eq!(
+            errors(&s, "SELECT 1"),
+            vec![("25P02".to_string(), "ERROR".to_string())],
+            "the block stays failed"
+        );
+        assert!(errors(&s, "ROLLBACK").is_empty(), "ROLLBACK ends the block");
+        assert!(
+            matches!(s.transaction_status(), TransactionStatus::Idle),
+            "the session is idle after the ROLLBACK"
+        );
+    }
+
+    /// The errors `sql` answers, as (code, severity).
+    fn errors(session: &Session, sql: &str) -> Vec<(String, String)> {
+        session
+            .simple(sql)
+            .into_iter()
+            .filter_map(|r| match r {
+                Response::Error(e) => Some((e.code.clone(), e.severity.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Whether table `name` is committed, read by a connection of its own.
+    fn committed_table(s: &Session, name: &str) -> bool {
+        let conn = s.shared.db.connect().unwrap();
+        let rows = conn
+            .prepare(format!(
+                "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = '{name}'"
+            ))
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        rows != vec![vec![Value::from_i64(0)]]
+    }
+
+    const FATAL: (&str, &str) = ("08006", "FATAL");
+
+    /// Wire review 16 item 14: an undo that fails is never swallowed. A CREATE TABLE whose key onto
+    /// itself does not resolve (42830 after the CREATE) is undone in the transaction it ran in;
+    /// when that undo fails (the failpoint), the engine still holds the table in an open
+    /// transaction, so the connection is broken: FATAL 08006, and the session ends rather than
+    /// serve the next statement, which joined that transaction (`let _ = rollback`: the client's
+    /// next COMMIT committed the refused table). In autocommit (the statement's own BEGIN), and in a
+    /// client's block (its savepoint).
+    #[test]
+    fn a_failed_undo_of_a_refused_create_breaks_the_connection() {
+        let refused = "CREATE TABLE c(id INT, x INT REFERENCES c(id))";
+        for in_block in [false, true] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let s = session(&dir);
+            ok(&s, "CREATE TABLE z(id INT)");
+            assert_eq!(
+                errors(&s, refused),
+                vec![("42830".to_string(), "ERROR".to_string())],
+                "premise: the key onto c(id), which is not unique, is refused after the CREATE"
+            );
+            assert!(!committed_table(&s, "c"), "premise: the refused c was undone");
+            if in_block {
+                ok(&s, "BEGIN");
+            }
+            turso_pg::fail_next_undo();
+            let got = errors(&s, refused);
+            let fatal = vec![(FATAL.0.to_string(), FATAL.1.to_string())];
+            assert_eq!(got, fatal, "in_block={in_block}: the failed undo was swallowed");
+            assert_eq!(
+                errors(&s, "COMMIT"),
+                fatal,
+                "in_block={in_block}: the session served a statement after its undo failed"
+            );
+            assert!(
+                !committed_table(&s, "c"),
+                "in_block={in_block}: the refused table was committed"
+            );
+        }
+    }
+
+    /// Wire review 16 item 14, the implicit block's half: a multi-statement query whose second
+    /// statement fails is rolled back whole; when that rollback fails (the failpoint), the engine
+    /// still holds the block's transaction, so the connection is broken and the next statement is
+    /// FATAL 08006, never run inside it (`let _ = engine_tx(Rollback)`: the next COMMIT committed
+    /// the block's first statement).
+    #[test]
+    fn a_failed_rollback_of_an_implicit_block_breaks_the_connection() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = session(&dir);
+        ok(&s, "CREATE TABLE p(id INT PRIMARY KEY)");
+        ok(&s, "INSERT INTO p VALUES (1)");
+        turso_pg::fail_next_undo();
+        let got = errors(&s, "CREATE TABLE kept(id INT); INSERT INTO p VALUES (1)");
+        assert!(
+            got.iter().any(|(code, _)| code == "23505"),
+            "premise: the second statement fails: {got:?}"
+        );
+        assert_eq!(
+            errors(&s, "COMMIT"),
+            vec![(FATAL.0.to_string(), FATAL.1.to_string())],
+            "the session served a statement after its block's rollback failed"
+        );
+        assert!(
+            !committed_table(&s, "kept"),
+            "the failed block's first statement was committed"
         );
     }
 
@@ -4620,6 +6534,44 @@ mod tests {
             1,
             "libpg_query calls for Describe then Execute"
         );
+    }
+
+    /// bind_portal_parameters refuses parameter types and values that differ in number, where it
+    /// zipped them short: a value bound under another's type, or a parameter left unbound, which
+    /// the engine reads as NULL. check_bind_arity makes them equal before it is called, so this
+    /// guards an invariant, refused XX000 (wire review 18 item 23). Equal counts bind (the
+    /// control).
+    #[test]
+    fn binding_refuses_types_and_values_that_differ_in_number() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = session(&dir);
+        ok(&s, "CREATE TABLE t(id INT PRIMARY KEY, v INT)");
+        let sql = "SELECT v FROM t WHERE id = $1 OR v = $2";
+        let stored = Arc::new(StoredStatement::new(
+            String::new(),
+            Parsed::new(sql.to_string()),
+            vec![],
+        ));
+        let bind = Bind::new(
+            None,
+            None,
+            vec![],
+            vec![Some(b"1".to_vec().into()), Some(b"2".to_vec().into())],
+            vec![],
+        );
+        let portal = Portal::try_new(&bind, stored).unwrap();
+        let conn = s.current(&mut s.state()).unwrap();
+        let (mut stmt, _) = conn.prepare_typed(sql).unwrap();
+        assert!(
+            bind_portal_parameters(&mut stmt, &portal, &[Type::INT4, Type::INT4]).is_ok(),
+            "the control: two types for two values"
+        );
+        for types in [vec![Type::INT4], vec![Type::INT4, Type::INT4, Type::INT4]] {
+            match bind_portal_parameters(&mut stmt, &portal, &types) {
+                Err(PgWireError::UserError(e)) => assert_eq!(e.code, "XX000", "{types:?}"),
+                other => panic!("{} types for 2 values: {other:?}", types.len()),
+            }
+        }
     }
 
     type Stmt = <Session as ExtendedQueryHandler>::Statement;
@@ -4736,7 +6688,10 @@ mod tests {
 
     /// One execution of the unnamed statement through the session's own handlers: Bind (with
     /// `param`, if any), Describe of the statement and of the portal when asked, Execute and Sync.
-    /// Returns the libpg_query calls it made; an ErrorResponse fails the test.
+    /// Returns the libpg_query calls it made; an ErrorResponse fails the test, and so does a round
+    /// that did not run: it must answer BindComplete, a ParameterDescription and a RowDescription
+    /// when described, one DataRow and `CommandComplete SELECT 1`, so an Execute that returned
+    /// early cannot pass as zero calls (wire review 16 item 25).
     async fn execute_unnamed(
         s: &Session,
         c: &mut MemClient,
@@ -4761,10 +6716,24 @@ mod tests {
         s.on_execute(c, Execute::new(None, 0)).await.unwrap();
         s.on_sync(c, PgSync::new()).await.unwrap();
         let calls = turso_pg_parser::libpg_query_calls() - before;
+        let (mut bound, mut params, mut rows_described, mut rows, mut tags) = (0, 0, 0, 0, vec![]);
         for reply in c.replies.drain(..) {
-            if let PgWireBackendMessage::ErrorResponse(e) = reply {
-                panic!("an error in the round: {e:?}");
+            match reply {
+                PgWireBackendMessage::ErrorResponse(e) => panic!("an error in the round: {e:?}"),
+                PgWireBackendMessage::BindComplete(_) => bound += 1,
+                PgWireBackendMessage::ParameterDescription(_) => params += 1,
+                PgWireBackendMessage::RowDescription(_) => rows_described += 1,
+                PgWireBackendMessage::DataRow(_) => rows += 1,
+                PgWireBackendMessage::CommandComplete(done) => tags.push(done.tag),
+                _ => {}
             }
+        }
+        assert_eq!(bound, 1, "the round's BindComplete");
+        assert_eq!(rows, 1, "the round's one row");
+        assert_eq!(tags, vec!["SELECT 1".to_string()], "the round's CommandComplete");
+        if describe {
+            assert_eq!(params, 1, "the statement Describe's ParameterDescription");
+            assert_eq!(rows_described, 2, "a RowDescription per Describe");
         }
         calls
     }
@@ -4783,6 +6752,9 @@ mod tests {
     fn an_extended_statement_is_classified_once_at_parse() {
         let dir = tempfile::TempDir::new().unwrap();
         let s = session(&dir);
+        // The engine refuses to branch an empty database (no committed page 1): a table first
+        // (ruled c9c821dd8d, P2).
+        ok(&s, "CREATE TABLE t(id INT)");
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
@@ -4811,11 +6783,106 @@ mod tests {
                     let describe = per_execution == 0;
                     let calls =
                         execute_unnamed(&s, &mut c, param.then_some(name.as_str()), describe).await;
+                    // FLAGGED TEST EDIT (C53): a statement PostgreSQL analyses is prepared at
+                    // Parse now, from the Parse's one parse, and the round that follows the Parse
+                    // runs that prepare: no call in execution 0, one (the engine's prepare) in
+                    // each later one.
+                    let want = if round == 0 && at_parse > 0 { 0 } else { per_execution };
                     assert_eq!(
-                        calls, per_execution,
+                        calls, want,
                         "{sql:?}: libpg_query calls in execution {round}"
                     );
+                    // A create that answered without creating cannot pass as zero calls.
+                    if param {
+                        assert!(
+                            s.shared.db.branch_named(&name).unwrap().is_some(),
+                            "{sql:?}: execution {round} created no branch {name}"
+                        );
+                    }
                 }
+            }
+        });
+    }
+
+    /// C44-M3: every SQLSTATE this server sends comes from the one table (kind_code): its own
+    /// refusals name a SqlErrorKind, never a code literal. Read from this file's source outside
+    /// the table and the tests (a test's expected code is a literal by design); a code is five
+    /// characters of digits and capitals with at least one digit.
+    #[test]
+    fn every_sqlstate_the_server_sends_comes_from_the_table() {
+        let source = include_str!("lib.rs");
+        let code_end = source.find("\n#[cfg(test)]\nmod tests").expect("the tests module");
+        let product = &source[..code_end];
+        let table_start = product.find("fn kind_code(kind: SqlErrorKind)").expect("the table");
+        let table_end = table_start + product[table_start..].find("\n}\n").expect("its end");
+        let outside = format!("{}{}", &product[..table_start], &product[table_end..]);
+        // Every `"` followed by five characters and a `"`: a quoted token, found wherever it sits,
+        // so no quote parity elsewhere (an escaped quote in a message) can hide one.
+        let b = outside.as_bytes();
+        let literals: Vec<&str> = (0..b.len().saturating_sub(6))
+            .filter(|&i| b[i] == b'"' && b[i + 6] == b'"')
+            .map(|i| &outside[i + 1..i + 6])
+            .filter(|s| {
+                s.bytes().all(|c| c.is_ascii_digit() || c.is_ascii_uppercase())
+                    && s.bytes().any(|c| c.is_ascii_digit())
+            })
+            .collect();
+        assert!(literals.is_empty(), "SQLSTATE literals outside the table: {literals:?}");
+    }
+
+    /// C44-M1: a branch the engine refuses as in use is 55006 by the engine's typed error
+    /// (LimboError::BranchInUse), whatever its text; another error on an existing branch is not
+    /// 55006, and a missing branch is 3D000. The wire tests reach the session's own in-use map
+    /// first, never this arm (planted: the arm turned off, all four 55006 wire tests still pass).
+    #[test]
+    fn a_branch_the_engine_refuses_as_in_use_is_55006_by_its_type() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = session(&dir);
+        ok(&s, "CREATE TABLE t(id INT)");
+        s.open_trunk().unwrap().inner().create_branch("held").unwrap();
+        let in_use = LimboError::BranchInUse {
+            name: Some("held".to_string()),
+            id: 1,
+            op: turso_core::BranchOp::Drop,
+        };
+        assert_eq!(s.missing_or("held", &in_use, "ERROR").code, "55006");
+        let other = LimboError::InternalError("already has an open connection".to_string());
+        assert_ne!(
+            s.missing_or("held", &other, "ERROR").code,
+            "55006",
+            "a text match, not the type"
+        );
+        assert_eq!(s.missing_or("nosuch", &in_use, "ERROR").code, "3D000");
+    }
+
+    /// C40 review LOW 6 (C49): a Parse makes at most ONE libpg_query call, whatever its text:
+    /// text that mentions the branch-function prefix and holds a `$` without being a call made
+    /// two (the branch-call parse and the parameter scan), and a statement PostgreSQL analyses at
+    /// Parse is prepared there from the same parse (C53). The fast call form makes none.
+    #[test]
+    fn a_parse_makes_at_most_one_libpg_query_call() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = session(&dir);
+        ok(&s, "CREATE TABLE t(id INT)");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut c = MemClient::new();
+            for (sql, at_most) in [
+                ("SELECT 'turso_branch_' || $1", 1),
+                ("SELECT 'turso_branch_' AS s, $1::int", 1),
+                ("SELECT id FROM t WHERE id = $1 /* turso_branch_ */", 1),
+                ("SELECT turso_branch_current() /* c */", 1),
+                ("SELECT turso_branch_create($1)", 0),
+            ] {
+                let before = turso_pg_parser::libpg_query_calls();
+                s.on_parse(&mut c, Parse::new(None, sql.to_string(), vec![]))
+                    .await
+                    .unwrap();
+                let calls = turso_pg_parser::libpg_query_calls() - before;
+                assert!(calls <= at_most, "{sql:?}: {calls} libpg_query calls at Parse");
+                s.on_sync(&mut c, PgSync::new()).await.unwrap();
             }
         });
     }
@@ -4824,7 +6891,12 @@ mod tests {
     /// walk, however often the statements over it are prepared and however often it is reached:
     /// v5 joins v4 twice, v4 joins v3 twice, and so on, so the walk opened 2^5 - 1 views (31
     /// parses beside the statement's own) at every prepare. The first Describe of a statement over
-    /// v5 may parse each view once (6 calls with the statement's), the second only the statement.
+    /// v5 may parse each view once (6 calls with the statement's), the second, after a Sync, only
+    /// the statement. Without the Sync the second Describe reused the statement the first one kept
+    /// and prepared nothing (measured [6, 0]), so it showed nothing about the memo. The memo is
+    /// the snapshot's: after DDL replaces the snapshot (v5 dropped and created again) and after a
+    /// SET search_path, a Describe parses the views again, as the first one did (wire review 18
+    /// HIGH 1; the lead's ruling 2026-10-15T02:59:32Z).
     #[test]
     fn a_view_is_parsed_once_per_schema_snapshot() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -4856,6 +6928,9 @@ mod tests {
                     .await
                     .unwrap();
                 calls.push(turso_pg_parser::libpg_query_calls() - before);
+                // The round ends, so the next Describe prepares the statement again rather than
+                // reuse the one this Describe kept.
+                s.on_sync(&mut c, PgSync::new()).await.unwrap();
                 for reply in c.replies.drain(..) {
                     if let PgWireBackendMessage::ErrorResponse(e) = reply {
                         panic!("Describe: {e:?}");
@@ -4868,6 +6943,31 @@ mod tests {
                 calls[0]
             );
             assert_eq!(calls[1], 1, "second Describe: the statement's parse only");
+            // Invalidation: a new snapshot, then a new search path, each parse the views again.
+            for change in [
+                "DROP VIEW v5; CREATE VIEW v5 AS SELECT a.id, a.n FROM v4 AS a JOIN v4 AS b ON a.id = b.id",
+                "SET search_path TO public",
+            ] {
+                ok(&s, change);
+                s.on_parse(&mut c, Parse::new(None, sql.to_string(), vec![]))
+                    .await
+                    .unwrap();
+                let before = turso_pg_parser::libpg_query_calls();
+                s.on_describe(&mut c, Describe::new(TARGET_TYPE_BYTE_STATEMENT, None))
+                    .await
+                    .unwrap();
+                let after_change = turso_pg_parser::libpg_query_calls() - before;
+                s.on_sync(&mut c, PgSync::new()).await.unwrap();
+                for reply in c.replies.drain(..) {
+                    if let PgWireBackendMessage::ErrorResponse(e) = reply {
+                        panic!("Describe after {change:?}: {e:?}");
+                    }
+                }
+                assert_eq!(
+                    after_change, calls[0],
+                    "after {change:?}: the views were not parsed again, as at the first Describe"
+                );
+            }
         });
     }
 
@@ -4910,19 +7010,23 @@ mod tests {
                 "SELECT * FROM v8 WHERE x = $1",
             ] {
                 let mut c = MemClient::new();
-                s.on_parse(&mut c, Parse::new(None, sql.to_string(), vec![]))
-                    .await
-                    .unwrap();
+                // FLAGGED TEST EDIT (C53): the statement is analysed at Parse now, as PostgreSQL
+                // analyses it, so the walk runs there and the cycle's statement is refused at
+                // Parse (the engine's circular view); Parse and Describe are counted together,
+                // with the same bound (the Parse's one parse serves the prepare).
                 let before = turso_pg_parser::libpg_query_calls();
-                // The cycle's Describe is refused (the engine's circular view); the walk before
-                // the refusal is what is counted.
-                let _ = s
-                    .on_describe(&mut c, Describe::new(TARGET_TYPE_BYTE_STATEMENT, None))
+                let parsed = s
+                    .on_parse(&mut c, Parse::new(None, sql.to_string(), vec![]))
                     .await;
+                if parsed.is_ok() {
+                    let _ = s
+                        .on_describe(&mut c, Describe::new(TARGET_TYPE_BYTE_STATEMENT, None))
+                        .await;
+                }
                 let calls = turso_pg_parser::libpg_query_calls() - before;
                 assert!(
                     calls <= 9,
-                    "{sql}: {calls} libpg_query calls at Describe, want at most 9"
+                    "{sql}: {calls} libpg_query calls at Parse and Describe, want at most 9"
                 );
             }
         });
@@ -4932,7 +7036,10 @@ mod tests {
     /// client's identifier. `SHOW "synchronous = off"` set the session's sync mode and `SHOW
     /// "fullfsync = off"` turned F_FULLFSYNC into fsync on Apple, both while compiling (a Describe
     /// too), and `SHOW wal_checkpoint` checkpointed: each is 42704 now, and the trunk connection's
-    /// settings read the same before and after.
+    /// settings read the same before and after. This D0 session already holds synchronous and
+    /// fullfsync off, so the SHOWs name the values it does not hold (full, on), and a premise says
+    /// so: a SHOW of the held value could change nothing, and the pin could not fail (ruled
+    /// c9c821dd8d, P8).
     #[test]
     fn show_cannot_change_an_engine_setting() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -4951,10 +7058,15 @@ mod tests {
                 .and_then(|mut stmt| stmt.run_collect_rows().ok())
         };
         let before = (pragma("synchronous"), pragma("fullfsync"));
-        assert!(before.0.is_some(), "premise: PRAGMA synchronous reads");
+        let off = Some(vec![vec![Value::from_i64(0)]]);
+        assert_eq!(
+            before,
+            (off.clone(), off),
+            "premise: the D0 session holds synchronous and fullfsync off, values the SHOWs differ from"
+        );
         for sql in [
-            "SHOW \"synchronous = off\"",
-            "SHOW \"fullfsync = off\"",
+            "SHOW \"synchronous = full\"",
+            "SHOW \"fullfsync = on\"",
             "SHOW wal_checkpoint",
             "SHOW synchronous",
         ] {
@@ -4991,6 +7103,110 @@ mod tests {
         }
     }
 
+    /// Wire review 18 item 3: a CHECKPOINT never holds up a branch create. Its store checkpoint is
+    /// the fuzzy one, written on a thread of its own, so while that write is held (the hook at stage
+    /// 2: rows written, not committed) a create from another session returns. The sharp checkpoint
+    /// (branch_compact_now) held the store mutex through the settle, the catalog write and its
+    /// syncs and the log's rewrite, so every create, switch and connect of every session waited
+    /// for it. At the base the premise fails: no fuzzy checkpoint ever reaches the hold. Mutant:
+    /// the sharp call.
+    #[test]
+    fn a_checkpoint_does_not_hold_up_a_create() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = session(&dir);
+        ok(&s, "CREATE TABLE t(id INT PRIMARY KEY)");
+        ok(&s, "INSERT INTO t VALUES (1)");
+        ok(&s, "SELECT turso_branch_create('b0')");
+        let db = s.shared.db.clone();
+        db.branch_checkpoint_hold(2);
+        let checkpoint = {
+            let shared = s.shared.clone();
+            std::thread::spawn(move || ok(&Session::new(shared), "CHECKPOINT"))
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while db.branch_checkpoint_held() & 0x80 == 0 {
+            if std::time::Instant::now() > deadline {
+                db.branch_checkpoint_hold(0);
+                panic!("premise: the CHECKPOINT's store checkpoint never reached the fuzzy hold");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let create = {
+            let shared = s.shared.clone();
+            std::thread::spawn(move || {
+                ok(&Session::new(shared), "SELECT turso_branch_create('b1')");
+                let _ = tx.send(());
+            })
+        };
+        let returned = rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok();
+        db.branch_checkpoint_hold(0);
+        checkpoint.join().unwrap();
+        create.join().unwrap();
+        assert!(
+            returned,
+            "a create waited for the CHECKPOINT's store checkpoint"
+        );
+    }
+
+    /// Wire review 18 item 14 and its appendix: the parameter-type walk opens a view chain of any
+    /// depth. Over v1..v40, each reading the one before, `SELECT * FROM v40 WHERE x = $1` types
+    /// `$1` int4 at its first Describe, with at most 41 libpg_query calls (each view once and the
+    /// statement), and again after a Sync. The walk cut every view past 32 levels
+    /// (MAX_VIEW_DEPTH, a bound against the session thread's stack), so the same Describe was
+    /// 42P18 cold and int4 once a shallower statement had memoised the views: the answer depended
+    /// on what the connection had prepared before.
+    #[test]
+    fn a_view_chain_of_any_depth_is_typed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = session(&dir);
+        ok(&s, "CREATE TABLE t(id INT PRIMARY KEY)");
+        ok(&s, "CREATE VIEW v1 AS SELECT id AS x FROM t");
+        for k in 2..=40 {
+            ok(
+                &s,
+                &format!("CREATE VIEW v{k} AS SELECT x FROM v{p}", p = k - 1),
+            );
+        }
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut c = MemClient::new();
+            let sql = "SELECT * FROM v40 WHERE x = $1";
+            s.on_parse(&mut c, Parse::new(None, sql.to_string(), vec![]))
+                .await
+                .unwrap();
+            for round in 0..2 {
+                let before = turso_pg_parser::libpg_query_calls();
+                if let Err(e) = s
+                    .on_describe(&mut c, Describe::new(TARGET_TYPE_BYTE_STATEMENT, None))
+                    .await
+                {
+                    panic!("round {round}: Describe refused: {e:?}");
+                }
+                let calls = turso_pg_parser::libpg_query_calls() - before;
+                s.on_sync(&mut c, PgSync::new()).await.unwrap();
+                let params: Vec<Vec<u32>> = c
+                    .replies
+                    .drain(..)
+                    .filter_map(|reply| match reply {
+                        PgWireBackendMessage::ParameterDescription(d) => Some(d.types),
+                        PgWireBackendMessage::ErrorResponse(e) => panic!("round {round}: {e:?}"),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(params, vec![vec![23]], "round {round}");
+                if round == 0 {
+                    assert!(
+                        calls <= 41,
+                        "{calls} libpg_query calls at the first Describe"
+                    );
+                }
+            }
+        });
+    }
+
     /// The instrument above counts: an ordinary statement does call libpg_query.
     #[test]
     fn an_ordinary_statement_calls_libpg_query() {
@@ -5023,6 +7239,79 @@ mod tests {
 
         let val = pg_bytes_to_value(b"1.23", &Type::NUMERIC).unwrap();
         assert_eq!(val, Value::from_f64(1.23));
+    }
+
+    /// A text bytea parameter without the `\x` prefix is read in byteain's escape format, as
+    /// PostgreSQL 18.6 reads it (recorded, artie raw loud-20261015/pg18-diff/pg18-bytea.out): `\\`
+    /// is one backslash, `\ooo` (three octal digits, the first 0-3) one byte, and any other
+    /// backslash is 22P02 "invalid input syntax for type bytea"; bytes with no backslash are
+    /// themselves. It was stored as the raw bytes, backslashes included (wire review 13 item 15).
+    #[test]
+    fn a_bytea_parameter_is_read_in_the_escape_format() {
+        let bytes = |text: &[u8]| match pg_bytes_to_value(text, &Type::BYTEA) {
+            Ok(Value::Blob(b)) => Ok(b),
+            Ok(other) => panic!("{other:?}"),
+            Err(PgWireError::UserError(e)) => Err(e.code.clone()),
+            Err(e) => panic!("{e:?}"),
+        };
+        assert_eq!(bytes(b"abc"), Ok(b"abc".to_vec()));
+        assert_eq!(bytes(b"a\\\\b"), Ok(b"a\\b".to_vec()));
+        assert_eq!(bytes(b"a\\101b"), Ok(b"aAb".to_vec()));
+        assert_eq!(bytes(b"\\x4142"), Ok(b"AB".to_vec()));
+        for bad in [&b"a\\qb"[..], b"a\\1b", b"a\\400b", b"a\\"] {
+            assert_eq!(
+                bytes(bad),
+                Err("22P02".to_string()),
+                "{:?}",
+                String::from_utf8_lossy(bad)
+            );
+        }
+    }
+
+    /// Wire review 16 item 23: parameter decoding at the edges, as PostgreSQL's input functions read
+    /// them. float4's own largest output, '3.4028235e+38' (float4out of FLT_MAX), binds, where it
+    /// was refused 22003 (compared as an f64 above f32::MAX); a spelling that underflows to zero
+    /// ('1e-400' for float8, '1e-50' for float4) is 22003 (recalled from float8in's ERANGE rule,
+    /// not re-read), where it bound 0, while a zero spelled as zero and the smallest denormals
+    /// bind; numeric keeps its range. An integer in base 2, 8 or 16 may put an underscore right
+    /// after its prefix ('0b_10_0101' is 37 in PostgreSQL 16 and later, conformance
+    /// upstream/int4.out), where it was 22P02; in base 10 a leading underscore is still 22P02, and
+    /// so is a prefix with no digit.
+    #[test]
+    fn parameters_decode_at_postgresqls_edges() {
+        let code = |bytes: &[u8], t: &Type| match pg_bytes_to_value(bytes, t) {
+            Err(PgWireError::UserError(e)) => Some(e.code.clone()),
+            Err(e) => panic!("{e:?}"),
+            Ok(_) => None,
+        };
+        let float4_max = pg_bytes_to_value(b"3.4028235e+38", &Type::FLOAT4).unwrap();
+        assert_eq!(float4_max, Value::from_f64(3.4028235e+38));
+        assert_eq!(code(b"3.5e+38", &Type::FLOAT4).as_deref(), Some("22003"));
+        assert_eq!(code(b"1e-400", &Type::FLOAT8).as_deref(), Some("22003"));
+        assert_eq!(code(b"-1e-400", &Type::FLOAT8).as_deref(), Some("22003"));
+        assert_eq!(code(b"1e-50", &Type::FLOAT4).as_deref(), Some("22003"));
+        for (zero, t) in [
+            (&b"0e-400"[..], &Type::FLOAT8),
+            (b"0.000", &Type::FLOAT8),
+            (b"-0", &Type::FLOAT4),
+            (b"4.9e-324", &Type::FLOAT8),
+            (b"1.4e-45", &Type::FLOAT4),
+            (b"1e-400", &Type::NUMERIC),
+        ] {
+            assert_eq!(code(zero, t), None, "{:?} as {t}", std::str::from_utf8(zero));
+        }
+        let based = pg_bytes_to_value(b"0b_10_0101", &Type::INT4).unwrap();
+        assert_eq!(based, Value::from_i64(37));
+        let based = pg_bytes_to_value(b"0x_1EEE_FFFF", &Type::INT4).unwrap();
+        assert_eq!(based, Value::from_i64(518979583));
+        for bad in [&b"_100"[..], b"0x_", b"0b__1", b"0o_", b"100_"] {
+            assert_eq!(
+                code(bad, &Type::INT4).as_deref(),
+                Some("22P02"),
+                "{:?}",
+                std::str::from_utf8(bad)
+            );
+        }
     }
 
     #[test]
@@ -5126,7 +7415,14 @@ mod tests {
         assert_eq!(sqlite_type_to_pg_type("SMALLINT"), Type::INT4);
         assert_eq!(sqlite_type_to_pg_type("BIGINT"), Type::INT8);
         assert_eq!(sqlite_type_to_pg_type("INT8"), Type::INT8);
+        // REAL stays float8 here: it is also the engine's name for a computed expression of REAL
+        // affinity (float8 in PostgreSQL). FLAGGED: this row of the never-green red 0748936d4
+        // asserted FLOAT4 on a premise that failed when run (`SELECT 2.5` and random() announced
+        // 700); an old REAL column's float4 is pinned by catalog's an_old_real_declaration test.
         assert_eq!(sqlite_type_to_pg_type("REAL"), Type::FLOAT8);
+        assert_eq!(sqlite_type_to_pg_type("FLOAT4"), Type::FLOAT4);
+        assert_eq!(sqlite_type_to_pg_type("FLOAT8"), Type::FLOAT8);
+        assert_eq!(sqlite_type_to_pg_type("DOUBLE PRECISION"), Type::FLOAT8);
         assert_eq!(sqlite_type_to_pg_type("TEXT"), Type::TEXT);
         assert_eq!(sqlite_type_to_pg_type("BLOB"), Type::BYTEA);
         assert_eq!(sqlite_type_to_pg_type("BOOLEAN"), Type::BOOL);
@@ -5320,6 +7616,45 @@ mod tests {
             count,
             vec![vec![Value::from_i64(1)]],
             "the INSERT was applied more than once"
+        );
+    }
+
+    /// A write whose commit meets Busy after its rows went out is stepped again to its end even
+    /// when its statement_timeout passes during the wait: dropped there, a write with RETURNING is
+    /// committed by the engine's reset, so the 57014 it answered reported as cancelled a write that
+    /// was stored (measured: 57014 with its row stored; fresh-context review of the ultrareview
+    /// fixes, on finding 9's Backoff).
+    #[test]
+    fn a_write_whose_commit_meets_busy_is_not_cancelled_by_its_timeout() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = session(&dir);
+        ok(&s, "CREATE TABLE t(id INT, v TEXT)");
+        ok(&s, "INSERT INTO t VALUES (1, 'a')");
+        ok(&s, "SELECT turso_branch_create('c')");
+        ok(&s, "SET statement_timeout = 1");
+        s.shared
+            .db
+            .branch_failpoint(Some(turso_core::branch::BranchFailpoint::TrunkDecisionBusy));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let replies = s.simple("INSERT INTO t VALUES (9, 'x') RETURNING id");
+        let conn = s.shared.db.connect().unwrap();
+        let count = conn
+            .prepare("SELECT count(*) FROM t WHERE id = 9")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        match replies.as_slice() {
+            [Response::Query(_)] => {}
+            [Response::Error(e)] => panic!(
+                "the write answered {} {} with {count:?} rows of it stored",
+                e.code, e.message
+            ),
+            other => panic!("{} replies", other.len()),
+        }
+        assert_eq!(
+            count,
+            vec![vec![Value::from_i64(1)]],
+            "the write was not applied once"
         );
     }
 
@@ -5521,6 +7856,33 @@ mod tests {
         }
     }
 
+    /// The savepoint verbs' edges (wire review 14 items 21 and 22). A `$` continues a name after its
+    /// first byte, as in an identifier, and no name starts with one; a `--` comment ends at \r as at
+    /// \n; an unterminated nested comment is no verb (pins of c305f1a13's halves, which no test
+    /// held). A savepoint may be named savepoint: `ROLLBACK TO SAVEPOINT` and `RELEASE SAVEPOINT`
+    /// with no other word name it, as PostgreSQL's grammar reads them (TO ColId, RELEASE ColId),
+    /// where the reader stripped the keyword and found no name (Other: in a failed block, 25P02).
+    #[test]
+    fn the_savepoint_verbs_are_read_by_their_grammar() {
+        for (sql, want) in [
+            ("SAVEPOINT a$b", TxVerb::Savepoint),
+            ("RELEASE a$1", TxVerb::Release),
+            ("SAVEPOINT $1", TxVerb::Other),
+            ("-- x\rCOMMIT", TxVerb::Commit),
+            ("/* a /* b */ COMMIT", TxVerb::Other),
+            ("SAVEPOINT savepoint", TxVerb::Savepoint),
+            ("ROLLBACK TO SAVEPOINT", TxVerb::RollbackTo),
+            ("ROLLBACK WORK TO savepoint", TxVerb::RollbackTo),
+            ("ROLLBACK TO SAVEPOINT savepoint", TxVerb::RollbackTo),
+            ("RELEASE SAVEPOINT", TxVerb::Release),
+            ("RELEASE SAVEPOINT savepoint", TxVerb::Release),
+            ("ROLLBACK TO", TxVerb::Other),
+            ("RELEASE", TxVerb::Other),
+        ] {
+            assert_eq!(TxVerb::of(sql), want, "{sql:?}");
+        }
+    }
+
     /// A COMMIT behind a comment that the trunk refuses settles as a COMMIT's refusal: committed
     /// or 40001 with nothing kept, the session idle, never run again (wire review 9 item 7).
     #[test]
@@ -5581,3 +7943,8 @@ mod tests {
         assert_eq!(s.in_use_waiters.load(Ordering::SeqCst), 0);
     }
 }
+
+#[cfg(test)]
+mod wait_tests;
+#[cfg(test)]
+mod shutdown_tests;

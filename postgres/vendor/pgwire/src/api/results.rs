@@ -386,6 +386,8 @@ pub enum Response {
     CopyIn(CopyResponse),
     CopyOut(CopyResponse),
     CopyBoth(CopyResponse),
+    /// A simple Query's whole reply but ReadyForQuery, already encoded (vendored change 8).
+    Inline(crate::messages::Inline),
 }
 
 #[cfg(test)]

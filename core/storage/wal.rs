@@ -3845,7 +3845,7 @@ impl Wal for WalFile {
             return Err(LimboError::InvalidArgument(format!(
                 "unexpected WAL frame buffer size: got={}, expected={expected_frame_len}",
                 frame.len()
-            )));
+            ).into()));
         }
 
         // HACK: *mut u8 can't be Sent between threads safely, cast it to usize then
@@ -3971,7 +3971,7 @@ impl Wal for WalFile {
                 "unexpected page size in frame: got={}, expected={}",
                 page.len(),
                 self.page_size(),
-            )));
+            ).into()));
         }
         if frame_id > self.max_frame.load(Ordering::Acquire) + 1 {
             // attempt to write frame out of sequential order - error out
@@ -3979,7 +3979,7 @@ impl Wal for WalFile {
                 "frame_id is beyond next frame in the WAL: frame_id={}, max_frame={}",
                 frame_id,
                 self.max_frame.load(Ordering::Acquire)
-            )));
+            ).into()));
         }
         if frame_id <= self.max_frame.load(Ordering::Acquire) {
             // just validate if page content from the frame matches frame in the WAL

@@ -1,0 +1,15 @@
+postgres (PostgreSQL) 18.6 (Homebrew)
+{"case": "search_path_ruling", "sql": "BEGIN; SET search_path TO s, public; SHOW search_path; ROLLBACK; SHOW search_path;", "returncode": 0, "stdout": "s, public\n\"$user\", public\n", "stderr": ""}
+{"case": "search_path_local_ruling", "sql": "BEGIN; SET LOCAL search_path TO public; SHOW search_path; COMMIT; SHOW search_path;", "returncode": 0, "stdout": "public\n\"$user\", public\n", "stderr": ""}
+{"case": "search_path_local_outside", "sql": "SET LOCAL search_path TO public; SHOW search_path;", "returncode": 0, "stdout": "\"$user\", public\n", "stderr": "WARNING:  SET LOCAL can only be used in transaction blocks\n"}
+{"case": "plain_then_local", "sql": "BEGIN; SET client_min_messages=warning; SET LOCAL client_min_messages=error; SHOW client_min_messages; COMMIT; SHOW client_min_messages;", "returncode": 0, "stdout": "error\nwarning\n", "stderr": ""}
+{"case": "local_then_plain", "sql": "BEGIN; SET LOCAL client_min_messages=error; SET client_min_messages=warning; COMMIT; SHOW client_min_messages;", "returncode": 0, "stdout": "warning\n", "stderr": ""}
+{"case": "savepoints", "sql": "BEGIN; SET client_min_messages=warning; SAVEPOINT a; SET client_min_messages=error; SAVEPOINT b; SET LOCAL client_min_messages=debug1; SHOW client_min_messages; ROLLBACK TO b; SHOW client_min_messages; ROLLBACK TO a; SHOW client_min_messages; RELEASE a; COMMIT; SHOW client_min_messages;", "returncode": 0, "stdout": "debug1\nerror\nwarning\nwarning\n", "stderr": ""}
+{"case": "commit_open_savepoint", "sql": "BEGIN; SAVEPOINT a; SET client_min_messages=error; COMMIT; SHOW client_min_messages;", "returncode": 0, "stdout": "error\n", "stderr": ""}
+{"case": "release_local", "sql": "BEGIN; SET client_min_messages=warning; SAVEPOINT a; SET LOCAL client_min_messages=error; RELEASE a; SHOW client_min_messages; COMMIT; SHOW client_min_messages;", "returncode": 0, "stdout": "error\nwarning\n", "stderr": ""}
+{"case": "search_path_rollback", "sql": "BEGIN; SET search_path TO pg_catalog; SHOW search_path; ROLLBACK; SHOW search_path;", "returncode": 0, "stdout": "pg_catalog\n\"$user\", public\n", "stderr": ""}
+{"case": "search_path_local", "sql": "BEGIN; SET LOCAL search_path TO pg_catalog; SHOW search_path; COMMIT; SHOW search_path;", "returncode": 0, "stdout": "pg_catalog\n\"$user\", public\n", "stderr": ""}
+{"case": "statement_timeout_local", "sql": "BEGIN; SET LOCAL statement_timeout='100ms'; SHOW statement_timeout; COMMIT; SHOW statement_timeout;", "returncode": 0, "stdout": "100ms\n0\n", "stderr": ""}
+{"case": "statement_timeout_rollback", "sql": "BEGIN; SET statement_timeout='100ms'; ROLLBACK; SHOW statement_timeout;", "returncode": 0, "stdout": "0\n", "stderr": ""}
+{"case": "local_outside_block", "sql": "SET LOCAL client_min_messages=error; SHOW client_min_messages;", "returncode": 0, "stdout": "notice\n", "stderr": "WARNING:  SET LOCAL can only be used in transaction blocks\n"}
+private PostgreSQL stopped 0

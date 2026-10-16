@@ -1,0 +1,23 @@
+>> Q DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public
+   N S=NOTICE C=00000 M=drop cascades to table t
+   C DROP SCHEMA
+   C CREATE SCHEMA
+   Z I
+>> Q CREATE TABLE t(id INT PRIMARY KEY, c INT)
+   C CREATE TABLE
+   Z I
+>> D - SELECT 1 FROM pg_class WHERE pg_class.relname = $1
+   ParseComplete
+   t params=[19]
+   T oids=[23] names=['?column?']
+   Z I
+>> D - SELECT 1 FROM pg_class WHERE pg_catalog.pg_class.relname = $1
+   ParseComplete
+   t params=[19]
+   T oids=[23] names=['?column?']
+   Z I
+>> D - SELECT 1 FROM t AS x WHERE public.t.c = $1
+   E S=ERROR C=42P01 M=invalid reference to FROM-clause entry for table "t"
+   Z I
+-- postgres (PostgreSQL) 18.6 (Homebrew)   (/opt/homebrew/Cellar/postgresql@18/18.6/bin/postgres, pid 8250 serving port 62816; server_version=18.6 (Homebrew). /opt/homebrew/bin/postgres on PATH is 17.11, not used)
+-- recorded 2026-10-15T20:59:32Z against 127.0.0.1:62816 db audit1 by pgproto.py (PGPROTO_NAMES=1)

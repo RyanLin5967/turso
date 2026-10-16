@@ -1,3 +1,4 @@
+use crate::error::SqlErrorKind;
 use std::sync::Arc;
 
 use crate::alloc::{TryClone, TursoSliceExt};
@@ -696,7 +697,7 @@ fn get_subquery_parser<'a>(
     let handle_unsupported_correlation =
         |correlated: bool, position: SubqueryPosition, allow_correlated: bool| -> Result<()> {
             if correlated && !allow_correlated {
-                crate::bail_parse_error!(
+                crate::bail_parse_error!(SqlErrorKind::FeatureNotSupported;
                     "correlated subqueries in {} clause are not supported yet",
                     position.name()
                 );
@@ -737,7 +738,7 @@ fn get_subquery_parser<'a>(
                     connection,
                 )?;
                 let Plan::Select(mut plan) = plan else {
-                    crate::bail_parse_error!(
+                    crate::bail_parse_error!(SqlErrorKind::FeatureNotSupported;
                         "compound SELECT queries not supported yet in WHERE clause subqueries"
                     );
                 };
@@ -828,7 +829,7 @@ fn get_subquery_parser<'a>(
                     connection,
                 )?;
                 let Plan::Select(mut plan) = plan else {
-                    crate::bail_parse_error!(
+                    crate::bail_parse_error!(SqlErrorKind::FeatureNotSupported;
                         "compound SELECT queries not supported yet in WHERE clause subqueries"
                     );
                 };
@@ -1596,8 +1597,6 @@ pub fn emit_from_clause_subquery(
     plan: &mut Plan,
     t_ctx: &mut TranslateCtx,
 ) -> Result<usize> {
-    // Emitted recursively per nested query (`stack::NestGuard`; the crash batch, 2026-10-15).
-    let _nest = crate::stack::NestGuard::enter("subqueries")?;
     let yield_reg = program.alloc_register();
     let coroutine_implementation_start_offset = program.allocate_label();
 

@@ -1,0 +1,50 @@
+>> Q SET client_encoding = 'nosuch'
+   E S=ERROR C=22023 M=invalid value for parameter "client_encoding": "nosuch"
+   Z I
+>> Q SET standard_conforming_strings = 'maybe'
+   E S=ERROR C=22023 M=parameter "standard_conforming_strings" requires a Boolean value
+   Z I
+>> Q SET DateStyle = 'nonsense'
+   E S=ERROR C=22023 M=invalid value for parameter "DateStyle": "nonsense"
+   Z I
+>> Q SET IntervalStyle = 'nonsense'
+   E S=ERROR C=22023 M=invalid value for parameter "IntervalStyle": "nonsense"
+   Z I
+>> Q SET TimeZone = 'Not/AZone'
+   E S=ERROR C=22023 M=invalid value for parameter "TimeZone": "Not/AZone"
+   Z I
+>> Q SET extra_float_digits = 99
+   E S=ERROR C=22023 M=99 is outside the valid range for parameter "extra_float_digits" (-15 .. 3)
+   Z I
+>> Q SET extra_float_digits = 'x'
+   E S=ERROR C=22023 M=invalid value for parameter "extra_float_digits": "x"
+   Z I
+>> Q SET xmloption = 'nonsense'
+   E S=ERROR C=22023 M=invalid value for parameter "xmloption": "nonsense"
+   Z I
+>> Q SET default_table_access_method = 'nosuch'
+   E S=ERROR C=22023 M=invalid value for parameter "default_table_access_method": "nosuch"
+   Z I
+>> Q SET transaction_read_only = 'maybe'
+   E S=ERROR C=22023 M=parameter "transaction_read_only" requires a Boolean value
+   Z I
+>> Q SET default_transaction_read_only = 'maybe'
+   E S=ERROR C=22023 M=parameter "default_transaction_read_only" requires a Boolean value
+   Z I
+>> Q SET bytea_output = 'nonsense'
+   E S=ERROR C=22023 M=invalid value for parameter "bytea_output": "nonsense"
+   Z I
+>> Q SET client_min_messages = 'nonsense'
+   E S=ERROR C=22023 M=invalid value for parameter "client_min_messages": "nonsense"
+   Z I
+>> Q SET lock_timeout = 'x'
+   E S=ERROR C=22023 M=invalid value for parameter "lock_timeout": "x"
+   Z I
+>> Q SET statement_timeout = '-5'
+   E S=ERROR C=22023 M=-5 ms is outside the valid range for parameter "statement_timeout" (0 ms .. 2147483647 ms)
+   Z I
+>> Q SET lock_timeout = '-1'
+   E S=ERROR C=22023 M=-1 ms is outside the valid range for parameter "lock_timeout" (0 ms .. 2147483647 ms)
+   Z I
+postgres (PostgreSQL) 18.6 (Homebrew)
+2026-10-16T16:31:13Z

@@ -1,6 +1,8 @@
 use pg_query::ParseResult;
 use thiserror::Error;
 
+pub use turso_parser::sql_error::{SqlErrorKind, SqlErrorMessage};
+
 pub mod translator;
 
 /// libpg_query's bindings, for callers that edit a parse tree (the frontend's table rebuild).
@@ -9,12 +11,26 @@ pub use pg_query;
 #[derive(Debug, Error)]
 pub enum ParseError {
     #[error("{0}")]
-    ParseError(String),
+    ParseError(SqlErrorMessage),
     /// A recursive entry of the translator found its thread's stack nearly spent
     /// (`turso_stack_guard::NestGuard`): PostgreSQL's 54001, which the frontend reports as the engine's
     /// `LimboError::StackDepthLimitExceeded`.
     #[error("stack depth limit exceeded")]
     StackDepthLimitExceeded,
+}
+
+impl From<ParseError> for SqlErrorMessage {
+    fn from(error: ParseError) -> Self {
+        match error {
+            ParseError::ParseError(message) => message,
+            // The translator's stack-guard refusal keeps its condition (54001) through the
+            // frontend's conversions.
+            ParseError::StackDepthLimitExceeded => SqlErrorMessage::classified(
+                SqlErrorKind::StatementTooComplex,
+                ParseError::StackDepthLimitExceeded.to_string(),
+            ),
+        }
+    }
 }
 
 /// The stack libpg_query's calls on `sql` run with (`turso_stack_guard::with_stack`). Its C code
@@ -46,7 +62,7 @@ fn pg_query_error(e: pg_query::Error) -> ParseError {
     if text.contains("recursion limit reached") || text.contains("stack depth limit exceeded") {
         ParseError::StackDepthLimitExceeded
     } else {
-        ParseError::ParseError(text)
+        ParseError::ParseError(text.into())
     }
 }
 
@@ -90,34 +106,23 @@ pub const MAX_PARAMETER: u32 = 65535;
 
 /// Every parameter number ($n) in a parse tree, sorted and without repeats, from the WHOLE tree:
 /// WITH, ON CONFLICT, RETURNING, set operations and every other clause, whether or not the
-/// translator or the engine keeps it (the engine registers only the $n it compiles: a $n in a clause
-/// it folds away has no slot; wire review 8 item 5). No libpg_query call: the tree is serialized
-/// (pg_query's protobuf types derive Serialize) and each `"ParamRef":{"number":N,"location":L`
-/// read off it, a pattern a string value in the tree cannot hold, since its quotes are escaped.
-/// The numbers are libpg_query's, which wrap above i32::MAX: [`checked_param_numbers`] reads them
-/// as PostgreSQL 18 does. Only for a statement whose text holds a '$'.
-pub fn param_numbers(parse: &ParseResult) -> Vec<i32> {
-    let mut numbers: Vec<i32> = param_refs(parse)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(number, _)| number)
-        .collect();
-    numbers.sort_unstable();
-    numbers.dedup();
-    numbers
-}
-
-/// [`param_numbers`], each number read again from `sql` (the text `parse` parsed) at its ParamRef's
-/// location, as PostgreSQL 18's scanner reads it. libpg_query reads a `$n` with atol into a 32-bit
-/// int (PostgreSQL 17's scanner), so `$4294967297` is $1 in its tree, and a branch call of it bound
-/// the wrong parameter and created a branch (wire review 12 item 1). A number above i32::MAX is
+/// translator or the engine keeps it (the engine registers only the $n it compiles: a $n in a
+/// clause it folds away has no slot; wire review 8 item 5). No libpg_query call: the tree is
+/// serialized (pg_query's protobuf types derive Serialize) and each
+/// `"ParamRef":{"number":N,"location":L` read off it, a pattern a string value in the tree cannot
+/// hold, since its quotes are escaped. The numbers are libpg_query's, which wrap above i32::MAX: so
+/// each number is read again from `sql` (the text `parse` parsed) at its ParamRef's location, as
+/// PostgreSQL 18's scanner reads it. libpg_query reads a `$n` with atol into a 32-bit int
+/// (PostgreSQL 17's scanner), so `$4294967297` is $1 in its tree, and a branch call of it bound the
+/// wrong parameter and created a branch (wire review 12 item 1). A number above i32::MAX is
 /// PostgreSQL 18's "parameter number too large" (42601); a tree number that is not the text's, or a
 /// tree whose parameters cannot be read, is refused (fail closed).
 pub fn checked_param_numbers(parse: &ParseResult, sql: &str) -> Result<Vec<i32>, ParseError> {
     let unreadable = || {
-        ParseError::ParseError(
+        ParseError::ParseError(SqlErrorMessage::classified(
+            SqlErrorKind::InternalError,
             "could not read the statement's parameters from its parse tree".to_string(),
-        )
+        ))
     };
     let mut numbers = Vec::new();
     for (number, location) in param_refs(parse).ok_or_else(unreadable)? {
@@ -128,6 +133,20 @@ pub fn checked_param_numbers(parse: &ParseResult, sql: &str) -> Result<Vec<i32>,
             .ok_or_else(unreadable)?;
         let len = digits.iter().take_while(|c| c.is_ascii_digit()).count();
         let text = &sql[location + 1..location + 1 + len];
+        // PostgreSQL 15+'s scanner refuses a parameter run into identifier characters ($1abc)
+        // as "trailing junk after parameter" (42601, at Parse); libpg_query 17's read it as $1
+        // aliased abc (C40 review LOW 5; recorded on PostgreSQL 18.6, pg18-c49-low5.out).
+        let ident = |c: &u8| c.is_ascii_alphanumeric() || *c == b'_' || *c >= 0x80;
+        let junk = digits[len..].iter().take_while(|c| ident(c)).count();
+        if junk > 0 {
+            return Err(ParseError::ParseError(SqlErrorMessage::classified(
+                SqlErrorKind::SyntaxError,
+                format!(
+                    "trailing junk after parameter at or near \"${}\"",
+                    &sql[location + 1..location + 1 + len + junk]
+                ),
+            )));
+        }
         let value = text.bytes().try_fold(0u64, |v, d| {
             v.checked_mul(10)?.checked_add(u64::from(d - b'0'))
         });
@@ -141,7 +160,7 @@ pub fn checked_param_numbers(parse: &ParseResult, sql: &str) -> Result<Vec<i32>,
             _ => {
                 return Err(ParseError::ParseError(format!(
                     "parameter number too large at or near \"${text}\""
-                )))
+                ).into()))
             }
         }
     }
@@ -151,7 +170,7 @@ pub fn checked_param_numbers(parse: &ParseResult, sql: &str) -> Result<Vec<i32>,
 }
 
 /// Each ParamRef's number and byte location in a parse tree, read off its serialization (see
-/// [`param_numbers`]); None if the tree cannot be serialized or a ParamRef not read.
+/// [`checked_param_numbers`]); None if the tree cannot be serialized or a ParamRef not read.
 fn param_refs(parse: &ParseResult) -> Option<Vec<(i32, usize)>> {
     const KEY: &str = "\"ParamRef\":{\"number\":";
     const LOCATION: &str = ",\"location\":";
@@ -222,7 +241,7 @@ pub fn sql_comment(b: &[u8]) -> Option<Option<usize>> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ParamScan {
     /// The highest `$n` the text holds, 0 for none; None for a number past MAX_PARAMETER, which
-    /// the parser refuses (42601), so no count is taken from it.
+    /// the parser refuses (42601), or unreadable tokens; no count is taken from either.
     pub highest: Option<u32>,
     /// PostgreSQL analyses the statement at Parse and so counts its `$n`: a query (SELECT, VALUES,
     /// TABLE, WITH, a parenthesised one), INSERT, UPDATE, DELETE, MERGE, CALL, EXPLAIN, DECLARE,
@@ -241,169 +260,88 @@ impl Default for ParamScan {
     }
 }
 
-/// [`ParamScan`] of `sql`, read as PostgreSQL's lexer reads it: a `$` followed by digits is a
-/// parameter unless it continues an identifier (`a$3`, whose `$` is an identifier byte); nothing
-/// inside a string (standard, `E'..'` with backslash escapes, `U&'..'`, `B'..'`, `X'..'`), a quoted
-/// identifier, a dollar-quoted string or a comment (`--`, nested `/* */`) is a parameter. One pass,
-/// no allocation but the first word's. The server reads it at Parse to count a Bind's values
-/// before anything runs: it tested for a `$` byte, so a `$` in a comment or a quoted name skipped
-/// the count and Execute's prepare performed a SET before refusing it (wire review 17 item 2).
+/// Read parameter tokens with the same libpg_query lexer that produces the parse tree used at
+/// Execute. In particular, continued strings retain their escape mode and identifier bytes never
+/// become parameter tokens. Bind keeps this result from Parse; it does not tokenize SQL itself.
 pub fn scan_params(sql: &str) -> ParamScan {
-    let b = sql.as_bytes();
-    let ident_start = |c: u8| c.is_ascii_alphabetic() || c == b'_' || c >= 0x80;
-    let ident_cont = |c: u8| ident_start(c) || c.is_ascii_digit() || c == b'$';
-    // The end of the quoted token opening at `i` (its closing quote doubled inside it; with
-    // `backslash`, a backslash escapes the next byte), or the text's end when it never closes.
-    let quoted = |i: usize, q: u8, backslash: bool| {
-        let mut j = i + 1;
-        while j < b.len() {
-            if backslash && b[j] == b'\\' {
-                j += 2;
-            } else if b[j] == q {
-                if b.get(j + 1) == Some(&q) {
-                    j += 2;
-                } else {
-                    return j + 1;
-                }
-            } else {
-                j += 1;
-            }
-        }
-        b.len()
+    use pg_query::protobuf::Token;
+
+    count_libpg_query_call();
+    let Ok(tokens) = pg_query::scan(sql) else {
+        // No count is available for a lexical error. The normal prepare path reports that error;
+        // never treat an unreadable statement as requiring zero values.
+        return ParamScan {
+            highest: None,
+            analysed: true,
+        };
     };
     let mut scan = ParamScan::default();
-    let mut highest: u64 = 0;
-    let mut first: Option<String> = None;
+    let mut first = None;
     let mut depth = 0usize;
-    // CREATE TABLE ... AS <query>, read at depth 0: TABLE seen before an AS, and the AS followed
-    // by a query.
     let (mut saw_table, mut after_as) = (false, false);
-    let mut i = 0;
-    while i < b.len() {
-        let c = b[i];
-        if pg_space(c) {
-            i += 1;
+    for token in tokens.tokens {
+        let kind = token.token();
+        if matches!(kind, Token::SqlComment | Token::CComment | Token::Ascii59) {
             continue;
         }
-        match sql_comment(&b[i..]) {
-            Some(Some(len)) => {
-                i += len;
-                continue;
-            }
-            Some(None) => break,
-            None => {}
+        if kind == Token::Param {
+            // libpg_query 17 stores parameter numbers in an i32. Read its token's original digits
+            // so a wrapped number cannot become a smaller count (checked_param_numbers also checks
+            // the original text at Execute).
+            let value = sql
+                .get(token.start as usize..token.end as usize)
+                .and_then(|text| text.strip_prefix('$'))
+                .and_then(|digits| digits.parse::<u32>().ok())
+                .filter(|n| *n <= MAX_PARAMETER);
+            scan.highest = scan.highest.zip(value).map(|(a, b)| a.max(b));
         }
-        let at_depth = depth;
-        let token_start = i;
-        let mut word: Option<&[u8]> = None;
-        match c {
-            b'\'' => i = quoted(i, b'\'', false),
-            b'"' => i = quoted(i, b'"', false),
-            b'$' if b.get(i + 1).is_some_and(u8::is_ascii_digit) => {
-                let mut j = i + 1;
-                let mut n: u64 = 0;
-                while j < b.len() && b[j].is_ascii_digit() {
-                    n = n.saturating_mul(10).saturating_add(u64::from(b[j] - b'0'));
-                    j += 1;
-                }
-                highest = highest.max(n);
-                i = j;
-            }
-            b'$' => {
-                // A dollar quote: $tag$ ... $tag$, the tag empty or an identifier without `$`.
-                let mut j = i + 1;
-                if j < b.len() && ident_start(b[j]) {
-                    while j < b.len() && (ident_start(b[j]) || b[j].is_ascii_digit()) {
-                        j += 1;
-                    }
-                }
-                if b.get(j) == Some(&b'$') {
-                    let delimiter = &b[i..=j];
-                    let body = j + 1;
-                    i = b[body..]
-                        .windows(delimiter.len())
-                        .position(|w| w == delimiter)
-                        .map_or(b.len(), |p| body + p + delimiter.len());
-                } else {
-                    i += 1;
-                }
-            }
-            b'(' => {
-                depth += 1;
-                i += 1;
-            }
-            b')' => {
-                depth = depth.saturating_sub(1);
-                i += 1;
-            }
-            c if ident_start(c) => {
-                while i < b.len() && ident_cont(b[i]) {
-                    i += 1;
-                }
-                let w = &b[token_start..i];
-                if w.eq_ignore_ascii_case(b"e") && b.get(i) == Some(&b'\'') {
-                    // E'..': a string whose backslash escapes the next byte.
-                    i = quoted(i, b'\'', true);
-                } else {
-                    word = Some(w);
-                }
-            }
-            c if c.is_ascii_digit() => {
-                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'.' || b[i] == b'_')
-                {
-                    i += 1;
-                }
-            }
-            _ => i += 1,
-        }
-        let paren = c == b'(';
-        if first.is_none() {
-            first = Some(match word {
-                Some(w) => String::from_utf8_lossy(w).to_ascii_uppercase(),
-                None if paren => "(".to_string(),
-                None => String::new(),
-            });
-        }
-        if first.as_deref() == Some("CREATE") && at_depth == 0 {
-            let is = |k: &str| word.is_some_and(|w| w.eq_ignore_ascii_case(k.as_bytes()));
+        let first = *first.get_or_insert(kind);
+        if first == Token::Create && depth == 0 {
             if after_as {
                 if saw_table
-                    && (paren
-                        || ["SELECT", "WITH", "VALUES", "TABLE", "EXECUTE"]
-                            .iter()
-                            .any(|k| is(k)))
+                    && matches!(
+                        kind,
+                        Token::Ascii40
+                            | Token::Select
+                            | Token::With
+                            | Token::Values
+                            | Token::Table
+                            | Token::Execute
+                    )
                 {
                     scan.analysed = true;
                 }
                 after_as = false;
             }
-            if is("AS") {
-                after_as = true;
-            } else if is("TABLE") {
-                saw_table = true;
+            match kind {
+                Token::As => after_as = true,
+                Token::Table => saw_table = true,
+                _ => {}
             }
         }
-    }
-    scan.highest = u32::try_from(highest).ok().filter(|n| *n <= MAX_PARAMETER);
-    if let Some(first) = first.as_deref() {
-        if matches!(
-            first,
-            "SELECT"
-                | "VALUES"
-                | "TABLE"
-                | "WITH"
-                | "("
-                | "INSERT"
-                | "UPDATE"
-                | "DELETE"
-                | "MERGE"
-                | "CALL"
-                | "EXPLAIN"
-                | "DECLARE"
-        ) {
-            scan.analysed = true;
+        match kind {
+            Token::Ascii40 => depth += 1,
+            Token::Ascii41 => depth = depth.saturating_sub(1),
+            _ => {}
         }
     }
+    scan.analysed |= matches!(
+        first,
+        Some(
+            Token::Select
+                | Token::Values
+                | Token::Table
+                | Token::With
+                | Token::Ascii40
+                | Token::Insert
+                | Token::Update
+                | Token::DeleteP
+                | Token::Merge
+                | Token::Call
+                | Token::Explain
+                | Token::Declare
+        )
+    );
     scan
 }
 
@@ -422,42 +360,68 @@ pub fn skip_blank(b: &[u8], mut i: usize) -> Option<usize> {
     }
 }
 
-/// Split a multi-statement SQL string into individual statements.
-/// Uses pg_query's scanner which correctly handles semicolons inside
-/// string literals, comments, and dollar-quoted strings.
-/// Returns the individual statement strings (without trailing semicolons).
+/// Split a multi-statement SQL string into its statements as PostgreSQL does for a simple Query:
+/// the whole text is parsed first (libpg_query's parser split), so a text any part of which does
+/// not parse is refused whole, and its caller runs none of it. Returns the statements' texts,
+/// trimmed; empty statements are none.
 ///
-/// The scanner emits a statement only where it saw a keyword, and skips every other stretch of the
-/// text: `COMMIT<NBSP>` (one identifier) between two statements was dropped, so `INSERT ..;
-/// COMMIT<NBSP>; INSERT ..` ran both INSERTs and nothing answered 42601. So every stretch before,
-/// between and after the statements must be blank (whitespace, comments, `;`), or the text is
-/// refused here: the caller then prepares it whole, and the parser refuses it, as PostgreSQL parses
-/// the whole string before it runs any of it (wire review 16 item 1).
+/// The scanner split this replaced emitted every stretch holding a keyword as a statement and
+/// skipped the rest: `INSERT ..; COMMIT<NBSP>; INSERT ..` ran both INSERTs (wire review 16 item 1),
+/// and `INSERT ..; COMMIT; SELEC * FROM t` committed the INSERT before the malformed part, which
+/// holds the keyword FROM, was refused (wire review 18 item 6). For the statement-at-a-time split
+/// a REPL wants, see [`split_statements_lenient`].
 pub fn split_statements(sql: &str) -> Result<Vec<String>, ParseError> {
     count_libpg_query_call();
-    let parts =
-        turso_stack_guard::with_stack(pg_query_stack(sql), || pg_query::split_with_scanner(sql)).map_err(pg_query_error)?;
+    let parts = turso_stack_guard::with_stack(pg_query_stack(sql), || pg_query::split_with_parser(sql))
+        .map_err(pg_query_error)?;
+    Ok(parts
+        .into_iter()
+        .map(|s| pg_trim(s).to_string())
+        .filter(|s| !s.is_empty())
+        .collect())
+}
+
+/// Split a multi-statement SQL string statement by statement, as psql sends a script: libpg_query's
+/// scanner finds the statements (`;` inside a string literal, a comment or a dollar quote is no
+/// separator), and a stretch it skips that is not blank (whitespace, comments, `;`) is a part of
+/// its own, in its place, so it fails when it is run instead of vanishing. The scanner emits a
+/// statement only where it saw a keyword: `SELECT 1; selecgt 2` lost `selecgt 2`, and `INSERT ..;
+/// COMMIT<NBSP>; INSERT ..` lost its COMMIT (wire review 16 item 1). The non-server REPL and
+/// PgConnection::execute run their parts this way: the valid parts run, a malformed one fails
+/// (wire review 18 item 7). A simple Query over the wire uses [`split_statements`].
+pub fn split_statements_lenient(sql: &str) -> Result<Vec<String>, ParseError> {
+    count_libpg_query_call();
+    let found = turso_stack_guard::with_stack(pg_query_stack(sql), || pg_query::split_with_scanner(sql))
+        .map_err(pg_query_error)?;
     let b = sql.as_bytes();
     let blank = |gap: &[u8]| skip_blank(gap, 0) == Some(gap.len());
-    let stray = || ParseError::ParseError("a part of the text is no statement".to_string());
+    let mut parts = Vec::with_capacity(found.len());
     let mut at = 0;
-    for part in &parts {
-        // Each part is a slice of `sql` (split_with_scanner returns `&query[start..end]`).
+    for part in &found {
+        // Each part is a slice of `sql` (split_with_scanner returns `&query[start..end]`); one that
+        // is not refuses the split, and its caller runs the text whole.
         let start = (part.as_ptr() as usize)
             .checked_sub(sql.as_ptr() as usize)
             .filter(|start| *start >= at && *start + part.len() <= b.len())
-            .ok_or_else(stray)?;
+            .ok_or_else(|| {
+                ParseError::ParseError("the scanner split lost its place".to_string().into())
+            })?;
         if !blank(&b[at..start]) {
-            return Err(stray());
+            parts.push(&sql[at..start]);
         }
+        parts.push(*part);
         at = start + part.len();
     }
     if !blank(&b[at..]) {
-        return Err(stray());
+        parts.push(&sql[at..]);
     }
     Ok(parts
         .into_iter()
-        .map(|s| pg_trim(&s).to_string())
+        .map(|s| {
+            // A stray stretch keeps the `;` that ends it; a statement's is not in its slice.
+            let s = pg_trim(s);
+            pg_trim(s.trim_end_matches(';')).to_string()
+        })
         .filter(|s| !s.is_empty())
         .collect())
 }
@@ -480,6 +444,40 @@ pub fn fingerprint(sql: &str) -> Result<String, ParseError> {
     turso_stack_guard::with_stack(pg_query_stack(sql), || pg_query::fingerprint(sql))
         .map(|fp| fp.hex)
         .map_err(pg_query_error)
+}
+
+/// What a schema qualifier names in this frontend: the one rule every reader of a relation's or a
+/// column's qualifier uses. It was spelled seven ways, and a three-part column reference and COPY
+/// missed it (wire review 18 items 21 and 22). Case-insensitive, as every spelling of it was. A
+/// search path's entries follow the engine's own rule instead (public alone is main there).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaQualifier<'a> {
+    /// No qualifier: the search path decides.
+    Unqualified,
+    /// The main database: public, PostgreSQL's schema for it, whatever the search path (wire
+    /// review 17 item 1), and main, the engine's name for it, which stored view text holds.
+    Main,
+    /// pg_catalog, whose relations the engine finds unqualified.
+    PgCatalog,
+    /// information_schema, whose views the engine names `information_schema_<view>`.
+    InformationSchema,
+    /// Any other schema: the attached database of that name.
+    Attached(&'a str),
+}
+
+/// [`SchemaQualifier`] of `schema` ("" for none).
+pub fn schema_qualifier(schema: &str) -> SchemaQualifier<'_> {
+    if schema.is_empty() {
+        SchemaQualifier::Unqualified
+    } else if schema.eq_ignore_ascii_case("public") || schema.eq_ignore_ascii_case("main") {
+        SchemaQualifier::Main
+    } else if schema.eq_ignore_ascii_case("pg_catalog") {
+        SchemaQualifier::PgCatalog
+    } else if schema.eq_ignore_ascii_case("information_schema") {
+        SchemaQualifier::InformationSchema
+    } else {
+        SchemaQualifier::Attached(schema)
+    }
 }
 
 /// Quote an identifier following PostgreSQL's server-side quote_identifier()
@@ -571,11 +569,12 @@ mod tests {
         }
     }
 
-    /// param_numbers finds every $n in the tree, in clauses the engine folds away or the translator
-    /// never reads (WITH, ON CONFLICT, a false AND, HAVING), and none in a string, a comment, a
-    /// quoted identifier or a dollar-quoted string that looks like one (wire review 8 item 5).
+    /// checked_param_numbers finds every $n in the tree, in clauses the engine folds away or the
+    /// translator never reads (WITH, ON CONFLICT, a false AND, HAVING), and none in a string, a
+    /// comment, a quoted identifier or a dollar-quoted string that looks like one (wire review 8
+    /// item 5). It read param_numbers, deleted as dead (wire review 14 item 24).
     #[test]
-    fn param_numbers_reads_the_whole_tree() {
+    fn checked_param_numbers_reads_the_whole_tree() {
         for (sql, want) in [
             ("SELECT 1", vec![]),
             ("SELECT v FROM t WHERE false AND id = $1", vec![1]),
@@ -592,7 +591,7 @@ mod tests {
             ("SELECT 1 LIMIT $2147483647", vec![2147483647]),
         ] {
             let parsed = parse(sql).unwrap();
-            assert_eq!(param_numbers(&parsed), want, "{sql}");
+            assert_eq!(checked_param_numbers(&parsed, sql).ok(), Some(want), "{sql}");
         }
     }
 }

@@ -564,7 +564,7 @@ impl Catalog {
             None => Arc::new(PlatformIO::new()?),
         };
         let path = path.to_str().ok_or_else(|| {
-            LimboError::InvalidArgument("branch catalog path is not UTF-8".to_string())
+            LimboError::InvalidArgument("branch catalog path is not UTF-8".to_string().into())
         })?;
         let db = Database::open_file_with_flags(
             io,

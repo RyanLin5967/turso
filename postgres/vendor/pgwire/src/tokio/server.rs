@@ -327,6 +327,41 @@ enum SslNegotiationType {
     Postgres,
     Direct,
     None,
+    /// A second SSLRequest or GSSENCRequest, refused with FATAL as PostgreSQL refuses it (vendored
+    /// change 10): the connection ends.
+    Repeated,
+}
+
+/// PostgreSQL's answer to a negotiation request after its kind was already answered: it reads it as
+/// a startup packet of protocol `code` (ProcessStartupPacket), FATAL 0A000. Recorded for SSL on
+/// PostgreSQL 18.6 (artie lanes/wire/raw/loud-20261015/pg18-diff/pg18-ssl2.out); the GSS code's
+/// text is the same with its own number (1234.5680), from PostgreSQL's source: a GSSAPI-enabled
+/// build accepts GSS, so the repeat could not be recorded.
+fn repeated_negotiation(code: &str) -> PgWireBackendMessage {
+    PgWireBackendMessage::ErrorResponse(
+        ErrorInfo::new(
+            "FATAL".to_string(),
+            "0A000".to_string(),
+            format!("unsupported frontend protocol {code}: server supports 3.0 to 3.2"),
+        )
+        .into(),
+    )
+}
+
+/// PostgreSQL's answer to bytes the client sent after a negotiation request and before reading its
+/// answer (ProcessStartupPacket checks pq_buffer_remaining_data after the 'N'): FATAL 08P01, so
+/// nothing sent before the encryption answer is read as the session's (vendored change 11).
+/// Recorded for SSL on PostgreSQL 18.6 (artie pg18-diff/pg18-ssl3.out); the GSS text is from
+/// PostgreSQL's source (a GSSAPI-enabled build answers 'G', so it could not be recorded).
+fn unencrypted_after(request: &str) -> PgWireBackendMessage {
+    PgWireBackendMessage::ErrorResponse(
+        ErrorInfo::new(
+            "FATAL".to_string(),
+            "08P01".to_string(),
+            format!("received unencrypted data after {request}"),
+        )
+        .into(),
+    )
 }
 
 async fn check_ssl_direct_negotiation(tcp_socket: &TcpStream) -> Result<bool, io::Error> {
@@ -336,11 +371,15 @@ async fn check_ssl_direct_negotiation(tcp_socket: &TcpStream) -> Result<bool, io
     Ok(n > 0 && buf[0] == 0x16)
 }
 
-async fn peek_for_sslrequest<ST>(
-    socket: &mut Framed<TcpStream, PgWireMessageServerCodec<ST>>,
+async fn peek_for_sslrequest<IO, ST>(
+    socket: &mut Framed<IO, PgWireMessageServerCodec<ST>>,
     ssl_supported: bool,
-) -> Result<SslNegotiationType, io::Error> {
-    if check_ssl_direct_negotiation(socket.get_ref()).await? {
+    direct: bool,
+) -> Result<SslNegotiationType, io::Error>
+where
+    IO: AsyncRead + AsyncWrite + Unpin,
+{
+    if direct {
         Ok(SslNegotiationType::Direct)
     } else {
         let mut ssl_done = false;
@@ -352,6 +391,10 @@ async fn peek_for_sslrequest<ST>(
                 Some(Ok(PgWireFrontendMessage::SslNegotiation(
                     SslNegotiationMetaMessage::PostgresSsl(_),
                 ))) => {
+                    if ssl_done {
+                        socket.send(repeated_negotiation("1234.5679")).await?;
+                        return Ok(SslNegotiationType::Repeated);
+                    }
                     // ssl request
                     if ssl_supported {
                         socket
@@ -362,6 +405,10 @@ async fn peek_for_sslrequest<ST>(
                         socket
                             .send(PgWireBackendMessage::SslResponse(SslResponse::Refuse))
                             .await?;
+                        if !socket.read_buffer().is_empty() {
+                            socket.send(unencrypted_after("SSL request")).await?;
+                            return Ok(SslNegotiationType::Repeated);
+                        }
                         ssl_done = true;
 
                         if gss_done {
@@ -377,9 +424,17 @@ async fn peek_for_sslrequest<ST>(
                 Some(Ok(PgWireFrontendMessage::SslNegotiation(
                     SslNegotiationMetaMessage::PostgresGss(_),
                 ))) => {
+                    if gss_done {
+                        socket.send(repeated_negotiation("1234.5680")).await?;
+                        return Ok(SslNegotiationType::Repeated);
+                    }
                     socket
                         .send(PgWireBackendMessage::GssEncResponse(GssEncResponse::Refuse))
                         .await?;
+                    if !socket.read_buffer().is_empty() {
+                        socket.send(unencrypted_after("GSSAPI encryption request")).await?;
+                        return Ok(SslNegotiationType::Repeated);
+                    }
                     gss_done = true;
 
                     if ssl_done {
@@ -423,6 +478,8 @@ fn check_alpn_for_direct_ssl<IO>(tls_socket: &TlsStream<IO>) -> Result<(), io::E
 #[non_exhaustive]
 pub enum MaybeTls {
     Plain(TcpStream),
+    /// A std socket in blocking mode, driven with no runtime (vendored change 9).
+    Blocking(BlockingTcp),
     #[cfg(any(feature = "_ring", feature = "_aws-lc-rs"))]
     Tls(Box<TlsStream<TcpStream>>),
 }
@@ -431,6 +488,7 @@ macro_rules! maybe_tls {
     ($self:ident, $poll_x:ident($($args:expr),*)) => {
         match $self.get_mut() {
             MaybeTls::Plain(io) => Pin::new(io).$poll_x($($args),*),
+            MaybeTls::Blocking(io) => Pin::new(io).$poll_x($($args),*),
             #[cfg(any(feature = "_ring", feature = "_aws-lc-rs"))]
             MaybeTls::Tls(io) => Pin::new(io).$poll_x($($args),*),
         }
@@ -465,6 +523,145 @@ impl AsyncWrite for MaybeTls {
     }
 }
 
+/// A std TCP socket in blocking mode as an AsyncRead/AsyncWrite whose every poll completes: the
+/// read or write blocks the calling thread in the system call, and nothing is registered with a
+/// reactor, so a session thread driven by a plain executor makes no kevent (vendored change 9).
+/// While `deadline` is set, every read waits only until it (SO_RCVTIMEO, re-armed per read), so a
+/// client that trickles bytes cannot stretch it; a read that reaches it reads as the stream's end,
+/// with `timed_out` set. Every write waits only until it too (SO_SNDTIMEO, re-armed per write;
+/// vendored change 10, C37 H1): a write that reaches it fails TimedOut, with `timed_out` set, so a
+/// client that never reads cannot hold the thread in a blocking write.
+pub struct BlockingTcp {
+    pub socket: std::net::TcpStream,
+    pub deadline: Option<std::time::Instant>,
+    pub timed_out: bool,
+}
+
+impl AsyncRead for BlockingTcp {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        use std::io::Read;
+        let this = self.get_mut();
+        if let Some(deadline) = this.deadline {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                this.timed_out = true;
+                return Poll::Ready(Ok(()));
+            }
+            this.socket.set_read_timeout(Some(left))?;
+        }
+        loop {
+            match this.socket.read(buf.initialize_unfilled()) {
+                Ok(n) => {
+                    buf.advance(n);
+                    return Poll::Ready(Ok(()));
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e)
+                    if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) =>
+                {
+                    this.timed_out = true;
+                    return Poll::Ready(Ok(()));
+                }
+                Err(e) => return Poll::Ready(Err(e)),
+            }
+        }
+    }
+}
+
+impl AsyncWrite for BlockingTcp {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        use std::io::Write;
+        let this = self.get_mut();
+        let timed_out = |this: &mut Self| {
+            this.timed_out = true;
+            Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the startup deadline passed while writing to the client",
+            )))
+        };
+        if let Some(deadline) = this.deadline {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return timed_out(this);
+            }
+            this.socket.set_write_timeout(Some(left))?;
+        }
+        loop {
+            match this.socket.write(buf) {
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e)
+                    if this.deadline.is_some()
+                        && matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) =>
+                {
+                    return timed_out(this)
+                }
+                r => return Poll::Ready(r),
+            }
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(match self.socket.shutdown(std::net::Shutdown::Write) {
+            Err(e) if e.kind() == io::ErrorKind::NotConnected => Ok(()),
+            r => r,
+        })
+    }
+}
+
+/// [`negotiate_tls`] with no TLS, on a std socket in blocking mode ([`BlockingTcp`]): the SSL and
+/// GSS requests are refused, as `negotiate_tls(.., None)` refuses them, and a direct TLS handshake
+/// gets `Ok(None)`. Every read, the peek for a direct handshake's first byte included, ends at
+/// `deadline`, which the returned socket keeps until the caller clears it. Vendored change 9.
+pub async fn negotiate_blocking<S>(
+    tcp_socket: std::net::TcpStream,
+    deadline: Option<std::time::Instant>,
+) -> io::Result<Option<Framed<MaybeTls, PgWireMessageServerCodec<S>>>> {
+    let addr = tcp_socket.peer_addr()?;
+    tcp_socket.set_nodelay(true)?;
+    tcp_socket.set_nonblocking(false)?;
+    if let Some(deadline) = deadline {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        tcp_socket.set_read_timeout(Some(left.max(std::time::Duration::from_nanos(1))))?;
+    }
+    let mut first = [0u8; 1];
+    let direct = loop {
+        match tcp_socket.peek(&mut first) {
+            Ok(n) => break n > 0 && first[0] == 0x16,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            // A read timeout before any byte: the stream reads as ended below.
+            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+                break false
+            }
+            Err(e) => return Err(e),
+        }
+    };
+    let client_info = DefaultClient::new(addr, false);
+    let io = BlockingTcp {
+        socket: tcp_socket,
+        deadline,
+        timed_out: false,
+    };
+    let mut socket = Framed::new(MaybeTls::Blocking(io), PgWireMessageServerCodec::new(client_info));
+    let ssl = peek_for_sslrequest(&mut socket, false, direct).await?;
+    if ssl != SslNegotiationType::None {
+        return Ok(None);
+    }
+    socket.set_state(PgWireConnectionState::AwaitingStartup);
+    Ok(Some(socket))
+}
+
 /// Negotiate TLS with the given client stream.
 ///
 /// Returns `Ok(None)` if the client sent a direct TLS negotiation but
@@ -481,8 +678,12 @@ pub async fn negotiate_tls<S>(
 
     // this function will process postgres ssl negotiation and consume the first
     // SslRequest packet if detected.
-    let ssl = peek_for_sslrequest(&mut tcp_socket, tls_acceptor.is_some()).await?;
+    let direct = check_ssl_direct_negotiation(tcp_socket.get_ref()).await?;
+    let ssl = peek_for_sslrequest(&mut tcp_socket, tls_acceptor.is_some(), direct).await?;
 
+    if ssl == SslNegotiationType::Repeated {
+        return Ok(None);
+    }
     let old_parts = tcp_socket.into_parts();
 
     if ssl == SslNegotiationType::None {

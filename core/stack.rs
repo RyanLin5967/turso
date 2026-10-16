@@ -214,3 +214,290 @@ mod tests {
         assert_eq!(flat, 0, "a flat SELECT counted as re-entered");
     }
 }
+
+/// fastest-wire's own NestGuard tests (db2fad5cf, core/stack.rs), kept verbatim below and run
+/// against the one implementation that survived the merge, `turso_stack_guard` (fastest-core
+/// integrate, 2026-10-16: wire's NestGuard and the engine's crate were two copies of one class).
+/// This shim binds the names wire's private implementation gave those tests to the crate's: its
+/// constants, `margin` and `remaining_stack`; `STACK_BOUNDS` to the crate's stack size (the tests
+/// read only the size); `FORCE_UNKNOWN` to the crate's force-unknown hook; `level_cost` to the
+/// crate's hooks, armed by the first take (the crate records only when armed). No assertion or
+/// input of wire's tests is changed.
+#[cfg(test)]
+mod fastest_wire_shim {
+    pub(super) use turso_stack_guard::{margin, remaining_stack, LEVEL_COST, STACK_MARGIN};
+
+    pub(super) struct StackBounds;
+    impl StackBounds {
+        pub(super) fn with<R>(&'static self, f: impl FnOnce(&Option<(usize, usize)>) -> R) -> R {
+            f(&turso_stack_guard::stack_size().map(|size| (0, size)))
+        }
+    }
+    pub(super) static STACK_BOUNDS: StackBounds = StackBounds;
+
+    pub(super) struct ForceUnknown;
+    impl ForceUnknown {
+        pub(super) fn with<R>(&'static self, f: impl FnOnce(&std::cell::Cell<bool>) -> R) -> R {
+            let cell = std::cell::Cell::new(false);
+            let r = f(&cell);
+            turso_stack_guard::test_hooks::force_unknown(cell.get());
+            r
+        }
+    }
+    pub(super) static FORCE_UNKNOWN: ForceUnknown = ForceUnknown;
+
+    pub(super) mod level_cost {
+        use turso_stack_guard::test_hooks;
+
+        pub(crate) fn take_worst() -> usize {
+            test_hooks::arm(true);
+            test_hooks::take_worst()
+        }
+
+        pub(crate) fn take_reentered() -> usize {
+            test_hooks::arm(true);
+            test_hooks::take_reentered()
+        }
+    }
+}
+
+#[cfg(test)]
+mod fastest_wire_tests {
+    use super::fastest_wire_shim::*;
+    use super::*;
+
+    /// Burns 16 KiB of stack per level until a NestGuard refuses; the levels entered.
+    fn nest_until_refused(levels: usize) -> usize {
+        let mut frame = [0u8; 16 << 10];
+        std::hint::black_box(&mut frame);
+        match NestGuard::enter("test") {
+            Ok(_guard) => nest_until_refused(levels + 1),
+            Err(_) => levels,
+        }
+    }
+
+    /// On a thread whose whole stack is under 512 KiB (Apple's GCD and NSThread default is 512 KiB;
+    /// Rust rounds a 512 KiB request up to 524 KiB, so 480 KiB is asked for) a statement's
+    /// outermost step is entered, and nesting is still refused before the stack runs out. The
+    /// fixed 512 KiB margin refused the outermost step itself, so no SELECT could prepare there
+    /// (ultrareview of fastest-wire, finding 3).
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    #[test]
+    fn a_small_thread_enters_its_outermost_step_and_still_refuses_deep_nesting() {
+        std::thread::Builder::new()
+            .stack_size(480 << 10)
+            .spawn(|| {
+                let size = STACK_BOUNDS.with(|b| b.map(|(_, size)| size));
+                assert!(
+                    size.is_some_and(|size| size < STACK_MARGIN),
+                    "premise: a known stack under 512 KiB, got {size:?}"
+                );
+                let outer = NestGuard::enter("outermost");
+                assert!(
+                    outer.is_ok(),
+                    "the outermost step was refused on a {size:?} B thread"
+                );
+                let levels = nest_until_refused(1);
+                assert!(levels >= 2, "only {levels} levels on a {size:?} B thread");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// C32 MED (a Claude review, 2026-10-15): where the stack is unknown, the 64-deep fallback admitted
+    /// about 32 views (two steps each), which overflow a 2 MiB thread in a debug build (Windows'
+    /// spawned-thread default; wasm32 has no guard page). On a 2 MiB thread taken as unknown, nested
+    /// steps of 120 KiB each must be refused before the stack runs out. Overflowing aborts the test
+    /// process: that is the red.
+    #[test]
+    fn an_unknown_stack_refuses_nesting_instead_of_guessing_a_depth() {
+        #[inline(never)]
+        fn nest(levels: usize) -> usize {
+            let mut frame = [0u8; 120 << 10];
+            std::hint::black_box(&mut frame);
+            match NestGuard::enter("nested") {
+                Ok(_guard) => nest(levels + 1),
+                Err(_) => levels,
+            }
+        }
+        std::thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn(|| {
+                FORCE_UNKNOWN.with(|u| u.set(true));
+                assert_eq!(remaining_stack(), None, "premise: the stack is unknown");
+                let outer = NestGuard::enter("outermost");
+                assert!(outer.is_ok(), "the outermost step was refused");
+                let levels = nest(0);
+                assert!(levels * (120 << 10) < (2 << 20), "{levels} nested levels of 120 KiB on a 2 MiB thread");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// A nested step that would leave less than one level's stack is refused on a small thread:
+    /// on a 256 KiB thread a quarter of the stack (64 KiB) is less than one level of the deepest
+    /// phase (a debug view expansion, about 93 KiB), so with the quarter-stack margin alone a
+    /// nested step was admitted with ~100 KiB left and a 120 KiB level then overflowed (fastest-
+    /// engine's review of ed4e4e9a5). Overflowing aborts the test process: that is the red.
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    #[test]
+    fn a_small_thread_refuses_a_nested_step_it_cannot_afford_one_level_for() {
+        #[inline(never)]
+        fn one_level() {
+            let mut frame = [0u8; 120 << 10];
+            std::hint::black_box(&mut frame);
+        }
+        #[inline(never)]
+        fn descend_to(left: usize) -> bool {
+            if remaining_stack().unwrap() > left {
+                let mut frame = [0u8; 1 << 10];
+                std::hint::black_box(&mut frame);
+                return descend_to(left);
+            }
+            match NestGuard::enter("nested") {
+                Ok(_guard) => {
+                    one_level();
+                    true
+                }
+                Err(_) => false,
+            }
+        }
+        std::thread::Builder::new()
+            .stack_size(256 << 10)
+            .spawn(|| {
+                let _outer = NestGuard::enter("outermost").unwrap();
+                assert!(
+                    !descend_to(100 << 10),
+                    "a nested step was admitted with ~100 KiB left"
+                );
+                assert!(
+                    descend_to(200 << 10),
+                    "premise: a nested step with ~200 KiB left runs"
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// The stack between two consecutive nested checks, over views, FROM subqueries, WHERE and
+    /// scalar subqueries and a mix of them, stays under LEVEL_COST (measured in debug on an 8 MiB
+    /// thread: 73,584 B at most). A lower bound on a level's cost: what the innermost level uses
+    /// below its own check is not measured. A WHERE or scalar subquery's emission was not checked, so two
+    /// checks were 481,216 B apart on the mix (fastest-engine, on the NestGuard margin). Not
+    /// covered: the parser, which recurses with no check (debug: 211 KB for a flat SELECT,
+    /// about 180 KB per scalar subquery level), and release frames (no release build here).
+    #[test]
+    fn two_consecutive_nested_checks_are_less_than_one_level_cost_apart() {
+        std::thread::Builder::new()
+            .stack_size(8 << 20)
+            .spawn(|| {
+                let io: std::sync::Arc<dyn crate::IO> = std::sync::Arc::new(crate::MemoryIO::new());
+                let db = crate::Database::open_file(
+                    io,
+                    ":memory:",
+                    std::sync::Arc::new(crate::SqliteDialect),
+                )
+                .unwrap();
+                let conn = db.connect().unwrap();
+                conn.execute("CREATE TABLE t(a INTEGER)").unwrap();
+                conn.execute("INSERT INTO t VALUES (1)").unwrap();
+                conn.execute("CREATE VIEW v0 AS SELECT a FROM t").unwrap();
+                for i in 1..12 {
+                    conn.execute(format!("CREATE VIEW v{i} AS SELECT a FROM v{}", i - 1))
+                        .unwrap();
+                }
+                let mut from = "SELECT a FROM t".to_string();
+                let mut scalar = "SELECT a FROM t".to_string();
+                let mut mixed = "SELECT a FROM v3".to_string();
+                for _ in 0..12 {
+                    from = format!("SELECT a FROM ({from})");
+                    scalar = format!("SELECT a FROM t WHERE a = ({scalar})");
+                    mixed = format!(
+                        "SELECT a FROM ({mixed}) WHERE a IN (SELECT a FROM v2 WHERE a = ({mixed}))"
+                    );
+                }
+                level_cost::take_worst();
+                for sql in ["SELECT a FROM v11".to_string(), from, scalar, mixed] {
+                    conn.prepare(&sql).unwrap().run_collect_rows().unwrap();
+                    let worst = level_cost::take_worst();
+                    assert!(
+                        worst > 0 && worst < LEVEL_COST,
+                        "{worst} B between two checks (LEVEL_COST {LEVEL_COST}): {sql}"
+                    );
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// A statement prepared while another steps on the thread is checked from its outermost step:
+    /// with ~100 KiB left (under LEVEL_COST) it is refused, where a flat statement on a quiet
+    /// thread is not. It was exempt, so a prepare re-entered deep in the stack went unchecked
+    /// (fastest-engine, on the NestGuard margin).
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    #[test]
+    fn a_prepare_reentered_while_a_statement_steps_is_checked_from_its_first_step() {
+        #[inline(never)]
+        fn at(left: usize, executing: bool) -> bool {
+            if remaining_stack().unwrap() > left {
+                let mut frame = [0u8; 1 << 10];
+                std::hint::black_box(&mut frame);
+                return at(left, executing);
+            }
+            let _executing = executing.then(Executing::enter);
+            NestGuard::enter("reentered").is_ok()
+        }
+        std::thread::Builder::new()
+            .stack_size(256 << 10)
+            .spawn(|| {
+                assert!(
+                    at(100 << 10, false),
+                    "premise: a quiet thread's outermost step runs"
+                );
+                assert!(
+                    !at(100 << 10, true),
+                    "a re-entered prepare's first step was exempt"
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// A real re-entry: a CREATE TABLE's schema reparse prepares a statement inside
+    /// `Program::step` (op_parse_schema), and that statement's outermost step is seen as entered
+    /// while a statement steps. Without `Executing` held by `Program::step` it is seen as a quiet
+    /// thread's, exempt (fresh-context review of bace2e9d0: the earlier test held `Executing` by
+    /// hand, so it passed with the line in `step` deleted).
+    #[test]
+    fn a_schema_reparse_inside_a_step_is_a_reentered_prepare() {
+        let io: std::sync::Arc<dyn crate::IO> = std::sync::Arc::new(crate::MemoryIO::new());
+        let db = crate::Database::open_file(io, ":memory:", std::sync::Arc::new(crate::SqliteDialect))
+            .unwrap();
+        let conn = db.connect().unwrap();
+        level_cost::take_reentered();
+        conn.execute("CREATE TABLE r(a INTEGER)").unwrap();
+        assert!(
+            level_cost::take_reentered() > 0,
+            "the schema reparse's prepare was not seen inside a step"
+        );
+        conn.execute("SELECT a FROM r").unwrap();
+        assert_eq!(level_cost::take_reentered(), 0, "a flat SELECT counted as re-entered");
+    }
+
+    /// On an 8 MiB thread the margin is the full STACK_MARGIN, as before.
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    #[test]
+    fn a_large_thread_keeps_the_full_margin() {
+        std::thread::Builder::new()
+            .stack_size(8 << 20)
+            .spawn(|| assert_eq!(margin(), STACK_MARGIN))
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+}

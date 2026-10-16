@@ -1,0 +1,11 @@
+>> Q DROP SCHEMA IF EXISTS s CASCADE; DROP SCHEMA public CASCADE; CREATE SCHEMA public
+   N S=NOTICE C=00000 M=schema "s" does not exist, skipping
+   C DROP SCHEMA
+   C DROP SCHEMA
+   C CREATE SCHEMA
+   Z I
+>> Q SELECT 1 % 0
+   E S=ERROR C=22012 M=division by zero
+   Z I
+postgres (PostgreSQL) 18.6 (Homebrew)
+recorded 2026-10-15T21:01:18Z with pgproto.py scenario-audit3-integer_modulo_by_zero_is_22012.txt against PostgreSQL 18.6 at 127.0.0.1:62816, database audit3 (trust auth); exit 0

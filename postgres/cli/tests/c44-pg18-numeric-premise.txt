@@ -1,0 +1,8 @@
+2026-10-15T22:35:04Z buildslot codex-C44-numeric-fixture acquired slot.2 free=32784MB bar=32768MB held_before=2 mem=73
+postgres (PostgreSQL) 18.6 (Homebrew)
+{"case": "numeric_operand_overflow", "sql": "CREATE TABLE c44_num(x numeric(10,2)); INSERT INTO c44_num VALUES (100); SELECT '1e131072' / x FROM c44_num;", "returncode": 3, "stdout": "", "stderr": "ERROR:  22003: value overflows numeric format\nLINE 1: SELECT '1e131072' / x FROM c44_num;\n               ^\nLOCATION:  numeric_in, numeric.c:795\n"}
+private PostgreSQL stopped 0
+Turso binary sha256 d1ed2ad87281ac8603d96628dd10b626c148f1dcd33fa5a5f8a5ab5217c21061 base ed0fb7b77, test-only tip 71ecd6391
+{"engine": "turso", "case": "numeric_operand_overflow", "sql": "CREATE TABLE c44_num(x numeric(10,2)); INSERT INTO c44_num VALUES (100); SELECT '1e131072' / x FROM c44_num;", "returncode": 3, "stdout": "", "stderr": "ERROR:  23000: value overflows numeric format\n"}
+private Turso stopped -15
+2026-10-15T22:35:14Z buildslot codex-C44-numeric-fixture released slot.2

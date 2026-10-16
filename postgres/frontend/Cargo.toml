@@ -10,10 +10,21 @@ description = "PostgreSQL frontend for Turso"
 [lib]
 path = "lib.rs"
 
+[features]
+# Test failpoints (fail_next_undo): only turso_pg_server's dev-dependency enables it, so never in a
+# credited build.
+failpoints = []
+# The L5 phase table (phase.rs): every phase boundary reads the thread's instruction counter, a system
+# call, so a phase build is a diagnostic and never a verdict or a credited build.
+phase-count = []
+
 [dependencies]
+smallvec = "1.15.1"
+compact_str = "0.8.1"
 chrono = { workspace = true, default-features = false, features = ["clock"] }
 parking_lot = { workspace = true }
 rustc-hash = "2.0"
+stacker = "0.1"
 tempfile = { workspace = true }
 tracing = { workspace = true }
 turso_core = { workspace = true, default-features = true, features = [

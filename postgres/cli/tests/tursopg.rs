@@ -952,38 +952,118 @@ fn copy_from_file_not_found_repl() {
 /// then fails mid-test when the winner tears it down. Instead, ask the kernel
 /// for a free ephemeral port and verify our own child is the process that
 /// came up on it, retrying with a fresh port if the child dies on bind.
-fn start_tursopg_server() -> (Child, u16) {
+/// A started server, killed and reaped when dropped, so a test that panics leaves no server
+/// behind (found 2026-10-16: 28 `tursopg :memory: --server` processes from this file's servers,
+/// re-parented to launchd and running for over a day). BLIND SPOT: a test binary killed by a
+/// signal runs no Drop, and its servers outlive it.
+struct ServerChild(Child);
+
+impl std::ops::Deref for ServerChild {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ServerChild {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.0
+    }
+}
+
+impl Drop for ServerChild {
+    fn drop(&mut self) {
+        self.0.kill().ok();
+        self.0.wait().ok();
+    }
+}
+
+fn start_tursopg_server() -> (ServerChild, u16) {
     for _ in 0..10 {
         let port = TcpListener::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()
             .unwrap()
             .port();
-        let addr = format!("127.0.0.1:{port}");
-        let mut child = Command::new(env!("CARGO_BIN_EXE_tursopg"))
-            .arg(":memory:")
-            .arg("--server")
-            .arg(&addr)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("failed to start tursopg server");
-
-        // Wait for the server to be ready by polling TCP connect, bailing out
-        // to a new port if the child exited (lost a bind race).
-        for _ in 0..50 {
-            if child.try_wait().unwrap().is_some() {
-                break;
-            }
-            if TcpStream::connect(&addr).is_ok() && child.try_wait().unwrap().is_none() {
-                return (child, port);
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
+        if let Some(child) = start_tursopg_server_on(port) {
+            return (ServerChild(child), port);
         }
+    }
+    panic!("tursopg server did not start");
+}
+
+/// One attempt on `port`: the ready child, or None (it exited, or never became ready), reaped.
+/// Ready means the server's own stdout line "PostgreSQL server listening on ADDR", printed after
+/// its bind; a connect probe was answered by any listener on the port. Its stdout and stderr go to
+/// files under WIRE_SERVER_LOG_DIR, or temp/tursopg_cli_server_logs/<pid>/, kept after the test
+/// (the pipes they used were never read, so a chatty server could block on a full one).
+fn start_tursopg_server_on(port: u16) -> Option<Child> {
+    use std::io::BufRead;
+    use std::time::{Duration, Instant};
+    let addr = format!("127.0.0.1:{port}");
+    let logs = std::env::var_os("WIRE_SERVER_LOG_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::temp_dir()
+                .join("tursopg_cli_server_logs")
+                .join(std::process::id().to_string())
+        });
+    std::fs::create_dir_all(&logs).expect("server log dir");
+    let stderr = std::fs::File::create(logs.join(format!("server-{port}.stderr")))
+        .expect("server stderr log");
+    let mut stdout_log = std::fs::File::create(logs.join(format!("server-{port}.stdout")))
+        .expect("server stdout log");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tursopg"))
+        .arg(":memory:")
+        .arg("--server")
+        .arg(&addr)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(stderr))
+        .spawn()
+        .expect("failed to start tursopg server");
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let listening = format!("PostgreSQL server listening on {addr} ");
+    let stdout = child.stdout.take().expect("piped stdout");
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            let _ = writeln!(stdout_log, "{line}");
+            if line.starts_with(&listening) {
+                let _ = ready_tx.send(());
+            }
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        match ready_rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(()) => return Some(child),
+            // The reader ended: stdout closed, so the server is exiting.
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+    }
+    child.kill().ok();
+    child.wait().ok();
+    None
+}
+
+/// The harness takes a server as ready only from the server itself: a listener another process
+/// holds on the port must not pass for it (the startup race; wire_sessions.rs has the twin).
+#[test]
+fn a_foreign_listener_on_the_port_is_not_taken_for_the_server() {
+    let foreign = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = foreign.local_addr().unwrap().port();
+    let child = start_tursopg_server_on(port);
+    let taken = child.is_some();
+    if let Some(mut child) = child {
         child.kill().ok();
         child.wait().ok();
     }
-    panic!("tursopg server did not start");
+    assert!(!taken, "a server that could not bind {port} was taken as ready");
+    drop(foreign);
 }
 
 /// Minimal PG wire protocol client for testing.
@@ -1220,8 +1300,10 @@ fn extract_row_description_oids(data: &[u8]) -> Vec<u32> {
 // PostgreSQL versions, so test expectations stay valid. Only the OIDs the
 // current wire tests assert against are declared; add more here as new
 // tests need them.
+const OID_BOOL: u32 = 16;
 const OID_INT4: u32 = 23;
 const OID_TEXT: u32 = 25;
+const OID_FLOAT4: u32 = 700;
 const OID_FLOAT8: u32 = 701;
 
 /// Extract CommandComplete ('C') tag strings from raw PG wire bytes.
@@ -1422,19 +1504,34 @@ fn wire_bitwise_ops_report_int4() {
     });
 }
 
-/// Comparison and logical ops return INT4 — SQLite returns 0/1 as INTEGER
-/// at runtime; tursopg's wire layer reports INT4 here. A future change
-/// could map these to BOOL OID, but for now stable + assertable.
+/// Comparison and logical operators return bool (16), as PostgreSQL 18.6 announces them
+/// (recorded, artie lanes/wire/raw/loud-20261015/pg18-diff/pg18-types.out). FLAGGED
+/// ORACLE-BACKED SPEC CHANGE (lead ruling, DECISIONS 9d8c1c38ef): this test pinned int4, the
+/// engine's integer 0/1, and was named `..._report_int4`; the logical rows are rewritten with
+/// PostgreSQL-valid boolean operands (PostgreSQL refuses `1 AND 0`). This server's acceptance of
+/// integer operands is pinned by wire_logical_operators_accept_integer_operands.
 #[test]
-fn wire_comparison_and_logical_report_int4() {
+fn wire_comparison_and_logical_report_bool() {
     with_pg_client(|c| {
-        assert_eq!(c.query_column_oids("SELECT 1 = 1"), vec![OID_INT4]);
-        assert_eq!(c.query_column_oids("SELECT 2 < 3"), vec![OID_INT4]);
-        assert_eq!(c.query_column_oids("SELECT 5 > 4"), vec![OID_INT4]);
-        assert_eq!(c.query_column_oids("SELECT 1 AND 0"), vec![OID_INT4]);
-        assert_eq!(c.query_column_oids("SELECT 1 OR 0"), vec![OID_INT4]);
+        assert_eq!(c.query_column_oids("SELECT 1 = 1"), vec![OID_BOOL]);
+        assert_eq!(c.query_column_oids("SELECT 2 < 3"), vec![OID_BOOL]);
+        assert_eq!(c.query_column_oids("SELECT 5 > 4"), vec![OID_BOOL]);
+        assert_eq!(c.query_column_oids("SELECT 1=1 AND 0=1"), vec![OID_BOOL]);
+        assert_eq!(c.query_column_oids("SELECT 1=1 OR 0=1"), vec![OID_BOOL]);
         // Nested: arithmetic feeding a comparison still propagates correctly.
-        assert_eq!(c.query_column_oids("SELECT 42 + 1 = 43"), vec![OID_INT4]);
+        assert_eq!(c.query_column_oids("SELECT 42 + 1 = 43"), vec![OID_BOOL]);
+    });
+}
+
+/// A logical operator over integer operands (`1 AND 0`, `NOT 1`) is accepted here, the engine
+/// reading 0 as false and any other integer as true, and answers bool; PostgreSQL refuses them
+/// (42804, an argument of AND must be boolean). A recorded divergence (COMPAT's boolean row), pinned
+/// so a change to it is seen (lead ruling, DECISIONS 9d8c1c38ef).
+#[test]
+fn wire_logical_operators_accept_integer_operands() {
+    with_pg_client(|c| {
+        assert_eq!(c.query_column_oids("SELECT 1 AND 0"), vec![OID_BOOL]);
+        assert_eq!(c.query_column_oids("SELECT NOT 1"), vec![OID_BOOL]);
     });
 }
 
@@ -1458,7 +1555,9 @@ fn wire_unary_and_parens_propagate() {
         assert_eq!(c.query_column_oids("SELECT -42"), vec![OID_INT4]);
         assert_eq!(c.query_column_oids("SELECT +5"), vec![OID_INT4]);
         assert_eq!(c.query_column_oids("SELECT (1 + 2) * 3"), vec![OID_INT4]);
-        assert_eq!(c.query_column_oids("SELECT NOT 1"), vec![OID_INT4]);
+        // FLAGGED ORACLE-BACKED SPEC CHANGE (DECISIONS 9d8c1c38ef): NOT is bool in PostgreSQL;
+        // the row is rewritten with a boolean operand (`NOT 1` is pinned elsewhere).
+        assert_eq!(c.query_column_oids("SELECT NOT (1=1)"), vec![OID_BOOL]);
     });
 }
 
@@ -1475,9 +1574,11 @@ fn wire_cast_reports_target_type() {
             c.query_column_oids("SELECT CAST(42 AS TEXT)"),
             vec![OID_TEXT]
         );
+        // FLAGGED ORACLE-BACKED SPEC CHANGE (DECISIONS 9d8c1c38ef): PostgreSQL's real is float4
+        // (700, recorded pg18-types.out); this pinned float8.
         assert_eq!(
             c.query_column_oids("SELECT CAST(1 AS REAL)"),
-            vec![OID_FLOAT8]
+            vec![OID_FLOAT4]
         );
     });
 }
@@ -1489,9 +1590,12 @@ fn wire_cast_reports_target_type() {
 fn wire_table_columns_report_declared_type() {
     with_pg_client(|c| {
         c.query_command_tags("CREATE TABLE t(id INTEGER, label TEXT, score REAL)");
+        // FLAGGED ORACLE-BACKED SPEC CHANGE (map_pg_type ruling, 2026-10-15T07:40:59Z): a real
+        // column is float4 (700) in PostgreSQL 18.6 (recorded pg18-types.out); this pinned float8,
+        // when real and double precision were both stored REAL.
         assert_eq!(
             c.query_column_oids("SELECT id, label, score FROM t"),
-            vec![OID_INT4, OID_TEXT, OID_FLOAT8]
+            vec![OID_INT4, OID_TEXT, OID_FLOAT4]
         );
     });
 }

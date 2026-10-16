@@ -1,0 +1,70 @@
+>> Q DROP SCHEMA IF EXISTS s CASCADE; DROP SCHEMA public CASCADE; CREATE SCHEMA public
+   N S=NOTICE C=00000 M=schema "s" does not exist, skipping
+   C DROP SCHEMA
+   N S=NOTICE C=00000 M=drop cascades to table t
+   C DROP SCHEMA
+   C CREATE SCHEMA
+   Z I
+>> Q CREATE TABLE dp(id INT PRIMARY KEY)
+   C CREATE TABLE
+   Z I
+>> Q CREATE TABLE dc1(id INT PRIMARY KEY, pid INT REFERENCES dp(id) DEFERRABLE INITIALLY DEFERRED)
+   C CREATE TABLE
+   Z I
+>> Q CREATE TABLE dc2(id INT PRIMARY KEY, pid INT, FOREIGN KEY (pid) REFERENCES dp(id) DEFERRABLE INITIALLY DEFERRED)
+   C CREATE TABLE
+   Z I
+>> Q BEGIN
+   C BEGIN
+   Z T
+>> Q INSERT INTO dc1 VALUES (1, 99)
+   C INSERT 0 1
+   Z T
+>> Q COMMIT
+   E S=ERROR C=23503 M=insert or update on table "dc1" violates foreign key constraint "dc1_pid_fkey"
+   Z I
+>> Q SELECT count(*) FROM dc1
+   T oids=[20]
+   D ['0']
+   C SELECT 1
+   Z I
+>> Q BEGIN
+   C BEGIN
+   Z T
+>> Q INSERT INTO dc1 VALUES (2, 7)
+   C INSERT 0 1
+   Z T
+>> Q INSERT INTO dp VALUES (7) ON CONFLICT DO NOTHING
+   C INSERT 0 1
+   Z T
+>> Q COMMIT
+   C COMMIT
+   Z I
+>> Q BEGIN
+   C BEGIN
+   Z T
+>> Q INSERT INTO dc2 VALUES (1, 99)
+   C INSERT 0 1
+   Z T
+>> Q COMMIT
+   E S=ERROR C=23503 M=insert or update on table "dc2" violates foreign key constraint "dc2_pid_fkey"
+   Z I
+>> Q SELECT count(*) FROM dc2
+   T oids=[20]
+   D ['0']
+   C SELECT 1
+   Z I
+>> Q BEGIN
+   C BEGIN
+   Z T
+>> Q INSERT INTO dc2 VALUES (2, 7)
+   C INSERT 0 1
+   Z T
+>> Q INSERT INTO dp VALUES (7) ON CONFLICT DO NOTHING
+   C INSERT 0 0
+   Z T
+>> Q COMMIT
+   C COMMIT
+   Z I
+postgres (PostgreSQL) 18.6 (Homebrew)
+recorded 2026-10-15T21:01:13Z with pgproto.py scenario-audit3-a_deferred_foreign_key_is_checked_at_commit.txt against PostgreSQL 18.6 at 127.0.0.1:62816, database audit3 (trust auth); exit 0

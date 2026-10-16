@@ -3704,7 +3704,7 @@ fn test_integrity_check_after_checkpoint_io_yield_then_post_durable_failure_uses
     conn.set_yield_injector(Some(injector.clone()));
     let failure_injector = FixedFailureInjector::new([(
         CheckpointYieldPoint::AfterDurableBoundaryAdvanced.point(),
-        LimboError::TxError("synthetic checkpoint failure after pager commit".to_string()),
+        LimboError::TxError("synthetic checkpoint failure after pager commit".to_string().into()),
     )]);
     conn.set_failure_injector(Some(failure_injector.clone()));
 
@@ -4978,7 +4978,7 @@ fn test_checkpoint_retry_does_not_replay_checkpointed_btree_resident_unique_dele
     let ckpt = db.connect();
     ckpt.set_failure_injector(Some(FixedFailureInjector::new([(
         CheckpointYieldPoint::AfterDurableBoundaryAdvanced.point(),
-        LimboError::TxError("synthetic checkpoint failure after pager commit".to_string()),
+        LimboError::TxError("synthetic checkpoint failure after pager commit".to_string().into()),
     )])));
     let err = ckpt
         .execute("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -5143,7 +5143,7 @@ fn test_checkpoint_stale_boundary_does_not_replay_checkpointed_create_table_afte
 
         conn.set_failure_injector(Some(FixedFailureInjector::new([(
             CheckpointYieldPoint::AfterDurableBoundaryAdvanced.point(),
-            LimboError::TxError("synthetic checkpoint failure after pager commit".to_string()),
+            LimboError::TxError("synthetic checkpoint failure after pager commit".to_string().into()),
         )])));
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             .expect_err("checkpoint should fail after pager commit");
@@ -5182,7 +5182,7 @@ fn test_checkpoint_post_durable_failure_then_unique_update_removes_stale_autoind
         let checkpoint_conn = db.connect();
         let failure_injector = FixedFailureInjector::new([(
             CheckpointYieldPoint::AfterDurableBoundaryAdvanced.point(),
-            LimboError::TxError("synthetic checkpoint failure after pager commit".to_string()),
+            LimboError::TxError("synthetic checkpoint failure after pager commit".to_string().into()),
         )]);
         checkpoint_conn.set_failure_injector(Some(failure_injector));
         checkpoint_conn
@@ -5232,7 +5232,7 @@ fn test_checkpoint_post_durable_failure_then_delete_removes_stale_table_row() {
         let checkpoint_conn = db.connect();
         let failure_injector = FixedFailureInjector::new([(
             CheckpointYieldPoint::AfterDurableBoundaryAdvanced.point(),
-            LimboError::TxError("synthetic checkpoint failure after pager commit".to_string()),
+            LimboError::TxError("synthetic checkpoint failure after pager commit".to_string().into()),
         )]);
         checkpoint_conn.set_failure_injector(Some(failure_injector));
         checkpoint_conn
@@ -12367,7 +12367,7 @@ fn test_checkpoint_post_durable_drop_failure_retry_removes_stale_rootpage_mappin
     db.conn
         .set_failure_injector(Some(FixedFailureInjector::new([(
             CheckpointYieldPoint::AfterDurableBoundaryAdvanced.point(),
-            LimboError::TxError("synthetic checkpoint failure after pager commit".to_string()),
+            LimboError::TxError("synthetic checkpoint failure after pager commit".to_string().into()),
         )])));
     db.conn
         .execute("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -12949,7 +12949,7 @@ fn test_commit_failure_after_remove_tx_does_not_strand_conn_cache() {
         // `TxError` is in the no-rollback list at vdbe/mod.rs:2204, so the abort
         // handler will not rescue stranded state on its own — the only thing
         // keeping the connection coherent here is `finish_committed_tx`.
-        LimboError::TxError("synthetic post-remove_tx failure".to_string()),
+        LimboError::TxError("synthetic post-remove_tx failure".to_string().into()),
     )])));
 
     let commit_err = conn
@@ -17909,7 +17909,7 @@ fn exclusive_commit_failure_at_after_remove_tx_strands_exclusive_atom() {
 
     conn_a.set_failure_injector(Some(FixedFailureInjector::new([(
         CommitYieldPoint::AfterRemoveTx.point(),
-        LimboError::TxError("synthetic AfterRemoveTx failure".to_string()),
+        LimboError::TxError("synthetic AfterRemoveTx failure".to_string().into()),
     )])));
 
     conn_a

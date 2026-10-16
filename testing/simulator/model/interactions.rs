@@ -802,7 +802,7 @@ impl InteractionType {
                     if !is_seq_schema_lag {
                         panic!("Unexpected parse error: {e}");
                     }
-                    return Err(turso_core::LimboError::ParseError(e));
+                    return Err(turso_core::LimboError::ParseError(e.into()));
                 }
                 return Err(err.unwrap());
             }

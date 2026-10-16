@@ -1,3 +1,4 @@
+use crate::error::SqlErrorKind;
 use crate::translate::emitter::Resolver;
 use crate::translate::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 use crate::translate::ProgramBuilder;
@@ -166,7 +167,7 @@ pub fn translate_create_trigger(
         // database ("no such table: main.t1"); temp triggers report the name
         // as the user wrote it.
         if temporary {
-            bail_parse_error!(
+            bail_parse_error!(SqlErrorKind::UndefinedTable;
                 "no such table: {}",
                 crate::util::table_name_for_error(&tbl_name)
             );
@@ -174,7 +175,7 @@ pub fn translate_create_trigger(
         let db_name = resolver
             .get_database_name_by_index(target_table_database_id)
             .unwrap_or_else(|| "main".to_string());
-        bail_parse_error!("no such table: {}.{}", db_name, tbl_name.name.as_str());
+        bail_parse_error!(SqlErrorKind::UndefinedTable; "no such table: {}.{}", db_name, tbl_name.name.as_str());
     };
     if table.virtual_table().is_some() {
         bail_parse_error!("cannot create triggers on virtual tables");
@@ -184,7 +185,7 @@ pub fn translate_create_trigger(
         .as_ref()
         .is_some_and(|t| *t == ast::TriggerTime::InsteadOf)
     {
-        bail_parse_error!("INSTEAD OF triggers are not supported yet");
+        bail_parse_error!(SqlErrorKind::FeatureNotSupported; "INSTEAD OF triggers are not supported yet");
     }
 
     let opts = ProgramBuilderOpts::new(1, 30, 1);

@@ -45,11 +45,12 @@ impl Connection {
         use turso_ext::ExtensionApiRef;
 
         let api = Box::new(unsafe { self._build_turso_ext() });
-        let lib =
-            unsafe { Library::new(path).map_err(|e| LimboError::ExtensionError(e.to_string()))? };
+        let lib = unsafe {
+            Library::new(path).map_err(|e| LimboError::ExtensionError(e.to_string().into()))?
+        };
         let entry: Symbol<ExtensionEntryPoint> = unsafe {
             lib.get(b"register_extension")
-                .map_err(|e| LimboError::ExtensionError(e.to_string()))?
+                .map_err(|e| LimboError::ExtensionError(e.to_string().into()))?
         };
         let api_ptr: *const ExtensionApi = Box::into_raw(api);
         let api_ref = ExtensionApiRef { api: api_ptr };
@@ -59,7 +60,9 @@ impl Connection {
             extensions
                 .lock()
                 .map_err(|_| {
-                    LimboError::ExtensionError("Error locking extension libraries".to_string())
+                    LimboError::ExtensionError(
+                        "Error locking extension libraries".to_string().into(),
+                    )
                 })?
                 .push((Arc::new(lib), api_ref));
             if self.is_db_initialized() {
@@ -71,7 +74,7 @@ impl Connection {
                 let _ = unsafe { Box::from_raw(api_ptr.cast_mut()) };
             }
             Err(LimboError::ExtensionError(
-                "Extension registration failed".to_string(),
+                "Extension registration failed".to_string().into(),
             ))
         }
     }
@@ -140,7 +143,7 @@ pub fn add_builtin_vfs_extensions(
             CString::from_raw(vfsimpl.name as *mut _)
                 .to_str()
                 .map_err(|_| {
-                    LimboError::ExtensionError("unable to register vfs extension".to_string())
+                    LimboError::ExtensionError("unable to register vfs extension".to_string().into())
                 })?
                 .to_string()
         };

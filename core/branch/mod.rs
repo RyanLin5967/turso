@@ -215,7 +215,7 @@ impl Unbranchable {
 
 impl From<Unbranchable> for LimboError {
     fn from(u: Unbranchable) -> Self {
-        LimboError::InvalidArgument(u.explain().to_string())
+        LimboError::InvalidArgument(u.explain().to_string().into())
     }
 }
 
@@ -268,7 +268,10 @@ impl BranchCheckpoint {
     /// The mode an open uses: `asked`, else `R11_CKPT`, else fuzzy (sharp in the splice arm).
     /// `R11_CKPT` names it exactly, "fuzzy" or "sharp"; any other value refuses the open, where it
     /// silently meant fuzzy (review 4 #8).
-    pub(crate) fn resolve(asked: Option<BranchCheckpoint>, splice: bool) -> crate::Result<BranchCheckpoint> {
+    pub(crate) fn resolve(
+        asked: Option<BranchCheckpoint>,
+        splice: bool,
+    ) -> crate::Result<BranchCheckpoint> {
         if let Some(asked) = asked {
             return Ok(asked);
         }
@@ -279,7 +282,7 @@ impl BranchCheckpoint {
             Err(std::env::VarError::NotPresent) => Ok(BranchCheckpoint::Fuzzy),
             other => Err(crate::LimboError::InvalidArgument(format!(
                 "R11_CKPT={other:?}: the branch checkpoint mode is \"fuzzy\" or \"sharp\""
-            ))),
+            ).into())),
         }
     }
 }
@@ -1016,7 +1019,7 @@ impl Connection {
             return Err(LimboError::InvalidArgument(
                 "cannot fork inside a transaction: a branch starts from committed state, so \
                  commit or roll back first"
-                    .to_string(),
+                    .to_string().into(),
             ));
         }
         let pager = self.pager.load().clone();
@@ -1029,7 +1032,7 @@ impl Connection {
                 "cannot fork with attached databases ({}): they are not branched, so the branch \
                  would not hold them; DETACH them first",
                 attached.join(", ")
-            )));
+            ).into()));
         }
         let store = &self.db.branches;
         // fastest-engine item 5: this fork's store-mutex holds, counted from here.

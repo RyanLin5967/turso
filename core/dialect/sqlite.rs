@@ -7,6 +7,7 @@
 //! into every fresh schema by [`crate::schema::Schema::with_options`]
 //! through [`register_builtin_catalog`].
 
+use crate::error::SqlErrorKind;
 use crate::pragma::PragmaVirtualTable;
 use crate::schema::{BTreeTable, Schema, Table};
 use crate::sync::Arc;
@@ -68,7 +69,7 @@ impl super::Dialect for SqliteDialect {
                 body
             )),
             turso_parser::ast::CreateTableBody::AsSelect(_) => {
-                crate::bail_parse_error!("CREATE TABLE AS SELECT is not supported")
+                crate::bail_parse_error!(SqlErrorKind::FeatureNotSupported; "CREATE TABLE AS SELECT is not supported")
             }
         }
     }

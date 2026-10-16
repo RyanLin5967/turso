@@ -1,3 +1,4 @@
+use crate::error::{SqlErrorKind, SqlErrorMessage};
 use crate::{alloc::TryReserveError, turso_assert_eq, turso_assert_greater_than};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
@@ -1547,15 +1548,18 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                     .any(|t| matches!(t.table, crate::schema::Table::RecursiveCteInput(_)));
                 let has_correlated_subquery = subqueries.iter().any(|sq| sq.correlated);
                 let msg = if build_is_outer {
-                    "FULL OUTER JOIN chaining is not yet supported"
+                    "FULL OUTER JOIN chaining is not yet supported".into()
                 } else if has_recursive_input {
-                    "FULL OUTER JOIN with a recursive reference is not yet supported"
+                    "FULL OUTER JOIN with a recursive reference is not yet supported".into()
                 } else if has_correlated_subquery {
-                    "FULL OUTER JOIN is not supported with correlated subqueries that reference the joined tables"
+                    SqlErrorMessage::classified(
+                        SqlErrorKind::FeatureNotSupported,
+                        "FULL OUTER JOIN is not supported with correlated subqueries that reference the joined tables",
+                    )
                 } else {
-                    "FULL OUTER JOIN requires an equality condition in the ON clause"
+                    "FULL OUTER JOIN requires an equality condition in the ON clause".into()
                 };
-                Err(LimboError::ParseError(msg.to_string()))
+                Err(LimboError::ParseError(msg))
             } else {
                 Err(LimboError::PlanningError(
                     "No valid query plan found".to_string(),
