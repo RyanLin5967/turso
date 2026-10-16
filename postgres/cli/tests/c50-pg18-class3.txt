@@ -1,0 +1,88 @@
+\set VERBOSITY verbose
+SELECT version();
+                                                            version                                                            
+-------------------------------------------------------------------------------------------------------------------------------
+ PostgreSQL 18.6 (Homebrew) on aarch64-apple-darwin25.6.0, compiled by Apple clang version 21.0.0 (clang-2100.1.1.101), 64-bit
+(1 row)
+
+CREATE TEMP TABLE c3_int(i integer);
+CREATE TABLE
+INSERT INTO c3_int SELECT x FROM (SELECT 0.5::numeric AS x UNION ALL SELECT 0.5::float8) q RETURNING i;
+ i 
+---
+ 0
+ 0
+(2 rows)
+
+INSERT 0 2
+WITH q AS MATERIALIZED (SELECT 0.5::numeric AS x UNION ALL SELECT 0.5::float8) INSERT INTO c3_int SELECT x FROM q RETURNING i;
+ i 
+---
+ 0
+ 0
+(2 rows)
+
+INSERT 0 2
+CREATE DOMAIN c3_num AS numeric;
+CREATE DOMAIN
+SELECT (1.5::c3_num)::int4;
+ int4 
+------
+    2
+(1 row)
+
+SELECT ('1.5'::numeric(3,1))::int4;
+ int4 
+------
+    2
+(1 row)
+
+SELECT '999.4'::numeric(3);
+ numeric 
+---------
+     999
+(1 row)
+
+SELECT '999.5'::numeric(3);
+psql:/private/tmp/codex-20261015/C50-class3.sql:10: ERROR:  22003: numeric field overflow
+DETAIL:  A field with precision 3, scale 0 must round to an absolute value less than 10^3.
+LOCATION:  apply_typmod, numeric.c:8129
+SELECT ' 1.5 '::numeric::int4;
+ int4 
+------
+    2
+(1 row)
+
+SELECT '3.4e38'::float4*2::float4;
+psql:/private/tmp/codex-20261015/C50-class3.sql:12: ERROR:  22003: value out of range: overflow
+LOCATION:  float_overflow_error, float.c:90
+SELECT '1e-30'::float4*'1e-30'::float4;
+psql:/private/tmp/codex-20261015/C50-class3.sql:13: ERROR:  22003: value out of range: underflow
+LOCATION:  float_underflow_error, float.c:98
+SELECT '1e-300'::float8*'1e-300'::float8;
+psql:/private/tmp/codex-20261015/C50-class3.sql:14: ERROR:  22003: value out of range: underflow
+LOCATION:  float_underflow_error, float.c:98
+CREATE TEMP TABLE c3_serial(s smallserial, b bigserial);
+CREATE TABLE
+INSERT INTO c3_serial(s,b) VALUES (40000,1);
+psql:/private/tmp/codex-20261015/C50-class3.sql:16: ERROR:  22003: smallint out of range
+LOCATION:  i4toi2, int.c:384
+INSERT INTO c3_serial(s,b) VALUES (1,9223372036854775807) RETURNING s,b,pg_typeof(s),pg_typeof(b);
+ s |          b          | pg_typeof | pg_typeof 
+---+---------------------+-----------+-----------
+ 1 | 9223372036854775807 | smallint  | bigint
+(1 row)
+
+INSERT 0 1
+CREATE TEMP TABLE c3_serial2(s serial2, b serial8);
+CREATE TABLE
+INSERT INTO c3_serial2(s,b) VALUES (40000,1);
+psql:/private/tmp/codex-20261015/C50-class3.sql:19: ERROR:  22003: smallint out of range
+LOCATION:  i4toi2, int.c:384
+INSERT INTO c3_serial2(s,b) VALUES (1,9223372036854775807) RETURNING s,b,pg_typeof(s),pg_typeof(b);
+ s |          b          | pg_typeof | pg_typeof 
+---+---------------------+-----------+-----------
+ 1 | 9223372036854775807 | smallint  | bigint
+(1 row)
+
+INSERT 0 1

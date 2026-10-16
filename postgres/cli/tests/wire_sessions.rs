@@ -13806,3 +13806,51 @@ fn c50_class2_lower_integer_boundaries_and_float_casts() {
         ("SELECT '9223372036854775808'::float8::int8","bigint out of range"),
     ] { let e=a.q(sql).err(sql); assert_eq!((e.code.as_str(),e.message.as_str()),("22003",message),"{sql}"); }
 }
+
+// PG18.6 c50-pg18-class3.txt SHA256 e567ee85cf7dd86d2d8e65f2a96cb4d2cd74ab04fdad3de43b9e3c6c710e2bbc.
+#[test]
+fn c50_class3_nested_compounds_use_their_common_source_type() {
+    let dir=Scratch::new("c50-nested-sources"); let server=Server::start(&dir.db(),&[]); let mut a=server.connect();
+    a.q("CREATE TEMP TABLE c3_int(i integer)").ok("table");
+    for sql in [
+        "INSERT INTO c3_int SELECT x FROM (SELECT 0.5::numeric AS x UNION ALL SELECT 0.5::float8) q RETURNING i",
+        "WITH q AS MATERIALIZED (SELECT 0.5::numeric AS x UNION ALL SELECT 0.5::float8) INSERT INTO c3_int SELECT x FROM q RETURNING i",
+    ] { assert_eq!(a.q(sql).ok(sql).rows,vec![vec![Some("0".into())],vec![Some("0".into())]]); }
+}
+
+#[test]
+fn c50_class3_numeric_domains_and_typmods_return_numeric_values() {
+    let dir=Scratch::new("c50-numeric-domain"); let server=Server::start(&dir.db(),&[]); let mut a=server.connect();
+    a.q("CREATE DOMAIN c3_num AS numeric").ok("domain");
+    for (sql,value) in [
+        ("SELECT (1.5::c3_num)::int4","2"),
+        ("SELECT ('1.5'::numeric(3,1))::int4","2"),
+        ("SELECT '999.4'::numeric(3)","999"),
+        ("SELECT ' 1.5 '::numeric::int4","2"),
+    ] { assert_eq!(a.q(sql).single(sql),value); }
+    let e=a.q("SELECT '999.5'::numeric(3)").err("implicit scale zero overflow");
+    assert_eq!((e.code.as_str(),e.message.as_str()),("22003","numeric field overflow"));
+}
+
+#[test]
+fn c50_class3_float_operations_check_overflow_and_underflow() {
+    let dir=Scratch::new("c50-float-ops"); let server=Server::start(&dir.db(),&[]); let mut a=server.connect();
+    for (sql,message) in [
+        ("SELECT '3.4e38'::float4*2::float4","value out of range: overflow"),
+        ("SELECT '1e-30'::float4*'1e-30'::float4","value out of range: underflow"),
+        ("SELECT '1e-300'::float8*'1e-300'::float8","value out of range: underflow"),
+    ] { let e=a.q(sql).err(sql); assert_eq!((e.code.as_str(),e.message.as_str()),("22003",message),"{sql}"); }
+}
+
+#[test]
+fn c50_class3_serial_aliases_retain_integer_widths() {
+    let dir=Scratch::new("c50-serial-widths"); let server=Server::start(&dir.db(),&[]); let mut a=server.connect();
+    for (table,small,big) in [("c3_serial","smallserial","bigserial"),("c3_serial2","serial2","serial8")] {
+        a.q(&format!("CREATE TEMP TABLE {table}(s {small}, b {big})")).ok("table");
+        let e=a.q(&format!("INSERT INTO {table}(s,b) VALUES (40000,1)")).err("smallserial overflow");
+        assert_eq!((e.code.as_str(),e.message.as_str()),("22003","smallint out of range"));
+        let r=a.q(&format!("INSERT INTO {table}(s,b) VALUES (1,9223372036854775807) RETURNING s,b,pg_typeof(s),pg_typeof(b)")).ok("bigserial max");
+        assert_eq!(r.rows,vec![vec![Some("1".into()),Some("9223372036854775807".into()),Some("smallint".into()),Some("bigint".into())]]);
+        assert_eq!(r.oids,Some(vec![21,20,2206,2206]));
+    }
+}
