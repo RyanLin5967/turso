@@ -2373,6 +2373,66 @@ fn the_failure_triggers_fail() {
     assert_eq!(a.q(sql).err(sql).code, "23505");
 }
 
+/// In a failed block Parse refuses any statement but a block exit, 25P02, with no ParseComplete
+/// before it and before anything reads the statement's parameters, as PostgreSQL's
+/// exec_parse_message refuses it ahead of parse analysis (postgres.c:1522-1528 at REL_19_BETA1-820,
+/// read). Parse succeeded for every statement, so CHECKPOINT declared one unspecified parameter
+/// answered 42P18 at Bind ahead of the 25P02 (wire review 17 item 8), and ParseComplete went out
+/// for a statement PostgreSQL never parses. A block exit still parses and ends the block.
+#[test]
+fn a_failed_block_refuses_at_parse() {
+    let dir = Scratch::new("abortedparse");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = seeded(&server);
+    // Parse (with `oids` declared), Bind (no values), Execute, Sync: every message type byte up to
+    // ReadyForQuery, the first error and the status ReadyForQuery carries.
+    fn round(w: &mut Wire, sql: &str, oids: &[u32]) -> (Vec<u8>, Option<WireError>, u8) {
+        let mut parse = vec![0u8];
+        parse.extend_from_slice(sql.as_bytes());
+        parse.push(0);
+        parse.extend_from_slice(&(oids.len() as i16).to_be_bytes());
+        for oid in oids {
+            parse.extend_from_slice(&oid.to_be_bytes());
+        }
+        w.send(b'P', &parse);
+        w.send(b'B', &[0, 0, 0, 0, 0, 0, 0, 0]);
+        w.send(b'E', &[0, 0, 0, 0, 0]);
+        w.send(b'S', &[]);
+        let (mut types, mut error) = (Vec::new(), None);
+        loop {
+            let mut head = [0u8; 5];
+            w.s.read_exact(&mut head).unwrap();
+            let len = i32::from_be_bytes([head[1], head[2], head[3], head[4]]) as usize;
+            let mut body = vec![0u8; len - 4];
+            w.s.read_exact(&mut body).unwrap();
+            types.push(head[0]);
+            if head[0] == b'E' && error.is_none() {
+                error = Some(error_fields(&body));
+            }
+            if head[0] == b'Z' {
+                return (types, error, body[0]);
+            }
+        }
+    }
+    a.q("BEGIN").ok("begin");
+    let fail = "SELECT * FROM nosuch";
+    assert_eq!(a.q(fail).status, b'E', "{fail} did not fail the block");
+    for (sql, oids) in [
+        ("CHECKPOINT", &[0u32][..]),
+        ("SELECT 1", &[0][..]),
+        ("SELECT v FROM t", &[][..]),
+    ] {
+        let (types, error, status) = round(&mut a, sql, oids);
+        assert_eq!(error.map(|e| e.code), Some("25P02".to_string()), "{sql}");
+        assert_eq!(types, vec![b'E', b'Z'], "{sql}: nothing before the refusal");
+        assert_eq!(status, b'E', "{sql}");
+    }
+    let (types, error, status) = round(&mut a, "ROLLBACK", &[]);
+    assert!(error.is_none(), "a block exit parses: {error:?}");
+    assert_eq!(types, vec![b'1', b'2', b'C', b'Z'], "ROLLBACK");
+    assert_eq!(status, b'I', "ROLLBACK ended the block");
+}
+
 /// KNOWN RED (known-red.txt; E5-QUEUE M1): an integer division by zero is 22012 "division by zero"
 /// in PostgreSQL. This engine answers one row holding NULL: core's exec_divide sends an integer /0
 /// to the float path, whose checked division answers None, and the PostgreSQL frontend maps `/` to
