@@ -356,7 +356,7 @@ impl PgNumeric {
     pub fn parse(text: &str) -> Option<crate::Result<Self>> {
         use std::str::FromStr;
         const PG_MAX_EXPONENT: i128 = (i32::MAX / 2) as i128;
-        let trimmed = text.trim();
+        let trimmed = text.trim_matches(|c: char| c.is_ascii_whitespace());
         match trimmed.to_ascii_lowercase().as_str() {
             "nan" => return Some(Ok(Self::NaN)),
             "inf" | "+inf" | "infinity" | "+infinity" => return Some(Ok(Self::Infinity)),
@@ -374,7 +374,7 @@ impl PgNumeric {
                 }
             }
         }
-        BigDecimal::from_str(text).ok().map(Self::new)
+        BigDecimal::from_str(trimmed).ok().map(Self::new)
     }
 
     pub fn from_i64(i: i64) -> Self {

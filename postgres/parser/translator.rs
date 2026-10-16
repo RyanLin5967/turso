@@ -5715,8 +5715,8 @@ pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
     let type_name = match pg_type.to_uppercase().as_str() {
         // Types with Turso custom type equivalents
         "BOOLEAN" | "BOOL" => "boolean".into(),
-        "SMALLINT" | "INT2" => "smallint".into(),
-        "BIGINT" | "INT8" => "bigint".into(),
+        "SMALLINT" | "INT2" | "SMALLSERIAL" | "SERIAL2" => "smallint".into(),
+        "BIGINT" | "INT8" | "BIGSERIAL" | "SERIAL8" => "bigint".into(),
         "UUID" => "uuid".into(),
         "DATE" => "date".into(),
         "TIME" | "TIMETZ" => "time".into(),
@@ -5745,8 +5745,7 @@ pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
         }
 
         // Base types (no Turso custom type needed)
-        "INTEGER" | "INT" | "INT4" | "SERIAL" | "SERIAL4" | "BIGSERIAL" | "SERIAL8"
-        | "SMALLSERIAL" | "SERIAL2" => "INTEGER".into(),
+        "INTEGER" | "INT" | "INT4" | "SERIAL" | "SERIAL4" => "INTEGER".into(),
         // A float keeps its width (both are REAL affinity; core's built-in float4 / float8 types),
         // so a real column reads as float4 and a double precision one as float8.
         "REAL" | "FLOAT4" => "FLOAT4".into(),

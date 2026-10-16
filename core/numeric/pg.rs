@@ -215,6 +215,13 @@ pub fn execute(
     if result.is_infinite() && a.is_finite() && b.is_none_or(f64::is_finite) {
         return Err(range_error("value out of range: overflow"));
     }
+    if result == 0.0
+        && a != 0.0
+        && b.is_some_and(|b| b != 0.0 && b.is_finite())
+        && matches!(op, PgNumericOp::Multiply | PgNumericOp::Divide)
+    {
+        return Err(range_error("value out of range: underflow"));
+    }
     float_value(result, ty, None)
 }
 
