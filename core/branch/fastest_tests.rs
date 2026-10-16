@@ -5459,7 +5459,7 @@ fn a_checkpoint_that_cannot_start_is_not_retried_by_the_next_create() {
         let _first = trunk.fork_branch().unwrap().into_id();
         let _t = Threshold::set(8 << 10);
         db.branch_failpoint(Some(fp));
-        let entered = || super::store::CAPTURE_ENTERED.with(|c| c.get());
+        let entered = || super::store::CAPTURE_ENTERED.load(std::sync::atomic::Ordering::Relaxed);
         let before = entered();
         let t = std::time::Instant::now();
         while entered() == before {
@@ -5490,7 +5490,7 @@ fn a_capture_that_fails_appends_no_checkpoint_marker() {
     seed(&trunk);
     let _first = trunk.fork_branch().unwrap().into_id();
     db.branch_failpoint(Some(BranchFailpoint::CaptureFails));
-    let entered = || super::store::CAPTURE_ENTERED.with(|c| c.get());
+    let entered = || super::store::CAPTURE_ENTERED.load(std::sync::atomic::Ordering::Relaxed);
     let (lsn, before) = (db.branches.log_lsn_for_test(), entered());
     assert!(!db.branch_checkpoint_fuzzy_now().unwrap(), "a checkpoint started through the failpoint");
     assert_eq!(entered(), before + 1, "premise: the capture was entered");
@@ -5521,7 +5521,7 @@ fn a_failed_checkpoint_start_backs_off_for_one_threshold_and_no_longer() {
         seed(&trunk);
         let _first = trunk.fork_branch().unwrap().into_id();
         let _t = Threshold::set(threshold);
-        let entered = || super::store::CAPTURE_ENTERED.with(|c| c.get());
+        let entered = || super::store::CAPTURE_ENTERED.load(std::sync::atomic::Ordering::Relaxed);
         let len = || db.branches.log_len_for_test();
         let fork = || {
             let _ = trunk.fork_branch().unwrap().into_id();
@@ -5582,7 +5582,7 @@ fn a_capture_whose_arena_handle_fails_appends_no_checkpoint_marker() {
     let dir = tempfile::TempDir::new().unwrap();
     let (db, _trunk, _keep) = raised_d0_with_an_unsynced_slot(dir.path());
     db.branch_failpoint(Some(BranchFailpoint::ArenaHandleFails));
-    let entered = || super::store::CAPTURE_ENTERED.with(|c| c.get());
+    let entered = || super::store::CAPTURE_ENTERED.load(std::sync::atomic::Ordering::Relaxed);
     let (lsn, before) = (db.branches.log_lsn_for_test(), entered());
     assert!(db.branch_compact_now().is_err(), "premise: the capture's arena handle failed");
     assert_eq!(entered(), before + 1, "premise: the capture was entered");
@@ -6724,7 +6724,7 @@ fn a_fuzzy_checkpoint_takes_no_arena_handle_of_its_own() {
             r
         });
         wait_hold(&hold, super::store::HOLD_FLIGHT_TAKEN);
-        let handles = || super::store::CAPTURE_ARENA_HANDLES.with(|c| c.get());
+        let handles = || super::store::CAPTURE_ARENA_HANDLES.load(std::sync::atomic::Ordering::Relaxed);
         let before = handles();
         let started = db.branch_checkpoint_fuzzy_now();
         hold.store(0, std::sync::atomic::Ordering::Release);
@@ -7267,7 +7267,7 @@ fn a_retried_checkpoint_does_not_stall_every_operation() {
         let _first = trunk.fork_branch().unwrap().into_id();
         let _t = Threshold::set(8 << 10);
         db.branch_failpoint(Some(fp));
-        let entered = || super::store::CAPTURE_ENTERED.with(|c| c.get());
+        let entered = || super::store::CAPTURE_ENTERED.load(std::sync::atomic::Ordering::Relaxed);
         let failed_at = entered();
         let t = std::time::Instant::now();
         while entered() == failed_at {
@@ -7326,8 +7326,8 @@ fn a_failed_capture_builds_no_row() {
     // FLAGGED instrument change (L2(d) slice 2): a fuzzy capture builds no row since 94b34fa3b;
     // its rows are encoded on the writer's thread (`FROZEN_ROWS_WRITTEN`), so both counters are
     // read: the capture's own (this thread) and the writer's. The claim is unchanged.
-    let rows = || super::store::CAPTURE_ROWS_BUILT.with(|c| c.get()) + super::store::FROZEN_ROWS_WRITTEN.load(std::sync::atomic::Ordering::Relaxed);
-    let entered = || super::store::CAPTURE_ENTERED.with(|c| c.get());
+    let rows = || super::store::CAPTURE_ROWS_BUILT.load(std::sync::atomic::Ordering::Relaxed) + super::store::FROZEN_ROWS_WRITTEN.load(std::sync::atomic::Ordering::Relaxed);
+    let entered = || super::store::CAPTURE_ENTERED.load(std::sync::atomic::Ordering::Relaxed);
     db.branch_failpoint(Some(BranchFailpoint::CaptureFails));
     let (rows0, entered0) = (rows(), entered());
     assert!(!db.branch_checkpoint_fuzzy_now().unwrap(), "premise: the capture failed");

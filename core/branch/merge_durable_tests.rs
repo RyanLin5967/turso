@@ -1592,10 +1592,10 @@ fn start_flight_refuses_a_splice_arm_store() {
     // reached (amendment 8.6).
     let _b = trunk.fork_branch().unwrap().into_id();
     let before = db.branches.fuzzy_refused_splice();
-    let entered = store::CAPTURE_ENTERED.with(|c| c.get());
+    let entered = store::CAPTURE_ENTERED.load(std::sync::atomic::Ordering::Relaxed);
     assert!(!db.branches.start_flight_for_test(), "a flight started on a splice-arm store");
     assert_eq!(db.branches.fuzzy_refused_splice(), before + 1, "G-b did not count its refusal");
-    assert_eq!(store::CAPTURE_ENTERED.with(|c| c.get()), entered, "the capture was entered");
+    assert_eq!(store::CAPTURE_ENTERED.load(std::sync::atomic::Ordering::Relaxed), entered, "the capture was entered");
 }
 
 /// A4.G's G-c: a fuzzy capture of a splice-arm store returns Err (in a release test build too: its

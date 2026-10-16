@@ -3369,7 +3369,7 @@ fn capture_rows(branches: &BranchTable<BranchState>, dirty: &BTreeMap<BranchId, 
         .filter_map(|(id, &what)| branches.get(id).map(|st| (row_of(*id, st), what)))
         .collect();
     #[cfg(test)]
-    CAPTURE_ROWS_BUILT.with(|c| c.set(c.get() + rows.len() as u64));
+    CAPTURE_ROWS_BUILT.fetch_add(rows.len() as u64, Ordering::Relaxed);
     rows
 }
 
@@ -4264,17 +4264,19 @@ fn guard_mutant(which: &str) -> bool {
     !cfg!(debug_assertions) && mutant(&format!("r13_guard_{which}_debug"))
 }
 
+/// Test builds: captures entered, by ANY thread (A4.G's G-b red: a guard that stopped before the
+/// capture leaves it unchanged). FLAGGED instrument change (L2(d) slice 3): these were this
+/// thread's counts; a create's checkpoint is now captured on the checkpoint worker's thread
+/// (`run_owed_start`), so a test that drove it saw none. The tests that read them are serial.
 #[cfg(test)]
-thread_local! {
-    /// A4.G's G-b red: captures entered on this thread (a guard that stopped before the capture
-    /// leaves it unchanged).
-    pub(crate) static CAPTURE_ENTERED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    /// Review 6 #3: captures on this thread that took an arena handle of their own, to sync the
-    /// arena outside the group's flights.
-    pub(crate) static CAPTURE_ARENA_HANDLES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    /// Engine review 8 #2: catalog rows captures on this thread built.
-    pub(crate) static CAPTURE_ROWS_BUILT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
+pub(crate) static CAPTURE_ENTERED: AtomicU64 = AtomicU64::new(0);
+/// Review 6 #3: captures that took an arena handle of their own, to sync the arena outside the
+/// group's flights (any thread, as above).
+#[cfg(test)]
+pub(crate) static CAPTURE_ARENA_HANDLES: AtomicU64 = AtomicU64::new(0);
+/// Engine review 8 #2: catalog rows captures built (any thread, as above).
+#[cfg(test)]
+pub(crate) static CAPTURE_ROWS_BUILT: AtomicU64 = AtomicU64::new(0);
 
 /// Test builds: catalog rows fuzzy checkpoints' writers took from the copy-on-write (L2(d): a fuzzy
 /// capture builds none, `BranchTable::freeze`; its rows are encoded on the writer's thread and by
@@ -10789,7 +10791,7 @@ impl StoreInner {
         flight_in_air: bool,
     ) -> Result<Box<Captured>> {
         #[cfg(test)]
-        CAPTURE_ENTERED.with(|c| c.set(c.get() + 1));
+        CAPTURE_ENTERED.fetch_add(1, Ordering::Relaxed);
         if fuzzy && self.splice && !guard_mutant("c") {
             return Err(LimboError::InvalidArgument(
                 "fuzzy capture refused: splice arm (r13-compose S-12)".to_string(),
@@ -10878,7 +10880,7 @@ impl StoreInner {
         };
         #[cfg(test)]
         if arena_file.is_some() {
-            CAPTURE_ARENA_HANDLES.with(|c| c.set(c.get() + 1));
+            CAPTURE_ARENA_HANDLES.fetch_add(1, Ordering::Relaxed);
         }
         let snapshot = if self.failpoint.take_if(|f| *f == BranchFailpoint::CaptureFails).is_some() {
             Err(LimboError::InternalError("failpoint: the capture's read snapshot failed".to_string()))
