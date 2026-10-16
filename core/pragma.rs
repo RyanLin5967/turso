@@ -1,3 +1,4 @@
+use crate::error::{SqlErrorKind, SqlErrorMessage};
 use crate::sync::Arc;
 use crate::{Connection, LimboError, Statement, StepResult, Value};
 use bitflags::bitflags;
@@ -427,7 +428,7 @@ impl PragmaVirtualTableCursor {
                 self.pragma_name,
                 self.max_arg_count,
                 args.len()
-            )));
+            ).into()));
         }
 
         let to_text = |v: &Value| v.to_text().map(str::to_owned);
@@ -442,9 +443,9 @@ impl PragmaVirtualTableCursor {
 
         if let Some(schema) = schema {
             // Schema-qualified PRAGMA statements are not supported yet
-            return Err(LimboError::ParseError(format!(
+            return Err(LimboError::ParseError(SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, format!(
                 "Schema argument is not supported yet (got schema: '{schema}')"
-            )));
+            ))));
         }
 
         let mut sql = format!("PRAGMA {}", self.pragma_name);

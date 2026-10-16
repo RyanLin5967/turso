@@ -92,7 +92,7 @@ impl VirtualTable {
         } else {
             return Err(LimboError::ParseError(format!(
                 "No such table-valued function: {name}"
-            )));
+            ).into()));
         };
 
         let vtab = VirtualTable {
@@ -133,14 +133,18 @@ impl VirtualTable {
         if let ast::Cmd::Stmt(ast::Stmt::CreateTable { body, .. }) =
             parser.next_cmd()?.ok_or_else(|| {
                 LimboError::ParseError(
-                    "Failed to parse schema from virtual table module".to_string(),
+                    "Failed to parse schema from virtual table module"
+                        .to_string()
+                        .into(),
                 )
             })?
         {
             columns_from_create_table_body(&body)
         } else {
             Err(LimboError::ParseError(
-                "Failed to parse schema from virtual table module".to_string(),
+                "Failed to parse schema from virtual table module"
+                    .to_string()
+                    .into(),
             ))
         }
     }
@@ -190,11 +194,11 @@ impl VirtualTable {
     pub(crate) fn begin(&self) -> crate::Result<()> {
         match &self.vtab_type {
             VirtualTableType::Pragma(_) => Err(LimboError::ExtensionError(
-                "Pragma virtual tables do not support transactions".to_string(),
+                "Pragma virtual tables do not support transactions".to_string().into(),
             )),
             VirtualTableType::External(table) => table.begin(),
             VirtualTableType::Internal(_) => Err(LimboError::ExtensionError(
-                "Internal virtual tables currently do not support transactions".to_string(),
+                "Internal virtual tables currently do not support transactions".to_string().into(),
             )),
         }
     }
@@ -202,11 +206,11 @@ impl VirtualTable {
     pub(crate) fn commit(&self) -> crate::Result<()> {
         match &self.vtab_type {
             VirtualTableType::Pragma(_) => Err(LimboError::ExtensionError(
-                "Pragma virtual tables do not support transactions".to_string(),
+                "Pragma virtual tables do not support transactions".to_string().into(),
             )),
             VirtualTableType::External(table) => table.commit(),
             VirtualTableType::Internal(_) => Err(LimboError::ExtensionError(
-                "Internal virtual tables currently do not support transactions".to_string(),
+                "Internal virtual tables currently do not support transactions".to_string().into(),
             )),
         }
     }
@@ -214,11 +218,11 @@ impl VirtualTable {
     pub(crate) fn rollback(&self) -> crate::Result<()> {
         match &self.vtab_type {
             VirtualTableType::Pragma(_) => Err(LimboError::ExtensionError(
-                "Pragma virtual tables do not support transactions".to_string(),
+                "Pragma virtual tables do not support transactions".to_string().into(),
             )),
             VirtualTableType::External(table) => table.rollback(),
             VirtualTableType::Internal(_) => Err(LimboError::ExtensionError(
-                "Internal virtual tables currently do not support transactions".to_string(),
+                "Internal virtual tables currently do not support transactions".to_string().into(),
             )),
         }
     }
@@ -226,11 +230,11 @@ impl VirtualTable {
     pub(crate) fn rename(&self, new_name: &str) -> crate::Result<()> {
         match &self.vtab_type {
             VirtualTableType::Pragma(_) => Err(LimboError::ExtensionError(
-                "Pragma virtual tables do not support renaming".to_string(),
+                "Pragma virtual tables do not support renaming".to_string().into(),
             )),
             VirtualTableType::External(table) => table.rename(new_name),
             VirtualTableType::Internal(_) => Err(LimboError::ExtensionError(
-                "Internal virtual tables currently do not support renaming".to_string(),
+                "Internal virtual tables currently do not support renaming".to_string().into(),
             )),
         }
     }
@@ -374,7 +378,9 @@ impl ExtVirtualTable {
         kind: VTabKind,
     ) -> crate::Result<(Self, String)> {
         let module = module.ok_or_else(|| {
-            LimboError::ExtensionError(format!("Virtual table module not found: {module_name}"))
+            LimboError::ExtensionError(
+                format!("Virtual table module not found: {module_name}").into(),
+            )
         })?;
         if kind != module.module_kind {
             let expected = match kind {
@@ -383,7 +389,7 @@ impl ExtVirtualTable {
             };
             return Err(LimboError::ExtensionError(format!(
                 "{module_name} is not a {expected} module"
-            )));
+            ).into()));
         }
         let (schema, table_ptr) = module.implementation.create(args)?;
         let vtab = ExtVirtualTable {
@@ -412,7 +418,7 @@ impl ExtVirtualTable {
                 ext_conn_ptr.as_ptr(),
             ) as *mut c_void
         }) else {
-            return Err(LimboError::ExtensionError("Open returned null".to_string()));
+            return Err(LimboError::ExtensionError("Open returned null".to_string().into()));
         };
         ExtVirtualTableCursor::new(cursor, ext_conn_ptr, self.implementation.clone(), id)
     }
@@ -437,7 +443,7 @@ impl ExtVirtualTable {
         match rc {
             ResultCode::OK => Ok(None),
             ResultCode::RowID => Ok(Some(newrowid)),
-            _ => Err(LimboError::ExtensionError(rc.to_string())),
+            _ => Err(LimboError::ExtensionError(rc.to_string().into())),
         }
     }
 
@@ -447,7 +453,7 @@ impl ExtVirtualTable {
         };
         match rc {
             ResultCode::OK => Ok(()),
-            _ => Err(LimboError::ExtensionError(rc.to_string())),
+            _ => Err(LimboError::ExtensionError(rc.to_string().into())),
         }
     }
 
@@ -455,7 +461,7 @@ impl ExtVirtualTable {
         let rc = unsafe { (self.implementation.commit)(self.table_ptr.load(Ordering::SeqCst)) };
         match rc {
             ResultCode::OK => Ok(()),
-            _ => Err(LimboError::ExtensionError("Commit failed".to_string())),
+            _ => Err(LimboError::ExtensionError("Commit failed".to_string().into())),
         }
     }
 
@@ -463,7 +469,7 @@ impl ExtVirtualTable {
         let rc = unsafe { (self.implementation.begin)(self.table_ptr.load(Ordering::SeqCst)) };
         match rc {
             ResultCode::OK => Ok(()),
-            _ => Err(LimboError::ExtensionError("Begin failed".to_string())),
+            _ => Err(LimboError::ExtensionError("Begin failed".to_string().into())),
         }
     }
 
@@ -471,7 +477,7 @@ impl ExtVirtualTable {
         let rc = unsafe { (self.implementation.rollback)(self.table_ptr.load(Ordering::SeqCst)) };
         match rc {
             ResultCode::OK => Ok(()),
-            _ => Err(LimboError::ExtensionError("Rollback failed".to_string())),
+            _ => Err(LimboError::ExtensionError("Rollback failed".to_string().into())),
         }
     }
 
@@ -482,7 +488,7 @@ impl ExtVirtualTable {
         };
         match rc {
             ResultCode::OK => Ok(()),
-            _ => Err(LimboError::ExtensionError("Rename failed".to_string())),
+            _ => Err(LimboError::ExtensionError("Rename failed".to_string().into())),
         }
     }
 }
@@ -558,7 +564,7 @@ impl ExtVirtualTableCursor {
         match rc {
             ResultCode::OK => Ok(true),
             ResultCode::EOF => Ok(false),
-            _ => Err(LimboError::ExtensionError(rc.to_string())),
+            _ => Err(LimboError::ExtensionError(rc.to_string().into())),
         }
     }
 
@@ -572,7 +578,7 @@ impl ExtVirtualTableCursor {
         match rc {
             ResultCode::OK => Ok(true),
             ResultCode::EOF => Ok(false),
-            _ => Err(LimboError::ExtensionError("Next failed".to_string())),
+            _ => Err(LimboError::ExtensionError("Next failed".to_string().into())),
         }
     }
 }

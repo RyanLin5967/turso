@@ -267,7 +267,7 @@ impl<'a> QueryRunner<'a> {
                 "",
                 Some(LimboError::ParseError(format!(
                     "invalid UTF-8 in SQL input: {err}"
-                ))),
+                ).into())),
             ),
         };
         Self {

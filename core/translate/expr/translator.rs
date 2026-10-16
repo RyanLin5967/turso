@@ -1,3 +1,4 @@
+use crate::error::SqlErrorKind;
 use super::*;
 
 /// Reason why [translate_expr_no_constant_opt()] was called.
@@ -668,7 +669,7 @@ pub fn translate_expr(
             crate::bail_parse_error!("DoublyQualified should have been rewritten in optimizer")
         }
         ast::Expr::Exists(_) => {
-            crate::bail_parse_error!("EXISTS is not supported in this position")
+            crate::bail_parse_error!(SqlErrorKind::FeatureNotSupported; "EXISTS is not supported in this position")
         }
         ast::Expr::FunctionCall {
             name,
@@ -682,7 +683,7 @@ pub fn translate_expr(
             let func_type = resolver.resolve_function(name.as_str(), args_count)?;
 
             if func_type.is_none() {
-                crate::bail_parse_error!("no such function: {}", name.as_str());
+                crate::bail_parse_error!(SqlErrorKind::UndefinedFunction; "no such function: {}", name.as_str());
             }
 
             let func_ctx = FuncCtx {
@@ -1907,7 +1908,7 @@ pub fn translate_expr(
                             // INSERT/UPDATE/UPSERT before translating the value.
                             let Some(ref union_td) = program.target_union_type else {
                                 return Err(crate::LimboError::ParseError(
-                                    "union_value() can only be used in INSERT/UPDATE targeting a union-typed column".to_string()
+                                    "union_value() can only be used in INSERT/UPDATE targeting a union-typed column".to_string().into()
                                 ));
                             };
                             let Some((tag_index, variant)) = union_td.find_union_variant(&tag_name)
@@ -1915,7 +1916,7 @@ pub fn translate_expr(
                                 return Err(crate::LimboError::ParseError(format!(
                                     "unknown variant '{}' in union type '{}'",
                                     tag_name, union_td.name
-                                )));
+                                ).into()));
                             };
                             // If the variant's type is itself a union, set
                             // target_union_type so nested union_value() resolves
@@ -1970,7 +1971,7 @@ pub fn translate_expr(
                                 .ok_or_else(|| {
                                     crate::LimboError::ParseError(format!(
                                         "cannot resolve union variant '{tag_name}' for union_extract"
-                                    ))
+                                    ).into())
                                 })?;
                             translate_fixed_insn!(program, referenced_tables, resolver, args, target_register,
                                 [src_reg <- 0],
@@ -1987,7 +1988,7 @@ pub fn translate_expr(
                                 .ok_or_else(|| {
                                     crate::LimboError::ParseError(format!(
                                         "cannot resolve struct field '{field_name}' for struct_extract"
-                                    ))
+                                    ).into())
                                 })?;
                             translate_fixed_insn!(program, referenced_tables, resolver, args, target_register,
                                 [src_reg <- 0],
@@ -2105,7 +2106,7 @@ pub fn translate_expr(
             let func_type = resolver.resolve_function(name.as_str(), args_count)?;
 
             if func_type.is_none() {
-                crate::bail_parse_error!("no such function: {}", name.as_str());
+                crate::bail_parse_error!(SqlErrorKind::UndefinedFunction; "no such function: {}", name.as_str());
             }
 
             let func = func_type.unwrap();
@@ -2133,7 +2134,7 @@ pub fn translate_expr(
                         LimboError::ParseError(format!(
                             "{}(*) requires a FROM clause",
                             name.as_str()
-                        ))
+                        ).into())
                     })?;
 
                     // Verify there's at least one table to expand
@@ -2141,7 +2142,7 @@ pub fn translate_expr(
                         return Err(LimboError::ParseError(format!(
                             "{}(*) requires a FROM clause",
                             name.as_str()
-                        )));
+                        ).into()));
                     }
 
                     // Build arguments: alternating column_name (as string literal), column_value (as column reference)
@@ -2229,7 +2230,7 @@ pub fn translate_expr(
                 return Ok(target_register);
             }
             if !resolver.dqs_dml.is_enabled() {
-                crate::bail_parse_error!("no such column: {}", id.as_str());
+                crate::bail_parse_error!(SqlErrorKind::UndefinedColumn; "no such column: {}", id.as_str());
             }
             // DQS enabled: treat double-quoted identifiers as string literals (SQLite compatibility)
             program.emit_insn(Insn::String8 {
@@ -2705,10 +2706,10 @@ pub fn translate_expr(
                 .find_table_by_internal_id(*table_ref_id)
                 .expect("table reference should be found");
             let Table::BTree(btree) = table else {
-                crate::bail_parse_error!("no such column: rowid");
+                crate::bail_parse_error!(SqlErrorKind::UndefinedColumn; "no such column: rowid");
             };
             if !btree.has_rowid {
-                crate::bail_parse_error!("no such column: rowid");
+                crate::bail_parse_error!(SqlErrorKind::UndefinedColumn; "no such column: rowid");
             }
 
             if is_from_outer_query_scope {
@@ -2826,10 +2827,10 @@ pub fn translate_expr(
             Ok(result_reg)
         }
         ast::Expr::InSelect { .. } => {
-            crate::bail_parse_error!("IN (...subquery) is not supported in this position")
+            crate::bail_parse_error!(SqlErrorKind::FeatureNotSupported; "IN (...subquery) is not supported in this position")
         }
         ast::Expr::InTable { .. } => {
-            crate::bail_parse_error!("Table expression is not supported in this position")
+            crate::bail_parse_error!(SqlErrorKind::FeatureNotSupported; "Table expression is not supported in this position")
         }
         ast::Expr::IsNull(expr) => {
             let reg = program.alloc_register();
@@ -2867,7 +2868,7 @@ pub fn translate_expr(
         }
         ast::Expr::Literal(lit) => emit_literal(program, lit, target_register),
         ast::Expr::Name(_) => {
-            crate::bail_parse_error!("ast::Expr::Name is not supported in this position")
+            crate::bail_parse_error!(SqlErrorKind::FeatureNotSupported; "ast::Expr::Name is not supported in this position")
         }
         ast::Expr::NotNull(expr) => {
             let reg = program.alloc_register();
@@ -3042,7 +3043,7 @@ pub fn translate_expr(
             Ok(target_register)
         }
         ast::Expr::Subquery(_) => {
-            crate::bail_parse_error!("Subquery is not supported in this position")
+            crate::bail_parse_error!(SqlErrorKind::FeatureNotSupported; "Subquery is not supported in this position")
         }
         ast::Expr::Unary(op, expr) => match (op, expr.as_ref()) {
             (UnaryOperator::Positive, expr) => {

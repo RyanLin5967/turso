@@ -267,7 +267,7 @@ impl InternalVirtualTableCursor for JsonEachCursor {
                 {
                     return Err(LimboError::InvalidArgument(
                         "Json paths with negative indices in json_tree are not supported yet"
-                            .to_owned(),
+                            .to_owned().into(),
                     ));
                 }
             }
@@ -281,7 +281,7 @@ impl InternalVirtualTableCursor for JsonEachCursor {
         } else {
             let Value::Text(path) = &args[1] else {
                 return Err(LimboError::InvalidArgument(
-                    "root path should be text".to_owned(),
+                    "root path should be text".to_owned().into(),
                 ));
             };
             let root_json = if let Some(json) = navigate_to_path(&mut jsonb, &args[1])? {
@@ -492,7 +492,7 @@ fn json_iterator_from(json: &Jsonb) -> crate::Result<IteratorState> {
 }
 fn navigate_to_path(jsonb: &mut Jsonb, path: &Value) -> Result<Option<Jsonb>, LimboError> {
     let json_path = json_path_from_db_value(path, true)?.ok_or_else(|| {
-        LimboError::InvalidArgument(format!("path '{path}' is not a valid json path"))
+        LimboError::InvalidArgument(format!("path '{path}' is not a valid json path").into())
     })?;
     let mut search_operation = SearchOperation::new(jsonb.len() / 2)?;
     if jsonb
@@ -610,7 +610,7 @@ mod columns {
                     let unquoted = s
                         .strip_prefix('"')
                         .and_then(|s| s.strip_suffix('"'))
-                        .ok_or_else(|| LimboError::ParseError("malformed JSON".to_string()))?;
+                        .ok_or_else(|| LimboError::ParseError("malformed JSON".to_string().into()))?;
                     Ok(Value::Text(Text::new(unquoted.to_string())))
                 }
                 jsonb::ElementType::ARRAY => Ok(Value::Null),
@@ -713,7 +713,7 @@ impl InPlaceJsonPath {
         let inner = key
             .strip_prefix('"')
             .and_then(|s| s.strip_suffix('"'))
-            .ok_or_else(|| crate::LimboError::ParseError("malformed JSON".to_string()))?;
+            .ok_or_else(|| crate::LimboError::ParseError("malformed JSON".to_string().into()))?;
 
         let unquoted_if_necessary = if inner
             .chars()

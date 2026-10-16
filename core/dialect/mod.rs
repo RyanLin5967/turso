@@ -12,6 +12,7 @@
 
 pub mod sqlite;
 
+use crate::error::{SqlErrorKind, SqlErrorMessage};
 pub use sqlite::SqliteDialect;
 
 /// SQL dialect layered on top of the engine.
@@ -155,8 +156,11 @@ pub trait Dialect: Send + Sync + 'static {
         name: &str,
         _args: &[crate::Value],
     ) -> crate::Result<crate::Value> {
-        Err(crate::LimboError::ParseError(format!(
+        Err(crate::LimboError::ParseError(SqlErrorMessage::classified(
+            SqlErrorKind::UndefinedFunction,
+            format!(
             "no such function: {name}"
+        ),
         )))
     }
 
@@ -269,7 +273,7 @@ mod tests {
             assert_eq!(name, "test_add_one");
             let crate::Value::Numeric(crate::numeric::Numeric::Integer(v)) = args[0] else {
                 return Err(crate::LimboError::InvalidArgument(
-                    "test_add_one expects an integer".to_string(),
+                    "test_add_one expects an integer".to_string().into(),
                 ));
             };
             Ok(crate::Value::Numeric(crate::numeric::Numeric::Integer(

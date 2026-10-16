@@ -1,3 +1,4 @@
+use turso_parser::sql_error::{SqlErrorKind, SqlErrorMessage};
 use crate::functions::validate_pg_input;
 use parking_lot::RwLock;
 use rustc_hash::FxHashMap as HashMap;
@@ -85,7 +86,7 @@ impl Dialect for PostgresDialect {
                 Ok(table)
             }
             _ => Err(LimboError::ParseError(
-                "expected CREATE TABLE statement".to_string(),
+                "expected CREATE TABLE statement".to_string().into(),
             )),
         }
     }
@@ -109,7 +110,7 @@ impl Dialect for PostgresDialect {
         match stmt {
             stmt @ turso_parser::ast::Stmt::CreateTable { .. } => Ok(stmt),
             _ => Err(LimboError::ParseError(
-                "expected CREATE TABLE statement".to_string(),
+                "expected CREATE TABLE statement".to_string().into(),
             )),
         }
     }
@@ -225,7 +226,7 @@ impl Dialect for PostgresDialect {
         for (what, v) in present.zip(args) {
             // An integer is finite; only a float can be an infinity (the engine has no NaN).
             if !v.to_float_or_zero().is_finite() {
-                return Err(LimboError::ExtensionError(format!("{what} cannot be infinity")));
+                return Err(LimboError::ExtensionError(SqlErrorMessage::classified(SqlErrorKind::InvalidParameterValue, format!("{what} cannot be infinity"))));
             }
         }
         Ok(())
@@ -235,9 +236,9 @@ impl Dialect for PostgresDialect {
         match text.trim().to_ascii_lowercase().as_str() {
             "infinity" | "+infinity" | "inf" | "+inf" => Some(Ok(f64::INFINITY)),
             "-infinity" | "-inf" => Some(Ok(f64::NEG_INFINITY)),
-            "nan" | "+nan" | "-nan" => Some(Err(LimboError::ParseError(format!(
+            "nan" | "+nan" | "-nan" => Some(Err(LimboError::ParseError(SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, format!(
                 "NaN is not supported by this engine: {text:?}"
-            )))),
+            ))))),
             _ => None,
         }
     }

@@ -261,10 +261,10 @@ impl CApiPageCodec {
 
     fn callback_error(error: *const std::ffi::c_char, operation: &str) -> LimboError {
         if error.is_null() {
-            return LimboError::InvalidArgument(format!("page codec {operation} failed"));
+            return LimboError::InvalidArgument(format!("page codec {operation} failed").into());
         }
         let message = unsafe { CStr::from_ptr(error) }.to_string_lossy();
-        LimboError::InvalidArgument(format!("page codec {operation} failed: {message}"))
+        LimboError::InvalidArgument(format!("page codec {operation} failed: {message}").into())
     }
 
     fn location_to_c(location: PageLocation) -> c::turso_codec_location_t {
@@ -285,7 +285,7 @@ impl CApiPageCodec {
         let Some(callback) = callback else {
             return Err(LimboError::InvalidArgument(format!(
                 "page codec {operation} callback is not configured"
-            )));
+            ).into()));
         };
         let mut error = std::ptr::null();
         let status = unsafe {
@@ -728,9 +728,8 @@ pub fn c_string_to_str(ptr: *const std::ffi::c_char) -> std::ffi::CString {
 impl From<LimboError> for TursoError {
     fn from(value: LimboError) -> Self {
         match value {
-            LimboError::ForeignKeyConstraint(e) | LimboError::Constraint(e) => {
-                TursoError::Constraint(e)
-            }
+            LimboError::ForeignKeyConstraint(e) => TursoError::Constraint(e),
+            LimboError::Constraint(e) => TursoError::Constraint(e.into_string()),
             LimboError::Corrupt(e) => TursoError::Corrupt(e),
             LimboError::NotADB => TursoError::NotAdb("file is not a database".to_string()),
             LimboError::DatabaseFull(e) => TursoError::DatabaseFull(e),

@@ -1,3 +1,4 @@
+use crate::error::SqlErrorKind;
 use crate::alloc::TursoIteratorExt;
 use crate::numeric::StrToF64;
 use crate::schema::ColDef;
@@ -377,7 +378,7 @@ pub fn module_name_from_sql(sql: &str) -> Result<&str> {
         Ok(sql[start..end].trim())
     } else {
         Err(LimboError::InvalidArgument(
-            "Expected 'USING' in module name".to_string(),
+            "Expected 'USING' in module name".to_string().into(),
         ))
     }
 }
@@ -389,10 +390,10 @@ pub fn module_args_from_sql(sql: &str) -> Result<Vec<turso_ext::Value>> {
         return Ok(vec![]);
     }
     let start = sql.find('(').ok_or_else(|| {
-        LimboError::InvalidArgument("Expected '(' in module argument list".to_string())
+        LimboError::InvalidArgument("Expected '(' in module argument list".to_string().into())
     })? + 1;
     let end = sql.rfind(')').ok_or_else(|| {
-        LimboError::InvalidArgument("Expected ')' in module argument list".to_string())
+        LimboError::InvalidArgument("Expected ')' in module argument list".to_string().into())
     })?;
 
     let mut args = Vec::new();
@@ -421,7 +422,7 @@ pub fn module_args_from_sql(sql: &str) -> Result<Vec<turso_ext::Value>> {
                                 chars.next();
                             } else {
                                 return Err(LimboError::InvalidArgument(
-                                    "Unexpected characters after quoted argument".to_string(),
+                                    "Unexpected characters after quoted argument".to_string().into(),
                                 ));
                             }
                         }
@@ -452,7 +453,7 @@ pub fn module_args_from_sql(sql: &str) -> Result<Vec<turso_ext::Value>> {
 
     if in_quotes {
         return Err(LimboError::InvalidArgument(
-            "Unterminated string literal in module arguments".to_string(),
+            "Unterminated string literal in module arguments".to_string().into(),
         ));
     }
 
@@ -1009,7 +1010,7 @@ pub fn columns_from_create_table_body(
 ) -> crate::Result<Vec<Column>> {
     let CreateTableBody::ColumnsAndConstraints { columns, .. } = body else {
         return Err(crate::LimboError::ParseError(
-            "CREATE TABLE body must contain columns and constraints".to_string(),
+            "CREATE TABLE body must contain columns and constraints".to_string().into(),
         ));
     };
 
@@ -1077,9 +1078,9 @@ impl OpenMode {
             b"rw" => Ok(OpenMode::ReadWrite),
             b"memory" => Ok(OpenMode::Memory),
             b"rwc" => Ok(OpenMode::ReadWriteCreate),
-            _ => Err(LimboError::InvalidArgument(format!(
-                "Invalid mode: '{s}'. Expected one of 'ro', 'rw', 'memory', 'rwc'"
-            ))),
+            _ => Err(LimboError::InvalidArgument(
+                format!("Invalid mode: '{s}'. Expected one of 'ro', 'rw', 'memory', 'rwc'").into()
+            )),
         })
     }
 }
@@ -1140,7 +1141,7 @@ impl<'a> OpenOptions<'a> {
             if !(authority.is_empty() || authority == "localhost") {
                 return Err(LimboError::InvalidArgument(format!(
                     "Invalid authority '{authority}'. Only '' or 'localhost' allowed."
-                )));
+                ).into()));
             }
             opts.authority = if authority.is_empty() {
                 None
@@ -1167,7 +1168,7 @@ impl<'a> OpenOptions<'a> {
         // Only use modeof if we're in a mode that can create files
         if self.mode != OpenMode::ReadWriteCreate && self.modeof.is_some() {
             return Err(LimboError::InvalidArgument(
-                "modeof is not applicable without mode=rwc".to_string(),
+                "modeof is not applicable without mode=rwc".to_string().into(),
             ));
         }
         // If modeof is not applicable or file doesn't exist, use default flags
@@ -1458,7 +1459,7 @@ pub fn parse_numeric_literal(text: &str) -> Result<Value> {
             // prepare time with "hex literal too big"; do the same.
             return Err(LimboError::ParseError(format!(
                 "hex literal too big: {text}"
-            )));
+            ).into()));
         }
         return Ok(Value::from_i64(-value));
     }
@@ -1472,7 +1473,7 @@ pub fn parse_numeric_literal(text: &str) -> Result<Value> {
     else {
         return Err(LimboError::ParseError(format!(
             "malformed numeric literal: {text}"
-        )));
+        ).into()));
     };
     Ok(Value::Numeric(crate::numeric::Numeric::Float(float)))
 }
@@ -1484,9 +1485,9 @@ fn parse_hex_literal(text: &str, digits: &str) -> Result<i64> {
         .map(|v| v as i64)
         .map_err(|e| match e.kind() {
             std::num::IntErrorKind::PosOverflow => {
-                LimboError::ParseError(format!("hex literal too big: {text}"))
+                LimboError::ParseError(format!("hex literal too big: {text}").into())
             }
-            _ => LimboError::ParseError(format!("malformed numeric literal: {text}")),
+            _ => LimboError::ParseError(format!("malformed numeric literal: {text}").into()),
         })
 }
 
@@ -1502,11 +1503,11 @@ pub fn parse_signed_number(expr: &Expr) -> Result<Value> {
                 parse_numeric_literal(num)
             }
             _ => Err(LimboError::InvalidArgument(
-                "signed-number must follow the format: ([+|-] numeric-literal)".to_string(),
+                "signed-number must follow the format: ([+|-] numeric-literal)".to_string().into(),
             )),
         },
         _ => Err(LimboError::InvalidArgument(
-            "signed-number must follow the format: ([+|-] numeric-literal)".to_string(),
+            "signed-number must follow the format: ([+|-] numeric-literal)".to_string().into(),
         )),
     }
 }
@@ -1516,7 +1517,7 @@ pub fn parse_string(expr: &Expr) -> Result<String> {
         Expr::Name(name) if name.quoted_with('\'') => Ok(name.as_str().to_string()),
         _ => Err(LimboError::InvalidArgument(format!(
             "string parameter expected, got {expr:?} instead"
-        ))),
+        ).into())),
     }
 }
 
@@ -1539,7 +1540,7 @@ pub fn parse_pragma_bool(expr: &Expr) -> Result<bool> {
     }
     Err(LimboError::InvalidArgument(
         "boolean pragma value must be either 0|1 integer or yes|true|on|no|false|off token"
-            .to_string(),
+            .to_string().into(),
     ))
 }
 
@@ -1844,7 +1845,7 @@ fn reject_cross_db_qualified_name(
         if is_cross_db {
             return Err(crate::LimboError::ParseError(format!(
                 "view cannot reference table in attached database: {qualified_name}"
-            )));
+            ).into()));
         }
     }
     Ok(())
@@ -1872,7 +1873,7 @@ pub fn validate_select_for_unsupported_features(select_stmt: &ast::Select) -> Re
     walk_select_expressions(select_stmt, &mut |expr| {
         if let ast::Expr::FunctionCall { order_by, .. } = expr {
             if !order_by.is_empty() {
-                crate::bail_parse_error!(
+                crate::bail_parse_error!(SqlErrorKind::FeatureNotSupported;
                     "ORDER BY clause is not supported yet in aggregate functions"
                 );
             }
@@ -2076,7 +2077,7 @@ fn view_sources_from_clause(
         let merged = if natural {
             if join.constraint.is_some() {
                 return Err(LimboError::ParseError(
-                    "a NATURAL join may not have an ON or USING clause".to_string(),
+                    "a NATURAL join may not have an ON or USING clause".to_string().into(),
                 ));
             }
             right
@@ -2110,7 +2111,7 @@ fn view_sources_from_clause(
                     return Err(LimboError::ParseError(format!(
                         "cannot join using column {} - column not present in both tables",
                         name.as_str()
-                    )));
+                    ).into()));
                 }
                 merged.push(normalized);
             }
@@ -2505,7 +2506,7 @@ mod rename_column_view {
         let mut parser = Parser::new(view_sql.as_bytes());
         let cmd = parser
             .next_cmd()
-            .map_err(|e| LimboError::ParseError(format!("failed to parse view SQL: {e}")))?;
+            .map_err(|e| LimboError::ParseError(format!("failed to parse view SQL: {e}").into()))?;
         let Some(ast::Cmd::Stmt(ast::Stmt::CreateView {
             temporary,
             if_not_exists,
@@ -2521,7 +2522,7 @@ mod rename_column_view {
         if !visiting_views.insert(current_view_name.clone()) {
             return Err(LimboError::ParseError(format!(
                 "view {current_view_name} is circularly defined"
-            )));
+            ).into()));
         }
 
         let rewrite_result = (|| -> Result<Option<RewrittenView>> {

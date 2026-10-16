@@ -1,6 +1,8 @@
 use pg_query::ParseResult;
 use thiserror::Error;
 
+pub use turso_parser::sql_error::{SqlErrorKind, SqlErrorMessage};
+
 pub mod translator;
 
 /// libpg_query's bindings, for callers that edit a parse tree (the frontend's table rebuild).
@@ -9,12 +11,22 @@ pub use pg_query;
 #[derive(Debug, Error)]
 pub enum ParseError {
     #[error("{0}")]
-    ParseError(String),
+    ParseError(SqlErrorMessage),
     /// A recursive entry of the translator found its thread's stack nearly spent
     /// (`turso_stack_guard::NestGuard`): PostgreSQL's 54001, which the frontend reports as the engine's
     /// `LimboError::StackDepthLimitExceeded`.
     #[error("stack depth limit exceeded")]
     StackDepthLimitExceeded,
+}
+
+impl From<ParseError> for SqlErrorMessage {
+    fn from(error: ParseError) -> Self {
+        match error {
+            ParseError::ParseError(message) => message,
+            ParseError::StackDepthLimitExceeded => SqlErrorMessage::classified(
+                SqlErrorKind::StatementTooComplex, "stack depth limit exceeded"),
+        }
+    }
 }
 
 /// The stack libpg_query's calls on `sql` run with (`turso_stack_guard::with_stack`). Its C code
@@ -46,7 +58,7 @@ fn pg_query_error(e: pg_query::Error) -> ParseError {
     if text.contains("recursion limit reached") || text.contains("stack depth limit exceeded") {
         ParseError::StackDepthLimitExceeded
     } else {
-        ParseError::ParseError(text)
+        ParseError::ParseError(text.into())
     }
 }
 
@@ -103,9 +115,10 @@ pub const MAX_PARAMETER: u32 = 65535;
 /// tree whose parameters cannot be read, is refused (fail closed).
 pub fn checked_param_numbers(parse: &ParseResult, sql: &str) -> Result<Vec<i32>, ParseError> {
     let unreadable = || {
-        ParseError::ParseError(
+        ParseError::ParseError(SqlErrorMessage::classified(
+            SqlErrorKind::InternalError,
             "could not read the statement's parameters from its parse tree".to_string(),
-        )
+        ))
     };
     let mut numbers = Vec::new();
     for (number, location) in param_refs(parse).ok_or_else(unreadable)? {
@@ -129,7 +142,7 @@ pub fn checked_param_numbers(parse: &ParseResult, sql: &str) -> Result<Vec<i32>,
             _ => {
                 return Err(ParseError::ParseError(format!(
                     "parameter number too large at or near \"${text}\""
-                )))
+                ).into()))
             }
         }
     }
@@ -373,7 +386,7 @@ pub fn split_statements_lenient(sql: &str) -> Result<Vec<String>, ParseError> {
             .checked_sub(sql.as_ptr() as usize)
             .filter(|start| *start >= at && *start + part.len() <= b.len())
             .ok_or_else(|| {
-                ParseError::ParseError("the scanner split lost its place".to_string())
+                ParseError::ParseError("the scanner split lost its place".to_string().into())
             })?;
         if !blank(&b[at..start]) {
             parts.push(&sql[at..start]);

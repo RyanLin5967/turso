@@ -2839,7 +2839,7 @@ fn check_branch_name(name: &str) -> Result<()> {
     if name.is_empty() || name.len() > 255 || name.contains('\0') {
         return Err(LimboError::InvalidArgument(format!(
             "branch name {name:?}: a name is 1 to 255 bytes with no NUL"
-        )));
+        ).into()));
     }
     Ok(())
 }
@@ -4324,7 +4324,7 @@ impl BranchStore {
                 return Err(LimboError::InvalidArgument(format!(
                     "{db_path}: durable branches need a read-write open: a fork would create \
                      branch files, and nothing below the connection refuses one when read-only"
-                )));
+                ).into()));
             }
         }
         let fuzzy = super::BranchCheckpoint::resolve(checkpoint, splice)? == super::BranchCheckpoint::Fuzzy;
@@ -4383,7 +4383,7 @@ impl BranchStore {
             return Err(LimboError::InvalidArgument(format!(
                 "{what} is refused: this database was opened read-only while it has durable \
                  branches, so its branch store was not opened (trunk reads only)"
-            )));
+            ).into()));
         }
         Ok(())
     }
@@ -4431,7 +4431,7 @@ impl BranchStore {
         if splice && fuzzy && !matches!(durability, BranchDurability::Volatile) {
             return Err(LimboError::InvalidArgument(
                 "the F7 splice arm and fuzzy checkpoints are refused together (r13-compose S-12)"
-                    .to_string(),
+                    .to_string().into(),
             ));
         }
         let memory = crate::is_memory_like(db_path);
@@ -4459,7 +4459,7 @@ impl BranchStore {
                         "{db_path} has durable branches; open it with branch durability \
                          (DatabaseOpts::with_branch_durability), or its trunk writes would \
                          silently change what those branches read"
-                    )));
+                    ).into()));
                 }
                 let mut inner = StoreInner::fresh(None, SyncClass::Off, default_lease);
                 inner.splice = splice;
@@ -4468,7 +4468,7 @@ impl BranchStore {
             BranchDurability::Durable { sync } => {
                 if memory {
                     return Err(LimboError::InvalidArgument(
-                        "durable branches need a file-backed database".to_string(),
+                        "durable branches need a file-backed database".to_string().into(),
                     ));
                 }
                 let files = BranchFiles::for_db(db_path);
@@ -4477,7 +4477,7 @@ impl BranchStore {
                         "{db_path} has a catalog-mode branch store ({}); open it with \
                          BranchDurability::Catalog",
                         files.cat.display()
-                    )));
+                    ).into()));
                 }
                 let mut inner = StoreInner::fresh(Some(files.clone()), sync, default_lease);
                 inner.splice = splice;
@@ -4596,7 +4596,7 @@ impl BranchStore {
             BranchDurability::Catalog { sync } => {
                 if memory {
                     return Err(LimboError::InvalidArgument(
-                        "durable branches need a file-backed database".to_string(),
+                        "durable branches need a file-backed database".to_string().into(),
                     ));
                 }
                 let files = BranchFiles::for_db(db_path);
@@ -4605,7 +4605,7 @@ impl BranchStore {
                         "{db_path} has a snapshot-mode branch store ({}); open it with \
                          BranchDurability::Durable",
                         files.snap.display()
-                    )));
+                    ).into()));
                 }
                 let mut inner = StoreInner::fresh_mode(Some(files.clone()), sync, default_lease, true);
                 inner.splice = splice;
@@ -6918,7 +6918,7 @@ impl BranchStore {
                 return Err(LimboError::InvalidArgument(format!(
                     "branch {}'s lease has run out, and the branch store is {cause}",
                     id.0
-                )));
+                ).into()));
             }
         }
         // A named server branch is connected by name and has no handle (fastest-engine item 4).
@@ -6926,7 +6926,7 @@ impl BranchStore {
             return Err(LimboError::InvalidArgument(format!(
                 "branch {} has no attached handle; attach it with Database::branch first",
                 id.0
-            )));
+            ).into()));
         }
         if st.open {
             return Err(in_use(id, st.name.as_deref(), crate::error::BranchOp::Connect));
@@ -7192,7 +7192,7 @@ impl BranchStore {
                     "branch {} is the named server branch {name:?}: it takes no handle; connect to \
                      it with Database::connect_named and release it with Database::drop_branch",
                     id.0
-                )));
+                ).into()));
             }
         }
         match st.handle {
@@ -7203,7 +7203,7 @@ impl BranchStore {
             Handle::Attached => Err(LimboError::InvalidArgument(format!(
                 "branch {} is already attached to a handle",
                 id.0
-            ))),
+            ).into())),
             Handle::Released | Handle::ReleasePending => Err(reaped(id)),
         }
     }
@@ -9414,7 +9414,7 @@ impl BranchStore {
         // splice's relink during a flight is untested). A runtime refusal, never a debug_assert.
         if inner.splice && !guard_mutant("a") {
             return Err(LimboError::InvalidArgument(
-                "fuzzy checkpoint refused: splice arm (r13-compose S-12)".to_string(),
+                "fuzzy checkpoint refused: splice arm (r13-compose S-12)".to_string().into(),
             ));
         }
         Ok(self.start_flight(&mut inner) == FlightStart::Started)
@@ -9504,15 +9504,15 @@ pub(crate) fn untyped_branch_error(e: LimboError) -> LimboError {
     let all = fe_mutant("untyped_branch_errors");
     match e {
         LimboError::NoSuchBranch(name) if all || fe_mutant("untyped_branch_errors_no_such") => {
-            LimboError::InvalidArgument(format!("no branch is named {name:?}"))
+            LimboError::InvalidArgument(format!("no branch is named {name:?}").into())
         }
         LimboError::NameTaken(name) if all || fe_mutant("untyped_branch_errors_name_taken") => {
-            LimboError::InvalidArgument(format!("branch name {name:?} already names an unreleased branch"))
+            LimboError::InvalidArgument(format!("branch name {name:?} already names an unreleased branch").into())
         }
         LimboError::BranchInUse { id, .. } if all || fe_mutant("untyped_branch_errors_in_use") => LimboError::InvalidArgument(format!(
             "branch {id} already has an open connection; a branch serves one connection at a \
              time, because a second one's page cache would silently miss the first one's commits"
-        )),
+        ).into()),
         other => other,
     }
 }
@@ -9529,7 +9529,7 @@ fn in_use(id: BranchId, name: Option<&str>, op: crate::error::BranchOp) -> Limbo
 }
 
 fn reaped(id: BranchId) -> LimboError {
-    LimboError::InvalidArgument(format!("branch {} has been reaped", id.0))
+    LimboError::InvalidArgument(format!("branch {} has been reaped", id.0).into())
 }
 
 impl StoreInner {
@@ -10627,7 +10627,7 @@ impl StoreInner {
         CAPTURE_ENTERED.with(|c| c.set(c.get() + 1));
         if fuzzy && self.splice && !guard_mutant("c") {
             return Err(LimboError::InvalidArgument(
-                "fuzzy capture refused: splice arm (r13-compose S-12)".to_string(),
+                "fuzzy capture refused: splice arm (r13-compose S-12)".to_string().into(),
             ));
         }
         let now = self.lease.now_ms();
@@ -13713,4 +13713,3 @@ mod fail_stop_tests {
         );
     }
 }
-
