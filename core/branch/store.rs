@@ -3795,13 +3795,6 @@ fn run_links_fill(shared: &StoreMutex, writer: &Mutex<Catalog>, group: &Group) {
         };
         if batch.is_ok() {
             kill_point("ckpt.upgrade.batch");
-            #[cfg(test)]
-            {
-                let ms = LINKS_FILL_PAUSE_MS.load(Ordering::Acquire);
-                if ms > 0 {
-                    std::thread::sleep(Duration::from_millis(ms));
-                }
-            }
         }
         if matches!(batch, Ok(None)) && !fe_mutant("l4_fill_wal_left") {
             truncate_catalog_wal(&mut writer.lock(), group, None);
@@ -3814,7 +3807,19 @@ fn run_links_fill(shared: &StoreMutex, writer: &Mutex<Catalog>, group: &Group) {
             cat.links_columns_made = true;
         }
         match batch {
-            Ok(Some(next)) if cat.filling => cat.links_cursor = Some(next),
+            Ok(Some(next)) if cat.filling => {
+                cat.links_cursor = Some(next);
+                drop(inner);
+                // Test builds: the slow fill's pause, after its batch is recorded (so the store
+                // sees the batch's columns while the fill sleeps).
+                #[cfg(test)]
+                {
+                    let ms = LINKS_FILL_PAUSE_MS.load(Ordering::Acquire);
+                    if ms > 0 {
+                        std::thread::sleep(Duration::from_millis(ms));
+                    }
+                }
+            }
             Ok(None) if cat.filling => {
                 cat.links_prefilled = true;
                 cat.filling = false;
