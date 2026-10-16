@@ -1195,7 +1195,7 @@ impl Statement {
     pub fn get_column_type_info(&self, idx: usize) -> Result<Option<ColumnTypeInfo>> {
         if !self.program.connection.experimental_custom_types_enabled() {
             return Err(LimboError::ParseError(
-                "get_column_type_info requires --experimental-custom-types".to_string(),
+                "get_column_type_info requires --experimental-custom-types".to_string().into(),
             ));
         }
         if self.query_mode != QueryMode::Normal {

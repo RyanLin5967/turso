@@ -1,5 +1,6 @@
 // This module contains code for emitting bytecode instructions for SQL query execution.
 // It handles translating high-level SQL operations into low-level bytecode that can be executed by the virtual machine.
+use crate::error::SqlErrorKind;
 use super::{
     collate::{get_expr_collation_ctx_with_symbols, CollationSeq},
     compound_select::emit_program_for_compound_select,
@@ -660,7 +661,7 @@ impl<'a> Resolver<'a> {
             }
             return Err(LimboError::ParseError(format!(
                 "no such object: {object_name}"
-            )));
+            ).into()));
         }
 
         if self.with_schema(crate::MAIN_DB_ID, |schema| {
@@ -794,7 +795,7 @@ impl<'a> Resolver<'a> {
                     } else {
                         Err(LimboError::InvalidArgument(format!(
                             "no such database: {db_name_normalized}"
-                        )))
+                        ).into()))
                     }
                 }
             }
@@ -829,7 +830,7 @@ impl<'a> Resolver<'a> {
                 return Err(LimboError::ParseError(format!(
                     "trigger {} cannot reference objects in database {}",
                     ctx.trigger_name, db_name
-                )));
+                ).into()));
             }
         }
 
@@ -1182,10 +1183,10 @@ pub fn prepare_cdc_if_necessary(
         }
     }
     let Some(turso_cdc_table) = schema.get_table(cdc_table) else {
-        crate::bail_parse_error!("no such table: {}", cdc_table);
+        crate::bail_parse_error!(SqlErrorKind::UndefinedTable; "no such table: {}", cdc_table);
     };
     let Some(cdc_btree) = turso_cdc_table.btree() else {
-        crate::bail_parse_error!("no such table: {}", cdc_table);
+        crate::bail_parse_error!(SqlErrorKind::UndefinedTable; "no such table: {}", cdc_table);
     };
     let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(cdc_btree.clone()));
     program.emit_insn(Insn::OpenWrite {

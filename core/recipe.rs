@@ -381,7 +381,7 @@ fn resolve_recipe_expr(expr: &Expr, columns: &[Column]) -> Result<Expr> {
     validate_generated_expr(expr)?;
     if !functions_allowed(expr)? {
         return Err(LimboError::ParseError(
-            "recipe: a function outside the recipe allowlist".to_string(),
+            "recipe: a function outside the recipe allowlist".to_string().into(),
         ));
     }
     let mut e = expr.clone();
@@ -393,7 +393,7 @@ fn resolve_recipe_expr(expr: &Expr, columns: &[Column]) -> Result<Expr> {
 fn reparse_table(sql: &str, root_page: i64) -> Result<BTreeTable> {
     let mut parser = turso_parser::parser::Parser::new(sql.as_bytes());
     let Some(ast::Cmd::Stmt(ast::Stmt::CreateTable { tbl_name, body, .. })) = parser.next_cmd()? else {
-        return Err(LimboError::ParseError(format!("not a CREATE TABLE: {sql}")));
+        return Err(LimboError::ParseError(format!("not a CREATE TABLE: {sql}").into()));
     };
     crate::schema::create_table(tbl_name.name.as_str(), &body, root_page)
 }

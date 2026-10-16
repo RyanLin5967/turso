@@ -1,3 +1,4 @@
+use turso_parser::sql_error::{SqlErrorKind, SqlErrorMessage};
 use std::num::NonZero;
 use std::str;
 use std::sync::Arc;
@@ -174,7 +175,7 @@ fn setting_ms(text: &str) -> Option<u64> {
         _ => return None,
     };
     let ms = (value * ms).round();
-    (ms.is_finite() && ms >= 0.0 && ms <= u64::MAX as f64).then_some(ms as u64)
+    (ms.is_finite() && ms >= 0.0 && ms <= i32::MAX as f64).then_some(ms as u64)
 }
 
 impl PgConnectionInner {
@@ -675,7 +676,7 @@ pub fn read_parse_message(sql: &str) -> Result<ParseMessage> {
     // The trimmed text, as the prepare reads it: the tree's locations must index the text the
     // prepare holds (a leading blank shifted every $n's location by one).
     let parse =
-        turso_pg_parser::parse(trimmed).map_err(|e| LimboError::ParseError(e.to_string()))?;
+        turso_pg_parser::parse(trimmed).map_err(|e| LimboError::ParseError(e.into()))?;
     let numbers = turso_pg_parser::checked_param_numbers(&parse, trimmed);
     let prefix = BRANCH_FUNCTION_PREFIX.as_bytes();
     let mentions = sql
@@ -1083,7 +1084,7 @@ fn prepare_statement_parsed(
     let sql = turso_pg_parser::pg_trim(sql);
     if sql.is_empty() {
         return Err(LimboError::InvalidArgument(
-            "The supplied SQL string contains no statements".to_string(),
+            "The supplied SQL string contains no statements".to_string().into(),
         ));
     }
 
@@ -1093,14 +1094,14 @@ fn prepare_statement_parsed(
     // message's serves its classification too (C53).
     let parse_result = match parsed {
         Some(parsed) => parsed,
-        None => turso_pg_parser::parse(sql).map_err(|e| LimboError::ParseError(e.to_string()))?,
+        None => turso_pg_parser::parse(sql).map_err(|e| LimboError::ParseError(e.into()))?,
     };
     // One statement per prepare, as PostgreSQL's Parse takes one (42601): the translator reads the
     // first, so `COMMIT; INSERT ...` in one Parse committed and skipped the INSERT, answering
     // success (wire review 14 item 5). The simple protocol splits a query before it prepares.
     if parse_result.protobuf.stmts.len() > 1 {
         return Err(LimboError::ParseError(
-            "cannot insert multiple commands into a prepared statement".to_string(),
+            "cannot insert multiple commands into a prepared statement".to_string().into(),
         ));
     }
     // Every $n of the whole tree, before anything is sized by one: a number past
@@ -1111,14 +1112,14 @@ fn prepare_statement_parsed(
         // Read from the text as PostgreSQL 18 reads them: a number above i32::MAX is 42601, never
         // libpg_query's 32-bit wrap (wire review 12 item 1).
         let numbers = turso_pg_parser::checked_param_numbers(&parse_result, sql)
-            .map_err(|e| LimboError::ParseError(e.to_string()))?;
+            .map_err(|e| LimboError::ParseError(e.into()))?;
         if let Some(n) = numbers
             .iter()
             .find(|n| !(1..=crate::result_types::MAX_PARAMETER as i32).contains(*n))
         {
-            return Err(LimboError::ParseError(format!(
+            return Err(LimboError::ParseError(SqlErrorMessage::classified(SqlErrorKind::UndefinedParameter, format!(
                 "there is no parameter ${n}"
-            )));
+            ))));
         }
         numbers.into_iter().map(|n| n as u32).collect()
     } else {
@@ -1150,7 +1151,12 @@ fn prepare_statement_parsed(
     // row (wire review 13 item 9); a Bind's then answered an invented 0A000 (wire review 17 item
     // 4, the lead's ruling).
     let first_param = used.first().copied();
-    let parameter_refused = |n: u32| LimboError::ParseError(format!("there is no parameter ${n}"));
+    let parameter_refused = |n: u32| {
+        LimboError::ParseError(SqlErrorMessage::classified(
+            SqlErrorKind::UndefinedParameter,
+            format!("there is no parameter ${n}"),
+        ))
+    };
     if let Some(n) = first_param.filter(|_| performs) {
         return Err(parameter_refused(n));
     }
@@ -1253,7 +1259,7 @@ fn prepare_statement_parsed(
     let first = translator();
     let mut translated = first
         .translate_with_prereqs(&parse_result)
-        .map_err(|e| LimboError::ParseError(e.to_string()))?;
+        .map_err(|e| LimboError::ParseError(e.into()))?;
     // A cast to a type that is not built-in is kept by name only when it is the engine's own (a
     // domain, a custom type), so the engine runs its CHECKs: `CAST(-5 AS dm)` returned -5 (the
     // domain CHECK class's PG 18.6 replay, 2026-10-15). Looked up, and translated again, only for
@@ -1269,7 +1275,7 @@ fn prepare_statement_parsed(
             translated = translator()
                 .with_known_types(known)
                 .translate_with_prereqs(&parse_result)
-                .map_err(|e| LimboError::ParseError(e.to_string()))?;
+                .map_err(|e| LimboError::ParseError(e.into()))?;
         }
     }
     reject_catalog_dml(translated.cmd.stmt())?;
@@ -1321,7 +1327,7 @@ fn prepare_statement_parsed(
             let retried = PostgreSQLTranslator::new()
                 .with_columns(move |schema, table| resident_relation_columns(&lookup_conn, schema, table))
                 .translate_with_prereqs(&parse_result)
-                .map_err(|e| LimboError::ParseError(e.to_string()))?;
+                .map_err(|e| LimboError::ParseError(e.into()))?;
             return pg_conn
                 .conn
                 .prepare_translated_cmd_with_options(retried.cmd, sql, &options)
@@ -1378,16 +1384,16 @@ fn reject_catalog_dml(stmt: &ast::Stmt) -> Result<()> {
     };
     Err(LimboError::ParseError(format!(
         "cannot {verb} pg_catalog table \"{table_name}\""
-    )))
+    ).into()))
 }
 
 fn reject_sqlite_catalog_access(sql: &str) -> Result<()> {
     let lower = sql.to_ascii_lowercase();
     for table_name in ["sqlite_master", "sqlite_schema"] {
         if lower.contains(table_name) {
-            return Err(LimboError::ParseError(format!(
+            return Err(LimboError::ParseError(SqlErrorMessage::classified(SqlErrorKind::UndefinedTable, format!(
                 "no such table: {table_name}"
-            )));
+            ))));
         }
     }
     Ok(())
@@ -1535,18 +1541,18 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
     // SET (`SET search_path TO s; SELECT ..`) acts, as before.
     if matches!(name.as_str(), "search_path" | "foreign_keys") {
         if set_stmt.is_local {
-            return Err(LimboError::ParseError(format!(
+            return Err(LimboError::ParseError(SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, format!(
                 "SET LOCAL {name} is not supported: this server cannot scope it to the block"
-            )));
+            ))));
         }
         if pg_conn
             .explicit_block
             .load(std::sync::atomic::Ordering::Relaxed)
         {
-            return Err(LimboError::ParseError(format!(
+            return Err(LimboError::ParseError(SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, format!(
                 "SET {name} is not supported inside a transaction block: a ROLLBACK could not \
                  undo it here; set it before BEGIN"
-            )));
+            ))));
         }
     }
     if name == "search_path" {
@@ -1555,21 +1561,21 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
             .iter()
             .map(|value| value.as_search_path_name().map(str::to_owned))
             .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| LimboError::ParseError("incorrect format".to_string()))?;
+            .ok_or_else(|| LimboError::ParseError("incorrect format".to_string().into()))?;
         pg_conn.set_search_path(path);
         return noop_statement(&pg_conn.conn);
     }
     let value = set_stmt.values.first().ok_or_else(|| {
-        LimboError::ParseError(format!("SET {}: no value provided", set_stmt.name))
+        LimboError::ParseError(format!("SET {}: no value provided", set_stmt.name).into())
     })?;
     // DateStyle is a list in PostgreSQL, read whole below (search_path is one too, above); any
     // other setting given more than one value is refused there (its flatten_set_variable_args).
     // Only the first value was read, so `SET client_encoding TO UTF8, LATIN1` answered SET (wire
     // review 18 item 19).
     if set_stmt.values.len() > 1 && name != "datestyle" {
-        return Err(LimboError::InvalidArgument(format!(
+        return Err(LimboError::InvalidArgument(SqlErrorMessage::classified(SqlErrorKind::InvalidParameterValue, format!(
             "SET {name} takes only one argument"
-        )));
+        ))));
     }
     if name == "foreign_keys" {
         return pg_conn
@@ -1596,13 +1602,15 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
     };
     let lower = text.to_ascii_lowercase();
     let unsupported = |what: &str| {
-        Err(LimboError::ParseError(format!(
-            "SET {name} = {text} is not supported: {what}"
+        Err(LimboError::ParseError(SqlErrorMessage::classified(
+            SqlErrorKind::FeatureNotSupported,
+            format!("SET {name} = {text} is not supported: {what}"),
         )))
     };
     let invalid = || {
-        Err(LimboError::InvalidArgument(format!(
-            "invalid value for parameter \"{name}\": \"{text}\""
+        Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
+            SqlErrorKind::InvalidParameterValue,
+            format!("invalid value for parameter \"{name}\": \"{text}\""),
         )))
     };
     let accepted = match name.as_str() {
@@ -1672,7 +1680,7 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
             Some(false) => true,
             _ => {
                 return Err(LimboError::ParseError(
-                    "READ ONLY transactions are not supported".to_string(),
+                    SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, "READ ONLY transactions are not supported".to_string()),
                 ))
             }
         },
@@ -1681,7 +1689,11 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
             clean == "utf8" || clean == "unicode"
         }
         "standard_conforming_strings" => pg_bool(&text) == Some(true),
-        "bytea_output" => lower == "hex",
+        "bytea_output" => match lower.as_str() {
+            "hex" => true,
+            "escape" => false,
+            _ => return invalid(),
+        },
         // Every element ISO, MDY or PostgreSQL's other names for that order (US, NonEuro...), or
         // DEFAULT, PostgreSQL's ISO, MDY: what SHOW gives stays true. DMY, YMD and the SQL,
         // Postgres and German output styles are refused, as this server reads and writes ISO
@@ -1705,9 +1717,9 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
             return unsupported("this server does not act on it")
         }
         _ => {
-            return Err(LimboError::ParseError(format!(
+            return Err(LimboError::ParseError(SqlErrorMessage::classified(SqlErrorKind::UndefinedObject, format!(
                 "unrecognized configuration parameter \"{name}\""
-            )))
+            ))))
         }
     };
     if accepted {
@@ -1765,18 +1777,18 @@ fn handle_pg_show(pg_conn: &Arc<PgConnectionInner>, show: &PgShowStmt) -> Result
         }
         "all" => {
             return Err(LimboError::ParseError(
-                "SHOW ALL is not supported".to_string(),
+                SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, "SHOW ALL is not supported".to_string()),
             ))
         }
         _ if crate::pg_settings::is_postgresql_parameter(&name) => {
-            return Err(LimboError::ParseError(format!(
+            return Err(LimboError::ParseError(SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, format!(
                 "SHOW {name} is not supported: this server does not act on it"
-            )))
+            ))))
         }
         _ => {
-            return Err(LimboError::ParseError(format!(
+            return Err(LimboError::ParseError(SqlErrorMessage::classified(SqlErrorKind::UndefinedObject, format!(
                 "unrecognized configuration parameter \"{name}\""
-            )))
+            ))))
         }
     };
     pg_conn.conn.prepare(format!(
@@ -1794,7 +1806,7 @@ fn handle_pg_create_schema(conn: &Arc<Connection>, stmt: &PgCreateSchemaStmt) ->
         }
         return Err(LimboError::ParseError(format!(
             "schema \"{name}\" already exists"
-        )));
+        ).into()));
     }
 
     if schema_exists(conn, &name)? {
@@ -1803,7 +1815,7 @@ fn handle_pg_create_schema(conn: &Arc<Connection>, stmt: &PgCreateSchemaStmt) ->
         }
         return Err(LimboError::ParseError(format!(
             "schema \"{name}\" already exists"
-        )));
+        ).into()));
     }
 
     let path = schema_file_path(conn, &name);
@@ -1842,7 +1854,7 @@ fn handle_pg_drop_schema(pg_conn: &Arc<PgConnectionInner>, stmt: &PgDropSchemaSt
         }
         return Err(LimboError::ParseError(format!(
             "schema \"{name}\" does not exist"
-        )));
+        ).into()));
     }
 
     if stmt.cascade {
@@ -1883,9 +1895,9 @@ fn handle_pg_drop_objects(pg_conn: &Arc<PgConnectionInner>, stmt: &PgDropObjects
                     skipping_notice(pg_conn, "schema", schema);
                     continue;
                 }
-                return Err(LimboError::ParseError(format!(
-                    "schema \"{schema}\" does not exist"
-                )));
+                return Err(LimboError::ParseError(
+                    format!("schema \"{schema}\" does not exist").into(),
+                ));
             }
         }
         // A type is named unqualified in the engine (the translator's DROP TYPE kept the last name).
@@ -1909,10 +1921,9 @@ fn handle_pg_drop_objects(pg_conn: &Arc<PgConnectionInner>, stmt: &PgDropObjects
                 };
                 if let Some(other) = other {
                     if conn.prepare(drop(other.keyword())).is_ok() {
-                        return Err(LimboError::ParseError(format!(
-                            "\"{name}\" is not a {}",
-                            stmt.kind.word()
-                        )));
+                        return Err(LimboError::ParseError(
+                            format!("\"{name}\" is not a {}", stmt.kind.word()).into(),
+                        ));
                     }
                 }
                 if !stmt.missing_ok {
@@ -1965,7 +1976,7 @@ fn handle_pg_drop_schema_public(conn: &Arc<Connection>, cascade: bool) -> Result
     let table_names = list_user_tables(conn, None)?;
     if !cascade && !table_names.is_empty() {
         return Err(LimboError::ParseError(
-            "cannot drop schema \"public\" because other objects depend on it".to_string(),
+            "cannot drop schema \"public\" because other objects depend on it".to_string().into(),
         ));
     }
 
@@ -2003,7 +2014,7 @@ fn handle_pg_add_constraints(
         turso_pg_parser::schema_qualifier(s) != turso_pg_parser::SchemaQualifier::Main
     }) {
         return Err(LimboError::ParseError(
-            "ALTER TABLE ADD CONSTRAINT is supported only for tables in schema public".to_string(),
+            "ALTER TABLE ADD CONSTRAINT is supported only for tables in schema public".to_string().into(),
         ));
     }
     let table = add.table.as_str();
@@ -2061,16 +2072,23 @@ fn handle_pg_add_constraints(
                 .to_string(),
         ));
     }
-    let definition = definition
-        .ok_or_else(|| LimboError::ParseError(format!("relation \"{table}\" does not exist")))?;
-    let pg_definition = catalog::decode_stored_pg_schema_sql(&definition).ok_or_else(|| {
-        LimboError::ParseError(format!(
-            "ALTER TABLE ADD CONSTRAINT: table \"{table}\" was not created by CREATE TABLE in \
-             this frontend, so it has no definition to rebuild"
+    let definition = definition.ok_or_else(|| {
+        LimboError::ParseError(SqlErrorMessage::classified(
+            SqlErrorKind::UndefinedTable,
+            format!("relation \"{table}\" does not exist"),
         ))
     })?;
+    let pg_definition = catalog::decode_stored_pg_schema_sql(&definition).ok_or_else(|| {
+        LimboError::ParseError(
+            format!(
+                "ALTER TABLE ADD CONSTRAINT: table \"{table}\" was not created by CREATE TABLE in \
+             this frontend, so it has no definition to rebuild"
+            )
+            .into(),
+        )
+    })?;
     let mut parsed =
-        turso_pg_parser::parse(pg_definition).map_err(|e| LimboError::ParseError(e.to_string()))?;
+        turso_pg_parser::parse(pg_definition).map_err(|e| LimboError::ParseError(e.into()))?;
     // Taken before the definition is edited below (a clone made while `create` borrows it would
     // not compile).
     let mut aside_tree = parsed.protobuf.clone();
@@ -2084,7 +2102,7 @@ fn handle_pg_add_constraints(
         return Err(LimboError::ParseError(format!(
             "ALTER TABLE ADD CONSTRAINT: table \"{table}\" was created by CREATE TABLE AS, so it \
              has no column definitions to rebuild"
-        )));
+        ).into()));
     };
     create.if_not_exists = false;
     // The rows wait in a table of the same columns and types, so each value is decoded and
@@ -2131,10 +2149,10 @@ fn handle_pg_add_constraints(
         }
     }
     let aside_def =
-        turso_pg_parser::deparse(&aside_tree).map_err(|e| LimboError::ParseError(e.to_string()))?;
+        turso_pg_parser::deparse(&aside_tree).map_err(|e| LimboError::ParseError(e.into()))?;
     create.table_elts.extend(add.constraints.iter().cloned());
-    let rebuilt = turso_pg_parser::deparse(&parsed.protobuf)
-        .map_err(|e| LimboError::ParseError(e.to_string()))?;
+    let rebuilt =
+        turso_pg_parser::deparse(&parsed.protobuf).map_err(|e| LimboError::ParseError(e.into()))?;
     // Every refusal the translator makes of the rebuilt CREATE TABLE (MATCH FULL over several
     // columns among them) is answered here, before anything is copied, dropped or locked: it came
     // from the rebuild's own CREATE, after the BEGIN, the aside copy and the DROP, under the trunk's
@@ -2142,7 +2160,7 @@ fn handle_pg_add_constraints(
     // review 16 item 9). One translation of the tree already in hand, no parse.
     PostgreSQLTranslator::new()
         .translate_with_prereqs(&parsed)
-        .map_err(|e| LimboError::ParseError(e.to_string()))?;
+        .map_err(|e| LimboError::ParseError(e.into()))?;
 
     let quoted = format!("\"{}\"", table.replace('"', "\"\""));
     let aside = format!("\"{}\"", aside_name.replace('"', "\"\""));
@@ -2163,7 +2181,7 @@ fn handle_pg_add_constraints(
         )
     }) {
         return Err(LimboError::ParseError(
-            "foreign keys in a schema other than public are not supported".to_string(),
+            SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, "foreign keys in a schema other than public are not supported".to_string()),
         ));
     }
     let child_columns: Vec<String> = conn
@@ -2270,7 +2288,22 @@ fn added_foreign_key(node: &turso_pg_parser::pg_query::protobuf::Node) -> Option
 /// by ALTER TABLE ADD FOREIGN KEY (wire review 11 item 5) and CREATE TABLE (review 13 item 2), so
 /// the two cannot drift.
 pub fn check_table_keys(conn: &Arc<Connection>, table: &str) -> Result<()> {
-    conn.current_schema()
+    let schema = conn.current_schema();
+    // A self-reference with an omitted parent column list resolves only after CREATE has
+    // installed the table. Its missing primary key is distinct from a non-unique explicit key.
+    if let Some(child) = schema.get_btree_table(table) {
+        if child.primary_key_columns.is_empty()
+            && child.foreign_keys.iter().any(|key| {
+                key.parent_table.eq_ignore_ascii_case(table) && key.parent_columns.is_empty()
+            })
+        {
+            return Err(LimboError::ParseError(SqlErrorMessage::classified(
+                SqlErrorKind::UndefinedObject,
+                format!("there is no primary key for referenced table \"{table}\""),
+            )));
+        }
+    }
+    schema
         .resolved_fks_for_child(table)
         .map(|_| ())
         .map_err(|e| {
@@ -2281,9 +2314,9 @@ pub fn check_table_keys(conn: &Arc<Connection>, table: &str) -> Result<()> {
                 .and_then(|(_, p)| p.strip_suffix('"'))
                 .unwrap_or(table)
                 .to_string();
-            LimboError::ParseError(format!(
+            LimboError::ParseError(SqlErrorMessage::classified(SqlErrorKind::InvalidForeignKey, format!(
                 "there is no unique constraint matching given keys for referenced table \"{parent}\""
-            ))
+            )))
         })
 }
 
@@ -2351,7 +2384,7 @@ fn precheck_create_keys(
     };
     if elsewhere(&relation.schemaname) || keys.iter().any(|k| elsewhere(&k.parent_schema)) {
         return Err(LimboError::ParseError(
-            "foreign keys in a schema other than public are not supported".to_string(),
+            SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, "foreign keys in a schema other than public are not supported".to_string()),
         ));
     }
     let child_columns: Vec<String> = create
@@ -2392,23 +2425,30 @@ fn check_foreign_key(
 ) -> Result<Vec<String>> {
     let schema = conn.current_schema();
     let missing = |column: &str| {
-        LimboError::ParseError(format!(
-            "column \"{column}\" referenced in foreign key constraint does not exist"
+        LimboError::ParseError(SqlErrorMessage::classified(
+            SqlErrorKind::UndefinedColumn,
+            format!("column \"{column}\" referenced in foreign key constraint does not exist"),
         ))
     };
     let disagree = |parent_columns: &[String]| {
-        LimboError::ParseError(format!(
+        LimboError::ParseError(SqlErrorMessage::classified(
+            SqlErrorKind::InvalidForeignKey,
+            format!(
             "number of referencing and referenced columns for foreign key disagree (the key on \
              {child} names {}, its parent key {})",
             key.columns.len(),
             parent_columns.len()
+        ),
         ))
     };
     let parent = if own_keys_pending && key.parent.eq_ignore_ascii_case(child) {
         None
     } else {
         Some(schema.get_btree_table(&key.parent).ok_or_else(|| {
-            LimboError::ParseError(format!("relation \"{}\" does not exist", key.parent))
+            LimboError::ParseError(SqlErrorMessage::classified(
+                SqlErrorKind::UndefinedTable,
+                format!("relation \"{}\" does not exist", key.parent),
+            ))
         })?)
     };
     if let Some(column) = key
@@ -2431,10 +2471,10 @@ fn check_foreign_key(
         if !declared {
             return Err(missing(column));
         }
-        return Err(LimboError::ParseError(format!(
+        return Err(LimboError::ParseError(SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, format!(
             "a foreign key onto a column named {column} is not supported: the engine reads the \
              name as the rowid"
-        )));
+        ))));
     }
     let Some(parent) = parent else {
         if let Some(column) = key
@@ -2466,16 +2506,16 @@ fn check_foreign_key(
         key.parent_columns.clone()
     };
     if parent_columns.is_empty() {
-        return Err(LimboError::ParseError(format!(
+        return Err(LimboError::ParseError(SqlErrorMessage::classified(SqlErrorKind::UndefinedObject, format!(
             "there is no primary key for referenced table \"{}\"",
             key.parent
-        )));
+        ))));
     }
     if !parent_key_resolves(&schema, &parent, &parent_columns) {
-        return Err(LimboError::ParseError(format!(
+        return Err(LimboError::ParseError(SqlErrorMessage::classified(SqlErrorKind::InvalidForeignKey, format!(
             "there is no unique constraint matching given keys for referenced table \"{}\"",
             key.parent
-        )));
+        ))));
     }
     if parent_columns.len() != key.columns.len() || key.columns.is_empty() {
         return Err(disagree(&parent_columns));
@@ -2765,16 +2805,16 @@ fn run_pg_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<()> {
 
 fn handle_pg_copy_from(pg_conn: &Arc<PgConnectionInner>, stmt: &PgCopyFromStmt) -> Result<usize> {
     if let Some(why) = &stmt.refused {
-        return Err(LimboError::ParseError(why.clone()));
+        return Err(LimboError::ParseError(why.clone().into()));
     }
     if stmt.has_where {
         return Err(LimboError::ParseError(
-            "COPY FROM ... WHERE is not supported".to_string(),
+            SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, "COPY FROM ... WHERE is not supported".to_string()),
         ));
     }
     let conn = &pg_conn.conn;
     let data = std::fs::read_to_string(&stmt.filename).map_err(|e| {
-        LimboError::ParseError(format!("COPY FROM: cannot read '{}': {}", stmt.filename, e))
+        LimboError::ParseError(format!("COPY FROM: cannot read '{}': {}", stmt.filename, e).into())
     })?;
 
     // An unqualified table is found through the search path, as the engine finds every other
@@ -2794,7 +2834,7 @@ fn handle_pg_copy_from(pg_conn: &Arc<PgConnectionInner>, stmt: &PgCopyFromStmt) 
         return Err(LimboError::ParseError(format!(
             "COPY FROM: table '{}' not found or has no columns",
             stmt.table_name
-        )));
+        ).into()));
     }
 
     let (insert_cols, num_columns) = match &stmt.columns {
@@ -2871,8 +2911,11 @@ fn schema_on_search_path(pg_conn: &Arc<PgConnectionInner>, table: &str) -> Resul
             return Ok(Some(database.to_string()));
         }
     }
-    Err(LimboError::ParseError(format!(
+    Err(LimboError::ParseError(SqlErrorMessage::classified(
+        SqlErrorKind::UndefinedTable,
+        format!(
         "relation \"{table}\" does not exist"
+    ),
     )))
 }
 

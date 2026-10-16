@@ -1,3 +1,4 @@
+use crate::error::{SqlErrorKind, SqlErrorMessage};
 use crate::incremental::{compiler::DBSP_CIRCUIT_VERSION, view::IncrementalView};
 use crate::schema::{
     BTreeCharacteristics, BTreeTable, SchemaObjectType, DBSP_TABLE_PREFIX, RESERVED_TABLE_PREFIXES,
@@ -26,13 +27,13 @@ fn validate_materialized(
     if !connection.experimental_views_enabled() {
         return Err(crate::LimboError::ParseError(
             "CREATE MATERIALIZED VIEW is an experimental feature. Enable with --experimental-views flag"
-                .to_string(),
+                .to_string().into(),
         ));
     }
     // The DBSP incremental maintenance runtime (populate_from_table, etc.) assumes
     // the main database pager/schema. Block attached databases until that is fixed.
     if database_id != crate::MAIN_DB_ID {
-        crate::bail_parse_error!("materialized views are not supported on attached databases");
+        crate::bail_parse_error!(SqlErrorKind::FeatureNotSupported; "materialized views are not supported on attached databases");
     }
     if RESERVED_TABLE_PREFIXES
         .iter()
@@ -49,7 +50,7 @@ fn validate_materialized(
     }) {
         return Err(crate::LimboError::ParseError(format!(
             "View {normalized_view_name} already exists"
-        )));
+        ).into()));
     }
     Ok(())
 }
@@ -298,7 +299,7 @@ fn validate_create_view(
         return Err(crate::LimboError::ParseError(format!(
             "view {} already exists",
             crate::util::identifier_token_for_error(view_name)
-        )));
+        ).into()));
     }
     if RESERVED_TABLE_PREFIXES
         .iter()
@@ -363,14 +364,14 @@ pub fn translate_create_view(
         // SQLite echoes the new view's name token as written, except when the
         // name clashes with an index, which gets its own message shape.
         let token = crate::util::identifier_token_for_error(&view_name.name);
-        return Err(crate::LimboError::ParseError(match object_type {
+        return Err(crate::LimboError::ParseError((match object_type {
             SchemaObjectType::Table => format!("table {token} already exists"),
             SchemaObjectType::View => format!("view {token} already exists"),
             SchemaObjectType::Index => format!(
                 "there is already an index named {}",
                 view_name.name.as_str()
             ),
-        }));
+        }).into()));
     }
 
     crate::util::validate_select_for_views(select_stmt, view_name.db_name.as_ref())?;
@@ -463,9 +464,9 @@ pub fn translate_drop_view(
     let view_exists = is_regular_view || is_materialized_view || is_broken_view;
 
     if !view_exists && !if_exists {
-        return Err(crate::LimboError::ParseError(format!(
+        return Err(crate::LimboError::ParseError(SqlErrorMessage::classified(SqlErrorKind::UndefinedTable, format!(
             "no such view: {normalized_view_name}"
-        )));
+        ))));
     }
 
     if !view_exists && if_exists {

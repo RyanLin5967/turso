@@ -265,7 +265,7 @@ fn handle_array_index<'a>(
         }
         (ArrayIndexState::Start, '0'..='9') => {
             *index_buffer = ch.1.to_digit(10).ok_or_else(|| {
-                crate::LimboError::ParseError(format!("failed to parse digit: {ch}", ch = ch.1))
+                crate::LimboError::ParseError(format!("failed to parse digit: {ch}", ch = ch.1).into())
             })? as i128;
             *index_state = ArrayIndexState::CollectingNumbers;
         }
@@ -292,7 +292,7 @@ fn handle_array_index<'a>(
             let (new_num, is_max) = collect_num(
                 *index_buffer,
                 ch.1.to_digit(10).ok_or_else(|| {
-                    crate::LimboError::ParseError(format!("failed to parse digit: {ch}", ch = ch.1))
+                    crate::LimboError::ParseError(format!("failed to parse digit: {ch}", ch = ch.1).into())
                 })? as i128,
                 negative,
             );
@@ -381,7 +381,7 @@ fn handle_negative_index(
     if let Some((_, next_c)) = path_iter.next() {
         if next_c.is_ascii_digit() {
             *index_buffer = -(next_c.to_digit(10).ok_or_else(|| {
-                crate::LimboError::ParseError(format!("failed to parse digit: {next_c}"))
+                crate::LimboError::ParseError(format!("failed to parse digit: {next_c}").into())
             })? as i128);
             *index_state = ArrayIndexState::CollectingNegativeNumbers;
             Ok(())

@@ -1,3 +1,4 @@
+use crate::error::SqlErrorKind;
 use crate::schema::{BTreeTable, Table};
 use crate::sync::Arc;
 use crate::translate::emitter::{emit_program, Resolver};
@@ -39,7 +40,7 @@ fn validate_delete(
     }
     let table = match resolver.with_schema(database_id, |s| s.get_table(tbl_name)) {
         Some(table) => table,
-        None => crate::bail_parse_error!(
+        None => crate::bail_parse_error!(SqlErrorKind::UndefinedTable;
             "no such table: {}",
             crate::util::table_name_for_error(qualified_name)
         ),
@@ -48,7 +49,7 @@ fn validate_delete(
         crate::bail_parse_error!("unsafe use of virtual table \"{}\"", tbl_name);
     }
     if table.btree().is_some_and(|bt| !bt.has_rowid) {
-        crate::bail_parse_error!("DELETE from WITHOUT ROWID tables is not supported");
+        crate::bail_parse_error!(SqlErrorKind::FeatureNotSupported; "DELETE from WITHOUT ROWID tables is not supported");
     }
 
     // Check if this is a materialized view

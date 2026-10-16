@@ -232,7 +232,7 @@ impl LocaleCollationId {
     fn from_index(index: usize) -> Result<Self> {
         if index > (u16::MAX - Self::FIRST_STORAGE_BIT) as usize {
             return Err(crate::LimboError::ParseError(
-                "too many locale collation sequences".to_string(),
+                "too many locale collation sequences".to_string().into(),
             ));
         }
         Ok(Self(index as u16))
@@ -271,11 +271,11 @@ impl LocaleCollationRegistry {
         }
 
         let locale = Locale::from_str(name).map_err(|_| {
-            crate::LimboError::ParseError(format!("no such collation sequence: {name}"))
+            crate::LimboError::ParseError(format!("no such collation sequence: {name}").into())
         })?;
         let collator =
             Collator::try_new(locale.into(), CollatorOptions::default()).map_err(|_| {
-                crate::LimboError::ParseError(format!("no such collation sequence: {name}"))
+                crate::LimboError::ParseError(format!("no such collation sequence: {name}").into())
             })?;
 
         let mut collations = self.collations.write();
@@ -410,10 +410,10 @@ pub fn get_expr_collation_ctx_with_symbols(
                     let (_, table_ref) = referenced_tables
                         .find_table_by_internal_id(*table)
                         .ok_or_else(|| {
-                            crate::LimboError::ParseError("table not found".to_string())
+                            crate::LimboError::ParseError("table not found".to_string().into())
                         })?;
                     let column = table_ref.get_column_at(*column).ok_or_else(|| {
-                        crate::LimboError::ParseError("column not found".to_string())
+                        crate::LimboError::ParseError("column not found".to_string().into())
                     })?;
                     if maybe_column_collseq.is_none() {
                         maybe_column_collseq = Some(column.collation());
@@ -487,10 +487,10 @@ fn get_collseq_parts_from_expr_with_symbols(
             Expr::Column { table, column, .. } => {
                 let (_, table_ref) = referenced_tables
                     .find_table_by_internal_id(*table)
-                    .ok_or_else(|| crate::LimboError::ParseError("table not found".to_string()))?;
+                    .ok_or_else(|| crate::LimboError::ParseError("table not found".to_string().into()))?;
                 let column = table_ref
                     .get_column_at(*column)
-                    .ok_or_else(|| crate::LimboError::ParseError("column not found".to_string()))?;
+                    .ok_or_else(|| crate::LimboError::ParseError("column not found".to_string().into()))?;
                 if maybe_column_collseq.is_none() {
                     maybe_column_collseq = column.collation_opt();
                 }
@@ -499,7 +499,7 @@ fn get_collseq_parts_from_expr_with_symbols(
             Expr::RowId { table, .. } => {
                 let (_, table_ref) = referenced_tables
                     .find_table_by_internal_id(*table)
-                    .ok_or_else(|| crate::LimboError::ParseError("table not found".to_string()))?;
+                    .ok_or_else(|| crate::LimboError::ParseError("table not found".to_string().into()))?;
                 if let Some(btree) = table_ref.btree() {
                     if let Some((_, rowid_alias_col)) = btree.get_rowid_alias_column() {
                         if maybe_column_collseq.is_none() {

@@ -249,7 +249,8 @@ fn step_to_end(stmt: &mut Statement) -> Result<()> {
 /// aborts the merge.
 fn member_error(err: LimboError) -> Result<Option<String>> {
     match err {
-        LimboError::Constraint(msg) | LimboError::ForeignKeyConstraint(msg) => Ok(Some(msg)),
+        LimboError::Constraint(msg) => Ok(Some(msg.into_string())),
+        LimboError::ForeignKeyConstraint(msg) => Ok(Some(msg)),
         other => Err(other),
     }
 }
@@ -391,7 +392,7 @@ impl Merger {
     pub fn new(trunk: Arc<Connection>) -> Result<Self> {
         if trunk.branch_id().is_some() {
             return Err(LimboError::InvalidArgument(
-                "a merger writes the trunk; this connection is on a branch".to_string(),
+                "a merger writes the trunk; this connection is on a branch".to_string().into(),
             ));
         }
         let store = trunk.db.branches.clone();
@@ -456,11 +457,16 @@ impl Merger {
         self.merge_as(top, policy, true)
     }
 
-    fn merge_as(&mut self, branch: Branch, policy: MergePolicy, land: bool) -> Result<MergeOutcome> {
+    fn merge_as(
+        &mut self,
+        branch: Branch,
+        policy: MergePolicy,
+        land: bool,
+    ) -> Result<MergeOutcome> {
         if !self.caller.get_auto_commit() {
             return Err(LimboError::InvalidArgument(
                 "the caller's connection has a transaction open; a merge commits its own"
-                    .to_string(),
+                    .to_string().into(),
             ));
         }
         self.mirror_settings();

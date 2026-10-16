@@ -1,3 +1,4 @@
+use crate::error::SqlErrorKind;
 use crate::schema::ColumnLayout;
 use crate::translate::emitter::{emit_index_column_value_old_image, gencol};
 use crate::turso_debug_assert;
@@ -267,7 +268,7 @@ pub fn translate_insert(
     let table_name = &tbl_name.name;
     let table = match resolver.with_schema(database_id, |s| s.get_table(table_name.as_str())) {
         Some(table) => table,
-        None => crate::bail_parse_error!(
+        None => crate::bail_parse_error!(SqlErrorKind::UndefinedTable;
             "no such table: {}",
             crate::util::table_name_for_error(&tbl_name)
         ),
@@ -298,7 +299,7 @@ pub fn translate_insert(
     }
 
     let Some(btree_table) = table.btree() else {
-        crate::bail_parse_error!(
+        crate::bail_parse_error!(SqlErrorKind::UndefinedTable;
             "no such table: {}",
             crate::util::table_name_for_error(&tbl_name)
         );
@@ -380,29 +381,29 @@ pub fn translate_insert(
             }));
     if !btree_table.has_rowid {
         if has_fks {
-            crate::bail_parse_error!("foreign keys on WITHOUT ROWID tables are not supported");
+            crate::bail_parse_error!(SqlErrorKind::FeatureNotSupported; "foreign keys on WITHOUT ROWID tables are not supported");
         }
         if on_conflict == Some(ResolveType::Replace) || !upsert_actions.is_empty() {
-            crate::bail_parse_error!(
+            crate::bail_parse_error!(SqlErrorKind::FeatureNotSupported;
                 "UPSERT and REPLACE on WITHOUT ROWID tables are not supported"
             );
         }
         if cdc_table.is_some() {
-            crate::bail_parse_error!("CDC on WITHOUT ROWID tables is not supported");
+            crate::bail_parse_error!(SqlErrorKind::FeatureNotSupported; "CDC on WITHOUT ROWID tables is not supported");
         }
         if !resolver
             .schema()
             .get_dependent_materialized_views(table_name.as_str())
             .is_empty()
         {
-            crate::bail_parse_error!(
+            crate::bail_parse_error!(SqlErrorKind::FeatureNotSupported;
                 "materialized views on WITHOUT ROWID tables are not supported"
             );
         }
         if resolver.with_schema(database_id, |s| {
             s.get_indices(table_name.as_str()).next().is_some()
         }) {
-            crate::bail_parse_error!("secondary indexes on WITHOUT ROWID tables are not supported");
+            crate::bail_parse_error!(SqlErrorKind::FeatureNotSupported; "secondary indexes on WITHOUT ROWID tables are not supported");
         }
     }
 
@@ -2078,12 +2079,12 @@ fn bind_insert(
                                             ))
                                             .into();
                                         } else {
-                                            crate::bail_parse_error!("no such column: {name}");
+                                            crate::bail_parse_error!(SqlErrorKind::UndefinedColumn; "no such column: {name}");
                                         }
                                     }
                                     Expr::Qualified(first_name, second_name) => {
                                         // an INSERT INTO ... VALUES (...) cannot reference columns
-                                        crate::bail_parse_error!(
+                                        crate::bail_parse_error!(SqlErrorKind::UndefinedColumn;
                                             "no such column: {first_name}.{second_name}"
                                         );
                                     }
@@ -2331,7 +2332,7 @@ fn init_source_emission<'a>(
                                             "table {} has no column named {}",
                                             table.get_name(),
                                             column_name
-                                        ))
+                                        ).into())
                                     })
                             })
                             .collect::<Result<String>>()?
@@ -3406,7 +3407,7 @@ fn translate_virtual_table_insert(
             _ => crate::bail_parse_error!("Virtual tables only support VALUES clause in INSERT"),
         },
         InsertBody::DefaultValues => (0, vec![]),
-        _ => crate::bail_parse_error!("Unsupported INSERT body for virtual tables"),
+        _ => crate::bail_parse_error!(SqlErrorKind::FeatureNotSupported; "Unsupported INSERT body for virtual tables"),
     };
     let table = Table::Virtual(virtual_table.clone());
     let cursor_id = program.alloc_cursor_id(CursorType::VirtualTable(virtual_table));
@@ -3417,7 +3418,7 @@ fn translate_virtual_table_insert(
     /* *
      * Inserts for virtual tables are done in a single step.
      * argv[0] = (NULL for insert)
-     */
+    */
     let registers_start = program.alloc_register();
     program.emit_insn(Insn::Null {
         dest: registers_start,
@@ -3426,7 +3427,7 @@ fn translate_virtual_table_insert(
     /* *
      * argv[1] = (rowid for insert - NULL in most cases)
      * argv[2..] = column values
-     * */
+    * */
     let insertion = build_insertion(program, &table, &columns, num_values)?;
 
     translate_rows_single(program, &value, &insertion, resolver, false)?;

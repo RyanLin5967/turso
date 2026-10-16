@@ -1,6 +1,8 @@
 use pg_query::ParseResult;
 use thiserror::Error;
 
+pub use turso_parser::sql_error::{SqlErrorKind, SqlErrorMessage};
+
 pub mod translator;
 
 /// libpg_query's bindings, for callers that edit a parse tree (the frontend's table rebuild).
@@ -9,7 +11,15 @@ pub use pg_query;
 #[derive(Debug, Error)]
 pub enum ParseError {
     #[error("{0}")]
-    ParseError(String),
+    ParseError(SqlErrorMessage),
+}
+
+impl From<ParseError> for SqlErrorMessage {
+    fn from(error: ParseError) -> Self {
+        match error {
+            ParseError::ParseError(message) => message,
+        }
+    }
 }
 
 thread_local! {
@@ -30,13 +40,13 @@ fn count_libpg_query_call() {
 /// Parse a PostgreSQL SQL statement using pg_query
 pub fn parse(sql: &str) -> Result<ParseResult, ParseError> {
     count_libpg_query_call();
-    pg_query::parse(sql).map_err(|e| ParseError::ParseError(e.to_string()))
+    pg_query::parse(sql).map_err(|e| ParseError::ParseError(e.to_string().into()))
 }
 
 /// Deparse a parse tree back to SQL text (libpg_query's deparser).
 pub fn deparse(protobuf: &pg_query::protobuf::ParseResult) -> Result<String, ParseError> {
     count_libpg_query_call();
-    pg_query::deparse(protobuf).map_err(|e| ParseError::ParseError(e.to_string()))
+    pg_query::deparse(protobuf).map_err(|e| ParseError::ParseError(e.to_string().into()))
 }
 
 /// The highest parameter number a statement may hold: Bind counts parameters in 16 bits. A `$n`
@@ -60,9 +70,10 @@ pub const MAX_PARAMETER: u32 = 65535;
 /// tree whose parameters cannot be read, is refused (fail closed).
 pub fn checked_param_numbers(parse: &ParseResult, sql: &str) -> Result<Vec<i32>, ParseError> {
     let unreadable = || {
-        ParseError::ParseError(
+        ParseError::ParseError(SqlErrorMessage::classified(
+            SqlErrorKind::InternalError,
             "could not read the statement's parameters from its parse tree".to_string(),
-        )
+        ))
     };
     let mut numbers = Vec::new();
     for (number, location) in param_refs(parse).ok_or_else(unreadable)? {
@@ -79,9 +90,12 @@ pub fn checked_param_numbers(parse: &ParseResult, sql: &str) -> Result<Vec<i32>,
         let ident = |c: &u8| c.is_ascii_alphanumeric() || *c == b'_' || *c >= 0x80;
         let junk = digits[len..].iter().take_while(|c| ident(c)).count();
         if junk > 0 {
-            return Err(ParseError::ParseError(format!(
-                "trailing junk after parameter at or near \"${}\"",
-                &sql[location + 1..location + 1 + len + junk]
+            return Err(ParseError::ParseError(SqlErrorMessage::classified(
+                SqlErrorKind::SyntaxError,
+                format!(
+                    "trailing junk after parameter at or near \"${}\"",
+                    &sql[location + 1..location + 1 + len + junk]
+                ),
             )));
         }
         let value = text.bytes().try_fold(0u64, |v, d| {
@@ -97,7 +111,7 @@ pub fn checked_param_numbers(parse: &ParseResult, sql: &str) -> Result<Vec<i32>,
             _ => {
                 return Err(ParseError::ParseError(format!(
                     "parameter number too large at or near \"${text}\""
-                )))
+                ).into()))
             }
         }
     }
@@ -309,8 +323,8 @@ pub fn skip_blank(b: &[u8], mut i: usize) -> Option<usize> {
 /// a REPL wants, see [`split_statements_lenient`].
 pub fn split_statements(sql: &str) -> Result<Vec<String>, ParseError> {
     count_libpg_query_call();
-    let parts =
-        pg_query::split_with_parser(sql).map_err(|e| ParseError::ParseError(e.to_string()))?;
+    let parts = pg_query::split_with_parser(sql)
+        .map_err(|e| ParseError::ParseError(e.to_string().into()))?;
     Ok(parts
         .into_iter()
         .map(|s| pg_trim(s).to_string())
@@ -328,8 +342,8 @@ pub fn split_statements(sql: &str) -> Result<Vec<String>, ParseError> {
 /// (wire review 18 item 7). A simple Query over the wire uses [`split_statements`].
 pub fn split_statements_lenient(sql: &str) -> Result<Vec<String>, ParseError> {
     count_libpg_query_call();
-    let found =
-        pg_query::split_with_scanner(sql).map_err(|e| ParseError::ParseError(e.to_string()))?;
+    let found = pg_query::split_with_scanner(sql)
+        .map_err(|e| ParseError::ParseError(e.to_string().into()))?;
     let b = sql.as_bytes();
     let blank = |gap: &[u8]| skip_blank(gap, 0) == Some(gap.len());
     let mut parts = Vec::with_capacity(found.len());
@@ -341,7 +355,7 @@ pub fn split_statements_lenient(sql: &str) -> Result<Vec<String>, ParseError> {
             .checked_sub(sql.as_ptr() as usize)
             .filter(|start| *start >= at && *start + part.len() <= b.len())
             .ok_or_else(|| {
-                ParseError::ParseError("the scanner split lost its place".to_string())
+                ParseError::ParseError("the scanner split lost its place".to_string().into())
             })?;
         if !blank(&b[at..start]) {
             parts.push(&sql[at..start]);
@@ -372,7 +386,7 @@ pub fn get_tables(sql: &str) -> Result<Vec<String>, ParseError> {
 /// Normalize a query (replace constants with $1, $2, etc.)
 pub fn normalize(sql: &str) -> Result<String, ParseError> {
     count_libpg_query_call();
-    pg_query::normalize(sql).map_err(|e| ParseError::ParseError(e.to_string()))
+    pg_query::normalize(sql).map_err(|e| ParseError::ParseError(e.to_string().into()))
 }
 
 /// Get a fingerprint for a query (for caching/deduplication)
@@ -380,7 +394,7 @@ pub fn fingerprint(sql: &str) -> Result<String, ParseError> {
     count_libpg_query_call();
     pg_query::fingerprint(sql)
         .map(|fp| fp.hex)
-        .map_err(|e| ParseError::ParseError(e.to_string()))
+        .map_err(|e| ParseError::ParseError(e.to_string().into()))
 }
 
 /// What a schema qualifier names in this frontend: the one rule every reader of a relation's or a

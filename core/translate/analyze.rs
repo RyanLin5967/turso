@@ -1,3 +1,4 @@
+use crate::error::SqlErrorKind;
 use crate::sync::Arc;
 
 use crate::{
@@ -47,7 +48,7 @@ fn resolve_analyze_targets(
                 // But first check if the name is actually a database name too (shouldn't be with db_name set)
                 let targets = resolve_targets_in_db(&normalized, database_id, resolver)?;
                 if targets.is_empty() {
-                    bail_parse_error!("no such table or index: {}.{}", db_normalized, normalized);
+                    bail_parse_error!(SqlErrorKind::UndefinedTable; "no such table or index: {}.{}", db_normalized, normalized);
                 }
                 return Ok((database_id, targets));
             }
@@ -67,7 +68,7 @@ fn resolve_analyze_targets(
             // Not a database name — search main schema for table/index
             let targets = resolve_targets_in_db(&normalized, 0, resolver)?;
             if targets.is_empty() {
-                bail_parse_error!("no such table or index: {}", target.name);
+                bail_parse_error!(SqlErrorKind::UndefinedTable; "no such table or index: {}", target.name);
             }
             Ok((0, targets))
         }
@@ -249,7 +250,7 @@ pub fn translate_analyze(
 
     for (target_table, target_index) in analyze_targets {
         if !target_table.has_rowid {
-            bail_parse_error!("ANALYZE on tables without rowid is not supported");
+            bail_parse_error!(SqlErrorKind::FeatureNotSupported; "ANALYZE on tables without rowid is not supported");
         }
 
         // Remove existing stat rows for this target before inserting fresh ones.

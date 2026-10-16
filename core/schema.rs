@@ -1,3 +1,4 @@
+use crate::error::{SqlErrorKind, SqlErrorMessage};
 use crate::alloc::vec;
 use crate::alloc::TursoFromIterator;
 use crate::alloc::*;
@@ -471,7 +472,7 @@ impl TypeDef {
                     return Err(crate::LimboError::ParseError(format!(
                         "UNION type cannot have more than 256 variants (got {})",
                         fields.len()
-                    )));
+                    ).into()));
                 }
                 let variants: Vec<UnionVariantDef> = fields
                     .iter()
@@ -718,7 +719,7 @@ impl Sequence {
         let increment_by = increment.unwrap_or(1);
         if increment_by == 0 {
             return Err(crate::LimboError::ParseError(
-                "INCREMENT must not be zero".to_string(),
+                "INCREMENT must not be zero".to_string().into(),
             ));
         }
         let min_val = min_value.unwrap_or(if increment_by > 0 { 1 } else { i64::MIN });
@@ -726,18 +727,18 @@ impl Sequence {
         if min_val >= max_val {
             return Err(crate::LimboError::ParseError(format!(
                 "MINVALUE ({min_val}) must be less than MAXVALUE ({max_val})"
-            )));
+            ).into()));
         }
         let start_val = start.unwrap_or(if increment_by > 0 { min_val } else { max_val });
         if start_val < min_val {
             return Err(crate::LimboError::ParseError(format!(
                 "START value ({start_val}) cannot be less than MINVALUE ({min_val})"
-            )));
+            ).into()));
         }
         if start_val > max_val {
             return Err(crate::LimboError::ParseError(format!(
                 "START value ({start_val}) cannot be greater than MAXVALUE ({max_val})"
-            )));
+            ).into()));
         }
         Ok(Self {
             name,
@@ -1040,7 +1041,7 @@ impl Schema {
             if !visited.insert(current.clone()) {
                 return Err(crate::LimboError::ParseError(format!(
                     "circular type dependency detected: {current}"
-                )));
+                ).into()));
             }
             match self.type_registry.get(&current) {
                 Some(td) => {
@@ -1093,7 +1094,7 @@ impl Schema {
             _ => {
                 return Err(crate::LimboError::ParseError(format!(
                     "invalid type sql: {sql}"
-                )));
+                ).into()));
             }
         }
         Ok(())
@@ -1222,8 +1223,9 @@ impl Schema {
 
             Ok(())
         } else {
-            Err(crate::LimboError::ParseError(format!(
-                "no such view: {name}"
+            Err(crate::LimboError::ParseError(SqlErrorMessage::classified(
+                SqlErrorKind::UndefinedTable,
+                format!("no such view: {name}"),
             )))
         }
     }
@@ -1299,7 +1301,7 @@ impl Schema {
         if !removed {
             return Err(crate::LimboError::ParseError(format!(
                 "no such trigger: {name}"
-            )));
+            ).into()));
         }
         Ok(())
     }
@@ -1582,7 +1584,7 @@ impl Schema {
                 MakeFromBtreePhase::Init => {
                     if mv_cursor.is_some() {
                         return Err(crate::LimboError::ParseError(
-                            "MVCC is not supported for make_from_btree schema recovery".to_string(),
+                            SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, "MVCC is not supported for make_from_btree schema recovery".to_string()),
                         ));
                     }
 
@@ -1853,7 +1855,7 @@ impl Schema {
                             return Err(LimboError::ParseError(format!(
                                 "Column {col_name} not found in table {}",
                                 table.name
-                            )));
+                            ).into()));
                         };
                         if column.is_rowid_alias() {
                             // rowid alias, no index needed
@@ -1888,7 +1890,7 @@ impl Schema {
                             return Err(crate::LimboError::ParseError(format!(
                                 "Column {} not found in table {}",
                                 unique_column.name, table.name
-                            )));
+                            ).into()));
                         };
                         column_indices_and_sort_orders
                             .push_within_capacity((pos_in_table, unique_column.sort_order))
@@ -2159,7 +2161,7 @@ impl Schema {
                         return Err(LimboError::ParseError(format!(
                             "table '{}' uses generated columns but the generated_columns feature is not enabled",
                             table.name
-                        )));
+                        ).into()));
                     }
 
                     // Detect sequence-backing tables by name prefix.
@@ -2367,7 +2369,7 @@ impl Schema {
                 else {
                     return Err(crate::LimboError::ParseError(format!(
                         "invalid trigger sql: {sql}"
-                    )));
+                    ).into()));
                 };
                 // Resolve the target database from the SQL qualifier:
                 // CREATE TEMP TRIGGER ... ON main.tbl → target is MAIN_DB_ID
@@ -2617,7 +2619,7 @@ impl Schema {
                 (_, SchemaObjectType::Table) => format!("table {name} already exists"),
                 (_, SchemaObjectType::View) => format!("view {name} already exists"),
             };
-            return Err(crate::LimboError::ParseError(msg));
+            return Err(crate::LimboError::ParseError(msg.into()));
         }
         Ok(())
     }
@@ -4277,7 +4279,7 @@ pub fn resolve_gencol_expr_columns(gencol_expr: &mut Expr, columns: &[Column]) -
                         .as_ref()
                         .is_some_and(|n| n.eq_ignore_ascii_case(&col_name))
                 })
-                .ok_or_else(|| LimboError::ParseError(format!("no such column: {col_name}")))?;
+                .ok_or_else(|| LimboError::ParseError(SqlErrorMessage::classified(SqlErrorKind::UndefinedColumn, format!("no such column: {col_name}"))))?;
             *e = Expr::Column {
                 database: None,
                 table: TableInternalId::SELF_TABLE,
@@ -4414,7 +4416,7 @@ pub(crate) fn validate_generated_expr(expr: &Expr) -> Result<()> {
                 return Err(LimboError::ParseError(format!(
                     "could not resolve function {}",
                     name.as_str()
-                )));
+                ).into()));
             };
             if matches!(func, Func::Agg(_)) {
                 bail_parse_error!("aggregate functions prohibited in generated columns");
@@ -4435,7 +4437,7 @@ pub(crate) fn validate_generated_expr(expr: &Expr) -> Result<()> {
                 return Err(LimboError::ParseError(format!(
                     "could not resolve function {}",
                     name.as_str()
-                )));
+                ).into()));
             };
 
             if matches!(func, Func::Agg(_)) {
@@ -4528,7 +4530,7 @@ fn constraint_column_collation(expr: &Expr) -> Result<(&Expr, Option<CollationSe
         Expr::Collate(inner, collation_name) => {
             let collation_seq = CollationSeq::new(collation_name.as_str())?;
             if collation_seq.is_custom() {
-                crate::bail_parse_error!(
+                crate::bail_parse_error!(SqlErrorKind::FeatureNotSupported;
                     "custom collations are not supported in schema definitions"
                 );
             }
@@ -4666,7 +4668,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
 
                     // Only check arity if parent columns were explicitly listed
                     if !parent_columns.is_empty() && child_columns.len() != parent_columns.len() {
-                        crate::bail_parse_error!(
+                        crate::bail_parse_error!(SqlErrorKind::InvalidForeignKey;
                             "foreign key on \"{}\" has {} child column(s) but {} parent column(s)",
                             tbl_name,
                             child_columns.len(),
@@ -4798,7 +4800,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                 .as_ref()
                                 .is_some_and(|t| matches!(t, ast::GeneratedColumnType::Stored))
                             {
-                                bail_parse_error!("Stored generated columns are not supported");
+                                bail_parse_error!(SqlErrorKind::FeatureNotSupported; "Stored generated columns are not supported");
                             }
                             validate_generated_expr(expr)?;
                             generated = Some(expr.clone());
@@ -4864,7 +4866,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         ast::ColumnConstraint::Collate { ref collation_name } => {
                             let collation_seq = CollationSeq::new(collation_name.as_str())?;
                             if collation_seq.is_custom() {
-                                crate::bail_parse_error!(
+                                crate::bail_parse_error!(SqlErrorKind::FeatureNotSupported;
                                     "custom collations are not supported in schema definitions"
                                 );
                             }
@@ -5002,7 +5004,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
             }
         }
         CreateTableBody::AsSelect(_) => {
-            crate::bail_parse_error!("CREATE TABLE AS SELECT is not supported")
+            crate::bail_parse_error!(SqlErrorKind::FeatureNotSupported; "CREATE TABLE AS SELECT is not supported")
         }
     };
 
@@ -5583,7 +5585,7 @@ impl TryFrom<&ColumnDefinition> for Column {
                 ast::ColumnConstraint::Collate { collation_name } => {
                     let collation_seq = CollationSeq::new(collation_name.as_str())?;
                     if collation_seq.is_custom() {
-                        crate::bail_parse_error!(
+                        crate::bail_parse_error!(SqlErrorKind::FeatureNotSupported;
                             "custom collations are not supported in schema definitions"
                         );
                     }
@@ -5931,7 +5933,7 @@ impl Index {
                 return Err(crate::LimboError::ParseError(format!(
                     "Column {} not found in table {}",
                     col_name, table.name
-                )));
+                ).into()));
             };
             let (_, column) = table.get_column(col_name).unwrap();
             primary_keys
@@ -5986,7 +5988,7 @@ impl Index {
                 return Err(crate::LimboError::ParseError(format!(
                     "Unique constraint column not found in table {}",
                     table.name
-                )));
+                ).into()));
             };
             unique_cols
                 .push_within_capacity(IndexColumn {

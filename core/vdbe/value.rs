@@ -726,7 +726,7 @@ impl Value {
             return Err(LimboError::InvalidArgument(format!(
                 "index {offset} out of valid range, 0..{}",
                 len - 1
-            )));
+            ).into()));
         }
         Ok(Value::from_i64(i64::from(bytes[offset as usize])))
     }
@@ -750,7 +750,7 @@ impl Value {
             return Err(LimboError::InvalidArgument(format!(
                 "index {offset} out of valid range, 0..{}",
                 len - 1
-            )));
+            ).into()));
         }
         // Copy into a Turso-allocated blob, then overwrite the target byte in place.
         let mut result = Value::from_slice(&bytes)?;
@@ -826,13 +826,13 @@ impl Value {
                     i += 10;
                     v
                 }
-                _ => return Err(LimboError::ParseError("invalid Unicode escape".to_string())),
+                _ => return Err(LimboError::ParseError("invalid Unicode escape".to_string().into())),
             };
 
             // Reject surrogates and values above U+10FFFF. SQLite encodes
             // these as raw bytes, but Value::Text requires valid UTF-8.
             let ch = char::from_u32(v)
-                .ok_or_else(|| LimboError::ParseError("invalid Unicode escape".to_string()))?;
+                .ok_or_else(|| LimboError::ParseError("invalid Unicode escape".to_string().into()))?;
             out.push(ch);
         }
 
@@ -1269,7 +1269,7 @@ impl Value {
         const MAX_LIKE_PATTERN_LENGTH: usize = 50000;
         if pattern.len() > MAX_LIKE_PATTERN_LENGTH {
             return Err(LimboError::Constraint(
-                "LIKE or GLOB pattern too complex".to_string(),
+                "LIKE or GLOB pattern too complex".to_string().into(),
             ));
         }
         let pattern = sqlite_text_prefix(pattern);
@@ -1313,7 +1313,7 @@ impl Value {
 
         if pattern.len() > MAX_GLOB_PATTERN_LENGTH {
             return Err(LimboError::Constraint(
-                "GLOB pattern too complex".to_string(),
+                "GLOB pattern too complex".to_string().into(),
             ));
         }
         let pattern = sqlite_text_prefix(pattern);
@@ -1483,7 +1483,7 @@ impl Value {
 /// Parse exactly `n` hex digits into a u32. Mirrors SQLite's isNHex().
 fn parse_n_hex(bytes: &[u8], n: usize) -> Result<u32> {
     if bytes.len() < n {
-        return Err(LimboError::ParseError("invalid Unicode escape".to_string()));
+        return Err(LimboError::ParseError("invalid Unicode escape".to_string().into()));
     }
     let mut v: u32 = 0;
     for &b in &bytes[..n] {
@@ -1491,7 +1491,7 @@ fn parse_n_hex(bytes: &[u8], n: usize) -> Result<u32> {
             b'0'..=b'9' => b - b'0',
             b'a'..=b'f' => b - b'a' + 10,
             b'A'..=b'F' => b - b'A' + 10,
-            _ => return Err(LimboError::ParseError("invalid Unicode escape".to_string())),
+            _ => return Err(LimboError::ParseError("invalid Unicode escape".to_string().into())),
         };
         v = (v << 4) | digit as u32;
     }
