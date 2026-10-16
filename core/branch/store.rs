@@ -1583,6 +1583,12 @@ pub(crate) struct StoreCounts {
     audited: std::sync::atomic::AtomicBool,
 }
 
+/// Test builds: the innermost store this thread works for, as an identity (0: none).
+#[cfg(test)]
+pub(crate) fn scope_store_id() -> usize {
+    SCOPE.with(|s| s.borrow().last().map_or(0, |c| Arc::as_ptr(c) as usize))
+}
+
 /// Test builds: the innermost store this thread works for is the audited one.
 #[cfg(test)]
 pub(crate) fn scope_is_audited() -> bool {
@@ -4544,6 +4550,11 @@ impl BranchStore {
             install_rewrites: get(&c.install_rewrites),
             syncs_under_store_mutex: get(&c.syncs_under_store_mutex),
         }
+    }
+
+    /// Test builds: this store's identity, as `scope_store_id` gives it.
+    pub(crate) fn store_id_for_test(&self) -> usize {
+        Arc::as_ptr(&self.inner.counts) as usize
     }
 
     /// Test builds: this store's syncs (its branch files, its catalog's, its trunk database's).

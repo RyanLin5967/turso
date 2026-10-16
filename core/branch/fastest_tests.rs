@@ -9008,8 +9008,15 @@ fn lifecycle_audit(n: u32) {
     probe::arm(true);
     // FLAGGED fixture change (the per-store counter class, d9cf2b609b): the audit records only this
     // store's holds, so another test's holds neither fill its log nor enter its claim.
-    // The store's own path is the real one (`Database`'s base: symlinks resolved).
-    *super::budget_probe::AUDIT_PATH.lock().unwrap() = Some(std::fs::canonicalize(&path).unwrap().to_str().unwrap().to_string());
+    // The store's own path is the real one (`Database`'s base: symlinks resolved). Mutant
+    // `audit_path_wrong` (test builds only): the path as given, not the store's, the own-store
+    // premise's red (lead ruling 67664df569).
+    let audited = if super::store::fe_mutant("audit_path_wrong") {
+        path.to_str().unwrap().to_string()
+    } else {
+        std::fs::canonicalize(&path).unwrap().to_str().unwrap().to_string()
+    };
+    *super::budget_probe::AUDIT_PATH.lock().unwrap() = Some(audited);
     AUDIT.store(true, Release);
     mark(&mut marks, "open");
     let db = reopen(&path, opts(true, SyncClass::FullFsync), incarnation);
@@ -9070,6 +9077,15 @@ fn lifecycle_audit(n: u32) {
     probe::arm(false);
     let log: Vec<HoldRec> = AUDIT_LOG.lock().unwrap().clone();
     assert_eq!(AUDIT_LOST.load(Relaxed), 0, "premise: the audit log lost holds (its room was too small)");
+    // Lead ruling 67664df569: the scoping cannot silently empty the audit. This arm recorded at least
+    // one hold, and every hold it recorded is of its OWN store.
+    let own = db.branches.store_id_for_test();
+    let mine = log.iter().filter(|r| r.store == own).count();
+    assert!(
+        mine > 0 && mine == log.len(),
+        "premise: the audit recorded {mine} holds of its own store, of {} (n = {n})",
+        log.len()
+    );
     assert!(db.branches.name_filter_stats().3 > builds0, "premise: no filter growth happened ({entries0} entries)");
     assert!(db.branches.name_filter_state_for_test().1 > rebuilds0, "premise: the forced overflow never rebuilt the filter");
     // Group each hold under the operation whose span it fell in.
@@ -9530,7 +9546,7 @@ fn diag_create_write_delete_syscalls_by_thread() {
 /// subtracts 1 "for the reading", which costs 0 BSD syscalls (measured: raw l35-diag-ckpt): a
 /// tightening, so newly red cells are real.
 #[test]
-fn a_fuzzy_checkpoint_issues_at_most_two_syscalls_under_the_store_mutex() {
+pub(crate) fn a_fuzzy_checkpoint_issues_at_most_two_syscalls_under_the_store_mutex() {
     use super::budget_probe::ran_between;
     let _s = serial();
     struct Disarm;

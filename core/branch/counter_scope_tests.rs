@@ -161,3 +161,41 @@ fn every_store_count_has_a_store() {
         .unwrap_or_else(|| panic!("premise: the lifecycle child ran:\n{text}"));
     assert_eq!(n, 0, "{n} store counts were made in no store's scope: a counter is not per store there");
 }
+
+/// The per-store counter class, the held-syscall budget (lead ruling 67664df569): in a parallel test
+/// run, `a_fuzzy_checkpoint_issues_at_most_two_syscalls_under_the_store_mutex` REFUSED (raws
+/// pc-branch-base_177f007c8 and pc-branch2_eb2f14846: "only 0 of up to 12 rounds could be
+/// attributed by thread"), because its count is the task's and another test's threads ran. Here
+/// another store works on another thread while that test runs: it must reach a verdict (its CLAIM,
+/// red or green), never the refusal. The test itself is called unchanged; its threshold is not read
+/// here.
+#[test]
+fn the_fuzzy_held_syscall_budget_is_judged_beside_another_stores_work() {
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let dir = tempfile::TempDir::new().unwrap();
+    let busy = {
+        let (stop, path) = (stop.clone(), dir.path().join("busy.db"));
+        std::thread::spawn(move || {
+            let db = open(&path, SyncClass::Fsync, BranchCheckpoint::Fuzzy);
+            let trunk = db.connect().unwrap();
+            trunk.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+            let mut i = 0u64;
+            while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                trunk.create_branch(&format!("busy{i}")).unwrap();
+                i += 1;
+            }
+            i
+        })
+    };
+    let judged = std::panic::catch_unwind(super::fastest_tests::a_fuzzy_checkpoint_issues_at_most_two_syscalls_under_the_store_mutex);
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    let creates = busy.join().unwrap();
+    assert!(creates > 0, "premise: the other store worked");
+    if let Err(e) = judged {
+        let msg = e.downcast_ref::<String>().cloned().or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default();
+        assert!(
+            !msg.contains("could be attributed by thread"),
+            "REFUSED beside another store's work ({creates} creates on another thread): {msg}"
+        );
+    }
+}

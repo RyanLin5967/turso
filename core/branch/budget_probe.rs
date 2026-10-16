@@ -78,6 +78,9 @@ pub(crate) struct HoldRec {
     pub(crate) allocs: u64,
     pub(crate) alloc_bytes: u64,
     pub(crate) cat_stmts: u64,
+    /// The store whose mutex this was (`store::scope_store_id`): the audit's premise that every
+    /// hold it recorded is its own store's.
+    pub(crate) store: usize,
 }
 
 /// The audit's log, recorded while `AUDIT` is set; the test reserves its room first, so recording
@@ -542,6 +545,7 @@ pub(crate) fn store_unlocked() {
                         allocs: get(&T_HELD_ALLOCS).wrapping_sub(allocs0),
                         alloc_bytes: bytes,
                         cat_stmts: get(&T_CAT_STMTS).wrapping_sub(stmts0),
+                        store: crate::branch::store::scope_store_id(),
                     };
                     match AUDIT_LOG.try_lock() {
                         Ok(mut log) if log.len() < log.capacity() => log.push(rec),
