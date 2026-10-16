@@ -2828,11 +2828,14 @@ impl PostgreSQLTranslator {
     }
 
     fn subquery_column_names(&self, select: &pg_query::protobuf::SelectStmt) -> Option<Vec<String>> {
-        use pg_query::protobuf::node::Node;
         let _nest = crate::nest().ok()?;
         if let Some(left) = &select.larg { return self.subquery_column_names(left); }
         if select.target_list.is_empty() { return cte_output_names(select); }
-        self.in_cte_scope(&select.with_clause, || {
+        self.in_cte_scope(&select.with_clause, || Ok(self.subquery_names_in_scope(select))).ok().flatten()
+    }
+
+    fn subquery_names_in_scope(&self, select: &pg_query::protobuf::SelectStmt) -> Option<Vec<String>> {
+        use pg_query::protobuf::node::Node;
             let mut columns = Vec::new();
             for target in &select.target_list {
                 let Some(Node::ResTarget(target)) = target.node.as_ref() else { return None; };
@@ -2861,7 +2864,6 @@ impl PostgreSQLTranslator {
                 columns.push(figure_colname(value));
             }
             Some(columns)
-        })
     }
 
     fn translate_range_function(
@@ -7036,7 +7038,7 @@ fn alias_select_columns(
         with: Some(ast::With { recursive: false, ctes: vec![ast::CommonTableExpr {
             tbl_name: name.clone(),
             columns: columns.into_iter().map(|name| ast::IndexedColumn {
-                col_name: ast::Name::from_string(name), collate: None, order: None,
+                col_name: ast::Name::from_string(name), collation_name: None, order: None,
             }).collect(),
             materialized: ast::Materialized::Any,
             select,
@@ -7058,53 +7060,6 @@ fn rename_columns(columns: &mut [String], names: &[pg_query::protobuf::Node]) {
         if let Some(pg_query::protobuf::node::Node::String(s)) = name.node.as_ref() {
             column.clone_from(&s.sval);
         }
-    }
-}
-
-/// A SELECT's output column names as PostgreSQL names them (an alias, a column reference's last
-/// field, a function's name, else "?column?"), or None when the walk cannot name them all (a `*`, a
-/// set operation).
-fn select_output_names(select: &pg_query::protobuf::SelectStmt) -> Option<Vec<String>> {
-    use pg_query::protobuf::node::Node;
-    if select.larg.is_some() || select.target_list.is_empty() {
-        return None;
-    }
-    select
-        .target_list
-        .iter()
-        .map(|t| {
-            let Some(Node::ResTarget(t)) = t.node.as_ref() else {
-                return None;
-            };
-            if !t.name.is_empty() {
-                return Some(t.name.clone());
-            }
-            t.val.as_deref().and_then(output_name)
-        })
-        .collect()
-}
-
-/// The name PostgreSQL gives an unaliased output (FigureColname), for the forms read here: a
-/// column reference's last name, a function's name, a cast's argument's name, else the type's.
-/// None for any other expression, so its relation's columns count as unknown and a bare name over
-/// them is refused rather than resolved: every other output was named `?column?`, which PostgreSQL
-/// gives only some (`SELECT id::int` is `id` there; wire review 16 item 21).
-fn output_name(node: &pg_query::protobuf::Node) -> Option<String> {
-    use pg_query::protobuf::node::Node;
-    let last = |names: &[pg_query::protobuf::Node]| match names.last().and_then(|n| n.node.as_ref())
-    {
-        Some(Node::String(s)) => Some(s.sval.clone()),
-        _ => None,
-    };
-    match node.node.as_ref()? {
-        Node::ColumnRef(c) => last(&c.fields),
-        Node::FuncCall(f) => last(&f.funcname),
-        Node::TypeCast(c) => c
-            .arg
-            .as_deref()
-            .and_then(output_name)
-            .or_else(|| c.type_name.as_ref().and_then(|t| last(&t.names))),
-        _ => None,
     }
 }
 
