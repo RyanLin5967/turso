@@ -2267,6 +2267,19 @@ mod c52_tests {
                 query = outer;
             }
             parse.protobuf.stmts[0].stmt = Some(query);
+            let mut identities = std::collections::BTreeSet::new();
+            let mut cursor = parse.protobuf.stmts[0].stmt.as_deref();
+            while let Some(Node::SelectStmt(select)) = cursor.and_then(|node| node.node.as_ref()) {
+                assert!(identities.insert(select.as_ref() as *const SelectStmt as usize));
+                cursor = match select.target_list[0].node.as_ref() {
+                    Some(Node::ResTarget(target)) => match target.val.as_deref().and_then(|node| node.node.as_ref()) {
+                        Some(Node::SubLink(scalar)) => scalar.subselect.as_deref(),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+            }
+            assert_eq!(identities.len(), depth + 1);
             let schema = std::sync::Arc::new(Schema::default());
             let attached = Attached { names: &[], holds: &|_, _| false };
             let walked = parameter_types(&parse, &schema, &[], &Default::default(),
