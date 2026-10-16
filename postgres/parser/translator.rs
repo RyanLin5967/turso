@@ -27,21 +27,34 @@ pub struct TranslateResult {
 #[derive(Debug, Clone, Default)]
 pub struct ExpressionTypes {
     oids: std::collections::HashMap<usize, u32>,
-    locations: std::collections::HashMap<(u8, i32), Option<u32>>,
+    locations: std::collections::HashMap<(u8, i32), AnnotationSources>,
+}
+
+/// Most source locations name one expression. A rewritten source may contain
+/// distinct nodes at the same location; only a unanimous current OID is reusable.
+#[derive(Debug, Clone)]
+enum AnnotationSources {
+    One(usize),
+    Many(Vec<usize>),
 }
 
 impl ExpressionTypes {
     pub fn insert(&mut self, node: &pg_query::protobuf::Node, oid: u32) {
-        self.oids.insert(node as *const _ as usize, oid);
+        let address = node as *const _ as usize;
+        self.oids.insert(address, oid);
         if let Some(location) = Self::location(node) {
             self.locations
                 .entry(location)
-                .and_modify(|known| {
-                    if *known != Some(oid) {
-                        *known = None;
+                .and_modify(|known| match known {
+                    AnnotationSources::One(previous) if *previous != address => {
+                        *known = AnnotationSources::Many(vec![*previous, address]);
                     }
+                    AnnotationSources::Many(sources) if !sources.contains(&address) => {
+                        sources.push(address);
+                    }
+                    _ => {}
                 })
-                .or_insert(Some(oid));
+                .or_insert(AnnotationSources::One(address));
         }
     }
 
@@ -50,7 +63,17 @@ impl ExpressionTypes {
             .get(&(node as *const _ as usize))
             .copied()
             .or_else(|| {
-                Self::location(node).and_then(|key| self.locations.get(&key).copied().flatten())
+                let sources = self.locations.get(&Self::location(node)?)?;
+                match sources {
+                    AnnotationSources::One(address) => self.oids.get(address).copied(),
+                    AnnotationSources::Many(addresses) => {
+                        let first = *self.oids.get(addresses.first()?)?;
+                        addresses
+                            .iter()
+                            .all(|address| self.oids.get(address) == Some(&first))
+                            .then_some(first)
+                    }
+                }
             })
     }
 

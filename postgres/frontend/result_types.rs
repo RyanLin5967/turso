@@ -78,6 +78,8 @@ fn integer_literal_fits_i64(text: &str) -> bool {
 
 /// What the parameter walk gives a statement ([`parameter_types`]).
 pub struct Walked {
+    #[cfg(test)]
+    work: usize,
     /// The type OID of each $n its context types, by n ([`StatementTypes::params`]).
     pub params: std::collections::BTreeMap<u32, u32>,
     /// The $n compared with an expression no context types ([`StatementTypes::untyped`]).
@@ -225,10 +227,13 @@ fn parameter_types_with(
     declared: &std::collections::BTreeMap<u32, u32>,
 ) -> Result<Walked, turso_core::LimboError> {
     let mut infer = Infer {
+        #[cfg(test)]
+        work: Default::default(),
         stack_limited: Default::default(),
         expressions: Default::default(),
         schema,
         types: declared.clone(),
+        parameter_links: Default::default(),
         compared_untyped: std::collections::BTreeSet::new(),
         ctes: Vec::new(),
         views: Vec::new(),
@@ -243,9 +248,11 @@ fn parameter_types_with(
     let mut columns = Vec::new();
     if let [raw] = parse.protobuf.stmts.as_slice() {
         if let Some(stmt) = raw.stmt.as_deref() {
+            // Context can propagate through a chain of bare parameters. `set`
+            // resolves those recorded relationships with a worklist, without
+            // revisiting the whole statement once per parameter. The final pass
+            // publishes every occurrence against that solved map.
             infer.statement(stmt);
-            // A later WHERE or cast can type a parameter used by an earlier result expression.
-            // Revisit that same tree with the solved parameters before publishing its types.
             infer.subselects.borrow_mut().clear();
             infer.expressions.take();
             columns = infer.statement(stmt);
@@ -264,6 +271,8 @@ fn parameter_types_with(
         return Err(turso_core::LimboError::ParseError(missing));
     }
     Ok(Walked {
+        #[cfg(test)]
+        work: infer.work.get(),
         params: infer.types,
         untyped,
         columns,
@@ -285,6 +294,13 @@ enum Rel {
         name: String,
         columns: Vec<(String, Option<u32>)>,
     },
+    /// An unaliased USING/NATURAL join has one merged output namespace, but its
+    /// original members remain available to qualified references. Share members
+    /// across scope snapshots so cloning a scope does not recursively clone joins.
+    Joined {
+        members: std::sync::Arc<Vec<Rel>>,
+        columns: Vec<(String, Option<u32>)>,
+    },
     Unknown {
         name: String,
     },
@@ -294,6 +310,31 @@ impl Rel {
     fn name(&self) -> &str {
         match self {
             Rel::Table { name, .. } | Rel::Derived { name, .. } | Rel::Unknown { name } => name,
+            Rel::Joined { .. } => "",
+        }
+    }
+
+    /// The visible relation named by a qualifier. A join alias is a Derived
+    /// relation, so its members cannot leak out through this search. Use an
+    /// iterative walk rather than add unguarded recursion for nested joins.
+    fn named(&self, name: &str) -> Option<&Rel> {
+        let mut current = self;
+        let mut pending = Vec::new();
+        loop {
+            match current {
+                Rel::Joined { members, .. } => pending.extend(members.iter().rev()),
+                _ if current.name() == name => return Some(current),
+                _ => {}
+            }
+            current = pending.pop()?;
+        }
+    }
+
+    fn unknown_columns(&self) -> bool {
+        match self {
+            Rel::Unknown { .. } => true,
+            Rel::Joined { columns, .. } => columns.iter().any(|(name, _)| name == STAR),
+            _ => false,
         }
     }
 
@@ -321,10 +362,15 @@ type Scope = Vec<Vec<Rel>>;
 type Found = Option<Option<u32>>;
 
 struct Infer<'a> {
+    #[cfg(test)]
+    work: std::rc::Rc<std::cell::Cell<usize>>,
     stack_limited: std::rc::Rc<std::cell::Cell<bool>>,
     expressions: std::rc::Rc<std::cell::RefCell<turso_pg_parser::translator::ExpressionTypes>>,
     schema: &'a Schema,
     types: std::collections::BTreeMap<u32, u32>,
+    /// Bare parameters compared before either has a context share that later
+    /// context. Each edge is recorded once; `set` visits a newly typed node once.
+    parameter_links: std::collections::BTreeMap<u32, std::collections::BTreeSet<u32>>,
     /// Parameters compared with an expression no context types (see [`parameter_types`]).
     compared_untyped: std::collections::BTreeSet<u32>,
     /// The CTEs in scope, innermost last: name and columns.
@@ -427,23 +473,6 @@ fn takes_text(name: &str) -> bool {
     )
 }
 
-fn merged_join(node: &PgNode) -> bool {
-    let mut pending = vec![node];
-    while let Some(node) = pending.pop() {
-        if let Some(Node::JoinExpr(join)) = node.node.as_ref() {
-            if join.is_natural || !join.using_clause.is_empty() { return true; }
-            pending.extend([join.larg.as_deref(), join.rarg.as_deref()].into_iter().flatten());
-        }
-    }
-    false
-}
-
-fn bare_star_target(node: &PgNode) -> bool {
-    matches!(node.node.as_ref(), Some(Node::ResTarget(target)) if matches!(
-        target.val.as_deref().and_then(|value| value.node.as_ref()), Some(Node::ColumnRef(column))
-            if matches!(column.fields.as_slice(), [node] if matches!(node.node.as_ref(), Some(Node::AStar(_))))))
-}
-
 fn resolve_output(oid: u32) -> u32 {
     if oid == 705 { TEXT } else { oid }
 }
@@ -508,6 +537,8 @@ impl Infer<'_> {
     // Inference shares the parser/engine's thread guard. Keep each entry alive across its
     // recursive calls; a refusal is carried back to preparation as the typed 54001 error.
     fn enter(&self) -> Option<turso_stack_guard::NestGuard> {
+        #[cfg(test)]
+        self.work.set(self.work.get() + 1);
         if self.stack_limited.get() { return None; }
         match turso_stack_guard::NestGuard::enter() {
             Ok(guard) => Some(guard),
@@ -521,7 +552,9 @@ impl Infer<'_> {
         scope: &Scope,
     ) -> Option<u32> {
         common_type(nodes.into_iter().map(|node| {
-            if unknown_literal(node) {
+            if unknown_literal(node)
+                || param(node).is_some_and(|number| !self.types.contains_key(&number))
+            {
                 Some(705)
             } else {
                 self.type_of(node, scope)
@@ -532,7 +565,18 @@ impl Infer<'_> {
     /// Type `node` as `ty` if it is a parameter its first context has not typed yet.
     fn set(&mut self, node: &PgNode, ty: Option<u32>) {
         if let (Some(n), Some(ty)) = (param(node), ty) {
-            self.types.entry(n).or_insert(resolve_output(ty));
+            if self.types.contains_key(&n) {
+                return;
+            }
+            let mut pending = smallvec::SmallVec::<[u32; 4]>::from_slice(&[n]);
+            while let Some(number) = pending.pop() {
+                if let std::collections::btree_map::Entry::Vacant(entry) = self.types.entry(number) {
+                    entry.insert(resolve_output(ty));
+                    if let Some(linked) = self.parameter_links.get(&number) {
+                        pending.extend(linked.iter().copied());
+                    }
+                }
+            }
         }
     }
 
@@ -556,6 +600,12 @@ impl Infer<'_> {
     /// [`parameter_types`]).
     fn compare(&mut self, a: &PgNode, b: &PgNode, scope: &Scope) {
         let (ta, tb) = (self.type_of(a, scope), self.type_of(b, scope));
+        if ta.is_none() && tb.is_none() {
+            if let (Some(a), Some(b)) = (param(a), param(b)) {
+                self.parameter_links.entry(a).or_default().insert(b);
+                self.parameter_links.entry(b).or_default().insert(a);
+            }
+        }
         self.set(a, tb);
         self.set(b, ta);
         for (side, other, other_type) in [(a, b, tb), (b, a, ta)] {
@@ -911,10 +961,13 @@ impl Infer<'_> {
         let mut views = self.views.clone();
         views.push(relname.to_string());
         let mut walk = Infer {
+            #[cfg(test)]
+            work: self.work.clone(),
             stack_limited: self.stack_limited.clone(),
             expressions: Default::default(),
             schema: self.schema,
             types: std::collections::BTreeMap::new(),
+            parameter_links: Default::default(),
             compared_untyped: std::collections::BTreeSet::new(),
             ctes: Vec::new(),
             views,
@@ -940,17 +993,133 @@ impl Infer<'_> {
         level
     }
 
+    /// The current engine expands a join's star in left-column order followed
+    /// by the right columns not merged by USING/NATURAL. Keep metadata aligned
+    /// with those values; moving USING columns to PostgreSQL's first positions
+    /// requires the translator to move the output expressions too. Qualified
+    /// member lookup is independent of this output order. The common-type rule
+    /// is the same one used by all other inference arms.
+    fn join_columns(
+        &self,
+        join: &turso_pg_parser::pg_query::protobuf::JoinExpr,
+        left: &[Rel],
+        right: &[Rel],
+    ) -> Vec<(String, Option<u32>)> {
+        let left: Vec<_> = left
+            .iter()
+            .flat_map(|rel| self.relation_columns(rel))
+            .collect();
+        let right: Vec<_> = right
+            .iter()
+            .flat_map(|rel| self.relation_columns(rel))
+            .collect();
+        if left.iter().chain(&right).any(|(name, _)| name == STAR) {
+            return vec![(STAR.to_string(), None)];
+        }
+        let names: Vec<&str> = if join.is_natural {
+            left.iter()
+                .filter(|(name, _)| right.iter().any(|(other, _)| other == name))
+                .map(|(name, _)| name.as_str())
+                .collect()
+        } else {
+            let Some(names) = join
+                .using_clause
+                .iter()
+                .map(|node| match node.node.as_ref() {
+                    Some(Node::String(name)) => Some(name.sval.as_str()),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()
+            else {
+                return vec![(STAR.to_string(), None)];
+            };
+            names
+        };
+        let mut columns = left.clone();
+        for (at, name) in names.iter().enumerate() {
+            let mut lhs = left.iter().filter(|(column, _)| column.as_str() == *name);
+            let mut rhs = right.iter().filter(|(column, _)| column.as_str() == *name);
+            let (Some((_, a)), Some((_, b))) = (lhs.next(), rhs.next()) else {
+                return vec![(STAR.to_string(), None)];
+            };
+            // A missing/duplicated USING column is the engine's error. Do not
+            // publish guessed metadata while that statement is being prepared.
+            if lhs.next().is_some() || rhs.next().is_some() || names[..at].contains(name) {
+                return vec![(STAR.to_string(), None)];
+            }
+            let column = columns
+                .iter_mut()
+                .find(|(column, _)| column.as_str() == *name)
+                .expect("the unique left USING column was checked above");
+            column.1 = common_type([*a, *b]);
+        }
+        columns.extend(
+            right
+                .iter()
+                .filter(|(name, _)| !names.contains(&name.as_str()))
+                .cloned(),
+        );
+        columns
+    }
+
     fn from_item(&mut self, item: &PgNode, scope: &Scope, level: &mut Vec<Rel>) {
         let Some(_guard) = self.enter() else { return ; };
         match item.node.as_ref() {
             Some(Node::RangeVar(rv)) => level.push(self.range_var(rv)),
             Some(Node::JoinExpr(j)) => {
-                for side in [j.larg.as_deref(), j.rarg.as_deref()].into_iter().flatten() {
-                    self.from_item(side, scope, level);
+                // Keep preceding FROM entries while collecting each side: a FROM
+                // function on the right is implicitly LATERAL and sees them and
+                // the left side. Only this join's members are grouped afterward.
+                let start = level.len();
+                if let Some(left) = j.larg.as_deref() {
+                    self.from_item(left, scope, level);
+                }
+                let middle = level.len();
+                if let Some(right) = j.rarg.as_deref() {
+                    self.from_item(right, scope, level);
                 }
                 let mut inner = scope.clone();
                 inner.push(level.clone());
                 self.qual(j.quals.as_deref(), &inner);
+                if j.alias.is_some() || j.is_natural || !j.using_clause.is_empty() {
+                    let columns = self.join_columns(j, &level[start..middle], &level[middle..]);
+                    let mut members = level.split_off(start);
+                    if let Some(alias) = &j.alias {
+                        // An alias names the whole join and hides its member names.
+                        level.push(if columns.iter().any(|(name, _)| name == STAR) {
+                            Rel::Unknown {
+                                name: alias.aliasname.clone(),
+                            }
+                        } else {
+                            Rel::derived(alias.aliasname.clone(), rename(columns, &alias.colnames))
+                        });
+                    } else {
+                        if let Some(alias) = &j.join_using_alias {
+                            // USING (...) AS name exposes only the merged columns;
+                            // it does not hide the original member names.
+                            let using_columns = j
+                                .using_clause
+                                .iter()
+                                .map(|node| {
+                                    if let Some(Node::String(name)) = node.node.as_ref() {
+                                        columns
+                                            .iter()
+                                            .find(|(column, _)| column == &name.sval)
+                                            .cloned()
+                                            .unwrap_or_else(|| (STAR.to_string(), None))
+                                    } else {
+                                        (STAR.to_string(), None)
+                                    }
+                                })
+                                .collect();
+                            members.push(Rel::derived(alias.aliasname.clone(), using_columns));
+                        }
+                        level.push(Rel::Joined {
+                            members: std::sync::Arc::new(members),
+                            columns,
+                        });
+                    }
+                }
             }
             Some(Node::RangeSubselect(r)) => {
                 let columns = match r.subquery.as_deref().and_then(|s| s.node.as_ref()) {
@@ -1214,19 +1383,7 @@ impl Infer<'_> {
             let level = self.from_items(&s.from_clause, scope);
             let mut inner = scope.clone();
             inner.push(level);
-            let columns = if s.from_clause.iter().any(merged_join)
-                && s.target_list.iter().any(bare_star_target) {
-                // USING/NATURAL merges columns; the engine's metadata remains authoritative
-                // for this unmodeled shape, including derived aliases over that star.
-                for target in &s.target_list {
-                    if let Some(Node::ResTarget(target)) = target.node.as_ref() {
-                        self.exprs(target.val.as_deref(), &inner);
-                    }
-                }
-                vec![(STAR.to_string(), None)]
-            } else {
-                self.targets(&s.target_list, &inner)
-            };
+            let columns = self.targets(&s.target_list, &inner);
             self.qual(s.where_clause.as_deref(), &inner);
             for g in &s.group_clause {
                 self.expr(g, &inner);
@@ -1253,17 +1410,30 @@ impl Infer<'_> {
                 self.expr(row, &inner);
             }
             if !s.values_lists.is_empty() {
-                // VALUES: the first row's types name its columns column1, column2, ...
+                // VALUES uses all rows to type both its result columns and parameter elements.
                 if let Some(Node::List(first)) =
                     s.values_lists.first().and_then(|r| r.node.as_ref())
                 {
-                    first.items.iter().enumerate().map(|(i, _)| {
-                        let items = s.values_lists.iter().filter_map(|row| match row.node.as_ref() {
-                            Some(Node::List(row)) => row.items.get(i),
-                            _ => None,
-                        });
-                        (format!("column{}", i + 1), self.common_expr_type(items, &inner))
-                    }).collect()
+                    first
+                        .items
+                        .iter()
+                        .enumerate()
+                        .map(|(i, _)| {
+                            let items: Vec<_> = s
+                                .values_lists
+                                .iter()
+                                .filter_map(|row| match row.node.as_ref() {
+                                    Some(Node::List(row)) => row.items.get(i),
+                                    _ => None,
+                                })
+                                .collect();
+                            let ty = self.common_expr_type(items.iter().copied(), &inner);
+                            for item in items {
+                                self.set(item, ty);
+                            }
+                            (format!("column{}", i + 1), ty)
+                        })
+                        .collect()
                 } else {
                     columns
                 }
@@ -1315,6 +1485,29 @@ impl Infer<'_> {
         columns
     }
 
+    /// One relation's unqualified output; Joined keeps member metadata separate
+    /// so both `*` and a containing derived relation see the merged shape.
+    fn relation_columns(&self, rel: &Rel) -> Vec<(String, Option<u32>)> {
+        match rel {
+            Rel::Table { relname, .. } => match self.schema.get_table(relname) {
+                Some(table) => table
+                    .columns()
+                    .iter()
+                    .filter(|column| !column.hidden())
+                    .map(|column| {
+                        (
+                            column.name.clone().unwrap_or_default(),
+                            column_oid(self.schema, column, table.is_strict()),
+                        )
+                    })
+                    .collect(),
+                None => vec![(STAR.to_string(), None)],
+            },
+            Rel::Derived { columns, .. } | Rel::Joined { columns, .. } => columns.clone(),
+            Rel::Unknown { .. } => vec![(STAR.to_string(), None)],
+        }
+    }
+
     /// A target-list `*` or `t.*`, expanded to the current FROM level's columns (those of `t`
     /// alone); a relation the walk cannot open, or a `t` the level does not have, gives [`STAR`].
     /// None for any other target.
@@ -1339,30 +1532,12 @@ impl Infer<'_> {
         let level = scope.last().map_or(&[][..], |l| l.as_slice());
         let mut columns = Vec::new();
         let mut any = false;
-        for rel in level
-            .iter()
-            .filter(|r| qualifier.is_none_or(|q| r.name() == q))
-        {
+        for rel in level {
+            let Some(rel) = qualifier.map_or(Some(rel), |name| rel.named(name)) else {
+                continue;
+            };
             any = true;
-            match rel {
-                Rel::Table { relname, .. } => match self.schema.get_table(relname) {
-                    Some(table) => columns.extend(
-                        table
-                            .columns()
-                            .iter()
-                            .filter(|col| !col.hidden())
-                            .map(|col| {
-                                (
-                                    col.name.clone().unwrap_or_default(),
-                                    column_oid(self.schema, col, table.is_strict()),
-                                )
-                            }),
-                    ),
-                    None => columns.push((STAR.to_string(), None)),
-                },
-                Rel::Derived { columns: c, .. } => columns.extend(c.iter().cloned()),
-                Rel::Unknown { .. } => columns.push((STAR.to_string(), None)),
-            }
+            columns.extend(self.relation_columns(rel));
         }
         if !any {
             columns.push((STAR.to_string(), None));
@@ -1568,10 +1743,16 @@ impl Infer<'_> {
                     })?;
                     Some(column_oid(self.schema, col, table.is_strict()))
                 }
-                Rel::Derived { columns, .. } => columns
-                    .iter()
-                    .find(|(n, _)| n.eq_ignore_ascii_case(column))
-                    .map(|(_, t)| *t),
+                Rel::Derived { columns, .. } | Rel::Joined { columns, .. } => {
+                    if columns.iter().any(|(name, _)| name == STAR) {
+                        Some(None)
+                    } else {
+                        columns
+                            .iter()
+                            .find(|(name, _)| name.eq_ignore_ascii_case(column))
+                            .map(|(_, ty)| *ty)
+                    }
+                }
                 // Whatever it has is unknown: found, with no type the walk knows.
                 Rel::Unknown { .. } => Some(None),
             }
@@ -1582,16 +1763,13 @@ impl Infer<'_> {
                     // A level with a relation the walk cannot open may hold the column: the search
                     // stops there, untyped, rather than bind it to an outer relation's column of
                     // that name or to text (wire review 11 item 3).
-                    if level.iter().any(|rel| matches!(rel, Rel::Unknown { .. })) {
+                    if level.iter().any(Rel::unknown_columns) {
                         return Some(None);
                     }
-                    // In two relations of the level: one column a join merged (USING, NATURAL)
-                    // when they agree on its type, which it then has; untyped when they do not, so
-                    // a USING over int4 and int8, which PostgreSQL types int8, is refused 42P18. A
-                    // column no join merges is the engine's 42702 whichever is returned, except in
-                    // ON CONFLICT DO UPDATE, where the engine binds a bare name to the target and
-                    // PostgreSQL refuses it 42702 (both recorded in COMPAT.md; wire review 17 item
-                    // 16). It was read as not found, which fell to text (wire review 14 item 9).
+                    // A Joined relation contributes each USING/NATURAL column once,
+                    // already common-typed. A remaining duplicate belongs to different
+                    // relations and is the engine's ambiguous-column error; retain the
+                    // prior conservative behavior when their metadata disagrees.
                     let found: Vec<Option<u32>> =
                         level.iter().filter_map(|rel| of(rel, column)).collect();
                     if let [first, rest @ ..] = found.as_slice() {
@@ -1606,7 +1784,7 @@ impl Infer<'_> {
             }
             [table, column] => {
                 for level in scope.iter().rev() {
-                    if let Some(rel) = level.iter().find(|rel| rel.name() == *table) {
+                    if let Some(rel) = level.iter().find_map(|rel| rel.named(table)) {
                         return of(rel, column);
                     }
                 }
@@ -1625,7 +1803,7 @@ impl Infer<'_> {
                 let found = scope
                     .iter()
                     .rev()
-                    .find_map(|level| level.iter().find(|rel| rel.name() == *table));
+                    .find_map(|level| level.iter().find_map(|rel| rel.named(table)));
                 let main = matches!(
                     turso_pg_parser::schema_qualifier(schema),
                     turso_pg_parser::SchemaQualifier::Main
@@ -1738,6 +1916,15 @@ impl Infer<'_> {
                     matches!(x.and_then(|x| x.node.as_ref()), Some(Node::ParamRef(_)))
                 };
                 match (l, r) {
+                    // PostgreSQL has equality overloads for every integer-width pair.
+                    // NULLIF returns the comparison's left operand without widening it.
+                    (Some(a), Some(b))
+                        if matches!(kind, AExprKind::AexprNullif)
+                            && matches!(a, INT2 | INT4 | INT8)
+                            && matches!(b, INT2 | INT4 | INT8) =>
+                    {
+                        Some(a)
+                    }
                     (Some(a), Some(b)) => Some(wider(a, b)),
                     (Some(a), None) if param(e.rexpr.as_deref()) => Some(a),
                     (None, Some(b)) if param(e.lexpr.as_deref()) => Some(b),
@@ -1801,10 +1988,13 @@ impl Infer<'_> {
             return *ty;
         }
         let mut walk = Infer {
+            #[cfg(test)]
+            work: self.work.clone(),
             stack_limited: self.stack_limited.clone(),
             expressions: self.expressions.clone(),
             schema: self.schema,
             types: self.types.clone(),
+            parameter_links: self.parameter_links.clone(),
             compared_untyped: std::collections::BTreeSet::new(),
             ctes: self.ctes.clone(),
             views: self.views.clone(),
@@ -2009,6 +2199,24 @@ fn column_oid(schema: &Schema, col: &Column, is_strict: bool) -> Option<u32> {
 #[cfg(test)]
 mod c52_tests {
     use super::*;
+
+    #[test]
+    fn c52_parameter_chain_has_linear_inference_work() {
+        const COUNT: u32 = 256;
+        let constraints = (1..COUNT).map(|n| format!("${n}=${}", n + 1))
+            .collect::<Vec<_>>().join(" AND ");
+        let parse = turso_pg_parser::parse(&format!("SELECT $1 WHERE {constraints}")).unwrap();
+        let schema = std::sync::Arc::new(Schema::default());
+        let attached = Attached { names: &[], holds: &|_, _| false };
+        let walked = parameter_types(&parse, &schema, &[], &Default::default(),
+            &attached, &std::collections::BTreeMap::from([(COUNT, INT4)])).unwrap();
+        assert_eq!(walked.params.len(), COUNT as usize);
+        assert!(walked.params.values().all(|oid| *oid == INT4));
+        assert_eq!(walked.columns, vec![Some(INT4)]);
+        // Count tree visits instead of wall time: repeated whole-tree propagation
+        // would exceed this generous linear bound on the reversed dependency chain.
+        assert!(walked.work < 100 * COUNT as usize, "{} inference visits", walked.work);
+    }
 
     #[test]
     fn c52_publishes_parameter_columns_and_expressions_from_the_same_solution() {
