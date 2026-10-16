@@ -1061,9 +1061,12 @@ fn a_domain_check_failure_is_23514_with_postgresqls_message_on_every_path() {
 /// slot, past the authentication timeout (Codex/Claude C37 H1: the server answered every repeated
 /// SSLRequest with 'N' and blocked for good in a write with no deadline; a second client got
 /// 53300 for 30 s and more). With --max-connections 1 and --authentication-timeout 1, a second
-/// client must log in within 8 s. A GUARD, not a discriminating red: on this Mac the base passes it
-/// too (the server's send buffer, autotuned to 4 MiB, took every 'N' before the read deadline;
-/// raws c37-h1-red*). The write deadline itself is pinned in process by
+/// client must log in within 8 s. The flood keeps its frames aligned: a nonblocking write that
+/// takes part of the buffer is followed by the rest of that buffer, never a new one. The first
+/// version dropped the unsent tail of every partial write, so the frames went out of step, the
+/// server refused the garbage and closed the connection, and the test passed at the base for that
+/// wrong reason (wire-rev-h1c33 MED A: aligned, the base held the slot from 1.52 s to 13.5 s). The
+/// write deadline itself is also pinned in process by
 /// a_startup_write_to_a_client_that_never_reads_ends_at_the_deadline.
 #[test]
 fn an_ssl_request_flood_that_never_reads_does_not_hold_the_slot() {
@@ -1101,32 +1104,50 @@ fn an_ssl_request_flood_that_never_reads_does_not_hold_the_slot() {
     };
     flood.set_nonblocking(true).unwrap();
     let mut ssl = Vec::new();
-    for _ in 0..512 {
+    for _ in 0..8192 {
         ssl.extend_from_slice(&8i32.to_be_bytes());
         ssl.extend_from_slice(&80877103i32.to_be_bytes());
     }
     let started = Instant::now();
-    let mut f = &flood;
-    while started.elapsed() < Duration::from_millis(1500) {
-        match f.write(&ssl) {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(1))
+    // The flood runs for the whole window, so the server always has an SSLRequest to answer and
+    // its 'N' never fits: a flood that stopped after 1.5 s let the base drain it, wait on a read,
+    // and free the slot at the authentication timeout (it passed 2 of 3 runs at the base).
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flooding = {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let mut f = &flood;
+            // Bytes of `ssl` already written: a partial write's tail goes out next, so every frame
+            // the server reads is a whole SSLRequest.
+            let mut sent = 0;
+            while !stop.load(Ordering::Relaxed) {
+                match f.write(&ssl[sent..]) {
+                    Ok(n) => sent = (sent + n) % ssl.len(),
+                    // No sleep: the base's 'N' must outrun its send buffer (autotuned to MiBs on
+                    // this Mac) before its one-second read deadline, which a 1 ms pause per full
+                    // buffer let it reach in a read, closing the session for the wrong reason.
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::thread::yield_now(),
+                    Err(_) => return, // the server closed it: the refusal this test wants
+                }
             }
-            Err(_) => break, // the server closed it: the refusal this test wants
-        }
-    }
+        })
+    };
+    let done = |stop: &std::sync::atomic::AtomicBool| stop.store(true, Ordering::Relaxed);
     let mut last = None;
     while started.elapsed() < Duration::from_secs(8) {
         match server.connect_to("postgres") {
             Ok(mut w) => {
                 w.q("SELECT 1").ok("the second client's query");
+                done(&stop);
+                flooding.join().unwrap();
                 return;
             }
             Err(e) => last = Some(e),
         }
         std::thread::sleep(Duration::from_millis(200));
     }
+    done(&stop);
+    flooding.join().unwrap();
     panic!("8 s after the flood began the slot is still held: {last:?}");
 }
 
