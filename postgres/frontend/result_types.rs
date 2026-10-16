@@ -100,8 +100,8 @@ pub struct StatementTypes {
     /// PostgreSQL resolves a parameter nothing types). Sparse, so a statement's highest $n sizes
     /// nothing (wire review 8 item 3).
     pub params: std::collections::BTreeMap<u32, u32>,
-    /// Every $n the statement's parse tree holds, sorted, each in 1..=MAX_PARAMETER (see
-    /// turso_pg_parser::checked_param_numbers): the parameter count and the gaps are read from
+    /// Every $n the statement's parse tree holds, sorted and checked against the prepare mode's
+    /// limit (see turso_pg_parser::checked_param_numbers): the parameter count and gaps come from
     /// this, not from the engine's slots, which a clause it folds away does not get (wire review 8
     /// item 5).
     pub used: Vec<u32>,

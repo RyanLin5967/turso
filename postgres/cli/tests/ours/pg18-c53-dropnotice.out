@@ -1,0 +1,137 @@
+>> Q DROP TABLE IF EXISTS dn1
+   N S=NOTICE C=00000 M=table "dn1" does not exist, skipping
+   C DROP TABLE
+   Z I
+>> Q CREATE TABLE dn2 (a int)
+   C CREATE TABLE
+   Z I
+>> Q DROP TABLE IF EXISTS dn1, dn2, dn3
+   N S=NOTICE C=00000 M=table "dn1" does not exist, skipping
+   N S=NOTICE C=00000 M=table "dn3" does not exist, skipping
+   C DROP TABLE
+   Z I
+>> Q DROP TABLE IF EXISTS public.dn4
+   N S=NOTICE C=00000 M=table "dn4" does not exist, skipping
+   C DROP TABLE
+   Z I
+>> Q DROP TABLE IF EXISTS nosuchschema.dn5
+   N S=NOTICE C=00000 M=schema "nosuchschema" does not exist, skipping
+   C DROP TABLE
+   Z I
+>> Q DROP VIEW IF EXISTS dv1
+   N S=NOTICE C=00000 M=view "dv1" does not exist, skipping
+   C DROP VIEW
+   Z I
+>> Q DROP INDEX IF EXISTS di1
+   N S=NOTICE C=00000 M=index "di1" does not exist, skipping
+   C DROP INDEX
+   Z I
+>> Q DROP SEQUENCE IF EXISTS ds1
+   N S=NOTICE C=00000 M=sequence "ds1" does not exist, skipping
+   C DROP SEQUENCE
+   Z I
+>> Q DROP SCHEMA IF EXISTS dsch1
+   E S=ERROR C=0A000 M=schemas other than public are not supported by the branch server: its branches cover the one schema (CREATE SCHEMA and DROP SCHEMA are refused)
+   Z I
+>> Q DROP TYPE IF EXISTS dty1
+   N S=NOTICE C=00000 M=type "dty1" does not exist, skipping
+   C DROP TYPE
+   Z I
+>> Q DROP DOMAIN IF EXISTS ddom1
+   N S=NOTICE C=00000 M=type "ddom1" does not exist, skipping
+   C DROP DOMAIN
+   Z I
+>> Q DROP TABLE IF EXISTS "Mixed Case"
+   N S=NOTICE C=00000 M=table "Mixed Case" does not exist, skipping
+   C DROP TABLE
+   Z I
+>> Q CREATE VIEW dv2 AS SELECT 1 AS x
+   C CREATE VIEW
+   Z I
+>> Q DROP TABLE IF EXISTS dv2
+   E S=ERROR C=42601 M=Parse error: "dv2" is not a table
+   Z I
+>> Q DROP VIEW dv2
+   C DROP VIEW
+   Z I
+>> Q SHOW search_path
+   T oids=[25] names=['search_path']
+   D ['"$user", public']
+   C SHOW
+   Z I
+>> Q SHOW DateStyle
+   T oids=[25] names=['DateStyle']
+   D ['ISO, MDY']
+   C SHOW
+   Z I
+>> X - SHOW search_path
+   ParseComplete
+   BindComplete
+   T oids=[25] names=['search_path']
+   D ['"$user", public']
+   C SHOW
+   Z I
+>> Q CREATE TABLE dm1 (a int)
+   C CREATE TABLE
+   Z I
+>> Q CREATE TABLE dm2 (a int)
+   C CREATE TABLE
+   Z I
+>> Q DROP TABLE dm1, dm2
+   C DROP TABLE
+   Z I
+>> Q SELECT count(*) FROM pg_class WHERE relname IN ('dm1', 'dm2')
+   T oids=[20] names=['count']
+   D ['0']
+   C SELECT 1
+   Z I
+>> Q CREATE TABLE dm1 (a int)
+   C CREATE TABLE
+   Z I
+>> Q DROP TABLE dm1, dmmissing
+   E S=ERROR C=42P01 M=Parse error: no such table: dmmissing
+   Z I
+>> Q SELECT count(*) FROM pg_class WHERE relname = 'dm1'
+   T oids=[20] names=['count']
+   D ['1']
+   C SELECT 1
+   Z I
+>> Q DROP TABLE IF EXISTS dm1, dmmissing
+   N S=NOTICE C=00000 M=table "dmmissing" does not exist, skipping
+   C DROP TABLE
+   Z I
+>> Q SELECT count(*) FROM pg_class WHERE relname = 'dm1'
+   T oids=[20] names=['count']
+   D ['0']
+   C SELECT 1
+   Z I
+>> Q CREATE VIEW dmv AS SELECT 1 AS x
+   C CREATE VIEW
+   Z I
+>> Q CREATE TABLE dmt (a int)
+   C CREATE TABLE
+   Z I
+>> Q CREATE INDEX dmi ON dmt (a)
+   C CREATE INDEX
+   Z I
+>> Q DROP INDEX IF EXISTS dmi, dmi2
+   N S=NOTICE C=00000 M=index "dmi2" does not exist, skipping
+   C DROP INDEX
+   Z I
+>> Q DROP VIEW IF EXISTS dmv, dmv2
+   N S=NOTICE C=00000 M=view "dmv2" does not exist, skipping
+   C DROP VIEW
+   Z I
+>> Q DROP TABLE dmt
+   C DROP TABLE
+   Z I
+>> Q BEGIN
+   C BEGIN
+   Z T
+>> Q DROP TABLE IF EXISTS dmx
+   N S=NOTICE C=00000 M=table "dmx" does not exist, skipping
+   C DROP TABLE
+   Z T
+>> Q COMMIT
+   C COMMIT
+   Z I

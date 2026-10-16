@@ -1,4 +1,4 @@
-use crate::error::SqlErrorKind;
+use crate::error::{LimboError, SqlErrorKind, SqlErrorMessage};
 use crate::sync::Arc;
 use crate::HashMap;
 
@@ -1227,18 +1227,17 @@ pub fn translate_create_table(
                 // (`table "t" already exists`), except when the name clashes
                 // with an index, which gets its own message shape.
                 let token = crate::util::identifier_token_for_error(&tbl_name.name);
-                match object_type {
-                    SchemaObjectType::Table => {
-                        bail_parse_error!("table {} already exists", token)
-                    }
-                    SchemaObjectType::View => {
-                        bail_parse_error!("view {} already exists", token)
-                    }
-                    SchemaObjectType::Index => bail_parse_error!(
-                        "there is already an index named {}",
-                        tbl_name.name.as_str()
+                let engine_text = match object_type {
+                    SchemaObjectType::Table => format!("table {} already exists", token),
+                    SchemaObjectType::View => format!("view {} already exists", token),
+                    SchemaObjectType::Index => format!(
+                        "there is already an index named {}", tbl_name.name.as_str()
                     ),
-                }
+                };
+                return Err(LimboError::ParseError(
+                    SqlErrorMessage::classified(SqlErrorKind::DuplicateTable, engine_text)
+                        .with_protocol_text(format!("relation \"{}\" already exists", normalized_tbl_name)),
+                ));
             }
         }
     }

@@ -24,7 +24,7 @@
 
 pub mod counters;
 
-use turso_parser::sql_error::SqlErrorKind;
+use turso_parser::sql_error::{SqlErrorKind, SqlErrorMessage};
 use std::num::NonZero;
 use std::sync::{
     atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -38,9 +38,9 @@ use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 use turso_core::{CheckpointMode, Database, LimboError, Value};
 use turso_pg::{
-    attach_schema_files, branch_call, element_of, pg_bool, single_statement, split_statements,
-    PgBranchArg,
-    PgBranchCall, PgConnection, StatementTypes, TxStmt,
+    attach_schema_files, branch_call, element_of, pg_bool, read_parse_message, single_statement,
+    split_statements, ParseMessage, PgBranchArg, PgBranchCall, PgConnection, StatementTypes,
+    TxStmt,
 };
 use turso_pg_parser::{pg_space, scan_params, skip_blank, sql_comment, ParamScan};
 
@@ -1153,6 +1153,22 @@ impl Parsed {
         }
     }
 
+    /// A Parse message's statement, from its one parse ([`read_parse_message`]): the branch call
+    /// it is and its parameters as the parse tree holds them (a tree's `$n` are the lexer's
+    /// parameter tokens, for a text that parses; one that does not is refused at Parse).
+    fn from_message(sql: String, msg: &ParseMessage) -> Self {
+        Self {
+            sql,
+            call: msg.call.clone(),
+            scan: ParamScan {
+                highest: msg.highest,
+                analysed: msg.counts_params,
+            },
+            params: OnceLock::new(),
+            columns: OnceLock::new(),
+        }
+    }
+
     /// Fix the statement's parameter types at the first call, and refuse any later call whose
     /// types are others. The same text with the same declared types has the same parameters, so
     /// only their types can differ.
@@ -1739,8 +1755,12 @@ impl Session {
             let warnings = conn.take_warnings();
             if !warnings.is_empty() {
                 let mut st = self.state();
-                for (code, message) in warnings {
-                    st.notices.push(warning(code, &message));
+                for (severity, code, message) in warnings {
+                    st.notices.push(Box::new(ErrorInfo::new(
+                        severity.to_string(),
+                        code.to_string(),
+                        message,
+                    )));
                 }
             }
         }
@@ -2058,6 +2078,47 @@ impl Session {
         Ok(())
     }
 
+    /// The Parse step's analysis ([`PgConnection::parse_step`]): a statement PostgreSQL analyses
+    /// at Parse is prepared now, from the Parse's one parse, and kept for the round's Bind,
+    /// Describe and Execute ([`Session::describe_prepare`] finds it), its parameters typed now as
+    /// PostgreSQL types them at Parse (42P18 for one it cannot type). Any other statement's
+    /// declared parameters must each have a type (42P18), as there; it is prepared when it runs.
+    fn parse_step(
+        &self,
+        parsed: &Parsed,
+        msg: &mut ParseMessage,
+        declared: &[Option<Type>],
+    ) -> PgWireResult<()> {
+        if parsed.call.is_some() || is_blank(&parsed.sql) {
+            return Ok(());
+        }
+        let conn = self
+            .current(&mut self.state())
+            .map_err(PgWireError::UserError)?;
+        let declared_oids: Vec<_> = declared.iter().map(|ty| ty.as_ref().map(Type::oid)).collect();
+        match conn.parse_step(&parsed.sql, msg, &declared_oids).map_err(engine_error)? {
+            Some((stmt, types)) => {
+                parameter_types(&types, declared).map_err(PgWireError::UserError)?;
+                self.state().described = Some(Described {
+                    conn: conn.inner().clone(),
+                    sql: parsed.sql.clone(),
+                    declared: declared_oids,
+                    stmt,
+                    types,
+                });
+            }
+            // A utility statement's declared parameters are its only ones. One PostgreSQL
+            // analyses but this engine prepares only when it runs (CALL, EXPLAIN, DECLARE,
+            // CREATE TABLE ... AS) has its parameters typed then.
+            None if !msg.counts_params => {
+                parameter_types(&StatementTypes::default(), declared)
+                    .map_err(PgWireError::UserError)?;
+            }
+            None => {}
+        }
+        Ok(())
+    }
+
     /// Describe's prepare. In the extended protocol Describe is where a statement first meets the
     /// engine, so a statement that fails to prepare inside a block aborts the block, as its
     /// execution would (wire review 1 item 2).
@@ -2338,7 +2399,7 @@ impl Session {
                 // PostgreSQL answers them: the query path's default was SELECT n, and drivers read
                 // the affected count from the tag (found by the PG 18 differential, 2026-10-15).
                 Response::Query(mut results) => {
-                    if let Some(tag) = returning_tag(sql) {
+                    if let Some(tag) = query_tag(sql) {
                         results.set_command_tag(tag);
                     }
                     Response::Query(results)
@@ -3610,7 +3671,7 @@ impl SimpleQueryHandler for Session {
                     }
                     client
                         .feed(PgWireBackendMessage::CommandComplete(
-                            Tag::new(&tag).with_rows(rows).into(),
+                            query_complete(&tag, rows).into(),
                         ))
                         .await?;
                 }
@@ -3715,19 +3776,23 @@ impl ExtendedQueryHandler for Session {
             return Err(PgWireError::UserError(aborted_error()));
         }
         // The text as it is, and the branch call it is, read here once (wire review 13 item 6).
-        let types = message
+        let types: Vec<Option<Type>> = message
             .type_oids
             .iter()
             .map(|o| Type::from_oid(*o))
             .collect();
+        // PostgreSQL's Parse step (exec_parse_message), in its order, before ParseComplete and
+        // before the statement exists (C53, PGDIV-PARSE-REFUSAL-STEP): the raw parse (a syntax or
+        // lexical error, 42601: C40 review LOW 2), then the analysis of a statement it analyses
+        // (a missing relation, an unknown function, a parameter it cannot type). They were found
+        // at Describe or Execute, after ParseComplete and BindComplete.
+        let mut msg = read_parse_message(&message.query).map_err(engine_error)?;
+        let parsed = Parsed::from_message(message.query, &msg);
+        self.parse_step(&parsed, &mut msg, &types)?;
         let id = message.name.unwrap_or_else(|| DEFAULT_NAME.to_owned());
         client
             .portal_store()
-            .put_statement(Arc::new(StoredStatement::new(
-                id,
-                Parsed::new(message.query),
-                types,
-            )));
+            .put_statement(Arc::new(StoredStatement::new(id, parsed, types)));
         client
             .feed(PgWireBackendMessage::ParseComplete(ParseComplete::new()))
             .await?;
@@ -3788,6 +3853,23 @@ impl ExtendedQueryHandler for Session {
         }
         check_parameter_codes(&message).map_err(PgWireError::UserError)?;
         let portal = Portal::try_new(&message, statement)?;
+        // The values, read by their parameters' types before BindComplete, as exec_bind_message
+        // reads them (C53, PGDIV-BIND-REFUSAL-STEP): they were read at Execute, after BindComplete
+        // and a RowDescription. The types come from the statement's first meeting with the engine
+        // (Describe's prepare, kept for the Describe and Execute that follow, so a round prepares
+        // once as before); a branch call's are text, read by the call itself.
+        if portal.statement.statement.call.is_none() && !portal.parameters.is_empty() {
+            self.describe_prepare_with_params(
+                &portal.statement.statement.sql,
+                &portal.statement.parameter_types,
+            )?;
+            let params = self
+                .described_parameters(&portal.statement.parameter_types)
+                .map_err(PgWireError::UserError)?;
+            if params.len() == portal.parameters.len() {
+                decode_portal_parameters(&portal, &params)?;
+            }
+        }
         // A named portal lives until its Close or its transaction's end: binding the name again
         // is 42P03, as PostgreSQL's CreatePortal refuses it. It replaced the portal silently, a
         // suspended one included (wire review 15 item 20). The unnamed portal is replaced, as
@@ -3992,7 +4074,7 @@ impl ExtendedQueryHandler for Session {
                     .unwrap_or_else(|| "SELECT".to_string());
                 client
                     .feed(PgWireBackendMessage::CommandComplete(
-                        Tag::new(&tag).with_rows(0).into(),
+                        query_complete(&tag, 0).into(),
                     ))
                     .await?;
             }
@@ -4225,7 +4307,7 @@ where
             None => {
                 client
                     .feed(PgWireBackendMessage::CommandComplete(
-                        Tag::new(&tag).with_rows(rows).into(),
+                        query_complete(&tag, rows).into(),
                     ))
                     .await?;
                 return Ok(false);
@@ -4713,10 +4795,12 @@ fn parameter_types(types: &StatementTypes, declared: &[Option<Type>]) -> SqlResu
             // not at prepare (wire review 11 item 1).
             if types.used.binary_search(&(n as u32)).is_err() || types.untyped.contains(&(n as u32))
             {
-                return Err(error(
-                    "42P18",
-                    format!("could not determine data type of parameter ${n}"),
-                ));
+                return Err(engine_info(&LimboError::InvalidArgument(
+                    SqlErrorMessage::classified(
+                        SqlErrorKind::IndeterminateDatatype,
+                        format!("could not determine data type of parameter ${n}"),
+                    ),
+                )));
             }
             Ok(types
                 .params
@@ -4739,6 +4823,23 @@ fn bind_portal_parameters(
     portal: &Portal<Parsed>,
     types: &[Type],
 ) -> PgWireResult<()> {
+    for (i, value) in decode_portal_parameters(portal, types)?.into_iter().enumerate() {
+        let index = NonZero::new(i + 1).expect("i + 1 >= 1");
+        // A parameter with no engine slot (declared but unused, or in a clause the engine folds
+        // away) binds nothing.
+        if stmt.parameters().has_index(index) {
+            stmt.bind_at(index, value)
+                .map_err(|e| PgWireError::UserError(engine_info(&e)))?;
+        }
+    }
+    Ok(())
+}
+
+/// Every value `portal` holds, read by its parameter's type and format, as PostgreSQL's
+/// exec_bind_message reads them before it answers BindComplete: a value its type cannot read
+/// (22P02, 22003, 22023) refuses the Bind (C53, PGDIV-BIND-REFUSAL-STEP; at [`Session::on_bind`])
+/// and again the Execute that binds them.
+fn decode_portal_parameters(portal: &Portal<Parsed>, types: &[Type]) -> PgWireResult<Vec<Value>> {
     // check_bind_arity made the counts equal; zipped short, a mismatch bound a value under another's
     // type or left a parameter unbound (NULL to the engine), so it is refused (wire review 18 item
     // 23).
@@ -4753,23 +4854,18 @@ fn bind_portal_parameters(
         )));
     }
     // The format codes were checked at Bind ([`check_bind`]): none, one, or one per value.
-    for (i, (pg_type, sent)) in types.iter().zip(&portal.parameters).enumerate() {
-        let value = match sent {
-            None => Value::Null,
+    types
+        .iter()
+        .zip(&portal.parameters)
+        .enumerate()
+        .map(|(i, (pg_type, sent))| match sent {
+            None => Ok(Value::Null),
             Some(bytes) if portal.parameter_format.is_binary(i) => {
-                pg_binary_to_value(bytes, pg_type, i + 1)?
+                pg_binary_to_value(bytes, pg_type, i + 1)
             }
-            Some(bytes) => pg_bytes_to_value(bytes, pg_type)?,
-        };
-        let index = NonZero::new(i + 1).expect("i + 1 >= 1");
-        // A parameter with no engine slot (declared but unused, or in a clause the engine folds
-        // away) binds nothing.
-        if stmt.parameters().has_index(index) {
-            stmt.bind_at(index, value)
-                .map_err(|e| PgWireError::UserError(engine_info(&e)))?;
-        }
-    }
-    Ok(())
+            Some(bytes) => pg_bytes_to_value(bytes, pg_type),
+        })
+        .collect()
 }
 
 /// PostgreSQL's first check of a Bind message (exec_bind_message), made before anything else and
@@ -4936,6 +5032,14 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
             format!("value \"{text}\" is out of range for type {name}"),
         ))
     };
+    // float4in and float8in word it without "value" (recorded, pg18.out and
+    // pg18-audit1-lib-parameters_decode_at_postgresqls_edges.out).
+    let float_out_of_range = |name: &str| {
+        PgWireError::UserError(error(
+            "22003",
+            format!("\"{text}\" is out of range for type {name}"),
+        ))
+    };
 
     match *pg_type {
         Type::INT2 | Type::INT4 | Type::INT8 => {
@@ -4969,7 +5073,7 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
                 _ => f,
             };
             if in_type.is_infinite() && !infinite_spelled {
-                return Err(out_of_range(name));
+                return Err(float_out_of_range(name));
             }
             // A spelling of a nonzero value that underflows the type to zero ('1e-400'), which
             // float4in and float8in refuse (ERANGE with a zero result; recalled from their source,
@@ -4979,7 +5083,7 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
                 && *pg_type != Type::NUMERIC
                 && mantissa.bytes().any(|b| (b'1'..=b'9').contains(&b))
             {
-                return Err(out_of_range(name));
+                return Err(float_out_of_range(name));
             }
             Ok(Value::from_f64(f))
         }
@@ -5350,7 +5454,10 @@ fn is_pg_non_query(sql: &str) -> bool {
     let upper = sql.trim().to_uppercase();
     upper.starts_with("COPY")
         || upper.starts_with("CREATE SCHEMA")
-        || upper.starts_with("DROP SCHEMA")
+        // Every DROP: none returns rows, and one the frontend performs while preparing it (DROP
+        // SCHEMA, DROP TABLE | VIEW | INDEX of several objects or IF EXISTS) is answered from a
+        // no-op SELECT that must not complete as one (C53).
+        || upper.starts_with("DROP")
         || upper.starts_with("REFRESH MATERIALIZED VIEW")
         || upper.starts_with("COMMENT")
         || upper.starts_with("CHECKPOINT")
@@ -5363,7 +5470,10 @@ fn is_pg_non_query(sql: &str) -> bool {
 /// (RETURNING), read from the statement's first token as [`command_tag`] reads it: `INSERT 0`,
 /// `UPDATE`, `DELETE`; None for any other statement, whose rows keep the query tag (SELECT n).
 /// Blind spot, as command_tag's: a data-modifying statement behind WITH keeps SELECT n.
-fn returning_tag(query: &str) -> Option<&'static str> {
+/// The completion tag of a statement that returns rows, when it is not SELECT's: a DML statement's
+/// RETURNING completes with its verb's, and SHOW with `SHOW` (the frontend answers SHOW with a
+/// one-row SELECT, which completed as `SELECT 1`: C53, recorded pg18-c53-dropnotice.out).
+fn query_tag(query: &str) -> Option<&'static str> {
     let start = skip_blank(query.as_bytes(), 0)?;
     let word: String = query[start..]
         .chars()
@@ -5373,7 +5483,21 @@ fn returning_tag(query: &str) -> Option<&'static str> {
         "INSERT" => Some("INSERT 0"),
         "UPDATE" => Some("UPDATE"),
         "DELETE" => Some("DELETE"),
+        "SHOW" => Some(SHOW_TAG),
         _ => None,
+    }
+}
+
+/// SHOW's completion tag, which PostgreSQL sends with no row count.
+const SHOW_TAG: &str = "SHOW";
+
+/// A query's CommandComplete after `rows` rows: the tag with the count, except SHOW's, which has
+/// none in PostgreSQL.
+fn query_complete(tag: &str, rows: usize) -> Tag {
+    if tag == SHOW_TAG {
+        Tag::new(tag)
+    } else {
+        Tag::new(tag).with_rows(rows)
     }
 }
 
@@ -6364,6 +6488,33 @@ mod tests {
     /// engine's prepare). The L5 counter had been read only through the simple protocol and a
     /// hand-built portal.
     #[test]
+    fn c44_large_parameter_analysis_reuses_one_parse() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = session(&dir);
+        ok(&s, "CREATE TABLE t(id INT)");
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        rt.block_on(async {
+            for (sql, code) in [
+                ("SELECT turso_branch_create($65536)", "42P02"),
+                ("SELECT turso_branch_create($65536::text)", "42P02"),
+                ("SELECT id FROM t WHERE id=$65536 /* turso_branch_create */", "42P18"),
+                ("SELECT 'turso_branch_create' FROM t WHERE id=$65536", "42P18"),
+            ] {
+                let mut c = MemClient::new();
+                let before = turso_pg_parser::libpg_query_calls();
+                let err = s.on_parse(&mut c, Parse::new(None, sql.to_string(), vec![]))
+                    .await.expect_err("the oversized marker must be refused");
+                assert_eq!(turso_pg_parser::libpg_query_calls() - before, 1, "{sql}");
+                match err {
+                    PgWireError::UserError(info) => assert_eq!(info.code, code, "{sql}"),
+                    other => panic!("unexpected error for {sql}: {other:?}"),
+                }
+                assert!(c.replies.is_empty(), "a refused Parse must not send ParseComplete");
+            }
+        });
+    }
+
+    #[test]
     fn an_extended_statement_is_classified_once_at_parse() {
         let dir = tempfile::TempDir::new().unwrap();
         let s = session(&dir);
@@ -6398,8 +6549,13 @@ mod tests {
                     let describe = per_execution == 0;
                     let calls =
                         execute_unnamed(&s, &mut c, param.then_some(name.as_str()), describe).await;
+                    // FLAGGED TEST EDIT (C53): a statement PostgreSQL analyses is prepared at
+                    // Parse now, from the Parse's one parse, and the round that follows the Parse
+                    // runs that prepare: no call in execution 0, one (the engine's prepare) in
+                    // each later one.
+                    let want = if round == 0 && at_parse > 0 { 0 } else { per_execution };
                     assert_eq!(
-                        calls, per_execution,
+                        calls, want,
                         "{sql:?}: libpg_query calls in execution {round}"
                     );
                     // A create that answered without creating cannot pass as zero calls.
@@ -6410,6 +6566,38 @@ mod tests {
                         );
                     }
                 }
+            }
+        });
+    }
+
+    /// C40 review LOW 6 (C49): a Parse makes at most ONE libpg_query call, whatever its text:
+    /// text that mentions the branch-function prefix and holds a `$` without being a call made
+    /// two (the branch-call parse and the parameter scan), and a statement PostgreSQL analyses at
+    /// Parse is prepared there from the same parse (C53). The fast call form makes none.
+    #[test]
+    fn a_parse_makes_at_most_one_libpg_query_call() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = session(&dir);
+        ok(&s, "CREATE TABLE t(id INT)");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut c = MemClient::new();
+            for (sql, at_most) in [
+                ("SELECT 'turso_branch_' || $1", 1),
+                ("SELECT 'turso_branch_' AS s, $1::int", 1),
+                ("SELECT id FROM t WHERE id = $1 /* turso_branch_ */", 1),
+                ("SELECT turso_branch_current() /* c */", 1),
+                ("SELECT turso_branch_create($1)", 0),
+            ] {
+                let before = turso_pg_parser::libpg_query_calls();
+                s.on_parse(&mut c, Parse::new(None, sql.to_string(), vec![]))
+                    .await
+                    .unwrap();
+                let calls = turso_pg_parser::libpg_query_calls() - before;
+                assert!(calls <= at_most, "{sql:?}: {calls} libpg_query calls at Parse");
+                s.on_sync(&mut c, PgSync::new()).await.unwrap();
             }
         });
     }
@@ -6537,19 +6725,23 @@ mod tests {
                 "SELECT * FROM v8 WHERE x = $1",
             ] {
                 let mut c = MemClient::new();
-                s.on_parse(&mut c, Parse::new(None, sql.to_string(), vec![]))
-                    .await
-                    .unwrap();
+                // FLAGGED TEST EDIT (C53): the statement is analysed at Parse now, as PostgreSQL
+                // analyses it, so the walk runs there and the cycle's statement is refused at
+                // Parse (the engine's circular view); Parse and Describe are counted together,
+                // with the same bound (the Parse's one parse serves the prepare).
                 let before = turso_pg_parser::libpg_query_calls();
-                // The cycle's Describe is refused (the engine's circular view); the walk before
-                // the refusal is what is counted.
-                let _ = s
-                    .on_describe(&mut c, Describe::new(TARGET_TYPE_BYTE_STATEMENT, None))
+                let parsed = s
+                    .on_parse(&mut c, Parse::new(None, sql.to_string(), vec![]))
                     .await;
+                if parsed.is_ok() {
+                    let _ = s
+                        .on_describe(&mut c, Describe::new(TARGET_TYPE_BYTE_STATEMENT, None))
+                        .await;
+                }
                 let calls = turso_pg_parser::libpg_query_calls() - before;
                 assert!(
                     calls <= 9,
-                    "{sql}: {calls} libpg_query calls at Describe, want at most 9"
+                    "{sql}: {calls} libpg_query calls at Parse and Describe, want at most 9"
                 );
             }
         });

@@ -29,6 +29,7 @@ pub(crate) fn resolve_scalar(name: &str, arg_count: usize) -> bool {
         "to_char" | "pg_input_is_valid" | "booleq" | "boolne" | "col_description" | "bpchareq"
         | "encode" | "bpcharlt" => &[2],
         "version" | "current_database" | "current_schema" | "pg_backend_pid" => &[0],
+        "__turso_bpchar_truncation" => &[1],
         "make_date" => &[3],
         "make_timestamp" => &[6],
         _ => return false,
@@ -48,6 +49,17 @@ pub(crate) fn exec_scalar(conn: &Connection, name: &str, args: &[Value]) -> Resu
         // PostgreSQL refuses a date past the range (22008) where the SQLite dialect answers NULL.
         "make_date" => turso_core::make_date_or_refuse(args),
         "make_timestamp" => turso_core::make_timestamp_or_refuse(args),
+        // This is evaluated only by bpchar's RAISE message. The RAISE compiler still skips
+        // it in a type-encoding catch region, preserving the existing seek-key behavior.
+        "__turso_bpchar_truncation" => Err(LimboError::Raise(
+            turso_parser::ast::ResolveType::Abort,
+            SqlErrorMessage::classified(
+                SqlErrorKind::StringDataRightTruncation,
+                "value too long for type character",
+            ).with_protocol_text(format!(
+                "value too long for type character({})", int_arg(0, 1)
+            )),
+        )),
         "pg_get_userbyid" => Ok(exec_pg_get_user_by_id(int_arg(0, 0))),
         "pg_table_is_visible" | "pg_function_is_visible" | "pg_type_is_visible" => {
             Ok(exec_pg_is_visible(int_arg(0, 0)))
@@ -548,9 +560,9 @@ fn pg_get_indexdef(conn: &Connection, target_oid: i64) -> Option<String> {
 
 /// Validate input for a PostgreSQL type, returning error info if invalid.
 ///
-/// Returns `None` for valid input, or `Some((message, sql_error_code))` for invalid input.
+/// Returns `None` for valid input, or `Some((message, kind))` for invalid input.
 /// Used by both `pg_input_error_info` (table-valued) and `pg_input_is_valid` (scalar).
-pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String, String)> {
+pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String, SqlErrorKind)> {
     let trimmed = input.trim();
 
     // Extract base type and optional length modifier, e.g. "varchar(4)" → ("varchar", Some(4))
@@ -576,7 +588,7 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
             } else {
                 Some((
                     format!("invalid input syntax for type boolean: \"{input}\""),
-                    "22P02".to_string(),
+                    SqlErrorKind::InvalidTextRepresentation,
                 ))
             }
         }
@@ -589,39 +601,39 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
                 target,
             )
             .err()
-            .map(|e| (e.to_string(), e.sql_error_kind().postgres_code().to_owned()))
+            .map(|e| (e.to_string(), e.sql_error_kind()))
         }
         "float4" | "real" => match trimmed.parse::<f32>() {
             Ok(v) if v.is_infinite() => Some((
                 format!("value \"{input}\" is out of range for type real"),
-                "22003".to_string(),
+                SqlErrorKind::NumericValueOutOfRange,
             )),
             Ok(_) => None,
             Err(_) => Some((
                 format!("invalid input syntax for type real: \"{input}\""),
-                "22P02".to_string(),
+                SqlErrorKind::InvalidTextRepresentation,
             )),
         },
         "float8" | "double precision" => match trimmed.parse::<f64>() {
             Ok(v) if v.is_infinite() => Some((
                 format!("value \"{input}\" is out of range for type double precision"),
-                "22003".to_string(),
+                SqlErrorKind::NumericValueOutOfRange,
             )),
             Ok(_) => None,
             Err(_) => Some((
                 format!("invalid input syntax for type double precision: \"{input}\""),
-                "22P02".to_string(),
+                SqlErrorKind::InvalidTextRepresentation,
             )),
         },
         "numeric" | "decimal" => match trimmed.parse::<f64>() {
             Ok(v) if v.is_nan() || v.is_infinite() => Some((
                 format!("invalid input syntax for type numeric: \"{input}\""),
-                "22P02".to_string(),
+                SqlErrorKind::InvalidTextRepresentation,
             )),
             Ok(_) => None,
             Err(_) => Some((
                 format!("invalid input syntax for type numeric: \"{input}\""),
-                "22P02".to_string(),
+                SqlErrorKind::InvalidTextRepresentation,
             )),
         },
         "text" => None,
@@ -630,7 +642,7 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
                 if trimmed.chars().count() > max_len {
                     return Some((
                         format!("value too long for type character varying({max_len})"),
-                        "22001".to_string(),
+                        SqlErrorKind::StringDataRightTruncation,
                     ));
                 }
             }
@@ -641,7 +653,7 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
                 if trimmed.chars().count() > max_len {
                     return Some((
                         format!("value too long for type character({max_len})"),
-                        "22001".to_string(),
+                        SqlErrorKind::StringDataRightTruncation,
                     ));
                 }
             }
@@ -652,7 +664,7 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
             if hex.len() != 32 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
                 Some((
                     format!("invalid input syntax for type uuid: \"{input}\""),
-                    "22P02".to_string(),
+                    SqlErrorKind::InvalidTextRepresentation,
                 ))
             } else {
                 None
@@ -670,7 +682,7 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
             } else {
                 Some((
                     format!("invalid input syntax for type date: \"{input}\""),
-                    "22007".to_string(),
+                    SqlErrorKind::InvalidDatetimeFormat,
                 ))
             }
         }
@@ -681,7 +693,7 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
             } else {
                 Some((
                     format!("invalid input syntax for type timestamp: \"{input}\""),
-                    "22007".to_string(),
+                    SqlErrorKind::InvalidDatetimeFormat,
                 ))
             }
         }
@@ -699,7 +711,7 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
             } else {
                 Some((
                     format!("invalid input syntax for type timestamp with time zone: \"{input}\""),
-                    "22007".to_string(),
+                    SqlErrorKind::InvalidDatetimeFormat,
                 ))
             }
         }
@@ -717,7 +729,7 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
             } else {
                 Some((
                     format!("invalid input syntax for type time: \"{input}\""),
-                    "22007".to_string(),
+                    SqlErrorKind::InvalidDatetimeFormat,
                 ))
             }
         }
@@ -732,7 +744,7 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
                 };
                 Some((
                     format!("invalid input syntax for type {type_label}: \"{input}\""),
-                    "22P02".to_string(),
+                    SqlErrorKind::InvalidTextRepresentation,
                 ))
             }
         }
@@ -744,7 +756,7 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
                 } else {
                     Some((
                         format!("invalid input syntax for type bytea: \"{input}\""),
-                        "22P02".to_string(),
+                        SqlErrorKind::InvalidTextRepresentation,
                     ))
                 }
             } else {
@@ -761,7 +773,7 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
                     if prefix_str.parse::<u8>().is_err() {
                         return Some((
                             format!("invalid input syntax for type {base_type}: \"{input}\""),
-                            "22P02".to_string(),
+                            SqlErrorKind::InvalidTextRepresentation,
                         ));
                     }
                 }
@@ -769,7 +781,7 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
             } else {
                 Some((
                     format!("invalid input syntax for type {base_type}: \"{input}\""),
-                    "22P02".to_string(),
+                    SqlErrorKind::InvalidTextRepresentation,
                 ))
             }
         }
@@ -784,7 +796,7 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
             } else {
                 Some((
                     format!("invalid input syntax for type macaddr: \"{input}\""),
-                    "22P02".to_string(),
+                    SqlErrorKind::InvalidTextRepresentation,
                 ))
             }
         }
@@ -794,13 +806,13 @@ pub(crate) fn validate_pg_input(input: &str, type_name: &str) -> Option<(String,
             } else {
                 Some((
                     format!("invalid input syntax for type oid: \"{input}\""),
-                    "22P02".to_string(),
+                    SqlErrorKind::InvalidTextRepresentation,
                 ))
             }
         }
         _ => Some((
             format!("type \"{type_name}\" does not exist"),
-            "42704".to_string(),
+            SqlErrorKind::UndefinedObject,
         )),
     }
 }

@@ -1481,7 +1481,15 @@ impl PostgreSQLTranslator {
         let remove_type = ObjectType::try_from(drop.remove_type)
             .map_err(|_| ParseError::ParseError("Invalid object type in DROP".into()))?;
 
-        // Extract the first qualified name from drop.objects
+        // One object: a DROP of several of a kind the frontend does not drop itself
+        // (try_extract_drop_objects) is refused, never cut to its first object, which dropped
+        // that one and kept the rest (C53).
+        if drop.objects.len() > 1 {
+            return Err(ParseError::ParseError(format!(
+                "DROP {} of more than one object is not supported",
+                drop_object_type_name(remove_type)
+            ).into()));
+        }
         let obj_node = drop
             .objects
             .first()
@@ -3077,8 +3085,15 @@ impl PostgreSQLTranslator {
         // its column are translated to `value` instead (`series_column`).
         if func_name.eq_ignore_ascii_case("generate_series") {
             if colnames > 1 {
+                let alias = range_func.alias.as_ref().expect("column aliases have an alias");
                 return Err(ParseError::ParseError(
-                    "too many column aliases specified for function generate_series".into(),
+                    SqlErrorMessage::classified(
+                        SqlErrorKind::InvalidColumnReference,
+                        "too many column aliases specified for function generate_series",
+                    ).with_protocol_text(format!(
+                        "table \"{}\" has 1 columns available but {} columns specified",
+                        alias.aliasname, colnames,
+                    )),
                 ));
             }
             let range_alias = range_func.alias.as_ref();
@@ -6578,6 +6593,113 @@ pub fn try_extract_drop_schema(parse_result: &ParseResult) -> Option<PgDropSchem
     })
 }
 
+/// The kind of relation a [`PgDropObjectsStmt`] drops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PgDropKind {
+    Table,
+    View,
+    Index,
+    Sequence,
+    Type,
+    Domain,
+}
+
+impl PgDropKind {
+    /// The kind's keyword, as DROP spells it.
+    pub fn keyword(self) -> &'static str {
+        match self {
+            PgDropKind::Table => "TABLE",
+            PgDropKind::View => "VIEW",
+            PgDropKind::Index => "INDEX",
+            PgDropKind::Sequence => "SEQUENCE",
+            PgDropKind::Type => "TYPE",
+            PgDropKind::Domain => "DOMAIN",
+        }
+    }
+
+    /// The kind as PostgreSQL's notices name it: a domain is a type there (recorded,
+    /// pg18-c53-dropnotice.out).
+    pub fn word(self) -> &'static str {
+        match self {
+            PgDropKind::Table => "table",
+            PgDropKind::View => "view",
+            PgDropKind::Index => "index",
+            PgDropKind::Sequence => "sequence",
+            PgDropKind::Type | PgDropKind::Domain => "type",
+        }
+    }
+}
+
+/// `DROP TABLE | VIEW | INDEX | SEQUENCE | TYPE | DOMAIN` with IF EXISTS or more than one object: each object as its schema
+/// (as written: None unqualified; Some("main") for public) and name. PostgreSQL resolves every
+/// object before it drops any (RemoveRelations), sends a NOTICE for each missing one under IF
+/// EXISTS, and drops all or none. The translator's DROP took the first object alone, so
+/// `DROP TABLE a, b` dropped a and kept b, and IF EXISTS sent no notice (C53, recorded
+/// pg18-c53-dropnotice.out). None for anything else, which the translator keeps: a single object
+/// without IF EXISTS, another kind, a catalog schema, or a three-part name.
+#[derive(Debug, Clone)]
+pub struct PgDropObjectsStmt {
+    pub kind: PgDropKind,
+    pub objects: Vec<(Option<String>, String)>,
+    pub missing_ok: bool,
+}
+
+pub fn try_extract_drop_objects(parse_result: &ParseResult) -> Option<PgDropObjectsStmt> {
+    use pg_query::protobuf::node::Node;
+    use pg_query::protobuf::ObjectType;
+    use pg_query::NodeRef;
+
+    let nodes = parse_result.protobuf.nodes();
+    let NodeRef::DropStmt(drop) = &nodes.first()?.0 else {
+        return None;
+    };
+    let kind = match ObjectType::try_from(drop.remove_type).ok()? {
+        ObjectType::ObjectTable => PgDropKind::Table,
+        ObjectType::ObjectView => PgDropKind::View,
+        ObjectType::ObjectIndex => PgDropKind::Index,
+        ObjectType::ObjectSequence => PgDropKind::Sequence,
+        ObjectType::ObjectType => PgDropKind::Type,
+        ObjectType::ObjectDomain => PgDropKind::Domain,
+        _ => return None,
+    };
+    if !drop.missing_ok && drop.objects.len() < 2 {
+        return None;
+    }
+    let mut objects = Vec::with_capacity(drop.objects.len());
+    for obj in &drop.objects {
+        // A relation's name is a List of Strings; a type's or a domain's a TypeName.
+        let items = match &obj.node {
+            Some(Node::List(list)) => &list.items,
+            Some(Node::TypeName(tn)) => &tn.names,
+            _ => return None,
+        };
+        let names: Vec<&str> = items
+            .iter()
+            .filter_map(|item| match &item.node {
+                Some(Node::String(s)) => Some(s.sval.as_str()),
+                _ => None,
+            })
+            .collect();
+        if names.is_empty() || names.len() != items.len() {
+            return None;
+        }
+        match names.as_slice() {
+            [name] => objects.push((None, name.to_string())),
+            [schema, name] => match schema_qualifier(schema) {
+                SchemaQualifier::Main => objects.push((Some("main".to_string()), name.to_string())),
+                SchemaQualifier::Attached(s) => objects.push((Some(s.to_string()), name.to_string())),
+                _ => return None,
+            },
+            _ => return None,
+        }
+    }
+    Some(PgDropObjectsStmt {
+        kind,
+        objects,
+        missing_ok: drop.missing_ok,
+    })
+}
+
 /// Returns true if the parse result is a REFRESH MATERIALIZED VIEW statement.
 /// Turso materialized views are live (auto-updating), so REFRESH is a no-op.
 pub fn is_refresh_matview(parse_result: &ParseResult) -> bool {
@@ -7472,6 +7594,21 @@ fn from_item_refnames(item: &pg_query::protobuf::Node, names: &mut Vec<String>) 
 /// name, an expression argument, a cast to any other type — is not a branch call, and reaches the
 /// engine, which fails it.
 pub fn try_extract_branch_call(parse_result: &ParseResult) -> Option<PgBranchCall> {
+    extract_branch_call(parse_result, crate::MAX_PARAMETER as i32)
+}
+
+/// Whether the same branch-call grammar holds except for a parameter past its Bind limit.
+/// Parse uses this only on an oversized marker, so an ordinary query's variable-parameter
+/// analysis cannot turn a refused branch call into an unknown scalar function.
+pub fn branch_call_exceeds_parameter_limit(parse_result: &ParseResult) -> bool {
+    extract_branch_call(parse_result, i32::MAX).is_some_and(|call| {
+        call.args.iter().any(|arg| {
+            matches!(arg, PgBranchArg::Param(n) if *n > crate::MAX_PARAMETER as usize)
+        })
+    })
+}
+
+fn extract_branch_call(parse_result: &ParseResult, parameter_limit: i32) -> Option<PgBranchCall> {
     use pg_query::protobuf::{a_const::Val, node::Node};
 
     let [raw] = parse_result.protobuf.stmts.as_slice() else {
@@ -7547,7 +7684,7 @@ pub fn try_extract_branch_call(parse_result: &ParseResult) -> Option<PgBranchCal
     {
         return None;
     }
-    fn arg(node: &pg_query::protobuf::Node) -> Option<PgBranchArg> {
+    fn arg(node: &pg_query::protobuf::Node, parameter_limit: i32) -> Option<PgBranchArg> {
         match node.node.as_ref()? {
             Node::AConst(c) if c.isnull => Some(PgBranchArg::Null),
             Node::AConst(c) => match c.val.as_ref()? {
@@ -7559,7 +7696,7 @@ pub fn try_extract_branch_call(parse_result: &ParseResult) -> Option<PgBranchCal
             // prepare refuses it (42P02); Describe sized the call's list by it (review 9 item 1).
             // The number is libpg_query's, which wraps above i32::MAX: the caller checks it
             // against the text first (checked_param_numbers; review 12 item 1).
-            Node::ParamRef(p) if (1..=crate::MAX_PARAMETER as i32).contains(&p.number) => {
+            Node::ParamRef(p) if (1..=parameter_limit).contains(&p.number) => {
                 Some(PgBranchArg::Param(p.number as usize))
             }
             // A cast with no location over a parameter is libpg_query's `type $n`, which
@@ -7573,7 +7710,7 @@ pub fn try_extract_branch_call(parse_result: &ParseResult) -> Option<PgBranchCal
                     ))
                     && to_text(cast.type_name.as_ref()?) =>
             {
-                match arg(cast.arg.as_deref()?)? {
+                match arg(cast.arg.as_deref()?, parameter_limit)? {
                     PgBranchArg::Bool(b) => Some(PgBranchArg::Text(b.to_string().into())),
                     other => Some(other),
                 }
@@ -7605,7 +7742,7 @@ pub fn try_extract_branch_call(parse_result: &ParseResult) -> Option<PgBranchCal
             && !t.setof
             && !t.pct_type
     }
-    let args = call.args.iter().map(arg).collect::<Option<smallvec::SmallVec<_>>>()?;
+    let args = call.args.iter().map(|node| arg(node, parameter_limit)).collect::<Option<smallvec::SmallVec<_>>>()?;
     // Lower-case already (an upper-case byte was refused above): borrowed when it is a known name.
     let function = branch_function_name(function);
     Some(PgBranchCall { function, args })

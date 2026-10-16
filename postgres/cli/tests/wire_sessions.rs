@@ -7091,8 +7091,9 @@ fn a_fatal_startup_error_ends_the_session() {
     );
 }
 
-/// A parameter number past PostgreSQL's limit (65535: Bind counts parameters in 16 bits) is refused
-/// with 42P02 before anything is sized by it, on both protocols, and the session answers on.
+/// A parameter number past the simple protocol's bound is refused with 42P02. Parse uses
+/// PostgreSQL's variable-parameter bound and diagnoses the first untyped gap with 42P18, as
+/// recorded by PG 18.6 in pg18-audit3-a_parameter_number_past_the_limit_is_refused.out.
 /// `SELECT 1 LIMIT $2147483647` sized the inferred-type list by the number (about 16 GiB zeroed),
 /// from one unauthenticated simple query (wire review 8 item 3).
 #[test]
@@ -7100,14 +7101,14 @@ fn a_parameter_number_past_the_limit_is_refused() {
     let dir = Scratch::new("paramlimit");
     let server = Server::start(&dir.db(), &[]);
     let mut a = seeded(&server);
-    for sql in [
-        "SELECT 1 LIMIT $2147483647",
-        "SELECT v FROM t WHERE id = $65536",
+    for (sql, extended_code) in [
+        ("SELECT 1 LIMIT $2147483647", "42P02"),
+        ("SELECT v FROM t WHERE id = $65536", "42P18"),
     ] {
         let r = a.q(sql);
         assert_eq!(r.err(sql).code, "42P02", "{sql}");
         let r = a.describe_statement(sql);
-        assert_eq!(r.err(sql).code, "42P02", "{sql}, extended");
+        assert_eq!(r.err(sql).code, extended_code, "{sql}, extended");
         assert_eq!(a.q("SELECT 1").single("the session answers"), "1");
     }
 }
@@ -12255,11 +12256,6 @@ replays_postgresql!(
     "pg18-audit1-lib-a_bytea_parameter_with_a_non_ascii_digit_is_refused.out",
     [
         (1, "PGDIV-PUBLIC-SCHEMA-NOOP refusal [wire]: DROP SCHEMA public CASCADE drops tables, but CREATE SCHEMA public is unconditionally refused 42601; PostgreSQL recreates it (C56)"),
-        (2, "PGDIV-BIND-REFUSAL-STEP protocol [wire]: bytea param \\x0é0: PG refuses 22023 at Bind; ours BindComplete+RowDescription first (same text)"),
-        (3, "PGDIV-BIND-REFUSAL-STEP protocol [wire]: bytea param \\xé: PG refuses 22023 at Bind; ours BindComplete+RowDescription first"),
-        (4, "PGDIV-BIND-REFUSAL-STEP protocol [wire]: bytea param \\x0😀0: PG refuses 22023 at Bind; ours BindComplete+RowDescription first"),
-        (5, "PGDIV-BIND-REFUSAL-STEP protocol [wire]: bytea param \\xGG: PG refuses 22023 at Bind; ours BindComplete+RowDescription first"),
-        (6, "PGDIV-BIND-REFUSAL-STEP protocol [wire]: bytea param \\x0 (odd digits): PG refuses 22023 at Bind; ours BindComplete+RowDescription first"),
     ]
 );
 replays_postgresql!(
@@ -12267,16 +12263,7 @@ replays_postgresql!(
     "pg18-audit1-lib-parameters_decode_at_postgresqls_edges.out",
     [
         (1, "PGDIV-PUBLIC-SCHEMA-NOOP refusal [wire]: DROP SCHEMA public CASCADE drops tables, but CREATE SCHEMA public is unconditionally refused 42601; PostgreSQL recreates it (C56)"),
-        (3, "PGDIV-BIND-REFUSAL-STEP protocol [wire]: real param 3.5e+38: PG refuses at Bind (no BindComplete); ours sends BindComplete+RowDescription then 22003, text also gains a leading 'value '"),
-        (4, "PGDIV-BIND-REFUSAL-STEP protocol [wire]: float8 param 1e-400: PG refuses at Bind; ours BindComplete+RowDescription then 22003 with extra 'value ' prefix"),
-        (5, "PGDIV-BIND-REFUSAL-STEP protocol [wire]: float8 param -1e-400: PG refuses at Bind; ours BindComplete+RowDescription then 22003 with extra 'value ' prefix"),
-        (6, "PGDIV-BIND-REFUSAL-STEP protocol [wire]: real param 1e-50: PG refuses at Bind; ours BindComplete+RowDescription then 22003 with extra 'value ' prefix"),
         (12, "PGDIV-NUMERIC-AS-FLOAT value [engine]: SILENT: numeric param 1e-400 answers '0' where PG answers the exact 0.(399 zeros)1; the numeric decode underflows"),
-        (15, "PGDIV-BIND-REFUSAL-STEP protocol [wire]: int4 param '_100': PG refuses 22P02 at Bind; ours BindComplete+RowDescription first (same code and text)"),
-        (16, "PGDIV-BIND-REFUSAL-STEP protocol [wire]: int4 param '0x_': PG refuses 22P02 at Bind; ours BindComplete+RowDescription first"),
-        (17, "PGDIV-BIND-REFUSAL-STEP protocol [wire]: int4 param '0b__1': PG refuses 22P02 at Bind; ours BindComplete+RowDescription first"),
-        (18, "PGDIV-BIND-REFUSAL-STEP protocol [wire]: int4 param '0o_': PG refuses 22P02 at Bind; ours BindComplete+RowDescription first"),
-        (19, "PGDIV-BIND-REFUSAL-STEP protocol [wire]: int4 param '100_': PG refuses 22P02 at Bind; ours BindComplete+RowDescription first"),
     ]
 );
 replays_postgresql!(
@@ -12284,8 +12271,6 @@ replays_postgresql!(
     "pg18-audit1-ws-a_bytea_parameter_with_a_non_ascii_digit_is_refused.out",
     [
         (1, "PGDIV-PUBLIC-SCHEMA-NOOP refusal [wire]: DROP SCHEMA public CASCADE drops tables, but CREATE SCHEMA public is unconditionally refused 42601; PostgreSQL recreates it (C56)"),
-        (5, "PGDIV-BIND-REFUSAL-STEP protocol [wire]: INSERT bytea param \\x0é0: PG refuses 22023 at Bind; ours BindComplete+NoData first"),
-        (7, "PGDIV-BIND-REFUSAL-STEP protocol [wire]: INSERT bytea param \\x0😀0: PG refuses 22023 at Bind; ours BindComplete+NoData first"),
     ]
 );
 replays_postgresql!(
@@ -12433,7 +12418,6 @@ replays_postgresql!(
     [
         (1, "PGDIV-PUBLIC-SCHEMA-NOOP refusal [wire]: DROP SCHEMA public CASCADE drops tables, but CREATE SCHEMA public is unconditionally refused 42601; PostgreSQL recreates it (C56)"),
         (6, "PGDIV-WITH-ORDINALITY ours-only [ours-only]: generate_series(...) WITH ORDINALITY refused 0A000"),
-        (7, "PGDIV-COLUMN-ALIAS-COUNT-CODE error-code [wire]: AS g(a, b) over a 1-column function: PG 42P10 'table \"g\" has 1 columns available but 2 columns specified'; ours 42601 'too many column aliases'"),
     ]
 );
 replays_postgresql!(
@@ -12485,7 +12469,6 @@ replays_postgresql!(
     "pg18-audit2-a_refused_create_table_leaves_no_sequence.out",
     [
         (3, "PGDIV-PARSE-PREFIX error-text [wire]: 42830 both; ours prefixes 'Parse error: '"),
-        (5, "PGDIV-RELATION-EXISTS-CODE error-code [wire]: CREATE TABLE of an existing name: PG 42P07 'relation \"p\" already exists'; ours 42601 'Parse error: table p already exists'"),
     ]
 );
 replays_postgresql!(
@@ -12551,7 +12534,6 @@ replays_postgresql!(
     "pg18-audit2-char_n_is_blank_padded_as_in_postgres.out",
     [
         (5, "PGDIV-EXPR-TYPE-TEXT value [wire]: length(char(n)) typed 25 text in RowDescription; PG 23 int4 (value 3 agrees)"),
-        (6, "PGDIV-CHAR-OVERFLOW-CODE error-code [wire]: char(6) overflow: PG 22001 'value too long for type character(6)'; ours XX000 'value too long for type character'"),
     ]
 );
 replays_postgresql!(
@@ -12627,22 +12609,13 @@ replays_postgresql!(
     "pg18-audit2-set_reads_every_value_it_is_given.out",
     [
         (3, "PGDIV-SET-REFUSED ours-only [ours-only]: SET DateStyle TO ISO, DMY refused 0A000"),
-        (5, "PGDIV-SHOW-TAG protocol [wire]: SHOW DateStyle completes with tag 'SELECT 1' where PG sends 'SHOW' (value 'ISO, MDY' agrees)"),
     ]
 );
 replays_postgresql!(
     pg18_audit2_show_answers_from_the_settings_set_keeps_replays_as_postgresql_answered,
     "pg18-audit2-show_answers_from_the_settings_set_keeps.out",
-    [
-        (1, "PGDIV-SHOW-TAG protocol [wire]: SHOW search_path completes with tag 'SELECT 1' where PG sends 'SHOW' (value agrees)"),
-        (3, "PGDIV-SHOW-TAG protocol [wire]: SHOW search_path tag 'SELECT 1' vs 'SHOW' (value 's, public' agrees)"),
-        (4, "PGDIV-SHOW-TAG protocol [wire]: SHOW client_encoding tag 'SELECT 1' vs 'SHOW'"),
-        (5, "PGDIV-SHOW-TAG protocol [wire]: SHOW standard_conforming_strings tag 'SELECT 1' vs 'SHOW'"),
-        (6, "PGDIV-CLUSTER-SETTINGS cluster-state [cluster]: SHOW DateStyle: PG cluster's config file sets 'ISO, YMD', ours default 'ISO, MDY'; tag 'SELECT 1' vs 'SHOW' also differs (wire)"),
-        (7, "PGDIV-SHOW-TAG protocol [wire]: SHOW IntervalStyle tag 'SELECT 1' vs 'SHOW'"),
+    [        (6, "PGDIV-CLUSTER-SETTINGS cluster-state [cluster]: SHOW DateStyle: PG cluster's config file sets 'ISO, YMD', ours default 'ISO, MDY'; tag 'SELECT 1' vs 'SHOW' also differs (wire)"),
         (8, "PGDIV-CLUSTER-SETTINGS cluster-state [cluster]: SHOW TimeZone: PG cluster's 'America/Toronto' vs ours 'UTC'; tag 'SELECT 1' vs 'SHOW' also differs (wire)"),
-        (9, "PGDIV-SHOW-TAG protocol [wire]: SHOW bytea_output tag 'SELECT 1' vs 'SHOW'"),
-        (10, "PGDIV-SHOW-TAG protocol [wire]: SHOW transaction_read_only tag 'SELECT 1' vs 'SHOW'"),
         (11, "PGDIV-PARSE-PREFIX error-text [wire]: 42704 both; ours prefixes 'Parse error: '"),
         (12, "PGDIV-PARSE-PREFIX error-text [wire]: 42704 both; ours prefixes 'Parse error: '"),
         (13, "PGDIV-PARSE-PREFIX error-text [wire]: 42704 both; ours prefixes 'Parse error: '"),
@@ -12747,7 +12720,6 @@ replays_postgresql!(
         (4, "PGDIV-PARSE-PREFIX error-text [wire]: 42P02 both; ours prefixes 'Parse error: '"),
         (5, "PGDIV-PARSE-REFUSAL-STEP protocol [wire]: Describe of LIMIT $2147483647: PG refuses 42P02 at Parse; ours ParseComplete then 42P02 with prefix"),
         (7, "PGDIV-PARSE-PREFIX error-text [wire]: 42P02 both; ours prefixes 'Parse error: '"),
-        (8, "PGDIV-PARAM-OVER-LIMIT-CODE error-code [wire]: Describe of id = $65536: PG refuses at Parse 42P18 'could not determine data type of parameter $1'; ours ParseComplete then 42P02 there is no parameter $65536"),
     ]
 );
 replays_postgresql!(
@@ -12804,8 +12776,6 @@ replays_postgresql!(
     "pg18-audit3-an_undeclared_parameter_has_its_inferred_type_at_describe_and_bind.out",
     [
         (1, "PGDIV-SCHEMA-REFUSED refusal [ours-only]: DROP SCHEMA IF EXISTS s (PG had s.t); DROP SCHEMA public: ours refuses the whole query 0A000"),
-        (20, "PGDIV-PARSE-REFUSAL-STEP protocol [wire]: Describe of id = $2 (no $1): PG refuses 42P18 at Parse; ours ParseComplete then the same 42P18"),
-        (25, "PGDIV-PARSE-REFUSAL-STEP protocol [wire]: Parse SELECT 1 with one declared-0 param: PG refuses 42P18 at Parse; ours ParseComplete then the same 42P18"),
     ]
 );
 replays_postgresql!(
@@ -12823,7 +12793,6 @@ replays_postgresql!(
     "pg18-audit3-copy_from_runs_inside_the_block_it_is_in.out",
     [
         (1, "PGDIV-SCHEMA-REFUSED refusal [ours-only]: DROP SCHEMA IF EXISTS s; DROP SCHEMA public: ours refuses the whole query 0A000"),
-        (15, "PGDIV-COPY-INPUT-CODE error-code [wire]: COPY of a non-integer into INT: PG 22P02 invalid input syntax for type integer: \"not-a-number\"; ours 23000 'cannot store TEXT value in INTEGER column cp.id (19)'"),
     ]
 );
 replays_postgresql!(
@@ -12906,19 +12875,12 @@ replays_postgresql!(
 replays_postgresql!(
     pg18_bytea_replays_as_postgresql_answered,
     "pg18-bytea.out",
-    [
-        (5, "PGDIV-BIND-REFUSAL-STEP protocol [wire]: bytea param a\\qb: PG refuses 22P02 at Bind; ours BindComplete+NoData first (same text)"),
-        (6, "PGDIV-BIND-REFUSAL-STEP protocol [wire]: bytea param a\\1b: PG refuses 22P02 at Bind; ours BindComplete+NoData first"),
-        (7, "PGDIV-BIND-REFUSAL-STEP protocol [wire]: bytea param a\\400b: PG refuses 22P02 at Bind; ours BindComplete+NoData first"),
-    ]
+    [    ]
 );
 replays_postgresql!(
     pg18_c33_engineerr_replays_as_postgresql_answered,
     "pg18-c33-engineerr.out",
-    [
-        (1, "PGDIV-DROP-NOTICE protocol [wire]: DROP TABLE IF EXISTS big: ours omits PG's NOTICE"),
-        (2, "PGDIV-DROP-NOTICE protocol [wire]: DROP TABLE IF EXISTS t: ours omits PG's NOTICE"),
-        (7, "PGDIV-SUM-INT8-NUMERIC value [engine]: sum(bigint) past int8: ours 22003 'integer overflow'; PG answers numeric 9223372036854775808"),
+    [        (7, "PGDIV-SUM-INT8-NUMERIC value [engine]: sum(bigint) past int8: ours 22003 'integer overflow'; PG answers numeric 9223372036854775808"),
         (8, "PGDIV-INT-RANGE value [engine]: SILENT: v + 1 past int8 answers '9.223372036854776e+18' typed 23; PG 20 then 22003"),
         (9, "PGDIV-INT-RANGE value [engine]: SILENT: v * 2 answers '1.8446744073709552e+19' typed 23; PG 20 then 22003"),
         (10, "PGDIV-INT-RANGE value [engine]: SILENT: abs(-9223372036854775808::int8) answers 9223372036854775807 typed 25; PG 22003"),
@@ -12941,14 +12903,11 @@ replays_postgresql!(
 replays_postgresql!(
     pg18_c33_replays_as_postgresql_answered,
     "pg18-c33.out",
-    [
-        (1, "PGDIV-DROP-NOTICE protocol [wire]: drop table if exists pd: ours omits PG's NOTICE"),
-        (13, "PGDIV-NUMERIC-AS-FLOAT value [engine]: SILENT: 0x_7FFF_FFFF_FFFF_FFFF_F answers '1.4757395258967641e+20' typed 701; PG exact 147573952589676412927 typed 1700"),
+    [        (13, "PGDIV-NUMERIC-AS-FLOAT value [engine]: SILENT: 0x_7FFF_FFFF_FFFF_FFFF_F answers '1.4757395258967641e+20' typed 701; PG exact 147573952589676412927 typed 1700"),
         (17, "PGDIV-NUMERIC-AS-FLOAT value [engine]: SILENT: SELECT 9223372036854775808 answers '9.223372036854776e+18' typed 701; PG exact numeric 9223372036854775808"),
         (19, "PGDIV-NEG-ZERO value [engine]: SILENT: SELECT -0.0 answers '-0' typed 701; PG numeric '0.0'"),
         (20, "PGDIV-NEG-ZERO value [engine]: SILENT: SELECT -0.0::float8 answers '0'; PG '-0' (cast binds before unary minus)"),
         (22, "PGDIV-NEG-ZERO value [engine]: SILENT: '-0'::numeric answers '-0' typed 701; PG '0' typed 1700"),
-        (23, "PGDIV-DROP-NOTICE protocol [wire]: drop table if exists rr: ours omits PG's NOTICE"),
         (25, "PGDIV-REAL-RANGE value [engine]: SILENT: insert 1e39 into a real column succeeds (stored as Infinity); PG 22003 out of range for type real"),
         (26, "PGDIV-REAL-RANGE value [engine]: SILENT: insert '1e39' into real succeeds (Infinity); PG 22003"),
         (27, "PGDIV-REAL-RANGE value [engine]: SILENT: insert -1e39 into real succeeds (-Infinity); PG 22003"),
@@ -12962,9 +12921,7 @@ replays_postgresql!(
 replays_postgresql!(
     pg18_colnames_replays_as_postgresql_answered,
     "pg18-colnames.out",
-    [
-        (1, "PGDIV-DROP-NOTICE protocol [wire]: DROP TABLE IF EXISTS of a missing table: ours omits PG's NOTICE 'table \"cn\" does not exist, skipping'"),
-        (4, "PGDIV-NAN ours-only [ours-only]: 'nan'::numeric refused 0A000 (engine holds no NaN); PG answers the whole row"),
+    [        (4, "PGDIV-NAN ours-only [ours-only]: 'nan'::numeric refused 0A000 (engine holds no NaN); PG answers the whole row"),
         (5, "PGDIV-EXPR-TYPE-TEXT value [wire]: CASE WHEN true THEN a ELSE a END typed 25 text; PG 23 int4 (values agree)"),
         (6, "PGDIV-ROW-CONSTRUCTOR value [wire]: SELECT ARRAY[1], ROW(1, 2), EXISTS ..., ...: ours errors 42601 'row value misused' where PG answers one row"),
         (7, "PGDIV-NUMERIC-OID-FLOAT8 value [wire]: numeric literal 1.5 typed 701 float8; PG 1700 numeric (text agrees)"),
@@ -12974,9 +12931,7 @@ replays_postgresql!(
 replays_postgresql!(
     pg18_derivedbool_replays_as_postgresql_answered,
     "pg18-derivedbool.out",
-    [
-        (1, "PGDIV-DROP-NOTICE protocol [wire]: DROP TABLE IF EXISTS parent, child: ours omits PG's two NOTICEs"),
-    ]
+    [    ]
 );
 replays_postgresql!(
     pg18_float_replays_as_postgresql_answered,
@@ -13010,16 +12965,12 @@ replays_postgresql!(
 replays_postgresql!(
     pg18_gsstar_replays_as_postgresql_answered,
     "pg18-gsstar.out",
-    [
-        (1, "PGDIV-DROP-NOTICE protocol [wire]: DROP TABLE IF EXISTS gt: ours omits PG's NOTICE 'does not exist, skipping'"),
-    ]
+    [    ]
 );
 replays_postgresql!(
     pg18_ident_replays_as_postgresql_answered,
     "pg18-ident.out",
-    [
-        (1, "PGDIV-DROP-NOTICE protocol [wire]: DROP TABLE IF EXISTS idt, idb, gv: ours omits PG's three NOTICEs"),
-        (6, "PGDIV-VIRTUAL-GENERATED value [wire]: create table with b ... GENERATED ALWAYS AS (a * 2) VIRTUAL: ours errors 42601 syntax error at \"virtual\" where PG creates it (a refusal should be 0A000)"),
+    [        (6, "PGDIV-VIRTUAL-GENERATED value [wire]: create table with b ... GENERATED ALWAYS AS (a * 2) VIRTUAL: ours errors 42601 syntax error at \"virtual\" where PG creates it (a refusal should be 0A000)"),
         (7, "PGDIV-VIRTUAL-GENERATED cascade [wire]: insert into gv: 42P01 no such table (cascade of #6)"),
         (10, "PGDIV-VIRTUAL-GENERATED cascade [wire]: select * from gv: 42P01 no such table (cascade of #6)"),
     ]
@@ -13042,9 +12993,7 @@ replays_postgresql!(
 replays_postgresql!(
     pg18_inherits_replays_as_postgresql_answered,
     "pg18-inherits.out",
-    [
-        (1, "PGDIV-DROP-NOTICE protocol [wire]: DROP TABLE IF EXISTS ich, ipa: ours omits PG's two NOTICEs 'does not exist, skipping'"),
-        (3, "PGDIV-INHERITS ours-only [ours-only]: CREATE TABLE ... INHERITS refused 0A000"),
+    [        (3, "PGDIV-INHERITS ours-only [ours-only]: CREATE TABLE ... INHERITS refused 0A000"),
         (4, "PGDIV-INHERITS cascade [ours-only]: INSERT INTO ich: 42P01 no such table (cascade of #3)"),
         (5, "PGDIV-INHERITS cascade [ours-only]: SELECT FROM ich: 42P01 (cascade of #3)"),
         (6, "PGDIV-INHERITS cascade [ours-only]: SELECT FROM ipa: 0 rows vs PG's inherited row (cascade of #3)"),
@@ -13054,9 +13003,7 @@ replays_postgresql!(
 replays_postgresql!(
     pg18_insdef_replays_as_postgresql_answered,
     "pg18-insdef.out",
-    [
-        (1, "PGDIV-DROP-NOTICE protocol [wire]: DROP TABLE IF EXISTS it: ours omits PG's NOTICE"),
-        (3, "PGDIV-PARSE-PREFIX error-text [wire]: 42601 both; ours prefixes 'Parse error: '"),
+    [        (3, "PGDIV-PARSE-PREFIX error-text [wire]: 42601 both; ours prefixes 'Parse error: '"),
         (4, "PGDIV-PARSE-PREFIX error-text [wire]: 42601 both; ours prefixes 'Parse error: '"),
         (8, "PGDIV-PARSE-PREFIX error-text [wire]: 42601 both; ours prefixes 'Parse error: '"),
     ]
@@ -13064,9 +13011,7 @@ replays_postgresql!(
 replays_postgresql!(
     pg18_join1_replays_as_postgresql_answered,
     "pg18-join1.out",
-    [
-        (1, "PGDIV-DROP-NOTICE protocol [wire]: DROP TABLE IF EXISTS j1, j2: ours omits PG's two NOTICEs"),
-    ]
+    [    ]
 );
 replays_postgresql!(
     pg18_join1b_replays_as_postgresql_answered,
@@ -13078,9 +13023,7 @@ replays_postgresql!(
 replays_postgresql!(
     pg18_join2_replays_as_postgresql_answered,
     "pg18-join2.out",
-    [
-        (1, "PGDIV-DROP-NOTICE protocol [wire]: DROP TABLE IF EXISTS j1, j2: ours omits PG's two NOTICEs"),
-        (8, "PGDIV-FULL-JOIN-USING value [wire]: FULL JOIN ... USING (i): ours errors 42601 'FULL OUTER JOIN requires an equality condition in the ON clause' where PG answers 4 rows"),
+    [        (8, "PGDIV-FULL-JOIN-USING value [wire]: FULL JOIN ... USING (i): ours errors 42601 'FULL OUTER JOIN requires an equality condition in the ON clause' where PG answers 4 rows"),
         (10, "PGDIV-FULL-JOIN-USING value [wire]: SELECT i FROM j1 FULL JOIN j2 USING (i): ours errors 42601 where PG answers 4 rows"),
         (12, "PGDIV-FULL-JOIN-USING value [wire]: NATURAL FULL JOIN: ours errors 42601 where PG answers 4 rows"),
     ]
@@ -13088,9 +13031,7 @@ replays_postgresql!(
 replays_postgresql!(
     pg18_nullorder_replays_as_postgresql_answered,
     "pg18-nullorder.out",
-    [
-        (1, "PGDIV-DROP-NOTICE protocol [wire]: drop table if exists nt: ours omits PG's NOTICE"),
-        (9, "PGDIV-EXPR-TYPE-TEXT value [wire]: row_number() OVER typed 25 text; PG 20 int8 (rows agree)"),
+    [        (9, "PGDIV-EXPR-TYPE-TEXT value [wire]: row_number() OVER typed 25 text; PG 20 int8 (rows agree)"),
     ]
 );
 replays_postgresql!(
@@ -13114,8 +13055,6 @@ replays_postgresql!(
         (27, "PGDIV-SQLITE-NAME-MESSAGE error-text [wire]: 42P01 both; ours 'Parse error: no such table: nosuch' vs PG 'relation \"nosuch\" does not exist'"),
         (33, "PGDIV-ARRAY-RESULT-BLOB value [wire]: SILENT: text[] param {\"NUL\\L\"} comes back as blob '\\\\x02154e554c4c' instead of '{\"NULL\"}'"),
         (34, "PGDIV-ARRAY-RESULT-BLOB value [wire]: SILENT: text[] param {NULL} comes back as blob '\\\\x0200' instead of '{NULL}'"),
-        (35, "PGDIV-BIND-REFUSAL-STEP protocol [wire]: malformed text[] param {a}}: PG refuses 22P02 at Bind; ours BindComplete+RowDescription first"),
-        (36, "PGDIV-BIND-REFUSAL-STEP protocol [wire]: int[] param {1,x}: PG refuses 22P02 at Bind; ours BindComplete+RowDescription first"),
         (37, "PGDIV-ARRAY-RESULT-BLOB value [wire]: SILENT: text[] param {a,b} comes back as blob '\\\\x030f0f6162' instead of '{a,b}'"),
     ]
 );
@@ -13130,17 +13069,13 @@ replays_postgresql!(
 replays_postgresql!(
     pg18_short_replays_as_postgresql_answered,
     "pg18-short.out",
-    [
-        (1, "PGDIV-DROP-NOTICE protocol [wire]: DROP TABLE IF EXISTS s3: ours omits PG's NOTICE"),
-        (6, "PGDIV-PARSE-PREFIX error-text [wire]: 42601 both; ours prefixes 'Parse error: '"),
+    [        (6, "PGDIV-PARSE-PREFIX error-text [wire]: 42601 both; ours prefixes 'Parse error: '"),
     ]
 );
 replays_postgresql!(
     pg18_tablestar_replays_as_postgresql_answered,
     "pg18-tablestar.out",
-    [
-        (1, "PGDIV-DROP-NOTICE protocol [wire]: DROP TABLE IF EXISTS parent, child: ours omits PG's two NOTICEs"),
-    ]
+    [    ]
 );
 replays_postgresql!(
     pg18_types_replays_as_postgresql_answered,
@@ -13153,15 +13088,11 @@ replays_postgresql!(
     [
         (6, "PGDIV-SCHEMA-REFUSED refusal [ours-only]: CREATE SCHEMA s refused 0A000 (recording relies on schema s)"),
         (7, "PGDIV-MISSING-SCHEMA-CODE cascade [wire]: CREATE TABLE s.t: XX000 no such database: s (cascade of #6); missing-schema XX000 rather than 3F000 is a frontend defect (C56)"),
-        (9, "PGDIV-PARSE-REFUSAL-STEP protocol [wire]: Describe of id = $2 (no $1): PG refuses 42P18 at Parse; ours ParseComplete then the same error"),
         (14, "PGDIV-SUM-INT8-NUMERIC value [engine]: sum(bigint) past int8 inside a savepoint block: ours 22003 'integer overflow' and aborts (Z E); PG answers numeric 9223372036854775808 (Z T)"),
         (15, "PGDIV-SUM-INT8-NUMERIC cascade [engine]: SELECT 1/0: ours 25P02 because #14 aborted the block; PG 22012 (cascade of #14)"),
         (20, "PGDIV-PARSE-PREFIX error-text [wire]: COPY ... WHERE v = $1 over Q: 42P02 both; ours prefixes 'Parse error: '"),
         (21, "PGDIV-PARSE-PREFIX error-text [wire]: COPY ... WHERE v = $1 extended: message sequence agrees (Parse/Bind/NoData then 42P02); ours prefixes 'Parse error: '"),
-        (22, "PGDIV-PARSE-REFUSAL-STEP protocol [wire]: COPY ... WHERE v = $1 with param type 0: PG refuses 42P18 at Parse; ours ParseComplete then the same error"),
         (25, "PGDIV-PARSE-REFUSAL-STEP protocol [wire]: s.t.c with only t in FROM: PG refuses at Parse 'invalid reference to FROM-clause entry'; ours ParseComplete then 'Parse error: missing FROM-clause entry' (42P01 both)"),
-        (26, "PGDIV-BIND-REFUSAL-STEP protocol [wire]: $1::float8 param 1e-400: PG refuses at Bind (only ParseComplete); ours BindComplete+RowDescription then 22003 with 'value ' prefix"),
-        (27, "PGDIV-BIND-REFUSAL-STEP protocol [wire]: $1::float4 param 1e-50: PG refuses at Bind; ours BindComplete+RowDescription then 22003 with 'value ' prefix"),
         (31, "PGDIV-PARSE-REFUSAL-STEP protocol [wire]: Describe of SELECT varchar $1: PG refuses 42601 at Parse; ours ParseComplete then 'Parse error: syntax error'"),
         (32, "PGDIV-PARSE-REFUSAL-STEP protocol [wire]: SELECT varchar $1 over Parse/Bind/Execute: PG refuses at Parse; ours ParseComplete+BindComplete then 42601 with prefix"),
         (37, "PGDIV-BOOL-TEXT value [wire]: SILENT: EXISTS (SELECT 1 FROM k WHERE k.flag) in DELETE RETURNING answers '1' typed 25; PG 't' typed 16"),
@@ -13173,9 +13104,7 @@ replays_postgresql!(
 replays_postgresql!(
     pg18_c33_intrange_replays_as_postgresql_answered,
     "pg18-c33-intrange.out",
-    [
-        (1, "PGDIV-DROP-NOTICE protocol [wire]: DROP TABLE IF EXISTS of a missing table: ours omits PG's NOTICE 00000 'table \"big\" does not exist, skipping'"),
-        (4, "PGDIV-INT-RANGE value [engine]: SILENT: -9223372036854775808::int8 (cast binds before minus, so 2^63 overflows) answers -9223372036854775807 typed 23; PG 22003 bigint out of range"),
+    [        (4, "PGDIV-INT-RANGE value [engine]: SILENT: -9223372036854775808::int8 (cast binds before minus, so 2^63 overflows) answers -9223372036854775807 typed 23; PG 22003 bigint out of range"),
         (5, "PGDIV-INT-RANGE value [engine]: SILENT: abs(-9223372036854775808::int8) answers 9223372036854775807 typed 25; PG 22003"),
         (6, "PGDIV-INT-RANGE value [engine]: SILENT: '9223372036854775808'::int8 clamps to 9223372036854775807 typed 23; PG 22003 out of range for type bigint"),
         (7, "PGDIV-INT-RANGE value [engine]: SILENT: 9223372036854775807 + 1 answers float '9.223372036854776e+18' typed 23; PG 22003 bigint out of range"),
@@ -13194,6 +13123,7 @@ replays_postgresql!(
         (20, "PGDIV-SUM-INT8-NUMERIC value [engine]: sum(bigint) past int8: ours 22003 'integer overflow'; PG sum(int8) is numeric and answers 9223372036854775808 typed 1700"),
     ]
 );
+
 
 // PG 18.6 card-row recordings: c44-pg18-errors.txt beside these tests.
 #[test]
@@ -14824,3 +14754,17 @@ fn c52_scalar_completed_text_is_refused_by_numeric_common_contexts() {
         .into_iter().map(|sql| w.describe_statement(sql).error.map(|error| error.code)).collect();
     assert_eq!(codes, vec![Some("42804".into()),Some("42804".into())]);
 }
+
+#[path = "c44_followup/regressions.rs"]
+mod c44_followup;
+
+replays_postgresql!(
+    pg18_c53_dropnotice_replays_as_postgresql_answered,
+    "pg18-c53-dropnotice.out",
+    [
+        (9, "PGDIV-SCHEMA-REFUSED ours-only [ours-only]: DROP SCHEMA IF EXISTS dsch1: PG sends NOTICE 'schema \"dsch1\" does not exist, skipping'; the branch server refuses every schema statement but public's with 0A000"),
+        (14, "PGDIV-WRONG-KIND-CODE error-code [wire]: DROP TABLE IF EXISTS of a view: PG 42809 '\"dv2\" is not a table'; ours the same text as 42601 with the 'Parse error: ' prefix"),
+        (17, "PGDIV-CLUSTER-SETTINGS cluster-state [cluster]: SHOW DateStyle: the recording cluster's config set 'ISO, YMD'; ours the built-in 'ISO, MDY'"),
+        (24, "PGDIV-SQLITE-NAME-MESSAGE error-text [wire]: DROP TABLE dm1, dmmissing: PG 42P01 'table \"dmmissing\" does not exist'; ours 42P01 'Parse error: no such table: dmmissing' (nothing dropped on either)"),
+    ]
+);
