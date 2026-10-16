@@ -2395,4 +2395,51 @@ mod c52_tests {
         assert_eq!(actual, cases.iter().map(|(_, oid)| Some(*oid)).collect::<Vec<_>>());
     }
 
+    #[test]
+    fn c52_scalar_numeric_set_and_cte_publish_the_recorded_type() {
+        // The independent PG18.6 scalar-context recording returns "numeric"
+        // for both expressions. Check the shared typed tree separately from the
+        // strict wire controls: compound scalar execution is still unsupported.
+        let schema = std::sync::Arc::new(Schema::default());
+        let attached = Attached { names: &[], holds: &|_, _| false };
+        for sql in [
+            "SELECT pg_typeof(abs((SELECT 1::numeric UNION SELECT 1::numeric)))::text",
+            "SELECT pg_typeof((WITH q AS (SELECT 1::numeric AS n) SELECT n FROM q))::text",
+        ] {
+            let parse = turso_pg_parser::parse(sql).unwrap();
+            let walked = parameter_types(&parse, &schema, &[], &Default::default(),
+                &attached, &Default::default()).unwrap();
+            assert!(walked.params.is_empty(), "{sql}");
+            assert!(walked.untyped.is_empty(), "{sql}");
+            assert_eq!(walked.columns, vec![Some(TEXT)], "{sql}");
+            let Some(Node::SelectStmt(select)) = parse.protobuf.stmts[0].stmt.as_deref().unwrap().node.as_ref() else {
+                panic!("SELECT tree");
+            };
+            let Some(Node::ResTarget(target)) = select.target_list[0].node.as_ref() else {
+                panic!("result target");
+            };
+            let output = target.val.as_deref().unwrap();
+            let Some(Node::TypeCast(cast)) = output.node.as_ref() else {
+                panic!("text result cast");
+            };
+            let typeof_node = cast.arg.as_deref().unwrap();
+            let Some(Node::FuncCall(typeof_call)) = typeof_node.node.as_ref() else {
+                panic!("pg_typeof call");
+            };
+            let argument = &typeof_call.args[0];
+            assert_eq!(walked.expressions.get(output), Some(TEXT), "{sql}");
+            assert_eq!(walked.expressions.get(typeof_node), Some(2206), "{sql}");
+            assert_eq!(walked.expressions.get(argument), Some(NUMERIC), "{sql}");
+            let scalar = match argument.node.as_ref() {
+                Some(Node::FuncCall(abs)) => {
+                    assert_eq!(func_name(abs).as_deref(), Some("abs"));
+                    &abs.args[0]
+                }
+                _ => argument,
+            };
+            assert!(matches!(scalar.node.as_ref(), Some(Node::SubLink(_))), "{sql}");
+            assert_eq!(walked.expressions.get(scalar), Some(NUMERIC), "{sql}");
+        }
+    }
+
 }
