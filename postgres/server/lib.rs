@@ -6455,6 +6455,33 @@ mod tests {
     /// engine's prepare). The L5 counter had been read only through the simple protocol and a
     /// hand-built portal.
     #[test]
+    fn c44_large_parameter_analysis_reuses_one_parse() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = session(&dir);
+        ok(&s, "CREATE TABLE t(id INT)");
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        rt.block_on(async {
+            for (sql, code) in [
+                ("SELECT turso_branch_create($65536)", "42P02"),
+                ("SELECT turso_branch_create($65536::text)", "42P02"),
+                ("SELECT id FROM t WHERE id=$65536 /* turso_branch_create */", "42P18"),
+                ("SELECT 'turso_branch_create' FROM t WHERE id=$65536", "42P18"),
+            ] {
+                let mut c = MemClient::new();
+                let before = turso_pg_parser::libpg_query_calls();
+                let err = s.on_parse(&mut c, Parse::new(None, sql.to_string(), vec![]))
+                    .await.expect_err("the oversized marker must be refused");
+                assert_eq!(turso_pg_parser::libpg_query_calls() - before, 1, "{sql}");
+                match err {
+                    PgWireError::UserError(info) => assert_eq!(info.code, code, "{sql}"),
+                    other => panic!("unexpected error for {sql}: {other:?}"),
+                }
+                assert!(c.replies.is_empty(), "a refused Parse must not send ParseComplete");
+            }
+        });
+    }
+
+    #[test]
     fn an_extended_statement_is_classified_once_at_parse() {
         let dir = tempfile::TempDir::new().unwrap();
         let s = session(&dir);
