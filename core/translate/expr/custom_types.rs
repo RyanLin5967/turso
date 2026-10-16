@@ -108,8 +108,15 @@ pub(super) fn emit_custom_type_operator(
     } else {
         // The operands as they are, in the call's argument slots.
         let arg_reg = program.alloc_registers(2);
-        translate_expr(program, referenced_tables, first, arg_reg, resolver)?;
-        translate_expr(program, referenced_tables, second, arg_reg + 1, resolver)?;
+        translate_custom_type_operand(program, referenced_tables, first, arg_reg, resolver, &func)?;
+        translate_custom_type_operand(
+            program,
+            referenced_tables,
+            second,
+            arg_reg + 1,
+            resolver,
+            &func,
+        )?;
         arg_reg
     };
 
@@ -127,6 +134,57 @@ pub(super) fn emit_custom_type_operator(
         });
     }
     Ok(result_reg)
+}
+
+fn translate_custom_type_operand(
+    program: &mut ProgramBuilder,
+    tables: Option<&TableReferences>,
+    expr: &ast::Expr,
+    target: usize,
+    resolver: &Resolver,
+    func: &Func,
+) -> Result<()> {
+    if matches!(
+        func,
+        Func::Scalar(
+            ScalarFunc::NumericAdd
+                | ScalarFunc::NumericSub
+                | ScalarFunc::NumericMul
+                | ScalarFunc::NumericDiv
+        )
+    ) {
+        // Numeric's operators already parse exact text. Converting a decimal literal to
+        // SQLite REAL first loses its display scale and possibly significant digits.
+        let mut literal = expr;
+        let mut negative = false;
+        loop {
+            match literal {
+                ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => literal = &exprs[0],
+                ast::Expr::Unary(ast::UnaryOperator::Positive, inner) => literal = inner,
+                ast::Expr::Unary(ast::UnaryOperator::Negative, inner) => {
+                    negative = !negative;
+                    literal = inner;
+                }
+                ast::Expr::Literal(ast::Literal::Numeric(text)) => {
+                    // Keep SQLite's signed hexadecimal-integer interpretation.
+                    let unsigned = text.trim_start_matches(['+', '-']);
+                    if unsigned.starts_with("0x") || unsigned.starts_with("0X") {
+                        break;
+                    }
+                    let mut value = unsigned.replace('_', "");
+                    if negative != text.starts_with('-') {
+                        value.insert(0, '-');
+                    }
+                    program.emit_insn(Insn::String8 { value, dest: target });
+                    program.mark_last_insn_constant();
+                    return Ok(());
+                }
+                _ => break,
+            }
+        }
+    }
+    translate_expr(program, tables, expr, target, resolver)?;
+    Ok(())
 }
 
 /// `emit_custom_type_operator` for operands already in registers: `lhs_reg` holds `e1` and
