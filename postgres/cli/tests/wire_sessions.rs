@@ -6476,7 +6476,12 @@ fn a_rollback_to_a_savepoint_the_engine_discarded_is_3b001() {
     assert!(r.error.is_some(), "division by zero did not fail: {:?}", r.rows);
     assert_eq!(r.status, b'E', "the block is not marked failed");
     let r = a.q("ROLLBACK TO s").ok("rollback to s");
-    assert_eq!(r.status, b'T', "the block recovered from its failure");
+    assert_eq!(
+        r.status,
+        b'T',
+        "ROLLBACK TO s did not recover the block from its failure: status {}",
+        r.status as char
+    );
     assert_eq!(a.q("SELECT 1").single("in the block"), "1");
     let r = a.q("COMMIT").ok("the block's end");
     assert_eq!(r.tags, vec!["COMMIT".to_string()]);
