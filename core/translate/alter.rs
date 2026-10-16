@@ -949,8 +949,8 @@ pub fn translate_alter_table(
             let column_name = column_name.as_str();
 
             // A table can have no columns (PostgreSQL's `CREATE TABLE t ()`): then the column to
-            // drop is not there, which the lookup below says. It was an assertion that killed the
-            // session (the crash batch, 2026-10-15).
+            // drop is not there, which the lookup below says. An assertion here killed the
+            // session.
             if btree.columns().len() == 1 {
                 return Err(LimboError::ParseError(format!(
                     "cannot drop column \"{column_name}\": no other columns exist"

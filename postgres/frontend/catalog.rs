@@ -200,13 +200,12 @@ impl Dialect for PostgresDialect {
     }
 
     /// PostgreSQL's float input reads 'Infinity', '-Infinity', 'inf' and '-inf' in any case, with
-    /// surrounding blanks, as the infinities, where SQLite's rules read 0 (the crash batch,
-    /// 2026-10-15). The engine has no NaN value, so 'NaN' is refused 0A000, as the translator's
-    /// literal path refuses it.
+    /// surrounding blanks, as the infinities, where SQLite's rules read 0. The engine has no NaN
+    /// value, so 'NaN' is refused 0A000, as the translator's literal path refuses it.
     /// PostgreSQL refuses an infinite generate_series bound (22023, "stop value cannot be
-    /// infinity"; recording pg18-gsinf), where SQLite clamps it to i64::MAX: an infinite stop then
-    /// generated ~10^18 rows and wedged the session thread (the crash batch, 2026-10-15). The
-    /// arguments are the present ones of start, stop and step, in that order (`idx_num` bits 1, 2, 4).
+    /// infinity" in PostgreSQL 18.6), where SQLite clamps it to i64::MAX: an infinite stop then
+    /// generated ~10^18 rows and wedged the session thread. The arguments are the present ones of
+    /// start, stop and step, in that order (`idx_num` bits 1, 2, 4).
     fn check_table_function_args(&self, name: &str, idx_num: i64, args: &[Value]) -> Result<()> {
         if !name.eq_ignore_ascii_case("generate_series") {
             return Ok(());

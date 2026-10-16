@@ -1,8 +1,8 @@
-//! The parser stack-guard class on the wire's route (fastest-engine, lead order 2026-10-15: client
-//! SQL must never crash the server). A PostgreSQL client's statement goes through libpg_query, the
-//! translator to the engine's AST (`turso_pg_parser::translator`), and the engine. Each recursive
-//! entry checks the stack left (`turso_stack_guard`) and a statement too deep for its thread is
-//! refused with 54001, not an overflow, which aborts the server process and every session in it.
+//! The parser stack guard on the PostgreSQL wire's route: client SQL must never crash the server.
+//! A PostgreSQL client's statement goes through libpg_query, the translator to the engine's AST
+//! (`turso_pg_parser::translator`), and the engine. Each recursive entry checks the stack left
+//! (`turso_stack_guard`) and a statement too deep for its thread is refused with 54001, not an
+//! overflow, which aborts the server process and every session in it.
 //!
 //! As in core's `stack_guard_tests`: each statement runs in a CHILD process (this test binary re-run
 //! on one test by name, `FE_STACK_CHILD` = "<stack KiB>|<sql>"), on a thread of that stack size,
@@ -87,9 +87,9 @@ fn shapes(depth: usize) -> Vec<(&'static str, String)> {
     ]
 }
 
-/// The class on the wire's route: every shape, 20, 60 and 200 levels deep, on session-sized and
-/// smaller threads (the server's session thread is 8 MiB, `SESSION_STACK`): an answer or a refusal,
-/// never a dead process. Premise: every shape answers at depth 3 on 8 MiB.
+/// The stack guard on the PostgreSQL wire's route: every shape, 20, 60 and 200 levels deep, on
+/// session-sized and smaller threads (the server's session thread is 8 MiB, `SESSION_STACK`): an
+/// answer or a refusal, never a dead process. Premise: every shape answers at depth 3 on 8 MiB.
 #[test]
 fn no_nesting_shape_kills_the_process_on_the_postgresql_route() {
     if run_child() {
@@ -114,7 +114,7 @@ fn no_nesting_shape_kills_the_process_on_the_postgresql_route() {
     }
     // libpg_query's own recursion (its C output functions overflowed 8 MiB at 3,000 nested scalar
     // subqueries), on the session's 8 MiB, up to bison's limit (PostgreSQL 18: 3,000 nested scalar
-    // subqueries are 54001, 10,000 levels are 42601 "memory exhausted"; raw pg18-nesting-depth.txt).
+    // subqueries are 54001, 10,000 levels are 42601 "memory exhausted").
     for depth in [1000usize, 3000, 6000, 9000] {
         for (shape, sql) in shapes(depth)
             .into_iter()

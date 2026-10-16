@@ -170,8 +170,7 @@ pub trait Dialect: Send + Sync + 'static {
 
     /// A text this dialect reads as a float in its own way, for a CAST to REAL (`Ok`), or refuses
     /// (`Err`); `None` takes SQLite's rules, which read a text that is no number as 0. The default
-    /// for every dialect but PostgreSQL's, which reads 'Infinity' as the infinity (the crash batch,
-    /// 2026-10-15).
+    /// for every dialect but PostgreSQL's, which reads 'Infinity' as the infinity.
     fn cast_text_to_float(&self, _text: &str) -> Option<crate::Result<f64>> {
         None
     }
@@ -179,7 +178,7 @@ pub trait Dialect: Send + Sync + 'static {
     /// Check a table-valued function's arguments before its filter runs: `name` the function,
     /// `idx_num` its plan's argument mask, `args` the values in the order the filter gets them.
     /// The default checks nothing (SQLite's rules); PostgreSQL's refuses an infinite
-    /// generate_series bound, which SQLite clamps (the crash batch, 2026-10-15).
+    /// generate_series bound, which SQLite clamps.
     fn check_table_function_args(&self, _name: &str, _idx_num: i64, _args: &[crate::Value]) -> crate::Result<()> {
         Ok(())
     }

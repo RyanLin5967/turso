@@ -94,8 +94,8 @@ fn a_statement_too_deep_for_its_stack_is_refused_with_54001_not_a_crash() {
     let small = in_child(test, 256, &sql);
     // A debug build's frames need about 128-256 KiB a level (diag_stack_needed_per_nesting_level),
     // so this is refused there; a release build's levels fit 256 KiB, and it answers. Either way it
-    // never kills the process (FLAGGED: the lead's red was measured in debug; release asserts the
-    // class, not the refusal).
+    // never kills the process, so a release build asserts that, not the
+    // refusal.
     #[cfg(not(debug_assertions))]
     assert!(
         small.starts_with("ok") || small.starts_with("err StackDepthLimitExceeded"),
@@ -154,7 +154,7 @@ fn shapes(depth: usize) -> Vec<(&'static str, String)> {
     ]
 }
 
-/// The class (lead order): client SQL must never crash the server. Every nesting shape above, 20,
+/// Client SQL must never crash the server. Every nesting shape above, 20,
 /// 60 and 200 levels deep, on threads of 128 KiB to 8 MiB: each outcome is an answer or a refusal,
 /// never a dead process. Premise: each shape answers on 8 MiB at depth 3 (so the shapes are valid SQL, and
 /// the guard has a case it must pass), but a parenthesised FROM, which the planner refuses after
@@ -188,7 +188,7 @@ fn no_nesting_shape_kills_the_process_on_any_thread_stack() {
     assert!(refused > 0, "premise: no case reached the stack guard, so nothing here tested it");
 }
 
-/// Lead order (ultrareview instance (i)): a DDL statement's schema reparse is a prepare inside a
+/// A DDL statement's schema reparse is a prepare inside a
 /// step, so it is checked from its first step (`Executing`), and refused with less than `margin()`
 /// left. Diagnostic (prints; asserts nothing): the stack each reparse really uses from that point,
 /// measured by painting the unused stack of an 8 MiB thread with a pattern, running the DDL, and

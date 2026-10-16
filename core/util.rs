@@ -1439,7 +1439,7 @@ pub fn cast_real_to_integer(float: f64) -> std::result::Result<i64, ()> {
 
 /// The value of a numeric literal's text. SQLite's grammar admits only well-formed literals here, but
 /// a caller that skipped it (the PostgreSQL translator) can pass any text, so a text that is no
-/// number is a parse error, never a panic (the crash batch, 2026-10-15).
+/// number is a parse error, never a panic.
 pub fn parse_numeric_literal(text: &str) -> Result<Value> {
     // a single extra underscore ("_") character can exist between any two digits
     let text = if text.contains('_') {
@@ -5089,7 +5089,7 @@ pub mod tests {
     use turso_parser::ast::{self, Expr, FunctionTail, Literal, Name, Operator::*, Type, Variable};
     use turso_parser::parser::Parser;
 
-    /// The crash batch (lead, 2026-10-15): text that is neither an integer nor a float reached
+    /// Text that is neither an integer nor a float reached
     /// `unreachable!()` here when a caller skipped SQLite's grammar (the PostgreSQL translator sent
     /// '0b1000...' and hex past i64). It must be a parse error, never a panic.
     #[test]

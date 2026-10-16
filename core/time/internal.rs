@@ -204,10 +204,10 @@ impl Time {
             .unwrap();
 
         // Every step is checked: a value at an integer's extreme (year i32::MIN made `year - 1`
-        // overflow, inside an extern "C" function that cannot unwind, so the process aborted; the
-        // crash batch, 2026-10-15) or a date past chrono's range is no date (`None`), never a panic.
-        // The months from 0001-01 to the year, then to the month, each in i64 so `- 1` cannot wrap.
-        // A year or a month of 0 moves nothing, as before.
+        // overflow, inside an extern "C" function that cannot unwind, so the process aborted) or a
+        // date past chrono's range is no date (`None`), never a panic. The months from 0001-01 to
+        // the year, then to the month, each in i64 so `- 1` cannot wrap. A year or a month of 0
+        // moves nothing, as before.
         let year_months = if year == 0 { Some(0) } else { (i64::from(year) - 1).checked_mul(12) };
         let month_months = if month == 0 { 0 } else { i64::from(month) - 1 };
         let Some(months) = year_months.and_then(|m| m.checked_add(month_months)) else {
@@ -251,7 +251,7 @@ impl Time {
         }
     }
 
-    /// `years`, `months` and `days` after this time. Every step is checked (the C32 HIGH: the u32
+    /// `years`, `months` and `days` after this time. Every step is checked (unchecked, the u32
     /// month span and the day sum panicked inside an extern "C" scalar): a year or month count
     /// outside i32, a span past u32 months, or a result past chrono's range is `CreationError`.
     pub fn time_add_date(self, years: i64, months: i64, days: i64) -> Result<Self> {
@@ -318,7 +318,7 @@ impl Time {
         self.inner.timestamp_nanos_opt()
     }
 
-    /// This time plus `d`, or `CreationError` past chrono's range (the C32 HIGH: `+` panicked).
+    /// This time plus `d`, or `CreationError` past chrono's range (an unchecked `+` panicked).
     pub fn add_duration(&self, d: Duration) -> Result<Self> {
         Ok(Self {
             inner: self.inner.checked_add_signed(d.inner).ok_or(TimeError::CreationError)?,
@@ -535,7 +535,7 @@ impl TryFrom<Vec<u8>> for Time {
             | (value[9] as u32) << 24;
 
         Ok(Self {
-            // Checked: a caller's blob can carry any seconds (the C32 HIGH, i64::MIN).
+            // Checked: a caller's blob can carry any seconds (i64::MIN included).
             inner: seconds
                 .checked_sub(3600 * 24 * DAYS_BEFORE_EPOCH)
                 .and_then(|s| DateTime::from_timestamp(s, nanoseconds))

@@ -171,8 +171,7 @@ impl VTabCursor for GenerateSeriesCursor {
         const DEFAULT_STOP_OMITTED: Option<i64> = Some(u32::MAX as i64);
 
         // An infinite float bound clamps to i64::MAX or MIN, as SQLite's does; the PostgreSQL
-        // dialect refuses it before this filter runs (`Dialect::check_table_function_args`; the
-        // crash batch, 2026-10-15).
+        // dialect refuses it before this filter runs (`Dialect::check_table_function_args`).
         if let Some((_, idx_num)) = idx_info {
             let mut arg_idx = 0;
             // For the semantics of `idx_num`, see the comment in the `best_index` method.
@@ -323,8 +322,7 @@ mod tests {
     // Helper function to collect all values from a cursor, returns Result with error code
     /// An infinite bound clamps, as SQLite's generate_series does (sqlite3_value_int64 of an
     /// infinity): the filter accepts it. The refusal PostgreSQL makes (22023) is the PostgreSQL
-    /// dialect's, before the filter (lead, 2026-10-15). FLAGGED TEST CHANGE by that ruling: this test
-    /// asserted the filter's refusal (OutOfRange) at 180ed6097.
+    /// dialect's, before the filter.
     #[test]
     fn an_infinite_bound_clamps_as_sqlite_does() {
         let tbl = GenerateSeriesTable {};

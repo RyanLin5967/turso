@@ -19,8 +19,8 @@ pub enum ParseError {
 
 /// The stack libpg_query's calls on `sql` run with (`turso_stack_guard::with_stack`). Its C code
 /// recurses over the tree with no check: the protobuf output functions (`_outNode`) overflowed an
-/// 8 MiB session thread at 3,000 nested scalar subqueries (stack-guard class, lldb), where
-/// PostgreSQL 18 answers 54001 (raw artie pg18-nesting-depth.txt). The tree's depth is bounded by
+/// 8 MiB session thread at 3,000 nested scalar subqueries (seen in lldb), where
+/// PostgreSQL 18 answers 54001. The tree's depth is bounded by
 /// the text's length (each level takes at least one byte), so the stack is sized from it:
 /// `PG_QUERY_BASE` plus `PG_QUERY_PER_BYTE` per byte, at most `PG_QUERY_MAX` (bison refuses past
 /// 10,000 levels, "memory exhausted"). A statement of a few KiB needs less than a session thread

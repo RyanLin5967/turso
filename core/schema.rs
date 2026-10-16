@@ -842,7 +842,7 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
         "CREATE TYPE smallint(value integer) BASE integer ENCODE CASE WHEN value BETWEEN -32768 AND 32767 THEN value ELSE RAISE(ABORT, 'integer out of range for smallint') END DECODE value OPERATOR '<'",
         "CREATE TYPE bigint(value integer) BASE integer",
         // PostgreSQL's float types, base real (REAL affinity), so a STRICT table accepts FLOAT4 and
-        // FLOAT8 declarations (the crash batch, item 8, 2026-10-15).
+        // FLOAT8 declarations.
         "CREATE TYPE float4(value real) BASE real",
         "CREATE TYPE float8(value real) BASE real",
         "CREATE TYPE inet(value text) BASE text ENCODE validate_ipaddr(value) DECODE value",

@@ -2627,13 +2627,13 @@ fn sqlstate(e: &LimboError) -> &'static str {
         LimboError::Constraint(m) if m == "division by zero" => "22012",
         LimboError::Constraint(_) => "23000",
         LimboError::ParseError(m) if m.starts_with("Invalid statement:") => "42601",
-        // The crash batch (2026-10-15): views nested past the planner's limit, refused where they
+        // Views nested past the planner's limit, refused where they
         // overflowed the stack (statement_too_complex, PostgreSQL's stack depth limit); and a
         // make_date / make_timestamp past the date range, which aborted the process.
         LimboError::ParseError(m) if m.starts_with("stack depth limit exceeded") => "54001",
         LimboError::ExtensionError(m) if m.starts_with("date field value out of range") => "22008",
         // An infinite generate_series bound, refused by the PostgreSQL dialect in PostgreSQL's
-        // words (the crash batch, 2026-10-15): invalid_parameter_value.
+        // words: invalid_parameter_value.
         LimboError::ExtensionError(m) if m.ends_with(" cannot be infinity") => "22023",
         LimboError::ParseError(m)
             if m.starts_with("no such table")
@@ -2682,7 +2682,7 @@ fn sqlstate(e: &LimboError) -> &'static str {
         LimboError::ReadOnly => "25006",
         LimboError::DatabaseFull(_) => "53100",
         LimboError::Interrupt => "57014",
-        // The stack-guard class (fastest-engine): a statement nested too deeply for the session's
+        // The stack guard: a statement nested too deeply for the session's
         // thread is refused, as PostgreSQL's check_stack_depth() refuses it.
         LimboError::StackDepthLimitExceeded => "54001",
         _ => "XX000",

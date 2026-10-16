@@ -2423,13 +2423,14 @@ struct BranchState {
 /// name is read from the catalog's `branch_name` table.
 ///
 /// A checkpoint's capture COPIES `fresh` and `gone`, and its install removes only the entries that
-/// are unchanged since (review C-F1, C-F2): until the catalog holds what the capture wrote, the
-/// index still masks and still names what it did, and a capture that is never written (a write
-/// that failed, a thread that did not start) leaves nothing to restore.
+/// are unchanged since: until the catalog holds what the capture wrote, the index still masks and
+/// still names what it did, and a capture that is never written (a write that failed, a thread
+/// that did not start) leaves nothing to restore.
 ///
-/// Ordered maps, not hash maps (L2 slope, budget create_allocates_no_table_of_every_branch_under_the_store_mutex:
-/// a named create rehashed `map`, 65,536 buckets of (Arc<str>, BranchId), 1,638,591 bytes under the
-/// store mutex at 33k branches): a B-tree grows a node at a time and never moves every name.
+/// Ordered maps, not hash maps (budget
+/// create_allocates_no_table_of_every_branch_under_the_store_mutex: a named create rehashed `map`,
+/// 65,536 buckets of (Arc<str>, BranchId), 1,638,591 bytes under the store mutex at 33k branches):
+/// a B-tree grows a node at a time and never moves every name.
 #[derive(Default)]
 struct NameIndex {
     map: BTreeMap<Arc<str>, BranchId>,
