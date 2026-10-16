@@ -1,0 +1,2 @@
+\set ON_ERROR_STOP on
+SELECT b,pg_typeof(b)::text,pg_typeof(b)::oid FROM c52_derived_v;

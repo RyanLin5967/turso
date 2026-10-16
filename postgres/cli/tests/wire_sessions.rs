@@ -13960,3 +13960,34 @@ fn c52_scalar_completed_text_is_refused_by_numeric_common_contexts() {
         .into_iter().map(|sql| w.describe_statement(sql).error.map(|error| error.code)).collect();
     assert_eq!(codes, vec![Some("42804".into()),Some("42804".into())]);
 }
+
+// New combined C54 derived-alias/C52 view-normalization control.
+// Independent PG18.6 facts: pg18/c52-derived-view-alias.sql/.txt and reopen.sql/.txt.
+// Raw canonical bank009dcc896d; the same boolean column survives rename and restart.
+#[test]
+fn c52_derived_alias_star_tail_preserves_view_type_after_rename() {
+    let dir = Scratch::new("c52derivedviewalias");
+    {
+        let server = Server::start(&dir.db(), &[]);
+        let mut w = server.connect();
+        for sql in [
+            "CREATE TABLE c52_derived_t(a integer,b boolean)",
+            "INSERT INTO c52_derived_t VALUES(1,true)",
+            "CREATE VIEW c52_derived_v AS SELECT d.b FROM (SELECT * FROM c52_derived_t) d(x)",
+        ] {
+            w.q(sql).ok(sql);
+        }
+        let before = w.q("SELECT b,pg_typeof(b)::text,pg_typeof(b)::oid FROM c52_derived_v").ok("before rename");
+        assert_eq!(before.oids, Some(vec![16,25,26]));
+        assert_eq!(before.rows, vec![vec![Some("t".into()),Some("boolean".into()),Some("16".into())]]);
+        w.q("ALTER TABLE c52_derived_t RENAME COLUMN b TO z").ok("scoped base rename");
+        let after = w.q("SELECT b,pg_typeof(b)::text,pg_typeof(b)::oid FROM c52_derived_v").ok("derived alias tail");
+        assert_eq!(after.oids, Some(vec![16,25,26]));
+        assert_eq!(after.rows, vec![vec![Some("t".into()),Some("boolean".into()),Some("16".into())]]);
+    }
+    let server = Server::start(&dir.db(), &[]);
+    let mut w = server.connect();
+    let reopened = w.q("SELECT b,pg_typeof(b)::text,pg_typeof(b)::oid FROM c52_derived_v").ok("reopened derived alias tail");
+    assert_eq!(reopened.oids, Some(vec![16,25,26]));
+    assert_eq!(reopened.rows, vec![vec![Some("t".into()),Some("boolean".into()),Some("16".into())]]);
+}
