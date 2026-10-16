@@ -12608,7 +12608,6 @@ replays_postgresql!(
     "pg18-audit3-a_numeric_division_by_zero_is_22012.out",
     [
         (1, "PGDIV-SCHEMA-REFUSED cluster-state [cluster]: DROP SCHEMA IF EXISTS s; DROP SCHEMA public: ours refuses the whole query 0A000"),
-        (4, "PGDIV-ERROR-BEFORE-ROWDESC protocol [wire]: x / 0 over NUMERIC: PG sends RowDescription 1700 then 22012; ours sends only the 22012 error (no RowDescription)"),
     ]
 );
 replays_postgresql!(
@@ -12878,10 +12877,7 @@ replays_postgresql!(
     pg18_gsinf_replays_as_postgresql_answered,
     "pg18-gsinf.out",
     [
-        (1, "PGDIV-ERROR-BEFORE-ROWDESC protocol [wire]: generate_series(numeric, 'inf'): PG sends RowDescription 1700 then 22023; ours only the error, prefixed 'Extension error: '"),
         (2, "PGDIV-GS-MIXED-TYPES error-code [wire]: generate_series(int, float8, int): PG 42883 function does not exist; ours 22023 'Extension error: stop value cannot be infinity' (accepts a mixed-type call PG refuses)"),
-        (3, "PGDIV-ERROR-BEFORE-ROWDESC protocol [wire]: generate_series step 'inf'::numeric: PG RowDescription 1700 then 22023; ours only the error, prefixed 'Extension error: '"),
-        (4, "PGDIV-ERROR-BEFORE-ROWDESC protocol [wire]: generate_series start '-inf'::numeric: PG RowDescription 1700 then 22023; ours only the error, prefixed 'Extension error: '"),
     ]
 );
 replays_postgresql!(
