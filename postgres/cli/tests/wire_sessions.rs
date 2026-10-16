@@ -14159,3 +14159,68 @@ fn c50_class5_division_zero_uses_the_existing_typed_error() {
     let sql = "SELECT NULL::int4/0::int4,NULL::float8/0::float8";
     assert_eq!(a.q(sql).ok(sql).rows, vec![vec![None, None]]);
 }
+
+// PostgreSQL 18.6 answers are retained in c50-pg18-sum-scale-edges.txt.
+#[test]
+fn c50_class6_moving_numeric_scales_handle_cancellation_specials_and_empty_frames() {
+    let dir = Scratch::new("c50-scale-edges");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE c50_scale_edges(n integer,v numeric)")
+        .ok("table");
+    for (values, expected) in [
+        (
+            "(1,1.00),(2,-1.00),(3,2),(4,3)",
+            vec![Some("1.00"), Some("0.00"), Some("1.00"), Some("5")],
+        ),
+        (
+            "(1,1.000),(2,NULL),(3,NULL),(4,'NaN'),(5,NULL),(6,NULL),(7,2)",
+            vec![
+                Some("1.000"),
+                Some("1.000"),
+                None,
+                Some("NaN"),
+                Some("NaN"),
+                None,
+                Some("2"),
+            ],
+        ),
+        (
+            "(1,'Infinity'),(2,'-Infinity'),(3,NULL),(4,1.00),(5,2),(6,NULL),(7,NULL)",
+            vec![
+                Some("Infinity"),
+                Some("NaN"),
+                Some("-Infinity"),
+                Some("1.00"),
+                Some("3.00"),
+                Some("2"),
+                None,
+            ],
+        ),
+        (
+            "(1,0.000),(2,1.00),(3,2)",
+            vec![Some("0.000"), Some("1.000"), Some("3.00")],
+        ),
+    ] {
+        a.q(&format!("INSERT INTO c50_scale_edges VALUES{values}"))
+            .ok("values");
+        let sql = "SELECT sum(v) OVER(ORDER BY n ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM c50_scale_edges ORDER BY n";
+        let expected = expected
+            .into_iter()
+            .map(|value| vec![value.map(str::to_owned)])
+            .collect::<Vec<_>>();
+        assert_eq!(a.q(sql).ok(sql).rows, expected, "{values}");
+        a.q("DELETE FROM c50_scale_edges").ok("clear");
+    }
+    a.q("INSERT INTO c50_scale_edges VALUES(1,0.000),(2,1.00),(3,2)")
+        .ok("empty frame values");
+    let sql = "SELECT sum(v) OVER(ORDER BY n ROWS BETWEEN 1 PRECEDING AND 1 PRECEDING) FROM c50_scale_edges ORDER BY n";
+    assert_eq!(
+        a.q(sql).ok(sql).rows,
+        vec![
+            vec![None],
+            vec![Some("0.000".into())],
+            vec![Some("1.00".into())]
+        ]
+    );
+}
