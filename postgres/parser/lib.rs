@@ -53,16 +53,21 @@ const PG_QUERY_MAX: usize = 256 << 20;
 /// A deparse walks a tree this crate decoded, at most prost's recursion limit (100 messages) deep.
 const PG_DEPARSE_STACK: usize = 4 << 20;
 
-/// libpg_query's refusals of a statement nested too deeply, in PostgreSQL's class (54001): prost's
-/// recursion limit on the decode of the tree (PostgreSQL answers some of these: a REGISTERED
-/// DIVERGENCE, it answers 1,000 nested scalar subqueries and the decode refuses past about 24), and
-/// the C parser's own stack check.
+/// libpg_query's refusals of a statement nested too deeply, in PostgreSQL's class (54001), told apart
+/// by pg_query's error variant, never by words a syntax error can quote (review of 96b69304b, F5:
+/// `contains` classified `SELECT 1 'stack depth limit exceeded'` 54001):
+/// - `Error::Decode`: prost's recursion limit on the decode of the tree (PostgreSQL answers some of
+///   these: a REGISTERED DIVERGENCE, it answers 1,000 nested scalar subqueries and the decode refuses
+///   past about 24). BLIND SPOT, stated: a decode error is taken as that limit, since the buffer is
+///   libpg_query's own output; a corrupt buffer would be reported 54001 too.
+/// - `Error::Parse` whose whole message is the C parser's check_stack_depth() message: a syntax
+///   error's message starts "syntax error at or near" (or names the unterminated token), so no
+///   user text makes it equal.
 fn pg_query_error(e: pg_query::Error) -> ParseError {
-    let text = e.to_string();
-    if text.contains("recursion limit reached") || text.contains("stack depth limit exceeded") {
-        ParseError::StackDepthLimitExceeded
-    } else {
-        ParseError::ParseError(text.into())
+    match e {
+        pg_query::Error::Decode(_) => ParseError::StackDepthLimitExceeded,
+        pg_query::Error::Parse(m) if m == "stack depth limit exceeded" => ParseError::StackDepthLimitExceeded,
+        e => ParseError::ParseError(e.to_string().into()),
     }
 }
 
