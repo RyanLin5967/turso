@@ -84,12 +84,76 @@ fn count_libpg_query_call() {
 pub fn parse(sql: &str) -> Result<ParseResult, ParseError> {
     count_libpg_query_call();
     let stack = pg_query_stack(sql);
-    turso_stack_guard::with_stack(stack, || pg_query::parse(sql))
-        .map(|inner| ParseResult {
-            inner: Some(inner),
-            stack,
-        })
-        .map_err(pg_query_error)
+    turso_stack_guard::with_stack(stack, || {
+        match pg_query::parse(sql) {
+            Ok(inner) => Ok(ParseResult {
+                inner: Some(inner), stack, virtual_generated: Default::default(),
+            }),
+            Err(original) => {
+                if let Some((rewritten, virtual_generated)) = normalize_virtual_generated(sql) {
+                    count_libpg_query_call();
+                    if let Ok(inner) = pg_query::parse(&rewritten) {
+                        return Ok(ParseResult { inner: Some(inner), stack, virtual_generated });
+                    }
+                }
+                Err(pg_query_error(original))
+            }
+        }
+    })
+}
+
+// libpg_query 17 knows STORED but not PG18's VIRTUAL storage keyword. Its lexer identifies the
+// clause and byte ranges; equal-length replacement preserves all AST source locations.
+fn normalize_virtual_generated(sql: &str) -> Option<(String, std::collections::HashSet<i32>)> {
+    let columns = generated_storage_tokens(sql)?;
+    let mut rewritten = sql.to_owned();
+    let mut locations = std::collections::HashSet::new();
+    for (location, range) in columns {
+        if sql[range.clone()].eq_ignore_ascii_case("virtual") {
+            rewritten.replace_range(range, "STORED ");
+            locations.insert(location);
+        }
+    }
+    (!locations.is_empty()).then_some((rewritten, locations))
+}
+
+fn generated_storage_tokens(sql: &str) -> Option<Vec<(i32, std::ops::Range<usize>)>> {
+    use pg_query::protobuf::Token;
+    count_libpg_query_call();
+    let scanned = turso_stack_guard::with_stack(pg_query_stack(sql), || pg_query::scan(sql)).ok()?;
+    let tokens: Vec<_> = scanned.tokens.iter()
+        .filter(|token| !matches!(token.token(), Token::SqlComment | Token::CComment))
+        .collect();
+    let mut columns = Vec::new();
+    for (i, token) in tokens.iter().enumerate() {
+        if token.token() != Token::Generated
+            || tokens.get(i + 1)?.token() != Token::Always
+            || tokens.get(i + 2)?.token() != Token::As
+            || tokens.get(i + 3)?.token() != Token::Ascii40
+        {
+            continue;
+        }
+        let mut depth = 1usize;
+        let mut j = i + 4;
+        while let Some(token) = tokens.get(j) {
+            match token.token() {
+                Token::Ascii40 => depth += 1,
+                Token::Ascii41 => depth -= 1,
+                _ => {}
+            }
+            j += 1;
+            if depth == 0 { break; }
+        }
+        if depth != 0 { continue; }
+        let Some(storage) = tokens.get(j) else { continue; };
+        let range = storage.start as usize..storage.end as usize;
+        if sql[range.clone()].eq_ignore_ascii_case("virtual")
+            || sql[range.clone()].eq_ignore_ascii_case("stored")
+        {
+            columns.push((token.start, range));
+        }
+    }
+    Some(columns)
 }
 
 /// A decoded tree owns its destruction stack even when a caller returns early.
@@ -97,6 +161,13 @@ pub fn parse(sql: &str) -> Result<ParseResult, ParseError> {
 pub struct ParseResult {
     inner: Option<pg_query::ParseResult>,
     stack: usize,
+    virtual_generated: std::collections::HashSet<i32>,
+}
+
+impl ParseResult {
+    pub(crate) fn virtual_generated_columns(&self) -> &std::collections::HashSet<i32> {
+        &self.virtual_generated
+    }
 }
 
 impl Deref for ParseResult {
@@ -135,6 +206,32 @@ pub fn with_preparation_stack<R>(sql: &str, f: impl FnOnce() -> R) -> R {
 pub fn deparse(protobuf: &pg_query::protobuf::ParseResult) -> Result<String, ParseError> {
     count_libpg_query_call();
     turso_stack_guard::with_stack(PG_DEPARSE_STACK, || pg_query::deparse(protobuf)).map_err(pg_query_error)
+}
+
+/// Deparse a changed tree while retaining PG18 generated-column storage kinds from its owner.
+pub fn deparse_with_metadata(
+    protobuf: &pg_query::protobuf::ParseResult,
+    owner: &ParseResult,
+) -> Result<String, ParseError> {
+    turso_stack_guard::with_stack(owner.stack.max(PG_DEPARSE_STACK), || {
+    let mut sql = deparse(protobuf)?;
+    if owner.virtual_generated.is_empty() { return Ok(sql); }
+    let kinds: Vec<_> = protobuf.nodes().into_iter().filter_map(|(node, ..)| {
+        match node {
+            pg_query::NodeRef::Constraint(c)
+                if c.contype() == pg_query::protobuf::ConstrType::ConstrGenerated =>
+                Some(owner.virtual_generated.contains(&c.location)),
+            _ => None,
+        }
+    }).collect();
+    let columns = generated_storage_tokens(&sql).filter(|columns| columns.len() == kinds.len())
+        .ok_or_else(|| ParseError::ParseError(SqlErrorMessage::classified(
+            SqlErrorKind::FeatureNotSupported, "cannot preserve generated column storage kinds")))?;
+    for ((_, range), is_virtual) in columns.into_iter().zip(kinds).rev() {
+        if is_virtual { sql.replace_range(range, "VIRTUAL"); }
+    }
+    Ok(sql)
+    })
 }
 
 /// The highest parameter number a statement may hold: Bind counts parameters in 16 bits. A `$n`
@@ -399,13 +496,24 @@ pub fn skip_blank(b: &[u8], mut i: usize) -> Option<usize> {
 /// a REPL wants, see [`split_statements_lenient`].
 pub fn split_statements(sql: &str) -> Result<Vec<String>, ParseError> {
     count_libpg_query_call();
-    let parts = turso_stack_guard::with_stack(pg_query_stack(sql), || pg_query::split_with_parser(sql))
-        .map_err(pg_query_error)?;
-    Ok(parts
-        .into_iter()
-        .map(|s| pg_trim(s).to_string())
-        .filter(|s| !s.is_empty())
-        .collect())
+    let stack = pg_query_stack(sql);
+    let parts = turso_stack_guard::with_stack(stack, || pg_query::split_with_parser(sql));
+    match parts {
+        Ok(parts) => Ok(parts.into_iter().map(|part| pg_trim(part).to_owned())
+            .filter(|part| !part.is_empty()).collect()),
+        Err(original) => {
+            if let Some((rewritten, _)) = normalize_virtual_generated(sql) {
+                count_libpg_query_call();
+                if let Ok(parts) = turso_stack_guard::with_stack(stack, || pg_query::split_with_parser(&rewritten)) {
+                    return Ok(parts.into_iter().map(|part| {
+                        let start = part.as_ptr() as usize - rewritten.as_ptr() as usize;
+                        pg_trim(&sql[start..start + part.len()]).to_owned()
+                    }).filter(|part| !part.is_empty()).collect());
+                }
+            }
+            Err(pg_query_error(original))
+        }
+    }
 }
 
 /// Split a multi-statement SQL string statement by statement, as psql sends a script: libpg_query's

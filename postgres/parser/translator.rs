@@ -88,6 +88,7 @@ impl ExpressionTypes {
 #[derive(Default)]
 pub struct PostgreSQLTranslator {
     expression_types: std::sync::Arc<ExpressionTypes>,
+    virtual_generated: std::cell::RefCell<std::collections::HashSet<i32>>,
     /// The scope of each SELECT being translated, innermost last: the names its FROM items are
     /// known by, with the columns those names stand for that the engine does not have under them.
     /// A reference `alias.column` translates by the innermost SELECT whose FROM names `alias`, so
@@ -480,7 +481,7 @@ impl PostgreSQLTranslator {
     /// Translate a PostgreSQL parse result into Turso's format.
     /// For statements that may generate prerequisites (e.g., serial columns),
     /// use `translate_with_prereqs` instead.
-    pub fn translate(&self, parse_result: &ParseResult) -> Result<ast::Stmt, ParseError> {
+    pub fn translate(&self, parse_result: &crate::ParseResult) -> Result<ast::Stmt, ParseError> {
         let translated = self.translate_with_prereqs(parse_result)?;
         let ast::Cmd::Stmt(stmt) = translated.cmd else {
             return Err(ParseError::ParseError(
@@ -494,8 +495,9 @@ impl PostgreSQLTranslator {
     /// and any prerequisite statements (e.g., implicit CREATE SEQUENCE for serial columns).
     pub fn translate_with_prereqs(
         &self,
-        parse_result: &ParseResult,
+        parse_result: &crate::ParseResult,
     ) -> Result<TranslateResult, ParseError> {
+        self.virtual_generated.borrow_mut().clone_from(parse_result.virtual_generated_columns());
         if parse_result.protobuf.nodes().is_empty() {
             return Err(ParseError::ParseError("No statements found".to_string().into()));
         }
@@ -806,6 +808,7 @@ impl PostgreSQLTranslator {
         let mut default_expr: Option<ast::Expr> = None;
         let mut foreign_key: Option<PgForeignKey> = None;
         let mut check_constraints = Vec::new();
+        let mut generated = None;
         // Whether the attribute nodes that follow (DEFERRABLE, INITIALLY DEFERRED) belong to
         // the column's foreign key: PostgreSQL attaches them to the constraint before them.
         let mut attrs_to_fk = false;
@@ -861,6 +864,12 @@ impl PostgreSQLTranslator {
                     ));
                 }
                 // The engine holds no stored generated column; dropped, the column read NULL.
+                ConstrType::ConstrGenerated
+                    if self.virtual_generated.borrow().contains(&constraint.location) => {
+                    generated = constraint.raw_expr.as_ref()
+                        .map(|expr| self.translate_expr(expr))
+                        .transpose()?;
+                }
                 ConstrType::ConstrGenerated => {
                     return Err(ParseError::ParseError(
                         SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, "generated columns are not supported"),
@@ -917,6 +926,15 @@ impl PostgreSQLTranslator {
 
         // Build constraints list
         let mut constraints = Vec::new();
+
+        if let Some(expr) = generated {
+            constraints.push(ast::NamedColumnConstraint {
+                name: None,
+                constraint: ast::ColumnConstraint::Generated {
+                    expr: Box::new(expr), typ: Some(ast::GeneratedColumnType::Virtual),
+                },
+            });
+        }
 
         // For serial columns, add DEFAULT nextval('tablename_colname_seq')
         if is_serial && default_expr.is_none() {

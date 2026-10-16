@@ -1914,10 +1914,10 @@ fn handle_pg_add_constraints(
         }
     }
     let aside_def =
-        turso_pg_parser::deparse(&aside_tree).map_err(crate::session::pg_parse_error)?;
+        turso_pg_parser::deparse_with_metadata(&aside_tree, &parsed).map_err(crate::session::pg_parse_error)?;
     create.table_elts.extend(add.constraints.iter().cloned());
     let rebuilt =
-        turso_pg_parser::deparse(&parsed.protobuf).map_err(crate::session::pg_parse_error)?;
+        turso_pg_parser::deparse_with_metadata(&parsed.protobuf, &parsed).map_err(crate::session::pg_parse_error)?;
     // Every refusal the translator makes of the rebuilt CREATE TABLE (MATCH FULL over several
     // columns among them) is answered here, before anything is copied, dropped or locked: it came
     // from the rebuild's own CREATE, after the BEGIN, the aside copy and the DROP, under the trunk's
