@@ -617,14 +617,10 @@ fn prepare_statement_checked(
     // `COPY ... WHERE v = $1` ran inside the prepare before any guard saw it and imported every
     // row (wire review 13 item 9); a Bind's then answered an invented 0A000 (wire review 17 item
     // 4, the lead's ruling).
-    if let Some(n) = used
-        .first()
-        .copied()
-        .filter(|_| performs_at_prepare(&parse_result))
-    {
-        return Err(LimboError::ParseError(format!(
-            "there is no parameter ${n}"
-        )));
+    let first_param = used.first().copied();
+    let parameter_refused = |n: u32| LimboError::ParseError(format!("there is no parameter ${n}"));
+    if let Some(n) = first_param.filter(|_| performs_at_prepare(&parse_result)) {
+        return Err(parameter_refused(n));
     }
     if let Some(stmt) = try_prepare_special(pg_conn, &parse_result)? {
         return Ok(Some(stmt));
