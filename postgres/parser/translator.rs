@@ -7076,7 +7076,7 @@ pub fn branch_function_name(name: &str) -> std::borrow::Cow<'static, str> {
 // cli/tests/c54-pg18-virtual-functions.out. This sees raw FuncCall nodes only;
 // SQL grammar forms and internal calls emitted by translation keep their own paths.
 fn sqlite_only_function(name: &str) -> bool {
-    matches!(name,
+    name.starts_with("pragma_") || matches!(name,
         "array"
         | "array_contains"
         | "array_contains_all"
