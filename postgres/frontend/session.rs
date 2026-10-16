@@ -455,12 +455,20 @@ impl PgConnection {
     }
 
     /// [`PgConnection::prepare`], with the types the same parse gives: PostgreSQL's type OID for
-    /// each result column the engine cannot type itself (aggregates; see
-    /// [`crate::result_types::aggregate_types`]; `None`, or a short list, where the engine types
-    /// the column), and for each parameter its context types (see
+    /// each result column and each parameter from one scoped inference (`None`, or a short
+    /// list, where the engine types an expression not modeled by that inference; see
     /// [`crate::result_types::parameter_types`]).
     pub fn prepare_typed(&self, sql: impl AsRef<str>) -> Result<(Statement, StatementTypes)> {
-        let mut types = StatementTypes::default();
+        self.prepare_typed_with_params(sql, &[])
+    }
+
+    /// Declared Parse types seed the same inference that types columns and translator expressions.
+    pub fn prepare_typed_with_params(
+        &self,
+        sql: impl AsRef<str>,
+        declared: &[Option<u32>],
+    ) -> Result<(Statement, StatementTypes)> {
+        let mut types = StatementTypes::from_declared(declared);
         let stmt = prepare_statement_typed(&self.inner, sql.as_ref(), Some(&mut types))?;
         Ok((stmt, types))
     }
@@ -473,7 +481,16 @@ impl PgConnection {
         &self,
         sql: impl AsRef<str>,
     ) -> Result<Option<(Statement, StatementTypes)>> {
-        let mut types = StatementTypes::default();
+        self.prepare_for_describe_with_params(sql, &[])
+    }
+
+    /// Describe with the Parse declarations available before translation.
+    pub fn prepare_for_describe_with_params(
+        &self,
+        sql: impl AsRef<str>,
+        declared: &[Option<u32>],
+    ) -> Result<Option<(Statement, StatementTypes)>> {
+        let mut types = StatementTypes::from_declared(declared);
         let stmt = prepare_statement_inner(&self.inner, sql.as_ref(), Some(&mut types), true)?;
         Ok(stmt.map(|stmt| (stmt, types)))
     }
@@ -1039,67 +1056,46 @@ fn prepare_statement_checked(
     } else {
         None
     };
+    let schema = pg_conn.conn.current_schema();
+    let search_path = pg_conn.session_state.lock().search_path.clone();
+    // Which attached schema holds a name, probed only when the walk resolves an
+    // unqualified name through one, once per (schema, name) per statement (wire review 17
+    // item 3).
+    let names = pg_conn.conn.attached_database_names();
+    let probed = std::cell::RefCell::new(std::collections::HashMap::new());
+    let holds = |schema: &str, name: &str| {
+        let key = (schema.to_ascii_lowercase(), name.to_ascii_lowercase());
+        if let Some(held) = probed.borrow().get(&key) {
+            return *held;
+        }
+        let held = get_table_columns(&pg_conn.conn, name, Some(schema))
+            .is_ok_and(|columns| !columns.is_empty());
+        probed.borrow_mut().insert(key, held);
+        held
+    };
+    let attached = crate::result_types::Attached {
+        names: &names,
+        holds: &holds,
+    };
+    // A column reference naming no FROM entry is refused here, 42P01 (wire review 17
+    // item 5).
+    let walked = crate::result_types::parameter_types(
+        &parse_result,
+        &schema,
+        &search_path,
+        &pg_conn.view_cache,
+        &attached,
+        &types
+            .as_deref()
+            .map(|types| types.params.clone())
+            .unwrap_or_default(),
+    )?;
+    let expression_types = walked.expressions.clone();
     if let Some(types) = types.as_deref_mut() {
-        let schema = pg_conn.conn.current_schema();
-        // An aggregate's result type is read through the walk, as a parameter's is, so its
-        // argument's relation is the one the engine reads (wire review 17 item 15): the walk runs
-        // for a statement with a parameter or an aggregate result column.
-        let aggregates = crate::result_types::aggregate_targets(&parse_result);
-        types.columns = vec![None; aggregates.len()];
-        if !used.is_empty() || aggregates.contains(&true) {
-            // A parameter compared with something no context types is refused (42P18) by the
-            // server, which alone reads the types the client declared (wire review 8 item 7,
-            // review 11 item 1).
-            let search_path = pg_conn.session_state.lock().search_path.clone();
-            // Which attached schema holds a name, probed only when the walk resolves an
-            // unqualified name through one, once per (schema, name) per statement (wire review 17
-            // item 3).
-            let names = pg_conn.conn.attached_database_names();
-            let probed = std::cell::RefCell::new(std::collections::HashMap::new());
-            let holds = |schema: &str, name: &str| {
-                let key = (schema.to_ascii_lowercase(), name.to_ascii_lowercase());
-                if let Some(held) = probed.borrow().get(&key) {
-                    return *held;
-                }
-                let held = get_table_columns(&pg_conn.conn, name, Some(schema))
-                    .is_ok_and(|columns| !columns.is_empty());
-                probed.borrow_mut().insert(key, held);
-                held
-            };
-            let attached = crate::result_types::Attached {
-                names: &names,
-                holds: &holds,
-            };
-            // A column reference naming no FROM entry is refused here, 42P01 (wire review 17
-            // item 5).
-            let walked = crate::result_types::parameter_types(
-                &parse_result,
-                &schema,
-                &search_path,
-                &pg_conn.view_cache,
-                &attached,
-            )
-            .map_err(LimboError::ParseError)?;
-            types.params = walked.params;
-            types.untyped = walked.untyped;
-            types.columns = crate::result_types::aggregate_types(&aggregates, &walked.columns);
-        }
-        // The columns whose type PostgreSQL's grammar fixes (a boolean expression, a float4 cast),
-        // where no aggregate typed them: the engine has no boolean type (PG 18 differential,
-        // 2026-10-15).
+        types.params = walked.params;
+        types.untyped = walked.untyped;
+        types.columns = walked.columns;
         types.param_targets = crate::result_types::param_targets(&parse_result);
-        // A table's width, for a `*` beside a typed column, from the in-memory schema alone.
-        let tables = |schema: &str, table: &str| resident_relation_columns(pg_conn, schema, table);
-        let fixed = crate::result_types::expression_types(&parse_result, &tables);
-        if fixed.len() == types.columns.len() {
-            for (column, fixed) in types.columns.iter_mut().zip(fixed) {
-                *column = column.or(fixed);
-            }
-        } else if types.columns.is_empty() {
-            // A `*` over derived tables and CTEs alone, which expression_types expanded (the
-            // aggregate list cannot line up with a `*`, so it is empty).
-            types.columns = fixed;
-        }
         types.used = used;
     }
 
@@ -1123,7 +1119,7 @@ fn prepare_statement_checked(
             PostgreSQLTranslator::new()
         }
     };
-    let first = translator();
+    let first = translator().with_expression_types(expression_types.clone());
     let mut translated = first
         .translate_with_prereqs(&parse_result)
         .map_err(crate::session::pg_parse_error)?;
@@ -1140,6 +1136,7 @@ fn prepare_statement_checked(
             .collect();
         if !known.is_empty() {
             translated = translator()
+                .with_expression_types(expression_types.clone())
                 .with_known_types(known)
                 .translate_with_prereqs(&parse_result)
                 .map_err(crate::session::pg_parse_error)?;
@@ -1192,6 +1189,7 @@ fn prepare_statement_checked(
         if prepared.is_err() && is_positional_insert_values(&parse_result) {
             let lookup_conn = pg_conn.clone();
             let retried = PostgreSQLTranslator::new()
+                .with_expression_types(expression_types.clone())
                 .with_columns(move |schema, table| resident_relation_columns(&lookup_conn, schema, table))
                 .translate_with_prereqs(&parse_result)
                 .map_err(|e| LimboError::ParseError(e.into()))?;

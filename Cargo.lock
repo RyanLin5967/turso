@@ -7477,13 +7477,13 @@ dependencies = [
  "parking_lot",
  "rustc-hash 2.1.1",
  "smallvec",
- "stacker",
  "tempfile",
  "tracing",
  "turso_core",
  "turso_ext",
  "turso_parser",
  "turso_pg_parser",
+ "turso_stack_guard",
 ]
 
 [[package]]
