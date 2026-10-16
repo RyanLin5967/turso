@@ -60,13 +60,17 @@ const PG_DEPARSE_STACK: usize = 4 << 20;
 ///   these: a REGISTERED DIVERGENCE, it answers 1,000 nested scalar subqueries and the decode refuses
 ///   past about 24). BLIND SPOT, stated: a decode error is taken as that limit, since the buffer is
 ///   libpg_query's own output; a corrupt buffer would be reported 54001 too.
-/// - `Error::Parse` whose whole message is the C parser's check_stack_depth() message: a syntax
+/// - `Error::Parse` or `Error::Split` whose whole message is the C parser's check_stack_depth() message: a syntax
 ///   error's message starts "syntax error at or near" (or names the unterminated token), so no
 ///   user text makes it equal.
 fn pg_query_error(e: pg_query::Error) -> ParseError {
     match e {
         pg_query::Error::Decode(_) => ParseError::StackDepthLimitExceeded,
-        pg_query::Error::Parse(m) if m == "stack depth limit exceeded" => ParseError::StackDepthLimitExceeded,
+        // The split's parser meets the same check (integrate-reviewer-2 L4: unreachable in
+        // libpg_query 6.1.1, matched so an upgrade that adds a check in the grammar stays 54001).
+        pg_query::Error::Parse(m) | pg_query::Error::Split(m) if m == turso_stack_guard::MESSAGE => {
+            ParseError::StackDepthLimitExceeded
+        }
         e => ParseError::ParseError(e.to_string().into()),
     }
 }
