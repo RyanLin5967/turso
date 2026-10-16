@@ -1682,5 +1682,13 @@ fn catalog_shape_closes_its_ledger(legacy: bool) {
     assert!(reaped.freelist_count > 0, "a mass delete freed no page: {reaped:?}");
     // The upgrade claim (DECISIONS e977c1d010): this build's first checkpoint made the meta row 21's.
     assert_eq!(rows(&reaped, "meta"), Some(11), "legacy {legacy}: not upgraded by this build's checkpoint: {reaped:?}");
-    assert_eq!(reaped.page_count, grown.page_count, "the file shrank without a vacuum: {reaped:?}");
+    // FLAGGED SPEC CHANGE, lead-ruled (links adversary 3 H1, option (b); DECISIONS, the ruling after
+    // 65eb410760): the legacy arm's upgrade adds exactly one table, the fill cursor's (`link_fill`),
+    // so its file holds exactly one more page, that table's root, derived from the design and not
+    // read from the store. The 21 arm makes no such table. The equality stays: any other growth,
+    // and any shrink, still fails.
+    let fill_table = reaped.trees.iter().any(|(n, _)| n == "link_fill");
+    assert_eq!(fill_table, legacy, "premise: link_fill exists exactly on the arm the upgrade ran on (legacy {legacy}): {reaped:?}");
+    let expected = grown.page_count + u64::from(legacy);
+    assert_eq!(reaped.page_count, expected, "the file shrank without a vacuum, or grew by more than the fill cursor's root page: {reaped:?}");
 }
