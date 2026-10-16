@@ -13063,3 +13063,4 @@ replays_postgresql!(
         (24, "PGDIV-SQLITE-NAME-MESSAGE error-text [wire]: DROP TABLE dm1, dmmissing: PG 42P01 'table \"dmmissing\" does not exist'; ours 42P01 'Parse error: no such table: dmmissing' (nothing dropped on either)"),
     ]
 );
+replays_postgresql!(pg18_c49_low5_replays_as_postgresql_answered, "pg18-c49-low5.out", []);

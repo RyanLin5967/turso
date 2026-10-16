@@ -1,0 +1,21 @@
+>> X 25 SELECT $1abc ||| x
+   E S=ERROR C=42601 M=trailing junk after parameter at or near "$1abc"
+   Z I
+>> X 25 SELECT $1 abc ||| x
+   ParseComplete
+   BindComplete
+   T oids=[25] names=['abc']
+   D ['x']
+   C SELECT 1
+   Z I
+>> D - SELECT $1abc
+   E S=ERROR C=42601 M=trailing junk after parameter at or near "$1abc"
+   Z I
+>> Q SELECT 1abc
+   E S=ERROR C=42601 M=trailing junk after numeric literal at or near "1abc"
+   Z I
+>> Q SELECT 0x1g
+   E S=ERROR C=42601 M=trailing junk after numeric literal at or near "0x1g"
+   Z I
+postgres (PostgreSQL) 18.6 (Homebrew)
+2026-10-16T12:11:02Z
