@@ -3449,6 +3449,20 @@ impl PostgreSQLTranslator {
                     Some(t) => pg_type_name_to_ast_type(t).or_else(|| self.engine_type(t)),
                     None => None,
                 };
+                // A numeric source cast to bytea is refused as PostgreSQL refuses it, 42846: there
+                // is no cast from integer or numeric to bytea, and the engine's BLOB cast took the
+                // number's text as bytes (review of 96b69304b, F4). Known here only for a source
+                // whose type the syntax gives (a numeric constant, a cast to a numeric type); a
+                // numeric column cast to bytea still takes the BLOB cast (BLIND SPOT, stated: its
+                // type is the engine's to know). A domain over bytea is refused by the engine.
+                if type_name.as_ref().is_some_and(|t| t.name == "BLOB") {
+                    if let Some(source) = pg_numeric_source_type(arg) {
+                        return Err(ParseError::ParseError(SqlErrorMessage::classified(
+                            SqlErrorKind::CannotCoerce,
+                            format!("cannot cast type {source} to bytea"),
+                        )));
+                    }
+                }
                 Ok(ast::Expr::Cast { expr, type_name })
             }
             Some(pg_query::protobuf::node::Node::SubLink(sub_link)) => {
@@ -5854,6 +5868,26 @@ fn pg_type_name_to_ast_type(type_name: &pg_query::protobuf::TypeName) -> Option<
         size: None,
         array_dimensions: 0,
     })
+}
+
+/// The PostgreSQL type a cast's source has by its syntax alone, when it is a number: an integer or
+/// a decimal constant, or a cast to a numeric type; None for anything else (a string constant, a
+/// parameter, a column, an expression).
+fn pg_numeric_source_type(node: &pg_query::protobuf::Node) -> Option<&'static str> {
+    use pg_query::protobuf::{a_const::Val, node::Node};
+    match node.node.as_ref()? {
+        Node::AConst(c) => match c.val.as_ref()? {
+            Val::Ival(_) => Some("integer"),
+            Val::Fval(_) => Some("numeric"),
+            _ => None,
+        },
+        Node::TypeCast(c) => match pg_type_name_to_ast_type(c.type_name.as_ref()?)?.name.as_str() {
+            "INTEGER" => Some("integer"),
+            "REAL" => Some("double precision"),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn extract_type_name_from_typename(
