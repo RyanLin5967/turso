@@ -1200,6 +1200,9 @@ fn plan_cte(
     connection: &Arc<crate::Connection>,
     validate_explicit_column_count: bool,
 ) -> Result<JoinedTable> {
+    // Stack-guard class (fastest-engine): a CTE plans the CTEs it reads, recursively (found by
+    // the class test: a 60-CTE chain overflowed 512 KiB in plan_cte).
+    let _nest = crate::stack::NestGuard::enter("CTEs")?;
     let cte_definition = &cte_definitions[cte_definition_index];
     if program.is_cte_being_defined(&cte_definition.name) {
         crate::bail_parse_error!("circular reference: {}", cte_definition.name);
@@ -1320,6 +1323,9 @@ fn prepare_recursive_cte_plan(
     outer_query_refs: &[OuterQueryReference],
     connection: &Arc<crate::Connection>,
 ) -> Result<Plan> {
+    // Stack-guard class (fastest-engine): a CTE plans the CTEs it reads, recursively (found by
+    // the class test: a 60-CTE chain overflowed 512 KiB in plan_cte).
+    let _nest = crate::stack::NestGuard::enter("CTEs")?;
     let select = &cte_definition.select;
     let mut first_recursive_query_index = None;
     let ref_counter = RecursiveRefCounter {
@@ -2131,6 +2137,8 @@ pub fn parse_from(
     table_references: &mut TableReferences,
     connection: &Arc<crate::Connection>,
 ) -> Result<()> {
+    // Stack-guard class (fastest-engine): a recursive entry is a nested step (`stack::NestGuard`).
+    let _nest = crate::stack::NestGuard::enter("a recursive step")?;
     let mut cte_definitions = Vec::new();
     let mut shadowed_outer_ctes = Vec::new();
 

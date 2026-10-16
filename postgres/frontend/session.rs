@@ -272,6 +272,16 @@ pub enum TxEvent {
     RollbackTo,
 }
 
+/// The PostgreSQL parser's and translator's error as the engine's: its stack-guard refusal is the
+/// engine's own (`LimboError::StackDepthLimitExceeded`, 54001 on the wire), anything else a parse
+/// error as before.
+pub(crate) fn pg_parse_error(e: turso_pg_parser::ParseError) -> LimboError {
+    match e {
+        turso_pg_parser::ParseError::StackDepthLimitExceeded => LimboError::StackDepthLimitExceeded,
+        turso_pg_parser::ParseError::ParseError(message) => LimboError::ParseError(message),
+    }
+}
+
 /// Open a database with the PostgreSQL schema dialect, resolving the IO
 /// backend from `vfs` or the path like [`turso_core::Database::open_new`].
 pub fn open_database(
@@ -935,6 +945,18 @@ fn prepare_statement_inner(
 fn prepare_statement_checked(
     pg_conn: &Arc<PgConnectionInner>,
     sql: &str,
+    types: Option<&mut StatementTypes>,
+    describe: bool,
+    check_keys: bool,
+) -> Result<Option<Statement>> {
+    turso_pg_parser::with_preparation_stack(sql, || {
+        prepare_statement_on_stack(pg_conn, sql, types, describe, check_keys)
+    })
+}
+
+fn prepare_statement_on_stack(
+    pg_conn: &Arc<PgConnectionInner>,
+    sql: &str,
     mut types: Option<&mut StatementTypes>,
     describe: bool,
     check_keys: bool,
@@ -952,7 +974,8 @@ fn prepare_statement_checked(
     reject_sqlite_catalog_access(sql)?;
 
     // One parse serves both the special forms and the translation (it was two).
-    let parse_result = turso_pg_parser::parse(sql).map_err(|e| LimboError::ParseError(e.into()))?;
+    let parse_result =
+        turso_pg_parser::parse(sql).map_err(crate::session::pg_parse_error)?;
     // One statement per prepare, as PostgreSQL's Parse takes one (42601): the translator reads the
     // first, so `COMMIT; INSERT ...` in one Parse committed and skipped the INSERT, answering
     // success (wire review 14 item 5). The simple protocol splits a query before it prepares.
@@ -969,7 +992,7 @@ fn prepare_statement_checked(
         // Read from the text as PostgreSQL 18 reads them: a number above i32::MAX is 42601, never
         // libpg_query's 32-bit wrap (wire review 12 item 1).
         let numbers = turso_pg_parser::checked_param_numbers(&parse_result, sql)
-            .map_err(|e| LimboError::ParseError(e.into()))?;
+            .map_err(crate::session::pg_parse_error)?;
         if let Some(n) = numbers
             .iter()
             .find(|n| !(1..=crate::result_types::MAX_PARAMETER as i32).contains(*n))
@@ -1116,7 +1139,7 @@ fn prepare_statement_checked(
     let first = translator();
     let mut translated = first
         .translate_with_prereqs(&parse_result)
-        .map_err(|e| LimboError::ParseError(e.into()))?;
+        .map_err(crate::session::pg_parse_error)?;
     // A cast to a type that is not built-in is kept by name only when it is the engine's own (a
     // domain, a custom type), so the engine runs its CHECKs: `CAST(-5 AS dm)` returned -5 (the
     // domain CHECK class's PG 18.6 replay, 2026-10-15). Looked up, and translated again, only for
@@ -1132,7 +1155,7 @@ fn prepare_statement_checked(
             translated = translator()
                 .with_known_types(known)
                 .translate_with_prereqs(&parse_result)
-                .map_err(|e| LimboError::ParseError(e.into()))?;
+                .map_err(crate::session::pg_parse_error)?;
         }
     }
     reject_catalog_dml(translated.cmd.stmt())?;
@@ -1184,7 +1207,7 @@ fn prepare_statement_checked(
             let retried = PostgreSQLTranslator::new()
                 .with_columns(move |schema, table| resident_relation_columns(&lookup_conn, schema, table))
                 .translate_with_prereqs(&parse_result)
-                .map_err(|e| LimboError::ParseError(e.into()))?;
+                .map_err(crate::session::pg_parse_error)?;
             return pg_conn
                 .conn
                 .prepare_translated_cmd_with_options(retried.cmd, sql, &options)
@@ -1830,7 +1853,7 @@ fn handle_pg_add_constraints(
         )
     })?;
     let mut parsed =
-        turso_pg_parser::parse(pg_definition).map_err(|e| LimboError::ParseError(e.into()))?;
+        turso_pg_parser::parse(pg_definition).map_err(crate::session::pg_parse_error)?;
     // Taken before the definition is edited below (a clone made while `create` borrows it would
     // not compile).
     let mut aside_tree = parsed.protobuf.clone();
@@ -1891,10 +1914,10 @@ fn handle_pg_add_constraints(
         }
     }
     let aside_def =
-        turso_pg_parser::deparse(&aside_tree).map_err(|e| LimboError::ParseError(e.into()))?;
+        turso_pg_parser::deparse(&aside_tree).map_err(crate::session::pg_parse_error)?;
     create.table_elts.extend(add.constraints.iter().cloned());
     let rebuilt =
-        turso_pg_parser::deparse(&parsed.protobuf).map_err(|e| LimboError::ParseError(e.into()))?;
+        turso_pg_parser::deparse(&parsed.protobuf).map_err(crate::session::pg_parse_error)?;
     // Every refusal the translator makes of the rebuilt CREATE TABLE (MATCH FULL over several
     // columns among them) is answered here, before anything is copied, dropped or locked: it came
     // from the rebuild's own CREATE, after the BEGIN, the aside copy and the DROP, under the trunk's
@@ -1902,7 +1925,7 @@ fn handle_pg_add_constraints(
     // review 16 item 9). One translation of the tree already in hand, no parse.
     PostgreSQLTranslator::new()
         .translate_with_prereqs(&parsed)
-        .map_err(|e| LimboError::ParseError(e.into()))?;
+        .map_err(crate::session::pg_parse_error)?;
 
     let quoted = format!("\"{}\"", table.replace('"', "\"\""));
     let aside = format!("\"{}\"", aside_name.replace('"', "\"\""));
@@ -3083,7 +3106,7 @@ mod tests {
     }
 
     fn slow(sql: &str) -> Option<PgBranchCall> {
-        try_extract_branch_call(&turso_pg_parser::parse(sql).ok()?)
+        try_extract_branch_call(&*turso_pg_parser::parse(sql).ok()?)
     }
 
     fn call(function: &str, args: Vec<PgBranchArg>) -> Option<PgBranchCall> {

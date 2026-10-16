@@ -65,6 +65,26 @@ static HELD_SYSCALLS: AtomicU64 = AtomicU64::new(0);
 /// Holds whose syscalls could not be attributed to the holding thread: another thread ran during
 /// the hold (`hold_attributed`); their syscalls are in neither `HELD_SYSCALLS` count.
 static HELD_UNATTRIBUTED: AtomicU64 = AtomicU64::new(0);
+
+/// One store-mutex hold, as the lifecycle audit records it (class (e), DECISIONS 994f7d41e0): where
+/// it was taken (`#[track_caller]` through `StoreMutex::lock` and its wrappers), on which thread,
+/// and what it did: its syscalls (attributed to the holder, `attribute`; `None` when they could not
+/// be), allocations and bytes, and catalog statements, each this thread's own.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HoldRec {
+    pub(crate) site: &'static std::panic::Location<'static>,
+    pub(crate) thread: u64,
+    pub(crate) syscalls: Option<u64>,
+    pub(crate) allocs: u64,
+    pub(crate) alloc_bytes: u64,
+    pub(crate) cat_stmts: u64,
+}
+
+/// The audit's log, recorded while `AUDIT` is set; the test reserves its room first, so recording
+/// allocates nothing (a push past the room is counted in `AUDIT_LOST` instead).
+pub(crate) static AUDIT: AtomicBool = AtomicBool::new(false);
+pub(crate) static AUDIT_LOG: std::sync::Mutex<Vec<HoldRec>> = std::sync::Mutex::new(Vec::new());
+pub(crate) static AUDIT_LOST: AtomicU64 = AtomicU64::new(0);
 /// Threads that declared themselves syscall-free while they spin (`spinning`): their CPU time does
 /// not make a window or a hold foreign. At most 8 at once; 0 is a free slot.
 static SPINNERS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
@@ -79,6 +99,10 @@ thread_local! {
     static T_CAT_ROWS: Cell<u64> = const { Cell::new(0) };
     /// `(held allocation bytes, catalog rows)` of this thread when it took its outermost store mutex.
     static HOLD_START: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+    /// The outermost hold's site, and this thread's (held allocations, catalog statements) at its
+    /// start (the lifecycle audit).
+    static HOLD_SITE: Cell<Option<&'static std::panic::Location<'static>>> = const { Cell::new(None) };
+    static HOLD_START2: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
     /// Whether this thread is the measuring (foreground) thread (`mark_foreground`).
     static FOREGROUND: Cell<bool> = const { Cell::new(false) };
     static T_FREE_BYTES: Cell<u64> = const { Cell::new(0) };
@@ -401,6 +425,11 @@ unsafe impl GlobalAlloc for Counting {
 
 /// A branch store's mutex was just granted to this thread (`StoreMutex::lock`).
 pub(crate) fn store_locked() {
+    store_locked_at(std::panic::Location::caller());
+}
+
+/// `store_locked`, with the site that took the mutex (the lifecycle audit's record).
+pub(crate) fn store_locked_at(site: &'static std::panic::Location<'static>) {
     LOCKS.fetch_add(1, Relaxed);
     bump(&T_LOCKS, 1);
     let depth = DEPTH.with(|d| {
@@ -410,6 +439,8 @@ pub(crate) fn store_locked() {
     if depth == 1 {
         let get = |c: &'static std::thread::LocalKey<Cell<u64>>| c.with(|c| c.get());
         HOLD_START.with(|h| h.set((get(&T_HELD_ALLOC_BYTES), get(&T_CAT_ROWS))));
+        HOLD_SITE.with(|h| h.set(Some(site)));
+        HOLD_START2.with(|h| h.set((get(&T_HELD_ALLOCS), get(&T_CAT_STMTS))));
         if ARMED.load(Relaxed) {
             // The table first, then the count: the hold's counted syscalls lie inside the table's
             // window (`hold_attributed`).
@@ -468,6 +499,25 @@ pub(crate) fn store_unlocked() {
                 } else {
                     HELD_UNATTRIBUTED.fetch_add(1, Relaxed);
                     bump(&T_HELD_UNATTRIBUTED, 1);
+                }
+                if AUDIT.load(Relaxed) {
+                    let get = |c: &'static std::thread::LocalKey<Cell<u64>>| c.with(|c| c.get());
+                    let (allocs0, stmts0) = HOLD_START2.with(|h| h.get());
+                    let me = t1.iter().find(|t| t.me).map_or(0, |t| t.id);
+                    let rec = HoldRec {
+                        site: HOLD_SITE.with(|h| h.get()).unwrap_or(std::panic::Location::caller()),
+                        thread: me,
+                        syscalls: attributed,
+                        allocs: get(&T_HELD_ALLOCS).wrapping_sub(allocs0),
+                        alloc_bytes: bytes,
+                        cat_stmts: get(&T_CAT_STMTS).wrapping_sub(stmts0),
+                    };
+                    match AUDIT_LOG.try_lock() {
+                        Ok(mut log) if log.len() < log.capacity() => log.push(rec),
+                        _ => {
+                            AUDIT_LOST.fetch_add(1, Relaxed);
+                        }
+                    }
                 }
             }
         }

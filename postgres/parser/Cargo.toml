@@ -18,10 +18,12 @@ path = "lib.rs"
 smallvec = "1.15.1"
 compact_str = "0.8.1"
 pg_query = "6.1"
+prost = { version = "0.13", features = ["no-recursion-limit", "turso-stack-guard"] }
 miette = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 turso_parser = { workspace = true }
+turso_stack_guard = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

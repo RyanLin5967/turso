@@ -25,6 +25,7 @@ members = [
     "testing/sqlite_test_ext",
     "tests",
     "sqlite/parser",
+    "sqlite/stack_guard",
     "postgres/cli",
     "postgres/client",
     "postgres/frontend",
@@ -53,7 +54,7 @@ members = [
     "testing/differential-oracle/fuzzer",
     "testing/sqltest"
 ]
-exclude = ["perf/latency/limbo", "postgres/vendor/pgwire"]
+exclude = ["perf/latency/limbo", "postgres/vendor/pgwire", "postgres/vendor/prost"]
 
 default-members = [
     "bindings/java",
@@ -78,6 +79,7 @@ default-members = [
     "testing/sqlite_test_ext",
     "tests",
     "sqlite/parser",
+    "sqlite/stack_guard",
     "postgres/tests",
     "serverless/rust",
     "serverless/rust/conformance",
@@ -117,6 +119,7 @@ turso_sync_engine = { path = "sync/engine", version = "0.8.0-pre.7" }
 turso_ext = { path = "extensions/core", version = "0.8.0-pre.7" }
 turso_macros = { path = "macros", version = "0.8.0-pre.7" }
 turso_parser = { path = "sqlite/parser", version = "0.8.0-pre.7" }
+turso_stack_guard = { path = "sqlite/stack_guard", version = "0.8.0-pre.7" }
 turso_pg = { path = "postgres/frontend", version = "0.8.0-pre.7" }
 turso_pg_client = { path = "postgres/client", version = "0.8.0-pre.7" }
 turso_pg_parser = { path = "postgres/parser", version = "0.8.0-pre.7" }
@@ -177,6 +180,7 @@ shuttle = { version = "0.8.1" }
 # pgwire 0.36.3, vendored for its frontend-message decoders: postgres/vendor/pgwire/VENDORED.md.
 [patch.crates-io]
 pgwire = { path = "postgres/vendor/pgwire" }
+prost = { path = "postgres/vendor/prost" }
 
 [profile.dev.package.similar]
 opt-level = 3

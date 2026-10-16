@@ -26,7 +26,13 @@ pub enum LimboError {
     ParseError(SqlErrorMessage),
     #[error(transparent)]
     #[diagnostic(transparent)]
-    LexerError(#[from] turso_parser::error::Error),
+    LexerError(turso_parser::error::Error),
+    /// A recursive entry of the parser or the engine found its thread's stack nearly spent
+    /// (`turso_stack_guard::NestGuard`, the stack-guard class): the statement nests too deeply for the
+    /// thread running it, and is refused rather than overflowing the thread, which would abort the
+    /// process. PostgreSQL's 54001 stack_depth_limit_exceeded, in its words.
+    #[error("stack depth limit exceeded")]
+    StackDepthLimitExceeded,
     #[error("Conversion error: {0}")]
     ConversionError(String),
     #[error("Env variable error: {0}")]
@@ -184,6 +190,7 @@ impl LimboError {
     pub fn sql_error_kind(&self) -> SqlErrorKind {
         use SqlErrorKind::*;
         match self {
+            Self::StackDepthLimitExceeded => StatementTooComplex,
             Self::Constraint(message) => message.kind().unwrap_or(IntegrityConstraintViolation),
             Self::ParseError(message) => message.kind().unwrap_or(SyntaxError),
             Self::TxError(message)
@@ -452,3 +459,15 @@ pub const SQLITE_CONSTRAINT_UNIQUE: usize = 2067;
 // op_sequence_commit_inner_tx.
 #[allow(dead_code)]
 pub const SQLITE_BUSY: usize = 5;
+
+/// The parser's errors, with its stack-guard refusal made the engine's own
+/// (`LimboError::StackDepthLimitExceeded`), so a caller sees one error for one condition whichever
+/// layer met it.
+impl From<turso_parser::error::Error> for LimboError {
+    fn from(e: turso_parser::error::Error) -> Self {
+        match e {
+            turso_parser::error::Error::StackDepthLimitExceeded => LimboError::StackDepthLimitExceeded,
+            e => LimboError::LexerError(e),
+        }
+    }
+}

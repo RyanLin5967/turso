@@ -17,11 +17,13 @@ fn main() {
             continue;
         }
         let sql = String::from_utf8_lossy(sql);
-        let line = match pg_query::parse(&sql) {
-            Ok(parsed) => serde_json::json!({ "i": i, "tree": parsed.protobuf }),
-            Err(e) => serde_json::json!({ "i": i, "error": e.to_string() }),
-        };
-        writeln!(out, "{line}").unwrap();
+        turso_pg_parser::with_preparation_stack(&sql, || {
+            let line = match turso_pg_parser::parse(&sql) {
+                Ok(parsed) => serde_json::json!({ "i": i, "tree": parsed.protobuf }),
+                Err(e) => serde_json::json!({ "i": i, "error": e.to_string() }),
+            };
+            writeln!(out, "{line}").unwrap();
+        });
     }
     out.flush().unwrap();
 }

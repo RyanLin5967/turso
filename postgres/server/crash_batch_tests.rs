@@ -228,6 +228,98 @@ fn the_sqlite_dialect_still_casts_infinity_text_to_zero() {
     assert_eq!(rows, vec![vec![Value::from_f64(0.0); 3]]);
 }
 
+/// C32 HIGH (a Claude review, verified, 2026-10-15): the time operators did unchecked chrono
+/// arithmetic, so a result past chrono's range (or a u32 month span, or a blob's seconds near
+/// i64::MIN) panicked inside an extern "C" scalar, which cannot unwind: the process aborted. Each
+/// case must answer NULL or a clean error, and the connection must answer after it. Expected RED:
+/// the test process aborts at the first case.
+#[test]
+fn the_time_operators_answer_an_overflow_with_null_or_an_error() {
+    let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::MemoryIO::new());
+    let db = turso_core::Database::open_file(io, ":memory:", Arc::new(turso_core::SqliteDialect)).unwrap();
+    let conn = db.connect().unwrap();
+    for sql in [
+        // 10^8 days past now (about 273,800 years, past chrono's year 262142).
+        "SELECT time_add_date(time_now(), 0, 0, 100000000)",
+        // 2^63 - 1 ns past year 262000.
+        "SELECT time_add(time_date(262000, 1, 1), 9223372036854775807)",
+        // ... and before year -262000.
+        "SELECT time_add(time_date(-262000, 1, 1), -9223372036854775807)",
+        // 4 * 10^8 years: the month span overflows a u32.
+        "SELECT time_add_date(time_now(), 400000000)",
+        // 2^31 years: truncated to an i32 before.
+        "SELECT time_add_date(time_now(), 2147483648)",
+        // A day count that fits a Duration, added past chrono's range.
+        "SELECT time_date(2020, 1, 100000000)",
+        // A blob whose seconds are i64::MIN.
+        "SELECT time_get_year(x'01800000000000000000000000')",
+    ] {
+        match conn.prepare(sql).and_then(|mut st| st.run_collect_rows()) {
+            Ok(rows) => assert_eq!(rows, vec![vec![Value::Null]], "{sql}: answered {rows:?}; want NULL or an error"),
+            Err(_) => {}
+        }
+        let rows = conn.prepare("SELECT 1").unwrap().run_collect_rows().unwrap();
+        assert_eq!(rows, vec![vec![Value::from_i64(1)]], "after {sql}: the connection does not answer");
+    }
+}
+
+/// The lead, 2026-10-15 (the checked-time class): SQLite's date functions added caller values with
+/// wrapping_add, so arithmetic past the date range could wrap to a silent wrong date where SQLite
+/// answers NULL. Each case's expected NULL is sqlite3 3.51.0's (/usr/bin/sqlite3, 2025-06-12, raw
+/// artie lanes/budgets/raw/sqlite3-date-oracle.txt), the chained ones included. The 12 single
+/// modifiers were already NULL at 1f38e9d83 (each modifier's own limit keeps one add in range); the
+/// chained ones are the red, where the engine wraps.
+#[test]
+fn date_arithmetic_past_the_range_is_null_as_in_sqlite() {
+    let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::MemoryIO::new());
+    let db = turso_core::Database::open_file(io, ":memory:", Arc::new(turso_core::SqliteDialect)).unwrap();
+    let conn = db.connect().unwrap();
+    let mut wrong = Vec::new();
+    for sql in [
+        "SELECT date('9999-12-31','+1 day')",
+        "SELECT julianday('2000-01-01','+5373484 days')",
+        "SELECT date('2000-01-01','+176545 months')",
+        "SELECT date('2000-01-01','+14712 years')",
+        "SELECT datetime('2000-01-01','+464269999999999 seconds')",
+        "SELECT datetime('2000-01-01','-464269999999999 seconds')",
+        "SELECT julianday('2000-01-01','+128969999999 hours')",
+        "SELECT date('2000-01-01','-14712 years')",
+        "SELECT datetime(5373484.4, '+1 day')",
+        "SELECT datetime('2000-01-01', '+99999:00:00')",
+        "SELECT datetime('2000-01-01', '+1000000000000:00')",
+        "SELECT date('-4713-11-24','-1 day')",
+    ]
+    .into_iter()
+    .map(String::from)
+    // Each modifier within its own limit, 25 of them chained: the sum passes i64 (about 20 do).
+    .chain(["+464269999999999 seconds", "-464269999999999 seconds", "+128969999999 hours"].iter().map(|m| {
+        let mods: Vec<String> = (0..25).map(|_| format!("'{m}'")).collect();
+        format!("SELECT julianday('2000-01-01', {})", mods.join(", "))
+    })) {
+        let sql = sql.as_str();
+        match conn.prepare(sql).and_then(|mut st| st.run_collect_rows()) {
+            Ok(rows) if rows == vec![vec![Value::Null]] => {}
+            other => wrong.push(format!("{sql}: {other:?}")),
+        }
+    }
+    assert!(wrong.is_empty(), "sqlite3 answers NULL for each:\n{}", wrong.join("\n"));
+}
+
+/// The one case found where the chained adds wrap i64 and land back in range: 64 modifiers of
+/// 2^58 ms each sum to exactly 2^64 ms. sqlite3 3.51.0 (/usr/bin/sqlite3) answers
+/// '2000-01-01 00:00:00' here, not NULL: SQLite's own `iJD +=` wraps as well (raw artie
+/// lanes/budgets/raw/sqlite3-date-oracle.txt). This pins the engine's answer to sqlite3's.
+#[test]
+fn date_arithmetic_that_wraps_answers_as_sqlite3_does() {
+    let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::MemoryIO::new());
+    let db = turso_core::Database::open_file(io, ":memory:", Arc::new(turso_core::SqliteDialect)).unwrap();
+    let conn = db.connect().unwrap();
+    let mods: Vec<&str> = (0..64).map(|_| "'+288230376151711.744 seconds'").collect();
+    let sql = format!("SELECT datetime('2000-01-01', {})", mods.join(", "));
+    let rows = conn.prepare(&sql).unwrap().run_collect_rows().unwrap();
+    assert_eq!(rows, vec![vec![Value::build_text("2000-01-01 00:00:00")]], "sqlite3 3.51.0's answer");
+}
+
 /// Run `f` on a fresh session on a thread of `stack` bytes ([`on_session`] at another size).
 fn on_session_with_stack(stack: usize, f: impl FnOnce(&Session) + Send + 'static) {
     let joined = std::thread::Builder::new()

@@ -99,6 +99,8 @@ pub fn translate_expr(
     target_register: usize,
     resolver: &Resolver,
 ) -> Result<usize> {
+    // Stack-guard class (fastest-engine): a recursive entry is a nested step (`stack::NestGuard`).
+    let _nest = crate::stack::NestGuard::enter("a recursive step")?;
     let constant_span = if expr.is_constant(resolver) {
         if !program.constant_span_is_open() {
             Some(program.constant_span_start())
