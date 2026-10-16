@@ -1126,7 +1126,12 @@ pub(crate) fn check_numeric_typmod(type_name: &str, params: &[Box<ast::Expr>], i
     }
     if let [p, s] = params {
         if let (Some(p), Some(s)) = (literal(p), literal(s)) {
-            crate::numeric::decimal::NumericTypmod::new(p, s).map_err(|e| crate::LimboError::ParseError(e.to_string().into()))?;
+            // The typmod's own condition is kept (22023 for a range PostgreSQL refuses; review of
+            // 96b69304b, F8: it was dropped, so 42601 was sent).
+            crate::numeric::decimal::NumericTypmod::new(p, s).map_err(|e| match e {
+                crate::LimboError::Constraint(m) => crate::LimboError::ParseError(m),
+                e => e,
+            })?;
         }
     }
     Ok(())

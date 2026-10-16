@@ -466,14 +466,16 @@ impl NumericTypmod {
     pub fn new(precision: i64, scale: i64) -> crate::Result<Self> {
         if !crate::branch::store::fe_mutant("typmod_range_unchecked") {
             if !(1..=1000).contains(&precision) {
-                return Err(LimboError::Constraint(format!(
-                    "NUMERIC precision {precision} must be between 1 and 1000"
-                ).into()));
+                return Err(LimboError::Constraint(SqlErrorMessage::classified(
+                    SqlErrorKind::InvalidParameterValue,
+                    format!("NUMERIC precision {precision} must be between 1 and 1000"),
+                )));
             }
             if !(-1000..=1000).contains(&scale) {
-                return Err(LimboError::Constraint(format!(
-                    "NUMERIC scale {scale} must be between -1000 and 1000"
-                ).into()));
+                return Err(LimboError::Constraint(SqlErrorMessage::classified(
+                    SqlErrorKind::InvalidParameterValue,
+                    format!("NUMERIC scale {scale} must be between -1000 and 1000"),
+                )));
             }
         }
         if scale < 0 {
