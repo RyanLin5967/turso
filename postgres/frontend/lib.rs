@@ -1,4 +1,6 @@
 mod aliases;
+#[cfg(test)]
+mod c54_table_lifecycle_tests;
 mod catalog;
 mod copy;
 mod functions;
