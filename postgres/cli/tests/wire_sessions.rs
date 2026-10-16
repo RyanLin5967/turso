@@ -12190,6 +12190,50 @@ mod recorded {
         assert!(report.is_empty(), "{report}");
     }
 
+    #[test]
+    fn c56_schema_membership_uses_literal_internal_prefixes() {
+        let commands = parse(include_str!("c56-pg18-schema-membership.out"));
+        let dir = Scratch::new("c56-schema-membership");
+        let server = Server::start(&dir.db(), &[]);
+        let mut wire = server.connect();
+        let mut pending = Vec::new();
+        let mut report = String::new();
+        for (i, command) in commands.iter().enumerate() {
+            let got = send(&mut wire, &mut pending, &command.text);
+            if !same(&command.want, &got) {
+                report.push_str(&format!(
+                    "#{} {}\nPG: {:?}\nours: {got:?}\n",
+                    i + 1,
+                    command.text,
+                    command.want
+                ));
+            }
+        }
+        assert!(report.is_empty(), "{report}");
+    }
+
+    #[test]
+    fn c56_retained_statement_observes_schema_drop_and_recreation() {
+        let commands = parse(include_str!("c56-pg18-schema-prepared.out"));
+        let dir = Scratch::new("c56-schema-prepared");
+        let server = Server::start(&dir.db(), &[]);
+        let mut wire = server.connect();
+        let mut pending = Vec::new();
+        let mut report = String::new();
+        for (i, command) in commands.iter().enumerate() {
+            let got = send(&mut wire, &mut pending, &command.text);
+            if !same(&command.want, &got) {
+                report.push_str(&format!(
+                    "#{} {}\nPG: {:?}\nours: {got:?}\n",
+                    i + 1,
+                    command.text,
+                    command.want
+                ));
+            }
+        }
+        assert!(report.is_empty(), "{report}");
+    }
+
     /// Replay `recording` on a fresh server and check that the commands answering otherwise than
     /// PostgreSQL are exactly `divergences`, with each registered answer pinned by `ours`.
     pub(super) fn replay(name: &str, recording: &str, ours: &str, divergences: &[(usize, &str)]) {

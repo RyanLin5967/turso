@@ -1,0 +1,63 @@
+>> Q CREATE TABLE sqlitexkept(i integer)
+   C CREATE TABLE
+   Z I
+>> Q DROP SCHEMA public RESTRICT
+   E S=ERROR C=2BP01 M=cannot drop schema public because other objects depend on it
+   Z I
+>> Q DROP SCHEMA public CASCADE
+   N S=NOTICE C=00000 M=drop cascades to table sqlitexkept
+   C DROP SCHEMA
+   Z I
+>> Q SELECT count(*) FROM pg_class WHERE relname IN ('sqlitexkept', '__turso_internal_pg_public_dropped')
+   T oids=[20] names=['count']
+   D ['0']
+   C SELECT 1
+   Z I
+>> Q DROP TABLE __turso_internal_pg_public_dropped
+   E S=ERROR C=42P01 M=table "__turso_internal_pg_public_dropped" does not exist
+   Z I
+>> Q DROP TABLE "__TURSO_INTERNAL_PG_PUBLIC_DROPPED"
+   E S=ERROR C=42P01 M=table "__TURSO_INTERNAL_PG_PUBLIC_DROPPED" does not exist
+   Z I
+>> Q DROP TABLE public.c56_absent
+   E S=ERROR C=3F000 M=schema "public" does not exist
+   Z I
+>> Q DROP TABLE IF EXISTS public.c56_absent
+   N S=NOTICE C=00000 M=schema "public" does not exist, skipping
+   C DROP TABLE
+   Z I
+>> Q CREATE SCHEMA public
+   C CREATE SCHEMA
+   Z I
+>> Q SELECT count(*) FROM pg_class WHERE relname = 'sqlitexkept'
+   T oids=[20] names=['count']
+   D ['0']
+   C SELECT 1
+   Z I
+>> Q CREATE TABLE c56_kept(i integer)
+   C CREATE TABLE
+   Z I
+>> Q DROP TABLE c56_absent.t
+   E S=ERROR C=3F000 M=schema "c56_absent" does not exist
+   Z I
+>> Q DROP TABLE c56_absent.t, c56_kept
+   E S=ERROR C=3F000 M=schema "c56_absent" does not exist
+   Z I
+>> Q SELECT count(*) FROM c56_kept
+   T oids=[20] names=['count']
+   D ['0']
+   C SELECT 1
+   Z I
+>> Q DROP TABLE IF EXISTS c56_absent.t
+   N S=NOTICE C=00000 M=schema "c56_absent" does not exist, skipping
+   C DROP TABLE
+   Z I
+>> Q DROP TABLE IF EXISTS c56_absent.t, c56_kept
+   N S=NOTICE C=00000 M=schema "c56_absent" does not exist, skipping
+   C DROP TABLE
+   Z I
+>> Q SELECT count(*) FROM pg_class WHERE relname = 'c56_kept'
+   T oids=[20] names=['count']
+   D ['0']
+   C SELECT 1
+   Z I
