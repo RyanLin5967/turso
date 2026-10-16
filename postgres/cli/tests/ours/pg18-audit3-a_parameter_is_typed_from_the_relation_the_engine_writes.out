@@ -11,34 +11,28 @@
    E S=ERROR C=0A000 M=schemas other than public are not supported by the branch server: its branches cover the one schema (CREATE SCHEMA and DROP SCHEMA are refused)
    Z I
 >> Q CREATE TABLE s.t(id INT PRIMARY KEY, c TEXT)
-   E S=ERROR C=XX000 M=no such database: s
+   E S=ERROR C=3F000 M=schema "s" does not exist
    Z I
 >> X 0 INSERT INTO s.t VALUES (1, $1) ||| 007
-   ParseComplete
-   BindComplete
-   E S=ERROR C=XX000 M=no such database: s
+   E S=ERROR C=42P01 M=relation "s.t" does not exist
    Z I
 >> Q SELECT c FROM s.t WHERE id = 1
-   E S=ERROR C=XX000 M=no such database: s
+   E S=ERROR C=42P01 M=relation "s.t" does not exist
    Z I
 >> Q INSERT INTO s.t VALUES (2, 'x') ON CONFLICT DO NOTHING
-   E S=ERROR C=XX000 M=no such database: s
+   E S=ERROR C=42P01 M=relation "s.t" does not exist
    Z I
 >> X 0 UPDATE s.t SET c = $1 WHERE id = 2 ||| 007
-   ParseComplete
-   BindComplete
-   E S=ERROR C=XX000 M=no such database: s
+   E S=ERROR C=42P01 M=relation "s.t" does not exist
    Z I
 >> Q SELECT c FROM s.t WHERE id = 2
-   E S=ERROR C=XX000 M=no such database: s
+   E S=ERROR C=42P01 M=relation "s.t" does not exist
    Z I
 >> X 0 INSERT INTO s.t VALUES (2, $1) ON CONFLICT (id) DO UPDATE SET c = excluded.c ||| 007
-   ParseComplete
-   BindComplete
-   E S=ERROR C=XX000 M=no such database: s
+   E S=ERROR C=42P01 M=relation "s.t" does not exist
    Z I
 >> Q SELECT c FROM s.t WHERE id = 2
-   E S=ERROR C=XX000 M=no such database: s
+   E S=ERROR C=42P01 M=relation "s.t" does not exist
    Z I
 >> Q SET search_path TO s, public
    C SET
@@ -50,7 +44,7 @@
    C INSERT 0 1
    Z I
 >> Q SELECT c FROM s.t WHERE id = 3
-   E S=ERROR C=XX000 M=no such database: s
+   E S=ERROR C=42P01 M=relation "s.t" does not exist
    Z I
 >> Q SET search_path TO public
    C SET

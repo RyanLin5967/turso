@@ -8,10 +8,10 @@
    E S=ERROR C=0A000 M=schemas other than public are not supported by the branch server: its branches cover the one schema (CREATE SCHEMA and DROP SCHEMA are refused)
    Z I
 >> Q CREATE TABLE s.t(id INT PRIMARY KEY, c TEXT)
-   E S=ERROR C=XX000 M=no such database: s
+   E S=ERROR C=3F000 M=schema "s" does not exist
    Z I
 >> Q INSERT INTO s.t VALUES (1, 'one')
-   E S=ERROR C=XX000 M=no such database: s
+   E S=ERROR C=42P01 M=relation "s.t" does not exist
    Z I
 >> Q SET search_path TO s, public
    C SET
@@ -32,7 +32,7 @@
    C DELETE 0
    Z I
 >> Q SELECT count(*) || ',' || coalesce(max(c), '') FROM s.t
-   E S=ERROR C=XX000 M=no such database: s
+   E S=ERROR C=42P01 M=relation "s.t" does not exist
    Z I
 >> Q SELECT c FROM public.t WHERE id = 5
    T oids=[23] names=['c']
@@ -51,5 +51,5 @@
    E S=ERROR C=42P01 M=Parse error: no such table: main.t
    Z I
 >> Q SELECT count(*) FROM s.t
-   E S=ERROR C=XX000 M=no such database: s
+   E S=ERROR C=42P01 M=relation "s.t" does not exist
    Z I
