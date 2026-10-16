@@ -1218,6 +1218,29 @@ mod tests {
         );
     }
 
+    /// A CAST to a BASE-only type over text (not a domain) converts to text, as PostgreSQL 18 casts
+    /// by the underlying type; over blob (bytea) a numeric source is refused, 42846 (CannotCoerce),
+    /// and a text source is not (review of 96b69304b, F4: the CAST was a no-op).
+    #[test]
+    fn a_cast_to_a_base_only_type_over_text_converts_and_over_blob_refuses_a_number() {
+        let conn = open();
+        conn.execute("CREATE TYPE ttext(value text) BASE text").unwrap();
+        let rows = conn
+            .prepare("SELECT typeof(CAST(10 AS ttext)), CAST(10 AS ttext)")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(rows, vec![vec![Value::build_text("text"), Value::build_text("10")]]);
+        for sql in ["SELECT CAST(10 AS bytea)", "SELECT CAST(1.5 AS bytea)", "SELECT CAST(CAST('1' AS integer) AS bytea)"] {
+            let got = conn.prepare(sql).and_then(|mut s| s.run_collect_rows());
+            assert!(
+                matches!(&got, Err(e) if format!("{:?}", e.sql_error_kind()) == "CannotCoerce"),
+                "{sql}: {got:?}"
+            );
+        }
+        conn.prepare("SELECT CAST('ab' AS bytea)").unwrap().run_collect_rows().unwrap();
+    }
+
     /// Engine review 20 item 9: 1d8bf442e's catch region covered only types with a function '=', so
     /// a built-in with a RAISE in its ENCODE, a bare '<' and no '=' (varchar(n), smallint, the
     /// date/time types) still raised through an indexed equality: `v = 'abcdef'` on varchar(3)

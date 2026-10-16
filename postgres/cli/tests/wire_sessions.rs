@@ -1057,6 +1057,35 @@ fn a_domain_check_failure_is_23514_with_postgresqls_message_on_every_path() {
     fails(&mut a, "UPDATE tm SET x = -1 WHERE id = 2", "value for domain dm violates check constraint \"dm_check\"");
 }
 
+/// A CAST to a type over text converts to text, a domain's included: PostgreSQL 18 casts to a
+/// domain with its underlying type's casts (CREATE CAST: "Casting to or from a domain uses the casts
+/// associated with its underlying type"), so CAST(10 AS dt) is the text '10', which passes CHECK
+/// (VALUE >= '0') and sorts above '9'. The CAST was a no-op, so the integer 10 failed that CHECK
+/// (an integer sorts below every text) and sorted below 9 (review of 96b69304b, F4). Over bytea a
+/// non-text source is refused as PostgreSQL refuses it, 42846 "cannot cast type integer to
+/// bytea"; a text source is not.
+#[test]
+fn a_cast_to_a_type_over_text_converts_and_over_bytea_refuses_a_non_text_source() {
+    let dir = Scratch::new("castbase");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE DOMAIN dt AS text CHECK (VALUE >= '0')").ok("CREATE DOMAIN dt");
+    assert_eq!(a.q("SELECT CAST(10 AS dt)").single("SELECT CAST(10 AS dt)"), "10");
+    a.q("CREATE DOMAIN du AS text").ok("CREATE DOMAIN du");
+    let sql = "SELECT x FROM (SELECT CAST(10 AS du) AS x UNION ALL SELECT CAST(9 AS du) AS x) s ORDER BY x";
+    let rows = a.q(sql).ok(sql).rows;
+    assert_eq!(rows, vec![vec![Some("10".to_string())], vec![Some("9".to_string())]], "{sql}");
+    for sql in ["SELECT CAST(10 AS bytea)", "SELECT CAST(1.5 AS bytea)"] {
+        let e = a.q(sql).err(sql);
+        assert_eq!(e.code, "42846", "{sql}: {e:?}");
+    }
+    a.q("CREATE DOMAIN dby AS bytea").ok("CREATE DOMAIN dby");
+    let e = a.q("SELECT CAST(10 AS dby)").err("SELECT CAST(10 AS dby)");
+    assert_eq!(e.code, "42846", "SELECT CAST(10 AS dby): {e:?}");
+    // Control: a text source to bytea is no refusal.
+    a.q("SELECT CAST('ab' AS bytea)").ok("SELECT CAST('ab' AS bytea)");
+}
+
 /// A client that floods SSLRequests and never reads cannot hold its session, nor the server's one
 /// slot, past the authentication timeout (Codex/Claude C37 H1: the server answered every repeated
 /// SSLRequest with 'N' and blocked for good in a write with no deadline; a second client got
