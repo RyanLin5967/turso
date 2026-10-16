@@ -4787,11 +4787,18 @@ impl PostgreSQLTranslator {
         {
             return Err(self.undefined_function(call));
         }
-        // PostgreSQL has integer, bigint and numeric overloads, but no floating-point series.
-        if name.eq_ignore_ascii_case("generate_series")
-            && call.args.iter().any(|arg| matches!(self.expression_type(arg), Some(700 | 701)))
-        {
-            return Err(self.undefined_function(call));
+        if name.eq_ignore_ascii_case("generate_series") {
+            let types: Vec<_> = call.args.iter().map(|arg| self.expression_type(arg)).collect();
+            let temporal = matches!(types.as_slice(),
+                [Some(1082 | 1114 | 1184 | 705) | None, Some(1082 | 1114 | 1184 | 705) | None,
+                 Some(1186 | 705) | None]
+                | [Some(1082 | 1184 | 705) | None, Some(1082 | 1184 | 705) | None,
+                   Some(1186 | 705) | None, Some(25 | 705) | None]);
+            if !temporal && types.iter().any(|oid| {
+                oid.is_some_and(|oid| !matches!(oid, 20 | 21 | 23 | 1700 | 705))
+            }) {
+                return Err(self.undefined_function(call));
+            }
         }
         Ok(())
     }
