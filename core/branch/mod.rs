@@ -439,6 +439,14 @@ pub struct ForkHolds {
     pub locked_trunk_forks: u64,
 }
 
+/// Test builds: the syncs a test reads for `db`'s work (the per-store counter class; at this red,
+/// still the process's, `sync_counts`).
+#[cfg(test)]
+pub(crate) fn sync_counts_of(db: &crate::Database) -> SyncCounts {
+    let _ = db;
+    sync_counts()
+}
+
 #[doc(hidden)]
 pub fn sync_counts() -> SyncCounts {
     use crate::sync::atomic::Ordering::Relaxed;
@@ -1770,6 +1778,11 @@ pub(crate) mod budget_probe;
 
 #[cfg(all(test, feature = "fs"))]
 mod budget_tests;
+
+// The per-store counter class (lead ruling d9cf2b609b): a counter a budget or test reads is this
+// store's, never the process's or any thread's.
+#[cfg(all(test, feature = "fs"))]
+mod counter_scope_tests;
 
 #[cfg(test)]
 mod tests {

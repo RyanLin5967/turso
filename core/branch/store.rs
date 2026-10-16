@@ -4343,6 +4343,36 @@ fn guard_mutant(which: &str) -> bool {
     !cfg!(debug_assertions) && mutant(&format!("r13_guard_{which}_debug"))
 }
 
+/// Test builds: the counters a test reads for ONE store (the per-store counter class, lead ruling
+/// d9cf2b609b). At this red they are still the process's (`CAPTURE_*`, `FROZEN_ROWS_WRITTEN`,
+/// `INSTALL_*`, `SYNCS_UNDER_STORE_MUTEX`), which another store's work on another thread moves.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct StoreTestCounts {
+    pub(crate) capture_entered: u64,
+    pub(crate) capture_arena_handles: u64,
+    pub(crate) capture_rows_built: u64,
+    pub(crate) frozen_rows_written: u64,
+    pub(crate) install_cuts: u64,
+    pub(crate) install_rewrites: u64,
+    pub(crate) syncs_under_store_mutex: u64,
+}
+
+#[cfg(test)]
+impl BranchStore {
+    pub(crate) fn test_counts(&self) -> StoreTestCounts {
+        StoreTestCounts {
+            capture_entered: CAPTURE_ENTERED.load(Ordering::Relaxed),
+            capture_arena_handles: CAPTURE_ARENA_HANDLES.load(Ordering::Relaxed),
+            capture_rows_built: CAPTURE_ROWS_BUILT.load(Ordering::Relaxed),
+            frozen_rows_written: FROZEN_ROWS_WRITTEN.load(Ordering::Relaxed),
+            install_cuts: INSTALL_CUTS.load(Ordering::Relaxed),
+            install_rewrites: INSTALL_REWRITES.load(Ordering::Relaxed),
+            syncs_under_store_mutex: syncs_under_store_mutex(),
+        }
+    }
+}
+
 /// Test builds: captures entered, by ANY thread (A4.G's G-b red: a guard that stopped before the
 /// capture leaves it unchanged). FLAGGED instrument change (L2(d) slice 3): these were this
 /// thread's counts; a create's checkpoint is now captured on the checkpoint worker's thread
