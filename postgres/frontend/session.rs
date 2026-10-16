@@ -469,6 +469,46 @@ impl PgConnection {
         Ok(stmt.map(|stmt| (stmt, types)))
     }
 
+    /// The Parse step's analysis (C53): a statement PostgreSQL analyses at Parse and this engine
+    /// compiles without performing it (a query, INSERT, UPDATE, DELETE, MERGE) is prepared from
+    /// `msg`'s parse, so whatever its analysis refuses (a missing relation, an unknown function, a
+    /// parameter it cannot type) refuses the Parse, as there; the statement is returned with its
+    /// types for the round's Bind, Describe and Execute. Any other statement is analysed when it
+    /// runs, as PostgreSQL analyses a utility statement: None, and nothing is compiled. A branch
+    /// call or blank statement has no parse: None.
+    pub fn parse_step(
+        &self,
+        sql: &str,
+        msg: &mut ParseMessage,
+    ) -> Result<Option<(Statement, StatementTypes)>> {
+        use turso_pg_parser::pg_query::NodeRef;
+        let analysed = msg.parse.as_ref().is_some_and(|parse| {
+            matches!(
+                parse.protobuf.nodes().first().map(|t| &t.0),
+                Some(
+                    NodeRef::SelectStmt(_)
+                        | NodeRef::InsertStmt(_)
+                        | NodeRef::UpdateStmt(_)
+                        | NodeRef::DeleteStmt(_)
+                        | NodeRef::MergeStmt(_)
+                )
+            )
+        });
+        if !analysed || msg.call.is_some() {
+            return Ok(None);
+        }
+        let mut types = StatementTypes::default();
+        let stmt = prepare_statement_parsed(
+            &self.inner,
+            sql,
+            msg.parse.take(),
+            Some(&mut types),
+            true,
+            true,
+        )?;
+        Ok(stmt.map(|stmt| (stmt, types)))
+    }
+
     pub fn query(&self, sql: impl AsRef<str>) -> Result<Option<Statement>> {
         let sql = turso_pg_parser::pg_trim(sql.as_ref());
         if sql.is_empty() {
@@ -595,6 +635,85 @@ pub fn branch_call(sql: &str) -> Option<PgBranchCall> {
         return None;
     }
     try_extract_branch_call(&parsed)
+}
+
+/// A Parse message's text as PostgreSQL's exec_parse_message reads it before anything runs (C53):
+/// with ONE libpg_query parse (none for a blank statement or a branch call's fast form), the
+/// statement's syntax (a lexical or syntax error refuses the Parse, 42601, where it passed Parse
+/// and Bind and failed at Execute: C40 review LOW 2), whether it is a branch call, and its
+/// parameters. The branch call's parse, the parameter scan and the prepare each made their own
+/// call (C40 review LOW 6).
+pub struct ParseMessage {
+    /// The branch call the text is, if any.
+    pub call: Option<PgBranchCall>,
+    /// PostgreSQL analyses the statement at Parse and so counts its `$n` (scan_params' list: a
+    /// query, INSERT, UPDATE, DELETE, MERGE, CALL, EXPLAIN, DECLARE, CREATE TABLE ... AS); any
+    /// other statement's parameters are the ones Parse declared.
+    pub counts_params: bool,
+    /// The highest `$n` of the tree, 0 for none; None when a number is past what the tree holds
+    /// (libpg_query's 32-bit wrap), which the prepare refuses (42601).
+    pub highest: Option<u32>,
+    /// The parse, for [`PgConnection::parse_step`]; None for a blank statement or a fast call.
+    parse: Option<turso_pg_parser::pg_query::ParseResult>,
+}
+
+pub fn read_parse_message(sql: &str) -> Result<ParseMessage> {
+    use turso_pg_parser::pg_query::NodeRef;
+    let none = |call| ParseMessage {
+        call,
+        counts_params: false,
+        highest: Some(0),
+        parse: None,
+    };
+    let trimmed = turso_pg_parser::pg_trim(sql);
+    if trimmed.is_empty() {
+        return Ok(none(None));
+    }
+    if let Some(call) = fast_branch_call(sql) {
+        return Ok(none(Some(call)));
+    }
+    // The trimmed text, as the prepare reads it: the tree's locations must index the text the
+    // prepare holds (a leading blank shifted every $n's location by one).
+    let parse =
+        turso_pg_parser::parse(trimmed).map_err(|e| LimboError::ParseError(e.to_string()))?;
+    let numbers = turso_pg_parser::checked_param_numbers(&parse, trimmed);
+    let prefix = BRANCH_FUNCTION_PREFIX.as_bytes();
+    let mentions = sql
+        .as_bytes()
+        .windows(prefix.len())
+        .any(|w| w.eq_ignore_ascii_case(prefix));
+    // As branch_call reads it: a wrapped $n makes no call.
+    let call = if mentions && numbers.is_ok() {
+        try_extract_branch_call(&parse)
+    } else {
+        None
+    };
+    let counts_params = matches!(
+        parse.protobuf.nodes().first().map(|t| &t.0),
+        Some(
+            NodeRef::SelectStmt(_)
+                | NodeRef::InsertStmt(_)
+                | NodeRef::UpdateStmt(_)
+                | NodeRef::DeleteStmt(_)
+                | NodeRef::MergeStmt(_)
+                | NodeRef::CallStmt(_)
+                | NodeRef::ExplainStmt(_)
+                | NodeRef::DeclareCursorStmt(_)
+                | NodeRef::CreateTableAsStmt(_)
+        )
+    );
+    let highest = numbers.ok().map(|ns| {
+        ns.into_iter()
+            .map(|n| n.max(0) as u32)
+            .max()
+            .unwrap_or(0)
+    });
+    Ok(ParseMessage {
+        call,
+        counts_params,
+        highest,
+        parse: Some(parse),
+    })
 }
 
 /// The common forms of a branch call, read byte by byte with no allocation but the call itself:
@@ -941,6 +1060,19 @@ fn prepare_statement_inner(
 fn prepare_statement_checked(
     pg_conn: &Arc<PgConnectionInner>,
     sql: &str,
+    types: Option<&mut StatementTypes>,
+    describe: bool,
+    check_keys: bool,
+) -> Result<Option<Statement>> {
+    prepare_statement_parsed(pg_conn, sql, None, types, describe, check_keys)
+}
+
+/// [`prepare_statement_checked`] from `parsed`, the text's parse when the caller already made it
+/// (a Parse message's: [`read_parse_message`]), so a Parse costs one libpg_query call.
+fn prepare_statement_parsed(
+    pg_conn: &Arc<PgConnectionInner>,
+    sql: &str,
+    parsed: Option<turso_pg_parser::pg_query::ParseResult>,
     mut types: Option<&mut StatementTypes>,
     describe: bool,
     check_keys: bool,
@@ -957,9 +1089,12 @@ fn prepare_statement_checked(
 
     reject_sqlite_catalog_access(sql)?;
 
-    // One parse serves both the special forms and the translation (it was two).
-    let parse_result =
-        turso_pg_parser::parse(sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
+    // One parse serves both the special forms and the translation (it was two), and a Parse
+    // message's serves its classification too (C53).
+    let parse_result = match parsed {
+        Some(parsed) => parsed,
+        None => turso_pg_parser::parse(sql).map_err(|e| LimboError::ParseError(e.to_string()))?,
+    };
     // One statement per prepare, as PostgreSQL's Parse takes one (42601): the translator reads the
     // first, so `COMMIT; INSERT ...` in one Parse committed and skipped the INSERT, answering
     // success (wire review 14 item 5). The simple protocol splits a query before it prepares.

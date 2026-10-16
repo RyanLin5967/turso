@@ -12145,6 +12145,7 @@ replays_postgresql!(
         (1, "PGDIV-PUBLIC-SCHEMA-NOOP cluster-state [cluster]: DROP SCHEMA public CASCADE no-op for us (PG cascades table t), CREATE SCHEMA public 'already exists'"),
         (3, "PGDIV-DESCRIBE-PARAM-TYPE value [wire]: Describe types $1 in pg_class.relname = $1 as 25 text; PG 19 name"),
         (4, "PGDIV-DESCRIBE-PARAM-TYPE value [wire]: Describe types $1 in pg_catalog.pg_class.relname = $1 as 25 text; PG 19 name"),
+        (5, "PGDIV-SQLITE-NAME-MESSAGE error-text [wire]: refused at Parse as PG refuses it (42P01); PG says 'invalid reference to FROM-clause entry for table \"t\"', ours 'Parse error: missing FROM-clause entry for table \"t\"' (C53 moved the refusal to Parse)"),
     ]
 );
 replays_postgresql!(
@@ -12254,6 +12255,7 @@ replays_postgresql!(
         (19, "PGDIV-DERIVED-COLUMN-BYTEA value [wire]: derived-table count(*) column typed 17 bytea in RowDescription (row '3' agrees); PG 20"),
         (26, "PGDIV-EXPR-TYPE-TEXT value [wire]: Describe: sum(n) OVER (PARTITION BY n > $1) typed 25 text in RowDescription; PG 20 int8 (param 23 agrees)"),
         (44, "PGDIV-SQLITE-FUNCTION-LEAK error-code [wire]: typeof(name) = $1: PG refuses at Parse 42883 'function typeof(text) does not exist'; ours ParseComplete then 42P18 (the SQLite typeof() leaks through)"),
+        (45, "PGDIV-SQLITE-NAME-MESSAGE error-text [wire]: refused at Parse as PG refuses it (42883); PG says 'function no_such_typing(text) does not exist', ours 'Parse error: no such function: no_such_typing' (C53 moved the refusal to Parse)"),
     ]
 );
 replays_postgresql!(pg18_audit2_a_create_table_with_a_serial_completes_as_create_table_replays_as_postgresql_answered, "pg18-audit2-a_create_table_with_a_serial_completes_as_create_table.out", []);
@@ -12439,12 +12441,17 @@ replays_postgresql!(
     "pg18-audit3-a_branch_call_parameter_past_the_limit_is_refused.out",
     [
         (1, "PGDIV-SCHEMA-REFUSED cluster-state [cluster]: DROP SCHEMA IF EXISTS s; DROP SCHEMA public: ours refuses the whole query 0A000"),
+        (4, "PGDIV-PARSE-PREFIX error-text [wire]: refused at Parse as PG refuses it (42601); the message carries 'Parse error: ' (C53 moved the refusal to Parse)"),
         (6, "PGDIV-PARSE-PREFIX error-text [wire]: 42601 parameter number too large both; ours prefixes 'Parse error: '"),
         (7, "PGDIV-TURSO-FUNCTIONS error-code [ours-only]: Describe of turso_branch_create($65536): PG 42883 function turso_branch_create(unknown) does not exist (PG has no such function); ours ParseComplete then 42P02 there is no parameter $65536"),
         (9, "PGDIV-PARSE-PREFIX error-text [wire]: 42P02 both; ours prefixes 'Parse error: '"),
+        (10, "PGDIV-PARSE-PREFIX error-text [wire]: refused at Parse as PG refuses it (42P02); the message carries 'Parse error: ' (C53 moved the refusal to Parse)"),
         (12, "PGDIV-PARSE-PREFIX error-text [wire]: 42P02 both; ours prefixes 'Parse error: '"),
+        (13, "PGDIV-PARSE-PREFIX error-text [wire]: refused at Parse as PG refuses it (42601); the message carries 'Parse error: ' (C53 moved the refusal to Parse)"),
         (15, "PGDIV-PARSE-PREFIX error-text [wire]: 42601 both; ours prefixes 'Parse error: '"),
+        (16, "PGDIV-PARSE-PREFIX error-text [wire]: refused at Parse as PG refuses it (42601); the message carries 'Parse error: ' (C53 moved the refusal to Parse)"),
         (18, "PGDIV-PARSE-PREFIX error-text [wire]: 42601 both; ours prefixes 'Parse error: '"),
+        (19, "PGDIV-PARSE-PREFIX error-text [wire]: refused at Parse as PG refuses it (42601); the message carries 'Parse error: ' (C53 moved the refusal to Parse)"),
         (21, "PGDIV-PARSE-PREFIX error-text [wire]: 42601 both; ours prefixes 'Parse error: '"),
     ]
 );
@@ -12507,6 +12514,7 @@ replays_postgresql!(
         (11, "PGDIV-SCHEMA-REFUSED cascade [cluster]: INSERT ... ON CONFLICT DO UPDATE into s.t: XX000 (cascade of #4)"),
         (12, "PGDIV-SCHEMA-REFUSED cascade [cluster]: SELECT FROM s.t: XX000 (cascade of #4)"),
         (15, "PGDIV-SCHEMA-REFUSED cascade [cluster]: SELECT FROM s.t: XX000 (cascade of #4)"),
+        (18, "PGDIV-SQLITE-NAME-MESSAGE error-text [wire]: refused at Parse as PG refuses it (42P01); PG says 'invalid reference to FROM-clause entry for table \"t\"', ours 'Parse error: missing FROM-clause entry for table \"t\"' (C53 moved the refusal to Parse)"),
     ]
 );
 replays_postgresql!(
@@ -12515,6 +12523,7 @@ replays_postgresql!(
     [
         (1, "PGDIV-SCHEMA-REFUSED cluster-state [cluster]: DROP SCHEMA IF EXISTS s (PG had s.t) ...; DROP SCHEMA public: ours refuses the whole query 0A000"),
         (4, "PGDIV-PARSE-PREFIX error-text [wire]: 42P02 both; ours prefixes 'Parse error: '"),
+        (5, "PGDIV-PARSE-PREFIX error-text [wire]: refused at Parse as PG refuses it (42P02); the message carries 'Parse error: ' (C53 moved the refusal to Parse)"),
         (7, "PGDIV-PARSE-PREFIX error-text [wire]: 42P02 both; ours prefixes 'Parse error: '"),
         (8, "PGDIV-PARAM-OVER-LIMIT-CODE error-code [wire]: Describe of id = $65536: PG refuses at Parse 42P18 'could not determine data type of parameter $1'; ours ParseComplete then 42P02 there is no parameter $65536"),
     ]
@@ -12524,10 +12533,14 @@ replays_postgresql!(
     "pg18-audit3-a_parameter_number_the_scanner_would_wrap_is_refused.out",
     [
         (1, "PGDIV-SCHEMA-REFUSED cluster-state [cluster]: DROP SCHEMA IF EXISTS s; DROP SCHEMA public: ours refuses the whole query 0A000"),
+        (4, "PGDIV-PARSE-PREFIX error-text [wire]: refused at Parse as PG refuses it (42601); the message carries 'Parse error: ' (C53 moved the refusal to Parse)"),
         (5, "PGDIV-TURSO-FUNCTIONS error-code [ours-only]: turso_branch_switch('x'): PG 42883 function does not exist (PG has no turso_* functions); ours 3D000 branch \"x\" does not exist"),
         (6, "PGDIV-PARSE-PREFIX error-text [wire]: 42601 both; ours prefixes 'Parse error: '"),
+        (7, "PGDIV-PARSE-PREFIX error-text [wire]: refused at Parse as PG refuses it (42601); the message carries 'Parse error: ' (C53 moved the refusal to Parse)"),
         (9, "PGDIV-PARSE-PREFIX error-text [wire]: 42601 both; ours prefixes 'Parse error: '"),
+        (10, "PGDIV-PARSE-PREFIX error-text [wire]: refused at Parse as PG refuses it (42601); the message carries 'Parse error: ' (C53 moved the refusal to Parse)"),
         (12, "PGDIV-PARSE-PREFIX error-text [wire]: 42601 both; ours prefixes 'Parse error: '"),
+        (13, "PGDIV-PARSE-PREFIX error-text [wire]: refused at Parse as PG refuses it (42601); the message carries 'Parse error: ' (C53 moved the refusal to Parse)"),
     ]
 );
 replays_postgresql!(
@@ -12578,6 +12591,7 @@ replays_postgresql!(
         (1, "PGDIV-SCHEMA-REFUSED cluster-state [cluster]: DROP SCHEMA IF EXISTS s; DROP SCHEMA public: ours refuses the whole query 0A000"),
         (4, "PGDIV-SCHEMA-REFUSED cluster-state [cluster]: CREATE SCHEMA s refused 0A000 (recording relies on schema s)"),
         (5, "PGDIV-SCHEMA-REFUSED cascade [cluster]: CREATE TABLE s.u: XX000 no such database: s (cascade of #4)"),
+        (6, "PGDIV-SQLITE-NAME-MESSAGE error-text [wire]: refused at Parse as PG refuses it (42P01); PG says 'relation \"u\" does not exist', ours 'Parse error: no such table: u' (C53 moved the refusal to Parse)"),
     ]
 );
 replays_postgresql!(
@@ -12895,6 +12909,9 @@ replays_postgresql!(
         (15, "PGDIV-SUM-INT8-NUMERIC cascade [engine]: SELECT 1/0: ours 25P02 because #14 aborted the block; PG 22012 (cascade of #14)"),
         (20, "PGDIV-PARSE-PREFIX error-text [wire]: COPY ... WHERE v = $1 over Q: 42P02 both; ours prefixes 'Parse error: '"),
         (21, "PGDIV-PARSE-PREFIX error-text [wire]: COPY ... WHERE v = $1 extended: message sequence agrees (Parse/Bind/NoData then 42P02); ours prefixes 'Parse error: '"),
+        (25, "PGDIV-SQLITE-NAME-MESSAGE error-text [wire]: refused at Parse as PG refuses it (42P01); PG says 'invalid reference to FROM-clause entry for table \"t\"', ours 'Parse error: missing FROM-clause entry for table \"t\"' (C53 moved the refusal to Parse)"),
+        (31, "PGDIV-PARSE-PREFIX error-text [wire]: refused at Parse as PG refuses it (42601); the message carries 'Parse error: ' (C53 moved the refusal to Parse)"),
+        (32, "PGDIV-PARSE-PREFIX error-text [wire]: refused at Parse as PG refuses it (42601); the message carries 'Parse error: ' (C53 moved the refusal to Parse)"),
         (37, "PGDIV-BOOL-TEXT value [wire]: SILENT: EXISTS (SELECT 1 FROM k WHERE k.flag) in DELETE RETURNING answers '1' typed 25; PG 't' typed 16"),
         (39, "PGDIV-BOOL-TEXT value [wire]: SILENT: EXISTS (... AS j WHERE flag) in DELETE RETURNING answers '1' typed 25; PG 't' typed 16"),
         (41, "PGDIV-BOOL-TEXT value [wire]: SILENT: EXISTS (SELECT * FROM k) in DELETE RETURNING answers '1' typed 25; PG 't' typed 16"),

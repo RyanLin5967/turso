@@ -37,9 +37,9 @@ use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 use turso_core::{CheckpointMode, Database, LimboError, Value};
 use turso_pg::{
-    attach_schema_files, branch_call, element_of, pg_bool, single_statement, split_statements,
-    PgBranchArg,
-    PgBranchCall, PgConnection, StatementTypes, TxStmt,
+    attach_schema_files, branch_call, element_of, pg_bool, read_parse_message, single_statement,
+    split_statements, ParseMessage, PgBranchArg, PgBranchCall, PgConnection, StatementTypes,
+    TxStmt,
 };
 use turso_pg_parser::{pg_space, scan_params, skip_blank, sql_comment, ParamScan};
 
@@ -1152,6 +1152,22 @@ impl Parsed {
         }
     }
 
+    /// A Parse message's statement, from its one parse ([`read_parse_message`]): the branch call
+    /// it is and its parameters as the parse tree holds them (a tree's `$n` are the lexer's
+    /// parameter tokens, for a text that parses; one that does not is refused at Parse).
+    fn from_message(sql: String, msg: &ParseMessage) -> Self {
+        Self {
+            sql,
+            call: msg.call.clone(),
+            scan: ParamScan {
+                highest: msg.highest,
+                analysed: msg.counts_params,
+            },
+            params: OnceLock::new(),
+            columns: OnceLock::new(),
+        }
+    }
+
     /// Fix the statement's parameter types at the first call, and refuse any later call whose
     /// types are others. The same text with the same declared types has the same parameters, so
     /// only their types can differ.
@@ -2056,6 +2072,45 @@ impl Session {
     fn refuse_describe_if_aborted(&self, sql: &str) -> PgWireResult<()> {
         if self.state().aborted && !TxVerb::of(sql).ends_block() {
             return Err(PgWireError::UserError(aborted_error()));
+        }
+        Ok(())
+    }
+
+    /// The Parse step's analysis ([`PgConnection::parse_step`]): a statement PostgreSQL analyses
+    /// at Parse is prepared now, from the Parse's one parse, and kept for the round's Bind,
+    /// Describe and Execute ([`Session::describe_prepare`] finds it), its parameters typed now as
+    /// PostgreSQL types them at Parse (42P18 for one it cannot type). Any other statement's
+    /// declared parameters must each have a type (42P18), as there; it is prepared when it runs.
+    fn parse_step(
+        &self,
+        parsed: &Parsed,
+        msg: &mut ParseMessage,
+        declared: &[Option<Type>],
+    ) -> PgWireResult<()> {
+        if parsed.call.is_some() || is_blank(&parsed.sql) {
+            return Ok(());
+        }
+        let conn = self
+            .current(&mut self.state())
+            .map_err(PgWireError::UserError)?;
+        match conn.parse_step(&parsed.sql, msg).map_err(engine_error)? {
+            Some((stmt, types)) => {
+                parameter_types(&types, declared).map_err(PgWireError::UserError)?;
+                self.state().described = Some(Described {
+                    conn: conn.inner().clone(),
+                    sql: parsed.sql.clone(),
+                    stmt,
+                    types,
+                });
+            }
+            // A utility statement's declared parameters are its only ones. One PostgreSQL
+            // analyses but this engine prepares only when it runs (CALL, EXPLAIN, DECLARE,
+            // CREATE TABLE ... AS) has its parameters typed then.
+            None if !msg.counts_params => {
+                parameter_types(&StatementTypes::default(), declared)
+                    .map_err(PgWireError::UserError)?;
+            }
+            None => {}
         }
         Ok(())
     }
@@ -3813,19 +3868,23 @@ impl ExtendedQueryHandler for Session {
             return Err(PgWireError::UserError(aborted_error()));
         }
         // The text as it is, and the branch call it is, read here once (wire review 13 item 6).
-        let types = message
+        let types: Vec<Option<Type>> = message
             .type_oids
             .iter()
             .map(|o| Type::from_oid(*o))
             .collect();
+        // PostgreSQL's Parse step (exec_parse_message), in its order, before ParseComplete and
+        // before the statement exists (C53, PGDIV-PARSE-REFUSAL-STEP): the raw parse (a syntax or
+        // lexical error, 42601: C40 review LOW 2), then the analysis of a statement it analyses
+        // (a missing relation, an unknown function, a parameter it cannot type). They were found
+        // at Describe or Execute, after ParseComplete and BindComplete.
+        let mut msg = read_parse_message(&message.query).map_err(engine_error)?;
+        let parsed = Parsed::from_message(message.query, &msg);
+        self.parse_step(&parsed, &mut msg, &types)?;
         let id = message.name.unwrap_or_else(|| DEFAULT_NAME.to_owned());
         client
             .portal_store()
-            .put_statement(Arc::new(StoredStatement::new(
-                id,
-                Parsed::new(message.query),
-                types,
-            )));
+            .put_statement(Arc::new(StoredStatement::new(id, parsed, types)));
         client
             .feed(PgWireBackendMessage::ParseComplete(ParseComplete::new()))
             .await?;
@@ -6543,8 +6602,13 @@ mod tests {
                     let describe = per_execution == 0;
                     let calls =
                         execute_unnamed(&s, &mut c, param.then_some(name.as_str()), describe).await;
+                    // FLAGGED TEST EDIT (C53): a statement PostgreSQL analyses is prepared at
+                    // Parse now, from the Parse's one parse, and the round that follows the Parse
+                    // runs that prepare: no call in execution 0, one (the engine's prepare) in
+                    // each later one.
+                    let want = if round == 0 && at_parse > 0 { 0 } else { per_execution };
                     assert_eq!(
-                        calls, per_execution,
+                        calls, want,
                         "{sql:?}: libpg_query calls in execution {round}"
                     );
                     // A create that answered without creating cannot pass as zero calls.
@@ -6555,6 +6619,38 @@ mod tests {
                         );
                     }
                 }
+            }
+        });
+    }
+
+    /// C40 review LOW 6 (C49): a Parse makes at most ONE libpg_query call, whatever its text:
+    /// text that mentions the branch-function prefix and holds a `$` without being a call made
+    /// two (the branch-call parse and the parameter scan), and a statement PostgreSQL analyses at
+    /// Parse is prepared there from the same parse (C53). The fast call form makes none.
+    #[test]
+    fn a_parse_makes_at_most_one_libpg_query_call() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = session(&dir);
+        ok(&s, "CREATE TABLE t(id INT)");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut c = MemClient::new();
+            for (sql, at_most) in [
+                ("SELECT 'turso_branch_' || $1", 1),
+                ("SELECT 'turso_branch_' AS s, $1::int", 1),
+                ("SELECT id FROM t WHERE id = $1 /* turso_branch_ */", 1),
+                ("SELECT turso_branch_current() /* c */", 1),
+                ("SELECT turso_branch_create($1)", 0),
+            ] {
+                let before = turso_pg_parser::libpg_query_calls();
+                s.on_parse(&mut c, Parse::new(None, sql.to_string(), vec![]))
+                    .await
+                    .unwrap();
+                let calls = turso_pg_parser::libpg_query_calls() - before;
+                assert!(calls <= at_most, "{sql:?}: {calls} libpg_query calls at Parse");
+                s.on_sync(&mut c, PgSync::new()).await.unwrap();
             }
         });
     }
@@ -6682,19 +6778,23 @@ mod tests {
                 "SELECT * FROM v8 WHERE x = $1",
             ] {
                 let mut c = MemClient::new();
-                s.on_parse(&mut c, Parse::new(None, sql.to_string(), vec![]))
-                    .await
-                    .unwrap();
+                // FLAGGED TEST EDIT (C53): the statement is analysed at Parse now, as PostgreSQL
+                // analyses it, so the walk runs there and the cycle's statement is refused at
+                // Parse (the engine's circular view); Parse and Describe are counted together,
+                // with the same bound (the Parse's one parse serves the prepare).
                 let before = turso_pg_parser::libpg_query_calls();
-                // The cycle's Describe is refused (the engine's circular view); the walk before
-                // the refusal is what is counted.
-                let _ = s
-                    .on_describe(&mut c, Describe::new(TARGET_TYPE_BYTE_STATEMENT, None))
+                let parsed = s
+                    .on_parse(&mut c, Parse::new(None, sql.to_string(), vec![]))
                     .await;
+                if parsed.is_ok() {
+                    let _ = s
+                        .on_describe(&mut c, Describe::new(TARGET_TYPE_BYTE_STATEMENT, None))
+                        .await;
+                }
                 let calls = turso_pg_parser::libpg_query_calls() - before;
                 assert!(
                     calls <= 9,
-                    "{sql}: {calls} libpg_query calls at Describe, want at most 9"
+                    "{sql}: {calls} libpg_query calls at Parse and Describe, want at most 9"
                 );
             }
         });
