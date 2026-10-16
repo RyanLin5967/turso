@@ -91,6 +91,11 @@ const LEGACY_BRANCH_TABLE: &str = "CREATE TABLE IF NOT EXISTS branch(id INTEGER 
      fork_epoch INTEGER NOT NULL, epoch INTEGER NOT NULL, released INTEGER NOT NULL, \
      lease INTEGER, n_children INTEGER NOT NULL)";
 /// The columns a 17-20 catalog gains at its upgrade (`Catalog::upgrade_links`).
+/// The rows one batch of the upgrade's fill links (`Catalog::upgrade_links_batch`): about five
+/// catalog rows touched per row, so a batch's transaction is bounded whatever the store holds (as
+/// `SETTLE_BATCH` bounds a settle).
+pub(crate) const UPGRADE_BATCH: usize = 64;
+
 const LINK_COLUMNS: [&str; 3] = [
     "ALTER TABLE branch ADD COLUMN sib_lo INTEGER",
     "ALTER TABLE branch ADD COLUMN sib_hi INTEGER",
@@ -551,8 +556,12 @@ pub(crate) struct Catalog {
     /// A `put_meta`'s version, recorded at this handle's commit and dropped at its rollback.
     pending_recorded: Option<u32>,
     link_stmts: Option<LinkStmts>,
-    /// Every row's (id, parent, fork epoch) in the children index's order: the upgrade's fill.
-    child_ids_all: Stmt,
+    /// Rows' (id, parent, fork epoch) in the children index's order, a bounded batch at a time:
+    /// the upgrade's fill (`upgrade_links_batch`) from the start, after a key under the same
+    /// parent, and under the parents above it.
+    child_ids_first: Stmt,
+    child_ids_after: Stmt,
+    child_ids_above: Stmt,
     branch_put: Stmt,
     branch_update: Stmt,
     branch_rekey: Stmt,
@@ -690,7 +699,11 @@ impl Catalog {
             recorded: None,
             pending_recorded: None,
             link_stmts: if links { Some(Self::link_stmts(&conn)?) } else { None },
-            child_ids_all: p("SELECT id, parent, fork_epoch FROM branch ORDER BY parent, fork_epoch")?,
+            child_ids_first: p("SELECT id, parent, fork_epoch FROM branch ORDER BY parent, fork_epoch LIMIT ?1")?,
+            child_ids_after: p(
+                "SELECT id, parent, fork_epoch FROM branch WHERE parent = ?1 AND fork_epoch > ?2 ORDER BY parent, fork_epoch LIMIT ?3",
+            )?,
+            child_ids_above: p("SELECT id, parent, fork_epoch FROM branch WHERE parent > ?1 ORDER BY parent, fork_epoch LIMIT ?2")?,
             meta_all: p("SELECT k, v FROM meta")?,
             meta_put: p("INSERT OR REPLACE INTO meta(k, v) VALUES (?1, ?2)")?,
             meta_del_facts: p("DELETE FROM meta WHERE k >= 10")?,
@@ -789,9 +802,8 @@ impl Catalog {
         })
     }
 
-    /// Whether the `branch` table has the link columns (test builds: their accessor; the store
-    /// reads `links_valid`).
-    #[cfg(test)]
+    /// Whether the `branch` table has the link columns (whether the rows' links are valid is
+    /// `links_valid`).
     pub(crate) fn links(&self) -> bool {
         self.links
     }
@@ -822,44 +834,54 @@ impl Catalog {
         Ok(())
     }
 
-    /// The one-write-path upgrade of a 17-20 catalog (DECISIONS e977c1d010), inside the checkpoint
-    /// writer's transaction: add the link columns, then set every row's links from the rows as they
-    /// stand (in the children index's order, one pass). Kill points `ckpt.upgrade.columns` (the
-    /// columns added, no row linked) and `ckpt.upgrade.rows` (every row linked, before the meta row
-    /// and the commit): a kill at either leaves the catalog as it was, by the transaction.
+    /// The one-write-path upgrade of a 17-20 catalog (DECISIONS e977c1d010) done whole in the
+    /// current transaction: every batch of `upgrade_links_batch` in turn. The checkpoint writer's
+    /// fallback, for a first checkpoint no bounded prefill preceded (links adversary L4).
     pub(crate) fn upgrade_links(&mut self) -> Result<()> {
-        // Columns already there under an older meta row (L2: no build writes that) are filled
-        // like new ones.
+        let mut at = None;
+        while let Some(next) = self.upgrade_links_batch(at, UPGRADE_BATCH)? {
+            at = Some(next);
+        }
+        Ok(())
+    }
+
+    /// One bounded batch of the upgrade's fill (links adversary L4, lead ruling: mutex work must not
+    /// grow with N, f398de1ff0), in the caller's transaction: the link columns first if they are not
+    /// there yet (kill point `ckpt.upgrade.columns`), then the links of at most `n` rows in the
+    /// children index's order after `after` (`None`: from the first), each set from the rows as they
+    /// stand (`relink`; kill point `ckpt.upgrade.rows` after the batch's rows). Returns the last key
+    /// filled, or `None` when the batch reached the last row. The meta row is not touched: the
+    /// version flips only in the checkpoint transaction that commits after the last batch.
+    pub(crate) fn upgrade_links_batch(&mut self, after: Option<(u64, u64)>, n: usize) -> Result<Option<(u64, u64)>> {
         if !self.links {
             for sql in LINK_COLUMNS {
                 self.conn.execute(sql)?;
             }
-        }
-        // Mutant `l4_upgrade_columns_committed_alone` (test builds only): the columns committed in a
-        // transaction of their own (the kill test's fire-check: a kill after it leaves 17 with them).
-        if super::store::fe_mutant("l4_upgrade_columns_committed_alone") {
-            self.conn.execute("COMMIT")?;
-            self.conn.execute("BEGIN")?;
-        }
-        self.refresh_links()?;
-        super::store::kill_point("ckpt.upgrade.columns");
-        let rows = self.child_ids_all.rows(&[], &mut self.counters)?;
-        let rows: Vec<(u64, u64, u64)> =
-            rows.iter().map(|r| Ok((get(r, 0)?, get(r, 1)?, get(r, 2)?))).collect::<Result<_>>()?;
-        let mut newest: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
-        for (i, &(id, parent, f)) in rows.iter().enumerate() {
-            let lo = i.checked_sub(1).map(|j| rows[j]).filter(|r| r.1 == parent).map(|r| r.2);
-            let hi = rows.get(i + 1).filter(|r| r.1 == parent).map(|r| r.2);
-            newest.insert(parent, f);
-            self.set_links(id, Links { lo, hi, child_max: None })?;
-        }
-        for &(id, ..) in &rows {
-            if let Some(&max) = newest.get(&id) {
-                self.set_child_max_of(id, Some(max))?;
+            // Mutant `l4_upgrade_columns_committed_alone` (test builds only): the columns committed
+            // in a transaction of their own (the kill test's fire-check: a kill after it leaves 17
+            // with them).
+            if super::store::fe_mutant("l4_upgrade_columns_committed_alone") {
+                self.conn.execute("COMMIT")?;
+                self.conn.execute("BEGIN")?;
             }
+            self.refresh_links()?;
+            super::store::kill_point("ckpt.upgrade.columns");
+        }
+        let n64 = n as u64;
+        let mut rows = match after {
+            None => self.child_ids_first.rows(&[int(n64)], &mut self.counters)?,
+            Some((p, f)) => self.child_ids_after.rows(&[int(p), int(f), int(n64)], &mut self.counters)?,
+        };
+        if let Some((p, _)) = after.filter(|_| rows.len() < n) {
+            let more = self.child_ids_above.rows(&[int(p), int(n64 - rows.len() as u64)], &mut self.counters)?;
+            rows.extend(more);
+        }
+        let keys: Vec<(u64, u64)> = rows.iter().map(|r| Ok((get(r, 1)?, get(r, 2)?))).collect::<Result<_>>()?;
+        for &(p, f) in &keys {
+            self.relink(p, f)?;
         }
         super::store::kill_point("ckpt.upgrade.rows");
-        Ok(())
+        Ok(if keys.len() < n { None } else { keys.last().copied() })
     }
 
     /// Test builds (links adversary L2): add the link columns alone, committed, leaving the meta
@@ -904,15 +926,6 @@ impl Catalog {
         self.relink(parent, f)
     }
 
-    /// Set `parent`'s newest-child link from the rows (its row's other links kept).
-    fn set_child_max_of(&mut self, parent: u64, max: Option<u64>) -> Result<()> {
-        let rows = self.branch_get.rows(&[int(parent)], &mut self.counters)?;
-        let Some(row) = rows.first() else {
-            return Ok(());
-        };
-        let (lo, hi) = (get_opt(row, 6)?, get_opt(row, 7)?);
-        self.set_links(parent, Links { lo, hi, child_max: max })
-    }
 
     /// Sync this handle's commits in `class`, or in the class it was opened in if that is
     /// stronger: a checkpoint replaces log records that were made durable in `class`, and its

@@ -239,6 +239,8 @@ pub(crate) struct BranchStore {
     /// Threads of fuzzy checkpoints started (F-FZ): joined by `compact_now`, by `Drop`, and once
     /// more than `FLIGHTS_KEPT` accumulate (the oldest is long past its install).
     flights: Mutex<Vec<crate::thread::JoinHandle<()>>>,
+    /// Links adversary L4: the upgrade's fill thread (`run_links_fill`), joined with the flights.
+    links_fill: Mutex<Option<crate::thread::JoinHandle<()>>>,
     /// The confirmation writer (`run_confirm_writer`; review 6 #1) and the process that started it
     /// (a fork(2) child has no such thread to join): `None` for a volatile or trunk-only store, and
     /// if it could not be started (the close then writes the last word).
@@ -1927,6 +1929,17 @@ struct CatState {
     /// A checkpoint has captured and not yet installed: the catalog connection holds a pinned
     /// read snapshot, the catalog free table is not refilled from, and no checkpoint starts.
     flight: bool,
+    /// Links adversary L4 (the upgrade in bounded batches): the fill thread (`run_links_fill`) is
+    /// linking a 17-20 catalog's rows, a batch per transaction on the writer, with this mutex free
+    /// between batches; no checkpoint starts meanwhile, so no row changes under it.
+    filling: bool,
+    /// The last key the fill linked (`None`: none yet). Rows up to it are true as of the last
+    /// batch's commit.
+    links_cursor: Option<(u64, u64)>,
+    /// Every row is linked and no checkpoint has committed since: the next checkpoint flips the meta
+    /// row, relinking only around its own changes. Not kept across opens: an older build may have
+    /// checkpointed in between, so every open fills again from the first row.
+    links_prefilled: bool,
     /// Checkpoint and settle counters (observing only).
     ckpt: CkptCounters,
     /// The part of `trunk_probes`/`trunk_rows` made by `trunk_written_known`'s once-per-page probe
@@ -2236,6 +2249,9 @@ impl CatState {
             generation,
             next_generation: generation + 1,
             flight: false,
+            filling: false,
+            links_cursor: None,
+            links_prefilled: false,
             ckpt: CkptCounters::default(),
             catalog,
             dirty: HashMap::new(),
@@ -3178,6 +3194,8 @@ enum FlightStart {
     Poisoned,
     /// A splice-arm store takes no fuzzy checkpoint (G-b).
     Refused,
+    /// The upgrade's link fill runs (links adversary L4): none starts until it ends.
+    Filling,
     /// The settle, the capture or the thread's spawn failed.
     Failed,
 }
@@ -3204,6 +3222,8 @@ struct Captured {
     /// replaced by an empty one once this commits, so the free table is cleared (every row deleted)
     /// and none is written; `free_cursor`, `taken` and the lists are empty.
     fresh_arena: bool,
+    /// Links adversary L4: the fill linked every row before this capture (`CatState::links_prefilled`).
+    links_prefilled: bool,
     free_list: Vec<Slot>,
     reserved: Vec<Slot>,
     /// Slots freed by early-released operations whose records were not yet durable at the
@@ -3345,12 +3365,19 @@ fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU
         // capture removed, their siblings not yet relinked (a kill there leaves the catalog as it
         // was, by the transaction). Mutant `l4_stale_sibling_link` (test builds only): nothing is
         // relinked (the oracle's plant).
+        // Links adversary L4: the fill thread linked every row in bounded batches before this
+        // capture (`links_prefilled`), so this transaction only flips the meta row and relinks
+        // around its own changes (kill point `ckpt.upgrade.flip`). With no prefill (a checkpoint
+        // that did not wait for one), the whole fill is done here, as before.
         let mut links = Vec::new();
-        let mut upgraded = false;
-        if super::journal::carries_links(cap.meta.format) && !catalog.links_valid() {
+        let flip = super::journal::carries_links(cap.meta.format) && !catalog.links_valid();
+        let upgraded = flip;
+        if flip && !(cap.links_prefilled && catalog.links()) {
             catalog.upgrade_links()?;
-            upgraded = true;
-        } else if catalog.links_valid() && !fe_mutant("l4_stale_sibling_link") {
+        } else if (catalog.links_valid() || flip) && !fe_mutant("l4_stale_sibling_link") {
+            if flip {
+                kill_point("ckpt.upgrade.flip");
+            }
             // Mutant `l4_unlinked_committed_first` (test builds only): the removals committed before
             // their siblings are relinked (the `ckpt.unlinked` kill test's plant, links adversary).
             if fe_mutant("l4_unlinked_committed_first") {
@@ -3679,6 +3706,58 @@ impl Drop for CutGate<'_> {
     }
 }
 
+/// Links adversary L4 (lead ruling: the upgrade's fill in BOUNDED BATCHES with the store mutex free
+/// between them): link a 17-20 catalog's rows, `UPGRADE_BATCH` per transaction on the checkpoint
+/// writer, committed one by one (kill point `ckpt.upgrade.batch` after each commit), the meta row
+/// untouched: a kill between batches leaves the store at its version, with link columns its meta
+/// row says nothing about (L2: not read), which the next open fills again. The store mutex is taken
+/// only to read and move the cursor. No checkpoint starts while it runs (`CatState::filling`), so
+/// no row changes under it; the next one flips the meta row (`checkpoint_write`).
+fn run_links_fill(shared: &StoreMutex, writer: &Mutex<Catalog>) {
+    loop {
+        let cursor = {
+            let inner = shared.lock();
+            match inner.cat.as_ref() {
+                Some(c) if c.filling => c.links_cursor,
+                _ => return,
+            }
+        };
+        let batch = {
+            let mut w = writer.lock();
+            let done = w.begin().and_then(|()| w.upgrade_links_batch(cursor, super::catalog::UPGRADE_BATCH)).and_then(|next| {
+                w.commit()?;
+                Ok(next)
+            });
+            if done.is_err() {
+                w.rollback();
+                let _ = w.refresh_links();
+            }
+            done
+        };
+        if batch.is_ok() {
+            kill_point("ckpt.upgrade.batch");
+        }
+        let mut inner = shared.lock();
+        let Some(cat) = inner.cat.as_mut() else {
+            return;
+        };
+        match batch {
+            Ok(Some(next)) if cat.filling => cat.links_cursor = Some(next),
+            Ok(None) if cat.filling => {
+                cat.links_prefilled = true;
+                cat.filling = false;
+                return;
+            }
+            Ok(_) => return,
+            Err(e) => {
+                tracing::warn!("branch catalog link fill stopped: {e}");
+                cat.filling = false;
+                return;
+            }
+        }
+    }
+}
+
 /// A fuzzy checkpoint's cut, after its catalog commit and before its install, holding no lock but
 /// briefly the store mutex (lead review 1 item 7, review 2 #5): wait — not holding the mutex — for
 /// no flight to be in the air; then stop group flights (`cutting`) and copy the kept part of the
@@ -3999,6 +4078,7 @@ impl BranchStore {
             inner: Arc::new(StoreMutex::new(StoreInner::fresh(None, SyncClass::Off, None))),
             prewarm: PrewarmStats::default(),
             flights: Mutex::new(Vec::new()),
+            links_fill: Mutex::new(None),
             confirm_writer: Mutex::new(None),
             name_filter_build: Mutex::new(None),
             name_filter_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -4305,6 +4385,7 @@ impl BranchStore {
             inner: Arc::new(StoreMutex::new(inner)),
             prewarm: warmed,
             flights: Mutex::new(Vec::new()),
+            links_fill: Mutex::new(None),
             confirm_writer: Mutex::new(None),
             name_filter_build: Mutex::new(None),
             name_filter_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -5765,6 +5846,12 @@ impl BranchStore {
         if !inner.journal.as_ref().is_some_and(|j| j.wants_compaction()) {
             return;
         }
+        // Links adversary L4: a 17-20 catalog's first checkpoint waits for its rows' links, which a
+        // thread of its own fills in bounded batches (this operation only starts it). Meanwhile no
+        // checkpoint runs and the log grows, past the hard limit too: the fill is bounded work.
+        if self.links_fill_gate(inner) {
+            return;
+        }
         if inner.cat.is_none() || !self.fuzzy {
             // A compaction that syncs (a D1 or D2 store's, a raised D0 store's) leaves this
             // operation's acknowledgement path (DECISIONS c9c821dd8d): a snapshot store's is owed
@@ -5835,6 +5922,9 @@ impl BranchStore {
             None => return FlightStart::NotCatalog,
             Some(c) if c.flight => return FlightStart::InFlight,
             Some(_) => {}
+        }
+        if self.links_fill_gate(inner) {
+            return FlightStart::Filling;
         }
         if inner.poisoned() {
             return FlightStart::Poisoned;
@@ -5996,7 +6086,66 @@ impl BranchStore {
 
     /// Wait for every fuzzy checkpoint thread started so far (F-FZ). Called without the store
     /// mutex: a thread in flight takes it for its install.
+    /// Links adversary L4: whether a 17-20 catalog's first checkpoint must wait for the link fill
+    /// (it runs, or is started here). Under the store mutex; a failed start is logged and the
+    /// checkpoint then fills every row in its own transaction, as before. Mutant
+    /// `l4_upgrade_unbatched` (test builds only): never waits, the whole fill under the mutex.
+    fn links_fill_gate(&self, inner: &mut StoreInner) -> bool {
+        let format = super::journal::format_version(inner.splice);
+        let Some(cat) = inner.cat.as_mut() else {
+            return false;
+        };
+        if cat.filling {
+            return true;
+        }
+        if cat.links_prefilled
+            || !super::journal::carries_links(format)
+            || cat.catalog.links_valid()
+            || fe_mutant("l4_upgrade_unbatched")
+        {
+            return false;
+        }
+        cat.filling = true;
+        cat.links_cursor = None;
+        let (shared, writer) = (self.inner.clone(), cat.writer.clone());
+        let spawned = crate::thread::Builder::new()
+            .name("branch-links-fill".to_string())
+            .spawn(move || run_links_fill(&shared, &writer));
+        match spawned {
+            Ok(handle) => {
+                *self.links_fill.lock() = Some(handle);
+                true
+            }
+            Err(e) => {
+                tracing::warn!("branch catalog link fill not started: {e}");
+                cat.filling = false;
+                false
+            }
+        }
+    }
+
+    /// Start the link fill if a checkpoint must wait for it, and wait for it, without the store
+    /// mutex (an explicit checkpoint's caller waits; nothing on an acknowledgement path does).
+    fn finish_links_fill(&self) {
+        {
+            let mut inner = self.inner.lock();
+            self.links_fill_gate(&mut inner);
+        }
+        let fill = self.links_fill.lock().take();
+        if let Some(handle) = fill {
+            if handle.join().is_err() {
+                tracing::warn!("the branch catalog's link fill thread panicked");
+            }
+        }
+    }
+
     fn join_flights(&self) {
+        let fill = self.links_fill.lock().take();
+        if let Some(handle) = fill {
+            if handle.join().is_err() {
+                tracing::warn!("the branch catalog's link fill thread panicked");
+            }
+        }
         let handles = std::mem::take(&mut *self.flights.lock());
         for handle in handles {
             if handle.join().is_err() {
@@ -8523,6 +8672,7 @@ impl BranchStore {
     }
 
     pub(crate) fn compact_now(&self) -> Result<()> {
+        self.finish_links_fill();
         // A fuzzy checkpoint in flight finishes first: the sharp one may not overlap it (F-FZ). One
         // another thread starts after the join is waited for once more; then this refuses.
         let mut attempts = 0;
@@ -8569,6 +8719,7 @@ impl BranchStore {
             self.compact_now()?;
             return Ok(true);
         }
+        self.finish_links_fill();
         let installed = || *self.installs.0.lock().unwrap_or_else(|e| e.into_inner());
         let started = Instant::now();
         let mut pause = Duration::from_millis(1);
@@ -8951,6 +9102,7 @@ impl BranchStore {
     /// starts nothing. `Ok(false)`: nothing started (parked Commits remain, one is in flight, or
     /// this is not a catalog store).
     pub(crate) fn checkpoint_fuzzy_now(&self) -> Result<bool> {
+        self.finish_links_fill();
         let mut inner = self.inner.lock();
         // Mutant `plant_premise_only` (test builds only): the mutant runner's planted control
         // (its flagged-edit judge, 2026-10-06T14:45:43Z). It starts nothing, which trips only the
@@ -8998,6 +9150,11 @@ impl Drop for BranchStore {
         self.flight_hold.store(0, Ordering::Release);
         #[cfg(test)]
         self.group.confirm_hold.store(0, Ordering::Release);
+        // The link fill stops after the batch it is in (links adversary L4): the next open fills
+        // again from the first row.
+        if let Some(cat) = self.inner.lock().cat.as_mut() {
+            cat.filling = false;
+        }
         self.join_flights();
         // The name filter's build holds the store's files too: stopped, then joined.
         self.name_filter_stop.store(true, Ordering::Release);
@@ -10155,8 +10312,9 @@ impl StoreInner {
         let Some(cat) = self.cat.as_ref() else {
             return Ok(());
         };
-        if cat.flight {
-            // A fuzzy checkpoint is between its capture and its install; this one would overlap it.
+        if cat.flight || cat.filling {
+            // A fuzzy checkpoint is between its capture and its install, or the upgrade's link fill
+            // runs (links adversary L4); this one would overlap it.
             return Err(LimboError::Busy);
         }
         let t = Instant::now();
@@ -10457,6 +10615,7 @@ impl StoreInner {
             free_cursor: cat.free_cursor,
             free_exhausted: cat.free_exhausted,
             fresh_arena: false,
+            links_prefilled: cat.links_prefilled,
             taken: cat.taken.iter().copied().collect(),
             free_list: arena.free_list().to_vec(),
             reserved,
