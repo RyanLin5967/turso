@@ -13747,6 +13747,20 @@ fn c52_view_of_integer_constant_retains_its_type() {
 }
 
 
+// PG18.6: c54-pg18-boundaries.out, commands 6, 7, 8.
+#[test]
+fn c54_derived_alias_wrapper_does_not_shadow_case_folded_table_names() {
+    let dir = Scratch::new("c54-derived-alias-name");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE \"__TURSO_PG_DERIVED_COLUMNS\"(v INT)").ok("fixture");
+    a.q("INSERT INTO \"__TURSO_PG_DERIVED_COLUMNS\" VALUES(7)").ok("fixture row");
+    let sql = "SELECT a FROM(SELECT v FROM \"__TURSO_PG_DERIVED_COLUMNS\")t(a)";
+    let reply = a.q(sql).ok(sql);
+    assert_eq!(reply.oids, Some(vec![23]));
+    assert_eq!(reply.rows, vec![vec![Some("7".into())]]);
+}
+
 #[test]
 fn c54_derived_column_lists_rename_positions() {
     let dir = Scratch::new("c54-derived-alias");
