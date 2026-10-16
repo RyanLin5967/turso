@@ -1,0 +1,25 @@
+{
+  "postgres_version": "postgres (PostgreSQL) 18.6 (Homebrew)",
+  "canonical_raw_bank": "009dcc896d",
+  "raw_bundle_sha256": "323ca2bbd8ea158221c5812f08d63e450f34a1141d40f89498527ec784654eff",
+  "recording_status": "Fresh PG18.6 success before rename, after rename and after full restart; derive assertions only after canonical bank",
+  "candidate_status": "UNRUN; no normalization producer change",
+  "files": [
+    {
+      "path": "postgres/cli/tests/pg18/c52-derived-view-alias.sql",
+      "sha256": "29e24201cc33dd2b84ccae5ba23bc6c215ab3dd5130a6eaad48dcdb71c5c8eb7"
+    },
+    {
+      "path": "postgres/cli/tests/pg18/c52-derived-view-alias.txt",
+      "sha256": "0ab457258e1e98578c49315579c0a26803570d4a8ff60a91989d4035461c2427"
+    },
+    {
+      "path": "postgres/cli/tests/pg18/c52-derived-view-alias-reopen.sql",
+      "sha256": "5e390bbc86e895319edf717e478c8e50afdfbee5c91894f1cc0eaad1aab4c589"
+    },
+    {
+      "path": "postgres/cli/tests/pg18/c52-derived-view-alias-reopen.txt",
+      "sha256": "52b0df9c09a715eba99a0b74f6ad05751fc5ba63a07428faddf39b6c129e2c51"
+    }
+  ]
+}
