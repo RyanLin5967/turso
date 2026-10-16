@@ -137,6 +137,7 @@ struct LateralScope {
     order: Vec<String>,
     /// Whether a join of the FROM merges columns (NATURAL, USING): a `*` is then left whole.
     merged: bool,
+    relations: Vec<(String, Option<Vec<String>>)>,
 }
 
 impl PostgreSQLTranslator {
@@ -184,7 +185,10 @@ impl PostgreSQLTranslator {
     /// The columns `rv` declares, renamed by its alias's column list; None when they cannot be
     /// read.
     fn columns_of(&self, rv: &pg_query::protobuf::RangeVar) -> Option<Vec<String>> {
-        let mut columns = self.columns.as_ref()?(&rv.schemaname, &rv.relname)?;
+        let mut columns = match self.cte_in_scope(rv) {
+            Some(columns) => columns?,
+            None => self.columns.as_ref()?(&rv.schemaname, &rv.relname)?,
+        };
         if let Some(alias) = &rv.alias {
             rename_columns(&mut columns, &alias.colnames);
         }
@@ -2466,6 +2470,11 @@ impl PostgreSQLTranslator {
         }
         // Each leaf in a LATERAL scope of its own (wire review 2 item 6).
         self.in_select_scope(|| {
+            let mut relations = Vec::new();
+            for item in &select.from_clause {
+                self.using_relations(item, &mut relations);
+            }
+            self.lateral_scopes.borrow_mut().last_mut().unwrap().relations = relations;
             let from_clause = if !select.from_clause.is_empty() {
                 Some(self.translate_from_items(&select.from_clause)?)
             } else {
@@ -3022,13 +3031,8 @@ impl PostgreSQLTranslator {
         ))
     }
 
-    /// The (table name, column) of the correlated generate_series call `col_ref` reads, if it reads
-    /// one (see `translate_range_function`). `alias.column` reads the innermost SELECT's whose FROM
-    /// names `alias`. A bare `column` reads only its own SELECT's: in a nested SELECT it may be a
-    /// column of that SELECT's own relations, which only the engine knows, so it is left to the
-    /// engine, which reads it from them or fails it as unknown, never from the outer series (which
-    /// the engine names `value`). Two series columns of one name in one SELECT make a bare reference
-    /// to it ambiguous (42702), as in PostgreSQL (gap review item 1).
+    /// Resolve a series column from the innermost visible scope. Ordinary columns shadow outer
+    /// series columns; an unreadable relation stops the outward search rather than guessing.
     fn series_column(
         &self,
         col_ref: &pg_query::protobuf::ColumnRef,
@@ -3041,17 +3045,37 @@ impl PostgreSQLTranslator {
         let scopes = self.lateral_scopes.borrow();
         match col_ref.fields.as_slice() {
             [column] => {
-                let (Some(column), Some(scope)) = (name(column), scopes.last()) else {
+                let Some(column) = name(column) else {
                     return Ok(None);
                 };
-                let mut tables = scope.series.iter().filter(|(_, c)| *c == column);
-                match (tables.next(), tables.next()) {
-                    (Some((table, _)), None) => Ok(Some((table.clone(), column))),
-                    (Some(_), Some(_)) => Err(ParseError::ParseError(SqlErrorMessage::classified(SqlErrorKind::AmbiguousColumn, format!(
-                        "column reference \"{column}\" is ambiguous"
-                    )))),
-                    _ => Ok(None),
+                for scope in scopes.iter().rev() {
+                    let mut tables = scope.series.iter().filter(|(_, c)| *c == column);
+                    let first = tables.next();
+                    let ordinary = scope.relations.iter().filter(|(table, _)| {
+                        !scope.series.iter().any(|(series, _)| series == table)
+                    });
+                    let ordinary_column = ordinary.clone().any(|(_, columns)| {
+                        columns.as_ref().is_some_and(|cols| cols.contains(&column))
+                    });
+                    if first.is_some() && (tables.next().is_some() || ordinary_column) {
+                        return Err(ParseError::ParseError(SqlErrorMessage::classified(
+                            SqlErrorKind::AmbiguousColumn,
+                            format!("column reference \"{column}\" is ambiguous"),
+                        )));
+                    }
+                    if ordinary_column {
+                        return Ok(None);
+                    }
+                    if let Some((table, _)) = first {
+                        return Ok(Some((table.clone(), column)));
+                    }
+                    if scope.names.contains(&column)
+                        || ordinary.clone().any(|(_, columns)| columns.is_none())
+                    {
+                        return Ok(None);
+                    }
                 }
+                Ok(None)
             }
             [table, column] => {
                 let (Some(table), Some(column)) = (name(table), name(column)) else {
