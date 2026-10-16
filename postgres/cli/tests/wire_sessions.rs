@@ -13817,6 +13817,44 @@ fn c54_virtual_batch_keeps_trailing_generated_identifier() {
     assert_eq!(a.q(sql).single(sql), "1");
 }
 
+/// PG18.6 preserves the row at depth 1000 (c54-pg18-depth.out). Our shared stack
+/// bound may refuse that depth, but an accepted CREATE must remain safe when a
+/// much shorter ALTER clones and deparses its retained definition.
+#[test]
+fn c54_deep_virtual_definition_survives_short_constraint_rebuild() {
+    let dir = Scratch::new("c54-virtual-depth");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let expression = format!("{}a{}", "abs(".repeat(1000), ")".repeat(1000));
+    let create = format!("CREATE TABLE vd(a INT,b INT GENERATED ALWAYS AS({expression}) VIRTUAL)");
+    let mut completed = true;
+    for (stage, sql) in [
+        ("create", create.as_str()),
+        ("insert", "INSERT INTO vd(a) VALUES(3)"),
+        ("rebuild", "ALTER TABLE vd ADD CONSTRAINT ck CHECK(a>=0)"),
+    ] {
+        let reply = a.q(sql);
+        if let Some(error) = reply.error {
+            assert_eq!(error.code, "54001", "{stage}: {error:?}");
+            eprintln!("C54 deep virtual {stage}: typed 54001");
+            completed = false;
+            break;
+        }
+        eprintln!("C54 deep virtual {stage}: accepted");
+    }
+    if completed {
+        let reply = a.q("SELECT a,b FROM vd");
+        if let Some(error) = reply.error {
+            assert_eq!(error.code, "54001", "deep generated value: {error:?}");
+        } else {
+            assert_eq!(reply.oids, Some(vec![23, 23]));
+            assert_eq!(reply.rows, vec![vec![Some("3".into()), Some("3".into())]]);
+        }
+    }
+    assert_eq!(a.q("SELECT 1").single("same session survives"), "1");
+    assert_eq!(server.connect().q("SELECT 1").single("server survives"), "1");
+}
+
 
 #[test]
 fn c54_nested_function_relation_does_not_hide_outer_series_column() {
