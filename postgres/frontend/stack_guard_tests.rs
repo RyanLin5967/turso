@@ -147,3 +147,38 @@ fn diag_postgresql_route_refusals_by_depth() {
         }
     }
 }
+
+
+/// PG 18.6 answers this statement: the protobuf codec must not add its own smaller limit.
+#[test]
+fn a_thousand_nested_scalar_subqueries_answer_one() {
+    if run_child() {
+        return;
+    }
+    let test = "stack_guard_tests::a_thousand_nested_scalar_subqueries_answer_one";
+    let sql = format!("SELECT {}1{}", "(SELECT ".repeat(1000), ")".repeat(1000));
+    let got = in_child(test, 8 * 1024, &sql);
+    assert_eq!(got, "ok [[Numeric(Integer(1))]]", "PG 18.6 answers 1 at depth 1000");
+}
+
+#[test]
+fn three_thousand_nested_scalar_subqueries_keep_the_stack_refusal() {
+    if run_child() {
+        return;
+    }
+    let test = "stack_guard_tests::three_thousand_nested_scalar_subqueries_keep_the_stack_refusal";
+    let sql = format!("SELECT {}1{}", "(SELECT ".repeat(3000), ")".repeat(3000));
+    let got = in_child(test, 8 * 1024, &sql);
+    assert_eq!(got, "err StackDepthLimitExceeded", "PG 18.6 gives SQLSTATE 54001 at depth 3000");
+}
+
+#[test]
+fn ten_thousand_nested_scalar_subqueries_keep_the_parser_refusal() {
+    if run_child() {
+        return;
+    }
+    let test = "stack_guard_tests::ten_thousand_nested_scalar_subqueries_keep_the_parser_refusal";
+    let sql = format!("SELECT {}1{}", "(SELECT ".repeat(10000), ")".repeat(10000));
+    let got = in_child(test, 8 * 1024, &sql);
+    assert!(got.starts_with("err ParseError(") && got.contains("memory exhausted"), "PG 18.6 gives SQLSTATE 42601 at depth 10000: {got}");
+}
