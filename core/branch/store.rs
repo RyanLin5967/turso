@@ -1495,7 +1495,7 @@ impl StoreMutex {
         #[cfg(test)]
         STORE_HELD.with(|held| held.set(held.get() + 1));
         #[cfg(test)]
-        SCOPE.with(|s| s.borrow_mut().push(self.counts.clone()));
+        scope_push(&self.counts);
         // fastest-budgets instrument (test builds): acquisitions, and what is done while held.
         #[cfg(test)]
         super::budget_probe::store_locked_at(site);
@@ -1524,7 +1524,7 @@ impl Drop for StoreGuard<'_> {
         STORE_HELD.with(|held| held.set(held.get() - 1));
         // Recorded while the store is still the innermost scope (the hold audit is per store).
         super::budget_probe::store_unlocked();
-        SCOPE.with(|s| s.borrow_mut().pop());
+        scope_pop();
     }
 }
 
@@ -1586,19 +1586,55 @@ pub(crate) struct StoreCounts {
 /// Test builds: the innermost store this thread works for, as an identity (0: none).
 #[cfg(test)]
 pub(crate) fn scope_store_id() -> usize {
-    SCOPE.with(|s| s.borrow().last().map_or(0, |c| Arc::as_ptr(c) as usize))
+    scope_top().map_or(0, |c| c as *const StoreCounts as usize)
 }
 
 /// Test builds: the innermost store this thread works for is the audited one.
 #[cfg(test)]
 pub(crate) fn scope_is_audited() -> bool {
-    SCOPE.with(|s| s.borrow().last().is_some_and(|c| c.audited.load(Ordering::Relaxed)))
+    scope_top().is_some_and(|c| c.audited.load(Ordering::Relaxed))
 }
 
 #[cfg(test)]
 thread_local! {
     /// The stores whose work this thread is doing, innermost last (test builds).
-    static SCOPE: std::cell::RefCell<Vec<Arc<StoreCounts>>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// The stores whose work this thread is doing, innermost last, as pointers into their
+    /// `StoreCounts` (each kept alive by its scope's owner: the guard's `StoreMutex`, a
+    /// `CountScope`'s caller), with the depth. A fixed array, so entering a scope allocates nothing:
+    /// a `Vec` here allocated at a thread's first lock, and the threads an open starts (its
+    /// confirmation writer, its name filter's build) then ran longer, which doubled the budgets'
+    /// recovery_open thread_new refusals (raws tn-head1..3, the names in tn-names-head.txt).
+    static SCOPE: std::cell::Cell<(usize, [usize; SCOPE_DEPTH])> = const { std::cell::Cell::new((0, [0; SCOPE_DEPTH])) };
+}
+
+#[cfg(test)]
+const SCOPE_DEPTH: usize = 16;
+
+#[cfg(test)]
+fn scope_push(counts: &Arc<StoreCounts>) {
+    SCOPE.with(|s| {
+        let (n, mut a) = s.get();
+        assert!(n < SCOPE_DEPTH, "store count scopes nested past {SCOPE_DEPTH}");
+        a[n] = Arc::as_ptr(counts) as usize;
+        s.set((n + 1, a));
+    });
+}
+
+#[cfg(test)]
+fn scope_pop() {
+    SCOPE.with(|s| {
+        let (n, a) = s.get();
+        s.set((n.saturating_sub(1), a));
+    });
+}
+
+#[cfg(test)]
+fn scope_top() -> Option<&'static StoreCounts> {
+    let (n, a) = SCOPE.with(std::cell::Cell::get);
+    // SAFETY: an entry is pushed by a scope whose owner keeps its `Arc<StoreCounts>` alive, and is
+    // popped before that owner lets it go (`StoreGuard`, `CountScope`); the reference is used only
+    // within the call that read it.
+    (n > 0).then(|| unsafe { &*(a[n - 1] as *const StoreCounts) })
 }
 
 /// Test builds: counts made in no store's scope (a coverage gap, never expected).
@@ -1612,7 +1648,7 @@ pub(crate) struct CountScope;
 #[cfg(test)]
 impl CountScope {
     pub(crate) fn enter(counts: &Arc<StoreCounts>) -> Self {
-        SCOPE.with(|s| s.borrow_mut().push(counts.clone()));
+        scope_push(counts);
         CountScope
     }
 }
@@ -1620,14 +1656,14 @@ impl CountScope {
 #[cfg(test)]
 impl Drop for CountScope {
     fn drop(&mut self) {
-        SCOPE.with(|s| s.borrow_mut().pop());
+        scope_pop();
     }
 }
 
 /// Test builds: add `n` to one counter of the innermost store this thread works for.
 #[cfg(test)]
 fn count_in_scope(field: impl Fn(&StoreCounts) -> &AtomicU64, n: u64) {
-    let counted = SCOPE.with(|s| s.borrow().last().map(|c| field(c).fetch_add(n, Ordering::Relaxed)).is_some());
+    let counted = scope_top().map(|c| field(c).fetch_add(n, Ordering::Relaxed)).is_some();
     if !counted {
         UNSCOPED.fetch_add(1, Ordering::Relaxed);
     }
@@ -1638,7 +1674,7 @@ fn count_in_scope(field: impl Fn(&StoreCounts) -> &AtomicU64, n: u64) {
 /// or a gap), it is this thread's own (`OWN_BARE_SYNCS`) and a gap (`UNSCOPED`).
 #[cfg(test)]
 pub(crate) fn note_branch_sync(kind: usize) {
-    if SCOPE.with(|s| s.borrow().is_empty()) {
+    if scope_top().is_none() {
         OWN_BARE_SYNCS.with(|b| b[kind].set(b[kind].get() + 1));
     }
     count_in_scope(|c| &c.syncs[kind], 1);
