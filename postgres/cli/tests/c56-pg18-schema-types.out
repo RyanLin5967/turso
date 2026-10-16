@@ -1,0 +1,27 @@
+>> Q DROP SCHEMA public
+   C DROP SCHEMA
+   Z I
+>> Q CREATE DOMAIN c56_domain AS integer
+   E S=ERROR C=3F000 M=no schema has been selected to create in
+   Z I
+>> Q CREATE DOMAIN public.c56_domain AS integer
+   E S=ERROR C=3F000 M=schema "public" does not exist
+   Z I
+>> Q CREATE TYPE c56_enum AS ENUM ('a')
+   E S=ERROR C=3F000 M=no schema has been selected to create in
+   Z I
+>> Q CREATE TYPE public.c56_enum AS ENUM ('a')
+   E S=ERROR C=3F000 M=schema "public" does not exist
+   Z I
+>> Q CREATE SEQUENCE c56_sequence
+   E S=ERROR C=3F000 M=no schema has been selected to create in
+   Z I
+>> Q CREATE SEQUENCE public.c56_sequence
+   E S=ERROR C=3F000 M=schema "public" does not exist
+   Z I
+>> Q CREATE TABLE c56_table AS SELECT 1 AS n
+   E S=ERROR C=3F000 M=no schema has been selected to create in
+   Z I
+>> Q CREATE SCHEMA public
+   C CREATE SCHEMA
+   Z I
