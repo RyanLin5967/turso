@@ -13226,3 +13226,215 @@ fn c44_lock_timeout_int32_max_is_accepted() {
     a.q("SET lock_timeout=2147483647").ok("maximum accepted timeout");
     assert_eq!(a.q("SHOW lock_timeout").single("timeout"), "2147483647ms");
 }
+
+// C50: each row is recorded in pg18/pg18-c33-intrange.out.
+#[test]
+fn c50_int8_cast_before_negation() {
+    let dir = Scratch::new("c50-int8_cast_before_negation");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE big(v BIGINT, i INT)").ok("typed operands");
+    a.q("INSERT INTO big VALUES (9223372036854775807, 2147483647), (1, 1)")
+        .ok("boundary operands");
+    let sql = "SELECT -9223372036854775808::int8";
+    let reply = a.q(sql);
+    let e = reply.err(sql);
+    assert_eq!((e.code.as_str(), e.message.as_str()), ("22003", "bigint out of range"), "{sql}");
+}
+
+#[test]
+fn c50_int8_min_abs() {
+    let dir = Scratch::new("c50-int8_min_abs");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE big(v BIGINT, i INT)").ok("typed operands");
+    a.q("INSERT INTO big VALUES (9223372036854775807, 2147483647), (1, 1)")
+        .ok("boundary operands");
+    let sql = "SELECT abs(-9223372036854775808::int8)";
+    let reply = a.q(sql);
+    let e = reply.err(sql);
+    assert_eq!((e.code.as_str(), e.message.as_str()), ("22003", "bigint out of range"), "{sql}");
+}
+
+#[test]
+fn c50_int8_text_cast() {
+    let dir = Scratch::new("c50-int8_text_cast");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE big(v BIGINT, i INT)").ok("typed operands");
+    a.q("INSERT INTO big VALUES (9223372036854775807, 2147483647), (1, 1)")
+        .ok("boundary operands");
+    let sql = "SELECT '9223372036854775808'::int8";
+    let reply = a.q(sql);
+    let e = reply.err(sql);
+    assert_eq!((e.code.as_str(), e.message.as_str()), ("22003", "value \"9223372036854775808\" is out of range for type bigint"), "{sql}");
+}
+
+#[test]
+fn c50_int8_constant_add() {
+    let dir = Scratch::new("c50-int8_constant_add");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE big(v BIGINT, i INT)").ok("typed operands");
+    a.q("INSERT INTO big VALUES (9223372036854775807, 2147483647), (1, 1)")
+        .ok("boundary operands");
+    let sql = "SELECT 9223372036854775807 + 1";
+    let reply = a.q(sql);
+    let e = reply.err(sql);
+    assert_eq!((e.code.as_str(), e.message.as_str()), ("22003", "bigint out of range"), "{sql}");
+}
+
+#[test]
+fn c50_int8_column_add() {
+    let dir = Scratch::new("c50-int8_column_add");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE big(v BIGINT, i INT)").ok("typed operands");
+    a.q("INSERT INTO big VALUES (9223372036854775807, 2147483647), (1, 1)")
+        .ok("boundary operands");
+    let sql = "SELECT v + 1 FROM big WHERE v > 1";
+    let reply = a.q(sql);
+    let e = reply.err(sql);
+    assert_eq!((e.code.as_str(), e.message.as_str()), ("22003", "bigint out of range"), "{sql}");
+}
+
+#[test]
+fn c50_int8_column_mul() {
+    let dir = Scratch::new("c50-int8_column_mul");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE big(v BIGINT, i INT)").ok("typed operands");
+    a.q("INSERT INTO big VALUES (9223372036854775807, 2147483647), (1, 1)")
+        .ok("boundary operands");
+    let sql = "SELECT v * 2 FROM big WHERE v > 1";
+    let reply = a.q(sql);
+    let e = reply.err(sql);
+    assert_eq!((e.code.as_str(), e.message.as_str()), ("22003", "bigint out of range"), "{sql}");
+}
+
+#[test]
+fn c50_int8_column_neg_sub() {
+    let dir = Scratch::new("c50-int8_column_neg_sub");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE big(v BIGINT, i INT)").ok("typed operands");
+    a.q("INSERT INTO big VALUES (9223372036854775807, 2147483647), (1, 1)")
+        .ok("boundary operands");
+    let sql = "SELECT -v - 2 FROM big WHERE v > 1";
+    let reply = a.q(sql);
+    let e = reply.err(sql);
+    assert_eq!((e.code.as_str(), e.message.as_str()), ("22003", "bigint out of range"), "{sql}");
+}
+
+#[test]
+fn c50_int4_constant_add() {
+    let dir = Scratch::new("c50-int4_constant_add");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE big(v BIGINT, i INT)").ok("typed operands");
+    a.q("INSERT INTO big VALUES (9223372036854775807, 2147483647), (1, 1)")
+        .ok("boundary operands");
+    let sql = "SELECT 2147483647::int4 + 1";
+    let reply = a.q(sql);
+    let e = reply.err(sql);
+    assert_eq!((e.code.as_str(), e.message.as_str()), ("22003", "integer out of range"), "{sql}");
+}
+
+#[test]
+fn c50_int4_column_add() {
+    let dir = Scratch::new("c50-int4_column_add");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE big(v BIGINT, i INT)").ok("typed operands");
+    a.q("INSERT INTO big VALUES (9223372036854775807, 2147483647), (1, 1)")
+        .ok("boundary operands");
+    let sql = "SELECT i + 1 FROM big WHERE v > 1";
+    let reply = a.q(sql);
+    let e = reply.err(sql);
+    assert_eq!((e.code.as_str(), e.message.as_str()), ("22003", "integer out of range"), "{sql}");
+}
+
+#[test]
+fn c50_int4_column_mul() {
+    let dir = Scratch::new("c50-int4_column_mul");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE big(v BIGINT, i INT)").ok("typed operands");
+    a.q("INSERT INTO big VALUES (9223372036854775807, 2147483647), (1, 1)")
+        .ok("boundary operands");
+    let sql = "SELECT i * 2 FROM big WHERE v > 1";
+    let reply = a.q(sql);
+    let e = reply.err(sql);
+    assert_eq!((e.code.as_str(), e.message.as_str()), ("22003", "integer out of range"), "{sql}");
+}
+
+#[test]
+fn c50_int4_text_cast() {
+    let dir = Scratch::new("c50-int4_text_cast");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE big(v BIGINT, i INT)").ok("typed operands");
+    a.q("INSERT INTO big VALUES (9223372036854775807, 2147483647), (1, 1)")
+        .ok("boundary operands");
+    let sql = "SELECT '2147483648'::int4";
+    let reply = a.q(sql);
+    let e = reply.err(sql);
+    assert_eq!((e.code.as_str(), e.message.as_str()), ("22003", "value \"2147483648\" is out of range for type integer"), "{sql}");
+}
+
+#[test]
+fn c50_int2_constant_add() {
+    let dir = Scratch::new("c50-int2_constant_add");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE big(v BIGINT, i INT)").ok("typed operands");
+    a.q("INSERT INTO big VALUES (9223372036854775807, 2147483647), (1, 1)")
+        .ok("boundary operands");
+    let sql = "SELECT 32767::int2 + 1::int2";
+    let reply = a.q(sql);
+    let e = reply.err(sql);
+    assert_eq!((e.code.as_str(), e.message.as_str()), ("22003", "smallint out of range"), "{sql}");
+}
+
+#[test]
+fn c50_int8_numeric_cast() {
+    let dir = Scratch::new("c50-int8_numeric_cast");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE big(v BIGINT, i INT)").ok("typed operands");
+    a.q("INSERT INTO big VALUES (9223372036854775807, 2147483647), (1, 1)")
+        .ok("boundary operands");
+    let sql = "SELECT CAST(9.5e18 AS BIGINT)";
+    let reply = a.q(sql);
+    let e = reply.err(sql);
+    assert_eq!((e.code.as_str(), e.message.as_str()), ("22003", "bigint out of range"), "{sql}");
+}
+
+#[test]
+fn c50_int4_numeric_cast() {
+    let dir = Scratch::new("c50-int4_numeric_cast");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE big(v BIGINT, i INT)").ok("typed operands");
+    a.q("INSERT INTO big VALUES (9223372036854775807, 2147483647), (1, 1)")
+        .ok("boundary operands");
+    let sql = "SELECT CAST(3e9 AS INT)";
+    let reply = a.q(sql);
+    let e = reply.err(sql);
+    assert_eq!((e.code.as_str(), e.message.as_str()), ("22003", "integer out of range"), "{sql}");
+}
+
+#[test]
+fn c50_int4_insert() {
+    let dir = Scratch::new("c50-int4_insert");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE big(v BIGINT, i INT)").ok("typed operands");
+    a.q("INSERT INTO big VALUES (9223372036854775807, 2147483647), (1, 1)")
+        .ok("boundary operands");
+    let sql = "INSERT INTO big VALUES (1, 2147483648)";
+    let reply = a.q(sql);
+    let e = reply.err(sql);
+    assert_eq!((e.code.as_str(), e.message.as_str()), ("22003", "integer out of range"), "{sql}");
+}
+
