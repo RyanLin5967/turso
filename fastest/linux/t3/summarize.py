@@ -529,6 +529,24 @@ def fixture_check(d, system, plan, dry):
     for k in ("age", "live"):
         if got[k] != plan[k]:
             bad.append(f"fixture {k} {got[k]!r}, planned {plan[k]!r}")
+    return bad + readback_problems(parent_record(d))
+
+
+def readback_problems(fx):
+    """fixture.py write's own comparison, judged here from its record (every system): the engine's read-back of t
+    (count|sum|row_hash) must equal the generator's facts and the fed streams' digests the generator's; a missing
+    record or field is a refusal, never a pass"""
+    if not isinstance(fx, dict):
+        return ["no fixture.json (the parent's read-back is unknown)"]
+    bad = []
+    rb, want = fx.get("readback"), fx.get("expected_readback")
+    if not isinstance(rb, dict) or not isinstance(want, dict):
+        bad.append(f"fixture.json has no read back of t ({rb!r}) beside the generator's ({want!r})")
+    elif rb != want:
+        bad.append(f"the engine read back {rb}, the generator wrote {want} (fixture.json)")
+    st, est = fx.get("stream_sha256"), fx.get("expected_streams")
+    if not isinstance(st, dict) or st != est:
+        bad.append(f"fed stream digests {st!r} are not the generator's {est!r} (fixture.json)")
     return bad
 
 
