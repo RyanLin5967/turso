@@ -3423,7 +3423,7 @@ impl Confirm {
     }
 }
 
-/// Test builds (fastest-budgets, the reachability arm of DECISIONS 2026-10-15): microseconds each
+/// Test builds: microseconds each
 /// syncing flight sleeps after its log's sync returns, still in the air (`flushing`), so a load arm
 /// can make flights outlast the confirmation writer's quiet period. 0 (the default): none.
 #[cfg(test)]

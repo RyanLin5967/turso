@@ -1165,7 +1165,6 @@ mod tests {
         }
     }
 
-    /// The crash batch, item 8 (lead, 2026-10-15; the wire's 4 reds at artie 512c7c17bb wait on it):
     /// FLOAT4 and FLOAT8 are built-in types of a STRICT table, base real with REAL affinity, as
     /// boolean and uuid are; `CREATE TABLE fw(r FLOAT4) STRICT` was refused "unknown datatype".
     #[test]
@@ -1188,9 +1187,9 @@ mod tests {
         );
     }
 
-    /// C32 MED (a Claude review, 2026-10-15): FLOAT4 and FLOAT8 are BASE-only custom types (no
-    /// ENCODE), and a CAST to one emitted nothing, so CAST('1.5' AS float8) stayed text. A CAST to a
-    /// BASE-only type casts by its primitive base's affinity. Expected values from sqlite3 3.51.0
+    /// FLOAT4 and FLOAT8 are BASE-only custom types (no ENCODE), and a CAST to one emitted nothing,
+    /// so CAST('1.5' AS float8) stayed text. A CAST to a BASE-only type casts by its primitive
+    /// base's affinity. Expected values from sqlite3 3.51.0
     /// (/usr/bin/sqlite3, 2025-06-12): `SELECT typeof(CAST('1.5' AS float8)), CAST('1.5' AS float8),
     /// typeof(CAST('1.5' AS float4)), CAST('1.5' AS float4), typeof(CAST(2 AS float8)),
     /// CAST(2 AS float8)` answered `real|1.5|real|1.5|real|2.0`.

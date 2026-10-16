@@ -90,10 +90,9 @@ pub(crate) fn trace_scope_with_detail(_label: &'static str, _detail: &'static st
 pub(crate) fn trace_remaining(_label: &'static str) {}
 
 /// One recursive step of a nested query (a view's expansion, a subquery's planning, optimizing or
-/// emission; the crash batch, 2026-10-15) in progress: `turso_stack_guard::NestGuard`, the one
-/// primitive the parser, the engine and the PostgreSQL translator share (fastest-engine's
-/// stack-guard class, built on this guard as revised on fastest-wire through 17572da73). A refusal
-/// is `LimboError::StackDepthLimitExceeded`, PostgreSQL's 54001. Leaving it, on every exit, pops it.
+/// emission) in progress: `turso_stack_guard::NestGuard`, the one primitive the parser, the engine
+/// and the PostgreSQL translator share. A refusal is `LimboError::StackDepthLimitExceeded`,
+/// PostgreSQL's 54001. Leaving it, on every exit, pops it.
 pub(crate) struct NestGuard(#[allow(dead_code)] turso_stack_guard::NestGuard);
 
 impl NestGuard {
@@ -117,8 +116,8 @@ mod tests {
     use turso_stack_guard::test_hooks;
 
     /// The stack between two consecutive nested checks, over views, FROM subqueries, WHERE and
-    /// scalar subqueries and a mix of them, stays under LEVEL_COST (fastest-wire 17572da73,
-    /// measured in debug on an 8 MiB thread: 73,584 B at most). A lower bound on a level's cost.
+    /// scalar subqueries and a mix of them, stays under LEVEL_COST (this test, in
+    /// debug on an 8 MiB thread, measured 73,584 B at most). A lower bound on a level's cost.
     #[test]
     fn two_consecutive_nested_checks_are_less_than_one_level_cost_apart() {
         std::thread::Builder::new()
@@ -161,12 +160,12 @@ mod tests {
             .unwrap();
     }
 
-    /// Lead order (ultrareview instance (ii), artie reviews/ULTRAREVIEW-1-wire.md): under INSERT,
-    /// UPDATE and DELETE the first subquery's planning and emission held no outer guard, so its
-    /// guard was a statement's outermost step, exempt from the check: one level ran unchecked on
-    /// whatever stack was left. Each statement's prepare must enter exactly its two outermost steps
-    /// (the parser's `parse_stmt` and `translate_inner`), so every subquery step is nested and
-    /// checked. Mutant `nest_statement_unguarded` (no guard in translate_inner) must turn it red.
+    /// Under INSERT, UPDATE and DELETE the first subquery's planning and emission once held no
+    /// outer guard, so its guard was a statement's outermost step, exempt from the check: one level
+    /// ran unchecked on whatever stack was left. Each statement's prepare must enter exactly its
+    /// two outermost steps (the parser's `parse_stmt` and `translate_inner`), so every subquery
+    /// step is nested and checked. Mutant `nest_statement_unguarded` (no guard in translate_inner)
+    /// must turn it red.
     #[test]
     fn a_dml_statements_first_subquery_is_a_nested_step() {
         let io: std::sync::Arc<dyn crate::IO> = std::sync::Arc::new(crate::MemoryIO::new());
@@ -246,7 +245,7 @@ mod tests {
 
     /// A real re-entry: a CREATE TABLE's schema reparse prepares a statement inside
     /// `Program::step` (op_parse_schema), and that statement's outermost step is seen as entered
-    /// while a statement steps; a flat SELECT is not (fastest-wire 17572da73).
+    /// while a statement steps; a flat SELECT is not.
     #[test]
     fn a_schema_reparse_inside_a_step_is_a_reentered_prepare() {
         let io: std::sync::Arc<dyn crate::IO> = std::sync::Arc::new(crate::MemoryIO::new());

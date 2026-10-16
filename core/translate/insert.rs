@@ -3398,7 +3398,7 @@ fn translate_virtual_table_insert(
     }
     let (num_values, value) = match &mut body {
         InsertBody::Select(select, None) => match &mut select.body.select {
-            // A translated VALUES can have no row (the crash batch, 2026-10-15).
+            // A translated VALUES can have no row.
             OneSelect::Values(values) => match values.pop() {
                 Some(row) => (row.len(), row),
                 None => crate::bail_parse_error!("a VALUES list has no row"),

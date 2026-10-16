@@ -1,7 +1,7 @@
-//! The crash batch (lead, fastest DECISIONS 2026-10-15): client SQL that took the whole server or a
-//! session down. Each case runs on a thread with the default 8 MiB stack (the size a pg-session
-//! thread gets from the platform, not the test harness's RUST_MIN_STACK) and must come back as a
-//! clean PostgreSQL-coded error, with the session still usable after it.
+//! Client SQL that took the whole server or a session down. Each case runs on a thread with the
+//! default 8 MiB stack (the size a pg-session thread gets from the platform, not the test
+//! harness's RUST_MIN_STACK) and must come back as a clean PostgreSQL-coded error, with the
+//! session still usable after it.
 
 use super::*;
 
@@ -70,12 +70,11 @@ fn alive(s: &Session) {
 }
 
 /// Views nested 90 deep: planning the outermost overflowed the stack in
-/// `translate::planner::parse_table` (raw artie lanes/wire/raw/loud-20261015/viewchain-probe). The
-/// bound is the stack (lead, 2026-10-15, as PostgreSQL's): the chain either answers or is refused
-/// 54001 (a debug build refuses it at 8 MiB; a release build, with smaller frames, may answer), at
-/// whichever statement first plans too deep, and never overflows. A shallow chain still answers.
-/// FLAGGED SPEC CHANGE (ruled): it read "must be refused" under the fixed 32-deep cap; the depth
-/// sweep (`every_depth_of_a_view_chain_answers_or_is_refused_never_overflows`) is its oracle.
+/// `translate::planner::parse_table`. The bound is the stack, as PostgreSQL's: the chain either
+/// answers or is refused 54001 (a debug build refuses it at 8 MiB; a release build, with smaller
+/// frames, may answer), at whichever statement first plans too deep, and never overflows. A shallow
+/// chain still answers. The depth sweep
+/// (`every_depth_of_a_view_chain_answers_or_is_refused_never_overflows`) is its oracle.
 #[test]
 fn a_ninety_view_chain_answers_or_is_refused_with_54001() {
     on_session(|s| {
@@ -111,8 +110,8 @@ fn make_date_at_the_int4_extremes_is_22008() {
     });
 }
 
-/// A table with no columns (PostgreSQL allows `CREATE TABLE t ()`; the wire's LIKE created one
-/// too): ALTER TABLE ... DROP of a column it does not have hit `turso_assert_ne!` at
+/// A table with no columns (PostgreSQL allows `CREATE TABLE t ()`; the PostgreSQL frontend's LIKE
+/// created one too): ALTER TABLE ... DROP of a column it does not have hit `turso_assert_ne!` at
 /// core/translate/alter.rs:941 and killed the session (alter_table, insert and updatable_views
 /// regress scripts). PostgreSQL answers 42703.
 #[test]
@@ -122,7 +121,7 @@ fn dropping_a_column_of_a_table_with_no_columns_is_42703() {
         if first_error(s, "CREATE TABLE p11 ()").is_none() {
             refused(s, "ALTER TABLE p11 DROP a", "42703");
         }
-        // The fastest-wire repro, whatever the translator now does with LIKE.
+        // The original repro, whatever the translator now does with LIKE.
         if first_error(s, "CREATE TABLE p12 (LIKE p1)").is_none() {
             let _ = first_error(s, "ALTER TABLE p12 DROP a");
         }
@@ -130,10 +129,10 @@ fn dropping_a_column_of_a_table_with_no_columns_is_42703() {
     });
 }
 
-/// Text 'Infinity' and 'NaN' cast to a float answered 0 (the engine casts text by SQLite's
-/// affinity rules). PostgreSQL 18.6 reads 'Infinity', '-Infinity' and 'inf' in any case as the
-/// infinities; the engine has no NaN value, so 'NaN' is refused 0A000, as the wire's literal path
-/// already refuses it. Read from a column, so no translator rewrite of a literal takes part.
+/// Text 'Infinity' and 'NaN' cast to a float answered 0 (the engine casts text by SQLite's affinity
+/// rules). PostgreSQL 18.6 reads 'Infinity', '-Infinity' and 'inf' in any case as the infinities;
+/// the engine has no NaN value, so 'NaN' is refused 0A000, as the translator's literal path already
+/// refuses it. Read from a column, so no translator rewrite of a literal takes part.
 #[test]
 fn text_infinity_casts_to_infinity_and_nan_is_refused() {
     on_session(|s| {
@@ -169,8 +168,8 @@ fn an_insert_whose_values_translate_to_no_row_is_42601() {
     });
 }
 
-/// Diagnostic, not a budget: run a PostgreSQL regress script statement by statement (the
-/// fastest-wire find_killer.py split) and name the first statement whose reply panics the session.
+/// Diagnostic, not a budget: run a PostgreSQL regress script statement by statement and name the
+/// first statement whose reply panics the session.
 /// `CRASH_SCRIPT=insert cargo test -p turso_pg_server crash_batch_tests::find_killer -- --ignored
 /// --nocapture`.
 #[test]
@@ -228,10 +227,10 @@ fn the_sqlite_dialect_still_casts_infinity_text_to_zero() {
     assert_eq!(rows, vec![vec![Value::from_f64(0.0); 3]]);
 }
 
-/// C32 HIGH (a Claude review, verified, 2026-10-15): the time operators did unchecked chrono
-/// arithmetic, so a result past chrono's range (or a u32 month span, or a blob's seconds near
-/// i64::MIN) panicked inside an extern "C" scalar, which cannot unwind: the process aborted. Each
-/// case must answer NULL or a clean error, and the connection must answer after it. Expected RED:
+/// The time operators did unchecked chrono arithmetic, so a result past chrono's range (or a u32
+/// month span, or a blob's seconds near i64::MIN) panicked inside an extern "C" scalar, which
+/// cannot unwind: the process aborted. Each case must answer NULL or a clean error, and the
+/// connection must answer after it. Expected RED:
 /// the test process aborts at the first case.
 #[test]
 fn the_time_operators_answer_an_overflow_with_null_or_an_error() {
@@ -263,12 +262,11 @@ fn the_time_operators_answer_an_overflow_with_null_or_an_error() {
     }
 }
 
-/// The lead, 2026-10-15 (the checked-time class): SQLite's date functions added caller values with
-/// wrapping_add, so arithmetic past the date range could wrap to a silent wrong date where SQLite
-/// answers NULL. Each case's expected NULL is sqlite3 3.51.0's (/usr/bin/sqlite3, 2025-06-12, raw
-/// artie lanes/budgets/raw/sqlite3-date-oracle.txt), the chained ones included. The 12 single
-/// modifiers were already NULL at 1f38e9d83 (each modifier's own limit keeps one add in range); the
-/// chained ones are the red, where the engine wraps.
+/// SQLite's date functions added caller values with wrapping_add, so arithmetic past the date range
+/// could wrap to a silent wrong date where SQLite answers NULL. Each case's expected NULL is
+/// sqlite3 3.51.0's (/usr/bin/sqlite3, 2025-06-12), the chained ones included. The 12 single
+/// modifiers were NULL before the adds were checked (each modifier's own limit keeps one add in
+/// range); the chained ones are the red, where the engine wraps.
 #[test]
 fn date_arithmetic_past_the_range_is_null_as_in_sqlite() {
     let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::MemoryIO::new());
@@ -305,10 +303,9 @@ fn date_arithmetic_past_the_range_is_null_as_in_sqlite() {
     assert!(wrong.is_empty(), "sqlite3 answers NULL for each:\n{}", wrong.join("\n"));
 }
 
-/// The one case found where the chained adds wrap i64 and land back in range: 64 modifiers of
-/// 2^58 ms each sum to exactly 2^64 ms. sqlite3 3.51.0 (/usr/bin/sqlite3) answers
-/// '2000-01-01 00:00:00' here, not NULL: SQLite's own `iJD +=` wraps as well (raw artie
-/// lanes/budgets/raw/sqlite3-date-oracle.txt). This pins the engine's answer to sqlite3's.
+/// The one case found where the chained adds wrap i64 and land back in range: 64 modifiers of 2^58
+/// ms each sum to exactly 2^64 ms. sqlite3 3.51.0 (/usr/bin/sqlite3) answers '2000-01-01 00:00:00'
+/// here, not NULL: SQLite's own `iJD +=` wraps as well. This pins the engine's answer to sqlite3's.
 #[test]
 fn date_arithmetic_that_wraps_answers_as_sqlite3_does() {
     let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::MemoryIO::new());
@@ -368,9 +365,9 @@ fn view_chain(s: &Session, n: usize) -> (usize, Option<(String, String)>) {
     (n, None)
 }
 
-/// Lead, 2026-10-15: the view bound is the STACK, as PostgreSQL's (max_stack_depth), not a fixed
-/// depth: a 40-view chain answers on the default 8 MiB session stack, as it does in PostgreSQL
-/// (fastest-wire's a_view_chain_of_any_depth_is_typed). Expected RED with the fixed 32-deep cap.
+/// The view bound is the STACK, as PostgreSQL's (max_stack_depth), not a fixed depth: a 40-view
+/// chain answers on the default 8 MiB session stack, as it does in PostgreSQL. A fixed 32-deep cap
+/// fails it.
 #[test]
 fn a_forty_view_chain_answers_on_the_session_stack() {
     on_session(|s| {
@@ -422,8 +419,7 @@ fn every_depth_of_a_view_chain_answers_or_is_refused_never_overflows() {
     }
 }
 
-/// `generate_series` with an infinite bound (lead, 2026-10-15; the wire's red ebc1845e9 against
-/// PostgreSQL 18.6's recording pg18-gsinf): an infinite stop saturated to i64::MAX and the session
+/// `generate_series` with an infinite bound: an infinite stop saturated to i64::MAX and the session
 /// thread spun through ~10^18 rows while the client got nothing more, so any client could wedge a
 /// session thread; an infinite step answered 1 row. PostgreSQL refuses each with 22023 ("stop value
 /// cannot be infinity", "step size ...", "start value ..."). Each must be refused 22023 within 10 s
@@ -463,9 +459,9 @@ fn an_infinite_generate_series_bound_is_refused_22023_promptly() {
     panic!("the finite control never reported");
 }
 
-/// The SQLite dialect keeps SQLite's clamp for an infinite generate_series bound (lead, 2026-10-15:
-/// the refusal is the PostgreSQL dialect's, as `cast_text_to_float` is): an infinite stop is
-/// i64::MAX, so `LIMIT 3` answers 0, 1, 2, as sqlite3 3.51.0 does.
+/// The SQLite dialect keeps SQLite's clamp for an infinite generate_series bound (the refusal is
+/// the PostgreSQL dialect's, as `cast_text_to_float` is): an infinite stop is i64::MAX, so
+/// `LIMIT 3` answers 0, 1, 2, as sqlite3 3.51.0 does.
 #[test]
 fn the_sqlite_dialect_still_clamps_an_infinite_series_bound() {
     let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::MemoryIO::new());

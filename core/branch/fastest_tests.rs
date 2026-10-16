@@ -9531,11 +9531,11 @@ fn a_steady_create_allocates_at_most_once_under_the_store_mutex() {
     assert!(over.is_empty(), "CLAIM: a steady create allocated more than once under the store mutex: {over:?}");
 }
 
-/// Class (b) step 1 (lead order 2026-10-15): the create-hold stall the hold audit found in its
-/// filter_rebuild run (fork_trunk's hold: 6,408 allocations, 11,088,085 B, 1 catalog statement, raw
-/// l69-audit). Hypothesis under test, as its CLAIM: that hold is a checkpoint STARTED inside the
-/// create's hold (`maybe_compact` -> `start_flight`, its capture), not the filter. The audit's store
-/// (10,000 named branches, catalog, D2) takes 16,384 named creates, each traced (`held_trace`);
+/// The create-hold stall of a filter_rebuild run (fork_trunk's hold: 6,408 allocations,
+/// 11,088,085 B, 1 catalog statement). Hypothesis under test, as its CLAIM: that hold is a
+/// checkpoint STARTED inside the create's hold (`maybe_compact` -> `start_flight`, its capture),
+/// not the filter. The store (10,000 named branches, catalog, D2) takes 16,384 named creates, each
+/// traced (`held_trace`);
 /// the worst create's spans are printed, and the claim is that its allocations fall in
 /// `compact.flight_starting` .. `compact.flight_start_returned`.
 #[test]

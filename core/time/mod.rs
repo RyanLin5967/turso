@@ -161,7 +161,7 @@ fn time_date_internal(args: &[Value]) -> Value {
 
 /// [`time_date_internal`], answering `none()` for a value that is no date (out of range, or an
 /// argument past i32): NULL for `time_date`, as before; PostgreSQL's out-of-range error for
-/// `make_date` and `make_timestamp` (22008; the crash batch, 2026-10-15).
+/// `make_date` and `make_timestamp` (22008).
 fn time_date_or(args: &[Value], none: impl FnOnce() -> Value) -> Value {
     if args.len() != 3 && args.len() != 6 && args.len() != 7 && args.len() != 8 {
         return Value::error(ResultCode::InvalidArgs);

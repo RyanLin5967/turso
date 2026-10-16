@@ -1,4 +1,4 @@
-//! The parser stack-guard class (lead order 2026-10-15): client SQL must never crash the server.
+//! The parser stack guard: client SQL must never crash the server.
 //! Every recursive entry of the parser and the engine checks the stack it has left
 //! (`turso_stack_guard`), and a statement too deep for its thread is refused with PostgreSQL's
 //! 54001 stack_depth_limit_exceeded rather than overflowing the thread, which aborts the process.
@@ -157,7 +157,7 @@ fn shapes(depth: usize) -> Vec<(&'static str, String)> {
     ]
 }
 
-/// The class (lead order): client SQL must never crash the server. Every nesting shape above, 20,
+/// Client SQL must never crash the server. Every nesting shape above, 20,
 /// 60 and 200 levels deep, on threads of 128 KiB to 8 MiB: each outcome is an answer or a refusal,
 /// never a dead process. Premise: each shape answers on 8 MiB at depth 3 (so the shapes are valid SQL, and
 /// the guard has a case it must pass), but a parenthesised FROM, which the planner refuses after
@@ -191,7 +191,7 @@ fn no_nesting_shape_kills_the_process_on_any_thread_stack() {
     assert!(refused > 0, "premise: no case reached the stack guard, so nothing here tested it");
 }
 
-/// Lead order (ultrareview instance (i)): a DDL statement's schema reparse is a prepare inside a
+/// A DDL statement's schema reparse is a prepare inside a
 /// step, so it is checked from its first step (`Executing`), and refused with less than `margin()`
 /// left. Diagnostic (prints; asserts nothing): the stack each reparse really uses from that point,
 /// measured by painting the unused stack of an 8 MiB thread with a pattern, running the DDL, and

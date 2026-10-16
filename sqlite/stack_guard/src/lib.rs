@@ -1,15 +1,14 @@
 //! The one stack guard of the parser and the engine: `NestGuard`, refusing a recursive step that
-//! would overflow the thread's stack, which aborts the whole server process (fastest-engine's
-//! stack-guard class, lead order 2026-10-15: client SQL must never crash the server).
+//! would overflow the thread's stack, which aborts the whole server process: client SQL must never
+//! crash the server.
 //!
-//! This is core's `stack::NestGuard` (the crash batch, 2026-10-15, as revised on fastest-wire
-//! through 17572da73: the small-thread margin, `LEVEL_COST`, the outermost exemption, `Executing`,
-//! refusing all nesting where the stack is unknown) moved into a crate of its own, so that
-//! `turso_parser` and `turso_pg_parser`, which core depends on and which cannot depend on core,
-//! use the same primitive with the same thread-local depth (lead order: build the shared crate on
-//! that NestGuard, not beside it). Core wraps it (`core::stack::NestGuard`) and reports a refusal
-//! as `LimboError::StackDepthLimitExceeded`, which a PostgreSQL client receives as 54001
-//! stack_depth_limit_exceeded, as PostgreSQL's own `check_stack_depth()` refuses.
+//! This is core's `stack::NestGuard` (the small-thread margin, `LEVEL_COST`, the outermost
+//! exemption, `Executing`, refusing all nesting where the stack is unknown) moved into a crate of
+//! its own, so that `turso_parser` and `turso_pg_parser`, which core depends on and which cannot
+//! depend on core, use the same primitive with the same thread-local depth. Core wraps it
+//! (`core::stack::NestGuard`) and reports a refusal as `LimboError::StackDepthLimitExceeded`, which
+//! a PostgreSQL client receives as 54001 stack_depth_limit_exceeded, as PostgreSQL's own
+//! `check_stack_depth()` refuses.
 //!
 //! A step is refused when the thread has less than [`margin`] of stack left, except the outermost
 //! step of a statement on a thread where no statement is stepping: a flat statement runs on
@@ -25,14 +24,13 @@
 //! one outermost statement's need overflows before any check (a 64 KiB thread died opening a
 //! database, measured). (4) The margins were sized in debug builds, whose frames are the largest.
 //! (5) [`with_stack`] sizes a segment from a bound its caller states; a wrong bound is an overflow
-//! the class tests must find.
+//! the stack guard tests must find.
 
 /// The stack a recursive step may still need below a check: one level of each phase, with margin,
 /// and a thread whose whole stack is under 4 times this keeps a quarter of its stack instead (a
 /// fixed 512 KiB refused every statement on a 512 KiB thread, Apple's GCD and NSThread default).
-/// Debug: 512 KiB, from the crash batch (a debug build's view expansion took about 93 KiB a level;
-/// a 90-view chain overflowed 8 MiB). Release: 128 KiB, sized as debug's is, at 4 times
-/// [`LEVEL_COST`].
+/// Debug: 512 KiB (a debug build's view expansion took about 93 KiB a level; a 90-view chain
+/// overflowed 8 MiB). Release: 128 KiB, sized as debug's is, at 4 times [`LEVEL_COST`].
 #[cfg(debug_assertions)]
 pub const STACK_MARGIN: usize = 512 << 10;
 #[cfg(not(debug_assertions))]
@@ -40,10 +38,10 @@ pub const STACK_MARGIN: usize = 128 << 10;
 
 /// One level of the deepest phase, with slack: the least a checked step is ever entered with,
 /// however small the thread, and the floor of a statement prepared inside a step (a DDL's schema
-/// reparse, lead's ultrareview instance (i)). A thread that cannot afford one level refuses every
-/// nested step and still runs flat statements. Sized from what was measured (core
+/// reparse). A thread that cannot afford one level refuses every nested step and still runs flat
+/// statements. Sized from what was measured (core
 /// `stack::tests::two_consecutive_nested_checks_are_less_than_one_level_cost_apart` and
-/// `stack_guard_tests::diag_schema_reparse_stack_cost`, raw artie l86):
+/// `stack_guard_tests::diag_schema_reparse_stack_cost`):
 /// - debug: the widest gap between two consecutive checks is 117,200 B, and a schema reparse uses
 ///   250,127 B (a CREATE TABLE) to 496,367 B (an 8-level view) in all, each level checked: 192 KiB;
 /// - release: the widest gap is 6,816 B, and a reparse uses 23,743 B to 36,839 B in all: 32 KiB,
@@ -339,7 +337,7 @@ mod tests {
 
     /// On a thread whose whole stack is under 512 KiB (Apple's GCD and NSThread default; 480 KiB
     /// asked, as Rust rounds 512 up) the outermost step is entered and nesting is still refused
-    /// before the stack runs out (ultrareview of fastest-wire, finding 3).
+    /// before the stack runs out.
     #[cfg(any(target_vendor = "apple", target_os = "linux"))]
     #[test]
     fn a_small_thread_enters_its_outermost_step_and_still_refuses_deep_nesting() {
@@ -360,14 +358,14 @@ mod tests {
     }
 
     /// A nested step that would leave less than one level's stack is refused on a small thread: a
-    /// quarter of 256 KiB is less than one level (fastest-engine's review of ed4e4e9a5).
+    /// quarter of 256 KiB is less than one level.
     /// Overflowing aborts the test process: that is the red.
     #[cfg(any(target_vendor = "apple", target_os = "linux"))]
     #[test]
     fn a_small_thread_refuses_a_nested_step_it_cannot_afford_one_level_for() {
         #[inline(never)]
         fn one_level() {
-            // One level just under LEVEL_COST (the wire's test used 120 KiB, debug's then 128 KiB).
+            // One level just under LEVEL_COST.
             let mut frame = [0u8; LEVEL_COST - (8 << 10)];
             std::hint::black_box(&mut frame);
         }
@@ -428,7 +426,7 @@ mod tests {
     }
 
     /// Where the platform does not report the stack (wasm), nested steps run (a refusal of every
-    /// one refused `SELECT 1` there, ultrareview of ultra-engine), and recursion that never stops
+    /// one refused `SELECT 1` there), and recursion that never stops
     /// on its own still ends in the refusal, within UNKNOWN_STACK of where it began: on a 2 MiB
     /// thread, so overflowing the estimate would not yet overflow the thread.
     #[test]

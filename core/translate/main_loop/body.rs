@@ -31,7 +31,7 @@ pub fn emit_loop<'a>(
     t_ctx: &mut TranslateCtx<'a>,
     plan: &'a SelectPlan,
 ) -> Result<()> {
-    // Stack-guard class (fastest-engine): a check between emit_query and translate_expr, which
+    // Stack guard: a check between emit_query and translate_expr, which
     // were 143,456 B apart in debug (core stack::tests::two_consecutive_nested_checks_...).
     let _nest = crate::stack::NestGuard::enter("emission")?;
     LoopBodyEmitter::emit(program, t_ctx, plan)
@@ -137,7 +137,7 @@ fn emit_loop_source<'a>(
     plan: &'a SelectPlan,
     emit_target: LoopEmitTarget,
 ) -> Result<()> {
-    // Stack-guard class (fastest-engine): a check between emit_query and translate_expr, which
+    // Stack guard: a check between emit_query and translate_expr, which
     // were 143,456 B apart in debug (core stack::tests::two_consecutive_nested_checks_...).
     let _nest = crate::stack::NestGuard::enter("emission")?;
     match emit_target {

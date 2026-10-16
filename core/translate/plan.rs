@@ -1015,8 +1015,8 @@ pub fn select_star(
     // lists the tables as written, left first. A USING column (which the swap put on the left
     // table's join_info) stands at the LEFT table's place but holds the RIGHT table's value, the
     // side every row has; the right table's own copy is left out. As PostgreSQL 18.6 and sqlite3
-    // 3.51.0 answer (the crash batch, 2026-10-15: it listed the swapped order, j, t, i, k for
-    // `j1 RIGHT JOIN j2 USING (i)`, where both list i, j, t, k).
+    // 3.51.0 answer (for `j1 RIGHT JOIN j2 USING (i)` both list i, j, t, k, not the swapped order
+    // j, t, i, k).
     if right_join_swapped && tables.len() == 2 {
         let (right, left) = (&tables[0], &tables[1]);
         let using: Vec<&str> = left
@@ -4731,8 +4731,7 @@ mod tests {
     }
 }
 
-/// `SELECT *` over a RIGHT JOIN (lead, 2026-10-15; fastest-wire's red 76f6ed92a against the
-/// PostgreSQL 18 recording pg18-join2): the planner swaps a two-table RIGHT JOIN into a LEFT JOIN,
+/// `SELECT *` over a RIGHT JOIN: the planner swaps a two-table RIGHT JOIN into a LEFT JOIN,
 /// and `*` listed the swapped tables' columns, so `j1 RIGHT JOIN j2 USING (i)` answered j, t, i, k
 /// where PostgreSQL 18.6 and sqlite3 3.51.0 both answer i, j, t, k (the USING column at the left
 /// table's place, holding the right table's value, then the rest of j1, then the rest of j2). A
@@ -4778,7 +4777,7 @@ mod right_join_star_tests {
     #[test]
     fn select_star_over_a_right_join_lists_the_columns_as_written() {
         let conn = open();
-        // Each expectation is pg18-join2's (PostgreSQL 18.6), which sqlite3 3.51.0 answers alike.
+        // Each expectation is PostgreSQL 18.6's answer, which sqlite3 3.51.0 answers alike.
         let ijtk = ["i", "j", "t", "k"].map(String::from).to_vec();
         let want = rows(&[&["1", "4", "one", "-1"], &["2", "3", "two", "2"], &["5", "-", "-", "-5"]]);
         for sql in [

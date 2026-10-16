@@ -553,7 +553,7 @@ pub fn optimize_plan(
     plan: &mut Plan,
     resolver: &Resolver,
 ) -> Result<()> {
-    // Stack-guard class (fastest-engine): a recursive entry is a nested step (`stack::NestGuard`).
+    // Stack guard: a recursive entry is a nested step (`stack::NestGuard`).
     let _nest = crate::stack::NestGuard::enter("a recursive step")?;
     let resources_before = subquery_resources(plan);
     match plan {
@@ -897,7 +897,7 @@ fn optimize_select_plan_with_cache(
     resolver: &Resolver,
     cache: &mut SubqueryPlanCache,
 ) -> Result<()> {
-    // Optimized recursively per nested query (`stack::NestGuard`; the crash batch, 2026-10-15).
+    // Optimized recursively per nested query (`stack::NestGuard`).
     let _nest = crate::stack::NestGuard::enter("subqueries")?;
     if !plan
         .non_from_clause_subqueries

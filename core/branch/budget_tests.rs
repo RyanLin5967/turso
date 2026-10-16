@@ -90,7 +90,7 @@ fn opts() -> DatabaseOpts {
     } else {
         BranchDurability::Catalog { sync }
     };
-    // The plant `exc_sharp` (DECISIONS bd0d845f97): a sharp catalog store, whose compactions sync
+    // The plant `exc_sharp`: a sharp catalog store, whose compactions sync
     // inline on the operation and are counted as an exception.
     let checkpoint = if spec == "exc_sharp" { BranchCheckpoint::Sharp } else { BranchCheckpoint::Fuzzy };
     DatabaseOpts::new()
@@ -262,7 +262,7 @@ impl Outside {
     }
 }
 
-/// The counted exceptions (DECISIONS bd0d845f97; `Database::branch_exception_counters`, keys
+/// The counted exceptions (`Database::branch_exception_counters`, keys
 /// `EXC_KEYS`): read outside a window, as it takes the group's lock.
 fn exceptions(db: &Arc<Database>) -> [u64; 4] {
     db.branch_exception_counters()
@@ -978,8 +978,8 @@ const CONFIRM_LOAD_ARMS: [(u64, u64); 4] = [(1, 0), (8, 0), (64, 0), (8, 20)];
 /// together half-way through their creates.
 const LOAD_GAPPED: &str = "load_c8_gapped";
 
-/// The load cell's reachability arm (lead, DECISIONS 2026-10-15: the writer's poll and its slot hold
-/// were unreachable at the shipped schedule, and are not equivalent): 8 clients whose every syncing
+/// The load cell's reachability arm (the writer's poll and its slot hold were unreachable at the
+/// shipped schedule, and are not equivalent): 8 clients whose every syncing
 /// flight stays in the air `SLOW_FLIGHT_US` past its sync (`journal::FLIGHT_SYNC_DELAY_US`, a test
 /// hook), longer than the 5 ms quiet period.
 const LOAD_SLOW: &str = "load_c8_slow_flights";
@@ -1040,7 +1040,7 @@ fn confirm_load(cell: &str, db: &Arc<Database>, out: &mut String) {
     for (c, delay_ms, gap, slow) in CONFIRM_LOAD_ARMS.iter().map(|&(c, d)| (c, d, false, false)).chain([gapped, slow]) {
         let rounds = shared_rounds(c);
         // The arm's line, and its creates' name prefix: three arms run at C = 8 on one database, so a
-        // prefix by C alone made the second arm's first create NameTaken (base16 at fb31e6153).
+        // prefix by C alone made the second arm's first create NameTaken.
         let arm = if slow {
             LOAD_SLOW.to_string()
         } else if gap {
@@ -1157,7 +1157,7 @@ fn idle_holes(spans: &[Vec<(std::time::Instant, std::time::Instant)>], quiet: st
     holes
 }
 
-/// The open-flush cells (lead order, DECISIONS 1334833a4d; review 16 LOW 11's a9ba5adb8): a store's
+/// The open-flush cells: a store's
 /// open of a whole log it KEEPS (the kept-log arm of `Scanned::finish`), counted absolutely, because
 /// the recovery budgets compare cells and a regression hitting every open equally passes them, and
 /// because the recovery cells' opens take another arm (BUDGETS.md, fixture findings). Cells:
@@ -1166,7 +1166,7 @@ fn idle_holes(spans: &[Vec<(std::time::Instant, std::time::Instant)>], quiet: st
 ///   writes the word; one reopen measured per sample, 3 samples;
 /// * `open_d2_confirmed`, `open_cat_d2`, `open_d1`: built in this process and closed cleanly (the
 ///   close writes the word: at once where the class proves stable storage, D2 on Apple, and at D1
-///   after a full flush of the log of its own, `Confirm::write_at_close`, a81058160), then reopened 5
+///   after a full flush of the log of its own, `Confirm::write_at_close`), then reopened 5
 ///   times, each reopen closed cleanly again.
 ///
 /// Per open: the process's device flushes and fsyncs (`io::SYNC_COUNTS`), the opening thread's syncs
@@ -2228,7 +2228,7 @@ fn cell(spec: &str) -> Arc<CellData> {
         let mut cells = cells.lock().unwrap_or_else(|e| e.into_inner());
         cells.entry(spec.to_string()).or_insert_with(|| Arc::new(run_child(spec))).clone()
     };
-    // DECISIONS bd0d845f97: a credited cell has all four counted exceptions at 0 inside every
+    // A credited cell has all four counted exceptions at 0 inside every
     // window; one that moved one, or a window that did not record them, is refused before any budget
     // reads the cell. The instruments' cell reads no database (its fire-checks are of the probes).
     if spec != "instruments" {
@@ -4148,7 +4148,7 @@ fn judge_load_arm(c: u64, op: &str, s: &Map, failures: &mut String) {
     }
 }
 
-/// The reachability arm (lead, DECISIONS 2026-10-15): with every flight in the air past the quiet
+/// The reachability arm: with every flight in the air past the quiet
 /// period (`load_c8_slow_flights`), the writer still writes no word while flights overlap, exactly one
 /// in the tail, and wakes at most twice per flight. A writer that polls while a flight is in the air
 /// (env mutant `confirm_poll_100us`) wakes many times per flight here, where the shipped schedule's
@@ -4179,7 +4179,7 @@ fn the_confirmation_writer_wakes_at_most_twice_per_flight_when_flights_outlast_t
     );
 }
 
-/// The reachability arm for the confirmation writer's slot hold (lead, DECISIONS 2026-10-15): the
+/// The reachability arm for the confirmation writer's slot hold: the
 /// writer is held mid-word (`HOLD_CONFIRM_WRITE`, after it took a word and before it writes it), and a
 /// create meanwhile must finish: on unix the writer takes no flight slot, so nothing waits on its word.
 /// The env mutant `confirm_holds_slot` holds the slot across the write, so the create waits until the
@@ -4342,8 +4342,8 @@ fn a_d2_open_of_a_confirmed_log_syncs_only_its_directory() {
 }
 
 /// A D1 open of a whole log makes exactly 2 plain fsyncs and no F_FULLFSYNC: the directory's, then
-/// the log's; on the opening thread 2 Fsync-class syncs, 1 of them a directory sync. Derivation (lead,
-/// accepted): an open that keeps a log it cannot prove durable exposes its records and appends after
+/// the log's; on the opening thread 2 Fsync-class syncs, 1 of them a directory sync. Derivation:
+/// an open that keeps a log it cannot prove durable exposes its records and appends after
 /// them, so it must first make durable (a) the log's bytes, whose last flight the previous process may
 /// never have synced, and (b) the log's name, whose rename it may never have synced. POSIX:
 /// fsync(file) does not make the file's directory entry durable, and fsync(dir) does not make the
@@ -4351,8 +4351,7 @@ fn a_d2_open_of_a_confirmed_log_syncs_only_its_directory() {
 /// its class: its own syncs do not prove stable storage (`journal::proves_stable`: only FullFsync on
 /// Apple), and the open's arm is chosen by that class, not by the header's word. The word IS there:
 /// the clean close that built the cell wrote it after a full flush of its own
-/// (`Confirm::write_at_close`, a81058160), so the premise is `confirmed` 1 (DECISIONS ba515419c3:
-/// a premise repair, the budget unchanged; it read "never confirmed", 0, before).
+/// (`Confirm::write_at_close`), so the premise is `confirmed` 1.
 /// Minimum 2; the engine issues 2. Mutant env `open_forgets_unsynced_rename`. WRITTEN NOT RUN.
 #[cfg(target_vendor = "apple")]
 #[test]
@@ -4389,7 +4388,7 @@ fn contention_each_create_registers_once_at_any_client_count() {
     assert!(failures.is_empty(), "creates registered more than once under contention (an internal retry):\n{failures}");
 }
 
-// ---- the counted exceptions (DECISIONS bd0d845f97: every run records them; a credited cell has all four at 0) ----
+// ---- the counted exceptions (every run records them; a credited cell has all four at 0) ----
 
 /// The sample keys of `Database::branch_exception_counters()`, in its order: held-free upgrades a
 /// freeing operation led past the hard cap, held-free upgrades that took the flight slot to raise
@@ -4397,7 +4396,7 @@ fn contention_each_create_registers_once_at_any_client_count() {
 /// behind a background compaction. Each is a window's delta.
 const EXC_KEYS: [&str; 4] = ["exc_hardcap_upgrades", "exc_header_raise_exclusive", "exc_inline_compaction_syncs", "exc_compaction_waits"];
 
-/// DECISIONS bd0d845f97 (the routing of `branch_exception_counters`): every run records the four
+/// Every run records the four
 /// counted exceptions, so every window of every engine cell carries all four keys. Checked here on
 /// the cells of each producer (the per-operation rounds, recovery, the checkpoint arm, the
 /// confirmation arm and the writer under load, a shared-flight arm, the first create, an open).
@@ -4424,7 +4423,7 @@ fn every_window_records_the_four_exception_counters() {
     assert!(missing.is_empty(), "windows that do not record the counted exceptions (DECISIONS bd0d845f97):\n{missing}");
 }
 
-/// DECISIONS bd0d845f97: a cell whose window moved one of the four counted exceptions is not
+/// A cell whose window moved one of the four counted exceptions is not
 /// credited: the cell is refused, naming the counter and the window, before any budget reads it.
 /// The plant `exc_sharp` moves one for real, not by a planted line: a SHARP catalog store
 /// (`BranchCheckpoint::Sharp`) at the checkpoint arm's lowered threshold, whose creates cross it, so

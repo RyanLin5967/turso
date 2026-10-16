@@ -707,7 +707,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_stmt(&mut self) -> Result<Stmt> {
-        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        // Stack guard: a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
         let _nest = turso_stack_guard::NestGuard::enter().map_err(|_| Error::StackDepthLimitExceeded)?;
         let tok = peek_expect!(
             self,
@@ -1676,7 +1676,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_expr_operand(&mut self) -> Result<Box<Expr>> {
-        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        // Stack guard: a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
         // Between parse_expr and a nested parse_select these frames held 143,456 B with no check
         // (core stack::tests::two_consecutive_nested_checks_are_less_than_one_level_cost_apart).
         let _nest = turso_stack_guard::NestGuard::enter().map_err(|_| Error::StackDepthLimitExceeded)?;
@@ -2100,7 +2100,7 @@ impl<'a> Parser<'a> {
     /// height of the resulting tree by [`MAX_EXPR_DEPTH`]. On return,
     /// `last_expr_height` holds the height of the returned expression.
     fn parse_expr(&mut self, precedence: u8) -> Result<Box<Expr>> {
-        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        // Stack guard: a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
         let _nest = turso_stack_guard::NestGuard::enter().map_err(|_| Error::StackDepthLimitExceeded)?;
         self.expr_nesting_depth += 1;
         if self.expr_nesting_depth as usize > MAX_EXPR_DEPTH {
@@ -2115,7 +2115,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_expr_inner(&mut self, precedence: u8) -> Result<Box<Expr>> {
-        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        // Stack guard: a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
         // Between parse_expr and a nested parse_select these frames held 143,456 B with no check
         // (core stack::tests::two_consecutive_nested_checks_are_less_than_one_level_cost_apart).
         let _nest = turso_stack_guard::NestGuard::enter().map_err(|_| Error::StackDepthLimitExceeded)?;
@@ -3015,7 +3015,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_from_clause(&mut self) -> Result<FromClause> {
-        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        // Stack guard: a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
         let _nest = turso_stack_guard::NestGuard::enter().map_err(|_| Error::StackDepthLimitExceeded)?;
         let tok = peek_expect!(
             self,
@@ -3181,7 +3181,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_one_select(&mut self) -> Result<OneSelect> {
-        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        // Stack guard: a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
         let _nest = turso_stack_guard::NestGuard::enter().map_err(|_| Error::StackDepthLimitExceeded)?;
         let tok = eat_expect!(self, TK_SELECT, TK_VALUES);
         match tok.token_type {
@@ -3231,7 +3231,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_select_body(&mut self) -> Result<SelectBody> {
-        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        // Stack guard: a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
         let _nest = turso_stack_guard::NestGuard::enter().map_err(|_| Error::StackDepthLimitExceeded)?;
         let select = self.parse_one_select()?;
         let mut compounds = vec![];
@@ -3366,7 +3366,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_select_without_cte(&mut self, with: Option<With>) -> Result<Select> {
-        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        // Stack guard: a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
         let _nest = turso_stack_guard::NestGuard::enter().map_err(|_| Error::StackDepthLimitExceeded)?;
         let body = self.parse_select_body()?;
         let order_by = self.parse_order_by()?;
@@ -3406,7 +3406,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_select(&mut self) -> Result<Select> {
-        // Stack-guard class (fastest-engine): a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
+        // Stack guard: a recursive entry is a nested step (`turso_stack_guard::NestGuard`).
         let _nest = turso_stack_guard::NestGuard::enter().map_err(|_| Error::StackDepthLimitExceeded)?;
         let with = self.parse_with()?;
         self.parse_select_without_cte(with)

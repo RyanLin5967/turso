@@ -1821,7 +1821,7 @@ impl Program {
     ) -> Result<StepResult> {
         // A statement prepared while this one steps (a schema reparse, a callback running SQL,
         // a trigger compiled at its first fire) is checked from its outermost step
-        // (`stack::Executing`; fastest-wire 17572da73).
+        // (`stack::Executing`).
         let _executing = crate::stack::Executing::enter();
         state.execution_state = ProgramExecutionState::Running;
         let result = match query_mode {
