@@ -1267,6 +1267,10 @@ struct SessionState {
     /// (22023) when a row is formatted, as PostgreSQL's printtup refuses it, never at the Bind,
     /// so a statement that returns no row succeeds (wire review 13 item 10).
     bad_result_codes: std::collections::HashMap<String, i16>,
+    /// The last statement's columns and rows when it was a query that failed while running: the
+    /// reply sends them before its error, as PostgreSQL has sent them by then (C53,
+    /// PGDIV-ERROR-BEFORE-ROWDESC). Set by every engine statement, taken by the reply.
+    started: Option<Started>,
     /// The search path last sent in a ParameterStatus, with its connection's stamp then and the
     /// path as SET gave it ([`Session::changed_parameters`]); None while it is the one startup
     /// announced.
@@ -1286,6 +1290,23 @@ struct StatementFailure {
     /// ([`StatementTypes::rolls_back`]).
     rolls_back: bool,
     info: Box<ErrorInfo>,
+    /// A query that failed while it ran: its columns and the rows it returned before the error,
+    /// which PostgreSQL has sent by then (RowDescription at the executor's start, each row as it is
+    /// made), so the reply is those, then the error (C53, PGDIV-ERROR-BEFORE-ROWDESC).
+    started: Option<Started>,
+}
+
+/// A query's columns and the rows it returned before it failed ([`StatementFailure::started`]).
+struct Started {
+    header: Arc<Vec<FieldInfo>>,
+    rows: Vec<DataRow>,
+}
+
+/// [`execute_query`]'s failure: the error, and what the query had sent when it failed while running
+/// (None when it failed before it ran: its columns refused, or an unencodable row).
+struct QueryFailure {
+    error: PgWireError,
+    started: Option<Started>,
 }
 
 /// A statement Describe prepared: on which engine connection, from which text.
@@ -1930,6 +1951,9 @@ impl Session {
         // or a refusal here is a statement that ran), and whether its translated parse was a
         // COMMIT or a ROLLBACK of the block.
         let mut ran = true;
+        // What a query that failed while running had sent ([`StatementFailure::started`]), for the
+        // reply to send before its error ([`SessionState::started`]).
+        let mut started = None;
         let mut parsed: Option<TxVerb> = None;
         let result = match call {
             Some(call) => {
@@ -1959,6 +1983,7 @@ impl Session {
                 let r = self.engine_statement(&conn, sql, verb, portal, format);
                 st = self.state();
                 r.map_err(|f| {
+                    started = f.started;
                     ran = f.prepared;
                     parsed = if f.commits {
                         Some(TxVerb::Commit)
@@ -2009,6 +2034,7 @@ impl Session {
         if let Some(left) = st.left.take() {
             self.shared.release(&left);
         }
+        st.started = started;
         if result.is_ok() && verb == TxVerb::RollbackTo {
             st.aborted = false;
         }
@@ -2269,6 +2295,7 @@ impl Session {
                         Err(e) => {
                             return Err(StatementFailure {
                                 info: engine_info(&e),
+                                started: None,
                                 ..f
                             })
                         }
@@ -2293,6 +2320,7 @@ impl Session {
             commits: false,
             rolls_back: false,
             info,
+            started: None,
         };
         let described = portal.and_then(|_| self.take_described(conn, sql));
         let (mut stmt, types) = match described {
@@ -2353,10 +2381,14 @@ impl Session {
                 }
             }
         }
+        let unstarted = |error| QueryFailure {
+            error,
+            started: None,
+        };
         let r = if let Some(table) = types.new_table_keys.as_deref() {
-            create_with_keys(conn, &mut stmt, sql, table, backoff)
+            create_with_keys(conn, &mut stmt, sql, table, backoff).map_err(unstarted)
         } else if !query {
-            execute_non_query(&mut stmt, sql, backoff, portal.is_none())
+            execute_non_query(&mut stmt, sql, backoff, portal.is_none()).map_err(unstarted)
         } else {
             // The column types are the statement's alone, so Describe (which runs nothing) and
             // this reply agree on both protocols (wire review 1 item 14).
@@ -2385,7 +2417,8 @@ impl Session {
             rerunnable: stmt.n_change() == 0 && !(types.commits || types.rolls_back),
             commits: types.commits,
             rolls_back: types.rolls_back,
-            info: wire_info(e),
+            info: wire_info(e.error),
+            started: e.started,
         })
     }
 
@@ -3780,6 +3813,18 @@ impl SimpleQueryHandler for Session {
                     return Err(PgWireError::UserError(e));
                 }
                 Response::Error(e) => {
+                    // A query that failed while running: its RowDescription and rows first.
+                    if let Some(started) = self.state().started.take() {
+                        let fields = started.header.iter().map(Into::into).collect();
+                        client
+                            .feed(PgWireBackendMessage::RowDescription(RowDescription::new(
+                                fields,
+                            )))
+                            .await?;
+                        for row in started.rows {
+                            client.feed(PgWireBackendMessage::DataRow(row)).await?;
+                        }
+                    }
                     client
                         .feed(PgWireBackendMessage::ErrorResponse((*e).into()))
                         .await?;
@@ -4095,7 +4140,18 @@ impl ExtendedQueryHandler for Session {
         let mut state = state.lock().await;
         match &mut *state {
             PortalExecutionState::Initial => {
-                match ExtendedQueryHandler::do_query(self, client, &portal, max_rows).await? {
+                let done = ExtendedQueryHandler::do_query(self, client, &portal, max_rows).await;
+                // A query that failed while running: the rows it made go out before the error, as
+                // PostgreSQL sends them (an Execute sends no RowDescription; Describe did, when it
+                // was asked).
+                if done.is_err() {
+                    if let Some(started) = self.state().started.take() {
+                        for row in started.rows {
+                            client.feed(PgWireBackendMessage::DataRow(row)).await?;
+                        }
+                    }
+                }
+                match done? {
                     Response::Query(mut results) => {
                         let refuse = self.state().bad_result_codes.get(name).copied();
                         let tag = results.command_tag().to_owned();
@@ -4607,9 +4663,15 @@ fn execute_query(
     columns: &[Type],
     schema: &turso_core::schema::Schema,
     backoff: &mut Backoff<'_>,
-) -> PgWireResult<Response> {
-    let header =
-        Arc::new(field_info(stmt, format, |i| columns[i].clone()).map_err(PgWireError::UserError)?);
+) -> Result<Response, QueryFailure> {
+    let unstarted = |error| QueryFailure {
+        error,
+        started: None,
+    };
+    let header = Arc::new(
+        field_info(stmt, format, |i| columns[i].clone())
+            .map_err(|e| unstarted(PgWireError::UserError(e)))?,
+    );
     // A binary column of a type encode_binary has no encoding for (numeric, date, timestamp,
     // uuid, ...) is refused before the statement runs, by its type alone: refused at its first
     // row, a write's RETURNING was refused after the write (wire review 4 item 1), and a numeric
@@ -4618,14 +4680,14 @@ fn execute_query(
         .iter()
         .find(|f| f.format() == FieldFormat::Binary && !BINARY_ENCODED.contains(f.datatype()))
     {
-        return Err(PgWireError::UserError(error(
+        return Err(unstarted(PgWireError::UserError(error(
             "0A000",
             format!(
                 "binary format for column \"{}\" of type {} is not supported; ask for text format",
                 f.name(),
                 f.datatype()
             ),
-        )));
+        ))));
     }
     let pads: Vec<Option<usize>> = (0..stmt.num_columns())
         .map(|i| bpchar_width(stmt, schema, i))
@@ -4650,9 +4712,19 @@ fn execute_query(
         }
     });
     if let Some(e) = unencodable {
-        return Err(e);
+        return Err(unstarted(e));
     }
-    ran.map_err(engine_error)?;
+    // An error while it ran comes after its RowDescription and the rows made before it, as
+    // PostgreSQL sends them (C53, PGDIV-ERROR-BEFORE-ROWDESC).
+    if let Err(e) = ran {
+        return Err(QueryFailure {
+            error: engine_error(e),
+            started: Some(Started {
+                header,
+                rows: rows.into_iter().filter_map(Result::ok).collect(),
+            }),
+        });
+    }
     Ok(Response::Query(QueryResponse::new(
         header,
         stream::iter(rows),
