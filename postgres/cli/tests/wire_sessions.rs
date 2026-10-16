@@ -13263,3 +13263,53 @@ fn setting_scope_foreign_keys_restore_and_follow_plain_set_at_commit() {
     );
 }
 
+
+/// ROLLBACK AND CHAIN in a failed block ends that block for the settings too, as PostgreSQL 18.6
+/// ends it (recorded, artie raw loud-20261015/pg18-diff/pg18-c41-m1-chain.txt): a SET and a SET
+/// LOCAL made in the rolled-back block are gone in the chained block and after it, on both
+/// protocols (C41-M1 / C45-M1). The chain ran ROLLBACK then BEGIN in the engine, never reported a
+/// block end, and the settings outlived the block.
+#[test]
+fn rollback_and_chain_ends_the_settings_of_the_failed_block() {
+    let dir = Scratch::new("chainsettings");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let show = |a: &mut Wire, what: &str| a.q(&format!("SHOW {what}")).single(what);
+    // M1: a SET in the failed block.
+    assert_eq!(show(&mut a, "lock_timeout"), "0");
+    a.q("BEGIN").ok("begin");
+    a.q("SET lock_timeout = '1s'").ok("set");
+    assert_eq!(a.q("SELECT * FROM nosuch").err("fail the block").code, "42P01");
+    assert_eq!(a.q("SELECT 1").err("failed").code, "25P02");
+    assert_eq!(a.q("ROLLBACK AND CHAIN").ok("chain").tags, ["ROLLBACK"]);
+    a.q("COMMIT").ok("commit");
+    assert_eq!(show(&mut a, "lock_timeout"), "0", "the rolled-back SET survived the chain");
+    // M1b: a SET LOCAL in the failed block, read inside the chained block.
+    a.q("BEGIN").ok("begin");
+    a.q("SET LOCAL client_min_messages = error").ok("set local");
+    a.q("SELECT * FROM nosuch").err("fail the block");
+    a.q("ROLLBACK AND CHAIN").ok("chain");
+    assert_eq!(
+        show(&mut a, "client_min_messages"),
+        "notice",
+        "the failed block's SET LOCAL is in force in the chained block"
+    );
+    a.q("COMMIT").ok("commit");
+    assert_eq!(show(&mut a, "client_min_messages"), "notice");
+    // M1c: search_path.
+    let path = show(&mut a, "search_path");
+    assert_eq!(path, "\"$user\", public");
+    a.q("BEGIN").ok("begin");
+    a.q("SET search_path TO s").ok("set search_path");
+    a.q("SELECT * FROM nosuch").err("fail the block");
+    a.q("ROLLBACK AND CHAIN").ok("chain");
+    a.q("COMMIT").ok("commit");
+    assert_eq!(show(&mut a, "search_path"), path, "the rolled-back search_path survived");
+    // The extended protocol's chain (C45 opened it), M1's case.
+    a.x("BEGIN", &[]).ok("begin");
+    a.x("SET lock_timeout = '1s'", &[]).ok("set");
+    a.x("SELECT * FROM nosuch", &[]).err("fail the block");
+    a.x("ROLLBACK AND CHAIN", &[]).ok("chain");
+    a.x("COMMIT", &[]).ok("commit");
+    assert_eq!(show(&mut a, "lock_timeout"), "0", "the rolled-back SET survived the extended chain");
+}
