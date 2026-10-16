@@ -2130,10 +2130,13 @@ fn drop_schema_relations(
     }
     let notice = match objects.as_slice() {
         [] => None,
-        [(kind, object)] => Some(format!(
-            "drop cascades to {kind} {}",
-            turso_pg_parser::quote_identifier(object),
-        )),
+        [(kind, object)] => {
+            let kind = if kind == "domain" { "type" } else { kind };
+            Some(format!(
+                "drop cascades to {kind} {}",
+                turso_pg_parser::quote_identifier(object),
+            ))
+        }
         _ => Some(format!("drop cascades to {} other objects", objects.len())),
     };
     for (kind, object) in objects {

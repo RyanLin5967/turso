@@ -2096,7 +2096,10 @@ impl Session {
             .current(&mut self.state())
             .map_err(PgWireError::UserError)?;
         let declared_oids: Vec<_> = declared.iter().map(|ty| ty.as_ref().map(Type::oid)).collect();
-        match conn.parse_step(&parsed.sql, msg, &declared_oids).map_err(engine_error)? {
+        match conn
+            .parse_step(&parsed.sql, msg, &declared_oids)
+            .map_err(engine_error)?
+        {
             Some((stmt, types)) => {
                 parameter_types(&types, declared).map_err(PgWireError::UserError)?;
                 self.state().described = Some(Described {
