@@ -8965,6 +8965,7 @@ fn lifecycle_audit(n: u32) {
     impl Drop for Disarm {
         fn drop(&mut self) {
             AUDIT.store(false, Release);
+            *super::budget_probe::AUDIT_PATH.lock().unwrap() = None;
             super::budget_probe::arm(false);
             super::store::FILTER_DRAIN_FAILS.store(false, Release);
         }
@@ -9005,6 +9006,9 @@ fn lifecycle_audit(n: u32) {
     let mark = |marks: &mut Vec<(&'static str, usize)>, op: &'static str| marks.push((op, AUDIT_LOG.lock().unwrap().len()));
     probe::prime();
     probe::arm(true);
+    // FLAGGED fixture change (the per-store counter class, d9cf2b609b): the audit records only this
+    // store's holds, so another test's holds neither fill its log nor enter its claim.
+    *super::budget_probe::AUDIT_PATH.lock().unwrap() = Some(path.to_str().unwrap().to_string());
     AUDIT.store(true, Release);
     mark(&mut marks, "open");
     let db = reopen(&path, opts(true, SyncClass::FullFsync), incarnation);

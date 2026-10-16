@@ -1522,8 +1522,9 @@ impl std::ops::DerefMut for StoreGuard<'_> {
 impl Drop for StoreGuard<'_> {
     fn drop(&mut self) {
         STORE_HELD.with(|held| held.set(held.get() - 1));
-        SCOPE.with(|s| s.borrow_mut().pop());
+        // Recorded while the store is still the innermost scope (the hold audit is per store).
         super::budget_probe::store_unlocked();
+        SCOPE.with(|s| s.borrow_mut().pop());
     }
 }
 
@@ -1578,6 +1579,14 @@ pub(crate) struct StoreCounts {
     syncs_under_store_mutex: AtomicU64,
     /// `[fsync(2), F_FULLFSYNC, F_BARRIERFSYNC, barrier fallbacks]`, as `crate::io::SYNC_COUNTS`.
     syncs: [AtomicU64; 4],
+    /// The hold audit records this store's holds (`budget_probe::AUDIT_PATH` named its path).
+    audited: std::sync::atomic::AtomicBool,
+}
+
+/// Test builds: the innermost store this thread works for is the audited one.
+#[cfg(test)]
+pub(crate) fn scope_is_audited() -> bool {
+    SCOPE.with(|s| s.borrow().last().is_some_and(|c| c.audited.load(Ordering::Relaxed)))
 }
 
 #[cfg(test)]
@@ -4856,6 +4865,10 @@ impl BranchStore {
         #[cfg(test)]
         if !crate::is_memory_like(db_path) {
             register_path(db_path, &counts);
+        }
+        #[cfg(test)]
+        if super::budget_probe::AUDIT_PATH.lock().unwrap_or_else(|e| e.into_inner()).as_deref() == Some(db_path) {
+            counts.audited.store(true, Ordering::Relaxed);
         }
         let format = super::journal::format_version(splice);
         // S-12 (r13-compose, A4.G: stands): the splice arm and fuzzy checkpoints are refused

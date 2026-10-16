@@ -83,6 +83,9 @@ pub(crate) struct HoldRec {
 /// The audit's log, recorded while `AUDIT` is set; the test reserves its room first, so recording
 /// allocates nothing (a push past the room is counted in `AUDIT_LOST` instead).
 pub(crate) static AUDIT: AtomicBool = AtomicBool::new(false);
+/// The per-store counter class (lead ruling d9cf2b609b): the audit records only the holds of the
+/// store opened at this database path (`store::scope_is_audited`), never another test's store's.
+pub(crate) static AUDIT_PATH: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 pub(crate) static AUDIT_LOG: std::sync::Mutex<Vec<HoldRec>> = std::sync::Mutex::new(Vec::new());
 pub(crate) static AUDIT_LOST: AtomicU64 = AtomicU64::new(0);
 /// Holds `attribute` refused (any thread), observation only.
@@ -528,7 +531,7 @@ pub(crate) fn store_unlocked() {
                     HELD_UNATTRIBUTED.fetch_add(1, Relaxed);
                     bump(&T_HELD_UNATTRIBUTED, 1);
                 }
-                if AUDIT.load(Relaxed) {
+                if AUDIT.load(Relaxed) && crate::branch::store::scope_is_audited() {
                     let get = |c: &'static std::thread::LocalKey<Cell<u64>>| c.with(|c| c.get());
                     let (allocs0, stmts0) = HOLD_START2.with(|h| h.get());
                     let me = t1.iter().find(|t| t.me).map_or(0, |t| t.id);
