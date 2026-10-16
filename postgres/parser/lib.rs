@@ -127,9 +127,9 @@ fn generated_storage_tokens(sql: &str) -> Option<Vec<(i32, std::ops::Range<usize
     let mut columns = Vec::new();
     for (i, token) in tokens.iter().enumerate() {
         if token.token() != Token::Generated
-            || tokens.get(i + 1)?.token() != Token::Always
-            || tokens.get(i + 2)?.token() != Token::As
-            || tokens.get(i + 3)?.token() != Token::Ascii40
+            || tokens.get(i + 1).map(|token| token.token()) != Some(Token::Always)
+            || tokens.get(i + 2).map(|token| token.token()) != Some(Token::As)
+            || tokens.get(i + 3).map(|token| token.token()) != Some(Token::Ascii40)
         {
             continue;
         }
@@ -150,7 +150,10 @@ fn generated_storage_tokens(sql: &str) -> Option<Vec<(i32, std::ops::Range<usize
         if sql[range.clone()].eq_ignore_ascii_case("virtual")
             || sql[range.clone()].eq_ignore_ascii_case("stored")
         {
-            columns.push((token.start, range));
+            let location = if i >= 2 && tokens[i - 2].token() == Token::Constraint {
+                tokens[i - 2].start
+            } else { token.start };
+            columns.push((location, range));
         }
     }
     Some(columns)
@@ -216,14 +219,23 @@ pub fn deparse_with_metadata(
     turso_stack_guard::with_stack(owner.stack.max(PG_DEPARSE_STACK), || {
     let mut sql = deparse(protobuf)?;
     if owner.virtual_generated.is_empty() { return Ok(sql); }
-    let kinds: Vec<_> = protobuf.nodes().into_iter().filter_map(|(node, ..)| {
-        match node {
-            pg_query::NodeRef::Constraint(c)
-                if c.contype() == pg_query::protobuf::ConstrType::ConstrGenerated =>
-                Some(owner.virtual_generated.contains(&c.location)),
-            _ => None,
+    use pg_query::protobuf::node::Node;
+    let mut kinds = Vec::new();
+    for raw in &protobuf.stmts {
+        if let Some(Node::CreateStmt(create)) = raw.stmt.as_ref().and_then(|node| node.node.as_ref()) {
+            for element in &create.table_elts {
+                if let Some(Node::ColumnDef(column)) = element.node.as_ref() {
+                    for constraint in &column.constraints {
+                        if let Some(Node::Constraint(constraint)) = constraint.node.as_ref() {
+                            if constraint.contype() == pg_query::protobuf::ConstrType::ConstrGenerated {
+                                kinds.push(owner.virtual_generated.contains(&constraint.location));
+                            }
+                        }
+                    }
+                }
+            }
         }
-    }).collect();
+    }
     let columns = generated_storage_tokens(&sql).filter(|columns| columns.len() == kinds.len())
         .ok_or_else(|| ParseError::ParseError(SqlErrorMessage::classified(
             SqlErrorKind::FeatureNotSupported, "cannot preserve generated column storage kinds")))?;

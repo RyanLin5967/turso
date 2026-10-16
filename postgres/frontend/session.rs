@@ -1958,6 +1958,12 @@ fn handle_pg_add_constraints(
     // Whether the table's older keys resolve: if they do, the engine's own resolution after the
     // rebuild can refuse only for a key this ALTER adds, and backs the per-key checks.
     let resolved_before = keys.is_empty() || check_table_keys(conn, table).is_ok();
+    // Virtual columns are recomputed by both tables; INSERT destinations accept only stored values.
+    let stored_columns = conn.current_schema().get_btree_table(table).ok_or_else(|| {
+        LimboError::InternalError("table disappeared before constraint rebuild".into())
+    })?.columns().iter().filter(|column| !column.hidden() && !column.is_generated())
+        .filter_map(|column| column.name.as_ref())
+        .map(|name| turso_pg_parser::quote_identifier(name)).collect::<Vec<_>>().join(", ");
     let enforced = conn.foreign_keys_enabled();
     // In a transaction of its own, under one undo rule (own_transaction): its end, COMMIT or
     // RELEASE, fails into the same undo as its steps (a failed COMMIT returned without it left the
@@ -1969,7 +1975,7 @@ fn handle_pg_add_constraints(
         let rebuild = (|| {
             conn.set_foreign_keys_enabled(false);
             run_pg_statement(pg_conn, &aside_def)?;
-            execute_root(conn, format!("INSERT INTO {aside} SELECT * FROM {quoted}"))?;
+            execute_root(conn, format!("INSERT INTO {aside} ({stored_columns}) SELECT {stored_columns} FROM {quoted}"))?;
             execute_root(conn, format!("DROP TABLE {quoted}"))?;
             run_pg_statement(pg_conn, &rebuilt)?;
             // The copy back checks every row against the new PRIMARY KEY, UNIQUE and CHECK
@@ -1977,7 +1983,7 @@ fn handle_pg_add_constraints(
             // the connection's pending deferred-key count: with keys on it counted the rows again,
             // and a block's deferred orphan was cancelled, or a fixed one counted twice (wire
             // review 6 item 1).
-            execute_root(conn, format!("INSERT INTO {quoted} SELECT * FROM {aside}"))?;
+            execute_root(conn, format!("INSERT INTO {quoted} ({stored_columns}) SELECT {stored_columns} FROM {aside}"))?;
             execute_root(conn, format!("DROP TABLE {aside}"))?;
             for sql in &dependents {
                 match catalog::decode_stored_pg_schema_sql(sql) {
