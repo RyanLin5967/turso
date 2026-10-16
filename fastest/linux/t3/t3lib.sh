@@ -436,3 +436,34 @@ host_unquiet() {
   done < "$rec"
   return $rc
 }
+
+# ours_parent DIR ROWS AGE / ours_fixture_record D ROWS AGE LIVE STORE -- ONE parent for every system (gate-6 t3run
+# HIGH 4; the owed ours fixture record, 2026-10-16: run 11's ours ran fastest_profile's own 1000-row seed beside the
+# competitors' 10000-row gen_seed parent). ours_parent writes comp's gen_seed.py streams for (ROWS, AGE): DIR/seed.sql
+# and DIR/age.sql with their digests (--digest-out), which fastest_profile --seed-sql/--age-sql feeds statement by
+# statement, as the competitors' seeds do. ours_fixture_record writes D/result/fixture.json through comp's own
+# fixture.py write: the plan's rows, age and prebranch LIVE, the live count fastest_profile MEASURED after its
+# prebranch (summary.json fixture.live_branches), du over STORE, the streams' digests, and ours' read-back of the
+# trunk (ours_readback.py over D/parent/trunk.tsv, fastest_profile --dump-trunk). fixture.py write compares the
+# read-back and the streams with gen_seed's facts and exits non-zero on a difference, after writing the record; so
+# does this, and summarize judges the record itself (readback_problems, one_parent).
+ours_parent() {
+  local d=$1 r=$2 k=$3 g="$T3LIB_DIR/../competitors/gen_seed.py"
+  mkdir -p "$d" || return 1
+  python3 -B "$g" sql --rows "$r" --digest-out "$d/sql.sha256" > "$d/seed.sql" &&
+    python3 -B "$g" age --rows "$r" --updates "$k" --digest-out "$d/age.sha256" > "$d/age.sql"
+}
+
+ours_fixture_record() {
+  local d=$1 r=$2 k=$3 n=$4 st=$5 live rb
+  live=$(python3 -B -c 'import json, sys
+fx = json.load(open(sys.argv[1])).get("fixture")
+v = fx.get("live_branches") if isinstance(fx, dict) else None
+sys.exit("no fixture record in " + sys.argv[1]) if type(v) is not int else print(v)' "$d/result/summary.json") ||
+    { echo "REFUSED: ours_fixture_record: no fixture record in $d/result/summary.json (fastest_profile ran without --seed-sql)"; return 1; }
+  rb=$(python3 -B "$T3LIB_DIR/ours_readback.py" "$d/parent/trunk.tsv") ||
+    { echo "REFUSED: ours_fixture_record: no read-back of $d/parent/trunk.tsv"; return 1; }
+  python3 -B "$T3LIB_DIR/../competitors/fixture.py" write "$d/result/fixture.json" --system ours --rows "$r" --age "$k" \
+    --prebranch "$n" --live "$live" --du "$st" --engine-why "ours: a branch store of several files, sized by du" \
+    --streams "$d/parent/sql.sha256" "$d/parent/age.sha256" --readback "$rb" > /dev/null
+}
