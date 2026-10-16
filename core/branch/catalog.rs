@@ -496,6 +496,10 @@ pub(crate) struct Catalog {
     /// What this handle's open prewarmed (r12-catload; `Prewarm::Off` unless [`Catalog::prewarm`] ran).
     pub(crate) prewarm: PrewarmStats,
     meta_all: Stmt,
+    /// `BEGIN` and `COMMIT`, compiled once, for the fuzzy checkpoint's read snapshot (L2(d): it
+    /// was parsed and compiled in the capture's store-mutex hold each time, raw l104).
+    begin_tx: Stmt,
+    commit_tx: Stmt,
     meta_put: Stmt,
     branch_get: Stmt,
     branch_put: Stmt,
@@ -629,6 +633,8 @@ impl Catalog {
         let p = |sql: &'static str| -> Result<Stmt> { Stmt::new(&conn, sql) };
         Ok(Catalog {
             meta_all: p("SELECT k, v FROM meta")?,
+            begin_tx: p("BEGIN")?,
+            commit_tx: p("COMMIT")?,
             meta_put: p("INSERT OR REPLACE INTO meta(k, v) VALUES (?1, ?2)")?,
             branch_get: p(
                 "SELECT parent, fork_epoch, epoch, released, lease, n_children FROM branch WHERE id = ?1",
@@ -1046,7 +1052,7 @@ impl Catalog {
     /// at its first read, so one is made now, before the checkpoint's writer can commit. Every read
     /// on this connection until [`Catalog::end_read_snapshot`] sees the catalog as of here.
     pub(crate) fn begin_read_snapshot(&mut self) -> Result<()> {
-        self.conn.execute("BEGIN")?;
+        self.begin_tx.rows(&[], &mut self.counters)?;
         if let Err(e) = self.meta_all.rows(&[], &mut self.counters) {
             self.rollback();
             return Err(e);
@@ -1057,7 +1063,7 @@ impl Catalog {
     /// End the snapshot [`Catalog::begin_read_snapshot`] pinned (F-FZ phase 3). It wrote nothing,
     /// so a failure to end it is a failure to release a read mark only.
     pub(crate) fn end_read_snapshot(&mut self) {
-        if let Err(e) = self.conn.execute("COMMIT") {
+        if let Err(e) = self.commit_tx.rows(&[], &mut self.counters) {
             tracing::warn!("branch catalog read snapshot not ended: {e}");
             self.rollback();
         }

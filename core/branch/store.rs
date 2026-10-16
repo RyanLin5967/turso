@@ -3487,6 +3487,9 @@ struct Captured {
     verify: Option<Vec<(CatBranch, u8)>>,
     /// Whether the rows are frozen in the branch table, owed to the writer (fuzzy, L2(d)).
     rows_frozen: bool,
+    /// The catalog's earliest lease after this checkpoint's commit, read by its writer (L2(d):
+    /// not by the install, under the store mutex); `None` for the install to read it.
+    lease_floor_after: Option<Option<u64>>,
     /// The dirty map the capture swapped out: merged back if the write fails.
     dirty: BTreeMap<BranchId, u8>,
     removed: Vec<BranchId>,
@@ -3987,7 +3990,12 @@ fn run_flight(
         if written.is_err() {
             w.rollback();
         }
-        (written, w.counters.rows_written - r0)
+        // The catalog's earliest lease, read here on the writer's connection, which sees its own
+        // commit, rather than at the install under the store mutex (a catalog statement there,
+        // raw l104). Nothing else writes the catalog between the commit and the install. A failed
+        // read leaves it to the install, as before.
+        let floor = written.as_ref().ok().and_then(|()| w.lease_min().ok());
+        (written.map(|()| floor), w.counters.rows_written - r0)
     }))
     .unwrap_or_else(|_| {
         writer.lock().rollback();
@@ -3999,6 +4007,9 @@ fn run_flight(
         )
     });
     let (written, rows_written) = written;
+    let written = written.map(|floor| {
+        cap.lease_floor_after = floor;
+    });
     cap.shape_rows_written = rows_written;
     let write_ns = ns(t);
     if written.is_ok() {
@@ -11150,6 +11161,7 @@ impl StoreInner {
             #[cfg(test)]
             verify,
             rows_frozen: cow,
+            lease_floor_after: None,
             dirty,
             removed: cat.removed.iter().copied().collect(),
             trunk_new,
@@ -11318,7 +11330,10 @@ impl StoreInner {
         }
         cat.free_cursor = None;
         cat.free_exhausted = false;
-        cat.lease_floor = cat.catalog.lease_min()?;
+        cat.lease_floor = match cap.lease_floor_after {
+            Some(floor) => floor,
+            None => cat.catalog.lease_min()?,
+        };
         cat.ckpt.stmts_locked += cat.catalog.counters.queries - q0;
         self.lease.durable_at_least(cap.lease_now);
         // githost-shape instrument (observing only; r13-compose S-1): counted from the capture,
