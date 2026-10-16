@@ -324,6 +324,10 @@ impl Interrupts {
         InterruptsArmed(self)
     }
 
+    fn request_cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+
     /// The progress handler's question: stop the running statement?
     fn should_stop(&self) -> bool {
         if self.cancel.load(Ordering::Relaxed) {
@@ -366,7 +370,7 @@ impl pgwire::api::cancel::CancelHandler for CancelSessions {
             .get(&(request.pid, secret))
             .and_then(std::sync::Weak::upgrade);
         if let Some(interrupts) = target {
-            interrupts.cancel.store(true, Ordering::Relaxed);
+            interrupts.request_cancel();
         }
     }
 }
@@ -557,7 +561,7 @@ impl TursoPgServer {
             .values()
             .filter_map(std::sync::Weak::upgrade)
         {
-            interrupts.cancel.store(true, Ordering::Relaxed);
+            interrupts.request_cancel();
         }
         let shut = self.shared.sessions.shut_all();
         let threads = std::mem::take(&mut *self.threads.lock().unwrap_or_else(|e| e.into_inner()));
@@ -7553,3 +7557,6 @@ mod tests {
         assert_eq!(s.in_use_waiters.load(Ordering::SeqCst), 0);
     }
 }
+
+#[cfg(test)]
+mod wait_tests;
