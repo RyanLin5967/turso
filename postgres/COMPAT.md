@@ -550,6 +550,7 @@ Upgrade is not supported.
 | psql \bind | ❌ Not supported | |
 | psql \dconfig | ❌ Not supported | |
 | psql pipeline queries | ❌ Not supported | |
+| A simple Query before an extended pipeline's Sync | 🟡 Divergence | A successful simple Query, including an empty Query or `turso_branch_current()`, commits the preceding implicit pipeline block and answers status I. PostgreSQL 18.6 keeps the block open (T) for `SELECT 1` and an empty Query; another session sees no row, and Sync returns I with the write discarded, and the next Query raises XX000. We retain our completion behavior instead of reproducing that PostgreSQL error. Recorded in `cli/tests/c45-pg18.txt`; pinned by `a_query_in_an_unsynced_pipeline_takes_part_in_its_block` (C26 LOW 3 / C45) |
 | psql named prepared statements | ❌ Not supported | SQL-level PREPARE/EXECUTE/DEALLOCATE are not translated |
 | Version aware psql | ❌ Not supported | |
 

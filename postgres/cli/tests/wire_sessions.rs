@@ -6404,17 +6404,17 @@ fn deleting_a_branch_another_session_switched_onto_is_refused_with_55006() {
         .ok("delete once b left");
 }
 
-/// Inside a block, an error from a statement with no statement savepoint of its own (an integer
-/// overflow, a read) leaves the block's savepoints, as in PostgreSQL: ROLLBACK TO one ends the
+/// Inside a block, an error from a statement with no statement savepoint of its own (division
+/// by zero, a read) leaves the block's savepoints, as in PostgreSQL: ROLLBACK TO one ends the
 /// failed state, the block carries on, and COMMIT keeps the work done before the savepoint. Until
 /// the engine kept them (wire review 3 item 10, the engine's half) such an error rolled the whole
 /// transaction back, savepoints with it, and this test pinned the server's 3B001 for the vanished
 /// savepoint; its expected values moved to PostgreSQL's behaviour, PROVISIONALLY (ruled
 /// c9c821dd8d, P7). The recording since made (artie raw loud-20261015/pg18-diff/pg18.out) agrees
 /// with every value after the error, and it showed the error itself was not PostgreSQL's: sum()
-/// over the int8 maximum is a numeric there. So the error is abs() of the int8 minimum, 22003 in
-/// PostgreSQL (pg18-c33-engineerr.out, its savepoint part), and the recorded scenario itself, with
-/// its sum and its 1/0, is replayed by a_savepoint_block_replays_postgresqls_recording (C33). The
+/// over the int8 maximum is a numeric there. The C45 lead ruling uses SELECT 1/0, 22012 in
+/// PostgreSQL (c45-pg18.txt), while keeping every expected value after the error. The full
+/// sum and 1/0 scenario is replayed by a_savepoint_block_replays_postgresqls_recording (C33). The
 /// name is kept from then. The 3B001 arm (Session::run, an aborted block with no engine
 /// transaction) has no test that reaches it now.
 #[test]
@@ -6425,11 +6425,11 @@ fn a_rollback_to_a_savepoint_the_engine_discarded_is_3b001() {
     a.q("BEGIN").ok("begin");
     a.q("INSERT INTO t VALUES (2, 'two')").ok("insert 2");
     a.q("SAVEPOINT s").ok("savepoint");
-    let r = a.q("SELECT abs(-9223372036854775808::int8)");
-    assert!(r.error.is_some(), "abs did not overflow: {:?}", r.rows);
+    let r = a.q("SELECT 1/0");
+    assert!(r.error.is_some(), "division by zero did not fail: {:?}", r.rows);
     assert_eq!(r.status, b'E', "the block is not marked failed");
     let r = a.q("ROLLBACK TO s").ok("rollback to s");
-    assert_eq!(r.status, b'T', "the block is still failed");
+    assert_eq!(r.status, b'T', "the block recovered from its failure");
     assert_eq!(a.q("SELECT 1").single("in the block"), "1");
     let r = a.q("COMMIT").ok("the block's end");
     assert_eq!(r.tags, vec!["COMMIT".to_string()]);
@@ -11032,14 +11032,15 @@ fn an_implicit_block_follows_the_engines_transaction() {
     assert_eq!(r.err("no branch y").code, "3D000");
 }
 
-/// A simple Query inside an unsynced pipeline is part of the pipeline's implicit block, as in
-/// PostgreSQL, whatever form the Query takes: a lone BEGIN makes the block the client's (status T),
+/// Our simple Query inside an unsynced pipeline takes part in its implicit block: a lone BEGIN
+/// makes the block the client's (status T),
 /// so its ROLLBACK drops the pipeline's write and its own; a branch call refused there (25001)
 /// rolls the block back and leaves the session idle, so the next Query runs before any Sync; and
 /// turso_branch_current() or an empty Query ends the block like any other Query, committing it
 /// (status I). A lone BEGIN committed the pipeline's write and answered I; the refused call left
 /// the session failed (E, then 25P02); and the fast path and the empty Query left the block open
-/// (T) (wire review 16 item 6).
+/// (T) (wire review 16 item 6). The successful Query and empty Query arms intentionally diverge
+/// from PostgreSQL 18.6, whose next Query after Sync errors XX000; see COMPAT and c45-pg18.txt.
 #[test]
 fn a_query_in_an_unsynced_pipeline_takes_part_in_its_block() {
     let dir = Scratch::new("pipequery");
@@ -13145,3 +13146,6 @@ fn c44_lock_timeout_int32_max_is_accepted() {
     a.q("SET lock_timeout=2147483647").ok("maximum accepted timeout");
     assert_eq!(a.q("SHOW lock_timeout").single("timeout"), "2147483647ms");
 }
+
+#[path = "c45/regressions.rs"]
+mod c45_regressions;
