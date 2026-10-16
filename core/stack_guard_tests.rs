@@ -96,10 +96,12 @@ fn a_statement_too_deep_for_its_stack_is_refused_with_54001_not_a_crash() {
     // so this is refused there; a release build's levels fit 256 KiB, and it answers. Either way it
     // never kills the process (FLAGGED: the lead's red was measured in debug; release asserts the
     // class, not the refusal).
+    // When it answers, the answer must be the right one: the 8 MiB control's (lead, 2026-10-16:
+    // never just "no error").
     #[cfg(not(debug_assertions))]
     assert!(
-        small.starts_with("ok") || small.starts_with("err StackDepthLimitExceeded"),
-        "CLAIM: {sql} on a 256 KiB thread neither answered nor was refused with 54001: {small}"
+        small == control || small.starts_with("err StackDepthLimitExceeded"),
+        "CLAIM: {sql} on a 256 KiB thread neither gave the 8 MiB answer ({control}) nor was refused with 54001: {small}"
     );
     #[cfg(debug_assertions)]
     assert!(
@@ -174,9 +176,17 @@ fn no_nesting_shape_kills_the_process_on_any_thread_stack() {
     }
     let mut died = Vec::new();
     let mut refused = 0;
-    for kib in [128usize, 256, 512, 1024, 2048, 8192] {
+    let mut wrong = Vec::new();
+    let mut answers: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for kib in [8192usize, 128, 256, 512, 1024, 2048] {
         for (shape, sql) in [20, 60, 200].into_iter().flat_map(shapes) {
             let got = in_child(test, kib, &sql);
+            // An answer must be the 8 MiB thread's answer, never just "no error" (lead, 2026-10-16).
+            if kib == 8192 {
+                answers.insert(sql.clone(), got.clone());
+            } else if got.starts_with("ok") && answers.get(&sql).is_some_and(|a| a.starts_with("ok") && *a != got) {
+                wrong.push(format!("{shape} on {kib} KiB answered {got}, 8 MiB answered {}", answers[&sql]));
+            }
             if got.starts_with("died") {
                 died.push(format!("{shape} ({} bytes of SQL) on {kib} KiB: {got}", sql.len()));
             } else if got.starts_with("err StackDepthLimitExceeded") {
@@ -185,6 +195,7 @@ fn no_nesting_shape_kills_the_process_on_any_thread_stack() {
         }
     }
     assert!(died.is_empty(), "CLAIM: client SQL killed the process ({} cases): {died:?}", died.len());
+    assert!(wrong.is_empty(), "CLAIM: a small thread answered differently from 8 MiB: {wrong:?}");
     assert!(refused > 0, "premise: no case reached the stack guard, so nothing here tested it");
 }
 
@@ -263,4 +274,58 @@ fn diag_schema_reparse_stack_cost() {
         .unwrap()
         .join()
         .unwrap();
+}
+
+/// Lead order (2026-10-16): the wire saw an intermittent 54001 for a statement that answers alone
+/// (a_view_chain_of_any_depth_is_typed, 1 of 2 full server runs). A verdict must not depend on how
+/// much of its thread's stack is already used, as long as what is left is the same, nor on the
+/// statements the thread ran or left open before it. On 2 MiB threads, after burning 0 to 1 MiB of
+/// stack, 2-deep scalar subqueries and a 3-view chain must answer every time (5 runs each), and
+/// again after another statement was left half-stepped on the same connection.
+#[test]
+fn a_verdict_does_not_depend_on_where_on_the_stack_the_statement_starts() {
+    #[inline(never)]
+    fn burn_then(kib: usize, f: &dyn Fn() -> String) -> String {
+        if kib == 0 {
+            return f();
+        }
+        let mut frame = [0u8; 8 << 10];
+        std::hint::black_box(&mut frame);
+        let r = burn_then(kib.saturating_sub(8), f);
+        std::hint::black_box(&frame);
+        r
+    }
+    let mut bad = Vec::new();
+    for used in [0usize, 256, 512, 768, 1024] {
+        for run in 0..5 {
+            let got = std::thread::Builder::new()
+                .stack_size(2 << 20)
+                .spawn(move || {
+                    let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+                    let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+                    let conn = db.connect().unwrap();
+                    conn.execute("CREATE TABLE t(a INTEGER)").unwrap();
+                    conn.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
+                    conn.execute("CREATE VIEW v0 AS SELECT a FROM t").unwrap();
+                    for i in 1..3 {
+                        conn.execute(format!("CREATE VIEW v{i} AS SELECT a FROM v{}", i - 1)).unwrap();
+                    }
+                    // A statement left half-stepped on this connection first.
+                    let mut open = conn.prepare("SELECT a FROM t").unwrap();
+                    let _ = open.step();
+                    burn_then(used, &|| {
+                        let a = conn.prepare("SELECT (SELECT (SELECT 7))").and_then(|mut s| s.run_collect_rows());
+                        let b = conn.prepare("SELECT count(*) FROM v2").and_then(|mut s| s.run_collect_rows());
+                        format!("{a:?} {b:?}")
+                    })
+                })
+                .unwrap()
+                .join()
+                .unwrap();
+            if !(got.contains("Integer(7)") && got.contains("Integer(3)")) {
+                bad.push(format!("{used} KiB used, run {run}: {got}"));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "CLAIM: a statement's verdict depended on where it started or on what ran before: {bad:?}");
 }
