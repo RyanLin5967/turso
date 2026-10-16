@@ -13278,3 +13278,14 @@ fn c54_full_join_merged_columns_are_explicitly_unsupported() {
     a.q("SELECT j1.i, j2.i FROM j1 FULL JOIN j2 ON j1.i = j2.i").ok("supported full join");
     a.q("SELECT * FROM j1 LEFT JOIN j2 USING(i)").ok("supported using");
 }
+
+#[test]
+fn c54_composite_output_is_explicitly_unsupported() {
+    let dir = Scratch::new("c54-row-output");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in ["SELECT ROW(1, 2)", "SELECT (1, 2)", "SELECT coalesce(ROW(1, 2), ROW(3, 4))"] {
+        assert_eq!(a.q(sql).err(sql).code, "0A000", "{sql}");
+    }
+    assert_eq!(a.q("SELECT (1, 2) < (2, 1)").single("row comparison"), "t");
+}
