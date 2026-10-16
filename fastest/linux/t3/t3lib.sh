@@ -390,9 +390,12 @@ EOF
 # and equally to stracecount's realtime-against-monotonic check; only a step (clock_settime, ADJ_SETOFFSET) moves the
 # difference, and that is what both refuse.
 T3_CLOCK_ADJUSTERS=${T3_CLOCK_ADJUSTERS:-"systemd-timesyncd chrony chronyd ntp ntpd ntpsec openntpd lima-guestagent"}
+t3_clockdelta() { # CLOCK_REALTIME minus CLOCK_MONOTONIC, in seconds: the default sampler (T3_CLOCKDELTA overrides it)
+  python3 -B -c 'import time; print(time.clock_gettime(time.CLOCK_REALTIME) - time.clock_gettime(time.CLOCK_MONOTONIC))'
+}
 host_quiet() {
   local rec=$1 sc=${T3_SYSTEMCTL:-sudo -n systemctl} timers u svc bad="" d0 d1
-  local clk=${T3_CLOCKDELTA:-python3 -B -c 'import time; print(time.clock_gettime(time.CLOCK_REALTIME) - time.clock_gettime(time.CLOCK_MONOTONIC))'}
+  local clk=${T3_CLOCKDELTA:-t3_clockdelta}
   : > "$rec" || return 1
   timers=$(${sc} list-timers --all --no-legend --plain) || { echo "REFUSED: host_quiet: systemctl list-timers failed"; return 1; }
   while read -r u svc; do
@@ -413,7 +416,7 @@ host_quiet() {
     [ "$(${sc} is-active "$u" 2> /dev/null)" = active ] && bad="$bad $u"
   done < "$rec"
   [ -z "$bad" ] || { echo "REFUSED: host_quiet: still active after stop:$bad"; return 1; }
-  d0=$(eval "$clk") && sleep "${T3_QUIET_WATCH_S:-30}" && d1=$(eval "$clk") && [ -n "$d0" ] && [ -n "$d1" ] ||
+  d0=$($clk) && sleep "${T3_QUIET_WATCH_S:-30}" && d1=$($clk) && [ -n "$d0" ] && [ -n "$d1" ] ||
     { echo "REFUSED: host_quiet: cannot sample the clocks ('${d0:-}' then '${d1:-}')"; return 1; }
   python3 -B -c 'import sys
 d0, d1, w, m = float(sys.argv[1]), float(sys.argv[2]), sys.argv[3], float(sys.argv[4])
