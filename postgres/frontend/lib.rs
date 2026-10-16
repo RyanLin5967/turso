@@ -1,5 +1,7 @@
 mod aliases;
 mod catalog;
+#[cfg(test)]
+mod c52_view_lifecycle_tests;
 mod copy;
 mod functions;
 mod information_schema;
