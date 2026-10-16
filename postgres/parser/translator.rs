@@ -4824,9 +4824,10 @@ impl PostgreSQLTranslator {
                  Some(1186 | 705) | None]
                 | [Some(1082 | 1184 | 705) | None, Some(1082 | 1184 | 705) | None,
                    Some(1186 | 705) | None, Some(25 | 705) | None]);
-            if !temporal && types.iter().any(|oid| {
-                oid.is_some_and(|oid| !matches!(oid, 20 | 21 | 23 | 1700 | 705))
-            }) {
+            let numeric = matches!(types.len(), 2 | 3) && types.iter().all(|oid| {
+                oid.is_none() || matches!(oid, Some(20 | 21 | 23 | 1700 | 705))
+            });
+            if !temporal && !numeric {
                 return Err(self.undefined_function(call));
             }
         }
