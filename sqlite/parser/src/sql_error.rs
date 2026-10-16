@@ -1,7 +1,7 @@
 //! Diagnostic metadata shared by the SQL parser, compiler and execution engine.
 //!
 //! A producer chooses the condition when it creates the error. Changing the human-readable
-//! message cannot change that condition. A frontend supplies its protocol's code mapping.
+//! message cannot change that condition. The shared PostgreSQL mapping also serves input diagnostics.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SqlErrorKind {
@@ -9,6 +9,12 @@ pub enum SqlErrorKind {
     FeatureNotSupported,
     InvalidTextRepresentation,
     NumericValueOutOfRange,
+    StringDataRightTruncation,
+    DuplicateTable,
+    DuplicateSchema,
+    InvalidSchemaName,
+    DependentObjectsStillExist,
+    IndeterminateDatatype,
     DivisionByZero,
     IntegrityConstraintViolation,
     UniqueViolation,
@@ -17,6 +23,7 @@ pub enum SqlErrorKind {
     ForeignKeyViolation,
     InvalidColumnReference,
     DatetimeFieldOverflow,
+    InvalidDatetimeFormat,
     InvalidParameterValue,
     UndefinedTable,
     InvalidForeignKey,
@@ -36,6 +43,51 @@ pub enum SqlErrorKind {
     QueryCanceled,
 }
 
+impl SqlErrorKind {
+    /// PostgreSQL SQLSTATE for a producer-selected SQL condition.
+    pub fn postgres_code(self) -> &'static str {
+        use SqlErrorKind::*;
+        match self {
+            SyntaxError => "42601",
+            FeatureNotSupported => "0A000",
+            InvalidTextRepresentation => "22P02",
+            NumericValueOutOfRange => "22003",
+            StringDataRightTruncation => "22001",
+            DuplicateTable => "42P07",
+            DuplicateSchema => "42P06",
+            InvalidSchemaName => "3F000",
+            DependentObjectsStillExist => "2BP01",
+            IndeterminateDatatype => "42P18",
+            DivisionByZero => "22012",
+            IntegrityConstraintViolation => "23000",
+            UniqueViolation => "23505",
+            NotNullViolation => "23502",
+            CheckViolation => "23514",
+            ForeignKeyViolation => "23503",
+            InvalidColumnReference => "42P10",
+            DatetimeFieldOverflow => "22008",
+            InvalidDatetimeFormat => "22007",
+            InvalidParameterValue => "22023",
+            UndefinedTable => "42P01",
+            InvalidForeignKey => "42830",
+            UndefinedColumn => "42703",
+            UndefinedObject => "42704",
+            UndefinedParameter => "42P02",
+            InvalidSavepointSpecification => "3B001",
+            AmbiguousColumn => "42702",
+            UndefinedFunction => "42883",
+            DuplicateAlias => "42712",
+            StatementTooComplex => "54001",
+            InternalError => "XX000",
+            SerializationFailure => "40001",
+            LockNotAvailable => "55P03",
+            ReadOnlyTransaction => "25006",
+            DiskFull => "53100",
+            QueryCanceled => "57014",
+        }
+    }
+}
+
 /// A diagnostic's text and optional, explicitly assigned SQL condition.
 ///
 /// The surrounding error variant still decides engine behavior such as SQLite constraint
@@ -44,6 +96,7 @@ pub enum SqlErrorKind {
 pub struct SqlErrorMessage {
     text: String,
     kind: Option<SqlErrorKind>,
+    protocol_text: Option<String>,
 }
 
 impl SqlErrorMessage {
@@ -51,7 +104,18 @@ impl SqlErrorMessage {
         Self {
             text: text.into(),
             kind: Some(kind),
+            protocol_text: None,
         }
+    }
+
+    /// An explicit protocol diagnostic; the engine's existing display and result code stay intact.
+    pub fn with_protocol_text(mut self, text: impl Into<String>) -> Self {
+        self.protocol_text = Some(text.into());
+        self
+    }
+
+    pub fn protocol_text(&self) -> Option<&str> {
+        self.protocol_text.as_deref()
     }
 
     pub fn kind(&self) -> Option<SqlErrorKind> {
@@ -71,7 +135,11 @@ impl SqlErrorMessage {
 
 impl From<String> for SqlErrorMessage {
     fn from(text: String) -> Self {
-        Self { text, kind: None }
+        Self {
+            text,
+            kind: None,
+            protocol_text: None,
+        }
     }
 }
 

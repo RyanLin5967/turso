@@ -3519,44 +3519,16 @@ fn engine_info(e: &LimboError) -> Box<ErrorInfo> {
         };
         return error(sqlstate(e), message.to_string());
     }
-    error(sqlstate(e), e.to_string())
+    error(
+        sqlstate(e),
+        e.protocol_message().map(str::to_owned).unwrap_or_else(|| e.to_string()),
+    )
 }
 
 /// PostgreSQL's SQLSTATE for the condition selected by the error's producer. Diagnostic text
 /// has no role here: rewording it preserves the code and the engine's error handling.
 fn sqlstate(e: &LimboError) -> &'static str {
-    use SqlErrorKind::*;
-    match e.sql_error_kind() {
-        SyntaxError => "42601",
-        FeatureNotSupported => "0A000",
-        InvalidTextRepresentation => "22P02",
-        NumericValueOutOfRange => "22003",
-        DivisionByZero => "22012",
-        IntegrityConstraintViolation => "23000",
-        UniqueViolation => "23505",
-        NotNullViolation => "23502",
-        CheckViolation => "23514",
-        ForeignKeyViolation => "23503",
-        InvalidColumnReference => "42P10",
-        DatetimeFieldOverflow => "22008",
-        InvalidParameterValue => "22023",
-        UndefinedTable => "42P01",
-        InvalidForeignKey => "42830",
-        UndefinedColumn => "42703",
-        UndefinedObject => "42704",
-        UndefinedParameter => "42P02",
-        InvalidSavepointSpecification => "3B001",
-        AmbiguousColumn => "42702",
-        UndefinedFunction => "42883",
-        DuplicateAlias => "42712",
-        StatementTooComplex => "54001",
-        InternalError => "XX000",
-        SerializationFailure => "40001",
-        LockNotAvailable => "55P03",
-        ReadOnlyTransaction => "25006",
-        DiskFull => "53100",
-        QueryCanceled => "57014",
-    }
+    e.sql_error_kind().postgres_code()
 }
 
 fn wire_info(e: PgWireError) -> Box<ErrorInfo> {
