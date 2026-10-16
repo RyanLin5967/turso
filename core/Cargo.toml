@@ -29,6 +29,11 @@ default = [
 ]
 tracing_release = ["tracing/release_max_level_info"]
 conn_raw_api = []
+# MEASUREMENT ONLY, never in a shipped build (off by default): lets a measuring binary hold back
+# the branch store's confirmation word, as the budget tests' hold_word(true) does, so no background
+# thread runs in a later measured window (fastest-wire's pre-registered FULL verdict, judged
+# word-held). turso_core::branch::measure_word_hold_compiled() says whether a binary has it.
+measure-word-hold = []
 # Harness-side observability: turns on aristo's instrument surface so the
 # logical-log conformance DTs can read private LogicalLog state (header
 # version, pending running CRC) and construct LogRecords. Off by default;

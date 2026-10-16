@@ -1803,3 +1803,46 @@ mod tests {
         assert_ne!(BranchId::TRUNK, BranchId(1));
     }
 }
+
+/// Whether this build has the default-off `measure-word-hold` feature (`measure_word_hold`): a
+/// measuring harness refuses a run whose binaries lack it. Always present, so it can be asked.
+pub fn measure_word_hold_compiled() -> bool {
+    cfg!(feature = "measure-word-hold")
+}
+
+/// MEASUREMENT ONLY (feature `measure-word-hold`, off by default, never in a shipped build): hold
+/// back every durable branch store's confirmation word in this process, as the budget tests'
+/// `hold_word(true)` does (woken once by the first landing, then asleep with the word pending, so
+/// no background thread runs in a later measured window), or let it be written after the shipped
+/// quiet period again. `TURSO_MEASURE_WORD_HOLD=1` in the environment holds it from the start.
+#[cfg(feature = "measure-word-hold")]
+pub fn measure_word_hold(held: bool) {
+    store::CONFIRM_QUIET_MS.store(if held { store::CONFIRM_HELD_MS } else { 0 }, std::sync::atomic::Ordering::Release);
+}
+
+#[cfg(test)]
+mod word_hold_tests {
+    /// The default build has no word hold (lead order: it can never be on by accident): the
+    /// feature is not compiled in, and `TURSO_MEASURE_WORD_HOLD=1` leaves the shipped quiet period.
+    /// (`cargo test --features measure-word-hold` runs the other arm.)
+    #[test]
+    fn the_word_hold_is_compiled_only_with_its_feature() {
+        let held = super::measure_word_hold_compiled();
+        assert_eq!(held, cfg!(feature = "measure-word-hold"));
+        #[cfg(not(feature = "measure-word-hold"))]
+        {
+            // SAFETY of set_var: this test reads no other environment and sets only this name.
+            unsafe { std::env::set_var("TURSO_MEASURE_WORD_HOLD", "1") };
+            let quiet = super::store::confirm_quiet_for_test();
+            unsafe { std::env::remove_var("TURSO_MEASURE_WORD_HOLD") };
+            assert_eq!(quiet, std::time::Duration::from_millis(5), "CLAIM: a default build read the word-hold environment");
+        }
+        #[cfg(feature = "measure-word-hold")]
+        {
+            super::measure_word_hold(true);
+            let quiet = super::store::confirm_quiet_for_test();
+            super::measure_word_hold(false);
+            assert!(quiet >= std::time::Duration::from_secs(1 << 30), "CLAIM: measure_word_hold(true) did not hold the word: {quiet:?}");
+        }
+    }
+}
