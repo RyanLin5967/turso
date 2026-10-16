@@ -1,0 +1,123 @@
+>> Q SELECT n,x FROM(VALUES(1,10),(2,20))t(n,x) ORDER BY n
+   T oids=[23, 23] names=['n', 'x']
+   D ['1', '10']
+   D ['2', '20']
+   C SELECT 2
+   Z I
+>> Q SELECT a,b FROM(SELECT 1 AS x,2 AS x)t(a,b)
+   T oids=[23, 23] names=['a', 'b']
+   D ['1', '2']
+   C SELECT 1
+   Z I
+>> Q SELECT n,column2 FROM(VALUES(1,10))t(n)
+   T oids=[23, 23] names=['n', 'column2']
+   D ['1', '10']
+   C SELECT 1
+   Z I
+>> Q SELECT a,b FROM(SELECT 1,2 UNION ALL SELECT 3,4)t(a,b) ORDER BY a
+   T oids=[23, 23] names=['a', 'b']
+   D ['1', '2']
+   D ['3', '4']
+   C SELECT 2
+   Z I
+>> Q SELECT * FROM(VALUES(1))t(a,b)
+   E S=ERROR C=42P10 M=table "t" has 1 columns available but 2 columns specified
+   Z I
+>> Q CREATE TABLE t(id INT,v TEXT)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO t VALUES(1,'one')
+   C INSERT 0 1
+   Z I
+>> D 25 SELECT id FROM t WHERE $1 IS NOT NULL
+   ParseComplete
+   t params=[25]
+   T oids=[23] names=['id']
+   Z I
+>> X 25 SELECT id FROM t WHERE $1 IS NOT NULL ||| text
+   ParseComplete
+   BindComplete
+   T oids=[23] names=['id']
+   D ['1']
+   C SELECT 1
+   Z I
+>> D 0 SELECT id FROM t WHERE $1 IS NOT NULL
+   E S=ERROR C=42P18 M=could not determine data type of parameter $1
+   Z I
+>> X 0 SELECT id FROM t WHERE $1 IS NOT NULL ||| text
+   E S=ERROR C=42P18 M=could not determine data type of parameter $1
+   Z I
+>> Q BEGIN
+   C BEGIN
+   Z T
+>> D 25 SELECT id FROM t WHERE $1 IS NOT NULL
+   ParseComplete
+   t params=[25]
+   T oids=[23] names=['id']
+   Z T
+>> Q SELECT 1
+   T oids=[23] names=['?column?']
+   D ['1']
+   C SELECT 1
+   Z T
+>> Q ROLLBACK
+   C ROLLBACK
+   Z I
+>> D - SELECT id FROM t WHERE typeof(v)=$1
+   E S=ERROR C=42883 M=function typeof(text) does not exist
+   Z I
+>> Q SELECT "TYPEOF"(1)
+   E S=ERROR C=42883 M=function TYPEOF(integer) does not exist
+   Z I
+>> Q SELECT * FROM pragma_table_info('t')
+   E S=ERROR C=42883 M=function pragma_table_info(unknown) does not exist
+   Z I
+>> Q CREATE TABLE s(x INT)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO s VALUES(1),(2)
+   C INSERT 0 2
+   Z I
+>> Q CREATE TABLE u(g INT)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO u VALUES(10)
+   C INSERT 0 1
+   Z I
+>> Q SELECT count(*) FROM s, generate_series(1,s.x)g WHERE EXISTS(SELECT 1 FROM u WHERE g=10)
+   T oids=[20] names=['count']
+   D ['3']
+   C SELECT 1
+   Z I
+>> Q SELECT a,b FROM(SELECT 1 AS x,2 AS y ORDER BY x)t(a,b)
+   T oids=[23, 23] names=['a', 'b']
+   D ['1', '2']
+   C SELECT 1
+   Z I
+>> Q SELECT a,b FROM(SELECT * FROM t)t2(a,b)
+   T oids=[23, 25] names=['a', 'b']
+   D ['1', 'one']
+   C SELECT 1
+   Z I
+>> Q CREATE TABLE va(a INT)
+   C CREATE TABLE
+   Z I
+>> Q ALTER TABLE va ADD COLUMN b INT GENERATED ALWAYS AS(a*2) VIRTUAL
+   C ALTER TABLE
+   Z I
+>> Q INSERT INTO va(a) VALUES(3)
+   C INSERT 0 1
+   Z I
+>> Q SELECT a,b FROM va
+   T oids=[23, 23] names=['a', 'b']
+   D ['3', '6']
+   C SELECT 1
+   Z I
+>> Q ALTER TABLE va ADD COLUMN c TEXT DEFAULT 'generated always as(a) virtual'
+   C ALTER TABLE
+   Z I
+>> Q SELECT a,b,c FROM va
+   T oids=[23, 23, 25] names=['a', 'b', 'c']
+   D ['3', '6', 'generated always as(a) virtual']
+   C SELECT 1
+   Z I
