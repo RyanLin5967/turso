@@ -359,7 +359,7 @@ impl PgNumeric {
             if numeric_shape && !crate::branch::store::fe_mutant("numeric_exponent_unbounded") {
                 let bounded = exp.parse::<i128>().ok().filter(|e| (-PG_MAX_EXPONENT..=PG_MAX_EXPONENT).contains(e));
                 if bounded.is_none() && BigDecimal::from_str(&format!("{mantissa}e0")).is_ok() {
-                    return Some(Err(LimboError::Constraint("value overflows numeric format".to_string())));
+                    return Some(Err(LimboError::Constraint(SqlErrorMessage::classified(SqlErrorKind::NumericValueOutOfRange, "value overflows numeric format"))));
                 }
             }
         }
