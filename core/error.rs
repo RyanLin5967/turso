@@ -208,6 +208,19 @@ impl LimboError {
         }
     }
 
+    /// A producer-supplied protocol message, without changing this error's engine display.
+    pub fn protocol_message(&self) -> Option<&str> {
+        match self {
+            Self::Constraint(message)
+            | Self::ParseError(message)
+            | Self::TxError(message)
+            | Self::ExtensionError(message)
+            | Self::InvalidArgument(message)
+            | Self::Raise(_, message) => message.protocol_text(),
+            _ => None,
+        }
+    }
+
     /// The primary SQLite result code for this error, e.g. what the sqlite3
     /// shell appends after a runtime error message ("... (19)").
     pub fn sqlite_result_code(&self) -> i32 {
