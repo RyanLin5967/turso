@@ -1880,6 +1880,12 @@ impl Session {
             if in_tx && conn.inner().get_auto_commit() {
                 let committed = result.is_ok() && verb == TxVerb::Commit && !aborted;
                 conn.tx_event(turso_pg::TxEvent::Ended { committed }, sql);
+            } else if in_tx && result.is_ok() && matches!(verb, TxVerb::Chain { .. }) {
+                // AND CHAIN ends the block and opens the next in one statement, so the engine is
+                // never in autocommit between them: the block's end is reported here. The chain
+                // runs only in a failed block, as a ROLLBACK (C41-M1 / C45-M1: a rolled-back SET
+                // and a SET LOCAL lived on in the chained block; recorded, pg18-c41-m1-chain.txt).
+                conn.tx_event(turso_pg::TxEvent::Ended { committed: false }, sql);
             } else if result.is_ok() {
                 let event = match verb {
                     TxVerb::Savepoint => Some(turso_pg::TxEvent::Savepoint),
