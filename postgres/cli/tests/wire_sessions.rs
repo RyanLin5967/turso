@@ -13729,3 +13729,80 @@ fn c52_view_of_integer_constant_retains_its_type() {
     assert_eq!(reply.oids, Some(vec![23]));
     assert_eq!(reply.rows, vec![vec![Some("1".into())]]);
 }
+
+// PG18.6 raw oracle: c50-pg18-class2.txt (54d3c589f9505aec6e0d845e914759b68b46ea605d6c4740b2cbba674772707c).
+#[test]
+fn c50_class2_unconstrained_numeric_keeps_exact_values_and_specials() {
+    let dir=Scratch::new("c50-exact-storage"); let server=Server::start(&dir.db(),&[]); let mut a=server.connect();
+    a.q("CREATE TABLE c_exact(v numeric)").ok("table");
+    a.q("INSERT INTO c_exact VALUES (9223372036854775808), ('NaN'), ('Infinity')").ok("values");
+    let r=a.q("SELECT v, pg_typeof(v) FROM c_exact ORDER BY v").ok("numeric values");
+    assert_eq!(r.oids,Some(vec![1700,2206]));
+    assert_eq!(r.rows,vec![vec![Some("9223372036854775808".into()),Some("numeric".into())],vec![Some("Infinity".into()),Some("numeric".into())],vec![Some("NaN".into()),Some("numeric".into())]]);
+}
+
+#[test]
+fn c50_class2_boolean_and_oid_writes_retain_their_types() {
+    let dir=Scratch::new("c50-nonnumeric-storage"); let server=Server::start(&dir.db(),&[]); let mut a=server.connect();
+    a.q("CREATE TABLE c_bool(v boolean)").ok("bool table");
+    a.q("INSERT INTO c_bool VALUES ('true'), ('false')").ok("bool values");
+    assert_eq!(a.q("SELECT v FROM c_bool ORDER BY v").ok("bool result").rows,vec![vec![Some("f".into())],vec![Some("t".into())]]);
+    a.q("CREATE TABLE c_oid(v oid)").ok("oid table");
+    a.q("INSERT INTO c_oid VALUES (4294967295)").ok("oid value");
+    assert_eq!(a.q("SELECT v, pg_typeof(v) FROM c_oid").ok("oid result").rows,vec![vec![Some("4294967295".into()),Some("oid".into())]]);
+}
+
+#[test]
+fn c50_class2_assignment_common_types_follow_the_query_context() {
+    let dir=Scratch::new("c50-common-assignment"); let server=Server::start(&dir.db(),&[]); let mut a=server.connect();
+    a.q("CREATE TABLE c_common(v integer)").ok("table");
+    let r=a.q("INSERT INTO c_common SELECT 0.5::numeric UNION ALL SELECT 0.5::float8 RETURNING v").ok("union common source");
+    assert_eq!(r.rows,vec![vec![Some("0".into())],vec![Some("0".into())]]);
+    let r=a.q("INSERT INTO c_common VALUES (0.5::numeric), (0.5::float8) RETURNING v").ok("values assignment contexts");
+    assert_eq!(r.rows,vec![vec![Some("1".into())],vec![Some("0".into())]]);
+    a.q("CREATE TABLE cn_source(x numeric)").ok("source");
+    a.q("INSERT INTO cn_source VALUES (0.5),(1.5)").ok("source values");
+    a.q("CREATE TABLE cn_dest(x integer)").ok("destination");
+    assert_eq!(a.q("INSERT INTO cn_dest SELECT x FROM cn_source ORDER BY x RETURNING x").ok("sorted assignment").rows,vec![vec![Some("1".into())],vec![Some("2".into())]]);
+    assert_eq!(a.q("INSERT INTO cn_dest SELECT 0.1::numeric UNION SELECT 0.2::numeric RETURNING x").ok("deduplicate before assignment").rows,vec![vec![Some("0".into())],vec![Some("0".into())]]);
+    assert_eq!(a.q("SELECT count(*) FROM cn_dest").single("all distinct source rows stored"),"4");
+}
+
+#[test]
+fn c50_class2_update_from_and_upsert_retain_numeric_sources() {
+    let dir=Scratch::new("c50-update-sources"); let server=Server::start(&dir.db(),&[]); let mut a=server.connect();
+    a.q("CREATE TABLE ci(id integer PRIMARY KEY, i smallint)").ok("table");
+    a.q("INSERT INTO ci VALUES (1,0)").ok("row");
+    assert_eq!(a.q("INSERT INTO ci VALUES (1,'1.5'::numeric) ON CONFLICT(id) DO UPDATE SET i=excluded.i + '1.5'::numeric RETURNING i").single("upsert"),"4");
+    assert_eq!(a.q("UPDATE ci SET i=s.n FROM (SELECT '2.5'::numeric AS n) s WHERE id=1 RETURNING i").single("update from"),"3");
+}
+
+#[test]
+fn c50_class2_omitted_domain_default_and_nullif_width() {
+    let dir=Scratch::new("c50-domain-nullif"); let server=Server::start(&dir.db(),&[]); let mut a=server.connect();
+    a.q("CREATE DOMAIN c_dom AS integer DEFAULT 1.5").ok("domain");
+    a.q("CREATE TABLE c_default(a integer,b c_dom)").ok("table");
+    assert_eq!(a.q("INSERT INTO c_default(a) VALUES(1) RETURNING b").single("inherited default"),"2");
+    let e=a.q("SELECT abs(NULLIF('-32768'::int2,1::int8))").err("retained width");
+    assert_eq!((e.code.as_str(),e.message.as_str()),("22003","smallint out of range"));
+}
+
+#[test]
+fn c50_class2_lower_integer_boundaries_and_float_casts() {
+    let dir=Scratch::new("c50-lower-bounds"); let server=Server::start(&dir.db(),&[]); let mut a=server.connect();
+    for (sql,message) in [
+        ("SELECT abs('-9223372036854775808'::int8)","bigint out of range"),
+        ("SELECT -('-2147483648'::int4)","integer out of range"),
+        ("SELECT -('-9223372036854775808'::int8)","bigint out of range"),
+        ("SELECT '-32768'::int2 - 1::int2","smallint out of range"),
+        ("SELECT '-2147483648'::int4 - 1::int4","integer out of range"),
+        ("SELECT '-9223372036854775808'::int8 - 1::int8","bigint out of range"),
+        ("SELECT '32768'::int2","value \"32768\" is out of range for type smallint"),
+        ("SELECT '-32769'::int2","value \"-32769\" is out of range for type smallint"),
+        ("SELECT '-2147483649'::int4","value \"-2147483649\" is out of range for type integer"),
+        ("SELECT '-9223372036854775809'::int8","value \"-9223372036854775809\" is out of range for type bigint"),
+        ("SELECT '32768'::float8::int2","smallint out of range"),
+        ("SELECT '2147483648'::float8::int4","integer out of range"),
+        ("SELECT '9223372036854775808'::float8::int8","bigint out of range"),
+    ] { let e=a.q(sql).err(sql); assert_eq!((e.code.as_str(),e.message.as_str()),("22003",message),"{sql}"); }
+}
