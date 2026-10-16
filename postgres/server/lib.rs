@@ -6841,6 +6841,51 @@ mod tests {
             })
             .collect();
         assert!(literals.is_empty(), "SQLSTATE literals outside the table: {literals:?}");
+        // Every other non-test source of this crate holds none at all (lead 2026-10-16T16:43:48Z (2)):
+        // each .rs file under the crate's directory but lib.rs, tests/ and the files lib.rs declares
+        // as `#[cfg(test)] mod`, examples included.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let test_mods: Vec<String> = source
+            .split("#[cfg(test)]\nmod ")
+            .skip(1)
+            .filter_map(|rest| rest.split(';').next())
+            .filter(|m| !m.contains(char::is_whitespace))
+            .map(|m| format!("{m}.rs"))
+            .collect();
+        let mut files = vec![root.to_path_buf()];
+        let mut scanned = Vec::new();
+        while let Some(path) = files.pop() {
+            if path.is_dir() {
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if path != root && (name == "tests" || name == "target") {
+                    continue;
+                }
+                for entry in std::fs::read_dir(&path).unwrap() {
+                    files.push(entry.unwrap().path());
+                }
+                continue;
+            }
+            let rel = path.strip_prefix(root).unwrap().to_string_lossy().to_string();
+            if !rel.ends_with(".rs") || rel == "lib.rs" || test_mods.contains(&rel) {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            let b = text.as_bytes();
+            let found: Vec<&str> = (0..b.len().saturating_sub(6))
+                .filter(|&i| b[i] == b'"' && b[i + 6] == b'"')
+                .map(|i| &text[i + 1..i + 6])
+                .filter(|s| {
+                    s.bytes().all(|c| c.is_ascii_digit() || c.is_ascii_uppercase())
+                        && s.bytes().any(|c| c.is_ascii_digit())
+                })
+                .collect();
+            assert!(found.is_empty(), "SQLSTATE literals in {rel}: {found:?}");
+            scanned.push(rel);
+        }
+        assert!(
+            scanned.iter().any(|f| f == "counters.rs"),
+            "the scan missed counters.rs: {scanned:?}"
+        );
     }
 
     /// C44-M1: a branch the engine refuses as in use is 55006 by the engine's typed error
