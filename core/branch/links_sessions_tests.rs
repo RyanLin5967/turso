@@ -106,8 +106,14 @@ fn ls_sessions_child() {
                 let _ = trunk.fork_branch().unwrap().into_id();
                 k += 1;
             }
-            // A session shorter than the fill: about 3 of its 16 batches.
-            std::thread::sleep(std::time::Duration::from_millis(130));
+            // A session shorter than the fill (about 3 of its 16 batches) that goes on working, as
+            // the adversary's sessions did (2,000 creates and a hold): an operation after the fill
+            // ends is what can start the checkpoint that flips the meta row.
+            let t = std::time::Instant::now();
+            while t.elapsed() < std::time::Duration::from_millis(130) {
+                let _ = trunk.fork_branch().unwrap().into_id();
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
         }
         println!("LS-SESSION s={s} meta={} log={}", meta_version(&path), log_bytes(&path));
     }
@@ -224,8 +230,15 @@ fn ls_failing_fill_child() {
     db.branch_wait_name_filter();
     let trunk = db.connect().unwrap();
     let log0 = log_bytes(&path);
+    let mut starts = db.branches.links_fill_state_for_test().2;
     for _ in 0..400 {
         let _ = trunk.fork_branch().unwrap().into_id();
+        let now = db.branches.links_fill_state_for_test().2;
+        if now != starts {
+            // Diagnostic only: where in the log each start came.
+            println!("LS-FAIL-START n={now} at={}", log_bytes(&path) - log0);
+            starts = now;
+        }
     }
     let grown = log_bytes(&path) - log0;
     println!("LS-FAIL starts={} grown={grown}", db.branches.links_fill_state_for_test().2);
