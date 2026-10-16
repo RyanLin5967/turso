@@ -38,8 +38,11 @@
 //! `warmup` or `measure`, `branch` the op's branch name (so budget.py can check, from the raw, that
 //! the two sides named their branches alike: wire review 15 item 29); `cpu_ns` is the calling thread's CPU time across the step
 //! (CLOCK_THREAD_CPUTIME_ID), and the last two are the process's unix system calls and
-//! instructions retired across it (turso_pg_server::counters, 0 where not counted). Each op starts
-//! with a `noop` step, two probes and nothing between, whose counts the budgets subtract.
+//! instructions retired across it (turso_pg_server::counters, 0 where not counted). Every step is
+//! preceded by a `noop` window of its own, two probes and nothing between, as every wire step follows
+//! an empty query of its own: each side's step is paired with its own adjacent floor (the
+//! pre-registered re-judgment's symmetric pairing, DECISIONS 06de6fd608; one noop per cycle sat
+//! four steps from the delete).
 
 use std::io::Write;
 use turso_core::branch::{BranchDurability, SyncClass};
@@ -262,12 +265,18 @@ fn main() {
         let name = format!("{}{seq}", a.name_prefix);
         let id = 1 + (seq * 7919) % a.rows;
 
-        // Two probes with nothing between: what the probes themselves cost, for the budget to
-        // subtract (the wire side subtracts its empty query the same way).
-        let p0 = Probe::now(&db);
-        let p1 = Probe::now(&db);
-        rec(seq, phase, "noop", p0, p1);
+        // Two probes with nothing between, before every step: what the probes themselves cost,
+        // for the budget to subtract from the step after it (the wire side subtracts the empty
+        // query just before each step the same way).
+        macro_rules! noop {
+            () => {{
+                let p0 = Probe::now(&db);
+                let p1 = Probe::now(&db);
+                rec(seq, phase, "noop", p0, p1);
+            }};
+        }
 
+        noop!();
         let p0 = Probe::now(&db);
         trunk.inner().create_branch(&name).unwrap();
         if a.plant_extra {
@@ -275,11 +284,13 @@ fn main() {
         }
         rec(seq, phase, "create", p0, Probe::now(&db));
 
+        noop!();
         let p0 = Probe::now(&db);
         let branch = PgConnection::new(db.connect_named(&name).unwrap());
         branch.adopt_session_of(&trunk);
         rec(seq, phase, "switch", p0, Probe::now(&db));
 
+        noop!();
         let p0 = Probe::now(&db);
         let mut stmt = branch
             .prepare(format!("UPDATE t SET v = v + 1 WHERE id = {id}"))
@@ -292,11 +303,13 @@ fn main() {
         }
         rec(seq, phase, "write", p0, Probe::now(&db));
 
+        noop!();
         let p0 = Probe::now(&db);
         trunk.adopt_session_of(&branch);
         drop(branch);
         rec(seq, phase, "main", p0, Probe::now(&db));
 
+        noop!();
         let p0 = Probe::now(&db);
         db.drop_branch(&name).unwrap();
         rec(seq, phase, "delete", p0, Probe::now(&db));
