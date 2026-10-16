@@ -10,9 +10,12 @@
 #
 # Stages (each timed into <out>/stages.tsv; the whole run's wall time is the last row):
 #   preflight  Ubuntu, passwordless sudo, free disk, the out dir new, the mode's refusals (below)
-#   selftests  the harness's own self-tests and the devguard root fire, before anything is paid for
 #   deps       apt (build tools, fio, strace, nvme-cli, smartmontools, fs tools, PGDG postgresql-18 without a
 #              cluster, MariaDB client), rustup with the repo's pinned toolchain
+#   quiet      t3lib.sh host_quiet: every active systemd timer and clock adjuster stopped (recorded in quiet.tsv),
+#              then CLOCK_REALTIME - CLOCK_MONOTONIC watched for 30 s and refused if it steps; finish() restarts them.
+#              After deps (apt can add timers), before everything timed
+#   selftests  the harness's own self-tests and the devguard root fire, before the build is paid for
 #   build      the engine driver fastest_profile (release, debug symbols), bbload/clonebench/sqlite3
 #              (competitors/build.sh), Dolt + Doltgres release binaries (competitors/fetch_dolt.sh), v3floor and
 #              the fire-check's statfs shim
@@ -22,8 +25,6 @@
 #              rc 0; fourth lane review LOW 14). That is the replay path only: the live loops' warm-ups are compared
 #              by live_check once the drivers record them (review 5 MED 8, LOUD-OWED; review 6 LOW 17), so rc 0 here
 #              does not yet mean an equal warm-up in the credited runs
-#   quiet      t3lib.sh host_quiet: every active systemd timer and clock adjuster stopped (recorded in quiet.tsv),
-#              then CLOCK_REALTIME - CLOCK_MONOTONIC watched for 30 s and refused if it steps; finish() restarts them
 #              Every timed run, ours and the competitors', runs under the ONE shared tracer sweeper (gates/sweeper.sh,
 #              read by gates/sweeper_record.py; the lead's MED 12 ruling): ours through t3lib.sh ours_timed_exec, its
 #              timed.json recording sweeper_cpu_s over fastest_profile's measured span (its summary.json
@@ -762,10 +763,16 @@ selftests() {
       { cat "$OUT/device-id-root-$d.txt"; echo "selftests: dev_identity cannot read /dev/$d's identity"; return 1; }
   done
 }
+# The host acts on nothing from here to the end (t3lib host_quiet: every systemd timer and clock adjuster stopped,
+# then the clocks watched for a step; finish() starts them again). It follows deps, whose apt installs can add and
+# start timers, and precedes everything timed: the selftests too (dry run 9, 2026-10-16: settle's 2 s quiet case
+# read 1.97 s off date +%s%N while lima-guestagent stepped CLOCK_REALTIME, before the stage stood here)
+quiet() { host_quiet "$OUT/quiet.tsv"; }
 stage preflight preflight
-stage selftests selftests
 stage deps deps
 export PATH="$HOME/.cargo/bin:$PATH"
+stage quiet quiet
+stage selftests selftests
 stage build build
 stage hwid hwid
 stage v3fixtures v3fixtures
@@ -785,10 +792,6 @@ warmup_conformance() {
 }
 envchecks() { fcenv_check && warmup_conformance; }
 stage envchecks envchecks
-# The host acts on nothing during the cells (t3lib host_quiet: every systemd timer and clock adjuster stopped, then
-# the clocks watched for a step); finish() starts them again
-quiet() { host_quiet "$OUT/quiet.tsv"; }
-stage quiet quiet
 if [ $DRY = 1 ]; then
   echo "dry run: the runner image mounts / nobarrier; remount with barrier as a T3 box has it"
   sudo mount -o remount,barrier / && findmnt -n -o OPTIONS / | tee "$OUT/root-mount.txt"
