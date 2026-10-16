@@ -7498,6 +7498,61 @@ fn a_foreign_key_the_catalog_refuses_is_refused_before_the_rebuild() {
     a.q("INSERT INTO c VALUES (6)").ok("c is unchanged");
 }
 
+/// create_with_keys's refusal and undo paths, which no test reached (wire review 16 item 13; the
+/// mutants that must turn this red are the server's check_table_keys call deleted and
+/// parent_key_resolves always true): a self-referencing key onto a column with no unique index
+/// (`up INT REFERENCES t(code)`) is 42830 and leaves no table t, in autocommit and in a block
+/// (which fails, then ROLLBACK, and still no t); a self-reference with no primary key to default
+/// to is 42830 too; a keyed CREATE that resolves, in a block, is kept by COMMIT (the RELEASE arm);
+/// and an ALTER adding a key onto a non-unique single column, while another session holds the
+/// trunk's write lock, is 42830 at once, not 55P03 after the wait (server lock wait 300 ms).
+#[test]
+fn create_with_keys_refuses_and_undoes() {
+    let dir = Scratch::new("keysundo");
+    let server = Server::start(&dir.db(), &["--lock-timeout-ms", "300"]);
+    let mut a = server.connect();
+    let exists = |a: &mut Wire, table: &str| {
+        a.q(&format!("SELECT count(*) FROM {table}"))
+            .error
+            .is_none()
+    };
+    let bad = "CREATE TABLE t(id INT PRIMARY KEY, code INT, up INT REFERENCES t(code))";
+    assert_eq!(a.q(bad).err(bad).code, "42830", "autocommit");
+    assert!(!exists(&mut a, "t"), "a refused t was kept");
+    a.q("BEGIN").ok("begin");
+    let r = a.q(bad);
+    assert_eq!(r.err(bad).code, "42830", "in a block");
+    assert_eq!(r.status, b'E', "the block fails");
+    a.q("ROLLBACK").ok("rollback");
+    assert!(!exists(&mut a, "t"), "a refused t was kept by the block");
+    let nopk = "CREATE TABLE n(id INT, up INT REFERENCES n)";
+    assert_eq!(
+        a.q(nopk).err(nopk).code,
+        "42830",
+        "a self-reference with no primary key"
+    );
+    assert!(!exists(&mut a, "n"));
+    a.q("BEGIN").ok("begin");
+    a.q("CREATE TABLE g(id INT PRIMARY KEY, up INT REFERENCES g(id))")
+        .ok("a keyed CREATE that resolves");
+    let r = a.q("COMMIT").ok("commit");
+    assert_eq!(r.tags, vec!["COMMIT".to_string()]);
+    assert!(exists(&mut a, "g"), "COMMIT kept g");
+    let orphan = "INSERT INTO g VALUES (1, 9)";
+    assert_eq!(a.q(orphan).err(orphan).code, "23503", "g's key holds");
+    a.q("CREATE TABLE p(id INT PRIMARY KEY, code INT)").ok("p");
+    a.q("CREATE TABLE c(x INT)").ok("c");
+    let mut w = server.connect();
+    w.q("BEGIN").ok("begin");
+    w.q("INSERT INTO p VALUES (9, 9)")
+        .ok("another session takes the write lock");
+    let alter = "ALTER TABLE c ADD FOREIGN KEY (x) REFERENCES p(code)";
+    let r = a.q(alter);
+    assert_eq!(r.err(alter).code, "42830", "not 55P03 after the lock wait");
+    assert_eq!(r.status, b'I');
+    w.q("ROLLBACK").ok("end");
+}
+
 /// A key the translator refuses (MATCH FULL over two columns, 0A000) is refused before an ALTER
 /// TABLE ADD FOREIGN KEY rebuilds the table, so while another session holds the trunk's write lock
 /// it is answered as it is, status I, not 55P03 after the lock wait, and the table is unchanged.
