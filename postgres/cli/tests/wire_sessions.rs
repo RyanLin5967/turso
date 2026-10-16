@@ -13227,3 +13227,6 @@ fn c44_lock_timeout_int32_max_is_accepted() {
     a.q("SET lock_timeout=2147483647").ok("maximum accepted timeout");
     assert_eq!(a.q("SHOW lock_timeout").single("timeout"), "2147483647ms");
 }
+
+#[path = "c44_followup/regressions.rs"]
+mod c44_followup;
