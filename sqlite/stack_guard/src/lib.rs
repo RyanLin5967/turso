@@ -188,8 +188,8 @@ impl Drop for Executing {
 
 /// Run `f` with at least `needs` bytes of stack: on this thread's stack when it has that much
 /// left, otherwise on a new stack segment of `needs` bytes (`stacker::maybe_grow`). For code with
-/// no `NestGuard` of ours inside it whose depth is bounded but large (libpg_query's C tree walks
-/// and its protobuf decode), where a refusal cannot be placed.
+/// bounded but potentially large foreign tree walks and tree destruction, where a refusal
+/// cannot be placed. Recursive Rust phases on the segment still use `NestGuard`.
 pub fn with_stack<R>(needs: usize, f: impl FnOnce() -> R) -> R {
     stacker::maybe_grow(needs, needs, f)
 }
