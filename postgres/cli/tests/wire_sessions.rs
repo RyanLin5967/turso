@@ -13265,3 +13265,16 @@ fn c54_bare_series_alias_resolves_in_correlated_subqueries() {
     a.q("CREATE TABLE u(g INT); INSERT INTO u VALUES (10)").ok("shadowing column");
     assert_eq!(a.q("SELECT count(*) FROM s, generate_series(1, s.x) AS g WHERE EXISTS (SELECT 1 FROM u WHERE g = 10)").single("inner column shadows series"), "3");
 }
+
+#[test]
+fn c54_full_join_merged_columns_are_explicitly_unsupported() {
+    let dir = Scratch::new("c54-full-using");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE j1(i INT); CREATE TABLE j2(i INT)").ok("join tables");
+    for sql in ["SELECT * FROM j1 FULL JOIN j2 USING(i)", "SELECT i FROM j1 FULL JOIN j2 USING(i)", "SELECT * FROM j1 NATURAL FULL JOIN j2"] {
+        assert_eq!(a.q(sql).err(sql).code, "0A000", "{sql}");
+    }
+    a.q("SELECT j1.i, j2.i FROM j1 FULL JOIN j2 ON j1.i = j2.i").ok("supported full join");
+    a.q("SELECT * FROM j1 LEFT JOIN j2 USING(i)").ok("supported using");
+}
