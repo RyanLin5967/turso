@@ -12255,6 +12255,20 @@ mod recorded {
         assert!(report.is_empty(), "{report}");
     }
 
+    /// Replay an unchanged sequence of commands selected from a committed PG recording.
+    pub(super) fn replay_selected(name: &str, recording: &str, ordinals: &[usize]) {
+        let commands = parse(recording);
+        let mut selected = String::new();
+        for &ordinal in ordinals {
+            let command = &commands[ordinal - 1];
+            selected.push_str(&format!(">> {}\n", command.text));
+            for line in &command.want {
+                selected.push_str(&format!("   {line}\n"));
+            }
+        }
+        replay(name, &selected, &selected, &[]);
+    }
+
     /// Replay `recording` on a fresh server and check that the commands answering otherwise than
     /// PostgreSQL are exactly `divergences`, with each registered answer pinned by `ours`.
     pub(super) fn replay(name: &str, recording: &str, ours: &str, divergences: &[(usize, &str)]) {
@@ -13274,6 +13288,24 @@ replays_postgresql!(
     ]
 );
 
+// C52: expectations are selected unchanged from the committed PG 18.6 recordings.
+macro_rules! c52_recorded_types {
+    ($test:ident, $file:literal, [$($n:literal),+]) => {
+        #[test]
+        fn $test() {
+            recorded::replay_selected($file, include_str!(concat!("pg18/", $file)), &[$($n),+]);
+        }
+    };
+}
+
+c52_recorded_types!(c52_boolean_returning_uses_pg_type, "pg18.out", [33, 34, 35, 36, 37, 38, 39, 40, 41]);
+c52_recorded_types!(c52_array_parameters_return_pg_text, "pg18-arrres.out", [1, 2, 3]);
+c52_recorded_types!(c52_parameter_description_uses_oid_array, "pg18-arrays.out", [1, 5]);
+c52_recorded_types!(c52_derived_count_has_pg_type, "pg18-audit1-ws-untyped_contexts_type_their_parameters.out", [2, 3, 18, 19]);
+c52_recorded_types!(c52_expression_columns_have_pg_types, "pg18-colnames.out", [2, 3, 5, 8]);
+c52_recorded_types!(c52_numeric_literal_has_pg_type, "pg18-colnames.out", [7]);
+c52_recorded_types!(c52_catalog_columns_have_pg_types, "pg18-audit2-pg_indexes_and_pg_database_size_answer.out", [1, 2, 3, 4]);
+c52_recorded_types!(c52_pg_typeof_reads_the_inferred_type, "pg18-random.out", [1]);
 
 // PG 18.6 card-row recordings: c44-pg18-errors.txt beside these tests.
 #[test]
@@ -13336,3 +13368,351 @@ replays_postgresql!(
         (24, "PGDIV-SQLITE-NAME-MESSAGE error-text [wire]: DROP TABLE dm1, dmmissing: PG 42P01 'table \"dmmissing\" does not exist'; ours 42P01 'Parse error: no such table: dmmissing' (nothing dropped on either)"),
     ]
 );
+
+// C50: each row is recorded in pg18/pg18-c33-intrange.out.
+#[test]
+fn c50_int8_cast_before_negation() {
+    let dir = Scratch::new("c50-int8_cast_before_negation");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE big(v BIGINT, i INT)").ok("typed operands");
+    a.q("INSERT INTO big VALUES (9223372036854775807, 2147483647), (1, 1)")
+        .ok("boundary operands");
+    let sql = "SELECT -9223372036854775808::int8";
+    let reply = a.q(sql);
+    let e = reply.err(sql);
+    assert_eq!((e.code.as_str(), e.message.as_str()), ("22003", "bigint out of range"), "{sql}");
+}
+
+#[test]
+fn c50_int8_min_abs() {
+    let dir = Scratch::new("c50-int8_min_abs");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE big(v BIGINT, i INT)").ok("typed operands");
+    a.q("INSERT INTO big VALUES (9223372036854775807, 2147483647), (1, 1)")
+        .ok("boundary operands");
+    let sql = "SELECT abs(-9223372036854775808::int8)";
+    let reply = a.q(sql);
+    let e = reply.err(sql);
+    assert_eq!((e.code.as_str(), e.message.as_str()), ("22003", "bigint out of range"), "{sql}");
+}
+
+#[test]
+fn c50_int8_text_cast() {
+    let dir = Scratch::new("c50-int8_text_cast");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE big(v BIGINT, i INT)").ok("typed operands");
+    a.q("INSERT INTO big VALUES (9223372036854775807, 2147483647), (1, 1)")
+        .ok("boundary operands");
+    let sql = "SELECT '9223372036854775808'::int8";
+    let reply = a.q(sql);
+    let e = reply.err(sql);
+    assert_eq!((e.code.as_str(), e.message.as_str()), ("22003", "value \"9223372036854775808\" is out of range for type bigint"), "{sql}");
+}
+
+#[test]
+fn c50_int8_constant_add() {
+    let dir = Scratch::new("c50-int8_constant_add");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE big(v BIGINT, i INT)").ok("typed operands");
+    a.q("INSERT INTO big VALUES (9223372036854775807, 2147483647), (1, 1)")
+        .ok("boundary operands");
+    let sql = "SELECT 9223372036854775807 + 1";
+    let reply = a.q(sql);
+    let e = reply.err(sql);
+    assert_eq!((e.code.as_str(), e.message.as_str()), ("22003", "bigint out of range"), "{sql}");
+}
+
+#[test]
+fn c50_int8_column_add() {
+    let dir = Scratch::new("c50-int8_column_add");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE big(v BIGINT, i INT)").ok("typed operands");
+    a.q("INSERT INTO big VALUES (9223372036854775807, 2147483647), (1, 1)")
+        .ok("boundary operands");
+    let sql = "SELECT v + 1 FROM big WHERE v > 1";
+    let reply = a.q(sql);
+    let e = reply.err(sql);
+    assert_eq!((e.code.as_str(), e.message.as_str()), ("22003", "bigint out of range"), "{sql}");
+}
+
+#[test]
+fn c50_int8_column_mul() {
+    let dir = Scratch::new("c50-int8_column_mul");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE big(v BIGINT, i INT)").ok("typed operands");
+    a.q("INSERT INTO big VALUES (9223372036854775807, 2147483647), (1, 1)")
+        .ok("boundary operands");
+    let sql = "SELECT v * 2 FROM big WHERE v > 1";
+    let reply = a.q(sql);
+    let e = reply.err(sql);
+    assert_eq!((e.code.as_str(), e.message.as_str()), ("22003", "bigint out of range"), "{sql}");
+}
+
+#[test]
+fn c50_int8_column_neg_sub() {
+    let dir = Scratch::new("c50-int8_column_neg_sub");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE big(v BIGINT, i INT)").ok("typed operands");
+    a.q("INSERT INTO big VALUES (9223372036854775807, 2147483647), (1, 1)")
+        .ok("boundary operands");
+    let sql = "SELECT -v - 2 FROM big WHERE v > 1";
+    let reply = a.q(sql);
+    let e = reply.err(sql);
+    assert_eq!((e.code.as_str(), e.message.as_str()), ("22003", "bigint out of range"), "{sql}");
+}
+
+#[test]
+fn c50_int4_constant_add() {
+    let dir = Scratch::new("c50-int4_constant_add");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE big(v BIGINT, i INT)").ok("typed operands");
+    a.q("INSERT INTO big VALUES (9223372036854775807, 2147483647), (1, 1)")
+        .ok("boundary operands");
+    let sql = "SELECT 2147483647::int4 + 1";
+    let reply = a.q(sql);
+    let e = reply.err(sql);
+    assert_eq!((e.code.as_str(), e.message.as_str()), ("22003", "integer out of range"), "{sql}");
+}
+
+#[test]
+fn c50_int4_column_add() {
+    let dir = Scratch::new("c50-int4_column_add");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE big(v BIGINT, i INT)").ok("typed operands");
+    a.q("INSERT INTO big VALUES (9223372036854775807, 2147483647), (1, 1)")
+        .ok("boundary operands");
+    let sql = "SELECT i + 1 FROM big WHERE v > 1";
+    let reply = a.q(sql);
+    let e = reply.err(sql);
+    assert_eq!((e.code.as_str(), e.message.as_str()), ("22003", "integer out of range"), "{sql}");
+}
+
+#[test]
+fn c50_int4_column_mul() {
+    let dir = Scratch::new("c50-int4_column_mul");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE big(v BIGINT, i INT)").ok("typed operands");
+    a.q("INSERT INTO big VALUES (9223372036854775807, 2147483647), (1, 1)")
+        .ok("boundary operands");
+    let sql = "SELECT i * 2 FROM big WHERE v > 1";
+    let reply = a.q(sql);
+    let e = reply.err(sql);
+    assert_eq!((e.code.as_str(), e.message.as_str()), ("22003", "integer out of range"), "{sql}");
+}
+
+#[test]
+fn c50_int4_text_cast() {
+    let dir = Scratch::new("c50-int4_text_cast");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE big(v BIGINT, i INT)").ok("typed operands");
+    a.q("INSERT INTO big VALUES (9223372036854775807, 2147483647), (1, 1)")
+        .ok("boundary operands");
+    let sql = "SELECT '2147483648'::int4";
+    let reply = a.q(sql);
+    let e = reply.err(sql);
+    assert_eq!((e.code.as_str(), e.message.as_str()), ("22003", "value \"2147483648\" is out of range for type integer"), "{sql}");
+}
+
+#[test]
+fn c50_int2_constant_add() {
+    let dir = Scratch::new("c50-int2_constant_add");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE big(v BIGINT, i INT)").ok("typed operands");
+    a.q("INSERT INTO big VALUES (9223372036854775807, 2147483647), (1, 1)")
+        .ok("boundary operands");
+    let sql = "SELECT 32767::int2 + 1::int2";
+    let reply = a.q(sql);
+    let e = reply.err(sql);
+    assert_eq!((e.code.as_str(), e.message.as_str()), ("22003", "smallint out of range"), "{sql}");
+}
+
+#[test]
+fn c50_int8_numeric_cast() {
+    let dir = Scratch::new("c50-int8_numeric_cast");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE big(v BIGINT, i INT)").ok("typed operands");
+    a.q("INSERT INTO big VALUES (9223372036854775807, 2147483647), (1, 1)")
+        .ok("boundary operands");
+    let sql = "SELECT CAST(9.5e18 AS BIGINT)";
+    let reply = a.q(sql);
+    let e = reply.err(sql);
+    assert_eq!((e.code.as_str(), e.message.as_str()), ("22003", "bigint out of range"), "{sql}");
+}
+
+#[test]
+fn c50_int4_numeric_cast() {
+    let dir = Scratch::new("c50-int4_numeric_cast");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE big(v BIGINT, i INT)").ok("typed operands");
+    a.q("INSERT INTO big VALUES (9223372036854775807, 2147483647), (1, 1)")
+        .ok("boundary operands");
+    let sql = "SELECT CAST(3e9 AS INT)";
+    let reply = a.q(sql);
+    let e = reply.err(sql);
+    assert_eq!((e.code.as_str(), e.message.as_str()), ("22003", "integer out of range"), "{sql}");
+}
+
+#[test]
+fn c50_int4_insert() {
+    let dir = Scratch::new("c50-int4_insert");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE big(v BIGINT, i INT)").ok("typed operands");
+    a.q("INSERT INTO big VALUES (9223372036854775807, 2147483647), (1, 1)")
+        .ok("boundary operands");
+    let sql = "INSERT INTO big VALUES (1, 2147483648)";
+    let reply = a.q(sql);
+    let e = reply.err(sql);
+    assert_eq!((e.code.as_str(), e.message.as_str()), ("22003", "integer out of range"), "{sql}");
+}
+
+// The complete numeric-special row in pg18/pg18-colnames.out, command 4.
+#[test]
+fn c50_numeric_specials_from_colnames_recording() {
+    let dir = Scratch::new("c50-numeric-specials");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE cn (a int, b text)").ok("cn");
+    a.q("INSERT INTO cn VALUES (1, 'x')").ok("row");
+    let sql = "SELECT 1 + 1, 'nan'::numeric / '0', 'Infinity'::float8::numeric, '42'::int2::numeric, a::int8, b::text FROM cn";
+    let r = a.q(sql).ok(sql);
+    assert_eq!(r.oids, Some(vec![23, 1700, 1700, 1700, 20, 25]));
+    assert_eq!(r.rows, vec![vec![Some("2".into()), Some("NaN".into()), Some("Infinity".into()), Some("42".into()), Some("1".into()), Some("x".into())]]);
+}
+
+/// Types come from the same inference even when Parse declares an argument, and evaluating
+/// pg_typeof must retain its argument's side effect exactly once.
+#[test]
+fn c52_pg_typeof_keeps_declared_types_and_argument_evaluation() {
+    let dir = Scratch::new("c52polymorphic");
+    let server = Server::start(&dir.db(), &[]);
+    let mut w = server.connect();
+    for (oid, value, name) in [(23, &b"7"[..], "integer"), (16, &b"true"[..], "boolean")] {
+        let reply = w.xt("SELECT pg_typeof($1)::text, $1", &[(oid, 0, value)]).ok("declared type");
+        assert_eq!(reply.oids, Some(vec![25, oid]));
+        assert_eq!(reply.rows[0][0].as_deref(), Some(name));
+    }
+    assert_eq!(w.q("SELECT pg_typeof(NULL)::text").single("unknown NULL"), "unknown");
+    assert_eq!(w.q("SELECT pg_typeof('literal')::text").single("unknown literal"), "unknown");
+    w.q("CREATE SEQUENCE c52_seq").ok("sequence");
+    assert_eq!(w.q("SELECT pg_typeof(nextval('c52_seq'))::text").single("side effect type"), "bigint");
+    assert_eq!(w.q("SELECT nextval('c52_seq')").single("exactly one previous evaluation"), "2");
+}
+
+#[test]
+fn c52_common_expression_types_consider_every_arm() {
+    let dir = Scratch::new("c52common");
+    let server = Server::start(&dir.db(), &[]);
+    let mut w = server.connect();
+    for sql in [
+        "SELECT CASE WHEN true THEN 1::int4 ELSE 2::int8 END",
+        "SELECT coalesce(1::int4, 2::int8)",
+        "SELECT greatest(1::int4, 2::int8)",
+        "SELECT 1::int4 UNION ALL SELECT 2::int8",
+        "VALUES (1::int4), (2::int8)",
+    ] {
+        let reply = w.q(sql).ok(sql);
+        assert_eq!(reply.oids, Some(vec![20]), "{sql}");
+    }
+}
+
+
+#[test]
+fn c52_returning_star_and_merged_join_star_keep_column_alignment() {
+    let dir = Scratch::new("c52star");
+    let server = Server::start(&dir.db(), &[]);
+    let mut w = server.connect();
+    w.q("CREATE TABLE a(id INT, flag BOOL)").ok("a");
+    w.q("CREATE TABLE b(id INT, txt TEXT)").ok("b");
+    let reply = w.q("INSERT INTO a VALUES (1, true) RETURNING *, false").ok("returning star");
+    assert_eq!(reply.oids, Some(vec![23, 16, 16]));
+    assert_eq!(reply.rows, vec![vec![Some("1".into()), Some("t".into()), Some("f".into())]]);
+    w.q("INSERT INTO b VALUES (1, 'b')").ok("b row");
+    let reply = w.q("SELECT * FROM a JOIN b USING(id)").ok("merged star");
+    assert_eq!(reply.oids, Some(vec![23, 16, 25]));
+    let reply = w.q("SELECT a.* FROM a JOIN b USING(id)").ok("qualified star");
+    assert_eq!(reply.oids, Some(vec![23, 16]));
+}
+
+#[test]
+fn c52_pg_typeof_arrays_and_select_bodies_use_the_shared_types() {
+    let dir = Scratch::new("c52bodies");
+    let server = Server::start(&dir.db(), &[]);
+    let mut w = server.connect();
+    for (oid, name) in [(1016, "bigint[]"), (1028, "oid[]"), (1005, "smallint[]"), (1015, "character varying[]")] {
+        assert_eq!(w.xt("SELECT pg_typeof($1)::text", &[(oid, 0, b"{1,2}")]).single("array type"), name);
+    }
+    w.q("CREATE VIEW c52_v AS SELECT pg_typeof(1)::text AS t").ok("view body");
+    assert_eq!(w.q("SELECT t FROM c52_v").single("view value"), "integer");
+    w.q("CREATE TABLE c52_t AS SELECT pg_typeof(1)::text AS t").ok("CTAS body");
+    assert_eq!(w.q("SELECT t FROM c52_t").single("CTAS value"), "integer");
+}
+
+#[test]
+fn c52_described_statement_cache_includes_declared_parameter_types() {
+    let dir = Scratch::new("c52cache");
+    let server = Server::start(&dir.db(), &[]);
+    let mut w = server.connect();
+    for (name, oid) in [("a", 23u32), ("b", 25u32)] {
+        let mut parse = format!("{name}\0SELECT pg_typeof($1)::text\0").into_bytes();
+        parse.extend_from_slice(&1i16.to_be_bytes());
+        parse.extend_from_slice(&oid.to_be_bytes());
+        w.send(b'P', &parse);
+    }
+    w.send(b'D', b"Sa\0");
+    w.send(b'S', &[]);
+    let reply = w.read_reply().ok("describe integer statement");
+    assert_eq!(reply.params, Some(vec![23]));
+    w.send(b'B', b"\0b\0\0\0\0\x01\0\0\0\x01x\0\0");
+    w.send(b'E', &[0, 0, 0, 0, 0]);
+    w.send(b'S', &[]);
+    assert_eq!(w.read_reply().single("execute distinct text statement"), "text");
+}
+
+
+#[test]
+fn c52_database_size_matches_its_documented_file_scope() {
+    let dir = Scratch::new("c52size");
+    let server = Server::start(&dir.db(), &[]);
+    let mut w = server.connect();
+    w.q("CREATE TABLE ix(id INT PRIMARY KEY, a INT, b TEXT UNIQUE)").ok("ix");
+    w.q("CREATE INDEX ix_a ON ix(a)").ok("index");
+    for after_write in [false, true] {
+        if after_write {
+            w.q("INSERT INTO ix VALUES(1, 1, 'one')").ok("change physical state");
+        }
+        let reply = w.q("SELECT pg_database_size(current_database())").ok("physical size");
+        assert_eq!(reply.oids, Some(vec![20]));
+        let bytes: u64 = reply.rows[0][0].as_ref().unwrap().parse().unwrap();
+        let main = std::fs::metadata(dir.db()).unwrap().len();
+        let wal_path = format!("{}-wal", dir.db().display());
+        let wal = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+        eprintln!("C52 database size: after_write={after_write}, main={main}, wal={wal}, reported={bytes}");
+        assert_eq!(bytes, main + wal);
+    }
+}
+
+#[test]
+fn c52_view_of_integer_constant_retains_its_type() {
+    let dir = Scratch::new("c52viewconstant");
+    let server = Server::start(&dir.db(), &[]);
+    let mut w = server.connect();
+    w.q("CREATE VIEW c52_constant AS SELECT 1 AS n").ok("constant view");
+    let reply = w.q("SELECT n FROM c52_constant").ok("constant result");
+    assert_eq!(reply.oids, Some(vec![23]));
+    assert_eq!(reply.rows, vec![vec![Some("1".into())]]);
+}

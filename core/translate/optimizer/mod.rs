@@ -553,6 +553,8 @@ pub fn optimize_plan(
     plan: &mut Plan,
     resolver: &Resolver,
 ) -> Result<()> {
+    // Stack-guard class (fastest-engine): a recursive entry is a nested step (`stack::NestGuard`).
+    let _nest = crate::stack::NestGuard::enter("a recursive step")?;
     let resources_before = subquery_resources(plan);
     match plan {
         Plan::Select(plan) => optimize_select_plan(plan, resolver)?,

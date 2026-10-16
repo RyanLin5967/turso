@@ -70,11 +70,11 @@ impl Dialect for PostgresDialect {
         };
 
         let parse_result =
-            turso_pg_parser::parse(raw_sql).map_err(|e| LimboError::ParseError(e.into()))?;
+            turso_pg_parser::parse(raw_sql).map_err(crate::session::pg_parse_error)?;
         let translator = turso_pg_parser::translator::PostgreSQLTranslator::new();
         let stmt = translator
             .translate(&parse_result)
-            .map_err(|e| LimboError::ParseError(e.into()))?;
+            .map_err(crate::session::pg_parse_error)?;
         match stmt {
             turso_parser::ast::Stmt::CreateTable { tbl_name, body, .. } => {
                 let mut table = BTreeTable::from_create_table_ast(&tbl_name, &body, root_page)?;
@@ -102,11 +102,11 @@ impl Dialect for PostgresDialect {
         };
 
         let parse_result =
-            turso_pg_parser::parse(raw_sql).map_err(|e| LimboError::ParseError(e.into()))?;
+            turso_pg_parser::parse(raw_sql).map_err(crate::session::pg_parse_error)?;
         let translator = turso_pg_parser::translator::PostgreSQLTranslator::new();
         let stmt = translator
             .translate(&parse_result)
-            .map_err(|e| LimboError::ParseError(e.into()))?;
+            .map_err(crate::session::pg_parse_error)?;
         match stmt {
             stmt @ turso_parser::ast::Stmt::CreateTable { .. } => Ok(stmt),
             _ => Err(LimboError::ParseError(
@@ -188,6 +188,7 @@ impl Dialect for PostgresDialect {
         }
         if enable_custom_types {
             register_bpchar(schema)?;
+            register_oid(schema)?;
         }
         Ok(())
     }
@@ -347,19 +348,143 @@ pub(crate) fn user_tables_sorted(schema: &Schema) -> Vec<(&String, &Arc<Table>)>
     tables
 }
 
+/// Exact metadata for exposed catalog columns, from PostgreSQL 18.6 postgres.bki
+/// and system_views.sql / information_schema.sql. Catalog internal char is OID 18;
+/// it must not share the ordinary SQL CHAR declaration mapping.
+pub(crate) fn catalog_column_oid(relation: &str, column: &str) -> Option<u32> {
+    let relation = relation.to_ascii_lowercase();
+    let column = column.to_ascii_lowercase();
+    Some(match (relation.as_str(), column.as_str()) {
+        ("information_schema_columns", "table_catalog" | "table_schema" | "table_name" | "column_name" | "udt_catalog" | "udt_schema" | "udt_name") => 19, // name
+        ("information_schema_columns", "column_default" | "is_nullable" | "data_type") => 1043, // varchar
+        ("information_schema_key_column_usage", "constraint_catalog" | "constraint_schema" | "constraint_name" | "table_catalog" | "table_schema" | "table_name" | "column_name") => 19, // name
+        ("information_schema_table_constraints", "constraint_catalog" | "constraint_schema" | "constraint_name" | "table_catalog" | "table_schema" | "table_name") => 19, // name
+        ("information_schema_table_constraints", "constraint_type" | "is_deferrable" | "initially_deferred") => 1043, // varchar
+        ("information_schema_tables", "table_catalog" | "table_schema" | "table_name") => 19, // name
+        ("information_schema_tables", "table_type") => 1043, // varchar
+        ("pg_am", "amtype") => 18, // char
+        ("pg_am", "amname") => 19, // name
+        ("pg_am", "oid") => 26, // oid
+        ("pg_attrdef", "adnum") => 21, // int2
+        ("pg_attrdef", "oid" | "adrelid") => 26, // oid
+        ("pg_attribute", "attbyval" | "attnotnull" | "atthasdef" | "atthasmissing" | "attisdropped" | "attislocal") => 16, // bool
+        ("pg_attribute", "attstorage" | "attalign" | "attidentity" | "attgenerated") => 18, // char
+        ("pg_attribute", "attname") => 19, // name
+        ("pg_attribute", "attstattarget" | "attlen" | "attnum" | "attndims" | "attinhcount") => 21, // int2
+        ("pg_attribute", "attrelid" | "atttypid" | "attcollation") => 26, // oid
+        ("pg_class", "relhasindex" | "relisshared" | "relhasrules" | "relhastriggers" | "relhassubclass" | "relrowsecurity" | "relforcerowsecurity" | "relispopulated" | "relispartition") => 16, // bool
+        ("pg_class", "relpersistence" | "relkind" | "relreplident") => 18, // char
+        ("pg_class", "relname") => 19, // name
+        ("pg_class", "relnatts" | "relchecks") => 21, // int2
+        ("pg_class", "oid" | "relnamespace" | "reltype" | "reloftype" | "relowner" | "relam" | "relfilenode" | "reltablespace" | "reltoastrelid" | "relrewrite") => 26, // oid
+        ("pg_collation", "collisdeterministic") => 16, // bool
+        ("pg_collation", "collprovider") => 18, // char
+        ("pg_collation", "collname") => 19, // name
+        ("pg_collation", "oid" | "collnamespace" | "collowner") => 26, // oid
+        ("pg_constraint", "condeferrable" | "condeferred" | "convalidated" | "conislocal" | "connoinherit") => 16, // bool
+        ("pg_constraint", "contype" | "confupdtype" | "confdeltype" | "confmatchtype") => 18, // char
+        ("pg_constraint", "conname") => 19, // name
+        ("pg_constraint", "coninhcount") => 21, // int2
+        ("pg_constraint", "oid" | "connamespace" | "conrelid" | "contypid" | "conindid" | "conparentid" | "confrelid") => 26, // oid
+        ("pg_database", "datistemplate" | "datallowconn") => 16, // bool
+        ("pg_database", "datlocprovider") => 18, // char
+        ("pg_database", "datname") => 19, // name
+        ("pg_database", "oid" | "datdba" | "dattablespace") => 26, // oid
+        ("pg_description", "objoid" | "classoid") => 26, // oid
+        ("pg_foreign_table", "ftrelid" | "ftserver") => 26, // oid
+        ("pg_index", "indisunique" | "indisprimary" | "indisexclusion" | "indimmediate" | "indisclustered" | "indisvalid" | "indcheckxmin" | "indisready" | "indislive" | "indisreplident") => 16, // bool
+        ("pg_index", "indnatts" | "indnkeyatts") => 21, // int2
+        ("pg_index", "indexrelid" | "indrelid") => 26, // oid
+        ("pg_indexes", "schemaname" | "tablename" | "indexname" | "tablespace") => 19, // name
+        ("pg_inherits", "inhdetachpending") => 16, // bool
+        ("pg_inherits", "inhrelid" | "inhparent") => 26, // oid
+        ("pg_namespace", "nspname") => 19, // name
+        ("pg_namespace", "oid" | "nspowner") => 26, // oid
+        ("pg_partitioned_table", "partstrat") => 18, // char
+        ("pg_partitioned_table", "partnatts") => 21, // int2
+        ("pg_partitioned_table", "partrelid" | "partdefid") => 26, // oid
+        ("pg_policy", "polpermissive") => 16, // bool
+        ("pg_policy", "polcmd") => 18, // char
+        ("pg_policy", "polname") => 19, // name
+        ("pg_policy", "oid" | "polrelid") => 26, // oid
+        ("pg_proc", "prosecdef" | "proleakproof" | "proisstrict" | "proretset") => 16, // bool
+        ("pg_proc", "prokind" | "provolatile" | "proparallel") => 18, // char
+        ("pg_proc", "proname") => 19, // name
+        ("pg_proc", "pronargs" | "pronargdefaults") => 21, // int2
+        ("pg_proc", "oid" | "pronamespace" | "proowner" | "prolang" | "provariadic" | "prorettype") => 26, // oid
+        ("pg_publication", "puballtables" | "pubinsert" | "pubupdate" | "pubdelete" | "pubtruncate" | "pubviaroot") => 16, // bool
+        ("pg_publication", "pubname") => 19, // name
+        ("pg_publication", "oid" | "pubowner") => 26, // oid
+        ("pg_publication_namespace", "oid" | "pnpubid" | "pnnspid") => 26, // oid
+        ("pg_publication_rel", "oid" | "prpubid" | "prrelid") => 26, // oid
+        ("pg_rewrite", "is_instead") => 16, // bool
+        ("pg_rewrite", "ev_type" | "ev_enabled") => 18, // char
+        ("pg_rewrite", "rulename") => 19, // name
+        ("pg_rewrite", "oid" | "ev_class") => 26, // oid
+        ("pg_roles", "rolsuper" | "rolinherit" | "rolcreaterole" | "rolcreatedb" | "rolcanlogin" | "rolreplication" | "rolbypassrls") => 16, // bool
+        ("pg_roles", "rolname") => 19, // name
+        ("pg_roles", "oid") => 26, // oid
+        ("pg_sequences", "cycle") => 16, // bool
+        ("pg_sequences", "schemaname" | "sequencename" | "sequenceowner") => 19, // name
+        ("pg_statistic_ext", "stxname") => 19, // name
+        ("pg_statistic_ext", "stxstattarget") => 21, // int2
+        ("pg_statistic_ext", "oid" | "stxrelid" | "stxnamespace" | "stxowner") => 26, // oid
+        ("pg_tables", "hasindexes" | "hasrules" | "hastriggers" | "rowsecurity") => 16, // bool
+        ("pg_tables", "schemaname" | "tablename" | "tableowner" | "tablespace") => 19, // name
+        ("pg_trigger", "tgisinternal" | "tgdeferrable" | "tginitdeferred") => 16, // bool
+        ("pg_trigger", "tgenabled") => 18, // char
+        ("pg_trigger", "tgname" | "tgoldtable" | "tgnewtable") => 19, // name
+        ("pg_trigger", "tgtype" | "tgnargs") => 21, // int2
+        ("pg_trigger", "oid" | "tgrelid" | "tgfoid" | "tgconstrrelid" | "tgconstrindid" | "tgconstraint") => 26, // oid
+        ("pg_type", "typbyval" | "typispreferred" | "typisdefined" | "typnotnull") => 16, // bool
+        ("pg_type", "typtype" | "typcategory" | "typdelim" | "typalign" | "typstorage") => 18, // char
+        ("pg_type", "typname") => 19, // name
+        ("pg_type", "typlen") => 21, // int2
+        ("pg_type", "oid" | "typnamespace" | "typowner" | "typrelid" | "typelem" | "typarray" | "typbasetype" | "typcollation") => 26, // oid
+        _ => return None,
+    })
+}
+
+fn register_oid(schema: &mut Schema) -> Result<()> {
+    use turso_parser::ast::{Cmd, Stmt};
+    const SQL: &str = "CREATE TYPE oid(value integer) BASE integer ENCODE value DECODE value";
+    let mut parser = turso_parser::parser::Parser::new(SQL.as_bytes());
+    let Ok(Some(Cmd::Stmt(Stmt::CreateType {
+        type_name, body, ..
+    }))) = parser.next_cmd()
+    else {
+        return Err(LimboError::InternalError(
+            "the built-in oid definition does not parse".into(),
+        ));
+    };
+    let definition =
+        turso_core::schema::TypeDef::from_create_type(&type_name, &body, true, SQL.into())?;
+    schema
+        .type_registry
+        .insert(type_name.to_lowercase(), Arc::new(definition));
+    Ok(())
+}
+
 /// Map a SQLite type string to a PostgreSQL type OID.
 /// Strips parenthesized parameters (e.g. `varchar(100)` -> `VARCHAR`) before matching.
 pub(crate) fn sqlite_type_to_pg_oid(ty_str: &str) -> i64 {
+    i64::from(builtin_type_oid(ty_str).unwrap_or(25))
+}
+
+/// A supported built-in declaration's OID. Unlike catalog display's text fallback,
+/// inference must distinguish an unknown name from an actual TEXT declaration.
+pub(crate) fn builtin_type_oid(ty_str: &str) -> Option<u32> {
     let base = match ty_str.find('(') {
         Some(pos) => &ty_str[..pos],
         None => ty_str,
     };
-    match base.to_uppercase().as_str() {
+    Some(match base.to_uppercase().as_str() {
         "INTEGER" | "INT" | "INT4" => 23,
         "SMALLINT" | "INT2" => 21,
         "BIGINT" | "INT8" => 20,
         "TINYINT" | "MEDIUMINT" => 23,
         "TEXT" => 25,
+        "NAME" => 19,
         "VARCHAR" | "CHAR" | "CLOB" | "NCHAR" | "NVARCHAR" | "CHARACTER VARYING" => 1043,
         "BPCHAR" => 1042,
         // REAL is PostgreSQL's real, float4: a declaration stored before the FLOAT4 / FLOAT8
@@ -380,8 +505,8 @@ pub(crate) fn sqlite_type_to_pg_oid(ty_str: &str) -> i64 {
         "CIDR" => 650,
         "MACADDR" => 829,
         "OID" => 26,
-        _ => 25, // default to text
-    }
+        _ => return None,
+    })
 }
 
 /// Build a mapping from table name to OID for all user tables.

@@ -344,8 +344,25 @@ impl PgNumeric {
     }
 
     /// Numeric input text, or `None` for text that is not a number (the caller words the refusal).
+    /// PostgreSQL's input exponent bound first (review C38 MED 2; numeric.c `set_var_from_str`): an
+    /// exponent past INT_MAX / 2 either way, or one no integer holds, is 22003 "value overflows
+    /// numeric format", even on a zero (PG 18.6: '0e1073741823' is 0, '0e1073741824' overflows; raw
+    /// pg18-numeric-exponent.txt). Mutant `numeric_exponent_unbounded` (test builds only): no bound.
     pub fn parse(text: &str) -> Option<crate::Result<Self>> {
         use std::str::FromStr;
+        const PG_MAX_EXPONENT: i128 = (i32::MAX / 2) as i128;
+        let trimmed = text.trim();
+        if let Some(at) = trimmed.find(['e', 'E']) {
+            let (mantissa, exp) = (&trimmed[..at], &trimmed[at + 1..]);
+            let digits = exp.strip_prefix(['+', '-']).unwrap_or(exp);
+            let numeric_shape = !mantissa.is_empty() && !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit());
+            if numeric_shape && !crate::branch::store::fe_mutant("numeric_exponent_unbounded") {
+                let bounded = exp.parse::<i128>().ok().filter(|e| (-PG_MAX_EXPONENT..=PG_MAX_EXPONENT).contains(e));
+                if bounded.is_none() && BigDecimal::from_str(&format!("{mantissa}e0")).is_ok() {
+                    return Some(Err(LimboError::Constraint(SqlErrorMessage::classified(SqlErrorKind::NumericValueOutOfRange, "value overflows numeric format"))));
+                }
+            }
+        }
         BigDecimal::from_str(text).ok().map(Self::new)
     }
 
@@ -483,6 +500,19 @@ fn validate_precision_scale(val: &BigDecimal, precision: i64, scale: i64) -> cra
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn c50_numeric_special_values_use_the_existing_numeric_representation() {
+        use super::PgNumeric;
+        let nan = PgNumeric::parse("NaN").expect("PG numeric accepts NaN").unwrap();
+        let infinity = PgNumeric::parse("Infinity").expect("PG numeric accepts Infinity").unwrap();
+        for (value, text) in [(&nan, "NaN"), (&infinity, "Infinity")] {
+            assert_eq!(value.format(), text);
+            assert_eq!(PgNumeric::from_blob(&value.to_blob()).unwrap(), *value);
+        }
+        assert_eq!(nan.div(&PgNumeric::from_i64(0)).unwrap().format(), "NaN");
+        assert!(nan > infinity);
+    }
+
     use super::*;
     use bigdecimal::Zero;
     use std::str::FromStr;

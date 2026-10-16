@@ -173,6 +173,14 @@ pub fn translate_inner(
     input: &str,
     origin: crate::statement::StatementOrigin,
 ) -> Result<()> {
+    // Stack-guard class (fastest-engine): the statement's outermost step, so that every step below
+    // it (a DML statement's first subquery included: lead, ultrareview instance (ii)) is nested and
+    // checked. Mutant `nest_statement_unguarded` (test builds only): no guard here.
+    let _nest = if crate::branch::store::fe_mutant("nest_statement_unguarded") {
+        None
+    } else {
+        Some(crate::stack::NestGuard::enter("a statement")?)
+    };
     let is_write = matches!(
         stmt,
         ast::Stmt::AlterTable { .. }
@@ -585,6 +593,22 @@ mod tests {
     use crate::vdbe::insn::Insn;
     use crate::Database;
     use crate::SqliteDialect;
+
+    #[test]
+    fn c50_sqlite_integer_overflow_stays_real() {
+        let db = Database::open_file(Arc::new(MemoryIO::new()), ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let conn = db.connect().unwrap();
+        for sql in [
+            "SELECT typeof(9223372036854775807 + 1)",
+            "SELECT typeof(-9223372036854775808 - 1)",
+            "SELECT typeof(9223372036854775807 * 2)",
+            "SELECT typeof(-(-9223372036854775808))",
+            "SELECT typeof(-9223372036854775808 / -1)",
+        ] {
+            let rows = conn.prepare(sql).unwrap().run_collect_rows().unwrap();
+            assert_eq!(rows[0][0], crate::Value::from_text("real"), "{sql}");
+        }
+    }
 
     /// Verify that REGEXP produces the correct error when no regexp function is registered.
     #[test]

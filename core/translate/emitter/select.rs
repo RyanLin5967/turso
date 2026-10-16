@@ -38,6 +38,8 @@ pub fn emit_program_for_select(
     resolver: &Resolver,
     plan: SelectPlan,
 ) -> Result<()> {
+    // Stack-guard class (fastest-engine): a recursive entry is a nested step (`stack::NestGuard`).
+    let _nest = crate::stack::NestGuard::enter("a recursive step")?;
     emit_program_for_select_with_resolver(program, resolver.fork(), plan)
 }
 
@@ -80,10 +82,8 @@ pub fn emit_query<'a>(
     plan: &'a mut SelectPlan,
     t_ctx: &mut TranslateCtx<'a>,
 ) -> Result<usize> {
-    // Every nested query's emission passes here, a FROM subquery's and a WHERE or scalar one's
-    // (`stack::NestGuard`): only the FROM ones were checked, so the stack between two checks
-    // could hold an unchecked emission level (fastest-engine, on the NestGuard margin).
-    let _nest = crate::stack::NestGuard::enter("subqueries")?;
+    // Stack-guard class (fastest-engine): a recursive entry is a nested step (`stack::NestGuard`).
+    let _nest = crate::stack::NestGuard::enter("a recursive step")?;
     let after_main_loop_label = program.allocate_label();
     t_ctx.label_main_loop_end = Some(after_main_loop_label);
 

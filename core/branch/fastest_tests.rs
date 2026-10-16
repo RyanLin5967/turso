@@ -1387,6 +1387,103 @@ fn a_released_name_is_free_while_a_fuzzy_checkpoint_is_in_flight() {
     assert_eq!(db.branch_named("x").unwrap(), Some(b), "after a reopen");
 }
 
+/// L2(d) (the capture freezes `fresh` and `gone` instead of copying them, `NameIndex`): a fuzzy
+/// checkpoint whose write fails gives its frozen names back, so the next checkpoint writes them. A
+/// name created before the failed capture (`kept`) is still found once its state is evicted (resident
+/// cap 0) and after a reopen, and a name released before it (`freed`) is still free: it resolves to
+/// nothing and can be given again, also after a reopen. Mutant `frozen_names_dropped_on_failure`.
+#[test]
+fn a_failed_fuzzy_checkpoint_gives_its_frozen_names_back() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("frozen-back.db");
+    let fuzzy = || opts(true, SyncClass::Fsync).with_branch_checkpoint(super::BranchCheckpoint::Fuzzy);
+    let (kept, incarnation) = {
+        let db = open_at(&path, fuzzy());
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        trunk.create_branch("freed").unwrap();
+        db.branch_compact_now().unwrap();
+        db.drop_branch("freed").unwrap();
+        let kept = trunk.create_branch("kept").unwrap();
+        db.branch_failpoint(Some(BranchFailpoint::CheckpointWriteFails));
+        assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: the failing fuzzy checkpoint started");
+        db.branch_checkpoint_wait();
+        db.branch_failpoint(None);
+        assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: the next fuzzy checkpoint started");
+        db.branch_checkpoint_wait();
+        db.branch_set_resident_cap(Some(0));
+        db.branch_compact_now().unwrap();
+        assert_eq!(db.branch_named("kept").unwrap(), Some(kept), "CLAIM: a name created before a failed checkpoint was lost once evicted");
+        assert_eq!(db.branch_named("freed").unwrap(), None, "CLAIM: a name released before a failed checkpoint resolved again");
+        (kept, db.incarnation)
+    };
+    let db = reopen(&path, fuzzy(), incarnation);
+    assert_eq!(db.branch_named("kept").unwrap(), Some(kept), "CLAIM: after a reopen, a name created before a failed checkpoint was lost");
+    assert_eq!(db.branch_named("freed").unwrap(), None, "CLAIM: after a reopen, a name released before a failed checkpoint resolved again");
+    assert!(db.connect().unwrap().create_branch("freed").is_ok(), "CLAIM: a released name could not be given again");
+}
+
+/// L2(d) slice 2: a fuzzy checkpoint's rows are exact to its capture although the states change
+/// while it is in flight. The writer is held before it encodes the frozen rows
+/// (`HOLD_BEFORE_ROWS`); meanwhile branch `a` is written again, `b` is dropped, and `a` forks a
+/// child: each change reaches a frozen state, so the table encodes its pre-image first. The rows
+/// the writer gets must equal the rows the capture would have built (`CAPTURE_VERIFY_FORCED`, the
+/// capture builds them too, the old way), and after a reopen every acknowledged change is there.
+/// Premise: the copy-on-write encoded at least one pre-image (`COW_PRESERVES`). Mutant
+/// `cow_preserve_skipped`.
+#[test]
+fn a_branch_changed_while_its_row_is_frozen_is_written_as_of_the_capture() {
+    use std::sync::atomic::Ordering::{Relaxed, Release};
+    let _s = serial();
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            super::store::CAPTURE_VERIFY_FORCED.store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+    let _r = Reset;
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("cow-rows.db");
+    let fuzzy = || opts(true, SyncClass::Fsync).with_branch_checkpoint(super::BranchCheckpoint::Fuzzy);
+    let incarnation = {
+        let db = open_at(&path, fuzzy());
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        trunk.create_branch("a").unwrap();
+        trunk.create_branch("b").unwrap();
+        let a = db.connect_named("a").unwrap();
+        a.execute("UPDATE t SET v = 'a1' WHERE id = 1").unwrap();
+        super::store::CAPTURE_VERIFY_FAILURES.lock().unwrap().clear();
+        super::store::CAPTURE_VERIFY_FORCED.store(true, Release);
+        let preserves0 = super::table::COW_PRESERVES.load(Relaxed);
+        db.branch_checkpoint_hold(super::store::HOLD_BEFORE_ROWS);
+        assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: a fuzzy checkpoint started");
+        let t = std::time::Instant::now();
+        while db.branch_checkpoint_held() != super::store::HOLD_BEFORE_ROWS | super::store::HOLD_ARRIVED {
+            assert!(t.elapsed() < std::time::Duration::from_secs(10), "premise: the writer never reached its rows");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        a.execute("UPDATE t SET v = 'a2' WHERE id = 2").unwrap();
+        let child = a.fork_branch().unwrap().into_id();
+        db.drop_branch("b").unwrap();
+        db.branch_checkpoint_hold(0);
+        db.branch_checkpoint_wait();
+        super::store::CAPTURE_VERIFY_FORCED.store(false, Release);
+        let preserved = super::table::COW_PRESERVES.load(Relaxed) - preserves0;
+        assert!(preserved >= 1, "premise: no change reached a frozen state while the writer was held");
+        let failures = super::store::CAPTURE_VERIFY_FAILURES.lock().unwrap().clone();
+        assert!(failures.is_empty(), "CLAIM: a fuzzy checkpoint's rows were not exact to its capture: {failures:?}");
+        let _ = child;
+        drop(a);
+        db.incarnation
+    };
+    let db = reopen(&path, fuzzy(), incarnation);
+    assert_eq!(db.branch_named("b").unwrap(), None, "after a reopen, a dropped branch resolved");
+    let a = db.connect_named("a").unwrap();
+    assert_eq!((read_v(&a, 1), read_v(&a, 2)), ("a1".to_string(), "a2".to_string()), "after a reopen, a's writes are not all there");
+}
+
 /// Review C-F3: a named server branch takes no `Branch` handle — a handle's drop would release it
 /// and a handle could lease it, and nothing but `Database::drop_branch` may end a named branch.
 #[test]
@@ -3453,6 +3550,14 @@ fn an_arena_sync_failure_in_a_compaction_or_checkpoint_fail_stops() {
 /// small multiple of n/256 (256 shards), and the filter ends under n/2 entries (a rebuild keeps it
 /// near twice the larger of the live names and its rebuild floor). Before: one insert moved half
 /// of all the names ever created, and the filter held all n.
+///
+/// RE-SPECIFIED (lead order 2026-10-15, review REVIEW-claude-namefilter-2 LOW; a flagged edit of a
+/// red's instrument, not of its claim): the filter's growth moved off the mutex, and `moved_max`
+/// became the entries one growth copies on its own thread, which grows with n by design, so the
+/// first bound read a number the claim is not about. The claim, "never stalls one create with a
+/// rehash", is now read where it lives: the most entries one note moved inside its store-mutex hold
+/// (`name_filter_held_moves_for_test`), within the same n/256 bound (0 by construction; mutant
+/// `name_filter_grows_in_note` moves them all). The bound on entries is unchanged.
 #[test]
 fn the_name_filter_stays_bounded_under_churn() {
     let _s = serial();
@@ -3467,7 +3572,8 @@ fn the_name_filter_stays_bounded_under_churn() {
         db.drop_branch(&name).unwrap();
     }
     db.branch_wait_name_filter();
-    let (built, entries, moved, _, _) = db.branch_name_filter_stats();
+    let (built, entries, _, _, _) = db.branch_name_filter_stats();
+    let moved = db.branches.name_filter_held_moves_for_test();
     assert!(built, "premise: the name filter is built");
     assert!(
         moved <= 4 * n / 256 + 64,
@@ -3501,6 +3607,74 @@ fn a_failed_name_scan_is_retried() {
     assert_eq!(failed, 1, "the failed scan was not counted");
     assert!(built && builds == 1, "the name filter was not built after its scan failed once");
     assert!(db.connect().unwrap().create_branch("held").is_err(), "a held name was given again");
+}
+
+/// Review REVIEW-claude-namefilter-2 MED-1: a close joins EVERY name-filter thread. The handle was
+/// one slot, so a rebuild started while the open's build was held overwrote that build's handle,
+/// and close returned with the build still alive, holding a catalog connection and the store's
+/// files. Here the open's build is held before its scan (`NAME_SCAN_HOLD`), creates fill its
+/// pending table until the filter overflows and a rebuild starts, and the held build is released
+/// 300 ms after the close begins. When the close returns, no filter thread may be alive
+/// (`FILTER_THREADS_LIVE`, counted from each thread's first statement to its last).
+#[test]
+fn a_close_joins_every_name_filter_thread() {
+    use std::sync::atomic::Ordering as O;
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("filter-join.db");
+    let incarnation = {
+        let db = open_at(&path, opts(true, SyncClass::Off));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        trunk.create_branch("held").unwrap();
+        db.branch_compact_now().unwrap();
+        db.incarnation
+    };
+    struct Release;
+    impl Drop for Release {
+        fn drop(&mut self) {
+            super::store::NAME_SCAN_HOLD.store(0, std::sync::atomic::Ordering::Release);
+        }
+    }
+    let _r = Release;
+    let live0 = super::store::FILTER_THREADS_LIVE.load(O::Acquire);
+    super::store::NAME_SCAN_HOLD.store(1, O::Release);
+    let db = reopen(&path, opts(true, SyncClass::Off), incarnation);
+    let t = std::time::Instant::now();
+    while super::store::NAME_SCAN_HOLD.load(O::Acquire) != 1 | super::store::HOLD_ARRIVED {
+        assert!(t.elapsed() < std::time::Duration::from_secs(30), "premise: the open's build never reached its scan");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let trunk = db.connect().unwrap();
+    let mut i = 0u32;
+    while db.branches.name_filter_state_for_test().1 == 0 {
+        assert!(i < 200_000, "premise: {i} creates never overflowed the held build's pending table");
+        trunk.create_branch(&format!("fill-{i}")).unwrap();
+        i += 1;
+    }
+    // The rebuild's thread, started by the create that took the owed rebuild, runs to its end;
+    // the held build stays alive until the release below.
+    let t = std::time::Instant::now();
+    while super::store::FILTER_THREADS_LIVE.load(O::Acquire) > live0 + 1 {
+        assert!(t.elapsed() < std::time::Duration::from_secs(30), "premise: the rebuild did not finish");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert_eq!(
+        super::store::FILTER_THREADS_LIVE.load(O::Acquire),
+        live0 + 1,
+        "premise: the open's held build is not alive"
+    );
+    let releaser = std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        super::store::NAME_SCAN_HOLD.store(0, std::sync::atomic::Ordering::Release);
+    });
+    drop(trunk);
+    let store = Arc::downgrade(&db.branches);
+    drop(db);
+    assert!(store.upgrade().is_none(), "premise: the store was not closed (a reference outlived the database)");
+    let live = super::store::FILTER_THREADS_LIVE.load(O::Acquire);
+    releaser.join().unwrap();
+    assert_eq!(live, live0, "CLAIM: {} name-filter thread(s) outlived the store's close", live - live0);
 }
 
 /// Review 3 #7 (e): each way a held name reaches the filter is load-bearing once the name's state
@@ -8764,6 +8938,165 @@ fn a_failed_filter_drain_never_answers_absent_for_a_held_name() {
     assert!(!absent, "CLAIM: between a failed filter drain's two holds the filter answered absent for a held name: a create would ask no catalog");
 }
 
+/// Class (e), the store mutex's lifecycle audit (DECISIONS 994f7d41e0; the lead's order with
+/// nf-adversary-2's MED-2 and M4 folded in): every store-mutex hold on the create path does NO syscall,
+/// NO allocation and NO catalog statement. One instrument for the whole class: every outermost hold
+/// is recorded with the site that took it (`#[track_caller]` through `StoreMutex::lock` and its
+/// wrappers), its thread, and what it did, each counted for the holding thread
+/// (`budget_probe::HoldRec`: syscalls attributed by `attribute`, exact under feshim). Audited, at `n`
+/// live named branches of a D2 catalog store:
+/// - a reopen (the name filter's open seed, M4);
+/// - 20 named creates, unnamed forks, connects by name, first writes, disconnects and deletes;
+/// - 3 fuzzy checkpoints (capture and install);
+/// - a name-filter growth, and a rebuild after a forced overflow (the drain failpoint; MED-2).
+/// The claim lists every (operation, site) whose worst hold did any of the three, so each instance of
+/// the class is named where it lives.
+fn lifecycle_audit(n: u32) {
+    use super::budget_probe::{self as probe, HoldRec, AUDIT, AUDIT_LOG, AUDIT_LOST};
+    use std::sync::atomic::Ordering::{Relaxed, Release};
+    let _s = serial();
+    struct Disarm;
+    impl Drop for Disarm {
+        fn drop(&mut self) {
+            AUDIT.store(false, Release);
+            super::budget_probe::arm(false);
+            super::store::FILTER_DRAIN_FAILS.store(false, Release);
+        }
+    }
+    let _d = Disarm;
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("audit.db");
+    let incarnation = {
+        let db = open_at(&path, opts(true, SyncClass::FullFsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        // The population, before anything is measured, by 16 connections at once so that their D2
+        // flushes are shared (FLAGGED fixture change: the 10^6 arm populated one create per
+        // F_FULLFSYNC and twice hit its budget, 90 min and 4 h, still populating: raws l70, l87).
+        // The same n named branches, the same store and sync class.
+        let workers = if n >= 100_000 { 16 } else { 1 };
+        std::thread::scope(|scope| {
+            for w in 0..workers {
+                let db = db.clone();
+                scope.spawn(move || {
+                    let conn = db.connect().unwrap();
+                    for i in (w..n).step_by(workers as usize) {
+                        conn.create_branch(&format!("pop-{i:07}")).unwrap();
+                    }
+                });
+            }
+        });
+        db.incarnation
+    };
+    {
+        let mut log = AUDIT_LOG.lock().unwrap();
+        log.clear();
+        log.reserve(1 << 20);
+    }
+    let mut marks: Vec<(&str, usize)> = Vec::new();
+    let mark = |marks: &mut Vec<(&'static str, usize)>, op: &'static str| marks.push((op, AUDIT_LOG.lock().unwrap().len()));
+    probe::prime();
+    probe::arm(true);
+    AUDIT.store(true, Release);
+    mark(&mut marks, "open");
+    let db = reopen(&path, opts(true, SyncClass::FullFsync), incarnation);
+    db.branch_wait_name_filter();
+    let trunk = db.connect().unwrap();
+    for i in 0..20u32 {
+        let name = format!("a-{i:03}");
+        mark(&mut marks, "named_create");
+        trunk.create_branch(&name).unwrap();
+        mark(&mut marks, "unnamed_fork");
+        let _ = trunk.fork_branch().unwrap().into_id();
+        mark(&mut marks, "connect_named");
+        let c = db.connect_named(&name).unwrap();
+        mark(&mut marks, "first_write");
+        c.execute(&format!("UPDATE t SET v = 'a{i}' WHERE id = {}", 1 + i % 50)).unwrap();
+        mark(&mut marks, "disconnect");
+        drop(c);
+        mark(&mut marks, "delete");
+        db.drop_branch(&name).unwrap();
+    }
+    for _ in 0..3 {
+        mark(&mut marks, "fuzzy_checkpoint");
+        assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: a fuzzy checkpoint started");
+        db.branch_checkpoint_wait();
+    }
+    mark(&mut marks, "filter_growth");
+    let (_, entries0, _, builds0, _) = db.branches.name_filter_stats();
+    let mut k = 0u32;
+    while db.branches.name_filter_stats().3 == builds0 && k < 4 * n.max(1024) {
+        trunk.create_branch(&format!("g-{k:07}")).unwrap();
+        k += 1;
+    }
+    db.branch_wait_name_filter();
+    mark(&mut marks, "filter_rebuild");
+    super::store::FILTER_DRAIN_FAILS.store(true, Release);
+    let rebuilds0 = db.branches.name_filter_state_for_test().1;
+    let mut r = 0u32;
+    while db.branches.name_filter_state_for_test().1 == rebuilds0 && r < 8 * n.max(1024) {
+        trunk.create_branch(&format!("r-{r:07}")).unwrap();
+        r += 1;
+    }
+    super::store::FILTER_DRAIN_FAILS.store(false, Release);
+    trunk.create_branch("after-rebuild").unwrap();
+    db.branch_wait_name_filter();
+    mark(&mut marks, "end");
+    AUDIT.store(false, Release);
+    probe::arm(false);
+    let log: Vec<HoldRec> = AUDIT_LOG.lock().unwrap().clone();
+    assert_eq!(AUDIT_LOST.load(Relaxed), 0, "premise: the audit log lost holds (its room was too small)");
+    assert!(db.branches.name_filter_stats().3 > builds0, "premise: no filter growth happened ({entries0} entries)");
+    assert!(db.branches.name_filter_state_for_test().1 > rebuilds0, "premise: the forced overflow never rebuilt the filter");
+    // Group each hold under the operation whose span it fell in.
+    let mut worst: std::collections::BTreeMap<(&str, String), (u64, u64, u64, u64, u64, bool)> = Default::default();
+    for (w, pair) in marks.windows(2).enumerate() {
+        let _ = w;
+        let (op, from) = pair[0];
+        let to = pair[1].1;
+        for h in &log[from..to] {
+            let site = format!("{}:{}", h.site.file().rsplit('/').next().unwrap_or(""), h.site.line());
+            let e = worst.entry((op, site)).or_default();
+            e.0 += 1;
+            e.1 = e.1.max(h.syscalls.unwrap_or(0));
+            e.2 = e.2.max(h.allocs);
+            e.3 = e.3.max(h.alloc_bytes);
+            e.4 = e.4.max(h.cat_stmts);
+            e.5 |= h.syscalls.is_none();
+        }
+    }
+    let mut over = Vec::new();
+    for ((op, site), (holds, sys, allocs, bytes, stmts, unattributed)) in &worst {
+        let line = format!(
+            "{op} @ {site}: {holds} holds, worst {sys} syscalls{}, {allocs} allocs ({bytes} B), {stmts} catalog stmts",
+            if *unattributed { " (some unattributable)" } else { "" }
+        );
+        println!("audit n={n}: {line}");
+        if *sys > 0 || *allocs > 0 || *stmts > 0 {
+            over.push(line);
+        }
+    }
+    assert!(!worst.is_empty(), "premise: the audit recorded no hold");
+    assert!(
+        over.is_empty(),
+        "CLAIM: {} store-mutex sites on the create path did a syscall, an allocation or a catalog statement while held (n = {n}): {over:#?}",
+        over.len()
+    );
+}
+
+#[test]
+fn the_create_path_s_store_mutex_holds_do_no_syscall_allocation_or_catalog_statement() {
+    lifecycle_audit(10_000);
+}
+
+/// The audit at 10^6 live branches (the lead's second scale): long to populate in a debug build, so
+/// run by name.
+#[test]
+#[ignore = "class (e) audit at 10^6: run by name with --ignored"]
+fn the_create_path_s_store_mutex_holds_do_no_syscall_allocation_or_catalog_statement_at_a_million() {
+    lifecycle_audit(1_000_000);
+}
+
 /// Lead conditions on the name filter (DECISIONS, the acceptance of the one-state fix): the table
 /// listing the regrowth tests read (`per_branch_tables_for_test`) prices the filter's tables at their
 /// REAL bytes (8 per slot; 4cb167221 listed them at 0, which blinded the regrowth test), and a growth
@@ -8818,7 +9151,10 @@ fn the_name_filter_never_answers_absent_for_a_noted_name_across_its_growth() {
     }
     let _r = Reset;
     let mut lost = Vec::new();
-    for (stage, drain_fails) in [(1u8, false), (2, false), (3, false), (4, false), (5, false), (5, true)] {
+    // Stages 1-5 hold a growth; 6 and 7 hold a BUILD, in `Draining` before its pending copy and
+    // in `Building` before its scan (review REVIEW-claude-namefilter-2 MED-3), reached by the
+    // rebuild a failed drain owes. Mutant `name_filter_build_skips_pending` must turn stage 7 red.
+    for (stage, drain_fails) in [(1u8, false), (2, false), (3, false), (4, false), (5, false), (5, true), (6, true), (7, true)] {
         let dir = tempfile::TempDir::new().unwrap();
         let db = open_at(&dir.path().join("filter-oracle.db"), opts(true, SyncClass::Off));
         let trunk = db.connect().unwrap();
@@ -8828,17 +9164,22 @@ fn the_name_filter_never_answers_absent_for_a_noted_name_across_its_growth() {
         FILTER_DRAIN_FAILS.store(drain_fails, Release);
         FILTER_PAUSE_AT.store(stage, Release);
         let stop = Arc::new(AtomicBool::new(false));
+        // Every create any worker made (review MED-3: the premise that the held window saw one).
+        let creates = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let workers: Vec<_> = (0..4)
             .map(|k| {
-                let (db, stop) = (db.clone(), stop.clone());
+                let (db, stop, creates) = (db.clone(), stop.clone(), creates.clone());
                 std::thread::spawn(move || {
                     let conn = db.connect().unwrap();
                     let mut made = Vec::new();
                     let mut i = 0u32;
-                    while !stop.load(Acquire) && i < 4000 {
+                    // Uncapped while a stage is held (the cap ended the window early, review MED-3);
+                    // `stop` ends it.
+                    while !stop.load(Acquire) && i < 40_000 {
                         let name = format!("s{stage}-t{k}-{i}");
                         conn.create_branch(&name).unwrap();
                         made.push(name);
+                        creates.fetch_add(1, Release);
                         i += 1;
                     }
                     made
@@ -8847,11 +9188,19 @@ fn the_name_filter_never_answers_absent_for_a_noted_name_across_its_growth() {
             .collect();
         let t = std::time::Instant::now();
         while FILTER_PAUSED.load(Acquire) != stage {
-            assert!(t.elapsed() < std::time::Duration::from_secs(60), "premise: stage {stage}: no growth reached the stage");
+            assert!(t.elapsed() < std::time::Duration::from_secs(60), "premise: stage {stage}: no filter thread reached the stage");
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        std::thread::sleep(std::time::Duration::from_millis(30));
+        // The window is held until at least 16 creates landed in it (not for a fixed time).
+        let at_pause = creates.load(Acquire);
+        let t = std::time::Instant::now();
+        while creates.load(Acquire) < at_pause + 16 {
+            assert!(t.elapsed() < std::time::Duration::from_secs(60), "premise: stage {stage}: no create ran while the stage was held");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let in_window = creates.load(Acquire) - at_pause;
         FILTER_PAUSE_AT.store(0, Release);
+        assert!(in_window >= 1, "premise: stage {stage}: no create landed while the stage was held");
         std::thread::sleep(std::time::Duration::from_millis(30));
         stop.store(true, Release);
         let made: Vec<String> = workers.into_iter().flat_map(|w| w.join().unwrap()).collect();
@@ -9290,6 +9639,70 @@ fn a_steady_create_allocates_at_most_once_under_the_store_mutex() {
         }
     }
     assert!(over.is_empty(), "CLAIM: a steady create allocated more than once under the store mutex: {over:?}");
+}
+
+/// Class (b) step 1 (lead order 2026-10-15): the create-hold stall the hold audit found in its
+/// filter_rebuild run (fork_trunk's hold: 6,408 allocations, 11,088,085 B, 1 catalog statement, raw
+/// l69-audit). Hypothesis under test, as its CLAIM: that hold is a checkpoint STARTED inside the
+/// create's hold (`maybe_compact` -> `start_flight`, its capture), not the filter. The audit's store
+/// (10,000 named branches, catalog, D2) takes 16,384 named creates, each traced (`held_trace`);
+/// the worst create's spans are printed, and the claim is that its allocations fall in
+/// `compact.flight_starting` .. `compact.flight_start_returned`.
+#[test]
+#[ignore = "class (b) step 1 and L2(d): run by name with --ignored --nocapture"]
+fn diag_the_create_hold_stall_is_a_checkpoint_start() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("stall.db");
+    let incarnation = {
+        let db = open_at(&path, opts(true, SyncClass::FullFsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        for i in 0..10_000u32 {
+            trunk.create_branch(&format!("pop-{i:07}")).unwrap();
+        }
+        db.incarnation
+    };
+    let db = reopen(&path, opts(true, SyncClass::FullFsync), incarnation);
+    db.branch_wait_name_filter();
+    let trunk = db.connect().unwrap();
+    let mut worst: (u64, String, Vec<(&'static str, u64)>, u64) = (0, String::new(), Vec::new(), 0);
+    let mut over_64 = 0u32;
+    for i in 0..16_384u32 {
+        let name = format!("r-{i:07}");
+        let before = super::budget_probe::thread_allocs().2;
+        super::store::HELD_TRACE.with(|t| *t.borrow_mut() = Some(Vec::with_capacity(64)));
+        trunk.create_branch(&name).unwrap();
+        let trace = super::store::HELD_TRACE.with(|t| t.borrow_mut().take()).unwrap_or_default();
+        let total = trace.last().map_or(0, |(_, n)| n - before);
+        if total > 64 {
+            over_64 += 1;
+        }
+        if total > worst.0 {
+            worst = (total, name, trace, before);
+        }
+    }
+    let (total, name, trace, before) = worst;
+    let mut last = before;
+    let mut in_start = 0;
+    let steps: Vec<String> = trace
+        .iter()
+        .map(|(label, n)| {
+            let d = n - last;
+            last = *n;
+            if *label == "compact.flight_start_returned" {
+                in_start = d;
+            }
+            format!("{label}+{d}")
+        })
+        .collect();
+    println!("FE_STALL worst create {name}: {total} allocations to its last trace point [{}]; {over_64} of 16384 creates over 64", steps.join(" "));
+    // Confirmed at f48184da2 (raw l82): 6,283 of the worst create's 6,288 held allocations were its
+    // checkpoint start. After L2(d) slice 1 (raw l92) the worst create allocates 60 (the capture's
+    // read snapshot 26, its rows 14, its hand-off 12) and none of 16,384 passes 64; the claim is now
+    // that bound, which the rows and the snapshot (slices 2-3) must bring to 0.
+    let _ = in_start;
+    assert_eq!(over_64, 0, "CLAIM: {over_64} creates allocated more than 64 times under the store mutex (worst {total}: [{}])", steps.join(" "));
 }
 
 /// Codex C25 HIGH 1 at the store (lead order 00: its "crash arm"): the background writer held after

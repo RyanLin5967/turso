@@ -274,6 +274,16 @@ pub enum TxEvent {
     RollbackTo,
 }
 
+/// The PostgreSQL parser's and translator's error as the engine's: its stack-guard refusal is the
+/// engine's own (`LimboError::StackDepthLimitExceeded`, 54001 on the wire), anything else a parse
+/// error as before.
+pub(crate) fn pg_parse_error(e: turso_pg_parser::ParseError) -> LimboError {
+    match e {
+        turso_pg_parser::ParseError::StackDepthLimitExceeded => LimboError::StackDepthLimitExceeded,
+        e => LimboError::ParseError(e.into()),
+    }
+}
+
 /// Open a database with the PostgreSQL schema dialect, resolving the IO
 /// backend from `vfs` or the path like [`turso_core::Database::open_new`].
 pub fn open_database(
@@ -447,12 +457,20 @@ impl PgConnection {
     }
 
     /// [`PgConnection::prepare`], with the types the same parse gives: PostgreSQL's type OID for
-    /// each result column the engine cannot type itself (aggregates; see
-    /// [`crate::result_types::aggregate_types`]; `None`, or a short list, where the engine types
-    /// the column), and for each parameter its context types (see
+    /// each result column and each parameter from one scoped inference (`None`, or a short
+    /// list, where the engine types an expression not modeled by that inference; see
     /// [`crate::result_types::parameter_types`]).
     pub fn prepare_typed(&self, sql: impl AsRef<str>) -> Result<(Statement, StatementTypes)> {
-        let mut types = StatementTypes::default();
+        self.prepare_typed_with_params(sql, &[])
+    }
+
+    /// Declared Parse types seed the same inference that types columns and translator expressions.
+    pub fn prepare_typed_with_params(
+        &self,
+        sql: impl AsRef<str>,
+        declared: &[Option<u32>],
+    ) -> Result<(Statement, StatementTypes)> {
+        let mut types = StatementTypes::from_declared(declared);
         let stmt = prepare_statement_typed(&self.inner, sql.as_ref(), Some(&mut types))?;
         Ok((stmt, types))
     }
@@ -465,7 +483,16 @@ impl PgConnection {
         &self,
         sql: impl AsRef<str>,
     ) -> Result<Option<(Statement, StatementTypes)>> {
-        let mut types = StatementTypes::default();
+        self.prepare_for_describe_with_params(sql, &[])
+    }
+
+    /// Describe with the Parse declarations available before translation.
+    pub fn prepare_for_describe_with_params(
+        &self,
+        sql: impl AsRef<str>,
+        declared: &[Option<u32>],
+    ) -> Result<Option<(Statement, StatementTypes)>> {
+        let mut types = StatementTypes::from_declared(declared);
         let stmt = prepare_statement_inner(&self.inner, sql.as_ref(), Some(&mut types), true)?;
         Ok(stmt.map(|stmt| (stmt, types)))
     }
@@ -676,7 +703,7 @@ pub fn read_parse_message(sql: &str) -> Result<ParseMessage> {
     // The trimmed text, as the prepare reads it: the tree's locations must index the text the
     // prepare holds (a leading blank shifted every $n's location by one).
     let parse =
-        turso_pg_parser::parse(trimmed).map_err(|e| LimboError::ParseError(e.into()))?;
+        turso_pg_parser::parse(trimmed).map_err(pg_parse_error)?;
     let numbers = turso_pg_parser::checked_param_numbers(&parse, trimmed);
     let prefix = BRANCH_FUNCTION_PREFIX.as_bytes();
     let mentions = sql
@@ -1094,7 +1121,7 @@ fn prepare_statement_parsed(
     // message's serves its classification too (C53).
     let parse_result = match parsed {
         Some(parsed) => parsed,
-        None => turso_pg_parser::parse(sql).map_err(|e| LimboError::ParseError(e.into()))?,
+        None => turso_pg_parser::parse(sql).map_err(pg_parse_error)?,
     };
     // One statement per prepare, as PostgreSQL's Parse takes one (42601): the translator reads the
     // first, so `COMMIT; INSERT ...` in one Parse committed and skipped the INSERT, answering
@@ -1112,7 +1139,7 @@ fn prepare_statement_parsed(
         // Read from the text as PostgreSQL 18 reads them: a number above i32::MAX is 42601, never
         // libpg_query's 32-bit wrap (wire review 12 item 1).
         let numbers = turso_pg_parser::checked_param_numbers(&parse_result, sql)
-            .map_err(|e| LimboError::ParseError(e.into()))?;
+            .map_err(crate::session::pg_parse_error)?;
         if let Some(n) = numbers
             .iter()
             .find(|n| !(1..=crate::result_types::MAX_PARAMETER as i32).contains(*n))
@@ -1172,67 +1199,46 @@ fn prepare_statement_parsed(
     } else {
         None
     };
+    let schema = pg_conn.conn.current_schema();
+    let search_path = pg_conn.session_state.lock().search_path.clone();
+    // Which attached schema holds a name, probed only when the walk resolves an
+    // unqualified name through one, once per (schema, name) per statement (wire review 17
+    // item 3).
+    let names = pg_conn.conn.attached_database_names();
+    let probed = std::cell::RefCell::new(std::collections::HashMap::new());
+    let holds = |schema: &str, name: &str| {
+        let key = (schema.to_ascii_lowercase(), name.to_ascii_lowercase());
+        if let Some(held) = probed.borrow().get(&key) {
+            return *held;
+        }
+        let held = get_table_columns(&pg_conn.conn, name, Some(schema))
+            .is_ok_and(|columns| !columns.is_empty());
+        probed.borrow_mut().insert(key, held);
+        held
+    };
+    let attached = crate::result_types::Attached {
+        names: &names,
+        holds: &holds,
+    };
+    // A column reference naming no FROM entry is refused here, 42P01 (wire review 17
+    // item 5).
+    let walked = crate::result_types::parameter_types(
+        &parse_result,
+        &schema,
+        &search_path,
+        &pg_conn.view_cache,
+        &attached,
+        &types
+            .as_deref()
+            .map(|types| types.params.clone())
+            .unwrap_or_default(),
+    )?;
+    let expression_types = walked.expressions.clone();
     if let Some(types) = types.as_deref_mut() {
-        let schema = pg_conn.conn.current_schema();
-        // An aggregate's result type is read through the walk, as a parameter's is, so its
-        // argument's relation is the one the engine reads (wire review 17 item 15): the walk runs
-        // for a statement with a parameter or an aggregate result column.
-        let aggregates = crate::result_types::aggregate_targets(&parse_result);
-        types.columns = vec![None; aggregates.len()];
-        if !used.is_empty() || aggregates.contains(&true) {
-            // A parameter compared with something no context types is refused (42P18) by the
-            // server, which alone reads the types the client declared (wire review 8 item 7,
-            // review 11 item 1).
-            let search_path = pg_conn.session_state.lock().search_path.clone();
-            // Which attached schema holds a name, probed only when the walk resolves an
-            // unqualified name through one, once per (schema, name) per statement (wire review 17
-            // item 3).
-            let names = pg_conn.conn.attached_database_names();
-            let probed = std::cell::RefCell::new(std::collections::HashMap::new());
-            let holds = |schema: &str, name: &str| {
-                let key = (schema.to_ascii_lowercase(), name.to_ascii_lowercase());
-                if let Some(held) = probed.borrow().get(&key) {
-                    return *held;
-                }
-                let held = get_table_columns(&pg_conn.conn, name, Some(schema))
-                    .is_ok_and(|columns| !columns.is_empty());
-                probed.borrow_mut().insert(key, held);
-                held
-            };
-            let attached = crate::result_types::Attached {
-                names: &names,
-                holds: &holds,
-            };
-            // A column reference naming no FROM entry is refused here, 42P01 (wire review 17
-            // item 5).
-            let walked = crate::result_types::parameter_types(
-                &parse_result,
-                &schema,
-                &search_path,
-                &pg_conn.view_cache,
-                &attached,
-            )
-            .map_err(LimboError::ParseError)?;
-            types.params = walked.params;
-            types.untyped = walked.untyped;
-            types.columns = crate::result_types::aggregate_types(&aggregates, &walked.columns);
-        }
-        // The columns whose type PostgreSQL's grammar fixes (a boolean expression, a float4 cast),
-        // where no aggregate typed them: the engine has no boolean type (PG 18 differential,
-        // 2026-10-15).
+        types.params = walked.params;
+        types.untyped = walked.untyped;
+        types.columns = walked.columns;
         types.param_targets = crate::result_types::param_targets(&parse_result);
-        // A table's width, for a `*` beside a typed column, from the in-memory schema alone.
-        let tables = |schema: &str, table: &str| resident_relation_columns(pg_conn, schema, table);
-        let fixed = crate::result_types::expression_types(&parse_result, &tables);
-        if fixed.len() == types.columns.len() {
-            for (column, fixed) in types.columns.iter_mut().zip(fixed) {
-                *column = column.or(fixed);
-            }
-        } else if types.columns.is_empty() {
-            // A `*` over derived tables and CTEs alone, which expression_types expanded (the
-            // aggregate list cannot line up with a `*`, so it is empty).
-            types.columns = fixed;
-        }
         types.used = used;
     }
 
@@ -1256,10 +1262,10 @@ fn prepare_statement_parsed(
             PostgreSQLTranslator::new()
         }
     };
-    let first = translator();
+    let first = translator().with_expression_types(expression_types.clone());
     let mut translated = first
         .translate_with_prereqs(&parse_result)
-        .map_err(|e| LimboError::ParseError(e.into()))?;
+        .map_err(crate::session::pg_parse_error)?;
     // A cast to a type that is not built-in is kept by name only when it is the engine's own (a
     // domain, a custom type), so the engine runs its CHECKs: `CAST(-5 AS dm)` returned -5 (the
     // domain CHECK class's PG 18.6 replay, 2026-10-15). Looked up, and translated again, only for
@@ -1273,9 +1279,10 @@ fn prepare_statement_parsed(
             .collect();
         if !known.is_empty() {
             translated = translator()
+                .with_expression_types(expression_types.clone())
                 .with_known_types(known)
                 .translate_with_prereqs(&parse_result)
-                .map_err(|e| LimboError::ParseError(e.into()))?;
+                .map_err(crate::session::pg_parse_error)?;
         }
     }
     reject_catalog_dml(translated.cmd.stmt())?;
@@ -1325,6 +1332,7 @@ fn prepare_statement_parsed(
         if prepared.is_err() && is_positional_insert_values(&parse_result) {
             let lookup_conn = pg_conn.clone();
             let retried = PostgreSQLTranslator::new()
+                .with_expression_types(expression_types.clone())
                 .with_columns(move |schema, table| resident_relation_columns(&lookup_conn, schema, table))
                 .translate_with_prereqs(&parse_result)
                 .map_err(|e| LimboError::ParseError(e.into()))?;
@@ -2234,7 +2242,7 @@ fn handle_pg_add_constraints(
         )
     })?;
     let mut parsed =
-        turso_pg_parser::parse(pg_definition).map_err(|e| LimboError::ParseError(e.into()))?;
+        turso_pg_parser::parse(pg_definition).map_err(crate::session::pg_parse_error)?;
     // Taken before the definition is edited below (a clone made while `create` borrows it would
     // not compile).
     let mut aside_tree = parsed.protobuf.clone();
@@ -2295,10 +2303,10 @@ fn handle_pg_add_constraints(
         }
     }
     let aside_def =
-        turso_pg_parser::deparse(&aside_tree).map_err(|e| LimboError::ParseError(e.into()))?;
+        turso_pg_parser::deparse(&aside_tree).map_err(crate::session::pg_parse_error)?;
     create.table_elts.extend(add.constraints.iter().cloned());
-    let rebuilt =
-        turso_pg_parser::deparse(&parsed.protobuf).map_err(|e| LimboError::ParseError(e.into()))?;
+    let rebuilt = turso_pg_parser::deparse(&parsed.protobuf)
+        .map_err(crate::session::pg_parse_error)?;
     // Every refusal the translator makes of the rebuilt CREATE TABLE (MATCH FULL over several
     // columns among them) is answered here, before anything is copied, dropped or locked: it came
     // from the rebuild's own CREATE, after the BEGIN, the aside copy and the DROP, under the trunk's
@@ -2306,7 +2314,7 @@ fn handle_pg_add_constraints(
     // review 16 item 9). One translation of the tree already in hand, no parse.
     PostgreSQLTranslator::new()
         .translate_with_prereqs(&parsed)
-        .map_err(|e| LimboError::ParseError(e.into()))?;
+        .map_err(crate::session::pg_parse_error)?;
 
     let quoted = format!("\"{}\"", table.replace('"', "\"\""));
     let aside = format!("\"{}\"", aside_name.replace('"', "\"\""));

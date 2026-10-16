@@ -851,7 +851,7 @@ fn validate(
                                     Some(ast::TypeSize::MaxSize(e)) => vec![e.clone()],
                                     None => vec![],
                                 };
-                                check_numeric_typmod(type_name, &params)?;
+                                check_numeric_typmod(type_name, &params, is_strict)?;
                             }
                             Some(_) => {}
                         }
@@ -1110,11 +1110,11 @@ fn emit_ctas_insert(
 /// declares a column type with parameters (a domain's base type takes none). Parameters that are
 /// not integer literals are left to numeric's ENCODE, which builds the same typmod at every write
 /// and CAST.
-pub(crate) fn check_numeric_typmod(
-    type_name: &str,
-    params: &[Box<ast::Expr>],
-) -> crate::Result<()> {
-    if !normalize_ident(type_name).eq_ignore_ascii_case("numeric") {
+pub(crate) fn check_numeric_typmod(type_name: &str, params: &[Box<ast::Expr>], is_strict: bool) -> crate::Result<()> {
+    // Only a STRICT table's column uses the numeric custom type; on any other table numeric(p, s)
+    // is a type name with SQLite's affinity, which CREATE TABLE accepts as written (review C38 MED
+    // 1: ALTER TABLE ADD COLUMN refused it there). One predicate for both statements.
+    if !is_strict || !normalize_ident(type_name).eq_ignore_ascii_case("numeric") {
         return Ok(());
     }
     fn literal(e: &ast::Expr) -> Option<i64> {

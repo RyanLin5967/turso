@@ -1293,6 +1293,7 @@ struct StatementFailure {
 struct Described {
     conn: Arc<turso_core::Connection>,
     sql: String,
+    declared: Vec<Option<u32>>,
     stmt: turso_core::Statement,
     /// The types the parse gave (see [`PgConnection::prepare_typed`]).
     types: StatementTypes,
@@ -2123,27 +2124,38 @@ impl Session {
     /// The prepared statement is kept for the Execute that follows (wire review 1 item 12: one
     /// parse, translation and compile per extended statement, not two): read its columns with
     /// [`Session::described_fields`]. A Describe of the statement already kept prepares nothing.
+    #[cfg(test)]
     fn describe_prepare(&self, sql: &str) -> PgWireResult<()> {
+        self.describe_prepare_with_params(sql, &[])
+    }
+
+    fn describe_prepare_with_params(
+        &self,
+        sql: &str,
+        declared: &[Option<Type>],
+    ) -> PgWireResult<()> {
+        let declared: Vec<_> = declared
+            .iter()
+            .map(|ty| ty.as_ref().map(Type::oid))
+            .collect();
         let conn = self
             .current(&mut self.state())
             .map_err(PgWireError::UserError)?;
-        if self
-            .state()
-            .described
-            .as_ref()
-            .is_some_and(|d| d.sql == sql && Arc::ptr_eq(&d.conn, conn.inner()))
-        {
+        if self.state().described.as_ref().is_some_and(|d| {
+            d.sql == sql && d.declared == declared && Arc::ptr_eq(&d.conn, conn.inner())
+        }) {
             return Ok(());
         }
         let in_tx = !conn.inner().get_auto_commit();
         // Never the prepare that performs a statement (ALTER ADD CONSTRAINT, COPY FROM, SET,
         // CREATE/DROP SCHEMA): the frontend declines those from the parse, they keep nothing and
         // answer NoData, and Execute performs them once (wire review 2 item 2, review 3 item 2).
-        match conn.prepare_for_describe(sql) {
+        match conn.prepare_for_describe_with_params(sql, &declared) {
             Ok(Some((stmt, types))) => {
                 self.state().described = Some(Described {
                     conn: conn.inner().clone(),
                     sql: sql.to_string(),
+                    declared,
                     stmt,
                     types,
                 });
@@ -2194,10 +2206,12 @@ impl Session {
         &self,
         conn: &PgConnection,
         sql: &str,
+        declared: &[Option<Type>],
     ) -> Option<(turso_core::Statement, StatementTypes)> {
+        let declared: Vec<_> = declared.iter().map(|ty| ty.as_ref().map(Type::oid)).collect();
         let mut st = self.state();
         match st.described.take() {
-            Some(d) if d.sql == sql && Arc::ptr_eq(&d.conn, conn.inner()) => {
+            Some(d) if d.sql == sql && d.declared == declared && Arc::ptr_eq(&d.conn, conn.inner()) => {
                 Some((d.stmt, d.types))
             }
             _ => None,
@@ -2295,11 +2309,21 @@ impl Session {
             rolls_back: false,
             info,
         };
-        let described = portal.and_then(|_| self.take_described(conn, sql));
+        let described = portal.and_then(|portal| self.take_described(conn, sql, &portal.statement.parameter_types));
         let (mut stmt, types) = match described {
             Some(kept) => kept,
             None => conn
-                .prepare_typed(sql)
+                .prepare_typed_with_params(
+                    sql,
+                    &portal.map_or_else(Vec::new, |portal| {
+                        portal
+                            .statement
+                            .parameter_types
+                            .iter()
+                            .map(|ty| ty.as_ref().map(Type::oid))
+                            .collect()
+                    }),
+                )
                 .map_err(|e| unprepared(engine_info(&e)))?,
         };
         self.shared.cleanup_dropped_schema_file(sql);
@@ -4146,7 +4170,7 @@ impl ExtendedQueryHandler for Session {
                 .collect();
             return Ok(DescribeStatementResponse::new(declared, vec![]));
         }
-        self.describe_prepare(sql)?;
+        self.describe_prepare_with_params(sql, &target.parameter_types)?;
         let fields = self
             .described_fields(&Format::UnifiedText, &target.parameter_types)
             .map_err(PgWireError::UserError)?;
@@ -4189,7 +4213,7 @@ impl ExtendedQueryHandler for Session {
         if is_pg_non_query(sql) {
             return Ok(DescribePortalResponse::new(vec![]));
         }
-        self.describe_prepare(sql)?;
+        self.describe_prepare_with_params(sql, &portal.statement.parameter_types)?;
         let fields = self
             .described_fields(
                 &portal.result_column_format,
@@ -5364,10 +5388,72 @@ fn encode_value(
                     .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
             }
         }
+        Value::Blob(b) if turso_pg::element_of(pg_type.oid()).is_some() => {
+            let element = turso_pg::element_of(pg_type.oid())
+                .and_then(Type::from_oid)
+                .expect("a known PostgreSQL array element");
+            let text = array_result_text(b, &element)?;
+            encoder
+                .encode_field_with_type_and_format(
+                    &text.as_str(),
+                    &Type::TEXT,
+                    FieldFormat::Text,
+                    &FormatOptions::default(),
+                )
+                .map_err(|e| turso_core::LimboError::InternalError(e.to_string()))
+        }
         Value::Blob(b) => encoder
             .encode_field(&b.as_slice())
             .map_err(|e| turso_core::LimboError::InternalError(e.to_string())),
     }
+}
+
+/// Array elements use the same text encodings as scalar results; only their quoting is different.
+fn array_result_text(blob: &[u8], element: &Type) -> turso_core::Result<String> {
+    let fields = Arc::new(vec![FieldInfo::new(
+        String::new(),
+        None,
+        None,
+        element.clone(),
+        FieldFormat::Text,
+    )]);
+    let mut text = String::from("{");
+    for (index, value) in turso_core::types::ValueIterator::new(blob)?.enumerate() {
+        if index > 0 {
+            text.push(',');
+        }
+        let value = value?.to_owned()?;
+        if matches!(value, Value::Null) {
+            text.push_str("NULL");
+            continue;
+        }
+        let mut scalar = DataRowEncoder::new(fields.clone());
+        encode_value(&mut scalar, &value, element)?;
+        let row = scalar
+            .finish()
+            .map_err(|e| LimboError::InternalError(e.to_string()))?;
+        let value = std::str::from_utf8(&row.data[4..])
+            .map_err(|e| LimboError::InternalError(e.to_string()))?;
+        let quote = value.is_empty()
+            || value.eq_ignore_ascii_case("null")
+            || value
+                .chars()
+                .any(|c| matches!(c, ',' | '{' | '}' | '"' | '\\') || c.is_whitespace());
+        if quote {
+            text.push('"');
+        }
+        for ch in value.chars() {
+            if matches!(ch, '"' | '\\') {
+                text.push('\\');
+            }
+            text.push(ch);
+        }
+        if quote {
+            text.push('"');
+        }
+    }
+    text.push('}');
+    Ok(text)
 }
 
 fn sqlite_type_to_pg_type(type_str: &str) -> Type {
