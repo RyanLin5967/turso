@@ -222,7 +222,7 @@ pub struct Attached<'a> {
     pub holds: &'a dyn Fn(&str, &str) -> bool,
 }
 
-fn parameter_types_with(
+pub(crate) fn parameter_types_with(
     parse: &ParseResult,
     schema: &Schema,
     search_path: &[String],
@@ -353,7 +353,13 @@ impl Rel {
         if columns.iter().any(|(n, _)| n == STAR) {
             Rel::Unknown { name }
         } else {
-            Rel::Derived { name, columns: columns.into_iter().map(|(name, ty)| (name, ty.map(resolve_output))).collect() }
+            Rel::Derived {
+                name,
+                columns: columns
+                    .into_iter()
+                    .map(|(name, ty)| (name, ty.map(resolve_output)))
+                    .collect(),
+            }
         }
     }
 }
@@ -388,7 +394,7 @@ struct Infer<'a> {
     publishing: bool,
     /// Parameters that an unknown/unknown comparison resolved to text.
     comparison_defaults: std::collections::BTreeSet<u32>,
-    type_error: std::rc::Rc<std::cell::RefCell<Option<SqlErrorMessage>>> ,
+    type_error: std::rc::Rc<std::cell::RefCell<Option<SqlErrorMessage>>>,
     /// Parameters compared with an expression no context types (see [`parameter_types`]).
     compared_untyped: std::collections::BTreeSet<u32>,
     /// The CTEs in scope, innermost last: name and columns.
@@ -454,7 +460,8 @@ fn scalar_result(name: &str) -> Option<u32> {
         | "reverse" | "md5" | "initcap" | "translate" | "split_part" | "chr" | "to_char"
         | "quote_ident" | "quote_literal" | "format" | "current_schema" | "current_database"
         | "version" => TEXT,
-        "row_number" | "rank" | "dense_rank" | "ntile" | "pg_database_size" | "nextval" | "currval" | "lastval" => INT8,
+        "row_number" | "rank" | "dense_rank" | "ntile" | "pg_database_size" | "nextval"
+        | "currval" | "lastval" => INT8,
         "pg_input_is_valid" => BOOL,
         "current_schemas" => 1003,
         "pg_typeof" => 2206,
@@ -492,14 +499,22 @@ fn takes_text(name: &str) -> bool {
 }
 
 fn resolve_output(oid: u32) -> u32 {
-    if oid == 705 { TEXT } else { oid }
+    if oid == 705 {
+        TEXT
+    } else {
+        oid
+    }
 }
 
 /// The wider of two numeric types (PostgreSQL's arithmetic promotes int to numeric to float8);
 /// otherwise the first.
 fn wider(a: u32, b: u32) -> u32 {
-    if a == 705 { return b; }
-    if b == 705 { return a; }
+    if a == 705 {
+        return b;
+    }
+    if b == 705 {
+        return a;
+    }
     let rank = |t: u32| match t {
         INT2 => 1,
         INT4 => 2,
@@ -557,10 +572,15 @@ impl Infer<'_> {
     fn enter(&self) -> Option<turso_stack_guard::NestGuard> {
         #[cfg(test)]
         self.work.set(self.work.get() + 1);
-        if self.stack_limited.get() { return None; }
+        if self.stack_limited.get() {
+            return None;
+        }
         match turso_stack_guard::NestGuard::enter() {
             Ok(guard) => Some(guard),
-            Err(_) => { self.stack_limited.set(true); None }
+            Err(_) => {
+                self.stack_limited.set(true);
+                None
+            }
         }
     }
 
@@ -570,14 +590,20 @@ impl Infer<'_> {
         // families may have implicit casts we do not model yet (date/timestamp,
         // for example), so an unresolved result is not by itself a refusal.
         let text_numeric_mismatch = types.iter().all(Option::is_some)
-            && types.iter().any(|ty| matches!(ty, Some(TEXT | 1043 | 1042 | 19)))
-            && types.iter().any(|ty| matches!(ty, Some(INT2 | INT4 | INT8 | NUMERIC | FLOAT4 | FLOAT8)));
+            && types
+                .iter()
+                .any(|ty| matches!(ty, Some(TEXT | 1043 | 1042 | 19)))
+            && types
+                .iter()
+                .any(|ty| matches!(ty, Some(INT2 | INT4 | INT8 | NUMERIC | FLOAT4 | FLOAT8)));
         let result = common_type(types);
         if text_numeric_mismatch && result.is_none() {
-            self.type_error.borrow_mut().get_or_insert_with(|| SqlErrorMessage::classified(
-                SqlErrorKind::DatatypeMismatch,
-                "types cannot be matched in common expression context",
-            ));
+            self.type_error.borrow_mut().get_or_insert_with(|| {
+                SqlErrorMessage::classified(
+                    SqlErrorKind::DatatypeMismatch,
+                    "types cannot be matched in common expression context",
+                )
+            });
         }
         result
     }
@@ -635,8 +661,11 @@ impl Infer<'_> {
             }
         }
         for (side, other) in [(a, tb), (b, ta)] {
-            if comparison && param(side).is_some_and(|number| self.comparison_defaults.contains(&number))
-                && other.is_some_and(|oid| matches!(oid, INT2 | INT4 | INT8 | NUMERIC | FLOAT4 | FLOAT8))
+            if comparison
+                && param(side).is_some_and(|number| self.comparison_defaults.contains(&number))
+                && other.is_some_and(|oid| {
+                    matches!(oid, INT2 | INT4 | INT8 | NUMERIC | FLOAT4 | FLOAT8)
+                })
             {
                 self.type_error.borrow_mut().get_or_insert_with(|| SqlErrorMessage::classified(
                     SqlErrorKind::UndefinedFunction,
@@ -668,21 +697,30 @@ impl Infer<'_> {
 
     /// Walk a statement; returns a SELECT's result columns' types (empty for any other).
     fn statement(&mut self, stmt: &PgNode) -> Vec<Option<u32>> {
-        let Some(_guard) = self.enter() else { return Vec::new(); };
+        let Some(_guard) = self.enter() else {
+            return Vec::new();
+        };
         let scope: Scope = Vec::new();
         match stmt.node.as_ref() {
             Some(Node::ViewStmt(v)) => {
-                if let Some(query) = v.query.as_deref() { self.statement(query); }
+                if let Some(query) = v.query.as_deref() {
+                    self.statement(query);
+                }
             }
             Some(Node::CreateTableAsStmt(c)) => {
-                if let Some(query) = c.query.as_deref() { self.statement(query); }
+                if let Some(query) = c.query.as_deref() {
+                    self.statement(query);
+                }
             }
             Some(Node::SelectStmt(s)) => {
                 let columns = self.select(s, &scope);
                 return if columns.iter().any(|(name, _)| name == STAR) {
                     Vec::new()
                 } else {
-                    columns.into_iter().map(|(_, ty)| ty.map(resolve_output)).collect()
+                    columns
+                        .into_iter()
+                        .map(|(_, ty)| ty.map(resolve_output))
+                        .collect()
                 };
             }
             Some(Node::InsertStmt(i)) => {
@@ -702,7 +740,10 @@ impl Infer<'_> {
                     self.qual(u.where_clause.as_deref(), &inner);
                     let columns = self.targets(&u.returning_list, &inner);
                     self.ctes.truncate(ctes);
-                    return columns.into_iter().map(|(_, ty)| ty.map(resolve_output)).collect();
+                    return columns
+                        .into_iter()
+                        .map(|(_, ty)| ty.map(resolve_output))
+                        .collect();
                 }
                 self.ctes.truncate(ctes);
             }
@@ -715,7 +756,10 @@ impl Infer<'_> {
                     self.qual(d.where_clause.as_deref(), &inner);
                     let columns = self.targets(&d.returning_list, &inner);
                     self.ctes.truncate(ctes);
-                    return columns.into_iter().map(|(_, ty)| ty.map(resolve_output)).collect();
+                    return columns
+                        .into_iter()
+                        .map(|(_, ty)| ty.map(resolve_output))
+                        .collect();
                 }
                 self.ctes.truncate(ctes);
             }
@@ -908,7 +952,9 @@ impl Infer<'_> {
     /// which of its views earlier statements had memoised (wire review 18 item 14): the cycle cut
     /// bounds cycles by the views in the schema; recursion shares the parser/engine NestGuard.
     fn view_columns(&self, relname: &str) -> Option<Vec<(String, Option<u32>)>> {
-        let Some(_guard) = self.enter() else { return None; };
+        let Some(_guard) = self.enter() else {
+            return None;
+        };
         if self.views.iter().any(|v| v.eq_ignore_ascii_case(relname)) {
             self.cuts.set(self.cuts.get() + 1);
             return None;
@@ -930,7 +976,9 @@ impl Infer<'_> {
         let view = self.schema.get_view(relname)?;
         let cuts = self.cuts.get();
         let columns = self.read_view(&view, relname);
-        if self.stack_limited.get() { return None; }
+        if self.stack_limited.get() {
+            return None;
+        }
         let memo = if self.cuts.get() == cuts {
             &self.view_memo
         } else {
@@ -973,7 +1021,15 @@ impl Infer<'_> {
                     .collect(),
             )
         };
-        let sql = crate::catalog::decode_stored_pg_schema_sql(&view.sql).unwrap_or(&view.sql);
+        // The schema loader consumed the executable derivative; the existing
+        // inference authority reads original frontend source after types load.
+        let source = match crate::catalog::stored_view_source(&view.sql) {
+            Ok(source) => source.map(|(source, _)| source),
+            Err(_) => return None,
+        };
+        let sql = source.as_deref().unwrap_or_else(|| {
+            crate::catalog::decode_stored_pg_schema_sql(&view.sql).unwrap_or(&view.sql)
+        });
         let parsed = match turso_pg_parser::parse(sql) {
             Ok(parsed) => parsed,
             Err(turso_pg_parser::ParseError::StackDepthLimitExceeded) => {
@@ -1020,7 +1076,24 @@ impl Infer<'_> {
             missing_rte: Default::default(),
         };
         let columns = walk.select(query, &Vec::new());
-        Some(rename(columns, &v.aliases))
+        // Public view names come from its persisted schema contract, including
+        // implicit names and names fixed before a base-column rename. Inference
+        // supplies only their types. Never truncate or shift a mismatched shape.
+        if columns.len() != view.columns.len() || columns.iter().any(|(name, _)| name == STAR) {
+            return Some(
+                view.columns
+                    .iter()
+                    .map(|column| (column.name.clone().unwrap_or_default(), None))
+                    .collect(),
+            );
+        }
+        Some(
+            view.columns
+                .iter()
+                .zip(columns)
+                .map(|(column, (_, ty))| (column.name.clone().unwrap_or_default(), ty))
+                .collect(),
+        )
     }
 
     /// The relations a list of FROM items brings into scope, walking the subqueries, functions and
@@ -1103,7 +1176,9 @@ impl Infer<'_> {
     }
 
     fn from_item(&mut self, item: &PgNode, scope: &Scope, level: &mut Vec<Rel>) {
-        let Some(_guard) = self.enter() else { return ; };
+        let Some(_guard) = self.enter() else {
+            return;
+        };
         match item.node.as_ref() {
             Some(Node::RangeVar(rv)) => level.push(self.range_var(rv)),
             Some(Node::JoinExpr(j)) => {
@@ -1399,8 +1474,15 @@ impl Infer<'_> {
         self.select_output(s, scope, true).columns
     }
 
-    fn select_output<'b>(&mut self, s: &'b SelectStmt, scope: &Scope, resolve_unknown: bool) -> SelectOutput<'b> {
-        let Some(_guard) = self.enter() else { return SelectOutput::default(); };
+    fn select_output<'b>(
+        &mut self,
+        s: &'b SelectStmt,
+        scope: &Scope,
+        resolve_unknown: bool,
+    ) -> SelectOutput<'b> {
+        let Some(_guard) = self.enter() else {
+            return SelectOutput::default();
+        };
         let ctes = self.with(s.with_clause.as_ref(), scope);
         let mut pending = Vec::new();
         let columns = if let (Some(l), Some(r)) = (s.larg.as_deref(), s.rarg.as_deref()) {
@@ -1423,11 +1505,17 @@ impl Infer<'_> {
                     self.refuse_untyped(node);
                     continue;
                 };
-                if self.types.get(&number).is_some_and(|previous| *previous != ty) {
-                    self.type_error.borrow_mut().get_or_insert_with(|| SqlErrorMessage::classified(
-                        SqlErrorKind::AmbiguousParameter,
-                        format!("inconsistent types deduced for parameter ${number}"),
-                    ));
+                if self
+                    .types
+                    .get(&number)
+                    .is_some_and(|previous| *previous != ty)
+                {
+                    self.type_error.borrow_mut().get_or_insert_with(|| {
+                        SqlErrorMessage::classified(
+                            SqlErrorKind::AmbiguousParameter,
+                            format!("inconsistent types deduced for parameter ${number}"),
+                        )
+                    });
                 } else {
                     self.set(node, Some(ty));
                 }
@@ -1478,10 +1566,12 @@ impl Infer<'_> {
                         continue;
                     }
                     if self.types.get(&number).is_some_and(|oid| *oid != TEXT) {
-                        self.type_error.borrow_mut().get_or_insert_with(|| SqlErrorMessage::classified(
-                            SqlErrorKind::AmbiguousParameter,
-                            format!("inconsistent types deduced for parameter ${number}"),
-                        ));
+                        self.type_error.borrow_mut().get_or_insert_with(|| {
+                            SqlErrorMessage::classified(
+                                SqlErrorKind::AmbiguousParameter,
+                                format!("inconsistent types deduced for parameter ${number}"),
+                            )
+                        });
                     } else {
                         self.set(node, Some(TEXT));
                         // A completed scalar SELECT resolves this unknown output
@@ -1530,7 +1620,9 @@ impl Infer<'_> {
         // Unresolved set leaves are not complete scalar outputs. Their parent
         // consumes pending refs directly; no second walk or speculative cache.
         if pending.is_empty() {
-            self.subselects.borrow_mut().insert(s as *const SelectStmt as usize, scalar);
+            self.subselects
+                .borrow_mut()
+                .insert(s as *const SelectStmt as usize, scalar);
         }
         SelectOutput { columns, pending }
     }
@@ -1541,8 +1633,14 @@ impl Infer<'_> {
         }
     }
 
-    fn window_definition(&mut self, definition: &turso_pg_parser::pg_query::protobuf::WindowDef, scope: &Scope) {
-        for node in &definition.partition_clause { self.expr(node, scope); }
+    fn window_definition(
+        &mut self,
+        definition: &turso_pg_parser::pg_query::protobuf::WindowDef,
+        scope: &Scope,
+    ) {
+        for node in &definition.partition_clause {
+            self.expr(node, scope);
+        }
         self.order_expressions(&definition.order_clause, scope);
         self.exprs(definition.start_offset.as_deref(), scope);
         self.exprs(definition.end_offset.as_deref(), scope);
@@ -1562,7 +1660,9 @@ impl Infer<'_> {
     }
 
     fn targets_with_unknowns<'b>(
-        &mut self, targets: &'b [PgNode], scope: &Scope,
+        &mut self,
+        targets: &'b [PgNode],
+        scope: &Scope,
     ) -> (Vec<(String, Option<u32>)>, Vec<(usize, &'b PgNode, u32)>) {
         let mut unknown = Vec::new();
         let mut columns = Vec::with_capacity(targets.len());
@@ -1578,11 +1678,22 @@ impl Infer<'_> {
                     // Earlier targets may have already supplied this parameter's
                     // context. Record only the state at this occurrence.
                     if let Some(number) = param(val) {
-                        if !self.types.contains_key(&number) { unknown.push((columns.len(), val, number)); }
+                        if !self.types.contains_key(&number) {
+                            unknown.push((columns.len(), val, number));
+                        }
                     }
                     self.expr(val, scope);
                     let name = if t.name.is_empty() {
-                        target_name(val)
+                        match turso_pg_parser::translator::figure_colname(val) {
+                            Ok(name) => name,
+                            Err(_) => {
+                                // FigureColname has only the shared depth refusal.
+                                // The enclosing inference reports that same error;
+                                // this placeholder is never published as metadata.
+                                self.stack_limited.set(true);
+                                "?column?".to_owned()
+                            }
+                        }
                     } else {
                         t.name.clone()
                     };
@@ -1660,7 +1771,9 @@ impl Infer<'_> {
     }
 
     fn expr(&mut self, node: &PgNode, scope: &Scope) {
-        let Some(_guard) = self.enter() else { return ; };
+        let Some(_guard) = self.enter() else {
+            return;
+        };
         use turso_pg_parser::pg_query::protobuf::{AExprKind, SubLinkType};
         match node.node.as_ref() {
             Some(Node::AExpr(e)) => {
@@ -1713,7 +1826,9 @@ impl Infer<'_> {
                 }
             }
             Some(Node::AArrayExpr(a)) => {
-                for arg in &a.elements { self.expr(arg, scope); }
+                for arg in &a.elements {
+                    self.expr(arg, scope);
+                }
                 let element = self.common_expr_type(a.elements.iter(), scope);
                 for arg in &a.elements {
                     self.set(arg, element);
@@ -1732,7 +1847,9 @@ impl Infer<'_> {
             Some(Node::BooleanTest(b)) => self.qual(b.arg.as_deref(), scope),
             Some(Node::NullTest(n)) => self.exprs(n.arg.as_deref(), scope),
             Some(Node::FuncCall(f)) => {
-                for arg in &f.args { self.expr(arg, scope); }
+                for arg in &f.args {
+                    self.expr(arg, scope);
+                }
                 let name = func_name(f);
                 if name.as_deref() == Some("abs") {
                     if let Some(arg) = f.args.first() {
@@ -1747,18 +1864,24 @@ impl Infer<'_> {
                     }
                 }
                 self.order_expressions(&f.agg_order, scope);
-                if let Some(w) = &f.over { self.window_definition(w, scope); }
+                if let Some(w) = &f.over {
+                    self.window_definition(w, scope);
+                }
                 self.exprs(f.agg_filter.as_deref(), scope);
             }
             Some(Node::CoalesceExpr(c)) => {
-                for arg in &c.args { self.expr(arg, scope); }
+                for arg in &c.args {
+                    self.expr(arg, scope);
+                }
                 let first = self.common_expr_type(c.args.iter(), scope);
                 for arg in &c.args {
                     self.set(arg, first);
                 }
             }
             Some(Node::MinMaxExpr(m)) => {
-                for arg in &m.args { self.expr(arg, scope); }
+                for arg in &m.args {
+                    self.expr(arg, scope);
+                }
                 let first = self.common_expr_type(m.args.iter(), scope);
                 for arg in &m.args {
                     self.set(arg, first);
@@ -1775,7 +1898,9 @@ impl Infer<'_> {
                     .collect();
                 // Transform each condition and its result together. A prior
                 // THEN cast supplies context before a later arm's scalar query.
-                if let Some(arg) = c.arg.as_deref() { self.expr(arg, scope); }
+                if let Some(arg) = c.arg.as_deref() {
+                    self.expr(arg, scope);
+                }
                 for when in &whens {
                     match c.arg.as_deref() {
                         Some(arg) => {
@@ -1948,7 +2073,9 @@ impl Infer<'_> {
 
     /// The type `node` has where a parameter is compared with it, if the parse says.
     fn type_of(&self, node: &PgNode, scope: &Scope) -> Option<u32> {
-        let Some(_guard) = self.enter() else { return None; };
+        let Some(_guard) = self.enter() else {
+            return None;
+        };
         let oid = self.infer_type(node, scope);
         if let Some(oid) = oid {
             self.expressions.borrow_mut().insert(node, oid);
@@ -1970,8 +2097,9 @@ impl Infer<'_> {
                     return Some(INT8);
                 }
                 let first = call.args.first().and_then(|a| self.type_of(a, scope));
-                if name == "abs" && (first == Some(705)
-                    || (first.is_none() && call.args.first().and_then(param).is_some()))
+                if name == "abs"
+                    && (first == Some(705)
+                        || (first.is_none() && call.args.first().and_then(param).is_some()))
                 {
                     return Some(FLOAT8);
                 }
@@ -2052,8 +2180,10 @@ impl Infer<'_> {
                         // Arithmetic overload selection differs from common-type
                         // selection: real plus an integer/numeric uses float8.
                         // Engine execution consumes this same shared OID rule.
-                        Some(turso_parser::pg_types::numeric_arithmetic_result_oid(a, b)
-                            .unwrap_or_else(|| wider(a, b)))
+                        Some(
+                            turso_parser::pg_types::numeric_arithmetic_result_oid(a, b)
+                                .unwrap_or_else(|| wider(a, b)),
+                        )
                     }
                     (Some(a), Some(b)) => Some(wider(a, b)),
                     (Some(a), None) if param(e.rexpr.as_deref()) => Some(a),
@@ -2101,26 +2231,11 @@ impl Infer<'_> {
     /// operands in source order before consulting result types, so this lookup
     /// neither revisits the subtree nor emits speculative parameter diagnostics.
     fn subselect_type(&self, s: &SelectStmt) -> Option<u32> {
-        self.subselects.borrow().get(&(s as *const SelectStmt as usize)).copied().flatten()
-    }
-
-}
-
-/// A target's output name when it has no alias, as PostgreSQL names it: a column reference's last
-/// field, a function's name, else "?column?".
-fn target_name(val: &PgNode) -> String {
-    match val.node.as_ref() {
-        Some(Node::ColumnRef(c)) => c
-            .fields
-            .last()
-            .and_then(|f| match f.node.as_ref() {
-                Some(Node::String(s)) => Some(s.sval.clone()),
-                _ => None,
-            })
-            .unwrap_or_else(|| "?column?".to_string()),
-        Some(Node::FuncCall(f)) => func_name(f).unwrap_or_else(|| "?column?".to_string()),
-        Some(Node::TypeCast(c)) => c.arg.as_deref().map_or("?column?".to_string(), target_name),
-        _ => "?column?".to_string(),
+        self.subselects
+            .borrow()
+            .get(&(s as *const SelectStmt as usize))
+            .copied()
+            .flatten()
     }
 }
 
@@ -2185,7 +2300,11 @@ const ARRAYS: [(u32, u32); 23] = [
 /// Preserve a known PostgreSQL ancestor (numeric, UUID, bpchar, etc.) before its
 /// SQLite storage primitive; do not guess TEXT for an unresolved terminal name.
 fn resolved_type_oid(resolved: &turso_core::schema::ResolvedType) -> Option<u32> {
-    if resolved.chain.iter().any(|ty| ty.is_struct() || ty.is_union()) {
+    if resolved
+        .chain
+        .iter()
+        .any(|ty| ty.is_struct() || ty.is_union())
+    {
         // The existing server result metadata exposes these structured values as JSONB.
         return Some(3802);
     }
@@ -2199,10 +2318,7 @@ fn resolved_type_oid(resolved: &turso_core::schema::ResolvedType) -> Option<u32>
 
 /// A cast is not column-scoped: resolve its registered type without a table's
 /// strictness gate, as the engine's cast path does. Array bounds wrap the scalar OID.
-fn cast_type(
-    schema: &Schema,
-    cast: &turso_pg_parser::pg_query::protobuf::TypeCast,
-) -> Option<u32> {
+fn cast_type(schema: &Schema, cast: &turso_pg_parser::pg_query::protobuf::TypeCast) -> Option<u32> {
     let type_name = cast.type_name.as_ref()?;
     let name = match type_name.names.last()?.node.as_ref()? {
         Node::String(s) => s.sval.as_str(),
@@ -2286,7 +2402,6 @@ fn column_oid(schema: &Schema, col: &Column, is_strict: bool) -> Option<u32> {
     }
 }
 
-
 #[cfg(test)]
 mod c52_tests {
     use super::*;
@@ -2294,19 +2409,35 @@ mod c52_tests {
     #[test]
     fn c52_parameter_chain_has_linear_inference_work() {
         const COUNT: u32 = 256;
-        let constraints = (1..COUNT).map(|n| format!("${n}=${}", n + 1))
-            .collect::<Vec<_>>().join(" AND ");
+        let constraints = (1..COUNT)
+            .map(|n| format!("${n}=${}", n + 1))
+            .collect::<Vec<_>>()
+            .join(" AND ");
         let parse = turso_pg_parser::parse(&format!("SELECT $1 WHERE {constraints}")).unwrap();
         let schema = std::sync::Arc::new(Schema::default());
-        let attached = Attached { names: &[], holds: &|_, _| false };
-        let walked = parameter_types(&parse, &schema, &[], &Default::default(),
-            &attached, &(1..=COUNT).map(|n| (n, INT4)).collect()).unwrap();
+        let attached = Attached {
+            names: &[],
+            holds: &|_, _| false,
+        };
+        let walked = parameter_types(
+            &parse,
+            &schema,
+            &[],
+            &Default::default(),
+            &attached,
+            &(1..=COUNT).map(|n| (n, INT4)).collect(),
+        )
+        .unwrap();
         assert_eq!(walked.params.len(), COUNT as usize);
         assert!(walked.params.values().all(|oid| *oid == INT4));
         assert_eq!(walked.columns, vec![Some(INT4)]);
         // Count tree visits instead of wall time; the accepted, fully declared
         // chain must remain within a generous linear work bound.
-        assert!(walked.work < 100 * COUNT as usize, "{} inference visits", walked.work);
+        assert!(
+            walked.work < 100 * COUNT as usize,
+            "{} inference visits",
+            walked.work
+        );
     }
 
     #[test]
@@ -2316,18 +2447,33 @@ mod c52_tests {
         // The exact unknown-chain refusals are exercised by the wire control.
         let parse = turso_pg_parser::parse("SELECT $1, $2 WHERE $1=$2 AND $2=$3").unwrap();
         let schema = std::sync::Arc::new(Schema::default());
-        let attached = Attached { names: &[], holds: &|_, _| false };
-        let walked = parameter_types(&parse, &schema, &[], &Default::default(),
-            &attached, &std::collections::BTreeMap::from([(1, INT4), (2, INT4), (3, INT4)])).unwrap();
+        let attached = Attached {
+            names: &[],
+            holds: &|_, _| false,
+        };
+        let walked = parameter_types(
+            &parse,
+            &schema,
+            &[],
+            &Default::default(),
+            &attached,
+            &std::collections::BTreeMap::from([(1, INT4), (2, INT4), (3, INT4)]),
+        )
+        .unwrap();
         assert_eq!(walked.params.get(&1), Some(&INT4));
         assert_eq!(walked.columns, vec![Some(INT4), Some(INT4)]);
-        let Some(Node::SelectStmt(select)) = parse.protobuf.stmts[0].stmt.as_ref().unwrap().node.as_ref() else {
+        let Some(Node::SelectStmt(select)) =
+            parse.protobuf.stmts[0].stmt.as_ref().unwrap().node.as_ref()
+        else {
             panic!("SELECT tree");
         };
         let Some(Node::ResTarget(target)) = select.target_list[0].node.as_ref() else {
             panic!("result target");
         };
-        assert_eq!(walked.expressions.get(target.val.as_deref().unwrap()), Some(INT4));
+        assert_eq!(
+            walked.expressions.get(target.val.as_deref().unwrap()),
+            Some(INT4)
+        );
     }
 
     #[test]
@@ -2340,9 +2486,16 @@ mod c52_tests {
             let mut query = parse.protobuf.stmts[0].stmt.take().unwrap();
             for _ in 0..depth {
                 let mut outer = wrapper.protobuf.stmts[0].stmt.clone().unwrap();
-                let Some(Node::SelectStmt(select)) = outer.node.as_mut() else { panic!("SELECT"); };
-                let Some(Node::ResTarget(target)) = select.target_list[0].node.as_mut() else { panic!("target"); };
-                let Some(Node::SubLink(scalar)) = target.val.as_deref_mut().unwrap().node.as_mut() else { panic!("scalar"); };
+                let Some(Node::SelectStmt(select)) = outer.node.as_mut() else {
+                    panic!("SELECT");
+                };
+                let Some(Node::ResTarget(target)) = select.target_list[0].node.as_mut() else {
+                    panic!("target");
+                };
+                let Some(Node::SubLink(scalar)) = target.val.as_deref_mut().unwrap().node.as_mut()
+                else {
+                    panic!("scalar");
+                };
                 scalar.subselect = Some(query);
                 query = outer;
             }
@@ -2352,26 +2505,40 @@ mod c52_tests {
             while let Some(Node::SelectStmt(select)) = cursor.and_then(|node| node.node.as_ref()) {
                 assert!(identities.insert(select.as_ref() as *const SelectStmt as usize));
                 cursor = match select.target_list[0].node.as_ref() {
-                    Some(Node::ResTarget(target)) => match target.val.as_deref().and_then(|node| node.node.as_ref()) {
-                        Some(Node::SubLink(scalar)) => scalar.subselect.as_deref(),
-                        _ => None,
-                    },
+                    Some(Node::ResTarget(target)) => {
+                        match target.val.as_deref().and_then(|node| node.node.as_ref()) {
+                            Some(Node::SubLink(scalar)) => scalar.subselect.as_deref(),
+                            _ => None,
+                        }
+                    }
                     _ => None,
                 };
             }
             assert_eq!(identities.len(), depth + 1);
             let schema = std::sync::Arc::new(Schema::default());
-            let attached = Attached { names: &[], holds: &|_, _| false };
-            let walked = parameter_types(&parse, &schema, &[], &Default::default(),
-                &attached, &Default::default()).unwrap();
+            let attached = Attached {
+                names: &[],
+                holds: &|_, _| false,
+            };
+            let walked = parameter_types(
+                &parse,
+                &schema,
+                &[],
+                &Default::default(),
+                &attached,
+                &Default::default(),
+            )
+            .unwrap();
             assert_eq!(walked.columns, vec![Some(INT4)]);
             walked.work
         };
         let short = count(16);
         let long = count(32);
-        assert!(long <= 3 * short, "nested scalar work: depth16={short}, depth32={long}");
+        assert!(
+            long <= 3 * short,
+            "nested scalar work: depth16={short}, depth32={long}"
+        );
     }
-
 
     #[test]
     fn c52_scalar_children_keep_recorded_parameter_contexts() {
@@ -2385,14 +2552,95 @@ mod c52_tests {
             ("SELECT CASE WHEN true THEN $1::int4 WHEN (SELECT $1 WHERE $1=1)=1 THEN 2 ELSE 3 END", INT4),
         ];
         let schema = std::sync::Arc::new(Schema::default());
-        let attached = Attached { names: &[], holds: &|_, _| false };
-        let actual: Vec<_> = cases.iter().map(|(sql, _)| {
-            let parse = turso_pg_parser::parse(sql).unwrap();
-            let walked = parameter_types(&parse, &schema, &[], &Default::default(),
-                &attached, &Default::default()).unwrap();
-            walked.params.get(&1).copied()
-        }).collect();
-        assert_eq!(actual, cases.iter().map(|(_, oid)| Some(*oid)).collect::<Vec<_>>());
+        let attached = Attached {
+            names: &[],
+            holds: &|_, _| false,
+        };
+        let actual: Vec<_> = cases
+            .iter()
+            .map(|(sql, _)| {
+                let parse = turso_pg_parser::parse(sql).unwrap();
+                let walked = parameter_types(
+                    &parse,
+                    &schema,
+                    &[],
+                    &Default::default(),
+                    &attached,
+                    &Default::default(),
+                )
+                .unwrap();
+                walked.params.get(&1).copied()
+            })
+            .collect();
+        assert_eq!(
+            actual,
+            cases.iter().map(|(_, oid)| Some(*oid)).collect::<Vec<_>>()
+        );
     }
 
+    #[test]
+    fn c52_scalar_numeric_set_and_cte_publish_the_recorded_type() {
+        // The independent PG18.6 scalar-context recording returns "numeric"
+        // for both expressions. Check the shared typed tree separately from the
+        // strict wire controls: compound scalar execution is still unsupported.
+        let schema = std::sync::Arc::new(Schema::default());
+        let attached = Attached {
+            names: &[],
+            holds: &|_, _| false,
+        };
+        for sql in [
+            "SELECT pg_typeof(abs((SELECT 1::numeric UNION SELECT 1::numeric)))::text",
+            "SELECT pg_typeof((WITH q AS (SELECT 1::numeric AS n) SELECT n FROM q))::text",
+        ] {
+            let parse = turso_pg_parser::parse(sql).unwrap();
+            let walked = parameter_types(
+                &parse,
+                &schema,
+                &[],
+                &Default::default(),
+                &attached,
+                &Default::default(),
+            )
+            .unwrap();
+            assert!(walked.params.is_empty(), "{sql}");
+            assert!(walked.untyped.is_empty(), "{sql}");
+            assert_eq!(walked.columns, vec![Some(TEXT)], "{sql}");
+            let Some(Node::SelectStmt(select)) = parse.protobuf.stmts[0]
+                .stmt
+                .as_deref()
+                .unwrap()
+                .node
+                .as_ref()
+            else {
+                panic!("SELECT tree");
+            };
+            let Some(Node::ResTarget(target)) = select.target_list[0].node.as_ref() else {
+                panic!("result target");
+            };
+            let output = target.val.as_deref().unwrap();
+            let Some(Node::TypeCast(cast)) = output.node.as_ref() else {
+                panic!("text result cast");
+            };
+            let typeof_node = cast.arg.as_deref().unwrap();
+            let Some(Node::FuncCall(typeof_call)) = typeof_node.node.as_ref() else {
+                panic!("pg_typeof call");
+            };
+            let argument = &typeof_call.args[0];
+            assert_eq!(walked.expressions.get(output), Some(TEXT), "{sql}");
+            assert_eq!(walked.expressions.get(typeof_node), Some(2206), "{sql}");
+            assert_eq!(walked.expressions.get(argument), Some(NUMERIC), "{sql}");
+            let scalar = match argument.node.as_ref() {
+                Some(Node::FuncCall(abs)) => {
+                    assert_eq!(func_name(abs).as_deref(), Some("abs"));
+                    &abs.args[0]
+                }
+                _ => argument,
+            };
+            assert!(
+                matches!(scalar.node.as_ref(), Some(Node::SubLink(_))),
+                "{sql}"
+            );
+            assert_eq!(walked.expressions.get(scalar), Some(NUMERIC), "{sql}");
+        }
+    }
 }

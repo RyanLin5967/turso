@@ -89,6 +89,49 @@ pub trait Dialect: Send + Sync + 'static {
         body: &turso_parser::ast::CreateTableBody,
     ) -> crate::Result<String>;
 
+    /// Store a view's frontend source together with its canonical executable SQL.
+    /// SQLite keeps the prior canonical representation. Dialects can preserve
+    /// source that carries semantics absent from the executable representation.
+    fn format_view_sql(&self, _input: &str, canonical: &str) -> crate::Result<String> {
+        Ok(canonical.to_owned())
+    }
+
+    /// Read a persisted view's executable AST. This runs during schema loading,
+    /// before custom type definitions may be loaded, and must not infer types.
+    fn parse_view_sql_ast(&self, sql: &str) -> crate::Result<Option<turso_parser::ast::Cmd>> {
+        sqlite::parse(sql).map(|(cmd, _)| cmd)
+    }
+
+    /// Recover a persisted view for replay. Unlike fresh user SQL, an older
+    /// schema row may contain canonical executable text only. The dialect must
+    /// preserve that distinction when replay creates the new schema row.
+    fn view_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
+        Ok(sql.to_owned())
+    }
+
+    /// Prepare a view for the engine's existing scoped rename walker. A frontend
+    /// may annotate identifiers with source origins here, after schema loading.
+    /// The returned source must describe the returned AST: a dialect may make
+    /// implicit output contracts explicit before assigning identifier origins.
+    fn parse_view_sql_for_rewrite(
+        &self,
+        sql: &str,
+        _schema: &crate::schema::Schema,
+    ) -> crate::Result<(Option<turso_parser::ast::Cmd>, String)> {
+        Ok((self.parse_view_sql_ast(sql)?, sql.to_owned()))
+    }
+
+    /// Persist the scoped walker's rewritten view. A frontend uses preserved
+    /// identifier origins to update its source and executable form together.
+    fn format_rewritten_view_sql(
+        &self,
+        _original: &str,
+        rewritten: &turso_parser::ast::Stmt,
+        _renames: &[turso_parser::ast::NameRename],
+    ) -> crate::Result<String> {
+        Ok(rewritten.to_string())
+    }
+
     /// Produce stored SQL after the engine rewrites a `CREATE TABLE` AST.
     ///
     /// Schema rewrites cannot reuse the original frontend text because it no
@@ -158,9 +201,7 @@ pub trait Dialect: Send + Sync + 'static {
     ) -> crate::Result<crate::Value> {
         Err(crate::LimboError::ParseError(SqlErrorMessage::classified(
             SqlErrorKind::UndefinedFunction,
-            format!(
-            "no such function: {name}"
-        ),
+            format!("no such function: {name}"),
         )))
     }
 
@@ -184,7 +225,12 @@ pub trait Dialect: Send + Sync + 'static {
     /// `idx_num` its plan's argument mask, `args` the values in the order the filter gets them.
     /// The default checks nothing (SQLite's rules); PostgreSQL's refuses an infinite
     /// generate_series bound, which SQLite clamps (the crash batch, 2026-10-15).
-    fn check_table_function_args(&self, _name: &str, _idx_num: i64, _args: &[crate::Value]) -> crate::Result<()> {
+    fn check_table_function_args(
+        &self,
+        _name: &str,
+        _idx_num: i64,
+        _args: &[crate::Value],
+    ) -> crate::Result<()> {
         Ok(())
     }
 }
@@ -445,6 +491,36 @@ mod tests {
             path,
             crate::OpenOptions::new(dialect).storage(db_file),
         )
+    }
+
+    #[test]
+    fn c52_sqlite_view_source_and_values_survive_reopen() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        for create in [true, false] {
+            let db = open_db(&io, "c52-sqlite-view.db", Arc::new(SqliteDialect)).unwrap();
+            let conn = db.connect().unwrap();
+            if create {
+                conn.execute("CREATE TABLE t(a INTEGER)").unwrap();
+                conn.execute("INSERT INTO t VALUES(7)").unwrap();
+                conn.execute("CREATE VIEW v AS SELECT a + 1 AS n FROM t")
+                    .unwrap();
+                conn.execute("ALTER TABLE t RENAME COLUMN a TO b").unwrap();
+            }
+            let rows = conn
+                .prepare("SELECT n FROM v")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap();
+            assert_eq!(rows, vec![vec![crate::Value::from_i64(8)]]);
+            let stored = conn
+                .prepare("SELECT sql FROM sqlite_schema WHERE name='v'")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap();
+            assert_eq!(stored.len(), 1);
+            assert!(!stored[0][0].to_string().contains("turso_frontend:postgres"));
+            conn.close().unwrap();
+        }
     }
 
     #[test]
@@ -1239,12 +1315,18 @@ mod tests {
             let bound = run_bound(&conn, "INSERT INTO k VALUES (?1, 'bound')");
             assert!(not_null(&bound), "a bound NULL key: {bound:?}");
             let named = conn.execute("INSERT INTO k (id, v) VALUES (NULL, 'named')");
-            assert!(not_null(&named), "a NULL key in a named column list: {named:?}");
+            assert!(
+                not_null(&named),
+                "a NULL key in a named column list: {named:?}"
+            );
 
             conn.execute("BEGIN").unwrap();
             conn.execute("INSERT INTO k VALUES (3, 'three')").unwrap();
             let multi = conn.execute("INSERT INTO k VALUES (5, 'five'), (NULL, 'null')");
-            assert!(not_null(&multi), "a NULL key in a multi-row INSERT: {multi:?}");
+            assert!(
+                not_null(&multi),
+                "a NULL key in a multi-row INSERT: {multi:?}"
+            );
             conn.execute("COMMIT").unwrap();
             assert_eq!(
                 ints(&conn, "SELECT id FROM k ORDER BY id"),
@@ -1252,7 +1334,8 @@ mod tests {
                 "the failed INSERT undid its own earlier row and nothing else"
             );
 
-            conn.execute("INSERT INTO k (v) VALUES ('omitted')").unwrap();
+            conn.execute("INSERT INTO k (v) VALUES ('omitted')")
+                .unwrap();
             assert_eq!(
                 ints(&conn, "SELECT id FROM k ORDER BY id"),
                 vec![3, 4],
@@ -1268,7 +1351,10 @@ mod tests {
             let upsert = conn.execute(
                 "INSERT INTO k VALUES (4, 'again') ON CONFLICT (id) DO UPDATE SET id = NULL",
             );
-            assert!(not_null(&upsert), "an upsert's DO UPDATE SET key = NULL: {upsert:?}");
+            assert!(
+                not_null(&upsert),
+                "an upsert's DO UPDATE SET key = NULL: {upsert:?}"
+            );
             assert_eq!(
                 ints(&conn, "SELECT id FROM k ORDER BY id"),
                 vec![3, 4],
@@ -1310,14 +1396,21 @@ mod tests {
             let conn = db.connect().unwrap();
             conn.execute("ALTER TABLE k DROP COLUMN w").unwrap();
             let after_drop = conn.execute("INSERT INTO k (id, v) VALUES (NULL, 'after drop')");
-            assert!(not_null(&after_drop), "after ALTER TABLE DROP COLUMN: {after_drop:?}");
+            assert!(
+                not_null(&after_drop),
+                "after ALTER TABLE DROP COLUMN: {after_drop:?}"
+            );
             conn.close().unwrap();
         }
         {
             let db = open_db(&io, "pgkey.db", Arc::new(PgKeyTestDialect)).unwrap();
             let conn = db.connect().unwrap();
-            let reopened = conn.execute("INSERT INTO k (id, v) VALUES (NULL, 'reopened after drop')");
-            assert!(not_null(&reopened), "after DROP COLUMN and a reopen: {reopened:?}");
+            let reopened =
+                conn.execute("INSERT INTO k (id, v) VALUES (NULL, 'reopened after drop')");
+            assert!(
+                not_null(&reopened),
+                "after DROP COLUMN and a reopen: {reopened:?}"
+            );
             conn.close().unwrap();
         }
 
@@ -1325,7 +1418,8 @@ mod tests {
         let conn = db.connect().unwrap();
         conn.execute("CREATE TABLE k (id INTEGER PRIMARY KEY, v TEXT)")
             .unwrap();
-        conn.execute("INSERT INTO k VALUES (NULL, 'literal')").unwrap();
+        conn.execute("INSERT INTO k VALUES (NULL, 'literal')")
+            .unwrap();
         run_bound(&conn, "INSERT INTO k VALUES (?1, 'bound')").unwrap();
         assert_eq!(
             ints(&conn, "SELECT id FROM k ORDER BY id"),
@@ -1356,19 +1450,41 @@ mod tests {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = open_db(&io, "pgkey-paths.db", Arc::new(PgKeyTestDialect)).unwrap();
         let conn = db.connect().unwrap();
-        conn.execute("CREATE TABLE k (id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+        conn.execute("CREATE TABLE k (id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
         conn.execute("CREATE TABLE src (x INTEGER)").unwrap();
         conn.execute("INSERT INTO src VALUES (NULL)").unwrap();
-        let ignored = conn.execute("INSERT OR IGNORE INTO k VALUES (1, 'a'), (NULL, 'skipped'), (2, 'b')");
-        assert!(ignored.is_ok(), "INSERT OR IGNORE with a NULL key failed: {ignored:?}");
-        assert_eq!(ids(&conn), vec![1, 2], "CLAIM: INSERT OR IGNORE did not skip the NULL-key row alone");
+        let ignored =
+            conn.execute("INSERT OR IGNORE INTO k VALUES (1, 'a'), (NULL, 'skipped'), (2, 'b')");
+        assert!(
+            ignored.is_ok(),
+            "INSERT OR IGNORE with a NULL key failed: {ignored:?}"
+        );
+        assert_eq!(
+            ids(&conn),
+            vec![1, 2],
+            "CLAIM: INSERT OR IGNORE did not skip the NULL-key row alone"
+        );
         let selected = conn.execute("INSERT INTO k (id, v) SELECT x, 's' FROM src");
-        assert!(not_null(&selected), "CLAIM: INSERT ... SELECT of a NULL key: {selected:?}");
+        assert!(
+            not_null(&selected),
+            "CLAIM: INSERT ... SELECT of a NULL key: {selected:?}"
+        );
         let rowid = conn.execute("UPDATE k SET rowid = NULL WHERE id = 1");
-        assert!(not_null(&rowid), "CLAIM: UPDATE SET rowid = NULL: {rowid:?}");
+        assert!(
+            not_null(&rowid),
+            "CLAIM: UPDATE SET rowid = NULL: {rowid:?}"
+        );
         let update_ignored = conn.execute("UPDATE OR IGNORE k SET id = NULL WHERE id = 2");
-        assert!(update_ignored.is_ok(), "UPDATE OR IGNORE SET id = NULL failed: {update_ignored:?}");
-        assert_eq!(ids(&conn), vec![1, 2], "CLAIM: the refused and skipped statements changed the table");
+        assert!(
+            update_ignored.is_ok(),
+            "UPDATE OR IGNORE SET id = NULL failed: {update_ignored:?}"
+        );
+        assert_eq!(
+            ids(&conn),
+            vec![1, 2],
+            "CLAIM: the refused and skipped statements changed the table"
+        );
     }
 
     /// Engine review 20 LOW 24: a multi-row UPDATE inside BEGIN whose third row sets the NOT NULL
@@ -1381,8 +1497,10 @@ mod tests {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = open_db(&io, "pgkey-update.db", Arc::new(PgKeyTestDialect)).unwrap();
         let conn = db.connect().unwrap();
-        conn.execute("CREATE TABLE k (id INTEGER PRIMARY KEY, v TEXT)").unwrap();
-        conn.execute("INSERT INTO k VALUES (1, 'a'), (2, 'b'), (3, 'c')").unwrap();
+        conn.execute("CREATE TABLE k (id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO k VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+            .unwrap();
         conn.execute("BEGIN").unwrap();
         let updated = conn.execute("UPDATE k SET id = CASE WHEN id = 3 THEN NULL ELSE id + 10 END");
         assert!(
@@ -1398,7 +1516,11 @@ mod tests {
             .iter()
             .map(|row| row[0].as_int().unwrap())
             .collect();
-        assert_eq!(ids, vec![1, 2, 3], "CLAIM: the failed UPDATE kept the keys it had already changed");
+        assert_eq!(
+            ids,
+            vec![1, 2, 3],
+            "CLAIM: the failed UPDATE kept the keys it had already changed"
+        );
     }
 
     /// Engine review 20 item 12: the NOT NULL key check's statement-journal term matters only where
@@ -1411,7 +1533,8 @@ mod tests {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = open_db(&io, "pgkey-replace.db", Arc::new(PgKeyTestDialect)).unwrap();
         let conn = db.connect().unwrap();
-        conn.execute("CREATE TABLE k (id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+        conn.execute("CREATE TABLE k (id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
         conn.execute("BEGIN").unwrap();
         conn.execute("INSERT INTO k VALUES (3, 'three')").unwrap();
         let replaced = conn.execute("INSERT OR REPLACE INTO k VALUES (5, 'five'), (NULL, 'n')");
@@ -1428,7 +1551,11 @@ mod tests {
             .iter()
             .map(|row| row[0].as_int().unwrap())
             .collect();
-        assert_eq!(ids, vec![3], "CLAIM: the failed OR REPLACE INSERT did not undo its own first row");
+        assert_eq!(
+            ids,
+            vec![3],
+            "CLAIM: the failed OR REPLACE INSERT did not undo its own first row"
+        );
     }
 
     /// Engine review 20 HIGH 1, the branch arm: a branch forked after ALTER TABLE ADD COLUMN on a
@@ -1461,7 +1588,9 @@ mod tests {
                 .execute("CREATE TABLE k (id INTEGER PRIMARY KEY, v TEXT)")
                 .unwrap();
             trunk.execute("ALTER TABLE k ADD COLUMN w INTEGER").unwrap();
-            trunk.execute("INSERT INTO k (id, v) VALUES (1, 'one')").unwrap();
+            trunk
+                .execute("INSERT INTO k (id, v) VALUES (1, 'one')")
+                .unwrap();
             let on_trunk = trunk.execute("INSERT INTO k (id, v) VALUES (NULL, 'trunk')");
             assert!(
                 matches!(&on_trunk, Err(crate::LimboError::Constraint(m)) if m == "NOT NULL constraint failed: k.id"),
