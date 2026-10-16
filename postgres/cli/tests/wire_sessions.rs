@@ -13261,6 +13261,26 @@ fn c44_lock_timeout_int32_max_is_accepted() {
     assert_eq!(a.q("SHOW lock_timeout").single("timeout"), "2147483647ms");
 }
 
+// PG18.6: c54-pg18-boundaries.out, commands 1, 2, 3, 4, 5.
+#[test]
+fn c54_series_arity_has_no_sqlite_defaults() {
+    let dir = Scratch::new("c54-series-arity");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "SELECT * FROM generate_series() LIMIT 1",
+        "SELECT * FROM generate_series(1) LIMIT 1",
+        "SELECT * FROM generate_series(1,2,1,1) LIMIT 1",
+    ] {
+        assert_eq!(a.q(sql).err(sql).code, "42883", "{sql}");
+    }
+    for sql in ["SELECT * FROM generate_series(1,2) LIMIT 1", "SELECT * FROM generate_series(1,2,1) LIMIT 1"] {
+        let reply = a.q(sql).ok(sql);
+        assert_eq!(reply.oids, Some(vec![23]));
+        assert_eq!(reply.rows, vec![vec![Some("1".into())]]);
+    }
+}
+
 #[test]
 fn c54_generate_series_rejects_float_arguments() {
     let dir = Scratch::new("c54-series-types");
