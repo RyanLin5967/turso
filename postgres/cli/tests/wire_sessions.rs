@@ -1086,6 +1086,33 @@ fn a_cast_to_a_type_over_text_converts_and_over_bytea_refuses_a_non_text_source(
     a.q("SELECT CAST('ab' AS bytea)").ok("SELECT CAST('ab' AS bytea)");
 }
 
+/// libpg_query's refusal of a statement nested too deeply is 54001, and it is told apart from any
+/// other error by its kind, never by its words: a syntax error that quotes a literal reading "stack
+/// depth limit exceeded" or "recursion limit reached" is PostgreSQL's 42601. The classification
+/// matched the message's text with `contains`, so such a literal was reported 54001 (review of
+/// 96b69304b, F5). Control: a statement nested past prost's decode limit is still 54001.
+#[test]
+fn a_syntax_error_quoting_the_stack_message_is_42601_and_a_deep_statement_54001() {
+    let dir = Scratch::new("pgq54001");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "SELECT 1 'stack depth limit exceeded'",
+        "SELECT 1 'recursion limit reached'",
+        "SELECT 'stack depth limit exceeded",
+    ] {
+        let e = a.q(sql).err(sql);
+        assert_eq!(e.code, "42601", "{sql}: {e:?}");
+    }
+    let mut deep = "1".to_string();
+    for _ in 0..200 {
+        deep = format!("(SELECT {deep})");
+    }
+    let sql = format!("SELECT {deep}");
+    let e = a.q(&sql).err("200 nested scalar subqueries");
+    assert_eq!(e.code, "54001", "premise: 200 nested scalar subqueries are refused 54001: {e:?}");
+}
+
 /// A client that floods SSLRequests and never reads cannot hold its session, nor the server's one
 /// slot, past the authentication timeout (Codex/Claude C37 H1: the server answered every repeated
 /// SSLRequest with 'N' and blocked for good in a write with no deadline; a second client got
