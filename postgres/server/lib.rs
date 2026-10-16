@@ -3886,6 +3886,20 @@ impl ExtendedQueryHandler for Session {
         }
         check_parameter_codes(&message).map_err(PgWireError::UserError)?;
         let portal = Portal::try_new(&message, statement)?;
+        // The values, read by their parameters' types before BindComplete, as exec_bind_message
+        // reads them (C53, PGDIV-BIND-REFUSAL-STEP): they were read at Execute, after BindComplete
+        // and a RowDescription. The types come from the statement's first meeting with the engine
+        // (Describe's prepare, kept for the Describe and Execute that follow, so a round prepares
+        // once as before); a branch call's are text, read by the call itself.
+        if portal.statement.statement.call.is_none() && !portal.parameters.is_empty() {
+            self.describe_prepare(&portal.statement.statement.sql)?;
+            let params = self
+                .described_parameters(&portal.statement.parameter_types)
+                .map_err(PgWireError::UserError)?;
+            if params.len() == portal.parameters.len() {
+                decode_portal_parameters(&portal, &params)?;
+            }
+        }
         // A named portal lives until its Close or its transaction's end: binding the name again
         // is 42P03, as PostgreSQL's CreatePortal refuses it. It replaced the portal silently, a
         // suspended one included (wire review 15 item 20). The unnamed portal is replaced, as
@@ -4837,6 +4851,23 @@ fn bind_portal_parameters(
     portal: &Portal<Parsed>,
     types: &[Type],
 ) -> PgWireResult<()> {
+    for (i, value) in decode_portal_parameters(portal, types)?.into_iter().enumerate() {
+        let index = NonZero::new(i + 1).expect("i + 1 >= 1");
+        // A parameter with no engine slot (declared but unused, or in a clause the engine folds
+        // away) binds nothing.
+        if stmt.parameters().has_index(index) {
+            stmt.bind_at(index, value)
+                .map_err(|e| PgWireError::UserError(engine_info(&e)))?;
+        }
+    }
+    Ok(())
+}
+
+/// Every value `portal` holds, read by its parameter's type and format, as PostgreSQL's
+/// exec_bind_message reads them before it answers BindComplete: a value its type cannot read
+/// (22P02, 22003, 22023) refuses the Bind (C53, PGDIV-BIND-REFUSAL-STEP; at [`Session::on_bind`])
+/// and again the Execute that binds them.
+fn decode_portal_parameters(portal: &Portal<Parsed>, types: &[Type]) -> PgWireResult<Vec<Value>> {
     // check_bind_arity made the counts equal; zipped short, a mismatch bound a value under another's
     // type or left a parameter unbound (NULL to the engine), so it is refused (wire review 18 item
     // 23).
@@ -4851,23 +4882,18 @@ fn bind_portal_parameters(
         )));
     }
     // The format codes were checked at Bind ([`check_bind`]): none, one, or one per value.
-    for (i, (pg_type, sent)) in types.iter().zip(&portal.parameters).enumerate() {
-        let value = match sent {
-            None => Value::Null,
+    types
+        .iter()
+        .zip(&portal.parameters)
+        .enumerate()
+        .map(|(i, (pg_type, sent))| match sent {
+            None => Ok(Value::Null),
             Some(bytes) if portal.parameter_format.is_binary(i) => {
-                pg_binary_to_value(bytes, pg_type, i + 1)?
+                pg_binary_to_value(bytes, pg_type, i + 1)
             }
-            Some(bytes) => pg_bytes_to_value(bytes, pg_type)?,
-        };
-        let index = NonZero::new(i + 1).expect("i + 1 >= 1");
-        // A parameter with no engine slot (declared but unused, or in a clause the engine folds
-        // away) binds nothing.
-        if stmt.parameters().has_index(index) {
-            stmt.bind_at(index, value)
-                .map_err(|e| PgWireError::UserError(engine_info(&e)))?;
-        }
-    }
-    Ok(())
+            Some(bytes) => pg_bytes_to_value(bytes, pg_type),
+        })
+        .collect()
 }
 
 /// PostgreSQL's first check of a Bind message (exec_bind_message), made before anything else and
@@ -5034,6 +5060,14 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
             format!("value \"{text}\" is out of range for type {name}"),
         ))
     };
+    // float4in and float8in word it without "value" (recorded, pg18.out and
+    // pg18-audit1-lib-parameters_decode_at_postgresqls_edges.out).
+    let float_out_of_range = |name: &str| {
+        PgWireError::UserError(error(
+            "22003",
+            format!("\"{text}\" is out of range for type {name}"),
+        ))
+    };
 
     match *pg_type {
         Type::INT2 | Type::INT4 | Type::INT8 => {
@@ -5069,7 +5103,7 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
                 _ => f,
             };
             if in_type.is_infinite() && !infinite_spelled {
-                return Err(out_of_range(name));
+                return Err(float_out_of_range(name));
             }
             // A spelling of a nonzero value that underflows the type to zero ('1e-400'), which
             // float4in and float8in refuse (ERANGE with a zero result; recalled from their source,
@@ -5079,7 +5113,7 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
                 && *pg_type != Type::NUMERIC
                 && mantissa.bytes().any(|b| (b'1'..=b'9').contains(&b))
             {
-                return Err(out_of_range(name));
+                return Err(float_out_of_range(name));
             }
             Ok(Value::from_f64(f))
         }
