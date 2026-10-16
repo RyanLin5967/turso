@@ -2756,6 +2756,37 @@ fn a_view_over_public_t_types_its_parameters() {
     assert_eq!(r.params, Some(vec![23]), "{:?}", r.error);
 }
 
+/// A three-part column reference resolves through its schema as the two-part form does: with
+/// pg_class in FROM, `pg_catalog.pg_class.relname = $1` types `$1` exactly as `pg_class.relname
+/// = $1` does (PostgreSQL types both name, 19; this catalog declares relname text, a separate
+/// divergence), and `public.t.c` with t aliased away (FROM t AS x) names no FROM entry, 42P01, as
+/// PostgreSQL's errorMissingRTE answers. The three-part path hard-coded public, so the pg_catalog
+/// form was refused 42P18 (wire review 17 item 5).
+#[test]
+fn a_three_part_reference_resolves_through_its_schema() {
+    let dir = Scratch::new("threepart");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE t(id INT PRIMARY KEY, c INT)").ok("t");
+    let two = a.describe_statement("SELECT 1 FROM pg_class WHERE pg_class.relname = $1");
+    assert!(
+        two.error.is_none() && two.params.is_some(),
+        "premise: the two-part form is typed: {:?}",
+        two.error
+    );
+    let three =
+        a.describe_statement("SELECT 1 FROM pg_class WHERE pg_catalog.pg_class.relname = $1");
+    assert_eq!(three.params, two.params, "{:?}", three.error);
+    let sql = "SELECT 1 FROM t AS x WHERE public.t.c = $1";
+    let r = a.describe_statement(sql);
+    assert_eq!(
+        r.error.as_ref().map(|e| e.code.as_str()),
+        Some("42P01"),
+        "{sql}: {:?}",
+        r.params
+    );
+}
+
 /// An unqualified relation is typed from the relation the engine resolves along the search path:
 /// an entry that names no attached schema (`"$user"`, PostgreSQL's default, or `nosuch`) is
 /// skipped, and an attached schema that does not hold the name is passed over, so under `"$user",
