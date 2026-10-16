@@ -1214,6 +1214,7 @@ fn prepare_statement_parsed(
         // where no aggregate typed them: the engine has no boolean type (PG 18 differential,
         // 2026-10-15).
         types.param_targets = crate::result_types::param_targets(&parse_result);
+        types.folds_at_plan = folds_at_plan(&parse_result);
         // A table's width, for a `*` beside a typed column, from the in-memory schema alone.
         let tables = |schema: &str, table: &str| resident_relation_columns(pg_conn, schema, table);
         let fixed = crate::result_types::expression_types(&parse_result, &tables);
@@ -2878,6 +2879,22 @@ fn schema_on_search_path(pg_conn: &Arc<PgConnectionInner>, table: &str) -> Resul
 /// Whether `parse` holds a DELETE ... USING anywhere (its rewrite reads the relations' declared
 /// columns): the statement itself, EXPLAIN's, a CTE's. The text is read for the word first, so any
 /// other statement pays one byte scan and no tree walk.
+/// [`crate::StatementTypes::folds_at_plan`]: the statement is a SELECT or VALUES with no FROM and
+/// no set operation.
+fn folds_at_plan(parse: &turso_pg_parser::pg_query::ParseResult) -> bool {
+    use turso_pg_parser::pg_query::protobuf::{node::Node, SetOperation};
+    let Some(Some(Node::SelectStmt(select))) = parse
+        .protobuf
+        .stmts
+        .first()
+        .and_then(|s| s.stmt.as_ref())
+        .map(|n| n.node.as_ref())
+    else {
+        return false;
+    };
+    select.from_clause.is_empty() && select.op() == SetOperation::SetopNone
+}
+
 fn is_delete_using(sql: &str, parse: &turso_pg_parser::pg_query::ParseResult) -> bool {
     use turso_pg_parser::pg_query::NodeRef;
     if !sql

@@ -2522,7 +2522,8 @@ impl Session {
             commits: types.commits,
             rolls_back: types.rolls_back,
             info: wire_info(e.error),
-            started: e.started,
+            // A constant SELECT's error is PostgreSQL's planner's, before RowDescription.
+            started: e.started.filter(|_| !types.folds_at_plan),
         })
     }
 

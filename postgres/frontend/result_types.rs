@@ -559,6 +559,13 @@ pub struct StatementTypes {
     /// prerequisites), and the statement it returns is a no-op: the server answers it with its
     /// command tag alone, never as a query (the no-op's one column made it `SELECT 0`).
     pub performed: bool,
+    /// A SELECT or VALUES with no FROM and no set operation: PostgreSQL's planner folds its
+    /// constant expressions, so an error in one is raised before the executor starts and before
+    /// RowDescription, where a query that reads a relation or a function's rows raises it after
+    /// (C53, PGDIV-ERROR-BEFORE-ROWDESC; recorded: `SELECT encode('abc', 'nosuch')` errors alone,
+    /// `SELECT x / 0 FROM nd` after its RowDescription). BLIND SPOT: a volatile function (random())
+    /// is not folded there, and its error comes after RowDescription.
+    pub folds_at_plan: bool,
     /// For each result column of a plain SELECT, the parameter number when the column is a bare
     /// `$n`: the server announces such a column as that parameter's type, declared or inferred,
     /// as PostgreSQL does (it was text; the PG 18 differential's finding (c)). Empty when the

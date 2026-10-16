@@ -73,6 +73,17 @@ pub fn checked_param_numbers(parse: &ParseResult, sql: &str) -> Result<Vec<i32>,
             .ok_or_else(unreadable)?;
         let len = digits.iter().take_while(|c| c.is_ascii_digit()).count();
         let text = &sql[location + 1..location + 1 + len];
+        // PostgreSQL 15+'s scanner refuses a parameter run into identifier characters ($1abc)
+        // as "trailing junk after parameter" (42601, at Parse); libpg_query 17's read it as $1
+        // aliased abc (C40 review LOW 5; recorded on PostgreSQL 18.6, pg18-c49-low5.out).
+        let ident = |c: &u8| c.is_ascii_alphanumeric() || *c == b'_' || *c >= 0x80;
+        let junk = digits[len..].iter().take_while(|c| ident(c)).count();
+        if junk > 0 {
+            return Err(ParseError::ParseError(format!(
+                "trailing junk after parameter at or near \"${}\"",
+                &sql[location + 1..location + 1 + len + junk]
+            )));
+        }
         let value = text.bytes().try_fold(0u64, |v, d| {
             v.checked_mul(10)?.checked_add(u64::from(d - b'0'))
         });

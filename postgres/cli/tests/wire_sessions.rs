@@ -12082,8 +12082,29 @@ fn declared_replays() -> Vec<(&'static str, Vec<&'static str>)> {
             .find(");\n")
             .expect("an invocation ends with `);` at a line's end");
         let body = &rest[body_start..body_start + body_len];
-        // The strings of the body: the recording file first, then one reason per entry.
-        let strings: Vec<&str> = body.split('"').skip(1).step_by(2).collect();
+        // The string literals of the body, read as Rust reads them (a `\"` inside one is part of
+        // it): the recording file first, then one reason per entry.
+        let mut strings: Vec<&str> = Vec::new();
+        let bytes = body.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            // A commented-out entry cites nothing: a `//` outside a literal runs to the line's end.
+            if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'/') {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            if bytes[i] == b'"' {
+                let start = i + 1;
+                i = start;
+                while bytes[i] != b'"' {
+                    i += if bytes[i] == b'\\' { 2 } else { 1 };
+                }
+                strings.push(&body[start..i]);
+            }
+            i += 1;
+        }
         let (file, reasons) = strings.split_first().expect("an invocation names its recording");
         let ids = reasons
             .iter()
@@ -12608,6 +12629,7 @@ replays_postgresql!(
     "pg18-audit3-a_numeric_division_by_zero_is_22012.out",
     [
         (1, "PGDIV-SCHEMA-REFUSED cluster-state [cluster]: DROP SCHEMA IF EXISTS s; DROP SCHEMA public: ours refuses the whole query 0A000"),
+        (4, "PGDIV-NUMERIC-OID-FLOAT8 value [wire]: SELECT x / 0 FROM nd: RowDescription then 22012 as in PG (C53), but the column is typed 701 where PG types it 1700"),
     ]
 );
 replays_postgresql!(
@@ -12877,7 +12899,10 @@ replays_postgresql!(
     pg18_gsinf_replays_as_postgresql_answered,
     "pg18-gsinf.out",
     [
+        (1, "PGDIV-GS-NUMERIC-TYPE value [wire]: generate_series over numeric: RowDescription then 22023 as in PG (C53); PG types the column 1700, ours 23, and our message carries 'Extension error: '"),
         (2, "PGDIV-GS-MIXED-TYPES error-code [wire]: generate_series(int, float8, int): PG 42883 function does not exist; ours 22023 'Extension error: stop value cannot be infinity' (accepts a mixed-type call PG refuses)"),
+        (3, "PGDIV-GS-NUMERIC-TYPE value [wire]: generate_series step 'inf'::numeric: as #1"),
+        (4, "PGDIV-GS-NUMERIC-TYPE value [wire]: generate_series start '-inf'::numeric: as #1"),
     ]
 );
 replays_postgresql!(
@@ -13059,4 +13084,13 @@ replays_postgresql!(
         (24, "PGDIV-SQLITE-NAME-MESSAGE error-text [wire]: DROP TABLE dm1, dmmissing: PG 42P01 'table \"dmmissing\" does not exist'; ours 42P01 'Parse error: no such table: dmmissing' (nothing dropped on either)"),
     ]
 );
-replays_postgresql!(pg18_c49_low5_replays_as_postgresql_answered, "pg18-c49-low5.out", []);
+replays_postgresql!(
+    pg18_c49_low5_replays_as_postgresql_answered,
+    "pg18-c49-low5.out",
+    [
+        (1, "PGDIV-PARSE-PREFIX error-text [wire]: $1abc is refused at Parse with 42601 as PG refuses it (C49 LOW 5); the message carries 'Parse error: '"),
+        (3, "PGDIV-PARSE-PREFIX error-text [wire]: Describe of $1abc, refused at Parse with 42601 as PG refuses it; the message carries 'Parse error: '"),
+        (4, "PGDIV-PARSE-PREFIX error-text [wire]: SELECT 1abc is 42601 as in PG; the message carries 'Parse error: Invalid statement: '"),
+        (5, "PGDIV-PARSE-PREFIX error-text [wire]: SELECT 0x1g is 42601 as in PG; the message carries 'Parse error: Invalid statement: '"),
+    ]
+);
