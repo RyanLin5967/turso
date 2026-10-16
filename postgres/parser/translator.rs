@@ -7274,7 +7274,7 @@ fn alias_select_columns(
             SqlErrorKind::InvalidColumnReference, message.clone()).with_protocol_text(message)));
     }
     rename_columns(&mut columns, &alias.colnames);
-    let source_sql = select.to_string();
+    let source_sql = select.to_string().to_ascii_lowercase();
     let mut name = "__turso_pg_derived_columns".to_string();
     while source_sql.contains(&name) { name.push('_'); }
     let name = ast::Name::from_string(name);
