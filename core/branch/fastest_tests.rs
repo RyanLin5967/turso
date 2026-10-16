@@ -9533,6 +9533,29 @@ fn diag_create_write_delete_syscalls_by_thread() {
     }
 }
 
+/// Run the test `name` alone in a child process of this test binary, with `marker` set (so the
+/// child runs the measurement), and relay its verdict: Ok if it passed; else a panic carrying the
+/// child's own panic message. A child that ran no test is refused.
+fn relay_child(name: &str, marker: &str) {
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([name, "--exact", "--test-threads=1", "--nocapture"])
+        .env(marker, "1")
+        .output()
+        .unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(text.contains("running 1 test"), "the child process ran no test ({name}):\n{text}");
+    if out.status.success() {
+        return;
+    }
+    let msg: Vec<&str> = text
+        .lines()
+        .skip_while(|l| !l.contains("panicked at"))
+        .skip(1)
+        .take_while(|l| !l.is_empty())
+        .collect();
+    panic!("{} (in its own process)", msg.join("\n"));
+}
+
 /// Checkpoint FIX (budget a_checkpoint_issues_at_most_two_syscalls_under_the_store_mutex: 52 over 3
 /// checkpoints in ckpt_n10, budget 2 each): a fuzzy checkpoint's syscalls inside its two store-mutex
 /// holds, the capture's and the install's, attributed to points (`store::CKPT_HELD_SYSCALLS`). A D2
@@ -9547,6 +9570,13 @@ fn diag_create_write_delete_syscalls_by_thread() {
 /// tightening, so newly red cells are real.
 #[test]
 pub(crate) fn a_fuzzy_checkpoint_issues_at_most_two_syscalls_under_the_store_mutex() {
+    // FLAGGED harness change (lead ruling, the per-store counter class: a syscall budget is decided
+    // only in a process where no foreign test's threads run): the measurement below runs, unchanged,
+    // in a child process of its own; this relays its verdict. In a parallel run it REFUSED in the
+    // test process (red the_fuzzy_held_syscall_budget_is_judged_beside_another_stores_work).
+    if std::env::var_os("FE_FUZZY_HELD_CHILD").is_none() {
+        return relay_child("branch::fastest_tests::a_fuzzy_checkpoint_issues_at_most_two_syscalls_under_the_store_mutex", "FE_FUZZY_HELD_CHILD");
+    }
     use super::budget_probe::ran_between;
     let _s = serial();
     struct Disarm;
