@@ -244,6 +244,10 @@ struct Shared {
     startup_timeout: std::time::Duration,
     /// Every live session's socket, for the shutdown that ends them.
     sessions: SessionSockets,
+    #[cfg(test)]
+    before_session: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    fail_socket_clone: std::sync::atomic::AtomicBool,
 }
 
 /// A handle on each live session's socket (a dup of its descriptor), so the server's shutdown can
@@ -406,7 +410,19 @@ impl Shared {
             next_pid: std::sync::atomic::AtomicI32::new(1),
             startup_timeout: std::time::Duration::from_secs(DEFAULT_AUTHENTICATION_TIMEOUT_S),
             sessions: SessionSockets::default(),
+            #[cfg(test)]
+            before_session: Mutex::new(None),
+            #[cfg(test)]
+            fail_socket_clone: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    fn clone_session_socket(&self, socket: &std::net::TcpStream) -> std::io::Result<std::net::TcpStream> {
+        #[cfg(test)]
+        if self.fail_socket_clone.load(Ordering::Relaxed) {
+            return Err(std::io::Error::other("test socket duplication failure"));
+        }
+        socket.try_clone()
     }
 
     fn uses(&self) -> MutexGuard<'_, std::collections::HashMap<compact_str::CompactString, BranchUse>> {
@@ -650,10 +666,18 @@ impl TursoPgServer {
             }
         };
         let shared = self.shared.clone();
+        #[cfg(test)]
+        let before_session = shared.before_session.lock().unwrap().take();
         let spawned = std::thread::Builder::new()
             .name("pg-session".to_string())
             .stack_size(SESSION_STACK)
-            .spawn(move || run_session(shared, socket, addr, slot));
+            .spawn(move || {
+                #[cfg(test)]
+                if let Some(before_session) = before_session {
+                    before_session();
+                }
+                run_session(shared, socket, addr, slot)
+            });
         match spawned {
             Ok(handle) => {
                 let mut threads = self.threads.lock().unwrap_or_else(|e| e.into_inner());
@@ -703,8 +727,8 @@ fn run_session(
     // A handle on the socket for the server's shutdown, which shuts it so a blocked read returns.
     // Given back by a guard, so a session that panics (an unwinding build) does not leak the dup
     // (Claude C37 M3).
-    let _registered = socket
-        .try_clone()
+    let _registered = shared
+        .clone_session_socket(&socket)
         .ok()
         .map(|handle| Registered::new(&shared.sessions, handle));
     let session = Arc::new(Session::new(shared.clone()));
@@ -7553,3 +7577,6 @@ mod tests {
         assert_eq!(s.in_use_waiters.load(Ordering::SeqCst), 0);
     }
 }
+
+#[cfg(test)]
+mod shutdown_tests;
