@@ -10322,10 +10322,10 @@ fn create_table_checks_its_foreign_keys_parents() {
             "CREATE TABLE c(x INT, FOREIGN KEY (x) REFERENCES p(code))",
             "42830",
         ),
-        ("CREATE TABLE c(x INT REFERENCES np)", "42830"),
+        ("CREATE TABLE c(x INT REFERENCES np)", "42704"),
         (
             "CREATE TABLE c(x INT, FOREIGN KEY (x) REFERENCES np)",
-            "42830",
+            "42704",
         ),
         ("CREATE TABLE c(x INT REFERENCES nosuch(id))", "42P01"),
         (
@@ -10596,7 +10596,7 @@ fn create_with_keys_refuses_and_undoes() {
     let nopk = "CREATE TABLE n(id INT, up INT REFERENCES n)";
     assert_eq!(
         a.q(nopk).err(nopk).code,
-        "42830",
+        "42704",
         "a self-reference with no primary key"
     );
     assert!(!exists(&mut a, "n"));
