@@ -13829,3 +13829,19 @@ fn c54_nested_function_relation_does_not_hide_outer_series_column() {
     assert_eq!(r.oids, Some(vec![23]));
     assert_eq!(r.rows, vec![vec![Some("1".into())], vec![Some("1".into())]]);
 }
+
+
+#[test]
+fn c54_series_signatures_reject_text_and_boolean_arguments() {
+    let dir = Scratch::new("c54-series-signatures");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in ["SELECT * FROM generate_series(1::text,2,1)", "SELECT * FROM generate_series(true,2,1)"] {
+        assert_eq!(a.q(sql).err(sql).code, "42883", "{sql}");
+    }
+    for (sql, oid) in [("SELECT * FROM generate_series(1::smallint,2::bigint,1)", 20), ("SELECT * FROM generate_series(1,2::numeric,1)", 1700)] {
+        let r = a.q(sql).ok(sql);
+        assert_eq!(r.oids, Some(vec![oid]));
+        assert_eq!(r.rows, vec![vec![Some("1".into())], vec![Some("2".into())]]);
+    }
+}
