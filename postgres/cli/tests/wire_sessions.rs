@@ -12282,7 +12282,7 @@ mod recorded {
     #[test]
     fn c56_reset_notices_follow_the_existing_public_objects() {
         let recording = include_str!("c56-pg18-schema-reset-controls.out");
-        replay("c56-reset-controls", recording, recording, &[]);
+        replay(None, "c56-reset-controls", recording, recording, &[]);
     }
 
     /// Replay an unchanged sequence of commands selected from a committed PG recording.
@@ -12296,12 +12296,18 @@ mod recorded {
                 selected.push_str(&format!("   {line}\n"));
             }
         }
-        replay(name, &selected, &selected, &[]);
+        replay(None, name, &selected, &selected, &[]);
     }
 
     /// Replay `recording` on a fresh server and check that the commands answering otherwise than
     /// PostgreSQL are exactly `divergences`, with each registered answer pinned by `ours`.
-    pub(super) fn replay(name: &str, recording: &str, ours: &str, divergences: &[(usize, &str)]) {
+    pub(super) fn replay(
+        test_name: Option<&str>,
+        name: &str,
+        recording: &str,
+        ours: &str,
+        divergences: &[(usize, &str)],
+    ) {
         let cmds = parse(recording);
         let baseline = parse(ours);
         assert!(!cmds.is_empty(), "refused: recording {name} has no command");
@@ -12332,6 +12338,11 @@ mod recorded {
         let mut pending = Vec::new();
         let mut report = String::new();
         let mut differing = Vec::new();
+        // Optional evidence only: verdicts below still come from the existing comparator.
+        // A fresh output file is required, so an interrupted capture cannot be overwritten.
+        // Selected type-only checks reuse recording names but are not corpus replays.
+        let capture_dir = test_name.and_then(|_| std::env::var_os("PG_REPLAY_CAPTURE_DIR"));
+        let mut captured = Vec::new();
         for (i, cmd) in cmds.iter().enumerate() {
             let got = send(&mut w, &mut pending, &cmd.text);
             let n = i + 1;
@@ -12340,14 +12351,48 @@ mod recorded {
             if !agrees {
                 differing.push(n);
             }
-            if let Some(problem) = answer_difference(
+            let problem = answer_difference(
                 n,
                 cmd,
                 &got,
                 registered.map(|(_, why)| (*why, baseline[i].want.as_slice())),
-            ) {
+            );
+            if capture_dir.is_some() {
+                captured.push(serde_json::json!({
+                    "ordinal": n,
+                    "command": cmd.text,
+                    "postgres": cmd.want,
+                    "pinned_ours": baseline[i].want,
+                    "current_ours": got,
+                    "registered": registered.map(|(_, why)| *why),
+                    "agrees_with_postgres": agrees,
+                    "problem": problem,
+                }));
+            }
+            if let Some(problem) = problem {
                 report.push_str(&problem);
             }
+        }
+        if let Some(directory) = capture_dir {
+            let path = std::path::PathBuf::from(directory).join(format!("{name}.json"));
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .expect("create a fresh replay evidence file");
+            serde_json::to_writer(
+                file,
+                &serde_json::json!({
+                    "format": 1,
+                    "test_name": test_name,
+                    "recording": name,
+                    "command_count": cmds.len(),
+                    "postgres_recording": recording,
+                    "pinned_recording": ours,
+                    "rows": captured,
+                }),
+            )
+            .expect("write complete replay evidence");
         }
         for (k, why) in divergences {
             assert!(
@@ -12417,7 +12462,7 @@ macro_rules! replays_postgresql {
     ($test:ident, $file:literal, [$(($n:literal, $why:literal)),* $(,)?]) => {
         #[test]
         fn $test() {
-            recorded::replay($file, include_str!(concat!("pg18/", $file)),
+            recorded::replay(Some(stringify!($test)), $file, include_str!(concat!("pg18/", $file)),
                 include_str!(concat!("ours/", $file)), &[$(($n, $why)),*]);
         }
     };
