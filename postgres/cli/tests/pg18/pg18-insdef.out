@@ -1,0 +1,36 @@
+>> Q DROP TABLE IF EXISTS it
+   N S=NOTICE C=00000 M=table "it" does not exist, skipping
+   C DROP TABLE
+   Z I
+>> Q create table it (col1 int4, col2 int4, col3 text default 'testing')
+   C CREATE TABLE
+   Z I
+>> Q insert into it (col1, col2, col3) values (DEFAULT, DEFAULT)
+   E S=ERROR C=42601 M=INSERT has more target columns than expressions
+   Z I
+>> Q insert into it (col1, col2) values (1, 2, 3)
+   E S=ERROR C=42601 M=INSERT has more expressions than target columns
+   Z I
+>> Q insert into it values (DEFAULT, 5, 'x')
+   C INSERT 0 1
+   Z I
+>> Q insert into it values (DEFAULT, DEFAULT)
+   C INSERT 0 1
+   Z I
+>> Q insert into it (col1, col2, col3) values (DEFAULT, 7, DEFAULT), (8, DEFAULT, DEFAULT)
+   C INSERT 0 2
+   Z I
+>> Q insert into it (col1, col2) values (1, 2), (3)
+   E S=ERROR C=42601 M=VALUES lists must all be the same length
+   Z I
+>> Q select * from it order by col2 nulls first, col1
+   T oids=[23, 23, 25]
+   D ['8', None, 'testing']
+   D [None, None, 'testing']
+   D [None, '5', 'x']
+   D [None, '7', 'testing']
+   C SELECT 4
+   Z I
+>> Q DROP TABLE it
+   C DROP TABLE
+   Z I

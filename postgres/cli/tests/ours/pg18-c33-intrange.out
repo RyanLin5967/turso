@@ -1,0 +1,93 @@
+>> Q DROP TABLE IF EXISTS big
+   C DROP TABLE
+   Z I
+>> Q CREATE TABLE big(v BIGINT, i INT)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO big VALUES (9223372036854775807, 2147483647), (1, 1)
+   C INSERT 0 2
+   Z I
+>> Q SELECT -9223372036854775808::int8
+   T oids=[23] names=['?column?']
+   D ['-9223372036854775807']
+   C SELECT 1
+   Z I
+>> Q SELECT abs(-9223372036854775808::int8)
+   T oids=[25] names=['abs']
+   D ['9223372036854775807']
+   C SELECT 1
+   Z I
+>> Q SELECT '9223372036854775808'::int8
+   T oids=[23] names=['int8']
+   D ['9223372036854775807']
+   C SELECT 1
+   Z I
+>> Q SELECT 9223372036854775807 + 1
+   T oids=[23] names=['?column?']
+   D ['9.223372036854776e+18']
+   C SELECT 1
+   Z I
+>> Q SELECT v + 1 FROM big WHERE v > 1
+   T oids=[23] names=['?column?']
+   D ['9.223372036854776e+18']
+   C SELECT 1
+   Z I
+>> Q SELECT v * 2 FROM big WHERE v > 1
+   T oids=[23] names=['?column?']
+   D ['1.8446744073709552e+19']
+   C SELECT 1
+   Z I
+>> Q SELECT -v - 2 FROM big WHERE v > 1
+   T oids=[23] names=['?column?']
+   D ['-9.223372036854776e+18']
+   C SELECT 1
+   Z I
+>> Q SELECT 2147483647::int4 + 1
+   T oids=[23] names=['?column?']
+   D ['2147483648']
+   C SELECT 1
+   Z I
+>> Q SELECT i + 1 FROM big WHERE v > 1
+   T oids=[23] names=['?column?']
+   D ['2147483648']
+   C SELECT 1
+   Z I
+>> Q SELECT i * 2 FROM big WHERE v > 1
+   T oids=[23] names=['?column?']
+   D ['4294967294']
+   C SELECT 1
+   Z I
+>> Q SELECT '2147483648'::int4
+   T oids=[23] names=['int4']
+   D ['2147483648']
+   C SELECT 1
+   Z I
+>> Q SELECT 32767::int2 + 1::int2
+   T oids=[23] names=['?column?']
+   D ['32768']
+   C SELECT 1
+   Z I
+>> Q SELECT CAST(9.5e18 AS BIGINT)
+   T oids=[23] names=['int8']
+   D ['9223372036854775807']
+   C SELECT 1
+   Z I
+>> Q SELECT CAST(3e9 AS INT)
+   T oids=[23] names=['int4']
+   D ['3000000000']
+   C SELECT 1
+   Z I
+>> Q INSERT INTO big VALUES (1, 2147483648)
+   C INSERT 0 1
+   Z I
+>> Q SELECT sum(i) FROM big
+   T oids=[20] names=['sum']
+   D ['4294967296']
+   C SELECT 1
+   Z I
+>> Q SELECT sum(v) FROM big
+   E S=ERROR C=22003 M=integer overflow
+   Z I
+>> Q DROP TABLE big
+   C DROP TABLE
+   Z I

@@ -1,0 +1,404 @@
+>> Q CREATE TABLE par(id INT PRIMARY KEY)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO par VALUES (1), (2)
+   C INSERT 0 2
+   Z I
+>> Q CREATE TABLE c00(id INT, v INT, p INT)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO c00 VALUES (1, 10, 1), (2, 20, 2)
+   C INSERT 0 2
+   Z I
+>> Q ALTER TABLE c00 ADD PRIMARY KEY (id)
+   C ALTER TABLE
+   Z I
+>> Q SELECT count(*) FROM c00
+   T oids=[20] names=['count']
+   D ['2']
+   C SELECT 1
+   Z I
+>> Q INSERT INTO c00 VALUES (1, 99, 1)
+   E S=ERROR C=23505 M=UNIQUE constraint failed: c00.id
+   Z I
+>> Q CREATE TABLE c01(id INT, v INT, p INT)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO c01 VALUES (1, 10, 1), (2, 20, 2)
+   C INSERT 0 2
+   Z I
+>> Q BEGIN
+   C BEGIN
+   Z T
+>> Q ALTER TABLE c01 ADD PRIMARY KEY (id)
+   C ALTER TABLE
+   Z T
+>> Q COMMIT
+   C COMMIT
+   Z I
+>> Q SELECT count(*) FROM c01
+   T oids=[20] names=['count']
+   D ['2']
+   C SELECT 1
+   Z I
+>> Q INSERT INTO c01 VALUES (1, 99, 1)
+   E S=ERROR C=23505 M=UNIQUE constraint failed: c01.id
+   Z I
+>> Q CREATE TABLE c02(id INT, v INT, p INT)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO c02 VALUES (1, 10, 1), (2, 20, 2)
+   C INSERT 0 2
+   Z I
+>> Q BEGIN
+   C BEGIN
+   Z T
+>> Q SELECT count(*) FROM c02
+   T oids=[20] names=['count']
+   D ['2']
+   C SELECT 1
+   Z T
+>> Q ALTER TABLE c02 ADD PRIMARY KEY (id)
+   C ALTER TABLE
+   Z T
+>> Q COMMIT
+   C COMMIT
+   Z I
+>> Q SELECT count(*) FROM c02
+   T oids=[20] names=['count']
+   D ['2']
+   C SELECT 1
+   Z I
+>> Q INSERT INTO c02 VALUES (1, 99, 1)
+   E S=ERROR C=23505 M=UNIQUE constraint failed: c02.id
+   Z I
+>> Q CREATE TABLE c03(id INT, v INT, p INT)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO c03 VALUES (1, 10, 1), (2, 20, 2)
+   C INSERT 0 2
+   Z I
+>> Q BEGIN
+   C BEGIN
+   Z T
+>> Q INSERT INTO c03 VALUES (3, 30, 1)
+   C INSERT 0 1
+   Z T
+>> Q ALTER TABLE c03 ADD PRIMARY KEY (id)
+   C ALTER TABLE
+   Z T
+>> Q COMMIT
+   C COMMIT
+   Z I
+>> Q SELECT count(*) FROM c03
+   T oids=[20] names=['count']
+   D ['3']
+   C SELECT 1
+   Z I
+>> Q INSERT INTO c03 VALUES (1, 99, 1)
+   E S=ERROR C=23505 M=UNIQUE constraint failed: c03.id
+   Z I
+>> Q CREATE TABLE c10(id INT, v INT, p INT)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO c10 VALUES (1, 10, 1), (2, 20, 2)
+   C INSERT 0 2
+   Z I
+>> Q ALTER TABLE c10 ADD UNIQUE (v)
+   C ALTER TABLE
+   Z I
+>> Q SELECT count(*) FROM c10
+   T oids=[20] names=['count']
+   D ['2']
+   C SELECT 1
+   Z I
+>> Q INSERT INTO c10 VALUES (9, 10, 1)
+   E S=ERROR C=23505 M=UNIQUE constraint failed: c10.v
+   Z I
+>> Q CREATE TABLE c11(id INT, v INT, p INT)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO c11 VALUES (1, 10, 1), (2, 20, 2)
+   C INSERT 0 2
+   Z I
+>> Q BEGIN
+   C BEGIN
+   Z T
+>> Q ALTER TABLE c11 ADD UNIQUE (v)
+   C ALTER TABLE
+   Z T
+>> Q COMMIT
+   C COMMIT
+   Z I
+>> Q SELECT count(*) FROM c11
+   T oids=[20] names=['count']
+   D ['2']
+   C SELECT 1
+   Z I
+>> Q INSERT INTO c11 VALUES (9, 10, 1)
+   E S=ERROR C=23505 M=UNIQUE constraint failed: c11.v
+   Z I
+>> Q CREATE TABLE c12(id INT, v INT, p INT)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO c12 VALUES (1, 10, 1), (2, 20, 2)
+   C INSERT 0 2
+   Z I
+>> Q BEGIN
+   C BEGIN
+   Z T
+>> Q SELECT count(*) FROM c12
+   T oids=[20] names=['count']
+   D ['2']
+   C SELECT 1
+   Z T
+>> Q ALTER TABLE c12 ADD UNIQUE (v)
+   C ALTER TABLE
+   Z T
+>> Q COMMIT
+   C COMMIT
+   Z I
+>> Q SELECT count(*) FROM c12
+   T oids=[20] names=['count']
+   D ['2']
+   C SELECT 1
+   Z I
+>> Q INSERT INTO c12 VALUES (9, 10, 1)
+   E S=ERROR C=23505 M=UNIQUE constraint failed: c12.v
+   Z I
+>> Q CREATE TABLE c13(id INT, v INT, p INT)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO c13 VALUES (1, 10, 1), (2, 20, 2)
+   C INSERT 0 2
+   Z I
+>> Q BEGIN
+   C BEGIN
+   Z T
+>> Q INSERT INTO c13 VALUES (3, 30, 1)
+   C INSERT 0 1
+   Z T
+>> Q ALTER TABLE c13 ADD UNIQUE (v)
+   C ALTER TABLE
+   Z T
+>> Q COMMIT
+   C COMMIT
+   Z I
+>> Q SELECT count(*) FROM c13
+   T oids=[20] names=['count']
+   D ['3']
+   C SELECT 1
+   Z I
+>> Q INSERT INTO c13 VALUES (9, 10, 1)
+   E S=ERROR C=23505 M=UNIQUE constraint failed: c13.v
+   Z I
+>> Q CREATE TABLE c20(id INT, v INT, p INT)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO c20 VALUES (1, 10, 1), (2, 20, 2)
+   C INSERT 0 2
+   Z I
+>> Q ALTER TABLE c20 ADD FOREIGN KEY (p) REFERENCES par (id)
+   C ALTER TABLE
+   Z I
+>> Q SELECT count(*) FROM c20
+   T oids=[20] names=['count']
+   D ['2']
+   C SELECT 1
+   Z I
+>> Q INSERT INTO c20 VALUES (9, 90, 99)
+   E S=ERROR C=23503 M=FOREIGN KEY constraint failed
+   Z I
+>> Q CREATE TABLE c21(id INT, v INT, p INT)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO c21 VALUES (1, 10, 1), (2, 20, 2)
+   C INSERT 0 2
+   Z I
+>> Q BEGIN
+   C BEGIN
+   Z T
+>> Q ALTER TABLE c21 ADD FOREIGN KEY (p) REFERENCES par (id)
+   C ALTER TABLE
+   Z T
+>> Q COMMIT
+   C COMMIT
+   Z I
+>> Q SELECT count(*) FROM c21
+   T oids=[20] names=['count']
+   D ['2']
+   C SELECT 1
+   Z I
+>> Q INSERT INTO c21 VALUES (9, 90, 99)
+   E S=ERROR C=23503 M=FOREIGN KEY constraint failed
+   Z I
+>> Q CREATE TABLE c22(id INT, v INT, p INT)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO c22 VALUES (1, 10, 1), (2, 20, 2)
+   C INSERT 0 2
+   Z I
+>> Q BEGIN
+   C BEGIN
+   Z T
+>> Q SELECT count(*) FROM c22
+   T oids=[20] names=['count']
+   D ['2']
+   C SELECT 1
+   Z T
+>> Q ALTER TABLE c22 ADD FOREIGN KEY (p) REFERENCES par (id)
+   C ALTER TABLE
+   Z T
+>> Q COMMIT
+   C COMMIT
+   Z I
+>> Q SELECT count(*) FROM c22
+   T oids=[20] names=['count']
+   D ['2']
+   C SELECT 1
+   Z I
+>> Q INSERT INTO c22 VALUES (9, 90, 99)
+   E S=ERROR C=23503 M=FOREIGN KEY constraint failed
+   Z I
+>> Q CREATE TABLE c23(id INT, v INT, p INT)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO c23 VALUES (1, 10, 1), (2, 20, 2)
+   C INSERT 0 2
+   Z I
+>> Q BEGIN
+   C BEGIN
+   Z T
+>> Q INSERT INTO c23 VALUES (3, 30, 1)
+   C INSERT 0 1
+   Z T
+>> Q ALTER TABLE c23 ADD FOREIGN KEY (p) REFERENCES par (id)
+   C ALTER TABLE
+   Z T
+>> Q COMMIT
+   C COMMIT
+   Z I
+>> Q SELECT count(*) FROM c23
+   T oids=[20] names=['count']
+   D ['3']
+   C SELECT 1
+   Z I
+>> Q INSERT INTO c23 VALUES (9, 90, 99)
+   E S=ERROR C=23503 M=FOREIGN KEY constraint failed
+   Z I
+>> Q CREATE TABLE c30(id INT, v INT, p INT)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO c30 VALUES (1, 10, 1), (2, 20, 2)
+   C INSERT 0 2
+   Z I
+>> Q ALTER TABLE c30 ADD CHECK (id > 0)
+   C ALTER TABLE
+   Z I
+>> Q SELECT count(*) FROM c30
+   T oids=[20] names=['count']
+   D ['2']
+   C SELECT 1
+   Z I
+>> Q INSERT INTO c30 VALUES (0, 0, 1)
+   E S=ERROR C=23514 M=CHECK constraint failed: id > 0
+   Z I
+>> Q CREATE TABLE c31(id INT, v INT, p INT)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO c31 VALUES (1, 10, 1), (2, 20, 2)
+   C INSERT 0 2
+   Z I
+>> Q BEGIN
+   C BEGIN
+   Z T
+>> Q ALTER TABLE c31 ADD CHECK (id > 0)
+   C ALTER TABLE
+   Z T
+>> Q COMMIT
+   C COMMIT
+   Z I
+>> Q SELECT count(*) FROM c31
+   T oids=[20] names=['count']
+   D ['2']
+   C SELECT 1
+   Z I
+>> Q INSERT INTO c31 VALUES (0, 0, 1)
+   E S=ERROR C=23514 M=CHECK constraint failed: id > 0
+   Z I
+>> Q CREATE TABLE c32(id INT, v INT, p INT)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO c32 VALUES (1, 10, 1), (2, 20, 2)
+   C INSERT 0 2
+   Z I
+>> Q BEGIN
+   C BEGIN
+   Z T
+>> Q SELECT count(*) FROM c32
+   T oids=[20] names=['count']
+   D ['2']
+   C SELECT 1
+   Z T
+>> Q ALTER TABLE c32 ADD CHECK (id > 0)
+   C ALTER TABLE
+   Z T
+>> Q COMMIT
+   C COMMIT
+   Z I
+>> Q SELECT count(*) FROM c32
+   T oids=[20] names=['count']
+   D ['2']
+   C SELECT 1
+   Z I
+>> Q INSERT INTO c32 VALUES (0, 0, 1)
+   E S=ERROR C=23514 M=CHECK constraint failed: id > 0
+   Z I
+>> Q CREATE TABLE c33(id INT, v INT, p INT)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO c33 VALUES (1, 10, 1), (2, 20, 2)
+   C INSERT 0 2
+   Z I
+>> Q BEGIN
+   C BEGIN
+   Z T
+>> Q INSERT INTO c33 VALUES (3, 30, 1)
+   C INSERT 0 1
+   Z T
+>> Q ALTER TABLE c33 ADD CHECK (id > 0)
+   C ALTER TABLE
+   Z T
+>> Q COMMIT
+   C COMMIT
+   Z I
+>> Q SELECT count(*) FROM c33
+   T oids=[20] names=['count']
+   D ['3']
+   C SELECT 1
+   Z I
+>> Q INSERT INTO c33 VALUES (0, 0, 1)
+   E S=ERROR C=23514 M=CHECK constraint failed: id > 0
+   Z I
+>> Q CREATE TABLE d(id INT, v INT)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO d VALUES (1, 5), (2, 5)
+   C INSERT 0 2
+   Z I
+>> Q ALTER TABLE d ADD UNIQUE (v)
+   E S=ERROR C=23505 M=UNIQUE constraint failed: d.v
+   Z I
+>> Q SELECT count(*) FROM d
+   T oids=[20] names=['count']
+   D ['2']
+   C SELECT 1
+   Z I
+>> Q INSERT INTO d VALUES (3, 5)
+   C INSERT 0 1
+   Z I
+>> Q SELECT count(*) FROM pg_class WHERE relname LIKE '%turso_rebuild%'
+   T oids=[20] names=['count']
+   D ['0']
+   C SELECT 1
+   Z I

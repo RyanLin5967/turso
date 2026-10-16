@@ -1,0 +1,79 @@
+>> Q DROP TABLE IF EXISTS j1, j2
+   N S=NOTICE C=00000 M=table "j1" does not exist, skipping
+   N S=NOTICE C=00000 M=table "j2" does not exist, skipping
+   C DROP TABLE
+   Z I
+>> Q CREATE TABLE j1 (i int, j int, t text)
+   C CREATE TABLE
+   Z I
+>> Q CREATE TABLE j2 (i int, k int)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO j1 VALUES (1, 4, 'one'), (2, 3, 'two'), (3, 2, 'three')
+   C INSERT 0 3
+   Z I
+>> Q INSERT INTO j2 VALUES (1, -1), (2, 2), (5, -5)
+   C INSERT 0 3
+   Z I
+>> Q SELECT * FROM j2 RIGHT JOIN j1 USING (i) ORDER BY i
+   T oids=[23, 23, 23, 25] names=['i', 'k', 'j', 't']
+   D ['1', '-1', '4', 'one']
+   D ['2', '2', '3', 'two']
+   D ['3', None, '2', 'three']
+   C SELECT 3
+   Z I
+>> Q SELECT * FROM j1 RIGHT JOIN j2 USING (i) ORDER BY i
+   T oids=[23, 23, 25, 23] names=['i', 'j', 't', 'k']
+   D ['1', '4', 'one', '-1']
+   D ['2', '3', 'two', '2']
+   D ['5', None, None, '-5']
+   C SELECT 3
+   Z I
+>> Q SELECT * FROM j1 FULL JOIN j2 USING (i) ORDER BY i
+   T oids=[23, 23, 25, 23] names=['i', 'j', 't', 'k']
+   D ['1', '4', 'one', '-1']
+   D ['2', '3', 'two', '2']
+   D ['3', '2', 'three', None]
+   D ['5', None, None, '-5']
+   C SELECT 4
+   Z I
+>> Q SELECT i FROM j1 RIGHT JOIN j2 USING (i) ORDER BY i
+   T oids=[23] names=['i']
+   D ['1']
+   D ['2']
+   D ['5']
+   C SELECT 3
+   Z I
+>> Q SELECT i FROM j1 FULL JOIN j2 USING (i) ORDER BY i
+   T oids=[23] names=['i']
+   D ['1']
+   D ['2']
+   D ['3']
+   D ['5']
+   C SELECT 4
+   Z I
+>> Q SELECT * FROM j1 NATURAL RIGHT JOIN j2 ORDER BY i
+   T oids=[23, 23, 25, 23] names=['i', 'j', 't', 'k']
+   D ['1', '4', 'one', '-1']
+   D ['2', '3', 'two', '2']
+   D ['5', None, None, '-5']
+   C SELECT 3
+   Z I
+>> Q SELECT * FROM j1 NATURAL FULL JOIN j2 ORDER BY i
+   T oids=[23, 23, 25, 23] names=['i', 'j', 't', 'k']
+   D ['1', '4', 'one', '-1']
+   D ['2', '3', 'two', '2']
+   D ['3', '2', 'three', None]
+   D ['5', None, None, '-5']
+   C SELECT 4
+   Z I
+>> Q SELECT * FROM j2 LEFT JOIN j1 USING (i) ORDER BY i
+   T oids=[23, 23, 23, 25] names=['i', 'k', 'j', 't']
+   D ['1', '-1', '4', 'one']
+   D ['2', '2', '3', 'two']
+   D ['5', '-5', None, None]
+   C SELECT 3
+   Z I
+>> Q DROP TABLE j1, j2
+   C DROP TABLE
+   Z I

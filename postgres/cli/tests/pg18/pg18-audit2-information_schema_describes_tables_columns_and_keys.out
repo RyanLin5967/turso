@@ -1,0 +1,48 @@
+>> Q CREATE TABLE w(w_id INT PRIMARY KEY, name VARCHAR(10))
+   C CREATE TABLE
+   Z I
+>> Q CREATE TABLE s(s_i_id INT NOT NULL, s_w_id SMALLINT NOT NULL, s_ytd NUMERIC(8, 2), s_data VARCHAR(50), PRIMARY KEY (s_w_id, s_i_id), FOREIGN KEY (s_w_id) REFERENCES w (w_id))
+   C CREATE TABLE
+   Z I
+>> Q SELECT column_name, udt_name, is_nullable, character_maximum_length, numeric_precision, numeric_scale FROM information_schema.columns WHERE table_name = 's' ORDER BY ordinal_position
+   T oids=[19, 19, 1043, 23, 23, 23]
+   D ['s_i_id', 'int4', 'NO', None, '32', '0']
+   D ['s_w_id', 'int2', 'NO', None, '16', '0']
+   D ['s_ytd', 'numeric', 'YES', None, '8', '2']
+   D ['s_data', 'varchar', 'YES', '50', None, None]
+   C SELECT 4
+   Z I
+>> Q SELECT column_name, ordinal_position FROM information_schema.key_column_usage WHERE table_schema = 'public' AND table_name = 's' AND constraint_name = (SELECT constraint_name FROM information_schema.table_constraints WHERE table_schema = 'public' AND table_name = 's' AND constraint_type = 'PRIMARY KEY') ORDER BY ordinal_position DESC
+   T oids=[19, 23]
+   D ['s_i_id', '2']
+   D ['s_w_id', '1']
+   C SELECT 2
+   Z I
+>> Q SELECT table_name FROM information_schema.tables WHERE table_type = 'BASE TABLE' AND table_schema NOT IN ('pg_catalog', 'information_schema') ORDER BY table_name
+   T oids=[19]
+   D ['s']
+   D ['w']
+   C SELECT 2
+   Z I
+>> Q SELECT constraint_type FROM information_schema.table_constraints WHERE table_name = 's' ORDER BY constraint_type
+   T oids=[1043]
+   D ['CHECK']
+   D ['CHECK']
+   D ['FOREIGN KEY']
+   D ['PRIMARY KEY']
+   C SELECT 4
+   Z I
+>> Q CREATE TABLE columns(x INT)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO columns VALUES (7)
+   C INSERT 0 1
+   Z I
+>> Q SELECT x FROM columns
+   T oids=[23]
+   D ['7']
+   C SELECT 1
+   Z I
+exit 0
+postgres (PostgreSQL) 18.6 (Homebrew)
+recorded 2026-10-15T21:00:39Z with pgproto.py scenario-audit2-information_schema_describes_tables_columns_and_keys.txt on the 62816 cluster, database audit2, Homebrew PostgreSQL 18.6 (trust auth, TCP 127.0.0.1)

@@ -7473,8 +7473,11 @@ name = "turso_pg"
 version = "0.8.0-pre.7"
 dependencies = [
  "chrono",
+ "compact_str",
  "parking_lot",
  "rustc-hash 2.1.1",
+ "smallvec",
+ "stacker",
  "tempfile",
  "tracing",
  "turso_core",
@@ -7494,10 +7497,12 @@ dependencies = [
 name = "turso_pg_parser"
 version = "0.8.0-pre.7"
 dependencies = [
+ "compact_str",
  "criterion",
  "miette",
  "pg_query",
  "serde_json",
+ "smallvec",
  "thiserror 2.0.16",
  "turso_parser",
  "turso_stack_guard",
@@ -7518,9 +7523,13 @@ version = "0.8.0-pre.7"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bytes",
+ "compact_str",
  "futures",
+ "getrandom 0.4.2",
  "libc",
  "pgwire",
+ "smallvec",
  "tempfile",
  "tokio",
  "tracing",

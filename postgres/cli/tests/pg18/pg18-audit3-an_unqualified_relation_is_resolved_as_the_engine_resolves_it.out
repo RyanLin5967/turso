@@ -1,0 +1,82 @@
+>> Q DROP SCHEMA IF EXISTS s CASCADE; DROP SCHEMA public CASCADE; CREATE SCHEMA public
+   N S=NOTICE C=00000 M=schema "s" does not exist, skipping
+   C DROP SCHEMA
+   N S=NOTICE C=00000 M=drop cascades to table t
+   C DROP SCHEMA
+   C CREATE SCHEMA
+   Z I
+>> Q CREATE TABLE orders(id INT PRIMARY KEY)
+   C CREATE TABLE
+   Z I
+>> Q CREATE TABLE t(id INT PRIMARY KEY, c INT)
+   C CREATE TABLE
+   Z I
+>> Q CREATE SCHEMA s
+   C CREATE SCHEMA
+   Z I
+>> Q CREATE TABLE s.u(id INT PRIMARY KEY, n INT)
+   C CREATE TABLE
+   Z I
+>> D - UPDATE u SET n = $1
+   E S=ERROR C=42P01 M=relation "u" does not exist
+   Z I
+>> P s1 INSERT INTO t VALUES ($1, 7)
+>> B - s1 ||| 3
+>> E - 0
+>> S
+   ParseComplete
+   BindComplete
+   C INSERT 0 1
+   Z I
+>> Q SET search_path TO "$user", public
+   C SET
+   Z I
+>> D - SELECT 1 FROM orders WHERE id = $1
+   ParseComplete
+   t params=[23]
+   T oids=[23]
+   Z I
+>> B - s1 ||| 25
+>> E - 0
+>> S
+   BindComplete
+   C INSERT 0 1
+   Z I
+>> Q SET search_path TO nosuch, public
+   C SET
+   Z I
+>> D - SELECT 1 FROM orders WHERE id = $1
+   ParseComplete
+   t params=[23]
+   T oids=[23]
+   Z I
+>> B - s1 ||| 24
+>> E - 0
+>> S
+   BindComplete
+   C INSERT 0 1
+   Z I
+>> Q SET search_path TO s, public
+   C SET
+   Z I
+>> D - SELECT 1 FROM orders WHERE id = $1
+   ParseComplete
+   t params=[23]
+   T oids=[23]
+   Z I
+>> B - s1 ||| 19
+>> E - 0
+>> S
+   BindComplete
+   C INSERT 0 1
+   Z I
+>> Q SET search_path TO public
+   C SET
+   Z I
+>> Q SELECT count(*) FROM t WHERE c = 7
+   T oids=[20]
+   D ['4']
+   C SELECT 1
+   Z I
+postgres (PostgreSQL) 18.6 (Homebrew)
+recorded 2026-10-15T21:01:17Z with pgproto.py scenario-audit3-an_unqualified_relation_is_resolved_as_the_engine_resolves_it.txt against PostgreSQL 18.6 at 127.0.0.1:62816, database audit3 (trust auth); exit 0

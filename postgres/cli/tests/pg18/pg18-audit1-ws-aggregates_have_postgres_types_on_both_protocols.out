@@ -1,0 +1,43 @@
+>> Q DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public
+   N S=NOTICE C=00000 M=drop cascades to table t
+   C DROP SCHEMA
+   C CREATE SCHEMA
+   Z I
+>> Q CREATE TABLE t(id INT PRIMARY KEY, v TEXT)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO t VALUES (1, 'trunk')
+   C INSERT 0 1
+   Z I
+>> Q INSERT INTO t VALUES (2, 'x')
+   C INSERT 0 1
+   Z I
+>> Q CREATE TABLE e(id INT PRIMARY KEY)
+   C CREATE TABLE
+   Z I
+>> Q SELECT count(*), sum(id), min(id), max(id), avg(id) FROM t
+   T oids=[20, 20, 23, 23, 1700] names=['count', 'sum', 'min', 'max', 'avg']
+   D ['2', '3', '1', '2', '1.5000000000000000']
+   C SELECT 1
+   Z I
+>> X - SELECT count(*), sum(id), min(id), max(id), avg(id) FROM t
+   ParseComplete
+   BindComplete
+   T oids=[20, 20, 23, 23, 1700] names=['count', 'sum', 'min', 'max', 'avg']
+   D ['2', '3', '1', '2', '1.5000000000000000']
+   C SELECT 1
+   Z I
+>> Q SELECT max(id) FROM e
+   T oids=[23] names=['max']
+   D [None]
+   C SELECT 1
+   Z I
+>> X - SELECT max(id) FROM e
+   ParseComplete
+   BindComplete
+   T oids=[23] names=['max']
+   D [None]
+   C SELECT 1
+   Z I
+-- postgres (PostgreSQL) 18.6 (Homebrew)   (/opt/homebrew/Cellar/postgresql@18/18.6/bin/postgres, pid 8250 serving port 62816; server_version=18.6 (Homebrew). /opt/homebrew/bin/postgres on PATH is 17.11, not used)
+-- recorded 2026-10-15T20:59:32Z against 127.0.0.1:62816 db audit1 by pgproto.py (PGPROTO_NAMES=1)

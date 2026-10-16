@@ -1,0 +1,37 @@
+>> Q DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public
+   N S=NOTICE C=00000 M=drop cascades to 2 other objects
+   C DROP SCHEMA
+   C CREATE SCHEMA
+   Z I
+>> Q CREATE TABLE s(x INT)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO s VALUES (2), (3)
+   C INSERT 0 2
+   Z I
+>> Q SELECT s.x, g FROM s, generate_series(1, s.x) AS g ORDER BY 1, 2
+   T oids=[23, 23] names=['x', 'g']
+   D ['2', '1']
+   D ['2', '2']
+   D ['3', '1']
+   D ['3', '2']
+   D ['3', '3']
+   C SELECT 5
+   Z I
+>> Q SELECT s.x, g.y FROM s, generate_series(1, s.x) AS g(y) WHERE g.y = s.x ORDER BY 1
+   T oids=[23, 23] names=['x', 'y']
+   D ['2', '2']
+   D ['3', '3']
+   C SELECT 2
+   Z I
+>> Q SELECT * FROM generate_series(1, 2) WITH ORDINALITY
+   T oids=[23, 20] names=['generate_series', 'ordinality']
+   D ['1', '1']
+   D ['2', '2']
+   C SELECT 2
+   Z I
+>> Q SELECT * FROM generate_series(1, 2) AS g(a, b)
+   E S=ERROR C=42P10 M=table "g" has 1 columns available but 2 columns specified
+   Z I
+-- postgres (PostgreSQL) 18.6 (Homebrew)   (/opt/homebrew/Cellar/postgresql@18/18.6/bin/postgres, pid 8250 serving port 62816; server_version=18.6 (Homebrew). /opt/homebrew/bin/postgres on PATH is 17.11, not used)
+-- recorded 2026-10-15T20:59:32Z against 127.0.0.1:62816 db audit1 by pgproto.py (PGPROTO_NAMES=1)

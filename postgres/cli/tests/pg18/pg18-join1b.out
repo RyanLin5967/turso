@@ -1,0 +1,9 @@
+>> Q CREATE TABLE IF NOT EXISTS j2x (i int, k int)
+   C CREATE TABLE
+   Z I
+>> Q SELECT * FROM j2x t2 (a, b, c)
+   E S=ERROR C=42P10 M=table "t2" has 2 columns available but 3 columns specified
+   Z I
+>> Q DROP TABLE j2x
+   C DROP TABLE
+   Z I

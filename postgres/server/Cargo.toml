@@ -14,12 +14,20 @@ path = "lib.rs"
 # The wire budget's fire-check plant (lanes/wire/budget/budget.py --plant split-reply): never in a credited
 # build.
 budget-plant-split-reply = []
+# The wire budget's allocation counter (budget.py work): the binaries install counters::CountingAlloc.
+# Never in a credited build: every allocation pays a shared atomic add.
+alloc-count = []
+# The L5 phase table (turso_pg's phase.rs; turso_branch_phases()): a diagnostic build only.
+phase-count = ["turso_pg/phase-count"]
 
 [dependencies]
 anyhow.workspace = true
 async-trait = "0.1"
 futures = { workspace = true }
+getrandom = { workspace = true }
 libc = "0.2.172"
+smallvec = "1.15.1"
+compact_str = "0.8.1"
 pgwire = "0.36"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "signal"] }
 tracing = { workspace = true }
@@ -32,6 +40,11 @@ turso_parser = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# The inline-reply test encodes pgwire's messages into a BytesMut (pgwire's own dependency).
+bytes = "1"
+# The frontend's test failpoints, for this crate's own tests alone (resolver 2 keeps a
+# dev-dependency's features out of every other build).
+turso_pg = { workspace = true, features = ["failpoints"] }
 
 [lints]
 workspace = true

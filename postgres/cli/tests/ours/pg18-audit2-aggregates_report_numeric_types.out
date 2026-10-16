@@ -1,0 +1,14 @@
+>> Q CREATE TABLE t(id INT PRIMARY KEY, v TEXT)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO t VALUES (1, 'trunk')
+   C INSERT 0 1
+   Z I
+>> Q INSERT INTO t VALUES (2, 'x')
+   C INSERT 0 1
+   Z I
+>> Q SELECT count(*), sum(id), min(id), max(id), avg(id) FROM t
+   T oids=[20, 20, 23, 23, 1700] names=['count', 'sum', 'min', 'max', 'avg']
+   D ['2', '3', '1', '2', '1.5']
+   C SELECT 1
+   Z I

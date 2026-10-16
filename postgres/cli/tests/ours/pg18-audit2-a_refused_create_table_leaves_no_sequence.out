@@ -1,0 +1,32 @@
+>> Q CREATE TABLE p(id INT)
+   C CREATE TABLE
+   Z I
+>> Q SELECT count(*) FROM pg_sequences
+   T oids=[20] names=['count']
+   D ['0']
+   C SELECT 1
+   Z I
+>> Q CREATE TABLE tree(id SERIAL PRIMARY KEY, code INT, parent INT REFERENCES tree(code))
+   E S=ERROR C=42830 M=Parse error: there is no unique constraint matching given keys for referenced table "tree"
+   Z I
+>> Q SELECT count(*) FROM pg_sequences
+   T oids=[20] names=['count']
+   D ['0']
+   C SELECT 1
+   Z I
+>> Q CREATE TABLE p(id SERIAL)
+   E S=ERROR C=42601 M=Parse error: table p already exists
+   Z I
+>> Q SELECT count(*) FROM pg_sequences
+   T oids=[20] names=['count']
+   D ['0']
+   C SELECT 1
+   Z I
+>> Q CREATE TABLE tree(id SERIAL PRIMARY KEY, code INT UNIQUE, parent INT REFERENCES tree(code))
+   C CREATE TABLE
+   Z I
+>> Q SELECT count(*) FROM pg_sequences
+   T oids=[20] names=['count']
+   D ['1']
+   C SELECT 1
+   Z I

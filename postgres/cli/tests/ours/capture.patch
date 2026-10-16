@@ -1,0 +1,26 @@
+diff --git a/postgres/cli/tests/wire_sessions.rs b/postgres/cli/tests/wire_sessions.rs
+index 93932a73f..5693046d7 100644
+--- a/postgres/cli/tests/wire_sessions.rs
++++ b/postgres/cli/tests/wire_sessions.rs
+@@ -11942,8 +11942,13 @@ mod recorded {
+         let mut pending = Vec::new();
+         let mut report = String::new();
+         let mut differing = Vec::new();
++        let mut observed = String::new();
+         for (i, cmd) in cmds.iter().enumerate() {
+             let got = send(&mut w, &mut pending, &cmd.text);
++            observed.push_str(&format!(">> {}\n", cmd.text));
++            for line in &got {
++                observed.push_str(&format!("   {line}\n"));
++            }
+             let n = i + 1;
+             let registered = divergences.iter().find(|(k, _)| *k == n);
+             let agrees = same(&cmd.want, &got);
+@@ -11962,6 +11967,7 @@ mod recorded {
+                 _ => {}
+             }
+         }
++        std::fs::write(std::path::Path::new("/private/tmp/codex-20261015/C55-base-ours").join(name), observed).unwrap();
+         for (k, why) in divergences {
+             assert!(
+                 *k >= 1 && *k <= cmds.len(),

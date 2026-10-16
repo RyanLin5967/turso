@@ -34,24 +34,24 @@ impl ExtraFloatDigits {
         if value.is_nan() {
             return "NaN".to_string();
         }
+        // PostgreSQL's float8out / float4out spellings, and a negative zero keeps its sign.
         if value.is_infinite() {
             return if value.is_sign_positive() {
-                "inf".to_string()
+                "Infinity".to_string()
             } else {
-                "-inf".to_string()
+                "-Infinity".to_string()
             };
         }
 
         if value == 0.0 {
-            return "0".to_string();
+            return if value.is_sign_negative() { "-0" } else { "0" }.to_string();
         }
 
-        // For extra_float_digits >= 1, use ryu for shortest-precise format
+        // For extra_float_digits >= 1, the shortest exact digits in PostgreSQL's layout
         // This preserves the original binary float value exactly
         // At most 17 digits for f64
         if extra >= 1 {
-            let mut buffer = ryu::Buffer::new();
-            return buffer.format(value).to_string();
+            return postgres_shortest(&format!("{value:e}"), Self::DBL_DIG as i32);
         }
 
         // For negative values, round to DBL_DIG + extra_float_digits significant digits
@@ -67,30 +67,63 @@ impl ExtraFloatDigits {
         if value.is_nan() {
             return "NaN".to_string();
         }
+        // PostgreSQL's float8out / float4out spellings, and a negative zero keeps its sign.
         if value.is_infinite() {
             return if value.is_sign_positive() {
-                "inf".to_string()
+                "Infinity".to_string()
             } else {
-                "-inf".to_string()
+                "-Infinity".to_string()
             };
         }
 
         if value == 0.0 {
-            return "0".to_string();
+            return if value.is_sign_negative() { "-0" } else { "0" }.to_string();
         }
 
-        // For extra_float_digits >= 1, use ryu for shortest-precise format
+        // For extra_float_digits >= 1, the shortest exact digits in PostgreSQL's layout
         // This preserves the original binary float value exactly
         // At most 9 digits for f32
         if extra >= 1 {
-            let mut buffer = ryu::Buffer::new();
-            return buffer.format(value).to_string();
+            return postgres_shortest(&format!("{value:e}"), Self::FLT_DIG as i32);
         }
 
         // For negative values, round to FLT_DIG + extra_float_digits significant digits
         // FLT_DIG = 6 for f32
         let sig_digits = (Self::FLT_DIG + extra).max(0) as usize;
         format_with_significant_digits(value as f64, sig_digits)
+    }
+}
+
+/// PostgreSQL's shortest-exact float text (float8out / float4out at extra_float_digits >= 1,
+/// float.c's double_to_shortest_decimal_buf): the shortest digits that read back exactly, written
+/// in fixed notation while the decimal exponent is in [-4, `max_exp`) (DBL_DIG 15 for float8,
+/// FLT_DIG 6 for float4), else as `d.ddde+XX` with a sign and at least two exponent digits.
+/// `shortest` is Rust's `{:e}` of the value, which is the shortest exact form (`1.5e-5`). ryu's
+/// text, used before, was `1.0`, `100.0`, `1e16` and `0.00001` where PostgreSQL writes `1`, `100`,
+/// `1e+16` and `1e-05` (turso fastest-wire, PG 18.6 recorded 2026-10-15).
+fn postgres_shortest(shortest: &str, max_exp: i32) -> String {
+    let (mantissa, exp) = match shortest.split_once('e') {
+        Some((m, e)) => (m, e.parse::<i32>().unwrap_or(0)),
+        None => (shortest, 0),
+    };
+    let (sign, mantissa) = match mantissa.strip_prefix('-') {
+        Some(m) => ("-", m),
+        None => ("", mantissa),
+    };
+    if exp < -4 || exp >= max_exp {
+        let e_sign = if exp < 0 { '-' } else { '+' };
+        return format!("{sign}{mantissa}e{e_sign}{:02}", exp.abs());
+    }
+    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+    if exp >= 0 {
+        let point = exp as usize + 1;
+        if digits.len() <= point {
+            format!("{sign}{digits}{}", "0".repeat(point - digits.len()))
+        } else {
+            format!("{sign}{}.{}", &digits[..point], &digits[point..])
+        }
+    } else {
+        format!("{sign}0.{}{digits}", "0".repeat((-exp - 1) as usize))
     }
 }
 
@@ -179,8 +212,10 @@ mod tests {
         }
 
         assert_eq!(ExtraFloatDigits(0).format_f64(f64::NAN), "NaN");
-        assert_eq!(ExtraFloatDigits(0).format_f64(f64::INFINITY), "inf");
-        assert_eq!(ExtraFloatDigits(0).format_f64(-f64::INFINITY), "-inf");
+        // FLAGGED TEST EDIT (fastest-wire, lead ruling 2026-10-15T07:40:59Z; VENDORED.md item 6):
+        // upstream asserted "inf" / "-inf"; PostgreSQL 18.6 writes "Infinity" / "-Infinity".
+        assert_eq!(ExtraFloatDigits(0).format_f64(f64::INFINITY), "Infinity");
+        assert_eq!(ExtraFloatDigits(0).format_f64(-f64::INFINITY), "-Infinity");
 
         let v = std::f32::consts::PI; //3.1415926535897931
 

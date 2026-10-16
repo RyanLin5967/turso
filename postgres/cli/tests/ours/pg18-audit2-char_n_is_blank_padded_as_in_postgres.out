@@ -1,0 +1,28 @@
+>> Q CREATE TABLE ch(id INT PRIMARY KEY, c CHAR(6), one CHAR, v VARCHAR(6))
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO ch VALUES (1, 'ab', 'x', 'ab'), (2, 'abc   ', NULL, 'ab  ')
+   C INSERT 0 2
+   Z I
+>> Q SELECT c, one, v FROM ch ORDER BY id
+   T oids=[1042, 1042, 1043] names=['c', 'one', 'v']
+   D ['ab    ', 'x', 'ab']
+   D ['abc   ', None, 'ab  ']
+   C SELECT 2
+   Z I
+>> Q SELECT id FROM ch WHERE c = 'ab'
+   T oids=[23] names=['id']
+   D ['1']
+   C SELECT 1
+   Z I
+>> Q SELECT length(c) FROM ch WHERE id = 2
+   T oids=[25] names=['length']
+   D ['3']
+   C SELECT 1
+   Z I
+>> Q INSERT INTO ch VALUES (3, 'abcdefg', NULL, NULL)
+   E S=ERROR C=XX000 M=value too long for type character
+   Z I
+>> Q INSERT INTO ch VALUES (4, 'abcdef    ', NULL, NULL)
+   C INSERT 0 1
+   Z I

@@ -578,6 +578,19 @@ pub fn translate_expr(
                             }
                         }
 
+                        // A domain over a numeric base with no ENCODE converts as that base
+                        // before its CHECKs read it: left text, CAST('0.5' AS d) passed a CHECK
+                        // (value > 1), text sorting above every number (fresh-context review of
+                        // the ultrareview fixes).
+                        if let Some(base) =
+                            super::arrays::numeric_base_without_encode(resolver, &tn.name)
+                        {
+                            program.emit_insn(Insn::Cast {
+                                reg: target_register,
+                                affinity: Affinity::affinity(base),
+                            });
+                        }
+
                         // Validate domain constraints on the encoded value
                         emit_domain_cast_constraints(
                             program,

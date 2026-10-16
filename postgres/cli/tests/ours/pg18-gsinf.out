@@ -1,0 +1,17 @@
+>> Q select * from generate_series(0::numeric, 'inf'::numeric, 10::numeric)
+   E S=ERROR C=22023 M=Extension error: stop value cannot be infinity
+   Z I
+>> Q select * from generate_series(0, 'inf'::float8, 10)
+   E S=ERROR C=22023 M=Extension error: stop value cannot be infinity
+   Z I
+>> Q select * from generate_series(1, 3, 'inf'::numeric)
+   E S=ERROR C=22023 M=Extension error: step size cannot be infinity
+   Z I
+>> Q select * from generate_series('-inf'::numeric, 0, 10)
+   E S=ERROR C=22023 M=Extension error: start value cannot be infinity
+   Z I
+>> Q select count(*) from generate_series(1, 5)
+   T oids=[20] names=['count']
+   D ['5']
+   C SELECT 1
+   Z I

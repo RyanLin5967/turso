@@ -170,6 +170,28 @@ expect {
     4200
 }
 
+# A built-in type with no ENCODE converts as its base type's affinity, as the same CAST does with
+# custom types off (SQLite's name rules). The CAST was left a no-op, so CAST('1.5' AS float8)
+# returned the text unconverted (ultrareview of fastest-wire, finding 7).
+@requires strict "uses STRICT tables"
+test cast-to-builtin-type-without-encode-converts-by-its-base {
+    SELECT CAST('1.5' AS float8), typeof(CAST('1.5' AS float8)), typeof(CAST(1 AS float4)), typeof(CAST('7' AS bigint));
+}
+expect {
+    1.5|real|real|integer
+}
+
+# A domain over float8 converts before its CHECK reads the value: left text, '0.5' passed
+# CHECK (value > 1), text sorting above every number (fresh-context review of the ultrareview
+# fixes).
+@requires strict "uses STRICT tables"
+test cast-to-a-domain-over-float8-converts-before-its-check {
+    CREATE DOMAIN over_one AS float8 CHECK (value > 1);
+    SELECT CAST('0.5' AS over_one);
+}
+expect error {
+}
+
 @requires strict "uses STRICT tables"
 test cast-to-varchar {
     SELECT CAST('hello' AS varchar(3));
@@ -308,6 +330,8 @@ expect {
     bytea(value blob)|blob||||'<'
     cidr(value text)|text|value|value||
     date(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN date (value) IS NULL THEN RAISE (ABORT, 'invalid date value') ELSE date (value) END|value||'<'
+    float4(value real)|real||||
+    float8(value real)|real||||
     inet(value text)|text|validate_ipaddr (value)|value||
     json(value text)|text|json (value)|value||
     jsonb(value text)|blob|jsonb (value)|json (value)||
@@ -342,6 +366,8 @@ expect {
     bytea(value blob)|blob||||'<'
     cidr(value text)|text|value|value||
     date(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN date (value) IS NULL THEN RAISE (ABORT, 'invalid date value') ELSE date (value) END|value||'<'
+    float4(value real)|real||||
+    float8(value real)|real||||
     inet(value text)|text|validate_ipaddr (value)|value||
     json(value text)|text|json (value)|value||
     jsonb(value text)|blob|jsonb (value)|json (value)||

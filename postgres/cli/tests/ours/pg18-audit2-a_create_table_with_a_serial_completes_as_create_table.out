@@ -1,0 +1,9 @@
+>> Q CREATE TABLE s1(id SERIAL, v INT)
+   C CREATE TABLE
+   Z I
+>> X - CREATE TABLE s2(id SERIAL, v INT)
+   ParseComplete
+   BindComplete
+   NoData
+   C CREATE TABLE
+   Z I

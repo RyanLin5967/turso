@@ -1,0 +1,25 @@
+>> Q CREATE TABLE pgbench_accounts(aid INT NOT NULL, bid INT, abalance INT, filler CHAR(84))
+   C CREATE TABLE
+   Z I
+>> Q select o.n, p.partstrat, pg_catalog.count(i.inhparent) from pg_catalog.pg_class as c join pg_catalog.pg_namespace as n on (n.oid = c.relnamespace) cross join lateral (select pg_catalog.array_position(pg_catalog.current_schemas(true), n.nspname)) as o(n) left join pg_catalog.pg_partitioned_table as p on (p.partrelid = c.oid) left join pg_catalog.pg_inherits as i on (c.oid = i.inhparent) where c.relname = 'pgbench_accounts' and o.n is not null group by 1, 2 order by 1 asc limit 1
+   T oids=[25, 25, 20] names=['n', 'partstrat', 'count']
+   D ['2', None, '0']
+   C SELECT 1
+   Z I
+>> Q SELECT current_schemas(false)
+   T oids=[25] names=['current_schemas']
+   D ['{public}']
+   C SELECT 1
+   Z I
+>> Q CREATE TABLE lt(x INT)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO lt VALUES (1), (2)
+   C INSERT 0 2
+   Z I
+>> Q SELECT t.x, o.d, o.s FROM lt AS t CROSS JOIN LATERAL (SELECT t.x * 2, t.x + 10) AS o(d, s) ORDER BY t.x
+   T oids=[23, 23, 23] names=['x', 'd', 's']
+   D ['1', '2', '11']
+   D ['2', '4', '12']
+   C SELECT 2
+   Z I

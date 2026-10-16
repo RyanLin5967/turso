@@ -1,0 +1,27 @@
+>> Q DROP TABLE IF EXISTS ich, ipa
+   N S=NOTICE C=00000 M=table "ich" does not exist, skipping
+   N S=NOTICE C=00000 M=table "ipa" does not exist, skipping
+   C DROP TABLE
+   Z I
+>> Q CREATE TABLE ipa (a int)
+   C CREATE TABLE
+   Z I
+>> Q CREATE TABLE ich (b text) INHERITS (ipa)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO ich VALUES (1, 'x')
+   C INSERT 0 1
+   Z I
+>> Q SELECT * FROM ich
+   T oids=[23, 25] names=['a', 'b']
+   D ['1', 'x']
+   C SELECT 1
+   Z I
+>> Q SELECT * FROM ipa
+   T oids=[23] names=['a']
+   D ['1']
+   C SELECT 1
+   Z I
+>> Q DROP TABLE ich, ipa
+   C DROP TABLE
+   Z I

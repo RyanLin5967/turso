@@ -1,0 +1,41 @@
+>> Q DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public
+   C DROP SCHEMA
+   E S=ERROR C=42601 M=Parse error: schema "public" already exists
+   Z I
+>> X 17 SELECT $1 ||| \x0é0
+   ParseComplete
+   BindComplete
+   T oids=[17] names=['?column?']
+   E S=ERROR C=22023 M=invalid hexadecimal digit: "é"
+   Z I
+>> X 17 SELECT $1 ||| \xé
+   ParseComplete
+   BindComplete
+   T oids=[17] names=['?column?']
+   E S=ERROR C=22023 M=invalid hexadecimal digit: "é"
+   Z I
+>> X 17 SELECT $1 ||| \x0😀0
+   ParseComplete
+   BindComplete
+   T oids=[17] names=['?column?']
+   E S=ERROR C=22023 M=invalid hexadecimal digit: "😀"
+   Z I
+>> X 17 SELECT $1 ||| \xGG
+   ParseComplete
+   BindComplete
+   T oids=[17] names=['?column?']
+   E S=ERROR C=22023 M=invalid hexadecimal digit: "G"
+   Z I
+>> X 17 SELECT $1 ||| \x0
+   ParseComplete
+   BindComplete
+   T oids=[17] names=['?column?']
+   E S=ERROR C=22023 M=invalid hexadecimal data: odd number of digits
+   Z I
+>> X 17 SELECT $1 ||| \x00Ff
+   ParseComplete
+   BindComplete
+   T oids=[17] names=['?column?']
+   D ['\\x00ff']
+   C SELECT 1
+   Z I

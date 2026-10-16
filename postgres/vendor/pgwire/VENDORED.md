@@ -45,3 +45,45 @@ Every change from the crate is listed here, newest last; `diff -r` against the c
 3. `read_cstring` decodes strictly: invalid UTF-8 is 22021 "invalid byte sequence for encoding
    \"UTF8\": 0x.." (it was read lossily), in one scan for the terminator. `MalformedMessage` and
    `PgWireFrontendMessage::Malformed` carry the SQLSTATE and the message (wire review 12 item 8).
+4. `api/auth/noop.rs`: `NoopStartupHandler` gains `server_parameters`, the provider of the
+   ParameterStatus values startup announces, `DefaultServerParameterProvider::default()` unless
+   the handler overrides it; `on_startup` used that default unconditionally, so the server could
+   not announce the settings SHOW answers (`ISO, YMD` against `ISO, MDY`, `Etc/UTC` against `UTC`,
+   `public` against `"$user", public`; wire review 18 item 19).
+5. `types/format/float_digits.rs`: at extra_float_digits >= 1 (the default, 1) a float's text is
+   PostgreSQL's float8out / float4out layout (`postgres_shortest`): the shortest exact digits (Rust's
+   `{:e}`), fixed notation while the decimal exponent is in [-4, 15) (float8) or [-4, 6) (float4),
+   else `d.ddde+XX`. ryu's text was `1.0`, `100.0`, `1e16`, `0.00001` (PostgreSQL 18.6 recorded,
+   artie lanes/wire/raw/loud-20261015/pg18-diff/pg18-float.out). The infinities are item 6. This crate's tests do not build alone here
+   (rustc 1.88 is below its MSRV); test_format's
+   PI rows were checked by reading: `{:e}` of PI is `3.141592653589793e0`, written `3.141592653589793`.
+6. `types/format/float_digits.rs`: the infinities are written `Infinity` / `-Infinity` and a
+   negative zero `-0`, as PostgreSQL 18.6's float8out / float4out write them (recorded, artie
+   lanes/wire/raw/loud-20261015/pg18-diff/pg18-inf.out); upstream wrote `inf`, `-inf` and `0`.
+   FLAGGED TEST EDIT, ruled by the lead (2026-10-15T07:40:59Z): test_format's two infinity rows
+   now assert `Infinity` / `-Infinity`. The crate's tests do not build alone here (MSRV), so the
+   wire test infinities_and_negative_zero_are_written_without_nan is the check that runs.
+7. `api/auth/noop.rs`: `NoopStartupHandler::backend_key`, set on the client before
+   `finish_authentication0` sends BackendKeyData. Upstream never set a key, so every session sent
+   process id 0 and secret 0, and a CancelRequest could not name one session (the wire server's
+   cancel handler, 2026-10-15).
+8. `messages/mod.rs`, `api/results.rs`, `api/query.rs`: `PgWireBackendMessage::Inline` and
+   `Response::Inline`, backend messages the server encoded itself into a fixed 256-byte buffer and
+   written as they are, so a branch call's simple-Query reply (RowDescription, DataRow,
+   CommandComplete) costs no heap allocation (L5). pgwire's own simple-query loop feeds one as it
+   is; its extended loop refuses one (a pre-encoded reply holds a RowDescription, which Execute
+   never sends). The server checks the bytes equal pgwire's encoding of the same reply
+   (inline_replies_are_the_messages_pgwire_encodes).
+9. `tokio/server.rs`: `MaybeTls::Blocking(BlockingTcp)`, a std socket in blocking mode whose
+   AsyncRead/AsyncWrite polls always complete (the read or write blocks in the system call; a read
+   deadline, re-armed as SO_RCVTIMEO before every read so a trickling client cannot stretch it, reads
+   as the stream's end with `timed_out` set), and `negotiate_blocking`,
+   `negotiate_tls(.., None)` on such a socket. `peek_for_sslrequest` takes any IO and is told
+   whether the first byte began a direct TLS handshake. The server runs each session on one with
+   no runtime, so the session thread makes no kevent (L5 step 3(a), lead 2026-10-15).
+10. `tokio/server.rs` (C37 H1): `BlockingTcp`'s startup deadline bounds writes as well as reads
+    (SO_SNDTIMEO re-armed per write; a write that reaches it fails TimedOut and sets `timed_out`), and
+    `peek_for_sslrequest` refuses a second SSLRequest or GSSENCRequest on one connection with
+    FATAL 0A000 "unsupported frontend protocol 1234.5679 (or 1234.5680): server supports 3.0 to 3.2",
+    as PostgreSQL 18.6 does (recorded for SSL: artie pg18-diff/pg18-ssl2.out), and the connection
+    ends. It answered every repeat with 'N'.

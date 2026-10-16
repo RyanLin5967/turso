@@ -19,12 +19,13 @@ const FLOAT4: u32 = 700;
 const FLOAT8: u32 = 701;
 const NUMERIC: u32 = 1700;
 
-/// For each result column of a plain SELECT (one statement, no set operation, no `*` target), the
-/// PostgreSQL type OID of an aggregate over a table column: count is bigint; sum of smallint or
-/// integer is bigint, of bigint or numeric numeric, of a float its own type; avg of an integer or
-/// numeric is numeric, of a float double precision; min and max are their argument's type. `None`
-/// for every other column, which the engine types. Empty when the statement is not such a SELECT.
-pub fn aggregate_types(parse: &ParseResult, schema: &Schema) -> Vec<Option<u32>> {
+/// Which result columns of a plain SELECT (one statement, no set operation, no `*` target) are
+/// aggregates, count, sum, avg, min or max over no window, whose PostgreSQL type the parameter
+/// walk gives ([`aggregate_types`]): count is bigint; sum of smallint or integer is bigint, of
+/// bigint or numeric numeric, of a float its own type; avg of an integer or numeric is numeric, of
+/// a float double precision; min and max are their argument's type. Empty when the statement is
+/// not such a SELECT; every other column is the engine's to type.
+pub fn aggregate_targets(parse: &ParseResult) -> Vec<bool> {
     let [raw] = parse.protobuf.stmts.as_slice() else {
         return Vec::new();
     };
@@ -34,7 +35,7 @@ pub fn aggregate_types(parse: &ParseResult, schema: &Schema) -> Vec<Option<u32>>
     if select.larg.is_some() || select.rarg.is_some() {
         return Vec::new();
     }
-    let mut targets = Vec::with_capacity(select.target_list.len());
+    let mut aggregates = Vec::with_capacity(select.target_list.len());
     for target in &select.target_list {
         let Some(Node::ResTarget(t)) = target.node.as_ref() else {
             return Vec::new();
@@ -49,121 +50,464 @@ pub fn aggregate_types(parse: &ParseResult, schema: &Schema) -> Vec<Option<u32>>
                 return Vec::new();
             }
         }
-        targets.push(val);
+        let aggregate = match val {
+            Some(Node::FuncCall(call)) => {
+                call.over.is_none()
+                    && func_name(call).is_some_and(|n| {
+                        matches!(n.as_str(), "count" | "sum" | "avg" | "min" | "max")
+                    })
+            }
+            _ => false,
+        };
+        aggregates.push(aggregate);
     }
-    if !targets.iter().any(|v| matches!(v, Some(Node::FuncCall(_)))) {
-        return vec![None; targets.len()];
+    aggregates
+}
+
+/// The result columns of a plain SELECT (as [`aggregate_targets`] lines them up) whose type
+/// PostgreSQL's grammar fixes whatever the operands are: bool for a boolean literal, a comparison
+/// (=, <>, !=, <, >, <=, >=), AND / OR / NOT, IS [NOT] NULL, IS [NOT] TRUE / FALSE / UNKNOWN, IN,
+/// BETWEEN, LIKE, ILIKE, SIMILAR TO, IS [NOT] DISTINCT FROM, ANY / ALL, EXISTS, a cast to bool, and a
+/// CASE whose every result is one of these; float4 for a cast to float4 or real. None for every
+/// other column (the engine's to type) and the empty list when the statement is no such SELECT.
+/// The engine has no boolean type, so it typed them int4 or text holding 1 and 0, and a float4
+/// cast float8; PostgreSQL 18 announces bool and float4 (recorded 2026-10-15, artie
+/// lanes/wire/raw/loud-20261015/pg18-diff/pg18-types.out).
+/// `tables` gives a table's column names, by (schema as written, name), when a `*` over it must be
+/// expanded to line the list up (read from the in-memory schema: no catalog query).
+pub fn expression_types(parse: &ParseResult, tables: &TableColumns) -> Vec<Option<u32>> {
+    let [raw] = parse.protobuf.stmts.as_slice() else {
+        return Vec::new();
+    };
+    let Some(Node::SelectStmt(select)) = raw.stmt.as_ref().and_then(|s| s.node.as_ref()) else {
+        return Vec::new();
+    };
+    if select.larg.is_some() || select.rarg.is_some() || select.target_list.is_empty() {
+        return Vec::new();
     }
-    let tables = from_tables(select);
-    targets
-        .into_iter()
-        .map(|val| match val {
-            Some(Node::FuncCall(call)) => aggregate_type(call, &tables, schema),
+    let unexpanded = |columns: &[(String, Option<u32>)]| {
+        columns.iter().any(|(name, ty)| name == "*" && ty.is_none())
+    };
+    // First without reading any table: a statement with no typed column says nothing, and only one
+    // with a `*` over a table beside a typed column reads that table's width.
+    let mut columns = select_fixed(select, &[], &|_, _| None);
+    if unexpanded(&columns) {
+        // A typed column may sit inside the `*`, or beside it: only a FROM list holding some
+        // derived item or CTE (whose columns the walk types) is worth expanding.
+        let derived =
+            select.with_clause.is_some() || select.from_clause.iter().any(holds_derived);
+        if !derived && columns.iter().all(|(_, ty)| ty.is_none()) {
+            return Vec::new();
+        }
+        columns = select_fixed(select, &[], tables);
+    } else if columns.iter().all(|(_, ty)| ty.is_none()) {
+        return Vec::new();
+    }
+    // A `*` left unexpanded: the list does not line up with the result columns.
+    if unexpanded(&columns) {
+        return Vec::new();
+    }
+    columns.into_iter().map(|(_, ty)| ty).collect()
+}
+
+/// A table's column names by (schema as written, name), or None when they cannot be read.
+pub type TableColumns<'a> = dyn Fn(&str, &str) -> Option<Vec<String>> + 'a;
+
+/// One derived FROM item's output columns as [`select_fixed`] names and types them, a `*` it could
+/// not expand kept as an entry named "*" (a name lookup skips it; a `*` over the item does not
+/// expand); `None` columns for a table, whose columns are the engine's to type.
+struct Derived {
+    alias: String,
+    columns: Option<Vec<(String, Option<u32>)>>,
+    /// A table item's (schema, name), whose columns are read only when a `*` expands over it.
+    table: Option<(String, String)>,
+}
+
+/// A SELECT's result columns, each named as PostgreSQL names it and typed when its grammar fixes the
+/// type ([`expression_type`]), reading a column of a derived table or a CTE as that item's own
+/// column (a boolean `true AS linked` read through a join stayed boolean in PostgreSQL and was
+/// announced bytea here: the regress corpus's join.sql). A `*` expands over the FROM items when
+/// every one is a derived table or a CTE; otherwise it stays one untyped entry, so the list does not
+/// line up with the result and is not used. `outer` holds the enclosing statements' CTEs.
+fn select_fixed(
+    select: &SelectStmt,
+    outer: &[(String, Vec<(String, Option<u32>)>)],
+    tables: &TableColumns,
+) -> Vec<(String, Option<u32>)> {
+    let mut ctes: Vec<(String, Vec<(String, Option<u32>)>)> = outer.to_vec();
+    if let Some(with) = &select.with_clause {
+        for cte in &with.ctes {
+            if let Some(Node::CommonTableExpr(c)) = cte.node.as_ref() {
+                if let Some(Node::SelectStmt(q)) = c.ctequery.as_ref().and_then(|q| q.node.as_ref()) {
+                    let mut columns = select_fixed(q, &ctes, tables);
+                    for (column, name) in columns.iter_mut().zip(&c.aliascolnames) {
+                        if let Some(Node::String(n)) = name.node.as_ref() {
+                            column.0.clone_from(&n.sval);
+                        }
+                    }
+                    ctes.push((c.ctename.clone(), columns));
+                }
+            }
+        }
+    }
+    let mut derived = Vec::new();
+    for item in &select.from_clause {
+        from_derived(item, &ctes, tables, &mut derived);
+    }
+    let lookup = |c: &turso_pg_parser::pg_query::protobuf::ColumnRef| -> Option<u32> {
+        let fields: Vec<&str> = c
+            .fields
+            .iter()
+            .map(|f| match f.node.as_ref() {
+                Some(Node::String(s)) => Some(s.sval.as_str()),
+                _ => None,
+            })
+            .collect::<Option<_>>()?;
+        let (rel, column) = match fields.as_slice() {
+            [column] => (None, *column),
+            [rel, column] => (Some(*rel), *column),
+            _ => return None,
+        };
+        let mut found = derived.iter().filter(|d| rel.is_none_or(|r| d.alias == r)).filter_map(|d| {
+            d.columns.as_ref()?.iter().find(|(n, _)| n == column).map(|(_, t)| *t)
+        });
+        let first = found.next()?;
+        // A bare name two derived items share is ambiguous: left untyped.
+        if rel.is_none() && found.next().is_some() {
+            return None;
+        }
+        first
+    };
+    let mut out = Vec::new();
+    for target in &select.target_list {
+        let Some(Node::ResTarget(t)) = target.node.as_ref() else {
+            out.push(("?column?".to_string(), None));
+            continue;
+        };
+        let Some(val) = t.val.as_deref() else {
+            out.push(("?column?".to_string(), None));
+            continue;
+        };
+        if let Some(Node::ColumnRef(c)) = val.node.as_ref() {
+            let star = matches!(c.fields.last().and_then(|f| f.node.as_ref()), Some(Node::AStar(_)));
+            if star {
+                let rel = match c.fields.as_slice() {
+                    [only] if matches!(only.node, Some(Node::AStar(_))) => None,
+                    [r, _] => match r.node.as_ref() {
+                        Some(Node::String(s)) => Some(s.sval.as_str()),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let items: Vec<&Derived> = derived.iter().filter(|d| rel.is_none_or(|r| d.alias == r)).collect();
+                // Only a FROM list of derived items alone (no join's USING merge) expands.
+                let plain = rel.is_some() || select.from_clause.iter().all(|i| !matches!(i.node, Some(Node::JoinExpr(_))));
+                // An item holding a `*` of its own (a table's) cannot be listed.
+                let listed = |d: &&Derived| match &d.columns {
+                    Some(c) => Some(c.clone()).filter(|c| !c.iter().any(|(n, _)| n == "*")),
+                    // A table's columns are the engine's to type; only their number is read.
+                    None => d.table.as_ref().and_then(|(schema, name)| tables(schema, name)).map(
+                        |names| names.into_iter().map(|n| (n, None)).collect(),
+                    ),
+                };
+                match items.iter().map(listed).collect::<Option<Vec<_>>>() {
+                    Some(lists) if plain && !items.is_empty() => out.extend(lists.into_iter().flatten()),
+                    _ => out.push(("*".to_string(), None)),
+                }
+                continue;
+            }
+            let name = if t.name.is_empty() { target_name(val) } else { t.name.clone() };
+            out.push((name, lookup(c)));
+            continue;
+        }
+        let name = if t.name.is_empty() { target_name(val) } else { t.name.clone() };
+        out.push((name, expression_type(val)));
+    }
+    out
+}
+
+/// Whether a FROM item is, or joins, a subselect (a CTE is the WITH's, checked beside this).
+fn holds_derived(item: &PgNode) -> bool {
+    match item.node.as_ref() {
+        Some(Node::RangeSubselect(_)) => true,
+        Some(Node::JoinExpr(j)) => {
+            j.larg.as_deref().is_some_and(holds_derived) || j.rarg.as_deref().is_some_and(holds_derived)
+        }
+        _ => false,
+    }
+}
+
+/// The derived items `item` brings into scope: a subselect, a CTE read by name, and a join's sides.
+fn from_derived(
+    item: &PgNode,
+    ctes: &[(String, Vec<(String, Option<u32>)>)],
+    tables: &TableColumns,
+    out: &mut Vec<Derived>,
+) {
+    let rename = |columns: &mut Vec<(String, Option<u32>)>, names: &[PgNode]| {
+        for (column, name) in columns.iter_mut().zip(names) {
+            if let Some(Node::String(n)) = name.node.as_ref() {
+                column.0.clone_from(&n.sval);
+            }
+        }
+    };
+    match item.node.as_ref() {
+        Some(Node::RangeSubselect(r)) => {
+            let Some(alias) = r.alias.as_ref() else { return };
+            let columns = match r.subquery.as_ref().and_then(|q| q.node.as_ref()) {
+                Some(Node::SelectStmt(q)) if !r.lateral => {
+                    let mut columns = select_fixed(q, ctes, tables);
+                    rename(&mut columns, &alias.colnames);
+                    Some(columns)
+                }
+                _ => None,
+            };
+            out.push(Derived {
+                alias: alias.aliasname.clone(),
+                columns,
+                table: None,
+            });
+        }
+        Some(Node::RangeVar(rv)) => {
+            let alias = rv.alias.as_ref().map_or(rv.relname.clone(), |a| a.aliasname.clone());
+            let columns = (rv.schemaname.is_empty())
+                .then(|| ctes.iter().rev().find(|(n, _)| *n == rv.relname))
+                .flatten()
+                .map(|(_, columns)| {
+                    let mut columns = columns.clone();
+                    if let Some(a) = &rv.alias {
+                        rename(&mut columns, &a.colnames);
+                    }
+                    columns
+                });
+            let table = columns
+                .is_none()
+                .then(|| (rv.schemaname.clone(), rv.relname.clone()));
+            out.push(Derived {
+                alias,
+                columns,
+                table,
+            });
+        }
+        Some(Node::JoinExpr(j)) => {
+            if let Some(l) = j.larg.as_deref() {
+                from_derived(l, ctes, tables, out);
+            }
+            if let Some(r) = j.rarg.as_deref() {
+                from_derived(r, ctes, tables, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The result columns of a plain SELECT (as [`expression_types`] lines them up) that are a bare
+/// `$n`: n for each, None for every other column (see [`StatementTypes::param_targets`]).
+pub fn param_targets(parse: &ParseResult) -> Vec<Option<u32>> {
+    if aggregate_targets(parse).is_empty() {
+        return Vec::new();
+    }
+    let [raw] = parse.protobuf.stmts.as_slice() else {
+        return Vec::new();
+    };
+    let Some(Node::SelectStmt(select)) = raw.stmt.as_ref().and_then(|s| s.node.as_ref()) else {
+        return Vec::new();
+    };
+    select
+        .target_list
+        .iter()
+        .map(|target| match target.node.as_ref() {
+            Some(Node::ResTarget(t)) => match t.val.as_deref().and_then(|v| v.node.as_ref()) {
+                Some(Node::ParamRef(p)) => u32::try_from(p.number).ok(),
+                _ => None,
+            },
             _ => None,
         })
         .collect()
 }
 
-fn aggregate_type(
-    call: &turso_pg_parser::pg_query::protobuf::FuncCall,
-    tables: &[(String, String)],
-    schema: &Schema,
-) -> Option<u32> {
-    if call.over.is_some() {
-        return None;
+/// Whether `text` (a literal pg_query gives as a float's text) is an integer literal, decimal or
+/// 0x / 0o / 0b with underscores, whose value fits int8.
+fn integer_literal_fits_i64(text: &str) -> bool {
+    let (negative, digits) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text),
+    };
+    let lower = digits.to_ascii_lowercase();
+    let (radix, body) = if let Some(b) = lower.strip_prefix("0x") {
+        (16, b)
+    } else if let Some(b) = lower.strip_prefix("0o") {
+        (8, b)
+    } else if let Some(b) = lower.strip_prefix("0b") {
+        (2, b)
+    } else {
+        (10, lower.as_str())
+    };
+    let clean: String = body.chars().filter(|c| *c != '_').collect();
+    if clean.is_empty() || !clean.chars().all(|c| c.is_digit(radix)) {
+        return false;
     }
-    let name = match call.funcname.as_slice() {
-        [name] | [_, name] => match name.node.as_ref()? {
-            Node::String(s) => s.sval.as_str(),
-            _ => return None,
+    match u128::from_str_radix(&clean, radix) {
+        Ok(v) if negative => v <= i64::MAX as u128 + 1,
+        Ok(v) => v <= i64::MAX as u128,
+        Err(_) => false,
+    }
+}
+
+/// [`expression_types`] for one expression.
+fn expression_type(node: &PgNode) -> Option<u32> {
+    use turso_pg_parser::pg_query::protobuf::{a_const::Val, AExprKind, SubLinkType};
+    let boolean = match node.node.as_ref()? {
+        // An integer literal past int4 (pg_query gives it as a float's text) is int8 while it fits
+        // one, as PostgreSQL types it (recorded, pg18-diff/pg18-c33.out; Claude C33: announced
+        // int4). One past int8 is numeric in PostgreSQL; the engine holds it as a float, so it is
+        // left to the engine's type (the bare-NUMERIC divergence, a known red).
+        Node::AConst(c) if matches!(&c.val, Some(Val::Fval(f)) if integer_literal_fits_i64(&f.fval)) => {
+            return Some(INT8);
+        }
+        Node::AConst(c) => matches!(c.val, Some(Val::Boolval(_))),
+        Node::BoolExpr(_) | Node::NullTest(_) | Node::BooleanTest(_) => true,
+        // NULLIF is its first argument's type.
+        Node::AExpr(e) if e.kind() == AExprKind::AexprNullif => {
+            return e.lexpr.as_deref().and_then(operand_type);
+        }
+        Node::AExpr(e) => match e.kind() {
+            AExprKind::AexprOp => matches!(
+                e.name.as_slice(),
+                [op] if matches!(
+                    op.node.as_ref(),
+                    Some(Node::String(s))
+                        if matches!(s.sval.as_str(), "=" | "<>" | "!=" | "<" | ">" | "<=" | ">=")
+                )
+            ),
+            AExprKind::AexprOpAny
+            | AExprKind::AexprOpAll
+            | AExprKind::AexprDistinct
+            | AExprKind::AexprNotDistinct
+            | AExprKind::AexprIn
+            | AExprKind::AexprLike
+            | AExprKind::AexprIlike
+            | AExprKind::AexprSimilar
+            | AExprKind::AexprBetween
+            | AExprKind::AexprNotBetween
+            | AExprKind::AexprBetweenSym
+            | AExprKind::AexprNotBetweenSym => true,
+            _ => false,
         },
-        _ => return None,
+        Node::SubLink(l) => matches!(
+            l.sub_link_type(),
+            SubLinkType::ExistsSublink | SubLinkType::AnySublink | SubLinkType::AllSublink
+        ),
+        Node::TypeCast(c) => {
+            let type_name = c.type_name.as_ref()?;
+            // A cast to an array type is that array type (the translator keeps a literal or a
+            // bound parameter as the array, and refuses any other operand).
+            if !type_name.array_bounds.is_empty() {
+                let element = u32::try_from(sqlite_type_to_pg_oid(match type_name
+                    .names
+                    .last()?
+                    .node
+                    .as_ref()?
+                {
+                    Node::String(s) => s.sval.as_str(),
+                    _ => return None,
+                }))
+                .ok()?;
+                return array_of(element);
+            }
+            return match type_name.names.last()?.node.as_ref()? {
+                Node::String(s) if s.sval == "bool" => Some(BOOL),
+                Node::String(s) if s.sval == "float4" => Some(FLOAT4),
+                _ => None,
+            };
+        }
+        // ARRAY[...] of integer or of string literals is int4[] or text[], as PostgreSQL types it
+        // (it was announced text; recorded 2026-10-15). Any other element mix is left untyped.
+        Node::AArrayExpr(e) => {
+            let element = |n: &PgNode| match n.node.as_ref() {
+                Some(Node::AConst(c)) => match c.val.as_ref() {
+                    Some(Val::Ival(_)) => Some(INT4),
+                    Some(Val::Sval(_)) => Some(TEXT),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let first = element(e.elements.first()?)?;
+            return e
+                .elements
+                .iter()
+                .all(|n| element(n) == Some(first))
+                .then(|| array_of(first))
+                .flatten();
+        }
+        // A conditional expression is its arguments' one type (PostgreSQL's select_common_type,
+        // here only when every typed argument agrees; a NULL literal takes the others' type):
+        // over integers they were announced text (pg18-colnames.out).
+        Node::CaseExpr(c) => {
+            let results: Vec<&PgNode> = c
+                .args
+                .iter()
+                .filter_map(|w| match w.node.as_ref() {
+                    Some(Node::CaseWhen(w)) => w.result.as_deref(),
+                    _ => None,
+                })
+                .chain(c.defresult.as_deref())
+                .collect();
+            return common_type(&results);
+        }
+        Node::CoalesceExpr(c) => return common_type(&c.args.iter().collect::<Vec<_>>()),
+        Node::MinMaxExpr(m) => return common_type(&m.args.iter().collect::<Vec<_>>()),
+
+        _ => false,
     };
-    if name == "count" {
-        return Some(INT8);
-    }
-    let [arg] = call.args.as_slice() else {
-        return None;
-    };
-    let arg = column_type(arg, tables, schema)?;
-    match (name, arg) {
-        ("sum", INT2 | INT4) => Some(INT8),
-        ("sum", INT8 | NUMERIC) => Some(NUMERIC),
-        ("sum", FLOAT4 | FLOAT8) => Some(arg),
-        ("avg", INT2 | INT4 | INT8 | NUMERIC) => Some(NUMERIC),
-        ("avg", FLOAT4 | FLOAT8) => Some(FLOAT8),
-        ("min" | "max", _) => Some(arg),
-        _ => None,
-    }
+    boolean.then_some(BOOL)
 }
 
-/// The type OID of a table column an aggregate reads: `col` when exactly one FROM table has it, or
-/// `t.col` by a FROM table's alias or name.
-fn column_type(arg: &PgNode, tables: &[(String, String)], schema: &Schema) -> Option<u32> {
-    let Some(Node::ColumnRef(c)) = arg.node.as_ref() else {
-        return None;
-    };
-    let names: Vec<&str> = c
-        .fields
-        .iter()
-        .map(|f| match f.node.as_ref() {
-            Some(Node::String(s)) => Some(s.sval.as_str()),
+/// An operand's type for [`common_type`]: a grammar-fixed one ([`expression_type`]) or an integer
+/// literal's int4 (pg_query gives a literal past int4 as a float's text).
+fn operand_type(node: &PgNode) -> Option<u32> {
+    use turso_pg_parser::pg_query::protobuf::a_const::Val;
+    match node.node.as_ref()? {
+        Node::AConst(c) => match c.val.as_ref() {
+            Some(Val::Ival(_)) => Some(INT4),
+            Some(Val::Boolval(_)) => Some(BOOL),
             _ => None,
-        })
-        .collect::<Option<_>>()?;
-    let declared = |relname: &str, column: &str| -> Option<Option<u32>> {
-        let table = schema.get_btree_table(relname)?;
-        let (_, col) = table.get_column(column)?;
-        Some(column_oid(col))
-    };
-    let ty = match names.as_slice() {
-        [column] => {
-            let mut found = tables.iter().filter_map(|(_, rel)| declared(rel, *column));
-            let ty = found.next()?;
-            if found.next().is_some() {
-                return None;
-            }
-            ty
-        }
-        [table, column] => {
-            let (_, rel) = tables.iter().find(|(name, _)| name.as_str() == *table)?;
-            declared(rel, *column)?
-        }
-        _ => return None,
-    };
-    ty
+        },
+        _ => expression_type(node),
+    }
 }
 
-/// The FROM clause's tables, as (the name a column reference qualifies them by, relation name),
-/// through joins; only tables of the default schema.
-fn from_tables(select: &SelectStmt) -> Vec<(String, String)> {
-    from_items(&select.from_clause)
+/// The one type every operand has, NULL literals aside; None when one is untyped or they differ.
+fn common_type(operands: &[&PgNode]) -> Option<u32> {
+    let mut common = None;
+    for operand in operands {
+        if matches!(operand.node.as_ref(), Some(Node::AConst(c)) if c.isnull) {
+            continue;
+        }
+        let ty = operand_type(operand)?;
+        if common.is_some_and(|c| c != ty) {
+            return None;
+        }
+        common = Some(ty);
+    }
+    common
 }
 
-/// [`from_tables`] of a list of FROM items (a SELECT's FROM, UPDATE's FROM, DELETE's USING).
-fn from_items(items: &[PgNode]) -> Vec<(String, String)> {
-    fn walk(node: &PgNode, out: &mut Vec<(String, String)>) {
-        match node.node.as_ref() {
-            Some(Node::RangeVar(rv)) if rv.schemaname.is_empty() || rv.schemaname == "public" => {
-                let name = rv
-                    .alias
-                    .as_ref()
-                    .map_or_else(|| rv.relname.clone(), |a| a.aliasname.clone());
-                out.push((name, rv.relname.clone()));
-            }
-            Some(Node::JoinExpr(j)) => {
-                for side in [&j.larg, &j.rarg].into_iter().flatten() {
-                    walk(side, out);
-                }
-            }
-            _ => {}
-        }
+/// The aggregate columns' types ([`aggregate_targets`]) out of the walk's types for the result
+/// columns ([`Walked::columns`]), which reads an aggregate's argument through its scope: the
+/// relation the engine reads, through the search path, a CTE, a derived table or a view. None for
+/// every other column, and for all of them when the two do not line up. The aggregates read every
+/// FROM table in public alone, so after `SET search_path TO s, public` `max(c)` over s.t's text
+/// announced public t's int4 (wire review 17 item 15).
+pub fn aggregate_types(aggregates: &[bool], columns: &[Option<u32>]) -> Vec<Option<u32>> {
+    if aggregates.len() != columns.len() {
+        return vec![None; aggregates.len()];
     }
-    let mut out = Vec::new();
-    for item in items {
-        walk(item, &mut out);
-    }
-    out
+    aggregates
+        .iter()
+        .zip(columns)
+        .map(|(&aggregate, &ty)| ty.filter(|_| aggregate))
+        .collect()
 }
 
 const BOOL: u32 = 16;
@@ -171,20 +515,29 @@ const TEXT: u32 = 25;
 
 /// The types a statement's parse gives: its result columns' (see [`aggregate_types`]) and its
 /// parameters' (see [`parameter_types`]).
+
+/// What the parameter walk gives a statement ([`parameter_types`]).
+pub struct Walked {
+    /// The type OID of each $n its context types, by n ([`StatementTypes::params`]).
+    pub params: std::collections::BTreeMap<u32, u32>,
+    /// The $n compared with an expression no context types ([`StatementTypes::untyped`]).
+    pub untyped: std::collections::BTreeSet<u32>,
+    /// A plain SELECT's result columns' types, in order, as the walk read them (empty for any other
+    /// statement): [`aggregate_types`] takes the aggregates' from these.
+    pub columns: Vec<Option<u32>>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct StatementTypes {
-    /// Set by the caller, not the parse: whether a Bind supplies this statement's parameters (the
-    /// extended protocol). A statement performed at prepare is refused when it holds a parameter,
-    /// 42P02 without a Bind and 0A000 with one (wire review 13 item 9).
-    pub bound: bool,
     pub columns: Vec<Option<u32>>,
     /// The type OID of each $n its context types, by n; one missing is untyped (text, as
     /// PostgreSQL resolves a parameter nothing types). Sparse, so a statement's highest $n sizes
     /// nothing (wire review 8 item 3).
     pub params: std::collections::BTreeMap<u32, u32>,
     /// Every $n the statement's parse tree holds, sorted, each in 1..=MAX_PARAMETER (see
-    /// turso_pg_parser::param_numbers): the parameter count and the gaps are read from this, not
-    /// from the engine's slots, which a clause it folds away does not get (wire review 8 item 5).
+    /// turso_pg_parser::checked_param_numbers): the parameter count and the gaps are read from
+    /// this, not from the engine's slots, which a clause it folds away does not get (wire review 8
+    /// item 5).
     pub used: Vec<u32>,
     /// Every $n compared with an expression no context types: refused (42P18) unless the client
     /// declared its type, which the server reads from Parse (wire review 8 item 7, review 11 item
@@ -198,8 +551,19 @@ pub struct StatementTypes {
     pub rolls_back: bool,
     /// The table a CREATE TABLE creates with foreign keys: the server resolves every key once the
     /// table exists, in the CREATE's own transaction, and refuses the CREATE (42830) if one does
-    /// not (turso_pg::check_table_keys; wire review 13 item 2).
+    /// not (turso_pg::check_table_keys; wire review 13 item 2). None for one the frontend performed
+    /// whole at prepare, keys resolved, because it has prerequisites (a SERIAL column's sequence;
+    /// wire review 16 item 15).
     pub new_table_keys: Option<String>,
+    /// The frontend performed the statement while preparing it (a CREATE TABLE with SERIAL
+    /// prerequisites), and the statement it returns is a no-op: the server answers it with its
+    /// command tag alone, never as a query (the no-op's one column made it `SELECT 0`).
+    pub performed: bool,
+    /// For each result column of a plain SELECT, the parameter number when the column is a bare
+    /// `$n`: the server announces such a column as that parameter's type, declared or inferred,
+    /// as PostgreSQL does (it was text; the PG 18 differential's finding (c)). Empty when the
+    /// statement is no such SELECT.
+    pub param_targets: Vec<Option<u32>>,
 }
 
 pub use turso_pg_parser::MAX_PARAMETER;
@@ -228,14 +592,11 @@ pub fn parameter_types(
     parse: &ParseResult,
     schema: &std::sync::Arc<Schema>,
     search_path: &[String],
-    cache: &std::sync::Mutex<ViewCache>,
+    cache: &parking_lot::Mutex<ViewCache>,
     attached: &Attached<'_>,
-) -> (
-    std::collections::BTreeMap<u32, u32>,
-    std::collections::BTreeSet<u32>,
-) {
+) -> Result<Walked, String> {
     let memo = {
-        let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cache = cache.lock();
         let same = cache
             .schema
             .as_ref()
@@ -250,7 +611,7 @@ pub fn parameter_types(
     };
     let view_memo = std::rc::Rc::new(std::cell::RefCell::new(memo));
     let result = parameter_types_with(parse, schema, search_path, &view_memo, attached);
-    cache.lock().unwrap_or_else(|e| e.into_inner()).views = view_memo.take();
+    cache.lock().views = view_memo.take();
     result
 }
 
@@ -259,7 +620,7 @@ pub fn parameter_types(
 /// k times was parsed k times (2^depth for a view joining the one before it twice; wire review 14
 /// item 10). Keyed by the snapshot itself, the Arc the connection hands out until DDL replaces it,
 /// which the cache holds so that it cannot be mistaken for a later one; a view read where the walk
-/// was cut (a cycle, the depth bound) is not kept.
+/// was cut (a cycle) is not kept.
 #[derive(Default)]
 pub struct ViewCache {
     schema: Option<std::sync::Arc<Schema>>,
@@ -284,10 +645,7 @@ fn parameter_types_with(
     search_path: &[String],
     view_memo: &std::rc::Rc<std::cell::RefCell<ViewMemo>>,
     attached: &Attached<'_>,
-) -> (
-    std::collections::BTreeMap<u32, u32>,
-    std::collections::BTreeSet<u32>,
-) {
+) -> Result<Walked, String> {
     let mut infer = Infer {
         schema,
         types: std::collections::BTreeMap::new(),
@@ -300,10 +658,12 @@ fn parameter_types_with(
         cuts: Default::default(),
         cut_views: Default::default(),
         attached,
+        missing_rte: Default::default(),
     };
+    let mut columns = Vec::new();
     if let [raw] = parse.protobuf.stmts.as_slice() {
         if let Some(stmt) = raw.stmt.as_deref() {
-            infer.statement(stmt);
+            columns = infer.statement(stmt);
         }
     }
     let untyped = infer
@@ -312,7 +672,14 @@ fn parameter_types_with(
         .filter(|n| !infer.types.contains_key(n))
         .copied()
         .collect();
-    (infer.types, untyped)
+    if let Some(missing) = infer.missing_rte.take() {
+        return Err(missing);
+    }
+    Ok(Walked {
+        params: infer.types,
+        untyped,
+        columns,
+    })
 }
 
 /// A relation a column reference can name, by the name references qualify it by: a table (its
@@ -360,8 +727,8 @@ const STAR: &str = "*";
 /// column reference resolves innermost first, as PostgreSQL resolves a correlated reference.
 type Scope = Vec<Vec<Rel>>;
 
-/// A column's type: `Some(Some(t))` resolved, `Some(None)` found with no type the walk knows,
-/// `None` not found (or ambiguous).
+/// A column's type: `Some(Some(t))` resolved, `Some(None)` found with no type the walk knows (or in
+/// two relations of one level with types that differ), `None` not found.
 type Found = Option<Option<u32>>;
 
 struct Infer<'a> {
@@ -383,19 +750,25 @@ struct Infer<'a> {
     search_path: Vec<String>,
     /// The views read so far for this snapshot ([`ViewCache`]), shared with every nested walk.
     view_memo: std::rc::Rc<std::cell::RefCell<ViewMemo>>,
-    /// How many times a view was cut (a cycle, the depth bound), shared with every nested walk: a
-    /// view whose reading saw a cut is not memoised for the snapshot.
+    /// How many times a view was cut (a cycle), shared with every nested walk: a view whose
+    /// reading saw a cut is not memoised for the snapshot.
     cuts: std::rc::Rc<std::cell::Cell<usize>>,
     /// The views whose reading saw a cut, for this statement's walk only, shared with every nested
     /// walk ([`Infer::view_columns`]).
     cut_views: std::rc::Rc<std::cell::RefCell<ViewMemo>>,
     /// The session's attached schemas ([`Attached`]).
     attached: &'a Attached<'a>,
+    /// A column reference that names no FROM entry (`s.t.c` with no relation s.t in scope),
+    /// PostgreSQL's errorMissingRTE (42P01): the statement is refused with it. Shared with the walks
+    /// of the statement's own subqueries, not with a view's (wire review 17 item 5).
+    missing_rte: std::rc::Rc<std::cell::RefCell<Option<String>>>,
 }
 
-/// How many views deep the walk opens a view inside a view; a deeper one is a relation it cannot
-/// open.
-const MAX_VIEW_DEPTH: usize = 32;
+/// The stack a view's reading starts with, and the stack grown for it when less is left: each view
+/// inside a view is a level of the walk's recursion, so a chain of any depth is read on stacks
+/// grown as it goes, not cut, and never overflows the session thread's ([`Infer::view_columns`]).
+const VIEW_RED_ZONE: usize = 100 * 1024;
+const VIEW_STACK: usize = 1024 * 1024;
 
 /// The parameter number of a bare `$n`.
 fn param(node: &PgNode) -> Option<u32> {
@@ -432,7 +805,10 @@ fn scalar_result(name: &str) -> Option<u32> {
         | "quote_ident" | "quote_literal" | "format" | "current_schema" | "current_database"
         | "version" => TEXT,
         "row_number" | "rank" | "dense_rank" | "ntile" => INT8,
-        "percent_rank" | "cume_dist" => FLOAT8,
+        // float8-only in PostgreSQL, whatever numeric argument they are given, and computed as a
+        // float by the engine (random() as the translator scales it).
+        "percent_rank" | "cume_dist" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan"
+        | "atan2" | "degrees" | "radians" | "pi" | "random" => FLOAT8,
         "now" | "statement_timestamp" | "transaction_timestamp" | "clock_timestamp" => 1184,
         _ => return None,
     })
@@ -531,11 +907,16 @@ impl Infer<'_> {
         }
     }
 
-    fn statement(&mut self, stmt: &PgNode) {
+    /// Walk a statement; returns a SELECT's result columns' types (empty for any other).
+    fn statement(&mut self, stmt: &PgNode) -> Vec<Option<u32>> {
         let scope: Scope = Vec::new();
         match stmt.node.as_ref() {
             Some(Node::SelectStmt(s)) => {
-                self.select(s, &scope);
+                return self
+                    .select(s, &scope)
+                    .into_iter()
+                    .map(|(_, ty)| ty)
+                    .collect();
             }
             Some(Node::InsertStmt(i)) => {
                 let ctes = self.with(i.with_clause.as_ref(), &scope);
@@ -568,6 +949,7 @@ impl Infer<'_> {
             }
             _ => {}
         }
+        Vec::new()
     }
 
     /// Walk a WITH clause and bring its CTEs into scope; returns the depth to truncate back to.
@@ -652,10 +1034,15 @@ impl Infer<'_> {
     /// an attached schema counts as a cut: its answer can change with no new main snapshot, so a
     /// view read through it is not kept for the snapshot ([`ViewCache`]).
     fn main_relname(&self, schemaname: &str, relname: &str) -> Option<String> {
-        match schemaname.to_lowercase().as_str() {
-            "public" | "pg_catalog" => Some(relname.to_string()),
-            "information_schema" => Some(format!("information_schema_{}", relname.to_lowercase())),
-            "" => {
+        use turso_pg_parser::SchemaQualifier;
+        match turso_pg_parser::schema_qualifier(schemaname) {
+            // main is the engine's name for public, which a view's stored text holds since the
+            // translator names public's relations so (wire review 17 item 1, review 18 item 5).
+            SchemaQualifier::Main | SchemaQualifier::PgCatalog => Some(relname.to_string()),
+            SchemaQualifier::InformationSchema => {
+                Some(format!("information_schema_{}", relname.to_lowercase()))
+            }
+            SchemaQualifier::Unqualified => {
                 let in_main = || {
                     self.schema.get_table(relname).is_some()
                         || self.schema.get_view(relname).is_some()
@@ -691,7 +1078,7 @@ impl Infer<'_> {
                 }
                 None
             }
-            _ => None,
+            SchemaQualifier::Attached(_) => None,
         }
     }
 
@@ -724,17 +1111,19 @@ impl Infer<'_> {
 
     /// A view's columns, typed by walking its query (stored as SQL text) as a statement of its own:
     /// the query sees no enclosing scope and none of this statement's CTEs. None for no view of
-    /// that name, one whose text does not parse as a view, one already being opened (a circular
-    /// view) and one nested past MAX_VIEW_DEPTH: the relation is then one the walk cannot open, and
-    /// a parameter compared with its columns fails closed (42P18 unless declared). A view was not
-    /// opened at all, so a parameter compared with its count(*) column fell to the text fallback,
-    /// and rows went missing (wire review 11 item 3); then a circular view recursed until the
-    /// session thread's stack overflowed, which aborts the process, every session with it, before
-    /// the engine's own "circularly defined" refusal could run (wire review 14 item 1).
+    /// that name, one whose text does not parse as a view, and one already being opened (a
+    /// circular view): the relation is then one the walk cannot open, and a parameter compared with
+    /// its columns fails closed (42P18 unless declared). A view was not opened at all, so a
+    /// parameter compared with its count(*) column fell to the text fallback, and rows went missing
+    /// (wire review 11 item 3); then a circular view recursed until the session thread's stack
+    /// overflowed, which aborts the process, every session with it, before the engine's own
+    /// "circularly defined" refusal could run (wire review 14 item 1). A view nested 32 deep was
+    /// cut too, against the stack, so whether a parameter over a deep chain was typed depended on
+    /// which of its views earlier statements had memoised (wire review 18 item 14): the cycle cut
+    /// bounds the depth by the views in the schema, and each reading runs on a stack grown when
+    /// less than VIEW_RED_ZONE is left.
     fn view_columns(&self, relname: &str) -> Option<Vec<(String, Option<u32>)>> {
-        if self.views.len() >= MAX_VIEW_DEPTH
-            || self.views.iter().any(|v| v.eq_ignore_ascii_case(relname))
-        {
+        if self.views.iter().any(|v| v.eq_ignore_ascii_case(relname)) {
             self.cuts.set(self.cuts.get() + 1);
             return None;
         }
@@ -743,19 +1132,19 @@ impl Infer<'_> {
             return columns.clone();
         }
         // A view read with a cut is kept for this statement: a view sees a cut only inside a cycle
-        // through it, which any later reading of it meets too, or past the depth bound, where a
-        // shallower reading might not; either way its columns are fail-closed (whatever a cut
-        // relation held is unknown), so reusing them can only refuse more. Its reader counts the
-        // cut, so nothing read from it reaches the snapshot's memo. Not kept, every sibling FROM
-        // item read its view again: about e*(k-1)! parses for k views that each list all k (wire
-        // review 16 item 3).
+        // through it, which any later reading of it meets too; its columns are fail-closed
+        // (whatever a cut relation held is unknown), so reusing them can only refuse more. Its
+        // reader counts the cut, so nothing read from it reaches the snapshot's memo. Not kept,
+        // every sibling FROM item read its view again: about e*(k-1)! parses for k views that each
+        // list all k (wire review 16 item 3).
         if let Some(columns) = self.cut_views.borrow().get(&key) {
             self.cuts.set(self.cuts.get() + 1);
             return columns.clone();
         }
         let view = self.schema.get_view(relname)?;
         let cuts = self.cuts.get();
-        let columns = self.read_view(&view, relname);
+        let columns =
+            stacker::maybe_grow(VIEW_RED_ZONE, VIEW_STACK, || self.read_view(&view, relname));
         let memo = if self.cuts.get() == cuts {
             &self.view_memo
         } else {
@@ -775,11 +1164,19 @@ impl Infer<'_> {
         view: &turso_core::schema::View,
         relname: &str,
     ) -> Option<Vec<(String, Option<u32>)>> {
+        // The engine's columns carry a table column's type only where it traced the column to a
+        // table (view_columns_traced); every other one it types with a placeholder TEXT, which
+        // typed a parameter compared with a computed column as text and bound it as a string
+        // (wire review 18 item 4). Untyped, such a parameter is refused (42P18).
         let engine_columns = || {
+            let traced = view_columns_traced(self.schema, &view.select_stmt);
             Some(
                 view.columns
                     .iter()
-                    .map(|c| (c.name.clone().unwrap_or_default(), column_oid(c)))
+                    .map(|c| {
+                        let ty = if traced { column_oid(c) } else { None };
+                        (c.name.clone().unwrap_or_default(), ty)
+                    })
                     .collect(),
             )
         };
@@ -815,6 +1212,7 @@ impl Infer<'_> {
             cuts: self.cuts.clone(),
             cut_views: self.cut_views.clone(),
             attached: self.attached,
+            missing_rte: Default::default(),
         };
         let columns = walk.select(query, &Vec::new());
         Some(rename(columns, &v.aliases))
@@ -855,13 +1253,15 @@ impl Infer<'_> {
                 });
             }
             Some(Node::RangeFunction(f)) => {
-                for item in &f.functions {
-                    self.expr(item, scope);
-                }
                 // A function in FROM reads the items before it (PostgreSQL's functions in FROM are
-                // implicitly LATERAL).
+                // implicitly LATERAL), its arguments too: they were walked in the enclosing scope
+                // alone, so a bare name bound to an outer relation's column (wire review 16 item
+                // 24).
                 let mut inner = scope.clone();
                 inner.push(level.clone());
+                for item in &f.functions {
+                    self.expr(item, &inner);
+                }
                 level.push(self.range_function(f, &inner));
             }
             _ => {}
@@ -1377,7 +1777,8 @@ impl Infer<'_> {
     }
 
     /// A column reference's type: `t.c` from the innermost level naming t, a bare `c` from the
-    /// innermost level holding it (ambiguous within one level: none).
+    /// innermost level holding it (in two of its relations: their type when they agree, else
+    /// untyped).
     fn column(&self, node: &PgNode, scope: &Scope) -> Found {
         let Some(Node::ColumnRef(c)) = node.node.as_ref() else {
             return None;
@@ -1419,9 +1820,12 @@ impl Infer<'_> {
                         return Some(None);
                     }
                     // In two relations of the level: one column a join merged (USING, NATURAL)
-                    // when they agree on its type, which it then has; untyped when they do not. A
-                    // column no join merges is the engine's 42702 whichever is returned. It was
-                    // read as not found, which fell to text (wire review 14 item 9).
+                    // when they agree on its type, which it then has; untyped when they do not, so
+                    // a USING over int4 and int8, which PostgreSQL types int8, is refused 42P18. A
+                    // column no join merges is the engine's 42702 whichever is returned, except in
+                    // ON CONFLICT DO UPDATE, where the engine binds a bare name to the target and
+                    // PostgreSQL refuses it 42702 (both recorded in COMPAT.md; wire review 17 item
+                    // 16). It was read as not found, which fell to text (wire review 14 item 9).
                     let found: Vec<Option<u32>> =
                         level.iter().filter_map(|rel| of(rel, column)).collect();
                     if let [first, rest @ ..] = found.as_slice() {
@@ -1442,16 +1846,35 @@ impl Infer<'_> {
                 }
                 None
             }
-            // `public.t.c` is t's c; a reference through any other schema (or deeper) names a
-            // relation this walk cannot read: found, untyped, so a parameter compared with it is
-            // refused (42P18). It was not found, which fell to text (wire review 14 item 3).
-            [schema, table, column] if schema.eq_ignore_ascii_case("public") => {
-                for level in scope.iter().rev() {
-                    if let Some(rel) = level.iter().find(|rel| rel.name() == *table) {
-                        return of(rel, column);
+            // `schema.t.c` names the FROM entry t of that schema, as PostgreSQL's
+            // refnameNamespaceItem reads it. Through public, `main` (a view's stored spelling) or
+            // pg_catalog it is the relation t in scope; through another schema it is a relation
+            // this walk cannot read (found, untyped: 42P18 for a parameter compared with it), unless
+            // the t in scope is main's or a derived one, which is no relation of that schema. With
+            // no entry t in scope at all, it names none: 42P01, PostgreSQL's errorMissingRTE. The
+            // path hard-coded public, so the pg_catalog form was 42P18, and a reference through a
+            // schema whose t was not in FROM was typed untyped instead of refused (wire review 14
+            // item 3, review 17 item 5, review 18 item 5).
+            [schema, table, column] => {
+                let found = scope
+                    .iter()
+                    .rev()
+                    .find_map(|level| level.iter().find(|rel| rel.name() == *table));
+                let main = matches!(
+                    turso_pg_parser::schema_qualifier(schema),
+                    turso_pg_parser::SchemaQualifier::Main
+                        | turso_pg_parser::SchemaQualifier::PgCatalog
+                );
+                match found {
+                    Some(rel) if main => of(rel, column),
+                    Some(Rel::Unknown { .. }) => Some(None),
+                    _ => {
+                        self.missing_rte.borrow_mut().get_or_insert_with(|| {
+                            format!("missing FROM-clause entry for table \"{table}\"")
+                        });
+                        Some(None)
                     }
                 }
-                None
             }
             _ => Some(None),
         }
@@ -1482,6 +1905,13 @@ impl Infer<'_> {
                     ("ceil" | "ceiling" | "floor" | "round" | "trunc", t @ (NUMERIC | FLOAT8)) => {
                         Some(t)
                     }
+                    // PostgreSQL has these for float8 and numeric: an integer or float argument
+                    // resolves to the float8 one (float8 is the numeric category's preferred type),
+                    // a numeric one keeps numeric, left untyped here (the engine computes a float).
+                    (
+                        "sqrt" | "exp" | "ln" | "log" | "log10" | "power" | "pow",
+                        INT2 | INT4 | INT8 | FLOAT4 | FLOAT8,
+                    ) => Some(FLOAT8),
                     _ => None,
                 }
             }
@@ -1513,9 +1943,21 @@ impl Infer<'_> {
                 }
                 let l = e.lexpr.as_deref().and_then(|l| self.type_of(l, scope));
                 let r = e.rexpr.as_deref().and_then(|r| self.type_of(r, scope));
+                // A side with no type types the expression only when it is a parameter, which
+                // takes the other side's type (`$1 + 1`); any other untyped operand (a function the
+                // walk does not know) leaves the expression untyped, so a parameter compared with
+                // it fails closed (42P18): `sqrt(n) + 1` was typed by the 1 alone, int4, where
+                // PostgreSQL types it float8 (wire review 14 item 17).
+                let param = |x: Option<&PgNode>| {
+                    matches!(x.and_then(|x| x.node.as_ref()), Some(Node::ParamRef(_)))
+                };
                 match (l, r) {
                     (Some(a), Some(b)) => Some(wider(a, b)),
-                    (a, b) => a.or(b),
+                    (Some(a), None) if param(e.rexpr.as_deref()) => Some(a),
+                    (None, Some(b)) if param(e.lexpr.as_deref()) => Some(b),
+                    // A unary operator (`-x`) has no left side.
+                    (None, Some(b)) if e.lexpr.is_none() => Some(b),
+                    _ => None,
                 }
             }
             Node::BoolExpr(_) | Node::NullTest(_) | Node::BooleanTest(_) => Some(BOOL),
@@ -1583,6 +2025,7 @@ impl Infer<'_> {
             cuts: self.cuts.clone(),
             cut_views: self.cut_views.clone(),
             attached: self.attached,
+            missing_rte: self.missing_rte.clone(),
         };
         let level = walk.from_items(&s.from_clause, scope);
         let mut inner = scope.clone();
@@ -1640,8 +2083,14 @@ pub fn element_of(array: u32) -> Option<u32> {
 
 /// (element type, its array type) from pg_type: bool, bytea, int2, int4, int8, text, varchar,
 /// bpchar, float4, float8, numeric, json, jsonb, uuid, date, time, timestamp, timestamptz.
-const ARRAYS: [(u32, u32); 18] = [
+const ARRAYS: [(u32, u32); 22] = [
     (16, 1000),
+    // inet, cidr, macaddr and oid (wire review 13 item 18: without them a parameter against such
+    // an array column was 42P18).
+    (869, 1041),
+    (650, 651),
+    (829, 1040),
+    (26, 1028),
     (17, 1001),
     (21, 1005),
     (23, 1007),
@@ -1679,6 +2128,47 @@ fn declared_type(schema: &Schema, relname: &str, column: &str) -> Option<u32> {
     let table = schema.get_btree_table(relname)?;
     let (_, col) = table.get_column(column)?;
     column_oid(col)
+}
+
+/// Whether the engine's columns for the view whose query (as the engine parsed it) is `select`
+/// carry real types: core types a view column from its table column only when the column is a
+/// bare reference into a table (core util.rs, extract_view_columns), and gives every other one, a
+/// computed column or one read through an inner view, a subquery or a table function, a
+/// placeholder TEXT. So the types are kept only for a plain SELECT (no WITH, no compound) whose
+/// every FROM item is a table and whose every result column is `*`, `t.*` or a bare column
+/// reference; for any other view none is, all or nothing (the view's columns cannot be matched to
+/// its result columns one by one once a `*` expands).
+fn view_columns_traced(schema: &Schema, select: &turso_parser::ast::Select) -> bool {
+    use turso_parser::ast::{Expr, OneSelect, ResultColumn, SelectTable};
+    if select.with.is_some() || !select.body.compounds.is_empty() {
+        return false;
+    }
+    let OneSelect::Select {
+        columns,
+        from: Some(from),
+        ..
+    } = &select.body.select
+    else {
+        return false;
+    };
+    let a_table = |item: &SelectTable| match item {
+        SelectTable::Table(name, _, _) => {
+            name.db_name
+                .as_ref()
+                .is_none_or(|db| db.as_str().eq_ignore_ascii_case("main"))
+                && schema.get_btree_table(name.name.as_str()).is_some()
+        }
+        _ => false,
+    };
+    a_table(&*from.select)
+        && from.joins.iter().all(|join| a_table(&*join.table))
+        && columns.iter().all(|column| match column {
+            ResultColumn::Star | ResultColumn::TableStar(_) => true,
+            ResultColumn::Expr(expr, _) => matches!(
+                expr.as_ref(),
+                Expr::Id(_) | Expr::Qualified(_, _) | Expr::DoublyQualified(_, _, _)
+            ),
+        })
 }
 
 /// The type OID of a table column as declared: its type name's, or for an array column the array

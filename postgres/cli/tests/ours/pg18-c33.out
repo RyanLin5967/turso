@@ -1,0 +1,150 @@
+>> Q drop table if exists pd
+   C DROP TABLE
+   Z I
+>> Q create table pd (k int, v text default 'dflt')
+   C CREATE TABLE
+   Z I
+>> Q insert into pd (k, v) values (1, DEFAULT), (2, 'y')
+   C INSERT 0 2
+   Z I
+>> Q insert into pd values (3, DEFAULT), (4, 'z')
+   C INSERT 0 2
+   Z I
+>> Q select * from pd order by k
+   T oids=[23, 25] names=['k', 'v']
+   D ['1', 'dflt']
+   D ['2', 'y']
+   D ['3', 'dflt']
+   D ['4', 'z']
+   C SELECT 4
+   Z I
+>> Q drop table pd
+   C DROP TABLE
+   Z I
+>> Q SELECT 0b10000000000000000000000000000000
+   T oids=[20] names=['?column?']
+   D ['2147483648']
+   C SELECT 1
+   Z I
+>> Q SELECT 0o20000000000
+   T oids=[20] names=['?column?']
+   D ['2147483648']
+   C SELECT 1
+   Z I
+>> Q SELECT 0x80000000
+   T oids=[20] names=['?column?']
+   D ['2147483648']
+   C SELECT 1
+   Z I
+>> Q SELECT -0x8000000000000000
+   T oids=[20] names=['?column?']
+   D ['-9223372036854775808']
+   C SELECT 1
+   Z I
+>> Q SELECT 1_000_000
+   T oids=[23] names=['?column?']
+   D ['1000000']
+   C SELECT 1
+   Z I
+>> Q SELECT 0b1_0
+   T oids=[23] names=['?column?']
+   D ['2']
+   C SELECT 1
+   Z I
+>> Q SELECT 0x_7FFF_FFFF_FFFF_FFFF_F
+   T oids=[701] names=['?column?']
+   D ['1.4757395258967641e+20']
+   C SELECT 1
+   Z I
+>> Q SELECT 2147483647
+   T oids=[23] names=['?column?']
+   D ['2147483647']
+   C SELECT 1
+   Z I
+>> Q SELECT 2147483648
+   T oids=[20] names=['?column?']
+   D ['2147483648']
+   C SELECT 1
+   Z I
+>> Q SELECT 9223372036854775807
+   T oids=[20] names=['?column?']
+   D ['9223372036854775807']
+   C SELECT 1
+   Z I
+>> Q SELECT 9223372036854775808
+   T oids=[701] names=['?column?']
+   D ['9.223372036854776e+18']
+   C SELECT 1
+   Z I
+>> Q SELECT -0
+   T oids=[23] names=['?column?']
+   D ['0']
+   C SELECT 1
+   Z I
+>> Q SELECT -0.0
+   T oids=[701] names=['?column?']
+   D ['-0']
+   C SELECT 1
+   Z I
+>> Q SELECT -0.0::float8
+   T oids=[701] names=['?column?']
+   D ['0']
+   C SELECT 1
+   Z I
+>> Q SELECT '-0'::float8
+   T oids=[701] names=['float8']
+   D ['-0']
+   C SELECT 1
+   Z I
+>> Q SELECT '-0'::numeric
+   T oids=[701] names=['numeric']
+   D ['-0']
+   C SELECT 1
+   Z I
+>> Q drop table if exists rr
+   C DROP TABLE
+   Z I
+>> Q create table rr (x real)
+   C CREATE TABLE
+   Z I
+>> Q insert into rr values (1e39)
+   C INSERT 0 1
+   Z I
+>> Q insert into rr values ('1e39')
+   C INSERT 0 1
+   Z I
+>> Q insert into rr values (-1e39)
+   C INSERT 0 1
+   Z I
+>> Q insert into rr values (1e-50)
+   C INSERT 0 1
+   Z I
+>> Q select * from rr
+   T oids=[700] names=['x']
+   D ['Infinity']
+   D ['Infinity']
+   D ['-Infinity']
+   D ['0']
+   C SELECT 4
+   Z I
+>> Q SELECT CAST(1e39 AS real)
+   T oids=[700] names=['float4']
+   D ['Infinity']
+   C SELECT 1
+   Z I
+>> Q SELECT 1e39::real
+   T oids=[700] names=['float4']
+   D ['Infinity']
+   C SELECT 1
+   Z I
+>> Q SELECT '1e39'::real
+   E S=ERROR C=22003 M=Parse error: "1e39" is out of range for type real
+   Z I
+>> Q SELECT '3.4e38'::real
+   T oids=[700] names=['float4']
+   D ['3.4e+38']
+   C SELECT 1
+   Z I
+>> Q drop table rr
+   C DROP TABLE
+   Z I

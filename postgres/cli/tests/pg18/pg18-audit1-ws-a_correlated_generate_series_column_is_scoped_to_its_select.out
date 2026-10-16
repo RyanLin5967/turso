@@ -1,0 +1,118 @@
+>> Q DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public
+   N S=NOTICE C=00000 M=drop cascades to table t
+   C DROP SCHEMA
+   C CREATE SCHEMA
+   Z I
+>> Q CREATE TABLE s(x INT)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO s VALUES (1), (2)
+   C INSERT 0 2
+   Z I
+>> Q CREATE TABLE u(k INT, g INT)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO u VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)
+   C INSERT 0 5
+   Z I
+>> Q CREATE TABLE w(k INT)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO w VALUES (1), (2), (3), (4), (5)
+   C INSERT 0 5
+   Z I
+>> Q CREATE TABLE ins(g INT)
+   C CREATE TABLE
+   Z I
+>> Q SELECT g FROM s, generate_series(1, s.x) AS g ORDER BY g
+   T oids=[23] names=['g']
+   D ['1']
+   D ['1']
+   D ['2']
+   C SELECT 3
+   Z I
+>> Q SELECT g FROM s, generate_series(1, s.x) AS g WHERE g NOT IN (SELECT g FROM u) ORDER BY g
+   T oids=[23] names=['g']
+   D ['1']
+   D ['1']
+   D ['2']
+   C SELECT 3
+   Z I
+>> Q SELECT g FROM s, generate_series(1, s.x) AS g WHERE EXISTS (SELECT 1 FROM w WHERE w.k = g.g) ORDER BY g
+   T oids=[23] names=['g']
+   D ['1']
+   D ['1']
+   D ['2']
+   C SELECT 3
+   Z I
+>> Q SELECT g FROM s, generate_series(1, s.x) AS g WHERE EXISTS (SELECT 1 FROM w WHERE w.k = g) ORDER BY g
+   T oids=[23] names=['g']
+   D ['1']
+   D ['1']
+   D ['2']
+   C SELECT 3
+   Z I
+>> Q SELECT g FROM (SELECT s.x, g FROM s, generate_series(1, s.x) AS g) AS sub ORDER BY g
+   T oids=[23] names=['g']
+   D ['1']
+   D ['1']
+   D ['2']
+   C SELECT 3
+   Z I
+>> Q SELECT g FROM s, generate_series(1, s.x) AS g UNION ALL SELECT g FROM u ORDER BY 1
+   T oids=[23] names=['g']
+   D ['1']
+   D ['1']
+   D ['2']
+   D ['10']
+   D ['20']
+   D ['30']
+   D ['40']
+   D ['50']
+   C SELECT 8
+   Z I
+>> Q SELECT g FROM u UNION ALL SELECT g FROM s, generate_series(1, s.x) AS g ORDER BY 1
+   T oids=[23] names=['g']
+   D ['1']
+   D ['1']
+   D ['2']
+   D ['10']
+   D ['20']
+   D ['30']
+   D ['40']
+   D ['50']
+   C SELECT 8
+   Z I
+>> Q WITH c AS (SELECT g FROM u) SELECT (SELECT sum(g) FROM c), g FROM s, generate_series(1, s.x) AS g ORDER BY g
+   T oids=[20, 23] names=['sum', 'g']
+   D ['150', '1']
+   D ['150', '1']
+   D ['150', '2']
+   C SELECT 3
+   Z I
+>> Q INSERT INTO ins SELECT g FROM s, generate_series(1, s.x) AS g RETURNING g
+   T oids=[23] names=['g']
+   D ['1']
+   D ['1']
+   D ['2']
+   C INSERT 0 3
+   Z I
+>> Q SELECT k, g FROM u WHERE EXISTS (SELECT 1 FROM s, generate_series(1, s.x) AS g WHERE g.g = u.k) ORDER BY g
+   T oids=[23, 23] names=['k', 'g']
+   D ['1', '10']
+   D ['2', '20']
+   C SELECT 2
+   Z I
+>> Q SELECT a.i, b.i FROM s, generate_series(1, s.x) AS a(i), generate_series(s.x, 2) AS b(i) ORDER BY 1, 2
+   T oids=[23, 23] names=['i', 'i']
+   D ['1', '1']
+   D ['1', '2']
+   D ['1', '2']
+   D ['2', '2']
+   C SELECT 4
+   Z I
+>> Q SELECT i FROM s, generate_series(1, s.x) AS a(i), generate_series(s.x, 2) AS b(i)
+   E S=ERROR C=42702 M=column reference "i" is ambiguous
+   Z I
+-- postgres (PostgreSQL) 18.6 (Homebrew)   (/opt/homebrew/Cellar/postgresql@18/18.6/bin/postgres, pid 8250 serving port 62816; server_version=18.6 (Homebrew). /opt/homebrew/bin/postgres on PATH is 17.11, not used)
+-- recorded 2026-10-15T20:59:31Z against 127.0.0.1:62816 db audit1 by pgproto.py (PGPROTO_NAMES=1)

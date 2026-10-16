@@ -153,18 +153,24 @@ pub(super) fn emit_array_encode(
     // For multi-dimensional arrays (e.g. INTEGER[][]), the outer array's elements
     // are themselves arrays (blobs), so we use ANY/Blob for validation.
     // Only 1-dimensional arrays validate elements against the declared base type.
-    let is_any = col.ty_str.eq_ignore_ascii_case("ANY");
+    // A custom element type with no ENCODE whose base, through any domains, is integer or real
+    // (bigint, float4, float8, a domain over one) is checked as that base: named as itself it
+    // reached ArrayEncode's catch-all for custom types, which checks nothing, so '{1.5,abc}' was
+    // stored in a float8[] (ultrareview of fastest-wire, finding 2). Other bases (bytea, a struct)
+    // keep the catch-all.
+    let element_ty = numeric_base_without_encode(resolver, &col.ty_str).unwrap_or(&col.ty_str);
+    let is_any = element_ty.eq_ignore_ascii_case("ANY");
     let is_multidim = col.array_dimensions() > 1;
     let col_name = col.name.as_deref().unwrap_or("");
     let element_affinity = if is_any || is_multidim {
         Affinity::Blob
     } else {
-        Affinity::affinity(&col.ty_str)
+        Affinity::affinity(element_ty)
     };
     let element_type = if is_any || is_multidim {
         "ANY".into()
     } else {
-        col.ty_str.to_uppercase().into()
+        element_ty.to_uppercase().into()
     };
     program.emit_insn(Insn::ArrayEncode {
         data: Box::new(ArrayEncodeData {
@@ -331,4 +337,25 @@ pub(crate) fn emit_custom_type_decode_columns(
         program.preassign_label_to_next_insn(skip_label);
     }
     Ok(())
+}
+
+/// The integer or real base `ty` stands for when neither it nor any type it is declared over has
+/// an ENCODE; None otherwise.
+pub(super) fn numeric_base_without_encode<'a>(
+    resolver: &'a Resolver,
+    ty: &'a str,
+) -> Option<&'a str> {
+    // A type is declared over an existing one and a cycle is refused at CREATE, so the chain
+    // ends, as resolve_base_type_chain's does.
+    let mut ty = ty;
+    loop {
+        let Some(type_def) = resolver.schema().get_type_def_unchecked(ty) else {
+            return matches!(Affinity::affinity(ty), Affinity::Integer | Affinity::Real)
+                .then_some(ty);
+        };
+        if type_def.encode().is_some() {
+            return None;
+        }
+        ty = type_def.base();
+    }
 }

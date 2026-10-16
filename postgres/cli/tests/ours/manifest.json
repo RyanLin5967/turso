@@ -1,0 +1,382 @@
+{
+  "base": "a8f4eab84d350aa31fd2daa5bbe9d7ed1dddeef8",
+  "observer_sha256": "6117bbe634fc53d2e62a41df7de9bab883b11d5e8c424e49df805ffa4c227852",
+  "recordings": {
+    "pg18-arrays.out": {
+      "ours_sha256": "7cb82d8a6c120b11414ed0c34e684283641fcb8e82e76e3a83abdf586c03aae8",
+      "postgresql_sha256": "05e599142eb32b1686415e2e9ddc727b8d00e2038f8a47f838c4fc6dee681180"
+    },
+    "pg18-arrres.out": {
+      "ours_sha256": "58d9813c50a6b6c5b180338bb59180408b6533bea1d1a496be84abb655a29349",
+      "postgresql_sha256": "681923e186db73f0422d701c73b153064680c50295792703555bbe325b733bc3"
+    },
+    "pg18-audit1-lib-a_bytea_parameter_with_a_non_ascii_digit_is_refused.out": {
+      "ours_sha256": "b7292a44073fc8e80c3ce9e0076487cc9b4351a9cccd6898cc0fa5afc20b0b26",
+      "postgresql_sha256": "bec487f7215eabd221a4c959092c33d830942c712fcc7aff35aad9c846ff8c3b"
+    },
+    "pg18-audit1-lib-parameters_decode_at_postgresqls_edges.out": {
+      "ours_sha256": "c6267e0f7213fc71f97ac2ebafee34ad23dbe915ef10b3b33e5a68d1618ea240",
+      "postgresql_sha256": "800ead25a4a59df91fc1170661b7a9a80447f91b7c6b1aded1aeffed80c5e449"
+    },
+    "pg18-audit1-ws-a_bytea_parameter_with_a_non_ascii_digit_is_refused.out": {
+      "ours_sha256": "98583f088e420b99d45c0262b53376e91cb7eed524a37346736a2d1625b5c039",
+      "postgresql_sha256": "b2bf0a2e8348c47161cbd60c761b6314b1a0664005aea717d65fd1916fcb8344"
+    },
+    "pg18-audit1-ws-a_chained_or_read_only_transaction_is_refused.out": {
+      "ours_sha256": "231fa18651e1856bbe1ab366a0e87e5d6def6cab9b8f06cc01ff2faa5bc83fad",
+      "postgresql_sha256": "831bb93a04200f1d9606d81a456e28f6dd0018ea39d9134d0b874443ed8f7df1"
+    },
+    "pg18-audit1-ws-a_correlated_generate_series_column_is_scoped_to_its_select.out": {
+      "ours_sha256": "f954736b1b3d5904e33c66938186284e2e7f79dd903c4f61ca64609c6c7f95bf",
+      "postgresql_sha256": "ff251e309a9534f5a2bbe0d01740dd651ede32f180583de98633e24ce543015f"
+    },
+    "pg18-audit1-ws-a_dump_headers_settings_are_accepted.out": {
+      "ours_sha256": "da80b6ad9c72f47331e1b657d8463bc7c09c49cb21a8ced5e3d9bfdaf8afb95d",
+      "postgresql_sha256": "aa7ec15b9d87aa23d2598850fa267ff540191d2feb4d3128698614618c68a0f7"
+    },
+    "pg18-audit1-ws-a_parameter_is_typed_by_every_kind_of_from_item.out": {
+      "ours_sha256": "806f71b5ad27c8f654e5e1df091c88052508676c427731a33bf02825dc353bfd",
+      "postgresql_sha256": "2295c0e1d6d5bdf00e12fea09f0cf670fb6feff5056d0bccd1983d8f509d43d6"
+    },
+    "pg18-audit1-ws-a_parameter_over_the_simple_protocol_is_refused.out": {
+      "ours_sha256": "3b9f2f0f0b93fb86a88a95560e45448bf7eaf0ec58619514d5682c174a2c085b",
+      "postgresql_sha256": "c283bc54d803909402973363f7bf0322d0d65416cf23eda2abceb3799d1a707e"
+    },
+    "pg18-audit1-ws-a_read_only_begin_inside_a_block_is_refused.out": {
+      "ours_sha256": "d1ecb742305932ceae355981bb8410880a7c30c9be14b127a0563d900eb8f6c3",
+      "postgresql_sha256": "99838108caa4d7037018dbbab52fbcbd9b81d81225f31c3f4be440293d1b7da2"
+    },
+    "pg18-audit1-ws-a_three_part_reference_resolves_through_its_schema.out": {
+      "ours_sha256": "85052ef4e8388b59174bf0fe0261cb550ff1f96346b191393ea86a48adc1d871",
+      "postgresql_sha256": "40009560afdcadfa84daa841081ae736a3be7e26dfee5c8ecf9da30a549389c7"
+    },
+    "pg18-audit1-ws-aggregates_have_postgres_types_on_both_protocols.out": {
+      "ours_sha256": "e73676dc9f41d0f217248c315882fec7720eec1ae8cf375e8da930cd78fb8624",
+      "postgresql_sha256": "ca5100a36afb20c909f3398c53785aba62560637b74334ea5f28376ffae520b8"
+    },
+    "pg18-audit1-ws-checkpoint_inside_a_block_keeps_the_block.out": {
+      "ours_sha256": "698a72bb4dd9e48beaa0b14deffc3c906f99ec51a82fd5c3e44e5da39bd30d25",
+      "postgresql_sha256": "416058d83dd38ab57ae8c65c9d30cf10bd3a1a7b9cf201a212c087137fb200dc"
+    },
+    "pg18-audit1-ws-delete_using_deletes_only_the_joined_rows.out": {
+      "ours_sha256": "fcdf185b21663d527f6fd84e715ea7c189399981bed9d116d511ee8d3d584f98",
+      "postgresql_sha256": "31f20ea0957055c7f687ee08557c078bbab6eb91692535e9222e444ed3441b23"
+    },
+    "pg18-audit1-ws-delete_using_reads_one_namespace.out": {
+      "ours_sha256": "0b957bc7f2e7eae9f82731e83117e92e6de2333db85c336ce1f786f8a146bfe5",
+      "postgresql_sha256": "272057657e6e48768cff10fd3a1483e25e9013688886735b5665f52fc5641bd9"
+    },
+    "pg18-audit1-ws-delete_using_returning_a_using_column_is_refused.out": {
+      "ours_sha256": "ec40072a83708055c8b8e229765b1fd1e26d7531621c5d318d4a3bf72c274b6e",
+      "postgresql_sha256": "faf122a8d8685d202c515ebb0e59c380492c741fdff9d38ca8edcfbb1c6b34d7"
+    },
+    "pg18-audit1-ws-delete_using_returning_resolves_a_bare_name_over_both.out": {
+      "ours_sha256": "9f3bd1f2c8e77feec7b83f0142d8e2f84aa7209c8307bdc05a18413d84a86b9c",
+      "postgresql_sha256": "daf5512ab01297efb54a95487930ce896f5edd1a5d263fbf4091ee48e34ffedd"
+    },
+    "pg18-audit1-ws-generate_series_may_read_the_row_it_joins.out": {
+      "ours_sha256": "764409c6c5bf011b9735d025a4124f1b16069588068bfad114c91be9082b9776",
+      "postgresql_sha256": "bbace9c3ee353b989be3baad3e1afca052c5043313b4f68e9b0001f510251799"
+    },
+    "pg18-audit1-ws-set_honours_or_refuses_each_parameter.out": {
+      "ours_sha256": "cc5f5bfdfaa9e0be93381b92899671a06211b47d4904f1267d614a53dd43b8b8",
+      "postgresql_sha256": "c0b896a780d0537bdaecfbe9ac363d1c675127b767a41a7e1b15f72d19ba0013"
+    },
+    "pg18-audit1-ws-set_operations_keep_their_grouping_and_clauses.out": {
+      "ours_sha256": "56a5c78e71f25587548cd42be4395a6216d3602732e60bd905e4f083bd7755b8",
+      "postgresql_sha256": "2fc5f6002457c10baff29cc920bc2f71766638b179cfc14ebedaa7a43910e008"
+    },
+    "pg18-audit1-ws-untyped_contexts_type_their_parameters.out": {
+      "ours_sha256": "a0a82a3990f939f72fe086b89ba488e65e2f314f53b913d94ce807c47e7b1a68",
+      "postgresql_sha256": "94781c6af75df741d7ac97424cb70e3cab9967820ffc7062321d866bf93685f1"
+    },
+    "pg18-audit2-a_create_table_with_a_serial_completes_as_create_table.out": {
+      "ours_sha256": "04a7372d8d132e103fdd7934fb2acacdf1ed50a30388e848a6fb270f909d9847",
+      "postgresql_sha256": "825d525e52c61e71e5a69c9947d0d77fdf15f198ef3fa979c765a067c31e4b9a"
+    },
+    "pg18-audit2-a_failed_commit_leaves_the_session_idle.out": {
+      "ours_sha256": "ffd08cac92a148e6c39cda13a5444a0ab2597b3d87f3c645225aa7f2ae2f4536",
+      "postgresql_sha256": "df062d170680e5126c9c0e0ede916ddf00507479ef1cf9392ee1a8107f160e04"
+    },
+    "pg18-audit2-a_refused_create_table_leaves_no_sequence.out": {
+      "ours_sha256": "1d7211eb0d18f2fca1d2c65eb8e2816142de564d5dd724b1390e840e3205b909",
+      "postgresql_sha256": "3ee3f7f198062d796ab68bf5ccd1f0f4bbbfc65e136b7ab4f9624acbffbc73b7"
+    },
+    "pg18-audit2-aggregates_report_numeric_types.out": {
+      "ours_sha256": "ca064fd2f27b08b058b8e44a51d9fcd2cbd9dd73327d9fbeca2e09da64504bb7",
+      "postgresql_sha256": "132d2a1baad30619d60c8a60f37245e105b94d56c8cc524f3e66b886931e23aa"
+    },
+    "pg18-audit2-alter_table_add_constraint_is_validated_and_atomic.out": {
+      "ours_sha256": "d54357e78722694934c573586a1f44158fae69f3f9062ee34926bda692dced96",
+      "postgresql_sha256": "a8057db2f92965e76fbc42e01b5175d09a75b8e0c167bd7bdd5b37c16634c960"
+    },
+    "pg18-audit2-alter_table_add_constraint_takes_effect_and_keeps_the_rows.out": {
+      "ours_sha256": "373865c9394add35cdbed04d75e506031d6889b4965b7760faae208f5115b0ee",
+      "postgresql_sha256": "686add7b54cfc7f2f4a6dafbb1f258a5688943061a9164464cc5cb42168c3563"
+    },
+    "pg18-audit2-alter_table_add_constraint_works_in_every_transaction_state.out": {
+      "ours_sha256": "8ed34c32a3100d4dae2c29386ba3bfe1c2aed1ff5e0adad5611262f4cde9eec6",
+      "postgresql_sha256": "85d348f1f38af33891037c36b7d75623eea59918f22784fe7b3427bd440951fc"
+    },
+    "pg18-audit2-an_error_inside_a_transaction_aborts_it_as_in_postgres.out": {
+      "ours_sha256": "4a818c4041edb431bc3c616680b7ee59bece2f72a203c7c5b063807765788778",
+      "postgresql_sha256": "aa80b0bbd472eccaa9dd799344a7c659c566b1016c143273f7f9fd2afd289066"
+    },
+    "pg18-audit2-char_n_is_blank_padded_as_in_postgres.out": {
+      "ours_sha256": "89b7d4d222126fd0142be1246d4925a9c7f0ef5c7ea5952075fcd5beebb40d90",
+      "postgresql_sha256": "fbb2c7003e242d30f5324c280a45f127e8719d8a72df08dcf5ef6a132f6acee8"
+    },
+    "pg18-audit2-ddl_statements_report_their_command_tags.out": {
+      "ours_sha256": "e10b216c7891befc08c19c6a247b70fe355bdd8665db4a40b0645ad6868f3237",
+      "postgresql_sha256": "eda55a6d141ca9472278f24629dd77aa2a3339fcbdc4be8770c343cf80fdf87e"
+    },
+    "pg18-audit2-encode_answers_as_postgresql_does.out": {
+      "ours_sha256": "0761599b441c1d59e19ba721369e77353205dfde1ca9c919549acf681f49db2c",
+      "postgresql_sha256": "22f394f38c970d7600591db3cdf3e752e7e615e014676c7bae11d0b327dafd3b"
+    },
+    "pg18-audit2-end_and_abort_report_commit_and_rollback.out": {
+      "ours_sha256": "347888a5a9932b592ec7f53e169b592ac8b0f93b578c956041f05d60778a8fc2",
+      "postgresql_sha256": "b2feb90b73b4decf008965fc4d84e90dff34fcc5d78627e072f55e8920dfbaf6"
+    },
+    "pg18-audit2-foreign_keys_are_enforced_on_the_trunk_and_on_a_branch.out": {
+      "ours_sha256": "2c9589d82e2961fb4aca9c42656b80ec5169ea9b845de7fe56c83e9852a1dc5f",
+      "postgresql_sha256": "fe8b932f3711728fc29634968aecdf0d85a12ef2ce62a1d09198ce13bb6b031f"
+    },
+    "pg18-audit2-generate_series_in_from_names_its_column_after_the_alias.out": {
+      "ours_sha256": "89ed1c9d9baa4c428e11c6851629fbec6b553785869d81fbc6ce2b28c765f1e8",
+      "postgresql_sha256": "37a297a36a02e55e7edcef89aa31e1eae03c857b631419a08a285ba649ab2db7"
+    },
+    "pg18-audit2-information_schema_describes_tables_columns_and_keys.out": {
+      "ours_sha256": "eb8d31b4555a852b055cc6d5d7c5205dd2f9afe6faddfb4e1e7a0ae6efa095bc",
+      "postgresql_sha256": "dfb960f0c2a87e529d86603b3e76be4d8e3b66548ff281f9da8624b37b50e011"
+    },
+    "pg18-audit2-pg_indexes_and_pg_database_size_answer.out": {
+      "ours_sha256": "4f95c06b75146aa22e2f0cb0e774302e37f00ecdeb97b11b6aba460baacdc572",
+      "postgresql_sha256": "8e255050bfbacde95d443a5ee7577119dd834932e3737da016fe3c65ba9ae6b7"
+    },
+    "pg18-audit2-pgbench_table_probe_runs.out": {
+      "ours_sha256": "3f82cd56752aaa2406609631b6c11850f3dd286e20b56f6230b889603166946b",
+      "postgresql_sha256": "658bd3bd112a32ae41f047e81c1541295444e511624951af60018280d2e9ce31"
+    },
+    "pg18-audit2-rollback_to_savepoint_recovers_a_failed_transaction.out": {
+      "ours_sha256": "56897b3e58d5dfceb02b867ae5d5b41d228724e29e26a126772fee37e2d9a646",
+      "postgresql_sha256": "73162fbdb03de5804d0ddb502df07093c7d0c4887a037203eedb935a0dd3e399"
+    },
+    "pg18-audit2-row_value_comparisons_work.out": {
+      "ours_sha256": "25fa43905c175e0d280e7980094661f7b8fae1b270ed3af58fad4cb09c7f4993",
+      "postgresql_sha256": "f17b7b5b0cea06fd148a9d0d1f23aeac0d5800473b70c4fab9235296b2a0c1d5"
+    },
+    "pg18-audit2-set_and_truncate_report_their_command_tags.out": {
+      "ours_sha256": "ad0f092e86a65bd83c0c38eaf1cbade35946fb8f70f292a3dd250be6dc09cc4c",
+      "postgresql_sha256": "052e39599d4318342abd37d4111d8cc680cd7517184c84f4a0dfdf656764e1bf"
+    },
+    "pg18-audit2-set_reads_every_value_it_is_given.out": {
+      "ours_sha256": "361a478ee2f6461c3e85c5d96b456c333cd0015120a09d411cc451f8f3050f00",
+      "postgresql_sha256": "9fce0f2dbf1b125544b29d39c4717db4ac100b45046aec9ffc6e7c632dcb1336"
+    },
+    "pg18-audit2-show_answers_from_the_settings_set_keeps.out": {
+      "ours_sha256": "0ef4ea630b6e8825af39db9dcae73890af3c00b387cdad79018f9cf5f647b6fa",
+      "postgresql_sha256": "66902db9fe0dbb195dbdea5437cd479655a8858ca657a4fa8839dc6280363383"
+    },
+    "pg18-audit3-a_bare_numeric_division_by_zero_is_22012.out": {
+      "ours_sha256": "94c40f69a02ee4d95c3b06479941475d4e33483477da1e97deb25c7c0e0a4049",
+      "postgresql_sha256": "99f7afba78d81ce1c9d7dad60cf448fb8d9aae3182cacd9553e3e1965b059f65"
+    },
+    "pg18-audit3-a_branch_call_parameter_past_the_limit_is_refused.out": {
+      "ours_sha256": "e3f57463e4ee26550e37e06c6ecc800e539ba2ea383425743596546927ba44c0",
+      "postgresql_sha256": "9880c06675edf8d9949a63d4732a69798fd455b0985cd4fa92616e8ca24eaf85"
+    },
+    "pg18-audit3-a_deferred_foreign_key_is_checked_at_commit.out": {
+      "ours_sha256": "cb813bf5816036a3605b0c5c2aaf40c8d560b81d9bc814deb1ca9591994bf519",
+      "postgresql_sha256": "aa3738818769700f5c5adcbd8284528484aad5c278197c642b3bef98bd2b02ba"
+    },
+    "pg18-audit3-a_from_functions_arguments_read_the_items_before_it.out": {
+      "ours_sha256": "10031b33f1b8bbb823cdfedcad8d51a17045ec5089555c80f36cb78aaa491bf1",
+      "postgresql_sha256": "3345bedc262d313407fe313af5254985b2528a6726e5f0a9b21fc38bc6e7887c"
+    },
+    "pg18-audit3-a_mistyped_commit_or_rollback_aborts_the_block.out": {
+      "ours_sha256": "566e01aedde7653101471e098f030fec2fa9d98ff9c2b309b259085661bef05f",
+      "postgresql_sha256": "9d8223307ffdb7d119894fbbc3a54370a79e4e657c7ba2032855c1a9834bade9"
+    },
+    "pg18-audit3-a_multi_statement_query_is_one_implicit_transaction.out": {
+      "ours_sha256": "6b134dfb99bb6ae592edca2d13af76fdbc5f76d5ce0f48f51779f71439d9c525",
+      "postgresql_sha256": "c12d8427ac2b68e49e4ff3b455ddc51f6dacaa2fe4ff778f23cab3ea7ad7356a"
+    },
+    "pg18-audit3-a_numeric_division_by_zero_is_22012.out": {
+      "ours_sha256": "22339f10cba077ae7a0902d7b50843b4dd323004330cacfb69e9eb9dcf5986cb",
+      "postgresql_sha256": "f2307cfbe758bef3ca33898f79d7c34e1fc6b1c8e5f508c26c8d5037bd8960bb"
+    },
+    "pg18-audit3-a_parameter_is_typed_from_the_relation_the_engine_writes.out": {
+      "ours_sha256": "52032d32244e52f6e9c2d49c3b789ee20d334cc49c364e763b3d46f7a51ba077",
+      "postgresql_sha256": "7bbdfed77feeb77c87f60fa11b628fcdb058a4c044bebb330f24b606c1f01204"
+    },
+    "pg18-audit3-a_parameter_number_past_the_limit_is_refused.out": {
+      "ours_sha256": "91738418ce33615f3c2db3bdd45179de86998c8466e34a31ade3386c1f617ac5",
+      "postgresql_sha256": "0980966c6eb39ec887c74bec23ac38e340f3404d4a84d6da0f4642ca2edd207e"
+    },
+    "pg18-audit3-a_parameter_number_the_scanner_would_wrap_is_refused.out": {
+      "ours_sha256": "3cda63467bbe254d675e6d09499afd16baeb4ea50f96f9756915ac8cf167619a",
+      "postgresql_sha256": "74937a3e1be61de652708da6121de000cd81d163ad3bd26ebfa7f8835fd5af4e"
+    },
+    "pg18-audit3-a_view_over_public_t_types_its_parameters.out": {
+      "ours_sha256": "2b0d817674e3924b976a511cc6db835510ad247402c8c61f0480696c03d3eafa",
+      "postgresql_sha256": "a89afd83aa7caeb239cce420ef840195acece572b1ec9f011017872383ead3a9"
+    },
+    "pg18-audit3-an_explicit_public_qualifier_names_public.out": {
+      "ours_sha256": "393595784ce3a2af935add2554dd1a0917686da9a825dde9a4f256ef37bee15f",
+      "postgresql_sha256": "dc3d2d1c296d983d9b8d8f62f73554701877005c2a782853871b8ff5b09167ea"
+    },
+    "pg18-audit3-an_index_on_a_qualified_table_is_that_tables.out": {
+      "ours_sha256": "7b0cf45b5a707034ec725d081ed9dba58a96dbe9debbf0488ffc41bde2ae88aa",
+      "postgresql_sha256": "94c3ff13d9192930132fc18124d007d406909716e83976d36fa1d8ff708ed399"
+    },
+    "pg18-audit3-an_undeclared_parameter_has_its_inferred_type_at_describe_and_bind.out": {
+      "ours_sha256": "88b5795ab5047645ca295b696dcbeab57f5a00cbc0bf641481e8eb9fa299a3f9",
+      "postgresql_sha256": "1bd79b5f039e10bda96c812432d3ff6a79f43fa9cab3df22d4f182e658562625"
+    },
+    "pg18-audit3-an_unqualified_relation_is_resolved_as_the_engine_resolves_it.out": {
+      "ours_sha256": "f7a1728dc79930434b87a2b4cfd473fb85c3a36493498558d5a0fabf8929b987",
+      "postgresql_sha256": "be23a42ae37bd9da532559947445b214653878fe875c6741b79592d35f6bca3b"
+    },
+    "pg18-audit3-copy_from_runs_inside_the_block_it_is_in.out": {
+      "ours_sha256": "d36c18e8e2fb5ee7dfa7033ce50e2fd337ff7f304097ac2d9d59cd001edf5ffc",
+      "postgresql_sha256": "bb9bc92d1d18c8e5b95e121f4a25e0220e9cbf93ce23a05775ba8fd5f1e9af31"
+    },
+    "pg18-audit3-copy_refuses_an_option_it_does_not_implement.out": {
+      "ours_sha256": "828c875623ef4931df09833b088aeddb926d9820ea780c291b1d1348d4ef2040",
+      "postgresql_sha256": "905aad054bb6d7f1ab8e9b1d8ecdf47c567d6e4f69e6e58d8152fd6719d5a53e"
+    },
+    "pg18-audit3-engine_errors_carry_postgres_sqlstates.out": {
+      "ours_sha256": "c657efafb21954015ad83f258199f14b698f1ef770c6a0ae258e1f63fe615d9f",
+      "postgresql_sha256": "0e7173bbe6e071495e2b43fa4e383b161527b8e9cb8dc0b22fca4ac310abfa6a"
+    },
+    "pg18-audit3-every_parameter_in_the_text_is_a_parameter.out": {
+      "ours_sha256": "d562fc7315195b1208536362929b527d10d0949e444694f7c2f014c96f1e09ae",
+      "postgresql_sha256": "44dbf404d0aafaefdabaef948531ad1c851d981ab9bd66aaa09919357563dbe9"
+    },
+    "pg18-audit3-having_without_group_by_filters_the_aggregate_row.out": {
+      "ours_sha256": "107f2649e64a1a026106400e967a81c41398a60dc332e29154a44eeca4934fa7",
+      "postgresql_sha256": "fc8d6e8d7a31f817699ac524387dc2bde696571c4fc270023269ba78a82f4884"
+    },
+    "pg18-audit3-integer_division_by_zero_is_22012.out": {
+      "ours_sha256": "e0cf9efaac9cc93f23ab256d319771708f6e97a367f60a54d06e04ed714e254c",
+      "postgresql_sha256": "0c2786cac6278268f533578c803aa67856e258778a419a451e153f72c077cf96"
+    },
+    "pg18-audit3-integer_modulo_by_zero_is_22012.out": {
+      "ours_sha256": "a4a4246813238581b25f63e4c454da91e2e9689d4a70c6e6909c9be6f690b709",
+      "postgresql_sha256": "89da76a75ec4a1b193936bc576dd8ebfb4ef394290346056ee37363fb68cdc08"
+    },
+    "pg18-audit3-primary_key_columns_are_reported_not_null.out": {
+      "ours_sha256": "e2555d1a7c394e5a90bf04aaf0f96fe5aaf5fe991a04921e1256b85f7bd62ea9",
+      "postgresql_sha256": "6b0049d3221345380f41479315d6e9d80a296abd664c105ed846cd27abf0fe06"
+    },
+    "pg18-bytea.out": {
+      "ours_sha256": "2a4237127b7baf24c3a3a5649cb5b53a50a9eb984eb9710539c7b74417b30d0f",
+      "postgresql_sha256": "c0f75f725dcc9e124bd30842a0f5e491677006a3eb5b8d2db0183377d06f304a"
+    },
+    "pg18-c33-engineerr.out": {
+      "ours_sha256": "f6059a0d3e691a39747adc3e6a3635ef36b267518c894b4a54831463f8b4e90a",
+      "postgresql_sha256": "495d89bae9efff4bcd3bc63e56d1650fe21f82d241718de3384452a47a6fdc50"
+    },
+    "pg18-c33-intrange.out": {
+      "ours_sha256": "9a496891f0acebd15da42c425477a27833c44e41f99e1c375c56b3fbe0aa5328",
+      "postgresql_sha256": "0e2e330d554eff20f4fdf56bd99188cdd9292b0d06940d4ff100f5dcf249b791"
+    },
+    "pg18-c33.out": {
+      "ours_sha256": "45de659d8bedeb57817f26ae00d274e6611264b35556791b62d28672fadbe6bc",
+      "postgresql_sha256": "e4266417a3aa3258c897c3d99b5f91fd2d7ea15423abf094995e8ec6afd2d506"
+    },
+    "pg18-colnames.out": {
+      "ours_sha256": "9d8dea28e7314965747a27bb80ec259d0bbc3283efa8ccd9ebeb56aa5efc9a90",
+      "postgresql_sha256": "1314d7f44805b1948537c6e0cb27602a23e5e16067df23fde3ca361c7750ba02"
+    },
+    "pg18-derivedbool.out": {
+      "ours_sha256": "68de477d267d524c1ab7205102e011cfea0125f72003ef18a6e4c4ff33319cba",
+      "postgresql_sha256": "a05f8e2e1882c7ee1fa15c375dd211a80ea5c6171fbbf540ad2d6201de981260"
+    },
+    "pg18-float.out": {
+      "ours_sha256": "3df22435de84175622be628ded3ea64545a72fadee64d3c135c16b2cbebc1ebf",
+      "postgresql_sha256": "1404c682f9c85895cb3493b2974563434cc7138aba7819a862a50489f62309fc"
+    },
+    "pg18-gs.out": {
+      "ours_sha256": "b502e7b051c5793df57f9de1aefe1740cffcafb369ba51070a3d8dafa2ec6879",
+      "postgresql_sha256": "f7b8eb67e247c3491256a4272a5ed1ad5aacc33d7cbc553497293090c8062b35"
+    },
+    "pg18-gsinf.out": {
+      "ours_sha256": "e554b3cb2cbd6a84cc0ef15678d60ca5dbea665ea7ccfe41b45d6b7c450f69a3",
+      "postgresql_sha256": "ba3ce2426a568bd01c104de357e2069dd5e6df434371a4c9cb57e93159effe9a"
+    },
+    "pg18-gsstar.out": {
+      "ours_sha256": "55e324eb1d60ba79e30db0c6a66d2f331fc267654fe5134524e9e78cbba12339",
+      "postgresql_sha256": "16ab6d9d51085ed35e90fb2f99dfd2699fc162096552791208117fc16b7b3e43"
+    },
+    "pg18-ident.out": {
+      "ours_sha256": "ad6dcb271fa708691d233b0613f36a140a01150f4ec4788415ae71c0a7a8ac9d",
+      "postgresql_sha256": "9a832a32cc879aa7a3e0cbeb4f083e5d32abf372b663cc874767eb1c8338d94f"
+    },
+    "pg18-inf.out": {
+      "ours_sha256": "93dd86fca6145b687ddc58d735e846ba0600098c376b3c79b9c585f5188a83d4",
+      "postgresql_sha256": "de119f56faadfe659400e9fb3a7c8c5c0624f50960ab49f966c93dc30e1f6b66"
+    },
+    "pg18-infcast.out": {
+      "ours_sha256": "33e50574a0bfb0c159dc3cacacd2fbd0bd2d339cfef1193c30cd7d75a2c1d99d",
+      "postgresql_sha256": "8f2dd8ab24374e922bdfdcea7e3db8e4fc3b1fd8dc5ff2fac956c7e49cacd421"
+    },
+    "pg18-inherits.out": {
+      "ours_sha256": "1dd4fa4dde3d7f862747e22dc210bf10c02dcbb684a5878e6be1894231b6e9d6",
+      "postgresql_sha256": "dcc54c98e655ac8cba8bc3e4f6531a1cfb2ea8467353635ff53cb34163419e84"
+    },
+    "pg18-insdef.out": {
+      "ours_sha256": "c560afe74a493a3726dce90a32b77a08cabda02ac21ec7d56b2ea88169645d0a",
+      "postgresql_sha256": "ec9f67630afc4c6cb7d901a8259e13881f94c93dfeed55f862b631b56dacd8f7"
+    },
+    "pg18-join1.out": {
+      "ours_sha256": "06ed8bb0acf85e9a93620f79b08712c7b575953e7537d2b1409fdd55d3df1cab",
+      "postgresql_sha256": "f275177ef9f10a141207f1ca51ebfaae8c6cf2d4ca822782a2f69a41a46b9232"
+    },
+    "pg18-join1b.out": {
+      "ours_sha256": "01317235acb6a1faec53511ea04578f0d02e0cfef9e96ea44e3ba27305d1d19c",
+      "postgresql_sha256": "7ea4e542a3ccf451ba137b4d0228cc15f15119b4503351dec28ebf72189f6166"
+    },
+    "pg18-join2.out": {
+      "ours_sha256": "40ba6374fb4d1510fd38740986093fc785546ec09a5ff2acf9845f68c016a675",
+      "postgresql_sha256": "2436e5d9f5ce046ad5c3230a941e4cb91ec14c7e4caf166480616e5a2cff95d8"
+    },
+    "pg18-nullorder.out": {
+      "ours_sha256": "266b13d150edc2669404b3c4665a5b9bfb3f15ef3f77ddb01316c48cba0ab7e3",
+      "postgresql_sha256": "d82a163ed01fd619ddb5e754082def3673ffb54ea24cac0721eeb623965b7614"
+    },
+    "pg18-num.out": {
+      "ours_sha256": "65ff36ead93da978bc48212d1d9a557fadc1d1c9f34b0322f6d9d4fc24f54557",
+      "postgresql_sha256": "2edbedca08c7a516fb1dda3ab1addd74d63fb73b87bb7df0d1ac0047b1cc659b"
+    },
+    "pg18-r14.out": {
+      "ours_sha256": "fac46f6e37985de42ca52683f634c7caa972650dacf039cfb61140fd16de2a41",
+      "postgresql_sha256": "59c4a0397251922744e5373b883b18fe9f0f9880f3ed6adde1600e7e161b9273"
+    },
+    "pg18-r15.out": {
+      "ours_sha256": "896a8427a3311f4d544e7d9b6ef54d2e303b69f6ed6c0db00e4c55c27e6d7694",
+      "postgresql_sha256": "89a497698011068acd9482f69566917c7b5273726c50579b2c83e703a7297488"
+    },
+    "pg18-random.out": {
+      "ours_sha256": "28fa754f13381b99f8a6ff1ef7891c2154ed77972e4e33b81566db3a1252ebe9",
+      "postgresql_sha256": "ee48b351657f1a5165df995465804b4de3204329e876de1b1dc50e6e03829f3e"
+    },
+    "pg18-short.out": {
+      "ours_sha256": "4319f5c9d2bcfb1c3a9f672d23c939d523384469ed052173f548250cbd2b120a",
+      "postgresql_sha256": "109fb2820d88d6cd0a8684dc7f4d59347c388ef3af6c696245cd099bee74e7b9"
+    },
+    "pg18-tablestar.out": {
+      "ours_sha256": "55cfcb167be80e789eff75104e2fff0bed7c5cc5125db067bd232627c9a7de58",
+      "postgresql_sha256": "28c54c97e937f685a109a69f34d87d12cd0ec7d663c0306099b6e669926f31d3"
+    },
+    "pg18-types.out": {
+      "ours_sha256": "620783edd1add8e627e640cb4a81559e92ad2e7c7adf0a023c703b27176aacdc",
+      "postgresql_sha256": "bc0abe3b539ca3226964c82dd425209b2a9ad08390990893114d3d936b51b5b5"
+    },
+    "pg18.out": {
+      "ours_sha256": "bc0319ce4e55f48f90a1329ada499f3073d18cb29c43a96a9b0bb68f4a68466e",
+      "postgresql_sha256": "4ed1743d425ef7220cbac35ea535d93081ef77182e47fa56c2da28b899e63611"
+    }
+  }
+}

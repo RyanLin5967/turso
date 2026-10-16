@@ -25,8 +25,10 @@ pub(crate) fn resolve_scalar(name: &str, arg_count: usize) -> bool {
         "format_type" | "pg_get_constraintdef" | "pg_get_indexdef" | "obj_description" => &[1, 2],
         "pg_get_expr" => &[2, 3],
         "to_char" | "pg_input_is_valid" | "booleq" | "boolne" | "col_description" | "bpchareq"
-        | "bpcharlt" => &[2],
+        | "encode" | "bpcharlt" => &[2],
         "version" | "current_database" | "current_schema" | "pg_backend_pid" => &[0],
+        "make_date" => &[3],
+        "make_timestamp" => &[6],
         _ => return false,
     };
     arities.contains(&(arg_count as i64))
@@ -41,6 +43,9 @@ pub(crate) fn exec_scalar(conn: &Connection, name: &str, args: &[Value]) -> Resu
         _ => String::new(),
     };
     match name {
+        // PostgreSQL refuses a date past the range (22008) where the SQLite dialect answers NULL.
+        "make_date" => turso_core::make_date_or_refuse(args),
+        "make_timestamp" => turso_core::make_timestamp_or_refuse(args),
         "pg_get_userbyid" => Ok(exec_pg_get_user_by_id(int_arg(0, 0))),
         "pg_table_is_visible" | "pg_function_is_visible" | "pg_type_is_visible" => {
             Ok(exec_pg_is_visible(int_arg(0, 0)))
@@ -49,6 +54,7 @@ pub(crate) fn exec_scalar(conn: &Connection, name: &str, args: &[Value]) -> Resu
         "pg_get_indexdef" => Ok(exec_pg_get_indexdef(conn, int_arg(0, 0))),
         "pg_encoding_to_char" => Ok(exec_pg_encoding_to_char(int_arg(0, 0))),
         "format_type" => Ok(exec_pg_format_type(int_arg(0, 0), int_arg(1, -1))),
+        "encode" => exec_encode(args),
         "to_char" => Ok(exec_to_char(
             args.first().unwrap_or(&Value::Null),
             &text_arg(1),
@@ -281,6 +287,93 @@ fn exec_pg_get_expr(args: &[Value]) -> Result<Value> {
             "Expected text value".to_string(),
         )),
     }
+}
+
+/// PostgreSQL's encode(bytea, format): `hex` (two lower-case digits a byte), `base64` (lines of 76
+/// characters, as encode.c breaks them) or `escape` (a backslash doubled, a zero byte or one with
+/// the high bit set as `\nnn` in octal, every other byte itself); NULL for a NULL argument (the
+/// function is strict); any other format 22023 "unrecognized encoding". A text argument is read as
+/// bytea input reads it: `\x` followed by hex digits, else its bytes. It was "no such function"
+/// (42883), so a client reading a bytea column as hex could not (found by the cloud run of
+/// bind_reads_each_parameter_in_its_format, 2026-10-10).
+fn exec_encode(args: &[Value]) -> Result<Value> {
+    let (Some(data), Some(format)) = (args.first(), args.get(1)) else {
+        return Err(LimboError::InvalidArgument(
+            "encode takes two arguments".to_string(),
+        ));
+    };
+    let format = match format {
+        Value::Null => return Ok(Value::Null),
+        Value::Text(t) => t.as_str().to_ascii_lowercase(),
+        other => other.to_string().to_ascii_lowercase(),
+    };
+    let hex_input;
+    let bytes: &[u8] = match data {
+        Value::Null => return Ok(Value::Null),
+        Value::Blob(_) => data.to_blob().unwrap_or_default(),
+        Value::Text(t) => match t.as_str().strip_prefix("\\x") {
+            Some(digits) => {
+                hex_input = (0..digits.len() / 2)
+                    .map(|i| u8::from_str_radix(&digits[2 * i..2 * i + 2], 16))
+                    .collect::<std::result::Result<Vec<u8>, _>>()
+                    .ok()
+                    .filter(|_| digits.len() % 2 == 0)
+                    .ok_or_else(|| {
+                        LimboError::Constraint("invalid input syntax for type bytea".to_string())
+                    })?;
+                &hex_input
+            }
+            None => t.as_str().as_bytes(),
+        },
+        other => {
+            hex_input = other.to_string().into_bytes();
+            &hex_input
+        }
+    };
+    let encoded = match format.as_str() {
+        "hex" => bytes.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+        "escape" => {
+            let mut out = String::with_capacity(bytes.len());
+            for &b in bytes {
+                match b {
+                    b'\\' => out.push_str("\\\\"),
+                    0 | 0x80..=0xff => out.push_str(&format!("\\{b:03o}")),
+                    _ => out.push(b as char),
+                }
+            }
+            out
+        }
+        "base64" => {
+            const ALPHABET: &[u8; 64] =
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4 + bytes.len() / 57);
+            let mut line = 0;
+            for chunk in bytes.chunks(3) {
+                if line == 76 {
+                    out.push('\n');
+                    line = 0;
+                }
+                let n = (u32::from(chunk[0]) << 16)
+                    | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+                    | u32::from(*chunk.get(2).unwrap_or(&0));
+                for i in 0..4 {
+                    if i <= chunk.len() {
+                        out.push(ALPHABET[((n >> (18 - 6 * i)) & 63) as usize] as char);
+                    } else {
+                        out.push('=');
+                    }
+                }
+                line += 4;
+            }
+            out
+        }
+        other => {
+            return Err(LimboError::InvalidArgument(format!(
+                "unrecognized encoding: \"{other}\""
+            )))
+        }
+    };
+    Ok(Value::build_text(encoded))
 }
 
 fn user_tables_sorted(schema: &Schema) -> Vec<(&String, &Arc<Table>)> {

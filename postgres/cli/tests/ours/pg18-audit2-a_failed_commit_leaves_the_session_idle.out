@@ -1,0 +1,20 @@
+>> Q CREATE TABLE p(id INT PRIMARY KEY)
+   C CREATE TABLE
+   Z I
+>> Q CREATE TABLE c(id INT PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED)
+   C CREATE TABLE
+   Z I
+>> Q BEGIN
+   C BEGIN
+   Z T
+>> Q INSERT INTO c VALUES (1, 99)
+   C INSERT 0 1
+   Z T
+>> Q COMMIT
+   E S=ERROR C=23503 M=deferred foreign key constraint failed on commit
+   Z I
+>> Q SELECT count(*) FROM c
+   T oids=[20] names=['count']
+   D ['0']
+   C SELECT 1
+   Z I

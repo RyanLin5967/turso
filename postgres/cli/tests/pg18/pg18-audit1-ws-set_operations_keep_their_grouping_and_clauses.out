@@ -1,0 +1,65 @@
+>> Q DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public
+   N S=NOTICE C=00000 M=drop cascades to table t
+   C DROP SCHEMA
+   C CREATE SCHEMA
+   Z I
+>> Q CREATE TABLE t(id INT PRIMARY KEY, v TEXT)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO t VALUES (1, 'trunk')
+   C INSERT 0 1
+   Z I
+>> Q CREATE TABLE u(k INT)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO u VALUES (1), (2), (3)
+   C INSERT 0 3
+   Z I
+>> Q CREATE TABLE w(k INT)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO w VALUES (7), (8)
+   C INSERT 0 2
+   Z I
+>> Q SELECT 1 UNION SELECT 2 INTERSECT SELECT 2
+   T oids=[23] names=['?column?']
+   D ['1']
+   D ['2']
+   C SELECT 2
+   Z I
+>> Q SELECT 1 EXCEPT (SELECT 1 EXCEPT SELECT 1)
+   T oids=[23] names=['?column?']
+   D ['1']
+   C SELECT 1
+   Z I
+>> Q SELECT 1 UNION ALL (SELECT 1 UNION SELECT 1)
+   T oids=[23] names=['?column?']
+   D ['1']
+   D ['1']
+   C SELECT 2
+   Z I
+>> Q (SELECT 1 UNION SELECT 2) INTERSECT SELECT 2
+   T oids=[23] names=['?column?']
+   D ['2']
+   C SELECT 1
+   Z I
+>> Q (SELECT k FROM u ORDER BY k DESC LIMIT 1) UNION ALL (SELECT k FROM w ORDER BY k LIMIT 1)
+   T oids=[23] names=['k']
+   D ['3']
+   D ['7']
+   C SELECT 2
+   Z I
+>> Q WITH c AS (SELECT 5 AS x) SELECT x FROM c UNION ALL SELECT 2
+   T oids=[23] names=['x']
+   D ['5']
+   D ['2']
+   C SELECT 2
+   Z I
+>> Q WITH t AS (SELECT 99 AS id) SELECT id FROM t UNION ALL SELECT 2
+   T oids=[23] names=['id']
+   D ['99']
+   D ['2']
+   C SELECT 2
+   Z I
+-- postgres (PostgreSQL) 18.6 (Homebrew)   (/opt/homebrew/Cellar/postgresql@18/18.6/bin/postgres, pid 8250 serving port 62816; server_version=18.6 (Homebrew). /opt/homebrew/bin/postgres on PATH is 17.11, not used)
+-- recorded 2026-10-15T20:59:32Z against 127.0.0.1:62816 db audit1 by pgproto.py (PGPROTO_NAMES=1)

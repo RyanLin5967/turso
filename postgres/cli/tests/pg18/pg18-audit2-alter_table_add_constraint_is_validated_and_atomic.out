@@ -1,0 +1,63 @@
+>> Q CREATE TABLE p(id INT PRIMARY KEY, name TEXT)
+   C CREATE TABLE
+   Z I
+>> Q CREATE TABLE c(id INT NOT NULL, pid INT, v VARCHAR(10), n NUMERIC(8, 2), b BOOLEAN, ts TIMESTAMP, ch CHAR(3))
+   C CREATE TABLE
+   Z I
+>> Q CREATE INDEX c_v ON c(v)
+   C CREATE INDEX
+   Z I
+>> Q INSERT INTO p VALUES (1, 'one'), (2, 'two')
+   C INSERT 0 2
+   Z I
+>> Q INSERT INTO c VALUES (10, 1, 'x', 12.50, true, '2026-10-06 01:02:03', 'ab'), (11, 2, 'y', -0.01, false, NULL, NULL), (12, NULL, NULL, NULL, NULL, NULL, NULL)
+   C INSERT 0 3
+   Z I
+>> Q INSERT INTO c (id, pid) VALUES (13, 77)
+   C INSERT 0 1
+   Z I
+>> Q SELECT id, pid, v, n, b, ts, ch FROM c ORDER BY id
+   T oids=[23, 23, 1043, 1700, 16, 1114, 1042]
+   D ['10', '1', 'x', '12.50', 't', '2026-10-06 01:02:03', 'ab ']
+   D ['11', '2', 'y', '-0.01', 'f', None, None]
+   D ['12', None, None, None, None, None, None]
+   D ['13', '77', None, None, None, None, None]
+   C SELECT 4
+   Z I
+>> Q ALTER TABLE c ADD FOREIGN KEY (pid) REFERENCES p (id)
+   E S=ERROR C=23503 M=insert or update on table "c" violates foreign key constraint "c_pid_fkey"
+   Z I
+>> Q ALTER TABLE c ADD UNIQUE (pid)
+   C ALTER TABLE
+   Z I
+>> Q SELECT id, pid, v, n, b, ts, ch FROM c ORDER BY id
+   T oids=[23, 23, 1043, 1700, 16, 1114, 1042]
+   D ['10', '1', 'x', '12.50', 't', '2026-10-06 01:02:03', 'ab ']
+   D ['11', '2', 'y', '-0.01', 'f', None, None]
+   D ['12', None, None, None, None, None, None]
+   D ['13', '77', None, None, None, None, None]
+   C SELECT 4
+   Z I
+>> Q DELETE FROM c WHERE id = 13
+   C DELETE 1
+   Z I
+>> Q BEGIN
+   C BEGIN
+   Z T
+>> Q ALTER TABLE c ADD FOREIGN KEY (pid) REFERENCES p (id)
+   C ALTER TABLE
+   Z T
+>> Q ROLLBACK
+   C ROLLBACK
+   Z I
+>> Q INSERT INTO c (id, pid) VALUES (30, 99)
+   C INSERT 0 1
+   Z I
+>> Q SELECT count(*) FROM c WHERE v = 'x'
+   T oids=[20]
+   D ['1']
+   C SELECT 1
+   Z I
+exit 0
+postgres (PostgreSQL) 18.6 (Homebrew)
+recorded 2026-10-15T21:00:37Z with pgproto.py scenario-audit2-alter_table_add_constraint_is_validated_and_atomic.txt on the 62816 cluster, database audit2, Homebrew PostgreSQL 18.6 (trust auth, TCP 127.0.0.1)

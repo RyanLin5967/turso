@@ -5,7 +5,12 @@
 //!
 //!   embedded_ops --db PATH [--durability full|fsync|off] [--store catalog|snapshot]
 //!                [--rows N] [--warmup N] [--ops N] [--siblings K] [--plant extra|extra-write]
-//!                [--name-prefix P] --out FILE
+//!                [--name-prefix P] [--stepwise] --out FILE
+//!
+//! `--stepwise` runs one cycle per line read from stdin (`cycle <seq>`), answering `done <seq>` on
+//! stdout after it, and says `ready` once the seed is in: the work budget drives the embedded and wire
+//! sides cycle by cycle inside one run (lead's pre-registered amendment, 2026-10-15), as their flush
+//! steps' cost drifted between two runs one after the other.
 //!
 //! `--name-prefix P` (default `b_`) names op k's branch `P<k>`: the budget passes the prefix the wire
 //! side's spec names its branches with (`b_{run}_{c}_{i}`, so `b_w_0_` for run tag w and one
@@ -29,8 +34,9 @@
 //! Before the ops it creates `t(id INT PRIMARY KEY, v INT)` with `--rows` rows and an empty `t2(id
 //! INT)`, as the wire side's seed does through the server.
 //!
-//! Output: TSV `seq phase step start_ns end_ns cpu_ns unix_syscalls instructions`, phase `warmup`
-//! or `measure`; `cpu_ns` is the calling thread's CPU time across the step
+//! Output: TSV `seq phase step start_ns end_ns cpu_ns unix_syscalls instructions branch`, phase
+//! `warmup` or `measure`, `branch` the op's branch name (so budget.py can check, from the raw, that
+//! the two sides named their branches alike: wire review 15 item 29); `cpu_ns` is the calling thread's CPU time across the step
 //! (CLOCK_THREAD_CPUTIME_ID), and the last two are the process's unix system calls and
 //! instructions retired across it (turso_pg_server::counters, 0 where not counted). Each op starts
 //! with a `noop` step, two probes and nothing between, whose counts the budgets subtract.
@@ -76,14 +82,34 @@ struct Probe {
     ns: u64,
     cpu_ns: u64,
     counters: Option<turso_pg_server::counters::ProcessCounters>,
+    allocations: Option<u64>,
+    /// This thread's own instructions (the driver runs every step on it).
+    thread_instructions: u64,
+    /// The branch store's confirmation words written (its background writer's work).
+    confirms: u64,
+    /// This thread's own allocations (counters::thread_allocations; 0 without alloc-count).
+    thread_allocations: u64,
 }
 
 impl Probe {
-    fn now() -> Self {
+    fn now(db: &turso_core::Database) -> Self {
+        // The counters in turso_branch_work()'s order (process counters, allocations, thread
+        // counters, confirms), then the clocks: the work budget's syscall coverage check
+        // (logged = kernel + 1 + getpid per window, lead 2026-10-15) holds the two sides to one
+        // reading sequence around the kernel's count.
+        let counters = turso_pg_server::counters::process_counters();
+        let allocations = turso_pg_server::counters::allocations();
+        let thread_instructions = turso_pg_server::counters::thread_counters().map_or(0, |c| c.0);
+        let confirms = db.branch_confirm_counts()[0];
+        let thread_allocations = turso_pg_server::counters::thread_allocations();
         Self {
             ns: now_ns(),
             cpu_ns: thread_cpu_ns(),
-            counters: turso_pg_server::counters::process_counters(),
+            counters,
+            allocations,
+            thread_instructions,
+            confirms,
+            thread_allocations,
         }
     }
 }
@@ -98,6 +124,7 @@ struct Args {
     plant_extra: bool,
     plant_extra_write: bool,
     name_prefix: String,
+    stepwise: bool,
     out: String,
 }
 
@@ -109,7 +136,12 @@ fn args() -> Args {
     let mut plant_extra = false;
     let mut plant_extra_write = false;
     let mut name_prefix = "b_".to_string();
+    let mut stepwise = false;
     while let Some(k) = a.next() {
+        if k == "--stepwise" {
+            stepwise = true;
+            continue;
+        }
         let mut v = || a.next().unwrap_or_else(|| panic!("{k} needs a value"));
         match k.as_str() {
             "--db" => db = Some(v()),
@@ -150,6 +182,7 @@ fn args() -> Args {
         plant_extra,
         plant_extra_write,
         name_prefix,
+        stepwise,
         out: out.expect("--out"),
     }
 }
@@ -160,14 +193,13 @@ fn run(conn: &PgConnection, sql: &str) {
 
 fn main() {
     let a = args();
+    // The server's options (database_opts), less the tursopg binary's `turso_cli()`, which exists
+    // only under core's cli_only feature (this crate does not enable it, so the call did not
+    // compile: the cloud's all-targets build at abefd2e71) and only allows loading extensions,
+    // which no operation measured here does.
     let opts = turso_pg_server::database_opts(a.branches);
-    let (_io, db) = turso_pg::open_database(
-        &a.db,
-        None,
-        turso_core::OpenFlags::default(),
-        opts.turso_cli(),
-    )
-    .unwrap();
+    let (_io, db) =
+        turso_pg::open_database(&a.db, None, turso_core::OpenFlags::default(), opts).unwrap();
     // The session's trunk connection, as a server session opens it.
     let trunk = PgConnection::new(db.connect().unwrap());
     turso_pg::attach_schema_files(&trunk, &a.db);
@@ -186,9 +218,10 @@ fn main() {
     let mut out = std::io::BufWriter::new(std::fs::File::create(&a.out).unwrap());
     writeln!(
         out,
-        "seq\tphase\tstep\tstart_ns\tend_ns\tcpu_ns\tunix_syscalls\tinstructions"
+        "seq\tphase\tstep\tstart_ns\tend_ns\tcpu_ns\tunix_syscalls\tinstructions\tbranch\tallocations\tthread_instructions\tconfirms\tthread_allocations"
     )
     .unwrap();
+    let prefix = a.name_prefix.clone();
     let mut rec = |seq: u64, phase: &str, step: &str, t0: Probe, t1: Probe| {
         let (s0, i0) = t0
             .counters
@@ -196,41 +229,58 @@ fn main() {
         let (s1, i1) = t1
             .counters
             .map_or((0, 0), |c| (c.unix_syscalls, c.instructions));
+        // NA where the build counts no allocations (no `alloc-count`): budget.py refuses it.
+        let allocations = match (t0.allocations, t1.allocations) {
+            (Some(a0), Some(a1)) => (a1 - a0).to_string(),
+            _ => "NA".to_string(),
+        };
         writeln!(
             out,
-            "{seq}\t{phase}\t{step}\t{}\t{}\t{}\t{}\t{}",
+            "{seq}\t{phase}\t{step}\t{}\t{}\t{}\t{}\t{}\t{prefix}{seq}\t{allocations}\t{}\t{}\t{}",
             t0.ns,
             t1.ns,
             t1.cpu_ns - t0.cpu_ns,
             s1 - s0,
-            i1 - i0
+            i1 - i0,
+            t1.thread_instructions - t0.thread_instructions,
+            t1.confirms - t0.confirms,
+            t1.thread_allocations - t0.thread_allocations
         )
         .unwrap();
     };
+    let mut control = std::io::stdin().lines();
+    if a.stepwise {
+        println!("ready");
+        std::io::stdout().flush().unwrap();
+    }
     for seq in 0..a.warmup + a.ops {
+        if a.stepwise {
+            let line = control.next().expect("--stepwise: stdin ended").unwrap();
+            assert_eq!(line, format!("cycle {seq}"), "--stepwise: out of step");
+        }
         let phase = if seq < a.warmup { "warmup" } else { "measure" };
         let name = format!("{}{seq}", a.name_prefix);
         let id = 1 + (seq * 7919) % a.rows;
 
         // Two probes with nothing between: what the probes themselves cost, for the budget to
         // subtract (the wire side subtracts its empty query the same way).
-        let p0 = Probe::now();
-        let p1 = Probe::now();
+        let p0 = Probe::now(&db);
+        let p1 = Probe::now(&db);
         rec(seq, phase, "noop", p0, p1);
 
-        let p0 = Probe::now();
+        let p0 = Probe::now(&db);
         trunk.inner().create_branch(&name).unwrap();
         if a.plant_extra {
             run(&trunk, &format!("INSERT INTO t2 VALUES ({seq})"));
         }
-        rec(seq, phase, "create", p0, Probe::now());
+        rec(seq, phase, "create", p0, Probe::now(&db));
 
-        let p0 = Probe::now();
+        let p0 = Probe::now(&db);
         let branch = PgConnection::new(db.connect_named(&name).unwrap());
         branch.adopt_session_of(&trunk);
-        rec(seq, phase, "switch", p0, Probe::now());
+        rec(seq, phase, "switch", p0, Probe::now(&db));
 
-        let p0 = Probe::now();
+        let p0 = Probe::now(&db);
         let mut stmt = branch
             .prepare(format!("UPDATE t SET v = v + 1 WHERE id = {id}"))
             .unwrap();
@@ -240,16 +290,25 @@ fn main() {
         if a.plant_extra_write {
             run(&branch, &format!("INSERT INTO t2 VALUES ({seq})"));
         }
-        rec(seq, phase, "write", p0, Probe::now());
+        rec(seq, phase, "write", p0, Probe::now(&db));
 
-        let p0 = Probe::now();
+        let p0 = Probe::now(&db);
         trunk.adopt_session_of(&branch);
         drop(branch);
-        rec(seq, phase, "main", p0, Probe::now());
+        rec(seq, phase, "main", p0, Probe::now(&db));
 
-        let p0 = Probe::now();
+        let p0 = Probe::now(&db);
         db.drop_branch(&name).unwrap();
-        rec(seq, phase, "delete", p0, Probe::now());
+        rec(seq, phase, "delete", p0, Probe::now(&db));
+        if a.stepwise {
+            println!("done {seq}");
+            std::io::stdout().flush().unwrap();
+        }
     }
     out.flush().unwrap();
 }
+
+/// The wire budget's allocation counter (feature `alloc-count`, budget builds only).
+#[cfg(feature = "alloc-count")]
+#[global_allocator]
+static ALLOC: turso_pg_server::counters::CountingAlloc = turso_pg_server::counters::CountingAlloc;

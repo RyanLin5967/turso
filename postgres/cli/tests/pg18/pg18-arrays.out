@@ -1,0 +1,28 @@
+>> Q CREATE TABLE n(a INET[], c CIDR[], m MACADDR[], o OID[])
+   C CREATE TABLE
+   Z I
+>> D - SELECT 1 FROM n WHERE a = $1
+   ParseComplete
+   t params=[1041]
+   T oids=[23]
+   Z I
+>> D - SELECT 1 FROM n WHERE c = $1
+   ParseComplete
+   t params=[651]
+   T oids=[23]
+   Z I
+>> D - SELECT 1 FROM n WHERE m = $1
+   ParseComplete
+   t params=[1040]
+   T oids=[23]
+   Z I
+>> D - SELECT 1 FROM n WHERE o = $1
+   ParseComplete
+   t params=[1028]
+   T oids=[23]
+   Z I
+>> D - SELECT 1 FROM n WHERE $1 = ANY(a)
+   ParseComplete
+   t params=[869]
+   T oids=[23]
+   Z I

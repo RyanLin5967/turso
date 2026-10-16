@@ -1,0 +1,24 @@
+>> Q CREATE TABLE ix(id INT PRIMARY KEY, a INT, b TEXT UNIQUE)
+   C CREATE TABLE
+   Z I
+>> Q CREATE INDEX ix_a ON ix(a)
+   C CREATE INDEX
+   Z I
+>> Q SELECT indexname FROM pg_indexes WHERE tablename = 'ix' ORDER BY indexname
+   T oids=[25] names=['indexname']
+   D ['ix_a']
+   D ['ix_b_key']
+   D ['ix_pkey']
+   C SELECT 3
+   Z I
+>> Q SELECT indexname FROM pg_indexes WHERE tablename = 'ix' AND indexname NOT LIKE '%_pkey' ORDER BY 1
+   T oids=[25] names=['indexname']
+   D ['ix_a']
+   D ['ix_b_key']
+   C SELECT 2
+   Z I
+>> Q SELECT pg_database_size(current_database())
+   T oids=[25] names=['pg_database_size']
+   D ['24728']
+   C SELECT 1
+   Z I

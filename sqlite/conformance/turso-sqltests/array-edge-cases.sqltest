@@ -872,6 +872,89 @@ expect error {
     cannot store TEXT value in REAL
 }
 
+# An array of a built-in type with no ENCODE checks its elements as the type's base: float8[] and
+# float4[] as REAL, bigint[] as INTEGER. Named as themselves they reached ArrayEncode's catch-all
+# for custom types and stored a text element (ultrareview of fastest-wire, finding 2).
+test float8-array-rejects-a-text-element {
+    CREATE TABLE fa1 (id INTEGER PRIMARY KEY, vals float8[]) STRICT;
+    INSERT INTO fa1 VALUES (1, '{1.5,abc}');
+}
+expect error {
+    cannot store TEXT value in REAL
+}
+
+test float4-array-rejects-a-text-element {
+    CREATE TABLE fa2 (id INTEGER PRIMARY KEY, vals float4[]) STRICT;
+    INSERT INTO fa2 VALUES (1, '{1e}');
+}
+expect error {
+    cannot store TEXT value in REAL
+}
+
+test bigint-array-rejects-a-text-element {
+    CREATE TABLE fa3 (id INTEGER PRIMARY KEY, vals bigint[]) STRICT;
+    INSERT INTO fa3 VALUES (1, '{1,x}');
+}
+expect error {
+    cannot store TEXT value in INTEGER
+}
+
+# Through a domain too: a domain over float8 has no ENCODE either (fresh-context review of the
+# ultrareview fixes).
+test float8-domain-array-rejects-a-text-element {
+    CREATE DOMAIN d8 AS float8;
+    CREATE TABLE fa5 (id INTEGER PRIMARY KEY, vals d8[]) STRICT;
+    INSERT INTO fa5 VALUES (1, '{1.5,abc}');
+}
+expect error {
+    cannot store TEXT value in REAL
+}
+
+# However deep the domains: 17 nested over float8 (a walk that stopped at 16 left them unchecked).
+test deep-domain-array-rejects-a-text-element {
+    CREATE DOMAIN dd0 AS float8;
+    CREATE DOMAIN dd1 AS dd0;
+    CREATE DOMAIN dd2 AS dd1;
+    CREATE DOMAIN dd3 AS dd2;
+    CREATE DOMAIN dd4 AS dd3;
+    CREATE DOMAIN dd5 AS dd4;
+    CREATE DOMAIN dd6 AS dd5;
+    CREATE DOMAIN dd7 AS dd6;
+    CREATE DOMAIN dd8 AS dd7;
+    CREATE DOMAIN dd9 AS dd8;
+    CREATE DOMAIN dd10 AS dd9;
+    CREATE DOMAIN dd11 AS dd10;
+    CREATE DOMAIN dd12 AS dd11;
+    CREATE DOMAIN dd13 AS dd12;
+    CREATE DOMAIN dd14 AS dd13;
+    CREATE DOMAIN dd15 AS dd14;
+    CREATE DOMAIN dd16 AS dd15;
+    CREATE TABLE fa7 (id INTEGER PRIMARY KEY, vals dd16[]) STRICT;
+    INSERT INTO fa7 VALUES (1, '{1.5,abc}');
+}
+expect error {
+    cannot store TEXT value in REAL
+}
+
+# A bytea[] keeps what it took before: only integer and real bases are checked as their base.
+test bytea-array-keeps-a-text-element {
+    CREATE TABLE fa6 (id INTEGER PRIMARY KEY, vals bytea[]) STRICT;
+    INSERT INTO fa6 VALUES (1, '{abc}');
+    SELECT count(*) FROM fa6;
+}
+expect {
+    1
+}
+
+test float8-array-keeps-its-numbers {
+    CREATE TABLE fa4 (id INTEGER PRIMARY KEY, vals float8[]) STRICT;
+    INSERT INTO fa4 VALUES (1, '{1.5,2}');
+    SELECT vals FROM fa4;
+}
+expect {
+    {1.5,2.0}
+}
+
 test double-minus-rejected {
     CREATE TABLE dm1 (id INTEGER PRIMARY KEY, vals integer[]) STRICT;
     INSERT INTO dm1 VALUES (1, '{--1}');

@@ -1,0 +1,36 @@
+>> Q CREATE TABLE t(id INT, g INT)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO t VALUES (1, 100)
+   C INSERT 0 1
+   Z I
+>> Q CREATE TABLE u(g INT)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO u VALUES (7)
+   C INSERT 0 1
+   Z I
+>> Q CREATE TABLE w(k INT)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO w VALUES (1)
+   C INSERT 0 1
+   Z I
+>> Q SELECT g FROM t, generate_series(1, 2) AS g
+   E S=ERROR C=42702 M=Parse error: ambiguous column name: g
+   Z I
+>> Q SELECT (SELECT g FROM u) FROM generate_series(1, 2) AS g ORDER BY 1
+   T oids=[25] names=['g']
+   D ['7']
+   D ['7']
+   C SELECT 2
+   Z I
+>> Q SELECT (SELECT g FROM w LIMIT 1) FROM generate_series(1, 2) AS g ORDER BY 1
+   T oids=[25] names=['g']
+   D ['1']
+   D ['2']
+   C SELECT 2
+   Z I
+>> Q SELECT (SELECT g FROM w LIMIT 1) FROM t, generate_series(5, 5) AS g
+   E S=ERROR C=42702 M=Parse error: ambiguous column name: g
+   Z I

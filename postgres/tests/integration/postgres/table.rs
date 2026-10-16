@@ -316,3 +316,79 @@ fn test_postgres_select_into_compound_rejected(db: TempDatabase) {
         "expected nested INTO rejection, got: {err}"
     );
 }
+
+/// VACUUM leaves a main-database table's stored PostgreSQL definition as it was. A table created
+/// as `public.b` keeps a `main` qualifier in its translated AST, so VACUUM's replay
+/// (table_sql_for_replay) took the branch meant for attached schemas and re-rendered it as SQLite
+/// text, which the frontend then stored marked as PostgreSQL DDL, for every later load to parse as
+/// PostgreSQL (wire review 18 item 20). The unqualified table `a` is the control: its definition
+/// replays as written at the tip, so the assertion can hold.
+#[turso_macros::test]
+fn test_postgres_vacuum_keeps_a_public_tables_definition(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE a (id INT PRIMARY KEY, v VARCHAR(10) DEFAULT 'x')")
+        .unwrap();
+    conn.execute("CREATE TABLE public.b (id INT PRIMARY KEY, v VARCHAR(10) DEFAULT 'x')")
+        .unwrap();
+    conn.execute("INSERT INTO b VALUES (1, 'one')").unwrap();
+    let raw = db.connect_limbo();
+    let stored = |name: &str| {
+        raw.prepare(format!(
+            "SELECT sql FROM sqlite_schema WHERE name = '{name}'"
+        ))
+        .unwrap()
+        .run_collect_rows()
+        .unwrap()
+        .into_iter()
+        .map(|row| match &row[0] {
+            Value::Text(t) => t.as_str().to_string(),
+            other => panic!("{name}: sql {other:?}"),
+        })
+        .collect::<Vec<_>>()
+    };
+    let before = (stored("a"), stored("b"));
+    for (name, sql) in [("a", &before.0), ("b", &before.1)] {
+        assert_eq!(sql.len(), 1, "{name}: {sql:?}");
+        assert!(
+            sql[0].starts_with("/* turso_frontend:postgres */ "),
+            "{name}: the premise, a definition stored as PostgreSQL DDL: {sql:?}"
+        );
+    }
+    assert!(before.1[0].contains("public.b"), "b: {:?}", before.1);
+    raw.execute("VACUUM").unwrap();
+    assert_eq!(stored("a"), before.0, "the control");
+    assert_eq!(stored("b"), before.1, "public.b");
+    let mut rows = conn.query("SELECT v FROM b").unwrap().unwrap();
+    let StepResult::Row = rows.step().unwrap() else {
+        panic!("expected b's row after VACUUM");
+    };
+    let Value::Text(v) = rows.row().unwrap().get_value(0) else {
+        panic!("expected text");
+    };
+    assert_eq!(v.as_str(), "one");
+}
+
+/// A three-part column reference through public names the main database's relation, as the
+/// two-part relation name does (wire review 18 item 21): `public.t.name` reads main's t, with t in
+/// FROM unqualified or as public.t. The column reference kept public as a database name, so it was
+/// "no such column" while `FROM public.t` worked (594edd413 mapped relation names only).
+#[turso_macros::test]
+fn test_postgres_three_part_public_column(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'pen')").unwrap();
+    for sql in [
+        "SELECT public.t.name FROM t WHERE public.t.id = 1",
+        "SELECT public.t.name FROM public.t WHERE public.t.id = 1",
+    ] {
+        let mut rows = conn
+            .query(sql)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"))
+            .unwrap();
+        let StepResult::Row = rows.step().unwrap() else {
+            panic!("{sql}: no row");
+        };
+        assert_eq!(rows.row().unwrap().get_value(0).to_string(), "pen", "{sql}");
+    }
+}

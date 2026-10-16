@@ -1,0 +1,31 @@
+>> Q DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public
+   C DROP SCHEMA
+   E S=ERROR C=42601 M=Parse error: schema "public" already exists
+   Z I
+>> Q CREATE TABLE s(x INT)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO s VALUES (2), (3)
+   C INSERT 0 2
+   Z I
+>> Q SELECT s.x, g FROM s, generate_series(1, s.x) AS g ORDER BY 1, 2
+   T oids=[23, 23] names=['x', 'g']
+   D ['2', '1']
+   D ['2', '2']
+   D ['3', '1']
+   D ['3', '2']
+   D ['3', '3']
+   C SELECT 5
+   Z I
+>> Q SELECT s.x, g.y FROM s, generate_series(1, s.x) AS g(y) WHERE g.y = s.x ORDER BY 1
+   T oids=[23, 23] names=['x', 'y']
+   D ['2', '2']
+   D ['3', '3']
+   C SELECT 2
+   Z I
+>> Q SELECT * FROM generate_series(1, 2) WITH ORDINALITY
+   E S=ERROR C=0A000 M=Parse error: WITH ORDINALITY is not supported on a function in FROM
+   Z I
+>> Q SELECT * FROM generate_series(1, 2) AS g(a, b)
+   E S=ERROR C=42601 M=Parse error: too many column aliases specified for function generate_series
+   Z I

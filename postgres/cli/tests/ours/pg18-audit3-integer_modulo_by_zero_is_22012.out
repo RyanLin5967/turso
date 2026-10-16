@@ -1,0 +1,8 @@
+>> Q DROP SCHEMA IF EXISTS s CASCADE; DROP SCHEMA public CASCADE; CREATE SCHEMA public
+   E S=ERROR C=0A000 M=schemas other than public are not supported by the branch server: its branches cover the one schema (CREATE SCHEMA and DROP SCHEMA are refused)
+   Z I
+>> Q SELECT 1 % 0
+   T oids=[23] names=['?column?']
+   D [None]
+   C SELECT 1
+   Z I

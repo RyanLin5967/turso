@@ -1,0 +1,5 @@
+>> Q SELECT 'Infinity'::float8, '-Infinity'::float8, 'NaN'::float8, 'Infinity'::float4, '-0'::float8
+   T oids=[701, 701, 701, 700, 701]
+   D ['Infinity', '-Infinity', 'NaN', 'Infinity', '-0']
+   C SELECT 1
+   Z I

@@ -1,0 +1,38 @@
+>> Q DROP TABLE IF EXISTS parent, child
+   N S=NOTICE C=00000 M=table "parent" does not exist, skipping
+   N S=NOTICE C=00000 M=table "child" does not exist, skipping
+   C DROP TABLE
+   Z I
+>> Q CREATE TABLE parent (k int primary key, pd int)
+   C CREATE TABLE
+   Z I
+>> Q CREATE TABLE child (k int unique, cd int)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO parent VALUES (1, 10), (2, 20)
+   C INSERT 0 2
+   Z I
+>> Q INSERT INTO child VALUES (1, 100), (4, 400)
+   C INSERT 0 2
+   Z I
+>> Q SELECT p.*, linked FROM parent p LEFT JOIN (SELECT c.*, true AS linked FROM child c) AS ss ON (p.k = ss.k) ORDER BY p.k
+   T oids=[23, 23, 16] names=['k', 'pd', 'linked']
+   D ['1', '10', 't']
+   D ['2', '20', None]
+   C SELECT 2
+   Z I
+>> Q SELECT * FROM parent p, (SELECT true AS b) s ORDER BY p.k
+   T oids=[23, 23, 16] names=['k', 'pd', 'b']
+   D ['1', '10', 't']
+   D ['2', '20', 't']
+   C SELECT 2
+   Z I
+>> Q SELECT * FROM (SELECT c.*, k > 1 AS big FROM child c) s ORDER BY k
+   T oids=[23, 23, 16] names=['k', 'cd', 'big']
+   D ['1', '100', 'f']
+   D ['4', '400', 't']
+   C SELECT 2
+   Z I
+>> Q DROP TABLE parent, child
+   C DROP TABLE
+   Z I

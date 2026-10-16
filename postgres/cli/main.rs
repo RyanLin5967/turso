@@ -109,6 +109,15 @@ struct Opts {
 
     #[clap(
         long,
+        default_value_t = turso_pg_server::DEFAULT_AUTHENTICATION_TIMEOUT_S,
+        value_parser = clap::value_parser!(u64).range(1..=600),
+        help = "With --server: how long a client has to complete its startup before the session \
+                ends, in seconds (PostgreSQL's authentication_timeout: 1 to 600, default 60)"
+    )]
+    authentication_timeout: u64,
+
+    #[clap(
+        long,
         value_enum,
         default_value_t = BranchStore::Catalog,
         help = "Where named branches live: a catalog store beside the database (the default), a \
@@ -768,8 +777,10 @@ fn print_result_set(
     table.set_header(header);
 
     stmt.run_with_row_callback(|row| {
+        // A value holding a newline spans as many lines as it holds, as psql shows it: cut to one
+        // line it read `li...`, and escape_string_backslash_n passed only while the column's
+        // header, the engine's text of the literal, held both words.
         let mut table_row = Row::new();
-        table_row.max_height(1);
         for (idx, value) in row.get_values().enumerate() {
             let (content, alignment) = match value {
                 Value::Null => ("NULL".to_string(), CellAlignment::Left),
@@ -1028,6 +1039,11 @@ fn is_exit_command(line: &str) -> bool {
 // main
 // ---------------------------------------------------------------------------
 
+/// The wire budget's allocation counter (feature `alloc-count`, budget builds only).
+#[cfg(feature = "alloc-count")]
+#[global_allocator]
+static ALLOC: turso_pg_server::counters::CountingAlloc = turso_pg_server::counters::CountingAlloc;
+
 fn main() -> anyhow::Result<()> {
     let opts = Opts::parse();
     let _guard = init_tracing(&opts)?;
@@ -1063,7 +1079,8 @@ fn main() -> anyhow::Result<()> {
             opts.max_connections,
             std::time::Duration::from_millis(opts.lock_timeout_ms),
             interrupt_count,
-        );
+        )
+        .with_startup_timeout(std::time::Duration::from_secs(opts.authentication_timeout));
         return server.run();
     }
 
