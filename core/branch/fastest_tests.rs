@@ -1424,6 +1424,66 @@ fn a_failed_fuzzy_checkpoint_gives_its_frozen_names_back() {
     assert!(db.connect().unwrap().create_branch("freed").is_ok(), "CLAIM: a released name could not be given again");
 }
 
+/// L2(d) slice 2: a fuzzy checkpoint's rows are exact to its capture although the states change
+/// while it is in flight. The writer is held before it encodes the frozen rows
+/// (`HOLD_BEFORE_ROWS`); meanwhile branch `a` is written again, `b` is dropped, and `a` forks a
+/// child: each change reaches a frozen state, so the table encodes its pre-image first. The rows
+/// the writer gets must equal the rows the capture would have built (`CAPTURE_VERIFY_FORCED`, the
+/// capture builds them too, the old way), and after a reopen every acknowledged change is there.
+/// Premise: the copy-on-write encoded at least one pre-image (`COW_PRESERVES`). Mutant
+/// `cow_preserve_skipped`.
+#[test]
+fn a_branch_changed_while_its_row_is_frozen_is_written_as_of_the_capture() {
+    use std::sync::atomic::Ordering::{Relaxed, Release};
+    let _s = serial();
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            super::store::CAPTURE_VERIFY_FORCED.store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+    let _r = Reset;
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("cow-rows.db");
+    let fuzzy = || opts(true, SyncClass::Fsync).with_branch_checkpoint(super::BranchCheckpoint::Fuzzy);
+    let incarnation = {
+        let db = open_at(&path, fuzzy());
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        trunk.create_branch("a").unwrap();
+        trunk.create_branch("b").unwrap();
+        let a = db.connect_named("a").unwrap();
+        a.execute("UPDATE t SET v = 'a1' WHERE id = 1").unwrap();
+        super::store::CAPTURE_VERIFY_FAILURES.lock().unwrap().clear();
+        super::store::CAPTURE_VERIFY_FORCED.store(true, Release);
+        let preserves0 = super::table::COW_PRESERVES.load(Relaxed);
+        db.branch_checkpoint_hold(super::store::HOLD_BEFORE_ROWS);
+        assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: a fuzzy checkpoint started");
+        let t = std::time::Instant::now();
+        while db.branch_checkpoint_held() != super::store::HOLD_BEFORE_ROWS | super::store::HOLD_ARRIVED {
+            assert!(t.elapsed() < std::time::Duration::from_secs(10), "premise: the writer never reached its rows");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        a.execute("UPDATE t SET v = 'a2' WHERE id = 2").unwrap();
+        let child = a.fork_branch().unwrap().into_id();
+        db.drop_branch("b").unwrap();
+        db.branch_checkpoint_hold(0);
+        db.branch_checkpoint_wait();
+        super::store::CAPTURE_VERIFY_FORCED.store(false, Release);
+        let preserved = super::table::COW_PRESERVES.load(Relaxed) - preserves0;
+        assert!(preserved >= 1, "premise: no change reached a frozen state while the writer was held");
+        let failures = super::store::CAPTURE_VERIFY_FAILURES.lock().unwrap().clone();
+        assert!(failures.is_empty(), "CLAIM: a fuzzy checkpoint's rows were not exact to its capture: {failures:?}");
+        let _ = child;
+        drop(a);
+        db.incarnation
+    };
+    let db = reopen(&path, fuzzy(), incarnation);
+    assert_eq!(db.branch_named("b").unwrap(), None, "after a reopen, a dropped branch resolved");
+    let a = db.connect_named("a").unwrap();
+    assert_eq!((read_v(&a, 1), read_v(&a, 2)), ("a1".to_string(), "a2".to_string()), "after a reopen, a's writes are not all there");
+}
+
 /// Review C-F3: a named server branch takes no `Branch` handle — a handle's drop would release it
 /// and a handle could lease it, and nothing but `Database::drop_branch` may end a named branch.
 #[test]
@@ -8910,9 +8970,22 @@ fn lifecycle_audit(n: u32) {
         let db = open_at(&path, opts(true, SyncClass::FullFsync));
         let trunk = db.connect().unwrap();
         seed(&trunk);
-        for i in 0..n {
-            trunk.create_branch(&format!("pop-{i:07}")).unwrap();
-        }
+        // The population, before anything is measured, by 16 connections at once so that their D2
+        // flushes are shared (FLAGGED fixture change: the 10^6 arm populated one create per
+        // F_FULLFSYNC and twice hit its budget, 90 min and 4 h, still populating: raws l70, l87).
+        // The same n named branches, the same store and sync class.
+        let workers = if n >= 100_000 { 16 } else { 1 };
+        std::thread::scope(|scope| {
+            for w in 0..workers {
+                let db = db.clone();
+                scope.spawn(move || {
+                    let conn = db.connect().unwrap();
+                    for i in (w..n).step_by(workers as usize) {
+                        conn.create_branch(&format!("pop-{i:07}")).unwrap();
+                    }
+                });
+            }
+        });
         db.incarnation
     };
     {

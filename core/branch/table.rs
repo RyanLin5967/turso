@@ -37,6 +37,11 @@ impl Preimage for u64 {
     }
 }
 
+/// Test builds: changes that reached a state whose row a freeze still owed (`BranchTable::preserve`),
+/// a test's premise that its window was hit.
+#[cfg(test)]
+pub(crate) static COW_PRESERVES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The rows a fuzzy checkpoint's capture froze (L2(d), O(1) under the store mutex): the ids it
 /// covers and their dirty bits, swapped in whole at the capture. Each is encoded once, as of the
 /// capture: by the table, the moment before the first change to its state (`get_mut`, `insert` over
@@ -163,6 +168,15 @@ impl<T: Preimage> BranchTable<T> {
     /// it now, as of the capture. O(1) when nothing is frozen or `id` is not owed.
     #[inline]
     fn preserve(&mut self, id: &BranchId) {
+        // Mutant `cow_preserve_skipped` (test builds only): a change reaches a frozen state with no
+        // pre-image, so the writer encodes it as changed (`FE_CAPTURE_VERIFY` must see it).
+        #[cfg(test)]
+        if self.frozen.as_ref().is_some_and(|f| f.pending.contains_key(id)) {
+            COW_PRESERVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if super::store::fe_mutant("cow_preserve_skipped") {
+                return;
+            }
+        }
         let Some(what) = self.frozen.as_mut().and_then(|f| f.pending.remove(id)) else {
             return;
         };

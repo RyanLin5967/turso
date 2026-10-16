@@ -2039,6 +2039,16 @@ pub(crate) const HOLD_AFTER_WAL_PASSIVE: u8 = 14;
 /// MED 8: a trunk commit that decides in this window writes a slot the settle then takes).
 #[cfg(test)]
 pub(crate) const HOLD_BEFORE_SETTLE: u8 = 15;
+/// A fuzzy checkpoint's writer, held before it encodes the rows its capture froze (L2(d)): every
+/// change to a frozen state meanwhile goes through the table's copy-on-write.
+#[cfg(test)]
+pub(crate) const HOLD_BEFORE_ROWS: u8 = 21;
+/// Test builds: compare every fuzzy checkpoint's copy-on-write rows with the capture's own
+/// (`verify_frozen_rows`), as `FE_CAPTURE_VERIFY` does for a whole run; and the differences found.
+#[cfg(test)]
+pub(crate) static CAPTURE_VERIFY_FORCED: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+pub(crate) static CAPTURE_VERIFY_FAILURES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 /// Test builds: the next fuzzy checkpoint's cut (`begin_cut`) panics (review 4 #16).
 #[cfg(test)]
 pub(crate) static CUT_PANICS: AtomicBool = AtomicBool::new(false);
@@ -3281,7 +3291,7 @@ impl super::table::Preimage for BranchState {
 /// the capture would have built, the old way, at the capture point. A mutation path that changed a
 /// frozen state without the table's preserve makes them differ: a panic naming the branch.
 #[cfg(test)]
-fn verify_frozen_rows(want: Vec<(CatBranch, u8)>, got: &[(CatBranch, u8)]) {
+fn verify_frozen_rows(want: Vec<(CatBranch, u8)>, got: &[(CatBranch, u8)]) -> std::result::Result<(), String> {
     let norm = |rows: &[(CatBranch, u8)]| {
         let mut v: Vec<_> = rows
             .iter()
@@ -3298,12 +3308,13 @@ fn verify_frozen_rows(want: Vec<(CatBranch, u8)>, got: &[(CatBranch, u8)]) {
     let (want, got) = (norm(&want), norm(got));
     if want != got {
         let diff: Vec<_> = want.iter().zip(got.iter()).filter(|(a, b)| a != b).take(3).collect();
-        panic!(
+        return Err(format!(
             "FE_CAPTURE_VERIFY: the frozen rows differ from the capture's ({} vs {} rows); first differences: {diff:?}",
             want.len(),
             got.len()
-        );
+        ));
     }
+    Ok(())
 }
 
 /// Rows a fuzzy checkpoint's writer encodes per store-mutex hold (L2(d), ASYNC-DESIGN R1.3's
@@ -3704,6 +3715,8 @@ fn run_flight(
     // `BranchTable::freeze`). Short, so the copy-on-write window is too.
     let mut cap = cap;
     if cap.rows_frozen {
+        #[cfg(test)]
+        pause_at(Some(&*hold), HOLD_BEFORE_ROWS);
         let rows = loop {
             let mut guard = inner.lock();
             if let Some(rows) = guard.branches.encode_frozen(CKPT_BATCH) {
@@ -3712,7 +3725,15 @@ fn run_flight(
         };
         #[cfg(test)]
         if let Some(want) = cap.verify.take() {
-            verify_frozen_rows(want, &rows);
+            if let Err(e) = verify_frozen_rows(want, &rows) {
+                // Recorded for the test that forced the check; a whole run under FE_CAPTURE_VERIFY
+                // stops at once, so no later test can pass over it.
+                eprintln!("{e}");
+                CAPTURE_VERIFY_FAILURES.lock().unwrap_or_else(|p| p.into_inner()).push(e);
+                if std::env::var_os("FE_CAPTURE_VERIFY").is_some() {
+                    std::process::abort();
+                }
+            }
         }
         cap.rows = rows;
     }
@@ -10721,7 +10742,8 @@ impl StoreInner {
             }
         };
         #[cfg(test)]
-        let verify = (cow && std::env::var_os("FE_CAPTURE_VERIFY").is_some()).then(|| capture_rows(&self.branches, &dirty));
+        let verify = (cow && (std::env::var_os("FE_CAPTURE_VERIFY").is_some() || CAPTURE_VERIFY_FORCED.load(Ordering::Acquire)))
+            .then(|| capture_rows(&self.branches, &dirty));
         held_trace("capture.rows");
         // The trunk: the versions retained since the last checkpoint (all in memory, none in the
         // catalog) are inserted, and the catalog versions reaped since are deleted, one row each.
