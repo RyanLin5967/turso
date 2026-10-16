@@ -6336,8 +6336,8 @@ fn deleting_a_branch_another_session_switched_onto_is_refused_with_55006() {
         .ok("delete once b left");
 }
 
-/// Inside a block, an error from a statement with no statement savepoint of its own (an integer
-/// overflow, a read) leaves the block's savepoints, as in PostgreSQL: ROLLBACK TO one ends the
+/// Inside a block, an error from a statement with no statement savepoint of its own (division
+/// by zero, a read) leaves the block's savepoints, as in PostgreSQL: ROLLBACK TO one ends the
 /// failed state, the block carries on, and COMMIT keeps the work done before the savepoint. Until
 /// the engine kept them (wire review 3 item 10, the engine's half) such an error rolled the whole
 /// transaction back, savepoints with it, and this test pinned the server's 3B001 for the vanished
@@ -10964,14 +10964,15 @@ fn an_implicit_block_follows_the_engines_transaction() {
     assert_eq!(r.err("no branch y").code, "3D000");
 }
 
-/// A simple Query inside an unsynced pipeline is part of the pipeline's implicit block, as in
-/// PostgreSQL, whatever form the Query takes: a lone BEGIN makes the block the client's (status T),
+/// Our simple Query inside an unsynced pipeline takes part in its implicit block: a lone BEGIN
+/// makes the block the client's (status T),
 /// so its ROLLBACK drops the pipeline's write and its own; a branch call refused there (25001)
 /// rolls the block back and leaves the session idle, so the next Query runs before any Sync; and
 /// turso_branch_current() or an empty Query ends the block like any other Query, committing it
 /// (status I). A lone BEGIN committed the pipeline's write and answered I; the refused call left
 /// the session failed (E, then 25P02); and the fast path and the empty Query left the block open
-/// (T) (wire review 16 item 6).
+/// (T) (wire review 16 item 6). The successful Query and empty Query arms intentionally diverge
+/// from PostgreSQL 18.6, whose next Query after Sync errors XX000; see COMPAT and c45-pg18.txt.
 #[test]
 fn a_query_in_an_unsynced_pipeline_takes_part_in_its_block() {
     let dir = Scratch::new("pipequery");
@@ -12361,5 +12362,5 @@ replays_postgresql!(
 );
 replays_postgresql!(pg18_replays_as_postgresql_answered, "pg18.out", []);
 
-#[path = "c45_regressions.rs"]
+#[path = "c45/regressions.rs"]
 mod c45_regressions;

@@ -841,6 +841,12 @@ async fn serve_session(
             // extended protocol, a skip to Sync, as PostgreSQL answers it (wire review 10 item 2;
             // postgres/vendor/pgwire/VENDORED.md).
             Some(Err(e)) => {
+                if starting && matches!(socket.get_ref(),
+                    pgwire::tokio::server::MaybeTls::Blocking(io) if io.timed_out)
+                {
+                    warn!("session ended before startup: the startup timeout passed");
+                    break Ok(());
+                }
                 error!("invalid frontend message: {}", e);
                 let info = ErrorInfo::new(
                     "FATAL".to_string(),
@@ -2064,6 +2070,12 @@ impl Session {
     /// parse, translation and compile per extended statement, not two): read its columns with
     /// [`Session::described_fields`]. A Describe of the statement already kept prepares nothing.
     fn describe_prepare(&self, sql: &str) -> PgWireResult<()> {
+        // The server performs AND CHAIN when a failed block recovers; translating it here
+        // would reject that supported path before Execute can inspect the block's state.
+        if matches!(TxVerb::of(sql), TxVerb::Chain { .. }) {
+            self.state().described = None;
+            return Ok(());
+        }
         let conn = self
             .current(&mut self.state())
             .map_err(PgWireError::UserError)?;
@@ -2652,14 +2664,14 @@ impl Shared {
 /// - Release: `RELEASE [SAVEPOINT] name`; Savepoint: `SAVEPOINT name`;
 /// - Other: anything else, malformed spellings of the above included, which go to the engine and
 ///   are syntax errors there. Read by two words, `COMMIT garbage` was answered as COMMIT and
-///   `/* c */ ROLLBACK` was not a ROLLBACK (wire review 6 item 4). `AND CHAIN` is Other: the
-///   engine has no chained transactions.
+///   `/* c */ ROLLBACK` was not a ROLLBACK (wire review 6 item 4). A Chain can recover a failed
+///   block; chaining a live block is not supported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TxVerb {
     Begin,
     Commit,
     Rollback,
-    /// COMMIT AND CHAIN or ROLLBACK AND CHAIN (`commit`: which), which the server does not run.
+    /// COMMIT AND CHAIN or ROLLBACK AND CHAIN (`commit`: which); accepted in a failed block.
     Chain {
         commit: bool,
     },
@@ -2796,7 +2808,10 @@ impl TxVerb {
 
     /// The statements a failed block still accepts.
     fn ends_block(self) -> bool {
-        matches!(self, TxVerb::Commit | TxVerb::Rollback | TxVerb::RollbackTo)
+        matches!(
+            self,
+            TxVerb::Commit | TxVerb::Rollback | TxVerb::RollbackTo | TxVerb::Chain { .. }
+        )
     }
 }
 

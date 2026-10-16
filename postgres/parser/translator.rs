@@ -6783,33 +6783,17 @@ fn select_output_names(select: &pg_query::protobuf::SelectStmt) -> Option<Vec<St
             if !t.name.is_empty() {
                 return Some(t.name.clone());
             }
-            t.val.as_deref().and_then(output_name)
+            let val = t.val.as_deref()?;
+            // A star expands to an unknown number of columns; every scalar expression has
+            // the same name here as in the translated SELECT's output.
+            if matches!(val.node.as_ref(), Some(Node::ColumnRef(c))
+                if matches!(c.fields.last().and_then(|f| f.node.as_ref()), Some(Node::AStar(_))))
+            {
+                return None;
+            }
+            Some(figure_colname(val))
         })
         .collect()
-}
-
-/// The name PostgreSQL gives an unaliased output (FigureColname), for the forms read here: a
-/// column reference's last name, a function's name, a cast's argument's name, else the type's.
-/// None for any other expression, so its relation's columns count as unknown and a bare name over
-/// them is refused rather than resolved: every other output was named `?column?`, which PostgreSQL
-/// gives only some (`SELECT id::int` is `id` there; wire review 16 item 21).
-fn output_name(node: &pg_query::protobuf::Node) -> Option<String> {
-    use pg_query::protobuf::node::Node;
-    let last = |names: &[pg_query::protobuf::Node]| match names.last().and_then(|n| n.node.as_ref())
-    {
-        Some(Node::String(s)) => Some(s.sval.clone()),
-        _ => None,
-    };
-    match node.node.as_ref()? {
-        Node::ColumnRef(c) => last(&c.fields),
-        Node::FuncCall(f) => last(&f.funcname),
-        Node::TypeCast(c) => c
-            .arg
-            .as_deref()
-            .and_then(output_name)
-            .or_else(|| c.type_name.as_ref().and_then(|t| last(&t.names))),
-        _ => None,
-    }
 }
 
 /// A DELETE ... USING's RETURNING, resolved as PostgreSQL resolves it, over the target and the
@@ -9892,4 +9876,3 @@ mod tests {
         assert_eq!(names, vec![Some("n".to_string()), Some("k".to_string())]);
     }
 }
-
