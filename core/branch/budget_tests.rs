@@ -2708,6 +2708,63 @@ fn create_logs_its_record_and_one_flight_end() {
     );
 }
 
+/// Probe-adversary-2 H1 (ruling: a budget verdict needs EVERY sample decided): with plant4 every
+/// third create costs 5 syscalls and wakes a helper, so the probe refuses exactly those creates. The
+/// create budget must then fail, RED or REFUSED, never pass on the cheap creates. Run in a child with
+/// the mutant, as the other mutant fire-checks are; its cells are its own (no raw dir).
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_budget_whose_expensive_samples_are_refused_is_never_green() {
+    if in_child() || std::env::var_os("FE_MUTANT").is_some() {
+        return;
+    }
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["branch::budget_tests::create_issues_at_most_three_syscalls", "--exact", "--test-threads=1", "--nocapture"])
+        .env("FE_MUTANT", "budget_plant_wake_on_expensive_create")
+        .env_remove("FE_BUDGET_RAW_DIR")
+        .output()
+        .unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(text.contains("running 1 test"), "premise: the budget test ran under the plant:\n{text}");
+    assert!(
+        !out.status.success(),
+        "plant4: create_issues_at_most_three_syscalls passed while every third create made 5 syscalls:\n{text}"
+    );
+    assert!(
+        text.contains("REFUSED") || text.contains("create.syscalls"),
+        "plant4: the budget failed for another reason than a refusal or the budget:\n{text}"
+    );
+}
+
+/// The selection rule itself, on samples whose values are known (none come from the subject): 16
+/// decided creates at 3 syscalls and 8 refused ones (the plant's shape). No budget may be read from
+/// the 16; the verdict is REFUSED.
+#[test]
+fn a_refused_sample_makes_the_budget_refused() {
+    let sample = |q: u64, sys: u64| -> Map { [("quiet".to_string(), q), ("syscalls".to_string(), sys)].into_iter().collect() };
+    let mut ops = BTreeMap::new();
+    ops.insert("create".to_string(), (0..24).map(|i| if i % 3 == 2 { sample(0, 7) } else { sample(1, 3) }).collect());
+    let c = CellData { name: "synthetic".to_string(), ops };
+    let got = std::panic::catch_unwind(|| quiet(&c, "create").len());
+    let msg = match got {
+        Ok(n) => panic!("a budget was read from {n} of 24 samples with 8 refused"),
+        Err(e) => e.downcast_ref::<String>().cloned().unwrap_or_default(),
+    };
+    assert!(msg.contains("REFUSED"), "the refusal is not reported as REFUSED: {msg}");
+    // The control: every sample decided, every sample read.
+    let mut ops = BTreeMap::new();
+    ops.insert("create".to_string(), (0..24).map(|_| sample(1, 3)).collect());
+    let c = CellData { name: "synthetic".to_string(), ops };
+    assert_eq!(quiet(&c, "create").len(), 24);
+    // A sample with no quiet flag is not decided either (DECISIONS 994f7d41e0).
+    let mut ops = BTreeMap::new();
+    let mut flagless = sample(1, 3);
+    flagless.remove("quiet");
+    ops.insert("create".to_string(), vec![sample(1, 3), flagless]);
+    let c = CellData { name: "synthetic".to_string(), ops };
+    assert!(std::panic::catch_unwind(|| quiet(&c, "create").len()).is_err(), "a flagless sample was read");
+}
+
 #[cfg(target_vendor = "apple")]
 #[test]
 fn create_issues_at_most_three_syscalls() {

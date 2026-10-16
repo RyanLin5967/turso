@@ -1010,6 +1010,45 @@ impl Connection {
     /// database. The name is unique among unreleased branches, and is durable with the fork: both
     /// are one log record.
     pub fn create_branch(self: &Arc<Connection>, name: &str) -> Result<BranchId> {
+        // Mutant `budget_plant_wake_on_expensive_create` (test builds only; probe-adversary-2's
+        // plant4, ADV-claude-budget-probe-2-fdb57fcfe H1): every third create makes 2 extra syscalls
+        // (a write that wakes a blocked helper thread, and a close(-1)), and the woken helper makes
+        // one close(-1). The helper is spawned once and counted persistent, as the confirmation
+        // writer is. The probe refuses exactly the expensive creates; a budget must not then read
+        // the cheap ones as its verdict.
+        #[cfg(all(test, unix))]
+        if store::fe_mutant("budget_plant_wake_on_expensive_create") {
+            static FD: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let fd = *FD.get_or_init(|| {
+                let mut p = [0i32; 2];
+                // SAFETY: a two-int buffer.
+                assert_eq!(unsafe { libc::pipe(p.as_mut_ptr()) }, 0);
+                let r = p[0];
+                budget_probe::persistent_started();
+                std::thread::Builder::new()
+                    .name("plant4-helper".into())
+                    .spawn(move || loop {
+                        let mut b = 0u8;
+                        // SAFETY: one byte into a local.
+                        if unsafe { libc::read(r, (&mut b as *mut u8).cast(), 1) } != 1 {
+                            return;
+                        }
+                        // SAFETY: an invalid descriptor: EBADF, one syscall.
+                        unsafe { libc::close(-1) };
+                    })
+                    .unwrap();
+                p[1]
+            });
+            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 3 == 2 {
+                let b = 1u8;
+                // SAFETY: one byte from a local; an invalid descriptor.
+                unsafe {
+                    libc::write(fd, (&b as *const u8).cast(), 1);
+                    libc::close(-1);
+                }
+            }
+        }
         self.fork_with(Some(name))
     }
 
