@@ -13438,3 +13438,16 @@ fn c50_int4_insert() {
     assert_eq!((e.code.as_str(), e.message.as_str()), ("22003", "integer out of range"), "{sql}");
 }
 
+// The complete numeric-special row in pg18/pg18-colnames.out, command 4.
+#[test]
+fn c50_numeric_specials_from_colnames_recording() {
+    let dir = Scratch::new("c50-numeric-specials");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE cn (a int, b text)").ok("cn");
+    a.q("INSERT INTO cn VALUES (1, 'x')").ok("row");
+    let sql = "SELECT 1 + 1, 'nan'::numeric / '0', 'Infinity'::float8::numeric, '42'::int2::numeric, a::int8, b::text FROM cn";
+    let r = a.q(sql).ok(sql);
+    assert_eq!(r.oids, Some(vec![23, 1700, 1700, 1700, 20, 25]));
+    assert_eq!(r.rows, vec![vec![Some("2".into()), Some("NaN".into()), Some("Infinity".into()), Some("42".into()), Some("1".into()), Some("x".into())]]);
+}
