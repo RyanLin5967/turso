@@ -223,9 +223,17 @@ mod tests {
 /// read only the size); `FORCE_UNKNOWN` to the crate's force-unknown hook; `level_cost` to the
 /// crate's hooks, armed by the first take (the crate records only when armed). No assertion or
 /// input of wire's tests is changed.
+///
+/// `LEVEL_COST` is wire's own literal, 128 KiB, not the crate's (192 KiB in debug): it is the bound
+/// of the level-gap test, the one wire test that reads it, and through the crate's constant that
+/// bound was loosened by half with no text changed (review of 96b69304b, F2; FLAGGED, a test
+/// strength restore).
 #[cfg(test)]
 mod fastest_wire_shim {
-    pub(super) use turso_stack_guard::{margin, remaining_stack, LEVEL_COST, STACK_MARGIN};
+    pub(super) use turso_stack_guard::{margin, remaining_stack, STACK_MARGIN};
+
+    /// fastest-wire's LEVEL_COST (db2fad5cf core/stack.rs), the level-gap test's bound.
+    pub(super) const LEVEL_COST: usize = 128 << 10;
 
     pub(super) struct StackBounds;
     impl StackBounds {
