@@ -711,7 +711,7 @@ mod tests {
         let levels = PG_QUERY_MAX / PG_QUERY_PER_LEVEL + 1;
         let sql = format!("SELECT {}", vec!["1"; levels + 1].join("+"));
         assert!(matches!(parse(&sql), Err(ParseError::StackDepthLimitExceeded)), "{levels} nested sums were not refused 54001");
-        let flat = format!("SELECT {}", vec!["1"; 10].join("+"));
+        let flat = format!("SELECT {}", ["1"; 10].join("+"));
         assert!(parse(&flat).is_ok(), "premise: 10 sums parse");
     }
 
