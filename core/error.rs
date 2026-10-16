@@ -201,6 +201,7 @@ impl LimboError {
             Self::BusySnapshot => SerializationFailure,
             Self::ForeignKeyConstraint(_) => ForeignKeyViolation,
             Self::IntegerOverflow => NumericValueOutOfRange,
+            Self::StackDepthLimitExceeded => StatementTooComplex,
             Self::ReadOnly => ReadOnlyTransaction,
             Self::DatabaseFull(_) => DiskFull,
             Self::Interrupt => QueryCanceled,

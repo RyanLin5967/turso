@@ -25,6 +25,7 @@ pub(crate) fn resolve_scalar(name: &str, arg_count: usize) -> bool {
         | "current_schemas" => &[1],
         "format_type" | "pg_get_constraintdef" | "pg_get_indexdef" | "obj_description" => &[1, 2],
         "pg_get_expr" => &[2, 3],
+        "__turso_pg_typeof" => &[2],
         "to_char" | "pg_input_is_valid" | "booleq" | "boolne" | "col_description" | "bpchareq"
         | "encode" | "bpcharlt" => &[2],
         "version" | "current_database" | "current_schema" | "pg_backend_pid" => &[0],
@@ -55,6 +56,9 @@ pub(crate) fn exec_scalar(conn: &Connection, name: &str, args: &[Value]) -> Resu
         "pg_get_indexdef" => Ok(exec_pg_get_indexdef(conn, int_arg(0, 0))),
         "pg_encoding_to_char" => Ok(exec_pg_encoding_to_char(int_arg(0, 0))),
         "format_type" => Ok(exec_pg_format_type(int_arg(0, 0), int_arg(1, -1))),
+        // The translated argument at index zero is evaluated normally; only its inferred type
+        // determines pg_typeof's value, including when the argument evaluates to NULL.
+        "__turso_pg_typeof" => Ok(exec_pg_format_type(int_arg(1, 0), -1)),
         "encode" => exec_encode(args),
         "to_char" => Ok(exec_to_char(
             args.first().unwrap_or(&Value::Null),
@@ -189,6 +193,11 @@ fn exec_pg_get_indexdef(conn: &Connection, oid: i64) -> Value {
 }
 
 fn exec_pg_format_type(type_oid: i64, typemod: i64) -> Value {
+    if let Some(element) = u32::try_from(type_oid).ok().and_then(crate::result_types::element_of) {
+        if let Value::Text(name) = exec_pg_format_type(element as i64, -1) {
+            return Value::build_text(format!("{}[]", name.as_str()));
+        }
+    }
     let type_name = match type_oid {
         16 => "boolean".to_string(),
         17 => "bytea".to_string(),
@@ -202,10 +211,10 @@ fn exec_pg_format_type(type_oid: i64, typemod: i64) -> Value {
         114 => "json".to_string(),
         700 => "real".to_string(),
         701 => "double precision".to_string(),
-        1000 => "boolean[]".to_string(),
-        1007 => "integer[]".to_string(),
-        1009 => "text[]".to_string(),
-        1022 => "double precision[]".to_string(),
+        705 => "unknown".to_string(),
+        650 => "cidr".to_string(),
+        829 => "macaddr".to_string(),
+        869 => "inet".to_string(),
         1042 => {
             if typemod > 4 {
                 format!("character({})", typemod - 4)

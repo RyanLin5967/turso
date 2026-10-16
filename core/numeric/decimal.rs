@@ -500,6 +500,19 @@ fn validate_precision_scale(val: &BigDecimal, precision: i64, scale: i64) -> cra
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn c50_numeric_special_values_use_the_existing_numeric_representation() {
+        use super::PgNumeric;
+        let nan = PgNumeric::parse("NaN").expect("PG numeric accepts NaN").unwrap();
+        let infinity = PgNumeric::parse("Infinity").expect("PG numeric accepts Infinity").unwrap();
+        for (value, text) in [(&nan, "NaN"), (&infinity, "Infinity")] {
+            assert_eq!(value.format(), text);
+            assert_eq!(PgNumeric::from_blob(&value.to_blob()).unwrap(), *value);
+        }
+        assert_eq!(nan.div(&PgNumeric::from_i64(0)).unwrap().format(), "NaN");
+        assert!(nan > infinity);
+    }
+
     use super::*;
     use bigdecimal::Zero;
     use std::str::FromStr;

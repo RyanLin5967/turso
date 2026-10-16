@@ -574,6 +574,22 @@ mod tests {
     use crate::Database;
     use crate::SqliteDialect;
 
+    #[test]
+    fn c50_sqlite_integer_overflow_stays_real() {
+        let db = Database::open_file(Arc::new(MemoryIO::new()), ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let conn = db.connect().unwrap();
+        for sql in [
+            "SELECT typeof(9223372036854775807 + 1)",
+            "SELECT typeof(-9223372036854775808 - 1)",
+            "SELECT typeof(9223372036854775807 * 2)",
+            "SELECT typeof(-(-9223372036854775808))",
+            "SELECT typeof(-9223372036854775808 / -1)",
+        ] {
+            let rows = conn.prepare(sql).unwrap().run_collect_rows().unwrap();
+            assert_eq!(rows[0][0], crate::Value::from_text("real"), "{sql}");
+        }
+    }
+
     /// Verify that REGEXP produces the correct error when no regexp function is registered.
     #[test]
     fn test_regexp_no_function_registered() {
