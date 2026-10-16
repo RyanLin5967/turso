@@ -12093,6 +12093,17 @@ mod recorded {
         }
     }
 
+    #[test]
+    fn c56_audit1_schema_reset_matches_pg18_replies() {
+        let recording = include_str!("pg18/pg18-audit1-lib-parameters_decode_at_postgresqls_edges.out");
+        let commands = parse(recording);
+        let command = &commands[0];
+        let dir = Scratch::new("c56-audit1-schema-reset");
+        let server = Server::start(&dir.db(), &[]);
+        let got = send(&mut server.connect(), &mut Vec::new(), &command.text);
+        assert!(same(&command.want, &got), "{}\nPG: {:?}\nours: {got:?}", command.text, command.want);
+    }
+
     /// Replay `recording` on a fresh server and check that the commands answering otherwise than
     /// PostgreSQL are exactly `divergences`, with each registered answer pinned by `ours`.
     pub(super) fn replay(name: &str, recording: &str, ours: &str, divergences: &[(usize, &str)]) {
