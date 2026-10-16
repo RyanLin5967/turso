@@ -1,0 +1,240 @@
+[
+  {
+    "name": "extended ROLLBACK AND CHAIN",
+    "steps": [
+      [
+        "Q",
+        "CREATE TEMP TABLE t(id INT PRIMARY KEY, v TEXT)"
+      ],
+      [
+        "Q",
+        "BEGIN"
+      ],
+      [
+        "Q",
+        "INSERT INTO t VALUES (2, 'two')"
+      ],
+      [
+        "Q",
+        "SELECT * FROM c45_missing"
+      ],
+      [
+        "X",
+        "ROLLBACK AND CHAIN",
+        [],
+        []
+      ],
+      [
+        "Q",
+        "SELECT 1"
+      ],
+      [
+        "Q",
+        "ROLLBACK"
+      ],
+      [
+        "Q",
+        "SELECT count(*) FROM t WHERE id = 2"
+      ]
+    ]
+  },
+  {
+    "name": "extended COMMIT AND CHAIN",
+    "steps": [
+      [
+        "Q",
+        "CREATE TEMP TABLE t(id INT PRIMARY KEY, v TEXT)"
+      ],
+      [
+        "Q",
+        "BEGIN"
+      ],
+      [
+        "Q",
+        "INSERT INTO t VALUES (2, 'two')"
+      ],
+      [
+        "Q",
+        "SELECT * FROM c45_missing"
+      ],
+      [
+        "X",
+        "COMMIT AND CHAIN",
+        [],
+        []
+      ],
+      [
+        "Q",
+        "SELECT 1"
+      ],
+      [
+        "Q",
+        "ROLLBACK"
+      ],
+      [
+        "Q",
+        "SELECT count(*) FROM t WHERE id = 2"
+      ]
+    ]
+  },
+  {
+    "name": "unnamed using output",
+    "steps": [
+      [
+        "Q",
+        "CREATE TEMP TABLE d(id INT PRIMARY KEY, v TEXT)"
+      ],
+      [
+        "Q",
+        "INSERT INTO d VALUES (1, 'a'), (2, 'b')"
+      ],
+      [
+        "Q",
+        "CREATE TEMP TABLE k(id INT)"
+      ],
+      [
+        "Q",
+        "INSERT INTO k VALUES (2)"
+      ],
+      [
+        "Q",
+        "DELETE FROM d USING (SELECT id + 0 FROM k) s WHERE d.id = s.\"?column?\" RETURNING id"
+      ],
+      [
+        "Q",
+        "SELECT id FROM d"
+      ]
+    ]
+  },
+  {
+    "name": "P7 approved premise",
+    "steps": [
+      [
+        "Q",
+        "CREATE TEMP TABLE t(id INT PRIMARY KEY, v TEXT)"
+      ],
+      [
+        "Q",
+        "BEGIN"
+      ],
+      [
+        "Q",
+        "INSERT INTO t VALUES (2, 'two')"
+      ],
+      [
+        "Q",
+        "SAVEPOINT s"
+      ],
+      [
+        "Q",
+        "SELECT 1/0"
+      ],
+      [
+        "Q",
+        "ROLLBACK TO s"
+      ],
+      [
+        "Q",
+        "SELECT 1"
+      ],
+      [
+        "Q",
+        "COMMIT"
+      ],
+      [
+        "Q",
+        "SELECT count(*) FROM t WHERE id = 2"
+      ]
+    ]
+  },
+  {
+    "name": "unsynced query 'SELECT 1'",
+    "steps": [
+      [
+        "Q",
+        "CREATE TABLE c45_pipe0(id INT)"
+      ],
+      [
+        "P",
+        "",
+        "INSERT INTO c45_pipe0 VALUES (1)",
+        []
+      ],
+      [
+        "B",
+        "",
+        "",
+        [],
+        [],
+        []
+      ],
+      [
+        "E"
+      ],
+      [
+        "Q",
+        "SELECT 1"
+      ],
+      [
+        "Q2",
+        "SELECT count(*) FROM c45_pipe0"
+      ],
+      [
+        "S"
+      ],
+      [
+        "Q2",
+        "SELECT count(*) FROM c45_pipe0"
+      ],
+      [
+        "Q",
+        "DROP TABLE c45_pipe0"
+      ]
+    ]
+  },
+  {
+    "name": "unsynced query ''",
+    "steps": [
+      [
+        "Q",
+        "CREATE TABLE c45_pipe1(id INT)"
+      ],
+      [
+        "P",
+        "",
+        "INSERT INTO c45_pipe1 VALUES (1)",
+        []
+      ],
+      [
+        "B",
+        "",
+        "",
+        [],
+        [],
+        []
+      ],
+      [
+        "E"
+      ],
+      [
+        "Q",
+        ""
+      ],
+      [
+        "Q2",
+        "SELECT count(*) FROM c45_pipe1"
+      ],
+      [
+        "S"
+      ],
+      [
+        "Q2",
+        "SELECT count(*) FROM c45_pipe1"
+      ],
+      [
+        "Q",
+        "DROP TABLE c45_pipe1"
+      ]
+    ]
+  }
+]
