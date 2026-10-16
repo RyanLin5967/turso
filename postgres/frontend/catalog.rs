@@ -3326,7 +3326,7 @@ impl InternalVirtualTableCursor for PgInputErrorInfoCursor {
                 Value::build_text(message),
                 Value::Null,
                 Value::Null,
-                Value::build_text(code),
+                Value::build_text(code.postgres_code().to_string()),
             ],
             None => [Value::Null, Value::Null, Value::Null, Value::Null],
         });

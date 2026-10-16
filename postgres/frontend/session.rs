@@ -2829,7 +2829,8 @@ fn handle_pg_copy_from(pg_conn: &Arc<PgConnectionInner>, stmt: &PgCopyFromStmt) 
         Some(schema) => format!("{}.{}", quoted(schema), quoted(&stmt.table_name)),
         None => quoted(&stmt.table_name),
     };
-    let column_names = get_table_columns(conn, &stmt.table_name, schema.as_deref())?;
+    let column_info = get_table_columns_and_types(conn, &stmt.table_name, schema.as_deref())?;
+    let column_names: Vec<String> = column_info.iter().map(|(name, _)| name.clone()).collect();
     if column_names.is_empty() {
         return Err(LimboError::ParseError(format!(
             "COPY FROM: table '{}' not found or has no columns",
@@ -2864,6 +2865,21 @@ fn handle_pg_copy_from(pg_conn: &Arc<PgConnectionInner>, stmt: &PgCopyFromStmt) 
         rows.remove(0);
     }
 
+    let input_columns = stmt.columns.as_ref().unwrap_or(&column_names);
+    let integer_inputs: Vec<Option<&str>> = input_columns
+        .iter()
+        .map(|name| {
+            column_info
+                .iter()
+                .find(|(column, _)| column.eq_ignore_ascii_case(name))
+                .and_then(|(_, ty)| match ty.to_ascii_lowercase().as_str() {
+                    "int" | "integer" | "int4" => Some("integer"),
+                    "bigint" | "int8" => Some("bigint"),
+                    "smallint" | "int2" => Some("smallint"),
+                    _ => None,
+                })
+        })
+        .collect();
     let rows_inserted = rows.len();
     // The rows go in atomically: in a transaction of their own, or, inside one already open (a
     // client's block, or the implicit block of a multi-statement query or a pipeline), under a
@@ -2877,7 +2893,17 @@ fn handle_pg_copy_from(pg_conn: &Arc<PgConnectionInner>, stmt: &PgCopyFromStmt) 
             for (i, val) in row.iter().enumerate() {
                 let index = NonZero::new(i + 1).unwrap();
                 match val {
-                    Some(s) => insert_stmt.bind_at(index, Value::build_text(s.clone()))?,
+                    Some(s) => {
+                        if let Some(ty) = integer_inputs[i] {
+                            if let Some((message, kind)) = crate::functions::validate_pg_input(s, ty) {
+                                return Err(LimboError::InvalidArgument(
+                                    SqlErrorMessage::classified(kind, message.clone())
+                                        .with_protocol_text(message),
+                                ));
+                            }
+                        }
+                        insert_stmt.bind_at(index, Value::build_text(s.clone()))?;
+                    }
                     None => insert_stmt.bind_at(index, Value::Null)?,
                 }
             }
@@ -3047,6 +3073,17 @@ fn get_table_columns(
     table_name: &str,
     schema_name: Option<&str>,
 ) -> Result<Vec<String>> {
+    Ok(get_table_columns_and_types(conn, table_name, schema_name)?
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect())
+}
+
+fn get_table_columns_and_types(
+    conn: &Arc<Connection>,
+    table_name: &str,
+    schema_name: Option<&str>,
+) -> Result<Vec<(String, String)>> {
     #[cfg(test)]
     TABLE_INFO_READS.with(|n| n.set(n.get() + 1));
     // The names quoted here, once, for every caller: COPY passed its table's name as written, so
@@ -3063,8 +3100,9 @@ fn get_table_columns(
     let rows = stmt.run_collect_rows()?;
     Ok(rows
         .into_iter()
-        .filter_map(|row| match row.get(1) {
-            Some(Value::Text(t)) => Some(t.as_str().to_string()),
+        .filter_map(|row| match (row.get(1), row.get(2)) {
+            (Some(Value::Text(name)), Some(Value::Text(ty))) =>
+                Some((name.as_str().to_string(), ty.as_str().to_string())),
             _ => None,
         })
         .collect())
