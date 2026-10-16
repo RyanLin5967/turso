@@ -7068,6 +7068,21 @@ fn from_item_refnames(item: &pg_query::protobuf::Node, names: &mut Vec<String>) 
 /// name, an expression argument, a cast to any other type — is not a branch call, and reaches the
 /// engine, which fails it.
 pub fn try_extract_branch_call(parse_result: &ParseResult) -> Option<PgBranchCall> {
+    extract_branch_call(parse_result, crate::MAX_PARAMETER as i32)
+}
+
+/// Whether the same branch-call grammar holds except for a parameter past its Bind limit.
+/// Parse uses this only on an oversized marker, so an ordinary query's variable-parameter
+/// analysis cannot turn a refused branch call into an unknown scalar function.
+pub fn branch_call_exceeds_parameter_limit(parse_result: &ParseResult) -> bool {
+    extract_branch_call(parse_result, i32::MAX).is_some_and(|call| {
+        call.args.iter().any(|arg| {
+            matches!(arg, PgBranchArg::Param(n) if *n > crate::MAX_PARAMETER as usize)
+        })
+    })
+}
+
+fn extract_branch_call(parse_result: &ParseResult, parameter_limit: i32) -> Option<PgBranchCall> {
     use pg_query::protobuf::{a_const::Val, node::Node};
 
     let [raw] = parse_result.protobuf.stmts.as_slice() else {
@@ -7143,7 +7158,7 @@ pub fn try_extract_branch_call(parse_result: &ParseResult) -> Option<PgBranchCal
     {
         return None;
     }
-    fn arg(node: &pg_query::protobuf::Node) -> Option<PgBranchArg> {
+    fn arg(node: &pg_query::protobuf::Node, parameter_limit: i32) -> Option<PgBranchArg> {
         match node.node.as_ref()? {
             Node::AConst(c) if c.isnull => Some(PgBranchArg::Null),
             Node::AConst(c) => match c.val.as_ref()? {
@@ -7155,7 +7170,7 @@ pub fn try_extract_branch_call(parse_result: &ParseResult) -> Option<PgBranchCal
             // prepare refuses it (42P02); Describe sized the call's list by it (review 9 item 1).
             // The number is libpg_query's, which wraps above i32::MAX: the caller checks it
             // against the text first (checked_param_numbers; review 12 item 1).
-            Node::ParamRef(p) if (1..=crate::MAX_PARAMETER as i32).contains(&p.number) => {
+            Node::ParamRef(p) if (1..=parameter_limit).contains(&p.number) => {
                 Some(PgBranchArg::Param(p.number as usize))
             }
             // A cast with no location over a parameter is libpg_query's `type $n`, which
@@ -7169,7 +7184,7 @@ pub fn try_extract_branch_call(parse_result: &ParseResult) -> Option<PgBranchCal
                     ))
                     && to_text(cast.type_name.as_ref()?) =>
             {
-                match arg(cast.arg.as_deref()?)? {
+                match arg(cast.arg.as_deref()?, parameter_limit)? {
                     PgBranchArg::Bool(b) => Some(PgBranchArg::Text(b.to_string().into())),
                     other => Some(other),
                 }
@@ -7201,7 +7216,7 @@ pub fn try_extract_branch_call(parse_result: &ParseResult) -> Option<PgBranchCal
             && !t.setof
             && !t.pct_type
     }
-    let args = call.args.iter().map(arg).collect::<Option<smallvec::SmallVec<_>>>()?;
+    let args = call.args.iter().map(|node| arg(node, parameter_limit)).collect::<Option<smallvec::SmallVec<_>>>()?;
     // Lower-case already (an upper-case byte was refused above): borrowed when it is a known name.
     let function = branch_function_name(function);
     Some(PgBranchCall { function, args })

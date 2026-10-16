@@ -498,6 +498,19 @@ impl PgConnection {
         if !analysed || msg.call.is_some() {
             return Ok(None);
         }
+        let branch_past_limit = msg.highest.is_some_and(|n| n > crate::result_types::MAX_PARAMETER)
+            && msg.parse.as_ref().is_some_and(
+                turso_pg_parser::translator::branch_call_exceeds_parameter_limit,
+            );
+        let parameter_limit = if branch_past_limit {
+            // An otherwise valid branch call keeps its original Bind-sized parameter bound.
+            // This uses the same AST classifier as branch extraction, never a substring scan.
+            crate::result_types::MAX_PARAMETER as i32
+        } else {
+            // PostgreSQL's variable_paramref_hook permits MaxAllocSize / sizeof(Oid).
+            // Sparse compiler/type metadata lets the existing Parse step diagnose the gap.
+            0x3fff_ffff / std::mem::size_of::<u32>() as i32
+        };
         let mut types = StatementTypes::default();
         let stmt = prepare_statement_parsed(
             &self.inner,
@@ -506,11 +519,7 @@ impl PgConnection {
             Some(&mut types),
             true,
             true,
-            // PostgreSQL's variable_paramref_hook permits a parameter type array up to
-            // MaxAllocSize / sizeof(Oid). Its Bind count is a separate, 16-bit limit. Our
-            // compiler and type walk keep sparse parameter metadata, so the existing Parse
-            // step can diagnose a gap without allocating up to the highest number.
-            0x3fff_ffff / std::mem::size_of::<u32>() as i32,
+            parameter_limit,
         )?;
         Ok(stmt.map(|stmt| (stmt, types)))
     }
