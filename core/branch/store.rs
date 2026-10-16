@@ -3848,12 +3848,18 @@ fn run_flight(
     if cap.rows_frozen {
         #[cfg(test)]
         pause_at(Some(&*hold), HOLD_BEFORE_ROWS);
-        let rows = loop {
-            let mut guard = inner.lock();
-            if let Some(rows) = guard.branches.encode_frozen(CKPT_BATCH) {
-                break rows;
+        // The writer's vector, sized once (never under the store mutex) and grown here between
+        // batches if the table encoded pre-images beyond it.
+        let mut rows = Vec::with_capacity(cap.shape_rows as usize);
+        loop {
+            if rows.capacity() - rows.len() < CKPT_BATCH {
+                rows.reserve(CKPT_BATCH);
             }
-        };
+            let mut guard = inner.lock();
+            if guard.branches.encode_frozen(CKPT_BATCH, &mut rows) {
+                break;
+            }
+        }
         #[cfg(test)]
         if let Some(want) = cap.verify.take() {
             if let Err(e) = verify_frozen_rows(want, &rows) {

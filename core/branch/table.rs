@@ -197,22 +197,27 @@ impl<T: Preimage> BranchTable<T> {
         Ok(())
     }
 
-    /// The writer's batch: encode up to `max` owed rows from states unchanged since the capture.
-    /// `Some(rows)`, the freeze ended, once none is owed; the rows of ids with no state (removed
-    /// before the capture) are skipped, as the capture skipped them.
-    pub(crate) fn encode_frozen(&mut self, max: usize) -> Option<Vec<(T::Row, u8)>> {
+    /// The writer's batch: encode up to `max` owed rows from states unchanged since the capture,
+    /// appended to `out` (the writer's own vector, grown outside the store mutex between batches,
+    /// so no batch reallocates every row so far: 4,718,592 B in one hold at 19k rows, raw l104).
+    /// `true`, the freeze ended and its pre-images moved into `out`, once none is owed; the rows of
+    /// ids with no state (removed before the capture) are skipped, as the capture skipped them.
+    pub(crate) fn encode_frozen(&mut self, max: usize, out: &mut Vec<(T::Row, u8)>) -> bool {
         for _ in 0..max {
-            let Some((id, what)) = self.frozen.as_mut()?.pending.pop_first() else {
+            let Some((id, what)) = self.frozen.as_mut().and_then(|f| f.pending.pop_first()) else {
                 break;
             };
             if let Some(row) = self.get(&id).map(|v| v.preimage(id)) {
-                self.frozen.as_mut()?.done.push((row, what));
+                out.push((row, what));
             }
         }
-        if self.frozen.as_ref()?.pending.is_empty() {
-            return self.frozen.take().map(|f| f.done);
+        if self.frozen.as_ref().is_some_and(|f| f.pending.is_empty()) {
+            if let Some(f) = self.frozen.take() {
+                out.extend(f.done);
+            }
+            return true;
         }
-        None
+        self.frozen.is_none()
     }
 
     /// A freeze that will not be written (a capture undone): its ids and dirty bits, owed or
@@ -397,14 +402,12 @@ mod tests {
         t.insert(BranchId(2), 222);
         t.remove(&BranchId(3));
         *t.get_mut(&BranchId(6)).unwrap() = 666;
-        let mut rows = None;
-        while rows.is_none() {
-            rows = t.encode_frozen(1);
-        }
-        let mut rows = rows.unwrap();
+        let mut rows = Vec::new();
+        while !t.encode_frozen(1, &mut rows) {}
         rows.sort();
         assert_eq!(rows, vec![(10, 1), (20, 2), (30, 3), (40, 4), (50, 5)], "rows not as of the freeze");
-        assert!(t.encode_frozen(64).is_none(), "a freeze ended twice");
+        let mut again = Vec::new();
+        assert!(t.encode_frozen(64, &mut again) && again.is_empty(), "a freeze ended twice");
         assert_eq!(t[&BranchId(1)], 1111);
         assert!(t.freeze((1..=2).map(|i| (BranchId(i), 9)).collect()).is_ok());
         *t.get_mut(&BranchId(1)).unwrap() = 7;
