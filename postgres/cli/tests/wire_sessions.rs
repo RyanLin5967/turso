@@ -13484,3 +13484,126 @@ fn c50_numeric_specials_from_colnames_recording() {
     assert_eq!(r.oids, Some(vec![23, 1700, 1700, 1700, 20, 25]));
     assert_eq!(r.rows, vec![vec![Some("2".into()), Some("NaN".into()), Some("Infinity".into()), Some("42".into()), Some("1".into()), Some("x".into())]]);
 }
+
+/// Types come from the same inference even when Parse declares an argument, and evaluating
+/// pg_typeof must retain its argument's side effect exactly once.
+#[test]
+fn c52_pg_typeof_keeps_declared_types_and_argument_evaluation() {
+    let dir = Scratch::new("c52polymorphic");
+    let server = Server::start(&dir.db(), &[]);
+    let mut w = server.connect();
+    for (oid, value, name) in [(23, &b"7"[..], "integer"), (16, &b"true"[..], "boolean")] {
+        let reply = w.xt("SELECT pg_typeof($1)::text, $1", &[(oid, 0, value)]).ok("declared type");
+        assert_eq!(reply.oids, Some(vec![25, oid]));
+        assert_eq!(reply.rows[0][0].as_deref(), Some(name));
+    }
+    assert_eq!(w.q("SELECT pg_typeof(NULL)::text").single("unknown NULL"), "unknown");
+    assert_eq!(w.q("SELECT pg_typeof('literal')::text").single("unknown literal"), "unknown");
+    w.q("CREATE SEQUENCE c52_seq").ok("sequence");
+    assert_eq!(w.q("SELECT pg_typeof(nextval('c52_seq'))::text").single("side effect type"), "bigint");
+    assert_eq!(w.q("SELECT nextval('c52_seq')").single("exactly one previous evaluation"), "2");
+}
+
+#[test]
+fn c52_common_expression_types_consider_every_arm() {
+    let dir = Scratch::new("c52common");
+    let server = Server::start(&dir.db(), &[]);
+    let mut w = server.connect();
+    for sql in [
+        "SELECT CASE WHEN true THEN 1::int4 ELSE 2::int8 END",
+        "SELECT coalesce(1::int4, 2::int8)",
+        "SELECT greatest(1::int4, 2::int8)",
+        "SELECT 1::int4 UNION ALL SELECT 2::int8",
+        "VALUES (1::int4), (2::int8)",
+    ] {
+        let reply = w.q(sql).ok(sql);
+        assert_eq!(reply.oids, Some(vec![20]), "{sql}");
+    }
+}
+
+
+#[test]
+fn c52_returning_star_and_merged_join_star_keep_column_alignment() {
+    let dir = Scratch::new("c52star");
+    let server = Server::start(&dir.db(), &[]);
+    let mut w = server.connect();
+    w.q("CREATE TABLE a(id INT, flag BOOL)").ok("a");
+    w.q("CREATE TABLE b(id INT, txt TEXT)").ok("b");
+    let reply = w.q("INSERT INTO a VALUES (1, true) RETURNING *, false").ok("returning star");
+    assert_eq!(reply.oids, Some(vec![23, 16, 16]));
+    assert_eq!(reply.rows, vec![vec![Some("1".into()), Some("t".into()), Some("f".into())]]);
+    w.q("INSERT INTO b VALUES (1, 'b')").ok("b row");
+    let reply = w.q("SELECT * FROM a JOIN b USING(id)").ok("merged star");
+    assert_eq!(reply.oids, Some(vec![23, 16, 25]));
+    let reply = w.q("SELECT a.* FROM a JOIN b USING(id)").ok("qualified star");
+    assert_eq!(reply.oids, Some(vec![23, 16]));
+}
+
+#[test]
+fn c52_pg_typeof_arrays_and_select_bodies_use_the_shared_types() {
+    let dir = Scratch::new("c52bodies");
+    let server = Server::start(&dir.db(), &[]);
+    let mut w = server.connect();
+    for (oid, name) in [(1016, "bigint[]"), (1028, "oid[]"), (1005, "smallint[]"), (1015, "character varying[]")] {
+        assert_eq!(w.xt("SELECT pg_typeof($1)::text", &[(oid, 0, b"{1,2}")]).single("array type"), name);
+    }
+    w.q("CREATE VIEW c52_v AS SELECT pg_typeof(1)::text AS t").ok("view body");
+    assert_eq!(w.q("SELECT t FROM c52_v").single("view value"), "integer");
+    w.q("CREATE TABLE c52_t AS SELECT pg_typeof(1)::text AS t").ok("CTAS body");
+    assert_eq!(w.q("SELECT t FROM c52_t").single("CTAS value"), "integer");
+}
+
+#[test]
+fn c52_described_statement_cache_includes_declared_parameter_types() {
+    let dir = Scratch::new("c52cache");
+    let server = Server::start(&dir.db(), &[]);
+    let mut w = server.connect();
+    for (name, oid) in [("a", 23u32), ("b", 25u32)] {
+        let mut parse = format!("{name}\0SELECT pg_typeof($1)::text\0").into_bytes();
+        parse.extend_from_slice(&1i16.to_be_bytes());
+        parse.extend_from_slice(&oid.to_be_bytes());
+        w.send(b'P', &parse);
+    }
+    w.send(b'D', b"Sa\0");
+    w.send(b'S', &[]);
+    let reply = w.read_reply().ok("describe integer statement");
+    assert_eq!(reply.params, Some(vec![23]));
+    w.send(b'B', b"\0b\0\0\0\0\x01\0\0\0\x01x\0\0");
+    w.send(b'E', &[0, 0, 0, 0, 0]);
+    w.send(b'S', &[]);
+    assert_eq!(w.read_reply().single("execute distinct text statement"), "text");
+}
+
+
+#[test]
+fn c52_database_size_matches_its_documented_file_scope() {
+    let dir = Scratch::new("c52size");
+    let server = Server::start(&dir.db(), &[]);
+    let mut w = server.connect();
+    w.q("CREATE TABLE ix(id INT PRIMARY KEY, a INT, b TEXT UNIQUE)").ok("ix");
+    w.q("CREATE INDEX ix_a ON ix(a)").ok("index");
+    for after_write in [false, true] {
+        if after_write {
+            w.q("INSERT INTO ix VALUES(1, 1, 'one')").ok("change physical state");
+        }
+        let reply = w.q("SELECT pg_database_size(current_database())").ok("physical size");
+        assert_eq!(reply.oids, Some(vec![20]));
+        let bytes: u64 = reply.rows[0][0].as_ref().unwrap().parse().unwrap();
+        let main = std::fs::metadata(dir.db()).unwrap().len();
+        let wal_path = format!("{}-wal", dir.db().display());
+        let wal = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+        eprintln!("C52 database size: after_write={after_write}, main={main}, wal={wal}, reported={bytes}");
+        assert_eq!(bytes, main + wal);
+    }
+}
+
+#[test]
+fn c52_view_of_integer_constant_retains_its_type() {
+    let dir = Scratch::new("c52viewconstant");
+    let server = Server::start(&dir.db(), &[]);
+    let mut w = server.connect();
+    w.q("CREATE VIEW c52_constant AS SELECT 1 AS n").ok("constant view");
+    let reply = w.q("SELECT n FROM c52_constant").ok("constant result");
+    assert_eq!(reply.oids, Some(vec![23]));
+    assert_eq!(reply.rows, vec![vec![Some("1".into())]]);
+}

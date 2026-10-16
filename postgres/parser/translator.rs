@@ -4442,6 +4442,35 @@ impl PostgreSQLTranslator {
             .next_back()
             .ok_or_else(|| ParseError::ParseError("Missing function name".to_string().into()))?;
 
+        if func_name.eq_ignore_ascii_case("__turso_pg_typeof") {
+            return Err(ParseError::ParseError(
+                "no such function: __turso_pg_typeof".into(),
+            ));
+        }
+        if func_name.eq_ignore_ascii_case("pg_typeof") && func_call.args.len() == 1 {
+            let argument = &func_call.args[0];
+            let oid = self.expression_type(argument).ok_or_else(|| {
+                ParseError::ParseError(
+                    "could not determine the type of pg_typeof's argument".into(),
+                )
+            })?;
+            return Ok(ast::Expr::FunctionCall {
+                name: ast::Name::from_string("__turso_pg_typeof"),
+                args: vec![
+                    // Preserve evaluation (including errors and side effects) exactly once.
+                    Box::new(self.translate_expr(argument)?),
+                    Box::new(ast::Expr::Literal(ast::Literal::Numeric(oid.to_string()))),
+                ],
+                distinctness: None,
+                order_by: vec![],
+                within_group: vec![],
+                filter_over: ast::FunctionTail {
+                    filter_clause: None,
+                    over_clause: None,
+                },
+            });
+        }
+
         // Translate FILTER clause
         let filter_clause = if let Some(ref filter) = func_call.agg_filter {
             Some(Box::new(self.translate_expr(filter)?))
@@ -5646,7 +5675,8 @@ pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
         "XML" | "TSVECTOR" | "TSQUERY" => "TEXT".into(),
         "MONEY" => "FLOAT8".into(),
         "BIT" | "VARBIT" => "TEXT".into(),
-        "OID" | "REGCLASS" | "REGTYPE" | "REGPROC" | "REGPROCEDURE" | "REGOPER" | "REGOPERATOR"
+        "OID" => "oid".into(),
+        "REGCLASS" | "REGTYPE" | "REGPROC" | "REGPROCEDURE" | "REGOPER" | "REGOPERATOR"
         | "REGCONFIG" | "REGDICTIONARY" | "REGNAMESPACE" | "REGROLE" => "INTEGER".into(),
         "VOID" => "TEXT".into(),
 
