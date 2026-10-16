@@ -2195,6 +2195,25 @@ fn show_answers_from_the_settings_set_keeps() {
     assert_eq!(a.q("SHOW ALL").err("SHOW ALL").code, "0A000");
 }
 
+/// encode(bytea, format) answers as PostgreSQL's does: 'abc' in hex is 616263 and 'ab' in base64
+/// YWI=, a NULL argument is NULL, and an unknown format is 22023 "unrecognized encoding". It was no
+/// function at all (42883), found by the cloud run of bind_reads_each_parameter_in_its_format.
+#[test]
+fn encode_answers_as_postgresql_does() {
+    let dir = Scratch::new("encode");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    assert_eq!(a.q("SELECT encode('abc', 'hex')").single("hex"), "616263");
+    assert_eq!(
+        a.q("SELECT encode('ab', 'base64')").single("base64"),
+        "YWI="
+    );
+    let r = a.q("SELECT encode(NULL, 'hex')").ok("NULL");
+    assert_eq!(r.rows, vec![vec![None]]);
+    let sql = "SELECT encode('abc', 'nosuch')";
+    assert_eq!(a.q(sql).err(sql).code, "22023");
+}
+
 /// The failure triggers the failure-path tests use do fail, each with its code, so a test that
 /// fails a statement or a block takes its failure path: a missing relation at prepare (42P01; in a
 /// block the block fails) and a duplicate key at execution (23505). `SELECT 1/0`, which they used,
