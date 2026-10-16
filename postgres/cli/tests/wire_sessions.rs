@@ -12370,7 +12370,9 @@ fn c44_numeric_overflow_is_22003() {
     let dir = Scratch::new("c44-numeric-overflow");
     let server = Server::start(&dir.db(), &[]);
     let mut a = server.connect();
-    let sql = "SELECT '1e131072'::numeric";
+    a.q("CREATE TABLE c44_num(x numeric(10,2))").ok("typed numeric column");
+    a.q("INSERT INTO c44_num VALUES (100)").ok("numeric operand");
+    let sql = "SELECT '1e131072' / x FROM c44_num";
     assert_eq!(a.q(sql).err(sql).code, "22003");
 }
 
