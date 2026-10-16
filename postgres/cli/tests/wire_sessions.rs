@@ -12703,7 +12703,6 @@ replays_postgresql!(
         (4, "PGDIV-PARSE-PREFIX error-text [wire]: 42P02 both; ours prefixes 'Parse error: '"),
         (5, "PGDIV-PARSE-REFUSAL-STEP protocol [wire]: Describe of LIMIT $2147483647: PG refuses 42P02 at Parse; ours ParseComplete then 42P02 with prefix"),
         (7, "PGDIV-PARSE-PREFIX error-text [wire]: 42P02 both; ours prefixes 'Parse error: '"),
-        (8, "PGDIV-PARAM-OVER-LIMIT-CODE error-code [wire]: Describe of id = $65536: PG refuses at Parse 42P18 'could not determine data type of parameter $1'; ours ParseComplete then 42P02 there is no parameter $65536"),
     ]
 );
 replays_postgresql!(

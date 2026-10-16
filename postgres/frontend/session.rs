@@ -506,6 +506,11 @@ impl PgConnection {
             Some(&mut types),
             true,
             true,
+            // PostgreSQL's variable_paramref_hook permits a parameter type array up to
+            // MaxAllocSize / sizeof(Oid). Its Bind count is a separate, 16-bit limit. Our
+            // compiler and type walk keep sparse parameter metadata, so the existing Parse
+            // step can diagnose a gap without allocating up to the highest number.
+            0x3fff_ffff / std::mem::size_of::<u32>() as i32,
         )?;
         Ok(stmt.map(|stmt| (stmt, types)))
     }
@@ -1065,7 +1070,15 @@ fn prepare_statement_checked(
     describe: bool,
     check_keys: bool,
 ) -> Result<Option<Statement>> {
-    prepare_statement_parsed(pg_conn, sql, None, types, describe, check_keys)
+    prepare_statement_parsed(
+        pg_conn,
+        sql,
+        None,
+        types,
+        describe,
+        check_keys,
+        crate::result_types::MAX_PARAMETER as i32,
+    )
 }
 
 /// [`prepare_statement_checked`] from `parsed`, the text's parse when the caller already made it
@@ -1077,6 +1090,7 @@ fn prepare_statement_parsed(
     mut types: Option<&mut StatementTypes>,
     describe: bool,
     check_keys: bool,
+    parameter_limit: i32,
 ) -> Result<Option<Statement>> {
     use crate::phase::{enter, Phase};
     let parsing = enter(Phase::Parse);
@@ -1104,10 +1118,12 @@ fn prepare_statement_parsed(
             "cannot insert multiple commands into a prepared statement".to_string().into(),
         ));
     }
-    // Every $n of the whole tree, before anything is sized by one: a number past
-    // MAX_PARAMETER (Bind counts in 16 bits) or below 1 names no parameter (42P02, PostgreSQL's
-    // "there is no parameter"); `SELECT 1 LIMIT $2147483647` sized a 16 GiB list (wire review 8
-    // item 3). Only a statement whose text holds a '$' pays the walk.
+    // Every $n of the whole tree, before anything is sized by one. Parse's variable-parameter
+    // limit is distinct from Bind's 16-bit count: after analysis, the server's existing Parse
+    // step checks the inferred types and refuses the first gap (42P18). The ordinary prepare
+    // keeps its bound. Above either limit, or below 1, the number names no parameter (42P02).
+    // The compiler and type walk keep sparse metadata; this must not allocate by the highest
+    // index (`SELECT 1 LIMIT $2147483647` once sized a 16 GiB list; wire review 8 item 3).
     let used: Vec<u32> = if sql.contains('$') {
         // Read from the text as PostgreSQL 18 reads them: a number above i32::MAX is 42601, never
         // libpg_query's 32-bit wrap (wire review 12 item 1).
@@ -1115,7 +1131,7 @@ fn prepare_statement_parsed(
             .map_err(|e| LimboError::ParseError(e.into()))?;
         if let Some(n) = numbers
             .iter()
-            .find(|n| !(1..=crate::result_types::MAX_PARAMETER as i32).contains(*n))
+            .find(|n| !(1..=parameter_limit).contains(*n))
         {
             return Err(LimboError::ParseError(SqlErrorMessage::classified(SqlErrorKind::UndefinedParameter, format!(
                 "there is no parameter ${n}"

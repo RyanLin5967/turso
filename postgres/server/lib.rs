@@ -24,7 +24,7 @@
 
 pub mod counters;
 
-use turso_parser::sql_error::SqlErrorKind;
+use turso_parser::sql_error::{SqlErrorKind, SqlErrorMessage};
 use std::num::NonZero;
 use std::sync::{
     atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -4766,10 +4766,12 @@ fn parameter_types(types: &StatementTypes, declared: &[Option<Type>]) -> SqlResu
             // not at prepare (wire review 11 item 1).
             if types.used.binary_search(&(n as u32)).is_err() || types.untyped.contains(&(n as u32))
             {
-                return Err(error(
-                    "42P18",
-                    format!("could not determine data type of parameter ${n}"),
-                ));
+                return Err(engine_info(&LimboError::InvalidArgument(
+                    SqlErrorMessage::classified(
+                        SqlErrorKind::IndeterminateDatatype,
+                        format!("could not determine data type of parameter ${n}"),
+                    ),
+                )));
             }
             Ok(types
                 .params
