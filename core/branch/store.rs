@@ -239,10 +239,9 @@ pub(crate) struct BranchStore {
     /// The fuzzy checkpoints' persistent worker (`CkptWorker`), started at the first checkpoint
     /// and joined at `Drop`; `flight_jobs` counts the checkpoints handed to it and finished, for
     /// `join_flights` (F-FZ: `compact_now` and `Drop` wait for every one started so far).
-    ckpt_worker: Mutex<Option<CkptWorker>>,
-    /// A fuzzy checkpoint an operation owes, for the worker to start once it has let the store
-    /// mutex go (`maybe_compact`, `start_owed_flight`; L2(d)).
-    start_due: AtomicBool,
+    ckpt_worker: Arc<Mutex<Option<CkptWorker>>>,
+    /// Set as the store's close begins: the starter of owed checkpoints sends none after it.
+    closing: Arc<AtomicBool>,
     flight_jobs: Arc<(std::sync::Mutex<(u64, u64)>, std::sync::Condvar)>,
     /// The confirmation writer (`run_confirm_writer`; review 6 #1) and the process that started it
     /// (a fork(2) child has no such thread to join): `None` for a volatile or trunk-only store, and
@@ -1439,11 +1438,21 @@ struct StoreMutex {
     /// writer locked, or after it unlocked) and did not wait is counted too: an overcount, never a
     /// miss (`StoreMutex::lock`).
     compaction_waits: AtomicU64,
+    /// A fuzzy checkpoint an operation owes (`BranchStore::maybe_compact`), and what starts it:
+    /// sent by the guard's unlock (`StoreGuard`'s drop), so owing a start and sending it are ONE
+    /// operation, whatever path the hold took (review REVIEW-claude-engine-L2d M1: an expiry, a
+    /// lease, an open and an erroring create owed starts no call ever sent). Set once, by
+    /// `BranchStore::install_starter`; unset (a store built for a test without one), nothing is
+    /// sent and the next owing operation owes it again.
+    start_due: AtomicBool,
+    starter: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
 }
 
 impl StoreMutex {
     fn new(inner: StoreInner) -> Self {
         Self {
+            start_due: AtomicBool::new(false),
+            starter: std::sync::OnceLock::new(),
             inner: Mutex::new(inner),
             compacting: AtomicU64::new(0),
             compaction_waits: AtomicU64::new(0),
@@ -1490,30 +1499,48 @@ impl StoreMutex {
         // fastest-budgets instrument (test builds): acquisitions, and what is done while held.
         #[cfg(test)]
         super::budget_probe::store_locked_at(site);
-        StoreGuard(guard)
+        StoreGuard { guard: Some(guard), store: self }
     }
 }
 
-struct StoreGuard<'a>(crate::sync::MutexGuard<'a, StoreInner>);
+struct StoreGuard<'a> {
+    /// `None` only inside the drop, between the unlock and the owed start's send.
+    guard: Option<crate::sync::MutexGuard<'a, StoreInner>>,
+    store: &'a StoreMutex,
+}
 
 impl std::ops::Deref for StoreGuard<'_> {
     type Target = StoreInner;
     fn deref(&self) -> &StoreInner {
-        &self.0
+        self.guard.as_ref().expect("held until the drop")
     }
 }
 
 impl std::ops::DerefMut for StoreGuard<'_> {
     fn deref_mut(&mut self) -> &mut StoreInner {
-        &mut self.0
+        self.guard.as_mut().expect("held until the drop")
     }
 }
 
-#[cfg(test)]
 impl Drop for StoreGuard<'_> {
     fn drop(&mut self) {
-        STORE_HELD.with(|held| held.set(held.get() - 1));
-        super::budget_probe::store_unlocked();
+        #[cfg(test)]
+        {
+            STORE_HELD.with(|held| held.set(held.get() - 1));
+            super::budget_probe::store_unlocked();
+        }
+        drop(self.guard.take());
+        // The checkpoint this hold owed, sent with the mutex let go (see `StoreMutex::start_due`).
+        // Mutant `owed_start_unsent` (test builds only): nothing sends it, as at 969e7a370 on every
+        // path that did not call `start_owed_flight`.
+        if self.store.start_due.load(Ordering::Acquire)
+            && !fe_mutant("owed_start_unsent")
+            && self.store.start_due.swap(false, Ordering::AcqRel)
+        {
+            if let Some(start) = self.store.starter.get() {
+                start();
+            }
+        }
     }
 }
 
@@ -3826,10 +3853,59 @@ fn settle_start(over_hard: &AtomicBool, inner: &mut StoreInner, started: FlightS
     }
 }
 
-/// The checkpoint worker's start of an owed fuzzy checkpoint (`BranchStore::start_owed_flight`):
+/// The checkpoint worker's start of an owed fuzzy checkpoint (`StoreMutex::starter`):
 /// its capture in a store-mutex hold of the worker's own, then, with the mutex let go, the flight
 /// itself on this same thread (it is the worker already). Nothing if the log no longer wants a
 /// checkpoint (a start that failed since backed it off, or one ran).
+/// `BranchStore::dispatch_flight`, given the worker and its job counts (also the starter of owed
+/// checkpoints', `BranchStore::install_starter`).
+fn dispatch_to(
+    ckpt_worker: &Mutex<Option<CkptWorker>>,
+    flight_jobs: &Arc<(std::sync::Mutex<(u64, u64)>, std::sync::Condvar)>,
+    job: CkptJob,
+) -> std::io::Result<()> {
+    if fe_mutant("checkpoint_thread_per_flight") {
+        let jobs = flight_jobs.clone();
+        jobs.0.lock().unwrap_or_else(|e| e.into_inner()).0 += 1;
+        let handle = crate::thread::Builder::new().name("branch-checkpoint".to_string()).spawn(move || {
+            job();
+            CkptWorker::finished(&jobs);
+        });
+        return handle.map(drop).inspect_err(|_| CkptWorker::finished(&flight_jobs));
+    }
+    let mut worker = ckpt_worker.lock();
+    let pid = std::process::id();
+    if worker.as_ref().is_some_and(|w| w.pid != pid) {
+        // The parent's thread does not exist in this process: never joined, never sent to.
+        std::mem::forget(worker.take());
+    }
+    flight_jobs.0.lock().unwrap_or_else(|e| e.into_inner()).0 += 1;
+    let mut job = job;
+    for _ in 0..2 {
+        if worker.is_none() {
+            match CkptWorker::start(flight_jobs.clone()) {
+                Ok(w) => *worker = Some(w),
+                Err(e) => {
+                    CkptWorker::finished(&flight_jobs);
+                    return Err(e);
+                }
+            }
+        }
+        match worker.as_ref().expect("started above").tx.send(job) {
+            Ok(()) => return Ok(()),
+            Err(std::sync::mpsc::SendError(back)) => {
+                // It exited: joined, and replaced.
+                if let Some(w) = worker.take() {
+                    let _ = w.handle.join();
+                }
+                job = back;
+            }
+        }
+    }
+    CkptWorker::finished(&flight_jobs);
+    Err(std::io::Error::other("the branch catalog checkpoint worker could not be started"))
+}
+
 fn run_owed_start(ctx: FlightCtx) {
     let flight = {
         let mut inner = ctx.inner.lock();
@@ -4552,11 +4628,11 @@ impl BranchStore {
     }
 
     fn trunk_only() -> Self {
-        Self {
+        let store = Self {
             inner: Arc::new(StoreMutex::new(StoreInner::fresh(None, SyncClass::Off, None))),
             prewarm: PrewarmStats::default(),
-            ckpt_worker: Mutex::new(None),
-            start_due: AtomicBool::new(false),
+            ckpt_worker: Arc::new(Mutex::new(None)),
+            closing: Arc::new(AtomicBool::new(false)),
             flight_jobs: Arc::new((std::sync::Mutex::new((0, 0)), std::sync::Condvar::new())),
             confirm_writer: Mutex::new(None),
             name_filter_build: Mutex::new(Vec::new()),
@@ -4591,7 +4667,9 @@ impl BranchStore {
             last_release_lsn: AtomicU64::new(0),
             retain_floor: AtomicU64::new(0),
             fuzzy: false,
-        }
+        };
+        store.install_starter();
+        store
     }
 
     pub(crate) fn is_trunk_only(&self) -> bool {
@@ -4860,8 +4938,8 @@ impl BranchStore {
             gate_closed: (std::sync::Mutex::new(()), std::sync::Condvar::new()),
             inner: Arc::new(StoreMutex::new(inner)),
             prewarm: warmed,
-            ckpt_worker: Mutex::new(None),
-            start_due: AtomicBool::new(false),
+            ckpt_worker: Arc::new(Mutex::new(None)),
+            closing: Arc::new(AtomicBool::new(false)),
             flight_jobs: Arc::new((std::sync::Mutex::new((0, 0)), std::sync::Condvar::new())),
             confirm_writer: Mutex::new(None),
             name_filter_build: Mutex::new(Vec::new()),
@@ -4878,6 +4956,9 @@ impl BranchStore {
             arena_reads: AtomicU64::new(0),
             holds: ForkHoldCounters::new(),
         };
+        // Before the first lock: every hold that owes a checkpoint start sends it at its unlock
+        // (review L2d M1), the open-time expiry's included.
+        store.install_starter();
         // A catalog the open recovered: its failed syncs reach this store's at-risk decision as
         // they happen (engine review 21 MED 5; a catalog created later is linked at its creation,
         // `ensure_backing`).
@@ -6266,7 +6347,7 @@ impl BranchStore {
         // threshold by what that truncation's time appends.)
         // L2(d) (ASYNC-DESIGN R1.3, superseding §6.2's start here): the operation that crossed
         // the threshold starts no checkpoint inside its own hold; it owes one, and once it has let
-        // the mutex go the checkpoint worker starts it (`start_owed_flight`, `run_owed_start`),
+        // the mutex go the checkpoint worker starts it (`StoreGuard`'s drop, `run_owed_start`),
         // in a hold of its own. Before, one create in 16,384 paid the capture in its hold (raws
         // l82, l92). Mutant `flight_start_inline` (test builds only): started here, as before.
         if !fe_mutant("flight_start_inline") {
@@ -6276,7 +6357,7 @@ impl BranchStore {
                 }
                 return;
             }
-            self.start_due.store(true, Ordering::Release);
+            self.inner.start_due.store(true, Ordering::Release);
             return;
         }
         held_trace("compact.flight_starting");
@@ -6285,18 +6366,40 @@ impl BranchStore {
         settle_start(&self.over_hard, inner, started);
     }
 
-    /// The checkpoint an operation owed (`maybe_compact`), started by the checkpoint worker once
-    /// that operation has let the store mutex go: called after the unlock, by every operation that
-    /// can owe one. Nothing is done unless one is owed.
-    fn start_owed_flight(&self) {
-        if !self.start_due.swap(false, Ordering::AcqRel) {
-            return;
-        }
-        let ctx = self.flight_ctx();
-        if let Err(e) = self.dispatch_flight(Box::new(move || run_owed_start(ctx))) {
-            // No worker: the next operation over the threshold owes it again.
-            tracing::warn!("branch catalog checkpoint not started (no worker): {e}");
-        }
+    /// Install the store's starter of owed checkpoints (`StoreMutex::starter`): it hands
+    /// `run_owed_start` to the checkpoint worker. Holds the store mutex weakly (the mutex owns it),
+    /// and does nothing once the store is closing (`closing`).
+    fn install_starter(&self) {
+        let shared = Arc::downgrade(&self.inner);
+        let group = self.group.clone();
+        let class = self.class;
+        let flight_hold = self.flight_hold.clone();
+        let over_hard = self.over_hard.clone();
+        let truncating = self.truncating.clone();
+        let installs = self.installs.clone();
+        let worker = self.ckpt_worker.clone();
+        let jobs = self.flight_jobs.clone();
+        let closing = self.closing.clone();
+        let _ = self.inner.starter.set(Box::new(move || {
+            if closing.load(Ordering::Acquire) {
+                return;
+            }
+            let Some(inner) = shared.upgrade() else {
+                return;
+            };
+            let ctx = FlightCtx {
+                inner,
+                group: group.clone(),
+                class,
+                flight_hold: flight_hold.clone(),
+                over_hard: over_hard.clone(),
+                truncating: truncating.clone(),
+                installs: installs.clone(),
+            };
+            if let Err(e) = dispatch_to(&worker, &jobs, Box::new(move || run_owed_start(ctx))) {
+                tracing::warn!("branch catalog checkpoint not started (no worker): {e}");
+            }
+        }));
     }
 
     /// F-FZ: start a fuzzy checkpoint unless one is in flight. Parked Commits (C-R) are settled
@@ -6309,7 +6412,7 @@ impl BranchStore {
 
     /// What a fuzzy checkpoint's start needs of its store (L2(d)): Arc clones only, so the
     /// checkpoint worker can run the start itself, off every operation's hold
-    /// (`start_owed_flight`; ASYNC-DESIGN R1.3, superseding §6.2's start in `maybe_compact`).
+    /// (`install_starter`; ASYNC-DESIGN R1.3, superseding §6.2's start in `maybe_compact`).
     fn flight_ctx(&self) -> FlightCtx {
         FlightCtx {
             inner: self.inner.clone(),
@@ -6505,46 +6608,7 @@ impl BranchStore {
     /// its parent's, and starts its own. A worker that died is replaced once. Mutant
     /// `checkpoint_thread_per_flight` (test builds only): a new thread for every one, as before.
     fn dispatch_flight(&self, job: CkptJob) -> std::io::Result<()> {
-        if fe_mutant("checkpoint_thread_per_flight") {
-            let jobs = self.flight_jobs.clone();
-            jobs.0.lock().unwrap_or_else(|e| e.into_inner()).0 += 1;
-            let handle = crate::thread::Builder::new().name("branch-checkpoint".to_string()).spawn(move || {
-                job();
-                CkptWorker::finished(&jobs);
-            });
-            return handle.map(drop).inspect_err(|_| CkptWorker::finished(&self.flight_jobs));
-        }
-        let mut worker = self.ckpt_worker.lock();
-        let pid = std::process::id();
-        if worker.as_ref().is_some_and(|w| w.pid != pid) {
-            // The parent's thread does not exist in this process: never joined, never sent to.
-            std::mem::forget(worker.take());
-        }
-        self.flight_jobs.0.lock().unwrap_or_else(|e| e.into_inner()).0 += 1;
-        let mut job = job;
-        for _ in 0..2 {
-            if worker.is_none() {
-                match CkptWorker::start(self.flight_jobs.clone()) {
-                    Ok(w) => *worker = Some(w),
-                    Err(e) => {
-                        CkptWorker::finished(&self.flight_jobs);
-                        return Err(e);
-                    }
-                }
-            }
-            match worker.as_ref().expect("started above").tx.send(job) {
-                Ok(()) => return Ok(()),
-                Err(std::sync::mpsc::SendError(back)) => {
-                    // It exited: joined, and replaced.
-                    if let Some(w) = worker.take() {
-                        let _ = w.handle.join();
-                    }
-                    job = back;
-                }
-            }
-        }
-        CkptWorker::finished(&self.flight_jobs);
-        Err(std::io::Error::other("the branch catalog checkpoint worker could not be started"))
+        dispatch_to(&self.ckpt_worker, &self.flight_jobs, job)
     }
 
     /// Wait for every fuzzy checkpoint handed out so far to finish (F-FZ). Called without the
@@ -7044,7 +7108,6 @@ impl BranchStore {
         held_trace("fork.done");
         let work = inner.names.filter.take_owed();
         drop(inner);
-        self.start_owed_flight();
         self.start_filter_work(work);
         Ok(TrunkFork::Forked { id, lsn, after })
     }
@@ -7127,7 +7190,6 @@ impl BranchStore {
         self.maybe_compact(&mut inner);
         let work = inner.names.filter.take_owed();
         drop(inner);
-        self.start_owed_flight();
         self.start_filter_work(work);
         Ok((id, lsn))
     }
@@ -7390,7 +7452,6 @@ impl BranchStore {
         self.maybe_compact(&mut inner);
         let class = inner.sync;
         drop(inner);
-        self.start_owed_flight();
         kill_point("release.applied");
         #[cfg(test)]
         pause_at(Some(&*self.trunk_commit_hold), HOLD_RELEASE_BUFFERED);
@@ -8164,8 +8225,7 @@ impl BranchStore {
                 self.unsynced.store(false, Ordering::Release);
                 self.maybe_compact(&mut inner);
                 drop(inner);
-                self.start_owed_flight();
-                kill_point("trunk.barrier_done");
+                        kill_point("trunk.barrier_done");
                 #[cfg(test)]
                 pause_at(Some(&*self.trunk_commit_hold), HOLD_TRUNK_BARRIER_DONE);
                 skip_backpressure(backpressure, ordered);
@@ -8468,7 +8528,6 @@ impl BranchStore {
         self.maybe_compact(&mut inner);
         let class = inner.sync;
         drop(inner);
-        self.start_owed_flight();
         kill_point("commit.applied");
         let durable = self.wait_durable(lsn, class);
         // fastest-engine mutant `commit_doubt_ignored` (test builds only).
@@ -9706,6 +9765,7 @@ impl Drop for BranchStore {
     /// (A crash loses the time since the last stamp, which extends leases and never shortens one.)
     /// A fuzzy checkpoint in flight is finished first: its thread holds the store's files.
     fn drop(&mut self) {
+        self.closing.store(true, Ordering::Release);
         self.flight_hold.store(0, Ordering::Release);
         #[cfg(test)]
         self.group.confirm_hold.store(0, Ordering::Release);
