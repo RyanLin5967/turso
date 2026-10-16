@@ -582,6 +582,8 @@ def summarize(out, sha, dry, manifest):
             for x in r["warmup_rules"] or [None]:
                 if x is None or x != rule:
                     parity.append(f"{fs}/{cell}: warm-up rule {x!r}, the package's {rule!r}")
+                    # C27 LOW: a rule refusal is a warm-up refusal too, so warmup_creditable reads it (finding 7)
+                    warm.append(f"{fs}/{cell}: warm-up rule {x!r}, the package's {rule!r}")
             for x in r["ops_measured"] or [None]:
                 if x is None or x != want:
                     parity.append(f"{fs}/{cell}: measured {x!r} ops, planned {want!r}")
