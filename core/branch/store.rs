@@ -4739,6 +4739,13 @@ impl CkptWorker {
     }
 }
 
+/// A name's lookup under the store mutex (`BranchStore::lookup_named_locked`).
+enum NamedLookup {
+    Found(BranchId),
+    /// No branch holds the name; `own_release` is its newest Release still in the air.
+    Missing { poisoned: bool, own_release: Option<u64> },
+}
+
 /// A client's bound on a store wait (review C42-M1: one shared interruptible wait): it ends at
 /// `until`, or as soon as `interrupted` returns true.
 pub(crate) struct Wait<'a> {
@@ -7978,13 +7985,30 @@ impl BranchStore {
         check_branch_name(name)?;
         // F-FZ back-pressure: dropped after the guard below.
         let _backpressure = Backpressure(self);
-        let inner = self.inner.lock();
+        let mut inner = self.inner.lock();
         held_trace("drop.locked");
-        let mut inner = inner;
+        // ONE lookup, `branch_named`'s (review delete MED-1: a copy had no killer).
+        match self.lookup_named_locked(&mut inner, name)? {
+            NamedLookup::Found(id) => self.release_locked(inner, id, true),
+            NamedLookup::Missing { poisoned, own_release } => {
+                drop(inner);
+                // Mutant `drop_miss_no_release_wait` (test builds only): the drop's miss answers at
+                // once, its name's Release still in the air.
+                if !fe_mutant("drop_miss_no_release_wait") {
+                    self.wait_missing_release(poisoned, own_release)?;
+                }
+                Err(untyped_branch_error(LimboError::NoSuchBranch(name.to_string())))
+            }
+        }
+    }
+
+    /// A name looked up under the store mutex, for `branch_named` and `drop_named` alike: the index
+    /// (`name_lookup`), and on a stopped store a branch whose Release did not become durable (a
+    /// reopen brings it back under its name, engine review 7 #3); for a miss, the newest Release of
+    /// this very name still in the air (engine review 7 #11).
+    fn lookup_named_locked(&self, inner: &mut StoreInner, name: &str) -> Result<NamedLookup> {
         let found = inner.name_lookup(name)?;
         let poisoned = inner.poisoned();
-        // A stopped store still finds a branch whose Release did not become durable (engine review
-        // 7 #3), as `branch_named` does.
         let found = match found {
             None if poisoned => {
                 let durable = self.group.durable(self.class);
@@ -7993,19 +8017,38 @@ impl BranchStore {
             }
             found => found,
         };
-        let Some(id) = found else {
-            let own_release = if poisoned {
-                None
-            } else {
-                inner.releases_in_air.iter().rev().find(|r| r.name.as_deref() == Some(name)).map(|r| r.lsn)
-            };
-            drop(inner);
-            if let Some(lsn) = own_release.filter(|&lsn| self.group.durable(self.class) < lsn) {
-                self.wait_durable(lsn, self.class)?;
-            }
-            return Err(untyped_branch_error(LimboError::NoSuchBranch(name.to_string())));
+        Ok(match found {
+            Some(id) => NamedLookup::Found(id),
+            None => NamedLookup::Missing {
+                poisoned,
+                own_release: if poisoned {
+                    None
+                } else {
+                    inner.releases_in_air.iter().rev().find(|r| r.name.as_deref() == Some(name)).map(|r| r.lsn)
+                },
+            },
+        })
+    }
+
+    /// A missing name is not reported free before the Release that freed it is durable (review 3
+    /// #17): a crash would bring the branch back under the name. Only this name's own Release in
+    /// the air may be it, and with none, or with it durable already (a lock-free compare), nothing
+    /// is waited for (engine review 7 #11). A stopped store waits for nothing. Mutants
+    /// `lookup_no_release_wait` (no wait at all) and `lookup_waits_any_release` (as before: the
+    /// newest Release of any name), test builds only; both reach the drop too.
+    fn wait_missing_release(&self, poisoned: bool, own_release: Option<u64>) -> Result<()> {
+        if poisoned || fe_mutant("lookup_no_release_wait") {
+            return Ok(());
+        }
+        let lsn = if fe_mutant("lookup_waits_any_release") {
+            Some(self.last_release_lsn.load(Ordering::Acquire))
+        } else {
+            own_release
         };
-        self.release_locked(inner, id, true)
+        if let Some(lsn) = lsn.filter(|&lsn| self.group.durable(self.class) < lsn) {
+            self.wait_durable(lsn, self.class)?;
+        }
+        Ok(())
     }
 
     /// `release_checked`'s work, in the hold its caller took.
@@ -8173,55 +8216,22 @@ impl BranchStore {
     pub(crate) fn branch_named(&self, name: &str) -> Result<Option<BranchId>> {
         self.refuse_if_trunk_only("looking a branch up by name")?;
         check_branch_name(name)?;
-        let (found, poisoned, own_release) = {
+        let lookup = {
             let mut inner = self.inner.lock();
-            let found = inner.name_lookup(name)?;
-            let poisoned = inner.poisoned();
-            // A stopped store still finds a branch whose Release did not become durable: a reopen
-            // brings it back under its name (engine review 7 #3).
-            let found = match found {
-                None if poisoned => {
-                    let durable = self.group.durable(self.class);
-                    let mut unflown = inner.unflown_releases(durable);
-                    unflown.find(|r| r.name.as_deref() == Some(name)).map(|r| r.id)
-                }
-                found => found,
-            };
-            // The newest Release of this very name still in the air, if any (engine review 7
-            // #11): `releases_in_air` holds every early-released Release until it is durable.
-            let own_release = if found.is_none() && !poisoned {
-                inner
-                    .releases_in_air
-                    .iter()
-                    .rev()
-                    .find(|r| r.name.as_deref() == Some(name))
-                    .map(|r| r.lsn)
-            } else {
-                None
-            };
-            (found, poisoned, own_release)
+            self.lookup_named_locked(&mut inner, name)?
         };
-        // Not before its fork is durable (review C-F4): a crash would lose a branch already found.
-        if let Some(id) = found {
-            self.settle(id, false)?;
-        } else if !poisoned && !fe_mutant("lookup_no_release_wait") {
-            // Nor reported free before the Release that freed it is durable (review 3 #17): a crash
-            // would bring the branch back under the name. Only this name's own Release in the air
-            // may be it, and with none, or with it durable already (a lock-free compare), nothing
-            // is waited for (engine review 7 #11: every miss took the group's lock and waited out
-            // any Release in the air). Mutants `lookup_no_release_wait` (no wait at all) and
-            // `lookup_waits_any_release` (as before: the newest Release of any name), test
-            // builds only.
-            let lsn = if fe_mutant("lookup_waits_any_release") {
-                Some(self.last_release_lsn.load(Ordering::Acquire))
-            } else {
-                own_release
-            };
-            if let Some(lsn) = lsn.filter(|&lsn| self.group.durable(self.class) < lsn) {
-                self.wait_durable(lsn, self.class)?;
+        match lookup {
+            // Not before its fork is durable (review C-F4): a crash would lose a branch already
+            // found.
+            NamedLookup::Found(id) => {
+                self.settle(id, false)?;
+                Ok(Some(id))
+            }
+            NamedLookup::Missing { poisoned, own_release } => {
+                self.wait_missing_release(poisoned, own_release)?;
+                Ok(None)
             }
         }
-        Ok(found)
     }
 
     /// Wait, holding no lock, until branch `id` may be found, attached or (`readable`) opened
