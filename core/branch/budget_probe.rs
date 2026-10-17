@@ -93,6 +93,10 @@ pub(crate) static AUDIT_PATH: std::sync::Mutex<Option<String>> = std::sync::Mute
 /// (armed, its end count read), by the guard's own identity, recorded or not. The audit's premise is
 /// `seen == recorded + lost`.
 pub(crate) static AUDIT_SEEN: AtomicU64 = AtomicU64::new(0);
+/// Counters review 2 MED 3: outermost holds of an audited store the probe saw and did not record by
+/// its own gates (not armed at its lock, or its end count unreadable): the premise is
+/// `seen == recorded + lost + excluded`, with seen counted by the guard, outside the probe.
+pub(crate) static AUDIT_EXCLUDED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static AUDIT_LOG: std::sync::Mutex<Vec<HoldRec>> = std::sync::Mutex::new(Vec::new());
 pub(crate) static AUDIT_LOST: AtomicU64 = AtomicU64::new(0);
 /// Holds `attribute` refused (any thread), observation only.
@@ -522,7 +526,18 @@ pub(crate) fn store_unlocked_of(own: Option<(usize, bool)>) {
         // Review 2 L7: the kernel count is read only when an armed hold sampled it at its lock.
         // Class (b): the hold's syscalls are this thread's only if no other thread ran during it
         // (`hold_attributed`); otherwise the hold is counted as unattributable, never as held.
-        if let Some(since) = HELD_SINCE.with(|s| s.take()) {
+        // The hold's audit decision, made once (counters review 2 MED 4: AUDIT was loaded twice, so a
+        // disarm between the loads split a hold): a guard's (`own`, already AND-ed with AUDIT by
+        // `StoreGuard::drop`), or for a direct test caller the scope's.
+        let (store, audited) = match own {
+            Some(o) => o,
+            None => (crate::branch::store::scope_store_id(), AUDIT.load(Relaxed) && crate::branch::store::scope_is_audited()),
+        };
+        let since = HELD_SINCE.with(|s| s.take());
+        if since.is_none() && audited {
+            AUDIT_EXCLUDED.fetch_add(1, Relaxed);
+        }
+        if let Some(since) = since {
             // The shim's counts (of the threads at the start), then the kernel's, then the table:
             // the mirror of the start's order (see `store_locked_at`).
             let c1 = HOLD_T0.with(|t0| t0.try_borrow().map(|t0| shim_counts(&t0[..])).unwrap_or([0; 48]));
@@ -533,6 +548,9 @@ pub(crate) fn store_unlocked_of(own: Option<(usize, bool)>) {
             if now.is_none() {
                 HELD_UNATTRIBUTED.fetch_add(1, Relaxed);
                 bump(&T_HELD_UNATTRIBUTED, 1);
+                if audited {
+                    AUDIT_EXCLUDED.fetch_add(1, Relaxed);
+                }
             }
             if let Some(now) = now {
                 let held = now.wrapping_sub(since) & u64::from(u32::MAX);
@@ -554,17 +572,9 @@ pub(crate) fn store_unlocked_of(own: Option<(usize, bool)>) {
                     HELD_UNATTRIBUTED.fetch_add(1, Relaxed);
                     bump(&T_HELD_UNATTRIBUTED, 1);
                 }
-                if AUDIT.load(Relaxed) && own.is_some_and(|o| o.1) {
-                    AUDIT_SEEN.fetch_add(1, Relaxed);
-                }
                 // Counters review E1: the store whose hold this is comes from its guard, never from
-                // whatever scope is innermost (a nested store's, a stray one); a direct test caller
-                // (`own` None) still reads the scope.
-                let (store, audited) = match own {
-                    Some(o) => o,
-                    None => (crate::branch::store::scope_store_id(), crate::branch::store::scope_is_audited()),
-                };
-                if AUDIT.load(Relaxed) && audited {
+                // whatever scope is innermost (a nested store's, a stray one).
+                if audited {
                     let get = |c: &'static std::thread::LocalKey<Cell<u64>>| c.with(|c| c.get());
                     let (allocs0, stmts0) = HOLD_START2.with(|h| h.get());
                     let me = t1.iter().find(|t| t.me).map_or(0, |t| t.id);

@@ -1543,7 +1543,14 @@ impl Drop for StoreGuard<'_> {
         // guard's own identity is passed too: the audit counts every outermost hold of an audited
         // store by it (`AUDIT_SEEN`).
         let own = self.1;
-        super::budget_probe::store_unlocked_of(Some((Arc::as_ptr(own) as usize, own.audited.load(Ordering::Relaxed))));
+        // Counters review 2 MED 3/MED 4: the audit decision is made here, once (AUDIT loaded once),
+        // and every outermost hold of an audited store is counted SEEN here, on the guard's own
+        // gates, outside the probe, so a hold the probe skipped or lost cannot drop out of both.
+        let audited = super::budget_probe::AUDIT.load(Ordering::Relaxed) && own.audited.load(Ordering::Relaxed);
+        if audited && STORE_HELD.with(|held| held.get()) == 0 {
+            super::budget_probe::AUDIT_SEEN.fetch_add(1, Ordering::Relaxed);
+        }
+        super::budget_probe::store_unlocked_of(Some((Arc::as_ptr(own) as usize, audited)));
         if fe_mutant("audit_stray_scope") {
             scope_pop();
         }

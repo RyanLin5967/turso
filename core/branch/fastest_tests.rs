@@ -8958,7 +8958,7 @@ fn a_failed_filter_drain_never_answers_absent_for_a_held_name() {
 /// The claim lists every (operation, site) whose worst hold did any of the three, so each instance of
 /// the class is named where it lives.
 fn lifecycle_audit(n: u32) {
-    use super::budget_probe::{self as probe, HoldRec, AUDIT, AUDIT_LOG, AUDIT_LOST, AUDIT_SEEN};
+    use super::budget_probe::{self as probe, HoldRec, AUDIT, AUDIT_EXCLUDED, AUDIT_LOG, AUDIT_LOST, AUDIT_SEEN};
     use std::sync::atomic::Ordering::{Relaxed, Release};
     let _s = serial();
     struct Disarm;
@@ -9003,6 +9003,7 @@ fn lifecycle_audit(n: u32) {
         log.reserve(1 << 20);
         AUDIT_SEEN.store(0, Release);
         AUDIT_LOST.store(0, Release);
+        AUDIT_EXCLUDED.store(0, Release);
     }
     let mut marks: Vec<(&str, usize)> = Vec::new();
     let mark = |marks: &mut Vec<(&'static str, usize)>, op: &'static str| marks.push((op, AUDIT_LOG.lock().unwrap().len()));
@@ -9077,25 +9078,38 @@ fn lifecycle_audit(n: u32) {
     trunk.create_branch("after-rebuild").unwrap();
     db.branch_wait_name_filter();
     mark(&mut marks, "end");
+    // Counters review 2 MED 4: what the claim reads of the store is read before the disarm; the
+    // store is closed (its background threads joined) after it and before the counts are read,
+    // so no hold is in flight while the log and the counts are compared.
+    let (filter_builds, filter_rebuilds, own) =
+        (db.branches.name_filter_stats().3, db.branches.name_filter_state_for_test().1, db.branches.store_id_for_test());
     AUDIT.store(false, Release);
     probe::arm(false);
+    drop(trunk);
+    drop(db);
     let log: Vec<HoldRec> = AUDIT_LOG.lock().unwrap().clone();
     assert_eq!(AUDIT_LOST.load(Relaxed), 0, "premise: the audit log lost holds (its room was too small)");
     // Lead ruling 67664df569: the scoping cannot silently empty the audit. This arm recorded at least
     // one hold, and every hold it recorded is of its OWN store.
     // Counters review E1: the audit is complete: every outermost hold of this store it should have
     // recorded, counted by the guard's own identity, is in its log or counted lost.
-    let seen = AUDIT_SEEN.load(Relaxed);
-    assert_eq!(seen, log.len() as u64 + AUDIT_LOST.load(Relaxed), "premise: the audit saw {seen} holds of its store and recorded {} (n = {n})", log.len());
-    let own = db.branches.store_id_for_test();
+    // Counters review 2 MED 3: seen is counted by the store's guard, outside the probe, and the probe
+    // counts what its own gates excluded, so a hold it skipped breaks the equation.
+    let (seen, excluded) = (AUDIT_SEEN.load(Relaxed), AUDIT_EXCLUDED.load(Relaxed));
+    assert_eq!(
+        seen,
+        log.len() as u64 + AUDIT_LOST.load(Relaxed) + excluded,
+        "premise: the audit saw {seen} holds of its store, recorded {} and excluded {excluded} (n = {n})",
+        log.len()
+    );
     let mine = log.iter().filter(|r| r.store == own).count();
     assert!(
         mine > 0 && mine == log.len(),
         "premise: the audit recorded {mine} holds of its own store, of {} (n = {n})",
         log.len()
     );
-    assert!(db.branches.name_filter_stats().3 > builds0, "premise: no filter growth happened ({entries0} entries)");
-    assert!(db.branches.name_filter_state_for_test().1 > rebuilds0, "premise: the forced overflow never rebuilt the filter");
+    assert!(filter_builds > builds0, "premise: no filter growth happened ({entries0} entries)");
+    assert!(filter_rebuilds > rebuilds0, "premise: the forced overflow never rebuilt the filter");
     // Group each hold under the operation whose span it fell in.
     let mut worst: std::collections::BTreeMap<(&str, String), (u64, u64, u64, u64, u64, bool)> = Default::default();
     for (w, pair) in marks.windows(2).enumerate() {
