@@ -3221,7 +3221,8 @@ fn every_setter_whose_value_translation_reads_bumps_the_prepare_generation() {
             }
         }
     }
-    let setter = regex::Regex::new(r"\n    pub(?:\(crate\))? fn set_(\w+)\(&self[^{]*\{").unwrap();
+    // Review C42 LOW-5: pub(super) and generic setters, and the Arc-receiver form, are scanned too.
+    let setter = regex::Regex::new(r"\n    pub(?:\((?:crate|super)\))? fn set_(\w+)(?:<[^>]*>)?\((?:&self|self: &Arc<Self>)[^{]*\{").unwrap();
     let mut checked = Vec::new();
     let mut missing = Vec::new();
     for m in setter.captures_iter(&conn) {
@@ -3250,7 +3251,18 @@ fn every_setter_whose_value_translation_reads_bumps_the_prepare_generation() {
             }
         }
     }
-    assert!(checked.len() >= 10, "premise: only {} setters found read under translate/ ({checked:?}): the scan is broken", checked.len());
+    // Review C42 LOW-5: the EXACT derived set (a Python run of the same scan over 498074b78), so a
+    // partial break of the scan, or a new setter read in translation, fails here until it is looked
+    // at, not only a scan that finds fewer than ten.
+    const DERIVED: &[&str] = &[
+        "busy_timeout", "cache_size", "capture_data_changes_info", "check_constraints_ignored", "count_changes",
+        "data_sync_retry", "dml_require_where", "dqs_dml", "foreign_keys_enabled", "full_column_names",
+        "mvcc_checkpoint_threshold", "mvcc_gc_threshold", "query_only", "row_image_apply", "short_column_names",
+        "sync_mode", "sync_type", "temp_store",
+    ];
+    let mut sorted = checked.clone();
+    sorted.sort();
+    assert_eq!(sorted, DERIVED, "premise: the setters read under translate/ differ from the derived set: a broken scan, or a new setter to classify");
     assert!(
         missing.is_empty(),
         "CLAIM: setters whose value translation reads never bump the prepare generation (cached programs keep the old value): {missing:?}"
