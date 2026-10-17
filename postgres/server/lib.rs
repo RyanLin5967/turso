@@ -1367,9 +1367,12 @@ struct SessionState {
     /// multi-statement query, or a pipeline up to Sync, in: an engine BEGIN the client did not send
     /// (see [`Session::begin_implicit`]).
     implicit: bool,
-    /// The statement the last Describe prepared, for the Execute that follows it to run instead of
-    /// preparing it again (see [`Session::describe_prepare`]); cleared at Sync.
-    described: Option<Described>,
+    /// The statements this round's Parse, Bind or Describe prepared, each for the Execute of the
+    /// same text that follows it to run instead of preparing it again (see
+    /// [`Session::describe_prepare`]); cleared at Sync. One per text: a pipelined Bind A, Bind B,
+    /// Execute A, Execute B reuses both (C53 follow-up review B3; one kept statement made it 4
+    /// prepares instead of 2).
+    described: Kept,
     /// Notices the session's statements raised and the client has not been sent yet: the simple
     /// protocol sends each before its statement's result, the extended one before ReadyForQuery.
     notices: Vec<Box<ErrorInfo>>,
@@ -1436,6 +1439,52 @@ struct Described {
     stmt: turso_core::Statement,
     /// The types the parse gave (see [`PgConnection::prepare_typed`]).
     types: StatementTypes,
+}
+
+/// The prepared statements a round keeps ([`SessionState::described`]): at most [`Kept::MAX`], the
+/// oldest dropped first, so a pipeline that never Syncs holds a bounded number of statements (and
+/// their connections) open.
+#[derive(Default)]
+struct Kept(Vec<Described>);
+
+impl Kept {
+    const MAX: usize = 16;
+
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    /// The statement kept for `sql`, on any connection (the newest).
+    fn for_sql(&self, sql: &str) -> Option<&Described> {
+        self.0.iter().rev().find(|d| d.sql == sql)
+    }
+
+    /// Whether `sql` is kept on `conn`.
+    fn holds(&self, sql: &str, conn: &Arc<turso_core::Connection>) -> bool {
+        self.0.iter().any(|d| d.sql == sql && Arc::ptr_eq(&d.conn, conn))
+    }
+
+    /// Keep `d`, in place of any statement kept for its text.
+    fn put(&mut self, d: Described) {
+        self.0.retain(|k| k.sql != d.sql);
+        if self.0.len() == Self::MAX {
+            self.0.remove(0);
+        }
+        self.0.push(d);
+    }
+
+    fn remove(&mut self, sql: &str) {
+        self.0.retain(|k| k.sql != sql);
+    }
+
+    /// Take the statement kept for `sql` on `conn`.
+    fn take(&mut self, sql: &str, conn: &Arc<turso_core::Connection>) -> Option<Described> {
+        let at = self
+            .0
+            .iter()
+            .position(|d| d.sql == sql && Arc::ptr_eq(&d.conn, conn))?;
+        Some(self.0.remove(at))
+    }
 }
 
 /// CHECKPOINTs skipped inside a block because the WAL was busy (see [`Session::checkpoint`]),
@@ -1536,7 +1585,7 @@ impl Session {
     fn end_round(&self) -> (Vec<Box<ErrorInfo>>, TransactionStatus) {
         let notices = {
             let mut st = self.state();
-            st.described = None;
+            st.described.clear();
             std::mem::take(&mut st.notices)
         };
         (self.deliverable(notices), self.transaction_status())
@@ -2085,7 +2134,7 @@ impl Session {
             Some(call) => {
                 // A statement a Describe kept holds its connection open: a switch away, or a
                 // delete of the branch it is on, must not find that connection still alive.
-                st.described = None;
+                st.described.clear();
                 self.branch(&mut st, &conn, &call, portal, format)
             }
             None if is_checkpoint(sql) => self.checkpoint(&mut st, in_tx),
@@ -2248,7 +2297,7 @@ impl Session {
         match conn.parse_step(&parsed.sql, msg).map_err(engine_error)? {
             Some((stmt, types)) => {
                 parameter_types(&types, declared).map_err(PgWireError::UserError)?;
-                self.state().described = Some(Described {
+                self.state().described.put(Described {
                     conn: conn.inner().clone(),
                     sql: parsed.sql.clone(),
                     stmt,
@@ -2278,18 +2327,13 @@ impl Session {
         // The server performs AND CHAIN when a failed block recovers; translating it here
         // would reject that supported path before Execute can inspect the block's state.
         if matches!(TxVerb::of(sql), TxVerb::Chain { .. }) {
-            self.state().described = None;
+            self.state().described.clear();
             return Ok(());
         }
         let conn = self
             .current(&mut self.state())
             .map_err(PgWireError::UserError)?;
-        if self
-            .state()
-            .described
-            .as_ref()
-            .is_some_and(|d| d.sql == sql && Arc::ptr_eq(&d.conn, conn.inner()))
-        {
+        if self.state().described.holds(sql, conn.inner()) {
             return Ok(());
         }
         let in_tx = !conn.inner().get_auto_commit();
@@ -2298,7 +2342,7 @@ impl Session {
         // answer NoData, and Execute performs them once (wire review 2 item 2, review 3 item 2).
         match conn.prepare_for_describe(sql) {
             Ok(Some((stmt, types))) => {
-                self.state().described = Some(Described {
+                self.state().described.put(Described {
                     conn: conn.inner().clone(),
                     sql: sql.to_string(),
                     stmt,
@@ -2307,7 +2351,7 @@ impl Session {
                 Ok(())
             }
             Ok(None) => {
-                self.state().described = None;
+                self.state().described.remove(sql);
                 Ok(())
             }
             Err(e) => {
@@ -2325,19 +2369,20 @@ impl Session {
     /// typed by the parameter's type (`declared`, else inferred: [`result_column_types`]).
     fn described_fields(
         &self,
+        sql: &str,
         format: &Format,
         declared: &[Option<Type>],
     ) -> SqlResult<Vec<FieldInfo>> {
-        self.state().described.as_ref().map_or(Ok(Vec::new()), |d| {
+        self.state().described.for_sql(sql).map_or(Ok(Vec::new()), |d| {
             result_fields(&d.stmt, &result_column_types(&d.types, declared), format)
         })
     }
 
     /// The parameter types of the statement [`Session::describe_prepare`] kept (see
     /// [`parameter_types`]); only the declared ones when it kept none.
-    fn described_parameters(&self, declared: &[Option<Type>]) -> SqlResult<Vec<Type>> {
+    fn described_parameters(&self, sql: &str, declared: &[Option<Type>]) -> SqlResult<Vec<Type>> {
         let st = self.state();
-        match st.described.as_ref() {
+        match st.described.for_sql(sql) {
             Some(d) => parameter_types(&d.types, declared),
             None => Ok(declared
                 .iter()
@@ -2353,12 +2398,9 @@ impl Session {
         sql: &str,
     ) -> Option<(turso_core::Statement, StatementTypes)> {
         let mut st = self.state();
-        match st.described.take() {
-            Some(d) if d.sql == sql && Arc::ptr_eq(&d.conn, conn.inner()) => {
-                Some((d.stmt, d.types))
-            }
-            _ => None,
-        }
+        st.described
+            .take(sql, conn.inner())
+            .map(|d| (d.stmt, d.types))
     }
 
     /// One statement through the engine. A statement that meets a lock another session holds waits
@@ -2796,7 +2838,7 @@ impl Session {
     /// the session drops.
     fn end(&self) {
         let mut st = self.state();
-        st.described = None;
+        st.described.clear();
         st.implicit = false;
         st.trunk = None;
         if let Some((name, conn)) = st.branch.take() {
@@ -4096,7 +4138,7 @@ impl ExtendedQueryHandler for Session {
         }
         if portal.statement.statement.call.is_none() && !portal.parameters.is_empty() {
             let params = self
-                .described_parameters(&portal.statement.parameter_types)
+                .described_parameters(&portal.statement.statement.sql, &portal.statement.parameter_types)
                 .map_err(PgWireError::UserError)?;
             if params.len() == portal.parameters.len() {
                 decode_portal_parameters(&portal, &params)?;
@@ -4422,15 +4464,15 @@ impl ExtendedQueryHandler for Session {
         }
         self.describe_prepare(sql)?;
         let fields = self
-            .described_fields(&Format::UnifiedText, &target.parameter_types)
+            .described_fields(sql, &Format::UnifiedText, &target.parameter_types)
             .map_err(PgWireError::UserError)?;
         let params = self
-            .described_parameters(&target.parameter_types)
+            .described_parameters(sql, &target.parameter_types)
             .map_err(PgWireError::UserError)?;
         // Fixed, or checked against the fixed ones, by a Describe that prepared the statement
         // (see [`Parsed`]); one whose prepare would perform it prepared nothing, and its Execute
         // fixes them.
-        if self.state().described.is_some() {
+        if self.state().described.for_sql(sql).is_some() {
             let parsed = &target.statement;
             parsed.fix_params(&params).map_err(PgWireError::UserError)?;
             parsed
@@ -4466,12 +4508,13 @@ impl ExtendedQueryHandler for Session {
         self.describe_prepare(sql)?;
         let fields = self
             .described_fields(
+                sql,
                 &portal.result_column_format,
                 &portal.statement.parameter_types,
             )
             .map_err(PgWireError::UserError)?;
         // As do_describe_statement: the result types only, which a portal's Describe reports.
-        if self.state().described.is_some() {
+        if self.state().described.for_sql(sql).is_some() {
             portal
                 .statement
                 .statement
