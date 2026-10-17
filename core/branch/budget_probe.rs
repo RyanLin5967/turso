@@ -181,8 +181,8 @@ fn record_free(bytes: usize) {
         return;
     }
     T_REC_ON.with(|r| r.set(false));
-    let trace = format!("free of {bytes} bytes:\n{}", std::backtrace::Backtrace::force_capture());
-    T_TRACES.with(|t| t.borrow_mut().push(trace));
+    let trace = format!("free of {bytes} bytes:\n{}", std::backtrace::Backtrace::force_capture()); // lint-allow: the recorder (record_allocs, record_big), on only when a test asks, itself off here
+    T_TRACES.with(|t| t.borrow_mut().push(trace)); // lint-allow: the recorder (record_allocs, record_big), on only when a test asks, itself off here
     T_REC_ON.with(|r| r.set(true));
 }
 
@@ -223,8 +223,8 @@ fn record_alloc(bytes: usize) {
     }
     if n >= T_TRACE_FROM.with(|t| t.get()) {
         T_REC_ON.with(|r| r.set(false));
-        let trace = format!("alloc #{n} of {bytes} bytes:\n{}", std::backtrace::Backtrace::force_capture());
-        T_TRACES.with(|t| t.borrow_mut().push(trace));
+        let trace = format!("alloc #{n} of {bytes} bytes:\n{}", std::backtrace::Backtrace::force_capture()); // lint-allow: the recorder (record_allocs, record_big), on only when a test asks, itself off here
+        T_TRACES.with(|t| t.borrow_mut().push(trace)); // lint-allow: the recorder (record_allocs, record_big), on only when a test asks, itself off here
         T_REC_ON.with(|r| r.set(true));
     }
 }
