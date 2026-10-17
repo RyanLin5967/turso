@@ -2681,6 +2681,9 @@ pub(crate) static FILTER_HOLD_FREES_ARMED: AtomicBool = AtomicBool::new(false);
 pub(crate) static FILTER_HOLD_FREED_MAX: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 pub(crate) static BUILD_TABLE_REFUSES: AtomicBool = AtomicBool::new(false);
+/// Test builds: the next build's drain copy of its pending table fails (review filter3 L3).
+#[cfg(test)]
+pub(crate) static BUILD_DRAIN_FAILS: AtomicBool = AtomicBool::new(false);
 /// Test builds (review m1-2b LOW-F2): the most bytes one `NameFilter::note` freed, inside the store
 /// mutex hold that noted it (a refusing table dropped there). A test resets it.
 #[cfg(test)]
@@ -9784,7 +9787,13 @@ impl BranchStore {
             }
             return FilterBuild::Ended;
         }
-        let copied = pending.copy_into(&table);
+        // Failpoint `BUILD_DRAIN_FAILS` (test builds; review filter3 L3): the drain copy fails, as
+        // a copy refused at a name does.
+        #[cfg(test)]
+        let drain_fails = BUILD_DRAIN_FAILS.swap(false, Ordering::AcqRel);
+        #[cfg(not(test))]
+        let drain_fails = false;
+        let copied = !drain_fails && pending.copy_into(&table);
         let mut inner = shared.lock();
         let f = &mut inner.names.filter;
         if matches!(&f.state, FilterState::Draining { table: t, pending: p } if Arc::ptr_eq(t, &table) && Arc::ptr_eq(p, &pending)) {
@@ -9792,9 +9801,10 @@ impl BranchStore {
                 f.state = FilterState::Ready { table: table.clone() };
             } else {
                 // The two tables together still hold every name; notes go into the new one.
-                // Mutant `filter_answer_drops_pending` (test builds only; review m1-2c N3): the
-                // pending table is left out of the answer.
-                let kept = (!fe_mutant("filter_answer_drops_pending")).then(|| pending.clone());
+                // Mutant `filter_build_answer_drops_pending` (test builds only; review filter3 L3,
+                // split from the growth site's `filter_answer_drops_pending`): the pending table is
+                // left out of the answer.
+                let kept = (!fe_mutant("filter_build_answer_drops_pending")).then(|| pending.clone());
                 f.overflow_answering(Some(Answer { fixed: [kept, None], sink: table.clone() }));
             }
         }
