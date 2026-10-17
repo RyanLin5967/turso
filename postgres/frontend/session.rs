@@ -1911,31 +1911,19 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
                 lower.as_str(),
                 "utc" | "gmt" | "etc/utc" | "etc/gmt" | "z" | "zulu" | "uct" | "universal" | "0"
             );
-            // A zone PostgreSQL would know, as its check_timezone reads it (review
-            // c39799c5d..9e24b455d LOW 7, pg18-rev-c39-tzforms.out): an INTERVAL; a number of
-            // hours read whole as strtod reads it (`--5` and `inf` refused, `nan` and `5.5`
-            // accepted); a name in the host's zone database, matched without case as PostgreSQL
-            // matches it; or a POSIX TZ spec (`UTC+3`, `EST5EDT,M3.2.0,M11.1.0`, `+05:30`). A valid
-            // zone other than UTC is refused 0A000 below, as this server runs in UTC alone.
-            // BLIND SPOTS: a host zone database lacking a name PostgreSQL knows answers 22023 for
-            // it; PostgreSQL's range bound for a numeric offset is not recorded, so any finite
-            // number or NaN is valid here.
-            // UNVERIFIED beyond the recorded rows (review wire-rework C, finding (1)): the
-            // interval, strtod and tzcode grammar below follow PostgreSQL's check_timezone and
-            // tzparse as read, until one strict PG 18.6 recording of every case (LOUD-OWED).
-            // SET TIME ZONE INTERVAL '...' [fields] arrives as its own value (the wire line review
-            // M6: it arrived as the bare literal, quotes and all, which posix_tz read as a name);
-            // a TimeZone string starting "interval" is a zone name like any other (PG 18.6:
-            // 'interval' and 'interval x' are 22023, pg18-rev-cd-tz2.out).
-            if let PgSetValue::Interval { literal, range } = value {
-                return match timezone_interval(literal, *range) {
+            // check_timezone, as PG 18.6 answered every recorded value (THE ORACLE: rev-cd-tz2,
+            // rev-l1-tz, rev-c39-tzforms, rev-c39-tzpath; a model of these rules agrees with all 82
+            // recorded rows, codes and messages). A valid zone other than UTC is refused 0A000 below,
+            // as this server runs in UTC alone. BLIND SPOT: a host zone database lacking a name
+            // PostgreSQL knows answers 22023 for it.
+            if let PgSetValue::Interval { literal, .. } = value {
+                return match timezone_interval(literal) {
                     TzInterval::Offset => unsupported("this server answers only by its own setting of it"),
-                    // check_timezone refuses months and days with the setting's own message, the
-                    // value echoed as interval_out prints it (PG 18.6: "INTERVAL '1 day'", and
-                    // '1 month' as "INTERVAL '1 mon'"; review wire-line2 M3 #4).
-                    TzInterval::NotAllowed => refused(format!(
-                        "invalid value for parameter \"{pg_name}\": \"INTERVAL '{}'\"",
-                        interval_out(literal)
+                    // Months, days, an offset of 168 hours or more, or infinity: the setting's
+                    // own refusal, the value echoed as interval_out prints it ('1 mon', '7 days',
+                    // '200:00:00', '-1 days +01:00:00', 'infinity').
+                    TzInterval::Refused(shown) => refused(format!(
+                        "invalid value for parameter \"{pg_name}\": \"INTERVAL '{shown}'\""
                     )),
                     TzInterval::Malformed => Err(LimboError::ParseError(SqlErrorMessage::classified(
                         SqlErrorKind::InvalidDatetimeFormat,
@@ -1943,15 +1931,23 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
                     ))),
                 };
             }
-            // A bare offset with seconds (PG 18.6: '+05:30:15' is 22023 "time zone ... appears to
-            // use leap seconds", review wire-line2 M3 #32). Which seconds are refused (all, or
-            // only non-zero ones) is not recorded: owed in the L1 recording.
-            let bare = text.trim_start_matches(['+', '-']);
-            if bare.split(':').count() == 3 && bare.split(':').all(|p| !p.is_empty() && p.bytes().all(|c| c.is_ascii_digit())) {
-                return refused(format!("time zone \"{text}\" appears to use leap seconds"));
+            // A value starting "interval" or ":" is refused (recorded: 'interval', 'interval x',
+            // 'interval5', ':EST5').
+            if lower.starts_with("interval") || text.starts_with(':') {
+                return invalid();
             }
             let numeric = strtod_whole(&lower).is_some_and(|h| h.is_nan() || h.abs() < 168.0);
-            let valid = utc || numeric || zone_file(&text) || posix_tz(&text);
+            let valid = utc || numeric || zone_file(&text) || {
+                match posix_tz(&text) {
+                    PosixTz::Valid => true,
+                    PosixTz::Invalid => false,
+                    // An offset that is not a whole number of minutes (recorded: '+05:30:15',
+                    // 'UTC+3:59:30' refused; '+05:30:00', 'UTC+3:00:60' SET).
+                    PosixTz::LeapSeconds => {
+                        return refused(format!("time zone \"{text}\" appears to use leap seconds"))
+                    }
+                }
+            };
             if !valid {
                 return invalid();
             }
@@ -2046,112 +2042,119 @@ fn zone_file(name: &str) -> bool {
         && &magic == b"TZif"
 }
 
-/// A TimeZone value's `INTERVAL '...' [fields]` form, as check_timezone reads it: an offset with
-/// no months or days, or refused.
+/// A TimeZone value's `INTERVAL '...' [fields]` form, as check_timezone reads it (PG 18.6,
+/// pg18-rev-cd-tz2.out and pg18-rev-l1-tz.out). The fields are read but change nothing recorded
+/// (`INTERVAL '1 month' HOUR` is still refused).
 enum TzInterval {
     /// A valid offset.
     Offset,
-    /// Months or days given: 22023, the setting's own refusal.
-    NotAllowed,
-    /// A literal interval_in refuses: 22007.
+    /// Refused with the setting's own message, the value as interval_out prints it.
+    Refused(String),
+    /// A literal interval_in refuses: 22007 (`x`, `inf`, `nan`).
     Malformed,
 }
 
-/// `literal` is the interval's string, `range` its fields' INTERVAL_RANGE mask (None: no fields;
-/// read, not yet used). The literal is `[+-]h[:m[:s]]`, a bare number, or a list of
-/// `<number> <unit>`, where a non-zero year, month or day is not allowed. PG 18.6 (pg18-rev-cd-tz2.out): '1 day' and
-/// '1 month' 22023, 'x' 22007, '+05:00' HOUR TO MINUTE valid. BLIND SPOT: interval_in's full
-/// grammar (ISO 8601 `PT5H`, `@` forms, fractional units) reads as Malformed here.
-fn timezone_interval(literal: &str, range: Option<i32>) -> TzInterval {
-    let literal = literal.trim();
-    if literal.is_empty() {
-        return TzInterval::Malformed;
+/// `literal` read as interval_in reads the recorded forms: `infinity`; a bare number (seconds);
+/// a clock `[+-]h:m[:s]`; or a list of `<number> <unit>` and clock tokens, units years (`yr`, `y`),
+/// months (`mon`), weeks (`w`, as 7 days), days (`d`), hours (`hr`, `h`), minutes (`min`, `m`) and
+/// seconds (`sec`, `s`), singular or plural. A non-zero month or day, an offset of 168 hours or
+/// more, or infinity is refused. BLIND SPOT: interval_in's other forms (ISO 8601 `PT5H`, `@`,
+/// `ago`) read as Malformed.
+fn timezone_interval(literal: &str) -> TzInterval {
+    let l = literal.trim().to_ascii_lowercase();
+    if matches!(l.as_str(), "infinity" | "+infinity" | "-infinity") {
+        return TzInterval::Refused(literal.trim().to_string());
     }
-    // A bare number is an offset: which unit the fields give it (`INTERVAL '1' DAY`) is not
-    // recorded, so no refusal is read into it (the lead: no rule a recollection alone supports;
-    // owed in the L1 recording).
-    let _ = range;
-    if literal.parse::<f64>().is_ok() {
-        return TzInterval::Offset;
-    }
-    let clock = |t: &str| {
-        let t = t.trim_start_matches(['+', '-']);
-        let parts: Vec<&str> = t.split(':').collect();
-        parts.len() <= 3 && parts.iter().all(|p| !p.is_empty() && p.parse::<f64>().is_ok())
+    let number = |t: &str| {
+        let t = t.strip_prefix(['+', '-']).unwrap_or(t);
+        !t.is_empty()
+            && t.bytes().all(|c| c.is_ascii_digit() || c == b'.')
+            && t.bytes().filter(|&c| c == b'.').count() <= 1
+            && t != "."
     };
-    if clock(literal) {
-        return TzInterval::Offset;
-    }
-    let words: Vec<&str> = literal.split_whitespace().collect();
-    if words.len() % 2 != 0 {
-        return TzInterval::Malformed;
-    }
-    let mut date = false;
-    for pair in words.chunks(2) {
-        let Ok(n) = pair[0].parse::<f64>() else {
+    let clock = |t: &str| -> Option<f64> {
+        let sign = if t.starts_with('-') { -1.0 } else { 1.0 };
+        let parts: Vec<&str> = t.trim_start_matches(['+', '-']).split(':').collect();
+        if parts.len() < 2 || parts.len() > 3 || !parts.iter().all(|p| number(p) && !p.starts_with(['+', '-'])) {
+            return None;
+        }
+        let v: Vec<f64> = parts.iter().map(|p| p.parse().unwrap_or(0.0)).collect();
+        Some(sign * (v[0] * 3600.0 + v[1] * 60.0 + v.get(2).copied().unwrap_or(0.0)))
+    };
+    let (mut months, mut days, mut secs) = (0f64, 0f64, 0f64);
+    if number(&l) {
+        secs = l.parse().unwrap_or(0.0);
+    } else if let Some(c) = clock(&l) {
+        secs = c;
+    } else {
+        let words: Vec<&str> = l.split_whitespace().collect();
+        if words.is_empty() {
             return TzInterval::Malformed;
-        };
-        let unit = pair[1].to_ascii_lowercase();
-        let unit = unit.trim_end_matches('s');
-        match unit {
-            "hour" | "minute" | "min" | "second" | "sec" => {}
-            "day" | "month" | "mon" | "year" => date |= n != 0.0,
-            _ => return TzInterval::Malformed,
+        }
+        let mut i = 0;
+        while i < words.len() {
+            if let Some(c) = clock(words[i]) {
+                secs += c;
+                i += 1;
+                continue;
+            }
+            if !number(words[i]) || i + 1 >= words.len() {
+                return TzInterval::Malformed;
+            }
+            let n: f64 = words[i].parse().unwrap_or(0.0);
+            match words[i + 1] {
+                "year" | "years" | "yr" | "yrs" | "y" => months += n * 12.0,
+                "month" | "months" | "mon" | "mons" => months += n,
+                "week" | "weeks" | "w" => days += n * 7.0,
+                "day" | "days" | "d" => days += n,
+                "hour" | "hours" | "hr" | "hrs" | "h" => secs += n * 3600.0,
+                "minute" | "minutes" | "min" | "mins" | "m" => secs += n * 60.0,
+                "second" | "seconds" | "sec" | "secs" | "s" => secs += n,
+                _ => return TzInterval::Malformed,
+            }
+            i += 2;
         }
     }
-    if date {
-        TzInterval::NotAllowed
-    } else {
-        TzInterval::Offset
+    let (months, days) = (months.trunc() as i64, days.trunc() as i64);
+    if months != 0 || days != 0 || secs.abs() >= 168.0 * 3600.0 {
+        return TzInterval::Refused(interval_out(months, days, secs.trunc() as i64));
     }
+    TzInterval::Offset
 }
 
-/// An interval literal of `<number> <unit>` pairs printed as PostgreSQL's interval_out prints it
-/// (the default IntervalStyle postgres): years, `mon`/`mons`, days, then the time as hh:mm:ss
-/// (`1 month` is `1 mon`, PG 18.6's echo in its refusal; review wire-line2 M3 #4). A literal of
-/// another shape is returned as written. BLIND SPOT: only whole numbers of the units below.
-fn interval_out(literal: &str) -> String {
-    let words: Vec<&str> = literal.split_whitespace().collect();
-    if words.is_empty() || words.len() % 2 != 0 {
-        return literal.to_string();
-    }
-    let (mut years, mut months, mut days, mut secs) = (0i64, 0i64, 0i64, 0i64);
-    for pair in words.chunks(2) {
-        let Ok(n) = pair[0].parse::<i64>() else {
-            return literal.to_string();
-        };
-        let unit = pair[1].to_ascii_lowercase();
-        match unit.trim_end_matches('s') {
-            "year" => years += n,
-            "month" | "mon" => months += n,
-            "day" => days += n,
-            "hour" => secs += n * 3600,
-            "minute" | "min" => secs += n * 60,
-            "second" | "sec" => secs += n,
-            _ => return literal.to_string(),
+/// An interval printed as PostgreSQL's interval_out prints it under IntervalStyle postgres
+/// (EncodeInterval): years and `mon`/`mons` from the months, days, then the time as hh:mm:ss, a
+/// field after a negative one signed `+` when positive, a count other than 1 plural (PG 18.6:
+/// '1 year 1 mon', '-1 days +01:00:00', '7 days', '200:00:00').
+fn interval_out(months: i64, days: i64, secs: i64) -> String {
+    let (years, mons) = (months / 12, months % 12);
+    let mut parts = Vec::new();
+    let (mut before_negative, mut zero) = (false, true);
+    for (n, unit) in [(years, "year"), (mons, "mon"), (days, "day")] {
+        if n != 0 {
+            let plus = if before_negative && n > 0 { "+" } else { "" };
+            parts.push(format!("{plus}{n} {unit}{}", if n == 1 { "" } else { "s" }));
+            before_negative = n < 0;
+            zero = false;
         }
     }
-    let plural = |n: i64, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
-    let mut parts = Vec::new();
-    if years != 0 {
-        parts.push(plural(years, "year", "years"));
-    }
-    if months != 0 {
-        parts.push(plural(months, "mon", "mons"));
-    }
-    if days != 0 {
-        parts.push(plural(days, "day", "days"));
-    }
-    if secs != 0 || parts.is_empty() {
-        let sign = if secs < 0 { "-" } else { "" };
+    if zero || secs != 0 {
+        let sign = if secs < 0 {
+            "-"
+        } else if before_negative {
+            "+"
+        } else {
+            ""
+        };
         let a = secs.abs();
         parts.push(format!("{sign}{:02}:{:02}:{:02}", a / 3600, a / 60 % 60, a % 60));
     }
     parts.join(" ")
 }
 
-/// `text` read whole as C's strtod reads a number (leading whitespace skipped; decimal, `0x` hex,
-/// `inf`/`infinity`, `nan` and `nan(...)`), or None when anything is left after it.
+/// `text` read whole as C's strtod reads a number (leading whitespace skipped; decimal, `0x` hex
+/// with an optional `p` exponent, `inf`/`infinity`, `nan` and `nan(...)`), or None when anything
+/// is left after it.
 fn strtod_whole(text: &str) -> Option<f64> {
     let t = text.trim_start();
     let (sign, body) = match t.as_bytes().first() {
@@ -2164,7 +2167,11 @@ fn strtod_whole(text: &str) -> Option<f64> {
     }
     let lower = body.to_ascii_lowercase();
     if let Some(hex) = lower.strip_prefix("0x") {
-        let (int, frac) = hex.split_once('.').unwrap_or((hex, ""));
+        let (mantissa, exp) = match hex.split_once('p') {
+            Some((m, e)) => (m, Some(e)),
+            None => (hex, None),
+        };
+        let (int, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
         if (int.is_empty() && frac.is_empty())
             || !int.bytes().chain(frac.bytes()).all(|c| c.is_ascii_hexdigit())
         {
@@ -2179,34 +2186,44 @@ fn strtod_whole(text: &str) -> Option<f64> {
             v += c.to_digit(16)? as f64 * scale;
             scale /= 16.0;
         }
+        if let Some(e) = exp {
+            let e: i32 = e.parse().ok()?;
+            v *= 2f64.powi(e);
+        }
         return Some(sign * v);
     }
-    if lower == "nan" || (lower.starts_with("nan(") && lower.ends_with(')')
-        && lower[4..lower.len() - 1].bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_'))
-    {
+    if lower == "nan" || (lower.starts_with("nan(") && lower.ends_with(')')) {
         return Some(f64::NAN);
     }
     if lower == "inf" || lower == "infinity" {
         return Some(sign * f64::INFINITY);
     }
-    // Rust's parse also takes `infinity`/`nan` spellings and no other trailing text.
     let ok = !body.is_empty()
         && body.bytes().all(|c| c.is_ascii_digit() || matches!(c, b'.' | b'e' | b'E' | b'+' | b'-'));
     ok.then(|| body.parse::<f64>().ok()).flatten().map(|v| sign * v)
 }
 
-/// Whether `spec` is a POSIX TZ string as tzcode's tzparse reads one (UNVERIFIED beyond the
-/// recorded rows, review wire-rework C finding (1)): a standard name (`<...>`, non-empty, or
-/// getzname's run of characters other than digits, `,`, `-` and `+`), an offset
-/// `[+-]h[:m[:s]]` with hours at most 167 and minutes and seconds at most 59 (getsecs; any digit
-/// count), then optionally a daylight name, its own offset, and two rules after `,` or `;`, each
-/// `Jn` (1-365), `n` (0-365) or `Mm.w.d` (1-12, 1-5, 0-6) with an optional `/offset`. A bare
-/// offset alone (`+05:30`) is a whole spec, as PG 18.6 answered it (pg18-rev-c39-tzforms.out).
-fn posix_tz(spec: &str) -> bool {
+/// A POSIX TZ spec's reading by tzparse, as PG 18.6 answered (pg18-rev-cd-tz2.out,
+/// pg18-rev-l1-tz.out).
+enum PosixTz {
+    Valid,
+    Invalid,
+    /// Well formed, but an offset is not a whole number of minutes: 22023 "appears to use leap
+    /// seconds".
+    LeapSeconds,
+}
+
+/// `spec` as tzparse reads one: a standard name (`<...>`, empty allowed, or getzname's run of
+/// characters other than digits, `,`, `-` and `+`), an offset `[+-]h[:m[:s]]` (hours at most 167,
+/// minutes at most 59; seconds unbounded: 'UTC+3:00:60' is SET), then optionally a daylight name, its
+/// own offset, and two rules after `,` only, each `Mm.w.d` (m 1-12), `Jn` (n 1-365) or `n`, with an
+/// optional `/time` of at most three groups and hours at most 167. A bare offset alone is a whole
+/// spec. Every bound named here is a recorded one; no other is applied.
+fn posix_tz(spec: &str) -> PosixTz {
     let b = spec.as_bytes();
+    let mut offsets: Vec<u64> = Vec::new();
     let name = |i: &mut usize| -> bool {
         if b.get(*i) == Some(&b'<') {
-            // An empty `<>` is a name too (PG 18.6: '<>5' is SET, pg18-rev-cd-tz2.out).
             let Some(end) = spec[*i + 1..].find('>') else { return false };
             *i += end + 2;
             return true;
@@ -2220,11 +2237,12 @@ fn posix_tz(spec: &str) -> bool {
         }
         *i > start
     };
-    // getsecs: h[:m[:s]]. The bounds are the recorded ones (pg18-rev-cd-tz2.out): hours up to 167
-    // (UTC+167 SET, UTC+168 refused), minutes up to 59 (UTC+3:59 SET, UTC+3:60 refused); seconds
-    // have no recorded bound and none is applied (the lead: no rule a recollection alone supports).
-    let secs = |i: &mut usize| -> bool {
-        let limits = [167u32, 59, u32::MAX];
+    let mut offset = |i: &mut usize| -> bool {
+        if matches!(b.get(*i), Some(b'+' | b'-')) {
+            *i += 1;
+        }
+        let limits = [Some(167u64), Some(59), None];
+        let mut total = 0u64;
         for (g, max) in limits.iter().enumerate() {
             let start = *i;
             let mut v: u64 = 0;
@@ -2232,70 +2250,70 @@ fn posix_tz(spec: &str) -> bool {
                 v = v.saturating_mul(10).saturating_add(u64::from(c - b'0'));
                 *i += 1;
             }
-            if *i == start || v > u64::from(*max) {
+            if *i == start || max.is_some_and(|m| v > m) {
                 return false;
             }
+            total += v * [3600, 60, 1][g];
             if g < 2 && b.get(*i) == Some(&b':') {
                 *i += 1;
                 continue;
             }
-            return true;
+            break;
         }
+        offsets.push(total);
         true
-    };
-    let offset = |i: &mut usize| -> bool {
-        if matches!(b.get(*i), Some(b'+' | b'-')) {
-            *i += 1;
-        }
-        secs(i)
     };
     let mut i = 0;
     let had_name = name(&mut i);
     if !had_name {
         i = 0;
-        // A bare offset alone: hours and minutes only (PG 18.6: '05:30' and '+5:3' are SET,
-        // '+05:30:15' is refused, pg18-rev-cd-tz2.out).
-        let bare = spec.trim_start_matches(['+', '-']);
-        if bare.split(':').count() > 2 {
-            return false;
-        }
     }
     if !offset(&mut i) {
-        return false;
+        return PosixTz::Invalid;
     }
-    if i == b.len() {
-        return true;
+    let mut finished = i == b.len();
+    if !finished {
+        if !had_name || !name(&mut i) {
+            return PosixTz::Invalid;
+        }
+        if i < b.len() && b[i] != b',' && !offset(&mut i) {
+            return PosixTz::Invalid;
+        }
+        finished = i == b.len();
     }
-    if !had_name || !name(&mut i) {
-        return false;
-    }
-    if i < b.len() && b[i] != b',' && !offset(&mut i) {
-        return false;
-    }
-    if i == b.len() {
-        return true;
-    }
-    // A rule's shape only: its fields' ranges are not recorded, so none is applied (the lead: no
-    // rule a recollection alone supports); a time of four groups is refused (recorded).
-    let digits = |t: &str| !t.is_empty() && t.bytes().all(|c| c.is_ascii_digit());
-    let rule = |r: &str| -> bool {
-        let (date, time) = r.split_once('/').unwrap_or((r, "0"));
-        let date_ok = if let Some(m) = date.strip_prefix('M') {
-            let f: Vec<&str> = m.split('.').collect();
-            f.len() == 3 && f.iter().all(|x| digits(x))
-        } else {
-            digits(date.strip_prefix('J').unwrap_or(date))
+    if !finished {
+        let digits = |t: &str| !t.is_empty() && t.bytes().all(|c| c.is_ascii_digit());
+        let in_range = |t: &str, lo: u64, hi: u64| t.parse::<u64>().is_ok_and(|v| (lo..=hi).contains(&v));
+        let rule = |r: &str| -> bool {
+            let (date, time) = r.split_once('/').unwrap_or((r, "0"));
+            let date_ok = if let Some(m) = date.strip_prefix('M') {
+                let f: Vec<&str> = m.split('.').collect();
+                f.len() == 3 && f.iter().all(|x| digits(x)) && in_range(f[0], 1, 12)
+            } else if let Some(j) = date.strip_prefix('J') {
+                digits(j) && in_range(j, 1, 365)
+            } else {
+                digits(date)
+            };
+            let time = time.strip_prefix(['+', '-']).unwrap_or(time);
+            let groups: Vec<&str> = time.split(':').collect();
+            date_ok
+                && groups.len() <= 3
+                && groups.iter().all(|x| digits(x))
+                && in_range(groups[0], 0, 167)
         };
-        let time = time.strip_prefix(['+', '-']).unwrap_or(time);
-        let groups: Vec<&str> = time.split(':').collect();
-        date_ok && groups.len() <= 3 && groups.iter().all(|x| digits(x))
-    };
-    // The rules follow a `,` only (PG 18.6: 'EST5EDT;M3.2.0;M11.1.0' is refused).
-    if b[i] != b',' {
-        return false;
+        if b[i] != b',' {
+            return PosixTz::Invalid;
+        }
+        let rules: Vec<&str> = spec[i + 1..].split(',').collect();
+        if rules.len() != 2 || !rules.iter().all(|r| rule(r)) {
+            return PosixTz::Invalid;
+        }
     }
-    let rules: Vec<&str> = spec[i + 1..].split(',').collect();
-    rules.len() == 2 && rules.iter().all(|r| rule(r))
+    if offsets.iter().any(|t| t % 60 != 0) {
+        PosixTz::LeapSeconds
+    } else {
+        PosixTz::Valid
+    }
 }
 
 const PG_ENCODINGS: &[&str] = &[
