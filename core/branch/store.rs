@@ -3074,14 +3074,20 @@ impl ChildIndex {
     }
 
     /// A capture: the live generation becomes the frozen one (O(1)). One flight at a time, so
-    /// nothing is frozen already; if something were, it is merged into the new frozen generation
-    /// rather than lost.
+    /// nothing is frozen already unless an install failed after its commit or lost its journal; a
+    /// generation left over is merged into the new frozen one rather than lost, with the live
+    /// entries winning: they are the newer, and `relink` can leave a key in both (review L2d LOW 1).
     fn freeze(&mut self) {
         let mut map = std::mem::take(&mut self.map);
         let mut removed = std::mem::take(&mut self.removed);
         if !self.frozen.is_empty() || !self.frozen_removed.is_empty() {
-            map.append(&mut self.frozen);
-            removed.append(&mut self.frozen_removed);
+            // `append` overwrites with its argument's values: the leftover first, the live last.
+            let mut older = std::mem::take(&mut self.frozen);
+            older.append(&mut map);
+            map = older;
+            let mut older = std::mem::take(&mut self.frozen_removed);
+            older.append(&mut removed);
+            removed = older;
         }
         self.frozen = map;
         self.frozen_removed = removed;
@@ -3096,7 +3102,7 @@ impl ChildIndex {
     }
 
     /// A capture that is not written: the frozen generation goes back into the live one (an entry
-    /// added since wins; the epochs are never reused, so no key is in both).
+    /// added since wins: `relink` can leave a key in both, the live one newer).
     fn unfreeze(&mut self) {
         let mut map = std::mem::take(&mut self.frozen);
         let mut removed = std::mem::take(&mut self.frozen_removed);
