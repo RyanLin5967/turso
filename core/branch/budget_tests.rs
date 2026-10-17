@@ -3085,7 +3085,15 @@ fn create_logs_its_record_and_one_flight_end() {
 /// allocator, prints, reads the environment, or calls `fe_mutant` (whose first call reads it; the
 /// path asks `budget_probe::mutant_on`, primed outside any window). A line marked `lint-allow:`
 /// with its reason is skipped. Bodies are found at a definition (a line starting `fn`, `pub fn` or
-/// `pub(crate) fn`), and braces inside strings, char literals and comments are not counted.
+/// `pub(crate) fn`, the name followed by `(` or `<`), and braces inside strings, char literals and
+/// comments are not counted.
+///
+/// Counters review 4 LOW-C, the scope: the bodies listed below, which are the window and hold paths
+/// and their callees (the counting allocator's hooks, the thread-table readers, the scope lookups,
+/// the harness's in-window waits and confirm reads) EXCEPT `prime` and `window_diagnostics` (which
+/// allocate by design, before a window's first count and after its last) and `ran_between` (called
+/// only from `window_diagnostics`). Its blind spots: a callee not listed here, a raw string holding
+/// `"` or `\`, and an escaped-quote char literal (`'\''`) are not parsed.
 #[test]
 fn nothing_on_the_probes_window_path_allocates() {
     const FORBIDDEN: [&str; 24] = [
@@ -3100,19 +3108,25 @@ fn nothing_on_the_probes_window_path_allocates() {
             &[
                 "begin", "end", "end_owning", "user_counts", "window_syncs", "attribute", "foreign_threads", "thread_table",
                 "shim_counts", "shim", "shim_lost", "unix_syscalls", "instructions", "store_locked_at", "store_unlocked_of",
-                "mutant_on",
+                "mutant_on", "threads", "others_blocked", "each_thread", "spinning", "bump", "record_alloc", "record_free",
+                "wal_lock_held", "persistent_live",
             ][..],
         ),
         ("budget_tests.rs", include_str!("budget_tests.rs"), &["absorb_confirm", "writer_settled", "spin_settled", "settled"][..]),
-        ("store.rs", include_str!("store.rs"), &["own_sync_counts", "own_test_counts"][..]),
-        ("mod.rs", include_str!("mod.rs"), &["sync_counts"][..]),
+        (
+            "store.rs",
+            include_str!("store.rs"),
+            &["own_sync_counts", "own_test_counts", "scope_top", "scope_is_audited", "scope_store_id", "confirm_park_for_test", "confirm_counts"][..],
+        ),
+        ("mod.rs", include_str!("mod.rs"), &["sync_counts", "branch_confirm_counts"][..]),
     ];
     let mut found = String::new();
     let mut read = 0;
     for (file, src, fns) in sources {
         for name in fns {
-            let heads = [format!("fn {name}("), format!("pub fn {name}("), format!("pub(crate) fn {name}(")];
-            let Some(at) = src.match_indices('\n').map(|(i, _)| i + 1).find(|&i| heads.iter().any(|h| src[i..].trim_start().starts_with(h.as_str()))) else {
+            let heads = ["fn ", "pub fn ", "pub(crate) fn "].map(|v| format!("{v}{name}"));
+            let opens = |rest: &str| heads.iter().any(|h| rest.starts_with(h.as_str()) && matches!(rest.as_bytes().get(h.len()), Some(b'(' | b'<')));
+            let Some(at) = src.match_indices('\n').map(|(i, _)| i + 1).find(|&i| opens(src[i..].trim_start())) else {
                 let _ = writeln!(found, "  {file}: fn {name} not found");
                 continue;
             };
@@ -3161,7 +3175,7 @@ fn nothing_on_the_probes_window_path_allocates() {
             }
         }
     }
-    assert_eq!(read, 23, "premise: every function on the window path was read:\n{found}");
+    assert_eq!(read, 38, "premise: every function on the window path was read:\n{found}");
     assert!(found.is_empty(), "the probe's window path allocates, prints, reads the environment or calls fe_mutant:\n{found}");
 }
 
