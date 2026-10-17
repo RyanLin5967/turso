@@ -3006,6 +3006,59 @@ fn create_logs_its_record_and_one_flight_end() {
     );
 }
 
+/// Counters review 2 HIGH 1, as a class (DECISIONS 7d1c461378): an instrument does no work inside
+/// a window. Read from the source (a static red: no run can be trusted to reach every branch): no
+/// function on the probe's window path (`begin`, `end`, `end_owning`, `user_counts`,
+/// `window_syncs`; the suite's `absorb_confirm`, called inside every main-cell window; the store's
+/// `own_sync_counts` and `own_test_counts`) contains a call that allocates or reads the environment
+/// (an env read allocates its value). Work a window does after its counts are taken belongs in a
+/// function of its own, called after them.
+#[test]
+fn nothing_on_the_probes_window_path_allocates() {
+    const FORBIDDEN: [&str; 10] =
+        ["env::var", "format!", ".to_string()", "String::from", "Vec::new()", "vec![", "Box::new", ".collect", ".to_owned()", "eprintln!"];
+    let sources = [
+        ("budget_probe.rs", include_str!("budget_probe.rs"), &["begin", "end", "end_owning", "user_counts", "window_syncs"][..]),
+        ("budget_tests.rs", include_str!("budget_tests.rs"), &["absorb_confirm"][..]),
+        ("store.rs", include_str!("store.rs"), &["own_sync_counts", "own_test_counts"][..]),
+    ];
+    let mut found = String::new();
+    let mut read = 0;
+    for (file, src, fns) in sources {
+        for name in fns {
+            let head = format!("fn {name}(");
+            let Some(at) = src.find(&head) else {
+                let _ = writeln!(found, "  {file}: fn {name} not found");
+                continue;
+            };
+            let open = at + src[at..].find('{').unwrap();
+            let (mut depth, mut end) = (0i32, open);
+            for (i, c) in src[open..].char_indices() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = open + i;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let body = &src[open..=end];
+            read += 1;
+            for bad in FORBIDDEN {
+                if body.contains(bad) {
+                    let _ = writeln!(found, "  {file}: fn {name} calls {bad}");
+                }
+            }
+        }
+    }
+    assert_eq!(read, 8, "premise: every function on the window path was read:\n{found}");
+    assert!(found.is_empty(), "the probe's window path allocates or reads the environment:\n{found}");
+}
+
 /// Counters review MED-5: in a budget child the process's sync counts are exact (one cell's stores
 /// at a time), so every window's sync reading must equal them. A reading that lost a sync made on a
 /// thread no store's scope covered, or by a store another thread opened, differs.
