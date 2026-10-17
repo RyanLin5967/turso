@@ -9615,8 +9615,12 @@ impl BranchStore {
                     #[cfg(not(test))]
                     let forced = false;
                     if forced || !unbuilt.iter().all(|h| table.insert(*h)) {
-                        // The answer that held through the build still does.
+                        // The answer that held through the build still does. The scanned table and
+                        // its hashes are freed after the unlock (review m1-2c N2: they are bound
+                        // after the guard, so they would drop before it).
                         f.overflow_answering(old);
+                        drop(inner);
+                        drop((table, unbuilt));
                         return FilterBuild::Ended;
                     }
                     f.live = (table.len() + pending.len()) as u64;
