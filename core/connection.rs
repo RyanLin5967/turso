@@ -1996,6 +1996,13 @@ impl Connection {
         self.fk_deferred_violations.load(Ordering::Acquire)
     }
 
+    /// Deferred foreign-key violations this connection's open transaction still holds: what its
+    /// COMMIT would refuse on (`check_deferred_fk_on_commit`). Read only. For a frontend that must
+    /// refuse turning `foreign_keys` off while any are pending (fastest-wire, review C41-H1).
+    pub fn deferred_foreign_key_violations(&self) -> isize {
+        self.get_deferred_foreign_key_violations()
+    }
+
     pub(crate) fn increment_deferred_foreign_key_violations(&self, v: isize) {
         self.fk_deferred_violations.fetch_add(v, Ordering::AcqRel);
     }
