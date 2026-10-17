@@ -3166,6 +3166,49 @@ fn another_session_s_ddl_on_an_attached_schema_is_adopted_between_statements() {
     assert!(moved, "CLAIM: A's adoption step left its prepare generation alone after B's DDL on the attached schema: A's cached programs keep the old one");
 }
 
+/// Review c42b MED-3 and LOW-2, as a class: whether the database is MVCC is compiled into every
+/// connection's programs (`Connection::mvcc_enabled` reads `Database::mv_store`), so EVERY install
+/// or removal of the MV store bumps the database-wide prepare generation (C42 MED-7) next to it.
+/// At 0b3abfefc the journal switch's two sites did, but not the bootstrap guard's removal
+/// (vdbe/execute.rs), the external-restore reload's install and removal (database.rs), the open's
+/// lazy install, or the attach's. Static: every `mv_store.store(` in core's source is followed,
+/// within three lines, by a `bump_prepare_context_generation()`.
+#[test]
+fn every_mv_store_install_or_removal_bumps_the_database_wide_generation() {
+    let core = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut sites = 0usize;
+    let mut unbumped = Vec::new();
+    let mut dirs = vec![core.to_path_buf()];
+    while let Some(d) = dirs.pop() {
+        for e in std::fs::read_dir(&d).unwrap() {
+            let path = e.unwrap().path();
+            if path.is_dir() {
+                if path.file_name().is_some_and(|n| n != "target") {
+                    dirs.push(path);
+                }
+                continue;
+            }
+            if path.extension().is_none_or(|x| x != "rs") || path.ends_with("branch/fastest_tests.rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            let lines: Vec<&str> = text.lines().collect();
+            for (i, l) in lines.iter().enumerate() {
+                if l.trim_start().starts_with("//") || !l.contains("mv_store.store(") {
+                    continue;
+                }
+                sites += 1;
+                let bumped = lines[i + 1..(i + 4).min(lines.len())].iter().any(|n| n.contains("bump_prepare_context_generation()"));
+                if !bumped {
+                    unbumped.push(format!("{}:{}", path.strip_prefix(core).unwrap().display(), i + 1));
+                }
+            }
+        }
+    }
+    assert!(sites >= 5, "premise: the scan found {sites} MV-store stores, fewer than the 7 known");
+    assert!(unbumped.is_empty(), "CLAIM: MV-store installs or removals with no database-wide generation bump: {unbumped:?}");
+}
+
 /// Review engine-rev-setter LOW-2: the audit of every prepare-generation bump (49e10e02a's message
 /// said 37 and missed five) is pinned here, per file, so a new bump site fails this gate until it
 /// is audited (and the setter class above says whether it should be change-only). Counts calls of
