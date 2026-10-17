@@ -4818,7 +4818,12 @@ pub(crate) fn fsync_file(file: &File, class: SyncClass) -> Result<()> {
         if unsafe { libc::fsync(file.as_raw_fd()) } != 0 {
             return Err(io_error(std::io::Error::last_os_error(), "fsync branch file"));
         }
-        crate::io::count_sync(false);
+        // Mutant `drop_journal_sync_count` (test builds only; counters review 2 HIGH 2): the process
+        // does not count this branch file's sync, which the stores' own count still does: the
+        // parity check's fire-check.
+        if !super::store::fe_mutant("drop_journal_sync_count") {
+            crate::io::count_sync(false);
+        }
         #[cfg(test)]
         super::store::note_branch_sync(0);
         Ok(())

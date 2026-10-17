@@ -3059,9 +3059,14 @@ fn nothing_on_the_probes_window_path_allocates() {
     assert!(found.is_empty(), "the probe's window path allocates or reads the environment:\n{found}");
 }
 
-/// Counters review MED-5: in a budget child the process's sync counts are exact (one cell's stores
-/// at a time), so every window's sync reading must equal them. A reading that lost a sync made on a
-/// thread no store's scope covered, or by a store another thread opened, differs.
+/// Counters review MED-5, and review 2 HIGH 2 (DECISIONS 7d1c461378): a parity check needs an
+/// independent second count. In a budget child the process's sync counts are exact (one cell's
+/// stores at a time), and the budget's reading IS them (`window_syncs`), so comparing the two would
+/// compare a reading with itself. The second count is the stores' own attribution (`_own`,
+/// `store::own_sync_counts`): EVERY window that records the process's syncs must record it too,
+/// and they must agree. Never process against process. Mutant `drop_journal_sync_count` (test
+/// builds only; a branch file's sync not counted by the process) must fail it in every cell whose
+/// windows sync a branch file.
 #[test]
 fn every_budget_windows_syncs_equal_the_process_syncs_in_its_child() {
     if in_child() {
@@ -3069,30 +3074,36 @@ fn every_budget_windows_syncs_equal_the_process_syncs_in_its_child() {
     }
     let mut failures = String::new();
     let mut compared = 0;
-    for spec in MAIN.iter().copied().chain(["ckpt_n10", "confirm_load", "confirm_n10", "first_create", "open_d1"]) {
+    let cells = MAIN
+        .iter()
+        .copied()
+        .chain(["ckpt_n10", "confirm_load", "confirm_n10", "first_create", "open_d1"])
+        .chain(["shared_c1", "shared_c8", "shared_c64", "shared_c256", "shared_c1024"]);
+    for spec in cells {
         let c = cell(spec);
+        let mut in_cell = 0;
         for (op, samples) in &c.ops {
             for (i, s) in samples.iter().enumerate() {
                 for k in ["fsync", "full_fsync", "barrier"] {
                     let Some(&process) = s.get(&format!("{k}_process")) else { continue };
-                    let read = *s.get(k).unwrap_or_else(|| panic!("{spec}: {op} {i}: no {k} beside {k}_process"));
+                    let Some(&own) = s.get(&format!("{k}_own")) else {
+                        let _ = writeln!(failures, "  {spec}: {op} {i}: {k}_process with no {k}_own: no independent count");
+                        continue;
+                    };
                     compared += 1;
-                    if read != process {
-                        let _ = writeln!(failures, "  {spec}: {op} {i}: {k} {read}, the process {process}");
-                    }
-                    // The attribution's parity (with the fix the reading above is the process's):
-                    // the stores' own counts must agree too, or a counter is not per store there.
-                    if let Some(&own) = s.get(&format!("{k}_own")) {
-                        if own != process {
-                            let _ = writeln!(failures, "  {spec}: {op} {i}: {k}_own {own}, the process {process}");
-                        }
+                    in_cell += 1;
+                    if own != process {
+                        let _ = writeln!(failures, "  {spec}: {op} {i}: {k}_own {own}, the process {process}");
                     }
                 }
             }
         }
+        if in_cell == 0 {
+            let _ = writeln!(failures, "  {spec}: no window compared");
+        }
     }
-    assert!(compared > 0, "premise: no window carried the process's syncs");
-    assert!(failures.is_empty(), "budget windows whose sync reading is not the process's ({compared} compared):\n{failures}");
+    assert!(compared > 0, "premise: no window carried both counts");
+    assert!(failures.is_empty(), "budget windows whose stores' own sync counts are not the process's ({compared} compared):\n{failures}");
 }
 
 #[cfg(target_vendor = "apple")]
