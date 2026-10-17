@@ -2187,6 +2187,25 @@ pub(crate) static NAME_SCAN_HOLD: std::sync::atomic::AtomicU8 = std::sync::atomi
 
 
 /// The name filter's builder waits at `NAME_SCAN_HOLD` (test builds only).
+/// Test builds: a name filter's build holds before its seed hold, while the state it starts from
+/// (`Stale`, `Overflowed`) still answers (review m1-2b LOW-F1). Armed by storing 1; released by
+/// storing 0.
+#[cfg(test)]
+pub(crate) static BUILD_SEED_HOLD: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn pause_build_seed() {
+    #[cfg(test)]
+    {
+        use std::sync::atomic::Ordering as O;
+        let arrived = 1 | HOLD_ARRIVED;
+        if BUILD_SEED_HOLD.compare_exchange(1, arrived, O::AcqRel, O::Acquire).is_ok() {
+            while BUILD_SEED_HOLD.load(O::Acquire) == arrived {
+                crate::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+}
+
 fn pause_name_scan() {
     #[cfg(test)]
     {
@@ -3048,6 +3067,19 @@ impl NameFilter {
         // exists.
         if fe_mutant("filter_says_absent") {
             return !matches!(self.state, FilterState::Unbuilt | FilterState::Overflowed { answer: None });
+        }
+        // Mutants `filter_lies_<state>` (test builds only; review m1-2b LOW-F1): "absent" for every
+        // name in that one state, the false absent each state's test must catch.
+        let lie = match &self.state {
+            FilterState::Growing { .. } => fe_mutant("filter_lies_growing"),
+            FilterState::Draining { .. } => fe_mutant("filter_lies_draining"),
+            FilterState::Stale { .. } => fe_mutant("filter_lies_stale"),
+            FilterState::Building { old: Some(_), .. } => fe_mutant("filter_lies_building_old"),
+            FilterState::Overflowed { answer: Some(_) } => fe_mutant("filter_lies_overflowed_answer"),
+            _ => false,
+        };
+        if lie {
+            return true;
         }
         let h = self.hash(name);
         match &self.state {
@@ -9394,6 +9426,7 @@ impl BranchStore {
                 return FilterBuild::Failed;
             }
         };
+        pause_build_seed();
         {
             let mut inner = shared.lock();
             let names = &mut inner.names;
@@ -9637,6 +9670,13 @@ impl BranchStore {
     #[cfg(test)]
     pub(crate) fn name_filter_says_absent_for_test(&self, name: &str) -> bool {
         self.inner.lock().names.filter.says_absent(name)
+    }
+
+    /// Test builds: `name` is in the resident name map (`names.map`), which `name_lookup` asks
+    /// before the filter. A name held but not resident is answered by the filter or the catalog.
+    #[cfg(test)]
+    pub(crate) fn name_resident_for_test(&self, name: &str) -> bool {
+        self.inner.lock().names.map.contains_key(name)
     }
 
     pub(crate) fn catalog_counters(&self) -> (u64, u64, u64, u64) {

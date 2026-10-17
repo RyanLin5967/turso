@@ -9645,6 +9645,173 @@ fn a_named_create_after_a_natural_filter_refusal_asks_the_catalog_nothing() {
     );
 }
 
+/// Review m1-2b LOW-F1 (DECISIONS 6c1dbf7449, must-fix before credit): the filter tests' controls
+/// were resident names, which `name_lookup` refuses from `names.map` before the filter answers, so
+/// no false "absent" could show. These are `k` named branches held ONLY in the catalog: created,
+/// checkpointed, then evicted (resident cap 1 and one more checkpoint).
+fn catalog_only_names(db: &Arc<Database>, trunk: &Arc<Connection>, k: usize) -> Vec<String> {
+    let names: Vec<String> = (0..k).map(|i| format!("cat-only-{i:03}")).collect();
+    for n in &names {
+        trunk.create_branch(n).unwrap();
+    }
+    db.branch_compact_now().unwrap();
+    db.branch_set_resident_cap(Some(1));
+    // The eviction runs at a fuzzy checkpoint's install (`evict_clean`).
+    assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: the evicting fuzzy checkpoint started");
+    db.branch_checkpoint_wait();
+    for n in &names {
+        assert!(!db.branches.name_resident_for_test(n), "premise: {n} is still resident after the eviction");
+    }
+    names
+}
+
+/// In the filter's current `state`: no name held only in the catalog is answered "absent", and
+/// creating one again is refused.
+fn assert_no_false_absent(db: &Arc<Database>, trunk: &Arc<Connection>, names: &[String], state: &str) {
+    assert_eq!(db.branches.name_filter_state_for_test().0, state, "premise: the filter is {state}");
+    for n in names {
+        assert!(!db.branches.name_filter_says_absent_for_test(n), "CLAIM: the filter answered absent while {state} for {n}, held only in the catalog");
+    }
+    assert!(trunk.create_branch(&names[0]).is_err(), "CLAIM: while {state}, a name held only in the catalog was given again");
+}
+
+/// LOW-F1 in a natural growth: `Growing` (stage 1) and `Draining` (stage 4). Mutants
+/// `filter_lies_growing`, `filter_lies_draining`.
+#[test]
+fn a_growing_or_draining_filter_never_answers_absent_for_a_catalog_only_name() {
+    use super::store::{FILTER_PAUSED, FILTER_PAUSE_AT};
+    use std::sync::atomic::Ordering::{Acquire, Release};
+    let _s = serial();
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FILTER_PAUSE_AT.store(0, Release);
+            FILTER_PAUSED.store(0, Release);
+        }
+    }
+    let _r = Reset;
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("lie-growth.db"), opts(true, SyncClass::Off));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let names = catalog_only_names(&db, &trunk, 4);
+    db.branch_wait_name_filter();
+    FILTER_PAUSE_AT.store(1, Release);
+    let t = std::time::Instant::now();
+    let mut n = 0u32;
+    while FILTER_PAUSED.load(Acquire) != 1 {
+        trunk.create_branch(&format!("fill-{n:05}")).unwrap();
+        n += 1;
+        assert!(t.elapsed() < std::time::Duration::from_secs(30), "premise: no natural filter growth began ({n} creates)");
+    }
+    assert_no_false_absent(&db, &trunk, &names, "Growing");
+    FILTER_PAUSE_AT.store(4, Release);
+    while FILTER_PAUSED.load(Acquire) != 4 {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        assert!(t.elapsed() < std::time::Duration::from_secs(60), "premise: the growth never reached its drain");
+    }
+    assert_no_false_absent(&db, &trunk, &names, "Draining");
+    FILTER_PAUSE_AT.store(0, Release);
+    db.branch_wait_name_filter();
+}
+
+/// LOW-F1 in a natural shrink: `Stale` (the build held before its seed, `BUILD_SEED_HOLD`) and
+/// `Building` with the old table (stage 7). Mutants `filter_lies_stale`, `filter_lies_building_old`.
+#[test]
+fn a_shrinking_filter_never_answers_absent_for_a_catalog_only_name() {
+    use super::store::{BUILD_SEED_HOLD, FILTER_PAUSED, FILTER_PAUSE_AT, HOLD_ARRIVED};
+    use std::sync::atomic::Ordering::{Acquire, Release};
+    let _s = serial();
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            BUILD_SEED_HOLD.store(0, Release);
+            FILTER_PAUSE_AT.store(0, Release);
+            FILTER_PAUSED.store(0, Release);
+        }
+    }
+    let _r = Reset;
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("lie-shrink.db"), opts(true, SyncClass::Off));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let names = catalog_only_names(&db, &trunk, 4);
+    db.branch_wait_name_filter();
+    BUILD_SEED_HOLD.store(1, Release);
+    let t = std::time::Instant::now();
+    let mut n = 0u32;
+    while BUILD_SEED_HOLD.load(Acquire) != 1 | HOLD_ARRIVED {
+        let name = format!("cycle-{n:05}");
+        trunk.create_branch(&name).unwrap();
+        db.drop_branch(&name).unwrap();
+        n += 1;
+        assert!(t.elapsed() < std::time::Duration::from_secs(30), "premise: no natural filter shrink owed a rebuild ({n} cycles)");
+    }
+    assert_no_false_absent(&db, &trunk, &names, "Stale");
+    FILTER_PAUSE_AT.store(7, Release);
+    BUILD_SEED_HOLD.store(0, Release);
+    while FILTER_PAUSED.load(Acquire) != 7 {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        assert!(t.elapsed() < std::time::Duration::from_secs(60), "premise: the shrink's rebuild never reached Building");
+    }
+    assert!(db.branches.name_filter_stats().0, "premise: the rebuild is Building with the old table answering");
+    assert_no_false_absent(&db, &trunk, &names, "Building");
+    FILTER_PAUSE_AT.store(0, Release);
+    db.branch_wait_name_filter();
+}
+
+/// LOW-F1 after a natural refusal (5a0d874e0's `Answer` and spare): `Overflowed` with an answer
+/// (the rebuild held before its seed) and `Building` with that answer as its old one (held at its
+/// scan). Mutants `filter_lies_overflowed_answer`, `filter_lies_building_old`.
+#[test]
+fn a_refusing_filter_never_answers_absent_for_a_catalog_only_name() {
+    use super::store::{BUILD_SEED_HOLD, FILTER_PAUSED, FILTER_PAUSE_AT, HOLD_ARRIVED, NAME_SCAN_HOLD};
+    use std::sync::atomic::Ordering::{Acquire, Release};
+    let _s = serial();
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            BUILD_SEED_HOLD.store(0, Release);
+            NAME_SCAN_HOLD.store(0, Release);
+            FILTER_PAUSE_AT.store(0, Release);
+            FILTER_PAUSED.store(0, Release);
+        }
+    }
+    let _r = Reset;
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("lie-refusal.db"), opts(true, SyncClass::Off));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let names = catalog_only_names(&db, &trunk, 4);
+    db.branch_wait_name_filter();
+    FILTER_PAUSE_AT.store(1, Release);
+    let t = std::time::Instant::now();
+    let mut n = 0u32;
+    while FILTER_PAUSED.load(Acquire) != 1 {
+        trunk.create_branch(&format!("fill-{n:05}")).unwrap();
+        n += 1;
+        assert!(t.elapsed() < std::time::Duration::from_secs(30), "premise: no natural filter growth began");
+    }
+    BUILD_SEED_HOLD.store(1, Release);
+    while BUILD_SEED_HOLD.load(Acquire) != 1 | HOLD_ARRIVED {
+        trunk.create_branch(&format!("burst-{n:05}")).unwrap();
+        n += 1;
+        assert!(n < 1 << 20, "premise: no table refused a key during the held growth");
+    }
+    assert!(db.branches.name_filter_stats().0, "premise: the refusal kept an answer (a spare was kept)");
+    assert_no_false_absent(&db, &trunk, &names, "Overflowed");
+    NAME_SCAN_HOLD.store(1, Release);
+    BUILD_SEED_HOLD.store(0, Release);
+    while NAME_SCAN_HOLD.load(Acquire) != 1 | HOLD_ARRIVED {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        assert!(t.elapsed() < std::time::Duration::from_secs(60), "premise: the refusal's rebuild never reached its scan");
+    }
+    assert_no_false_absent(&db, &trunk, &names, "Building");
+    NAME_SCAN_HOLD.store(0, Release);
+    FILTER_PAUSE_AT.store(0, Release);
+    db.branch_wait_name_filter();
+}
+
 /// Class (e), the store mutex's lifecycle audit (DECISIONS 994f7d41e0; the lead's order with
 /// nf-adversary-2's MED-2 and M4 folded in): every store-mutex hold on the create path does NO syscall,
 /// NO allocation and NO catalog statement. One instrument for the whole class: every outermost hold
