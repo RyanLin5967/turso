@@ -546,7 +546,7 @@ impl PgConnection {
     }
 
     pub fn pragma_update(&self, name: &str, value: impl std::fmt::Display) -> Result<()> {
-        let sql = format!("PRAGMA {name} = {value}");
+        let sql = catalog::sqlite_text(format!("PRAGMA {name} = {value}"));
         let mut stmt = self.inner.conn.prepare_internal(sql)?;
         stmt.run_ignore_rows()
     }
@@ -890,7 +890,7 @@ pub fn attach_schema_files(conn: &PgConnection, db_file: &str) {
             continue;
         };
         let path = entry.path().to_string_lossy().to_string();
-        let sql = format!("ATTACH '{path}' AS \"{schema}\"");
+        let sql = catalog::sqlite_text(format!("ATTACH '{path}' AS \"{schema}\""));
         tracing::info!("Auto-attaching PG schema '{}' from {}", schema, path);
         if let Err(e) = conn.inner().execute(&sql) {
             tracing::warn!("Failed to attach schema '{}': {}", schema, e);
@@ -1436,7 +1436,9 @@ fn try_prepare_special(
         // PostgreSQL's CHECKPOINT writes every dirty page to the data files; a WAL checkpoint that
         // copies every frame back into the database file and truncates the log is the same act
         // here.
-        Special::Checkpoint => pg_conn.conn.prepare("PRAGMA wal_checkpoint(TRUNCATE)")?,
+        Special::Checkpoint => pg_conn
+            .conn
+            .prepare(catalog::sqlite_text("PRAGMA wal_checkpoint(TRUNCATE)"))?,
         Special::AddConstraints(add) => {
             handle_pg_add_constraints(pg_conn, &add)?;
             noop_statement(&pg_conn.conn)?
@@ -2189,7 +2191,7 @@ fn handle_pg_show(pg_conn: &Arc<PgConnectionInner>, show: &PgShowStmt) -> Result
             ("search_path", shown)
         }
         "foreign_keys" => {
-            let mut stmt = pg_conn.conn.prepare("PRAGMA foreign_keys")?;
+            let mut stmt = pg_conn.conn.prepare(catalog::sqlite_text("PRAGMA foreign_keys"))?;
             let rows = stmt.run_collect_rows()?;
             let on = rows
                 .first()
@@ -2259,7 +2261,7 @@ fn handle_pg_create_schema(conn: &Arc<Connection>, stmt: &PgCreateSchemaStmt) ->
     let path = schema_file_path(conn, &name);
     execute_sqlite_internal(
         conn,
-        format!("ATTACH '{}' AS \"{}\"", path.replace('\'', "''"), name),
+        catalog::sqlite_text(format!("ATTACH '{}' AS \"{}\"", path.replace('\'', "''"), name)),
     )?;
     Ok(())
 }
@@ -2299,7 +2301,7 @@ fn handle_pg_drop_schema(pg_conn: &Arc<PgConnectionInner>, stmt: &PgDropSchemaSt
         drop_all_tables_in_schema(conn, &name)?;
     }
 
-    execute_sqlite_internal(conn, format!("DETACH \"{name}\""))?;
+    execute_sqlite_internal(conn, catalog::sqlite_text(format!("DETACH \"{name}\"")))?;
     Ok(())
 }
 
@@ -2463,10 +2465,10 @@ fn handle_pg_add_constraints(
     // own, and its DDL reaches SetCookie with none (wire review 2 item 1). So the lookup's rows are
     // collected and the statement dropped here, before the rebuild's first statement.
     {
-        let mut stmt = conn.prepare_internal(
+        let mut stmt = conn.prepare_internal(catalog::sqlite_text(
             "SELECT type, sql FROM sqlite_schema WHERE tbl_name = ?1 AND sql IS NOT NULL \
              ORDER BY CASE type WHEN 'table' THEN 0 WHEN 'index' THEN 1 ELSE 2 END, rowid",
-        )?;
+        ))?;
         stmt.bind_at(
             NonZero::new(1).unwrap(),
             Value::build_text(table.to_string()),
@@ -2494,7 +2496,7 @@ fn handle_pg_add_constraints(
         let name = aside_name_for(table, n);
         let taken = {
             let mut stmt =
-                conn.prepare_internal("SELECT 1 FROM sqlite_schema WHERE lower(name) = lower(?1)")?;
+                conn.prepare_internal(catalog::sqlite_text("SELECT 1 FROM sqlite_schema WHERE lower(name) = lower(?1)"))?;
             stmt.bind_at(NonZero::new(1).unwrap(), Value::build_text(name.clone()))?;
             !stmt.run_collect_rows()?.is_empty()
         };
@@ -3023,7 +3025,7 @@ fn check_added_foreign_key(
          {matches}) LIMIT 1",
         quote(&key.parent)
     );
-    let orphans = conn.prepare_sqlite(&sql)?.run_collect_rows()?;
+    let orphans = conn.prepare_sqlite(catalog::sqlite_text(&sql))?.run_collect_rows()?;
     if orphans.is_empty() {
         Ok(())
     } else {
@@ -3247,7 +3249,9 @@ pub const CONNECTION_BROKEN: &str = "connection broken";
 
 /// Run one statement as the engine runs a client's (a root statement), in SQLite text.
 fn execute_root(conn: &Arc<Connection>, sql: impl AsRef<str>) -> Result<()> {
-    conn.prepare_sqlite(sql)?.run_ignore_rows()
+    // Marked as this frontend's SQLite: a stored index's text was re-read as PostgreSQL and
+    // translated again (the dialect audit of 2026-10-17, C).
+    conn.prepare_sqlite(catalog::sqlite_text(sql))?.run_ignore_rows()
 }
 
 /// Run one PostgreSQL statement through this frontend, as a client's would be.
@@ -3308,7 +3312,9 @@ fn handle_pg_copy_from(pg_conn: &Arc<PgConnectionInner>, stmt: &PgCopyFromStmt) 
     };
 
     let placeholders = (0..num_columns).map(|_| "?").collect::<Vec<_>>().join(", ");
-    let insert_sql = format!("INSERT INTO {table_name}{insert_cols} VALUES ({placeholders})");
+    let insert_sql = catalog::sqlite_text(format!(
+        "INSERT INTO {table_name}{insert_cols} VALUES ({placeholders})"
+    ));
 
     let delimiter = stmt
         .delimiter
@@ -3527,11 +3533,11 @@ fn get_table_columns(
     // a quote in it broke the PRAGMA's text.
     let table_name = table_name.replace('\'', "''");
     let sql = match schema_name {
-        Some(schema) => format!(
+        Some(schema) => catalog::sqlite_text(format!(
             "PRAGMA \"{}\".table_info('{table_name}')",
             schema.replace('"', "\"\"")
-        ),
-        None => format!("PRAGMA table_info('{table_name}')"),
+        )),
+        None => catalog::sqlite_text(format!("PRAGMA table_info('{table_name}')")),
     };
     let mut stmt = conn.prepare_internal(&sql)?;
     let rows = stmt.run_collect_rows()?;

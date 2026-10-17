@@ -21,6 +21,18 @@ const STORED_PG_SCHEMA_PREFIX: &str = "/* turso_frontend:postgres */ ";
 /// engine review 20 HIGH 1). A reader unaware of it sees a leading comment and SQLite text.
 const STORED_PG_ALTERED_PREFIX: &str = "/* turso_frontend:postgres sqlite */ ";
 
+/// The mark of text that is this frontend's (or the engine's) own SQLite, written by the code that
+/// builds it (PRAGMAs, ATTACH, DETACH, sqlite_schema lookups with `?N`, COPY's `VALUES (?, ...)`):
+/// the one text [`PostgresDialect::parse`] reads as SQLite. NO SILENT DIALECT SWITCH (lead class,
+/// 2026-10-17): text PostgreSQL parses is never read again as SQLite, whatever its translation
+/// does; the SQLite parse is taken by a mark written at the source, never guessed from a failure.
+pub(crate) const SQLITE_TEXT_MARKER: &str = "/* turso:sqlite */ ";
+
+/// `sql` marked as this frontend's own SQLite ([`SQLITE_TEXT_MARKER`]).
+pub(crate) fn sqlite_text(sql: impl AsRef<str>) -> String {
+    format!("{SQLITE_TEXT_MARKER}{}", sql.as_ref())
+}
+
 #[derive(Debug)]
 pub struct PostgresDialect;
 
@@ -30,9 +42,15 @@ impl Dialect for PostgresDialect {
     }
 
     fn parse(&self, sql: &str) -> Result<(Option<turso_parser::ast::Cmd>, usize)> {
-        // Engine-generated helper statements and pragmas are canonical SQLite
-        // text that pg_query rejects, so anything the PostgreSQL parser cannot
-        // handle falls back to SQLite parsing.
+        // This frontend's own SQLite, marked where it is built: read as SQLite.
+        if sql.starts_with(SQLITE_TEXT_MARKER) {
+            return turso_core::dialect::sqlite::parse(sql);
+        }
+        // Text the PostgreSQL parser rejects still falls back to SQLite, for the ENGINE's own
+        // unmarked helper statements (pragma_* table functions, VACUUM's replay, branch merge,
+        // CDC, MVCC bootstrap: the audit of 2026-10-17). That half of the class waits on
+        // fastest-engine marking them (or routing StatementOrigin::InternalHelper to the SQLite
+        // parse); then a rejected unmarked text becomes an error too.
         let Ok(parse_result) = turso_pg_parser::parse(sql) else {
             return turso_core::dialect::sqlite::parse(sql);
         };
@@ -67,10 +85,13 @@ impl Dialect for PostgresDialect {
                     .to_string(),
             ));
         }
+        // Text PostgreSQL parsed is PostgreSQL's: a translation failure is an error, never a
+        // reading of the same text as SQLite, which can mean something else (`SELECT ?1`: an
+        // operator there, a parameter here).
         let translator = turso_pg_parser::translator::PostgreSQLTranslator::new();
         match translator.translate(&parse_result) {
             Ok(stmt) => Ok((Some(turso_parser::ast::Cmd::Stmt(stmt)), consumed)),
-            Err(_) => turso_core::dialect::sqlite::parse(sql),
+            Err(e) => Err(LimboError::ParseError(e.into())),
         }
     }
 
@@ -4317,5 +4338,14 @@ mod dialect_switch_tests {
             PostgresDialect.parse(sql).is_err(),
             "a PG statement whose translation failed was read as SQLite"
         );
+    }
+
+    /// Text marked as this frontend's own SQLite takes the SQLite parse, and the same text
+    /// unmarked does not.
+    #[test]
+    fn only_marked_text_takes_the_sqlite_parse() {
+        let pragma = "PRAGMA foreign_keys";
+        assert!(PostgresDialect.parse(&format!("{SQLITE_TEXT_MARKER}{pragma}")).is_ok());
+        assert!(PostgresDialect.parse(&format!("{SQLITE_TEXT_MARKER}SELECT ?1")).is_ok());
     }
 }
