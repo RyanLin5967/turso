@@ -1773,6 +1773,10 @@ struct StoreInner {
     /// The log sequence number that makes the newest fork durable: a listing waits for it, so no
     /// branch is listed before its fork is durable (review C-F4).
     last_fork_lsn: u64,
+    /// Test builds: captures entered in THIS store (review m1-2b item 5; `CAPTURE_ENTERED` counts
+    /// every store in the process, so another file's test could move a premise read from it).
+    #[cfg(test)]
+    captures_entered: u64,
 }
 
 /// A branch id as the live set's key. Ids are minted from 1 upward; one past `u32` would need a wider
@@ -9714,6 +9718,12 @@ impl BranchStore {
         (name, f.rebuilds)
     }
 
+    /// Test builds: captures entered in this store (`StoreInner::captures_entered`).
+    #[cfg(test)]
+    pub(crate) fn captures_entered_for_test(&self) -> u64 {
+        self.inner.lock().captures_entered
+    }
+
     /// Test builds: this store's case-4 observation counters, `(Stale refusals, answers ended by a
     /// refusing sink)` (review m1-2b item 4).
     #[cfg(test)]
@@ -10354,6 +10364,8 @@ impl StoreInner {
             fail_stop: Arc::new(AtomicBool::new(false)),
             files_dev: Arc::new(AtomicU64::new(NO_DEVICE)),
             last_fork_lsn: 0,
+            #[cfg(test)]
+            captures_entered: 0,
         }
     }
 
@@ -11391,7 +11403,10 @@ impl StoreInner {
         flight_in_air: bool,
     ) -> Result<Box<Captured>> {
         #[cfg(test)]
-        CAPTURE_ENTERED.fetch_add(1, Ordering::Relaxed);
+        {
+            CAPTURE_ENTERED.fetch_add(1, Ordering::Relaxed);
+            self.captures_entered += 1;
+        }
         if fuzzy && self.splice && !guard_mutant("c") {
             return Err(LimboError::InvalidArgument(
                 "fuzzy capture refused: splice arm (r13-compose S-12)".to_string(),
