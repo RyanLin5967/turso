@@ -3962,6 +3962,39 @@ fn checkpoint_now_with_its_flight_held(
     r
 }
 
+/// Review c42b LOW-5 (C42 LOW-1 was fixed with no red): `checkpoint_now` takes any deadline, so a
+/// client asking to wait without bound (`Duration::MAX`) gets its checkpoint (`Ok(true)`) rather
+/// than an `Instant` overflow. Answered on its own thread within 30 s. Expected red at
+/// 5eca7a09a^ (`started + deadline` panicked: the thread dies and no answer comes).
+#[test]
+fn checkpoint_now_with_no_bound_on_its_wait_installs() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(
+        &dir.path().join("checkpoint-now-max.db"),
+        opts(true, SyncClass::Fsync).with_branch_checkpoint(super::BranchCheckpoint::Fuzzy),
+    );
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    for _ in 0..8 {
+        let _ = trunk.fork_branch().unwrap().into_id();
+    }
+    db.branch_checkpoint_wait();
+    let installed0 = db.branch_checkpoint_counters()[0];
+    let (tx, rx) = std::sync::mpsc::channel();
+    {
+        let db = db.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(db.branch_checkpoint_now(std::time::Duration::MAX));
+        });
+    }
+    let r = rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("CLAIM: checkpoint_now(Duration::MAX) gave no answer in 30 s (its thread died or hung)");
+    assert!(matches!(r, Ok(true)), "CLAIM: checkpoint_now(Duration::MAX) on a fuzzy store answered {r:?}, not Ok(true)");
+    assert!(db.branch_checkpoint_counters()[0] > installed0, "CLAIM: Ok(true) with no checkpoint installed");
+}
+
 /// Review C42 MED-3: `checkpoint_now` whose own flight INSTALLED but whose WAL truncation ran past
 /// the deadline reports the install (`Ok(true)`), as its doc says (`Ok(false)`: none did before
 /// the deadline). The flight is held at `HOLD_BEFORE_WAL_TRUNCATE`, after its install, past a
