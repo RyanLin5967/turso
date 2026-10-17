@@ -9173,6 +9173,91 @@ fn the_create_path_s_store_mutex_holds_do_no_syscall_allocation_or_catalog_state
     lifecycle_audit(1_000_000);
 }
 
+/// Counters review 4 LOW-F (DECISIONS 6399fd35bf): a disarm racing another thread's hold excludes
+/// nothing. The audit disarms as `AUDIT = false` then `ARMED = false`; a hold whose lock reads the
+/// new `ARMED` (false: not sampled) and whose end reads the old `AUDIT` (true: audited) is counted
+/// excluded, a false red of `lifecycle_audit`'s `excluded == 0`. Relaxed on both, a weakly ordered
+/// CPU (ARM64) may show another thread the two stores in either order. A background thread takes
+/// the audited store's mutex in a loop through the real guard (`branch_catalog_counters`) while
+/// this thread disarms, round after round; it is paused at each re-arm, so the only race is the
+/// disarm's. A stress red: it can only fail when the reordering happens, never pass by construction.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_disarm_racing_another_threads_hold_excludes_no_hold() {
+    use super::budget_probe::{self as probe, AUDIT, AUDIT_EXCLUDED, AUDIT_LOG, AUDIT_PATH};
+    use std::sync::atomic::{AtomicU64, Ordering::{Acquire, Relaxed, Release}};
+    let _s = serial();
+    struct Disarm;
+    impl Drop for Disarm {
+        fn drop(&mut self) {
+            AUDIT.store(false, Release);
+            *AUDIT_PATH.lock().unwrap() = None;
+            probe::arm(false);
+        }
+    }
+    let _d = Disarm;
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("race.db");
+    let incarnation = open_at(&path, opts(true, SyncClass::Off)).incarnation;
+    *AUDIT_PATH.lock().unwrap() = Some(std::fs::canonicalize(&path).unwrap().to_str().unwrap().to_string());
+    let db = reopen(&path, opts(true, SyncClass::Off), incarnation);
+    {
+        let mut log = AUDIT_LOG.lock().unwrap();
+        log.clear();
+        log.reserve(1 << 16);
+    }
+    AUDIT_EXCLUDED.store(0, Release);
+    probe::prime();
+    // The command: 2r + 1, hold (round r); 2r + 2, pause after round r; MAX, exit. A pause is
+    // acknowledged with the command read, after the hold in flight has ended, so a stale
+    // acknowledgement cannot let a re-arm meet a hold.
+    let cmd = Arc::new(AtomicU64::new(0));
+    let acked = Arc::new(AtomicU64::new(u64::MAX));
+    let holds = Arc::new(AtomicU64::new(0));
+    let bg = {
+        let (db, cmd, acked, holds) = (db.clone(), cmd.clone(), acked.clone(), holds.clone());
+        std::thread::spawn(move || loop {
+            let c = cmd.load(Acquire);
+            if c == u64::MAX {
+                break;
+            }
+            if c % 2 == 1 {
+                std::hint::black_box(db.branch_catalog_counters());
+                holds.fetch_add(1, Release);
+            } else {
+                acked.store(c, Release);
+                std::hint::spin_loop();
+            }
+        })
+    };
+    let wait = |what: &str, done: &dyn Fn() -> bool| {
+        let t = std::time::Instant::now();
+        while !done() {
+            assert!(t.elapsed() < std::time::Duration::from_secs(30), "premise: the background thread never {what}");
+            std::hint::spin_loop();
+        }
+    };
+    const ROUNDS: u64 = 2_000;
+    for r in 0..ROUNDS {
+        wait("paused", &|| acked.load(Acquire) == 2 * r);
+        probe::arm(true);
+        AUDIT.store(true, Release);
+        let h0 = holds.load(Acquire);
+        cmd.store(2 * r + 1, Release);
+        wait("held", &|| holds.load(Acquire) >= h0 + 2);
+        // The disarm, in lifecycle_audit's order, while the other thread is between holds or in one.
+        AUDIT.store(false, Release);
+        probe::arm(false);
+        cmd.store(2 * r + 2, Release);
+    }
+    wait("paused", &|| acked.load(Acquire) == 2 * ROUNDS);
+    cmd.store(u64::MAX, Release);
+    bg.join().unwrap();
+    let n = holds.load(Acquire);
+    assert!(n >= 2 * ROUNDS, "premise: {n} background holds in {ROUNDS} rounds");
+    assert_eq!(AUDIT_EXCLUDED.load(Relaxed), 0, "a disarm racing a hold excluded it ({n} holds, {ROUNDS} disarms): the guard saw the old AUDIT after the new ARMED");
+}
+
 /// Lead conditions on the name filter (DECISIONS, the acceptance of the one-state fix): the table
 /// listing the regrowth tests read (`per_branch_tables_for_test`) prices the filter's tables at their
 /// REAL bytes (8 per slot; 4cb167221 listed them at 0, which blinded the regrowth test), and a growth
