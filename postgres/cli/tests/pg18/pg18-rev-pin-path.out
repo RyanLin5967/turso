@@ -1,0 +1,30 @@
+>> [a] Q CREATE SCHEMA s
+   C CREATE SCHEMA
+   Z I
+>> [a] Q CREATE TABLE s.t(x int)
+   C CREATE TABLE
+   Z I
+>> [a] Q INSERT INTO s.t VALUES (2)
+   C INSERT 0 1
+   Z I
+>> [a] Q CREATE TABLE t(x int)
+   C CREATE TABLE
+   Z I
+>> [a] Q INSERT INTO t VALUES (1)
+   C INSERT 0 1
+   Z I
+>> [a] PARSE s1 - SELECT x FROM t
+>> [a] SYNC
+   ParseComplete
+   Z I
+>> [a] Q SET search_path TO s
+   C SET
+   ParameterStatus search_path=s
+   Z I
+>> [a] BIND - s1 - -
+>> [a] EXEC - 0
+>> [a] SYNC
+   BindComplete
+   D ['2']
+   C SELECT 1
+   Z I

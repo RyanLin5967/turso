@@ -1,0 +1,53 @@
+>> [a] Q BEGIN
+   C BEGIN
+   Z T
+>> [a] Q SET lock_timeout = '1s'
+   C SET
+   Z T
+>> [a] Q SELECT * FROM nosuch
+   E S=ERROR C=42P01 M=relation "nosuch" does not exist
+   Z E
+>> [a] Q COMMIT AND CHAIN
+   C ROLLBACK
+   Z T
+>> [a] Q SHOW lock_timeout
+   T oids=[25] names=['lock_timeout']
+   D ['0']
+   C SHOW
+   Z T
+>> [a] Q COMMIT
+   C COMMIT
+   Z I
+>> [a] Q SHOW lock_timeout
+   T oids=[25] names=['lock_timeout']
+   D ['0']
+   C SHOW
+   Z I
+>> [a] Q BEGIN
+   C BEGIN
+   Z T
+>> [a] Q SAVEPOINT s
+   C SAVEPOINT
+   Z T
+>> [a] Q SET lock_timeout = '2s'
+   C SET
+   Z T
+>> [a] Q SELECT * FROM nosuch
+   E S=ERROR C=42P01 M=relation "nosuch" does not exist
+   Z E
+>> [a] Q ROLLBACK AND CHAIN
+   C ROLLBACK
+   Z T
+>> [a] Q SHOW lock_timeout
+   T oids=[25] names=['lock_timeout']
+   D ['0']
+   C SHOW
+   Z T
+>> [a] Q COMMIT
+   C COMMIT
+   Z I
+>> [a] Q SHOW lock_timeout
+   T oids=[25] names=['lock_timeout']
+   D ['0']
+   C SHOW
+   Z I

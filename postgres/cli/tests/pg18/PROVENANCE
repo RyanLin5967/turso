@@ -105,3 +105,8 @@ pg18-rev-c39-misc.out 051e38b5d0 da2d41c330ae7f05
 pg18-rev-c39-enc.out 051e38b5d0 d110d251e8fa8397
 pg18-rev-cd-tz2.out 2d9c4aa18b 72cb9dceb5e46cc1
 pg18-rev-cd-setlocal.out 2d9c4aa18b 326da8d6cebca458
+pg18-rev-bl1.out 23bf38368a be3a8148703a1069
+pg18-rev-bl3.out 2d9c4aa18b af9c867747d57f32
+pg18-rev-eh1.out 23bf38368a b35890dd0ea8b074
+pg18-rev-pin-path.out 2d9c4aa18b aea5ed1cdc72ef1d
+pg18-rev-low5-chain.out 2d9c4aa18b dee159f4003c7bd8

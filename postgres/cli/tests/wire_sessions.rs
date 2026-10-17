@@ -11921,6 +11921,12 @@ mod recorded {
         b
     }
 
+    thread_local! {
+        /// The recording is pgraw.py's, which also prints ParameterStatus and EmptyQueryResponse
+        /// lines (pgproto.py prints neither).
+        static PGRAW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
     fn read_until_ready(w: &mut Wire) -> Vec<String> {
         let mut lines = Vec::new();
         loop {
@@ -11932,7 +11938,16 @@ mod recorded {
             let len = i32::from_be_bytes([head[1], head[2], head[3], head[4]]) as usize;
             let mut body = vec![0u8; len - 4];
             w.s.read_exact(&mut body).unwrap();
-            if let Some(l) = describe(head[0], &body) {
+            if PGRAW.with(std::cell::Cell::get) && matches!(head[0], b'S' | b'I') {
+                if head[0] == b'I' {
+                    lines.push("EmptyQueryResponse".to_string());
+                } else {
+                    let text = String::from_utf8_lossy(&body);
+                    let mut kv = text.trim_end_matches('\0').splitn(2, '\0');
+                    let (k, v) = (kv.next().unwrap_or(""), kv.next().unwrap_or(""));
+                    lines.push(format!("ParameterStatus {k}={v}"));
+                }
+            } else if let Some(l) = describe(head[0], &body) {
                 lines.push(l);
             }
             if head[0] == b'Z' {
@@ -11987,10 +12002,66 @@ mod recorded {
                 w.s.write_all(&out).unwrap();
                 read_until_ready(w)
             }
+            // As pgraw.py sends a Query: any queued messages first (pgproto.py recordings never
+            // queue before one, so their replay is unchanged).
             "Q" => {
-                w.s.write_all(&frame(b'Q', &c(rest))).unwrap();
+                let mut out = std::mem::take(pending);
+                out.extend(frame(b'Q', &c(rest)));
+                w.s.write_all(&out).unwrap();
                 read_until_ready(w)
             }
+            // pgraw.py's verbs (frontier/fastest/lanes/wire/raw/loud-20261015/pg18-diff/pgraw.py),
+            // for the recordings of named statements, format codes and several sessions (the line
+            // review reds: rev-bl1, rev-bl3, rev-eh1, rev-pin-path, rev-low5-chain).
+            "PARSE" => {
+                let (name, rest) = rest.split_once(' ').unwrap();
+                let (oids, sql) = rest.split_once(' ').unwrap();
+                let oid_list: Vec<u32> = if oids == "-" {
+                    Vec::new()
+                } else {
+                    oids.split(',').map(|o| o.parse().unwrap()).collect()
+                };
+                let mut b = c(if name == "-" { "" } else { name });
+                b.extend(c(sql));
+                b.extend_from_slice(&(oid_list.len() as u16).to_be_bytes());
+                for o in &oid_list {
+                    b.extend_from_slice(&o.to_be_bytes());
+                }
+                pending.extend(frame(b'P', &b));
+                Vec::new()
+            }
+            "BIND" => {
+                let parts: Vec<&str> = rest.split("|||").map(str::trim).collect();
+                let head: Vec<&str> = parts[0].split_whitespace().collect();
+                let dash = |x: &str| if x == "-" { String::new() } else { x.to_string() };
+                let codes = |x: &str| -> Vec<i16> {
+                    if x == "-" { Vec::new() } else { x.split(',').map(|k| k.parse().unwrap()).collect() }
+                };
+                let mut b = c(&dash(head[0]));
+                b.extend(c(&dash(head[1])));
+                let pcodes = codes(head[2]);
+                b.extend_from_slice(&(pcodes.len() as u16).to_be_bytes());
+                for k in &pcodes {
+                    b.extend_from_slice(&k.to_be_bytes());
+                }
+                b.extend(bind_values(&parts[1..]));
+                let rcodes = codes(head[3]);
+                b.extend_from_slice(&(rcodes.len() as u16).to_be_bytes());
+                for k in &rcodes {
+                    b.extend_from_slice(&k.to_be_bytes());
+                }
+                pending.extend(frame(b'B', &b));
+                Vec::new()
+            }
+            "EXEC" => {
+                let mut it = rest.split_whitespace();
+                let (portal, n) = (it.next().unwrap(), it.next().unwrap());
+                let mut b = c(if portal == "-" { "" } else { portal });
+                b.extend_from_slice(&n.parse::<i32>().unwrap().to_be_bytes());
+                pending.extend(frame(b'E', &b));
+                Vec::new()
+            }
+            "SYNC" => send(w, pending, "S"),
             "X" | "D" => {
                 let (oids, rest) = rest.split_once(' ').unwrap();
                 let parts: Vec<&str> = rest.split("|||").map(str::trim).collect();
@@ -12059,12 +12130,37 @@ mod recorded {
         assert!(!cmds.is_empty(), "refused: recording {name} has no command");
         let dir = Scratch::new(&format!("rec{}", name.len()));
         let server = Server::start(&dir.db(), &[]);
-        let mut w = server.connect();
-        let mut pending = Vec::new();
+        // pgraw.py's sessions: `CONN <name>` switches to one, connecting it first if new, and
+        // each of its commands is prefixed `[<name>] `; the first session is "a".
+        let mut sessions: Vec<(String, Wire, Vec<u8>)> = vec![("a".to_string(), server.connect(), Vec::new())];
+        PGRAW.with(|p| {
+            p.set(cmds.iter().any(|c| c.text.starts_with('[') || c.text.starts_with("CONN ")))
+        });
+        let mut current = 0;
         let mut report = String::new();
         let mut differing = Vec::new();
         for (i, cmd) in cmds.iter().enumerate() {
-            let got = send(&mut w, &mut pending, &cmd.text);
+            let got = if let Some(conn) = cmd.text.strip_prefix("CONN ") {
+                current = match sessions.iter().position(|(n, ..)| n == conn) {
+                    Some(k) => k,
+                    None => {
+                        sessions.push((conn.to_string(), server.connect(), Vec::new()));
+                        sessions.len() - 1
+                    }
+                };
+                Vec::new()
+            } else {
+                let text = match cmd.text.strip_prefix('[') {
+                    Some(rest) => {
+                        let (who, text) = rest.split_once("] ").expect("a [session] prefix");
+                        assert_eq!(who, sessions[current].0, "{name}: a command for another session");
+                        text
+                    }
+                    None => cmd.text.as_str(),
+                };
+                let (_, w, pending) = &mut sessions[current];
+                send(w, pending, text)
+            };
             let n = i + 1;
             let registered = divergences.iter().find(|(k, _)| *k == n);
             let agrees = same(&cmd.want, &got);
@@ -13760,3 +13856,13 @@ fn a_reprepare_after_another_sessions_ddl_translates_as_the_session_did() {
 // until a run's diff registers the intended 0A000 rows (valid zones this server does not act on).
 replays_postgresql!(pg18_rev_cd_tz2_replays_as_postgresql_answered, "pg18-rev-cd-tz2.out", []);
 replays_postgresql!(pg18_rev_cd_setlocal_replays_as_postgresql_answered, "pg18-rev-cd-setlocal.out", []);
+// The line-review reds, from PG 18.6 recordings (pgraw.py: named statements and several
+// sessions; artie 2d9c4aa18b, 23bf38368a): B-L1 and B1 (a same-session DROP mid-round), B-L3 (another
+// session's DROP between Parse and Bind, in autocommit and in a block), E-H1 (the kept statement
+// across DROP, ADD COLUMN and a temp table in the round), the search_path re-analysis pin, and the
+// c39 LOW 5 AND CHAIN arms. Strict until a run's diff registers the intended rows.
+replays_postgresql!(pg18_rev_bl1_replays_as_postgresql_answered, "pg18-rev-bl1.out", []);
+replays_postgresql!(pg18_rev_bl3_replays_as_postgresql_answered, "pg18-rev-bl3.out", []);
+replays_postgresql!(pg18_rev_eh1_replays_as_postgresql_answered, "pg18-rev-eh1.out", []);
+replays_postgresql!(pg18_rev_pin_path_replays_as_postgresql_answered, "pg18-rev-pin-path.out", []);
+replays_postgresql!(pg18_rev_low5_chain_replays_as_postgresql_answered, "pg18-rev-low5-chain.out", []);
