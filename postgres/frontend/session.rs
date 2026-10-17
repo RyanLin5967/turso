@@ -1504,10 +1504,21 @@ pub fn pg_bool(text: &str) -> Option<bool> {
 fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Result<Statement> {
     let name = set_stmt.name.to_ascii_lowercase();
     let in_block = !pg_conn.conn.get_auto_commit();
+    // PostgreSQL warns of a SET LOCAL outside a block first, for every setting and before the
+    // value is checked (ExecSetVariableStmt's WarnNoTransactionBlock before set_config_option), so
+    // an invalid value is the warning and then its error (review wire-rework C-M1, C-M2: the
+    // warning came only after an accepted value, and search_path's arm never reached it).
+    if set_stmt.is_local && !in_block {
+        pg_conn.warnings.lock().push((
+            "WARNING",
+            SqlErrorKind::NoActiveSqlTransaction,
+            "SET LOCAL can only be used in transaction blocks".to_string(),
+        ));
+    }
     // Every mutable setting uses this assignment path, including the outside-block LOCAL rule.
     let assign = |apply: &dyn Fn(&mut Gucs, &mut Locals, bool)| {
         // Outside a block a SET LOCAL lasts only its own statement: nothing to keep. Its warning
-        // is given once for every setting, below.
+        // was given above.
         if set_stmt.is_local && !in_block {
             return;
         }
@@ -1813,15 +1824,6 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
         }
     };
     if accepted {
-        // PostgreSQL warns of a SET LOCAL outside a block for every setting, after the value
-        // checked (review c39799c5d..9e24b455d LOW 11: only the settings that act warned).
-        if set_stmt.is_local && !in_block {
-            pg_conn.warnings.lock().push((
-                "WARNING",
-                SqlErrorKind::NoActiveSqlTransaction,
-                "SET LOCAL can only be used in transaction blocks".to_string(),
-            ));
-        }
         noop_statement(&pg_conn.conn)
     } else {
         unsupported("this server answers only by its own setting of it")
