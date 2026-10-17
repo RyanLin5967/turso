@@ -3275,6 +3275,14 @@ struct LeasedPastDue {
     started: u64,
 }
 
+/// Review engine-rev-setter LOW-7: the operation's OWN unlock sent the start it owed, read with no
+/// store-mutex hold (any hold's unlock would send an owed start and rescue the claim below):
+/// nothing is still owed, and a job was handed out since `handed0`. Mutant `owed_start_sent_late`.
+fn assert_the_operation_sent_its_start(probe: &super::store::StarterProbe, handed0: u64, path: &str) {
+    assert!(!probe.owed(), "CLAIM: {path} left its owed checkpoint start unsent at its own unlock");
+    assert!(probe.handed_out() > handed0, "CLAIM: {path}'s unlock handed no checkpoint start to the worker");
+}
+
 /// Premise (review m1-2 LOW-C): the operation's expiry pass reaped the 300, so a failure below is
 /// the start path's, not the fixture's.
 fn assert_the_expiry_reaped(db: &Arc<Database>, probe: BranchId, path: &str) {
@@ -3324,7 +3332,10 @@ fn a_lease_renewal_whose_expiry_crosses_the_threshold_starts_a_checkpoint() {
     let dir = tempfile::TempDir::new().unwrap();
     let s = leased_past_due(&dir.path().join("owed-set-lease.db"));
     let _t = Threshold::set(1);
+    let starter = s.db.branches.starter_probe();
+    let handed0 = starter.handed_out();
     s.keep.lease(std::time::Duration::from_secs(60)).unwrap();
+    assert_the_operation_sent_its_start(&starter, handed0, "set_lease");
     assert_the_expiry_reaped(&s.db, s.probe, "set_lease");
     assert_a_checkpoint_started(&s.db, s.started, "set_lease");
     drop(s.held);
@@ -3336,7 +3347,10 @@ fn a_connect_whose_expiry_crosses_the_threshold_starts_a_checkpoint() {
     let dir = tempfile::TempDir::new().unwrap();
     let s = leased_past_due(&dir.path().join("owed-open-conn.db"));
     let _t = Threshold::set(1);
+    let starter = s.db.branches.starter_probe();
+    let handed0 = starter.handed_out();
     let c = s.keep.connect().unwrap();
+    assert_the_operation_sent_its_start(&starter, handed0, "open_conn");
     assert_the_expiry_reaped(&s.db, s.probe, "open_conn");
     assert_a_checkpoint_started(&s.db, s.started, "open_conn");
     drop(c);
@@ -3349,7 +3363,10 @@ fn a_named_create_refused_after_its_expiry_crossed_the_threshold_starts_a_checkp
     let dir = tempfile::TempDir::new().unwrap();
     let s = leased_past_due(&dir.path().join("owed-create-error.db"));
     let _t = Threshold::set(1);
+    let starter = s.db.branches.starter_probe();
+    let handed0 = starter.handed_out();
     assert!(s.trunk.create_branch("named-keep").is_err(), "premise: the name was taken, so the create returned an error");
+    assert_the_operation_sent_its_start(&starter, handed0, "a refused named create");
     assert_the_expiry_reaped(&s.db, s.probe, "a refused named create");
     assert_a_checkpoint_started(&s.db, s.started, "a refused named create");
     drop(s.held);

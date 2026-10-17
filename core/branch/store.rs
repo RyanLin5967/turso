@@ -1448,6 +1448,9 @@ struct StoreMutex {
     /// Test builds: the starter's hold (`HOLD_STARTER_SENDING`), per store.
     #[cfg(test)]
     starter_hold: AtomicU8,
+    /// Test builds: mutant `owed_start_sent_late` has skipped this store's first owed send.
+    #[cfg(test)]
+    late_skipped: AtomicBool,
 }
 
 impl StoreMutex {
@@ -1457,6 +1460,8 @@ impl StoreMutex {
             starter: std::sync::OnceLock::new(),
             #[cfg(test)]
             starter_hold: AtomicU8::new(0),
+            #[cfg(test)]
+            late_skipped: AtomicBool::new(false),
             inner: Mutex::new(inner),
             compacting: AtomicU64::new(0),
             compaction_waits: AtomicU64::new(0),
@@ -1571,6 +1576,15 @@ impl Drop for StoreGuard<'_> {
         // A hold that panicked sends nothing while its stack unwinds (its store may be half
         // changed): the start stays owed, and the next hold's unlock sends it (review M1 LOW-2).
         // Checked only once a start is owed, so the common unlock reads one flag (review m1-2 INFO).
+        // Mutant `owed_start_sent_late` (test builds only; review engine-rev-setter LOW-7): the
+        // first owed start's own unlock does not send it; a later hold's does.
+        #[cfg(test)]
+        if self.store.start_due.load(Ordering::Acquire)
+            && fe_mutant("owed_start_sent_late")
+            && !self.store.late_skipped.swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
         if self.store.start_due.load(Ordering::Acquire)
             && !std::thread::panicking()
             && !fe_mutant("owed_start_unsent")
