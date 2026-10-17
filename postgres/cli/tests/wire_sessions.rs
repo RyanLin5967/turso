@@ -13345,7 +13345,18 @@ fn foreign_keys_cannot_be_turned_off_over_pending_deferred_violations() {
         let mut refused = false;
         for sql in statements {
             let r = a.q(sql);
-            if sql.contains("foreign_keys") {
+            // The implicit block first: its query holds foreign_keys too, so the SET branch below
+            // took it and this one was dead (review wire-rework A-L1).
+            if sql.starts_with("INSERT") && sql.contains(';') {
+                // The implicit block: the refusal is this query's own error.
+                match &r.error {
+                    None => wrong.push(format!("{label}: the implicit block was accepted")),
+                    Some(e) if e.code != "55000" => {
+                        wrong.push(format!("{label}: the implicit block refused with {}, not 55000", e.code))
+                    }
+                    Some(_) => refused = true,
+                }
+            } else if sql.contains("foreign_keys") {
                 match &r.error {
                     None => wrong.push(format!("{label}: {sql} accepted over a pending violation")),
                     Some(e) if e.code != "55000" => {
@@ -13355,15 +13366,6 @@ fn foreign_keys_cannot_be_turned_off_over_pending_deferred_violations() {
                 }
                 if r.error.is_some() && r.status != b'E' && statements[0] == "BEGIN" {
                     wrong.push(format!("{label}: the refused SET did not fail the block"));
-                }
-            } else if sql.starts_with("INSERT") && sql.contains(';') {
-                // The implicit block: the refusal is this query's own error.
-                match &r.error {
-                    None => wrong.push(format!("{label}: the implicit block was accepted")),
-                    Some(e) if e.code != "55000" => {
-                        wrong.push(format!("{label}: the implicit block refused with {}, not 55000", e.code))
-                    }
-                    Some(_) => refused = true,
                 }
             } else if *sql == "COMMIT" {
                 if r.error.is_some() || r.tags != ["ROLLBACK"] {
@@ -13384,12 +13386,17 @@ fn foreign_keys_cannot_be_turned_off_over_pending_deferred_violations() {
         if !refused && wrong.is_empty() {
             wrong.push(format!("{label}: nothing was refused"));
         }
-        // The next write still works (the deferred count was not left behind).
+        // The next write still works (the deferred count was not left behind), and the session
+        // that saw the refusal still accepts turning foreign_keys off with nothing pending
+        // (review wire-rework A-L2).
         let w = a.q("INSERT INTO p VALUES (1)");
         let w2 = a.q("INSERT INTO c VALUES (2, 1)");
-        for r in [&w, &w2] {
+        let c0 = a.q("BEGIN");
+        let c1 = a.q("SET LOCAL foreign_keys = off");
+        let c2 = a.q("COMMIT");
+        for r in [&w, &w2, &c0, &c1, &c2] {
             if let Some(e) = &r.error {
-                wrong.push(format!("{label}: a later write failed: {} {}", e.code, e.message));
+                wrong.push(format!("{label}: a later statement failed: {} {}", e.code, e.message));
             }
         }
         wrong
