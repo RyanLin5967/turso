@@ -8349,7 +8349,7 @@ impl BranchStore {
                 self.unsynced.store(false, Ordering::Release);
                 self.maybe_compact(&mut inner);
                 drop(inner);
-                        kill_point("trunk.barrier_done");
+                kill_point("trunk.barrier_done");
                 #[cfg(test)]
                 pause_at(Some(&*self.trunk_commit_hold), HOLD_TRUNK_BARRIER_DONE);
                 skip_backpressure(backpressure, ordered);

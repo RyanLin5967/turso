@@ -986,13 +986,13 @@ pub(crate) fn thread_locks() -> u64 {
     T_LOCKS.with(|c| c.get())
 }
 
-/// This thread's `(allocations, bytes, allocations under a store mutex, bytes under one)`: exact
-/// per thread however many others run.
 /// Catalog statements this thread ran, on any catalog connection (`catalog_statement`).
 pub(crate) fn thread_cat_stmts() -> u64 {
     T_CAT_STMTS.with(|c| c.get())
 }
 
+/// This thread's `(allocations, bytes, allocations under a store mutex, bytes under one)`: exact
+/// per thread however many others run.
 pub(crate) fn thread_allocs() -> (u64, u64, u64, u64) {
     let get = |c: &'static std::thread::LocalKey<Cell<u64>>| c.with(|c| c.get());
     (get(&T_ALLOCS), get(&T_ALLOC_BYTES), get(&T_HELD_ALLOCS), get(&T_HELD_ALLOC_BYTES))
