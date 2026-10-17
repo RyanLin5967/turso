@@ -1500,9 +1500,42 @@ impl StoreMutex {
     /// through every wrapper).
     #[track_caller]
     fn lock_uncounted(&self) -> StoreGuard<'_> {
+        let guard = self.inner.lock();
+        self.guard_of(guard)
+    }
+
+    /// `lock` within a client's bound (review C42 MED-2: a CHECKPOINT bounded end to end): the
+    /// mutex taken by polling `try_lock` every millisecond at most, `Busy` once `wait.until` has
+    /// passed, `Interrupt` as soon as `wait.interrupted()` says so. `None`: `lock`.
+    #[track_caller]
+    fn lock_within(&self, wait: Option<&Wait<'_>>) -> Result<StoreGuard<'_>> {
+        let Some(wait) = wait else {
+            return Ok(self.lock());
+        };
+        loop {
+            let before = self.compacting.load(Ordering::Acquire);
+            if let Some(guard) = self.inner.try_lock() {
+                if before & 1 == 1 {
+                    self.compaction_waits.fetch_add(1, Ordering::Relaxed);
+                }
+                return Ok(self.guard_of(guard));
+            }
+            if (wait.interrupted)() {
+                return Err(LimboError::Interrupt);
+            }
+            if Instant::now() >= wait.until {
+                return Err(LimboError::Busy);
+            }
+            crate::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// A taken mutex as a `StoreGuard`, with the test builds' bookkeeping (the lifecycle audit's
+    /// site through `#[track_caller]`).
+    #[track_caller]
+    fn guard_of<'a>(&'a self, guard: crate::sync::MutexGuard<'a, StoreInner>) -> StoreGuard<'a> {
         #[cfg(test)]
         let site = std::panic::Location::caller();
-        let guard = self.inner.lock();
         #[cfg(test)]
         STORE_HELD.with(|held| held.set(held.get() + 1));
         // fastest-budgets instrument (test builds): acquisitions, and what is done while held.
@@ -10175,7 +10208,9 @@ impl BranchStore {
         let mut attempts = 0;
         let mut inner = loop {
             self.join_flights_within(wait)?;
-            let inner = self.inner.lock();
+            // Bounded too (review C42 MED-2): a background compaction's sync or a sharp compact may
+            // hold the mutex.
+            let inner = self.lock_within(wait)?;
             if !inner.cat.as_ref().is_some_and(|c| c.flight) {
                 break inner;
             }

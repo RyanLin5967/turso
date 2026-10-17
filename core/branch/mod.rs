@@ -1526,9 +1526,11 @@ impl Database {
     }
 
     /// [`Database::branch_compact_now`] for a client's session (a wire CHECKPOINT; review
-    /// C42-M1): its wait for a fuzzy checkpoint in flight ends at `until` (`LimboError::Busy`, so
-    /// the caller's lock-wait schedule decides) or as soon as `interrupted` says so (the session's
-    /// cancel or statement_timeout: `LimboError::Interrupt`). Nothing is compacted then.
+    /// C42-M1, MED-2). BOUNDED: its wait for a fuzzy checkpoint in flight and its wait for the
+    /// store mutex each end at `until` (`LimboError::Busy`, so the caller's lock-wait schedule
+    /// decides) or as soon as `interrupted` says so (the session's cancel or statement_timeout:
+    /// `LimboError::Interrupt`), and nothing is compacted then. NOT bounded: the compaction itself,
+    /// once it holds the mutex (its own I/O and syncs, which no caller can stop half way).
     #[doc(hidden)]
     pub fn branch_compact_now_within(&self, until: std::time::Instant, interrupted: &dyn Fn() -> bool) -> Result<()> {
         self.branches.compact_now_within(Some(&store::Wait { until, interrupted }))
