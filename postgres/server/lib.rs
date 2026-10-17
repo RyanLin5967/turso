@@ -7017,6 +7017,53 @@ mod tests {
     /// text that mentions the branch-function prefix and holds a `$` without being a call made
     /// two (the branch-call parse and the parameter scan), and a statement PostgreSQL analyses at
     /// Parse is prepared there from the same parse (C53). The fast call form makes none.
+    /// C53 follow-up review B3: each Bind's prepare is reused by its own Execute. A pipelined Bind
+    /// A, Bind B, Execute A, Execute B (no values, no Sync between) costs 2 prepares; with one kept
+    /// statement Bind B replaced A's, and Execute A threw B's away, so it cost 4. Counted as
+    /// libpg_query calls, one per prepare.
+    #[test]
+    fn pipelined_binds_each_keep_their_own_prepare() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = session(&dir);
+        ok(&s, "CREATE TABLE a(x INT)");
+        ok(&s, "CREATE TABLE b(y INT)");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut c = MemClient::new();
+            for (name, sql) in [("sa", "SELECT x FROM a"), ("sb", "SELECT y FROM b")] {
+                s.on_parse(&mut c, Parse::new(Some(name.to_string()), sql.to_string(), vec![]))
+                    .await
+                    .unwrap();
+            }
+            s.on_sync(&mut c, PgSync::new()).await.unwrap();
+            let before = turso_pg_parser::libpg_query_calls();
+            for (portal, stmt) in [("pa", "sa"), ("pb", "sb")] {
+                s.on_bind(
+                    &mut c,
+                    Bind::new(
+                        Some(portal.to_string()),
+                        Some(stmt.to_string()),
+                        vec![],
+                        vec![],
+                        vec![],
+                    ),
+                )
+                .await
+                .unwrap();
+            }
+            for portal in ["pa", "pb"] {
+                s.on_execute(&mut c, Execute::new(Some(portal.to_string()), 0))
+                    .await
+                    .unwrap();
+            }
+            let prepares = turso_pg_parser::libpg_query_calls() - before;
+            s.on_sync(&mut c, PgSync::new()).await.unwrap();
+            assert_eq!(prepares, 2, "prepares for Bind A, Bind B, Execute A, Execute B");
+        });
+    }
+
     #[test]
     fn a_parse_makes_at_most_one_libpg_query_call() {
         let dir = tempfile::TempDir::new().unwrap();
