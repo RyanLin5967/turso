@@ -3020,57 +3020,115 @@ fn create_logs_its_record_and_one_flight_end() {
     );
 }
 
-/// Counters review 2 HIGH 1, as a class (DECISIONS 7d1c461378): an instrument does no work inside
-/// a window. Read from the source (a static red: no run can be trusted to reach every branch): no
-/// function on the probe's window path (`begin`, `end`, `end_owning`, `user_counts`,
-/// `window_syncs`; the suite's `absorb_confirm`, called inside every main-cell window; the store's
-/// `own_sync_counts` and `own_test_counts`) contains a call that allocates or reads the environment
-/// (an env read allocates its value). Work a window does after its counts are taken belongs in a
-/// function of its own, called after them.
+/// Counters review 2 HIGH 1 and review 3 MED-A (DECISIONS 7d1c461378, 4e5b6e3b0a): an instrument
+/// does no work inside a window. The instrument of record is DYNAMIC
+/// (`the_instruments_count_exactly_under_every_flag`); this is a LINT over the source (review 3
+/// LOW-1/2/3): no function on the probe's window and hold paths, callees included, calls a known
+/// allocator, prints, reads the environment, or calls `fe_mutant` (whose first call reads it; the
+/// path asks `budget_probe::mutant_on`, primed outside any window). A line marked `lint-allow:`
+/// with its reason is skipped. Bodies are found at a definition (a line starting `fn`, `pub fn` or
+/// `pub(crate) fn`), and braces inside strings, char literals and comments are not counted.
 #[test]
 fn nothing_on_the_probes_window_path_allocates() {
-    const FORBIDDEN: [&str; 10] =
-        ["env::var", "format!", ".to_string()", "String::from", "Vec::new()", "vec![", "Box::new", ".collect", ".to_owned()", "eprintln!"];
+    const FORBIDDEN: [&str; 24] = [
+        "env::var", "format!", ".to_string()", "String::from", "String::new", "Vec::new()", "Vec::with_capacity", "vec![",
+        "Box::new", "Arc::new", ".collect", ".to_owned()", ".to_vec()", ".clone()", "eprintln!", "println!", "print!(",
+        "dbg!", "write!", "writeln!", "getenv", "fe_mutant(", ".push(", ".insert(",
+    ];
     let sources = [
-        ("budget_probe.rs", include_str!("budget_probe.rs"), &["begin", "end", "end_owning", "user_counts", "window_syncs"][..]),
-        ("budget_tests.rs", include_str!("budget_tests.rs"), &["absorb_confirm"][..]),
+        (
+            "budget_probe.rs",
+            include_str!("budget_probe.rs"),
+            &[
+                "begin", "end", "end_owning", "user_counts", "window_syncs", "attribute", "foreign_threads", "thread_table",
+                "shim_counts", "shim", "shim_lost", "unix_syscalls", "instructions", "store_locked_at", "store_unlocked_of",
+                "mutant_on",
+            ][..],
+        ),
+        ("budget_tests.rs", include_str!("budget_tests.rs"), &["absorb_confirm", "writer_settled", "spin_settled", "settled"][..]),
         ("store.rs", include_str!("store.rs"), &["own_sync_counts", "own_test_counts"][..]),
+        ("mod.rs", include_str!("mod.rs"), &["sync_counts"][..]),
     ];
     let mut found = String::new();
     let mut read = 0;
     for (file, src, fns) in sources {
         for name in fns {
-            let head = format!("fn {name}(");
-            let Some(at) = src.find(&head) else {
+            let heads = [format!("fn {name}("), format!("pub fn {name}("), format!("pub(crate) fn {name}(")];
+            let Some(at) = src.match_indices('\n').map(|(i, _)| i + 1).find(|&i| heads.iter().any(|h| src[i..].trim_start().starts_with(h.as_str()))) else {
                 let _ = writeln!(found, "  {file}: fn {name} not found");
                 continue;
             };
+            let bytes = src.as_bytes();
             let open = at + src[at..].find('{').unwrap();
-            let (mut depth, mut end) = (0i32, open);
-            for (i, c) in src[open..].char_indices() {
-                match c {
-                    '{' => depth += 1,
-                    '}' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            end = open + i;
-                            break;
-                        }
+            let (mut depth, mut j, mut end) = (0i32, open, open);
+            let (mut in_str, mut in_comment) = (false, false);
+            while j < bytes.len() {
+                let c = bytes[j];
+                if in_comment {
+                    in_comment = c != b'\n';
+                } else if in_str {
+                    if c == b'\\' {
+                        j += 1;
+                    } else if c == b'"' {
+                        in_str = false;
                     }
-                    _ => {}
+                } else if c == b'/' && bytes.get(j + 1) == Some(&b'/') {
+                    in_comment = true;
+                } else if c == b'"' {
+                    in_str = true;
+                } else if c == b'\'' && bytes.get(j + 2) == Some(&b'\'') {
+                    j += 2;
+                } else if c == b'{' {
+                    depth += 1;
+                } else if c == b'}' {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = j;
+                        break;
+                    }
                 }
+                j += 1;
             }
-            let body = &src[open..=end];
             read += 1;
-            for bad in FORBIDDEN {
-                if body.contains(bad) {
-                    let _ = writeln!(found, "  {file}: fn {name} calls {bad}");
+            for line in src[open..=end].lines() {
+                if line.contains("lint-allow:") {
+                    continue;
+                }
+                let code = line.split("//").next().unwrap_or("");
+                for bad in FORBIDDEN {
+                    if code.contains(bad) {
+                        let _ = writeln!(found, "  {file}: fn {name}: {bad} in `{}`", line.trim());
+                    }
                 }
             }
         }
     }
-    assert_eq!(read, 8, "premise: every function on the window path was read:\n{found}");
-    assert!(found.is_empty(), "the probe's window path allocates or reads the environment:\n{found}");
+    assert_eq!(read, 23, "premise: every function on the window path was read:\n{found}");
+    assert!(found.is_empty(), "the probe's window path allocates, prints, reads the environment or calls fe_mutant:\n{found}");
+}
+
+/// Counters review 3 MED-A, the instrument of record (DECISIONS 4e5b6e3b0a): the instruments'
+/// exact-count fire-checks (`fc_nothing` moves nothing, `fc_box_23` allocates 23 boxes of 184 bytes)
+/// hold in a child with FE_MUTANT set to a name no mutant has and every diagnostic flag set, so that
+/// a flag's first read, or a diagnostic's work, cannot land inside a window unseen.
+#[test]
+fn the_instruments_count_exactly_under_every_flag() {
+    if in_child() || std::env::var_os("FE_FLAGS_CHILD").is_some() {
+        return;
+    }
+    let dir = tempfile::TempDir::new().unwrap();
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["branch::budget_tests::the_budget_counters_count_exactly_what_was_done", "--exact", "--test-threads=1", "--nocapture"])
+        .env("FE_FLAGS_CHILD", "1")
+        .env("FE_MUTANT", "no_mutant_has_this_name")
+        .env("FE_BUDGET_FOREIGN_NAMES", "1")
+        .env("FE_BUDGET_NEW_NAMES", dir.path().join("new-names.txt"))
+        .env_remove("FE_BUDGET_RAW_DIR")
+        .output()
+        .unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(text.contains("running 1 test"), "premise: the instruments test ran under the flags:\n{text}");
+    assert!(out.status.success(), "the instruments' exact counts fail with every flag set:\n{text}");
 }
 
 /// Counters review MED-5, and review 2 HIGH 2 (DECISIONS 7d1c461378): a parity check needs an
