@@ -89,6 +89,10 @@ pub(crate) static AUDIT: AtomicBool = AtomicBool::new(false);
 /// The per-store counter class (lead ruling d9cf2b609b): the audit records only the holds of the
 /// store opened at this database path (`store::scope_is_audited`), never another test's store's.
 pub(crate) static AUDIT_PATH: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+/// Counters review E1: every outermost hold of an audited store the audit should have recorded
+/// (armed, its end count read), by the guard's own identity, recorded or not. The audit's premise is
+/// `seen == recorded + lost`.
+pub(crate) static AUDIT_SEEN: AtomicU64 = AtomicU64::new(0);
 pub(crate) static AUDIT_LOG: std::sync::Mutex<Vec<HoldRec>> = std::sync::Mutex::new(Vec::new());
 pub(crate) static AUDIT_LOST: AtomicU64 = AtomicU64::new(0);
 /// Holds `attribute` refused (any thread), observation only.
@@ -482,6 +486,12 @@ pub(crate) fn store_locked_at(site: &'static std::panic::Location<'static>) {
 
 /// This thread is letting go of a branch store's mutex (its guard's drop, before the unlock).
 pub(crate) fn store_unlocked() {
+    store_unlocked_of(None);
+}
+
+/// `store_unlocked`, with the identity of the store whose guard this is (`StoreGuard`):
+/// `(id, audited)`. `None` (a test driving the probe directly): no store.
+pub(crate) fn store_unlocked_of(own: Option<(usize, bool)>) {
     let depth = DEPTH.with(|d| {
         d.set(d.get().saturating_sub(1));
         d.get()
@@ -533,6 +543,9 @@ pub(crate) fn store_unlocked() {
                 } else {
                     HELD_UNATTRIBUTED.fetch_add(1, Relaxed);
                     bump(&T_HELD_UNATTRIBUTED, 1);
+                }
+                if AUDIT.load(Relaxed) && own.is_some_and(|o| o.1) {
+                    AUDIT_SEEN.fetch_add(1, Relaxed);
                 }
                 if AUDIT.load(Relaxed) && crate::branch::store::scope_is_audited() {
                     let get = |c: &'static std::thread::LocalKey<Cell<u64>>| c.with(|c| c.get());

@@ -8958,7 +8958,7 @@ fn a_failed_filter_drain_never_answers_absent_for_a_held_name() {
 /// The claim lists every (operation, site) whose worst hold did any of the three, so each instance of
 /// the class is named where it lives.
 fn lifecycle_audit(n: u32) {
-    use super::budget_probe::{self as probe, HoldRec, AUDIT, AUDIT_LOG, AUDIT_LOST};
+    use super::budget_probe::{self as probe, HoldRec, AUDIT, AUDIT_LOG, AUDIT_LOST, AUDIT_SEEN};
     use std::sync::atomic::Ordering::{Relaxed, Release};
     let _s = serial();
     struct Disarm;
@@ -9001,6 +9001,8 @@ fn lifecycle_audit(n: u32) {
         let mut log = AUDIT_LOG.lock().unwrap();
         log.clear();
         log.reserve(1 << 20);
+        AUDIT_SEEN.store(0, Release);
+        AUDIT_LOST.store(0, Release);
     }
     let mut marks: Vec<(&str, usize)> = Vec::new();
     let mark = |marks: &mut Vec<(&'static str, usize)>, op: &'static str| marks.push((op, AUDIT_LOG.lock().unwrap().len()));
@@ -9079,6 +9081,10 @@ fn lifecycle_audit(n: u32) {
     assert_eq!(AUDIT_LOST.load(Relaxed), 0, "premise: the audit log lost holds (its room was too small)");
     // Lead ruling 67664df569: the scoping cannot silently empty the audit. This arm recorded at least
     // one hold, and every hold it recorded is of its OWN store.
+    // Counters review E1: the audit is complete: every outermost hold of this store it should have
+    // recorded, counted by the guard's own identity, is in its log or counted lost.
+    let seen = AUDIT_SEEN.load(Relaxed);
+    assert_eq!(seen, log.len() as u64 + AUDIT_LOST.load(Relaxed), "premise: the audit saw {seen} holds of its store and recorded {} (n = {n})", log.len());
     let own = db.branches.store_id_for_test();
     let mine = log.iter().filter(|r| r.store == own).count();
     assert!(

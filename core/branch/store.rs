@@ -1496,14 +1496,31 @@ impl StoreMutex {
         STORE_HELD.with(|held| held.set(held.get() + 1));
         #[cfg(test)]
         scope_push(&self.counts);
+        // Mutant `audit_stray_scope` (test builds only; counters review E1): another store's scope
+        // pushed between this lock and its unlock, so the scope's innermost entry is not this store's
+        // when the hold ends.
+        #[cfg(test)]
+        if fe_mutant("audit_stray_scope") {
+            scope_push(STRAY_COUNTS.get_or_init(|| Arc::new(StoreCounts::default())));
+        }
         // fastest-budgets instrument (test builds): acquisitions, and what is done while held.
         #[cfg(test)]
         super::budget_probe::store_locked_at(site);
-        StoreGuard(guard)
+        StoreGuard(
+            guard,
+            #[cfg(test)]
+            &self.counts,
+        )
     }
 }
 
-struct StoreGuard<'a>(crate::sync::MutexGuard<'a, StoreInner>);
+/// Test builds: the stray store of mutant `audit_stray_scope`.
+#[cfg(test)]
+static STRAY_COUNTS: std::sync::OnceLock<Arc<StoreCounts>> = std::sync::OnceLock::new();
+
+/// A held store mutex; in test builds, with the store's own counters (the hold audit's identity
+/// comes from the guard, never from whatever scope is innermost: counters review E1).
+struct StoreGuard<'a>(crate::sync::MutexGuard<'a, StoreInner>, #[cfg(test)] &'a Arc<StoreCounts>);
 
 impl std::ops::Deref for StoreGuard<'_> {
     type Target = StoreInner;
@@ -1522,8 +1539,14 @@ impl std::ops::DerefMut for StoreGuard<'_> {
 impl Drop for StoreGuard<'_> {
     fn drop(&mut self) {
         STORE_HELD.with(|held| held.set(held.get() - 1));
-        // Recorded while the store is still the innermost scope (the hold audit is per store).
-        super::budget_probe::store_unlocked();
+        // Recorded while the store is still the innermost scope (the hold audit is per store). The
+        // guard's own identity is passed too: the audit counts every outermost hold of an audited
+        // store by it (`AUDIT_SEEN`).
+        let own = self.1;
+        super::budget_probe::store_unlocked_of(Some((Arc::as_ptr(own) as usize, own.audited.load(Ordering::Relaxed))));
+        if fe_mutant("audit_stray_scope") {
+            scope_pop();
+        }
         scope_pop();
     }
 }
