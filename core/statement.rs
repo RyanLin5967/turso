@@ -324,6 +324,10 @@ pub struct Statement {
     /// True if this statement called `Connection::start_nested()` during
     /// construction and therefore must call `end_nested()` on drop.
     nested_guard_active: bool,
+    /// The options this statement was prepared under (its search path): a re-prepare translates
+    /// under the same ones, never defaults (wire-rework review B-H2; PG re-analyses a kept
+    /// statement under the session's search_path).
+    prepare_options: PrepareOptions,
 }
 
 crate::assert::assert_send_sync!(Statement);
@@ -404,7 +408,14 @@ impl Statement {
             counted_as_active_root: false,
             is_blob_handle: false,
             nested_guard_active,
+            prepare_options: PrepareOptions::default(),
         }
+    }
+
+    /// The options this statement was prepared under, kept for its re-prepares.
+    pub(crate) fn with_prepare_options(mut self, prepare_options: PrepareOptions) -> Self {
+        self.prepare_options = prepare_options;
+        self
     }
 
     /// Mark this statement as the parked backing statement of an incremental
@@ -959,7 +970,9 @@ impl Statement {
             crate::turso_assert_eq!(QueryMode::new(&cmd), mode);
             let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan { stmt, .. }) = cmd;
             let schema = conn.schema.read().clone();
-            let prepare_options = PrepareOptions::default();
+            // Under the options it was prepared with, not defaults (wire-rework B-H2: defaults
+            // resolved an unqualified name to main, whatever the session's search path).
+            let prepare_options = &self.prepare_options;
             translate::translate(
                 &schema,
                 stmt,
@@ -969,7 +982,7 @@ impl Statement {
                 mode,
                 &self.program.sql,
                 self.origin,
-                &prepare_options,
+                prepare_options,
             )?
         };
 
