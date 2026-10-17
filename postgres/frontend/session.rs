@@ -49,11 +49,7 @@ struct PgConnectionInner {
     /// A stamp of the last assignment to the search path, unique across connections, 0 before any
     /// ([`PgConnection::search_path_stamp`]).
     search_path_stamp: std::sync::atomic::AtomicU64,
-    /// The statement being prepared runs in a transaction block the client opened (BEGIN), as the
-    /// server tells it ([`PgConnection::set_explicit_block`]); an implicit block (a multi-statement
-    /// query's, a pipeline's) is not one. Read by SET ([`handle_pg_set`]).
-    explicit_block: std::sync::atomic::AtomicBool,
-    /// Notices a statement raised for the client ((severity, SQLSTATE, message): a WARNING, or a
+    /// Notices a statement raised for the client ((severity, condition, message): a WARNING, or a
     /// NOTICE such as DROP ... IF EXISTS's for a missing object), which the server sends before
     /// the statement's result ([`PgConnection::take_warnings`]).
     warnings: parking_lot::Mutex<Vec<(&'static str, SqlErrorKind, String)>>,
@@ -339,7 +335,6 @@ impl PgConnection {
                 statement_timeout_ms: std::sync::atomic::AtomicU64::new(0),
                 min_messages: std::sync::atomic::AtomicU8::new(7),
                 search_path_stamp: std::sync::atomic::AtomicU64::new(0),
-                explicit_block: std::sync::atomic::AtomicBool::new(false),
                 warnings: parking_lot::Mutex::new(Vec::new()),
             }),
         }
@@ -396,15 +391,6 @@ impl PgConnection {
     /// The session's search path as SHOW search_path gives it.
     pub fn shown_search_path(&self) -> String {
         shown_search_path(&self.inner.session_state.lock().search_path)
-    }
-
-    /// Whether the statements prepared next run in a transaction block the client opened (true)
-    /// or outside one or in an implicit block (false): the server, which alone tells the two
-    /// kinds of block apart, says so before each statement (see `PgConnectionInner::explicit_block`).
-    pub fn set_explicit_block(&self, explicit: bool) {
-        self.inner
-            .explicit_block
-            .store(explicit, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Whether a failed statement's undo failed too, leaving the engine connection in an unknown

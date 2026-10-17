@@ -1996,9 +1996,6 @@ impl Session {
         self.min_messages
             .store(conn.min_messages_rank(), Ordering::Relaxed);
         let in_tx = !conn.inner().get_auto_commit();
-        // Which kind of block the statement runs in, for the settings a ROLLBACK cannot undo here
-        // (turso_pg's handle_pg_set; wire review 16 item 18).
-        conn.set_explicit_block(in_tx && !st.implicit);
         if st.aborted {
             match verb {
                 TxVerb::Commit | TxVerb::Rollback => {
