@@ -89,9 +89,9 @@ pub(crate) static AUDIT: AtomicBool = AtomicBool::new(false);
 /// The per-store counter class (lead ruling d9cf2b609b): the audit records only the holds of the
 /// store opened at this database path (`store::scope_is_audited`), never another test's store's.
 pub(crate) static AUDIT_PATH: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-/// Counters review E1: every outermost hold of an audited store the audit should have recorded
-/// (armed, its end count read), by the guard's own identity, recorded or not. The audit's premise is
-/// `seen == recorded + lost`.
+/// Counters review E1 and review 2 MED 3: every outermost hold of an audited store, counted by its
+/// guard (`StoreGuard::drop`), outside the probe and before any of the probe's gates. The audit's
+/// premise is `seen == recorded + lost + excluded`, with excluded 0 on Apple (review 3 MED-C).
 pub(crate) static AUDIT_SEEN: AtomicU64 = AtomicU64::new(0);
 /// Counters review 2 MED 3: outermost holds of an audited store the probe saw and did not record by
 /// its own gates (not armed at its lock, or its end count unreadable): the premise is

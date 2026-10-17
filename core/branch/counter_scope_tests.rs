@@ -201,15 +201,31 @@ fn the_fuzzy_held_syscall_budget_is_judged_beside_another_stores_work() {
             }
         })
     };
-    if started_rx.recv_timeout(std::time::Duration::from_secs(60)).is_err() {
-        let why = if busy.is_finished() { "it ended (panicked?)" } else { "no first create in 60 s" };
+    // Counters review 3 LOW-9: the reason is the channel's (a sender dropped is a thread that ended,
+    // at once; a timeout is one that never created), and the thread is joined, bounded, before the
+    // panic, so its store's files are not deleted under it.
+    if let Err(e) = started_rx.recv_timeout(std::time::Duration::from_secs(60)) {
+        let why = match e {
+            std::sync::mpsc::RecvTimeoutError::Disconnected => "it ended before its first create (panicked?)",
+            std::sync::mpsc::RecvTimeoutError::Timeout => "no first create in 60 s",
+        };
         stop.store(true, O::Release);
+        let t = std::time::Instant::now();
+        while !busy.is_finished() && t.elapsed() < std::time::Duration::from_secs(30) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         panic!("premise: the other store never started working: {why}");
     }
     let at_entry = creates.load(O::Acquire);
     let judged = std::panic::catch_unwind(super::fastest_tests::a_fuzzy_checkpoint_issues_at_most_two_syscalls_under_the_store_mutex);
     let at_exit = creates.load(O::Acquire);
     stop.store(true, O::Release);
+    // LOW-9: a busy thread that stopped responding fails the test instead of hanging it.
+    let t = std::time::Instant::now();
+    while !busy.is_finished() && t.elapsed() < std::time::Duration::from_secs(60) {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(busy.is_finished(), "the other store's thread did not stop within 60 s of being told to");
     busy.join().unwrap();
     assert!(at_exit > at_entry, "premise: the other store's work overlaps the relay ({at_entry} -> {at_exit} creates)");
     if let Err(e) = judged {

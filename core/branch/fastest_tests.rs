@@ -9091,8 +9091,12 @@ fn lifecycle_audit(n: u32) {
         (db.branches.name_filter_stats().3, db.branches.name_filter_state_for_test().1, db.branches.store_id_for_test());
     AUDIT.store(false, Release);
     probe::arm(false);
+    // Counters review 3 LOW-8: the close is checked, not assumed: no other strong reference keeps
+    // the store (and its threads) alive past it.
+    let closed = Arc::downgrade(&db);
     drop(trunk);
     drop(db);
+    assert!(closed.upgrade().is_none(), "premise: the audited store outlived its close (another reference holds it)");
     let log: Vec<HoldRec> = AUDIT_LOG.lock().unwrap().clone();
     assert_eq!(AUDIT_LOST.load(Relaxed), 0, "premise: the audit log lost holds (its room was too small)");
     // Lead ruling 67664df569: the scoping cannot silently empty the audit. This arm recorded at least
