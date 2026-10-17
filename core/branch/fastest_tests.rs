@@ -3053,6 +3053,65 @@ fn a_statement_reprepared_after_a_setting_change_keeps_its_search_path() {
     assert_eq!(after, vec![2], "CLAIM: re-prepared after a setting change, the SELECT read {after:?}, not s.t's row: the search path was dropped");
 }
 
+/// Review engine-rev-setter MED-1 (lead order), as a class: which setters must bump the prepare
+/// generation is DERIVED from what translation reads, not from a list of the bump's callers (an
+/// audit of callers cannot see a setter that never bumps). Every `Connection` setter `set_X` whose
+/// value translation reads (a call `.X()`, `.get_X()` or `.is_X()` anywhere under core/translate/)
+/// must bump in its body. At 19f7a7bfc set_check_constraints_ignored, set_dml_require_where,
+/// set_count_changes and set_sync_type never bumped, so a cached INSERT compiled with CHECK ignored
+/// kept skipping it after the setting was turned back on. Static: reads the source.
+#[test]
+fn every_setter_whose_value_translation_reads_bumps_the_prepare_generation() {
+    let core = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let conn = std::fs::read_to_string(core.join("connection.rs")).unwrap();
+    let mut translate = String::new();
+    let mut dirs = vec![core.join("translate")];
+    while let Some(d) = dirs.pop() {
+        for e in std::fs::read_dir(&d).unwrap() {
+            let path = e.unwrap().path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.extension().is_some_and(|x| x == "rs") {
+                translate.push_str(&std::fs::read_to_string(&path).unwrap());
+            }
+        }
+    }
+    let setter = regex::Regex::new(r"\n    pub(?:\(crate\))? fn set_(\w+)\(&self[^{]*\{").unwrap();
+    let mut checked = Vec::new();
+    let mut missing = Vec::new();
+    for m in setter.captures_iter(&conn) {
+        let name = m.get(1).unwrap().as_str();
+        let start = m.get(0).unwrap().end();
+        let (mut depth, mut end) = (1i32, start);
+        for (i, ch) in conn[start..].char_indices() {
+            depth += match ch {
+                '{' => 1,
+                '}' => -1,
+                _ => 0,
+            };
+            if depth == 0 {
+                end = start + i;
+                break;
+            }
+        }
+        let body = &conn[start..end];
+        let read = [name.to_string(), format!("get_{name}"), format!("is_{name}")]
+            .iter()
+            .any(|g| translate.contains(&format!(".{g}()")));
+        if read {
+            checked.push(name.to_string());
+            if !body.contains("bump_prepare_context_generation") {
+                missing.push(name.to_string());
+            }
+        }
+    }
+    assert!(checked.len() >= 10, "premise: only {} setters found read under translate/ ({checked:?}): the scan is broken", checked.len());
+    assert!(
+        missing.is_empty(),
+        "CLAIM: setters whose value translation reads never bump the prepare generation (cached programs keep the old value): {missing:?}"
+    );
+}
+
 /// Lead ruling DECISIONS 179e043b9e (wire-rev-fkguard MED 1), as a class: a setter whose side
 /// effect invalidates compiled programs bumps the prepare generation only on a CHANGE. The wire's
 /// publish sets foreign_keys at every transaction end, so an unconditional bump re-prepared every
