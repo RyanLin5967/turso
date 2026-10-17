@@ -9954,6 +9954,61 @@ fn a_build_that_overflows_at_its_install_frees_nothing_under_the_store_mutex() {
     assert_eq!(freed, 0, "CLAIM: a name-filter thread freed {freed} bytes inside a store-mutex hold (the overflowing build's table)");
 }
 
+/// Review m1-2c N3: after a growth's failed drain the filter overflows answering from the new table
+/// and the pending one (5a0d874e0); a name noted only into the pending table (held at stage 3, as
+/// in `a_failed_filter_drain_never_answers_absent_for_a_held_name`) must still not be answered
+/// absent once `Overflowed`, held there by the rebuild's seed hold. The H1 test reads only the
+/// `Draining` state before the overflow, so it cannot see mutant `filter_answer_drops_pending`;
+/// this is its killer.
+#[test]
+fn a_failed_filter_drain_s_overflow_still_answers_for_a_pending_name() {
+    use super::store::{BUILD_SEED_HOLD, FILTER_DRAIN_FAILS, FILTER_PAUSED, FILTER_PAUSE_AT, HOLD_ARRIVED};
+    use std::sync::atomic::Ordering::{Acquire, Release};
+    let _s = serial();
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FILTER_DRAIN_FAILS.store(false, Release);
+            FILTER_PAUSE_AT.store(0, Release);
+            FILTER_PAUSED.store(0, Release);
+            BUILD_SEED_HOLD.store(0, Release);
+        }
+    }
+    let _r = Reset;
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("drain-overflow-answer.db"), opts(true, SyncClass::Off));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    db.branch_wait_name_filter();
+    FILTER_DRAIN_FAILS.store(true, Release);
+    FILTER_PAUSE_AT.store(3, Release);
+    let t = std::time::Instant::now();
+    let mut n = 0u32;
+    while FILTER_PAUSED.load(Acquire) != 3 {
+        trunk.create_branch(&format!("fill-{n:05}")).unwrap();
+        n += 1;
+        assert!(t.elapsed() < std::time::Duration::from_secs(30), "premise: no filter growth reached its swap ({n} creates)");
+    }
+    trunk.create_branch("victim").unwrap();
+    BUILD_SEED_HOLD.store(1, Release);
+    FILTER_PAUSE_AT.store(0, Release);
+    while db.branches.name_filter_state_for_test().0 != "Overflowed" {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        assert!(t.elapsed() < std::time::Duration::from_secs(60), "premise: the failed drain never overflowed the filter");
+    }
+    // The overflow owes a rebuild; a create starts it, and it holds before its seed.
+    trunk.create_branch("starts-the-rebuild").unwrap();
+    while BUILD_SEED_HOLD.load(Acquire) != 1 | HOLD_ARRIVED {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        assert!(t.elapsed() < std::time::Duration::from_secs(60), "premise: the overflow's rebuild never began");
+    }
+    assert_eq!(db.branches.name_filter_state_for_test().0, "Overflowed", "premise: still Overflowed, held before the rebuild's seed");
+    let absent = db.branches.name_filter_says_absent_for_test("victim");
+    BUILD_SEED_HOLD.store(0, Release);
+    db.branch_wait_name_filter();
+    assert!(!absent, "CLAIM: after a failed drain the overflowed filter answered absent for a name only its pending table held");
+}
+
 /// Class (e), the store mutex's lifecycle audit (DECISIONS 994f7d41e0; the lead's order with
 /// nf-adversary-2's MED-2 and M4 folded in): every store-mutex hold on the create path does NO syscall,
 /// NO allocation and NO catalog statement. One instrument for the whole class: every outermost hold

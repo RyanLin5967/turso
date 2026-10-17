@@ -3116,7 +3116,9 @@ impl NameFilter {
             }
             return None;
         };
-        if sink.insert(h) {
+        // Mutant `filter_spill_drops_refused_key` (test builds only; review m1-2c N3): the spare
+        // becomes the sink without the refused key.
+        if fe_mutant("filter_spill_drops_refused_key") || sink.insert(h) {
             Some(Answer { fixed, sink })
         } else {
             self.retire_answer(Answer { fixed, sink });
@@ -9660,7 +9662,10 @@ impl BranchStore {
                 f.state = FilterState::Ready { table: table.clone() };
             } else {
                 // The two tables together still hold every name; notes go into the new one.
-                f.overflow_answering(Some(Answer { fixed: [Some(pending.clone()), None], sink: table.clone() }));
+                // Mutant `filter_answer_drops_pending` (test builds only; review m1-2c N3): the
+                // pending table is left out of the answer.
+                let kept = (!fe_mutant("filter_answer_drops_pending")).then(|| pending.clone());
+                f.overflow_answering(Some(Answer { fixed: [kept, None], sink: table.clone() }));
             }
         }
         FilterBuild::Ended
@@ -9744,8 +9749,10 @@ impl BranchStore {
                 if copied {
                     f.state = FilterState::Ready { table: grown.clone() };
                 } else {
-                    // Together complete (review H1's union); notes go into the new table.
-                    f.overflow_answering(Some(Answer { fixed: [Some(pending.clone()), None], sink: grown.clone() }));
+                    // Together complete (review H1's union); notes go into the new table. Mutant
+                    // `filter_answer_drops_pending`: the pending table left out, as above.
+                    let kept = (!fe_mutant("filter_answer_drops_pending")).then(|| pending.clone());
+                    f.overflow_answering(Some(Answer { fixed: [kept, None], sink: grown.clone() }));
                 }
             }
         });
