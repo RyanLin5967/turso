@@ -10237,7 +10237,7 @@ impl BranchStore {
             self.join_flights_within(wait)?;
             // Bounded too (review C42 MED-2): a background compaction's sync or a sharp compact may
             // hold the mutex.
-            let inner = self.lock_within(wait)?;
+            let inner = self.inner.lock_within(wait)?;
             if !inner.cat.as_ref().is_some_and(|c| c.flight) {
                 break inner;
             }

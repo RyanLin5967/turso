@@ -3644,13 +3644,14 @@ fn a_client_checkpoint_s_wait_for_the_store_mutex_ends_at_its_deadline_or_its_in
     seed(&trunk);
     let _ = trunk.fork_branch().unwrap().into_id();
     let (held, release) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
-    struct Release(Arc<AtomicBool>);
-    impl Drop for Release {
+    // Named apart from `Ordering::Release`, which this test imports (review c42b HIGH-2: E0255).
+    struct ReleaseOnDrop(Arc<AtomicBool>);
+    impl Drop for ReleaseOnDrop {
         fn drop(&mut self) {
             self.0.store(true, std::sync::atomic::Ordering::Release);
         }
     }
-    let _release = Release(release.clone());
+    let _release = ReleaseOnDrop(release.clone());
     let holder = {
         let (db, held, release) = (db.clone(), held.clone(), release.clone());
         std::thread::spawn(move || db.branches.hold_store_mutex_for_test(&held, &release))
@@ -3724,6 +3725,9 @@ fn checkpoint_now_with_its_flight_held(
 #[test]
 fn checkpoint_now_reports_an_install_whose_truncation_ran_past_its_deadline() {
     let _s = serial();
+    // The truncation's hold is reached only when the catalog WAL is due (review c42b HIGH-3: 50 rows
+    // and 8 forks never reach 4 MiB, so the red failed at its premise at its base and its fix).
+    let _always = CatalogWalTruncateAlways::set();
     let dir = tempfile::TempDir::new().unwrap();
     let db = open_at(
         &dir.path().join("checkpoint-now-installed.db"),
