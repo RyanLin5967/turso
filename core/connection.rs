@@ -1019,7 +1019,13 @@ impl Connection {
                 drop(syms);
                 let cmd = {
                     crate::stack::trace_stack!("schema_retry_parse");
-                    let (cmd, _) = self.parse_text(input, text)?;
+                    // A re-parse after another process's schema change: client text goes through
+                    // the dialect's connection-aware hook, as `Statement::reprepare`'s does (review
+                    // c42b LOW-3); SQLite text stays SQLite.
+                    let (cmd, _) = match text {
+                        SqlText::Client => self.db.dialect().parse_for_reprepare(input, self)?,
+                        SqlText::Sqlite => self.parse_text(input, text)?,
+                    };
                     let Some(cmd) = cmd else {
                         return Err(err);
                     };
