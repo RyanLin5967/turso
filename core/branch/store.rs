@@ -9775,7 +9775,10 @@ impl BranchStore {
                         Some(answer) => FilterState::Stale { answer },
                         None => FilterState::Unbuilt,
                     };
+                    // The error (a String) and its log line after the unlock (review filter3 L5).
+                    drop(inner);
                     tracing::debug!("branch name filter not built: {e}");
+                    drop(e);
                     return FilterBuild::Failed;
                 }
             }
