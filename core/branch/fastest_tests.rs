@@ -5072,10 +5072,11 @@ fn a_named_branch_with_an_open_connection_is_not_dropped() {
 /// Engine review 14 MED 7: nothing showed that `Database::drop_branch`'s open check and its
 /// release are one hold of the store mutex. Under a regression to check-then-act across two holds,
 /// a drop and a concurrent `connect_named` would both succeed and the Release would be written
-/// under a live connection. A drop parked between its lookup and its release
-/// (`HOLD_DROP_LOOKED_UP`) while a `connect_named` runs on this thread: the connect wins, and the
-/// drop is then refused as `BranchInUse`; the two never both succeed. Mutant
-/// `drop_check_separate_hold`.
+/// under a live connection. A drop parked at `HOLD_DROP_LOOKED_UP` while a `connect_named` runs on
+/// this thread: the connect wins, and the drop is then refused as `BranchInUse`; the two never both
+/// succeed. Since 838c41999 the lookup and the release are ONE hold and the park is before it, so on
+/// the default arm this is a sequential connect-then-drop (its subject, the window, is gone; review
+/// delete LOW-4); it still kills mutant `drop_check_separate_hold`, which reopens the window.
 #[test]
 fn a_drop_and_a_connect_never_both_win_a_named_branch() {
     let _s = serial();

@@ -7914,16 +7914,11 @@ impl BranchStore {
         self.release_checked(id, false)
     }
 
-    /// `Database::drop_branch`'s release of a named branch: refused while the branch has an open
-    /// connection (`LimboError::BranchInUse`), as a database server refuses to drop a database in
-    /// use (fastest-wire). A handle's release keeps the branch whole until its connection closes
-    /// instead.
-    pub(crate) fn release_named(&self, id: BranchId) -> Result<Reaped> {
-        self.release_checked(id, true)
-    }
 
     /// `Database::drop_branch` waits at `HOLD_DROP_LOOKED_UP` (test builds only; a no-op
-    /// otherwise), between its lookup and its release (engine review 14 MED 7).
+    /// otherwise): before its single hold since 838c41999, which leaves no window between the
+    /// lookup and the release; between them only under mutant `drop_check_separate_hold`
+    /// (engine review 14 MED 7).
     pub(crate) fn pause_drop_looked_up(&self) {
         #[cfg(test)]
         pause_at(Some(&*self.trunk_commit_hold), HOLD_DROP_LOOKED_UP);
