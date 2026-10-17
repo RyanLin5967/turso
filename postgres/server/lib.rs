@@ -6968,11 +6968,18 @@ mod tests {
                 }
                 let text = std::fs::read_to_string(&path).unwrap();
                 let rel = path.strip_prefix(&root).unwrap().to_string_lossy().to_string();
-                // A file some lib.rs of these crates declares as `#[cfg(test)] mod <stem>;`.
+                // A file some lib.rs of these crates declares as a test module: `mod <stem>;` under
+                // any test cfg, `#[cfg(test)]` or `#[cfg(all(test, unix))]` alike (the integration
+                // review's LOW-1: the frontend's stack_guard_tests was scanned as product).
                 let stem = rel.trim_end_matches(".rs").to_string();
                 let declared_test = [server.join("lib.rs"), root.join("lib.rs")].iter().any(|lib| {
                     std::fs::read_to_string(lib)
-                        .map(|l| l.contains(&format!("#[cfg(test)]\nmod {stem};")))
+                        .map(|l| {
+                            let lines: Vec<&str> = l.lines().collect();
+                            lines.windows(2).any(|w| {
+                                is_test_cfg(w[0]) && w[1].trim() == format!("mod {stem};")
+                            })
+                        })
                         .unwrap_or(false)
                 });
                 if declared_test {
@@ -7016,10 +7023,36 @@ mod tests {
     /// `text` less each `#[cfg(test)]` + `mod <name> {` span (its newlines kept), through its matching brace; braces
     /// inside string and char literals and comments are not counted. An unmatched span keeps the
     /// rest of the file (read, never skipped).
+    /// Whether `line` is a cfg attribute that holds only under test: `#[cfg(test)]`,
+    /// `#[cfg(all(test, ...))]`; never one with `not(` in it.
+    fn is_test_cfg(line: &str) -> bool {
+        let l = line.trim();
+        l.starts_with("#[cfg(")
+            && l.ends_with(")]")
+            && !l.contains("not(")
+            && !l.contains("any(")
+            && l.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .any(|w| w == "test")
+    }
+
+    /// Where the next `<test cfg line>\nmod ` starts in `rest`.
+    fn next_test_mod(rest: &str) -> Option<usize> {
+        let mut from = 0;
+        while let Some(k) = rest[from..].find("#[cfg(") {
+            let at = from + k;
+            let line_end = rest[at..].find('\n').map(|n| at + n).unwrap_or(rest.len());
+            if is_test_cfg(&rest[at..line_end]) && rest[line_end..].starts_with("\nmod ") {
+                return Some(at);
+            }
+            from = at + 1;
+        }
+        None
+    }
+
     fn strip_test_modules(text: &str) -> String {
         let mut out = String::new();
         let mut rest = text;
-        while let Some(at) = rest.find("#[cfg(test)]\nmod ") {
+        while let Some(at) = next_test_mod(rest) {
             let after = &rest[at..];
             let line_end = after.find('\n').map(|n| n + 1).unwrap_or(after.len());
             let header_end = after[line_end..].find('\n').map(|n| line_end + n).unwrap_or(after.len());
@@ -7164,20 +7197,34 @@ mod tests {
     fn every_assign_call_propagates_its_refusal() {
         let source = include_str!("../frontend/session.rs");
         let lines: Vec<&str> = source.lines().collect();
+        // Each call's own closing parenthesis, found by matching it (the wire line review L2: the
+        // next `});` or `})?;` line could be another call's, so `}).ok();` passed), and what
+        // follows it must be `?`: the outcome is propagated, whatever the formatting.
+        let _ = &lines;
         let (mut calls, mut dropped) = (0, Vec::new());
-        for (i, line) in lines.iter().enumerate() {
-            if !line.contains("assign(&|") {
-                continue;
-            }
+        let b = source.as_bytes();
+        let mut from = 0;
+        while let Some(k) = source[from..].find("assign(&|") {
+            let open = from + k + "assign".len();
             calls += 1;
-            let close = lines[i + 1..]
-                .iter()
-                .position(|l| matches!(l.trim(), "});" | "})?;"))
-                .map(|k| i + 1 + k)
-                .expect("the call's closing line");
-            if lines[close].trim() != "})?;" {
-                dropped.push(i + 1);
+            let (mut depth, mut j) = (0i64, open);
+            while j < b.len() {
+                match b[j] {
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                j += 1;
             }
+            if b.get(j + 1) != Some(&b'?') {
+                dropped.push(source[..open].matches('\n').count() + 1);
+            }
+            from = open;
         }
         assert!(calls >= 5, "found {calls} assign calls, not the five known");
         assert!(dropped.is_empty(), "assign calls whose Result is dropped, at session.rs lines {dropped:?}");
