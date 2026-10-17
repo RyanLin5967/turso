@@ -5040,6 +5040,29 @@ fn a_drop_miss_waits_for_its_own_names_release() {
     }
 }
 
+/// Review delete LOW-6: a drop of a branch whose fork never became durable (its create's flight
+/// failed) does not say the branch "comes back at the next open": the reopen will not have that
+/// fork. Since 838c41999 the drop runs the release without settling the fork first, so the release's
+/// failure message is reached for such a branch.
+#[test]
+fn a_drop_of_a_branch_whose_fork_failed_does_not_promise_it_comes_back() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("drop-failed-fork.db"), opts(catalog, SyncClass::Fsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let _anchor = trunk.fork_branch().unwrap().into_id();
+        db.branch_failpoint(Some(BranchFailpoint::GroupFlightFails));
+        assert!(trunk.create_branch("x").is_err(), "catalog={catalog}: premise: the create's flight failed");
+        let dropped = db.drop_branch("x");
+        assert!(
+            !dropped.as_ref().is_err_and(|e| e.to_string().contains("comes back")),
+            "catalog={catalog}: CLAIM: the drop of a branch whose fork never became durable said it comes back: {dropped:?}"
+        );
+    }
+}
+
 /// fastest-wire (the typed branch errors): `Database::drop_branch` released a named branch that
 /// still had an open connection, as a handle's release does (the branch kept whole until the
 /// connection closes). A server's DROP of a database in use must be refused instead, as
