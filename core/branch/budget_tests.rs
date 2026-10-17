@@ -1912,6 +1912,43 @@ fn run_instruments(cell: &str) -> String {
             h.join().unwrap();
         }
     }
+    // Counters review 4 MED-1: a window refused as ThreadNew whose own thread does nothing (a helper
+    // that existed before it spawns a thread still running at its end), so its allocation counts are
+    // asserted and a ThreadNew diagnostic (FE_BUDGET_NEW_NAMES) inside the counts is seen.
+    {
+        use std::sync::atomic::{AtomicBool, Ordering::{Acquire, Release}};
+        let (go, spawned, release, ready) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let (g, sp, rl, r) = (go.clone(), spawned.clone(), release.clone(), ready.clone());
+        let helper = std::thread::spawn(move || {
+            r.store(true, Release);
+            while !g.load(Acquire) {
+                std::hint::spin_loop();
+            }
+            let rl2 = rl.clone();
+            let late = std::thread::spawn(move || {
+                // Still RUNNING at the window's end: a spin, no call.
+                while !rl2.load(Acquire) {
+                    std::hint::spin_loop();
+                }
+            });
+            sp.store(true, Release);
+            late.join().unwrap();
+        });
+        while !ready.load(Acquire) {
+            std::hint::spin_loop();
+        }
+        put(
+            "fc_thread_new_quiet",
+            &window(&mut || {
+                go.store(true, Release);
+                while !spawned.load(Acquire) {
+                    std::hint::spin_loop();
+                }
+            }),
+        );
+        release.store(true, Release);
+        helper.join().unwrap();
+    }
     // (f) probe-adversary-2 M3: a foreign thread makes ONE call the shim cannot see (syscall(2)) and
     // none it can, while the window makes 5 it can: every foreign shim delta is 0 and only the sum
     // check refuses (5 against the kernel's 6). Mutant `probe_sum_unchecked`.
@@ -2339,6 +2376,10 @@ fn run_instruments(cell: &str) -> String {
             }
         }),
     );
+    // Counters review 4 MED-1: one harness window with nothing in it (`measure`, an empty `f`): the
+    // harness's own in-window work (the thread count, the declared spin, the confirmation absorb, the
+    // settle waits, the confirm counts) is inside the counts, so it must move none of them.
+    put("fc_measure_empty", &measure(&db, base, || {}).1);
     out
 }
 
@@ -2870,6 +2911,18 @@ fn the_budget_counters_count_exactly_what_was_done() {
     };
     for k in ["allocs", "locks", "held_syscalls", "held_allocs", "fsync", "full_fsync", "barrier"] {
         assert_eq!(get("fc_nothing", k), 0, "an empty window moved {k}");
+    }
+    // Counters review 4 MED-1: windows whose counts are asserted and that reach the configured code: a
+    // ThreadNew refusal and a foreign one (each diagnostic's trigger, under the flags of
+    // `the_instruments_count_exactly_under_every_flag`) and a harness window with nothing in it. Each
+    // window's own thread allocates nothing; any allocation counted is the instrument's or the
+    // harness's.
+    assert_eq!(get("fc_thread_new_quiet", "refusal"), probe::Refusal::ThreadNew as u64, "premise: fc_thread_new_quiet was not refused as ThreadNew");
+    assert!(get("fc_foreign_window", "foreign_threads") >= 1, "premise: fc_foreign_window had no foreign thread");
+    for op in ["fc_thread_new_quiet", "fc_foreign_window", "fc_measure_empty"] {
+        for k in ["allocs", "alloc_bytes", "held_allocs"] {
+            assert_eq!(get(op, k), 0, "{op}: a window whose own work allocates nothing moved {k}: the instrument or the harness allocated inside it");
+        }
     }
     assert_eq!(get("fc_box_23", "allocs"), 23, "23 boxes");
     assert_eq!(get("fc_box_23", "frees"), 23, "23 boxes dropped");
