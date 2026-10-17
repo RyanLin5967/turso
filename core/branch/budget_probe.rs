@@ -497,6 +497,16 @@ pub(crate) fn store_unlocked_of(own: Option<(usize, bool)>) {
         d.get()
     });
     if depth == 0 {
+        // Mutant `audit_skip_half` (test builds only; counters review 2 MED 3): every second
+        // outermost hold of an audited store skips the probe entirely, before any count: the hold
+        // audit's completeness premise must fire.
+        if own.is_some_and(|o| o.1) && super::store::fe_mutant("audit_skip_half") {
+            static SKIP: AtomicU64 = AtomicU64::new(0);
+            if SKIP.fetch_add(1, Relaxed) % 2 == 1 {
+                HELD_SINCE.with(|s| s.take());
+                return;
+            }
+        }
         let get = |c: &'static std::thread::LocalKey<Cell<u64>>| c.with(|c| c.get());
         let (bytes0, rows0) = HOLD_START.with(|h| h.get());
         let (bytes, rows) = (get(&T_HELD_ALLOC_BYTES).wrapping_sub(bytes0), get(&T_CAT_ROWS).wrapping_sub(rows0));
