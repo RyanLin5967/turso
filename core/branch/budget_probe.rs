@@ -752,6 +752,11 @@ fn shim_lost() -> u64 {
 /// measured as if it were one (probe-adversary item 1: a run with the shim stripped passed exactly as
 /// a shim run did, and nothing recorded the mode).
 pub(crate) fn prime() {
+    // Counters review 2 HIGH 1: every environment flag a window consults is read here, once, outside
+    // any window (an env read allocates its value).
+    let _ = IN_BUDGET_CHILD.get_or_init(|| std::env::var_os("FE_BUDGET_CHILD").is_some());
+    let _ = NEW_NAMES_FILE.get_or_init(|| std::env::var_os("FE_BUDGET_NEW_NAMES"));
+    let _ = FOREIGN_NAMES.get_or_init(|| std::env::var_os("FE_BUDGET_FOREIGN_NAMES").is_some());
     let loaded = shim().is_some();
     let _ = shim_lost();
     if !loaded && std::env::var_os("FE_SHIM_RUN").is_some() {
@@ -759,11 +764,25 @@ pub(crate) fn prime() {
     }
 }
 
+/// The flags `prime` reads once (counters review 2 HIGH 1): whether this process is a budget
+/// child, and the two window diagnostics' settings.
+static IN_BUDGET_CHILD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static NEW_NAMES_FILE: std::sync::OnceLock<Option<std::ffi::OsString>> = std::sync::OnceLock::new();
+static FOREIGN_NAMES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
 /// The syncs a budget window reads (counters review MED-5): in a budget child, which runs one
 /// cell's stores at a time, the process's (`branch::sync_counts`, exact there, and blind to no
 /// thread); elsewhere, a test's own stores' (`store::own_sync_counts`).
 pub(crate) fn window_syncs() -> crate::branch::SyncCounts {
-    if std::env::var_os("FE_BUDGET_CHILD").is_some() {
+    let child = match IN_BUDGET_CHILD.get() {
+        Some(&c) => c,
+        // Never reached inside a window (`begin` primes first); a reading before any window primes.
+        None => {
+            prime();
+            IN_BUDGET_CHILD.get().copied().unwrap_or(false)
+        }
+    };
+    if child {
         crate::branch::sync_counts()
     } else {
         crate::branch::store::own_sync_counts()
@@ -972,10 +991,18 @@ pub(crate) fn end_owning(owned: &[&str]) -> Snapshot {
     s.shim_loaded = shim().is_some();
     s.shim_lost = lost1;
     s.instructions = instructions();
+    window_diagnostics(refusal, foreign, owned, attributed, &t1);
+    s
+}
+
+/// A window's diagnostics, after every count of it is taken (counters review 2 HIGH 1: they
+/// allocate, so they are not on the window path): the threads new at a `ThreadNew` refusal, and
+/// the foreign threads' names. Off unless `prime` read their settings.
+fn window_diagnostics(refusal: Refusal, foreign: u64, owned: &[&str], attributed: Option<u64>, t1: &[ThreadCpu; 48]) {
     // Diagnostics only (FE_BUDGET_NEW_NAMES names a file): a window refused for a thread new at its
     // end appends the names of the threads in the end table that were not in the start one, after
     // every count of the window is taken.
-    if let Some(file) = std::env::var_os("FE_BUDGET_NEW_NAMES").filter(|_| refusal == Refusal::ThreadNew) {
+    if let Some(file) = NEW_NAMES_FILE.get().cloned().flatten().filter(|_| refusal == Refusal::ThreadNew) {
         WINDOW_T0.with(|t0| {
             let t0 = t0.borrow();
             let name = |t: &ThreadCpu| {
@@ -991,14 +1018,13 @@ pub(crate) fn end_owning(owned: &[&str]) -> Snapshot {
     }
     // Diagnostics only (FE_BUDGET_FOREIGN_NAMES set): name the foreign threads on stderr, after every
     // count of the window is taken.
-    if foreign > 0 && std::env::var_os("FE_BUDGET_FOREIGN_NAMES").is_some() {
+    if foreign > 0 && FOREIGN_NAMES.get().copied().unwrap_or(false) {
         WINDOW_T0.with(|t0| {
             let me = t1.iter().find(|t| t.me).map_or(0, |t| t.id);
-            let ran: Vec<_> = ran_between(&t0.borrow()[..], &t1, me).into_iter().map(|(_, n, ns)| format!("{n}:{ns}ns")).collect();
+            let ran: Vec<_> = ran_between(&t0.borrow()[..], &t1[..], me).into_iter().map(|(_, n, ns)| format!("{n}:{ns}ns")).collect();
             eprintln!("budget window foreign (owned {owned:?}, attributed {attributed:?}): {ran:?}");
         });
     }
-    s
 }
 
 /// The threads that ran between two `thread_table` readings, other than the reading thread, the
