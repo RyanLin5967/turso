@@ -6817,75 +6817,175 @@ mod tests {
         });
     }
 
-    /// C44-M3: every SQLSTATE this server sends comes from the one table (kind_code): its own
-    /// refusals name a SqlErrorKind, never a code literal. Read from this file's source outside
-    /// the table and the tests (a test's expected code is a literal by design); a code is five
-    /// characters of digits and capitals with at least one digit.
+    /// C44-M3: every SQLSTATE this server and the frontend send comes from the one table
+    /// (turso_pg::sqlstate, postgres/frontend/sqlstate.rs): their refusals and notices name a
+    /// SqlErrorKind, never a code literal (review c39799c5d..9e24b455d MED 1: two frontend notice
+    /// codes and pg_input_error_info's were literals the lib.rs-only scan could not see). Every
+    /// non-test .rs source of both crates is read, examples included: test files (tests/, and the
+    /// `#[cfg(test)] mod x;` files) are skipped, and each `#[cfg(test)] mod x { .. }` span is cut out
+    /// by its matching brace, so product code after a tests module is read (LOW 10). A code is five
+    /// characters of digits and capitals with at least one digit, quoted. The table's own function
+    /// is the one exemption.
     #[test]
     fn every_sqlstate_the_server_sends_comes_from_the_table() {
-        let source = include_str!("lib.rs");
-        let code_end = source.find("\n#[cfg(test)]\nmod tests").expect("the tests module");
-        let product = &source[..code_end];
-        let table_start = product.find("fn kind_code(kind: SqlErrorKind)").expect("the table");
-        let table_end = table_start + product[table_start..].find("\n}\n").expect("its end");
-        let outside = format!("{}{}", &product[..table_start], &product[table_end..]);
-        // Every `"` followed by five characters and a `"`: a quoted token, found wherever it sits,
-        // so no quote parity elsewhere (an escaped quote in a message) can hide one.
-        let b = outside.as_bytes();
-        let literals: Vec<&str> = (0..b.len().saturating_sub(6))
+        let server = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let frontend = server.join("../frontend");
+        let mut scanned = Vec::new();
+        // Every violation of every file, collected before the one assert, so the report names them
+        // all whatever order the directories are read in (lead, on the MED 1 red).
+        let mut violations = Vec::new();
+        for root in [server.to_path_buf(), frontend] {
+            let mut files = vec![root.clone()];
+            while let Some(path) = files.pop() {
+                if path.is_dir() {
+                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    if path != root && (name == "tests" || name == "target") {
+                        continue;
+                    }
+                    for entry in std::fs::read_dir(&path).unwrap() {
+                        files.push(entry.unwrap().path());
+                    }
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).unwrap();
+                let rel = path.strip_prefix(&root).unwrap().to_string_lossy().to_string();
+                // A file some lib.rs of these crates declares as `#[cfg(test)] mod <stem>;`.
+                let stem = rel.trim_end_matches(".rs").to_string();
+                let declared_test = [server.join("lib.rs"), root.join("lib.rs")].iter().any(|lib| {
+                    std::fs::read_to_string(lib)
+                        .map(|l| l.contains(&format!("#[cfg(test)]\nmod {stem};")))
+                        .unwrap_or(false)
+                });
+                if declared_test {
+                    continue;
+                }
+                let mut product = strip_test_modules(&text);
+                if rel == "sqlstate.rs" {
+                    let start = product.find("pub fn sqlstate(").expect("the table");
+                    let end = start + product[start..].find("\n}\n").expect("its end");
+                    let kept_lines = "\n".repeat(product[start..end].matches('\n').count());
+                    product.replace_range(start..end, &kept_lines);
+                }
+                for (line, code) in sqlstate_literals(&product) {
+                    violations.push(format!("{}:{line}: \"{code}\"", path.display()));
+                }
+                scanned.push(format!("{}:{rel}", root.file_name().unwrap().to_string_lossy()));
+            }
+        }
+        for must in ["server:lib.rs", "server:counters.rs", "frontend:session.rs", "frontend:functions.rs"] {
+            assert!(scanned.iter().any(|f| f == must), "the scan missed {must}: {scanned:?}");
+        }
+        violations.sort();
+        assert!(violations.is_empty(), "SQLSTATE literals outside the table:\n{}", violations.join("\n"));
+    }
+
+    /// Every quoted five-character token of digits and capitals with at least one digit, found
+    /// wherever it sits (no quote parity elsewhere can hide one), with its 1-based line.
+    fn sqlstate_literals(text: &str) -> Vec<(usize, String)> {
+        let b = text.as_bytes();
+        (0..b.len().saturating_sub(6))
             .filter(|&i| b[i] == b'"' && b[i + 6] == b'"')
-            .map(|i| &outside[i + 1..i + 6])
-            .filter(|s| {
+            .map(|i| (i, &text[i + 1..i + 6]))
+            .filter(|(_, s)| {
                 s.bytes().all(|c| c.is_ascii_digit() || c.is_ascii_uppercase())
                     && s.bytes().any(|c| c.is_ascii_digit())
             })
-            .collect();
-        assert!(literals.is_empty(), "SQLSTATE literals outside the table: {literals:?}");
-        // Every other non-test source of this crate holds none at all (lead 2026-10-16T16:43:48Z (2)):
-        // each .rs file under the crate's directory but lib.rs, tests/ and the files lib.rs declares
-        // as `#[cfg(test)] mod`, examples included.
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let test_mods: Vec<String> = source
-            .split("#[cfg(test)]\nmod ")
-            .skip(1)
-            .filter_map(|rest| rest.split(';').next())
-            .filter(|m| !m.contains(char::is_whitespace))
-            .map(|m| format!("{m}.rs"))
-            .collect();
-        let mut files = vec![root.to_path_buf()];
-        let mut scanned = Vec::new();
-        while let Some(path) = files.pop() {
-            if path.is_dir() {
-                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if path != root && (name == "tests" || name == "target") {
-                    continue;
-                }
-                for entry in std::fs::read_dir(&path).unwrap() {
-                    files.push(entry.unwrap().path());
-                }
+            .map(|(i, s)| (text[..i].matches('\n').count() + 1, s.to_string()))
+            .collect()
+    }
+
+    /// `text` less each `#[cfg(test)]` + `mod <name> {` span (its newlines kept), through its matching brace; braces
+    /// inside string and char literals and comments are not counted. An unmatched span keeps the
+    /// rest of the file (read, never skipped).
+    fn strip_test_modules(text: &str) -> String {
+        let mut out = String::new();
+        let mut rest = text;
+        while let Some(at) = rest.find("#[cfg(test)]\nmod ") {
+            let after = &rest[at..];
+            let line_end = after.find('\n').map(|n| n + 1).unwrap_or(after.len());
+            let header_end = after[line_end..].find('\n').map(|n| line_end + n).unwrap_or(after.len());
+            let header = &after[line_end..header_end];
+            if !header.trim_end().ends_with('{') {
+                out.push_str(&rest[..at + line_end]);
+                rest = &rest[at + line_end..];
                 continue;
             }
-            let rel = path.strip_prefix(root).unwrap().to_string_lossy().to_string();
-            if !rel.ends_with(".rs") || rel == "lib.rs" || test_mods.contains(&rel) {
-                continue;
+            let body = &after[line_end..];
+            let b = body.as_bytes();
+            let (mut i, mut depth, mut end) = (0, 0i64, None);
+            while i < b.len() {
+                match b[i] {
+                    b'/' if b.get(i + 1) == Some(&b'/') => {
+                        while i < b.len() && b[i] != b'\n' {
+                            i += 1;
+                        }
+                    }
+                    b'/' if b.get(i + 1) == Some(&b'*') => {
+                        i += 2;
+                        while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                            i += 1;
+                        }
+                        i += 1;
+                    }
+                    b'r' if matches!(b.get(i + 1), Some(b'#') | Some(b'"'))
+                        && !b[i.saturating_sub(1)].is_ascii_alphanumeric() =>
+                    {
+                        let mut j = i + 1;
+                        while b.get(j) == Some(&b'#') {
+                            j += 1;
+                        }
+                        if b.get(j) == Some(&b'"') {
+                            let close = format!("\"{}", "#".repeat(j - i - 1));
+                            let from = j + 1;
+                            i = body[from..].find(&close).map_or(b.len(), |n| from + n + close.len() - 1);
+                        }
+                    }
+                    b'"' => {
+                        i += 1;
+                        while i < b.len() && b[i] != b'"' {
+                            if b[i] == b'\\' {
+                                i += 1;
+                            }
+                            i += 1;
+                        }
+                    }
+                    b'\'' => {
+                        // A char literal ('x', '\n', '{'); a lifetime has no closing quote.
+                        if b.get(i + 1) == Some(&b'\\') {
+                            if let Some(n) = body[i + 2..].find('\'') {
+                                i += 2 + n;
+                            }
+                        } else if b.get(i + 2) == Some(&b'\'') {
+                            i += 2;
+                        }
+                    }
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(i + 1);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
             }
-            let text = std::fs::read_to_string(&path).unwrap();
-            let b = text.as_bytes();
-            let found: Vec<&str> = (0..b.len().saturating_sub(6))
-                .filter(|&i| b[i] == b'"' && b[i + 6] == b'"')
-                .map(|i| &text[i + 1..i + 6])
-                .filter(|s| {
-                    s.bytes().all(|c| c.is_ascii_digit() || c.is_ascii_uppercase())
-                        && s.bytes().any(|c| c.is_ascii_digit())
-                })
-                .collect();
-            assert!(found.is_empty(), "SQLSTATE literals in {rel}: {found:?}");
-            scanned.push(rel);
+            match end {
+                Some(e) => {
+                    out.push_str(&rest[..at]);
+                    // The span's newlines kept, so a line number after it is the file's own.
+                    out.push_str(&"\n".repeat(rest[at..at + line_end + e].matches('\n').count()));
+                    rest = &rest[at + line_end + e..];
+                }
+                None => break,
+            }
         }
-        assert!(
-            scanned.iter().any(|f| f == "counters.rs"),
-            "the scan missed counters.rs: {scanned:?}"
-        );
+        out.push_str(rest);
+        out
     }
 
     /// C44-M1: a branch the engine refuses as in use is 55006 by the engine's typed error
