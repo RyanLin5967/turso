@@ -3106,10 +3106,21 @@ impl NameFilter {
                 }
                 // Together complete but for `h`.
                 FilterState::Draining { table, pending } => self.spill([Some(table), Some(pending)], h),
-                FilterState::Stale { answer } => {
+                FilterState::Stale { mut answer } => {
                     self.stale_refusals += 1;
                     if answer.fixed.iter().all(Option::is_none) {
                         self.spill([Some(answer.sink), None], h)
+                    } else if answer.fixed.iter().any(Option::is_none) && self.spare.as_ref().is_some_and(|s| s.insert(h)) {
+                        // A free fixed slot and a kept spare (review filter3 L7): the refusing sink
+                        // moves into the slot and the spare, holding `h`, becomes the sink; the
+                        // answer stays Stale, its rebuild still owed as before.
+                        let sink = self.spare.take().expect("checked above");
+                        let refusing = std::mem::replace(&mut answer.sink, sink);
+                        if let Some(free) = answer.fixed.iter_mut().find(|f| f.is_none()) {
+                            *free = Some(refusing);
+                        }
+                        self.state = FilterState::Stale { answer };
+                        return;
                     } else {
                         self.retire_answer(answer);
                         None
