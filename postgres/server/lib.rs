@@ -1435,6 +1435,9 @@ struct QueryFailure {
 /// A statement Describe prepared: on which engine connection, from which text.
 struct Described {
     conn: Arc<turso_core::Connection>,
+    /// The connection's schema version when it was prepared: a statement kept across a schema
+    /// change is prepared again, not reused (C53 follow-up review B1).
+    schema_version: u32,
     sql: String,
     stmt: turso_core::Statement,
     /// The types the parse gave (see [`PgConnection::prepare_typed`]).
@@ -1459,9 +1462,11 @@ impl Kept {
         self.0.iter().rev().find(|d| d.sql == sql)
     }
 
-    /// Whether `sql` is kept on `conn`.
-    fn holds(&self, sql: &str, conn: &Arc<turso_core::Connection>) -> bool {
-        self.0.iter().any(|d| d.sql == sql && Arc::ptr_eq(&d.conn, conn))
+    /// Whether `sql` is kept on `conn` at the schema version `version`.
+    fn holds(&self, sql: &str, conn: &Arc<turso_core::Connection>, version: u32) -> bool {
+        self.0
+            .iter()
+            .any(|d| d.sql == sql && Arc::ptr_eq(&d.conn, conn) && d.schema_version == version)
     }
 
     /// Keep `d`, in place of any statement kept for its text.
@@ -2299,6 +2304,7 @@ impl Session {
                 parameter_types(&types, declared).map_err(PgWireError::UserError)?;
                 self.state().described.put(Described {
                     conn: conn.inner().clone(),
+                    schema_version: conn.inner().current_schema().schema_version,
                     sql: parsed.sql.clone(),
                     stmt,
                     types,
@@ -2333,7 +2339,15 @@ impl Session {
         let conn = self
             .current(&mut self.state())
             .map_err(PgWireError::UserError)?;
-        if self.state().described.holds(sql, conn.inner()) {
+        // A kept statement is reused only if the schema has not changed since it was kept, by
+        // this session's DDL (a simple Query mid-round) or another session's: PostgreSQL's
+        // GetCachedPlan revalidates at Bind, so a dropped relation is 42P01 there, before
+        // BindComplete (C53 follow-up review B1). The connection first takes any schema another
+        // session published, as its next statement would. RED OWED: a PG 18.6 recording of P /
+        // Q DROP / B / E / S and of the cross-session variant (LOUD-OWED).
+        conn.inner().maybe_update_schema();
+        let version = conn.inner().current_schema().schema_version;
+        if self.state().described.holds(sql, conn.inner(), version) {
             return Ok(());
         }
         let in_tx = !conn.inner().get_auto_commit();
@@ -2344,6 +2358,7 @@ impl Session {
             Ok(Some((stmt, types))) => {
                 self.state().described.put(Described {
                     conn: conn.inner().clone(),
+                    schema_version: conn.inner().current_schema().schema_version,
                     sql: sql.to_string(),
                     stmt,
                     types,
