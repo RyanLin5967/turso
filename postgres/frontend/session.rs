@@ -193,7 +193,13 @@ impl PgConnectionInner {
         // violation pending; a fault-injection test (`pretend_deferred_violations`) holds it.
         // The count is read only when the setting would turn the check off (LOW 7).
         let enforce = gucs.foreign_keys || deferred_violations(&self.conn) > 0;
-        self.conn.set_foreign_keys_enabled(enforce);
+        // Only a change reaches the engine (review wire-rework A-M1): the setter bumped the
+        // prepare generation whatever the value, so every SET and block end re-prepared every
+        // kept statement. The engine's setter now bumps on a change only (fastest-engine
+        // 49e10e02a); this keeps the wire's side of the class whatever a setter does.
+        if self.conn.foreign_keys_enabled() != enforce {
+            self.conn.set_foreign_keys_enabled(enforce);
+        }
         let mut state = self.session_state.lock();
         if state.search_path != gucs.search_path {
             state.search_path.clone_from(&gucs.search_path);
