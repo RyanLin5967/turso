@@ -13641,3 +13641,28 @@ fn a_kept_delete_using_across_a_generation_bump_deletes_the_same_rows() {
         "the rows left"
     );
 }
+
+/// The search_path re-analysis class (lead, "reprepare fix, wire search_path re-analysis class"):
+/// a named statement Parsed under public, then a SET search_path TO s in a later round, is bound
+/// and executed under s: it reads s.t's 2. Every statement the wire keeps across messages is
+/// prepared again under the current options when the path it was prepared under has changed (the
+/// engine's re-prepare keeps the statement's own options, so it cannot). PG 18.6 recording owed
+/// (LOUD). Expected green by reading at this commit (Kept is cleared at Sync, and Bind prepares
+/// an analysed statement again), so it pins the class across rounds.
+#[test]
+fn a_named_statement_bound_after_a_search_path_change_reads_the_new_path() {
+    let dir = Scratch::new("named-path");
+    let server = two_schemas(&dir);
+    let mut a = server.connect();
+    named_parse(&mut a, "s1", "SELECT x FROM t");
+    a.send(b'S', &[]);
+    let parsed = a.read_reply();
+    assert!(parsed.error.is_none(), "{:?}", parsed.error);
+    a.q("SET search_path TO s").ok("path");
+    named_bind(&mut a, "", "s1");
+    named_execute(&mut a, "");
+    a.send(b'S', &[]);
+    let r = a.read_reply();
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(r.rows, vec![vec![Some("2".to_string())]], "the read under search_path s");
+}
