@@ -1045,6 +1045,10 @@ fn is_exit_command(line: &str) -> bool {
 static ALLOC: turso_pg_server::counters::CountingAlloc = turso_pg_server::counters::CountingAlloc;
 
 fn main() -> anyhow::Result<()> {
+    // The budget build's thread start and exit counter, before any thread exists (turso_branch_work's
+    // thread_starts and thread_exits columns).
+    #[cfg(feature = "alloc-count")]
+    turso_pg_server::counters::install_thread_lifecycle_counter();
     let opts = Opts::parse();
     let _guard = init_tracing(&opts)?;
 

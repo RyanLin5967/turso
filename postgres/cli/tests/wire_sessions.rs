@@ -6586,7 +6586,12 @@ fn a_rollback_to_a_savepoint_the_engine_discarded_is_3b001() {
     assert!(r.error.is_some(), "division by zero did not fail: {:?}", r.rows);
     assert_eq!(r.status, b'E', "the block is not marked failed");
     let r = a.q("ROLLBACK TO s").ok("rollback to s");
-    assert_eq!(r.status, b'T', "the block recovered from its failure");
+    assert_eq!(
+        r.status,
+        b'T',
+        "ROLLBACK TO s did not recover the block from its failure: status {}",
+        r.status as char
+    );
     assert_eq!(a.q("SELECT 1").single("in the block"), "1");
     let r = a.q("COMMIT").ok("the block's end");
     assert_eq!(r.tags, vec!["COMMIT".to_string()]);
@@ -13434,25 +13439,340 @@ fn rollback_and_chain_ends_the_settings_of_the_failed_block() {
 /// violation pending the SET is accepted (the control).
 #[test]
 fn foreign_keys_cannot_be_turned_off_over_pending_deferred_violations() {
-    let dir = Scratch::new("fkdeferredoff");
+    // Each arm on a server of its own, recording what went wrong without a panicking helper, so
+    // every arm is red at a base for its own reason (fk-guard review MED 2: arm 1's leaked
+    // deferred count made the next statement fail, `.single()` panicked, and the later arms never
+    // ran). Every refusal must be 55000 (LOW 3), this server's own code: PostgreSQL has no
+    // foreign_keys setting (postgres/COMPAT.md).
+    fn arm(label: &str, statements: &[&str]) -> Vec<String> {
+        let dir = Scratch::new("fkdeferredoff");
+        let server = Server::start(&dir.db(), &[]);
+        let mut a = server.connect();
+        let mut wrong = Vec::new();
+        a.q("CREATE TABLE p(id INT PRIMARY KEY)").ok("p");
+        a.q("CREATE TABLE c(id INT PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED)")
+            .ok("c");
+        let mut refused = false;
+        for sql in statements {
+            let r = a.q(sql);
+            // The implicit block first: its query holds foreign_keys too, so the SET branch below
+            // took it and this one was dead (review wire-rework A-L1).
+            if sql.starts_with("INSERT") && sql.contains(';') {
+                // The implicit block: the refusal is this query's own error.
+                match &r.error {
+                    None => wrong.push(format!("{label}: the implicit block was accepted")),
+                    Some(e) if e.code != "55000" => {
+                        wrong.push(format!("{label}: the implicit block refused with {}, not 55000", e.code))
+                    }
+                    Some(_) => refused = true,
+                }
+            } else if sql.contains("foreign_keys") {
+                match &r.error {
+                    None => wrong.push(format!("{label}: {sql} accepted over a pending violation")),
+                    Some(e) if e.code != "55000" => {
+                        wrong.push(format!("{label}: {sql} refused with {}, not 55000", e.code))
+                    }
+                    Some(_) => refused = true,
+                }
+                if r.error.is_some() && r.status != b'E' && statements[0] == "BEGIN" {
+                    wrong.push(format!("{label}: the refused SET did not fail the block"));
+                }
+            } else if *sql == "COMMIT" {
+                if r.error.is_some() || r.tags != ["ROLLBACK"] {
+                    wrong.push(format!("{label}: COMMIT answered {:?} {:?}", r.tags, r.error));
+                }
+            }
+        }
+        let rows = a.q("SELECT count(*) FROM c");
+        match (&rows.error, rows.rows.first().and_then(|r| r.first().cloned()).flatten()) {
+            (None, Some(n)) if n == "0" => {}
+            (None, n) => wrong.push(format!("{label}: the orphan committed ({n:?} rows)")),
+            (Some(e), _) => wrong.push(format!("{label}: the next statement failed: {} {}", e.code, e.message)),
+        }
+        let shown = a.q("SHOW foreign_keys");
+        if shown.rows.first().and_then(|r| r.first().cloned()).flatten().as_deref() != Some("on") {
+            wrong.push(format!("{label}: foreign_keys after it: {:?} {:?}", shown.rows, shown.error));
+        }
+        if !refused && wrong.is_empty() {
+            wrong.push(format!("{label}: nothing was refused"));
+        }
+        // The next write still works (the deferred count was not left behind), and the session
+        // that saw the refusal still accepts turning foreign_keys off with nothing pending
+        // (review wire-rework A-L2).
+        let w = a.q("INSERT INTO p VALUES (1)");
+        let w2 = a.q("INSERT INTO c VALUES (2, 1)");
+        let c0 = a.q("BEGIN");
+        let c1 = a.q("SET LOCAL foreign_keys = off");
+        let c2 = a.q("COMMIT");
+        for r in [&w, &w2, &c0, &c1, &c2] {
+            if let Some(e) = &r.error {
+                wrong.push(format!("{label}: a later statement failed: {} {}", e.code, e.message));
+            }
+        }
+        wrong
+    }
+    let orphan = "INSERT INTO c VALUES (1, 99)";
+    let mut wrong = Vec::new();
+    for set in [
+        "SET LOCAL foreign_keys = off",
+        "SET foreign_keys = off",
+        "SET SESSION foreign_keys = off",
+    ] {
+        wrong.extend(arm(set, &["BEGIN", orphan, set, "COMMIT"]));
+    }
+    wrong.extend(arm(
+        "implicit block",
+        &["INSERT INTO c VALUES (1, 99); SET foreign_keys = off; SELECT 1"],
+    ));
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    // The control: nothing pending, the SET LOCAL is accepted and ends with its block.
+    let dir = Scratch::new("fkdeferredoffctl");
     let server = Server::start(&dir.db(), &[]);
     let mut a = server.connect();
-    a.q("CREATE TABLE p(id INT PRIMARY KEY)").ok("p");
-    a.q("CREATE TABLE c(id INT PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED)")
-        .ok("c");
-    a.q("BEGIN").ok("begin");
-    a.q("INSERT INTO c VALUES (1, 99)").ok("the orphan, deferred");
-    let r = a.q("SET LOCAL foreign_keys = off");
-    assert!(r.error.is_some(), "foreign_keys turned off over a pending violation: {:?}", r.tags);
-    assert_eq!(r.status, b'E', "the refused SET did not fail the block");
-    assert_eq!(a.q("COMMIT").ok("commit").tags, ["ROLLBACK"]);
-    assert_eq!(a.q("SELECT count(*) FROM c").single("rows"), "0", "the orphan committed");
-    a.q("INSERT INTO p VALUES (1)").ok("the next write");
-    a.q("INSERT INTO c VALUES (2, 1)").ok("a valid child");
-    // The control: nothing pending, the SET LOCAL is accepted and ends with its block.
     a.q("BEGIN").ok("begin");
     a.q("SET LOCAL foreign_keys = off").ok("no violation pending");
     a.q("COMMIT").ok("commit");
     assert_eq!(a.q("SHOW foreign_keys").single("foreign_keys"), "on");
 }
 replays_postgresql!(pg18_c44_m2_sets_replays_as_postgresql_answered, "pg18-c44-m2-sets.out", []);
+// Review c39799c5d..9e24b455d MED 2: a TimeZone value naming a host path (or a zone-directory file that
+// is not a zone) is PostgreSQL's 22023, so no answer tells a client which host files exist.
+replays_postgresql!(pg18_rev_c39_tzpath_replays_as_postgresql_answered, "pg18-rev-c39-tzpath.out", []);
+// C53 follow-up (Codex C56's NEEDS-CLAUDE, frontier/codex/reports/C56-protocol-dependency.md): a
+// retained named statement whose relation was dropped is refused at Bind (42P01, before
+// BindComplete), where PostgreSQL's GetCachedPlan revalidates it, not at Execute.
+replays_postgresql!(pg18_c56_schema_prepared_replays_as_postgresql_answered, "pg18-c56-schema-prepared.out", []);
+// Review c39799c5d..9e24b455d LOWs 6, 7, 8, 9, 11 (one class: a SET value is valid or not as
+// PostgreSQL's check hooks decide, before this server's own refusal of a valid value it does not
+// act on). Strict until a run's diff registers the intended 0A000 rows (PGDIV-SET-REFUSED), each
+// from a read of that diff.
+replays_postgresql!(pg18_rev_c39_tzforms_replays_as_postgresql_answered, "pg18-rev-c39-tzforms.out", []);
+replays_postgresql!(pg18_rev_c39_misc_replays_as_postgresql_answered, "pg18-rev-c39-misc.out", []);
+replays_postgresql!(pg18_rev_c39_enc_replays_as_postgresql_answered, "pg18-rev-c39-enc.out", []);
+
+/// Named extended-protocol messages, for the kept-statement reds below.
+fn named_parse(w: &mut Wire, name: &str, sql: &str) {
+    let mut b = format!("{name}\0{sql}\0").into_bytes();
+    b.extend_from_slice(&0i16.to_be_bytes());
+    w.send(b'P', &b);
+}
+
+fn named_bind(w: &mut Wire, portal: &str, stmt: &str) {
+    let mut b = format!("{portal}\0{stmt}\0").into_bytes();
+    for _ in 0..3 {
+        b.extend_from_slice(&0i16.to_be_bytes());
+    }
+    w.send(b'B', &b);
+}
+
+fn named_execute(w: &mut Wire, portal: &str) {
+    let mut b = format!("{portal}\0").into_bytes();
+    b.extend_from_slice(&0i32.to_be_bytes());
+    w.send(b'E', &b);
+}
+
+/// A server whose database has `t` (x = 1) in public and `s.t` (x = 2), for the kept-statement
+/// reds: an unqualified `t` read under search_path s must be 2.
+fn two_schemas(dir: &Scratch) -> Server {
+    cli_script(dir, b"CREATE SCHEMA s;\nCREATE TABLE s.t(x INT);\nINSERT INTO s.t VALUES (2);\n");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE t(x INT)").ok("t");
+    a.q("INSERT INTO t VALUES (1)").ok("row");
+    server
+}
+
+/// Review wire-rework B-H1 (DECISIONS, "cache-key and reprepare classes"): a statement kept at
+/// Parse is not reused across a SET search_path in the same round. The kept statement resolved
+/// `t` under public; reused after `SET search_path TO s` it read public.t's 1. PostgreSQL
+/// re-analyses a cached statement when search_path changes, and the base (one kept statement,
+/// dropped at any Execute) gave 2.
+#[test]
+fn a_kept_statement_is_not_reused_across_a_search_path_change() {
+    let dir = Scratch::new("kept-path");
+    let server = two_schemas(&dir);
+    let mut a = server.connect();
+    named_parse(&mut a, "sq", "SELECT x FROM t");
+    named_parse(&mut a, "ss", "SET search_path TO s");
+    named_bind(&mut a, "", "ss");
+    named_execute(&mut a, "");
+    named_bind(&mut a, "", "sq");
+    named_execute(&mut a, "");
+    a.send(b'S', &[]);
+    let r = a.read_reply();
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(r.rows, vec![vec![Some("2".to_string())]], "the read under search_path s");
+}
+
+/// Review wire-rework B-H2: a kept statement executed after another statement changed a setting
+/// (which bumps the engine's prepare generation) is re-prepared with the session's search path.
+/// The engine's reprepare translated with default options, without the session's path, so an
+/// unqualified `t` read public's 1 (root fix: fastest-engine). Under search_path s it must be 2,
+/// after a SET of another setting and after a SAVEPOINT alike.
+#[test]
+fn a_kept_statement_reprepared_after_a_setting_change_keeps_the_search_path() {
+    let dir = Scratch::new("kept-reprepare");
+    let server = two_schemas(&dir);
+    let mut wrong = Vec::new();
+    // Arms that force a real bump of the engine's prepare generation (review wire-rework E-M1):
+    // with the setter bumping only on a change, the first two no longer bump, and would pass
+    // whether or not a re-prepare keeps the session's path.
+    for (label, begin, other) in [
+        ("SET client_min_messages", false, "SET client_min_messages TO notice"),
+        ("SAVEPOINT", true, "SAVEPOINT a"),
+        ("SET foreign_keys = off", false, "SET foreign_keys = off"),
+        ("ALTER TABLE s.t ADD COLUMN", false, "ALTER TABLE s.t ADD COLUMN y INT"),
+    ] {
+        let mut a = server.connect();
+        a.q("SET search_path TO s").ok("path");
+        if begin {
+            a.q("BEGIN").ok("begin");
+        }
+        named_parse(&mut a, "pq", "SELECT x FROM t");
+        named_bind(&mut a, "p1", "pq");
+        named_parse(&mut a, "pc", other);
+        named_bind(&mut a, "p2", "pc");
+        named_execute(&mut a, "p2");
+        named_execute(&mut a, "p1");
+        a.send(b'S', &[]);
+        let r = a.read_reply();
+        if r.error.is_some() || r.rows != vec![vec![Some("2".to_string())]] {
+            wrong.push(format!("{label}: rows {:?} error {:?}", r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Review wire-rework C-M1 and C-M2: a SET LOCAL outside a block warns 25P01 for every setting,
+/// search_path included (its arm returned before the warning), and the warning comes before the
+/// value is checked, so an invalid value is the warning then its error. The SET LOCAL warning
+/// of the other settings is recorded (pg18-rev-c39-misc.out); search_path's and the warning
+/// before an error follow PostgreSQL's ExecSetVariableStmt (WarnNoTransactionBlock before
+/// set_config_option), whose PG 18.6 recording is LOUD-OWED.
+#[test]
+fn a_set_local_outside_a_block_warns_before_its_value_is_checked() {
+    let dir = Scratch::new("setlocalwarn");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    let warned = |r: &Reply| {
+        r.notices.len() == 1 && r.notices[0].code == "25P01"
+    };
+    let r = a.q("SET LOCAL search_path TO public");
+    if !warned(&r) || r.error.is_some() || r.tags != ["SET"] {
+        wrong.push(format!("search_path: notices {:?} tags {:?} error {:?}", r.notices, r.tags, r.error));
+    }
+    let r = a.q("SET LOCAL TimeZone = '--5'");
+    if !warned(&r) || r.error.as_ref().map(|e| e.code.as_str()) != Some("22023") {
+        wrong.push(format!("an invalid value: notices {:?} error {:?}", r.notices, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Review wire-rework E-H1: DDL in an attached schema leaves the main schema and the search path
+/// as they were but moves the engine's prepare generation; a kept statement must not be reused
+/// across it. Under search_path s, a statement over `t` kept before `DROP TABLE s.t` is refused
+/// 42P01 (PostgreSQL re-analyses it under s; it silently read public.t's 1), one kept before
+/// `ALTER TABLE s.t ADD COLUMN` still reads s.t's 2, and one kept before a temp `t` is created
+/// reads the temp table's 3. PG 18.6 recordings of the three owed (LOUD).
+#[test]
+fn a_kept_statement_is_not_reused_across_ddl_the_key_did_not_see() {
+    let dir = Scratch::new("kept-attached");
+    let server = two_schemas(&dir);
+    let mut wrong = Vec::new();
+    for (label, path, ddl, want) in [
+        ("DROP TABLE s.t", true, &["DROP TABLE s.t"][..], Err("42P01")),
+        ("ALTER TABLE s.t ADD COLUMN", true, &["ALTER TABLE s.t ADD COLUMN y INT"][..], Ok("2")),
+        (
+            "a temp t",
+            false,
+            &["CREATE TEMP TABLE t(x INT)", "INSERT INTO t VALUES (3)"][..],
+            Ok("3"),
+        ),
+    ] {
+        let mut a = server.connect();
+        if path {
+            a.q("SET search_path TO s").ok("path");
+        }
+        named_parse(&mut a, "sq", "SELECT x FROM t");
+        for (i, sql) in ddl.iter().enumerate() {
+            let name = format!("d{i}");
+            named_parse(&mut a, &name, sql);
+            named_bind(&mut a, "", &name);
+            named_execute(&mut a, "");
+        }
+        named_bind(&mut a, "", "sq");
+        named_execute(&mut a, "");
+        a.send(b'S', &[]);
+        let r = a.read_reply();
+        match want {
+            Err(code) => {
+                if r.error.as_ref().map(|e| e.code.as_str()) != Some(code) || !r.rows.is_empty() {
+                    wrong.push(format!("{label}: want {code}, got rows {:?} error {:?}", r.rows, r.error));
+                }
+            }
+            Ok(v) => {
+                if r.error.is_some() || r.rows != vec![vec![Some(v.to_string())]] {
+                    wrong.push(format!("{label}: want {v}, got rows {:?} error {:?}", r.rows, r.error));
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Review wire-rework E-M2: a kept DELETE ... USING (whose translation reads its relations'
+/// columns) executed after a real bump of the prepare generation deletes the rows it deletes
+/// without the bump. The engine's re-prepare would translate it with no column lookup (the
+/// dialect has no connection); the wire re-prepares it under the session's own translator.
+#[test]
+fn a_kept_delete_using_across_a_generation_bump_deletes_the_same_rows() {
+    let dir = Scratch::new("kept-delete-using");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE a(x INT)").ok("a");
+    a.q("CREATE TABLE b(x INT)").ok("b");
+    a.q("INSERT INTO a VALUES (1), (2), (3)").ok("rows a");
+    a.q("INSERT INTO b VALUES (2)").ok("rows b");
+    named_parse(&mut a, "del", "DELETE FROM a USING b WHERE a.x = b.x");
+    named_bind(&mut a, "pd", "del");
+    named_parse(&mut a, "fk", "SET foreign_keys = off");
+    named_bind(&mut a, "pf", "fk");
+    named_execute(&mut a, "pf");
+    named_execute(&mut a, "pd");
+    a.send(b'S', &[]);
+    let r = a.read_reply();
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(r.tags.last().map(String::as_str), Some("DELETE 1"), "tags {:?}", r.tags);
+    let left = a.q("SELECT x FROM a ORDER BY x");
+    assert_eq!(
+        left.rows,
+        vec![vec![Some("1".to_string())], vec![Some("3".to_string())]],
+        "the rows left"
+    );
+}
+
+/// The search_path re-analysis class (lead, "reprepare fix, wire search_path re-analysis class"):
+/// a named statement Parsed under public, then a SET search_path TO s in a later round, is bound
+/// and executed under s: it reads s.t's 2. Every statement the wire keeps across messages is
+/// prepared again under the current options when the path it was prepared under has changed (the
+/// engine's re-prepare keeps the statement's own options, so it cannot). PG 18.6 recording owed
+/// (LOUD). Expected green by reading at this commit (Kept is cleared at Sync, and Bind prepares
+/// an analysed statement again), so it pins the class across rounds.
+#[test]
+fn a_named_statement_bound_after_a_search_path_change_reads_the_new_path() {
+    let dir = Scratch::new("named-path");
+    let server = two_schemas(&dir);
+    let mut a = server.connect();
+    named_parse(&mut a, "s1", "SELECT x FROM t");
+    a.send(b'S', &[]);
+    let parsed = a.read_reply();
+    assert!(parsed.error.is_none(), "{:?}", parsed.error);
+    a.q("SET search_path TO s").ok("path");
+    named_bind(&mut a, "", "s1");
+    named_execute(&mut a, "");
+    a.send(b'S', &[]);
+    let r = a.read_reply();
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(r.rows, vec![vec![Some("2".to_string())]], "the read under search_path s");
+}

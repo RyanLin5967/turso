@@ -48,6 +48,25 @@ impl Dialect for PostgresDialect {
             Some(next) => next.stmt_location as usize,
             None => sql.len(),
         };
+        // A statement whose translation reads its relations' columns (DELETE ... USING, a
+        // positional INSERT with DEFAULT, an alias column list) cannot be translated here, where
+        // no connection's lookup exists: the session's prepare builds that translator, and a
+        // statement the wire keeps is prepared again by the wire under it (review wire-rework
+        // E-M2, E-H1). Reached only by the engine's own re-prepare of such a statement; it is
+        // refused rather than translated without the lookup or read as SQLite. BLIND SPOT: a
+        // re-prepare the engine starts itself (another session's DDL mid-statement) fails here
+        // instead of re-translating; owed to fastest-engine (a Dialect parse given the
+        // re-preparing connection).
+        if crate::session::is_delete_using(sql, &parse_result)
+            || crate::session::is_positional_insert_default(sql, &parse_result)
+            || crate::session::has_alias_column_list(&parse_result)
+        {
+            return Err(turso_core::LimboError::InternalError(
+                "this statement must be prepared again by its session: its translation reads \
+                 its relations' columns"
+                    .to_string(),
+            ));
+        }
         let translator = turso_pg_parser::translator::PostgreSQLTranslator::new();
         match translator.translate(&parse_result) {
             Ok(stmt) => Ok((Some(turso_parser::ast::Cmd::Stmt(stmt)), consumed)),
@@ -3328,11 +3347,11 @@ impl InternalVirtualTableCursor for PgInputErrorInfoCursor {
         };
 
         self.row = Some(match validate_pg_input(&input, &type_name) {
-            Some((message, code)) => [
+            Some((message, kind)) => [
                 Value::build_text(message),
                 Value::Null,
                 Value::Null,
-                Value::build_text(code),
+                Value::build_text(crate::sqlstate(kind)),
             ],
             None => [Value::Null, Value::Null, Value::Null, Value::Null],
         });

@@ -49,6 +49,10 @@ mod imp {
         static TOTALS: [Cell<u64>; 8] = const { [const { Cell::new(0) }; 8] };
     }
 
+    pub(super) fn thread_instructions() -> u64 {
+        instructions()
+    }
+
     fn instructions() -> u64 {
         #[cfg(target_vendor = "apple")]
         {
@@ -113,6 +117,106 @@ impl Drop for Guard {
     fn drop(&mut self) {
         #[cfg(feature = "phase-count")]
         imp::switch(self.previous);
+    }
+}
+
+/// A bracketed stretch of the session thread's work, for attributing a window's instructions
+/// finer than its phases (the wire-only high mode in empty floor windows, lead 2026-10-17, a
+/// diagnostic): each span is charged the instructions between its guard's creation and drop,
+/// inclusive of anything nested in it, and its totals are read by [`span_totals`]. A span must not
+/// contain a budget window's counter reading, or its cost lands in the next window; the spans below
+/// are the leaves of a floor window's path. Without `phase-count` every call is an empty inline.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Span {
+    /// The server's answers fed to the client after a simple Query's statements ran.
+    Feed = 0,
+    /// The transaction status read for ReadyForQuery.
+    TxStatus = 1,
+    /// The ParameterStatus check (search_path) before ReadyForQuery.
+    ChangedParameters = 2,
+    /// The reply flushed to the socket.
+    Flush = 3,
+    /// An empty Query's implicit-block end.
+    EndImplicit = 4,
+    /// turso_branch_work()'s reads after this thread's own counters (confirmation words, thread
+    /// allocations, foreign CPU, thread lifecycle).
+    WorkTail = 5,
+    /// turso_branch_work()'s row finished and its response built.
+    WorkFinish = 6,
+}
+
+/// The spans' names, in [`Span`]'s order: the columns of [`span_totals`].
+pub const SPAN_NAMES: [&str; 7] = [
+    "feed",
+    "tx_status",
+    "changed_parameters",
+    "flush",
+    "end_implicit",
+    "work_tail",
+    "work_finish",
+];
+
+#[cfg(feature = "phase-count")]
+mod spans {
+    use std::cell::Cell;
+    thread_local! {
+        static TOTALS: [Cell<u64>; 7] = const { [const { Cell::new(0) }; 7] };
+    }
+    pub(super) fn add(i: usize, n: u64) {
+        TOTALS.with(|t| t[i].set(t[i].get() + n));
+    }
+    pub(super) fn totals() -> [u64; 7] {
+        TOTALS.with(|t| std::array::from_fn(|i| t[i].get()))
+    }
+}
+
+/// The span's guard: charges it on drop.
+#[must_use]
+pub struct SpanGuard {
+    #[cfg(feature = "phase-count")]
+    span: Span,
+    #[cfg(feature = "phase-count")]
+    start: u64,
+}
+
+/// Bracket `span` until the guard drops.
+#[inline]
+pub fn span(span: Span) -> SpanGuard {
+    #[cfg(feature = "phase-count")]
+    {
+        SpanGuard {
+            span,
+            start: imp::thread_instructions(),
+        }
+    }
+    #[cfg(not(feature = "phase-count"))]
+    {
+        let _ = span;
+        SpanGuard {}
+    }
+}
+
+impl Drop for SpanGuard {
+    #[inline]
+    fn drop(&mut self) {
+        #[cfg(feature = "phase-count")]
+        spans::add(
+            self.span as usize,
+            imp::thread_instructions().saturating_sub(self.start),
+        );
+    }
+}
+
+/// This thread's instructions per span so far, in [`SPAN_NAMES`]' order; None in a build without
+/// the `phase-count` feature.
+pub fn span_totals() -> Option<[u64; 7]> {
+    #[cfg(feature = "phase-count")]
+    {
+        Some(spans::totals())
+    }
+    #[cfg(not(feature = "phase-count"))]
+    {
+        None
     }
 }
 

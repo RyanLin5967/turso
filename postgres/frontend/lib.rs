@@ -10,6 +10,8 @@ pub use result_types::{element_of, StatementTypes};
 mod session;
 #[cfg(all(test, unix))]
 mod stack_guard_tests;
+mod sqlstate;
+pub use sqlstate::sqlstate;
 
 pub use session::PgConnection as Connection;
 pub use session::{
@@ -20,6 +22,8 @@ pub use session::{
 };
 #[cfg(feature = "failpoints")]
 pub use session::fail_next_undo;
+#[cfg(feature = "failpoints")]
+pub use session::pretend_deferred_violations;
 pub use turso_core::{
     Database, DatabaseOpts, Func, LimboError, Numeric, OpenFlags, PlatformIO, Result, StepResult,
 };

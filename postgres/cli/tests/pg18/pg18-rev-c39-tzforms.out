@@ -1,0 +1,36 @@
+>> Q SET TimeZone = 'america/new_york'
+   C SET
+   Z I
+>> Q SET TimeZone = 'AMERICA/NEW_YORK'
+   C SET
+   Z I
+>> Q SET TimeZone = 'UTC+3'
+   C SET
+   Z I
+>> Q SET TimeZone = 'EST5EDT,M3.2.0,M11.1.0'
+   C SET
+   Z I
+>> Q SET TimeZone = '--5'
+   E S=ERROR C=22023 M=invalid value for parameter "TimeZone": "--5"
+   Z I
+>> Q SET TimeZone = 'nan'
+   C SET
+   Z I
+>> Q SET TimeZone = 'inf'
+   E S=ERROR C=22023 M=invalid value for parameter "TimeZone": "inf"
+   Z I
+>> Q SET TimeZone = 'Factory'
+   C SET
+   Z I
+>> Q SET TimeZone = '+05:30'
+   C SET
+   Z I
+>> Q SET TimeZone = '5.5'
+   C SET
+   Z I
+>> Q SET TIME ZONE INTERVAL '+05:00' HOUR TO MINUTE
+   C SET
+   Z I
+>> Q SET TimeZone = 'UTC'
+   C SET
+   Z I

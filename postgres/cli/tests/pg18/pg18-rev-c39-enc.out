@@ -1,0 +1,312 @@
+>> Q SET client_encoding = 'sqlascii'
+   C SET
+   Z I
+>> Q SET client_encoding = 'utf8'
+   C SET
+   Z I
+>> Q SET client_encoding = 'unicode'
+   C SET
+   Z I
+>> Q SET client_encoding = 'eucjp'
+   C SET
+   Z I
+>> Q SET client_encoding = 'euccn'
+   C SET
+   Z I
+>> Q SET client_encoding = 'euckr'
+   C SET
+   Z I
+>> Q SET client_encoding = 'euctw'
+   C SET
+   Z I
+>> Q SET client_encoding = 'eucjis2004'
+   C SET
+   Z I
+>> Q SET client_encoding = 'muleinternal'
+   E S=ERROR C=0A000 M=invalid value for parameter "client_encoding": "muleinternal"
+   Z I
+>> Q SET client_encoding = 'latin1'
+   C SET
+   Z I
+>> Q SET client_encoding = 'latin2'
+   C SET
+   Z I
+>> Q SET client_encoding = 'latin3'
+   C SET
+   Z I
+>> Q SET client_encoding = 'latin4'
+   C SET
+   Z I
+>> Q SET client_encoding = 'latin5'
+   C SET
+   Z I
+>> Q SET client_encoding = 'latin6'
+   C SET
+   Z I
+>> Q SET client_encoding = 'latin7'
+   C SET
+   Z I
+>> Q SET client_encoding = 'latin8'
+   C SET
+   Z I
+>> Q SET client_encoding = 'latin9'
+   C SET
+   Z I
+>> Q SET client_encoding = 'latin10'
+   C SET
+   Z I
+>> Q SET client_encoding = 'win1256'
+   C SET
+   Z I
+>> Q SET client_encoding = 'win1258'
+   C SET
+   Z I
+>> Q SET client_encoding = 'win866'
+   C SET
+   Z I
+>> Q SET client_encoding = 'win874'
+   C SET
+   Z I
+>> Q SET client_encoding = 'koi8r'
+   C SET
+   Z I
+>> Q SET client_encoding = 'koi8'
+   C SET
+   Z I
+>> Q SET client_encoding = 'win1251'
+   C SET
+   Z I
+>> Q SET client_encoding = 'win1252'
+   C SET
+   Z I
+>> Q SET client_encoding = 'iso88595'
+   C SET
+   Z I
+>> Q SET client_encoding = 'iso88596'
+   C SET
+   Z I
+>> Q SET client_encoding = 'iso88597'
+   C SET
+   Z I
+>> Q SET client_encoding = 'iso88598'
+   C SET
+   Z I
+>> Q SET client_encoding = 'win1250'
+   C SET
+   Z I
+>> Q SET client_encoding = 'win1253'
+   C SET
+   Z I
+>> Q SET client_encoding = 'win1254'
+   C SET
+   Z I
+>> Q SET client_encoding = 'win1255'
+   C SET
+   Z I
+>> Q SET client_encoding = 'win1257'
+   C SET
+   Z I
+>> Q SET client_encoding = 'koi8u'
+   C SET
+   Z I
+>> Q SET client_encoding = 'sjis'
+   C SET
+   Z I
+>> Q SET client_encoding = 'big5'
+   C SET
+   Z I
+>> Q SET client_encoding = 'gbk'
+   C SET
+   Z I
+>> Q SET client_encoding = 'uhc'
+   C SET
+   Z I
+>> Q SET client_encoding = 'gb18030'
+   C SET
+   Z I
+>> Q SET client_encoding = 'johab'
+   C SET
+   Z I
+>> Q SET client_encoding = 'shiftjis2004'
+   C SET
+   Z I
+>> Q SET client_encoding = 'alt'
+   C SET
+   Z I
+>> Q SET client_encoding = 'win'
+   C SET
+   Z I
+>> Q SET client_encoding = 'mskanji'
+   C SET
+   Z I
+>> Q SET client_encoding = 'shiftjis'
+   C SET
+   Z I
+>> Q SET client_encoding = 'tcvn'
+   C SET
+   Z I
+>> Q SET client_encoding = 'tcvn5712'
+   C SET
+   Z I
+>> Q SET client_encoding = 'vscii'
+   C SET
+   Z I
+>> Q SET client_encoding = 'abc'
+   C SET
+   Z I
+>> Q SET client_encoding = 'iso885910'
+   C SET
+   Z I
+>> Q SET client_encoding = 'iso885913'
+   C SET
+   Z I
+>> Q SET client_encoding = 'iso885914'
+   C SET
+   Z I
+>> Q SET client_encoding = 'iso885915'
+   C SET
+   Z I
+>> Q SET client_encoding = 'iso885916'
+   C SET
+   Z I
+>> Q SET client_encoding = 'iso88591'
+   C SET
+   Z I
+>> Q SET client_encoding = 'iso88592'
+   C SET
+   Z I
+>> Q SET client_encoding = 'iso88593'
+   C SET
+   Z I
+>> Q SET client_encoding = 'iso88594'
+   C SET
+   Z I
+>> Q SET client_encoding = 'iso88599'
+   C SET
+   Z I
+>> Q SET client_encoding = 'cp1250'
+   E S=ERROR C=22023 M=invalid value for parameter "client_encoding": "cp1250"
+   Z I
+>> Q SET client_encoding = 'cp1251'
+   E S=ERROR C=22023 M=invalid value for parameter "client_encoding": "cp1251"
+   Z I
+>> Q SET client_encoding = 'cp1252'
+   E S=ERROR C=22023 M=invalid value for parameter "client_encoding": "cp1252"
+   Z I
+>> Q SET client_encoding = 'cp1253'
+   E S=ERROR C=22023 M=invalid value for parameter "client_encoding": "cp1253"
+   Z I
+>> Q SET client_encoding = 'cp1254'
+   E S=ERROR C=22023 M=invalid value for parameter "client_encoding": "cp1254"
+   Z I
+>> Q SET client_encoding = 'cp1255'
+   E S=ERROR C=22023 M=invalid value for parameter "client_encoding": "cp1255"
+   Z I
+>> Q SET client_encoding = 'cp1256'
+   E S=ERROR C=22023 M=invalid value for parameter "client_encoding": "cp1256"
+   Z I
+>> Q SET client_encoding = 'cp1257'
+   E S=ERROR C=22023 M=invalid value for parameter "client_encoding": "cp1257"
+   Z I
+>> Q SET client_encoding = 'cp1258'
+   E S=ERROR C=22023 M=invalid value for parameter "client_encoding": "cp1258"
+   Z I
+>> Q SET client_encoding = 'cp866'
+   E S=ERROR C=22023 M=invalid value for parameter "client_encoding": "cp866"
+   Z I
+>> Q SET client_encoding = 'cp874'
+   E S=ERROR C=22023 M=invalid value for parameter "client_encoding": "cp874"
+   Z I
+>> Q SET client_encoding = 'cp932'
+   E S=ERROR C=22023 M=invalid value for parameter "client_encoding": "cp932"
+   Z I
+>> Q SET client_encoding = 'cp936'
+   E S=ERROR C=22023 M=invalid value for parameter "client_encoding": "cp936"
+   Z I
+>> Q SET client_encoding = 'cp949'
+   E S=ERROR C=22023 M=invalid value for parameter "client_encoding": "cp949"
+   Z I
+>> Q SET client_encoding = 'cp950'
+   E S=ERROR C=22023 M=invalid value for parameter "client_encoding": "cp950"
+   Z I
+>> Q SET client_encoding = 'windows1250'
+   C SET
+   Z I
+>> Q SET client_encoding = 'windows1251'
+   C SET
+   Z I
+>> Q SET client_encoding = 'windows1252'
+   C SET
+   Z I
+>> Q SET client_encoding = 'windows1253'
+   C SET
+   Z I
+>> Q SET client_encoding = 'windows1254'
+   C SET
+   Z I
+>> Q SET client_encoding = 'windows1255'
+   C SET
+   Z I
+>> Q SET client_encoding = 'windows1256'
+   C SET
+   Z I
+>> Q SET client_encoding = 'windows1257'
+   C SET
+   Z I
+>> Q SET client_encoding = 'windows1258'
+   C SET
+   Z I
+>> Q SET client_encoding = 'windows866'
+   C SET
+   Z I
+>> Q SET client_encoding = 'windows874'
+   C SET
+   Z I
+>> Q SET client_encoding = 'windows932'
+   C SET
+   Z I
+>> Q SET client_encoding = 'windows936'
+   C SET
+   Z I
+>> Q SET client_encoding = 'windows949'
+   C SET
+   Z I
+>> Q SET client_encoding = 'windows950'
+   C SET
+   Z I
+>> Q SET client_encoding = 'win932'
+   C SET
+   Z I
+>> Q SET client_encoding = 'win936'
+   C SET
+   Z I
+>> Q SET client_encoding = 'win949'
+   C SET
+   Z I
+>> Q SET client_encoding = 'win950'
+   C SET
+   Z I
+>> Q SET client_encoding = 'UTF-8'
+   C SET
+   Z I
+>> Q SET client_encoding = 'utf_8'
+   C SET
+   Z I
+>> Q SET client_encoding = 'Latin-1'
+   C SET
+   Z I
+>> Q SET client_encoding = 'ISO-8859-1'
+   C SET
+   Z I
+>> Q SET client_encoding = 'EUC_JP'
+   C SET
+   Z I
+>> Q SET client_encoding = 'SHIFT_JIS_2004'
+   C SET
+   Z I
+>> Q SET client_encoding = 'GB-18030'
+   C SET
+   Z I
+>> Q SET client_encoding = 'UTF8'
+   C SET
+   Z I

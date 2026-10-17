@@ -49,14 +49,10 @@ struct PgConnectionInner {
     /// A stamp of the last assignment to the search path, unique across connections, 0 before any
     /// ([`PgConnection::search_path_stamp`]).
     search_path_stamp: std::sync::atomic::AtomicU64,
-    /// The statement being prepared runs in a transaction block the client opened (BEGIN), as the
-    /// server tells it ([`PgConnection::set_explicit_block`]); an implicit block (a multi-statement
-    /// query's, a pipeline's) is not one. Read by SET ([`handle_pg_set`]).
-    explicit_block: std::sync::atomic::AtomicBool,
-    /// Notices a statement raised for the client ((severity, SQLSTATE, message): a WARNING, or a
+    /// Notices a statement raised for the client ((severity, condition, message): a WARNING, or a
     /// NOTICE such as DROP ... IF EXISTS's for a missing object), which the server sends before
     /// the statement's result ([`PgConnection::take_warnings`]).
-    warnings: parking_lot::Mutex<Vec<(&'static str, &'static str, String)>>,
+    warnings: parking_lot::Mutex<Vec<(&'static str, SqlErrorKind, String)>>,
 }
 
 /// The source of [`PgConnectionInner::search_path_stamp`]'s values.
@@ -185,7 +181,21 @@ impl PgConnectionInner {
         self.lock_timeout_ms.store(gucs.lock_timeout_ms, Relaxed);
         self.statement_timeout_ms.store(gucs.statement_timeout_ms, Relaxed);
         self.min_messages.store(gucs.min_messages, Relaxed);
-        self.conn.set_foreign_keys_enabled(gucs.foreign_keys);
+        // Never off over pending deferred violations (C41-H1: the check the COMMIT makes is the
+        // engine's, so turning it off let an orphan commit). The SET that asks for it is refused
+        // in `handle_pg_set`. This second guard is UNREACHABLE defence in depth (fk-guard review
+        // LOW 4): every block end, ROLLBACK TO and RELEASE reaches here after the engine settled
+        // the count, and no client sequence was found that arrives with the setting off and a
+        // violation pending; a fault-injection test (`pretend_deferred_violations`) holds it.
+        // The count is read only when the setting would turn the check off (LOW 7).
+        let enforce = gucs.foreign_keys || deferred_violations(&self.conn) > 0;
+        // Only a change reaches the engine (review wire-rework A-M1): the setter bumped the
+        // prepare generation whatever the value, so every SET and block end re-prepared every
+        // kept statement. The engine's setter now bumps on a change only (fastest-engine
+        // 49e10e02a); this keeps the wire's side of the class whatever a setter does.
+        if self.conn.foreign_keys_enabled() != enforce {
+            self.conn.set_foreign_keys_enabled(enforce);
+        }
         let mut state = self.session_state.lock();
         if state.search_path != gucs.search_path {
             state.search_path.clone_from(&gucs.search_path);
@@ -349,7 +359,6 @@ impl PgConnection {
                 statement_timeout_ms: std::sync::atomic::AtomicU64::new(0),
                 min_messages: std::sync::atomic::AtomicU8::new(7),
                 search_path_stamp: std::sync::atomic::AtomicU64::new(0),
-                explicit_block: std::sync::atomic::AtomicBool::new(false),
                 warnings: parking_lot::Mutex::new(Vec::new()),
             }),
         }
@@ -406,15 +415,6 @@ impl PgConnection {
     /// The session's search path as SHOW search_path gives it.
     pub fn shown_search_path(&self) -> String {
         shown_search_path(&self.inner.session_state.lock().search_path)
-    }
-
-    /// Whether the statements prepared next run in a transaction block the client opened (true)
-    /// or outside one or in an implicit block (false): the server, which alone tells the two
-    /// kinds of block apart, says so before each statement (see `PgConnectionInner::explicit_block`).
-    pub fn set_explicit_block(&self, explicit: bool) {
-        self.inner
-            .explicit_block
-            .store(explicit, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Whether a failed statement's undo failed too, leaving the engine connection in an unknown
@@ -627,7 +627,7 @@ impl PgConnection {
     }
 
     /// The notices the last statements raised for the client, as (severity, SQLSTATE, message).
-    pub fn take_warnings(&self) -> Vec<(&'static str, &'static str, String)> {
+    pub fn take_warnings(&self) -> Vec<(&'static str, SqlErrorKind, String)> {
         std::mem::take(&mut *self.inner.warnings.lock())
     }
 }
@@ -1528,18 +1528,50 @@ pub fn pg_bool(text: &str) -> Option<bool> {
 fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Result<Statement> {
     let name = set_stmt.name.to_ascii_lowercase();
     let in_block = !pg_conn.conn.get_auto_commit();
+    // PostgreSQL warns of a SET LOCAL outside a block first, for every setting and before the
+    // value is checked (ExecSetVariableStmt's WarnNoTransactionBlock before set_config_option), so
+    // an invalid value is the warning and then its error (review wire-rework C-M1, C-M2: the
+    // warning came only after an accepted value, and search_path's arm never reached it).
+    if set_stmt.is_local && !in_block {
+        pg_conn.warnings.lock().push((
+            "WARNING",
+            SqlErrorKind::NoActiveSqlTransaction,
+            "SET LOCAL can only be used in transaction blocks".to_string(),
+        ));
+    }
     // Every mutable setting uses this assignment path, including the outside-block LOCAL rule.
-    let assign = |apply: &dyn Fn(&mut Gucs, &mut Locals, bool)| {
+    let assign = |apply: &dyn Fn(&mut Gucs, &mut Locals, bool)| -> Result<()> {
+        // Outside a block a SET LOCAL lasts only its own statement: nothing to keep. Its warning
+        // was given above.
         if set_stmt.is_local && !in_block {
-            pg_conn.warnings.lock().push((
-                "WARNING",
-                "25P01",
-                "SET LOCAL can only be used in transaction blocks".to_string(),
-            ));
-            return;
+            return Ok(());
         }
         let mut state = pg_conn.session_state.lock();
         let gucs = &mut state.gucs;
+        // A foreign_keys SET is applied to a copy first: a change of the effective value to off
+        // while the transaction holds deferred violations is refused, by the effective value and
+        // not by the statement's form (SET, SET LOCAL, SET SESSION, inside an implicit block alike:
+        // C41-H1, review c39799c5d..9e24b455d MED 3), and nothing of the refused SET is kept. No
+        // other setting is copied (fk-guard review LOW 7).
+        if name == "foreign_keys" {
+            let (mut session, mut local) = (gucs.session.clone(), gucs.local.clone());
+            apply(&mut session, &mut local, set_stmt.is_local);
+            let was = gucs.effective().foreign_keys;
+            let now = local.foreign_keys.unwrap_or(session.foreign_keys);
+            if was && !now {
+                let pending = deferred_violations(&pg_conn.conn);
+                if pending > 0 {
+                    return Err(LimboError::ParseError(SqlErrorMessage::classified(
+                        SqlErrorKind::ObjectNotInPrerequisiteState,
+                        format!(
+                            "cannot turn foreign_keys off while the transaction holds {pending} \
+                             deferred foreign key violation{}",
+                            if pending == 1 { "" } else { "s" }
+                        ),
+                    )));
+                }
+            }
+        }
         if in_block && gucs.block_start.is_none() {
             gucs.block_start = Some(gucs.session.clone());
         }
@@ -1547,6 +1579,7 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
         let effective = gucs.effective();
         drop(state);
         pg_conn.publish(&effective);
+        Ok(())
     };
     if name == "search_path" {
         let path = set_stmt
@@ -1562,7 +1595,7 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
                 session.search_path.clone_from(&path);
                 local.search_path = None;
             }
-        });
+        })?;
         return noop_statement(&pg_conn.conn);
     }
     let value = set_stmt.values.first().ok_or_else(|| {
@@ -1636,7 +1669,7 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
                     session.foreign_keys = on;
                     local.foreign_keys = None;
                 }
-            });
+            })?;
             true
         }
         // These change answers PostgreSQL gives, so they act, or are refused, rather than being
@@ -1654,7 +1687,7 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
                     session.lock_timeout_ms = ms;
                     local.lock_timeout_ms = None;
                 }
-            });
+            })?;
             true
         }
         "client_min_messages" => {
@@ -1668,7 +1701,7 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
                     session.min_messages = rank;
                     local.min_messages = None;
                 }
-            });
+            })?;
             true
         }
         // The server stops a statement running past it (57014).
@@ -1683,7 +1716,7 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
                     session.statement_timeout_ms = ms;
                     local.statement_timeout_ms = None;
                 }
-            });
+            })?;
             true
         }
         "idle_in_transaction_session_timeout" | "transaction_timeout" => {
@@ -1704,8 +1737,12 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
             _ => return invalid(),
         },
         // PostgreSQL refuses a tablespace or an access method that does not exist (22023), and
-        // this server has none but the default ones.
-        "default_tablespace" => text.is_empty() || return invalid(),
+        // this server has none but the ones every cluster has: pg_default (the default, so a no-op)
+        // and pg_global, which PostgreSQL accepts as a SET (review c39799c5d..9e24b455d LOW 6,
+        // pg18-rev-c39-misc.out).
+        "default_tablespace" => {
+            matches!(lower.as_str(), "" | "pg_default" | "pg_global") || return invalid()
+        }
         "default_table_access_method" => lower == "heap" || return invalid(),
         "transaction_read_only" | "default_transaction_read_only" => match pg_bool(&text) {
             Some(false) => true,
@@ -1750,6 +1787,34 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
             if !parts.iter().all(|p| known(p)) {
                 return invalid();
             }
+            // check_datestyle's conflicts: two output styles, or two field orders, are 22023,
+            // before any style this server does not act on is refused (review c39799c5d..9e24b455d
+            // LOW 8: `ISO, SQL` and `MDY, DMY` were 0A000; pg18-rev-c39-misc.out).
+            let style = |p: &str| matches!(p, "iso" | "sql" | "postgres" | "german");
+            let order = |p: &str| {
+                matches!(p, "ymd" | "dmy" | "mdy" | "us" | "european")
+                    || p.starts_with("noneuro")
+                    || p.starts_with("euro")
+            };
+            let distinct = |f: &dyn Fn(&str) -> bool| {
+                let mut seen: Vec<&str> = parts.iter().copied().filter(|p| f(p)).collect();
+                // US and NonEuro are MDY; Euro and European are DMY.
+                for p in seen.iter_mut() {
+                    *p = match *p {
+                        "us" => "mdy",
+                        "european" => "dmy",
+                        q if q.starts_with("noneuro") => "mdy",
+                        q if q.starts_with("euro") => "dmy",
+                        q => q,
+                    };
+                }
+                seen.sort_unstable();
+                seen.dedup();
+                seen.len() <= 1
+            };
+            if !distinct(&style) || !distinct(&order) {
+                return invalid();
+            }
             parts.iter().all(|part| {
                 matches!(*part, "iso" | "mdy" | "us" | "default") || part.starts_with("noneuro")
             })
@@ -1764,13 +1829,36 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
                 lower.as_str(),
                 "utc" | "gmt" | "etc/utc" | "etc/gmt" | "z" | "zulu" | "uct" | "universal" | "0"
             );
-            // A zone PostgreSQL would know: a numeric offset or a name in the host's zone
-            // database, which PostgreSQL's own tz database mirrors. BLIND SPOT: a host whose zone
-            // database lacks a name PostgreSQL knows answers 22023 for it, not 0A000.
-            let numeric = lower.trim_start_matches(['+', '-']).parse::<f64>().is_ok();
-            let zoned = !text.contains("..")
-                && std::path::Path::new("/usr/share/zoneinfo").join(&text).is_file();
-            if !(utc || numeric || zoned) {
+            // A zone PostgreSQL would know, as its check_timezone reads it (review
+            // c39799c5d..9e24b455d LOW 7, pg18-rev-c39-tzforms.out): an INTERVAL; a number of
+            // hours read whole as strtod reads it (`--5` and `inf` refused, `nan` and `5.5`
+            // accepted); a name in the host's zone database, matched without case as PostgreSQL
+            // matches it; or a POSIX TZ spec (`UTC+3`, `EST5EDT,M3.2.0,M11.1.0`, `+05:30`). A valid
+            // zone other than UTC is refused 0A000 below, as this server runs in UTC alone.
+            // BLIND SPOTS: a host zone database lacking a name PostgreSQL knows answers 22023 for
+            // it; PostgreSQL's range bound for a numeric offset is not recorded, so any finite
+            // number or NaN is valid here.
+            // UNVERIFIED beyond the recorded rows (review wire-rework C, finding (1)): the
+            // interval, strtod and tzcode grammar below follow PostgreSQL's check_timezone and
+            // tzparse as read, until one strict PG 18.6 recording of every case (LOUD-OWED).
+            if let Some(body) = lower.strip_prefix("interval") {
+                match timezone_interval(body) {
+                    TzInterval::Offset => return unsupported("this server answers only by its own setting of it"),
+                    TzInterval::NotAllowed(unit) => {
+                        return refused(format!("invalid interval value for time zone: {unit} not allowed"))
+                    }
+                    TzInterval::Malformed => {
+                        return Err(LimboError::ParseError(SqlErrorMessage::classified(
+                            SqlErrorKind::InvalidDatetimeFormat,
+                            format!("invalid input syntax for type interval: \"{text}\""),
+                        )))
+                    }
+                    TzInterval::NotOne => {}
+                }
+            }
+            let numeric = strtod_whole(&lower).is_some_and(|h| h.is_nan() || h.abs() < 168.0);
+            let valid = utc || numeric || zone_file(&text) || posix_tz(&text);
+            if !valid {
                 return invalid();
             }
             utc
@@ -1818,6 +1906,263 @@ fn pg_parameter_name(name: &str) -> &str {
 
 /// PostgreSQL's encoding names and aliases, letters and digits only (pg_wchar.c's table, as
 /// client_encoding accepts them): any other is 22023.
+/// Whether `name` is a zone in the host's zone database: only name components of letters, digits,
+/// `_`, `-` and `+` (no leading `/`, no `.` or `..`, nothing empty), joined under
+/// /usr/share/zoneinfo, naming a TZif file, and not `posixrules`, which PostgreSQL refuses by name.
+/// A value that is a host path never reaches the filesystem, so no answer says whether a host file
+/// exists (review c39799c5d..9e24b455d MED 2: `/etc/passwd` replaced the base in `join` and
+/// answered 0A000, `/etc/nosuch` 22023), and a zone-directory file that is not a zone
+/// (`zone.tab`, `tzdata.zi`) is not one; PG 18.6 answers 22023 for all of them
+/// (pg18-rev-c39-tzpath.out).
+fn zone_file(name: &str) -> bool {
+    use std::io::Read;
+    let named = name.len() <= 255
+        && name.split('/').all(|c| {
+            !c.is_empty()
+                && c.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'+'))
+        });
+    if !named || name.eq_ignore_ascii_case("posixrules") {
+        return false;
+    }
+    // Each component matched without case, as PostgreSQL matches zone names (a case-sensitive
+    // host filesystem found `America/New_York` and not `america/new_york`).
+    let mut path = std::path::PathBuf::from("/usr/share/zoneinfo");
+    for part in name.split('/') {
+        let exact = path.join(part);
+        if exact.exists() {
+            path = exact;
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&path) else {
+            return false;
+        };
+        let Some(found) = entries
+            .flatten()
+            .find(|e| e.file_name().to_str().is_some_and(|f| f.eq_ignore_ascii_case(part)))
+        else {
+            return false;
+        };
+        path = found.path();
+    }
+    let mut magic = [0u8; 4];
+    std::fs::File::open(&path)
+        .and_then(|mut f| f.read_exact(&mut magic))
+        .is_ok()
+        && &magic == b"TZif"
+}
+
+/// A TimeZone value's `INTERVAL '...' [qualifier]` form, as check_timezone reads it: an offset
+/// with no months or days, or refused.
+enum TzInterval {
+    /// Not the quoted-literal form (`interval` alone, or followed by anything but a quote): read
+    /// as a zone name, which it is not.
+    NotOne,
+    /// A valid offset.
+    Offset,
+    /// Months or days given: 22023.
+    NotAllowed(&'static str),
+    /// A body interval_in refuses: 22007.
+    Malformed,
+}
+
+/// `body` is what follows `interval` in a lowercased TimeZone value: whitespace, a quoted
+/// interval literal, and an optional qualifier (`hour to minute`). The literal is `[+-]h[:m[:s]]`
+/// or a list of `<number> <unit>`; a year, month or day unit with a non-zero number is not
+/// allowed. BLIND SPOT: interval_in's full grammar (ISO 8601 `PT5H`, `@` forms, fractional
+/// units) is not read; such a body is Malformed here.
+fn timezone_interval(body: &str) -> TzInterval {
+    let rest = body.trim_start();
+    let Some(quoted) = rest.strip_prefix('\'') else {
+        return TzInterval::NotOne;
+    };
+    let Some(end) = quoted.find('\'') else {
+        return TzInterval::Malformed;
+    };
+    let (literal, tail) = (quoted[..end].trim(), quoted[end + 1..].trim());
+    let qualifier_ok = tail.is_empty()
+        || tail.split_whitespace().all(|w| {
+            matches!(w, "year" | "month" | "day" | "hour" | "minute" | "second" | "to")
+        });
+    if !qualifier_ok || literal.is_empty() {
+        return TzInterval::Malformed;
+    }
+    let clock = |t: &str| {
+        let t = t.trim_start_matches(['+', '-']);
+        let parts: Vec<&str> = t.split(':').collect();
+        parts.len() <= 3 && parts.iter().all(|p| !p.is_empty() && p.parse::<f64>().is_ok())
+    };
+    if clock(literal) {
+        return TzInterval::Offset;
+    }
+    let words: Vec<&str> = literal.split_whitespace().collect();
+    if words.len() % 2 != 0 {
+        return TzInterval::Malformed;
+    }
+    for pair in words.chunks(2) {
+        let Ok(n) = pair[0].parse::<f64>() else {
+            return TzInterval::Malformed;
+        };
+        let unit = pair[1].trim_end_matches('s');
+        match unit {
+            "hour" | "minute" | "min" | "second" | "sec" => {}
+            "day" if n != 0.0 => return TzInterval::NotAllowed("days"),
+            "month" | "mon" | "year" if n != 0.0 => return TzInterval::NotAllowed("months"),
+            "day" | "month" | "mon" | "year" => {}
+            _ => return TzInterval::Malformed,
+        }
+    }
+    TzInterval::Offset
+}
+
+/// `text` read whole as C's strtod reads a number (leading whitespace skipped; decimal, `0x` hex,
+/// `inf`/`infinity`, `nan` and `nan(...)`), or None when anything is left after it.
+fn strtod_whole(text: &str) -> Option<f64> {
+    let t = text.trim_start();
+    let (sign, body) = match t.as_bytes().first() {
+        Some(b'-') => (-1.0, &t[1..]),
+        Some(b'+') => (1.0, &t[1..]),
+        _ => (1.0, t),
+    };
+    if body.starts_with(['-', '+']) {
+        return None;
+    }
+    let lower = body.to_ascii_lowercase();
+    if let Some(hex) = lower.strip_prefix("0x") {
+        let (int, frac) = hex.split_once('.').unwrap_or((hex, ""));
+        if (int.is_empty() && frac.is_empty())
+            || !int.bytes().chain(frac.bytes()).all(|c| c.is_ascii_hexdigit())
+        {
+            return None;
+        }
+        let mut v = 0.0f64;
+        for c in int.chars() {
+            v = v * 16.0 + c.to_digit(16)? as f64;
+        }
+        let mut scale = 1.0 / 16.0;
+        for c in frac.chars() {
+            v += c.to_digit(16)? as f64 * scale;
+            scale /= 16.0;
+        }
+        return Some(sign * v);
+    }
+    if lower == "nan" || (lower.starts_with("nan(") && lower.ends_with(')')
+        && lower[4..lower.len() - 1].bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_'))
+    {
+        return Some(f64::NAN);
+    }
+    if lower == "inf" || lower == "infinity" {
+        return Some(sign * f64::INFINITY);
+    }
+    // Rust's parse also takes `infinity`/`nan` spellings and no other trailing text.
+    let ok = !body.is_empty()
+        && body.bytes().all(|c| c.is_ascii_digit() || matches!(c, b'.' | b'e' | b'E' | b'+' | b'-'));
+    ok.then(|| body.parse::<f64>().ok()).flatten().map(|v| sign * v)
+}
+
+/// Whether `spec` is a POSIX TZ string as tzcode's tzparse reads one (UNVERIFIED beyond the
+/// recorded rows, review wire-rework C finding (1)): a standard name (`<...>`, non-empty, or
+/// getzname's run of characters other than digits, `,`, `-` and `+`), an offset
+/// `[+-]h[:m[:s]]` with hours at most 167 and minutes and seconds at most 59 (getsecs; any digit
+/// count), then optionally a daylight name, its own offset, and two rules after `,` or `;`, each
+/// `Jn` (1-365), `n` (0-365) or `Mm.w.d` (1-12, 1-5, 0-6) with an optional `/offset`. A bare
+/// offset alone (`+05:30`) is a whole spec, as PG 18.6 answered it (pg18-rev-c39-tzforms.out).
+fn posix_tz(spec: &str) -> bool {
+    let b = spec.as_bytes();
+    let name = |i: &mut usize| -> bool {
+        if b.get(*i) == Some(&b'<') {
+            let Some(end) = spec[*i + 1..].find('>') else { return false };
+            if end == 0 {
+                return false;
+            }
+            *i += end + 2;
+            return true;
+        }
+        let start = *i;
+        while b
+            .get(*i)
+            .is_some_and(|c| !c.is_ascii_digit() && !matches!(c, b',' | b'-' | b'+' | b';'))
+        {
+            *i += 1;
+        }
+        *i > start
+    };
+    // getsecs: h[:m[:s]], hours up to 167, minutes and seconds up to 59.
+    let secs = |i: &mut usize| -> bool {
+        let limits = [167u32, 59, 59];
+        for (g, max) in limits.iter().enumerate() {
+            let start = *i;
+            let mut v: u64 = 0;
+            while let Some(c) = b.get(*i).filter(|c| c.is_ascii_digit()) {
+                v = v.saturating_mul(10).saturating_add(u64::from(c - b'0'));
+                *i += 1;
+            }
+            if *i == start || v > u64::from(*max) {
+                return false;
+            }
+            if g < 2 && b.get(*i) == Some(&b':') {
+                *i += 1;
+                continue;
+            }
+            return true;
+        }
+        true
+    };
+    let offset = |i: &mut usize| -> bool {
+        if matches!(b.get(*i), Some(b'+' | b'-')) {
+            *i += 1;
+        }
+        secs(i)
+    };
+    let mut i = 0;
+    let had_name = name(&mut i);
+    if !had_name {
+        i = 0;
+    }
+    if !offset(&mut i) {
+        return false;
+    }
+    if i == b.len() {
+        return true;
+    }
+    if !had_name || !name(&mut i) {
+        return false;
+    }
+    if i < b.len() && !matches!(b[i], b',' | b';') && !offset(&mut i) {
+        return false;
+    }
+    if i == b.len() {
+        return true;
+    }
+    let num = |t: &str, lo: u32, hi: u32| t.parse::<u32>().is_ok_and(|v| (lo..=hi).contains(&v))
+        && t.bytes().all(|c| c.is_ascii_digit());
+    let rule = |r: &str| -> bool {
+        let (date, time) = r.split_once('/').unwrap_or((r, "0"));
+        let date_ok = if let Some(m) = date.strip_prefix('M') {
+            let f: Vec<&str> = m.split('.').collect();
+            f.len() == 3 && num(f[0], 1, 12) && num(f[1], 1, 5) && num(f[2], 0, 6)
+        } else if let Some(j) = date.strip_prefix('J') {
+            num(j, 1, 365)
+        } else {
+            num(date, 0, 365)
+        };
+        let tb = time.as_bytes();
+        let mut k = 0;
+        if matches!(tb.first(), Some(b'+' | b'-')) {
+            k = 1;
+        }
+        let groups: Vec<&str> = time[k..].split(':').collect();
+        let time_ok = groups.len() <= 3
+            && groups.iter().enumerate().all(|(g, x)| num(x, 0, if g == 0 { 167 } else { 59 }));
+        date_ok && time_ok
+    };
+    if !matches!(b[i], b',' | b';') {
+        return false;
+    }
+    let rules: Vec<&str> = spec[i + 1..].split([',', ';']).collect();
+    rules.len() == 2 && rules.iter().all(|r| rule(r))
+}
+
 const PG_ENCODINGS: &[&str] = &[
     "sqlascii", "utf8", "unicode", "eucjp", "euccn", "euckr", "euctw", "eucjis2004",
     "muleinternal", "latin1", "latin2", "latin3", "latin4", "latin5", "latin6", "latin7",
@@ -1826,8 +2171,7 @@ const PG_ENCODINGS: &[&str] = &[
     "win1254", "win1255", "win1257", "koi8u", "sjis", "big5", "gbk", "uhc", "gb18030", "johab",
     "shiftjis2004", "alt", "win", "mskanji", "shiftjis", "tcvn", "tcvn5712", "vscii", "abc",
     "iso885910", "iso885913", "iso885914", "iso885915", "iso885916", "iso88591", "iso88592",
-    "iso88593", "iso88594", "iso88599", "cp1250", "cp1251", "cp1252", "cp1253", "cp1254",
-    "cp1255", "cp1256", "cp1257", "cp1258", "cp866", "cp874", "cp932", "cp936", "cp949", "cp950",
+    "iso88593", "iso88594", "iso88599", "win932", "win936", "win949", "win950",
     "windows1250", "windows1251", "windows1252", "windows1253", "windows1254", "windows1255",
     "windows1256", "windows1257", "windows1258", "windows866", "windows874", "windows932",
     "windows936", "windows949", "windows950",
@@ -1974,7 +2318,7 @@ fn handle_pg_drop_schema(pg_conn: &Arc<PgConnectionInner>, stmt: &PgDropSchemaSt
 fn skipping_notice(pg_conn: &Arc<PgConnectionInner>, kind: &str, name: &str) {
     pg_conn.warnings.lock().push((
         "NOTICE",
-        "00000",
+        SqlErrorKind::SuccessfulCompletion,
         format!("{kind} \"{name}\" does not exist, skipping"),
     ));
 }
@@ -2721,6 +3065,26 @@ fn aside_name_for(table: &str, n: usize) -> String {
 #[cfg(feature = "failpoints")]
 thread_local! {
     static UNDO_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static PRETEND_DEFERRED: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+}
+
+/// Test failpoint (feature `failpoints`, never in a credited build): every read of a connection's
+/// pending deferred foreign-key violations on this thread answers at least `n` until it is reset
+/// to 0, so the publish guard, which no client sequence reaches, can be shown to hold (fk-guard
+/// review LOW 4).
+#[cfg(feature = "failpoints")]
+pub fn pretend_deferred_violations(n: isize) {
+    PRETEND_DEFERRED.with(|f| f.set(n));
+}
+
+/// The connection's pending deferred foreign-key violations (the engine's count), through the
+/// `pretend_deferred_violations` failpoint in a failpoints build.
+#[inline]
+fn deferred_violations(conn: &Connection) -> isize {
+    let n = conn.deferred_foreign_key_violations();
+    #[cfg(feature = "failpoints")]
+    let n = n.max(PRETEND_DEFERRED.with(std::cell::Cell::get));
+    n
 }
 
 /// Test failpoint (feature `failpoints`, never in a credited build): the next undo of a transaction
@@ -3042,7 +3406,7 @@ fn folds_at_plan(parse: &turso_pg_parser::pg_query::ParseResult) -> bool {
     select.from_clause.is_empty() && select.op() == SetOperation::SetopNone
 }
 
-fn is_delete_using(sql: &str, parse: &turso_pg_parser::pg_query::ParseResult) -> bool {
+pub(crate) fn is_delete_using(sql: &str, parse: &turso_pg_parser::pg_query::ParseResult) -> bool {
     use turso_pg_parser::pg_query::NodeRef;
     if !sql
         .as_bytes()
@@ -3060,7 +3424,7 @@ fn is_delete_using(sql: &str, parse: &turso_pg_parser::pg_query::ParseResult) ->
 
 /// Whether a FROM item's alias carries a column list (`t AS a (x, y)`), which the translator reads
 /// the table's columns for.
-fn has_alias_column_list(parse: &turso_pg_parser::pg_query::ParseResult) -> bool {
+pub(crate) fn has_alias_column_list(parse: &turso_pg_parser::pg_query::ParseResult) -> bool {
     use turso_pg_parser::pg_query::NodeRef;
     parse.protobuf.nodes().iter().any(|(n, ..)| {
         matches!(n, NodeRef::RangeVar(rv) if rv.alias.as_ref().is_some_and(|a| !a.colnames.is_empty()))
@@ -3068,7 +3432,7 @@ fn has_alias_column_list(parse: &turso_pg_parser::pg_query::ParseResult) -> bool
 }
 
 /// Whether the statement holds an INSERT with no column list whose VALUES lists hold DEFAULT.
-fn is_positional_insert_default(sql: &str, parse: &turso_pg_parser::pg_query::ParseResult) -> bool {
+pub(crate) fn is_positional_insert_default(sql: &str, parse: &turso_pg_parser::pg_query::ParseResult) -> bool {
     sql.as_bytes()
         .windows(7)
         .any(|w| w.eq_ignore_ascii_case(b"default"))
