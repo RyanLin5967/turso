@@ -3266,8 +3266,9 @@ fn an_armed_hold_before_any_window_allocates_nothing_under_the_mutex() {
 /// count (`{killer}_own` sums above zero), so the mutant has something to hide there; under the
 /// mutant, every cell compared a window and has a mismatch on its killer key. By the mutation
 /// convention a mutant run FAILS when the mutant is killed ("KILLED in every cell") and PASSES,
-/// printing "SURVIVED in ...", when it survives, so a harness that judges by exit status never
-/// counts a survivor as killed. An empty cell list fails either way.
+/// printing "SURVIVED ..." with the reason, when it survives (`parity_mutant_verdict`: a run that
+/// compared nothing or read no cell survives too), so a harness that judges by exit status never
+/// counts a survivor as killed. Unmutated, an empty cell list fails.
 #[test]
 fn every_budget_windows_syncs_equal_the_process_syncs_in_its_child() {
     if in_child() {
@@ -3339,7 +3340,8 @@ fn every_budget_windows_syncs_equal_the_process_syncs_in_its_child() {
     if mutant {
         match parity_mutant_verdict(cells_read, compared, &survived, &failures) {
             Ok(survivors) => {
-                eprintln!("{survivors}");
+                // Straight to stderr: a passing test's eprintln! is captured by libtest and lost.
+                let _ = std::io::Write::write_all(&mut std::io::stderr(), format!("{survivors}\n").as_bytes());
                 return;
             }
             Err(killed) => panic!("{killed}"),
@@ -3354,14 +3356,16 @@ fn every_budget_windows_syncs_equal_the_process_syncs_in_its_child() {
 /// mutant SURVIVED (the run passes, the message names the survivors); `Err`, it was KILLED (the run
 /// fails). `survived` lists the cells with no window compared or no mismatch on their killer key.
 fn parity_mutant_verdict(cells_read: usize, compared: usize, survived: &str, failures: &str) -> Result<String, String> {
+    // Counters review 5 LOW-E: survival is decided first; a missing premise is a reason to survive,
+    // never a kill. (With cells read and nothing compared, every cell is already in `survived`.)
     if cells_read == 0 {
-        return Err("premise: no cell was read".to_string());
-    }
-    if compared == 0 {
-        return Err("premise: under the mutant no window carried both counts: nothing was killed".to_string());
+        return Ok("drop_journal_sync_count SURVIVED: no cell was read, so nothing could kill it".to_string());
     }
     if !survived.is_empty() {
-        return Ok(format!("drop_journal_sync_count SURVIVED in:\n{survived}"));
+        return Ok(format!("drop_journal_sync_count SURVIVED in ({compared} windows compared):\n{survived}"));
+    }
+    if compared == 0 {
+        return Ok("drop_journal_sync_count SURVIVED: no window carried both counts, so nothing could kill it".to_string());
     }
     Err(format!("drop_journal_sync_count KILLED in every cell ({cells_read} cells, {compared} compared):\n{failures}"))
 }
