@@ -555,8 +555,9 @@ pub(crate) fn store_unlocked() {
 /// A catalog statement ran on this thread (`catalog::Stmt::{rows, each_row, exec}`; `write` for
 /// `exec`), touching `rows` rows (read, or 1 written), on ANY of the store's catalog connections —
 /// the store's own, the checkpoint writer's, the name filter's reader — unlike the catalog's own
-/// counters, which see one connection each. BLIND SPOT: transaction control and pragmas
-/// (`conn.execute("BEGIN")`, `wal_checkpoint`) are not statements of `Stmt` and are not counted.
+/// counters, which see one connection each. BLIND SPOT: transaction control and pragmas run through
+/// `conn.execute` (`wal_checkpoint`, a write transaction's BEGIN) are not statements of `Stmt` and
+/// are not counted; the fuzzy checkpoint's read snapshot BEGIN and COMMIT are, since 177f007c8.
 pub(crate) fn catalog_statement(write: bool, rows: u64) {
     CAT_STMTS.fetch_add(1, Relaxed);
     CAT_ROWS.fetch_add(rows, Relaxed);
@@ -983,6 +984,16 @@ pub(crate) fn spinning<R>(f: impl FnOnce() -> R) -> R {
 /// This thread's store-mutex acquisitions so far (exact per thread however many others run).
 pub(crate) fn thread_locks() -> u64 {
     T_LOCKS.with(|c| c.get())
+}
+
+/// Catalog statements this thread ran, on any catalog connection (`catalog_statement`).
+pub(crate) fn thread_cat_stmts() -> u64 {
+    T_CAT_STMTS.with(|c| c.get())
+}
+
+/// This thread's `(frees, bytes freed)`, exact per thread.
+pub(crate) fn thread_frees() -> (u64, u64) {
+    (T_FREES.with(|c| c.get()), T_FREE_BYTES.with(|c| c.get()))
 }
 
 /// This thread's `(allocations, bytes, allocations under a store mutex, bytes under one)`: exact

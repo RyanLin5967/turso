@@ -2749,6 +2749,747 @@ fn a_capture_neither_waits_for_nor_frees_a_release_in_the_air() {
     }
 }
 
+/// Review REVIEW-claude-engine-L2d M1 (DECISIONS 07c88bb280): every operation that owes a fuzzy
+/// checkpoint gets it started. Since 969e7a370 `maybe_compact` only owes the start, and only the
+/// paths that called `start_owed_flight` sent it; an expiry pass (`expire_branches`, `set_lease`,
+/// `open_conn`, the open's expiry, an erroring create) owed one that never started, so a workload of
+/// leases and expiries grew the log without bound. Here 1,000 leased branches expire in one
+/// `expire_branches`, whose Releases cross the 8 KiB threshold: a checkpoint must start after it,
+/// with no other operation. Mutant `flight_start_inline` (as before 969e7a370) is green too.
+#[test]
+fn an_expiry_that_crosses_the_threshold_starts_a_checkpoint() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(
+        &dir.path().join("expiry-owes.db"),
+        opts(true, SyncClass::Fsync).with_branch_checkpoint(super::BranchCheckpoint::Fuzzy),
+    );
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let _t = Threshold::set(8 << 10);
+    let mut held = Vec::new();
+    for _ in 0..1000 {
+        let b = trunk.fork_branch().unwrap();
+        b.lease(std::time::Duration::from_secs(60)).unwrap();
+        held.push(b);
+    }
+    db.branch_checkpoint_wait();
+    let started = db.branch_checkpoint_counters()[1];
+    db.branch_lease_clock_advance(std::time::Duration::from_secs(3600));
+    let expired = db.expire_branches().unwrap();
+    assert!(expired.reaped.len() >= 1000, "premise: the expiry reaped {} of 1,000 leased branches", expired.reaped.len());
+    let t = std::time::Instant::now();
+    while db.branch_checkpoint_counters()[1] == started && t.elapsed() < std::time::Duration::from_secs(10) {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    db.branch_checkpoint_wait();
+    assert!(
+        db.branch_checkpoint_counters()[1] > started,
+        "CLAIM: an expiry whose Releases crossed the threshold started no checkpoint ({started} started before it, as many after)"
+    );
+    drop(held);
+}
+
+/// Review REVIEW-claude-engine-M1 MED-1 (lead order after c1809b546): no checkpoint worker
+/// exists after a store closes. A thread that outlives the store's close with its own handle on
+/// the store mutex (the name filter's and the confirmation writer's do) sends a start it owed;
+/// held between the starter's `closing` check and its dispatch while the store closes, at
+/// c1809b546 it then found the worker slot empty and started a NEW worker, unjoined, holding the
+/// store's files after the close. Here the send must hand no job out.
+#[test]
+fn a_start_sent_after_the_store_closed_starts_no_worker() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(
+        &dir.path().join("closed-starter.db"),
+        opts(true, SyncClass::Fsync).with_branch_checkpoint(super::BranchCheckpoint::Fuzzy),
+    );
+    let probe = db.branches.starter_probe();
+    probe.hold();
+    let sender = {
+        let probe = probe.clone();
+        std::thread::spawn(move || probe.owe())
+    };
+    let t = std::time::Instant::now();
+    while !probe.arrived() && t.elapsed() < std::time::Duration::from_secs(10) {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(probe.arrived(), "premise: the owed start reached the starter's hold");
+    let before = probe.handed_out();
+    drop(db);
+    assert!(probe.closed(), "premise: the store closed while the start was held");
+    probe.release();
+    sender.join().unwrap();
+    assert_eq!(
+        probe.handed_out(),
+        before,
+        "CLAIM: a start sent after the store closed was handed to a checkpoint worker"
+    );
+}
+
+/// Review REVIEW-claude-engine-M1 LOW-2: a hold that panicked starts no checkpoint while its
+/// stack unwinds (it would capture a half-changed store); the start it owed stays owed, and the
+/// next hold's unlock sends it. At c1809b546 the unwinding guard sent it.
+#[test]
+fn a_hold_that_panicked_sends_its_owed_start_only_at_the_next_hold() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(
+        &dir.path().join("panicked-hold.db"),
+        opts(true, SyncClass::Fsync).with_branch_checkpoint(super::BranchCheckpoint::Fuzzy),
+    );
+    let probe = db.branches.starter_probe();
+    let before = probe.handed_out();
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| probe.owe_then_panic()));
+    assert!(unwound.is_err(), "premise: the hold panicked");
+    assert_eq!(
+        probe.handed_out(),
+        before,
+        "CLAIM: a hold that panicked handed its owed start to the checkpoint worker while unwinding"
+    );
+    assert!(probe.owed(), "CLAIM: the start a panicked hold owed was dropped, not kept for the next hold");
+    probe.touch();
+    assert_eq!(probe.handed_out(), before + 1, "CLAIM: the next hold did not send the start the panicked one owed");
+    db.branch_checkpoint_wait();
+}
+
+/// Review REVIEW-claude-engine-M1 LOW-3: the lease floor a fuzzy checkpoint's writer reads after
+/// its commit (177f007c8, off the install's hold) is the catalog's at the install, i.e. nothing
+/// wrote the catalog between them. Checked at every install under the capture check
+/// (`CAPTURE_VERIFY_FORCED`), with leases in flight: branches leased before the checkpoint and
+/// one leased while it is held before its rows. Mutant `lease_floor_after_stale`.
+#[test]
+fn a_fuzzy_checkpoint_s_lease_floor_is_the_catalog_s_at_its_install() {
+    use std::sync::atomic::Ordering::{Relaxed, Release};
+    let _s = serial();
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            super::store::CAPTURE_VERIFY_FORCED.store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+    let _r = Reset;
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(
+        &dir.path().join("lease-floor.db"),
+        opts(true, SyncClass::Fsync).with_branch_checkpoint(super::BranchCheckpoint::Fuzzy),
+    );
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let mut held = Vec::new();
+    for i in 0..8u64 {
+        let b = trunk.fork_branch().unwrap();
+        b.lease(std::time::Duration::from_secs(60 + i)).unwrap();
+        held.push(b);
+    }
+    super::store::CAPTURE_VERIFY_FAILURES.lock().unwrap().clear();
+    super::store::CAPTURE_VERIFY_FORCED.store(true, Release);
+    let verified0 = super::store::LEASE_FLOORS_VERIFIED.load(Relaxed);
+    assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: a fuzzy checkpoint started");
+    db.branch_checkpoint_wait();
+    db.branch_checkpoint_hold(super::store::HOLD_BEFORE_ROWS);
+    let late = trunk.fork_branch().unwrap();
+    assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: a second fuzzy checkpoint started");
+    let t = std::time::Instant::now();
+    while db.branch_checkpoint_held() != super::store::HOLD_BEFORE_ROWS | super::store::HOLD_ARRIVED {
+        assert!(t.elapsed() < std::time::Duration::from_secs(10), "premise: the writer never reached its rows");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    late.lease(std::time::Duration::from_secs(30)).unwrap();
+    held[0].lease(std::time::Duration::from_secs(3600)).unwrap();
+    db.branch_checkpoint_hold(0);
+    db.branch_checkpoint_wait();
+    super::store::CAPTURE_VERIFY_FORCED.store(false, Release);
+    let verified = super::store::LEASE_FLOORS_VERIFIED.load(Relaxed) - verified0;
+    assert!(verified >= 2, "premise: the capture check compared {verified} installs' lease floors, not both");
+    let failures = super::store::CAPTURE_VERIFY_FAILURES.lock().unwrap().clone();
+    assert!(failures.is_empty(), "CLAIM: a fuzzy checkpoint's writer-read lease floor was not the catalog's at its install: {failures:?}");
+    drop(late);
+    drop(held);
+}
+
+/// Review REVIEW-claude-engine-m1-2 LOW-B: the lease-floor check exercised in the window it guards,
+/// between the writer's commit and the install (`HOLD_AFTER_COMMIT`), where real operations run:
+/// a lease renewed, a named create, and an expiry that reaps, in each of two checkpoints' windows.
+/// The check must compare both installs (`LEASE_FLOORS_VERIFIED` +2) and find no difference.
+/// Mutant `lease_floor_after_stale` (a floor one past the catalog's) must still fail it.
+#[test]
+fn the_lease_floor_check_holds_with_operations_between_the_commit_and_the_install() {
+    use std::sync::atomic::Ordering::{Relaxed, Release};
+    let _s = serial();
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            super::store::CAPTURE_VERIFY_FORCED.store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+    let _r = Reset;
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(
+        &dir.path().join("lease-floor-window.db"),
+        opts(true, SyncClass::Fsync).with_branch_checkpoint(super::BranchCheckpoint::Fuzzy),
+    );
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let keep = trunk.fork_branch().unwrap();
+    keep.lease(std::time::Duration::from_secs(36_000)).unwrap();
+    let mut short = Vec::new();
+    for _ in 0..8 {
+        let b = trunk.fork_branch().unwrap();
+        b.lease(std::time::Duration::from_secs(60)).unwrap();
+        short.push(b.into_id());
+    }
+    super::store::CAPTURE_VERIFY_FAILURES.lock().unwrap().clear();
+    super::store::CAPTURE_VERIFY_FORCED.store(true, Release);
+    let verified0 = super::store::LEASE_FLOORS_VERIFIED.load(Relaxed);
+    for round in 0..2u32 {
+        db.branch_checkpoint_hold(super::store::HOLD_AFTER_COMMIT);
+        assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: fuzzy checkpoint {round} started");
+        let t = std::time::Instant::now();
+        while db.branch_checkpoint_held() != super::store::HOLD_AFTER_COMMIT | super::store::HOLD_ARRIVED {
+            assert!(t.elapsed() < std::time::Duration::from_secs(10), "premise: checkpoint {round}'s writer never committed");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        keep.lease(std::time::Duration::from_secs(36_000 + u64::from(round))).unwrap();
+        trunk.create_branch(&format!("in-window-{round}")).unwrap();
+        db.branch_lease_clock_advance(std::time::Duration::from_secs(120));
+        let reaped = db.expire_branches().unwrap().reaped.len();
+        if round == 0 {
+            assert!(reaped >= 8, "premise: the expiry in the window reaped {reaped} of the 8 short leases");
+        }
+        db.branch_checkpoint_hold(0);
+        db.branch_checkpoint_wait();
+    }
+    super::store::CAPTURE_VERIFY_FORCED.store(false, Release);
+    let verified = super::store::LEASE_FLOORS_VERIFIED.load(Relaxed) - verified0;
+    let failures = super::store::CAPTURE_VERIFY_FAILURES.lock().unwrap().clone();
+    assert!(verified >= 2, "premise: the check compared {verified} installs' lease floors, not 2");
+    assert!(failures.is_empty(), "CLAIM: the writer-read lease floor was not the catalog's at the install, with operations in the window: {failures:?}");
+    let _ = short;
+}
+
+/// Review REVIEW-claude-engine-m1-2 MED-A (DECISIONS bda6df71dc), as a class: under the whole-run
+/// capture check (`FE_CAPTURE_VERIFY`) every check that fails records the failure and ABORTS the
+/// process, as the frozen-rows check does, so no later test passes over it. At ee1d54b6c the
+/// lease-floor check panicked instead, inside the install under the store mutex, on the checkpoint
+/// worker, whose `catch_unwind` swallowed it (and left the install half done). Here a child of this
+/// test binary runs the lease-floor test with the check on and mutant `lease_floor_after_stale`
+/// (a mismatch at every install): it must die of SIGABRT, not exit with a test failure.
+#[cfg(unix)]
+#[test]
+fn a_failed_capture_check_under_the_whole_run_switch_aborts_the_process() {
+    use std::os::unix::process::ExitStatusExt;
+    let _s = serial();
+    let exe = std::env::current_exe().unwrap();
+    // Review engine-rev-setter LOW-6: a deadline (generous: it costs nothing when the child aborts), so a child the half-done install hangs fails this
+    // test instead of hanging it.
+    let mut child = std::process::Command::new(exe)
+        .args([
+            "--exact",
+            "branch::fastest_tests::a_fuzzy_checkpoint_s_lease_floor_is_the_catalog_s_at_its_install",
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .env("FE_CAPTURE_VERIFY", "1")
+        .env("FE_MUTANT", "lease_floor_after_stale")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stderr_pipe = child.stderr.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        let mut s = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut stderr_pipe, &mut s);
+        s
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("CLAIM: the child hung (300 s) instead of aborting on the failed capture check");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let out = std::process::Output { status, stdout: Vec::new(), stderr: reader.join().unwrap() };
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("FE_CAPTURE_VERIFY: the lease floor"),
+        "premise: the child's lease-floor check never fired (status {:?}); stderr tail: {}",
+        out.status,
+        &stderr[stderr.len().saturating_sub(2000)..]
+    );
+    assert_eq!(
+        out.status.signal(),
+        Some(libc::SIGABRT),
+        "CLAIM: a failed capture check under FE_CAPTURE_VERIFY did not abort the process (status {:?})",
+        out.status
+    );
+}
+
+/// Lead ruling "cache-key and reprepare classes" (wire-rework review B-H2): a statement prepared
+/// with a search path is re-prepared, after a prepare-generation bump, under that search path, as
+/// PG re-analyses under the session's search_path; never under defaults. At 67353b158
+/// `Statement::reprepare` translated with `PrepareOptions::default()`, so an unqualified name then
+/// resolved to main: wrong rows for every connection with a search path. Two databases each hold
+/// `t` with a different row; `SELECT x FROM t` prepared with search path [s] reads s.t, then a real
+/// setting change bumps the generation and the next run must still read s.t.
+#[test]
+fn a_statement_reprepared_after_a_setting_change_keeps_its_search_path() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("search-path-main.db"), DatabaseOpts::new());
+    let c = db.connect().unwrap();
+    c.execute("CREATE TABLE t(x INTEGER)").unwrap();
+    c.execute("INSERT INTO t VALUES (1)").unwrap();
+    let other = dir.path().join("search-path-s.db");
+    c.execute(format!("ATTACH '{}' AS s", other.display())).unwrap();
+    c.execute("CREATE TABLE s.t(x INTEGER)").unwrap();
+    c.execute("INSERT INTO s.t VALUES (2)").unwrap();
+    let sql = "SELECT x FROM t";
+    let (cmd, _) = c.parse_sql(sql).unwrap();
+    let options = crate::connection::PrepareOptions { unqualified_database_search_path: Some(vec!["s".to_string()]) };
+    let mut stmt = c.prepare_translated_cmd_with_options(cmd.unwrap(), sql, &options).unwrap();
+    let read = |stmt: &mut crate::Statement| -> Vec<i64> {
+        let mut out = Vec::new();
+        loop {
+            match stmt.step().unwrap() {
+                crate::StepResult::Row => out.push(stmt.row().unwrap().get_value(0).as_int().expect("an integer x")),
+                crate::StepResult::IO | crate::StepResult::Yield => db.io.step().unwrap(),
+                crate::StepResult::Done => break,
+                other => panic!("premise: the SELECT runs to completion, not {other:?}"),
+            }
+        }
+        stmt.reset().unwrap();
+        out
+    };
+    assert_eq!(read(&mut stmt), vec![2], "premise: prepared with search path [s], the SELECT reads s.t");
+    let reprepares0 = stmt.metrics().reprepares;
+    let g0 = c.prepare_context_generation();
+    c.set_cache_size(c.get_cache_size() + 1);
+    assert_ne!(c.prepare_context_generation(), g0, "premise: the setting change bumped the prepare generation");
+    let after = read(&mut stmt);
+    assert!(stmt.metrics().reprepares > reprepares0, "premise: the statement was re-prepared after the bump");
+    assert_eq!(after, vec![2], "CLAIM: re-prepared after a setting change, the SELECT read {after:?}, not s.t's row: the search path was dropped");
+}
+
+/// Review engine-rev-setter LOW-2: the audit of every prepare-generation bump (49e10e02a's message
+/// said 37 and missed five) is pinned here, per file, so a new bump site fails this gate until it
+/// is audited (and the setter class above says whether it should be change-only). Counts calls of
+/// `bump_prepare_context_generation()` and the extensions' raw `prepare_context_generation)
+/// .fetch_add(`, outside comments and the function's own definition. Audited at 09e8b26b0:
+/// - connection.rs 37: the change-only setters (17: set_temp_store and the 16 of 49e10e02a and
+///   09e8b26b0); schema, attach,
+///   detach, rollback and collation events that are themselves changes; set_busy_handler, the
+///   encryption setters and the mvcc thresholds, unconditional (not comparable, or rare).
+/// - ext/mod.rs 4: extension registration (functions, vtabs), each a change.
+/// - mvcc/database/checkpoint_state_machine.rs 1: an unconditional schema reload, itself a change.
+/// - storage/pager.rs 1: rollback of a schema change. translate/pragma.rs 1: cache_spill, on a
+///   change. vdbe/execute.rs 1: savepoint schema restore. vdbe/mod.rs 1: an abandoned MVCC commit's
+///   schema removed.
+#[test]
+fn every_prepare_generation_bump_site_is_audited() {
+    const AUDITED: &[(&str, usize)] = &[
+        ("connection.rs", 37),
+        ("ext/mod.rs", 4),
+        ("mvcc/database/checkpoint_state_machine.rs", 1),
+        ("storage/pager.rs", 1),
+        ("translate/pragma.rs", 1),
+        ("vdbe/execute.rs", 1),
+        ("vdbe/mod.rs", 1),
+    ];
+    let core = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut found: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut dirs = vec![core.to_path_buf()];
+    while let Some(d) = dirs.pop() {
+        for e in std::fs::read_dir(&d).unwrap() {
+            let path = e.unwrap().path();
+            if path.is_dir() {
+                if path.file_name().is_some_and(|n| n != "target") {
+                    dirs.push(path);
+                }
+            } else if path.extension().is_some_and(|x| x == "rs") && !path.ends_with("branch/fastest_tests.rs") {
+                let text = std::fs::read_to_string(&path).unwrap();
+                let n: usize = text
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.starts_with("//") && !l.contains("fn bump_prepare_context_generation"))
+                    .map(|l| l.matches("bump_prepare_context_generation()").count() + l.matches("prepare_context_generation).fetch_add(").count())
+                    .sum();
+                if n > 0 {
+                    let rel = path.strip_prefix(core).unwrap().to_string_lossy().replace('\\', "/");
+                    found.insert(rel, n);
+                }
+            }
+        }
+    }
+    let audited: std::collections::BTreeMap<String, usize> = AUDITED.iter().map(|&(f, n)| (f.to_string(), n)).collect();
+    assert!(!found.is_empty(), "premise: the scan found no bump site: it is broken");
+    assert_eq!(found, audited, "CLAIM: the prepare-generation bump sites differ from the audited list: audit the new ones (and the setter class) and update AUDITED with each one's reason");
+}
+
+/// Review engine-rev-setter MED-1 (lead order), as a class: which setters must bump the prepare
+/// generation is DERIVED from what translation reads, not from a list of the bump's callers (an
+/// audit of callers cannot see a setter that never bumps). Every `Connection` setter `set_X` whose
+/// value translation reads (a call `.X()`, `.get_X()` or `.is_X()` anywhere under core/translate/)
+/// must bump in its body. At 19f7a7bfc set_check_constraints_ignored, set_dml_require_where,
+/// set_count_changes and set_sync_type never bumped, so a cached INSERT compiled with CHECK ignored
+/// kept skipping it after the setting was turned back on. Static: reads the source.
+#[test]
+fn every_setter_whose_value_translation_reads_bumps_the_prepare_generation() {
+    let core = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let conn = std::fs::read_to_string(core.join("connection.rs")).unwrap();
+    let mut translate = String::new();
+    let mut dirs = vec![core.join("translate")];
+    while let Some(d) = dirs.pop() {
+        for e in std::fs::read_dir(&d).unwrap() {
+            let path = e.unwrap().path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.extension().is_some_and(|x| x == "rs") {
+                translate.push_str(&std::fs::read_to_string(&path).unwrap());
+            }
+        }
+    }
+    let setter = regex::Regex::new(r"\n    pub(?:\(crate\))? fn set_(\w+)\(&self[^{]*\{").unwrap();
+    let mut checked = Vec::new();
+    let mut missing = Vec::new();
+    for m in setter.captures_iter(&conn) {
+        let name = m.get(1).unwrap().as_str();
+        let start = m.get(0).unwrap().end();
+        let (mut depth, mut end) = (1i32, start);
+        for (i, ch) in conn[start..].char_indices() {
+            depth += match ch {
+                '{' => 1,
+                '}' => -1,
+                _ => 0,
+            };
+            if depth == 0 {
+                end = start + i;
+                break;
+            }
+        }
+        let body = &conn[start..end];
+        let read = [name.to_string(), format!("get_{name}"), format!("is_{name}")]
+            .iter()
+            .any(|g| translate.contains(&format!(".{g}()")));
+        if read {
+            checked.push(name.to_string());
+            if !body.contains("bump_prepare_context_generation") {
+                missing.push(name.to_string());
+            }
+        }
+    }
+    assert!(checked.len() >= 10, "premise: only {} setters found read under translate/ ({checked:?}): the scan is broken", checked.len());
+    assert!(
+        missing.is_empty(),
+        "CLAIM: setters whose value translation reads never bump the prepare generation (cached programs keep the old value): {missing:?}"
+    );
+}
+
+/// Lead ruling DECISIONS 179e043b9e (wire-rev-fkguard MED 1), as a class: a setter whose side
+/// effect invalidates compiled programs bumps the prepare generation only on a CHANGE. The wire's
+/// publish sets foreign_keys at every transaction end, so an unconditional bump re-prepared every
+/// cached statement after every commit. Each setter given the value it holds must leave the
+/// generation alone, and (positive control) given another must move it.
+#[test]
+fn a_setter_given_the_value_it_holds_leaves_the_prepare_generation_alone() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("prepare-generation.db"), opts(true, SyncClass::Off));
+    let c = db.connect().unwrap();
+    let mut same_bumped = Vec::new();
+    let mut change_missed = Vec::new();
+    let mut check = |name: &'static str, same: &dyn Fn(), other: &dyn Fn(), back: &dyn Fn()| {
+        let g0 = c.prepare_context_generation();
+        same();
+        if c.prepare_context_generation() != g0 {
+            same_bumped.push(name);
+        }
+        let g1 = c.prepare_context_generation();
+        other();
+        if c.prepare_context_generation() == g1 {
+            change_missed.push(name);
+        }
+        back();
+    };
+    let v = c.foreign_keys_enabled();
+    check("set_foreign_keys_enabled", &|| c.set_foreign_keys_enabled(v), &|| c.set_foreign_keys_enabled(!v), &|| c.set_foreign_keys_enabled(v));
+    let v = c.row_image_apply();
+    check("set_row_image_apply", &|| c.set_row_image_apply(v), &|| c.set_row_image_apply(!v), &|| c.set_row_image_apply(v));
+    let v = c.get_cache_size();
+    check("set_cache_size", &|| c.set_cache_size(v), &|| c.set_cache_size(v + 1), &|| c.set_cache_size(v));
+    let v = c.get_query_only();
+    check("set_query_only", &|| c.set_query_only(v), &|| c.set_query_only(!v), &|| c.set_query_only(v));
+    let v = c.recipe_backfill();
+    check("set_recipe_backfill", &|| c.set_recipe_backfill(v), &|| c.set_recipe_backfill(!v), &|| c.set_recipe_backfill(v));
+    let v = c.get_dqs_dml();
+    check("set_dqs_dml", &|| c.set_dqs_dml(v), &|| c.set_dqs_dml(!v), &|| c.set_dqs_dml(v));
+    let v = c.get_full_column_names();
+    check("set_full_column_names", &|| c.set_full_column_names(v), &|| c.set_full_column_names(!v), &|| c.set_full_column_names(v));
+    let v = c.get_short_column_names();
+    check("set_short_column_names", &|| c.set_short_column_names(v), &|| c.set_short_column_names(!v), &|| c.set_short_column_names(v));
+    let v = c.get_sync_mode();
+    let w = if v == crate::SyncMode::Full { crate::SyncMode::Normal } else { crate::SyncMode::Full };
+    check("set_sync_mode", &|| c.set_sync_mode(v), &|| c.set_sync_mode(w), &|| c.set_sync_mode(v));
+    let v = c.get_data_sync_retry();
+    check("set_data_sync_retry", &|| c.set_data_sync_retry(v), &|| c.set_data_sync_retry(!v), &|| c.set_data_sync_retry(v));
+    // Review engine-rev-setter LOW-3: the two changed sites the red did not cover. The current CDC
+    // value is cloned on its own line: inline, its read guard would still be held when the setter
+    // takes the write lock.
+    let v = c.get_capture_data_changes_info().clone();
+    let w = crate::CaptureDataChangesInfo::parse("id", None).unwrap();
+    check(
+        "set_capture_data_changes_info",
+        &|| c.set_capture_data_changes_info(v.clone()),
+        &|| c.set_capture_data_changes_info(w.clone()),
+        &|| c.set_capture_data_changes_info(v.clone()),
+    );
+    let v = c.get_pager().get_spill_enabled();
+    let pragma = |on: bool| c.execute(format!("PRAGMA cache_spill = {}", if on { 1 } else { 0 })).unwrap();
+    check("PRAGMA cache_spill", &|| pragma(v), &|| pragma(!v), &|| pragma(v));
+    let v = c.get_busy_timeout();
+    let w = v + std::time::Duration::from_millis(7);
+    check("set_busy_timeout", &|| c.set_busy_timeout(v), &|| c.set_busy_timeout(w), &|| c.set_busy_timeout(v));
+    assert!(change_missed.is_empty(), "premise: a setter given ANOTHER value did not move the prepare generation: {change_missed:?}");
+    assert!(same_bumped.is_empty(), "CLAIM: setters given the value they hold re-prepared every statement: {same_bumped:?}");
+}
+
+/// Review REVIEW-claude-engine-M1 LOW-5: each path the M1 fix names gets its own owed start sent,
+/// not only `expire_branches`. The store is built at the default threshold with 300 forks leased
+/// for a minute and one branch `keep` with ten hours; the lease clock then passes the minute, the
+/// threshold drops to 1 byte (the log is past it, and past twice the snapshot), and ONE operation
+/// of the path under test runs: its expiry pass reaps the 300 and owes the checkpoint, which must
+/// start with no other operation. Mutant `owed_start_unsent`: red on every path.
+struct LeasedPastDue {
+    db: Arc<Database>,
+    trunk: Arc<Connection>,
+    keep: Branch,
+    held: Vec<Branch>,
+    /// One of the 300, detached (`into_id`): reaped by the operation's expiry, `db.branch` refuses
+    /// it (review m1-2 LOW-C's premise).
+    probe: BranchId,
+    started: u64,
+}
+
+/// Review engine-rev-setter LOW-7: the operation's OWN unlock sent the start it owed, read with no
+/// store-mutex hold (any hold's unlock would send an owed start and rescue the claim below):
+/// nothing is still owed, and a job was handed out since `handed0`. Mutant `owed_start_sent_late`.
+fn assert_the_operation_sent_its_start(probe: &super::store::StarterProbe, handed0: u64, path: &str) {
+    assert!(!probe.owed(), "CLAIM: {path} left its owed checkpoint start unsent at its own unlock");
+    assert!(probe.handed_out() > handed0, "CLAIM: {path}'s unlock handed no checkpoint start to the worker");
+}
+
+/// Premise (review m1-2 LOW-C): the operation's expiry pass reaped the 300, so a failure below is
+/// the start path's, not the fixture's.
+fn assert_the_expiry_reaped(db: &Arc<Database>, probe: BranchId, path: &str) {
+    assert!(db.branch(probe).is_err(), "premise: {path}'s expiry pass did not reap the 300 leased branches");
+}
+
+fn leased_past_due(path: &Path) -> LeasedPastDue {
+    let db = open_at(path, opts(true, SyncClass::Fsync).with_branch_checkpoint(super::BranchCheckpoint::Fuzzy));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let keep = trunk.fork_branch().unwrap();
+    keep.lease(std::time::Duration::from_secs(36_000)).unwrap();
+    trunk.create_branch("named-keep").unwrap();
+    let mut held = Vec::new();
+    let mut probe = None;
+    for _ in 0..300 {
+        let b = trunk.fork_branch().unwrap();
+        b.lease(std::time::Duration::from_secs(60)).unwrap();
+        if probe.is_none() {
+            probe = Some(b.into_id());
+        } else {
+            held.push(b);
+        }
+    }
+    db.branch_checkpoint_wait();
+    let started = db.branch_checkpoint_counters()[1];
+    db.branch_lease_clock_advance(std::time::Duration::from_secs(3600));
+    LeasedPastDue { db, trunk, keep, held, probe: probe.expect("300 forks"), started }
+}
+
+/// After the one operation: a checkpoint started (fuzzy flights started rose past `started`).
+fn assert_a_checkpoint_started(db: &Database, started: u64, path: &str) {
+    let t = std::time::Instant::now();
+    while db.branch_checkpoint_counters()[1] == started && t.elapsed() < std::time::Duration::from_secs(10) {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    db.branch_checkpoint_wait();
+    assert!(
+        db.branch_checkpoint_counters()[1] > started,
+        "CLAIM: {path}'s expiry pass reaped past the threshold and no checkpoint started ({started} before, as many after)"
+    );
+}
+
+#[test]
+fn a_lease_renewal_whose_expiry_crosses_the_threshold_starts_a_checkpoint() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let s = leased_past_due(&dir.path().join("owed-set-lease.db"));
+    let _t = Threshold::set(1);
+    let starter = s.db.branches.starter_probe();
+    let handed0 = starter.handed_out();
+    s.keep.lease(std::time::Duration::from_secs(60)).unwrap();
+    assert_the_operation_sent_its_start(&starter, handed0, "set_lease");
+    assert_the_expiry_reaped(&s.db, s.probe, "set_lease");
+    assert_a_checkpoint_started(&s.db, s.started, "set_lease");
+    drop(s.held);
+}
+
+#[test]
+fn a_connect_whose_expiry_crosses_the_threshold_starts_a_checkpoint() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let s = leased_past_due(&dir.path().join("owed-open-conn.db"));
+    let _t = Threshold::set(1);
+    let starter = s.db.branches.starter_probe();
+    let handed0 = starter.handed_out();
+    let c = s.keep.connect().unwrap();
+    assert_the_operation_sent_its_start(&starter, handed0, "open_conn");
+    assert_the_expiry_reaped(&s.db, s.probe, "open_conn");
+    assert_a_checkpoint_started(&s.db, s.started, "open_conn");
+    drop(c);
+    drop(s.held);
+}
+
+#[test]
+fn a_named_create_refused_after_its_expiry_crossed_the_threshold_starts_a_checkpoint() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let s = leased_past_due(&dir.path().join("owed-create-error.db"));
+    let _t = Threshold::set(1);
+    let starter = s.db.branches.starter_probe();
+    let handed0 = starter.handed_out();
+    assert!(s.trunk.create_branch("named-keep").is_err(), "premise: the name was taken, so the create returned an error");
+    assert_the_operation_sent_its_start(&starter, handed0, "a refused named create");
+    assert_the_expiry_reaped(&s.db, s.probe, "a refused named create");
+    assert_a_checkpoint_started(&s.db, s.started, "a refused named create");
+    drop(s.held);
+}
+
+#[test]
+fn an_open_whose_expiry_crosses_the_threshold_starts_a_checkpoint() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("owed-open.db");
+    let (incarnation, probe) = {
+        let s = leased_past_due(&path);
+        // Detached, not released: the 300 outlive the close, and the reopen's expiry reaps them
+        // (the close stamps the lease clock, an hour on).
+        for b in s.held {
+            let _ = b.into_id();
+        }
+        let _ = s.keep.into_id();
+        drop(s.trunk);
+        (s.db.incarnation, s.probe)
+    };
+    let _t = Threshold::set(1);
+    let db = reopen(&path, opts(true, SyncClass::Fsync).with_branch_checkpoint(super::BranchCheckpoint::Fuzzy), incarnation);
+    assert_the_expiry_reaped(&db, probe, "the open");
+    assert_a_checkpoint_started(&db, 0, "the open");
+}
+
+/// Review REVIEW-claude-engine-L2d M2: a fuzzy install takes the names and child keys it let go
+/// of under the store mutex with no allocation (they are freed after it). At f666f19bd
+/// `ChildIndex::take_retired` boxed the generation, one heap allocation inside every install's
+/// hold (the lifecycle audit's install site, store.rs:4111 at c1809b546: 18 allocations, raw
+/// l111). Premises: the take ran at three installs, one with a retired child generation.
+#[test]
+fn a_fuzzy_install_takes_its_retired_names_and_children_without_allocating() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(
+        &dir.path().join("retire-take.db"),
+        opts(true, SyncClass::Fsync).with_branch_checkpoint(super::BranchCheckpoint::Fuzzy),
+    );
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let (takes0, with0, allocs0) = (
+        super::store::RETIRE_TAKES.load(Relaxed),
+        super::store::RETIRE_TAKES_WITH_CHILDREN.load(Relaxed),
+        super::store::RETIRE_TAKE_ALLOCS.load(Relaxed),
+    );
+    for round in 0..3 {
+        if round < 2 {
+            for i in 0..16 {
+                trunk.create_branch(&format!("r{round}-{i}")).unwrap();
+                let _ = trunk.fork_branch().unwrap().into_id();
+            }
+        }
+        assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: fuzzy checkpoint {round} started");
+        db.branch_checkpoint_wait();
+    }
+    let takes = super::store::RETIRE_TAKES.load(Relaxed) - takes0;
+    let with = super::store::RETIRE_TAKES_WITH_CHILDREN.load(Relaxed) - with0;
+    let allocs = super::store::RETIRE_TAKE_ALLOCS.load(Relaxed) - allocs0;
+    // Review engine-rev-setter LOW-8: exactly the three checkpoints' installs, so an extra one (a
+    // threshold's) fails as a premise, not as the with == 2 claim below.
+    assert_eq!(takes, 3, "premise: {takes} installs took their retired generations, not the 3 checkpoints'");
+    // Review m1-2 LOW-D: exactly the two rounds that forked children retire a generation; round 2,
+    // with none forked since, retires nothing (`retire_frozen` keeps `None` for an empty one).
+    assert_eq!(with, 2, "CLAIM: {with} of 3 installs retired a child generation, not the 2 that forked children");
+    assert_eq!(allocs, 0, "CLAIM: taking the retired names and children allocated {allocs} times under the store mutex over {takes} installs");
+}
+
+/// Review C42-M1 (lead order): a client's CHECKPOINT waits for a fuzzy checkpoint in flight
+/// within its bound, never unboundedly: `branch_compact_now_within` returns `Busy` at its deadline
+/// and `Interrupt` as soon as its interrupt says so, with the flight still held (here at
+/// `HOLD_BEFORE_ROWS`). Before 2026-10-17 the join had no deadline, and neither cancel nor statement_timeout
+/// ended it. Each call runs on its own thread; the test refuses one that has not returned in 30 s.
+#[test]
+fn a_client_checkpoint_s_wait_for_a_flight_ends_at_its_deadline_or_its_interrupt() {
+    let _s = serial();
+    struct Release(Arc<Database>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.branch_checkpoint_hold(0);
+        }
+    }
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(
+        &dir.path().join("checkpoint-within.db"),
+        opts(true, SyncClass::Fsync).with_branch_checkpoint(super::BranchCheckpoint::Fuzzy),
+    );
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    for _ in 0..8 {
+        let _ = trunk.fork_branch().unwrap().into_id();
+    }
+    let _release = Release(db.clone());
+    db.branch_checkpoint_hold(super::store::HOLD_BEFORE_ROWS);
+    assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: a fuzzy checkpoint started");
+    let t = std::time::Instant::now();
+    while db.branch_checkpoint_held() != super::store::HOLD_BEFORE_ROWS | super::store::HOLD_ARRIVED {
+        assert!(t.elapsed() < std::time::Duration::from_secs(10), "premise: the flight never reached its hold");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let call = |until: std::time::Duration, interrupt_after: Option<std::time::Duration>| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let db = db.clone();
+        std::thread::spawn(move || {
+            let begun = std::time::Instant::now();
+            let interrupted = move || interrupt_after.is_some_and(|d| begun.elapsed() >= d);
+            let r = db.branch_compact_now_within(begun + until, &interrupted);
+            let _ = tx.send(r.map_err(|e| e.to_string()));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(30))
+    };
+    let at_deadline = call(std::time::Duration::from_millis(300), None);
+    let interrupted = call(std::time::Duration::from_secs(600), Some(std::time::Duration::from_millis(100)));
+    db.branch_checkpoint_hold(0);
+    db.branch_checkpoint_wait();
+    let at_deadline = at_deadline.expect("CLAIM: a client's CHECKPOINT waited past its 300 ms deadline for the flight in flight (no return in 30 s)");
+    let interrupted = interrupted.expect("CLAIM: a client's CHECKPOINT went on waiting for the flight after its interrupt (no return in 30 s)");
+    assert!(at_deadline.is_err(), "CLAIM: at its deadline the CHECKPOINT reported success with the flight still held");
+    assert!(interrupted.as_ref().is_err_and(|e| e.to_lowercase().contains("interrupt")), "CLAIM: an interrupted CHECKPOINT did not report the interrupt: {interrupted:?}");
+}
+
 /// Review 2 #5: a checkpoint that failed is not retried by the very next operation — the log is
 /// past the threshold still, so without a back-off every create would start (and pay for) another
 /// one: it waits for another threshold's worth of log.
@@ -3575,6 +4316,7 @@ fn the_name_filter_stays_bounded_under_churn() {
     let (built, entries, _, _, _) = db.branch_name_filter_stats();
     let moved = db.branches.name_filter_held_moves_for_test();
     assert!(built, "premise: the name filter is built");
+    assert_eq!(db.branches.name_filter_state_for_test().0, "Ready", "premise (review m1-2c N5): built means Ready, not Stale or an overflow's answer");
     assert!(
         moved <= 4 * n / 256 + 64,
         "one insert into the name filter moved {moved} entries ({n} names created)"
@@ -3606,6 +4348,7 @@ fn a_failed_name_scan_is_retried() {
     let (built, _, _, builds, failed) = db.branch_name_filter_stats();
     assert_eq!(failed, 1, "the failed scan was not counted");
     assert!(built && builds == 1, "the name filter was not built after its scan failed once");
+    assert_eq!(db.branches.name_filter_state_for_test().0, "Ready", "premise (review m1-2c N5): built means Ready, not Stale or an overflow's answer");
     assert!(db.connect().unwrap().create_branch("held").is_err(), "a held name was given again");
 }
 
@@ -3726,6 +4469,7 @@ fn every_held_name_reaches_the_name_filter() {
         super::store::NAME_SCAN_HOLD.store(0, O::Release);
         db.branch_wait_name_filter();
         assert!(db.branch_name_filter_stats().0, "{arm}: premise: the name filter is built");
+        assert_eq!(db.branches.name_filter_state_for_test().0, "Ready", "{arm}: premise (review m1-2c N5): built means Ready");
         db.branch_set_resident_cap(Some(0));
         db.branch_compact_now().unwrap();
         assert!(trunk.create_branch("x").is_err(), "{arm}: an evicted held name was given again");
@@ -5459,7 +6203,7 @@ fn a_checkpoint_that_cannot_start_is_not_retried_by_the_next_create() {
         let _first = trunk.fork_branch().unwrap().into_id();
         let _t = Threshold::set(8 << 10);
         db.branch_failpoint(Some(fp));
-        let entered = || super::store::CAPTURE_ENTERED.load(std::sync::atomic::Ordering::Relaxed);
+        let entered = || db.branches.captures_entered_for_test();
         let before = entered();
         let t = std::time::Instant::now();
         while entered() == before {
@@ -5471,6 +6215,10 @@ fn a_checkpoint_that_cannot_start_is_not_retried_by_the_next_create() {
         for _ in 0..5 {
             let _ = trunk.fork_branch().unwrap().into_id();
         }
+        // FLAGGED TEST EDIT (lead order, review L2d LOW 4; strengthening only): since slice 3 a
+        // retried capture runs on the checkpoint worker after the create returns, so the read waits
+        // for every start handed out; without it the retry mutant was caught only by timing.
+        db.branch_checkpoint_wait();
         assert_eq!(entered(), after, "{fp:?}: the next creates retried the checkpoint's capture");
     }
 }
@@ -5490,7 +6238,7 @@ fn a_capture_that_fails_appends_no_checkpoint_marker() {
     seed(&trunk);
     let _first = trunk.fork_branch().unwrap().into_id();
     db.branch_failpoint(Some(BranchFailpoint::CaptureFails));
-    let entered = || super::store::CAPTURE_ENTERED.load(std::sync::atomic::Ordering::Relaxed);
+    let entered = || db.branches.captures_entered_for_test();
     let (lsn, before) = (db.branches.log_lsn_for_test(), entered());
     assert!(!db.branch_checkpoint_fuzzy_now().unwrap(), "a checkpoint started through the failpoint");
     assert_eq!(entered(), before + 1, "premise: the capture was entered");
@@ -5521,7 +6269,7 @@ fn a_failed_checkpoint_start_backs_off_for_one_threshold_and_no_longer() {
         seed(&trunk);
         let _first = trunk.fork_branch().unwrap().into_id();
         let _t = Threshold::set(threshold);
-        let entered = || super::store::CAPTURE_ENTERED.load(std::sync::atomic::Ordering::Relaxed);
+        let entered = || db.branches.captures_entered_for_test();
         let len = || db.branches.log_len_for_test();
         let fork = || {
             let _ = trunk.fork_branch().unwrap().into_id();
@@ -5582,7 +6330,7 @@ fn a_capture_whose_arena_handle_fails_appends_no_checkpoint_marker() {
     let dir = tempfile::TempDir::new().unwrap();
     let (db, _trunk, _keep) = raised_d0_with_an_unsynced_slot(dir.path());
     db.branch_failpoint(Some(BranchFailpoint::ArenaHandleFails));
-    let entered = || super::store::CAPTURE_ENTERED.load(std::sync::atomic::Ordering::Relaxed);
+    let entered = || db.branches.captures_entered_for_test();
     let (lsn, before) = (db.branches.log_lsn_for_test(), entered());
     assert!(db.branch_compact_now().is_err(), "premise: the capture's arena handle failed");
     assert_eq!(entered(), before + 1, "premise: the capture was entered");
@@ -7267,7 +8015,7 @@ fn a_retried_checkpoint_does_not_stall_every_operation() {
         let _first = trunk.fork_branch().unwrap().into_id();
         let _t = Threshold::set(8 << 10);
         db.branch_failpoint(Some(fp));
-        let entered = || super::store::CAPTURE_ENTERED.load(std::sync::atomic::Ordering::Relaxed);
+        let entered = || db.branches.captures_entered_for_test();
         let failed_at = entered();
         let t = std::time::Instant::now();
         while entered() == failed_at {
@@ -7327,7 +8075,7 @@ fn a_failed_capture_builds_no_row() {
     // its rows are encoded on the writer's thread (`FROZEN_ROWS_WRITTEN`), so both counters are
     // read: the capture's own (this thread) and the writer's. The claim is unchanged.
     let rows = || super::store::CAPTURE_ROWS_BUILT.load(std::sync::atomic::Ordering::Relaxed) + super::store::FROZEN_ROWS_WRITTEN.load(std::sync::atomic::Ordering::Relaxed);
-    let entered = || super::store::CAPTURE_ENTERED.load(std::sync::atomic::Ordering::Relaxed);
+    let entered = || db.branches.captures_entered_for_test();
     db.branch_failpoint(Some(BranchFailpoint::CaptureFails));
     let (rows0, entered0) = (rows(), entered());
     assert!(!db.branch_checkpoint_fuzzy_now().unwrap(), "premise: the capture failed");
@@ -8941,6 +9689,598 @@ fn a_failed_filter_drain_never_answers_absent_for_a_held_name() {
     assert!(!absent, "CLAIM: between a failed filter drain's two holds the filter answered absent for a held name: a create would ask no catalog");
 }
 
+/// Lead order (a) and the filter-fallback proof (2026-10-16): a NATURAL name-filter growth, with no
+/// fault injected, sent every named create of its window to the catalog under the store mutex,
+/// because `says_absent` answered only in `Ready`. While `Growing` the old table is still complete
+/// (notes go into it and the pending table, and a refusal overflows); while `Draining` the new table
+/// and the pending one together are (what `Ready` ends up holding). A fresh name created in each
+/// state must ask the catalog nothing; a held name created again must still be refused. Hooks:
+/// `FILTER_PAUSE_AT` stage 1 (Growing) and 4 (Draining).
+#[test]
+fn a_named_create_during_a_natural_filter_growth_asks_the_catalog_nothing() {
+    use super::store::{FILTER_PAUSED, FILTER_PAUSE_AT};
+    use std::sync::atomic::Ordering::{Acquire, Release};
+    let _s = serial();
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FILTER_PAUSE_AT.store(0, Release);
+            FILTER_PAUSED.store(0, Release);
+        }
+    }
+    let _r = Reset;
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("filter-growth-asks.db"), opts(true, SyncClass::Off));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    db.branch_wait_name_filter();
+    let stmts = || super::budget_probe::thread_cat_stmts();
+    FILTER_PAUSE_AT.store(1, Release);
+    let t = std::time::Instant::now();
+    let mut n = 0u32;
+    while FILTER_PAUSED.load(Acquire) != 1 {
+        trunk.create_branch(&format!("fill-{n:05}")).unwrap();
+        n += 1;
+        assert!(t.elapsed() < std::time::Duration::from_secs(30), "premise: no natural filter growth began ({n} creates)");
+    }
+    assert_eq!(db.branches.name_filter_state_for_test().0, "Growing", "premise: the filter is Growing at stage 1");
+    let s0 = stmts();
+    trunk.create_branch("while-growing").unwrap();
+    let growing = stmts() - s0;
+    FILTER_PAUSE_AT.store(4, Release);
+    while FILTER_PAUSED.load(Acquire) != 4 {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        assert!(t.elapsed() < std::time::Duration::from_secs(60), "premise: the growth never reached its drain");
+    }
+    assert_eq!(db.branches.name_filter_state_for_test().0, "Draining", "premise: the filter is Draining at stage 4");
+    let s1 = stmts();
+    trunk.create_branch("while-draining").unwrap();
+    let draining = stmts() - s1;
+    let taken = trunk.create_branch("while-growing").is_err() && trunk.create_branch("fill-00000").is_err();
+    FILTER_PAUSE_AT.store(0, Release);
+    db.branch_wait_name_filter();
+    assert!(taken, "CLAIM: a name held before or during the growth was given again while the filter was Draining");
+    assert_eq!(
+        (growing, draining),
+        (0, 0),
+        "CLAIM: a named create of a fresh name ran catalog statements while the filter was Growing ({growing}) or Draining ({draining})"
+    );
+}
+
+/// Lead order (a), the filter-fallback proof's second natural path: create-and-delete cycles (the
+/// wire's benchmark loop) leave the filter's table past half full of released names while few are
+/// live, and the next note SHRINKS it, by a rebuild from the catalog. At 0cca39a23 the shrink
+/// overflowed the filter, so every named create until the rebuild landed ran a catalog statement
+/// under the store mutex, though the old table was still complete (a shrink refuses nothing). No
+/// fault injected; the rebuild is held after its `Building` began (`FILTER_PAUSE_AT` stage 7), and
+/// a fresh name created there must ask the catalog nothing. Premise: a rebuild was started.
+#[test]
+fn a_named_create_during_a_natural_filter_shrink_asks_the_catalog_nothing() {
+    use super::store::{FILTER_PAUSED, FILTER_PAUSE_AT};
+    use std::sync::atomic::Ordering::{Acquire, Release};
+    let _s = serial();
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FILTER_PAUSE_AT.store(0, Release);
+            FILTER_PAUSED.store(0, Release);
+        }
+    }
+    let _r = Reset;
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("filter-shrink-asks.db"), opts(true, SyncClass::Off));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    trunk.create_branch("held").unwrap();
+    db.branch_wait_name_filter();
+    let rebuilds0 = db.branches.name_filter_state_for_test().1;
+    FILTER_PAUSE_AT.store(7, Release);
+    let t = std::time::Instant::now();
+    let mut n = 0u32;
+    while FILTER_PAUSED.load(Acquire) != 7 {
+        let name = format!("cycle-{n:05}");
+        trunk.create_branch(&name).unwrap();
+        db.drop_branch(&name).unwrap();
+        n += 1;
+        assert!(t.elapsed() < std::time::Duration::from_secs(30), "premise: no natural filter rebuild began ({n} cycles)");
+    }
+    assert!(db.branches.name_filter_state_for_test().1 > rebuilds0, "premise: the rebuild held at stage 7 was not one a create owed");
+    let s0 = super::budget_probe::thread_cat_stmts();
+    trunk.create_branch("while-shrinking").unwrap();
+    let asked = super::budget_probe::thread_cat_stmts() - s0;
+    let taken = trunk.create_branch("held").is_err();
+    FILTER_PAUSE_AT.store(0, Release);
+    db.branch_wait_name_filter();
+    assert!(taken, "CLAIM: a held name was given again during the shrink's rebuild");
+    assert_eq!(asked, 0, "CLAIM: a named create of a fresh name ran {asked} catalog statements during a natural filter shrink's rebuild ({n} cycles)");
+}
+
+/// Lead order (a), the filter-fallback proof's third natural path (artie engine NOTES df996a0f91,
+/// case 3): after every reopen of a catalog store the filter is Unbuilt and then Building with no
+/// table until the open's build lands, so every named create meanwhile runs a catalog statement
+/// under the store mutex. The build is held after Building began (stage 7); a fresh name created
+/// there must ask the catalog nothing. REGISTERED RED with no fix written: the fix is a LEAP (the
+/// filter carried in the checkpoint, so an open starts Ready).
+#[test]
+#[ignore = "registered red (review m1-2b LOW-F3): fails at HEAD by design until the LEAP in artie engine NOTES df996a0f91/e312ad20c6 (the filter carried across a reopen) lands; run by name with --ignored"]
+fn a_named_create_before_the_open_s_filter_build_lands_asks_the_catalog_nothing() {
+    use super::store::{FILTER_PAUSED, FILTER_PAUSE_AT};
+    use std::sync::atomic::Ordering::{Acquire, Release};
+    let _s = serial();
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FILTER_PAUSE_AT.store(0, Release);
+            FILTER_PAUSED.store(0, Release);
+        }
+    }
+    let _r = Reset;
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("filter-open-asks.db");
+    let incarnation = {
+        let db = open_at(&path, opts(true, SyncClass::Fsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        for i in 0..64 {
+            trunk.create_branch(&format!("kept-{i:02}")).unwrap();
+        }
+        db.branch_compact_now().unwrap();
+        db.incarnation
+    };
+    FILTER_PAUSE_AT.store(7, Release);
+    let db = reopen(&path, opts(true, SyncClass::Fsync), incarnation);
+    let t = std::time::Instant::now();
+    while FILTER_PAUSED.load(Acquire) != 7 {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        assert!(t.elapsed() < std::time::Duration::from_secs(30), "premise: the open's filter build never began");
+    }
+    let trunk = db.connect().unwrap();
+    let s0 = super::budget_probe::thread_cat_stmts();
+    trunk.create_branch("after-open").unwrap();
+    let asked = super::budget_probe::thread_cat_stmts() - s0;
+    let taken = trunk.create_branch("kept-07").is_err();
+    FILTER_PAUSE_AT.store(0, Release);
+    db.branch_wait_name_filter();
+    assert!(taken, "CLAIM: a checkpointed name was given again before the open's filter build landed");
+    assert_eq!(asked, 0, "CLAIM: a named create of a fresh name ran {asked} catalog statements before the open's filter build landed");
+}
+
+/// Lead order (a), the filter-fallback proof's fourth natural path (artie engine NOTES df996a0f91,
+/// case 4): a burst of creates while a natural growth is slow (held at stage 1, `Growing`) fills a
+/// table to its refusal (7/8 full), and the filter overflowed with no table answering, so every
+/// named create until the rebuild landed ran a catalog statement under the store mutex. With the
+/// refusing tables and a pre-allocated spill table of what they refused, the answer stays complete:
+/// a fresh name created once the refusal owed its rebuild, and again while that rebuild is held
+/// `Building` before its scan (`NAME_SCAN_HOLD`, armed before the burst: the rebuild starts at the
+/// refusing create), asks the catalog nothing, and the filter never says "absent" for a name
+/// created in the burst.
+#[test]
+fn a_named_create_after_a_natural_filter_refusal_asks_the_catalog_nothing() {
+    use super::store::{FILTER_PAUSED, FILTER_PAUSE_AT};
+    use std::sync::atomic::Ordering::{Acquire, Release};
+    let _s = serial();
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FILTER_PAUSE_AT.store(0, Release);
+            FILTER_PAUSED.store(0, Release);
+            super::store::NAME_SCAN_HOLD.store(0, Release);
+        }
+    }
+    let _r = Reset;
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("filter-refusal-asks.db"), opts(true, SyncClass::Off));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    trunk.create_branch("first").unwrap();
+    db.branch_wait_name_filter();
+    FILTER_PAUSE_AT.store(1, Release);
+    let t = std::time::Instant::now();
+    let mut names = Vec::new();
+    while FILTER_PAUSED.load(Acquire) != 1 {
+        let name = format!("fill-{:05}", names.len());
+        trunk.create_branch(&name).unwrap();
+        names.push(name);
+        assert!(t.elapsed() < std::time::Duration::from_secs(30), "premise: no natural filter growth began");
+    }
+    // The burst, with the growth held: until a table refuses and owes its rebuild.
+    let rebuilds0 = db.branches.name_filter_state_for_test().1;
+    super::store::NAME_SCAN_HOLD.store(1, Release);
+    while db.branches.name_filter_state_for_test().1 == rebuilds0 {
+        let name = format!("burst-{:05}", names.len());
+        trunk.create_branch(&name).unwrap();
+        names.push(name);
+        assert!(names.len() < 1 << 20, "premise: no table refused a key during the held growth");
+    }
+    let stmts = || super::budget_probe::thread_cat_stmts();
+    let s0 = stmts();
+    trunk.create_branch("while-overflowed").unwrap();
+    let overflowed = stmts() - s0;
+    names.push("while-overflowed".to_string());
+    while super::store::NAME_SCAN_HOLD.load(Acquire) != 1 | super::store::HOLD_ARRIVED {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        assert!(t.elapsed() < std::time::Duration::from_secs(60), "premise: the refusal's rebuild never reached its scan");
+    }
+    assert_eq!(db.branches.name_filter_state_for_test().0, "Building", "premise: the rebuild is held Building");
+    let s1 = stmts();
+    trunk.create_branch("while-rebuilding").unwrap();
+    let rebuilding = stmts() - s1;
+    names.push("while-rebuilding".to_string());
+    let said_absent: Vec<&String> = names.iter().filter(|n| db.branches.name_filter_says_absent_for_test(n)).collect();
+    super::store::NAME_SCAN_HOLD.store(0, Release);
+    FILTER_PAUSE_AT.store(0, Release);
+    db.branch_wait_name_filter();
+    assert!(said_absent.is_empty(), "CLAIM: the filter said absent for {} held names after the refusal: {:?}", said_absent.len(), &said_absent[..said_absent.len().min(8)]);
+    assert_eq!(
+        (overflowed, rebuilding),
+        (0, 0),
+        "CLAIM: a named create of a fresh name ran catalog statements after a natural refusal: {overflowed} while Overflowed, {rebuilding} while its rebuild was Building"
+    );
+}
+
+/// Review m1-2b LOW-F1 (DECISIONS 6c1dbf7449, must-fix before credit): the filter tests' controls
+/// were resident names, which `name_lookup` refuses from `names.map` before the filter answers, so
+/// no false "absent" could show. These are `k` named branches held ONLY in the catalog: created,
+/// checkpointed, then evicted (resident cap 1 and one more checkpoint).
+fn catalog_only_names(db: &Arc<Database>, trunk: &Arc<Connection>, k: usize) -> Vec<String> {
+    let names: Vec<String> = (0..k).map(|i| format!("cat-only-{i:03}")).collect();
+    for n in &names {
+        trunk.create_branch(n).unwrap();
+    }
+    db.branch_compact_now().unwrap();
+    db.branch_set_resident_cap(Some(1));
+    // The eviction runs at a fuzzy checkpoint's install (`evict_clean`).
+    assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: the evicting fuzzy checkpoint started");
+    db.branch_checkpoint_wait();
+    for n in &names {
+        assert!(!db.branches.name_resident_for_test(n), "premise: {n} is still resident after the eviction");
+    }
+    names
+}
+
+/// In the filter's current `state`: no name held only in the catalog is answered "absent", and
+/// creating one again is refused.
+fn assert_no_false_absent(db: &Arc<Database>, trunk: &Arc<Connection>, names: &[String], state: &str) {
+    assert_eq!(db.branches.name_filter_state_for_test().0, state, "premise: the filter is {state}");
+    for n in names {
+        assert!(!db.branches.name_filter_says_absent_for_test(n), "CLAIM: the filter answered absent while {state} for {n}, held only in the catalog");
+    }
+    assert!(trunk.create_branch(&names[0]).is_err(), "CLAIM: while {state}, a name held only in the catalog was given again");
+}
+
+/// LOW-F1 in a natural growth: `Growing` (stage 1) and `Draining` (stage 4). Mutants
+/// `filter_lies_growing`, `filter_lies_draining`.
+#[test]
+fn a_growing_or_draining_filter_never_answers_absent_for_a_catalog_only_name() {
+    use super::store::{FILTER_PAUSED, FILTER_PAUSE_AT};
+    use std::sync::atomic::Ordering::{Acquire, Release};
+    let _s = serial();
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FILTER_PAUSE_AT.store(0, Release);
+            FILTER_PAUSED.store(0, Release);
+        }
+    }
+    let _r = Reset;
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("lie-growth.db"), opts(true, SyncClass::Off));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let names = catalog_only_names(&db, &trunk, 4);
+    db.branch_wait_name_filter();
+    FILTER_PAUSE_AT.store(1, Release);
+    let t = std::time::Instant::now();
+    let mut n = 0u32;
+    while FILTER_PAUSED.load(Acquire) != 1 {
+        trunk.create_branch(&format!("fill-{n:05}")).unwrap();
+        n += 1;
+        assert!(t.elapsed() < std::time::Duration::from_secs(30), "premise: no natural filter growth began ({n} creates)");
+    }
+    assert_no_false_absent(&db, &trunk, &names, "Growing");
+    FILTER_PAUSE_AT.store(4, Release);
+    while FILTER_PAUSED.load(Acquire) != 4 {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        assert!(t.elapsed() < std::time::Duration::from_secs(60), "premise: the growth never reached its drain");
+    }
+    assert_no_false_absent(&db, &trunk, &names, "Draining");
+    FILTER_PAUSE_AT.store(0, Release);
+    db.branch_wait_name_filter();
+}
+
+/// LOW-F1 in a natural shrink: `Stale` (the build held before its seed, `BUILD_SEED_HOLD`) and
+/// `Building` with the old table (stage 7). Mutants `filter_lies_stale`, `filter_lies_building_old`.
+#[test]
+fn a_shrinking_filter_never_answers_absent_for_a_catalog_only_name() {
+    use super::store::{BUILD_SEED_HOLD, FILTER_PAUSED, FILTER_PAUSE_AT, HOLD_ARRIVED};
+    use std::sync::atomic::Ordering::{Acquire, Release};
+    let _s = serial();
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            BUILD_SEED_HOLD.store(0, Release);
+            FILTER_PAUSE_AT.store(0, Release);
+            FILTER_PAUSED.store(0, Release);
+        }
+    }
+    let _r = Reset;
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("lie-shrink.db"), opts(true, SyncClass::Off));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let names = catalog_only_names(&db, &trunk, 4);
+    db.branch_wait_name_filter();
+    BUILD_SEED_HOLD.store(1, Release);
+    let t = std::time::Instant::now();
+    let mut n = 0u32;
+    while BUILD_SEED_HOLD.load(Acquire) != 1 | HOLD_ARRIVED {
+        let name = format!("cycle-{n:05}");
+        trunk.create_branch(&name).unwrap();
+        db.drop_branch(&name).unwrap();
+        n += 1;
+        assert!(t.elapsed() < std::time::Duration::from_secs(30), "premise: no natural filter shrink owed a rebuild ({n} cycles)");
+    }
+    assert_no_false_absent(&db, &trunk, &names, "Stale");
+    FILTER_PAUSE_AT.store(7, Release);
+    BUILD_SEED_HOLD.store(0, Release);
+    while FILTER_PAUSED.load(Acquire) != 7 {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        assert!(t.elapsed() < std::time::Duration::from_secs(60), "premise: the shrink's rebuild never reached Building");
+    }
+    assert!(db.branches.name_filter_stats().0, "premise: the rebuild is Building with the old table answering");
+    assert_no_false_absent(&db, &trunk, &names, "Building");
+    FILTER_PAUSE_AT.store(0, Release);
+    db.branch_wait_name_filter();
+}
+
+/// LOW-F1 after a natural refusal (5a0d874e0's `Answer` and spare): `Overflowed` with an answer
+/// (the rebuild held before its seed) and `Building` with that answer as its old one (held at its
+/// scan). Mutants `filter_lies_overflowed_answer`, `filter_lies_building_old`.
+#[test]
+fn a_refusing_filter_never_answers_absent_for_a_catalog_only_name() {
+    use super::store::{BUILD_SEED_HOLD, FILTER_PAUSED, FILTER_PAUSE_AT, HOLD_ARRIVED, NAME_SCAN_HOLD};
+    use std::sync::atomic::Ordering::{Acquire, Release};
+    let _s = serial();
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            BUILD_SEED_HOLD.store(0, Release);
+            NAME_SCAN_HOLD.store(0, Release);
+            FILTER_PAUSE_AT.store(0, Release);
+            FILTER_PAUSED.store(0, Release);
+        }
+    }
+    let _r = Reset;
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("lie-refusal.db"), opts(true, SyncClass::Off));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let names = catalog_only_names(&db, &trunk, 4);
+    db.branch_wait_name_filter();
+    FILTER_PAUSE_AT.store(1, Release);
+    let t = std::time::Instant::now();
+    let mut n = 0u32;
+    while FILTER_PAUSED.load(Acquire) != 1 {
+        trunk.create_branch(&format!("fill-{n:05}")).unwrap();
+        n += 1;
+        assert!(t.elapsed() < std::time::Duration::from_secs(30), "premise: no natural filter growth began");
+    }
+    BUILD_SEED_HOLD.store(1, Release);
+    while BUILD_SEED_HOLD.load(Acquire) != 1 | HOLD_ARRIVED {
+        trunk.create_branch(&format!("burst-{n:05}")).unwrap();
+        n += 1;
+        assert!(n < 1 << 20, "premise: no table refused a key during the held growth");
+    }
+    assert!(db.branches.name_filter_stats().0, "premise: the refusal kept an answer (a spare was kept)");
+    assert_no_false_absent(&db, &trunk, &names, "Overflowed");
+    NAME_SCAN_HOLD.store(1, Release);
+    BUILD_SEED_HOLD.store(0, Release);
+    while NAME_SCAN_HOLD.load(Acquire) != 1 | HOLD_ARRIVED {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        assert!(t.elapsed() < std::time::Duration::from_secs(60), "premise: the refusal's rebuild never reached its scan");
+    }
+    assert_no_false_absent(&db, &trunk, &names, "Building");
+    NAME_SCAN_HOLD.store(0, Release);
+    FILTER_PAUSE_AT.store(0, Release);
+    db.branch_wait_name_filter();
+}
+
+/// Review m1-2b LOW-F2 (DECISIONS 6c1dbf7449), as a class: no filter table is freed under the
+/// store mutex. A shrink's rebuild is held at its scan (`Building` with the shrink's table as its
+/// old answer); a burst of named creates then fills that old table until it refuses a note, which
+/// ends the answer (counted, `name_filter_refusals_for_test`). At bf7a1ef1f the answer's table was
+/// dropped inside that create's note, its last reference: a free of the whole table under the mutex.
+/// No note may free anything (`FILTER_NOTE_FREED_MAX`).
+#[test]
+fn a_refusing_answer_s_table_is_not_freed_under_the_store_mutex() {
+    use super::store::{FILTER_NOTE_FREED_MAX, HOLD_ARRIVED, NAME_SCAN_HOLD};
+    use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+    let _s = serial();
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            NAME_SCAN_HOLD.store(0, Release);
+        }
+    }
+    let _r = Reset;
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("refusal-free.db"), opts(true, SyncClass::Off));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    trunk.create_branch("held").unwrap();
+    db.branch_wait_name_filter();
+    NAME_SCAN_HOLD.store(1, Release);
+    let t = std::time::Instant::now();
+    let mut n = 0u32;
+    while NAME_SCAN_HOLD.load(Acquire) != 1 | HOLD_ARRIVED {
+        let name = format!("cycle-{n:05}");
+        trunk.create_branch(&name).unwrap();
+        db.drop_branch(&name).unwrap();
+        n += 1;
+        assert!(t.elapsed() < std::time::Duration::from_secs(30), "premise: no natural shrink's rebuild reached its scan ({n} cycles)");
+    }
+    assert!(db.branches.name_filter_stats().0, "premise: the shrink's rebuild is Building with its old table answering");
+    let refused0 = db.branches.name_filter_refusals_for_test().1;
+    FILTER_NOTE_FREED_MAX.store(0, Release);
+    while db.branches.name_filter_refusals_for_test().1 == refused0 {
+        trunk.create_branch(&format!("burst-{n:05}")).unwrap();
+        n += 1;
+        assert!(n < 1 << 20, "premise: the old table never refused a note");
+    }
+    let freed = FILTER_NOTE_FREED_MAX.load(Relaxed);
+    NAME_SCAN_HOLD.store(0, Release);
+    db.branch_wait_name_filter();
+    assert_eq!(freed, 0, "CLAIM: a note freed {freed} bytes under the store mutex (a refusing answer's table)");
+}
+
+/// Review m1-2c N1 (DECISIONS 0f341519ea): a shrink's rebuild held at its scan (`Building` with the
+/// shrink's table as its old answer, and the spare its seed hold installed); a burst of fresh names
+/// fills that table until it refuses a note. At d94431cbe the refusal ended the answer, and every
+/// create until Draining asked the catalog; the spare is there to take it. After the refusal, a
+/// fresh name must run no catalog statement, and no held name is answered absent.
+#[test]
+fn a_named_create_after_a_building_answer_refuses_asks_the_catalog_nothing() {
+    use super::store::{HOLD_ARRIVED, NAME_SCAN_HOLD};
+    use std::sync::atomic::Ordering::{Acquire, Release};
+    let _s = serial();
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            NAME_SCAN_HOLD.store(0, Release);
+        }
+    }
+    let _r = Reset;
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("building-refusal-asks.db"), opts(true, SyncClass::Off));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    trunk.create_branch("held").unwrap();
+    db.branch_wait_name_filter();
+    NAME_SCAN_HOLD.store(1, Release);
+    let t = std::time::Instant::now();
+    let mut n = 0u32;
+    while NAME_SCAN_HOLD.load(Acquire) != 1 | HOLD_ARRIVED {
+        let name = format!("cycle-{n:05}");
+        trunk.create_branch(&name).unwrap();
+        db.drop_branch(&name).unwrap();
+        n += 1;
+        assert!(t.elapsed() < std::time::Duration::from_secs(30), "premise: no natural shrink's rebuild reached its scan ({n} cycles)");
+    }
+    let refused0 = db.branches.name_filter_refusals_for_test().1;
+    let mut names = Vec::new();
+    while db.branches.name_filter_refusals_for_test().1 == refused0 {
+        let name = format!("burst-{n:05}");
+        trunk.create_branch(&name).unwrap();
+        names.push(name);
+        n += 1;
+        assert!(n < 1 << 20, "premise: the old table never refused a note");
+    }
+    let s0 = super::budget_probe::thread_cat_stmts();
+    trunk.create_branch("after-refusal").unwrap();
+    let asked = super::budget_probe::thread_cat_stmts() - s0;
+    names.push("after-refusal".to_string());
+    let said_absent: Vec<&String> = names.iter().filter(|n| db.branches.name_filter_says_absent_for_test(n)).collect();
+    NAME_SCAN_HOLD.store(0, Release);
+    db.branch_wait_name_filter();
+    assert!(said_absent.is_empty(), "CLAIM: {} held names answered absent after the refusal: {:?}", said_absent.len(), &said_absent[..said_absent.len().min(8)]);
+    assert_eq!(asked, 0, "CLAIM: a fresh name ran {asked} catalog statements after a Building answer's table refused a note");
+}
+
+/// Review m1-2c N2: a build whose table cannot take its unbuilt hashes overflows at its install;
+/// at 5a0d874e0 that return lost its `drop(inner)`, so the scanned table (and the unbuilt hashes)
+/// were freed inside the filter thread's store-mutex hold. Forced by `BUILD_TABLE_REFUSES` on a
+/// reopen's build; no filter-thread hold may free anything (`FILTER_HOLD_FREED_MAX`).
+#[test]
+fn a_build_that_overflows_at_its_install_frees_nothing_under_the_store_mutex() {
+    use super::store::{BUILD_TABLE_REFUSES, FILTER_HOLD_FREED_MAX, FILTER_HOLD_FREES_ARMED};
+    use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+    let _s = serial();
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FILTER_HOLD_FREES_ARMED.store(false, Release);
+            BUILD_TABLE_REFUSES.store(false, Release);
+        }
+    }
+    let _r = Reset;
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("build-overflow-free.db");
+    let incarnation = {
+        let db = open_at(&path, opts(true, SyncClass::Off));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        for i in 0..64 {
+            trunk.create_branch(&format!("kept-{i:02}")).unwrap();
+        }
+        db.branch_compact_now().unwrap();
+        db.incarnation
+    };
+    FILTER_HOLD_FREED_MAX.store(0, Release);
+    FILTER_HOLD_FREES_ARMED.store(true, Release);
+    BUILD_TABLE_REFUSES.store(true, Release);
+    let db = reopen(&path, opts(true, SyncClass::Off), incarnation);
+    db.branch_wait_name_filter();
+    FILTER_HOLD_FREES_ARMED.store(false, Release);
+    assert!(!BUILD_TABLE_REFUSES.load(Acquire), "premise: the reopen's build never reached its install");
+    let freed = FILTER_HOLD_FREED_MAX.load(Relaxed);
+    assert_eq!(freed, 0, "CLAIM: a name-filter thread freed {freed} bytes inside a store-mutex hold (the overflowing build's table)");
+}
+
+/// Review m1-2c N3: after a growth's failed drain the filter overflows answering from the new table
+/// and the pending one (5a0d874e0); a name noted only into the pending table (held at stage 3, as
+/// in `a_failed_filter_drain_never_answers_absent_for_a_held_name`) must still not be answered
+/// absent once `Overflowed`, held there by the rebuild's seed hold. The H1 test reads only the
+/// `Draining` state before the overflow, so it cannot see mutant `filter_answer_drops_pending`;
+/// this is its killer.
+#[test]
+fn a_failed_filter_drain_s_overflow_still_answers_for_a_pending_name() {
+    use super::store::{BUILD_SEED_HOLD, FILTER_DRAIN_FAILS, FILTER_PAUSED, FILTER_PAUSE_AT, HOLD_ARRIVED};
+    use std::sync::atomic::Ordering::{Acquire, Release};
+    let _s = serial();
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FILTER_DRAIN_FAILS.store(false, Release);
+            FILTER_PAUSE_AT.store(0, Release);
+            FILTER_PAUSED.store(0, Release);
+            BUILD_SEED_HOLD.store(0, Release);
+        }
+    }
+    let _r = Reset;
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("drain-overflow-answer.db"), opts(true, SyncClass::Off));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    db.branch_wait_name_filter();
+    FILTER_DRAIN_FAILS.store(true, Release);
+    FILTER_PAUSE_AT.store(3, Release);
+    let t = std::time::Instant::now();
+    let mut n = 0u32;
+    while FILTER_PAUSED.load(Acquire) != 3 {
+        trunk.create_branch(&format!("fill-{n:05}")).unwrap();
+        n += 1;
+        assert!(t.elapsed() < std::time::Duration::from_secs(30), "premise: no filter growth reached its swap ({n} creates)");
+    }
+    trunk.create_branch("victim").unwrap();
+    BUILD_SEED_HOLD.store(1, Release);
+    FILTER_PAUSE_AT.store(0, Release);
+    while db.branches.name_filter_state_for_test().0 != "Overflowed" {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        assert!(t.elapsed() < std::time::Duration::from_secs(60), "premise: the failed drain never overflowed the filter");
+    }
+    // The overflow owes a rebuild; a create starts it, and it holds before its seed.
+    trunk.create_branch("starts-the-rebuild").unwrap();
+    while BUILD_SEED_HOLD.load(Acquire) != 1 | HOLD_ARRIVED {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        assert!(t.elapsed() < std::time::Duration::from_secs(60), "premise: the overflow's rebuild never began");
+    }
+    assert_eq!(db.branches.name_filter_state_for_test().0, "Overflowed", "premise: still Overflowed, held before the rebuild's seed");
+    let absent = db.branches.name_filter_says_absent_for_test("victim");
+    BUILD_SEED_HOLD.store(0, Release);
+    db.branch_wait_name_filter();
+    assert!(!absent, "CLAIM: after a failed drain the overflowed filter answered absent for a name only its pending table held");
+}
+
 /// Class (e), the store mutex's lifecycle audit (DECISIONS 994f7d41e0; the lead's order with
 /// nf-adversary-2's MED-2 and M4 folded in): every store-mutex hold on the create path does NO syscall,
 /// NO allocation and NO catalog statement. One instrument for the whole class: every outermost hold
@@ -9034,6 +10374,11 @@ fn lifecycle_audit(n: u32) {
     // population too, raw l96; the D0 population itself costs about 0.7 ms a create in debug, raw
     // l102). Its creates, and its growth's holds, are the same; only how it is started differs.
     let force = n >= 100_000;
+    // Review L2d M3: a threshold the growth's creates cross, so a checkpoint the worker starts
+    // (`run_owed_start`'s hold, slice 3) falls in the audited window; the forced arm's handful of
+    // creates crosses only a 1-byte one. Asserted below as a premise.
+    let _threshold = Threshold::set(if force { 1 } else { 8 << 10 });
+    let growth_from = AUDIT_LOG.lock().unwrap().len();
     if force {
         db.branches.force_name_filter_growth_for_test();
     }
@@ -9093,6 +10438,12 @@ fn lifecycle_audit(n: u32) {
         }
     }
     assert!(!worst.is_empty(), "premise: the audit recorded no hold");
+    let owed_site = super::store::OWED_START_SITE.get().copied();
+    let owed_holds = owed_site.map_or(0, |s| log[growth_from..].iter().filter(|h| std::ptr::eq(h.site, s) || (h.site.file() == s.file() && h.site.line() == s.line())).count());
+    assert!(
+        owed_holds >= 1,
+        "premise: no hold at run_owed_start's site ({owed_site:?}) after the growth began: the checkpoint worker's start was not audited"
+    );
     assert!(
         over.is_empty(),
         "CLAIM: {} store-mutex sites on the create path did a syscall, an allocation or a catalog statement while held (n = {n}): {over:#?}",
@@ -9131,6 +10482,7 @@ fn the_name_filter_lists_its_real_bytes_and_records_its_growth() {
     db.branch_wait_name_filter();
     let (built, entries, moved_max, builds, _) = db.branches.name_filter_stats();
     assert!(built && entries >= 1_500, "premise: the filter holds the 1,500 names ({entries})");
+    assert_eq!(db.branches.name_filter_state_for_test().0, "Ready", "premise (review m1-2c N5): built means Ready, not Stale or an overflow's answer");
     assert!(builds >= 1, "premise: the filter grew past its first table ({builds} growths)");
     let listed: Vec<_> = db
         .branches
@@ -9272,6 +10624,7 @@ fn a_named_create_allocates_nothing_in_the_name_filter_as_it_grows() {
     db.branch_wait_name_filter();
     let (built, entries0, _, builds0, _) = db.branches.name_filter_stats();
     assert!(built && entries0 >= 10_000, "premise: the reopened store's name filter was built from its 10,000 names ({entries0})");
+    assert_eq!(db.branches.name_filter_state_for_test().0, "Ready", "premise (review m1-2c N5): built means Ready, not Stale or an overflow's answer");
     let trunk = db.connect().unwrap();
     let before = super::store::FILTER_NOTE_ALLOCS.load(Relaxed);
     for i in 0..8_000 {
@@ -9288,7 +10641,56 @@ fn a_named_create_allocates_nothing_in_the_name_filter_as_it_grows() {
     }
     let (built, entries, _, builds, _) = db.branches.name_filter_stats();
     assert!(built && entries >= 18_000, "the name filter stopped answering, or lost names, as it grew: built {built}, {entries} entries");
+    assert_eq!(db.branches.name_filter_state_for_test().0, "Ready", "premise (review m1-2c N5): built means Ready, not Stale or an overflow's answer");
     assert!(builds > builds0, "premise: the name filter never grew past the table it was built with ({builds0} -> {builds} builds)");
+}
+
+/// Class (e)'s delete site (release_checked: 657 allocations and 4 catalog statements in one hold at
+/// 10^4 and 10^6, raws l104, l103): the delete the audit makes, traced span by span (`held_trace`:
+/// allocations and catalog statements at each point), at 10^4 named branches populated at D0, at
+/// D2. Prints each of 20 deletes' spans.
+#[test]
+#[ignore = "diagnostic: run by name with --ignored --nocapture"]
+fn diag_the_delete_hold_by_span() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("del.db");
+    let incarnation = {
+        let db = open_at(&path, opts(true, SyncClass::Off));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        for i in 0..10_000u32 {
+            trunk.create_branch(&format!("pop-{i:07}")).unwrap();
+        }
+        db.branch_compact_now().unwrap();
+        db.incarnation
+    };
+    let db = reopen(&path, opts(true, SyncClass::FullFsync), incarnation);
+    db.branch_wait_name_filter();
+    let trunk = db.connect().unwrap();
+    for i in 0..20u32 {
+        let name = format!("a-{i:03}");
+        trunk.create_branch(&name).unwrap();
+        let c = db.connect_named(&name).unwrap();
+        c.execute(&format!("UPDATE t SET v = 'a{i}' WHERE id = {}", 1 + i % 50)).unwrap();
+        drop(c);
+        let a0 = super::budget_probe::thread_allocs().2;
+        let s0 = super::budget_probe::thread_cat_stmts();
+        super::store::HELD_TRACE.with(|t| *t.borrow_mut() = Some(Vec::with_capacity(64)));
+        db.drop_branch(&name).unwrap();
+        let trace = super::store::HELD_TRACE.with(|t| t.borrow_mut().take()).unwrap_or_default();
+        let (mut la, mut ls) = (a0, s0);
+        let steps: Vec<String> = trace
+            .iter()
+            .map(|(l, a, st)| {
+                let r = format!("{l}+{}a/{}s", a - la, st - ls);
+                la = *a;
+                ls = *st;
+                r
+            })
+            .collect();
+        println!("FE_DELETE {name}: [{}]", steps.join(" "));
+    }
 }
 
 /// Diagnostic for the 10^6 audit arm's population (it timed out at D0 in 90 min, raw l96): the wall
@@ -9666,7 +11068,7 @@ fn a_steady_create_allocates_at_most_once_under_the_store_mutex() {
         let mut last = before;
         let steps: Vec<String> = trace
             .iter()
-            .map(|(label, n)| {
+            .map(|(label, n, _)| {
                 let d = n - last;
                 last = *n;
                 format!("{label}+{d}")
@@ -9704,7 +11106,7 @@ fn diag_the_create_hold_stall_is_a_checkpoint_start() {
     let db = reopen(&path, opts(true, SyncClass::FullFsync), incarnation);
     db.branch_wait_name_filter();
     let trunk = db.connect().unwrap();
-    let mut worst: (u64, String, Vec<(&'static str, u64)>, u64) = (0, String::new(), Vec::new(), 0);
+    let mut worst: (u64, String, Vec<(&'static str, u64, u64)>, u64) = (0, String::new(), Vec::new(), 0);
     let mut over_64 = 0u32;
     let mut started_in_a_create = 0u32;
     for i in 0..16_384u32 {
@@ -9713,11 +11115,11 @@ fn diag_the_create_hold_stall_is_a_checkpoint_start() {
         super::store::HELD_TRACE.with(|t| *t.borrow_mut() = Some(Vec::with_capacity(64)));
         trunk.create_branch(&name).unwrap();
         let trace = super::store::HELD_TRACE.with(|t| t.borrow_mut().take()).unwrap_or_default();
-        let total = trace.last().map_or(0, |(_, n)| n - before);
+        let total = trace.last().map_or(0, |(_, n, _)| n - before);
         if total > 64 {
             over_64 += 1;
         }
-        if trace.iter().any(|(l, _)| *l == "compact.flight_starting" || l.starts_with("capture.")) {
+        if trace.iter().any(|(l, _, _)| *l == "compact.flight_starting" || l.starts_with("capture.")) {
             started_in_a_create += 1;
         }
         if total > worst.0 {
@@ -9729,7 +11131,7 @@ fn diag_the_create_hold_stall_is_a_checkpoint_start() {
     let mut in_start = 0;
     let steps: Vec<String> = trace
         .iter()
-        .map(|(label, n)| {
+        .map(|(label, n, _)| {
             let d = n - last;
             last = *n;
             if *label == "compact.flight_start_returned" {
@@ -9746,10 +11148,49 @@ fn diag_the_create_hold_stall_is_a_checkpoint_start() {
     // After L2(d)'s owed start the claim is structural: no create's hold runs any part of a
     // checkpoint's start (no `compact.flight_starting` or `capture.*` trace point in any of the
     // 16,384 holds). Mutant `flight_start_inline` (the start back in the create's hold) puts them
-    // back. The worst create's allocations are printed, not bounded here (17 measured: its own
-    // apply, raw l100).
-    let _ = (in_start, over_64);
+    // back. The worst create's allocations are printed (17 measured: its own apply, raw l100), and
+    // slice 1's bound stays asserted (review L2d M4: 969e7a370 had dropped it): no create over 64.
+    let _ = in_start;
     assert_eq!(started_in_a_create, 0, "CLAIM: {started_in_a_create} creates ran a checkpoint's start in their store-mutex hold (worst: [{}])", steps.join(" "));
+    assert_eq!(over_64, 0, "CLAIM: {over_64} of 16,384 creates made more than 64 held allocations (worst {total}: [{}])", steps.join(" "));
+}
+
+/// Review REVIEW-claude-engine-L2d M4: slice 3's claim (969e7a370) gated, not only in the ignored
+/// diag above. 512 named creates on a fuzzy catalog store at an 8 KiB threshold, each create's
+/// store-mutex hold traced (`HELD_TRACE`): none runs any part of a checkpoint's start (no
+/// `compact.flight_starting` or `capture.*` point). Premise: checkpoints were captured meanwhile
+/// (this store's `captures_entered` rose), so the starts happened, elsewhere. Mutant `flight_start_inline`.
+#[test]
+fn no_create_runs_a_checkpoint_start_in_its_store_mutex_hold() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(
+        &dir.path().join("no-start-in-create.db"),
+        opts(true, SyncClass::Fsync).with_branch_checkpoint(super::BranchCheckpoint::Fuzzy),
+    );
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let _t = Threshold::set(8 << 10);
+    let captures0 = db.branches.captures_entered_for_test();
+    let mut started_in = Vec::new();
+    for i in 0..512u32 {
+        let name = format!("g-{i:04}");
+        super::store::HELD_TRACE.with(|t| *t.borrow_mut() = Some(Vec::with_capacity(64)));
+        trunk.create_branch(&name).unwrap();
+        let trace = super::store::HELD_TRACE.with(|t| t.borrow_mut().take()).unwrap_or_default();
+        if trace.iter().any(|(l, _, _)| *l == "compact.flight_starting" || l.starts_with("capture.")) {
+            started_in.push(name);
+        }
+    }
+    db.branch_checkpoint_wait();
+    let captures = db.branches.captures_entered_for_test() - captures0;
+    assert!(captures >= 1, "premise: no checkpoint was captured during 512 creates past an 8 KiB threshold");
+    assert!(
+        started_in.is_empty(),
+        "CLAIM: {} of 512 creates ran a checkpoint's start in their store-mutex hold ({captures} captures): {:?}",
+        started_in.len(),
+        &started_in[..started_in.len().min(8)]
+    );
 }
 
 /// Codex C25 HIGH 1 at the store (lead order 00: its "crash arm"): the background writer held after

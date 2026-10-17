@@ -167,7 +167,7 @@ impl Drop for SchemaReparseGuard {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct PrepareOptions {
     pub unqualified_database_search_path: Option<Vec<String>>,
 }
@@ -870,8 +870,11 @@ impl Connection {
             .fetch_add(1, Ordering::Release);
     }
 
+    /// The generation every prepared statement of this connection was compiled under: a setter
+    /// whose change invalidates compiled programs bumps it, and a statement prepared under an older
+    /// one is reprepared before it runs. Read only (for frontends measuring re-prepares).
     #[inline]
-    pub(crate) fn prepare_context_generation(&self) -> u64 {
+    pub fn prepare_context_generation(&self) -> u64 {
         self.prepare_context_generation.load(Ordering::Acquire)
     }
 
@@ -1155,6 +1158,7 @@ impl Connection {
         }
         let result = (|| {
             let (program, pager, mode) = self.compile_cmd(cmd, input, origin, prepare_options)?;
+            // Kept with the statement: a re-prepare translates under them (wire-rework B-H2).
             Ok(Statement::new_with_origin(
                 program,
                 pager,
@@ -1162,7 +1166,8 @@ impl Connection {
                 0,
                 origin,
                 needs_nested_guard,
-            ))
+            )
+            .with_prepare_options(prepare_options.clone()))
         })();
         if result.is_err() && needs_nested_guard {
             self.end_nested();
@@ -1960,8 +1965,10 @@ impl Connection {
     }
 
     pub fn set_foreign_keys_enabled(&self, enable: bool) {
-        self.fk_pragma.store(enable, Ordering::Release);
-        self.bump_prepare_context_generation();
+        // Bumped only on a change (DECISIONS 179e043b9e): the wire sets it at every transaction end.
+        if self.fk_pragma.swap(enable, Ordering::AcqRel) != enable {
+            self.bump_prepare_context_generation();
+        }
     }
 
     pub fn foreign_keys_enabled(&self) -> bool {
@@ -1971,8 +1978,9 @@ impl Connection {
     /// Compile statements with no triggers (see `row_image_apply`). Bumps the prepare generation, so
     /// a statement prepared under the other setting is reprepared before it runs.
     pub(crate) fn set_row_image_apply(&self, on: bool) {
-        self.row_image_apply.store(on, Ordering::Release);
-        self.bump_prepare_context_generation();
+        if self.row_image_apply.swap(on, Ordering::AcqRel) != on {
+            self.bump_prepare_context_generation();
+        }
     }
 
     pub(crate) fn row_image_apply(&self) -> bool {
@@ -1980,8 +1988,11 @@ impl Connection {
     }
 
     pub fn set_check_constraints_ignored(&self, ignore: bool) {
-        self.check_constraints_pragma
-            .store(ignore, Ordering::Release);
+        // Compiled into every INSERT/UPDATE's CHECK (translate/emitter): bumped on a change
+        // (engine-rev-setter MED-1).
+        if self.check_constraints_pragma.swap(ignore, Ordering::AcqRel) != ignore {
+            self.bump_prepare_context_generation();
+        }
     }
 
     pub fn check_constraints_ignored(&self) -> bool {
@@ -1994,6 +2005,13 @@ impl Connection {
 
     pub(crate) fn get_deferred_foreign_key_violations(&self) -> isize {
         self.fk_deferred_violations.load(Ordering::Acquire)
+    }
+
+    /// Deferred foreign-key violations this connection's open transaction still holds: what its
+    /// COMMIT would refuse on (`check_deferred_fk_on_commit`). Read only. For a frontend that must
+    /// refuse turning `foreign_keys` off while any are pending (fastest-wire, review C41-H1).
+    pub fn deferred_foreign_key_violations(&self) -> isize {
+        self.get_deferred_foreign_key_violations()
     }
 
     pub(crate) fn increment_deferred_foreign_key_violations(&self, v: isize) {
@@ -2747,8 +2765,9 @@ impl Connection {
         self.cache_size.load(Ordering::SeqCst)
     }
     pub fn set_cache_size(&self, size: i32) {
-        self.cache_size.store(size, Ordering::SeqCst);
-        self.bump_prepare_context_generation();
+        if self.cache_size.swap(size, Ordering::SeqCst) != size {
+            self.bump_prepare_context_generation();
+        }
     }
 
     pub fn get_capture_data_changes_info(
@@ -2757,7 +2776,12 @@ impl Connection {
         self.capture_data_changes.read()
     }
     pub fn set_capture_data_changes_info(&self, opts: Option<CaptureDataChangesInfo>) {
-        *self.capture_data_changes.write() = opts;
+        let mut cdc = self.capture_data_changes.write();
+        if *cdc == opts {
+            return;
+        }
+        *cdc = opts;
+        drop(cdc);
         self.bump_prepare_context_generation();
     }
     pub fn get_cdc_transaction_id(&self) -> i64 {
@@ -4031,14 +4055,16 @@ impl Connection {
     }
 
     pub fn set_query_only(&self, value: bool) {
-        self.query_only.store(value, Ordering::SeqCst);
-        self.bump_prepare_context_generation();
+        if self.query_only.swap(value, Ordering::SeqCst) != value {
+            self.bump_prepare_context_generation();
+        }
     }
 
     /// Turn recipe backfill on or off for this connection (see `crate::recipe`).
     pub fn set_recipe_backfill(&self, value: bool) {
-        self.recipe_backfill.store(value, Ordering::SeqCst);
-        self.bump_prepare_context_generation();
+        if self.recipe_backfill.swap(value, Ordering::SeqCst) != value {
+            self.bump_prepare_context_generation();
+        }
     }
 
     pub fn recipe_backfill(&self) -> bool {
@@ -4058,7 +4084,10 @@ impl Connection {
     }
 
     pub fn set_dml_require_where(&self, value: bool) {
-        self.dml_require_where.store(value, Ordering::SeqCst);
+        // Checked at translation (translate/mod.rs): bumped on a change (engine-rev-setter MED-1).
+        if self.dml_require_where.swap(value, Ordering::SeqCst) != value {
+            self.bump_prepare_context_generation();
+        }
     }
 
     pub fn get_count_changes(&self) -> bool {
@@ -4066,7 +4095,11 @@ impl Connection {
     }
 
     pub fn set_count_changes(&self, value: bool) {
-        self.count_changes.store(value, Ordering::SeqCst);
+        // Adds a count row to the compiled DML (translate/mod.rs): bumped on a change
+        // (engine-rev-setter MED-1).
+        if self.count_changes.swap(value, Ordering::SeqCst) != value {
+            self.bump_prepare_context_generation();
+        }
     }
 
     pub fn get_dqs_dml(&self) -> bool {
@@ -4074,8 +4107,9 @@ impl Connection {
     }
 
     pub fn set_dqs_dml(&self, value: bool) {
-        self.dqs_dml.store(value, Ordering::SeqCst);
-        self.bump_prepare_context_generation();
+        if self.dqs_dml.swap(value, Ordering::SeqCst) != value {
+            self.bump_prepare_context_generation();
+        }
     }
 
     pub fn get_full_column_names(&self) -> bool {
@@ -4083,8 +4117,9 @@ impl Connection {
     }
 
     pub fn set_full_column_names(&self, value: bool) {
-        self.full_column_names.store(value, Ordering::SeqCst);
-        self.bump_prepare_context_generation();
+        if self.full_column_names.swap(value, Ordering::SeqCst) != value {
+            self.bump_prepare_context_generation();
+        }
     }
 
     pub fn get_short_column_names(&self) -> bool {
@@ -4092,8 +4127,9 @@ impl Connection {
     }
 
     pub fn set_short_column_names(&self, value: bool) {
-        self.short_column_names.store(value, Ordering::SeqCst);
-        self.bump_prepare_context_generation();
+        if self.short_column_names.swap(value, Ordering::SeqCst) != value {
+            self.bump_prepare_context_generation();
+        }
     }
 
     pub fn get_sync_mode(&self) -> SyncMode {
@@ -4101,6 +4137,9 @@ impl Connection {
     }
 
     pub fn set_sync_mode(&self, mode: SyncMode) {
+        if self.sync_mode.get() == mode {
+            return;
+        }
         self.sync_mode.set(mode);
         self.bump_prepare_context_generation();
     }
@@ -4618,9 +4657,13 @@ impl Connection {
     }
 
     pub fn set_data_sync_retry(&self, value: bool) {
-        self.data_sync_retry
-            .store(value, crate::sync::atomic::Ordering::SeqCst);
-        self.bump_prepare_context_generation();
+        if self
+            .data_sync_retry
+            .swap(value, crate::sync::atomic::Ordering::SeqCst)
+            != value
+        {
+            self.bump_prepare_context_generation();
+        }
     }
 
     /// Get the sync type setting.
@@ -4630,7 +4673,14 @@ impl Connection {
 
     /// Set the sync type (for PRAGMA fullfsync).
     pub fn set_sync_type(&self, value: crate::io::FileSyncType) {
-        self.pager.load().set_sync_type(value);
+        // Read by PRAGMA fullfsync's compiled answer (translate/pragma.rs): bumped on a change
+        // (engine-rev-setter MED-1).
+        let pager = self.pager.load();
+        if pager.get_sync_type() == value {
+            return;
+        }
+        pager.set_sync_type(value);
+        self.bump_prepare_context_generation();
     }
 
     /// Creates a HashSet of modules that have been loaded
@@ -4853,11 +4903,22 @@ impl Connection {
 
     /// Sets maximum total accumulated timeout. If the duration is Zero, we unset the busy handler.
     pub fn set_busy_timeout(&self, duration: Duration) {
-        *self.busy_handler.write() = if duration.is_zero() {
+        let mut handler = self.busy_handler.write();
+        // Bumped only on a change (DECISIONS 179e043b9e).
+        let same = match &*handler {
+            BusyHandler::None => duration.is_zero(),
+            BusyHandler::Timeout(d) => *d == duration,
+            BusyHandler::Custom { .. } => false,
+        };
+        if same {
+            return;
+        }
+        *handler = if duration.is_zero() {
             BusyHandler::None
         } else {
             BusyHandler::Timeout(duration)
         };
+        drop(handler);
         self.bump_prepare_context_generation();
     }
 
