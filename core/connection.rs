@@ -392,7 +392,7 @@ pub struct Connection {
     /// The attached databases' shared schema versions this connection last adopted, summed
     /// (`maybe_update_schema`; wire-rev-line M1). Versions only grow, so the sum moves whenever
     /// any one does. `u64::MAX`: not read yet.
-    attached_schemas_seen: AtomicU64,
+    pub(super) attached_schemas_seen: AtomicU64,
     /// Whether to automatically commit transaction
     pub(crate) auto_commit: AtomicBool,
     pub(super) transaction_state: AtomicTransactionState,
