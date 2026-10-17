@@ -7001,6 +7001,15 @@ mod tests {
             before,
             "a block end with no setting changed bumped the prepare generation"
         );
+        // A SET of a setting the engine does not read (review wire-rework A-M1): every publish ran
+        // the foreign_keys setter, so every SET of any name bumped it too.
+        ok(&s, "SET client_min_messages TO notice");
+        ok(&s, "SET lock_timeout = '1s'");
+        assert_eq!(
+            conn.inner().prepare_context_generation(),
+            before,
+            "a SET of a setting the engine does not read bumped the prepare generation"
+        );
     }
 
     /// fk-guard review LOW 6: postgres/COMPAT.md states the foreign_keys refusal and its code, beside
