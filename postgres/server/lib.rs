@@ -6979,6 +6979,30 @@ mod tests {
         out
     }
 
+    /// fk-guard review MED 1 (the PERF class): a block end whose settings did not change leaves
+    /// the engine's prepare generation alone, so the statements the connection keeps are not all
+    /// re-prepared after every transaction. publish ran set_foreign_keys_enabled at every block
+    /// end, and the setter bumped the generation whether or not the value changed (fastest-engine
+    /// fixes the setter, 49e10e02a). The red reads the generation across BEGIN; SELECT 1; COMMIT,
+    /// and across an implicit single-statement block.
+    #[test]
+    fn a_block_end_that_changes_no_setting_keeps_the_prepare_generation() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = session(&dir);
+        ok(&s, "CREATE TABLE t(id INT)");
+        let conn = s.current(&mut s.state()).unwrap();
+        let before = conn.inner().prepare_context_generation();
+        ok(&s, "BEGIN");
+        ok(&s, "SELECT 1");
+        ok(&s, "COMMIT");
+        ok(&s, "INSERT INTO t VALUES (1)");
+        assert_eq!(
+            conn.inner().prepare_context_generation(),
+            before,
+            "a block end with no setting changed bumped the prepare generation"
+        );
+    }
+
     /// fk-guard review LOW 6: postgres/COMPAT.md states the foreign_keys refusal and its code, beside
     /// the setting's row, and no longer says SET LOCAL of foreign_keys is 0A000 (C41 made it follow
     /// transaction scope).
