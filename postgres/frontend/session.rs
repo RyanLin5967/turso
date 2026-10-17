@@ -2031,33 +2031,22 @@ enum TzInterval {
     Malformed,
 }
 
-/// `literal` is the interval's string, `range` its fields' INTERVAL_RANGE mask (None: no fields).
-/// The literal is `[+-]h[:m[:s]]`, a list of `<number> <unit>`, or a bare number, which is in the
-/// unit of the fields' last one (`INTERVAL '1' DAY` is a day) and seconds with no fields; a
-/// non-zero year, month or day is not allowed. PG 18.6 (pg18-rev-cd-tz2.out): '1 day' and
+/// `literal` is the interval's string, `range` its fields' INTERVAL_RANGE mask (None: no fields;
+/// read, not yet used). The literal is `[+-]h[:m[:s]]`, a bare number, or a list of
+/// `<number> <unit>`, where a non-zero year, month or day is not allowed. PG 18.6 (pg18-rev-cd-tz2.out): '1 day' and
 /// '1 month' 22023, 'x' 22007, '+05:00' HOUR TO MINUTE valid. BLIND SPOT: interval_in's full
 /// grammar (ISO 8601 `PT5H`, `@` forms, fractional units) reads as Malformed here.
 fn timezone_interval(literal: &str, range: Option<i32>) -> TzInterval {
-    const MONTH: i32 = 1 << 1;
-    const YEAR: i32 = 1 << 2;
-    const DAY: i32 = 1 << 3;
-    const HOUR: i32 = 1 << 10;
-    const MINUTE: i32 = 1 << 11;
     let literal = literal.trim();
     if literal.is_empty() {
         return TzInterval::Malformed;
     }
-    if let Ok(n) = literal.parse::<f64>() {
-        // A bare number: the unit of the fields' last one.
-        let unit_is_date = match range {
-            Some(r) if r & (HOUR | MINUTE | (1 << 12)) == 0 => r & (YEAR | MONTH | DAY) != 0,
-            _ => false,
-        };
-        return if unit_is_date && n != 0.0 {
-            TzInterval::NotAllowed
-        } else {
-            TzInterval::Offset
-        };
+    // A bare number is an offset: which unit the fields give it (`INTERVAL '1' DAY`) is not
+    // recorded, so no refusal is read into it (the lead: no rule a recollection alone supports;
+    // owed in the L1 recording).
+    let _ = range;
+    if literal.parse::<f64>().is_ok() {
+        return TzInterval::Offset;
     }
     let clock = |t: &str| {
         let t = t.trim_start_matches(['+', '-']);
@@ -2161,9 +2150,11 @@ fn posix_tz(spec: &str) -> bool {
         }
         *i > start
     };
-    // getsecs: h[:m[:s]], hours up to 167, minutes and seconds up to 59.
+    // getsecs: h[:m[:s]]. The bounds are the recorded ones (pg18-rev-cd-tz2.out): hours up to 167
+    // (UTC+167 SET, UTC+168 refused), minutes up to 59 (UTC+3:59 SET, UTC+3:60 refused); seconds
+    // have no recorded bound and none is applied (the lead: no rule a recollection alone supports).
     let secs = |i: &mut usize| -> bool {
-        let limits = [167u32, 59, 59];
+        let limits = [167u32, 59, u32::MAX];
         for (g, max) in limits.iter().enumerate() {
             let start = *i;
             let mut v: u64 = 0;
@@ -2214,27 +2205,20 @@ fn posix_tz(spec: &str) -> bool {
     if i == b.len() {
         return true;
     }
-    let num = |t: &str, lo: u32, hi: u32| t.parse::<u32>().is_ok_and(|v| (lo..=hi).contains(&v))
-        && t.bytes().all(|c| c.is_ascii_digit());
+    // A rule's shape only: its fields' ranges are not recorded, so none is applied (the lead: no
+    // rule a recollection alone supports); a time of four groups is refused (recorded).
+    let digits = |t: &str| !t.is_empty() && t.bytes().all(|c| c.is_ascii_digit());
     let rule = |r: &str| -> bool {
         let (date, time) = r.split_once('/').unwrap_or((r, "0"));
         let date_ok = if let Some(m) = date.strip_prefix('M') {
             let f: Vec<&str> = m.split('.').collect();
-            f.len() == 3 && num(f[0], 1, 12) && num(f[1], 1, 5) && num(f[2], 0, 6)
-        } else if let Some(j) = date.strip_prefix('J') {
-            num(j, 1, 365)
+            f.len() == 3 && f.iter().all(|x| digits(x))
         } else {
-            num(date, 0, 365)
+            digits(date.strip_prefix('J').unwrap_or(date))
         };
-        let tb = time.as_bytes();
-        let mut k = 0;
-        if matches!(tb.first(), Some(b'+' | b'-')) {
-            k = 1;
-        }
-        let groups: Vec<&str> = time[k..].split(':').collect();
-        let time_ok = groups.len() <= 3
-            && groups.iter().enumerate().all(|(g, x)| num(x, 0, if g == 0 { 167 } else { 59 }));
-        date_ok && time_ok
+        let time = time.strip_prefix(['+', '-']).unwrap_or(time);
+        let groups: Vec<&str> = time.split(':').collect();
+        date_ok && groups.len() <= 3 && groups.iter().all(|x| digits(x))
     };
     // The rules follow a `,` only (PG 18.6: 'EST5EDT;M3.2.0;M11.1.0' is refused).
     if b[i] != b',' {
