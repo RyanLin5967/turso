@@ -1736,7 +1736,32 @@ static PATHS: std::sync::Mutex<Vec<(String, std::sync::Weak<StoreCounts>)>> = st
 fn register_path(db_path: &str, counts: &Arc<StoreCounts>) {
     let mut paths = PATHS.lock().unwrap_or_else(|e| e.into_inner());
     paths.retain(|(p, w)| p != db_path && w.strong_count() > 0);
+    // Counters review MED-3: a database opened under a live store's own files (its catalog,
+    // `<db>-branch-cat`, whose own store is nested and volatile) is not a store of its own here: its
+    // files' syncs stay the outer store's.
+    if paths.iter().any(|(p, w)| w.strong_count() > 0 && path_under(db_path, p)) {
+        return;
+    }
     paths.push((db_path.to_string(), Arc::downgrade(counts)));
+}
+
+/// Test builds: `path` is the file at `db` or one of `db`'s own (`db` followed by `-`).
+#[cfg(test)]
+fn path_under(path: &str, db: &str) -> bool {
+    path == db || path.strip_prefix(db).is_some_and(|r| r.starts_with('-'))
+}
+
+#[cfg(test)]
+impl BranchStore {
+    /// Test builds (counters review HIGH-1): files opened by `path` as given are this store's too.
+    /// The store's own path is the real one (`Database`'s base, symlinks resolved); the database file
+    /// is opened by the path the caller gave, which on macOS differs (/var is /private/var), and its
+    /// syncs were attributed to no store.
+    pub(crate) fn register_path_alias(&self, path: &str) {
+        if !crate::is_memory_like(path) {
+            register_path(path, &self.inner.counts);
+        }
+    }
 }
 
 /// Test builds: a platform-IO file's sync (`io/unix.rs`), kind as in `StoreCounts::syncs`: the
@@ -1745,9 +1770,21 @@ fn register_path(db_path: &str, counts: &Arc<StoreCounts>) {
 #[cfg(test)]
 pub(crate) fn note_path_sync(path: &str, kind: usize) {
     let paths = PATHS.lock().unwrap_or_else(|e| e.into_inner());
-    let owner = paths.iter().rev().find(|(p, _)| path == p || path.strip_prefix(p.as_str()).is_some_and(|r| r.starts_with('-')));
-    if let Some(c) = owner.and_then(|(_, w)| w.upgrade()) {
-        c.syncs[kind].fetch_add(1, Ordering::Relaxed);
+    // Counters review MED-4: the LONGEST live registered path the file is under (`d.db-2-wal` is
+    // `d.db-2`'s, not `d.db`'s), skipping dead entries rather than stopping at them.
+    let owner = paths
+        .iter()
+        .filter(|(p, _)| path_under(path, p))
+        .filter_map(|(p, w)| w.upgrade().map(|c| (p.len(), c)))
+        .max_by_key(|(len, _)| *len);
+    match owner {
+        Some((_, c)) => {
+            c.syncs[kind].fetch_add(1, Ordering::Relaxed);
+        }
+        // HIGH-2: a sync no store owns is a gap the guard counts (`UNSCOPED`), not a silence.
+        None => {
+            UNSCOPED.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 

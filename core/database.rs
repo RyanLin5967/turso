@@ -970,6 +970,12 @@ impl Database {
             branch_base,
             flags.contains(OpenFlags::ReadOnly),
         )?);
+        // Test builds (counters review HIGH-1): the database file is opened by `path` as given,
+        // which may differ from the store's real path; its syncs are the store's too.
+        #[cfg(test)]
+        if path.as_str() != branch_base {
+            branches.register_path_alias(&path);
+        }
         let shared_wal = WalFileShared::new_noop();
         let mv_store = ArcSwapOption::empty();
 
