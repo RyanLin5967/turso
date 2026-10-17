@@ -1443,6 +1443,13 @@ struct PrepareKey {
     conn: Arc<turso_core::Connection>,
     schema: Arc<turso_core::schema::Schema>,
     path_stamp: u64,
+    /// The engine's prepare generation, which every input of the engine's compile moves:
+    /// attached and temp schema changes (review wire-rework E-H1: DDL in an attached schema left
+    /// the main schema and the path as they were, so a kept statement ran stale and the engine's
+    /// own re-prepare resolved it without the session's path) and engine settings such as
+    /// foreign_keys. On a mismatch the WIRE prepares again under the session's current options, so
+    /// a kept statement never reaches the engine's re-prepare.
+    generation: u64,
 }
 
 impl PrepareKey {
@@ -1451,6 +1458,7 @@ impl PrepareKey {
             conn: conn.inner().clone(),
             schema: conn.inner().current_schema(),
             path_stamp: conn.search_path_stamp(),
+            generation: conn.inner().prepare_context_generation(),
         }
     }
 
@@ -1458,6 +1466,7 @@ impl PrepareKey {
         Arc::ptr_eq(&self.conn, &other.conn)
             && Arc::ptr_eq(&self.schema, &other.schema)
             && self.path_stamp == other.path_stamp
+            && self.generation == other.generation
     }
 }
 
@@ -2447,6 +2456,11 @@ impl Session {
         conn: &PgConnection,
         sql: &str,
     ) -> Option<(turso_core::Statement, StatementTypes)> {
+        // Nothing kept for the text: no key read (review wire-rework E, cost LOW: every Execute of
+        // a portal paid PrepareKey::of with nothing kept).
+        if self.state().described.for_sql(sql).is_none() {
+            return None;
+        }
         let key = PrepareKey::of(conn);
         let mut st = self.state();
         st.described.take(sql, &key).map(|d| (d.stmt, d.types))
