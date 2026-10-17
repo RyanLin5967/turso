@@ -1432,12 +1432,41 @@ struct QueryFailure {
     started: Option<Started>,
 }
 
+/// Every input a prepare reads, beside its text: the engine connection, its schema snapshot (held,
+/// so its identity cannot be reused by a later snapshot: review wire-rework B-L2, the version
+/// number could repeat after a ROLLBACK TO), and the session's search path, which translation
+/// resolves unqualified names by (B-H1). A kept statement is reused only under an equal key. The
+/// engine's own settings (foreign_keys and the PRAGMA-level ones) are not in it: the engine
+/// re-prepares a statement whose prepare generation they moved (B-H2's root is that reprepare,
+/// fastest-engine's).
+struct PrepareKey {
+    conn: Arc<turso_core::Connection>,
+    schema: Arc<turso_core::schema::Schema>,
+    path_stamp: u64,
+}
+
+impl PrepareKey {
+    fn of(conn: &PgConnection) -> Self {
+        Self {
+            conn: conn.inner().clone(),
+            schema: conn.inner().current_schema(),
+            path_stamp: conn.search_path_stamp(),
+        }
+    }
+
+    fn same(&self, other: &PrepareKey) -> bool {
+        Arc::ptr_eq(&self.conn, &other.conn)
+            && Arc::ptr_eq(&self.schema, &other.schema)
+            && self.path_stamp == other.path_stamp
+    }
+}
+
 /// A statement Describe prepared: on which engine connection, from which text.
 struct Described {
     conn: Arc<turso_core::Connection>,
-    /// The connection's schema version when it was prepared: a statement kept across a schema
-    /// change is prepared again, not reused (C53 follow-up review B1).
-    schema_version: u32,
+    /// What it was prepared under: reused only under the same key (review wire-rework B-H1, C53
+    /// follow-up review B1).
+    key: PrepareKey,
     sql: String,
     stmt: turso_core::Statement,
     /// The types the parse gave (see [`PgConnection::prepare_typed`]).
@@ -1462,11 +1491,15 @@ impl Kept {
         self.0.iter().rev().find(|d| d.sql == sql)
     }
 
-    /// Whether `sql` is kept on `conn` at the schema version `version`.
-    fn holds(&self, sql: &str, conn: &Arc<turso_core::Connection>, version: u32) -> bool {
-        self.0
-            .iter()
-            .any(|d| d.sql == sql && Arc::ptr_eq(&d.conn, conn) && d.schema_version == version)
+    /// Whether a statement for `sql` is kept on `conn` at all: the cheap check made before the
+    /// key is read (review wire-rework B-M1: the schema lock was taken on every Bind and Describe).
+    fn candidate(&self, sql: &str, conn: &Arc<turso_core::Connection>) -> bool {
+        self.0.iter().any(|d| d.sql == sql && Arc::ptr_eq(&d.conn, conn))
+    }
+
+    /// Whether `sql` is kept under `key`.
+    fn holds(&self, sql: &str, key: &PrepareKey) -> bool {
+        self.0.iter().any(|d| d.sql == sql && d.key.same(key))
     }
 
     /// Keep `d`, in place of any statement kept for its text.
@@ -1482,13 +1515,13 @@ impl Kept {
         self.0.retain(|k| k.sql != sql);
     }
 
-    /// Take the statement kept for `sql` on `conn`.
-    fn take(&mut self, sql: &str, conn: &Arc<turso_core::Connection>) -> Option<Described> {
-        let at = self
-            .0
-            .iter()
-            .position(|d| d.sql == sql && Arc::ptr_eq(&d.conn, conn))?;
-        Some(self.0.remove(at))
+    /// Take the statement kept for `sql` under `key`; one kept under another key is dropped, as
+    /// it can no longer be reused (B-H1: take matched the text alone, so a statement resolved
+    /// before a SET search_path ran after it).
+    fn take(&mut self, sql: &str, key: &PrepareKey) -> Option<Described> {
+        let at = self.0.iter().position(|d| d.sql == sql)?;
+        let d = self.0.remove(at);
+        d.key.same(key).then_some(d)
     }
 }
 
@@ -2305,7 +2338,7 @@ impl Session {
                 parameter_types(&types, declared).map_err(PgWireError::UserError)?;
                 self.state().described.put(Described {
                     conn: conn.inner().clone(),
-                    schema_version: conn.inner().current_schema().schema_version,
+                    key: PrepareKey::of(&conn),
                     sql: parsed.sql.clone(),
                     stmt,
                     types,
@@ -2346,10 +2379,11 @@ impl Session {
         // BindComplete (C53 follow-up review B1). The connection first takes any schema another
         // session published, as its next statement would. RED OWED: a PG 18.6 recording of P /
         // Q DROP / B / E / S and of the cross-session variant (LOUD-OWED).
-        conn.inner().maybe_update_schema();
-        let version = conn.inner().current_schema().schema_version;
-        if self.state().described.holds(sql, conn.inner(), version) {
-            return Ok(());
+        if self.state().described.candidate(sql, conn.inner()) {
+            conn.inner().maybe_update_schema();
+            if self.state().described.holds(sql, &PrepareKey::of(&conn)) {
+                return Ok(());
+            }
         }
         let in_tx = !conn.inner().get_auto_commit();
         // Never the prepare that performs a statement (ALTER ADD CONSTRAINT, COPY FROM, SET,
@@ -2359,7 +2393,7 @@ impl Session {
             Ok(Some((stmt, types))) => {
                 self.state().described.put(Described {
                     conn: conn.inner().clone(),
-                    schema_version: conn.inner().current_schema().schema_version,
+                    key: PrepareKey::of(&conn),
                     sql: sql.to_string(),
                     stmt,
                     types,
@@ -2413,10 +2447,9 @@ impl Session {
         conn: &PgConnection,
         sql: &str,
     ) -> Option<(turso_core::Statement, StatementTypes)> {
+        let key = PrepareKey::of(conn);
         let mut st = self.state();
-        st.described
-            .take(sql, conn.inner())
-            .map(|d| (d.stmt, d.types))
+        st.described.take(sql, &key).map(|d| (d.stmt, d.types))
     }
 
     /// One statement through the engine. A statement that meets a lock another session holds waits
