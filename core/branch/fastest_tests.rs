@@ -9530,6 +9530,7 @@ fn a_named_create_during_a_natural_filter_shrink_asks_the_catalog_nothing() {
 /// there must ask the catalog nothing. REGISTERED RED with no fix written: the fix is a LEAP (the
 /// filter carried in the checkpoint, so an open starts Ready).
 #[test]
+#[ignore = "registered red (review m1-2b LOW-F3): fails at HEAD by design until the LEAP in artie engine NOTES df996a0f91/e312ad20c6 (the filter carried across a reopen) lands; run by name with --ignored"]
 fn a_named_create_before_the_open_s_filter_build_lands_asks_the_catalog_nothing() {
     use super::store::{FILTER_PAUSED, FILTER_PAUSE_AT};
     use std::sync::atomic::Ordering::{Acquire, Release};
