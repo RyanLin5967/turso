@@ -1,0 +1,81 @@
+>> Q SET TimeZone = '+05:30:00'
+   C SET
+   Z I
+>> Q SET TimeZone = '+05:30:15'
+   E S=ERROR C=22023 M=time zone "+05:30:15" appears to use leap seconds
+   Z I
+>> Q SET TimeZone = 'UTC+3:00:60'
+   C SET
+   Z I
+>> Q SET TimeZone = 'UTC+3:59:30'
+   E S=ERROR C=22023 M=time zone "UTC+3:59:30" appears to use leap seconds
+   Z I
+>> Q SET TimeZone = 'UTC+3:00:00'
+   C SET
+   Z I
+>> Q SET TimeZone = '0.001'
+   C SET
+   Z I
+>> Q SET TimeZone = 'EST5EDT,M3.2.0;M11.1.0'
+   E S=ERROR C=22023 M=invalid value for parameter "TimeZone": "EST5EDT,M3.2.0;M11.1.0"
+   Z I
+>> Q SET TimeZone = ':EST5'
+   E S=ERROR C=22023 M=invalid value for parameter "TimeZone": ":EST5"
+   Z I
+>> Q SET TimeZone = 'A;B5'
+   C SET
+   Z I
+>> Q SET TimeZone = 'interval5'
+   E S=ERROR C=22023 M=invalid value for parameter "TimeZone": "interval5"
+   Z I
+>> Q SET TimeZone = '0x1p3'
+   C SET
+   Z I
+>> Q SET TimeZone = 'EST5EDT,M13.1.0,M11.1.0'
+   E S=ERROR C=22023 M=invalid value for parameter "TimeZone": "EST5EDT,M13.1.0,M11.1.0"
+   Z I
+>> Q SET TimeZone = 'EST5EDT,J0,J366'
+   E S=ERROR C=22023 M=invalid value for parameter "TimeZone": "EST5EDT,J0,J366"
+   Z I
+>> Q SET TimeZone = 'EST5EDT,M3.2.0/200,M11.1.0'
+   E S=ERROR C=22023 M=invalid value for parameter "TimeZone": "EST5EDT,M3.2.0/200,M11.1.0"
+   Z I
+>> Q SET TIME ZONE INTERVAL '1 month' HOUR
+   E S=ERROR C=22023 M=invalid value for parameter "TimeZone": "INTERVAL '1 mon'"
+   Z I
+>> Q SET TIME ZONE INTERVAL '200 hours'
+   E S=ERROR C=22023 M=invalid value for parameter "TimeZone": "INTERVAL '200:00:00'"
+   Z I
+>> Q SET TIME ZONE INTERVAL '+200:00'
+   E S=ERROR C=22023 M=invalid value for parameter "TimeZone": "INTERVAL '200:00:00'"
+   Z I
+>> Q SET TIME ZONE INTERVAL 'infinity'
+   E S=ERROR C=22023 M=invalid value for parameter "TimeZone": "INTERVAL 'infinity'"
+   Z I
+>> Q SET TIME ZONE INTERVAL 'inf'
+   E S=ERROR C=22007 M=invalid input syntax for type interval: "inf"
+   Z I
+>> Q SET TIME ZONE INTERVAL 'nan'
+   E S=ERROR C=22007 M=invalid input syntax for type interval: "nan"
+   Z I
+>> Q SET TIME ZONE INTERVAL '1 week'
+   E S=ERROR C=22023 M=invalid value for parameter "TimeZone": "INTERVAL '7 days'"
+   Z I
+>> Q SET TIME ZONE INTERVAL '5 hrs'
+   C SET
+   Z I
+>> Q SET TIME ZONE INTERVAL '1 h'
+   C SET
+   Z I
+>> Q SET TIME ZONE INTERVAL '13 months'
+   E S=ERROR C=22023 M=invalid value for parameter "TimeZone": "INTERVAL '1 year 1 mon'"
+   Z I
+>> Q SET TIME ZONE INTERVAL '-1 day 1 hour'
+   E S=ERROR C=22023 M=invalid value for parameter "TimeZone": "INTERVAL '-1 days +01:00:00'"
+   Z I
+>> Q SET TIME ZONE INTERVAL '5'
+   C SET
+   Z I
+>> Q SET TimeZone = 'UTC'
+   C SET
+   Z I

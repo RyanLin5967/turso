@@ -13905,7 +13905,13 @@ fn client_text_cannot_carry_the_sqlite_marker() {
 /// beside it.
 #[test]
 fn every_recorded_timezone_value_is_classified_as_postgresql_did() {
-    let recording = include_str!("pg18/pg18-rev-cd-tz2.out");
+    // Both recordings (rev-l1-tz: the cases the reviews owed, review wire-line3 LOW-3/LOW-4), and
+    // EVERY error row's message compared exactly (LOW-5: two of 35 were).
+    let recording = [
+        include_str!("pg18/pg18-rev-cd-tz2.out"),
+        include_str!("pg18/pg18-rev-l1-tz.out"),
+    ]
+    .join("\n");
     let dir = Scratch::new("tz-classify");
     let server = Server::start(&dir.db(), &[]);
     let mut a = server.connect();
@@ -13930,8 +13936,7 @@ fn every_recorded_timezone_value_is_classified_as_postgresql_did() {
                 let message = message.trim_start().strip_prefix("M=").unwrap_or("");
                 match &r.error {
                     Some(e) if e.code == code => {
-                        let exact = sql.contains("'1 month'") || sql.contains("+05:30:15");
-                        if exact && e.message != message {
+                        if e.message != message {
                             wrong.push(format!("{sql}: message {:?}, PostgreSQL {:?}", e.message, message));
                         }
                     }
@@ -13945,7 +13950,7 @@ fn every_recorded_timezone_value_is_classified_as_postgresql_did() {
             },
         }
     }
-    assert!(rows >= 35, "premise: {rows} recorded rows");
+    assert!(rows >= 62, "premise: {rows} recorded rows");
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
@@ -14014,3 +14019,4 @@ fn schema_and_table_names_holding_quotes_are_quoted_in_engine_text() {
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+replays_postgresql!(pg18_rev_l1_tz_replays_as_postgresql_answered, "pg18-rev-l1-tz.out", []);
