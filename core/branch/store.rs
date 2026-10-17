@@ -3155,7 +3155,12 @@ impl NameFilter {
             drop(t);
             return;
         }
-        if let Some(slot) = self.retired.iter_mut().find(|s| s.is_none()) {
+        let slot = self.retired.iter_mut().find(|s| s.is_none());
+        // Every hold that notes takes the retired tables (`take_retired`), and one hold retires at
+        // most four, so a full array is a broken invariant (review filter3 L4): refused loudly in
+        // test and debug builds, never freed in place silently (a release build frees it here).
+        debug_assert!(slot.is_some(), "the name filter's retired slots are full: a hold retired a fifth table");
+        if let Some(slot) = slot {
             *slot = Some(t);
         }
     }
