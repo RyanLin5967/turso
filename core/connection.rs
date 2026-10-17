@@ -3734,6 +3734,8 @@ impl Connection {
                             init.db.experimental_mvcc_passive_checkpoint_enabled(),
                         )?;
                         init.db.mv_store.store(Some(mv_store));
+                        // The MV store is compiled into every connection's programs (review c42b MED-3, LOW-2).
+                        init.db.bump_prepare_context_generation();
                         *state = AttachDatabaseState::Bootstrap(Box::new(
                             AttachDatabaseBootstrapState {
                                 alias: init.alias.clone(),

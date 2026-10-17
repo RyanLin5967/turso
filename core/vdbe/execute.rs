@@ -18318,6 +18318,8 @@ impl Drop for MvccBootstrapGuard {
             self.connection.promote_to_regular_connection();
         }
         self.connection.db.mv_store.store(None);
+        // The MV store is compiled into every connection's programs (review c42b MED-3, LOW-2).
+        self.connection.db.bump_prepare_context_generation();
     }
 }
 

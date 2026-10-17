@@ -2692,6 +2692,8 @@ impl Database {
                             self.experimental_mvcc_passive_checkpoint_enabled(),
                         )?;
                         self.mv_store.store(Some(mv_store));
+                        // The MV store is compiled into every connection's programs (review c42b MED-3, LOW-2).
+                        self.bump_prepare_context_generation();
                     }
 
                     return Ok(IOResult::Done(Arc::new(*pager)));
@@ -2793,6 +2795,8 @@ impl Database {
                 self.experimental_mvcc_passive_checkpoint_enabled(),
             )?;
             self.mv_store.store(Some(mv_store.clone()));
+            // The MV store is compiled into every connection's programs (review c42b MED-3, LOW-2).
+            self.bump_prepare_context_generation();
             let mvcc_bootstrap_conn = self._connect(true, None, None, None)?;
             match mv_store.bootstrap(mvcc_bootstrap_conn.clone()) {
                 Ok(()) => {}
@@ -2804,6 +2808,8 @@ impl Database {
             }
         } else {
             self.mv_store.store(None);
+            // The MV store is compiled into every connection's programs (review c42b MED-3, LOW-2).
+            self.bump_prepare_context_generation();
         }
         Ok(())
     }
