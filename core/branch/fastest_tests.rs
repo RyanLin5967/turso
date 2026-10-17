@@ -3480,7 +3480,7 @@ fn a_client_checkpoint_s_wait_for_a_flight_ends_at_its_deadline_or_its_interrupt
             let begun = std::time::Instant::now();
             let interrupted = move || interrupt_after.is_some_and(|d| begun.elapsed() >= d);
             let r = db.branch_compact_now_within(begun + until, &interrupted);
-            let _ = tx.send(r.map_err(|e| e.to_string()));
+            let _ = tx.send((r, begun.elapsed()));
         });
         rx.recv_timeout(std::time::Duration::from_secs(30))
     };
@@ -3488,10 +3488,21 @@ fn a_client_checkpoint_s_wait_for_a_flight_ends_at_its_deadline_or_its_interrupt
     let interrupted = call(std::time::Duration::from_secs(600), Some(std::time::Duration::from_millis(100)));
     db.branch_checkpoint_hold(0);
     db.branch_checkpoint_wait();
-    let at_deadline = at_deadline.expect("CLAIM: a client's CHECKPOINT waited past its 300 ms deadline for the flight in flight (no return in 30 s)");
-    let interrupted = interrupted.expect("CLAIM: a client's CHECKPOINT went on waiting for the flight after its interrupt (no return in 30 s)");
-    assert!(at_deadline.is_err(), "CLAIM: at its deadline the CHECKPOINT reported success with the flight still held");
-    assert!(interrupted.as_ref().is_err_and(|e| e.to_lowercase().contains("interrupt")), "CLAIM: an interrupted CHECKPOINT did not report the interrupt: {interrupted:?}");
+    let (at_deadline, took) = at_deadline.expect("CLAIM: a client's CHECKPOINT waited past its 300 ms deadline for the flight in flight (no return in 30 s)");
+    let (interrupted, _) = interrupted.expect("CLAIM: a client's CHECKPOINT went on waiting for the flight after its interrupt (no return in 30 s)");
+    // Review C42 MED-4 (FLAGGED: this red's own assertions sharpened before it first ran): by
+    // variant, not by text; not before the deadline; and a positive control.
+    assert!(matches!(at_deadline, Err(LimboError::Busy)), "CLAIM: at its deadline the CHECKPOINT did not report Busy: {at_deadline:?}");
+    assert!(took >= std::time::Duration::from_millis(300), "CLAIM: the CHECKPOINT gave up before its 300 ms deadline ({took:?})");
+    assert!(matches!(interrupted, Err(LimboError::Interrupt)), "CLAIM: an interrupted CHECKPOINT did not report the interrupt: {interrupted:?}");
+    // New records since the held checkpoint's cut, so a compaction has something to cut.
+    for _ in 0..8 {
+        let _ = trunk.fork_branch().unwrap().into_id();
+    }
+    let log0 = db.branches.log_len_for_test();
+    let unheld = db.branch_compact_now_within(std::time::Instant::now() + std::time::Duration::from_secs(10), &|| false);
+    assert!(unheld.is_ok(), "CLAIM (positive control): with no flight held, a bounded CHECKPOINT failed: {unheld:?}");
+    assert!(db.branches.log_len_for_test() < log0, "CLAIM (positive control): the bounded CHECKPOINT compacted nothing (log {log0} -> {})", db.branches.log_len_for_test());
 }
 
 /// Review C42 MED-2 (lead ruling "C42-M1 review, bounded end to end"): a client's CHECKPOINT is
