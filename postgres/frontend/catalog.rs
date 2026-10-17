@@ -66,33 +66,43 @@ impl Dialect for PostgresDialect {
             Some(next) => next.stmt_location as usize,
             None => sql.len(),
         };
-        // A statement whose translation reads its relations' columns (DELETE ... USING, a
-        // positional INSERT with DEFAULT, an alias column list) cannot be translated here, where
-        // no connection's lookup exists: the session's prepare builds that translator, and a
-        // statement the wire keeps is prepared again by the wire under it (review wire-rework
-        // E-M2, E-H1). Reached only by the engine's own re-prepare of such a statement; it is
-        // refused rather than translated without the lookup or read as SQLite. BLIND SPOT: a
-        // re-prepare the engine starts itself (another session's DDL mid-statement) fails here
-        // instead of re-translating; owed to fastest-engine (a Dialect parse given the
-        // re-preparing connection).
-        if crate::session::is_delete_using(sql, &parse_result)
-            || crate::session::is_positional_insert_default(sql, &parse_result)
-            || crate::session::has_alias_column_list(&parse_result)
-        {
-            return Err(turso_core::LimboError::InternalError(
-                "this statement must be prepared again by its session: its translation reads \
-                 its relations' columns"
-                    .to_string(),
-            ));
-        }
-        // Text PostgreSQL parsed is PostgreSQL's: a translation failure is an error, never a
-        // reading of the same text as SQLite, which can mean something else (`SELECT ?1`: an
-        // operator there, a parameter here).
         let translator = turso_pg_parser::translator::PostgreSQLTranslator::new();
         match translator.translate(&parse_result) {
             Ok(stmt) => Ok((Some(turso_parser::ast::Cmd::Stmt(stmt)), consumed)),
             Err(e) => Err(LimboError::ParseError(e.into())),
         }
+    }
+
+    /// The engine's re-prepare of a statement on `conn`: when `conn` is a session's, its text is
+    /// translated as that session's prepare translated it ([`crate::session::reprepare_translation`]:
+    /// the column lookups, the known types, the positional-INSERT naming and the session's search
+    /// path), ONE TRANSLATION PATH (the wire line review M1-M4); otherwise as [`Dialect::parse`].
+    /// 92257e453's refusal list is gone: it over-refused a CTE alias and any text holding
+    /// "default", and still left a domain cast without its CHECK.
+    fn parse_for_reprepare(
+        &self,
+        sql: &str,
+        conn: &Arc<Connection>,
+    ) -> Result<(Option<turso_parser::ast::Cmd>, usize)> {
+        let Some(pg_conn) = crate::session::session_of(conn) else {
+            return self.parse(sql);
+        };
+        if sql.starts_with(SQLITE_TEXT_MARKER) {
+            return turso_core::dialect::sqlite::parse(sql);
+        }
+        let Ok(parse_result) = turso_pg_parser::parse(sql) else {
+            return turso_core::dialect::sqlite::parse(sql);
+        };
+        let stmts = &parse_result.protobuf.stmts;
+        if stmts.is_empty() {
+            return Ok((None, sql.len()));
+        }
+        let consumed = match stmts.get(1) {
+            Some(next) => next.stmt_location as usize,
+            None => sql.len(),
+        };
+        let cmd = crate::session::reprepare_translation(&pg_conn, sql, &parse_result)?;
+        Ok((Some(cmd), consumed))
     }
 
     fn parse_table_sql(&self, sql: &str, root_page: i64) -> Result<BTreeTable> {

@@ -6009,6 +6009,12 @@ pub enum PgSetValue {
     Bool(bool),
     RawSql(String),
     Null,
+    /// `INTERVAL '<literal>' [fields]` (SET TIME ZONE INTERVAL ...): the literal and the fields'
+    /// range mask (PostgreSQL's INTERVAL_RANGE bits: MONTH 1<<1, YEAR 1<<2, DAY 1<<3, HOUR 1<<10,
+    /// MINUTE 1<<11, SECOND 1<<12), or None with no fields. Read whole from the TypeCast, so the
+    /// TimeZone check sees what check_timezone sees (the wire line review M6: the deparse kept the
+    /// literal alone, quotes and all).
+    Interval { literal: String, range: Option<i32> },
 }
 
 impl PgSetValue {
@@ -6032,6 +6038,27 @@ impl PgSetValue {
                     Val::Bsval(_) => deparse_default_expr(node).map(Self::RawSql),
                 }
             }
+            Some(Node::TypeCast(cast)) if cast_is_interval(cast) => {
+                let literal = match cast.arg.as_ref().and_then(|a| a.node.as_ref()) {
+                    Some(Node::AConst(c)) => match c.val.as_ref()? {
+                        Val::Sval(s) => s.sval.clone(),
+                        _ => return deparse_default_expr(node).map(Self::RawSql),
+                    },
+                    _ => return deparse_default_expr(node).map(Self::RawSql),
+                };
+                let range = cast
+                    .type_name
+                    .as_ref()
+                    .and_then(|t| t.typmods.first())
+                    .and_then(|m| match m.node.as_ref() {
+                        Some(Node::AConst(c)) => match c.val.as_ref() {
+                            Some(Val::Ival(i)) => Some(i.ival),
+                            _ => None,
+                        },
+                        _ => None,
+                    });
+                Some(Self::Interval { literal, range })
+            }
             _ => deparse_default_expr(node).map(Self::RawSql),
         }
     }
@@ -6050,6 +6077,9 @@ impl PgSetValue {
             }
             PgSetValue::Null => "NULL".to_string(),
             PgSetValue::RawSql(value) => value.clone(),
+            PgSetValue::Interval { literal, .. } => {
+                format!("INTERVAL '{}'", literal.replace('\'', "''"))
+            }
         }
     }
 
@@ -6060,6 +6090,17 @@ impl PgSetValue {
             _ => None,
         }
     }
+}
+
+/// Whether a TypeCast is to `interval` (or `pg_catalog.interval`).
+fn cast_is_interval(cast: &pg_query::protobuf::TypeCast) -> bool {
+    use pg_query::protobuf::node::Node;
+    cast.type_name.as_ref().is_some_and(|t| {
+        t.array_bounds.is_empty()
+            && t.names.last().and_then(|n| n.node.as_ref()).is_some_and(
+                |n| matches!(n, Node::String(s) if s.sval.eq_ignore_ascii_case("interval")),
+            )
+    })
 }
 
 /// Extracted SHOW statement: `SHOW name`

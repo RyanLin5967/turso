@@ -334,12 +334,40 @@ pub fn open_database_with_io(
     )
 }
 
+/// Each engine connection's session ([`PgConnectionInner`]), by the connection's address, for the
+/// engine's re-prepare: [`crate::catalog::PostgresDialect`]'s `parse_for_reprepare` gets the
+/// engine connection only and translates as the session's prepare does through it (ONE
+/// TRANSLATION PATH, the wire line review M1-M4). An entry is removed when its session drops.
+static SESSIONS_BY_CONNECTION: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<usize, std::sync::Weak<PgConnectionInner>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// The session of the engine connection `conn`, if one is alive.
+pub(crate) fn session_of(conn: &Arc<Connection>) -> Option<Arc<PgConnectionInner>> {
+    SESSIONS_BY_CONNECTION
+        .lock()
+        .get(&(Arc::as_ptr(conn) as usize))
+        .and_then(std::sync::Weak::upgrade)
+        .filter(|inner| Arc::ptr_eq(&inner.conn, conn))
+}
+
+impl Drop for PgConnectionInner {
+    fn drop(&mut self) {
+        let key = Arc::as_ptr(&self.conn) as usize;
+        let mut sessions = SESSIONS_BY_CONNECTION.lock();
+        // Only this session's own entry: another may since have registered the same address.
+        if sessions.get(&key).is_some_and(|w| w.strong_count() == 0) {
+            sessions.remove(&key);
+        }
+    }
+}
+
 impl PgConnection {
     pub fn new(conn: Arc<Connection>) -> Self {
         aliases::install(&conn);
         // PostgreSQL enforces every foreign key; the engine only under PRAGMA foreign_keys.
         conn.set_foreign_keys_enabled(true);
-        Self {
+        let pg = Self {
             inner: Arc::new(PgConnectionInner {
                 conn,
                 session_state: parking_lot::Mutex::new(SessionState::default()),
@@ -351,7 +379,11 @@ impl PgConnection {
                 search_path_stamp: std::sync::atomic::AtomicU64::new(0),
                 warnings: parking_lot::Mutex::new(Vec::new()),
             }),
-        }
+        };
+        SESSIONS_BY_CONNECTION
+            .lock()
+            .insert(Arc::as_ptr(&pg.inner.conn) as usize, Arc::downgrade(&pg.inner));
+        pg
     }
 
     pub fn inner(&self) -> &Arc<Connection> {
@@ -1252,44 +1284,7 @@ fn prepare_statement_parsed(
     // lookup refuses one. An INSERT whose VALUES lists, with no column list, hold DEFAULT names its
     // positions from the in-memory schema alone (no catalog query). No other statement pays for a
     // lookup.
-    let translator = || {
-        if is_delete_using(sql, &parse_result) {
-            let pg_conn = pg_conn.clone();
-            PostgreSQLTranslator::new()
-                .with_columns(move |schema, table| relation_columns(&pg_conn, schema, table))
-        } else if is_positional_insert_default(sql, &parse_result)
-            || has_alias_column_list(&parse_result)
-        {
-            let pg_conn = pg_conn.clone();
-            PostgreSQLTranslator::new()
-                .with_columns(move |schema, table| resident_relation_columns(&pg_conn, schema, table))
-        } else {
-            PostgreSQLTranslator::new()
-        }
-    };
-    let first = translator();
-    let mut translated = first
-        .translate_with_prereqs(&parse_result)
-        .map_err(|e| LimboError::ParseError(e.into()))?;
-    // A cast to a type that is not built-in is kept by name only when it is the engine's own (a
-    // domain, a custom type), so the engine runs its CHECKs: `CAST(-5 AS dm)` returned -5 (the
-    // domain CHECK class's PG 18.6 replay, 2026-10-15). Looked up, and translated again, only for
-    // a statement that casts to such a name.
-    let unmapped = first.unmapped_cast_types();
-    if !unmapped.is_empty() {
-        let schema = pg_conn.conn.current_schema();
-        let known: std::collections::HashSet<String> = unmapped
-            .into_iter()
-            .filter(|name| schema.get_type_def_unchecked(name).is_some())
-            .collect();
-        if !known.is_empty() {
-            translated = translator()
-                .with_known_types(known)
-                .translate_with_prereqs(&parse_result)
-                .map_err(|e| LimboError::ParseError(e.into()))?;
-        }
-    }
-    reject_catalog_dml(translated.cmd.stmt())?;
+    let translated = session_translation(pg_conn, sql, &parse_result, false)?;
     drop(translating);
     // A statement with prerequisites (a CREATE TABLE's SERIAL sequences) is performed below, keys
     // and all, so the server has no keys left to resolve.
@@ -1334,11 +1329,7 @@ fn prepare_statement_parsed(
         // leading columns. Asked again, the translator reads the table's columns and names them, on
         // this refusal path only, so a positional INSERT that fits pays for no lookup.
         if prepared.is_err() && is_positional_insert_values(&parse_result) {
-            let lookup_conn = pg_conn.clone();
-            let retried = PostgreSQLTranslator::new()
-                .with_columns(move |schema, table| resident_relation_columns(&lookup_conn, schema, table))
-                .translate_with_prereqs(&parse_result)
-                .map_err(|e| LimboError::ParseError(e.into()))?;
+            let retried = session_translation(pg_conn, sql, &parse_result, true)?;
             return pg_conn
                 .conn
                 .prepare_translated_cmd_with_options(retried.cmd, sql, &options)
@@ -1369,6 +1360,88 @@ fn prepare_statement_parsed(
         }
     })?;
     noop_statement(&pg_conn.conn).map(Some)
+}
+
+/// THE translation of a statement, for the session's prepare and for the engine's re-prepare of it
+/// alike (ONE TRANSLATION PATH, the wire line review M1-M4: the re-prepare translated with a plain
+/// translator, so a DELETE ... USING lost its column lookup, a domain cast its CHECK, and
+/// 92257e453's refusal list over-refused a CTE alias and any text with "default").
+/// - A DELETE ... USING reads its relations' declared columns (wire review 13 item 5, review 15
+///   item 7), wherever it sits (EXPLAIN's, a CTE's: wire review 16 item 21); a translator with no
+///   lookup refuses one.
+/// - An INSERT whose VALUES lists, with no column list, hold DEFAULT, or a FROM item with an alias
+///   column list, names its positions from the in-memory schema alone (no catalog query).
+/// - `positional_retry`: a positional INSERT the engine refused at its first compile (a VALUES list
+///   of another length than the table's) is asked again with the in-memory column lookup, which
+///   names the columns. The re-prepare takes that translator for every positional INSERT VALUES:
+///   it cannot see a compile failure, and naming the columns is the same statement when the
+///   lengths agree.
+/// - A cast to a type that is not built-in is kept by name only when it is the engine's own (a
+///   domain, a custom type), so the engine runs its CHECKs (`CAST(-5 AS dm)` returned -5: the
+///   domain CHECK class's PG 18.6 replay, 2026-10-15).
+/// No other statement pays for a lookup. The search path is the session's own: every lookup reads
+/// it, and so does the prepare's PrepareOptions.
+pub(crate) fn session_translation(
+    pg_conn: &Arc<PgConnectionInner>,
+    sql: &str,
+    parse_result: &turso_pg_parser::pg_query::ParseResult,
+    positional_retry: bool,
+) -> Result<turso_pg_parser::translator::TranslateResult> {
+    let translator = || {
+        if is_delete_using(sql, parse_result) {
+            let pg_conn = pg_conn.clone();
+            PostgreSQLTranslator::new()
+                .with_columns(move |schema, table| relation_columns(&pg_conn, schema, table))
+        } else if positional_retry
+            || is_positional_insert_default(sql, parse_result)
+            || has_alias_column_list(parse_result)
+        {
+            let pg_conn = pg_conn.clone();
+            PostgreSQLTranslator::new()
+                .with_columns(move |schema, table| resident_relation_columns(&pg_conn, schema, table))
+        } else {
+            PostgreSQLTranslator::new()
+        }
+    };
+    let first = translator();
+    let mut translated = first
+        .translate_with_prereqs(parse_result)
+        .map_err(|e| LimboError::ParseError(e.into()))?;
+    let unmapped = first.unmapped_cast_types();
+    if !unmapped.is_empty() {
+        let schema = pg_conn.conn.current_schema();
+        let known: std::collections::HashSet<String> = unmapped
+            .into_iter()
+            .filter(|name| schema.get_type_def_unchecked(name).is_some())
+            .collect();
+        if !known.is_empty() {
+            translated = translator()
+                .with_known_types(known)
+                .translate_with_prereqs(parse_result)
+                .map_err(|e| LimboError::ParseError(e.into()))?;
+        }
+    }
+    reject_catalog_dml(translated.cmd.stmt())?;
+    Ok(translated)
+}
+
+/// The engine's re-prepare of a statement this session prepared: through
+/// [`session_translation`], as the prepare translated it. A statement with prerequisites (a CREATE
+/// TABLE's SERIAL sequences) is performed whole by its prepare and is never re-prepared, so one
+/// here is refused rather than compiled without them.
+pub(crate) fn reprepare_translation(
+    pg_conn: &Arc<PgConnectionInner>,
+    sql: &str,
+    parse_result: &turso_pg_parser::pg_query::ParseResult,
+) -> Result<ast::Cmd> {
+    let translated =
+        session_translation(pg_conn, sql, parse_result, is_positional_insert_values(parse_result))?;
+    if !translated.prereqs.is_empty() {
+        return Err(LimboError::InternalError(
+            "a statement with prerequisites is not re-prepared".to_string(),
+        ));
+    }
+    Ok(translated.cmd)
 }
 
 fn reject_catalog_dml(stmt: &ast::Stmt) -> Result<()> {
@@ -1609,6 +1682,8 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
         | PgSetValue::RawSql(v) => v.clone(),
         PgSetValue::Bool(b) => b.to_string(),
         PgSetValue::Null => String::new(),
+        // As PostgreSQL quotes it in its refusal: `INTERVAL '1 day'`.
+        PgSetValue::Interval { .. } => value.to_sql_string(),
     };
     let text = if name == "datestyle" {
         set_stmt
@@ -1833,20 +1908,21 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
             // UNVERIFIED beyond the recorded rows (review wire-rework C, finding (1)): the
             // interval, strtod and tzcode grammar below follow PostgreSQL's check_timezone and
             // tzparse as read, until one strict PG 18.6 recording of every case (LOUD-OWED).
-            if let Some(body) = lower.strip_prefix("interval") {
-                match timezone_interval(body) {
-                    TzInterval::Offset => return unsupported("this server answers only by its own setting of it"),
-                    TzInterval::NotAllowed(unit) => {
-                        return refused(format!("invalid interval value for time zone: {unit} not allowed"))
-                    }
-                    TzInterval::Malformed => {
-                        return Err(LimboError::ParseError(SqlErrorMessage::classified(
-                            SqlErrorKind::InvalidDatetimeFormat,
-                            format!("invalid input syntax for type interval: \"{text}\""),
-                        )))
-                    }
-                    TzInterval::NotOne => {}
-                }
+            // SET TIME ZONE INTERVAL '...' [fields] arrives as its own value (the wire line review
+            // M6: it arrived as the bare literal, quotes and all, which posix_tz read as a name);
+            // a TimeZone string starting "interval" is a zone name like any other (PG 18.6:
+            // 'interval' and 'interval x' are 22023, pg18-rev-cd-tz2.out).
+            if let PgSetValue::Interval { literal, range } = value {
+                return match timezone_interval(literal, *range) {
+                    TzInterval::Offset => unsupported("this server answers only by its own setting of it"),
+                    // check_timezone refuses months and days with the setting's own message
+                    // (PG 18.6: invalid value for parameter "TimeZone": "INTERVAL '1 day'").
+                    TzInterval::NotAllowed => invalid(),
+                    TzInterval::Malformed => Err(LimboError::ParseError(SqlErrorMessage::classified(
+                        SqlErrorKind::InvalidDatetimeFormat,
+                        format!("invalid input syntax for type interval: \"{literal}\""),
+                    ))),
+                };
             }
             let numeric = strtod_whole(&lower).is_some_and(|h| h.is_nan() || h.abs() < 168.0);
             let valid = utc || numeric || zone_file(&text) || posix_tz(&text);
@@ -1944,40 +2020,44 @@ fn zone_file(name: &str) -> bool {
         && &magic == b"TZif"
 }
 
-/// A TimeZone value's `INTERVAL '...' [qualifier]` form, as check_timezone reads it: an offset
-/// with no months or days, or refused.
+/// A TimeZone value's `INTERVAL '...' [fields]` form, as check_timezone reads it: an offset with
+/// no months or days, or refused.
 enum TzInterval {
-    /// Not the quoted-literal form (`interval` alone, or followed by anything but a quote): read
-    /// as a zone name, which it is not.
-    NotOne,
     /// A valid offset.
     Offset,
-    /// Months or days given: 22023.
-    NotAllowed(&'static str),
-    /// A body interval_in refuses: 22007.
+    /// Months or days given: 22023, the setting's own refusal.
+    NotAllowed,
+    /// A literal interval_in refuses: 22007.
     Malformed,
 }
 
-/// `body` is what follows `interval` in a lowercased TimeZone value: whitespace, a quoted
-/// interval literal, and an optional qualifier (`hour to minute`). The literal is `[+-]h[:m[:s]]`
-/// or a list of `<number> <unit>`; a year, month or day unit with a non-zero number is not
-/// allowed. BLIND SPOT: interval_in's full grammar (ISO 8601 `PT5H`, `@` forms, fractional
-/// units) is not read; such a body is Malformed here.
-fn timezone_interval(body: &str) -> TzInterval {
-    let rest = body.trim_start();
-    let Some(quoted) = rest.strip_prefix('\'') else {
-        return TzInterval::NotOne;
-    };
-    let Some(end) = quoted.find('\'') else {
+/// `literal` is the interval's string, `range` its fields' INTERVAL_RANGE mask (None: no fields).
+/// The literal is `[+-]h[:m[:s]]`, a list of `<number> <unit>`, or a bare number, which is in the
+/// unit of the fields' last one (`INTERVAL '1' DAY` is a day) and seconds with no fields; a
+/// non-zero year, month or day is not allowed. PG 18.6 (pg18-rev-cd-tz2.out): '1 day' and
+/// '1 month' 22023, 'x' 22007, '+05:00' HOUR TO MINUTE valid. BLIND SPOT: interval_in's full
+/// grammar (ISO 8601 `PT5H`, `@` forms, fractional units) reads as Malformed here.
+fn timezone_interval(literal: &str, range: Option<i32>) -> TzInterval {
+    const MONTH: i32 = 1 << 1;
+    const YEAR: i32 = 1 << 2;
+    const DAY: i32 = 1 << 3;
+    const HOUR: i32 = 1 << 10;
+    const MINUTE: i32 = 1 << 11;
+    let literal = literal.trim();
+    if literal.is_empty() {
         return TzInterval::Malformed;
-    };
-    let (literal, tail) = (quoted[..end].trim(), quoted[end + 1..].trim());
-    let qualifier_ok = tail.is_empty()
-        || tail.split_whitespace().all(|w| {
-            matches!(w, "year" | "month" | "day" | "hour" | "minute" | "second" | "to")
-        });
-    if !qualifier_ok || literal.is_empty() {
-        return TzInterval::Malformed;
+    }
+    if let Ok(n) = literal.parse::<f64>() {
+        // A bare number: the unit of the fields' last one.
+        let unit_is_date = match range {
+            Some(r) if r & (HOUR | MINUTE | (1 << 12)) == 0 => r & (YEAR | MONTH | DAY) != 0,
+            _ => false,
+        };
+        return if unit_is_date && n != 0.0 {
+            TzInterval::NotAllowed
+        } else {
+            TzInterval::Offset
+        };
     }
     let clock = |t: &str| {
         let t = t.trim_start_matches(['+', '-']);
@@ -1991,20 +2071,24 @@ fn timezone_interval(body: &str) -> TzInterval {
     if words.len() % 2 != 0 {
         return TzInterval::Malformed;
     }
+    let mut date = false;
     for pair in words.chunks(2) {
         let Ok(n) = pair[0].parse::<f64>() else {
             return TzInterval::Malformed;
         };
-        let unit = pair[1].trim_end_matches('s');
+        let unit = pair[1].to_ascii_lowercase();
+        let unit = unit.trim_end_matches('s');
         match unit {
             "hour" | "minute" | "min" | "second" | "sec" => {}
-            "day" if n != 0.0 => return TzInterval::NotAllowed("days"),
-            "month" | "mon" | "year" if n != 0.0 => return TzInterval::NotAllowed("months"),
-            "day" | "month" | "mon" | "year" => {}
+            "day" | "month" | "mon" | "year" => date |= n != 0.0,
             _ => return TzInterval::Malformed,
         }
     }
-    TzInterval::Offset
+    if date {
+        TzInterval::NotAllowed
+    } else {
+        TzInterval::Offset
+    }
 }
 
 /// `text` read whole as C's strtod reads a number (leading whitespace skipped; decimal, `0x` hex,
@@ -2063,17 +2147,15 @@ fn posix_tz(spec: &str) -> bool {
     let b = spec.as_bytes();
     let name = |i: &mut usize| -> bool {
         if b.get(*i) == Some(&b'<') {
+            // An empty `<>` is a name too (PG 18.6: '<>5' is SET, pg18-rev-cd-tz2.out).
             let Some(end) = spec[*i + 1..].find('>') else { return false };
-            if end == 0 {
-                return false;
-            }
             *i += end + 2;
             return true;
         }
         let start = *i;
         while b
             .get(*i)
-            .is_some_and(|c| !c.is_ascii_digit() && !matches!(c, b',' | b'-' | b'+' | b';'))
+            .is_some_and(|c| !c.is_ascii_digit() && !matches!(c, b',' | b'-' | b'+'))
         {
             *i += 1;
         }
@@ -2110,6 +2192,12 @@ fn posix_tz(spec: &str) -> bool {
     let had_name = name(&mut i);
     if !had_name {
         i = 0;
+        // A bare offset alone: hours and minutes only (PG 18.6: '05:30' and '+5:3' are SET,
+        // '+05:30:15' is refused, pg18-rev-cd-tz2.out).
+        let bare = spec.trim_start_matches(['+', '-']);
+        if bare.split(':').count() > 2 {
+            return false;
+        }
     }
     if !offset(&mut i) {
         return false;
@@ -2120,7 +2208,7 @@ fn posix_tz(spec: &str) -> bool {
     if !had_name || !name(&mut i) {
         return false;
     }
-    if i < b.len() && !matches!(b[i], b',' | b';') && !offset(&mut i) {
+    if i < b.len() && b[i] != b',' && !offset(&mut i) {
         return false;
     }
     if i == b.len() {
@@ -2148,10 +2236,11 @@ fn posix_tz(spec: &str) -> bool {
             && groups.iter().enumerate().all(|(g, x)| num(x, 0, if g == 0 { 167 } else { 59 }));
         date_ok && time_ok
     };
-    if !matches!(b[i], b',' | b';') {
+    // The rules follow a `,` only (PG 18.6: 'EST5EDT;M3.2.0;M11.1.0' is refused).
+    if b[i] != b',' {
         return false;
     }
-    let rules: Vec<&str> = spec[i + 1..].split([',', ';']).collect();
+    let rules: Vec<&str> = spec[i + 1..].split(',').collect();
     rules.len() == 2 && rules.iter().all(|r| rule(r))
 }
 

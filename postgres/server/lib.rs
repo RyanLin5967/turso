@@ -1436,9 +1436,8 @@ struct QueryFailure {
 /// so its identity cannot be reused by a later snapshot: review wire-rework B-L2, the version
 /// number could repeat after a ROLLBACK TO), and the session's search path, which translation
 /// resolves unqualified names by (B-H1). A kept statement is reused only under an equal key. The
-/// engine's own settings (foreign_keys and the PRAGMA-level ones) are not in it: the engine
-/// re-prepares a statement whose prepare generation they moved (B-H2's root is that reprepare,
-/// fastest-engine's).
+/// engine's own settings (foreign_keys and the PRAGMA-level ones) and its attached and temp
+/// schemas reach it through `generation`, the engine's prepare generation (E-H1).
 struct PrepareKey {
     conn: Arc<turso_core::Connection>,
     schema: Arc<turso_core::schema::Schema>,
@@ -2342,12 +2341,15 @@ impl Session {
         let conn = self
             .current(&mut self.state())
             .map_err(PgWireError::UserError)?;
+        // The key is read BEFORE the prepare (the wire line review L5): a change landing during
+        // the compile then makes the key differ, never a stale statement match a fresh key.
+        let key = PrepareKey::of(&conn);
         match conn.parse_step(&parsed.sql, msg).map_err(engine_error)? {
             Some((stmt, types)) => {
                 parameter_types(&types, declared).map_err(PgWireError::UserError)?;
                 self.state().described.put(Described {
                     conn: conn.inner().clone(),
-                    key: PrepareKey::of(&conn),
+                    key,
                     sql: parsed.sql.clone(),
                     stmt,
                     types,
@@ -2398,11 +2400,13 @@ impl Session {
         // Never the prepare that performs a statement (ALTER ADD CONSTRAINT, COPY FROM, SET,
         // CREATE/DROP SCHEMA): the frontend declines those from the parse, they keep nothing and
         // answer NoData, and Execute performs them once (wire review 2 item 2, review 3 item 2).
+        // Read before the prepare, as in parse_step (L5).
+        let key = PrepareKey::of(&conn);
         match conn.prepare_for_describe(sql) {
             Ok(Some((stmt, types))) => {
                 self.state().described.put(Described {
                     conn: conn.inner().clone(),
-                    key: PrepareKey::of(&conn),
+                    key,
                     sql: sql.to_string(),
                     stmt,
                     types,
@@ -2461,6 +2465,12 @@ impl Session {
         if self.state().described.for_sql(sql).is_none() {
             return None;
         }
+        // The schema another session published is taken first, as describe_prepare does (the
+        // wire line review M1: Execute checked a kept statement against a schema it had not
+        // refreshed, so cross-session DDL between Parse and Execute reached the engine's
+        // re-prepare). BLIND SPOT, the engine's: maybe_update_schema compares the main schema's
+        // version only, so another session's DDL in an attached schema is not seen here.
+        conn.inner().maybe_update_schema();
         let key = PrepareKey::of(conn);
         let mut st = self.state();
         st.described.take(sql, &key).map(|d| (d.stmt, d.types))
