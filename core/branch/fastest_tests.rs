@@ -3284,6 +3284,20 @@ fn the_bump_site_scan_sees_a_site_move_between_functions_of_one_file() {
     assert_ne!(bump_sites(before), bump_sites(after), "CLAIM: a bump moved between functions of one file is invisible to the scan");
 }
 
+/// Review c42b LOW-B: the attached-schemas fold sees a changed set whose versions sum the same
+/// (x 4 -> 12 while s at 10 is replaced by s2 at 2: a plain sum stayed 14 and saw nothing), and it
+/// does not depend on the catalog's iteration order. No red at the base: the fold is new.
+#[test]
+fn the_attached_schemas_fold_sees_a_changed_set_with_the_same_sum() {
+    use crate::connection::attached_schemas_fold as fold;
+    let (x, s, s2) = (0x1000usize, 0x2000usize, 0x3000usize);
+    let before = fold(fold(0, 2, x, 4), 3, s, 10);
+    let after = fold(fold(0, 2, x, 12), 3, s2, 2);
+    assert_eq!(4 + 10, 12 + 2, "premise: the plain sums agree");
+    assert_ne!(before, after, "CLAIM: the fold missed a changed attached set whose versions sum the same");
+    assert_eq!(fold(fold(0, 3, s, 10), 2, x, 4), before, "CLAIM: the fold depends on iteration order");
+}
+
 /// Review c42b LOW-4: the bump-site scan counts every form a bump is written in, so a site rustfmt
 /// splits over two lines (`self.prepare_context_generation` then `.fetch_add(`, as the two bump
 /// definitions themselves are written) cannot hide from the audit gate. Planted texts: each

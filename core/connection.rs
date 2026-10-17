@@ -2149,21 +2149,32 @@ impl Connection {
         // The attached databases too (wire-rev-line M1: another session's DDL on an attached
         // schema was never adopted between statements). Their shared schemas are read directly,
         // so adopting means dropping this connection's older staged copies and re-preparing.
+        // Locks in the connection's order: `attached_databases`, then `database_schemas` (review
+        // c42b LOW-C).
         if self.has_no_open_transaction_state() {
             let attached = self.attached_databases.read();
             let mut seen: u64 = 0;
-            for (&idx, (db, _pager)) in attached.index_to_data.iter() {
-                let version = db.schema.lock().schema_version;
-                seen = seen.wrapping_add(u64::from(version));
-                let stale = self.database_schemas.read().get(&idx).is_some_and(|s| s.schema_version < version);
-                if stale {
-                    self.database_schemas.write().remove(&idx);
+            // No attached database: nothing to read (review c42b LOW-A).
+            if !attached.index_to_data.is_empty() {
+                for (&idx, (db, _pager)) in attached.index_to_data.iter() {
+                    let version = db.schema.lock().schema_version;
+                    seen = attached_schemas_fold(seen, idx, Arc::as_ptr(db) as usize, version);
+                    let stale = self.database_schemas.read().get(&idx).is_some_and(|s| s.schema_version < version);
+                    if stale {
+                        self.database_schemas.write().remove(&idx);
+                    }
                 }
             }
             drop(attached);
-            let before = self.attached_schemas_seen.swap(seen, Ordering::AcqRel);
-            if before != u64::MAX && before != seen {
-                self.bump_prepare_context_generation();
+            // `u64::MAX` is "not read yet".
+            let seen = seen.min(u64::MAX - 1);
+            // A load first, a store only on a change (review c42b LOW-A: the swap was unconditional).
+            let before = self.attached_schemas_seen.load(Ordering::Acquire);
+            if before != seen {
+                self.attached_schemas_seen.store(seen, Ordering::Release);
+                if before != u64::MAX {
+                    self.bump_prepare_context_generation();
+                }
             }
         }
     }
@@ -3343,9 +3354,12 @@ impl Connection {
                 // We don't update the shared db.schema until after the WAL commit, so
                 // other connections won't see uncommitted schema changes (which would
                 // cause SchemaUpdated mismatches).
+                // `attached_databases` before `database_schemas`, the connection's lock order
+                // (review c42b LOW-C: the catalog was read inside the schemas' write lock); the
+                // catalog is let go before `f` runs.
+                let attached_dbs = self.attached_databases.read();
                 let mut schemas = self.database_schemas.write();
                 let schema_arc = schemas.entry(database_id).or_insert_with(|| {
-                    let attached_dbs = self.attached_databases.read();
                     let (db, _pager) = attached_dbs
                         .index_to_data
                         .get(&database_id)
@@ -3353,6 +3367,7 @@ impl Connection {
                     let schema = db.schema.lock().clone();
                     schema
                 });
+                drop(attached_dbs);
                 let schema = Schema::try_make_mut(schema_arc)?;
                 let result = f(schema);
                 self.bump_prepare_context_generation();
@@ -3964,9 +3979,11 @@ impl Connection {
         if database_id == crate::TEMP_DB_ID {
             return;
         }
+        // `attached_databases` before `database_schemas`, the connection's lock order (review c42b
+        // LOW-C: this took them the other way round).
+        let attached_dbs = self.attached_databases.read();
         let mut schemas = self.database_schemas.write();
         if let Some(local_schema) = schemas.remove(&database_id) {
-            let attached_dbs = self.attached_databases.read();
             if let Some((db, _pager)) = attached_dbs.index_to_data.get(&database_id) {
                 *db.schema.lock() = local_schema;
             }
@@ -5972,4 +5989,17 @@ mod tests {
         );
         Ok(())
     }
+}
+
+/// One attached database's schema version folded into `acc`, with its index and identity (review
+/// c42b LOW-B: a plain sum of versions let one version rising and another falling cancel out, so
+/// only ATTACH's and DETACH's own bumps covered a changed set). Each entry is mixed (splitmix64)
+/// and the mixes are summed, so the fold does not depend on the catalog's iteration order.
+pub(crate) fn attached_schemas_fold(acc: u64, idx: usize, db: usize, version: u32) -> u64 {
+    let mut z = (idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ (db as u64).rotate_left(32)
+        ^ u64::from(version).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    acc.wrapping_add(z ^ (z >> 31))
 }
