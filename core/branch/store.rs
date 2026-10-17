@@ -7108,6 +7108,30 @@ impl BranchStore {
         }
     }
 
+    /// `join_flights` within a client's bound (review C42-M1, the one shared interruptible wait):
+    /// `Ok` once every checkpoint handed out so far has finished; `Busy` at `wait.until`;
+    /// `Interrupt` as soon as `wait.interrupted()` says so (polled every 10 ms at most). `None`:
+    /// unbounded, as `join_flights` (the store's own close and the tests' waits).
+    fn join_flights_within(&self, wait: Option<&Wait<'_>>) -> Result<()> {
+        let Some(wait) = wait else {
+            self.join_flights();
+            return Ok(());
+        };
+        let (m, cv) = &*self.flight_jobs;
+        let mut jobs = m.lock().unwrap_or_else(|e| e.into_inner());
+        let target = jobs.0;
+        while jobs.1 < target {
+            if (wait.interrupted)() {
+                return Err(LimboError::Interrupt);
+            }
+            let Some(left) = wait.until.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) else {
+                return Err(LimboError::Busy);
+            };
+            jobs = cv.wait_timeout(jobs, left.min(Duration::from_millis(10))).unwrap_or_else(|e| e.into_inner()).0;
+        }
+        Ok(())
+    }
+
     fn compact(&self, inner: &mut StoreInner, fail_after_rename: bool) -> Result<()> {
         if inner.cat.is_some() {
             // No flight is in the air while it cuts the log, and none can start (this holds the
@@ -10035,18 +10059,18 @@ impl BranchStore {
         self.inner.lock().orphans.clone()
     }
 
-    /// `compact_now`, its waits bounded by `wait` (review C42-M1). Not yet bounded: delegates.
-    pub(crate) fn compact_now_within(&self, wait: Option<&Wait<'_>>) -> Result<()> {
-        let _ = wait;
-        self.compact_now()
+    pub(crate) fn compact_now(&self) -> Result<()> {
+        self.compact_now_within(None)
     }
 
-    pub(crate) fn compact_now(&self) -> Result<()> {
+    /// `compact_now`, its wait for a flight in flight bounded by `wait` (review C42-M1): `Busy` at
+    /// its deadline, `Interrupt` on its interrupt, and nothing compacted then. `None`: unbounded.
+    pub(crate) fn compact_now_within(&self, wait: Option<&Wait<'_>>) -> Result<()> {
         // A fuzzy checkpoint in flight finishes first: the sharp one may not overlap it (F-FZ). One
         // another thread starts after the join is waited for once more; then this refuses.
         let mut attempts = 0;
         let mut inner = loop {
-            self.join_flights();
+            self.join_flights_within(wait)?;
             let inner = self.inner.lock();
             if !inner.cat.as_ref().is_some_and(|c| c.flight) {
                 break inner;
@@ -10097,8 +10121,15 @@ impl BranchStore {
             }
             let before = installed();
             if self.checkpoint_fuzzy_now()? {
-                self.join_flights();
-                return Ok(installed() > before);
+                // Its own flight, joined within the same deadline (review C42-M1: this join had
+                // none). Past it, `Ok(false)`: no install before the deadline.
+                let never = || false;
+                let within = Wait { until: started + deadline, interrupted: &never };
+                return match self.join_flights_within(Some(&within)) {
+                    Ok(()) => Ok(installed() > before),
+                    Err(LimboError::Busy) => Ok(false),
+                    Err(e) => Err(e),
+                };
             }
             // One in flight covers state older than this call: wait for its install, then start our
             // own; never past the deadline (Codex C15 MED 2: the join here waited for the flight
