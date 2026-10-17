@@ -3002,11 +3002,37 @@ impl NameFilter {
         };
         if answer_refused {
             self.answers_refused += 1;
+            // The refusing sink moves into a free `fixed` slot and the spare, with `h`, becomes the
+            // sink (review m1-2c N1): the answer stays complete. With no spare kept or no slot free,
+            // the answer ends (lookups ask the catalog) and its tables are retired. Mutant
+            // `filter_answer_ends_on_refusal` (test builds only): it ends, as before.
+            let mut spare = if fe_mutant("filter_answer_ends_on_refusal") { None } else { self.spare.take() };
             let ended = match &mut self.state {
-                FilterState::Building { old, .. } => old.take(),
-                FilterState::Overflowed { answer } => answer.take(),
+                FilterState::Building { old: slot, .. } | FilterState::Overflowed { answer: slot } => {
+                    let respilled = match (slot.as_mut(), spare.take()) {
+                        (Some(a), Some(sink)) if a.fixed.iter().any(Option::is_none) && sink.insert(h) => {
+                            let refusing = std::mem::replace(&mut a.sink, sink);
+                            if let Some(free) = a.fixed.iter_mut().find(|f| f.is_none()) {
+                                *free = Some(refusing);
+                            }
+                            true
+                        }
+                        (_, unused) => {
+                            spare = unused;
+                            false
+                        }
+                    };
+                    if respilled {
+                        None
+                    } else {
+                        slot.take()
+                    }
+                }
                 _ => None,
             };
+            if spare.is_some() {
+                self.spare = spare;
+            }
             if let Some(a) = ended {
                 self.retire_answer(a);
             }
