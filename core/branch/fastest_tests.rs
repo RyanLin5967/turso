@@ -8958,6 +8958,12 @@ fn a_failed_filter_drain_never_answers_absent_for_a_held_name() {
 /// The claim lists every (operation, site) whose worst hold did any of the three, so each instance of
 /// the class is named where it lives.
 fn lifecycle_audit(n: u32) {
+    // Counters review 3 LOW-6: refused off Apple, with its reason, rather than failing for one.
+    assert!(
+        cfg!(target_vendor = "apple"),
+        "REFUSED: the hold audit needs the kernel's per-task syscall count (budget_probe::unix_syscalls), which only \
+         Apple provides here; off Apple every hold is excluded and the audit is empty whatever the code does"
+    );
     use super::budget_probe::{self as probe, HoldRec, AUDIT, AUDIT_EXCLUDED, AUDIT_LOG, AUDIT_LOST, AUDIT_SEEN};
     use std::sync::atomic::Ordering::{Relaxed, Release};
     let _s = serial();
