@@ -6979,6 +6979,26 @@ mod tests {
         out
     }
 
+    /// fk-guard review LOW 6: postgres/COMPAT.md states the foreign_keys refusal and its code, beside
+    /// the setting's row, and no longer says SET LOCAL of foreign_keys is 0A000 (C41 made it follow
+    /// transaction scope).
+    #[test]
+    fn compat_states_the_foreign_keys_refusal() {
+        let compat = include_str!("../COMPAT.md");
+        let row = compat
+            .lines()
+            .find(|l| l.starts_with("| SET / SHOW configuration parameters"))
+            .expect("the SET / SHOW row");
+        assert!(
+            row.contains("foreign_keys") && row.contains("55000"),
+            "the SET / SHOW row does not state the foreign_keys refusal's 55000"
+        );
+        assert!(
+            !row.contains("search_path and foreign_keys are 0A000 inside a transaction block"),
+            "the row still says foreign_keys is 0A000 in a block"
+        );
+    }
+
     /// fk-guard review LOW 4: the publish guard (no foreign_keys off over pending deferred
     /// violations) is unreachable from a client, so it is held by fault injection: with the
     /// session's setting off and a violation pretended pending, a block's end keeps the engine's
