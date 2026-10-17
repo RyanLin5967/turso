@@ -1559,10 +1559,9 @@ impl Drop for StoreGuard<'_> {
         // path that did not call `start_owed_flight`.
         // A hold that panicked sends nothing while its stack unwinds (its store may be half
         // changed): the start stays owed, and the next hold's unlock sends it (review M1 LOW-2).
-        if std::thread::panicking() {
-            return;
-        }
+        // Checked only once a start is owed, so the common unlock reads one flag (review m1-2 INFO).
         if self.store.start_due.load(Ordering::Acquire)
+            && !std::thread::panicking()
             && !fe_mutant("owed_start_unsent")
             && self.store.start_due.swap(false, Ordering::AcqRel)
         {
