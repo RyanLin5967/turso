@@ -32,7 +32,7 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering::{Acquire, Relaxed, Release}};
 
 /// The counting allocator (test builds of this crate only).
 pub(crate) struct Counting;
@@ -463,7 +463,11 @@ pub(crate) fn store_locked_at(site: &'static std::panic::Location<'static>) {
         HOLD_START.with(|h| h.set((get(&T_HELD_ALLOC_BYTES), get(&T_CAT_ROWS))));
         HOLD_SITE.with(|h| h.set(Some(site)));
         HOLD_START2.with(|h| h.set((get(&T_HELD_ALLOCS), get(&T_CAT_STMTS))));
-        if ARMED.load(Relaxed) {
+        // Counters review 4 LOW-F: Acquire, paired with `arm`'s Release. The audit disarms as
+        // `AUDIT = false` then `arm(false)`, so a lock that reads the new `ARMED` (false) happens after
+        // that `AUDIT` store, and its guard's end can no longer read the old `AUDIT` (true) and count
+        // an unsampled hold as excluded.
+        if ARMED.load(Acquire) {
             // The table first, then the count: the hold's counted syscalls lie inside the table's
             // window (`hold_attributed`).
             // The table, then the kernel's count, then the shim's: a call between the kernel's read
@@ -653,7 +657,8 @@ pub(crate) fn mark_foreground(on: bool) {
 /// Sample the syscall count around store-mutex holds from now on (off by default: two Mach traps
 /// per hold would slow every other test).
 pub(crate) fn arm(on: bool) {
-    ARMED.store(on, Relaxed);
+    // Release: see `store_locked_at` (counters review 4 LOW-F).
+    ARMED.store(on, Release);
 }
 
 /// Every counter at one moment. The thread fields are the calling thread's; the rest are the
