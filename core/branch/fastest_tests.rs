@@ -3929,7 +3929,10 @@ fn checkpoint_now_s_wait_for_the_store_mutex_ends_at_its_deadline() {
 
 /// `branch_checkpoint_now(deadline)` on its own thread while the flight it starts is held at
 /// `stage`, released after `release_after`; its answer and how long it took (`None`: no answer in
-/// 30 s).
+/// 30 s). Premise (review c42b LOW-6): the held flight is `checkpoint_now`'s own. Every flight the
+/// forks started is waited for first, so the fuzzy-flights-started counter moves by exactly one
+/// by the time the hold is reached; a `maybe_compact` flight in the air would have sent
+/// `checkpoint_now` down its other branch, and a revert of the own-flight join would survive.
 fn checkpoint_now_with_its_flight_held(
     db: &Arc<Database>,
     stage: u8,
@@ -3940,6 +3943,8 @@ fn checkpoint_now_with_its_flight_held(
     for _ in 0..8 {
         let _ = trunk.fork_branch().unwrap().into_id();
     }
+    db.branch_checkpoint_wait();
+    let started0 = db.branch_checkpoint_counters()[1];
     db.branch_checkpoint_hold(stage);
     let (tx, rx) = std::sync::mpsc::channel();
     {
@@ -3954,6 +3959,11 @@ fn checkpoint_now_with_its_flight_held(
     while db.branch_checkpoint_held() != stage | super::store::HOLD_ARRIVED {
         assert!(t.elapsed() < std::time::Duration::from_secs(10), "premise: the checkpoint_now flight never reached hold {stage}");
         std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let started = db.branch_checkpoint_counters()[1] - started0;
+    if started != 1 {
+        db.branch_checkpoint_hold(0);
+        panic!("premise: {started} fuzzy flights started after the settle, not exactly checkpoint_now's own");
     }
     std::thread::sleep(release_after.saturating_sub(t.elapsed()));
     db.branch_checkpoint_hold(0);
