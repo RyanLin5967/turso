@@ -7874,8 +7874,55 @@ impl BranchStore {
     fn release_checked(&self, id: BranchId, refuse_open: bool) -> Result<Reaped> {
         // F-FZ back-pressure: dropped after the guard below.
         let _backpressure = Backpressure(self);
-        let mut inner = self.inner.lock();
+        let inner = self.inner.lock();
         held_trace("release.locked");
+        self.release_locked(inner, id, refuse_open)
+    }
+
+    /// A drop by name in ONE store-mutex hold (budget delete_takes_the_store_mutex_at_most_twice,
+    /// review 1 #37: lookup and release in one hold, plus the flight leader). At 7c698b9b5 a drop
+    /// took four: `branch_named`'s lookup, its `settle` (a wait for the fork's durability), the
+    /// release, and the leader (raw l111, the audit's delete sites). The settle is subsumed: the
+    /// Release is buffered after the fork's records in the one in-order log, so waiting for the
+    /// Release's durability waits for the fork's. No such name: `NoSuchBranch`, once this name's own
+    /// Release in the air, if any, is durable (review 3 #17, as `branch_named`).
+    pub(crate) fn drop_named(&self, name: &str) -> Result<Reaped> {
+        self.refuse_if_trunk_only("dropping a branch by name")?;
+        check_branch_name(name)?;
+        // F-FZ back-pressure: dropped after the guard below.
+        let _backpressure = Backpressure(self);
+        let inner = self.inner.lock();
+        held_trace("drop.locked");
+        let mut inner = inner;
+        let found = inner.name_lookup(name)?;
+        let poisoned = inner.poisoned();
+        // A stopped store still finds a branch whose Release did not become durable (engine review
+        // 7 #3), as `branch_named` does.
+        let found = match found {
+            None if poisoned => {
+                let durable = self.group.durable(self.class);
+                let mut unflown = inner.unflown_releases(durable);
+                unflown.find(|r| r.name.as_deref() == Some(name)).map(|r| r.id)
+            }
+            found => found,
+        };
+        let Some(id) = found else {
+            let own_release = if poisoned {
+                None
+            } else {
+                inner.releases_in_air.iter().rev().find(|r| r.name.as_deref() == Some(name)).map(|r| r.lsn)
+            };
+            drop(inner);
+            if let Some(lsn) = own_release.filter(|&lsn| self.group.durable(self.class) < lsn) {
+                self.wait_durable(lsn, self.class)?;
+            }
+            return Err(untyped_branch_error(LimboError::NoSuchBranch(name.to_string())));
+        };
+        self.release_locked(inner, id, true)
+    }
+
+    /// `release_checked`'s work, in the hold its caller took.
+    fn release_locked(&self, mut inner: StoreGuard<'_>, id: BranchId, refuse_open: bool) -> Result<Reaped> {
         inner.ensure(id)?;
         held_trace("release.ensured");
         // Released already — by a racing drop of the same name, say — and possibly collected: the

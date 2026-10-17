@@ -1445,6 +1445,15 @@ impl Database {
     /// refuses to drop a database in use; a `Branch` handle's release instead keeps the branch
     /// whole until its connection closes).
     pub fn drop_branch(&self, name: &str) -> Result<Reaped> {
+        // The lookup, the open check and the release in ONE store-mutex hold (budget
+        // delete_takes_the_store_mutex_at_most_twice): no window between them exists to race.
+        // The test hook still parks before it (`HOLD_DROP_LOOKED_UP`), so a connect made there wins
+        // and the drop is refused as in use. Mutant `drop_check_separate_hold`: the old separate
+        // holds below.
+        if !crate::branch::store::fe_mutant("drop_check_separate_hold") {
+            self.branches.pause_drop_looked_up();
+            return self.branches.drop_named(name);
+        }
         let id = self
             .branches
             .branch_named(name)?
