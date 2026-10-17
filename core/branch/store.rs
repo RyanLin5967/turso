@@ -1512,10 +1512,15 @@ impl StoreMutex {
         let Some(wait) = wait else {
             return Ok(self.lock());
         };
+        // Counted as `lock` counts (review c42b MED-1: "an overcount, never a miss"): if any poll saw
+        // a compaction's sync in progress, or `compacting` moved since the first poll.
+        let first = self.compacting.load(Ordering::Acquire);
+        let mut saw_odd = first & 1 == 1;
         loop {
             let before = self.compacting.load(Ordering::Acquire);
+            saw_odd |= before & 1 == 1;
             if let Some(guard) = self.inner.try_lock() {
-                if before & 1 == 1 {
+                if saw_odd || self.compacting.load(Ordering::Acquire) != first {
                     self.compaction_waits.fetch_add(1, Ordering::Relaxed);
                 }
                 return Ok(self.guard_of(guard));
