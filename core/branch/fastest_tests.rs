@@ -11386,7 +11386,13 @@ fn a_fuzzy_checkpoint_issues_at_most_two_syscalls_under_the_store_mutex() {
         for _ in 0..30 {
             let _ = trunk.fork_branch().unwrap().into_id();
         }
-        super::store::CKPT_HELD_SYSCALLS.lock().unwrap().clear();
+        {
+            // Reserved too (review delete LOW-7): a push that reallocates mid-checkpoint would land
+            // its syscalls, if any, in the next span.
+            let mut s = super::store::CKPT_HELD_SYSCALLS.lock().unwrap();
+            s.clear();
+            s.reserve(32);
+        }
         {
             let mut t = super::store::CKPT_HELD_THREADS.lock().unwrap();
             t.clear();
