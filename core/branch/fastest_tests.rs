@@ -11416,11 +11416,17 @@ fn a_fuzzy_checkpoint_issues_at_most_two_syscalls_under_the_store_mutex() {
             span("install.installed", "install.marked"),
         );
         // FLAGGED instrument change (diagnostic only; the claim and its sum are unchanged): the
-        // capture's span split at its read snapshot's two steps, so a red names its syscalls.
+        // capture's span split at its read snapshot's two steps, so a red names its syscalls. Read
+        // with no foreign check (review delete MED-2): a sub-span's own thread check would refuse
+        // rounds the judged spans accept, so the judged rounds stay as they were.
+        let quiet = |a: &str, b: &str| match (at(a), at(b)) {
+            (Some(i), Some(j)) => points[j].1 - points[i].1,
+            _ => u64::MAX,
+        };
         let in_capture = (
-            span("capture.matured", "capture.tx_begun"),
-            span("capture.tx_begun", "capture.snapshot_pinned"),
-            span("capture.snapshot_pinned", "capture.captured"),
+            quiet("capture.matured", "capture.tx_begun"),
+            quiet("capture.tx_begun", "capture.snapshot_pinned"),
+            quiet("capture.snapshot_pinned", "capture.captured"),
         );
         let inside = (
             span("install.quiesced", "install.snapshot_ended"),
