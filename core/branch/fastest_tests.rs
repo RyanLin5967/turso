@@ -3072,7 +3072,16 @@ struct LeasedPastDue {
     trunk: Arc<Connection>,
     keep: Branch,
     held: Vec<Branch>,
+    /// One of the 300, detached (`into_id`): reaped by the operation's expiry, `db.branch` refuses
+    /// it (review m1-2 LOW-C's premise).
+    probe: BranchId,
     started: u64,
+}
+
+/// Premise (review m1-2 LOW-C): the operation's expiry pass reaped the 300, so a failure below is
+/// the start path's, not the fixture's.
+fn assert_the_expiry_reaped(db: &Arc<Database>, probe: BranchId, path: &str) {
+    assert!(db.branch(probe).is_err(), "premise: {path}'s expiry pass did not reap the 300 leased branches");
 }
 
 fn leased_past_due(path: &Path) -> LeasedPastDue {
@@ -3083,15 +3092,20 @@ fn leased_past_due(path: &Path) -> LeasedPastDue {
     keep.lease(std::time::Duration::from_secs(36_000)).unwrap();
     trunk.create_branch("named-keep").unwrap();
     let mut held = Vec::new();
+    let mut probe = None;
     for _ in 0..300 {
         let b = trunk.fork_branch().unwrap();
         b.lease(std::time::Duration::from_secs(60)).unwrap();
-        held.push(b);
+        if probe.is_none() {
+            probe = Some(b.into_id());
+        } else {
+            held.push(b);
+        }
     }
     db.branch_checkpoint_wait();
     let started = db.branch_checkpoint_counters()[1];
     db.branch_lease_clock_advance(std::time::Duration::from_secs(3600));
-    LeasedPastDue { db, trunk, keep, held, started }
+    LeasedPastDue { db, trunk, keep, held, probe: probe.expect("300 forks"), started }
 }
 
 /// After the one operation: a checkpoint started (fuzzy flights started rose past `started`).
@@ -3114,6 +3128,7 @@ fn a_lease_renewal_whose_expiry_crosses_the_threshold_starts_a_checkpoint() {
     let s = leased_past_due(&dir.path().join("owed-set-lease.db"));
     let _t = Threshold::set(1);
     s.keep.lease(std::time::Duration::from_secs(60)).unwrap();
+    assert_the_expiry_reaped(&s.db, s.probe, "set_lease");
     assert_a_checkpoint_started(&s.db, s.started, "set_lease");
     drop(s.held);
 }
@@ -3125,6 +3140,7 @@ fn a_connect_whose_expiry_crosses_the_threshold_starts_a_checkpoint() {
     let s = leased_past_due(&dir.path().join("owed-open-conn.db"));
     let _t = Threshold::set(1);
     let c = s.keep.connect().unwrap();
+    assert_the_expiry_reaped(&s.db, s.probe, "open_conn");
     assert_a_checkpoint_started(&s.db, s.started, "open_conn");
     drop(c);
     drop(s.held);
@@ -3137,6 +3153,7 @@ fn a_named_create_refused_after_its_expiry_crossed_the_threshold_starts_a_checkp
     let s = leased_past_due(&dir.path().join("owed-create-error.db"));
     let _t = Threshold::set(1);
     assert!(s.trunk.create_branch("named-keep").is_err(), "premise: the name was taken, so the create returned an error");
+    assert_the_expiry_reaped(&s.db, s.probe, "a refused named create");
     assert_a_checkpoint_started(&s.db, s.started, "a refused named create");
     drop(s.held);
 }
@@ -3146,7 +3163,7 @@ fn an_open_whose_expiry_crosses_the_threshold_starts_a_checkpoint() {
     let _s = serial();
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("owed-open.db");
-    let incarnation = {
+    let (incarnation, probe) = {
         let s = leased_past_due(&path);
         // Detached, not released: the 300 outlive the close, and the reopen's expiry reaps them
         // (the close stamps the lease clock, an hour on).
@@ -3155,10 +3172,11 @@ fn an_open_whose_expiry_crosses_the_threshold_starts_a_checkpoint() {
         }
         let _ = s.keep.into_id();
         drop(s.trunk);
-        s.db.incarnation
+        (s.db.incarnation, s.probe)
     };
     let _t = Threshold::set(1);
     let db = reopen(&path, opts(true, SyncClass::Fsync).with_branch_checkpoint(super::BranchCheckpoint::Fuzzy), incarnation);
+    assert_the_expiry_reaped(&db, probe, "the open");
     assert_a_checkpoint_started(&db, 0, "the open");
 }
 
