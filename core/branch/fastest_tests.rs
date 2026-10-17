@@ -3053,6 +3053,60 @@ fn a_statement_reprepared_after_a_setting_change_keeps_its_search_path() {
     assert_eq!(after, vec![2], "CLAIM: re-prepared after a setting change, the SELECT read {after:?}, not s.t's row: the search path was dropped");
 }
 
+/// Review engine-rev-setter LOW-2: the audit of every prepare-generation bump (49e10e02a's message
+/// said 37 and missed five) is pinned here, per file, so a new bump site fails this gate until it
+/// is audited (and the setter class above says whether it should be change-only). Counts calls of
+/// `bump_prepare_context_generation()` and the extensions' raw `prepare_context_generation)
+/// .fetch_add(`, outside comments and the function's own definition. Audited at 09e8b26b0:
+/// - connection.rs 37: the change-only setters (16, incl. the four of MED-1); schema, attach,
+///   detach, rollback and collation events that are themselves changes; set_busy_handler, the
+///   encryption setters and the mvcc thresholds, unconditional (not comparable, or rare).
+/// - ext/mod.rs 4: extension registration (functions, vtabs), each a change.
+/// - mvcc/database/checkpoint_state_machine.rs 1: an unconditional schema reload, itself a change.
+/// - storage/pager.rs 1: rollback of a schema change. translate/pragma.rs 1: cache_spill, on a
+///   change. vdbe/execute.rs 1: savepoint schema restore. vdbe/mod.rs 1: an abandoned MVCC commit's
+///   schema removed.
+#[test]
+fn every_prepare_generation_bump_site_is_audited() {
+    const AUDITED: &[(&str, usize)] = &[
+        ("connection.rs", 37),
+        ("ext/mod.rs", 4),
+        ("mvcc/database/checkpoint_state_machine.rs", 1),
+        ("storage/pager.rs", 1),
+        ("translate/pragma.rs", 1),
+        ("vdbe/execute.rs", 1),
+        ("vdbe/mod.rs", 1),
+    ];
+    let core = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut found: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut dirs = vec![core.to_path_buf()];
+    while let Some(d) = dirs.pop() {
+        for e in std::fs::read_dir(&d).unwrap() {
+            let path = e.unwrap().path();
+            if path.is_dir() {
+                if path.file_name().is_some_and(|n| n != "target") {
+                    dirs.push(path);
+                }
+            } else if path.extension().is_some_and(|x| x == "rs") && !path.ends_with("branch/fastest_tests.rs") {
+                let text = std::fs::read_to_string(&path).unwrap();
+                let n: usize = text
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.starts_with("//") && !l.contains("fn bump_prepare_context_generation"))
+                    .map(|l| l.matches("bump_prepare_context_generation()").count() + l.matches("prepare_context_generation).fetch_add(").count())
+                    .sum();
+                if n > 0 {
+                    let rel = path.strip_prefix(core).unwrap().to_string_lossy().replace('\\', "/");
+                    found.insert(rel, n);
+                }
+            }
+        }
+    }
+    let audited: std::collections::BTreeMap<String, usize> = AUDITED.iter().map(|&(f, n)| (f.to_string(), n)).collect();
+    assert!(!found.is_empty(), "premise: the scan found no bump site: it is broken");
+    assert_eq!(found, audited, "CLAIM: the prepare-generation bump sites differ from the audited list: audit the new ones (and the setter class) and update AUDITED with each one's reason");
+}
+
 /// Review engine-rev-setter MED-1 (lead order), as a class: which setters must bump the prepare
 /// generation is DERIVED from what translation reads, not from a list of the bump's callers (an
 /// audit of callers cannot see a setter that never bumps). Every `Connection` setter `set_X` whose
