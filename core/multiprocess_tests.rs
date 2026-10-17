@@ -1536,12 +1536,14 @@ fn subprocess_schema_retry_reparses_through_the_dialect_with_its_connection() {
     let mut stmt = conn
         .prepare("insert into child_table(value) values ('parent-schema')")
         .unwrap();
-    stmt.run_ignore_rows().unwrap();
+    // Counted when the prepare returns, before any step, so a step-time `Statement::reprepare`
+    // (which used the hook already) cannot satisfy the claim (fresh type check H2).
     let parses = dialect.parses.load(Ordering::SeqCst) - parses0;
     let reparses = dialect.reparses.load(Ordering::SeqCst) - reparses0;
+    stmt.run_ignore_rows().unwrap();
     assert!(
         parses + reparses >= 2,
-        "premise: the prepare took the schema retry (parses {parses}, connection-aware re-parses {reparses})"
+        "premise: the prepare itself re-parsed, so it took the schema retry (parses {parses}, connection-aware re-parses {reparses})"
     );
     assert!(
         reparses >= 1,
