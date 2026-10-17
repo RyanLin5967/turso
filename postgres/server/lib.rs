@@ -7165,6 +7165,61 @@ mod tests {
         });
     }
 
+    /// Review wire-rework A-M1: a SET of another setting between a kept statement's Bind and its
+    /// Execute does not make the statement prepare again. Bind pq (a SELECT), Bind pc (SET
+    /// client_min_messages), Execute pc, Execute pq costs 2 prepares: pq's at Bind, reused by
+    /// its Execute, and pc's at its Execute. publish's set_foreign_keys_enabled bumped the
+    /// engine's prepare generation at every SET, so pq re-prepared at its Execute (fixed in the
+    /// engine's setter, fastest-engine 49e10e02a, which this line takes with the integration
+    /// merge). Replies asserted, as B-M2 asks.
+    #[test]
+    fn a_set_between_bind_and_execute_does_not_reprepare_the_kept_statement() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = session(&dir);
+        ok(&s, "CREATE TABLE a(x INT)");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut c = MemClient::new();
+            for (name, sql) in [("pq", "SELECT x FROM a"), ("pc", "SET client_min_messages TO notice")] {
+                s.on_parse(&mut c, Parse::new(Some(name.to_string()), sql.to_string(), vec![]))
+                    .await
+                    .unwrap();
+            }
+            s.on_sync(&mut c, PgSync::new()).await.unwrap();
+            c.replies.clear();
+            let before = turso_pg_parser::libpg_query_calls();
+            for (portal, stmt) in [("p1", "pq"), ("p2", "pc")] {
+                s.on_bind(
+                    &mut c,
+                    Bind::new(Some(portal.to_string()), Some(stmt.to_string()), vec![], vec![], vec![]),
+                )
+                .await
+                .unwrap();
+            }
+            for portal in ["p2", "p1"] {
+                s.on_execute(&mut c, Execute::new(Some(portal.to_string()), 0))
+                    .await
+                    .unwrap();
+            }
+            let prepares = turso_pg_parser::libpg_query_calls() - before;
+            let (mut bound, mut tags) = (0, vec![]);
+            for reply in c.replies.drain(..) {
+                match reply {
+                    PgWireBackendMessage::ErrorResponse(e) => panic!("an error in the round: {e:?}"),
+                    PgWireBackendMessage::BindComplete(_) => bound += 1,
+                    PgWireBackendMessage::CommandComplete(done) => tags.push(done.tag),
+                    _ => {}
+                }
+            }
+            s.on_sync(&mut c, PgSync::new()).await.unwrap();
+            assert_eq!(bound, 2, "the two Binds' BindCompletes");
+            assert_eq!(tags, vec!["SET".to_string(), "SELECT 0".to_string()], "the Executes' tags");
+            assert_eq!(prepares, 2, "prepares for Bind pq, Bind pc, Execute pc, Execute pq");
+        });
+    }
+
     /// C40 review LOW 6 (C49): a Parse makes at most ONE libpg_query call, whatever its text:
     /// text that mentions the branch-function prefix and holds a `$` without being a call made
     /// two (the branch-call parse and the parameter scan), and a statement PostgreSQL analyses at
