@@ -1926,14 +1926,25 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
             if let PgSetValue::Interval { literal, range } = value {
                 return match timezone_interval(literal, *range) {
                     TzInterval::Offset => unsupported("this server answers only by its own setting of it"),
-                    // check_timezone refuses months and days with the setting's own message
-                    // (PG 18.6: invalid value for parameter "TimeZone": "INTERVAL '1 day'").
-                    TzInterval::NotAllowed => invalid(),
+                    // check_timezone refuses months and days with the setting's own message, the
+                    // value echoed as interval_out prints it (PG 18.6: "INTERVAL '1 day'", and
+                    // '1 month' as "INTERVAL '1 mon'"; review wire-line2 M3 #4).
+                    TzInterval::NotAllowed => refused(format!(
+                        "invalid value for parameter \"{pg_name}\": \"INTERVAL '{}'\"",
+                        interval_out(literal)
+                    )),
                     TzInterval::Malformed => Err(LimboError::ParseError(SqlErrorMessage::classified(
                         SqlErrorKind::InvalidDatetimeFormat,
                         format!("invalid input syntax for type interval: \"{literal}\""),
                     ))),
                 };
+            }
+            // A bare offset with seconds (PG 18.6: '+05:30:15' is 22023 "time zone ... appears to
+            // use leap seconds", review wire-line2 M3 #32). Which seconds are refused (all, or
+            // only non-zero ones) is not recorded: owed in the L1 recording.
+            let bare = text.trim_start_matches(['+', '-']);
+            if bare.split(':').count() == 3 && bare.split(':').all(|p| !p.is_empty() && p.bytes().all(|c| c.is_ascii_digit())) {
+                return refused(format!("time zone \"{text}\" appears to use leap seconds"));
             }
             let numeric = strtod_whole(&lower).is_some_and(|h| h.is_nan() || h.abs() < 168.0);
             let valid = utc || numeric || zone_file(&text) || posix_tz(&text);
@@ -2089,6 +2100,50 @@ fn timezone_interval(literal: &str, range: Option<i32>) -> TzInterval {
     } else {
         TzInterval::Offset
     }
+}
+
+/// An interval literal of `<number> <unit>` pairs printed as PostgreSQL's interval_out prints it
+/// (the default IntervalStyle postgres): years, `mon`/`mons`, days, then the time as hh:mm:ss
+/// (`1 month` is `1 mon`, PG 18.6's echo in its refusal; review wire-line2 M3 #4). A literal of
+/// another shape is returned as written. BLIND SPOT: only whole numbers of the units below.
+fn interval_out(literal: &str) -> String {
+    let words: Vec<&str> = literal.split_whitespace().collect();
+    if words.is_empty() || words.len() % 2 != 0 {
+        return literal.to_string();
+    }
+    let (mut years, mut months, mut days, mut secs) = (0i64, 0i64, 0i64, 0i64);
+    for pair in words.chunks(2) {
+        let Ok(n) = pair[0].parse::<i64>() else {
+            return literal.to_string();
+        };
+        let unit = pair[1].to_ascii_lowercase();
+        match unit.trim_end_matches('s') {
+            "year" => years += n,
+            "month" | "mon" => months += n,
+            "day" => days += n,
+            "hour" => secs += n * 3600,
+            "minute" | "min" => secs += n * 60,
+            "second" | "sec" => secs += n,
+            _ => return literal.to_string(),
+        }
+    }
+    let plural = |n: i64, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+    let mut parts = Vec::new();
+    if years != 0 {
+        parts.push(plural(years, "year", "years"));
+    }
+    if months != 0 {
+        parts.push(plural(months, "mon", "mons"));
+    }
+    if days != 0 {
+        parts.push(plural(days, "day", "days"));
+    }
+    if secs != 0 || parts.is_empty() {
+        let sign = if secs < 0 { "-" } else { "" };
+        let a = secs.abs();
+        parts.push(format!("{sign}{:02}:{:02}:{:02}", a / 3600, a / 60 % 60, a % 60));
+    }
+    parts.join(" ")
 }
 
 /// `text` read whole as C's strtod reads a number (leading whitespace skipped; decimal, `0x` hex,
