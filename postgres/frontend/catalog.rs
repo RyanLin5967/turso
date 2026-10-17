@@ -4286,3 +4286,36 @@ mod tests {
         }
     }
 }
+
+/// NO SILENT DIALECT SWITCH (lead class, 2026-10-17): text the PostgreSQL parser parses is never
+/// read again as SQLite; a translation failure is an error. Only text marked as this frontend's or
+/// the engine's own SQLite takes the SQLite parse.
+#[cfg(test)]
+mod dialect_switch_tests {
+    use super::*;
+
+    /// A PG statement whose translation fails but whose text is valid SQLite with another meaning
+    /// (`?1`: a prefix operator to PostgreSQL, which the translator refuses; a parameter to
+    /// SQLite) is an error, not a SQLite statement.
+    #[test]
+    fn a_pg_statement_whose_translation_fails_is_an_error() {
+        let sql = "SELECT ?1";
+        // The premise, so the red cannot pass vacuously: PostgreSQL parses it, the translator
+        // refuses it, and SQLite reads it.
+        let parsed = turso_pg_parser::parse(sql).expect("premise: libpg_query parses it");
+        assert!(
+            turso_pg_parser::translator::PostgreSQLTranslator::new()
+                .translate(&parsed)
+                .is_err(),
+            "premise: the translator refuses it"
+        );
+        assert!(
+            turso_core::dialect::sqlite::parse(sql).is_ok(),
+            "premise: SQLite reads it"
+        );
+        assert!(
+            PostgresDialect.parse(sql).is_err(),
+            "a PG statement whose translation failed was read as SQLite"
+        );
+    }
+}
