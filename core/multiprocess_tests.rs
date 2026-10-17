@@ -1442,6 +1442,113 @@ fn subprocess_database_open_parent_directly_uses_child_created_table() {
     assert_eq!(child_rows[1][0].to_string(), "parent-schema");
 }
 
+/// SQLite in every respect, counting its plain parses and its connection-aware re-parses
+/// (review c42b LOW-3).
+#[derive(Default)]
+struct CountingReparseDialect {
+    parses: crate::sync::atomic::AtomicUsize,
+    reparses: crate::sync::atomic::AtomicUsize,
+}
+
+impl crate::Dialect for CountingReparseDialect {
+    fn name(&self) -> &'static str {
+        crate::Dialect::name(&SqliteDialect)
+    }
+    fn parse(&self, sql: &str) -> Result<(Option<turso_parser::ast::Cmd>, usize)> {
+        self.parses.fetch_add(1, Ordering::SeqCst);
+        crate::Dialect::parse(&SqliteDialect, sql)
+    }
+    fn parse_for_reprepare(
+        &self,
+        sql: &str,
+        _conn: &crate::sync::Arc<Connection>,
+    ) -> Result<(Option<turso_parser::ast::Cmd>, usize)> {
+        self.reparses.fetch_add(1, Ordering::SeqCst);
+        crate::Dialect::parse(&SqliteDialect, sql)
+    }
+    fn parse_table_sql(&self, sql: &str, root_page: i64) -> Result<crate::schema::BTreeTable> {
+        crate::Dialect::parse_table_sql(&SqliteDialect, sql, root_page)
+    }
+    fn parse_table_sql_ast(&self, sql: &str) -> Result<turso_parser::ast::Stmt> {
+        crate::Dialect::parse_table_sql_ast(&SqliteDialect, sql)
+    }
+    fn table_sql_for_replay(&self, sql: &str) -> Result<String> {
+        crate::Dialect::table_sql_for_replay(&SqliteDialect, sql)
+    }
+    fn format_table_sql(
+        &self,
+        input: &str,
+        tbl_name: &turso_parser::ast::QualifiedName,
+        body: &turso_parser::ast::CreateTableBody,
+    ) -> Result<String> {
+        crate::Dialect::format_table_sql(&SqliteDialect, input, tbl_name, body)
+    }
+    fn register_catalog(&self, schema: &mut crate::schema::Schema, enable_custom_types: bool) -> Result<()> {
+        crate::Dialect::register_catalog(&SqliteDialect, schema, enable_custom_types)
+    }
+    fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<crate::Func>> {
+        crate::Dialect::resolve_function(&SqliteDialect, name, arg_count)
+    }
+}
+
+/// Review c42b LOW-3: `compile_cmd`'s retry after another process's schema change re-parses the
+/// client's text through the dialect's connection-aware hook, as `Statement::reprepare` does, so a
+/// frontend whose translation needs the connection re-translates as its own prepare did. The parent
+/// prepares against a table a child process created after the parent loaded its schema, which takes
+/// the retry. Premise: a re-parse happened at all (plain plus connection-aware parses >= 2). At
+/// eea3a6449 the retry called `Dialect::parse` (parses 2, re-parses 0).
+#[test]
+fn subprocess_schema_retry_reparses_through_the_dialect_with_its_connection() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("coordination-schema-retry-reparse.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let dialect = Arc::new(CountingReparseDialect::default());
+    let db = Database::open_file_with_flags(
+        io,
+        db_path_str,
+        OpenFlags::default(),
+        multiprocess_wal_db_opts(),
+        None,
+        dialect.clone(),
+    )
+    .unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("create table t(value integer)").unwrap();
+
+    let current_exe = std::env::current_exe().unwrap();
+    let schema_output = Command::new(&current_exe)
+        .arg(MULTIPROCESS_SHM_SCHEMA_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .output()
+        .unwrap();
+    assert!(
+        schema_output.status.success(),
+        "premise: the child created its table: stdout={}; stderr={}",
+        String::from_utf8_lossy(&schema_output.stdout),
+        String::from_utf8_lossy(&schema_output.stderr)
+    );
+
+    let parses0 = dialect.parses.load(Ordering::SeqCst);
+    let reparses0 = dialect.reparses.load(Ordering::SeqCst);
+    let mut stmt = conn
+        .prepare("insert into child_table(value) values ('parent-schema')")
+        .unwrap();
+    stmt.run_ignore_rows().unwrap();
+    let parses = dialect.parses.load(Ordering::SeqCst) - parses0;
+    let reparses = dialect.reparses.load(Ordering::SeqCst) - reparses0;
+    assert!(
+        parses + reparses >= 2,
+        "premise: the prepare took the schema retry (parses {parses}, connection-aware re-parses {reparses})"
+    );
+    assert!(
+        reparses >= 1,
+        "CLAIM: the schema retry re-parsed the client's text without the dialect's connection (parses {parses})"
+    );
+}
+
 #[test]
 fn subprocess_database_open_parent_translated_stmt_uses_child_created_table() {
     let dir = tempfile::tempdir().unwrap();
