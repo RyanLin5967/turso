@@ -4084,8 +4084,17 @@ impl ExtendedQueryHandler for Session {
         // and a RowDescription. The types come from the statement's first meeting with the engine
         // (Describe's prepare, kept for the Describe and Execute that follow, so a round prepares
         // once as before); a branch call's are text, read by the call itself.
-        if portal.statement.statement.call.is_none() && !portal.parameters.is_empty() {
+        // A statement PostgreSQL analyses is also revalidated here, with or without values: its
+        // GetCachedPlan at Bind re-plans one whose relations changed, so a retained statement
+        // over a dropped table is refused at Bind (42P01) before BindComplete; it got BindComplete
+        // and the error at Execute (C53 follow-up, pg18-c56-schema-prepared.out). The prepare is
+        // the round's one, kept for its Describe and Execute.
+        if portal.statement.statement.call.is_none()
+            && (scan.analysed || !portal.parameters.is_empty())
+        {
             self.describe_prepare(&portal.statement.statement.sql)?;
+        }
+        if portal.statement.statement.call.is_none() && !portal.parameters.is_empty() {
             let params = self
                 .described_parameters(&portal.statement.parameter_types)
                 .map_err(PgWireError::UserError)?;
