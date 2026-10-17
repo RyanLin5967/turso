@@ -3080,6 +3080,23 @@ fn a_statement_reprepared_after_a_setting_change_keeps_its_search_path() {
     assert_eq!(after, vec![2], "CLAIM: re-prepared after a setting change, the SELECT read {after:?}, not s.t's row: the search path was dropped");
 }
 
+/// Review C42 LOW-7: off Apple the pager has one sync type (fsync) and `set_sync_type` changes
+/// nothing PRAGMA fullfsync compiles in, so it must never bump: at 8a77618a5 setting FullFsync passed
+/// the "differs from the pager's" check on every call and re-prepared everything each time.
+#[cfg(not(target_vendor = "apple"))]
+#[test]
+fn off_apple_set_sync_type_never_bumps_the_prepare_generation() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("sync-type-off-apple.db"), DatabaseOpts::new());
+    let c = db.connect().unwrap();
+    let g0 = c.prepare_context_generation();
+    c.set_sync_type(crate::io::FileSyncType::FullFsync);
+    c.set_sync_type(crate::io::FileSyncType::FullFsync);
+    assert_eq!(c.get_sync_type(), crate::io::FileSyncType::Fsync, "premise: off Apple the pager's sync type stays fsync");
+    assert_eq!(c.prepare_context_generation(), g0, "CLAIM: set_sync_type bumped the prepare generation though nothing it compiles in changed");
+}
+
 /// Review engine-rev-setter LOW-2: the audit of every prepare-generation bump (49e10e02a's message
 /// said 37 and missed five) is pinned here, per file, so a new bump site fails this gate until it
 /// is audited (and the setter class above says whether it should be change-only). Counts calls of
