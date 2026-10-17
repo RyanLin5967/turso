@@ -5056,6 +5056,11 @@ fn a_drop_of_a_branch_whose_fork_failed_does_not_promise_it_comes_back() {
         db.branch_failpoint(Some(BranchFailpoint::GroupFlightFails));
         assert!(trunk.create_branch("x").is_err(), "catalog={catalog}: premise: the create's flight failed");
         let dropped = db.drop_branch("x");
+        // The drop reached the release (a NoSuchBranch would pass the claim without testing it).
+        assert!(
+            matches!(dropped, Err(LimboError::InternalError(ref m)) if m.contains("not released durably")),
+            "catalog={catalog}: premise: the drop of x reached the release and failed there: {dropped:?}"
+        );
         assert!(
             !dropped.as_ref().is_err_and(|e| e.to_string().contains("comes back")),
             "catalog={catalog}: CLAIM: the drop of a branch whose fork never became durable said it comes back: {dropped:?}"
