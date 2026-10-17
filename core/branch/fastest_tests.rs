@@ -5044,6 +5044,14 @@ fn a_drop_miss_waits_for_its_own_names_release() {
 /// failed) does not say the branch "comes back at the next open": the reopen will not have that
 /// fork. Since 838c41999 the drop runs the release without settling the fork first, so the release's
 /// failure message is reached for such a branch.
+///
+/// Repaired per review c42b MED-5: the first version dropped x AFTER its create had failed, which
+/// never reaches that message (the create's own discarded release left x `ReleasePending`, so the
+/// drop answered "takes no release"), so its premise fired at its base and at the fix. Now the
+/// creator is parked with x's flight taken (`HOLD_FLIGHT_TAKEN`; `GroupFlightFails`, consumed by
+/// x's buffer, fails that flight's write); the drop of x runs on another thread and waits on the
+/// group; the hold is released, the flight fails, and the drop's release fails with it. Expected
+/// RED at 06ef0cff8^ (the message promised the branch comes back).
 #[test]
 fn a_drop_of_a_branch_whose_fork_failed_does_not_promise_it_comes_back() {
     let _s = serial();
@@ -5053,9 +5061,37 @@ fn a_drop_of_a_branch_whose_fork_failed_does_not_promise_it_comes_back() {
         let trunk = db.connect().unwrap();
         seed(&trunk);
         let _anchor = trunk.fork_branch().unwrap().into_id();
+        let hold = db.branches.trunk_commit_hold.clone();
+        struct HoldOff(Arc<crate::sync::atomic::AtomicU8>);
+        impl Drop for HoldOff {
+            fn drop(&mut self) {
+                self.0.store(0, std::sync::atomic::Ordering::Release);
+            }
+        }
+        let _release = HoldOff(hold.clone());
         db.branch_failpoint(Some(BranchFailpoint::GroupFlightFails));
-        assert!(trunk.create_branch("x").is_err(), "catalog={catalog}: premise: the create's flight failed");
-        let dropped = db.drop_branch("x");
+        hold.store(super::store::HOLD_FLIGHT_TAKEN, std::sync::atomic::Ordering::Release);
+        let creator = {
+            let db = db.clone();
+            std::thread::spawn(move || db.connect().unwrap().create_branch("x").map(|_| ()))
+        };
+        wait_hold(&hold, super::store::HOLD_FLIGHT_TAKEN);
+        let before = db.branches.group_counters();
+        let dropper = {
+            let db = db.clone();
+            std::thread::spawn(move || db.drop_branch("x").map(|_| ()))
+        };
+        let waited = blocked_in_wait_durable(&db, before, &dropper);
+        hold.store(0, std::sync::atomic::Ordering::Release);
+        let created = creator.join().unwrap();
+        let dropped = dropper.join().unwrap();
+        assert!(created.is_err(), "catalog={catalog}: premise: x's create failed with its flight");
+        assert!(waited, "catalog={catalog}: premise: the drop of x waited on the group while x's flight was held: {dropped:?}");
+        // The drop reached the release (a NoSuchBranch would pass the claim without testing it).
+        assert!(
+            matches!(dropped, Err(LimboError::InternalError(ref m)) if m.contains("not released durably")),
+            "catalog={catalog}: premise: the drop of x reached the release and failed there: {dropped:?}"
+        );
         assert!(
             !dropped.as_ref().is_err_and(|e| e.to_string().contains("comes back")),
             "catalog={catalog}: CLAIM: the drop of a branch whose fork never became durable said it comes back: {dropped:?}"
