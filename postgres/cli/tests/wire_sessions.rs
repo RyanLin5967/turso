@@ -13395,3 +13395,10 @@ replays_postgresql!(pg18_rev_c39_tzpath_replays_as_postgresql_answered, "pg18-re
 // retained named statement whose relation was dropped is refused at Bind (42P01, before
 // BindComplete), where PostgreSQL's GetCachedPlan revalidates it, not at Execute.
 replays_postgresql!(pg18_c56_schema_prepared_replays_as_postgresql_answered, "pg18-c56-schema-prepared.out", []);
+// Review c39799c5d..9e24b455d LOWs 6, 7, 8, 9, 11 (one class: a SET value is valid or not as
+// PostgreSQL's check hooks decide, before this server's own refusal of a valid value it does not
+// act on). Strict until a run's diff registers the intended 0A000 rows (PGDIV-SET-REFUSED), each
+// from a read of that diff.
+replays_postgresql!(pg18_rev_c39_tzforms_replays_as_postgresql_answered, "pg18-rev-c39-tzforms.out", []);
+replays_postgresql!(pg18_rev_c39_misc_replays_as_postgresql_answered, "pg18-rev-c39-misc.out", []);
+replays_postgresql!(pg18_rev_c39_enc_replays_as_postgresql_answered, "pg18-rev-c39-enc.out", []);

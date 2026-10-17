@@ -1,0 +1,36 @@
+>> Q SET default_tablespace = pg_default
+   C SET
+   Z I
+>> Q SET default_tablespace = pg_global
+   C SET
+   Z I
+>> Q SET default_tablespace = ''
+   C SET
+   Z I
+>> Q SET DateStyle = 'ISO, SQL'
+   E S=ERROR C=22023 M=invalid value for parameter "DateStyle": "ISO, SQL"
+   Z I
+>> Q SET DateStyle = 'MDY, DMY'
+   E S=ERROR C=22023 M=invalid value for parameter "DateStyle": "MDY, DMY"
+   Z I
+>> Q SET DateStyle = 'ISO, MDY'
+   C SET
+   Z I
+>> Q SET LOCAL DateStyle = ISO
+   N S=WARNING C=25P01 M=SET LOCAL can only be used in transaction blocks
+   C SET
+   Z I
+>> Q SET LOCAL xmloption = content
+   N S=WARNING C=25P01 M=SET LOCAL can only be used in transaction blocks
+   C SET
+   Z I
+>> Q SET LOCAL lock_timeout = '1s'
+   N S=WARNING C=25P01 M=SET LOCAL can only be used in transaction blocks
+   C SET
+   Z I
+>> Q SET lock_timeout = '3000000s'
+   E S=ERROR C=22023 M=invalid value for parameter "lock_timeout": "3000000s"
+   Z I
+>> Q SET lock_timeout = 0
+   C SET
+   Z I
