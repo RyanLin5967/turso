@@ -10968,6 +10968,48 @@ fn an_answer_that_ends_on_a_refusal_frees_nothing_under_the_store_mutex() {
     assert_eq!(freed, 0, "CLAIM: a note freed {freed} bytes under the store mutex when the answer ended (its tables are retired, freed after the unlock)");
 }
 
+/// Review c42b LOW-9 (the filter3 instrument note, as a class): a name-filter failpoint armed by one
+/// test is consumed only by a build of a store that test's thread started, never by another
+/// test's store that happens to build first. Armed here; a store opened and built on ANOTHER
+/// thread must build with no failed scan and leave the failpoint armed. At 1631f38cf the flags
+/// were process-global and the first build anywhere consumed them.
+#[test]
+fn a_name_filter_failpoint_armed_by_one_thread_spares_another_thread_s_store() {
+    use super::store::NAME_SCAN_FAILS;
+    use std::sync::atomic::Ordering::{Acquire, Release};
+    let _s = serial();
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            NAME_SCAN_FAILS.store(false, Release);
+        }
+    }
+    let _r = Reset;
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("failpoint-scope.db");
+    let incarnation = {
+        let db = open_at(&path, opts(true, SyncClass::Off));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        trunk.create_branch("kept").unwrap();
+        db.branch_compact_now().unwrap();
+        db.branch_wait_name_filter();
+        db.incarnation
+    };
+    NAME_SCAN_FAILS.store(true, Release);
+    let failed = std::thread::spawn(move || {
+        let db = reopen(&path, opts(true, SyncClass::Off), incarnation);
+        db.branch_wait_name_filter();
+        let (built, _, _, _, failed) = db.branch_name_filter_stats();
+        (built, failed)
+    })
+    .join()
+    .unwrap();
+    assert!(failed.0, "premise: the other thread's store built its name filter");
+    assert_eq!(failed.1, 0, "CLAIM: a store another thread started consumed this thread's failpoint (a failed scan)");
+    assert!(NAME_SCAN_FAILS.load(Acquire), "CLAIM: this thread's failpoint was consumed by another thread's store");
+}
+
 /// Review filter3 L3: the BUILD's failed drain overflows answering from its new table and its pending
 /// one, as the growth's does; a name noted into the pending table only (created while the reopen's
 /// build is held at its scan, so the scan and the table lack it) must not be answered absent once
