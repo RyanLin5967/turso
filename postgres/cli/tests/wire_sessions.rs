@@ -13896,3 +13896,55 @@ fn client_text_cannot_carry_the_sqlite_marker() {
     a.q("SELECT '/* turso:sqlite */ '").ok("the marker inside a literal");
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// Review wire-line2 M3: each TimeZone row of PG 18.6's rev-cd-tz2 recording classified as
+/// PostgreSQL classified it, whatever this server's own answer to a valid value: an error row gets
+/// the same SQLSTATE, a `SET` row gets SET or this server's 0A000 (a valid zone it does not act
+/// on). Two messages exactly: #4's month echoed as interval_out prints it ('1 mon'), and #32's
+/// leap-seconds refusal. The strict replay, which needs the 0A000 rows registered from a run, stays
+/// beside it.
+#[test]
+fn every_recorded_timezone_value_is_classified_as_postgresql_did() {
+    let recording = include_str!("pg18/pg18-rev-cd-tz2.out");
+    let dir = Scratch::new("tz-classify");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    let mut rows = 0;
+    let mut lines = recording.lines().peekable();
+    while let Some(line) = lines.next() {
+        let Some(sql) = line.strip_prefix(">> Q ") else { continue };
+        let mut answer = Vec::new();
+        while let Some(l) = lines.peek() {
+            if l.starts_with(">> ") {
+                break;
+            }
+            answer.push(lines.next().unwrap().trim().to_string());
+        }
+        rows += 1;
+        let pg_error = answer.iter().find_map(|l| l.strip_prefix("E S=ERROR C="));
+        let r = a.q(sql);
+        match pg_error {
+            Some(rest) => {
+                let (code, message) = rest.split_at(5);
+                let message = message.trim_start().strip_prefix("M=").unwrap_or("");
+                match &r.error {
+                    Some(e) if e.code == code => {
+                        let exact = sql.contains("'1 month'") || sql.contains("+05:30:15");
+                        if exact && e.message != message {
+                            wrong.push(format!("{sql}: message {:?}, PostgreSQL {:?}", e.message, message));
+                        }
+                    }
+                    other => wrong.push(format!("{sql}: PostgreSQL {code}, ours {other:?}")),
+                }
+            }
+            None => match &r.error {
+                None => {}
+                Some(e) if e.code == "0A000" => {}
+                Some(e) => wrong.push(format!("{sql}: PostgreSQL SET, ours {} {}", e.code, e.message)),
+            },
+        }
+    }
+    assert!(rows >= 35, "premise: {rows} recorded rows");
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
