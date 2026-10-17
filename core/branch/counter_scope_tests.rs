@@ -172,16 +172,20 @@ fn every_store_count_has_a_store() {
 #[test]
 fn the_fuzzy_held_syscall_budget_is_judged_beside_another_stores_work() {
     // Counters review E3 (FLAGGED strengthening of this red; its claim unchanged): the other store's
-    // work is PROVEN to overlap the call (a barrier after its first create, and its create count must
-    // rise between the call's entry and exit), and only a verdict passes: Ok, or a panic whose
-    // message starts with "CLAIM:". A premise failure or a reworded refusal no longer reads as one.
+    // work is proven to overlap the RELAY (the test's own call, which relays its measurement to a
+    // child process: review 2 LOW 6, it does not reach the measurement itself), by a start signal
+    // after its first create and its create count rising between the call's entry and exit; and only
+    // a verdict passes: Ok, or a panic whose message starts with "CLAIM:". It guards the relay: with
+    // the measurement back in this process the refusal returns.
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as O};
     let stop = Arc::new(AtomicBool::new(false));
     let creates = Arc::new(AtomicU64::new(0));
-    let started = Arc::new(std::sync::Barrier::new(2));
+    // Review 2 MED 5: a channel with a deadline, not a barrier, so a busy thread that fails before
+    // its first create fails the test instead of hanging it.
+    let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
     let dir = tempfile::TempDir::new().unwrap();
     let busy = {
-        let (stop, creates, started, path) = (stop.clone(), creates.clone(), started.clone(), dir.path().join("busy.db"));
+        let (stop, creates, started, path) = (stop.clone(), creates.clone(), started_tx, dir.path().join("busy.db"));
         std::thread::spawn(move || {
             let db = open(&path, SyncClass::Fsync, BranchCheckpoint::Fuzzy);
             let trunk = db.connect().unwrap();
@@ -191,19 +195,22 @@ fn the_fuzzy_held_syscall_budget_is_judged_beside_another_stores_work() {
                 trunk.create_branch(&format!("busy{}", creates.load(O::Relaxed))).unwrap();
                 creates.fetch_add(1, O::Release);
                 if first {
-                    started.wait();
+                    let _ = started.send(());
                     first = false;
                 }
             }
         })
     };
-    started.wait();
+    if started_rx.recv_timeout(std::time::Duration::from_secs(60)).is_err() {
+        let why = if busy.is_finished() { "it ended (panicked?)" } else { "no first create in 60 s" };
+        panic!("premise: the other store never started working: {why}");
+    }
     let at_entry = creates.load(O::Acquire);
     let judged = std::panic::catch_unwind(super::fastest_tests::a_fuzzy_checkpoint_issues_at_most_two_syscalls_under_the_store_mutex);
     let at_exit = creates.load(O::Acquire);
     stop.store(true, O::Release);
     busy.join().unwrap();
-    assert!(at_exit > at_entry, "premise: the other store worked during the call ({at_entry} -> {at_exit} creates)");
+    assert!(at_exit > at_entry, "premise: the other store's work overlaps the relay ({at_entry} -> {at_exit} creates)");
     if let Err(e) = judged {
         let msg = e.downcast_ref::<String>().cloned().or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default();
         assert!(
