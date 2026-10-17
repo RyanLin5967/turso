@@ -18589,6 +18589,8 @@ fn op_journal_mode_inner(
                     // bootstrap yield restores in-memory state.
                     let guard = MvccBootstrapGuard::new(program.connection.clone());
                     program.connection.db.mv_store.store(Some(mv_store.clone()));
+                    // Every connection compiled the old mode in (review C42 MED-7).
+                    program.connection.db.bump_prepare_context_generation();
                     program.connection.demote_to_mvcc_connection();
                     state.active_op_state.journal_mode().bootstrap_guard = Some(guard);
                     state.active_op_state.journal_mode().bootstrap_state =
@@ -18600,6 +18602,8 @@ fn op_journal_mode_inner(
 
                 if matches!(new_mode, journal_mode::JournalMode::Wal) {
                     program.connection.db.mv_store.store(None);
+                    // Every connection compiled the old mode in (review C42 MED-7).
+                    program.connection.db.bump_prepare_context_generation();
                 }
 
                 // Return result

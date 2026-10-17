@@ -875,7 +875,11 @@ impl Connection {
     /// one is reprepared before it runs. Read only (for frontends measuring re-prepares).
     #[inline]
     pub fn prepare_context_generation(&self) -> u64 {
-        self.prepare_context_generation.load(Ordering::Acquire)
+        // This connection's own generation plus its database's (review C42 MED-7): either moving
+        // moves the sum, since both only grow.
+        self.prepare_context_generation
+            .load(Ordering::Acquire)
+            .wrapping_add(self.db.prepare_context_generation.load(Ordering::Acquire))
     }
 
     /// check if connection executes nested program (so it must not do any "finalization" work as parent program will handle it)

@@ -863,6 +863,11 @@ pub struct Database<A: alloc::ConcurrentAllocator = alloc::DynAllocator> {
     /// address, this can never repeat within a process, so detach/reattach
     /// and close/reopen produce distinguishable values.
     pub(crate) incarnation: u64,
+    /// A prepare generation shared by every connection of this database (review C42 MED-7): a
+    /// change that alters what translation compiles in for all of them (a journal-mode switch, which
+    /// installs or removes the MV store) bumps it, and each connection's prepare key adds it to its
+    /// own (`Connection::prepare_context_generation`).
+    pub(crate) prepare_context_generation: AtomicU64,
 
     /// In Memory Page 1 for Empty Dbs
     init_page_1: Arc<ArcSwapOption<Page>>,
@@ -938,6 +943,13 @@ impl fmt::Debug for Database {
 }
 
 impl Database {
+    /// Bump the database-wide prepare generation (`prepare_context_generation`): every
+    /// connection's cached programs re-prepare (review C42 MED-7).
+    pub(crate) fn bump_prepare_context_generation(&self) {
+        self.prepare_context_generation
+            .fetch_add(1, Ordering::Release);
+    }
+
     /// Returns true if this database is backed by MemoryIO.
     pub fn is_in_memory_db(&self) -> bool {
         is_memory_like(&self.path)
@@ -1000,6 +1012,7 @@ impl Database {
         let enable_custom_types = opts.enable_custom_types || dialect.requires_custom_types();
 
         let db = Database {
+            prepare_context_generation: AtomicU64::new(0),
             mv_store,
             mv_store_allocator,
             path,

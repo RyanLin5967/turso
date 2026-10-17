@@ -3133,8 +3133,10 @@ fn a_journal_mode_switch_on_one_connection_moves_every_connection_s_prepare_gene
 /// - ext/mod.rs 4: extension registration (functions, vtabs), each a change.
 /// - mvcc/database/checkpoint_state_machine.rs 1: an unconditional schema reload, itself a change.
 /// - storage/pager.rs 1: rollback of a schema change. translate/pragma.rs 1: cache_spill, on a
-///   change. vdbe/execute.rs 1: savepoint schema restore. vdbe/mod.rs 1: an abandoned MVCC commit's
-///   schema removed.
+///   change. vdbe/execute.rs 3: savepoint schema restore, and the journal-mode switch's two
+///   Database-wide bumps (MV store installed, removed; review C42 MED-7). vdbe/mod.rs 1: an
+///   abandoned MVCC commit's schema removed.
+/// - Also counted (review C42 LOW-6): a raw `prepare_context_generation.fetch_add(` on one line.
 #[test]
 fn every_prepare_generation_bump_site_is_audited() {
     const AUDITED: &[(&str, usize)] = &[
@@ -3143,7 +3145,7 @@ fn every_prepare_generation_bump_site_is_audited() {
         ("mvcc/database/checkpoint_state_machine.rs", 1),
         ("storage/pager.rs", 1),
         ("translate/pragma.rs", 1),
-        ("vdbe/execute.rs", 1),
+        ("vdbe/execute.rs", 3),
         ("vdbe/mod.rs", 1),
     ];
     let core = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -3162,7 +3164,11 @@ fn every_prepare_generation_bump_site_is_audited() {
                     .lines()
                     .map(str::trim)
                     .filter(|l| !l.starts_with("//") && !l.contains("fn bump_prepare_context_generation"))
-                    .map(|l| l.matches("bump_prepare_context_generation()").count() + l.matches("prepare_context_generation).fetch_add(").count())
+                    .map(|l| {
+                        l.matches("bump_prepare_context_generation()").count()
+                            + l.matches("prepare_context_generation).fetch_add(").count()
+                            + l.matches("prepare_context_generation.fetch_add(").count()
+                    })
                     .sum();
                 if n > 0 {
                     let rel = path.strip_prefix(core).unwrap().to_string_lossy().replace('\\', "/");
