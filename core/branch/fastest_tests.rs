@@ -9184,7 +9184,12 @@ fn the_create_path_s_store_mutex_holds_do_no_syscall_allocation_or_catalog_state
 /// CPU (ARM64) may show another thread the two stores in either order. A background thread takes
 /// the audited store's mutex in a loop through the real guard (`branch_catalog_counters`) while
 /// this thread disarms, round after round; it is paused at each re-arm, so the only race is the
-/// disarm's. A stress red: it can only fail when the reordering happens, never pass by construction.
+/// disarm's. REGISTERED AS A NON-DISCRIMINATING SMOKE TEST (counters review 5): to fail before the fix,
+/// a stale AUDIT would have to stay invisible for a whole hold, far longer than a store buffer holds a
+/// store, so a green at the red commit is near certain. It credits nothing about the ordering (the
+/// fix's argument is the memory model's); it checks only that the race harness itself excludes
+/// nothing. The store is quiesced before round 0 (its name filter built, no checkpoint in flight), so
+/// its own threads take no hold across a re-arm; a hold one of them takes later is its blind spot.
 #[cfg(target_vendor = "apple")]
 #[test]
 fn a_disarm_racing_another_threads_hold_excludes_no_hold() {
@@ -9205,6 +9210,9 @@ fn a_disarm_racing_another_threads_hold_excludes_no_hold() {
     let incarnation = open_at(&path, opts(true, SyncClass::Off)).incarnation;
     *AUDIT_PATH.lock().unwrap() = Some(std::fs::canonicalize(&path).unwrap().to_str().unwrap().to_string());
     let db = reopen(&path, opts(true, SyncClass::Off), incarnation);
+    // Counters review 5: the store's own background work ends before any arming.
+    db.branch_wait_name_filter();
+    db.branch_checkpoint_wait();
     {
         let mut log = AUDIT_LOG.lock().unwrap();
         log.clear();
