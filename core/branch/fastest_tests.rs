@@ -9399,6 +9399,73 @@ fn a_named_create_before_the_open_s_filter_build_lands_asks_the_catalog_nothing(
     assert_eq!(asked, 0, "CLAIM: a named create of a fresh name ran {asked} catalog statements before the open's filter build landed");
 }
 
+/// Lead order (a), the filter-fallback proof's fourth natural path (artie engine NOTES df996a0f91,
+/// case 4): a burst of creates while a natural growth is slow (held at stage 1, `Growing`) fills a
+/// table to its refusal (7/8 full), and the filter overflowed with no table answering, so every
+/// named create until the rebuild landed ran a catalog statement under the store mutex. With the
+/// refusing tables and a pre-allocated spill table of what they refused, the answer stays complete:
+/// a fresh name created while `Overflowed`, and again while the rebuild is `Building` (stage 7),
+/// asks the catalog nothing, and the filter never says "absent" for a name created in the burst.
+#[test]
+fn a_named_create_after_a_natural_filter_refusal_asks_the_catalog_nothing() {
+    use super::store::{FILTER_PAUSED, FILTER_PAUSE_AT};
+    use std::sync::atomic::Ordering::{Acquire, Release};
+    let _s = serial();
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FILTER_PAUSE_AT.store(0, Release);
+            FILTER_PAUSED.store(0, Release);
+        }
+    }
+    let _r = Reset;
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("filter-refusal-asks.db"), opts(true, SyncClass::Off));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    trunk.create_branch("first").unwrap();
+    db.branch_wait_name_filter();
+    FILTER_PAUSE_AT.store(1, Release);
+    let t = std::time::Instant::now();
+    let mut names = Vec::new();
+    while FILTER_PAUSED.load(Acquire) != 1 {
+        let name = format!("fill-{:05}", names.len());
+        trunk.create_branch(&name).unwrap();
+        names.push(name);
+        assert!(t.elapsed() < std::time::Duration::from_secs(30), "premise: no natural filter growth began");
+    }
+    // The burst, with the growth held: until a table refuses.
+    while db.branches.name_filter_state_for_test().0 != "Overflowed" {
+        let name = format!("burst-{:05}", names.len());
+        trunk.create_branch(&name).unwrap();
+        names.push(name);
+        assert!(names.len() < 1 << 20, "premise: no table refused a key during the held growth");
+    }
+    let stmts = || super::budget_probe::thread_cat_stmts();
+    let s0 = stmts();
+    trunk.create_branch("while-overflowed").unwrap();
+    let overflowed = stmts() - s0;
+    names.push("while-overflowed".to_string());
+    FILTER_PAUSE_AT.store(7, Release);
+    while FILTER_PAUSED.load(Acquire) != 7 {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        assert!(t.elapsed() < std::time::Duration::from_secs(60), "premise: the overflow's rebuild never began");
+    }
+    let s1 = stmts();
+    trunk.create_branch("while-rebuilding").unwrap();
+    let rebuilding = stmts() - s1;
+    names.push("while-rebuilding".to_string());
+    let said_absent: Vec<&String> = names.iter().filter(|n| db.branches.name_filter_says_absent_for_test(n)).collect();
+    FILTER_PAUSE_AT.store(0, Release);
+    db.branch_wait_name_filter();
+    assert!(said_absent.is_empty(), "CLAIM: the filter said absent for {} held names after the refusal: {:?}", said_absent.len(), &said_absent[..said_absent.len().min(8)]);
+    assert_eq!(
+        (overflowed, rebuilding),
+        (0, 0),
+        "CLAIM: a named create of a fresh name ran catalog statements after a natural refusal: {overflowed} while Overflowed, {rebuilding} while its rebuild was Building"
+    );
+}
+
 /// Class (e), the store mutex's lifecycle audit (DECISIONS 994f7d41e0; the lead's order with
 /// nf-adversary-2's MED-2 and M4 folded in): every store-mutex hold on the create path does NO syscall,
 /// NO allocation and NO catalog statement. One instrument for the whole class: every outermost hold
