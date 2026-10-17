@@ -9302,6 +9302,54 @@ fn a_named_create_during_a_natural_filter_growth_asks_the_catalog_nothing() {
     );
 }
 
+/// Lead order (a), the filter-fallback proof's second natural path: create-and-delete cycles (the
+/// wire's benchmark loop) leave the filter's table past half full of released names while few are
+/// live, and the next note SHRINKS it, by a rebuild from the catalog. At 0cca39a23 the shrink
+/// overflowed the filter, so every named create until the rebuild landed ran a catalog statement
+/// under the store mutex, though the old table was still complete (a shrink refuses nothing). No
+/// fault injected; the rebuild is held after its `Building` began (`FILTER_PAUSE_AT` stage 7), and
+/// a fresh name created there must ask the catalog nothing. Premise: a rebuild was started.
+#[test]
+fn a_named_create_during_a_natural_filter_shrink_asks_the_catalog_nothing() {
+    use super::store::{FILTER_PAUSED, FILTER_PAUSE_AT};
+    use std::sync::atomic::Ordering::{Acquire, Release};
+    let _s = serial();
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FILTER_PAUSE_AT.store(0, Release);
+            FILTER_PAUSED.store(0, Release);
+        }
+    }
+    let _r = Reset;
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("filter-shrink-asks.db"), opts(true, SyncClass::Off));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    trunk.create_branch("held").unwrap();
+    db.branch_wait_name_filter();
+    let rebuilds0 = db.branches.name_filter_state_for_test().1;
+    FILTER_PAUSE_AT.store(7, Release);
+    let t = std::time::Instant::now();
+    let mut n = 0u32;
+    while FILTER_PAUSED.load(Acquire) != 7 {
+        let name = format!("cycle-{n:05}");
+        trunk.create_branch(&name).unwrap();
+        db.drop_branch(&name).unwrap();
+        n += 1;
+        assert!(t.elapsed() < std::time::Duration::from_secs(30), "premise: no natural filter rebuild began ({n} cycles)");
+    }
+    assert!(db.branches.name_filter_state_for_test().1 > rebuilds0, "premise: the rebuild held at stage 7 was not one a create owed");
+    let s0 = super::budget_probe::thread_cat_stmts();
+    trunk.create_branch("while-shrinking").unwrap();
+    let asked = super::budget_probe::thread_cat_stmts() - s0;
+    let taken = trunk.create_branch("held").is_err();
+    FILTER_PAUSE_AT.store(0, Release);
+    db.branch_wait_name_filter();
+    assert!(taken, "CLAIM: a held name was given again during the shrink's rebuild");
+    assert_eq!(asked, 0, "CLAIM: a named create of a fresh name ran {asked} catalog statements during a natural filter shrink's rebuild ({n} cycles)");
+}
+
 /// Class (e), the store mutex's lifecycle audit (DECISIONS 994f7d41e0; the lead's order with
 /// nf-adversary-2's MED-2 and M4 folded in): every store-mutex hold on the create path does NO syscall,
 /// NO allocation and NO catalog statement. One instrument for the whole class: every outermost hold
