@@ -3268,8 +3268,8 @@ impl NameFilter {
         fn answer(a: &Answer) -> [Option<(&'static str, &Arc<FilterTable>)>; 3] {
             [
                 Some(("names.filter.answer_sink", &a.sink)),
-                a.fixed[0].as_ref().map(|t| ("names.filter.answer_fixed", t)),
-                a.fixed[1].as_ref().map(|t| ("names.filter.answer_fixed", t)),
+                a.fixed[0].as_ref().map(|t| ("names.filter.answer_fixed0", t)),
+                a.fixed[1].as_ref().map(|t| ("names.filter.answer_fixed1", t)),
             ]
         }
         let state: [Option<(&'static str, &Arc<FilterTable>)>; 4] = match &self.state {
@@ -3288,7 +3288,11 @@ impl NameFilter {
             }
         };
         let spare = self.spare.as_ref().map(|t| ("names.filter.spare", t));
-        let retired = self.retired.iter().map(|t| t.as_ref().map(|t| ("names.filter.retired", t)));
+        // Unique labels (review filter3 L6): a reader matching by label must not score one table
+        // against another.
+        const RETIRED: [&str; 4] =
+            ["names.filter.retired0", "names.filter.retired1", "names.filter.retired2", "names.filter.retired3"];
+        let retired = self.retired.iter().zip(RETIRED).map(|(t, label)| t.as_ref().map(|t| (label, t)));
         state.into_iter().chain(std::iter::once(spare)).chain(retired).flatten()
     }
 
