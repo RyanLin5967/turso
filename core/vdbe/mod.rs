@@ -1737,6 +1737,15 @@ impl PrepareContext {
         }
     }
 
+    /// `from_connection`, keyed at a generation read earlier (before translation; review c42b
+    /// MED-4).
+    pub fn from_connection_at(connection: &Connection, generation: u64) -> Self {
+        Self {
+            database_ptr: connection.database_ptr(),
+            generation,
+        }
+    }
+
     #[inline]
     pub fn matches_connection(&self, connection: &Connection) -> bool {
         self.database_ptr == connection.database_ptr()

@@ -85,6 +85,7 @@ pub fn translate(
     origin: crate::statement::StatementOrigin,
     prepare_options: &PrepareOptions,
     text: crate::connection::SqlText,
+    prepare_generation: u64,
 ) -> Result<Program> {
     tracing::trace!("querying {}", input);
     let change_cnt_on = matches!(
@@ -107,6 +108,9 @@ pub fn translate(
         // These options will be extended whithin each translate program
         ProgramBuilderOpts::new(1, 32, 2),
     ));
+    // Keyed at the generation the caller read before it read any state the key covers (review
+    // c42b MED-4): a change landing after that re-prepares this program instead of being missed.
+    program.set_prepare_generation(prepare_generation);
     program.set_mvcc_enabled(connection.mvcc_enabled());
 
     program.prologue();

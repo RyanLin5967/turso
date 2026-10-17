@@ -978,6 +978,9 @@ impl Statement {
         // publish new btree roots without bumping the schema cookie, so
         // same-version reprepare still refreshes it.
         conn.refresh_schema_from_shared_for_reprepare();
+        // The key before the re-parse and re-translation read any state it covers (review c42b
+        // MED-4).
+        let prepare_generation = conn.prepare_context_generation();
         let new_program = {
             // Through the dialect's connection-aware hook (wire-rework E-M2): a frontend whose
             // translation needs the connection re-translates as its own prepare did.
@@ -1008,6 +1011,7 @@ impl Statement {
                 self.origin,
                 prepare_options,
                 self.sql_text,
+                prepare_generation,
             )?
         };
 

@@ -989,6 +989,9 @@ impl Connection {
         #[cfg(test)]
         crate::branch::budget_probe::statement_prepared();
         self.maybe_update_schema();
+        // The key before any state it covers is read (review c42b MED-4): the symbols, schema,
+        // pager, CDC and journal mode below are all read after it.
+        let prepare_generation = self.prepare_context_generation();
 
         let syms = self.syms.read();
         let pager = self.pager.load().clone();
@@ -1006,6 +1009,7 @@ impl Connection {
             origin,
             prepare_options,
             text,
+            prepare_generation,
         ) {
             Ok(program) => Ok((program, pager, mode)),
             Err(err) if self.should_retry_cross_process_schema_lookup(&err)? => {
@@ -1022,6 +1026,7 @@ impl Connection {
                     cmd
                 };
                 self.maybe_update_schema();
+                let prepare_generation = self.prepare_context_generation();
                 let syms = self.syms.read();
                 let pager = self.pager.load().clone();
                 let mode = QueryMode::new(&cmd);
@@ -1039,6 +1044,7 @@ impl Connection {
                     origin,
                     prepare_options,
                     text,
+                    prepare_generation,
                 )
                 .map(|program| (program, pager, mode))
             }
