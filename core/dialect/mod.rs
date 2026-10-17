@@ -394,6 +394,100 @@ mod tests {
         assert!(failed.is_empty(), "CLAIM: engine helper SQL went through the frontend dialect's parser: {failed:#?}");
     }
 
+    /// `ClientOnlyDialect`, storing tables as a frontend does: `format_table_sql` marks the text
+    /// it stores (`/* client */ `), and marked text must be the dialect's own (`client: ...`), as a
+    /// frontend parses its marked rows with its own parser; unmarked rows fall back to SQLite.
+    struct MarkingDialect;
+
+    impl MarkingDialect {
+        fn unmark(sql: &str) -> crate::Result<&str> {
+            match sql.strip_prefix("/* client */ ") {
+                Some(marked) => marked.strip_prefix("client: ").ok_or_else(|| {
+                    crate::LimboError::ParseError(format!("a marked row that is not client text: {sql}"))
+                }),
+                None => Ok(sql),
+            }
+        }
+    }
+
+    impl Dialect for MarkingDialect {
+        fn name(&self) -> &'static str {
+            "marking"
+        }
+        fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+            ClientOnlyDialect.parse(sql)
+        }
+        fn parse_table_sql(&self, sql: &str, root_page: i64) -> crate::Result<BTreeTable> {
+            BTreeTable::from_sql(Self::unmark(sql)?, root_page)
+        }
+        fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<turso_parser::ast::Stmt> {
+            sqlite::parse_table_sql_ast(Self::unmark(sql)?)
+        }
+        fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
+            sqlite::table_sql_for_replay(Self::unmark(sql)?)
+        }
+        fn format_table_sql(
+            &self,
+            input: &str,
+            _tbl_name: &turso_parser::ast::QualifiedName,
+            _body: &turso_parser::ast::CreateTableBody,
+        ) -> crate::Result<String> {
+            Ok(format!("/* client */ {input}"))
+        }
+        fn resolve_function(&self, name: &str, arg_count: usize) -> crate::Result<Option<crate::function::Func>> {
+            sqlite::resolve_builtin_function(name, arg_count)
+        }
+        fn register_catalog(&self, schema: &mut crate::schema::Schema, enable_custom_types: bool) -> crate::Result<()> {
+            sqlite::register_builtin_catalog(schema, enable_custom_types)
+        }
+    }
+
+    /// The wire's NO SILENT DIALECT SWITCH class, stored side (lead order): an engine helper's
+    /// CREATE TABLE (CDC's capture table, MVCC's metadata table) stores SQLite text, never its text
+    /// through the frontend's `format_table_sql`, which marks it as the frontend's own and makes the
+    /// frontend's parser read it at the next open. Each database is created under `MarkingDialect`
+    /// with a client table, the helper's table made, closed, and reopened: it must load and read.
+    /// At 7b5093ef0 the helper's text went through the dialect's formatter.
+    #[cfg(all(feature = "fs", not(target_family = "wasm")))]
+    #[test]
+    fn an_engine_helper_s_table_stores_sqlite_text_and_reopens_under_any_dialect() {
+        let dir = tempfile::tempdir().unwrap();
+        let io: Arc<dyn IO> = Arc::new(crate::io::PlatformIO::new().unwrap());
+        let open = |name: &str| {
+            Database::open_file_with_flags(
+                io.clone(),
+                dir.path().join(name).to_str().unwrap(),
+                OpenFlags::Create,
+                DatabaseOpts::new(),
+                None,
+                Arc::new(MarkingDialect),
+            )
+        };
+        let mut failed = Vec::new();
+        for (name, make_helper_table) in [
+            ("cdc.db", "client: PRAGMA capture_data_changes_conn('id')"),
+            ("mvcc.db", "client: PRAGMA journal_mode = 'mvcc'"),
+        ] {
+            {
+                let db = open(name).unwrap();
+                let conn = db.connect().unwrap();
+                conn.execute("client: CREATE TABLE t(x INTEGER)").unwrap();
+                if let Err(e) = conn.execute(make_helper_table).and_then(|()| conn.execute("client: INSERT INTO t VALUES (1)")) {
+                    failed.push(format!("{name}: premise: the helper's table was not made: {e}"));
+                    continue;
+                }
+            }
+            let reopened = open(name).and_then(|db| {
+                let conn = db.connect()?;
+                conn.prepare("client: SELECT x FROM t")?.run_collect_rows().map(drop)
+            });
+            if let Err(e) = reopened {
+                failed.push(format!("{name}: {e}"));
+            }
+        }
+        assert!(failed.is_empty(), "CLAIM: a database whose engine helper made a table does not reopen under its dialect: {failed:#?}");
+    }
+
     /// A dialect that counts its connection-aware re-parses (wire-rework E-M2).
     #[derive(Default)]
     struct ReparseDialect {
