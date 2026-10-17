@@ -3670,6 +3670,46 @@ mod tests {
         stmt.run_ignore_rows().unwrap_or_else(|e| panic!("{sql}: {e}"));
     }
 
+    /// Review wire-line2 M1: an engine re-prepare of a session's statement really goes through
+    /// PostgresDialect::parse_for_reprepare and translates as the session did. A prepared
+    /// DELETE ... USING (whose translation reads its relations' columns), with the prepare
+    /// generation bumped by a setting change (set_cache_size) before its first step, re-prepares
+    /// (the reprepares metric rises: the premise) and deletes the one matching row. MUTANT owed with
+    /// the run: the override returning `self.parse(sql)` translates with no lookup and must fail it.
+    #[test]
+    fn an_engine_reprepare_translates_as_the_session_did() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("r.db");
+        let io = Arc::new(crate::PlatformIO::new().unwrap());
+        let db = open_database_with_io(
+            io,
+            path.to_str().unwrap(),
+            crate::OpenFlags::default(),
+            crate::DatabaseOpts::new(),
+        )
+        .unwrap();
+        let conn = crate::Connection::new(db.connect().unwrap());
+        run(&conn, "CREATE TABLE a (x INT)");
+        run(&conn, "CREATE TABLE b (x INT)");
+        run(&conn, "INSERT INTO a VALUES (1), (2), (3)");
+        run(&conn, "INSERT INTO b VALUES (2)");
+        let mut stmt = conn.prepare("DELETE FROM a USING b WHERE a.x = b.x").unwrap();
+        let before = stmt.metrics().reprepares;
+        let size = conn.inner().get_cache_size();
+        conn.inner().set_cache_size(size + 1);
+        stmt.run_ignore_rows().unwrap();
+        assert!(
+            stmt.metrics().reprepares > before,
+            "premise: the statement was not re-prepared after the generation moved"
+        );
+        assert_eq!(stmt.n_change(), 1, "the re-prepared DELETE ... USING deleted the wrong rows");
+        drop(stmt);
+        let mut left = conn.prepare("SELECT x FROM a ORDER BY x").unwrap();
+        let rows = left.run_collect_rows().unwrap();
+        let xs: Vec<String> = rows.iter().map(|r| format!("{}", r[0])).collect();
+        assert_eq!(xs, ["1", "3"]);
+    }
+
     /// A multi-row UPDATE inside a block whose third row sets a primary key NULL fails the key's
     /// NOT NULL and leaves every row as it was: the rows it already changed are undone by the
     /// statement journal (engine fix c29eaa7f4, engine review 20 LOWs 24 and 26; the engine's own red
