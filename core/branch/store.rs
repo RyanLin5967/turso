@@ -13173,6 +13173,18 @@ impl StoreInner {
 mod tests {
     use super::*;
 
+    /// Review filter3 L4: a hold that retires a fifth table breaks the bound the retired slots rest
+    /// on (every noting hold takes them, one hold retires at most four). It must be refused
+    /// loudly, never freed in place under the store mutex without a word.
+    #[test]
+    #[should_panic(expected = "retired slots are full")]
+    fn a_fifth_retired_filter_table_is_refused_loudly() {
+        let mut f = NameFilter::default();
+        for _ in 0..5 {
+            f.retire_table(Arc::new(FilterTable::for_keys(8)));
+        }
+    }
+
     /// Review REVIEW-claude-engine-L2d LOW 1: a capture's freeze that finds a frozen generation left
     /// over (an install that failed after its commit, or lost its journal) merges it with the live
     /// one's entries winning, since they are the newer. `relink` can leave `(parent, zf)` in both:
