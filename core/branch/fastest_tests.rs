@@ -5770,6 +5770,10 @@ fn a_checkpoint_that_cannot_start_is_not_retried_by_the_next_create() {
         for _ in 0..5 {
             let _ = trunk.fork_branch().unwrap().into_id();
         }
+        // FLAGGED TEST EDIT (lead order, review L2d LOW 4; strengthening only): since slice 3 a
+        // retried capture runs on the checkpoint worker after the create returns, so the read waits
+        // for every start handed out; without it the retry mutant was caught only by timing.
+        db.branch_checkpoint_wait();
         assert_eq!(entered(), after, "{fp:?}: the next creates retried the checkpoint's capture");
     }
 }
