@@ -3082,6 +3082,9 @@ struct NameFilter {
     /// them after its unlock (`take_retired`). Four slots, more than one hold ever retires (an
     /// answer holds three tables); a fifth would be freed in place.
     retired: [Option<Arc<FilterTable>>; 4],
+    /// Fifth tables a hold retired (a broken invariant): a panic in test and debug builds; in a
+    /// release build each is freed in place and counted here, never silently (review c42b LOW-10).
+    retired_overflows: u64,
 }
 
 /// The keys a refusal's spare table holds before it refuses too (`NameFilter::spare`): the notes of
@@ -3357,7 +3360,11 @@ impl NameFilter {
         let slot = self.retired.iter_mut().find(|s| s.is_none());
         // Every hold that notes takes the retired tables (`take_retired`), and one hold retires at
         // most four, so a full array is a broken invariant (review filter3 L4): refused loudly in
-        // test and debug builds, never freed in place silently (a release build frees it here).
+        // test and debug builds; a release build frees it here and counts it (`retired_overflows`;
+        // review c42b LOW-10), never silently.
+        if slot.is_none() {
+            self.retired_overflows += 1;
+        }
         debug_assert!(slot.is_some(), "the name filter's retired slots are full: a hold retired a fifth table");
         if let Some(slot) = slot {
             *slot = Some(t);
@@ -13445,9 +13452,6 @@ impl StoreInner {
 mod tests {
     use super::*;
 
-    /// Review filter3 L4: a hold that retires a fifth table breaks the bound the retired slots rest
-    /// on (every noting hold takes them, one hold retires at most four). It must be refused
-    /// loudly, never freed in place under the store mutex without a word.
     /// Review filter3 L7: a Stale answer that already holds a fixed table (a failed scan restored a
     /// respilled answer) respills a refused note into a kept spare, as Building's and Overflowed's
     /// answers do (N1), when a fixed slot is free: it keeps answering through the build's backoff
@@ -13471,6 +13475,11 @@ mod tests {
         assert!(f.spare.is_none(), "premise: the spare became the sink");
     }
 
+    /// Review filter3 L4: a hold that retires a fifth table breaks the bound the retired slots rest
+    /// on (every noting hold takes them, one hold retires at most four). It must be refused
+    /// loudly, never freed in place under the store mutex without a word: a panic where debug
+    /// assertions are on (review c42b LOW-10: under `--release` the `should_panic` failed).
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "retired slots are full")]
     fn a_fifth_retired_filter_table_is_refused_loudly() {
@@ -13478,6 +13487,19 @@ mod tests {
         for _ in 0..5 {
             f.retire_table(Arc::new(FilterTable::for_keys(8)));
         }
+    }
+
+    /// Review c42b LOW-10: with debug assertions off, a fifth retired table is counted, not lost
+    /// without a word: `retired_overflows` reads 1 and the four slots stay full.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn a_fifth_retired_filter_table_is_counted_in_a_release_build() {
+        let mut f = NameFilter::default();
+        for _ in 0..5 {
+            f.retire_table(Arc::new(FilterTable::for_keys(8)));
+        }
+        assert_eq!(f.retired_overflows, 1, "CLAIM: a fifth retired table was freed in place uncounted");
+        assert!(f.retired.iter().all(Option::is_some), "premise: the four slots were filled first");
     }
 
     /// Review REVIEW-claude-engine-L2d LOW 1: a capture's freeze that finds a frozen generation left
