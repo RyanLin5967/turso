@@ -4368,8 +4368,9 @@ mod dialect_switch_tests {
         }
     }
 
-    /// Text marked as this frontend's own SQLite takes the SQLite parse, and the same text
-    /// unmarked does not.
+    /// Text marked as this frontend's own SQLite takes the SQLite parse. (Unmarked text that
+    /// libpg_query rejects, such as a PRAGMA, still falls back to SQLite until the engine's typed
+    /// text kind lands at integration; nothing here asserts otherwise: review wire-line2 LOW-9.)
     #[test]
     fn only_marked_text_takes_the_sqlite_parse() {
         let pragma = "PRAGMA foreign_keys";

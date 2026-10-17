@@ -7020,18 +7020,88 @@ mod tests {
             .collect()
     }
 
-    /// `text` less each `#[cfg(test)]` + `mod <name> {` span (its newlines kept), through its matching brace; braces
-    /// inside string and char literals and comments are not counted. An unmatched span keeps the
-    /// rest of the file (read, never skipped).
+    /// The index of the `close` that matches the `open` at `at` in `text`, counting neither inside
+    /// string, raw-string and char literals nor inside comments (a lifetime is not a char literal);
+    /// None when it is never closed.
+    fn matching_close(text: &str, at: usize, open: u8, close: u8) -> Option<usize> {
+        let b = text.as_bytes();
+        let (mut i, mut depth) = (at, 0i64);
+        while i < b.len() {
+            match b[i] {
+                b'/' if b.get(i + 1) == Some(&b'/') => {
+                    while i < b.len() && b[i] != b'\n' {
+                        i += 1;
+                    }
+                }
+                b'/' if b.get(i + 1) == Some(&b'*') => {
+                    i += 2;
+                    while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                b'r' if matches!(b.get(i + 1), Some(b'#') | Some(b'"'))
+                    && !b[i.saturating_sub(1)].is_ascii_alphanumeric() =>
+                {
+                    let mut j = i + 1;
+                    while b.get(j) == Some(&b'#') {
+                        j += 1;
+                    }
+                    if b.get(j) == Some(&b'"') {
+                        let end = format!("\"{}", "#".repeat(j - i - 1));
+                        i = text[j + 1..].find(&end).map_or(b.len(), |n| j + 1 + n + end.len() - 1);
+                    }
+                }
+                b'"' => {
+                    i += 1;
+                    while i < b.len() && b[i] != b'"' {
+                        if b[i] == b'\\' {
+                            i += 1;
+                        }
+                        i += 1;
+                    }
+                }
+                b'\'' => {
+                    if b.get(i + 1) == Some(&b'\\') {
+                        if let Some(n) = text[i + 2..].find('\'') {
+                            i += 2 + n;
+                        }
+                    } else if b.get(i + 2) == Some(&b'\'') {
+                        i += 2;
+                    }
+                }
+                c if c == open => depth += 1,
+                c if c == close => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        None
+    }
+
     /// Whether `line` is a cfg attribute that holds only under test: `#[cfg(test)]`,
-    /// `#[cfg(all(test, ...))]`; never one with `not(` in it.
+    /// `#[cfg(all(test, ...))]`; never one with `not(` or `any(` in it. Quoted strings are dropped
+    /// before the words are read, so `feature = "test-utils"` is not `test` (review wire-line2
+    /// LOW-6).
     fn is_test_cfg(line: &str) -> bool {
         let l = line.trim();
+        let unquoted: String = l
+            .split('"')
+            .enumerate()
+            .filter(|(i, _)| i % 2 == 0)
+            .map(|(_, part)| part)
+            .collect();
         l.starts_with("#[cfg(")
             && l.ends_with(")]")
-            && !l.contains("not(")
-            && !l.contains("any(")
-            && l.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            && !unquoted.contains("not(")
+            && !unquoted.contains("any(")
+            && unquoted
+                .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
                 .any(|w| w == "test")
     }
 
@@ -7049,6 +7119,9 @@ mod tests {
         None
     }
 
+    /// `text` less each test-cfg `mod <name> {` span (its newlines kept), through its matching
+    /// brace; braces inside string and char literals and comments are not counted. An unmatched span
+    /// keeps the rest of the file (read, never skipped).
     fn strip_test_modules(text: &str) -> String {
         let mut out = String::new();
         let mut rest = text;
@@ -7196,33 +7269,20 @@ mod tests {
     #[test]
     fn every_assign_call_propagates_its_refusal() {
         let source = include_str!("../frontend/session.rs");
-        let lines: Vec<&str> = source.lines().collect();
         // Each call's own closing parenthesis, found by matching it (the wire line review L2: the
         // next `});` or `})?;` line could be another call's, so `}).ok();` passed), and what
         // follows it must be `?`: the outcome is propagated, whatever the formatting.
-        let _ = &lines;
+        // Parentheses inside string and char literals and comments are not counted (review
+        // wire-line2 LOW-5: a "(" in a closure body shifted the close).
         let (mut calls, mut dropped) = (0, Vec::new());
         let b = source.as_bytes();
         let mut from = 0;
         while let Some(k) = source[from..].find("assign(&|") {
             let open = from + k + "assign".len();
             calls += 1;
-            let (mut depth, mut j) = (0i64, open);
-            while j < b.len() {
-                match b[j] {
-                    b'(' => depth += 1,
-                    b')' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-                j += 1;
-            }
-            if b.get(j + 1) != Some(&b'?') {
-                dropped.push(source[..open].matches('\n').count() + 1);
+            match matching_close(source, open, b'(', b')') {
+                Some(j) if b.get(j + 1) == Some(&b'?') => {}
+                _ => dropped.push(source[..open].matches('\n').count() + 1),
             }
             from = open;
         }
