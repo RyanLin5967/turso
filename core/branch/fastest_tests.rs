@@ -3058,7 +3058,8 @@ fn a_statement_reprepared_after_a_setting_change_keeps_its_search_path() {
 /// is audited (and the setter class above says whether it should be change-only). Counts calls of
 /// `bump_prepare_context_generation()` and the extensions' raw `prepare_context_generation)
 /// .fetch_add(`, outside comments and the function's own definition. Audited at 09e8b26b0:
-/// - connection.rs 37: the change-only setters (16, incl. the four of MED-1); schema, attach,
+/// - connection.rs 37: the change-only setters (17: set_temp_store and the 16 of 49e10e02a and
+///   09e8b26b0); schema, attach,
 ///   detach, rollback and collation events that are themselves changes; set_busy_handler, the
 ///   encryption setters and the mvcc thresholds, unconditional (not comparable, or rare).
 /// - ext/mod.rs 4: extension registration (functions, vtabs), each a change.
@@ -3213,6 +3214,20 @@ fn a_setter_given_the_value_it_holds_leaves_the_prepare_generation_alone() {
     check("set_sync_mode", &|| c.set_sync_mode(v), &|| c.set_sync_mode(w), &|| c.set_sync_mode(v));
     let v = c.get_data_sync_retry();
     check("set_data_sync_retry", &|| c.set_data_sync_retry(v), &|| c.set_data_sync_retry(!v), &|| c.set_data_sync_retry(v));
+    // Review engine-rev-setter LOW-3: the two changed sites the red did not cover. The current CDC
+    // value is cloned on its own line: inline, its read guard would still be held when the setter
+    // takes the write lock.
+    let v = c.get_capture_data_changes_info().clone();
+    let w = crate::CaptureDataChangesInfo::parse("id", None).unwrap();
+    check(
+        "set_capture_data_changes_info",
+        &|| c.set_capture_data_changes_info(v.clone()),
+        &|| c.set_capture_data_changes_info(w.clone()),
+        &|| c.set_capture_data_changes_info(v.clone()),
+    );
+    let v = c.get_pager().get_spill_enabled();
+    let pragma = |on: bool| c.execute(format!("PRAGMA cache_spill = {}", if on { 1 } else { 0 })).unwrap();
+    check("PRAGMA cache_spill", &|| pragma(v), &|| pragma(!v), &|| pragma(v));
     let v = c.get_busy_timeout();
     let w = v + std::time::Duration::from_millis(7);
     check("set_busy_timeout", &|| c.set_busy_timeout(v), &|| c.set_busy_timeout(w), &|| c.set_busy_timeout(v));
