@@ -2807,8 +2807,14 @@ enum FilterState {
     /// No table: lookups ask the catalog (not built yet, or a failed scan).
     #[default]
     Unbuilt,
-    /// The catalog scan of a build runs off the mutex; names noted meanwhile go into `pending`.
-    Building { pending: Arc<FilterTable> },
+    /// The catalog scan of a build runs off the mutex; names noted meanwhile go into `pending`,
+    /// and into `old` if the build replaces a complete table (a shrink's, from `Stale`), which
+    /// answers meanwhile; a note `old` refuses drops it (lookups then ask the catalog).
+    Building { pending: Arc<FilterTable>, old: Option<Arc<FilterTable>> },
+    /// `table` is complete but a rebuild is owed: a shrink (lead order (a): it overflowed before,
+    /// and every create until the rebuild landed asked the catalog). Notes go into `table`, which
+    /// answers; one it refuses overflows.
+    Stale { table: Arc<FilterTable> },
     /// The filter answers from `table`.
     Ready { table: Arc<FilterTable> },
     /// A growth copies `table` into a larger one off the mutex; notes go into both.
@@ -2869,9 +2875,14 @@ impl NameFilter {
                 }
             }
         }
+        let mut old_refused = false;
         let fits = match &self.state {
             FilterState::Unbuilt | FilterState::Overflowed => true,
-            FilterState::Building { pending } => pending.insert(h),
+            FilterState::Building { pending, old } => {
+                old_refused = old.as_ref().is_some_and(|o| !o.insert(h));
+                pending.insert(h)
+            }
+            FilterState::Stale { table } => table.insert(h),
             FilterState::Ready { table } => {
                 let fits = table.insert(h);
                 if fits && table.wants_room() && self.owed.is_none() {
@@ -2879,7 +2890,16 @@ impl NameFilter {
                     if self.live.saturating_mul(4) < table.len() as u64 && !fe_mutant("name_filter_never_shrinks") {
                         self.live = self.live.saturating_add(1);
                         self.shrinks += 1;
-                        self.overflow();
+                        // The table refused nothing: it keeps answering until the smaller one is
+                        // built (`Stale`). Mutant `filter_shrink_overflows` (test builds only): it
+                        // overflows, as before, and lookups ask the catalog meanwhile.
+                        if fe_mutant("filter_shrink_overflows") {
+                            self.overflow();
+                        } else {
+                            let table = table.clone();
+                            self.state = FilterState::Stale { table };
+                            self.owed = Some(FilterWork::Rebuild);
+                        }
                         return;
                     }
                     self.owed = Some(FilterWork::Grow);
@@ -2890,6 +2910,11 @@ impl NameFilter {
             FilterState::Growing { table, pending } => table.insert(h) & pending.insert(h),
             FilterState::Draining { table, .. } => table.insert(h),
         };
+        if old_refused {
+            if let FilterState::Building { old, .. } = &mut self.state {
+                *old = None;
+            }
+        }
         if !fits {
             self.overflow();
         }
@@ -2933,8 +2958,14 @@ impl NameFilter {
             FilterState::Draining { table, pending } if !fe_mutant("filter_absent_only_when_ready") => {
                 !table.contains(h) && !pending.contains(h)
             }
+            FilterState::Stale { table } | FilterState::Building { old: Some(table), .. }
+                if !fe_mutant("filter_absent_only_when_ready") =>
+            {
+                !table.contains(h)
+            }
             FilterState::Unbuilt
             | FilterState::Building { .. }
+            | FilterState::Stale { .. }
             | FilterState::Growing { .. }
             | FilterState::Draining { .. }
             | FilterState::Overflowed => false,
@@ -2945,8 +2976,8 @@ impl NameFilter {
     fn tables(&self) -> (Option<&Arc<FilterTable>>, Option<&Arc<FilterTable>>) {
         match &self.state {
             FilterState::Unbuilt | FilterState::Overflowed => (None, None),
-            FilterState::Building { pending } => (None, Some(pending)),
-            FilterState::Ready { table } => (Some(table), None),
+            FilterState::Building { pending, old } => (old.as_ref(), Some(pending)),
+            FilterState::Ready { table } | FilterState::Stale { table } => (Some(table), None),
             FilterState::Growing { table, pending } | FilterState::Draining { table, pending } => {
                 (Some(table), Some(pending))
             }
@@ -9249,7 +9280,7 @@ impl BranchStore {
             let Some(cat) = inner.cat.as_ref() else {
                 return FilterBuild::Ended;
             };
-            if !matches!(inner.names.filter.state, FilterState::Unbuilt | FilterState::Overflowed) {
+            if !matches!(inner.names.filter.state, FilterState::Unbuilt | FilterState::Overflowed | FilterState::Stale { .. }) {
                 return FilterBuild::Ended;
             }
             let frozen = inner.names.frozen.as_ref().map_or(0, |f| f.fresh.len());
@@ -9268,7 +9299,7 @@ impl BranchStore {
         {
             let mut inner = shared.lock();
             let names = &mut inner.names;
-            if !matches!(names.filter.state, FilterState::Unbuilt | FilterState::Overflowed) {
+            if !matches!(names.filter.state, FilterState::Unbuilt | FilterState::Overflowed | FilterState::Stale { .. }) {
                 return FilterBuild::Ended;
             }
             // The names created since the last checkpoint, frozen by a capture in flight or not
@@ -9282,7 +9313,12 @@ impl BranchStore {
                 tracing::warn!("branch name filter not built: its pending table filled at the seed");
                 return FilterBuild::Failed;
             }
-            names.filter.state = FilterState::Building { pending: pending.clone() };
+            // A shrink's complete table answers through the build (`Building::old`).
+            let old = match std::mem::take(&mut names.filter.state) {
+                FilterState::Stale { table } => Some(table),
+                _ => None,
+            };
+            names.filter.state = FilterState::Building { pending: pending.clone(), old };
         }
         filter_pause(7);
         use std::hash::BuildHasher;
@@ -9313,31 +9349,40 @@ impl BranchStore {
         // The table's Arc is made here, with the mutex let go (the review's LOW: `Arc::new`
         // under the mutex at the install).
         let scanned = scanned.map(|(table, unbuilt)| (Arc::new(table), unbuilt));
-        let table = {
+        // The replaced table (a shrink's) is taken out under the mutex and freed after it.
+        let (table, replaced) = {
             let mut inner = shared.lock();
             let f = &mut inner.names.filter;
-            if !matches!(&f.state, FilterState::Building { pending: p } if Arc::ptr_eq(p, &pending)) {
-                return FilterBuild::Ended;
-            }
+            let old = match &mut f.state {
+                FilterState::Building { pending: p, old } if Arc::ptr_eq(p, &pending) => old.take(),
+                _ => return FilterBuild::Ended,
+            };
             match scanned {
                 Ok((table, unbuilt)) => {
                     if !unbuilt.iter().all(|h| table.insert(*h)) {
                         f.overflow();
+                        drop(inner);
+                        drop(old);
                         return FilterBuild::Ended;
                     }
                     f.live = (table.len() + pending.len()) as u64;
                     f.state = FilterState::Draining { table: table.clone(), pending: pending.clone() };
                     f.builds += 1;
-                    table
+                    (table, old)
                 }
                 Err(e) => {
                     f.failed_scans += 1;
-                    f.state = FilterState::Unbuilt;
+                    // A shrink's table still answers while the build is retried.
+                    f.state = match old {
+                        Some(table) => FilterState::Stale { table },
+                        None => FilterState::Unbuilt,
+                    };
                     tracing::debug!("branch name filter not built: {e}");
                     return FilterBuild::Failed;
                 }
             }
         };
+        drop(replaced);
         filter_pause(6);
         // Mutant `name_filter_build_skips_pending` (test builds only): the build installs
         // Ready without copying its pending table, the build-side race the oracle must catch.
@@ -9450,6 +9495,7 @@ impl BranchStore {
         let name = match f.state {
             FilterState::Unbuilt => "Unbuilt",
             FilterState::Building { .. } => "Building",
+            FilterState::Stale { .. } => "Stale",
             FilterState::Ready { .. } => "Ready",
             FilterState::Growing { .. } => "Growing",
             FilterState::Draining { .. } => "Draining",
