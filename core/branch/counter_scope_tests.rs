@@ -171,31 +171,45 @@ fn every_store_count_has_a_store() {
 /// here.
 #[test]
 fn the_fuzzy_held_syscall_budget_is_judged_beside_another_stores_work() {
-    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Counters review E3 (FLAGGED strengthening of this red; its claim unchanged): the other store's
+    // work is PROVEN to overlap the call (a barrier after its first create, and its create count must
+    // rise between the call's entry and exit), and only a verdict passes: Ok, or a panic whose
+    // message starts with "CLAIM:". A premise failure or a reworded refusal no longer reads as one.
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as O};
+    let stop = Arc::new(AtomicBool::new(false));
+    let creates = Arc::new(AtomicU64::new(0));
+    let started = Arc::new(std::sync::Barrier::new(2));
     let dir = tempfile::TempDir::new().unwrap();
     let busy = {
-        let (stop, path) = (stop.clone(), dir.path().join("busy.db"));
+        let (stop, creates, started, path) = (stop.clone(), creates.clone(), started.clone(), dir.path().join("busy.db"));
         std::thread::spawn(move || {
             let db = open(&path, SyncClass::Fsync, BranchCheckpoint::Fuzzy);
             let trunk = db.connect().unwrap();
             trunk.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)").unwrap();
-            let mut i = 0u64;
-            while !stop.load(std::sync::atomic::Ordering::Acquire) {
-                trunk.create_branch(&format!("busy{i}")).unwrap();
-                i += 1;
+            let mut first = true;
+            while !stop.load(O::Acquire) {
+                trunk.create_branch(&format!("busy{}", creates.load(O::Relaxed))).unwrap();
+                creates.fetch_add(1, O::Release);
+                if first {
+                    started.wait();
+                    first = false;
+                }
             }
-            i
         })
     };
+    started.wait();
+    let at_entry = creates.load(O::Acquire);
     let judged = std::panic::catch_unwind(super::fastest_tests::a_fuzzy_checkpoint_issues_at_most_two_syscalls_under_the_store_mutex);
-    stop.store(true, std::sync::atomic::Ordering::Release);
-    let creates = busy.join().unwrap();
-    assert!(creates > 0, "premise: the other store worked");
+    let at_exit = creates.load(O::Acquire);
+    stop.store(true, O::Release);
+    busy.join().unwrap();
+    assert!(at_exit > at_entry, "premise: the other store worked during the call ({at_entry} -> {at_exit} creates)");
     if let Err(e) = judged {
         let msg = e.downcast_ref::<String>().cloned().or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default();
         assert!(
-            !msg.contains("could be attributed by thread"),
-            "REFUSED beside another store's work ({creates} creates on another thread): {msg}"
+            msg.starts_with("CLAIM:"),
+            "beside another store's work ({} creates during the call) the budget reached no verdict: {msg}",
+            at_exit - at_entry
         );
     }
 }
