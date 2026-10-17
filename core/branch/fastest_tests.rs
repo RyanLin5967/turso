@@ -3137,6 +3137,35 @@ fn setting_auto_vacuum_moves_the_prepare_generation() {
     assert_ne!(c.prepare_context_generation(), g0, "CLAIM: PRAGMA auto_vacuum changed the mode and left the prepare generation alone");
 }
 
+/// Wire-rev-line M1 (lead order): `maybe_update_schema` compared only the MAIN schema's version, so
+/// another session's DDL on an ATTACHED database was never adopted between statements: this
+/// connection's cached programs kept the old attached schema. Two connections, each with s
+/// attached; B adds a column to s.t; A's adoption step must move A's prepare generation, and A's
+/// next statement reads the new column.
+#[test]
+fn another_session_s_ddl_on_an_attached_schema_is_adopted_between_statements() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("attached-adopt-main.db"), DatabaseOpts::new().with_attach(true));
+    let other = dir.path().join("attached-adopt-s.db");
+    let attach = format!("ATTACH '{}' AS s", other.display());
+    let a = db.connect().unwrap();
+    let b = db.connect().unwrap();
+    let attached = (a.execute(&attach), b.execute(&attach));
+    assert!(attached.0.is_ok() && attached.1.is_ok(), "premise: both connections attached s: {attached:?}");
+    a.execute("CREATE TABLE s.t(x INTEGER)").unwrap();
+    a.execute("INSERT INTO s.t VALUES (1)").unwrap();
+    a.maybe_update_schema();
+    let g0 = a.prepare_context_generation();
+    let altered = b.execute("ALTER TABLE s.t ADD COLUMN y INTEGER");
+    assert!(altered.is_ok(), "premise: B's ALTER on the attached table succeeded: {altered:?}");
+    a.maybe_update_schema();
+    let moved = a.prepare_context_generation() != g0;
+    let read = a.prepare("SELECT y FROM s.t").and_then(|mut st| st.run_collect_rows());
+    assert!(read.is_ok(), "CLAIM: A's next statement did not see B's new column on the attached table: {read:?}");
+    assert!(moved, "CLAIM: A's adoption step left its prepare generation alone after B's DDL on the attached schema: A's cached programs keep the old one");
+}
+
 /// Review engine-rev-setter LOW-2: the audit of every prepare-generation bump (49e10e02a's message
 /// said 37 and missed five) is pinned here, per file, so a new bump site fails this gate until it
 /// is audited (and the setter class above says whether it should be change-only). Counts calls of
