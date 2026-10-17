@@ -9094,9 +9094,13 @@ fn lifecycle_audit(n: u32) {
     // Counters review 3 LOW-8: the close is checked, not assumed: no other strong reference keeps
     // the store (and its threads) alive past it.
     let closed = Arc::downgrade(&db);
+    // Counters review 4 LOW-G: the Database is a proxy; the store itself (held by pagers too, through
+    // their branch binding) must be gone as well, so its threads are not alive past the close.
+    let store_closed = Arc::downgrade(&db.branches);
     drop(trunk);
     drop(db);
     assert!(closed.upgrade().is_none(), "premise: the audited store outlived its close (another reference holds it)");
+    assert!(store_closed.upgrade().is_none(), "premise: the audited BranchStore outlived its Database's close (a pager or thread holds it)");
     let log: Vec<HoldRec> = AUDIT_LOG.lock().unwrap().clone();
     assert_eq!(AUDIT_LOST.load(Relaxed), 0, "premise: the audit log lost holds (its room was too small)");
     // Lead ruling 67664df569: the scoping cannot silently empty the audit. This arm recorded at least
