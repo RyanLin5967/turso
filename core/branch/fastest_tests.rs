@@ -9914,6 +9914,46 @@ fn a_named_create_after_a_building_answer_refuses_asks_the_catalog_nothing() {
     assert_eq!(asked, 0, "CLAIM: a fresh name ran {asked} catalog statements after a Building answer's table refused a note");
 }
 
+/// Review m1-2c N2: a build whose table cannot take its unbuilt hashes overflows at its install;
+/// at 5a0d874e0 that return lost its `drop(inner)`, so the scanned table (and the unbuilt hashes)
+/// were freed inside the filter thread's store-mutex hold. Forced by `BUILD_TABLE_REFUSES` on a
+/// reopen's build; no filter-thread hold may free anything (`FILTER_HOLD_FREED_MAX`).
+#[test]
+fn a_build_that_overflows_at_its_install_frees_nothing_under_the_store_mutex() {
+    use super::store::{BUILD_TABLE_REFUSES, FILTER_HOLD_FREED_MAX, FILTER_HOLD_FREES_ARMED};
+    use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+    let _s = serial();
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FILTER_HOLD_FREES_ARMED.store(false, Release);
+            BUILD_TABLE_REFUSES.store(false, Release);
+        }
+    }
+    let _r = Reset;
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("build-overflow-free.db");
+    let incarnation = {
+        let db = open_at(&path, opts(true, SyncClass::Off));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        for i in 0..64 {
+            trunk.create_branch(&format!("kept-{i:02}")).unwrap();
+        }
+        db.branch_compact_now().unwrap();
+        db.incarnation
+    };
+    FILTER_HOLD_FREED_MAX.store(0, Release);
+    FILTER_HOLD_FREES_ARMED.store(true, Release);
+    BUILD_TABLE_REFUSES.store(true, Release);
+    let db = reopen(&path, opts(true, SyncClass::Off), incarnation);
+    db.branch_wait_name_filter();
+    FILTER_HOLD_FREES_ARMED.store(false, Release);
+    assert!(!BUILD_TABLE_REFUSES.load(Acquire), "premise: the reopen's build never reached its install");
+    let freed = FILTER_HOLD_FREED_MAX.load(Relaxed);
+    assert_eq!(freed, 0, "CLAIM: a name-filter thread freed {freed} bytes inside a store-mutex hold (the overflowing build's table)");
+}
+
 /// Class (e), the store mutex's lifecycle audit (DECISIONS 994f7d41e0; the lead's order with
 /// nf-adversary-2's MED-2 and M4 folded in): every store-mutex hold on the create path does NO syscall,
 /// NO allocation and NO catalog statement. One instrument for the whole class: every outermost hold

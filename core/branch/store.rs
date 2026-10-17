@@ -1508,6 +1508,8 @@ impl StoreMutex {
             store: self,
             #[cfg(test)]
             site,
+            #[cfg(test)]
+            freed0: super::budget_probe::thread_frees().1,
         }
     }
 }
@@ -1519,6 +1521,9 @@ struct StoreGuard<'a> {
     /// Test builds: where the mutex was taken (the lifecycle audit's `HoldRec::site`).
     #[cfg(test)]
     site: &'static std::panic::Location<'static>,
+    /// Test builds: this thread's bytes freed when the mutex was taken (`FILTER_HOLD_FREED_MAX`).
+    #[cfg(test)]
+    freed0: u64,
 }
 
 #[cfg(test)]
@@ -1552,6 +1557,12 @@ impl Drop for StoreGuard<'_> {
         {
             STORE_HELD.with(|held| held.set(held.get() - 1));
             super::budget_probe::store_unlocked();
+            if FILTER_HOLD_FREES_ARMED.load(Ordering::Acquire)
+                && std::thread::current().name() == Some("branch-name-filter")
+            {
+                let freed = super::budget_probe::thread_frees().1 - self.freed0;
+                FILTER_HOLD_FREED_MAX.fetch_max(freed, Ordering::Relaxed);
+            }
         }
         drop(self.guard.take());
         // The checkpoint this hold owed, sent with the mutex let go (see `StoreMutex::start_due`).
@@ -2647,6 +2658,15 @@ struct FrozenNames {
 /// node in 37-39 of 40 creates, raws l35-diag-alloc).
 #[cfg(test)]
 pub(crate) static FILTER_NOTE_ALLOCS: AtomicU64 = AtomicU64::new(0);
+/// Test builds (review m1-2c N2): while armed, the most bytes any store-mutex hold of a name-filter
+/// thread freed before its unlock; and a failpoint that makes the next build's table refuse its
+/// unbuilt hashes (the build overflows at its install).
+#[cfg(test)]
+pub(crate) static FILTER_HOLD_FREES_ARMED: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+pub(crate) static FILTER_HOLD_FREED_MAX: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+pub(crate) static BUILD_TABLE_REFUSES: AtomicBool = AtomicBool::new(false);
 /// Test builds (review m1-2b LOW-F2): the most bytes one `NameFilter::note` freed, inside the store
 /// mutex hold that noted it (a refusing table dropped there). A test resets it.
 #[cfg(test)]
@@ -9590,7 +9610,11 @@ impl BranchStore {
             };
             match scanned {
                 Ok((table, unbuilt)) => {
-                    if !unbuilt.iter().all(|h| table.insert(*h)) {
+                    #[cfg(test)]
+                    let forced = BUILD_TABLE_REFUSES.swap(false, Ordering::AcqRel);
+                    #[cfg(not(test))]
+                    let forced = false;
+                    if forced || !unbuilt.iter().all(|h| table.insert(*h)) {
                         // The answer that held through the build still does.
                         f.overflow_answering(old);
                         return FilterBuild::Ended;
