@@ -4673,6 +4673,13 @@ impl CkptWorker {
     }
 }
 
+/// A client's bound on a store wait (review C42-M1: one shared interruptible wait): it ends at
+/// `until`, or as soon as `interrupted` returns true.
+pub(crate) struct Wait<'a> {
+    pub(crate) until: Instant,
+    pub(crate) interrupted: &'a dyn Fn() -> bool,
+}
+
 /// Test builds: `BranchStore::starter_probe`.
 #[cfg(test)]
 #[derive(Clone)]
@@ -10026,6 +10033,12 @@ impl BranchStore {
 
     pub(crate) fn failpoint_orphans(&self) -> Vec<u32> {
         self.inner.lock().orphans.clone()
+    }
+
+    /// `compact_now`, its waits bounded by `wait` (review C42-M1). Not yet bounded: delegates.
+    pub(crate) fn compact_now_within(&self, wait: Option<&Wait<'_>>) -> Result<()> {
+        let _ = wait;
+        self.compact_now()
     }
 
     pub(crate) fn compact_now(&self) -> Result<()> {

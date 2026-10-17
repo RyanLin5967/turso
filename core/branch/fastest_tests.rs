@@ -3437,6 +3437,59 @@ fn a_fuzzy_install_takes_its_retired_names_and_children_without_allocating() {
     assert_eq!(allocs, 0, "CLAIM: taking the retired names and children allocated {allocs} times under the store mutex over {takes} installs");
 }
 
+/// Review C42-M1 (lead order): a client's CHECKPOINT waits for a fuzzy checkpoint in flight
+/// within its bound, never unboundedly: `branch_compact_now_within` returns `Busy` at its deadline
+/// and `Interrupt` as soon as its interrupt says so, with the flight still held (here at
+/// `HOLD_BEFORE_ROWS`). Before 2026-10-17 the join had no deadline, and neither cancel nor statement_timeout
+/// ended it. Each call runs on its own thread; the test refuses one that has not returned in 30 s.
+#[test]
+fn a_client_checkpoint_s_wait_for_a_flight_ends_at_its_deadline_or_its_interrupt() {
+    let _s = serial();
+    struct Release(Arc<Database>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.branch_checkpoint_hold(0);
+        }
+    }
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(
+        &dir.path().join("checkpoint-within.db"),
+        opts(true, SyncClass::Fsync).with_branch_checkpoint(super::BranchCheckpoint::Fuzzy),
+    );
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    for _ in 0..8 {
+        let _ = trunk.fork_branch().unwrap().into_id();
+    }
+    let _release = Release(db.clone());
+    db.branch_checkpoint_hold(super::store::HOLD_BEFORE_ROWS);
+    assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: a fuzzy checkpoint started");
+    let t = std::time::Instant::now();
+    while db.branch_checkpoint_held() != super::store::HOLD_BEFORE_ROWS | super::store::HOLD_ARRIVED {
+        assert!(t.elapsed() < std::time::Duration::from_secs(10), "premise: the flight never reached its hold");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let call = |until: std::time::Duration, interrupt_after: Option<std::time::Duration>| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let db = db.clone();
+        std::thread::spawn(move || {
+            let begun = std::time::Instant::now();
+            let interrupted = move || interrupt_after.is_some_and(|d| begun.elapsed() >= d);
+            let r = db.branch_compact_now_within(begun + until, &interrupted);
+            let _ = tx.send(r.map_err(|e| e.to_string()));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(30))
+    };
+    let at_deadline = call(std::time::Duration::from_millis(300), None);
+    let interrupted = call(std::time::Duration::from_secs(600), Some(std::time::Duration::from_millis(100)));
+    db.branch_checkpoint_hold(0);
+    db.branch_checkpoint_wait();
+    let at_deadline = at_deadline.expect("CLAIM: a client's CHECKPOINT waited past its 300 ms deadline for the flight in flight (no return in 30 s)");
+    let interrupted = interrupted.expect("CLAIM: a client's CHECKPOINT went on waiting for the flight after its interrupt (no return in 30 s)");
+    assert!(at_deadline.is_err(), "CLAIM: at its deadline the CHECKPOINT reported success with the flight still held");
+    assert!(interrupted.as_ref().is_err_and(|e| e.to_lowercase().contains("interrupt")), "CLAIM: an interrupted CHECKPOINT did not report the interrupt: {interrupted:?}");
+}
+
 /// Review 2 #5: a checkpoint that failed is not retried by the very next operation — the log is
 /// past the threshold still, so without a back-off every create would start (and pay for) another
 /// one: it waits for another threshold's worth of log.
