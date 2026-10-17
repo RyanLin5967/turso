@@ -657,6 +657,13 @@ pub(crate) fn mark_foreground(on: bool) {
 /// Sample the syscall count around store-mutex holds from now on (off by default: two Mach traps
 /// per hold would slow every other test).
 pub(crate) fn arm(on: bool) {
+    // Counters review 4 LOW-D: an armed hold is measured, so what the hold path reads is primed
+    // before the first one (an armed hold before any window otherwise fell back to the store's
+    // fe_mutant, whose first call allocates under the mutex). A disarm primes nothing: it may run in
+    // a Drop while a refused `prime` unwinds.
+    if on {
+        prime();
+    }
     // Release: see `store_locked_at` (counters review 4 LOW-F).
     ARMED.store(on, Release);
 }
@@ -809,11 +816,11 @@ static FOREIGN_NAMES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 static MUTANT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
 
 /// Whether mutant `name` is on, for the probe's window and hold paths: the name `prime` read, so no
-/// window reads the environment. Unprimed (a hold before any window), the store's own reader.
+/// window reads the environment. Unprimed (an unarmed hold before any window), the store's own reader.
 pub(crate) fn mutant_on(name: &str) -> bool {
     match MUTANT.get() {
         Some(m) => m.as_deref() == Some(name),
-        None => crate::branch::store::fe_mutant(name), // lint-allow: unprimed, outside every window (begin primes first)
+        None => crate::branch::store::fe_mutant(name), // lint-allow: unprimed: no window and no armed hold (begin and arm(true) prime first)
     }
 }
 
