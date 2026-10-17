@@ -24,7 +24,7 @@ pub struct PgConnection {
     inner: Arc<PgConnectionInner>,
 }
 
-struct PgConnectionInner {
+pub(crate) struct PgConnectionInner {
     conn: Arc<Connection>,
     /// A parking_lot lock, as is the view cache's: std's Mutex on Apple boxes its pthread mutex at
     /// the first lock, one allocation per new connection paid inside the branch switch that opens
@@ -1355,7 +1355,8 @@ fn prepare_statement_parsed(
     // steps a no-op; a Describe declined it above.
     own_transaction(pg_conn, "__turso_create_prereqs", "CREATE TABLE", || {
         for prereq in translated.prereqs {
-            let input = prereq.to_string();
+            // The prerequisite's own SQLite text, marked, for a re-prepare (review wire-line2 LOW-2).
+            let input = catalog::sqlite_text(prereq.to_string());
             pg_conn
                 .conn
                 .prepare_translated_stmt_with_options(prereq, &input, &options)?
@@ -1390,8 +1391,10 @@ fn prepare_statement_parsed(
 /// - A cast to a type that is not built-in is kept by name only when it is the engine's own (a
 ///   domain, a custom type), so the engine runs its CHECKs (`CAST(-5 AS dm)` returned -5: the
 ///   domain CHECK class's PG 18.6 replay, 2026-10-15).
-/// No other statement pays for a lookup. The search path is the session's own: every lookup reads
-/// it, and so does the prepare's PrepareOptions.
+/// No other statement pays for a lookup. The lookups read the session's CURRENT search path; at an
+/// engine re-prepare the compile uses the PrepareOptions saved at the prepare, so the two agree only
+/// while the path has not changed since (review wire-line2 LOW-1; a kept statement's key enforces
+/// that through its path stamp, and the engine's statement does not).
 pub(crate) fn session_translation(
     pg_conn: &Arc<PgConnectionInner>,
     sql: &str,
@@ -1437,9 +1440,7 @@ pub(crate) fn session_translation(
 }
 
 /// The engine's re-prepare of a statement this session prepared: through
-/// [`session_translation`], as the prepare translated it. A statement with prerequisites (a CREATE
-/// TABLE's SERIAL sequences) is performed whole by its prepare and is never re-prepared, so one
-/// here is refused rather than compiled without them.
+/// [`session_translation`], as the prepare translated it.
 pub(crate) fn reprepare_translation(
     pg_conn: &Arc<PgConnectionInner>,
     sql: &str,
@@ -1447,11 +1448,10 @@ pub(crate) fn reprepare_translation(
 ) -> Result<ast::Cmd> {
     let translated =
         session_translation(pg_conn, sql, parse_result, is_positional_insert_values(parse_result))?;
-    if !translated.prereqs.is_empty() {
-        return Err(LimboError::InternalError(
-            "a statement with prerequisites is not re-prepared".to_string(),
-        ));
-    }
+    // A statement with prerequisites (a CREATE TABLE's SERIAL sequences) re-prepared between its
+    // prepare and its step (a schema change inside own_transaction): its prerequisites already ran
+    // in the same transaction, so the statement alone is compiled again (review wire-line2 LOW-3:
+    // it was refused, failing the CREATE in that race).
     Ok(translated.cmd)
 }
 
@@ -1538,7 +1538,7 @@ fn try_prepare_special(
 }
 
 fn noop_statement(conn: &Arc<Connection>) -> Result<Statement> {
-    conn.prepare("SELECT 0 WHERE 0")
+    conn.prepare(catalog::sqlite_text("SELECT 0 WHERE 0"))
 }
 
 fn execute_sqlite_internal(conn: &Arc<Connection>, sql: impl AsRef<str>) -> Result<()> {
@@ -2370,11 +2370,11 @@ fn handle_pg_show(pg_conn: &Arc<PgConnectionInner>, show: &PgShowStmt) -> Result
             ))))
         }
     };
-    pg_conn.conn.prepare(format!(
+    pg_conn.conn.prepare(catalog::sqlite_text(format!(
         "SELECT '{}' AS \"{}\"",
         value.replace('\'', "''"),
         column
-    ))
+    )))
 }
 
 fn handle_pg_create_schema(conn: &Arc<Connection>, stmt: &PgCreateSchemaStmt) -> Result<()> {
@@ -2520,15 +2520,15 @@ fn handle_pg_drop_objects(pg_conn: &Arc<PgConnectionInner>, stmt: &PgDropObjects
             .iter()
             .try_for_each(|sql| conn.prepare(sql)?.run_ignore_rows());
     }
-    execute_sqlite_internal(conn, "SAVEPOINT turso_pg_drop_objects")?;
+    execute_sqlite_internal(conn, catalog::sqlite_text("SAVEPOINT turso_pg_drop_objects"))?;
     let dropped = found
         .iter()
         .try_for_each(|sql| conn.prepare(sql)?.run_ignore_rows());
     match dropped {
-        Ok(()) => execute_sqlite_internal(conn, "RELEASE turso_pg_drop_objects"),
+        Ok(()) => execute_sqlite_internal(conn, catalog::sqlite_text("RELEASE turso_pg_drop_objects")),
         Err(e) => {
-            let _ = execute_sqlite_internal(conn, "ROLLBACK TO turso_pg_drop_objects");
-            let _ = execute_sqlite_internal(conn, "RELEASE turso_pg_drop_objects");
+            let _ = execute_sqlite_internal(conn, catalog::sqlite_text("ROLLBACK TO turso_pg_drop_objects"));
+            let _ = execute_sqlite_internal(conn, catalog::sqlite_text("RELEASE turso_pg_drop_objects"));
             Err(e)
         }
     }
@@ -3692,8 +3692,8 @@ fn get_table_columns(
 fn list_user_tables(conn: &Arc<Connection>, schema_name: Option<&str>) -> Result<Vec<String>> {
     let filter = "type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso_internal_%'";
     let sql = match schema_name {
-        Some(name) => format!("SELECT name FROM \"{name}\".sqlite_schema WHERE {filter}"),
-        None => format!("SELECT name FROM sqlite_schema WHERE {filter}"),
+        Some(name) => catalog::sqlite_text(format!("SELECT name FROM \"{name}\".sqlite_schema WHERE {filter}")),
+        None => catalog::sqlite_text(format!("SELECT name FROM sqlite_schema WHERE {filter}")),
     };
     let mut stmt = conn.prepare_internal(&sql)?;
     let rows = stmt.run_collect_rows()?;
@@ -3707,10 +3707,10 @@ fn list_user_tables(conn: &Arc<Connection>, schema_name: Option<&str>) -> Result
 }
 
 fn schema_exists(conn: &Arc<Connection>, schema_name: &str) -> Result<bool> {
-    let sql = format!(
+    let sql = catalog::sqlite_text(format!(
         "SELECT 1 FROM pragma_database_list WHERE name = '{}'",
         schema_name.replace('\'', "''")
-    );
+    ));
     let mut stmt = conn.prepare_internal(&sql)?;
     let rows = stmt.run_collect_rows()?;
     Ok(!rows.is_empty())
