@@ -799,6 +799,8 @@ pub(crate) fn prime() {
     // inside a window.
     let _ = MUTANT.get_or_init(|| std::env::var("FE_MUTANT").ok());
     let _ = crate::branch::store::fe_mutant("");
+    // Counters review 4 LOW-B: the other read-once mutant selector (R13_MUTANT) too.
+    let _ = crate::branch::store::mutant("");
     let loaded = shim().is_some();
     let _ = shim_lost();
     if !loaded && std::env::var_os("FE_SHIM_RUN").is_some() {
