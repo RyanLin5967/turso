@@ -370,7 +370,7 @@ impl Merger {
     /// trunk write transaction it rolls back.
     #[doc(hidden)]
     pub fn derive_only(&mut self, branch: &Branch) -> Result<DerivedReport> {
-        self.trunk.execute("BEGIN IMMEDIATE")?;
+        self.trunk.execute_sqlite("BEGIN IMMEDIATE")?;
         let result = (|| -> Result<DerivedReport> {
             let pager = self.trunk.pager.load().clone();
             let view = self.store.merge_view(branch.id())?;
@@ -382,7 +382,7 @@ impl Merger {
                 owned: view.owned.len() as u64,
             })
         })();
-        self.trunk.execute("ROLLBACK")?;
+        self.trunk.execute_sqlite("ROLLBACK")?;
         result
     }
 
@@ -495,16 +495,16 @@ impl Merger {
     ) -> Result<MergeOutcome> {
         // BEGIN IMMEDIATE checks the schema cookie once it holds the write lock, so from here to
         // COMMIT the merger's schema is the trunk's.
-        self.trunk.execute("BEGIN IMMEDIATE")?;
+        self.trunk.execute_sqlite("BEGIN IMMEDIATE")?;
         let result = self.validate_and_install(branch, policy, fk_on, land);
         match &result {
             Ok(outcome) if outcome.refused.is_none() => {
-                if let Err(err) = self.trunk.execute("COMMIT") {
-                    let _ = self.trunk.execute("ROLLBACK");
+                if let Err(err) = self.trunk.execute_sqlite("COMMIT") {
+                    let _ = self.trunk.execute_sqlite("ROLLBACK");
                     return Err(err);
                 }
             }
-            _ => self.trunk.execute("ROLLBACK")?,
+            _ => self.trunk.execute_sqlite("ROLLBACK")?,
         }
         result
     }
@@ -711,21 +711,21 @@ impl Merger {
         prep: &Prepared,
         fk_on: bool,
     ) -> Result<Option<String>> {
-        self.trunk.execute(format!("SAVEPOINT {MEMBER}"))?;
+        self.trunk.execute_sqlite(format!("SAVEPOINT {MEMBER}"))?;
         let installed = self.install_checked(branch, from, prep, fk_on);
         match installed {
             Ok(None) => {
-                self.trunk.execute(format!("RELEASE {MEMBER}"))?;
+                self.trunk.execute_sqlite(format!("RELEASE {MEMBER}"))?;
                 Ok(None)
             }
             Ok(Some(reason)) => {
-                self.trunk.execute(format!("ROLLBACK TO {MEMBER}"))?;
-                self.trunk.execute(format!("RELEASE {MEMBER}"))?;
+                self.trunk.execute_sqlite(format!("ROLLBACK TO {MEMBER}"))?;
+                self.trunk.execute_sqlite(format!("RELEASE {MEMBER}"))?;
                 Ok(Some(reason))
             }
             Err(err) => {
-                let _ = self.trunk.execute(format!("ROLLBACK TO {MEMBER}"));
-                let _ = self.trunk.execute(format!("RELEASE {MEMBER}"));
+                let _ = self.trunk.execute_sqlite(format!("ROLLBACK TO {MEMBER}"));
+                let _ = self.trunk.execute_sqlite(format!("RELEASE {MEMBER}"));
                 Err(err)
             }
         }
@@ -792,7 +792,7 @@ impl Merger {
                     cols.join(", "),
                     quote(&table.name)
                 );
-                selects.insert(root, from.prepare(sql)?);
+                selects.insert(root, from.prepare_sqlite(sql)?);
             }
             let select = selects.get_mut(&root).expect("just prepared");
             select.bind_at(1.try_into().unwrap(), Value::from_i64(rowid))?;
@@ -953,7 +953,7 @@ impl Merger {
 
     fn prepare_fk(&self, r: &ResolvedFkRef, sql: String) -> std::result::Result<Statement, String> {
         self.trunk
-            .prepare(sql)
+            .prepare_sqlite(sql)
             .map_err(|err| format!("foreign key {} cannot be checked: {err}", fk_name(r)))
     }
 
@@ -1038,7 +1038,7 @@ impl Merger {
                 }
                 let stmt = match theirs.entry((root, i)) {
                     Entry::Occupied(e) => e.into_mut(),
-                    Entry::Vacant(e) => e.insert(from.prepare(&side.key_sql)?),
+                    Entry::Vacant(e) => e.insert(from.prepare_sqlite(&side.key_sql)?),
                 };
                 if first_row(stmt, rowid)?.as_ref() == Some(&ours) {
                     continue;
@@ -1146,9 +1146,9 @@ impl Merger {
         };
         let delete = format!("DELETE FROM {t} WHERE rowid = ?1");
         Ok(TableStmts {
-            update: update.map(|sql| self.trunk.prepare(sql)).transpose()?,
-            insert: self.trunk.prepare(insert)?,
-            delete: self.trunk.prepare(delete)?,
+            update: update.map(|sql| self.trunk.prepare_sqlite(sql)).transpose()?,
+            insert: self.trunk.prepare_sqlite(insert)?,
+            delete: self.trunk.prepare_sqlite(delete)?,
             columns: names.len(),
             alias,
         })

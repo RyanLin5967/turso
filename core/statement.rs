@@ -328,6 +328,9 @@ pub struct Statement {
     /// under the same ones, never defaults (wire-rework review B-H2; PG re-analyses a kept
     /// statement under the session's search_path).
     prepare_options: PrepareOptions,
+    /// Which parser this statement's text is for (`SqlText`): a re-prepare parses it with the same
+    /// one (the wire's NO SILENT DIALECT SWITCH class).
+    sql_text: crate::connection::SqlText,
 }
 
 crate::assert::assert_send_sync!(Statement);
@@ -409,7 +412,14 @@ impl Statement {
             is_blob_handle: false,
             nested_guard_active,
             prepare_options: PrepareOptions::default(),
+            sql_text: crate::connection::SqlText::Client,
         }
+    }
+
+    /// The parser this statement's text is for, kept for its re-prepares.
+    pub(crate) fn with_sql_text(mut self, sql_text: crate::connection::SqlText) -> Self {
+        self.sql_text = sql_text;
+        self
     }
 
     /// The options this statement was prepared under, kept for its re-prepares.
@@ -971,7 +981,11 @@ impl Statement {
         let new_program = {
             // Through the dialect's connection-aware hook (wire-rework E-M2): a frontend whose
             // translation needs the connection re-translates as its own prepare did.
-            let (cmd, _) = conn.db.dialect().parse_for_reprepare(&self.program.sql, &conn)?;
+            let (cmd, _) = match self.sql_text {
+                crate::connection::SqlText::Client => conn.db.dialect().parse_for_reprepare(&self.program.sql, &conn)?,
+                // SQLite text re-parsed as SQLite (the wire's NO SILENT DIALECT SWITCH class).
+                crate::connection::SqlText::Sqlite => crate::dialect::sqlite::parse(&self.program.sql)?,
+            };
             let cmd = cmd.expect("Same SQL string should be able to be parsed");
 
             let syms = conn.syms.read();

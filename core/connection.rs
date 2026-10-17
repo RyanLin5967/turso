@@ -167,6 +167,17 @@ impl Drop for SchemaReparseGuard {
     }
 }
 
+/// Which parser a statement's text is for (the wire's NO SILENT DIALECT SWITCH class): a client's
+/// text goes to the database's dialect; the engine's own helper text, and a frontend's
+/// `prepare_sqlite`/`execute_sqlite` text, is SQLite and goes to the SQLite parser, whatever the
+/// dialect, never through the frontend's (where text it rejects fell back to SQLite, and text it
+/// accepts could mean something else).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SqlText {
+    Client,
+    Sqlite,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct PrepareOptions {
     pub unqualified_database_search_path: Option<Vec<String>>,
@@ -973,6 +984,7 @@ impl Connection {
         input: &str,
         origin: StatementOrigin,
         prepare_options: &PrepareOptions,
+        text: SqlText,
     ) -> Result<(Program, Arc<Pager>, QueryMode)> {
         #[cfg(test)]
         crate::branch::budget_probe::statement_prepared();
@@ -1002,7 +1014,7 @@ impl Connection {
                 drop(syms);
                 let cmd = {
                     crate::stack::trace_stack!("schema_retry_parse");
-                    let (cmd, _) = self.parse_sql(input)?;
+                    let (cmd, _) = self.parse_text(input, text)?;
                     let Some(cmd) = cmd else {
                         return Err(err);
                     };
@@ -1036,8 +1048,10 @@ impl Connection {
         self._prepare(sql)
     }
 
+    /// Prepare SQLite text, parsed as SQLite whatever the database's dialect (`SqlText`), and
+    /// re-prepared as SQLite too.
     pub fn prepare_sqlite(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
-        self.prepare_with_origin(sql, StatementOrigin::Root)
+        self.prepare_text_with_origin(sql, StatementOrigin::Root, SqlText::Sqlite)
     }
 
     #[doc(hidden)]
@@ -1051,10 +1065,22 @@ impl Connection {
     }
 
     #[turso_macros::trace_stack]
+    /// An engine helper's statement (`InternalHelper`) is SQLite text; any other is the client's.
     pub(crate) fn prepare_with_origin(
         self: &Arc<Connection>,
         sql: impl AsRef<str>,
         origin: StatementOrigin,
+    ) -> Result<Statement> {
+        let text = if origin == StatementOrigin::InternalHelper { SqlText::Sqlite } else { SqlText::Client };
+        self.prepare_text_with_origin(sql, origin, text)
+    }
+
+    #[turso_macros::trace_stack]
+    fn prepare_text_with_origin(
+        self: &Arc<Connection>,
+        sql: impl AsRef<str>,
+        origin: StatementOrigin,
+        text: SqlText,
     ) -> Result<Statement> {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
@@ -1075,7 +1101,7 @@ impl Connection {
 
             let (cmd, byte_offset_end) = {
                 crate::stack::trace_stack!("parse");
-                self.parse_sql(sql)?
+                self.parse_text(sql, text)?
             };
             let cmd = match cmd {
                 Some(cmd) => cmd,
@@ -1089,7 +1115,7 @@ impl Connection {
                 .unwrap()
                 .trim();
             let prepare_options = PrepareOptions::default();
-            let (program, pager, mode) = self.compile_cmd(cmd, input, origin, &prepare_options)?;
+            let (program, pager, mode) = self.compile_cmd(cmd, input, origin, &prepare_options, text)?;
 
             Ok(Statement::new_with_origin(
                 program,
@@ -1098,7 +1124,8 @@ impl Connection {
                 byte_offset_end,
                 origin,
                 needs_nested_guard,
-            ))
+            )
+            .with_sql_text(text))
         })();
         if result.is_err() && needs_nested_guard {
             self.end_nested();
@@ -1167,7 +1194,7 @@ impl Connection {
             self.start_nested();
         }
         let result = (|| {
-            let (program, pager, mode) = self.compile_cmd(cmd, input, origin, &prepare_options)?;
+            let (program, pager, mode) = self.compile_cmd(cmd, input, origin, &prepare_options, SqlText::Client)?;
             // Kept with the statement: a re-prepare translates under them (wire-rework B-H2).
             Ok(Statement::new_with_origin(
                 program,
@@ -1482,7 +1509,8 @@ impl Connection {
             Ok::<_, crate::alloc::TryReserveError>(())
         })??;
 
-        let stmt = self.prepare("SELECT * FROM sqlite_schema")?;
+        // Engine helper text: SQLite whatever the dialect (the NO SILENT DIALECT SWITCH class).
+        let stmt = self.prepare_sqlite("SELECT * FROM sqlite_schema")?;
 
         // MVCC bootstrap connection gets the "baseline" from the DB file and ignores anything in MV store
         let mv_tx = if self.is_mvcc_bootstrap_connection() {
@@ -1771,7 +1799,7 @@ impl Connection {
                 .unwrap()
                 .trim();
             let (program, pager, mode) =
-                self.compile_cmd(cmd, input, StatementOrigin::Root, &prepare_options)?;
+                self.compile_cmd(cmd, input, StatementOrigin::Root, &prepare_options, SqlText::Client)?;
             Statement::new(program, pager, mode, 0).run_ignore_rows()?;
             remaining = &remaining[byte_offset_end..];
         }
@@ -1807,7 +1835,7 @@ impl Connection {
         }
         let prepare_options = PrepareOptions::default();
         let (program, pager, mode) =
-            self.compile_cmd(cmd, input, StatementOrigin::Root, &prepare_options)?;
+            self.compile_cmd(cmd, input, StatementOrigin::Root, &prepare_options, SqlText::Client)?;
         let stmt = Statement::new(program, pager, mode, 0);
         Ok(Some(stmt))
     }
@@ -1821,18 +1849,28 @@ impl Connection {
     #[instrument(skip_all, level = Level::DEBUG)]
     #[turso_macros::trace_stack]
     pub fn execute(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<()> {
+        self.execute_text(sql.as_ref(), SqlText::Client)
+    }
+
+    /// `execute` of SQLite text, parsed as SQLite whatever the database's dialect (`SqlText`): for
+    /// the engine's own helper statements and a frontend's SQLite text.
+    pub fn execute_sqlite(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<()> {
+        self.execute_text(sql.as_ref(), SqlText::Sqlite)
+    }
+
+    #[turso_macros::trace_stack]
+    fn execute_text(self: &Arc<Connection>, sql: &str, text: SqlText) -> Result<()> {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
-        let sql = sql.as_ref();
         let mut remaining = sql;
         let prepare_options = PrepareOptions::default();
-        while let (Some(cmd), byte_offset_end) = self.parse_sql(remaining)? {
+        while let (Some(cmd), byte_offset_end) = self.parse_text(remaining, text)? {
             let input = str::from_utf8(&remaining.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
             let (program, pager, mode) =
-                self.compile_cmd(cmd, input, StatementOrigin::Root, &prepare_options)?;
+                self.compile_cmd(cmd, input, StatementOrigin::Root, &prepare_options, text)?;
             {
                 crate::stack::trace_stack!("run");
                 Statement::new(program, pager.clone(), mode, 0).run_ignore_rows()?;
@@ -1856,13 +1894,21 @@ impl Connection {
             .trim();
         let prepare_options = PrepareOptions::default();
         let (program, pager, mode) =
-            self.compile_cmd(cmd, input, StatementOrigin::Root, &prepare_options)?;
+            self.compile_cmd(cmd, input, StatementOrigin::Root, &prepare_options, SqlText::Client)?;
         let stmt = Statement::new(program, pager, mode, 0);
         Ok(Some((stmt, byte_offset_end)))
     }
 
     pub(crate) fn parse_sql(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
         self.db.dialect().parse(sql)
+    }
+
+    /// `sql` parsed by the parser its `text` names (`SqlText`).
+    pub(crate) fn parse_text(&self, sql: &str, text: SqlText) -> Result<(Option<Cmd>, usize)> {
+        match text {
+            SqlText::Client => self.db.dialect().parse(sql),
+            SqlText::Sqlite => crate::dialect::sqlite::parse(sql),
+        }
     }
 
     #[cfg(feature = "fs")]
@@ -2959,9 +3005,8 @@ impl Connection {
         // would deadlock against the schema write lock.
         let mut rows_data: Vec<(String, String, String, i64, Option<String>)> = Vec::new();
         {
-            let mut rows = self
-                .query("SELECT * FROM sqlite_schema")?
-                .expect("query must be parsed to statement");
+            // Engine helper text: SQLite whatever the dialect (the NO SILENT DIALECT SWITCH class).
+            let mut rows = self.prepare_sqlite("SELECT * FROM sqlite_schema")?;
             rows.run_with_row_callback(|row| {
                 let ty = row.get::<&str>(0)?.to_string();
                 let name = row.get::<&str>(1)?.to_string();
@@ -3041,8 +3086,9 @@ impl Connection {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
+        // Engine-built PRAGMA text: SQLite whatever the dialect (the NO SILENT DIALECT SWITCH class).
         let pragma = format!("PRAGMA {pragma_name}");
-        let mut stmt = self.prepare(pragma)?;
+        let mut stmt = self.prepare_sqlite(pragma)?;
         stmt.run_collect_rows()
     }
 
@@ -3059,7 +3105,7 @@ impl Connection {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         let pragma = format!("PRAGMA {pragma_name} = {pragma_value}");
-        let mut stmt = self.prepare(pragma)?;
+        let mut stmt = self.prepare_sqlite(pragma)?;
         stmt.run_collect_rows()
     }
 

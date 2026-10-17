@@ -1212,7 +1212,9 @@ impl IncrementalView {
                     // the new connection's schema cookie check would fail (database file has old version).
 
                     // Prepare the statement using the parent connection
-                    let stmt = conn.prepare(&query)?;
+                    // The fill's printed SQLite text: SQLite whatever the dialect (the wire's NO
+                    // SILENT DIALECT SWITCH class).
+                    let stmt = conn.prepare_sqlite(&query)?;
 
                     self.populate_state = PopulateState::ProcessingOneTable {
                         queries,

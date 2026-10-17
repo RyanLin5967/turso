@@ -18939,7 +18939,7 @@ fn op_vacuum_into_inner(
                 // BEGIN and pragma helpers here are blocking convenience wrappers;
                 // async work starts with the schema scan in vacuum_target_build_step.
                 let source_db = program.connection.get_source_database(source_db_id);
-                program.connection.execute("BEGIN")?;
+                program.connection.execute_sqlite("BEGIN")?;
                 state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
                 let page_size: u32 = extract_pragma_int(
                     &program
@@ -19076,7 +19076,7 @@ fn op_vacuum_into_inner(
 
             VacuumIntoOpPhase::Done => {
                 // Commit the source transaction started in Init.
-                program.connection.execute("COMMIT")?;
+                program.connection.execute_sqlite("COMMIT")?;
                 state.auto_txn_cleanup = TxnCleanup::None;
 
                 state.pc += 1;

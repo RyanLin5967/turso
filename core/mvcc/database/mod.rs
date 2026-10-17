@@ -4595,7 +4595,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         loop {
             match st {
                 InitMetadataTableState::Start => {
-                    let stmt = connection.prepare(format!(
+                    let stmt = connection.prepare_sqlite(format!(
                         "CREATE TABLE IF NOT EXISTS {MVCC_META_TABLE_NAME}(k TEXT, v INTEGER NOT NULL)"
                     ))?;
                     *st = InitMetadataTableState::CreateTable {
@@ -4604,7 +4604,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 }
                 InitMetadataTableState::CreateTable { stmt } => {
                     return_if_io!(stmt.run_ignore_rows_nonblock());
-                    let stmt = connection.prepare(format!(
+                    let stmt = connection.prepare_sqlite(format!(
                         "INSERT OR IGNORE INTO {MVCC_META_TABLE_NAME}(rowid, k, v) VALUES (1, '{MVCC_META_KEY_PERSISTENT_TX_TS_MAX}', 0)"
                     ))?;
                     *st = InitMetadataTableState::Insert {
