@@ -2981,7 +2981,9 @@ fn a_failed_capture_check_under_the_whole_run_switch_aborts_the_process() {
     use std::os::unix::process::ExitStatusExt;
     let _s = serial();
     let exe = std::env::current_exe().unwrap();
-    let out = std::process::Command::new(exe)
+    // Review engine-rev-setter LOW-6: a deadline (generous: it costs nothing when the child aborts), so a child the half-done install hangs fails this
+    // test instead of hanging it.
+    let mut child = std::process::Command::new(exe)
         .args([
             "--exact",
             "branch::fastest_tests::a_fuzzy_checkpoint_s_lease_floor_is_the_catalog_s_at_its_install",
@@ -2990,8 +2992,29 @@ fn a_failed_capture_check_under_the_whole_run_switch_aborts_the_process() {
         ])
         .env("FE_CAPTURE_VERIFY", "1")
         .env("FE_MUTANT", "lease_floor_after_stale")
-        .output()
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .unwrap();
+    let mut stderr_pipe = child.stderr.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        let mut s = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut stderr_pipe, &mut s);
+        s
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("CLAIM: the child hung (300 s) instead of aborting on the failed capture check");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let out = std::process::Output { status, stdout: Vec::new(), stderr: reader.join().unwrap() };
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("FE_CAPTURE_VERIFY: the lease floor"),
