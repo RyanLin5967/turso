@@ -12651,6 +12651,31 @@ impl StoreInner {
 mod tests {
     use super::*;
 
+    /// Review REVIEW-claude-engine-L2d LOW 1: a capture's freeze that finds a frozen generation left
+    /// over (an install that failed after its commit, or lost its journal) merges it with the live
+    /// one's entries winning, since they are the newer. `relink` can leave `(parent, zf)` in both:
+    /// the zombie in the leftover, its spliced child in the live one. At f666f19bd the leftover's
+    /// entry overwrote the live one, so the key answered the zombie. The links' merge likewise.
+    #[test]
+    fn a_freeze_over_a_leftover_frozen_generation_keeps_the_newer_entries() {
+        let (parent, zombie, child, zf, f) = (BranchId(1), BranchId(2), BranchId(3), 7, 9);
+        let mut ci = ChildIndex::default();
+        ci.insert(parent, zf, zombie);
+        ci.removed.insert((parent.0, 5), (Some(1), None));
+        ci.freeze();
+        // The capture is not installed and not unfrozen: its generation is left over.
+        ci.relink(zombie, f, parent, zf, child);
+        ci.removed.insert((parent.0, 5), (Some(2), Some(7)));
+        ci.freeze();
+        assert_eq!(
+            ci.child_at(None, parent, zf).unwrap(),
+            Some(child),
+            "CLAIM: the leftover frozen entry overwrote the newer live one: the key answers the zombie"
+        );
+        assert_eq!(ci.link(&(parent.0, 5)), Some((Some(2), Some(7))), "CLAIM: the leftover's removal link overwrote the newer one");
+        assert!(ci.map.is_empty() && ci.removed.is_empty(), "premise: the second freeze froze the live generation");
+    }
+
     /// Review 4 C2 (the lead's decision): a read-only open of a database WITH branch files opens
     /// trunk-only — no recovery, no lock — and every branch operation on it is refused. This is the
     /// second fence behind the VDBE's read-only check: a trunk page write reaching this store is
