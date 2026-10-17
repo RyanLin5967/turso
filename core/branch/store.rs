@@ -1537,6 +1537,11 @@ impl Drop for StoreGuard<'_> {
         // The checkpoint this hold owed, sent with the mutex let go (see `StoreMutex::start_due`).
         // Mutant `owed_start_unsent` (test builds only): nothing sends it, as at 969e7a370 on every
         // path that did not call `start_owed_flight`.
+        // A hold that panicked sends nothing while its stack unwinds (its store may be half
+        // changed): the start stays owed, and the next hold's unlock sends it (review M1 LOW-2).
+        if std::thread::panicking() {
+            return;
+        }
         if self.store.start_due.load(Ordering::Acquire)
             && !fe_mutant("owed_start_unsent")
             && self.store.start_due.swap(false, Ordering::AcqRel)
