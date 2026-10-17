@@ -3233,13 +3233,13 @@ impl NameFilter {
     /// Every table the filter holds, labelled, for the memory listing: the state's tables (an
     /// answer's sink and fixed ones included), the spare and the retired ones. At most nine.
     fn every_table(&self) -> impl Iterator<Item = (&'static str, &Arc<FilterTable>)> {
-        let answer = |a: &'_ Answer| -> [Option<(&'static str, &Arc<FilterTable>)>; 3] {
+        fn answer(a: &Answer) -> [Option<(&'static str, &Arc<FilterTable>)>; 3] {
             [
                 Some(("names.filter.answer_sink", &a.sink)),
                 a.fixed[0].as_ref().map(|t| ("names.filter.answer_fixed", t)),
                 a.fixed[1].as_ref().map(|t| ("names.filter.answer_fixed", t)),
             ]
-        };
+        }
         let state: [Option<(&'static str, &Arc<FilterTable>)>; 4] = match &self.state {
             FilterState::Unbuilt | FilterState::Overflowed { answer: None } => [None, None, None, None],
             FilterState::Ready { table } => [Some(("names.filter.table", table)), None, None, None],
