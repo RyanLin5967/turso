@@ -161,7 +161,7 @@ fn exec_quote_literal(value: &Value) -> Value {
     let quoted = if text.contains('\\') {
         format!("E'{}'", text.replace('\\', "\\\\").replace('\'', "''"))
     } else {
-        format!("'{}'", text.replace('\'', "''"))
+        crate::catalog::quote_literal(&text)
     };
     Value::build_text(quoted)
 }

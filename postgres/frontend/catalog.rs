@@ -28,6 +28,21 @@ const STORED_PG_ALTERED_PREFIX: &str = "/* turso_frontend:postgres sqlite */ ";
 /// does; the SQLite parse is taken by a mark written at the source, never guessed from a failure.
 pub(crate) const SQLITE_TEXT_MARKER: &str = "/* turso:sqlite */ ";
 
+/// THE quoting of an identifier pasted into engine text (review wire-line3 HIGH-1, the lead's
+/// class): wrapped in double quotes, each double quote doubled, so no name can end the identifier
+/// early. Every frontend SQL builder quotes a name through it, never by hand (the guard test
+/// `engine_text_is_quoted_by_the_one_quoting_function`).
+pub(crate) fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// THE quoting of a string literal pasted into engine text: wrapped in single quotes, each single
+/// quote doubled (SQLite and PostgreSQL with standard_conforming_strings on read no backslash
+/// escapes in it).
+pub(crate) fn quote_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
 /// `sql` marked as this frontend's own SQLite ([`SQLITE_TEXT_MARKER`]).
 pub(crate) fn sqlite_text(sql: impl AsRef<str>) -> String {
     format!("{SQLITE_TEXT_MARKER}{}", sql.as_ref())

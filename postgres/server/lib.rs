@@ -7178,7 +7178,12 @@ mod tests {
         while let Some(k) = rest[from..].find("#[cfg(") {
             let at = from + k;
             let line_end = rest[at..].find('\n').map(|n| at + n).unwrap_or(rest.len());
-            if is_test_cfg(&rest[at..line_end]) && rest[line_end..].starts_with("\nmod ") {
+            // Other attributes may sit between the cfg and the mod (`#[allow(dead_code)]`).
+            let mut next = line_end;
+            while rest[next..].starts_with("\n#[") {
+                next = rest[next + 1..].find('\n').map(|n| next + 1 + n).unwrap_or(rest.len());
+            }
+            if is_test_cfg(&rest[at..line_end]) && rest[next..].starts_with("\nmod ") {
                 return Some(at);
             }
             from = at + 1;
@@ -7194,7 +7199,11 @@ mod tests {
         let mut rest = text;
         while let Some(at) = next_test_mod(rest) {
             let after = &rest[at..];
-            let line_end = after.find('\n').map(|n| n + 1).unwrap_or(after.len());
+            let mut line_end = after.find('\n').map(|n| n + 1).unwrap_or(after.len());
+            // Past any attribute lines between the cfg and the mod.
+            while after[line_end..].starts_with("#[") {
+                line_end += after[line_end..].find('\n').map(|n| n + 1).unwrap_or(after.len() - line_end);
+            }
             let header_end = after[line_end..].find('\n').map(|n| line_end + n).unwrap_or(after.len());
             let header = &after[line_end..header_end];
             if !header.trim_end().ends_with('{') {

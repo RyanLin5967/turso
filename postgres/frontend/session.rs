@@ -922,7 +922,11 @@ pub fn attach_schema_files(conn: &PgConnection, db_file: &str) {
             continue;
         };
         let path = entry.path().to_string_lossy().to_string();
-        let sql = catalog::sqlite_text(format!("ATTACH '{path}' AS \"{schema}\""));
+        let sql = catalog::sqlite_text(format!(
+            "ATTACH {} AS {}",
+            catalog::quote_literal(&path),
+            catalog::quote_ident(schema)
+        ));
         tracing::info!("Auto-attaching PG schema '{}' from {}", schema, path);
         if let Err(e) = conn.inner().execute(&sql) {
             tracing::warn!("Failed to attach schema '{}': {}", schema, e);
@@ -2371,9 +2375,9 @@ fn handle_pg_show(pg_conn: &Arc<PgConnectionInner>, show: &PgShowStmt) -> Result
         }
     };
     pg_conn.conn.prepare(catalog::sqlite_text(format!(
-        "SELECT '{}' AS \"{}\"",
-        value.replace('\'', "''"),
-        column
+        "SELECT {} AS {}",
+        catalog::quote_literal(&value),
+        catalog::quote_ident(column)
     )))
 }
 
@@ -2400,7 +2404,11 @@ fn handle_pg_create_schema(conn: &Arc<Connection>, stmt: &PgCreateSchemaStmt) ->
     let path = schema_file_path(conn, &name);
     execute_sqlite_internal(
         conn,
-        catalog::sqlite_text(format!("ATTACH '{}' AS \"{}\"", path.replace('\'', "''"), name)),
+        catalog::sqlite_text(format!(
+            "ATTACH {} AS {}",
+            catalog::quote_literal(&path),
+            catalog::quote_ident(&name)
+        )),
     )?;
     Ok(())
 }
@@ -2440,7 +2448,7 @@ fn handle_pg_drop_schema(pg_conn: &Arc<PgConnectionInner>, stmt: &PgDropSchemaSt
         drop_all_tables_in_schema(conn, &name)?;
     }
 
-    execute_sqlite_internal(conn, catalog::sqlite_text(format!("DETACH \"{name}\"")))?;
+    execute_sqlite_internal(conn, catalog::sqlite_text(format!("DETACH {}", catalog::quote_ident(&name))))?;
     Ok(())
 }
 
@@ -2465,7 +2473,7 @@ fn skipping_notice(pg_conn: &Arc<PgConnectionInner>, kind: &str, name: &str) {
 /// worded otherwise propagates as an error, never as a skip.
 fn handle_pg_drop_objects(pg_conn: &Arc<PgConnectionInner>, stmt: &PgDropObjectsStmt) -> Result<()> {
     let conn = &pg_conn.conn;
-    let quote = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+    let quote = |s: &str| catalog::quote_ident(s);
     let mut found = Vec::with_capacity(stmt.objects.len());
     for (schema, name) in &stmt.objects {
         if let Some(schema) = schema.as_deref().filter(|s| *s != "main") {
@@ -2560,7 +2568,10 @@ fn handle_pg_drop_schema_public(conn: &Arc<Connection>, cascade: bool) -> Result
     }
 
     for table_name in table_names {
-        let mut stmt = conn.prepare(format!("DROP TABLE \"{table_name}\""))?;
+        let mut stmt = conn.prepare(catalog::sqlite_text(format!(
+            "DROP TABLE {}",
+            catalog::quote_ident(&table_name)
+        )))?;
         stmt.run_ignore_rows()?;
     }
     Ok(())
@@ -2568,7 +2579,11 @@ fn handle_pg_drop_schema_public(conn: &Arc<Connection>, cascade: bool) -> Result
 
 fn drop_all_tables_in_schema(conn: &Arc<Connection>, schema_name: &str) -> Result<()> {
     for table_name in list_user_tables(conn, Some(schema_name))? {
-        let mut stmt = conn.prepare(format!("DROP TABLE \"{schema_name}\".\"{table_name}\"",))?;
+        let mut stmt = conn.prepare(catalog::sqlite_text(format!(
+            "DROP TABLE {}.{}",
+            catalog::quote_ident(schema_name),
+            catalog::quote_ident(&table_name)
+        )))?;
         stmt.run_ignore_rows()?;
     }
     Ok(())
@@ -2741,8 +2756,8 @@ fn handle_pg_add_constraints(
         .translate_with_prereqs(&parsed)
         .map_err(|e| LimboError::ParseError(e.into()))?;
 
-    let quoted = format!("\"{}\"", table.replace('"', "\"\""));
-    let aside = format!("\"{}\"", aside_name.replace('"', "\"\""));
+    let quoted = catalog::quote_ident(table);
+    let aside = catalog::quote_ident(&aside_name);
     // The keys the ALTER adds, each checked against the catalog before anything is copied or
     // dropped (a key onto the table itself as far as it can be before the table's own new keys
     // exist): a refused key cost two copies of the table and an index rebuild, and an arity the
@@ -3145,7 +3160,7 @@ fn check_added_foreign_key(
     key: &AddedForeignKey,
     parent_columns: &[String],
 ) -> Result<()> {
-    let quote = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+    let quote = |s: &str| catalog::quote_ident(s);
     let not_null = key
         .columns
         .iter()
@@ -3425,7 +3440,7 @@ fn handle_pg_copy_from(pg_conn: &Arc<PgConnectionInner>, stmt: &PgCopyFromStmt) 
         Some(schema) => Some(schema.clone()),
         None => schema_on_search_path(pg_conn, &stmt.table_name)?,
     };
-    let quoted = |name: &str| format!("\"{}\"", name.replace('"', "\"\""));
+    let quoted = catalog::quote_ident;
     let table_name = match &schema {
         Some(schema) => format!("{}.{}", quoted(schema), quoted(&stmt.table_name)),
         None => quoted(&stmt.table_name),
@@ -3440,9 +3455,24 @@ fn handle_pg_copy_from(pg_conn: &Arc<PgConnectionInner>, stmt: &PgCopyFromStmt) 
 
     let (insert_cols, num_columns) = match &stmt.columns {
         Some(cols) => {
+            // Each named column is one the table has (42703, as PostgreSQL answers), and each is
+            // quoted by the one quoting function (review wire-line3 HIGH-1: they were pasted into
+            // the marked SQLite INSERT as written).
+            if let Some(missing) = cols
+                .iter()
+                .find(|c| !column_names.iter().any(|n| n.eq_ignore_ascii_case(c)))
+            {
+                return Err(LimboError::ParseError(SqlErrorMessage::classified(
+                    SqlErrorKind::UndefinedColumn,
+                    format!(
+                        "column \"{missing}\" of relation \"{}\" does not exist",
+                        stmt.table_name
+                    ),
+                )));
+            }
             let col_list = cols
                 .iter()
-                .map(|c| format!("\"{c}\""))
+                .map(|c| catalog::quote_ident(c))
                 .collect::<Vec<_>>()
                 .join(", ");
             (format!(" ({col_list})"), cols.len())
@@ -3668,15 +3698,18 @@ fn get_table_columns(
 ) -> Result<Vec<String>> {
     #[cfg(test)]
     TABLE_INFO_READS.with(|n| n.set(n.get() + 1));
-    // The names quoted here, once, for every caller: COPY passed its table's name as written, so
-    // a quote in it broke the PRAGMA's text.
-    let table_name = table_name.replace('\'', "''");
+    // The names quoted here, once, for every caller, by the one quoting function: COPY passed its
+    // table's name as written, so a quote in it broke the PRAGMA's text.
     let sql = match schema_name {
         Some(schema) => catalog::sqlite_text(format!(
-            "PRAGMA \"{}\".table_info('{table_name}')",
-            schema.replace('"', "\"\"")
+            "PRAGMA {}.table_info({})",
+            catalog::quote_ident(schema),
+            catalog::quote_literal(table_name)
         )),
-        None => catalog::sqlite_text(format!("PRAGMA table_info('{table_name}')")),
+        None => catalog::sqlite_text(format!(
+            "PRAGMA table_info({})",
+            catalog::quote_literal(table_name)
+        )),
     };
     let mut stmt = conn.prepare_internal(&sql)?;
     let rows = stmt.run_collect_rows()?;
@@ -3692,7 +3725,10 @@ fn get_table_columns(
 fn list_user_tables(conn: &Arc<Connection>, schema_name: Option<&str>) -> Result<Vec<String>> {
     let filter = "type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso_internal_%'";
     let sql = match schema_name {
-        Some(name) => catalog::sqlite_text(format!("SELECT name FROM \"{name}\".sqlite_schema WHERE {filter}")),
+        Some(name) => catalog::sqlite_text(format!(
+            "SELECT name FROM {}.sqlite_schema WHERE {filter}",
+            catalog::quote_ident(name)
+        )),
         None => catalog::sqlite_text(format!("SELECT name FROM sqlite_schema WHERE {filter}")),
     };
     let mut stmt = conn.prepare_internal(&sql)?;
@@ -3708,8 +3744,8 @@ fn list_user_tables(conn: &Arc<Connection>, schema_name: Option<&str>) -> Result
 
 fn schema_exists(conn: &Arc<Connection>, schema_name: &str) -> Result<bool> {
     let sql = catalog::sqlite_text(format!(
-        "SELECT 1 FROM pragma_database_list WHERE name = '{}'",
-        schema_name.replace('\'', "''")
+        "SELECT 1 FROM pragma_database_list WHERE name = {}",
+        catalog::quote_literal(schema_name)
     ));
     let mut stmt = conn.prepare_internal(&sql)?;
     let rows = stmt.run_collect_rows()?;
