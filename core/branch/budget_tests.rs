@@ -1925,12 +1925,20 @@ fn run_instruments(cell: &str) -> String {
                 std::hint::spin_loop();
             }
             let rl2 = rl.clone();
+            // Counters review 5: the window closes only once `late` is running, not merely spawned (a
+            // thread not yet scheduled may read as waiting, and the window would be refused as foreign).
+            let running = Arc::new(AtomicBool::new(false));
+            let run2 = running.clone();
             let late = std::thread::spawn(move || {
+                run2.store(true, Release);
                 // Still RUNNING at the window's end: a spin, no call.
                 while !rl2.load(Acquire) {
                     std::hint::spin_loop();
                 }
             });
+            while !running.load(Acquire) {
+                std::hint::spin_loop();
+            }
             sp.store(true, Release);
             late.join().unwrap();
         });
