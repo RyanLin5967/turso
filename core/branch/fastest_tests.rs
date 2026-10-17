@@ -3209,6 +3209,52 @@ fn every_mv_store_install_or_removal_bumps_the_database_wide_generation() {
     assert!(unbumped.is_empty(), "CLAIM: MV-store installs or removals with no database-wide generation bump: {unbumped:?}");
 }
 
+/// The prepare-generation bump sites in one source file's text, as `every_prepare_generation_bump_
+/// site_is_audited` counts them.
+fn bump_site_count(text: &str) -> usize {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with("//") && !l.contains("fn bump_prepare_context_generation"))
+        .map(|l| {
+            l.matches("bump_prepare_context_generation()").count()
+                + l.matches("prepare_context_generation).fetch_add(").count()
+                + l.matches("prepare_context_generation.fetch_add(").count()
+        })
+        .sum()
+}
+
+/// Review c42b LOW-4: the bump-site scan counts every form a bump is written in, so a site rustfmt
+/// splits over two lines (`self.prepare_context_generation` then `.fetch_add(`, as the two bump
+/// definitions themselves are written) cannot hide from the audit gate. Planted texts: each
+/// form counts once; comments and the bump functions' own bodies count zero. At 01d412f8e the
+/// scan read one line at a time, so the two-line form counted zero.
+#[test]
+fn the_bump_site_scan_counts_every_form_of_a_bump() {
+    let one_line = "fn a(&self) {\n    self.prepare_context_generation.fetch_add(1, Ordering::Release);\n}\n";
+    let two_line = "fn a(&self) {\n    self.prepare_context_generation\n        .fetch_add(1, Ordering::Release);\n}\n";
+    let ext_two_line = "fn a() {\n    (*ctx.prepare_context_generation)\n        .fetch_add(1, Ordering::Release);\n}\n";
+    let call = "fn a(&self) {\n    self.db\n        .bump_prepare_context_generation();\n}\n";
+    let stored = "fn a(&self) {\n    self.prepare_context_generation\n        .store(0, Ordering::Release);\n}\n";
+    let comment = "fn a(&self) {\n    // self.prepare_context_generation.fetch_add(1, Ordering::Release);\n}\n";
+    let definition = "pub(crate) fn bump_prepare_context_generation(&self) {\n    self.prepare_context_generation\n        .fetch_add(1, Ordering::Release);\n}\n";
+    let mut wrong = Vec::new();
+    for (name, text, want) in [
+        ("one line", one_line, 1),
+        ("two lines", two_line, 1),
+        ("an extension's two lines", ext_two_line, 1),
+        ("a split call", call, 1),
+        ("a store", stored, 1),
+        ("a comment", comment, 0),
+        ("the bump's own definition", definition, 0),
+    ] {
+        let got = bump_site_count(text);
+        if got != want {
+            wrong.push(format!("{name}: counted {got}, want {want}"));
+        }
+    }
+    assert!(wrong.is_empty(), "CLAIM: the bump-site scan miscounts a form of a bump: {wrong:?}");
+}
+
 /// Review engine-rev-setter LOW-2: the audit of every prepare-generation bump (49e10e02a's message
 /// said 37 and missed five) is pinned here, per file, so a new bump site fails this gate until it
 /// is audited (and the setter class above says whether it should be change-only). Counts calls of
@@ -3252,16 +3298,7 @@ fn every_prepare_generation_bump_site_is_audited() {
                 }
             } else if path.extension().is_some_and(|x| x == "rs") && !path.ends_with("branch/fastest_tests.rs") {
                 let text = std::fs::read_to_string(&path).unwrap();
-                let n: usize = text
-                    .lines()
-                    .map(str::trim)
-                    .filter(|l| !l.starts_with("//") && !l.contains("fn bump_prepare_context_generation"))
-                    .map(|l| {
-                        l.matches("bump_prepare_context_generation()").count()
-                            + l.matches("prepare_context_generation).fetch_add(").count()
-                            + l.matches("prepare_context_generation.fetch_add(").count()
-                    })
-                    .sum();
+                let n = bump_site_count(&text);
                 if n > 0 {
                     let rel = path.strip_prefix(core).unwrap().to_string_lossy().replace('\\', "/");
                     found.insert(rel, n);
