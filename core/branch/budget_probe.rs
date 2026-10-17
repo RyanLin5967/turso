@@ -477,7 +477,12 @@ pub(crate) fn store_locked_at(site: &'static std::panic::Location<'static>) {
                     HOLD_N0.with(|n| n.set(thread_table(&mut t[..])));
                 }
             });
-            HELD_SINCE.with(|s| s.set(unix_syscalls()));
+            // Mutant `audit_unarm_half` (test builds only; counters review 3 MED-C): every second
+            // outermost lock is left unarmed, so its hold is excluded at its end.
+            static UNARM: AtomicU64 = AtomicU64::new(0);
+            if !(mutant_on("audit_unarm_half") && UNARM.fetch_add(1, Relaxed) % 2 == 1) {
+                HELD_SINCE.with(|s| s.set(unix_syscalls()));
+            }
             HOLD_LOST0.with(|l| l.set(shim_lost()));
             HOLD_T0.with(|t| {
                 if let Ok(t) = t.try_borrow() {
