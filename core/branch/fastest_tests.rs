@@ -5002,6 +5002,44 @@ fn a_lookup_by_name_waits_for_the_release_it_reports() {
     }
 }
 
+/// Review delete MED-1: a DROP of a name whose Release is still in the air does not answer
+/// NoSuchBranch before that Release is durable (after a crash the branch would come back under the
+/// name), as a lookup does not (`a_lookup_by_name_waits_for_the_release_it_reports`). 838c41999
+/// copied the lookup's wait into `drop_named`, where neither lookup mutant reached it. Mutants
+/// `drop_miss_no_release_wait` and (once the lookup is shared) `lookup_no_release_wait`.
+#[test]
+fn a_drop_miss_waits_for_its_own_names_release() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("drop-miss-wait.db"), opts(catalog, SyncClass::Fsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        trunk.create_branch("x").unwrap();
+        let hold = db.branches.trunk_commit_hold.clone();
+        hold.store(super::store::HOLD_FLIGHT_TAKEN, std::sync::atomic::Ordering::Release);
+        let dropper = {
+            let db = db.clone();
+            std::thread::spawn(move || db.drop_branch("x").map(|_| ()))
+        };
+        wait_hold(&hold, super::store::HOLD_FLIGHT_TAKEN);
+        let before = db.branches.group_counters();
+        let second = {
+            let db = db.clone();
+            std::thread::spawn(move || db.drop_branch("x").map(|_| ()))
+        };
+        let blocked = blocked_in_wait_durable(&db, before, &second);
+        hold.store(0, std::sync::atomic::Ordering::Release);
+        dropper.join().unwrap().unwrap();
+        let missed = second.join().unwrap();
+        assert!(blocked, "catalog={catalog}: a drop answered for a name whose Release was not yet durable");
+        assert!(
+            matches!(missed, Err(LimboError::NoSuchBranch(ref n)) if n == "x"),
+            "catalog={catalog}: the second drop, after the release, is NoSuchBranch: {missed:?}"
+        );
+    }
+}
+
 /// fastest-wire (the typed branch errors): `Database::drop_branch` released a named branch that
 /// still had an open connection, as a handle's release does (the branch kept whole until the
 /// connection closes). A server's DROP of a database in use must be refused instead, as
