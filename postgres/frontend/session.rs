@@ -1758,8 +1758,7 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
             // database, which PostgreSQL's own tz database mirrors. BLIND SPOT: a host whose zone
             // database lacks a name PostgreSQL knows answers 22023 for it, not 0A000.
             let numeric = lower.trim_start_matches(['+', '-']).parse::<f64>().is_ok();
-            let zoned = !text.contains("..")
-                && std::path::Path::new("/usr/share/zoneinfo").join(&text).is_file();
+            let zoned = zone_file(&text);
             if !(utc || numeric || zoned) {
                 return invalid();
             }
@@ -1808,6 +1807,32 @@ fn pg_parameter_name(name: &str) -> &str {
 
 /// PostgreSQL's encoding names and aliases, letters and digits only (pg_wchar.c's table, as
 /// client_encoding accepts them): any other is 22023.
+/// Whether `name` is a zone in the host's zone database: only name components of letters, digits,
+/// `_`, `-` and `+` (no leading `/`, no `.` or `..`, nothing empty), joined under
+/// /usr/share/zoneinfo, naming a TZif file, and not `posixrules`, which PostgreSQL refuses by name.
+/// A value that is a host path never reaches the filesystem, so no answer says whether a host file
+/// exists (review c39799c5d..9e24b455d MED 2: `/etc/passwd` replaced the base in `join` and
+/// answered 0A000, `/etc/nosuch` 22023), and a zone-directory file that is not a zone
+/// (`zone.tab`, `tzdata.zi`) is not one; PG 18.6 answers 22023 for all of them
+/// (pg18-rev-c39-tzpath.out).
+fn zone_file(name: &str) -> bool {
+    use std::io::Read;
+    let named = name.len() <= 255
+        && name.split('/').all(|c| {
+            !c.is_empty()
+                && c.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'+'))
+        });
+    if !named || name.eq_ignore_ascii_case("posixrules") {
+        return false;
+    }
+    let mut magic = [0u8; 4];
+    std::fs::File::open(std::path::Path::new("/usr/share/zoneinfo").join(name))
+        .and_then(|mut f| f.read_exact(&mut magic))
+        .is_ok()
+        && &magic == b"TZif"
+}
+
 const PG_ENCODINGS: &[&str] = &[
     "sqlascii", "utf8", "unicode", "eucjp", "euccn", "euckr", "euctw", "eucjis2004",
     "muleinternal", "latin1", "latin2", "latin3", "latin4", "latin5", "latin6", "latin7",
