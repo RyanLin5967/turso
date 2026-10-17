@@ -3056,7 +3056,7 @@ fn a_statement_reprepared_after_a_setting_change_keeps_its_search_path() {
     let sql = "SELECT x FROM t";
     let (cmd, _) = c.parse_sql(sql).unwrap();
     let options = crate::connection::PrepareOptions { unqualified_database_search_path: Some(vec!["s".to_string()]) };
-    let mut stmt = c.prepare_translated_cmd_with_options(cmd.unwrap(), sql, &options).unwrap();
+    let mut stmt = c.prepare_translated_cmd_with_options(cmd.unwrap(), sql, options).unwrap();
     let read = |stmt: &mut crate::Statement| -> Vec<i64> {
         let mut out = Vec::new();
         loop {

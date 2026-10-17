@@ -1125,7 +1125,7 @@ impl Connection {
         self: &Arc<Connection>,
         stmt: ast::Stmt,
         input: &str,
-        prepare_options: &PrepareOptions,
+        prepare_options: PrepareOptions,
     ) -> Result<Statement> {
         self.prepare_translated_cmd_with_options(ast::Cmd::Stmt(stmt), input, prepare_options)
     }
@@ -1137,14 +1137,16 @@ impl Connection {
         cmd: ast::Cmd,
         input: &str,
     ) -> Result<Statement> {
-        self.prepare_translated_cmd_with_options(cmd, input, &PrepareOptions::default())
+        self.prepare_translated_cmd_with_options(cmd, input, PrepareOptions::default())
     }
 
+    /// The options are taken by value and kept with the statement for its re-prepares
+    /// (wire-rework B-H2), so a prepare clones nothing (wire-rev-line L6).
     pub fn prepare_translated_cmd_with_options(
         self: &Arc<Connection>,
         cmd: ast::Cmd,
         input: &str,
-        prepare_options: &PrepareOptions,
+        prepare_options: PrepareOptions,
     ) -> Result<Statement> {
         self.prepare_cmd_with_input_and_origin(cmd, input, StatementOrigin::Root, prepare_options)
     }
@@ -1155,7 +1157,7 @@ impl Connection {
         cmd: ast::Cmd,
         input: &str,
         origin: StatementOrigin,
-        prepare_options: &PrepareOptions,
+        prepare_options: PrepareOptions,
     ) -> Result<Statement> {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
@@ -1165,7 +1167,7 @@ impl Connection {
             self.start_nested();
         }
         let result = (|| {
-            let (program, pager, mode) = self.compile_cmd(cmd, input, origin, prepare_options)?;
+            let (program, pager, mode) = self.compile_cmd(cmd, input, origin, &prepare_options)?;
             // Kept with the statement: a re-prepare translates under them (wire-rework B-H2).
             Ok(Statement::new_with_origin(
                 program,
@@ -1175,7 +1177,7 @@ impl Connection {
                 origin,
                 needs_nested_guard,
             )
-            .with_prepare_options(prepare_options.clone()))
+            .with_prepare_options(prepare_options))
         })();
         if result.is_err() && needs_nested_guard {
             self.end_nested();

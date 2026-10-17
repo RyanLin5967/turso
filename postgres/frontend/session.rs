@@ -650,13 +650,13 @@ fn prepare_statement_checked(
         let input = prereq.to_string();
         let mut stmt = pg_conn
             .conn
-            .prepare_translated_stmt_with_options(prereq, &input, &options)?;
+            .prepare_translated_stmt_with_options(prereq, &input, options.clone())?;
         stmt.run_ignore_rows()?;
     }
 
     pg_conn
         .conn
-        .prepare_translated_cmd_with_options(translated.cmd, sql, &options)
+        .prepare_translated_cmd_with_options(translated.cmd, sql, options)
         .map(Some)
 }
 
