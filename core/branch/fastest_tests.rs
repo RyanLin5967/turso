@@ -3007,6 +3007,52 @@ fn a_failed_capture_check_under_the_whole_run_switch_aborts_the_process() {
     );
 }
 
+/// Lead ruling "cache-key and reprepare classes" (wire-rework review B-H2): a statement prepared
+/// with a search path is re-prepared, after a prepare-generation bump, under that search path, as
+/// PG re-analyses under the session's search_path; never under defaults. At 67353b158
+/// `Statement::reprepare` translated with `PrepareOptions::default()`, so an unqualified name then
+/// resolved to main: wrong rows for every connection with a search path. Two databases each hold
+/// `t` with a different row; `SELECT x FROM t` prepared with search path [s] reads s.t, then a real
+/// setting change bumps the generation and the next run must still read s.t.
+#[test]
+fn a_statement_reprepared_after_a_setting_change_keeps_its_search_path() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("search-path-main.db"), DatabaseOpts::new());
+    let c = db.connect().unwrap();
+    c.execute("CREATE TABLE t(x INTEGER)").unwrap();
+    c.execute("INSERT INTO t VALUES (1)").unwrap();
+    let other = dir.path().join("search-path-s.db");
+    c.execute(format!("ATTACH '{}' AS s", other.display())).unwrap();
+    c.execute("CREATE TABLE s.t(x INTEGER)").unwrap();
+    c.execute("INSERT INTO s.t VALUES (2)").unwrap();
+    let sql = "SELECT x FROM t";
+    let (cmd, _) = c.parse_sql(sql).unwrap();
+    let options = crate::connection::PrepareOptions { unqualified_database_search_path: Some(vec!["s".to_string()]) };
+    let mut stmt = c.prepare_translated_cmd_with_options(cmd.unwrap(), sql, &options).unwrap();
+    let read = |stmt: &mut crate::Statement| -> Vec<i64> {
+        let mut out = Vec::new();
+        loop {
+            match stmt.step().unwrap() {
+                crate::StepResult::Row => out.push(stmt.row().unwrap().get_value(0).as_int().expect("an integer x")),
+                crate::StepResult::IO | crate::StepResult::Yield => db.io.step().unwrap(),
+                crate::StepResult::Done => break,
+                other => panic!("premise: the SELECT runs to completion, not {other:?}"),
+            }
+        }
+        stmt.reset().unwrap();
+        out
+    };
+    assert_eq!(read(&mut stmt), vec![2], "premise: prepared with search path [s], the SELECT reads s.t");
+    let reprepares0 = stmt.metrics().reprepares;
+    let g0 = c.prepare_context_generation();
+    c.set_cache_size(c.get_cache_size() + 1);
+    assert_ne!(c.prepare_context_generation(), g0, "premise: the setting change bumped the prepare generation");
+    let after = read(&mut stmt);
+    assert!(stmt.metrics().reprepares > reprepares0, "premise: the statement was re-prepared after the bump");
+    assert_eq!(after, vec![2], "CLAIM: re-prepared after a setting change, the SELECT read {after:?}, not s.t's row: the search path was dropped");
+}
+
 /// Lead ruling DECISIONS 179e043b9e (wire-rev-fkguard MED 1), as a class: a setter whose side
 /// effect invalidates compiled programs bumps the prepare generation only on a CHANGE. The wire's
 /// publish sets foreign_keys at every transaction end, so an unconditional bump re-prepared every
