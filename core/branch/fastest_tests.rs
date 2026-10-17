@@ -3121,6 +3121,22 @@ fn a_journal_mode_switch_on_one_connection_moves_every_connection_s_prepare_gene
     );
 }
 
+/// Review C42 LOW-4: `PRAGMA auto_vacuum` compiles the pager's mode in as a constant, so setting a
+/// different mode (allowed until page 1 exists) bumps the prepare generation. At 1b0e4f2e7
+/// `persist_auto_vacuum_mode` changed it with no bump.
+#[test]
+fn setting_auto_vacuum_moves_the_prepare_generation() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("auto-vacuum-generation.db"), DatabaseOpts::new().with_autovacuum(true));
+    let c = db.connect().unwrap();
+    let mode0 = c.get_pager().get_auto_vacuum_mode();
+    let g0 = c.prepare_context_generation();
+    c.execute("PRAGMA auto_vacuum = FULL").unwrap();
+    assert_ne!(c.get_pager().get_auto_vacuum_mode(), mode0, "premise: the auto-vacuum mode changed");
+    assert_ne!(c.prepare_context_generation(), g0, "CLAIM: PRAGMA auto_vacuum changed the mode and left the prepare generation alone");
+}
+
 /// Review engine-rev-setter LOW-2: the audit of every prepare-generation bump (49e10e02a's message
 /// said 37 and missed five) is pinned here, per file, so a new bump site fails this gate until it
 /// is audited (and the setter class above says whether it should be change-only). Counts calls of
