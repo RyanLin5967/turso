@@ -13402,3 +13402,91 @@ replays_postgresql!(pg18_c56_schema_prepared_replays_as_postgresql_answered, "pg
 replays_postgresql!(pg18_rev_c39_tzforms_replays_as_postgresql_answered, "pg18-rev-c39-tzforms.out", []);
 replays_postgresql!(pg18_rev_c39_misc_replays_as_postgresql_answered, "pg18-rev-c39-misc.out", []);
 replays_postgresql!(pg18_rev_c39_enc_replays_as_postgresql_answered, "pg18-rev-c39-enc.out", []);
+
+/// Named extended-protocol messages, for the kept-statement reds below.
+fn named_parse(w: &mut Wire, name: &str, sql: &str) {
+    let mut b = format!("{name}\0{sql}\0").into_bytes();
+    b.extend_from_slice(&0i16.to_be_bytes());
+    w.send(b'P', &b);
+}
+
+fn named_bind(w: &mut Wire, portal: &str, stmt: &str) {
+    let mut b = format!("{portal}\0{stmt}\0").into_bytes();
+    for _ in 0..3 {
+        b.extend_from_slice(&0i16.to_be_bytes());
+    }
+    w.send(b'B', &b);
+}
+
+fn named_execute(w: &mut Wire, portal: &str) {
+    let mut b = format!("{portal}\0").into_bytes();
+    b.extend_from_slice(&0i32.to_be_bytes());
+    w.send(b'E', &b);
+}
+
+/// A server whose database has `t` (x = 1) in public and `s.t` (x = 2), for the kept-statement
+/// reds: an unqualified `t` read under search_path s must be 2.
+fn two_schemas(dir: &Scratch) -> Server {
+    cli_script(dir, b"CREATE SCHEMA s;\nCREATE TABLE s.t(x INT);\nINSERT INTO s.t VALUES (2);\n");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE t(x INT)").ok("t");
+    a.q("INSERT INTO t VALUES (1)").ok("row");
+    server
+}
+
+/// Review wire-rework B-H1 (DECISIONS, "cache-key and reprepare classes"): a statement kept at
+/// Parse is not reused across a SET search_path in the same round. The kept statement resolved
+/// `t` under public; reused after `SET search_path TO s` it read public.t's 1. PostgreSQL
+/// re-analyses a cached statement when search_path changes, and the base (one kept statement,
+/// dropped at any Execute) gave 2.
+#[test]
+fn a_kept_statement_is_not_reused_across_a_search_path_change() {
+    let dir = Scratch::new("kept-path");
+    let server = two_schemas(&dir);
+    let mut a = server.connect();
+    named_parse(&mut a, "sq", "SELECT x FROM t");
+    named_parse(&mut a, "ss", "SET search_path TO s");
+    named_bind(&mut a, "", "ss");
+    named_execute(&mut a, "");
+    named_bind(&mut a, "", "sq");
+    named_execute(&mut a, "");
+    a.send(b'S', &[]);
+    let r = a.read_reply();
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(r.rows, vec![vec![Some("2".to_string())]], "the read under search_path s");
+}
+
+/// Review wire-rework B-H2: a kept statement executed after another statement changed a setting
+/// (which bumps the engine's prepare generation) is re-prepared with the session's search path.
+/// The engine's reprepare translated with default options, without the session's path, so an
+/// unqualified `t` read public's 1 (root fix: fastest-engine). Under search_path s it must be 2,
+/// after a SET of another setting and after a SAVEPOINT alike.
+#[test]
+fn a_kept_statement_reprepared_after_a_setting_change_keeps_the_search_path() {
+    let dir = Scratch::new("kept-reprepare");
+    let server = two_schemas(&dir);
+    let mut wrong = Vec::new();
+    for (label, begin, other) in [
+        ("SET client_min_messages", false, "SET client_min_messages TO notice"),
+        ("SAVEPOINT", true, "SAVEPOINT a"),
+    ] {
+        let mut a = server.connect();
+        a.q("SET search_path TO s").ok("path");
+        if begin {
+            a.q("BEGIN").ok("begin");
+        }
+        named_parse(&mut a, "pq", "SELECT x FROM t");
+        named_bind(&mut a, "p1", "pq");
+        named_parse(&mut a, "pc", other);
+        named_bind(&mut a, "p2", "pc");
+        named_execute(&mut a, "p2");
+        named_execute(&mut a, "p1");
+        a.send(b'S', &[]);
+        let r = a.read_reply();
+        if r.error.is_some() || r.rows != vec![vec![Some("2".to_string())]] {
+            wrong.push(format!("{label}: rows {:?} error {:?}", r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
