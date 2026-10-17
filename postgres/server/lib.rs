@@ -6979,6 +6979,29 @@ mod tests {
         out
     }
 
+    /// fk-guard review LOW 4: the publish guard (no foreign_keys off over pending deferred
+    /// violations) is unreachable from a client, so it is held by fault injection: with the
+    /// session's setting off and a violation pretended pending, a block's end keeps the engine's
+    /// check on; with the pretence gone it turns off as set. MUTANT owed with the run: drop
+    /// `|| deferred_violations(..) > 0` from publish and this fails.
+    #[test]
+    fn a_block_end_never_turns_foreign_keys_off_over_pending_violations() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = session(&dir);
+        ok(&s, "SET foreign_keys = off");
+        let conn = s.current(&mut s.state()).unwrap();
+        assert!(!conn.inner().foreign_keys_enabled(), "the control: SET turned the check off");
+        turso_pg::pretend_deferred_violations(1);
+        ok(&s, "BEGIN");
+        ok(&s, "COMMIT");
+        let held = conn.inner().foreign_keys_enabled();
+        turso_pg::pretend_deferred_violations(0);
+        assert!(held, "a block end turned the check off over a pending violation");
+        ok(&s, "BEGIN");
+        ok(&s, "COMMIT");
+        assert!(!conn.inner().foreign_keys_enabled(), "with nothing pending the setting holds");
+    }
+
     /// C44-M1: a branch the engine refuses as in use is 55006 by the engine's typed error
     /// (LimboError::BranchInUse), whatever its text; another error on an existing branch is not
     /// 55006, and a missing branch is 3D000. The wire tests reach the session's own in-use map
