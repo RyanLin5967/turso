@@ -1525,7 +1525,16 @@ impl StoreMutex {
         loop {
             let before = self.compacting.load(Ordering::Acquire);
             saw_odd |= before & 1 == 1;
-            if let Some(guard) = self.inner.try_lock() {
+            // Parked in the mutex's queue for up to 10 ms at a time, so a fair handoff can reach this
+            // waiter as it reaches a plain `lock()` (review c42b LOW-4: a 1 ms `try_lock` poll never
+            // queued, and a saturated mutex answered a bounded CHECKPOINT Busy); the interrupt and
+            // the deadline are checked between slices. Shuttle's mutex has no timed lock: it polls.
+            let slice = wait.until.saturating_duration_since(Instant::now()).min(Duration::from_millis(10));
+            #[cfg(not(shuttle))]
+            let taken = self.inner.try_lock_for(slice);
+            #[cfg(shuttle)]
+            let taken = self.inner.try_lock();
+            if let Some(guard) = taken {
                 if saw_odd || self.compacting.load(Ordering::Acquire) != first {
                     self.compaction_waits.fetch_add(1, Ordering::Relaxed);
                 }
@@ -1537,7 +1546,8 @@ impl StoreMutex {
             if Instant::now() >= wait.until {
                 return Err(LimboError::Busy);
             }
-            crate::thread::sleep(Duration::from_millis(1));
+            #[cfg(shuttle)]
+            crate::thread::sleep(slice.min(Duration::from_millis(1)));
         }
     }
 

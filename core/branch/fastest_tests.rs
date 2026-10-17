@@ -4082,6 +4082,45 @@ fn a_bounded_compaction_s_interrupt_may_wait_for_the_flights() {
     assert!(matches!(r, Err(LimboError::Interrupt)), "CLAIM: the interrupted compaction answered {r:?}, not Interrupt");
 }
 
+/// Review c42b LOW-4 (measurement, not a red: the gain is a probability): 8 threads create
+/// branches in a loop while `branch_compact_now_within(now + 2 s)` is called 20 times; prints how
+/// many calls answered Busy. Run at 4e6665378 (the 1 ms poll) and at the parked `lock_within` and
+/// compare. `#[ignore]`: owed in the build plan.
+#[test]
+#[ignore]
+fn measure_bounded_compactions_busy_under_saturated_creates() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("lock-within-busy.db"), opts(true, SyncClass::Off));
+    seed(&db.connect().unwrap());
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let creators: Vec<_> = (0..8)
+        .map(|t| {
+            let (db, stop) = (db.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let conn = db.connect().unwrap();
+                let mut i = 0u64;
+                while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                    let _ = conn.create_branch(&format!("c{t}-{i}"));
+                    i += 1;
+                }
+            })
+        })
+        .collect();
+    let mut busy = 0;
+    for _ in 0..20 {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        if matches!(db.branch_compact_now_within(until, &|| false), Err(LimboError::Busy)) {
+            busy += 1;
+        }
+    }
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    for c in creators {
+        c.join().unwrap();
+    }
+    println!("LOW4_MEASURE busy={busy} of 20");
+}
+
 /// Review C42 MED-3: `checkpoint_now` whose own flight INSTALLED but whose WAL truncation ran past
 /// the deadline reports the install (`Ok(true)`), as its doc says (`Ok(false)`: none did before
 /// the deadline). The flight is held at `HOLD_BEFORE_WAL_TRUNCATE`, after its install, past a
