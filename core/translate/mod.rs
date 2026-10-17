@@ -610,6 +610,7 @@ mod tests {
             crate::statement::StatementOrigin::Root,
             &crate::connection::PrepareOptions::default(),
             crate::connection::SqlText::Client,
+            0, // review c42b MED-4: these tests check translation errors only
         );
         let err = result.unwrap_err().to_string();
         assert!(
@@ -695,6 +696,7 @@ mod tests {
             crate::statement::StatementOrigin::Root,
             &crate::connection::PrepareOptions::default(),
             crate::connection::SqlText::Client,
+            0, // review c42b MED-4: these tests check translation errors only
         )
         .expect_err("translation should fail with malformed sqlite_sequence");
         match err {
@@ -740,6 +742,7 @@ mod tests {
             crate::statement::StatementOrigin::Root,
             &crate::connection::PrepareOptions::default(),
             crate::connection::SqlText::Client,
+            0, // review c42b MED-4: these tests check translation errors only
         )
         .expect_err("translation should fail with missing sqlite_sequence");
         match err {
