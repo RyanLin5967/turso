@@ -4365,6 +4365,19 @@ mod dialect_switch_tests {
         );
     }
 
+    /// Review wire-line3 LOW-2: a table created before the marker refusal (f8f0d4b13) may be
+    /// stored as client text that starts with the SQLite marker. Its replay text (VACUUM) must not
+    /// start with the marker, or the replay reads the client's PostgreSQL DDL as SQLite.
+    #[test]
+    fn a_stored_marker_led_table_replays_as_postgresql() {
+        let stored = format!("{STORED_PG_SCHEMA_PREFIX}{SQLITE_TEXT_MARKER}CREATE TABLE t (x int)");
+        let replay = PostgresDialect.table_sql_for_replay(&stored).unwrap();
+        assert!(
+            !replay.trim_start().starts_with(SQLITE_TEXT_MARKER.trim_end()),
+            "the replay text starts with the SQLite marker: {replay:?}"
+        );
+    }
+
     /// The wire line review M3: statements whose plain translation is right parse Ok through the
     /// dialect: a CTE referenced with an alias column list (resolved with no lookup), and an
     /// INSERT holding the string 'default' (no DEFAULT keyword). 92257e453's refusal list refused

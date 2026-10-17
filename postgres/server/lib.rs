@@ -7072,6 +7072,18 @@ mod tests {
         assert!(wrong.is_empty(), "engine text quoted by hand:\n{}", wrong.join("\n"));
     }
 
+    /// Review wire-line3 LOW-6: matching_close skips an escaped-quote char literal whole (it read
+    /// the closing quote of `'\''` as a new opener) and nested block comments.
+    #[test]
+    fn matching_close_skips_escaped_char_literals_and_nested_comments() {
+        assert_eq!(matching_close("('\\'','(')", 0, b'(', b')'), Some(9));
+        // Nested: with the inner `*/` read as the comment's end, the `(` after it opens and the
+        // last `)` closes only that one (None).
+        assert_eq!(matching_close("(/* a /* x */ ( */ y)", 0, b'(', b')'), Some(20));
+        // A control: a paren in a string and in a char literal is not counted.
+        assert_eq!(matching_close("(\"(\" ')' (x))", 0, b'(', b')'), Some(12));
+    }
+
     /// Every quoted five-character token of digits and capitals with at least one digit, found
     /// wherever it sits (no quote parity elsewhere can hide one), with its 1-based line.
     fn sqlstate_literals(text: &str) -> Vec<(usize, String)> {
