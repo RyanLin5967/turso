@@ -900,6 +900,14 @@ impl Statement {
         #[cfg(test)]
         crate::branch::budget_probe::statement_prepared();
         tracing::trace!("repreparing statement");
+        // A subprogram (a trigger's, an FK action's) is compiled inside its parent under the
+        // parent's search path, which its own Statement does not carry (review reprepare LOW-B2):
+        // re-prepared alone it would resolve under defaults. Its parent re-prepares first at its
+        // own Init, so this is unreachable; refused if it ever is.
+        turso_assert!(
+            self.origin != StatementOrigin::Subprogram,
+            "a subprogram statement re-prepared on its own, without its parent's prepare options"
+        );
         let conn = self.program.connection.clone();
         let main_pager = conn.pager.load().clone();
 
