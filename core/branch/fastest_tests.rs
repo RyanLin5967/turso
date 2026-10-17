@@ -2853,6 +2853,61 @@ fn a_hold_that_panicked_sends_its_owed_start_only_at_the_next_hold() {
     db.branch_checkpoint_wait();
 }
 
+/// Review REVIEW-claude-engine-M1 LOW-3: the lease floor a fuzzy checkpoint's writer reads after
+/// its commit (177f007c8, off the install's hold) is the catalog's at the install, i.e. nothing
+/// wrote the catalog between them. Checked at every install under the capture check
+/// (`CAPTURE_VERIFY_FORCED`), with leases in flight: branches leased before the checkpoint and
+/// one leased while it is held before its rows. Mutant `lease_floor_after_stale`.
+#[test]
+fn a_fuzzy_checkpoint_s_lease_floor_is_the_catalog_s_at_its_install() {
+    use std::sync::atomic::Ordering::{Relaxed, Release};
+    let _s = serial();
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            super::store::CAPTURE_VERIFY_FORCED.store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+    let _r = Reset;
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(
+        &dir.path().join("lease-floor.db"),
+        opts(true, SyncClass::Fsync).with_branch_checkpoint(super::BranchCheckpoint::Fuzzy),
+    );
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let mut held = Vec::new();
+    for i in 0..8u64 {
+        let b = trunk.fork_branch().unwrap();
+        b.lease(std::time::Duration::from_secs(60 + i)).unwrap();
+        held.push(b);
+    }
+    super::store::CAPTURE_VERIFY_FAILURES.lock().unwrap().clear();
+    super::store::CAPTURE_VERIFY_FORCED.store(true, Release);
+    let verified0 = super::store::LEASE_FLOORS_VERIFIED.load(Relaxed);
+    assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: a fuzzy checkpoint started");
+    db.branch_checkpoint_wait();
+    db.branch_checkpoint_hold(super::store::HOLD_BEFORE_ROWS);
+    let late = trunk.fork_branch().unwrap();
+    assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: a second fuzzy checkpoint started");
+    let t = std::time::Instant::now();
+    while db.branch_checkpoint_held() != super::store::HOLD_BEFORE_ROWS | super::store::HOLD_ARRIVED {
+        assert!(t.elapsed() < std::time::Duration::from_secs(10), "premise: the writer never reached its rows");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    late.lease(std::time::Duration::from_secs(30)).unwrap();
+    held[0].lease(std::time::Duration::from_secs(3600)).unwrap();
+    db.branch_checkpoint_hold(0);
+    db.branch_checkpoint_wait();
+    super::store::CAPTURE_VERIFY_FORCED.store(false, Release);
+    let verified = super::store::LEASE_FLOORS_VERIFIED.load(Relaxed) - verified0;
+    assert!(verified >= 2, "premise: the capture check compared {verified} installs' lease floors, not both");
+    let failures = super::store::CAPTURE_VERIFY_FAILURES.lock().unwrap().clone();
+    assert!(failures.is_empty(), "CLAIM: a fuzzy checkpoint's writer-read lease floor was not the catalog's at its install: {failures:?}");
+    drop(late);
+    drop(held);
+}
+
 /// Review 2 #5: a checkpoint that failed is not retried by the very next operation — the log is
 /// past the threshold still, so without a back-off every create would start (and pay for) another
 /// one: it waits for another threshold's worth of log.

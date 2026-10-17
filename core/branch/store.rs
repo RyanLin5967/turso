@@ -2123,6 +2123,9 @@ pub(crate) const HOLD_STARTER_SENDING: u8 = 22;
 /// (`verify_frozen_rows`), as `FE_CAPTURE_VERIFY` does for a whole run; and the differences found.
 #[cfg(test)]
 pub(crate) static CAPTURE_VERIFY_FORCED: AtomicBool = AtomicBool::new(false);
+/// Test builds: installs whose writer-read lease floor the capture check compared (review M1 LOW-3).
+#[cfg(test)]
+pub(crate) static LEASE_FLOORS_VERIFIED: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 pub(crate) static CAPTURE_VERIFY_FAILURES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 /// Test builds: the next fuzzy checkpoint's cut (`begin_cut`) panics (review 4 #16).
@@ -4102,6 +4105,13 @@ fn run_flight(
         // raw l104). Nothing else writes the catalog between the commit and the install. A failed
         // read leaves it to the install, as before.
         let floor = written.as_ref().ok().and_then(|()| w.lease_min().ok());
+        // Mutant `lease_floor_after_stale` (test builds only): a floor one past the catalog's, as a
+        // write between the commit and the install would leave it (review M1 LOW-3's check).
+        let floor = if fe_mutant("lease_floor_after_stale") {
+            floor.map(|f| Some(f.map_or(1, |v| v + 1)))
+        } else {
+            floor
+        };
         (written.map(|()| floor), w.counters.rows_written - r0)
     }))
     .unwrap_or_else(|_| {
@@ -11490,6 +11500,28 @@ impl StoreInner {
             None => cat.catalog.lease_min()?,
         };
         cat.ckpt.stmts_locked += cat.catalog.counters.queries - q0;
+        // Test builds, under the capture check (`FE_CAPTURE_VERIFY` or `CAPTURE_VERIFY_FORCED`): the
+        // floor the writer read after its commit is the catalog's at the install, which holds only
+        // if nothing wrote the catalog between them (review M1 LOW-3). Read after `stmts_locked`
+        // is counted, and only under the check, so no budget run pays the statement.
+        #[cfg(test)]
+        if let Some(after) = cap.lease_floor_after {
+            if std::env::var_os("FE_CAPTURE_VERIFY").is_some() || CAPTURE_VERIFY_FORCED.load(Ordering::Acquire) {
+                LEASE_FLOORS_VERIFIED.fetch_add(1, Ordering::Relaxed);
+                match cat.catalog.lease_min() {
+                    Ok(at_install) if at_install == after => {}
+                    found => {
+                        let e = format!(
+                            "FE_CAPTURE_VERIFY: the lease floor read after the checkpoint's commit ({after:?}) is not the catalog's at its install ({found:?})"
+                        );
+                        CAPTURE_VERIFY_FAILURES.lock().unwrap_or_else(|p| p.into_inner()).push(e.clone());
+                        if std::env::var_os("FE_CAPTURE_VERIFY").is_some() {
+                            panic!("{e}");
+                        }
+                    }
+                }
+            }
+        }
         self.lease.durable_at_least(cap.lease_now);
         // githost-shape instrument (observing only; r13-compose S-1): counted from the capture,
         // with the rows the WRITER connection wrote (`cat.catalog`, the reader, writes none).
