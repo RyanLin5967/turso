@@ -3131,20 +3131,39 @@ fn the_instruments_count_exactly_under_every_flag() {
     assert!(out.status.success(), "the instruments' exact counts fail with every flag set:\n{text}");
 }
 
-/// Counters review MED-5, and review 2 HIGH 2 (DECISIONS 7d1c461378): a parity check needs an
-/// independent second count. In a budget child the process's sync counts are exact (one cell's
-/// stores at a time), and the budget's reading IS them (`window_syncs`), so comparing the two would
-/// compare a reading with itself. The second count is the stores' own attribution (`_own`,
-/// `store::own_sync_counts`): EVERY window that records the process's syncs must record it too,
-/// and they must agree. Never process against process. Mutant `drop_journal_sync_count` (test
-/// builds only; a branch file's sync not counted by the process) must fail it in every cell whose
-/// windows sync a branch file.
+/// Counters review MED-5, review 2 HIGH 2 and review 3 MED-B/LOW-4/LOW-10 (DECISIONS 7d1c461378,
+/// 4e5b6e3b0a): a parity check needs an independent second count. In a budget child the process's
+/// sync counts are exact (one cell's stores at a time) and the budget's reading IS them
+/// (`window_syncs`), so the second count is the stores' own attribution (`_own`). Every window that
+/// records the process's syncs records the budget's own key and `_own` too, and they agree; every
+/// cell compares at least one window and its process syncs sum above zero (a 0 == 0 comparison
+/// guards nothing). Never process against process.
+///
+/// Mutant `drop_journal_sync_count` (test builds only) hides every counted arm of a branch file's
+/// sync from the process (fsync, F_FULLFSYNC, barrier). Its expected killer, per cell and
+/// platform (`KILLERS`): on Apple, the D1 open cell's `fsync` and the D2 cells' `full_fsync`; off
+/// Apple, every cell's `fsync` (F_FULLFSYNC is fsync there). Under the mutant this test checks each
+/// cell has a mismatch on its killer key and fails either way: "KILLED in every cell" or
+/// "SURVIVED in ...".
 #[test]
 fn every_budget_windows_syncs_equal_the_process_syncs_in_its_child() {
     if in_child() {
         return;
     }
+    const D2_CELLS: [&str; 13] = [
+        "n10_small", "n1e4_small", "n10_large", "ckpt_n10", "confirm_load", "confirm_n10", "first_create", "shared_c1", "shared_c8",
+        "shared_c64", "shared_c256", "shared_c1024", "open_d2_unconfirmed",
+    ];
+    let killer = |spec: &str| -> &'static str {
+        if cfg!(target_vendor = "apple") && D2_CELLS.contains(&spec) {
+            "full_fsync"
+        } else {
+            "fsync"
+        }
+    };
+    let mutant = super::store::fe_mutant("drop_journal_sync_count");
     let mut failures = String::new();
+    let mut survived = String::new();
     let mut compared = 0;
     let cells = MAIN
         .iter()
@@ -3153,18 +3172,25 @@ fn every_budget_windows_syncs_equal_the_process_syncs_in_its_child() {
         .chain(["shared_c1", "shared_c8", "shared_c64", "shared_c256", "shared_c1024"]);
     for spec in cells {
         let c = cell(spec);
-        let mut in_cell = 0;
+        let (mut in_cell, mut process_sum, mut killed) = (0, 0u64, false);
         for (op, samples) in &c.ops {
             for (i, s) in samples.iter().enumerate() {
                 for k in ["fsync", "full_fsync", "barrier"] {
                     let Some(&process) = s.get(&format!("{k}_process")) else { continue };
+                    if !s.contains_key(k) {
+                        let _ = writeln!(failures, "  {spec}: {op} {i}: {k}_process with no {k}: the budget's own reading is missing");
+                    }
                     let Some(&own) = s.get(&format!("{k}_own")) else {
                         let _ = writeln!(failures, "  {spec}: {op} {i}: {k}_process with no {k}_own: no independent count");
                         continue;
                     };
                     compared += 1;
                     in_cell += 1;
+                    process_sum += process;
                     if own != process {
+                        if k == killer(spec) {
+                            killed = true;
+                        }
                         let _ = writeln!(failures, "  {spec}: {op} {i}: {k}_own {own}, the process {process}");
                     }
                 }
@@ -3173,6 +3199,16 @@ fn every_budget_windows_syncs_equal_the_process_syncs_in_its_child() {
         if in_cell == 0 {
             let _ = writeln!(failures, "  {spec}: no window compared");
         }
+        if process_sum == 0 && !mutant {
+            let _ = writeln!(failures, "  {spec}: its windows' process syncs sum to 0: the comparison guards nothing");
+        }
+        if mutant && !killed {
+            let _ = writeln!(survived, "  {spec} (killer {})", killer(spec));
+        }
+    }
+    if mutant {
+        assert!(survived.is_empty(), "drop_journal_sync_count SURVIVED in:\n{survived}");
+        panic!("drop_journal_sync_count KILLED in every cell:\n{failures}");
     }
     assert!(compared > 0, "premise: no window carried both counts");
     assert!(failures.is_empty(), "budget windows whose stores' own sync counts are not the process's ({compared} compared):\n{failures}");
