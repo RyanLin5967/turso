@@ -56,7 +56,7 @@ struct PgConnectionInner {
     /// Notices a statement raised for the client ((severity, SQLSTATE, message): a WARNING, or a
     /// NOTICE such as DROP ... IF EXISTS's for a missing object), which the server sends before
     /// the statement's result ([`PgConnection::take_warnings`]).
-    warnings: parking_lot::Mutex<Vec<(&'static str, &'static str, String)>>,
+    warnings: parking_lot::Mutex<Vec<(&'static str, SqlErrorKind, String)>>,
 }
 
 /// The source of [`PgConnectionInner::search_path_stamp`]'s values.
@@ -617,7 +617,7 @@ impl PgConnection {
     }
 
     /// The notices the last statements raised for the client, as (severity, SQLSTATE, message).
-    pub fn take_warnings(&self) -> Vec<(&'static str, &'static str, String)> {
+    pub fn take_warnings(&self) -> Vec<(&'static str, SqlErrorKind, String)> {
         std::mem::take(&mut *self.inner.warnings.lock())
     }
 }
@@ -1523,7 +1523,7 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
         if set_stmt.is_local && !in_block {
             pg_conn.warnings.lock().push((
                 "WARNING",
-                "25P01",
+                SqlErrorKind::NoActiveSqlTransaction,
                 "SET LOCAL can only be used in transaction blocks".to_string(),
             ));
             return;
@@ -1989,7 +1989,7 @@ fn handle_pg_drop_schema(pg_conn: &Arc<PgConnectionInner>, stmt: &PgDropSchemaSt
 fn skipping_notice(pg_conn: &Arc<PgConnectionInner>, kind: &str, name: &str) {
     pg_conn.warnings.lock().push((
         "NOTICE",
-        "00000",
+        SqlErrorKind::SuccessfulCompletion,
         format!("{kind} \"{name}\" does not exist, skipping"),
     ));
 }

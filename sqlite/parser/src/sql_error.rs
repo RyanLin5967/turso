@@ -55,6 +55,9 @@ pub enum SqlErrorKind {
     TooManyConnections,
     Warning,
     SuccessfulCompletion,
+    // pg_input_error_info's conditions (review c39799c5d..9e24b455d MED 1).
+    StringDataRightTruncation,
+    InvalidDatetimeFormat,
 }
 
 /// A diagnostic's text and optional, explicitly assigned SQL condition.

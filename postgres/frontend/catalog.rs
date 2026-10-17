@@ -3322,11 +3322,11 @@ impl InternalVirtualTableCursor for PgInputErrorInfoCursor {
         };
 
         self.row = Some(match validate_pg_input(&input, &type_name) {
-            Some((message, code)) => [
+            Some((message, kind)) => [
                 Value::build_text(message),
                 Value::Null,
                 Value::Null,
-                Value::build_text(code),
+                Value::build_text(crate::sqlstate(kind)),
             ],
             None => [Value::Null, Value::Null, Value::Null, Value::Null],
         });

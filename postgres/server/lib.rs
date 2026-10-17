@@ -1900,10 +1900,10 @@ impl Session {
             let warnings = conn.take_warnings();
             if !warnings.is_empty() {
                 let mut st = self.state();
-                for (severity, code, message) in warnings {
+                for (severity, kind, message) in warnings {
                     st.notices.push(Box::new(ErrorInfo::new(
                         severity.to_string(),
-                        code.to_string(),
+                        kind_code(kind).to_string(),
                         message,
                     )));
                 }
@@ -3721,61 +3721,10 @@ fn sqlstate(e: &LimboError) -> &'static str {
     kind_code(e.sql_error_kind())
 }
 
-/// THE table: the SQLSTATE of each condition, the engine's and this server's own alike (C44; C44-M3
-/// moved the server's literal codes here: `every_sqlstate_the_server_sends_comes_from_the_table`).
+/// The SQLSTATE of each condition, from THE table, turso_pg::sqlstate (C44-M3; it moved to the
+/// frontend crate, which sends codes too: review c39799c5d..9e24b455d MED 1).
 fn kind_code(kind: SqlErrorKind) -> &'static str {
-    use SqlErrorKind::*;
-    match kind {
-        SyntaxError => "42601",
-        FeatureNotSupported => "0A000",
-        InvalidTextRepresentation => "22P02",
-        NumericValueOutOfRange => "22003",
-        DivisionByZero => "22012",
-        IntegrityConstraintViolation => "23000",
-        UniqueViolation => "23505",
-        NotNullViolation => "23502",
-        CheckViolation => "23514",
-        ForeignKeyViolation => "23503",
-        InvalidColumnReference => "42P10",
-        DatetimeFieldOverflow => "22008",
-        InvalidParameterValue => "22023",
-        UndefinedTable => "42P01",
-        InvalidForeignKey => "42830",
-        UndefinedColumn => "42703",
-        UndefinedObject => "42704",
-        UndefinedParameter => "42P02",
-        InvalidSavepointSpecification => "3B001",
-        AmbiguousColumn => "42702",
-        UndefinedFunction => "42883",
-        DuplicateAlias => "42712",
-        StatementTooComplex => "54001",
-        InternalError => "XX000",
-        SerializationFailure => "40001",
-        LockNotAvailable => "55P03",
-        ReadOnlyTransaction => "25006",
-        DiskFull => "53100",
-        QueryCanceled => "57014",
-        ConnectionFailure => "08006",
-        ProtocolViolation => "08P01",
-        NullValueNotAllowed => "22004",
-        CharacterNotInRepertoire => "22021",
-        InvalidBinaryRepresentation => "22P03",
-        ActiveSqlTransaction => "25001",
-        NoActiveSqlTransaction => "25P01",
-        InFailedSqlTransaction => "25P02",
-        InvalidCursorName => "34000",
-        InvalidCatalogName => "3D000",
-        DatatypeMismatch => "42804",
-        ReservedName => "42939",
-        DuplicateCursor => "42P03",
-        DuplicateDatabase => "42P04",
-        IndeterminateDatatype => "42P18",
-        ObjectNotInPrerequisiteState => "55000",
-        ObjectInUse => "55006",
-        TooManyConnections => "53300",
-        Warning => "01000",
-        SuccessfulCompletion => "00000",
-    }
+    turso_pg::sqlstate(kind)
 }
 
 fn wire_info(e: PgWireError) -> Box<ErrorInfo> {
