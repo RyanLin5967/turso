@@ -296,6 +296,9 @@ fn sample_of(s0: &probe::Snapshot, s1: &probe::Snapshot, o0: &Outside, o1: &Outs
     s.insert("fsync_process", delta(s0.p_fsync, s1.p_fsync));
     s.insert("full_fsync_process", delta(s0.p_full_fsync, s1.p_full_fsync));
     s.insert("barrier_process", delta(s0.p_barrier, s1.p_barrier));
+    s.insert("fsync_own", delta(s0.o_fsync, s1.o_fsync));
+    s.insert("full_fsync_own", delta(s0.o_full_fsync, s1.o_full_fsync));
+    s.insert("barrier_own", delta(s0.o_barrier, s1.o_barrier));
     s.insert("allocs", delta(s0.t_allocs, s1.t_allocs));
     s.insert("alloc_bytes", delta(s0.t_alloc_bytes, s1.t_alloc_bytes));
     s.insert("allocs_process", delta(s0.allocs, s1.allocs));
@@ -459,7 +462,7 @@ fn hold_word(held: bool) {
 /// 25 ms spin, and a thread state that read "waiting" mid-pwrite. Whether the work since `s0`
 /// synced, and whether the writer settled.
 fn absorb_confirm(db: &Arc<Database>, s0: &probe::Snapshot) -> (bool, bool) {
-    let now = super::store::own_sync_counts();
+    let now = probe::window_syncs();
     let synced = now.full_fsync != s0.full_fsync || now.fsync != s0.fsync;
     (synced, writer_settled(db, std::time::Duration::from_secs(1)))
 }
@@ -772,7 +775,7 @@ fn shared(cell: &str, db: &Arc<Database>, c: u64, out: &mut String) {
         // cannot leave the others parked for ever.
         let go = std::sync::atomic::AtomicBool::new(false);
         let e0 = exceptions(db);
-        let s0 = super::store::own_sync_counts();
+        let s0 = probe::window_syncs();
         let p0 = super::sync_counts();
         // Per client, from its start to its last acknowledgement: the store's condition-variable
         // waits (`store::thread_waits`, one per wait call, so a futile wake-up that waits again
@@ -870,7 +873,7 @@ fn shared(cell: &str, db: &Arc<Database>, c: u64, out: &mut String) {
             }
             per
         });
-        let s1 = super::store::own_sync_counts();
+        let s1 = probe::window_syncs();
         let p1 = super::sync_counts();
         let e1 = exceptions(db);
         let mut m = Sample::new();
@@ -1257,10 +1260,10 @@ fn open_once(path: &Path, log: &Path) -> Sample {
     let (m0, confirmed) = (std::fs::metadata(log).unwrap(), log_confirmed(log));
     let classes = || super::journal::CLASS_SYNCS.with(|c| [c[0].get(), c[1].get()]);
     let dirs = || super::journal::DIR_SYNCS.with(|c| c.get());
-    let (s0, c0, d0) = (super::store::own_sync_counts(), classes(), dirs());
+    let (s0, c0, d0) = (probe::window_syncs(), classes(), dirs());
     let p0 = super::sync_counts();
     let db = open_at(path);
-    let (s1, c1, d1) = (super::store::own_sync_counts(), classes(), dirs());
+    let (s1, c1, d1) = (probe::window_syncs(), classes(), dirs());
     let p1 = super::sync_counts();
     let m1 = std::fs::metadata(log).unwrap();
     // Counted since this open (`Outside::zero`).
@@ -1566,10 +1569,10 @@ fn first_create(cell: &str, out: &mut String) {
             };
             let trunk = db.connect().unwrap();
             let e0 = exceptions(&db);
-            let (c0, f0) = (probe::sql_counts(), super::store::own_sync_counts());
+            let (c0, f0) = (probe::sql_counts(), probe::window_syncs());
             let p0 = super::sync_counts();
             trunk.create_branch("m-0000").unwrap();
-            let (c1, f1) = (probe::sql_counts(), super::store::own_sync_counts());
+            let (c1, f1) = (probe::sql_counts(), probe::window_syncs());
             let p1 = super::sync_counts();
             let mut s = sql_sample(&c0, &c1);
             put_exceptions(&mut s, e0, exceptions(&db));
@@ -3023,6 +3026,13 @@ fn every_budget_windows_syncs_equal_the_process_syncs_in_its_child() {
                     compared += 1;
                     if read != process {
                         let _ = writeln!(failures, "  {spec}: {op} {i}: {k} {read}, the process {process}");
+                    }
+                    // The attribution's parity (with the fix the reading above is the process's):
+                    // the stores' own counts must agree too, or a counter is not per store there.
+                    if let Some(&own) = s.get(&format!("{k}_own")) {
+                        if own != process {
+                            let _ = writeln!(failures, "  {spec}: {op} {i}: {k}_own {own}, the process {process}");
+                        }
                     }
                 }
             }

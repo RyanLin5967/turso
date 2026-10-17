@@ -677,6 +677,11 @@ pub(crate) struct Snapshot {
     pub(crate) p_fsync: u64,
     pub(crate) p_full_fsync: u64,
     pub(crate) p_barrier: u64,
+    /// The syncs counted as the stores' this thread opened (`store::own_sync_counts`), beside them:
+    /// the attribution's own parity in a budget child.
+    pub(crate) o_fsync: u64,
+    pub(crate) o_full_fsync: u64,
+    pub(crate) o_barrier: u64,
     pub(crate) syscalls: Option<u64>,
     /// Whether the per-thread counter was loaded, and its lost count at this snapshot (probe-
     /// adversary item 1: every sample records its mode).
@@ -751,6 +756,17 @@ pub(crate) fn prime() {
     let _ = shim_lost();
     if !loaded && std::env::var_os("FE_SHIM_RUN").is_some() {
         panic!("budget_probe: REFUSED: this run is labelled a shim run (FE_SHIM_RUN) but feshim is not loaded");
+    }
+}
+
+/// The syncs a budget window reads (counters review MED-5): in a budget child, which runs one
+/// cell's stores at a time, the process's (`branch::sync_counts`, exact there, and blind to no
+/// thread); elsewhere, a test's own stores' (`store::own_sync_counts`).
+pub(crate) fn window_syncs() -> crate::branch::SyncCounts {
+    if std::env::var_os("FE_BUDGET_CHILD").is_some() {
+        crate::branch::sync_counts()
+    } else {
+        crate::branch::store::own_sync_counts()
     }
 }
 
@@ -1044,12 +1060,16 @@ pub(crate) fn thread_allocs() -> (u64, u64, u64, u64) {
 
 fn user_counts() -> Snapshot {
     let get = |c: &'static std::thread::LocalKey<Cell<u64>>| c.with(|c| c.get());
-    let syncs = crate::branch::store::own_sync_counts();
+    let syncs = window_syncs();
     let process = crate::branch::sync_counts();
+    let own = crate::branch::store::own_sync_counts();
     Snapshot {
         p_fsync: process.fsync,
         p_full_fsync: process.full_fsync,
         p_barrier: process.barrier,
+        o_fsync: own.fsync,
+        o_full_fsync: own.full_fsync,
+        o_barrier: own.barrier,
         instructions: None,
         allocs: ALLOCS.load(Relaxed),
         alloc_bytes: ALLOC_BYTES.load(Relaxed),
