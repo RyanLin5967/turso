@@ -6998,15 +6998,15 @@ mod tests {
         // reading cannot isolate publish; and adopt_session_of (a branch switch).
         let mut wrong = Vec::new();
         let mut events: Vec<(&str, &[&str])> = vec![
-            ("BEGIN; SELECT 1; COMMIT", &["BEGIN", "SELECT 1", "COMMIT"]),
-            ("SAVEPOINT", &["BEGIN", "SAVEPOINT a"]),
-            ("RELEASE", &["RELEASE a", "COMMIT"]),
+            ("BEGIN; SELECT 1; COMMIT", &["BEGIN", "SELECT 1", "COMMIT"][..]),
+            ("SAVEPOINT", &["BEGIN", "SAVEPOINT a"][..]),
+            ("RELEASE", &["RELEASE a", "COMMIT"][..]),
             // A multi-statement query: its implicit block ends through end_implicit's commit,
             // which runs publish (D-M1: a single statement runs in autocommit and never did).
-            ("an implicit block", &["INSERT INTO t VALUES (1); SELECT 1"]),
-            ("SET lock_timeout to its value", &["SET lock_timeout = 0"]),
-            ("SET client_min_messages", &["SET client_min_messages TO notice"]),
-            ("SET lock_timeout", &["SET lock_timeout = '1s'"]),
+            ("an implicit block", &["INSERT INTO t VALUES (1); SELECT 1"][..]),
+            ("SET lock_timeout to its value", &["SET lock_timeout = 0"][..]),
+            ("SET client_min_messages", &["SET client_min_messages TO notice"][..]),
+            ("SET lock_timeout", &["SET lock_timeout = '1s'"][..]),
         ];
         for (label, sqls) in events.drain(..) {
             let before = conn.inner().prepare_context_generation();
