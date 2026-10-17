@@ -2152,6 +2152,20 @@ pub(crate) static RETIRE_TAKES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static RETIRE_TAKES_WITH_CHILDREN: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 pub(crate) static RETIRE_TAKE_ALLOCS: AtomicU64 = AtomicU64::new(0);
+/// Test builds: ONE way every capture check fails (review m1-2 MED-A, DECISIONS bda6df71dc): the
+/// failure is printed and recorded for the test that forced the check, and a whole run under
+/// `FE_CAPTURE_VERIFY` stops at once (`abort`), so no later test can pass over it. Never a panic:
+/// these checks run under the store mutex, often on the checkpoint worker, whose `catch_unwind`
+/// would swallow it and leave the install half done.
+#[cfg(test)]
+fn capture_check_failed(e: String) {
+    eprintln!("{e}");
+    CAPTURE_VERIFY_FAILURES.lock().unwrap_or_else(|p| p.into_inner()).push(e);
+    if std::env::var_os("FE_CAPTURE_VERIFY").is_some() {
+        std::process::abort();
+    }
+}
+
 /// Test builds: installs whose writer-read lease floor the capture check compared (review M1 LOW-3).
 #[cfg(test)]
 pub(crate) static LEASE_FLOORS_VERIFIED: AtomicU64 = AtomicU64::new(0);
@@ -4213,13 +4227,7 @@ fn run_flight(
         #[cfg(test)]
         if let Some(want) = cap.verify.take() {
             if let Err(e) = verify_frozen_rows(want, &rows) {
-                // Recorded for the test that forced the check; a whole run under FE_CAPTURE_VERIFY
-                // stops at once, so no later test can pass over it.
-                eprintln!("{e}");
-                CAPTURE_VERIFY_FAILURES.lock().unwrap_or_else(|p| p.into_inner()).push(e);
-                if std::env::var_os("FE_CAPTURE_VERIFY").is_some() {
-                    std::process::abort();
-                }
+                capture_check_failed(e);
             }
         }
         #[cfg(test)]
@@ -11731,15 +11739,9 @@ impl StoreInner {
                 LEASE_FLOORS_VERIFIED.fetch_add(1, Ordering::Relaxed);
                 match cat.catalog.lease_min() {
                     Ok(at_install) if at_install == after => {}
-                    found => {
-                        let e = format!(
-                            "FE_CAPTURE_VERIFY: the lease floor read after the checkpoint's commit ({after:?}) is not the catalog's at its install ({found:?})"
-                        );
-                        CAPTURE_VERIFY_FAILURES.lock().unwrap_or_else(|p| p.into_inner()).push(e.clone());
-                        if std::env::var_os("FE_CAPTURE_VERIFY").is_some() {
-                            panic!("{e}");
-                        }
-                    }
+                    found => capture_check_failed(format!(
+                        "FE_CAPTURE_VERIFY: the lease floor read after the checkpoint's commit ({after:?}) is not the catalog's at its install ({found:?})"
+                    )),
                 }
             }
         }
