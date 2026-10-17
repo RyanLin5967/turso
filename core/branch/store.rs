@@ -6221,6 +6221,12 @@ impl BranchStore {
             all.freed_pages += pass.freed_pages;
             all.reaped.extend(pass.reaped);
             if !more {
+                // Mutant `expire_start_unsent` (test builds only; review M1 LOW-4): this hold's
+                // owed start is dropped before its unlock, so only the expiry pass on demand sends
+                // none, as at f147be4c2, while every other path still sends its own.
+                if fe_mutant("expire_start_unsent") {
+                    self.inner.start_due.store(false, Ordering::Release);
+                }
                 return Ok(all);
             }
         }
