@@ -9861,6 +9861,59 @@ fn a_refusing_answer_s_table_is_not_freed_under_the_store_mutex() {
     assert_eq!(freed, 0, "CLAIM: a note freed {freed} bytes under the store mutex (a refusing answer's table)");
 }
 
+/// Review m1-2c N1 (DECISIONS 0f341519ea): a shrink's rebuild held at its scan (`Building` with the
+/// shrink's table as its old answer, and the spare its seed hold installed); a burst of fresh names
+/// fills that table until it refuses a note. At d94431cbe the refusal ended the answer, and every
+/// create until Draining asked the catalog; the spare is there to take it. After the refusal, a
+/// fresh name must run no catalog statement, and no held name is answered absent.
+#[test]
+fn a_named_create_after_a_building_answer_refuses_asks_the_catalog_nothing() {
+    use super::store::{HOLD_ARRIVED, NAME_SCAN_HOLD};
+    use std::sync::atomic::Ordering::{Acquire, Release};
+    let _s = serial();
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            NAME_SCAN_HOLD.store(0, Release);
+        }
+    }
+    let _r = Reset;
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("building-refusal-asks.db"), opts(true, SyncClass::Off));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    trunk.create_branch("held").unwrap();
+    db.branch_wait_name_filter();
+    NAME_SCAN_HOLD.store(1, Release);
+    let t = std::time::Instant::now();
+    let mut n = 0u32;
+    while NAME_SCAN_HOLD.load(Acquire) != 1 | HOLD_ARRIVED {
+        let name = format!("cycle-{n:05}");
+        trunk.create_branch(&name).unwrap();
+        db.drop_branch(&name).unwrap();
+        n += 1;
+        assert!(t.elapsed() < std::time::Duration::from_secs(30), "premise: no natural shrink's rebuild reached its scan ({n} cycles)");
+    }
+    let refused0 = db.branches.name_filter_refusals_for_test().1;
+    let mut names = Vec::new();
+    while db.branches.name_filter_refusals_for_test().1 == refused0 {
+        let name = format!("burst-{n:05}");
+        trunk.create_branch(&name).unwrap();
+        names.push(name);
+        n += 1;
+        assert!(n < 1 << 20, "premise: the old table never refused a note");
+    }
+    let s0 = super::budget_probe::thread_cat_stmts();
+    trunk.create_branch("after-refusal").unwrap();
+    let asked = super::budget_probe::thread_cat_stmts() - s0;
+    names.push("after-refusal".to_string());
+    let said_absent: Vec<&String> = names.iter().filter(|n| db.branches.name_filter_says_absent_for_test(n)).collect();
+    NAME_SCAN_HOLD.store(0, Release);
+    db.branch_wait_name_filter();
+    assert!(said_absent.is_empty(), "CLAIM: {} held names answered absent after the refusal: {:?}", said_absent.len(), &said_absent[..said_absent.len().min(8)]);
+    assert_eq!(asked, 0, "CLAIM: a fresh name ran {asked} catalog statements after a Building answer's table refused a note");
+}
+
 /// Class (e), the store mutex's lifecycle audit (DECISIONS 994f7d41e0; the lead's order with
 /// nf-adversary-2's MED-2 and M4 folded in): every store-mutex hold on the create path does NO syscall,
 /// NO allocation and NO catalog statement. One instrument for the whole class: every outermost hold
