@@ -10093,10 +10093,50 @@ fn diag_the_create_hold_stall_is_a_checkpoint_start() {
     // After L2(d)'s owed start the claim is structural: no create's hold runs any part of a
     // checkpoint's start (no `compact.flight_starting` or `capture.*` trace point in any of the
     // 16,384 holds). Mutant `flight_start_inline` (the start back in the create's hold) puts them
-    // back. The worst create's allocations are printed, not bounded here (17 measured: its own
-    // apply, raw l100).
-    let _ = (in_start, over_64);
+    // back. The worst create's allocations are printed (17 measured: its own apply, raw l100), and
+    // slice 1's bound stays asserted (review L2d M4: 969e7a370 had dropped it): no create over 64.
+    let _ = in_start;
     assert_eq!(started_in_a_create, 0, "CLAIM: {started_in_a_create} creates ran a checkpoint's start in their store-mutex hold (worst: [{}])", steps.join(" "));
+    assert_eq!(over_64, 0, "CLAIM: {over_64} of 16,384 creates made more than 64 held allocations (worst {total}: [{}])", steps.join(" "));
+}
+
+/// Review REVIEW-claude-engine-L2d M4: slice 3's claim (969e7a370) gated, not only in the ignored
+/// diag above. 512 named creates on a fuzzy catalog store at an 8 KiB threshold, each create's
+/// store-mutex hold traced (`HELD_TRACE`): none runs any part of a checkpoint's start (no
+/// `compact.flight_starting` or `capture.*` point). Premise: checkpoints were captured meanwhile
+/// (`CAPTURE_ENTERED` rose), so the starts happened, elsewhere. Mutant `flight_start_inline`.
+#[test]
+fn no_create_runs_a_checkpoint_start_in_its_store_mutex_hold() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(
+        &dir.path().join("no-start-in-create.db"),
+        opts(true, SyncClass::Fsync).with_branch_checkpoint(super::BranchCheckpoint::Fuzzy),
+    );
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let _t = Threshold::set(8 << 10);
+    let captures0 = super::store::CAPTURE_ENTERED.load(Relaxed);
+    let mut started_in = Vec::new();
+    for i in 0..512u32 {
+        let name = format!("g-{i:04}");
+        super::store::HELD_TRACE.with(|t| *t.borrow_mut() = Some(Vec::with_capacity(64)));
+        trunk.create_branch(&name).unwrap();
+        let trace = super::store::HELD_TRACE.with(|t| t.borrow_mut().take()).unwrap_or_default();
+        if trace.iter().any(|(l, _, _)| *l == "compact.flight_starting" || l.starts_with("capture.")) {
+            started_in.push(name);
+        }
+    }
+    db.branch_checkpoint_wait();
+    let captures = super::store::CAPTURE_ENTERED.load(Relaxed) - captures0;
+    assert!(captures >= 1, "premise: no checkpoint was captured during 512 creates past an 8 KiB threshold");
+    assert!(
+        started_in.is_empty(),
+        "CLAIM: {} of 512 creates ran a checkpoint's start in their store-mutex hold ({captures} captures): {:?}",
+        started_in.len(),
+        &started_in[..started_in.len().min(8)]
+    );
 }
 
 /// Codex C25 HIGH 1 at the store (lead order 00: its "crash arm"): the background writer held after
