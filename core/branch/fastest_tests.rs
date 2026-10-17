@@ -9350,6 +9350,55 @@ fn a_named_create_during_a_natural_filter_shrink_asks_the_catalog_nothing() {
     assert_eq!(asked, 0, "CLAIM: a named create of a fresh name ran {asked} catalog statements during a natural filter shrink's rebuild ({n} cycles)");
 }
 
+/// Lead order (a), the filter-fallback proof's third natural path (artie engine NOTES df996a0f91,
+/// case 3): after every reopen of a catalog store the filter is Unbuilt and then Building with no
+/// table until the open's build lands, so every named create meanwhile runs a catalog statement
+/// under the store mutex. The build is held after Building began (stage 7); a fresh name created
+/// there must ask the catalog nothing. REGISTERED RED with no fix written: the fix is a LEAP (the
+/// filter carried in the checkpoint, so an open starts Ready).
+#[test]
+fn a_named_create_before_the_open_s_filter_build_lands_asks_the_catalog_nothing() {
+    use super::store::{FILTER_PAUSED, FILTER_PAUSE_AT};
+    use std::sync::atomic::Ordering::{Acquire, Release};
+    let _s = serial();
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FILTER_PAUSE_AT.store(0, Release);
+            FILTER_PAUSED.store(0, Release);
+        }
+    }
+    let _r = Reset;
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("filter-open-asks.db");
+    let incarnation = {
+        let db = open_at(&path, opts(true, SyncClass::Fsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        for i in 0..64 {
+            trunk.create_branch(&format!("kept-{i:02}")).unwrap();
+        }
+        db.branch_compact_now().unwrap();
+        db.incarnation
+    };
+    FILTER_PAUSE_AT.store(7, Release);
+    let db = reopen(&path, opts(true, SyncClass::Fsync), incarnation);
+    let t = std::time::Instant::now();
+    while FILTER_PAUSED.load(Acquire) != 7 {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        assert!(t.elapsed() < std::time::Duration::from_secs(30), "premise: the open's filter build never began");
+    }
+    let trunk = db.connect().unwrap();
+    let s0 = super::budget_probe::thread_cat_stmts();
+    trunk.create_branch("after-open").unwrap();
+    let asked = super::budget_probe::thread_cat_stmts() - s0;
+    let taken = trunk.create_branch("kept-07").is_err();
+    FILTER_PAUSE_AT.store(0, Release);
+    db.branch_wait_name_filter();
+    assert!(taken, "CLAIM: a checkpointed name was given again before the open's filter build landed");
+    assert_eq!(asked, 0, "CLAIM: a named create of a fresh name ran {asked} catalog statements before the open's filter build landed");
+}
+
 /// Class (e), the store mutex's lifecycle audit (DECISIONS 994f7d41e0; the lead's order with
 /// nf-adversary-2's MED-2 and M4 folded in): every store-mutex hold on the create path does NO syscall,
 /// NO allocation and NO catalog statement. One instrument for the whole class: every outermost hold
