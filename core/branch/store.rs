@@ -2846,6 +2846,11 @@ struct NameFilter {
     /// (`Building::old`, `Overflowed`'s), in this store.
     stale_refusals: u64,
     answers_refused: u64,
+    /// Tables a note let go of (a refusal's), parked here so no table is freed under the store
+    /// mutex (review m1-2b LOW-F2): the create that noted takes them with its owed work and drops
+    /// them after its unlock (`take_retired`). Four slots, more than one hold ever retires (an
+    /// answer holds three tables); a fifth would be freed in place.
+    retired: [Option<Arc<FilterTable>>; 4],
 }
 
 /// The keys a refusal's spare table holds before it refuses too (`NameFilter::spare`): the notes of
@@ -2993,10 +2998,13 @@ impl NameFilter {
         };
         if answer_refused {
             self.answers_refused += 1;
-            match &mut self.state {
-                FilterState::Building { old, .. } => *old = None,
-                FilterState::Overflowed { answer } => *answer = None,
-                _ => {}
+            let ended = match &mut self.state {
+                FilterState::Building { old, .. } => old.take(),
+                FilterState::Overflowed { answer } => answer.take(),
+                _ => None,
+            };
+            if let Some(a) = ended {
+                self.retire_answer(a);
             }
         }
         if !fits {
@@ -3017,7 +3025,8 @@ impl NameFilter {
                 FilterState::Ready { table } => self.spill([Some(table), None], h),
                 // Notes go into both: if the old table took `h` it is still complete, else it and
                 // the spare (the pending one holds nothing the old one lacks but `h`).
-                FilterState::Growing { table, .. } => {
+                FilterState::Growing { table, pending } => {
+                    self.retire_table(pending);
                     if table.contains(h) {
                         Some(Answer::of(table))
                     } else {
@@ -3028,14 +3037,19 @@ impl NameFilter {
                 FilterState::Draining { table, pending } => self.spill([Some(table), Some(pending)], h),
                 FilterState::Stale { answer } => {
                     self.stale_refusals += 1;
-                    match answer.fixed {
-                        [None, None] => self.spill([Some(answer.sink), None], h),
-                        _ => None,
+                    if answer.fixed.iter().all(Option::is_none) {
+                        self.spill([Some(answer.sink), None], h)
+                    } else {
+                        self.retire_answer(answer);
+                        None
                     }
                 }
                 // The build cannot complete; what answered still does (it took `h`, or it was
                 // dropped above).
-                FilterState::Building { old, .. } => old,
+                FilterState::Building { old, pending } => {
+                    self.retire_table(pending);
+                    old
+                }
                 FilterState::Unbuilt | FilterState::Overflowed { .. } => None,
             }
         };
@@ -3043,10 +3057,41 @@ impl NameFilter {
         self.owed = Some(FilterWork::Rebuild);
     }
 
-    /// `fixed` with the spare holding `h` as its sink, if a spare is kept and takes `h`.
+    /// `fixed` with the spare holding `h` as its sink, if a spare is kept and takes `h`; otherwise
+    /// `fixed` is retired (`retired`), not freed here.
     fn spill(&mut self, fixed: [Option<Arc<FilterTable>>; 2], h: u64) -> Option<Answer> {
-        let sink = self.spare.take()?;
-        sink.insert(h).then_some(Answer { fixed, sink })
+        let Some(sink) = self.spare.take() else {
+            for t in fixed.into_iter().flatten() {
+                self.retire_table(t);
+            }
+            return None;
+        };
+        if sink.insert(h) {
+            Some(Answer { fixed, sink })
+        } else {
+            self.retire_answer(Answer { fixed, sink });
+            None
+        }
+    }
+
+    /// Park a table this hold let go of, to be freed after the mutex (`retired`).
+    fn retire_table(&mut self, t: Arc<FilterTable>) {
+        if let Some(slot) = self.retired.iter_mut().find(|s| s.is_none()) {
+            *slot = Some(t);
+        }
+    }
+
+    fn retire_answer(&mut self, a: Answer) {
+        let Answer { fixed, sink } = a;
+        self.retire_table(sink);
+        for t in fixed.into_iter().flatten() {
+            self.retire_table(t);
+        }
+    }
+
+    /// The tables this store's holds let go of, for the caller to drop after its unlock.
+    fn take_retired(&mut self) -> [Option<Arc<FilterTable>>; 4] {
+        std::mem::take(&mut self.retired)
     }
 
     /// A held name was released (`live`). The table keeps its key: a filter only ever answers
@@ -7445,7 +7490,10 @@ impl BranchStore {
         self.maybe_compact(&mut inner);
         held_trace("fork.done");
         let work = inner.names.filter.take_owed();
+        // Tables a refusal let go of, freed after the unlock (review m1-2b LOW-F2).
+        let retired = inner.names.filter.take_retired();
         drop(inner);
+        drop(retired);
         self.start_filter_work(work);
         Ok(TrunkFork::Forked { id, lsn, after })
     }
@@ -7527,7 +7575,10 @@ impl BranchStore {
         self.sync_lease_flag(&inner);
         self.maybe_compact(&mut inner);
         let work = inner.names.filter.take_owed();
+        // Tables a refusal let go of, freed after the unlock (review m1-2b LOW-F2).
+        let retired = inner.names.filter.take_retired();
         drop(inner);
+        drop(retired);
         self.start_filter_work(work);
         Ok((id, lsn))
     }
