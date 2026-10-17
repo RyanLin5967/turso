@@ -3230,6 +3230,36 @@ impl NameFilter {
         }
     }
 
+    /// Every table the filter holds, labelled, for the memory listing: the state's tables (an
+    /// answer's sink and fixed ones included), the spare and the retired ones. At most nine.
+    fn every_table(&self) -> impl Iterator<Item = (&'static str, &Arc<FilterTable>)> {
+        let answer = |a: &'_ Answer| -> [Option<(&'static str, &Arc<FilterTable>)>; 3] {
+            [
+                Some(("names.filter.answer_sink", &a.sink)),
+                a.fixed[0].as_ref().map(|t| ("names.filter.answer_fixed", t)),
+                a.fixed[1].as_ref().map(|t| ("names.filter.answer_fixed", t)),
+            ]
+        };
+        let state: [Option<(&'static str, &Arc<FilterTable>)>; 4] = match &self.state {
+            FilterState::Unbuilt | FilterState::Overflowed { answer: None } => [None, None, None, None],
+            FilterState::Ready { table } => [Some(("names.filter.table", table)), None, None, None],
+            FilterState::Growing { table, pending } | FilterState::Draining { table, pending } => {
+                [Some(("names.filter.table", table)), Some(("names.filter.pending", pending)), None, None]
+            }
+            FilterState::Building { pending, old } => {
+                let [a, b, c] = old.as_ref().map_or([None, None, None], answer);
+                [Some(("names.filter.pending", pending)), a, b, c]
+            }
+            FilterState::Stale { answer: a } | FilterState::Overflowed { answer: Some(a) } => {
+                let [x, y, z] = answer(a);
+                [x, y, z, None]
+            }
+        };
+        let spare = self.spare.as_ref().map(|t| ("names.filter.spare", t));
+        let retired = self.retired.iter().map(|t| t.as_ref().map(|t| ("names.filter.retired", t)));
+        state.into_iter().chain(std::iter::once(spare)).chain(retired).flatten()
+    }
+
     fn entries(&self) -> u64 {
         self.tables().0.map_or(0, |t| t.len() as u64)
     }
@@ -9331,12 +9361,10 @@ impl BranchStore {
         // 0-byte listing of 4cb167221 blinded the regrowth test). They are grown by
         // `grow_name_filter` on its own thread, off the mutex, which the regrowth test attributes
         // by the create's own held allocations.
-        let (table, pending) = inner.names.filter.tables();
-        if let Some(t) = table {
-            out.push(("names.filter.table", t.cap(), t.cap() * 8));
-        }
-        if let Some(p) = pending {
-            out.push(("names.filter.pending", p.cap(), p.cap() * 8));
+        // Every table the filter holds, an answer's fixed tables and the spare included (review
+        // m1-2c N5: `tables()` names only two).
+        for (label, t) in inner.names.filter.every_table() {
+            out.push((label, t.cap(), t.cap() * 8));
         }
         if let Some(cat) = inner.cat.as_ref() {
             // An ordered map: no regrowth, nodes of a few entries each (L2 slope, red e2b119cb6).

@@ -4047,6 +4047,7 @@ fn the_name_filter_stays_bounded_under_churn() {
     let (built, entries, _, _, _) = db.branch_name_filter_stats();
     let moved = db.branches.name_filter_held_moves_for_test();
     assert!(built, "premise: the name filter is built");
+    assert_eq!(db.branches.name_filter_state_for_test().0, "Ready", "premise (review m1-2c N5): built means Ready, not Stale or an overflow's answer");
     assert!(
         moved <= 4 * n / 256 + 64,
         "one insert into the name filter moved {moved} entries ({n} names created)"
@@ -4078,6 +4079,7 @@ fn a_failed_name_scan_is_retried() {
     let (built, _, _, builds, failed) = db.branch_name_filter_stats();
     assert_eq!(failed, 1, "the failed scan was not counted");
     assert!(built && builds == 1, "the name filter was not built after its scan failed once");
+    assert_eq!(db.branches.name_filter_state_for_test().0, "Ready", "premise (review m1-2c N5): built means Ready, not Stale or an overflow's answer");
     assert!(db.connect().unwrap().create_branch("held").is_err(), "a held name was given again");
 }
 
@@ -4198,6 +4200,7 @@ fn every_held_name_reaches_the_name_filter() {
         super::store::NAME_SCAN_HOLD.store(0, O::Release);
         db.branch_wait_name_filter();
         assert!(db.branch_name_filter_stats().0, "{arm}: premise: the name filter is built");
+        assert_eq!(db.branches.name_filter_state_for_test().0, "Ready", "{arm}: premise (review m1-2c N5): built means Ready");
         db.branch_set_resident_cap(Some(0));
         db.branch_compact_now().unwrap();
         assert!(trunk.create_branch("x").is_err(), "{arm}: an evicted held name was given again");
@@ -10210,6 +10213,7 @@ fn the_name_filter_lists_its_real_bytes_and_records_its_growth() {
     db.branch_wait_name_filter();
     let (built, entries, moved_max, builds, _) = db.branches.name_filter_stats();
     assert!(built && entries >= 1_500, "premise: the filter holds the 1,500 names ({entries})");
+    assert_eq!(db.branches.name_filter_state_for_test().0, "Ready", "premise (review m1-2c N5): built means Ready, not Stale or an overflow's answer");
     assert!(builds >= 1, "premise: the filter grew past its first table ({builds} growths)");
     let listed: Vec<_> = db
         .branches
@@ -10351,6 +10355,7 @@ fn a_named_create_allocates_nothing_in_the_name_filter_as_it_grows() {
     db.branch_wait_name_filter();
     let (built, entries0, _, builds0, _) = db.branches.name_filter_stats();
     assert!(built && entries0 >= 10_000, "premise: the reopened store's name filter was built from its 10,000 names ({entries0})");
+    assert_eq!(db.branches.name_filter_state_for_test().0, "Ready", "premise (review m1-2c N5): built means Ready, not Stale or an overflow's answer");
     let trunk = db.connect().unwrap();
     let before = super::store::FILTER_NOTE_ALLOCS.load(Relaxed);
     for i in 0..8_000 {
@@ -10367,6 +10372,7 @@ fn a_named_create_allocates_nothing_in_the_name_filter_as_it_grows() {
     }
     let (built, entries, _, builds, _) = db.branches.name_filter_stats();
     assert!(built && entries >= 18_000, "the name filter stopped answering, or lost names, as it grew: built {built}, {entries} entries");
+    assert_eq!(db.branches.name_filter_state_for_test().0, "Ready", "premise (review m1-2c N5): built means Ready, not Stale or an overflow's answer");
     assert!(builds > builds0, "premise: the name filter never grew past the table it was built with ({builds0} -> {builds} builds)");
 }
 
