@@ -238,10 +238,9 @@ pub(crate) struct BranchStore {
     prewarm: PrewarmStats,
     /// The fuzzy checkpoints' persistent worker (`CkptWorker`), started at the first checkpoint
     /// and joined at `Drop`; `flight_jobs` counts the checkpoints handed to it and finished, for
-    /// `join_flights` (F-FZ: `compact_now` and `Drop` wait for every one started so far).
-    ckpt_worker: Arc<Mutex<Option<CkptWorker>>>,
-    /// Set as the store's close begins: the starter of owed checkpoints sends none after it.
-    closing: Arc<AtomicBool>,
+    /// `join_flights` (F-FZ: `compact_now` and `Drop` wait for every one started so far). Closed
+    /// by `Drop`, after which nothing is handed out and no worker starts (`WorkerSlot`).
+    ckpt_worker: Arc<Mutex<WorkerSlot>>,
     flight_jobs: Arc<(std::sync::Mutex<(u64, u64)>, std::sync::Condvar)>,
     /// The confirmation writer (`run_confirm_writer`; review 6 #1) and the process that started it
     /// (a fork(2) child has no such thread to join): `None` for a volatile or trunk-only store, and
@@ -3862,18 +3861,24 @@ fn settle_start(over_hard: &AtomicBool, inner: &mut StoreInner, started: FlightS
     }
 }
 
-/// The checkpoint worker's start of an owed fuzzy checkpoint (`StoreMutex::starter`):
-/// its capture in a store-mutex hold of the worker's own, then, with the mutex let go, the flight
-/// itself on this same thread (it is the worker already). Nothing if the log no longer wants a
-/// checkpoint (a start that failed since backed it off, or one ran).
 /// `BranchStore::dispatch_flight`, given the worker and its job counts (also the starter of owed
 /// checkpoints', `BranchStore::install_starter`).
 fn dispatch_to(
-    ckpt_worker: &Mutex<Option<CkptWorker>>,
+    ckpt_worker: &Mutex<WorkerSlot>,
     flight_jobs: &Arc<(std::sync::Mutex<(u64, u64)>, std::sync::Condvar)>,
     job: CkptJob,
 ) -> std::io::Result<()> {
+    let mut slot = ckpt_worker.lock();
+    // Closed (the store's `Drop` joined its worker): nothing is handed out and no worker starts,
+    // whoever still holds the store mutex and sends (review REVIEW-claude-engine-M1 MED-1: a
+    // send that passed a separate `closing` check started a new, unjoined worker after the join).
+    // Decided under the slot's lock, which `Drop` closes it under. Mutant `worker_after_close`
+    // (test builds only): not refused, as at c1809b546.
+    if slot.closed && !fe_mutant("worker_after_close") {
+        return Err(std::io::Error::other("the branch store is closed"));
+    }
     if fe_mutant("checkpoint_thread_per_flight") {
+        drop(slot);
         let jobs = flight_jobs.clone();
         jobs.0.lock().unwrap_or_else(|e| e.into_inner()).0 += 1;
         let handle = crate::thread::Builder::new().name("branch-checkpoint".to_string()).spawn(move || {
@@ -3882,7 +3887,7 @@ fn dispatch_to(
         });
         return handle.map(drop).inspect_err(|_| CkptWorker::finished(&flight_jobs));
     }
-    let mut worker = ckpt_worker.lock();
+    let worker = &mut slot.worker;
     let pid = std::process::id();
     if worker.as_ref().is_some_and(|w| w.pid != pid) {
         // The parent's thread does not exist in this process: never joined, never sent to.
@@ -3915,6 +3920,18 @@ fn dispatch_to(
     Err(std::io::Error::other("the branch catalog checkpoint worker could not be started"))
 }
 
+/// The checkpoint worker's place in its store: none yet (started at the first checkpoint), one,
+/// or closed for good by the store's `Drop` (`dispatch_to` refuses then).
+#[derive(Default)]
+struct WorkerSlot {
+    worker: Option<CkptWorker>,
+    closed: bool,
+}
+
+/// The checkpoint worker's start of an owed fuzzy checkpoint (`StoreMutex::starter`):
+/// its capture in a store-mutex hold of the worker's own, then, with the mutex let go, the flight
+/// itself on this same thread (it is the worker already). Nothing if the log no longer wants a
+/// checkpoint (a start that failed since backed it off, or one ran).
 fn run_owed_start(ctx: FlightCtx) {
     let flight = {
         let mut inner = ctx.inner.lock();
@@ -4266,7 +4283,7 @@ impl CkptWorker {
 pub(crate) struct StarterProbe {
     store: Arc<StoreMutex>,
     jobs: Arc<(std::sync::Mutex<(u64, u64)>, std::sync::Condvar)>,
-    closing: Arc<AtomicBool>,
+    slot: Arc<Mutex<WorkerSlot>>,
 }
 
 #[cfg(test)]
@@ -4291,7 +4308,7 @@ impl StarterProbe {
         self.jobs.0.lock().unwrap_or_else(|e| e.into_inner()).0
     }
     pub(crate) fn closed(&self) -> bool {
-        self.closing.load(Ordering::Acquire)
+        self.slot.lock().closed
     }
 }
 
@@ -4675,8 +4692,7 @@ impl BranchStore {
         let store = Self {
             inner: Arc::new(StoreMutex::new(StoreInner::fresh(None, SyncClass::Off, None))),
             prewarm: PrewarmStats::default(),
-            ckpt_worker: Arc::new(Mutex::new(None)),
-            closing: Arc::new(AtomicBool::new(false)),
+            ckpt_worker: Arc::new(Mutex::new(WorkerSlot::default())),
             flight_jobs: Arc::new((std::sync::Mutex::new((0, 0)), std::sync::Condvar::new())),
             confirm_writer: Mutex::new(None),
             name_filter_build: Mutex::new(Vec::new()),
@@ -4982,8 +4998,7 @@ impl BranchStore {
             gate_closed: (std::sync::Mutex::new(()), std::sync::Condvar::new()),
             inner: Arc::new(StoreMutex::new(inner)),
             prewarm: warmed,
-            ckpt_worker: Arc::new(Mutex::new(None)),
-            closing: Arc::new(AtomicBool::new(false)),
+            ckpt_worker: Arc::new(Mutex::new(WorkerSlot::default())),
             flight_jobs: Arc::new((std::sync::Mutex::new((0, 0)), std::sync::Condvar::new())),
             confirm_writer: Mutex::new(None),
             name_filter_build: Mutex::new(Vec::new()),
@@ -6411,8 +6426,8 @@ impl BranchStore {
     }
 
     /// Install the store's starter of owed checkpoints (`StoreMutex::starter`): it hands
-    /// `run_owed_start` to the checkpoint worker. Holds the store mutex weakly (the mutex owns it),
-    /// and does nothing once the store is closing (`closing`).
+    /// `run_owed_start` to the checkpoint worker. Holds the store mutex weakly (the mutex owns it);
+    /// once the store has closed its worker slot, `dispatch_to` refuses the start.
     fn install_starter(&self) {
         let shared = Arc::downgrade(&self.inner);
         let group = self.group.clone();
@@ -6423,11 +6438,7 @@ impl BranchStore {
         let installs = self.installs.clone();
         let worker = self.ckpt_worker.clone();
         let jobs = self.flight_jobs.clone();
-        let closing = self.closing.clone();
         let _ = self.inner.starter.set(Box::new(move || {
-            if closing.load(Ordering::Acquire) {
-                return;
-            }
             let Some(inner) = shared.upgrade() else {
                 return;
             };
@@ -6452,7 +6463,7 @@ impl BranchStore {
     /// REVIEW-claude-engine-M1 MED-1), as a filter or confirmation thread's `Arc` does.
     #[cfg(test)]
     pub(crate) fn starter_probe(&self) -> StarterProbe {
-        StarterProbe { store: self.inner.clone(), jobs: self.flight_jobs.clone(), closing: self.closing.clone() }
+        StarterProbe { store: self.inner.clone(), jobs: self.flight_jobs.clone(), slot: self.ckpt_worker.clone() }
     }
 
     /// F-FZ: start a fuzzy checkpoint unless one is in flight. Parked Commits (C-R) are settled
@@ -9818,13 +9829,20 @@ impl Drop for BranchStore {
     /// (A crash loses the time since the last stamp, which extends leases and never shortens one.)
     /// A fuzzy checkpoint in flight is finished first: its thread holds the store's files.
     fn drop(&mut self) {
-        self.closing.store(true, Ordering::Release);
         self.flight_hold.store(0, Ordering::Release);
         #[cfg(test)]
         self.group.confirm_hold.store(0, Ordering::Release);
         self.join_flights();
-        // The worker stops once its channel closes; joined only in the process that started it.
-        if let Some(w) = self.ckpt_worker.lock().take() {
+        // The slot closes under its lock, so no start sent from now on hands anything out or starts
+        // a worker (review M1 MED-1); the worker is joined outside that lock, so a sender waiting
+        // on it never waits on the join. It stops once its channel closes (the jobs already
+        // queued run first); joined only in the process that started it.
+        let worker = {
+            let mut slot = self.ckpt_worker.lock();
+            slot.closed = true;
+            slot.worker.take()
+        };
+        if let Some(w) = worker {
             if w.pid == std::process::id() {
                 drop(w.tx);
                 if w.handle.join().is_err() {
