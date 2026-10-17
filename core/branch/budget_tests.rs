@@ -3085,15 +3085,20 @@ fn create_logs_its_record_and_one_flight_end() {
 /// allocator, prints, reads the environment, or calls `fe_mutant` (whose first call reads it; the
 /// path asks `budget_probe::mutant_on`, primed outside any window). A line marked `lint-allow:`
 /// with its reason is skipped. Bodies are found at a definition (a line starting `fn`, `pub fn` or
-/// `pub(crate) fn`, the name followed by `(` or `<`), and braces inside strings, char literals and
-/// comments are not counted.
+/// `pub(crate) fn`, each optionally `unsafe`, the name followed by `(` or `<`), and braces inside
+/// strings, char literals and comments are not counted.
 ///
-/// Counters review 4 LOW-C, the scope: the bodies listed below, which are the window and hold paths
-/// and their callees (the counting allocator's hooks, the thread-table readers, the scope lookups,
-/// the harness's in-window waits and confirm reads) EXCEPT `prime` and `window_diagnostics` (which
-/// allocate by design, before a window's first count and after its last) and `ran_between` (called
-/// only from `window_diagnostics`). Its blind spots: a callee not listed here, a raw string holding
-/// `"` or `\`, and an escaped-quote char literal (`'\''`) are not parsed.
+/// Counters review 4 LOW-C and review 5, the scope: the bodies listed below, which are the window
+/// and hold paths and their callees (the counting allocator's hooks: `note_alloc`, `record_alloc`,
+/// `record_free` and the `GlobalAlloc` methods `alloc`, `alloc_zeroed`, `realloc`, `dealloc`; the
+/// thread-table readers; the scope lookups; the harness's in-window waits and confirm reads) EXCEPT
+/// `prime`, `arm` and `window_diagnostics` and `ran_between` (called only from `window_diagnostics`).
+/// `window_diagnostics` allocates by design, after a window's last count. `prime` reads the
+/// environment by design: first from `begin`, before any count, and again inside a window from
+/// `arm(true)`, where primed it must allocate nothing: that is checked dynamically, not here
+/// (`fc_held_5_syscalls_3_allocs`'s allocations outside its hold are 0). Its blind spots: a callee not
+/// listed here, a raw string holding `"` or `\`, and an escaped-quote char literal (`'\''`) are not
+/// parsed.
 #[test]
 fn nothing_on_the_probes_window_path_allocates() {
     const FORBIDDEN: [&str; 24] = [
@@ -3109,7 +3114,7 @@ fn nothing_on_the_probes_window_path_allocates() {
                 "begin", "end", "end_owning", "user_counts", "window_syncs", "attribute", "foreign_threads", "thread_table",
                 "shim_counts", "shim", "shim_lost", "unix_syscalls", "instructions", "store_locked_at", "store_unlocked_of",
                 "mutant_on", "threads", "others_blocked", "each_thread", "spinning", "bump", "record_alloc", "record_free",
-                "wal_lock_held", "persistent_live",
+                "wal_lock_held", "persistent_live", "note_alloc", "alloc", "alloc_zeroed", "realloc", "dealloc",
             ][..],
         ),
         ("budget_tests.rs", include_str!("budget_tests.rs"), &["absorb_confirm", "writer_settled", "spin_settled", "settled"][..]),
@@ -3124,7 +3129,7 @@ fn nothing_on_the_probes_window_path_allocates() {
     let mut read = 0;
     for (file, src, fns) in sources {
         for name in fns {
-            let heads = ["fn ", "pub fn ", "pub(crate) fn "].map(|v| format!("{v}{name}"));
+            let heads = ["fn ", "pub fn ", "pub(crate) fn ", "unsafe fn ", "pub unsafe fn ", "pub(crate) unsafe fn "].map(|v| format!("{v}{name}"));
             let opens = |rest: &str| heads.iter().any(|h| rest.starts_with(h.as_str()) && matches!(rest.as_bytes().get(h.len()), Some(b'(' | b'<')));
             let Some(at) = src.match_indices('\n').map(|(i, _)| i + 1).find(|&i| opens(src[i..].trim_start())) else {
                 let _ = writeln!(found, "  {file}: fn {name} not found");
@@ -3175,7 +3180,7 @@ fn nothing_on_the_probes_window_path_allocates() {
             }
         }
     }
-    assert_eq!(read, 38, "premise: every function on the window path was read:\n{found}");
+    assert_eq!(read, 43, "premise: every function on the window path was read:\n{found}");
     assert!(found.is_empty(), "the probe's window path allocates, prints, reads the environment or calls fe_mutant:\n{found}");
 }
 
