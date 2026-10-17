@@ -3148,8 +3148,8 @@ fn setting_auto_vacuum_moves_the_prepare_generation() {
 ///   encryption setters and the mvcc thresholds, unconditional (not comparable, or rare).
 /// - ext/mod.rs 4: extension registration (functions, vtabs), each a change.
 /// - mvcc/database/checkpoint_state_machine.rs 1: an unconditional schema reload, itself a change.
-/// - storage/pager.rs 1: rollback of a schema change. translate/pragma.rs 1: cache_spill, on a
-///   change. vdbe/execute.rs 3: savepoint schema restore, and the journal-mode switch's two
+/// - storage/pager.rs 1: rollback of a schema change. translate/pragma.rs 2: cache_spill and
+///   auto_vacuum, each on a change (review C42 LOW-4). vdbe/execute.rs 3: savepoint schema restore, and the journal-mode switch's two
 ///   Database-wide bumps (MV store installed, removed; review C42 MED-7). vdbe/mod.rs 1: an
 ///   abandoned MVCC commit's schema removed.
 /// - Also counted (review C42 LOW-6): a raw `prepare_context_generation.fetch_add(` on one line.
@@ -3160,7 +3160,7 @@ fn every_prepare_generation_bump_site_is_audited() {
         ("ext/mod.rs", 4),
         ("mvcc/database/checkpoint_state_machine.rs", 1),
         ("storage/pager.rs", 1),
-        ("translate/pragma.rs", 1),
+        ("translate/pragma.rs", 2),
         ("vdbe/execute.rs", 3),
         ("vdbe/mod.rs", 1),
     ];

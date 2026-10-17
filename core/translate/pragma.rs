@@ -556,7 +556,12 @@ fn update_pragma(
                     "invalid auto vacuum mode".to_string(),
                 ));
             };
+            // PRAGMA auto_vacuum compiles the mode in: a change re-prepares (review C42 LOW-4).
+            let changed = pager.get_auto_vacuum_mode() != auto_vacuum_mode;
             pager.persist_auto_vacuum_mode(auto_vacuum_mode)?;
+            if changed {
+                connection.bump_prepare_context_generation();
+            }
             let largest_root_page_number_reg = program.alloc_register();
             program.emit_insn(Insn::ReadCookie {
                 db: database_id,
