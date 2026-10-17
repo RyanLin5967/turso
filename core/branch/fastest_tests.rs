@@ -3209,18 +3209,79 @@ fn every_mv_store_install_or_removal_bumps_the_database_wide_generation() {
     assert!(unbumped.is_empty(), "CLAIM: MV-store installs or removals with no database-wide generation bump: {unbumped:?}");
 }
 
-/// The prepare-generation bump sites in one source file's text, as `every_prepare_generation_bump_
-/// site_is_audited` counts them.
+/// The prepare-generation bump sites in one source file's text, per enclosing function, as
+/// `every_prepare_generation_bump_site_is_audited` pins them (review c42b LOW-4). Read with comment
+/// lines dropped and all whitespace removed, so a call or a raw write rustfmt splits over lines is
+/// one site; a raw write is any atomic write method on the field; the bump functions' own bodies are
+/// their definitions, not sites. Each site is keyed by the nearest `fn NAME` above it.
+fn bump_sites(text: &str) -> std::collections::BTreeMap<String, usize> {
+    const WRITES: &[&str] = &["fetch_add(", "fetch_sub(", "fetch_max(", "fetch_or(", "fetch_update(", "store(", "swap("];
+    let lines: Vec<&str> = text.lines().collect();
+    let mut s = String::new();
+    let mut line_of = Vec::new();
+    for (i, l) in lines.iter().enumerate() {
+        if l.trim_start().starts_with("//") {
+            continue;
+        }
+        for c in l.chars().filter(|c| !c.is_whitespace()) {
+            line_of.extend(std::iter::repeat_n(i, c.len_utf8()));
+            s.push(c);
+        }
+    }
+    let definition = "fnbump_prepare_context_generation(&self){";
+    let mut from = 0;
+    while let Some(k) = s[from..].find(definition) {
+        let start = from + k;
+        let end = s[start..].find('}').map_or(s.len(), |e| start + e + 1);
+        s.replace_range(start..end, &"#".repeat(end - start));
+        from = end;
+    }
+    let mut patterns = vec!["bump_prepare_context_generation()".to_string()];
+    for close in ["", ")"] {
+        for w in WRITES {
+            patterns.push(format!("prepare_context_generation{close}.{w}"));
+        }
+    }
+    let fn_name = |line: &str| -> Option<String> {
+        let mut rest = line;
+        while let Some(k) = rest.find("fn ") {
+            let starts_word = !rest[..k].chars().next_back().is_some_and(|c| c.is_alphanumeric() || c == '_');
+            let after = &rest[k + 3..];
+            let name = &after[..after.find(|c: char| !(c.is_alphanumeric() || c == '_')).unwrap_or(after.len())];
+            if starts_word && !name.is_empty() {
+                return Some(name.to_string());
+            }
+            rest = after;
+        }
+        None
+    };
+    let mut sites = std::collections::BTreeMap::new();
+    for pattern in &patterns {
+        for (k, _) in s.match_indices(pattern.as_str()) {
+            let name = (0..=line_of[k])
+                .rev()
+                .filter(|&j| !lines[j].trim_start().starts_with("//"))
+                .find_map(|j| fn_name(lines[j]))
+                .unwrap_or_else(|| "?".to_string());
+            *sites.entry(name).or_insert(0) += 1;
+        }
+    }
+    sites
+}
+
+/// All of a file's bump sites (the planted-form red of review c42b LOW-4 counts with this).
 fn bump_site_count(text: &str) -> usize {
-    text.lines()
-        .map(str::trim)
-        .filter(|l| !l.starts_with("//") && !l.contains("fn bump_prepare_context_generation"))
-        .map(|l| {
-            l.matches("bump_prepare_context_generation()").count()
-                + l.matches("prepare_context_generation).fetch_add(").count()
-                + l.matches("prepare_context_generation.fetch_add(").count()
-        })
-        .sum()
+    bump_sites(text).values().sum()
+}
+
+/// Review c42b LOW-4, second half: the gate pins each site to its enclosing function, so a bump
+/// removed in one function and added in another of the same file changes what the gate sees.
+#[test]
+fn the_bump_site_scan_sees_a_site_move_between_functions_of_one_file() {
+    let before = "fn a(&self) {\n    self.bump_prepare_context_generation();\n}\nfn b(&self) {}\n";
+    let after = "fn a(&self) {}\nfn b(&self) {\n    self.bump_prepare_context_generation();\n}\n";
+    assert_eq!(bump_site_count(before), bump_site_count(after), "premise: the move keeps the count");
+    assert_ne!(bump_sites(before), bump_sites(after), "CLAIM: a bump moved between functions of one file is invisible to the scan");
 }
 
 /// Review c42b LOW-4: the bump-site scan counts every form a bump is written in, so a site rustfmt
@@ -3274,20 +3335,69 @@ fn the_bump_site_scan_counts_every_form_of_a_bump() {
 ///   Database-wide bumps (MV store installed, removed; review C42 MED-7). vdbe/mod.rs 1: an
 ///   abandoned MVCC commit's schema removed.
 /// - Also counted (review C42 LOW-6): a raw `prepare_context_generation.fetch_add(` on one line.
+/// - Since review c42b LOW-4: every form (`bump_sites`: split over lines, any atomic write), pinned
+///   per enclosing function, so a site moved within a file is seen.
 #[test]
 fn every_prepare_generation_bump_site_is_audited() {
-    const AUDITED: &[(&str, usize)] = &[
-        ("connection.rs", 39),
-        ("database.rs", 3),
-        ("ext/mod.rs", 4),
-        ("mvcc/database/checkpoint_state_machine.rs", 1),
-        ("storage/pager.rs", 1),
-        ("translate/pragma.rs", 2),
-        ("vdbe/execute.rs", 4),
-        ("vdbe/mod.rs", 1),
+    // Per enclosing function (review c42b LOW-4). The per-file totals are the audited ones below
+    // (connection.rs 39, database.rs 3, ext/mod.rs 4, mvcc/database/checkpoint_state_machine.rs 1,
+    // storage/pager.rs 1, translate/pragma.rs 2, vdbe/execute.rs 4, vdbe/mod.rs 1); the split by
+    // function came from an independent scan (a Python script over the source, not this one), checked
+    // against those classes. `database.rs` `header_validation` is the open's lazy install; `vdbe/
+    // execute.rs` `drop` is the bootstrap guard's.
+    const AUDITED: &[(&str, &str, usize)] = &[
+        ("connection.rs", "attach_database_with_config", 2),
+        ("connection.rs", "detach_database", 1),
+        ("connection.rs", "maybe_update_schema", 2),
+        ("connection.rs", "publish_database_schema", 1),
+        ("connection.rs", "refresh_schema_from_shared_for_reprepare", 1),
+        ("connection.rs", "register_external_collation", 1),
+        ("connection.rs", "register_internal_vtab", 1),
+        ("connection.rs", "register_virtual_table", 1),
+        ("connection.rs", "reset_page_size", 1),
+        ("connection.rs", "rollback_attached_mvcc_txs", 1),
+        ("connection.rs", "rollback_attached_wal_txns", 1),
+        ("connection.rs", "rollback_temp_schema", 1),
+        ("connection.rs", "set_busy_handler", 1),
+        ("connection.rs", "set_busy_timeout", 1),
+        ("connection.rs", "set_cache_size", 1),
+        ("connection.rs", "set_capture_data_changes_info", 1),
+        ("connection.rs", "set_check_constraints_ignored", 1),
+        ("connection.rs", "set_count_changes", 1),
+        ("connection.rs", "set_data_sync_retry", 1),
+        ("connection.rs", "set_dml_require_where", 1),
+        ("connection.rs", "set_dqs_dml", 1),
+        ("connection.rs", "set_encryption_cipher", 1),
+        ("connection.rs", "set_encryption_key", 1),
+        ("connection.rs", "set_foreign_keys_enabled", 1),
+        ("connection.rs", "set_full_column_names", 1),
+        ("connection.rs", "set_mvcc_checkpoint_threshold", 1),
+        ("connection.rs", "set_mvcc_gc_threshold", 1),
+        ("connection.rs", "set_query_only", 1),
+        ("connection.rs", "set_recipe_backfill", 1),
+        ("connection.rs", "set_row_image_apply", 1),
+        ("connection.rs", "set_short_column_names", 1),
+        ("connection.rs", "set_sync_mode", 1),
+        ("connection.rs", "set_sync_type", 1),
+        ("connection.rs", "set_temp_store", 1),
+        ("connection.rs", "unregister_external_collation", 1),
+        ("connection.rs", "with_database_schema_mut", 2),
+        ("database.rs", "header_validation", 1),
+        ("database.rs", "reload_wal_after_external_restore", 2),
+        ("ext/mod.rs", "register_aggregate_function", 1),
+        ("ext/mod.rs", "register_scalar_function_with_options", 1),
+        ("ext/mod.rs", "register_vtab_module", 1),
+        ("ext/mod.rs", "unregister_function", 1),
+        ("mvcc/database/checkpoint_state_machine.rs", "publish_checkpointed_schema_roots", 1),
+        ("storage/pager.rs", "rollback", 1),
+        ("translate/pragma.rs", "update_pragma", 2),
+        ("vdbe/execute.rs", "drop", 1),
+        ("vdbe/execute.rs", "op_journal_mode_inner", 2),
+        ("vdbe/execute.rs", "op_savepoint", 1),
+        ("vdbe/mod.rs", "cleanup_abandoned_mvcc_commit", 1),
     ];
     let core = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut found: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut found: std::collections::BTreeMap<(String, String), usize> = Default::default();
     let mut dirs = vec![core.to_path_buf()];
     while let Some(d) = dirs.pop() {
         for e in std::fs::read_dir(&d).unwrap() {
@@ -3298,15 +3408,15 @@ fn every_prepare_generation_bump_site_is_audited() {
                 }
             } else if path.extension().is_some_and(|x| x == "rs") && !path.ends_with("branch/fastest_tests.rs") {
                 let text = std::fs::read_to_string(&path).unwrap();
-                let n = bump_site_count(&text);
-                if n > 0 {
-                    let rel = path.strip_prefix(core).unwrap().to_string_lossy().replace('\\', "/");
-                    found.insert(rel, n);
+                let rel = path.strip_prefix(core).unwrap().to_string_lossy().replace('\\', "/");
+                for (function, n) in bump_sites(&text) {
+                    found.insert((rel.clone(), function), n);
                 }
             }
         }
     }
-    let audited: std::collections::BTreeMap<String, usize> = AUDITED.iter().map(|&(f, n)| (f.to_string(), n)).collect();
+    let audited: std::collections::BTreeMap<(String, String), usize> =
+        AUDITED.iter().map(|&(f, function, n)| ((f.to_string(), function.to_string()), n)).collect();
     assert!(!found.is_empty(), "premise: the scan found no bump site: it is broken");
     assert_eq!(found, audited, "CLAIM: the prepare-generation bump sites differ from the audited list: audit the new ones (and the setter class) and update AUDITED with each one's reason");
 }
