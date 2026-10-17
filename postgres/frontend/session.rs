@@ -181,7 +181,21 @@ impl PgConnectionInner {
         self.lock_timeout_ms.store(gucs.lock_timeout_ms, Relaxed);
         self.statement_timeout_ms.store(gucs.statement_timeout_ms, Relaxed);
         self.min_messages.store(gucs.min_messages, Relaxed);
-        self.conn.set_foreign_keys_enabled(gucs.foreign_keys);
+        // Never off over pending deferred violations (C41-H1: the check the COMMIT makes is the
+        // engine's, so turning it off let an orphan commit). The SET that asks for it is refused
+        // in `handle_pg_set`. This second guard is UNREACHABLE defence in depth (fk-guard review
+        // LOW 4): every block end, ROLLBACK TO and RELEASE reaches here after the engine settled
+        // the count, and no client sequence was found that arrives with the setting off and a
+        // violation pending; a fault-injection test (`pretend_deferred_violations`) holds it.
+        // The count is read only when the setting would turn the check off (LOW 7).
+        let enforce = gucs.foreign_keys || deferred_violations(&self.conn) > 0;
+        // Only a change reaches the engine (review wire-rework A-M1): the setter bumped the
+        // prepare generation whatever the value, so every SET and block end re-prepared every
+        // kept statement. The engine's setter now bumps on a change only (fastest-engine
+        // 49e10e02a); this keeps the wire's side of the class whatever a setter does.
+        if self.conn.foreign_keys_enabled() != enforce {
+            self.conn.set_foreign_keys_enabled(enforce);
+        }
         let mut state = self.session_state.lock();
         if state.search_path != gucs.search_path {
             state.search_path.clone_from(&gucs.search_path);
@@ -1516,14 +1530,38 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
         ));
     }
     // Every mutable setting uses this assignment path, including the outside-block LOCAL rule.
-    let assign = |apply: &dyn Fn(&mut Gucs, &mut Locals, bool)| {
+    let assign = |apply: &dyn Fn(&mut Gucs, &mut Locals, bool)| -> Result<()> {
         // Outside a block a SET LOCAL lasts only its own statement: nothing to keep. Its warning
         // was given above.
         if set_stmt.is_local && !in_block {
-            return;
+            return Ok(());
         }
         let mut state = pg_conn.session_state.lock();
         let gucs = &mut state.gucs;
+        // A foreign_keys SET is applied to a copy first: a change of the effective value to off
+        // while the transaction holds deferred violations is refused, by the effective value and
+        // not by the statement's form (SET, SET LOCAL, SET SESSION, inside an implicit block alike:
+        // C41-H1, review c39799c5d..9e24b455d MED 3), and nothing of the refused SET is kept. No
+        // other setting is copied (fk-guard review LOW 7).
+        if name == "foreign_keys" {
+            let (mut session, mut local) = (gucs.session.clone(), gucs.local.clone());
+            apply(&mut session, &mut local, set_stmt.is_local);
+            let was = gucs.effective().foreign_keys;
+            let now = local.foreign_keys.unwrap_or(session.foreign_keys);
+            if was && !now {
+                let pending = deferred_violations(&pg_conn.conn);
+                if pending > 0 {
+                    return Err(LimboError::ParseError(SqlErrorMessage::classified(
+                        SqlErrorKind::ObjectNotInPrerequisiteState,
+                        format!(
+                            "cannot turn foreign_keys off while the transaction holds {pending} \
+                             deferred foreign key violation{}",
+                            if pending == 1 { "" } else { "s" }
+                        ),
+                    )));
+                }
+            }
+        }
         if in_block && gucs.block_start.is_none() {
             gucs.block_start = Some(gucs.session.clone());
         }
@@ -1531,6 +1569,7 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
         let effective = gucs.effective();
         drop(state);
         pg_conn.publish(&effective);
+        Ok(())
     };
     if name == "search_path" {
         let path = set_stmt
@@ -1546,7 +1585,7 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
                 session.search_path.clone_from(&path);
                 local.search_path = None;
             }
-        });
+        })?;
         return noop_statement(&pg_conn.conn);
     }
     let value = set_stmt.values.first().ok_or_else(|| {
@@ -1620,7 +1659,7 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
                     session.foreign_keys = on;
                     local.foreign_keys = None;
                 }
-            });
+            })?;
             true
         }
         // These change answers PostgreSQL gives, so they act, or are refused, rather than being
@@ -1638,7 +1677,7 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
                     session.lock_timeout_ms = ms;
                     local.lock_timeout_ms = None;
                 }
-            });
+            })?;
             true
         }
         "client_min_messages" => {
@@ -1652,7 +1691,7 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
                     session.min_messages = rank;
                     local.min_messages = None;
                 }
-            });
+            })?;
             true
         }
         // The server stops a statement running past it (57014).
@@ -1667,7 +1706,7 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
                     session.statement_timeout_ms = ms;
                     local.statement_timeout_ms = None;
                 }
-            });
+            })?;
             true
         }
         "idle_in_transaction_session_timeout" | "transaction_timeout" => {
@@ -3016,6 +3055,26 @@ fn aside_name_for(table: &str, n: usize) -> String {
 #[cfg(feature = "failpoints")]
 thread_local! {
     static UNDO_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static PRETEND_DEFERRED: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+}
+
+/// Test failpoint (feature `failpoints`, never in a credited build): every read of a connection's
+/// pending deferred foreign-key violations on this thread answers at least `n` until it is reset
+/// to 0, so the publish guard, which no client sequence reaches, can be shown to hold (fk-guard
+/// review LOW 4).
+#[cfg(feature = "failpoints")]
+pub fn pretend_deferred_violations(n: isize) {
+    PRETEND_DEFERRED.with(|f| f.set(n));
+}
+
+/// The connection's pending deferred foreign-key violations (the engine's count), through the
+/// `pretend_deferred_violations` failpoint in a failpoints build.
+#[inline]
+fn deferred_violations(conn: &Connection) -> isize {
+    let n = conn.deferred_foreign_key_violations();
+    #[cfg(feature = "failpoints")]
+    let n = n.max(PRETEND_DEFERRED.with(std::cell::Cell::get));
+    n
 }
 
 /// Test failpoint (feature `failpoints`, never in a credited build): the next undo of a transaction

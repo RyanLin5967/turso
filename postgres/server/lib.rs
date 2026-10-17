@@ -7080,6 +7080,100 @@ mod tests {
         out
     }
 
+    /// fk-guard review MED 1 (the PERF class): a block end whose settings did not change leaves
+    /// the engine's prepare generation alone, so the statements the connection keeps are not all
+    /// re-prepared after every transaction. publish ran set_foreign_keys_enabled at every block
+    /// end, and the setter bumped the generation whether or not the value changed (fastest-engine
+    /// fixes the setter, 49e10e02a). The red reads the generation across BEGIN; SELECT 1; COMMIT,
+    /// and across an implicit single-statement block.
+    #[test]
+    fn a_block_end_that_changes_no_setting_keeps_the_prepare_generation() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = session(&dir);
+        ok(&s, "CREATE TABLE t(id INT)");
+        let conn = s.current(&mut s.state()).unwrap();
+        // One assertion per event that runs publish (review wire-rework D-L1), each read right
+        // after it, so a failure names the event that bumped. NOT asserted: ROLLBACK, ROLLBACK TO
+        // and a failed block's end, where the engine's own rollback bumps the generation
+        // (pager.rs rollback, execute.rs savepoint restore) whatever publish does, so their
+        // reading cannot isolate publish; and adopt_session_of (a branch switch).
+        let mut wrong = Vec::new();
+        let mut events: Vec<(&str, &[&str])> = vec![
+            ("BEGIN; SELECT 1; COMMIT", &["BEGIN", "SELECT 1", "COMMIT"][..]),
+            ("SAVEPOINT", &["BEGIN", "SAVEPOINT a"][..]),
+            ("RELEASE", &["RELEASE a", "COMMIT"][..]),
+            // A multi-statement query: its implicit block ends through end_implicit's commit,
+            // which runs publish (D-M1: a single statement runs in autocommit and never did).
+            ("an implicit block", &["INSERT INTO t VALUES (1); SELECT 1"][..]),
+            ("SET lock_timeout to its value", &["SET lock_timeout = 0"][..]),
+            ("SET client_min_messages", &["SET client_min_messages TO notice"][..]),
+            ("SET lock_timeout", &["SET lock_timeout = '1s'"][..]),
+        ];
+        for (label, sqls) in events.drain(..) {
+            let before = conn.inner().prepare_context_generation();
+            for sql in sqls {
+                let _ = s.simple(sql);
+            }
+            let after = conn.inner().prepare_context_generation();
+            if after != before {
+                wrong.push(format!("{label}: the prepare generation moved {before} -> {after}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+        // The control (D-L2): a SET that does change what the engine compiles by bumps it, or a
+        // setter that never bumped (stale statements after a real change) would pass the above.
+        let before = conn.inner().prepare_context_generation();
+        ok(&s, "SET foreign_keys = off");
+        assert_ne!(
+            conn.inner().prepare_context_generation(),
+            before,
+            "SET foreign_keys = off did not bump the prepare generation"
+        );
+    }
+
+    /// fk-guard review LOW 6: postgres/COMPAT.md states the foreign_keys refusal and its code, beside
+    /// the setting's row, and no longer says SET LOCAL of foreign_keys is 0A000 (C41 made it follow
+    /// transaction scope).
+    #[test]
+    fn compat_states_the_foreign_keys_refusal() {
+        let compat = include_str!("../COMPAT.md");
+        let row = compat
+            .lines()
+            .find(|l| l.starts_with("| SET / SHOW configuration parameters"))
+            .expect("the SET / SHOW row");
+        assert!(
+            row.contains("foreign_keys") && row.contains("55000"),
+            "the SET / SHOW row does not state the foreign_keys refusal's 55000"
+        );
+        assert!(
+            !row.contains("search_path and foreign_keys are 0A000 inside a transaction block"),
+            "the row still says foreign_keys is 0A000 in a block"
+        );
+    }
+
+    /// fk-guard review LOW 4: the publish guard (no foreign_keys off over pending deferred
+    /// violations) is unreachable from a client, so it is held by fault injection: with the
+    /// session's setting off and a violation pretended pending, a block's end keeps the engine's
+    /// check on; with the pretence gone it turns off as set. MUTANT owed with the run: drop
+    /// `|| deferred_violations(..) > 0` from publish and this fails.
+    #[test]
+    fn a_block_end_never_turns_foreign_keys_off_over_pending_violations() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s = session(&dir);
+        ok(&s, "SET foreign_keys = off");
+        let conn = s.current(&mut s.state()).unwrap();
+        assert!(!conn.inner().foreign_keys_enabled(), "the control: SET turned the check off");
+        turso_pg::pretend_deferred_violations(1);
+        ok(&s, "BEGIN");
+        ok(&s, "COMMIT");
+        let held = conn.inner().foreign_keys_enabled();
+        turso_pg::pretend_deferred_violations(0);
+        assert!(held, "a block end turned the check off over a pending violation");
+        ok(&s, "BEGIN");
+        ok(&s, "COMMIT");
+        assert!(!conn.inner().foreign_keys_enabled(), "with nothing pending the setting holds");
+    }
+
     /// C44-M1: a branch the engine refuses as in use is 55006 by the engine's typed error
     /// (LimboError::BranchInUse), whatever its text; another error on an existing branch is not
     /// 55006, and a missing branch is 3D000. The wire tests reach the session's own in-use map
