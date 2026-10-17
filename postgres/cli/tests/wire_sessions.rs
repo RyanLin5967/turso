@@ -13504,9 +13504,14 @@ fn a_kept_statement_reprepared_after_a_setting_change_keeps_the_search_path() {
     let dir = Scratch::new("kept-reprepare");
     let server = two_schemas(&dir);
     let mut wrong = Vec::new();
+    // Arms that force a real bump of the engine's prepare generation (review wire-rework E-M1):
+    // with the setter bumping only on a change, the first two no longer bump, and would pass
+    // whether or not a re-prepare keeps the session's path.
     for (label, begin, other) in [
         ("SET client_min_messages", false, "SET client_min_messages TO notice"),
         ("SAVEPOINT", true, "SAVEPOINT a"),
+        ("SET foreign_keys = off", false, "SET foreign_keys = off"),
+        ("ALTER TABLE s.t ADD COLUMN", false, "ALTER TABLE s.t ADD COLUMN y INT"),
     ] {
         let mut a = server.connect();
         a.q("SET search_path TO s").ok("path");
@@ -13552,4 +13557,87 @@ fn a_set_local_outside_a_block_warns_before_its_value_is_checked() {
         wrong.push(format!("an invalid value: notices {:?} error {:?}", r.notices, r.error));
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Review wire-rework E-H1: DDL in an attached schema leaves the main schema and the search path
+/// as they were but moves the engine's prepare generation; a kept statement must not be reused
+/// across it. Under search_path s, a statement over `t` kept before `DROP TABLE s.t` is refused
+/// 42P01 (PostgreSQL re-analyses it under s; it silently read public.t's 1), one kept before
+/// `ALTER TABLE s.t ADD COLUMN` still reads s.t's 2, and one kept before a temp `t` is created
+/// reads the temp table's 3. PG 18.6 recordings of the three owed (LOUD).
+#[test]
+fn a_kept_statement_is_not_reused_across_ddl_the_key_did_not_see() {
+    let dir = Scratch::new("kept-attached");
+    let server = two_schemas(&dir);
+    let mut wrong = Vec::new();
+    for (label, path, ddl, want) in [
+        ("DROP TABLE s.t", true, &["DROP TABLE s.t"][..], Err("42P01")),
+        ("ALTER TABLE s.t ADD COLUMN", true, &["ALTER TABLE s.t ADD COLUMN y INT"][..], Ok("2")),
+        (
+            "a temp t",
+            false,
+            &["CREATE TEMP TABLE t(x INT)", "INSERT INTO t VALUES (3)"][..],
+            Ok("3"),
+        ),
+    ] {
+        let mut a = server.connect();
+        if path {
+            a.q("SET search_path TO s").ok("path");
+        }
+        named_parse(&mut a, "sq", "SELECT x FROM t");
+        for (i, sql) in ddl.iter().enumerate() {
+            let name = format!("d{i}");
+            named_parse(&mut a, &name, sql);
+            named_bind(&mut a, "", &name);
+            named_execute(&mut a, "");
+        }
+        named_bind(&mut a, "", "sq");
+        named_execute(&mut a, "");
+        a.send(b'S', &[]);
+        let r = a.read_reply();
+        match want {
+            Err(code) => {
+                if r.error.as_ref().map(|e| e.code.as_str()) != Some(code) || !r.rows.is_empty() {
+                    wrong.push(format!("{label}: want {code}, got rows {:?} error {:?}", r.rows, r.error));
+                }
+            }
+            Ok(v) => {
+                if r.error.is_some() || r.rows != vec![vec![Some(v.to_string())]] {
+                    wrong.push(format!("{label}: want {v}, got rows {:?} error {:?}", r.rows, r.error));
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Review wire-rework E-M2: a kept DELETE ... USING (whose translation reads its relations'
+/// columns) executed after a real bump of the prepare generation deletes the rows it deletes
+/// without the bump. The engine's re-prepare would translate it with no column lookup (the
+/// dialect has no connection); the wire re-prepares it under the session's own translator.
+#[test]
+fn a_kept_delete_using_across_a_generation_bump_deletes_the_same_rows() {
+    let dir = Scratch::new("kept-delete-using");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE a(x INT)").ok("a");
+    a.q("CREATE TABLE b(x INT)").ok("b");
+    a.q("INSERT INTO a VALUES (1), (2), (3)").ok("rows a");
+    a.q("INSERT INTO b VALUES (2)").ok("rows b");
+    named_parse(&mut a, "del", "DELETE FROM a USING b WHERE a.x = b.x");
+    named_bind(&mut a, "pd", "del");
+    named_parse(&mut a, "fk", "SET foreign_keys = off");
+    named_bind(&mut a, "pf", "fk");
+    named_execute(&mut a, "pf");
+    named_execute(&mut a, "pd");
+    a.send(b'S', &[]);
+    let r = a.read_reply();
+    assert!(r.error.is_none(), "{:?}", r.error);
+    assert_eq!(r.tags.last().map(String::as_str), Some("DELETE 1"), "tags {:?}", r.tags);
+    let left = a.q("SELECT x FROM a ORDER BY x");
+    assert_eq!(
+        left.rows,
+        vec![vec![Some("1".to_string())], vec![Some("3".to_string())]],
+        "the rows left"
+    );
 }
