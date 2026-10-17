@@ -2912,15 +2912,27 @@ impl NameFilter {
         self.owed.take()
     }
 
-    /// No branch ever held `name`: answered only in `Ready`; every other state asks the catalog.
+    /// No branch ever held `name`: answered in every state whose tables hold every name noted
+    /// (lead order (a): a natural growth's window sent every named create to the catalog under the
+    /// mutex). `Ready`: its table. `Growing`: the old table, still complete (notes go into it and
+    /// the pending one, and a refusal overflows). `Draining`: the new table and the pending one
+    /// together, which is what `Ready` will hold (a build's scan plus its seeded pending, or a
+    /// growth's copy plus what was noted during it). `Unbuilt`, `Building` and `Overflowed` hold no
+    /// complete table, so they ask the catalog. Mutant `filter_absent_only_when_ready` (test builds
+    /// only): `Ready` alone, as before.
     fn says_absent(&self, name: &str) -> bool {
         // fastest-engine mutant `filter_says_absent` (test builds only): "absent" whenever a table
         // exists.
         if fe_mutant("filter_says_absent") {
             return !matches!(self.state, FilterState::Unbuilt | FilterState::Overflowed);
         }
+        let h = self.hash(name);
         match &self.state {
-            FilterState::Ready { table } => !table.contains(self.hash(name)),
+            FilterState::Ready { table } => !table.contains(h),
+            FilterState::Growing { table, .. } if !fe_mutant("filter_absent_only_when_ready") => !table.contains(h),
+            FilterState::Draining { table, pending } if !fe_mutant("filter_absent_only_when_ready") => {
+                !table.contains(h) && !pending.contains(h)
+            }
             FilterState::Unbuilt
             | FilterState::Building { .. }
             | FilterState::Growing { .. }
