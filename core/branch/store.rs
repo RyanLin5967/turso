@@ -10275,32 +10275,43 @@ impl BranchStore {
     /// caller's Busy). A fail-stopped store refuses rather than return `Ok(false)` for ever. Mutant
     /// `checkpoint_now_sharp` (test builds only): `compact_now` for every store, as the wire did.
     pub(crate) fn checkpoint_now(&self, deadline: Duration) -> Result<bool> {
+        // Bounded end to end (review c42b MED-2): every wait for the store mutex and for a flight
+        // ends at the deadline; a deadline past an Instant's range is taken as a year (C42 LOW-1).
+        let started = Instant::now();
+        let never = || false;
+        let until = started.checked_add(deadline).unwrap_or_else(|| started + Duration::from_secs(365 * 24 * 3600));
+        let within = Wait { until, interrupted: &never };
         let fuzzy = {
-            let inner = self.inner.lock();
+            let inner = match self.inner.lock_within(Some(&within)) {
+                Ok(inner) => inner,
+                Err(LimboError::Busy) => return Ok(false),
+                Err(e) => return Err(e),
+            };
             inner.cat.is_some() && !inner.splice && !fe_mutant("checkpoint_now_sharp")
         };
         if !fuzzy {
-            self.compact_now()?;
-            return Ok(true);
+            return match self.compact_now_within(Some(&within)) {
+                Ok(()) => Ok(true),
+                Err(LimboError::Busy) => Ok(false),
+                Err(e) => Err(e),
+            };
         }
         let installed = || *self.installs.0.lock().unwrap_or_else(|e| e.into_inner());
-        let started = Instant::now();
         let mut pause = Duration::from_millis(1);
         loop {
             if self.group.poisoned() {
                 return Err(group_poisoned());
             }
             let before = installed();
-            if self.checkpoint_fuzzy_now()? {
+            let started_one = match self.checkpoint_fuzzy_now_within(Some(&within)) {
+                Ok(started_one) => started_one,
+                Err(LimboError::Busy) => return Ok(installed() > before),
+                Err(e) => return Err(e),
+            };
+            if started_one {
                 // Its own flight, joined within the same deadline (review C42-M1: this join had
-                // none). Past it, `Ok(false)`: no install before the deadline.
-                // A deadline past what an Instant can hold is no deadline (review C42 LOW-1:
-                // `started + Duration::MAX` panicked).
-                let never = || false;
-                let until = started.checked_add(deadline).unwrap_or_else(|| started + Duration::from_secs(365 * 24 * 3600));
-                let within = Wait { until, interrupted: &never };
-                // At the deadline, what installed is still reported (review C42 MED-3: an install
-                // whose WAL truncation ran past the deadline answered Ok(false)).
+                // none). At the deadline, what installed is still reported (review C42 MED-3: an
+                // install whose WAL truncation ran past the deadline answered Ok(false)).
                 return match self.join_flights_within(Some(&within)) {
                     Ok(()) | Err(LimboError::Busy) => Ok(installed() > before),
                     Err(e) => Err(e),
@@ -10488,7 +10499,12 @@ impl BranchStore {
     /// starts nothing. `Ok(false)`: nothing started (parked Commits remain, one is in flight, or
     /// this is not a catalog store).
     pub(crate) fn checkpoint_fuzzy_now(&self) -> Result<bool> {
-        let mut inner = self.inner.lock();
+        self.checkpoint_fuzzy_now_within(None)
+    }
+
+    /// `checkpoint_fuzzy_now`, its wait for the store mutex bounded by `wait` (review c42b MED-2).
+    fn checkpoint_fuzzy_now_within(&self, wait: Option<&Wait<'_>>) -> Result<bool> {
+        let mut inner = self.inner.lock_within(wait)?;
         // Mutant `plant_premise_only` (test builds only): the mutant runner's planted control
         // (its flagged-edit judge, 2026-10-06T14:45:43Z). It starts nothing, which trips only the
         // "premise: a fuzzy checkpoint started" of the test it runs: the runner must read it as
