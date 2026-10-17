@@ -210,31 +210,54 @@ fn the_fuzzy_held_syscall_budget_is_judged_beside_another_stores_work() {
             std::sync::mpsc::RecvTimeoutError::Timeout => "no first create in 60 s",
         };
         stop.store(true, O::Release);
-        let t = std::time::Instant::now();
-        while !busy.is_finished() && t.elapsed() < std::time::Duration::from_secs(30) {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        panic!("premise: the other store never started working: {why}");
+        let joined = join_within(busy, std::time::Duration::from_secs(30));
+        panic!("premise: the other store never started working: {why} (its thread: {})", joined_state(&joined));
     }
     let at_entry = creates.load(O::Acquire);
     let judged = std::panic::catch_unwind(super::fastest_tests::a_fuzzy_checkpoint_issues_at_most_two_syscalls_under_the_store_mutex);
     let at_exit = creates.load(O::Acquire);
     stop.store(true, O::Release);
-    // LOW-9: a busy thread that stopped responding fails the test instead of hanging it.
-    let t = std::time::Instant::now();
-    while !busy.is_finished() && t.elapsed() < std::time::Duration::from_secs(60) {
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    assert!(busy.is_finished(), "the other store's thread did not stop within 60 s of being told to");
-    busy.join().unwrap();
-    assert!(at_exit > at_entry, "premise: the other store's work overlaps the relay ({at_entry} -> {at_exit} creates)");
-    if let Err(e) = judged {
-        let msg = e.downcast_ref::<String>().cloned().or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default();
+    // LOW-9, counters review 4 LOW-H: a busy thread that stopped responding fails the test instead of
+    // hanging it; one that stops is really joined (its panic, if any, is reported); and the judged
+    // test's own failure is reported first, so a busy thread's failure cannot hide it.
+    let joined = join_within(busy, std::time::Duration::from_secs(60));
+    if let Err(e) = &judged {
+        let msg = panic_text(&**e);
         assert!(
             msg.starts_with("CLAIM:"),
-            "beside another store's work ({} creates during the call) the budget reached no verdict: {msg}",
-            at_exit - at_entry
+            "beside another store's work ({} creates during the call) the budget reached no verdict: {msg} (the other store's thread: {})",
+            at_exit - at_entry,
+            joined_state(&joined)
         );
+    }
+    match &joined {
+        Some(Ok(())) => {}
+        _ => panic!("the other store's thread failed: {}", joined_state(&joined)),
+    }
+    assert!(at_exit > at_entry, "premise: the other store's work overlaps the relay ({at_entry} -> {at_exit} creates)");
+}
+
+/// `h` joined if it finishes within `bound` (polled; wall time only bounds the wait): its result,
+/// or `None` if it is still running then (left detached, and named by the caller's failure).
+fn join_within<T>(h: std::thread::JoinHandle<T>, bound: std::time::Duration) -> Option<std::thread::Result<T>> {
+    let t = std::time::Instant::now();
+    while !h.is_finished() && t.elapsed() < bound {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    h.is_finished().then(|| h.join())
+}
+
+/// A panic payload's message.
+fn panic_text(e: &(dyn std::any::Any + Send)) -> String {
+    e.downcast_ref::<String>().cloned().or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default()
+}
+
+/// How a `join_within` ended, for a failure message.
+fn joined_state(j: &Option<std::thread::Result<()>>) -> String {
+    match j {
+        None => "still running past its bound, not joined".to_string(),
+        Some(Ok(())) => "joined".to_string(),
+        Some(Err(e)) => format!("joined, it panicked: {}", panic_text(&**e)),
     }
 }
 
