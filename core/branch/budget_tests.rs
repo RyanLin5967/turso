@@ -3169,6 +3169,15 @@ fn nothing_on_the_probes_window_path_allocates() {
 /// exact-count fire-checks (`fc_nothing` moves nothing, `fc_box_23` allocates 23 boxes of 184 bytes)
 /// hold in a child with FE_MUTANT set to a name no mutant has and every diagnostic flag set, so that
 /// a flag's first read, or a diagnostic's work, cannot land inside a window unseen.
+///
+/// Counters review 4 LOW-B, the scope: "every flag" is the probe's own diagnostics
+/// (FE_BUDGET_FOREIGN_NAMES, FE_BUDGET_NEW_NAMES; FE_BUDGET_CHILD is set in the cell's own child)
+/// and the two mutant selectors read once per process (FE_MUTANT, R13_MUTANT), each set to a name no
+/// mutant has. NOT in scope, because a run with one set is not a budget configuration: behaviour
+/// knobs (R11_*, R12_PREWARM*, R13_FW1/FW2/MERGER, FE_LOSE_UNSYNCED, FE_KILL_*,
+/// TURSO_MEASURE_WORD_HOLD), other lanes' instruments that record by design (R12_TRACE_READS pushes
+/// every page read, R11_TRACE_*), FE_CAPTURE_VERIFY (verifies captures, and aborts), and
+/// R12_MUTANT (read on every call).
 #[test]
 fn the_instruments_count_exactly_under_every_flag() {
     if in_child() || std::env::var_os("FE_FLAGS_CHILD").is_some() {
@@ -3181,14 +3190,17 @@ fn the_instruments_count_exactly_under_every_flag() {
         // A mutant run passes its mutant on (counters review 4 MED-1: the probe's and the harness's
         // window mutants are killed here); otherwise a name no mutant has, so the name is still read.
         .env("FE_MUTANT", std::env::var("FE_MUTANT").unwrap_or_else(|_| "no_mutant_has_this_name".to_string()))
+        .env("R13_MUTANT", "no_mutant_has_this_name")
         .env("FE_BUDGET_FOREIGN_NAMES", "1")
         .env("FE_BUDGET_NEW_NAMES", dir.path().join("new-names.txt"))
         .env_remove("FE_BUDGET_RAW_DIR")
         .output()
         .unwrap();
     let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    // Counters review 4 LOW-A: "running 1 test" and exit 0 also accept an ignored test.
     assert!(text.contains("running 1 test"), "premise: the instruments test ran under the flags:\n{text}");
     assert!(out.status.success(), "the instruments' exact counts fail with every flag set:\n{text}");
+    assert!(text.contains("test result: ok. 1 passed"), "premise: the instruments test passed, not ignored or filtered, under the flags:\n{text}");
 }
 
 /// Counters review 4 LOW-D (DECISIONS 6399fd35bf): an armed hold taken before any window allocates
