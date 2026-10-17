@@ -3255,6 +3255,22 @@ fn a_setter_given_the_value_it_holds_leaves_the_prepare_generation_alone() {
     let v = c.get_pager().get_spill_enabled();
     let pragma = |on: bool| c.execute(format!("PRAGMA cache_spill = {}", if on { 1 } else { 0 })).unwrap();
     check("PRAGMA cache_spill", &|| pragma(v), &|| pragma(!v), &|| pragma(v));
+    // Review C42 MED-6: the four setters 09e8b26b0 made change-only (a mutant bumping any of them
+    // unconditionally survived the static red, which reads only that the body bumps).
+    let v = c.check_constraints_ignored();
+    check("set_check_constraints_ignored", &|| c.set_check_constraints_ignored(v), &|| c.set_check_constraints_ignored(!v), &|| c.set_check_constraints_ignored(v));
+    let v = c.get_dml_require_where();
+    check("set_dml_require_where", &|| c.set_dml_require_where(v), &|| c.set_dml_require_where(!v), &|| c.set_dml_require_where(v));
+    let v = c.get_count_changes();
+    check("set_count_changes", &|| c.set_count_changes(v), &|| c.set_count_changes(!v), &|| c.set_count_changes(v));
+    // Only Apple's pager distinguishes the two (elsewhere both are fsync, and the setter does not
+    // change what PRAGMA fullfsync answers, so it must not bump at all: review C42 LOW-7).
+    #[cfg(target_vendor = "apple")]
+    {
+        let v = c.get_sync_type();
+        let w = if v == crate::io::FileSyncType::FullFsync { crate::io::FileSyncType::Fsync } else { crate::io::FileSyncType::FullFsync };
+        check("set_sync_type", &|| c.set_sync_type(v), &|| c.set_sync_type(w), &|| c.set_sync_type(v));
+    }
     let v = c.get_busy_timeout();
     let w = v + std::time::Duration::from_millis(7);
     check("set_busy_timeout", &|| c.set_busy_timeout(v), &|| c.set_busy_timeout(w), &|| c.set_busy_timeout(v));
