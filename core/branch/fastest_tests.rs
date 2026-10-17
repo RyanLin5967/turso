@@ -10281,6 +10281,58 @@ fn a_failed_filter_drain_s_overflow_still_answers_for_a_pending_name() {
     assert!(!absent, "CLAIM: after a failed drain the overflowed filter answered absent for a name only its pending table held");
 }
 
+/// Review filter3 MED-1: LOW-F2's class has a red that can fire again. Since N1 the first refusal
+/// in `a_refusing_answer_s_table_is_not_freed_under_the_store_mutex` respills into the spare, so
+/// nothing is retired and that test passes whatever `retire_table` does. Here the burst goes on
+/// until the answer ENDS (`name_filter_refusals_for_test().3`: the spare is used by the first
+/// refusal, so a later one ends it and retires the old sink and the spare, both their last
+/// references). Premise: the filter then answers nothing. No note may free anything. Mutant
+/// `filter_retire_frees_in_place` (retired tables freed under the mutex) is its killer.
+#[test]
+fn an_answer_that_ends_on_a_refusal_frees_nothing_under_the_store_mutex() {
+    use super::store::{FILTER_NOTE_FREED_MAX, HOLD_ARRIVED, NAME_SCAN_HOLD};
+    use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+    let _s = serial();
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            NAME_SCAN_HOLD.store(0, Release);
+        }
+    }
+    let _r = Reset;
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("answer-ends-free.db"), opts(true, SyncClass::Off));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    trunk.create_branch("held").unwrap();
+    db.branch_wait_name_filter();
+    NAME_SCAN_HOLD.store(1, Release);
+    let t = std::time::Instant::now();
+    let mut n = 0u32;
+    while NAME_SCAN_HOLD.load(Acquire) != 1 | HOLD_ARRIVED {
+        let name = format!("cycle-{n:05}");
+        trunk.create_branch(&name).unwrap();
+        db.drop_branch(&name).unwrap();
+        n += 1;
+        assert!(t.elapsed() < std::time::Duration::from_secs(30), "premise: no natural shrink's rebuild reached its scan ({n} cycles)");
+    }
+    let ended0 = db.branches.name_filter_refusals_for_test().3;
+    FILTER_NOTE_FREED_MAX.store(0, Release);
+    while db.branches.name_filter_refusals_for_test().3 == ended0 {
+        trunk.create_branch(&format!("burst-{n:05}")).unwrap();
+        n += 1;
+        assert!(n < 1 << 20, "premise: the Building answer never ended");
+    }
+    let built = db.branches.name_filter_stats().0;
+    let freed = FILTER_NOTE_FREED_MAX.load(Relaxed);
+    let respilled = db.branches.name_filter_refusals_for_test().2;
+    NAME_SCAN_HOLD.store(0, Release);
+    db.branch_wait_name_filter();
+    assert!(respilled >= 1, "premise: the first refusal respilled into the spare before a later one ended the answer");
+    assert!(!built, "premise: the ended answer leaves the filter answering nothing");
+    assert_eq!(freed, 0, "CLAIM: a note freed {freed} bytes under the store mutex when the answer ended (its tables are retired, freed after the unlock)");
+}
+
 /// Class (e), the store mutex's lifecycle audit (DECISIONS 994f7d41e0; the lead's order with
 /// nf-adversary-2's MED-2 and M4 folded in): every store-mutex hold on the create path does NO syscall,
 /// NO allocation and NO catalog statement. One instrument for the whole class: every outermost hold

@@ -2879,11 +2879,13 @@ struct NameFilter {
     /// kept; taken by a refusal. With none kept, a refusal leaves no answer (lookups ask the
     /// catalog until the rebuild).
     spare: Option<Arc<FilterTable>>,
-    /// Observation (review m1-2b item 4, case 4's frequency): refusals by a `Stale` table (a
-    /// shrink's, before its rebuild's seed), and answers ended because their sink refused a note
-    /// (`Building::old`, `Overflowed`'s), in this store.
+    /// Observation (review m1-2b item 4, case 4's frequency), in this store: refusals by a `Stale`
+    /// table (a shrink's, before its rebuild's seed); and notes an answer's sink refused
+    /// (`Building::old`, `Overflowed`'s), split (review filter3 L2) into those the spare took
+    /// (`answers_respilled`, the answer kept) and those that ended the answer (`answers_ended`).
     stale_refusals: u64,
-    answers_refused: u64,
+    answers_respilled: u64,
+    answers_ended: u64,
     /// Tables a note let go of (a refusal's), parked here so no table is freed under the store
     /// mutex (review m1-2b LOW-F2): the create that noted takes them with its owed work and drops
     /// them after its unlock (`take_retired`). Four slots, more than one hold ever retires (an
@@ -3035,7 +3037,6 @@ impl NameFilter {
             FilterState::Draining { table, .. } => table.insert(h),
         };
         if answer_refused {
-            self.answers_refused += 1;
             // The refusing sink moves into a free `fixed` slot and the spare, with `h`, becomes the
             // sink (review m1-2c N1): the answer stays complete. With no spare kept or no slot free,
             // the answer ends (lookups ask the catalog) and its tables are retired. Mutant
@@ -3068,7 +3069,10 @@ impl NameFilter {
                 self.spare = spare;
             }
             if let Some(a) = ended {
+                self.answers_ended += 1;
                 self.retire_answer(a);
+            } else {
+                self.answers_respilled += 1;
             }
         }
         if !fits {
@@ -3142,6 +3146,12 @@ impl NameFilter {
 
     /// Park a table this hold let go of, to be freed after the mutex (`retired`).
     fn retire_table(&mut self, t: Arc<FilterTable>) {
+        // Mutant `filter_retire_frees_in_place` (test builds only; review filter3 MED-1): freed
+        // here, under the store mutex, as before LOW-F2.
+        if fe_mutant("filter_retire_frees_in_place") {
+            drop(t);
+            return;
+        }
         if let Some(slot) = self.retired.iter_mut().find(|s| s.is_none()) {
             *slot = Some(t);
         }
@@ -9905,12 +9915,14 @@ impl BranchStore {
         self.inner.lock().captures_entered
     }
 
-    /// Test builds: this store's case-4 observation counters, `(Stale refusals, answers ended by a
-    /// refusing sink)` (review m1-2b item 4).
+    /// Test builds: this store's case-4 observation counters, `(Stale refusals, notes an answer's
+    /// sink refused, of which respilled, of which ended the answer)` (review m1-2b item 4,
+    /// filter3 L2).
     #[cfg(test)]
-    pub(crate) fn name_filter_refusals_for_test(&self) -> (u64, u64) {
+    pub(crate) fn name_filter_refusals_for_test(&self) -> (u64, u64, u64, u64) {
         let inner = self.inner.lock();
-        (inner.names.filter.stale_refusals, inner.names.filter.answers_refused)
+        let f = &inner.names.filter;
+        (f.stale_refusals, f.answers_respilled + f.answers_ended, f.answers_respilled, f.answers_ended)
     }
 
     /// Test builds: the most entries one note moved inside its store-mutex hold (`held_moved_max`).
