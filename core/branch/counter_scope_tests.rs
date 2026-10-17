@@ -199,3 +199,83 @@ fn the_fuzzy_held_syscall_budget_is_judged_beside_another_stores_work() {
         );
     }
 }
+
+/// The child of `a_single_store_runs_own_counts_equal_the_process_counts` (counters review HIGH-2):
+/// each arm's whole life, opened through a SYMLINKED directory (so the path a file is opened by is not
+/// the store's real one, as macOS's /var is /private/var), including a trunk WAL checkpoint and the
+/// close; then, per arm, the syncs counted as the store's against the process's.
+#[cfg(unix)]
+#[test]
+fn parity_lifecycle_child() {
+    if std::env::var_os("FE_PARITY_CHILD").is_none() {
+        return;
+    }
+    let real = tempfile::TempDir::new().unwrap();
+    let link_root = tempfile::TempDir::new().unwrap();
+    let link = link_root.path().join("via");
+    std::os::unix::fs::symlink(real.path(), &link).unwrap();
+    let arms: &[(BranchDurability, BranchCheckpoint)] = &[
+        (BranchDurability::Catalog { sync: SyncClass::Fsync }, BranchCheckpoint::Fuzzy),
+        (BranchDurability::Catalog { sync: SyncClass::FullFsync }, BranchCheckpoint::Fuzzy),
+        (BranchDurability::Catalog { sync: SyncClass::Off }, BranchCheckpoint::Fuzzy),
+        (BranchDurability::Catalog { sync: SyncClass::Fsync }, BranchCheckpoint::Sharp),
+        (BranchDurability::Durable { sync: SyncClass::Fsync }, BranchCheckpoint::Sharp),
+        (BranchDurability::Durable { sync: SyncClass::FullFsync }, BranchCheckpoint::Sharp),
+        (BranchDurability::Volatile, BranchCheckpoint::Sharp),
+    ];
+    let all = |s: SyncCounts| (s.fsync, s.full_fsync, s.barrier, s.barrier_fallback);
+    let mut bad = 0;
+    for (i, &(durability, ckpt)) in arms.iter().enumerate() {
+        let path = link.join(format!("p{i}.db"));
+        let (own0, proc0) = (all(super::store::own_sync_counts()), all(super::sync_counts()));
+        for round in 0..2 {
+            let db = open_with(&path, durability, ckpt);
+            db.branch_wait_name_filter();
+            let trunk = db.connect().unwrap();
+            if round == 0 {
+                trunk.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+            }
+            for j in 0..12 {
+                trunk.execute(format!("INSERT INTO t VALUES ({}, 'x')", round * 100 + j)).unwrap();
+                trunk.create_branch(&format!("r{round}b{j}")).unwrap();
+            }
+            db.drop_branch(&format!("r{round}b5")).unwrap();
+            db.branch_compact_now().unwrap();
+            db.branch_checkpoint_wait();
+            let _ = trunk.execute("PRAGMA wal_checkpoint(TRUNCATE)");
+            drop(trunk);
+            drop(db);
+        }
+        let (own1, proc1) = (all(super::store::own_sync_counts()), all(super::sync_counts()));
+        let d = |a: (u64, u64, u64, u64), b: (u64, u64, u64, u64)| (b.0 - a.0, b.1 - a.1, b.2 - a.2, b.3 - a.3);
+        let (own, process) = (d(own0, own1), d(proc0, proc1));
+        if own != process {
+            bad += 1;
+        }
+        println!("PARITY arm={i} {durability:?}/{ckpt:?}: own {own:?} process {process:?}");
+    }
+    println!("PARITY-BAD {bad}");
+}
+
+/// Counters review HIGH-2: in a run where one store at a time is the only thing syncing, the syncs
+/// counted as the stores' equal the process's, arm by arm. A sync attributed to no store (a path the
+/// registry does not know, HIGH-1) breaks the equality where `UNSCOPED` cannot see it.
+#[cfg(unix)]
+#[test]
+fn a_single_store_runs_own_counts_equal_the_process_counts() {
+    if std::env::var_os("FE_PARITY_CHILD").is_some() {
+        return;
+    }
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["branch::counter_scope_tests::parity_lifecycle_child", "--exact", "--test-threads=1", "--nocapture"])
+        .env("FE_PARITY_CHILD", "1")
+        .output()
+        .unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "the parity child failed:\n{text}");
+    let bad: u64 = text
+        .lines()
+        .find_map(|l| l.find("PARITY-BAD ").map(|i| l[i + 11..].trim().parse().unwrap()))
+        .unwrap_or_else(|| panic!("premise: the parity child ran:\n{text}"));
+    assert_eq!(bad, 0, "arms whose own counts differ from the process's:\n{text}");
+}
