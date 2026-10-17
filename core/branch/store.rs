@@ -13188,6 +13188,29 @@ mod tests {
     /// Review filter3 L4: a hold that retires a fifth table breaks the bound the retired slots rest
     /// on (every noting hold takes them, one hold retires at most four). It must be refused
     /// loudly, never freed in place under the store mutex without a word.
+    /// Review filter3 L7: a Stale answer that already holds a fixed table (a failed scan restored a
+    /// respilled answer) respills a refused note into a kept spare, as Building's and Overflowed's
+    /// answers do (N1), when a fixed slot is free: it keeps answering through the build's backoff
+    /// instead of ending and sending lookups to the catalog.
+    #[test]
+    fn a_stale_answer_with_a_fixed_table_respills_a_refused_note() {
+        let mut f = NameFilter::default();
+        let (t0, t1) = (Arc::new(FilterTable::for_keys(8)), Arc::new(FilterTable::for_keys(8)));
+        assert!(t0.insert(f.hash("in-fixed")) && t1.insert(f.hash("in-sink")), "premise: the tables take their names");
+        f.state = FilterState::Stale { answer: Answer { fixed: [Some(t0), None], sink: t1 } };
+        f.spare = Some(Arc::new(FilterTable::for_keys(FILTER_SPARE_KEYS)));
+        let h = f.hash("refused");
+        f.refused(h);
+        assert!(
+            matches!(f.state, FilterState::Stale { .. }),
+            "CLAIM: the refusal ended the Stale answer though a spare and a free fixed slot were there"
+        );
+        for name in ["in-fixed", "in-sink", "refused"] {
+            assert!(!f.says_absent(name), "CLAIM: the respilled Stale answer said absent for {name}");
+        }
+        assert!(f.spare.is_none(), "premise: the spare became the sink");
+    }
+
     #[test]
     #[should_panic(expected = "retired slots are full")]
     fn a_fifth_retired_filter_table_is_refused_loudly() {
