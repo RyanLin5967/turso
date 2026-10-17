@@ -4340,6 +4340,24 @@ mod dialect_switch_tests {
         );
     }
 
+    /// The wire line review M3: statements whose plain translation is right parse Ok through the
+    /// dialect: a CTE referenced with an alias column list (resolved with no lookup), and an
+    /// INSERT holding the string 'default' (no DEFAULT keyword). 92257e453's refusal list refused
+    /// both.
+    #[test]
+    fn a_cte_alias_and_a_default_string_parse() {
+        for sql in [
+            "WITH c(a) AS (SELECT 1) SELECT p FROM c AS x(p)",
+            "INSERT INTO t VALUES (1, 'default')",
+        ] {
+            assert!(
+                matches!(PostgresDialect.parse(sql), Ok((Some(_), _))),
+                "{sql}: {:?}",
+                PostgresDialect.parse(sql).err()
+            );
+        }
+    }
+
     /// Text marked as this frontend's own SQLite takes the SQLite parse, and the same text
     /// unmarked does not.
     #[test]

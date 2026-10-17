@@ -1,0 +1,17 @@
+>> Q SET LOCAL TimeZone = '--5'
+   N S=WARNING C=25P01 M=SET LOCAL can only be used in transaction blocks
+   E S=ERROR C=22023 M=invalid value for parameter "TimeZone": "--5"
+   Z I
+>> Q SET LOCAL TimeZone = 'America/New_York'
+   N S=WARNING C=25P01 M=SET LOCAL can only be used in transaction blocks
+   C SET
+   Z I
+>> Q SET LOCAL search_path TO public
+   N S=WARNING C=25P01 M=SET LOCAL can only be used in transaction blocks
+   C SET
+   Z I
+>> Q SHOW search_path
+   T oids=[25]
+   D ['"$user", public']
+   C SHOW
+   Z I

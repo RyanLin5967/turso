@@ -13570,21 +13570,39 @@ fn a_kept_statement_is_not_reused_across_ddl_the_key_did_not_see() {
     let dir = Scratch::new("kept-attached");
     let server = two_schemas(&dir);
     let mut wrong = Vec::new();
-    for (label, path, ddl, want) in [
-        ("DROP TABLE s.t", true, &["DROP TABLE s.t"][..], Err("42P01")),
-        ("ALTER TABLE s.t ADD COLUMN", true, &["ALTER TABLE s.t ADD COLUMN y INT"][..], Ok("2")),
+    // (label, under search_path s, statements run first, the kept statement, the DDL in the round,
+    // the answer wanted: an error code, the rows, or the last command tag). The temp arm is a kept
+    // DELETE ... USING over a temp t created in the round (the wire line review M5: a kept SELECT
+    // read the temp table's 3 at the base too, since the engine's re-prepare resolves temp
+    // first; a DELETE ... USING re-prepared by the engine has no column lookup and errors).
+    let arms: [(&str, bool, &[&str], &str, &[&str], Result<&str, &str>); 3] = [
+        ("DROP TABLE s.t", true, &[], "SELECT x FROM t", &["DROP TABLE s.t"], Err("42P01")),
         (
-            "a temp t",
-            false,
-            &["CREATE TEMP TABLE t(x INT)", "INSERT INTO t VALUES (3)"][..],
-            Ok("3"),
+            "ALTER TABLE s.t ADD COLUMN",
+            true,
+            &[],
+            "SELECT x FROM t",
+            &["ALTER TABLE s.t ADD COLUMN y INT"],
+            Ok("2"),
         ),
-    ] {
+        (
+            "a temp t under a kept DELETE ... USING",
+            false,
+            &["CREATE TABLE u(x INT)", "INSERT INTO u VALUES (3)"],
+            "DELETE FROM t USING u WHERE t.x = u.x",
+            &["CREATE TEMP TABLE t(x INT)", "INSERT INTO t VALUES (3)"],
+            Ok("DELETE 1"),
+        ),
+    ];
+    for (label, path, before, kept, ddl, want) in arms {
         let mut a = server.connect();
         if path {
             a.q("SET search_path TO s").ok("path");
         }
-        named_parse(&mut a, "sq", "SELECT x FROM t");
+        for sql in before {
+            a.q(sql).ok(sql);
+        }
+        named_parse(&mut a, "sq", kept);
         for (i, sql) in ddl.iter().enumerate() {
             let name = format!("d{i}");
             named_parse(&mut a, &name, sql);
@@ -13599,6 +13617,11 @@ fn a_kept_statement_is_not_reused_across_ddl_the_key_did_not_see() {
             Err(code) => {
                 if r.error.as_ref().map(|e| e.code.as_str()) != Some(code) || !r.rows.is_empty() {
                     wrong.push(format!("{label}: want {code}, got rows {:?} error {:?}", r.rows, r.error));
+                }
+            }
+            Ok(v) if v.starts_with("DELETE") => {
+                if r.error.is_some() || r.tags.last().map(String::as_str) != Some(v) {
+                    wrong.push(format!("{label}: want {v}, got tags {:?} error {:?}", r.tags, r.error));
                 }
             }
             Ok(v) => {
@@ -13666,3 +13689,74 @@ fn a_named_statement_bound_after_a_search_path_change_reads_the_new_path() {
     assert!(r.error.is_none(), "{:?}", r.error);
     assert_eq!(r.rows, vec![vec![Some("2".to_string())]], "the read under search_path s");
 }
+
+/// Read `n` backend messages after a Flush, returning their tags (no ReadyForQuery comes).
+fn read_tags(w: &mut Wire, n: usize) -> Vec<u8> {
+    use std::io::Read;
+    (0..n)
+        .map(|_| {
+            let mut tag = [0u8; 1];
+            w.s.read_exact(&mut tag).unwrap();
+            let mut len = [0u8; 4];
+            w.s.read_exact(&mut len).unwrap();
+            let mut body = vec![0u8; i32::from_be_bytes(len) as usize - 4];
+            w.s.read_exact(&mut body).unwrap();
+            tag[0]
+        })
+        .collect()
+}
+
+/// The wire line review M1 and M2 (ONE TRANSLATION PATH): a statement Parsed and Bound, then
+/// another session's DDL, then its Execute: the engine re-prepares it on the schema change, and
+/// that re-prepare must translate it as the session did. A DELETE ... USING keeps its column
+/// lookup (DELETE 1; it was refused, "must be prepared again by its session"), and a cast to a
+/// domain keeps its CHECK (23514; it returned -5).
+#[test]
+fn a_reprepare_after_another_sessions_ddl_translates_as_the_session_did() {
+    let dir = Scratch::new("reprepare-xsession");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut b = server.connect();
+    a.q("CREATE TABLE a(x INT)").ok("a");
+    a.q("CREATE TABLE b(x INT)").ok("b");
+    a.q("INSERT INTO a VALUES (1), (2), (3)").ok("rows a");
+    a.q("INSERT INTO b VALUES (2)").ok("rows b");
+    a.q("CREATE DOMAIN dm AS INT CHECK (VALUE > 0)").ok("domain");
+    let mut wrong = Vec::new();
+    for (i, (sql, ddl)) in [
+        ("DELETE FROM a USING b WHERE a.x = b.x", "CREATE TABLE z1(i INT)"),
+        ("SELECT CAST(-5 AS dm)", "CREATE TABLE z2(i INT)"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let name = format!("k{i}");
+        named_parse(&mut a, &name, sql);
+        named_bind(&mut a, "", &name);
+        a.send(b'H', &[]);
+        let tags = read_tags(&mut a, 2);
+        if tags != b"12" {
+            wrong.push(format!("{sql}: Parse and Bind answered {tags:?}"));
+        }
+        b.q(ddl).ok(ddl);
+        named_execute(&mut a, "");
+        a.send(b'S', &[]);
+        let r = a.read_reply();
+        if i == 0 {
+            if r.error.is_some() || r.tags.last().map(String::as_str) != Some("DELETE 1") {
+                wrong.push(format!("{sql}: tags {:?} error {:?}", r.tags, r.error));
+            }
+        } else if r.error.as_ref().map(|e| e.code.as_str()) != Some("23514") {
+            wrong.push(format!("{sql}: rows {:?} error {:?}", r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    let left = a.q("SELECT x FROM a ORDER BY x");
+    assert_eq!(left.rows, vec![vec![Some("1".to_string())], vec![Some("3".to_string())]]);
+}
+// The wire line review M6 and L3, and review C finding (1): every TimeZone value it names, recorded
+// on PG 18.6 (SET TIME ZONE INTERVAL '1 day' 22023, 'x' 22007, the 167-hour bound, '<>5' accepted,
+// ';' refused ...), and SET LOCAL outside a block: the warning BEFORE the value's error. Strict
+// until a run's diff registers the intended 0A000 rows (valid zones this server does not act on).
+replays_postgresql!(pg18_rev_cd_tz2_replays_as_postgresql_answered, "pg18-rev-cd-tz2.out", []);
+replays_postgresql!(pg18_rev_cd_setlocal_replays_as_postgresql_answered, "pg18-rev-cd-setlocal.out", []);
