@@ -6991,15 +6991,42 @@ mod tests {
         let s = session(&dir);
         ok(&s, "CREATE TABLE t(id INT)");
         let conn = s.current(&mut s.state()).unwrap();
+        // One assertion per event that runs publish (review wire-rework D-L1), each read right
+        // after it, so a failure names the event that bumped. NOT asserted: ROLLBACK, ROLLBACK TO
+        // and a failed block's end, where the engine's own rollback bumps the generation
+        // (pager.rs rollback, execute.rs savepoint restore) whatever publish does, so their
+        // reading cannot isolate publish; and adopt_session_of (a branch switch).
+        let mut wrong = Vec::new();
+        let mut events: Vec<(&str, &[&str])> = vec![
+            ("BEGIN; SELECT 1; COMMIT", &["BEGIN", "SELECT 1", "COMMIT"][..]),
+            ("SAVEPOINT", &["BEGIN", "SAVEPOINT a"][..]),
+            ("RELEASE", &["RELEASE a", "COMMIT"][..]),
+            // A multi-statement query: its implicit block ends through end_implicit's commit,
+            // which runs publish (D-M1: a single statement runs in autocommit and never did).
+            ("an implicit block", &["INSERT INTO t VALUES (1); SELECT 1"][..]),
+            ("SET lock_timeout to its value", &["SET lock_timeout = 0"][..]),
+            ("SET client_min_messages", &["SET client_min_messages TO notice"][..]),
+            ("SET lock_timeout", &["SET lock_timeout = '1s'"][..]),
+        ];
+        for (label, sqls) in events.drain(..) {
+            let before = conn.inner().prepare_context_generation();
+            for sql in sqls {
+                let _ = s.simple(sql);
+            }
+            let after = conn.inner().prepare_context_generation();
+            if after != before {
+                wrong.push(format!("{label}: the prepare generation moved {before} -> {after}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+        // The control (D-L2): a SET that does change what the engine compiles by bumps it, or a
+        // setter that never bumped (stale statements after a real change) would pass the above.
         let before = conn.inner().prepare_context_generation();
-        ok(&s, "BEGIN");
-        ok(&s, "SELECT 1");
-        ok(&s, "COMMIT");
-        ok(&s, "INSERT INTO t VALUES (1)");
-        assert_eq!(
+        ok(&s, "SET foreign_keys = off");
+        assert_ne!(
             conn.inner().prepare_context_generation(),
             before,
-            "a block end with no setting changed bumped the prepare generation"
+            "SET foreign_keys = off did not bump the prepare generation"
         );
     }
 
