@@ -3205,7 +3205,7 @@ fn every_mv_store_install_or_removal_bumps_the_database_wide_generation() {
             }
         }
     }
-    assert!(sites >= 5, "premise: the scan found {sites} MV-store stores, fewer than the 7 known");
+    assert!(sites >= 7, "premise: the scan found {sites} MV-store stores, fewer than the 7 known");
     assert!(unbumped.is_empty(), "CLAIM: MV-store installs or removals with no database-wide generation bump: {unbumped:?}");
 }
 
