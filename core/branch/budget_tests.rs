@@ -3191,6 +3191,39 @@ fn the_instruments_count_exactly_under_every_flag() {
     assert!(out.status.success(), "the instruments' exact counts fail with every flag set:\n{text}");
 }
 
+/// Counters review 4 LOW-D (DECISIONS 6399fd35bf): an armed hold taken before any window allocates
+/// nothing under the store mutex. Measured in a fresh process, where nothing is primed, with
+/// FE_MUTANT set (so the mutant name's first read allocates): `arm(true)`, one hold through the
+/// probe, and the thread's held allocations must not move. A held allocation here is the probe's
+/// own (`mutant_on`'s unprimed fallback, or a lazy lookup at the lock), charged to a measured hold.
+#[test]
+fn an_armed_hold_before_any_window_allocates_nothing_under_the_mutex() {
+    if std::env::var_os("FE_ARM_CHILD").is_some() {
+        let (_, _, held0, bytes0) = probe::thread_allocs();
+        probe::arm(true);
+        probe::store_locked();
+        probe::store_unlocked();
+        let (_, _, held1, bytes1) = probe::thread_allocs();
+        probe::arm(false);
+        println!("ARM-CHILD held_allocs {} held_bytes {}", held1 - held0, bytes1 - bytes0);
+        return;
+    }
+    if in_child() || std::env::var_os("FE_FLAGS_CHILD").is_some() {
+        return;
+    }
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["branch::budget_tests::an_armed_hold_before_any_window_allocates_nothing_under_the_mutex", "--exact", "--test-threads=1", "--nocapture"])
+        .env("FE_ARM_CHILD", "1")
+        .env("FE_MUTANT", std::env::var("FE_MUTANT").unwrap_or_else(|_| "no_mutant_has_this_name".to_string()))
+        .env_remove("FE_BUDGET_CHILD")
+        .output()
+        .unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success() && text.contains("test result: ok. 1 passed"), "premise: the arm child ran:\n{text}");
+    let line = text.lines().find_map(|l| l.find("ARM-CHILD ").map(|i| l[i..].to_string())).unwrap_or_else(|| panic!("premise: the arm child reported nothing:\n{text}"));
+    assert_eq!(line.trim(), "ARM-CHILD held_allocs 0 held_bytes 0", "an armed hold before any window allocated under the store mutex");
+}
+
 /// Counters review MED-5, review 2 HIGH 2 and review 3 MED-B/LOW-4/LOW-10 (DECISIONS 7d1c461378,
 /// 4e5b6e3b0a): a parity check needs an independent second count. In a budget child the process's
 /// sync counts are exact (one cell's stores at a time) and the budget's reading IS them
