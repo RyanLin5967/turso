@@ -12423,6 +12423,51 @@ fn a_create_behind_a_background_compaction_is_counted() {
     eventually("the background compaction never ran", || db.branches.background_compactions() >= 1);
 }
 
+/// Review c42b MED-1: a bounded CHECKPOINT that waited behind the background compaction's sync
+/// under the mutex is counted as an operation that waited (`branch_exception_counters()[3]`), as
+/// `lock()` counts one: "an overcount, never a miss". `lock_within` read `compacting` only at the
+/// successful `try_lock`, after the compaction had cleared it. The fixture of
+/// `a_create_behind_a_background_compaction_is_counted`, with `branch_compact_now_within` as the
+/// waiter.
+#[test]
+fn a_bounded_checkpoint_behind_a_background_compaction_is_counted() {
+    let _s = serial();
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            super::store::COMPACT_CATCH_UPS_OFF.store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+    let _restore = Restore;
+    super::store::COMPACT_CATCH_UPS_OFF.store(true, std::sync::atomic::Ordering::Release);
+    let dir = tempfile::TempDir::new().unwrap();
+    let (db, trunk, x, _) = raised_d0_with_a_kept_pre_image(&dir.path().join("bounded-compact-wait.db"), false, true);
+    let _x = x.into_id();
+    db.branches.confirm_hold_for_test(super::store::HOLD_COMPACT_TAIL);
+    let _t = Threshold::set(8 << 10);
+    let t = std::time::Instant::now();
+    while !db.branches.compaction_owed_for_test() {
+        let _ = trunk.fork_branch().unwrap().into_id();
+        assert!(t.elapsed() < std::time::Duration::from_secs(30), "premise: no create owed a compaction");
+    }
+    eventually("premise: the background compaction never reached its hold", || {
+        db.branches.confirm_held_for_test() == super::store::HOLD_COMPACT_TAIL | super::store::HOLD_ARRIVED
+    });
+    let before = db.branch_exception_counters();
+    let waiter = {
+        let db = db.clone();
+        std::thread::spawn(move || db.branch_compact_now_within(std::time::Instant::now() + std::time::Duration::from_secs(10), &|| false))
+    };
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let waited_while_held = !waiter.is_finished();
+    db.branches.confirm_hold_for_test(0);
+    let joined = waiter.join().unwrap();
+    let after = db.branch_exception_counters();
+    assert!(waited_while_held, "premise: the bounded CHECKPOINT did not wait behind the compaction's hold");
+    assert!(joined.is_ok(), "premise: the bounded CHECKPOINT failed: {joined:?}");
+    assert!(after[3] > before[3], "CLAIM: a bounded CHECKPOINT that waited behind the background compaction was not counted");
+}
+
 /// C15 ruling (fastest DECISIONS 2026-10-15T04:15:07Z), exception (a), the hard-cap fallback: with
 /// the bound forced to 1 and the background writer held where it found the upgrade due, every
 /// held-free upgrade is led by a freeing operation past the hard cap, and each is counted
