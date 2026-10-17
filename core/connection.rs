@@ -870,8 +870,11 @@ impl Connection {
             .fetch_add(1, Ordering::Release);
     }
 
+    /// The generation every prepared statement of this connection was compiled under: a setter
+    /// whose change invalidates compiled programs bumps it, and a statement prepared under an older
+    /// one is reprepared before it runs. Read only (for frontends measuring re-prepares).
     #[inline]
-    pub(crate) fn prepare_context_generation(&self) -> u64 {
+    pub fn prepare_context_generation(&self) -> u64 {
         self.prepare_context_generation.load(Ordering::Acquire)
     }
 
