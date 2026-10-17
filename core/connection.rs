@@ -4596,12 +4596,17 @@ impl Connection {
     pub fn set_sync_type(&self, value: crate::io::FileSyncType) {
         // Read by PRAGMA fullfsync's compiled answer (translate/pragma.rs): bumped on a change
         // (engine-rev-setter MED-1).
+        // Bumped only if what the pager reports changed (review C42 LOW-7: off Apple the pager has one
+        // sync type and ignores the set, so nothing compiled in changes).
         let pager = self.pager.load();
-        if pager.get_sync_type() == value {
+        let before = pager.get_sync_type();
+        if before == value {
             return;
         }
         pager.set_sync_type(value);
-        self.bump_prepare_context_generation();
+        if pager.get_sync_type() != before {
+            self.bump_prepare_context_generation();
+        }
     }
 
     /// Creates a HashSet of modules that have been loaded
