@@ -13391,3 +13391,7 @@ replays_postgresql!(pg18_c44_m2_sets_replays_as_postgresql_answered, "pg18-c44-m
 // Review c39799c5d..9e24b455d MED 2: a TimeZone value naming a host path (or a zone-directory file that
 // is not a zone) is PostgreSQL's 22023, so no answer tells a client which host files exist.
 replays_postgresql!(pg18_rev_c39_tzpath_replays_as_postgresql_answered, "pg18-rev-c39-tzpath.out", []);
+// C53 follow-up (Codex C56's NEEDS-CLAUDE, frontier/codex/reports/C56-protocol-dependency.md): a
+// retained named statement whose relation was dropped is refused at Bind (42P01, before
+// BindComplete), where PostgreSQL's GetCachedPlan revalidates it, not at Execute.
+replays_postgresql!(pg18_c56_schema_prepared_replays_as_postgresql_answered, "pg18-c56-schema-prepared.out", []);

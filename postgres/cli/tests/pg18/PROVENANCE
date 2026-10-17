@@ -99,3 +99,4 @@ pg18-c53-dropnotice.out 21c74c0dcc d97a2445c2a51060
 pg18-c49-low5.out ad833569cd 72e8bd80883f5e69
 pg18-c44-m2-sets.out 3120d26047 e81b89dea7bfef85
 pg18-rev-c39-tzpath.out 051e38b5d0 cf0af16432d12b44
+pg18-c56-schema-prepared.out 7c3889455d 354be2a4f5803e93
