@@ -4019,6 +4019,69 @@ fn checkpoint_now_with_no_bound_on_its_wait_installs() {
     assert!(db.branch_checkpoint_counters()[0] > installed0, "CLAIM: Ok(true) with no checkpoint installed");
 }
 
+/// Review c42b LOW-8 (C42 LOW-2 was fixed with no red): a bounded compaction's wait for a flight
+/// evaluates the caller's interrupt with the flight-jobs mutex let go, so an interrupt that touches
+/// the store's flights does not deadlock. A fuzzy flight is held before its commit; the compaction
+/// waits for it with an interrupt that itself waits for every flight (`branch_checkpoint_wait`,
+/// which takes that mutex) and then interrupts; the hold is released 200 ms after the interrupt is
+/// first called. It must answer `Interrupt` within 30 s. Expected red at 5eca7a09a^: the interrupt
+/// ran with the mutex held, and its wait relocked it on the same thread.
+#[test]
+fn a_bounded_compaction_s_interrupt_may_wait_for_the_flights() {
+    use std::sync::atomic::{AtomicBool, Ordering::{Acquire, Release}};
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(
+        &dir.path().join("compact-interrupt-unlocked.db"),
+        opts(true, SyncClass::Fsync).with_branch_checkpoint(super::BranchCheckpoint::Fuzzy),
+    );
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    for _ in 0..8 {
+        let _ = trunk.fork_branch().unwrap().into_id();
+    }
+    db.branch_checkpoint_wait();
+    struct Unhold(Arc<Database>);
+    impl Drop for Unhold {
+        fn drop(&mut self) {
+            self.0.branch_checkpoint_hold(0);
+        }
+    }
+    let _unhold = Unhold(db.clone());
+    db.branch_checkpoint_hold(super::store::HOLD_BEFORE_COMMIT);
+    assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: a fuzzy flight started");
+    let t = std::time::Instant::now();
+    while db.branch_checkpoint_held() != super::store::HOLD_BEFORE_COMMIT | super::store::HOLD_ARRIVED {
+        assert!(t.elapsed() < std::time::Duration::from_secs(10), "premise: the flight never reached its hold");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let called = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = std::sync::mpsc::channel();
+    {
+        let (db, called) = (db.clone(), called.clone());
+        std::thread::spawn(move || {
+            let begun = std::time::Instant::now();
+            let interrupted = || {
+                called.store(true, Release);
+                db.branch_checkpoint_wait();
+                true
+            };
+            let _ = tx.send(db.branch_compact_now_within(begun + std::time::Duration::from_secs(600), &interrupted));
+        });
+    }
+    let t = std::time::Instant::now();
+    while !called.load(Acquire) {
+        assert!(t.elapsed() < std::time::Duration::from_secs(10), "premise: the compaction never evaluated its interrupt");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    db.branch_checkpoint_hold(0);
+    let r = rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("CLAIM: the compaction's interrupt deadlocked on the flight-jobs mutex (no answer in 30 s)");
+    assert!(matches!(r, Err(LimboError::Interrupt)), "CLAIM: the interrupted compaction answered {r:?}, not Interrupt");
+}
+
 /// Review C42 MED-3: `checkpoint_now` whose own flight INSTALLED but whose WAL truncation ran past
 /// the deadline reports the install (`Ok(true)`), as its doc says (`Ok(false)`: none did before
 /// the deadline). The flight is held at `HOLD_BEFORE_WAL_TRUNCATE`, after its install, past a
