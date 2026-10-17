@@ -2312,8 +2312,17 @@ impl Session {
         // none of the store's, so no client could force or count it (PREREG section 5 M2; wire
         // review 14 item 13). It waits for a fuzzy checkpoint in flight, which is why a block's
         // CHECKPOINT, which never waits, leaves the store alone.
-        self.waiting(|| self.shared.db.branch_compact_now())
-            .map_err(|e| engine_info(&e))?;
+        // Bounded by the session's lock wait and ended by its cancel or statement_timeout
+        // (C42-M1): the store's wait for a flight in progress had no deadline. At `until` the
+        // engine answers Busy, which `waiting` retries on its schedule; an interrupt is
+        // LimboError::Interrupt, which engine_info answers 57014.
+        let until = std::time::Instant::now() + self.lock_wait();
+        self.waiting(|| {
+            self.shared
+                .db
+                .branch_compact_now_within(until, &|| self.interrupts.should_stop())
+        })
+        .map_err(|e| engine_info(&e))?;
         Ok(Response::Execution(Tag::new("CHECKPOINT")))
     }
 
