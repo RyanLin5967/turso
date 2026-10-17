@@ -3336,17 +3336,50 @@ fn every_budget_windows_syncs_equal_the_process_syncs_in_its_child() {
             let _ = writeln!(survived, "  {spec} (killer {}, {in_cell} windows compared)", killer(spec));
         }
     }
-    assert!(cells_read > 0, "premise: no cell was read");
     if mutant {
-        assert!(compared > 0, "premise: under the mutant no window carried both counts: nothing was killed");
-        if !survived.is_empty() {
-            eprintln!("drop_journal_sync_count SURVIVED in:\n{survived}");
-            return;
+        match parity_mutant_verdict(cells_read, compared, &survived, &failures) {
+            Ok(survivors) => {
+                eprintln!("{survivors}");
+                return;
+            }
+            Err(killed) => panic!("{killed}"),
         }
-        panic!("drop_journal_sync_count KILLED in every cell ({cells_read} cells, {compared} compared):\n{failures}");
     }
+    assert!(cells_read > 0, "premise: no cell was read");
     assert!(compared > 0, "premise: no window carried both counts");
     assert!(failures.is_empty(), "budget windows whose stores' own sync counts are not the process's ({compared} compared):\n{failures}");
+}
+
+/// The parity test's verdict under `drop_journal_sync_count`, by the mutation convention: `Ok`, the
+/// mutant SURVIVED (the run passes, the message names the survivors); `Err`, it was KILLED (the run
+/// fails). `survived` lists the cells with no window compared or no mismatch on their killer key.
+fn parity_mutant_verdict(cells_read: usize, compared: usize, survived: &str, failures: &str) -> Result<String, String> {
+    if cells_read == 0 {
+        return Err("premise: no cell was read".to_string());
+    }
+    if compared == 0 {
+        return Err("premise: under the mutant no window carried both counts: nothing was killed".to_string());
+    }
+    if !survived.is_empty() {
+        return Ok(format!("drop_journal_sync_count SURVIVED in:\n{survived}"));
+    }
+    Err(format!("drop_journal_sync_count KILLED in every cell ({cells_read} cells, {compared} compared):\n{failures}"))
+}
+
+/// Counters review 5 LOW-E (DECISIONS 52616c176d): under the mutation convention no premise may turn a
+/// survivor into a kill. A run that compared nothing (every cell a survivor) and a run that read no
+/// cell are SURVIVED, with the reason; only a mismatch on every cell's killer key is KILLED.
+#[test]
+fn the_parity_verdict_counts_no_survivor_as_killed() {
+    let all_uncompared = "  a (killer fsync, 0 windows compared)\n  b (killer full_fsync, 0 windows compared)\n";
+    let v = parity_mutant_verdict(2, 0, all_uncompared, "");
+    assert!(v.as_ref().is_ok_and(|m| m.contains("SURVIVED")), "every cell uncompared read as killed: {v:?}");
+    let v = parity_mutant_verdict(0, 0, "", "");
+    assert!(v.as_ref().is_ok_and(|m| m.contains("SURVIVED") && m.contains("no cell")), "an empty cell list read as killed: {v:?}");
+    let v = parity_mutant_verdict(2, 7, "  a (killer fsync, 3 windows compared)\n", "  ...\n");
+    assert!(v.as_ref().is_ok_and(|m| m.contains("SURVIVED in") && m.contains("  a ")), "a cell without a killer mismatch read as killed: {v:?}");
+    let v = parity_mutant_verdict(2, 7, "", "  a: x\n  b: y\n");
+    assert!(v.as_ref().is_err_and(|m| m.contains("KILLED in every cell")), "a mismatch on every cell's killer key did not read as killed: {v:?}");
 }
 
 #[cfg(target_vendor = "apple")]
