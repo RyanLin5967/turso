@@ -2769,8 +2769,8 @@ impl FilterTable {
 ///
 /// ONE state (`FilterState`, review REVIEW-claude-namefilter H1, DECISIONS: the class of a half-
 /// updated filter): the tables, and what a note and a lookup do with them, are a single value,
-/// replaced only by one assignment inside one store-mutex hold, and the filter answers "absent" ONLY
-/// in `Ready`. Before, `built`, `pending`, `draining` and `overflowed` were four fields set in
+/// replaced only by one assignment inside one store-mutex hold, and the filter answers "absent" only
+/// from tables that together hold every name noted (`says_absent`). Before, `built`, `pending`, `draining` and `overflowed` were four fields set in
 /// separate holds, and between two of them a lookup read "absent" for a name only a draining table
 /// held. A growth or a build that comes back to a state other than the one it left (an overflow
 /// meanwhile) changes nothing (`Arc::ptr_eq`).
@@ -2799,6 +2799,34 @@ struct NameFilter {
     builds: u64,
     failed_scans: u64,
     rebuilds: u64,
+    /// An empty table kept for a refusal (lead order (a), filter case 4): the refused key and every
+    /// later note go into it, so the refusing tables keep answering until the owed rebuild lands
+    /// (`Answer`). Allocated off the mutex by a growth or a build, which install it if none is
+    /// kept; taken by a refusal. With none kept, a refusal leaves no answer (lookups ask the
+    /// catalog until the rebuild).
+    spare: Option<Arc<FilterTable>>,
+}
+
+/// The keys a refusal's spare table holds before it refuses too (`NameFilter::spare`): the notes of
+/// one rebuild's window. 2 x 1024 slots, 16 KiB.
+const FILTER_SPARE_KEYS: usize = 1024;
+
+/// What answers for the name filter while no single complete table does (lead order (a), filter
+/// cases 2 and 4): every name noted is in `sink` or one of `fixed`, and every note goes into
+/// `sink`. A note `sink` refuses ends the answer (lookups then ask the catalog).
+struct Answer {
+    fixed: [Option<Arc<FilterTable>>; 2],
+    sink: Arc<FilterTable>,
+}
+
+impl Answer {
+    fn of(sink: Arc<FilterTable>) -> Self {
+        Self { fixed: [None, None], sink }
+    }
+
+    fn contains(&self, h: u64) -> bool {
+        self.sink.contains(h) || self.fixed.iter().flatten().any(|t| t.contains(h))
+    }
 }
 
 /// The name filter's one state (`NameFilter`).
@@ -2808,13 +2836,14 @@ enum FilterState {
     #[default]
     Unbuilt,
     /// The catalog scan of a build runs off the mutex; names noted meanwhile go into `pending`,
-    /// and into `old` if the build replaces a complete table (a shrink's, from `Stale`), which
-    /// answers meanwhile; a note `old` refuses drops it (lookups then ask the catalog).
-    Building { pending: Arc<FilterTable>, old: Option<Arc<FilterTable>> },
-    /// `table` is complete but a rebuild is owed: a shrink (lead order (a): it overflowed before,
-    /// and every create until the rebuild landed asked the catalog). Notes go into `table`, which
-    /// answers; one it refuses overflows.
-    Stale { table: Arc<FilterTable> },
+    /// and into `old` if the build replaces an answer (a shrink's, from `Stale`, or a refusal's,
+    /// from `Overflowed`), which answers meanwhile; a note `old` refuses drops it (lookups then ask
+    /// the catalog).
+    Building { pending: Arc<FilterTable>, old: Option<Answer> },
+    /// A complete answer, but a rebuild is owed: a shrink (lead order (a): it overflowed before,
+    /// and every create until the rebuild landed asked the catalog). Notes go into it; one it
+    /// refuses overflows.
+    Stale { answer: Answer },
     /// The filter answers from `table`.
     Ready { table: Arc<FilterTable> },
     /// A growth copies `table` into a larger one off the mutex; notes go into both.
@@ -2822,8 +2851,10 @@ enum FilterState {
     /// A new `table` is installed and `pending` (a build's or a growth's) is being copied into it;
     /// notes go into `table`.
     Draining { table: Arc<FilterTable>, pending: Arc<FilterTable> },
-    /// A table refused a key: lookups ask the catalog until the owed rebuild lands.
-    Overflowed,
+    /// A table refused a key, and a rebuild is owed: the refusing tables and the spare that took the
+    /// refused key answer (`answer`), or, with no spare kept or once the spare refuses too, nothing
+    /// does and lookups ask the catalog until the rebuild lands.
+    Overflowed { answer: Option<Answer> },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2875,14 +2906,19 @@ impl NameFilter {
                 }
             }
         }
-        let mut old_refused = false;
+        // A note an answer's sink refused ends that answer (`Building::old`, `Overflowed`).
+        let mut answer_refused = false;
         let fits = match &self.state {
-            FilterState::Unbuilt | FilterState::Overflowed => true,
+            FilterState::Unbuilt => true,
+            FilterState::Overflowed { answer } => {
+                answer_refused = answer.as_ref().is_some_and(|a| !a.sink.insert(h));
+                true
+            }
             FilterState::Building { pending, old } => {
-                old_refused = old.as_ref().is_some_and(|o| !o.insert(h));
+                answer_refused = old.as_ref().is_some_and(|a| !a.sink.insert(h));
                 pending.insert(h)
             }
-            FilterState::Stale { table } => table.insert(h),
+            FilterState::Stale { answer } => answer.sink.insert(h),
             FilterState::Ready { table } => {
                 let fits = table.insert(h);
                 if fits && table.wants_room() && self.owed.is_none() {
@@ -2894,10 +2930,11 @@ impl NameFilter {
                         // built (`Stale`). Mutant `filter_shrink_overflows` (test builds only): it
                         // overflows, as before, and lookups ask the catalog meanwhile.
                         if fe_mutant("filter_shrink_overflows") {
-                            self.overflow();
+                            self.state = FilterState::Overflowed { answer: None };
+                            self.owed = Some(FilterWork::Rebuild);
                         } else {
                             let table = table.clone();
-                            self.state = FilterState::Stale { table };
+                            self.state = FilterState::Stale { answer: Answer::of(table) };
                             self.owed = Some(FilterWork::Rebuild);
                         }
                         return;
@@ -2910,14 +2947,58 @@ impl NameFilter {
             FilterState::Growing { table, pending } => table.insert(h) & pending.insert(h),
             FilterState::Draining { table, .. } => table.insert(h),
         };
-        if old_refused {
-            if let FilterState::Building { old, .. } = &mut self.state {
-                *old = None;
+        if answer_refused {
+            match &mut self.state {
+                FilterState::Building { old, .. } => *old = None,
+                FilterState::Overflowed { answer } => *answer = None,
+                _ => {}
             }
         }
         if !fits {
-            self.overflow();
+            self.refused(h);
         }
+    }
+
+    /// A note's key `h` was refused (a table 7/8 full): the filter overflows and owes one rebuild,
+    /// and keeps answering from what still holds every name with `h` (lead order (a), filter case
+    /// 4): the refusing state's tables, plus the spare with `h` in it where they lack `h`. Mutant
+    /// `filter_refusal_answers_nothing` (test builds only): no answer, as before.
+    fn refused(&mut self, h: u64) {
+        let answer = if fe_mutant("filter_refusal_answers_nothing") {
+            None
+        } else {
+            match std::mem::take(&mut self.state) {
+                // The table lacks `h`: it and the spare.
+                FilterState::Ready { table } => self.spill([Some(table), None], h),
+                // Notes go into both: if the old table took `h` it is still complete, else it and
+                // the spare (the pending one holds nothing the old one lacks but `h`).
+                FilterState::Growing { table, .. } => {
+                    if table.contains(h) {
+                        Some(Answer::of(table))
+                    } else {
+                        self.spill([Some(table), None], h)
+                    }
+                }
+                // Together complete but for `h`.
+                FilterState::Draining { table, pending } => self.spill([Some(table), Some(pending)], h),
+                FilterState::Stale { answer } => match answer.fixed {
+                    [None, None] => self.spill([Some(answer.sink), None], h),
+                    _ => None,
+                },
+                // The build cannot complete; what answered still does (it took `h`, or it was
+                // dropped above).
+                FilterState::Building { old, .. } => old,
+                FilterState::Unbuilt | FilterState::Overflowed { .. } => None,
+            }
+        };
+        self.state = FilterState::Overflowed { answer };
+        self.owed = Some(FilterWork::Rebuild);
+    }
+
+    /// `fixed` with the spare holding `h` as its sink, if a spare is kept and takes `h`.
+    fn spill(&mut self, fixed: [Option<Arc<FilterTable>>; 2], h: u64) -> Option<Answer> {
+        let sink = self.spare.take()?;
+        sink.insert(h).then_some(Answer { fixed, sink })
     }
 
     /// A held name was released (`live`). The table keeps its key: a filter only ever answers
@@ -2927,8 +3008,9 @@ impl NameFilter {
     }
 
     /// A table refused a key: stop answering, and owe one rebuild (never a growth per create).
-    fn overflow(&mut self) {
-        self.state = FilterState::Overflowed;
+    /// Overflow, answering from `answer` (complete) until the rebuild lands.
+    fn overflow_answering(&mut self, answer: Option<Answer>) {
+        self.state = FilterState::Overflowed { answer };
         self.owed = Some(FilterWork::Rebuild);
     }
 
@@ -2942,14 +3024,17 @@ impl NameFilter {
     /// mutex). `Ready`: its table. `Growing`: the old table, still complete (notes go into it and
     /// the pending one, and a refusal overflows). `Draining`: the new table and the pending one
     /// together, which is what `Ready` will hold (a build's scan plus its seeded pending, or a
-    /// growth's copy plus what was noted during it). `Unbuilt`, `Building` and `Overflowed` hold no
-    /// complete table, so they ask the catalog. Mutant `filter_absent_only_when_ready` (test builds
-    /// only): `Ready` alone, as before.
+    /// growth's copy plus what was noted during it). `Stale`, and `Building` and `Overflowed` with an
+    /// answer: that `Answer` (a shrink's table; a refusal's tables plus the spare that took the
+    /// refused key). `Unbuilt`, and `Building` and `Overflowed` with none, hold no complete table,
+    /// so they ask the catalog (after every reopen until its build lands, case 3; and once a spare
+    /// refuses or none was kept). Mutant `filter_absent_only_when_ready` (test builds only):
+    /// `Ready` alone, as before.
     fn says_absent(&self, name: &str) -> bool {
         // fastest-engine mutant `filter_says_absent` (test builds only): "absent" whenever a table
         // exists.
         if fe_mutant("filter_says_absent") {
-            return !matches!(self.state, FilterState::Unbuilt | FilterState::Overflowed);
+            return !matches!(self.state, FilterState::Unbuilt | FilterState::Overflowed { answer: None });
         }
         let h = self.hash(name);
         match &self.state {
@@ -2958,26 +3043,29 @@ impl NameFilter {
             FilterState::Draining { table, pending } if !fe_mutant("filter_absent_only_when_ready") => {
                 !table.contains(h) && !pending.contains(h)
             }
-            FilterState::Stale { table } | FilterState::Building { old: Some(table), .. }
+            FilterState::Stale { answer }
+            | FilterState::Building { old: Some(answer), .. }
+            | FilterState::Overflowed { answer: Some(answer) }
                 if !fe_mutant("filter_absent_only_when_ready") =>
             {
-                !table.contains(h)
+                !answer.contains(h)
             }
             FilterState::Unbuilt
             | FilterState::Building { .. }
             | FilterState::Stale { .. }
             | FilterState::Growing { .. }
             | FilterState::Draining { .. }
-            | FilterState::Overflowed => false,
+            | FilterState::Overflowed { .. } => false,
         }
     }
 
     /// The table a lookup will answer from once the filter is `Ready`, and the pending one in use.
     fn tables(&self) -> (Option<&Arc<FilterTable>>, Option<&Arc<FilterTable>>) {
         match &self.state {
-            FilterState::Unbuilt | FilterState::Overflowed => (None, None),
-            FilterState::Building { pending, old } => (old.as_ref(), Some(pending)),
-            FilterState::Ready { table } | FilterState::Stale { table } => (Some(table), None),
+            FilterState::Unbuilt | FilterState::Overflowed { answer: None } => (None, None),
+            FilterState::Overflowed { answer: Some(a) } | FilterState::Stale { answer: a } => (Some(&a.sink), a.fixed[0].as_ref()),
+            FilterState::Building { pending, old } => (old.as_ref().map(|a| &a.sink), Some(pending)),
+            FilterState::Ready { table } => (Some(table), None),
             FilterState::Growing { table, pending } | FilterState::Draining { table, pending } => {
                 (Some(table), Some(pending))
             }
@@ -9280,7 +9368,7 @@ impl BranchStore {
             let Some(cat) = inner.cat.as_ref() else {
                 return FilterBuild::Ended;
             };
-            if !matches!(inner.names.filter.state, FilterState::Unbuilt | FilterState::Overflowed | FilterState::Stale { .. }) {
+            if !matches!(inner.names.filter.state, FilterState::Unbuilt | FilterState::Overflowed { .. } | FilterState::Stale { .. }) {
                 return FilterBuild::Ended;
             }
             let frozen = inner.names.frozen.as_ref().map_or(0, |f| f.fresh.len());
@@ -9289,6 +9377,9 @@ impl BranchStore {
         // Room for the names created since the checkpoint and as many again created while the scan
         // runs; the connection, its pragmas and prepares. Both with the mutex let go.
         let pending = Arc::new(FilterTable::for_keys(fresh.saturating_mul(2).max(8192)));
+        // A refusal's spare, installed below if none is kept (`NameFilter::spare`); freed after the
+        // mutex otherwise (declared before every guard, so dropped after it).
+        let mut spare = Some(Arc::new(FilterTable::for_keys(FILTER_SPARE_KEYS)));
         let mut reader = match super::catalog::Catalog::writer_of(db, sync) {
             Ok(reader) => reader,
             Err(e) => {
@@ -9299,7 +9390,10 @@ impl BranchStore {
         {
             let mut inner = shared.lock();
             let names = &mut inner.names;
-            if !matches!(names.filter.state, FilterState::Unbuilt | FilterState::Overflowed | FilterState::Stale { .. }) {
+            if names.filter.spare.is_none() {
+                names.filter.spare = spare.take();
+            }
+            if !matches!(names.filter.state, FilterState::Unbuilt | FilterState::Overflowed { .. } | FilterState::Stale { .. }) {
                 return FilterBuild::Ended;
             }
             // The names created since the last checkpoint, frozen by a capture in flight or not
@@ -9313,9 +9407,9 @@ impl BranchStore {
                 tracing::warn!("branch name filter not built: its pending table filled at the seed");
                 return FilterBuild::Failed;
             }
-            // A shrink's complete table answers through the build (`Building::old`).
+            // A shrink's or a refusal's answer answers through the build (`Building::old`).
             let old = match std::mem::take(&mut names.filter.state) {
-                FilterState::Stale { table } => Some(table),
+                FilterState::Stale { answer } | FilterState::Overflowed { answer: Some(answer) } => Some(answer),
                 _ => None,
             };
             names.filter.state = FilterState::Building { pending: pending.clone(), old };
@@ -9360,9 +9454,8 @@ impl BranchStore {
             match scanned {
                 Ok((table, unbuilt)) => {
                     if !unbuilt.iter().all(|h| table.insert(*h)) {
-                        f.overflow();
-                        drop(inner);
-                        drop(old);
+                        // The answer that held through the build still does.
+                        f.overflow_answering(old);
                         return FilterBuild::Ended;
                     }
                     f.live = (table.len() + pending.len()) as u64;
@@ -9372,9 +9465,9 @@ impl BranchStore {
                 }
                 Err(e) => {
                     f.failed_scans += 1;
-                    // A shrink's table still answers while the build is retried.
+                    // A shrink's or a refusal's answer still answers while the build is retried.
                     f.state = match old {
-                        Some(table) => FilterState::Stale { table },
+                        Some(answer) => FilterState::Stale { answer },
                         None => FilterState::Unbuilt,
                     };
                     tracing::debug!("branch name filter not built: {e}");
@@ -9401,7 +9494,8 @@ impl BranchStore {
             if copied {
                 f.state = FilterState::Ready { table: table.clone() };
             } else {
-                f.overflow();
+                // The two tables together still hold every name; notes go into the new one.
+                f.overflow_answering(Some(Answer { fixed: [Some(pending.clone()), None], sink: table.clone() }));
             }
         }
         FilterBuild::Ended
@@ -9429,9 +9523,15 @@ impl BranchStore {
             };
             let grown = FilterTable::for_keys(old.cap());
             let pending = Arc::new(FilterTable::for_keys(old.cap() / 2));
+            // A refusal's spare (`NameFilter::spare`), installed if none is kept, else freed after
+            // the mutex (declared before the guard, so dropped after it).
+            let mut spare = Some(Arc::new(FilterTable::for_keys(FILTER_SPARE_KEYS)));
             {
                 let mut inner = shared.lock();
                 let f = &mut inner.names.filter;
+                if f.spare.is_none() {
+                    f.spare = spare.take();
+                }
                 if !matches!(&f.state, FilterState::Ready { table } if Arc::ptr_eq(table, &old)) {
                     return;
                 }
@@ -9453,7 +9553,9 @@ impl BranchStore {
                     return;
                 }
                 if !copied {
-                    f.overflow();
+                    // The old table is still complete (a note it refused would have overflowed
+                    // the filter already, and this hold would not be here).
+                    f.overflow_answering(Some(Answer::of(old.clone())));
                     return;
                 }
                 f.state = if skip {
@@ -9477,7 +9579,8 @@ impl BranchStore {
                 if copied {
                     f.state = FilterState::Ready { table: grown.clone() };
                 } else {
-                    f.overflow();
+                    // Together complete (review H1's union); notes go into the new table.
+                    f.overflow_answering(Some(Answer { fixed: [Some(pending.clone()), None], sink: grown.clone() }));
                 }
             }
         });
@@ -9499,7 +9602,7 @@ impl BranchStore {
             FilterState::Ready { .. } => "Ready",
             FilterState::Growing { .. } => "Growing",
             FilterState::Draining { .. } => "Draining",
-            FilterState::Overflowed => "Overflowed",
+            FilterState::Overflowed { .. } => "Overflowed",
         };
         (name, f.rebuilds)
     }
