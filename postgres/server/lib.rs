@@ -3426,7 +3426,7 @@ const WORK_COLUMNS: [&str; 9] = [
 /// thread's instructions per statement phase (turso_pg::phase::NAMES), so the default build's row
 /// is unchanged.
 #[cfg(feature = "phase-count")]
-const WORK_COLUMNS: [&str; 17] = [
+const WORK_COLUMNS: [&str; 24] = [
     "unix_syscalls",
     "instructions",
     "allocations",
@@ -3444,6 +3444,13 @@ const WORK_COLUMNS: [&str; 17] = [
     "phase_execute",
     "phase_encode",
     "phase_write",
+    "span_feed",
+    "span_tx_status",
+    "span_changed_parameters",
+    "span_flush",
+    "span_end_implicit",
+    "span_work_tail",
+    "span_work_finish",
 ];
 
 /// turso_branch_work(): this process's system calls and instructions (counters::process_counters),
@@ -3466,14 +3473,33 @@ fn work_row(format: &Format, db: &Database) -> SqlResult<Response> {
         .collect::<SqlResult<Vec<_>>>()?;
     let header = Arc::new(fields);
     let mut encoder = DataRowEncoder::new(header.clone());
+    #[cfg(feature = "phase-count")]
+    let mut spans_now: Option<[u64; 7]> = None;
+    #[cfg(feature = "phase-count")]
+    let mut work_tail: Option<turso_pg::phase::SpanGuard> = None;
     let counters = counters::process_counters();
     let allocations = counters::allocations();
     let row = encoder
         .encode_field(&counters.map(|c| c.unix_syscalls as i64))
         .and_then(|()| encoder.encode_field(&counters.map(|c| c.instructions as i64)))
         .and_then(|()| encoder.encode_field(&allocations.map(|n| n as i64)))
-        .and_then(|()| encoder.encode_field(&counters::thread_counters().map(|c| c.0 as i64)))
-        .and_then(|()| encoder.encode_field(&(db.branch_confirm_counts()[0] as i64)))
+        .and_then(|()| {
+            let own = counters::thread_counters();
+            // A phase build's span totals, read with this thread's own counters, so a span
+            // charged after this reading falls in the next window as its instructions do.
+            #[cfg(feature = "phase-count")]
+            {
+                spans_now = turso_pg::phase::span_totals();
+            }
+            encoder.encode_field(&own.map(|c| c.0 as i64))
+        })
+        .and_then(|()| {
+            #[cfg(feature = "phase-count")]
+            {
+                work_tail = Some(turso_pg::phase::span(turso_pg::phase::Span::WorkTail));
+            }
+            encoder.encode_field(&(db.branch_confirm_counts()[0] as i64))
+        })
         // This session thread's own allocations (counters::thread_allocations; 0 without the
         // alloc-count feature): the work budget judges every counter by the operation's own thread.
         .and_then(|()| encoder.encode_field(&(counters::thread_allocations() as i64)))
@@ -3492,10 +3518,15 @@ fn work_row(format: &Format, db: &Database) -> SqlResult<Response> {
                 .and_then(|()| encoder.encode_field(&lifecycle.map(|c| c.1 as i64)))
         });
     #[cfg(feature = "phase-count")]
+    drop(work_tail);
+    #[cfg(feature = "phase-count")]
+    let _finishing = turso_pg::phase::span(turso_pg::phase::Span::WorkFinish);
+    #[cfg(feature = "phase-count")]
     let row = row.and_then(|()| {
         let phases = turso_pg::phase::totals().unwrap_or_default();
         phases
             .iter()
+            .chain(spans_now.unwrap_or_default().iter())
             .try_for_each(|n| encoder.encode_field(&(*n as i64)))
     });
     let row = row.and_then(|()| encoder.finish());
@@ -3808,7 +3839,10 @@ impl SimpleQueryHandler for Session {
             // (committing it); it left the block open (wire review 16 item 6).
             let mut responses = Replies::new();
             responses.push((Vec::new(), Response::EmptyQuery));
-            if let Err(e) = self.end_implicit() {
+            let ending = turso_pg::phase::span(turso_pg::phase::Span::EndImplicit);
+            let ended = self.end_implicit();
+            drop(ending);
+            if let Err(e) = ended {
                 responses.push((Vec::new(), Response::Error(e)));
             }
             responses
@@ -3816,6 +3850,7 @@ impl SimpleQueryHandler for Session {
             self.simple_with_notices(&query.query)
         };
         let encoding = turso_pg::phase::enter(turso_pg::phase::Phase::Encode);
+        let feeding = turso_pg::phase::span(turso_pg::phase::Span::Feed);
         for (notices, response) in responses {
             for notice in notices {
                 client
@@ -3894,15 +3929,21 @@ impl SimpleQueryHandler for Session {
                 }
             }
         }
+        drop(feeding);
         client.set_state(PgWireConnectionState::ReadyForQuery);
+        let status_span = turso_pg::phase::span(turso_pg::phase::Span::TxStatus);
         let status = self.transaction_status();
+        drop(status_span);
         client.set_transaction_status(status);
         // The wire budget's fire-check plant (feature budget-plant-split-reply, never in a default
         // build): the results in one write and ReadyForQuery in a second, the double reply write
         // its one-write-per-statement check must catch (gap review item 2, wire review 5 item 3).
         #[cfg(feature = "budget-plant-split-reply")]
         client.flush().await?;
-        if let Some(changed) = self.changed_parameters() {
+        let changed_span = turso_pg::phase::span(turso_pg::phase::Span::ChangedParameters);
+        let changed = self.changed_parameters();
+        drop(changed_span);
+        if let Some(changed) = changed {
             client
                 .feed(PgWireBackendMessage::ParameterStatus(changed))
                 .await?;
@@ -3914,6 +3955,7 @@ impl SimpleQueryHandler for Session {
             .await?;
         drop(encoding);
         let _writing = turso_pg::phase::enter(turso_pg::phase::Phase::Write);
+        let _flushing = turso_pg::phase::span(turso_pg::phase::Span::Flush);
         client.flush().await?;
         Ok(())
     }
