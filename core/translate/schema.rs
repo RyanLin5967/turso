@@ -1347,8 +1347,10 @@ pub fn translate_create_table(
     let sql = if let Some(ref info) = ctas_info {
         info.schema_sql.clone()
     } else {
-        connection
-            .dialect()
+        // The resolver's dialect: SQLite for SQLite text (an engine helper's table is stored as
+        // SQLite text, never marked as the frontend's; the NO SILENT DIALECT SWITCH class).
+        resolver
+            .dialect
             .format_table_sql(input, &tbl_name, &body)?
     };
 

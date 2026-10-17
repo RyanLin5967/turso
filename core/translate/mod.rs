@@ -84,6 +84,7 @@ pub fn translate(
     input: &str,
     origin: crate::statement::StatementOrigin,
     prepare_options: &PrepareOptions,
+    text: crate::connection::SqlText,
 ) -> Result<Program> {
     tracing::trace!("querying {}", input);
     let change_cnt_on = matches!(
@@ -117,10 +118,12 @@ pub fn translate(
         syms,
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
-        // Engine-generated helper statements are always SQLite text and
-        // must resolve functions with SQLite semantics regardless of the
-        // database's dialect — the same invariant as unmarked schema rows.
-        if matches!(origin, crate::statement::StatementOrigin::InternalHelper) {
+        // SQLite text (an engine helper's, a frontend's prepare_sqlite) resolves functions and
+        // formats the table SQL it stores with SQLite semantics regardless of the database's
+        // dialect: the same invariant as unmarked schema rows (the NO SILENT DIALECT SWITCH class).
+        if text == crate::connection::SqlText::Sqlite
+            || matches!(origin, crate::statement::StatementOrigin::InternalHelper)
+        {
             Arc::new(crate::dialect::SqliteDialect) as Arc<dyn crate::dialect::Dialect>
         } else {
             connection.dialect()
@@ -602,6 +605,7 @@ mod tests {
             "",
             crate::statement::StatementOrigin::Root,
             &crate::connection::PrepareOptions::default(),
+            crate::connection::SqlText::Client,
         );
         let err = result.unwrap_err().to_string();
         assert!(
@@ -686,6 +690,7 @@ mod tests {
             "",
             crate::statement::StatementOrigin::Root,
             &crate::connection::PrepareOptions::default(),
+            crate::connection::SqlText::Client,
         )
         .expect_err("translation should fail with malformed sqlite_sequence");
         match err {
@@ -730,6 +735,7 @@ mod tests {
             "",
             crate::statement::StatementOrigin::Root,
             &crate::connection::PrepareOptions::default(),
+            crate::connection::SqlText::Client,
         )
         .expect_err("translation should fail with missing sqlite_sequence");
         match err {

@@ -1007,6 +1007,7 @@ impl Statement {
                 &self.program.sql,
                 self.origin,
                 prepare_options,
+                self.sql_text,
             )?
         };
 

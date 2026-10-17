@@ -1005,6 +1005,7 @@ impl Connection {
             input,
             origin,
             prepare_options,
+            text,
         ) {
             Ok(program) => Ok((program, pager, mode)),
             Err(err) if self.should_retry_cross_process_schema_lookup(&err)? => {
@@ -1037,6 +1038,7 @@ impl Connection {
                     input,
                     origin,
                     prepare_options,
+                    text,
                 )
                 .map(|program| (program, pager, mode))
             }
