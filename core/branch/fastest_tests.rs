@@ -10393,6 +10393,47 @@ fn a_failed_build_drain_s_overflow_still_answers_for_a_pending_name() {
     assert!(!absent, "CLAIM: after a failed build drain the overflowed filter answered absent for a name only its pending table held");
 }
 
+/// Review filter3 L5: a build attempt whose catalog scan failed frees nothing inside its store-mutex
+/// hold (N2's rule: no filter-thread hold frees anything). At dd9d97b1d the failed-scan arm's error
+/// (a String) dropped before the guard on `return FilterBuild::Failed`. Failpoint
+/// `NAME_SCAN_FAILS` on a reopen's build; the retry builds it.
+#[test]
+fn a_failed_build_scan_frees_nothing_under_the_store_mutex() {
+    use super::store::{FILTER_HOLD_FREED_MAX, FILTER_HOLD_FREES_ARMED, NAME_SCAN_FAILS};
+    use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+    let _s = serial();
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FILTER_HOLD_FREES_ARMED.store(false, Release);
+            NAME_SCAN_FAILS.store(false, Release);
+        }
+    }
+    let _r = Reset;
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("failed-scan-free.db");
+    let incarnation = {
+        let db = open_at(&path, opts(true, SyncClass::Off));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        for i in 0..16 {
+            trunk.create_branch(&format!("kept-{i:02}")).unwrap();
+        }
+        db.branch_compact_now().unwrap();
+        db.incarnation
+    };
+    FILTER_HOLD_FREED_MAX.store(0, Release);
+    FILTER_HOLD_FREES_ARMED.store(true, Release);
+    NAME_SCAN_FAILS.store(true, Release);
+    let db = reopen(&path, opts(true, SyncClass::Off), incarnation);
+    db.branch_wait_name_filter();
+    FILTER_HOLD_FREES_ARMED.store(false, Release);
+    assert!(!NAME_SCAN_FAILS.load(Acquire), "premise: the reopen's build met the failing scan");
+    assert_eq!(db.branch_name_filter_stats().4, 1, "premise: one failed scan was counted");
+    let freed = FILTER_HOLD_FREED_MAX.load(Relaxed);
+    assert_eq!(freed, 0, "CLAIM: a name-filter thread freed {freed} bytes inside a store-mutex hold (a failed scan's error)");
+}
+
 /// Class (e), the store mutex's lifecycle audit (DECISIONS 994f7d41e0; the lead's order with
 /// nf-adversary-2's MED-2 and M4 folded in): every store-mutex hold on the create path does NO syscall,
 /// NO allocation and NO catalog statement. One instrument for the whole class: every outermost hold
