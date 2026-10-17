@@ -3428,7 +3428,9 @@ fn a_fuzzy_install_takes_its_retired_names_and_children_without_allocating() {
     let takes = super::store::RETIRE_TAKES.load(Relaxed) - takes0;
     let with = super::store::RETIRE_TAKES_WITH_CHILDREN.load(Relaxed) - with0;
     let allocs = super::store::RETIRE_TAKE_ALLOCS.load(Relaxed) - allocs0;
-    assert!(takes >= 3, "premise: {takes} installs took their retired generations, not 3");
+    // Review engine-rev-setter LOW-8: exactly the three checkpoints' installs, so an extra one (a
+    // threshold's) fails as a premise, not as the with == 2 claim below.
+    assert_eq!(takes, 3, "premise: {takes} installs took their retired generations, not the 3 checkpoints'");
     // Review m1-2 LOW-D: exactly the two rounds that forked children retire a generation; round 2,
     // with none forked since, retires nothing (`retire_frozen` keeps `None` for an empty one).
     assert_eq!(with, 2, "CLAIM: {with} of 3 installs retired a child generation, not the 2 that forked children");
