@@ -13329,59 +13329,89 @@ fn rollback_and_chain_ends_the_settings_of_the_failed_block() {
 /// violation pending the SET is accepted (the control).
 #[test]
 fn foreign_keys_cannot_be_turned_off_over_pending_deferred_violations() {
-    let dir = Scratch::new("fkdeferredoff");
-    let server = Server::start(&dir.db(), &[]);
-    let mut a = server.connect();
-    a.q("CREATE TABLE p(id INT PRIMARY KEY)").ok("p");
-    a.q("CREATE TABLE c(id INT PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED)")
-        .ok("c");
-    // Every way the effective value can change (review c39799c5d..9e24b455d MED 3: a fix keyed on
-    // SET LOCAL left plain SET open): each arm runs and records what went wrong, so every arm is
-    // shown red, not only the first.
+    // Each arm on a server of its own, recording what went wrong without a panicking helper, so
+    // every arm is red at a base for its own reason (fk-guard review MED 2: arm 1's leaked
+    // deferred count made the next statement fail, `.single()` panicked, and the later arms never
+    // ran). Every refusal must be 55000 (LOW 3), this server's own code: PostgreSQL has no
+    // foreign_keys setting (postgres/COMPAT.md).
+    fn arm(label: &str, statements: &[&str]) -> Vec<String> {
+        let dir = Scratch::new("fkdeferredoff");
+        let server = Server::start(&dir.db(), &[]);
+        let mut a = server.connect();
+        let mut wrong = Vec::new();
+        a.q("CREATE TABLE p(id INT PRIMARY KEY)").ok("p");
+        a.q("CREATE TABLE c(id INT PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED)")
+            .ok("c");
+        let mut refused = false;
+        for sql in statements {
+            let r = a.q(sql);
+            if sql.contains("foreign_keys") {
+                match &r.error {
+                    None => wrong.push(format!("{label}: {sql} accepted over a pending violation")),
+                    Some(e) if e.code != "55000" => {
+                        wrong.push(format!("{label}: {sql} refused with {}, not 55000", e.code))
+                    }
+                    Some(_) => refused = true,
+                }
+                if r.error.is_some() && r.status != b'E' && statements[0] == "BEGIN" {
+                    wrong.push(format!("{label}: the refused SET did not fail the block"));
+                }
+            } else if sql.starts_with("INSERT") && sql.contains(';') {
+                // The implicit block: the refusal is this query's own error.
+                match &r.error {
+                    None => wrong.push(format!("{label}: the implicit block was accepted")),
+                    Some(e) if e.code != "55000" => {
+                        wrong.push(format!("{label}: the implicit block refused with {}, not 55000", e.code))
+                    }
+                    Some(_) => refused = true,
+                }
+            } else if *sql == "COMMIT" {
+                if r.error.is_some() || r.tags != ["ROLLBACK"] {
+                    wrong.push(format!("{label}: COMMIT answered {:?} {:?}", r.tags, r.error));
+                }
+            }
+        }
+        let rows = a.q("SELECT count(*) FROM c");
+        match (&rows.error, rows.rows.first().and_then(|r| r.first().cloned()).flatten()) {
+            (None, Some(n)) if n == "0" => {}
+            (None, n) => wrong.push(format!("{label}: the orphan committed ({n:?} rows)")),
+            (Some(e), _) => wrong.push(format!("{label}: the next statement failed: {} {}", e.code, e.message)),
+        }
+        let shown = a.q("SHOW foreign_keys");
+        if shown.rows.first().and_then(|r| r.first().cloned()).flatten().as_deref() != Some("on") {
+            wrong.push(format!("{label}: foreign_keys after it: {:?} {:?}", shown.rows, shown.error));
+        }
+        if !refused && wrong.is_empty() {
+            wrong.push(format!("{label}: nothing was refused"));
+        }
+        // The next write still works (the deferred count was not left behind).
+        let w = a.q("INSERT INTO p VALUES (1)");
+        let w2 = a.q("INSERT INTO c VALUES (2, 1)");
+        for r in [&w, &w2] {
+            if let Some(e) = &r.error {
+                wrong.push(format!("{label}: a later write failed: {} {}", e.code, e.message));
+            }
+        }
+        wrong
+    }
+    let orphan = "INSERT INTO c VALUES (1, 99)";
     let mut wrong = Vec::new();
     for set in [
         "SET LOCAL foreign_keys = off",
         "SET foreign_keys = off",
         "SET SESSION foreign_keys = off",
     ] {
-        a.q("BEGIN").ok("begin");
-        a.q("INSERT INTO c VALUES (1, 99)").ok("the orphan, deferred");
-        let r = a.q(set);
-        if r.error.is_none() {
-            wrong.push(format!("{set}: accepted over a pending violation"));
-        } else if r.status != b'E' {
-            wrong.push(format!("{set}: refused, but the block is not failed"));
-        }
-        let end = a.q("COMMIT");
-        if end.error.is_some() || end.tags != ["ROLLBACK"] {
-            wrong.push(format!("{set}: COMMIT answered {:?} {:?}", end.tags, end.error));
-        }
-        if a.q("SELECT count(*) FROM c").single("rows") != "0" {
-            wrong.push(format!("{set}: the orphan committed"));
-            a.q("DELETE FROM c").ok("reset");
-        }
-        if a.q("SHOW foreign_keys").single("foreign_keys") != "on" {
-            wrong.push(format!("{set}: foreign_keys is off after the block"));
-            a.q("SET foreign_keys = on").ok("reset");
-        }
+        wrong.extend(arm(set, &["BEGIN", orphan, set, "COMMIT"]));
     }
-    // An implicit block: the orphan and the SET in one multi-statement query.
-    let r = a.q("INSERT INTO c VALUES (1, 99); SET foreign_keys = off; SELECT 1");
-    if r.error.is_none() {
-        wrong.push("implicit block: the SET was accepted over a pending violation".to_string());
-    }
-    if a.q("SELECT count(*) FROM c").single("rows") != "0" {
-        wrong.push("implicit block: the orphan committed".to_string());
-        a.q("DELETE FROM c").ok("reset");
-    }
-    if a.q("SHOW foreign_keys").single("foreign_keys") != "on" {
-        wrong.push("implicit block: foreign_keys is off after it".to_string());
-        a.q("SET foreign_keys = on").ok("reset");
-    }
+    wrong.extend(arm(
+        "implicit block",
+        &["INSERT INTO c VALUES (1, 99); SET foreign_keys = off; SELECT 1"],
+    ));
     assert!(wrong.is_empty(), "{wrong:#?}");
-    a.q("INSERT INTO p VALUES (1)").ok("the next write");
-    a.q("INSERT INTO c VALUES (2, 1)").ok("a valid child");
     // The control: nothing pending, the SET LOCAL is accepted and ends with its block.
+    let dir = Scratch::new("fkdeferredoffctl");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
     a.q("BEGIN").ok("begin");
     a.q("SET LOCAL foreign_keys = off").ok("no violation pending");
     a.q("COMMIT").ok("commit");
