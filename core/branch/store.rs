@@ -2123,6 +2123,15 @@ pub(crate) const HOLD_STARTER_SENDING: u8 = 22;
 /// (`verify_frozen_rows`), as `FE_CAPTURE_VERIFY` does for a whole run; and the differences found.
 #[cfg(test)]
 pub(crate) static CAPTURE_VERIFY_FORCED: AtomicBool = AtomicBool::new(false);
+/// Test builds (review L2d M2): fuzzy installs that took their retired names and child keys under
+/// the store mutex, how many of them had a retired child generation, and the allocations this
+/// thread made taking them (none may be: they are freed after the mutex).
+#[cfg(test)]
+pub(crate) static RETIRE_TAKES: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+pub(crate) static RETIRE_TAKES_WITH_CHILDREN: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+pub(crate) static RETIRE_TAKE_ALLOCS: AtomicU64 = AtomicU64::new(0);
 /// Test builds: installs whose writer-read lease floor the capture check compared (review M1 LOW-3).
 #[cfg(test)]
 pub(crate) static LEASE_FLOORS_VERIFIED: AtomicU64 = AtomicU64::new(0);
@@ -4165,7 +4174,17 @@ fn run_flight(
         // The cut's retired handles are closed after the store mutex (`Journal::take_retired`).
         let retired = guard.journal.as_mut().and_then(Journal::take_retired);
         // And the names and child keys the install let go of, freed after it too (L2(d)).
+        #[cfg(test)]
+        let allocs0 = super::budget_probe::thread_allocs().0;
+        #[cfg(test)]
+        let children_retired = guard.children.retired.is_some();
         let retired_names = (guard.names.retired.take(), guard.children.take_retired());
+        #[cfg(test)]
+        {
+            RETIRE_TAKES.fetch_add(1, Ordering::Relaxed);
+            RETIRE_TAKES_WITH_CHILDREN.fetch_add(u64::from(children_retired), Ordering::Relaxed);
+            RETIRE_TAKE_ALLOCS.fetch_add(super::budget_probe::thread_allocs().0 - allocs0, Ordering::Relaxed);
+        }
         if let Some(journal) = guard.journal.as_ref() {
             // The catalog's commit made everything the capture covers durable in the class it
             // synced in, even if the cut failed after it: a raised D0 store's held frees up to the

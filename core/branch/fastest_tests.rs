@@ -3009,6 +3009,45 @@ fn an_open_whose_expiry_crosses_the_threshold_starts_a_checkpoint() {
     assert_a_checkpoint_started(&db, 0, "the open");
 }
 
+/// Review REVIEW-claude-engine-L2d M2: a fuzzy install takes the names and child keys it let go
+/// of under the store mutex with no allocation (they are freed after it). At f666f19bd
+/// `ChildIndex::take_retired` boxed the generation, one heap allocation inside every install's
+/// hold (the lifecycle audit's install site, store.rs:4111 at c1809b546: 18 allocations, raw
+/// l111). Premises: the take ran at three installs, one with a retired child generation.
+#[test]
+fn a_fuzzy_install_takes_its_retired_names_and_children_without_allocating() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(
+        &dir.path().join("retire-take.db"),
+        opts(true, SyncClass::Fsync).with_branch_checkpoint(super::BranchCheckpoint::Fuzzy),
+    );
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let (takes0, with0, allocs0) = (
+        super::store::RETIRE_TAKES.load(Relaxed),
+        super::store::RETIRE_TAKES_WITH_CHILDREN.load(Relaxed),
+        super::store::RETIRE_TAKE_ALLOCS.load(Relaxed),
+    );
+    for round in 0..3 {
+        if round < 2 {
+            for i in 0..16 {
+                trunk.create_branch(&format!("r{round}-{i}")).unwrap();
+                let _ = trunk.fork_branch().unwrap().into_id();
+            }
+        }
+        assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: fuzzy checkpoint {round} started");
+        db.branch_checkpoint_wait();
+    }
+    let takes = super::store::RETIRE_TAKES.load(Relaxed) - takes0;
+    let with = super::store::RETIRE_TAKES_WITH_CHILDREN.load(Relaxed) - with0;
+    let allocs = super::store::RETIRE_TAKE_ALLOCS.load(Relaxed) - allocs0;
+    assert!(takes >= 3, "premise: {takes} installs took their retired generations, not 3");
+    assert!(with >= 1, "premise: no install had a retired child generation");
+    assert_eq!(allocs, 0, "CLAIM: taking the retired names and children allocated {allocs} times under the store mutex over {takes} installs");
+}
+
 /// Review 2 #5: a checkpoint that failed is not retried by the very next operation — the log is
 /// past the threshold still, so without a back-off every create would start (and pay for) another
 /// one: it waits for another threshold's worth of log.
