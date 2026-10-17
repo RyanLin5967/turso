@@ -1025,6 +1025,16 @@ pub(crate) fn end_owning(owned: &[&str]) -> Snapshot {
         }
         _ => (None, 0, Refusal::NoKernelCount),
     };
+    // Mutants (test builds only; counters review 4 MED-1): `probe_diagnostics_first` runs the
+    // window's diagnostics before its counts are read, as a regression would; `probe_box_before_counts`
+    // allocates once there, the control every exact-count fire-check must see.
+    let diagnostics_first = mutant_on("probe_diagnostics_first");
+    if diagnostics_first {
+        window_diagnostics(refusal, foreign, owned, attributed, &t1);
+    }
+    if mutant_on("probe_box_before_counts") {
+        std::hint::black_box(Box::new(0u8)); // lint-allow: mutant probe_box_before_counts, the control
+    }
     let mut s = user_counts();
     s.foreign = foreign;
     s.refusal = refusal;
@@ -1033,7 +1043,9 @@ pub(crate) fn end_owning(owned: &[&str]) -> Snapshot {
     s.shim_loaded = shim().is_some();
     s.shim_lost = lost1;
     s.instructions = instructions();
-    window_diagnostics(refusal, foreign, owned, attributed, &t1);
+    if !diagnostics_first {
+        window_diagnostics(refusal, foreign, owned, attributed, &t1);
+    }
     s
 }
 

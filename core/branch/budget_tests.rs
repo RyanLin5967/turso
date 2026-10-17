@@ -359,6 +359,11 @@ fn settled(base: Option<u64>) -> bool {
 
 /// Spin, with no syscall, until `settled(base)` or the deadline; whether it settled.
 fn spin_settled(base: Option<u64>, deadline: std::time::Duration) -> bool {
+    // Mutant `harness_box_in_spin_settled` (test builds only; counters review 4 MED-1): the harness's
+    // own wait allocates inside the window it waits in.
+    if probe::mutant_on("harness_box_in_spin_settled") {
+        std::hint::black_box(Box::new(0u8)); // lint-allow: mutant harness_box_in_spin_settled
+    }
     let t = std::time::Instant::now();
     while !settled(base) {
         if t.elapsed() > deadline {
@@ -3120,7 +3125,9 @@ fn the_instruments_count_exactly_under_every_flag() {
     let out = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["branch::budget_tests::the_budget_counters_count_exactly_what_was_done", "--exact", "--test-threads=1", "--nocapture"])
         .env("FE_FLAGS_CHILD", "1")
-        .env("FE_MUTANT", "no_mutant_has_this_name")
+        // A mutant run passes its mutant on (counters review 4 MED-1: the probe's and the harness's
+        // window mutants are killed here); otherwise a name no mutant has, so the name is still read.
+        .env("FE_MUTANT", std::env::var("FE_MUTANT").unwrap_or_else(|_| "no_mutant_has_this_name".to_string()))
         .env("FE_BUDGET_FOREIGN_NAMES", "1")
         .env("FE_BUDGET_NEW_NAMES", dir.path().join("new-names.txt"))
         .env_remove("FE_BUDGET_RAW_DIR")
