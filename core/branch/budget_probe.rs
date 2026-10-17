@@ -547,7 +547,14 @@ pub(crate) fn store_unlocked_of(own: Option<(usize, bool)>) {
                 if AUDIT.load(Relaxed) && own.is_some_and(|o| o.1) {
                     AUDIT_SEEN.fetch_add(1, Relaxed);
                 }
-                if AUDIT.load(Relaxed) && crate::branch::store::scope_is_audited() {
+                // Counters review E1: the store whose hold this is comes from its guard, never from
+                // whatever scope is innermost (a nested store's, a stray one); a direct test caller
+                // (`own` None) still reads the scope.
+                let (store, audited) = match own {
+                    Some(o) => o,
+                    None => (crate::branch::store::scope_store_id(), crate::branch::store::scope_is_audited()),
+                };
+                if AUDIT.load(Relaxed) && audited {
                     let get = |c: &'static std::thread::LocalKey<Cell<u64>>| c.with(|c| c.get());
                     let (allocs0, stmts0) = HOLD_START2.with(|h| h.get());
                     let me = t1.iter().find(|t| t.me).map_or(0, |t| t.id);
@@ -558,7 +565,7 @@ pub(crate) fn store_unlocked_of(own: Option<(usize, bool)>) {
                         allocs: get(&T_HELD_ALLOCS).wrapping_sub(allocs0),
                         alloc_bytes: bytes,
                         cat_stmts: get(&T_CAT_STMTS).wrapping_sub(stmts0),
-                        store: crate::branch::store::scope_store_id(),
+                        store,
                     };
                     match AUDIT_LOG.try_lock() {
                         Ok(mut log) if log.len() < log.capacity() => log.push(rec),
