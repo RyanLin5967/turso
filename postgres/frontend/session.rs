@@ -1520,12 +1520,9 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
     let in_block = !pg_conn.conn.get_auto_commit();
     // Every mutable setting uses this assignment path, including the outside-block LOCAL rule.
     let assign = |apply: &dyn Fn(&mut Gucs, &mut Locals, bool)| {
+        // Outside a block a SET LOCAL lasts only its own statement: nothing to keep. Its warning
+        // is given once for every setting, below.
         if set_stmt.is_local && !in_block {
-            pg_conn.warnings.lock().push((
-                "WARNING",
-                SqlErrorKind::NoActiveSqlTransaction,
-                "SET LOCAL can only be used in transaction blocks".to_string(),
-            ));
             return;
         }
         let mut state = pg_conn.session_state.lock();
@@ -1694,8 +1691,12 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
             _ => return invalid(),
         },
         // PostgreSQL refuses a tablespace or an access method that does not exist (22023), and
-        // this server has none but the default ones.
-        "default_tablespace" => text.is_empty() || return invalid(),
+        // this server has none but the ones every cluster has: pg_default (the default, so a no-op)
+        // and pg_global, which PostgreSQL accepts as a SET (review c39799c5d..9e24b455d LOW 6,
+        // pg18-rev-c39-misc.out).
+        "default_tablespace" => {
+            matches!(lower.as_str(), "" | "pg_default" | "pg_global") || return invalid()
+        }
         "default_table_access_method" => lower == "heap" || return invalid(),
         "transaction_read_only" | "default_transaction_read_only" => match pg_bool(&text) {
             Some(false) => true,
@@ -1740,6 +1741,34 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
             if !parts.iter().all(|p| known(p)) {
                 return invalid();
             }
+            // check_datestyle's conflicts: two output styles, or two field orders, are 22023,
+            // before any style this server does not act on is refused (review c39799c5d..9e24b455d
+            // LOW 8: `ISO, SQL` and `MDY, DMY` were 0A000; pg18-rev-c39-misc.out).
+            let style = |p: &str| matches!(p, "iso" | "sql" | "postgres" | "german");
+            let order = |p: &str| {
+                matches!(p, "ymd" | "dmy" | "mdy" | "us" | "european")
+                    || p.starts_with("noneuro")
+                    || p.starts_with("euro")
+            };
+            let distinct = |f: &dyn Fn(&str) -> bool| {
+                let mut seen: Vec<&str> = parts.iter().copied().filter(|p| f(p)).collect();
+                // US and NonEuro are MDY; Euro and European are DMY.
+                for p in seen.iter_mut() {
+                    *p = match *p {
+                        "us" => "mdy",
+                        "european" => "dmy",
+                        q if q.starts_with("noneuro") => "mdy",
+                        q if q.starts_with("euro") => "dmy",
+                        q => q,
+                    };
+                }
+                seen.sort_unstable();
+                seen.dedup();
+                seen.len() <= 1
+            };
+            if !distinct(&style) || !distinct(&order) {
+                return invalid();
+            }
             parts.iter().all(|part| {
                 matches!(*part, "iso" | "mdy" | "us" | "default") || part.starts_with("noneuro")
             })
@@ -1754,12 +1783,21 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
                 lower.as_str(),
                 "utc" | "gmt" | "etc/utc" | "etc/gmt" | "z" | "zulu" | "uct" | "universal" | "0"
             );
-            // A zone PostgreSQL would know: a numeric offset or a name in the host's zone
-            // database, which PostgreSQL's own tz database mirrors. BLIND SPOT: a host whose zone
-            // database lacks a name PostgreSQL knows answers 22023 for it, not 0A000.
-            let numeric = lower.trim_start_matches(['+', '-']).parse::<f64>().is_ok();
-            let zoned = zone_file(&text);
-            if !(utc || numeric || zoned) {
+            // A zone PostgreSQL would know, as its check_timezone reads it (review
+            // c39799c5d..9e24b455d LOW 7, pg18-rev-c39-tzforms.out): an INTERVAL; a number of
+            // hours read whole as strtod reads it (`--5` and `inf` refused, `nan` and `5.5`
+            // accepted); a name in the host's zone database, matched without case as PostgreSQL
+            // matches it; or a POSIX TZ spec (`UTC+3`, `EST5EDT,M3.2.0,M11.1.0`, `+05:30`). A valid
+            // zone other than UTC is refused 0A000 below, as this server runs in UTC alone.
+            // BLIND SPOTS: a host zone database lacking a name PostgreSQL knows answers 22023 for
+            // it; PostgreSQL's range bound for a numeric offset is not recorded, so any finite
+            // number or NaN is valid here.
+            let numeric = lower
+                .parse::<f64>()
+                .is_ok_and(|h| h.is_finite() || h.is_nan());
+            let interval = lower.starts_with("interval");
+            let valid = utc || numeric || interval || zone_file(&text) || posix_tz(&text);
+            if !valid {
                 return invalid();
             }
             utc
@@ -1789,6 +1827,15 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
         }
     };
     if accepted {
+        // PostgreSQL warns of a SET LOCAL outside a block for every setting, after the value
+        // checked (review c39799c5d..9e24b455d LOW 11: only the settings that act warned).
+        if set_stmt.is_local && !in_block {
+            pg_conn.warnings.lock().push((
+                "WARNING",
+                SqlErrorKind::NoActiveSqlTransaction,
+                "SET LOCAL can only be used in transaction blocks".to_string(),
+            ));
+        }
         noop_statement(&pg_conn.conn)
     } else {
         unsupported("this server answers only by its own setting of it")
@@ -1826,11 +1873,108 @@ fn zone_file(name: &str) -> bool {
     if !named || name.eq_ignore_ascii_case("posixrules") {
         return false;
     }
+    // Each component matched without case, as PostgreSQL matches zone names (a case-sensitive
+    // host filesystem found `America/New_York` and not `america/new_york`).
+    let mut path = std::path::PathBuf::from("/usr/share/zoneinfo");
+    for part in name.split('/') {
+        let exact = path.join(part);
+        if exact.exists() {
+            path = exact;
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&path) else {
+            return false;
+        };
+        let Some(found) = entries
+            .flatten()
+            .find(|e| e.file_name().to_str().is_some_and(|f| f.eq_ignore_ascii_case(part)))
+        else {
+            return false;
+        };
+        path = found.path();
+    }
     let mut magic = [0u8; 4];
-    std::fs::File::open(std::path::Path::new("/usr/share/zoneinfo").join(name))
+    std::fs::File::open(&path)
         .and_then(|mut f| f.read_exact(&mut magic))
         .is_ok()
         && &magic == b"TZif"
+}
+
+/// Whether `spec` is a POSIX TZ string as PostgreSQL's tz code reads one: an optional standard
+/// name (three or more letters, or `<...>`), an offset `[+-]hh[:mm[:ss]]` (required after a name;
+/// alone, as `+05:30`, it is the whole spec), then optionally a daylight name, its own offset, and
+/// `,start[/time],end[/time]` rules (`Jn`, `n` or `Mm.w.d`). Only the shape is read, the values'
+/// ranges are not (BLIND SPOT: PostgreSQL's tzparse bounds hours at 24 and rules' fields too).
+fn posix_tz(spec: &str) -> bool {
+    let b = spec.as_bytes();
+    let mut i = 0;
+    let name = |i: &mut usize| -> bool {
+        if b.get(*i) == Some(&b'<') {
+            let Some(end) = spec[*i..].find('>') else { return false };
+            *i += end + 1;
+            return true;
+        }
+        let start = *i;
+        while b.get(*i).is_some_and(u8::is_ascii_alphabetic) {
+            *i += 1;
+        }
+        *i - start >= 3
+    };
+    let offset = |i: &mut usize| -> bool {
+        if matches!(b.get(*i), Some(b'+' | b'-')) {
+            *i += 1;
+        }
+        let mut groups = 0;
+        loop {
+            let start = *i;
+            while b.get(*i).is_some_and(u8::is_ascii_digit) {
+                *i += 1;
+            }
+            if *i == start || *i - start > 2 {
+                return false;
+            }
+            groups += 1;
+            if groups < 3 && b.get(*i) == Some(&b':') {
+                *i += 1;
+                continue;
+            }
+            return true;
+        }
+    };
+    let had_name = name(&mut i);
+    if !had_name {
+        i = 0;
+    }
+    if !offset(&mut i) {
+        return false;
+    }
+    if i == b.len() {
+        return true;
+    }
+    if !had_name || !name(&mut i) {
+        return false;
+    }
+    if i < b.len() && b[i] != b',' && !offset(&mut i) {
+        return false;
+    }
+    if i == b.len() {
+        return true;
+    }
+    // Two rules, each Jn, n or Mm.w.d, with an optional /time.
+    let rule = |r: &str| -> bool {
+        let (date, time) = r.split_once('/').unwrap_or((r, "0"));
+        let digits = |s: &str| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit());
+        let date_ok = if let Some(m) = date.strip_prefix('M') {
+            let f: Vec<&str> = m.split('.').collect();
+            f.len() == 3 && f.iter().all(|x| digits(x))
+        } else {
+            digits(date.strip_prefix('J').unwrap_or(date))
+        };
+        let t = time.trim_start_matches(['+', '-']);
+        date_ok && !t.is_empty() && t.split(':').all(digits)
+    };
+    let rules: Vec<&str> = spec[i + 1..].split(',').collect();
+    b[i] == b',' && rules.len() == 2 && rules.iter().all(|r| rule(r))
 }
 
 const PG_ENCODINGS: &[&str] = &[
@@ -1841,8 +1985,7 @@ const PG_ENCODINGS: &[&str] = &[
     "win1254", "win1255", "win1257", "koi8u", "sjis", "big5", "gbk", "uhc", "gb18030", "johab",
     "shiftjis2004", "alt", "win", "mskanji", "shiftjis", "tcvn", "tcvn5712", "vscii", "abc",
     "iso885910", "iso885913", "iso885914", "iso885915", "iso885916", "iso88591", "iso88592",
-    "iso88593", "iso88594", "iso88599", "cp1250", "cp1251", "cp1252", "cp1253", "cp1254",
-    "cp1255", "cp1256", "cp1257", "cp1258", "cp866", "cp874", "cp932", "cp936", "cp949", "cp950",
+    "iso88593", "iso88594", "iso88599", "win932", "win936", "win949", "win950",
     "windows1250", "windows1251", "windows1252", "windows1253", "windows1254", "windows1255",
     "windows1256", "windows1257", "windows1258", "windows866", "windows874", "windows932",
     "windows936", "windows949", "windows950",
