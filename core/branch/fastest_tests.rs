@@ -9812,6 +9812,54 @@ fn a_refusing_filter_never_answers_absent_for_a_catalog_only_name() {
     db.branch_wait_name_filter();
 }
 
+/// Review m1-2b LOW-F2 (DECISIONS 6c1dbf7449), as a class: no filter table is freed under the
+/// store mutex. A shrink's rebuild is held at its scan (`Building` with the shrink's table as its
+/// old answer); a burst of named creates then fills that old table until it refuses a note, which
+/// ends the answer (counted, `name_filter_refusals_for_test`). At bf7a1ef1f the answer's table was
+/// dropped inside that create's note, its last reference: a free of the whole table under the mutex.
+/// No note may free anything (`FILTER_NOTE_FREED_MAX`).
+#[test]
+fn a_refusing_answer_s_table_is_not_freed_under_the_store_mutex() {
+    use super::store::{FILTER_NOTE_FREED_MAX, HOLD_ARRIVED, NAME_SCAN_HOLD};
+    use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+    let _s = serial();
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            NAME_SCAN_HOLD.store(0, Release);
+        }
+    }
+    let _r = Reset;
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("refusal-free.db"), opts(true, SyncClass::Off));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    trunk.create_branch("held").unwrap();
+    db.branch_wait_name_filter();
+    NAME_SCAN_HOLD.store(1, Release);
+    let t = std::time::Instant::now();
+    let mut n = 0u32;
+    while NAME_SCAN_HOLD.load(Acquire) != 1 | HOLD_ARRIVED {
+        let name = format!("cycle-{n:05}");
+        trunk.create_branch(&name).unwrap();
+        db.drop_branch(&name).unwrap();
+        n += 1;
+        assert!(t.elapsed() < std::time::Duration::from_secs(30), "premise: no natural shrink's rebuild reached its scan ({n} cycles)");
+    }
+    assert!(db.branches.name_filter_stats().0, "premise: the shrink's rebuild is Building with its old table answering");
+    let refused0 = db.branches.name_filter_refusals_for_test().1;
+    FILTER_NOTE_FREED_MAX.store(0, Release);
+    while db.branches.name_filter_refusals_for_test().1 == refused0 {
+        trunk.create_branch(&format!("burst-{n:05}")).unwrap();
+        n += 1;
+        assert!(n < 1 << 20, "premise: the old table never refused a note");
+    }
+    let freed = FILTER_NOTE_FREED_MAX.load(Relaxed);
+    NAME_SCAN_HOLD.store(0, Release);
+    db.branch_wait_name_filter();
+    assert_eq!(freed, 0, "CLAIM: a note freed {freed} bytes under the store mutex (a refusing answer's table)");
+}
+
 /// Class (e), the store mutex's lifecycle audit (DECISIONS 994f7d41e0; the lead's order with
 /// nf-adversary-2's MED-2 and M4 folded in): every store-mutex hold on the create path does NO syscall,
 /// NO allocation and NO catalog statement. One instrument for the whole class: every outermost hold

@@ -2643,6 +2643,10 @@ struct FrozenNames {
 /// node in 37-39 of 40 creates, raws l35-diag-alloc).
 #[cfg(test)]
 pub(crate) static FILTER_NOTE_ALLOCS: AtomicU64 = AtomicU64::new(0);
+/// Test builds (review m1-2b LOW-F2): the most bytes one `NameFilter::note` freed, inside the store
+/// mutex hold that noted it (a refusing table dropped there). A test resets it.
+#[cfg(test)]
+pub(crate) static FILTER_NOTE_FREED_MAX: AtomicU64 = AtomicU64::new(0);
 
 /// Test hooks for the name filter's growth (review REVIEW-claude-namefilter H1): the growth's drain
 /// copy fails (`FILTER_DRAIN_FAILS`), and the growth thread pauses at stage `FILTER_PAUSE_AT`
@@ -2837,6 +2841,11 @@ struct NameFilter {
     /// kept; taken by a refusal. With none kept, a refusal leaves no answer (lookups ask the
     /// catalog until the rebuild).
     spare: Option<Arc<FilterTable>>,
+    /// Observation (review m1-2b item 4, case 4's frequency): refusals by a `Stale` table (a
+    /// shrink's, before its rebuild's seed), and answers ended because their sink refused a note
+    /// (`Building::old`, `Overflowed`'s), in this store.
+    stale_refusals: u64,
+    answers_refused: u64,
 }
 
 /// The keys a refusal's spare table holds before it refuses too (`NameFilter::spare`): the notes of
@@ -2917,10 +2926,13 @@ impl NameFilter {
     /// `name` is held by a branch from now on.
     fn note(&mut self, name: &str) {
         #[cfg(test)]
-        let allocs0 = super::budget_probe::thread_allocs().0;
+        let (allocs0, freed0) = (super::budget_probe::thread_allocs().0, super::budget_probe::thread_frees().1);
         self.note_inner(name);
         #[cfg(test)]
-        FILTER_NOTE_ALLOCS.fetch_add(super::budget_probe::thread_allocs().0 - allocs0, Ordering::Relaxed);
+        {
+            FILTER_NOTE_ALLOCS.fetch_add(super::budget_probe::thread_allocs().0 - allocs0, Ordering::Relaxed);
+            FILTER_NOTE_FREED_MAX.fetch_max(super::budget_probe::thread_frees().1 - freed0, Ordering::Relaxed);
+        }
     }
 
     fn note_inner(&mut self, name: &str) {
@@ -2980,6 +2992,7 @@ impl NameFilter {
             FilterState::Draining { table, .. } => table.insert(h),
         };
         if answer_refused {
+            self.answers_refused += 1;
             match &mut self.state {
                 FilterState::Building { old, .. } => *old = None,
                 FilterState::Overflowed { answer } => *answer = None,
@@ -3013,10 +3026,13 @@ impl NameFilter {
                 }
                 // Together complete but for `h`.
                 FilterState::Draining { table, pending } => self.spill([Some(table), Some(pending)], h),
-                FilterState::Stale { answer } => match answer.fixed {
-                    [None, None] => self.spill([Some(answer.sink), None], h),
-                    _ => None,
-                },
+                FilterState::Stale { answer } => {
+                    self.stale_refusals += 1;
+                    match answer.fixed {
+                        [None, None] => self.spill([Some(answer.sink), None], h),
+                        _ => None,
+                    }
+                }
                 // The build cannot complete; what answered still does (it took `h`, or it was
                 // dropped above).
                 FilterState::Building { old, .. } => old,
@@ -9645,6 +9661,14 @@ impl BranchStore {
             FilterState::Overflowed { .. } => "Overflowed",
         };
         (name, f.rebuilds)
+    }
+
+    /// Test builds: this store's case-4 observation counters, `(Stale refusals, answers ended by a
+    /// refusing sink)` (review m1-2b item 4).
+    #[cfg(test)]
+    pub(crate) fn name_filter_refusals_for_test(&self) -> (u64, u64) {
+        let inner = self.inner.lock();
+        (inner.names.filter.stale_refusals, inner.names.filter.answers_refused)
     }
 
     /// Test builds: the most entries one note moved inside its store-mutex hold (`held_moved_max`).

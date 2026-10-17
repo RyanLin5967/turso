@@ -991,6 +991,11 @@ pub(crate) fn thread_cat_stmts() -> u64 {
     T_CAT_STMTS.with(|c| c.get())
 }
 
+/// This thread's `(frees, bytes freed)`, exact per thread.
+pub(crate) fn thread_frees() -> (u64, u64) {
+    (T_FREES.with(|c| c.get()), T_FREE_BYTES.with(|c| c.get()))
+}
+
 /// This thread's `(allocations, bytes, allocations under a store mutex, bytes under one)`: exact
 /// per thread however many others run.
 pub(crate) fn thread_allocs() -> (u64, u64, u64, u64) {
