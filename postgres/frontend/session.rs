@@ -1789,11 +1789,26 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
             // BLIND SPOTS: a host zone database lacking a name PostgreSQL knows answers 22023 for
             // it; PostgreSQL's range bound for a numeric offset is not recorded, so any finite
             // number or NaN is valid here.
-            let numeric = lower
-                .parse::<f64>()
-                .is_ok_and(|h| h.is_finite() || h.is_nan());
-            let interval = lower.starts_with("interval");
-            let valid = utc || numeric || interval || zone_file(&text) || posix_tz(&text);
+            // UNVERIFIED beyond the recorded rows (review wire-rework C, finding (1)): the
+            // interval, strtod and tzcode grammar below follow PostgreSQL's check_timezone and
+            // tzparse as read, until one strict PG 18.6 recording of every case (LOUD-OWED).
+            if let Some(body) = lower.strip_prefix("interval") {
+                match timezone_interval(body) {
+                    TzInterval::Offset => return unsupported("this server answers only by its own setting of it"),
+                    TzInterval::NotAllowed(unit) => {
+                        return refused(format!("invalid interval value for time zone: {unit} not allowed"))
+                    }
+                    TzInterval::Malformed => {
+                        return Err(LimboError::ParseError(SqlErrorMessage::classified(
+                            SqlErrorKind::InvalidDatetimeFormat,
+                            format!("invalid input syntax for type interval: \"{text}\""),
+                        )))
+                    }
+                    TzInterval::NotOne => {}
+                }
+            }
+            let numeric = strtod_whole(&lower).is_some_and(|h| h.is_nan() || h.abs() < 168.0);
+            let valid = utc || numeric || zone_file(&text) || posix_tz(&text);
             if !valid {
                 return invalid();
             }
@@ -1888,47 +1903,169 @@ fn zone_file(name: &str) -> bool {
         && &magic == b"TZif"
 }
 
-/// Whether `spec` is a POSIX TZ string as PostgreSQL's tz code reads one: an optional standard
-/// name (three or more letters, or `<...>`), an offset `[+-]hh[:mm[:ss]]` (required after a name;
-/// alone, as `+05:30`, it is the whole spec), then optionally a daylight name, its own offset, and
-/// `,start[/time],end[/time]` rules (`Jn`, `n` or `Mm.w.d`). Only the shape is read, the values'
-/// ranges are not (BLIND SPOT: PostgreSQL's tzparse bounds hours at 24 and rules' fields too).
+/// A TimeZone value's `INTERVAL '...' [qualifier]` form, as check_timezone reads it: an offset
+/// with no months or days, or refused.
+enum TzInterval {
+    /// Not the quoted-literal form (`interval` alone, or followed by anything but a quote): read
+    /// as a zone name, which it is not.
+    NotOne,
+    /// A valid offset.
+    Offset,
+    /// Months or days given: 22023.
+    NotAllowed(&'static str),
+    /// A body interval_in refuses: 22007.
+    Malformed,
+}
+
+/// `body` is what follows `interval` in a lowercased TimeZone value: whitespace, a quoted
+/// interval literal, and an optional qualifier (`hour to minute`). The literal is `[+-]h[:m[:s]]`
+/// or a list of `<number> <unit>`; a year, month or day unit with a non-zero number is not
+/// allowed. BLIND SPOT: interval_in's full grammar (ISO 8601 `PT5H`, `@` forms, fractional
+/// units) is not read; such a body is Malformed here.
+fn timezone_interval(body: &str) -> TzInterval {
+    let rest = body.trim_start();
+    let Some(quoted) = rest.strip_prefix('\'') else {
+        return TzInterval::NotOne;
+    };
+    let Some(end) = quoted.find('\'') else {
+        return TzInterval::Malformed;
+    };
+    let (literal, tail) = (quoted[..end].trim(), quoted[end + 1..].trim());
+    let qualifier_ok = tail.is_empty()
+        || tail.split_whitespace().all(|w| {
+            matches!(w, "year" | "month" | "day" | "hour" | "minute" | "second" | "to")
+        });
+    if !qualifier_ok || literal.is_empty() {
+        return TzInterval::Malformed;
+    }
+    let clock = |t: &str| {
+        let t = t.trim_start_matches(['+', '-']);
+        let parts: Vec<&str> = t.split(':').collect();
+        parts.len() <= 3 && parts.iter().all(|p| !p.is_empty() && p.parse::<f64>().is_ok())
+    };
+    if clock(literal) {
+        return TzInterval::Offset;
+    }
+    let words: Vec<&str> = literal.split_whitespace().collect();
+    if words.len() % 2 != 0 {
+        return TzInterval::Malformed;
+    }
+    for pair in words.chunks(2) {
+        let Ok(n) = pair[0].parse::<f64>() else {
+            return TzInterval::Malformed;
+        };
+        let unit = pair[1].trim_end_matches('s');
+        match unit {
+            "hour" | "minute" | "min" | "second" | "sec" => {}
+            "day" if n != 0.0 => return TzInterval::NotAllowed("days"),
+            "month" | "mon" | "year" if n != 0.0 => return TzInterval::NotAllowed("months"),
+            "day" | "month" | "mon" | "year" => {}
+            _ => return TzInterval::Malformed,
+        }
+    }
+    TzInterval::Offset
+}
+
+/// `text` read whole as C's strtod reads a number (leading whitespace skipped; decimal, `0x` hex,
+/// `inf`/`infinity`, `nan` and `nan(...)`), or None when anything is left after it.
+fn strtod_whole(text: &str) -> Option<f64> {
+    let t = text.trim_start();
+    let (sign, body) = match t.as_bytes().first() {
+        Some(b'-') => (-1.0, &t[1..]),
+        Some(b'+') => (1.0, &t[1..]),
+        _ => (1.0, t),
+    };
+    if body.starts_with(['-', '+']) {
+        return None;
+    }
+    let lower = body.to_ascii_lowercase();
+    if let Some(hex) = lower.strip_prefix("0x") {
+        let (int, frac) = hex.split_once('.').unwrap_or((hex, ""));
+        if (int.is_empty() && frac.is_empty())
+            || !int.bytes().chain(frac.bytes()).all(|c| c.is_ascii_hexdigit())
+        {
+            return None;
+        }
+        let mut v = 0.0f64;
+        for c in int.chars() {
+            v = v * 16.0 + c.to_digit(16)? as f64;
+        }
+        let mut scale = 1.0 / 16.0;
+        for c in frac.chars() {
+            v += c.to_digit(16)? as f64 * scale;
+            scale /= 16.0;
+        }
+        return Some(sign * v);
+    }
+    if lower == "nan" || (lower.starts_with("nan(") && lower.ends_with(')')
+        && lower[4..lower.len() - 1].bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_'))
+    {
+        return Some(f64::NAN);
+    }
+    if lower == "inf" || lower == "infinity" {
+        return Some(sign * f64::INFINITY);
+    }
+    // Rust's parse also takes `infinity`/`nan` spellings and no other trailing text.
+    let ok = !body.is_empty()
+        && body.bytes().all(|c| c.is_ascii_digit() || matches!(c, b'.' | b'e' | b'E' | b'+' | b'-'));
+    ok.then(|| body.parse::<f64>().ok()).flatten().map(|v| sign * v)
+}
+
+/// Whether `spec` is a POSIX TZ string as tzcode's tzparse reads one (UNVERIFIED beyond the
+/// recorded rows, review wire-rework C finding (1)): a standard name (`<...>`, non-empty, or
+/// getzname's run of characters other than digits, `,`, `-` and `+`), an offset
+/// `[+-]h[:m[:s]]` with hours at most 167 and minutes and seconds at most 59 (getsecs; any digit
+/// count), then optionally a daylight name, its own offset, and two rules after `,` or `;`, each
+/// `Jn` (1-365), `n` (0-365) or `Mm.w.d` (1-12, 1-5, 0-6) with an optional `/offset`. A bare
+/// offset alone (`+05:30`) is a whole spec, as PG 18.6 answered it (pg18-rev-c39-tzforms.out).
 fn posix_tz(spec: &str) -> bool {
     let b = spec.as_bytes();
-    let mut i = 0;
     let name = |i: &mut usize| -> bool {
         if b.get(*i) == Some(&b'<') {
-            let Some(end) = spec[*i..].find('>') else { return false };
-            *i += end + 1;
+            let Some(end) = spec[*i + 1..].find('>') else { return false };
+            if end == 0 {
+                return false;
+            }
+            *i += end + 2;
             return true;
         }
         let start = *i;
-        while b.get(*i).is_some_and(u8::is_ascii_alphabetic) {
+        while b
+            .get(*i)
+            .is_some_and(|c| !c.is_ascii_digit() && !matches!(c, b',' | b'-' | b'+' | b';'))
+        {
             *i += 1;
         }
-        *i - start >= 3
+        *i > start
     };
-    let offset = |i: &mut usize| -> bool {
-        if matches!(b.get(*i), Some(b'+' | b'-')) {
-            *i += 1;
-        }
-        let mut groups = 0;
-        loop {
+    // getsecs: h[:m[:s]], hours up to 167, minutes and seconds up to 59.
+    let secs = |i: &mut usize| -> bool {
+        let limits = [167u32, 59, 59];
+        for (g, max) in limits.iter().enumerate() {
             let start = *i;
-            while b.get(*i).is_some_and(u8::is_ascii_digit) {
+            let mut v: u64 = 0;
+            while let Some(c) = b.get(*i).filter(|c| c.is_ascii_digit()) {
+                v = v.saturating_mul(10).saturating_add(u64::from(c - b'0'));
                 *i += 1;
             }
-            if *i == start || *i - start > 2 {
+            if *i == start || v > u64::from(*max) {
                 return false;
             }
-            groups += 1;
-            if groups < 3 && b.get(*i) == Some(&b':') {
+            if g < 2 && b.get(*i) == Some(&b':') {
                 *i += 1;
                 continue;
             }
             return true;
         }
+        true
     };
+    let offset = |i: &mut usize| -> bool {
+        if matches!(b.get(*i), Some(b'+' | b'-')) {
+            *i += 1;
+        }
+        secs(i)
+    };
+    let mut i = 0;
     let had_name = name(&mut i);
     if !had_name {
         i = 0;
@@ -1942,27 +2079,39 @@ fn posix_tz(spec: &str) -> bool {
     if !had_name || !name(&mut i) {
         return false;
     }
-    if i < b.len() && b[i] != b',' && !offset(&mut i) {
+    if i < b.len() && !matches!(b[i], b',' | b';') && !offset(&mut i) {
         return false;
     }
     if i == b.len() {
         return true;
     }
-    // Two rules, each Jn, n or Mm.w.d, with an optional /time.
+    let num = |t: &str, lo: u32, hi: u32| t.parse::<u32>().is_ok_and(|v| (lo..=hi).contains(&v))
+        && t.bytes().all(|c| c.is_ascii_digit());
     let rule = |r: &str| -> bool {
         let (date, time) = r.split_once('/').unwrap_or((r, "0"));
-        let digits = |s: &str| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit());
         let date_ok = if let Some(m) = date.strip_prefix('M') {
             let f: Vec<&str> = m.split('.').collect();
-            f.len() == 3 && f.iter().all(|x| digits(x))
+            f.len() == 3 && num(f[0], 1, 12) && num(f[1], 1, 5) && num(f[2], 0, 6)
+        } else if let Some(j) = date.strip_prefix('J') {
+            num(j, 1, 365)
         } else {
-            digits(date.strip_prefix('J').unwrap_or(date))
+            num(date, 0, 365)
         };
-        let t = time.trim_start_matches(['+', '-']);
-        date_ok && !t.is_empty() && t.split(':').all(digits)
+        let tb = time.as_bytes();
+        let mut k = 0;
+        if matches!(tb.first(), Some(b'+' | b'-')) {
+            k = 1;
+        }
+        let groups: Vec<&str> = time[k..].split(':').collect();
+        let time_ok = groups.len() <= 3
+            && groups.iter().enumerate().all(|(g, x)| num(x, 0, if g == 0 { 167 } else { 59 }));
+        date_ok && time_ok
     };
-    let rules: Vec<&str> = spec[i + 1..].split(',').collect();
-    b[i] == b',' && rules.len() == 2 && rules.iter().all(|r| rule(r))
+    if !matches!(b[i], b',' | b';') {
+        return false;
+    }
+    let rules: Vec<&str> = spec[i + 1..].split([',', ';']).collect();
+    rules.len() == 2 && rules.iter().all(|r| rule(r))
 }
 
 const PG_ENCODINGS: &[&str] = &[
