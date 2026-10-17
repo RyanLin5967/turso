@@ -3041,12 +3041,16 @@ fn a_failed_capture_check_under_the_whole_run_switch_aborts_the_process() {
 fn a_statement_reprepared_after_a_setting_change_keeps_its_search_path() {
     let _s = serial();
     let dir = tempfile::TempDir::new().unwrap();
-    let db = open_at(&dir.path().join("search-path-main.db"), DatabaseOpts::new());
+    // Setup completed before its first run (lead ruling "reprepare red invalid"): ATTACH is off by
+    // default (DatabaseOpts derives Default; translate/attach.rs refuses), so the red never reached
+    // its claim.
+    let db = open_at(&dir.path().join("search-path-main.db"), DatabaseOpts::new().with_attach(true));
     let c = db.connect().unwrap();
     c.execute("CREATE TABLE t(x INTEGER)").unwrap();
     c.execute("INSERT INTO t VALUES (1)").unwrap();
     let other = dir.path().join("search-path-s.db");
-    c.execute(format!("ATTACH '{}' AS s", other.display())).unwrap();
+    let attached = c.execute(format!("ATTACH '{}' AS s", other.display()));
+    assert!(attached.is_ok(), "premise: ATTACH succeeded: {attached:?}");
     c.execute("CREATE TABLE s.t(x INTEGER)").unwrap();
     c.execute("INSERT INTO s.t VALUES (2)").unwrap();
     let sql = "SELECT x FROM t";
