@@ -1503,7 +1503,12 @@ impl StoreMutex {
         // fastest-budgets instrument (test builds): acquisitions, and what is done while held.
         #[cfg(test)]
         super::budget_probe::store_locked_at(site);
-        StoreGuard { guard: Some(guard), store: self }
+        StoreGuard {
+            guard: Some(guard),
+            store: self,
+            #[cfg(test)]
+            site,
+        }
     }
 }
 
@@ -1511,7 +1516,22 @@ struct StoreGuard<'a> {
     /// `None` only inside the drop, between the unlock and the owed start's send.
     guard: Option<crate::sync::MutexGuard<'a, StoreInner>>,
     store: &'a StoreMutex,
+    /// Test builds: where the mutex was taken (the lifecycle audit's `HoldRec::site`).
+    #[cfg(test)]
+    site: &'static std::panic::Location<'static>,
 }
+
+#[cfg(test)]
+impl StoreGuard<'_> {
+    fn held_site(&self) -> &'static std::panic::Location<'static> {
+        self.site
+    }
+}
+
+/// Test builds: the site of `run_owed_start`'s hold, as the lifecycle audit records it, so the audit
+/// can assert the checkpoint worker's start was in its window (review L2d M3).
+#[cfg(test)]
+pub(crate) static OWED_START_SITE: std::sync::OnceLock<&'static std::panic::Location<'static>> = std::sync::OnceLock::new();
 
 impl std::ops::Deref for StoreGuard<'_> {
     type Target = StoreInner;
@@ -3959,6 +3979,8 @@ struct WorkerSlot {
 fn run_owed_start(ctx: FlightCtx) {
     let flight = {
         let mut inner = ctx.inner.lock();
+        #[cfg(test)]
+        let _ = OWED_START_SITE.set(inner.held_site());
         if !inner.journal.as_ref().is_some_and(|j| j.wants_compaction()) {
             return;
         }

@@ -9333,6 +9333,11 @@ fn lifecycle_audit(n: u32) {
     // population too, raw l96; the D0 population itself costs about 0.7 ms a create in debug, raw
     // l102). Its creates, and its growth's holds, are the same; only how it is started differs.
     let force = n >= 100_000;
+    // Review L2d M3: a threshold the growth's creates cross, so a checkpoint the worker starts
+    // (`run_owed_start`'s hold, slice 3) falls in the audited window; the forced arm's handful of
+    // creates crosses only a 1-byte one. Asserted below as a premise.
+    let _threshold = Threshold::set(if force { 1 } else { 8 << 10 });
+    let growth_from = AUDIT_LOG.lock().unwrap().len();
     if force {
         db.branches.force_name_filter_growth_for_test();
     }
@@ -9392,6 +9397,12 @@ fn lifecycle_audit(n: u32) {
         }
     }
     assert!(!worst.is_empty(), "premise: the audit recorded no hold");
+    let owed_site = super::store::OWED_START_SITE.get().copied();
+    let owed_holds = owed_site.map_or(0, |s| log[growth_from..].iter().filter(|h| std::ptr::eq(h.site, s) || (h.site.file() == s.file() && h.site.line() == s.line())).count());
+    assert!(
+        owed_holds >= 1,
+        "premise: no hold at run_owed_start's site ({owed_site:?}) after the growth began: the checkpoint worker's start was not audited"
+    );
     assert!(
         over.is_empty(),
         "CLAIM: {} store-mutex sites on the create path did a syscall, an allocation or a catalog statement while held (n = {n}): {over:#?}",
