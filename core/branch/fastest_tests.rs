@@ -2827,6 +2827,32 @@ fn a_start_sent_after_the_store_closed_starts_no_worker() {
     );
 }
 
+/// Review REVIEW-claude-engine-M1 LOW-2: a hold that panicked starts no checkpoint while its
+/// stack unwinds (it would capture a half-changed store); the start it owed stays owed, and the
+/// next hold's unlock sends it. At c1809b546 the unwinding guard sent it.
+#[test]
+fn a_hold_that_panicked_sends_its_owed_start_only_at_the_next_hold() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(
+        &dir.path().join("panicked-hold.db"),
+        opts(true, SyncClass::Fsync).with_branch_checkpoint(super::BranchCheckpoint::Fuzzy),
+    );
+    let probe = db.branches.starter_probe();
+    let before = probe.handed_out();
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| probe.owe_then_panic()));
+    assert!(unwound.is_err(), "premise: the hold panicked");
+    assert_eq!(
+        probe.handed_out(),
+        before,
+        "CLAIM: a hold that panicked handed its owed start to the checkpoint worker while unwinding"
+    );
+    assert!(probe.owed(), "CLAIM: the start a panicked hold owed was dropped, not kept for the next hold");
+    probe.touch();
+    assert_eq!(probe.handed_out(), before + 1, "CLAIM: the next hold did not send the start the panicked one owed");
+    db.branch_checkpoint_wait();
+}
+
 /// Review 2 #5: a checkpoint that failed is not retried by the very next operation — the log is
 /// past the threshold still, so without a back-off every create would start (and pay for) another
 /// one: it waits for another threshold's worth of log.

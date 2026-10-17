@@ -4303,6 +4303,19 @@ impl StarterProbe {
     pub(crate) fn release(&self) {
         self.store.starter_hold.store(0, Ordering::Release);
     }
+    /// A hold that owes a checkpoint start and then panics, so its guard drops while unwinding.
+    pub(crate) fn owe_then_panic(&self) {
+        let _guard = self.store.lock();
+        self.store.start_due.store(true, Ordering::Release);
+        panic!("test: a hold that owed a checkpoint start panicked");
+    }
+    /// A hold that owes nothing (its unlock sends whatever is still owed).
+    pub(crate) fn touch(&self) {
+        drop(self.store.lock());
+    }
+    pub(crate) fn owed(&self) -> bool {
+        self.store.start_due.load(Ordering::Acquire)
+    }
     /// Checkpoint jobs handed to a worker so far.
     pub(crate) fn handed_out(&self) -> u64 {
         self.jobs.0.lock().unwrap_or_else(|e| e.into_inner()).0
