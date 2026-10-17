@@ -39,6 +39,20 @@ pub trait Dialect: Send + Sync + 'static {
     /// engine-generated and AST-only statements use that representation.
     fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)>;
 
+    /// Parse `sql` again for a statement the engine re-prepares on `conn` (after a
+    /// prepare-generation bump or another session's schema change), so a frontend whose
+    /// translation needs the connection (its schema, for a column lookup: DELETE ... USING, a
+    /// positional INSERT with DEFAULT, an alias column list) re-translates as its own prepare did
+    /// (wire-rework review E-M2). Default: [`Dialect::parse`], for dialects that need no
+    /// connection.
+    fn parse_for_reprepare(
+        &self,
+        sql: &str,
+        _conn: &crate::sync::Arc<crate::Connection>,
+    ) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+        self.parse(sql)
+    }
+
     /// Parse a `sqlite_schema` `type='table'` row's SQL into a table
     /// definition.
     ///
@@ -291,6 +305,79 @@ mod tests {
             )?;
             schema.add_virtual_table(Arc::new(vtab))
         }
+    }
+
+    /// A dialect that counts its connection-aware re-parses (wire-rework E-M2).
+    #[derive(Default)]
+    struct ReparseDialect {
+        reparses: AtomicUsize,
+    }
+
+    impl Dialect for ReparseDialect {
+        fn name(&self) -> &'static str {
+            "reparse-test"
+        }
+        fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+            sqlite::parse(sql)
+        }
+        fn parse_for_reprepare(
+            &self,
+            sql: &str,
+            conn: &crate::sync::Arc<crate::Connection>,
+        ) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+            assert!(!conn.is_closed(), "the re-preparing connection is open");
+            self.reparses.fetch_add(1, Ordering::SeqCst);
+            sqlite::parse(sql)
+        }
+        fn parse_table_sql(&self, sql: &str, root_page: i64) -> crate::Result<BTreeTable> {
+            BTreeTable::from_sql(sql, root_page)
+        }
+        fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<turso_parser::ast::Stmt> {
+            sqlite::parse_table_sql_ast(sql)
+        }
+        fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
+            sqlite::table_sql_for_replay(sql)
+        }
+        fn format_table_sql(
+            &self,
+            input: &str,
+            _tbl_name: &turso_parser::ast::QualifiedName,
+            _body: &turso_parser::ast::CreateTableBody,
+        ) -> crate::Result<String> {
+            Ok(input.to_string())
+        }
+        fn resolve_function(&self, name: &str, arg_count: usize) -> crate::Result<Option<crate::function::Func>> {
+            sqlite::resolve_builtin_function(name, arg_count)
+        }
+        fn register_catalog(&self, schema: &mut crate::schema::Schema, enable_custom_types: bool) -> crate::Result<()> {
+            sqlite::register_builtin_catalog(schema, enable_custom_types)
+        }
+    }
+
+    /// Wire-rework review E-M2 (lead order): a statement the ENGINE re-prepares (here after a real
+    /// setting change bumps the prepare generation) is re-parsed through the dialect's
+    /// connection-aware hook, with the re-preparing connection, so a frontend can re-translate as
+    /// its own prepare did. At b119a4f1e `Statement::reprepare` called `Dialect::parse`, which has
+    /// no connection. Premise: the statement was re-prepared.
+    #[test]
+    fn an_engine_reprepare_reparses_through_the_dialect_with_its_connection() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let dialect = Arc::new(ReparseDialect::default());
+        let db = open_db(&io, "reparse.db", dialect.clone()).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER)").unwrap();
+        conn.execute("INSERT INTO t VALUES (7)").unwrap();
+        let mut stmt = conn.prepare("SELECT x FROM t").unwrap();
+        assert_eq!(stmt.run_collect_rows().unwrap().len(), 1, "premise: the SELECT reads its row");
+        stmt.reset().unwrap();
+        let reprepares0 = stmt.metrics().reprepares;
+        conn.set_cache_size(conn.get_cache_size() + 1);
+        assert_eq!(stmt.run_collect_rows().unwrap().len(), 1, "premise: the re-prepared SELECT reads its row");
+        assert!(stmt.metrics().reprepares > reprepares0, "premise: the statement was re-prepared");
+        assert!(
+            dialect.reparses.load(Ordering::SeqCst) >= 1,
+            "CLAIM: the engine re-prepared without the dialect's connection-aware re-parse"
+        );
     }
 
     /// Stores table definitions in syntax that SQLite cannot parse and always
