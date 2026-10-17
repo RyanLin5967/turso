@@ -2908,6 +2908,107 @@ fn a_fuzzy_checkpoint_s_lease_floor_is_the_catalog_s_at_its_install() {
     drop(held);
 }
 
+/// Review REVIEW-claude-engine-M1 LOW-5: each path the M1 fix names gets its own owed start sent,
+/// not only `expire_branches`. The store is built at the default threshold with 300 forks leased
+/// for a minute and one branch `keep` with ten hours; the lease clock then passes the minute, the
+/// threshold drops to 1 byte (the log is past it, and past twice the snapshot), and ONE operation
+/// of the path under test runs: its expiry pass reaps the 300 and owes the checkpoint, which must
+/// start with no other operation. Mutant `owed_start_unsent`: red on every path.
+struct LeasedPastDue {
+    db: Arc<Database>,
+    trunk: Arc<Connection>,
+    keep: Branch,
+    held: Vec<Branch>,
+    started: u64,
+}
+
+fn leased_past_due(path: &Path) -> LeasedPastDue {
+    let db = open_at(path, opts(true, SyncClass::Fsync).with_branch_checkpoint(super::BranchCheckpoint::Fuzzy));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let keep = trunk.fork_branch().unwrap();
+    keep.lease(std::time::Duration::from_secs(36_000)).unwrap();
+    trunk.create_branch("named-keep").unwrap();
+    let mut held = Vec::new();
+    for _ in 0..300 {
+        let b = trunk.fork_branch().unwrap();
+        b.lease(std::time::Duration::from_secs(60)).unwrap();
+        held.push(b);
+    }
+    db.branch_checkpoint_wait();
+    let started = db.branch_checkpoint_counters()[1];
+    db.branch_lease_clock_advance(std::time::Duration::from_secs(3600));
+    LeasedPastDue { db, trunk, keep, held, started }
+}
+
+/// After the one operation: a checkpoint started (fuzzy flights started rose past `started`).
+fn assert_a_checkpoint_started(db: &Database, started: u64, path: &str) {
+    let t = std::time::Instant::now();
+    while db.branch_checkpoint_counters()[1] == started && t.elapsed() < std::time::Duration::from_secs(10) {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    db.branch_checkpoint_wait();
+    assert!(
+        db.branch_checkpoint_counters()[1] > started,
+        "CLAIM: {path}'s expiry pass reaped past the threshold and no checkpoint started ({started} before, as many after)"
+    );
+}
+
+#[test]
+fn a_lease_renewal_whose_expiry_crosses_the_threshold_starts_a_checkpoint() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let s = leased_past_due(&dir.path().join("owed-set-lease.db"));
+    let _t = Threshold::set(1);
+    s.keep.lease(std::time::Duration::from_secs(60)).unwrap();
+    assert_a_checkpoint_started(&s.db, s.started, "set_lease");
+    drop(s.held);
+}
+
+#[test]
+fn a_connect_whose_expiry_crosses_the_threshold_starts_a_checkpoint() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let s = leased_past_due(&dir.path().join("owed-open-conn.db"));
+    let _t = Threshold::set(1);
+    let c = s.keep.connect().unwrap();
+    assert_a_checkpoint_started(&s.db, s.started, "open_conn");
+    drop(c);
+    drop(s.held);
+}
+
+#[test]
+fn a_named_create_refused_after_its_expiry_crossed_the_threshold_starts_a_checkpoint() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let s = leased_past_due(&dir.path().join("owed-create-error.db"));
+    let _t = Threshold::set(1);
+    assert!(s.trunk.create_branch("named-keep").is_err(), "premise: the name was taken, so the create returned an error");
+    assert_a_checkpoint_started(&s.db, s.started, "a refused named create");
+    drop(s.held);
+}
+
+#[test]
+fn an_open_whose_expiry_crosses_the_threshold_starts_a_checkpoint() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("owed-open.db");
+    let incarnation = {
+        let s = leased_past_due(&path);
+        // Detached, not released: the 300 outlive the close, and the reopen's expiry reaps them
+        // (the close stamps the lease clock, an hour on).
+        for b in s.held {
+            let _ = b.into_id();
+        }
+        let _ = s.keep.into_id();
+        drop(s.trunk);
+        s.db.incarnation
+    };
+    let _t = Threshold::set(1);
+    let db = reopen(&path, opts(true, SyncClass::Fsync).with_branch_checkpoint(super::BranchCheckpoint::Fuzzy), incarnation);
+    assert_a_checkpoint_started(&db, 0, "the open");
+}
+
 /// Review 2 #5: a checkpoint that failed is not retried by the very next operation — the log is
 /// past the threshold still, so without a back-off every create would start (and pay for) another
 /// one: it waits for another threshold's worth of log.
