@@ -3396,7 +3396,7 @@ fn folds_at_plan(parse: &turso_pg_parser::pg_query::ParseResult) -> bool {
     select.from_clause.is_empty() && select.op() == SetOperation::SetopNone
 }
 
-fn is_delete_using(sql: &str, parse: &turso_pg_parser::pg_query::ParseResult) -> bool {
+pub(crate) fn is_delete_using(sql: &str, parse: &turso_pg_parser::pg_query::ParseResult) -> bool {
     use turso_pg_parser::pg_query::NodeRef;
     if !sql
         .as_bytes()
@@ -3414,7 +3414,7 @@ fn is_delete_using(sql: &str, parse: &turso_pg_parser::pg_query::ParseResult) ->
 
 /// Whether a FROM item's alias carries a column list (`t AS a (x, y)`), which the translator reads
 /// the table's columns for.
-fn has_alias_column_list(parse: &turso_pg_parser::pg_query::ParseResult) -> bool {
+pub(crate) fn has_alias_column_list(parse: &turso_pg_parser::pg_query::ParseResult) -> bool {
     use turso_pg_parser::pg_query::NodeRef;
     parse.protobuf.nodes().iter().any(|(n, ..)| {
         matches!(n, NodeRef::RangeVar(rv) if rv.alias.as_ref().is_some_and(|a| !a.colnames.is_empty()))
@@ -3422,7 +3422,7 @@ fn has_alias_column_list(parse: &turso_pg_parser::pg_query::ParseResult) -> bool
 }
 
 /// Whether the statement holds an INSERT with no column list whose VALUES lists hold DEFAULT.
-fn is_positional_insert_default(sql: &str, parse: &turso_pg_parser::pg_query::ParseResult) -> bool {
+pub(crate) fn is_positional_insert_default(sql: &str, parse: &turso_pg_parser::pg_query::ParseResult) -> bool {
     sql.as_bytes()
         .windows(7)
         .any(|w| w.eq_ignore_ascii_case(b"default"))
