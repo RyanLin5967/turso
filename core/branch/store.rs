@@ -3039,9 +3039,14 @@ struct ChildIndex {
     /// rows then, and its links' rows are deleted); a capture that is not written merges it back.
     frozen: BTreeMap<(u64, u64), BranchId>,
     frozen_removed: BTreeMap<(u64, u64), (Option<u64>, Option<u64>)>,
-    /// The frozen generation an install let go of, freed after the store mutex.
-    retired: Option<(BTreeMap<(u64, u64), BranchId>, BTreeMap<(u64, u64), (Option<u64>, Option<u64>)>)>,
+    /// The frozen generation an install let go of, freed after the store mutex. `None` when it
+    /// held nothing.
+    retired: Option<RetiredChildren>,
 }
+
+/// A frozen child generation an install let go of: its keys and links, moved out (no copy, no
+/// allocation) to be freed after the store mutex.
+type RetiredChildren = (BTreeMap<(u64, u64), BranchId>, BTreeMap<(u64, u64), (Option<u64>, Option<u64>)>);
 
 impl ChildIndex {
     fn insert(&mut self, parent: BranchId, f: u64, child: BranchId) {
@@ -3067,7 +3072,7 @@ impl ChildIndex {
     fn retire_frozen(&mut self) {
         let map = std::mem::take(&mut self.frozen);
         let removed = std::mem::take(&mut self.frozen_removed);
-        self.retired = Some((map, removed));
+        self.retired = (!map.is_empty() || !removed.is_empty()).then_some((map, removed));
     }
 
     /// A capture that is not written: the frozen generation goes back into the live one (an entry
@@ -3081,8 +3086,10 @@ impl ChildIndex {
         self.removed = removed;
     }
 
-    fn take_retired(&mut self) -> Option<impl Drop> {
-        self.retired.take().map(Box::new)
+    /// The retired generation, moved out for its caller to drop after the store mutex (review
+    /// L2d M2: no `Box`, which was one allocation inside every fuzzy install's hold).
+    fn take_retired(&mut self) -> Option<RetiredChildren> {
+        self.retired.take()
     }
 
     fn contains(&self, k: &(u64, u64)) -> bool {
