@@ -1988,8 +1988,11 @@ impl Connection {
     }
 
     pub fn set_check_constraints_ignored(&self, ignore: bool) {
-        self.check_constraints_pragma
-            .store(ignore, Ordering::Release);
+        // Compiled into every INSERT/UPDATE's CHECK (translate/emitter): bumped on a change
+        // (engine-rev-setter MED-1).
+        if self.check_constraints_pragma.swap(ignore, Ordering::AcqRel) != ignore {
+            self.bump_prepare_context_generation();
+        }
     }
 
     pub fn check_constraints_ignored(&self) -> bool {
@@ -4002,7 +4005,10 @@ impl Connection {
     }
 
     pub fn set_dml_require_where(&self, value: bool) {
-        self.dml_require_where.store(value, Ordering::SeqCst);
+        // Checked at translation (translate/mod.rs): bumped on a change (engine-rev-setter MED-1).
+        if self.dml_require_where.swap(value, Ordering::SeqCst) != value {
+            self.bump_prepare_context_generation();
+        }
     }
 
     pub fn get_count_changes(&self) -> bool {
@@ -4010,7 +4016,11 @@ impl Connection {
     }
 
     pub fn set_count_changes(&self, value: bool) {
-        self.count_changes.store(value, Ordering::SeqCst);
+        // Adds a count row to the compiled DML (translate/mod.rs): bumped on a change
+        // (engine-rev-setter MED-1).
+        if self.count_changes.swap(value, Ordering::SeqCst) != value {
+            self.bump_prepare_context_generation();
+        }
     }
 
     pub fn get_dqs_dml(&self) -> bool {
@@ -4584,7 +4594,14 @@ impl Connection {
 
     /// Set the sync type (for PRAGMA fullfsync).
     pub fn set_sync_type(&self, value: crate::io::FileSyncType) {
-        self.pager.load().set_sync_type(value);
+        // Read by PRAGMA fullfsync's compiled answer (translate/pragma.rs): bumped on a change
+        // (engine-rev-setter MED-1).
+        let pager = self.pager.load();
+        if pager.get_sync_type() == value {
+            return;
+        }
+        pager.set_sync_type(value);
+        self.bump_prepare_context_generation();
     }
 
     /// Creates a HashSet of modules that have been loaded
