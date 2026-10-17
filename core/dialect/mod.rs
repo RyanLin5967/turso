@@ -307,6 +307,93 @@ mod tests {
         }
     }
 
+    /// A frontend dialect that parses ONLY its own client text (marked `client: `) and refuses
+    /// everything else, so any engine helper whose SQLite text goes through `Dialect::parse` fails
+    /// instead of silently switching dialects (the wire's NO SILENT DIALECT SWITCH class).
+    struct ClientOnlyDialect;
+
+    impl Dialect for ClientOnlyDialect {
+        fn name(&self) -> &'static str {
+            "client-only"
+        }
+        fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+            let Some(rest) = sql.strip_prefix("client: ") else {
+                return Err(crate::LimboError::ParseError(format!("client-only dialect refused engine text: {sql}")));
+            };
+            let (cmd, offset) = sqlite::parse(rest)?;
+            Ok((cmd, "client: ".len() + offset))
+        }
+        fn parse_table_sql(&self, sql: &str, root_page: i64) -> crate::Result<BTreeTable> {
+            BTreeTable::from_sql(sql, root_page)
+        }
+        fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<turso_parser::ast::Stmt> {
+            sqlite::parse_table_sql_ast(sql)
+        }
+        fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
+            sqlite::table_sql_for_replay(sql)
+        }
+        fn format_table_sql(
+            &self,
+            input: &str,
+            _tbl_name: &turso_parser::ast::QualifiedName,
+            _body: &turso_parser::ast::CreateTableBody,
+        ) -> crate::Result<String> {
+            Ok(input.strip_prefix("client: ").unwrap_or(input).to_string())
+        }
+        fn resolve_function(&self, name: &str, arg_count: usize) -> crate::Result<Option<crate::function::Func>> {
+            sqlite::resolve_builtin_function(name, arg_count)
+        }
+        fn register_catalog(&self, schema: &mut crate::schema::Schema, enable_custom_types: bool) -> crate::Result<()> {
+            sqlite::register_builtin_catalog(schema, enable_custom_types)
+        }
+    }
+
+    /// The wire's NO SILENT DIALECT SWITCH class (fastest-wire DIALECT-SWITCH-AUDIT, 297bbe33cd):
+    /// the engine's own helper statements are SQLite text, parsed as SQLite whatever the
+    /// database's dialect, never handed to the frontend's parser (where text it rejects used to fall
+    /// back to SQLite, and text it accepts could mean something else). Each case runs an engine
+    /// path that prepares helper SQL, on a database whose dialect refuses all but client text: the
+    /// pragma table functions, VACUUM, ALTER TABLE's schema rewrite, CDC capture and the MVCC
+    /// journal-mode switch. At bcf8e75a0 helpers went through `Dialect::parse`.
+    #[cfg(all(feature = "fs", not(target_family = "wasm")))]
+    #[test]
+    fn engine_helper_sql_is_parsed_as_sqlite_whatever_the_dialect() {
+        let dir = tempfile::tempdir().unwrap();
+        let io: Arc<dyn IO> = Arc::new(crate::io::PlatformIO::new().unwrap());
+        let open = |name: &str| {
+            let db = Database::open_file_with_flags(
+                io.clone(),
+                dir.path().join(name).to_str().unwrap(),
+                OpenFlags::Create,
+                DatabaseOpts::new().with_vacuum(true),
+                None,
+                Arc::new(ClientOnlyDialect),
+            )
+            .unwrap();
+            let conn = db.connect().unwrap();
+            conn.execute("client: CREATE TABLE t(x INTEGER)").unwrap();
+            conn.execute("client: INSERT INTO t VALUES (1)").unwrap();
+            (db, conn)
+        };
+        let mut failed = Vec::new();
+        let mut case = |what: &str, r: crate::Result<()>| {
+            if let Err(e) = r {
+                failed.push(format!("{what}: {e}"));
+            }
+        };
+        let (_db, c) = open("pragma.db");
+        case("pragma table function", c.prepare("client: SELECT name FROM pragma_table_info('t')").and_then(|mut s| s.run_collect_rows()).map(drop));
+        let (_db, c) = open("vacuum.db");
+        case("VACUUM", c.execute("client: VACUUM"));
+        let (_db, c) = open("alter.db");
+        case("ALTER TABLE ADD COLUMN", c.execute("client: ALTER TABLE t ADD COLUMN y INTEGER").and_then(|()| c.execute("client: INSERT INTO t VALUES (2, 3)")));
+        let (_db, c) = open("cdc.db");
+        case("CDC capture", c.execute("client: PRAGMA capture_data_changes_conn('id')").and_then(|()| c.execute("client: INSERT INTO t VALUES (2)")));
+        let (_db, c) = open("mvcc.db");
+        case("MVCC switch", c.execute("client: PRAGMA journal_mode = 'mvcc'").and_then(|()| c.execute("client: INSERT INTO t VALUES (2)")));
+        assert!(failed.is_empty(), "CLAIM: engine helper SQL went through the frontend dialect's parser: {failed:#?}");
+    }
+
     /// A dialect that counts its connection-aware re-parses (wire-rework E-M2).
     #[derive(Default)]
     struct ReparseDialect {
