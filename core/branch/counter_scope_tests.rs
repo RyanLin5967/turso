@@ -203,6 +203,7 @@ fn the_fuzzy_held_syscall_budget_is_judged_beside_another_stores_work() {
     };
     if started_rx.recv_timeout(std::time::Duration::from_secs(60)).is_err() {
         let why = if busy.is_finished() { "it ended (panicked?)" } else { "no first create in 60 s" };
+        stop.store(true, O::Release);
         panic!("premise: the other store never started working: {why}");
     }
     let at_entry = creates.load(O::Acquire);
