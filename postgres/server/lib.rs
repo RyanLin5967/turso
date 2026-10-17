@@ -7113,11 +7113,21 @@ mod tests {
                     }
                 }
                 b'/' if b.get(i + 1) == Some(&b'*') => {
+                    // Rust block comments nest (review wire-line3 LOW-6).
+                    let mut nest = 1;
                     i += 2;
-                    while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
-                        i += 1;
+                    while i + 1 < b.len() && nest > 0 {
+                        if b[i] == b'/' && b[i + 1] == b'*' {
+                            nest += 1;
+                            i += 2;
+                        } else if b[i] == b'*' && b[i + 1] == b'/' {
+                            nest -= 1;
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
                     }
-                    i += 1;
+                    i -= 1;
                 }
                 b'r' if matches!(b.get(i + 1), Some(b'#') | Some(b'"'))
                     && !b[i.saturating_sub(1)].is_ascii_alphanumeric() =>
@@ -7141,9 +7151,12 @@ mod tests {
                     }
                 }
                 b'\'' => {
+                    // `'\X'`: the closing quote comes after the escaped character, which may
+                    // itself be a quote (`'\''`: it was read as the close, and the real close as
+                    // a new opener; review wire-line3 LOW-6).
                     if b.get(i + 1) == Some(&b'\\') {
-                        if let Some(n) = text[i + 2..].find('\'') {
-                            i += 2 + n;
+                        if let Some(n) = text.get(i + 3..).and_then(|t| t.find('\'')) {
+                            i += 3 + n;
                         }
                     } else if b.get(i + 2) == Some(&b'\'') {
                         i += 2;

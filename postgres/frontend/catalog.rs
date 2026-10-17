@@ -187,6 +187,12 @@ impl Dialect for PostgresDialect {
         let Some(raw_sql) = decode_stored_pg_schema_sql(sql) else {
             return turso_core::dialect::sqlite::table_sql_for_replay(sql);
         };
+        // Client DDL stored before the marker refusal (f8f0d4b13) may start with the SQLite
+        // marker; replayed bare, the client's PostgreSQL DDL would be read as SQLite. It replays as
+        // stored, behind its PostgreSQL prefix (review wire-line3 LOW-2).
+        if raw_sql.trim_start().starts_with(SQLITE_TEXT_MARKER.trim_end()) {
+            return Ok(sql.to_string());
+        }
 
         let stmt = self.parse_table_sql_ast(sql)?;
         let turso_parser::ast::Stmt::CreateTable {
@@ -4400,7 +4406,7 @@ mod dialect_switch_tests {
     /// libpg_query rejects, such as a PRAGMA, still falls back to SQLite until the engine's typed
     /// text kind lands at integration; nothing here asserts otherwise: review wire-line2 LOW-9.)
     #[test]
-    fn only_marked_text_takes_the_sqlite_parse() {
+    fn marked_text_takes_the_sqlite_parse() {
         let pragma = "PRAGMA foreign_keys";
         assert!(PostgresDialect.parse(&format!("{SQLITE_TEXT_MARKER}{pragma}")).is_ok());
         assert!(PostgresDialect.parse(&format!("{SQLITE_TEXT_MARKER}SELECT ?1")).is_ok());
