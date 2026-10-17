@@ -378,6 +378,10 @@ pub struct Connection {
     /// Per-database schema cache (database_index -> schema)
     /// Loaded lazily to avoid copying all schemas on connection open
     pub(super) database_schemas: RwLock<HashMap<usize, Arc<Schema>>>,
+    /// The attached databases' shared schema versions this connection last adopted, summed
+    /// (`maybe_update_schema`; wire-rev-line M1). Versions only grow, so the sum moves whenever
+    /// any one does. `u64::MAX`: not read yet.
+    attached_schemas_seen: AtomicU64,
     /// Whether to automatically commit transaction
     pub(crate) auto_commit: AtomicBool,
     pub(super) transaction_state: AtomicTransactionState,
@@ -2077,6 +2081,28 @@ impl Connection {
             }
             *self.schema.write() = adopted;
             self.bump_prepare_context_generation();
+        }
+        // The main schema's lock first let go: no attached schema's lock is taken under it.
+        drop(schema);
+        // The attached databases too (wire-rev-line M1: another session's DDL on an attached
+        // schema was never adopted between statements). Their shared schemas are read directly,
+        // so adopting means dropping this connection's older staged copies and re-preparing.
+        if self.has_no_open_transaction_state() {
+            let attached = self.attached_databases.read();
+            let mut seen: u64 = 0;
+            for (&idx, (db, _pager)) in attached.index_to_data.iter() {
+                let version = db.schema.lock().schema_version;
+                seen = seen.wrapping_add(u64::from(version));
+                let stale = self.database_schemas.read().get(&idx).is_some_and(|s| s.schema_version < version);
+                if stale {
+                    self.database_schemas.write().remove(&idx);
+                }
+            }
+            drop(attached);
+            let before = self.attached_schemas_seen.swap(seen, Ordering::AcqRel);
+            if before != u64::MAX && before != seen {
+                self.bump_prepare_context_generation();
+            }
         }
     }
 

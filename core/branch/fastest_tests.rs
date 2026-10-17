@@ -3171,8 +3171,8 @@ fn another_session_s_ddl_on_an_attached_schema_is_adopted_between_statements() {
 /// is audited (and the setter class above says whether it should be change-only). Counts calls of
 /// `bump_prepare_context_generation()` and the extensions' raw `prepare_context_generation)
 /// .fetch_add(`, outside comments and the function's own definition. Audited at 09e8b26b0:
-/// - connection.rs 37: the change-only setters (17: set_temp_store and the 16 of 49e10e02a and
-///   09e8b26b0); schema, attach,
+/// - connection.rs 38: the change-only setters (17: set_temp_store and the 16 of 49e10e02a and
+///   09e8b26b0); an attached schema's adoption on a change (wire-rev-line M1); schema, attach,
 ///   detach, rollback and collation events that are themselves changes; set_busy_handler, the
 ///   encryption setters and the mvcc thresholds, unconditional (not comparable, or rare).
 /// - ext/mod.rs 4: extension registration (functions, vtabs), each a change.
@@ -3185,7 +3185,7 @@ fn another_session_s_ddl_on_an_attached_schema_is_adopted_between_statements() {
 #[test]
 fn every_prepare_generation_bump_site_is_audited() {
     const AUDITED: &[(&str, usize)] = &[
-        ("connection.rs", 37),
+        ("connection.rs", 38),
         ("ext/mod.rs", 4),
         ("mvcc/database/checkpoint_state_machine.rs", 1),
         ("storage/pager.rs", 1),
