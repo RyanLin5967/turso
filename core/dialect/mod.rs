@@ -488,6 +488,114 @@ mod tests {
         assert!(failed.is_empty(), "CLAIM: a database whose engine helper made a table does not reopen under its dialect: {failed:#?}");
     }
 
+    /// A dialect that parks one translation in the middle: resolving the function `park_here()`
+    /// signals `parked` and waits for `go`, recording whether `go` (not the bound) ended the park
+    /// (review c42b MED-4).
+    #[derive(Default)]
+    struct ParkingDialect {
+        parked: crate::sync::atomic::AtomicBool,
+        go: crate::sync::atomic::AtomicBool,
+        released_by_go: crate::sync::atomic::AtomicBool,
+    }
+
+    impl Dialect for ParkingDialect {
+        fn name(&self) -> &'static str {
+            "parking"
+        }
+        fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+            sqlite::parse(sql)
+        }
+        fn parse_table_sql(&self, sql: &str, root_page: i64) -> crate::Result<BTreeTable> {
+            BTreeTable::from_sql(sql, root_page)
+        }
+        fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<turso_parser::ast::Stmt> {
+            sqlite::parse_table_sql_ast(sql)
+        }
+        fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
+            sqlite::table_sql_for_replay(sql)
+        }
+        fn format_table_sql(
+            &self,
+            input: &str,
+            _tbl_name: &turso_parser::ast::QualifiedName,
+            _body: &turso_parser::ast::CreateTableBody,
+        ) -> crate::Result<String> {
+            Ok(input.to_string())
+        }
+        fn resolve_function(&self, name: &str, arg_count: usize) -> crate::Result<Option<crate::function::Func>> {
+            if name.eq_ignore_ascii_case("park_here") {
+                if !self.parked.swap(true, Ordering::SeqCst) {
+                    let t = std::time::Instant::now();
+                    while !self.go.load(Ordering::SeqCst) && t.elapsed() < std::time::Duration::from_secs(30) {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    self.released_by_go.store(self.go.load(Ordering::SeqCst), Ordering::SeqCst);
+                }
+                return sqlite::resolve_builtin_function("random", arg_count);
+            }
+            sqlite::resolve_builtin_function(name, arg_count)
+        }
+        fn register_catalog(&self, schema: &mut crate::schema::Schema, enable_custom_types: bool) -> crate::Result<()> {
+            sqlite::register_builtin_catalog(schema, enable_custom_types)
+        }
+    }
+
+    /// Review c42b MED-4: a program is keyed at the prepare generation read BEFORE its translation
+    /// reads the state it keys, so a keyed change landing during translation re-prepares it. The
+    /// prepare parks inside translation (at `park_here()`, after `translate` read `mvcc_enabled`);
+    /// another thread changes a keyed setting of the same connection (`set_cache_size`, a
+    /// change-only setter that bumps the generation and touches no schema); the prepare finishes.
+    /// Stepped, the statement must re-prepare. At 7b74fa9fa the key was read at `build`, after the
+    /// change, so the program matched and never re-prepared.
+    ///
+    /// Not the review's journal switch: switching to MVCC bootstraps a metadata table, a schema
+    /// change, which re-prepares the parked statement at the base too (by reading, UNVERIFIED), so
+    /// that red could not tell the base from the fix. The setter isolates the generation.
+    #[test]
+    fn a_keyed_change_during_translation_re_prepares_the_program() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let dialect = Arc::new(ParkingDialect::default());
+        let db = open_db(&io, "park.db", dialect.clone()).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        let changer = {
+            let conn = conn.clone();
+            let dialect = dialect.clone();
+            std::thread::spawn(move || {
+                let t = std::time::Instant::now();
+                while !dialect.parked.load(Ordering::SeqCst) {
+                    if t.elapsed() > std::time::Duration::from_secs(10) {
+                        dialect.go.store(true, Ordering::SeqCst);
+                        return None;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                let before = conn.prepare_context_generation();
+                conn.set_cache_size(conn.get_cache_size() + 1);
+                let after = conn.prepare_context_generation();
+                dialect.go.store(true, Ordering::SeqCst);
+                Some((before, after))
+            })
+        };
+        let mut stmt = conn.prepare("SELECT park_here(), x FROM t").unwrap();
+        let moved = changer.join().unwrap();
+        assert!(moved.is_some(), "premise: the prepare never reached park_here()");
+        let (before, after) = moved.unwrap();
+        assert!(after > before, "premise: the setter moved the prepare generation ({before} -> {after})");
+        assert!(
+            dialect.released_by_go.load(Ordering::SeqCst),
+            "premise: the change landed while the translation was parked (the park ended at its bound)"
+        );
+        let reprepares0 = stmt.metrics().reprepares;
+        let rows = stmt.run_collect_rows();
+        assert!(matches!(&rows, Ok(r) if r.len() == 1), "premise: the statement read its row: {rows:?}");
+        assert!(
+            stmt.metrics().reprepares > reprepares0,
+            "CLAIM: a program whose translation straddled a keyed change was not re-prepared"
+        );
+    }
+
     /// A dialect that counts its connection-aware re-parses (wire-rework E-M2).
     #[derive(Default)]
     struct ReparseDialect {
