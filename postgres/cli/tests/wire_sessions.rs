@@ -13490,3 +13490,29 @@ fn a_kept_statement_reprepared_after_a_setting_change_keeps_the_search_path() {
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// Review wire-rework C-M1 and C-M2: a SET LOCAL outside a block warns 25P01 for every setting,
+/// search_path included (its arm returned before the warning), and the warning comes before the
+/// value is checked, so an invalid value is the warning then its error. The SET LOCAL warning
+/// of the other settings is recorded (pg18-rev-c39-misc.out); search_path's and the warning
+/// before an error follow PostgreSQL's ExecSetVariableStmt (WarnNoTransactionBlock before
+/// set_config_option), whose PG 18.6 recording is LOUD-OWED.
+#[test]
+fn a_set_local_outside_a_block_warns_before_its_value_is_checked() {
+    let dir = Scratch::new("setlocalwarn");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    let warned = |r: &Reply| {
+        r.notices.len() == 1 && r.notices[0].code == "25P01"
+    };
+    let r = a.q("SET LOCAL search_path TO public");
+    if !warned(&r) || r.error.is_some() || r.tags != ["SET"] {
+        wrong.push(format!("search_path: notices {:?} tags {:?} error {:?}", r.notices, r.tags, r.error));
+    }
+    let r = a.q("SET LOCAL TimeZone = '--5'");
+    if !warned(&r) || r.error.as_ref().map(|e| e.code.as_str()) != Some("22023") {
+        wrong.push(format!("an invalid value: notices {:?} error {:?}", r.notices, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
