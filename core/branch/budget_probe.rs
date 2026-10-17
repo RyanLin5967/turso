@@ -504,7 +504,7 @@ pub(crate) fn store_unlocked_of(own: Option<(usize, bool)>) {
         // Mutant `audit_skip_half` (test builds only; counters review 2 MED 3): every second
         // outermost hold of an audited store skips the probe entirely, before any count: the hold
         // audit's completeness premise must fire.
-        if own.is_some_and(|o| o.1) && super::store::fe_mutant("audit_skip_half") {
+        if own.is_some_and(|o| o.1) && mutant_on("audit_skip_half") {
             static SKIP: AtomicU64 = AtomicU64::new(0);
             if SKIP.fetch_add(1, Relaxed) % 2 == 1 {
                 HELD_SINCE.with(|s| s.take());
@@ -588,7 +588,7 @@ pub(crate) fn store_unlocked_of(own: Option<(usize, bool)>) {
                         store,
                     };
                     match AUDIT_LOG.try_lock() {
-                        Ok(mut log) if log.len() < log.capacity() => log.push(rec),
+                        Ok(mut log) if log.len() < log.capacity() => log.push(rec), // lint-allow: within the reserved room, no allocation
                         _ => {
                             AUDIT_LOST.fetch_add(1, Relaxed);
                         }
@@ -777,6 +777,11 @@ pub(crate) fn prime() {
     let _ = IN_BUDGET_CHILD.get_or_init(|| std::env::var_os("FE_BUDGET_CHILD").is_some());
     let _ = NEW_NAMES_FILE.get_or_init(|| std::env::var_os("FE_BUDGET_NEW_NAMES"));
     let _ = FOREIGN_NAMES.get_or_init(|| std::env::var_os("FE_BUDGET_FOREIGN_NAMES").is_some());
+    // Counters review 3 MED-A: the mutant name too, and the store's own reader, whose first call
+    // reads FE_MUTANT (an allocation, never freed) where it would otherwise land: in attribute,
+    // inside a window.
+    let _ = MUTANT.get_or_init(|| std::env::var("FE_MUTANT").ok());
+    let _ = crate::branch::store::fe_mutant("");
     let loaded = shim().is_some();
     let _ = shim_lost();
     if !loaded && std::env::var_os("FE_SHIM_RUN").is_some() {
@@ -789,6 +794,18 @@ pub(crate) fn prime() {
 static IN_BUDGET_CHILD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 static NEW_NAMES_FILE: std::sync::OnceLock<Option<std::ffi::OsString>> = std::sync::OnceLock::new();
 static FOREIGN_NAMES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// The mutant this process runs (`FE_MUTANT`), read once by `prime` (counters review 3 MED-A).
+static MUTANT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+/// Whether mutant `name` is on, for the probe's window and hold paths: the name `prime` read, so no
+/// window reads the environment. Unprimed (a hold before any window), the store's own reader.
+pub(crate) fn mutant_on(name: &str) -> bool {
+    match MUTANT.get() {
+        Some(m) => m.as_deref() == Some(name),
+        None => crate::branch::store::fe_mutant(name), // lint-allow: unprimed, outside every window (begin primes first)
+    }
+}
 
 /// The syncs a budget window reads (counters review MED-5): in a budget child, which runs one
 /// cell's stores at a time, the process's (`branch::sync_counts`, exact there, and blind to no
@@ -915,7 +932,7 @@ fn attribute(kernel: u64, t0: &[ThreadCpu], c0: &[u64; 48], t1: &[ThreadCpu], c1
     // (a thread new at the end refused on the shim path only, as before probe-adversary-2 M1),
     // `probe_shim_excludes_foreign` (the shim path as before: the own threads' deltas, a foreign
     // thread's calls excluded, only the total checked), `probe_sum_unchecked` (no sum check).
-    let mutant = |m: &str| crate::branch::store::fe_mutant(m);
+    let mutant = |m: &str| mutant_on(m);
     let room = t0.len().min(t1.len());
     match (ends.n0, ends.n1) {
         (Some(n0), Some(n1)) if (n0 <= room && n1 <= room) || mutant("probe_full_table_trusted") => {}
