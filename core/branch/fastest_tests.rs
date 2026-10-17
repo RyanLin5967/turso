@@ -3097,6 +3097,30 @@ fn off_apple_set_sync_type_never_bumps_the_prepare_generation() {
     assert_eq!(c.prepare_context_generation(), g0, "CLAIM: set_sync_type bumped the prepare generation though nothing it compiles in changed");
 }
 
+/// Review C42 MED-7 (lead ruling): a journal-mode switch changes what translation compiles in for
+/// EVERY connection of the database (`Connection::mvcc_enabled` reads the Database's MV store), so it
+/// bumps a database-wide generation every connection's prepare key reads. At f6186c900 only the
+/// switching connection's own setters bumped, so B's cached programs kept the WAL compilation.
+#[test]
+fn a_journal_mode_switch_on_one_connection_moves_every_connection_s_prepare_generation() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("journal-switch-generation.db"), DatabaseOpts::new());
+    let a = db.connect().unwrap();
+    let b = db.connect().unwrap();
+    a.execute("CREATE TABLE t(x INTEGER)").unwrap();
+    let _cached = b.prepare("INSERT INTO t VALUES (1)").unwrap();
+    let g0 = b.prepare_context_generation();
+    let switched = a.execute("PRAGMA journal_mode = 'mvcc'");
+    assert!(switched.is_ok(), "premise: the journal-mode switch succeeded: {switched:?}");
+    assert!(a.mvcc_enabled(), "premise: the database is in MVCC mode after the switch");
+    assert_ne!(
+        b.prepare_context_generation(),
+        g0,
+        "CLAIM: another connection's journal-mode switch left this connection's prepare generation alone: its cached programs keep the old mode"
+    );
+}
+
 /// Review engine-rev-setter LOW-2: the audit of every prepare-generation bump (49e10e02a's message
 /// said 37 and missed five) is pinned here, per file, so a new bump site fails this gate until it
 /// is audited (and the setter class above says whether it should be change-only). Counts calls of
