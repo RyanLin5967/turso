@@ -2932,6 +2932,10 @@ fn the_budget_counters_count_exactly_what_was_done() {
     assert_eq!(get("fc_box_23", "held_allocs"), 0, "allocations outside a store mutex counted as held");
     assert_eq!(get("fc_held_5_syscalls_3_allocs", "locks"), 1, "one hold");
     assert_eq!(get("fc_held_5_syscalls_3_allocs", "held_allocs"), 3, "three allocations while held");
+    // Counters review 5: `arm(true)` primes inside these windows, so what they allocate outside the
+    // hold is the probe's own: primed, nothing.
+    assert_eq!(get("fc_held_5_syscalls_3_allocs", "allocs"), 3, "allocations outside the hold (arm's prime, inside the window)");
+    assert_eq!(get("fc_foreign_hold", "allocs"), 0, "fc_foreign_hold's own thread allocated (arm's prime, inside the window)");
     assert_eq!(get("fc_one_store_lock", "locks"), 1, "catalog_counters takes the store mutex once");
     assert!(get("fc_catalog_shape", "locks") >= 1, "the catalog walk took no store mutex");
     assert!(get("fc_lookup_cataloged", "catalog_queries") >= 1, "a cataloged name's lookup asked nothing");
