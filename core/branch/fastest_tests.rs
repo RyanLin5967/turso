@@ -2908,6 +2908,66 @@ fn a_fuzzy_checkpoint_s_lease_floor_is_the_catalog_s_at_its_install() {
     drop(held);
 }
 
+/// Review REVIEW-claude-engine-m1-2 LOW-B: the lease-floor check exercised in the window it guards,
+/// between the writer's commit and the install (`HOLD_AFTER_COMMIT`), where real operations run:
+/// a lease renewed, a named create, and an expiry that reaps, in each of two checkpoints' windows.
+/// The check must compare both installs (`LEASE_FLOORS_VERIFIED` +2) and find no difference.
+/// Mutant `lease_floor_after_stale` (a floor one past the catalog's) must still fail it.
+#[test]
+fn the_lease_floor_check_holds_with_operations_between_the_commit_and_the_install() {
+    use std::sync::atomic::Ordering::{Relaxed, Release};
+    let _s = serial();
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            super::store::CAPTURE_VERIFY_FORCED.store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+    let _r = Reset;
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(
+        &dir.path().join("lease-floor-window.db"),
+        opts(true, SyncClass::Fsync).with_branch_checkpoint(super::BranchCheckpoint::Fuzzy),
+    );
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let keep = trunk.fork_branch().unwrap();
+    keep.lease(std::time::Duration::from_secs(36_000)).unwrap();
+    let mut short = Vec::new();
+    for _ in 0..8 {
+        let b = trunk.fork_branch().unwrap();
+        b.lease(std::time::Duration::from_secs(60)).unwrap();
+        short.push(b.into_id());
+    }
+    super::store::CAPTURE_VERIFY_FAILURES.lock().unwrap().clear();
+    super::store::CAPTURE_VERIFY_FORCED.store(true, Release);
+    let verified0 = super::store::LEASE_FLOORS_VERIFIED.load(Relaxed);
+    for round in 0..2u32 {
+        db.branch_checkpoint_hold(super::store::HOLD_AFTER_COMMIT);
+        assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: fuzzy checkpoint {round} started");
+        let t = std::time::Instant::now();
+        while db.branch_checkpoint_held() != super::store::HOLD_AFTER_COMMIT | super::store::HOLD_ARRIVED {
+            assert!(t.elapsed() < std::time::Duration::from_secs(10), "premise: checkpoint {round}'s writer never committed");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        keep.lease(std::time::Duration::from_secs(36_000 + u64::from(round))).unwrap();
+        trunk.create_branch(&format!("in-window-{round}")).unwrap();
+        db.branch_lease_clock_advance(std::time::Duration::from_secs(120));
+        let reaped = db.expire_branches().unwrap().reaped.len();
+        if round == 0 {
+            assert!(reaped >= 8, "premise: the expiry in the window reaped {reaped} of the 8 short leases");
+        }
+        db.branch_checkpoint_hold(0);
+        db.branch_checkpoint_wait();
+    }
+    super::store::CAPTURE_VERIFY_FORCED.store(false, Release);
+    let verified = super::store::LEASE_FLOORS_VERIFIED.load(Relaxed) - verified0;
+    let failures = super::store::CAPTURE_VERIFY_FAILURES.lock().unwrap().clone();
+    assert!(verified >= 2, "premise: the check compared {verified} installs' lease floors, not 2");
+    assert!(failures.is_empty(), "CLAIM: the writer-read lease floor was not the catalog's at the install, with operations in the window: {failures:?}");
+    let _ = short;
+}
+
 /// Review REVIEW-claude-engine-m1-2 MED-A (DECISIONS bda6df71dc), as a class: under the whole-run
 /// capture check (`FE_CAPTURE_VERIFY`) every check that fails records the failure and ABORTS the
 /// process, as the frozen-rows check does, so no later test passes over it. At ee1d54b6c the
