@@ -961,7 +961,9 @@ impl Statement {
         // same-version reprepare still refreshes it.
         conn.refresh_schema_from_shared_for_reprepare();
         let new_program = {
-            let (cmd, _) = conn.parse_sql(&self.program.sql)?;
+            // Through the dialect's connection-aware hook (wire-rework E-M2): a frontend whose
+            // translation needs the connection re-translates as its own prepare did.
+            let (cmd, _) = conn.db.dialect().parse_for_reprepare(&self.program.sql, &conn)?;
             let cmd = cmd.expect("Same SQL string should be able to be parsed");
 
             let syms = conn.syms.read();
