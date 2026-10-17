@@ -806,6 +806,11 @@ pub(crate) fn prime() {
     if !loaded && std::env::var_os("FE_SHIM_RUN").is_some() {
         panic!("budget_probe: REFUSED: this run is labelled a shim run (FE_SHIM_RUN) but feshim is not loaded");
     }
+    // Mutant `probe_prime_allocates` (test builds only; counters review 5): a primed prime that still
+    // allocates, which `arm(true)` would then do inside a window.
+    if mutant_on("probe_prime_allocates") {
+        std::hint::black_box(Box::new(0u8));
+    }
 }
 
 /// The flags `prime` reads once (counters review 2 HIGH 1): whether this process is a budget
