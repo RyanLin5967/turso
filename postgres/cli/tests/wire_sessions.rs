@@ -13866,3 +13866,33 @@ replays_postgresql!(pg18_rev_bl3_replays_as_postgresql_answered, "pg18-rev-bl3.o
 replays_postgresql!(pg18_rev_eh1_replays_as_postgresql_answered, "pg18-rev-eh1.out", []);
 replays_postgresql!(pg18_rev_pin_path_replays_as_postgresql_answered, "pg18-rev-pin-path.out", []);
 replays_postgresql!(pg18_rev_low5_chain_replays_as_postgresql_answered, "pg18-rev-low5-chain.out", []);
+
+/// Review wire-line2 H1 (lead: a kind is never carried by text a client can write): client SQL
+/// that starts with the frontend's SQLite marker is refused (42601), on both protocols, so an engine
+/// re-prepare can never read a statement the session checked as PostgreSQL as SQLite instead. Its
+/// own SQLite text is marked by the frontend alone.
+#[test]
+fn client_text_cannot_carry_the_sqlite_marker() {
+    let dir = Scratch::new("marker-forge");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    for sql in [
+        "/* turso:sqlite */ SELECT 1",
+        "  /* turso:sqlite */ SELECT 1",
+        "SELECT 1; /* turso:sqlite */ SELECT 2",
+    ] {
+        let r = a.q(sql);
+        if r.error.as_ref().map(|e| e.code.as_str()) != Some("42601") {
+            wrong.push(format!("simple {sql:?}: tags {:?} error {:?}", r.tags, r.error));
+        }
+    }
+    let r = a.x("/* turso:sqlite */ SELECT 1", &[]);
+    if r.error.as_ref().map(|e| e.code.as_str()) != Some("42601") {
+        wrong.push(format!("extended: tags {:?} error {:?}", r.tags, r.error));
+    }
+    // The control: the same text without the marker, and the marker's words elsewhere.
+    a.q("SELECT 1").ok("control");
+    a.q("SELECT '/* turso:sqlite */ '").ok("the marker inside a literal");
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
