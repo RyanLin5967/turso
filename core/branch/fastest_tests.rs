@@ -9244,6 +9244,64 @@ fn a_failed_filter_drain_never_answers_absent_for_a_held_name() {
     assert!(!absent, "CLAIM: between a failed filter drain's two holds the filter answered absent for a held name: a create would ask no catalog");
 }
 
+/// Lead order (a) and the filter-fallback proof (2026-10-16): a NATURAL name-filter growth, with no
+/// fault injected, sent every named create of its window to the catalog under the store mutex,
+/// because `says_absent` answered only in `Ready`. While `Growing` the old table is still complete
+/// (notes go into it and the pending table, and a refusal overflows); while `Draining` the new table
+/// and the pending one together are (what `Ready` ends up holding). A fresh name created in each
+/// state must ask the catalog nothing; a held name created again must still be refused. Hooks:
+/// `FILTER_PAUSE_AT` stage 1 (Growing) and 4 (Draining).
+#[test]
+fn a_named_create_during_a_natural_filter_growth_asks_the_catalog_nothing() {
+    use super::store::{FILTER_PAUSED, FILTER_PAUSE_AT};
+    use std::sync::atomic::Ordering::{Acquire, Release};
+    let _s = serial();
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FILTER_PAUSE_AT.store(0, Release);
+            FILTER_PAUSED.store(0, Release);
+        }
+    }
+    let _r = Reset;
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("filter-growth-asks.db"), opts(true, SyncClass::Off));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    db.branch_wait_name_filter();
+    let stmts = || super::budget_probe::thread_cat_stmts();
+    FILTER_PAUSE_AT.store(1, Release);
+    let t = std::time::Instant::now();
+    let mut n = 0u32;
+    while FILTER_PAUSED.load(Acquire) != 1 {
+        trunk.create_branch(&format!("fill-{n:05}")).unwrap();
+        n += 1;
+        assert!(t.elapsed() < std::time::Duration::from_secs(30), "premise: no natural filter growth began ({n} creates)");
+    }
+    assert_eq!(db.branches.name_filter_state_for_test().0, "Growing", "premise: the filter is Growing at stage 1");
+    let s0 = stmts();
+    trunk.create_branch("while-growing").unwrap();
+    let growing = stmts() - s0;
+    FILTER_PAUSE_AT.store(4, Release);
+    while FILTER_PAUSED.load(Acquire) != 4 {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        assert!(t.elapsed() < std::time::Duration::from_secs(60), "premise: the growth never reached its drain");
+    }
+    assert_eq!(db.branches.name_filter_state_for_test().0, "Draining", "premise: the filter is Draining at stage 4");
+    let s1 = stmts();
+    trunk.create_branch("while-draining").unwrap();
+    let draining = stmts() - s1;
+    let taken = trunk.create_branch("while-growing").is_err() && trunk.create_branch("fill-00000").is_err();
+    FILTER_PAUSE_AT.store(0, Release);
+    db.branch_wait_name_filter();
+    assert!(taken, "CLAIM: a name held before or during the growth was given again while the filter was Draining");
+    assert_eq!(
+        (growing, draining),
+        (0, 0),
+        "CLAIM: a named create of a fresh name ran catalog statements while the filter was Growing ({growing}) or Draining ({draining})"
+    );
+}
+
 /// Class (e), the store mutex's lifecycle audit (DECISIONS 994f7d41e0; the lead's order with
 /// nf-adversary-2's MED-2 and M4 folded in): every store-mutex hold on the create path does NO syscall,
 /// NO allocation and NO catalog statement. One instrument for the whole class: every outermost hold
