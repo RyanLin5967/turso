@@ -9011,10 +9011,12 @@ fn lifecycle_audit(n: u32) {
     // FLAGGED fixture change (the per-store counter class, d9cf2b609b): the audit records only this
     // store's holds, so another test's holds neither fill its log nor enter its claim.
     // The store's own path is the real one (`Database`'s base: symlinks resolved). Mutant
-    // `audit_path_wrong` (test builds only): the path as given, not the store's, the own-store
-    // premise's red (lead ruling 67664df569).
+    // `audit_path_wrong` (test builds only): a deliberately wrong path, the real one plus "x", the
+    // own-store premise's red (lead ruling 67664df569). Counters review E2: the path as given, which
+    // it named before, equals the real one where the temp dir is under no symlink (Linux /tmp), so
+    // the mutant was equivalent there.
     let audited = if super::store::fe_mutant("audit_path_wrong") {
-        path.to_str().unwrap().to_string()
+        format!("{}x", std::fs::canonicalize(&path).unwrap().to_str().unwrap())
     } else {
         std::fs::canonicalize(&path).unwrap().to_str().unwrap().to_string()
     };
