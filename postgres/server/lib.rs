@@ -7105,10 +7105,6 @@ mod tests {
         assert_eq!(s.missing_or("nosuch", &in_use, "ERROR").code, "3D000");
     }
 
-    /// C40 review LOW 6 (C49): a Parse makes at most ONE libpg_query call, whatever its text:
-    /// text that mentions the branch-function prefix and holds a `$` without being a call made
-    /// two (the branch-call parse and the parameter scan), and a statement PostgreSQL analyses at
-    /// Parse is prepared there from the same parse (C53). The fast call form makes none.
     /// C53 follow-up review B3: each Bind's prepare is reused by its own Execute. A pipelined Bind
     /// A, Bind B, Execute A, Execute B (no values, no Sync between) costs 2 prepares; with one kept
     /// statement Bind B replaced A's, and Execute A threw B's away, so it cost 4. Counted as
@@ -7151,11 +7147,28 @@ mod tests {
                     .unwrap();
             }
             let prepares = turso_pg_parser::libpg_query_calls() - before;
+            // The replies too (review wire-rework B-M2): two BindCompletes and two empty SELECTs,
+            // no error, so 2 is not the count of an Execute that failed or ended early.
+            let (mut bound, mut tags) = (0, vec![]);
+            for reply in c.replies.drain(..) {
+                match reply {
+                    PgWireBackendMessage::ErrorResponse(e) => panic!("an error in the round: {e:?}"),
+                    PgWireBackendMessage::BindComplete(_) => bound += 1,
+                    PgWireBackendMessage::CommandComplete(done) => tags.push(done.tag),
+                    _ => {}
+                }
+            }
+            assert_eq!(bound, 2, "the two Binds' BindCompletes");
+            assert_eq!(tags, vec!["SELECT 0".to_string(); 2], "the two Executes' CommandCompletes");
             s.on_sync(&mut c, PgSync::new()).await.unwrap();
             assert_eq!(prepares, 2, "prepares for Bind A, Bind B, Execute A, Execute B");
         });
     }
 
+    /// C40 review LOW 6 (C49): a Parse makes at most ONE libpg_query call, whatever its text:
+    /// text that mentions the branch-function prefix and holds a `$` without being a call made
+    /// two (the branch-call parse and the parameter scan), and a statement PostgreSQL analyses at
+    /// Parse is prepared there from the same parse (C53). The fast call form makes none.
     #[test]
     fn a_parse_makes_at_most_one_libpg_query_call() {
         let dir = tempfile::TempDir::new().unwrap();
