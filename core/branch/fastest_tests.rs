@@ -9404,8 +9404,10 @@ fn a_named_create_before_the_open_s_filter_build_lands_asks_the_catalog_nothing(
 /// table to its refusal (7/8 full), and the filter overflowed with no table answering, so every
 /// named create until the rebuild landed ran a catalog statement under the store mutex. With the
 /// refusing tables and a pre-allocated spill table of what they refused, the answer stays complete:
-/// a fresh name created while `Overflowed`, and again while the rebuild is `Building` (stage 7),
-/// asks the catalog nothing, and the filter never says "absent" for a name created in the burst.
+/// a fresh name created once the refusal owed its rebuild, and again while that rebuild is held
+/// `Building` before its scan (`NAME_SCAN_HOLD`, armed before the burst: the rebuild starts at the
+/// refusing create), asks the catalog nothing, and the filter never says "absent" for a name
+/// created in the burst.
 #[test]
 fn a_named_create_after_a_natural_filter_refusal_asks_the_catalog_nothing() {
     use super::store::{FILTER_PAUSED, FILTER_PAUSE_AT};
@@ -9416,6 +9418,7 @@ fn a_named_create_after_a_natural_filter_refusal_asks_the_catalog_nothing() {
         fn drop(&mut self) {
             FILTER_PAUSE_AT.store(0, Release);
             FILTER_PAUSED.store(0, Release);
+            super::store::NAME_SCAN_HOLD.store(0, Release);
         }
     }
     let _r = Reset;
@@ -9434,8 +9437,10 @@ fn a_named_create_after_a_natural_filter_refusal_asks_the_catalog_nothing() {
         names.push(name);
         assert!(t.elapsed() < std::time::Duration::from_secs(30), "premise: no natural filter growth began");
     }
-    // The burst, with the growth held: until a table refuses.
-    while db.branches.name_filter_state_for_test().0 != "Overflowed" {
+    // The burst, with the growth held: until a table refuses and owes its rebuild.
+    let rebuilds0 = db.branches.name_filter_state_for_test().1;
+    super::store::NAME_SCAN_HOLD.store(1, Release);
+    while db.branches.name_filter_state_for_test().1 == rebuilds0 {
         let name = format!("burst-{:05}", names.len());
         trunk.create_branch(&name).unwrap();
         names.push(name);
@@ -9446,16 +9451,17 @@ fn a_named_create_after_a_natural_filter_refusal_asks_the_catalog_nothing() {
     trunk.create_branch("while-overflowed").unwrap();
     let overflowed = stmts() - s0;
     names.push("while-overflowed".to_string());
-    FILTER_PAUSE_AT.store(7, Release);
-    while FILTER_PAUSED.load(Acquire) != 7 {
+    while super::store::NAME_SCAN_HOLD.load(Acquire) != 1 | super::store::HOLD_ARRIVED {
         std::thread::sleep(std::time::Duration::from_millis(1));
-        assert!(t.elapsed() < std::time::Duration::from_secs(60), "premise: the overflow's rebuild never began");
+        assert!(t.elapsed() < std::time::Duration::from_secs(60), "premise: the refusal's rebuild never reached its scan");
     }
+    assert_eq!(db.branches.name_filter_state_for_test().0, "Building", "premise: the rebuild is held Building");
     let s1 = stmts();
     trunk.create_branch("while-rebuilding").unwrap();
     let rebuilding = stmts() - s1;
     names.push("while-rebuilding".to_string());
     let said_absent: Vec<&String> = names.iter().filter(|n| db.branches.name_filter_says_absent_for_test(n)).collect();
+    super::store::NAME_SCAN_HOLD.store(0, Release);
     FILTER_PAUSE_AT.store(0, Release);
     db.branch_wait_name_filter();
     assert!(said_absent.is_empty(), "CLAIM: the filter said absent for {} held names after the refusal: {:?}", said_absent.len(), &said_absent[..said_absent.len().min(8)]);
