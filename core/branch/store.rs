@@ -8112,10 +8112,17 @@ impl BranchStore {
                 // review 7 #3).
                 inner.live_ids_remove(id);
                 inner.releases_in_air.push_back(ReleaseInAir { lsn: u64::MAX, id, fork_lsn, name });
+                // Only a fork that is durable comes back (review delete LOW-6: a drop no longer
+                // settles the fork first, so this is reached for one whose flight failed).
+                let comes_back = self.group.durable(self.class) >= fork_lsn;
                 return Err(LimboError::InternalError(format!(
-                    "branch {} was not released durably ({e}); it is kept, and comes back at the \
-                     next open",
-                    id.0
+                    "branch {} was not released durably ({e}); {}",
+                    id.0,
+                    if comes_back {
+                        "it is kept, and comes back at the next open"
+                    } else {
+                        "its fork never became durable either, so the next open does not have it"
+                    }
                 )));
             }
         };
@@ -8153,9 +8160,15 @@ impl BranchStore {
                     st.handle = Handle::ReleasePending;
                 }
             }
+            let comes_back = self.group.durable(self.class) >= fork_lsn;
             return Err(LimboError::InternalError(format!(
-                "branch {} was not released durably ({e}); it comes back at the next open",
-                id.0
+                "branch {} was not released durably ({e}); {}",
+                id.0,
+                if comes_back {
+                    "it comes back at the next open"
+                } else {
+                    "its fork never became durable either, so the next open does not have it"
+                }
             )));
         }
         self.upgrade_if_overdue();
