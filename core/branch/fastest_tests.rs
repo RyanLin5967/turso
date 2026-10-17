@@ -2908,6 +2908,45 @@ fn a_fuzzy_checkpoint_s_lease_floor_is_the_catalog_s_at_its_install() {
     drop(held);
 }
 
+/// Review REVIEW-claude-engine-m1-2 MED-A (DECISIONS bda6df71dc), as a class: under the whole-run
+/// capture check (`FE_CAPTURE_VERIFY`) every check that fails records the failure and ABORTS the
+/// process, as the frozen-rows check does, so no later test passes over it. At ee1d54b6c the
+/// lease-floor check panicked instead, inside the install under the store mutex, on the checkpoint
+/// worker, whose `catch_unwind` swallowed it (and left the install half done). Here a child of this
+/// test binary runs the lease-floor test with the check on and mutant `lease_floor_after_stale`
+/// (a mismatch at every install): it must die of SIGABRT, not exit with a test failure.
+#[cfg(unix)]
+#[test]
+fn a_failed_capture_check_under_the_whole_run_switch_aborts_the_process() {
+    use std::os::unix::process::ExitStatusExt;
+    let _s = serial();
+    let exe = std::env::current_exe().unwrap();
+    let out = std::process::Command::new(exe)
+        .args([
+            "--exact",
+            "branch::fastest_tests::a_fuzzy_checkpoint_s_lease_floor_is_the_catalog_s_at_its_install",
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .env("FE_CAPTURE_VERIFY", "1")
+        .env("FE_MUTANT", "lease_floor_after_stale")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("FE_CAPTURE_VERIFY: the lease floor"),
+        "premise: the child's lease-floor check never fired (status {:?}); stderr tail: {}",
+        out.status,
+        &stderr[stderr.len().saturating_sub(2000)..]
+    );
+    assert_eq!(
+        out.status.signal(),
+        Some(libc::SIGABRT),
+        "CLAIM: a failed capture check under FE_CAPTURE_VERIFY did not abort the process (status {:?})",
+        out.status
+    );
+}
+
 /// Review REVIEW-claude-engine-M1 LOW-5: each path the M1 fix names gets its own owed start sent,
 /// not only `expire_branches`. The store is built at the default threshold with 300 forks leased
 /// for a minute and one branch `keep` with ten hours; the lease clock then passes the minute, the
