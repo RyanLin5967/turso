@@ -6780,6 +6780,9 @@ mod tests {
         let server = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let frontend = server.join("../frontend");
         let mut scanned = Vec::new();
+        // Every violation of every file, collected before the one assert, so the report names them
+        // all whatever order the directories are read in (lead, on the MED 1 red).
+        let mut violations = Vec::new();
         for root in [server.to_path_buf(), frontend] {
             let mut files = vec![root.clone()];
             while let Some(path) = files.pop() {
@@ -6812,34 +6815,38 @@ mod tests {
                 if rel == "sqlstate.rs" {
                     let start = product.find("pub fn sqlstate(").expect("the table");
                     let end = start + product[start..].find("\n}\n").expect("its end");
-                    product.replace_range(start..end, "");
+                    let kept_lines = "\n".repeat(product[start..end].matches('\n').count());
+                    product.replace_range(start..end, &kept_lines);
                 }
-                let found = sqlstate_literals(&product);
-                assert!(found.is_empty(), "SQLSTATE literals in {}: {found:?}", path.display());
+                for (line, code) in sqlstate_literals(&product) {
+                    violations.push(format!("{}:{line}: \"{code}\"", path.display()));
+                }
                 scanned.push(format!("{}:{rel}", root.file_name().unwrap().to_string_lossy()));
             }
         }
         for must in ["server:lib.rs", "server:counters.rs", "frontend:session.rs", "frontend:functions.rs"] {
             assert!(scanned.iter().any(|f| f == must), "the scan missed {must}: {scanned:?}");
         }
+        violations.sort();
+        assert!(violations.is_empty(), "SQLSTATE literals outside the table:\n{}", violations.join("\n"));
     }
 
     /// Every quoted five-character token of digits and capitals with at least one digit, found
-    /// wherever it sits (no quote parity elsewhere can hide one).
-    fn sqlstate_literals(text: &str) -> Vec<String> {
+    /// wherever it sits (no quote parity elsewhere can hide one), with its 1-based line.
+    fn sqlstate_literals(text: &str) -> Vec<(usize, String)> {
         let b = text.as_bytes();
         (0..b.len().saturating_sub(6))
             .filter(|&i| b[i] == b'"' && b[i + 6] == b'"')
-            .map(|i| &text[i + 1..i + 6])
-            .filter(|s| {
+            .map(|i| (i, &text[i + 1..i + 6]))
+            .filter(|(_, s)| {
                 s.bytes().all(|c| c.is_ascii_digit() || c.is_ascii_uppercase())
                     && s.bytes().any(|c| c.is_ascii_digit())
             })
-            .map(str::to_string)
+            .map(|(i, s)| (text[..i].matches('\n').count() + 1, s.to_string()))
             .collect()
     }
 
-    /// `text` less each `#[cfg(test)]` + `mod <name> {` span, through its matching brace; braces
+    /// `text` less each `#[cfg(test)]` + `mod <name> {` span (its newlines kept), through its matching brace; braces
     /// inside string and char literals and comments are not counted. An unmatched span keeps the
     /// rest of the file (read, never skipped).
     fn strip_test_modules(text: &str) -> String {
@@ -6919,6 +6926,8 @@ mod tests {
             match end {
                 Some(e) => {
                     out.push_str(&rest[..at]);
+                    // The span's newlines kept, so a line number after it is the file's own.
+                    out.push_str(&"\n".repeat(rest[at..at + line_end + e].matches('\n').count()));
                     rest = &rest[at + line_end + e..];
                 }
                 None => break,
