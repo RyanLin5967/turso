@@ -60,7 +60,7 @@
 //! held to CAPTURE what changed since the last checkpoint and to install the result, never across
 //! the catalog writes, the commit or the WAL backfill. A second connection ([`Catalog::writer`])
 //! writes the captured rows while the store's own connection serves on-demand reads from a snapshot
-//! pinned at the capture ([`Catalog::begin_read_snapshot`]), which in-memory state overrides exactly
+//! pinned at the capture ([`Catalog::begin_snapshot_tx`], [`Catalog::pin_snapshot`]), which in-memory state overrides exactly
 //! as it does between checkpoints. The capture appends a `Record::Checkpoint` to the log (ARIES's
 //! begin-checkpoint record), so the log is cut to what follows it only after the commit, and a crash
 //! between the two replays just that suffix (see `Journal::recover_catalog`).
@@ -1048,21 +1048,17 @@ impl Catalog {
         Ok(())
     }
 
-    /// Pin a read snapshot on this connection (F-FZ phase 1): a deferred BEGIN takes its snapshot
-    /// at its first read, so one is made now, before the checkpoint's writer can commit. Every read
-    /// on this connection until [`Catalog::end_read_snapshot`] sees the catalog as of here.
-    pub(crate) fn begin_read_snapshot(&mut self) -> Result<()> {
-        self.begin_snapshot_tx()?;
-        self.pin_snapshot()
-    }
-
-    /// `begin_read_snapshot`'s first step: the transaction begun (deferred: nothing read yet).
+    /// A read snapshot on this connection is pinned in two steps (F-FZ phase 1), this then
+    /// [`Catalog::pin_snapshot`]: a deferred BEGIN takes its snapshot at its first read, so one is
+    /// made at once, before the checkpoint's writer can commit. Every read on this connection until
+    /// [`Catalog::end_read_snapshot`] sees the catalog as of there. This first step begins the
+    /// transaction (deferred: nothing read yet).
     pub(crate) fn begin_snapshot_tx(&mut self) -> Result<()> {
         self.begin_tx.rows(&[], &mut self.counters).map(drop)
     }
 
-    /// `begin_read_snapshot`'s second step: the first read, which pins the snapshot (the meta
-    /// rows); a failure rolls the transaction back.
+    /// The second step after [`Catalog::begin_snapshot_tx`]: the first read, which pins the
+    /// snapshot (the meta rows); a failure rolls the transaction back.
     pub(crate) fn pin_snapshot(&mut self) -> Result<()> {
         if let Err(e) = self.meta_all.rows(&[], &mut self.counters) {
             self.rollback();
@@ -1071,7 +1067,7 @@ impl Catalog {
         Ok(())
     }
 
-    /// End the snapshot [`Catalog::begin_read_snapshot`] pinned (F-FZ phase 3). It wrote nothing,
+    /// End the snapshot [`Catalog::pin_snapshot`] pinned (F-FZ phase 3). It wrote nothing,
     /// so a failure to end it is a failure to release a read mark only.
     pub(crate) fn end_read_snapshot(&mut self) {
         if let Err(e) = self.commit_tx.rows(&[], &mut self.counters) {
