@@ -7196,18 +7196,27 @@ impl BranchStore {
             return Ok(());
         };
         let (m, cv) = &*self.flight_jobs;
-        let mut jobs = m.lock().unwrap_or_else(|e| e.into_inner());
-        let target = jobs.0;
-        while jobs.1 < target {
+        let target = m.lock().unwrap_or_else(|e| e.into_inner()).0;
+        loop {
+            {
+                let jobs = m.lock().unwrap_or_else(|e| e.into_inner());
+                if jobs.1 >= target {
+                    return Ok(());
+                }
+                let Some(left) = wait.until.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) else {
+                    return Err(LimboError::Busy);
+                };
+                let jobs = cv.wait_timeout(jobs, left.min(Duration::from_millis(10))).unwrap_or_else(|e| e.into_inner()).0;
+                if jobs.1 >= target {
+                    return Ok(());
+                }
+            }
+            // The caller's interrupt with the job mutex let go (review C42 LOW-2: `dispatch_to`
+            // takes it under the store mutex, so a closure touching the store would invert them).
             if (wait.interrupted)() {
                 return Err(LimboError::Interrupt);
             }
-            let Some(left) = wait.until.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) else {
-                return Err(LimboError::Busy);
-            };
-            jobs = cv.wait_timeout(jobs, left.min(Duration::from_millis(10))).unwrap_or_else(|e| e.into_inner()).0;
         }
-        Ok(())
     }
 
     fn compact(&self, inner: &mut StoreInner, fail_after_rename: bool) -> Result<()> {
@@ -10262,11 +10271,15 @@ impl BranchStore {
             if self.checkpoint_fuzzy_now()? {
                 // Its own flight, joined within the same deadline (review C42-M1: this join had
                 // none). Past it, `Ok(false)`: no install before the deadline.
+                // A deadline past what an Instant can hold is no deadline (review C42 LOW-1:
+                // `started + Duration::MAX` panicked).
                 let never = || false;
-                let within = Wait { until: started + deadline, interrupted: &never };
+                let until = started.checked_add(deadline).unwrap_or_else(|| started + Duration::from_secs(365 * 24 * 3600));
+                let within = Wait { until, interrupted: &never };
+                // At the deadline, what installed is still reported (review C42 MED-3: an install
+                // whose WAL truncation ran past the deadline answered Ok(false)).
                 return match self.join_flights_within(Some(&within)) {
-                    Ok(()) => Ok(installed() > before),
-                    Err(LimboError::Busy) => Ok(false),
+                    Ok(()) | Err(LimboError::Busy) => Ok(installed() > before),
                     Err(e) => Err(e),
                 };
             }
