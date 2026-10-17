@@ -7005,6 +7005,73 @@ mod tests {
         assert!(violations.is_empty(), "SQLSTATE literals outside the table:\n{}", violations.join("\n"));
     }
 
+    /// Review wire-line3 HIGH-1, the lead's class: ONE quoting function for every identifier and
+    /// literal the frontend pastes into engine text (catalog::quote_ident, catalog::quote_literal).
+    /// No format! string in the frontend's product sources that builds SQL (it starts with an SQL
+    /// keyword) wraps a placeholder in quotes itself (`\"{..}\"` or `'{..}'`), and no format! string
+    /// is a bare quoting fragment, outside the two quoting functions. COPY's `format!("\"{c}\"")`
+    /// pasted client column names unescaped into marked SQLite text.
+    #[test]
+    fn engine_text_is_quoted_by_the_one_quoting_function() {
+        const KEYWORDS: [&str; 18] = [
+            "SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ATTACH", "DETACH", "PRAGMA",
+            "ALTER", "SAVEPOINT", "RELEASE", "ROLLBACK", "WITH", "BEGIN", "COMMIT", "VACUUM", "REINDEX",
+        ];
+        let frontend = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../frontend");
+        let mut wrong = Vec::new();
+        let mut literals_seen = 0;
+        for entry in std::fs::read_dir(&frontend).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let mut text = strip_test_modules(&std::fs::read_to_string(&path).unwrap());
+            for exempt in ["pub(crate) fn quote_ident(", "pub(crate) fn quote_literal("] {
+                if let Some(start) = text.find(exempt) {
+                    let end = start + text[start..].find("\n}\n").expect("its end");
+                    let kept = "\n".repeat(text[start..end].matches('\n').count());
+                    text.replace_range(start..end, &kept);
+                }
+            }
+            let mut from = 0;
+            while let Some(k) = text[from..].find("format!(") {
+                let at = from + k + "format!(".len();
+                from = at;
+                let rest = text[at..].trim_start();
+                let Some(body) = rest.strip_prefix('"') else { continue };
+                let b = body.as_bytes();
+                let mut e = 0;
+                while e < b.len() && b[e] != b'"' {
+                    if b[e] == b'\\' {
+                        e += 1;
+                    }
+                    e += 1;
+                }
+                let lit = &body[..e.min(body.len())];
+                literals_seen += 1;
+                let fragment = |l: &str| {
+                    let wrapped = |open: &str, close: &str| {
+                        l.match_indices(open).any(|(i, _)| {
+                            l[i + open.len()..].find('}').is_some_and(|j| {
+                                l[i + open.len() + j + 1..].starts_with(close)
+                            })
+                        })
+                    };
+                    wrapped("\\\"{", "\\\"") || wrapped("'{", "'")
+                };
+                let head = lit.trim_start_matches("\\n").trim_start();
+                let sql = KEYWORDS.iter().any(|k| head.starts_with(k)) && !lit.contains(": ");
+                let bare = lit == "\\\"{}\\\"" || lit == "'{}'" || (lit.starts_with("\\\"{") && lit.ends_with("}\\\"") && lit.matches('{').count() == 1);
+                if (sql && fragment(lit)) || bare {
+                    let line = text[..at].matches('\n').count() + 1;
+                    wrong.push(format!("{}:{line}: {lit}", path.display()));
+                }
+            }
+        }
+        assert!(literals_seen > 100, "premise: the scan read {literals_seen} format! strings");
+        assert!(wrong.is_empty(), "engine text quoted by hand:\n{}", wrong.join("\n"));
+    }
+
     /// Every quoted five-character token of digits and capitals with at least one digit, found
     /// wherever it sits (no quote parity elsewhere can hide one), with its 1-based line.
     fn sqlstate_literals(text: &str) -> Vec<(usize, String)> {

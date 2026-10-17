@@ -13948,3 +13948,69 @@ fn every_recorded_timezone_value_is_classified_as_postgresql_did() {
     assert!(rows >= 35, "premise: {rows} recorded rows");
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// Review wire-line3 HIGH-1 (lead class: ONE quoting function for every identifier and literal the
+/// frontend pastes into engine text). COPY FROM's column list names only columns the table has
+/// (42703, as PostgreSQL answers, and no row lands), and a column name holding a double quote is
+/// quoted, not pasted: `"a""b"` loads (COPY 1; PostgreSQL 18.6's answer). Both went into the
+/// marked SQLite INSERT as written.
+#[test]
+fn copy_names_only_the_tables_columns_and_quotes_each() {
+    let dir = Scratch::new("copy-columns");
+    let file = dir.0.join("rows.tsv");
+    std::fs::write(&file, "1\n").unwrap();
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE t (a int, b text)").ok("t");
+    a.q("CREATE TABLE q (\"a\"\"b\" int)").ok("q");
+    let mut wrong = Vec::new();
+    let r = a.q(&format!("COPY t (nosuch) FROM '{}'", file.display()));
+    if r.error.as_ref().map(|e| e.code.as_str()) != Some("42703") {
+        wrong.push(format!("an unknown column: tags {:?} error {:?}", r.tags, r.error));
+    }
+    if a.q("SELECT count(*) FROM t").single("count") != "0" {
+        wrong.push("an unknown column's COPY inserted a row".to_string());
+    }
+    let r = a.q(&format!("COPY q (\"a\"\"b\") FROM '{}'", file.display()));
+    if r.error.is_some() || r.tags != ["COPY 1"] {
+        wrong.push(format!("a quoted column: tags {:?} error {:?}", r.tags, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Review wire-line3 MED-1 and MED-2: a schema or table name holding a double quote reaches ATTACH,
+/// DETACH, the schema lookups and DROP SCHEMA ... CASCADE's DROP TABLE quoted (PostgreSQL's answers:
+/// CREATE SCHEMA, CREATE TABLE, DROP SCHEMA), and a public table whose name holds quotes and a dot
+/// is dropped by DROP SCHEMA public CASCADE without touching s.victim, which another table's name
+/// only resembles.
+#[test]
+fn schema_and_table_names_holding_quotes_are_quoted_in_engine_text() {
+    let dir = Scratch::new("quoted-names");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    for sql in [
+        "CREATE SCHEMA \"s\"\"x\"",
+        "CREATE TABLE \"s\"\"x\".t (a int)",
+        "DROP SCHEMA \"s\"\"x\" CASCADE",
+    ] {
+        if let Some(e) = a.q(sql).error {
+            wrong.push(format!("{sql}: {} {}", e.code, e.message));
+        }
+    }
+    for sql in [
+        "CREATE SCHEMA s",
+        "CREATE TABLE s.victim (x int)",
+        "CREATE TABLE \"s\"\".\"\"victim\" (x int)",
+        "DROP SCHEMA public CASCADE",
+    ] {
+        if let Some(e) = a.q(sql).error {
+            wrong.push(format!("{sql}: {} {}", e.code, e.message));
+        }
+    }
+    let r = a.q("SELECT count(*) FROM s.victim");
+    if r.error.is_some() {
+        wrong.push(format!("s.victim was dropped by DROP SCHEMA public CASCADE: {:?}", r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
