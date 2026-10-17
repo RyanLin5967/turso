@@ -11694,7 +11694,15 @@ impl StoreInner {
         let snapshot = if self.failpoint.take_if(|f| *f == BranchFailpoint::CaptureFails).is_some() {
             Err(LimboError::InternalError("failpoint: the capture's read snapshot failed".to_string()))
         } else {
-            cat.catalog.begin_read_snapshot()
+            // Two steps, each a point of the held-syscall attribution (budget
+            // a_fuzzy_checkpoint_issues_at_most_two_syscalls_under_the_store_mutex: the capture's
+            // span holds 2, raw pc-relay_82b982e09): the transaction's begin, then its pinning read.
+            cat.catalog.begin_snapshot_tx().and_then(|()| {
+                ckpt_held("capture.tx_begun");
+                let pinned = cat.catalog.pin_snapshot();
+                ckpt_held("capture.snapshot_pinned");
+                pinned
+            })
         };
         if let Err(e) = snapshot {
             if let Some((dirty, _)) = early {

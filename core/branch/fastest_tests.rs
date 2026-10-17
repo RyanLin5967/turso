@@ -10976,6 +10976,13 @@ fn a_fuzzy_checkpoint_issues_at_most_two_syscalls_under_the_store_mutex() {
             span("install.quiesced", "install.installed"),
             span("install.installed", "install.marked"),
         );
+        // FLAGGED instrument change (diagnostic only; the claim and its sum are unchanged): the
+        // capture's span split at its read snapshot's two steps, so a red names its syscalls.
+        let in_capture = (
+            span("capture.matured", "capture.tx_begun"),
+            span("capture.tx_begun", "capture.snapshot_pinned"),
+            span("capture.snapshot_pinned", "capture.captured"),
+        );
         let inside = (
             span("install.quiesced", "install.snapshot_ended"),
             span("install.snapshot_ended", "install.before_cut"),
@@ -10990,8 +10997,8 @@ fn a_fuzzy_checkpoint_issues_at_most_two_syscalls_under_the_store_mutex() {
         let total = capture.0 + capture.1 + install.0 + install.1 + install.2;
         if total > 2 {
             over.push(format!(
-                "round {round}: {total} syscalls held: capture [to matured {}, capture {}], install [quiesce {}, install {} (snapshot end {}, to cut {}, cut {}, after {}), mark {}]",
-                capture.0, capture.1, install.0, install.1, inside.0, inside.1, inside.2, inside.3, install.2
+                "round {round}: {total} syscalls held: capture [to matured {}, capture {} (to tx begun {}, snapshot pin {}, after {})], install [quiesce {}, install {} (snapshot end {}, to cut {}, cut {}, after {}), mark {}]",
+                capture.0, capture.1, in_capture.0, in_capture.1, in_capture.2, install.0, install.1, inside.0, inside.1, inside.2, inside.3, install.2
             ));
         }
     }

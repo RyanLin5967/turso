@@ -1052,7 +1052,18 @@ impl Catalog {
     /// at its first read, so one is made now, before the checkpoint's writer can commit. Every read
     /// on this connection until [`Catalog::end_read_snapshot`] sees the catalog as of here.
     pub(crate) fn begin_read_snapshot(&mut self) -> Result<()> {
-        self.begin_tx.rows(&[], &mut self.counters)?;
+        self.begin_snapshot_tx()?;
+        self.pin_snapshot()
+    }
+
+    /// `begin_read_snapshot`'s first step: the transaction begun (deferred: nothing read yet).
+    pub(crate) fn begin_snapshot_tx(&mut self) -> Result<()> {
+        self.begin_tx.rows(&[], &mut self.counters).map(drop)
+    }
+
+    /// `begin_read_snapshot`'s second step: the first read, which pins the snapshot (the meta
+    /// rows); a failure rolls the transaction back.
+    pub(crate) fn pin_snapshot(&mut self) -> Result<()> {
         if let Err(e) = self.meta_all.rows(&[], &mut self.counters) {
             self.rollback();
             return Err(e);
