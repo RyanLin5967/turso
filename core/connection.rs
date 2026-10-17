@@ -167,7 +167,7 @@ impl Drop for SchemaReparseGuard {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct PrepareOptions {
     pub unqualified_database_search_path: Option<Vec<String>>,
 }
@@ -1158,6 +1158,7 @@ impl Connection {
         }
         let result = (|| {
             let (program, pager, mode) = self.compile_cmd(cmd, input, origin, prepare_options)?;
+            // Kept with the statement: a re-prepare translates under them (wire-rework B-H2).
             Ok(Statement::new_with_origin(
                 program,
                 pager,
@@ -1165,7 +1166,8 @@ impl Connection {
                 0,
                 origin,
                 needs_nested_guard,
-            ))
+            )
+            .with_prepare_options(prepare_options.clone()))
         })();
         if result.is_err() && needs_nested_guard {
             self.end_nested();
