@@ -1451,6 +1451,10 @@ struct StoreMutex {
     /// Test builds: mutant `owed_start_sent_late` has skipped this store's first owed send.
     #[cfg(test)]
     late_skipped: AtomicBool,
+    /// Test builds: the thread that opened this store (`thread_token`), whose name-filter failpoints
+    /// it obeys (`ArmedFlag`, `ArmedHold`; review c42b LOW-9).
+    #[cfg(test)]
+    opened_by: u64,
 }
 
 impl StoreMutex {
@@ -1462,6 +1466,8 @@ impl StoreMutex {
             starter_hold: AtomicU8::new(0),
             #[cfg(test)]
             late_skipped: AtomicBool::new(false),
+            #[cfg(test)]
+            opened_by: thread_token(),
             inner: Mutex::new(inner),
             compacting: AtomicU64::new(0),
             compaction_waits: AtomicU64::new(0),
@@ -1600,9 +1606,9 @@ impl Drop for StoreGuard<'_> {
         {
             STORE_HELD.with(|held| held.set(held.get() - 1));
             super::budget_probe::store_unlocked();
-            if FILTER_HOLD_FREES_ARMED.load(Ordering::Acquire)
-                && std::thread::current().name() == Some("branch-name-filter")
-            {
+            // A name-filter thread's hold, armed by the test that opened this store (review c42b
+            // LOW-9: a thread-local read, where `std::thread::current()` was called under the mutex).
+            if filter_owner() != 0 && FILTER_HOLD_FREES_ARMED.armed_for(self.store.opened_by) {
                 let freed = super::budget_probe::thread_frees().1 - self.freed0;
                 FILTER_HOLD_FREED_MAX.fetch_max(freed, Ordering::Relaxed);
             }
@@ -2244,13 +2250,13 @@ pub(crate) static CUT_PANICS: AtomicBool = AtomicBool::new(false);
 /// Test builds: the next build of a name filter finds its first catalog scan failing, as an I/O
 /// error would (review 3 #7). Set before the open that starts the build.
 #[cfg(test)]
-pub(crate) static NAME_SCAN_FAILS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub(crate) static NAME_SCAN_FAILS: ArmedFlag = ArmedFlag::new();
 
 /// Test builds: while it holds 1, a name filter's builder waits before its catalog scan, having
-/// marked its arrival (`| HOLD_ARRIVED`); stored 0 to release it (review 3 #7). Process-wide, so a
-/// test can set it before the open that starts the build.
+/// marked its arrival (`| HOLD_ARRIVED`); stored 0 to release it (review 3 #7). Set before the open
+/// that starts the build; it holds only stores the setting thread opened (`ArmedHold`).
 #[cfg(test)]
-pub(crate) static NAME_SCAN_HOLD: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+pub(crate) static NAME_SCAN_HOLD: ArmedHold = ArmedHold::new();
 
 
 /// The name filter's builder waits at `NAME_SCAN_HOLD` (test builds only).
@@ -2258,14 +2264,14 @@ pub(crate) static NAME_SCAN_HOLD: std::sync::atomic::AtomicU8 = std::sync::atomi
 /// (`Stale`, `Overflowed`) still answers (review m1-2b LOW-F1). Armed by storing 1; released by
 /// storing 0.
 #[cfg(test)]
-pub(crate) static BUILD_SEED_HOLD: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+pub(crate) static BUILD_SEED_HOLD: ArmedHold = ArmedHold::new();
 
 fn pause_build_seed() {
     #[cfg(test)]
     {
         use std::sync::atomic::Ordering as O;
         let arrived = 1 | HOLD_ARRIVED;
-        if BUILD_SEED_HOLD.compare_exchange(1, arrived, O::AcqRel, O::Acquire).is_ok() {
+        if BUILD_SEED_HOLD.arrive_for(filter_owner(), 1, arrived) {
             while BUILD_SEED_HOLD.load(O::Acquire) == arrived {
                 crate::thread::sleep(Duration::from_millis(1));
             }
@@ -2278,7 +2284,7 @@ fn pause_name_scan() {
     {
         use std::sync::atomic::Ordering as O;
         let arrived = 1 | HOLD_ARRIVED;
-        if NAME_SCAN_HOLD.compare_exchange(1, arrived, O::AcqRel, O::Acquire).is_ok() {
+        if NAME_SCAN_HOLD.arrive_for(filter_owner(), 1, arrived) {
             while NAME_SCAN_HOLD.load(O::Acquire) == arrived {
                 crate::thread::sleep(Duration::from_millis(1));
             }
@@ -2714,14 +2720,14 @@ pub(crate) static FILTER_NOTE_ALLOCS: AtomicU64 = AtomicU64::new(0);
 /// thread freed before its unlock; and a failpoint that makes the next build's table refuse its
 /// unbuilt hashes (the build overflows at its install).
 #[cfg(test)]
-pub(crate) static FILTER_HOLD_FREES_ARMED: AtomicBool = AtomicBool::new(false);
+pub(crate) static FILTER_HOLD_FREES_ARMED: ArmedFlag = ArmedFlag::new();
 #[cfg(test)]
 pub(crate) static FILTER_HOLD_FREED_MAX: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
-pub(crate) static BUILD_TABLE_REFUSES: AtomicBool = AtomicBool::new(false);
+pub(crate) static BUILD_TABLE_REFUSES: ArmedFlag = ArmedFlag::new();
 /// Test builds: the next build's drain copy of its pending table fails (review filter3 L3).
 #[cfg(test)]
-pub(crate) static BUILD_DRAIN_FAILS: AtomicBool = AtomicBool::new(false);
+pub(crate) static BUILD_DRAIN_FAILS: ArmedFlag = ArmedFlag::new();
 /// Test builds (review m1-2b LOW-F2): the most bytes one `NameFilter::note` freed, inside the store
 /// mutex hold that noted it (a refusing table dropped there). A test resets it.
 #[cfg(test)]
@@ -2733,9 +2739,9 @@ pub(crate) static FILTER_NOTE_FREED_MAX: AtomicU64 = AtomicU64::new(0);
 /// after the drain copy, before its install. A build's thread pauses at 7 in `Building` (before its
 /// scan) and at 6 in `Draining` (before its pending copy; review REVIEW-claude-namefilter-2 MED-3).
 #[cfg(test)]
-pub(crate) static FILTER_DRAIN_FAILS: AtomicBool = AtomicBool::new(false);
+pub(crate) static FILTER_DRAIN_FAILS: ArmedFlag = ArmedFlag::new();
 #[cfg(test)]
-pub(crate) static FILTER_PAUSE_AT: AtomicU8 = AtomicU8::new(0);
+pub(crate) static FILTER_PAUSE_AT: ArmedHold = ArmedHold::new();
 #[cfg(test)]
 pub(crate) static FILTER_PAUSED: AtomicU8 = AtomicU8::new(0);
 
@@ -2745,13 +2751,144 @@ pub(crate) static FILTER_PAUSED: AtomicU8 = AtomicU8::new(0);
 #[cfg(test)]
 pub(crate) static FILTER_THREADS_LIVE: AtomicU64 = AtomicU64::new(0);
 
-/// One live name-filter thread (`FILTER_THREADS_LIVE`), counted while it is held.
+/// Test builds: a number for the calling thread, unique in the process (the owner `ArmedFlag` and
+/// `ArmedHold` record, and `StoreMutex::opened_by`).
+#[cfg(test)]
+fn thread_token() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    thread_local! {
+        static TOKEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+    TOKEN.with(|t| {
+        if t.get() == 0 {
+            t.set(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        }
+        t.get()
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// On a name-filter thread, its store's `opened_by` (`FilterThreadLive`); 0 on any other thread.
+    static FILTER_OWNER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Test builds: the `opened_by` of the store whose name-filter thread this is; 0 on any other
+/// thread.
+#[cfg(test)]
+fn filter_owner() -> u64 {
+    FILTER_OWNER.with(|o| o.get())
+}
+
+/// Test builds: a name-filter failpoint flag (review c42b LOW-9, the filter3 instrument note as a
+/// class). A test arms it with `store(true, _)` and its owner is the arming thread; only a store that
+/// thread opened obeys it, so another test's store, built at the same moment, neither consumes nor
+/// trips it. `store`, `load` and `swap` keep `AtomicBool`'s shape for the tests. Blind spot: the
+/// owner is the thread that OPENED the store, so a test that opens a store on one thread and arms on
+/// another arms nothing (no test does, at 8fb3b2fb3); the store's other failpoints and holds
+/// (compaction, checkpoint) are still process-wide, behind `serial()`.
+#[cfg(test)]
+pub(crate) struct ArmedFlag {
+    on: std::sync::atomic::AtomicBool,
+    by: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(test)]
+impl ArmedFlag {
+    pub(crate) const fn new() -> Self {
+        Self { on: std::sync::atomic::AtomicBool::new(false), by: std::sync::atomic::AtomicU64::new(0) }
+    }
+
+    /// Arm it (`true`) for the stores this thread opens, or disarm it.
+    pub(crate) fn store(&self, on: bool, order: std::sync::atomic::Ordering) {
+        if on {
+            self.by.store(thread_token(), std::sync::atomic::Ordering::Release);
+        }
+        self.on.store(on, order);
+    }
+
+    pub(crate) fn load(&self, order: std::sync::atomic::Ordering) -> bool {
+        self.on.load(order)
+    }
+
+    pub(crate) fn swap(&self, on: bool, order: std::sync::atomic::Ordering) -> bool {
+        if on {
+            self.by.store(thread_token(), std::sync::atomic::Ordering::Release);
+        }
+        self.on.swap(on, order)
+    }
+
+    /// Store side: armed for the store `owner` opened.
+    fn armed_for(&self, owner: u64) -> bool {
+        self.on.load(std::sync::atomic::Ordering::Acquire) && self.by.load(std::sync::atomic::Ordering::Acquire) == owner
+    }
+
+    /// Store side: consume it for the store `owner` opened (`false`, untouched, if armed for
+    /// another's).
+    fn take_for(&self, owner: u64) -> bool {
+        self.by.load(std::sync::atomic::Ordering::Acquire) == owner && self.on.swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
+}
+
+/// Test builds: a name-filter hold (`NAME_SCAN_HOLD`, `BUILD_SEED_HOLD`, `FILTER_PAUSE_AT`), owned
+/// as `ArmedFlag` is: a test sets a stage with `store(stage, _)` (0 releases) and reads it, with
+/// the arrival mark, with `load`; only a name-filter thread of a store the setting thread opened
+/// waits there.
+#[cfg(test)]
+pub(crate) struct ArmedHold {
+    value: std::sync::atomic::AtomicU8,
+    by: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(test)]
+impl ArmedHold {
+    pub(crate) const fn new() -> Self {
+        Self { value: std::sync::atomic::AtomicU8::new(0), by: std::sync::atomic::AtomicU64::new(0) }
+    }
+
+    pub(crate) fn store(&self, value: u8, order: std::sync::atomic::Ordering) {
+        if value != 0 {
+            self.by.store(thread_token(), std::sync::atomic::Ordering::Release);
+        }
+        self.value.store(value, order);
+    }
+
+    pub(crate) fn load(&self, order: std::sync::atomic::Ordering) -> u8 {
+        self.value.load(order)
+    }
+
+    /// Store side: the stage set for the store `owner` opened (0 if set for another's).
+    fn value_for(&self, owner: u64) -> u8 {
+        if self.by.load(std::sync::atomic::Ordering::Acquire) == owner {
+            self.value.load(std::sync::atomic::Ordering::Acquire)
+        } else {
+            0
+        }
+    }
+
+    /// Store side: mark the arrival (`from` to `to`) for the store `owner` opened.
+    fn arrive_for(&self, owner: u64, from: u8, to: u8) -> bool {
+        self.by.load(std::sync::atomic::Ordering::Acquire) == owner
+            && self
+                .value
+                .compare_exchange(from, to, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire)
+                .is_ok()
+    }
+}
+
+/// One live name-filter thread (`FILTER_THREADS_LIVE`), counted while it is held; in test builds it
+/// also marks the thread as its store's (`filter_owner`).
 struct FilterThreadLive;
 
 impl FilterThreadLive {
-    fn enter() -> Self {
+    fn enter(store: &StoreMutex) -> Self {
         #[cfg(test)]
-        FILTER_THREADS_LIVE.fetch_add(1, Ordering::AcqRel);
+        {
+            FILTER_THREADS_LIVE.fetch_add(1, Ordering::AcqRel);
+            FILTER_OWNER.with(|o| o.set(store.opened_by));
+        }
+        #[cfg(not(test))]
+        let _ = store;
         FilterThreadLive
     }
 }
@@ -2759,13 +2896,16 @@ impl FilterThreadLive {
 impl Drop for FilterThreadLive {
     fn drop(&mut self) {
         #[cfg(test)]
-        FILTER_THREADS_LIVE.fetch_sub(1, Ordering::AcqRel);
+        {
+            FILTER_OWNER.with(|o| o.set(0));
+            FILTER_THREADS_LIVE.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 }
 
 fn filter_pause(stage: u8) {
     #[cfg(test)]
-    if FILTER_PAUSE_AT.load(Ordering::Acquire) == stage {
+    if FILTER_PAUSE_AT.value_for(filter_owner()) == stage {
         FILTER_PAUSED.store(stage, Ordering::Release);
         while FILTER_PAUSE_AT.load(Ordering::Acquire) == stage {
             std::thread::sleep(std::time::Duration::from_millis(1));
@@ -2777,7 +2917,7 @@ fn filter_pause(stage: u8) {
 
 fn filter_drain_fails() -> bool {
     #[cfg(test)]
-    return FILTER_DRAIN_FAILS.load(Ordering::Acquire);
+    return FILTER_DRAIN_FAILS.armed_for(filter_owner());
     #[cfg(not(test))]
     false
 }
@@ -9709,13 +9849,13 @@ impl BranchStore {
             return;
         }
         #[cfg(test)]
-        let fail_scan = NAME_SCAN_FAILS.swap(false, std::sync::atomic::Ordering::AcqRel);
+        let fail_scan = NAME_SCAN_FAILS.take_for(self.inner.opened_by);
         #[cfg(not(test))]
         let fail_scan = false;
         let shared = self.inner.clone();
         let stop = self.name_filter_stop.clone();
         let spawned = crate::thread::Builder::new().name("branch-name-filter".to_string()).spawn(move || {
-            let _live = FilterThreadLive::enter();
+            let _live = FilterThreadLive::enter(&shared);
             let mut fail_scan = fail_scan;
             // Mutant `name_filter_build_no_retry` (test builds only): one attempt, as before.
             let attempts = if fe_mutant("name_filter_build_no_retry") { 1 } else { FILTER_BUILD_ATTEMPTS };
@@ -9843,7 +9983,7 @@ impl BranchStore {
             match scanned {
                 Ok((table, unbuilt)) => {
                     #[cfg(test)]
-                    let forced = BUILD_TABLE_REFUSES.swap(false, Ordering::AcqRel);
+                    let forced = BUILD_TABLE_REFUSES.take_for(shared.opened_by);
                     #[cfg(not(test))]
                     let forced = false;
                     if forced || !unbuilt.iter().all(|h| table.insert(*h)) {
@@ -9890,7 +10030,7 @@ impl BranchStore {
         // Failpoint `BUILD_DRAIN_FAILS` (test builds; review filter3 L3): the drain copy fails, as
         // a copy refused at a name does.
         #[cfg(test)]
-        let drain_fails = BUILD_DRAIN_FAILS.swap(false, Ordering::AcqRel);
+        let drain_fails = BUILD_DRAIN_FAILS.take_for(shared.opened_by);
         #[cfg(not(test))]
         let drain_fails = false;
         let copied = !drain_fails && pending.copy_into(&table);
@@ -9926,7 +10066,7 @@ impl BranchStore {
     fn grow_name_filter(&self) {
         let shared = self.inner.clone();
         let spawned = crate::thread::Builder::new().name("branch-name-filter".to_string()).spawn(move || {
-            let _live = FilterThreadLive::enter();
+            let _live = FilterThreadLive::enter(&shared);
             let old = match &shared.lock().names.filter.state {
                 FilterState::Ready { table } => table.clone(),
                 _ => return,
