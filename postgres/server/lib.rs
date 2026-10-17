@@ -7131,6 +7131,34 @@ mod tests {
         );
     }
 
+    /// The merge gate of fk-guard into this line (review wire-rework C, finding (3)): every call of
+    /// handle_pg_set's `assign` propagates its Result with `?`, so a refused SET (the foreign_keys
+    /// 55000) can never be dropped silently, as a call without it would be (only an
+    /// unused_must_use warning). Reads the frontend's source; each call's closing `})` must be
+    /// `})?;`, and at least the five known calls must be found.
+    #[test]
+    fn every_assign_call_propagates_its_refusal() {
+        let source = include_str!("../frontend/session.rs");
+        let lines: Vec<&str> = source.lines().collect();
+        let (mut calls, mut dropped) = (0, Vec::new());
+        for (i, line) in lines.iter().enumerate() {
+            if !line.contains("assign(&|") {
+                continue;
+            }
+            calls += 1;
+            let close = lines[i + 1..]
+                .iter()
+                .position(|l| matches!(l.trim(), "});" | "})?;"))
+                .map(|k| i + 1 + k)
+                .expect("the call's closing line");
+            if lines[close].trim() != "})?;" {
+                dropped.push(i + 1);
+            }
+        }
+        assert!(calls >= 5, "found {calls} assign calls, not the five known");
+        assert!(dropped.is_empty(), "assign calls whose Result is dropped, at session.rs lines {dropped:?}");
+    }
+
     /// fk-guard review LOW 6: postgres/COMPAT.md states the foreign_keys refusal and its code, beside
     /// the setting's row, and no longer says SET LOCAL of foreign_keys is 0A000 (C41 made it follow
     /// transaction scope).
