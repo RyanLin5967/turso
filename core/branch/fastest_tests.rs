@@ -3683,6 +3683,56 @@ fn a_client_checkpoint_s_wait_for_the_store_mutex_ends_at_its_deadline_or_its_in
     assert!(matches!(r, Err(LimboError::Interrupt)), "CLAIM: an interrupted CHECKPOINT did not report the interrupt: {r:?}");
 }
 
+/// Review c42b MED-2: BOTH client checkpoints are bounded end to end. `checkpoint_now(deadline)` (the
+/// wire's CHECKPOINT on a catalog store) took the store mutex unbounded, at its first line and in
+/// `checkpoint_fuzzy_now`. Another thread holds the mutex; with a 300 ms deadline it must answer
+/// `Ok(false)` (no install before the deadline) within 30 s, not before the deadline.
+#[test]
+fn checkpoint_now_s_wait_for_the_store_mutex_ends_at_its_deadline() {
+    use std::sync::atomic::{AtomicBool, Ordering::Acquire};
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(
+        &dir.path().join("checkpoint-now-mutex.db"),
+        opts(true, SyncClass::Fsync).with_branch_checkpoint(super::BranchCheckpoint::Fuzzy),
+    );
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let _ = trunk.fork_branch().unwrap().into_id();
+    let (held, release) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+    struct ReleaseOnDrop(Arc<AtomicBool>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+    let _release = ReleaseOnDrop(release.clone());
+    let holder = {
+        let (db, held, release) = (db.clone(), held.clone(), release.clone());
+        std::thread::spawn(move || db.branches.hold_store_mutex_for_test(&held, &release))
+    };
+    let t = std::time::Instant::now();
+    while !held.load(Acquire) {
+        assert!(t.elapsed() < std::time::Duration::from_secs(10), "premise: the holder never took the store mutex");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    {
+        let db = db.clone();
+        std::thread::spawn(move || {
+            let begun = std::time::Instant::now();
+            let r = db.branch_checkpoint_now(std::time::Duration::from_millis(300));
+            let _ = tx.send((r, begun.elapsed()));
+        });
+    }
+    let answered = rx.recv_timeout(std::time::Duration::from_secs(30));
+    release.store(true, std::sync::atomic::Ordering::Release);
+    holder.join().unwrap();
+    let (r, took) = answered.expect("CLAIM: checkpoint_now waited for the store mutex past its 300 ms deadline (no answer in 30 s)");
+    assert!(took >= std::time::Duration::from_millis(300), "CLAIM: checkpoint_now gave up before its deadline ({took:?})");
+    assert!(matches!(r, Ok(false)), "CLAIM: checkpoint_now held off by the mutex past its deadline answered {r:?}, not Ok(false)");
+}
+
 /// `branch_checkpoint_now(deadline)` on its own thread while the flight it starts is held at
 /// `stage`, released after `release_after`; its answer and how long it took (`None`: no answer in
 /// 30 s).
