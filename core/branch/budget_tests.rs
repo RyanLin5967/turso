@@ -292,6 +292,10 @@ fn sample_of(s0: &probe::Snapshot, s1: &probe::Snapshot, o0: &Outside, o1: &Outs
     s.insert("fsync", delta(s0.fsync, s1.fsync));
     s.insert("full_fsync", delta(s0.full_fsync, s1.full_fsync));
     s.insert("barrier", delta(s0.barrier, s1.barrier));
+    // Counters review MED-5: the process's syncs in the same window, for the parity check.
+    s.insert("fsync_process", delta(s0.p_fsync, s1.p_fsync));
+    s.insert("full_fsync_process", delta(s0.p_full_fsync, s1.p_full_fsync));
+    s.insert("barrier_process", delta(s0.p_barrier, s1.p_barrier));
     s.insert("allocs", delta(s0.t_allocs, s1.t_allocs));
     s.insert("alloc_bytes", delta(s0.t_alloc_bytes, s1.t_alloc_bytes));
     s.insert("allocs_process", delta(s0.allocs, s1.allocs));
@@ -769,6 +773,7 @@ fn shared(cell: &str, db: &Arc<Database>, c: u64, out: &mut String) {
         let go = std::sync::atomic::AtomicBool::new(false);
         let e0 = exceptions(db);
         let s0 = super::store::own_sync_counts();
+        let p0 = super::sync_counts();
         // Per client, from its start to its last acknowledgement: the store's condition-variable
         // waits (`store::thread_waits`, one per wait call, so a futile wake-up that waits again
         // counts again), and the most any one acknowledgement waited (review 2 H5: a sum is a mean,
@@ -866,6 +871,7 @@ fn shared(cell: &str, db: &Arc<Database>, c: u64, out: &mut String) {
             per
         });
         let s1 = super::store::own_sync_counts();
+        let p1 = super::sync_counts();
         let e1 = exceptions(db);
         let mut m = Sample::new();
         put_exceptions(&mut m, e0, e1);
@@ -874,6 +880,9 @@ fn shared(cell: &str, db: &Arc<Database>, c: u64, out: &mut String) {
         m.insert("full_fsync", s1.full_fsync - s0.full_fsync);
         m.insert("fsync", s1.fsync - s0.fsync);
         m.insert("barrier", s1.barrier - s0.barrier);
+        m.insert("fsync_process", p1.fsync - p0.fsync);
+        m.insert("full_fsync_process", p1.full_fsync - p0.full_fsync);
+        m.insert("barrier_process", p1.barrier - p0.barrier);
         m.insert("store_waits", per.iter().map(|p| p.0).sum());
         m.insert("store_waits_max_client", per.iter().map(|p| p.0).max().unwrap_or(0));
         m.insert("store_waits_max_ack", per.iter().map(|p| p.3).max().unwrap_or(0));
@@ -1249,8 +1258,10 @@ fn open_once(path: &Path, log: &Path) -> Sample {
     let classes = || super::journal::CLASS_SYNCS.with(|c| [c[0].get(), c[1].get()]);
     let dirs = || super::journal::DIR_SYNCS.with(|c| c.get());
     let (s0, c0, d0) = (super::store::own_sync_counts(), classes(), dirs());
+    let p0 = super::sync_counts();
     let db = open_at(path);
     let (s1, c1, d1) = (super::store::own_sync_counts(), classes(), dirs());
+    let p1 = super::sync_counts();
     let m1 = std::fs::metadata(log).unwrap();
     // Counted since this open (`Outside::zero`).
     let exc = exceptions(&db);
@@ -1259,6 +1270,9 @@ fn open_once(path: &Path, log: &Path) -> Sample {
         ("full_fsync", s1.full_fsync - s0.full_fsync),
         ("fsync", s1.fsync - s0.fsync),
         ("barrier", s1.barrier - s0.barrier),
+        ("fsync_process", p1.fsync - p0.fsync),
+        ("full_fsync_process", p1.full_fsync - p0.full_fsync),
+        ("barrier_process", p1.barrier - p0.barrier),
         ("thread_plain", c1[0] - c0[0]),
         ("thread_full", c1[1] - c0[1]),
         ("dir_syncs", d1 - d0),
@@ -1553,12 +1567,16 @@ fn first_create(cell: &str, out: &mut String) {
             let trunk = db.connect().unwrap();
             let e0 = exceptions(&db);
             let (c0, f0) = (probe::sql_counts(), super::store::own_sync_counts());
+            let p0 = super::sync_counts();
             trunk.create_branch("m-0000").unwrap();
             let (c1, f1) = (probe::sql_counts(), super::store::own_sync_counts());
+            let p1 = super::sync_counts();
             let mut s = sql_sample(&c0, &c1);
             put_exceptions(&mut s, e0, exceptions(&db));
             s.insert("full_fsync", f1.full_fsync - f0.full_fsync);
             s.insert("fsync", f1.fsync - f0.fsync);
+            s.insert("full_fsync_process", p1.full_fsync - p0.full_fsync);
+            s.insert("fsync_process", p1.fsync - p0.fsync);
             line(out, cell, op, i, &s);
         }
     }
@@ -2983,6 +3001,35 @@ fn create_logs_its_record_and_one_flight_end() {
             "journal.rs format 11: its own ForkNamed and one 17 B flight end (review 2 #8)",
         )],
     );
+}
+
+/// Counters review MED-5: in a budget child the process's sync counts are exact (one cell's stores
+/// at a time), so every window's sync reading must equal them. A reading that lost a sync made on a
+/// thread no store's scope covered, or by a store another thread opened, differs.
+#[test]
+fn every_budget_windows_syncs_equal_the_process_syncs_in_its_child() {
+    if in_child() {
+        return;
+    }
+    let mut failures = String::new();
+    let mut compared = 0;
+    for spec in MAIN.iter().copied().chain(["ckpt_n10", "confirm_load", "confirm_n10", "first_create", "open_d1"]) {
+        let c = cell(spec);
+        for (op, samples) in &c.ops {
+            for (i, s) in samples.iter().enumerate() {
+                for k in ["fsync", "full_fsync", "barrier"] {
+                    let Some(&process) = s.get(&format!("{k}_process")) else { continue };
+                    let read = *s.get(k).unwrap_or_else(|| panic!("{spec}: {op} {i}: no {k} beside {k}_process"));
+                    compared += 1;
+                    if read != process {
+                        let _ = writeln!(failures, "  {spec}: {op} {i}: {k} {read}, the process {process}");
+                    }
+                }
+            }
+        }
+    }
+    assert!(compared > 0, "premise: no window carried the process's syncs");
+    assert!(failures.is_empty(), "budget windows whose sync reading is not the process's ({compared} compared):\n{failures}");
 }
 
 #[cfg(target_vendor = "apple")]

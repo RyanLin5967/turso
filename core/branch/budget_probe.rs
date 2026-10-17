@@ -671,6 +671,12 @@ pub(crate) struct Snapshot {
     pub(crate) fsync: u64,
     pub(crate) full_fsync: u64,
     pub(crate) barrier: u64,
+    /// The process's syncs at this snapshot (`branch::sync_counts`), beside the budget's reading
+    /// above: counters review MED-5's parity check in a budget child, where the process's counts
+    /// are exact.
+    pub(crate) p_fsync: u64,
+    pub(crate) p_full_fsync: u64,
+    pub(crate) p_barrier: u64,
     pub(crate) syscalls: Option<u64>,
     /// Whether the per-thread counter was loaded, and its lost count at this snapshot (probe-
     /// adversary item 1: every sample records its mode).
@@ -1039,7 +1045,11 @@ pub(crate) fn thread_allocs() -> (u64, u64, u64, u64) {
 fn user_counts() -> Snapshot {
     let get = |c: &'static std::thread::LocalKey<Cell<u64>>| c.with(|c| c.get());
     let syncs = crate::branch::store::own_sync_counts();
+    let process = crate::branch::sync_counts();
     Snapshot {
+        p_fsync: process.fsync,
+        p_full_fsync: process.full_fsync,
+        p_barrier: process.barrier,
         instructions: None,
         allocs: ALLOCS.load(Relaxed),
         alloc_bytes: ALLOC_BYTES.load(Relaxed),
