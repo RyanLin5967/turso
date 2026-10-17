@@ -3494,6 +3494,63 @@ fn a_client_checkpoint_s_wait_for_a_flight_ends_at_its_deadline_or_its_interrupt
     assert!(interrupted.as_ref().is_err_and(|e| e.to_lowercase().contains("interrupt")), "CLAIM: an interrupted CHECKPOINT did not report the interrupt: {interrupted:?}");
 }
 
+/// Review C42 MED-2 (lead ruling "C42-M1 review, bounded end to end"): a client's CHECKPOINT is
+/// bounded END TO END, its wait for the store mutex too, not only its wait for a flight. Another
+/// thread holds the store mutex (as a background compaction's sync or a sharp compact would);
+/// `branch_compact_now_within` must return `Busy` at its 300 ms deadline (not before it), and
+/// `Interrupt` once its interrupt says so, each within 30 s. At 7c698b9b5 the mutex was taken with
+/// no bound after the bounded join.
+#[test]
+fn a_client_checkpoint_s_wait_for_the_store_mutex_ends_at_its_deadline_or_its_interrupt() {
+    use std::sync::atomic::{AtomicBool, Ordering::{Acquire, Release}};
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(
+        &dir.path().join("checkpoint-mutex-within.db"),
+        opts(true, SyncClass::Fsync).with_branch_checkpoint(super::BranchCheckpoint::Fuzzy),
+    );
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let _ = trunk.fork_branch().unwrap().into_id();
+    let (held, release) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+    struct Release(Arc<AtomicBool>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+    let _release = Release(release.clone());
+    let holder = {
+        let (db, held, release) = (db.clone(), held.clone(), release.clone());
+        std::thread::spawn(move || db.branches.hold_store_mutex_for_test(&held, &release))
+    };
+    let t = std::time::Instant::now();
+    while !held.load(Acquire) {
+        assert!(t.elapsed() < std::time::Duration::from_secs(10), "premise: the holder never took the store mutex");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let call = |until: std::time::Duration, interrupt_after: Option<std::time::Duration>| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let db = db.clone();
+        std::thread::spawn(move || {
+            let begun = std::time::Instant::now();
+            let interrupted = move || interrupt_after.is_some_and(|d| begun.elapsed() >= d);
+            let r = db.branch_compact_now_within(begun + until, &interrupted);
+            let _ = tx.send((r, begun.elapsed()));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(30))
+    };
+    let at_deadline = call(std::time::Duration::from_millis(300), None);
+    let interrupted = call(std::time::Duration::from_secs(600), Some(std::time::Duration::from_millis(100)));
+    release.store(true, Release);
+    holder.join().unwrap();
+    let (r, took) = at_deadline.expect("CLAIM: a client's CHECKPOINT waited for the store mutex past its 300 ms deadline (no return in 30 s)");
+    assert!(matches!(r, Err(LimboError::Busy)), "CLAIM: at its deadline the CHECKPOINT did not report Busy: {r:?}");
+    assert!(took >= std::time::Duration::from_millis(300), "CLAIM: the CHECKPOINT gave up before its deadline ({took:?})");
+    let (r, _) = interrupted.expect("CLAIM: a client's CHECKPOINT went on waiting for the store mutex after its interrupt (no return in 30 s)");
+    assert!(matches!(r, Err(LimboError::Interrupt)), "CLAIM: an interrupted CHECKPOINT did not report the interrupt: {r:?}");
+}
+
 /// Review 2 #5: a checkpoint that failed is not retried by the very next operation — the log is
 /// past the threshold still, so without a back-off every create would start (and pay for) another
 /// one: it waits for another threshold's worth of log.

@@ -6914,6 +6914,18 @@ impl BranchStore {
         }));
     }
 
+    /// Test builds: hold the store mutex on this thread from the moment `held` is set until `release`
+    /// is (review C42 MED-2: a CHECKPOINT's bounded wait must also bound its wait for the mutex).
+    #[cfg(test)]
+    pub(crate) fn hold_store_mutex_for_test(&self, held: &AtomicBool, release: &AtomicBool) {
+        let guard = self.inner.lock();
+        held.store(true, Ordering::Release);
+        while !release.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        drop(guard);
+    }
+
     /// Test builds: a handle on this store's starter that outlives the store (review
     /// REVIEW-claude-engine-M1 MED-1), as a filter or confirmation thread's `Arc` does.
     #[cfg(test)]
