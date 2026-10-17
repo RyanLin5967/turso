@@ -4809,7 +4809,10 @@ pub(crate) fn fsync_file(file: &File, class: SyncClass) -> Result<()> {
             if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) } == -1 {
                 return Err(io_error(std::io::Error::last_os_error(), "F_FULLFSYNC branch file"));
             }
-            crate::io::count_sync(true);
+            // Mutant `drop_journal_sync_count` gates every counted arm (counters review 3 MED-B).
+            if !super::store::fe_mutant("drop_journal_sync_count") {
+                crate::io::count_sync(true);
+            }
             #[cfg(test)]
             super::store::note_branch_sync(1);
             return Ok(());
@@ -4818,9 +4821,10 @@ pub(crate) fn fsync_file(file: &File, class: SyncClass) -> Result<()> {
         if unsafe { libc::fsync(file.as_raw_fd()) } != 0 {
             return Err(io_error(std::io::Error::last_os_error(), "fsync branch file"));
         }
-        // Mutant `drop_journal_sync_count` (test builds only; counters review 2 HIGH 2): the process
-        // does not count this branch file's sync, which the stores' own count still does: the
-        // parity check's fire-check.
+        // Mutant `drop_journal_sync_count` (test builds only; counters review 2 HIGH 2, review 3
+        // MED-B/LOW-5): the process does not count this branch file's sync, in every arm, which
+        // `own_sync_counts` still does: the parity check's fire-check. It also skips the process's
+        // `note_sync` (THREAD_SYNCS, `syncs_under_store_mutex`), so tests reading those can kill it too.
         if !super::store::fe_mutant("drop_journal_sync_count") {
             crate::io::count_sync(false);
         }
@@ -4858,7 +4862,9 @@ pub(crate) fn barrier_file(file: &File, class: SyncClass) -> Result<()> {
         let injected = 0;
         // SAFETY: the descriptor is owned by `file` and open for the duration of the call.
         if injected == 0 && unsafe { libc::fcntl(file.as_raw_fd(), libc::F_BARRIERFSYNC) } != -1 {
-            crate::io::count_barrier();
+            if !super::store::fe_mutant("drop_journal_sync_count") {
+                crate::io::count_barrier();
+            }
             #[cfg(test)]
             super::store::note_branch_sync(2);
             return Ok(());
@@ -4885,7 +4891,9 @@ pub(crate) fn barrier_file(file: &File, class: SyncClass) -> Result<()> {
             Some(libc::ENOTSUP | libc::EOPNOTSUPP | libc::EINVAL | libc::ENOTTY)
         ) && (darwin_major() < 23 || super::store::fe_mutant("barrier_retries_on_new_kernel"));
         if unsupported || super::store::fe_mutant("barrier_retries_any") {
-            crate::io::count_barrier_fallback();
+            if !super::store::fe_mutant("drop_journal_sync_count") {
+                crate::io::count_barrier_fallback();
+            }
             #[cfg(test)]
             super::store::note_branch_sync(3);
             return fsync_file(file, class);
