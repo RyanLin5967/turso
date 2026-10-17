@@ -1132,6 +1132,17 @@ fn prepare_statement_parsed(
     }
 
     reject_sqlite_catalog_access(sql)?;
+    // A kind is never carried by text a client can write (review wire-line2 H1, the lead's class):
+    // the marker is the frontend's own SQLite's, and this text is stored as the statement's SQL,
+    // which an engine re-prepare would then read as SQLite instead of the PostgreSQL statement
+    // checked here. Client text that starts with it is refused. BLIND SPOT, closed only by the
+    // engine's typed text kind at integration: a statement's text is still what decides its parse.
+    if sql.starts_with(crate::catalog::SQLITE_TEXT_MARKER.trim_end()) {
+        return Err(LimboError::ParseError(SqlErrorMessage::classified(
+            SqlErrorKind::SyntaxError,
+            "a statement may not start with the frontend's internal marker comment",
+        )));
+    }
 
     // One parse serves both the special forms and the translation (it was two), and a Parse
     // message's serves its classification too (C53).
