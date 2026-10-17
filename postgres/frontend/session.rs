@@ -185,7 +185,12 @@ impl PgConnectionInner {
         self.lock_timeout_ms.store(gucs.lock_timeout_ms, Relaxed);
         self.statement_timeout_ms.store(gucs.statement_timeout_ms, Relaxed);
         self.min_messages.store(gucs.min_messages, Relaxed);
-        self.conn.set_foreign_keys_enabled(gucs.foreign_keys);
+        // Never off over pending deferred violations, whatever path got here (C41-H1: the check
+        // the COMMIT makes is the engine's, so turning it off let an orphan commit). The SET that
+        // asks for it is refused in `handle_pg_set`; this keeps any other path that would change
+        // the effective value (a savepoint or block end) from reaching the state at all.
+        let pending = self.conn.deferred_foreign_key_violations() > 0;
+        self.conn.set_foreign_keys_enabled(gucs.foreign_keys || pending);
         let mut state = self.session_state.lock();
         if state.search_path != gucs.search_path {
             state.search_path.clone_from(&gucs.search_path);
@@ -1519,24 +1524,45 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
     let name = set_stmt.name.to_ascii_lowercase();
     let in_block = !pg_conn.conn.get_auto_commit();
     // Every mutable setting uses this assignment path, including the outside-block LOCAL rule.
-    let assign = |apply: &dyn Fn(&mut Gucs, &mut Locals, bool)| {
+    let assign = |apply: &dyn Fn(&mut Gucs, &mut Locals, bool)| -> Result<()> {
         if set_stmt.is_local && !in_block {
             pg_conn.warnings.lock().push((
                 "WARNING",
                 SqlErrorKind::NoActiveSqlTransaction,
                 "SET LOCAL can only be used in transaction blocks".to_string(),
             ));
-            return;
+            return Ok(());
         }
         let mut state = pg_conn.session_state.lock();
         let gucs = &mut state.gucs;
+        // Applied to a copy first: a change of the effective foreign_keys to off while the
+        // transaction holds deferred violations is refused, by the effective value and not by the
+        // statement's form (SET, SET LOCAL, SET SESSION, inside an implicit block alike: C41-H1,
+        // review c39799c5d..9e24b455d MED 3), and nothing of the refused SET is kept.
+        let (mut session, mut local) = (gucs.session.clone(), gucs.local.clone());
+        apply(&mut session, &mut local, set_stmt.is_local);
+        let was = gucs.effective().foreign_keys;
+        let now = local.foreign_keys.unwrap_or(session.foreign_keys);
+        let pending = pg_conn.conn.deferred_foreign_key_violations();
+        if was && !now && pending > 0 {
+            return Err(LimboError::ParseError(SqlErrorMessage::classified(
+                SqlErrorKind::ObjectNotInPrerequisiteState,
+                format!(
+                    "cannot turn foreign_keys off while the transaction holds {pending} deferred \
+                     foreign key violation{}",
+                    if pending == 1 { "" } else { "s" }
+                ),
+            )));
+        }
         if in_block && gucs.block_start.is_none() {
             gucs.block_start = Some(gucs.session.clone());
         }
-        apply(&mut gucs.session, &mut gucs.local, set_stmt.is_local);
+        gucs.session = session;
+        gucs.local = local;
         let effective = gucs.effective();
         drop(state);
         pg_conn.publish(&effective);
+        Ok(())
     };
     if name == "search_path" {
         let path = set_stmt
@@ -1552,7 +1578,7 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
                 session.search_path.clone_from(&path);
                 local.search_path = None;
             }
-        });
+        })?;
         return noop_statement(&pg_conn.conn);
     }
     let value = set_stmt.values.first().ok_or_else(|| {
@@ -1626,7 +1652,7 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
                     session.foreign_keys = on;
                     local.foreign_keys = None;
                 }
-            });
+            })?;
             true
         }
         // These change answers PostgreSQL gives, so they act, or are refused, rather than being
@@ -1644,7 +1670,7 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
                     session.lock_timeout_ms = ms;
                     local.lock_timeout_ms = None;
                 }
-            });
+            })?;
             true
         }
         "client_min_messages" => {
@@ -1658,7 +1684,7 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
                     session.min_messages = rank;
                     local.min_messages = None;
                 }
-            });
+            })?;
             true
         }
         // The server stops a statement running past it (57014).
@@ -1673,7 +1699,7 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
                     session.statement_timeout_ms = ms;
                     local.statement_timeout_ms = None;
                 }
-            });
+            })?;
             true
         }
         "idle_in_transaction_session_timeout" | "transaction_timeout" => {
