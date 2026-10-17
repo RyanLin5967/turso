@@ -2947,6 +2947,60 @@ fn a_failed_capture_check_under_the_whole_run_switch_aborts_the_process() {
     );
 }
 
+/// Lead ruling DECISIONS 179e043b9e (wire-rev-fkguard MED 1), as a class: a setter whose side
+/// effect invalidates compiled programs bumps the prepare generation only on a CHANGE. The wire's
+/// publish sets foreign_keys at every transaction end, so an unconditional bump re-prepared every
+/// cached statement after every commit. Each setter given the value it holds must leave the
+/// generation alone, and (positive control) given another must move it.
+#[test]
+fn a_setter_given_the_value_it_holds_leaves_the_prepare_generation_alone() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("prepare-generation.db"), opts(true, SyncClass::Off));
+    let c = db.connect().unwrap();
+    let mut same_bumped = Vec::new();
+    let mut change_missed = Vec::new();
+    let mut check = |name: &'static str, same: &dyn Fn(), other: &dyn Fn(), back: &dyn Fn()| {
+        let g0 = c.prepare_context_generation();
+        same();
+        if c.prepare_context_generation() != g0 {
+            same_bumped.push(name);
+        }
+        let g1 = c.prepare_context_generation();
+        other();
+        if c.prepare_context_generation() == g1 {
+            change_missed.push(name);
+        }
+        back();
+    };
+    let v = c.foreign_keys_enabled();
+    check("set_foreign_keys_enabled", &|| c.set_foreign_keys_enabled(v), &|| c.set_foreign_keys_enabled(!v), &|| c.set_foreign_keys_enabled(v));
+    let v = c.row_image_apply();
+    check("set_row_image_apply", &|| c.set_row_image_apply(v), &|| c.set_row_image_apply(!v), &|| c.set_row_image_apply(v));
+    let v = c.get_cache_size();
+    check("set_cache_size", &|| c.set_cache_size(v), &|| c.set_cache_size(v + 1), &|| c.set_cache_size(v));
+    let v = c.get_query_only();
+    check("set_query_only", &|| c.set_query_only(v), &|| c.set_query_only(!v), &|| c.set_query_only(v));
+    let v = c.recipe_backfill();
+    check("set_recipe_backfill", &|| c.set_recipe_backfill(v), &|| c.set_recipe_backfill(!v), &|| c.set_recipe_backfill(v));
+    let v = c.get_dqs_dml();
+    check("set_dqs_dml", &|| c.set_dqs_dml(v), &|| c.set_dqs_dml(!v), &|| c.set_dqs_dml(v));
+    let v = c.get_full_column_names();
+    check("set_full_column_names", &|| c.set_full_column_names(v), &|| c.set_full_column_names(!v), &|| c.set_full_column_names(v));
+    let v = c.get_short_column_names();
+    check("set_short_column_names", &|| c.set_short_column_names(v), &|| c.set_short_column_names(!v), &|| c.set_short_column_names(v));
+    let v = c.get_sync_mode();
+    let w = if v == crate::SyncMode::Full { crate::SyncMode::Normal } else { crate::SyncMode::Full };
+    check("set_sync_mode", &|| c.set_sync_mode(v), &|| c.set_sync_mode(w), &|| c.set_sync_mode(v));
+    let v = c.get_data_sync_retry();
+    check("set_data_sync_retry", &|| c.set_data_sync_retry(v), &|| c.set_data_sync_retry(!v), &|| c.set_data_sync_retry(v));
+    let v = c.get_busy_timeout();
+    let w = v + std::time::Duration::from_millis(7);
+    check("set_busy_timeout", &|| c.set_busy_timeout(v), &|| c.set_busy_timeout(w), &|| c.set_busy_timeout(v));
+    assert!(change_missed.is_empty(), "premise: a setter given ANOTHER value did not move the prepare generation: {change_missed:?}");
+    assert!(same_bumped.is_empty(), "CLAIM: setters given the value they hold re-prepared every statement: {same_bumped:?}");
+}
+
 /// Review REVIEW-claude-engine-M1 LOW-5: each path the M1 fix names gets its own owed start sent,
 /// not only `expire_branches`. The store is built at the default threshold with 300 forks leased
 /// for a minute and one branch `keep` with ten hours; the lease clock then passes the minute, the
