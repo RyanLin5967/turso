@@ -9096,6 +9096,10 @@ fn lifecycle_audit(n: u32) {
     // Counters review 2 MED 3: seen is counted by the store's guard, outside the probe, and the probe
     // counts what its own gates excluded, so a hold it skipped breaks the equation.
     let (seen, excluded) = (AUDIT_SEEN.load(Relaxed), AUDIT_EXCLUDED.load(Relaxed));
+    // Counters review 3 MED-C: on Apple a correct run excludes no hold (the probe is armed before the
+    // audit, earlier stores are closed, and the kernel's count is readable), so an excluded hold is a
+    // defect the equation alone would absorb.
+    assert_eq!(excluded, 0, "premise: the audit excluded {excluded} holds of its store on Apple (n = {n})");
     assert_eq!(
         seen,
         log.len() as u64 + AUDIT_LOST.load(Relaxed) + excluded,
