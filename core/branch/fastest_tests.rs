@@ -14333,3 +14333,78 @@ fn a_failed_ddl_leaves_no_in_memory_schema_change_on_the_routes_the_first_fix_mi
     }
     assert!(failed.is_empty(), "CLAIM: a failed DDL left its in-memory schema change: {failed:#?}");
 }
+
+/// The fresh adversary of 3e4c0a12b^..d806241ea (review agent ad597da8d5542fa0b, read-only;
+/// schedules UNRUN until this red). Each case on its own database; every failure is listed.
+/// - HIGH 1: `CREATE TYPE "integer"` passed the built-in guard (it read the token, quotes kept)
+///   and type_key then registered `integer`, which every STRICT INTEGER column resolves to.
+/// - MED 2: `CREATE TYPE "Foo"; DROP TYPE foo` removed the registry entry but not the stored row
+///   (matched by the token), so the type came back at the next open.
+/// - MED 3: a STRUCT field typed `[a,b]` (the parser strips brackets) was stored as `a,b`.
+/// - MED 4: `BEGIN; switch the capture table; ROLLBACK` left capture on the rolled-back table.
+#[test]
+fn quoted_type_names_and_cdc_switches_hold_what_the_adversary_attacked() {
+    let mut failed: Vec<String> = Vec::new();
+    let opts = || DatabaseOpts::new().with_custom_types(true);
+    // HIGH 1.
+    {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("builtin.db"), opts());
+        let c = db.connect().unwrap();
+        for name in ["\"integer\"", "\"TEXT\"", "\"any\""] {
+            if c.execute(format!("CREATE TYPE {name}(value text) BASE text ENCODE 'x' DECODE value")).is_ok() {
+                failed.push(format!("HIGH 1: CREATE TYPE {name} was accepted: a built-in type's name"));
+            }
+        }
+        if c.execute("CREATE DOMAIN \"text\" AS integer CHECK (value > 0)").is_ok() {
+            failed.push("HIGH 1: CREATE DOMAIN \"text\" was accepted: a built-in type's name".to_string());
+        }
+    }
+    // MED 2.
+    {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("drop-type.db");
+        {
+            let db = open_at(&path, opts());
+            let c = db.connect().unwrap();
+            c.execute("CREATE TYPE \"Foo\"(value text) BASE text").unwrap();
+            if let Err(e) = c.execute("DROP TYPE foo") {
+                failed.push(format!("MED 2: DROP TYPE foo after CREATE TYPE \"Foo\": {e}"));
+            }
+        }
+        let db = open_at(&path, opts());
+        let c = db.connect().unwrap();
+        if c.schema.read().get_type_def_unchecked("foo").is_some() {
+            failed.push("MED 2: the dropped type foo is back after a reopen".to_string());
+        }
+    }
+    // MED 3.
+    {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("struct.db"), opts());
+        let c = db.connect().unwrap();
+        c.execute("CREATE TYPE \"a,b\"(value text) BASE text").unwrap();
+        if let Err(e) = c.execute("CREATE TYPE s AS STRUCT(f [a,b])") {
+            failed.push(format!("MED 3: CREATE TYPE s AS STRUCT(f [a,b]): {e}"));
+        }
+    }
+    // MED 4.
+    {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("cdc-rollback.db"), DatabaseOpts::new());
+        let c = db.connect().unwrap();
+        c.execute("CREATE TABLE t(x)").unwrap();
+        c.execute("PRAGMA capture_data_changes_conn('full,c1')").unwrap();
+        c.execute("BEGIN").unwrap();
+        c.execute("PRAGMA capture_data_changes_conn('full,c2')").unwrap();
+        c.execute("ROLLBACK").unwrap();
+        if let Err(e) = c.execute("INSERT INTO t VALUES (1)") {
+            failed.push(format!("MED 4: a write after BEGIN; switch to c2; ROLLBACK: {e}"));
+        }
+        match c.prepare("SELECT count(*) FROM c1 WHERE table_name = 't'").and_then(|mut s| s.run_collect_rows()) {
+            Ok(r) if r[0][0].to_string() == "1" => {}
+            other => failed.push(format!("MED 4: after the rolled-back switch, c1 holds {other:?} changes of t, want 1")),
+        }
+    }
+    assert!(failed.is_empty(), "CLAIM: quoted type names or a rolled-back CDC switch broke: {failed:#?}");
+}
