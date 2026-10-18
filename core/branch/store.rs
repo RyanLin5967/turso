@@ -469,6 +469,11 @@ pub(crate) struct Group {
 /// `Group::upgrade_due` while the upgrade it named is being led.
 const UPGRADE_IN_AIR: u64 = u64::MAX;
 
+/// LEAP L3: the longest a leader holds for its cohort (review 1 #9's adaptive hold; the design's g =
+/// 50 µs, against a flush of milliseconds). Bounded, so a cohort estimated wrongly costs at most this
+/// per flight.
+const COHORT_GATHER: Duration = Duration::from_micros(50);
+
 /// The held frees, in bounds (`hold_bound()`), past which a freeing operation leads the owed
 /// upgrade itself (`Group::upgrade_overdue`).
 const UPGRADE_HARD_CAP: usize = 4;
@@ -527,6 +532,17 @@ pub(crate) const HOLD_COMPACT_INSTALLED: u8 = 20;
 struct GroupState {
     /// A flight is being written.
     flushing: bool,
+    /// LEAP L3, the cohort gather (review 1 #9): a leader is holding, off every lock, for the cohort
+    /// the last flight acknowledged to buffer again before it takes the next flight. Waiters treat it
+    /// as a flight in the air, so the gather has one leader (a trunk commit's ordered flight does
+    /// not wait for it).
+    gathering: bool,
+    /// The cohort the last flight carried: callers inside `wait_durable_on` when it was taken.
+    cohort: u64,
+    /// Observation only: gathers held, and those that ended at `COHORT_GATHER` before the cohort
+    /// was back.
+    gathers: u64,
+    gathers_expired: u64,
     /// `durable[c]`: every journal byte below this log sequence number is durable in class `c` or
     /// a stronger one (indexed `Off`, `Fsync`, `FullFsync`; `Off` means written to the OS).
     durable: [u64; 3],
@@ -6333,7 +6349,7 @@ impl BranchStore {
                     if group.poisoned() {
                         return Err(group_poisoned());
                     }
-                    let blocked = g.flushing || g.cutting || (gated && g.arena_syncing);
+                    let blocked = g.flushing || g.gathering || g.cutting || (gated && g.arena_syncing);
                     // An ordered flight carries these bytes and a trunk commit's WAL flush is
                     // about to make them durable (lead review 1 item 6): waited for, briefly,
                     // rather than led past with an upgrade flight, a second flusher.
@@ -6361,6 +6377,35 @@ impl BranchStore {
                     }
                     first = false;
                     g = group.wait(g);
+                }
+                // LEAP L3, the cohort gather (review 1 #9): in a closed loop the callers a flight
+                // acknowledged are still making their next operation when it lands, so a leader that
+                // takes the buffer at once carries only the other half: two cohorts alternate, about
+                // C/2 per flush. The leader holds instead, holding no lock, until as many callers
+                // wait as the last flight carried, or for `COHORT_GATHER` at most. At C = 1 the
+                // cohort is the leader alone, so it never holds. Mutant `no_cohort_gather` (test
+                // builds only): no hold, as before.
+                let cohort = g.cohort;
+                if cohort > 1 && !fe_mutant("no_cohort_gather") && group.awaiting.load(Ordering::Acquire) < cohort {
+                    g.gathering = true;
+                    g.gathers += 1;
+                    drop(g);
+                    let until = Instant::now() + COHORT_GATHER;
+                    let mut back = false;
+                    while Instant::now() < until {
+                        if group.awaiting.load(Ordering::Acquire) >= cohort {
+                            back = true;
+                            break;
+                        }
+                        crate::thread::yield_now();
+                    }
+                    let mut g = group.lock();
+                    g.gathering = false;
+                    if !back {
+                        g.gathers_expired += 1;
+                    }
+                    // The waiters the gather held lead or wait again.
+                    group.cv.notify_all();
                 }
             }
             first = false;
@@ -6400,6 +6445,8 @@ impl BranchStore {
                     Ok(Some(flight)) if !flight.is_empty() => {
                         g.flushing = true;
                         g.flights += 1;
+                        // The cohort this flight carries, for the next leader's gather.
+                        g.cohort = group.awaiting.load(Ordering::Acquire);
                         if upgrade && flight.len() == 0 {
                             g.upgrades += 1;
                         }
@@ -6784,6 +6831,13 @@ impl BranchStore {
     pub(crate) fn group_counters(&self) -> [u64; 5] {
         let g = self.group.lock();
         [g.flights, g.locked_flushes, g.waits, g.already_durable, g.upgrades]
+    }
+
+    /// LEAP L3's cohort gather, observation only: gathers held, and those that ended at
+    /// `COHORT_GATHER` before the cohort was back.
+    pub(crate) fn gather_counters(&self) -> [u64; 2] {
+        let g = self.group.lock();
+        [g.gathers, g.gathers_expired]
     }
 
     /// Grant or extend `id`'s lease to `ttl` past the lease clock's now. A deadline only moves

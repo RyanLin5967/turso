@@ -769,6 +769,7 @@ fn shared(cell: &str, db: &Arc<Database>, c: u64, out: &mut String) {
         let go = std::sync::atomic::AtomicBool::new(false);
         let e0 = exceptions(db);
         let s0 = sync_counts();
+        let gathers0 = db.branches.gather_counters();
         // Per client, from its start to its last acknowledgement: the store's condition-variable
         // waits (`store::thread_waits`, one per wait call, so a futile wake-up that waits again
         // counts again), and the most any one acknowledgement waited (review 2 H5: a sum is a mean,
@@ -867,9 +868,13 @@ fn shared(cell: &str, db: &Arc<Database>, c: u64, out: &mut String) {
         });
         let s1 = sync_counts();
         let e1 = exceptions(db);
+        let gathers1 = db.branches.gather_counters();
         let mut m = Sample::new();
         put_exceptions(&mut m, e0, e1);
         m.insert("threads", c);
+        // LEAP L3, observation only: the cohort gathers the leaders held, and those that expired.
+        m.insert("gathers", gathers1[0] - gathers0[0]);
+        m.insert("gathers_expired", gathers1[1] - gathers0[1]);
         m.insert("acks", c * rounds * if cfw { 2 } else { 1 });
         m.insert("full_fsync", s1.full_fsync - s0.full_fsync);
         m.insert("fsync", s1.fsync - s0.fsync);
