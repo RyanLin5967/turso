@@ -15717,3 +15717,34 @@ fn no_create_allocates_a_table_chunk_or_segment_under_the_mutex_across_a_segment
     assert!(live >= 72_000, "premise: the table grew past one 65,536-id segment ({live} live)");
     assert!(worst <= 8 << 10, "CLAIM: no create allocated more than 8 KiB under the store mutex across a segment; one allocated {worst}");
 }
+
+/// LEAP L1, ASYNC-DESIGN T11 (ASYNC-5), a failed flight loses async creates visibly: async creates
+/// acknowledged while the flusher is held, then its flight fails (GroupFlightFails). The lost name
+/// is gone from `branch_ids` and `branch_named`; `connect_named` refuses it; the next async create
+/// is refused (the store is fail-stopped). At the stub the failpoint fails the create's own flight,
+/// so the create itself returns the error instead of being acknowledged: red by the first claim.
+#[test]
+fn a_failed_flight_loses_async_creates_visibly() {
+    let _s = serial();
+    let class = if cfg!(target_vendor = "apple") { SyncClass::FullFsync } else { SyncClass::Fsync };
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("t11.db"), opts(true, class));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    trunk.create_branch_async("warm").unwrap();
+    let held = db.branch_flusher_hold(true);
+    db.branch_failpoint(Some(BranchFailpoint::GroupFlightFails));
+    let acked = trunk.create_branch_async("doomed");
+    assert!(acked.is_ok(), "CLAIM: the async create was acknowledged before its flight: {:?}", acked.as_ref().err());
+    let id = acked.unwrap().id;
+    db.branch_flusher_hold(false);
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < until && db.branch_ids().map(|ids| ids.contains(&id)).unwrap_or(false) {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(!db.branch_ids().unwrap_or_default().contains(&id), "CLAIM: the lost create left branch_ids");
+    assert!(db.branch_named("doomed").ok().flatten().is_none(), "CLAIM: the lost name is not found");
+    assert!(db.connect_named("doomed").is_err(), "CLAIM: connect_named refuses the lost create");
+    assert!(trunk.create_branch_async("next").is_err(), "CLAIM: the next async create is refused");
+    assert!(held, "premise: the flusher was held");
+}

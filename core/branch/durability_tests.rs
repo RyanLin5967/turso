@@ -3347,3 +3347,30 @@ fn an_async_create_is_durable_at_its_branchs_first_write() {
         assert_eq!(value(&c, 7).as_deref(), Some("t6-write"), "CLAIM: the crash image holds the first write");
     }
 }
+
+/// LEAP L1, ASYNC-DESIGN T17 arm (a), G5 (an id lost in a crash is never reissued): with the
+/// flusher held, an async create k, then a crash image; the reopened store gives a new create an id
+/// above k, and `branch_status(k)` reads LostInCrash. At the stub k is durable when acknowledged,
+/// so it survives the crash and reads Durable: red by the status claim.
+#[test]
+fn an_id_lost_in_a_crash_is_never_reissued() {
+    let class = if cfg!(target_vendor = "apple") { crate::branch::SyncClass::FullFsync } else { crate::branch::SyncClass::Fsync };
+    let opts = || DatabaseOpts::new().with_branch_durability(BranchDurability::Catalog { sync: class });
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("t17.db");
+    let db = open_at(&path, opts()).unwrap();
+    let trunk = db.connect().unwrap();
+    seed(&trunk, 5);
+    trunk.create_branch_async("warm").unwrap();
+    let held = db.branch_flusher_hold(true);
+    let k = trunk.create_branch_async("lost").unwrap().id;
+    let image = crash_image(&path, dir.path());
+    db.branch_flusher_hold(false);
+    let crashed = open_at(&image, opts()).unwrap();
+    let t = crashed.connect().unwrap();
+    let next = t.create_branch_async("after").unwrap().id;
+    let status = crashed.branch_status(k).unwrap();
+    assert!(next.0 > k.0, "CLAIM: the id after the crash ({}) is above the lost one ({})", next.0, k.0);
+    assert_eq!(status, crate::branch::async_api::BranchStatus::LostInCrash, "CLAIM: the lost create reads LostInCrash");
+    assert!(held, "premise: the flusher was held");
+}
