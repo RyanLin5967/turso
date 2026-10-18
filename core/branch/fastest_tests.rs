@@ -15279,6 +15279,56 @@ fn adv_probe_add_column_check_on_existing_rows() {
     println!("ADV7 update same row: {:?}", c.execute("UPDATE a SET x = 2"));
 }
 
+/// M1 (queue a-f review): ADD COLUMN verifies its new CHECK against every existing row, the row
+/// read as it reads after the change (stored columns plus the new column's DEFAULT, else NULL).
+/// Each expectation is SQLite 3.53.1's answer to the same statements (Python's sqlite3 on UW host
+/// ecetesla1, uwrun engine-m1-sqlite, raw banked in artie engine raw/uw-m1-sqlite-3531.txt), not
+/// the engine's. A refused ADD COLUMN leaves the table as it was.
+#[test]
+fn add_column_checks_its_new_check_against_every_existing_row() {
+    let _g = serial();
+    let mut failed: Vec<String> = Vec::new();
+    let cases: [(&str, &[&str], &str, bool); 7] = [
+        ("no DEFAULT, c IS NOT NULL", &["CREATE TABLE a(x)", "INSERT INTO a VALUES (1)"], "ALTER TABLE a ADD COLUMN c INTEGER CHECK (c IS NOT NULL)", false),
+        ("DEFAULT NULL, c IS NOT NULL", &["CREATE TABLE a(x)", "INSERT INTO a VALUES (1)"], "ALTER TABLE a ADD COLUMN c INTEGER DEFAULT NULL CHECK (c IS NOT NULL)", false),
+        ("no DEFAULT, c > 0 (NULL passes)", &["CREATE TABLE a(x)", "INSERT INTO a VALUES (1)"], "ALTER TABLE a ADD COLUMN c INTEGER CHECK (c > 0)", true),
+        ("a CHECK naming another column, the row fails it", &["CREATE TABLE a(x)", "INSERT INTO a VALUES (-1)"], "ALTER TABLE a ADD COLUMN c INTEGER CHECK (x > 0 OR c IS NOT NULL)", false),
+        ("a CHECK naming another column, the row passes it", &["CREATE TABLE a(x)", "INSERT INTO a VALUES (5)"], "ALTER TABLE a ADD COLUMN c INTEGER CHECK (x > 0 OR c IS NOT NULL)", true),
+        ("DEFAULT 0, c > 0", &["CREATE TABLE a(x)", "INSERT INTO a VALUES (1)"], "ALTER TABLE a ADD COLUMN c INTEGER DEFAULT 0 CHECK (c > 0)", false),
+        ("an empty table, c IS NOT NULL", &["CREATE TABLE a(x)"], "ALTER TABLE a ADD COLUMN c INTEGER CHECK (c IS NOT NULL)", true),
+    ];
+    for (case, setup, alter, sqlite_accepts) in cases {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("addcol-check.db"), DatabaseOpts::new());
+        let c = db.connect().unwrap();
+        for sql in setup {
+            c.execute(*sql).unwrap();
+        }
+        let before = adv_rows(&c, "SELECT * FROM a");
+        let r = c.execute(alter);
+        if r.is_ok() != sqlite_accepts {
+            failed.push(format!("{case}: `{alter}` gave {r:?}; SQLite 3.53.1 {}", if sqlite_accepts { "accepts it" } else { "refuses it: CHECK constraint failed" }));
+            continue;
+        }
+        let cols = adv_rows(&c, "SELECT count(*) FROM pragma_table_info('a')");
+        let want_cols = if sqlite_accepts { "2" } else { "1" };
+        if cols.as_ref().ok().map(|r| r[0][0].as_str()) != Some(want_cols) {
+            failed.push(format!("{case}: a has {cols:?} columns after `{alter}`, want {want_cols}"));
+        }
+        if !sqlite_accepts {
+            let after = adv_rows(&c, "SELECT * FROM a");
+            if after.as_ref().ok() != before.as_ref().ok() {
+                failed.push(format!("{case}: the refused ADD COLUMN changed the rows: {before:?} -> {after:?}"));
+            }
+            match adv_rows(&c, "PRAGMA integrity_check") {
+                Ok(r) if r.len() == 1 && r[0][0] == "ok" => {}
+                other => failed.push(format!("{case}: integrity_check after the refusal: {other:?}")),
+            }
+        }
+    }
+    assert!(failed.is_empty(), "CLAIM: ADD COLUMN answers as SQLite does over existing rows: {failed:#?}");
+}
+
 /// ADV-8: a custom type named with each quote form survives a reopen as ONE type: a STRICT column
 /// declared with any spelling of it reads back, and DROP TYPE is refused while the column uses it.
 #[test]
