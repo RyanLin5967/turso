@@ -1786,15 +1786,7 @@ fn run_instruments(cell: &str) -> String {
                 std::thread::spawn(move || {
                     let mut me = 0u64;
                     // SAFETY: this thread's own id into a local.
-                    #[cfg(target_vendor = "apple")]
                     unsafe { libc::pthread_threadid_np(0, &mut me) };
-                    // Linux has no pthread_threadid_np: the kernel thread id, so the suite compiles
-                    // there (iccad5, 2026-10-18: turso_core's lib tests did not build on Linux).
-                    #[cfg(not(target_vendor = "apple"))]
-                    {
-                        // SAFETY: gettid has no preconditions.
-                        me = unsafe { libc::gettid() } as u64;
-                    }
                     ids.lock().unwrap().push(me);
                     while !roles.load(Acquire) {
                         std::thread::park_timeout(std::time::Duration::from_millis(1));
