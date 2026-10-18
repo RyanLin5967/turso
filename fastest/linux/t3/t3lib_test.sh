@@ -522,7 +522,7 @@ chmod +x "$T/sudo/denied" "$T/sudo/notin"
 check "u4 host: sudo_state reads a sudo that refuses this user (ecetesla3's text) as 'denied'" \
   '[ "$(T3_SUDO_BIN=$T/sudo/denied sudo_state)" = denied ]'
 check "u4 host: sudo_state reads 'not in the sudoers file' as 'denied'" '[ "$(T3_SUDO_BIN=$T/sudo/notin sudo_state)" = denied ]'
-check "u4 host: root_check counts a root case N/A-on-noroot under a denying sudo, and runs nothing" \
+check "u4 host: root_check counts a root case as a no-root N/A under a denying sudo, and runs nothing" \
   '( T3_SUDO_BIN=$T/sudo/denied; na=0; root_check "probe" "touch $T/sudo/ran" > "$T/sudo/rc.out"; [ $na = 1 ] && [ ! -e "$T/sudo/ran" ] && grep -q "N/A-on-noroot: probe" "$T/sudo/rc.out" )'
 
 echo "TALLY ran=$((pass + fail)) pass=$pass na=${na:-0} fail=$fail"  # gates/tally.py
