@@ -370,6 +370,49 @@ static SESSIONS_BY_CONNECTION: std::sync::LazyLock<
     parking_lot::Mutex<std::collections::HashMap<usize, std::sync::Weak<PgConnectionInner>>>,
 > = std::sync::LazyLock::new(Default::default);
 
+/// The schemas the session's open block dropped, whose DETACH waits for its COMMIT: until then
+/// each is gone for the session's statements ([`refuse_dropped_schemas`], pg_namespace) and can
+/// be created again (wire-rev-uw2 N4).
+pub(crate) fn schemas_dropped_in_block(pg_conn: &PgConnectionInner) -> Vec<String> {
+    pg_conn.dropped_schemas.lock().iter().map(|(name, _)| name.clone()).collect()
+}
+
+/// 3F000 'schema "s" does not exist' for a statement that names a relation in a schema this
+/// session's open block dropped (wire-rev-uw2 N4: CREATE TABLE s.u ran, and the COMMIT then
+/// deleted s.u with s's file; PG 18.6 answers 3F000, r5-pg.txt m2c). Free while no schema was
+/// dropped in the block.
+fn refuse_dropped_schemas(pg_conn: &PgConnectionInner, parse: &turso_pg_parser::pg_query::ParseResult) -> Result<()> {
+    use turso_pg_parser::pg_query::protobuf::node::Node;
+    let dropped = {
+        let dropped = pg_conn.dropped_schemas.lock();
+        if dropped.is_empty() {
+            return Ok(());
+        }
+        dropped.iter().map(|(name, _)| name.clone()).collect::<Vec<_>>()
+    };
+    let mut schemas: Vec<String> = turso_pg_parser::translator::named_relations(parse)
+        .into_iter()
+        .filter_map(|(schema, _)| schema)
+        .collect();
+    // CREATE TABLE's own relation is not on pg_query's walk.
+    for raw in &parse.protobuf.stmts {
+        if let Some(Node::CreateStmt(create)) = raw.stmt.as_ref().and_then(|s| s.node.as_ref()) {
+            if let Some(rel) = &create.relation {
+                if !rel.schemaname.is_empty() {
+                    schemas.push(rel.schemaname.clone());
+                }
+            }
+        }
+    }
+    match schemas.iter().find(|s| dropped.contains(s)) {
+        Some(schema) => Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
+            SqlErrorKind::InvalidSchemaName,
+            format!("schema \"{schema}\" does not exist"),
+        ))),
+        None => Ok(()),
+    }
+}
+
 /// The session of the engine connection `conn`, if one is alive.
 pub(crate) fn session_of(conn: &Arc<Connection>) -> Option<Arc<PgConnectionInner>> {
     SESSIONS_BY_CONNECTION
@@ -1393,6 +1436,7 @@ fn prepare_statement_parsed(
     // Inside a block, the relations this statement names are held to the block's end, as
     // PostgreSQL's parse analysis locks them: the server takes them for its cross-session DROP
     // wait (lead ruling 2026-10-18, pg18-rev-bl3.out #19), from this parse, never a second one.
+    refuse_dropped_schemas(pg_conn, &parse_result)?;
     if !pg_conn.conn.get_auto_commit() {
         let relations = turso_pg_parser::translator::named_relations(&parse_result);
         if !relations.is_empty() {
@@ -1750,7 +1794,7 @@ fn try_prepare_special(
         Special::Show(show_stmt) => handle_pg_show(pg_conn, &show_stmt)?,
         Special::CreateSchema(stmt) => {
             refuse_schema_ddl(pg_conn, &stmt.name)?;
-            handle_pg_create_schema(&pg_conn.conn, &stmt)?;
+            handle_pg_create_schema(pg_conn, &stmt)?;
             noop_statement(&pg_conn.conn)?
         }
         Special::DropSchema(stmt) => {
@@ -2669,10 +2713,22 @@ fn handle_pg_show(pg_conn: &Arc<PgConnectionInner>, show: &PgShowStmt) -> Result
     )))
 }
 
-fn handle_pg_create_schema(conn: &Arc<Connection>, stmt: &PgCreateSchemaStmt) -> Result<()> {
+fn handle_pg_create_schema(pg_conn: &Arc<PgConnectionInner>, stmt: &PgCreateSchemaStmt) -> Result<()> {
+    let conn = &pg_conn.conn;
     // As libpg_query gives it: an unquoted name already lowercased, a quoted one as written
     // (review wire-quote LOW-4: a quoted name was lowercased here).
     let name = stmt.name.clone();
+    // A schema this block dropped is created again: its database stays attached, emptied by the
+    // drop (CASCADE dropped its tables, or it had none), and is no longer detached at the
+    // COMMIT; a ROLLBACK restores the old one with its tables, as in PostgreSQL (wire-rev-uw2 N4:
+    // this was 'already exists'; r5-pg.txt m2d).
+    {
+        let mut dropped = pg_conn.dropped_schemas.lock();
+        if let Some(at) = dropped.iter().position(|(n, _)| *n == name) {
+            dropped.remove(at);
+            return Ok(());
+        }
+    }
     if name == "public" {
         if stmt.if_not_exists {
             return Ok(());
@@ -2768,7 +2824,8 @@ fn handle_pg_drop_schema(pg_conn: &Arc<PgConnectionInner>, stmt: &PgDropSchemaSt
         if found.contains(&name.as_str()) {
             continue;
         }
-        if name == "public" || schema_exists(conn, name)? {
+        let dropped_here = pg_conn.dropped_schemas.lock().iter().any(|(n, _)| n == name);
+        if name == "public" || (!dropped_here && schema_exists(conn, name)?) {
             found.push(name.as_str());
         } else if stmt.if_exists {
             // PostgreSQL's notice for the missing schema (recorded, pg18-c53-dropnotice.out).

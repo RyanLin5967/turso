@@ -1030,10 +1030,18 @@ impl PgNamespaceCursor {
             ],
         ];
 
-        // Add attached schemas (CREATE SCHEMA creates attached databases)
+        // Add attached schemas (CREATE SCHEMA creates attached databases), but one this
+        // session's open block dropped: its DETACH waits for the COMMIT, and PostgreSQL no
+        // longer lists it (wire-rev-uw2 N4; r5-pg.txt m2c).
         let schema_names = self.conn.attached_database_names();
+        let dropped = crate::session::session_of(&self.conn)
+            .map(|pg_conn| crate::session::schemas_dropped_in_block(&pg_conn))
+            .unwrap_or_default();
         let mut oid = 16384i64;
         for name in schema_names {
+            if dropped.contains(&name) {
+                continue;
+            }
             self.rows.push(vec![
                 Value::from_i64(oid),
                 Value::build_text(name),
