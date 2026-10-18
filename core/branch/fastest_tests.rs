@@ -13987,3 +13987,44 @@ fn the_public_checkpoint_hold_holds_one_flight_and_a_bounded_checkpoint_ends_bus
     assert!(unheld.is_ok(), "CLAIM (positive control): released, a bounded CHECKPOINT failed: {unheld:?}");
     assert!(db.branches.log_len_for_test() < log0, "CLAIM (positive control): the bounded CHECKPOINT compacted nothing (log {log0} -> {})", db.branches.log_len_for_test());
 }
+
+/// engine-rev-quote42 H1 and H2 (lead order c): names that carry a double quote, end to end.
+/// - H1: a table-valued pragma's argument went into `PRAGMA name="arg"` unescaped (pragma.rs), so
+///   `pragma_table_info('a"b')` was a parse error while a caller's own `'a""b'` worked.
+/// - H2: `PRAGMA capture_data_changes_conn('full,my"cdc')` failed at 9a58832f5: the capture table's
+///   AUTOINCREMENT sequence backing table was created by `CREATE TABLE "<prefix>my"cdc"(...)`
+///   (sequence.rs, lexer error at offset 69 = 14 + the 52-byte prefix + 2 + 1; probe
+///   engine-probe-q42-1 on ecetesla2).
+/// Each case runs and every failure is listed.
+#[test]
+fn names_with_a_double_quote_work_in_pragma_functions_and_cdc_tables() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("quote42.db"), DatabaseOpts::new());
+    let c = db.connect().unwrap();
+    let mut failed: Vec<String> = Vec::new();
+    let rows = |sql: &str| c.prepare(sql).and_then(|mut s| s.run_collect_rows());
+    c.execute("CREATE TABLE \"a\"\"b\"(x INTEGER, y TEXT)").unwrap();
+    match rows("SELECT name FROM pragma_table_info('a\"b')") {
+        Ok(r) if r.iter().map(|row| row[0].to_string()).collect::<Vec<_>>() == ["x", "y"] => {}
+        other => failed.push(format!("H1: pragma_table_info('a\"b') = {other:?}, want the columns x, y")),
+    }
+    // A name with a quote and text after it must name a (missing) table, not end the PRAGMA.
+    match rows("SELECT name FROM pragma_table_info('a\" OR 1')") {
+        Ok(r) if r.is_empty() => {}
+        other => failed.push(format!("H1: pragma_table_info('a\" OR 1') = {other:?}, want no rows")),
+    }
+    c.execute("CREATE TABLE t(x)").unwrap();
+    match c.execute("PRAGMA capture_data_changes_conn('full,my\"cdc')") {
+        Err(e) => failed.push(format!("H2: PRAGMA capture_data_changes_conn('full,my\"cdc'): {e}")),
+        Ok(()) => {
+            if let Err(e) = c.execute("INSERT INTO t VALUES (1)") {
+                failed.push(format!("H2: INSERT under capture into my\"cdc: {e}"));
+            }
+            match rows("SELECT count(*) FROM \"my\"\"cdc\" WHERE table_name = 't'") {
+                Ok(r) if r.len() == 1 && r[0][0].to_string() == "1" => {}
+                other => failed.push(format!("H2: the capture table my\"cdc holds {other:?}, want one change of t")),
+            }
+        }
+    }
+    assert!(failed.is_empty(), "CLAIM: a name with a double quote broke engine-built SQL: {failed:#?}");
+}
