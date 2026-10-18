@@ -3,7 +3,7 @@ name: fastest-competitors
 # file_copy_method=clone and STRATEGY=WAL_LOG at D2 = pg18-d2, amendment 14, plus the clone proof's copy control
 # pg18-create-copy; pg18-defaults is DROPPED on Linux by the lead's ruling, artie DECISIONS 6b0bef481b: on Linux it
 # configures the same server as pg18-d2, and PREREG-CORE v2's OUT list excludes PG18 at its defaults),
-# Dolt and Doltgres at the registered versions of versions.tsv (2.4.1, 1.4.0: release binaries, sha256-checked, telemetry off; amendment 14
+# Dolt and Doltgres at the registered versions of versions.tsv (2.5.0, 1.4.0: release binaries, sha256-checked, telemetry off; amendment 14
 # variants (a), (b), (c)), and the B1 file-copy baseline (FICLONE of a stock-SQLite db + fsync(clone) + fsync(dir),
 # and its D0 no-flush row) -- on ubuntu x86_64 and arm64, each on XFS and btrfs loop filesystems.
 # Every job records its hardware (fastest/linux/hw/record.sh) and fire-checks the flush counter before using it.

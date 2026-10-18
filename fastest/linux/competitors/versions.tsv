@@ -15,7 +15,8 @@ postgresql	18.6	any	pgdg_package	18.6-1.pgdg24.04+2
 # binary_sha256: the sha256 of the binary each job runs, as run 37841577896 recorded it on both arches (every job of
 # an arch alike; run/version.txt line 2; LOW 19): run_system.sh refuses a server binary that differs before it starts.
 # Dolt 2.5.0's binary rows are the sha256 of bin/dolt extracted from those tarballs (sha256sum on iccad9, 2026-10-18),
-# not yet re-recorded by a run's version.txt; the first run on 2.5.0 must read the same
+# and the first runs on 2.5.0 read the same amd64 binary sha256 (comp's fetch_dolt.sh records, artie 9418d387c7 and
+# 9893aff260; comp-rev-dolt250, artie 50790f7018). The arm64 row is not yet re-recorded by a run.
 dolt	2.5.0	amd64	binary_sha256	a499444dc13400b9b8119a986ac3c749278f8b0f574c3ca6d72279eafe5d39a2
 dolt	2.5.0	arm64	binary_sha256	708add03b3803b8bdfd68ace5c1b554dff8bfae685e26d38790881075206f4b5
 doltgres	1.4.0	amd64	binary_sha256	76f8107630dfc7dddf51862ece428aa6a7a2818842ac2f449ecfcd10eddab21c
