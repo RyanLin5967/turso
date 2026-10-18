@@ -53,6 +53,14 @@ pub(crate) struct PgConnectionInner {
     /// NOTICE such as DROP ... IF EXISTS's for a missing object), which the server sends before
     /// the statement's result ([`PgConnection::take_warnings`]).
     warnings: parking_lot::Mutex<Vec<(&'static str, SqlErrorKind, String)>>,
+    /// The branch server's sessions ([`PgConnection::new_server`]): no schema but public may be
+    /// created or dropped (its branches cover the one schema), decided here from the parsed
+    /// statement (review wire-quote MED-3's class: the server read it from the client's text, and
+    /// a leading comment hid it).
+    public_schema_only: bool,
+    /// The files of the schemas this session dropped inside its open block, deleted when the
+    /// block commits and forgotten when it rolls back (review wire-quote MED-3).
+    dropped_schema_files: parking_lot::Mutex<Vec<String>>,
 }
 
 /// The source of [`PgConnectionInner::search_path_stamp`]'s values.
@@ -364,6 +372,16 @@ impl Drop for PgConnectionInner {
 
 impl PgConnection {
     pub fn new(conn: Arc<Connection>) -> Self {
+        Self::open(conn, false)
+    }
+
+    /// A branch server session: as [`PgConnection::new`], except that CREATE SCHEMA and DROP
+    /// SCHEMA of any schema but public are refused (0A000), by the statement's kind.
+    pub fn new_server(conn: Arc<Connection>) -> Self {
+        Self::open(conn, true)
+    }
+
+    fn open(conn: Arc<Connection>, public_schema_only: bool) -> Self {
         aliases::install(&conn);
         // PostgreSQL enforces every foreign key; the engine only under PRAGMA foreign_keys.
         conn.set_foreign_keys_enabled(true);
@@ -378,6 +396,8 @@ impl PgConnection {
                 min_messages: std::sync::atomic::AtomicU8::new(7),
                 search_path_stamp: std::sync::atomic::AtomicU64::new(0),
                 warnings: parking_lot::Mutex::new(Vec::new()),
+                public_schema_only,
+                dropped_schema_files: parking_lot::Mutex::new(Vec::new()),
             }),
         };
         SESSIONS_BY_CONNECTION
@@ -614,6 +634,10 @@ impl PgConnection {
         let gucs = &mut state.gucs;
         match event {
             TxEvent::Ended { committed } => {
+                let dropped = std::mem::take(&mut *self.inner.dropped_schema_files.lock());
+                if committed {
+                    dropped.iter().for_each(|path| remove_schema_file(path));
+                }
                 if let (false, Some(start)) = (committed, gucs.block_start.take()) {
                     gucs.session = start;
                 }
@@ -1509,10 +1533,12 @@ fn try_prepare_special(
         Special::Set(set_stmt) => handle_pg_set(pg_conn, &set_stmt)?,
         Special::Show(show_stmt) => handle_pg_show(pg_conn, &show_stmt)?,
         Special::CreateSchema(stmt) => {
+            refuse_schema_ddl(pg_conn, &stmt.name)?;
             handle_pg_create_schema(&pg_conn.conn, &stmt)?;
             noop_statement(&pg_conn.conn)?
         }
         Special::DropSchema(stmt) => {
+            refuse_schema_ddl(pg_conn, &stmt.name)?;
             handle_pg_drop_schema(pg_conn, &stmt)?;
             noop_statement(&pg_conn.conn)?
         }
@@ -2493,6 +2519,42 @@ fn handle_pg_drop_schema(pg_conn: &Arc<PgConnectionInner>, stmt: &PgDropSchemaSt
     }
 
     execute_sqlite_internal(conn, catalog::sqlite_text(format!("DETACH {}", catalog::quote_ident(&name))))?;
+    // The file of the schema resolved and detached, never one read from the client's text; at
+    // once outside a block, at the block's COMMIT inside one ([`PgConnection::tx_event`]).
+    // An in-memory main database's schemas have no file of their own here.
+    let path = schema_file_path(conn, &name);
+    if conn.db_file_path() == ":memory:" {
+    } else if conn.get_auto_commit() {
+        remove_schema_file(&path);
+    } else {
+        pg_conn.dropped_schema_files.lock().push(path);
+    }
+    Ok(())
+}
+
+/// A dropped schema's database file and its WAL and SHM files. A file already gone is no error.
+fn remove_schema_file(path: &str) {
+    for suffix in ["", "-wal", "-shm"] {
+        let file = format!("{path}{suffix}");
+        if let Err(e) = std::fs::remove_file(&file) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!("failed to delete the dropped schema's file {file}: {e}");
+            }
+        }
+    }
+}
+
+/// The branch server's refusal of schema DDL ([`PgConnection::new_server`]): any schema but
+/// public, as the parsed statement names it.
+fn refuse_schema_ddl(pg_conn: &Arc<PgConnectionInner>, name: &str) -> Result<()> {
+    if pg_conn.public_schema_only && !name.eq_ignore_ascii_case("public") {
+        return Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
+            SqlErrorKind::FeatureNotSupported,
+            "schemas other than public are not supported by the branch server: its branches cover \
+             the one schema (CREATE SCHEMA and DROP SCHEMA are refused)"
+                .to_string(),
+        )));
+    }
     Ok(())
 }
 

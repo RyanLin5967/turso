@@ -1600,7 +1600,7 @@ impl Session {
     }
 
     fn open_trunk(&self) -> SqlResult<PgConnection> {
-        let conn = PgConnection::new(self.shared.db.connect().map_err(|e| engine_info(&e))?);
+        let conn = PgConnection::new_server(self.shared.db.connect().map_err(|e| engine_info(&e))?);
         self.arm(conn.inner());
         attach_schema_files(&conn, &self.shared.db_file);
         Ok(conn)
@@ -1727,7 +1727,7 @@ impl Session {
                 ));
             }
         };
-        let conn = PgConnection::new(conn);
+        let conn = PgConnection::new_server(conn);
         self.arm(conn.inner());
         self.state().branch = Some((branch.into(), conn));
         Ok(())
@@ -2192,14 +2192,6 @@ impl Session {
                  new one"
                     .to_string(),
             )),
-            None if schema_ddl(sql).is_some_and(|name| !name.eq_ignore_ascii_case("public")) => {
-                Err(error(
-                    SqlErrorKind::FeatureNotSupported,
-                    "schemas other than public are not supported by the branch server: its \
-                     branches cover the one schema (CREATE SCHEMA and DROP SCHEMA are refused)"
-                        .to_string(),
-                ))
-            }
             None => {
                 drop(st);
                 let r = self.engine_statement(&conn, sql, verb, portal, format);
@@ -2577,7 +2569,6 @@ impl Session {
                 .prepare_typed(sql)
                 .map_err(|e| unprepared(engine_info(&e)))?,
         };
-        self.shared.cleanup_dropped_schema_file(sql);
         // A statement that ends the transaction, as the translator read it, is never stepped
         // again, whatever the verb reader made of its text (wire review 13 item 1).
         if types.commits || types.rolls_back {
@@ -2772,7 +2763,7 @@ impl Session {
                         let opened = self
                             .waiting(|| self.shared.db.connect_named(&name))
                             .map_err(|e| self.switch_error(&name, &e, "ERROR"))?;
-                        let next = PgConnection::new(opened);
+                        let next = PgConnection::new_server(opened);
                         self.arm(next.inner());
                         next.adopt_session_of(conn);
                         st.branch = Some((name.as_ref().into(), next));
@@ -2797,7 +2788,7 @@ impl Session {
                             return Err(self.switch_error(&name, &e, "ERROR"));
                         }
                     };
-                    let next = PgConnection::new(opened);
+                    let next = PgConnection::new_server(opened);
                     self.arm(next.inner());
                     next.adopt_session_of(conn);
                     st.branch.replace((name.as_ref().into(), next))
@@ -2931,57 +2922,6 @@ impl Drop for Session {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&self.key);
-    }
-}
-
-impl Shared {
-    /// After a DROP SCHEMA query succeeds, delete the schema's database file.
-    /// Uses simple string matching to detect DROP SCHEMA statements.
-    fn cleanup_dropped_schema_file(&self, query: &str) {
-        if self.db_file == ":memory:" {
-            return;
-        }
-        // Simple detection: look for DROP SCHEMA pattern. Every other statement is turned away
-        // before the lowered copy, so a write pays no allocation here (L5).
-        let head = query.trim_start().as_bytes();
-        if head.len() < 4 || !head[..4].eq_ignore_ascii_case(b"drop") {
-            return;
-        }
-        let trimmed = query.trim().to_lowercase();
-        if !trimmed.starts_with("drop schema") {
-            return;
-        }
-        // Extract schema name: "drop schema [if exists] <name> [cascade|restrict]"
-        let rest = trimmed.strip_prefix("drop schema").unwrap().trim();
-        let rest = rest
-            .strip_prefix("if exists")
-            .map(|s| s.trim())
-            .unwrap_or(rest);
-        // Take the first word as the schema name
-        let name = rest
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .trim_matches('"');
-        if name.is_empty() || name == "public" {
-            return;
-        }
-        let parent = std::path::Path::new(&self.db_file)
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."));
-        let schema_file = parent.join(format!("turso-postgres-schema-{name}.db"));
-        if schema_file.exists() {
-            if let Err(e) = std::fs::remove_file(&schema_file) {
-                tracing::warn!("Failed to delete schema file {:?}: {}", schema_file, e);
-            } else {
-                tracing::info!("Deleted schema file {:?}", schema_file);
-            }
-            // Also clean up WAL and SHM files
-            let wal = schema_file.with_extension("db-wal");
-            let shm = schema_file.with_extension("db-shm");
-            let _ = std::fs::remove_file(wal);
-            let _ = std::fs::remove_file(shm);
-        }
     }
 }
 
@@ -3325,31 +3265,6 @@ fn commit_failed(conn: &PgConnection, mut info: Box<ErrorInfo>) -> Box<ErrorInfo
         );
     }
     info
-}
-
-/// The schema a CREATE SCHEMA or DROP SCHEMA names (`[IF [NOT] EXISTS] name`, quotes dropped), if
-/// `sql` is one. In server mode only public passes (wire review 1 item 16): each session attaches
-/// the schema files that exist when it opens, so a schema created or dropped while others run
-/// leaves sessions that disagree about it, and a branch would not cover it.
-fn schema_ddl(sql: &str) -> Option<&str> {
-    let mut words = sql
-        .split(|c: char| c.is_ascii_whitespace() || c == ';')
-        .filter(|w| !w.is_empty());
-    let verb = words.next()?;
-    if !(verb.eq_ignore_ascii_case("CREATE") || verb.eq_ignore_ascii_case("DROP")) {
-        return None;
-    }
-    if !words.next()?.eq_ignore_ascii_case("SCHEMA") {
-        return None;
-    }
-    let mut name = words.next()?;
-    while ["IF", "NOT", "EXISTS"]
-        .iter()
-        .any(|k| name.eq_ignore_ascii_case(k))
-    {
-        name = words.next()?;
-    }
-    Some(name.trim_matches('"'))
 }
 
 /// Whether `sql` is CHECKPOINT alone, which the server runs itself ([`Session::checkpoint`]), read
@@ -7003,6 +6918,23 @@ mod tests {
         }
         violations.sort();
         assert!(violations.is_empty(), "SQLSTATE literals outside the table:\n{}", violations.join("\n"));
+    }
+
+    /// Review wire-quote MED-3's class: every server session refuses schema DDL by the statement's
+    /// kind (PgConnection::new_server), so the server's product code opens none with
+    /// PgConnection::new, which would let a schema be created or dropped on the server.
+    #[test]
+    fn every_server_session_is_a_server_session() {
+        let product = strip_test_modules(include_str!("lib.rs"));
+        let opened = product.matches("PgConnection::new_server(").count();
+        assert!(opened >= 4, "premise: the server opens its sessions in {opened} places");
+        let plain: Vec<usize> = product
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| l.contains("PgConnection::new(") && !l.trim_start().starts_with("//"))
+            .map(|(n, _)| n + 1)
+            .collect();
+        assert!(plain.is_empty(), "sessions opened with PgConnection::new at lines {plain:?}");
     }
 
     /// Review wire-quote HIGH-1: every engine name built from a libpg_query-sourced string goes
