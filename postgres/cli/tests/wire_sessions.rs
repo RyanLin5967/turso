@@ -15026,6 +15026,36 @@ fn an_index_access_method_other_than_btree_is_refused() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-uw2 LOW: USING "BTREE" built a btree and an unknown method was 0A000. PostgreSQL 18.6
+/// names an access method exactly, so a quoted "BTREE" and an unknown one are 42704 'access
+/// method "..." does not exist', and an unquoted BTREE is btree (recorded: pg18-rev-uw2-lows.out).
+#[test]
+fn an_access_method_that_does_not_exist_is_42704() {
+    let dir = Scratch::new("index-am-names");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE amx(x int, y int)").ok("amx");
+    let mut wrong = Vec::new();
+    for (sql, message) in [
+        ("CREATE INDEX amx_q ON amx USING \"BTREE\" (x)", "access method \"BTREE\" does not exist"),
+        ("CREATE INDEX amx_n ON amx USING nosuch (x)", "access method \"nosuch\" does not exist"),
+    ] {
+        let r = a.q(sql);
+        match &r.error {
+            Some(e) if e.code == "42704" && e.message == message => {}
+            other => wrong.push(format!("{sql}: want 42704 {message:?}, got {other:?} {:?}", r.tags)),
+        }
+    }
+    if let Some(e) = a.q("CREATE INDEX amx_u ON amx USING BTREE (x)").error {
+        wrong.push(format!("USING BTREE (unquoted): {} {}", e.code, e.message));
+    }
+    let r = a.q("SELECT indexname FROM pg_indexes WHERE tablename = 'amx' ORDER BY 1");
+    if r.rows != vec![vec![Some("amx_u".to_string())]] {
+        wrong.push(format!("indexes on amx: {:?} {:?}, want amx_u alone", r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-uw2 N5: a schema-qualified type was refused 42704 'type "public m" does not exist',
 /// its parts joined with a blank, so a pg_dump restore, which writes public.<type> for every enum
 /// and domain column, failed at its first such table. PostgreSQL 18.6 takes public.m and
