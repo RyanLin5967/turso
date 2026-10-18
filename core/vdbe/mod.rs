@@ -963,6 +963,8 @@ pub struct ProgramState {
     /// statement's pages, so a schema object it added (a table whose root page the rollback took
     /// back) must go too, or the next allocation hands that page to another table.
     schema_undo: Option<crate::connection::RollbackFrameInfo>,
+    /// Whether begin_statement opened an MVCC savepoint (the MVCC twin of `uses_subjournal`).
+    uses_mvcc_savepoint: bool,
     pub n_change: AtomicI64,
     pub n_total_change: AtomicI64,
 }
@@ -1033,6 +1035,7 @@ impl ProgramState {
             is_active_write: false,
             has_stmt_transaction: false,
             schema_undo: None,
+            uses_mvcc_savepoint: false,
             attached_savepoint_pagers: Vec::new(),
             n_change: AtomicI64::new(0),
             n_total_change: AtomicI64::new(0),
@@ -1185,6 +1188,7 @@ impl ProgramState {
         self.view_delta_state = ViewDeltaCommitState::NotStarted;
         self.auto_txn_cleanup = TxnCleanup::None;
         self.schema_undo = None;
+        self.uses_mvcc_savepoint = false;
         self.fk_immediate_violations_during_stmt
             .store(0, Ordering::SeqCst);
         self.fk_deferred_violations_when_stmt_started
@@ -1396,6 +1400,7 @@ impl ProgramState {
             if let Some(mv_store) = connection.mv_store().as_ref() {
                 if let Some(tx_id) = connection.get_mv_tx_id() {
                     mv_store.begin_savepoint(tx_id);
+                    self.uses_mvcc_savepoint = true;
                 }
             } else {
                 // Non-MVCC mode: use pager savepoints
@@ -1543,9 +1548,17 @@ impl ProgramState {
                     None
                 };
 
-                // The pagers rolled this statement's pages back, so its in-memory schema changes go.
+                // The pagers rolled this statement's pages back, so its in-memory schema changes go:
+                // only when a savepoint was rolled back and the rollback succeeded (adversary of
+                // 5650219c0, LOWs 4 and 5: in autocommit nothing is rolled back here, and a
+                // transaction rollback restores the committed schema itself).
+                let rolled_back_pages = std::mem::take(&mut self.uses_mvcc_savepoint)
+                    || self.uses_subjournal
+                    || !attached_pagers.is_empty();
                 if let Some(undo) = self.schema_undo.take() {
-                    connection.restore_schema_snapshot(undo);
+                    if rolled_back_pages && pager_err.is_none() {
+                        connection.restore_schema_snapshot(undo);
+                    }
                 }
 
                 // Always restore FK violation counters on statement rollback,
@@ -1563,6 +1576,7 @@ impl ProgramState {
                 }
             }
         };
+        self.uses_mvcc_savepoint = false;
         if self.uses_subjournal {
             pager.stop_use_subjournal();
             self.uses_subjournal = false;

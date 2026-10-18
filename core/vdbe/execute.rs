@@ -14940,6 +14940,9 @@ pub fn op_init_cdc_version(
             }
         }
 
+        // The tables are created by NESTED statements, whose schema notes are their own: this
+        // statement keeps the snapshot its rollback restores (adversary of 5650219c0, HIGH 1).
+        state.note_schema_change(&conn, crate::MAIN_DB_ID);
         let stmt = prepare_cdc_internal(
             &conn,
             format!(

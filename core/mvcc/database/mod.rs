@@ -6628,7 +6628,16 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
 
         if let Some(connection) = connection {
+            // Or the transaction was marked as a schema change before its version moved (a DDL
+            // that failed between its ParseSchema or AddType and its SetCookie: adversary of
+            // 5650219c0, MED 3).
             if connection.schema.read().schema_version > connection.db.schema.lock().schema_version
+                || matches!(
+                    connection.get_tx_state(),
+                    crate::connection::TransactionState::Write {
+                        schema_did_change: true
+                    }
+                )
             {
                 // Connection made schema changes during tx and rolled back -> revert connection-local schema.
                 *connection.schema.write() = connection.db.clone_schema();

@@ -5637,6 +5637,9 @@ impl Connection {
             self.auto_commit.store(true, Ordering::SeqCst);
         }
         self.rollback_attached_wal_txns();
+        // The temp pager was rolled back with the attached ones; its in-memory schema goes back to
+        // the last committed one too (adversary of 5650219c0, HIGH 2: only COMMIT/ROLLBACK did it).
+        self.rollback_temp_schema();
         self.index_methods_on_transaction_rolled_back();
         self.set_tx_state(TransactionState::None);
         self.clear_tx_poison();
