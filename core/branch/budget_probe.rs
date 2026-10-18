@@ -1050,11 +1050,14 @@ pub(crate) fn end_owning(owned: &[&str]) -> Snapshot {
     // caller's own (the same checks, with a count of 0 that nothing reads), and names the foreign
     // threads; the syscall count stays None.
     // On Apple a missing count stays a refusal, as before: the rule replaces a count only where none exists.
-    let (threads_quiet, foreign) = if !cfg!(target_vendor = "apple") && syscalls.is_none() && WINDOW_N0.with(|n| n.get()).is_some() && n1.is_some() {
-        let (own, f, _) = WINDOW_T0.with(|t0| attribute(0, &t0.borrow()[..], &WINDOW_C0.with(|c| c.get()), &t1, &c1, ends, owned, true));
-        (own.is_some() && f == 0, f)
+    // The refusal is the rule's own where it refuses (a ThreadNew window reads ThreadNew on both platforms:
+    // the Linux port's run 1 found fc_thread_new_quiet reading NoKernelCount, ecetesla4 raw ctr6-instr);
+    // NoKernelCount only where the rule passes and the count alone is missing.
+    let (threads_quiet, foreign, refusal) = if !cfg!(target_vendor = "apple") && syscalls.is_none() && WINDOW_N0.with(|n| n.get()).is_some() && n1.is_some() {
+        let (own, f, r) = WINDOW_T0.with(|t0| attribute(0, &t0.borrow()[..], &WINDOW_C0.with(|c| c.get()), &t1, &c1, ends, owned, true));
+        (own.is_some() && f == 0, f, if own.is_some() { refusal } else { r })
     } else {
-        (attributed.is_some(), foreign)
+        (attributed.is_some(), foreign, refusal)
     };
     // Mutants (test builds only; counters review 4 MED-1): `probe_diagnostics_first` runs the
     // window's diagnostics before its counts are read, as a regression would; `probe_box_before_counts`
