@@ -14521,3 +14521,33 @@ fn a_materialized_view_resolves_functions_through_the_database_s_dialect() {
         "CLAIM: a materialized view did not resolve dfn through the database's dialect: create {made:?}, read {read:?}"
     );
 }
+
+/// fastest-wire (CREATE SCHEMA "MixedCase" lists as mixedcase): an attached database's name is kept as
+/// written, as SQLite keeps it, and matched case-insensitively. translate/attach.rs folded it with
+/// normalize_ident, so `PRAGMA database_list` (and every list built from the catalog) showed
+/// `mixedcase`. Lookups by any case, and a DETACH by another case, must still work. Every failure is
+/// listed.
+#[test]
+fn an_attached_database_keeps_its_name_as_written() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("m.db"), DatabaseOpts::new().with_attach(true));
+    let c = db.connect().unwrap();
+    let mut failed: Vec<String> = Vec::new();
+    c.execute(format!("ATTACH '{}' AS \"MixedCase\"", dir.path().join("s.db").display())).unwrap();
+    let names = c.prepare("PRAGMA database_list").and_then(|mut s| s.run_collect_rows()).map(|r| format!("{r:?}"));
+    if !names.as_ref().is_ok_and(|n| n.contains("\"MixedCase\"")) {
+        failed.push(format!("PRAGMA database_list = {names:?}, want MixedCase as written"));
+    }
+    if !c.list_attached_databases().iter().any(|n| n == "MixedCase") {
+        failed.push(format!("list_attached_databases = {:?}, want MixedCase", c.list_attached_databases()));
+    }
+    for sql in ["CREATE TABLE mixedcase.t(x)", "INSERT INTO \"MIXEDCASE\".t VALUES (1)", "SELECT x FROM MixedCase.t"] {
+        if let Err(e) = c.execute(sql) {
+            failed.push(format!("{sql}: {e}"));
+        }
+    }
+    if let Err(e) = c.execute("DETACH mixedCASE") {
+        failed.push(format!("DETACH mixedCASE: {e}"));
+    }
+    assert!(failed.is_empty(), "CLAIM: an attached database's name was not kept as written and matched in any case: {failed:#?}");
+}
