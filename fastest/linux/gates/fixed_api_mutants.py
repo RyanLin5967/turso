@@ -32,6 +32,7 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 LINUX = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
+import tally  # noqa: E402  the one outcome record (gates/tally.py)
 import hostbin  # noqa: E402  "bash" below is hostbin's bash 5+, never the caller's PATH's (the platform class)
 PY = [sys.executable, "-B"]
 T3LIB = ["bash", "t3lib_test.sh"]
@@ -173,7 +174,8 @@ def main(argv):
     inherited = []
     for k, (d, cmd) in enumerate(sorted({(r[2], tuple(r[4])) for r in todo})):
         rc, out = run_test(copy_of(d, os.path.join(top, f"control-{k}-" + d.replace("/", "_"))), list(cmd))
-        if rc not in (0, 3):
+        # the control is judged by its own TALLY and rc (pass, or N/A inherited below), never by rc alone
+        if rc not in (0, 3) or tally.judge(out, rc)[0] not in ("pass", "na"):
             print(f"fixed_api_mutants: REFUSED: the unmutated {d} control ({' '.join(cmd)}) is not green (rc {rc}): "
                   f"{out[-300:]!r}")
             return 2

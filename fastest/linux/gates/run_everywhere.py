@@ -307,6 +307,25 @@ def self_test():
                 cases.append((f"LOW 5: the host's real {old[0]} (major {hostbin._major(old[0])}) alone is refused", True))
         else:
             print("INFO: this host has no bash older than 5; the fake-4 case above fires BASH_MIN", flush=True)
+        # the lead's order (2026-10-18, from comp): each real row's source prints its TALLY, so a file that stops is
+        # caught by reading it, before any run; and a real row with its TALLY print removed is refused when run
+        real = os.path.dirname(HERE)
+        rows_, _ = table(real)
+        silent = [r[0] for r in rows_ if os.path.isfile(os.path.join(real, r[0]))
+                  and "TALLY ran=" not in open(os.path.join(real, r[0]), errors="replace").read()]
+        cases.append(("every real row's source prints a TALLY line (none silent: %s)" % (silent or "none"), not silent))
+        for victim in ("gates/warmup_conformance.py", "gates/driver_contract.py"):
+            vt = open(os.path.join(real, victim)).read()
+            cut = "\n".join(ln for ln in vt.splitlines() if 'print(f"TALLY ran=' not in ln) + "\n"
+            vd = os.path.join(t, "victim")
+            shutil.rmtree(vd, ignore_errors=True)
+            shutil.copytree(os.path.dirname(os.path.join(real, victim)), vd)
+            open(os.path.join(vd, os.path.basename(victim)), "w").write(cut)
+            r_ = subprocess.run([sys.executable, "-B", os.path.basename(victim), "self-test"], cwd=vd, capture_output=True,
+                                text=True, timeout=600)
+            cases.append((f"{victim} with its TALLY print removed is refused (rc {r_.returncode}, no tally)",
+                          tally.judge(r_.stdout + r_.stderr, r_.returncode)[0] == "fail"
+                          and "no TALLY" in " ".join(tally.judge(r_.stdout + r_.stderr, r_.returncode)[2])))
         rows, _ = table(os.path.dirname(HERE))
         cases.append(("the real table: every discovered entry point has a row",
                       set(discover(os.path.dirname(HERE))) <= {r[0] for r in rows}))
