@@ -4771,3 +4771,49 @@ fn a_cell_whose_window_moved_an_exception_counter_is_not_credited() {
         "exc_sharp was refused, but not as a moved exception counter (DECISIONS bd0d845f97):\n{text}"
     );
 }
+
+/// The Linux port of `probe::others_blocked` (LEAP L3's cells refused on Linux: "whether the other
+/// threads are blocked cannot be read on this platform"), fired both ways: with one other thread
+/// spinning it reads `false`; once that thread parks, `true` within 10 s. Apple reads it from Mach
+/// (`each_thread`), as before.
+#[cfg(target_os = "linux")]
+#[test]
+fn others_blocked_reads_a_spinning_thread_and_a_parked_one_on_linux() {
+    use std::sync::atomic::{AtomicBool, Ordering::{Acquire, Release}};
+    let (spin, park) = (Arc::new(AtomicBool::new(true)), Arc::new(AtomicBool::new(false)));
+    let t = {
+        let (spin, park) = (spin.clone(), park.clone());
+        std::thread::spawn(move || {
+            while spin.load(Acquire) {
+                std::hint::spin_loop();
+            }
+            while !park.load(Acquire) {
+                std::thread::park_timeout(std::time::Duration::from_millis(50));
+            }
+        })
+    };
+    // The spinner must be seen running at least once (a busy host may deschedule it for a moment).
+    let start = std::time::Instant::now();
+    let mut saw_running = false;
+    while start.elapsed() < std::time::Duration::from_secs(10) {
+        if probe::others_blocked() == Some(false) {
+            saw_running = true;
+            break;
+        }
+    }
+    spin.store(false, Release);
+    let start = std::time::Instant::now();
+    let mut saw_blocked = false;
+    while start.elapsed() < std::time::Duration::from_secs(10) {
+        if probe::others_blocked() == Some(true) {
+            saw_blocked = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    park.store(true, Release);
+    t.thread().unpark();
+    t.join().unwrap();
+    assert!(saw_running, "CLAIM: others_blocked never read a spinning thread as running");
+    assert!(saw_blocked, "CLAIM: others_blocked never read a parked thread as blocked");
+}
