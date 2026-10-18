@@ -32,6 +32,11 @@ check "an ordinary --dry-run carries no stamp" \
   't3 s2 --dry-run; m=$T/s2/mode.txt; cat "$m"; grep -qx dry=1 "$m" && ! grep -q "^stamp=." "$m" && [ ! -e "$T/s2/STAMP" ]'
 # the real device mode's refusal of a virtualized box is unchanged: its preflight asks virt_ok real (tested in
 # t3lib_test.sh); only --dry-block asks virt_ok dryblock
+# the lead's 'denied' ruling: the T3 preflight's root check is t3lib.sh's t3_need_root (every sudo state but 'ok'
+# refuses, rc 2), not a bare sudo -n true that a self-test-only N/A rule could ever be confused with
+check "u4 ruling: preflight requires root through t3_need_root, and has no bare sudo -n true check" \
+  'grep -n "t3_need_root\|sudo -n true" "$HERE/t3run.sh"; grep -q "^  t3_need_root || return 2" "$HERE/t3run.sh" &&
+   ! grep -q "sudo -n true ||" "$HERE/t3run.sh"'
 check "preflight asks virt_ok real unless --dry-block, and nothing else decides virtualization" \
   'grep -n "systemd-detect-virt" "$HERE/t3run.sh"; [ "$(grep -c "systemd-detect-virt" "$HERE/t3run.sh")" = 1 ] &&
    grep -q "virt_ok \"\$VIRT_MODE\" \"\$virt\"" "$HERE/t3run.sh" && grep -q "VIRT_MODE=real" "$HERE/t3run.sh"'
