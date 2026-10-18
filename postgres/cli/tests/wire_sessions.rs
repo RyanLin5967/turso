@@ -14800,6 +14800,50 @@ fn ddl_under_this_sessions_open_portal_follows_postgresql() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-uw2 LOW: a block's reads were held to the block's end even past a ROLLBACK TO the
+/// savepoint before them and past an error that failed the block, so another session's DROP
+/// waited and was 55P03. PostgreSQL 18.6 releases a subtransaction's locks at its ROLLBACK TO and
+/// a failed block's at the error (recorded by the reviewer: artie 718f73d7c1,
+/// reviews/uw2-raws/round1-pg-all.txt r07, r08: the other session's DROP runs within 50 ms).
+#[test]
+fn a_blocks_reads_end_at_rollback_to_and_at_its_error() {
+    let dir = Scratch::new("reads-subxact");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut b = server.connect();
+    for t in ["d1", "d2", "d3"] {
+        a.q(&format!("CREATE TABLE {t}(x int)")).ok(t);
+        a.q(&format!("INSERT INTO {t} VALUES (1)")).ok(t);
+    }
+    b.q("SET lock_timeout = '50ms'").ok("lock_timeout");
+    let mut wrong = Vec::new();
+    // r07: the read after SAVEPOINT s is released by ROLLBACK TO s; the one before it is kept.
+    a.q("BEGIN").ok("begin");
+    a.q("SELECT x FROM d3").ok("read d3");
+    a.q("SAVEPOINT s").ok("savepoint");
+    a.q("SELECT x FROM d1").ok("read d1");
+    a.q("ROLLBACK TO SAVEPOINT s").ok("rollback to");
+    if let Some(e) = b.q("DROP TABLE d1").error {
+        wrong.push(format!("b's DROP TABLE d1 after a's ROLLBACK TO s: {} {}", e.code, e.message));
+    }
+    match b.q("DROP TABLE d3").error {
+        Some(e) if e.code == "55P03" => {}
+        other => wrong.push(format!("b's DROP TABLE d3 (read before SAVEPOINT s): want 55P03, got {other:?}")),
+    }
+    a.q("ROLLBACK").ok("rollback");
+    // r08: a statement that fails inside a block ends the block's reads at the error.
+    a.q("BEGIN").ok("begin");
+    let r = a.q("SELECT x FROM d2 WHERE x = 1/0");
+    if r.error.as_ref().map(|e| e.code.as_str()) != Some("22012") {
+        wrong.push(format!("premise: a's SELECT ... 1/0 fails 22012: {:?}", r.error));
+    }
+    if let Some(e) = b.q("DROP TABLE d2").error {
+        wrong.push(format!("b's DROP TABLE d2 while a's block is failed: {} {}", e.code, e.message));
+    }
+    a.q("ROLLBACK").ok("rollback");
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// Review wire-quote LOW-2: pg_get_indexdef, pg_indexes.indexdef and pg_get_constraintdef printed
 /// identifiers unquoted, so pg_dump-style output of a name like `a b` did not read back. PostgreSQL
 /// 18.6 quotes each by quote_identifier and qualifies the index's table (recorded with these very
