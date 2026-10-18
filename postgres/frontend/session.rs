@@ -1651,6 +1651,14 @@ pub(crate) fn session_translation(
             .iter()
             .find(|name| schema.get_type_def_unchecked(&name.to_lowercase()).is_none())
         {
+            // information_schema's domains (cardinal_number, sql_identifier, ...) exist in
+            // PostgreSQL, so not 42704: they are not served here (wire-rev-uw2 N5).
+            if missing.starts_with("information_schema.") {
+                return Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
+                    SqlErrorKind::FeatureNotSupported,
+                    format!("type \"{missing}\" is not supported"),
+                )));
+            }
             return Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
                 SqlErrorKind::UndefinedObject,
                 format!("type \"{missing}\" does not exist"),

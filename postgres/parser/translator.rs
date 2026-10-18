@@ -5953,23 +5953,34 @@ fn pg_type_name_to_ast_type(type_name: &pg_query::protobuf::TypeName) -> Option<
     })
 }
 
+/// A TypeName's name, its schema dropped where it is one this frontend's types live in:
+/// pg_catalog (the built-in types) and public (every CREATE TYPE and CREATE DOMAIN), so
+/// public.m is m, as PostgreSQL resolves it (wire-rev-uw2 N5: the parts were joined with a blank,
+/// and public.m was refused as the type "public m"; pg_dump writes public.<type> for enum and
+/// domain columns). Any other schema is kept, dotted (`s.m`), and no type of that name exists
+/// here, so the caller's check refuses it naming it as written. None for an empty name.
+fn qualified_type_name(type_name: &pg_query::protobuf::TypeName) -> Option<String> {
+    use pg_query::protobuf::node::Node;
+    let parts: Vec<&str> = type_name
+        .names
+        .iter()
+        .filter_map(|n| match &n.node {
+            Some(Node::String(s)) => Some(s.sval.as_str()),
+            _ => None,
+        })
+        .collect();
+    match parts.as_slice() {
+        [] => None,
+        ["pg_catalog" | "public", name] => Some(name.to_string()),
+        parts => Some(parts.join(".")),
+    }
+}
+
 fn extract_type_name_from_typename(
     type_name: &pg_query::protobuf::TypeName,
 ) -> Result<String, ParseError> {
-    use pg_query::protobuf::node::Node;
-
-    let mut parts = Vec::new();
-    for name_node in &type_name.names {
-        if let Some(Node::String(s)) = &name_node.node {
-            if s.sval != "pg_catalog" {
-                parts.push(s.sval.clone());
-            }
-        }
-    }
-    if parts.is_empty() {
-        return Err(ParseError::ParseError("empty type name".into()));
-    }
-    let mut name = parts.join(" ");
+    let mut name = qualified_type_name(type_name)
+        .ok_or_else(|| ParseError::ParseError("empty type name".into()))?;
     if !type_name.array_bounds.is_empty() {
         for _ in &type_name.array_bounds {
             name.push_str("[]");
@@ -5998,27 +6009,13 @@ fn extract_def_elem_bool(elem: &pg_query::protobuf::DefElem) -> bool {
 }
 
 fn extract_type_name(col_def: &pg_query::protobuf::ColumnDef) -> Result<String, ParseError> {
-    use pg_query::protobuf::node::Node;
-
     let type_name = col_def
         .type_name
         .as_ref()
         .ok_or_else(|| ParseError::ParseError("column missing type".into()))?;
 
-    // TypeName.names is a list of String nodes (e.g., ["pg_catalog", "int4"])
-    // Skip "pg_catalog" prefix if present
-    let mut parts = Vec::new();
-    for name_node in &type_name.names {
-        if let Some(Node::String(s)) = &name_node.node {
-            if s.sval != "pg_catalog" {
-                parts.push(s.sval.clone());
-            }
-        }
-    }
-    if parts.is_empty() {
-        return Err(ParseError::ParseError("column has empty type name".into()));
-    }
-    let mut name = parts.join(" ");
+    let mut name = qualified_type_name(type_name)
+        .ok_or_else(|| ParseError::ParseError("column has empty type name".into()))?;
 
     // PG represents array types like `integer[]` with array_bounds on the TypeName,
     // not by appending `[]` to the type name. Detect and append it.
