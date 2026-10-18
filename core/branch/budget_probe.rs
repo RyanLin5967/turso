@@ -990,10 +990,7 @@ fn attribute(kernel: u64, t0: &[ThreadCpu], c0: &[u64; 48], t1: &[ThreadCpu], c1
         return (None, foreign, Refusal::ThreadNew);
     }
     let me = t1.iter().find(|t| t.me).map_or(0, |t| t.id);
-    let owned_name = |t: &ThreadCpu| {
-        let end = t.name.iter().position(|c| *c == 0).unwrap_or(t.name.len());
-        owned.iter().any(|o| o.as_bytes() == &t.name[..end])
-    };
+    let owned_name = |t: &ThreadCpu| owned_named(t, owned);
     let mut all = 0u64;
     let mut own_sum = 0u64;
     let excludes = mutant("probe_shim_excludes_foreign");
@@ -1106,10 +1103,7 @@ fn window_diagnostics(refusal: Refusal, foreign: u64, owned: &[&str], attributed
 fn foreign_threads(a: &[ThreadCpu], b: &[ThreadCpu], owned: &[&str], new_foreign: bool) -> u64 {
     let me = b.iter().find(|t| t.me).map_or(0, |t| t.id);
     let spinning = |id: u64| SPINNERS.iter().any(|s| s.load(Relaxed) == id);
-    let owned_name = |t: &ThreadCpu| {
-        let end = t.name.iter().position(|c| *c == 0).unwrap_or(t.name.len());
-        owned.iter().any(|o| o.as_bytes() == &t.name[..end])
-    };
+    let owned_name = |t: &ThreadCpu| owned_named(t, owned);
     let mut n = 0;
     for t in b.iter().filter(|t| t.id != 0 && t.id != me) {
         let before = a.iter().find(|x| x.id == t.id);
@@ -1459,7 +1453,21 @@ fn each_thread(mut each: impl FnMut(bool, bool)) -> Option<()> {
         };
         Some(())
     }
-    #[cfg(not(target_vendor = "apple"))]
+    // The Linux port (lead ruling 2026-10-18): every task in /proc/self/task, blocked when its state
+    // is S or D (see `thread_table` for where this differs from Mach).
+    #[cfg(target_os = "linux")]
+    {
+        let me = linux_tid();
+        let mut ok = true;
+        linux_each_tid(|tid| match linux_task_stat(tid) {
+            Some((state, _)) if state != b'Z' && state != b'X' => each(tid == me, state == b'S' || state == b'D'),
+            Some(_) => {}
+            // Gone between the listing and the read: an exited thread, as on Mach, is not listed.
+            None => ok &= !linux_task_alive(tid),
+        })?;
+        ok.then_some(())
+    }
+    #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
     {
         let _ = &mut each;
         None
@@ -1488,7 +1496,7 @@ impl ThreadCpu {
 }
 
 /// Every thread of this process now, into `out` (the first `out.len()`), and how many there are;
-/// `None` off Apple. Mach traps and userspace only, as `each_thread`, with no allocation, so it can
+/// `None` where they cannot be read. On Apple Mach traps and userspace only, as `each_thread`; on Linux /proc (below); with no allocation on either, so it can
 /// be read inside a window whose BSD syscalls and allocations are counted. What it is for: the
 /// syscall counters here are the task's (`unix_syscalls`), so a window's count is its thread's
 /// own only if no other thread ran in it: compare two tables (`ran_between`).
@@ -1552,11 +1560,218 @@ pub(crate) fn thread_table(out: &mut [ThreadCpu]) -> Option<usize> {
         };
         Some(count as usize)
     }
-    #[cfg(not(target_vendor = "apple"))]
+    // The Linux port (lead ruling 2026-10-18): /proc/self/task, read with raw syscalls into stack
+    // buffers (no allocation; its syscalls are not counted off Apple, where no kernel count exists).
+    // Where it differs from Mach, which stays the semantics of record:
+    // - the id is the kernel tid, which Linux reuses after pid_max wraps (Mach's thread_id is unique
+    //   per boot): a tid reused between two readings of one window would read as one thread;
+    // - CPU time is the scheduler's run time (`schedstat`, ns), Mach's is user plus system time;
+    // - blocked is state S or D (Mach: TH_STATE_WAITING); a stopped (T, t) thread reads running, as a
+    //   Mach-suspended one does; a zombie or dead (Z, X) task is not listed, as Mach lists no exited
+    //   thread;
+    // - the name is the kernel's comm, at most 15 bytes (TASK_COMM_LEN), so names are compared cut
+    //   to it (`owned_named`).
+    // A live thread whose CPU time cannot be read (a kernel without schedstat) refuses the whole
+    // table: None, never a guessed time.
+    #[cfg(target_os = "linux")]
+    {
+        let me = linux_tid();
+        let mut n = 0usize;
+        let mut ok = true;
+        linux_each_tid(|tid| {
+            let Some((state, name)) = linux_task_stat(tid) else {
+                ok &= !linux_task_alive(tid);
+                return;
+            };
+            if state == b'Z' || state == b'X' {
+                return;
+            }
+            let Some(cpu_ns) = linux_task_run_ns(tid) else {
+                ok &= !linux_task_alive(tid);
+                return;
+            };
+            if let Some(slot) = out.get_mut(n) {
+                *slot = ThreadCpu { id: tid, cpu_ns, me: tid == me, name, waiting: state == b'S' || state == b'D' };
+            }
+            n += 1;
+        })?;
+        ok.then_some(n)
+    }
+    #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
     {
         let _ = out;
         None
     }
+}
+
+/// Whether `t` is one of the threads named in `owned`. On Linux a thread name is the kernel's comm,
+/// cut at 15 bytes (TASK_COMM_LEN), so `owned` is compared cut the same way there.
+fn owned_named(t: &ThreadCpu, owned: &[&str]) -> bool {
+    let end = t.name.iter().position(|c| *c == 0).unwrap_or(t.name.len());
+    let cut = if cfg!(target_os = "linux") { 15 } else { usize::MAX };
+    owned.iter().any(|o| &o.as_bytes()[..o.len().min(cut)] == &t.name[..end])
+}
+
+/// This thread's kernel id (the raw syscall: glibc before 2.30 has no gettid wrapper).
+#[cfg(target_os = "linux")]
+fn linux_tid() -> u64 {
+    // SAFETY: gettid takes no argument and cannot fail.
+    unsafe { libc::syscall(libc::SYS_gettid) as u64 }
+}
+
+/// Read the small file at `path` (NUL-terminated) into `buf`: the bytes read, `None` if it cannot be
+/// opened or read. Raw syscalls only, no allocation.
+#[cfg(target_os = "linux")]
+fn linux_read_into(path: &[u8], buf: &mut [u8]) -> Option<usize> {
+    // SAFETY: a NUL-terminated path; the descriptor is closed below.
+    let fd = unsafe { libc::open(path.as_ptr().cast(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: `buf` is writable for its length.
+    let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+    // SAFETY: the descriptor opened above.
+    unsafe { libc::close(fd) };
+    usize::try_from(n).ok()
+}
+
+/// `/proc/self/task/<tid>/<leaf>` with its NUL, into `out`; the bytes used.
+#[cfg(target_os = "linux")]
+fn linux_task_path(tid: u64, leaf: &[u8], out: &mut [u8; 64]) -> usize {
+    const HEAD: &[u8] = b"/proc/self/task/";
+    out[..HEAD.len()].copy_from_slice(HEAD);
+    let mut i = HEAD.len();
+    let mut digits = [0u8; 20];
+    let (mut v, mut d) = (tid, 0);
+    loop {
+        digits[d] = b'0' + (v % 10) as u8;
+        d += 1;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    while d > 0 {
+        d -= 1;
+        out[i] = digits[d];
+        i += 1;
+    }
+    out[i] = b'/';
+    i += 1;
+    out[i..i + leaf.len()].copy_from_slice(leaf);
+    i += leaf.len();
+    out[i] = 0;
+    i + 1
+}
+
+/// Whether task `tid` still exists (its /proc directory opens).
+#[cfg(target_os = "linux")]
+fn linux_task_alive(tid: u64) -> bool {
+    let mut path = [0u8; 64];
+    let used = linux_task_path(tid, b"", &mut path);
+    // SAFETY: a NUL-terminated path; the descriptor is closed below.
+    let fd = unsafe { libc::open(path[..used].as_ptr().cast(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return false;
+    }
+    // SAFETY: the descriptor opened above.
+    unsafe { libc::close(fd) };
+    true
+}
+
+/// Task `tid`'s state letter and name (comm, NUL-padded) from its `stat`.
+#[cfg(target_os = "linux")]
+fn linux_task_stat(tid: u64) -> Option<(u8, [u8; 32])> {
+    let mut path = [0u8; 64];
+    let used = linux_task_path(tid, b"stat", &mut path);
+    let mut buf = [0u8; 512];
+    let n = linux_read_into(&path[..used], &mut buf)?;
+    let text = buf.get(..n)?;
+    // "tid (comm) S ...": comm may hold spaces and ')', so it ends at the LAST ')'.
+    let open = text.iter().position(|c| *c == b'(')?;
+    let close = text.iter().rposition(|c| *c == b')')?;
+    let state = *text.get(close + 2)?;
+    let mut name = [0u8; 32];
+    for (d, c) in name.iter_mut().zip(text.get(open + 1..close)?.iter().take(31)) {
+        *d = *c;
+    }
+    Some((state, name))
+}
+
+/// Task `tid`'s CPU time so far, ns: the first field of its `schedstat`.
+#[cfg(target_os = "linux")]
+fn linux_task_run_ns(tid: u64) -> Option<u64> {
+    let mut path = [0u8; 64];
+    let used = linux_task_path(tid, b"schedstat", &mut path);
+    let mut buf = [0u8; 128];
+    let n = linux_read_into(&path[..used], &mut buf)?;
+    let mut v: u64 = 0;
+    let mut any = false;
+    for c in buf.get(..n)? {
+        if !c.is_ascii_digit() {
+            break;
+        }
+        v = v.checked_mul(10)?.checked_add(u64::from(c - b'0'))?;
+        any = true;
+    }
+    any.then_some(v)
+}
+
+/// Each task id in /proc/self/task, given to `each`; `None` if the directory cannot be read. Raw
+/// getdents64 into a stack buffer: no allocation.
+#[cfg(target_os = "linux")]
+fn linux_each_tid(mut each: impl FnMut(u64)) -> Option<()> {
+    // SAFETY: a NUL-terminated path; the descriptor is closed below.
+    let fd = unsafe { libc::open(b"/proc/self/task\0".as_ptr().cast(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return None;
+    }
+    let mut buf = [0u8; 4096];
+    let mut ok = true;
+    loop {
+        // SAFETY: `buf` is writable for its length; the kernel fills whole records.
+        let n = unsafe { libc::syscall(libc::SYS_getdents64, fd, buf.as_mut_ptr(), buf.len()) };
+        if n < 0 {
+            ok = false;
+            break;
+        }
+        if n == 0 {
+            break;
+        }
+        let n = n as usize;
+        let mut at = 0usize;
+        // linux_dirent64: d_ino u64, d_off i64, d_reclen u16, d_type u8, d_name NUL-terminated.
+        while at + 19 < n {
+            let reclen = usize::from(u16::from_ne_bytes([buf[at + 16], buf[at + 17]]));
+            if reclen == 0 || at + reclen > n {
+                ok = false;
+                break;
+            }
+            let mut tid: u64 = 0;
+            let mut digits = 0;
+            for c in &buf[at + 19..at + reclen] {
+                if *c == 0 {
+                    break;
+                }
+                if !c.is_ascii_digit() {
+                    digits = 0;
+                    break;
+                }
+                tid = tid * 10 + u64::from(c - b'0');
+                digits += 1;
+            }
+            if digits > 0 {
+                each(tid);
+            }
+            at += reclen;
+        }
+        if !ok {
+            break;
+        }
+    }
+    // SAFETY: the descriptor opened above.
+    unsafe { libc::close(fd) };
+    ok.then_some(())
 }
 
 /// The threads, other than `skip` (a thread id), that ran between two `thread_table` readings:
@@ -1582,8 +1797,8 @@ pub(crate) fn threads() -> Option<u64> {
 }
 
 /// Whether every thread but the caller is blocked (see [`each_thread`]): the work a notify woke has
-/// run and parked again. `None` off Apple: a window that needs it must refuse there, never assume it
-/// (review 2 M6).
+/// run and parked again. `None` where the thread states cannot be read (neither Apple nor Linux): a
+/// window that needs it must refuse there, never assume it (review 2 M6).
 pub(crate) fn others_blocked() -> Option<bool> {
     let mut all = true;
     each_thread(|me, blocked| all &= me || blocked)?;
