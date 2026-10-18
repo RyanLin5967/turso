@@ -1914,8 +1914,7 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
             // check_timezone, as PG 18.6 answered every recorded value (THE ORACLE: rev-cd-tz2,
             // rev-l1-tz, rev-c39-tzforms, rev-c39-tzpath; a model of these rules agrees with all 82
             // recorded rows, codes and messages). A valid zone other than UTC is refused 0A000 below,
-            // as this server runs in UTC alone. BLIND SPOT: a host zone database lacking a name
-            // PostgreSQL knows answers 22023 for it.
+            // as this server runs in UTC alone. Zone names are PG 18.6's own list (zone_file).
             if let PgSetValue::Interval { literal, .. } = value {
                 return match timezone_interval(literal) {
                     TzInterval::Offset => unsupported("this server answers only by its own setting of it"),
@@ -1996,52 +1995,19 @@ fn pg_parameter_name(name: &str) -> &str {
     }
 }
 
-/// PostgreSQL's encoding names and aliases, letters and digits only (pg_wchar.c's table, as
-/// client_encoding accepts them): any other is 22023.
-/// Whether `name` is a zone in the host's zone database: only name components of letters, digits,
-/// `_`, `-` and `+` (no leading `/`, no `.` or `..`, nothing empty), joined under
-/// /usr/share/zoneinfo, naming a TZif file, and not `posixrules`, which PostgreSQL refuses by name.
-/// A value that is a host path never reaches the filesystem, so no answer says whether a host file
-/// exists (review c39799c5d..9e24b455d MED 2: `/etc/passwd` replaced the base in `join` and
-/// answered 0A000, `/etc/nosuch` 22023), and a zone-directory file that is not a zone
-/// (`zone.tab`, `tzdata.zi`) is not one; PG 18.6 answers 22023 for all of them
-/// (pg18-rev-c39-tzpath.out).
+/// The zone names PostgreSQL 18.6 knows, one per line: its pg_timezone_names in full (598,
+/// recorded on iccad11, pg18-rev-host1.out). PostgreSQL reads its own tz database, never the
+/// host's, so this list replaces the host zoneinfo walk (the first host run: RHEL 8's zoneinfo
+/// lacks `Factory`, which PG 18.6 SETs).
+const PG_TIMEZONE_NAMES: &str = include_str!("pg_timezone_names.txt");
+
+/// Whether `name` is a zone PostgreSQL 18.6 knows, matched without case as PostgreSQL matches zone
+/// names ('america/new_york' SETs, rev-c39-tzforms #1). A host path, a zone-directory file that is
+/// not a zone (`zone.tab`, `tzdata.zi`) and `posixrules` are not in the list, and PG 18.6 answers
+/// 22023 for all of them (pg18-rev-c39-tzpath.out); no answer reads the host's filesystem (review
+/// c39799c5d..9e24b455d MED 2).
 fn zone_file(name: &str) -> bool {
-    use std::io::Read;
-    let named = name.len() <= 255
-        && name.split('/').all(|c| {
-            !c.is_empty()
-                && c.bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'+'))
-        });
-    if !named || name.eq_ignore_ascii_case("posixrules") {
-        return false;
-    }
-    // Each component matched without case, as PostgreSQL matches zone names (a case-sensitive
-    // host filesystem found `America/New_York` and not `america/new_york`).
-    let mut path = std::path::PathBuf::from("/usr/share/zoneinfo");
-    for part in name.split('/') {
-        let exact = path.join(part);
-        if exact.exists() {
-            path = exact;
-            continue;
-        }
-        let Ok(entries) = std::fs::read_dir(&path) else {
-            return false;
-        };
-        let Some(found) = entries
-            .flatten()
-            .find(|e| e.file_name().to_str().is_some_and(|f| f.eq_ignore_ascii_case(part)))
-        else {
-            return false;
-        };
-        path = found.path();
-    }
-    let mut magic = [0u8; 4];
-    std::fs::File::open(&path)
-        .and_then(|mut f| f.read_exact(&mut magic))
-        .is_ok()
-        && &magic == b"TZif"
+    PG_TIMEZONE_NAMES.lines().any(|zone| zone.eq_ignore_ascii_case(name))
 }
 
 /// A TimeZone value's `INTERVAL '...' [fields]` form, as check_timezone reads it (PG 18.6,
