@@ -150,7 +150,37 @@ def busy_evidence(path, exclude=(), interval_default=1.0):
         m = re.match(r"foreign process (\d+) \((.*)\) above 50% for >= 5 s$", r)
         if m:
             named.append((int(m.group(1)), m.group(2)))
-    return [f"{comm} pid {pid}" for pid, comm in named if pid not in exclude and (pid, comm) in per]
+    out = [f"{comm} pid {pid}" for pid, comm in named if pid not in exclude and (pid, comm) in per]
+    # linux-rev-uw3 LOW 6: rule 1 (the foreign total) names no process, so a host busy only by many processes each
+    # under 50% read FAIL. Rule 1 is re-derived on the record WITHOUT the excluded tree: when the remaining foreign
+    # processes still exceed 100% in more than 5% of the ticks, they are the evidence (the largest four, by CPU)
+    if not out and any(r.startswith("foreign CPU > 100%") for r in v["reasons"]):
+        ticks = [float(p[1]) for p in (ln.rstrip("\n").split("\t") for ln in open(path)) if p[0] == "#tick"]
+        at = {}
+        for (pid, comm), rows in per.items():
+            for t, pct in rows:
+                at[t] = at.get(t, 0.0) + pct
+        over = sum(1 for t in ticks if at.get(t, 0.0) > 100.0)
+        if ticks and over / len(ticks) > 0.05:
+            top = sorted(per.items(), key=lambda kv: -sum(p for _t, p in kv[1]))[:4]
+            out = [f"{comm} pid {pid}" for (pid, comm), _r in top]
+    return out
+
+
+def burners_ran(v, burners, mine):
+    """linux-rev-uw3 MED 1: a live case's burners were SEEN to run in its window's decide() record V. Each SUT burner
+    (True, or a SUT parent's "child") must show in the SUT's CPU: sut_max at least 80% per SUT burner. A foreign
+    burner (False) must be what voided the window: a rule-2 reason naming one of MINE (this case's own burner pids). A
+    case with no burner is trivially true. Without this the live cases passed with burners that never burned."""
+    sut = [b for b in burners if b[0] is True or b[0] == "child"]
+    foreign = [b for b in burners if b[0] is False]
+    if sut and (v.get("sut_max") or 0.0) < 80.0 * len(sut):
+        return False
+    if foreign:
+        pids = {int(m.group(1)) for m in (re.match(r"foreign process (\d+) ", r) for r in v.get("reasons") or []) if m}
+        if not pids & set(mine):
+            return False
+    return True
 
 
 def decide(path, interval_default=1.0):
@@ -277,10 +307,13 @@ def self_test():
                 n_na += 1
                 print(f"N/A-on-busy-host: self-test {label}: {busy}", flush=True)
                 continue
-        ok = out == want
+        # linux-rev-uw3 MED 1: the verdict counts only when the case's own burners were seen to run in its record
+        seen = burners_ran(decide(rec), burners, mine)
+        ok = out == want and seen
         bad += not ok
         n_pass += ok
-        print(f"self-test {'PASS' if ok else 'FAIL'}: {label}: want {want}, got {out}")
+        print(f"self-test {'PASS' if ok else 'FAIL'}: {label}: want {want}, got {out}"
+              + ("" if seen else " (its burners were NOT seen to run in the window record)"))
 
     # Synthetic: each rule alone, on records whose every number is chosen here (a live box's own
     # background cannot be held still: runs 37255216397 and 37255904818 voided a 3 s burner by the

@@ -43,6 +43,12 @@ check "t3run unsets an inherited T3_IDENTITY_MODE and sets virtio only under --d
 # linux-rev-uw2 LOW 6: t3run's private bash dir (the pin of its own bash first on PATH) is removed when it exits: a
 # run that refuses at its argument rules leaves nothing in TMPDIR (the reviewer counted 16 left on iccad7)
 mkdir -p "$T/tmpd"
+# linux-rev-uw3 LOW 2: an empty TMPDIR alone does not prove the dir was made THERE and removed (a t3run that pinned
+# its bash outside TMPDIR and kept it passed). A read-only TMPDIR shows where it is made: t3run must refuse, naming it
+mkdir -p "$T/rotmp"; chmod 555 "$T/rotmp"
+check "uw3 LOW 2: t3run pins its bash under TMPDIR: a read-only TMPDIR refuses (rc 2), naming the pin" \
+  'TMPDIR=$T/rotmp refuses l6ro "cannot pin bash" --dry-block /dev/vdb --block loop'
+chmod 755 "$T/rotmp"
 check "uw2 LOW 6: a t3run that refuses leaves no temp dir behind (its pinned-bash dir is removed at exit)" \
   'TMPDIR=$T/tmpd refuses l6 "--block" --dry-block /dev/vdb --block loop; ls -A "$T/tmpd"; [ -z "$(ls -A "$T/tmpd")" ]'
 echo "TALLY ran=$((pass + fail)) pass=$pass na=${na:-0} fail=$fail"  # gates/tally.py

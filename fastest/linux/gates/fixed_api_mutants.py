@@ -105,6 +105,12 @@ def parses(path, text):
     return None if r.returncode == 0 else r.stderr.strip()[:200]
 
 
+def control_ok(out, rc):
+    """linux-rev-uw3 LOW 4: an unmutated control is green when its TALLY agrees with its rc and says pass, or N/A
+    (inherited, exit 3). rc alone, or a summary line, is not enough"""
+    return rc in (0, 3) and tally.judge(out, rc)[0] in ("pass", "na")
+
+
 def table_problems(rows, root=LINUX):
     """why the table cannot run against ROOT's files: a target not found exactly once, an indented target not at a
     line start, a mutated file that does not parse"""
@@ -175,7 +181,7 @@ def main(argv):
     for k, (d, cmd) in enumerate(sorted({(r[2], tuple(r[4])) for r in todo})):
         rc, out = run_test(copy_of(d, os.path.join(top, f"control-{k}-" + d.replace("/", "_"))), list(cmd))
         # the control is judged by its own TALLY and rc (pass, or N/A inherited below), never by rc alone
-        if rc not in (0, 3) or tally.judge(out, rc)[0] not in ("pass", "na"):
+        if not control_ok(out, rc):
             print(f"fixed_api_mutants: REFUSED: the unmutated {d} control ({' '.join(cmd)}) is not green (rc {rc}): "
                   f"{out[-300:]!r}")
             return 2

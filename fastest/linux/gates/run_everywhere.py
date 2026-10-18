@@ -31,6 +31,36 @@ PY_MARK = re.compile(r'''(==|in|\[)\s*\(?\s*\[?\s*["'](--)?self-?test["']''')
 SH_MARK = re.compile(r'''--self-test\)|= *"?--self-test"?''')
 
 
+def prints_tally(path):
+    """linux-rev-uw3 LOW 5: whether a row's SOURCE prints a TALLY line, by parsing, not by text (a comment naming
+    'TALLY ran=' satisfied the old text check). Python: a print() call whose first argument is a string or f-string
+    starting 'TALLY ran=', or a call of tally.line(). Shell: an echo or printf of 'TALLY ran=...' on a line that is not
+    a comment. Blind spot, stated: a print that is present but never reached; the row's run is judged by its output."""
+    import ast
+    try:
+        src = open(path, errors="replace").read()
+    except OSError:
+        return False
+    if path.endswith(".py"):
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:
+            return False
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "print" and node.args:
+                a = node.args[0]
+                if isinstance(a, ast.Constant) and isinstance(a.value, str) and a.value.startswith("TALLY ran="):
+                    return True
+                if isinstance(a, ast.JoinedStr) and a.values and isinstance(a.values[0], ast.Constant) \
+                        and str(a.values[0].value).startswith("TALLY ran="):
+                    return True
+                if isinstance(a, ast.Call) and getattr(a.func, "id", getattr(a.func, "attr", None)) == "line":
+                    return True
+        return False
+    return any(re.search(r"\b(echo|printf)\s+[\"']TALLY ran=", ln) for ln in src.splitlines()
+               if not ln.lstrip().startswith("#"))
+
+
 def this_platform():
     return "linux" if sys.platform.startswith("linux") else sys.platform
 

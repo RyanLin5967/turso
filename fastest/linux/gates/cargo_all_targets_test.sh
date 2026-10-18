@@ -16,9 +16,17 @@ cd "$ROOT" || exit 2
 # any other feature (simulator, fuzz, experimental_win_iocp, aristo-instr, pure-rust-crypto, ...) is not compiled here.
 FEATURES=conn_raw_api,bench,fts,io_uring
 # required_features TOML: every feature a [[bench]], [[example]] or [[test]] of TOML requires, one per line
+# parsed as TOML (python3's tomllib, 3.11+), as cargo reads it, so a multi-line array is read whole (linux-rev-uw3
+# LOW 5: the line-grep missed one). No tomllib refuses (rc 2, no tally), never falls back to a line match
 required_features() {
-  awk '/^\[\[(bench|example|test)\]\]/{t=1} /^\[/ && !/^\[\[(bench|example|test)\]\]/{t=0} t && /^required-features/' "$1" |
-    grep -oE '"[A-Za-z0-9_-]+"' | tr -d '"' | sort -u
+  python3 -B -c 'import sys
+try:
+    import tomllib
+except ImportError:
+    sys.exit("REFUSED: python3 has no tomllib (3.11+): the manifest cannot be parsed")
+m = tomllib.load(open(sys.argv[1], "rb"))
+fs = sorted({f for k in ("bench", "example", "test") for t in m.get(k) or [] for f in t.get("required-features") or []})
+print("\n".join(fs))' "$1" || exit 2
 }
 # linux-rev-uw3 LOW 5: the parser's own cases, before the build, on planted manifests: a multi-line required-features
 # array (which cargo reads, and the line-grep missed: a planted bench needing 'simulator' passed) must be read whole
@@ -34,7 +42,7 @@ pcase "a one-line required-features array is read" '[ "$(required_features "$pd/
 pcase "uw3 LOW 5: a multi-line required-features array is read whole" '[ "$(required_features "$pd/multi.toml" | tr "\n" " ")" = "fuzz simulator " ]'
 pcase "a key outside [[bench]]/[[example]]/[[test]] is not a target's requirement" '[ -z "$(required_features "$pd/none.toml")" ]'
 [ $pf = 0 ] || { echo "TALLY ran=$((pp + pf + 1)) pass=$pp na=0 fail=$((pf + 1))"; echo "CARGO-ALL-TARGETS FAIL: its parser"; exit 1; }
-req=$(required_features core/Cargo.toml)
+req=$(required_features core/Cargo.toml) || { echo "CARGO-ALL-TARGETS REFUSED: core/Cargo.toml could not be parsed"; exit 2; }
 miss=""
 for f in $req; do [[ ",$FEATURES," == *",$f,"* ]] || miss="$miss $f"; done
 [ -z "$miss" ] || { echo "CARGO-ALL-TARGETS FAIL: targets need features not checked here (cargo skips them):$miss"

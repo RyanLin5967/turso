@@ -192,7 +192,16 @@ def selftest(path):
     lines = r.stdout.splitlines()
     fails = [ln for ln in lines if " FAIL: " in ln]
     total = next((ln for ln in reversed(lines) if ln.startswith("V3L SELF-TEST")), None)
-    return r.returncode, fails, total, r.stderr
+    return r.returncode, fails, total, r.stderr + r.stdout
+
+
+def control_green(rc, out):
+    """linux-rev-uw3 LOW 3: the unmutated control is green when its TALLY agrees with its rc and says pass
+    (gates/tally.py), it printed no FAIL line, and its summary ends ' PASS'"""
+    sys.path.insert(0, os.path.join(os.path.dirname(HERE), "gates"))
+    import tally
+    return tally.judge(out, rc)[0] == "pass" and " FAIL: " not in out and any(
+        ln.startswith("V3L SELF-TEST") and ln.endswith(" PASS") for ln in out.splitlines())
 
 
 def main_case(kind):
@@ -290,8 +299,8 @@ def main(argv, src_path=SRC, table=None, testdata=None):
     if stale:
         print(f"v3l_mutants: REFUSED: stale table: {stale}")
         return 2
-    rc, fails, total, _ = selftest(src_path)
-    if rc != 0 or fails or not total or not total.endswith(" PASS"):
+    rc, fails, total, both = selftest(src_path)
+    if not control_green(rc, both):
         print(f"v3l_mutants: REFUSED: the unmutated self-test is not green (rc {rc}; {total}; {len(fails)} FAIL lines)")
         return 2
     print(f"control (unmutated): {total}")
