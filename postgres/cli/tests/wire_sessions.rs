@@ -14780,3 +14780,33 @@ fn copy_from_a_server_file_needs_the_servers_grant() {
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// Lead ruling 2026-10-18 (found answering the engine's dialect question 2): CREATE INDEX ...
+/// USING gin, hash or any access method but btree silently built a btree, so the client believed
+/// it had an index of a kind it does not have (pg_indexes then said btree). Refused (0A000), as
+/// this server builds btree indexes only; USING btree and no USING build one as before.
+#[test]
+fn an_index_access_method_other_than_btree_is_refused() {
+    let dir = Scratch::new("index-am");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE t(x int, y int)").ok("t");
+    let mut wrong = Vec::new();
+    for am in ["gin", "gist", "hash", "brin", "spgist"] {
+        let sql = format!("CREATE INDEX i_{am} ON t USING {am} (x)");
+        let r = a.q(&sql);
+        if r.error.as_ref().map(|e| e.code.as_str()) != Some("0A000") {
+            wrong.push(format!("{sql}: want 0A000, got {:?} {:?}", r.tags, r.error));
+        }
+    }
+    for sql in ["CREATE INDEX i_b ON t USING btree (x)", "CREATE INDEX i_d ON t (y)"] {
+        if let Some(e) = a.q(sql).error {
+            wrong.push(format!("{sql}: {} {}", e.code, e.message));
+        }
+    }
+    let r = a.q("SELECT count(*) FROM pg_indexes WHERE tablename = 't'");
+    if r.rows != vec![vec![Some("2".to_string())]] {
+        wrong.push(format!("indexes on t: {:?} {:?}", r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
