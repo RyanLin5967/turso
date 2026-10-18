@@ -14061,3 +14061,27 @@ fn switching_capture_to_another_table_while_on_creates_it_and_captures_there() {
     }
     assert!(failed.is_empty(), "CLAIM: switching capture to another table while on did not capture there: {failed:#?}");
 }
+
+/// engine-rev-quote42 MED-3 (lead order c): the DISCRIMINATING attached-view red for 9a58832f5's
+/// view_in_db. main holds a view `vv` over a table that has nothing to drop, and the attached
+/// database `side` holds a view of the SAME name that selects `b` from side.base2. DROP COLUMN b
+/// on side.base2 must be refused for side.vv; a probe that resolves `vv` bare finds main's view,
+/// which compiles fine without b, and lets the drop through.
+#[test]
+fn dropping_a_column_an_attached_view_selects_is_refused_when_main_has_a_view_of_that_name() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("main-vv.db"), DatabaseOpts::new());
+    let c = db.connect().unwrap();
+    c.execute("CREATE TABLE good(a INTEGER)").unwrap();
+    c.execute("CREATE VIEW vv AS SELECT a FROM good").unwrap();
+    let side = dir.path().join("side.db");
+    c.execute(format!("ATTACH DATABASE '{}' AS side", side.display())).unwrap();
+    c.execute("CREATE TABLE side.base2(a INTEGER, b INTEGER)").unwrap();
+    c.execute("CREATE VIEW side.vv AS SELECT b FROM base2").unwrap();
+    let r = c.execute("ALTER TABLE side.base2 DROP COLUMN b");
+    let still = c.prepare("SELECT b FROM side.base2").and_then(|mut s| s.run_collect_rows());
+    assert!(
+        r.is_err() && still.is_ok(),
+        "CLAIM: DROP COLUMN b on side.base2 was not refused for side.vv (main.vv, of the same name, does not select b): drop {r:?}, then SELECT b {still:?}"
+    );
+}
