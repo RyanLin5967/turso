@@ -604,6 +604,13 @@ def self_test():
          os.getuid() == 0 or (got_pid1 is not None and got_pid1[0] != me_uid and got_pid1[1:] == ("-", "-"))),
         ("owner: sample() writes an #owner row for a foreign pid it records, with our user",
          len(burn_owner) == 1 and burn_owner[0][3] == me_user),
+        # the lead's E4 order: owners are resolved at STOP, never inside the timed window (the per-pid lookups cost the
+        # sampler 2-6x CPU there, measured by linux-uw4): every #owner row follows the #stop row
+        ("uw4 E4: every #owner row is written after the #stop row (no owner lookup inside the window)",
+         bool(burn_owner) and min(i for i, r in enumerate(srows) if r[0] == "#owner")
+         > max(i for i, r in enumerate(srows) if r[0] == "#stop")),
+        ("uw4 E4: a process of ours that exited before the stop keeps its uid and login, its run unknown (?)",
+         len(burn_owner) == 1 and burn_owner[0][2] == str(me_uid) and burn_owner[0][4] == "?"),
     ]
     for label, ok in synthetic_evid:
         bad += not ok
