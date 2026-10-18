@@ -380,20 +380,27 @@ def self_test():
     # linux-rev-uw1 MED 3: busy-host evidence comes from the WINDOW's own samples (a ps CPU% is a lifetime average:
     # the reviewer's 30 s burner read 57-94% while idle), of a foreign, non-kernel process outside the test's tree
     def evid(label, rows, exclude=(), gap_at=None, foreign_ticks=0.0, owners=()):
+        return busy_evidence(evid_file(label, rows, gap_at, foreign_ticks, owners), exclude)
+
+    def evid_file(label, rows, gap_at=None, foreign_ticks=0.0, owners=()):
         f = os.path.join(d, f"evid-{label}.tsv")
         with open(f, "w") as o:
             o.write("#start\t0\tcell=ST\tinterval=1.0\tload=()\n")
             for pid, uid, user, run in owners:
                 o.write(f"#owner\t{pid}\t{uid}\t{user}\t{run}\n")
             t_ = 0.0
+            any_sut = any(r[3] == "sut" for r in rows)
             for i in range(20):
                 t_ += 4.0 if gap_at == i else 1.0
+                sut_sum = 0.0
                 for pid, comm, pct, kind, start, n in rows:
                     if start <= i < start + n:
                         o.write(f"{t_:.3f}\t{pid}\t{comm}\t{pct}\t{kind}\n")
-                o.write(f"#tick\t{t_:.3f}\t{foreign_ticks}\t0.0\t50.0\n")
+                        sut_sum += pct if kind == "sut" else 0.0
+                # the tick's SUT sum is the rows' own when the fixture has SUT rows (uw4 MED 1), else the old constant
+                o.write(f"#tick\t{t_:.3f}\t{foreign_ticks}\t0.0\t{sut_sum if any_sut else 50.0}\n")
             o.write("#stop\t20.000\tstop-file\tload=()\n")
-        return busy_evidence(f, exclude)
+        return f
     synthetic_evid = [
         ("MED 3: a foreign process at 60% for 6 window samples is busy-host evidence",
          [p_.split(" ")[0] for p_ in evid("busy", [(7, "java", 60.0, "foreign", 3, 6)])] == ["java"]),
@@ -416,6 +423,31 @@ def self_test():
     # at these claims, not at setup
     ran = globals().get("burners_ran", lambda v, burners, mine: True)
     two_sut = [(True, 1, 17), (True, 1, 17)]
+
+    # linux-rev-uw4 MED 1: a "child" burner is seen only when a SUT-class process that is NOT one of the case's own
+    # (mine: the parent and the self-test) burns, in the window's own per-process rows: sut_max is the SUT TOTAL, so
+    # the parent burning alone (F1: no child forked; F2: also no ancestry rule) satisfied it. The record is passed as
+    # rec=; the red reaches it through a fallback to today's call
+    def ran_rec(v, burners, mine, rec):
+        try:
+            return ran(v, burners, mine, rec=rec)
+        except TypeError:
+            return ran(v, burners, mine)
+
+    def sut_rec(label, rows):
+        return evid_file(label, [(pid, "python3", pct, "sut", start, n) for pid, pct, start, n in rows])
+    child = [("child", 3, 9)]
+    par_only = sut_rec("paronly", [(41, 99.0, 3, 9)])
+    par_child = sut_rec("parchild", [(41, 0.2, 3, 9), (77, 99.0, 3, 9)])
+    brief_child = sut_rec("briefchild", [(41, 0.2, 3, 9), (77, 99.0, 3, 2)])
+    synthetic_evid += [
+        ("uw4 MED 1: a child case whose SUT CPU is all the parent's (pid 41, ours) is refused: no child burned",
+         not ran_rec(decide(par_only), child, {40, 41}, par_only)),
+        ("uw4 MED 1: a child case whose SUT CPU comes from a SUT process not ours (pid 77) shows the child ran",
+         ran_rec(decide(par_child), child, {40, 41}, par_child)),
+        ("uw4 MED 1: a child seen at 99% for only 2 s (under rule 2's 5 s) is not seen to run",
+         not ran_rec(decide(brief_child), child, {40, 41}, brief_child)),
+    ]
     synthetic_evid += [
         ("uw3 MED 1: two SUT burners that never burned (sut_max 0) are refused", not ran({"sut_max": 0.0, "reasons": []}, two_sut, {1, 2})),
         ("uw3 MED 1: two SUT burners seen at 190% pass", ran({"sut_max": 190.0, "reasons": []}, two_sut, {1, 2})),
