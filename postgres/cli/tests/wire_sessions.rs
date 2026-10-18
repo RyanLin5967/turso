@@ -13523,7 +13523,14 @@ fn foreign_keys_cannot_be_turned_off_over_pending_deferred_violations() {
 replays_postgresql!(pg18_c44_m2_sets_replays_as_postgresql_answered, "pg18-c44-m2-sets.out", []);
 // Review c39799c5d..9e24b455d MED 2: a TimeZone value naming a host path (or a zone-directory file that
 // is not a zone) is PostgreSQL's 22023, so no answer tells a client which host files exist.
-replays_postgresql!(pg18_rev_c39_tzpath_replays_as_postgresql_answered, "pg18-rev-c39-tzpath.out", []);
+// Registered from the first host run, iccad11 9f5839a88 diff (rows read one by one; DECISIONS: only from a run's diff).
+replays_postgresql!(
+    pg18_rev_c39_tzpath_replays_as_postgresql_answered,
+    "pg18-rev-c39-tzpath.out",
+    [
+        (7, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = America/New_York refused 0A000 (PG: SET)"),
+    ]
+);
 // C53 follow-up (Codex C56's NEEDS-CLAUDE, frontier/codex/reports/C56-protocol-dependency.md): a
 // retained named statement whose relation was dropped is refused at Bind (42P01, before
 // BindComplete), where PostgreSQL's GetCachedPlan revalidates it, not at Execute.
@@ -13532,9 +13539,113 @@ replays_postgresql!(pg18_c56_schema_prepared_replays_as_postgresql_answered, "pg
 // PostgreSQL's check hooks decide, before this server's own refusal of a valid value it does not
 // act on). Strict until a run's diff registers the intended 0A000 rows (PGDIV-SET-REFUSED), each
 // from a read of that diff.
-replays_postgresql!(pg18_rev_c39_tzforms_replays_as_postgresql_answered, "pg18-rev-c39-tzforms.out", []);
+// Registered from the first host run, iccad11 9f5839a88 diff (rows read one by one; DECISIONS: only from a run's diff).
+replays_postgresql!(
+    pg18_rev_c39_tzforms_replays_as_postgresql_answered,
+    "pg18-rev-c39-tzforms.out",
+    [
+        (1, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = america/new_york refused 0A000 (PG: SET)"),
+        (2, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = AMERICA/NEW_YORK refused 0A000 (PG: SET)"),
+        (3, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = UTC+3 refused 0A000 (PG: SET)"),
+        (4, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = EST5EDT,M3.2.0,M11.1.0 refused 0A000 (PG: SET)"),
+        (6, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = nan refused 0A000 (PG: SET)"),
+        (9, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = +05:30 refused 0A000 (PG: SET)"),
+        (10, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = 5.5 refused 0A000 (PG: SET)"),
+        (11, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = INTERVAL '+05:00' refused 0A000 (PG: SET)"),
+    ]
+);
 replays_postgresql!(pg18_rev_c39_misc_replays_as_postgresql_answered, "pg18-rev-c39-misc.out", []);
-replays_postgresql!(pg18_rev_c39_enc_replays_as_postgresql_answered, "pg18-rev-c39-enc.out", []);
+// Registered from the first host run, iccad11 9f5839a88 diff (rows read one by one; DECISIONS: only from a run's diff).
+replays_postgresql!(
+    pg18_rev_c39_enc_replays_as_postgresql_answered,
+    "pg18-rev-c39-enc.out",
+    [
+        (1, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = sqlascii refused 0A000 (PG: SET)"),
+        (4, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = eucjp refused 0A000 (PG: SET)"),
+        (5, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = euccn refused 0A000 (PG: SET)"),
+        (6, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = euckr refused 0A000 (PG: SET)"),
+        (7, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = euctw refused 0A000 (PG: SET)"),
+        (8, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = eucjis2004 refused 0A000 (PG: SET)"),
+        (9, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = muleinternal: 0A000 both; PG says invalid value, ours not supported"),
+        (10, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = latin1 refused 0A000 (PG: SET)"),
+        (11, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = latin2 refused 0A000 (PG: SET)"),
+        (12, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = latin3 refused 0A000 (PG: SET)"),
+        (13, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = latin4 refused 0A000 (PG: SET)"),
+        (14, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = latin5 refused 0A000 (PG: SET)"),
+        (15, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = latin6 refused 0A000 (PG: SET)"),
+        (16, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = latin7 refused 0A000 (PG: SET)"),
+        (17, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = latin8 refused 0A000 (PG: SET)"),
+        (18, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = latin9 refused 0A000 (PG: SET)"),
+        (19, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = latin10 refused 0A000 (PG: SET)"),
+        (20, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = win1256 refused 0A000 (PG: SET)"),
+        (21, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = win1258 refused 0A000 (PG: SET)"),
+        (22, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = win866 refused 0A000 (PG: SET)"),
+        (23, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = win874 refused 0A000 (PG: SET)"),
+        (24, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = koi8r refused 0A000 (PG: SET)"),
+        (25, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = koi8 refused 0A000 (PG: SET)"),
+        (26, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = win1251 refused 0A000 (PG: SET)"),
+        (27, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = win1252 refused 0A000 (PG: SET)"),
+        (28, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = iso88595 refused 0A000 (PG: SET)"),
+        (29, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = iso88596 refused 0A000 (PG: SET)"),
+        (30, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = iso88597 refused 0A000 (PG: SET)"),
+        (31, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = iso88598 refused 0A000 (PG: SET)"),
+        (32, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = win1250 refused 0A000 (PG: SET)"),
+        (33, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = win1253 refused 0A000 (PG: SET)"),
+        (34, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = win1254 refused 0A000 (PG: SET)"),
+        (35, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = win1255 refused 0A000 (PG: SET)"),
+        (36, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = win1257 refused 0A000 (PG: SET)"),
+        (37, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = koi8u refused 0A000 (PG: SET)"),
+        (38, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = sjis refused 0A000 (PG: SET)"),
+        (39, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = big5 refused 0A000 (PG: SET)"),
+        (40, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = gbk refused 0A000 (PG: SET)"),
+        (41, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = uhc refused 0A000 (PG: SET)"),
+        (42, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = gb18030 refused 0A000 (PG: SET)"),
+        (43, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = johab refused 0A000 (PG: SET)"),
+        (44, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = shiftjis2004 refused 0A000 (PG: SET)"),
+        (45, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = alt refused 0A000 (PG: SET)"),
+        (46, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = win refused 0A000 (PG: SET)"),
+        (47, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = mskanji refused 0A000 (PG: SET)"),
+        (48, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = shiftjis refused 0A000 (PG: SET)"),
+        (49, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = tcvn refused 0A000 (PG: SET)"),
+        (50, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = tcvn5712 refused 0A000 (PG: SET)"),
+        (51, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = vscii refused 0A000 (PG: SET)"),
+        (52, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = abc refused 0A000 (PG: SET)"),
+        (53, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = iso885910 refused 0A000 (PG: SET)"),
+        (54, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = iso885913 refused 0A000 (PG: SET)"),
+        (55, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = iso885914 refused 0A000 (PG: SET)"),
+        (56, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = iso885915 refused 0A000 (PG: SET)"),
+        (57, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = iso885916 refused 0A000 (PG: SET)"),
+        (58, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = iso88591 refused 0A000 (PG: SET)"),
+        (59, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = iso88592 refused 0A000 (PG: SET)"),
+        (60, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = iso88593 refused 0A000 (PG: SET)"),
+        (61, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = iso88594 refused 0A000 (PG: SET)"),
+        (62, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = iso88599 refused 0A000 (PG: SET)"),
+        (78, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = windows1250 refused 0A000 (PG: SET)"),
+        (79, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = windows1251 refused 0A000 (PG: SET)"),
+        (80, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = windows1252 refused 0A000 (PG: SET)"),
+        (81, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = windows1253 refused 0A000 (PG: SET)"),
+        (82, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = windows1254 refused 0A000 (PG: SET)"),
+        (83, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = windows1255 refused 0A000 (PG: SET)"),
+        (84, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = windows1256 refused 0A000 (PG: SET)"),
+        (85, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = windows1257 refused 0A000 (PG: SET)"),
+        (86, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = windows1258 refused 0A000 (PG: SET)"),
+        (87, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = windows866 refused 0A000 (PG: SET)"),
+        (88, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = windows874 refused 0A000 (PG: SET)"),
+        (89, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = windows932 refused 0A000 (PG: SET)"),
+        (90, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = windows936 refused 0A000 (PG: SET)"),
+        (91, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = windows949 refused 0A000 (PG: SET)"),
+        (92, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = windows950 refused 0A000 (PG: SET)"),
+        (93, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = win932 refused 0A000 (PG: SET)"),
+        (94, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = win936 refused 0A000 (PG: SET)"),
+        (95, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = win949 refused 0A000 (PG: SET)"),
+        (96, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = win950 refused 0A000 (PG: SET)"),
+        (99, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = Latin-1 refused 0A000 (PG: SET)"),
+        (100, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = ISO-8859-1 refused 0A000 (PG: SET)"),
+        (101, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = EUC_JP refused 0A000 (PG: SET)"),
+        (102, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = SHIFT_JIS_2004 refused 0A000 (PG: SET)"),
+        (103, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = GB-18030 refused 0A000 (PG: SET)"),
+    ]
+);
 
 /// Named extended-protocol messages, for the kept-statement reds below.
 fn named_parse(w: &mut Wire, name: &str, sql: &str) {
@@ -13854,8 +13965,41 @@ fn a_reprepare_after_another_sessions_ddl_translates_as_the_session_did() {
 // on PG 18.6 (SET TIME ZONE INTERVAL '1 day' 22023, 'x' 22007, the 167-hour bound, '<>5' accepted,
 // ';' refused ...), and SET LOCAL outside a block: the warning BEFORE the value's error. Strict
 // until a run's diff registers the intended 0A000 rows (valid zones this server does not act on).
-replays_postgresql!(pg18_rev_cd_tz2_replays_as_postgresql_answered, "pg18-rev-cd-tz2.out", []);
-replays_postgresql!(pg18_rev_cd_setlocal_replays_as_postgresql_answered, "pg18-rev-cd-setlocal.out", []);
+// Registered from the first host run, iccad11 9f5839a88 diff (rows read one by one; DECISIONS: only from a run's diff).
+replays_postgresql!(
+    pg18_rev_cd_tz2_replays_as_postgresql_answered,
+    "pg18-rev-cd-tz2.out",
+    [
+        (5, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = INTERVAL '+05:00' refused 0A000 (PG: SET)"),
+        (8, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = 167 refused 0A000 (PG: SET)"),
+        (10, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = -167 refused 0A000 (PG: SET)"),
+        (12, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = UTC+167 refused 0A000 (PG: SET)"),
+        (15, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = UTC+3:59 refused 0A000 (PG: SET)"),
+        (18, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = EST5EDT,M3.2.0/1:2:3,M11.1.0 refused 0A000 (PG: SET)"),
+        (19, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = <>5 refused 0A000 (PG: SET)"),
+        (20, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = <AB>5 refused 0A000 (PG: SET)"),
+        (21, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone =  5 refused 0A000 (PG: SET)"),
+        (22, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = 0x5 refused 0A000 (PG: SET)"),
+        (23, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = nan(1) refused 0A000 (PG: SET)"),
+        (24, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = UTC+005 refused 0A000 (PG: SET)"),
+        (25, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = UTC+100 refused 0A000 (PG: SET)"),
+        (26, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = AB3 refused 0A000 (PG: SET)"),
+        (27, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = A_B5 refused 0A000 (PG: SET)"),
+        (29, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = 05:30 refused 0A000 (PG: SET)"),
+        (30, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = +5:3 refused 0A000 (PG: SET)"),
+        (32, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = CST7CDT,M4.1.0,M10.5.0 refused 0A000 (PG: SET)"),
+        (33, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = UTC-2 refused 0A000 (PG: SET)"),
+        (34, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = -1.5 refused 0A000 (PG: SET)"),
+    ]
+);
+// Registered from the first host run, iccad11 9f5839a88 diff (rows read one by one; DECISIONS: only from a run's diff).
+replays_postgresql!(
+    pg18_rev_cd_setlocal_replays_as_postgresql_answered,
+    "pg18-rev-cd-setlocal.out",
+    [
+        (2, "PGDIV-SET-REFUSED ours-only [ours-only]: SET LOCAL TimeZone = America/New_York outside a block: the 25P01 warning as PG sends it, then refused 0A000 (PG: SET)"),
+    ]
+);
 // The line-review reds, from PG 18.6 recordings (pgraw.py: named statements and several
 // sessions; artie 2d9c4aa18b, 23bf38368a): B-L1 and B1 (a same-session DROP mid-round), B-L3 (another
 // session's DROP between Parse and Bind, in autocommit and in a block), E-H1 (the kept statement
@@ -13863,9 +14007,42 @@ replays_postgresql!(pg18_rev_cd_setlocal_replays_as_postgresql_answered, "pg18-r
 // c39 LOW 5 AND CHAIN arms. Strict until a run's diff registers the intended rows.
 replays_postgresql!(pg18_rev_bl1_replays_as_postgresql_answered, "pg18-rev-bl1.out", []);
 replays_postgresql!(pg18_rev_bl3_replays_as_postgresql_answered, "pg18-rev-bl3.out", []);
-replays_postgresql!(pg18_rev_eh1_replays_as_postgresql_answered, "pg18-rev-eh1.out", []);
-replays_postgresql!(pg18_rev_pin_path_replays_as_postgresql_answered, "pg18-rev-pin-path.out", []);
-replays_postgresql!(pg18_rev_low5_chain_replays_as_postgresql_answered, "pg18-rev-low5-chain.out", []);
+// Registered from the first host run, iccad11 9f5839a88 diff (rows read one by one; DECISIONS: only from a run's diff).
+replays_postgresql!(
+    pg18_rev_eh1_replays_as_postgresql_answered,
+    "pg18-rev-eh1.out",
+    [
+        (1, "PGDIV-SCHEMA-REFUSED cluster-state [cluster]: [a] Q CREATE SCHEMA s: ours refuses 0A000 (schemas other than public)"),
+        (2, "PGDIV-SCHEMA-REFUSED cluster-state [cluster]: [a] Q CREATE TABLE s.t(x int): XX000 no such database (the schema was refused)"),
+        (3, "PGDIV-SCHEMA-REFUSED cluster-state [cluster]: [a] Q INSERT INTO s.t VALUES (2): XX000 no such database (the schema was refused)"),
+        (13, "PGDIV-SCHEMA-REFUSED cluster-state [cluster]: a cascade of #1's refusal: under search_path s, `t` resolves to no table (s was never created), so the round fails at its first Parse 42601 'no such object: t'"),
+        (14, "PGDIV-SCHEMA-REFUSED cluster-state [cluster]: a cascade of #1's refusal: DROP TABLE IF EXISTS s.t notices that schema s does not exist (PG drops the s.t it created)"),
+        (15, "PGDIV-SCHEMA-REFUSED cluster-state [cluster]: [a] Q CREATE TABLE s.t(x int): XX000 no such database (the schema was refused)"),
+        (16, "PGDIV-SCHEMA-REFUSED cluster-state [cluster]: [a] Q INSERT INTO s.t VALUES (2): XX000 no such database (the schema was refused)"),
+        (23, "PGDIV-SCHEMA-REFUSED cluster-state [cluster]: a cascade of #1's refusal: under search_path s, `t` resolves to no table (s was never created), so the round fails at its first Parse 42601 'no such object: t'"),
+        (34, "PGDIV-SCHEMA-REFUSED cluster-state [cluster]: a cascade of #1's refusal: under search_path s, `t` resolves to no table (s was never created), so the round fails at its first Parse 42601 'no such object: t'"),
+    ]
+);
+// Registered from the first host run, iccad11 9f5839a88 diff (rows read one by one; DECISIONS: only from a run's diff).
+replays_postgresql!(
+    pg18_rev_pin_path_replays_as_postgresql_answered,
+    "pg18-rev-pin-path.out",
+    [
+        (1, "PGDIV-SCHEMA-REFUSED cluster-state [cluster]: [a] Q CREATE SCHEMA s: ours refuses 0A000 (schemas other than public)"),
+        (2, "PGDIV-SCHEMA-REFUSED cluster-state [cluster]: [a] Q CREATE TABLE s.t(x int): XX000 no such database (the schema was refused)"),
+        (3, "PGDIV-SCHEMA-REFUSED cluster-state [cluster]: [a] Q INSERT INTO s.t VALUES (2): XX000 no such database (the schema was refused)"),
+        (11, "PGDIV-SCHEMA-REFUSED cluster-state [cluster]: a cascade of #1's refusal: under search_path s, `t` resolves to no table (s was never created), so the round fails at its first Parse 42601 'no such object: t'"),
+    ]
+);
+// Registered from the first host run, iccad11 9f5839a88 diff (rows read one by one; DECISIONS: only from a run's diff).
+replays_postgresql!(
+    pg18_rev_low5_chain_replays_as_postgresql_answered,
+    "pg18-rev-low5-chain.out",
+    [
+        (3, "PGDIV-SQLITE-NAME-MESSAGE error-text [wire]: 42P01 both; ours 'Parse error: no such table: nosuch' vs PG 'relation \"nosuch\" does not exist'"),
+        (11, "PGDIV-SQLITE-NAME-MESSAGE error-text [wire]: 42P01 both; ours 'Parse error: no such table: nosuch' vs PG 'relation \"nosuch\" does not exist'"),
+    ]
+);
 
 /// Review wire-line2 H1 (lead: a kind is never carried by text a client can write): client SQL
 /// that starts with the frontend's SQLite marker is refused (42601), on both protocols, so an engine
@@ -14041,4 +14218,19 @@ fn schema_and_table_names_holding_quotes_are_quoted_in_engine_text() {
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
-replays_postgresql!(pg18_rev_l1_tz_replays_as_postgresql_answered, "pg18-rev-l1-tz.out", []);
+// Registered from the first host run, iccad11 9f5839a88 diff (rows read one by one; DECISIONS: only from a run's diff).
+replays_postgresql!(
+    pg18_rev_l1_tz_replays_as_postgresql_answered,
+    "pg18-rev-l1-tz.out",
+    [
+        (1, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = +05:30:00 refused 0A000 (PG: SET)"),
+        (3, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = UTC+3:00:60 refused 0A000 (PG: SET)"),
+        (5, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = UTC+3:00:00 refused 0A000 (PG: SET)"),
+        (6, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = 0.001 refused 0A000 (PG: SET)"),
+        (9, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = A;B5 refused 0A000 (PG: SET)"),
+        (11, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = 0x1p3 refused 0A000 (PG: SET)"),
+        (22, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = INTERVAL '5 hrs' refused 0A000 (PG: SET)"),
+        (23, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = INTERVAL '1 h' refused 0A000 (PG: SET)"),
+        (26, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = INTERVAL '5' refused 0A000 (PG: SET)"),
+    ]
+);
