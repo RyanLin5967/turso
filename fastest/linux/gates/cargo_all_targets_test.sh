@@ -1,0 +1,16 @@
+#!/bin/bash
+# cargo_all_targets_test.sh -- the platform class in Rust (the lead's ruling, 2026-10-18): every target of turso_core
+# must compile on Linux, not only the ones a lane happened to build there. iccad7 found core/examples/branch_githost
+# and branch_restart calling macOS-only libc proc_pid_rusage / rusage_info_v4 with no cfg, so `cargo check
+# --all-targets` failed on Linux while every lane's own command passed. run_everywhere runs this on Linux only
+# (gates/platforms.tsv); on the Mac it is N/A, never a pass, and never a local build. Exit 0 iff the check passes.
+set -uo pipefail
+ROOT=$(git -C "$(dirname "$0")" rev-parse --show-toplevel 2> /dev/null) || ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
+[ -f "$ROOT/core/Cargo.toml" ] || { echo "REFUSED: no core/Cargo.toml under $ROOT"; exit 2; }
+command -v cargo > /dev/null || { echo "REFUSED: cargo is not on PATH"; exit 2; }
+cd "$ROOT" || exit 2
+out=$(timeout 3600 cargo check -p turso_core --all-targets --features conn_raw_api 2>&1); rc=$?
+printf '%s\n' "$out" | grep -E '^error|could not compile' | head -20
+[ $rc = 0 ] && echo "CARGO-ALL-TARGETS PASS: cargo check -p turso_core --all-targets --features conn_raw_api" ||
+  echo "CARGO-ALL-TARGETS FAIL: rc $rc"
+exit $rc
