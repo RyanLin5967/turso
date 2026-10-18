@@ -907,6 +907,7 @@ def selftest():
         r5 = count(tr, [], "/x", w3)
         ok("c3: clock-pair text in the cmd= line is not a stamp (the window stays ok)", r5.get("verdict") == "ok",
            r5.get("verdict"))
+    print(f"TALLY ran={n} pass={n - bad} na=0 fail={bad}")  # gates/tally.py (linux-rev-uw2 MED 1)
     print(f"stracecount selftest: {n - bad}/{n}")
     return 1 if bad else 0
 

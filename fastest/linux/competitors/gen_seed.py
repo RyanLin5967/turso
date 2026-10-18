@@ -252,6 +252,7 @@ def selftest():
     # comp review 1 LOW 27's re-pin (readback_repin.sh, artie runs/loud-20261015/readback-repin): PG 18.6, Dolt 2.4.1 and
     # Doltgres 1.4.0 each read back 10000|89963830|84362189621 with the OFFSET 0 query form. Not computed by the subject.
     ok("row hash at the CI default = what three engines read back", facts(10000, 200, 1)["row_hash"] == 84362189621)
+    print(f"TALLY ran={n} pass={n - bad} na=0 fail={bad}")  # gates/tally.py (linux-rev-uw2 MED 1)
     print(f"gen_seed selftest: {n - bad}/{n}")
     return 1 if bad else 0
 
