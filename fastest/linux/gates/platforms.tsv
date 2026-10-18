@@ -19,6 +19,7 @@ competitors/spec_lint.py	selftest	any	pure Python over records
 competitors/stracecount.py	selftest	any	pure Python over strace text
 competitors/timedrun.py	selftest	any	pure Python over records
 competitors/timedrun_mutants.py	selftest	any	pure Python, timedrun.py mutated in memory
+gates/cargo_all_targets_test.sh		linux	cargo check -p turso_core --all-targets on a Linux build (macOS-only libc calls must be gated)
 gates/driver_contract.py	self-test	any	pure Python; its TracerPid cases name their platform (linux=True/False)
 gates/fixed_api_mutants.py	self-test	any	the table guard on the real files
 gates/sweeper_record.py	selftest	any	pure Python over sweeper records
