@@ -543,6 +543,10 @@ struct GroupState {
     /// was back.
     gathers: u64,
     gathers_expired: u64,
+    /// Observation only (LEAP L3's diagnosis): nanoseconds spent holding gathers, and writing
+    /// flights (the pwrite and its sync), over every gather and flight.
+    gather_ns: u64,
+    flight_ns: u64,
     /// `durable[c]`: every journal byte below this log sequence number is durable in class `c` or
     /// a stronger one (indexed `Off`, `Fsync`, `FullFsync`; `Off` means written to the OS).
     durable: [u64; 3],
@@ -6396,7 +6400,8 @@ impl BranchStore {
                     g.gathering = true;
                     g.gathers += 1;
                     drop(g);
-                    let until = Instant::now() + COHORT_GATHER;
+                    let held_from = Instant::now();
+                    let until = held_from + COHORT_GATHER;
                     let mut back = false;
                     while Instant::now() < until {
                         if group.awaiting.load(Ordering::Acquire) >= cohort {
@@ -6407,6 +6412,7 @@ impl BranchStore {
                     }
                     let mut g = group.lock();
                     g.gathering = false;
+                    g.gather_ns += held_from.elapsed().as_nanos() as u64;
                     if !back {
                         g.gathers_expired += 1;
                     }
@@ -6469,6 +6475,7 @@ impl BranchStore {
             #[cfg(test)]
             pause_at(hold, HOLD_FLIGHT_TAKEN);
             let (end, flight_class) = (flight.end_lsn, flight.class);
+            let written_from = Instant::now();
             // Mutant M-b (PREREG v1 amendment 36): the waiters are acknowledged after the pwrite
             // and before the sync. Caught by C1b and V2, not by SIGKILL.
             let (written, confirm) = split_confirm(if fe_mutant("ack_before_sync") {
@@ -6476,6 +6483,7 @@ impl BranchStore {
             } else {
                 flight.write()
             });
+            group.lock().flight_ns += written_from.elapsed().as_nanos() as u64;
             if written.is_err() {
                 // Fail-stops the group and the journal in one step (they share the flag), and
                 // wakes the waiters, some of whom hold the store mutex while they wait.
@@ -6842,6 +6850,12 @@ impl BranchStore {
     pub(crate) fn gather_counters(&self) -> [u64; 2] {
         let g = self.group.lock();
         [g.gathers, g.gathers_expired]
+    }
+
+    /// LEAP L3's diagnosis, observation only: nanoseconds held in gathers and spent writing flights.
+    pub(crate) fn gather_and_flight_ns(&self) -> [u64; 2] {
+        let g = self.group.lock();
+        [g.gather_ns, g.flight_ns]
     }
 
     /// Grant or extend `id`'s lease to `ttl` past the lease clock's now. A deadline only moves
