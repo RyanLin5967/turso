@@ -3284,6 +3284,86 @@ fn the_bump_site_scan_sees_a_site_move_between_functions_of_one_file() {
     assert_ne!(bump_sites(before), bump_sites(after), "CLAIM: a bump moved between functions of one file is invisible to the scan");
 }
 
+/// HIGH (wire-rev-uw1, lead order): engine code rebuilt ALREADY-UNQUOTED stored names with
+/// `Name::from_string`, which parses quoting: a name that starts with a quote character asserts (with
+/// panic = abort, a release server dies), and a name written with its own quotes ('victim') is dequoted
+/// into another table's name. Each case runs and every failure is listed (a panic is caught per case):
+/// - an FK ON DELETE CASCADE into a child table `"x` (fkeys.rs qualified_table_name);
+/// - an FK cascade into a child table `'victim'` beside a table `victim`: only `'victim'`'s rows go;
+/// - an FK ON UPDATE CASCADE and ON DELETE SET NULL through a quote-led column `"c` (fkeys.rs columns);
+/// - RENAME COLUMN to a quote-led name referenced by a CHECK and an index (alter.rs);
+/// - ALTER TABLE RENAME of a table whose trigger is named `"tr` (execute.rs regenerate_trigger_sql).
+/// At cd1e5624c each went through Name::from_string.
+#[test]
+fn engine_code_rebuilds_stored_names_exactly() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("exact-names.db"), DatabaseOpts::new());
+    let c = db.connect().unwrap();
+    let mut failed: Vec<String> = Vec::new();
+    fn case(c: &Arc<Connection>, failed: &mut Vec<String>, name: &str, sqls: &[&str]) {
+        let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> crate::Result<()> {
+            for sql in sqls {
+                c.execute(sql)?;
+            }
+            Ok(())
+        }));
+        match run {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => failed.push(format!("{name}: {e}")),
+            Err(p) => failed.push(format!(
+                "{name}: PANIC {}",
+                p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default()
+            )),
+        }
+    }
+    case(&c, &mut failed, "FK cascade into \"x", &[
+        "PRAGMA foreign_keys = ON",
+        "CREATE TABLE p(id INTEGER PRIMARY KEY)",
+        "CREATE TABLE \"\"\"x\"(pid INTEGER REFERENCES p(id) ON DELETE CASCADE)",
+        "INSERT INTO p VALUES (1)",
+        "INSERT INTO \"\"\"x\" VALUES (1)",
+        "DELETE FROM p WHERE id = 1",
+    ]);
+    case(&c, &mut failed, "FK cascade into 'victim' beside victim", &[
+        "CREATE TABLE p2(id INTEGER PRIMARY KEY)",
+        "CREATE TABLE victim(pid INTEGER)",
+        "CREATE TABLE \"'victim'\"(pid INTEGER REFERENCES p2(id) ON DELETE CASCADE)",
+        "INSERT INTO p2 VALUES (1)",
+        "INSERT INTO victim VALUES (1)",
+        "INSERT INTO \"'victim'\" VALUES (1)",
+        "DELETE FROM p2 WHERE id = 1",
+    ]);
+    let count = |sql: &str| c.prepare(sql).and_then(|mut s| s.run_collect_rows()).map(|r| r[0][0].to_string());
+    if !failed.iter().any(|f| f.starts_with("FK cascade into 'victim'")) {
+        match (count("SELECT count(*) FROM victim"), count("SELECT count(*) FROM \"'victim'\"")) {
+            (Ok(v), Ok(q)) if v == "1" && q == "0" => {}
+            other => failed.push(format!("FK cascade into 'victim': the cascade hit the wrong table (victim, 'victim') = {other:?}")),
+        }
+    }
+    case(&c, &mut failed, "FK ON UPDATE CASCADE / SET NULL through column \"c", &[
+        "CREATE TABLE p3(id INTEGER PRIMARY KEY)",
+        "CREATE TABLE c3(\"\"\"c\" INTEGER REFERENCES p3(id) ON UPDATE CASCADE ON DELETE SET NULL)",
+        "INSERT INTO p3 VALUES (1)",
+        "INSERT INTO c3 VALUES (1)",
+        "UPDATE p3 SET id = 2 WHERE id = 1",
+        "DELETE FROM p3 WHERE id = 2",
+    ]);
+    case(&c, &mut failed, "RENAME COLUMN to \"n", &[
+        "CREATE TABLE r(a INTEGER CHECK (a >= 0))",
+        "CREATE INDEX ri ON r(a)",
+        "ALTER TABLE r RENAME COLUMN a TO \"\"\"n\"",
+        "INSERT INTO r VALUES (1)",
+    ]);
+    case(&c, &mut failed, "RENAME of a table whose trigger is \"tr", &[
+        "CREATE TABLE tt(a INTEGER)",
+        "CREATE TABLE log(a INTEGER)",
+        "CREATE TRIGGER \"\"\"tr\" AFTER INSERT ON tt BEGIN INSERT INTO log VALUES (new.a); END",
+        "ALTER TABLE tt RENAME TO tt2",
+        "INSERT INTO tt2 VALUES (5)",
+    ]);
+    assert!(failed.is_empty(), "CLAIM: engine code re-parsed a stored name as quoted text: {failed:#?}");
+}
+
 /// R6a (dialect design REVISION 2 item 1; adversary-2 H1, its RAN probe made the red): a branch MERGE compiles
 /// the target table's CHECK, DEFAULT and trigger expressions, which belong to the database, so they resolve
 /// through the database's dialect. A dialect-only function `dfn` (= abs) in a CHECK: a branch updates a row,
