@@ -14656,6 +14656,150 @@ fn another_sessions_drop_waits_for_a_blocks_read_and_is_55p03() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-uw2 H1: the cross-session wait covered only a literal DROP TABLE, so every other
+/// statement that invalidates a block's read ran at once, and the reader's Bind in its block was
+/// 42P01 (42703 for a type change). PostgreSQL 18.6 makes each wait its lock_timeout and answers
+/// 55P03, and the reader then reads its rows (recorded by the reviewer: artie 718f73d7c1,
+/// reviews/uw2-raws/round1-pg-all.txt x01-x12 and round1-pg-run2.txt y01-y09): ALTER TABLE
+/// RENAME, ADD COLUMN, DROP COLUMN and ALTER COLUMN TYPE, TRUNCATE, DROP INDEX of the read
+/// table's index, DROP SCHEMA public CASCADE (the branch server's one schema), DROP TABLE of a
+/// name holding a dot, DROP TABLE ... CASCADE of a table read through a view, and DROP VIEW; and
+/// a DROP TABLE whose name is qualified on one side only. A statement that touches nothing the
+/// block read runs at once.
+#[test]
+fn every_ddl_that_invalidates_a_blocks_read_waits_and_is_55p03() {
+    let dir = Scratch::new("ddl-xsession");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut b = server.connect();
+    for sql in [
+        "CREATE TABLE d(x int, y int)",
+        "INSERT INTO d VALUES (1, 1)",
+        "CREATE INDEX di ON d(x)",
+        "CREATE VIEW dv AS SELECT x FROM d",
+        "CREATE TABLE \"a.b\"(x int)",
+        "INSERT INTO \"a.b\" VALUES (1)",
+        "CREATE TABLE other(x int)",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    b.q("SET lock_timeout = '300ms'").ok("lock_timeout");
+    let mut wrong = Vec::new();
+    for (read, ddl) in [
+        ("SELECT x FROM d", "ALTER TABLE d RENAME TO d2"),
+        ("SELECT x FROM d", "ALTER TABLE d ADD COLUMN z int"),
+        ("SELECT x FROM d", "ALTER TABLE d DROP COLUMN y"),
+        ("SELECT x FROM d", "ALTER TABLE d ALTER COLUMN x TYPE text"),
+        ("SELECT x FROM d", "TRUNCATE d"),
+        ("SELECT x FROM d", "DROP INDEX di"),
+        ("SELECT x FROM d", "DROP SCHEMA public CASCADE"),
+        ("SELECT x FROM public.d", "DROP TABLE d"),
+        ("SELECT x FROM d", "DROP TABLE public.d"),
+        ("SELECT x FROM \"a.b\"", "DROP TABLE \"a.b\""),
+        ("SELECT x FROM dv", "DROP TABLE d CASCADE"),
+        ("SELECT x FROM dv", "DROP VIEW dv"),
+    ] {
+        a.q("BEGIN").ok("begin");
+        named_parse(&mut a, "", read);
+        a.send(b'S', &[]);
+        a.read_reply();
+        let started = Instant::now();
+        let r = b.q(ddl);
+        let waited = started.elapsed();
+        match &r.error {
+            Some(e) if e.code == "55P03" && waited >= Duration::from_millis(250) => {}
+            Some(e) => wrong.push(format!("{ddl} under a's block read {read:?}: {} {} after {waited:?}", e.code, e.message)),
+            None => wrong.push(format!("{ddl} under a's block read {read:?}: ran, after {waited:?}")),
+        }
+        named_bind(&mut a, "", "");
+        named_execute(&mut a, "");
+        a.send(b'S', &[]);
+        let r = a.read_reply();
+        if r.error.is_some() || r.rows != vec![vec![Some("1".to_string())]] {
+            wrong.push(format!("a's {read:?} in its block after b's {ddl}: {:?} {:?}", r.rows, r.error));
+        }
+        a.q("COMMIT").ok("commit");
+    }
+    a.q("BEGIN").ok("begin");
+    named_parse(&mut a, "", "SELECT x FROM d");
+    a.send(b'S', &[]);
+    a.read_reply();
+    for ddl in ["ALTER TABLE other ADD COLUMN z int", "TRUNCATE other", "DROP TABLE other"] {
+        let started = Instant::now();
+        if let Some(e) = b.q(ddl).error {
+            wrong.push(format!("{ddl} (a's block read only d): {} {} after {:?}", e.code, e.message, started.elapsed()));
+        }
+    }
+    a.q("COMMIT").ok("commit");
+    if let Some(e) = b.q("TRUNCATE d").error {
+        wrong.push(format!("TRUNCATE d after a's block ended: {} {}", e.code, e.message));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-uw2 MED (same-session 55006 bypasses): with a named portal open on a read, PostgreSQL
+/// 18.6 refuses, 55006, every statement that would drop or rewrite a relation the portal reads,
+/// naming that relation, and runs the ones its CheckTableNotInUse does not cover (recorded by the
+/// reviewer: artie 718f73d7c1, reviews/uw2-raws/round1-pg-all.txt s01-s16). Ours refused only a
+/// literal DROP TABLE of a name as written: DROP SCHEMA public CASCADE and TRUNCATE ran under the
+/// portal, a name holding a dot was split at the dot, and a table read through a view was not
+/// seen. ALTER TABLE RENAME, DROP INDEX and DROP VIEW of the portal's own view run, as in PG.
+#[test]
+fn ddl_under_this_sessions_open_portal_follows_postgresql() {
+    let dir = Scratch::new("ddl-held");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE TABLE e(x int, y int)",
+        "INSERT INTO e VALUES (1, 1)",
+        "CREATE INDEX ei ON e(x)",
+        "CREATE VIEW v AS SELECT x FROM e",
+        "CREATE TABLE \"a.b\"(x int)",
+        "INSERT INTO \"a.b\" VALUES (1)",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    let in_use = |verb: &str, name: &str| {
+        format!("cannot {verb} \"{name}\" because it is being used by active queries in this session")
+    };
+    let mut wrong = Vec::new();
+    for (i, case) in [
+        ("SELECT x FROM e", "DROP SCHEMA public CASCADE", Some(in_use("DROP TABLE", "e"))),
+        ("SELECT x FROM e", "ALTER TABLE e DROP COLUMN y", Some(in_use("ALTER TABLE", "e"))),
+        ("SELECT x FROM e", "TRUNCATE e", Some(in_use("TRUNCATE", "e"))),
+        ("SELECT x FROM v", "DROP TABLE e CASCADE", Some(in_use("DROP TABLE", "e"))),
+        ("SELECT x FROM \"a.b\"", "DROP TABLE \"a.b\"", Some(in_use("DROP TABLE", "a.b"))),
+        ("WITH w AS (SELECT x FROM e) SELECT x FROM w", "DROP TABLE e", Some(in_use("DROP TABLE", "e"))),
+        ("SELECT 1 FROM (SELECT x FROM e) q", "DROP TABLE e", Some(in_use("DROP TABLE", "e"))),
+        ("SELECT x FROM e", "ALTER TABLE e RENAME TO e2", None),
+        ("SELECT x FROM e", "DROP INDEX ei", None),
+        ("SELECT x FROM v", "DROP VIEW v", None),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (read, ddl, want) = case;
+        let stmt = format!("sh{i}");
+        a.q("BEGIN").ok("begin");
+        named_parse(&mut a, &stmt, read);
+        named_bind(&mut a, "ph", &stmt);
+        a.send(b'S', &[]);
+        a.read_reply();
+        let r = a.q(ddl);
+        match (&r.error, &want) {
+            (Some(e), Some(w)) if e.code == "55006" && e.message == *w => {}
+            (None, None) => {}
+            (got, _) => wrong.push(format!(
+                "{ddl} under the open portal on {read:?}: {:?}, PostgreSQL {}",
+                got.as_ref().map(|e| (&e.code, &e.message)),
+                want.as_deref().map_or("runs".to_string(), |w| format!("55006 {w:?}"))
+            )),
+        }
+        a.q("ROLLBACK").ok("rollback");
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// Review wire-quote LOW-2: pg_get_indexdef, pg_indexes.indexdef and pg_get_constraintdef printed
 /// identifiers unquoted, so pg_dump-style output of a name like `a b` did not read back. PostgreSQL
 /// 18.6 quotes each by quote_identifier and qualifies the index's table (recorded with these very
