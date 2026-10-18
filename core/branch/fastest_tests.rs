@@ -14185,3 +14185,47 @@ fn a_string_literal_name_argument_is_read_as_sql_reads_it() {
     }
     assert!(failed.is_empty(), "CLAIM: a string-literal name argument was not read as SQL reads it: {failed:#?}");
 }
+
+/// Found checking fastest-wire's CreateType fmt report (probes engine-probe-fmt-1 and
+/// engine-probe-type-1, ecetesla2): a type name is the parser's TOKEN (`"m'x"`, quotes included),
+/// and the type registry was keyed by that token while the canonical SQL quoted it again
+/// (`CREATE TYPE """m'x"""`), so the type the reparse registered was named `"m'x"` WITH its quotes
+/// and a STRICT column declared `"m'x"` was "unknown datatype". (The fmt itself prints the token,
+/// which round-trips: probe 1.) A type is one type however its name is quoted: here `"m'x"` and a
+/// plain type declared `"plain2"`, across a reopen, then dropped. Every failure is listed.
+#[test]
+fn a_custom_type_is_one_type_however_its_name_is_quoted() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("quoted-types.db");
+    let mut failed: Vec<String> = Vec::new();
+    {
+        let db = open_at(&path, DatabaseOpts::new().with_custom_types(true));
+        let c = db.connect().unwrap();
+        for sql in [
+            "CREATE TYPE \"m'x\"(value text) BASE text ENCODE lower(value) DECODE value",
+            "CREATE TYPE plain2(value text) BASE text ENCODE lower(value) DECODE value",
+            "CREATE TABLE ut(a \"m'x\", b \"plain2\") STRICT",
+            "INSERT INTO ut VALUES ('v', 'w')",
+        ] {
+            if let Err(e) = c.execute(sql) {
+                failed.push(format!("{sql}: {e}"));
+            }
+        }
+    }
+    let db = open_at(&path, DatabaseOpts::new().with_custom_types(true));
+    let c = db.connect().unwrap();
+    if let Err(e) = c.execute("INSERT INTO ut VALUES ('v2', 'w2')") {
+        failed.push(format!("after the reopen, INSERT INTO ut: {e}"));
+    }
+    match c.prepare("SELECT a, b FROM ut ORDER BY a").and_then(|mut s| s.run_collect_rows()) {
+        Ok(r) if r.iter().map(|row| (row[0].to_string(), row[1].to_string())).collect::<Vec<_>>()
+            == [("v".to_string(), "w".to_string()), ("v2".to_string(), "w2".to_string())] => {}
+        other => failed.push(format!("after the reopen, ut = {other:?}, want (v, w), (v2, w2)")),
+    }
+    for sql in ["DROP TABLE ut", "DROP TYPE \"m'x\"", "DROP TYPE \"plain2\""] {
+        if let Err(e) = c.execute(sql) {
+            failed.push(format!("{sql}: {e}"));
+        }
+    }
+    assert!(failed.is_empty(), "CLAIM: a quoted custom type name was not one type: {failed:#?}");
+}
