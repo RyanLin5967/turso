@@ -14679,3 +14679,51 @@ fn definitions_quote_their_identifiers_as_postgresql_does() {
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// Review wire-quote LOW-4: a schema's name went into its database file's path as it is, so a
+/// name holding `/` named a path in a directory that does not exist (the CREATE failed), `..`
+/// could step out of the database's directory, and CREATE and DROP SCHEMA lowercased a quoted
+/// name, which PostgreSQL keeps as written. Each schema's file lies in the database's own
+/// directory, under a name that encodes the schema's, and the schema reads back after a reopen.
+#[test]
+fn a_schema_name_is_never_a_path() {
+    let dir = Scratch::new("schema-path");
+    let mut wrong = Vec::new();
+    for sql in [
+        "CREATE SCHEMA \"a/b\"",
+        "CREATE TABLE \"a/b\".t (x int)",
+        "INSERT INTO \"a/b\".t VALUES (1)",
+        "CREATE SCHEMA \"..\"",
+        "CREATE SCHEMA \"MixedCase\"",
+        "CREATE TABLE \"MixedCase\".t (x int)",
+    ] {
+        let (ok, out) = cli_one(&dir, sql);
+        if !ok {
+            wrong.push(format!("{sql}: {out}"));
+        }
+    }
+    for (sql, want) in [
+        ("SELECT x FROM \"a/b\".t", "1"),
+        ("SELECT count(*) FROM \"MixedCase\".t", "0"),
+    ] {
+        let (ok, out) = cli_one(&dir, sql);
+        if !ok || !out.contains(want) {
+            wrong.push(format!("after a reopen, {sql}: {out}"));
+        }
+    }
+    let parent = dir.0.parent().expect("the scratch has a parent");
+    let strays: Vec<_> = std::fs::read_dir(parent)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.starts_with("turso-postgres-schema-"))
+        .collect();
+    if !strays.is_empty() {
+        wrong.push(format!("schema files outside the database's directory: {strays:?}"));
+    }
+    let (_, names) = cli_one(&dir, "SELECT nspname FROM pg_namespace ORDER BY nspname");
+    if !names.contains("MixedCase") {
+        wrong.push(format!("the quoted name MixedCase was not kept as written: {names}"));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
