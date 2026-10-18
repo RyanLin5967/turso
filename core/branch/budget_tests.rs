@@ -3138,6 +3138,9 @@ fn nothing_on_the_probes_window_path_allocates() {
                 "shim_counts", "shim", "shim_lost", "unix_syscalls", "instructions", "store_locked_at", "store_unlocked_of",
                 "mutant_on", "threads", "others_blocked", "each_thread", "spinning", "bump", "record_alloc", "record_free",
                 "wal_lock_held", "persistent_live", "note_alloc", "alloc", "alloc_zeroed", "realloc", "dealloc",
+                // The Linux thread-state readers (the Linux port, 2026-10-18).
+                "owned_named", "linux_tid", "linux_read_into", "linux_task_path", "linux_task_alive", "linux_task_stat",
+                "linux_task_run_ns", "linux_each_tid",
             ][..],
         ),
         ("budget_tests.rs", include_str!("budget_tests.rs"), &["absorb_confirm", "writer_settled", "spin_settled", "settled"][..]),
@@ -3203,7 +3206,7 @@ fn nothing_on_the_probes_window_path_allocates() {
             }
         }
     }
-    assert_eq!(read, 43, "premise: every function on the window path was read:\n{found}");
+    assert_eq!(read, 51, "premise: every function on the window path was read:\n{found}");
     assert!(found.is_empty(), "the probe's window path allocates, prints, reads the environment or calls fe_mutant:\n{found}");
 }
 
