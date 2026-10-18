@@ -15111,3 +15111,70 @@ fn a_schema_whose_name_needs_quoting_holds_tables_and_keeps_its_case() {
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// wire-rev-uw2 N1, DATA LOSS: through the CLI, DROP SCHEMA without CASCADE on a schema that holds
+/// a table detached it and deleted its file, so the table and its rows were gone, in autocommit,
+/// inside a block, and for `DROP SCHEMA a, b` where only b holds one. PostgreSQL 18.6 refuses with
+/// 2BP01 and drops nothing (wire-rev-uw2's PG runs, artie 718f73d7c1 reviews/uw2-raws/r5-pg.txt:
+/// m2e, m4a, m4c). Also N2 (an empty schema's DROP ... CASCADE failed 'database s is locked') and
+/// N3 (`DROP SCHEMA s, s CASCADE` dropped s, then reported an error; PG drops it once).
+#[test]
+fn drop_schema_without_cascade_keeps_a_schema_that_holds_tables() {
+    let dir = Scratch::new("drop-schema-restrict");
+    let mut wrong = Vec::new();
+    let mut must = |sql: &str, wrong: &mut Vec<String>| {
+        let (ok, out) = cli_one(&dir, sql);
+        if !ok {
+            wrong.push(format!("{sql}: {out}"));
+        }
+    };
+    for sql in [
+        "CREATE SCHEMA s",
+        "CREATE TABLE s.t (x int)",
+        "INSERT INTO s.t VALUES (1)",
+        "CREATE SCHEMA a",
+        "CREATE SCHEMA b",
+        "CREATE TABLE b.t (x int)",
+        "INSERT INTO b.t VALUES (2)",
+    ] {
+        must(sql, &mut wrong);
+    }
+    let (ok, out) = cli_one(&dir, "DROP SCHEMA s");
+    if ok || !out.contains("cannot drop schema s because other objects depend on it") {
+        wrong.push(format!("DROP SCHEMA s (non-empty): ok {ok}: {out}"));
+    }
+    let block = Command::new(env!("CARGO_BIN_EXE_tursopg"))
+        .arg(dir.db())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .and_then(|mut c| {
+            c.stdin.take().unwrap().write_all(b"BEGIN;\nDROP SCHEMA s;\nCOMMIT;\n")?;
+            c.wait_with_output()
+        })
+        .expect("the CLI");
+    let _ = block;
+    let (ok, out) = cli_one(&dir, "DROP SCHEMA a, b");
+    if ok || !out.contains("cannot drop desired object(s) because other objects depend on them") {
+        wrong.push(format!("DROP SCHEMA a, b (b non-empty): ok {ok}: {out}"));
+    }
+    for (sql, want) in [("SELECT x FROM s.t", "1"), ("SELECT x FROM b.t", "2")] {
+        let (ok, out) = cli_one(&dir, sql);
+        if !ok || !out.contains(want) {
+            wrong.push(format!("after the refused DROPs, {sql}: {out}"));
+        }
+    }
+    let (_, names) = cli_one(&dir, "SELECT nspname FROM pg_namespace ORDER BY nspname");
+    if !names.lines().any(|l| l.split('│').any(|c| c.trim() == "a")) {
+        wrong.push(format!("schema a was dropped by the refused DROP SCHEMA a, b: {names}"));
+    }
+    for sql in ["DROP SCHEMA a CASCADE", "DROP SCHEMA IF EXISTS nosuch CASCADE", "DROP SCHEMA s, s CASCADE"] {
+        must(sql, &mut wrong);
+    }
+    let (ok, _) = cli_one(&dir, "SELECT x FROM s.t");
+    if ok {
+        wrong.push("s.t reads after DROP SCHEMA s, s CASCADE".to_string());
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
