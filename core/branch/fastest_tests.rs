@@ -14558,3 +14558,68 @@ fn an_attached_database_keeps_its_name_as_written() {
     }
     assert!(failed.is_empty(), "CLAIM: an attached database's name was not kept as written and matched in any case: {failed:#?}");
 }
+
+/// Found by the LOW red at the tip and probe engine-probe-mv-1 (ecetesla2): a materialized view over
+/// a table whose name needs quotes is populated but never maintained by INSERT, and one over a
+/// mixed-case table is not even populated. INSERT keyed its view delta by the Name's display (the
+/// quoted `"s p"`), where UPDATE and DELETE use the table's own name and the view's input is named
+/// as its SELECT wrote it. Each table: insert, view, insert, update; the view must follow. Every
+/// failure is listed.
+#[test]
+fn a_materialized_view_follows_writes_to_a_table_whose_name_needs_quotes_or_case() {
+    let mut failed: Vec<String> = Vec::new();
+    for (i, (create, view_ref)) in [
+        ("\"s p\"", "\"s p\""),
+        ("\"m\"\"t\"", "\"m\"\"t\""),
+        ("\"Mixed\"", "\"Mixed\""),
+        ("Upper", "upper"),
+        ("plain", "plain"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("mv.db"), DatabaseOpts::new().with_views(true));
+        let c = db.connect().unwrap();
+        let read = |c: &Arc<Connection>| -> Result<Vec<String>, String> {
+            let mut v: Vec<String> = c
+                .prepare(format!("SELECT a FROM mv{i}"))
+                .and_then(|mut s| s.run_collect_rows())
+                .map_err(|e| e.to_string())?
+                .iter()
+                .map(|r| r[0].to_string())
+                .collect();
+            v.sort();
+            Ok(v)
+        };
+        let step = |sql: String| c.execute(&sql).map_err(|e| format!("{sql}: {e}"));
+        let r = step(format!("CREATE TABLE {create}(a INTEGER)"))
+            .and_then(|()| step(format!("INSERT INTO {create} VALUES (1)")))
+            .and_then(|()| step(format!("CREATE MATERIALIZED VIEW mv{i} AS SELECT a FROM {view_ref}")));
+        if let Err(e) = r {
+            failed.push(format!("{create}: {e}"));
+            continue;
+        }
+        match read(&c) {
+            Ok(v) if v == ["1"] => {}
+            other => failed.push(format!("{create}: populated view = {other:?}, want [1]")),
+        }
+        if let Err(e) = step(format!("INSERT INTO {view_ref} VALUES (2)")) {
+            failed.push(format!("{create}: {e}"));
+            continue;
+        }
+        match read(&c) {
+            Ok(v) if v == ["1", "2"] => {}
+            other => failed.push(format!("{create}: after INSERT the view = {other:?}, want [1, 2]")),
+        }
+        if let Err(e) = step(format!("UPDATE {create} SET a = 5 WHERE a = 1")) {
+            failed.push(format!("{create}: {e}"));
+            continue;
+        }
+        match read(&c) {
+            Ok(v) if v == ["2", "5"] => {}
+            other => failed.push(format!("{create}: after UPDATE the view = {other:?}, want [2, 5]")),
+        }
+    }
+    assert!(failed.is_empty(), "CLAIM: a materialized view did not follow its table: {failed:#?}");
+}
