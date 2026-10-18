@@ -1598,7 +1598,7 @@ fn this_thread_id() -> u64 {
     #[cfg(not(target_vendor = "apple"))]
     {
         // SAFETY: gettid(2) has no preconditions and cannot fail.
-        unsafe { libc::syscall(libc::SYS_gettid) as u64 }
+        unsafe { libc::gettid() as u64 }
     }
 }
 
