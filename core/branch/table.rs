@@ -168,6 +168,13 @@ impl<T: Preimage> BranchTable<T> {
         self.inline_allocs
     }
 
+    /// Test builds: empty the pool (engine-rev-l2b HIGH 3's schedule: a hold that leaves it low).
+    #[cfg(test)]
+    pub(crate) fn drain_pool_for_test(&mut self) {
+        self.spare_chunks.clear();
+        self.spare_segments.clear();
+    }
+
     /// The ids the pool's spare chunks cover.
     pub(crate) fn spare_ids(&self) -> u64 {
         (self.spare_chunks.len() * CHUNK) as u64

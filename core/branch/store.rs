@@ -15324,3 +15324,37 @@ mod fail_stop_tests {
     }
 }
 
+
+#[cfg(test)]
+mod l2b_kick_tests {
+    use super::*;
+    use crate::branch::SyncClass;
+
+    /// engine-rev-l2b HIGH 3 (its reproducer, as a red): a hold that leaves the table's pool low
+    /// and unkicked, dropped while its thread holds the group lock (begin_cut's pattern: the store
+    /// guard, then the group lock, then the guard dropped), must not deadlock on the pool's wake.
+    #[test]
+    fn a_low_pool_unlock_under_the_group_lock_does_not_deadlock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("k.db");
+        let store = Arc::new(
+            BranchStore::open(BranchDurability::Durable { sync: SyncClass::Off }, None, path.to_str().unwrap()).unwrap(),
+        );
+        assert!(store.confirm_writer.lock().is_some(), "premise: the background writer runs");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let s2 = store.clone();
+        std::thread::spawn(move || {
+            let mut guard = s2.inner.lock();
+            guard.branches.drain_pool_for_test();
+            s2.inner.pool_kicked.store(false, Ordering::Release);
+            let g = s2.group.lock();
+            drop(guard);
+            drop(g);
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_secs(10)).is_ok(),
+            "CLAIM: a low pool's unlock under the group lock returned (it deadlocked on the pool's wake)"
+        );
+    }
+}
