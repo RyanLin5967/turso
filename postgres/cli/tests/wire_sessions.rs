@@ -14810,3 +14810,41 @@ fn an_index_access_method_other_than_btree_is_refused() {
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// Found by the review wire-quote LOW-2 red: '...'::regclass was a cast to INTEGER, so every name
+/// answered 0 and a catalog query by regclass (conrelid = 't'::regclass, as psql and drivers send)
+/// matched nothing, silently. PostgreSQL 18.6 resolves the name to its pg_class oid, reading it as
+/// an identifier list, and refuses a missing relation 42P01 and a malformed name 42602 (recorded
+/// with these statements: artie 3b69c8dab8, pg18-rev-regclass.out).
+#[test]
+fn a_regclass_names_its_relations_oid() {
+    let dir = Scratch::new("regclass");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in ["CREATE TABLE \"a b\"(x int)", "CREATE TABLE t2(x int)", "CREATE INDEX ij ON t2(x)"] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    let r = a.q(
+        "SELECT '\"a b\"'::regclass = (SELECT oid FROM pg_class WHERE relname = 'a b'), \
+         'T2'::regclass = (SELECT oid FROM pg_class WHERE relname = 't2'), \
+         'public.t2'::regclass = (SELECT oid FROM pg_class WHERE relname = 't2'), \
+         'ij'::regclass = (SELECT oid FROM pg_class WHERE relname = 'ij')",
+    );
+    let t = Some("t".to_string());
+    if r.error.is_some() || r.rows != vec![vec![t.clone(), t.clone(), t.clone(), t]] {
+        wrong.push(format!("the four names: {:?} {:?}", r.rows, r.error));
+    }
+    for (sql, code, message) in [
+        ("SELECT 'nosuch'::regclass", "42P01", "relation \"nosuch\" does not exist"),
+        ("SELECT '\"T2\"'::regclass", "42P01", "relation \"T2\" does not exist"),
+        ("SELECT 'a b'::regclass", "42602", "invalid name syntax"),
+    ] {
+        let r = a.q(sql);
+        match &r.error {
+            Some(e) if e.code == code && e.message == message => {}
+            other => wrong.push(format!("{sql}: want {code} {message:?}, got {other:?} {:?}", r.rows)),
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
