@@ -14848,3 +14848,143 @@ fn a_regclass_names_its_relations_oid() {
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// wire-rev-uw1 M3 (DESTRUCTIVE at 56e4400d9): the server's refusal compared "public" without
+/// case, and the frontend then lowercased the name, so DROP SCHEMA "PUBLIC" CASCADE dropped every
+/// public table. A quoted "PUBLIC" is a schema of its own: PG 18.6 answers 3F000 'schema "PUBLIC"
+/// does not exist' and drops nothing (recorded: artie aebf97e89c, pg18-rev-uw1-schema.out). The
+/// server refuses it as every schema but public (0A000); the CLI answers PG's 3F000.
+#[test]
+fn a_quoted_public_is_not_public() {
+    let dir = Scratch::new("quoted-public");
+    let mut wrong = Vec::new();
+    {
+        let server = Server::start(&dir.db(), &[]);
+        let mut a = server.connect();
+        a.q("CREATE TABLE keep(x int)").ok("keep");
+        a.q("INSERT INTO keep VALUES (1)").ok("row");
+        let r = a.q("DROP SCHEMA \"PUBLIC\" CASCADE");
+        if r.error.as_ref().map(|e| e.code.as_str()) != Some("0A000") {
+            wrong.push(format!("server DROP SCHEMA \"PUBLIC\" CASCADE: {:?}", r.error));
+        }
+        let r = a.q("SELECT count(*) FROM keep");
+        if r.rows != vec![vec![Some("1".to_string())]] {
+            wrong.push(format!("server: keep after it: {:?} {:?}", r.rows, r.error));
+        }
+    }
+    let (ok, out) = cli_one(&dir, "DROP SCHEMA \"PUBLIC\" CASCADE");
+    if ok || !out.contains("schema \"PUBLIC\" does not exist") {
+        wrong.push(format!("CLI DROP SCHEMA \"PUBLIC\" CASCADE: ok {ok}: {out}"));
+    }
+    let (_, out) = cli_one(&dir, "SELECT count(*) FROM keep");
+    if !out.contains('1') {
+        wrong.push(format!("CLI: keep after it: {out}"));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-uw1 M4: DROP SCHEMA read only its first name, so `DROP SCHEMA s, nosuch CASCADE`
+/// dropped s and skipped nosuch silently, and the server's refusal checked only the first. PG 18.6
+/// checks every name first: 3F000 for nosuch and s kept; with IF EXISTS a NOTICE for nosuch and s
+/// dropped (recorded: pg18-rev-uw1-schema.out). On the server, any name but public is refused.
+#[test]
+fn drop_schema_reads_every_name() {
+    let dir = Scratch::new("drop-schemas");
+    let mut wrong = Vec::new();
+    for sql in ["CREATE SCHEMA s", "CREATE TABLE s.t (x int)", "CREATE TABLE keep (x int)"] {
+        let (ok, out) = cli_one(&dir, sql);
+        if !ok {
+            wrong.push(format!("{sql}: {out}"));
+        }
+    }
+    let (ok, out) = cli_one(&dir, "DROP SCHEMA s, nosuch CASCADE");
+    if ok || !out.contains("schema \"nosuch\" does not exist") {
+        wrong.push(format!("DROP SCHEMA s, nosuch CASCADE: ok {ok}: {out}"));
+    }
+    let (ok, out) = cli_one(&dir, "SELECT count(*) FROM s.t");
+    if !ok {
+        wrong.push(format!("s.t after the refused DROP: {out}"));
+    }
+    {
+        let server = Server::start(&dir.db(), &[]);
+        let mut a = server.connect();
+        let r = a.q("DROP SCHEMA public, s CASCADE");
+        if r.error.as_ref().map(|e| e.code.as_str()) != Some("0A000") {
+            wrong.push(format!("server DROP SCHEMA public, s CASCADE: {:?}", r.error));
+        }
+        if a.q("SELECT count(*) FROM keep").error.is_some() {
+            wrong.push("server: keep was dropped by the refused DROP".to_string());
+        }
+    }
+    let (ok, out) = cli_one(&dir, "DROP SCHEMA IF EXISTS nosuch, s CASCADE");
+    if !ok {
+        wrong.push(format!("DROP SCHEMA IF EXISTS nosuch, s CASCADE: {out}"));
+    }
+    let (ok, _) = cli_one(&dir, "SELECT count(*) FROM s.t");
+    if ok {
+        wrong.push("s.t after DROP SCHEMA IF EXISTS nosuch, s CASCADE still reads".to_string());
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-uw1 M2: the frontend deletes a dropped schema's file at its block's COMMIT, but only
+/// the server reported a block's end to it, and the server refuses every DROP SCHEMA but public's:
+/// the CLI, the one place a DROP SCHEMA can run in a block, never deleted the file, so the schema
+/// came back at the next open. Through the CLI, BEGIN; DROP SCHEMA s CASCADE; COMMIT, then a new
+/// process can CREATE SCHEMA s; and a DROP rolled back keeps the schema and its table.
+#[test]
+fn a_schema_dropped_in_a_cli_block_goes_at_commit_and_stays_at_rollback() {
+    let dir = Scratch::new("drop-schema-block");
+    let mut wrong = Vec::new();
+    for sql in ["CREATE SCHEMA s", "CREATE TABLE s.t (x int)", "CREATE SCHEMA r", "CREATE TABLE r.t (x int)"] {
+        let (ok, out) = cli_one(&dir, sql);
+        if !ok {
+            wrong.push(format!("{sql}: {out}"));
+        }
+    }
+    cli_script(&dir, b"BEGIN;\nDROP SCHEMA s CASCADE;\nCOMMIT;\n");
+    let (ok, out) = cli_one(&dir, "CREATE SCHEMA s");
+    if !ok {
+        wrong.push(format!("CREATE SCHEMA s after the block's COMMIT: {out}"));
+    }
+    let rolled = Command::new(env!("CARGO_BIN_EXE_tursopg"))
+        .arg(dir.db())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .and_then(|mut c| {
+            c.stdin.take().unwrap().write_all(b"BEGIN;\nDROP SCHEMA r CASCADE;\nROLLBACK;\n")?;
+            c.wait_with_output()
+        })
+        .expect("the CLI");
+    let (ok, out) = cli_one(&dir, "SELECT count(*) FROM r.t");
+    if !ok {
+        wrong.push(format!(
+            "r.t after a DROP SCHEMA rolled back: {out} (the block: {})",
+            String::from_utf8_lossy(&rolled.stdout)
+        ));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-uw1 LOW-2: DROP SCHEMA public CASCADE listed the user tables with NOT LIKE 'sqlite_%',
+/// where `_` is any character, so a table named sqliteXy was left behind. Every user table goes.
+#[test]
+fn drop_schema_public_cascade_drops_a_table_named_like_sqlite() {
+    let dir = Scratch::new("drop-public-like");
+    let mut wrong = Vec::new();
+    for sql in ["CREATE TABLE sqlitexy (x int)", "CREATE TABLE plain (x int)", "DROP SCHEMA public CASCADE"] {
+        let (ok, out) = cli_one(&dir, sql);
+        if !ok {
+            wrong.push(format!("{sql}: {out}"));
+        }
+    }
+    for t in ["sqlitexy", "plain"] {
+        let (ok, _) = cli_one(&dir, &format!("SELECT count(*) FROM {t}"));
+        if ok {
+            wrong.push(format!("{t} survived DROP SCHEMA public CASCADE"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
