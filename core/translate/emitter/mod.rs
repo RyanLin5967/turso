@@ -703,9 +703,14 @@ impl<'a> Resolver<'a> {
     }
 
     fn schema_has_table_like_object(schema: &Schema, table_name: &str) -> bool {
+        // A broken or incompatible view is held too, so a search path finds it where its callers
+        // look (DROP VIEW of a broken view; the incompatible-version refusal: adversary of
+        // f8d0c9eb0, LOWs; no red, no fixture makes a broken view without writing sqlite_schema).
         schema.get_table(table_name).is_some()
             || schema.get_view(table_name).is_some()
             || schema.get_materialized_view(table_name).is_some()
+            || schema.broken_views.contains(&crate::util::normalize_ident(table_name))
+            || schema.incompatible_views.contains(&crate::util::normalize_ident(table_name))
     }
 
     fn schema_has_index(schema: &Schema, index_name: &str) -> bool {

@@ -1455,9 +1455,11 @@ pub fn translate_optimize(
         });
 
         if !found {
-            return Err(LimboError::InvalidArgument(format!(
-                "No such index: {idx_name}"
-            ).into()));
+            // PostgreSQL's 42704 (undefined_object), the variant kept (adversary of f8d0c9eb0, LOW).
+            return Err(LimboError::InvalidArgument(crate::error::SqlErrorMessage::classified(
+                crate::error::SqlErrorKind::UndefinedObject,
+                format!("No such index: {idx_name}"),
+            )));
         }
     } else {
         // Optimize all index method indexes across all visible databases.
