@@ -37,7 +37,13 @@ pub unsafe extern "C" fn execute(
     let weak_box = extcon._ctx as *const Weak<Connection>;
     let weak = unsafe { &*weak_box };
     if let Some(conn) = weak.upgrade() {
-        match conn.prepare_engine(EngineSql::new(sql_str), Origin::Root).map(Some) {
+        // Text with no statement (empty, or only comments) is no statement, as `query` answered
+        // before step 2b (dialect code review LOW-3), not a prepare error.
+        let stmt = match crate::dialect::sqlite::parse(&sql_str) {
+            Ok((None, _)) => Ok(None),
+            _ => conn.prepare_engine(EngineSql::new(sql_str), Origin::Root).map(Some),
+        };
+        match stmt {
             Ok(Some(mut stmt)) => {
                 if arg_count > 0 {
                     let args_slice = &mut std::slice::from_raw_parts_mut(args, arg_count as usize);
