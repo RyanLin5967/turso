@@ -2501,7 +2501,17 @@ mod search_path_error_kind_tests {
     fn optimize_index_of_a_missing_index_is_an_undefined_object() {
         use crate::error::SqlErrorKind;
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        // FLAGGED fixture repair: OPTIMIZE INDEX needs the index-method feature on; the first runs
+        // (red 94de196d0, green 15729a565) refused at that gate, before the claim.
+        let db = Database::open_file_with_flags(
+            io,
+            ":memory:",
+            crate::OpenFlags::Create,
+            crate::DatabaseOpts::new().with_index_method(true),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
         let conn = db.connect().unwrap();
         let mut failed: Vec<String> = Vec::new();
         for path in [None, Some("public")] {
