@@ -317,6 +317,11 @@ mod tests {
             "client-only"
         }
         fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+            // The tail after a client statement holds no statement (an `execute` loop parses it to
+            // find that out), so it is not engine text: no statement, as every real dialect answers.
+            if sql.trim().is_empty() {
+                return Ok((None, sql.len()));
+            }
             let Some(rest) = sql.strip_prefix("client: ") else {
                 return Err(crate::LimboError::ParseError(format!("client-only dialect refused engine text: {sql}")));
             };
