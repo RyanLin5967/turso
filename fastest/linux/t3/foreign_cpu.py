@@ -335,10 +335,12 @@ def self_test():
 
     # linux-rev-uw1 MED 3: busy-host evidence comes from the WINDOW's own samples (a ps CPU% is a lifetime average:
     # the reviewer's 30 s burner read 57-94% while idle), of a foreign, non-kernel process outside the test's tree
-    def evid(label, rows, exclude=(), gap_at=None, foreign_ticks=0.0):
+    def evid(label, rows, exclude=(), gap_at=None, foreign_ticks=0.0, owners=()):
         f = os.path.join(d, f"evid-{label}.tsv")
         with open(f, "w") as o:
             o.write("#start\t0\tcell=ST\tinterval=1.0\tload=()\n")
+            for pid, uid, user, run in owners:
+                o.write(f"#owner\t{pid}\t{uid}\t{user}\t{run}\n")
             t_ = 0.0
             for i in range(20):
                 t_ += 4.0 if gap_at == i else 1.0
@@ -387,6 +389,49 @@ def self_test():
         ("uw3 LOW 6: the same rule-1 load from the test's own tree is no evidence",
          evid("r1own", [(31, "a", 40.0, "foreign", 0, 20), (32, "b", 40.0, "foreign", 0, 20), (33, "c", 40.0, "foreign", 0, 20),
                         (34, "d", 40.0, "foreign", 0, 20)], exclude={31, 32, 33, 34}, foreign_ticks=160.0) == []),
+    ]
+    # the lead's 2026-10-18 order (M1's quiet baseline VOIDed on eceubuntu2 and ecetesla3 by "node-MainThread"
+    # processes nobody could name afterwards): busy-host evidence names each process's OWNER, user and, for a process
+    # of this account, the uwrun run it belongs to (its cwd under <prefix>-runs/<NAME>/), from #owner rows the sampler
+    # writes when it first records a foreign pid. The busy rule itself does NOT exclude our own runs: a window shared
+    # with another of our runs is as loaded as one shared with a stranger, and T3 times only quiet windows. The red
+    # reaches owner_of through a fallback with today's behaviour (nothing recorded: None)
+    own = globals().get("owner_of", lambda pid: None)
+    import pwd
+    me_user = pwd.getpwuid(os.getuid()).pw_name
+    rd = os.path.join(d, "x-runs", "probe-run", "work")
+    os.makedirs(rd)
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], cwd=rd)
+    try:
+        got_child = own(child.pid)
+    finally:
+        child.kill(); child.wait()
+    got_self = own(os.getpid())
+    # sample() itself: a foreign child burning for 2 s is recorded, and the record carries an #owner row for it
+    srec, sstop = os.path.join(d, "owner-sample.tsv"), os.path.join(d, "owner-sample.stop")
+    burn = subprocess.Popen([sys.executable, "-c", "import time\nt=time.monotonic()\nwhile time.monotonic()-t<3: pass"])
+    sp = subprocess.Popen([sys.executable, "-B", os.path.abspath(__file__), "sample", srec, "--cell", "OWNERPROBE",
+                           "--interval", "0.5", "--stop-file", sstop, "--max-s", "10"])
+    burn.wait()
+    open(sstop, "w").close()
+    sp.wait()
+    srows = [ln.rstrip("\n").split("\t") for ln in open(srec)]
+    burn_owner = [r for r in srows if r[0] == "#owner" and r[1] == str(burn.pid)]
+    synthetic_evid += [
+        ("owner: busy-host evidence names another user's process by its user",
+         evid("own1", [(7, "node-MainThread", 90.0, "foreign", 2, 8)], owners=[(7, 4242, "alice", "-")])
+         == ["node-MainThread pid 7 (user alice)"]),
+        ("owner: busy-host evidence names a process of OUR account by its uwrun run",
+         evid("own2", [(7, "node-MainThread", 90.0, "foreign", 2, 8)], owners=[(7, 1000, me_user, "moonshot-x")])
+         == [f"node-MainThread pid 7 (user {me_user}, our run moonshot-x)"]),
+        ("owner: a process with no #owner row is named as unrecorded, never guessed",
+         evid("own3", [(7, "java", 90.0, "foreign", 2, 8)]) == ["java pid 7 (owner unrecorded)"]),
+        ("owner: owner_of names a child of ours by our user and by the run its cwd is under",
+         got_child is not None and got_child[1:] == (me_user, "probe-run")),
+        ("owner: owner_of names our own process with no run when its cwd is under none",
+         got_self is not None and got_self[1] == me_user),
+        ("owner: sample() writes an #owner row for a foreign pid it records, with our user",
+         len(burn_owner) == 1 and burn_owner[0][3] == me_user),
     ]
     for label, ok in synthetic_evid:
         bad += not ok
