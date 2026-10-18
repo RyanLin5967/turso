@@ -303,6 +303,9 @@ impl<'a> Resolver<'a> {
         dqs_dml: DoubleQuotedDml,
         dialect: Arc<dyn crate::dialect::Dialect>,
         unqualified_database_search_path: &Option<Vec<String>>,
+        // Where the text being compiled came from, with no default (dialect code review LOW-1: it
+        // defaulted to Engine): a CREATE's own row is stored by it.
+        sql_source: crate::connection::SqlSource,
     ) -> Self {
         let has_temp_schema = temp_database.read().is_some();
         Self {
@@ -322,7 +325,7 @@ impl<'a> Resolver<'a> {
             enable_custom_types,
             dqs_dml,
             dialect,
-            sql_source: crate::connection::SqlSource::Engine,
+            sql_source,
             trigger_context: None,
             has_temp_schema,
             fk_action_compile_stack: FkActionCompileStack::default(),

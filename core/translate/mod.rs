@@ -128,8 +128,8 @@ pub fn translate(
         // its source, never by this dialect (`Resolver::sql_source`).
         connection.dialect(),
         &prepare_options.unqualified_database_search_path,
+        kind.source().clone(),
     );
-    resolver.sql_source = kind.source().clone();
     // A branch merge applying row images compiles with no triggers (see `branch::merge`).
     resolver.triggers_disabled = connection.row_image_apply();
 

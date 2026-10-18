@@ -1090,6 +1090,8 @@ impl CompiledRecipe {
             // The database's dialect (dialect code review MED-3: it was SqliteDialect).
             conn.dialect(),
             &None,
+            // A recipe's expressions compile no CREATE: no row of its own is stored.
+            crate::connection::SqlSource::Engine,
         );
         let columns = table.columns();
         let n = columns.len();

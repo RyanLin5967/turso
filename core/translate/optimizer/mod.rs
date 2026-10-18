@@ -4182,6 +4182,7 @@ mod tests {
             DoubleQuotedDml::Enabled,
             crate::sync::Arc::new(crate::dialect::SqliteDialect),
             &None,
+            crate::connection::SqlSource::Engine,
         )
     }
 
