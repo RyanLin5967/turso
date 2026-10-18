@@ -14596,3 +14596,51 @@ fn a_drop_of_a_table_an_open_portal_reads_is_55006() {
     a.q("COMMIT").ok("commit");
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// Lead ruling 2026-10-18 on rev-bl3 #19: another session's DROP TABLE of a table this session's
+/// open block has parsed waits its lock_timeout and is 55P03, as PostgreSQL's AccessShareLock
+/// makes it (pg18-rev-bl3.out). Ours dropped it, and the reader's Bind in its block was 42P01, so
+/// the reader's snapshot did not keep the table: not a consistent read to register, a defect.
+/// After the reader's block ends the DROP runs; in autocommit a Parse holds nothing.
+#[test]
+fn another_sessions_drop_waits_for_a_blocks_read_and_is_55p03() {
+    let dir = Scratch::new("drop-xsession");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut b = server.connect();
+    for t in ["c", "d"] {
+        a.q(&format!("CREATE TABLE {t}(x int)")).ok(t);
+        a.q(&format!("INSERT INTO {t} VALUES (1)")).ok(t);
+    }
+    let mut wrong = Vec::new();
+    a.q("BEGIN").ok("begin");
+    named_parse(&mut a, "sd", "SELECT x FROM d");
+    a.send(b'S', &[]);
+    a.read_reply();
+    b.q("SET lock_timeout = '300ms'").ok("lock_timeout");
+    let started = Instant::now();
+    let r = b.q("DROP TABLE d");
+    if r.error.as_ref().map(|e| e.code.as_str()) != Some("55P03") {
+        wrong.push(format!("b's DROP TABLE d under a's block: {:?}", r.error));
+    } else if started.elapsed() < Duration::from_millis(250) {
+        wrong.push(format!("b's 55P03 came after {:?}, before its lock_timeout", started.elapsed()));
+    }
+    named_bind(&mut a, "", "sd");
+    named_execute(&mut a, "");
+    a.send(b'S', &[]);
+    let r = a.read_reply();
+    if r.error.is_some() || r.rows != vec![vec![Some("1".to_string())]] {
+        wrong.push(format!("a's read in its block after b's DROP: {:?} {:?}", r.rows, r.error));
+    }
+    a.q("COMMIT").ok("commit");
+    if let Some(e) = b.q("DROP TABLE d").error {
+        wrong.push(format!("b's DROP TABLE d after a's block ended: {} {}", e.code, e.message));
+    }
+    named_parse(&mut a, "sc", "SELECT x FROM c");
+    a.send(b'S', &[]);
+    a.read_reply();
+    if let Some(e) = b.q("DROP TABLE c").error {
+        wrong.push(format!("b's DROP TABLE c after a's autocommit Parse: {} {}", e.code, e.message));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
