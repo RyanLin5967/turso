@@ -14408,3 +14408,124 @@ fn quoted_type_names_and_cdc_switches_hold_what_the_adversary_attacked() {
     }
     assert!(failed.is_empty(), "CLAIM: quoted type names or a rolled-back CDC switch broke: {failed:#?}");
 }
+
+// ===== The queue a-f adversary's tests (engine-rev-queue-af, artie reviews/engine-queue-af-tests/), verbatim: the lead's order uses them as reds =====
+
+// ===== ADVERSARY (queue a-f review, 2026-10-18): routes of the failed-DDL class =====
+
+fn adv_failing_create_type(c: &Arc<Connection>) -> crate::Result<()> {
+    use turso_parser::ast;
+    let (Some(mut cmd), _) =
+        crate::dialect::sqlite::parse("CREATE TYPE m(value text) BASE text ENCODE 'p' DECODE value").unwrap()
+    else {
+        panic!("fixture: no command")
+    };
+    let ast::Cmd::Stmt(ast::Stmt::CreateType { body: ast::CreateTypeBody::CustomType { encode: Some(e), .. }, .. }) = &mut cmd else {
+        panic!("fixture: not a CREATE TYPE with ENCODE")
+    };
+    **e = ast::Expr::Literal(ast::Literal::String("'a'b'".to_string()));
+    c.prepare_translated_cmd(cmd, "CREATE TYPE m(value text) BASE text ENCODE 'p' DECODE value")
+        .and_then(|mut s| s.run_ignore_rows())
+}
+
+fn adv_rows(c: &Arc<Connection>, sql: &str) -> crate::Result<Vec<Vec<String>>> {
+    c.prepare(sql)
+        .and_then(|mut s| s.run_collect_rows())
+        .map(|r| r.into_iter().map(|row| row.into_iter().map(|v| v.to_string()).collect()).collect())
+}
+
+/// Every (kind, name, root) the connection's in-memory schema for `db_id` holds that its
+/// `<schema>.sqlite_schema` does not, and the reverse.
+fn adv_divergence(c: &Arc<Connection>, db_id: usize, schema_name: &str) -> Vec<String> {
+    let mut mem: std::collections::BTreeSet<(String, String, i64)> = Default::default();
+    c.with_schema(db_id, |s| {
+        for (name, t) in &s.tables {
+            if let crate::schema::Table::BTree(b) = t.as_ref() {
+                if b.root_page > 0 && !name.eq_ignore_ascii_case("sqlite_schema") && !name.eq_ignore_ascii_case("sqlite_temp_schema") {
+                    mem.insert(("table".into(), b.name.to_lowercase(), b.root_page));
+                }
+            }
+        }
+        for v in s.indexes.values() {
+            for i in v {
+                if i.root_page > 0 && !i.ephemeral {
+                    mem.insert(("index".into(), i.name.to_lowercase(), i.root_page));
+                }
+            }
+        }
+    });
+    let disk: std::collections::BTreeSet<(String, String, i64)> =
+        match adv_rows(c, &format!("SELECT type, name, rootpage FROM {schema_name}.sqlite_schema WHERE rootpage > 0 AND type IN ('table','index')")) {
+            Ok(r) => r.into_iter().map(|r| (r[0].clone(), r[1].to_lowercase(), r[2].parse().unwrap())).collect(),
+            Err(e) => return vec![format!("reading {schema_name}.sqlite_schema: {e}")],
+        };
+    let mut out = Vec::new();
+    for m in mem.difference(&disk) {
+        out.push(format!("in memory only: {m:?}"));
+    }
+    for d in disk.difference(&mem) {
+        out.push(format!("on file only: {d:?}"));
+    }
+    out
+}
+
+/// ADV-1: the red's sequence on a NAMED BRANCH connection (the fork's own pager, whose rollback
+/// restores the schema from the branch store).
+#[test]
+
+/// ADV-2: an ATTACHED database's CTAS that fails after its ParseSchema, in autocommit and inside
+/// BEGIN; then the attached file must hold what its in-memory schema says.
+#[test]
+fn adv_a_failed_attached_ctas_leaves_no_in_memory_schema_change() {
+    let _g = serial();
+    let mut failed: Vec<String> = Vec::new();
+    for explicit in [false, true] {
+        let case = if explicit { "inside BEGIN" } else { "autocommit" };
+        let dir = tempfile::TempDir::new().unwrap();
+        let main = dir.path().join("m.db");
+        let aux = dir.path().join("aux.db");
+        {
+            let db = open_at(&main, DatabaseOpts::new().with_attach(true));
+            let c = db.connect().unwrap();
+            c.execute(format!("ATTACH '{}' AS aux", aux.display())).unwrap();
+            c.execute("CREATE TABLE aux.src(j)").unwrap();
+            c.execute("INSERT INTO aux.src VALUES ('{')").unwrap();
+            if explicit {
+                c.execute("BEGIN").unwrap();
+                c.execute("CREATE TABLE aux.a(x)").unwrap();
+            }
+            let r = c.execute("CREATE TABLE aux.b AS SELECT json(j) FROM aux.src");
+            if r.is_ok() {
+                panic!("premise ({case}): the CTAS over malformed JSON must fail");
+            }
+            let id = c.get_database_id_by_name("aux").unwrap();
+            for d in adv_divergence(&c, id, "aux") {
+                failed.push(format!("{case}: after the failed CTAS ({r:?}): {d}"));
+            }
+            for sql in ["CREATE TABLE aux.u(y)", "INSERT INTO aux.u VALUES (1)", "CREATE TABLE aux.w(z)", "INSERT INTO aux.w VALUES (2)"] {
+                if let Err(e) = c.execute(sql) {
+                    failed.push(format!("{case}: {sql}: {e}"));
+                }
+            }
+            if explicit {
+                let _ = c.execute("COMMIT").map_err(|e| failed.push(format!("{case}: COMMIT: {e}")));
+            }
+            for d in adv_divergence(&c, id, "aux") {
+                failed.push(format!("{case}: after the commit: {d}"));
+            }
+        }
+        let db = open_at(&aux, DatabaseOpts::new());
+        let c = db.connect().unwrap();
+        for (sql, want) in [("SELECT * FROM u", "1"), ("SELECT * FROM w", "2")] {
+            let r = adv_rows(&c, sql);
+            if !matches!(&r, Ok(r) if r.len() == 1 && r[0] == vec![want.to_string()]) {
+                failed.push(format!("{case}: after the reopen of aux `{sql}` = {r:?}"));
+            }
+        }
+        match adv_rows(&c, "PRAGMA integrity_check") {
+            Ok(r) if r.len() == 1 && r[0][0] == "ok" => {}
+            other => failed.push(format!("{case}: integrity_check of aux: {other:?}")),
+        }
+    }
+    assert!(failed.is_empty(), "CLAIM: a failed attached DDL left an in-memory schema change: {failed:#?}");
+}
