@@ -1925,7 +1925,9 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
                     TzInterval::Refused(shown) => refused(format!(
                         "invalid value for parameter \"{pg_name}\": \"INTERVAL '{shown}'\""
                     )),
-                    TzInterval::Malformed => Err(LimboError::ParseError(SqlErrorMessage::classified(
+                    // PostgreSQL's own message, with no "Parse error: " prefix (rev-cd-tz2 #6,
+                    // rev-l1-tz #19/#20: the first host run of the strict replays).
+                    TzInterval::Malformed => Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
                         SqlErrorKind::InvalidDatetimeFormat,
                         format!("invalid input syntax for type interval: \"{literal}\""),
                     ))),
