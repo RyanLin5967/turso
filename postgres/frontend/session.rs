@@ -2748,6 +2748,15 @@ fn handle_pg_create_schema(pg_conn: &Arc<PgConnectionInner>, stmt: &PgCreateSche
     // As libpg_query gives it: an unquoted name already lowercased, a quoted one as written
     // (review wire-quote LOW-4: a quoted name was lowercased here).
     let name = stmt.name.clone();
+    // A name that folds to public is public to the engine, which folds an attached database's
+    // name: a quoted "PUBLIC" attached a second public (wire-rev-uw2 LOW). PostgreSQL creates a
+    // schema of its own for it; the engine cannot hold two names that fold alike (COMPAT).
+    if name != "public" && name.eq_ignore_ascii_case("public") {
+        if stmt.if_not_exists {
+            return Ok(());
+        }
+        return Err(LimboError::ParseError(format!("schema \"{name}\" already exists").into()));
+    }
     // A schema this block dropped is created again: its database stays attached, emptied by the
     // drop (CASCADE dropped its tables, or it had none), and is no longer detached at the
     // COMMIT; a ROLLBACK restores the old one with its tables, as in PostgreSQL (wire-rev-uw2 N4:
