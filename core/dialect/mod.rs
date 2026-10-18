@@ -965,6 +965,67 @@ mod tests {
         assert!(!helper.contains("/* client */"), "CLAIM: RENAME or ALTER marked the engine's row as the dialect's: {rows}");
     }
 
+    /// R7b (dialect code review MED-1): the halves R7 could not see. R7's later ADD COLUMN rewrites the
+    /// renamed engine row from the in-memory owner bit, which erased a mark the RENAME made, so forcing
+    /// every RENAME owner site to "owned" left R7 green. Here, apart: (a) a client's RENAME ALONE of an
+    /// engine-made table keeps its row plain, read straight after and after a reopen; (b) a client's ADD
+    /// COLUMN on a client table keeps its row the dialect's (marked).
+    #[cfg(all(feature = "fs", not(target_family = "wasm")))]
+    #[test]
+    fn a_rename_alone_keeps_an_engine_row_plain_and_add_column_keeps_a_client_row_marked() {
+        let dir = tempfile::tempdir().unwrap();
+        let io: Arc<dyn IO> = Arc::new(crate::io::PlatformIO::new().unwrap());
+        let path = dir.path().join("r7b.db");
+        let open = || {
+            Database::open_file_with_flags(
+                io.clone(),
+                path.to_str().unwrap(),
+                OpenFlags::Create,
+                DatabaseOpts::new(),
+                None,
+                Arc::new(MarkingDialect),
+            )
+            .unwrap()
+        };
+        let row = |c: &Arc<Connection>, name: &str| {
+            c.prepare(format!("client: SELECT sql FROM sqlite_schema WHERE name = '{name}'"))
+                .and_then(|mut s| s.run_collect_rows())
+                .map(|r| format!("{r:?}"))
+        };
+        let mut failed: Vec<String> = Vec::new();
+        {
+            let db = open();
+            let c = db.connect().unwrap();
+            c.execute_engine(crate::connection::EngineSql::new("CREATE TABLE helper(x INTEGER)"), crate::Origin::Root)
+                .expect("premise: the engine made its table");
+            c.execute("client: CREATE TABLE mine(y INTEGER)").expect("premise: the client made its table");
+            c.execute("client: ALTER TABLE helper RENAME TO helper2").expect("premise: the RENAME ran");
+            c.execute("client: ALTER TABLE mine ADD COLUMN w INTEGER").expect("premise: the ADD COLUMN ran");
+            match row(&c, "helper2") {
+                Ok(r) if !r.contains("/* client */") && r.contains("helper2") => {}
+                other => failed.push(format!("(a) straight after the RENAME alone, the engine's row is {other:?}, want plain")),
+            }
+            match row(&c, "mine") {
+                Ok(r) if r.contains("/* client */") && r.contains(" w ") => {}
+                other => failed.push(format!("(b) after ADD COLUMN, the client's row is {other:?}, want marked, with w")),
+            }
+        }
+        let c = open().connect().unwrap();
+        match c.prepare("client: SELECT x FROM helper2").and_then(|mut s| s.run_collect_rows()) {
+            Ok(_) => {}
+            Err(e) => failed.push(format!("(a) after a reopen, helper2 does not read: {e}")),
+        }
+        match row(&c, "helper2") {
+            Ok(r) if !r.contains("/* client */") => {}
+            other => failed.push(format!("(a) after a reopen, the engine's row is {other:?}, want plain")),
+        }
+        match row(&c, "mine") {
+            Ok(r) if r.contains("/* client */") => {}
+            other => failed.push(format!("(b) after a reopen, the client's row is {other:?}, want marked")),
+        }
+        assert!(failed.is_empty(), "CLAIM: a RENAME alone or an ADD COLUMN changed whose form a row is in: {failed:#?}");
+    }
+
     /// The frontend-context slot (dialect design REVISION 1, fastest-wire's M4): set once, read back as the
     /// frontend's own type, refused on a second set, and gone once the frontend drops its session (the
     /// connection holds it weakly). A new API, so no red at a base: the claims are pinned here.
