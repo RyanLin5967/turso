@@ -176,6 +176,8 @@ impl<T: Preimage> BranchTable<T> {
     pub(crate) fn drain_pool_for_test(&mut self) {
         self.spare_chunks.clear();
         self.spare_segments.clear();
+        // As a table that has held a branch, so the pool counts as low (`pool_low`).
+        self.chunk_allocs = self.chunk_allocs.max(1);
     }
 
     /// The ids the pool's spare chunks cover.

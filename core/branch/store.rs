@@ -15337,6 +15337,7 @@ mod l2b_kick_tests {
         std::thread::spawn(move || {
             let mut guard = s2.inner.lock();
             guard.branches.drain_pool_for_test();
+            assert!(guard.branches.pool_low(), "premise: the pool is low");
             s2.inner.pool_kicked.store(false, Ordering::Release);
             let g = s2.group.lock();
             drop(guard);
