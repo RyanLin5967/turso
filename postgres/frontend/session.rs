@@ -2777,12 +2777,24 @@ fn schema_file_name(schema: &str) -> String {
     out
 }
 
-/// [`schema_file_name`] read back; None for a file name it never writes. A file an earlier version
-/// named with the schema's raw text (a quote, a space) reads as that text, so it attaches as before.
+/// [`schema_file_name`] read back. A file an earlier version named with the schema's raw text (a
+/// quote, a space, a `%`) reads as that text, so it attaches as before: a name is decoded only
+/// when it is exactly what schema_file_name writes for the decoded name, which never encodes a
+/// letter, digit or `_` and writes two upper-case hex digits (wire-rev-uw2 MED: a%zz and p% no
+/// longer attached, and q%41 attached as qa). BLIND SPOT: an old raw name that is itself such an
+/// encoding (`a%20b`) reads as the name it encodes (`a b`).
 fn schema_of_file_name(name: &str) -> Option<String> {
     if !name.contains('%') {
         return Some(name.to_string());
     }
+    match decode_schema_file_name(name) {
+        Some(decoded) if schema_file_name(&decoded) == name => Some(decoded),
+        _ => Some(name.to_string()),
+    }
+}
+
+/// `%XX` decoded; None when a `%` is not followed by two hex digits or the bytes are not UTF-8.
+fn decode_schema_file_name(name: &str) -> Option<String> {
     let b = name.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
@@ -2874,7 +2886,7 @@ fn handle_pg_drop_schema(pg_conn: &Arc<PgConnectionInner>, stmt: &PgDropSchemaSt
         // ([`PgConnection::tx_event`]; wire-rev-uw1 M2: a DROP SCHEMA in a CLI block failed
         // 'database s is locked'). The file is the one of the schema resolved here, never one
         // read from the client's text. An in-memory main database's schemas have no file here.
-        let path = (conn.db_file_path() != ":memory:").then(|| schema_file_path(conn, name));
+        let path = if conn.db_file_path() != ":memory:" { attached_schema_file(conn, name)? } else { None };
         if conn.get_auto_commit() {
             detach_schema(conn, name)?;
             if let Some(path) = &path {
@@ -4315,14 +4327,35 @@ fn list_user_tables(conn: &Arc<Connection>, schema_name: Option<&str>) -> Result
         .collect())
 }
 
+/// Whether a schema of this name is attached, by the engine's identity for it: the engine folds
+/// an attached database's name, so a schema created as "MixedCase" is its mixedcase, and asking
+/// for it as written found nothing (wire-rev-uw2 MED: `DROP SCHEMA "MixedCase"` was 3F000).
 fn schema_exists(conn: &Arc<Connection>, schema_name: &str) -> Result<bool> {
     let sql = catalog::sqlite_text(format!(
-        "SELECT 1 FROM pragma_database_list WHERE name = {}",
+        "SELECT 1 FROM pragma_database_list WHERE name = {} COLLATE NOCASE",
         catalog::quote_literal(schema_name)
     ));
     let mut stmt = conn.prepare_internal(&sql)?;
     let rows = stmt.run_collect_rows()?;
     Ok(!rows.is_empty())
+}
+
+/// The file the engine attached schema `schema_name` from, by the engine's identity for the name
+/// ([`schema_exists`]); None for one with no file (in memory). The file deleted with a dropped
+/// schema is this one, never a name derived from the client's spelling: `CREATE SCHEMA "Foo";
+/// DROP SCHEMA foo` detached "Foo" and left its file, so it came back at the next open
+/// (wire-rev-uw2 MED).
+fn attached_schema_file(conn: &Arc<Connection>, schema_name: &str) -> Result<Option<String>> {
+    let sql = catalog::sqlite_text(format!(
+        "SELECT file FROM pragma_database_list WHERE name = {} COLLATE NOCASE",
+        catalog::quote_literal(schema_name)
+    ));
+    let mut stmt = conn.prepare_sqlite(&sql)?;
+    let rows = stmt.run_collect_rows()?;
+    Ok(rows.into_iter().find_map(|row| match row.into_iter().next() {
+        Some(Value::Text(t)) if !t.as_str().is_empty() => Some(t.as_str().to_string()),
+        _ => None,
+    }))
 }
 
 #[cfg(test)]
