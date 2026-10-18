@@ -15572,3 +15572,46 @@ fn no_create_grows_the_log_buffer_from_the_first_one_after_open() {
         );
     }
 }
+
+/// LEAP L1, ASYNC-DESIGN T4 (ASYNC-1), the no-wait law: with the flusher and housekeeping held,
+/// 1,000 named async creates on one thread lead no flight and wait for none. The group's flights
+/// and locked flushes do not move, the creating thread issues no sync (`thread_syncs`), and every
+/// create reads NotYetDurable. Catalog store (async is catalog-only, ASYNC §1), in the store class
+/// async requires. At the stub commit each create is durable (D2), so the flights move: red by
+/// its claim. The hold premise is checked after the claims, so a stub that holds nothing fails at
+/// the claim, the stated reason.
+#[test]
+fn an_async_create_leads_no_flight_and_waits_for_none() {
+    let _s = serial();
+    let class = if cfg!(target_vendor = "apple") { SyncClass::FullFsync } else { SyncClass::Fsync };
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("t4.db"), opts(true, class));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    for i in 0..10 {
+        trunk.create_branch_async(&format!("warm-{i}")).unwrap();
+    }
+    let held = (db.branch_flusher_hold(true), db.branch_housekeeping_hold(true));
+    let g0 = db.branches.group_counters();
+    let s0 = super::store::thread_syncs();
+    let mut created = Vec::with_capacity(1000);
+    for i in 0..1000 {
+        created.push(trunk.create_branch_async(&format!("t4-{i}")).unwrap());
+    }
+    let s1 = super::store::thread_syncs();
+    let g1 = db.branches.group_counters();
+    let not_yet = created
+        .iter()
+        .filter(|c| matches!(db.branch_status(c.id), Ok(super::async_api::BranchStatus::NotYetDurable)))
+        .count();
+    db.branch_flusher_hold(false);
+    db.branch_housekeeping_hold(false);
+    assert_eq!(
+        (g1[0] - g0[0], g1[1] - g0[1]),
+        (0, 0),
+        "CLAIM: 1,000 async creates led no flight and no locked flush (flights, locked_flushes)"
+    );
+    assert_eq!(s1 - s0, 0, "CLAIM: the creating thread issued no sync");
+    assert_eq!(not_yet, 1000, "CLAIM: every async create reads NotYetDurable while the flusher is held");
+    assert_eq!(held, (true, true), "premise: the flusher and housekeeping were held");
+}
