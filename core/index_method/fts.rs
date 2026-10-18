@@ -1,3 +1,4 @@
+use crate::connection::{EngineSql, Origin};
 use crate::sync::{Arc, Weak};
 use crate::{
     index_method::{
@@ -1680,7 +1681,7 @@ fn initialize_btree_storage_table(
     // (we're already inside a transaction from the parent CREATE INDEX statement)
     {
         conn.start_nested();
-        let mut stmt = conn.prepare(create_table_sql)?;
+        let mut stmt = conn.prepare_engine(EngineSql::new(create_table_sql), Origin::Root)?;
         stmt.program
             .prepared
             .needs_stmt_subtransactions
@@ -1691,7 +1692,7 @@ fn initialize_btree_storage_table(
     }
     {
         conn.start_nested();
-        let mut stmt = conn.prepare(create_index_sql)?;
+        let mut stmt = conn.prepare_engine(EngineSql::new(create_index_sql), Origin::Root)?;
         stmt.program
             .prepared
             .needs_stmt_subtransactions
@@ -3383,7 +3384,7 @@ impl IndexMethodCursor for FtsCursor {
             quote_identifier(&self.dir_table_name)
         );
         conn.start_nested();
-        let mut stmt = conn.prepare(drop_table_sql)?;
+        let mut stmt = conn.prepare_engine(EngineSql::new(drop_table_sql), Origin::Root)?;
         // Disable subtransactions since we're already inside a transaction from the parent DROP INDEX
         stmt.program
             .prepared

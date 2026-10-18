@@ -1164,12 +1164,14 @@ impl Connection {
         }
     }
 
+    #[allow(clippy::disallowed_methods, reason = "an entry point: it delegates to the shared preparation with the kind it states (dialect design R1)")]
     pub fn prepare(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
         self._prepare(sql)
     }
 
     /// Prepare SQLite text, parsed as SQLite whatever the database's dialect (`SqlKind::frontend`), and
     /// re-prepared as SQLite too.
+    #[allow(clippy::disallowed_methods, reason = "an entry point: it delegates to the shared preparation with the kind it states (dialect design R1)")]
     pub fn prepare_sqlite(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
         self.prepare_text_with_origin(sql, StatementOrigin::Root, SqlKind::frontend())
     }
@@ -1177,17 +1179,20 @@ impl Connection {
     /// A frontend's nested SQLite statement (it runs inside the statement that is running). The
     /// engine's own nested statements use `prepare_engine(.., Origin::Nested)`.
     #[doc(hidden)]
+    #[allow(clippy::disallowed_methods, reason = "an entry point: it delegates to the shared preparation with the kind it states (dialect design R1)")]
     pub fn prepare_internal(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
         self.prepare_text_with_origin(sql, StatementOrigin::InternalHelper, SqlKind::frontend())
     }
 
     /// The engine's own SQLite text (dialect design REVISION 2): parsed as SQLite, its kind
     /// `SqlKind::engine()`, whatever the database's dialect. The only entry engine code uses.
+    #[allow(clippy::disallowed_methods, reason = "an entry point: it delegates to the shared preparation with the kind it states (dialect design R1)")]
     pub(crate) fn prepare_engine(self: &Arc<Connection>, sql: EngineSql<'_>, origin: Origin) -> Result<Statement> {
         self.prepare_text_with_origin(sql.as_str(), origin.into(), SqlKind::engine())
     }
 
     /// `execute` of the engine's own SQLite text: every statement in it, kind `SqlKind::engine()`.
+    #[allow(clippy::disallowed_methods, reason = "an entry point: it delegates to the shared preparation with the kind it states (dialect design R1)")]
     pub(crate) fn execute_engine(self: &Arc<Connection>, sql: EngineSql<'_>, origin: Origin) -> Result<()> {
         self.execute_text(sql.as_str(), SqlKind::engine(), origin.into())
     }
@@ -1196,6 +1201,7 @@ impl Connection {
     /// `SqlKind::frontend()`) and how it runs. A replay is the engine's own (`prepare_replay`) and is
     /// refused here.
     #[doc(hidden)]
+    #[allow(clippy::disallowed_methods, reason = "an entry point: it delegates to the shared preparation with the kind it states (dialect design R1)")]
     pub fn prepare_with(self: &Arc<Connection>, sql: impl AsRef<str>, kind: SqlKind, origin: Origin) -> Result<Statement> {
         refuse_foreign_replay(&kind)?;
         self.prepare_text_with_origin(sql, origin.into(), kind)
@@ -1203,18 +1209,21 @@ impl Connection {
 
     /// `execute` with the kind its text is and how it runs (as `prepare_with`).
     #[doc(hidden)]
+    #[allow(clippy::disallowed_methods, reason = "an entry point: it delegates to the shared preparation with the kind it states (dialect design R1)")]
     pub fn execute_with(self: &Arc<Connection>, sql: impl AsRef<str>, kind: SqlKind, origin: Origin) -> Result<()> {
         refuse_foreign_replay(&kind)?;
         self.execute_text(sql.as_ref(), kind, origin.into())
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
+    #[allow(clippy::disallowed_methods, reason = "an entry point: it delegates to the shared preparation with the kind it states (dialect design R1)")]
     pub fn _prepare(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
         self.prepare_with_origin(sql, StatementOrigin::Root)
     }
 
     #[turso_macros::trace_stack]
     /// An engine helper's statement (`InternalHelper`) is SQLite text; any other is the client's.
+    #[allow(clippy::disallowed_methods, reason = "an entry point: it delegates to the shared preparation with the kind it states (dialect design R1)")]
     pub(crate) fn prepare_with_origin(
         self: &Arc<Connection>,
         sql: impl AsRef<str>,
@@ -1289,6 +1298,7 @@ impl Connection {
     /// parsing through [`Dialect::parse`](crate::Dialect::parse), while the
     /// original text remains available for schema storage, diagnostics, and
     /// later re-preparation through the dialect.
+    #[allow(clippy::disallowed_methods, reason = "an entry point: it delegates to the shared preparation with the kind it states (dialect design R1)")]
     pub fn prepare_translated_stmt(
         self: &Arc<Connection>,
         stmt: ast::Stmt,
@@ -1297,6 +1307,7 @@ impl Connection {
         self.prepare_translated_cmd(ast::Cmd::Stmt(stmt), input)
     }
 
+    #[allow(clippy::disallowed_methods, reason = "an entry point: it delegates to the shared preparation with the kind it states (dialect design R1)")]
     pub fn prepare_translated_stmt_with_options(
         self: &Arc<Connection>,
         stmt: ast::Stmt,
@@ -1308,6 +1319,7 @@ impl Connection {
 
     /// Prepare an already-translated command while keeping the original SQL
     /// text.
+    #[allow(clippy::disallowed_methods, reason = "an entry point: it delegates to the shared preparation with the kind it states (dialect design R1)")]
     pub fn prepare_translated_cmd(
         self: &Arc<Connection>,
         cmd: ast::Cmd,
@@ -1318,6 +1330,7 @@ impl Connection {
 
     /// The options are taken by value and kept with the statement for its re-prepares
     /// (wire-rework B-H2), so a prepare clones nothing (wire-rev-line L6).
+    #[allow(clippy::disallowed_methods, reason = "an entry point: it delegates to the shared preparation with the kind it states (dialect design R1)")]
     pub fn prepare_translated_cmd_with_options(
         self: &Arc<Connection>,
         cmd: ast::Cmd,
@@ -1328,6 +1341,7 @@ impl Connection {
     }
 
     #[turso_macros::trace_stack]
+    #[allow(clippy::disallowed_methods, reason = "an entry point: it delegates to the shared preparation with the kind it states (dialect design R1)")]
     fn prepare_cmd_with_input_and_origin(
         self: &Arc<Connection>,
         cmd: ast::Cmd,
@@ -1931,6 +1945,7 @@ impl Connection {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
+    #[allow(clippy::disallowed_methods, reason = "an entry point: it delegates to the shared preparation with the kind it states (dialect design R1)")]
     pub fn prepare_execute_batch(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<()> {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
@@ -1959,6 +1974,7 @@ impl Connection {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
+    #[allow(clippy::disallowed_methods, reason = "an entry point: it delegates to the shared preparation with the kind it states (dialect design R1)")]
     pub fn query(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Option<Statement>> {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
@@ -1977,6 +1993,7 @@ impl Connection {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
+    #[allow(clippy::disallowed_methods, reason = "an entry point: it delegates to the shared preparation with the kind it states (dialect design R1)")]
     pub(crate) fn run_cmd(
         self: &Arc<Connection>,
         cmd: Cmd,
@@ -2001,12 +2018,14 @@ impl Connection {
     /// TODO: make this api async
     #[instrument(skip_all, level = Level::DEBUG)]
     #[turso_macros::trace_stack]
+    #[allow(clippy::disallowed_methods, reason = "an entry point: it delegates to the shared preparation with the kind it states (dialect design R1)")]
     pub fn execute(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<()> {
         self.execute_text(sql.as_ref(), SqlKind::client(), Origin::Root)
     }
 
     /// `execute` of SQLite text, parsed as SQLite whatever the database's dialect (`SqlKind::frontend`): for
     /// the engine's own helper statements and a frontend's SQLite text.
+    #[allow(clippy::disallowed_methods, reason = "an entry point: it delegates to the shared preparation with the kind it states (dialect design R1)")]
     pub fn execute_sqlite(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<()> {
         self.execute_text(sql.as_ref(), SqlKind::frontend(), Origin::Root)
     }
@@ -2035,6 +2054,7 @@ impl Connection {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
+    #[allow(clippy::disallowed_methods, reason = "an entry point: it delegates to the shared preparation with the kind it states (dialect design R1)")]
     pub fn consume_stmt(
         self: &Arc<Connection>,
         sql: impl AsRef<str>,
@@ -2117,9 +2137,11 @@ impl Connection {
         }
         let conn = db.connect()?;
         if let Some(cipher) = opts.cipher {
+            #[allow(clippy::disallowed_methods, reason = "pragma_update is engine-kind (prepare_engine) (dialect design R1)")]
             let _ = conn.pragma_update("cipher", format!("'{cipher}'"));
         }
         if let Some(hexkey) = opts.hexkey {
+            #[allow(clippy::disallowed_methods, reason = "pragma_update is engine-kind (prepare_engine) (dialect design R1)")]
             let _ = conn.pragma_update("hexkey", format!("'{hexkey}'"));
         }
         Ok((io, conn))
@@ -3442,8 +3464,9 @@ impl Connection {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
+        // Engine-built PRAGMA text: SQLite whatever the dialect (review dialect MED-4).
         let pragma = format!("PRAGMA {pragma_name}({pragma_value})");
-        let mut stmt = self.prepare(pragma)?;
+        let mut stmt = self.prepare_engine(EngineSql::new(pragma), Origin::Root)?;
         let mut results = Vec::new();
         loop {
             match stmt.step()? {

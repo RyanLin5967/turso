@@ -283,6 +283,7 @@ impl<'a> QueryRunner<'a> {
 impl Iterator for QueryRunner<'_> {
     type Item = Result<Option<Statement>>;
 
+    #[allow(clippy::disallowed_methods, reason = "the query runner is the client entry: it runs client text (dialect design R1)")]
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(err) = self.pending_error.take() {
             return Some(Err(err));

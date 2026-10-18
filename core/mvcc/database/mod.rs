@@ -4650,10 +4650,17 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         loop {
             match st {
                 ReadPersistentTxTsMaxState::Start => {
-                    let query_result = connection.query(format!(
-                        "SELECT v FROM {MVCC_META_TABLE_NAME}
+                    // Engine SQLite text, whatever the dialect (review dialect HIGH-1: it went through the
+                    // client parser, so a strict dialect read a valid MVCC database as Corrupt).
+                    let query_result = connection
+                        .prepare_engine(
+                            EngineSql::new(format!(
+                                "SELECT v FROM {MVCC_META_TABLE_NAME}
                          WHERE k = '{MVCC_META_KEY_PERSISTENT_TX_TS_MAX}'"
-                    ));
+                            )),
+                            Origin::Root,
+                        )
+                        .map(Some);
                     let maybe_stmt = match query_result {
                         Ok(stmt) => stmt,
                         Err(LimboError::ParseError(msg)) if msg.contains("no such table") => {
@@ -8822,11 +8829,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     else {
                         unreachable!("state is ReadCookie");
                     };
-                    let stmt = connection
-                        .query(
-                            "SELECT rowid, type, name, tbl_name, rootpage, sql FROM sqlite_schema",
-                        )?
-                        .map(Box::new);
+                    // Engine SQLite text (review dialect HIGH-1: the recovery scan used the client parser).
+                    let stmt = Some(Box::new(connection.prepare_engine(
+                        EngineSql::new("SELECT rowid, type, name, tbl_name, rootpage, sql FROM sqlite_schema"),
+                        Origin::Root,
+                    )?));
                     *st = RecoverLogicalLogState::QuerySchema {
                         reader,
                         preserved_tvfs,

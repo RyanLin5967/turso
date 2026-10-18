@@ -1,3 +1,4 @@
+use crate::connection::{EngineSql, Origin};
 use crate::{types::Value, Connection, LimboError, Statement};
 use std::{
     boxed::Box,
@@ -36,7 +37,7 @@ pub unsafe extern "C" fn execute(
     let weak_box = extcon._ctx as *const Weak<Connection>;
     let weak = unsafe { &*weak_box };
     if let Some(conn) = weak.upgrade() {
-        match conn.query(&sql_str) {
+        match conn.prepare_engine(EngineSql::new(sql_str), Origin::Root).map(Some) {
             Ok(Some(mut stmt)) => {
                 if arg_count > 0 {
                     let args_slice = &mut std::slice::from_raw_parts_mut(args, arg_count as usize);
@@ -102,7 +103,7 @@ pub unsafe extern "C" fn prepare_stmt(ctx: *mut ExtConn, sql: *const c_char) -> 
     let weak_box = extcon._ctx as *const Weak<Connection>;
     let weak = unsafe { &*weak_box };
     if let Some(conn) = weak.upgrade() {
-        match conn.prepare(&sql_str) {
+        match conn.prepare_engine(EngineSql::new(sql_str), Origin::Root) {
             Ok(stmt) => {
                 let raw_stmt = Box::into_raw(Box::new(stmt)) as *mut c_void;
                 Box::into_raw(Box::new(Stmt::new(

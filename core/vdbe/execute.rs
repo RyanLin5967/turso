@@ -16683,7 +16683,7 @@ pub fn op_drop_column(
     conn.with_schema(*db, |schema| -> crate::Result<()> {
         for (view_name, view) in schema.views.iter() {
             let view_select_sql = format!("SELECT * FROM {}", view_in_db(&conn, *db, view_name));
-            let _ = conn.prepare(view_select_sql.as_str()).map_err(|e| {
+            let _ = conn.prepare_engine(EngineSql::new(view_select_sql.as_str()), Origin::Root).map_err(|e| {
                 LimboError::ParseError(format!(
                     "cannot drop column \"{}\": referenced in VIEW {view_name}: {}. {e}",
                     column_name, view.sql,
@@ -17053,7 +17053,7 @@ pub fn op_alter_column(
                     .expect("column being ALTERed should be in schema");
                 for (view_name, view) in schema.views.iter() {
                     let view_select_sql = format!("SELECT * FROM {}", view_in_db(&conn, *db, view_name));
-                    let _ = conn.prepare(view_select_sql.as_str()).map_err(|e| {
+                    let _ = conn.prepare_engine(EngineSql::new(view_select_sql.as_str()), Origin::Root).map_err(|e| {
                         LimboError::ParseError(format!(
                             "cannot rename column \"{}\": referenced in VIEW {view_name}: {}. {e}",
                             old_column_name, view.sql,
@@ -18951,6 +18951,7 @@ fn op_vacuum_into_inner(
                 let source_db = program.connection.get_source_database(source_db_id);
                 program.connection.execute_engine(EngineSql::new("BEGIN"), Origin::Root)?;
                 state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
+                #[allow(clippy::disallowed_methods, reason = "pragma_query is engine-kind (prepare_engine) (dialect design R1)")]
                 let page_size: u32 = extract_pragma_int(
                     &program
                         .connection
