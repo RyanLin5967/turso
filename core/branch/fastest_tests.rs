@@ -12065,6 +12065,13 @@ fn a_fuzzy_checkpoint_issues_at_most_two_syscalls_under_the_store_mutex() {
             refused.push(format!("round {round}: {foreign:?}"));
             continue;
         }
+        // A point that was never recorded (no syscall counter on this platform, or a hook that did not
+        // fire) is unattributable, never a count: as u64::MAX it overflowed the sum (a panic on Linux,
+        // ecetesla2 2026-10-18, uw-bp-a1-heldsys_ccf6488ce), or would wrap into a false red.
+        if [capture.0, capture.1, install.0, install.1, install.2].contains(&u64::MAX) {
+            refused.push(format!("round {round}: a held-syscall point is missing ({} recorded)", points.len()));
+            continue;
+        }
         judged += 1;
         let total = capture.0 + capture.1 + install.0 + install.1 + install.2;
         if total > 2 {
