@@ -14644,3 +14644,38 @@ fn another_sessions_drop_waits_for_a_blocks_read_and_is_55p03() {
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// Review wire-quote LOW-2: pg_get_indexdef, pg_indexes.indexdef and pg_get_constraintdef printed
+/// identifiers unquoted, so pg_dump-style output of a name like `a b` did not read back. PostgreSQL
+/// 18.6 quotes each by quote_identifier and qualifies the index's table (recorded with these very
+/// statements: artie b2e3e87f75, pg18-rev-quote-low.out).
+#[test]
+fn definitions_quote_their_identifiers_as_postgresql_does() {
+    let dir = Scratch::new("defs-quoted");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE TABLE \"a b\"(x int, \"Y\" int, id int PRIMARY KEY)",
+        "CREATE INDEX \"i j\" ON \"a b\"(x)",
+        "CREATE UNIQUE INDEX plain ON \"a b\"(\"Y\")",
+        "CREATE TABLE \"c d\"(r int REFERENCES \"a b\"(id), CONSTRAINT \"u k\" UNIQUE (r))",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    for (sql, want) in [
+        ("SELECT pg_get_indexdef(oid) FROM pg_class WHERE relname = 'i j'", "CREATE INDEX \"i j\" ON public.\"a b\" USING btree (x)"),
+        ("SELECT pg_get_indexdef(oid) FROM pg_class WHERE relname = 'plain'", "CREATE UNIQUE INDEX plain ON public.\"a b\" USING btree (\"Y\")"),
+        ("SELECT indexdef FROM pg_indexes WHERE indexname = 'i j'", "CREATE INDEX \"i j\" ON public.\"a b\" USING btree (x)"),
+        (
+            "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE contype = 'f'",
+            "FOREIGN KEY (r) REFERENCES \"a b\"(id)",
+        ),
+    ] {
+        let r = a.q(sql);
+        if r.error.is_some() || r.rows != vec![vec![Some(want.to_string())]] {
+            wrong.push(format!("{sql}: {:?} {:?}, PostgreSQL {want:?}", r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
