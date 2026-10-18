@@ -14234,9 +14234,14 @@ fn a_custom_type_is_one_type_however_its_name_is_quoted() {
     if let Err(e) = c.execute("INSERT INTO ut VALUES ('v2', 'w2')") {
         failed.push(format!("after the reopen, INSERT INTO ut: {e}"));
     }
-    match c.prepare("SELECT a, b FROM ut ORDER BY a").and_then(|mut s| s.run_collect_rows()) {
-        Ok(r) if r.iter().map(|row| (row[0].to_string(), row[1].to_string())).collect::<Vec<_>>()
-            == [("v".to_string(), "w".to_string()), ("v2".to_string(), "w2".to_string())] => {}
+    // FLAGGED fixture repair after its first green run (4cd12779e): no ORDER BY, since a custom type
+    // with no OPERATOR '<' cannot be ordered (that refusal is the type's, not this claim's); sorted here.
+    match c.prepare("SELECT a, b FROM ut").and_then(|mut s| s.run_collect_rows()) {
+        Ok(r) if {
+            let mut got = r.iter().map(|row| (row[0].to_string(), row[1].to_string())).collect::<Vec<_>>();
+            got.sort();
+            got == [("v".to_string(), "w".to_string()), ("v2".to_string(), "w2".to_string())]
+        } => {}
         other => failed.push(format!("after the reopen, ut = {other:?}, want (v, w), (v2, w2)")),
     }
     for sql in ["DROP TABLE ut", "DROP TYPE \"m'x\"", "DROP TYPE \"plain2\""] {
