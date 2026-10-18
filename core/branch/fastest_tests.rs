@@ -14085,3 +14085,79 @@ fn dropping_a_column_an_attached_view_selects_is_refused_when_main_has_a_view_of
         "CLAIM: DROP COLUMN b on side.base2 was not refused for side.vv (main.vv, of the same name, does not select b): drop {r:?}, then SELECT b {still:?}"
     );
 }
+
+/// engine-rev-quote42 LOWs (lead order c): reds for the subsystems 9a58832f5 quoted by reading
+/// alone, each with a name that carries a double quote (the `w x` case above has only a space):
+/// - the toy-vector index method's query patterns (table `v"x`, column `e"m`);
+/// - a materialized view's per-table populate SELECT (table `m"t`);
+/// - DROP/RENAME COLUMN's view probe for a view `q"x` over the altered table;
+/// - with `--features fts`, the FTS index method's query patterns (table `f"t`, column `b"o`).
+/// Each case runs, and every failure is listed.
+#[test]
+fn engine_text_quotes_a_double_quote_in_index_method_view_and_probe_names() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(
+        &dir.path().join("lows.db"),
+        DatabaseOpts::new().with_index_method(true).with_views(true),
+    );
+    let c = db.connect().unwrap();
+    let mut failed: Vec<String> = Vec::new();
+    let rows = |sql: &str| c.prepare(sql).and_then(|mut s| s.run_collect_rows());
+    let mut case = |name: &str, sqls: &[&str], check: &str, want_rows: usize| {
+        for sql in sqls {
+            if let Err(e) = c.execute(sql) {
+                failed.push(format!("{name}: {sql}: {e}"));
+                return;
+            }
+        }
+        match rows(check) {
+            Ok(r) if r.len() == want_rows => {}
+            other => failed.push(format!("{name}: {check} = {other:?}, want {want_rows} row(s)")),
+        }
+    };
+    case(
+        "toy-vector index on v\"x(e\"m)",
+        &[
+            "CREATE TABLE \"v\"\"x\"(\"e\"\"m\" BLOB)",
+            "CREATE INDEX vi ON \"v\"\"x\" USING toy_vector_sparse_ivf (\"e\"\"m\")",
+            "INSERT INTO \"v\"\"x\" VALUES (vector32_sparse('[0, 1, 0, 2]'))",
+        ],
+        "SELECT vector_distance_jaccard(\"e\"\"m\", vector32_sparse('[0, 1, 0, 2]')) AS d FROM \"v\"\"x\" ORDER BY d LIMIT 1",
+        1,
+    );
+    case(
+        "materialized view over m\"t",
+        &[
+            "CREATE TABLE \"m\"\"t\"(a INTEGER)",
+            "INSERT INTO \"m\"\"t\" VALUES (1)",
+            "CREATE MATERIALIZED VIEW mv AS SELECT a FROM \"m\"\"t\"",
+            "INSERT INTO \"m\"\"t\" VALUES (2)",
+        ],
+        "SELECT a FROM mv",
+        2,
+    );
+    case(
+        "view q\"x over an altered table",
+        &[
+            "CREATE TABLE base3(a, b)",
+            "CREATE VIEW \"q\"\"x\" AS SELECT a FROM base3",
+            "ALTER TABLE base3 DROP COLUMN b",
+            "ALTER TABLE base3 RENAME COLUMN a TO a2",
+            "INSERT INTO base3 VALUES (7)",
+        ],
+        "SELECT * FROM \"q\"\"x\"",
+        1,
+    );
+    #[cfg(feature = "fts")]
+    case(
+        "FTS index on f\"t(b\"o)",
+        &[
+            "CREATE TABLE \"f\"\"t\"(\"b\"\"o\" TEXT)",
+            "CREATE INDEX fi ON \"f\"\"t\" USING fts (\"b\"\"o\")",
+            "INSERT INTO \"f\"\"t\" VALUES ('hello world')",
+        ],
+        "SELECT * FROM \"f\"\"t\" WHERE fts_match(\"b\"\"o\", 'hello')",
+        1,
+    );
+    assert!(failed.is_empty(), "CLAIM: engine-built text broke on a double quote in a name: {failed:#?}");
+}
