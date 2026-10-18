@@ -490,5 +490,19 @@ printf '{"windows": []}\n' > "$T/fx/d/result/summary.json"
 check "ours_fixture_record refuses a summary.json with no fixture record (the driver ran without the parent)" \
   '! ( source "$HERE/t3lib.sh"; ours_fixture_record "$T/fx/d" 300 7 4 "$T/fx/store" ) && grep -q "no fixture" "$T/out.txt"'
 
+# linux-rev-uw1 LOW 6: root_check told a missing or broken sudo from one that needs a password only by "sudo -n true
+# failed". sudo_state classifies it (T3_SUDO_BIN names the sudo to ask; t3run unsets it): absent and error are FAILs
+# of the root case, password alone is N/A-on-noroot
+mkdir -p "$T/sudo"
+printf '#!/bin/sh\necho "sudo: a password is required" >&2\nexit 1\n' > "$T/sudo/pw"
+printf '#!/bin/sh\nexit 0\n' > "$T/sudo/ok"
+printf '#!/bin/sh\necho "sudo: unable to resolve host x" >&2\nexit 1\n' > "$T/sudo/err"
+chmod +x "$T/sudo/pw" "$T/sudo/ok" "$T/sudo/err"
+check "LOW 6: sudo_state: no sudo at all is 'absent'" '[ "$(T3_SUDO_BIN=$T/sudo/none sudo_state)" = absent ]'
+check "LOW 6: sudo_state: a sudo that needs a password is 'password'" '[ "$(T3_SUDO_BIN=$T/sudo/pw sudo_state)" = password ]'
+check "LOW 6: sudo_state: passwordless sudo is 'ok'" '[ "$(T3_SUDO_BIN=$T/sudo/ok sudo_state)" = ok ]'
+check "LOW 6: sudo_state: any other sudo failure is an error, named" \
+  'case "$(T3_SUDO_BIN=$T/sudo/err sudo_state)" in error:*resolve*) true ;; *) false ;; esac'
+
 echo "T3LIB SELF-TEST $pass/$((pass + fail)) $([ $fail = 0 ] && echo PASS || echo FAIL)$([ $na = 0 ] || echo " ($na N/A: off Linux or without root)")"
 [ $fail = 0 ]
