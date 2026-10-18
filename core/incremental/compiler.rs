@@ -259,18 +259,29 @@ impl DeltaSet {
 
     /// Create a DeltaSet from a HashMap
     pub fn from_map(deltas: HashMap<String, Delta>) -> Self {
-        Self { deltas }
+        let mut set = Self::new();
+        for (name, delta) in deltas {
+            set.insert(name, delta);
+        }
+        set
+    }
+
+    /// The key a table is filed under: its name case-folded, as SQL matches names, so a write to
+    /// `"Mixed"` reaches a view whose SELECT wrote `"Mixed"`, `mixed` or `MIXED` (a materialized
+    /// view over a mixed-case table was not even populated).
+    fn key(table_name: &str) -> String {
+        crate::util::normalize_ident(table_name)
     }
 
     /// Add a delta for a table
     pub fn insert(&mut self, table_name: String, delta: Delta) {
-        self.deltas.insert(table_name, delta);
+        self.deltas.insert(Self::key(&table_name), delta);
     }
 
     /// Get delta for a table, returns empty delta if not found
     pub fn get(&self, table_name: &str) -> Delta {
         self.deltas
-            .get(table_name)
+            .get(&Self::key(table_name))
             .cloned()
             .unwrap_or_else(Delta::new)
     }
