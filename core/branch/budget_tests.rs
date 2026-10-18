@@ -3418,6 +3418,20 @@ fn the_thread_state_readers_read_blocked_and_running_threads() {
     let p1 = find(&t2, pid).expect("CLAIM: the parked thread vanished");
     assert!(s1.cpu_ns >= s0.cpu_ns + 20_000_000, "CLAIM: 100 ms of spinning moved its CPU time {} ns -> {} ns", s0.cpu_ns, s1.cpu_ns);
     assert_eq!(p1.cpu_ns, p.cpu_ns, "CLAIM: a parked thread's CPU time moved");
+    // A running thread's CPU time is current when read, not as of its last scheduler event: between
+    // two readings 200 us apart a thread that never stopped running has gained time, every time
+    // (fc_foreign_window's helper runs for well under a tick; the Linux port's run 1 read it as not
+    // having run, ecetesla4 and iccad6).
+    for i in 0..20 {
+        let (_, a) = read();
+        let w = std::time::Instant::now();
+        while w.elapsed() < std::time::Duration::from_micros(200) {
+            std::hint::spin_loop();
+        }
+        let (_, b) = read();
+        let (x, y) = (find(&a, sid).expect("CLAIM: the spinning thread vanished"), find(&b, sid).expect("CLAIM: the spinning thread vanished"));
+        assert!(y.cpu_ns > x.cpu_ns, "CLAIM: a running thread's CPU time did not move in 200 us (try {i}: {} ns -> {} ns): it is read stale", x.cpu_ns, y.cpu_ns);
+    }
     assert_eq!(probe::others_blocked(), Some(false), "CLAIM: others_blocked missed the running spinner");
     let with = probe::threads().expect("CLAIM: the thread count cannot be read on this platform");
     stop.store(true, Release);
