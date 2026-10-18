@@ -14028,3 +14028,36 @@ fn names_with_a_double_quote_work_in_pragma_functions_and_cdc_tables() {
     }
     assert!(failed.is_empty(), "CLAIM: a name with a double quote broke engine-built SQL: {failed:#?}");
 }
+
+/// Found while finding engine-rev-quote42 H2's mechanism (probe engine-probe-cdcswitch-1, ecetesla2):
+/// `PRAGMA capture_data_changes_conn('full,c2')` while capture into `c1` is on returned Ok and never
+/// created `c2`; InitCdcVersion's early exit for an enabled connection ignored the table name, so
+/// every later write on the connection failed "no such table: c2". A switch must create the new
+/// table and capture into it, and leave the old one as it was.
+#[test]
+fn switching_capture_to_another_table_while_on_creates_it_and_captures_there() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("cdc-switch.db"), DatabaseOpts::new());
+    let c = db.connect().unwrap();
+    let count = |sql: &str| c.prepare(sql).and_then(|mut s| s.run_collect_rows()).map(|r| r[0][0].to_string());
+    c.execute("CREATE TABLE t(x)").unwrap();
+    c.execute("PRAGMA capture_data_changes_conn('full,c1')").unwrap();
+    c.execute("INSERT INTO t VALUES (1)").unwrap();
+    assert_eq!(count("SELECT count(*) FROM c1 WHERE table_name = 't'").ok().as_deref(), Some("1"), "premise: c1 captured the first insert");
+    let mut failed: Vec<String> = Vec::new();
+    if let Err(e) = c.execute("PRAGMA capture_data_changes_conn('full,c2')") {
+        failed.push(format!("the switch to c2: {e}"));
+    }
+    if let Err(e) = c.execute("INSERT INTO t VALUES (2)") {
+        failed.push(format!("an insert after the switch: {e}"));
+    }
+    match count("SELECT count(*) FROM c2 WHERE table_name = 't'") {
+        Ok(n) if n == "1" => {}
+        other => failed.push(format!("c2 holds {other:?} changes of t, want 1")),
+    }
+    match count("SELECT count(*) FROM c1 WHERE table_name = 't'") {
+        Ok(n) if n == "1" => {}
+        other => failed.push(format!("c1 holds {other:?} changes of t after the switch, want still 1")),
+    }
+    assert!(failed.is_empty(), "CLAIM: switching capture to another table while on did not capture there: {failed:#?}");
+}
