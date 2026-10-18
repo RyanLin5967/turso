@@ -1090,8 +1090,7 @@ pub(crate) fn build_copy_sql(
                 "missing column name for table \"{escaped_table_name}\""
             )));
         };
-        let escaped = name.replace('"', "\"\"");
-        data_columns.push(format!("\"{escaped}\""));
+        data_columns.push(crate::util::double_quote_identifier(name));
     }
 
     if data_columns.is_empty() {

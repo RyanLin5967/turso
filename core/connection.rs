@@ -4605,8 +4605,8 @@ impl Connection {
     ) -> Result<crate::types::IOResult<()>> {
         use crate::types::IOResult;
         if stmt.is_none() {
-            let escaped = backing_table_name.replace('"', "\"\"");
-            let sql = format!("SELECT start, inc, min, max, cycle FROM \"{escaped}\" LIMIT 1");
+            let quoted = crate::util::double_quote_identifier(&backing_table_name);
+            let sql = format!("SELECT start, inc, min, max, cycle FROM {quoted} LIMIT 1");
             let prepared = self.prepare_engine(EngineSql::new(sql), Origin::Nested).map_err(|err| {
                 LimboError::Corrupt(format!(
                     "internal sequence backing table \"{backing_table_name}\" for sequence \
@@ -4682,10 +4682,10 @@ impl Connection {
     ) -> Result<crate::types::IOResult<()>> {
         use crate::types::IOResult;
         if stmt.is_none() {
-            let escaped = backing_table_name.replace('"', "\"\"");
+            let quoted = crate::util::double_quote_identifier(&backing_table_name);
             let direction = if seq.increment_by >= 0 { "DESC" } else { "ASC" };
             let sql = format!(
-                "SELECT value, is_called FROM \"{escaped}\" ORDER BY value {direction} LIMIT 1"
+                "SELECT value, is_called FROM {quoted} ORDER BY value {direction} LIMIT 1"
             );
             let prepared = self.prepare_engine(EngineSql::new(sql), Origin::Nested).map_err(|err| {
                 LimboError::Corrupt(format!(
@@ -4817,9 +4817,9 @@ impl Connection {
                             }
                             // Read current backing watermark; only upsert if we'd
                             // actually advance it (avoids needless writes on boot).
-                            let escaped = backing_table_name.replace('"', "\"\"");
+                            let quoted = crate::util::double_quote_identifier(&backing_table_name);
                             let stmt = self.prepare_engine(EngineSql::new(format!(
-                                "SELECT MAX(value) FROM \"{escaped}\""
+                                "SELECT MAX(value) FROM {quoted}"
                             )), Origin::Nested)?;
                             *sub = SyncRowStep::ReadMax {
                                 backing_table_name,
@@ -4858,9 +4858,9 @@ impl Connection {
                             // inc=1, min=1, max=i64::MAX, cycle=0) — mirror what
                             // the translator emits when CREATE TABLE bytecode
                             // creates the backing table for an AUTOINCREMENT column.
-                            let escaped = backing_table_name.replace('"', "\"\"");
+                            let quoted = crate::util::double_quote_identifier(&backing_table_name);
                             let insert_sql = format!(
-                                "INSERT OR REPLACE INTO \"{escaped}\"\
+                                "INSERT OR REPLACE INTO {quoted}\
                                  (value, is_called, start, inc, min, max, cycle) \
                                  VALUES ({watermark}, 1, 1, 1, 1, {}, 0)",
                                 i64::MAX

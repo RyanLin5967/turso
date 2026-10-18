@@ -2742,9 +2742,7 @@ pub fn translate_create_type(
 /// Build canonical CREATE TYPE SQL from a normalized name and parsed body.
 fn build_create_type_sql(name: &str, body: &ast::CreateTypeBody) -> String {
     use crate::util::quote_identifier as quote_ident;
-    fn quote_string_literal(s: &str) -> String {
-        s.replace('\'', "''")
-    }
+    use crate::util::escape_sql_string_literal as quote_string_literal;
 
     match body {
         ast::CreateTypeBody::CustomType {

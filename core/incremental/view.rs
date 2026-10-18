@@ -740,10 +740,12 @@ impl IncrementalView {
             };
 
             // Use the qualified table name if available, otherwise just the table name
+            // The fallback quoted as the qualified names are (engine-rev-quote42 LOW; by reading
+            // no table reaches it: extract_table_info fills both maps together).
             let table_name = qualified_table_names
                 .get(&table.name)
                 .cloned()
-                .unwrap_or_else(|| table.name.clone());
+                .unwrap_or_else(|| crate::util::quote_identifier(&table.name));
 
             // Construct the query for this table
             let query = if where_clause.is_empty() {
