@@ -836,6 +836,58 @@ mod tests {
         assert_eq!(before, rows(&c).unwrap(), "CLAIM: after VACUUM and a reopen, a schema row's bytes changed");
     }
 
+    /// R7 (dialect design REVISION 1 item 2, REVISION 2 item 8; review dialect LOW-9): RENAME and ALTER never
+    /// change whose form a row is in. Under MarkingDialect, an engine-made table is stored plain (step 3);
+    /// a client's RENAME of it, and a client's ADD COLUMN on it, must keep it plain, so it reopens (a marked
+    /// row must be the dialect's own text, which this one is not). Control: the client table renamed beside it
+    /// reopens. At b9b7f34ea RENAME re-formatted every row through the dialect (`format_rewritten_table_sql`),
+    /// marking the engine's row.
+    #[cfg(all(feature = "fs", not(target_family = "wasm")))]
+    #[test]
+    fn rename_and_alter_keep_an_engine_row_plain() {
+        let dir = tempfile::tempdir().unwrap();
+        let io: Arc<dyn IO> = Arc::new(crate::io::PlatformIO::new().unwrap());
+        let path = dir.path().join("r7.db");
+        let open = || {
+            Database::open_file_with_flags(
+                io.clone(),
+                path.to_str().unwrap(),
+                OpenFlags::Create,
+                DatabaseOpts::new(),
+                None,
+                Arc::new(MarkingDialect),
+            )
+            .unwrap()
+        };
+        {
+            let db = open();
+            let c = db.connect().unwrap();
+            c.execute_engine(crate::connection::EngineSql::new("CREATE TABLE helper(x INTEGER)"), crate::Origin::Root)
+                .expect("premise: the engine made its table");
+            c.execute("client: CREATE TABLE mine(y INTEGER)").expect("premise: the client made its table");
+            let helper_row = c
+                .prepare("client: SELECT sql FROM sqlite_schema WHERE name = 'helper'")
+                .and_then(|mut s| s.run_collect_rows())
+                .unwrap();
+            assert!(
+                !format!("{helper_row:?}").contains("/* client */"),
+                "premise: the engine's row is stored plain: {helper_row:?}"
+            );
+            for sql in [
+                "client: ALTER TABLE helper RENAME TO helper2",
+                "client: ALTER TABLE helper2 ADD COLUMN z INTEGER",
+                "client: ALTER TABLE mine RENAME TO mine2",
+            ] {
+                c.execute(sql).unwrap_or_else(|e| panic!("premise: {sql}: {e}"));
+            }
+        }
+        let reopened = open().connect().and_then(|c| {
+            c.prepare("client: SELECT x, z FROM helper2")?.run_collect_rows()?;
+            c.prepare("client: SELECT y FROM mine2")?.run_collect_rows()
+        });
+        assert!(reopened.is_ok(), "CLAIM: RENAME or ALTER changed whose form a row is in, so the database did not reopen: {reopened:?}");
+    }
+
     /// A dialect that parks one translation in the middle: resolving the function `park_here()`
     /// signals `parked` and waits for `go`, recording whether `go` (not the bound) ended the park
     /// (review c42b MED-4).
