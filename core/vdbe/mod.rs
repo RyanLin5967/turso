@@ -3169,6 +3169,7 @@ impl Program {
                 // is rolling back the whole MVCC transaction.
             }
             let must_rollback_tx_if_needed = can_autocommit_now || changed_shared_mvcc_auto_txn;
+            let mut statement_rollback_failed = false;
             if err.is_some() && !pager.is_checkpointing() {
                 // For ON CONFLICT FAIL, do NOT rollback the statement savepoint —
                 // changes made before the error should persist.
@@ -3182,6 +3183,7 @@ impl Program {
                         pager,
                         EndStatement::RollbackSavepoint,
                     ) {
+                        statement_rollback_failed = true;
                         capture_abort_error(
                             &mut abort_error,
                             end_stmt_err,
@@ -3364,6 +3366,7 @@ impl Program {
                                 pager,
                                 EndStatement::RollbackSavepoint,
                             ) {
+                                statement_rollback_failed = true;
                                 capture_abort_error(
                                     &mut abort_error,
                                     end_stmt_err,
@@ -3398,6 +3401,14 @@ impl Program {
                         }
                     }
                 },
+            }
+            // A statement whose own rollback failed left part of itself in its transaction, and
+            // its schema undo was skipped: as SQLite's sqlite3VdbeHalt does when
+            // vdbeCloseStatement fails (sqlite3RollbackAll, sqlite3CloseSavepoints, autoCommit = 1),
+            // the whole transaction rolls back. Queue a-f review L6.
+            if statement_rollback_failed && !self.connection.get_auto_commit() {
+                self.rollback_current_txn(pager);
+                self.connection.clear_named_savepoints();
             }
         }
         if state.uses_subjournal {
