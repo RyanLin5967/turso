@@ -1,25 +1,37 @@
 #!/usr/bin/env python3
 """A failed op, or a lost connection, is a failure in EVERY phase, never one the run hides (comp-rev-dolt250 HIGH-1;
-comp-rev-failcount MED-1..3).
+comp-rev-failcount MED-1..3; comp-rev-b15 LOW-1, LOW-2).
 
 sql-serial narrows Dolt's concurrent-delete race and does not close it, so a serialized Dolt cell can still lose
-an op (a recovered panic: "Lost connection") in any phase. Each case below makes one failure deterministic:
-  warm-up   a `step write` (must affect >= 1 row) on a table missing id 1: the client's op 1, a warm-up op at
-            --warmup 3:0:60, C=1, fails (HIGH-1)
-  measured  the same with id 5 missing: a measured op fails
-  drain     C=2, client 1 sleeps 1 s per op, client 0 does not, on a table holding ids 0..2 only: client 0's ops
-            after the 4 measured claims are drain ops, and from its op 3 on they fail (MED-3; the reviewer's T1)
-  teardown  a teardown statement on a missing table fails after the last op (MED-1; T2)
-  reconnect the home connection is KILLed by another client mid-run; the run must count a reconnect (MED-2; T3)
-Needs a running MySQL-protocol server (a Dolt sql-server) with database DB; no server is started here. The
-reconnect case also needs a mysql/mariadb client binary (--mysql-client) to KILL the connection; without one it is
-N/A.
-  test_phase_errors.py --binary BBLOAD --port PORT [--db bench] [--mysql-client MARIADB]
+an op (a recovered panic: "Lost connection") in any phase. Each case makes one failure deterministic.
+
+MySQL protocol (a Dolt sql-server, --port):
+  warm-up      a `step write` (it must affect >= 1 row) on a table missing id 1: op 1, a warm-up op at
+               --warmup 3:0:60, C=1, fails (HIGH-1)
+  measured     the same with id 5 missing: a measured op fails
+  drain        C=2; client 1 sleeps 1 s per op, client 0 does not, on a table holding ids 0..2 only. Client 0's ops
+               after the 4 measured claims are drain ops, and from its op 3 on they fail (MED-3, the reviewer's T1)
+  server-kill  (--dolt) the test's OWN Dolt server is SIGKILLed mid-run: rc 3, failed ops, and failed reconnects in
+               other_err (LOW-2)
+Both protocols (MySQL; PG with --pg-port and --psql):
+  teardown       a teardown statement on a missing table fails after the last op (MED-1, T2)
+  kill-running   the home connection is KILLed mid-query; the run must count a reconnect (MED-2, T3)
+  kill-idle      ops run on branch connections only (step connect ... / after close); the home connection is KILLed
+                 while idle; the run must notice it (comp-rev-b15 LOW-1)
+  setup-rerun    a setup statement that succeeds once (CREATE TABLE) fails when the KILLed home reconnects and
+                 re-runs it; the run must count it in other_err (LOW-2)
+Needs running servers; no MySQL/PG server is started here, except for server-kill. KILLs go through a client binary:
+--mysql-client (mariadb) and --psql. A case with no tool or server given is N/A.
+  test_phase_errors.py --binary BBLOAD --port PORT [--db bench] [--mysql-client MARIADB] [--dolt DOLT]
+                       [--pg-port PORT --psql PSQL [--pg-db postgres] [--pg-user postgres]]
 Prints TALLY ran= pass= na= fail= (gates/tally.py); exit 0 when every case passed, 3 when some were N/A and none
 failed, 1 when one failed.
 """
 import argparse
 import json
+import os
+import signal
+import socket
 import subprocess
 import tempfile
 import time
@@ -28,19 +40,15 @@ from pathlib import Path
 FAIL_KEYS = ("measured_err", "warmup_err", "drain_err", "other_err", "failed_ops", "reconnects")
 
 
-def head(port, db):
-    return f"protocol mysql\nconnect host=127.0.0.1 port={port} user=root db={db}\n"
-
-
 def bb(binary, root, spec_text, clients=1, max_ops=10, warmup="3:0:60", extra=(), popen=False):
     spec = root / "t.spec"
     spec.write_text(spec_text)
     out = root / "out"
     cmd = [binary, "--spec", str(spec), "--out", str(out), "--clients", str(clients), "--warmup", warmup,
-           "--max-ops", str(max_ops), *extra]
+           "--max-ops", str(max_ops), "--stall-s", "60", *extra]
     if popen:
         return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True), out
-    p = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
     return p.returncode, summary(out), p.stdout + p.stderr
 
 
@@ -54,17 +62,73 @@ def errors_txt(out):
     return f.read_text() if f.exists() else ""
 
 
-def prep(binary, port, db, root, sqls):
-    """run SQLS once, untimed, on one connection (a 1-op C=1 run whose setup lines are SQLS)"""
-    rc, sm, txt = bb(binary, root, head(port, db) + "".join(f"setup {s}\n" for s in sqls) + "step sql SELECT 1\n",
-                     max_ops=1, warmup="0:0:0")
-    if rc != 0:
-        raise SystemExit(f"prep failed rc={rc}: {txt[-400:]}")
+class MySQL:
+    name = "mysql"
+
+    def __init__(self, port, db, client):
+        self.port, self.db, self.client = port, db, client
+
+    def head(self, port=None):
+        return f"protocol mysql\nconnect host=127.0.0.1 port={port or self.port} user=root db={self.db}\n"
+
+    def sleep(self, s):
+        return f"SELECT SLEEP({s})"
+
+    branch = property(lambda self: f"db={self.db}")
+
+    def sql(self, q):
+        return subprocess.run([self.client, "--protocol=TCP", "-h", "127.0.0.1", "-P", str(self.port), "-u", "root",
+                               "--skip-ssl", "-N", "-B", self.db, "-e", q], capture_output=True, text=True, timeout=30)
+
+    def kill_running(self, marker):
+        ids = [ln.split("\t")[0] for ln in self.sql("SHOW PROCESSLIST").stdout.splitlines() if marker in ln]
+        return bool(ids) and self.sql(f"KILL {ids[0]}").returncode == 0, ids[:1]
+
+    def kill_idle(self):
+        # the home connection: bbload's FIRST connection (lowest id) among those not running the sleep; branch
+        # connections run the sleep or are newer; our own row runs SHOW PROCESSLIST
+        lines = self.sql("SHOW PROCESSLIST").stdout.splitlines()
+        idle = sorted(int(ln.split("\t")[0]) for ln in lines
+                      if ln.split("\t")[0].isdigit() and "SLEEP" not in ln and "PROCESSLIST" not in ln.upper())
+        return bool(idle) and self.sql(f"KILL {idle[0]}").returncode == 0, idle[:1]
 
 
-def table(name, ids):
-    return [f"CREATE TABLE IF NOT EXISTS {name} (id INT PRIMARY KEY, v INT)", f"DELETE FROM {name}",
-            f"INSERT INTO {name} VALUES " + ",".join(f"({i},0)" for i in ids)]
+class PG:
+    name = "pg"
+
+    def __init__(self, port, db, user, psql):
+        self.port, self.db, self.user, self.psql = port, db, user, psql
+
+    def head(self, port=None):
+        return f"protocol pg\nconnect host=127.0.0.1 port={port or self.port} user={self.user} dbname={self.db}\n"
+
+    def sleep(self, s):
+        return f"SELECT pg_sleep({s})"
+
+    branch = property(lambda self: f"dbname={self.db}")
+
+    def sql(self, q):
+        return subprocess.run([self.psql, "-X", "-h", "127.0.0.1", "-p", str(self.port), "-U", self.user, "-d", self.db,
+                               "-At", "-c", q], capture_output=True, text=True, timeout=30)
+
+    def kill_running(self, marker):
+        r = self.sql("SELECT pid, pg_terminate_backend(pid) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND "
+                     f"query LIKE '{marker}%' AND state = 'active' LIMIT 1").stdout.split()
+        return bool(r) and r[0].endswith("|t"), r[:1]
+
+    def kill_idle(self):
+        r = self.sql("SELECT pid, pg_terminate_backend(pid) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND "
+                     f"datname = '{self.db}' AND backend_type = 'client backend' AND state = 'idle' "
+                     "ORDER BY backend_start LIMIT 1").stdout.split()
+        return bool(r) and r[0].endswith("|t"), r[:1]
+
+
+def free_port():
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    p = s.getsockname()[1]
+    s.close()
+    return p
 
 
 def main():
@@ -73,8 +137,13 @@ def main():
     a.add_argument("--port", required=True)
     a.add_argument("--db", default="bench")
     a.add_argument("--mysql-client")
+    a.add_argument("--dolt")
+    a.add_argument("--pg-port")
+    a.add_argument("--psql")
+    a.add_argument("--pg-db", default="postgres")
+    a.add_argument("--pg-user", default="postgres")
     args = a.parse_args()
-    res = []  # (name, "pass" | "fail" | "na")
+    res = []
 
     def case(name, ok, got, na=False):
         res.append("na" if na else ("pass" if ok else "fail"))
@@ -83,69 +152,143 @@ def main():
     def fresh():
         return tempfile.TemporaryDirectory(prefix="pe-")
 
-    H = head(args.port, args.db)
+    my = MySQL(args.port, args.db, args.mysql_client)
+    H = my.head()
+
+    def prep(sqls):
+        """run SQLS once on one MySQL connection (a 1-op C=1 run whose setup lines are SQLS)"""
+        with fresh() as t:
+            rc, sm, txt = bb(args.binary, Path(t), H + "".join(f"setup {s}\n" for s in sqls) + "step sql SELECT 1\n",
+                             max_ops=1, warmup="0:0:0")
+            if rc != 0:
+                raise SystemExit(f"prep failed rc={rc}: {txt[-400:]}")
+
+    def table(name, ids):
+        return [f"CREATE TABLE IF NOT EXISTS {name} (id INT PRIMARY KEY, v INT)", f"DELETE FROM {name}",
+                f"INSERT INTO {name} VALUES " + ",".join(f"({i},0)" for i in ids)]
+
     upd = "step write UPDATE {t} SET v = v + 1 WHERE id = {{i}}\n"
-    with fresh() as t:
-        prep(args.binary, args.port, args.db, Path(t), table("pe0", range(200)))
+    # ---- MySQL only: the op phases ----
+    prep(table("pe0", range(200)))
     with fresh() as t:
         rc, sm, txt = bb(args.binary, Path(t), H + upd.format(t="pe0"))
         # LOW-2 (comp-rev-failcount): the control judges behaviour; a counter it does not print is 0, not a failure
-        case("control: no op fails -> rc 0, verdict ok, every failure counter 0 or absent",
+        case("mysql control: no op fails -> rc 0, verdict ok, every failure counter 0 or absent",
              rc == 0 and sm.get("verdict") == "ok" and all(sm.get(k, 0) == 0 for k in FAIL_KEYS),
              (rc, sm.get("verdict"), {k: sm.get(k) for k in FAIL_KEYS}))
-    with fresh() as t:
-        prep(args.binary, args.port, args.db, Path(t), table("pe1", [i for i in range(200) if i != 1]))
+    prep(table("pe1", [i for i in range(200) if i != 1]))
     with fresh() as t:
         rc, sm, txt = bb(args.binary, Path(t), H + upd.format(t="pe1"))
-        case("a failed warm-up op refuses the run (rc 3) and is counted (warmup_err 1)",
+        case("mysql: a failed warm-up op refuses the run (rc 3) and is counted (warmup_err 1)",
              rc == 3 and sm.get("warmup_err") == 1 and "warm-up" in str(sm.get("verdict", "")),
              (rc, sm.get("warmup_err"), sm.get("verdict")))
     with fresh() as t:
         rc, sm, txt = bb(args.binary, Path(t), H + upd.format(t="pe1"), extra=("--allow-errors",))
         # the failure must be REPORTED: before HIGH-1 no field and no line said that a warm-up op failed
-        case("--allow-errors accepts it but still reports it (warmup_err 1, failed_ops 1)",
+        case("mysql: --allow-errors accepts it but still reports it (warmup_err 1, failed_ops 1)",
              rc == 0 and sm.get("warmup_err") == 1 and sm.get("failed_ops") == 1,
              (rc, sm.get("warmup_err"), sm.get("failed_ops"), sm.get("verdict")))
-    with fresh() as t:
-        prep(args.binary, args.port, args.db, Path(t), table("pe5", [i for i in range(200) if i != 5]))
+    prep(table("pe5", [i for i in range(200) if i != 5]))
     with fresh() as t:
         rc, sm, txt = bb(args.binary, Path(t), H + upd.format(t="pe5"))
-        case("a failed measured op refuses (rc 3) and is counted (measured_err 1)",
+        case("mysql: a failed measured op refuses (rc 3) and is counted (measured_err 1)",
              rc == 3 and sm.get("measured_err") == 1, (rc, sm.get("measured_err"), sm.get("verdict")))
-    with fresh() as t:
-        prep(args.binary, args.port, args.db, Path(t), table("dr", range(3)))
+    prep(table("dr", range(3)))
     with fresh() as t:
         rc, sm, txt = bb(args.binary, Path(t), H + "step sql SELECT SLEEP({c})\n" + upd.format(t="dr"), clients=2,
                          max_ops=4, warmup="0:0:0")
-        case("C=2: failed drain ops refuse the run (rc 3) and are counted (drain_err >= 1, measured_err 0)",
+        case("mysql C=2: failed drain ops refuse the run (rc 3) and are counted (drain_err >= 1, measured_err 0)",
              rc == 3 and (sm.get("drain_err") or 0) >= 1 and sm.get("measured_err") == 0,
              (rc, sm.get("drain_err"), sm.get("measured_err"), sm.get("verdict")))
-    with fresh() as t:
-        rc, sm, txt = bb(args.binary, Path(t), H + "step sql SELECT 1\nteardown SELECT * FROM no_such_table_t2\n",
-                         max_ops=5, warmup="0:0:0")
-        case("a failed teardown refuses the run (rc 3), is counted (other_err >= 1) and listed in errors.txt",
-             rc == 3 and (sm.get("other_err") or 0) >= 1 and "no_such_table_t2" in errors_txt(Path(t) / "out"),
-             (rc, sm.get("other_err"), sm.get("verdict"), errors_txt(Path(t) / "out")[:120]))
-    if not args.mysql_client:
-        case("a KILLed home connection counts as a reconnect (reconnects >= 1) and refuses (rc 3)", False,
-             "no --mysql-client to KILL with", na=True)
-    else:
+
+    # ---- both protocols: failures outside an op, and lost home connections ----
+    backends = [(my, bool(args.mysql_client), "no --mysql-client to KILL with")]
+    pg = PG(args.pg_port, args.pg_db, args.pg_user, args.psql) if args.pg_port and args.psql else None
+    backends.append((pg, pg is not None, "no --pg-port/--psql"))
+    for be, have_kill, why_na in backends:
+        nm = be.name if be else "pg"
+        if be is None:
+            for c in ("teardown", "kill-running", "kill-idle", "setup-rerun"):
+                case(f"{nm} {c}", False, why_na, na=True)
+            continue
         with fresh() as t:
-            p, out = bb(args.binary, Path(t), H + "step sql SELECT SLEEP(0.05)\n", max_ops=60, warmup="0:0:0",
+            rc, sm, txt = bb(args.binary, Path(t), be.head() + "step sql SELECT 1\nteardown SELECT * FROM no_such_table_t2\n",
+                             max_ops=5, warmup="0:0:0")
+            case(f"{nm} teardown: a failed teardown refuses (rc 3), is counted (other_err >= 1), listed in errors.txt",
+                 rc == 3 and (sm.get("other_err") or 0) >= 1 and "no_such_table_t2" in errors_txt(Path(t) / "out"),
+                 (rc, sm.get("other_err"), sm.get("verdict")))
+        if not have_kill:
+            for c in ("kill-running", "kill-idle", "setup-rerun"):
+                case(f"{nm} {c}", False, why_na, na=True)
+            continue
+        with fresh() as t:
+            p, out = bb(args.binary, Path(t), be.head() + f"step sql {be.sleep(0.05)}\n", max_ops=60, warmup="0:0:0",
                         popen=True)
             time.sleep(1.5)
-            my = [args.mysql_client, "--protocol=TCP", "-h", "127.0.0.1", "-P", str(args.port), "-u", "root",
-                  "--skip-ssl", "-N", "-B"]
-            pl = subprocess.run(my + ["-e", "SHOW PROCESSLIST"], capture_output=True, text=True, timeout=30).stdout
-            ids = [ln.split("\t")[0] for ln in pl.splitlines() if "SLEEP(0.05)" in ln]
-            k = subprocess.run(my + ["-e", f"KILL {ids[0]}"], capture_output=True, text=True,
-                               timeout=30) if ids else None
-            log, _ = p.communicate(timeout=180)
+            killed, ids = be.kill_running(be.sleep(0.05))
+            p.communicate(timeout=240)
             sm = summary(out)
-            case("a KILLed home connection counts as a reconnect (reconnects >= 1) and refuses (rc 3)",
-                 bool(ids) and k.returncode == 0 and p.returncode == 3 and (sm.get("reconnects") or 0) >= 1,
-                 (ids[:1], k.returncode if k else None, p.returncode, sm.get("reconnects"), sm.get("measured_err"),
-                  sm.get("verdict")))
+            case(f"{nm} kill-running: a KILLed home connection counts as a reconnect (>= 1) and refuses (rc 3)",
+                 killed and p.returncode == 3 and (sm.get("reconnects") or 0) >= 1,
+                 (ids, killed, p.returncode, sm.get("reconnects"), sm.get("measured_err"), sm.get("verdict")))
+        with fresh() as t:
+            spec = be.head() + f"step connect {be.branch}\nstep sql {be.sleep(0.051)}\nafter close\n"
+            p, out = bb(args.binary, Path(t), spec, max_ops=60, warmup="0:0:0", popen=True)
+            time.sleep(1.5)
+            killed, ids = be.kill_idle()
+            p.communicate(timeout=240)
+            sm = summary(out)
+            case(f"{nm} kill-idle: a home connection KILLed while idle is noticed (rc 3, other_err or reconnects >= 1)",
+                 killed and p.returncode == 3 and ((sm.get("other_err") or 0) + (sm.get("reconnects") or 0)) >= 1,
+                 (ids, killed, p.returncode, sm.get("other_err"), sm.get("reconnects"), sm.get("verdict")))
+        be.sql("DROP TABLE IF EXISTS once_t")
+        with fresh() as t:
+            spec = be.head() + "setup CREATE TABLE once_t (id INT)\n" + f"step sql {be.sleep(0.05)}\n"
+            p, out = bb(args.binary, Path(t), spec, max_ops=60, warmup="0:0:0", popen=True)
+            time.sleep(1.5)
+            killed, ids = be.kill_running(be.sleep(0.05))
+            p.communicate(timeout=240)
+            sm = summary(out)
+            et = errors_txt(out)
+            case(f"{nm} setup-rerun: a setup statement failing on the reconnected home refuses (rc 3), other_err >= 1",
+                 killed and p.returncode == 3 and (sm.get("other_err") or 0) >= 1 and "setup on a reconnected" in et,
+                 (ids, killed, p.returncode, sm.get("other_err"), sm.get("reconnects"), et[:160]))
+        be.sql("DROP TABLE IF EXISTS once_t")
+
+    # ---- MySQL only: the server itself dies mid-run (the test's own Dolt server) ----
+    if not args.dolt:
+        case("mysql server-kill", False, "no --dolt to start a server to kill", na=True)
+    else:
+        with fresh() as t:
+            root = Path(t)
+            (root / "root/.dolt").mkdir(parents=True)
+            (root / "root/.dolt/config_global.json").write_text(
+                '{"metrics.disabled":"true","versioncheck.disabled":"true","user.name":"t","user.email":"t@x.invalid"}\n')
+            env = dict(os.environ, DOLT_ROOT_PATH=str(root / "root"), DOLT_DISABLE_EVENT_FLUSH="1")
+            (root / "dbs" / args.db).mkdir(parents=True)
+            subprocess.run([args.dolt, "init"], cwd=root / "dbs" / args.db, env=env, capture_output=True, timeout=60)
+            port = free_port()
+            (root / "config.yaml").write_text(f"log_level: warning\nlistener:\n  host: 127.0.0.1\n  port: {port}\n"
+                                              f"data_dir: {root / 'dbs'}\ncfg_dir: {root / 'cfg'}\n")
+            srv = subprocess.Popen([args.dolt, "sql-server", "--config", str(root / "config.yaml")], cwd=root, env=env,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            for _ in range(120):
+                try:
+                    socket.create_connection(("127.0.0.1", port), 1).close()
+                    break
+                except OSError:
+                    time.sleep(0.5)
+            (root / "w").mkdir()
+            p, out = bb(args.binary, root / "w", my.head(port) + "step sql SELECT SLEEP(0.01)\n", max_ops=300,
+                        warmup="0:0:0", popen=True)
+            time.sleep(1.0)
+            srv.send_signal(signal.SIGKILL)
+            srv.wait(timeout=30)
+            p.communicate(timeout=240)
+            sm = summary(out)
+            case("mysql server-kill: a server killed mid-run refuses (rc 3), counts failed ops and failed reconnects",
+                 p.returncode == 3 and (sm.get("failed_ops") or 0) >= 1 and (sm.get("other_err") or 0) >= 1,
+                 (p.returncode, sm.get("failed_ops"), sm.get("other_err"), sm.get("reconnects"), sm.get("verdict")))
     n = len(res)
     np_, nn, nf = res.count("pass"), res.count("na"), res.count("fail")
     print(f"TALLY ran={np_ + nf} pass={np_} na={nn} fail={nf}")
