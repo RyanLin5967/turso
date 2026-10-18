@@ -17,7 +17,7 @@ Each row: (name, the red it stands for and the old behaviour, directory under fa
 target text, replacement, the case whose FAIL line must appear). The copy is the whole directory (testdata/ is
 symlinked to the original), run from the copy. The last column is the last observed result. Every row is UNRUN
 (written under QUIET, 2026-10-15); the first run of this file is that run. Run it on Linux: t3lib.sh uses coproc
-(bash 4+; macOS's /bin/bash 3.2 does not parse it), and t3lib_test.sh's production-hook cases need sudo -n and
+(bash 5+, hostbin.BASH_MIN; macOS's /bin/bash 3.2 does not parse it), and t3lib_test.sh's production-hook cases need sudo -n and
 mkfs.ext4.
 Owed with it, the fixed-API mutants that already exist in v3l_mutants.py for the other API-setup reds: A24g
 (d036af4fc's sync_record(paths=...) argv case), A27a and A27b (576a75632's measure() cases, which at their red
@@ -32,7 +32,7 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 LINUX = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
-import hostbin  # noqa: E402  "bash" below is hostbin's bash 4+, never the caller's PATH's (the platform class)
+import hostbin  # noqa: E402  "bash" below is hostbin's bash 5+, never the caller's PATH's (the platform class)
 PY = [sys.executable, "-B"]
 T3LIB = ["bash", "t3lib_test.sh"]
 ANALYZE = PY + ["analyze.py", "--self-test"]
@@ -167,13 +167,19 @@ def main(argv):
     top = tempfile.mkdtemp(prefix="fixed-api-mut-")
     # one control per (dir, command): two commands over one dir each get their own copy (the first run, 2026-10-15,
     # crashed copying t3/ a second time into control-t3)
+    # a control that exits 3 ran green apart from N/A cases (a host without root, a busy host): the mutants still run,
+    # a mutant at rc 3 SURVIVED (it failed nothing that ran), and the whole result inherits the N/A: exit 3, never 0
+    # (linux-rev-uw1 HIGH 1), naming each control's N/A causes
+    inherited = []
     for k, (d, cmd) in enumerate(sorted({(r[2], tuple(r[4])) for r in todo})):
         rc, out = run_test(copy_of(d, os.path.join(top, f"control-{k}-" + d.replace("/", "_"))), list(cmd))
-        if rc != 0:
+        if rc not in (0, 3):
             print(f"fixed_api_mutants: REFUSED: the unmutated {d} control ({' '.join(cmd)}) is not green (rc {rc}): "
                   f"{out[-300:]!r}")
             return 2
-        print(f"control {d} ({' '.join(cmd)}): rc 0")
+        if rc == 3:
+            inherited += [ln.strip() for ln in out.splitlines() if "N/A-on-" in ln]
+        print(f"control {d} ({' '.join(cmd)}): rc {rc}")
     bad = 0
     for name, what, d, f, cmd, old, new, case, last in todo:
         cp = copy_of(d, os.path.join(top, name))
@@ -183,14 +189,16 @@ def main(argv):
             fh.write(src.replace(old, new))
         rc, out = run_test(cp, cmd)
         named = any(" FAIL: " in ln and case in ln for ln in out.splitlines())
-        verdict = ("KILLED" if rc not in (0, None) and named else "SURVIVED" if rc == 0
+        verdict = ("KILLED" if rc not in (0, 3, None) and named else "SURVIVED" if rc in (0, 3)
                    else "MISSED" if rc is not None else "BROKEN")
         bad += verdict != "KILLED"
         print(f"MUTANT {name} ({what}): {verdict} (rc {rc}; must fail: {case!r}; last recorded: {last})")
         if verdict != "KILLED":
             print("    " + "\n    ".join([ln for ln in out.splitlines() if " FAIL" in ln][:6] or [out[-300:]]))
     print(f"fixed_api_mutants: {len(todo) - bad}/{len(todo)} KILLED ({top})")
-    return 0 if not bad else 1
+    for ln in inherited:
+        print(f"fixed_api_mutants: inherited from a control: {ln}")
+    return 1 if bad else 3 if inherited else 0
 
 
 def self_test():

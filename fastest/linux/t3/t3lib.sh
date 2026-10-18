@@ -467,3 +467,14 @@ sys.exit("no fixture record in " + sys.argv[1]) if type(v) is not int else print
     --prebranch "$n" --live "$live" --du "$st" --engine-why "ours: a branch store of several files, sized by du" \
     --streams "$d/parent/sql.sha256" "$d/parent/age.sha256" --readback "$rb" > /dev/null
 }
+
+# sudo_state -- whether this host gives passwordless root (linux-rev-uw1 LOW 6): 'ok'; 'password' (sudo is there and
+# asks for one: a no-root host, so a root case is N/A-on-noroot there, which t3run's selftests refuse on the T3 box);
+# 'absent' (no sudo at all) or 'error: <text>' (anything else), each a FAIL of a root case, never an N/A.
+# T3_SUDO_BIN names the sudo to ask (tests only; t3run unsets it)
+sudo_state() {
+  local s=${T3_SUDO_BIN:-sudo} e
+  command -v "$s" > /dev/null 2>&1 || { echo absent; return 0; }
+  e=$("$s" -n true 2>&1) && { echo ok; return 0; }
+  case $e in *"password is required"*|*"a terminal is required"*) echo password ;; *) echo "error: ${e:-no output}" ;; esac
+}

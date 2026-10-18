@@ -44,9 +44,13 @@ mac=$(mktemp -d)
 top=$(git -C "$HERE" rev-parse --show-toplevel) && git -C "$top" archive "$SHA" fastest .github | tar -x -C "$mac" ||
   { echo "vm_dryblock: REFUSED: cannot archive $SHA here for the Mac self-tests"; rm -rf "$mac"; exit 2; }
 gnu=""; for g in /opt/homebrew/opt/coreutils/libexec/gnubin /usr/local/opt/coreutils/libexec/gnubin; do [ -d "$g" ] && gnu=$g:; done
+# rc 3 is accepted HERE, and only here: the Mac half is a pre-check before the VM run, and its linux-only rows are
+# N/A by construction (counted in the totals line); the gate's own half, t3run's selftests stage on Linux, takes rc 0
+mrc=0
 PATH=$gnu/opt/homebrew/bin:$PATH timeout 3600 python3 -B "$mac/fastest/linux/gates/run_everywhere.py" "$mac/fastest/linux" \
-  > "$OUTDIR/mac-run-everywhere.txt" 2>&1 ||
-  { tail -6 "$OUTDIR/mac-run-everywhere.txt"; echo "vm_dryblock: REFUSED: the Mac self-tests at $SHA fail"; rm -rf "$mac"; exit 2; }
+  > "$OUTDIR/mac-run-everywhere.txt" 2>&1 || mrc=$?
+[ $mrc = 0 ] || [ $mrc = 3 ] ||
+  { tail -6 "$OUTDIR/mac-run-everywhere.txt"; echo "vm_dryblock: REFUSED: the Mac self-tests at $SHA fail (rc $mrc)"; rm -rf "$mac"; exit 2; }
 tail -1 "$OUTDIR/mac-run-everywhere.txt"
 rm -rf "$mac"
 mkdir -p "$OUTDIR" || exit 2

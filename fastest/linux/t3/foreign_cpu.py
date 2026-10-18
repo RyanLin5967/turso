@@ -122,6 +122,38 @@ def sample(path, cell, interval, stop_file, max_s):
                 return 0
 
 
+def busy_evidence(path, exclude=(), interval_default=1.0):
+    """linux-rev-uw1 MED 3: the processes that make a window's record show a BUSY HOST, from the window's own samples:
+    each FOREIGN process (the sampler's own classification, so kernel threads and the system under test never count)
+    whose pid is not in EXCLUDE (the self-test's own tree) and that the record shows above 50% for 5 s or more (rule
+    2's own run-length). A ps CPU% is a lifetime average and proves nothing about the window (the reviewer's idle
+    burner read 57-94%). Returns ["comm pid N", ...]; an empty list is no evidence."""
+    per, interval = {}, interval_default
+    for line in open(path):
+        p = line.rstrip("\n").split("\t")
+        if p[0] == "#start":
+            for x in p[1:]:
+                if x.startswith("interval="):
+                    interval = float(x.split("=")[1])
+        elif not p[0].startswith("#") and len(p) == 5 and p[4] == "foreign" and int(p[1]) not in exclude:
+            per.setdefault((int(p[1]), p[2]), []).append((float(p[0]), float(p[3])))
+    out = []
+    for (pid, comm), rows in sorted(per.items()):
+        run, last = 0.0, None
+        for t, pct in rows:
+            if pct > 50.0 and last is not None and t - last <= 1.5 * interval:
+                run += t - last
+            elif pct > 50.0:
+                run = interval
+            else:
+                run = 0.0
+            last = t if pct > 50.0 else None
+            if run >= 5.0:
+                out.append(f"{comm} pid {pid}")
+                break
+    return out
+
+
 def decide(path, interval_default=1.0):
     ticks, per_proc, stopped, interval = [], {}, False, interval_default
     for line in open(path):
@@ -208,7 +240,7 @@ def self_test():
             p.wait()
         open(stop, "w").close()
         s.wait()
-        return decide(out)["verdict"]
+        return decide(out)["verdict"], out, {os.getpid(), s.pid} | {p.pid for p in procs}
 
     # Live: the sampler sees real processes and classifies them (marker -> sut, none -> foreign).
     live = [
@@ -231,28 +263,14 @@ def self_test():
             print(f"N/A-on-busy-host: self-test {label}: the quiet baseline was VOID ({busy}); a busy host cannot "
                   "show VALID", flush=True)
             continue
-        out = window(label.split(": ")[1].replace(" ", "_")[:24], burners)
+        out, rec, mine = window(label.split(": ")[1].replace(" ", "_")[:24], burners)
         if not burners and out != "VALID":
-            # busy only on evidence that is not the sampler's: a process OUTSIDE this self-test's own process tree at
-            # 50%+ CPU by ps right after (not "another uid": on iccad7 every one of the owner's sessions shares one
-            # uid, and a java there at 422% was one of them). Without that evidence a VOID baseline is a FAIL, so a
-            # sampler that voids everything cannot read as a busy host
-            r = subprocess.run(["ps", "-eo", "pid=,ppid=,pcpu=,comm="], capture_output=True, text=True)
-            rows = [ln.split(None, 3) for ln in r.stdout.splitlines() if len(ln.split(None, 3)) == 4]
-            parent = {int(p_): int(pp) for p_, pp, _pc, _c in rows if p_.isdigit() and pp.isdigit()}
-
-            def ours(pid):
-                for _ in range(64):
-                    if pid == os.getpid():
-                        return True
-                    pid = parent.get(pid)
-                    if not pid:
-                        return False
-                return False
-            others = [f"{c} pid {p_} {pc}%" for p_, _pp, pc, c in rows
-                      if p_.isdigit() and not ours(int(p_)) and float(pc) >= 50.0]
+            # busy only on evidence from the window's OWN record (linux-rev-uw1 MED 3): a foreign, non-kernel process
+            # outside this self-test's own tree above 50% for 5 s or more in its samples (busy_evidence). Without it a
+            # VOID baseline is a FAIL, so a sampler that voids everything cannot read as a busy host
+            others = busy_evidence(rec, exclude=mine)
             if others:
-                busy = f"the no-burner window gave {out}; processes outside this test at 50%+: {', '.join(others[:4])}"
+                busy = f"the no-burner window gave {out}; the window's own samples show: {', '.join(others[:4])}"
                 print(f"N/A-on-busy-host: self-test {label}: {busy}", flush=True)
                 continue
         ok = out == want
@@ -319,12 +337,13 @@ def self_test():
         ok = got == want
         bad += not ok
         print(f"self-test {'PASS' if ok else 'FAIL'}: {label}: want {want}, got {got}")
-    return bad == 0
+    # an N/A is its own outcome, never a pass (linux-rev-uw1 HIGH 1): "fail", "na" (some case did not run) or "pass"
+    return "fail" if bad else "na" if busy else "pass"
 
 
 def main(a):
     if len(a) >= 2 and a[1] == "self-test":
-        return 0 if self_test() else 1
+        return {"pass": 0, "fail": 1, "na": 3}[self_test()]
     if len(a) >= 3 and a[1] == "sample":
         opt = dict(zip(a[3::2], a[4::2]))
         if "--cell" not in opt:

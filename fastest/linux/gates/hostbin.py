@@ -1,7 +1,7 @@
 """hostbin.py -- the one place a gate or test under fastest/linux chooses the bash it runs (the platform class, Ryan's
 class rule, DECISIONS 994f7d41e0: no gate silently inherits the host platform or layout).
 
-Every shell script here needs bash 4+ (coproc, associative arrays, ${x,,}). macOS ships /bin/bash 3.2 first on the
+Every shell script here needs bash 5+ (coproc, associative arrays, ${x,,}, $EPOCHREALTIME). macOS ships /bin/bash 3.2 first on the
 default PATH; a run that passed did so only because its caller had put homebrew first. So no caller runs "bash" by
 name: it runs bash(), which tries each `bash` on PATH and then the stated fallbacks, takes the first that reports
 BASH_VERSINFO >= BASH_MIN (5), and REFUSES (BashMissing, naming everything it tried) when none does -- never falls
@@ -38,11 +38,11 @@ def _major(path):
 _cache = {}
 
 
-def bash(path=None):
-    """the absolute path of a bash 4+, searched on PATH (default: os.environ's) and then FALLBACKS"""
+def bash(path=None, fallbacks=FALLBACKS):
+    """the absolute path of a bash BASH_MIN+, searched on PATH (default: os.environ's) and then FALLBACKS"""
     path = os.environ.get("PATH", "") if path is None else path
-    if path in _cache:
-        return _cache[path]
+    if (path, fallbacks) in _cache:
+        return _cache[(path, fallbacks)]
     tried = []
     seen = set()
     for d in path.split(os.pathsep):
@@ -50,12 +50,12 @@ def bash(path=None):
         if c and os.access(c, os.X_OK) and os.path.realpath(c) not in seen:
             seen.add(os.path.realpath(c))
             tried.append(c)
-    tried += [c for c in FALLBACKS if os.access(c, os.X_OK) and os.path.realpath(c) not in seen]
+    tried += [c for c in fallbacks if os.access(c, os.X_OK) and os.path.realpath(c) not in seen]
     for c in tried:
         m = _major(c)
         if m is not None and m >= BASH_MIN:
-            _cache[path] = os.path.abspath(c)
-            return _cache[path]
+            _cache[(path, fallbacks)] = os.path.abspath(c)
+            return _cache[(path, fallbacks)]
     raise BashMissing(f"no bash {BASH_MIN}+ found (tried {tried or 'nothing'}); on macOS: brew install bash")
 
 

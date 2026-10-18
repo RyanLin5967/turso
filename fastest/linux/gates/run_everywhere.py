@@ -5,7 +5,9 @@ layout). The same command runs on the Mac and on Linux; vm_dryblock.sh runs it o
 t3run.sh's selftests stage runs it on Linux.
 
   run_everywhere.py [ROOT]     ROOT is fastest/linux (default: this file's ../). Exit 0 iff every row for this
-                               platform passed, no entry point lacks a row, and no row names a missing file.
+                               platform ran and passed, no entry point lacks a row, and no row names a missing file;
+                               3 when nothing failed but a case or row was N/A (counted by cause in the totals; never
+                               a pass); 1 otherwise. A row that skips a case exits 3 with an N/A-on-<cause> line.
   run_everywhere.py self-test  the table rules on planted trees
 
 Refused (exit 1, each named): an entry point with no row (discovered: a .py whose text compares an argument with
@@ -81,7 +83,8 @@ def run(root, plat=None, timeout=1800):
     for p in discover(root):
         if p not in listed:
             fails.append(f"{p}: a self-test entry point with no row in gates/platforms.tsv (state its platform)")
-    na = passed = 0
+    passed = 0
+    causes = {}  # N/A cause -> case count (a whole linux row off Linux counts once, under the platform's name)
     try:
         env = hostbin.env_with_bash()
         lines.append(f"bash: {hostbin.bash()} (hostbin; first on every row's PATH)")
@@ -98,7 +101,7 @@ def run(root, plat=None, timeout=1800):
             fails.append(f"{path}: listed in platforms.tsv but absent")
             continue
         if pf == "linux" and plat != "linux":
-            na += 1
+            causes[plat] = causes.get(plat, 0) + 1
             lines.append(f"N/A-on-{plat}: {path} ({why})")
             continue
         cmd = ([sys.executable, "-B", os.path.basename(full)] if path.endswith(".py")
@@ -110,16 +113,34 @@ def run(root, plat=None, timeout=1800):
         except subprocess.TimeoutExpired:
             rc, out = None, "timed out"
         last = [ln for ln in out.splitlines() if ln.strip()][-1:] or [""]
-        inner_na = sum(1 for ln in out.splitlines() if "N/A-on-" in ln)
-        lines.append(f"{'PASS' if rc == 0 else 'FAIL'} {path} {args} rc={rc} | {last[0][:160]}"
-                     + (f" ({inner_na} case(s) N/A-on-{plat})" if inner_na else ""))
-        if rc == 0:
+        # an N/A is its own outcome (linux-rev-uw1 HIGH 1, MED 2; the lead's rule: an N/A never counts toward a T3
+        # gate item): a row that skips a case exits 3 and names each case's cause in an "N/A-on-<cause>" line
+        row_na = re.findall(r"N/A-on-([A-Za-z0-9_-]+)", out)
+        if rc == 0 and row_na:
+            fails.append(f"{path}: printed {len(row_na)} N/A line(s) but exited 0: an N/A must exit 3")
+            lines.append(f"FAIL {path} {args} rc=0 | N/A lines with exit 0")
+        elif rc == 3 and row_na:
+            for c in row_na:
+                causes[c] = causes.get(c, 0) + 1
+            lines.append(f"N/A {path} {args} rc=3 | {len(row_na)} case(s) N/A: "
+                         + ", ".join(f"{c} {row_na.count(c)}" for c in sorted(set(row_na))))
+        elif rc == 3:
+            fails.append(f"{path}: exited 3 (N/A) but printed no N/A-on-<cause> line")
+            lines.append(f"FAIL {path} {args} rc=3 | no cause named")
+        elif rc == 0:
             passed += 1
+            lines.append(f"PASS {path} {args} rc=0 | {last[0][:160]}")
         else:
             fails.append(f"{path}: rc {rc}: {last[0][:200]}")
+            lines.append(f"FAIL {path} {args} rc={rc} | {last[0][:160]}")
     lines += [f"REFUSED: {x}" for x in fails if x not in bad]
-    lines.append(f"run_everywhere ({plat}): {passed} passed, {len(fails)} failed or refused, {na} N/A-on-{plat}")
-    return (0 if not fails and passed > 0 else 1), lines
+    n_na = sum(causes.values())
+    lines.append(f"run_everywhere ({plat}): {passed} passed, {n_na} N/A"
+                 + (" (" + ", ".join(f"{c} {causes[c]}" for c in sorted(causes)) + ")" if n_na else "")
+                 + f", {len(fails)} failed or refused")
+    # 0: every row ran and passed. 3: no failure, but at least one case N/A (never a pass: t3run's selftests stage
+    # takes 0 only). 1: a failure or refusal, or nothing passed.
+    return (1 if fails or passed == 0 else 3 if n_na else 0), lines
 
 
 def self_test():

@@ -70,8 +70,13 @@ na=0
 linux_check() { if [ "$(uname -s)" = Linux ]; then check "$@"; else na=$((na + 1)); echo "T3LIB self-test N/A-on-$(uname -s | tr A-Z a-z): $1"; fi; }
 # the host-property class (2026-10-18, a real RHEL 8.10 host with no root): a case that needs root states it, and on a
 # host without passwordless sudo it is N/A-on-noroot, printed and never counted as a pass, as linux_check is off Linux
-root_check() { if [ "$(uname -s)" != Linux ]; then linux_check "$@"; elif sudo -n true 2> /dev/null; then check "$@"
-               else na=$((na + 1)); echo "T3LIB self-test N/A-on-noroot: $1"; fi; }
+# sudo_state (linux-rev-uw1 LOW 6): only a sudo that asks for a password is N/A-on-noroot; a missing or broken one runs
+# the case, which then fails, so it is never mistaken for a no-root host
+root_check() { if [ "$(uname -s)" != Linux ]; then linux_check "$@"; return; fi
+               case $(sudo_state) in
+                 password) na=$((na + 1)); echo "T3LIB self-test N/A-on-noroot: $1" ;;
+                 *) check "$@" ;;
+               esac; }
 mkdir -p "$T/dev"; : > "$T/dev/nvme1n1"; : > "$T/dev/nvme2n1"
 REAL1=$(readlink -f "$T/dev/nvme1n1")
 ln -sfn "$T/dev/nvme1n1" "$T/dev/by-id-x"
@@ -505,4 +510,6 @@ check "LOW 6: sudo_state: any other sudo failure is an error, named" \
   'case "$(T3_SUDO_BIN=$T/sudo/err sudo_state)" in error:*resolve*) true ;; *) false ;; esac'
 
 echo "T3LIB SELF-TEST $pass/$((pass + fail)) $([ $fail = 0 ] && echo PASS || echo FAIL)$([ $na = 0 ] || echo " ($na N/A: off Linux or without root)")"
-[ $fail = 0 ]
+# an N/A is its own outcome, exit 3, never a pass (linux-rev-uw1 HIGH 1): 0 only when every case ran and held
+[ $fail = 0 ] || exit 1
+[ $na = 0 ] || exit 3

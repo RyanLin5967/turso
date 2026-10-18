@@ -833,6 +833,7 @@ def main(out, sha, dry, manifest):
 def self_test():
     """Synthetic packages, the V3 batches in the probe's c225124ae shape: one good block, then each way a block or the
     package can be incomplete."""
+    na_cases = []  # the cases this host cannot run (each printed as N/A-on-<cause>)
     def w(path, text):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         open(path, "w").write(text)
@@ -1523,6 +1524,7 @@ def self_test():
             shutil.rmtree(root)
     else:
         print(f"N/A-on-{sys.platform}: DATA_GIB fired by a real ENOSPC (/dev/full is Linux's)", flush=True)
+        na_cases.append("DATA_GIB real ENOSPC")
     # the owed ours fixture record: ONE parent for every system in a block (gen_seed's rows and digest), so ours at
     # fastest_profile's old default 1000 rows beside the competitors' 10000 fails (run 11 measured exactly that)
     for name, ofx, cfx, want in (
@@ -1653,8 +1655,10 @@ def self_test():
     bad = [c for c in cases if not c[1]]
     for n, ok, fb in cases:
         print(f"SUMMARIZE self-test {'PASS' if ok else 'FAIL'}: {n}" + (f" (why {fb})" if fb and not ok else ""))
-    print(f"SUMMARIZE SELF-TEST {len(cases) - len(bad)}/{len(cases)} {'PASS' if not bad else 'FAIL'}")
-    return 0 if not bad else 1
+    print(f"SUMMARIZE SELF-TEST {len(cases) - len(bad)}/{len(cases)} {'PASS' if not bad else 'FAIL'}"
+          + (f" ({len(na_cases)} N/A)" if na_cases else ""))
+    # an N/A is its own outcome, exit 3, never a pass (linux-rev-uw1 HIGH 1)
+    return 1 if bad else 3 if na_cases else 0
 
 
 if __name__ == "__main__":
