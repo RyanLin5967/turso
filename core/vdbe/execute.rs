@@ -14926,14 +14926,18 @@ pub fn op_init_cdc_version(
             return Ok(InsnFunctionStepResult::Step);
         }
 
-        // If CDC is already enabled, re-parse with current version and exit
+        // If CDC is already enabled INTO THIS TABLE, re-parse with current version and exit
         // early. Idempotent; avoids CDC capturing its own table creation when
-        // the pragma is called multiple times.
+        // the pragma is called multiple times. A switch to another table goes on to create it
+        // (the early exit ignored the name: `'full,c2'` while capturing into c1 left the
+        // connection capturing into a c2 that never existed, so every write failed).
         if let Some(info) = conn.get_capture_data_changes_info().as_ref() {
-            let opts = CaptureDataChangesInfo::parse(cdc_mode, info.version)?;
-            state.pending_cdc_info = Some(opts);
-            state.pc += 1;
-            return Ok(InsnFunctionStepResult::Step);
+            if info.table == cdc_table_name.as_str() {
+                let opts = CaptureDataChangesInfo::parse(cdc_mode, info.version)?;
+                state.pending_cdc_info = Some(opts);
+                state.pc += 1;
+                return Ok(InsnFunctionStepResult::Step);
+            }
         }
 
         let stmt = prepare_cdc_internal(
