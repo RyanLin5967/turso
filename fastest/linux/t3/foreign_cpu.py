@@ -498,13 +498,20 @@ def self_test():
         except TypeError:
             return ran(v, burners, mine)
 
-    def sut_rec(label, rows):
-        return evid_file(label, [(pid, "python3", pct, "sut", start, n) for pid, pct, start, n in rows])
+    def sut_rec(label, rows, anc=()):
+        f_ = evid_file(label, [(pid, "python3", pct, "sut", start, n) for pid, pct, start, n in rows])
+        with open(f_, "a") as o_:
+            for pid in anc:
+                o_.write(f"#anc\t{pid}\n")
+        return f_
     child = [("child", 3, 9)]
     par_only = sut_rec("paronly", [(41, 99.0, 3, 9)])
-    par_child = sut_rec("parchild", [(41, 0.2, 3, 9), (77, 99.0, 3, 9)])
+    # FLAGGED TEST EDIT (linux-rev-uw5 L1, a tightening): the seen child must be SUT BY ANCESTRY (an #anc row), so
+    # this fixture now records pid 77 as such; the inherited-marker twin below must be refused
+    par_child = sut_rec("parchild", [(41, 0.2, 3, 9), (77, 99.0, 3, 9)], anc=[77])
+    inherit_child = sut_rec("inheritchild", [(41, 0.2, 3, 9), (77, 99.0, 3, 9)])
     brief_child = sut_rec("briefchild", [(41, 0.2, 3, 9), (77, 99.0, 3, 2)])
-    x10_child = sut_rec("x10child", [(41, 2.0, 3, 9), (77, 990.0, 3, 9)])
+    x10_child = sut_rec("x10child", [(41, 2.0, 3, 9), (77, 990.0, 3, 9)], anc=[77])
     synthetic_evid += [
         ("uw4 MED 1: a child case whose SUT CPU is all the parent's (pid 41, ours) is refused: no child burned",
          not ran_rec(decide(par_only), child, {40, 41}, par_only)),
@@ -512,6 +519,8 @@ def self_test():
          ran_rec(decide(par_child), child, {40, 41}, par_child)),
         ("uw4 MED 1: a child seen at 99% for only 2 s (under rule 2's 5 s) is not seen to run",
          not ran_rec(decide(brief_child), child, {40, 41}, brief_child)),
+        ("uw5 L1: a child whose SUT class came from its OWN marker (no #anc row: an inherited environ) is refused",
+         not ran_rec(decide(inherit_child), child, {40, 41}, inherit_child)),
         ("uw4 LOW 5: a child read at 990% (10x one core) is refused",
          not ran_rec(decide(x10_child), child, {40, 41}, x10_child)),
     ]
@@ -573,6 +582,11 @@ def self_test():
         got = {k: own(v.pid, roots=[root]) for k, v in procs_.items()}
         got_default_slash = own(procs_["slash"].pid)
         got_pid1 = own(1)
+        dead_ = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead_.wait()
+        oas = globals().get("owners_at_stop", lambda pid, uid, roots=None: None)
+        got_dead_other = oas(dead_.pid, me_uid + 4242)
+        got_dead_mine = oas(dead_.pid, me_uid)
     finally:
         for c_ in procs_.values():
             c_.kill(); c_.wait()
@@ -620,8 +634,10 @@ def self_test():
         ("uw4 E3: our own process whose cwd is / has user us and run - (with the planted root and the default roots)",
          got["slash"] == (me_uid, me_user, "-") and got_default_slash == (me_uid, me_user, "-")),
         ("uw4 E4: the login of a uid is looked up once, not once per lookup (50 lookups)", calls[0] <= 1),
-        ("uw4 E6: owner_of on pid 1 (another uid: root's init) records its uid and no login and no run",
-         os.getuid() == 0 or (got_pid1 is not None and got_pid1[0] != me_uid and got_pid1[1:] == ("-", "-"))),
+        ("uw5 L2: an exited process of ANOTHER uid is resolved at stop as that uid, no login, no run",
+         got_dead_other == (me_uid + 4242, "-", "-")),
+        ("uw5 L2: an exited process of ours is resolved at stop as our uid and login, run ?",
+         got_dead_mine == (me_uid, me_user, "?")),
         ("owner: sample() writes an #owner row for a foreign pid it records, with our user",
          len(burn_owner) == 1 and burn_owner[0][3] == me_user),
         # the lead's E4 order: owners are resolved at STOP, never inside the timed window (the per-pid lookups cost the
@@ -632,6 +648,13 @@ def self_test():
         ("uw4 E4: a process of ours that exited before the stop keeps its uid and login, its run unknown (?)",
          len(burn_owner) == 1 and burn_owner[0][2] == str(me_uid) and burn_owner[0][4] == "?"),
     ]
+    # linux-rev-uw5 L7: under root, pid 1 is our own uid, so the "another uid" case cannot run: N/A-on-root, not a pass
+    if os.getuid() == 0:
+        n_na += 1
+        print("N/A-on-root: self-test uw4 E6: owner_of on pid 1 needs a uid other than ours (this self-test runs as root)")
+    else:
+        synthetic_evid.append(("uw4 E6: owner_of on pid 1 (another uid: root's init) records its uid and no login and no run",
+                               got_pid1 is not None and got_pid1[0] != me_uid and got_pid1[1:] == ("-", "-")))
     for label, ok in synthetic_evid:
         bad += not ok
         n_pass += ok

@@ -377,6 +377,19 @@ def self_test():
                       rc == 1 and "busy-host" in out))
         rc, out = cli(t)
         cases.append(("uw2 MED 1: an honest tally (na=1, exit 3) is the N/A outcome, rc 3", rc == 3 and "N/A a/na3.py" in out))
+        # linux-rev-uw5 L4: an N/A line is one whose OUTCOME is N/A: a PASS or FAIL line whose label merely names
+        # "N/A-on-<cause>" (t3lib's root_check case did, 77c2f546b) is no N/A, and a real N/A line still counts
+        rows(("good.py", good), ("labelna.py", ('print("SELF-TEST PASS: a root case counted N/A-on-noroot: under sudo x")',
+                                                'print("TALLY ran=1 pass=1 na=0 fail=0")', "sys.exit(0)")))
+        rc, out = cli(t)
+        cases.append(("uw5 L4: a PASS line whose label names N/A-on-noroot: is no N/A line (the row passes, rc 0)",
+                      rc == 0 and "PASS a/labelna.py" in out))
+        rows(("good.py", good), ("labelna2.py", ('print("SELF-TEST PASS: a case named N/A-on-noroot: x")',
+                                                 'print("T3LIB self-test N/A-on-noroot: case y")',
+                                                 'print("TALLY ran=1 pass=1 na=1 fail=0")', "sys.exit(3)")))
+        rc, out = cli(t)
+        cases.append(("uw5 L4: beside such a label, the row's one real N/A line is counted once (na=1 agrees, rc 3)",
+                      rc == 3 and "N/A a/labelna2.py" in out))
         for f_ in os.listdir(os.path.join(t, "a")):
             os.remove(os.path.join(t, "a", f_))
         open(os.path.join(t, "a", "good.py"), "w").write(ok_py)
