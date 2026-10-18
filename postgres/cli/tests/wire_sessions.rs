@@ -14543,3 +14543,56 @@ fn the_servers_schema_refusal_reads_the_statement_not_its_text() {
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// Lead ruling 2026-10-18 on rev-bl1 #19: a DROP TABLE of a table this session's own open named
+/// portal reads is refused, as PostgreSQL refuses it (55006 'cannot DROP TABLE "e" because it is
+/// being used by active queries in this session'), since a dropped table under a live cursor risks
+/// a wrong answer or a crash. Ours dropped it. A portal that ran to completion, or was closed, no
+/// longer holds its table; an unrelated table drops as before.
+#[test]
+fn a_drop_of_a_table_an_open_portal_reads_is_55006() {
+    let dir = Scratch::new("drop-held");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for t in ["e", "f", "g", "other"] {
+        a.q(&format!("CREATE TABLE {t}(x int)")).ok(t);
+        a.q(&format!("INSERT INTO {t} VALUES (1)")).ok(t);
+    }
+    let mut wrong = Vec::new();
+    a.q("BEGIN").ok("begin");
+    named_parse(&mut a, "se", "SELECT x FROM e");
+    named_bind(&mut a, "pe", "se");
+    let r = a.q("DROP TABLE e");
+    if r.error.as_ref().map(|e| e.code.as_str()) != Some("55006") {
+        wrong.push(format!("DROP TABLE e under the open portal pe: {:?}", r.error));
+    }
+    a.q("ROLLBACK").ok("rollback");
+    a.q("BEGIN").ok("begin");
+    named_parse(&mut a, "so", "SELECT x FROM e");
+    named_bind(&mut a, "po", "so");
+    a.send(b'S', &[]);
+    a.read_reply();
+    if let Some(e) = a.q("DROP TABLE other").error {
+        wrong.push(format!("DROP TABLE other (no portal reads it): {} {}", e.code, e.message));
+    }
+    a.q("COMMIT").ok("commit");
+    a.q("BEGIN").ok("begin");
+    named_parse(&mut a, "sf", "SELECT x FROM f");
+    named_bind(&mut a, "pf", "sf");
+    named_execute(&mut a, "pf");
+    a.send(b'S', &[]);
+    a.read_reply();
+    if let Some(e) = a.q("DROP TABLE f").error {
+        wrong.push(format!("DROP TABLE f after pf ran to completion: {} {}", e.code, e.message));
+    }
+    named_parse(&mut a, "sg", "SELECT x FROM g");
+    named_bind(&mut a, "pg", "sg");
+    a.send(b'C', b"Ppg\0");
+    a.send(b'S', &[]);
+    a.read_reply();
+    if let Some(e) = a.q("DROP TABLE g").error {
+        wrong.push(format!("DROP TABLE g after pg was closed: {} {}", e.code, e.message));
+    }
+    a.q("COMMIT").ok("commit");
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
