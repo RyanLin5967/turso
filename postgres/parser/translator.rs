@@ -6341,6 +6341,13 @@ pub struct PgDropObjectsStmt {
 }
 
 pub fn try_extract_drop_objects(parse_result: &ParseResult) -> Option<PgDropObjectsStmt> {
+    drop_objects(parse_result).filter(|d| d.missing_ok || d.objects.len() >= 2)
+}
+
+/// Every DROP TABLE, VIEW, INDEX, SEQUENCE, TYPE or DOMAIN statement's objects, whatever its form
+/// (try_extract_drop_objects takes only the forms this frontend runs itself: IF EXISTS, or
+/// several objects).
+pub fn drop_objects(parse_result: &ParseResult) -> Option<PgDropObjectsStmt> {
     use pg_query::protobuf::node::Node;
     use pg_query::protobuf::ObjectType;
     use pg_query::NodeRef;
@@ -6358,9 +6365,6 @@ pub fn try_extract_drop_objects(parse_result: &ParseResult) -> Option<PgDropObje
         ObjectType::ObjectDomain => PgDropKind::Domain,
         _ => return None,
     };
-    if !drop.missing_ok && drop.objects.len() < 2 {
-        return None;
-    }
     let mut objects = Vec::with_capacity(drop.objects.len());
     for obj in &drop.objects {
         // A relation's name is a List of Strings; a type's or a domain's a TypeName.

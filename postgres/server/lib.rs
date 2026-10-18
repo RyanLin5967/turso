@@ -1417,6 +1417,10 @@ struct SessionState {
     /// The named portals that ran to completion without rows, or failed: a second Execute of one
     /// is 55000, never a second run (wire review 12 item 5).
     done_portals: std::collections::HashSet<String>,
+    /// The named portals bound and not yet run to completion or closed, with their statement's
+    /// text: each holds the relations it reads, so a DROP TABLE of one is 55006 as in PostgreSQL
+    /// (lead ruling 2026-10-18, pg18-rev-bl1.out #19; [`Session::drop_of_a_held_relation`]).
+    held_portals: std::collections::HashMap<String, String>,
     /// The completion tag of each query portal that returned all its rows (its verb's, `SELECT`,
     /// `INSERT 0`, ...), which a further Execute answers with 0 rows, as PostgreSQL does (wire
     /// review 15 item 17: it answered SELECT 0 for every portal).
@@ -1655,8 +1659,56 @@ impl Session {
     /// A named portal's statement ran to completion without rows, or failed: it does not run again.
     fn portal_done(&self, name: &str) {
         if name != DEFAULT_NAME {
-            self.state().done_portals.insert(name.to_string());
+            let mut st = self.state();
+            st.done_portals.insert(name.to_string());
+            st.held_portals.remove(name);
         }
+    }
+
+    /// A DROP TABLE of a relation this session's open named portal reads: PostgreSQL's
+    /// CheckTableNotInUse answer, 55006 (recorded, pg18-rev-bl1.out #19). Free unless a named
+    /// portal is held: then the statement and each held portal's statement are parsed, and
+    /// relations match by name, and by schema when both name one (public is main). BLIND SPOTS:
+    /// a held portal's view or function body is not looked through, and two schemas' tables of
+    /// one name match when either side is unqualified.
+    fn drop_of_a_held_relation(&self, sql: &str) -> Option<Box<ErrorInfo>> {
+        let held: Vec<String> = {
+            let st = self.state();
+            if st.held_portals.is_empty() {
+                return None;
+            }
+            st.held_portals.values().cloned().collect()
+        };
+        let parsed = turso_pg_parser::parse(sql).ok()?;
+        let drop = turso_pg_parser::translator::drop_objects(&parsed)?;
+        if !matches!(drop.kind, turso_pg_parser::translator::PgDropKind::Table) {
+            return None;
+        }
+        let schema = |s: &str| if s.eq_ignore_ascii_case("public") { "main".to_string() } else { s.to_ascii_lowercase() };
+        for held_sql in &held {
+            let Ok(reads) = turso_pg_parser::parse(held_sql) else { continue };
+            for table in reads.tables() {
+                let (ts, tn) = match table.rsplit_once('.') {
+                    Some((s, n)) => (Some(schema(s)), n.to_ascii_lowercase()),
+                    None => (None, table.to_ascii_lowercase()),
+                };
+                for (ds, dn) in &drop.objects {
+                    let same_schema = match (&ts, ds) {
+                        (Some(a), Some(b)) => *a == schema(b),
+                        _ => true,
+                    };
+                    if same_schema && tn == dn.to_ascii_lowercase() {
+                        return Some(error(
+                            SqlErrorKind::ObjectInUse,
+                            format!(
+                                "cannot DROP TABLE \"{dn}\" because it is being used by active queries in this session"
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// The end of an extended-protocol round, at a Sync whether or not its body was well formed
@@ -1716,6 +1768,7 @@ impl Session {
         }
         let mut st = self.state();
         st.done_portals.clear();
+        st.held_portals.clear();
         let ended = std::mem::take(&mut st.portals);
         for name in &ended {
             st.bad_result_codes.remove(name);
@@ -2597,6 +2650,9 @@ impl Session {
             info,
             started: None,
         };
+        if let Some(info) = self.drop_of_a_held_relation(sql) {
+            return Err(unprepared(info));
+        }
         let described = portal.and_then(|_| self.take_described(conn, sql));
         let (mut stmt, types) = match described {
             Some(kept) => kept,
@@ -4202,6 +4258,12 @@ impl ExtendedQueryHandler for Session {
             if !st.portals.contains(&portal.name) {
                 st.portals.push(portal.name.clone());
             }
+            if portal.name != DEFAULT_NAME && portal.statement.statement.call.is_none() {
+                st.held_portals
+                    .insert(portal.name.clone(), portal.statement.statement.sql.clone());
+            } else {
+                st.held_portals.remove(&portal.name);
+            }
         }
         client.portal_store().put_portal(Arc::new(portal));
         client
@@ -4399,6 +4461,11 @@ impl ExtendedQueryHandler for Session {
         if name == DEFAULT_NAME && !suspended {
             client.portal_store().rm_portal(name);
         }
+        // Run to completion, a portal no longer holds its relations (PostgreSQL's MarkPortalDone
+        // ends its executor); a suspended one still does.
+        if !suspended {
+            self.state().held_portals.remove(name);
+        }
         Ok(())
     }
 
@@ -4412,7 +4479,10 @@ impl ExtendedQueryHandler for Session {
         let name = message.name.as_deref().unwrap_or(DEFAULT_NAME);
         match message.target_type {
             TARGET_TYPE_BYTE_STATEMENT => client.portal_store().rm_statement(name),
-            TARGET_TYPE_BYTE_PORTAL => client.portal_store().rm_portal(name),
+            TARGET_TYPE_BYTE_PORTAL => {
+                self.state().held_portals.remove(name);
+                client.portal_store().rm_portal(name)
+            }
             _ => {}
         }
         client
