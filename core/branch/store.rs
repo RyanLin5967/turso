@@ -651,7 +651,6 @@ pub(crate) const CONFIRM_PARK_FLIGHT: u8 = 2;
 #[cfg(test)]
 pub(crate) const CONFIRM_PARK_QUIET: u8 = 3;
 
-#[cfg(test)]
 impl GroupState {
     /// A flight that landed took `ns` to write and sync.
     fn record_flight(&mut self, ns: u64) {
@@ -674,7 +673,10 @@ impl GroupState {
         times.sort_unstable();
         Duration::from_nanos(times[n / 2] / 10)
     }
+}
 
+#[cfg(test)]
+impl GroupState {
     /// Test builds (fastest-budgets, review 2 L3): the confirmation writer's wait returned.
     fn confirm_wait_left(&mut self) {
         self.confirm_parked = 0;
