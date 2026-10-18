@@ -5999,6 +5999,9 @@ pub struct PgSetStmt {
     /// SET LOCAL: the setting is the transaction block's alone (wire review 16 item 18: dropped,
     /// it acted as a SET).
     pub is_local: bool,
+    /// SET name TO DEFAULT, RESET name, or RESET ALL (whose name is empty): the setting, or every
+    /// setting, takes its default value (`values` is empty). Recorded: pg18-rev-host1.out.
+    pub to_default: bool,
 }
 
 #[derive(Clone)]
@@ -6123,9 +6126,21 @@ pub fn try_extract_set(parse_result: &ParseResult) -> Option<PgSetStmt> {
         _ => return None,
     };
 
-    // Only handle VAR_SET_VALUE (kind == 1)
-    if set_stmt.kind != 1 {
-        return None;
+    // VAR_SET_VALUE (1); VAR_SET_DEFAULT (2), VAR_RESET (5) and VAR_RESET_ALL (6) as the
+    // setting's default. SET ... FROM CURRENT (3) and the multi forms (4: SET TRANSACTION ...)
+    // are not SETs of one value here.
+    let to_default = match set_stmt.kind {
+        1 => false,
+        2 | 5 | 6 => true,
+        _ => return None,
+    };
+    if to_default {
+        return Some(PgSetStmt {
+            name: set_stmt.name.clone(),
+            values: Vec::new(),
+            is_local: set_stmt.is_local,
+            to_default,
+        });
     }
 
     // Extract the value from args
@@ -6139,6 +6154,7 @@ pub fn try_extract_set(parse_result: &ParseResult) -> Option<PgSetStmt> {
         name: set_stmt.name.clone(),
         values,
         is_local: set_stmt.is_local,
+        to_default,
     })
 }
 

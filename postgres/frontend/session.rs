@@ -1661,6 +1661,64 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
         pg_conn.publish(&effective);
         Ok(())
     };
+    // SET name TO DEFAULT, RESET name and RESET ALL (recorded, pg18-rev-host1.out #13-#31): the
+    // settings this session keeps take the values it started with (Gucs::default, as no startup
+    // option sets one), under SET's scoping, so SET LOCAL ... TO DEFAULT lasts its block. Any
+    // other setting this server knows already holds its default, since a SET of one is accepted
+    // only at the value this server answers by: nothing changes. A dotted name is 0A000 and a
+    // name nobody knows 42704, as for SET.
+    if set_stmt.to_default {
+        let default = Gucs::default();
+        let reset_all = name.is_empty();
+        let kept = matches!(
+            name.as_str(),
+            "search_path" | "foreign_keys" | "lock_timeout" | "statement_timeout" | "client_min_messages"
+        );
+        if reset_all || kept {
+            assign(&|session, local, is_local| {
+                if reset_all {
+                    *session = default.clone();
+                    *local = Locals::default();
+                    return;
+                }
+                macro_rules! to_default {
+                    ($field:ident, $local:ident) => {
+                        if is_local {
+                            local.$local = Some(default.$field.clone());
+                        } else {
+                            session.$field = default.$field.clone();
+                            local.$local = None;
+                        }
+                    };
+                }
+                match name.as_str() {
+                    "search_path" => to_default!(search_path, search_path),
+                    "foreign_keys" => to_default!(foreign_keys, foreign_keys),
+                    "lock_timeout" => to_default!(lock_timeout_ms, lock_timeout_ms),
+                    "statement_timeout" => to_default!(statement_timeout_ms, statement_timeout_ms),
+                    _ => to_default!(min_messages, min_messages),
+                }
+            })?;
+            return noop_statement(&pg_conn.conn);
+        }
+        if name.contains('.') {
+            return Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
+                SqlErrorKind::FeatureNotSupported,
+                format!("SET {name} TO DEFAULT is not supported: custom configuration parameters are not supported"),
+            )));
+        }
+        let known = FIXED_SETTINGS.iter().any(|(n, _)| n.eq_ignore_ascii_case(&name))
+            || NOOP_PARAMETERS.contains(&name.as_str())
+            || name.starts_with("enable_")
+            || crate::pg_settings::is_postgresql_parameter(&name);
+        if !known {
+            return Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
+                SqlErrorKind::UndefinedObject,
+                format!("unrecognized configuration parameter \"{name}\""),
+            )));
+        }
+        return noop_statement(&pg_conn.conn);
+    }
     if name == "search_path" {
         let path = set_stmt
             .values
