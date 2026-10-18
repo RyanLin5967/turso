@@ -15534,3 +15534,41 @@ fn adv_merge_with_a_rowid_column_keeps_every_branch_change() {
         out.as_ref().map(|o| (o.refused.clone(), o.rows_changed))
     );
 }
+
+/// LEAP L2(c) (ASYNC-DESIGN R1.7, "no growth and no first touch in the log buffer"): the log's
+/// buffers are allocated at open, so no create, at C = 1 from the first one after open or at C = 16
+/// with flights of every size up to 16 creates, grows one (`pending_reallocs`, counted wherever
+/// buffering a record or taking a flight grows a buffer under the store mutex). Both arms, eager and
+/// catalog.
+#[test]
+fn no_create_grows_the_log_buffer_from_the_first_one_after_open() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("ring.db"), opts(catalog, SyncClass::Fsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let r0 = db.branches.log_buffer_reallocs();
+        for i in 0..50 {
+            trunk.create_branch(&format!("one-{i}")).unwrap();
+        }
+        let r1 = db.branches.log_buffer_reallocs();
+        std::thread::scope(|s| {
+            for t in 0..16 {
+                let db = &db;
+                s.spawn(move || {
+                    let c = db.connect().unwrap();
+                    for i in 0..40 {
+                        c.create_branch(&format!("many-{t}-{i}")).unwrap();
+                    }
+                });
+            }
+        });
+        let r2 = db.branches.log_buffer_reallocs();
+        assert_eq!(
+            (r1 - r0, r2 - r1),
+            (0, 0),
+            "catalog={catalog}: CLAIM: no create grew the log buffer (C=1 from the first create after open, then C=16)"
+        );
+    }
+}
