@@ -15,7 +15,7 @@ pub use session::PgConnection as Connection;
 pub use session::{
     attach_schema_files, branch_call, check_table_keys, message_rank, open_database,
     open_database_with_io, pg_bool, read_parse_message, single_statement, split_statements,
-    ParseMessage, PgConnection, PgQueryRunner, TxEvent, TxStmt,
+    ParseMessage, PgConnection, PgQueryRunner, ServerFiles, TxEvent, TxStmt,
     CONNECTION_BROKEN, DEFAULT_SEARCH_PATH, FIXED_SETTINGS,
 };
 #[cfg(feature = "failpoints")]

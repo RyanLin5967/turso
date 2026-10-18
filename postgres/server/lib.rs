@@ -311,6 +311,9 @@ struct Shared {
     /// sessions with an entry, so no DROP pays the lock while none does.
     block_reads: Mutex<std::collections::HashMap<(i32, i32), Vec<BlockRead>>>,
     block_readers: AtomicUsize,
+    /// The directory whose files a client's COPY FROM 'file' may read (--copy-from-dir), as its
+    /// real path; None, no file (review wire-quote LOW-3).
+    copy_from_dir: Option<std::path::PathBuf>,
     /// The next session's process id.
     next_pid: std::sync::atomic::AtomicI32,
     /// How long a client has to complete its startup (TursoPgServer::with_startup_timeout).
@@ -483,6 +486,14 @@ enum BranchUse {
 }
 
 impl Shared {
+    /// What a session's COPY FROM 'file' may read ([`TursoPgServer::with_copy_from_dir`]).
+    fn server_files(&self) -> turso_pg::ServerFiles {
+        match &self.copy_from_dir {
+            Some(dir) => turso_pg::ServerFiles::Under(dir.clone()),
+            None => turso_pg::ServerFiles::None,
+        }
+    }
+
     fn new(
         db: Arc<Database>,
         db_file: String,
@@ -501,6 +512,7 @@ impl Shared {
             cancels: Mutex::new(std::collections::HashMap::new()),
             block_reads: Mutex::new(std::collections::HashMap::new()),
             block_readers: AtomicUsize::new(0),
+            copy_from_dir: None,
             next_pid: std::sync::atomic::AtomicI32::new(1),
             startup_timeout: std::time::Duration::from_secs(DEFAULT_AUTHENTICATION_TIMEOUT_S),
             sessions: Arc::new(SessionSockets::default()),
@@ -702,6 +714,16 @@ impl TursoPgServer {
             interrupt_count,
             threads: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Grant client COPY FROM 'file' the files under `dir` (its real path, resolved now). With
+    /// no grant a branch server reads no file for a client (42501).
+    pub fn with_copy_from_dir(mut self, dir: &std::path::Path) -> std::io::Result<Self> {
+        let real = std::fs::canonicalize(dir)?;
+        Arc::get_mut(&mut self.shared)
+            .expect("set before the server runs")
+            .copy_from_dir = Some(real);
+        Ok(self)
     }
 
     /// How long a client has to complete its startup (PostgreSQL's authentication_timeout).
@@ -1687,7 +1709,7 @@ impl Session {
     }
 
     fn open_trunk(&self) -> SqlResult<PgConnection> {
-        let conn = PgConnection::new_server(self.shared.db.connect().map_err(|e| engine_info(&e))?);
+        let conn = PgConnection::new_server(self.shared.db.connect().map_err(|e| engine_info(&e))?, self.shared.server_files());
         self.arm(conn.inner());
         attach_schema_files(&conn, &self.shared.db_file);
         Ok(conn)
@@ -1937,7 +1959,7 @@ impl Session {
                 ));
             }
         };
-        let conn = PgConnection::new_server(conn);
+        let conn = PgConnection::new_server(conn, self.shared.server_files());
         self.arm(conn.inner());
         self.state().branch = Some((branch.into(), conn));
         Ok(())
@@ -2989,7 +3011,7 @@ impl Session {
                         let opened = self
                             .waiting(|| self.shared.db.connect_named(&name))
                             .map_err(|e| self.switch_error(&name, &e, "ERROR"))?;
-                        let next = PgConnection::new_server(opened);
+                        let next = PgConnection::new_server(opened, self.shared.server_files());
                         self.arm(next.inner());
                         next.adopt_session_of(conn);
                         st.branch = Some((name.as_ref().into(), next));
@@ -3014,7 +3036,7 @@ impl Session {
                             return Err(self.switch_error(&name, &e, "ERROR"));
                         }
                     };
-                    let next = PgConnection::new_server(opened);
+                    let next = PgConnection::new_server(opened, self.shared.server_files());
                     self.arm(next.inner());
                     next.adopt_session_of(conn);
                     st.branch.replace((name.as_ref().into(), next))

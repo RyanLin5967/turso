@@ -64,6 +64,21 @@ pub(crate) struct PgConnectionInner {
     /// The relations statements prepared inside the open block named (libpg_query's tables(),
     /// `schema.name` or `name`), for the server to take ([`PgConnection::take_block_reads`]).
     block_reads: parking_lot::Mutex<Vec<String>>,
+    /// Which server files a COPY FROM 'file' may read (review wire-quote LOW-3).
+    server_files: ServerFiles,
+}
+
+/// The files a client's COPY FROM 'file' may read. PostgreSQL grants them by role
+/// (pg_read_server_files); this server has no roles, so a branch server's operator grants a
+/// directory (--copy-from-dir) or none, and the CLI and an embedding process read their own files.
+#[derive(Clone, Debug)]
+pub enum ServerFiles {
+    /// The process's own user's files (the CLI, an embedding).
+    Any,
+    /// Only files whose real path lies under this real directory.
+    Under(std::path::PathBuf),
+    /// None: every COPY FROM 'file' is 42501.
+    None,
 }
 
 /// The source of [`PgConnectionInner::search_path_stamp`]'s values.
@@ -375,16 +390,17 @@ impl Drop for PgConnectionInner {
 
 impl PgConnection {
     pub fn new(conn: Arc<Connection>) -> Self {
-        Self::open(conn, false)
+        Self::open(conn, false, ServerFiles::Any)
     }
 
     /// A branch server session: as [`PgConnection::new`], except that CREATE SCHEMA and DROP
-    /// SCHEMA of any schema but public are refused (0A000), by the statement's kind.
-    pub fn new_server(conn: Arc<Connection>) -> Self {
-        Self::open(conn, true)
+    /// SCHEMA of any schema but public are refused (0A000), by the statement's kind, and COPY
+    /// FROM 'file' reads only the files `files` grants.
+    pub fn new_server(conn: Arc<Connection>, files: ServerFiles) -> Self {
+        Self::open(conn, true, files)
     }
 
-    fn open(conn: Arc<Connection>, public_schema_only: bool) -> Self {
+    fn open(conn: Arc<Connection>, public_schema_only: bool, server_files: ServerFiles) -> Self {
         aliases::install(&conn);
         // PostgreSQL enforces every foreign key; the engine only under PRAGMA foreign_keys.
         conn.set_foreign_keys_enabled(true);
@@ -402,6 +418,7 @@ impl PgConnection {
                 public_schema_only,
                 dropped_schema_files: parking_lot::Mutex::new(Vec::new()),
                 block_reads: parking_lot::Mutex::new(Vec::new()),
+                server_files,
             }),
         };
         SESSIONS_BY_CONNECTION
@@ -3589,6 +3606,35 @@ fn run_pg_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<()> {
         .run_ignore_rows()
 }
 
+/// PostgreSQL's privilege check for COPY FROM a server file, before the file is opened: 42501
+/// 'permission denied to COPY from a file' (recorded, pg18-rev-quote-low.out) unless `files`
+/// grants it. Under a granted directory the file's REAL path decides (a symlink in it pointing
+/// outside is refused); a file that does not exist is judged by its directory's real path, so its
+/// own error comes from the read.
+fn may_read_server_file(files: &ServerFiles, filename: &str) -> Result<()> {
+    let denied = || {
+        Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
+            SqlErrorKind::InsufficientPrivilege,
+            "permission denied to COPY from a file".to_string(),
+        )))
+    };
+    match files {
+        ServerFiles::Any => Ok(()),
+        ServerFiles::None => denied(),
+        ServerFiles::Under(dir) => {
+            let path = std::path::Path::new(filename);
+            let real = std::fs::canonicalize(path).or_else(|_| {
+                let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+                std::fs::canonicalize(parent).map(|p| p.join(path.file_name().unwrap_or_default()))
+            });
+            match real {
+                Ok(real) if real.starts_with(dir) => Ok(()),
+                _ => denied(),
+            }
+        }
+    }
+}
+
 fn handle_pg_copy_from(pg_conn: &Arc<PgConnectionInner>, stmt: &PgCopyFromStmt) -> Result<usize> {
     if let Some(why) = &stmt.refused {
         return Err(LimboError::ParseError(why.clone().into()));
@@ -3599,6 +3645,7 @@ fn handle_pg_copy_from(pg_conn: &Arc<PgConnectionInner>, stmt: &PgCopyFromStmt) 
         ));
     }
     let conn = &pg_conn.conn;
+    may_read_server_file(&pg_conn.server_files, &stmt.filename)?;
     let data = std::fs::read_to_string(&stmt.filename).map_err(|e| {
         LimboError::ParseError(format!("COPY FROM: cannot read '{}': {}", stmt.filename, e).into())
     })?;

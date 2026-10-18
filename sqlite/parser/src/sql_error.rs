@@ -52,6 +52,7 @@ pub enum SqlErrorKind {
     IndeterminateDatatype,
     ObjectNotInPrerequisiteState,
     ObjectInUse,
+    InsufficientPrivilege,
     TooManyConnections,
     Warning,
     SuccessfulCompletion,

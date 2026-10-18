@@ -109,6 +109,14 @@ struct Opts {
 
     #[clap(
         long,
+        help = "With --server: the directory whose files a client's COPY FROM 'file' may read \
+                (by real path); without it a client reads no server file (42501), as a \
+                PostgreSQL role without pg_read_server_files"
+    )]
+    copy_from_dir: Option<PathBuf>,
+
+    #[clap(
+        long,
         default_value_t = turso_pg_server::DEFAULT_AUTHENTICATION_TIMEOUT_S,
         value_parser = clap::value_parser!(u64).range(1..=600),
         help = "With --server: how long a client has to complete its startup before the session \
@@ -1085,6 +1093,10 @@ fn main() -> anyhow::Result<()> {
             interrupt_count,
         )
         .with_startup_timeout(std::time::Duration::from_secs(opts.authentication_timeout));
+        let server = match &opts.copy_from_dir {
+            Some(dir) => server.with_copy_from_dir(dir)?,
+            None => server,
+        };
         return server.run();
     }
 
