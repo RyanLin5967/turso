@@ -1528,6 +1528,11 @@ struct SessionState {
     /// A statement failed inside a transaction block: as in PostgreSQL, everything but the block's
     /// end (or a ROLLBACK TO SAVEPOINT) is refused with 25P02 until then.
     aborted: bool,
+    /// The open block's savepoints, innermost last, each with how many block reads the session
+    /// held when it was set: a ROLLBACK TO one releases the reads taken after it, as PostgreSQL
+    /// releases a subtransaction's locks, and an error releases the innermost subtransaction's
+    /// reads, or every read when there is none (wire-rev-uw2 LOW; round1-pg-all.txt r07, r08).
+    read_marks: Vec<(String, usize)>,
     /// The branch a switch just left, released in [`Shared`]'s map when the switch's statement ends.
     left: Option<compact_str::CompactString>,
     /// The session's connection is in the implicit transaction block PostgreSQL wraps a
@@ -2576,7 +2581,75 @@ impl Session {
         if result.is_ok() && verb == TxVerb::RollbackTo {
             st.aborted = false;
         }
+        self.mark_block_reads(&mut st, sql, verb, result.is_ok());
         result
+    }
+
+    /// The block reads' savepoint marks after a statement ([`SessionState::read_marks`]): a
+    /// SAVEPOINT marks the reads held, a ROLLBACK TO releases those taken after its savepoint,
+    /// a RELEASE merges, a failed block releases its innermost subtransaction's reads (all of
+    /// them with no savepoint), and a block's end clears the marks.
+    fn mark_block_reads(&self, st: &mut SessionState, sql: &str, verb: TxVerb, ok: bool) {
+        let in_block = match &st.branch {
+            Some((_, conn)) => !conn.inner().get_auto_commit(),
+            None => st.trunk.as_ref().is_some_and(|conn| !conn.inner().get_auto_commit()),
+        };
+        if !in_block {
+            st.read_marks.clear();
+            return;
+        }
+        if !ok {
+            if st.aborted {
+                match st.read_marks.last() {
+                    Some((_, held)) => self.keep_block_reads(*held),
+                    None => self.release_block_reads(),
+                }
+            }
+            return;
+        }
+        let name = || turso_pg::savepoint_name(sql);
+        match verb {
+            TxVerb::Savepoint => {
+                if let Some(name) = name() {
+                    let held = self.block_read_count();
+                    st.read_marks.push((name, held));
+                }
+            }
+            TxVerb::RollbackTo => {
+                if let Some(at) = name().and_then(|n| st.read_marks.iter().rposition(|(m, _)| *m == n)) {
+                    let held = st.read_marks[at].1;
+                    st.read_marks.truncate(at + 1);
+                    self.keep_block_reads(held);
+                }
+            }
+            TxVerb::Release => {
+                if let Some(at) = name().and_then(|n| st.read_marks.iter().rposition(|(m, _)| *m == n)) {
+                    st.read_marks.truncate(at);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// How many block reads the session holds.
+    fn block_read_count(&self) -> usize {
+        if self.shared.block_readers.load(Ordering::Relaxed) == 0 {
+            return 0;
+        }
+        let all = self.shared.block_reads.lock().unwrap_or_else(|e| e.into_inner());
+        all.get(&self.key).map_or(0, Vec::len)
+    }
+
+    /// Keep the session's first `held` block reads and release the rest (all of them at 0).
+    fn keep_block_reads(&self, held: usize) {
+        if held == 0 {
+            self.release_block_reads();
+            return;
+        }
+        let mut all = self.shared.block_reads.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(mine) = all.get_mut(&self.key) {
+            mine.truncate(held);
+        }
     }
 
     /// CHECKPOINT is the trunk's, as PostgreSQL's is the cluster's, so a session on a branch runs it

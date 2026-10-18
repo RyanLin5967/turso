@@ -168,7 +168,7 @@ fn shown_ms(ms: u64) -> String {
 
 /// The savepoint a SAVEPOINT, RELEASE or ROLLBACK TO statement names, lowercased as PostgreSQL
 /// folds an unquoted name; None when it cannot be read.
-fn savepoint_name(sql: &str) -> Option<String> {
+pub fn savepoint_name(sql: &str) -> Option<String> {
     let parsed = turso_pg_parser::parse(sql).ok()?;
     let stmt = parsed.protobuf.stmts.first()?.stmt.as_ref()?.node.as_ref()?;
     match stmt {
