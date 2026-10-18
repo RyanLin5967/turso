@@ -74,7 +74,7 @@ linux_check() { if [ "$(uname -s)" = Linux ]; then check "$@"; else na=$((na + 1
 # the case, which then fails, so it is never mistaken for a no-root host
 root_check() { if [ "$(uname -s)" != Linux ]; then linux_check "$@"; return; fi
                case $(sudo_state) in
-                 password) na=$((na + 1)); echo "T3LIB self-test N/A-on-noroot: $1" ;;
+                 password|denied) na=$((na + 1)); echo "T3LIB self-test N/A-on-noroot: $1" ;;
                  *) check "$@" ;;
                esac; }
 mkdir -p "$T/dev"; : > "$T/dev/nvme1n1"; : > "$T/dev/nvme2n1"

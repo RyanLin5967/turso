@@ -470,6 +470,7 @@ sys.exit("no fixture record in " + sys.argv[1]) if type(v) is not int else print
 
 # sudo_state -- whether this host gives passwordless root (linux-rev-uw1 LOW 6): 'ok'; 'password' (sudo is there and
 # asks for one: a no-root host, so a root case is N/A-on-noroot there, which t3run's selftests refuse on the T3 box);
+# 'denied' (sudo refuses this user: also no root, also N/A-on-noroot);
 # 'absent' (no sudo at all) or 'error: <text>' (anything else), each a FAIL of a root case, never an N/A.
 # T3_SUDO_BIN names the sudo to ask (tests only; t3run unsets it)
 sudo_state() {
@@ -477,5 +478,11 @@ sudo_state() {
   command -v "$s" > /dev/null 2>&1 || { echo absent; return 0; }
   # in the C locale: sudo localises its message (linux-rev-uw2 LOW 7: de_DE says "Ein Passwort ist notwendig")
   e=$(LC_ALL=C LANG=C LANGUAGE= "$s" -n true 2>&1) && { echo ok; return 0; }
-  case $e in *"password is required"*|*"a terminal is required"*) echo password ;; *) echo "error: ${e:-no output}" ;; esac
+  # a sudo that REFUSES this user is no root, as one that wants a password is (ecetesla3, 2026-10-18: "I'm afraid I
+  # can't do that"); both are N/A-on-noroot. Anything else (unresolvable host, a broken binary) stays an error
+  case $e in
+    *"password is required"*|*"a terminal is required"*) echo password ;;
+    *"is not in the sudoers file"*|*"is not allowed to run sudo"*|*"may not run sudo"*|*"I'm afraid I can't do that"*) echo denied ;;
+    *) echo "error: ${e:-no output}" ;;
+  esac
 }
