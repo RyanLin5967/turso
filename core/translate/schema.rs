@@ -2698,10 +2698,14 @@ pub fn translate_create_type(
     let normalized_name = normalize_ident(type_name);
 
     // Reject names that shadow SQLite base types
-    let is_base_type = turso_macros::match_ignore_ascii_case!(match normalized_name.as_bytes() {
-        b"INT" | b"INTEGER" | b"REAL" | b"TEXT" | b"BLOB" | b"ANY" => true,
-        _ => false,
-    });
+    // The registry key, quotes undone (adversary of d806241ea, HIGH 1: `"integer"` passed a test
+    // of the token and then took over every STRICT INTEGER column); an empty name is refused too.
+    let key = crate::schema::type_key(&normalized_name);
+    let is_base_type = key.is_empty()
+        || turso_macros::match_ignore_ascii_case!(match key.as_bytes() {
+            b"INT" | b"INTEGER" | b"REAL" | b"TEXT" | b"BLOB" | b"ANY" => true,
+            _ => false,
+        });
     if is_base_type {
         bail_parse_error!("cannot create type \"{normalized_name}\": name is a built-in type");
     }
@@ -2736,7 +2740,9 @@ pub fn translate_create_type(
     // Build canonical SQL (without IF NOT EXISTS) for persistence
     let sql = build_create_type_sql(&normalized_name, body);
 
-    persist_type_definition(normalized_name, sql, resolver, program)
+    // Stored under the registry key, so DROP finds the row however the name was quoted
+    // (adversary of d806241ea, MED 2).
+    persist_type_definition(crate::schema::type_key(&normalized_name), sql, resolver, program)
 }
 
 /// Build canonical CREATE TYPE SQL from a normalized name and parsed body.
@@ -2746,6 +2752,15 @@ pub fn translate_create_type(
 /// with its quotes (`CREATE TYPE """m'x"""`). Field names are `Name`s and are quoted.
 fn build_create_type_sql(name: &str, body: &ast::CreateTypeBody) -> String {
     use crate::util::quote_identifier as quote_ident;
+    // A parser token (`"m'x"`) as given, any other text (a bracket-stripped `a,b`) quoted
+    // (adversary of d806241ea, MED 3 and the OPERATOR LOW).
+    let token = |s: &str| -> String {
+        if crate::schema::is_one_quoted_token(s) {
+            s.to_string()
+        } else {
+            quote_ident(s)
+        }
+    };
     use crate::util::escape_sql_string_literal as quote_string_literal;
 
     match body {
@@ -2760,22 +2775,22 @@ fn build_create_type_sql(name: &str, body: &ast::CreateTypeBody) -> String {
             let mut sql = if params.is_empty() {
                 format!(
                     "CREATE TYPE {} BASE {}",
-                    name,
-                    base
+                    token(name),
+                    token(base)
                 )
             } else {
                 let param_strs: Vec<String> = params
                     .iter()
                     .map(|p| match &p.ty {
-                        Some(ty) => format!("{} {}", p.name, ty),
-                        None => p.name.clone(),
+                        Some(ty) => format!("{} {}", token(&p.name), ty),
+                        None => token(&p.name),
                     })
                     .collect();
                 format!(
                     "CREATE TYPE {}({}) BASE {}",
-                    name,
+                    token(name),
                     param_strs.join(", "),
-                    base
+                    token(base)
                 )
             };
             if let Some(ref encode) = encode {
@@ -2792,7 +2807,7 @@ fn build_create_type_sql(name: &str, body: &ast::CreateTypeBody) -> String {
                     Some(func_name) => sql.push_str(&format!(
                         " OPERATOR '{}' {}",
                         quote_string_literal(&op.op),
-                        quote_ident(func_name)
+                        token(func_name)
                     )),
                     None => sql.push_str(&format!(" OPERATOR '{}'", quote_string_literal(&op.op))),
                 }
@@ -2806,13 +2821,13 @@ fn build_create_type_sql(name: &str, body: &ast::CreateTypeBody) -> String {
                     format!(
                         "{} {}",
                         quote_ident(f.name.as_str()),
-                        &f.field_type.name
+                        token(&f.field_type.name)
                     )
                 })
                 .collect();
             format!(
                 "CREATE TYPE {} AS STRUCT({})",
-                name,
+                token(name),
                 field_strs.join(", ")
             )
         }
@@ -2823,13 +2838,13 @@ fn build_create_type_sql(name: &str, body: &ast::CreateTypeBody) -> String {
                     format!(
                         "{} {}",
                         quote_ident(f.name.as_str()),
-                        &f.field_type.name
+                        token(&f.field_type.name)
                     )
                 })
                 .collect();
             format!(
                 "CREATE TYPE {} AS UNION({})",
-                name,
+                token(name),
                 variant_strs.join(", ")
             )
         }
@@ -2850,10 +2865,14 @@ pub fn translate_create_domain(
     let normalized_name = normalize_ident(domain_name);
 
     // Reject names that shadow SQLite base types
-    let is_base_type = turso_macros::match_ignore_ascii_case!(match normalized_name.as_bytes() {
-        b"INT" | b"INTEGER" | b"REAL" | b"TEXT" | b"BLOB" | b"ANY" => true,
-        _ => false,
-    });
+    // The registry key, quotes undone (adversary of d806241ea, HIGH 1: `"integer"` passed a test
+    // of the token and then took over every STRICT INTEGER column); an empty name is refused too.
+    let key = crate::schema::type_key(&normalized_name);
+    let is_base_type = key.is_empty()
+        || turso_macros::match_ignore_ascii_case!(match key.as_bytes() {
+            b"INT" | b"INTEGER" | b"REAL" | b"TEXT" | b"BLOB" | b"ANY" => true,
+            _ => false,
+        });
     if is_base_type {
         bail_parse_error!("cannot create domain \"{normalized_name}\": name is a built-in type");
     }
@@ -2918,7 +2937,9 @@ pub fn translate_create_domain(
         s
     };
 
-    persist_type_definition(normalized_name, sql, resolver, program)
+    // Stored under the registry key, so DROP finds the row however the name was quoted
+    // (adversary of d806241ea, MED 2).
+    persist_type_definition(crate::schema::type_key(&normalized_name), sql, resolver, program)
 }
 
 pub fn translate_drop_type(
@@ -2992,10 +3013,16 @@ pub fn translate_drop_type(
         db: MAIN_DB_ID,
     });
 
-    // Search for matching row: name=type_name (col 0)
+    // Search for matching rows: name = the registry key (how rows are stored), or = the name's
+    // token (how rows were stored before; adversary of d806241ea, MED 2).
     let name_reg = program.alloc_register();
     program.emit_insn(Insn::String8 {
         dest: name_reg,
+        value: crate::schema::type_key(&normalized_name),
+    });
+    let token_reg = program.alloc_register();
+    program.emit_insn(Insn::String8 {
+        dest: token_reg,
         value: normalized_name.clone(),
     });
 
@@ -3013,15 +3040,24 @@ pub fn translate_drop_type(
     program.emit_column_or_rowid(types_cursor_id, 0, col0_reg);
 
     let skip_delete_label = program.allocate_label();
+    let delete_label = program.allocate_label();
 
-    // Check name=type_name
-    program.emit_insn(Insn::Ne {
+    // Check name = key, or name = token
+    program.emit_insn(Insn::Eq {
         lhs: col0_reg,
         rhs: name_reg,
+        target_pc: delete_label,
+        flags: CmpInsFlags::default(),
+        collation: program.curr_collation(),
+    });
+    program.emit_insn(Insn::Ne {
+        lhs: col0_reg,
+        rhs: token_reg,
         target_pc: skip_delete_label,
         flags: CmpInsFlags::default(),
         collation: program.curr_collation(),
     });
+    program.preassign_label_to_next_insn(delete_label);
 
     // Delete matching row
     program.emit_insn(Insn::Delete {

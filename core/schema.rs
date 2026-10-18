@@ -192,7 +192,20 @@ pub const AUTOINCREMENT_SEQ_PREFIX: &str = "__turso_internal_autoincrement_";
 /// folded as it stands (never `Name::from_string`, which asserts on a quote it cannot close).
 pub(crate) fn type_key(token: &str) -> String {
     let b = token.as_bytes();
-    let one_quoted = b.len() >= 2
+    if is_one_quoted_token(token) {
+        turso_parser::ast::Name::from_string(token).as_str().to_lowercase()
+    } else if b.len() >= 2 && b[0] == b'[' && b[b.len() - 1] == b']' && !token[1..token.len() - 1].contains(']') {
+        token[1..token.len() - 1].to_lowercase()
+    } else {
+        token.to_lowercase()
+    }
+}
+
+/// Whether `text` is ONE complete quoted token (`"m'x"`, `'a''b'`, `` `c` ``): a quote character
+/// first and last, and every one between them doubled.
+pub(crate) fn is_one_quoted_token(text: &str) -> bool {
+    let b = text.as_bytes();
+    b.len() >= 2
         && matches!(b[0], b'"' | b'\'' | b'`')
         && b[b.len() - 1] == b[0]
         && {
@@ -213,14 +226,7 @@ pub(crate) fn type_key(token: &str) -> String {
                 i += 1;
             }
             ok
-        };
-    if one_quoted {
-        turso_parser::ast::Name::from_string(token).as_str().to_lowercase()
-    } else if b.len() >= 2 && b[0] == b'[' && b[b.len() - 1] == b']' && !token[1..token.len() - 1].contains(']') {
-        token[1..token.len() - 1].to_lowercase()
-    } else {
-        token.to_lowercase()
-    }
+        }
 }
 
 pub fn autoincrement_sequence_name(table_name: &str) -> String {

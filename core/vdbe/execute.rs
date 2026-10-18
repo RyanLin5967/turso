@@ -5052,6 +5052,7 @@ pub fn op_auto_commit(
                 }
                 conn.rollback_attached_wal_txns();
                 conn.rollback_temp_schema();
+                conn.end_capture_at_begin(true);
                 conn.index_methods_on_transaction_rolled_back();
                 conn.set_tx_state(TransactionState::None);
                 conn.auto_commit.store(true, Ordering::SeqCst);
@@ -5071,6 +5072,7 @@ pub fn op_auto_commit(
                 }
                 // Pre-check deferred FKs; leave tx open and do NOT clear violations
                 check_deferred_fk_on_commit(&conn)?;
+                conn.end_capture_at_begin(false);
                 conn.auto_commit.store(true, Ordering::SeqCst);
                 state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
             }
@@ -5080,6 +5082,7 @@ pub fn op_auto_commit(
                     "rollback-only marker leaked outside an explicit transaction"
                 );
                 conn.auto_commit.store(false, Ordering::SeqCst);
+                conn.remember_capture_at_begin();
                 return Ok(InsnFunctionStepResult::Done);
             }
         }

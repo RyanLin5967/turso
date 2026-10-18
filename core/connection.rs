@@ -545,6 +545,11 @@ pub struct Connection {
     #[cfg(feature = "conn_raw_api")]
     pub(super) mvcc_log_metadata: RwLock<HashMap<String, String>>,
     pub(super) capture_data_changes: RwLock<Option<CaptureDataChangesInfo>>,
+    /// The capture setting at this explicit transaction's BEGIN (`Some`: inside one), put back by
+    /// its rollback: a PRAGMA inside BEGIN takes effect at its own Halt, so `BEGIN; switch the
+    /// capture table; ROLLBACK` left capture on a table the rollback removed (adversary of
+    /// d806241ea, MED 4).
+    pub(super) capture_data_changes_at_begin: RwLock<Option<Option<CaptureDataChangesInfo>>>,
     /// CDC v2: transaction ID for grouping CDC records by transaction.
     /// -1 means unset (will be assigned on first CDC write in the transaction).
     pub(crate) cdc_transaction_id: AtomicI64,
@@ -3092,6 +3097,21 @@ impl Connection {
     ) -> crate::sync::RwLockReadGuard<'_, Option<CaptureDataChangesInfo>> {
         self.capture_data_changes.read()
     }
+    /// At an explicit BEGIN: remember the capture setting a rollback puts back.
+    pub(crate) fn remember_capture_at_begin(&self) {
+        let now = self.capture_data_changes.read().clone();
+        *self.capture_data_changes_at_begin.write() = Some(now);
+    }
+
+    /// At a COMMIT (the setting stands) or a ROLLBACK (`restore`: the setting at BEGIN comes back).
+    pub(crate) fn end_capture_at_begin(&self, restore: bool) {
+        if let Some(at_begin) = self.capture_data_changes_at_begin.write().take() {
+            if restore {
+                self.set_capture_data_changes_info(at_begin);
+            }
+        }
+    }
+
     pub fn set_capture_data_changes_info(&self, opts: Option<CaptureDataChangesInfo>) {
         let mut cdc = self.capture_data_changes.write();
         if *cdc == opts {
@@ -5637,6 +5657,7 @@ impl Connection {
             self.auto_commit.store(true, Ordering::SeqCst);
         }
         self.rollback_attached_wal_txns();
+        self.end_capture_at_begin(true);
         // The temp pager was rolled back with the attached ones; its in-memory schema goes back to
         // the last committed one too (adversary of 5650219c0, HIGH 2: only COMMIT/ROLLBACK did it).
         self.rollback_temp_schema();
@@ -5674,6 +5695,7 @@ impl Connection {
         }
 
         self.rollback_temp_schema();
+        self.end_capture_at_begin(true);
         self.clear_tx_poison();
         self.set_cdc_transaction_id(-1);
         self.clear_named_savepoints();
