@@ -1582,6 +1582,13 @@ fn trunk_for_fc(db: &Arc<Database>) {
     db.connect().unwrap().create_branch("fc-dirty").unwrap();
 }
 
+/// getppid by raw syscall(2), the one call the shim cannot see: BSD/macOS number 39; on Linux the
+/// platform's own SYS_getppid (39 there is getpid on x86_64 and umount2 on aarch64: integ-rev-1017).
+#[cfg(target_vendor = "apple")]
+const RAW_GETPPID: libc::c_int = 39;
+#[cfg(not(target_vendor = "apple"))]
+const RAW_GETPPID: libc::c_long = libc::SYS_getppid;
+
 /// The instruments' fire-checks, in the child (nothing else runs there): each counter moves by
 /// exactly what was done, and by nothing when nothing was.
 fn run_instruments(cell: &str) -> String {
@@ -1732,11 +1739,11 @@ fn run_instruments(cell: &str) -> String {
         put(
             "fc_shim_compensation",
             &window(&mut || {
-                // SAFETY: getppid (BSD syscall 39) through syscall(2), which the shim does not
+                // SAFETY: getppid (RAW_GETPPID) through syscall(2), which the shim does not
                 // interpose (gen.py's SKIP): one syscall the shim cannot see.
                 #[allow(deprecated)]
                 unsafe {
-                    libc::syscall(39)
+                    libc::syscall(RAW_GETPPID)
                 };
                 for _ in 0..5 {
                     // SAFETY: as above.
@@ -1896,10 +1903,10 @@ fn run_instruments(cell: &str) -> String {
             while !g.load(Acquire) {
                 std::hint::spin_loop();
             }
-            // SAFETY: getppid (BSD syscall 39) through syscall(2): one call the shim cannot see.
+            // SAFETY: getppid (RAW_GETPPID) through syscall(2): one call the shim cannot see.
             #[allow(deprecated)]
             unsafe {
-                libc::syscall(39)
+                libc::syscall(RAW_GETPPID)
             };
             d.store(true, Release);
             while g.load(Acquire) {
