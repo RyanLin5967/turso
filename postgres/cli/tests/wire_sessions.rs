@@ -14724,3 +14724,51 @@ fn a_schema_name_is_never_a_path() {
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// Review wire-quote LOW-3: a client's COPY FROM 'file' read any file the server process can
+/// read. PostgreSQL requires pg_read_server_files (a role without it: 42501 'permission denied to
+/// COPY from a file', recorded: artie b2e3e87f75 pg18-rev-quote-low.out). This server has no roles,
+/// so its operator grants server files by directory: --copy-from-dir DIR lets COPY read a file
+/// whose real path lies under DIR, and without it no file is read.
+#[test]
+fn copy_from_a_server_file_needs_the_servers_grant() {
+    let dir = Scratch::new("copy-grant");
+    let inside = dir.0.join("granted");
+    std::fs::create_dir_all(&inside).unwrap();
+    let ok_file = inside.join("rows.tsv");
+    std::fs::write(&ok_file, "1\n2\n").unwrap();
+    let outside = dir.0.join("outside.tsv");
+    std::fs::write(&outside, "3\n").unwrap();
+    let escape = inside.join("escape.tsv");
+    std::os::unix::fs::symlink(&outside, &escape).unwrap();
+    let mut wrong = Vec::new();
+    {
+        let server = Server::start(&dir.db(), &[]);
+        let mut a = server.connect();
+        a.q("CREATE TABLE t(x int)").ok("t");
+        let r = a.q(&format!("COPY t FROM '{}'", ok_file.display()));
+        if r.error.as_ref().map(|e| e.code.as_str()) != Some("42501") {
+            wrong.push(format!("no grant, COPY from a file: {:?} {:?}", r.tags, r.error));
+        }
+    }
+    // Checked before the granted half, whose flag a server without the grant does not take.
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    let grant = inside.to_string_lossy().to_string();
+    let server = Server::start(&dir.db(), &["--copy-from-dir", &grant]);
+    let mut a = server.connect();
+    let r = a.q(&format!("COPY t FROM '{}'", ok_file.display()));
+    if r.error.is_some() || r.tags.last().map(String::as_str) != Some("COPY 2") {
+        wrong.push(format!("granted dir, COPY from a file in it: {:?} {:?}", r.tags, r.error));
+    }
+    for file in [&outside, &escape] {
+        let r = a.q(&format!("COPY t FROM '{}'", file.display()));
+        if r.error.as_ref().map(|e| e.code.as_str()) != Some("42501") {
+            wrong.push(format!("granted dir, COPY from {}: {:?} {:?}", file.display(), r.tags, r.error));
+        }
+    }
+    let r = a.q("SELECT count(*) FROM t");
+    if r.rows != vec![vec![Some("2".to_string())]] {
+        wrong.push(format!("rows loaded: {:?}", r.rows));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
