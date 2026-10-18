@@ -4992,6 +4992,7 @@ pub fn op_auto_commit(
             if !*rollback {
                 conn.index_methods_on_transaction_committed();
             }
+            conn.end_capture_at_begin(false);
             conn.clear_tx_poison();
             conn.clear_named_savepoints();
         }
@@ -5072,7 +5073,8 @@ pub fn op_auto_commit(
                 }
                 // Pre-check deferred FKs; leave tx open and do NOT clear violations
                 check_deferred_fk_on_commit(&conn)?;
-                conn.end_capture_at_begin(false);
+                // The capture setting from BEGIN is dropped only once the COMMIT succeeds (below):
+                // a COMMIT refused with Busy reopens the transaction, and its ROLLBACK restores it.
                 conn.auto_commit.store(true, Ordering::SeqCst);
                 state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
             }
@@ -5130,6 +5132,8 @@ pub fn op_auto_commit(
         }
         Err(err) => return Err(err),
     };
+    // After a ROLLBACK the setting was already restored and taken; after a COMMIT it stands.
+    conn.end_capture_at_begin(false);
 
     if mv_store.is_none() {
         pager.clear_savepoints()?;
@@ -5253,6 +5257,7 @@ pub fn op_savepoint(
                         main_schema_snapshot,
                         temp_schema_snapshot,
                         staged_schema_snapshot,
+                        capture_data_changes: (*conn.get_capture_data_changes_info()).clone(),
                     };
                     // Mirror onto attached/temp pagers. If any pager fails
                     // mid-flight, earlier ones already opened a savepoint
@@ -5291,6 +5296,7 @@ pub fn op_savepoint(
                             "rollback-only marker leaked outside an explicit transaction"
                         );
                         conn.auto_commit.store(false, Ordering::SeqCst);
+                        conn.remember_capture_at_begin();
                     }
 
                     state.pc += 1;

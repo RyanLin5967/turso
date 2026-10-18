@@ -145,6 +145,9 @@ pub(crate) struct NamedSavepointFrame {
     /// SAVEPOINT begin. Cheap — values are `Arc`. Used by ROLLBACK TO
     /// to restore staged DDL on attached databases.
     pub(crate) staged_schema_snapshot: HashMap<usize, Arc<Schema>>,
+    /// The CDC capture setting at SAVEPOINT begin. ROLLBACK TO puts it back, because the
+    /// rollback also undoes the capture table a later switch created.
+    pub(crate) capture_data_changes: Option<CaptureDataChangesInfo>,
 }
 
 /// Info returned by `rollback_named_savepoint_frame` so callers can
@@ -3088,7 +3091,8 @@ impl Connection {
     ) -> crate::sync::RwLockReadGuard<'_, Option<CaptureDataChangesInfo>> {
         self.capture_data_changes.read()
     }
-    /// At an explicit BEGIN: remember the capture setting a rollback puts back.
+    /// At an explicit BEGIN, or a SAVEPOINT that opens the transaction: remember the capture
+    /// setting a rollback puts back.
     pub(crate) fn remember_capture_at_begin(&self) {
         let now = self.capture_data_changes.read().clone();
         *self.capture_data_changes_at_begin.write() = Some(now);
@@ -5503,9 +5507,12 @@ impl Connection {
             temp_schema_snapshot: frame.temp_schema_snapshot.clone(),
             staged_schema_snapshot: frame.staged_schema_snapshot.clone(),
         };
+        let capture = frame.capture_data_changes.clone();
         // ROLLBACK TO keeps the target savepoint itself on the stack;
         // only nested savepoints above it are discarded.
         savepoints.truncate(target_idx + 1);
+        drop(savepoints);
+        self.set_capture_data_changes_info(capture);
         Some(info)
     }
 
