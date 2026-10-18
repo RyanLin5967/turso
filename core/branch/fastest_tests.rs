@@ -14420,3 +14420,28 @@ fn quoted_type_names_and_cdc_switches_hold_what_the_adversary_attacked() {
     }
     assert!(failed.is_empty(), "CLAIM: quoted type names or a rolled-back CDC switch broke: {failed:#?}");
 }
+
+/// Dialect code review MED-2: the replay kind's name check (`translate::replayed_own_row`) is
+/// guarded. A replayed table row whose name is not its CREATE's name must be refused at prepare, and
+/// the matching row must prepare (positive control). Deleting the check made no test fail before;
+/// this one does (mutant run on ecetesla2, banked with this commit's report).
+#[test]
+fn a_replayed_row_whose_name_is_not_its_creates_name_is_refused() {
+    use crate::vdbe::vacuum::{SchemaEntry, SchemaEntryType};
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("replay-name.db"), DatabaseOpts::new());
+    let c = db.connect().unwrap();
+    let entry = |name: &str| SchemaEntry {
+        entry_type: SchemaEntryType::Table,
+        name: name.to_string(),
+        tbl_name: name.to_string(),
+        rootpage: 2,
+        sql: "CREATE TABLE b(x)".to_string(),
+    };
+    let matching = c.prepare_replay(&entry("b"), crate::connection::Origin::Root);
+    assert!(matching.is_ok(), "premise (positive control): a replayed row named as its CREATE did not prepare: {:?}", matching.err());
+    match c.prepare_replay(&entry("a"), crate::connection::Origin::Root) {
+        Err(e) if e.to_string().contains("a replayed CREATE names") => {}
+        other => panic!("CLAIM: a replayed row named a whose CREATE names b was not refused by the name check: {:?}", other.map(|_| ())),
+    }
+}

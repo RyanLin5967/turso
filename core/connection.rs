@@ -1212,6 +1212,7 @@ impl Connection {
     /// statement's implicit rows (an autoindex, a sequence table, sqlite_sequence) keep their engine
     /// text. Two copies (name and sql into the kind's `Arc<str>`s), in VACUUM only.
     #[allow(clippy::disallowed_methods, reason = "an entry point: it delegates to the shared preparation with the kind it states (dialect design R1)")]
+    #[allow(clippy::disallowed_methods, reason = "the one place a replay kind is built: the entry's own name and bytes (R1, dialect code review MED-2)")]
     pub(crate) fn prepare_replay(
         self: &Arc<Connection>,
         entry: &crate::vdbe::vacuum::SchemaEntry,
