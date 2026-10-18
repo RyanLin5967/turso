@@ -1824,18 +1824,19 @@ fn run_instruments(cell: &str) -> String {
             .map(|_| {
                 let (stop, ids, unlisted, roles, go, done) = (stop.clone(), ids.clone(), unlisted.clone(), roles.clone(), go.clone(), done.clone());
                 std::thread::spawn(move || {
-                    let mut me = 0u64;
-                    // SAFETY: this thread's own id into a local.
                     #[cfg(target_vendor = "apple")]
-                    unsafe { libc::pthread_threadid_np(0, &mut me) };
+                    let me = {
+                        let mut me = 0u64;
+                        // SAFETY: this thread's own id into a local.
+                        unsafe { libc::pthread_threadid_np(0, &mut me) };
+                        me
+                    };
                     // Off Apple `thread_table` is None, so this block's table checks have no data there;
                     // the kernel thread id keeps it compiling and distinct per thread (a Linux test build
                     // failed E0425 here, ecetesla2 2026-10-18).
+                    // SAFETY: gettid has no preconditions.
                     #[cfg(not(target_vendor = "apple"))]
-                    {
-                        // SAFETY: gettid has no preconditions.
-                        me = unsafe { libc::gettid() } as u64;
-                    }
+                    let me = unsafe { libc::gettid() } as u64;
                     ids.lock().unwrap().push(me);
                     while !roles.load(Acquire) {
                         std::thread::park_timeout(std::time::Duration::from_millis(1));
