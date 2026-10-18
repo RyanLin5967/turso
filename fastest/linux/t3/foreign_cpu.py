@@ -211,15 +211,30 @@ def busy_evidence(path, exclude=(), interval_default=1.0):
     return [who(e) for e in out]
 
 
-def burners_ran(v, burners, mine):
+def burners_ran(v, burners, mine, rec=None):
     """linux-rev-uw3 MED 1: a live case's burners were SEEN to run in its window's decide() record V. Each SUT burner
     (True, or a SUT parent's "child") must show in the SUT's CPU: sut_max at least 80% per SUT burner. A foreign
     burner (False) must be what voided the window: a rule-2 reason naming one of MINE (this case's own burner pids). A
-    case with no burner is trivially true. Without this the live cases passed with burners that never burned."""
+    case with no burner is trivially true. Without this the live cases passed with burners that never burned.
+    linux-rev-uw4 MED 1: sut_max is the SUT TOTAL, so a parent burning alone satisfied a "child" case (mutants F1, no
+    child forked, and F2, also without the ancestry rule, survived). A "child" burner is seen only when the record REC
+    has a sut-class process that is NOT in MINE (the child is the parent's own fork, so never in MINE) at 80% or more
+    for 5 samples or more (rule 2's run-length); without REC a child is never seen."""
     sut = [b for b in burners if b[0] is True or b[0] == "child"]
     foreign = [b for b in burners if b[0] is False]
     if sut and (v.get("sut_max") or 0.0) < 80.0 * len(sut):
         return False
+    children = [b for b in burners if b[0] == "child"]
+    if children:
+        if rec is None:
+            return False
+        hot = {}
+        for line in open(rec):
+            p = line.rstrip("\n").split("\t")
+            if not p[0].startswith("#") and len(p) == 5 and p[4] == "sut" and int(p[1]) not in mine and float(p[3]) >= 80.0:
+                hot[int(p[1])] = hot.get(int(p[1]), 0) + 1
+        if sum(1 for n in hot.values() if n >= 5) < len(children):
+            return False
     if foreign:
         pids = {int(m.group(1)) for m in (re.match(r"foreign process (\d+) ", r) for r in v.get("reasons") or []) if m}
         if not pids & set(mine):
@@ -352,7 +367,7 @@ def self_test():
                 print(f"N/A-on-busy-host: self-test {label}: {busy}", flush=True)
                 continue
         # linux-rev-uw3 MED 1: the verdict counts only when the case's own burners were seen to run in its record
-        seen = burners_ran(decide(rec), burners, mine)
+        seen = burners_ran(decide(rec), burners, mine, rec=rec)
         ok = out == want and seen
         bad += not ok
         n_pass += ok

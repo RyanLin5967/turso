@@ -9,6 +9,9 @@ ROOT=$(git -C "$(dirname "$0")" rev-parse --show-toplevel 2> /dev/null) || ROOT=
 [ -f "$ROOT/core/Cargo.toml" ] || { echo "REFUSED: no core/Cargo.toml under $ROOT"; exit 2; }
 command -v cargo > /dev/null || { echo "REFUSED: cargo is not on PATH"; exit 2; }
 cd "$ROOT" || exit 2
+# linux-rev-uw4 LOW 2: no tomllib is a REFUSAL of the host (rc 2, no tally), probed once here, never a failure of
+# the parser cases below (which would print a tally blaming the parser and exit 1)
+python3 -B -c 'import tomllib' 2> /dev/null || { echo "CARGO-ALL-TARGETS REFUSED: python3 has no tomllib (3.11+): the manifest cannot be parsed"; exit 2; }
 # linux-rev-uw2 LOW 8: --all-targets SKIPS a target whose required-features are not enabled, silently. Every feature
 # any [[bench]], [[example]] or [[test]] of core/Cargo.toml requires must be in FEATURES, or this refuses, naming it
 # The features checked: conn_raw_api (the lanes' own builds), bench and fts (the [[bench]] targets' required-features)
