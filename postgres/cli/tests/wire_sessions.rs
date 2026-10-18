@@ -13534,7 +13534,15 @@ replays_postgresql!(
 // C53 follow-up (Codex C56's NEEDS-CLAUDE, frontier/codex/reports/C56-protocol-dependency.md): a
 // retained named statement whose relation was dropped is refused at Bind (42P01, before
 // BindComplete), where PostgreSQL's GetCachedPlan revalidates it, not at Execute.
-replays_postgresql!(pg18_c56_schema_prepared_replays_as_postgresql_answered, "pg18-c56-schema-prepared.out", []);
+// Registered from the host run iccad11 ff9f1bdfe diff (each row read).
+replays_postgresql!(
+    pg18_c56_schema_prepared_replays_as_postgresql_answered,
+    "pg18-c56-schema-prepared.out",
+    [
+        (8, "PGDIV-PUBLIC-SCHEMA-NOOP cluster-state [cluster]: DROP SCHEMA public CASCADE drops c56_prepared but sends no 'drop cascades to table c56_prepared' NOTICE (the review's #5; B2 ruling, DECISIONS 2026-10-17T06:24:21Z)"),
+        (12, "PGDIV-PUBLIC-SCHEMA-NOOP cluster-state [cluster]: CREATE SCHEMA public after it fails 42601 'schema \"public\" already exists' (the review's #7; #11, the review's #6, is NEVER registered)"),
+    ]
+);
 // Review c39799c5d..9e24b455d LOWs 6, 7, 8, 9, 11 (one class: a SET value is valid or not as
 // PostgreSQL's check hooks decide, before this server's own refusal of a valid value it does not
 // act on). Strict until a run's diff registers the intended 0A000 rows (PGDIV-SET-REFUSED), each
@@ -13552,6 +13560,7 @@ replays_postgresql!(
         (9, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = +05:30 refused 0A000 (PG: SET)"),
         (10, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = 5.5 refused 0A000 (PG: SET)"),
         (11, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = INTERVAL '+05:00' refused 0A000 (PG: SET)"),
+        (8, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = Factory refused 0A000 (PG: SET); registered from the host run iccad11 ff9f1bdfe, after zone names became PG 18.6's own list"),
     ]
 );
 replays_postgresql!(pg18_rev_c39_misc_replays_as_postgresql_answered, "pg18-rev-c39-misc.out", []);
@@ -14005,8 +14014,22 @@ replays_postgresql!(
 // session's DROP between Parse and Bind, in autocommit and in a block), E-H1 (the kept statement
 // across DROP, ADD COLUMN and a temp table in the round), the search_path re-analysis pin, and the
 // c39 LOW 5 AND CHAIN arms. Strict until a run's diff registers the intended rows.
-replays_postgresql!(pg18_rev_bl1_replays_as_postgresql_answered, "pg18-rev-bl1.out", []);
-replays_postgresql!(pg18_rev_bl3_replays_as_postgresql_answered, "pg18-rev-bl3.out", []);
+// Registered from the host run iccad11 ff9f1bdfe diff (each row read).
+replays_postgresql!(
+    pg18_rev_bl1_replays_as_postgresql_answered,
+    "pg18-rev-bl1.out",
+    [
+        (14, "PGDIV-SQLITE-NAME-MESSAGE error-text [wire]: 42P01 both at the Bind after the DROP (B1); ours 'Parse error: no such table: b' vs PG 'relation \"b\" does not exist'"),
+    ]
+);
+// Registered from the host run iccad11 ff9f1bdfe diff (each row read).
+replays_postgresql!(
+    pg18_rev_bl3_replays_as_postgresql_answered,
+    "pg18-rev-bl3.out",
+    [
+        (13, "PGDIV-SQLITE-NAME-MESSAGE error-text [wire]: 42P01 both; ours 'Parse error: no such table: c' vs PG 'relation \"c\" does not exist'"),
+    ]
+);
 // Registered from the first host run, iccad11 9f5839a88 diff (rows read one by one; DECISIONS: only from a run's diff).
 replays_postgresql!(
     pg18_rev_eh1_replays_as_postgresql_answered,
@@ -14265,7 +14288,21 @@ fn every_zone_postgresql_knows_is_a_valid_timezone() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-replays_postgresql!(pg18_rev_host1_replays_as_postgresql_answered, "pg18-rev-host1.out", []);
+// Registered from the host run iccad11 ff9f1bdfe diff (each row read).
+replays_postgresql!(
+    pg18_rev_host1_replays_as_postgresql_answered,
+    "pg18-rev-host1.out",
+    [
+        (4, "PGDIV-CONSTRAINT-MESSAGE error-text [wire]: 23502 both; ours 'NOT NULL constraint failed: t.id' vs PG 'null value in column \"id\" of relation \"t\" violates not-null constraint'"),
+        (35, "PGDIV-CURSOR-REFUSED ours-only [ours-only]: DECLARE CURSOR outside a block: PG BindComplete then 25P01 at Execute; ours 0A000 at Bind"),
+        (40, "PGDIV-CURSOR-REFUSED ours-only [ours-only]: DECLARE CURSOR in a block: PG DECLARE CURSOR; ours 0A000 at Bind, which fails the block"),
+        (45, "PGDIV-CALL-REFUSED ours-only [ours-only]: CALL nosuch(): PG 42883 at Parse; ours ParseComplete then 0A000 at Bind"),
+        (46, "PGDIV-PG-TIMEZONE-NAMES value [wire]: no pg_timezone_names view (42P01)"),
+        (47, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = Factory refused 0A000 (PG: SET)"),
+        (48, "PGDIV-CLUSTER-SETTINGS cluster-state [cluster]: RESET TimeZone: the recording cluster's default is America/New_York (ParameterStatus); ours stays UTC, sending none"),
+        (49, "PGDIV-PG-TIMEZONE-NAMES value [wire]: no pg_timezone_names view (42P01)"),
+    ]
+);
 
 /// Review wire-quote HIGH-1 (artie 8280634a2f): libpg_query hands the translator names already
 /// unquoted, and Name::from_string read a leading `"`, `'`, `` ` `` or `[` as SQL quoting again: it
