@@ -1,4 +1,3 @@
-use turso_parser::sql_error::SqlErrorKind;
 use turso_parser::sql_error::{SqlErrorKind, SqlErrorMessage};
 use std::sync::Arc;
 use turso_core::schema::{Schema, Table};
