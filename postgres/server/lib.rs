@@ -7005,6 +7005,36 @@ mod tests {
         assert!(violations.is_empty(), "SQLSTATE literals outside the table:\n{}", violations.join("\n"));
     }
 
+    /// Review wire-quote HIGH-1: every engine name built from a libpg_query-sourced string goes
+    /// through ONE constructor, turso_pg_parser::translator::pg_name (Name::exact: the string is
+    /// the name, never re-read as quoting). Name::from_string re-reads a leading quote, so it
+    /// appears in none of the translator's or the frontend's product sources.
+    #[test]
+    fn libpg_query_names_take_the_one_name_constructor() {
+        let mut found = Vec::new();
+        for (file, source) in [
+            ("parser/translator.rs", include_str!("../parser/translator.rs")),
+            ("frontend/session.rs", include_str!("../frontend/session.rs")),
+            ("frontend/catalog.rs", include_str!("../frontend/catalog.rs")),
+            ("frontend/functions.rs", include_str!("../frontend/functions.rs")),
+            ("frontend/lib.rs", include_str!("../frontend/lib.rs")),
+            ("frontend/aliases.rs", include_str!("../frontend/aliases.rs")),
+            ("frontend/copy.rs", include_str!("../frontend/copy.rs")),
+            ("frontend/information_schema.rs", include_str!("../frontend/information_schema.rs")),
+            ("frontend/pg_settings.rs", include_str!("../frontend/pg_settings.rs")),
+            ("frontend/phase.rs", include_str!("../frontend/phase.rs")),
+            ("frontend/result_types.rs", include_str!("../frontend/result_types.rs")),
+            ("frontend/sqlstate.rs", include_str!("../frontend/sqlstate.rs")),
+        ] {
+            for (n, line) in source.lines().enumerate() {
+                if line.contains("Name::from_string(") && !line.trim_start().starts_with("//") {
+                    found.push(format!("{file}:{}: {}", n + 1, line.trim()));
+                }
+            }
+        }
+        assert!(found.is_empty(), "names re-read as quoting:\n{}", found.join("\n"));
+    }
+
     /// Review wire-line3 HIGH-1, the lead's class: ONE quoting function for every identifier and
     /// literal the frontend pastes into engine text (catalog::quote_ident, catalog::quote_literal).
     /// No format! string in the frontend's product sources that builds SQL (it starts with an SQL

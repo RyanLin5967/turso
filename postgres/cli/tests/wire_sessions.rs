@@ -14266,3 +14266,54 @@ fn every_zone_postgresql_knows_is_a_valid_timezone() {
 }
 
 replays_postgresql!(pg18_rev_host1_replays_as_postgresql_answered, "pg18-rev-host1.out", []);
+
+/// Review wire-quote HIGH-1 (artie 8280634a2f): libpg_query hands the translator names already
+/// unquoted, and Name::from_string read a leading `"`, `'`, `` ` `` or `[` as SQL quoting again: it
+/// asserted on the closing quote (a panic, which aborts every session under the release
+/// profile's panic = "abort"), and stripped the quotes of a name that holds them, so `"""t"""`
+/// named `t`. A quote-led name is a name: an unknown one is 42P01 with the session alive, and a
+/// table named `"t"` is not `t`.
+#[test]
+fn a_quote_led_identifier_is_a_name_not_quoting() {
+    let dir = Scratch::new("quote-led");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    for sql in [
+        "SELECT * FROM \"\"\"a\"",
+        "SELECT * FROM \"'a\"",
+        "SELECT * FROM \"[a\"",
+        "SELECT * FROM \"`a\"",
+    ] {
+        let r = a.q(sql);
+        if r.error.as_ref().map(|e| e.code.as_str()) != Some("42P01") {
+            wrong.push(format!("{sql}: want 42P01, got {:?}", r.error));
+        }
+        if let Some(e) = a.q("SELECT 1").error {
+            wrong.push(format!("after {sql}: the session is gone: {e:?}"));
+            return assert!(wrong.is_empty(), "{wrong:#?}");
+        }
+    }
+    for sql in [
+        "CREATE TABLE \"\"\"t\"\"\" (x int)",
+        "CREATE TABLE t (y int)",
+        "INSERT INTO t VALUES (7)",
+        "BEGIN",
+        "SAVEPOINT \"\"\"s\"",
+        "RELEASE SAVEPOINT \"\"\"s\"",
+        "COMMIT",
+    ] {
+        if let Some(e) = a.q(sql).error {
+            wrong.push(format!("{sql}: {} {}", e.code, e.message));
+        }
+    }
+    let quoted = a.q("SELECT count(*) FROM \"\"\"t\"\"\"");
+    if quoted.error.is_some() || quoted.rows != vec![vec![Some("0".to_string())]] {
+        wrong.push(format!("the table named \"t\" (empty): {:?} {:?}", quoted.rows, quoted.error));
+    }
+    let plain = a.q("SELECT y FROM t");
+    if plain.error.is_some() || plain.rows != vec![vec![Some("7".to_string())]] {
+        wrong.push(format!("the table named t: {:?} {:?}", plain.rows, plain.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
