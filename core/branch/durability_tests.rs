@@ -3344,7 +3344,6 @@ fn an_async_create_is_durable_at_its_branchs_first_write() {
         let crashed = open_at(&image, DatabaseOpts::new().with_branch_durability(BranchDurability::Catalog { sync: class })).unwrap();
         assert_eq!(crashed.branch_named("t6").unwrap(), Some(id), "CLAIM: the crash image holds the branch");
         let c = crashed.connect_named("t6").unwrap();
-        let rows = c.prepare("SELECT v FROM t WHERE id = 7").unwrap().run_collect_rows().unwrap();
-        assert_eq!(rows[0][0].to_string(), "t6-write", "CLAIM: the crash image holds the first write");
+        assert_eq!(value(&c, 7).as_deref(), Some("t6-write"), "CLAIM: the crash image holds the first write");
     }
 }
