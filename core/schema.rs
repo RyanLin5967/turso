@@ -1996,6 +1996,7 @@ impl Schema {
                 check_constraints: vec![],
                 rowid_alias_conflict_clause: None,
                 rowid_alias_not_null: false,
+                dialect_owned: false,
                 unique_sets: vec![],
                 has_virtual_columns: false,
                 logical_to_physical_map,
@@ -2153,7 +2154,8 @@ impl Schema {
                     };
                     self.add_virtual_table(vtab)?;
                 } else {
-                    let table = dialect.parse_table_sql(sql, root_page)?;
+                    let mut table = dialect.parse_table_sql(sql, root_page)?;
+                    table.dialect_owned = dialect.owns_stored_table_sql(sql);
 
                     if table.has_virtual_columns && !self.generated_columns_enabled {
                         return Err(LimboError::ParseError(format!(
@@ -2738,6 +2740,7 @@ impl TryClone for BTreeTable {
             check_constraints: self.check_constraints.try_clone()?,
             rowid_alias_conflict_clause: self.rowid_alias_conflict_clause,
             rowid_alias_not_null: self.rowid_alias_not_null,
+            dialect_owned: self.dialect_owned,
             has_virtual_columns: self.has_virtual_columns,
             logical_to_physical_map: self.logical_to_physical_map.try_clone()?,
             column_dependencies: Default::default(),
@@ -3391,6 +3394,11 @@ pub struct BTreeTable {
     /// false for SQLite tables, whose INTEGER PRIMARY KEY turns a NULL into a new rowid
     /// (fastest-engine 4c).
     pub rowid_alias_not_null: bool,
+    /// Whose form the table's stored row is in (dialect design REVISION 2 item 8): true iff the
+    /// database's dialect recognises the row as its own (`Dialect::owns_stored_table_sql`, set by the
+    /// schema loader), so RENAME and ALTER rewrite it in that dialect's form; false for an engine row
+    /// (canonical SQLite), which they keep canonical. A RENAME or ALTER never changes it.
+    pub dialect_owned: bool,
     pub has_virtual_columns: bool,
     pub logical_to_physical_map: Vec<usize>,
     column_dependencies: ResetOnClone<OnceLock<GeneratedColGraph>>,
@@ -3459,6 +3467,7 @@ impl BTreeTable {
             check_constraints,
             rowid_alias_conflict_clause,
             rowid_alias_not_null: false,
+            dialect_owned: false,
             has_virtual_columns,
             logical_to_physical_map,
             column_dependencies: Default::default(),
@@ -5117,6 +5126,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         check_constraints,
         rowid_alias_conflict_clause,
         rowid_alias_not_null: false,
+        dialect_owned: false,
         has_virtual_columns: false,
         logical_to_physical_map: vec![],
         column_dependencies: Default::default(),
@@ -5710,6 +5720,7 @@ pub fn sqlite_schema_table() -> Result<BTreeTable> {
         check_constraints: try_vec![]?,
         rowid_alias_conflict_clause: None,
         rowid_alias_not_null: false,
+        dialect_owned: false,
         unique_sets: try_vec![]?,
         has_virtual_columns: false,
         logical_to_physical_map,
@@ -6667,6 +6678,7 @@ mod tests {
             check_constraints: vec![],
             rowid_alias_conflict_clause: None,
             rowid_alias_not_null: false,
+            dialect_owned: false,
             has_virtual_columns: false,
             logical_to_physical_map,
             column_dependencies: Default::default(),

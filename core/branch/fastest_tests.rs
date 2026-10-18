@@ -3299,6 +3299,9 @@ fn a_merge_resolves_a_check_through_the_database_s_dialect() {
         fn name(&self) -> &'static str {
             "dfn"
         }
+        fn owns_stored_table_sql(&self, _sql: &str) -> bool {
+            false
+        }
         fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
             sqlite::parse(sql)
         }

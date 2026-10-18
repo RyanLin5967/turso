@@ -11175,10 +11175,12 @@ pub fn op_function(
                                         },
                                     };
                                     Some(
-                                        program
-                                            .connection
-                                            .dialect()
-                                            .format_rewritten_table_sql(&new_stmt)?,
+                                        {
+                                            // The row stays in the form it was in (REVISION 2 item 8).
+                                            let dialect = program.connection.dialect();
+                                            let owned = dialect.owns_stored_table_sql(sql.as_str());
+                                            dialect.format_changed_table_sql(owned, crate::dialect::TableChange::Rewritten(&new_stmt))?
+                                        },
                                     )
                                 } else {
                                     // Other tables: only emit if we actually changed their FK targets.
@@ -11196,10 +11198,12 @@ pub fn op_function(
                                         },
                                     };
                                     Some(
-                                        program
-                                            .connection
-                                            .dialect()
-                                            .format_rewritten_table_sql(&new_stmt)?,
+                                        {
+                                            // The row stays in the form it was in (REVISION 2 item 8).
+                                            let dialect = program.connection.dialect();
+                                            let owned = dialect.owns_stored_table_sql(sql.as_str());
+                                            dialect.format_changed_table_sql(owned, crate::dialect::TableChange::Rewritten(&new_stmt))?
+                                        },
                                     )
                                 }
                             }
@@ -11568,10 +11572,12 @@ pub fn op_function(
                                     if_not_exists,
                                 };
                                 Some(
-                                    program
-                                        .connection
-                                        .dialect()
-                                        .format_rewritten_table_sql(&new_stmt)?,
+                                    {
+                                        // The row stays in the form it was in (REVISION 2 item 8).
+                                        let dialect = program.connection.dialect();
+                                        let owned = dialect.owns_stored_table_sql(sql.as_str());
+                                        dialect.format_changed_table_sql(owned, crate::dialect::TableChange::Rewritten(&new_stmt))?
+                                    },
                                 )
                             }
                             // Trigger SQL is rewritten by separate UPDATE statements

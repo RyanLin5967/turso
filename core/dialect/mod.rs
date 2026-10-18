@@ -14,6 +14,14 @@ pub mod sqlite;
 
 pub use sqlite::SqliteDialect;
 
+/// What a RENAME or an ALTER did to a table, for `Dialect::format_changed_table_sql`.
+pub enum TableChange<'a> {
+    /// RENAME rebuilt the table's CREATE statement.
+    Rewritten(&'a turso_parser::ast::Stmt),
+    /// ADD/DROP COLUMN changed the table in place.
+    Altered(&'a crate::schema::BTreeTable),
+}
+
 /// SQL dialect layered on top of the engine.
 ///
 /// Every [`crate::Database`] carries a dialect, supplied explicitly by
@@ -133,6 +141,27 @@ pub trait Dialect: Send + Sync + 'static {
     /// connect (fastest-engine; engine review 20 HIGH 1).
     fn format_altered_table_sql(&self, table: &crate::schema::BTreeTable) -> crate::Result<String> {
         Ok(table.to_sql())
+    }
+
+    /// Whether `sql`, a stored `sqlite_schema` table row, is in this dialect's own form (dialect design
+    /// REVISION 2 item 8): the schema loader records the answer on the table (`BTreeTable::dialect_owned`),
+    /// so a RENAME or ALTER rewrites the row in the same form it was in. Required, with no default: a
+    /// default of "none" would canonicalise a frontend's own rows on ALTER, and one of "all" would
+    /// re-mark the engine's rows (review dialect LOW-9), so each dialect must say. SQLite owns none.
+    fn owns_stored_table_sql(&self, sql: &str) -> bool;
+
+    /// The stored text of a table row that a RENAME or an ALTER changed (dialect design REVISION 1 item 2,
+    /// REVISION 2 item 8): a row stays in the form it was in. `dialect_owned` is the row's owner as the
+    /// loader recorded it (`BTreeTable::dialect_owned`). An engine row (not the dialect's) is written as
+    /// canonical SQLite; the dialect's own row through its own formatters (`format_rewritten_table_sql`,
+    /// `format_altered_table_sql`). The engine calls only this.
+    fn format_changed_table_sql(&self, dialect_owned: bool, change: TableChange<'_>) -> crate::Result<String> {
+        match (dialect_owned, change) {
+            (false, TableChange::Rewritten(stmt)) => Ok(stmt.to_string()),
+            (false, TableChange::Altered(table)) => Ok(table.to_sql()),
+            (true, TableChange::Rewritten(stmt)) => self.format_rewritten_table_sql(stmt),
+            (true, TableChange::Altered(table)) => self.format_altered_table_sql(table),
+        }
     }
 
     /// Install the dialect's catalog tables into a freshly constructed
@@ -330,6 +359,9 @@ mod tests {
         fn name(&self) -> &'static str {
             "test"
         }
+        fn owns_stored_table_sql(&self, sql: &str) -> bool {
+            sql.starts_with("/* test */ ")
+        }
 
         fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
             self.statement_parse_calls.fetch_add(1, Ordering::SeqCst);
@@ -423,6 +455,9 @@ mod tests {
     impl Dialect for ClientOnlyDialect {
         fn name(&self) -> &'static str {
             "client-only"
+        }
+        fn owns_stored_table_sql(&self, _sql: &str) -> bool {
+            false
         }
         fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
             // The tail after a client statement holds no statement (an `execute` loop parses it to
@@ -601,6 +636,18 @@ mod tests {
         fn parse_table_sql(&self, sql: &str, root_page: i64) -> crate::Result<BTreeTable> {
             BTreeTable::from_sql(Self::unmark(sql)?, root_page)
         }
+        // Its own rows are the marked ones (the dialect design's owner bit, REVISION 2 item 8).
+        fn owns_stored_table_sql(&self, sql: &str) -> bool {
+            sql.starts_with("/* client */ ")
+        }
+        // Its own form for its own rows changed by RENAME or ALTER: marked client text, as it stores
+        // them (REVISION 2 item 8: a changed row stays in the form it was in).
+        fn format_rewritten_table_sql(&self, stmt: &turso_parser::ast::Stmt) -> crate::Result<String> {
+            Ok(format!("/* client */ client: {stmt}"))
+        }
+        fn format_altered_table_sql(&self, table: &BTreeTable) -> crate::Result<String> {
+            Ok(format!("/* client */ client: {}", table.to_sql()))
+        }
         fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<turso_parser::ast::Stmt> {
             sqlite::parse_table_sql_ast(Self::unmark(sql)?)
         }
@@ -687,6 +734,9 @@ mod tests {
         impl Dialect for ShadowAbs {
             fn name(&self) -> &'static str {
                 "shadow-abs"
+            }
+            fn owns_stored_table_sql(&self, _sql: &str) -> bool {
+                false
             }
             fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
                 sqlite::parse(sql)
@@ -902,6 +952,9 @@ mod tests {
         fn name(&self) -> &'static str {
             "parking"
         }
+        fn owns_stored_table_sql(&self, _sql: &str) -> bool {
+            false
+        }
         fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
             sqlite::parse(sql)
         }
@@ -1006,6 +1059,9 @@ mod tests {
         fn name(&self) -> &'static str {
             "reparse-test"
         }
+        fn owns_stored_table_sql(&self, _sql: &str) -> bool {
+            false
+        }
         fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
             sqlite::parse(sql)
         }
@@ -1080,6 +1136,9 @@ mod tests {
     impl Dialect for StrictTestDialect {
         fn name(&self) -> &'static str {
             "strict-test"
+        }
+        fn owns_stored_table_sql(&self, sql: &str) -> bool {
+            sql.starts_with(Self::PREFIX)
         }
 
         fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
@@ -1478,6 +1537,9 @@ mod tests {
     impl Dialect for NoFunctionsDialect {
         fn name(&self) -> &'static str {
             "nofuncs"
+        }
+        fn owns_stored_table_sql(&self, _sql: &str) -> bool {
+            false
         }
 
         fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
@@ -1907,6 +1969,9 @@ mod tests {
     impl Dialect for PgKeyTestDialect {
         fn name(&self) -> &'static str {
             "pgkey-test"
+        }
+        fn owns_stored_table_sql(&self, sql: &str) -> bool {
+            Self::own(sql).is_some()
         }
 
         fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {

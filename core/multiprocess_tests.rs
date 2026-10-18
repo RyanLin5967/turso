@@ -1454,6 +1454,9 @@ impl crate::Dialect for CountingReparseDialect {
     fn name(&self) -> &'static str {
         crate::Dialect::name(&SqliteDialect)
     }
+    fn owns_stored_table_sql(&self, _sql: &str) -> bool {
+        false
+    }
     fn parse(&self, sql: &str) -> Result<(Option<turso_parser::ast::Cmd>, usize)> {
         self.parses.fetch_add(1, Ordering::SeqCst);
         crate::Dialect::parse(&SqliteDialect, sql)

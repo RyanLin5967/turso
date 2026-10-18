@@ -27,6 +27,18 @@ impl Dialect for PostgresDialect {
     fn name(&self) -> &'static str {
         "postgres"
     }
+    // This frontend's own rows are its two marked forms (dialect design REVISION 2 item 8).
+    fn owns_stored_table_sql(&self, sql: &str) -> bool {
+        sql.starts_with(STORED_PG_SCHEMA_PREFIX) || sql.starts_with(STORED_PG_ALTERED_PREFIX)
+    }
+
+    // Its raw rows replay as their own PostgreSQL DDL, so that text is the client's syntax; its ALTERed
+    // and schema-qualified rows replay as canonical SQLite (REVISION 2 item 4).
+    fn table_sql_for_replay_stored(&self, sql: &str) -> Result<turso_core::StoredSql> {
+        let text = self.table_sql_for_replay(sql)?;
+        let raw = !sql.starts_with(STORED_PG_ALTERED_PREFIX) && decode_stored_pg_schema_sql(sql) == Some(text.as_str());
+        Ok(if raw { turso_core::StoredSql::client(text) } else { turso_core::StoredSql::sqlite(text) })
+    }
 
     fn parse(&self, sql: &str) -> Result<(Option<turso_parser::ast::Cmd>, usize)> {
         // Engine-generated helper statements and pragmas are canonical SQLite

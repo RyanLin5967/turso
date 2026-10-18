@@ -38,6 +38,9 @@ impl super::Dialect for SqliteDialect {
     fn name(&self) -> &'static str {
         "sqlite"
     }
+    fn owns_stored_table_sql(&self, _sql: &str) -> bool {
+        false
+    }
 
     fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
         parse(sql)
