@@ -262,7 +262,7 @@ pub fn parse_schema_rows(
     schema: &mut Schema,
     syms: &SymbolTable,
     resolve_attached_db: &dyn Fn(&str) -> Option<usize>,
-    dialect: &dyn crate::dialect::Dialect,
+    dialect: &crate::sync::Arc<dyn crate::dialect::Dialect>,
 ) -> Result<IOResult<()>> {
     {
         let inner = state
@@ -298,7 +298,7 @@ pub fn parse_schema_rows(
                 dbsp_state_index_roots,
                 materialized_view_info,
                 resolve_attached_db,
-                dialect,
+                dialect.as_ref(),
             )
         }));
     }
@@ -319,6 +319,7 @@ pub fn parse_schema_rows(
         inner.materialized_view_info,
         inner.dbsp_state_roots,
         inner.dbsp_state_index_roots,
+        dialect,
     )?;
 
     Ok(IOResult::Done(()))

@@ -865,6 +865,9 @@ impl DbspCircuit {
 /// Compiler from LogicalPlan to DBSP Circuit
 pub struct DbspCompiler {
     circuit: DbspCircuit,
+    /// The dialect the view's expressions resolve through: the database's (`with_dialect`; dialect
+    /// code review MED-3), SQLite until it is set.
+    dialect: crate::sync::Arc<dyn crate::Dialect>,
 }
 
 impl DbspCompiler {
@@ -880,7 +883,14 @@ impl DbspCompiler {
                 internal_state_root,
                 internal_state_index_root,
             ),
+            dialect: crate::sync::Arc::new(SqliteDialect),
         }
+    }
+
+    /// Resolve the view's expressions through `dialect`, the database's.
+    pub fn with_dialect(mut self, dialect: crate::sync::Arc<dyn crate::Dialect>) -> Self {
+        self.dialect = dialect;
+        self
     }
 
     /// Resolve join condition columns to determine which side each column belongs to.
@@ -977,7 +987,7 @@ impl DbspCompiler {
                 let mut compiled_exprs = Vec::new();
                 let mut aliases = Vec::new();
                 for expr in &proj.exprs {
-                    let (compiled, alias) = Self::compile_expression(expr, input_schema)?;
+                    let (compiled, alias) = Self::compile_expression(expr, input_schema, &self.dialect)?;
                     compiled_exprs.push(compiled);
                     aliases.push(alias);
                 }
@@ -1036,7 +1046,7 @@ impl DbspCompiler {
                     let mut aliases = Vec::new();
                     let mut output_names = Vec::new();
                     for (i, expr) in projection_exprs.iter().enumerate() {
-                        let (compiled, _alias) = Self::compile_expression(expr, input_schema)?;
+                        let (compiled, _alias) = Self::compile_expression(expr, input_schema, &self.dialect)?;
                         compiled_exprs.push(compiled);
                         if i < input_schema.columns.len() {
                             aliases.push(None);
@@ -1631,11 +1641,12 @@ impl DbspCompiler {
     fn compile_expression(
         expr: &LogicalExpr,
         input_schema: &LogicalSchema,
+        dialect: &crate::sync::Arc<dyn crate::Dialect>,
     ) -> Result<(CompiledExpression, Option<String>)> {
         // Check for alias first
         if let LogicalExpr::Alias { expr, alias } = expr {
             // For aliases, compile the underlying expression and return with alias
-            let (compiled, _) = Self::compile_expression(expr, input_schema)?;
+            let (compiled, _) = Self::compile_expression(expr, input_schema, dialect)?;
             return Ok((compiled, Some(alias.clone())));
         }
 
@@ -1657,7 +1668,9 @@ impl DbspCompiler {
 
         // Create an internal connection for expression compilation
         let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect))?;
+        // The expressions compile through this connection's dialect: the database's (dialect code
+        // review MED-3: it was SqliteDialect, so a view's dialect-only function was "no such function").
+        let db = Database::open_file(io, ":memory:", dialect.clone())?;
         let internal_conn = db.connect()?;
         internal_conn.set_query_only(true);
         internal_conn.auto_commit.store(false, Ordering::SeqCst);

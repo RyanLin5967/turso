@@ -14795,6 +14795,7 @@ fn op_parse_schema_step(
                     materialized_view_info,
                     dbsp_state_roots,
                     dbsp_state_index_roots,
+                    &conn.dialect(),
                 );
 
                 state.note_schema_change(conn, db);

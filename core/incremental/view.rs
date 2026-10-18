@@ -248,6 +248,7 @@ impl IncrementalView {
         main_data_root: i64,
         internal_state_root: i64,
         internal_state_index_root: i64,
+        dialect: &Arc<dyn crate::Dialect>,
     ) -> Result<DbspCircuit> {
         // Build the logical plan from the SELECT statement
         let mut builder = LogicalPlanBuilder::new(schema);
@@ -260,7 +261,8 @@ impl IncrementalView {
             main_data_root,
             internal_state_root,
             internal_state_index_root,
-        );
+        )
+        .with_dialect(dialect.clone());
         let circuit = compiler.compile(&logical_plan)?;
 
         Ok(circuit)
@@ -310,6 +312,20 @@ impl IncrementalView {
         internal_state_root: i64,
         internal_state_index_root: i64,
     ) -> Result<Self> {
+        let sqlite: Arc<dyn crate::Dialect> = Arc::new(crate::dialect::SqliteDialect);
+        Self::from_sql_with_dialect(sql, schema, main_data_root, internal_state_root, internal_state_index_root, &sqlite)
+    }
+
+    /// `from_sql`, its expressions resolved through `dialect`: the database's, as a plain view's are
+    /// (dialect code review MED-3: the view's compiler resolved with SQLite whatever the database).
+    pub fn from_sql_with_dialect(
+        sql: &str,
+        schema: &Schema,
+        main_data_root: i64,
+        internal_state_root: i64,
+        internal_state_index_root: i64,
+        dialect: &Arc<dyn crate::Dialect>,
+    ) -> Result<Self> {
         let mut parser = Parser::new(sql.as_bytes());
         let cmd = parser.next_cmd()?;
         let cmd = cmd.expect("View is an empty statement");
@@ -319,13 +335,14 @@ impl IncrementalView {
                 view_name,
                 columns: _,
                 select,
-            }) => IncrementalView::from_stmt(
+            }) => IncrementalView::from_stmt_with_dialect(
                 view_name,
                 select,
                 schema,
                 main_data_root,
                 internal_state_root,
                 internal_state_index_root,
+                dialect,
             ),
             _ => Err(LimboError::ParseError(format!(
                 "View is not a CREATE MATERIALIZED VIEW statement: {sql}"
@@ -340,6 +357,20 @@ impl IncrementalView {
         main_data_root: i64,
         internal_state_root: i64,
         internal_state_index_root: i64,
+    ) -> Result<Self> {
+        let sqlite: Arc<dyn crate::Dialect> = Arc::new(crate::dialect::SqliteDialect);
+        Self::from_stmt_with_dialect(view_name, select, schema, main_data_root, internal_state_root, internal_state_index_root, &sqlite)
+    }
+
+    /// `from_stmt` with the database's dialect (`from_sql_with_dialect`).
+    pub fn from_stmt_with_dialect(
+        view_name: ast::QualifiedName,
+        select: ast::Select,
+        schema: &Schema,
+        main_data_root: i64,
+        internal_state_root: i64,
+        internal_state_index_root: i64,
+        dialect: &Arc<dyn crate::Dialect>,
     ) -> Result<Self> {
         let name = view_name.name.as_str().to_string();
 
@@ -359,7 +390,7 @@ impl IncrementalView {
             &mut table_conditions,
         )?;
 
-        Self::new(
+        Self::new_with_dialect(
             name,
             select.clone(),
             referenced_tables,
@@ -371,6 +402,7 @@ impl IncrementalView {
             main_data_root,
             internal_state_root,
             internal_state_index_root,
+            dialect,
         )
     }
 
@@ -388,6 +420,39 @@ impl IncrementalView {
         internal_state_root: i64,
         internal_state_index_root: i64,
     ) -> Result<Self> {
+        let sqlite: Arc<dyn crate::Dialect> = Arc::new(crate::dialect::SqliteDialect);
+        Self::new_with_dialect(
+            name,
+            select_stmt,
+            referenced_tables,
+            table_aliases,
+            qualified_table_names,
+            table_conditions,
+            column_schema,
+            schema,
+            main_data_root,
+            internal_state_root,
+            internal_state_index_root,
+            &sqlite,
+        )
+    }
+
+    /// `new`, its expressions resolved through `dialect` (`from_sql_with_dialect`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_dialect(
+        name: String,
+        select_stmt: ast::Select,
+        referenced_tables: Vec<Arc<BTreeTable>>,
+        table_aliases: HashMap<String, String>,
+        qualified_table_names: HashMap<String, String>,
+        table_conditions: HashMap<String, Vec<Option<ast::Expr>>>,
+        column_schema: ViewColumnSchema,
+        schema: &Schema,
+        main_data_root: i64,
+        internal_state_root: i64,
+        internal_state_index_root: i64,
+        dialect: &Arc<dyn crate::Dialect>,
+    ) -> Result<Self> {
         // Create the tracker that will be shared by all operators
         let tracker = Arc::new(Mutex::new(ComputationTracker::new()));
 
@@ -398,6 +463,7 @@ impl IncrementalView {
             main_data_root,
             internal_state_root,
             internal_state_index_root,
+            dialect,
         )?;
 
         Ok(Self {

@@ -2035,7 +2035,7 @@ impl Database {
                         None,
                         pager,
                         &syms,
-                        dialect.as_ref(),
+                        &dialect,
                     );
 
                     match result {

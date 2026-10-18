@@ -1599,7 +1599,7 @@ impl Schema {
         mv_cursor: Option<Arc<RwLock<MvCursor>>>,
         pager: &Arc<Pager>,
         syms: &SymbolTable,
-        dialect: &dyn crate::dialect::Dialect,
+        dialect: &Arc<dyn crate::dialect::Dialect>,
     ) -> Result<IOResult<()>> {
         let result = self.make_from_btree_internal(state, mv_cursor, pager, syms, dialect);
         if result.is_err() {
@@ -1619,7 +1619,7 @@ impl Schema {
         mv_cursor: Option<Arc<RwLock<MvCursor>>>,
         pager: &Arc<Pager>,
         syms: &SymbolTable,
-        dialect: &dyn crate::dialect::Dialect,
+        dialect: &Arc<dyn crate::dialect::Dialect>,
     ) -> Result<IOResult<()>> {
         loop {
             tracing::debug!("make_from_btree: state.phase={:?}", state.phase);
@@ -1726,7 +1726,7 @@ impl Schema {
                         &mut acc.dbsp_state_index_roots,
                         &mut acc.materialized_view_info,
                         &|_| None,
-                        dialect,
+                        dialect.as_ref(),
                     )?;
 
                     state.phase = MakeFromBtreePhase::Advancing;
@@ -1762,6 +1762,7 @@ impl Schema {
                             acc.materialized_view_info,
                             acc.dbsp_state_roots,
                             acc.dbsp_state_index_roots,
+                            dialect,
                         )?;
 
                         state.phase = MakeFromBtreePhase::Done;
@@ -1974,11 +1975,14 @@ impl Schema {
     }
 
     /// Populate materialized views parsed from the schema.
+    /// `dialect`: the database's, which the views' expressions resolve through (dialect code review
+    /// MED-3).
     pub fn populate_materialized_views(
         &mut self,
         materialized_view_info: HashMap<String, (String, i64)>,
         dbsp_state_roots: HashMap<String, i64>,
         dbsp_state_index_roots: HashMap<String, i64>,
+        dialect: &Arc<dyn crate::Dialect>,
     ) -> Result<()> {
         for (view_name, (sql, main_root)) in materialized_view_info {
             // Look up the DBSP state root for this view
@@ -2016,12 +2020,13 @@ impl Schema {
             }
 
             // Create the IncrementalView with all root pages
-            let incremental_view = IncrementalView::from_sql(
+            let incremental_view = IncrementalView::from_sql_with_dialect(
                 &sql,
                 self,
                 main_root,
                 dbsp_state_root,
                 dbsp_state_index_root,
+                dialect,
             )?;
             let referenced_tables = incremental_view.get_referenced_table_names();
 

@@ -8720,6 +8720,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             materialized_view_info,
             dbsp_state_roots,
             dbsp_state_index_roots,
+            &connection.dialect(),
         )?;
         Self::rehydrate_table_valued_functions(&mut fresh, preserved_table_valued_functions);
 
@@ -9672,6 +9673,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             materialized_view_info,
             dbsp_state_roots,
             dbsp_state_index_roots,
+            &connection.dialect(),
         )?;
         Self::rehydrate_table_valued_functions(&mut fresh, preserved_table_valued_functions);
 

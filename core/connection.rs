@@ -1767,7 +1767,7 @@ impl Connection {
                         &mut inner.fresh,
                         &self.syms.read(),
                         &attached_resolver,
-                        self.db.dialect().as_ref(),
+                        &self.db.dialect(),
                     ));
 
                     // Rehydrate built-in table-valued functions captured at init.
@@ -3321,6 +3321,7 @@ impl Connection {
                 materialized_view_info,
                 dbsp_state_roots,
                 dbsp_state_index_roots,
+                &self.dialect(),
             ) {
                 Ok(()) => {}
                 Err(LimboError::ExtensionError(msg)) => eprintln!("Warning: {msg}"),
