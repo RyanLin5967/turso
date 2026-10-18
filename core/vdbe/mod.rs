@@ -1558,6 +1558,11 @@ impl ProgramState {
                 if let Some(undo) = self.schema_undo.take() {
                     if rolled_back_pages && pager_err.is_none() {
                         connection.restore_schema_snapshot(undo);
+                        // As ROLLBACK TO does: the cookies cached before the rollback are stale.
+                        pager.set_schema_cookie(None);
+                        for p in &attached_pagers {
+                            p.set_schema_cookie(None);
+                        }
                     }
                 }
 
