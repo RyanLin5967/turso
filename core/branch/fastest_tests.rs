@@ -14070,7 +14070,7 @@ fn switching_capture_to_another_table_while_on_creates_it_and_captures_there() {
 #[test]
 fn dropping_a_column_an_attached_view_selects_is_refused_when_main_has_a_view_of_that_name() {
     let dir = tempfile::TempDir::new().unwrap();
-    let db = open_at(&dir.path().join("main-vv.db"), DatabaseOpts::new());
+    let db = open_at(&dir.path().join("main-vv.db"), DatabaseOpts::new().with_attach(true));
     let c = db.connect().unwrap();
     c.execute("CREATE TABLE good(a INTEGER)").unwrap();
     c.execute("CREATE VIEW vv AS SELECT a FROM good").unwrap();
