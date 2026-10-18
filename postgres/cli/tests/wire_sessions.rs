@@ -13927,6 +13927,13 @@ fn read_tags(w: &mut Wire, n: usize) -> Vec<u8> {
 /// that re-prepare must translate it as the session did. A DELETE ... USING keeps its column
 /// lookup (DELETE 1; it was refused, "must be prepared again by its session"), and a cast to a
 /// domain keeps its CHECK (23514; it returned -5).
+/// ITS RED BASE (lead ruling 2026-10-18; host batch rg6, iccad11) is 2102d79ac (= bddd29f79^), with
+/// this test's file: there the engine re-prepared the kept statement and the DELETE was a SQLite
+/// syntax error and the cast -5, the stated reason. It PASSES at 269737907, 0b846e86f and
+/// 140da7b76, because since bddd29f79 the wire itself re-prepares a kept statement whose schema
+/// moved, so this test no longer reaches the engine's re-prepare: it pins the end-to-end answer.
+/// The override itself is held by the frontend's an_engine_reprepare_translates_as_the_session_did
+/// (red at 269737907 plus that test, and the mutant "the override returns self.parse" killed).
 #[test]
 fn a_reprepare_after_another_sessions_ddl_translates_as_the_session_did() {
     let dir = Scratch::new("reprepare-xsession");
