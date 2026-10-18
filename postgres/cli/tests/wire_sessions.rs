@@ -15183,6 +15183,43 @@ fn a_cast_to_a_type_that_does_not_exist_is_42704() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// Found by the E5' differential on iccad11 at f312d1e13 (uwrun wire-e5-f312d1e13, e5host.sh; PG
+/// 18.6 answers in its pg.jsonl): a NUMERIC(p, s) or DECIMAL(p, s) column, stored as the engine's
+/// exact numeric, was announced float8 (701) where PostgreSQL announces numeric (1700): 1000 type
+/// mismatches in BranchBench micro READ and RANGE_READ (stock.s_ytd DECIMAL(8, 0)); and nextval,
+/// currval, setval and pg_database_size, bigint (20) in PostgreSQL, were announced text (25): 6
+/// type mismatches in the E2 workload. A bare NUMERIC stays the float it is stored as (COMPAT).
+#[test]
+fn an_exact_numeric_column_and_the_sequence_functions_carry_postgresqls_types() {
+    let dir = Scratch::new("numeric-oids");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE TABLE n(a DECIMAL(8, 0), b NUMERIC(8, 2))",
+        "INSERT INTO n VALUES (0, 1.5)",
+        "CREATE SEQUENCE sq",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    for (sql, oids, rows) in [
+        ("SELECT a, b FROM n", vec![1700u32, 1700], vec![vec![Some("0".to_string()), Some("1.50".to_string())]]),
+        ("SELECT nextval('sq')", vec![20], vec![vec![Some("1".to_string())]]),
+        ("SELECT currval('sq')", vec![20], vec![vec![Some("1".to_string())]]),
+        ("SELECT setval('sq', 5)", vec![20], vec![vec![Some("5".to_string())]]),
+    ] {
+        let r = a.q(sql);
+        if r.error.is_some() || r.oids != Some(oids.clone()) || r.rows != rows {
+            wrong.push(format!("{sql}: oids {:?} rows {:?} error {:?}, PostgreSQL {oids:?} {rows:?}", r.oids, r.rows, r.error));
+        }
+    }
+    let r = a.q("SELECT pg_database_size(current_database())");
+    if r.error.is_some() || r.oids != Some(vec![20]) {
+        wrong.push(format!("pg_database_size: oids {:?} error {:?}, PostgreSQL [20]", r.oids, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-uw2 N5: a schema-qualified type was refused 42704 'type "public m" does not exist',
 /// its parts joined with a blank, so a pg_dump restore, which writes public.<type> for every enum
 /// and domain column, failed at its first such table. PostgreSQL 18.6 takes public.m and
