@@ -1585,14 +1585,14 @@ pub(crate) fn thread_table(out: &mut [ThreadCpu]) -> Option<usize> {
     // Where it differs from Mach, which stays the semantics of record:
     // - the id is the kernel tid, which Linux reuses after pid_max wraps (Mach's thread_id is unique
     //   per boot): a tid reused between two readings of one window would read as one thread;
-    // - CPU time is the scheduler's run time (`schedstat`, ns), Mach's is user plus system time;
+    // - CPU time is the thread's scheduler run time (its per-thread CPU clock, ns, current even for a
+    //   running thread), Mach's is user plus system time;
     // - blocked is state S or D (Mach: TH_STATE_WAITING); a stopped (T, t) thread reads running, as a
     //   Mach-suspended one does; a zombie or dead (Z, X) task is not listed, as Mach lists no exited
     //   thread;
     // - the name is the kernel's comm, at most 15 bytes (TASK_COMM_LEN), so names are compared cut
     //   to it (`owned_named`).
-    // A live thread whose CPU time cannot be read (a kernel without schedstat) refuses the whole
-    // table: None, never a guessed time.
+    // A live thread whose CPU time cannot be read refuses the whole table: None, never a guessed time.
     #[cfg(target_os = "linux")]
     {
         let me = linux_tid();
@@ -1718,23 +1718,23 @@ fn linux_task_stat(tid: u64) -> Option<(u8, [u8; 32])> {
     Some((state, name))
 }
 
-/// Task `tid`'s CPU time so far, ns: the first field of its `schedstat`.
+/// Task `tid`'s CPU time so far, ns: its per-thread CPU clock (clock_gettime on the kernel's
+/// thread clock id, MAKE_THREAD_CPUCLOCK(tid, CPUCLOCK_SCHED)), which brings a RUNNING thread's time
+/// up to date when read. Run 1 read `schedstat` instead, and a helper that ran for well under a tick
+/// read as not having run (fc_foreign_window "had no foreign thread" on ecetesla4 and iccad6, raws
+/// ctr7-instr_0b26cdece); that schedstat lags a thread not yet descheduled is the suspected cause,
+/// UNVERIFIED (the red at 116534802 settles whether this clock fixes it). Our own threads only (the
+/// kernel refuses another process's thread clock).
 #[cfg(target_os = "linux")]
 fn linux_task_run_ns(tid: u64) -> Option<u64> {
-    let mut path = [0u8; 64];
-    let used = linux_task_path(tid, b"schedstat", &mut path);
-    let mut buf = [0u8; 128];
-    let n = linux_read_into(&path[..used], &mut buf)?;
-    let mut v: u64 = 0;
-    let mut any = false;
-    for c in buf.get(..n)? {
-        if !c.is_ascii_digit() {
-            break;
-        }
-        v = v.checked_mul(10)?.checked_add(u64::from(c - b'0'))?;
-        any = true;
+    // CPUCLOCK_PERTHREAD_MASK (4) | CPUCLOCK_SCHED (2), with the inverted tid above the low 3 bits.
+    let clock = ((!(i32::try_from(tid).ok()?)) << 3) | 6;
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: a valid out-pointer; a bad or foreign clock id only fails (EINVAL).
+    if unsafe { libc::clock_gettime(clock as libc::clockid_t, &mut ts) } != 0 {
+        return None;
     }
-    any.then_some(v)
+    u64::try_from(ts.tv_sec).ok()?.checked_mul(1_000_000_000)?.checked_add(u64::try_from(ts.tv_nsec).ok()?)
 }
 
 /// Each task id in /proc/self/task, given to `each`; `None` if the directory cannot be read. Raw
