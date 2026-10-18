@@ -151,11 +151,13 @@ def self_test():
     try:
         os.makedirs(os.path.join(t, "gates"))
         os.makedirs(os.path.join(t, "a"))
-        ok_py = 'import sys\nif sys.argv[1:] == ["self-test"]:\n    print("OK 1/1")\n    sys.exit(0)\n'
-        bad_py = 'import sys\nif sys.argv[1:] == ["self-test"]:\n    print("BAD 0/1")\n    sys.exit(1)\n'
+        # TEST EDIT, flagged (linux-rev-uw2 MED 1, the TALLY allowlist): the planted rows print the fixed tally line every
+        # row now must, at the values their own outcome implies; what each case checks is unchanged
+        ok_py = 'import sys\nif sys.argv[1:] == ["self-test"]:\n    print("OK 1/1")\n    print("TALLY ran=1 pass=1 na=0 fail=0")\n    sys.exit(0)\n'
+        bad_py = 'import sys\nif sys.argv[1:] == ["self-test"]:\n    print("BAD 0/1")\n    print("TALLY ran=1 pass=0 na=0 fail=1")\n    sys.exit(1)\n'
         open(os.path.join(t, "a", "good.py"), "w").write(ok_py)
         open(os.path.join(t, "a", "bad.py"), "w").write(bad_py)
-        open(os.path.join(t, "a", "lin_test.sh"), "w").write("exit 1\n")
+        open(os.path.join(t, "a", "lin_test.sh"), "w").write("echo 'TALLY ran=1 pass=0 na=0 fail=1'\nexit 1\n")
 
         def tsv(*rows):
             open(os.path.join(t, "gates", "platforms.tsv"), "w").write("# x\n" + "".join("\t".join(r) + "\n" for r in rows))
@@ -185,14 +187,15 @@ def self_test():
         cases.append(("nothing run (every row N/A) is not a pass: rc 1", rc == 1))
         # CLASS (the platform class, instance found 2026-10-15): a row's interpreter came from the CALLER's PATH, so the
         # same tree passed under vm_dryblock.sh (homebrew first on PATH) and failed run by hand on the Mac (/bin/bash
-        # 3.2: t3lib.sh's coproc, fixed_api_mutants' bash -n). A planted `bash` first on PATH that is not bash 4+ must
+        # 3.2: t3lib.sh's coproc, fixed_api_mutants' bash -n). A planted `bash` first on PATH that is not bash 5+ (BASH_MIN) must
         # not be the one a row runs under, nor the one its children run under
         fake = os.path.join(t, "fakebin")
         os.makedirs(fake)
         open(os.path.join(fake, "bash"), "w").write("#!/bin/sh\necho FAKE-BASH; exit 97\n")
         os.chmod(os.path.join(fake, "bash"), 0o755)
         open(os.path.join(t, "a", "v4_test.sh"), "w").write(
-            '[ "${BASH_VERSINFO[0]}" -ge 5 ] || exit 1\nbash -c \'[ "${BASH_VERSINFO[0]}" -ge 5 ]\' || exit 2\necho V5 ok\n')
+            '[ "${BASH_VERSINFO[0]}" -ge 5 ] || exit 1\nbash -c \'[ "${BASH_VERSINFO[0]}" -ge 5 ]\' || exit 2\necho V5 ok\n'
+            "echo 'TALLY ran=1 pass=1 na=0 fail=0'\n")
         tsv(("a/v4_test.sh", "", "any", "x"), ("a/bad.py", "self-test", "linux", "x"), ("a/lin_test.sh", "", "linux", "x"))
         old_path = os.environ.get("PATH", "")
         os.environ["PATH"] = fake + os.pathsep + old_path
@@ -210,7 +213,8 @@ def self_test():
         # the run counts it apart from the passes with its cause, and exits 3, which t3run's selftests stage
         # (rc 0 only) refuses; a row that prints an N/A line but exits 0 is refused outright
         open(os.path.join(t, "a", "na3.py"), "w").write(
-            'import sys\nif sys.argv[1:] == ["self-test"]:\n    print("N/A-on-busy-host: case x")\n    sys.exit(3)\n')
+            'import sys\nif sys.argv[1:] == ["self-test"]:\n    print("N/A-on-busy-host: case x")\n'
+            '    print("TALLY ran=0 pass=0 na=1 fail=0")\n    sys.exit(3)\n')
         open(os.path.join(t, "a", "na0.py"), "w").write(
             'import sys\nif sys.argv[1:] == ["self-test"]:\n    print("N/A-on-noroot: case y")\n    sys.exit(0)\n')
         open(os.path.join(t, "a", "good.py"), "w").write(ok_py)
@@ -231,6 +235,44 @@ def self_test():
                       rc == 1 and any("a/na0.py" in ln and "an N/A must exit 3" in ln for ln in lines)))
         for f_ in ("na0.py", "na3.py"):
             os.remove(os.path.join(t, "a", f_))
+        # linux-rev-uw2 MED 1: an outcome ALLOWLIST, not a wording match. Every row prints one fixed tally line, and a
+        # row with no tally, or a tally that disagrees with its rc, is REFUSED; so is the reviewer's respelled skip
+        # ("SKIPPED (no root)", exit 0, no tally). Run through the CLI, so this red fails at its claim, not at setup
+        def cli(root, *extra):
+            r = subprocess.run([sys.executable, "-B", os.path.abspath(__file__), root, *extra], capture_output=True,
+                               text=True, timeout=600)
+            return r.returncode, r.stdout
+        def rows(*specs):
+            for f_ in os.listdir(os.path.join(t, "a")):
+                os.remove(os.path.join(t, "a", f_))
+            for name, body in specs:
+                open(os.path.join(t, "a", name), "w").write(
+                    'import sys\nif sys.argv[1:] == ["self-test"]:\n' + "".join(f"    {ln}\n" for ln in body))
+            tsv(*[(f"a/{name}", "self-test", "any", "x") for name, _ in specs])
+        good = ('print("TALLY ran=2 pass=2 na=0 fail=0")', "sys.exit(0)")
+        rows(("good.py", good), ("respelled.py", ('print("SKIPPED (no root): case y")', "sys.exit(0)")))
+        rc, out = cli(t)
+        cases.append(("uw2 MED 1: the reviewer's respelled skip ('SKIPPED (no root)', exit 0, no tally) is REFUSED",
+                      rc == 1 and "respelled.py" in out and "no TALLY" in out))
+        rows(("good.py", good), ("lies.py", ('print("TALLY ran=1 pass=1 na=1 fail=0")', "sys.exit(0)")))
+        rc, out = cli(t)
+        cases.append(("uw2 MED 1: a tally with na=1 under exit 0 is REFUSED (the tally and the rc disagree)",
+                      rc == 1 and "lies.py" in out and "disagree" in out))
+        rows(("good.py", good), ("failna.py", ('print("FAIL: case z")', 'print("TALLY ran=1 pass=0 na=1 fail=1")', "sys.exit(3)")))
+        rc, out = cli(t)
+        cases.append(("uw2 LOW 5: a row that failed a case is never classed N/A, whatever its rc",
+                      rc == 1 and "failna.py" in out and "N/A failna.py" not in out))
+        rows(("good.py", good), ("na3.py", ('print("N/A-on-busy-host: case w")', 'print("TALLY ran=0 pass=0 na=1 fail=0")', "sys.exit(3)")))
+        rc, out = cli(t, "--allow-na", "darwin")
+        cases.append(("uw2 LOW 5: with --allow-na darwin, a busy-host N/A is refused (rc 1); only the allowed cause is rc 3",
+                      rc == 1 and "busy-host" in out))
+        rc, out = cli(t)
+        cases.append(("uw2 MED 1: an honest tally (na=1, exit 3) is the N/A outcome, rc 3", rc == 3 and "N/A a/na3.py" in out))
+        for f_ in os.listdir(os.path.join(t, "a")):
+            os.remove(os.path.join(t, "a", f_))
+        open(os.path.join(t, "a", "good.py"), "w").write(ok_py)
+        open(os.path.join(t, "a", "bad.py"), "w").write(bad_py)
+        open(os.path.join(t, "a", "lin_test.sh"), "w").write("echo 'TALLY ran=1 pass=0 na=0 fail=1'\nexit 1\n")
         # LOW 5: BASH_MIN fired: a bash reporting major 4 is never chosen, a fake one and, where the host has one,
         # a real one (macOS /bin/bash 3.2, RHEL 8 /bin/bash 4.4)
         f4 = os.path.join(t, "bash4")

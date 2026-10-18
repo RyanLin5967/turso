@@ -9,7 +9,15 @@ ROOT=$(git -C "$(dirname "$0")" rev-parse --show-toplevel 2> /dev/null) || ROOT=
 [ -f "$ROOT/core/Cargo.toml" ] || { echo "REFUSED: no core/Cargo.toml under $ROOT"; exit 2; }
 command -v cargo > /dev/null || { echo "REFUSED: cargo is not on PATH"; exit 2; }
 cd "$ROOT" || exit 2
-out=$(timeout 3600 cargo check -p turso_core --all-targets --features conn_raw_api 2>&1); rc=$?
+# linux-rev-uw2 LOW 8: --all-targets SKIPS a target whose required-features are not enabled, silently. Every feature
+# any [[bench]], [[example]] or [[test]] of core/Cargo.toml requires must be in FEATURES, or this refuses, naming it
+FEATURES=conn_raw_api
+req=$(awk '/^\[\[(bench|example|test)\]\]/{t=1} /^\[/ && !/^\[\[(bench|example|test)\]\]/{t=0} t && /^required-features/' core/Cargo.toml |
+      grep -oE '"[A-Za-z0-9_-]+"' | tr -d '"' | sort -u)
+miss=""
+for f in $req; do [[ ",$FEATURES," == *",$f,"* ]] || miss="$miss $f"; done
+[ -z "$miss" ] || { echo "CARGO-ALL-TARGETS FAIL: targets need features not checked here (cargo skips them):$miss"; exit 1; }
+out=$(timeout 3600 cargo check -p turso_core --all-targets --features "$FEATURES" 2>&1); rc=$?
 printf '%s\n' "$out" | grep -E '^error|could not compile' | head -20
 [ $rc = 0 ] && echo "CARGO-ALL-TARGETS PASS: cargo check -p turso_core --all-targets --features conn_raw_api" ||
   echo "CARGO-ALL-TARGETS FAIL: rc $rc"

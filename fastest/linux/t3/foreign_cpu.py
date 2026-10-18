@@ -297,15 +297,17 @@ def self_test():
 
     # linux-rev-uw1 MED 3: busy-host evidence comes from the WINDOW's own samples (a ps CPU% is a lifetime average:
     # the reviewer's 30 s burner read 57-94% while idle), of a foreign, non-kernel process outside the test's tree
-    def evid(label, rows, exclude=()):
+    def evid(label, rows, exclude=(), gap_at=None):
         f = os.path.join(d, f"evid-{label}.tsv")
         with open(f, "w") as o:
             o.write("#start\t0\tcell=ST\tinterval=1.0\tload=()\n")
+            t_ = 0.0
             for i in range(20):
+                t_ += 4.0 if gap_at == i else 1.0
                 for pid, comm, pct, kind, start, n in rows:
                     if start <= i < start + n:
-                        o.write(f"{i + 1.0:.3f}\t{pid}\t{comm}\t{pct}\t{kind}\n")
-                o.write(f"#tick\t{i + 1.0:.3f}\t0\t0.0\t50.0\n")
+                        o.write(f"{t_:.3f}\t{pid}\t{comm}\t{pct}\t{kind}\n")
+                o.write(f"#tick\t{t_:.3f}\t0\t0.0\t50.0\n")
             o.write("#stop\t20.000\tstop-file\tload=()\n")
         return busy_evidence(f, exclude)
     synthetic_evid = [
@@ -319,6 +321,10 @@ def self_test():
          evid("ours", [(10, "python3", 99.0, "foreign", 0, 20)], exclude={10}) == []),
         ("MED 3: 60% for only 4 samples (under rule 2's 5 s) is no evidence",
          evid("brief", [(11, "java", 60.0, "foreign", 3, 4)]) == []),
+        # linux-rev-uw2 LOW 3: the evidence is the process decide() NAMED for the VOID, and only when every VOID reason
+        # is a foreign process: a record that is also unusable (here a 4 s gap) is not a busy host, burner or not
+        ("uw2 LOW 3: a VOID that is also an unusable record (a 4 s gap) is no busy-host evidence, burner or not",
+         evid("gap", [(12, "java", 90.0, "foreign", 2, 15)], gap_at=8) == []),
     ]
     for label, ok in synthetic_evid:
         bad += not ok

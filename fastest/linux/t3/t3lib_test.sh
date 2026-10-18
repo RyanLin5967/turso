@@ -506,6 +506,11 @@ chmod +x "$T/sudo/pw" "$T/sudo/ok" "$T/sudo/err"
 check "LOW 6: sudo_state: no sudo at all is 'absent'" '[ "$(T3_SUDO_BIN=$T/sudo/none sudo_state)" = absent ]'
 check "LOW 6: sudo_state: a sudo that needs a password is 'password'" '[ "$(T3_SUDO_BIN=$T/sudo/pw sudo_state)" = password ]'
 check "LOW 6: sudo_state: passwordless sudo is 'ok'" '[ "$(T3_SUDO_BIN=$T/sudo/ok sudo_state)" = ok ]'
+# linux-rev-uw2 LOW 7: sudo's message is localised (de_DE gave "Ein Passwort ist notwendig"); sudo_state asks it in C
+printf '#!/bin/sh\nif [ "${LC_ALL:-}" = C ]; then echo "sudo: a password is required" >&2; else echo "sudo: Ein Passwort ist notwendig" >&2; fi\nexit 1\n' > "$T/sudo/de"
+chmod +x "$T/sudo/de"
+check "uw2 LOW 7: sudo_state reads a localised sudo (de_DE) as 'password', asking it in the C locale" \
+  '[ "$(LANG=de_DE.UTF-8 LC_ALL=de_DE.UTF-8 T3_SUDO_BIN=$T/sudo/de sudo_state)" = password ]'
 check "LOW 6: sudo_state: any other sudo failure is an error, named" \
   'case "$(T3_SUDO_BIN=$T/sudo/err sudo_state)" in error:*resolve*) true ;; *) false ;; esac'
 
