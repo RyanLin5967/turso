@@ -3284,6 +3284,78 @@ fn the_bump_site_scan_sees_a_site_move_between_functions_of_one_file() {
     assert_ne!(bump_sites(before), bump_sites(after), "CLAIM: a bump moved between functions of one file is invisible to the scan");
 }
 
+/// fastest-wire (the ONE QUOTING FUNCTION class, core side; wire 98ca163a2 on iccad11): engine text that names a
+/// database, table or view interpolated the name unquoted, so a name holding a quote or a space broke the text the
+/// engine itself built. Instances, each a case here:
+/// - `op_parse_schema`'s `{db}.sqlite_schema` (vdbe/execute.rs): CREATE TABLE in an attached database `s"x`;
+/// - ALTER's `schema_table_name_for_db` (translate/alter.rs): ALTER TABLE in it;
+/// - the stored CREATE VIEW text (translate/view.rs): a view `v"x`, reopened;
+/// - DROP/RENAME COLUMN's view probe `SELECT * FROM {view}` (vdbe/execute.rs): a view `w x` over the altered table;
+/// - the CDC table's DDL and lookups (vdbe/execute.rs): a capture table `my cdc`.
+/// Every case runs and every failure is listed. At 8d6f81233 the attached case failed with "non-terminated literal".
+#[test]
+fn engine_text_quotes_every_name_it_interpolates() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("quoting.db");
+    let side = dir.path().join("side.db");
+    let mut failed: Vec<String> = Vec::new();
+    {
+        let db = open_at(&path, DatabaseOpts::new());
+        let c = db.connect().unwrap();
+        let mut case = |name: &str, sqls: &[String]| {
+            for sql in sqls {
+                if let Err(e) = c.execute(sql) {
+                    failed.push(format!("{name}: {sql}: {e}"));
+                    return;
+                }
+            }
+        };
+        case(
+            "attached database s\"x",
+            &[
+                format!("ATTACH '{}' AS \"s\"\"x\"", side.to_str().unwrap()),
+                "CREATE TABLE \"s\"\"x\".t(a)".into(),
+                "INSERT INTO \"s\"\"x\".t VALUES (1)".into(),
+                "ALTER TABLE \"s\"\"x\".t ADD COLUMN b".into(),
+                "CREATE INDEX \"s\"\"x\".ti ON t(a)".into(),
+                "DROP TABLE \"s\"\"x\".t".into(),
+            ],
+        );
+        case("view v\"x", &["CREATE VIEW \"v\"\"x\" AS SELECT 1 AS a".into()]);
+        case(
+            "view w x over an altered table",
+            &[
+                "CREATE TABLE base(a, b)".into(),
+                "CREATE VIEW \"w x\" AS SELECT a FROM base".into(),
+                "ALTER TABLE base DROP COLUMN b".into(),
+                "ALTER TABLE base RENAME COLUMN a TO a2".into(),
+            ],
+        );
+        case(
+            "CDC table my cdc",
+            &[
+                "PRAGMA capture_data_changes_conn('full,my cdc')".into(),
+                "CREATE TABLE z(a)".into(),
+                "INSERT INTO z VALUES (1)".into(),
+            ],
+        );
+        if !failed.iter().any(|f| f.starts_with("CDC")) {
+            match c.prepare("SELECT count(*) FROM \"my cdc\"").and_then(|mut s| s.run_collect_rows()) {
+                Ok(rows) if rows.first().and_then(|r| r.first()).is_some_and(|v| v.to_string() != "0") => {}
+                other => failed.push(format!("CDC table my cdc: no captured row: {other:?}")),
+            }
+        }
+    }
+    let db = open_at(&path, DatabaseOpts::new());
+    let c = db.connect().unwrap();
+    for (name, sql) in [("view v\"x, reopened", "SELECT a FROM \"v\"\"x\""), ("view w x, reopened", "SELECT * FROM \"w x\"")] {
+        if let Err(e) = c.prepare(sql).and_then(|mut s| s.run_collect_rows()) {
+            failed.push(format!("{name}: {sql}: {e}"));
+        }
+    }
+    assert!(failed.is_empty(), "CLAIM: engine-built text broke on a name it did not quote: {failed:#?}");
+}
+
 /// Review c42b LOW-B: the attached-schemas fold sees a changed set whose versions sum the same
 /// (x 4 -> 12 while s at 10 is replaced by s2 at 2: a plain sum stayed 14 and saw nothing), and it
 /// does not depend on the catalog's iteration order. No red at the base: the fold is new.
