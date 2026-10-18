@@ -15498,6 +15498,96 @@ fn a_schema_whose_name_needs_quoting_holds_tables_and_keeps_its_case() {
     if !names.contains("MixedCase") {
         wrong.push(format!("the quoted name MixedCase was not kept as written: {names}"));
     }
+    // The reviewer's DROP arms (wire-rev-uw2 MED, c1 and c6), as PostgreSQL answers them: "Foo"
+    // and foo are two names, so DROP SCHEMA foo is 3F000 and "Foo" stays; "MixedCase" drops by
+    // its own name.
+    let (ok, _) = cli_one(&dir, "CREATE SCHEMA \"Foo\"");
+    if !ok {
+        wrong.push("CREATE SCHEMA \"Foo\"".to_string());
+    }
+    let (ok, out) = cli_one(&dir, "DROP SCHEMA foo");
+    if ok || !out.contains("schema \"foo\" does not exist") {
+        wrong.push(format!("DROP SCHEMA foo with only \"Foo\": ok {ok}: {out}"));
+    }
+    let (ok, out) = cli_one(&dir, "DROP SCHEMA \"MixedCase\" CASCADE");
+    if !ok {
+        wrong.push(format!("DROP SCHEMA \"MixedCase\" CASCADE: {out}"));
+    }
+    let (_, names) = cli_one(&dir, "SELECT nspname FROM pg_namespace ORDER BY nspname");
+    if !names.contains("Foo") || names.to_lowercase().contains("mixedcase") {
+        wrong.push(format!("after the DROPs, want Foo and no MixedCase: {names}"));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-uw2 MED, b2284ce36's schema-name regressions (the reviewer's c1, c6, c5, RAN against
+/// the base). The engine folds an attached database's name, so a schema created as "Foo" is its
+/// foo; the frontend then looked the name up as written and derived the file to delete from the
+/// name it was given: `CREATE SCHEMA "Foo"; DROP SCHEMA foo` answered DROP SCHEMA and left
+/// "Foo"'s file, so the schema came back at the next open; `DROP SCHEMA "MixedCase"` was 3F000
+/// 'does not exist'; and the files an earlier version named with a schema's raw text holding `%`
+/// (a%zz, p%) no longer attached, and q%41 attached as qa. Whatever DROP SCHEMA answers, a
+/// schema it reports dropped is gone with its file, and one it refuses stays; a mixed-case schema
+/// drops by its own name; an old raw file attaches by its raw name, as at the base.
+#[test]
+fn a_schemas_file_goes_with_the_schema_the_engine_dropped() {
+    let dir = Scratch::new("schema-file-names");
+    let files = |dir: &Scratch| {
+        let mut names: Vec<String> = std::fs::read_dir(&dir.0)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with("turso-postgres-schema-") && n.ends_with(".db"))
+            .collect();
+        names.sort();
+        names
+    };
+    let listed = |dir: &Scratch, name: &str| {
+        let (_, names) = cli_one(dir, "SELECT nspname FROM pg_namespace ORDER BY nspname");
+        names.lines().any(|l| l.split('│').any(|c| c.trim() == name))
+    };
+    let mut wrong = Vec::new();
+    let (ok, out) = cli_one(&dir, "CREATE SCHEMA \"Foo\"");
+    if !ok {
+        wrong.push(format!("CREATE SCHEMA \"Foo\": {out}"));
+    }
+    let (dropped, out) = cli_one(&dir, "DROP SCHEMA foo");
+    let foo_listed = listed(&dir, "foo") || listed(&dir, "Foo");
+    if dropped && (foo_listed || !files(&dir).is_empty()) {
+        wrong.push(format!(
+            "DROP SCHEMA foo answered success, then at the next open: listed {foo_listed}, files {:?}",
+            files(&dir)
+        ));
+    }
+    if !dropped && (!out.contains("does not exist") || !foo_listed) {
+        wrong.push(format!("DROP SCHEMA foo refused, and the schema is listed {foo_listed}: {out}"));
+    }
+    let _ = cli_one(&dir, "DROP SCHEMA IF EXISTS \"Foo\"");
+    let (ok, out) = cli_one(&dir, "CREATE SCHEMA \"MixedCase\"");
+    if !ok {
+        wrong.push(format!("CREATE SCHEMA \"MixedCase\": {out}"));
+    }
+    let (ok, out) = cli_one(&dir, "DROP SCHEMA \"MixedCase\"");
+    if !ok {
+        wrong.push(format!("DROP SCHEMA \"MixedCase\" by its own name: {out}"));
+    }
+    if listed(&dir, "mixedcase") || listed(&dir, "MixedCase") || !files(&dir).is_empty() {
+        wrong.push(format!("after DROP SCHEMA \"MixedCase\": files {:?}", files(&dir)));
+    }
+    let (ok, out) = cli_one(&dir, "CREATE SCHEMA qz");
+    if !ok {
+        wrong.push(format!("CREATE SCHEMA qz: {out}"));
+    }
+    let source = dir.0.join("turso-postgres-schema-qz.db");
+    for raw in ["a%zz", "q%41", "p%"] {
+        std::fs::copy(&source, dir.0.join(format!("turso-postgres-schema-{raw}.db"))).unwrap();
+    }
+    for raw in ["a%zz", "q%41", "p%", "qz"] {
+        if !listed(&dir, raw) {
+            let (_, names) = cli_one(&dir, "SELECT nspname FROM pg_namespace ORDER BY nspname");
+            wrong.push(format!("the old raw file of {raw} did not attach as {raw}: {names}"));
+        }
+    }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
