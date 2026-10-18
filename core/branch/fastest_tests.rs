@@ -3291,7 +3291,9 @@ fn the_bump_site_scan_sees_a_site_move_between_functions_of_one_file() {
 /// - ALTER's `schema_table_name_for_db` (translate/alter.rs): ALTER TABLE in it;
 /// - the stored CREATE VIEW text (translate/view.rs): a view `v"x`, reopened;
 /// - DROP/RENAME COLUMN's view probe `SELECT * FROM {view}` (vdbe/execute.rs): a view `w x` over the altered table;
-/// - the CDC table's DDL and lookups (vdbe/execute.rs): a capture table `my cdc`.
+/// - the CDC table's DDL and lookups (vdbe/execute.rs): a capture table `my cdc`;
+/// - the same probes for an ATTACHED database's views, which named the view unqualified (so they resolved in main):
+///   a view vv of `s"x` over a table that renames and drops a column.
 /// Every case runs and every failure is listed. At 8d6f81233 the attached case failed with "non-terminated literal".
 #[test]
 fn engine_text_quotes_every_name_it_interpolates() {
@@ -3319,6 +3321,15 @@ fn engine_text_quotes_every_name_it_interpolates() {
                 "ALTER TABLE \"s\"\"x\".t ADD COLUMN b".into(),
                 "CREATE INDEX \"s\"\"x\".ti ON t(a)".into(),
                 "DROP TABLE \"s\"\"x\".t".into(),
+            ],
+        );
+        case(
+            "a view of an attached database, probed in that database",
+            &[
+                "CREATE TABLE \"s\"\"x\".base2(a, b)".into(),
+                "CREATE VIEW \"s\"\"x\".vv AS SELECT a FROM base2".into(),
+                "ALTER TABLE \"s\"\"x\".base2 RENAME COLUMN b TO b2".into(),
+                "ALTER TABLE \"s\"\"x\".base2 DROP COLUMN b2".into(),
             ],
         );
         case("view v\"x", &["CREATE VIEW \"v\"\"x\" AS SELECT 1 AS a".into()]);
