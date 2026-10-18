@@ -949,11 +949,13 @@ pub fn attach_schema_files(conn: &PgConnection, db_file: &str) {
             continue;
         };
         let Some(schema) = name
-            .strip_prefix("turso-postgres-schema-")
+            .strip_prefix(SCHEMA_FILE_PREFIX)
             .and_then(|s| s.strip_suffix(".db"))
+            .and_then(schema_of_file_name)
         else {
             continue;
         };
+        let schema = schema.as_str();
         let path = entry.path().to_string_lossy().to_string();
         let sql = catalog::sqlite_text(format!(
             "ATTACH {} AS {}",
@@ -2470,7 +2472,9 @@ fn handle_pg_show(pg_conn: &Arc<PgConnectionInner>, show: &PgShowStmt) -> Result
 }
 
 fn handle_pg_create_schema(conn: &Arc<Connection>, stmt: &PgCreateSchemaStmt) -> Result<()> {
-    let name = stmt.name.to_lowercase();
+    // As libpg_query gives it: an unquoted name already lowercased, a quoted one as written
+    // (review wire-quote LOW-4: a quoted name was lowercased here).
+    let name = stmt.name.clone();
     if name == "public" {
         if stmt.if_not_exists {
             return Ok(());
@@ -2501,9 +2505,49 @@ fn handle_pg_create_schema(conn: &Arc<Connection>, stmt: &PgCreateSchemaStmt) ->
     Ok(())
 }
 
+/// The prefix of every schema's database file, beside the main database.
+const SCHEMA_FILE_PREFIX: &str = "turso-postgres-schema-";
+
+/// A schema's name as a file name (review wire-quote LOW-4): ASCII letters, digits and `_` as
+/// they are, every other byte `%XX`, so no name is a path (`/`, `..`, a NUL) and every name
+/// round-trips ([`schema_of_file_name`]). A plain name's file is named as before.
+fn schema_file_name(schema: &str) -> String {
+    let mut out = String::with_capacity(schema.len());
+    for b in schema.bytes() {
+        if b.is_ascii_alphanumeric() || b == b'_' {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// [`schema_file_name`] read back; None for a file name it never writes. A file an earlier version
+/// named with the schema's raw text (a quote, a space) reads as that text, so it attaches as before.
+fn schema_of_file_name(name: &str) -> Option<String> {
+    if !name.contains('%') {
+        return Some(name.to_string());
+    }
+    let b = name.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' {
+            let hex = name.get(i + 1..i + 3)?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
 fn schema_file_path(conn: &Connection, schema_name: &str) -> String {
     let main_path = conn.db_file_path();
-    let filename = format!("turso-postgres-schema-{schema_name}.db");
+    let filename = format!("{SCHEMA_FILE_PREFIX}{}.db", schema_file_name(schema_name));
     if main_path == ":memory:" {
         filename
     } else {
@@ -2516,7 +2560,9 @@ fn schema_file_path(conn: &Connection, schema_name: &str) -> String {
 
 fn handle_pg_drop_schema(pg_conn: &Arc<PgConnectionInner>, stmt: &PgDropSchemaStmt) -> Result<()> {
     let conn = &pg_conn.conn;
-    let name = stmt.name.to_lowercase();
+    // As libpg_query gives it: an unquoted name already lowercased, a quoted one as written
+    // (review wire-quote LOW-4: a quoted name was lowercased here).
+    let name = stmt.name.clone();
     if name == "public" {
         return handle_pg_drop_schema_public(conn, stmt.cascade);
     }
