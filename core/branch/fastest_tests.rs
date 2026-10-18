@@ -15672,3 +15672,39 @@ fn async_creates_are_listed_and_found_at_once() {
     assert_eq!(found, Some(created.id), "CLAIM: the async create is found by name at once");
     assert!(held, "premise: the flusher was held");
 }
+
+/// LEAP L2(b) across a directory segment (engine-rev-l2b MED: the budget red's growth cell stops at
+/// 33,040 ids, inside the first 65,536-id segment, so a segment taken from the pool was never
+/// exercised): 16 threads create 72,000 named branches, past the first segment, and no create
+/// allocates more than 8 KiB under the store mutex (a chunk is about 23,552 B, a segment 24 KiB).
+#[test]
+fn no_create_allocates_a_table_chunk_or_segment_under_the_mutex_across_a_segment() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("seg.db"), opts(true, SyncClass::Fsync));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let worst: u64 = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..16u64)
+            .map(|t| {
+                let db = &db;
+                s.spawn(move || {
+                    let c = db.connect().unwrap();
+                    let mut worst = 0;
+                    for i in 0..4_500u64 {
+                        let name = format!("seg-{t}-{i}");
+                        let a = super::budget_probe::thread_allocs();
+                        c.create_branch(&name).unwrap();
+                        let b = super::budget_probe::thread_allocs();
+                        worst = worst.max(b.3 - a.3);
+                    }
+                    worst
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).max().unwrap()
+    });
+    let live = db.branch_ids().unwrap().len();
+    assert!(live >= 72_000, "premise: the table grew past one 65,536-id segment ({live} live)");
+    assert!(worst <= 8 << 10, "CLAIM: no create allocated more than 8 KiB under the store mutex across a segment; one allocated {worst}");
+}
