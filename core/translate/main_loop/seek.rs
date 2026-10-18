@@ -29,6 +29,7 @@ fn encode_seek_keys_for_custom_types(
     start_reg: usize,
     num_keys: usize,
     idx_col_offset: usize,
+    keys: &[Option<&turso_parser::ast::Expr>],
     loop_end: BranchOffset,
     resolver: &Resolver<'_>,
 ) -> crate::Result<()> {
@@ -76,11 +77,22 @@ fn encode_seek_keys_for_custom_types(
                     column: table_col,
                     type_def: &**type_def,
                     eq_func,
+                    key_takes_operator: keys.get(i).copied().flatten().is_none_or(|k| {
+                        crate::translate::expr::key_takes_type_operator(
+                            k,
+                            &table_col.ty_str,
+                            type_def,
+                            Some(tables),
+                            resolver,
+                        )
+                    }),
                     loop_end,
                     done: skip_label,
                 },
                 resolver,
             )?;
+        } else if !crate::branch::store::fe_mutant("seek_key_encodes_raising_plain") {
+            emit_seek_key_encode_or_empty_plain(program, encode_expr, reg, table_col, type_def, loop_end, resolver)?;
         } else {
             crate::translate::expr::emit_type_expr(
                 program,
@@ -105,6 +117,9 @@ struct SeekKeyEncode<'a> {
     column: &'a crate::schema::Column,
     type_def: &'a crate::schema::TypeDef,
     eq_func: &'a str,
+    /// Whether the equality the key comes from compares through the type's operator
+    /// (`key_takes_type_operator`), so a scan passes the key to `eq_func`.
+    key_takes_operator: bool,
     /// The seek's loop end: an empty seek.
     loop_end: BranchOffset,
     /// Past the key's encoding.
@@ -132,6 +147,8 @@ struct SeekKeyEncode<'a> {
 ///   Goto done
 /// refused:
 ///   CatchEnd
+///   equal   = eq_func(key, key)    ; raises as the scan would (engine review 20 item 6),
+///                                  ; for a key the type's operator takes only
 ///   Goto loop_end
 /// ```
 fn emit_seek_key_encode_or_empty(
@@ -189,7 +206,7 @@ fn emit_seek_key_encode_or_empty(
         start_reg: args,
         dest: equal,
         func: crate::function::FuncCtx {
-            func,
+            func: func.clone(),
             arg_count: 2,
         },
     });
@@ -209,9 +226,87 @@ fn emit_seek_key_encode_or_empty(
     });
     program.preassign_label_to_next_insn(refused);
     program.emit_insn(Insn::CatchEnd);
+    // Engine review 20 item 6: a refusal was caught whole, so a key the type's own '=' raises on
+    // (numeric's 'abc', a blob operand) answered an empty seek where a scan raises. The key is
+    // compared with itself under that '=', outside the catch region: what raises there raises, as
+    // the scan's first comparison would; a key it accepts equals no stored value (its ENCODE
+    // refused it), so the seek is empty. Mutant `seek_refusal_swallowed` (test builds only): no
+    // comparison, as before. A key the type's operator does not take (a TEXT join column against
+    // numeric) meets the plain comparison in a scan, which never raises on it, so it is not
+    // compared (b36ed9367's red: the item-6 comparison raised on 'x' where the scan answered).
+    // Mutant `refusal_compares_any_key` (test builds only): every key is compared, as 3481755a6.
+    if !crate::branch::store::fe_mutant("seek_refusal_swallowed")
+        && (key.key_takes_operator || crate::branch::store::fe_mutant("refusal_compares_any_key"))
+    {
+        program.emit_insn(Insn::Copy {
+            src_reg: key.reg,
+            dst_reg: args,
+            extra_amount: 0,
+        });
+        program.emit_insn(Insn::Copy {
+            src_reg: key.reg,
+            dst_reg: args + 1,
+            extra_amount: 0,
+        });
+        program.emit_insn(Insn::Function {
+            constant_mask: 0,
+            start_reg: args,
+            dest: equal,
+            func: crate::function::FuncCtx { func, arg_count: 2 },
+        });
+    }
     program.emit_insn(Insn::Goto {
         target_pc: key.loop_end,
     });
+    Ok(())
+}
+
+/// Engine review 20 item 9: a seek key of a custom type with no function '=' (varchar(n),
+/// smallint, the date/time types: a RAISE in the ENCODE, a bare '<'), ENCODEd inside a catch region
+/// into a register of its own (`Insn::CatchBegin`; a RAISE jumps too). A key the ENCODE refuses
+/// ('value too long', 'out of range') equals no stored value, so the seek is empty: what the scan
+/// and PostgreSQL answer, where it raised. Otherwise the key becomes its encoding, as before.
+/// Mutant `seek_key_encodes_raising_plain` (test builds only): ENCODEd in place, as before.
+///
+/// ```text
+///   CatchBegin refused
+///   encoded = ENCODE(key)          ; RAISE -> Goto refused
+///   CatchEnd
+///   key = encoded
+///   Goto done
+/// refused:
+///   CatchEnd
+///   Goto loop_end
+/// done:
+/// ```
+fn emit_seek_key_encode_or_empty_plain(
+    program: &mut ProgramBuilder,
+    encode_expr: &turso_parser::ast::Expr,
+    reg: usize,
+    column: &crate::schema::Column,
+    type_def: &crate::schema::TypeDef,
+    loop_end: BranchOffset,
+    resolver: &Resolver<'_>,
+) -> crate::Result<()> {
+    let refused = program.allocate_label();
+    let done = program.allocate_label();
+    let encoded = program.alloc_register();
+    program.emit_insn(Insn::CatchBegin { target_pc: refused });
+    let outer = program.catch_raise_target.replace(refused);
+    let encode = crate::translate::expr::emit_type_expr(program, encode_expr, reg, encoded, column, type_def, resolver);
+    program.catch_raise_target = outer;
+    encode?;
+    program.emit_insn(Insn::CatchEnd);
+    program.emit_insn(Insn::Copy {
+        src_reg: encoded,
+        dst_reg: reg,
+        extra_amount: 0,
+    });
+    program.emit_insn(Insn::Goto { target_pc: done });
+    program.preassign_label_to_next_insn(refused);
+    program.emit_insn(Insn::CatchEnd);
+    program.emit_insn(Insn::Goto { target_pc: loop_end });
+    program.preassign_label_to_next_insn(done);
     Ok(())
 }
 
@@ -349,6 +444,14 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
         let null_matching_mask = NullMatchingMask::from(null_matching_bits);
 
         if let Some(idx) = self.seek_index {
+            let keys: Vec<Option<&Expr>> = self
+                .seek_def
+                .iter(&self.seek_def.start)
+                .map(|key| match key {
+                    SeekKeyComponent::Expr(expr) => Some(expr),
+                    _ => None,
+                })
+                .collect();
             encode_seek_keys_for_custom_types(
                 self.program,
                 self.tables,
@@ -356,6 +459,7 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                 self.start_reg,
                 num_regs,
                 0,
+                &keys,
                 self.loop_end,
                 &self.t_ctx.resolver,
             )?;
@@ -484,6 +588,7 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                         last_reg,
                         1,
                         self.seek_def.prefix.len(),
+                        &[Some(expr)],
                         self.loop_end,
                         &self.t_ctx.resolver,
                     )?;
