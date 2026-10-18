@@ -103,7 +103,7 @@ def owners_at_stop(pid, uid, roots=None):
     return (uid, _login(uid), "?") if uid == os.getuid() else (uid, "-", "-")
 
 
-def read_procs(cell):
+def read_procs(cell, anc=None):
     """pid -> (comm, cpu_ticks, class). A process is sut when its environ carries FASTEST_CELL=<cell> OR any ancestor
     (by ppid, within this snapshot) is sut: a child of the system under test is the system under test, even when its
     environ no longer says so (PostgreSQL's ps display clobbers the environ area of every process it forks: the first
@@ -152,6 +152,8 @@ def read_procs(cell):
             seen.add(q)
             if out[q][2] == "sut":
                 out[pid] = (comm, ticks, "sut")
+                if anc is not None:
+                    anc.add(pid)  # SUT by ancestry, not by its own marker (linux-rev-uw5 L1)
                 break
             q = ppid.get(q)
     return out
@@ -159,7 +161,8 @@ def read_procs(cell):
 
 def sample(path, cell, interval, stop_file, max_s):
     t0 = time.monotonic()
-    prev = read_procs(cell)
+    anc = set()
+    prev = read_procs(cell, anc)
     prev_t = t0
     owned = {}
     with open(path, "w") as f:
@@ -167,7 +170,7 @@ def sample(path, cell, interval, stop_file, max_s):
         while True:
             time.sleep(interval)
             now = time.monotonic()
-            cur = read_procs(cell)
+            cur = read_procs(cell, anc)
             dt = now - prev_t
             sums = {"foreign": 0.0, "kernel": 0.0, "sut": 0.0}
             for pid, (comm, ticks, cls) in cur.items():
@@ -195,6 +198,9 @@ def sample(path, cell, interval, stop_file, max_s):
                     o = owners_at_stop(opid, ouid)
                     if o:
                         f.write(f"#owner\t{opid}\t{o[0]}\t{o[1]}\t{o[2]}\n")
+                # every pid that was SUT only by ancestry (its own environ had no marker): burners_ran's child proof
+                for apid in sorted(anc):
+                    f.write(f"#anc\t{apid}\n")
                 return 0
 
 
@@ -263,7 +269,8 @@ def burners_ran(v, burners, mine, rec=None):
     linux-rev-uw4 MED 1: sut_max is the SUT TOTAL, so a parent burning alone satisfied a "child" case (mutants F1, no
     child forked, and F2, also without the ancestry rule, survived). A "child" burner is seen only when the record REC
     has a sut-class process that is NOT in MINE (the child is the parent's own fork, so never in MINE) at 80% or more
-    for 5 samples or more (rule 2's run-length); without REC a child is never seen."""
+    for 5 samples or more (rule 2's run-length), and that the sampler recorded as SUT BY ANCESTRY (an #anc row:
+    its own environ had no marker; linux-rev-uw5 L1); without REC a child is never seen."""
     sut = [b for b in burners if b[0] is True or b[0] == "child"]
     foreign = [b for b in burners if b[0] is False]
     if sut and (v.get("sut_max") or 0.0) < 80.0 * len(sut):
@@ -276,13 +283,17 @@ def burners_ran(v, burners, mine, rec=None):
     if children:
         if rec is None:
             return False
-        hot = {}
+        hot, by_anc = {}, set()
         for line in open(rec):
             p = line.rstrip("\n").split("\t")
+            if p[0] == "#anc" and len(p) == 2:
+                by_anc.add(int(p[1]))
             if not p[0].startswith("#") and len(p) == 5 and p[4] == "sut" and int(p[1]) not in mine \
                     and 80.0 <= float(p[3]) <= 120.0:
                 hot[int(p[1])] = hot.get(int(p[1]), 0) + 1
-        if sum(1 for n in hot.values() if n >= 5) < len(children):
+        # linux-rev-uw5 L1: and it must be SUT BY ANCESTRY (an #anc row): a child that inherited the marker is SUT on its
+        # own environ, so it would pass with the production ancestry rule deleted (mutant G1)
+        if sum(1 for q, n in hot.items() if n >= 5 and q in by_anc) < len(children):
             return False
     if foreign:
         pids = {int(m.group(1)) for m in (re.match(r"foreign process (\d+) ", r) for r in v.get("reasons") or []) if m}

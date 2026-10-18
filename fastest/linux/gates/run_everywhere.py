@@ -126,6 +126,17 @@ def prints_tally(path):
     return any(re.search(r"\b(echo|printf)\s+(['\"]%s\\n['\"]\s+)?[\"']TALLY ran=", ln) for ln in _sh_lines(src))
 
 
+def na_causes(out):
+    """the causes of the N/A lines in OUT: a line whose OUTCOME is N/A, i.e. 'N/A-on-<cause>' with no PASS or FAIL
+    before it on that line (linux-rev-uw5 L4: a PASS line whose label named 'N/A-on-noroot' was counted)"""
+    causes = []
+    for ln in out.splitlines():
+        m = re.search(r"N/A-on-([A-Za-z0-9_-]+)", ln)
+        if m and not re.search(r"\b(PASS|FAIL)\b", ln[:m.start()]):
+            causes.append(m.group(1))
+    return causes
+
+
 def this_platform():
     return "linux" if sys.platform.startswith("linux") else sys.platform
 
@@ -217,7 +228,7 @@ def run(root, plat=None, timeout=1800, allow_na=None):
         # the row's outcome is its TALLY line, agreeing with its rc (linux-rev-uw2 MED 1: an allowlist of outcomes, not
         # a wording match); every N/A case also names its cause in an "N/A-on-<cause>" line (MED 2's totals)
         outcome, t_, probs = tally.judge(out, rc if rc is not None else -1)
-        row_na = re.findall(r"N/A-on-([A-Za-z0-9_-]+)", out)
+        row_na = na_causes(out)
         if rc == 0 and row_na:
             probs = probs + [f"printed {len(row_na)} N/A line(s) but exited 0: an N/A must exit 3"]
             outcome = "fail"
