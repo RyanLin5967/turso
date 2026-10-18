@@ -91,7 +91,14 @@ set -uo pipefail
 # the virtio disk identity (t3lib.sh dev_identity) is a DRY-VIRT run's alone: never inherited, set below only by --dry-block
 unset T3_IDENTITY_MODE
 # host_quiet's test hooks (a faked systemctl or clock) and knobs never reach a run from the caller's environment
-unset T3_SYSTEMCTL T3_CLOCKDELTA T3_QUIET_WATCH_S T3_QUIET_MAX_S T3_CLOCK_ADJUSTERS
+unset T3_SYSTEMCTL T3_CLOCKDELTA T3_QUIET_WATCH_S T3_QUIET_MAX_S T3_CLOCK_ADJUSTERS T3_SUDO_BIN
+# linux-rev-uw1 LOW 4: t3run checks its OWN bash (hostbin.BASH_MIN, 5: gates/sweeper.sh and ours_timed_run read
+# $EPOCHREALTIME) and runs every `bash X` it calls under that same bash: a private dir holding only a `bash` link to
+# it goes first on PATH, so no step picks up an older bash from the box's PATH
+[ "${BASH_VERSINFO[0]:-0}" -ge 5 ] ||
+  { echo "t3run: REFUSED: running under bash ${BASH_VERSION:-?}; it needs bash 5+ (\$EPOCHREALTIME)" >&2; exit 2; }
+T3_BASHDIR=$(mktemp -d) && ln -s "$BASH" "$T3_BASHDIR/bash" && PATH=$T3_BASHDIR:$PATH ||
+  { echo "t3run: REFUSED: cannot pin bash ($BASH) first on PATH" >&2; exit 2; }
 REPO_URL=https://github.com/RyanLin5967/turso
 SHA="" OUT="" DRY=0 MANIFEST="" FSLIST="" DEVICE="" DESTROY="" SEED=20261005 BLOCK="" PLANT="" PLP="" DEV_REAL=""
 DRY_BLOCK="" DRYB_GIVEN="" STAMP=""
@@ -736,8 +743,13 @@ selftests() {
     { echo "self-test warmup_conformance FAILED"; return 1; }
   # every self-test entry point, each on the platform it states (gates/platforms.tsv; the platform-inheritance class):
   # one runner, the same one vm_dryblock.sh runs on the Mac first, and it refuses an entry point with no row
-  timeout 3600 python3 -B "$L/gates/run_everywhere.py" "$L" > "$OUT/run-everywhere.txt" 2>&1 ||
-    { tail -5 "$OUT/run-everywhere.txt"; echo "self-test run_everywhere FAILED"; return 1; }
+  # rc 0 only: an N/A (rc 3, any case this box could not run) is never a pass on the T3 box (linux-rev-uw1 HIGH 1, the
+  # lead's rule: a T3 run has zero N/A on its gate cases); the self-tests above take rc 0 only for the same reason
+  local rer=0
+  timeout 3600 python3 -B "$L/gates/run_everywhere.py" "$L" > "$OUT/run-everywhere.txt" 2>&1 || rer=$?
+  [ $rer = 0 ] || { tail -5 "$OUT/run-everywhere.txt"
+    [ $rer = 3 ] && echo "self-test run_everywhere: N/A cases on the T3 box (rc 3): refused, an N/A is never a pass"
+    echo "self-test run_everywhere FAILED (rc $rer)"; return 1; }
   # the shared sweeper's one reader, every refusal planted (MED 12 ruling; t3lib_test.sh runs ours_timed_run on /proc)
   timeout 60 python3 -B "$L/gates/sweeper_record.py" selftest > "$OUT/sweeper-record-selftest.txt" 2>&1 ||
     { echo "self-test sweeper_record FAILED"; return 1; }

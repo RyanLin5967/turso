@@ -506,6 +506,7 @@ def _node(name, typ, pkname=None, mounts=None, children=None, kname=None):
 def self_test():
     """Every refusal case matches its OWN rule's text: another rule refusing the same device does not count (T3 runner
     review MED 13: the mount rule refused the root disk first, so `elif False:` on the root rule survived)."""
+    na259 = False  # the two major-259 cases could not run (a dev_t that cannot hold major 259)
     N = _node
     # box A: / on a plain partition
     root = N("nvme0n1", "disk", children=[N("nvme0n1p1", "part", "nvme0n1", ["/"]), N("nvme0n1p3", "part", "nvme0n1")])
@@ -941,6 +942,7 @@ def self_test():
              lambda: (lambda r: (any("nvme1n1's node is device 259:0, not its sysfs dev 259:3" in b for b in r[1]), r))(
                  box259("nvme1n1", node={"nvme1n1": (stat.S_IFBLK | 0o660, os.makedev(259, 0))})))]
     else:
+        na259 = True
         print(f"DEVGUARD self-test N/A-on-{sys.platform}: the two major-259 cases (this dev_t cannot hold major 259: "
               f"os.makedev(259, 3) reads back {os.major(os.makedev(259, 3))}:{os.minor(os.makedev(259, 3))})")
     bad = []
@@ -955,8 +957,10 @@ def self_test():
                 bad.append(n)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-    print(f"DEVGUARD SELF-TEST {len(cases) - len(bad)}/{len(cases)} {'PASS' if not bad else 'FAIL'}")
-    return 0 if not bad else 1
+    print(f"DEVGUARD SELF-TEST {len(cases) - len(bad)}/{len(cases)} {'PASS' if not bad else 'FAIL'}"
+          + (" (2 N/A)" if na259 else ""))
+    # an N/A is its own outcome, exit 3, never a pass (linux-rev-uw1 HIGH 1)
+    return 1 if bad else 3 if na259 else 0
 
 
 def main(a):

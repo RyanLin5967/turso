@@ -26,7 +26,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import v3cell  # noqa: E402
 sys.path.insert(0, os.path.join(os.path.dirname(HERE), "gates"))
-import hostbin  # noqa: E402  every "bash" here is hostbin's bash 4+, never the caller's PATH's (the platform class)
+import hostbin  # noqa: E402  every "bash" here is hostbin's bash 5+, never the caller's PATH's (the platform class)
 
 
 def current_f3_sync_record(sy):
@@ -1092,6 +1092,9 @@ def leaf_remote_ok(rc, txt, what, prem, out_exists, f3):
     return False, f"no plant ran (leaf driver {leaf.get('driver')!r}, virtualized {virt!r})", False
 
 
+SELF_TEST_NA = []  # the self-test's cases this host cannot run (each printed as N/A-on-<cause>)
+
+
 def self_test():
     """The checker's own rules on planted records, expectations by hand (fifth review M3)."""
     res = []
@@ -1430,6 +1433,7 @@ def self_test():
     # pass (the platform-inheritance class, 2026-10-15); on Linux it must pass as before
     if not sys.platform.startswith("linux"):
         print(f"N/A-on-{sys.platform}: nestloops.sh --self-test (GNU readlink -m, and a /var that is not a symlink)", flush=True)
+        SELF_TEST_NA.append("nestloops.sh --self-test")
     else:
         r12 = _sp12.run([hostbin.bash(), nl, "--self-test"], capture_output=True, text=True, timeout=120) if os.path.exists(nl) else None
         chk("nestloops.sh --self-test: the one anchored nest-chain matcher on canned listings (nb/x.img is not the chain; a "
@@ -1507,8 +1511,10 @@ def self_test():
     # write-back batch (run 37528595878, x86 ext4loop on NVMe, a VM)
     real_selftest(chk)
     ok = all(res) and len(res) > 0
-    print("CHECK SELF-TEST %d/%d %s" % (sum(res), len(res), "PASS" if ok else "FAIL"))
-    return 0 if ok else 1
+    print("CHECK SELF-TEST %d/%d %s" % (sum(res), len(res), "PASS" if ok else "FAIL")
+          + (f" ({len(SELF_TEST_NA)} N/A)" if SELF_TEST_NA else ""))
+    # an N/A is its own outcome, exit 3, never a pass (linux-rev-uw1 HIGH 1; gates/run_everywhere.py)
+    return 1 if not ok else 3 if SELF_TEST_NA else 0
 
 
 BANKED_F3 = "f3-37812355435-x86-ext4loop"     # write-back MSFT NVMe, real (four format fields: its README)

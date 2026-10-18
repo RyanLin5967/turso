@@ -6,7 +6,7 @@
 #   any    must pass on every platform it is run on (macOS and Linux today); a case inside it that needs Linux says so
 #          itself and reports N/A-on-<platform> off Linux, never a pass
 #   linux  the whole file needs Linux (the why says what); off Linux it is reported N/A, never a pass
-# Every .sh row, and every `bash` its children run, is hostbin.py's bash 4+, never the caller's PATH's first bash.
+# Every .sh row, and every `bash` its children run, is hostbin.py's bash 5+ (BASH_MIN), never the caller's PATH's first bash.
 competitors/drive.py	selftest	any	pure Python over records
 competitors/fixture.py	selftest	any	pure Python over records
 competitors/fthelp.py	selftest	any	pure Python over records
