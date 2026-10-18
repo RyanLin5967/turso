@@ -15213,6 +15213,39 @@ fn adv_a_rolled_back_cdc_switch_on_savepoint_routes() {
     assert!(failed.is_empty(), "CLAIM: a rolled-back CDC switch left capture on the wrong table: {failed:#?}");
 }
 
+/// H6, the route ADV-5 does not take: a COMMIT refused with Busy before anything of it committed
+/// leaves its transaction open (`undo_commit_transition_after_busy`), so a ROLLBACK that follows
+/// must still put back the capture setting from BEGIN. Before the fix the refused COMMIT had
+/// already dropped that setting, so the switch to c2 outlived the rollback that removed c2.
+#[test]
+fn a_rollback_after_a_busy_commit_puts_the_capture_setting_back() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("busy-cdc.db"), opts(catalog, SyncClass::Fsync));
+        let a = db.connect().unwrap();
+        seed_wide(&a);
+        let _child = a.fork_branch().unwrap();
+        a.execute("PRAGMA capture_data_changes_conn('full,c1')").unwrap();
+        a.execute("BEGIN").unwrap();
+        a.execute("PRAGMA capture_data_changes_conn('full,c2')").unwrap();
+        a.execute("UPDATE t SET v = 'new' WHERE id = 3").unwrap();
+        db.branch_failpoint(Some(BranchFailpoint::TrunkDecisionBusy));
+        let first = a.execute("COMMIT");
+        assert!(
+            matches!(first, Err(LimboError::Busy)),
+            "catalog={catalog}: premise: the decision pass was refused: {first:?}"
+        );
+        a.execute("ROLLBACK").unwrap();
+        let c2 = adv_rows(&a, "SELECT count(*) FROM sqlite_schema WHERE name = 'c2'");
+        assert_eq!(c2.as_ref().ok().map(|r| r[0][0].as_str()), Some("0"), "catalog={catalog}: premise: the rollback removed c2: {c2:?}");
+        let write = a.execute("UPDATE t SET v = 'after' WHERE id = 4");
+        assert!(write.is_ok(), "catalog={catalog}: CLAIM: a write after the rollback is captured somewhere that exists: {write:?}");
+        let c1 = adv_rows(&a, "SELECT count(*) FROM c1 WHERE table_name = 't'");
+        assert_eq!(c1.as_ref().ok().map(|r| r[0][0].as_str()), Some("1"), "catalog={catalog}: CLAIM: c1 captures the write: {c1:?}");
+    }
+}
+
 /// ADV-6 (probe, never fails): a capture table named in another case than it was created in.
 #[test]
 fn adv_probe_cdc_case_variant_name() {
