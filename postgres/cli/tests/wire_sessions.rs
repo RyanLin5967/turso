@@ -15100,6 +15100,48 @@ fn an_access_method_that_does_not_exist_is_42704() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-uw2 LOW, M1's edge cases (the reviewer's PG 18.6 runs: artie 718f73d7c1,
+/// reviews/uw2-raws/r5-pg.txt t_6 ... t_63): eight built-in types PostgreSQL takes as column
+/// types were 42704 (int4range, daterange, int2vector, oidvector, xid, tid, pg_lsn,
+/// txid_snapshot); a pseudo-type was 42704 where PostgreSQL says 42P16 'column "a" has
+/// pseudo-type anyelement' (void was taken); and the SQLite name blob and a quoted "INT4" (a
+/// built-in's name in another case is no type) were taken where PostgreSQL says 42704. Not here:
+/// a quoted "M" for an enum m, which names m to the engine (it folds type names; COMPAT).
+#[test]
+fn a_column_type_is_read_as_postgresql_reads_it() {
+    let dir = Scratch::new("column-types");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    for (i, ty) in ["int4range", "daterange", "int2vector", "oidvector", "xid", "tid", "pg_lsn", "txid_snapshot"]
+        .iter()
+        .enumerate()
+    {
+        let sql = format!("CREATE TABLE tb_{i} (a {ty})");
+        if let Some(e) = a.q(&sql).error {
+            wrong.push(format!("{sql}: {} {}, PostgreSQL CREATE TABLE", e.code, e.message));
+        }
+    }
+    for (i, ty) in ["anyelement", "record", "void", "trigger", "unknown"].iter().enumerate() {
+        let sql = format!("CREATE TABLE tp_{i} (a {ty})");
+        let want = format!("column \"a\" has pseudo-type {ty}");
+        match a.q(&sql).error {
+            Some(e) if e.code == "42P16" && e.message == want => {}
+            other => wrong.push(format!("{sql}: want 42P16 {want:?}, got {other:?}")),
+        }
+    }
+    for (sql, want) in [
+        ("CREATE TABLE t_18 (a blob)", "type \"blob\" does not exist"),
+        ("CREATE TABLE t_23 (a \"INT4\")", "type \"INT4\" does not exist"),
+    ] {
+        match a.q(sql).error {
+            Some(e) if e.code == "42704" && e.message == want => {}
+            other => wrong.push(format!("{sql}: want 42704 {want:?}, got {other:?}")),
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-uw2 N5: a schema-qualified type was refused 42704 'type "public m" does not exist',
 /// its parts joined with a blank, so a pg_dump restore, which writes public.<type> for every enum
 /// and domain column, failed at its first such table. PostgreSQL 18.6 takes public.m and
