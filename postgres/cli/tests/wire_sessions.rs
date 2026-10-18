@@ -15621,6 +15621,53 @@ fn a_schemas_file_goes_with_the_schema_the_engine_dropped() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// Found by wire-rev-uw2 N4's red through the CLI: a statement that failed inside a CLI block left
+/// the block open and working, so a later COMMIT committed the block's other statements, the
+/// failed one's neighbours included (a script's BEGIN; DROP SCHEMA s CASCADE; CREATE TABLE s.u
+/// [fails]; COMMIT dropped s and its tables, where PostgreSQL keeps them). PostgreSQL aborts the
+/// block at the error: every later statement is 25P02 'current transaction is aborted, commands
+/// ignored until end of transaction block', COMMIT ends it as ROLLBACK, and ROLLBACK TO a
+/// savepoint recovers it (the server's fail_block; recorded there, pg18 recordings of the
+/// server's failed-block replays). The CLI keeps that state across a script's lines.
+#[test]
+fn a_cli_block_that_failed_commits_nothing() {
+    let dir = Scratch::new("cli-failed-block");
+    let script = |input: &str| {
+        let mut cli = Command::new(env!("CARGO_BIN_EXE_tursopg"))
+            .arg(dir.db())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("the CLI");
+        cli.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+        let out = cli.wait_with_output().expect("the CLI");
+        format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
+    };
+    let mut wrong = Vec::new();
+    let (ok, out) = cli_one(&dir, "CREATE TABLE f(x int)");
+    if !ok {
+        wrong.push(format!("CREATE TABLE f: {out}"));
+    }
+    let out = script("BEGIN;\nINSERT INTO f VALUES (1);\nSELECT nosuch FROM f;\nINSERT INTO f VALUES (2);\nCOMMIT;\n");
+    if !out.contains("current transaction is aborted, commands ignored until end of transaction block") {
+        wrong.push(format!("the INSERT after the failed SELECT in the block: {out}"));
+    }
+    let (_, out) = cli_one(&dir, "SELECT count(*) FROM f");
+    if !out.lines().any(|l| l.split('│').any(|c| c.trim() == "0")) {
+        wrong.push(format!("rows of the failed block after its COMMIT (want 0): {out}"));
+    }
+    let out = script(
+        "BEGIN;\nINSERT INTO f VALUES (10);\nSAVEPOINT a;\nSELECT nosuch FROM f;\nROLLBACK TO a;\n\
+         INSERT INTO f VALUES (11);\nCOMMIT;\n",
+    );
+    let (_, count) = cli_one(&dir, "SELECT count(*) FROM f WHERE x >= 10");
+    if !count.lines().any(|l| l.split('│').any(|c| c.trim() == "2")) {
+        wrong.push(format!("a block recovered by ROLLBACK TO keeps 10 and 11: {out} / {count}"));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-uw2 N4: inside a CLI block, a DROP SCHEMA's DETACH waits for COMMIT, and until then
 /// the dropped schema still answered: pg_namespace listed it, and CREATE TABLE s.u succeeded, so
 /// the COMMIT then deleted s.u with the schema's file (DATA LOSS of a table the block had just
