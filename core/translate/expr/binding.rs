@@ -701,7 +701,11 @@ pub fn bind_and_rewrite_expr<'a>(
 /// validated as `Expr::Literal(Literal::String(_))` during bind-time checks.
 pub(super) fn extract_string_literal(expr: &ast::Expr) -> crate::Result<String> {
     match expr {
-        ast::Expr::Literal(ast::Literal::String(s)) => Ok(s.trim_matches('\'').to_string()),
+        // As SQL reads it: the outer quotes off and each `''` one `'` (it was trim_matches, which
+        // kept the doubling and took every edge quote: fastest-wire).
+        ast::Expr::Literal(ast::Literal::String(s)) if s.len() >= 2 && s.starts_with('\'') && s.ends_with('\'') => {
+            Ok(sanitize_string(s))
+        }
         _ => crate::bail_parse_error!("expected a string literal argument"),
     }
 }
