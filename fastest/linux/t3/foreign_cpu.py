@@ -277,6 +277,34 @@ def self_test():
                 o.write(f"#stop\t{t:.3f}\tstop-file\tload=()\n")
         return decide(f)["verdict"]
 
+    # linux-rev-uw1 MED 3: busy-host evidence comes from the WINDOW's own samples (a ps CPU% is a lifetime average:
+    # the reviewer's 30 s burner read 57-94% while idle), of a foreign, non-kernel process outside the test's tree
+    def evid(label, rows, exclude=()):
+        f = os.path.join(d, f"evid-{label}.tsv")
+        with open(f, "w") as o:
+            o.write("#start\t0\tcell=ST\tinterval=1.0\tload=()\n")
+            for i in range(20):
+                for pid, comm, pct, kind, start, n in rows:
+                    if start <= i < start + n:
+                        o.write(f"{i + 1.0:.3f}\t{pid}\t{comm}\t{pct}\t{kind}\n")
+                o.write(f"#tick\t{i + 1.0:.3f}\t0\t0.0\t50.0\n")
+            o.write("#stop\t20.000\tstop-file\tload=()\n")
+        return busy_evidence(f, exclude)
+    synthetic_evid = [
+        ("MED 3: a foreign process at 60% for 6 window samples is busy-host evidence",
+         [p_.split(" ")[0] for p_ in evid("busy", [(7, "java", 60.0, "foreign", 3, 6)])] == ["java"]),
+        ("MED 3: a process the window saw at 0% (a ps lifetime average says 94%) is no evidence",
+         evid("stale", [(8, "burn", 0.0, "foreign", 0, 20)]) == []),
+        ("MED 3: a kernel thread at 90% is no evidence (the sampler never lets one void a window)",
+         evid("kern", [(9, "kworker/u8:1", 90.0, "kernel", 0, 20)]) == []),
+        ("MED 3: a process of the test's own tree is no evidence",
+         evid("ours", [(10, "python3", 99.0, "foreign", 0, 20)], exclude={10}) == []),
+        ("MED 3: 60% for only 4 samples (under rule 2's 5 s) is no evidence",
+         evid("brief", [(11, "java", 60.0, "foreign", 3, 4)]) == []),
+    ]
+    for label, ok in synthetic_evid:
+        bad += not ok
+        print(f"self-test {'PASS' if ok else 'FAIL'}: {label}")
     synthetic = [
         ("rule 1: foreign 150% in 2 of 20 ticks (10% > 5%)", synth("r1v", [10] * 18 + [150, 150]), "VOID"),
         ("rule 1: foreign 150% in 1 of 20 ticks (5%, not above)", synth("r1ok", [10] * 19 + [150]), "VALID"),

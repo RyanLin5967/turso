@@ -140,8 +140,10 @@ def self_test():
             open(os.path.join(t, "gates", "platforms.tsv"), "w").write("# x\n" + "".join("\t".join(r) + "\n" for r in rows))
         tsv(("a/good.py", "self-test", "any", "x"), ("a/bad.py", "self-test", "linux", "x"), ("a/lin_test.sh", "", "linux", "x"))
         rc, lines = run(t, "darwin")
-        cases.append(("a linux row off Linux is N/A, never run, and the any row passes: rc 0",
-                      rc == 0 and any(ln.startswith("N/A-on-darwin: a/bad.py") for ln in lines)))
+        # TEST EDIT, flagged (linux-rev-uw1 HIGH 1, the lead's standing rule: an N/A never counts toward a T3 gate
+        # item): this case wanted rc 0 with a row N/A, the very outcome the rule forbids; an N/A run exits 3
+        cases.append(("a linux row off Linux is N/A, never run, and the any row passes: rc 3 (N/A), not 0",
+                      rc == 3 and any(ln.startswith("N/A-on-darwin: a/bad.py") for ln in lines)))
         rc, lines = run(t, "linux")
         cases.append(("the same table on Linux runs the linux rows, and a failing one fails (rc 1, naming it)",
                       rc == 1 and any("a/bad.py: rc 1" in ln for ln in lines)))
@@ -169,7 +171,7 @@ def self_test():
         open(os.path.join(fake, "bash"), "w").write("#!/bin/sh\necho FAKE-BASH; exit 97\n")
         os.chmod(os.path.join(fake, "bash"), 0o755)
         open(os.path.join(t, "a", "v4_test.sh"), "w").write(
-            '[ "${BASH_VERSINFO[0]}" -ge 4 ] || exit 1\nbash -c \'[ "${BASH_VERSINFO[0]}" -ge 4 ]\' || exit 2\necho V4 ok\n')
+            '[ "${BASH_VERSINFO[0]}" -ge 5 ] || exit 1\nbash -c \'[ "${BASH_VERSINFO[0]}" -ge 5 ]\' || exit 2\necho V5 ok\n')
         tsv(("a/v4_test.sh", "", "any", "x"), ("a/bad.py", "self-test", "linux", "x"), ("a/lin_test.sh", "", "linux", "x"))
         old_path = os.environ.get("PATH", "")
         os.environ["PATH"] = fake + os.pathsep + old_path
@@ -177,9 +179,60 @@ def self_test():
             rc, lines = run(t, "darwin")
         finally:
             os.environ["PATH"] = old_path
-        cases.append(("a non-bash-4 `bash` first on the caller's PATH runs neither a row nor its children: rc 0",
-                      rc == 0 and any(ln.startswith("PASS a/v4_test.sh") for ln in lines)))
+        # TEST EDIT, flagged (the same ruling): the table's two linux rows are N/A off Linux, so the run exits 3, not 0;
+        # what this case checks, the row run under bash 5 with its children, is unchanged
+        cases.append(("a `bash` first on the caller's PATH that is not bash 5+ runs neither a row nor its children: "
+                      "the row passes (the run exits 3 for its two N/A rows)",
+                      rc == 3 and any(ln.startswith("PASS a/v4_test.sh") for ln in lines)))
         os.remove(os.path.join(t, "a", "v4_test.sh"))
+        # linux-rev-uw1 HIGH 1 / MED 2: an N/A is its own outcome, carried end to end: a row that skips a case exits 3,
+        # the run counts it apart from the passes with its cause, and exits 3, which t3run's selftests stage
+        # (rc 0 only) refuses; a row that prints an N/A line but exits 0 is refused outright
+        open(os.path.join(t, "a", "na3.py"), "w").write(
+            'import sys\nif sys.argv[1:] == ["self-test"]:\n    print("N/A-on-busy-host: case x")\n    sys.exit(3)\n')
+        open(os.path.join(t, "a", "na0.py"), "w").write(
+            'import sys\nif sys.argv[1:] == ["self-test"]:\n    print("N/A-on-noroot: case y")\n    sys.exit(0)\n')
+        open(os.path.join(t, "a", "good.py"), "w").write(ok_py)
+        tsv(("a/good.py", "self-test", "any", "x"), ("a/na3.py", "self-test", "any", "x"),
+            ("a/bad.py", "self-test", "linux", "x"), ("a/lin_test.sh", "", "linux", "x"))
+        os.remove(os.path.join(t, "a", "na0.py"))
+        rc, lines = run(t, "darwin")
+        cases.append(("HIGH 1: a row that skips a case (exit 3) makes the run exit 3, not 0",
+                      rc == 3 and any(ln.startswith("N/A a/na3.py") for ln in lines)))
+        cases.append(("MED 2: the totals count N/A apart from the passes, by cause",
+                      lines[-1] == "run_everywhere (darwin): 1 passed, 3 N/A (busy-host 1, darwin 2), 0 failed or refused"))
+        open(os.path.join(t, "a", "na0.py"), "w").write(
+            'import sys\nif sys.argv[1:] == ["self-test"]:\n    print("N/A-on-noroot: case y")\n    sys.exit(0)\n')
+        tsv(("a/good.py", "self-test", "any", "x"), ("a/na0.py", "self-test", "any", "x"), ("a/na3.py", "self-test", "any", "x"),
+            ("a/bad.py", "self-test", "linux", "x"), ("a/lin_test.sh", "", "linux", "x"))
+        rc, lines = run(t, "linux")
+        cases.append(("HIGH 1: a row that prints an N/A line but exits 0 is refused, naming the rule",
+                      rc == 1 and any("a/na0.py" in ln and "an N/A must exit 3" in ln for ln in lines)))
+        for f_ in ("na0.py", "na3.py"):
+            os.remove(os.path.join(t, "a", f_))
+        # LOW 5: BASH_MIN fired: a bash reporting major 4 is never chosen, a fake one and, where the host has one,
+        # a real one (macOS /bin/bash 3.2, RHEL 8 /bin/bash 4.4)
+        f4 = os.path.join(t, "bash4")
+        os.makedirs(f4)
+        open(os.path.join(f4, "bash"), "w").write('#!/bin/sh\necho 4\n')
+        os.chmod(os.path.join(f4, "bash"), 0o755)
+        try:
+            hostbin.bash(f4, fallbacks=())
+            cases.append(("LOW 5: a bash reporting major 4 alone on PATH is refused (BashMissing)", False))
+        except hostbin.BashMissing:
+            cases.append(("LOW 5: a bash reporting major 4 alone on PATH is refused (BashMissing)", True))
+        old = [b for b in ("/bin/bash", "/usr/bin/bash") if os.access(b, os.X_OK) and (hostbin._major(b) or 99) < 5]
+        if old:
+            rb = os.path.join(t, "realold")
+            os.makedirs(rb)
+            os.symlink(old[0], os.path.join(rb, "bash"))
+            try:
+                hostbin.bash(rb, fallbacks=())
+                cases.append((f"LOW 5: the host's real {old[0]} (major {hostbin._major(old[0])}) alone is refused", False))
+            except hostbin.BashMissing:
+                cases.append((f"LOW 5: the host's real {old[0]} (major {hostbin._major(old[0])}) alone is refused", True))
+        else:
+            print("INFO: this host has no bash older than 5; the fake-4 case above fires BASH_MIN", flush=True)
         rows, _ = table(os.path.dirname(HERE))
         cases.append(("the real table: every discovered entry point has a row",
                       set(discover(os.path.dirname(HERE))) <= {r[0] for r in rows}))
