@@ -46,8 +46,8 @@ RUN_RE = re.compile(r"/[A-Za-z0-9_.-]+-runs/([A-Za-z0-9_-]+)(?:/|$)")
 
 def owner_of(pid):
     """(uid, user, run) of PID, or None when it is gone. RUN is the uwrun run the process belongs to: for a process of
-    THIS account, the <NAME> of the <prefix>-runs/<NAME>/ its cwd is under (uwrun's host-local layout, the run dir
-    under /var/tmp or /dev/shm), else "-". Another user's cwd cannot be read, so their run is always "-"."""
+    THIS account, the <NAME> of the OUTERMOST <prefix>-runs/<NAME>/ its cwd is under (uwrun's host-local layout, the
+    run dir under /var/tmp or /dev/shm; a runs dir nested inside a run is still that run's), else "-". Another user's cwd cannot be read, so their run is always "-"."""
     import pwd
     try:
         uid = os.stat(f"/proc/{pid}").st_uid
@@ -443,13 +443,24 @@ def self_test():
     own = globals().get("owner_of", lambda pid: None)
     import pwd
     me_user = pwd.getpwuid(os.getuid()).pw_name
-    rd = os.path.join(d, "x-runs", "probe-run", "work")
+    # the probe dir must sit under no OTHER runs dir: d is under TMPDIR, which uwrun puts inside the run's own dir
+    # (<user>-runs/<NAME>/tmp), so a probe under d is rightly named by that outer run (green run 1, ecetesla2)
+    base = next(b for b in ("/dev/shm", "/tmp", d) if os.access(b, os.W_OK))
+    pd = tempfile.mkdtemp(dir=base)
+    rd = os.path.join(pd, "x-runs", "probe-run", "work")
     os.makedirs(rd)
     child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], cwd=rd)
+    nd = os.path.join(pd, "x-runs", "outer-run", "work", "y-runs", "inner-run")
+    os.makedirs(nd)
+    nested = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], cwd=nd)
     try:
         got_child = own(child.pid)
+        got_nested = own(nested.pid)
     finally:
-        child.kill(); child.wait()
+        for c_ in (child, nested):
+            c_.kill(); c_.wait()
+    import shutil
+    shutil.rmtree(pd, ignore_errors=True)
     got_self = own(os.getpid())
     # sample() itself: a foreign child burning for 2 s is recorded, and the record carries an #owner row for it
     srec, sstop = os.path.join(d, "owner-sample.tsv"), os.path.join(d, "owner-sample.stop")
@@ -472,6 +483,8 @@ def self_test():
          evid("own3", [(7, "java", 90.0, "foreign", 2, 8)]) == ["java pid 7 (owner unrecorded)"]),
         ("owner: owner_of names a child of ours by our user and by the run its cwd is under",
          got_child is not None and got_child[1:] == (me_user, "probe-run")),
+        ("owner: a runs dir nested inside a run is still the outer run's (uwrun's own dir is the outermost)",
+         got_nested is not None and got_nested[2] == "outer-run"),
         ("owner: owner_of names our own process with no run when its cwd is under none",
          got_self is not None and got_self[1] == me_user),
         ("owner: sample() writes an #owner row for a foreign pid it records, with our user",
