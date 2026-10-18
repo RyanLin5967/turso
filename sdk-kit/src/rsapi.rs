@@ -1332,7 +1332,7 @@ impl TursoConnection {
                     self.connection.clone(),
                 );
                 let statement =
-                    Statement::new(program, self.connection.get_pager(), cached.query_mode, 0);
+                    Statement::new(program, self.connection.get_pager(), cached.query_mode, 0, turso_core::SqlKind::client());
                 let handle: StatementHandle = Arc::new(Mutex::new(Some(statement)));
                 let stmt_id = self.track_stmt(&handle);
                 return Ok(Box::new(TursoStatement {

@@ -167,15 +167,87 @@ impl Drop for SchemaReparseGuard {
     }
 }
 
-/// Which parser a statement's text is for (the wire's NO SILENT DIALECT SWITCH class): a client's
-/// text goes to the database's dialect; the engine's own helper text, and a frontend's
-/// `prepare_sqlite`/`execute_sqlite` text, is SQLite and goes to the SQLite parser, whatever the
-/// dialect, never through the frontend's (where text it rejects fell back to SQLite, and text it
-/// accepts could mean something else).
+/// What a statement's text is (dialect design REVISION 2, NOTES 9433759f13): which parser reads it
+/// (`Syntax`) and where it came from (`SqlSource`), fixed where the text is made and carried on the
+/// `Statement`, so every re-prepare and retry reads it the same way. Its fields are private: the
+/// constructors are the only way in. (Step 1 of the build order: the plumbing, behaviour unchanged;
+/// the source does not yet decide storage or the resolver.)
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SqlKind {
+    syntax: Syntax,
+    source: SqlSource,
+}
+
+/// Which parser reads a statement's text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SqlText {
-    Client,
+pub enum Syntax {
+    /// SQLite's parser, whatever the database's dialect.
     Sqlite,
+    /// The database dialect's parser (`Dialect::parse`, `Dialect::parse_for_reprepare`).
+    Client,
+}
+
+/// Where a statement's text came from: what decides how a schema row it writes is stored.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SqlSource {
+    /// Engine-built SQLite text.
+    Engine,
+    /// A client's text, in the dialect's syntax.
+    Client,
+    /// A frontend's own canonical SQLite text for its client's objects.
+    Frontend,
+    /// A stored schema row replayed (VACUUM): the statement's OWN row keeps these bytes.
+    Replay { name: crate::sync::Arc<str>, bytes: crate::sync::Arc<str> },
+}
+
+impl SqlKind {
+    /// Engine-built SQLite text.
+    pub(crate) fn engine() -> Self {
+        Self { syntax: Syntax::Sqlite, source: SqlSource::Engine }
+    }
+    /// A client's statement, in the database dialect's syntax.
+    pub fn client() -> Self {
+        Self { syntax: Syntax::Client, source: SqlSource::Client }
+    }
+    /// A frontend's own canonical SQLite text.
+    pub fn frontend() -> Self {
+        Self { syntax: Syntax::Sqlite, source: SqlSource::Frontend }
+    }
+    /// Which parser reads this text.
+    pub fn syntax(&self) -> Syntax {
+        self.syntax
+    }
+    /// Where this text came from.
+    pub fn source(&self) -> &SqlSource {
+        &self.source
+    }
+}
+
+/// How a frontend's statement runs: on its own (it may open and commit its transaction), or nested
+/// inside the statement that is running (no re-prepare on a schema change; reserved names allowed).
+/// The crate's own `StatementOrigin` (with its `Subprogram`) is never reachable from outside.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Origin {
+    Root,
+    Nested,
+}
+
+/// Stored text with the syntax it is in, as a dialect reports it (`Dialect::table_sql_for_replay`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredSql {
+    pub syntax: Syntax,
+    pub sql: crate::sync::Arc<str>,
+}
+
+impl StoredSql {
+    /// Stored text in SQLite's syntax.
+    pub fn sqlite(sql: impl Into<crate::sync::Arc<str>>) -> Self {
+        Self { syntax: Syntax::Sqlite, sql: sql.into() }
+    }
+    /// Stored text in the dialect's syntax.
+    pub fn client(sql: impl Into<crate::sync::Arc<str>>) -> Self {
+        Self { syntax: Syntax::Client, sql: sql.into() }
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -984,7 +1056,7 @@ impl Connection {
         input: &str,
         origin: StatementOrigin,
         prepare_options: &PrepareOptions,
-        text: SqlText,
+        kind: &SqlKind,
     ) -> Result<(Program, Arc<Pager>, QueryMode)> {
         #[cfg(test)]
         crate::branch::budget_probe::statement_prepared();
@@ -1008,7 +1080,7 @@ impl Connection {
             input,
             origin,
             prepare_options,
-            text,
+            kind,
             prepare_generation,
         ) {
             Ok(program) => Ok((program, pager, mode)),
@@ -1022,9 +1094,9 @@ impl Connection {
                     // A re-parse after another process's schema change: client text goes through
                     // the dialect's connection-aware hook, as `Statement::reprepare`'s does (review
                     // c42b LOW-3); SQLite text stays SQLite.
-                    let (cmd, _) = match text {
-                        SqlText::Client => self.db.dialect().parse_for_reprepare(input, self)?,
-                        SqlText::Sqlite => self.parse_text(input, text)?,
+                    let (cmd, _) = match kind.syntax() {
+                        Syntax::Client => self.db.dialect().parse_for_reprepare(input, self)?,
+                        Syntax::Sqlite => crate::dialect::sqlite::parse(input)?,
                     };
                     let Some(cmd) = cmd else {
                         return Err(err);
@@ -1049,7 +1121,7 @@ impl Connection {
                     input,
                     origin,
                     prepare_options,
-                    text,
+                    kind,
                     prepare_generation,
                 )
                 .map(|program| (program, pager, mode))
@@ -1062,10 +1134,10 @@ impl Connection {
         self._prepare(sql)
     }
 
-    /// Prepare SQLite text, parsed as SQLite whatever the database's dialect (`SqlText`), and
+    /// Prepare SQLite text, parsed as SQLite whatever the database's dialect (`SqlKind::frontend`), and
     /// re-prepared as SQLite too.
     pub fn prepare_sqlite(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
-        self.prepare_text_with_origin(sql, StatementOrigin::Root, SqlText::Sqlite)
+        self.prepare_text_with_origin(sql, StatementOrigin::Root, SqlKind::frontend())
     }
 
     #[doc(hidden)]
@@ -1085,8 +1157,8 @@ impl Connection {
         sql: impl AsRef<str>,
         origin: StatementOrigin,
     ) -> Result<Statement> {
-        let text = if origin == StatementOrigin::InternalHelper { SqlText::Sqlite } else { SqlText::Client };
-        self.prepare_text_with_origin(sql, origin, text)
+        let kind = if origin == StatementOrigin::InternalHelper { SqlKind::engine() } else { SqlKind::client() };
+        self.prepare_text_with_origin(sql, origin, kind)
     }
 
     #[turso_macros::trace_stack]
@@ -1094,7 +1166,7 @@ impl Connection {
         self: &Arc<Connection>,
         sql: impl AsRef<str>,
         origin: StatementOrigin,
-        text: SqlText,
+        kind: SqlKind,
     ) -> Result<Statement> {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
@@ -1115,7 +1187,7 @@ impl Connection {
 
             let (cmd, byte_offset_end) = {
                 crate::stack::trace_stack!("parse");
-                self.parse_text(sql, text)?
+                self.parse_text(sql, kind.syntax())?
             };
             let cmd = match cmd {
                 Some(cmd) => cmd,
@@ -1129,7 +1201,7 @@ impl Connection {
                 .unwrap()
                 .trim();
             let prepare_options = PrepareOptions::default();
-            let (program, pager, mode) = self.compile_cmd(cmd, input, origin, &prepare_options, text)?;
+            let (program, pager, mode) = self.compile_cmd(cmd, input, origin, &prepare_options, &kind)?;
 
             Ok(Statement::new_with_origin(
                 program,
@@ -1138,8 +1210,8 @@ impl Connection {
                 byte_offset_end,
                 origin,
                 needs_nested_guard,
-            )
-            .with_sql_text(text))
+                kind,
+            ))
         })();
         if result.is_err() && needs_nested_guard {
             self.end_nested();
@@ -1208,7 +1280,8 @@ impl Connection {
             self.start_nested();
         }
         let result = (|| {
-            let (program, pager, mode) = self.compile_cmd(cmd, input, origin, &prepare_options, SqlText::Client)?;
+            let kind = SqlKind::client();
+            let (program, pager, mode) = self.compile_cmd(cmd, input, origin, &prepare_options, &kind)?;
             // Kept with the statement: a re-prepare translates under them (wire-rework B-H2).
             Ok(Statement::new_with_origin(
                 program,
@@ -1217,6 +1290,7 @@ impl Connection {
                 0,
                 origin,
                 needs_nested_guard,
+                kind,
             )
             .with_prepare_options(prepare_options))
         })();
@@ -1812,9 +1886,10 @@ impl Connection {
             let input = str::from_utf8(&remaining.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
+            let kind = SqlKind::client();
             let (program, pager, mode) =
-                self.compile_cmd(cmd, input, StatementOrigin::Root, &prepare_options, SqlText::Client)?;
-            Statement::new(program, pager, mode, 0).run_ignore_rows()?;
+                self.compile_cmd(cmd, input, StatementOrigin::Root, &prepare_options, &kind)?;
+            Statement::new(program, pager, mode, 0, kind).run_ignore_rows()?;
             remaining = &remaining[byte_offset_end..];
         }
         Ok(())
@@ -1848,9 +1923,10 @@ impl Connection {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         let prepare_options = PrepareOptions::default();
+        let kind = SqlKind::client();
         let (program, pager, mode) =
-            self.compile_cmd(cmd, input, StatementOrigin::Root, &prepare_options, SqlText::Client)?;
-        let stmt = Statement::new(program, pager, mode, 0);
+            self.compile_cmd(cmd, input, StatementOrigin::Root, &prepare_options, &kind)?;
+        let stmt = Statement::new(program, pager, mode, 0, kind);
         Ok(Some(stmt))
     }
 
@@ -1863,31 +1939,32 @@ impl Connection {
     #[instrument(skip_all, level = Level::DEBUG)]
     #[turso_macros::trace_stack]
     pub fn execute(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<()> {
-        self.execute_text(sql.as_ref(), SqlText::Client)
+        self.execute_text(sql.as_ref(), SqlKind::client())
     }
 
-    /// `execute` of SQLite text, parsed as SQLite whatever the database's dialect (`SqlText`): for
+    /// `execute` of SQLite text, parsed as SQLite whatever the database's dialect (`SqlKind::frontend`): for
     /// the engine's own helper statements and a frontend's SQLite text.
     pub fn execute_sqlite(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<()> {
-        self.execute_text(sql.as_ref(), SqlText::Sqlite)
+        self.execute_text(sql.as_ref(), SqlKind::frontend())
     }
 
     #[turso_macros::trace_stack]
-    fn execute_text(self: &Arc<Connection>, sql: &str, text: SqlText) -> Result<()> {
+    fn execute_text(self: &Arc<Connection>, sql: &str, kind: SqlKind) -> Result<()> {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         let mut remaining = sql;
         let prepare_options = PrepareOptions::default();
-        while let (Some(cmd), byte_offset_end) = self.parse_text(remaining, text)? {
+        while let (Some(cmd), byte_offset_end) = self.parse_text(remaining, kind.syntax())? {
             let input = str::from_utf8(&remaining.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
             let (program, pager, mode) =
-                self.compile_cmd(cmd, input, StatementOrigin::Root, &prepare_options, text)?;
+                self.compile_cmd(cmd, input, StatementOrigin::Root, &prepare_options, &kind)?;
             {
                 crate::stack::trace_stack!("run");
-                Statement::new(program, pager.clone(), mode, 0).run_ignore_rows()?;
+                // The kind travels with the statement (review dialect MED-3: it defaulted to Client).
+                Statement::new(program, pager.clone(), mode, 0, kind.clone()).run_ignore_rows()?;
             }
             remaining = &remaining[byte_offset_end..];
         }
@@ -1907,9 +1984,10 @@ impl Connection {
             .unwrap()
             .trim();
         let prepare_options = PrepareOptions::default();
+        let kind = SqlKind::client();
         let (program, pager, mode) =
-            self.compile_cmd(cmd, input, StatementOrigin::Root, &prepare_options, SqlText::Client)?;
-        let stmt = Statement::new(program, pager, mode, 0);
+            self.compile_cmd(cmd, input, StatementOrigin::Root, &prepare_options, &kind)?;
+        let stmt = Statement::new(program, pager, mode, 0, kind);
         Ok(Some((stmt, byte_offset_end)))
     }
 
@@ -1917,11 +1995,11 @@ impl Connection {
         self.db.dialect().parse(sql)
     }
 
-    /// `sql` parsed by the parser its `text` names (`SqlText`).
-    pub(crate) fn parse_text(&self, sql: &str, text: SqlText) -> Result<(Option<Cmd>, usize)> {
-        match text {
-            SqlText::Client => self.db.dialect().parse(sql),
-            SqlText::Sqlite => crate::dialect::sqlite::parse(sql),
+    /// `sql` parsed by the parser its `syntax` names.
+    pub(crate) fn parse_text(&self, sql: &str, syntax: Syntax) -> Result<(Option<Cmd>, usize)> {
+        match syntax {
+            Syntax::Client => self.db.dialect().parse(sql),
+            Syntax::Sqlite => crate::dialect::sqlite::parse(sql),
         }
     }
 

@@ -5608,6 +5608,10 @@ pub fn op_program(
                             0,
                             crate::statement::StatementOrigin::Subprogram,
                             false,
+                            // A subprogram never re-prepares (statement.rs asserts it) and writes no
+                            // schema row of its own, so its kind is read by nothing (dialect
+                            // adversary-2 Q2); engine text, not the parent's, until a reader needs it.
+                            crate::connection::SqlKind::engine(),
                         ))
                     };
 

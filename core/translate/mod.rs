@@ -84,7 +84,7 @@ pub fn translate(
     input: &str,
     origin: crate::statement::StatementOrigin,
     prepare_options: &PrepareOptions,
-    text: crate::connection::SqlText,
+    kind: &crate::connection::SqlKind,
     prepare_generation: u64,
 ) -> Result<Program> {
     tracing::trace!("querying {}", input);
@@ -125,7 +125,7 @@ pub fn translate(
         // SQLite text (an engine helper's, a frontend's prepare_sqlite) resolves functions and
         // formats the table SQL it stores with SQLite semantics regardless of the database's
         // dialect: the same invariant as unmarked schema rows (the NO SILENT DIALECT SWITCH class).
-        if text == crate::connection::SqlText::Sqlite
+        if kind.syntax() == crate::connection::Syntax::Sqlite
             || matches!(origin, crate::statement::StatementOrigin::InternalHelper)
         {
             Arc::new(crate::dialect::SqliteDialect) as Arc<dyn crate::dialect::Dialect>
@@ -609,7 +609,7 @@ mod tests {
             "",
             crate::statement::StatementOrigin::Root,
             &crate::connection::PrepareOptions::default(),
-            crate::connection::SqlText::Client,
+            &crate::connection::SqlKind::client(),
             0, // review c42b MED-4: these tests check translation errors only
         );
         let err = result.unwrap_err().to_string();
@@ -695,7 +695,7 @@ mod tests {
             "",
             crate::statement::StatementOrigin::Root,
             &crate::connection::PrepareOptions::default(),
-            crate::connection::SqlText::Client,
+            &crate::connection::SqlKind::client(),
             0, // review c42b MED-4: these tests check translation errors only
         )
         .expect_err("translation should fail with malformed sqlite_sequence");
@@ -741,7 +741,7 @@ mod tests {
             "",
             crate::statement::StatementOrigin::Root,
             &crate::connection::PrepareOptions::default(),
-            crate::connection::SqlText::Client,
+            &crate::connection::SqlKind::client(),
             0, // review c42b MED-4: these tests check translation errors only
         )
         .expect_err("translation should fail with missing sqlite_sequence");

@@ -123,7 +123,10 @@ pub use cdc::{
     CaptureDataChangesExt, CaptureDataChangesInfo, CaptureDataChangesMode, CdcVersion,
     CDC_VERSION_CURRENT,
 };
-pub use connection::{resolve_ext_path, Connection, PrepareOptions, Row, StepResult, SymbolTable};
+pub use connection::{
+    resolve_ext_path, Connection, Origin, PrepareOptions, Row, SqlKind, SqlSource, StepResult, StoredSql, SymbolTable,
+    Syntax,
+};
 pub(crate) use connection::{AtomicTransactionState, TransactionState};
 #[cfg(feature = "simulator")]
 pub use database::{clear_database_registry, SharedWalTestingSnapshot};
