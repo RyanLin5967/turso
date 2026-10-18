@@ -13990,22 +13990,44 @@ fn copy_names_only_the_tables_columns_and_quotes_each() {
 /// only resembles.
 #[test]
 fn schema_and_table_names_holding_quotes_are_quoted_in_engine_text() {
+    // The server refuses CREATE SCHEMA and DROP SCHEMA of any schema but public (0A000, since
+    // 5ab82f374), so the schema statements run through the CLI, the same frontend's builders (the
+    // ATTACH of a schema file, DROP SCHEMA ... CASCADE's DROP TABLE text); the server then opens
+    // the schema files at session open (their ATTACH) and runs DROP SCHEMA public CASCADE. The
+    // first host run (iccad11, 9f5839a88) found this red's premise wrong: CREATE SCHEMA was sent
+    // to the server.
     let dir = Scratch::new("quoted-names");
-    let server = Server::start(&dir.db(), &[]);
-    let mut a = server.connect();
     let mut wrong = Vec::new();
+    let cli = |sql: &str, wrong: &mut Vec<String>| {
+        let out = Command::new(env!("CARGO_BIN_EXE_tursopg"))
+            .arg(dir.db())
+            .arg(sql)
+            .stdin(Stdio::null())
+            .output()
+            .expect("the CLI");
+        if !out.status.success() {
+            wrong.push(format!(
+                "CLI {sql}: {}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+    };
     for sql in [
         "CREATE SCHEMA \"s\"\"x\"",
         "CREATE TABLE \"s\"\"x\".t (a int)",
         "DROP SCHEMA \"s\"\"x\" CASCADE",
-    ] {
-        if let Some(e) = a.q(sql).error {
-            wrong.push(format!("{sql}: {} {}", e.code, e.message));
-        }
-    }
-    for sql in [
+        "CREATE SCHEMA \"s\"\"y\"",
+        "CREATE TABLE \"s\"\"y\".t (a int)",
         "CREATE SCHEMA s",
         "CREATE TABLE s.victim (x int)",
+    ] {
+        cli(sql, &mut wrong);
+    }
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "SELECT count(*) FROM \"s\"\"y\".t",
         "CREATE TABLE \"s\"\".\"\"victim\" (x int)",
         "DROP SCHEMA public CASCADE",
     ] {
