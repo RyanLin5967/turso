@@ -15178,3 +15178,34 @@ fn drop_schema_without_cascade_keeps_a_schema_that_holds_tables() {
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// wire-rev-uw2 H2, a LOCK LEAK from 3605da9f2: a multi-statement simple Query in autocommit runs
+/// in an implicit block, so its reads were noted, and nothing released them when that block
+/// ended: every other session's DROP TABLE of what it read then waited its lock_timeout and was
+/// 55P03, until the session ran a block of its own or left. PG and the base drop at once. Reads
+/// are held to the end of the block that made them, an implicit one included, in both protocols.
+#[test]
+fn an_implicit_blocks_reads_end_with_it() {
+    let dir = Scratch::new("implicit-reads");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut b = server.connect();
+    for t in ["d", "e"] {
+        a.q(&format!("CREATE TABLE {t}(x int)")).ok(t);
+    }
+    let mut wrong = Vec::new();
+    a.q("SELECT x FROM d; SELECT 2").ok("a multi-statement query");
+    named_parse(&mut a, "", "SELECT x FROM e");
+    named_bind(&mut a, "", "");
+    named_execute(&mut a, "");
+    a.send(b'S', &[]);
+    a.read_reply();
+    b.q("SET lock_timeout = '300ms'").ok("lock_timeout");
+    for t in ["d", "e"] {
+        let started = Instant::now();
+        if let Some(e) = b.q(&format!("DROP TABLE {t}")).error {
+            wrong.push(format!("b's DROP TABLE {t} after a's implicit block ended: {} {} after {:?}", e.code, e.message, started.elapsed()));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
