@@ -199,6 +199,8 @@ fn run_arm(arm: Arm, run: usize) -> Result<Reading, Void> {
     let root = tempfile::TempDir::new().map_err(|e| format!("no trace root: {e}"))?;
     let db = open_store(root.path());
     let conn = db.connect().map_err(|e| format!("connect: {e}"))?;
+    // A branch starts from a committed trunk page: one table first.
+    conn.execute("CREATE TABLE t(x)").map_err(|e| format!("seed the trunk: {e}"))?;
     for i in 0..WARMUP {
         conn.create_branch_async(&format!("warm-{run}-{i}")).map_err(|e| format!("warm-up create: {e}"))?;
     }
