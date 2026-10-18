@@ -80,7 +80,9 @@
  *                                 them and the closing of a branch connection) and each apart as after<k>_ns
  *   after sql-serial <sql>        as after sql, but no two clients run a sql-serial statement at the same time (Dolt's
  *                                 branch deletes: concurrent DOLT_BRANCH('-d') can panic or kill the server, a fatal
- *                                 concurrent map read and map write, in 2.4.1 and the registered 2.5.0)
+ *                                 concurrent map read and map write, in 2.4.1 and the registered 2.5.0). It NARROWS
+ *                                 that race and does not close it: a serialized delete still reads other sessions'
+ *                                 state unlocked while they CHECKOUT (comp-rev-dolt250 HIGH-1)
  *   teardown <sql>                once per connection at the end, untimed
  *   c1b <step> <label>            with --c1b-run RUN: an OPSTART "<label>" before the op's first byte and an ACK
  *                                 "<label>" right after step <step> (1-based) is acknowledged, into the C1b trace
@@ -699,8 +701,12 @@ static int run_step(client_t *c, conn_t *cur, int *have_branch, const step_t *st
     /* sql-serial: no two clients run one at the same time (Dolt's DOLT_BRANCH('-d') from concurrent sessions races
      * validateBranchNotActiveInAnySession: in 2.4.1 AND the registered 2.5.0 it can recover a nil-pointer panic or kill
      * the server with a fatal concurrent map read and map write; artie runs/uw-20261018-pc241 (2.4.1 dies without
-     * churn) and runs/uw-20261018-dolt250churn4-b29acc86b (2.5.0); lead review 62430d8bf..b49fb656a HIGH 1). Used in
-     * untimed after-steps only. */
+     * churn) and runs/uw-20261018-dolt250churn4-b29acc86b (2.5.0); lead review 62430d8bf..b49fb656a HIGH 1). This
+     * NARROWS the race and does not close it (comp-rev-dolt250 HIGH-1: serialized, 2.5.0 still recovered panics at
+     * session.go:1752 <- dolt_branch.go:345). The delete reads every other session's dbState (lookupDbState,
+     * session.go:276) without that session's lock, and the conflicting writer can be another session's CHECKOUT,
+     * which no lock here orders. So a failed op in a serialized Dolt cell is a failure the cell reports, never
+     * something serialization rules out. Used in untimed after-steps only. */
     uint64_t wait_start = now_ns();
     pthread_mutex_lock(&g_serial_mu);
     uint64_t wait_end = now_ns();
@@ -1516,7 +1522,7 @@ int main(int argc, char **argv) {
             mean_inflight, mean_serial_waiters, effective_c,
             sql_serial ? "true" : "false", reduced_concurrency ? "REDUCED-CONCURRENCY" : "registered",
             reduced_concurrency ? "false" : "true",
-            sql_serial && C > 1 ? "Dolt 2.4.1/2.5.0 concurrent-delete panic and server crash: deletes serialized; see DECISIONS 2026-10-09T18:51:35Z" : "");
+            sql_serial && C > 1 ? "Dolt 2.4.1/2.5.0 concurrent-delete panic and server crash: deletes serialized, which narrows the race and does not close it; see DECISIONS 2026-10-09T18:51:35Z" : "");
     {   /* MED 4: the measured window on CLOCK_REALTIME (the tracer sweeps' clock), mapped through one offset read now,
          * and the load generator's own TracerPid at its start and end */
         struct timespec rt;
