@@ -1514,6 +1514,22 @@ pub(crate) fn session_translation(
     let mut translated = first
         .translate_with_prereqs(parse_result)
         .map_err(|e| LimboError::ParseError(e.into()))?;
+    // A column type no built-in type covers must be a type the engine knows: otherwise it is
+    // PostgreSQL's 42704 with its message, before anything runs (wire-rev-uw1 M1; recorded,
+    // pg18-rev-uw1-type.out). The engine refused it as 42601 'unknown datatype'.
+    let user_types = first.user_column_types();
+    if !user_types.is_empty() {
+        let schema = pg_conn.conn.current_schema();
+        if let Some(missing) = user_types
+            .iter()
+            .find(|name| schema.get_type_def_unchecked(&name.to_lowercase()).is_none())
+        {
+            return Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
+                SqlErrorKind::UndefinedObject,
+                format!("type \"{missing}\" does not exist"),
+            )));
+        }
+    }
     let unmapped = first.unmapped_cast_types();
     if !unmapped.is_empty() {
         let schema = pg_conn.conn.current_schema();

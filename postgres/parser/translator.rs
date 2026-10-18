@@ -84,6 +84,10 @@ pub struct PostgreSQLTranslator {
     /// was dropped here, so `CAST(-5 AS dm)` skipped dm's CHECK and returned -5 (the domain CHECK
     /// class's PG 18.6 replay, 2026-10-15).
     unmapped_casts: std::cell::RefCell<Vec<String>>,
+    /// The column types this translation met that are no built-in type, as the client wrote
+    /// them, for the caller to check against the engine's types before anything runs
+    /// ([`PostgreSQLTranslator::user_column_types`]; wire-rev-uw1 M1).
+    user_column_types: std::cell::RefCell<Vec<String>>,
 }
 
 /// One WITH's CTEs: each name, with its output columns when its query names them all.
@@ -143,6 +147,13 @@ impl PostgreSQLTranslator {
     /// translates again with the ones it knows.
     pub fn unmapped_cast_types(&self) -> Vec<String> {
         self.unmapped_casts.borrow().clone()
+    }
+
+    /// The column types the last translation met that are no built-in type (a user-defined
+    /// type's name, or no type at all), as written: a caller refuses each the engine does not
+    /// know with PostgreSQL's 42704, before the CREATE runs.
+    pub fn user_column_types(&self) -> Vec<String> {
+        self.user_column_types.borrow().clone()
     }
 
     /// The columns `rv` declares, renamed by its alias's column list; None when they cannot be
@@ -756,6 +767,9 @@ impl PostgreSQLTranslator {
         let mapping = map_pg_type(&pg_type, &typmods).ok_or_else(|| {
             ParseError::ParseError(format!("unsupported PostgreSQL type: {pg_type}").into())
         })?;
+        if user_defined_type(&pg_type) {
+            self.user_column_types.borrow_mut().push(pg_type.trim_end_matches("[]").to_string());
+        }
 
         // Serial does NOT imply PRIMARY KEY in PostgreSQL
         let mut is_primary_key = false;
@@ -1232,6 +1246,9 @@ impl PostgreSQLTranslator {
         let mapping = map_pg_type(&pg_type, &typmods).ok_or_else(|| {
             ParseError::ParseError(format!("unsupported PostgreSQL type: {pg_type}").into())
         })?;
+        if user_defined_type(&pg_type) {
+            self.user_column_types.borrow_mut().push(pg_type.trim_end_matches("[]").to_string());
+        }
         let size = match mapping.type_params.as_slice() {
             [p, s] => Some(ast::TypeSize::TypeSize(
                 Box::new(ast::Expr::Literal(ast::Literal::Numeric(p.to_string()))),
@@ -5556,6 +5573,17 @@ pub fn is_serial_type(pg_type: &str) -> bool {
 /// For array types (e.g. `INTEGER[]`, `_int4`), returns the base scalar type
 /// with `array_dimensions > 0` so native Turso arrays are used.
 pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
+    map_pg_type_marked(pg_type, params).map(|(mapping, _)| mapping)
+}
+
+/// Whether map_pg_type passes `pg_type` through as a user-defined type's name, no built-in type
+/// covering it (wire-rev-uw1 M1): the caller checks such a name against the engine's types.
+pub fn user_defined_type(pg_type: &str) -> bool {
+    map_pg_type_marked(pg_type, &[]).is_some_and(|(_, user)| user)
+}
+
+/// [`map_pg_type`], and whether the name passed through as a user-defined type's.
+fn map_pg_type_marked(pg_type: &str, params: &[i64]) -> Option<(PgTypeMapping, bool)> {
     // Check for array types first
     if pg_type.ends_with("[]") || pg_type.starts_with('_') {
         let (base, dims) = if pg_type.ends_with("[]") {
@@ -5568,12 +5596,15 @@ pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
             (&pg_type[1..], 1u32)
         };
         // Recursively map the base type as a scalar
-        let scalar = map_pg_type(base, params)?;
-        return Some(PgTypeMapping {
-            type_name: scalar.type_name,
-            array_dimensions: scalar.array_dimensions + dims,
-            type_params: scalar.type_params,
-        });
+        let (scalar, user) = map_pg_type_marked(base, params)?;
+        return Some((
+            PgTypeMapping {
+                type_name: scalar.type_name,
+                array_dimensions: scalar.array_dimensions + dims,
+                type_params: scalar.type_params,
+            },
+            user,
+        ));
     }
 
     let type_name = match pg_type.to_uppercase().as_str() {
@@ -5593,19 +5624,25 @@ pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
 
         // Parametric types — return base name + params separately
         "VARCHAR" | "CHAR" => {
-            return match params.first() {
-                Some(_) => Some(PgTypeMapping::with_params("varchar", params.to_vec())),
-                None => Some(PgTypeMapping::scalar("TEXT")),
-            };
+            return Some((
+                match params.first() {
+                    Some(_) => PgTypeMapping::with_params("varchar", params.to_vec()),
+                    None => PgTypeMapping::scalar("TEXT"),
+                },
+                false,
+            ));
         }
         "NUMERIC" | "DECIMAL" => {
-            return match params {
-                [p, s] => Some(PgTypeMapping::with_params("numeric", vec![*p, *s])),
-                [p] => Some(PgTypeMapping::with_params("numeric", vec![*p, 0])),
-                // Stored FLOAT8, so it keeps the float8 it was announced as (a REAL declaration
-                // reads as float4).
-                _ => Some(PgTypeMapping::scalar("FLOAT8")),
-            };
+            return Some((
+                match params {
+                    [p, s] => PgTypeMapping::with_params("numeric", vec![*p, *s]),
+                    [p] => PgTypeMapping::with_params("numeric", vec![*p, 0]),
+                    // Stored FLOAT8, so it keeps the float8 it was announced as (a REAL
+                    // declaration reads as float4).
+                    _ => PgTypeMapping::scalar("FLOAT8"),
+                },
+                false,
+            ));
         }
 
         // Base types (no Turso custom type needed)
@@ -5618,7 +5655,7 @@ pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
         // character(n) (libpg_query's bpchar with a length; `char` alone is char(1)); an unbounded
         // bpchar behaves as text.
         "BPCHAR" | "CHARACTER" if !params.is_empty() => {
-            return Some(PgTypeMapping::with_params("bpchar", params.to_vec()));
+            return Some((PgTypeMapping::with_params("bpchar", params.to_vec()), false));
         }
         "TEXT" | "BPCHAR" | "NAME" => "TEXT".into(),
         "BLOB" => "BLOB".into(),
@@ -5637,16 +5674,28 @@ pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
         | "REGCONFIG" | "REGDICTIONARY" | "REGNAMESPACE" | "REGROLE" => "INTEGER".into(),
         "VOID" => "TEXT".into(),
 
-        // Unknown types pass through as-is (e.g. user-defined enums).
-        // The custom type system will validate at CREATE TABLE time.
-        _ => pg_type.to_lowercase(),
+        // Unknown types pass through (e.g. user-defined enums), marked: the caller checks them
+        // against the engine's types (42704) before the CREATE runs.
+        _ => {
+            return Some((
+                PgTypeMapping {
+                    type_name: pg_type.to_lowercase(),
+                    array_dimensions: 0,
+                    type_params: vec![],
+                },
+                true,
+            ))
+        }
     };
 
-    Some(PgTypeMapping {
-        type_name,
-        array_dimensions: 0,
-        type_params: vec![],
-    })
+    Some((
+        PgTypeMapping {
+            type_name,
+            array_dimensions: 0,
+            type_params: vec![],
+        },
+        false,
+    ))
 }
 
 /// Internal DDL plan for FK constraints — used during CREATE TABLE translation.
