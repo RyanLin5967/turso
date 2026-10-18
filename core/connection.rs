@@ -1257,19 +1257,9 @@ impl Connection {
     #[instrument(skip_all, level = Level::DEBUG)]
     #[allow(clippy::disallowed_methods, reason = "an entry point: it delegates to the shared preparation with the kind it states (dialect design R1)")]
     pub fn _prepare(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
-        self.prepare_with_origin(sql, StatementOrigin::Root)
-    }
-
-    #[turso_macros::trace_stack]
-    /// An engine helper's statement (`InternalHelper`) is SQLite text; any other is the client's.
-    #[allow(clippy::disallowed_methods, reason = "an entry point: it delegates to the shared preparation with the kind it states (dialect design R1)")]
-    pub(crate) fn prepare_with_origin(
-        self: &Arc<Connection>,
-        sql: impl AsRef<str>,
-        origin: StatementOrigin,
-    ) -> Result<Statement> {
-        let kind = if origin == StatementOrigin::InternalHelper { SqlKind::engine() } else { SqlKind::client() };
-        self.prepare_text_with_origin(sql, origin, kind)
+        // The client's text, stated (dialect code review LOW-4: prepare_with_origin, now gone, derived
+        // the kind from the origin, a default that could be wrong; it had no other caller).
+        self.prepare_text_with_origin(sql, StatementOrigin::Root, SqlKind::client())
     }
 
     #[turso_macros::trace_stack]

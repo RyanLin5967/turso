@@ -10,7 +10,6 @@ disallowed-methods = [
     { path = "turso_core::connection::Connection::execute", reason = "engine code builds its own SQLite text: use prepare_engine/execute_engine (dialect design REVISION 2)" },
     { path = "turso_core::connection::Connection::execute_sqlite", reason = "engine code builds its own SQLite text: use prepare_engine/execute_engine (dialect design REVISION 2)" },
     { path = "turso_core::connection::Connection::_prepare", reason = "engine code builds its own SQLite text: use prepare_engine/execute_engine (dialect design REVISION 2)" },
-    { path = "turso_core::connection::Connection::prepare_with_origin", reason = "engine code builds its own SQLite text: use prepare_engine/execute_engine (dialect design REVISION 2)" },
     { path = "turso_core::connection::Connection::prepare_text_with_origin", reason = "engine code builds its own SQLite text: use prepare_engine/execute_engine (dialect design REVISION 2)" },
     { path = "turso_core::connection::Connection::prepare_execute_batch", reason = "engine code builds its own SQLite text: use prepare_engine/execute_engine (dialect design REVISION 2)" },
     { path = "turso_core::connection::Connection::consume_stmt", reason = "engine code builds its own SQLite text: use prepare_engine/execute_engine (dialect design REVISION 2)" },
