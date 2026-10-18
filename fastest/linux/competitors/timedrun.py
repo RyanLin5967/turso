@@ -442,8 +442,14 @@ def check(celldir, n, warm_rule=None, live=None, cap=None):
         return f"measured {got} ops, not N={n}"
     if not lab:
         why.append("no labelling run summary")
-    elif short(lab):
-        why.append("labelling run " + short(lab))
+    else:
+        if short(lab):
+            why.append("labelling run " + short(lab))
+        # comp-rev-failcount LOW-3: the labelling run's own verdict and rc, as the timed run's below (bbload refuses a
+        # run with any failed op, rc 3; a refused labelling run must not label a credited cell)
+        want_lv = "capped" if lab.get("capped") is True else "ok"
+        if lab.get("verdict") != want_lv or lab.get("rc") != 0:
+            why.append(f"labelling run verdict {lab.get('verdict')} rc {lab.get('rc')} (want {want_lv}, 0)")
     t = load(os.path.join(celldir, "timed", "summary.json"))
     if t is None or not os.path.exists(os.path.join(celldir, "timed", "raw.tsv")):
         why.append("no timed run (timed/summary.json and timed/raw.tsv): only the traced labelling run's latency")
