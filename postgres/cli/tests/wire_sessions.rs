@@ -15492,6 +15492,70 @@ fn a_schema_whose_name_needs_quoting_holds_tables_and_keeps_its_case() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-uw2 N4: inside a CLI block, a DROP SCHEMA's DETACH waits for COMMIT, and until then
+/// the dropped schema still answered: pg_namespace listed it, and CREATE TABLE s.u succeeded, so
+/// the COMMIT then deleted s.u with the schema's file (DATA LOSS of a table the block had just
+/// made); and dropping then re-creating the schema in one block failed 'already exists'.
+/// PostgreSQL 18.6 (the reviewer's runs, artie 718f73d7c1 reviews/uw2-raws/r5-pg.txt m2c, m2d):
+/// after the drop pg_namespace has no s and s.u is 3F000 'schema "s" does not exist' (the block
+/// then rolls back, s and s.t are kept); a re-created s takes new tables, and they are there
+/// after the COMMIT.
+#[test]
+fn a_schema_dropped_in_a_block_is_gone_until_it_is_created_again() {
+    let dir = Scratch::new("drop-schema-in-block");
+    let script = |input: &str| {
+        let mut cli = Command::new(env!("CARGO_BIN_EXE_tursopg"))
+            .arg(dir.db())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("the CLI");
+        cli.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+        let out = cli.wait_with_output().expect("the CLI");
+        format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
+    };
+    let mut wrong = Vec::new();
+    for sql in ["CREATE SCHEMA s", "CREATE TABLE s.t (x int)", "CREATE SCHEMA q", "CREATE TABLE q.t (x int)"] {
+        let (ok, out) = cli_one(&dir, sql);
+        if !ok {
+            wrong.push(format!("{sql}: {out}"));
+        }
+    }
+    let out = script(
+        "BEGIN;\nDROP SCHEMA s CASCADE;\nSELECT 'listed' FROM pg_namespace WHERE nspname = 's';\n\
+         SELECT 'unlisted' WHERE NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 's');\n\
+         CREATE TABLE s.u (x int);\nCOMMIT;\n",
+    );
+    let listed = out.lines().any(|l| l.split('│').any(|c| c.trim() == "listed"));
+    if listed || !out.contains("unlisted") {
+        wrong.push(format!("pg_namespace after the in-block DROP SCHEMA s: {out}"));
+    }
+    if !out.contains("schema \"s\" does not exist") {
+        wrong.push(format!("CREATE TABLE s.u after the in-block DROP SCHEMA s: {out}"));
+    }
+    let (ok, out) = cli_one(&dir, "SELECT count(*) FROM s.t");
+    if !ok {
+        wrong.push(format!("s.t after the block that failed: {out}"));
+    }
+    let out = script(
+        "BEGIN;\nDROP SCHEMA q CASCADE;\nCREATE SCHEMA q;\nCREATE TABLE q.u (x int);\n\
+         INSERT INTO q.u VALUES (5);\nCOMMIT;\n",
+    );
+    if out.contains("rror") {
+        wrong.push(format!("drop and re-create q in one block: {out}"));
+    }
+    let (ok, out) = cli_one(&dir, "SELECT x FROM q.u");
+    if !ok || !out.contains('5') {
+        wrong.push(format!("q.u after the COMMIT: ok {ok}: {out}"));
+    }
+    let (ok, out) = cli_one(&dir, "SELECT x FROM q.t");
+    if ok {
+        wrong.push(format!("q.t, dropped with the old q, still reads: {out}"));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-uw2 N1, DATA LOSS: through the CLI, DROP SCHEMA without CASCADE on a schema that holds
 /// a table detached it and deleted its file, so the table and its rows were gone, in autocommit,
 /// inside a block, and for `DROP SCHEMA a, b` where only b holds one. PostgreSQL 18.6 refuses with
