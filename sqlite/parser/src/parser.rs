@@ -4810,13 +4810,16 @@ impl<'a> Parser<'a> {
     }
 
     /// The name of CREATE TYPE and DROP TYPE as written: an identifier token with its quotes kept,
-    /// or a bracket-quoted name kept as `[name]`; `schema::type_key` undoes either quoting. Queue
-    /// a-f review L1: `CREATE TYPE [m x]` was refused, since only an identifier token was taken.
+    /// or a bracket-quoted name given as the double-quoted token naming the same identifier
+    /// (`[m x]` as `"m x"`), the one quoted form the type registry's key, the stored SQL and its
+    /// reparse all read alike (`schema::type_key`, `build_create_type_sql`). Queue a-f review L1:
+    /// `CREATE TYPE [m x]` was refused; kept as `[m x]` (7870317a3) it was stored as `"[m x]"`,
+    /// another type, so `"m x"` on a column was unknown (lane raw uw-glibc228-lib-branch-83450678a).
     fn parse_type_name(&mut self) -> Result<String> {
         if let Some(tok) = self.peek()? {
             if tok.token_type == TK_LBRACKET && !self.peeked_empty_brackets() {
                 let name = self.parse_bracket_quoted_name()?;
-                return Ok(format!("[{}]", name.as_str()));
+                return Ok(format!("\"{}\"", name.as_str().replace('"', "\"\"")));
             }
         }
         match self.eat()? {
