@@ -31,11 +31,52 @@ PY_MARK = re.compile(r'''(==|in|\[)\s*\(?\s*\[?\s*["'](--)?self-?test["']''')
 SH_MARK = re.compile(r'''--self-test\)|= *"?--self-test"?''')
 
 
+def _sh_code(line):
+    """LINE with its comment removed: a # that starts a word (line start, or after a blank or ; & | ( ) and is
+    outside quotes begins a comment; ${#x} and quoted #s do not"""
+    q, i = None, 0
+    while i < len(line):
+        ch = line[i]
+        if ch == "\\" and q != "'":
+            i += 2
+            continue
+        if q:
+            if ch == q:
+                q = None
+        elif ch in "'\"":
+            q = ch
+        elif ch == "#" and (i == 0 or line[i - 1] in " \t;&|()"):
+            return line[:i]
+        i += 1
+    return line
+
+
+def _sh_lines(src):
+    """the code lines of a shell source: heredoc bodies (<<WORD, <<'WORD', <<"WORD", <<-WORD) skipped, comments cut"""
+    out, end, strip_tabs = [], None, False
+    for ln in src.splitlines():
+        if end is not None:
+            if (ln.lstrip("\t") if strip_tabs else ln) == end:
+                end = None
+            continue
+        code = _sh_code(ln)
+        out.append(code)
+        m = re.search(r"<<(-?)\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\2", code)
+        if m and "<<<" not in code:
+            end, strip_tabs = m.group(3), m.group(1) == "-"
+    return out
+
+
 def prints_tally(path):
     """linux-rev-uw3 LOW 5: whether a row's SOURCE prints a TALLY line, by parsing, not by text (a comment naming
-    'TALLY ran=' satisfied the old text check). Python: a print() call whose first argument is a string or f-string
-    starting 'TALLY ran=', or a call of tally.line(). Shell: an echo or printf of 'TALLY ran=...' on a line that is not
-    a comment. Blind spot, stated: a print that is present but never reached; the row's run is judged by its output."""
+    'TALLY ran=' satisfied the old text check). linux-rev-uw4 LOW 4 closed the rest of that class:
+    - Python: a print() whose first argument is a string or f-string starting 'TALLY ran=', or a call of tally.line()
+      (an attribute line of the NAME tally), with no file= other than sys.stdout, and not inside a statically dead
+      branch (an `if`/`while` whose test is a falsy constant).
+    - Shell: an echo or printf of 'TALLY ran=...' in code, so not in a comment (a full line, or trailing from an
+      unquoted word-start #) and not in a heredoc body.
+    Blind spots, stated: a print behind a condition that is false at run time, or any other way of never reaching it;
+    the row's run is judged by its output (tally.py), which refuses a row that prints none."""
     import ast
     try:
         src = open(path, errors="replace").read()
@@ -46,19 +87,30 @@ def prints_tally(path):
             tree = ast.parse(src)
         except SyntaxError:
             return False
+        dead = set()
         for node in ast.walk(tree):
-            if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "print" and node.args:
-                a = node.args[0]
-                if isinstance(a, ast.Constant) and isinstance(a.value, str) and a.value.startswith("TALLY ran="):
-                    return True
-                if isinstance(a, ast.JoinedStr) and a.values and isinstance(a.values[0], ast.Constant) \
-                        and str(a.values[0].value).startswith("TALLY ran="):
-                    return True
-                if isinstance(a, ast.Call) and getattr(a.func, "id", getattr(a.func, "attr", None)) == "line":
-                    return True
+            if isinstance(node, (ast.If, ast.While)) and isinstance(node.test, ast.Constant) and not node.test.value:
+                for st in node.body:
+                    dead.update(id(x) for x in ast.walk(st))
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call) and getattr(node.func, "id", None) == "print" and node.args) \
+                    or id(node) in dead:
+                continue
+            fk = [k.value for k in node.keywords if k.arg == "file"]
+            if fk and not (isinstance(fk[0], ast.Attribute) and fk[0].attr == "stdout"
+                           and getattr(fk[0].value, "id", None) == "sys"):
+                continue
+            a = node.args[0]
+            if isinstance(a, ast.Constant) and isinstance(a.value, str) and a.value.startswith("TALLY ran="):
+                return True
+            if isinstance(a, ast.JoinedStr) and a.values and isinstance(a.values[0], ast.Constant) \
+                    and str(a.values[0].value).startswith("TALLY ran="):
+                return True
+            if isinstance(a, ast.Call) and isinstance(a.func, ast.Attribute) and a.func.attr == "line" \
+                    and getattr(a.func.value, "id", None) == "tally":
+                return True
         return False
-    return any(re.search(r"\b(echo|printf)\s+[\"']TALLY ran=", ln) for ln in src.splitlines()
-               if not ln.lstrip().startswith("#"))
+    return any(re.search(r"\b(echo|printf)\s+(['\"]%s\\n['\"]\s+)?[\"']TALLY ran=", ln) for ln in _sh_lines(src))
 
 
 def this_platform():
@@ -339,7 +391,12 @@ def self_test():
             except hostbin.BashMissing:
                 cases.append((f"LOW 5: the host's real {old[0]} (major {hostbin._major(old[0])}) alone is refused", True))
         else:
-            print("INFO: this host has no bash older than 5; the fake-4 case above fires BASH_MIN", flush=True)
+            # linux-rev-uw4 LOW 8, ruled: this case exists only on a host that HAS a bash older than 5, so the case count
+            # is host-dependent by one, on purpose. It is not an N/A: N/A means a case that should run here and could
+            # not, and here there is nothing to run (a T3 box with bash 5 would otherwise never read zero N/A). Said
+            # in the output, so a count differing by one between hosts is explained where it is read
+            print("INFO: this host has no bash older than 5, so the real-old-bash case does not exist here (one case "
+                  "fewer than on RHEL 8); the fake-4 case above fires BASH_MIN", flush=True)
         # the lead's order (2026-10-18, from comp): each real row's source prints its TALLY, so a file that stops is
         # caught by reading it, before any run; and a real row with its TALLY print removed is refused when run
         real = os.path.dirname(HERE)

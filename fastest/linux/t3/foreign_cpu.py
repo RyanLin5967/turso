@@ -13,8 +13,9 @@ where class is
           started with setsid keep their environment, so they stay inside);
   kernel  a kernel thread (no command line);
   foreign everything else, the sampler itself excluded.
-The first time a foreign pid is recorded, an `#owner` row names it: pid, uid, user, and the uwrun run it belongs to
-(for this account's processes, the <NAME> of the <prefix>-runs/<NAME>/ its cwd is under; "-" otherwise). Owners only
+The first time a foreign pid is recorded, an `#owner` row names it: pid, uid, login and the uwrun run it belongs to.
+The login and run are written for this account's processes only (the run is the first component of its cwd under
+uwrun's run roots, see run_roots); any other uid gets "-" for both, so another user's login is never recorded. Owners only
 name busy-host evidence; they never change a verdict, and our own other runs are foreign like anyone's.
 Each tick also writes a `#tick` row (t, foreign_sum, kernel_sum, sut_sum), so a tick in which nothing
 foreign ran is on the record as a zero, not as a missing row.
@@ -41,30 +42,51 @@ import time
 HZ = os.sysconf("SC_CLK_TCK")
 
 
-RUN_RE = re.compile(r"/[A-Za-z0-9_.-]+-runs/([A-Za-z0-9_-]+)(?:/|$)")
+_LOGIN = {}
 
 
-def owner_of(pid):
-    """(uid, user, run) of PID, or None when it is gone. RUN is the uwrun run the process belongs to: for a process of
-    THIS account, the <NAME> of the OUTERMOST <prefix>-runs/<NAME>/ its cwd is under (uwrun's host-local layout, the
-    run dir under /var/tmp or /dev/shm; a runs dir nested inside a run is still that run's), else "-". Another user's cwd cannot be read, so their run is always "-"."""
-    import pwd
+def _login(uid):
+    """uid -> login, looked up once per uid (linux-rev-uw4 E4: NSS, sss on the UW hosts, took up to 7 ms a call inside
+    the sampler's tick loop)"""
+    if uid not in _LOGIN:
+        import pwd
+        try:
+            _LOGIN[uid] = pwd.getpwuid(uid).pw_name
+        except KeyError:
+            _LOGIN[uid] = str(uid)
+    return _LOGIN[uid]
+
+
+def run_roots():
+    """uwrun's own run roots for this account: /var/tmp/<login>-runs, /dev/shm/<login>-runs (host-local) and ~/runs
+    (the NFS home's links, and a --nfs run's real dir), each resolved"""
+    me = _login(os.getuid())
+    return [os.path.realpath(r) for r in (f"/var/tmp/{me}-runs", f"/dev/shm/{me}-runs", os.path.expanduser("~/runs"))]
+
+
+def owner_of(pid, roots=None):
+    """(uid, login, run) of PID, or None when it is gone.
+    - LOGIN is this account's login for its own processes and "-" for any other uid: another user's login is never
+      written (linux-rev-uw4 E6: committed raws carried one); their uid identifies them.
+    - RUN is the uwrun run one of OUR processes belongs to: the first path component under one of ROOTS (default
+      run_roots()) of its cwd, so a runs dir nested inside a run is still that run's, and a directory that merely ends
+      in "-runs" elsewhere is no run (linux-rev-uw4 E2); "-" otherwise. Another user's cwd cannot be read."""
     try:
         uid = os.stat(f"/proc/{pid}").st_uid
     except OSError:
         return None
-    try:
-        user = pwd.getpwuid(uid).pw_name
-    except KeyError:
-        user = str(uid)
+    if uid != os.getuid():
+        return uid, "-", "-"
     run = "-"
-    if uid == os.getuid():
-        try:
-            m = RUN_RE.search(os.readlink(f"/proc/{pid}/cwd"))
-            run = m.group(1) if m else "-"
-        except OSError:
-            pass
-    return uid, user, run
+    try:
+        cwd = os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        cwd = ""
+    for r in (run_roots() if roots is None else [os.path.realpath(x) for x in roots]):
+        if cwd.startswith(r + "/"):
+            run = cwd[len(r) + 1:].split("/", 1)[0] or "-"
+            break
+    return uid, _login(uid), run
 
 
 def read_procs(cell):
@@ -168,7 +190,7 @@ def busy_evidence(path, exclude=(), interval_default=1.0):
     for line in open(path):
         p = line.rstrip("\n").split("\t")
         if p[0] == "#owner" and len(p) == 5:
-            owners[int(p[1])] = (p[3], p[4])
+            owners[int(p[1])] = (int(p[2]), p[3], p[4])
         elif p[0] == "#start":
             for x in p[1:]:
                 if x.startswith("interval="):
@@ -206,7 +228,9 @@ def busy_evidence(path, exclude=(), interval_default=1.0):
         pid = int(e.rsplit(" pid ", 1)[1])
         if pid not in owners:
             return f"{e} (owner unrecorded)"
-        user, run = owners[pid]
+        uid, user, run = owners[pid]
+        if uid != os.getuid():
+            return f"{e} (another user, uid {uid})"
         return f"{e} (user {user}, our run {run})" if run != "-" else f"{e} (user {user})"
     return [who(e) for e in out]
 
@@ -224,6 +248,10 @@ def burners_ran(v, burners, mine, rec=None):
     foreign = [b for b in burners if b[0] is False]
     if sut and (v.get("sut_max") or 0.0) < 80.0 * len(sut):
         return False
+    # linux-rev-uw4 LOW 5: and an upper bound: a burner is one core, so a SUT total above 120% per SUT burner (plus 20
+    # for the self-test's own short-lived helpers) is a sampler that over-counts (mutant F6, 10x), not a burner seen
+    if sut and (v.get("sut_max") or 0.0) > 120.0 * len(sut) + 20.0:
+        return False
     children = [b for b in burners if b[0] == "child"]
     if children:
         if rec is None:
@@ -231,7 +259,8 @@ def burners_ran(v, burners, mine, rec=None):
         hot = {}
         for line in open(rec):
             p = line.rstrip("\n").split("\t")
-            if not p[0].startswith("#") and len(p) == 5 and p[4] == "sut" and int(p[1]) not in mine and float(p[3]) >= 80.0:
+            if not p[0].startswith("#") and len(p) == 5 and p[4] == "sut" and int(p[1]) not in mine \
+                    and 80.0 <= float(p[3]) <= 120.0:
                 hot[int(p[1])] = hot.get(int(p[1]), 0) + 1
         if sum(1 for n in hot.values() if n >= 5) < len(children):
             return False
@@ -523,6 +552,7 @@ def self_test():
     try:
         got = {k: own(v.pid, roots=[root]) for k, v in procs_.items()}
         got_default_slash = own(procs_["slash"].pid)
+        got_pid1 = own(1)
     finally:
         for c_ in procs_.values():
             c_.kill(); c_.wait()
@@ -570,6 +600,8 @@ def self_test():
         ("uw4 E3: our own process whose cwd is / has user us and run - (with the planted root and the default roots)",
          got["slash"] == (me_uid, me_user, "-") and got_default_slash == (me_uid, me_user, "-")),
         ("uw4 E4: the login of a uid is looked up once, not once per lookup (50 lookups)", calls[0] <= 1),
+        ("uw4 E6: owner_of on pid 1 (another uid: root's init) records its uid and no login and no run",
+         os.getuid() == 0 or (got_pid1 is not None and got_pid1[0] != me_uid and got_pid1[1:] == ("-", "-"))),
         ("owner: sample() writes an #owner row for a foreign pid it records, with our user",
          len(burn_owner) == 1 and burn_owner[0][3] == me_user),
     ]
