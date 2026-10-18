@@ -14996,6 +14996,107 @@ fn a_regclass_names_its_relations_oid() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-uw2 H3 and the regclass MED and LOW: '...'::regclass refused every catalog name 42P01
+/// ('pg_class', 'pg_catalog.pg_class', 'pg_namespace'), so a catalog join on
+/// `classoid = 'pg_class'::regclass` that ran at the base failed; a quoted mixed-case table was
+/// found by its folded name and not by its own; views and sequences were 42P01; blanks around
+/// the dot were 42602; and over-qualified names were 42602. PostgreSQL 18.6 (recorded with these
+/// statements: pg18-rev-uw2-regclass.out) resolves pg_catalog first, with its fixed oids
+/// (pg_class 1259), reads a quoted part as written and an unquoted one folded, has every view
+/// and sequence in pg_class (relkind v and S), allows blanks around each part, refuses four parts
+/// 42601 and another database's name 0A000, and takes the current database's.
+#[test]
+fn a_regclass_resolves_catalogs_quoted_names_views_and_sequences() {
+    let dir = Scratch::new("regclass-uw2");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE TABLE \"U2\"(x int)",
+        "CREATE TABLE w3(x int)",
+        "CREATE VIEW vw3 AS SELECT x FROM w3",
+        "CREATE SEQUENCE sqw3",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    for (name, oid) in [
+        ("pg_class", "1259"),
+        ("pg_namespace", "2615"),
+        ("pg_attribute", "1249"),
+        ("pg_roles", "12000"),
+        ("pg_proc", "1255"),
+        ("pg_database", "1262"),
+        ("pg_am", "2601"),
+        ("pg_type", "1247"),
+        ("pg_collation", "3456"),
+        ("pg_attrdef", "2604"),
+        ("pg_description", "2609"),
+        ("pg_publication", "6104"),
+        ("pg_publication_namespace", "6237"),
+        ("pg_publication_rel", "6106"),
+        ("pg_sequences", "12048"),
+        ("pg_constraint", "2606"),
+        ("pg_index", "2610"),
+        ("pg_inherits", "2611"),
+        ("pg_rewrite", "2618"),
+        ("pg_foreign_table", "3118"),
+        ("pg_partitioned_table", "3350"),
+        ("pg_trigger", "2620"),
+        ("pg_policy", "3256"),
+        ("pg_tables", "12033"),
+        ("pg_indexes", "12043"),
+        ("pg_catalog.pg_class", "1259"),
+        ("pg_catalog.pg_namespace", "2615"),
+        ("PG_CLASS", "1259"),
+    ] {
+        let sql = format!("SELECT '{name}'::regclass::oid");
+        let r = a.q(&sql);
+        if r.error.is_some() || r.rows != vec![vec![Some(oid.to_string())]] {
+            wrong.push(format!("{sql}: {:?} {:?}, PostgreSQL {oid}", r.rows, r.error));
+        }
+    }
+    let db = a.q("SELECT current_database()").rows[0][0].clone().unwrap_or_default();
+    let t = Some("t".to_string());
+    for name in ["\"U2\"", "w3", "public.w3", "vw3", "sqw3", " public . w3 ", "public .w3", &format!("{db}.public.w3")] {
+        let relname = name.trim().rsplit(['.', ' ']).next().unwrap_or_default().trim_matches('"').to_string();
+        let sql = format!("SELECT '{name}'::regclass = (SELECT oid FROM pg_class WHERE relname = '{relname}')");
+        let r = a.q(&sql);
+        if r.error.is_some() || r.rows != vec![vec![t.clone()]] {
+            wrong.push(format!("{sql}: {:?} {:?}, PostgreSQL t", r.rows, r.error));
+        }
+    }
+    let r = a.q("SELECT relname, relkind FROM pg_class WHERE relname IN ('U2', 'w3', 'vw3', 'sqw3') ORDER BY relname");
+    let want: Vec<Vec<Option<String>>> = [("U2", "r"), ("sqw3", "S"), ("vw3", "v"), ("w3", "r")]
+        .iter()
+        .map(|(n, k)| vec![Some(n.to_string()), Some(k.to_string())])
+        .collect();
+    if r.error.is_some() || r.rows != want {
+        wrong.push(format!("pg_class rows: {:?} {:?}, PostgreSQL {want:?}", r.rows, r.error));
+    }
+    for (name, code, message) in [
+        ("pg_input_error_info", "42P01", "relation \"pg_input_error_info\" does not exist".to_string()),
+        ("pg_get_tabledef", "42P01", "relation \"pg_get_tabledef\" does not exist".to_string()),
+        ("\"PG_CLASS\"", "42P01", "relation \"PG_CLASS\" does not exist".to_string()),
+        ("public.pg_class", "42P01", "relation \"public.pg_class\" does not exist".to_string()),
+        ("pg_catalog.w3", "42P01", "relation \"pg_catalog.w3\" does not exist".to_string()),
+        ("U2", "42P01", "relation \"u2\" does not exist".to_string()),
+        ("x.y.z.w", "42601", "improper relation name (too many dotted names): x.y.z.w".to_string()),
+        (
+            "otherdb.public.w3",
+            "0A000",
+            "cross-database references are not implemented: \"otherdb.public.w3\"".to_string(),
+        ),
+    ] {
+        let sql = format!("SELECT '{name}'::regclass");
+        let r = a.q(&sql);
+        match &r.error {
+            Some(e) if e.code == code && e.message == message => {}
+            other => wrong.push(format!("{sql}: want {code} {message:?}, got {other:?} {:?}", r.rows)),
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-uw1 M3 (DESTRUCTIVE at 56e4400d9): the server's refusal compared "public" without
 /// case, and the frontend then lowercased the name, so DROP SCHEMA "PUBLIC" CASCADE dropped every
 /// public table. A quoted "PUBLIC" is a schema of its own: PG 18.6 answers 3F000 'schema "PUBLIC"
