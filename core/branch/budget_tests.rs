@@ -3027,7 +3027,8 @@ fn the_budget_counters_count_exactly_what_was_done() {
         assert_eq!(get("fc_writer_settled_cost", k), 0, "1,000 settle checks of a parked writer moved {k} (review C14)");
     }
     assert_eq!(get("fc_thread_count", "after"), get("fc_thread_count", "base"), "an exited thread counted");
-    #[cfg(target_vendor = "apple")]
+    // FLAGGED (the Linux port, 2026-10-18): the thread-state checks run wherever the readers exist.
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
     {
         assert_eq!(get("fc_thread_count", "with_persistent"), get("fc_thread_count", "base"), "a persistent store thread counted");
         assert_eq!(get("fc_thread_count", "parked_blocked"), 1, "a parked thread not read as blocked");
@@ -3275,6 +3276,121 @@ fn an_armed_hold_before_any_window_allocates_nothing_under_the_mutex() {
     assert!(out.status.success() && text.contains("test result: ok. 1 passed"), "premise: the arm child ran:\n{text}");
     let line = text.lines().find_map(|l| l.find("ARM-CHILD ").map(|i| l[i..].to_string())).unwrap_or_else(|| panic!("premise: the arm child reported nothing:\n{text}"));
     assert_eq!(line.trim(), "ARM-CHILD held_allocs 0 held_bytes 0", "an armed hold before any window allocated under the store mutex");
+}
+
+/// The probe's thread-state readers (lead ruling 2026-10-18, the Linux port): `thread_table`,
+/// `others_blocked` and `threads`, on which every budget window closes, read a parked thread as
+/// blocked and a spinning one as running, each forced, list every thread with its own id and CPU
+/// time, and mark the caller. The same assertions hold on Apple (Mach, the semantics of record) and
+/// on Linux (/proc/self/task): this is the parity check; where the platforms differ is stated at
+/// `thread_table`. Run in a child of its own, so no other test's threads run beside it. Expected ids
+/// come from the platform (pthread_threadid_np, gettid), never from the readers.
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+#[test]
+fn the_thread_state_readers_read_blocked_and_running_threads() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::{Acquire, Release}};
+    fn platform_tid() -> u64 {
+        #[cfg(target_vendor = "apple")]
+        let id = {
+            let mut me = 0u64;
+            // SAFETY: this thread's own id into a local.
+            unsafe { libc::pthread_threadid_np(0, &mut me) };
+            me
+        };
+        // SAFETY: the raw syscall (glibc before 2.30 has no gettid wrapper); it cannot fail.
+        #[cfg(not(target_vendor = "apple"))]
+        let id = unsafe { libc::syscall(libc::SYS_gettid) } as u64;
+        id
+    }
+    if std::env::var_os("FE_THREAD_STATE_CHILD").is_none() {
+        if in_child() || std::env::var_os("FE_FLAGS_CHILD").is_some() || std::env::var_os("FE_ARM_CHILD").is_some() {
+            return;
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["branch::budget_tests::the_thread_state_readers_read_blocked_and_running_threads", "--exact", "--test-threads=1", "--nocapture"])
+            .env("FE_THREAD_STATE_CHILD", "1")
+            .env_remove("FE_BUDGET_CHILD")
+            .output()
+            .unwrap();
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success() && text.contains("test result: ok. 1 passed"), "the thread-state readers, in their own child:\n{text}");
+        return;
+    }
+    let me = platform_tid();
+    let (parked_id, spinner_id) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let parked = {
+        let id = parked_id.clone();
+        std::thread::spawn(move || {
+            id.store(platform_tid(), Release);
+            let _ = rx.recv();
+        })
+    };
+    let stop = Arc::new(AtomicBool::new(false));
+    let spinner = {
+        let (id, stop) = (spinner_id.clone(), stop.clone());
+        std::thread::spawn(move || {
+            id.store(platform_tid(), Release);
+            while !stop.load(Acquire) {
+                std::hint::spin_loop();
+            }
+        })
+    };
+    while parked_id.load(Acquire) == 0 || spinner_id.load(Acquire) == 0 {
+        std::hint::spin_loop();
+    }
+    let (pid, sid) = (parked_id.load(Acquire), spinner_id.load(Acquire));
+    let read = || {
+        let mut t = [probe::ThreadCpu::EMPTY; 48];
+        let n = probe::thread_table(&mut t).expect("CLAIM: the thread table cannot be read on this platform");
+        (n, t)
+    };
+    let find = |t: &[probe::ThreadCpu; 48], id: u64| t.iter().copied().find(|x| x.id == id && x.id != 0);
+    // Forced blocked: the parked thread reads waiting (it may still be on its way into the wait).
+    let t0 = std::time::Instant::now();
+    let (n, t) = loop {
+        let (n, t) = read();
+        if find(&t, pid).is_some_and(|x| x.waiting) || t0.elapsed() > std::time::Duration::from_secs(5) {
+            break (n, t);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    };
+    assert!(n >= 3 && n <= 48, "premise: {n} threads listed (this thread, the parked one, the spinner, the harness's)");
+    let mine: Vec<_> = t.iter().filter(|x| x.me).collect();
+    assert_eq!(mine.len(), 1, "CLAIM: the caller is not marked exactly once");
+    assert_eq!(mine[0].id, me, "CLAIM: the caller's id is not the platform's thread id");
+    let p = find(&t, pid).unwrap_or_else(|| panic!("CLAIM: the parked thread (id {pid}) is not listed"));
+    assert!(p.waiting, "CLAIM: a parked thread does not read blocked");
+    let s0 = find(&t, sid).unwrap_or_else(|| panic!("CLAIM: the spinning thread (id {sid}) is not listed"));
+    assert!(!s0.waiting, "CLAIM: a spinning thread reads blocked");
+    let mut ids: Vec<u64> = t[..n].iter().map(|x| x.id).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), n, "CLAIM: two listed threads share an id");
+    // CPU time: the spinner's grows, the parked thread's does not.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let (_, t2) = read();
+    let s1 = find(&t2, sid).expect("CLAIM: the spinning thread vanished");
+    let p1 = find(&t2, pid).expect("CLAIM: the parked thread vanished");
+    assert!(s1.cpu_ns >= s0.cpu_ns + 20_000_000, "CLAIM: 100 ms of spinning moved its CPU time {} ns -> {} ns", s0.cpu_ns, s1.cpu_ns);
+    assert_eq!(p1.cpu_ns, p.cpu_ns, "CLAIM: a parked thread's CPU time moved");
+    assert_eq!(probe::others_blocked(), Some(false), "CLAIM: others_blocked missed the running spinner");
+    let with = probe::threads().expect("CLAIM: the thread count cannot be read on this platform");
+    stop.store(true, Release);
+    spinner.join().unwrap();
+    // Forced blocked again: with the spinner gone, every other thread reads blocked, soon.
+    let t0 = std::time::Instant::now();
+    while probe::others_blocked() != Some(true) && t0.elapsed() < std::time::Duration::from_secs(5) {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert_eq!(probe::others_blocked(), Some(true), "CLAIM: with only a parked thread beside it, others_blocked is not true");
+    let t0 = std::time::Instant::now();
+    while probe::threads() != Some(with - 1) && t0.elapsed() < std::time::Duration::from_secs(5) {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert_eq!(probe::threads(), Some(with - 1), "CLAIM: the joined spinner is still counted");
+    tx.send(()).unwrap();
+    parked.join().unwrap();
 }
 
 /// Counters review MED-5, review 2 HIGH 2 and review 3 MED-B/LOW-4/LOW-10 (DECISIONS 7d1c461378,
