@@ -3300,7 +3300,7 @@ fn engine_text_quotes_every_name_it_interpolates() {
     let side = dir.path().join("side.db");
     let mut failed: Vec<String> = Vec::new();
     {
-        let db = open_at(&path, DatabaseOpts::new());
+        let db = open_at(&path, DatabaseOpts::new().with_attach(true));
         let c = db.connect().unwrap();
         let mut case = |name: &str, sqls: &[String]| {
             for sql in sqls {
@@ -3346,7 +3346,7 @@ fn engine_text_quotes_every_name_it_interpolates() {
             }
         }
     }
-    let db = open_at(&path, DatabaseOpts::new());
+    let db = open_at(&path, DatabaseOpts::new().with_attach(true));
     let c = db.connect().unwrap();
     for (name, sql) in [("view v\"x, reopened", "SELECT a FROM \"v\"\"x\""), ("view w x, reopened", "SELECT * FROM \"w x\"")] {
         if let Err(e) = c.prepare(sql).and_then(|mut s| s.run_collect_rows()) {
