@@ -706,6 +706,8 @@ pub(super) fn extract_string_literal(expr: &ast::Expr) -> crate::Result<String> 
         ast::Expr::Literal(ast::Literal::String(s)) if s.len() >= 2 && s.starts_with('\'') && s.ends_with('\'') => {
             Ok(sanitize_string(s))
         }
+        // A literal built without its quotes (not the parser's form) is taken as written, as before.
+        ast::Expr::Literal(ast::Literal::String(s)) => Ok(s.clone()),
         _ => crate::bail_parse_error!("expected a string literal argument"),
     }
 }
