@@ -1865,7 +1865,15 @@ impl Session {
             st.described.clear();
             std::mem::take(&mut st.notices)
         };
-        (self.deliverable(notices), self.transaction_status())
+        let status = self.transaction_status();
+        // A round that ends outside a block has ended every block it ran, an implicit one
+        // included, by whatever path (end_implicit, fail_block, after_implicit, a failure): the
+        // reads they held go (wire-rev-uw2 H2: a multi-statement Query's implicit block kept its
+        // reads to the session's end, and every other session's DROP of one was 55P03).
+        if matches!(status, TransactionStatus::Idle) {
+            self.release_block_reads();
+        }
+        (self.deliverable(notices), status)
     }
 
     /// The ParameterStatus PostgreSQL sends ahead of a ReadyForQuery for a reported setting
