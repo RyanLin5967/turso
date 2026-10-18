@@ -88,7 +88,7 @@ ROWS = [
      '        print(f"v3l_mutants: REFUSED: stale table: {stale}")\n',
      "LOW 14: main() on a table with a row that breaks the syntax", "UNRUN (QUIET)"),
     ("V2-no-layout-control", "3a1990f6a / review 6 LOW 15: the temp layout's unmutated control not judged",
-     "t3", "v3l_mutants.py", MUTSELF, '    if rc2 != 0 or fails2 or total2 != total:\n', '    if False:\n',
+     "t3", "v3l_mutants.py", MUTSELF, '    if not layout_control_ok(rc2, err2, total2, total):\n', '    if False:\n',
      "LOW 15: main() whose temp layout lacks testdata returns 2", "UNRUN (QUIET)"),
 ]
 
