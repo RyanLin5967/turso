@@ -61,6 +61,7 @@ pub fn sqlstate(kind: SqlErrorKind) -> &'static str {
         InvalidName => "42602",
         InvalidSchemaName => "3F000",
         DependentObjectsStillExist => "2BP01",
+        InvalidTableDefinition => "42P16",
         TooManyConnections => "53300",
         Warning => "01000",
         SuccessfulCompletion => "00000",

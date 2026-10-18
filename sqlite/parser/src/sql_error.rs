@@ -56,6 +56,7 @@ pub enum SqlErrorKind {
     InvalidName,
     InvalidSchemaName,
     DependentObjectsStillExist,
+    InvalidTableDefinition,
     TooManyConnections,
     Warning,
     SuccessfulCompletion,

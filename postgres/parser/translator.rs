@@ -764,10 +764,11 @@ impl PostgreSQLTranslator {
         });
         let is_serial = is_serial_type(&pg_type) || is_identity;
 
+        let user_type = column_type_checked(&name, &pg_type)?;
         let mapping = map_pg_type(&pg_type, &typmods).ok_or_else(|| {
             ParseError::ParseError(format!("unsupported PostgreSQL type: {pg_type}").into())
         })?;
-        if user_defined_type(&pg_type) {
+        if user_type {
             self.user_column_types.borrow_mut().push(pg_type.trim_end_matches("[]").to_string());
         }
 
@@ -1243,10 +1244,11 @@ impl PostgreSQLTranslator {
 
         let pg_type = extract_type_name(col_def)?;
         let typmods = extract_integer_typmods(col_def);
+        let user_type = column_type_checked(&col_def.colname, &pg_type)?;
         let mapping = map_pg_type(&pg_type, &typmods).ok_or_else(|| {
             ParseError::ParseError(format!("unsupported PostgreSQL type: {pg_type}").into())
         })?;
-        if user_defined_type(&pg_type) {
+        if user_type {
             self.user_column_types.borrow_mut().push(pg_type.trim_end_matches("[]").to_string());
         }
         let size = match mapping.type_params.as_slice() {
@@ -5682,6 +5684,14 @@ fn map_pg_type_marked(pg_type: &str, params: &[i64]) -> Option<(PgTypeMapping, b
         "OID" | "REGCLASS" | "REGTYPE" | "REGPROC" | "REGPROCEDURE" | "REGOPER" | "REGOPERATOR"
         | "REGCONFIG" | "REGDICTIONARY" | "REGNAMESPACE" | "REGROLE" => "INTEGER".into(),
         "VOID" => "TEXT".into(),
+        // Built-in types PostgreSQL takes as column types, kept as their text (or a number for
+        // the transaction ids), as the geometric types are: they were 42704 (wire-rev-uw2 LOW;
+        // r5-pg.txt t_6, t_44, t_57 ... t_63).
+        "INT4RANGE" | "INT8RANGE" | "NUMRANGE" | "TSRANGE" | "TSTZRANGE" | "DATERANGE"
+        | "INT4MULTIRANGE" | "INT8MULTIRANGE" | "NUMMULTIRANGE" | "TSMULTIRANGE"
+        | "TSTZMULTIRANGE" | "DATEMULTIRANGE" => "TEXT".into(),
+        "INT2VECTOR" | "OIDVECTOR" | "TID" | "PG_LSN" | "TXID_SNAPSHOT" | "PG_SNAPSHOT" => "TEXT".into(),
+        "XID" | "XID8" | "CID" => "INTEGER".into(),
 
         // Unknown types pass through (e.g. user-defined enums), marked: the caller checks them
         // against the engine's types (42704) before the CREATE runs.
@@ -5960,6 +5970,31 @@ fn pg_type_name_to_ast_type(type_name: &pg_query::protobuf::TypeName) -> Option<
         size: None,
         array_dimensions: 0,
     })
+}
+
+/// PostgreSQL's pseudo-types, which no column may have (42P16 'column "a" has pseudo-type X').
+const PSEUDO_TYPES: [&str; 25] = [
+    "any", "anyelement", "anyarray", "anynonarray", "anyenum", "anyrange", "anymultirange",
+    "anycompatible", "anycompatiblearray", "anycompatiblenonarray", "anycompatiblerange",
+    "anycompatiblemultirange", "record", "void", "trigger", "event_trigger", "unknown", "cstring",
+    "internal", "language_handler", "fdw_handler", "table_am_handler", "index_am_handler",
+    "tsm_handler", "pg_ddl_command",
+];
+
+/// A column's type as PostgreSQL reads one, before it is mapped (wire-rev-uw2 LOW, M1's edges;
+/// r5-pg.txt): a pseudo-type is 42P16; and a name the built-in mapping took only because it
+/// compares without case (a quoted "INT4": built-in names are lower case, and an unquoted one
+/// arrives folded) or that is SQLite's own (blob) is no PostgreSQL type, so it is checked as a
+/// user type's name, which the caller refuses 42704 unless the engine has such a type.
+fn column_type_checked(column: &str, pg_type: &str) -> Result<bool, ParseError> {
+    let base = pg_type.trim_end_matches("[]");
+    if PSEUDO_TYPES.contains(&base) {
+        return Err(ParseError::ParseError(SqlErrorMessage::classified(
+            SqlErrorKind::InvalidTableDefinition,
+            format!("column \"{column}\" has pseudo-type {base}"),
+        )));
+    }
+    Ok(user_defined_type(pg_type) || base.bytes().any(|b| b.is_ascii_uppercase()) || base == "blob")
 }
 
 /// A TypeName's name, its schema dropped where it is one this frontend's types live in:
