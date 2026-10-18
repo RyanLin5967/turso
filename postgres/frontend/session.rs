@@ -1715,7 +1715,7 @@ pub(crate) fn session_translation(
     let first = translator();
     let mut translated = first
         .translate_with_prereqs(parse_result)
-        .map_err(|e| LimboError::ParseError(e.into()))?;
+        .map_err(translation_error)?;
     // A column type no built-in type covers must be a type the engine knows: otherwise it is
     // PostgreSQL's 42704 with its message, before anything runs (wire-rev-uw1 M1; recorded,
     // pg18-rev-uw1-type.out). The engine refused it as 42601 'unknown datatype'.
@@ -1763,11 +1763,25 @@ pub(crate) fn session_translation(
             translated = translator()
                 .with_known_types(known)
                 .translate_with_prereqs(parse_result)
-                .map_err(|e| LimboError::ParseError(e.into()))?;
+                .map_err(translation_error)?;
         }
     }
     reject_catalog_dml(translated.cmd.stmt())?;
     Ok(translated)
+}
+
+/// A translation's refusal as the engine error it is reported with: PostgreSQL's own message, with
+/// no "Parse error: " prefix, for the conditions whose text this frontend writes as PostgreSQL's
+/// (42704 'access method "x" does not exist', 42P16 'column "a" has pseudo-type x'; wire-rev-uw2
+/// LOW), and a parse error as before for every other.
+fn translation_error(e: turso_pg_parser::ParseError) -> LimboError {
+    let message: SqlErrorMessage = e.into();
+    match message.kind() {
+        Some(SqlErrorKind::UndefinedObject | SqlErrorKind::InvalidTableDefinition) => {
+            LimboError::InvalidArgument(message)
+        }
+        _ => LimboError::ParseError(message),
+    }
 }
 
 /// PostgreSQL 18.6's pg_catalog type names but the pg_* ones (recorded: pg18-rev-uw2-casts.out,
