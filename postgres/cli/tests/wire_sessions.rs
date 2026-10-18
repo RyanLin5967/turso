@@ -14420,3 +14420,82 @@ fn a_serial_survives_drop_column_and_a_restart() {
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// One CLI process per statement on `dir`'s database, its stdout and whether it succeeded.
+fn cli_one(dir: &Scratch, sql: &str) -> (bool, String) {
+    let out = Command::new(env!("CARGO_BIN_EXE_tursopg"))
+        .arg(dir.db())
+        .arg(sql)
+        .stdin(Stdio::null())
+        .output()
+        .expect("the CLI");
+    (
+        out.status.success(),
+        format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)),
+    )
+}
+
+/// Review wire-quote MED-3: the schema file of a dropped schema was chosen by hand-parsing the
+/// client's text, in the server only, after prepare and before commit. Through the CLI nothing
+/// deleted it, so the next open attached the dropped schema again; `DROP SCHEMA IF EXISTS "my x"`
+/// read as `my`; `"s""x"` read as `s""x`. The frontend deletes the file of the schema it
+/// resolved and detached, once the DROP is committed.
+#[test]
+fn a_dropped_schemas_file_is_the_resolved_schemas_and_goes_at_commit() {
+    let dir = Scratch::new("drop-schema-file");
+    let mut wrong = Vec::new();
+    let mut must = |sql: &str, wrong: &mut Vec<String>| {
+        let (ok, out) = cli_one(&dir, sql);
+        if !ok {
+            wrong.push(format!("{sql}: {out}"));
+        }
+        out
+    };
+    for sql in [
+        "CREATE SCHEMA my",
+        "CREATE TABLE my.t (x int)",
+        "INSERT INTO my.t VALUES (1)",
+        "DROP SCHEMA IF EXISTS \"my x\"",
+        "CREATE SCHEMA \"s\"\"x\"",
+        "DROP SCHEMA \"s\"\"x\"",
+        "CREATE SCHEMA \"s\"\"x\"",
+        "CREATE SCHEMA gone",
+        "DROP SCHEMA gone",
+        "CREATE SCHEMA gone",
+    ] {
+        must(sql, &mut wrong);
+    }
+    let out = must("SELECT count(*) FROM my.t", &mut wrong);
+    if !out.contains('1') {
+        wrong.push(format!("my.t after DROP SCHEMA IF EXISTS \"my x\": {out}"));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// The server refuses CREATE SCHEMA and DROP SCHEMA of any schema but public (5ab82f374), and it
+/// read the statement's kind from the client's text: a leading comment hid it, so the frontend
+/// ran the DDL on the server. The refusal is decided from the parsed statement.
+#[test]
+fn the_servers_schema_refusal_reads_the_statement_not_its_text() {
+    let dir = Scratch::new("schema-refusal");
+    cli_script(&dir, b"CREATE SCHEMA s;\nCREATE TABLE s.t(x INT);\nINSERT INTO s.t VALUES (2);\n");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    for sql in [
+        "/* c */ CREATE SCHEMA n",
+        "-- c\nCREATE SCHEMA n",
+        "/* c */ DROP SCHEMA s CASCADE",
+        "SELECT 1; DROP SCHEMA s CASCADE",
+    ] {
+        let r = a.q(sql);
+        if r.error.as_ref().map(|e| e.code.as_str()) != Some("0A000") {
+            wrong.push(format!("{sql}: want 0A000, got {:?}", r.error));
+        }
+    }
+    let r = a.q("SELECT x FROM s.t");
+    if r.error.is_some() || r.rows != vec![vec![Some("2".to_string())]] {
+        wrong.push(format!("s.t after the refused DROPs: {:?} {:?}", r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
