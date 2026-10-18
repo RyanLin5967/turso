@@ -15417,6 +15417,39 @@ fn a_rolled_back_drop_of_a_virtual_table_leaves_it_writable() {
     }
 }
 
+/// L6 (queue a-f review, by reading): inside BEGIN, a statement fails after a write and its own
+/// rollback then fails (an I/O error reading the subjournal, by the test failpoint). SQLite 3.51.0
+/// rolls the whole transaction back and returns to autocommit (vdbeaux.c sqlite3VdbeHalt: a failed
+/// vdbeCloseStatement runs sqlite3RollbackAll, sqlite3CloseSavepoints, autoCommit = 1; artie raw
+/// uw-l6-sqlite-vdbeaux-3510.txt). Before the fix the transaction stayed open holding the failed
+/// statement's first row, and a COMMIT would have made it durable.
+#[test]
+fn a_failed_statement_rollback_inside_begin_rolls_the_transaction_back() {
+    let _g = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("l6.db"), DatabaseOpts::new());
+    let c = db.connect().unwrap();
+    c.execute("CREATE TABLE u(x UNIQUE)").unwrap();
+    c.execute("INSERT INTO u VALUES (1)").unwrap();
+    c.execute("BEGIN").unwrap();
+    c.execute("INSERT INTO u VALUES (10)").unwrap();
+    let fail = crate::storage::pager::Pager::fail_next_statement_rollback();
+    fail.store(true, std::sync::atomic::Ordering::SeqCst);
+    let r = c.execute("INSERT INTO u VALUES (2), (1)");
+    let consumed = !fail.swap(false, std::sync::atomic::Ordering::SeqCst);
+    assert!(r.is_err(), "premise: the second row violates UNIQUE: {r:?}");
+    assert!(consumed, "premise: the failing statement's own rollback ran (and failed)");
+    assert!(c.get_auto_commit(), "CLAIM: the failed statement rollback ended the transaction");
+    let commit = c.execute("COMMIT");
+    assert!(commit.is_err(), "CLAIM: no transaction is left to commit: {commit:?}");
+    let rows = adv_rows(&c, "SELECT x FROM u ORDER BY x");
+    assert_eq!(
+        rows.as_ref().ok().map(|r| r.iter().map(|row| row[0].clone()).collect::<Vec<_>>()),
+        Some(vec!["1".to_string()]),
+        "CLAIM: the transaction's rows are gone, the committed one stays: {rows:?}"
+    );
+}
+
 /// ADV-8: a custom type named with each quote form survives a reopen as ONE type: a STRICT column
 /// declared with any spelling of it reads back, and DROP TYPE is refused while the column uses it.
 #[test]
