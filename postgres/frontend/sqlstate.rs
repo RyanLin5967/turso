@@ -58,6 +58,7 @@ pub fn sqlstate(kind: SqlErrorKind) -> &'static str {
         ObjectNotInPrerequisiteState => "55000",
         ObjectInUse => "55006",
         InsufficientPrivilege => "42501",
+        InvalidName => "42602",
         TooManyConnections => "53300",
         Warning => "01000",
         SuccessfulCompletion => "00000",

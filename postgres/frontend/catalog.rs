@@ -487,6 +487,75 @@ pub(crate) fn sqlite_type_to_pg_oid(ty_str: &str) -> i64 {
     }
 }
 
+/// A user table's or index's pg_class oid by its exact name, by the scheme pg_class and
+/// pg_index assign them: tables first in name order, then each table's indexes in order.
+pub(crate) fn relation_oid(schema: &Schema, name: &str) -> Option<i64> {
+    let tables = user_tables_sorted(schema);
+    if let Some(i) = tables.iter().position(|(t, _)| t.as_str() == name) {
+        return Some(USER_TABLE_OID_START + i as i64);
+    }
+    let mut index_oid = USER_TABLE_OID_START + tables.len() as i64;
+    for (table_name, _) in &tables {
+        for idx in schema.get_indices(table_name) {
+            if idx.ephemeral {
+                continue;
+            }
+            if idx.name == name {
+                return Some(index_oid);
+            }
+            index_oid += 1;
+        }
+    }
+    None
+}
+
+/// `text` read as PostgreSQL reads a qualified name in a regclass (stringToQualifiedNameList):
+/// parts split at dots outside double quotes, an unquoted part folded to lower case and holding
+/// no blank, a quoted part as written with `""` as one quote. None for a malformed name.
+pub(crate) fn identifier_list(text: &str) -> Option<Vec<String>> {
+    let mut parts = Vec::new();
+    let mut chars = text.trim().chars().peekable();
+    loop {
+        let mut part = String::new();
+        if chars.peek() == Some(&'"') {
+            chars.next();
+            loop {
+                match chars.next()? {
+                    '"' if chars.peek() == Some(&'"') => {
+                        chars.next();
+                        part.push('"');
+                    }
+                    '"' => break,
+                    c => part.push(c),
+                }
+            }
+            if part.is_empty() {
+                return None;
+            }
+        } else {
+            while let Some(&c) = chars.peek() {
+                if c == '.' {
+                    break;
+                }
+                if c.is_whitespace() || c == '"' {
+                    return None;
+                }
+                part.push(c.to_ascii_lowercase());
+                chars.next();
+            }
+            if part.is_empty() {
+                return None;
+            }
+        }
+        parts.push(part);
+        match chars.next() {
+            None => return Some(parts),
+            Some('.') => continue,
+            Some(_) => return None,
+        }
+    }
+}
+
 /// Build a mapping from table name to OID for all user tables.
 fn table_oid_map(schema: &Schema) -> HashMap<String, i64> {
     let tables = user_tables_sorted(schema);

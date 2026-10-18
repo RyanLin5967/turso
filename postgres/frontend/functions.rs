@@ -22,7 +22,8 @@ pub(crate) fn resolve_scalar(name: &str, arg_count: usize) -> bool {
         | "quote_ident"
         | "quote_literal"
         | "pg_database_size"
-        | "current_schemas" => &[1],
+        | "current_schemas"
+        | "pg_regclass" => &[1],
         "format_type" | "pg_get_constraintdef" | "pg_get_indexdef" | "obj_description" => &[1, 2],
         "pg_get_expr" => &[2, 3],
         "to_char" | "pg_input_is_valid" | "booleq" | "boolne" | "col_description" | "bpchareq"
@@ -53,6 +54,7 @@ pub(crate) fn exec_scalar(conn: &Connection, name: &str, args: &[Value]) -> Resu
         }
         "pg_get_constraintdef" => Ok(exec_pg_get_constraintdef(conn, int_arg(0, 0))),
         "pg_get_indexdef" => Ok(exec_pg_get_indexdef(conn, int_arg(0, 0))),
+        "pg_regclass" => exec_pg_regclass(conn, args),
         "pg_encoding_to_char" => Ok(exec_pg_encoding_to_char(int_arg(0, 0))),
         "format_type" => Ok(exec_pg_format_type(int_arg(0, 0), int_arg(1, -1))),
         "encode" => exec_encode(args),
@@ -174,6 +176,44 @@ fn exec_pg_get_constraintdef(conn: &Connection, oid: i64) -> Value {
         Some(s) => Value::build_text(s),
         None => Value::Null,
     }
+}
+
+/// `value::regclass`: the named relation's pg_class oid (recorded, pg18-rev-regclass.out). A
+/// number is taken as an oid; text is read as PostgreSQL's regclassin reads it, an identifier
+/// list (an unquoted part folded to lower case, a quoted part as written, `public.` the main
+/// schema): a missing relation is 42P01 'relation "<name>" does not exist', a malformed name
+/// 42602 'invalid name syntax'. NULL stays NULL.
+fn exec_pg_regclass(conn: &Connection, args: &[Value]) -> Result<Value> {
+    let text = match args.first() {
+        None | Some(Value::Null) => return Ok(Value::Null),
+        Some(Value::Text(t)) => t.as_str().to_string(),
+        Some(other) => match other.as_int() {
+            Some(oid) => return Ok(Value::from_i64(oid)),
+            None => other.to_string(),
+        },
+    };
+    let invalid = || {
+        LimboError::InvalidArgument(SqlErrorMessage::classified(
+            SqlErrorKind::InvalidName,
+            "invalid name syntax".to_string(),
+        ))
+    };
+    let parts = crate::catalog::identifier_list(&text).ok_or_else(invalid)?;
+    let (schema, name) = match parts.as_slice() {
+        [name] => (None, name.clone()),
+        [schema, name] => (Some(schema.clone()), name.clone()),
+        _ => return Err(invalid()),
+    };
+    let found = match schema.as_deref() {
+        None | Some("public") => crate::catalog::relation_oid(&conn.current_schema(), &name),
+        Some(_) => None,
+    };
+    found.map(Value::from_i64).ok_or_else(|| {
+        LimboError::InvalidArgument(SqlErrorMessage::classified(
+            SqlErrorKind::UndefinedTable,
+            format!("relation \"{}\" does not exist", parts.join(".")),
+        ))
+    })
 }
 
 fn exec_pg_get_indexdef(conn: &Connection, oid: i64) -> Value {

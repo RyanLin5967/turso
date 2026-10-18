@@ -3485,6 +3485,27 @@ impl PostgreSQLTranslator {
                     }
                 }
                 let expr = Box::new(self.translate_expr(arg)?);
+                // A regclass is the named relation's pg_class oid, resolved by the frontend's
+                // pg_regclass (recorded, pg18-rev-regclass.out); a cast to INTEGER made every
+                // name 0.
+                let regclass = type_cast.type_name.as_ref().is_some_and(|t| {
+                    t.names.last().is_some_and(|n| {
+                        matches!(&n.node, Some(pg_query::protobuf::node::Node::String(s)) if s.sval.eq_ignore_ascii_case("regclass"))
+                    })
+                });
+                if regclass {
+                    return Ok(ast::Expr::FunctionCall {
+                        name: pg_name("pg_regclass"),
+                        distinctness: None,
+                        args: vec![expr],
+                        order_by: vec![],
+                        within_group: vec![],
+                        filter_over: ast::FunctionTail {
+                            filter_clause: None,
+                            over_clause: None,
+                        },
+                    });
+                }
                 let type_name = match type_cast.type_name.as_ref() {
                     Some(t) => pg_type_name_to_ast_type(t).or_else(|| self.engine_type(t)),
                     None => None,
