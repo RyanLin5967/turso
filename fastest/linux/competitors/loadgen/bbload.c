@@ -79,7 +79,8 @@
  *   after sql|write|connect|close untimed, after every op (also after a failed one); recorded as after_ns (all of
  *                                 them and the closing of a branch connection) and each apart as after<k>_ns
  *   after sql-serial <sql>        as after sql, but no two clients run a sql-serial statement at the same time (Dolt's
- *                                 branch deletes: 2.4.1 panics on concurrent DOLT_BRANCH('-d'))
+ *                                 branch deletes: concurrent DOLT_BRANCH('-d') panicked 2.4.1 and kills the
+ *                                 registered 2.5.0 with a fatal concurrent map read and map write)
  *   teardown <sql>                once per connection at the end, untimed
  *   c1b <step> <label>            with --c1b-run RUN: an OPSTART "<label>" before the op's first byte and an ACK
  *                                 "<label>" right after step <step> (1-based) is acknowledged, into the C1b trace
@@ -695,8 +696,10 @@ static int run_step(client_t *c, conn_t *cur, int *have_branch, const step_t *st
     }
     conn_t *target = *have_branch ? cur : &c->home;
     if (!st->serial) return conn_exec(target, text, st->k == K_WRITE, why, wsz);
-    /* sql-serial: no two clients run one at the same time (Dolt 2.4.1's DOLT_BRANCH('-d') from concurrent sessions
-     * panics the server; lead review 62430d8bf..b49fb656a HIGH 1). Used in untimed after-steps only. */
+    /* sql-serial: no two clients run one at the same time (Dolt's DOLT_BRANCH('-d') from concurrent sessions: 2.4.1
+     * recovered a nil-pointer panic in validateBranchNotActiveInAnySession; the registered 2.5.0 dies there with a
+     * fatal concurrent map read and map write, artie runs/uw-20261018-dolt250-4078bf83b; lead review 62430d8bf..b49fb656a
+     * HIGH 1). Used in untimed after-steps only. */
     uint64_t wait_start = now_ns();
     pthread_mutex_lock(&g_serial_mu);
     uint64_t wait_end = now_ns();
@@ -1512,7 +1515,7 @@ int main(int argc, char **argv) {
             mean_inflight, mean_serial_waiters, effective_c,
             sql_serial ? "true" : "false", reduced_concurrency ? "REDUCED-CONCURRENCY" : "registered",
             reduced_concurrency ? "false" : "true",
-            sql_serial && C > 1 ? "Dolt 2.4.1 concurrent-delete panic: deletes serialized; see DECISIONS 2026-10-09T18:51:35Z" : "");
+            sql_serial && C > 1 ? "Dolt 2.5.0 concurrent-delete crash (2.4.1: panic): deletes serialized; see DECISIONS 2026-10-09T18:51:35Z" : "");
     {   /* MED 4: the measured window on CLOCK_REALTIME (the tracer sweeps' clock), mapped through one offset read now,
          * and the load generator's own TracerPid at its start and end */
         struct timespec rt;

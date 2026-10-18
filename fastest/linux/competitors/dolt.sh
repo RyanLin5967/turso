@@ -39,7 +39,8 @@ start)
   dolt_quiet_root "$DATA/root"
   require_port_free "$(port_of)"
   # comp review 1 LOW 28: one explicit config, banked with the job, stating the auto-GC behaviour at the vendor default
-  # the probe read from Dolt 2.4.1 (dolt_auto_gc_enabled ON; artie runs/loud-20261015/probe-dolt-gc) instead of
+  # the probe read from Dolt 2.4.1 and the registered 2.5.0 (dolt_auto_gc_enabled ON; artie
+  # runs/loud-20261015/probe-dolt-gc, artie runs/uw-20261018-dolt250-4078bf83b) instead of
   # leaving it implicit; the other settings are the flags this used to pass
   cat >"$DATA/config.yaml" <<EOF
 log_level: warning
@@ -76,7 +77,7 @@ seed)
   # comp review 1 LOW 28: the record is judged (empty, failed or GC-less is refused); run_system.sh fails the job on it
   "$FT_PY" -B "$FT_HERE/fthelp.py" gcsettings "$DATA.gc-settings.txt" >"$DATA.gc-settings.verdict" || true
   # DOLT_GC, judged by an allowlist (lead review 62430d8bf..b49fb656a MED 9: the old check exempted a lost
-  # connection, which is what a recovered panic or a failed handshake looks like; in 2.4.1 DOLT_GC does not end the
+  # connection, which is what a recovered panic or a failed handshake looks like; in 2.4.1 and 2.5.0 DOLT_GC does not end the
   # calling session): client rc 0, its output exactly the status 0, and no panic in the server log written since the
   # CALL (fthelp.py gcverdict); a failed GC fails the seed, and the store size is recorded on both sides of it.
   gc_before=$(du -sB1 "$DATA/dbs/bench" | cut -f1)
