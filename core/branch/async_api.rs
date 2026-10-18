@@ -84,12 +84,19 @@ impl Connection {
     pub fn create_branch_async(self: &Arc<Self>, name: &str) -> Result<AsyncCreated> {
         let id = self.create_branch(name)?;
         self.db.branches.async_stub_mutants();
+        let token = DurableToken {
+            incarnation: self.db.incarnation,
+            lsn: 0,
+        };
+        // Mutant `async_waits_durable` (ASYNC-DESIGN §13; test and fe-mutants builds): the async
+        // path waits for durability before it returns. A no-op at the stub, which already waited;
+        // the seam is here so AD-T5's kill rule for it has a site.
+        if super::store::fe_mutant("async_waits_durable") {
+            self.db.branch_wait_durable(token)?;
+        }
         Ok(AsyncCreated {
             id,
-            token: DurableToken {
-                incarnation: self.db.incarnation,
-                lsn: 0,
-            },
+            token,
             durable_through: id,
         })
     }
