@@ -3823,33 +3823,78 @@ fn run_pg_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<()> {
         .run_ignore_rows()
 }
 
-/// PostgreSQL's privilege check for COPY FROM a server file, before the file is opened: 42501
+/// The file a COPY FROM 'file' reads, opened, with PostgreSQL's privilege check: 42501
 /// 'permission denied to COPY from a file' (recorded, pg18-rev-quote-low.out) unless `files`
-/// grants it. Under a granted directory the file's REAL path decides (a symlink in it pointing
-/// outside is refused); a file that does not exist is judged by its directory's real path, so its
-/// own error comes from the read.
-fn may_read_server_file(files: &ServerFiles, filename: &str) -> Result<()> {
+/// grants it. Under a granted directory the file is opened first and the OPENED file is judged,
+/// by the path the kernel holds for it ([`opened_path`]), which must lie under the directory: a
+/// symlink in it pointing outside is refused, and so is one a local writer flips between the
+/// judgment and the open (wire-rev-uw2 MED: the real path was judged, then the client's name was
+/// opened again, and 1132 of 2673 COPYs through a flipping link read the outside file). A file
+/// that does not open is judged by its directory's real path, so its own error comes from the
+/// read. BLIND SPOTS: a hardlink inside the directory to a file outside it is read (the kernel
+/// may name either link); on a platform with no fd path (neither Linux nor macOS) every granted
+/// read is refused.
+fn open_server_file(files: &ServerFiles, filename: &str) -> Result<std::fs::File> {
     let denied = || {
         Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
             SqlErrorKind::InsufficientPrivilege,
             "permission denied to COPY from a file".to_string(),
         )))
     };
+    let unreadable = |e: std::io::Error| {
+        LimboError::ParseError(format!("COPY FROM: cannot read '{filename}': {e}").into())
+    };
     match files {
-        ServerFiles::Any => Ok(()),
+        ServerFiles::Any => std::fs::File::open(filename).map_err(unreadable),
         ServerFiles::None => denied(),
         ServerFiles::Under(dir) => {
             let path = std::path::Path::new(filename);
-            let real = std::fs::canonicalize(path).or_else(|_| {
-                let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
-                std::fs::canonicalize(parent).map(|p| p.join(path.file_name().unwrap_or_default()))
-            });
-            match real {
-                Ok(real) if real.starts_with(dir) => Ok(()),
-                _ => denied(),
+            match std::fs::File::open(path) {
+                Ok(file) => match opened_path(&file) {
+                    Some(real) if real.starts_with(dir) => Ok(file),
+                    _ => denied(),
+                },
+                Err(e) => {
+                    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+                    match std::fs::canonicalize(parent) {
+                        Ok(p) if p.join(path.file_name().unwrap_or_default()).starts_with(dir) => {
+                            Err(unreadable(e))
+                        }
+                        _ => denied(),
+                    }
+                }
             }
         }
     }
+}
+
+/// The path the kernel holds for an open file: Linux's /proc/self/fd link.
+#[cfg(target_os = "linux")]
+fn opened_path(file: &std::fs::File) -> Option<std::path::PathBuf> {
+    use std::os::fd::AsRawFd;
+    std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).ok()
+}
+
+/// The path the kernel holds for an open file: macOS's fcntl F_GETPATH.
+#[cfg(target_os = "macos")]
+fn opened_path(file: &std::fs::File) -> Option<std::path::PathBuf> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStringExt;
+    let mut buf = vec![0u8; libc::PATH_MAX as usize];
+    // SAFETY: F_GETPATH writes at most PATH_MAX bytes, NUL included, into a buffer of that size.
+    let r = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, buf.as_mut_ptr()) };
+    if r == -1 {
+        return None;
+    }
+    let len = buf.iter().position(|&b| b == 0)?;
+    buf.truncate(len);
+    Some(std::path::PathBuf::from(std::ffi::OsString::from_vec(buf)))
+}
+
+/// No fd path on this platform: every granted read is refused ([`open_server_file`]).
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn opened_path(_file: &std::fs::File) -> Option<std::path::PathBuf> {
+    None
 }
 
 fn handle_pg_copy_from(pg_conn: &Arc<PgConnectionInner>, stmt: &PgCopyFromStmt) -> Result<usize> {
@@ -3862,8 +3907,8 @@ fn handle_pg_copy_from(pg_conn: &Arc<PgConnectionInner>, stmt: &PgCopyFromStmt) 
         ));
     }
     let conn = &pg_conn.conn;
-    may_read_server_file(&pg_conn.server_files, &stmt.filename)?;
-    let data = std::fs::read_to_string(&stmt.filename).map_err(|e| {
+    let mut data = String::new();
+    std::io::Read::read_to_string(&mut open_server_file(&pg_conn.server_files, &stmt.filename)?, &mut data).map_err(|e| {
         LimboError::ParseError(format!("COPY FROM: cannot read '{}': {}", stmt.filename, e).into())
     })?;
 
