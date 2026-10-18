@@ -487,6 +487,8 @@ sudo_state() {
   command -v "$s" > /dev/null 2>&1 || { echo absent; return 0; }
   # in the C locale: sudo localises its message (linux-rev-uw2 LOW 7: de_DE says "Ein Passwort ist notwendig")
   e=$(LC_ALL=C LANG=C LANGUAGE= "$s" -n true 2>&1) && { echo ok; return 0; }
+  # only sudo's LAST line: earlier lines can quote the sudoers file, staff logins included (linux-rev-uw5 L5, ecetesla3)
+  e=$(printf '%s\n' "$e" | sed '/^[[:space:]]*$/d' | tail -1)
   # a sudo that REFUSES this user is no root, as one that wants a password is (ecetesla3, 2026-10-18: "I'm afraid I
   # can't do that"); both are N/A-on-noroot. Anything else (unresolvable host, a broken binary) stays an error
   case $e in

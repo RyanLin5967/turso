@@ -530,9 +530,18 @@ check "u4 host: root_check counts a root case as a no-root N/A under a denying s
 declare -F t3_need_root > /dev/null || t3_need_root() { sudo -n true || return 1; }
 for st_ in denied pw err none; do
   check "u4 ruling: t3_need_root under a '$st_' sudo REFUSES (rc 2), naming the state" \
-    '( T3_SUDO_BIN=$T/sudo/'"$st_"' t3_need_root; rc=$?; [ $rc = 2 ] ) && T3_SUDO_BIN=$T/sudo/'"$st_"' t3_need_root 2>&1 | grep -q "needs passwordless root"'
+    'o_=$(T3_SUDO_BIN=$T/sudo/'"$st_"' t3_need_root 2>&1); rc_=$?; echo "$o_"; [ $rc_ = 2 ] && printf "%s\\n" "$o_" | grep -q "needs passwordless root"'
 done
 check "u4 ruling: t3_need_root under a passwordless sudo passes (rc 0)" '( T3_SUDO_BIN=$T/sudo/ok t3_need_root )'
+# linux-rev-uw5 L3: an 'error' sudo is NOT N/A: root_check runs the case, which fails, and counts no N/A
+check "uw5 L3: root_check under an erroring sudo runs the case and counts its FAIL, never an N/A" \
+  '( T3_SUDO_BIN=$T/sudo/err; pass=0; fail=0; na=0; root_check "probe2" false > "$T/sudo/rc2.out"; [ $fail = 1 ] && [ $na = 0 ] )'
+# linux-rev-uw5 L5: sudo's stderr can carry a sudoers line naming a staff login (ecetesla3); sudo_state keeps only
+# sudo's LAST line, so no other person's login reaches a raw
+printf '#!/bin/sh\necho "/etc/sudoers:42:9: expected host name" >&2\necho "staffx  ALL=(ALL) NOPASSWD: X" >&2\necho "sudo: unable to resolve host x" >&2\nexit 1\n' > "$T/sudo/err2"
+chmod +x "$T/sudo/err2"
+check "uw5 L5: sudo_state keeps only sudo's last line (no sudoers line, no login from it)" \
+  'st_=$(T3_SUDO_BIN=$T/sudo/err2 sudo_state); echo "$st_"; [ "$st_" = "error: sudo: unable to resolve host x" ]'
 
 echo "TALLY ran=$((pass + fail)) pass=$pass na=${na:-0} fail=$fail"  # gates/tally.py
 echo "T3LIB SELF-TEST $pass/$((pass + fail)) $([ $fail = 0 ] && echo PASS || echo FAIL)$([ $na = 0 ] || echo " ($na N/A: off Linux or without root)")"
