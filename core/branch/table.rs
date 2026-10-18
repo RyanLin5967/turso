@@ -214,9 +214,9 @@ impl<T: Preimage> BranchTable<T> {
             }
         }
         // LEAP L2(b): a missing segment or chunk comes from the pool; one is built here, in the
-        // caller's hold, only when the pool is empty (counted). Mutant `chunk_inline` (test builds
-        // only): always built here, as before.
-        let inline = cfg!(test) && super::store::fe_mutant("chunk_inline");
+        // caller's hold, only when the pool is empty (counted). Mutant `chunk_inline` (test and
+        // fe-mutants builds): always built here, as before.
+        let inline = super::store::fe_mutant("chunk_inline");
         if self.dir[g].is_none() {
             let segment = match self.spare_segments.pop().filter(|_| !inline) {
                 Some(segment) => segment,

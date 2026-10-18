@@ -1513,13 +1513,14 @@ struct StoreMutex {
     /// sent and the next owing operation owes it again.
     start_due: AtomicBool,
     starter: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
-    /// LEAP L2(b): the branch table's pool fell low in a hold, and the background writer was woken
-    /// to refill it off the mutex (`BranchStore::refill_table_pool`), by the unlock of that hold
-    /// (`StoreGuard`'s drop), once per refill: the writer clears it when the refill lands. The wake
-    /// (`pool_kicker`) is installed when the writer starts; without one the pool is never refilled
-    /// and inserts build their chunks themselves, counted (`BranchTable::inline_allocs`).
+    /// LEAP L2(b): the branch table's pool fell low in a hold, set by that hold's unlock
+    /// (`StoreGuard`'s drop) with no lock taken and no wake sent. The background writer refills the
+    /// pool off the mutex (`BranchStore::refill_table_pool`) at its next wake: every flight's
+    /// landing offers a confirmation and wakes it. The unlock used to wake it under the group lock,
+    /// which a hold dropped while its thread held that lock (begin_cut) deadlocked on
+    /// (engine-rev-l2b HIGH 3). Without a writer the pool is never refilled, and inserts build
+    /// their chunks themselves, counted (`BranchTable::inline_allocs`).
     pool_kicked: AtomicBool,
-    pool_kicker: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
     /// Test builds: the starter's hold (`HOLD_STARTER_SENDING`), per store.
     #[cfg(test)]
     starter_hold: AtomicU8,
@@ -1538,7 +1539,6 @@ impl StoreMutex {
             start_due: AtomicBool::new(false),
             starter: std::sync::OnceLock::new(),
             pool_kicked: AtomicBool::new(false),
-            pool_kicker: std::sync::OnceLock::new(),
             #[cfg(test)]
             starter_hold: AtomicU8::new(0),
             #[cfg(test)]
@@ -1702,12 +1702,10 @@ impl Drop for StoreGuard<'_> {
         }
         let pool_low = self.guard.as_ref().is_some_and(|inner| inner.branches.pool_low());
         drop(self.guard.take());
-        // LEAP L2(b): a pool that fell low wakes the writer, with the mutex let go, once per refill.
-        if pool_low && !std::thread::panicking() && !self.store.pool_kicked.swap(true, Ordering::AcqRel) {
-            match self.store.pool_kicker.get() {
-                Some(kick) => kick(),
-                None => self.store.pool_kicked.store(false, Ordering::Release),
-            }
+        // LEAP L2(b): a pool that fell low is flagged for the writer's next wake; nothing is locked
+        // or woken here.
+        if pool_low {
+            self.store.pool_kicked.store(true, Ordering::Release);
         }
         // The checkpoint this hold owed, sent with the mutex let go (see `StoreMutex::start_due`).
         // Mutant `owed_start_unsent` (test builds only): nothing sends it, as at 969e7a370 on every
@@ -7503,24 +7501,17 @@ impl BranchStore {
     /// spares allocated (and every page touched) holding no lock, kept in one short hold, and any
     /// surplus freed after it.
     fn refill_table_pool(store: &StoreMutex) {
+        // Cleared first: a hold that leaves the pool low while this refills flags it again.
+        store.pool_kicked.store(false, Ordering::Release);
         let need = store.lock().branches.pool_need();
         let spares = BranchTable::<BranchState>::new_spares(need);
         let surplus = store.lock().branches.add_spares(spares);
-        store.pool_kicked.store(false, Ordering::Release);
         drop(surplus);
     }
 
     /// Start the confirmation writer (review 6 #1). If it cannot start, the store runs on and its
     /// close writes the last flight's word.
     fn start_confirm_writer(&self) {
-        // LEAP L2(b): the wake a low table pool sends the writer (`StoreMutex::pool_kicked`), under
-        // the group lock the writer checks its flags under, so it cannot fall between the check
-        // and the wait.
-        let kick_group = self.group.clone();
-        let _ = self.inner.pool_kicker.set(Box::new(move || {
-            let _g = kick_group.lock();
-            kick_group.confirm_cv.notify_one();
-        }));
         let group = self.group.clone();
         let store = self.inner.clone();
         #[cfg(test)]
