@@ -26,6 +26,9 @@ pub use turso_core::{
     Database, DatabaseOpts, Func, LimboError, Numeric, OpenFlags, PlatformIO, Result, StepResult,
 };
 pub use turso_pg_parser::translator::{PgBranchArg, PgBranchCall};
+/// A value as PostgreSQL string-literal text, the one quoting function (for the CLI's catalog
+/// queries; wire-rev-uw2 N6).
+pub use turso_pg_parser::translator::sql_quoted;
 
 pub mod vtab {
     pub use turso_core::VirtualTable;

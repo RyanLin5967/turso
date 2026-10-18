@@ -270,14 +270,15 @@ fn cmd_list_tables(conn: &Connection, w: &mut dyn Write) {
 }
 
 fn cmd_describe_table(conn: &Connection, table_name: &str, w: &mut dyn Write) {
-    let safe_name = table_name.replace('\'', "''");
+    // Quoted by the one literal-quoting function (wire-rev-uw2 N6: quoted here by hand).
+    let name_literal = turso_pg::sql_quoted(table_name);
     let sql = format!(
         "SELECT a.attname, t.typname, a.attnotnull, COALESCE(d.adbin, ''), a.attnum \
          FROM pg_attribute a \
          JOIN pg_class c ON a.attrelid = c.oid \
          JOIN pg_type t ON a.atttypid = t.oid \
          LEFT JOIN pg_attrdef d ON a.attrelid = d.adrelid AND a.attnum = d.adnum \
-         WHERE c.relname = '{safe_name}' AND a.attnum > 0 AND a.attisdropped = 0 \
+         WHERE c.relname = {name_literal} AND a.attnum > 0 AND a.attisdropped = 0 \
          ORDER BY a.attnum"
     );
     match conn.query(&sql) {
@@ -310,11 +311,11 @@ fn cmd_describe_table(conn: &Connection, table_name: &str, w: &mut dyn Write) {
                 let _ = writeln!(w, "Table: {table_name}");
                 let _ = writeln!(w, "{table}");
             } else {
-                let _ = writeln!(w, "Table '{table_name}' not found.");
+                let _ = writeln!(w, "Did not find any relation named \"{table_name}\".");
             }
         }
         Ok(None) => {
-            let _ = writeln!(w, "Table '{table_name}' not found.");
+            let _ = writeln!(w, "Did not find any relation named \"{table_name}\".");
         }
         Err(e) => {
             let _ = writeln!(w, "Error: {e}");
@@ -547,7 +548,8 @@ fn cmd_describe_table_extended(conn: &Connection, table_name: &str, w: &mut dyn 
     // First show the regular column description
     cmd_describe_table(conn, table_name, w);
 
-    let safe_name = table_name.replace('\'', "''");
+    // Quoted by the one literal-quoting function (wire-rev-uw2 N6: quoted here by hand).
+    let name_literal = turso_pg::sql_quoted(table_name);
 
     // Show indexes
     let idx_sql = format!(
@@ -555,7 +557,7 @@ fn cmd_describe_table_extended(conn: &Connection, table_name: &str, w: &mut dyn 
          FROM pg_index i \
          JOIN pg_class c ON i.indexrelid = c.oid \
          JOIN pg_class c2 ON i.indrelid = c2.oid \
-         WHERE c2.relname = '{safe_name}' \
+         WHERE c2.relname = {name_literal} \
          ORDER BY c.relname"
     );
     if let Ok(Some(mut rows)) = conn.query(&idx_sql) {
@@ -577,7 +579,7 @@ fn cmd_describe_table_extended(conn: &Connection, table_name: &str, w: &mut dyn 
         "SELECT conname, contype \
          FROM pg_constraint con \
          JOIN pg_class c ON con.conrelid = c.oid \
-         WHERE c.relname = '{safe_name}' \
+         WHERE c.relname = {name_literal} \
          ORDER BY conname"
     );
     if let Ok(Some(mut rows)) = conn.query(&con_sql) {

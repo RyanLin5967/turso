@@ -6216,7 +6216,9 @@ impl PgSetValue {
             PgSetValue::Null => "NULL".to_string(),
             PgSetValue::RawSql(value) => value.clone(),
             PgSetValue::Interval { literal, .. } => {
-                format!("INTERVAL '{}'", literal.replace('\'', "''"))
+                // Quoted by the one quoting function (wire-rev-uw2 N6: by hand, which the widened
+                // guard found).
+                format!("INTERVAL {}", sql_quoted(literal))
             }
         }
     }
