@@ -313,6 +313,7 @@ def selftest():
             ok(f"main exits with REFUSED, printing no table: {name}", refused and buf.getvalue() == "")
         vers, why = run_versions(good, tsv2)
         ok("refused: versions.tsv registers two Dolt versions", any("no single dolt" in w for w in why))
+    print(f"TALLY ran={n} pass={n - bad} na=0 fail={bad}")  # gates/tally.py (linux-rev-uw2 MED 1)
     print(f"smoke_table selftest: {n - bad}/{n}")
     return 1 if bad else 0
 

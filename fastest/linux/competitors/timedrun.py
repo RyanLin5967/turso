@@ -1244,6 +1244,7 @@ def selftest():
                 expected.append("is not PREREG :210's rule at the registered cap")
             ok(bool(expected) and all(reason in (why or "") for reason in expected),
                f"reason: real cap={cap!r} warmup={warm!r}: expected {expected!r}, got {why!r}")
+    print(f"TALLY ran={n} pass={n - bad} na=0 fail={bad}")  # gates/tally.py (linux-rev-uw2 MED 1)
     print(f"timedrun selftest: {n - bad}/{n}")
     return 1 if bad else 0
 

@@ -175,6 +175,7 @@ def selftest():
         ok("after-tm1: a measured row at tm1 is refused",
            check_after_tm1(run("late", good_rows, dict(sm, tm1_ns=t0 + offs[-1]))) != [])
         ok("after-tm1: no tm1_ns is refused", check_after_tm1(run("notm1", good_rows, {"t0_ns": t0})) != [])
+    print(f"TALLY ran={n} pass={n - bad} na=0 fail={bad}")  # gates/tally.py (linux-rev-uw2 MED 1)
     print(f"sched_check selftest: {n - bad}/{n}")
     return 1 if bad else 0
 

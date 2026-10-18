@@ -156,6 +156,7 @@ def selftest():
             prepend_step("pg18-create.spec", "setup SET synchronous_commit = off"), "pg18-create.spec: setup lines")
     planted("a registered spec missing", lambda dd: os.remove(os.path.join(dd, "doltgres-c-m1.spec")),
             "doltgres-c-m1.spec: registered but missing")
+    print(f"TALLY ran={n} pass={n - bad} na=0 fail={bad}")  # gates/tally.py (linux-rev-uw2 MED 1)
     print(f"spec_lint selftest: {n - bad}/{n}")
     return 1 if bad else 0
 

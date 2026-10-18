@@ -47,8 +47,9 @@ def main():
     if rc or failures:
         print("REFUSED: baseline selftest failed", *failures, sep="\n")
         return 1
-    bad = 0
+    bad = n = 0
     for function, target in candidates(original):
+        n += 1
         mutant = copy.deepcopy(original)
         for name, node in candidates(mutant):
             if name != function or node.lineno != target.lineno:
@@ -71,6 +72,7 @@ def main():
         else:
             print(f"SURVIVED: {label}")
             bad += 1
+    print(f"TALLY ran={n} pass={n - bad} na=0 fail={bad}")  # gates/tally.py (linux-rev-uw2 MED 1)
     return int(bool(bad))
 
 

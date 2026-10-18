@@ -85,6 +85,7 @@ def selftest():
             ("an unknown window", rec(), None, 100.3, "no sweeps bracket")):
         r, why = sweeper_record(lines, t0, t1)
         ok(r is None and any(reason in w for w in why), f"{name} -> refused ({why!r})")
+    print(f"TALLY ran={n} pass={n - bad} na=0 fail={bad}")  # gates/tally.py (linux-rev-uw2 MED 1)
     print(f"sweeper_record selftest: {n - bad}/{n}")
     return 1 if bad else 0
 

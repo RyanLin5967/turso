@@ -546,6 +546,7 @@ def selftest():
         print(("PASS" if ok_ else "FAIL"), f"real run on {name} -> {why or 'allowed'}")
         bad += not ok_
         n += 1
+    print(f"TALLY ran={n} pass={n - bad} na=0 fail={bad}")  # gates/tally.py (linux-rev-uw2 MED 1)
     print(f"drive selftest: {n - bad}/{n}")
     return 1 if bad else 0
 

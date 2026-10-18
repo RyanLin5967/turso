@@ -1,4 +1,4 @@
-# sweeper.sh -- the ONE tracer sweeper every timed run uses (sourced; bash 4.3+; Linux /proc).
+# sweeper.sh -- the ONE tracer sweeper every timed run uses (sourced; bash 5+, for $EPOCHREALTIME; Linux /proc).
 #
 # The lead's ruling on comp review 1 MED 12: "SAME INSTRUMENT FOR EVERY SYSTEM. Put the sweeper in one shared script
 # that runs identically in every timed run, and record sweeper_cpu_s in every timed.json." The competitors' timed runs
