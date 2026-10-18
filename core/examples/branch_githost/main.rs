@@ -2594,6 +2594,16 @@ fn victims_line(s0: u64, made: u64, n: u64, label: &str) {
 /// r13-compose A5.8: this process's device bytes written and read (proc_pid_rusage RUSAGE_INFO_V4,
 /// as r12-catload's branch_restart reads them): D_c's instrument, an upper bound on a clone's
 /// copy-on-write divergence (a rewrite counts again).
+///
+/// Apple only: off Apple there is no proc_pid_rusage, and no other counter is substituted (a different instrument
+/// would print the same line with another meaning), so the line refuses there (the platform class, 2026-10-18:
+/// `cargo check --all-targets` failed on Linux at this call).
+#[cfg(not(target_vendor = "apple"))]
+fn diskio_line(cmd: &str) -> String {
+    not_a_result(&format!("DISKIO ({cmd}): proc_pid_rusage is Apple-only; r13-compose's D_c instrument runs on macOS"))
+}
+
+#[cfg(target_vendor = "apple")]
 fn diskio_line(cmd: &str) -> String {
     // SAFETY: a zeroed plain-integer struct, filled by the call.
     let mut info: libc::rusage_info_v4 = unsafe { std::mem::zeroed() };
