@@ -1999,7 +1999,7 @@ fn pg_parameter_name(name: &str) -> &str {
 /// recorded on iccad11, pg18-rev-host1.out). PostgreSQL reads its own tz database, never the
 /// host's, so this list replaces the host zoneinfo walk (the first host run: RHEL 8's zoneinfo
 /// lacks `Factory`, which PG 18.6 SETs).
-const PG_TIMEZONE_NAMES: &str = include_str!("pg_timezone_names.txt");
+const PG_TIMEZONE_NAMES: &str = include_str!("pg_timezone_names.list");
 
 /// Whether `name` is a zone PostgreSQL 18.6 knows, matched without case as PostgreSQL matches zone
 /// names ('america/new_york' SETs, rev-c39-tzforms #1). A host path, a zone-directory file that is
