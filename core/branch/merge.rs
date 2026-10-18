@@ -189,7 +189,7 @@ fn fk_name(r: &ResolvedFkRef) -> String {
 }
 
 fn quote(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
+    crate::util::double_quote_identifier(name)
 }
 
 /// The ordinary rowid table rooted at `root`, if there is one a merge may write.

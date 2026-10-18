@@ -450,7 +450,9 @@ impl PragmaVirtualTableCursor {
 
         let mut sql = format!("PRAGMA {}", self.pragma_name);
         if let Some(arg) = &self.arg {
-            sql.push_str(&format!("=\"{arg}\""));
+            // Quoted with its own `"` doubled (engine-rev-quote42 H1: `pragma_table_info('a"b')`).
+            sql.push('=');
+            sql.push_str(&crate::util::double_quote_identifier(arg));
         }
 
         // Table-valued pragma helpers execute inside the parent statement's VM step.

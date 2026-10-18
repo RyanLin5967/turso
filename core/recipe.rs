@@ -320,7 +320,7 @@ pub fn parse_recipe_name(name: &str) -> Option<u64> {
 }
 
 fn quote_ident(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
+    crate::util::double_quote_identifier(name)
 }
 
 /// The persisted text of a recipe: `UPDATE "t" SET "c" = e, ... [WHERE p]`, from the statement's

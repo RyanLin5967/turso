@@ -191,11 +191,17 @@ pub fn quote_identifier(name: &str) -> String {
         || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
         || turso_parser::lexer::is_quotable_keyword(name.as_bytes());
     if needs_quoting {
-        let escaped = name.replace('"', "\"\"");
-        format!("\"{escaped}\"")
+        double_quote_identifier(name)
     } else {
         name.to_string()
     }
+}
+
+/// Quote a SQL identifier with double quotes always (each `"` in it doubled), for SQL text whose
+/// spelling is kept quoted whatever the name: stored backing-table SQL, a pragma's argument.
+pub fn double_quote_identifier(name: &str) -> String {
+    let escaped = name.replace('"', "\"\"");
+    format!("\"{escaped}\"")
 }
 
 pub const PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX: &str = "sqlite_autoindex_";
