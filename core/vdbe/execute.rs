@@ -512,6 +512,7 @@ pub fn op_drop_index(
     load_insn!(DropIndex { index, db }, insn);
     let conn = program.connection.clone();
     let is_mvcc = conn.mv_store_for_db(*db).is_some();
+    state.note_schema_change(&conn, *db);
     conn.with_database_schema_mut(*db, |schema| {
         // In MVCC mode, track dropped index root pages so integrity_check knows about them.
         // The btree pages won't be freed until checkpoint, so integrity_check needs to
@@ -5372,15 +5373,7 @@ pub fn op_savepoint(
             // consistent across tables / indexes / sequences without any
             // I/O.
             if let Some(info) = frame_info {
-                *conn.schema.write() = info.main_schema_snapshot;
-                if let Some(temp_db) = conn.temp.database.read().as_ref() {
-                    match info.temp_schema_snapshot {
-                        Some(snap) => *temp_db.db.schema.lock() = snap,
-                        None => *temp_db.db.schema.lock() = conn.empty_temp_schema(),
-                    }
-                }
-                *conn.database_schemas().write() = info.staged_schema_snapshot;
-                conn.bump_prepare_context_generation();
+                conn.restore_schema_snapshot(info);
             }
 
             // Invalidate cached schema cookies on ALL pagers whose pages may
@@ -13734,6 +13727,7 @@ pub fn op_drop_table(
     let conn = program.connection.clone();
     let is_mvcc = conn.mv_store_for_db(*db).is_some();
     {
+        state.note_schema_change(&conn, *db);
         conn.with_database_schema_mut(*db, |schema| {
             // In MVCC mode, track dropped root pages so integrity_check knows about them.
             // The btree pages won't be freed until checkpoint, so integrity_check needs
@@ -13769,6 +13763,7 @@ pub fn op_drop_table(
         // also nuke temp triggers that target `temp.t` or `aux.t`.
         if *db != crate::TEMP_DB_ID && conn.temp.database.read().is_some() {
             let dropped_db = *db;
+            state.note_schema_change(&conn, crate::TEMP_DB_ID);
             conn.with_database_schema_mut(crate::TEMP_DB_ID, |temp_schema| {
                 temp_schema.remove_triggers_for_table_with_db(table_name, dropped_db);
             })?;
@@ -13786,6 +13781,7 @@ pub fn op_drop_view(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(DropView { db, view_name }, insn);
     let conn = program.connection.clone();
+    state.note_schema_change(&conn, *db);
     conn.with_database_schema_mut(*db, |schema| {
         schema.remove_view(view_name).ok();
         schema.broken_views.remove(view_name);
@@ -13802,6 +13798,7 @@ pub fn op_drop_type(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(DropType { db, type_name }, insn);
     let conn = program.connection.clone();
+    state.note_schema_change(&conn, *db);
     conn.with_database_schema_mut(*db, |schema| {
         schema.remove_type(type_name);
     })?;
@@ -13834,6 +13831,7 @@ pub fn op_add_sequence(
         *cycle,
     )?;
     let conn = program.connection.clone();
+    state.note_schema_change(&conn, *db);
     conn.with_database_schema_mut(*db, |schema| {
         schema
             .sequences
@@ -13851,6 +13849,7 @@ pub fn op_drop_sequence(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(DropSequence { db, seq_name }, insn);
     let conn = program.connection.clone();
+    state.note_schema_change(&conn, *db);
     conn.with_database_schema_mut(*db, |schema| {
         schema.remove_sequence(seq_name);
     })?;
@@ -13873,6 +13872,7 @@ pub fn op_add_type(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(AddType { db, sql }, insn);
     let conn = program.connection.clone();
+    state.note_schema_change(&conn, *db);
     conn.with_database_schema_mut(*db, |schema| schema.add_type_from_sql(sql))??;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -14485,6 +14485,7 @@ pub fn op_drop_trigger(
     load_insn!(DropTrigger { db, trigger_name }, insn);
 
     let conn = program.connection.clone();
+    state.note_schema_change(&conn, *db);
     conn.with_database_schema_mut(*db, |schema| {
         schema.remove_trigger(trigger_name).ok();
     })?;
@@ -14793,6 +14794,7 @@ fn op_parse_schema_step(
                     dbsp_state_index_roots,
                 );
 
+                state.note_schema_change(conn, db);
                 // Store the modified schema back
                 if db == crate::TEMP_DB_ID {
                     // TEMP: write directly to `temp_db.db.schema` — the single
@@ -15205,6 +15207,9 @@ pub fn op_set_cookie(
         },
         insn
     );
+    if matches!(cookie, Cookie::SchemaVersion) {
+        state.note_schema_change(&program.connection, *db);
+    }
     let pager = program.get_pager_from_database_index(db)?;
     let mv_store = program.connection.mv_store_for_db(*db);
     if let Some(mv_store) = mv_store.as_ref() {
@@ -16390,6 +16395,7 @@ pub fn op_rename_table(
 
     let conn = program.connection.clone();
 
+    state.note_schema_change(&conn, *db);
     conn.with_database_schema_mut(*db, |schema| -> crate::Result<()> {
         if let Some(mut indexes) = schema.indexes.remove(&normalized_from) {
             let autoindex_prefix = format!("sqlite_autoindex_{normalized_from}_");
@@ -16525,6 +16531,7 @@ pub fn op_rename_table(
     })??;
 
     if *db != crate::TEMP_DB_ID && conn.temp.database.read().is_some() {
+        state.note_schema_change(&conn, crate::TEMP_DB_ID);
         conn.with_database_schema_mut(crate::TEMP_DB_ID, |schema| -> crate::Result<()> {
             // A TEMP trigger may run on a table in another database. Triggers
             // are found by the name of that table. When the table is renamed,
@@ -16611,6 +16618,7 @@ pub fn op_drop_column(
             .clone()
     });
 
+    state.note_schema_change(&conn, *db);
     conn.with_database_schema_mut(*db, |schema| -> Result<()> {
         let table = schema
             .tables
@@ -16657,6 +16665,7 @@ pub fn op_drop_column(
     // Shift left pos_in_table in all indexes, and self-table placeholders in generated column
     // expressions, to account for the dropped column. For example, if the dropped column had index
     // 2, then anything that was indexed on column 3 or higher should be decremented by 1.
+    state.note_schema_change(&conn, *db);
     conn.with_database_schema_mut(*db, |schema| -> Result<()> {
         if let Some(indexes) = schema.indexes.get_mut(&normalized_table_name) {
             for index in indexes {
@@ -16716,6 +16725,7 @@ pub fn op_add_column(
     let new_check_constraints = data.check_constraints.try_to_vec()?;
     let new_foreign_keys = data.foreign_keys.try_to_vec()?;
 
+    state.note_schema_change(&conn, data.db);
     conn.with_database_schema_mut(data.db, |schema| -> Result<()> {
         let table_ref = schema
             .tables
@@ -16760,6 +16770,7 @@ pub fn op_recipe_install(
         return Ok(InsnFunctionStepResult::Step);
     }
     let conn = program.connection.clone();
+    state.note_schema_change(&conn, crate::MAIN_DB_ID);
     conn.with_database_schema_mut(crate::MAIN_DB_ID, |schema| {
         crate::recipe::install_in_schema(
             schema,
@@ -16869,6 +16880,7 @@ pub fn op_alter_column(
         Vec::new()
     };
 
+    state.note_schema_change(&conn, *db);
     conn.with_database_schema_mut(*db, |schema| -> Result<()> {
         let table_arc = schema
             .tables
@@ -17021,6 +17033,8 @@ pub fn op_alter_column(
     if *rename {
         // Update in-memory trigger objects for the renamed column in both the
         // altered schema and temp, since temp triggers may reference main/attached tables.
+        state.note_schema_change(&conn, *db);
+        state.note_schema_change(&conn, crate::TEMP_DB_ID);
         with_relevant_trigger_schemas_mut(&conn, *db, |schema| {
             for triggers in schema.triggers.values_mut() {
                 for trigger_arc in triggers.iter_mut() {
@@ -17037,6 +17051,7 @@ pub fn op_alter_column(
         })?;
 
         for (view_db, view_name, rewritten) in view_rewrites {
+            state.note_schema_change(&conn, view_db);
             conn.with_database_schema_mut(view_db, move |schema| -> crate::Result<()> {
                 if let Some(view_arc) = schema.views.get_mut(&view_name) {
                     let view = Arc::make_mut(view_arc);

@@ -958,6 +958,11 @@ pub struct ProgramState {
     pub(crate) is_active_write: bool,
     /// Whether begin_statement was called (savepoint + FK bookkeeping active).
     has_stmt_transaction: bool,
+    /// The connection's in-memory schemas as they were before this statement's first change to
+    /// one (`note_schema_change`). A statement rollback puts them back: the pagers undo the
+    /// statement's pages, so a schema object it added (a table whose root page the rollback took
+    /// back) must go too, or the next allocation hands that page to another table.
+    schema_undo: Option<crate::connection::RollbackFrameInfo>,
     pub n_change: AtomicI64,
     pub n_total_change: AtomicI64,
 }
@@ -1027,6 +1032,7 @@ impl ProgramState {
             uses_subjournal: false,
             is_active_write: false,
             has_stmt_transaction: false,
+            schema_undo: None,
             attached_savepoint_pagers: Vec::new(),
             n_change: AtomicI64::new(0),
             n_total_change: AtomicI64::new(0),
@@ -1178,6 +1184,7 @@ impl ProgramState {
         self.op_vacuum_state = VacuumOpState::None;
         self.view_delta_state = ViewDeltaCommitState::NotStarted;
         self.auto_txn_cleanup = TxnCleanup::None;
+        self.schema_undo = None;
         self.fk_immediate_violations_during_stmt
             .store(0, Ordering::SeqCst);
         self.fk_deferred_violations_when_stmt_started
@@ -1419,6 +1426,26 @@ impl ProgramState {
         Ok(IOResult::Done(()))
     }
 
+    /// Called by every opcode before it changes database `db`'s in-memory schema on this
+    /// connection. The first call keeps the schemas for a statement rollback, and each call marks
+    /// the transaction as a schema change so a transaction rollback restores the committed schema:
+    /// before this, only SetCookie marked it, so a DDL that failed between its ParseSchema or
+    /// AddType and its SetCookie kept an in-memory table whose root page the rollback freed.
+    pub(crate) fn note_schema_change(&mut self, connection: &Connection, db: usize) {
+        if self.schema_undo.is_none() {
+            self.schema_undo = Some(connection.schema_snapshot());
+        }
+        if db == crate::MAIN_DB_ID {
+            if let TransactionState::Write { .. } = connection.get_tx_state() {
+                connection.set_tx_state(TransactionState::Write {
+                    schema_did_change: true,
+                });
+            }
+        } else if db == crate::TEMP_DB_ID && connection.temp.database.read().is_some() {
+            connection.mark_temp_schema_did_change();
+        }
+    }
+
     /// End a statement subtransaction.
     ///
     /// Mirrors SQLite's vdbeCloseStatement (vdbeaux.c:3203-3248). Pager/MVCC
@@ -1515,6 +1542,11 @@ impl ProgramState {
                 } else {
                     None
                 };
+
+                // The pagers rolled this statement's pages back, so its in-memory schema changes go.
+                if let Some(undo) = self.schema_undo.take() {
+                    connection.restore_schema_snapshot(undo);
+                }
 
                 // Always restore FK violation counters on statement rollback,
                 // regardless of whether a pager savepoint was opened.

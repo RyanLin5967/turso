@@ -5453,6 +5453,31 @@ impl Connection {
         )
     }
 
+    /// The connection's in-memory schemas (main, temp and the staged attached copies), for a later
+    /// `restore_schema_snapshot`. Cheap: `Arc` clones.
+    pub(crate) fn schema_snapshot(&self) -> RollbackFrameInfo {
+        self.with_savepoint_schema_snapshot(|main, temp, staged| RollbackFrameInfo {
+            main_schema_snapshot: main,
+            temp_schema_snapshot: temp,
+            staged_schema_snapshot: staged,
+        })
+    }
+
+    /// Put back the in-memory schemas a `schema_snapshot` (or a savepoint frame) holds, after the
+    /// pagers rolled the pages they describe back. Statements prepared under the discarded schemas
+    /// re-prepare.
+    pub(crate) fn restore_schema_snapshot(&self, info: RollbackFrameInfo) {
+        *self.schema.write() = info.main_schema_snapshot;
+        if let Some(temp_db) = self.temp.database.read().as_ref() {
+            match info.temp_schema_snapshot {
+                Some(snap) => *temp_db.db.schema.lock() = snap,
+                None => *temp_db.db.schema.lock() = self.empty_temp_schema(),
+            }
+        }
+        *self.database_schemas().write() = info.staged_schema_snapshot;
+        self.bump_prepare_context_generation();
+    }
+
     pub(crate) fn release_named_savepoint_frame(&self, name: &str) -> SavepointResult {
         let mut savepoints = self.named_savepoints.write();
         let Some(target_idx) = savepoints
