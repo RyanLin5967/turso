@@ -5566,7 +5566,17 @@ fn a_store_missing_its_log_or_arena_is_refused_at_open() {
             Ok(_) => panic!("{arm}: the store opened"),
             Err(e) => e.to_string(),
         };
-        assert!(refused.contains(&gone), "{arm}: the refusal does not name the missing file: {refused}");
+        // FLAGGED fixture repair (lane tip suite 4a97c9c36 on ecetesla2 under uwrun v5's TMPDIR): the
+        // refusal names the file by its canonical path, which a TMPDIR spelled through a link differs
+        // from; either spelling names it.
+        let canonical_gone = format!(
+            "{}{missing}",
+            std::fs::canonicalize(&path).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| base.to_string())
+        );
+        assert!(
+            refused.contains(&gone) || refused.contains(&canonical_gone),
+            "{arm}: the refusal does not name the missing file: {refused}"
+        );
         if let Some(bytes) = log_bytes {
             assert!(std::fs::read(&log).unwrap() == bytes, "{arm}: the refused open changed the log");
         }
