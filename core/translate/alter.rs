@@ -2702,7 +2702,7 @@ fn rewrite_trigger_sql_for_column_rename(
                 for col in &mut cols {
                     let col_norm = normalize_ident(col.as_str());
                     if col_norm == old_col_norm {
-                        *col = ast::Name::from_string(new_col_norm.clone());
+                        *col = ast::Name::exact(new_col_norm.clone());
                     }
                 }
                 ast::TriggerEvent::UpdateOf(cols)
@@ -2734,7 +2734,7 @@ fn rewrite_trigger_sql_for_column_rename(
                             && is_renaming_trigger_table
                             && trigger_table.get_column(&col_norm).is_some()
                         {
-                            *col = ast::Name::from_string(&*new_col_norm);
+                            *col = ast::Name::exact(new_col_norm.to_string());
                         }
                     }
                     Ok(WalkControl::Continue)
@@ -2929,7 +2929,7 @@ fn apply_expr_column_ref_with_context(
             if ns_norm.eq_ignore_ascii_case("new") || ns_norm.eq_ignore_ascii_case("old") {
                 if is_renaming_trigger_table && trigger_table.get_column(&col_norm).is_some() {
                     if let Some(new_col_norm) = mode.rewritten_name() {
-                        *col = ast::Name::from_string(new_col_norm);
+                        *col = ast::Name::exact(new_col_norm.to_string());
                     } else {
                         return Err(no_such_column_error(&error_column_ref));
                     }
@@ -2944,7 +2944,7 @@ fn apply_expr_column_ref_with_context(
             {
                 let _ = (ctx_name_norm, is_renaming_ctx);
                 if let Some(new_col_norm) = mode.rewritten_name() {
-                    *col = ast::Name::from_string(new_col_norm);
+                    *col = ast::Name::exact(new_col_norm.to_string());
                 } else {
                     return Err(no_such_column_error(&error_column_ref));
                 }
@@ -2960,13 +2960,13 @@ fn apply_expr_column_ref_with_context(
                     if ctx_is_different_table {
                         return Err(no_such_column_error(&error_column_ref));
                     }
-                    *col = ast::Name::from_string(new_col_norm);
+                    *col = ast::Name::exact(new_col_norm.to_string());
                 } else {
                     return Err(no_such_column_error(&error_column_ref));
                 }
             } else if from_target_qualifiers.contains(&ns_norm) {
                 if let Some(new_col_norm) = mode.rewritten_name() {
-                    *col = ast::Name::from_string(new_col_norm);
+                    *col = ast::Name::exact(new_col_norm.to_string());
                 } else {
                     return Err(no_such_column_error(&error_column_ref));
                 }
@@ -2982,7 +2982,7 @@ fn apply_expr_column_ref_with_context(
                 if ctx_table.get_column(&col_norm).is_some() {
                     if is_renaming_ctx {
                         if let Some(new_col_norm) = mode.rewritten_name() {
-                            *e = ast::Expr::Id(ast::Name::from_string(new_col_norm));
+                            *e = ast::Expr::Id(ast::Name::exact(new_col_norm.to_string()));
                         } else {
                             return Err(no_such_column_error(old_col_norm));
                         }
@@ -3005,7 +3005,7 @@ fn apply_expr_column_ref_with_context(
                 || !from_target_qualifiers.is_empty()
             {
                 if let Some(new_col_norm) = mode.rewritten_name() {
-                    *e = ast::Expr::Id(ast::Name::from_string(new_col_norm));
+                    *e = ast::Expr::Id(ast::Name::exact(new_col_norm.to_string()));
                 } else {
                     return Err(no_such_column_error(old_col_norm));
                 }
@@ -3209,7 +3209,7 @@ fn apply_upsert_for_column_rename(
                 for col_name in &mut set.col_names {
                     if col_name.as_str().eq_ignore_ascii_case(old_col_norm) {
                         if let Some(new_col_norm) = mode.rewritten_name() {
-                            *col_name = ast::Name::from_string(new_col_norm);
+                            *col_name = ast::Name::exact(new_col_norm.to_string());
                         } else {
                             return Err(no_such_column_error(old_col_norm));
                         }
@@ -3728,7 +3728,7 @@ fn apply_trigger_cmd_for_column_rename(
                     for col_name in &mut set.col_names {
                         if col_name.as_str().eq_ignore_ascii_case(old_col_norm) {
                             if let Some(new_col_norm) = mode.rewritten_name() {
-                                *col_name = ast::Name::from_string(new_col_norm);
+                                *col_name = ast::Name::exact(new_col_norm.to_string());
                             } else {
                                 return Err(no_such_column_error(old_col_norm));
                             }
@@ -3794,7 +3794,7 @@ fn apply_trigger_cmd_for_column_rename(
                 for col_name in col_names.iter_mut() {
                     if col_name.as_str().eq_ignore_ascii_case(old_col_norm) {
                         if let Some(new_col_norm) = mode.rewritten_name() {
-                            *col_name = ast::Name::from_string(new_col_norm);
+                            *col_name = ast::Name::exact(new_col_norm.to_string());
                         } else {
                             return Err(no_such_column_error(old_col_norm));
                         }
@@ -3933,7 +3933,7 @@ fn rename_excluded_column_refs(
             if ns.as_str().eq_ignore_ascii_case("excluded")
                 && col.as_str().eq_ignore_ascii_case(old_col_norm)
             {
-                *col = ast::Name::from_string(new_col_norm);
+                *col = ast::Name::exact(new_col_norm.to_string());
             }
         }
         Ok(WalkControl::Continue)

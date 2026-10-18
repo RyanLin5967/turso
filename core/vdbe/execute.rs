@@ -16276,12 +16276,12 @@ fn regenerate_trigger_sql(trigger: &crate::schema::Trigger) -> String {
 
     let trigger_name = QualifiedName {
         db_name: None,
-        name: Name::from_string(&trigger.name),
+        name: Name::exact(trigger.name.clone()),
         alias: None,
     };
     let tbl_name = QualifiedName {
         db_name: None,
-        name: Name::from_string(&trigger.table_name),
+        name: Name::exact(trigger.table_name.clone()),
         alias: None,
     };
     create_trigger_to_sql(

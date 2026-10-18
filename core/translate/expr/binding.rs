@@ -876,7 +876,7 @@ pub(super) fn make_field_access_expr(
             column: col_idx,
             is_rowid_alias,
         }),
-        field: ast::Name::from_bytes(field_name.as_bytes()),
+        field: ast::Name::exact(field_name.to_string()),
         resolved,
     }
 }
@@ -926,10 +926,10 @@ pub(super) fn try_resolve_nested_field_access<'a>(
                 column: m.col_idx,
                 is_rowid_alias: m.is_rowid_alias,
             }),
-            field: ast::Name::from_bytes(mid_name.as_bytes()),
+            field: ast::Name::exact(mid_name.to_string()),
             resolved: None,
         }),
-        field: ast::Name::from_bytes(leaf_name.as_bytes()),
+        field: ast::Name::exact(leaf_name.to_string()),
         resolved: None,
     };
 
