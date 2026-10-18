@@ -1514,13 +1514,18 @@ struct StoreMutex {
     start_due: AtomicBool,
     starter: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
     /// LEAP L2(b): the branch table's pool fell low in a hold, set by that hold's unlock
-    /// (`StoreGuard`'s drop) with no lock taken and no wake sent. The background writer refills the
-    /// pool off the mutex (`BranchStore::refill_table_pool`) at its next wake: every flight's
-    /// landing offers a confirmation and wakes it. The unlock used to wake it under the group lock,
-    /// which a hold dropped while its thread held that lock (begin_cut) deadlocked on
-    /// (engine-rev-l2b HIGH 3). Without a writer the pool is never refilled, and inserts build
-    /// their chunks themselves, counted (`BranchTable::inline_allocs`).
+    /// (`StoreGuard`'s drop). The background writer refills the pool off the mutex
+    /// (`BranchStore::refill_table_pool`) at its next wake, and clears it.
     pool_kicked: AtomicBool,
+    /// The writer was woken for this refill (`pool_kicker` returned true). The wake is sent under
+    /// the group lock, so it cannot fall between the writer's check of `pool_kicked` and its wait,
+    /// and only through `try_lock`: an unlock whose thread holds the group lock (begin_cut) is
+    /// never blocked on it. That deadlocked when the wake took the lock outright (engine-rev-l2b
+    /// HIGH 3); with no wake at all, a store whose landings wake no writer (D0: no proved
+    /// confirmation) never refilled (lane raw e677ce4541: 25,640 B under the mutex). A failed
+    /// try is retried by the next unlock that finds the pool low.
+    pool_notified: AtomicBool,
+    pool_kicker: std::sync::OnceLock<Box<dyn Fn() -> bool + Send + Sync>>,
     /// Test builds: the starter's hold (`HOLD_STARTER_SENDING`), per store.
     #[cfg(test)]
     starter_hold: AtomicU8,
@@ -1539,6 +1544,8 @@ impl StoreMutex {
             start_due: AtomicBool::new(false),
             starter: std::sync::OnceLock::new(),
             pool_kicked: AtomicBool::new(false),
+            pool_notified: AtomicBool::new(false),
+            pool_kicker: std::sync::OnceLock::new(),
             #[cfg(test)]
             starter_hold: AtomicU8::new(0),
             #[cfg(test)]
@@ -1702,10 +1709,17 @@ impl Drop for StoreGuard<'_> {
         }
         let pool_low = self.guard.as_ref().is_some_and(|inner| inner.branches.pool_low());
         drop(self.guard.take());
-        // LEAP L2(b): a pool that fell low is flagged for the writer's next wake; nothing is locked
-        // or woken here.
+        // LEAP L2(b): a pool that fell low is flagged, and the writer woken once per refill, never
+        // blocking on the group lock (see `StoreMutex::pool_notified`).
         if pool_low {
             self.store.pool_kicked.store(true, Ordering::Release);
+            if !std::thread::panicking() && !self.store.pool_notified.load(Ordering::Acquire) {
+                if let Some(kick) = self.store.pool_kicker.get() {
+                    if kick() {
+                        self.store.pool_notified.store(true, Ordering::Release);
+                    }
+                }
+            }
         }
         // The checkpoint this hold owed, sent with the mutex let go (see `StoreMutex::start_due`).
         // Mutant `owed_start_unsent` (test builds only): nothing sends it, as at 969e7a370 on every
@@ -7501,8 +7515,10 @@ impl BranchStore {
     /// spares allocated (and every page touched) holding no lock, kept in one short hold, and any
     /// surplus freed after it.
     fn refill_table_pool(store: &StoreMutex) {
-        // Cleared first: a hold that leaves the pool low while this refills flags it again.
+        // Cleared first: a hold that leaves the pool low while this refills flags it, and wakes the
+        // writer, again.
         store.pool_kicked.store(false, Ordering::Release);
+        store.pool_notified.store(false, Ordering::Release);
         let need = store.lock().branches.pool_need();
         let spares = BranchTable::<BranchState>::new_spares(need);
         let surplus = store.lock().branches.add_spares(spares);
@@ -7512,6 +7528,19 @@ impl BranchStore {
     /// Start the confirmation writer (review 6 #1). If it cannot start, the store runs on and its
     /// close writes the last flight's word.
     fn start_confirm_writer(&self) {
+        // LEAP L2(b): the writer's wake for a low table pool (`StoreMutex::pool_notified`).
+        let kick_group = self.group.clone();
+        let _ = self.inner.pool_kicker.set(Box::new(move || match kick_group.state.try_lock() {
+            Ok(_g) => {
+                kick_group.confirm_cv.notify_one();
+                true
+            }
+            Err(std::sync::TryLockError::Poisoned(_g)) => {
+                kick_group.confirm_cv.notify_one();
+                true
+            }
+            Err(std::sync::TryLockError::WouldBlock) => false,
+        }));
         let group = self.group.clone();
         let store = self.inner.clone();
         #[cfg(test)]
