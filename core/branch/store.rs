@@ -469,10 +469,13 @@ pub(crate) struct Group {
 /// `Group::upgrade_due` while the upgrade it named is being led.
 const UPGRADE_IN_AIR: u64 = u64::MAX;
 
-/// LEAP L3: the longest a leader holds for its cohort (review 1 #9's adaptive hold; the design's g =
-/// 50 µs, against a flush of milliseconds). Bounded, so a cohort estimated wrongly costs at most this
-/// per flight.
-const COHORT_GATHER: Duration = Duration::from_micros(50);
+/// LEAP L3 before the bound below: a fixed 50 µs hold, kept only for mutant `cohort_gather_fixed`.
+/// Against a flush of milliseconds it expired before nearly every cohort was back (lane raw
+/// uw-l3d-fae301d05: ecetesla2, flights about 5.5 ms, 241 of 241 gathers expired at C = 64).
+const COHORT_GATHER_FIXED: Duration = Duration::from_micros(50);
+
+/// LEAP L3: the flights whose durations bound the cohort gather (`GroupState::gather_bound`).
+const FLIGHT_TIMES: usize = 16;
 
 /// The held frees, in bounds (`hold_bound()`), past which a freeing operation leads the owed
 /// upgrade itself (`Group::upgrade_overdue`).
@@ -539,7 +542,7 @@ struct GroupState {
     gathering: bool,
     /// The cohort the last flight carried: callers inside `wait_durable_on` when it was taken.
     cohort: u64,
-    /// Observation only: gathers held, and those that ended at `COHORT_GATHER` before the cohort
+    /// Observation only: gathers held, and those that ended at `gather_bound` before the cohort
     /// was back.
     gathers: u64,
     gathers_expired: u64,
@@ -547,6 +550,10 @@ struct GroupState {
     /// flights (the pwrite and its sync), over every gather and flight.
     gather_ns: u64,
     flight_ns: u64,
+    /// The last `FLIGHT_TIMES` flights' durations, ns (the pwrite and its sync), and how many
+    /// flights were timed: the device p50 the gather is bounded by.
+    flight_times: [u64; FLIGHT_TIMES],
+    flights_timed: u64,
     /// `durable[c]`: every journal byte below this log sequence number is durable in class `c` or
     /// a stronger one (indexed `Off`, `Fsync`, `FullFsync`; `Off` means written to the OS).
     durable: [u64; 3],
@@ -643,6 +650,28 @@ pub(crate) const CONFIRM_PARK_QUIET: u8 = 3;
 
 #[cfg(test)]
 impl GroupState {
+    /// A flight that landed took `ns` to write and sync.
+    fn record_flight(&mut self, ns: u64) {
+        self.flight_times[(self.flights_timed % FLIGHT_TIMES as u64) as usize] = ns;
+        self.flights_timed += 1;
+    }
+
+    /// LEAP L3: the longest a leader holds for its cohort, 10% of the device's p50 flight over the
+    /// last `FLIGHT_TIMES` flights (DESIGN.md §3, "Adaptive hold": the previous flight's rider count,
+    /// or at most 10% of the device p50; lead ruling 2026-10-18). A flight costs a whole device
+    /// flush, so a hold this short costs a cohort less than the second flush it saves. Zero, so no
+    /// hold, before any flight was timed.
+    fn gather_bound(&self) -> Duration {
+        let n = (self.flights_timed as usize).min(FLIGHT_TIMES);
+        if n == 0 {
+            return Duration::ZERO;
+        }
+        let mut times = self.flight_times;
+        let times = &mut times[..n];
+        times.sort_unstable();
+        Duration::from_nanos(times[n / 2] / 10)
+    }
+
     /// Test builds (fastest-budgets, review 2 L3): the confirmation writer's wait returned.
     fn confirm_wait_left(&mut self) {
         self.confirm_parked = 0;
@@ -6392,16 +6421,22 @@ impl BranchStore {
                 // acknowledged are still making their next operation when it lands, so a leader that
                 // takes the buffer at once carries only the other half: two cohorts alternate, about
                 // C/2 per flush. The leader holds instead, holding no lock, until as many callers
-                // wait as the last flight carried, or for `COHORT_GATHER` at most. At C = 1 the
+                // wait as the last flight carried, or for `GroupState::gather_bound` at most. At C = 1 the
                 // cohort is the leader alone, so it never holds. Mutant `no_cohort_gather` (test
                 // builds only): no hold, as before.
                 let cohort = g.cohort;
-                if cohort > 1 && !fe_mutant("no_cohort_gather") && group.awaiting.load(Ordering::Acquire) < cohort {
+                // Mutant `cohort_gather_fixed` (test builds only): the fixed 50 µs bound, as before.
+                let bound = if fe_mutant("cohort_gather_fixed") { COHORT_GATHER_FIXED } else { g.gather_bound() };
+                if cohort > 1
+                    && !bound.is_zero()
+                    && !fe_mutant("no_cohort_gather")
+                    && group.awaiting.load(Ordering::Acquire) < cohort
+                {
                     g.gathering = true;
                     g.gathers += 1;
                     drop(g);
                     let held_from = Instant::now();
-                    let until = held_from + COHORT_GATHER;
+                    let until = held_from + bound;
                     let mut back = false;
                     while Instant::now() < until {
                         if group.awaiting.load(Ordering::Acquire) >= cohort {
@@ -6483,7 +6518,14 @@ impl BranchStore {
             } else {
                 flight.write()
             });
-            group.lock().flight_ns += written_from.elapsed().as_nanos() as u64;
+            {
+                let took = written_from.elapsed().as_nanos() as u64;
+                let mut g = group.lock();
+                g.flight_ns += took;
+                if written.is_ok() {
+                    g.record_flight(took);
+                }
+            }
             if written.is_err() {
                 // Fail-stops the group and the journal in one step (they share the flag), and
                 // wakes the waiters, some of whom hold the store mutex while they wait.
@@ -6846,7 +6888,7 @@ impl BranchStore {
     }
 
     /// LEAP L3's cohort gather, observation only: gathers held, and those that ended at
-    /// `COHORT_GATHER` before the cohort was back.
+    /// `GroupState::gather_bound` before the cohort was back.
     pub(crate) fn gather_counters(&self) -> [u64; 2] {
         let g = self.group.lock();
         [g.gathers, g.gathers_expired]
