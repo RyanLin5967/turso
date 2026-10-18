@@ -5238,7 +5238,8 @@ fn an_extended_checkpoint_outside_a_block_empties_the_wal() {
 #[test]
 fn an_extended_copy_from_loads_its_rows_once() {
     let dir = Scratch::new("copyext");
-    let server = Server::start(&dir.db(), &[]);
+    // Its COPY FROM reads a file the test wrote in its scratch: granted (review wire-quote LOW-3).
+    let server = Server::start(&dir.db(), &["--copy-from-dir", dir.0.to_str().unwrap()]);
     let mut a = seeded(&server);
     let file = dir.0.join("rows.tsv");
     std::fs::write(&file, "2\ttwo\n3\tthree\n").unwrap();
@@ -6113,7 +6114,8 @@ fn an_extended_alter_add_constraint_adds_it_once() {
 #[test]
 fn describe_never_performs_a_statement_behind_a_comment() {
     let dir = Scratch::new("extaltercomment");
-    let server = Server::start(&dir.db(), &[]);
+    // Its COPY FROM reads a file the test wrote in its scratch: granted (review wire-quote LOW-3).
+    let server = Server::start(&dir.db(), &["--copy-from-dir", dir.0.to_str().unwrap()]);
     let mut a = server.connect();
     a.q("CREATE TABLE e5(id INT, v INT)").ok("table");
     a.q("INSERT INTO e5 VALUES (1, 10)").ok("row");
@@ -6910,7 +6912,8 @@ fn a_correlated_generate_series_column_is_scoped_to_its_select() {
 #[test]
 fn copy_from_runs_inside_the_block_it_is_in() {
     let dir = Scratch::new("copyblock");
-    let server = Server::start(&dir.db(), &[]);
+    // Its COPY FROM reads a file the test wrote in its scratch: granted (review wire-quote LOW-3).
+    let server = Server::start(&dir.db(), &["--copy-from-dir", dir.0.to_str().unwrap()]);
     let mut a = server.connect();
     a.q("CREATE TABLE cp(id INT, v TEXT)").ok("cp");
     let good = dir.0.join("good.tsv");
@@ -6951,7 +6954,8 @@ fn copy_from_runs_inside_the_block_it_is_in() {
 #[test]
 fn copy_refuses_an_option_it_does_not_implement() {
     let dir = Scratch::new("copyopts");
-    let server = Server::start(&dir.db(), &[]);
+    // Its COPY FROM reads a file the test wrote in its scratch: granted (review wire-quote LOW-3).
+    let server = Server::start(&dir.db(), &["--copy-from-dir", dir.0.to_str().unwrap()]);
     let mut a = server.connect();
     a.q("CREATE TABLE co(id INT, v TEXT)").ok("co");
     let rows = dir.0.join("rows.tsv");
@@ -6988,7 +6992,8 @@ fn copy_refuses_an_option_it_does_not_implement() {
 #[test]
 fn a_prepare_time_statement_is_refused_before_it_runs() {
     let dir = Scratch::new("copywhere");
-    let server = Server::start(&dir.db(), &[]);
+    // Its COPY FROM reads a file the test wrote in its scratch: granted (review wire-quote LOW-3).
+    let server = Server::start(&dir.db(), &["--copy-from-dir", dir.0.to_str().unwrap()]);
     let mut a = server.connect();
     a.q("CREATE TABLE cw(id INT, v TEXT)").ok("cw");
     let rows = dir.0.join("rows.tsv");
@@ -12129,7 +12134,9 @@ mod recorded {
         let cmds = parse(recording);
         assert!(!cmds.is_empty(), "refused: recording {name} has no command");
         let dir = Scratch::new(&format!("rec{}", name.len()));
-        let server = Server::start(&dir.db(), &[]);
+        // Every recording was made as PostgreSQL's superuser, who may COPY FROM any server file:
+        // the replay's server is granted every file (review wire-quote LOW-3).
+        let server = Server::start(&dir.db(), &["--copy-from-dir", "/"]);
         // pgraw.py's sessions: `CONN <name>` switches to one, connecting it first if new, and
         // each of its commands is prefixed `[<name>] `; the first session is "a".
         let mut sessions: Vec<(String, Wire, Vec<u8>)> = vec![("a".to_string(), server.connect(), Vec::new())];
@@ -14171,7 +14178,8 @@ fn copy_names_only_the_tables_columns_and_quotes_each() {
     let dir = Scratch::new("copy-columns");
     let file = dir.0.join("rows.tsv");
     std::fs::write(&file, "1\n").unwrap();
-    let server = Server::start(&dir.db(), &[]);
+    // Its COPY FROM reads a file the test wrote in its scratch: granted (review wire-quote LOW-3).
+    let server = Server::start(&dir.db(), &["--copy-from-dir", dir.0.to_str().unwrap()]);
     let mut a = server.connect();
     a.q("CREATE TABLE t (a int, b text)").ok("t");
     a.q("CREATE TABLE q (\"a\"\"b\" int)").ok("q");
