@@ -138,15 +138,18 @@ def busy_evidence(path, exclude=(), interval_default=1.0):
                     interval = float(x.split("=")[1])
         elif not p[0].startswith("#") and len(p) == 5 and p[4] == "foreign" and int(p[1]) not in exclude:
             per.setdefault((int(p[1]), p[2]), []).append((float(p[0]), float(p[3])))
-    # linux-rev-uw2 LOW 3: the evidence is what decide() NAMED for the VOID, and only when every reason it gives is a
-    # foreign process above 50% (rule 2): an unusable record or a rule-1 total is not explained by a busy process
+    # linux-rev-uw2 LOW 3: the evidence is the process decide() NAMED for the VOID (rule 2: a foreign process above 50%
+    # for 5 s), and none when the record is also unusable (a gap, too few ticks, no stop): a broken record is not a
+    # busy host. A rule-1 reason (the foreign total) names no process, so it alone is no evidence (measured on iccad7:
+    # a busy host's VOID gives rule 1 and rule 2 together)
     v = decide(path, interval_default)
+    if any(r.startswith("unusable record") for r in v["reasons"]):
+        return []
     named = []
     for r in v["reasons"]:
         m = re.match(r"foreign process (\d+) \((.*)\) above 50% for >= 5 s$", r)
-        if not m:
-            return []
-        named.append((int(m.group(1)), m.group(2)))
+        if m:
+            named.append((int(m.group(1)), m.group(2)))
     return [f"{comm} pid {pid}" for pid, comm in named if pid not in exclude and (pid, comm) in per]
 
 
