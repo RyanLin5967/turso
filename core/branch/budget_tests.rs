@@ -314,6 +314,7 @@ fn sample_of(s0: &probe::Snapshot, s1: &probe::Snapshot, o0: &Outside, o1: &Outs
     // Class (b): the threads that made the window unattributable, and the holds inside it that
     // could not be attributed to their holder (`probe::end_owning`, `store_unlocked`).
     s.insert("foreign_threads", s1.foreign);
+    s.insert("threads_quiet", u64::from(s1.threads_quiet));
     // Probe-adversary item 1: every sample records the probe's mode and the shim's lost count.
     s.insert("shim_loaded", u64::from(s1.shim_loaded));
     // probe-adversary-2 L4: why a count was refused (`probe::Refusal`, 0 when it was not).
@@ -432,7 +433,10 @@ fn measure_owning<R>(db: &Arc<Database>, base: Option<u64>, owned: &[&str], f: i
     // A window whose work synced a flight and started no checkpoint (which may take the word
     // itself) must have absorbed the word's write.
     let absorbed = !synced || left || confirms == 1 || WORD_HELD.load(std::sync::atomic::Ordering::Acquire);
-    let attributed = s1.attributed_syscalls.is_some() && s1.held_unattributed == s0.held_unattributed;
+    // The Linux port (2026-10-18): where no kernel syscall count exists, the window is the caller's own
+    // when the thread rule says so (`Snapshot::threads_quiet`); where one exists, its attribution.
+    let own = s1.attributed_syscalls.is_some() || (s1.syscalls.is_none() && s1.threads_quiet);
+    let attributed = own && s1.held_unattributed == s0.held_unattributed;
     let quiet = settled && back && parked && absorbed && attributed && (left || s["allocs_process"] == s["allocs"]);
 
     s.insert("writer_parked", u64::from(parked));

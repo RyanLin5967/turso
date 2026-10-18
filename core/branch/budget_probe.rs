@@ -726,6 +726,11 @@ pub(crate) struct Snapshot {
     pub(crate) shim_lost: u64,
     /// Why `attributed_syscalls` is `None`, if it is (`Refusal`).
     pub(crate) refusal: Refusal,
+    /// The Linux port (2026-10-18): whether the thread rule alone (the same `attribute` checks on the
+    /// two thread tables, with no count to attribute) shows the window was the caller's own: no thread
+    /// gone, none new and running, no foreign thread ran. Where a kernel count exists (Apple) it is
+    /// `attributed_syscalls.is_some()`; off Apple it is the only evidence, since no count exists.
+    pub(crate) threads_quiet: bool,
 }
 
 /// Take a snapshot to open a window (see [`Snapshot`]): every thread's CPU time is read just
@@ -1041,6 +1046,16 @@ pub(crate) fn end_owning(owned: &[&str]) -> Snapshot {
         }
         _ => (None, 0, Refusal::NoKernelCount),
     };
+    // The Linux port: with no kernel count, the thread rule still decides whether the window was the
+    // caller's own (the same checks, with a count of 0 that nothing reads), and names the foreign
+    // threads; the syscall count stays None.
+    // On Apple a missing count stays a refusal, as before: the rule replaces a count only where none exists.
+    let (threads_quiet, foreign) = if !cfg!(target_vendor = "apple") && syscalls.is_none() && WINDOW_N0.with(|n| n.get()).is_some() && n1.is_some() {
+        let (own, f, _) = WINDOW_T0.with(|t0| attribute(0, &t0.borrow()[..], &WINDOW_C0.with(|c| c.get()), &t1, &c1, ends, owned, true));
+        (own.is_some() && f == 0, f)
+    } else {
+        (attributed.is_some(), foreign)
+    };
     // Mutants (test builds only; counters review 4 MED-1): `probe_diagnostics_first` runs the
     // window's diagnostics before its counts are read, as a regression would; `probe_box_before_counts`
     // allocates once there, the control every exact-count fire-check must see.
@@ -1058,6 +1073,7 @@ pub(crate) fn end_owning(owned: &[&str]) -> Snapshot {
     s.attributed_syscalls = attributed;
     s.shim_loaded = shim().is_some();
     s.shim_lost = lost1;
+    s.threads_quiet = threads_quiet;
     s.instructions = instructions();
     if !diagnostics_first {
         window_diagnostics(refusal, foreign, owned, attributed, &t1);
@@ -1194,6 +1210,7 @@ fn user_counts() -> Snapshot {
         shim_loaded: false,
         shim_lost: 0,
         refusal: Refusal::None,
+        threads_quiet: false,
     }
 }
 
