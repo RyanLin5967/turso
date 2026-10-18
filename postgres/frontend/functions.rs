@@ -199,13 +199,34 @@ fn exec_pg_regclass(conn: &Connection, args: &[Value]) -> Result<Value> {
         ))
     };
     let parts = crate::catalog::identifier_list(&text).ok_or_else(invalid)?;
+    // makeRangeVarFromNameList: a third part is a database, which must be this one (0A000
+    // otherwise), and a fourth is 42601 (recorded, pg18-rev-uw2-regclass.out).
     let (schema, name) = match parts.as_slice() {
         [name] => (None, name.clone()),
         [schema, name] => (Some(schema.clone()), name.clone()),
-        _ => return Err(invalid()),
+        [database, schema, name] => {
+            if *database != crate::catalog::db_name_from_path(conn.db_file_path()) {
+                return Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
+                    SqlErrorKind::FeatureNotSupported,
+                    format!("cross-database references are not implemented: \"{}\"", parts.join(".")),
+                )));
+            }
+            (Some(schema.clone()), name.clone())
+        }
+        _ => {
+            return Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
+                SqlErrorKind::SyntaxError,
+                format!("improper relation name (too many dotted names): {}", parts.join(".")),
+            )))
+        }
     };
+    // pg_catalog comes first on every search path, as PostgreSQL puts it (wire-rev-uw2 H3:
+    // 'pg_class'::regclass was 42P01; PG 18.6 answers 1259); public names only user relations.
     let found = match schema.as_deref() {
-        None | Some("public") => crate::catalog::relation_oid(&conn.current_schema(), &name),
+        None => crate::catalog::catalog_relation_oid(&name)
+            .or_else(|| crate::catalog::relation_oid(&conn.current_schema(), &name)),
+        Some("pg_catalog") => crate::catalog::catalog_relation_oid(&name),
+        Some("public") => crate::catalog::relation_oid(&conn.current_schema(), &name),
         Some(_) => None,
     };
     found.map(Value::from_i64).ok_or_else(|| {

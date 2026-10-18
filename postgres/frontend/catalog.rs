@@ -490,8 +490,13 @@ pub(crate) fn sqlite_type_to_pg_oid(ty_str: &str) -> i64 {
 /// A user table's or index's pg_class oid by its exact name, by the scheme pg_class and
 /// pg_index assign them: tables first in name order, then each table's indexes in order.
 pub(crate) fn relation_oid(schema: &Schema, name: &str) -> Option<i64> {
+    // Each relation by the engine's identity for its name, ASCII case folded: the engine folds
+    // every relation name (normalize_ident), so a table created as "T2" is the engine's t2, and
+    // '"T2"' named no relation while 'T2' named it (wire-rev-uw2 MED; recorded,
+    // pg18-rev-uw2-regclass.out). PostgreSQL's 'T2' is 42P01 for a "T2": that half, and pg_class
+    // showing "T2" as created, need the engine to keep a name's case (engine-owned, known-red).
     let tables = user_tables_sorted(schema);
-    if let Some(i) = tables.iter().position(|(t, _)| t.as_str() == name) {
+    if let Some(i) = tables.iter().position(|(key, _)| key.eq_ignore_ascii_case(name)) {
         return Some(USER_TABLE_OID_START + i as i64);
     }
     let mut index_oid = USER_TABLE_OID_START + tables.len() as i64;
@@ -500,22 +505,84 @@ pub(crate) fn relation_oid(schema: &Schema, name: &str) -> Option<i64> {
             if idx.ephemeral {
                 continue;
             }
-            if idx.name == name {
+            if idx.name.eq_ignore_ascii_case(name) {
                 return Some(index_oid);
             }
             index_oid += 1;
         }
     }
-    None
+    views_and_sequences_sorted(schema)
+        .iter()
+        .position(|(relname, _, _)| relname.eq_ignore_ascii_case(name))
+        .map(|i| index_oid + i as i64)
 }
 
-/// `text` read as PostgreSQL reads a qualified name in a regclass (stringToQualifiedNameList):
-/// parts split at dots outside double quotes, an unquoted part folded to lower case and holding
-/// no blank, a quoted part as written with `""` as one quote. None for a malformed name.
+/// The views and sequences of `schema`, as pg_class numbers them after every index: the views by
+/// their catalog names, then the sequences by theirs, each with its name as created, its relkind
+/// (v or S) and its column count (a sequence's three: last_value, log_cnt, is_called). Both
+/// pg_class and [`relation_oid`] use it, so the two agree on each oid.
+pub(crate) fn views_and_sequences_sorted(schema: &Schema) -> Vec<(String, &'static str, i64)> {
+    let mut views: Vec<_> = schema.views.iter().collect();
+    views.sort_by_key(|(key, _)| *key);
+    let mut sequences: Vec<_> = schema.sequences.iter().collect();
+    sequences.sort_by_key(|(key, _)| *key);
+    views
+        .into_iter()
+        .map(|(_, v)| (v.name.clone(), "v", v.columns.len() as i64))
+        .chain(sequences.into_iter().map(|(_, q)| (q.name.clone(), "S", 3)))
+        .collect()
+}
+
+/// The pg_catalog relations this frontend serves, with their PostgreSQL 18.6 oids, which a
+/// regclass names (recorded, pg18-rev-uw2-regclass.out: each '<name>'::regclass::oid). The
+/// catalogs' oids are fixed by PostgreSQL's catalog headers; the views' (pg_roles, pg_tables,
+/// pg_indexes, pg_sequences) are initdb's, as 18.6 assigns them.
+const PG_CATALOG_RELATION_OIDS: &[(&str, i64)] = &[
+    ("pg_am", 2601),
+    ("pg_attrdef", 2604),
+    ("pg_attribute", 1249),
+    ("pg_class", 1259),
+    ("pg_collation", 3456),
+    ("pg_constraint", 2606),
+    ("pg_database", 1262),
+    ("pg_description", 2609),
+    ("pg_foreign_table", 3118),
+    ("pg_index", 2610),
+    ("pg_indexes", 12043),
+    ("pg_inherits", 2611),
+    ("pg_namespace", 2615),
+    ("pg_partitioned_table", 3350),
+    ("pg_policy", 3256),
+    ("pg_proc", 1255),
+    ("pg_publication", 6104),
+    ("pg_publication_namespace", 6237),
+    ("pg_publication_rel", 6106),
+    ("pg_rewrite", 2618),
+    ("pg_roles", 12000),
+    ("pg_sequences", 12048),
+    ("pg_tables", 12033),
+    ("pg_trigger", 2620),
+    ("pg_type", 1247),
+];
+
+/// The oid of the pg_catalog relation named `name` exactly, as [`PG_CATALOG_RELATION_OIDS`]
+/// holds it.
+pub(crate) fn catalog_relation_oid(name: &str) -> Option<i64> {
+    PG_CATALOG_RELATION_OIDS.iter().find(|(n, _)| *n == name).map(|(_, oid)| *oid)
+}
+
+/// `text` read as PostgreSQL reads a qualified name in a regclass (stringToQualifiedNameList,
+/// SplitIdentifierString): parts split at dots outside double quotes, blanks allowed before and
+/// after each part (' public . t ' is public.t; recorded, pg18-rev-uw2-regclass.out), an unquoted
+/// part folded to lower case and holding no blank, a quoted part as written with `""` as one
+/// quote. None for a malformed name.
 pub(crate) fn identifier_list(text: &str) -> Option<Vec<String>> {
     let mut parts = Vec::new();
     let mut chars = text.trim().chars().peekable();
     loop {
+        while chars.peek().is_some_and(|c| c.is_whitespace()) {
+            chars.next();
+        }
         let mut part = String::new();
         if chars.peek() == Some(&'"') {
             chars.next();
@@ -534,10 +601,10 @@ pub(crate) fn identifier_list(text: &str) -> Option<Vec<String>> {
             }
         } else {
             while let Some(&c) = chars.peek() {
-                if c == '.' {
+                if c == '.' || c.is_whitespace() {
                     break;
                 }
-                if c.is_whitespace() || c == '"' {
+                if c == '"' {
                     return None;
                 }
                 part.push(c.to_ascii_lowercase());
@@ -548,6 +615,9 @@ pub(crate) fn identifier_list(text: &str) -> Option<Vec<String>> {
             }
         }
         parts.push(part);
+        while chars.peek().is_some_and(|c| c.is_whitespace()) {
+            chars.next();
+        }
         match chars.next() {
             None => return Some(parts),
             Some('.') => continue,
@@ -783,6 +853,48 @@ impl PgClassCursor {
                 ]);
                 index_oid += 1;
             }
+        }
+
+        // Views (relkind v) and sequences (relkind S), numbered after the indexes, as
+        // relation_oid numbers them: PostgreSQL's pg_class holds both, and a regclass of one
+        // was 42P01 (wire-rev-uw2 MED; recorded, pg18-rev-uw2-regclass.out).
+        for (relname, relkind, relnatts) in views_and_sequences_sorted(&schema) {
+            self.rows.push(vec![
+                Value::from_i64(index_oid),    // oid
+                Value::Text(relname.into()),   // relname
+                Value::from_i64(2200),         // relnamespace (public)
+                Value::from_i64(0),            // reltype
+                Value::from_i64(0),            // reloftype
+                Value::from_i64(10),           // relowner
+                Value::from_i64(0),            // relam (none)
+                Value::from_i64(0),            // relfilenode
+                Value::from_i64(0),            // reltablespace
+                Value::from_i64(0),            // relpages
+                Value::from_f64(0.0),          // reltuples
+                Value::from_i64(0),            // relallvisible
+                Value::from_i64(0),            // reltoastrelid
+                Value::from_i64(0),            // relhasindex
+                Value::from_i64(0),            // relisshared
+                Value::Text("p".into()),       // relpersistence
+                Value::Text(relkind.into()),   // relkind (view or sequence)
+                Value::from_i64(relnatts),     // relnatts
+                Value::from_i64(0),            // relchecks
+                Value::from_i64(i64::from(relkind == "v")), // relhasrules (a view's _RETURN)
+                Value::from_i64(0),            // relhastriggers
+                Value::from_i64(0),            // relhassubclass
+                Value::from_i64(0),            // relrowsecurity
+                Value::from_i64(0),            // relforcerowsecurity
+                Value::from_i64(1),            // relispopulated
+                Value::Text("n".into()),       // relreplident
+                Value::from_i64(0),            // relispartition
+                Value::from_i64(0),            // relrewrite
+                Value::from_i64(0),            // relfrozenxid
+                Value::from_i64(0),            // relminmxid
+                Value::Null,                   // relacl
+                Value::Null,                   // reloptions
+                Value::Null,                   // relpartbound
+            ]);
+            index_oid += 1;
         }
 
         Ok(())
