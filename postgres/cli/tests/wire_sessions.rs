@@ -12575,17 +12575,13 @@ replays_postgresql!(
     pg18_audit2_alter_table_add_constraint_is_validated_and_atomic_replays_as_postgresql_answered,
     "pg18-audit2-alter_table_add_constraint_is_validated_and_atomic.out",
     [
-        (7, "PGDIV-NUMERIC-OID-FLOAT8 value [wire]: NUMERIC(p,s) column n typed 701 float8 in RowDescription; PG 1700 (text '12.50' agrees)"),
         (8, "PGDIV-CONSTRAINT-MESSAGE error-text [wire]: ALTER TABLE ADD FOREIGN KEY 23503 both; ours 'violates the foreign key constraint it adds: a row's key (pid) is not present in table \"p\"' vs PG '... violates foreign key constraint \"c_pid_fkey\"'"),
-        (10, "PGDIV-NUMERIC-OID-FLOAT8 value [wire]: NUMERIC(p,s) column n typed 701 float8; PG 1700 (same as #7, not a cascade)"),
     ]
 );
 replays_postgresql!(
     pg18_audit2_alter_table_add_constraint_takes_effect_and_keeps_the_rows_replays_as_postgresql_answered,
     "pg18-audit2-alter_table_add_constraint_takes_effect_and_keeps_the_rows.out",
     [
-        (6, "PGDIV-NUMERIC-OID-FLOAT8 value [wire]: NUMERIC(p,s) column n typed 701 float8; PG 1700 (text agrees)"),
-        (10, "PGDIV-NUMERIC-OID-FLOAT8 value [wire]: NUMERIC(p,s) column n typed 701 float8; PG 1700 (text agrees)"),
         (11, "PGDIV-CONSTRAINT-MESSAGE error-text [wire]: 23505 both; ours 'UNIQUE constraint failed: c.id' vs PG '... unique constraint \"c_pkey\"'"),
         (12, "PGDIV-CONSTRAINT-MESSAGE error-text [wire]: 23502 both; ours 'NOT NULL constraint failed: c.id' vs PG 'null value in column \"id\" of relation \"c\" violates not-null constraint'"),
         (13, "PGDIV-CONSTRAINT-MESSAGE error-text [wire]: 23503 both; ours 'FOREIGN KEY constraint failed' vs PG '... violates foreign key constraint \"c_pid_fkey\"'"),
