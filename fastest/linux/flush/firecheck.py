@@ -75,7 +75,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "gates"))
-import hostbin  # noqa: E402  the strace wrapper's bash is hostbin's bash 4+, never the caller's PATH's (the platform class)
+import hostbin  # noqa: E402  the strace wrapper's bash is hostbin's bash 5+ (BASH_MIN), never the caller's PATH's (the platform class)
 
 KINDS = ["fsync", "fdatasync", "syncfs", "sync", "msync_SYNC", "osync_write", "odsync_write", "sfr_write_wait",
          "sfr_write", "sfr_wait", "msync_other", "FICLONE", "FICLONERANGE", "copy_file_range"]

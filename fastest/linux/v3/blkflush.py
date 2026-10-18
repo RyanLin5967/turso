@@ -1029,6 +1029,7 @@ def self_test():
         chk("refuses overlapping windows", True)
     os.unlink(tmp)
     ok = all(res) and len(res) > 0
+    print(f"TALLY ran={len(res)} pass={sum(res)} na=0 fail={len(res) - sum(res)}")  # gates/tally.py
     print("BLKFLUSH SELF-TEST %d/%d %s" % (sum(res), len(res), "PASS" if ok else "FAIL"))
     return 0 if ok else 1
 

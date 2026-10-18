@@ -31,6 +31,7 @@ I/O-heavy batch; the T3 registration must rule on this). A process whose environ
 """
 import json
 import os
+import re
 import sys
 import time
 
@@ -137,21 +138,16 @@ def busy_evidence(path, exclude=(), interval_default=1.0):
                     interval = float(x.split("=")[1])
         elif not p[0].startswith("#") and len(p) == 5 and p[4] == "foreign" and int(p[1]) not in exclude:
             per.setdefault((int(p[1]), p[2]), []).append((float(p[0]), float(p[3])))
-    out = []
-    for (pid, comm), rows in sorted(per.items()):
-        run, last = 0.0, None
-        for t, pct in rows:
-            if pct > 50.0 and last is not None and t - last <= 1.5 * interval:
-                run += t - last
-            elif pct > 50.0:
-                run = interval
-            else:
-                run = 0.0
-            last = t if pct > 50.0 else None
-            if run >= 5.0:
-                out.append(f"{comm} pid {pid}")
-                break
-    return out
+    # linux-rev-uw2 LOW 3: the evidence is what decide() NAMED for the VOID, and only when every reason it gives is a
+    # foreign process above 50% (rule 2): an unusable record or a rule-1 total is not explained by a busy process
+    v = decide(path, interval_default)
+    named = []
+    for r in v["reasons"]:
+        m = re.match(r"foreign process (\d+) \((.*)\) above 50% for >= 5 s$", r)
+        if not m:
+            return []
+        named.append((int(m.group(1)), m.group(2)))
+    return [f"{comm} pid {pid}" for pid, comm in named if pid not in exclude and (pid, comm) in per]
 
 
 def decide(path, interval_default=1.0):
@@ -258,10 +254,14 @@ def self_test():
     # host itself is busy, so those cases are N/A-on-busy-host, printed and never counted as a pass; the VOID-wanting
     # case still runs, as a busy host cannot excuse a missed burner. On the T3 box (quiet by its own preflight) all run.
     busy = None
+    n_pass = n_na = 0
     for label, burners, want in live:
-        if busy and want == "VALID":
+        # linux-rev-uw2 LOW 4: on a busy host the VOID-wanting case is N/A too: its window would VOID with or without
+        # the burner, so it cannot tell a working sampler from one that voids everything
+        if busy:
+            n_na += 1
             print(f"N/A-on-busy-host: self-test {label}: the quiet baseline was VOID ({busy}); a busy host cannot "
-                  "show VALID", flush=True)
+                  f"show {want} apart from its own load", flush=True)
             continue
         out, rec, mine = window(label.split(": ")[1].replace(" ", "_")[:24], burners)
         if not burners and out != "VALID":
@@ -271,10 +271,12 @@ def self_test():
             others = busy_evidence(rec, exclude=mine)
             if others:
                 busy = f"the no-burner window gave {out}; the window's own samples show: {', '.join(others[:4])}"
+                n_na += 1
                 print(f"N/A-on-busy-host: self-test {label}: {busy}", flush=True)
                 continue
         ok = out == want
         bad += not ok
+        n_pass += ok
         print(f"self-test {'PASS' if ok else 'FAIL'}: {label}: want {want}, got {out}")
 
     # Synthetic: each rule alone, on records whose every number is chosen here (a live box's own
@@ -328,6 +330,7 @@ def self_test():
     ]
     for label, ok in synthetic_evid:
         bad += not ok
+        n_pass += ok
         print(f"self-test {'PASS' if ok else 'FAIL'}: {label}")
     synthetic = [
         ("rule 1: foreign 150% in 2 of 20 ticks (10% > 5%)", synth("r1v", [10] * 18 + [150, 150]), "VOID"),
@@ -342,7 +345,9 @@ def self_test():
     for label, got, want in synthetic:
         ok = got == want
         bad += not ok
+        n_pass += ok
         print(f"self-test {'PASS' if ok else 'FAIL'}: {label}: want {want}, got {got}")
+    print(f"TALLY ran={n_pass + bad} pass={n_pass} na={n_na} fail={bad}")  # gates/tally.py
     # an N/A is its own outcome, never a pass (linux-rev-uw1 HIGH 1): "fail", "na" (some case did not run) or "pass"
     return "fail" if bad else "na" if busy else "pass"
 

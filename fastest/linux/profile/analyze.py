@@ -883,6 +883,7 @@ def self_test():
     bad = [name for name, good in cases if not good]
     for name, good in cases:
         print(f"self-test {'PASS' if good else 'FAIL'}: {name}")
+    print(f"TALLY ran={len(cases)} pass={len(cases) - len(bad)} na=0 fail={len(bad)}")  # gates/tally.py
     return not bad
 
 

@@ -2975,6 +2975,11 @@ fn main() {
         }
     }
     let args = parse_args();
+    // linux-rev-uw2 LOW 9: off Apple every command would end at diskio_line, which refuses there, after printing
+    // its result lines (and the crash victim would exit 1 instead of dying by SIGKILL). It refuses here instead,
+    // before any result line
+    #[cfg(not(target_vendor = "apple"))]
+    diskio_line(&args.cmd);
     if cfg!(debug_assertions) {
         println!("# DEBUG build: not a timing result");
     }

@@ -45,5 +45,6 @@ check "t3run unsets an inherited T3_IDENTITY_MODE and sets virtio only under --d
 mkdir -p "$T/tmpd"
 check "uw2 LOW 6: a t3run that refuses leaves no temp dir behind (its pinned-bash dir is removed at exit)" \
   'TMPDIR=$T/tmpd refuses l6 "--block" --dry-block /dev/vdb --block loop; ls -A "$T/tmpd"; [ -z "$(ls -A "$T/tmpd")" ]'
+echo "TALLY ran=$((pass + fail)) pass=$pass na=${na:-0} fail=$fail"  # gates/tally.py
 echo "T3RUN-ARGS SELF-TEST $pass/$((pass + fail)) $([ $fail = 0 ] && echo PASS || echo FAIL)"
 [ $fail = 0 ]

@@ -4,7 +4,8 @@ declares it (lead order 2026-10-15, Ryan's class rule: no gate script or test si
 layout). The same command runs on the Mac and on Linux; vm_dryblock.sh runs it on the Mac before a VM dry run, and
 t3run.sh's selftests stage runs it on Linux.
 
-  run_everywhere.py [ROOT]     ROOT is fastest/linux (default: this file's ../). Exit 0 iff every row for this
+  run_everywhere.py [ROOT] [--allow-na CAUSE,...]
+                               ROOT is fastest/linux (default: this file's ../). Exit 0 iff every row for this
                                platform ran and passed, no entry point lacks a row, and no row names a missing file;
                                3 when nothing failed but a case or row was N/A (counted by cause in the totals; never
                                a pass); 1 otherwise. A row that skips a case exits 3 with an N/A-on-<cause> line.
@@ -24,6 +25,7 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import hostbin  # noqa: E402  the one bash every row and its children run under (the platform class)
+import tally  # noqa: E402  the one outcome record every row prints (linux-rev-uw2 MED 1)
 PLATFORMS = ("any", "linux")
 PY_MARK = re.compile(r'''(==|in|\[)\s*\(?\s*\[?\s*["'](--)?self-?test["']''')
 SH_MARK = re.compile(r'''--self-test\)|= *"?--self-test"?''')
@@ -73,8 +75,9 @@ def discover(root):
     return sorted(out)
 
 
-def run(root, plat=None, timeout=1800):
-    """-> (rc, lines). Runs each row for plat (default: this platform) from its file's directory."""
+def run(root, plat=None, timeout=1800, allow_na=None):
+    """-> (rc, lines). Runs each row for plat (default: this platform) from its file's directory. ALLOW_NA (a set of
+    causes) limits which N/A causes may give rc 3; any other N/A is a failure (linux-rev-uw2 LOW 5)."""
     plat = plat or this_platform()
     rows, bad = table(root)
     listed = {r[0] for r in rows}
@@ -101,6 +104,9 @@ def run(root, plat=None, timeout=1800):
             fails.append(f"{path}: listed in platforms.tsv but absent")
             continue
         if pf == "linux" and plat != "linux":
+            if allow_na is not None and plat not in allow_na:
+                fails.append(f"{path}: N/A-on-{plat}, a cause not allowed here (--allow-na {','.join(allow_na)})")
+                continue
             causes[plat] = causes.get(plat, 0) + 1
             lines.append(f"N/A-on-{plat}: {path} ({why})")
             continue
@@ -113,26 +119,31 @@ def run(root, plat=None, timeout=1800):
         except subprocess.TimeoutExpired:
             rc, out = None, "timed out"
         last = [ln for ln in out.splitlines() if ln.strip()][-1:] or [""]
-        # an N/A is its own outcome (linux-rev-uw1 HIGH 1, MED 2; the lead's rule: an N/A never counts toward a T3
-        # gate item): a row that skips a case exits 3 and names each case's cause in an "N/A-on-<cause>" line
+        # the row's outcome is its TALLY line, agreeing with its rc (linux-rev-uw2 MED 1: an allowlist of outcomes, not
+        # a wording match); every N/A case also names its cause in an "N/A-on-<cause>" line (MED 2's totals)
+        outcome, t_, probs = tally.judge(out, rc if rc is not None else -1)
         row_na = re.findall(r"N/A-on-([A-Za-z0-9_-]+)", out)
         if rc == 0 and row_na:
-            fails.append(f"{path}: printed {len(row_na)} N/A line(s) but exited 0: an N/A must exit 3")
-            lines.append(f"FAIL {path} {args} rc=0 | N/A lines with exit 0")
-        elif rc == 3 and row_na:
+            probs = probs + [f"printed {len(row_na)} N/A line(s) but exited 0: an N/A must exit 3"]
+            outcome = "fail"
+        if outcome == "na" and len(row_na) != t_["na"]:
+            probs.append(f"TALLY na={t_['na']}, but {len(row_na)} N/A-on-<cause> line(s) name a cause")
+            outcome = "fail"
+        if outcome == "na" and allow_na is not None and set(row_na) - set(allow_na):
+            probs.append(f"N/A cause(s) {sorted(set(row_na) - set(allow_na))} not allowed here (--allow-na {','.join(allow_na)})")
+            outcome = "fail"
+        if outcome == "pass":
+            passed += 1
+            lines.append(f"PASS {path} {args} rc=0 | {last[0][:160]}")
+        elif outcome == "na":
             for c in row_na:
                 causes[c] = causes.get(c, 0) + 1
             lines.append(f"N/A {path} {args} rc=3 | {len(row_na)} case(s) N/A: "
                          + ", ".join(f"{c} {row_na.count(c)}" for c in sorted(set(row_na))))
-        elif rc == 3:
-            fails.append(f"{path}: exited 3 (N/A) but printed no N/A-on-<cause> line")
-            lines.append(f"FAIL {path} {args} rc=3 | no cause named")
-        elif rc == 0:
-            passed += 1
-            lines.append(f"PASS {path} {args} rc=0 | {last[0][:160]}")
         else:
-            fails.append(f"{path}: rc {rc}: {last[0][:200]}")
-            lines.append(f"FAIL {path} {args} rc={rc} | {last[0][:160]}")
+            why = "; ".join(probs) or (last[0][:200])
+            fails.append(f"{path}: rc {rc}: {why}")
+            lines.append(f"FAIL {path} {args} rc={rc} | {why[:200]}")
     lines += [f"REFUSED: {x}" for x in fails if x not in bad]
     n_na = sum(causes.values())
     lines.append(f"run_everywhere ({plat}): {passed} passed, {n_na} N/A"
@@ -304,6 +315,7 @@ def self_test():
     bad = [n for n, ok in cases if not ok]
     for n, ok in cases:
         print(f"RUN-EVERYWHERE self-test {'PASS' if ok else 'FAIL'}: {n}")
+    print(f"TALLY ran={len(cases)} pass={len(cases) - len(bad)} na=0 fail={len(bad)}")  # gates/tally.py
     print(f"RUN-EVERYWHERE SELF-TEST {len(cases) - len(bad)}/{len(cases)} {'PASS' if not bad else 'FAIL'}")
     return 0 if not bad else 1
 
@@ -311,7 +323,13 @@ def self_test():
 if __name__ == "__main__":
     if sys.argv[1:] == ["self-test"]:
         sys.exit(self_test())
-    root = sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(HERE)
-    rc, lines = run(os.path.abspath(root))
+    av = sys.argv[1:]
+    allow = None
+    if "--allow-na" in av:
+        i = av.index("--allow-na")
+        allow = set(av[i + 1].split(",")) if i + 1 < len(av) else set()
+        av = av[:i] + av[i + 2:]
+    root = av[0] if av else os.path.dirname(HERE)
+    rc, lines = run(os.path.abspath(root), allow_na=allow)
     print("\n".join(lines))
     sys.exit(rc)

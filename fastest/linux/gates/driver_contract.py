@@ -383,6 +383,7 @@ def self_test():
     bad = [n for n, ok in cases if not ok]
     for n, ok in cases:
         print(f"DRIVER-CONTRACT self-test {'PASS' if ok else 'FAIL'}: {n}")
+    print(f"TALLY ran={len(cases)} pass={len(cases) - len(bad)} na=0 fail={len(bad)}")  # gates/tally.py
     print(f"DRIVER-CONTRACT SELF-TEST {len(cases) - len(bad)}/{len(cases)} {'PASS' if not bad else 'FAIL'}")
     return 0 if not bad else 1
 

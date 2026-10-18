@@ -514,6 +514,7 @@ check "uw2 LOW 7: sudo_state reads a localised sudo (de_DE) as 'password', askin
 check "LOW 6: sudo_state: any other sudo failure is an error, named" \
   'case "$(T3_SUDO_BIN=$T/sudo/err sudo_state)" in error:*resolve*) true ;; *) false ;; esac'
 
+echo "TALLY ran=$((pass + fail)) pass=$pass na=${na:-0} fail=$fail"  # gates/tally.py
 echo "T3LIB SELF-TEST $pass/$((pass + fail)) $([ $fail = 0 ] && echo PASS || echo FAIL)$([ $na = 0 ] || echo " ($na N/A: off Linux or without root)")"
 # an N/A is its own outcome, exit 3, never a pass (linux-rev-uw1 HIGH 1): 0 only when every case ran and held
 [ $fail = 0 ] || exit 1

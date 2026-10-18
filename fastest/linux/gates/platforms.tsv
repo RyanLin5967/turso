@@ -23,6 +23,7 @@ gates/cargo_all_targets_test.sh		linux	cargo check -p turso_core --all-targets o
 gates/driver_contract.py	self-test	any	pure Python; its TracerPid cases name their platform (linux=True/False)
 gates/fixed_api_mutants.py	self-test	any	the table guard on the real files
 gates/sweeper_record.py	selftest	any	pure Python over sweeper records
+gates/tally.py	self-test	any	pure Python: the outcome record every row prints
 gates/warmup_conformance.py	self-test	any	pure Python with fake replayers
 profile/analyze.py	--self-test	any	pure Python over profile records
 t3/blockgate.py	self-test	any	pure Python over V3 records (testdata)
