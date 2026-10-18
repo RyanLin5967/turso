@@ -3624,6 +3624,9 @@ fn every_prepare_generation_bump_site_is_audited() {
         ("connection.rs", "register_internal_vtab", 1),
         ("connection.rs", "register_virtual_table", 1),
         ("connection.rs", "reset_page_size", 1),
+        // ROLLBACK TO's schema restore, moved here from op_savepoint (5650219c0) and shared with a
+        // statement rollback's restore (end_statement): the schemas it installs are new.
+        ("connection.rs", "restore_schema_snapshot", 1),
         ("connection.rs", "rollback_attached_mvcc_txs", 1),
         ("connection.rs", "rollback_attached_wal_txns", 1),
         ("connection.rs", "rollback_temp_schema", 1),
@@ -3662,7 +3665,6 @@ fn every_prepare_generation_bump_site_is_audited() {
         ("translate/pragma.rs", "update_pragma", 2),
         ("vdbe/execute.rs", "drop", 1),
         ("vdbe/execute.rs", "op_journal_mode_inner", 2),
-        ("vdbe/execute.rs", "op_savepoint", 1),
         ("vdbe/mod.rs", "cleanup_abandoned_mvcc_commit", 1),
     ];
     let core = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
