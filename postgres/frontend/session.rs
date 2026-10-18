@@ -1158,9 +1158,10 @@ pub fn attach_schema_files(conn: &PgConnection, db_file: &str) {
             catalog::quote_literal(&path),
             catalog::quote_ident(schema)
         ));
-        tracing::info!("Auto-attaching PG schema '{}' from {}", schema, path);
+        // Log text, not SQL: the name in Rust's own quoting ({:?}), never a hand-quoted hole.
+        tracing::info!("Auto-attaching PG schema {:?} from {}", schema, path);
         if let Err(e) = conn.inner().execute(&sql) {
-            tracing::warn!("Failed to attach schema '{}': {}", schema, e);
+            tracing::warn!("Failed to attach schema {:?}: {}", schema, e);
         }
     }
 }
