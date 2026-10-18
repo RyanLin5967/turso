@@ -14664,6 +14664,15 @@ fn engine_built_sql_quotes_identifiers_and_escapes_literals_everywhere() {
             .map(|r| r.iter().map(|row| row.iter().map(|v| v.to_string()).collect()).collect())
             .map_err(|e| e.to_string())
     }
+    // FLAGGED fixture repair after its first run (145f76f07): a reopen that the stored rows refuse is a
+    // listed failure, not a panic that hides the cases after it.
+    let reopen = |path: &std::path::Path, case: &str, failed: &mut Vec<String>| match try_open_at(path, DatabaseOpts::new()) {
+        Ok(db) => Some(db.connect().unwrap()),
+        Err(e) => {
+            failed.push(format!("{case}: the reopen was refused: {e}"));
+            None
+        }
+    };
     let fresh = |name: &str| {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join(format!("{name}.db"));
@@ -14687,9 +14696,10 @@ fn engine_built_sql_quotes_identifiers_and_escapes_literals_everywhere() {
                 }
             }
         }
-        let c = open_at(&path, DatabaseOpts::new()).connect().unwrap();
-        if let Err(e) = rows(&c, "SELECT z FROM other") {
-            failed.push(format!("F4: after a reopen, other: {e}"));
+        if let Some(c) = reopen(&path, "F4", &mut failed) {
+            if let Err(e) = rows(&c, "SELECT z FROM other") {
+                failed.push(format!("F4: after a reopen, other: {e}"));
+            }
         }
     }
     // F1
@@ -14707,8 +14717,7 @@ fn engine_built_sql_quotes_identifiers_and_escapes_literals_everywhere() {
                 "ALTER TABLE k ADD COLUMN w",
             ], &mut failed)
         };
-        if ok {
-            let c = open_at(&path, DatabaseOpts::new()).connect().unwrap();
+        if let Some(c) = ok.then(|| reopen(&path, "F1", &mut failed)).flatten() {
             for sql in ["INSERT INTO t VALUES (1, 2)", "INSERT INTO ch VALUES (1, 2, 3)", "INSERT INTO k VALUES (1, 2, 3)"] {
                 if let Err(e) = c.execute(sql) {
                     failed.push(format!("F1: after a reopen, {sql}: {e}"));
@@ -14728,8 +14737,7 @@ fn engine_built_sql_quotes_identifiers_and_escapes_literals_everywhere() {
                 "ALTER TABLE t3 RENAME COLUMN a TO \"123\"",
             ], &mut failed)
         };
-        if ok {
-            let c = open_at(&path, DatabaseOpts::new()).connect().unwrap();
+        if let Some(c) = ok.then(|| reopen(&path, "F2", &mut failed)).flatten() {
             if let Err(e) = rows(&c, "SELECT x FROM \"1t\"") {
                 failed.push(format!("F2: after a reopen, \"1t\": {e}"));
             }
@@ -14762,8 +14770,7 @@ fn engine_built_sql_quotes_identifiers_and_escapes_literals_everywhere() {
             }
             ok
         };
-        if ok {
-            let c = open_at(&path, DatabaseOpts::new()).connect().unwrap();
+        if let Some(c) = ok.then(|| reopen(&path, "F6", &mut failed)).flatten() {
             if let Err(e) = c.execute("INSERT INTO u VALUES (1, 2, 3)") {
                 failed.push(format!("F6: after a reopen, u: {e}"));
             }
