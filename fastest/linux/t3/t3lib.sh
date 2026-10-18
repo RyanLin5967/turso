@@ -473,6 +473,15 @@ sys.exit("no fixture record in " + sys.argv[1]) if type(v) is not int else print
 # 'denied' (sudo refuses this user: also no root, also N/A-on-noroot);
 # 'absent' (no sudo at all) or 'error: <text>' (anything else), each a FAIL of a root case, never an N/A.
 # T3_SUDO_BIN names the sudo to ask (tests only; t3run unsets it)
+# t3_need_root -- the T3 run's own root requirement (preflight): rc 0 only when sudo_state is 'ok'; any other state
+# ('password', 'denied', 'absent', 'error: ...') REFUSES, rc 2, naming it. 'denied' and 'password' are N/A-on-noroot
+# in a DEV box's self-tests only (the lead's ruling, 2026-10-18); a T3 run that needs root never passes without it
+t3_need_root() {
+  local st; st=$(sudo_state)
+  [ "$st" = ok ] && return 0
+  echo "REFUSED: the T3 run needs passwordless root; sudo_state is '$st'"
+  return 2
+}
 sudo_state() {
   local s=${T3_SUDO_BIN:-sudo} e
   command -v "$s" > /dev/null 2>&1 || { echo absent; return 0; }

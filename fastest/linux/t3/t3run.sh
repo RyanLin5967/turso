@@ -279,7 +279,7 @@ preflight() {
   dirty=$(git -C "$SRC" status --porcelain --untracked-files=all)
   [ -z "$dirty" ] || { echo "REFUSED: the checkout differs from commit $head: $(echo "$dirty" | head -5)"; return 2; }
   grep -q 'Ubuntu 24' /etc/os-release || { echo "not Ubuntu 24.04"; return 2; }
-  sudo -n true || { echo "needs passwordless sudo"; return 2; }
+  t3_need_root || return 2
   # one warm-up rule for every system, from the competitors' own implementation (gate-6 review 3: PREREG :210's
   # min(max(1000 ops, 10 s), 10% of the cap) as OPS:S:MAX_S), passed verbatim to fastest_profile and run_system.sh
   WARMUP=$(python3 -B "$L/competitors/timedrun.py" rule "$RUN_CAP_S") &&
