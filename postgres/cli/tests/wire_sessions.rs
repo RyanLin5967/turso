@@ -15071,3 +15071,43 @@ fn a_cascade_into_a_quote_led_child_runs_on_that_child() {
     check(&mut a, "SELECT count(*) FROM victim", "0", &mut wrong);
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// The arms d5a24b3db took out of a_schema_name_is_never_a_path, restored as their own test (lead
+/// ruling 2026-10-18: a narrowing may never make a known bug invisible). ENGINE-OWNED (owner
+/// fastest-engine; in known-red until its fixes land): a table in a schema whose name needs
+/// quoting fails in core's own text, which prints database names bare (9a58832f5, held), and the
+/// engine's attached names lowercase a quoted mixed-case schema (sent to fastest-engine).
+#[test]
+fn a_schema_whose_name_needs_quoting_holds_tables_and_keeps_its_case() {
+    let dir = Scratch::new("schema-quoted-tables");
+    let mut wrong = Vec::new();
+    for sql in [
+        "CREATE SCHEMA \"a/b\"",
+        "CREATE TABLE \"a/b\".t (x int)",
+        "INSERT INTO \"a/b\".t VALUES (1)",
+        "CREATE SCHEMA \"..\"",
+        "CREATE TABLE \"..\".t (x int)",
+        "CREATE SCHEMA \"MixedCase\"",
+        "CREATE TABLE \"MixedCase\".t (x int)",
+    ] {
+        let (ok, out) = cli_one(&dir, sql);
+        if !ok {
+            wrong.push(format!("{sql}: {out}"));
+        }
+    }
+    for (sql, want) in [
+        ("SELECT x FROM \"a/b\".t", "1"),
+        ("SELECT count(*) FROM \"..\".t", "0"),
+        ("SELECT count(*) FROM \"MixedCase\".t", "0"),
+    ] {
+        let (ok, out) = cli_one(&dir, sql);
+        if !ok || !out.contains(want) {
+            wrong.push(format!("after a reopen, {sql}: {out}"));
+        }
+    }
+    let (_, names) = cli_one(&dir, "SELECT nspname FROM pg_namespace ORDER BY nspname");
+    if !names.contains("MixedCase") {
+        wrong.push(format!("the quoted name MixedCase was not kept as written: {names}"));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
