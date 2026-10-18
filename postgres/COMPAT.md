@@ -153,7 +153,7 @@ INTEGER. Unknown type names pass through as custom types.
 | Covering indexes for GiST (INCLUDE) | ❌ Not supported | |
 | Deferrable unique constraints | ❌ Not supported | |
 | Exclusion constraints | ❌ Not supported | |
-| GIN (Generalized Inverted Index) indexes | ❌ Not supported | `USING <method>` silently ignored; every index is a B-tree |
+| GIN (Generalized Inverted Index) indexes | ❌ Not supported | `USING <method>` other than btree is refused with 0A000 (gin, gist, hash, brin, spgist); every index is a B-tree. It was silently built as a B-tree. |
 | GIN indexes partial match | ❌ Not supported | |
 | GIN index performance and size improvements | ❌ Not supported | |
 | GiST (Generalized Search Tree) indexes | ❌ Not supported | |
@@ -352,7 +352,7 @@ Upgrade is not supported.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| COPY table FROM 'file' (text format) | ✅ Supported | DELIMITER, NULL string, HEADER, column lists, backslash escapes, `\.` end-of-data marker; atomic (rolls back on malformed rows). The table is found as any statement's: `public.t` is the main database's whatever the search path, and an unqualified name goes through the search path (42P01 when no entry holds it) |
+| COPY table FROM 'file' (text format) | ✅ Supported | DELIMITER, NULL string, HEADER, column lists, backslash escapes, `\.` end-of-data marker; atomic (rolls back on malformed rows). The table is found as any statement's: `public.t` is the main database's whatever the search path, and an unqualified name goes through the search path (42P01 when no entry holds it) Through `tursopg --server`, a client reads only files under the directory the operator grants with `--copy-from-dir` (by real path), else 42501 `permission denied to COPY from a file`, as PostgreSQL refuses a role without pg_read_server_files (recorded: pg18-rev-quote-low.out); the CLI reads its own user's files. |
 | COPY from/to STDIN/STDOUT | ❌ Not supported | Rejected with an error; no wire-level COPY sub-protocol |
 | COPY FROM ... WHERE | ❌ Not supported | |
 | COPY ... ON_ERROR | ❌ Not supported | |

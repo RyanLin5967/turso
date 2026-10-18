@@ -1292,6 +1292,18 @@ impl PostgreSQLTranslator {
     ) -> Result<ast::Stmt, ParseError> {
         use pg_query::protobuf::node::Node;
 
+        // This server builds btree indexes only: any other access method is refused, never built
+        // as a btree under the name the client gave it (lead ruling 2026-10-18). libpg_query names
+        // the default, so a CREATE INDEX with no USING is "btree".
+        if !idx.access_method.is_empty() && !idx.access_method.eq_ignore_ascii_case("btree") {
+            return Err(ParseError::ParseError(SqlErrorMessage::classified(
+                SqlErrorKind::FeatureNotSupported,
+                format!(
+                    "access method \"{}\" is not supported: this server builds btree indexes only",
+                    idx.access_method
+                ),
+            )));
+        }
         let relation = idx
             .relation
             .as_ref()
