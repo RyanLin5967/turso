@@ -14239,3 +14239,97 @@ fn a_custom_type_is_one_type_however_its_name_is_quoted() {
     }
     assert!(failed.is_empty(), "CLAIM: a quoted custom type name was not one type: {failed:#?}");
 }
+
+/// The fresh adversary of 5650219c0 (a failed DDL leaves no in-memory schema change; review agent
+/// a6328a11fc233f21c, read-only, schedules UNRUN until this red): three routes the fix missed.
+/// - HIGH 1, nested DDL: `PRAGMA capture_data_changes_conn` creates its tables through NESTED
+///   statements, whose snapshots are their own, so when the PRAGMA failed after the nested CREATE
+///   inside BEGIN, the statement rollback took the pages and kept `turso_cdc` in memory.
+/// - HIGH 2, TEMP: a whole-transaction rollback never restored the temp schema
+///   (`rollback_current_txn_state` rolled the temp pager back only): a TEMP CTAS that fails after
+///   its ParseSchema, in autocommit and inside BEGIN.
+/// - MED 3, MVCC: its transaction rollback restored the schema only on a version bump, which a
+///   failed CREATE TYPE (AddType before SetCookie) never made.
+/// Each case runs on its own database, and every failure is listed.
+#[test]
+fn a_failed_ddl_leaves_no_in_memory_schema_change_on_the_routes_the_first_fix_missed() {
+    use turso_parser::ast;
+    let _g = serial();
+    let mut failed: Vec<String> = Vec::new();
+    let rows = |c: &Arc<Connection>, sql: &str| format!("{:?}", c.prepare(sql).and_then(|mut s| s.run_collect_rows()));
+    // HIGH 1.
+    {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("cdc-nested.db"), DatabaseOpts::new());
+        let c = db.connect().unwrap();
+        c.execute("CREATE TABLE turso_cdc_version(a, b)").unwrap();
+        c.execute("BEGIN").unwrap();
+        let r = c.execute("PRAGMA unstable_capture_data_changes_conn('full')");
+        if r.is_ok() {
+            failed.push("HIGH 1 premise: the PRAGMA over a turso_cdc_version without its columns succeeded".to_string());
+        } else if c.schema.read().get_btree_table("turso_cdc").is_some() {
+            failed.push(format!("HIGH 1: after the failed PRAGMA ({r:?}) the in-memory schema holds turso_cdc"));
+        }
+        let _ = c.execute("ROLLBACK");
+    }
+    // HIGH 2, autocommit and inside BEGIN.
+    for explicit in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("temp-ctas.db"), DatabaseOpts::new());
+        let c = db.connect().unwrap();
+        c.execute("CREATE TEMP TABLE src(j)").unwrap();
+        c.execute("INSERT INTO src VALUES ('{')").unwrap();
+        if explicit {
+            c.execute("BEGIN").unwrap();
+            c.execute("CREATE TEMP TABLE a(x)").unwrap();
+        }
+        let r = c.execute("CREATE TEMP TABLE b AS SELECT json(j) FROM temp.src");
+        let case = if explicit { "HIGH 2 inside BEGIN" } else { "HIGH 2 autocommit" };
+        if r.is_ok() {
+            failed.push(format!("{case} premise: the CTAS over malformed JSON succeeded"));
+            continue;
+        }
+        let names = rows(&c, "SELECT name FROM temp.sqlite_schema ORDER BY name");
+        // Inside BEGIN the failed statement may roll the whole transaction back (a too): whatever the
+        // file kept, the in-memory temp schema must say the same.
+        for t in ["a", "b"] {
+            let in_memory = c
+                .temp
+                .database
+                .read()
+                .as_ref()
+                .is_some_and(|tdb| tdb.db.schema.lock().get_btree_table(t).is_some());
+            let on_file = names.contains(&format!("value: \"{t}\""));
+            if in_memory != on_file {
+                failed.push(format!("{case}: temp table {t} in memory={in_memory}, in temp.sqlite_schema={on_file} ({names}) after {r:?}"));
+            }
+        }
+        let _ = c.execute("ROLLBACK");
+    }
+    // MED 3.
+    {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("mvcc-type.db"), DatabaseOpts::new().with_custom_types(true));
+        let c = db.connect().unwrap();
+        c.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        assert!(c.mvcc_enabled(), "premise: the database is in MVCC mode");
+        let (Some(mut cmd), _) =
+            crate::dialect::sqlite::parse("CREATE TYPE m(value text) BASE text ENCODE 'p' DECODE value").unwrap()
+        else {
+            panic!("fixture: no command")
+        };
+        let ast::Cmd::Stmt(ast::Stmt::CreateType { body: ast::CreateTypeBody::CustomType { encode: Some(e), .. }, .. }) = &mut cmd else {
+            panic!("fixture: not a CREATE TYPE with ENCODE")
+        };
+        **e = ast::Expr::Literal(ast::Literal::String("'a'b'".to_string()));
+        let r = c
+            .prepare_translated_cmd(cmd, "CREATE TYPE m(value text) BASE text ENCODE 'p' DECODE value")
+            .and_then(|mut s| s.run_ignore_rows());
+        if r.is_ok() {
+            failed.push("MED 3 premise: the fixture CREATE TYPE succeeded".to_string());
+        } else if c.schema.read().get_btree_table(crate::schema::TURSO_TYPES_TABLE_NAME).is_some() {
+            failed.push(format!("MED 3: after the failed CREATE TYPE under MVCC ({r:?}) the in-memory schema holds {}", crate::schema::TURSO_TYPES_TABLE_NAME));
+        }
+    }
+    assert!(failed.is_empty(), "CLAIM: a failed DDL left its in-memory schema change: {failed:#?}");
+}
