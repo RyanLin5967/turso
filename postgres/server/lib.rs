@@ -7160,8 +7160,11 @@ mod tests {
     /// fragment (` WHERE`, ` AND`, ...); such a literal must not hold a quote character next to a
     /// placeholder of any form (`'{x}'`, `'%{x}%'`, `\"{s}.{t}\"`, `{x:?}`). And the translator
     /// builds a string literal only through sql_string (no `Literal::String(format!(` or of a
-    /// literal). BLIND SPOTS (stated, not covered): a quote held in a variable (`{q}{x}{q}`), a
-    /// placeholder spliced by `.replace`, and text assembled from parts none of which is SQL-led.
+    /// literal). Also flagged: `{x:?}` in engine text, an engine literal that ends by opening a
+    /// quote (concatenation), and a bare quoted placeholder anywhere. BLIND SPOTS (stated, not
+    /// covered): a quote held in a variable (`{q}{x}{q}`), a placeholder spliced by `.replace`, an
+    /// UNquoted identifier placeholder (`INSERT INTO {} ...`, which quote_ident output also fills),
+    /// and text assembled from parts none of which is SQL-led.
     #[test]
     fn engine_text_from_any_literal_is_quoted_by_the_one_quoting_function() {
         const KEYWORDS: [&str; 22] = [
@@ -7187,6 +7190,7 @@ mod tests {
                 "pub(crate) fn quote_ident(",
                 "pub(crate) fn quote_literal(",
                 "pub fn sql_string(",
+                "pub fn sql_quoted(",
             ] {
                 if let Some(start) = text.find(exempt) {
                     let end = start + text[start..].find("\n}\n").expect("its end");
@@ -7197,7 +7201,8 @@ mod tests {
             for (line, lit) in string_literals(&text) {
                 seen += 1;
                 let head = lit
-                    .trim_start_matches("\\n")
+                    .trim_start_matches(|c: char| c == '\\' || c.is_whitespace())
+                    .trim_start_matches("n")
                     .trim_start_matches("{SQLITE_TEXT_MARKER}")
                     .trim_start_matches("/* turso:sqlite */ ")
                     .trim_start();
@@ -7206,7 +7211,7 @@ mod tests {
                     upper.starts_with(k)
                         && !upper[k.len()..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
                 }) || FRAGMENTS.iter().any(|f| lit.starts_with(f));
-                let quoted_hole = ["'", "\\\"", "`"].iter().any(|q| {
+                let quoted_hole = ["'", "\\\"", "\"", "`"].iter().any(|q| {
                     lit.match_indices(&format!("{q}{{")).any(|(i, _)| !lit[i + q.len()..].starts_with("{{"))
                         || lit.match_indices(&format!("}}{q}")).any(|(i, _)| i == 0 || &lit[i - 1..i] != "}")
                         || lit.contains(&format!("{q}%{{"))
@@ -7223,7 +7228,16 @@ mod tests {
                     || ["is not supported", "violates ", "does not exist", "cannot ", " was not ", " was created "]
                         .iter()
                         .any(|p| lit.contains(p));
-                if led && quoted_hole && !message {
+                // `{x:?}` prints quotes of its own; a literal that opens a quote at its end is
+                // half of a concatenation (`"... \"" + x`); a bare quoted placeholder is a
+                // quoting fragment wherever it is used.
+                let debug_hole = lit.contains(":?}");
+                let open_quote = (lit.ends_with('\'') && lit.matches('\'').count() % 2 == 1)
+                    || (lit.ends_with("\\\"") && lit.matches("\\\"").count() % 2 == 1);
+                let bare = ["'", "\\\""].iter().any(|q| {
+                    lit.starts_with(&format!("{q}{{")) && lit.ends_with(&format!("}}{q}")) && lit.matches('{').count() == 1
+                });
+                if bare || (led && (quoted_hole || debug_hole || open_quote) && !message) {
                     wrong.push(format!("{}:{line}: {lit}", path.display()));
                 }
             }
