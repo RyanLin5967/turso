@@ -58,6 +58,21 @@ pub(crate) const CHUNK: usize = 64;
 /// Chunk slots per directory segment.
 const SEG: usize = 1024;
 
+/// LEAP L2(b) (ASYNC-DESIGN R1.2, "the branch table never allocates on the create path"): the
+/// emptied chunks and segments kept, and the spares the store's background writer allocates off
+/// the store mutex (`BranchStore::refill_table_pool`), so an insert takes one instead of
+/// allocating it in its caller's hold. 16 chunks are 1,024 ids, about 376 KB at a 368-byte state;
+/// the writer refills at every flight's landing once the pool falls to `CHUNK_POOL_LOW`.
+pub(crate) const CHUNK_POOL: usize = 16;
+const CHUNK_POOL_LOW: usize = 8;
+pub(crate) const SEG_POOL: usize = 1;
+
+/// Chunks and segments allocated off the store mutex for a table's pool (`BranchTable::new_spares`).
+pub(crate) struct Spares<T> {
+    chunks: Vec<Chunk<T>>,
+    segments: Vec<Segment<T>>,
+}
+
 struct Chunk<T> {
     entries: Box<[Option<(BranchId, T)>]>,
     live: usize,
@@ -76,6 +91,12 @@ pub(crate) struct BranchTable<T: Preimage> {
     dir_moved: u64,
     /// Chunks allocated since the table was made (r13-compose I6, observation only).
     chunk_allocs: u64,
+    /// LEAP L2(b)'s pool: emptied or pre-allocated chunks and segments, at most `CHUNK_POOL` and
+    /// `SEG_POOL` (their capacity is reserved at `new`, so keeping one never allocates).
+    spare_chunks: Vec<Chunk<T>>,
+    spare_segments: Vec<Segment<T>>,
+    /// Chunks and segments an insert had to allocate itself, the pool being empty (observation).
+    inline_allocs: u64,
 }
 
 impl<T: Preimage> BranchTable<T> {
@@ -88,7 +109,63 @@ impl<T: Preimage> BranchTable<T> {
             dir_grows: 0,
             dir_moved: 0,
             chunk_allocs: 0,
+            spare_chunks: Vec::with_capacity(CHUNK_POOL),
+            spare_segments: Vec::with_capacity(SEG_POOL),
+            inline_allocs: 0,
         }
+    }
+
+    fn new_chunk() -> Chunk<T> {
+        Chunk {
+            entries: (0..CHUNK).map(|_| None).collect(),
+            live: 0,
+        }
+    }
+
+    fn new_segment() -> Segment<T> {
+        (0..SEG).map(|_| None).collect()
+    }
+
+    /// The spares that bring a pool to `CHUNK_POOL` chunks and `SEG_POOL` segments, given what it
+    /// needs (`pool_need`), allocated here: called off the store mutex. Writing every slot touches
+    /// every page, so an insert that takes one faults nothing in.
+    pub(crate) fn new_spares((chunks, segments): (usize, usize)) -> Spares<T> {
+        Spares {
+            chunks: (0..chunks).map(|_| Self::new_chunk()).collect(),
+            segments: (0..segments).map(|_| Self::new_segment()).collect(),
+        }
+    }
+
+    /// The chunks and segments the pool lacks.
+    pub(crate) fn pool_need(&self) -> (usize, usize) {
+        (
+            CHUNK_POOL.saturating_sub(self.spare_chunks.len()),
+            SEG_POOL.saturating_sub(self.spare_segments.len()),
+        )
+    }
+
+    /// Whether the pool is low enough that the writer should refill it.
+    pub(crate) fn pool_low(&self) -> bool {
+        self.spare_chunks.len() <= CHUNK_POOL_LOW || self.spare_segments.is_empty()
+    }
+
+    /// Keep `spares` in the pool, up to its bounds (no allocation: the capacity is reserved). What
+    /// does not fit is handed back, for the caller to free after it lets the store mutex go.
+    pub(crate) fn add_spares(&mut self, mut spares: Spares<T>) -> Spares<T> {
+        while self.spare_chunks.len() < CHUNK_POOL {
+            let Some(c) = spares.chunks.pop() else { break };
+            self.spare_chunks.push(c);
+        }
+        while self.spare_segments.len() < SEG_POOL {
+            let Some(g) = spares.segments.pop() else { break };
+            self.spare_segments.push(g);
+        }
+        spares
+    }
+
+    /// Chunks and segments inserts allocated themselves, the pool being empty (LEAP L2(b)).
+    pub(crate) fn inline_allocs(&self) -> u64 {
+        self.inline_allocs
     }
 
     /// (segment, chunk within it, slot within the chunk).
@@ -124,11 +201,32 @@ impl<T: Preimage> BranchTable<T> {
                 self.dir_moved += len as u64;
             }
         }
-        let segment = self.dir[g].get_or_insert_with(|| (0..SEG).map(|_| None).collect());
-        let chunk = segment[c].get_or_insert_with(|| Chunk {
-            entries: (0..CHUNK).map(|_| None).collect(),
-            live: 0,
-        });
+        // LEAP L2(b): a missing segment or chunk comes from the pool; one is built here, in the
+        // caller's hold, only when the pool is empty (counted). Mutant `chunk_inline` (test builds
+        // only): always built here, as before.
+        let inline = cfg!(test) && super::store::fe_mutant("chunk_inline");
+        if self.dir[g].is_none() {
+            let segment = match self.spare_segments.pop().filter(|_| !inline) {
+                Some(segment) => segment,
+                None => {
+                    self.inline_allocs += 1;
+                    Self::new_segment()
+                }
+            };
+            self.dir[g] = Some(segment);
+        }
+        if self.dir[g].as_ref().is_some_and(|segment| segment[c].is_none()) {
+            let chunk = match self.spare_chunks.pop().filter(|_| !inline) {
+                Some(chunk) => chunk,
+                None => {
+                    self.inline_allocs += 1;
+                    Self::new_chunk()
+                }
+            };
+            self.dir[g].as_mut().expect("placed above")[c] = Some(chunk);
+        }
+        let segment = self.dir[g].as_mut().expect("placed above");
+        let chunk = segment[c].as_mut().expect("placed above");
         let old = chunk.entries[i].replace((id, val)).map(|(_, v)| v);
         if old.is_none() {
             if chunk.live == 0 {
@@ -150,11 +248,19 @@ impl<T: Preimage> BranchTable<T> {
         chunk.live -= 1;
         self.len -= 1;
         if chunk.live == 0 {
-            segment[c] = None;
+            let emptied = segment[c].take().expect("the chunk just emptied");
             self.chunks -= 1;
-            // A segment whose chunks are all gone is freed too.
+            // An emptied chunk (every slot None again) is kept for the next insert while the pool
+            // has room (LEAP L2(b)), else freed.
+            if self.spare_chunks.len() < CHUNK_POOL {
+                self.spare_chunks.push(emptied);
+            }
+            // A segment whose chunks are all gone is kept or freed the same way.
             if segment.iter().all(Option::is_none) {
-                self.dir[g] = None;
+                let emptied = self.dir[g].take().expect("the segment just emptied");
+                if self.spare_segments.len() < SEG_POOL {
+                    self.spare_segments.push(emptied);
+                }
             }
         }
         Some(val)
@@ -383,6 +489,36 @@ mod tests {
         }
         assert_eq!(t.len(), m.len());
         assert!(CHUNK * 368 + SEG * 24 <= 64 << 10, "premise: a chunk of 368-byte states and a segment fit 64 KiB together");
+    }
+
+    /// LEAP L2(b)'s pool: inserts that need a segment and chunks take them from the pool (none
+    /// built inline while it lasts), one built inline once it is empty is counted, an emptied chunk
+    /// goes back to the pool, and the pool never holds more than its bounds (the surplus is handed
+    /// back).
+    #[test]
+    fn a_branch_table_takes_its_chunks_from_the_pool_and_keeps_emptied_ones() {
+        let mut t: BranchTable<u64> = BranchTable::new();
+        assert_eq!(t.pool_need(), (CHUNK_POOL, SEG_POOL));
+        assert!(t.pool_low());
+        let surplus = t.add_spares(BranchTable::new_spares((CHUNK_POOL + 3, SEG_POOL + 1)));
+        assert_eq!((surplus.chunks.len(), surplus.segments.len()), (3, 1), "the surplus was kept");
+        assert_eq!(t.pool_need(), (0, 0));
+        let ids = (CHUNK * CHUNK_POOL) as u64;
+        for id in 0..ids {
+            t.insert(BranchId(id), id);
+        }
+        assert_eq!(t.inline_allocs(), 0, "an insert built a chunk or segment while the pool lasted");
+        assert_eq!(t.pool_need(), (CHUNK_POOL, SEG_POOL));
+        t.insert(BranchId(ids), ids);
+        assert_eq!(t.inline_allocs(), 1, "the chunk built on an empty pool was not counted");
+        for id in 0..CHUNK as u64 {
+            t.remove(&BranchId(id));
+        }
+        assert_eq!(t.pool_need(), (CHUNK_POOL - 1, SEG_POOL), "the emptied chunk was not kept");
+        t.insert(BranchId(5), 5);
+        assert_eq!(t.inline_allocs(), 1, "a re-filled chunk was built though one was kept");
+        assert_eq!(t.get(&BranchId(5)), Some(&5));
+        assert_eq!(t.len(), CHUNK * CHUNK_POOL - CHUNK + 2);
     }
 
     /// L2(d)'s copy-on-write: a frozen row is encoded as of the freeze whichever way the state is
