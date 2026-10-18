@@ -2488,4 +2488,29 @@ mod search_path_error_kind_tests {
         }
         assert!(failed.is_empty(), "CLAIM: a missing name on the search path was misclassified or its IF EXISTS refused: {failed:#?}");
     }
+
+    /// The fresh adversary of f8d0c9eb0 (review agent ad597da8d5542fa0b; LOW): `OPTIMIZE INDEX` of a
+    /// missing index is UndefinedObject (42704) too, with or without a search path; it was an
+    /// unclassified InvalidArgument.
+    #[test]
+    fn optimize_index_of_a_missing_index_is_an_undefined_object() {
+        use crate::error::SqlErrorKind;
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let conn = db.connect().unwrap();
+        let mut failed: Vec<String> = Vec::new();
+        for path in [None, Some("public")] {
+            let sql = "OPTIMIZE INDEX nope";
+            let mut parser = turso_parser::parser::Parser::new(sql.as_bytes());
+            let Some(Ok(turso_parser::ast::Cmd::Stmt(stmt))) = parser.next() else {
+                panic!("premise: {sql} parses");
+            };
+            let options = crate::PrepareOptions { unqualified_database_search_path: path.map(|p| vec![p.to_string()]) };
+            match conn.prepare_translated_stmt_with_options(stmt, sql, &options).and_then(|mut s| s.run_ignore_rows()) {
+                Err(e) if e.sql_error_kind() == SqlErrorKind::UndefinedObject => {}
+                other => failed.push(format!("[{path:?}] {sql}: {other:?}, want UndefinedObject")),
+            }
+        }
+        assert!(failed.is_empty(), "CLAIM: OPTIMIZE INDEX of a missing index was misclassified: {failed:#?}");
+    }
 }
