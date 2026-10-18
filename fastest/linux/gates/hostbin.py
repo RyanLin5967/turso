@@ -4,7 +4,9 @@ class rule, DECISIONS 994f7d41e0: no gate silently inherits the host platform or
 Every shell script here needs bash 4+ (coproc, associative arrays, ${x,,}). macOS ships /bin/bash 3.2 first on the
 default PATH; a run that passed did so only because its caller had put homebrew first. So no caller runs "bash" by
 name: it runs bash(), which tries each `bash` on PATH and then the stated fallbacks, takes the first that reports
-BASH_VERSINFO >= 4, and REFUSES (BashMissing, naming everything it tried) when none does -- never falls back to 3.2.
+BASH_VERSINFO >= BASH_MIN (5), and REFUSES (BashMissing, naming everything it tried) when none does -- never falls
+back to an older one. 5, not 4 (measured 2026-10-18 on RHEL 8.10's bash 4.4.20): gates/sweeper.sh and t3lib.sh's
+ours_timed_run read $EPOCHREALTIME, which bash 5.0 added; under 4.4 it is unset and the sweeper refused every run.
 env_with_bash() gives children the same bash: a private directory holding only a `bash` link to it goes first on PATH,
 so a script's own `bash x.sh` resolves too, and nothing else on PATH changes (homebrew's directory would also put its
 python3 and coreutils first).
@@ -17,6 +19,7 @@ import shutil
 import subprocess
 import tempfile
 
+BASH_MIN = 5
 FALLBACKS = ("/opt/homebrew/bin/bash", "/usr/local/bin/bash", "/usr/bin/bash", "/bin/bash")
 
 
@@ -50,10 +53,10 @@ def bash(path=None):
     tried += [c for c in FALLBACKS if os.access(c, os.X_OK) and os.path.realpath(c) not in seen]
     for c in tried:
         m = _major(c)
-        if m is not None and m >= 4:
+        if m is not None and m >= BASH_MIN:
             _cache[path] = os.path.abspath(c)
             return _cache[path]
-    raise BashMissing(f"no bash 4+ found (tried {tried or 'nothing'}); on macOS: brew install bash")
+    raise BashMissing(f"no bash {BASH_MIN}+ found (tried {tried or 'nothing'}); on macOS: brew install bash")
 
 
 _shim = {}
