@@ -14445,3 +14445,79 @@ fn a_replayed_row_whose_name_is_not_its_creates_name_is_refused() {
         other => panic!("CLAIM: a replayed row named a whose CREATE names b was not refused by the name check: {:?}", other.map(|_| ())),
     }
 }
+
+/// Dialect code review MED-3: a materialized view compiles its expressions through the database's
+/// dialect, as a plain view does. `incremental/expr_compiler.rs` built its resolver with
+/// `SqliteDialect`, so `CREATE MATERIALIZED VIEW .. AS SELECT dfn(x) ..` failed "no such function:
+/// dfn" under a dialect whose `dfn` is abs (not a regression: the base gives the same). Control: the
+/// plain view with the same expression.
+#[test]
+fn a_materialized_view_resolves_functions_through_the_database_s_dialect() {
+    use crate::dialect::sqlite;
+    use crate::schema::BTreeTable;
+    struct MvDfnDialect;
+    impl crate::Dialect for MvDfnDialect {
+        fn name(&self) -> &'static str {
+            "mvdfn"
+        }
+        fn owns_stored_table_sql(&self, _sql: &str) -> bool {
+            false
+        }
+        fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+            sqlite::parse(sql)
+        }
+        fn parse_table_sql(&self, sql: &str, root_page: i64) -> crate::Result<BTreeTable> {
+            BTreeTable::from_sql(sql, root_page)
+        }
+        fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<turso_parser::ast::Stmt> {
+            sqlite::parse_table_sql_ast(sql)
+        }
+        fn table_sql_for_replay_stored(&self, sql: &str) -> crate::Result<crate::connection::StoredSql> {
+            Ok(crate::connection::StoredSql::sqlite(self.table_sql_for_replay(sql)?))
+        }
+        fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
+            sqlite::table_sql_for_replay(sql)
+        }
+        fn format_table_sql(
+            &self,
+            input: &str,
+            _t: &turso_parser::ast::QualifiedName,
+            _b: &turso_parser::ast::CreateTableBody,
+        ) -> crate::Result<String> {
+            Ok(input.to_string())
+        }
+        fn resolve_function(&self, name: &str, arg_count: usize) -> crate::Result<Option<crate::function::Func>> {
+            if name.eq_ignore_ascii_case("dfn") {
+                return sqlite::resolve_builtin_function("abs", arg_count);
+            }
+            sqlite::resolve_builtin_function(name, arg_count)
+        }
+        fn register_catalog(&self, schema: &mut crate::schema::Schema, e: bool) -> crate::Result<()> {
+            sqlite::register_builtin_catalog(schema, e)
+        }
+    }
+    let dir = tempfile::TempDir::new().unwrap();
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let db = Database::open_file_with_flags(
+        io,
+        dir.path().join("mv-dfn.db").to_str().unwrap(),
+        OpenFlags::Create,
+        DatabaseOpts::new().with_views(true),
+        None,
+        Arc::new(MvDfnDialect),
+    )
+    .unwrap();
+    let c = db.connect().unwrap();
+    c.execute("CREATE TABLE t(x INTEGER)").unwrap();
+    c.execute("INSERT INTO t VALUES (-3)").unwrap();
+    let rows = |sql: &str| c.prepare(sql).and_then(|mut s| s.run_collect_rows()).map(|r| format!("{r:?}"));
+    c.execute("CREATE VIEW v AS SELECT dfn(x) AS a FROM t").expect("premise (control): a plain view with dfn");
+    let control = rows("SELECT a FROM v");
+    assert!(control.as_ref().is_ok_and(|r| r.contains("Integer(3)")), "premise (control): the plain view reads abs(-3): {control:?}");
+    let made = c.execute("CREATE MATERIALIZED VIEW mv AS SELECT dfn(x) AS a FROM t");
+    let read = made.as_ref().map_err(|e| e.to_string()).and_then(|()| rows("SELECT a FROM mv").map_err(|e| e.to_string()));
+    assert!(
+        read.as_ref().is_ok_and(|r| r.contains("Integer(3)")),
+        "CLAIM: a materialized view did not resolve dfn through the database's dialect: create {made:?}, read {read:?}"
+    );
+}
