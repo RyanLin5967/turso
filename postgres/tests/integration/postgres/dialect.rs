@@ -2018,7 +2018,7 @@ fn test_postgres_order_by_nulls_first_last(db: TempDatabase) {
     };
 
     // Default ASC ordering puts NULLs LAST, as PostgreSQL does: they sort as larger than every
-    // value (recorded on PostgreSQL 18.6 with this table: artie bf6f8cd78b pg18-rev-host1.out
+    // value (recorded on PostgreSQL 18.6 with this table: artie ef23b9bda3 pg18-rev-host1.out
     // #8, and pg18-nullorder.out). The expectation was NULLs first, SQLite's order.
     assert_eq!(
         run("SELECT v FROM t ORDER BY v"),
@@ -2419,7 +2419,7 @@ fn test_postgres_insert_default(db: TempDatabase) {
         .unwrap();
 
     // All columns DEFAULT: id has no default, so DEFAULT is NULL there, and PostgreSQL 18.6
-    // refuses it 23502 (recorded with this very table: artie bf6f8cd78b pg18-rev-host1.out #4,
+    // refuses it 23502 (recorded with this very table: artie ef23b9bda3 pg18-rev-host1.out #4,
     // 'null value in column "id" of relation "t" violates not-null constraint'). The expectation
     // was SQLite's: an auto-assigned rowid 4.
     let err = conn
