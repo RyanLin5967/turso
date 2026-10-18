@@ -2393,3 +2393,34 @@ pub(crate) fn emit_check_constraints<'a>(
 
     result
 }
+
+#[cfg(test)]
+mod search_path_error_kind_tests {
+    use crate::sync::Arc;
+    use crate::{Database, MemoryIO, SqliteDialect, IO};
+
+    /// fastest-wire (iccad11, wire_sessions::a_kept_statement_is_not_reused_across_ddl_the_key_did_not_see, its DROP
+    /// arm): an unqualified name that no schema on the search path holds is PostgreSQL's 42P01 (relation does not
+    /// exist; pg18-rev-eh1.out #13), so the engine must classify it UndefinedTable. At 48559560f it is an
+    /// unclassified ParseError, which the wire sends as 42601 (syntax error).
+    #[test]
+    fn an_unqualified_name_missing_from_the_search_path_is_an_undefined_table() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let conn = db.connect().unwrap();
+        let sql = "SELECT x FROM nope";
+        let mut parser = turso_parser::parser::Parser::new(sql.as_bytes());
+        let Some(Ok(turso_parser::ast::Cmd::Stmt(stmt))) = parser.next() else {
+            panic!("premise: the SELECT parses");
+        };
+        let options = crate::PrepareOptions { unqualified_database_search_path: Some(vec!["main".to_string()]) };
+        let Err(err) = conn.prepare_translated_stmt_with_options(stmt, sql, &options) else {
+            panic!("premise: nope is on no schema of the search path, so the prepare fails");
+        };
+        assert!(err.to_string().contains("no such object"), "premise: the search-path miss raised it: {err}");
+        assert!(
+            matches!(err.sql_error_kind(), crate::error::SqlErrorKind::UndefinedTable),
+            "CLAIM: a name missing from every schema on the search path is not UndefinedTable (42P01): {err}"
+        );
+    }
+}
