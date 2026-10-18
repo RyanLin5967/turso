@@ -15017,3 +15017,54 @@ fn a_column_type_that_names_no_type_is_42704() {
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// wire-rev-uw1 HIGH-1 (engine-owned; the engine's fix is fastest-engine a3e80f1b4): core rebuilt
+/// a foreign key's child table and column names with Name::from_string, which reads a leading
+/// quote as SQL quoting again: a child named `"c` (or a column `"x`) asserted on a cascade, which
+/// aborts the release server, and a child named `'victim'` (quotes in its name) was read as
+/// `victim`, so a cascade reached the wrong table. Each cascade runs on the right table, and the
+/// session lives on.
+#[test]
+fn a_cascade_into_a_quote_led_child_runs_on_that_child() {
+    let dir = Scratch::new("fk-quote-led");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE TABLE p (id int PRIMARY KEY)",
+        "INSERT INTO p VALUES (1), (2), (3)",
+        "CREATE TABLE \"\"\"c\" (\"\"\"x\" int REFERENCES p(id) ON DELETE CASCADE)",
+        "INSERT INTO \"\"\"c\" VALUES (1)",
+        "CREATE TABLE \"\"\"n\" (\"\"\"y\" int REFERENCES p(id) ON DELETE SET NULL ON UPDATE CASCADE)",
+        "INSERT INTO \"\"\"n\" VALUES (2)",
+        "CREATE TABLE victim (v int REFERENCES p(id) ON DELETE CASCADE)",
+        "INSERT INTO victim VALUES (3)",
+        "CREATE TABLE \"'victim'\" (v int REFERENCES p(id) ON DELETE CASCADE)",
+        "INSERT INTO \"'victim'\" VALUES (3)",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    let mut check = |a: &mut Wire, sql: &str, want: &str, wrong: &mut Vec<String>| {
+        let r = a.q(sql);
+        if r.error.is_some() || r.rows != vec![vec![Some(want.to_string())]] {
+            wrong.push(format!("{sql}: want {want}, got {:?} {:?}", r.rows, r.error));
+        }
+    };
+    for (sql, then, want) in [
+        ("DELETE FROM p WHERE id = 1", "SELECT count(*) FROM \"\"\"c\"", "0"),
+        ("UPDATE p SET id = 20 WHERE id = 2", "SELECT \"\"\"y\" FROM \"\"\"n\"", "20"),
+        ("DELETE FROM p WHERE id = 20", "SELECT count(*) FROM \"\"\"n\" WHERE \"\"\"y\" IS NULL", "1"),
+        ("DELETE FROM p WHERE id = 3", "SELECT count(*) FROM \"'victim'\"", "0"),
+    ] {
+        if let Some(e) = a.q(sql).error {
+            wrong.push(format!("{sql}: {} {}", e.code, e.message));
+        }
+        if a.q("SELECT 1").error.is_some() {
+            wrong.push(format!("after {sql}: the session is gone"));
+            return assert!(wrong.is_empty(), "{wrong:#?}");
+        }
+        check(&mut a, then, want, &mut wrong);
+    }
+    check(&mut a, "SELECT count(*) FROM victim", "0", &mut wrong);
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
