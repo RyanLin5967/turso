@@ -12548,3 +12548,89 @@ fn a_frameless_full_commit_after_a_synced_one_syncs_nothing() {
         );
     }
 }
+
+/// `branch_checkpoint_now(deadline)` on its own thread while the flight it starts is held at
+/// `stage`, released after `release_after`; its answer and how long it took (`None`: no answer in
+/// 30 s).
+fn checkpoint_now_with_its_flight_held(
+    db: &Arc<Database>,
+    stage: u8,
+    deadline: std::time::Duration,
+    release_after: std::time::Duration,
+) -> Option<(crate::Result<bool>, std::time::Duration)> {
+    let trunk = db.connect().unwrap();
+    for _ in 0..8 {
+        let _ = trunk.fork_branch().unwrap().into_id();
+    }
+    db.branch_checkpoint_hold(stage);
+    let (tx, rx) = std::sync::mpsc::channel();
+    {
+        let db = db.clone();
+        std::thread::spawn(move || {
+            let begun = std::time::Instant::now();
+            let r = db.branch_checkpoint_now(deadline);
+            let _ = tx.send((r, begun.elapsed()));
+        });
+    }
+    let t = std::time::Instant::now();
+    while db.branch_checkpoint_held() != stage | super::store::HOLD_ARRIVED {
+        assert!(t.elapsed() < std::time::Duration::from_secs(10), "premise: the checkpoint_now flight never reached hold {stage}");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    std::thread::sleep(release_after.saturating_sub(t.elapsed()));
+    db.branch_checkpoint_hold(0);
+    let r = rx.recv_timeout(std::time::Duration::from_secs(30)).ok();
+    db.branch_checkpoint_wait();
+    r
+}
+
+/// Review C42 MED-3: `checkpoint_now` whose own flight INSTALLED but whose WAL truncation ran past
+/// the deadline reports the install (`Ok(true)`), as its doc says (`Ok(false)`: none did before
+/// the deadline). The flight is held at `HOLD_BEFORE_WAL_TRUNCATE`, after its install, past a
+/// 300 ms deadline. At b3fad32f8 the bounded join's Busy mapped to `Ok(false)`.
+#[test]
+fn checkpoint_now_reports_an_install_whose_truncation_ran_past_its_deadline() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(
+        &dir.path().join("checkpoint-now-installed.db"),
+        opts(true, SyncClass::Fsync).with_branch_checkpoint(super::BranchCheckpoint::Fuzzy),
+    );
+    seed(&db.connect().unwrap());
+    let installed0 = db.branch_checkpoint_counters()[0];
+    let (r, took) = checkpoint_now_with_its_flight_held(
+        &db,
+        super::store::HOLD_BEFORE_WAL_TRUNCATE,
+        std::time::Duration::from_millis(300),
+        std::time::Duration::from_secs(1),
+    )
+    .expect("premise: checkpoint_now answered within 30 s");
+    assert!(db.branch_checkpoint_counters()[0] > installed0, "premise: the flight installed");
+    assert!(took >= std::time::Duration::from_millis(300), "premise: the answer came after the deadline ({took:?})");
+    assert!(matches!(r, Ok(true)), "CLAIM: checkpoint_now reported {r:?} for a checkpoint that installed before its deadline ran out");
+}
+
+/// Review C42 MED-5: `checkpoint_now`'s join of the flight IT started is bounded by its deadline
+/// (C42-M1 bounded it; nothing tested it, so reverting to the unbounded join survived). The flight
+/// is held before its commit (`HOLD_BEFORE_COMMIT`), so nothing installs; with a 300 ms deadline
+/// `checkpoint_now` must answer `Ok(false)` within 30 s, the hold released only after 5 s.
+#[test]
+fn checkpoint_now_s_join_of_its_own_flight_ends_at_its_deadline() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(
+        &dir.path().join("checkpoint-now-bounded.db"),
+        opts(true, SyncClass::Fsync).with_branch_checkpoint(super::BranchCheckpoint::Fuzzy),
+    );
+    seed(&db.connect().unwrap());
+    let (r, took) = checkpoint_now_with_its_flight_held(
+        &db,
+        super::store::HOLD_BEFORE_COMMIT,
+        std::time::Duration::from_millis(300),
+        std::time::Duration::from_secs(5),
+    )
+    .expect("premise: checkpoint_now answered within 30 s of its flight's release");
+    assert!(took < std::time::Duration::from_secs(5), "CLAIM: checkpoint_now waited for its own flight past its 300 ms deadline ({took:?}: the hold was released at 5 s)");
+    assert!(matches!(r, Ok(false)), "CLAIM: checkpoint_now with no install before its deadline answered {r:?}");
+}
+
