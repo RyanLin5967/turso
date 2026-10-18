@@ -7194,7 +7194,8 @@ mod tests {
         let plain: Vec<usize> = product
             .lines()
             .enumerate()
-            .filter(|(_, l)| l.contains("PgConnection::new(") && !l.trim_start().starts_with("//"))
+            // Every spelling: turso_pg's re-export `turso_pg::Connection::new(` too (wire-rev-uw1 M5).
+            .filter(|(_, l)| l.contains("Connection::new(") && !l.trim_start().starts_with("//"))
             .map(|(n, _)| n + 1)
             .collect();
         assert!(plain.is_empty(), "sessions opened with PgConnection::new at lines {plain:?}");
@@ -7356,20 +7357,28 @@ mod tests {
     /// placeholder of any form (`'{x}'`, `'%{x}%'`, `\"{s}.{t}\"`, `{x:?}`). And the translator
     /// builds a string literal only through sql_string (no `Literal::String(format!(` or of a
     /// literal). Also flagged: `{x:?}` in engine text, an engine literal that ends by opening a
-    /// quote (concatenation), and a bare quoted placeholder anywhere. BLIND SPOTS (stated, not
-    /// covered): a quote held in a variable (`{q}{x}{q}`), a placeholder spliced by `.replace`, an
-    /// UNquoted identifier placeholder (`INSERT INTO {} ...`, which quote_ident output also fills),
-    /// and text assembled from parts none of which is SQL-led.
+    /// quote (concatenation), a bare quoted placeholder anywhere, and one placeholder written on
+    /// both sides of another (`{q}{v}{q}`). The head is read in any case, past leading
+    /// placeholders, commas and parens (wire-rev-uw1 M5), and a client message is exempt only when
+    /// it holds no SQL clause (FROM, WHERE, VALUES, SET, INTO, =). BLIND SPOTS (stated, not
+    /// covered): a quote in a variable spliced in other ways (`.replace`, `+`, a `{}` positional
+    /// pair), an UNquoted identifier placeholder (`INSERT INTO {} ...`, which quote_ident output
+    /// also fills), a message-shaped literal with no clause word, and text assembled from parts
+    /// none of which is SQL-led or a continuation.
     #[test]
     fn engine_text_from_any_literal_is_quoted_by_the_one_quoting_function() {
-        const KEYWORDS: [&str; 22] = [
+        // Statement verbs and clause words, matched in any case at the literal's head, past
+        // blanks, an escaped newline, the SQLite marker, any leading placeholders (`{sel} WHERE
+        // ...`) and a leading comma or paren (`", '{v}'"`, a VALUES continuation): wire-rev-uw1 M5.
+        const KEYWORDS: [&str; 44] = [
             "SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ATTACH", "DETACH", "PRAGMA",
             "ALTER", "SAVEPOINT", "RELEASE", "ROLLBACK", "WITH", "BEGIN", "COMMIT", "VACUUM",
-            "REINDEX", "VALUES", "SET", "COPY", "CASE",
+            "REINDEX", "VALUES", "SET", "COPY", "CASE", "REPLACE", "EXPLAIN", "ANALYZE", "TRUNCATE",
+            "UPSERT", "WHERE", "AND", "OR", "FROM", "AS", "IN", "ON", "LIKE", "JOIN", "ORDER",
+            "GROUP", "LIMIT", "RETURNING", "HAVING", "UNION", "INTO", "NOT",
         ];
-        const FRAGMENTS: [&str; 10] = [
-            " WHERE", " AND ", " OR ", " FROM", " AS ", " IN (", " VALUES", " LIKE", " ON ", "(",
-        ];
+        // Clause words whose presence makes a literal SQL even past an exempting colon or phrase.
+        const CLAUSES: [&str; 6] = [" FROM ", " WHERE ", " VALUES", " SET ", " INTO ", " = "];
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut files: Vec<_> = std::fs::read_dir(root.join("../frontend"))
             .unwrap()
@@ -7395,17 +7404,37 @@ mod tests {
             }
             for (line, lit) in string_literals(&text) {
                 seen += 1;
-                let head = lit
-                    .trim_start_matches(|c: char| c == '\\' || c.is_whitespace())
-                    .trim_start_matches("n")
-                    .trim_start_matches("{SQLITE_TEXT_MARKER}")
-                    .trim_start_matches("/* turso:sqlite */ ")
-                    .trim_start();
+                let mut head = lit.as_str();
+                loop {
+                    let t = head
+                        .trim_start()
+                        .trim_start_matches("\\n")
+                        .trim_start_matches("\\t")
+                        .trim_start_matches("\\\n")
+                        .trim_start_matches("{SQLITE_TEXT_MARKER}")
+                        .trim_start_matches("/* turso:sqlite */ ");
+                    if t.len() == head.len() {
+                        break;
+                    }
+                    head = t;
+                }
+                loop {
+                    let t = head.trim_start_matches(|c: char| c.is_whitespace() || c == ',' || c == '(');
+                    match t.strip_prefix('{').and_then(|r| r.find('}').map(|e| &r[e + 1..])) {
+                        Some(rest) if !t.starts_with("{{") => head = rest,
+                        _ => {
+                            head = t;
+                            break;
+                        }
+                    }
+                }
                 let upper = head.to_ascii_uppercase();
-                let led = KEYWORDS.iter().any(|k| {
-                    upper.starts_with(k)
-                        && !upper[k.len()..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
-                }) || FRAGMENTS.iter().any(|f| lit.starts_with(f));
+                let continues = lit.trim_start().starts_with(',') || lit.trim_start().starts_with('(');
+                let led = continues
+                    || KEYWORDS.iter().any(|k| {
+                        upper.starts_with(k)
+                            && !upper[k.len()..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+                    });
                 let quoted_hole = ["'", "\\\"", "\"", "`"].iter().any(|q| {
                     lit.match_indices(&format!("{q}{{")).any(|(i, _)| !lit[i + q.len()..].starts_with("{{"))
                         || lit.match_indices(&format!("}}{q}")).any(|(i, _)| i == 0 || &lit[i - 1..i] != "}")
@@ -7419,20 +7448,33 @@ mod tests {
                     .filter_map(|h| lit.find(h))
                     .min()
                     .unwrap_or(lit.len());
-                let message = lit.find(": ").is_some_and(|c| c < first_hole)
-                    || ["is not supported", "violates ", "does not exist", "cannot ", " was not ", " was created "]
-                        .iter()
-                        .any(|p| lit.contains(p));
+                let sql_clause = CLAUSES.iter().any(|c| lit.to_ascii_uppercase().contains(c));
+                let message = !sql_clause
+                    && (lit.find(": ").is_some_and(|c| c < first_hole)
+                        || ["is not supported", "violates ", "does not exist", "cannot ", " was not ", " was created "]
+                            .iter()
+                            .any(|p| lit.contains(p)));
                 // `{x:?}` prints quotes of its own; a literal that opens a quote at its end is
                 // half of a concatenation (`"... \"" + x`); a bare quoted placeholder is a
                 // quoting fragment wherever it is used.
                 let debug_hole = lit.contains(":?}");
+                // A quote passed in as an argument and written around another placeholder
+                // (`{q}{v}{q}`, `q = '\''`): the same named placeholder on both sides of one.
+                let wrapped_by_name = {
+                    let names: Vec<(usize, usize, &str)> = lit
+                        .match_indices('{')
+                        .filter_map(|(i, _)| lit[i + 1..].find('}').map(|e| (i, i + 1 + e + 1, &lit[i + 1..i + 1 + e])))
+                        .collect();
+                    names.windows(3).any(|w| {
+                        w[0].1 == w[1].0 && w[1].1 == w[2].0 && !w[0].2.is_empty() && w[0].2 == w[2].2
+                    })
+                };
                 let open_quote = (lit.ends_with('\'') && lit.matches('\'').count() % 2 == 1)
                     || (lit.ends_with("\\\"") && lit.matches("\\\"").count() % 2 == 1);
                 let bare = ["'", "\\\""].iter().any(|q| {
                     lit.starts_with(&format!("{q}{{")) && lit.ends_with(&format!("}}{q}")) && lit.matches('{').count() == 1
                 });
-                if bare || (led && (quoted_hole || debug_hole || open_quote) && !message) {
+                if bare || wrapped_by_name || (led && (quoted_hole || debug_hole || open_quote) && !message) {
                     wrong.push(format!("{}:{line}: {lit}", path.display()));
                 }
             }
