@@ -15026,6 +15026,44 @@ fn an_index_access_method_other_than_btree_is_refused() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-uw2 N5: a schema-qualified type was refused 42704 'type "public m" does not exist',
+/// its parts joined with a blank, so a pg_dump restore, which writes public.<type> for every enum
+/// and domain column, failed at its first such table. PostgreSQL 18.6 takes public.m and
+/// public.dm as m and dm (recorded by the reviewer: artie 718f73d7c1,
+/// reviews/uw2-raws/r5-pg.txt t_21, t_29), in a column and in a cast.
+#[test]
+fn a_schema_qualified_type_is_its_type() {
+    let dir = Scratch::new("qualified-type");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in ["CREATE TYPE m AS ENUM ('a')", "CREATE DOMAIN dm AS int CHECK (VALUE > 0)"] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    for sql in [
+        "CREATE TABLE t_21 (a public.m)",
+        "CREATE TABLE t_29 (a public.dm)",
+        "CREATE TABLE t_pc (a pg_catalog.int4)",
+        "INSERT INTO t_21 VALUES ('a')",
+        "INSERT INTO t_29 VALUES (5)",
+    ] {
+        if let Some(e) = a.q(sql).error {
+            wrong.push(format!("{sql}: {} {}", e.code, e.message));
+        }
+    }
+    for (sql, want) in [
+        ("SELECT a FROM t_21", "a"),
+        ("SELECT a FROM t_29", "5"),
+        ("SELECT 'a'::public.m", "a"),
+    ] {
+        let r = a.q(sql);
+        if r.error.is_some() || r.rows != vec![vec![Some(want.to_string())]] {
+            wrong.push(format!("{sql}: {:?} {:?}, PostgreSQL {want}", r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// Found by the review wire-quote LOW-2 red: '...'::regclass was a cast to INTEGER, so every name
 /// answered 0 and a catalog query by regclass (conrelid = 't'::regclass, as psql and drivers send)
 /// matched nothing, silently. PostgreSQL 18.6 resolves the name to its pg_class oid, reading it as
