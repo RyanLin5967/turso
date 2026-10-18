@@ -631,6 +631,17 @@ static int conn_alive(conn_t *x) {
     return x->my != NULL;
 }
 
+/* A failed MySQL call: the error text into WHY; a lost connection (2006, 2013) closes and NULLs the handle (MED-2). */
+static int my_fail(conn_t *x, char *why, size_t wsz) {
+    unsigned e = mysql_errno(x->my);
+    snprintf(why, wsz, "%s", mysql_error(x->my));
+    if (e == 2006 || e == 2013) {
+        mysql_close(x->my);
+        x->my = NULL;
+    }
+    return -1;
+}
+
 /* Run one statement; need_rows: it must affect >= 1 row. */
 static int conn_exec(conn_t *x, const char *sql, int need_rows, char *why, size_t wsz) {
     if (x->proto == P_PG) {
@@ -647,16 +658,21 @@ static int conn_exec(conn_t *x, const char *sql, int need_rows, char *why, size_
         PQclear(r);
         return rc;
     }
-    if (mysql_real_query(x->my, sql, (unsigned long)strlen(sql)) != 0) { snprintf(why, wsz, "%s", mysql_error(x->my)); return -1; }
+    /* comp-rev-failcount MED-2: a MySQL connection that reported it is gone (CR_SERVER_GONE_ERROR 2006, CR_SERVER_LOST
+     * 2013) is closed and NULLed here, so conn_alive sees it and reconnect_home reopens and COUNTS it (g_reconnects);
+     * conn_alive used to read x->my != NULL, true for a dead handle, so a lost MySQL home connection was never
+     * counted and every later op on it failed with "server has gone away" instead. */
+    if (!x->my) { snprintf(why, wsz, "connection lost earlier (closed after a lost-connection error)"); return -1; }
+    if (mysql_real_query(x->my, sql, (unsigned long)strlen(sql)) != 0) return my_fail(x, why, wsz);
     my_ulonglong affected = 0;
     int status;
     do {
         MYSQL_RES *res = mysql_store_result(x->my);
         if (res) mysql_free_result(res);
         else if (mysql_field_count(x->my) == 0) affected += mysql_affected_rows(x->my);
-        else { snprintf(why, wsz, "%s", mysql_error(x->my)); return -1; }
+        else return my_fail(x, why, wsz);
         status = mysql_next_result(x->my);
-        if (status > 0) { snprintf(why, wsz, "%s", mysql_error(x->my)); return -1; }
+        if (status > 0) return my_fail(x, why, wsz);
     } while (status == 0);
     if (need_rows && affected < 1) { snprintf(why, wsz, "write affected 0 rows: %.120s", sql); return -1; }
     return 0;
