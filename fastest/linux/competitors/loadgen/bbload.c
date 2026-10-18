@@ -1080,6 +1080,13 @@ static void *client_main(void *arg) {
         free_since = r.after_end;
     }
 done:
+    /* comp-rev-b15 LOW-1: a home connection that died while idle (every op on branch connections, no teardown) was
+     * never noticed: libpq's status and a MySQL handle change only when used. One untimed SELECT 1 on the home
+     * connection after the last op: a failure is counted (other_err) and refuses the run. A handle already closed
+     * after a lost-connection error was counted when it was lost. */
+    if (c->home.pg || c->home.my) {
+        if (conn_exec(&c->home, "SELECT 1", 0, w, sizeof w) != 0) other_fail("home connection lost (found after the last op)", w);
+    }
     for (int k = 0; k < S.nteardown; k++) {
         char t[8192];
         if (expand(S.teardown[k], &x0, t, sizeof t, w) != 0 || conn_exec(&c->home, t, 0, w, sizeof w) != 0)
