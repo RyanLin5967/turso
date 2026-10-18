@@ -14161,3 +14161,27 @@ fn engine_text_quotes_a_double_quote_in_index_method_view_and_probe_names() {
     );
     assert!(failed.is_empty(), "CLAIM: engine-built text broke on a double quote in a name: {failed:#?}");
 }
+
+/// fastest-wire (binding.rs extract_string_literal, lead order c): a function's string-literal
+/// name argument kept SQL's `''` doubling and lost every edge quote, since it was
+/// `trim_matches('\'')`: `nextval('s''q')` looked up `s''q`, and `nextval('q''')` looked up `q`
+/// (probe engine-probe-fmt-1, ecetesla2). Each case runs, and every failure is listed.
+#[test]
+fn a_string_literal_name_argument_is_read_as_sql_reads_it() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("seq-literal.db"), DatabaseOpts::new());
+    let c = db.connect().unwrap();
+    let mut failed: Vec<String> = Vec::new();
+    for (create, call) in [
+        ("CREATE SEQUENCE \"s'q\"", "SELECT nextval('s''q')"),
+        ("CREATE SEQUENCE \"q'\"", "SELECT nextval('q''')"),
+        ("CREATE SEQUENCE \"'lead\"", "SELECT nextval('''lead')"),
+    ] {
+        c.execute(create).unwrap();
+        match c.prepare(call).and_then(|mut s| s.run_collect_rows()) {
+            Ok(r) if r.len() == 1 && r[0][0].to_string() == "1" => {}
+            other => failed.push(format!("{call} after {create}: {other:?}, want 1")),
+        }
+    }
+    assert!(failed.is_empty(), "CLAIM: a string-literal name argument was not read as SQL reads it: {failed:#?}");
+}
