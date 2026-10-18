@@ -60,6 +60,7 @@ pub fn sqlstate(kind: SqlErrorKind) -> &'static str {
         InsufficientPrivilege => "42501",
         InvalidName => "42602",
         InvalidSchemaName => "3F000",
+        DependentObjectsStillExist => "2BP01",
         TooManyConnections => "53300",
         Warning => "01000",
         SuccessfulCompletion => "00000",

@@ -2626,8 +2626,13 @@ fn handle_pg_drop_schema(pg_conn: &Arc<PgConnectionInner>, stmt: &PgDropSchemaSt
     // Every name is resolved before anything is dropped, as PostgreSQL's RemoveObjects does
     // (recorded, pg18-rev-uw1-schema.out): a missing one is 3F000 and nothing is dropped, or under
     // IF EXISTS a NOTICE and skipped. public is only `public` exactly (wire-rev-uw1 M3).
-    let mut found = Vec::with_capacity(stmt.names.len());
+    let mut found: Vec<&str> = Vec::with_capacity(stmt.names.len());
     for name in &stmt.names {
+        // A name given twice is dropped once (wire-rev-uw2 N3: the second reported an error
+        // after the first had dropped it).
+        if found.contains(&name.as_str()) {
+            continue;
+        }
         if name == "public" || schema_exists(conn, name)? {
             found.push(name.as_str());
         } else if stmt.if_exists {
@@ -2637,6 +2642,30 @@ fn handle_pg_drop_schema(pg_conn: &Arc<PgConnectionInner>, stmt: &PgDropSchemaSt
             return Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
                 SqlErrorKind::InvalidSchemaName,
                 format!("schema \"{name}\" does not exist"),
+            )));
+        }
+    }
+    // Without CASCADE, a schema that holds a table is not dropped, and neither is any other
+    // schema the statement names: PostgreSQL's 2BP01, checked before anything is dropped
+    // (wire-rev-uw2 N1, DATA LOSS: the file of a schema holding tables was detached and deleted).
+    if !stmt.cascade {
+        let mut holding = None;
+        for name in &found {
+            let schema = (*name != "public").then_some(*name);
+            if !list_user_tables(conn, schema)?.is_empty() {
+                holding = Some(*name);
+                break;
+            }
+        }
+        if let Some(name) = holding {
+            let message = if stmt.names.len() > 1 {
+                "cannot drop desired object(s) because other objects depend on them".to_string()
+            } else {
+                format!("cannot drop schema {} because other objects depend on it", catalog::pg_ident(name))
+            };
+            return Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
+                SqlErrorKind::DependentObjectsStillExist,
+                message,
             )));
         }
     }
@@ -2809,9 +2838,10 @@ fn drop_refused_as_missing(kind: PgDropKind, e: &LimboError) -> bool {
 fn handle_pg_drop_schema_public(conn: &Arc<Connection>, cascade: bool) -> Result<()> {
     let table_names = list_user_tables(conn, None)?;
     if !cascade && !table_names.is_empty() {
-        return Err(LimboError::ParseError(
-            "cannot drop schema \"public\" because other objects depend on it".to_string().into(),
-        ));
+        return Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
+            SqlErrorKind::DependentObjectsStillExist,
+            "cannot drop schema public because other objects depend on it".to_string(),
+        )));
     }
 
     for table_name in table_names {
@@ -4010,7 +4040,10 @@ fn list_user_tables(conn: &Arc<Connection>, schema_name: Option<&str>) -> Result
         )),
         None => catalog::sqlite_text(format!("SELECT name FROM sqlite_schema WHERE {filter}")),
     };
-    let mut stmt = conn.prepare_internal(&sql)?;
+    // A root statement, so its read ends with it: a nested one (prepare_internal) left the
+    // attached database's read open, and the DETACH after it failed 'database s is locked'
+    // (wire-rev-uw2 N2: an empty schema's DROP SCHEMA ... CASCADE, and N1's emptiness check).
+    let mut stmt = conn.prepare_sqlite(&sql)?;
     let rows = stmt.run_collect_rows()?;
     Ok(rows
         .into_iter()
