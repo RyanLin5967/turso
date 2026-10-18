@@ -394,6 +394,74 @@ mod tests {
         assert!(failed.is_empty(), "CLAIM: engine helper SQL went through the frontend dialect's parser: {failed:#?}");
     }
 
+    /// Dialect design R5 (review dialect MED-4): the engine sites that still hand their own SQLite text
+    /// to the client path. Under a dialect that refuses all but client text, each must still work:
+    /// - DROP COLUMN's view probe (`SELECT * FROM {view}`, vdbe/execute.rs);
+    /// - `Connection::pragma()` (`PRAGMA {name}({value})`);
+    /// - the stats load at open (stats.rs `STATS_QUERY`, whose error is swallowed, so a refused query left
+    ///   the planner with no stats, silently). Its control: the same sequence under SqliteDialect has the
+    ///   table's stats after the reopen.
+    /// Not covered here (stated): the FTS and toy-vector backing tables (feature- and flag-gated; R3's
+    /// reopen covers their storage), and extension SQL (ext/vtab_xconnect.rs, which needs a loaded
+    /// extension).
+    /// At 846697d35 each went through `Dialect::parse`.
+    #[cfg(all(feature = "fs", not(target_family = "wasm")))]
+    #[test]
+    fn the_engine_sites_on_the_client_path_reach_sqlite() {
+        let dir = tempfile::tempdir().unwrap();
+        let io: Arc<dyn IO> = Arc::new(crate::io::PlatformIO::new().unwrap());
+        let open = |name: &str, dialect: Arc<dyn Dialect>| {
+            Database::open_file_with_flags(
+                io.clone(),
+                dir.path().join(name).to_str().unwrap(),
+                OpenFlags::Create,
+                DatabaseOpts::new(),
+                None,
+                dialect,
+            )
+            .unwrap()
+        };
+        let mut failed = Vec::new();
+        {
+            let db = open("probe.db", Arc::new(ClientOnlyDialect));
+            let c = db.connect().unwrap();
+            let r = c
+                .execute("client: CREATE TABLE t2(a, b)")
+                .and_then(|()| c.execute("client: CREATE VIEW v AS SELECT a FROM t2"))
+                .and_then(|()| c.execute("client: ALTER TABLE t2 DROP COLUMN b"));
+            if let Err(e) = r {
+                failed.push(format!("DROP COLUMN's view probe: {e}"));
+            }
+            if let Err(e) = c.pragma("table_info", "t2") {
+                failed.push(format!("Connection::pragma(): {e}"));
+            }
+        }
+        // The stats load at open, with its control.
+        let analyzed = |name: &str, dialect: Arc<dyn Dialect>, prefix: &str| -> crate::Result<bool> {
+            {
+                let db = open(name, dialect.clone());
+                let c = db.connect()?;
+                c.execute(format!("{prefix}CREATE TABLE s(a INTEGER)"))?;
+                c.execute(format!("{prefix}CREATE INDEX si ON s(a)"))?;
+                c.execute(format!("{prefix}INSERT INTO s VALUES (1), (2), (3)"))?;
+                c.execute(format!("{prefix}ANALYZE"))?;
+            }
+            let db = open(name, dialect);
+            let c = db.connect()?;
+            let has = c.schema.read().analyze_stats.table_stats("s").is_some();
+            Ok(has)
+        };
+        match analyzed("stats-control.db", Arc::new(SqliteDialect), "") {
+            Ok(true) => {}
+            other => failed.push(format!("premise: under SqliteDialect the reopened database has no stats for s: {other:?}")),
+        }
+        match analyzed("stats.db", Arc::new(ClientOnlyDialect), "client: ") {
+            Ok(true) => {}
+            other => failed.push(format!("the stats load at open (STATS_QUERY): the reopened database has no stats for s: {other:?}")),
+        }
+        assert!(failed.is_empty(), "CLAIM: an engine site handed its own SQLite text to the client parser: {failed:#?}");
+    }
+
     /// `ClientOnlyDialect`, storing tables as a frontend does: `format_table_sql` marks the text
     /// it stores (`/* client */ `), and marked text must be the dialect's own (`client: ...`), as a
     /// frontend parses its marked rows with its own parser; unmarked rows fall back to SQLite.
