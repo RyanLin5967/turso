@@ -233,14 +233,26 @@ def self_test():
             continue
         out = window(label.split(": ")[1].replace(" ", "_")[:24], burners)
         if not burners and out != "VALID":
-            # busy only on evidence that is not the sampler's: another user's process at 50%+ CPU by ps right after.
-            # Without that evidence a VOID baseline is a FAIL (a sampler that voids everything must not read as busy)
-            r = subprocess.run(["ps", "-eo", "uid=,pcpu=,comm="], capture_output=True, text=True)
-            others = [ln.split(None, 2) for ln in r.stdout.splitlines() if len(ln.split(None, 2)) == 3]
-            others = [f"{c} uid {u} {pc}%" for u, pc, c in others
-                      if u.isdigit() and int(u) != os.getuid() and float(pc) >= 50.0]
+            # busy only on evidence that is not the sampler's: a process OUTSIDE this self-test's own process tree at
+            # 50%+ CPU by ps right after (not "another uid": on iccad7 every one of the owner's sessions shares one
+            # uid, and a java there at 422% was one of them). Without that evidence a VOID baseline is a FAIL, so a
+            # sampler that voids everything cannot read as a busy host
+            r = subprocess.run(["ps", "-eo", "pid=,ppid=,pcpu=,comm="], capture_output=True, text=True)
+            rows = [ln.split(None, 3) for ln in r.stdout.splitlines() if len(ln.split(None, 3)) == 4]
+            parent = {int(p_): int(pp) for p_, pp, _pc, _c in rows if p_.isdigit() and pp.isdigit()}
+
+            def ours(pid):
+                for _ in range(64):
+                    if pid == os.getpid():
+                        return True
+                    pid = parent.get(pid)
+                    if not pid:
+                        return False
+                return False
+            others = [f"{c} pid {p_} {pc}%" for p_, _pp, pc, c in rows
+                      if p_.isdigit() and not ours(int(p_)) and float(pc) >= 50.0]
             if others:
-                busy = f"the no-burner window gave {out}; other users' processes: {', '.join(others[:4])}"
+                busy = f"the no-burner window gave {out}; processes outside this test at 50%+: {', '.join(others[:4])}"
                 print(f"N/A-on-busy-host: self-test {label}: {busy}", flush=True)
                 continue
         ok = out == want

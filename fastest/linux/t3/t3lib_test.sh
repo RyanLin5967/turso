@@ -490,5 +490,5 @@ printf '{"windows": []}\n' > "$T/fx/d/result/summary.json"
 check "ours_fixture_record refuses a summary.json with no fixture record (the driver ran without the parent)" \
   '! ( source "$HERE/t3lib.sh"; ours_fixture_record "$T/fx/d" 300 7 4 "$T/fx/store" ) && grep -q "no fixture" "$T/out.txt"'
 
-echo "T3LIB SELF-TEST $pass/$((pass + fail)) $([ $fail = 0 ] && echo PASS || echo FAIL)$([ $na = 0 ] || echo " ($na N/A-on-$(uname -s | tr A-Z a-z))")"
+echo "T3LIB SELF-TEST $pass/$((pass + fail)) $([ $fail = 0 ] && echo PASS || echo FAIL)$([ $na = 0 ] || echo " ($na N/A: off Linux or without root)")"
 [ $fail = 0 ]
