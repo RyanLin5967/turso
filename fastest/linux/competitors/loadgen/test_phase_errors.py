@@ -20,6 +20,9 @@ Both protocols (MySQL; PG with --pg-port and --psql):
                  while idle; the run must notice it (comp-rev-b15 LOW-1)
   setup-rerun    a setup statement that succeeds once (CREATE TABLE) fails when the KILLed home reconnects and
                  re-runs it; the run must count it in other_err (LOW-2)
+PG only:
+  hung-idle      the idle home backend is SIGSTOPped (the test must run on the PG host as its user): the end-of-run
+                 check is bounded and blames the home connection (rc 3), never an ops stall (rc 4) (comp-rev-67b2 LOW-B)
 Needs running servers; no MySQL/PG server is started here, except for server-kill. KILLs go through a client binary:
 --mysql-client (mariadb) and --psql. A case with no tool or server given is N/A.
   test_phase_errors.py --binary BBLOAD --port PORT [--db bench] [--mysql-client MARIADB] [--dolt DOLT]
@@ -120,7 +123,21 @@ class PG:
         r = self.sql("SELECT pid, pg_terminate_backend(pid) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND "
                      f"datname = '{self.db}' AND backend_type = 'client backend' AND state = 'idle' "
                      "ORDER BY backend_start LIMIT 1").stdout.split()
-        return bool(r) and r[0].endswith("|t"), r[:1]
+        return bool(r) and r[0].endswith("|t"), [int(r[0].split("|")[0])] if r else []
+
+    def idle_home_pid(self):
+        r = self.sql("SELECT pid FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND "
+                     f"datname = '{self.db}' AND backend_type = 'client backend' AND state = 'idle' "
+                     "ORDER BY backend_start LIMIT 1").stdout.split()
+        return int(r[0]) if r else None
+
+
+def home_ids(out):
+    """the home connections' server-side ids bbload recorded (backends.tsv rows of kind home)"""
+    f = out / "backends.tsv"
+    if not f.exists():
+        return []
+    return [int(ln.split("\t")[3]) for ln in f.read_text().splitlines()[1:] if ln.split("\t")[2:3] == ["home"]]
 
 
 def free_port():
@@ -238,9 +255,39 @@ def main():
             killed, ids = be.kill_idle()
             p.communicate(timeout=240)
             sm = summary(out)
-            case(f"{nm} kill-idle: a home connection KILLed while idle is noticed (rc 3, other_err or reconnects >= 1)",
-                 killed and p.returncode == 3 and ((sm.get("other_err") or 0) + (sm.get("reconnects") or 0)) >= 1,
-                 (ids, killed, p.returncode, sm.get("other_err"), sm.get("reconnects"), sm.get("verdict")))
+            # comp-rev-67b2 LOW-A: the case asserts its own reason -- the KILLed id is bbload's home connection
+            # (backends.tsv), and errors.txt names the end-of-run check as what found it
+            et = errors_txt(out)
+            case(f"{nm} kill-idle: a home connection KILLed while idle is noticed (rc 3, other_err >= 1, named "
+                 "'found after the last op', and the KILLed id is the home row of backends.tsv)",
+                 killed and p.returncode == 3 and (sm.get("other_err") or 0) >= 1 and "found after the last op" in et
+                 and bool(ids) and int(ids[0]) in home_ids(out),
+                 (ids, home_ids(out), killed, p.returncode, sm.get("other_err"), sm.get("reconnects"), et[:120]))
+        if be.name == "pg":
+            # comp-rev-67b2 LOW-B: a home backend that HANGS (SIGSTOPped) while idle. The end-of-run check must be
+            # bounded and blame the home connection (rc 3, other_err >= 1), not report a stall of the ops (rc 4)
+            # after --stall-s (60 s here); the test runs on the PG host as the PG user, so it can stop the backend
+            with fresh() as t:
+                spec = be.head() + f"step connect {be.branch}\nstep sql {be.sleep(0.051)}\nafter close\n"
+                p, out = bb(args.binary, Path(t), spec, max_ops=60, warmup="0:0:0", popen=True)
+                time.sleep(1.5)
+                pid = be.idle_home_pid()
+                t0 = time.monotonic()
+                if pid:
+                    os.kill(pid, signal.SIGSTOP)
+                try:
+                    p.communicate(timeout=240)
+                finally:
+                    if pid:
+                        os.kill(pid, signal.SIGCONT)
+                secs = time.monotonic() - t0
+                sm = summary(out)
+                et = errors_txt(out)
+                case("pg hung-idle: a SIGSTOPped idle home backend is reported as the home connection (rc 3, "
+                     "other_err >= 1, named in errors.txt) within 30 s, not as an ops stall (rc 4)",
+                     bool(pid) and pid in home_ids(out) and p.returncode == 3 and (sm.get("other_err") or 0) >= 1
+                     and "home connection" in et and secs < 30,
+                     (pid, home_ids(out), p.returncode, round(secs, 1), sm.get("other_err"), et[:160]))
         be.sql("DROP TABLE IF EXISTS once_t")
         with fresh() as t:
             spec = be.head() + "setup CREATE TABLE once_t (id INT)\n" + f"step sql {be.sleep(0.05)}\n"
