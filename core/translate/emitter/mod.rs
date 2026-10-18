@@ -2423,4 +2423,53 @@ mod search_path_error_kind_tests {
             "CLAIM: a name missing from every schema on the search path is not UndefinedTable (42P01): {err}"
         );
     }
+
+    /// engine-rev-quote42 MED-1, MED-2 and the LOW on the red above (lead order c), with the search
+    /// path a wire session has (["public"], which names main) and with one no entry of which exists:
+    /// - MED-2: DROP TABLE/VIEW/INDEX/TRIGGER IF EXISTS of a missing name succeeds (PostgreSQL sends a
+    ///   NOTICE); at 61a58752c the resolver refused the miss before the IF EXISTS was looked at;
+    /// - MED-1: DROP INDEX and DROP TRIGGER of a missing name are UndefinedObject (42704), not
+    ///   UndefinedTable (42P01): the kind is the caller's;
+    /// - the LOW: under ["public"] a missing relation is still UndefinedTable (42P01).
+    /// Each case runs, and every failure is listed.
+    #[test]
+    fn a_missing_name_on_a_search_path_is_classified_by_its_kind_and_if_exists_holds() {
+        use crate::error::SqlErrorKind;
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let conn = db.connect().unwrap();
+        let run = |path: &str, sql: &str| -> crate::Result<()> {
+            let mut parser = turso_parser::parser::Parser::new(sql.as_bytes());
+            let Some(Ok(turso_parser::ast::Cmd::Stmt(stmt))) = parser.next() else {
+                panic!("premise: {sql} parses");
+            };
+            let options = crate::PrepareOptions { unqualified_database_search_path: Some(vec![path.to_string()]) };
+            conn.prepare_translated_stmt_with_options(stmt, sql, &options)?.run_ignore_rows()
+        };
+        let mut failed: Vec<String> = Vec::new();
+        for sql in [
+            "DROP TABLE IF EXISTS nope",
+            "DROP VIEW IF EXISTS nope",
+            "DROP INDEX IF EXISTS nope",
+            "DROP TRIGGER IF EXISTS nope",
+        ] {
+            if let Err(e) = run("public", sql) {
+                failed.push(format!("MED-2 [public] {sql}: {e}"));
+            }
+        }
+        for (path, sql, want) in [
+            ("public", "DROP INDEX nope", SqlErrorKind::UndefinedObject),
+            ("public", "DROP TRIGGER nope", SqlErrorKind::UndefinedObject),
+            ("nosuch", "DROP INDEX nope", SqlErrorKind::UndefinedObject),
+            ("nosuch", "DROP TRIGGER nope", SqlErrorKind::UndefinedObject),
+            ("public", "SELECT x FROM nope", SqlErrorKind::UndefinedTable),
+            ("public", "DROP TABLE nope", SqlErrorKind::UndefinedTable),
+        ] {
+            match run(path, sql) {
+                Err(e) if e.sql_error_kind() == want => {}
+                other => failed.push(format!("[{path}] {sql}: {other:?}, want {want:?}")),
+            }
+        }
+        assert!(failed.is_empty(), "CLAIM: a missing name on the search path was misclassified or its IF EXISTS refused: {failed:#?}");
+    }
 }
