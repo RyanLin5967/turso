@@ -87,6 +87,17 @@ def prints_tally(path):
             tree = ast.parse(src)
         except SyntaxError:
             return False
+        # a bare line() resolves to tally.line when the module imports it from tally, or IS tally: it defines a
+        # top-level line() returning an f-string that starts 'TALLY ran=' (gates/tally.py's own self-test prints so)
+        bare_line = any(isinstance(n, ast.ImportFrom) and n.module == "tally" and any(a.name == "line" for a in n.names)
+                        for n in tree.body)
+        for n in tree.body:
+            if isinstance(n, ast.FunctionDef) and n.name == "line":
+                for r in ast.walk(n):
+                    if isinstance(r, ast.Return) and isinstance(r.value, ast.JoinedStr) and r.value.values \
+                            and isinstance(r.value.values[0], ast.Constant) \
+                            and str(r.value.values[0].value).startswith("TALLY ran="):
+                        bare_line = True
         dead = set()
         for node in ast.walk(tree):
             if isinstance(node, (ast.If, ast.While)) and isinstance(node.test, ast.Constant) and not node.test.value:
@@ -108,6 +119,8 @@ def prints_tally(path):
                 return True
             if isinstance(a, ast.Call) and isinstance(a.func, ast.Attribute) and a.func.attr == "line" \
                     and getattr(a.func.value, "id", None) == "tally":
+                return True
+            if bare_line and isinstance(a, ast.Call) and getattr(a.func, "id", None) == "line":
                 return True
         return False
     return any(re.search(r"\b(echo|printf)\s+(['\"]%s\\n['\"]\s+)?[\"']TALLY ran=", ln) for ln in _sh_lines(src))
@@ -426,12 +439,16 @@ def self_test():
             ("a while 0 body", "dead2.py", f'while 0:\n    print("{tl}")\n'),
             ("a print to another file", "tofile.py", f'print("{tl}", file=open("/dev/null", "w"))\n'),
             ("a .line() of another object", "otherline.py", 'class X:\n    def line(self):\n        return "x"\nprint(X().line())\n'),
+            ("a bare line() that is not tally's", "otherline2.py", 'def line():\n    return "x"\nprint(line())\n'),
         ]
         honest_plants = [
             ("an echo with a trailing comment", "honest_test.sh", f'#!/bin/bash\necho "{tl}"  # gates/tally.py\n'),
             ("a printf after a heredoc ends", "honest2_test.sh", f"#!/bin/bash\ncat > /dev/null <<'EOF2'\nx\nEOF2\nprintf '%s\\n' '{tl}'\n"),
             ("an echo after ${{#x}} on the line", "honest3_test.sh", f'#!/bin/bash\nx=ab; n=${{#x}}; echo "{tl}"\n'),
             ("a print of tally.line()", "honest.py", 'import tally\nprint(tally.line(1, 1, 0, 0))\n'),
+            ("a print of line() imported from tally", "honest3.py", 'from tally import line\nprint(line(1, 0))\n'),
+            ("a print of the module's own TALLY line() (tally.py)", "honest4.py",
+             'def line(p, f, na=0):\n    return f"TALLY ran={p + f} pass={p} na={na} fail={f}"\nprint(line(1, 0))\n'),
             ("an f-string print to stdout", "honest2.py", 'import sys\np = 1\nprint(f"TALLY ran={p} pass={p} na=0 fail=0", file=sys.stdout)\n'),
         ]
         for what, name, text in silent_plants:
