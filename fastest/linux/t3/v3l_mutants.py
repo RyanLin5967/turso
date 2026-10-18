@@ -192,7 +192,16 @@ def selftest(path):
     lines = r.stdout.splitlines()
     fails = [ln for ln in lines if " FAIL: " in ln]
     total = next((ln for ln in reversed(lines) if ln.startswith("V3L SELF-TEST")), None)
-    return r.returncode, fails, total, r.stderr
+    return r.returncode, fails, total, r.stderr + r.stdout
+
+
+def control_green(rc, out):
+    """linux-rev-uw3 LOW 3: the unmutated control is green when its TALLY agrees with its rc and says pass
+    (gates/tally.py), it printed no FAIL line, and its summary ends ' PASS'"""
+    sys.path.insert(0, os.path.join(os.path.dirname(HERE), "gates"))
+    import tally
+    return tally.judge(out, rc)[0] == "pass" and " FAIL: " not in out and any(
+        ln.startswith("V3L SELF-TEST") and ln.endswith(" PASS") for ln in out.splitlines())
 
 
 def main_case(kind):
@@ -248,6 +257,16 @@ def self_test():
         ("LOW 15: main() whose temp layout lacks testdata returns 2 before any mutant runs",
          lambda: main_case("layout")),
     ]
+    # linux-rev-uw3 LOW 3: the unmutated control is judged by control_green (its TALLY with its rc), not by its summary
+    # line; the red reaches it through a fallback with today's rule (rc 0, no FAIL lines, summary ending ' PASS')
+    cg = globals().get("control_green", lambda rc, out: rc == 0 and " FAIL: " not in out and any(
+        ln.startswith("V3L SELF-TEST") and ln.endswith(" PASS") for ln in out.splitlines()))
+    cases += [
+        ("uw3 LOW 3: a control whose summary ends PASS but which prints no TALLY is not green",
+         lambda: not cg(0, "V3L SELF-TEST 3/3 PASS\n")),
+        ("uw3 LOW 3: a control with its honest TALLY and summary is green",
+         lambda: cg(0, "TALLY ran=3 pass=3 na=0 fail=0\nV3L SELF-TEST 3/3 PASS\n")),
+    ]
     bad = 0
     for name, f in cases:
         try:
@@ -280,8 +299,8 @@ def main(argv, src_path=SRC, table=None, testdata=None):
     if stale:
         print(f"v3l_mutants: REFUSED: stale table: {stale}")
         return 2
-    rc, fails, total, _ = selftest(src_path)
-    if rc != 0 or fails or not total or not total.endswith(" PASS"):
+    rc, fails, total, both = selftest(src_path)
+    if not control_green(rc, both):
         print(f"v3l_mutants: REFUSED: the unmutated self-test is not green (rc {rc}; {total}; {len(fails)} FAIL lines)")
         return 2
     print(f"control (unmutated): {total}")

@@ -61,7 +61,8 @@ refuse inf --class full --warmup 1000:inf:inf
 refuse zero-max --class full --warmup 10:0:0
 # one warm-up rule for every driver (fourth lane review LOW 14): with fastest_profile alone the verdict can only be
 # PARTIAL (rc 3: every case matches, not all three drivers given); the three-driver verdict is t3run's envchecks
-arm conformance-selftest 0 python3 -B "$W" self-test
+# judged by its TALLY and rc too (linux-rev-uw3 MED 2: this arm was still rc-only)
+arm conformance-selftest 0 bash "$HERE/run_selftest.sh" python3 -B "$W" self-test
 arm conformance 3 python3 -B "$W" run --fastest-profile "$BIN"
 cat "$OUT/contract-conformance.txt"
 [ -z "$FAILED" ] || { echo "driver contract: FAILED arms:$FAILED"; exit 1; }

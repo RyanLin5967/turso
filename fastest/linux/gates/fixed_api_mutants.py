@@ -105,6 +105,12 @@ def parses(path, text):
     return None if r.returncode == 0 else r.stderr.strip()[:200]
 
 
+def control_ok(out, rc):
+    """linux-rev-uw3 LOW 4: an unmutated control is green when its TALLY agrees with its rc and says pass, or N/A
+    (inherited, exit 3). rc alone, or a summary line, is not enough"""
+    return rc in (0, 3) and tally.judge(out, rc)[0] in ("pass", "na")
+
+
 def table_problems(rows, root=LINUX):
     """why the table cannot run against ROOT's files: a target not found exactly once, an indented target not at a
     line start, a mutated file that does not parse"""
@@ -175,7 +181,7 @@ def main(argv):
     for k, (d, cmd) in enumerate(sorted({(r[2], tuple(r[4])) for r in todo})):
         rc, out = run_test(copy_of(d, os.path.join(top, f"control-{k}-" + d.replace("/", "_"))), list(cmd))
         # the control is judged by its own TALLY and rc (pass, or N/A inherited below), never by rc alone
-        if rc not in (0, 3) or tally.judge(out, rc)[0] not in ("pass", "na"):
+        if not control_ok(out, rc):
             print(f"fixed_api_mutants: REFUSED: the unmutated {d} control ({' '.join(cmd)}) is not green (rc {rc}): "
                   f"{out[-300:]!r}")
             return 2
@@ -209,6 +215,12 @@ def self_test():
              ("a row whose target is absent is a stale table",
               any("found 0 times" in x for x in table_problems(
                   [("t", "synthetic", "t3", "t3lib.sh", T3LIB, "no such line\n", "", "x", "")])))]
+    # linux-rev-uw3 LOW 4: an unmutated control is judged by control_ok (its TALLY with its rc: pass, or N/A); these
+    # cases make it fire. The red reaches it through a fallback with the rc-only rule
+    cok = globals().get("control_ok", lambda out, rc: rc in (0, 3))
+    cases += [("uw3 LOW 4: a control at rc 0 with no TALLY is not green", not cok("all fine\n", 0)),
+              ("uw3 LOW 4: a control at rc 3 whose TALLY has fail=1 is not green", not cok("TALLY ran=1 pass=0 na=1 fail=1\n", 3)),
+              ("uw3 LOW 4: a control with its honest TALLY at rc 0 is green", cok("TALLY ran=2 pass=2 na=0 fail=0\n", 0))]
     bad = 0
     for n, ok in cases:
         bad += not ok

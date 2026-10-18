@@ -1093,6 +1093,14 @@ def leaf_remote_ok(rc, txt, what, prem, out_exists, f3):
     return False, f"no plant ran (leaf driver {leaf.get('driver')!r}, virtualized {virt!r})", False
 
 
+def selftest_output_ok(text, rc, name):
+    """linux-rev-uw3 LOW 4: the fire-check's judgement of one self-test's output (blkflush, batchgate, check): rc 0,
+    its 'NAME SELF-TEST n/n PASS' summary last, and its TALLY agreeing (gates/tally.py: every case ran and passed)"""
+    m = re.search(name + r" SELF-TEST (\d+)/(\d+) PASS\s*$", text)
+    return rc == 0 and m is not None and m.group(1) == m.group(2) and int(m.group(2)) > 0 \
+        and tally.judge(text, rc)[0] == "pass"
+
+
 SELF_TEST_NA = []  # the self-test's cases this host cannot run (each printed as N/A-on-<cause>)
 
 
@@ -1511,6 +1519,17 @@ def self_test():
     # sixth review M3: the call paths themselves -- check_real and cell_leaf_check on planted copies of a banked
     # write-back batch (run 37528595878, x86 ext4loop on NVMe, a VM)
     real_selftest(chk)
+    # linux-rev-uw3 LOW 4: the fire-check's judgement of a self-test's output (B:selftest, S:batchgate, S:check) is one
+    # helper, selftest_output_ok, and these cases make it fire: a passing summary with no TALLY, or a TALLY that
+    # disagrees with the rc, is not ok. The red reaches it through a fallback with the summary-and-rc rule alone
+    so_ok = globals().get("selftest_output_ok", lambda text, rc, name: rc == 0 and re.search(
+        name + r" SELF-TEST (\d+)/(\d+) PASS\s*$", text) is not None)
+    chk("uw3 LOW 4: a self-test output whose summary says PASS but which has no TALLY is not ok",
+        not so_ok("BLKFLUSH SELF-TEST 3/3 PASS\n", 0, "BLKFLUSH"))
+    chk("uw3 LOW 4: a TALLY that disagrees with the rc (na=1 at rc 0) is not ok",
+        not so_ok("TALLY ran=3 pass=3 na=1 fail=0\nBATCHGATE SELF-TEST 3/3 PASS\n", 0, "BATCHGATE"))
+    chk("uw3 LOW 4: a PASS summary with its honest TALLY at rc 0 is ok",
+        so_ok("TALLY ran=3 pass=3 na=0 fail=0\nCHECK SELF-TEST 3/3 PASS\n", 0, "CHECK"))
     ok = all(res) and len(res) > 0
     print(f"TALLY ran={len(res)} pass={sum(res)} na={len(SELF_TEST_NA)} fail={len(res) - sum(res)}")  # gates/tally.py
     print("CHECK SELF-TEST %d/%d %s" % (sum(res), len(res), "PASS" if ok else "FAIL")
@@ -2151,8 +2170,7 @@ def main(argv):
     m = re.search(r"BLKFLUSH SELF-TEST (\d+)/(\d+) PASS\s*$", bt)
     # the summary line AND the self-test's own TALLY agreeing with its rc (gates/tally.py): a summary read alone is
     # wording, the TALLY is the outcome (the lead's 2026-10-18 order on truncated self-test output)
-    check("B:selftest", rc_of(os.path.join(OUT, "B", "selftest.rc")) == 0 and m is not None and m.group(1) == m.group(2)
-          and int(m.group(2)) > 0 and tally.judge(bt, 0)[0] == "pass", {"tail": bt[-300:], "rc": rc_of(os.path.join(OUT, "B", "selftest.rc"))},
+    check("B:selftest", selftest_output_ok(bt, rc_of(os.path.join(OUT, "B", "selftest.rc")), "BLKFLUSH"), {"tail": bt[-300:], "rc": rc_of(os.path.join(OUT, "B", "selftest.rc"))},
           "blkflush.py self-test: the parser and the window attribution on planted text (rc 0, n/n with n > 0)")
     br = rj(os.path.join(OUT, "B", "report.json")) or {}
     lp_dev = (rd(os.path.join(OUT, "B", "loopdev.txt")) or "").strip().replace("/dev/", "")
@@ -2190,14 +2208,12 @@ def main(argv):
     check("B:misuse", not mbad, {"bad": mbad}, "stop without start and start into an existing record both refuse (rc 2)")
     st = rd(os.path.join(OUT, "B", "batchgate-selftest.txt")) or ""
     m = re.search(r"BATCHGATE SELF-TEST (\d+)/(\d+) PASS\s*$", st)
-    check("S:batchgate", rc_of(os.path.join(OUT, "B", "batchgate-selftest.rc")) == 0 and m is not None
-          and m.group(1) == m.group(2) and int(m.group(2)) > 0 and tally.judge(st, 0)[0] == "pass", {"tail": st[-400:]},
+    check("S:batchgate", selftest_output_ok(st, rc_of(os.path.join(OUT, "B", "batchgate-selftest.rc")), "BATCHGATE"), {"tail": st[-400:]},
           "batchgate.py self-test in this cell (the flush gate on the banked cells, every verdict-shape refusal by its "
           "own reason, the T3 rule): the binding's rules are tested in the verdict that relies on them")
     st = rd(os.path.join(OUT, "B", "check-selftest.txt")) or ""
     m = re.search(r"CHECK SELF-TEST (\d+)/(\d+) PASS\s*$", st)
-    check("S:check", rc_of(os.path.join(OUT, "B", "check-selftest.rc")) == 0 and m is not None
-          and m.group(1) == m.group(2) and int(m.group(2)) > 0 and tally.judge(st, 0)[0] == "pass", {"tail": st[-400:]},
+    check("S:check", selftest_output_ok(st, rc_of(os.path.join(OUT, "B", "check-selftest.rc")), "CHECK"), {"tail": st[-400:]},
           "check.py --self-test in this cell: the checker's own leaf, virtualization, linkage, qualifier, MODE SENSE "
           "byte and harness rules each fire on planted records")
 
