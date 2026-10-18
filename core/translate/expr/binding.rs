@@ -650,7 +650,8 @@ pub fn bind_and_rewrite_expr<'a>(
                                             let col_name = col.name.clone().unwrap_or_else(|| {
                                                 format!("column{}", col_idx + 1)
                                             });
-                                            let quoted_col_name = format!("'{col_name}'");
+                                            // Escaped (QUOTE-SWEEP F5: sanitize_string un-doubles it).
+                                            let quoted_col_name = format!("'{}'", crate::util::escape_sql_string_literal(&col_name));
                                             args.push(Box::new(ast::Expr::Literal(
                                                 ast::Literal::String(quoted_col_name),
                                             )));

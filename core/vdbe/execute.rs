@@ -14950,7 +14950,9 @@ pub fn op_init_cdc_version(
         let stmt = prepare_cdc_internal(
             &conn,
             format!(
-                "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='{escaped_cdc_table_name}'",
+                // COLLATE NOCASE: names match in any case (QUOTE-SWEEP F7: 'full,MyCdc' missed a legacy
+                // table mycdc and recorded the current version over its v1 layout).
+                "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='{escaped_cdc_table_name}' COLLATE NOCASE",
             ),
         )?;
         *state.active_op_state.init_cdc_version() = Some(Box::new(OpInitCdcVersionInner {
@@ -18930,7 +18932,7 @@ fn op_vacuum_into_inner(
         }
 
         state.op_vacuum_state = VacuumOpState::IntoFile(Box::new(VacuumIntoOpContext {
-            escaped_schema_name: schema_name.replace('"', "\"\""),
+            escaped_schema_name: crate::util::escape_identifier(&schema_name),
             source_db_id,
             ..Default::default()
         }));

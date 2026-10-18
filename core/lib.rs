@@ -186,6 +186,10 @@ pub use turso_macros::{
 pub use turso_parser::ast::EqpFormat;
 pub use types::{IOResult, Value, ValueBlob, ValueRef};
 pub use util::IOExt;
+/// The engine's one always-quoting identifier helper, for a binding that builds SQL text
+/// (QUOTE-SWEEP-4a97c9c36 F8: the C binding spliced a table name into PRAGMA text bare).
+#[doc(hidden)]
+pub use util::double_quote_identifier;
 pub use vdbe::{
     builder::QueryMode, explain::EXPLAIN_COLUMNS, explain::EXPLAIN_QUERY_PLAN_COLUMNS,
     explain::EXPLAIN_QUERY_PLAN_JSON_COLUMNS, FromValueRow, PrepareContext, PreparedProgram,

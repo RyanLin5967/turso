@@ -3585,7 +3585,9 @@ pub unsafe extern "C" fn sqlite3_table_column_metadata(
             // Use pragma table_info to get column information
             match db_inner
                 .conn
-                .pragma_query(&format!("table_info({table_name})"))
+                // Quoted (QUOTE-SWEEP-4a97c9c36 F8: a name like "my table", "order", or one with ')'
+                // or ';' broke or spliced into the PRAGMA text).
+                .pragma_query(&format!("table_info({})", turso_core::double_quote_identifier(table_name)))
             {
                 Ok(rows) => {
                     let mut found_column = false;

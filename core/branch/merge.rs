@@ -198,6 +198,8 @@ fn table_at(schema: &Schema, root: i64) -> Option<Arc<BTreeTable>> {
         Table::BTree(bt)
             if bt.root_page == root
                 && bt.has_rowid
+                // Its rows are addressed by a rowid name no column shadows (QUOTE-SWEEP F3).
+                && bt.rowid_name().is_some()
                 && !bt.name.starts_with("sqlite_")
                 && !bt.columns().iter().any(|c| c.is_generated()) =>
         {
@@ -789,9 +791,10 @@ impl Merger {
                     .map(|c| quote(c.name.as_deref().unwrap_or("")))
                     .collect();
                 let sql = format!(
-                    "SELECT {} FROM {} WHERE rowid = ?1",
+                    "SELECT {} FROM {} WHERE {} = ?1",
                     cols.join(", "),
-                    quote(&table.name)
+                    quote(&table.name),
+                    table.rowid_name().expect("table_at admits only a table with an unshadowed rowid name")
                 );
                 selects.insert(root, from.prepare_engine(EngineSql::new(sql), Origin::Root)?);
             }
@@ -935,11 +938,18 @@ impl Merger {
                     fk_name(r)
                 ));
             }
+            if r.child_table.rowid_name().is_none() {
+                return Err(format!(
+                    "foreign key {}: every rowid name of the child is a column's, which a merge does not check",
+                    fk_name(r)
+                ));
+            }
             let parent_cols: Vec<String> = r.parent_cols.iter().map(|c| quote(c)).collect();
             let key_sql = format!(
-                "SELECT {} FROM {} WHERE rowid = ?1",
+                "SELECT {} FROM {} WHERE {} = ?1",
                 parent_cols.join(", "),
-                quote(&table.name)
+                quote(&table.name),
+                table.rowid_name().expect("table_at admits only a table with an unshadowed rowid name")
             );
             out.push(ParentFk {
                 name: fk_name(r),
@@ -975,9 +985,10 @@ impl Merger {
             .map(|cc| format!("c.{} IS NOT NULL", quote(cc)))
             .collect();
         Ok(format!(
-            "SELECT 1 FROM {} AS c WHERE c.rowid = ?1 AND {} AND NOT EXISTS \
+            "SELECT 1 FROM {} AS c WHERE c.{} = ?1 AND {} AND NOT EXISTS \
              (SELECT 1 FROM {} AS p WHERE {})",
             quote(&r.child_table.name),
+            r.child_table.rowid_name().unwrap_or("rowid"),
             not_null.join(" AND "),
             quote(&parent.name),
             matches.join(" AND ")
@@ -1009,10 +1020,12 @@ impl Merger {
             })
             .collect();
         format!(
-            "SELECT c.rowid FROM {} AS p JOIN {} AS c ON {} WHERE p.rowid = ?1",
+            "SELECT c.{} FROM {} AS p JOIN {} AS c ON {} WHERE p.{} = ?1",
+            child.rowid_name().unwrap_or("rowid"),
             quote(&parent.name),
             quote(&child.name),
-            matches.join(" AND ")
+            matches.join(" AND "),
+            parent.rowid_name().unwrap_or("rowid")
         )
     }
 
@@ -1111,6 +1124,9 @@ impl Merger {
             .collect();
         let alias = table.get_rowid_alias_column().map(|(i, _)| i);
         let t = quote(&table.name);
+        let rowid = table.rowid_name().ok_or_else(|| {
+            LimboError::InternalError(format!("merge: every rowid name of {} is a column's", table.name))
+        })?;
         // The rowid alias stays out of the SET list (b161e861d: assigning it runs a two-pass
         // update through an ephemeral table). OR ABORT overrides a constraint-level ON CONFLICT
         // REPLACE, so installing a row can never delete a row only the trunk has.
@@ -1123,7 +1139,7 @@ impl Merger {
             .collect();
         let or_abort = " OR ABORT";
         let update = (!sets.is_empty())
-            .then(|| format!("UPDATE{or_abort} {t} SET {} WHERE rowid = ?1", sets.join(", ")));
+            .then(|| format!("UPDATE{or_abort} {t} SET {} WHERE {rowid} = ?1", sets.join(", ")));
         let insert = match alias {
             Some(_) if names.len() == 1 => {
                 format!("INSERT OR IGNORE INTO {t}({}) VALUES (?1)", names[0])
@@ -1139,13 +1155,13 @@ impl Merger {
             None => {
                 let params: Vec<String> = (2..=names.len() + 1).map(|i| format!("?{i}")).collect();
                 format!(
-                    "INSERT{or_abort} INTO {t}(rowid, {}) VALUES (?1, {})",
+                    "INSERT{or_abort} INTO {t}({rowid}, {}) VALUES (?1, {})",
                     names.join(", "),
                     params.join(", ")
                 )
             }
         };
-        let delete = format!("DELETE FROM {t} WHERE rowid = ?1");
+        let delete = format!("DELETE FROM {t} WHERE {rowid} = ?1");
         Ok(TableStmts {
             update: update.map(|sql| self.trunk.prepare_engine(EngineSql::new(sql), Origin::Root)).transpose()?,
             insert: self.trunk.prepare_engine(EngineSql::new(insert), Origin::Root)?,

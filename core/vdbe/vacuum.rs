@@ -788,7 +788,7 @@ pub(crate) fn vacuum_target_build_step(
                     }
                 }
 
-                let escaped_table_name = table_name.replace('"', "\"\"");
+                let escaped_table_name = crate::util::escape_identifier(table_name);
                 // Derive copy-column list from BTreeTable.columns in schema,
                 // filtering out virtual generated columns so the SELECT and
                 // INSERT arities stay aligned.

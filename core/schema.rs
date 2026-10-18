@@ -3701,6 +3701,20 @@ impl BTreeTable {
         Ok(())
     }
 
+    /// The name SQL text the engine builds uses for this table's rowid: the first of `rowid`,
+    /// `_rowid_` and `oid` that no ordinary column takes (a rowid-alias column named so names the rowid
+    /// itself), as SQLite resolves them; `None` when all three are taken, and such text must refuse.
+    /// QUOTE-SWEEP-4a97c9c36 F3: the merge's and a materialized view's text said `rowid`, which a
+    /// column named rowid shadows, so they addressed the rows by that column.
+    pub fn rowid_name(&self) -> Option<&'static str> {
+        ["rowid", "_rowid_", "oid"].into_iter().find(|n| {
+            !self
+                .columns()
+                .iter()
+                .any(|c| !c.is_rowid_alias() && c.name.as_deref().is_some_and(|cn| cn.eq_ignore_ascii_case(n)))
+        })
+    }
+
     pub fn get_rowid_alias_column(&self) -> Option<(usize, &Column)> {
         self.columns
             .iter()
@@ -3848,7 +3862,9 @@ impl BTreeTable {
                 if i > 0 {
                     sql.push_str(", ");
                 }
-                sql.push_str(&col.0);
+                // Quoted (QUOTE-SWEEP-4a97c9c36 F1: printed bare, so a name like `a b` or `order`
+                // stored a row that did not reparse after ALTER ADD/DROP COLUMN).
+                sql.push_str(&quote_ident(&col.0));
             }
             sql.push(')');
         }
@@ -3859,17 +3875,17 @@ impl BTreeTable {
                 if i > 0 {
                     sql.push_str(", ");
                 }
-                sql.push_str(col);
+                sql.push_str(&quote_ident(col));
             }
             sql.push_str(") REFERENCES ");
-            sql.push_str(&fk.parent_table);
+            sql.push_str(&quote_ident(&fk.parent_table));
             if !fk.parent_columns.is_empty() {
                 sql.push('(');
                 for (i, col) in fk.parent_columns.iter().enumerate() {
                     if i > 0 {
                         sql.push_str(", ");
                     }
-                    sql.push_str(col);
+                    sql.push_str(&quote_ident(col));
                 }
                 sql.push(')');
             }
@@ -4655,7 +4671,10 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         let col_name = match expr {
                             Expr::Id(id) => normalize_ident(id.as_str()),
                             Expr::Literal(Literal::String(value)) => {
-                                value.trim_matches('\'').to_owned()
+                                // As SQL reads the literal: the outer quotes off, each '' one '
+                                // (QUOTE-SWEEP F13: trim_matches kept the doubling and took any
+                                // quote at the name's edge).
+                                crate::translate::expr::sanitize_string(value)
                             }
                             expr => {
                                 bail_parse_error!("unsupported primary key expression: {}", expr)
@@ -4686,7 +4705,10 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         let col_name = match expr {
                             Expr::Id(id) => id.as_str().to_string(),
                             Expr::Literal(Literal::String(value)) => {
-                                value.trim_matches('\'').to_owned()
+                                // As SQL reads the literal: the outer quotes off, each '' one '
+                                // (QUOTE-SWEEP F13: trim_matches kept the doubling and took any
+                                // quote at the name's edge).
+                                crate::translate::expr::sanitize_string(value)
                             }
                             expr => {
                                 bail_parse_error!("unsupported unique key expression: {}", expr)

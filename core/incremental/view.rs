@@ -13,6 +13,11 @@ use crate::util::{extract_view_columns, ViewColumnSchema};
 use crate::{return_if_io, LimboError, Pager, Result, Statement};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::cell::RefCell;
+
+/// `map[key]`, or the entry whose key is `key` in another ASCII case (SQL names match in any case).
+fn get_ignore_case<'m, V>(map: &'m HashMap<String, V>, key: &str) -> Option<&'m V> {
+    map.get(key).or_else(|| map.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)).map(|(_, v)| v))
+}
 use std::fmt;
 use std::rc::Rc;
 use turso_parser::ast;
@@ -788,11 +793,21 @@ impl IncrementalView {
             let select_clause = if has_rowid_alias {
                 "*".to_string()
             } else {
-                "*, rowid".to_string()
+                // The rowid by a name no column shadows (QUOTE-SWEEP F3: `*, rowid` read a column
+                // named rowid as the row's key).
+                let rowid = table.rowid_name().ok_or_else(|| {
+                    LimboError::ParseError(format!(
+                        "materialized view: every rowid name of {} is a column's",
+                        table.name
+                    ))
+                })?;
+                format!("*, {rowid}")
             };
 
             // Get accumulated WHERE conditions for this table
-            let where_clause = if let Some(conditions) = table_conditions.get(&table.name) {
+            // Both maps are keyed by the name AS WRITTEN in the view, so a stored spelling in another
+            // case missed them (QUOTE-SWEEP F10: the db qualifier and the populate WHERE were dropped).
+            let where_clause = if let Some(conditions) = get_ignore_case(table_conditions, &table.name) {
                 // Combine multiple conditions with OR if there are multiple occurrences
                 Self::combine_conditions(
                     select_stmt,
@@ -806,10 +821,10 @@ impl IncrementalView {
             };
 
             // Use the qualified table name if available, otherwise just the table name
-            // The fallback quoted as the qualified names are (engine-rev-quote42 LOW; by reading
-            // no table reaches it: extract_table_info fills both maps together).
-            let table_name = qualified_table_names
-                .get(&table.name)
+            // The fallback quoted as the qualified names are (engine-rev-quote42 LOW). It IS reached
+            // (QUOTE-SWEEP F10 corrects d14d50a7f's "unreachable"): the map is keyed by the name as
+            // the view wrote it; the case-blind lookup above now finds it in another case.
+            let table_name = get_ignore_case(qualified_table_names, &table.name)
                 .cloned()
                 .unwrap_or_else(|| crate::util::quote_identifier(&table.name));
 

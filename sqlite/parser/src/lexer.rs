@@ -9,6 +9,20 @@ pub fn is_quotable_keyword(input: &[u8]) -> bool {
     token != TokenType::TK_ID && token != TokenType::TK_TYPE
 }
 
+/// Whether `name` must be double-quoted to be read back as that identifier: THE one rule for every
+/// identifier the engine prints (`ast::Name::as_ident`, core's `util::quote_identifier`; fastest-engine,
+/// QUOTE-SWEEP-4a97c9c36 F2 and F6). Bare only when it is non-empty, all `[A-Za-z0-9_]`, starts with no
+/// digit (a lexer number otherwise: `1t`, `123`), is no keyword, and is not `true` or `false` (TK_ID to
+/// the lexer, but a literal in expression position).
+pub fn identifier_needs_quotes(name: &[u8]) -> bool {
+    name.is_empty()
+        || name[0].is_ascii_digit()
+        || !name.iter().all(|&b| b.is_ascii_alphanumeric() || b == b'_')
+        || is_quotable_keyword(name)
+        || name.eq_ignore_ascii_case(b"true")
+        || name.eq_ignore_ascii_case(b"false")
+}
+
 fn keyword_or_id_token(input: &[u8]) -> TokenType {
     match_ignore_ascii_case!(match input {
         b"ABORT" => TokenType::TK_ABORT,

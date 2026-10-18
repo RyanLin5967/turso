@@ -1750,8 +1750,8 @@ fn query_pragma(
                             .operators()
                             .iter()
                             .map(|op| match &op.func_name {
-                                Some(f) => format!("'{}' {}", op.op, f),
-                                None => format!("'{}'", op.op),
+                                Some(f) => format!("'{}' {}", crate::util::escape_sql_string_literal(&op.op), f),
+                                None => format!("'{}'", crate::util::escape_sql_string_literal(&op.op)),
                             })
                             .collect();
                         program.emit_string8(ops.join(", "), base_reg + 5);

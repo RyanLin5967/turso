@@ -1723,7 +1723,7 @@ impl DbspCompiler {
                     Value::Text(t) => {
                         // Add quotes for string literals as translate_expr expects them
                         // Also escape any single quotes in the string
-                        let escaped = t.to_string().replace('\'', "''");
+                        let escaped = crate::util::escape_sql_string_literal(&t.to_string());
                         ast::Literal::String(format!("'{escaped}'"))
                     }
                     Value::Blob(b) => ast::Literal::Blob(format!("X'{}'", hex::encode(b))),
