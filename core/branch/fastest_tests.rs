@@ -15693,10 +15693,19 @@ fn no_create_allocates_a_table_chunk_or_segment_under_the_mutex_across_a_segment
                     let mut worst = 0;
                     for i in 0..4_500u64 {
                         let name = format!("seg-{t}-{i}");
-                        let a = super::budget_probe::thread_allocs();
-                        c.create_branch(&name).unwrap();
-                        let b = super::budget_probe::thread_allocs();
-                        worst = worst.max(b.3 - a.3);
+                        // A trunk fork refused Busy (16 writers on one trunk) is retried, each
+                        // attempt measured.
+                        loop {
+                            let a = super::budget_probe::thread_allocs();
+                            let r = c.create_branch(&name);
+                            let b = super::budget_probe::thread_allocs();
+                            worst = worst.max(b.3 - a.3);
+                            match r {
+                                Ok(_) => break,
+                                Err(LimboError::Busy) => continue,
+                                Err(e) => panic!("create {name}: {e}"),
+                            }
+                        }
                     }
                     worst
                 })
