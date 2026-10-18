@@ -553,6 +553,9 @@ pub struct Connection {
     /// capture table; ROLLBACK` left capture on a table the rollback removed (adversary of
     /// d806241ea, MED 4).
     pub(super) capture_data_changes_at_begin: RwLock<Option<Option<CaptureDataChangesInfo>>>,
+    /// Virtual tables a DROP TABLE of this transaction removed, destroyed (the module's table
+    /// freed) only when the transaction commits without them (`finish_vtab_destroys`).
+    pub(super) pending_vtab_destroys: RwLock<Vec<Arc<crate::VirtualTable>>>,
     /// CDC v2: transaction ID for grouping CDC records by transaction.
     /// -1 means unset (will be assigned on first CDC write in the transaction).
     pub(crate) cdc_transaction_id: AtomicI64,
@@ -5582,7 +5585,54 @@ impl Connection {
         entries
     }
 
+    /// DROP TABLE of a virtual table (VDestroy): its destruction waits for the transaction's
+    /// outcome. Destroying at the DROP (as before) freed the module's table while the schema it was
+    /// dropped from could still come back (a ROLLBACK, a ROLLBACK TO, a failed statement) holding
+    /// it, and while other connections' schemas, the database's included, still held it: a later
+    /// use of the table read a freed pointer. Queue a-f review L5.
+    pub(crate) fn defer_vtab_destroy(&self, vtab: Arc<crate::VirtualTable>) {
+        self.pending_vtab_destroys.write().push(vtab);
+    }
+
+    /// The transaction ended: on a commit, each dropped virtual table that no schema of this
+    /// connection holds any more (a statement or savepoint rollback can have restored it) leaves
+    /// the registry and is destroyed; on a rollback, none is. A destroy that fails after the commit
+    /// cannot fail the DROP any more, so it is logged.
+    fn finish_vtab_destroys(&self, committed: bool) {
+        let pending = std::mem::take(&mut *self.pending_vtab_destroys.write());
+        if pending.is_empty() || !committed {
+            return;
+        }
+        let (main, temp, staged) =
+            self.with_savepoint_schema_snapshot(|main, temp, staged| (main, temp, staged));
+        let held = |vtab: &Arc<crate::VirtualTable>| {
+            std::iter::once(&main)
+                .chain(temp.iter())
+                .chain(staged.values())
+                .any(|schema| {
+                    schema.tables.values().any(|t| {
+                        matches!(t.as_ref(), crate::schema::Table::Virtual(v) if Arc::ptr_eq(v, vtab))
+                    })
+                })
+        };
+        for vtab in pending {
+            if held(&vtab) {
+                continue;
+            }
+            {
+                let mut syms = self.syms.write();
+                if syms.vtabs.get(&vtab.name).is_some_and(|v| Arc::ptr_eq(v, &vtab)) {
+                    syms.vtabs.remove(&vtab.name);
+                }
+            }
+            if let Err(e) = vtab.destroy() {
+                tracing::error!("destroying dropped virtual table {} after its commit: {e}", vtab.name);
+            }
+        }
+    }
+
     pub(crate) fn index_methods_on_transaction_committed(&self) {
+        self.finish_vtab_destroys(true);
         let entries = self.take_index_method_transaction_cursors();
         tracing::trace!(
             attachments = entries.len(),
@@ -5595,6 +5645,7 @@ impl Connection {
     }
 
     pub(crate) fn index_methods_on_transaction_rolled_back(&self) {
+        self.finish_vtab_destroys(false);
         let entries = self.take_index_method_transaction_cursors();
         tracing::trace!(
             attachments = entries.len(),

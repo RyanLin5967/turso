@@ -1689,15 +1689,14 @@ pub fn op_vdestroy(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(VDestroy { db: _, table_name }, insn);
     let conn = program.connection.clone();
-    {
-        let Some(vtab) = conn.syms.write().vtabs.remove(table_name) else {
-            mark_unlikely();
-            return Err(crate::LimboError::InternalError(
-                "Could not find Virtual Table to Destroy".to_string(),
-            ));
-        };
-        vtab.destroy()?;
-    }
+    // Destroyed when the transaction commits without it (`Connection::defer_vtab_destroy`).
+    let Some(vtab) = conn.syms.read().vtabs.get(table_name).cloned() else {
+        mark_unlikely();
+        return Err(crate::LimboError::InternalError(
+            "Could not find Virtual Table to Destroy".to_string(),
+        ));
+    };
+    conn.defer_vtab_destroy(vtab);
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
