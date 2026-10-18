@@ -524,6 +524,15 @@ check "u4 host: sudo_state reads a sudo that refuses this user (ecetesla3's text
 check "u4 host: sudo_state reads 'not in the sudoers file' as 'denied'" '[ "$(T3_SUDO_BIN=$T/sudo/notin sudo_state)" = denied ]'
 check "u4 host: root_check counts a root case as a no-root N/A under a denying sudo, and runs nothing" \
   '( T3_SUDO_BIN=$T/sudo/denied; na=0; root_check "probe" "touch $T/sudo/ran" > "$T/sudo/rc.out"; [ $na = 1 ] && [ ! -e "$T/sudo/ran" ] && grep -q "N/A-on-noroot: probe" "$T/sudo/rc.out" )'
+# the lead's ruling on 'denied' (2026-10-18): N/A-on-noroot is for a DEV box's self-tests only. The T3 run itself needs
+# root, so its preflight (t3_need_root) REFUSES every state but 'ok', naming it: a denying sudo can never pass there.
+# The red reaches t3_need_root through a fallback with today's preflight (sudo -n true, rc 1 on failure, no state)
+declare -F t3_need_root > /dev/null || t3_need_root() { sudo -n true || return 1; }
+for st_ in denied pw err none; do
+  check "u4 ruling: t3_need_root under a '$st_' sudo REFUSES (rc 2), naming the state" \
+    '( T3_SUDO_BIN=$T/sudo/'"$st_"' t3_need_root; rc=$?; [ $rc = 2 ] ) && T3_SUDO_BIN=$T/sudo/'"$st_"' t3_need_root 2>&1 | grep -q "needs passwordless root"'
+done
+check "u4 ruling: t3_need_root under a passwordless sudo passes (rc 0)" '( T3_SUDO_BIN=$T/sudo/ok t3_need_root )'
 
 echo "TALLY ran=$((pass + fail)) pass=$pass na=${na:-0} fail=$fail"  # gates/tally.py
 echo "T3LIB SELF-TEST $pass/$((pass + fail)) $([ $fail = 0 ] && echo PASS || echo FAIL)$([ $na = 0 ] || echo " ($na N/A: off Linux or without root)")"
