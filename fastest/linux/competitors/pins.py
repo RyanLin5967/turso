@@ -214,6 +214,7 @@ def selftest():
     ok("check-d2: a missing fsync row refused",
        cd2 is not None and any("fsync" in w for w in cd2("".join(ln for ln in d2.splitlines(True)
                                                                  if not ln.startswith("fsync\t")))))
+    print(f"TALLY ran={n} pass={n - bad} na=0 fail={bad}")  # gates/tally.py (linux-rev-uw2 MED 1)
     print(f"pins selftest: {n - bad}/{n}")
     return 1 if bad else 0
 

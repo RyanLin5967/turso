@@ -460,6 +460,7 @@ def selftest():
         print(("PASS" if got == want else "FAIL"), name, "->", got)
         bad += got != want
     n = len(cases) + len(wcases)
+    print(f"TALLY ran={n} pass={n - bad} na=0 fail={bad}")  # gates/tally.py (linux-rev-uw2 MED 1)
     print(f"fixture selftest: {n - bad}/{n}")
     return 1 if bad else 0
 

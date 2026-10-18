@@ -308,6 +308,7 @@ def selftest():
             ("Doltgres's auto GC as SHOW reports it (1)", "dolt_auto_gc_enabled|1\n", True)):
         why = gs(text) if gs else "no gc_settings_problem() in fthelp.py"
         ok(f"gc settings record: {name} -> {'ok' if not why else why}", (not why) == want_ok)
+    print(f"TALLY ran={n} pass={n - bad} na=0 fail={bad}")  # gates/tally.py (linux-rev-uw2 MED 1)
     print(f"fthelp selftest: {n - bad}/{n}")
     return 1 if bad else 0
 

@@ -90,6 +90,7 @@ def selftest():
                                                                          "step1_ns", "err"], source_header(p))
     finally:
         os.remove(p)
+    print(f"TALLY ran={n} pass={n - bad} na=0 fail={bad}")  # gates/tally.py (linux-rev-uw2 MED 1)
     print(f"raw_schema selftest: {n - bad}/{n}")
     return 1 if bad else 0
 

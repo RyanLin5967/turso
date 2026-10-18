@@ -199,6 +199,7 @@ def selftest():
            check_after_tm1(run_c("c_late", [(0, 0, "measure", 1, 0, tm1c, tm1c + 900)], closed)) != [])
         ok("after-tm1, open loop: a row intended at tm1 but claimed before it is refused",
            check_after_tm1(run_c("o_late", [(0, 0, "measure", 1, 0, tm1c - 900, tm1c)], dict(closed, loop="open"))) != [])
+    print(f"TALLY ran={n} pass={n - bad} na=0 fail={bad}")  # gates/tally.py (linux-rev-uw2 MED 1)
     print(f"sched_check selftest: {n - bad}/{n}")
     return 1 if bad else 0
 
