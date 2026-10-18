@@ -14491,7 +14491,10 @@ fn cli_one(dir: &Scratch, sql: &str) -> (bool, String) {
 /// client's text, in the server only, after prepare and before commit. Through the CLI nothing
 /// deleted it, so the next open attached the dropped schema again; `DROP SCHEMA IF EXISTS "my x"`
 /// read as `my`; `"s""x"` read as `s""x`. The frontend deletes the file of the schema it
-/// resolved and detached, once the DROP is committed.
+/// resolved and detached, once the DROP is committed. The `"my x"` arm is a CONTROL, not a red
+/// (wire-rev-uw1 LOW-1): it cannot fail at its base, since the old deleter ran only in the server
+/// and this test goes through the CLI, and the server refused the statement first anyway; the
+/// `s"x` and `gone` arms are the ones red at the base (out/med3-red).
 #[test]
 fn a_dropped_schemas_file_is_the_resolved_schemas_and_goes_at_commit() {
     let dir = Scratch::new("drop-schema-file");
