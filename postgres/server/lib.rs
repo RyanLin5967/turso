@@ -174,9 +174,13 @@ impl<'a> Backoff<'a> {
         #[cfg(test)]
         let delay = commit_busy_test::floor(&mode, delay);
         self.attempt += 1;
-        if now + delay > deadline {
+        // The last wait ends AT the deadline, so the whole lock wait is waited, as PostgreSQL's
+        // lock_timeout waits it: a delay that would pass it was skipped, giving up as much as the
+        // next delay early (measured: 55P03 after 234 ms of a 300 ms lock_timeout, iccad11).
+        if now >= deadline {
             return Ok(false);
         }
+        let delay = delay.min(deadline - now);
         let waits = &self
             .interrupts
             .expect("a waiting backoff has a session")
@@ -247,6 +251,41 @@ fn run_waiting(
     }
 }
 
+/// A relation a session's open block holds: the database it is in (the branch's name, empty for
+/// the trunk), its schema when the statement named one (public as main), and its name, lowercase.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct BlockRead {
+    db: String,
+    schema: Option<String>,
+    name: String,
+}
+
+impl BlockRead {
+    /// The same relation, by name and by schema when both name one.
+    fn matches(&self, other: &BlockRead) -> bool {
+        self.db == other.db
+            && self.name == other.name
+            && match (&self.schema, &other.schema) {
+                (Some(a), Some(b)) => a == b,
+                _ => true,
+            }
+    }
+}
+
+fn relation(db: &str, schema: Option<&str>, name: &str) -> BlockRead {
+    BlockRead {
+        db: db.to_string(),
+        schema: schema.map(|s| {
+            if s.eq_ignore_ascii_case("public") {
+                "main".to_string()
+            } else {
+                s.to_ascii_lowercase()
+            }
+        }),
+        name: name.to_ascii_lowercase(),
+    }
+}
+
 /// What every session of one server shares.
 struct Shared {
     db: Arc<Database>,
@@ -265,6 +304,13 @@ struct Shared {
     /// Each live session's interrupt flags by its BackendKeyData (process id, secret key), for a
     /// CancelRequest on another connection to stop its statement.
     cancels: Mutex<std::collections::HashMap<(i32, i32), std::sync::Weak<Interrupts>>>,
+    /// The relations each session's open block has read or parsed, by its key: PostgreSQL holds
+    /// an AccessShareLock on each to the block's end, so another session's DROP TABLE of one waits
+    /// its lock_timeout and is 55P03 (lead ruling 2026-10-18, pg18-rev-bl3.out #19: ours dropped
+    /// it, and the reader's next statement in its block was 42P01). `block_readers` counts the
+    /// sessions with an entry, so no DROP pays the lock while none does.
+    block_reads: Mutex<std::collections::HashMap<(i32, i32), Vec<BlockRead>>>,
+    block_readers: AtomicUsize,
     /// The next session's process id.
     next_pid: std::sync::atomic::AtomicI32,
     /// How long a client has to complete its startup (TursoPgServer::with_startup_timeout).
@@ -453,6 +499,8 @@ impl Shared {
             in_use_waiters: AtomicUsize::new(0),
             in_use_wait: IN_USE_WAIT,
             cancels: Mutex::new(std::collections::HashMap::new()),
+            block_reads: Mutex::new(std::collections::HashMap::new()),
+            block_readers: AtomicUsize::new(0),
             next_pid: std::sync::atomic::AtomicI32::new(1),
             startup_timeout: std::time::Duration::from_secs(DEFAULT_AUTHENTICATION_TIMEOUT_S),
             sessions: Arc::new(SessionSockets::default()),
@@ -1672,6 +1720,9 @@ impl Session {
     /// a held portal's view or function body is not looked through, and two schemas' tables of
     /// one name match when either side is unqualified.
     fn drop_of_a_held_relation(&self, sql: &str) -> Option<Box<ErrorInfo>> {
+        if !sql.as_bytes().windows(4).any(|w| w.eq_ignore_ascii_case(b"drop")) {
+            return None;
+        }
         let held: Vec<String> = {
             let st = self.state();
             if st.held_portals.is_empty() {
@@ -1709,6 +1760,77 @@ impl Session {
             }
         }
         None
+    }
+
+    /// The database a statement of this session runs in, as [`BlockRead::db`] names it.
+    fn current_db(&self) -> String {
+        self.state().branch.as_ref().map(|(name, _)| name.to_string()).unwrap_or_default()
+    }
+
+    /// Inside a block, the relations the frontend's prepare of a statement named (its one parse)
+    /// are held until the block ends, as PostgreSQL's parse analysis takes AccessShareLock on
+    /// each and keeps it to the transaction's end. Taken after every engine statement and every
+    /// Parse. Free when nothing was named.
+    fn note_block_reads(&self, conn: &PgConnection) {
+        let tables = conn.take_block_reads();
+        if tables.is_empty() {
+            return;
+        }
+        let db = self.current_db();
+        let mut all = self.shared.block_reads.lock().unwrap_or_else(|e| e.into_inner());
+        let mine = all.entry(self.key).or_insert_with(|| {
+            self.shared.block_readers.fetch_add(1, Ordering::Relaxed);
+            Vec::new()
+        });
+        for t in tables {
+            let read = relation(&db, t.rsplit_once('.').map(|(s, _)| s), t.rsplit('.').next().unwrap_or(&t));
+            if !mine.contains(&read) {
+                mine.push(read);
+            }
+        }
+    }
+
+    /// The block ended (or the session did): its relations are released.
+    fn release_block_reads(&self) {
+        if self.shared.block_readers.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        let mut all = self.shared.block_reads.lock().unwrap_or_else(|e| e.into_inner());
+        if all.remove(&self.key).is_some() {
+            self.shared.block_readers.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A DROP TABLE of a relation another session's open block holds: 55P03, PostgreSQL's answer
+    /// once its lock_timeout passes (recorded, pg18-rev-bl3.out #19). It is a rerunnable 55P03, so
+    /// engine_statement waits it out on the session's Backoff (its lock_timeout, or the server's
+    /// lock wait) and answers this message at the last attempt. Free while no session holds a
+    /// block's reads, and for any statement that does not name DROP. BLIND SPOTS: a read in
+    /// autocommit holds nothing (its statement's own run is the engine's), and a DROP inside a
+    /// block does not make a later reader in another session wait.
+    fn drop_waits_for_other_readers(&self, sql: &str) -> Option<Box<ErrorInfo>> {
+        if self.shared.block_readers.load(Ordering::Relaxed) == 0
+            || !sql.as_bytes().windows(4).any(|w| w.eq_ignore_ascii_case(b"drop"))
+        {
+            return None;
+        }
+        let parsed = turso_pg_parser::parse(sql).ok()?;
+        let drop = turso_pg_parser::translator::drop_objects(&parsed)?;
+        if !matches!(drop.kind, turso_pg_parser::translator::PgDropKind::Table) {
+            return None;
+        }
+        let db = self.current_db();
+        let targets: Vec<BlockRead> = drop
+            .objects
+            .iter()
+            .map(|(schema, name)| relation(&db, schema.as_deref(), name))
+            .collect();
+        let all = self.shared.block_reads.lock().unwrap_or_else(|e| e.into_inner());
+        let held = all
+            .iter()
+            .filter(|(key, _)| **key != self.key)
+            .any(|(_, reads)| reads.iter().any(|r| targets.iter().any(|t| t.matches(r))));
+        held.then(|| error(SqlErrorKind::LockNotAvailable, "canceling statement due to lock timeout".to_string()))
     }
 
     /// The end of an extended-protocol round, at a Sync whether or not its body was well formed
@@ -2063,6 +2185,7 @@ impl Session {
             if in_tx && conn.inner().get_auto_commit() {
                 let committed = result.is_ok() && verb == TxVerb::Commit && !aborted;
                 conn.tx_event(turso_pg::TxEvent::Ended { committed }, sql);
+                self.release_block_reads();
             } else if in_tx && result.is_ok() && matches!(verb, TxVerb::Chain { .. }) {
                 // AND CHAIN ends the block and opens the next in one statement, so the engine is
                 // never in autocommit between them: the block's end is reported here (C41-M1 /
@@ -2073,6 +2196,7 @@ impl Session {
                 // SETs, not roll them back (review c39799c5d..9e24b455d LOW 5).
                 let committed = matches!(verb, TxVerb::Chain { commit: true }) && !aborted;
                 conn.tx_event(turso_pg::TxEvent::Ended { committed }, sql);
+                self.release_block_reads();
             } else if result.is_ok() {
                 let event = match verb {
                     TxVerb::Savepoint => Some(turso_pg::TxEvent::Savepoint),
@@ -2424,7 +2548,10 @@ impl Session {
         // The key is read BEFORE the prepare (the wire line review L5): a change landing during
         // the compile then makes the key differ, never a stale statement match a fresh key.
         let key = PrepareKey::of(&conn);
-        match conn.parse_step(&parsed.sql, msg).map_err(engine_error)? {
+        let step = conn.parse_step(&parsed.sql, msg);
+        // A Parse inside a block holds what it names (pg18-rev-bl3.out #19).
+        self.note_block_reads(&conn);
+        match step.map_err(engine_error)? {
             Some((stmt, types)) => {
                 parameter_types(&types, declared).map_err(PgWireError::UserError)?;
                 self.state().described.put(Described {
@@ -2482,7 +2609,9 @@ impl Session {
         // answer NoData, and Execute performs them once (wire review 2 item 2, review 3 item 2).
         // Read before the prepare, as in parse_step (L5).
         let key = PrepareKey::of(&conn);
-        match conn.prepare_for_describe(sql) {
+        let prepared = conn.prepare_for_describe(sql);
+        self.note_block_reads(&conn);
+        match prepared {
             Ok(Some((stmt, types))) => {
                 self.state().described.put(Described {
                     conn: conn.inner().clone(),
@@ -2653,12 +2782,18 @@ impl Session {
         if let Some(info) = self.drop_of_a_held_relation(sql) {
             return Err(unprepared(info));
         }
+        if let Some(info) = self.drop_waits_for_other_readers(sql) {
+            return Err(unprepared(info));
+        }
+
         let described = portal.and_then(|_| self.take_described(conn, sql));
         let (mut stmt, types) = match described {
             Some(kept) => kept,
-            None => conn
-                .prepare_typed(sql)
-                .map_err(|e| unprepared(engine_info(&e)))?,
+            None => {
+                let prepared = conn.prepare_typed(sql);
+                self.note_block_reads(conn);
+                prepared.map_err(|e| unprepared(engine_info(&e)))?
+            }
         };
         // A statement that ends the transaction, as the translator read it, is never stepped
         // again, whatever the verb reader made of its text (wire review 13 item 1).
@@ -2992,6 +3127,7 @@ impl Session {
     /// terminates or goes, before its socket closes (serve_session), and again, as a no-op, when
     /// the session drops.
     fn end(&self) {
+        self.release_block_reads();
         let mut st = self.state();
         st.described.clear();
         st.implicit = false;

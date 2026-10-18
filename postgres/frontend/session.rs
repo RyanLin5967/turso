@@ -61,6 +61,9 @@ pub(crate) struct PgConnectionInner {
     /// The files of the schemas this session dropped inside its open block, deleted when the
     /// block commits and forgotten when it rolls back (review wire-quote MED-3).
     dropped_schema_files: parking_lot::Mutex<Vec<String>>,
+    /// The relations statements prepared inside the open block named (libpg_query's tables(),
+    /// `schema.name` or `name`), for the server to take ([`PgConnection::take_block_reads`]).
+    block_reads: parking_lot::Mutex<Vec<String>>,
 }
 
 /// The source of [`PgConnectionInner::search_path_stamp`]'s values.
@@ -398,6 +401,7 @@ impl PgConnection {
                 warnings: parking_lot::Mutex::new(Vec::new()),
                 public_schema_only,
                 dropped_schema_files: parking_lot::Mutex::new(Vec::new()),
+                block_reads: parking_lot::Mutex::new(Vec::new()),
             }),
         };
         SESSIONS_BY_CONNECTION
@@ -408,6 +412,11 @@ impl PgConnection {
 
     pub fn inner(&self) -> &Arc<Connection> {
         &self.inner.conn
+    }
+
+    /// The relations named by statements prepared inside the open block since the last take.
+    pub fn take_block_reads(&self) -> Vec<String> {
+        std::mem::take(&mut *self.inner.block_reads.lock())
     }
 
     /// SET lock_timeout, in milliseconds; 0 when unset or set to 0 (see
@@ -1207,6 +1216,15 @@ fn prepare_statement_parsed(
     } else {
         Vec::new()
     };
+    // Inside a block, the relations this statement names are held to the block's end, as
+    // PostgreSQL's parse analysis locks them: the server takes them for its cross-session DROP
+    // wait (lead ruling 2026-10-18, pg18-rev-bl3.out #19), from this parse, never a second one.
+    if !pg_conn.conn.get_auto_commit() {
+        let tables = parse_result.tables();
+        if !tables.is_empty() {
+            pg_conn.block_reads.lock().extend(tables);
+        }
+    }
     let special = Special::of(&parse_result);
     drop(parsing);
     let performs = special.as_ref().is_some_and(Special::performs);
