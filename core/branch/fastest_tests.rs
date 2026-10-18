@@ -13846,3 +13846,87 @@ fn a_frameless_full_commit_after_a_synced_one_syncs_nothing() {
         );
     }
 }
+
+/// CORRUPTION (fastest-wire's "short read on page 2", lead order b): a DDL statement that changes the
+/// connection's IN-MEMORY schema and then fails leaves that change in place while the pager rolls
+/// its pages back. `persist_type_definition` creates `__turso_internal_types` lazily with
+/// CreateBtree + ParseSchema, then runs AddType, then SetCookie. Rollback restores the in-memory
+/// schema only when SetCookie marked the transaction, so an AddType failure keeps a table whose root
+/// page the file never got. The next table is given that page, and the next CREATE TYPE writes its
+/// row INTO the user's table: at cd1e5624c `SELECT * FROM u` returned [1], ["m3"] after a reopen
+/// (probe engine-probe-shortread-4 on ecetesla2). Statement rollback inside BEGIN restores no
+/// in-memory schema at all, so the same holds there. Each case runs, and every failure is listed.
+#[test]
+fn a_failed_ddl_leaves_no_in_memory_schema_change() {
+    use turso_parser::ast;
+    let _g = serial();
+    let opts = || DatabaseOpts::new().with_custom_types(true);
+    // A CREATE TYPE whose AddType fails at run time: the stored SQL text does not reparse.
+    fn failing_create_type(c: &Arc<Connection>) -> crate::Result<()> {
+        let (Some(mut cmd), _) =
+            crate::dialect::sqlite::parse("CREATE TYPE m(value text) BASE text ENCODE 'p' DECODE value").unwrap()
+        else {
+            panic!("fixture: no command")
+        };
+        let ast::Cmd::Stmt(ast::Stmt::CreateType {
+            body: ast::CreateTypeBody::CustomType { encode: Some(e), .. },
+            ..
+        }) = &mut cmd
+        else {
+            panic!("fixture: not a CREATE TYPE with ENCODE")
+        };
+        **e = ast::Expr::Literal(ast::Literal::String("'a'b'".to_string()));
+        c.prepare_translated_cmd(cmd, "CREATE TYPE m(value text) BASE text ENCODE 'p' DECODE value")
+            .and_then(|mut s| s.run_ignore_rows())
+    }
+    fn rows(c: &Arc<Connection>, sql: &str) -> String {
+        format!("{:?}", c.prepare(sql).and_then(|mut s| s.run_collect_rows()))
+    }
+    let mut failed: Vec<String> = Vec::new();
+    for explicit in [false, true] {
+        let case = if explicit { "inside BEGIN" } else { "autocommit" };
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("stale.db");
+        {
+            let db = open_at(&path, opts());
+            let c = db.connect().unwrap();
+            c.execute("CREATE TABLE a(x)").unwrap();
+            if explicit {
+                c.execute("BEGIN").unwrap();
+            }
+            let r = failing_create_type(&c);
+            if r.is_ok() {
+                panic!("premise ({case}): the fixture CREATE TYPE must fail at AddType");
+            }
+            if c.schema.read().get_btree_table(crate::schema::TURSO_TYPES_TABLE_NAME).is_some() {
+                failed.push(format!(
+                    "{case}: after the failed CREATE TYPE ({r:?}) the in-memory schema still holds {} (sqlite_schema: {})",
+                    crate::schema::TURSO_TYPES_TABLE_NAME,
+                    rows(&c, "SELECT name, rootpage FROM sqlite_schema")
+                ));
+            }
+            for sql in ["CREATE TABLE u(y)", "INSERT INTO u VALUES (1)", "CREATE TYPE m3(value text) BASE text"] {
+                if let Err(e) = c.execute(sql) {
+                    failed.push(format!("{case}: {sql}: {e}"));
+                }
+            }
+            if explicit {
+                if let Err(e) = c.execute("COMMIT") {
+                    failed.push(format!("{case}: COMMIT: {e}"));
+                }
+            }
+            let integrity = rows(&c, "PRAGMA integrity_check");
+            if !integrity.contains("\"ok\"") {
+                failed.push(format!("{case}: integrity_check before the reopen: {integrity}"));
+            }
+        }
+        let db = open_at(&path, opts());
+        let c = db.connect().unwrap();
+        let u = c.prepare("SELECT * FROM u").and_then(|mut s| s.run_collect_rows());
+        let one_row_of_1 = matches!(&u, Ok(r) if r.len() == 1 && r[0].len() == 1 && r[0][0].to_string() == "1");
+        if !one_row_of_1 {
+            failed.push(format!("{case}: after the reopen `SELECT * FROM u` = {u:?}, want the one row (1)"));
+        }
+    }
+    assert!(failed.is_empty(), "CLAIM: a failed DDL left its in-memory schema change: {failed:#?}");
+}
