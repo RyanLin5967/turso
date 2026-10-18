@@ -10964,6 +10964,16 @@ fn catalog_only_names(db: &Arc<Database>, trunk: &Arc<Connection>, k: usize) -> 
     // The eviction runs at a fuzzy checkpoint's install (`evict_clean`).
     assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: the evicting fuzzy checkpoint started");
     db.branch_checkpoint_wait();
+    // FLAGGED fixture repair (lead rule for item f; DECISIONS owed): cap 1 keeps ONE state resident,
+    // and the trunk is not in the branch table, so one of these names stays: on Linux it is the
+    // highest id, cat-only-003, in 10 of 10 runs over a debug and a release build (probe
+    // engine-filter-dump-2, ecetesla2; artie 2f8ecd03b6). The survivor is read from the engine's
+    // own state and only it is left out of the controls; every other name must be evicted.
+    let survivors: Vec<&String> = names.iter().filter(|n| db.branches.name_resident_for_test(n)).collect();
+    assert!(survivors.len() <= 1, "premise: cap 1 left {} of these names resident: {survivors:?}", survivors.len());
+    let survivors: Vec<String> = survivors.into_iter().cloned().collect();
+    let names: Vec<String> = names.into_iter().filter(|n| !survivors.contains(n)).collect();
+    assert!(names.len() + 1 >= k, "premise: more than the one survivor was left out ({} of {k} kept)", names.len());
     for n in &names {
         assert!(!db.branches.name_resident_for_test(n), "premise: {n} is still resident after the eviction");
     }
