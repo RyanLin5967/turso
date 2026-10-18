@@ -15142,6 +15142,34 @@ fn a_column_type_is_read_as_postgresql_reads_it() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-uw2 LOW (M1's edges): a cast to a type that does not exist was left to its operand's
+/// own type, so `CREATE TABLE ... AS SELECT 1::nosuchtype` and a `DEFAULT 1::nosuchtype` ran.
+/// PostgreSQL 18.6 refuses each, and a bare SELECT, 42704 'type "nosuchtype" does not exist', and
+/// takes a cast to a built-in type this frontend does not model ('[1,2)'::int4range) (recorded
+/// with these statements on iccad11: pg18-rev-uw2-casts.out).
+#[test]
+fn a_cast_to_a_type_that_does_not_exist_is_42704() {
+    let dir = Scratch::new("cast-nosuchtype");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    for sql in [
+        "CREATE TABLE cx_as AS SELECT 1::nosuchtype AS a",
+        "CREATE TABLE cx_def (a int DEFAULT 1::nosuchtype)",
+        "SELECT 1::nosuchtype",
+    ] {
+        match a.q(sql).error {
+            Some(e) if e.code == "42704" && e.message == "type \"nosuchtype\" does not exist" => {}
+            other => wrong.push(format!("{sql}: want 42704, got {other:?}")),
+        }
+    }
+    let r = a.q("SELECT '[1,2)'::int4range");
+    if r.error.is_some() || r.rows != vec![vec![Some("[1,2)".to_string())]] {
+        wrong.push(format!("SELECT '[1,2)'::int4range: {:?} {:?}", r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-uw2 N5: a schema-qualified type was refused 42704 'type "public m" does not exist',
 /// its parts joined with a blank, so a pg_dump restore, which writes public.<type> for every enum
 /// and domain column, failed at its first such table. PostgreSQL 18.6 takes public.m and
