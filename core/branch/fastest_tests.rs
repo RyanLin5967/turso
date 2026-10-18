@@ -14633,3 +14633,217 @@ fn a_materialized_view_follows_writes_to_a_table_whose_name_needs_quotes_or_case
     }
     assert!(failed.is_empty(), "CLAIM: a materialized view did not follow its table: {failed:#?}");
 }
+
+/// The read-only quoting sweep of 4a97c9c36 (artie reviews/QUOTE-SWEEP-4a97c9c36.txt; lead order: one
+/// class, identifier and literal emission), its items reproduced. Each case on its own database, with a
+/// reopen where the claim is about the stored row; every failure is listed.
+/// - F4: RENAME COLUMN's view rewrite put the view's name into `WHERE name = '{view}'` unescaped: a view
+///   `v' OR 1 OR '` rewrote every sqlite_schema row.
+/// - F1: BTreeTable::to_sql printed table-level PRIMARY KEY and FOREIGN KEY names bare, so ALTER ADD/DROP
+///   COLUMN stored a row that does not reparse.
+/// - F2: Name::as_ident left a digit-leading name bare: RENAME TO "1t" stored an unparseable row, RENAME
+///   COLUMN to "123" turned CHECK(a > 0) into CHECK(123 > 0).
+/// - F6: true and false were printed bare: RENAME COLUMN a TO "true" made a view return 1 and a CHECK a
+///   constant.
+/// - F5: json_object(*)'s keys were wrapped in quotes unescaped, then un-doubled: a column a''b gave a'b.
+#[test]
+fn engine_built_sql_quotes_identifiers_and_escapes_literals_everywhere() {
+    let mut failed: Vec<String> = Vec::new();
+    fn steps(c: &Arc<Connection>, case: &str, sqls: &[&str], failed: &mut Vec<String>) -> bool {
+        for sql in sqls {
+            if let Err(e) = c.execute(sql) {
+                failed.push(format!("{case}: {sql}: {e}"));
+                return false;
+            }
+        }
+        true
+    }
+    fn rows(c: &Arc<Connection>, sql: &str) -> Result<Vec<Vec<String>>, String> {
+        c.prepare(sql)
+            .and_then(|mut s| s.run_collect_rows())
+            .map(|r| r.iter().map(|row| row.iter().map(|v| v.to_string()).collect()).collect())
+            .map_err(|e| e.to_string())
+    }
+    let fresh = |name: &str| {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join(format!("{name}.db"));
+        (dir, path)
+    };
+    // F4
+    {
+        let (_d, path) = fresh("f4");
+        {
+            let c = open_at(&path, DatabaseOpts::new()).connect().unwrap();
+            if steps(&c, "F4", &[
+                "CREATE TABLE t(a)",
+                "CREATE TABLE other(z)",
+                "CREATE VIEW \"v' OR 1 OR '\" AS SELECT a FROM t",
+                "CREATE VIEW \"it's\" AS SELECT a FROM t",
+                "ALTER TABLE t RENAME COLUMN a TO b",
+            ], &mut failed) {
+                match rows(&c, "SELECT sql FROM sqlite_schema WHERE name = 'other'") {
+                    Ok(r) if r.len() == 1 && r[0][0].contains("other") && !r[0][0].contains("VIEW") => {}
+                    other => failed.push(format!("F4: other's row after the rename = {other:?}")),
+                }
+            }
+        }
+        let c = open_at(&path, DatabaseOpts::new()).connect().unwrap();
+        if let Err(e) = rows(&c, "SELECT z FROM other") {
+            failed.push(format!("F4: after a reopen, other: {e}"));
+        }
+    }
+    // F1
+    {
+        let (_d, path) = fresh("f1");
+        let ok = {
+            let c = open_at(&path, DatabaseOpts::new()).connect().unwrap();
+            steps(&c, "F1", &[
+                "CREATE TABLE t(\"a b\", c, d, PRIMARY KEY(\"a b\", c))",
+                "ALTER TABLE t DROP COLUMN d",
+                "CREATE TABLE \"my p\"(\"my id\" INTEGER PRIMARY KEY)",
+                "CREATE TABLE ch(x, y, FOREIGN KEY(x) REFERENCES \"my p\"(\"my id\"))",
+                "ALTER TABLE ch ADD COLUMN z",
+                "CREATE TABLE k(\"order\", x, PRIMARY KEY(\"order\", x))",
+                "ALTER TABLE k ADD COLUMN w",
+            ], &mut failed)
+        };
+        if ok {
+            let c = open_at(&path, DatabaseOpts::new()).connect().unwrap();
+            for sql in ["INSERT INTO t VALUES (1, 2)", "INSERT INTO ch VALUES (1, 2, 3)", "INSERT INTO k VALUES (1, 2, 3)"] {
+                if let Err(e) = c.execute(sql) {
+                    failed.push(format!("F1: after a reopen, {sql}: {e}"));
+                }
+            }
+        }
+    }
+    // F2
+    {
+        let (_d, path) = fresh("f2");
+        let ok = {
+            let c = open_at(&path, DatabaseOpts::new()).connect().unwrap();
+            steps(&c, "F2", &[
+                "CREATE TABLE t2(x)",
+                "ALTER TABLE t2 RENAME TO \"1t\"",
+                "CREATE TABLE t3(a CHECK (a > 0))",
+                "ALTER TABLE t3 RENAME COLUMN a TO \"123\"",
+            ], &mut failed)
+        };
+        if ok {
+            let c = open_at(&path, DatabaseOpts::new()).connect().unwrap();
+            if let Err(e) = rows(&c, "SELECT x FROM \"1t\"") {
+                failed.push(format!("F2: after a reopen, \"1t\": {e}"));
+            }
+            if c.execute("INSERT INTO t3 VALUES (-1)").is_ok() {
+                failed.push("F2: after RENAME COLUMN a TO \"123\", CHECK (a > 0) let -1 in".to_string());
+            }
+        }
+    }
+    // F6
+    {
+        let (_d, path) = fresh("f6");
+        let ok = {
+            let c = open_at(&path, DatabaseOpts::new()).connect().unwrap();
+            let ok = steps(&c, "F6", &[
+                "CREATE TABLE t4(a CHECK (a > 0))",
+                "CREATE VIEW v4 AS SELECT a FROM t4",
+                "INSERT INTO t4 VALUES (5)",
+                "ALTER TABLE t4 RENAME COLUMN a TO \"true\"",
+                "CREATE TABLE u(\"true\", b, UNIQUE(\"true\", b))",
+                "ALTER TABLE u ADD COLUMN c",
+            ], &mut failed);
+            if ok {
+                match rows(&c, "SELECT * FROM v4") {
+                    Ok(r) if r == [["5".to_string()]] => {}
+                    other => failed.push(format!("F6: the view over the renamed column = {other:?}, want [[5]]")),
+                }
+                if c.execute("INSERT INTO t4 VALUES (-1)").is_ok() {
+                    failed.push("F6: after RENAME COLUMN a TO \"true\", CHECK (a > 0) let -1 in".to_string());
+                }
+            }
+            ok
+        };
+        if ok {
+            let c = open_at(&path, DatabaseOpts::new()).connect().unwrap();
+            if let Err(e) = c.execute("INSERT INTO u VALUES (1, 2, 3)") {
+                failed.push(format!("F6: after a reopen, u: {e}"));
+            }
+        }
+    }
+    // F5
+    {
+        let (_d, path) = fresh("f5");
+        let c = open_at(&path, DatabaseOpts::new()).connect().unwrap();
+        if steps(&c, "F5", &["CREATE TABLE j(\"a''b\" INTEGER)", "INSERT INTO j VALUES (1)"], &mut failed) {
+            match rows(&c, "SELECT json_object(*) FROM j") {
+                Ok(r) if r.len() == 1 && r[0][0] == "{\"a''b\":1}" => {}
+                other => failed.push(format!("F5: json_object(*) over a column a''b = {other:?}, want {{\"a''b\":1}}")),
+            }
+        }
+    }
+    assert!(failed.is_empty(), "CLAIM: engine-built SQL emitted an identifier or a literal unquoted: {failed:#?}");
+}
+
+/// The sweep's F3 (adjacent: name shadowing): a table with an ordinary column named rowid. The branch
+/// merge addressed rows by the bare word rowid (merge.rs), which there names that column, so its UPDATE
+/// and DELETE hit the rows whose rowid COLUMN equals the key; a materialized view's populate read
+/// `*, rowid` (view.rs). A branch updates one row and deletes another; the merge must change exactly
+/// those. And a materialized view over the table must hold every row. Every failure is listed.
+#[test]
+fn a_table_with_a_column_named_rowid_is_merged_and_viewed_by_its_real_rowid() {
+    use super::merge::{MergePolicy, Merger, Validation};
+    let mut failed: Vec<String> = Vec::new();
+    {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(
+            &dir.path().join("m.db"),
+            DatabaseOpts::new().with_branch_durability(BranchDurability::Catalog { sync: SyncClass::Off }),
+        );
+        let trunk = db.connect().unwrap();
+        trunk.execute("CREATE TABLE t(rowid TEXT, v INTEGER)").unwrap();
+        // Real rowids 1..=3; the column named rowid holds '2', '3', '1', so the two disagree on every row.
+        for (col, v) in [("2", 10), ("3", 20), ("1", 30)] {
+            trunk.execute(format!("INSERT INTO t VALUES ('{col}', {v})")).unwrap();
+        }
+        let b = trunk.fork_branch().unwrap();
+        {
+            let bc = b.connect().unwrap();
+            bc.execute("UPDATE t SET v = 11 WHERE _rowid_ = 1").unwrap();
+            bc.execute("DELETE FROM t WHERE _rowid_ = 3").unwrap();
+        }
+        let b_id = b.into_id();
+        let mut merger = Merger::new(trunk.clone()).unwrap();
+        let out = merger.merge(db.branch(b_id).unwrap(), MergePolicy { validation: Validation::BaseRead, keep_merged: false });
+        if let Err(e) = &out {
+            failed.push(format!("merge: {e}"));
+        }
+        let got: Vec<(String, String, String)> = trunk
+            .prepare("SELECT _rowid_, rowid, v FROM t ORDER BY _rowid_")
+            .and_then(|mut s| s.run_collect_rows())
+            .map(|r| r.iter().map(|row| (row[0].to_string(), row[1].to_string(), row[2].to_string())).collect())
+            .unwrap_or_default();
+        let want = vec![("1".into(), "2".into(), "11".into()), ("2".into(), "3".into(), "20".into())];
+        if got != want {
+            failed.push(format!("merge: trunk (real rowid, rowid column, v) = {got:?}, want {want:?}"));
+        }
+    }
+    {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("v.db"), DatabaseOpts::new().with_views(true));
+        let c = db.connect().unwrap();
+        for sql in [
+            "CREATE TABLE r(rowid TEXT, v INTEGER)",
+            "INSERT INTO r VALUES ('x', 1)",
+            "INSERT INTO r VALUES ('x', 2)",
+            "CREATE MATERIALIZED VIEW mvr AS SELECT v FROM r",
+        ] {
+            if let Err(e) = c.execute(sql) {
+                failed.push(format!("view: {sql}: {e}"));
+            }
+        }
+        match c.prepare("SELECT v FROM mvr ORDER BY v").and_then(|mut s| s.run_collect_rows()) {
+            Ok(r) if r.iter().map(|row| row[0].to_string()).collect::<Vec<_>>() == ["1", "2"] => {}
+            other => failed.push(format!("view: mvr = {other:?}, want [1, 2]")),
+        }
+    }
+    assert!(failed.is_empty(), "CLAIM: a column named rowid shadowed the real rowid: {failed:#?}");
+}
