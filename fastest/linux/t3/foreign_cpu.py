@@ -31,6 +31,7 @@ I/O-heavy batch; the T3 registration must rule on this). A process whose environ
 """
 import json
 import os
+import re
 import sys
 import time
 
@@ -137,21 +138,16 @@ def busy_evidence(path, exclude=(), interval_default=1.0):
                     interval = float(x.split("=")[1])
         elif not p[0].startswith("#") and len(p) == 5 and p[4] == "foreign" and int(p[1]) not in exclude:
             per.setdefault((int(p[1]), p[2]), []).append((float(p[0]), float(p[3])))
-    out = []
-    for (pid, comm), rows in sorted(per.items()):
-        run, last = 0.0, None
-        for t, pct in rows:
-            if pct > 50.0 and last is not None and t - last <= 1.5 * interval:
-                run += t - last
-            elif pct > 50.0:
-                run = interval
-            else:
-                run = 0.0
-            last = t if pct > 50.0 else None
-            if run >= 5.0:
-                out.append(f"{comm} pid {pid}")
-                break
-    return out
+    # linux-rev-uw2 LOW 3: the evidence is what decide() NAMED for the VOID, and only when every reason it gives is a
+    # foreign process above 50% (rule 2): an unusable record or a rule-1 total is not explained by a busy process
+    v = decide(path, interval_default)
+    named = []
+    for r in v["reasons"]:
+        m = re.match(r"foreign process (\d+) \((.*)\) above 50% for >= 5 s$", r)
+        if not m:
+            return []
+        named.append((int(m.group(1)), m.group(2)))
+    return [f"{comm} pid {pid}" for pid, comm in named if pid not in exclude and (pid, comm) in per]
 
 
 def decide(path, interval_default=1.0):
@@ -258,10 +254,14 @@ def self_test():
     # host itself is busy, so those cases are N/A-on-busy-host, printed and never counted as a pass; the VOID-wanting
     # case still runs, as a busy host cannot excuse a missed burner. On the T3 box (quiet by its own preflight) all run.
     busy = None
+    n_pass = n_na = 0
     for label, burners, want in live:
-        if busy and want == "VALID":
+        # linux-rev-uw2 LOW 4: on a busy host the VOID-wanting case is N/A too: its window would VOID with or without
+        # the burner, so it cannot tell a working sampler from one that voids everything
+        if busy:
+            n_na += 1
             print(f"N/A-on-busy-host: self-test {label}: the quiet baseline was VOID ({busy}); a busy host cannot "
-                  "show VALID", flush=True)
+                  f"show {want} apart from its own load", flush=True)
             continue
         out, rec, mine = window(label.split(": ")[1].replace(" ", "_")[:24], burners)
         if not burners and out != "VALID":
@@ -271,10 +271,12 @@ def self_test():
             others = busy_evidence(rec, exclude=mine)
             if others:
                 busy = f"the no-burner window gave {out}; the window's own samples show: {', '.join(others[:4])}"
+                n_na += 1
                 print(f"N/A-on-busy-host: self-test {label}: {busy}", flush=True)
                 continue
         ok = out == want
         bad += not ok
+        n_pass += ok
         print(f"self-test {'PASS' if ok else 'FAIL'}: {label}: want {want}, got {out}")
 
     # Synthetic: each rule alone, on records whose every number is chosen here (a live box's own
@@ -297,15 +299,17 @@ def self_test():
 
     # linux-rev-uw1 MED 3: busy-host evidence comes from the WINDOW's own samples (a ps CPU% is a lifetime average:
     # the reviewer's 30 s burner read 57-94% while idle), of a foreign, non-kernel process outside the test's tree
-    def evid(label, rows, exclude=()):
+    def evid(label, rows, exclude=(), gap_at=None):
         f = os.path.join(d, f"evid-{label}.tsv")
         with open(f, "w") as o:
             o.write("#start\t0\tcell=ST\tinterval=1.0\tload=()\n")
+            t_ = 0.0
             for i in range(20):
+                t_ += 4.0 if gap_at == i else 1.0
                 for pid, comm, pct, kind, start, n in rows:
                     if start <= i < start + n:
-                        o.write(f"{i + 1.0:.3f}\t{pid}\t{comm}\t{pct}\t{kind}\n")
-                o.write(f"#tick\t{i + 1.0:.3f}\t0\t0.0\t50.0\n")
+                        o.write(f"{t_:.3f}\t{pid}\t{comm}\t{pct}\t{kind}\n")
+                o.write(f"#tick\t{t_:.3f}\t0\t0.0\t50.0\n")
             o.write("#stop\t20.000\tstop-file\tload=()\n")
         return busy_evidence(f, exclude)
     synthetic_evid = [
@@ -319,9 +323,14 @@ def self_test():
          evid("ours", [(10, "python3", 99.0, "foreign", 0, 20)], exclude={10}) == []),
         ("MED 3: 60% for only 4 samples (under rule 2's 5 s) is no evidence",
          evid("brief", [(11, "java", 60.0, "foreign", 3, 4)]) == []),
+        # linux-rev-uw2 LOW 3: the evidence is the process decide() NAMED for the VOID, and only when every VOID reason
+        # is a foreign process: a record that is also unusable (here a 4 s gap) is not a busy host, burner or not
+        ("uw2 LOW 3: a VOID that is also an unusable record (a 4 s gap) is no busy-host evidence, burner or not",
+         evid("gap", [(12, "java", 90.0, "foreign", 2, 15)], gap_at=8) == []),
     ]
     for label, ok in synthetic_evid:
         bad += not ok
+        n_pass += ok
         print(f"self-test {'PASS' if ok else 'FAIL'}: {label}")
     synthetic = [
         ("rule 1: foreign 150% in 2 of 20 ticks (10% > 5%)", synth("r1v", [10] * 18 + [150, 150]), "VOID"),
@@ -336,7 +345,9 @@ def self_test():
     for label, got, want in synthetic:
         ok = got == want
         bad += not ok
+        n_pass += ok
         print(f"self-test {'PASS' if ok else 'FAIL'}: {label}: want {want}, got {got}")
+    print(f"TALLY ran={n_pass + bad} pass={n_pass} na={n_na} fail={bad}")  # gates/tally.py
     # an N/A is its own outcome, never a pass (linux-rev-uw1 HIGH 1): "fail", "na" (some case did not run) or "pass"
     return "fail" if bad else "na" if busy else "pass"
 

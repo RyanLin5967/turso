@@ -1511,6 +1511,7 @@ def self_test():
     # write-back batch (run 37528595878, x86 ext4loop on NVMe, a VM)
     real_selftest(chk)
     ok = all(res) and len(res) > 0
+    print(f"TALLY ran={len(res)} pass={sum(res)} na={len(SELF_TEST_NA)} fail={len(res) - sum(res)}")  # gates/tally.py
     print("CHECK SELF-TEST %d/%d %s" % (sum(res), len(res), "PASS" if ok else "FAIL")
           + (f" ({len(SELF_TEST_NA)} N/A)" if SELF_TEST_NA else ""))
     # an N/A is its own outcome, exit 3, never a pass (linux-rev-uw1 HIGH 1; gates/run_everywhere.py)

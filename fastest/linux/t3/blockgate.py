@@ -569,6 +569,7 @@ def self_test(data):
     bad = [n for n, good in cases if not good]
     for n, good in cases:
         print(f"BLOCKGATE self-test {'PASS' if good else 'FAIL'}: {n}")
+    print(f"TALLY ran={len(cases)} pass={len(cases) - len(bad)} na=0 fail={len(bad)}")  # gates/tally.py
     print(f"BLOCKGATE SELF-TEST {len(cases) - len(bad)}/{len(cases)} {'PASS' if not bad else 'FAIL'}")
     return 0 if not bad else 1
 

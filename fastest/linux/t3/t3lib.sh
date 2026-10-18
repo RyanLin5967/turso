@@ -475,6 +475,7 @@ sys.exit("no fixture record in " + sys.argv[1]) if type(v) is not int else print
 sudo_state() {
   local s=${T3_SUDO_BIN:-sudo} e
   command -v "$s" > /dev/null 2>&1 || { echo absent; return 0; }
-  e=$("$s" -n true 2>&1) && { echo ok; return 0; }
+  # in the C locale: sudo localises its message (linux-rev-uw2 LOW 7: de_DE says "Ein Passwort ist notwendig")
+  e=$(LC_ALL=C LANG=C LANGUAGE= "$s" -n true 2>&1) && { echo ok; return 0; }
   case $e in *"password is required"*|*"a terminal is required"*) echo password ;; *) echo "error: ${e:-no output}" ;; esac
 }

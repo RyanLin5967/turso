@@ -40,5 +40,11 @@ check "preflight asks virt_ok real unless --dry-block, and nothing else decides 
 check "t3run unsets an inherited T3_IDENTITY_MODE and sets virtio only under --dry-block" \
   'grep -n "T3_IDENTITY_MODE" "$HERE/t3run.sh"; [ "$(grep -c "T3_IDENTITY_MODE=virtio" "$HERE/t3run.sh")" = 1 ] &&
    awk "/^unset T3_IDENTITY_MODE/{u=NR} /T3_IDENTITY_MODE=virtio/{v=NR} /^if \\[ -n \"\\\$DRYB_GIVEN\" \\]; then/{b=NR} END{exit !(u && b && v > b && u < b)}" "$HERE/t3run.sh"'
+# linux-rev-uw2 LOW 6: t3run's private bash dir (the pin of its own bash first on PATH) is removed when it exits: a
+# run that refuses at its argument rules leaves nothing in TMPDIR (the reviewer counted 16 left on iccad7)
+mkdir -p "$T/tmpd"
+check "uw2 LOW 6: a t3run that refuses leaves no temp dir behind (its pinned-bash dir is removed at exit)" \
+  'TMPDIR=$T/tmpd refuses l6 "--block" --dry-block /dev/vdb --block loop; ls -A "$T/tmpd"; [ -z "$(ls -A "$T/tmpd")" ]'
+echo "TALLY ran=$((pass + fail)) pass=$pass na=${na:-0} fail=$fail"  # gates/tally.py
 echo "T3RUN-ARGS SELF-TEST $pass/$((pass + fail)) $([ $fail = 0 ] && echo PASS || echo FAIL)"
 [ $fail = 0 ]

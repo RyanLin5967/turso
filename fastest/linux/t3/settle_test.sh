@@ -51,5 +51,6 @@ st 100 0 5 7; dirty 4096
 settle /mnt/x loop9 "$T/out"
 check "4 MiB dirty: not quiet" '[ "$(field quiet)" = no ]'
 
+echo "TALLY ran=$((pass + fail)) pass=$pass na=${na:-0} fail=$fail"  # gates/tally.py
 echo "SETTLE SELF-TEST $pass/$((pass + fail)) $([ $fail = 0 ] && echo PASS || echo FAIL)"
 [ $fail = 0 ]

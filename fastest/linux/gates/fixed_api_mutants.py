@@ -211,6 +211,7 @@ def self_test():
     for n, ok in cases:
         bad += not ok
         print(f"FIXED-API-MUTANTS self-test {'PASS' if ok else 'FAIL'}: {n}")
+    print(f"TALLY ran={len(cases)} pass={len(cases) - bad} na=0 fail={bad}")  # gates/tally.py
     print(f"FIXED-API-MUTANTS SELF-TEST {len(cases) - bad}/{len(cases)} {'PASS' if not bad else 'FAIL'}")
     return 0 if not bad else 1
 

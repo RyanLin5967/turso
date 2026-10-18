@@ -957,6 +957,7 @@ def self_test():
                 bad.append(n)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+    print(f"TALLY ran={len(cases)} pass={len(cases) - len(bad)} na={2 if na259 else 0} fail={len(bad)}")  # gates/tally.py
     print(f"DEVGUARD SELF-TEST {len(cases) - len(bad)}/{len(cases)} {'PASS' if not bad else 'FAIL'}"
           + (" (2 N/A)" if na259 else ""))
     # an N/A is its own outcome, exit 3, never a pass (linux-rev-uw1 HIGH 1)

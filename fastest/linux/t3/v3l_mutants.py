@@ -257,6 +257,7 @@ def self_test():
             print(f"V3L-MUTANTS self-test case raised {type(e).__name__}: {e}")
         bad += not ok
         print(f"V3L-MUTANTS self-test {'PASS' if ok else 'FAIL'}: {name}")
+    print(f"TALLY ran={len(cases)} pass={len(cases) - bad} na=0 fail={bad}")  # gates/tally.py
     print(f"V3L-MUTANTS SELF-TEST {len(cases) - bad}/{len(cases)} {'PASS' if not bad else 'FAIL'}")
     return 0 if not bad else 1
 

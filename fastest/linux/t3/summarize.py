@@ -1655,6 +1655,7 @@ def self_test():
     bad = [c for c in cases if not c[1]]
     for n, ok, fb in cases:
         print(f"SUMMARIZE self-test {'PASS' if ok else 'FAIL'}: {n}" + (f" (why {fb})" if fb and not ok else ""))
+    print(f"TALLY ran={len(cases)} pass={len(cases) - len(bad)} na={len(na_cases)} fail={len(bad)}")  # gates/tally.py
     print(f"SUMMARIZE SELF-TEST {len(cases) - len(bad)}/{len(cases)} {'PASS' if not bad else 'FAIL'}"
           + (f" ({len(na_cases)} N/A)" if na_cases else ""))
     # an N/A is its own outcome, exit 3, never a pass (linux-rev-uw1 HIGH 1)

@@ -99,6 +99,9 @@ unset T3_SYSTEMCTL T3_CLOCKDELTA T3_QUIET_WATCH_S T3_QUIET_MAX_S T3_CLOCK_ADJUST
   { echo "t3run: REFUSED: running under bash ${BASH_VERSION:-?}; it needs bash 5+ (\$EPOCHREALTIME)" >&2; exit 2; }
 T3_BASHDIR=$(mktemp -d) && ln -s "$BASH" "$T3_BASHDIR/bash" && PATH=$T3_BASHDIR:$PATH ||
   { echo "t3run: REFUSED: cannot pin bash ($BASH) first on PATH" >&2; exit 2; }
+# linux-rev-uw2 LOW 6: the pin's dir goes when t3run does (here for an early exit; finish() too, since a plant's own
+# EXIT trap replaces this one while it runs)
+trap 'rm -rf "$T3_BASHDIR"' EXIT
 REPO_URL=https://github.com/RyanLin5967/turso
 SHA="" OUT="" DRY=0 MANIFEST="" FSLIST="" DEVICE="" DESTROY="" SEED=20261005 BLOCK="" PLANT="" PLP="" DEV_REAL=""
 DRY_BLOCK="" DRYB_GIVEN="" STAMP=""
@@ -233,6 +236,7 @@ finish() {
     echo "t3run: package failed (tar or sha256sum)"; rc=1  # gate-6 review 17
   fi
   echo "# t3run done rc=$rc wall_s=$t package=$OUT.tar.gz"
+  rm -rf "${T3_BASHDIR:-/nonexistent}"
   exit "$rc"
 }
 
@@ -730,17 +734,27 @@ run_cell() {
   done
 }
 
-# The checks that need nothing built, BEFORE deps and build are paid for (T3 runner review LOW 17): the harness's own
-# self-tests and the devguard root fire on this box's real disks
+# The harness's own self-tests and the devguard root fire on this box's real disks, before the build is paid for (T3
+# runner review LOW 17). Not "nothing built" since 2026-10-18 (linux-rev-uw2 LOW 8): run_everywhere's
+# gates/cargo_all_targets_test.sh row runs a cold cargo check of every turso_core target
+# st NAME OUT CMD...: one self-test on the T3 box, judged by its own TALLY line and rc (gates/tally.py, linux-rev-uw2
+# MED 1: an allowlist of outcomes, not a wording match): every case must have run and passed, so an N/A, a missing
+# tally or a tally that disagrees with the rc refuses the stage
+st() {
+  local n=$1 o=$2 rc=0; shift 2
+  "$@" > "$o" 2>&1 || rc=$?
+  python3 -B "$L/gates/tally.py" check "$o" "$rc" --require-all >> "$o" 2>&1 ||
+    { tail -4 "$o"; echo "self-test $n FAILED (rc $rc; its TALLY must say every case ran and passed)"; return 1; }
+}
 selftests() {
   local t
   for t in foreign_cpu v3l summarize blockgate devguard; do
-    python3 -B "$L/t3/$t.py" self-test > "$OUT/$t-selftest.txt" 2>&1 || { echo "self-test $t FAILED"; return 1; }
+    st "$t" "$OUT/$t-selftest.txt" python3 -B "$L/t3/$t.py" self-test || return 1
   done
-  timeout 120 bash "$L/t3/settle_test.sh" > "$OUT/settle-selftest.txt" 2>&1 || { echo "self-test settle FAILED"; return 1; }
-  timeout 60 bash "$L/t3/t3lib_test.sh" > "$OUT/t3lib-selftest.txt" 2>&1 || { echo "self-test t3lib FAILED"; return 1; }
-  timeout 120 python3 -B "$L/gates/warmup_conformance.py" self-test > "$OUT/warmup-conformance-selftest.txt" 2>&1 ||
-    { echo "self-test warmup_conformance FAILED"; return 1; }
+  st settle "$OUT/settle-selftest.txt" timeout 120 bash "$L/t3/settle_test.sh" || return 1
+  st t3lib "$OUT/t3lib-selftest.txt" timeout 60 bash "$L/t3/t3lib_test.sh" || return 1
+  st warmup_conformance "$OUT/warmup-conformance-selftest.txt" timeout 120 python3 -B "$L/gates/warmup_conformance.py" self-test ||
+    return 1
   # every self-test entry point, each on the platform it states (gates/platforms.tsv; the platform-inheritance class):
   # one runner, the same one vm_dryblock.sh runs on the Mac first, and it refuses an entry point with no row
   # rc 0 only: an N/A (rc 3, any case this box could not run) is never a pass on the T3 box (linux-rev-uw1 HIGH 1, the
@@ -751,11 +765,10 @@ selftests() {
     [ $rer = 3 ] && echo "self-test run_everywhere: N/A cases on the T3 box (rc 3): refused, an N/A is never a pass"
     echo "self-test run_everywhere FAILED (rc $rer)"; return 1; }
   # the shared sweeper's one reader, every refusal planted (MED 12 ruling; t3lib_test.sh runs ours_timed_run on /proc)
-  timeout 60 python3 -B "$L/gates/sweeper_record.py" selftest > "$OUT/sweeper-record-selftest.txt" 2>&1 ||
-    { echo "self-test sweeper_record FAILED"; return 1; }
+  st sweeper_record "$OUT/sweeper-record-selftest.txt" timeout 60 python3 -B "$L/gates/sweeper_record.py" selftest ||
+    return 1
   # v3l.py's mutant table: its own guard, then every mutant, each of which must be KILLED (review 5 MED 5: nothing ran it)
-  timeout 120 python3 -B "$L/t3/v3l_mutants.py" self-test > "$OUT/v3l-mutants-selftest.txt" 2>&1 ||
-    { echo "self-test v3l_mutants FAILED"; return 1; }
+  st v3l_mutants "$OUT/v3l-mutants-selftest.txt" timeout 120 python3 -B "$L/t3/v3l_mutants.py" self-test || return 1
   timeout 1800 python3 -B "$L/t3/v3l_mutants.py" > "$OUT/v3l-mutants.txt" 2>&1 ||
     { tail -3 "$OUT/v3l-mutants.txt"; echo "v3l mutants: not every mutant KILLED"; return 1; }
   # devguard on this box's real lsblk: the root disk must be refused (a fire on real input, not a fixture)
