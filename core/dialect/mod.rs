@@ -199,6 +199,106 @@ pub trait Dialect: Send + Sync + 'static {
     }
 }
 
+/// The SQLite builtin function names, read from `sqlite::resolve_builtin_function`'s own source (dialect
+/// design REVISION 2 item 7, R10), with whether each arm sits under `#[cfg(feature = "json")]`. Read from the
+/// source, not a typed list, so a builtin added there is in the contract the day it lands. Every quoted
+/// name in a match-arm pattern of that function's top-level match counts (alternations included).
+#[cfg(any(test, feature = "dialect_contract"))]
+#[doc(hidden)]
+pub fn sqlite_builtin_names() -> Vec<(String, bool)> {
+    const SRC: &str = include_str!("sqlite.rs");
+    let Some(start) = SRC.find("pub fn resolve_builtin_function(") else {
+        return Vec::new();
+    };
+    // The function body: from its first `{` to the matching `}`, skipping strings (the arms hold
+    // format strings with braces) and line comments.
+    let bytes = SRC.as_bytes();
+    let Some(open) = SRC[start..].find('{').map(|i| start + i) else {
+        return Vec::new();
+    };
+    let (mut depth, mut i, mut end) = (0i32, open, SRC.len());
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    i += if bytes[i] == b'\\' { 2 } else { 1 };
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = i;
+                    break;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let mut names = Vec::new();
+    let mut json = false;
+    for line in SRC[open..end].lines() {
+        let t = line.trim_start();
+        if t.starts_with("#[cfg(feature = \"json\")]") {
+            json = true;
+            continue;
+        }
+        if t.starts_with('"') {
+            if let Some(arrow) = t.find("=>") {
+                let pattern = &t[..arrow];
+                let pattern = pattern.split(" if ").next().unwrap_or(pattern);
+                for part in pattern.split('|') {
+                    let p = part.trim().trim_matches('"');
+                    if !p.is_empty() && p.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+                        names.push((p.to_string(), json));
+                    }
+                }
+            }
+        }
+        if !t.starts_with("#[") && !t.is_empty() {
+            json = false;
+        }
+    }
+    names
+}
+
+/// The builtin (name, arity) pairs that `dialect` resolves differently from SQLite (R10: functions always
+/// resolve through the database's dialect, so a dialect must give every SQLite builtin SQLite's meaning).
+/// Compared at every arity from 0 to 8: both errors, both `None`, or both `Some` with equal `Func`, where
+/// two `Func`s are equal iff their `Debug` forms are (`Func` has no `PartialEq`). Err if the source read
+/// yielded fewer than `min_names`: a contract that collected nothing would pass vacuously.
+#[cfg(any(test, feature = "dialect_contract"))]
+#[doc(hidden)]
+pub fn sqlite_builtins_resolved_differently(dialect: &dyn Dialect, min_names: usize) -> Result<Vec<String>, String> {
+    let names = sqlite_builtin_names();
+    if names.len() < min_names {
+        return Err(format!("the builtin source read found {} names, fewer than {min_names}: the read is broken", names.len()));
+    }
+    let shape = |r: crate::Result<Option<crate::Func>>| match r {
+        Err(_) => "Err".to_string(),
+        Ok(None) => "None".to_string(),
+        Ok(Some(f)) => format!("Some({f:?})"),
+    };
+    let mut different = Vec::new();
+    for (name, _) in &names {
+        for arity in 0..=8 {
+            let want = shape(sqlite::resolve_builtin_function(name, arity));
+            let got = shape(dialect.resolve_function(name, arity));
+            if want != got {
+                different.push(format!("{name}/{arity}: sqlite {want}, dialect {got}"));
+            }
+        }
+    }
+    Ok(different)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -559,6 +659,173 @@ mod tests {
             }
         }
         assert!(failed.is_empty(), "CLAIM: a database whose engine helper made a table does not reopen under its dialect: {failed:#?}");
+    }
+
+    /// R10 (dialect design REVISION 2 item 7): every core dialect gives every SQLite builtin SQLite's meaning,
+    /// so resolving functions always through the database's dialect changes nothing for SQLite names. The
+    /// names come from `resolve_builtin_function`'s source (`sqlite_builtin_names`); the read must find at
+    /// least the count it found at its own commit, and the json-gated subset likewise. Negative control: a
+    /// dialect that shadows `abs` must be caught (else the comparison is blind).
+    #[test]
+    fn every_core_dialect_resolves_every_sqlite_builtin_as_sqlite_does() {
+        // Measured at this test's commit (ecetesla2, uwrun engine-step3-reds-1): 214 names, 28 json-gated.
+        const MIN_NAMES: usize = 214;
+        const MIN_JSON: usize = 28;
+        let names = super::sqlite_builtin_names();
+        let json = names.iter().filter(|(_, j)| *j).count();
+        assert!(names.len() >= MIN_NAMES, "premise: the builtin source read found {} names, fewer than {MIN_NAMES}", names.len());
+        assert!(json >= MIN_JSON, "premise: the builtin source read found {json} json-gated names, fewer than {MIN_JSON}");
+        struct ShadowAbs;
+        impl Dialect for ShadowAbs {
+            fn name(&self) -> &'static str {
+                "shadow-abs"
+            }
+            fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+                sqlite::parse(sql)
+            }
+            fn parse_table_sql(&self, sql: &str, root_page: i64) -> crate::Result<BTreeTable> {
+                BTreeTable::from_sql(sql, root_page)
+            }
+            fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<turso_parser::ast::Stmt> {
+                sqlite::parse_table_sql_ast(sql)
+            }
+            fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
+                sqlite::table_sql_for_replay(sql)
+            }
+            fn format_table_sql(
+                &self,
+                input: &str,
+                _tbl_name: &turso_parser::ast::QualifiedName,
+                _body: &turso_parser::ast::CreateTableBody,
+            ) -> crate::Result<String> {
+                Ok(input.to_string())
+            }
+            fn resolve_function(&self, name: &str, arg_count: usize) -> crate::Result<Option<crate::function::Func>> {
+                if name.eq_ignore_ascii_case("abs") {
+                    return sqlite::resolve_builtin_function("sign", arg_count);
+                }
+                sqlite::resolve_builtin_function(name, arg_count)
+            }
+            fn register_catalog(&self, schema: &mut crate::schema::Schema, enable_custom_types: bool) -> crate::Result<()> {
+                sqlite::register_builtin_catalog(schema, enable_custom_types)
+            }
+        }
+        let shadow = super::sqlite_builtins_resolved_differently(&ShadowAbs, MIN_NAMES).unwrap();
+        assert!(
+            shadow.iter().any(|d| d.starts_with("abs/")),
+            "premise (negative control): a dialect shadowing abs was not caught: {shadow:?}"
+        );
+        let dialects: [(&str, &dyn Dialect); 5] = [
+            ("SqliteDialect", &SqliteDialect),
+            ("ClientOnlyDialect", &ClientOnlyDialect),
+            ("MarkingDialect", &MarkingDialect),
+            ("ReparseDialect", &ReparseDialect::default()),
+            ("StrictTestDialect", &StrictTestDialect),
+        ];
+        let mut failed = Vec::new();
+        for (name, d) in dialects {
+            match super::sqlite_builtins_resolved_differently(d, MIN_NAMES) {
+                Ok(diff) if diff.is_empty() => {}
+                Ok(diff) => failed.push(format!("{name}: {} pairs differ, first {:?}", diff.len(), &diff[..diff.len().min(4)])),
+                Err(e) => failed.push(format!("{name}: {e}")),
+            }
+        }
+        assert!(failed.is_empty(), "CLAIM: a core dialect resolves a SQLite builtin differently from SQLite: {failed:#?}");
+    }
+
+    /// R11 (dialect design REVISION 2 item 9): a frontend's canonical SQLite text never creates a table (a
+    /// frontend makes its tables through its own parser, as the wire does with run_pg_statement): a CREATE
+    /// TABLE, CTAS included, under `SqlKind::frontend()` is refused with a named error and stores nothing.
+    /// Control: the same CREATE under `SqlKind::client()` works.
+    #[test]
+    fn a_frontend_create_table_is_refused() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(&io, "frontend-create.db", Arc::new(SqliteDialect)).unwrap();
+        let c = db.connect().unwrap();
+        let run = |sql: &str, kind: crate::SqlKind| {
+            c.prepare_with(sql, kind, crate::Origin::Root).and_then(|mut s| s.run_ignore_rows())
+        };
+        let mut failed = Vec::new();
+        if let Err(e) = run("CREATE TABLE ok(a)", crate::SqlKind::client()) {
+            failed.push(format!("premise (control): a client CREATE TABLE failed: {e}"));
+        }
+        for sql in ["CREATE TABLE f(a)", "CREATE TABLE g AS SELECT 1 AS a"] {
+            match run(sql, crate::SqlKind::frontend()) {
+                Err(e) if e.to_string().contains("frontend") => {}
+                other => failed.push(format!("{sql}: not refused by name: {other:?}")),
+            }
+        }
+        let rows = c
+            .prepare("SELECT name FROM sqlite_schema WHERE name IN ('f', 'g')")
+            .and_then(|mut s| s.run_collect_rows())
+            .unwrap();
+        if !rows.is_empty() {
+            failed.push(format!("a refused frontend CREATE stored a row: {rows:?}"));
+        }
+        assert!(failed.is_empty(), "CLAIM: a frontend's text created a table: {failed:#?}");
+    }
+
+    /// R3 (dialect design REVISION 2 item 1; reviews dialect HIGH-2, adversary-2 H1): VACUUM keeps every
+    /// schema row BYTE FOR BYTE. Under MarkingDialect (which marks the client rows it stores), a database with a
+    /// marked client table, an AUTOINCREMENT + UNIQUE table (whose CREATE also writes an autoindex, a sequence
+    /// table and sqlite_sequence), a composite-key table, an index, a view, a trigger and an ALTERed table is
+    /// VACUUMed. `SELECT type, name, tbl_name, sql FROM sqlite_schema` must be identical before, after, and
+    /// after a reopen. Premise: the marking dialect marked the client rows. At 846697d35 VACUUM replayed the
+    /// unmarked replay text through prepare_sqlite and stored it unmarked.
+    #[cfg(all(feature = "fs", not(target_family = "wasm")))]
+    #[test]
+    fn vacuum_keeps_every_schema_row_byte_for_byte() {
+        let dir = tempfile::tempdir().unwrap();
+        let io: Arc<dyn IO> = Arc::new(crate::io::PlatformIO::new().unwrap());
+        let path = dir.path().join("r3.db");
+        let open = || {
+            Database::open_file_with_flags(
+                io.clone(),
+                path.to_str().unwrap(),
+                OpenFlags::Create,
+                DatabaseOpts::new().with_vacuum(true).with_views(true),
+                None,
+                Arc::new(MarkingDialect),
+            )
+            .unwrap()
+        };
+        let rows = |c: &Arc<crate::Connection>| {
+            c.prepare("client: SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY type, name")
+                .and_then(|mut s| s.run_collect_rows())
+                .map(|rows| rows.iter().map(|r| format!("{r:?}")).collect::<Vec<_>>())
+        };
+        let before = {
+            let db = open();
+            let c = db.connect().unwrap();
+            for sql in [
+                "client: CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, u TEXT UNIQUE, w INTEGER)",
+                "client: CREATE TABLE p(a, b, PRIMARY KEY (a, b))",
+                "client: CREATE TABLE plain(x INTEGER)",
+                "client: CREATE INDEX ti ON t(w)",
+                "client: CREATE VIEW tv AS SELECT id FROM t",
+                "client: CREATE TRIGGER tt AFTER INSERT ON plain BEGIN UPDATE t SET w = 0 WHERE id = new.x; END",
+                "client: ALTER TABLE plain ADD COLUMN y INTEGER",
+                "client: INSERT INTO t(u, w) VALUES ('a', 1), ('b', 2)",
+                "client: INSERT INTO p VALUES (1, 2)",
+                "client: INSERT INTO plain VALUES (1, 2)",
+            ] {
+                c.execute(sql).unwrap_or_else(|e| panic!("premise: {sql}: {e}"));
+            }
+            let before = rows(&c).unwrap();
+            assert!(
+                before.iter().any(|r| r.contains("/* client */")),
+                "premise: the marking dialect marked no client row: {before:#?}"
+            );
+            if let Err(e) = c.execute("client: VACUUM") {
+                panic!("CLAIM: VACUUM failed: {e}");
+            }
+            let after = rows(&c).unwrap();
+            assert_eq!(before, after, "CLAIM: VACUUM changed a schema row's bytes");
+            before
+        };
+        let db = open();
+        let c = db.connect().unwrap();
+        assert_eq!(before, rows(&c).unwrap(), "CLAIM: after VACUUM and a reopen, a schema row's bytes changed");
     }
 
     /// A dialect that parks one translation in the middle: resolving the function `park_here()`

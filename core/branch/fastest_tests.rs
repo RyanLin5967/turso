@@ -3284,6 +3284,90 @@ fn the_bump_site_scan_sees_a_site_move_between_functions_of_one_file() {
     assert_ne!(bump_sites(before), bump_sites(after), "CLAIM: a bump moved between functions of one file is invisible to the scan");
 }
 
+/// R6a (dialect design REVISION 2 item 1; adversary-2 H1, its RAN probe made the red): a branch MERGE compiles
+/// the target table's CHECK, DEFAULT and trigger expressions, which belong to the database, so they resolve
+/// through the database's dialect. A dialect-only function `dfn` (= abs) in a CHECK: a branch updates a row,
+/// MERGE must succeed. Control: the same with `abs`. At 846697d35 merge's apply statements compiled under
+/// SQLite names and failed "no such function: dfn".
+#[test]
+fn a_merge_resolves_a_check_through_the_database_s_dialect() {
+    use super::merge::{MergePolicy, Merger, Validation};
+    use crate::dialect::sqlite;
+    use crate::schema::BTreeTable;
+    struct DfnDialect;
+    impl crate::Dialect for DfnDialect {
+        fn name(&self) -> &'static str {
+            "dfn"
+        }
+        fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+            sqlite::parse(sql)
+        }
+        fn parse_table_sql(&self, sql: &str, root_page: i64) -> crate::Result<BTreeTable> {
+            BTreeTable::from_sql(sql, root_page)
+        }
+        fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<turso_parser::ast::Stmt> {
+            sqlite::parse_table_sql_ast(sql)
+        }
+        fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
+            sqlite::table_sql_for_replay(sql)
+        }
+        fn format_table_sql(
+            &self,
+            input: &str,
+            _t: &turso_parser::ast::QualifiedName,
+            _b: &turso_parser::ast::CreateTableBody,
+        ) -> crate::Result<String> {
+            Ok(input.to_string())
+        }
+        fn resolve_function(&self, name: &str, arg_count: usize) -> crate::Result<Option<crate::function::Func>> {
+            if name.eq_ignore_ascii_case("dfn") {
+                return sqlite::resolve_builtin_function("abs", arg_count);
+            }
+            sqlite::resolve_builtin_function(name, arg_count)
+        }
+        fn register_catalog(&self, schema: &mut crate::schema::Schema, e: bool) -> crate::Result<()> {
+            sqlite::register_builtin_catalog(schema, e)
+        }
+    }
+    let _s = serial();
+    let mut failed = Vec::new();
+    for f in ["abs", "dfn"] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let db = Database::open_file_with_flags(
+            io,
+            dir.path().join("m.db").to_str().unwrap(),
+            OpenFlags::Create,
+            DatabaseOpts::new().with_branch_durability(BranchDurability::Catalog { sync: SyncClass::Off }),
+            None,
+            Arc::new(DfnDialect),
+        )
+        .unwrap();
+        let trunk = db.connect().unwrap();
+        trunk
+            .execute(format!("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT, w INTEGER CHECK ({f}(w) >= 0))"))
+            .unwrap_or_else(|e| panic!("premise ({f}): the table was not made: {e}"));
+        for id in 1..=50 {
+            trunk.execute(format!("INSERT INTO t(id, v, w) VALUES ({id}, 'v{id}', {id})")).unwrap();
+        }
+        let b = trunk.fork_branch().unwrap();
+        b.connect().unwrap().execute("UPDATE t SET w = 777 WHERE id = 5").unwrap();
+        let b_id = b.into_id();
+        let mut merger = Merger::new(trunk.clone()).unwrap();
+        let out = merger.merge(db.branch(b_id).unwrap(), MergePolicy { validation: Validation::BaseRead, keep_merged: false });
+        let w = trunk.prepare("SELECT w FROM t WHERE id = 5").and_then(|mut s| s.run_collect_rows());
+        match (&out, &w) {
+            (Ok(_), Ok(rows)) if rows.first().and_then(|r| r.first()).is_some_and(|v| v.to_string() == "777") => {}
+            _ => failed.push(format!("{f}: merge={:?}, w={w:?}", out.as_ref().map(|o| (o.refused, o.rows_changed)))),
+        }
+    }
+    assert!(
+        !failed.iter().any(|x| x.starts_with("abs:")),
+        "premise (control): the merge failed with a SQLite builtin in the CHECK: {failed:?}"
+    );
+    assert!(failed.is_empty(), "CLAIM: a merge compiled a table's CHECK under SQLite's function names: {failed:?}");
+}
+
 /// fastest-wire (the ONE QUOTING FUNCTION class, core side; wire 98ca163a2 on iccad11): engine text that names a
 /// database, table or view interpolated the name unquoted, so a name holding a quote or a space broke the text the
 /// engine itself built. Instances, each a case here:
