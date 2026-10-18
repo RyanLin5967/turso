@@ -15090,7 +15090,6 @@ fn a_regclass_names_its_relations_oid() {
     }
     for (sql, code, message) in [
         ("SELECT 'nosuch'::regclass", "42P01", "relation \"nosuch\" does not exist"),
-        ("SELECT '\"T2\"'::regclass", "42P01", "relation \"T2\" does not exist"),
         ("SELECT 'a b'::regclass", "42602", "invalid name syntax"),
     ] {
         let r = a.q(sql);
@@ -15206,15 +15205,25 @@ fn a_regclass_resolves_catalogs_quoted_names_views_and_sequences() {
 /// that needs the engine to keep a quoted name's case (moved here from that test, its assertions
 /// unchanged, so the half the frontend fixes is not hidden behind this one): PostgreSQL 18.6's
 /// pg_class holds a table created as "U2" as U2, '"U2"' names it, and 'U2' (folded to u2) is
-/// 42P01 (recorded, pg18-rev-uw2-regclass.out). The engine folds every relation name
-/// (normalize_ident), so "U2" is its u2: engine-owned, in known-red.
+/// 42P01 (recorded, pg18-rev-uw2-regclass.out); and for a table created unquoted as t2, '"T2"'
+/// is 42P01 (moved here, unchanged, from a_regclass_names_its_relations_oid; recorded, artie
+/// 3b69c8dab8 pg18-rev-regclass.out), since "T2" and t2 are two names there. The engine folds
+/// every relation name (normalize_ident), so "U2" is its u2 and "T2" its t2, and regclass names
+/// a relation by the engine's identity, as every other statement does: engine-owned, in
+/// known-red.
 #[test]
 fn a_quoted_mixed_case_table_keeps_its_case_in_the_catalog() {
     let dir = Scratch::new("regclass-case");
     let server = Server::start(&dir.db(), &[]);
     let mut a = server.connect();
     a.q("CREATE TABLE \"U2\"(x int)").ok("U2");
+    a.q("CREATE TABLE t2(x int)").ok("t2");
     let mut wrong = Vec::new();
+    let r = a.q("SELECT '\"T2\"'::regclass");
+    match &r.error {
+        Some(e) if e.code == "42P01" && e.message == "relation \"T2\" does not exist" => {}
+        other => wrong.push(format!("SELECT '\"T2\"'::regclass (t2 created unquoted): want 42P01, got {other:?} {:?}", r.rows)),
+    }
     let sql = "SELECT '\"U2\"'::regclass = (SELECT oid FROM pg_class WHERE relname = 'U2')";
     let r = a.q(sql);
     if r.error.is_some() || r.rows != vec![vec![Some("t".to_string())]] {
