@@ -2937,6 +2937,10 @@ fn the_budget_counters_count_exactly_what_was_done() {
     // harness's.
     assert_eq!(get("fc_thread_new_quiet", "refusal"), probe::Refusal::ThreadNew as u64, "premise: fc_thread_new_quiet was not refused as ThreadNew");
     assert!(get("fc_foreign_window", "foreign_threads") >= 1, "premise: fc_foreign_window had no foreign thread");
+    // The Linux port (2026-10-18): an empty harness window is quiet wherever the thread states can be
+    // read. Off Apple no kernel syscall count exists, so quiet cannot rest on an attributed count there.
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    assert_eq!(get("fc_measure_empty", "quiet"), 1, "CLAIM: an empty harness window is not quiet, so no cell of this platform can pass");
     for op in ["fc_thread_new_quiet", "fc_foreign_window", "fc_measure_empty"] {
         for k in ["allocs", "alloc_bytes", "held_allocs"] {
             assert_eq!(get(op, k), 0, "{op}: a window whose own work allocates nothing moved {k}: the instrument or the harness allocated inside it");
