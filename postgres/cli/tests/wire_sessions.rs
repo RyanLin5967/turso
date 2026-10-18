@@ -15712,6 +15712,27 @@ fn a_cli_block_that_failed_commits_nothing() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-uw2 LOW: through the CLI, CREATE SCHEMA "PUBLIC" attached a database the engine
+/// names public (it folds an attached name), so pg_namespace listed public twice. PostgreSQL 18.6
+/// creates a schema "PUBLIC" of its own (recorded: pg18-rev-uw2-lows.out); the engine cannot hold
+/// two schemas whose names fold alike, so the CLI refuses it as the public it is, 'schema
+/// "PUBLIC" already exists', and lists public once (COMPAT: folded names).
+#[test]
+fn a_schema_named_public_in_another_case_is_public() {
+    let dir = Scratch::new("schema-public-case");
+    let mut wrong = Vec::new();
+    let (ok, out) = cli_one(&dir, "CREATE SCHEMA \"PUBLIC\"");
+    if ok || !out.contains("schema \"PUBLIC\" already exists") {
+        wrong.push(format!("CREATE SCHEMA \"PUBLIC\": ok {ok}: {out}"));
+    }
+    let (_, names) = cli_one(&dir, "SELECT nspname FROM pg_namespace ORDER BY nspname");
+    let publics = names.lines().filter(|l| l.split('│').any(|c| c.trim().eq_ignore_ascii_case("public"))).count();
+    if publics != 1 {
+        wrong.push(format!("pg_namespace lists public {publics} times: {names}"));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-uw2 N4: inside a CLI block, a DROP SCHEMA's DETACH waits for COMMIT, and until then
 /// the dropped schema still answered: pg_namespace listed it, and CREATE TABLE s.u succeeded, so
 /// the COMMIT then deleted s.u with the schema's file (DATA LOSS of a table the block had just
