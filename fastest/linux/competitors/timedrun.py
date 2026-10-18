@@ -765,6 +765,11 @@ def selftest():
         ("the timed run's raw.tsv missing (summary present)", dict(tracer=clean, raw=False), False),
         ("the timed summary says fail with rc 0", dict(tracer=clean, timed_extra={"verdict": "fail"}), False),
         ("the timed summary says ok with rc 3", dict(tracer=clean, timed_extra={"rc": 3}), False),
+        # comp-rev-failcount LOW-3: the labelling run's own verdict and rc were never read, so a refused labelling run
+        # (bbload rc 3: failed ops) whose counts look whole could label a credited cell
+        ("the labelling summary says REFUSED with rc 3",
+         dict(tracer=clean, lab_extra={"verdict": "REFUSED: 1 warm-up, 0 drain and 0 other op(s) failed", "rc": 3}), False),
+        ("the labelling summary says ok with rc 3", dict(tracer=clean, lab_extra={"rc": 3}), False),
         ("the timed run's exit status file says 1", dict(tracer=clean, rc_file=1), False),
         ("capped with 1200 ops but 50 ok (the tier counts ok ops)",
          dict(tracer=clean, capped=True, lab_ops=1200, timed_ops=1200, timed_extra={"measured_ok": 50},
@@ -1006,6 +1011,8 @@ def selftest():
         "the timed run's raw.tsv missing (summary present)": ("no timed run (timed/summary.json",),
         "the timed summary says fail with rc 0": ("timed run verdict fail rc 0",),
         "the timed summary says ok with rc 3": ("timed run verdict ok rc 3",),
+        "the labelling summary says REFUSED with rc 3": ("labelling run verdict REFUSED: 1 warm-up",),
+        "the labelling summary says ok with rc 3": ("labelling run verdict ok rc 3",),
         "the timed run's exit status file says 1": ("timed run exit status 1",),
         "capped with 1200 ops but 50 ok (the tier counts ok ops)": ("timed run capped with 50 ok ops",),
         "a warm-up that left before S and before MAX_S (1000 ops, 1.0 s of 10 s)": ("timed run left its warm-up early",),
