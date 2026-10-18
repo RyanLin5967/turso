@@ -987,7 +987,7 @@ mod tests {
             )
             .unwrap()
         };
-        let row = |c: &Arc<Connection>, name: &str| {
+        let row = |c: &Arc<crate::Connection>, name: &str| {
             c.prepare(format!("client: SELECT sql FROM sqlite_schema WHERE name = '{name}'"))
                 .and_then(|mut s| s.run_collect_rows())
                 .map(|r| format!("{r:?}"))
