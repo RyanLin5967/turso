@@ -14854,3 +14854,471 @@ fn a_table_with_a_column_named_rowid_is_merged_and_viewed_by_its_real_rowid() {
     }
     assert!(failed.is_empty(), "CLAIM: a column named rowid shadowed the real rowid: {failed:#?}");
 }
+
+// ===== The queue a-f adversary's tests (engine-rev-queue-af, artie reviews/engine-queue-af-tests/), verbatim: the lead's order uses them as reds =====
+
+// ===== ADVERSARY (queue a-f review, 2026-10-18): routes of the failed-DDL class =====
+
+fn adv_failing_create_type(c: &Arc<Connection>) -> crate::Result<()> {
+    use turso_parser::ast;
+    let (Some(mut cmd), _) =
+        crate::dialect::sqlite::parse("CREATE TYPE m(value text) BASE text ENCODE 'p' DECODE value").unwrap()
+    else {
+        panic!("fixture: no command")
+    };
+    let ast::Cmd::Stmt(ast::Stmt::CreateType { body: ast::CreateTypeBody::CustomType { encode: Some(e), .. }, .. }) = &mut cmd else {
+        panic!("fixture: not a CREATE TYPE with ENCODE")
+    };
+    **e = ast::Expr::Literal(ast::Literal::String("'a'b'".to_string()));
+    c.prepare_translated_cmd(cmd, "CREATE TYPE m(value text) BASE text ENCODE 'p' DECODE value")
+        .and_then(|mut s| s.run_ignore_rows())
+}
+
+fn adv_rows(c: &Arc<Connection>, sql: &str) -> crate::Result<Vec<Vec<String>>> {
+    c.prepare(sql)
+        .and_then(|mut s| s.run_collect_rows())
+        .map(|r| r.into_iter().map(|row| row.into_iter().map(|v| v.to_string()).collect()).collect())
+}
+
+/// Every (kind, name, root) the connection's in-memory schema for `db_id` holds that its
+/// `<schema>.sqlite_schema` does not, and the reverse.
+fn adv_divergence(c: &Arc<Connection>, db_id: usize, schema_name: &str) -> Vec<String> {
+    let mut mem: std::collections::BTreeSet<(String, String, i64)> = Default::default();
+    c.with_schema(db_id, |s| {
+        for (name, t) in &s.tables {
+            if let crate::schema::Table::BTree(b) = t.as_ref() {
+                if b.root_page > 0 && !name.eq_ignore_ascii_case("sqlite_schema") && !name.eq_ignore_ascii_case("sqlite_temp_schema") {
+                    mem.insert(("table".into(), b.name.to_lowercase(), b.root_page));
+                }
+            }
+        }
+        for v in s.indexes.values() {
+            for i in v {
+                if i.root_page > 0 && !i.ephemeral {
+                    mem.insert(("index".into(), i.name.to_lowercase(), i.root_page));
+                }
+            }
+        }
+    });
+    let disk: std::collections::BTreeSet<(String, String, i64)> =
+        match adv_rows(c, &format!("SELECT type, name, rootpage FROM {schema_name}.sqlite_schema WHERE rootpage > 0 AND type IN ('table','index')")) {
+            Ok(r) => r.into_iter().map(|r| (r[0].clone(), r[1].to_lowercase(), r[2].parse().unwrap())).collect(),
+            Err(e) => return vec![format!("reading {schema_name}.sqlite_schema: {e}")],
+        };
+    let mut out = Vec::new();
+    for m in mem.difference(&disk) {
+        out.push(format!("in memory only: {m:?}"));
+    }
+    for d in disk.difference(&mem) {
+        out.push(format!("on file only: {d:?}"));
+    }
+    out
+}
+
+/// ADV-1: the red's sequence on a NAMED BRANCH connection (the fork's own pager, whose rollback
+/// restores the schema from the branch store).
+#[test]
+fn adv_a_failed_ddl_on_a_branch_leaves_no_in_memory_schema_change() {
+    let _g = serial();
+    let mut failed: Vec<String> = Vec::new();
+    for catalog in [false, true] {
+        for explicit in [false, true] {
+            let case = format!("catalog={catalog} {}", if explicit { "inside BEGIN" } else { "autocommit" });
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("br.db");
+            let o = || opts(catalog, SyncClass::Fsync).with_custom_types(true);
+            {
+                let db = open_at(&path, o());
+                let trunk = db.connect().unwrap();
+                trunk.execute("CREATE TABLE a(x)").unwrap();
+                trunk.create_branch("b").unwrap();
+                let c = db.connect_named("b").unwrap();
+                if explicit {
+                    c.execute("BEGIN").unwrap();
+                }
+                let r = adv_failing_create_type(&c);
+                if r.is_ok() {
+                    panic!("premise ({case}): the fixture CREATE TYPE must fail");
+                }
+                if c.schema.read().get_btree_table(crate::schema::TURSO_TYPES_TABLE_NAME).is_some() {
+                    failed.push(format!("{case}: after the failed CREATE TYPE ({r:?}) the branch's in-memory schema holds the types table"));
+                }
+                for d in adv_divergence(&c, crate::MAIN_DB_ID, "main") {
+                    failed.push(format!("{case}: after the failure: {d}"));
+                }
+                for sql in ["CREATE TABLE u(y)", "INSERT INTO u VALUES (1)", "CREATE TYPE m3(value text) BASE text"] {
+                    if let Err(e) = c.execute(sql) {
+                        failed.push(format!("{case}: {sql}: {e}"));
+                    }
+                }
+                if explicit {
+                    if let Err(e) = c.execute("COMMIT") {
+                        failed.push(format!("{case}: COMMIT: {e}"));
+                    }
+                }
+                for d in adv_divergence(&c, crate::MAIN_DB_ID, "main") {
+                    failed.push(format!("{case}: after the commit: {d}"));
+                }
+                match adv_rows(&c, "PRAGMA integrity_check") {
+                    Ok(r) if r.len() == 1 && r[0][0] == "ok" => {}
+                    other => failed.push(format!("{case}: integrity_check on the branch: {other:?}")),
+                }
+            }
+            let db = open_at(&path, o());
+            let c = db.connect_named("b").unwrap();
+            let u = adv_rows(&c, "SELECT * FROM u");
+            if !matches!(&u, Ok(r) if r.len() == 1 && r[0] == vec!["1".to_string()]) {
+                failed.push(format!("{case}: after the reopen the branch's `SELECT * FROM u` = {u:?}, want [[1]]"));
+            }
+            let a = adv_rows(&c, "SELECT count(*) FROM a");
+            if !matches!(&a, Ok(r) if r[0][0] == "0") {
+                failed.push(format!("{case}: after the reopen the branch's `SELECT count(*) FROM a` = {a:?}"));
+            }
+        }
+    }
+    assert!(failed.is_empty(), "CLAIM: a failed DDL on a branch left an in-memory schema change: {failed:#?}");
+}
+
+/// ADV-2: an ATTACHED database's CTAS that fails after its ParseSchema, in autocommit and inside
+/// BEGIN; then the attached file must hold what its in-memory schema says.
+#[test]
+fn adv_a_failed_attached_ctas_leaves_no_in_memory_schema_change() {
+    let _g = serial();
+    let mut failed: Vec<String> = Vec::new();
+    for explicit in [false, true] {
+        let case = if explicit { "inside BEGIN" } else { "autocommit" };
+        let dir = tempfile::TempDir::new().unwrap();
+        let main = dir.path().join("m.db");
+        let aux = dir.path().join("aux.db");
+        {
+            let db = open_at(&main, DatabaseOpts::new().with_attach(true));
+            let c = db.connect().unwrap();
+            c.execute(format!("ATTACH '{}' AS aux", aux.display())).unwrap();
+            c.execute("CREATE TABLE aux.src(j)").unwrap();
+            c.execute("INSERT INTO aux.src VALUES ('{')").unwrap();
+            if explicit {
+                c.execute("BEGIN").unwrap();
+                c.execute("CREATE TABLE aux.a(x)").unwrap();
+            }
+            let r = c.execute("CREATE TABLE aux.b AS SELECT json(j) FROM aux.src");
+            if r.is_ok() {
+                panic!("premise ({case}): the CTAS over malformed JSON must fail");
+            }
+            let id = c.get_database_id_by_name("aux").unwrap();
+            for d in adv_divergence(&c, id, "aux") {
+                failed.push(format!("{case}: after the failed CTAS ({r:?}): {d}"));
+            }
+            for sql in ["CREATE TABLE aux.u(y)", "INSERT INTO aux.u VALUES (1)", "CREATE TABLE aux.w(z)", "INSERT INTO aux.w VALUES (2)"] {
+                if let Err(e) = c.execute(sql) {
+                    failed.push(format!("{case}: {sql}: {e}"));
+                }
+            }
+            if explicit {
+                let _ = c.execute("COMMIT").map_err(|e| failed.push(format!("{case}: COMMIT: {e}")));
+            }
+            for d in adv_divergence(&c, id, "aux") {
+                failed.push(format!("{case}: after the commit: {d}"));
+            }
+        }
+        let db = open_at(&aux, DatabaseOpts::new());
+        let c = db.connect().unwrap();
+        for (sql, want) in [("SELECT * FROM u", "1"), ("SELECT * FROM w", "2")] {
+            let r = adv_rows(&c, sql);
+            if !matches!(&r, Ok(r) if r.len() == 1 && r[0] == vec![want.to_string()]) {
+                failed.push(format!("{case}: after the reopen of aux `{sql}` = {r:?}"));
+            }
+        }
+        match adv_rows(&c, "PRAGMA integrity_check") {
+            Ok(r) if r.len() == 1 && r[0][0] == "ok" => {}
+            other => failed.push(format!("{case}: integrity_check of aux: {other:?}")),
+        }
+    }
+    assert!(failed.is_empty(), "CLAIM: a failed attached DDL left an in-memory schema change: {failed:#?}");
+}
+
+/// ADV-3: other DDL failing at run time (unique index over duplicates, ADD COLUMN whose CHECK
+/// fails on an existing row, DROP TABLE of an FK parent with a child row), each in autocommit,
+/// inside BEGIN and inside a SAVEPOINT with no BEGIN; then the file must hold what memory says.
+#[test]
+fn adv_other_failed_ddl_leaves_no_in_memory_schema_change() {
+    let _g = serial();
+    let mut failed: Vec<String> = Vec::new();
+    let setups: [(&str, &[&str], &str); 4] = [
+        ("unique index", &["CREATE TABLE a(x)", "INSERT INTO a VALUES (1), (1)"], "CREATE UNIQUE INDEX ia ON a(x)"),
+        ("add column check", &["CREATE TABLE a(x)", "INSERT INTO a VALUES (1)"], "ALTER TABLE a ADD COLUMN c INTEGER CHECK (c IS NOT NULL)"),
+        ("drop fk parent", &["PRAGMA foreign_keys = ON", "CREATE TABLE a(id INTEGER PRIMARY KEY)", "CREATE TABLE ch(pid REFERENCES a(id))", "INSERT INTO a VALUES (1)", "INSERT INTO ch VALUES (1)"], "DROP TABLE a"),
+        ("ctas", &["CREATE TABLE a(j)", "INSERT INTO a VALUES ('{')"], "CREATE TABLE b AS SELECT json(j) FROM a"),
+    ];
+    for (what, setup, ddl) in setups {
+        for mode in ["autocommit", "BEGIN", "SAVEPOINT"] {
+            let case = format!("{what} / {mode}");
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("o.db");
+            {
+                let db = open_at(&path, DatabaseOpts::new());
+                let c = db.connect().unwrap();
+                for s in setup {
+                    c.execute(*s).unwrap();
+                }
+                match mode {
+                    "BEGIN" => c.execute("BEGIN").unwrap(),
+                    "SAVEPOINT" => c.execute("SAVEPOINT s").unwrap(),
+                    _ => {}
+                }
+                let r = c.execute(ddl);
+                if r.is_ok() {
+                    failed.push(format!("{case}: premise: `{ddl}` succeeded"));
+                    continue;
+                }
+                for d in adv_divergence(&c, crate::MAIN_DB_ID, "main") {
+                    failed.push(format!("{case}: after the failure ({r:?}): {d}"));
+                }
+                if what == "add column check" {
+                    let cols = c.schema.read().get_btree_table("a").map(|t| t.columns().len());
+                    let sql = adv_rows(&c, "SELECT sql FROM sqlite_schema WHERE name = 'a'");
+                    if cols != Some(1) {
+                        failed.push(format!("{case}: after the failed ADD COLUMN the in-memory a has {cols:?} columns, file sql {sql:?}"));
+                    }
+                }
+                for sql in ["CREATE TABLE u(y)", "INSERT INTO u VALUES (1)", "CREATE TABLE w(z)", "INSERT INTO w VALUES (2)"] {
+                    if let Err(e) = c.execute(sql) {
+                        failed.push(format!("{case}: {sql}: {e}"));
+                    }
+                }
+                match mode {
+                    "BEGIN" => {
+                        let _ = c.execute("COMMIT").map_err(|e| failed.push(format!("{case}: COMMIT: {e}")));
+                    }
+                    "SAVEPOINT" => {
+                        let _ = c.execute("RELEASE s").map_err(|e| failed.push(format!("{case}: RELEASE: {e}")));
+                    }
+                    _ => {}
+                }
+                for d in adv_divergence(&c, crate::MAIN_DB_ID, "main") {
+                    failed.push(format!("{case}: after the commit: {d}"));
+                }
+            }
+            let db = open_at(&path, DatabaseOpts::new());
+            let c = db.connect().unwrap();
+            for (sql, want) in [("SELECT * FROM u", "1"), ("SELECT * FROM w", "2")] {
+                let r = adv_rows(&c, sql);
+                if !matches!(&r, Ok(r) if r.len() == 1 && r[0] == vec![want.to_string()]) {
+                    failed.push(format!("{case}: after the reopen `{sql}` = {r:?}"));
+                }
+            }
+            match adv_rows(&c, "PRAGMA integrity_check") {
+                Ok(r) if r.len() == 1 && r[0][0] == "ok" => {}
+                other => failed.push(format!("{case}: integrity_check: {other:?}")),
+            }
+        }
+    }
+    assert!(failed.is_empty(), "CLAIM: a failed DDL left an in-memory schema change: {failed:#?}");
+}
+
+/// ADV-4: a failed CREATE TYPE inside SAVEPOINT s (no BEGIN), then ROLLBACK TO s, then more DDL and
+/// RELEASE; and the same with a DROP TABLE that commits in between.
+#[test]
+fn adv_a_failed_create_type_under_a_named_savepoint() {
+    let _g = serial();
+    let mut failed: Vec<String> = Vec::new();
+    for rollback_to in [false, true] {
+        let case = if rollback_to { "ROLLBACK TO s" } else { "no ROLLBACK TO" };
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("sp.db");
+        let o = || DatabaseOpts::new().with_custom_types(true);
+        {
+            let db = open_at(&path, o());
+            let c = db.connect().unwrap();
+            c.execute("CREATE TABLE a(x)").unwrap();
+            c.execute("SAVEPOINT s").unwrap();
+            c.execute("CREATE TABLE p(q)").unwrap();
+            let r = adv_failing_create_type(&c);
+            assert!(r.is_err(), "premise: the fixture CREATE TYPE fails");
+            if rollback_to {
+                let _ = c.execute("ROLLBACK TO s").map_err(|e| failed.push(format!("{case}: ROLLBACK TO: {e}")));
+            }
+            for d in adv_divergence(&c, crate::MAIN_DB_ID, "main") {
+                failed.push(format!("{case}: after the failure: {d}"));
+            }
+            for sql in ["CREATE TABLE u(y)", "INSERT INTO u VALUES (1)", "CREATE TYPE m3(value text) BASE text", "RELEASE s"] {
+                if let Err(e) = c.execute(sql) {
+                    failed.push(format!("{case}: {sql}: {e}"));
+                }
+            }
+            for d in adv_divergence(&c, crate::MAIN_DB_ID, "main") {
+                failed.push(format!("{case}: after RELEASE: {d}"));
+            }
+        }
+        let db = open_at(&path, o());
+        let c = db.connect().unwrap();
+        let u = adv_rows(&c, "SELECT * FROM u");
+        if !matches!(&u, Ok(r) if r.len() == 1 && r[0] == vec!["1".to_string()]) {
+            failed.push(format!("{case}: after the reopen `SELECT * FROM u` = {u:?}"));
+        }
+        match adv_rows(&c, "PRAGMA integrity_check") {
+            Ok(r) if r.len() == 1 && r[0][0] == "ok" => {}
+            other => failed.push(format!("{case}: integrity_check: {other:?}")),
+        }
+    }
+    assert!(failed.is_empty(), "CLAIM: {failed:#?}");
+}
+
+
+// ===== ADVERSARY 2 (queue a-f review): CDC capture setting across savepoint routes =====
+
+/// ADV-5: the capture setting a rollback must put back, on the routes e19e8907f's BEGIN-time
+/// snapshot does not see: a transaction opened by SAVEPOINT (no BEGIN) then ROLLBACK, and
+/// ROLLBACK TO a savepoint taken before the switch. After each, a write to t must succeed and be
+/// captured in c1 (the table capture was on before the rolled-back switch).
+#[test]
+fn adv_a_rolled_back_cdc_switch_on_savepoint_routes() {
+    let _g = serial();
+    let mut failed: Vec<String> = Vec::new();
+    let routes: [(&str, &[&str]); 5] = [
+        ("SAVEPOINT s; switch; ROLLBACK", &["SAVEPOINT s", "PRAGMA capture_data_changes_conn('full,c2')", "ROLLBACK"]),
+        ("SAVEPOINT s; switch; ROLLBACK TO s; RELEASE s", &["SAVEPOINT s", "PRAGMA capture_data_changes_conn('full,c2')", "ROLLBACK TO s", "RELEASE s"]),
+        ("BEGIN; SAVEPOINT s; switch; ROLLBACK TO s; COMMIT", &["BEGIN", "SAVEPOINT s", "PRAGMA capture_data_changes_conn('full,c2')", "ROLLBACK TO s", "COMMIT"]),
+        ("BEGIN; switch; COMMIT (control)", &["BEGIN", "PRAGMA capture_data_changes_conn('full,c2')", "COMMIT"]),
+        ("BEGIN; switch; ROLLBACK (e19e8907f's route)", &["BEGIN", "PRAGMA capture_data_changes_conn('full,c2')", "ROLLBACK"]),
+    ];
+    for (case, steps) in routes {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("cdc-sp.db"), DatabaseOpts::new());
+        let c = db.connect().unwrap();
+        c.execute("CREATE TABLE t(x)").unwrap();
+        c.execute("PRAGMA capture_data_changes_conn('full,c1')").unwrap();
+        let mut ok = true;
+        for s in steps {
+            if let Err(e) = c.execute(*s) {
+                failed.push(format!("{case}: `{s}`: {e}"));
+                ok = false;
+                break;
+            }
+        }
+        if !ok {
+            continue;
+        }
+        let committed_switch = case.contains("control");
+        let c2_exists = adv_rows(&c, "SELECT count(*) FROM sqlite_schema WHERE name = 'c2'");
+        if let Err(e) = c.execute("INSERT INTO t VALUES (1)") {
+            failed.push(format!("{case}: a write after the route: {e} (c2 in sqlite_schema: {c2_exists:?})"));
+            continue;
+        }
+        let want_table = if committed_switch { "c2" } else { "c1" };
+        match adv_rows(&c, &format!("SELECT count(*) FROM {want_table} WHERE table_name = 't'")) {
+            Ok(r) if r[0][0] == "1" => {}
+            other => failed.push(format!("{case}: {want_table} holds {other:?} changes of t, want 1")),
+        }
+    }
+    assert!(failed.is_empty(), "CLAIM: a rolled-back CDC switch left capture on the wrong table: {failed:#?}");
+}
+
+/// ADV-6 (probe, never fails): a capture table named in another case than it was created in.
+#[test]
+fn adv_probe_cdc_case_variant_name() {
+    let _g = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("cdc-case.db"), DatabaseOpts::new());
+    let c = db.connect().unwrap();
+    c.execute("CREATE TABLE t(x)").unwrap();
+    println!("ADV6 on c1: {:?}", c.execute("PRAGMA capture_data_changes_conn('full,c1')"));
+    println!("ADV6 insert1: {:?}", c.execute("INSERT INTO t VALUES (1)"));
+    println!("ADV6 switch to C1: {:?}", c.execute("PRAGMA capture_data_changes_conn('full,C1')"));
+    println!("ADV6 insert2: {:?}", c.execute("INSERT INTO t VALUES (2)"));
+    println!("ADV6 version rows: {:?}", adv_rows(&c, "SELECT * FROM turso_cdc_version"));
+    println!("ADV6 c1 rows: {:?}", adv_rows(&c, "SELECT change_id, table_name FROM c1"));
+    println!("ADV6 schema: {:?}", adv_rows(&c, "SELECT type, name FROM sqlite_schema"));
+}
+
+/// ADV-7 (probe, never fails): ADD COLUMN whose CHECK an existing row violates. SQLite 3.51.0
+/// refuses it ("CHECK constraint failed"); what does the engine do?
+#[test]
+fn adv_probe_add_column_check_on_existing_rows() {
+    let _g = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("addcol.db"), DatabaseOpts::new());
+    let c = db.connect().unwrap();
+    c.execute("CREATE TABLE a(x)").unwrap();
+    c.execute("INSERT INTO a VALUES (1)").unwrap();
+    println!("ADV7 add column: {:?}", c.execute("ALTER TABLE a ADD COLUMN c INTEGER CHECK (c IS NOT NULL)"));
+    println!("ADV7 rows: {:?}", adv_rows(&c, "SELECT * FROM a"));
+    println!("ADV7 integrity: {:?}", adv_rows(&c, "PRAGMA integrity_check"));
+    println!("ADV7 update same row: {:?}", c.execute("UPDATE a SET x = 2"));
+}
+
+/// ADV-8: a custom type named with each quote form survives a reopen as ONE type: a STRICT column
+/// declared with any spelling of it reads back, and DROP TYPE is refused while the column uses it.
+#[test]
+fn adv_quoted_type_names_survive_a_reopen() {
+    let _g = serial();
+    let mut failed: Vec<String> = Vec::new();
+    let o = || DatabaseOpts::new().with_custom_types(true);
+    for (create, used) in [
+        ("\"m'x\"", "\"m'x\""),
+        ("[m x]", "\"m x\""),
+        ("`Mb`", "mb"),
+        ("\"q\"\"t\"", "\"q\"\"t\""),
+    ] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("qt.db");
+        {
+            let db = open_at(&path, o());
+            let c = db.connect().unwrap();
+            for sql in [
+                format!("CREATE TYPE {create}(value text) BASE text"),
+                format!("CREATE TABLE s(v {used}) STRICT"),
+                "INSERT INTO s VALUES ('hello')".to_string(),
+            ] {
+                if let Err(e) = c.execute(&sql) {
+                    failed.push(format!("{create}: `{sql}`: {e}"));
+                }
+            }
+        }
+        let db = open_at(&path, o());
+        let c = db.connect().unwrap();
+        match adv_rows(&c, "SELECT v FROM s") {
+            Ok(r) if r.len() == 1 && r[0][0] == "hello" => {}
+            other => failed.push(format!("{create}: after the reopen SELECT v FROM s = {other:?}")),
+        }
+        if c.execute(format!("DROP TYPE {create}")).is_ok() {
+            failed.push(format!("{create}: DROP TYPE succeeded while s.v uses it"));
+        }
+        if let Err(e) = c.execute("INSERT INTO s VALUES ('again')") {
+            failed.push(format!("{create}: an insert after the reopen: {e}"));
+        }
+        if let Err(e) = c.execute(format!("CREATE TABLE s2(v {create}) STRICT")) {
+            failed.push(format!("{create}: a second STRICT table after the reopen: {e}"));
+        }
+    }
+    assert!(failed.is_empty(), "CLAIM: {failed:#?}");
+}
+
+/// The reviewer's H5 (adv5's merge probe, made an assertion): a table with an ordinary column named
+/// rowid, a branch that updates one row, deletes another and inserts one that takes the freed real
+/// rowid. The merge must leave the trunk exactly as the branch reads it.
+#[test]
+fn adv_merge_with_a_rowid_column_keeps_every_branch_change() {
+    use super::merge::{MergePolicy, Merger, Validation};
+    let _g = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("mr.db"), opts(false, SyncClass::Fsync));
+    let trunk = db.connect().unwrap();
+    trunk.execute("CREATE TABLE t(rowid INTEGER, v TEXT)").unwrap();
+    trunk.execute("INSERT INTO t(rowid, v) VALUES (3, 'r1'), (1, 'r2'), (2, 'r3')").unwrap();
+    let b = trunk.fork_branch().unwrap();
+    let branch_view = {
+        let c = b.connect().unwrap();
+        c.execute("UPDATE t SET v = 'changed' WHERE _rowid_ = 1").unwrap();
+        c.execute("DELETE FROM t WHERE _rowid_ = 3").unwrap();
+        c.execute("INSERT INTO t(rowid, v) VALUES (9, 'new')").unwrap();
+        adv_rows(&c, "SELECT _rowid_, rowid, v FROM t ORDER BY _rowid_").unwrap()
+    };
+    let mut merger = Merger::new(trunk.clone()).unwrap();
+    let out = merger.merge(b, MergePolicy { validation: Validation::BaseRead, keep_merged: false });
+    let trunk_view = adv_rows(&trunk, "SELECT _rowid_, rowid, v FROM t ORDER BY _rowid_").unwrap();
+    assert!(
+        out.is_ok() && trunk_view == branch_view,
+        "CLAIM: the merge of a table with a column named rowid lost a branch change: merge {:?}, trunk {trunk_view:?}, branch {branch_view:?}",
+        out.as_ref().map(|o| (o.refused.clone(), o.rows_changed))
+    );
+}
