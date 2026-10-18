@@ -14317,3 +14317,71 @@ fn a_quote_led_identifier_is_a_name_not_quoting() {
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// Review wire-quote MED-1: an ENUM's labels and its type name went into the stored CREATE TYPE
+/// text as `'{l}'` and `'invalid input value for enum {type_name}'`, unescaped, and that text is
+/// parsed again at every schema load. A label holding a quote (`a'b`) broke the reload. After a
+/// restart the type still reads and checks its labels.
+#[test]
+fn an_enum_label_or_type_name_holding_a_quote_survives_a_restart() {
+    let dir = Scratch::new("enum-quote");
+    let mut wrong = Vec::new();
+    {
+        let server = Server::start(&dir.db(), &[]);
+        let mut a = server.connect();
+        for sql in ["CREATE TYPE m AS ENUM ('a''b', 'c')", "CREATE TYPE \"m'x\" AS ENUM ('z')"] {
+            if let Some(e) = a.q(sql).error {
+                wrong.push(format!("{sql}: {} {}", e.code, e.message));
+            }
+        }
+    }
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let r = a.q("SELECT 'a''b'::m");
+    if r.error.is_some() || r.rows != vec![vec![Some("a'b".to_string())]] {
+        wrong.push(format!("after a restart, 'a''b'::m: {:?} {:?}", r.rows, r.error));
+    }
+    let r = a.q("SELECT 'z'::\"m'x\"");
+    if r.error.is_some() || r.rows != vec![vec![Some("z".to_string())]] {
+        wrong.push(format!("after a restart, 'z'::\"m'x\": {:?} {:?}", r.rows, r.error));
+    }
+    if a.q("SELECT 'q'::m").error.is_none() {
+        wrong.push("after a restart, 'q'::m is accepted: the label check is gone".to_string());
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Review wire-quote MED-2: a serial column's default `nextval('{table}_{col}_seq')` pasted the
+/// table name unescaped into a string literal, and ALTER stores that text for good. In a table
+/// named `x'y` the stored default no longer parsed. After DROP COLUMN, a reconnect and a restart,
+/// INSERT ... DEFAULT VALUES still takes the serial.
+#[test]
+fn a_serial_in_a_table_named_with_a_quote_survives_alter_and_a_restart() {
+    let dir = Scratch::new("serial-quote");
+    let mut wrong = Vec::new();
+    {
+        let server = Server::start(&dir.db(), &[]);
+        let mut a = server.connect();
+        for sql in ["CREATE TABLE \"x'y\" (id serial, a int)", "ALTER TABLE \"x'y\" DROP COLUMN a"] {
+            if let Some(e) = a.q(sql).error {
+                wrong.push(format!("{sql}: {} {}", e.code, e.message));
+            }
+        }
+        let mut b = server.connect();
+        let r = b.q("INSERT INTO \"x'y\" DEFAULT VALUES");
+        if r.error.is_some() || r.tags.last().map(String::as_str) != Some("INSERT 0 1") {
+            wrong.push(format!("after a reconnect: {:?} {:?}", r.tags, r.error));
+        }
+    }
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let r = a.q("INSERT INTO \"x'y\" DEFAULT VALUES");
+    if r.error.is_some() || r.tags.last().map(String::as_str) != Some("INSERT 0 1") {
+        wrong.push(format!("after a restart: {:?} {:?}", r.tags, r.error));
+    }
+    let r = a.q("SELECT max(id) FROM \"x'y\"");
+    if r.error.is_some() || r.rows != vec![vec![Some("2".to_string())]] {
+        wrong.push(format!("the serial's values: {:?} {:?}", r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}

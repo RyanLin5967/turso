@@ -7102,6 +7102,144 @@ mod tests {
         assert!(wrong.is_empty(), "engine text quoted by hand:\n{}", wrong.join("\n"));
     }
 
+    /// Every string literal of `text` (normal and raw, `r#"..."#`), as written between its quotes,
+    /// with its 1-based line. Char literals and comments are skipped.
+    fn string_literals(text: &str) -> Vec<(usize, String)> {
+        let b = text.as_bytes();
+        let (mut out, mut i) = (Vec::new(), 0);
+        let line = |at: usize| text[..at].matches('\n').count() + 1;
+        while i < b.len() {
+            match b[i] {
+                b'/' if b.get(i + 1) == Some(&b'/') => {
+                    i += text[i..].find('\n').unwrap_or(text.len() - i);
+                }
+                b'/' if b.get(i + 1) == Some(&b'*') => {
+                    i += text[i..].find("*/").map_or(text.len() - i, |e| e + 2);
+                }
+                b'\'' => {
+                    // A char literal ('x', '\'', '\u{..}') or a lifetime ('a): skip either.
+                    let rest = &text[i + 1..];
+                    i += 1 + match rest.find('\'') {
+                        Some(e) if e <= 10 && !rest[..e].contains(char::is_whitespace) => e + 1,
+                        _ => 0,
+                    };
+                }
+                b'r' if (b.get(i + 1) == Some(&b'"') || b.get(i + 1) == Some(&b'#'))
+                    && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_')) =>
+                {
+                    let hashes = text[i + 1..].bytes().take_while(|&c| c == b'#').count();
+                    let open = i + 1 + hashes;
+                    if b.get(open) != Some(&b'"') {
+                        i += 1;
+                        continue;
+                    }
+                    let close = format!("\"{}", "#".repeat(hashes));
+                    let end = text[open + 1..].find(&close).map_or(text.len(), |e| open + 1 + e);
+                    out.push((line(i), text[open + 1..end].to_string()));
+                    i = end + close.len();
+                }
+                b'"' => {
+                    let mut e = i + 1;
+                    while e < b.len() && b[e] != b'"' {
+                        e += if b[e] == b'\\' { 2 } else { 1 };
+                    }
+                    out.push((line(i), text[i + 1..e.min(b.len())].to_string()));
+                    i = e + 1;
+                }
+                _ => i += 1,
+            }
+        }
+        out
+    }
+
+    /// Review wire-quote MED-4: the format!-only, keyword-led scan missed every planted evasion
+    /// and never read postgres/parser. This one reads every string literal (format!, format_args!,
+    /// write!, raw strings, plain literals later concatenated) of the frontend AND the translator,
+    /// outside test modules and the quoting functions. A literal is engine text when, past blanks,
+    /// `\n` and the SQLite marker, it starts with an SQL keyword in any case or with a clause
+    /// fragment (` WHERE`, ` AND`, ...); such a literal must not hold a quote character next to a
+    /// placeholder of any form (`'{x}'`, `'%{x}%'`, `\"{s}.{t}\"`, `{x:?}`). And the translator
+    /// builds a string literal only through sql_string (no `Literal::String(format!(` or of a
+    /// literal). BLIND SPOTS (stated, not covered): a quote held in a variable (`{q}{x}{q}`), a
+    /// placeholder spliced by `.replace`, and text assembled from parts none of which is SQL-led.
+    #[test]
+    fn engine_text_from_any_literal_is_quoted_by_the_one_quoting_function() {
+        const KEYWORDS: [&str; 22] = [
+            "SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ATTACH", "DETACH", "PRAGMA",
+            "ALTER", "SAVEPOINT", "RELEASE", "ROLLBACK", "WITH", "BEGIN", "COMMIT", "VACUUM",
+            "REINDEX", "VALUES", "SET", "COPY", "CASE",
+        ];
+        const FRAGMENTS: [&str; 10] = [
+            " WHERE", " AND ", " OR ", " FROM", " AS ", " IN (", " VALUES", " LIKE", " ON ", "(",
+        ];
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files: Vec<_> = std::fs::read_dir(root.join("../frontend"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("rs"))
+            .collect();
+        files.push(root.join("../parser/translator.rs"));
+        let mut wrong = Vec::new();
+        let mut seen = 0;
+        for path in &files {
+            let mut text = strip_test_modules(&std::fs::read_to_string(path).unwrap());
+            for exempt in [
+                "pub(crate) fn quote_ident(",
+                "pub(crate) fn quote_literal(",
+                "pub fn sql_string(",
+            ] {
+                if let Some(start) = text.find(exempt) {
+                    let end = start + text[start..].find("\n}\n").expect("its end");
+                    let kept = "\n".repeat(text[start..end].matches('\n').count());
+                    text.replace_range(start..end, &kept);
+                }
+            }
+            for (line, lit) in string_literals(&text) {
+                seen += 1;
+                let head = lit
+                    .trim_start_matches("\\n")
+                    .trim_start_matches("{SQLITE_TEXT_MARKER}")
+                    .trim_start_matches("/* turso:sqlite */ ")
+                    .trim_start();
+                let upper = head.to_ascii_uppercase();
+                let led = KEYWORDS.iter().any(|k| {
+                    upper.starts_with(k)
+                        && !upper[k.len()..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+                }) || FRAGMENTS.iter().any(|f| lit.starts_with(f));
+                let quoted_hole = ["'", "\\\"", "`"].iter().any(|q| {
+                    lit.match_indices(&format!("{q}{{")).any(|(i, _)| !lit[i + q.len()..].starts_with("{{"))
+                        || lit.match_indices(&format!("}}{q}")).any(|(i, _)| i == 0 || &lit[i - 1..i] != "}")
+                        || lit.contains(&format!("{q}%{{"))
+                });
+                // An error message reads like SQL but is text for the client: PostgreSQL's
+                // message form (`ALTER TABLE ADD CONSTRAINT: table "t" ...`, a colon BEFORE any
+                // quoted placeholder) or one of its phrases. A colon after the hole does not exempt.
+                let first_hole = ["'{", "\\\"{", "`{", "'%{"]
+                    .iter()
+                    .filter_map(|h| lit.find(h))
+                    .min()
+                    .unwrap_or(lit.len());
+                let message = lit.find(": ").is_some_and(|c| c < first_hole)
+                    || ["is not supported", "violates ", "does not exist", "cannot ", " was not ", " was created "]
+                        .iter()
+                        .any(|p| lit.contains(p));
+                if led && quoted_hole && !message {
+                    wrong.push(format!("{}:{line}: {lit}", path.display()));
+                }
+            }
+            if path.ends_with("translator.rs") {
+                for (n, l) in text.lines().enumerate() {
+                    let t = l.trim_start();
+                    if l.contains("Literal::String(format!(") || l.contains("Literal::String(\"") {
+                        wrong.push(format!("{}:{}: {t}", path.display(), n + 1));
+                    }
+                }
+            }
+        }
+        assert!(seen > 1000, "premise: the scan read {seen} string literals");
+        assert!(wrong.is_empty(), "engine text quoted by hand:\n{}", wrong.join("\n"));
+    }
+
     /// Review wire-line3 LOW-6: matching_close skips an escaped-quote char literal whole (it read
     /// the closing quote of `'\''` as a new opener) and nested block comments.
     #[test]
