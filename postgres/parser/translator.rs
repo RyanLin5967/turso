@@ -1311,15 +1311,24 @@ impl PostgreSQLTranslator {
 
         // This server builds btree indexes only: any other access method is refused, never built
         // as a btree under the name the client gave it (lead ruling 2026-10-18). libpg_query names
-        // the default, so a CREATE INDEX with no USING is "btree".
-        if !idx.access_method.is_empty() && !idx.access_method.eq_ignore_ascii_case("btree") {
-            return Err(ParseError::ParseError(SqlErrorMessage::classified(
-                SqlErrorKind::FeatureNotSupported,
-                format!(
-                    "access method \"{}\" is not supported: this server builds btree indexes only",
-                    idx.access_method
-                ),
-            )));
+        // the default, so a CREATE INDEX with no USING is "btree". The name is PostgreSQL's,
+        // exactly (an unquoted one arrives folded): one of its other methods is 0A000 here, and a
+        // name it has no method of ("BTREE" quoted, nosuch) is its 42704 (wire-rev-uw2 LOW;
+        // recorded, pg18-rev-uw2-lows.out).
+        let method = idx.access_method.as_str();
+        if !method.is_empty() && method != "btree" {
+            let known = matches!(method, "hash" | "gist" | "gin" | "spgist" | "brin");
+            return Err(ParseError::ParseError(if known {
+                SqlErrorMessage::classified(
+                    SqlErrorKind::FeatureNotSupported,
+                    format!("access method \"{method}\" is not supported: this server builds btree indexes only"),
+                )
+            } else {
+                SqlErrorMessage::classified(
+                    SqlErrorKind::UndefinedObject,
+                    format!("access method \"{method}\" does not exist"),
+                )
+            }));
         }
         let relation = idx
             .relation
