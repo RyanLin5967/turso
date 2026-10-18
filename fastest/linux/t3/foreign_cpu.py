@@ -13,6 +13,9 @@ where class is
           started with setsid keep their environment, so they stay inside);
   kernel  a kernel thread (no command line);
   foreign everything else, the sampler itself excluded.
+The first time a foreign pid is recorded, an `#owner` row names it: pid, uid, user, and the uwrun run it belongs to
+(for this account's processes, the <NAME> of the <prefix>-runs/<NAME>/ its cwd is under; "-" otherwise). Owners only
+name busy-host evidence; they never change a verdict, and our own other runs are foreign like anyone's.
 Each tick also writes a `#tick` row (t, foreign_sum, kernel_sum, sut_sum), so a tick in which nothing
 foreign ran is on the record as a zero, not as a missing row.
 
@@ -36,6 +39,32 @@ import sys
 import time
 
 HZ = os.sysconf("SC_CLK_TCK")
+
+
+RUN_RE = re.compile(r"/[A-Za-z0-9_.-]+-runs/([A-Za-z0-9_-]+)(?:/|$)")
+
+
+def owner_of(pid):
+    """(uid, user, run) of PID, or None when it is gone. RUN is the uwrun run the process belongs to: for a process of
+    THIS account, the <NAME> of the <prefix>-runs/<NAME>/ its cwd is under (uwrun's host-local layout, the run dir
+    under /var/tmp or /dev/shm), else "-". Another user's cwd cannot be read, so their run is always "-"."""
+    import pwd
+    try:
+        uid = os.stat(f"/proc/{pid}").st_uid
+    except OSError:
+        return None
+    try:
+        user = pwd.getpwuid(uid).pw_name
+    except KeyError:
+        user = str(uid)
+    run = "-"
+    if uid == os.getuid():
+        try:
+            m = RUN_RE.search(os.readlink(f"/proc/{pid}/cwd"))
+            run = m.group(1) if m else "-"
+        except OSError:
+            pass
+    return uid, user, run
 
 
 def read_procs(cell):
@@ -96,6 +125,7 @@ def sample(path, cell, interval, stop_file, max_s):
     t0 = time.monotonic()
     prev = read_procs(cell)
     prev_t = t0
+    owned = set()
     with open(path, "w") as f:
         f.write(f"#start\t{time.time():.3f}\tcell={cell}\tinterval={interval}\tload={os.getloadavg()}\n")
         while True:
@@ -111,6 +141,11 @@ def sample(path, cell, interval, stop_file, max_s):
                     continue
                 pct = 100.0 * used / HZ / dt
                 sums[cls] += pct
+                if cls == "foreign" and pid not in owned:
+                    owned.add(pid)
+                    o = owner_of(pid)
+                    if o:
+                        f.write(f"#owner\t{pid}\t{o[0]}\t{o[1]}\t{o[2]}\n")
                 f.write(f"{now - t0:.3f}\t{pid}\t{comm}\t{pct:.1f}\t{cls}\n")
             f.write(f"#tick\t{now - t0:.3f}\t{sums['foreign']:.1f}\t{sums['kernel']:.1f}\t{sums['sut']:.1f}\n")
             f.flush()
@@ -129,10 +164,12 @@ def busy_evidence(path, exclude=(), interval_default=1.0):
     whose pid is not in EXCLUDE (the self-test's own tree) and that the record shows above 50% for 5 s or more (rule
     2's own run-length). A ps CPU% is a lifetime average and proves nothing about the window (the reviewer's idle
     burner read 57-94%). Returns ["comm pid N", ...]; an empty list is no evidence."""
-    per, interval = {}, interval_default
+    per, interval, owners = {}, interval_default, {}
     for line in open(path):
         p = line.rstrip("\n").split("\t")
-        if p[0] == "#start":
+        if p[0] == "#owner" and len(p) == 5:
+            owners[int(p[1])] = (p[3], p[4])
+        elif p[0] == "#start":
             for x in p[1:]:
                 if x.startswith("interval="):
                     interval = float(x.split("=")[1])
@@ -164,7 +201,14 @@ def busy_evidence(path, exclude=(), interval_default=1.0):
         if ticks and over / len(ticks) > 0.05:
             top = sorted(per.items(), key=lambda kv: -sum(p for _t, p in kv[1]))[:4]
             out = [f"{comm} pid {pid}" for (pid, comm), _r in top]
-    return out
+    # who: each named process's owner from the sampler's #owner rows (the lead's 2026-10-18 order), never guessed
+    def who(e):
+        pid = int(e.rsplit(" pid ", 1)[1])
+        if pid not in owners:
+            return f"{e} (owner unrecorded)"
+        user, run = owners[pid]
+        return f"{e} (user {user}, our run {run})" if run != "-" else f"{e} (user {user})"
+    return [who(e) for e in out]
 
 
 def burners_ran(v, burners, mine):
