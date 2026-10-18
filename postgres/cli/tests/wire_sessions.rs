@@ -14385,3 +14385,38 @@ fn a_serial_in_a_table_named_with_a_quote_survives_alter_and_a_restart() {
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// Found by the first host run of the review wire-quote MED-2 red: with no quote anywhere, a serial
+/// column's table no longer opened after ALTER TABLE ... DROP COLUMN. ALTER stores the table as
+/// SQLite text with the default as given, `DEFAULT nextval ('xy_id_seq')`, and SQLite's grammar
+/// takes only `DEFAULT (expr)` for a call, so every later open failed with near "(". Also INSERT
+/// ... DEFAULT VALUES was refused ("INSERT missing VALUES or SELECT").
+#[test]
+fn a_serial_survives_drop_column_and_a_restart() {
+    let dir = Scratch::new("serial-alter");
+    let mut wrong = Vec::new();
+    {
+        let server = Server::start(&dir.db(), &[]);
+        let mut a = server.connect();
+        for sql in [
+            "CREATE TABLE xy (id serial, a int)",
+            "INSERT INTO xy DEFAULT VALUES",
+            "ALTER TABLE xy DROP COLUMN a",
+        ] {
+            if let Some(e) = a.q(sql).error {
+                wrong.push(format!("{sql}: {} {}", e.code, e.message));
+            }
+        }
+    }
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let r = a.q("INSERT INTO xy DEFAULT VALUES");
+    if r.error.is_some() || r.tags.last().map(String::as_str) != Some("INSERT 0 1") {
+        wrong.push(format!("after a restart: {:?} {:?}", r.tags, r.error));
+    }
+    let r = a.q("SELECT id FROM xy ORDER BY id");
+    if r.error.is_some() || r.rows != vec![vec![Some("1".to_string())], vec![Some("2".to_string())]] {
+        wrong.push(format!("the serial's values: {:?} {:?}", r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
