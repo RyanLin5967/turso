@@ -14928,6 +14928,74 @@ fn copy_from_a_server_file_needs_the_servers_grant() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-uw2 MED, the COPY grant's check-then-read race: the grant was checked on the file's
+/// real path, then the file was opened again by the name the client gave, so a link inside the
+/// granted directory that a local writer flips between a file in it and one outside loaded the
+/// outside file (the reviewer: 1132 of 2673 COPYs in 20 s). The file opened is the file judged:
+/// a COPY through the flipping link loads the inside file or is refused 42501, never the outside
+/// one, whatever the timing.
+#[test]
+fn a_copy_through_a_flipping_link_never_reads_outside_the_grant() {
+    let dir = Scratch::new("copy-race");
+    let inside = dir.0.join("granted");
+    std::fs::create_dir_all(&inside).unwrap();
+    let real = inside.join("real.tsv");
+    std::fs::write(&real, "1\n").unwrap();
+    let outside = dir.0.join("outside.tsv");
+    std::fs::write(&outside, "3\n").unwrap();
+    let link = inside.join("flip.tsv");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let grant = inside.to_string_lossy().to_string();
+    let server = Server::start(&dir.db(), &["--copy-from-dir", &grant]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE t(x int)").ok("t");
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flipper = {
+        let (stop, link, real, outside) = (stop.clone(), link.clone(), real.clone(), outside.clone());
+        let tmp = inside.join("flip.tmp");
+        std::thread::spawn(move || {
+            let mut flips = 0u64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let target = if flips % 2 == 0 { &outside } else { &real };
+                let _ = std::fs::remove_file(&tmp);
+                std::os::unix::fs::symlink(target, &tmp).unwrap();
+                std::fs::rename(&tmp, &link).unwrap();
+                flips += 1;
+            }
+            flips
+        })
+    };
+    let (mut loaded, mut refused, mut other) = (0, 0, Vec::new());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while loaded + refused < 2000 && Instant::now() < deadline {
+        let r = a.q(&format!("COPY t FROM '{}'", link.display()));
+        match &r.error {
+            None => loaded += 1,
+            Some(e) if e.code == "42501" => refused += 1,
+            Some(e) => {
+                if other.len() < 5 {
+                    other.push(format!("{} {}", e.code, e.message));
+                }
+            }
+        }
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let flips = flipper.join().unwrap();
+    let mut wrong = Vec::new();
+    let r = a.q("SELECT count(*) FROM t WHERE x = 3");
+    if r.rows != vec![vec![Some("0".to_string())]] {
+        wrong.push(format!("rows loaded from the file outside the grant: {:?} {:?}", r.rows, r.error));
+    }
+    // The race was run, not skipped: COPYs both loaded and were refused while the link flipped.
+    if loaded == 0 || refused == 0 || flips < 100 {
+        wrong.push(format!("the race did not run: {loaded} loaded, {refused} refused, {flips} flips"));
+    }
+    if !other.is_empty() {
+        wrong.push(format!("other answers: {other:?}"));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// Lead ruling 2026-10-18 (found answering the engine's dialect question 2): CREATE INDEX ...
 /// USING gin, hash or any access method but btree silently built a btree, so the client believed
 /// it had an index of a kind it does not have (pg_indexes then said btree). Refused (0A000), as
