@@ -946,6 +946,81 @@ mod tests {
         assert!(!helper.contains("/* client */"), "CLAIM: RENAME or ALTER marked the engine's row as the dialect's: {rows}");
     }
 
+    /// The frontend-context slot (dialect design REVISION 1, fastest-wire's M4): set once, read back as the
+    /// frontend's own type, refused on a second set, and gone once the frontend drops its session (the
+    /// connection holds it weakly). A new API, so no red at a base: the claims are pinned here.
+    #[test]
+    fn a_frontend_context_is_set_once_and_held_weakly() {
+        struct Session(u32);
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(&io, "frontend-context.db", Arc::new(SqliteDialect)).unwrap();
+        let c = db.connect().unwrap();
+        assert!(c.frontend_context().is_none(), "CLAIM: a fresh connection has a frontend context");
+        let session: std::sync::Arc<dyn std::any::Any + Send + Sync> = std::sync::Arc::new(Session(7));
+        c.set_frontend_context(std::sync::Arc::downgrade(&session)).unwrap();
+        let got = c.frontend_context().expect("CLAIM: the context set is not read back");
+        assert_eq!(got.downcast_ref::<Session>().map(|s| s.0), Some(7), "CLAIM: the context is not the frontend's own type");
+        drop(got);
+        let other: std::sync::Arc<dyn std::any::Any + Send + Sync> = std::sync::Arc::new(Session(8));
+        assert!(c.set_frontend_context(std::sync::Arc::downgrade(&other)).is_err(), "CLAIM: a second set was not refused");
+        assert_eq!(
+            c.frontend_context().and_then(|g| g.downcast_ref::<Session>().map(|s| s.0)),
+            Some(7),
+            "CLAIM: a refused second set replaced the first"
+        );
+        drop(session);
+        assert!(c.frontend_context().is_none(), "CLAIM: the connection kept the dropped session alive");
+    }
+
+    /// R4 (review dialect MED-3, structural half): every entry gives its statement the kind of the text it
+    /// was given, and the statement keeps it (it defaulted to Client in `execute_text`). Type-enforced since
+    /// a9afc6c0c (no constructor without a kind); pinned here per entry.
+    #[test]
+    fn every_entry_s_statement_carries_the_kind_of_its_text() {
+        use crate::connection::{EngineSql, Origin, SqlKind, SqlSource};
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(&io, "kinds.db", Arc::new(SqliteDialect)).unwrap();
+        let c = db.connect().unwrap();
+        let source = |s: &crate::Statement| s.kind().source().clone();
+        let mut wrong = Vec::new();
+        let mut check = |entry: &str, got: crate::Result<SqlSource>, want: SqlSource| match got {
+            Ok(g) if g == want => {}
+            other => wrong.push(format!("{entry}: {other:?}, want {want:?}")),
+        };
+        check("prepare", c.prepare("SELECT 1").map(|s| source(&s)), SqlSource::Client);
+        check("prepare_sqlite", c.prepare_sqlite("SELECT 1").map(|s| source(&s)), SqlSource::Frontend);
+        check("prepare_internal", c.prepare_internal("SELECT 1").map(|s| source(&s)), SqlSource::Frontend);
+        check("prepare_engine", c.prepare_engine(EngineSql::new("SELECT 1"), Origin::Root).map(|s| source(&s)), SqlSource::Engine);
+        check("prepare_with(client)", c.prepare_with("SELECT 1", SqlKind::client(), Origin::Root).map(|s| source(&s)), SqlSource::Client);
+        check("prepare_with(frontend)", c.prepare_with("SELECT 1", SqlKind::frontend(), Origin::Nested).map(|s| source(&s)), SqlSource::Frontend);
+        check("consume_stmt", c.consume_stmt("SELECT 1").map(|o| source(&o.expect("a statement").0)), SqlSource::Client);
+        check("query", c.query("SELECT 1").map(|o| source(&o.expect("a statement"))), SqlSource::Client);
+        assert!(wrong.is_empty(), "CLAIM: an entry's statement does not carry its text's kind: {wrong:#?}");
+    }
+
+    /// R8 (dialect design R8, review dialect LOW-6): an engine statement keeps its kind through a re-prepare,
+    /// so a re-prepared engine statement never reaches a strict dialect's parser. Under ClientOnlyDialect an
+    /// engine SELECT is prepared, a keyed setting changes (the statement must re-prepare: premise), and it
+    /// runs again. A guard: the class was fixed at 7b5093ef0 (the kind on the Statement) and is
+    /// type-enforced since a9afc6c0c.
+    #[test]
+    fn an_engine_statement_keeps_its_kind_through_a_reprepare() {
+        use crate::connection::{EngineSql, Origin};
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(&io, "reprepare-kind.db", Arc::new(ClientOnlyDialect)).unwrap();
+        let c = db.connect().unwrap();
+        c.execute("client: CREATE TABLE t(x INTEGER)").unwrap();
+        c.execute("client: INSERT INTO t VALUES (1)").unwrap();
+        let mut s = c.prepare_engine(EngineSql::new("SELECT x FROM t"), Origin::Root).unwrap();
+        assert_eq!(s.run_collect_rows().unwrap().len(), 1, "premise: the engine SELECT ran");
+        s.reset().unwrap();
+        let reprepares0 = s.metrics().reprepares;
+        c.set_cache_size(c.get_cache_size() + 1);
+        let rows = s.run_collect_rows();
+        assert!(s.metrics().reprepares > reprepares0, "premise: the statement was re-prepared");
+        assert!(matches!(&rows, Ok(r) if r.len() == 1), "CLAIM: a re-prepared engine statement reached the client parser: {rows:?}");
+    }
+
     /// A dialect that parks one translation in the middle: resolving the function `park_here()`
     /// signals `parked` and waits for `go`, recording whether `go` (not the bound) ended the park
     /// (review c42b MED-4).

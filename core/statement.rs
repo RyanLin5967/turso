@@ -421,6 +421,11 @@ impl Statement {
         }
     }
 
+    /// What this statement's text is (its syntax and source), fixed where the text was made.
+    pub(crate) fn kind(&self) -> &crate::connection::SqlKind {
+        &self.kind
+    }
+
     /// The options this statement was prepared under, kept for its re-prepares.
     pub(crate) fn with_prepare_options(mut self, prepare_options: PrepareOptions) -> Self {
         self.prepare_options = prepare_options;

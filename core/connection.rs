@@ -506,6 +506,11 @@ pub struct Connection {
     /// (`maybe_update_schema`; wire-rev-line M1). Versions only grow, so the sum moves whenever
     /// any one does. `u64::MAX`: not read yet.
     pub(super) attached_schemas_seen: AtomicU64,
+    /// A frontend's per-connection context (its session), set once when the frontend makes the
+    /// session, read with no lock and no allocation (fastest-wire's M4: the wire found its session
+    /// for a connection through a global mutex-guarded map on the branch-switch path). Weak, so the
+    /// connection never keeps the session alive.
+    pub(super) frontend_context: std::sync::OnceLock<std::sync::Weak<dyn std::any::Any + Send + Sync>>,
     /// Whether to automatically commit transaction
     pub(crate) auto_commit: AtomicBool,
     pub(super) transaction_state: AtomicTransactionState,
@@ -3323,6 +3328,20 @@ impl Connection {
         let pragma = format!("PRAGMA {pragma_name} = {pragma_value}");
         let mut stmt = self.prepare_engine(EngineSql::new(pragma), Origin::Root)?;
         stmt.run_collect_rows()
+    }
+
+    /// Attach a frontend's context to this connection, once (the session that owns it). A second
+    /// set is refused, never overwritten.
+    pub fn set_frontend_context(&self, context: std::sync::Weak<dyn std::any::Any + Send + Sync>) -> Result<()> {
+        self.frontend_context.set(context).map_err(|_| {
+            LimboError::InvalidArgument("this connection's frontend context is already set".to_string())
+        })
+    }
+
+    /// The frontend's context, if one was set and is still alive: an atomic load and a refcount
+    /// increment, with no lock and no allocation. A frontend downcasts it to its own session type.
+    pub fn frontend_context(&self) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
+        self.frontend_context.get().and_then(std::sync::Weak::upgrade)
     }
 
     /// The SQL dialect of the database this connection belongs to.
