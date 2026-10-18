@@ -15329,6 +15329,94 @@ fn add_column_checks_its_new_check_against_every_existing_row() {
     assert!(failed.is_empty(), "CLAIM: ADD COLUMN answers as SQLite does over existing rows: {failed:#?}");
 }
 
+/// L5's module (queue a-f review): an ordinary writable virtual table with no rows, so a write to
+/// it runs VBegin, which looks the table up in the connection's registry by id.
+#[derive(Debug, turso_ext::VTabModuleDerive, Default)]
+struct L5VTabModule;
+
+#[derive(Debug)]
+struct L5Table;
+
+#[derive(Debug)]
+struct L5Cursor;
+
+impl turso_ext::VTabModule for L5VTabModule {
+    type Table = L5Table;
+    const VTAB_KIND: turso_ext::VTabKind = turso_ext::VTabKind::VirtualTable;
+    const NAME: &'static str = "l5_vtab";
+    const READONLY: bool = false;
+
+    fn create(_args: &[turso_ext::Value]) -> Result<(String, Self::Table), turso_ext::ResultCode> {
+        Ok(("CREATE TABLE x (v INTEGER)".to_string(), L5Table))
+    }
+}
+
+impl turso_ext::VTable for L5Table {
+    type Cursor = L5Cursor;
+    type Error = String;
+
+    fn open(&self, _conn: Option<Arc<turso_ext::Connection>>) -> Result<Self::Cursor, Self::Error> {
+        Ok(L5Cursor)
+    }
+
+    fn insert(&mut self, _args: &[turso_ext::Value]) -> Result<i64, Self::Error> {
+        Ok(1)
+    }
+}
+
+impl turso_ext::VTabCursor for L5Cursor {
+    type Error = String;
+
+    fn filter(&mut self, _args: &[turso_ext::Value], _idx_info: Option<(&str, i32)>) -> turso_ext::ResultCode {
+        turso_ext::ResultCode::EOF
+    }
+
+    fn rowid(&self) -> i64 {
+        0
+    }
+
+    fn column(&self, _idx: u32) -> Result<turso_ext::Value, Self::Error> {
+        Ok(turso_ext::Value::null())
+    }
+
+    fn eof(&self) -> bool {
+        true
+    }
+
+    fn next(&mut self) -> turso_ext::ResultCode {
+        turso_ext::ResultCode::EOF
+    }
+}
+
+/// L5 (queue a-f review, by reading): DROP TABLE of a virtual table inside a transaction that is
+/// then rolled back. The rollback restores the schema's virtual table, so a write to it after the
+/// rollback must work as it did before the DROP (SQLite reconnects the module): before the fix
+/// VDestroy had removed the table from the connection's registry, and VBegin panicked ("Could not
+/// find virtual table for VBegin").
+#[test]
+fn a_rolled_back_drop_of_a_virtual_table_leaves_it_writable() {
+    let _g = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("l5.db"), DatabaseOpts::new());
+    let c = db.connect().unwrap();
+    c.register_static_extension(|api| unsafe {
+        L5VTabModule::register_L5VTabModule(api);
+    });
+    c.execute("CREATE VIRTUAL TABLE vt USING l5_vtab").unwrap();
+    c.execute("INSERT INTO vt VALUES (1)").expect("premise: a write to the virtual table works");
+    c.execute("BEGIN").unwrap();
+    c.execute("DROP TABLE vt").unwrap();
+    c.execute("ROLLBACK").unwrap();
+    let in_schema = adv_rows(&c, "SELECT count(*) FROM sqlite_schema WHERE name = 'vt'");
+    assert_eq!(in_schema.as_ref().ok().map(|r| r[0][0].as_str()), Some("1"), "premise: the rollback kept vt: {in_schema:?}");
+    let write = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| c.execute("INSERT INTO vt VALUES (2)")));
+    match write {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => panic!("CLAIM: a write to vt after the rolled-back DROP works: {e}"),
+        Err(_) => panic!("CLAIM: a write to vt after the rolled-back DROP works: it panicked"),
+    }
+}
+
 /// ADV-8: a custom type named with each quote form survives a reopen as ONE type: a STRICT column
 /// declared with any spelling of it reads back, and DROP TYPE is refused while the column uses it.
 #[test]
