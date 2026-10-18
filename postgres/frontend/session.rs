@@ -1743,6 +1743,18 @@ pub(crate) fn session_translation(
     let unmapped = first.unmapped_cast_types();
     if !unmapped.is_empty() {
         let schema = pg_conn.conn.current_schema();
+        // A cast to a type neither the engine nor PostgreSQL has is 42704, as there; it was left
+        // to the operand's own type, so CREATE TABLE AS and DEFAULT ran (wire-rev-uw2 LOW;
+        // recorded, pg18-rev-uw2-casts.out). A PostgreSQL type this frontend does not model keeps
+        // the old pass-through.
+        if let Some(missing) = unmapped.iter().find(|name| {
+            schema.get_type_def_unchecked(name).is_none() && !is_postgresql_type_name(name)
+        }) {
+            return Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
+                SqlErrorKind::UndefinedObject,
+                format!("type \"{missing}\" does not exist"),
+            )));
+        }
         let known: std::collections::HashSet<String> = unmapped
             .into_iter()
             .filter(|name| schema.get_type_def_unchecked(name).is_some())
@@ -1756,6 +1768,35 @@ pub(crate) fn session_translation(
     }
     reject_catalog_dml(translated.cmd.stmt())?;
     Ok(translated)
+}
+
+/// PostgreSQL 18.6's pg_catalog type names but the pg_* ones (recorded: pg18-rev-uw2-casts.out,
+/// 98 of the 473, array types left out), for [`is_postgresql_type_name`].
+const PG_CATALOG_TYPE_NAMES: &[&str] = &[
+    "aclitem", "any", "anyarray", "anycompatible", "anycompatiblearray",
+    "anycompatiblemultirange", "anycompatiblenonarray", "anycompatiblerange", "anyelement",
+    "anyenum", "anymultirange", "anynonarray", "anyrange", "bit", "bool", "box", "bpchar",
+    "bytea", "char", "cid", "cidr", "circle", "cstring", "date", "datemultirange", "daterange",
+    "event_trigger", "fdw_handler", "float4", "float8", "gtsvector", "index_am_handler", "inet",
+    "int2", "int2vector", "int4", "int4multirange", "int4range", "int8", "int8multirange",
+    "int8range", "internal", "interval", "json", "jsonb", "jsonpath", "language_handler",
+    "line", "lseg", "macaddr", "macaddr8", "money", "name", "numeric", "nummultirange",
+    "numrange", "oid", "oidvector", "path", "point", "polygon", "record", "refcursor",
+    "regclass", "regcollation", "regconfig", "regdictionary", "regnamespace", "regoper",
+    "regoperator", "regproc", "regprocedure", "regrole", "regtype", "table_am_handler", "text",
+    "tid", "time", "timestamp", "timestamptz", "timetz", "trigger", "tsm_handler",
+    "tsmultirange", "tsquery", "tsrange", "tstzmultirange", "tstzrange", "tsvector",
+    "txid_snapshot", "unknown", "uuid", "varbit", "varchar", "void", "xid", "xid8", "xml"
+];
+
+/// Whether `name` (lower case, as a cast target's last part) may be a PostgreSQL type: one of
+/// pg_catalog's (an array type `_x` by its element), any pg_* name (pg_catalog's own row types and
+/// pg_lsn-like types, not listed), or one of information_schema's domains.
+fn is_postgresql_type_name(name: &str) -> bool {
+    let base = name.strip_prefix('_').unwrap_or(name);
+    PG_CATALOG_TYPE_NAMES.contains(&base)
+        || base.starts_with("pg_")
+        || matches!(base, "cardinal_number" | "character_data" | "sql_identifier" | "time_stamp" | "yes_or_no")
 }
 
 /// The engine's re-prepare of a statement this session prepared: through
