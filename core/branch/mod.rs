@@ -1587,8 +1587,12 @@ impl Database {
         self.branches.checkpoint_fuzzy_now()
     }
 
-    /// Make a fuzzy checkpoint in flight wait at `stage`: 2, its rows written and not committed;
-    /// 3, committed and not installed. Any other value (0) releases it.
+    /// Make a fuzzy checkpoint in flight wait at `stage` until this is called with another value
+    /// (0 releases it): `CHECKPOINT_HOLD_BEFORE_COMMIT`, its rows written and not committed, or
+    /// `CHECKPOINT_HOLD_AFTER_COMMIT`, committed and not installed, in every build; test builds
+    /// have more stages. `branch_checkpoint_held` reads `stage | CHECKPOINT_HOLD_ARRIVED` once the
+    /// flight waits there. The hook is one atomic load in the checkpoint's own writer thread,
+    /// never on a create's or a commit's acknowledgement path.
     #[doc(hidden)]
     pub fn branch_checkpoint_hold(&self, stage: u8) {
         self.branches.checkpoint_hold(stage);
@@ -1813,6 +1817,18 @@ mod tests {
         assert_ne!(BranchId::TRUNK, BranchId(1));
     }
 }
+
+/// `Database::branch_checkpoint_hold`'s stage in every build: a fuzzy checkpoint's flight waits
+/// with its rows written and not committed, so a frontend's test (fastest-wire's server-side red
+/// for review C42-M1) can hold one flight in the air and see a client's CHECKPOINT end at its bound.
+#[doc(hidden)]
+pub const CHECKPOINT_HOLD_BEFORE_COMMIT: u8 = store::HOLD_BEFORE_COMMIT;
+/// `Database::branch_checkpoint_hold`'s stage in every build: committed and not installed.
+#[doc(hidden)]
+pub const CHECKPOINT_HOLD_AFTER_COMMIT: u8 = store::HOLD_AFTER_COMMIT;
+/// Or-ed into `Database::branch_checkpoint_held`'s value once the flight waits at its stage.
+#[doc(hidden)]
+pub const CHECKPOINT_HOLD_ARRIVED: u8 = store::HOLD_ARRIVED;
 
 /// Whether this build has the default-off `measure-word-hold` feature (`measure_word_hold`): a
 /// measuring harness refuses a run whose binaries lack it. Always present, so it can be asked.

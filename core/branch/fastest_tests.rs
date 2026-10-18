@@ -13930,3 +13930,60 @@ fn a_failed_ddl_leaves_no_in_memory_schema_change() {
     }
     assert!(failed.is_empty(), "CLAIM: a failed DDL left its in-memory schema change: {failed:#?}");
 }
+
+/// The held-flight hook a frontend's test uses (lead order d, for fastest-wire's server-side C42-M1
+/// red), through its public names only: `Database::branch_checkpoint_hold(CHECKPOINT_HOLD_BEFORE_COMMIT)`
+/// holds the next fuzzy checkpoint's flight in every build, `branch_checkpoint_held` shows it
+/// arrived, and a bounded CHECKPOINT (`branch_compact_now_within`) then returns `Busy` at its 300 ms
+/// deadline, not before it; released, the flight installs and a bounded CHECKPOINT compacts.
+#[test]
+fn the_public_checkpoint_hold_holds_one_flight_and_a_bounded_checkpoint_ends_busy() {
+    use crate::branch::{CHECKPOINT_HOLD_ARRIVED, CHECKPOINT_HOLD_BEFORE_COMMIT};
+    let _s = serial();
+    struct Release(Arc<Database>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.branch_checkpoint_hold(0);
+        }
+    }
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(
+        &dir.path().join("public-hold.db"),
+        opts(true, SyncClass::Fsync).with_branch_checkpoint(super::BranchCheckpoint::Fuzzy),
+    );
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    for _ in 0..8 {
+        let _ = trunk.fork_branch().unwrap().into_id();
+    }
+    let _release = Release(db.clone());
+    db.branch_checkpoint_hold(CHECKPOINT_HOLD_BEFORE_COMMIT);
+    assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: a fuzzy checkpoint started");
+    let t = std::time::Instant::now();
+    while db.branch_checkpoint_held() != CHECKPOINT_HOLD_BEFORE_COMMIT | CHECKPOINT_HOLD_ARRIVED {
+        assert!(t.elapsed() < std::time::Duration::from_secs(10), "CLAIM: the flight never reached the public hold");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    {
+        let db = db.clone();
+        std::thread::spawn(move || {
+            let begun = std::time::Instant::now();
+            let r = db.branch_compact_now_within(begun + std::time::Duration::from_millis(300), &|| false);
+            let _ = tx.send((r, begun.elapsed()));
+        });
+    }
+    let held = rx.recv_timeout(std::time::Duration::from_secs(30));
+    db.branch_checkpoint_hold(0);
+    db.branch_checkpoint_wait();
+    let (r, took) = held.expect("CLAIM: a bounded CHECKPOINT waited past its deadline for the held flight (no return in 30 s)");
+    assert!(matches!(r, Err(LimboError::Busy)), "CLAIM: at its deadline the CHECKPOINT did not report Busy: {r:?}");
+    assert!(took >= std::time::Duration::from_millis(300), "CLAIM: the CHECKPOINT gave up before its 300 ms deadline ({took:?})");
+    for _ in 0..8 {
+        let _ = trunk.fork_branch().unwrap().into_id();
+    }
+    let log0 = db.branches.log_len_for_test();
+    let unheld = db.branch_compact_now_within(std::time::Instant::now() + std::time::Duration::from_secs(10), &|| false);
+    assert!(unheld.is_ok(), "CLAIM (positive control): released, a bounded CHECKPOINT failed: {unheld:?}");
+    assert!(db.branches.log_len_for_test() < log0, "CLAIM (positive control): the bounded CHECKPOINT compacted nothing (log {log0} -> {})", db.branches.log_len_for_test());
+}
