@@ -15615,3 +15615,60 @@ fn an_async_create_leads_no_flight_and_waits_for_none() {
     assert_eq!(not_yet, 1000, "CLAIM: every async create reads NotYetDurable while the flusher is held");
     assert_eq!(held, (true, true), "premise: the flusher and housekeeping were held");
 }
+
+/// LEAP L1, ASYNC-DESIGN T8 (ASYNC-3), flusher liveness: one async create and nothing else is made
+/// durable by the flusher. `branch_status` is polled (it never leads a flight) with a 10 s
+/// deadline until Durable; the flusher led at least one flight, and the creating thread issued no
+/// sync. At the stub the create is durable at once on its own thread (D2), so the sync claim and the
+/// flusher claim fail.
+#[test]
+fn the_flusher_makes_an_idle_async_create_durable() {
+    let _s = serial();
+    let class = if cfg!(target_vendor = "apple") { SyncClass::FullFsync } else { SyncClass::Fsync };
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("t8.db"), opts(true, class));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let f0 = db.branch_async_stats().flusher_flights;
+    let s0 = super::store::thread_syncs();
+    let created = trunk.create_branch_async("idle").unwrap();
+    let s1 = super::store::thread_syncs();
+    let until = std::time::Instant::now() + Duration::from_secs(10);
+    let mut durable = false;
+    while std::time::Instant::now() < until {
+        if matches!(db.branch_status(created.id), Ok(super::async_api::BranchStatus::Durable)) {
+            durable = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let f1 = db.branch_async_stats().flusher_flights;
+    assert_eq!(s1 - s0, 0, "CLAIM: the creating thread issued no sync");
+    assert!(f1 > f0, "CLAIM: the flusher led a flight ({f0} -> {f1})");
+    assert!(durable, "CLAIM: the idle async create read Durable within 10 s");
+}
+
+/// LEAP L1, ASYNC-DESIGN T23 (ASYNC-10), visibility: with the flusher held, an async create is in
+/// `branch_ids()` and `branch_named()` at once, with no flight led. At the stub every create leads
+/// its own flight, so the flights claim fails.
+#[test]
+fn async_creates_are_listed_and_found_at_once() {
+    let _s = serial();
+    let class = if cfg!(target_vendor = "apple") { SyncClass::FullFsync } else { SyncClass::Fsync };
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("t23.db"), opts(true, class));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    trunk.create_branch_async("warm").unwrap();
+    let held = db.branch_flusher_hold(true);
+    let g0 = db.branches.group_counters();
+    let created = trunk.create_branch_async("seen").unwrap();
+    let listed = db.branch_ids().unwrap().contains(&created.id);
+    let found = db.branch_named("seen").unwrap();
+    let g1 = db.branches.group_counters();
+    db.branch_flusher_hold(false);
+    assert_eq!(g1[0] - g0[0], 0, "CLAIM: the async create led no flight");
+    assert!(listed, "CLAIM: the async create is in branch_ids() at once");
+    assert_eq!(found, Some(created.id), "CLAIM: the async create is found by name at once");
+    assert!(held, "premise: the flusher was held");
+}
