@@ -15633,14 +15633,14 @@ fn the_flusher_makes_an_idle_async_create_durable() {
     let s0 = super::store::thread_syncs();
     let created = trunk.create_branch_async("idle").unwrap();
     let s1 = super::store::thread_syncs();
-    let until = std::time::Instant::now() + Duration::from_secs(10);
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let mut durable = false;
     while std::time::Instant::now() < until {
         if matches!(db.branch_status(created.id), Ok(super::async_api::BranchStatus::Durable)) {
             durable = true;
             break;
         }
-        std::thread::sleep(Duration::from_millis(5));
+        std::thread::sleep(std::time::Duration::from_millis(5));
     }
     let f1 = db.branch_async_stats().flusher_flights;
     assert_eq!(s1 - s0, 0, "CLAIM: the creating thread issued no sync");
