@@ -14815,6 +14815,8 @@ fn a_blocks_reads_end_at_rollback_to_and_at_its_error() {
         a.q(&format!("CREATE TABLE {t}(x int)")).ok(t);
         a.q(&format!("INSERT INTO {t} VALUES (1)")).ok(t);
     }
+    a.q("CREATE TABLE u(x int PRIMARY KEY)").ok("u");
+    a.q("INSERT INTO u VALUES (1)").ok("u");
     b.q("SET lock_timeout = '50ms'").ok("lock_timeout");
     let mut wrong = Vec::new();
     // r07: the read after SAVEPOINT s is released by ROLLBACK TO s; the one before it is kept.
@@ -14831,11 +14833,14 @@ fn a_blocks_reads_end_at_rollback_to_and_at_its_error() {
         other => wrong.push(format!("b's DROP TABLE d3 (read before SAVEPOINT s): want 55P03, got {other:?}")),
     }
     a.q("ROLLBACK").ok("rollback");
-    // r08: a statement that fails inside a block ends the block's reads at the error.
+    // r08: a statement that fails inside a block ends the block's reads at the error. r08's own
+    // statement, SELECT ... WHERE x = 1/0, does not fail on this engine (integer division by zero
+    // is NULL here: known-red integer_division_by_zero_is_22012), so the failing statement reads
+    // d2 and fails at run time on a key: the same error-in-a-block path.
     a.q("BEGIN").ok("begin");
-    let r = a.q("SELECT x FROM d2 WHERE x = 1/0");
-    if r.error.as_ref().map(|e| e.code.as_str()) != Some("22012") {
-        wrong.push(format!("premise: a's SELECT ... 1/0 fails 22012: {:?}", r.error));
+    let r = a.q("INSERT INTO u SELECT x FROM d2");
+    if r.error.as_ref().map(|e| e.code.as_str()) != Some("23505") {
+        wrong.push(format!("premise: a's INSERT INTO u SELECT x FROM d2 fails 23505: {:?}", r.error));
     }
     if let Some(e) = b.q("DROP TABLE d2").error {
         wrong.push(format!("b's DROP TABLE d2 while a's block is failed: {} {}", e.code, e.message));
