@@ -1559,6 +1559,61 @@ fn subprocess_schema_retry_reparses_through_the_dialect_with_its_connection() {
     );
 }
 
+/// Dialect code review MED-6: `compile_cmd`'s retry after another process's schema change keeps an
+/// ENGINE statement's text SQLite: it never reaches the dialect, plain or connection-aware. Premise:
+/// the engine prepare against the child's table succeeds, which it can only do through the retry (the
+/// parent loaded its schema before the child made the table). Sending SQLite text to the dialect in the
+/// retry fails this; R8 covers only `Statement::reprepare`.
+#[test]
+fn subprocess_schema_retry_keeps_an_engine_statement_sqlite() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("coordination-schema-retry-engine.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let dialect = Arc::new(CountingReparseDialect::default());
+    let db = Database::open_file_with_flags(
+        io,
+        db_path_str,
+        OpenFlags::default(),
+        multiprocess_wal_db_opts(),
+        None,
+        dialect.clone(),
+    )
+    .unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("create table t(value integer)").unwrap();
+
+    let current_exe = std::env::current_exe().unwrap();
+    let schema_output = Command::new(&current_exe)
+        .arg(MULTIPROCESS_SHM_SCHEMA_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path_str)
+        .output()
+        .unwrap();
+    assert!(
+        schema_output.status.success(),
+        "premise: the child created its table: stdout={}; stderr={}",
+        String::from_utf8_lossy(&schema_output.stdout),
+        String::from_utf8_lossy(&schema_output.stderr)
+    );
+
+    let parses0 = dialect.parses.load(Ordering::SeqCst);
+    let reparses0 = dialect.reparses.load(Ordering::SeqCst);
+    let stmt = conn.prepare_engine(
+        crate::connection::EngineSql::new("insert into child_table(value) values ('engine')"),
+        crate::connection::Origin::Root,
+    );
+    let parses = dialect.parses.load(Ordering::SeqCst) - parses0;
+    let reparses = dialect.reparses.load(Ordering::SeqCst) - reparses0;
+    assert!(stmt.is_ok(), "premise: the engine prepare took the schema retry and found the child's table: {:?}", stmt.err());
+    assert_eq!(
+        (parses, reparses),
+        (0, 0),
+        "CLAIM: the schema retry sent an engine statement's SQLite text to the dialect"
+    );
+}
+
 #[test]
 fn subprocess_database_open_parent_translated_stmt_uses_child_created_table() {
     let dir = tempfile::tempdir().unwrap();

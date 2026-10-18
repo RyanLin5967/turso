@@ -1085,6 +1085,32 @@ mod tests {
         assert!(wrong.is_empty(), "CLAIM: an entry's statement does not carry its text's kind: {wrong:#?}");
     }
 
+    /// R4b (dialect code review MED-5): the EXECUTE entries carry their text's kind too, the class R4's doc
+    /// names (it defaulted to Client in `execute_text`) and R4 did not check: under ClientOnlyDialect, which
+    /// refuses any text not marked `client: `, `execute_engine`, `execute_sqlite` and `execute_with(frontend)`
+    /// run plain SQLite text, and `execute` runs client text. Control: `execute` of plain text is refused
+    /// (client text goes to the dialect). Forcing `execute_text`'s statements to the client kind fails this.
+    #[test]
+    fn every_execute_entry_runs_its_text_with_its_kind() {
+        use crate::connection::{EngineSql, Origin, SqlKind};
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(&io, "execute-kinds.db", Arc::new(ClientOnlyDialect)).unwrap();
+        let c = db.connect().unwrap();
+        assert!(c.execute("CREATE TABLE plain(x)").is_err(), "premise (control): execute sends its text to the dialect, which refuses plain text");
+        let mut wrong = Vec::new();
+        let mut check = |entry: &str, r: crate::Result<()>| {
+            if let Err(e) = r {
+                wrong.push(format!("{entry}: {e}"));
+            }
+        };
+        check("execute(client)", c.execute("client: CREATE TABLE t0(x)"));
+        check("execute_engine", c.execute_engine(EngineSql::new("CREATE TABLE t1(x); INSERT INTO t1 VALUES (1)"), Origin::Root));
+        check("execute_sqlite", c.execute_sqlite("CREATE TABLE t2(x); INSERT INTO t2 VALUES (1)"));
+        check("execute_with(frontend)", c.execute_with("CREATE TABLE t3(x); INSERT INTO t3 VALUES (1)", SqlKind::frontend(), Origin::Root));
+        check("execute_with(client)", c.execute_with("client: CREATE TABLE t4(x)", SqlKind::client(), Origin::Root));
+        assert!(wrong.is_empty(), "CLAIM: an execute entry ran its text under another kind: {wrong:#?}");
+    }
+
     /// R8 (dialect design R8, review dialect LOW-6): an engine statement keeps its kind through a re-prepare,
     /// so a re-prepared engine statement never reaches a strict dialect's parser. Under ClientOnlyDialect an
     /// engine SELECT is prepared, a keyed setting changes (the statement must re-prepare: premise), and it
