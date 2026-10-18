@@ -14234,3 +14234,35 @@ replays_postgresql!(
         (26, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = INTERVAL '5' refused 0A000 (PG: SET)"),
     ]
 );
+
+/// The first host run (iccad11, RHEL 8, 9f5839a88): zone_file read the HOST's zone database, and
+/// RHEL 8's lacks `Factory`, so a zone PostgreSQL knows answered 22023 there (rev-c39-tzforms #8;
+/// the blind spot zone_file's caller states). PostgreSQL reads its own tz database, so every name
+/// in PG 18.6's pg_timezone_names (recorded in full, pg18-rev-host1.out) is a valid TimeZone on
+/// any host: SET for a UTC spelling, else this server's 0A000, never 22023.
+#[test]
+fn every_zone_postgresql_knows_is_a_valid_timezone() {
+    let recording = include_str!("pg18/pg18-rev-host1.out");
+    let names: Vec<&str> = recording
+        .lines()
+        .skip_while(|l| !l.ends_with("Q SELECT name FROM pg_timezone_names ORDER BY name"))
+        .skip(2)
+        .take_while(|l| l.starts_with("   D ['"))
+        .map(|l| &l["   D ['".len()..l.len() - "']".len()])
+        .collect();
+    assert_eq!(names.len(), 598, "premise: the recording's SELECT 598 rows are read");
+    let dir = Scratch::new("pg-zones");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    for name in &names {
+        if let Some(e) = a.q(&format!("SET TimeZone = '{name}'")).error {
+            if e.code != "0A000" {
+                wrong.push(format!("{name}: {} {}", e.code, e.message));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+replays_postgresql!(pg18_rev_host1_replays_as_postgresql_answered, "pg18-rev-host1.out", []);
