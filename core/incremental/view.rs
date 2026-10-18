@@ -1,3 +1,4 @@
+use crate::connection::{EngineSql, Origin};
 use super::compiler::{DbspCircuit, DbspCompiler, DeltaSet};
 use super::dbsp::Delta;
 use super::operator::ComputationTracker;
@@ -1220,7 +1221,7 @@ impl IncrementalView {
                     // Prepare the statement using the parent connection
                     // The fill's printed SQLite text: SQLite whatever the dialect (the wire's NO
                     // SILENT DIALECT SWITCH class).
-                    let stmt = conn.prepare_sqlite(&query)?;
+                    let stmt = conn.prepare_engine(EngineSql::new(&query), Origin::Root)?;
 
                     self.populate_state = PopulateState::ProcessingOneTable {
                         queries,

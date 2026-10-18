@@ -232,6 +232,40 @@ pub enum Origin {
     Nested,
 }
 
+impl From<Origin> for StatementOrigin {
+    fn from(origin: Origin) -> Self {
+        match origin {
+            Origin::Root => StatementOrigin::Root,
+            Origin::Nested => StatementOrigin::InternalHelper,
+        }
+    }
+}
+
+/// The engine's own SQLite text: the only argument `prepare_engine` and `execute_engine` take, so
+/// engine code names, at every call, that the text it hands the engine is its own SQLite (dialect
+/// design REVISION 2; R1 enforces that engine code reaches no other entry).
+pub(crate) struct EngineSql<'a>(std::borrow::Cow<'a, str>);
+
+impl<'a> EngineSql<'a> {
+    /// Engine-built text: a literal, a `format!`, or a borrowed engine string.
+    pub(crate) fn new(sql: impl Into<std::borrow::Cow<'a, str>>) -> Self {
+        Self(sql.into())
+    }
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A replay is the engine's own (`Connection::prepare_replay`): no frontend entry may carry one.
+fn refuse_foreign_replay(kind: &SqlKind) -> Result<()> {
+    if matches!(kind.source(), SqlSource::Replay { .. }) {
+        return Err(LimboError::InvalidArgument(
+            "a replay kind is the engine's own: prepare it with prepare_replay".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Stored text with the syntax it is in, as a dialect reports it (`Dialect::table_sql_for_replay`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredSql {
@@ -1140,9 +1174,38 @@ impl Connection {
         self.prepare_text_with_origin(sql, StatementOrigin::Root, SqlKind::frontend())
     }
 
+    /// A frontend's nested SQLite statement (it runs inside the statement that is running). The
+    /// engine's own nested statements use `prepare_engine(.., Origin::Nested)`.
     #[doc(hidden)]
     pub fn prepare_internal(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
-        self.prepare_with_origin(sql, StatementOrigin::InternalHelper)
+        self.prepare_text_with_origin(sql, StatementOrigin::InternalHelper, SqlKind::frontend())
+    }
+
+    /// The engine's own SQLite text (dialect design REVISION 2): parsed as SQLite, its kind
+    /// `SqlKind::engine()`, whatever the database's dialect. The only entry engine code uses.
+    pub(crate) fn prepare_engine(self: &Arc<Connection>, sql: EngineSql<'_>, origin: Origin) -> Result<Statement> {
+        self.prepare_text_with_origin(sql.as_str(), origin.into(), SqlKind::engine())
+    }
+
+    /// `execute` of the engine's own SQLite text: every statement in it, kind `SqlKind::engine()`.
+    pub(crate) fn execute_engine(self: &Arc<Connection>, sql: EngineSql<'_>, origin: Origin) -> Result<()> {
+        self.execute_text(sql.as_str(), SqlKind::engine(), origin.into())
+    }
+
+    /// A frontend's statement with the kind it says its text is (`SqlKind::client()` or
+    /// `SqlKind::frontend()`) and how it runs. A replay is the engine's own (`prepare_replay`) and is
+    /// refused here.
+    #[doc(hidden)]
+    pub fn prepare_with(self: &Arc<Connection>, sql: impl AsRef<str>, kind: SqlKind, origin: Origin) -> Result<Statement> {
+        refuse_foreign_replay(&kind)?;
+        self.prepare_text_with_origin(sql, origin.into(), kind)
+    }
+
+    /// `execute` with the kind its text is and how it runs (as `prepare_with`).
+    #[doc(hidden)]
+    pub fn execute_with(self: &Arc<Connection>, sql: impl AsRef<str>, kind: SqlKind, origin: Origin) -> Result<()> {
+        refuse_foreign_replay(&kind)?;
+        self.execute_text(sql.as_ref(), kind, origin.into())
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
@@ -1598,7 +1661,7 @@ impl Connection {
         })??;
 
         // Engine helper text: SQLite whatever the dialect (the NO SILENT DIALECT SWITCH class).
-        let stmt = self.prepare_sqlite("SELECT * FROM sqlite_schema")?;
+        let stmt = self.prepare_engine(EngineSql::new("SELECT * FROM sqlite_schema"), Origin::Root)?;
 
         // MVCC bootstrap connection gets the "baseline" from the DB file and ignores anything in MV store
         let mv_tx = if self.is_mvcc_bootstrap_connection() {
@@ -1769,10 +1832,10 @@ impl Connection {
                             *schema = inner.fresh.try_clone()?;
                             Ok::<_, crate::alloc::TryReserveError>(())
                         })??;
-                        let stmt = self.prepare_internal(format!(
+                        let stmt = self.prepare_engine(EngineSql::new(format!(
                             "SELECT name, sql FROM {}",
                             crate::schema::TURSO_TYPES_TABLE_NAME
-                        ))?;
+                        )), Origin::Nested)?;
                         inner.phase = ReparsePhase::LoadTypes {
                             stmt: Box::new(stmt),
                             type_rows: Vec::new(),
@@ -1939,17 +2002,17 @@ impl Connection {
     #[instrument(skip_all, level = Level::DEBUG)]
     #[turso_macros::trace_stack]
     pub fn execute(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<()> {
-        self.execute_text(sql.as_ref(), SqlKind::client())
+        self.execute_text(sql.as_ref(), SqlKind::client(), Origin::Root)
     }
 
     /// `execute` of SQLite text, parsed as SQLite whatever the database's dialect (`SqlKind::frontend`): for
     /// the engine's own helper statements and a frontend's SQLite text.
     pub fn execute_sqlite(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<()> {
-        self.execute_text(sql.as_ref(), SqlKind::frontend())
+        self.execute_text(sql.as_ref(), SqlKind::frontend(), Origin::Root)
     }
 
     #[turso_macros::trace_stack]
-    fn execute_text(self: &Arc<Connection>, sql: &str, kind: SqlKind) -> Result<()> {
+    fn execute_text(self: &Arc<Connection>, sql: &str, kind: SqlKind, origin: Origin) -> Result<()> {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
@@ -1959,12 +2022,12 @@ impl Connection {
             let input = str::from_utf8(&remaining.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
-            let (program, pager, mode) =
-                self.compile_cmd(cmd, input, StatementOrigin::Root, &prepare_options, &kind)?;
+            let origin = StatementOrigin::from(origin);
+            let (program, pager, mode) = self.compile_cmd(cmd, input, origin, &prepare_options, &kind)?;
             {
                 crate::stack::trace_stack!("run");
                 // The kind travels with the statement (review dialect MED-3: it defaulted to Client).
-                Statement::new(program, pager.clone(), mode, 0, kind.clone()).run_ignore_rows()?;
+                Statement::new_with_origin(program, pager.clone(), mode, 0, origin, false, kind.clone()).run_ignore_rows()?;
             }
             remaining = &remaining[byte_offset_end..];
         }
@@ -2178,10 +2241,10 @@ impl Connection {
         if !has_types_table {
             return Ok(Vec::new());
         }
-        let mut type_stmt = self.prepare_internal(format!(
+        let mut type_stmt = self.prepare_engine(EngineSql::new(format!(
             "SELECT name, sql FROM {}",
             crate::schema::TURSO_TYPES_TABLE_NAME
-        ))?;
+        )), Origin::Nested)?;
         let mut type_rows = Vec::new();
         type_stmt.run_with_row_callback(|row| {
             type_rows.push(row.get::<&str>(1)?.to_string());
@@ -3109,7 +3172,7 @@ impl Connection {
         let mut rows_data: Vec<(String, String, String, i64, Option<String>)> = Vec::new();
         {
             // Engine helper text: SQLite whatever the dialect (the NO SILENT DIALECT SWITCH class).
-            let mut rows = self.prepare_sqlite("SELECT * FROM sqlite_schema")?;
+            let mut rows = self.prepare_engine(EngineSql::new("SELECT * FROM sqlite_schema"), Origin::Root)?;
             rows.run_with_row_callback(|row| {
                 let ty = row.get::<&str>(0)?.to_string();
                 let name = row.get::<&str>(1)?.to_string();
@@ -3191,7 +3254,7 @@ impl Connection {
         }
         // Engine-built PRAGMA text: SQLite whatever the dialect (the NO SILENT DIALECT SWITCH class).
         let pragma = format!("PRAGMA {pragma_name}");
-        let mut stmt = self.prepare_sqlite(pragma)?;
+        let mut stmt = self.prepare_engine(EngineSql::new(pragma), Origin::Root)?;
         stmt.run_collect_rows()
     }
 
@@ -3208,7 +3271,7 @@ impl Connection {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         let pragma = format!("PRAGMA {pragma_name} = {pragma_value}");
-        let mut stmt = self.prepare_sqlite(pragma)?;
+        let mut stmt = self.prepare_engine(EngineSql::new(pragma), Origin::Root)?;
         stmt.run_collect_rows()
     }
 
@@ -4456,7 +4519,7 @@ impl Connection {
         if stmt.is_none() {
             let escaped = backing_table_name.replace('"', "\"\"");
             let sql = format!("SELECT start, inc, min, max, cycle FROM \"{escaped}\" LIMIT 1");
-            let prepared = self.prepare_internal(sql).map_err(|err| {
+            let prepared = self.prepare_engine(EngineSql::new(sql), Origin::Nested).map_err(|err| {
                 LimboError::Corrupt(format!(
                     "internal sequence backing table \"{backing_table_name}\" for sequence \
                      \"{seq_name}\": cannot prepare descriptor SELECT: {err}"
@@ -4536,7 +4599,7 @@ impl Connection {
             let sql = format!(
                 "SELECT value, is_called FROM \"{escaped}\" ORDER BY value {direction} LIMIT 1"
             );
-            let prepared = self.prepare_internal(sql).map_err(|err| {
+            let prepared = self.prepare_engine(EngineSql::new(sql), Origin::Nested).map_err(|err| {
                 LimboError::Corrupt(format!(
                     "internal sequence backing table \"{backing_table_name}\" for sequence \
                      \"{}\": cannot prepare watermark SELECT: {err}",
@@ -4626,9 +4689,9 @@ impl Connection {
                     if !has_seq_table {
                         return Ok(IOResult::Done(()));
                     }
-                    let stmt = self.prepare_internal(format!(
+                    let stmt = self.prepare_engine(EngineSql::new(format!(
                         "SELECT name, seq FROM {SQLITE_SEQUENCE_TABLE_NAME}"
-                    ))?;
+                    )), Origin::Nested)?;
                     *state = SyncAutoincrementState::ReadSeqRows {
                         stmt: Box::new(stmt),
                         rows: Vec::new(),
@@ -4667,9 +4730,9 @@ impl Connection {
                             // Read current backing watermark; only upsert if we'd
                             // actually advance it (avoids needless writes on boot).
                             let escaped = backing_table_name.replace('"', "\"\"");
-                            let stmt = self.prepare_internal(format!(
+                            let stmt = self.prepare_engine(EngineSql::new(format!(
                                 "SELECT MAX(value) FROM \"{escaped}\""
-                            ))?;
+                            )), Origin::Nested)?;
                             *sub = SyncRowStep::ReadMax {
                                 backing_table_name,
                                 stmt: Box::new(stmt),
@@ -4714,7 +4777,7 @@ impl Connection {
                                  VALUES ({watermark}, 1, 1, 1, 1, {}, 0)",
                                 i64::MAX
                             );
-                            let stmt = self.prepare_internal(insert_sql)?;
+                            let stmt = self.prepare_engine(EngineSql::new(insert_sql), Origin::Nested)?;
                             *sub = SyncRowStep::Upsert {
                                 stmt: Box::new(stmt),
                             };

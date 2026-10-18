@@ -1,3 +1,4 @@
+use crate::connection::{EngineSql, Origin};
 use crate::alloc::{
     DynAllocator, TryClone, TursoAllocExt, TursoIteratorExt, TursoSliceExt,
     TursoTryWithCapacityExt, TursoVecExt,
@@ -14628,7 +14629,7 @@ pub fn op_parse_schema(
     } else {
         format!("SELECT * FROM {schema_table}")
     };
-    let mut stmt = conn.prepare_internal(sql)?;
+    let mut stmt = conn.prepare_engine(EngineSql::new(sql), Origin::Nested)?;
     // ParseSchema runs as a nested helper statement inside the parent schema
     // mutation. It only reads sqlite_schema, so a statement subtransaction is
     // unnecessary and can contend with the parent's subjournal on temp/attached
@@ -14881,7 +14882,7 @@ pub struct OpInitCdcVersionInner {
 pub type OpInitCdcVersionState = Option<Box<OpInitCdcVersionInner>>;
 
 fn prepare_cdc_internal(conn: &Arc<Connection>, sql: String) -> Result<crate::Statement> {
-    let stmt = conn.prepare_internal(sql)?;
+    let stmt = conn.prepare_engine(EngineSql::new(sql), Origin::Nested)?;
     stmt.program
         .prepared
         .needs_stmt_subtransactions
@@ -18948,7 +18949,7 @@ fn op_vacuum_into_inner(
                 // BEGIN and pragma helpers here are blocking convenience wrappers;
                 // async work starts with the schema scan in vacuum_target_build_step.
                 let source_db = program.connection.get_source_database(source_db_id);
-                program.connection.execute_sqlite("BEGIN")?;
+                program.connection.execute_engine(EngineSql::new("BEGIN"), Origin::Root)?;
                 state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
                 let page_size: u32 = extract_pragma_int(
                     &program
@@ -19085,7 +19086,7 @@ fn op_vacuum_into_inner(
 
             VacuumIntoOpPhase::Done => {
                 // Commit the source transaction started in Init.
-                program.connection.execute_sqlite("COMMIT")?;
+                program.connection.execute_engine(EngineSql::new("COMMIT"), Origin::Root)?;
                 state.auto_txn_cleanup = TxnCleanup::None;
 
                 state.pc += 1;

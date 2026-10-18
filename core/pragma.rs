@@ -1,3 +1,4 @@
+use crate::connection::{EngineSql, Origin};
 use crate::sync::Arc;
 use crate::{Connection, LimboError, Statement, StepResult, Value};
 use bitflags::bitflags;
@@ -456,7 +457,7 @@ impl PragmaVirtualTableCursor {
         // For example, UPDATE ... FROM pragma_table_info('dst') runs this helper while the
         // outer UPDATE still has an active MVCC transaction and write cursor open on `dst`.
         // The helper must stay nested so it does not disturb the parent's transaction state.
-        self.stmt = Some(self.conn.prepare_internal(sql)?);
+        self.stmt = Some(self.conn.prepare_engine(EngineSql::new(sql), Origin::Nested)?);
 
         self.next()
     }

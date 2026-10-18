@@ -47,6 +47,7 @@
 //! ROWID table. Batches of more than one member, the physical install and the page-granular
 //! validators of b161e861d are not ported (D-M8).
 
+use crate::connection::{EngineSql, Origin};
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -370,7 +371,7 @@ impl Merger {
     /// trunk write transaction it rolls back.
     #[doc(hidden)]
     pub fn derive_only(&mut self, branch: &Branch) -> Result<DerivedReport> {
-        self.trunk.execute_sqlite("BEGIN IMMEDIATE")?;
+        self.trunk.execute_engine(EngineSql::new("BEGIN IMMEDIATE"), Origin::Root)?;
         let result = (|| -> Result<DerivedReport> {
             let pager = self.trunk.pager.load().clone();
             let view = self.store.merge_view(branch.id())?;
@@ -382,7 +383,7 @@ impl Merger {
                 owned: view.owned.len() as u64,
             })
         })();
-        self.trunk.execute_sqlite("ROLLBACK")?;
+        self.trunk.execute_engine(EngineSql::new("ROLLBACK"), Origin::Root)?;
         result
     }
 
@@ -495,16 +496,16 @@ impl Merger {
     ) -> Result<MergeOutcome> {
         // BEGIN IMMEDIATE checks the schema cookie once it holds the write lock, so from here to
         // COMMIT the merger's schema is the trunk's.
-        self.trunk.execute_sqlite("BEGIN IMMEDIATE")?;
+        self.trunk.execute_engine(EngineSql::new("BEGIN IMMEDIATE"), Origin::Root)?;
         let result = self.validate_and_install(branch, policy, fk_on, land);
         match &result {
             Ok(outcome) if outcome.refused.is_none() => {
-                if let Err(err) = self.trunk.execute_sqlite("COMMIT") {
-                    let _ = self.trunk.execute_sqlite("ROLLBACK");
+                if let Err(err) = self.trunk.execute_engine(EngineSql::new("COMMIT"), Origin::Root) {
+                    let _ = self.trunk.execute_engine(EngineSql::new("ROLLBACK"), Origin::Root);
                     return Err(err);
                 }
             }
-            _ => self.trunk.execute_sqlite("ROLLBACK")?,
+            _ => self.trunk.execute_engine(EngineSql::new("ROLLBACK"), Origin::Root)?,
         }
         result
     }
@@ -711,21 +712,21 @@ impl Merger {
         prep: &Prepared,
         fk_on: bool,
     ) -> Result<Option<String>> {
-        self.trunk.execute_sqlite(format!("SAVEPOINT {MEMBER}"))?;
+        self.trunk.execute_engine(EngineSql::new(format!("SAVEPOINT {MEMBER}")), Origin::Root)?;
         let installed = self.install_checked(branch, from, prep, fk_on);
         match installed {
             Ok(None) => {
-                self.trunk.execute_sqlite(format!("RELEASE {MEMBER}"))?;
+                self.trunk.execute_engine(EngineSql::new(format!("RELEASE {MEMBER}")), Origin::Root)?;
                 Ok(None)
             }
             Ok(Some(reason)) => {
-                self.trunk.execute_sqlite(format!("ROLLBACK TO {MEMBER}"))?;
-                self.trunk.execute_sqlite(format!("RELEASE {MEMBER}"))?;
+                self.trunk.execute_engine(EngineSql::new(format!("ROLLBACK TO {MEMBER}")), Origin::Root)?;
+                self.trunk.execute_engine(EngineSql::new(format!("RELEASE {MEMBER}")), Origin::Root)?;
                 Ok(Some(reason))
             }
             Err(err) => {
-                let _ = self.trunk.execute_sqlite(format!("ROLLBACK TO {MEMBER}"));
-                let _ = self.trunk.execute_sqlite(format!("RELEASE {MEMBER}"));
+                let _ = self.trunk.execute_engine(EngineSql::new(format!("ROLLBACK TO {MEMBER}")), Origin::Root);
+                let _ = self.trunk.execute_engine(EngineSql::new(format!("RELEASE {MEMBER}")), Origin::Root);
                 Err(err)
             }
         }
@@ -792,7 +793,7 @@ impl Merger {
                     cols.join(", "),
                     quote(&table.name)
                 );
-                selects.insert(root, from.prepare_sqlite(sql)?);
+                selects.insert(root, from.prepare_engine(EngineSql::new(sql), Origin::Root)?);
             }
             let select = selects.get_mut(&root).expect("just prepared");
             select.bind_at(1.try_into().unwrap(), Value::from_i64(rowid))?;
@@ -953,7 +954,7 @@ impl Merger {
 
     fn prepare_fk(&self, r: &ResolvedFkRef, sql: String) -> std::result::Result<Statement, String> {
         self.trunk
-            .prepare_sqlite(sql)
+            .prepare_engine(EngineSql::new(sql), Origin::Root)
             .map_err(|err| format!("foreign key {} cannot be checked: {err}", fk_name(r)))
     }
 
@@ -1038,7 +1039,7 @@ impl Merger {
                 }
                 let stmt = match theirs.entry((root, i)) {
                     Entry::Occupied(e) => e.into_mut(),
-                    Entry::Vacant(e) => e.insert(from.prepare_sqlite(&side.key_sql)?),
+                    Entry::Vacant(e) => e.insert(from.prepare_engine(EngineSql::new(&side.key_sql), Origin::Root)?),
                 };
                 if first_row(stmt, rowid)?.as_ref() == Some(&ours) {
                     continue;
@@ -1146,9 +1147,9 @@ impl Merger {
         };
         let delete = format!("DELETE FROM {t} WHERE rowid = ?1");
         Ok(TableStmts {
-            update: update.map(|sql| self.trunk.prepare_sqlite(sql)).transpose()?,
-            insert: self.trunk.prepare_sqlite(insert)?,
-            delete: self.trunk.prepare_sqlite(delete)?,
+            update: update.map(|sql| self.trunk.prepare_engine(EngineSql::new(sql), Origin::Root)).transpose()?,
+            insert: self.trunk.prepare_engine(EngineSql::new(insert), Origin::Root)?,
+            delete: self.trunk.prepare_engine(EngineSql::new(delete), Origin::Root)?,
             columns: names.len(),
             alias,
         })

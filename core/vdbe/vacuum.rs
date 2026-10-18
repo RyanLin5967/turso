@@ -1,3 +1,4 @@
+use crate::connection::{EngineSql, Origin};
 use rustc_hash::FxHashMap;
 use std::sync::{atomic::Ordering, Arc};
 
@@ -583,7 +584,7 @@ pub(crate) fn vacuum_target_build_step(
 
                 // Enable MVCC on targets that should persist as MVCC.
                 if config.target_mvcc_enabled {
-                    state.target_conn.execute_sqlite("PRAGMA journal_mode = 'mvcc'")?;
+                    state.target_conn.execute_engine(EngineSql::new("PRAGMA journal_mode = 'mvcc'"), Origin::Root)?;
                 }
 
                 // Performance optimizations for the target database (matches SQLite vacuum.c):
@@ -601,7 +602,7 @@ pub(crate) fn vacuum_target_build_step(
                 // roll it back reliably on error.
                 // Engine helper text: SQLite whatever the dialect (the wire's NO SILENT DIALECT
                 // SWITCH class), as are the target's other helper statements below.
-                state.target_conn.execute_sqlite("BEGIN IMMEDIATE")?;
+                state.target_conn.execute_engine(EngineSql::new("BEGIN IMMEDIATE"), Origin::Root)?;
 
                 // Query sqlite_schema with rootpage, ordered by rowid.
                 // Decide whether schema replay should include the internal MVCC metadata table.
@@ -623,7 +624,7 @@ pub(crate) fn vacuum_target_build_step(
                         crate::mvcc::database::MVCC_META_TABLE_NAME
                     )
                 };
-                let schema_stmt = config.source_conn.prepare_internal(schema_sql.as_str())?;
+                let schema_stmt = config.source_conn.prepare_engine(EngineSql::new(schema_sql.as_str()), Origin::Nested)?;
 
                 state.phase = VacuumTargetBuildPhase::CollectSchemaRows {
                     schema_stmt: Box::new(schema_stmt),
@@ -813,7 +814,7 @@ pub(crate) fn vacuum_target_build_step(
                 )?;
 
                 // SELECT from source, INSERT into the target.
-                let select_stmt = config.source_conn.prepare_internal(&select_sql)?;
+                let select_stmt = config.source_conn.prepare_engine(EngineSql::new(&select_sql), Origin::Nested)?;
 
                 // System tables need nested mode during prepare() to bypass
                 // "may not be modified" checks. Can't use prepare_internal()
@@ -823,7 +824,7 @@ pub(crate) fn vacuum_target_build_step(
                 if is_system {
                     state.target_conn.start_nested();
                 }
-                let target_insert_stmt = state.target_conn.prepare_sqlite(&insert_sql);
+                let target_insert_stmt = state.target_conn.prepare_engine(EngineSql::new(&insert_sql), Origin::Root);
                 if is_system {
                     state.target_conn.end_nested();
                 }
@@ -1033,7 +1034,7 @@ pub(crate) fn vacuum_target_build_step(
 
             VacuumTargetBuildPhase::Done => {
                 // Commit the target transaction started in Init phase.
-                state.target_conn.execute_sqlite("COMMIT")?;
+                state.target_conn.execute_engine(EngineSql::new("COMMIT"), Origin::Root)?;
                 return Ok(crate::IOResult::Done(()));
             }
         }
@@ -3300,7 +3301,7 @@ mod tests {
         target_conn.execute("CREATE TABLE seed(x)")?;
 
         let mut context = VacuumTargetBuildContext::new(target_conn.clone());
-        let helper_stmt = target_conn.prepare_internal("SELECT 1")?;
+        let helper_stmt = target_conn.prepare_engine(EngineSql::new("SELECT 1"), Origin::Nested)?;
         context.phase = VacuumTargetBuildPhase::CollectSchemaRows {
             schema_stmt: Box::new(helper_stmt),
         };
