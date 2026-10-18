@@ -6931,6 +6931,12 @@ impl BranchStore {
         [g.gathers, g.gathers_expired]
     }
 
+    /// LEAP L2(c)'s instrument (R1.7): the log buffer's growths so far (`Journal::pending_reallocs`);
+    /// 0 for a volatile store.
+    pub(crate) fn log_buffer_reallocs(&self) -> u64 {
+        self.inner.lock().journal.as_ref().map_or(0, Journal::pending_reallocs)
+    }
+
     /// LEAP L2(b): the chunks and segments inserts built themselves (`BranchTable::inline_allocs`).
     pub(crate) fn table_inline_allocs(&self) -> u64 {
         self.inner.lock().branches.inline_allocs()

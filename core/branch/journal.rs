@@ -1157,6 +1157,10 @@ pub(crate) struct Journal {
     pending: Vec<u8>,
     /// Arena slots named by records still in `pending` (the failpoint reports them as orphans).
     pub(crate) pending_slots: Vec<Slot>,
+    /// Observation only (ASYNC-DESIGN R1.7's `pending_reallocs`, LEAP L2(c)): how many times
+    /// buffering a record or taking a flight grew `pending`, `pending_slots` or a flight's bytes,
+    /// i.e. allocated under the store mutex.
+    pending_reallocs: u64,
     snapshot_len: u64,
     sync: SyncClass,
     /// Set by an I/O failure, or a failpoint standing in for a crash. From then on nothing more is
@@ -1465,6 +1469,7 @@ impl Journal {
             len: 0,
             pending: Vec::new(),
             pending_slots: Vec::new(),
+            pending_reallocs: 0,
             snapshot_len: 0,
             sync,
             poisoned: Arc::new(AtomicBool::new(false)),
@@ -1672,6 +1677,7 @@ impl Journal {
             len: 0,
             pending: Vec::new(),
             pending_slots: Vec::new(),
+            pending_reallocs: 0,
             snapshot_len,
             sync,
             poisoned: Arc::new(AtomicBool::new(false)),
@@ -2514,6 +2520,20 @@ impl Journal {
     /// Queue a record. It reaches the file only through [`Journal::flush`].
     pub(crate) fn buffer(&mut self, record: &Record) -> Result<()> {
         self.check_live()?;
+        let caps = (self.pending.capacity(), self.pending_slots.capacity());
+        let result = self.buffer_counted(record);
+        if (self.pending.capacity(), self.pending_slots.capacity()) != caps {
+            self.pending_reallocs += 1;
+        }
+        result
+    }
+
+    /// The log buffer's growths so far (`pending_reallocs`).
+    pub(crate) fn pending_reallocs(&self) -> u64 {
+        self.pending_reallocs
+    }
+
+    fn buffer_counted(&mut self, record: &Record) -> Result<()> {
         // Encoded in place after its frame header, which is filled in once the payload's length and
         // checksum are known; room for the flight's end frame is kept, so `take_flight` need not
         // reallocate. Mutant `record_encoded_aside` (test builds only): through a Vec of its own,
@@ -2803,6 +2823,9 @@ impl Journal {
         // The flight's end frame goes in the same write, built by `Flight::write` with no lock held
         // (review 2 #8); its room is reserved here. An upgrade has no frames and no end.
         if !bytes.is_empty() {
+            if bytes.capacity() - bytes.len() < END_FRAME_LEN {
+                self.pending_reallocs += 1;
+            }
             bytes.reserve_exact(END_FRAME_LEN);
             self.len += END_FRAME_LEN as u64;
             self.last_names_slots = names_slots;

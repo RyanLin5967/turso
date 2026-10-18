@@ -119,11 +119,12 @@ impl Database {
         })
     }
 
-    /// The async counters: the branch table's inline allocations and the group's flights are
-    /// measured; the rest read 0 and `measured` is false until L1 lands.
+    /// The async counters: the branch table's inline allocations, the log buffer's growths and the
+    /// group's flights are measured; the rest read 0 and `measured` is false until L1 lands.
     pub fn branch_async_stats(&self) -> BranchAsyncStats {
         BranchAsyncStats {
             chunk_inline_allocs: self.branches.table_inline_allocs(),
+            pending_reallocs: self.branches.log_buffer_reallocs(),
             group_flights: self.branches.group_counters()[0],
             measured: false,
             ..Default::default()
