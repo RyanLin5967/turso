@@ -88,7 +88,12 @@ pub fn translate_create_index(
     resolver: &Resolver,
     stmt: ast::Stmt,
 ) -> crate::Result<()> {
-    let sql = canonical_create_index_sql(&stmt);
+    let replayed = match &stmt {
+        ast::Stmt::CreateIndex { idx_name, .. } => crate::translate::replayed_own_row(resolver, idx_name.name.as_str())?,
+        _ => None,
+    };
+    // A replay keeps its row's bytes (dialect design REVISION 2 item 1); otherwise canonical text.
+    let sql = replayed.unwrap_or_else(|| canonical_create_index_sql(&stmt));
     let ast::Stmt::CreateIndex {
         unique,
         if_not_exists,

@@ -91,7 +91,9 @@ pub fn translate_create_materialized_view(
     let view_columns = view_column_schema.flat_columns();
 
     // Reconstruct the SQL string for storage
-    let sql = create_materialized_view_to_str(&view_name.name.as_ident(), select_stmt);
+    // A replay keeps its row's bytes (dialect design REVISION 2 item 1).
+    let sql = crate::translate::replayed_own_row(resolver, view_name.name.as_str())?
+        .unwrap_or_else(|| create_materialized_view_to_str(&view_name.name.as_ident(), select_stmt));
 
     // Create a btree for storing the materialized view state
     // This btree will hold the materialized rows (row_id -> values)
@@ -376,7 +378,9 @@ pub fn translate_create_view(
     crate::util::validate_select_for_views(select_stmt, view_name.db_name.as_ref())?;
 
     // Reconstruct the SQL string
-    let sql = create_view_to_str(&view_name.name.as_ident(), columns, select_stmt);
+    // A replay keeps its row's bytes (dialect design REVISION 2 item 1).
+    let sql = crate::translate::replayed_own_row(resolver, view_name.name.as_str())?
+        .unwrap_or_else(|| create_view_to_str(&view_name.name.as_ident(), columns, select_stmt));
 
     // Open cursor to sqlite_schema table
     let table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();

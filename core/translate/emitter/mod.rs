@@ -181,6 +181,9 @@ pub struct Resolver<'a> {
     /// Schema dialect of the database being compiled against; used when a
     /// fresh placeholder schema must be constructed during resolution.
     pub(crate) dialect: Arc<dyn crate::dialect::Dialect>,
+    /// Where the statement's text came from (dialect design REVISION 2): it alone decides how the
+    /// schema row the statement writes for its own object is stored. `Engine` by default.
+    pub(crate) sql_source: crate::connection::SqlSource,
     /// When set, we are compiling a trigger subprogram for this database.
     /// Ordinary triggers are restricted to their own database, but temp-backed
     /// triggers follow SQLite's looser resolution rules and may access objects
@@ -319,6 +322,7 @@ impl<'a> Resolver<'a> {
             enable_custom_types,
             dqs_dml,
             dialect,
+            sql_source: crate::connection::SqlSource::Engine,
             trigger_context: None,
             has_temp_schema,
             fk_action_compile_stack: FkActionCompileStack::default(),
@@ -353,6 +357,7 @@ impl<'a> Resolver<'a> {
             enable_custom_types: self.enable_custom_types,
             dqs_dml: self.dqs_dml,
             dialect: self.dialect.clone(),
+            sql_source: self.sql_source.clone(),
             trigger_context: self.trigger_context.clone(),
             has_temp_schema: self.has_temp_schema,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
@@ -379,6 +384,7 @@ impl<'a> Resolver<'a> {
             enable_custom_types: self.enable_custom_types,
             dqs_dml: self.dqs_dml,
             dialect: self.dialect.clone(),
+            sql_source: self.sql_source.clone(),
             trigger_context: self.trigger_context.clone(),
             has_temp_schema: self.has_temp_schema,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),

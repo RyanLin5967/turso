@@ -1007,7 +1007,6 @@ impl Statement {
                 &syms,
                 mode,
                 &self.program.sql,
-                self.origin,
                 prepare_options,
                 &self.kind,
                 prepare_generation,

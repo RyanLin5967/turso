@@ -698,7 +698,6 @@ pub(crate) fn vacuum_target_build_step(
 
                 let entry_ordinal = state.tables_to_create[idx];
                 let entry = &state.schema_entries[entry_ordinal];
-                let sql = table_sql_for_vacuum_replay(&state.target_conn, &entry.sql)?;
 
                 // System tables (sqlite_stat1, __turso_internal_types, etc.) have
                 // reserved name prefixes that translate_create_table rejects for
@@ -711,7 +710,8 @@ pub(crate) fn vacuum_target_build_step(
                 if is_system {
                     state.target_conn.start_nested();
                 }
-                let target_stmt = state.target_conn.prepare_sqlite(&sql);
+                // The row's own bytes are kept, its text parsed as the dialect reports (REVISION 2).
+                let target_stmt = state.target_conn.prepare_replay(entry, Origin::Root);
                 if is_system {
                     state.target_conn.end_nested();
                 }
@@ -937,7 +937,8 @@ pub(crate) fn vacuum_target_build_step(
                 // Backing-btree indexes for custom index methods were filtered
                 // out when indexes_to_create was built. The remaining CREATE
                 // INDEX statements are user-visible and can use ordinary prepare.
-                let target_stmt = state.target_conn.prepare(&entry.sql)?;
+                // Canonical SQLite text, its bytes kept (REVISION 2; it went through the client parser).
+                let target_stmt = state.target_conn.prepare_replay(entry, Origin::Root)?;
                 state.phase = VacuumTargetBuildPhase::StepCreateIndex {
                     target_schema_stmt: Box::new(target_stmt),
                     idx,
@@ -983,7 +984,7 @@ pub(crate) fn vacuum_target_build_step(
 
                 let entry_ordinal = state.post_data_entries[idx];
                 let entry = &state.schema_entries[entry_ordinal];
-                let target_stmt = state.target_conn.prepare_sqlite(&entry.sql)?;
+                let target_stmt = state.target_conn.prepare_replay(entry, Origin::Root)?;
                 state.phase = VacuumTargetBuildPhase::StepPostData {
                     target_schema_stmt: Box::new(target_stmt),
                     idx,
@@ -1041,9 +1042,6 @@ pub(crate) fn vacuum_target_build_step(
     }
 }
 
-fn table_sql_for_vacuum_replay(target_conn: &Arc<Connection>, sql: &str) -> Result<String> {
-    target_conn.dialect().table_sql_for_replay(sql)
-}
 
 // Build the SELECT and INSERT SQL strings for copying a table's data.
 //

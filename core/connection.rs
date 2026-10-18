@@ -213,6 +213,13 @@ impl SqlKind {
     pub fn frontend() -> Self {
         Self { syntax: Syntax::Sqlite, source: SqlSource::Frontend }
     }
+    /// A stored schema row replayed (`Connection::prepare_replay` only): its own row keeps `bytes`.
+    pub(crate) fn replay(syntax: Syntax, name: &str, bytes: &str) -> Self {
+        Self {
+            syntax,
+            source: SqlSource::Replay { name: crate::sync::Arc::from(name), bytes: crate::sync::Arc::from(bytes) },
+        }
+    }
     /// Which parser reads this text.
     pub fn syntax(&self) -> Syntax {
         self.syntax
@@ -1088,7 +1095,6 @@ impl Connection {
         self: &Arc<Connection>,
         cmd: Cmd,
         input: &str,
-        origin: StatementOrigin,
         prepare_options: &PrepareOptions,
         kind: &SqlKind,
     ) -> Result<(Program, Arc<Pager>, QueryMode)> {
@@ -1112,7 +1118,6 @@ impl Connection {
             &syms,
             mode,
             input,
-            origin,
             prepare_options,
             kind,
             prepare_generation,
@@ -1153,7 +1158,6 @@ impl Connection {
                     &syms,
                     mode,
                     input,
-                    origin,
                     prepare_options,
                     kind,
                     prepare_generation,
@@ -1189,6 +1193,30 @@ impl Connection {
     #[allow(clippy::disallowed_methods, reason = "an entry point: it delegates to the shared preparation with the kind it states (dialect design R1)")]
     pub(crate) fn prepare_engine(self: &Arc<Connection>, sql: EngineSql<'_>, origin: Origin) -> Result<Statement> {
         self.prepare_text_with_origin(sql.as_str(), origin.into(), SqlKind::engine())
+    }
+
+    /// Prepare the CREATE that recreates one stored schema row (VACUUM; dialect design REVISION 2 items 1
+    /// and 6, 2.1): the bytes stored for the statement's own row are `entry.sql` verbatim, and the text
+    /// prepared is what the dialect reports for that row (`Dialect::table_sql_for_replay_stored` for a
+    /// table; the row itself for an index, view or trigger, whose rows are canonical SQLite). The
+    /// statement's implicit rows (an autoindex, a sequence table, sqlite_sequence) keep their engine
+    /// text. Two copies (name and sql into the kind's `Arc<str>`s), in VACUUM only.
+    #[allow(clippy::disallowed_methods, reason = "an entry point: it delegates to the shared preparation with the kind it states (dialect design R1)")]
+    pub(crate) fn prepare_replay(
+        self: &Arc<Connection>,
+        entry: &crate::vdbe::vacuum::SchemaEntry,
+        origin: Origin,
+    ) -> Result<Statement> {
+        // A storage-backed table's row is the dialect's to read back; every other row (an index, a view,
+        // a trigger, a virtual table's rootpage-0 row) is canonical SQLite, prepared as VACUUM always has.
+        let parse = match entry.entry_type {
+            crate::vdbe::vacuum::SchemaEntryType::Table if entry.rootpage != 0 => {
+                self.db.dialect().table_sql_for_replay_stored(&entry.sql)?
+            }
+            _ => StoredSql::sqlite(entry.sql.as_str()),
+        };
+        let kind = SqlKind::replay(parse.syntax, &entry.name, &entry.sql);
+        self.prepare_text_with_origin(&*parse.sql, origin.into(), kind)
     }
 
     /// `execute` of the engine's own SQLite text: every statement in it, kind `SqlKind::engine()`.
@@ -1273,7 +1301,7 @@ impl Connection {
                 .unwrap()
                 .trim();
             let prepare_options = PrepareOptions::default();
-            let (program, pager, mode) = self.compile_cmd(cmd, input, origin, &prepare_options, &kind)?;
+            let (program, pager, mode) = self.compile_cmd(cmd, input, &prepare_options, &kind)?;
 
             Ok(Statement::new_with_origin(
                 program,
@@ -1358,7 +1386,7 @@ impl Connection {
         }
         let result = (|| {
             let kind = SqlKind::client();
-            let (program, pager, mode) = self.compile_cmd(cmd, input, origin, &prepare_options, &kind)?;
+            let (program, pager, mode) = self.compile_cmd(cmd, input, &prepare_options, &kind)?;
             // Kept with the statement: a re-prepare translates under them (wire-rework B-H2).
             Ok(Statement::new_with_origin(
                 program,
@@ -1966,7 +1994,7 @@ impl Connection {
                 .trim();
             let kind = SqlKind::client();
             let (program, pager, mode) =
-                self.compile_cmd(cmd, input, StatementOrigin::Root, &prepare_options, &kind)?;
+                self.compile_cmd(cmd, input, &prepare_options, &kind)?;
             Statement::new(program, pager, mode, 0, kind).run_ignore_rows()?;
             remaining = &remaining[byte_offset_end..];
         }
@@ -2005,7 +2033,7 @@ impl Connection {
         let prepare_options = PrepareOptions::default();
         let kind = SqlKind::client();
         let (program, pager, mode) =
-            self.compile_cmd(cmd, input, StatementOrigin::Root, &prepare_options, &kind)?;
+            self.compile_cmd(cmd, input, &prepare_options, &kind)?;
         let stmt = Statement::new(program, pager, mode, 0, kind);
         Ok(Some(stmt))
     }
@@ -2042,7 +2070,7 @@ impl Connection {
                 .unwrap()
                 .trim();
             let origin = StatementOrigin::from(origin);
-            let (program, pager, mode) = self.compile_cmd(cmd, input, origin, &prepare_options, &kind)?;
+            let (program, pager, mode) = self.compile_cmd(cmd, input, &prepare_options, &kind)?;
             {
                 crate::stack::trace_stack!("run");
                 // The kind travels with the statement (review dialect MED-3: it defaulted to Client).
@@ -2069,7 +2097,7 @@ impl Connection {
         let prepare_options = PrepareOptions::default();
         let kind = SqlKind::client();
         let (program, pager, mode) =
-            self.compile_cmd(cmd, input, StatementOrigin::Root, &prepare_options, &kind)?;
+            self.compile_cmd(cmd, input, &prepare_options, &kind)?;
         let stmt = Statement::new(program, pager, mode, 0, kind);
         Ok(Some((stmt, byte_offset_end)))
     }

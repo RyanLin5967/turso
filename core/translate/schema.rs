@@ -1344,14 +1344,25 @@ pub fn translate_create_table(
     // the schema dialect format the SQL to store (the SQLite dialect renders
     // canonical text from the AST, a frontend dialect preserves its own
     // input text).
-    let sql = if let Some(ref info) = ctas_info {
-        info.schema_sql.clone()
-    } else {
-        // The resolver's dialect: SQLite for SQLite text (an engine helper's table is stored as
-        // SQLite text, never marked as the frontend's; the NO SILENT DIALECT SWITCH class).
-        resolver
-            .dialect
-            .format_table_sql(input, &tbl_name, &body)?
+    // The table's own row, by the statement's SOURCE (dialect design REVISION 2 item 2): engine text is
+    // stored as canonical SQLite (never the frontend's formatter); a client's text through the
+    // dialect's formatter; a replay keeps its source row's bytes (its own row only); a frontend's
+    // canonical text never creates a table (R11). CTAS stores its plan's text (outside item 2).
+    let sql = match (&resolver.sql_source, &ctas_info) {
+        (crate::connection::SqlSource::Frontend, _) => {
+            bail_parse_error!(
+                "a frontend's canonical SQLite text may not create a table ({}): a frontend creates its tables through its own parser",
+                tbl_name.name.as_str()
+            );
+        }
+        (crate::connection::SqlSource::Replay { .. }, _) => {
+            crate::translate::replayed_own_row(resolver, tbl_name.name.as_str())?.expect("a replay source")
+        }
+        (_, Some(info)) => info.schema_sql.clone(),
+        (crate::connection::SqlSource::Engine, None) => {
+            crate::dialect::Dialect::format_table_sql(&crate::dialect::SqliteDialect, input, &tbl_name, &body)?
+        }
+        (crate::connection::SqlSource::Client, None) => resolver.dialect.format_table_sql(input, &tbl_name, &body)?,
     };
 
     let parse_schema_label = program.allocate_label();

@@ -87,6 +87,14 @@ pub trait Dialect: Send + Sync + 'static {
     /// schema parsing methods.
     fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String>;
 
+    /// `table_sql_for_replay` with the syntax the returned text is in (dialect design REVISION 2 item 4):
+    /// VACUUM prepares the text with that parser and stores the row's own bytes verbatim. Default:
+    /// SQLite syntax, which holds for a dialect whose replay text is SQLite (SqliteDialect). A frontend
+    /// whose replay text is its own DDL (PostgresDialect) returns `StoredSql::client` for those rows.
+    fn table_sql_for_replay_stored(&self, sql: &str) -> crate::Result<crate::connection::StoredSql> {
+        Ok(crate::connection::StoredSql::sqlite(self.table_sql_for_replay(sql)?))
+    }
+
     /// Produce the SQL text to store in `sqlite_schema` for a
     /// `CREATE TABLE`.
     ///
