@@ -1115,7 +1115,9 @@ fn a_cast_to_a_type_over_text_converts_and_over_bytea_encodes_an_integer() {
     ] {
         let e = a.q(sql).err(sql);
         assert_eq!(e.code, "42846", "{sql}: {e:?}");
-        assert!(e.message.starts_with(&format!("cannot cast type {source} to ")), "{sql}: {e:?}");
+        // PostgreSQL's text after the registered PGDIV-PARSE-PREFIX ("Parse error: ", postgres/COMPAT.md).
+        let text = e.message.strip_prefix("Parse error: ").unwrap_or(&e.message);
+        assert!(text.starts_with(&format!("cannot cast type {source} to ")), "{sql}: {e:?}");
     }
     // Control: a text source to bytea is no refusal.
     a.q("SELECT CAST('ab' AS bytea)").ok("SELECT CAST('ab' AS bytea)");
