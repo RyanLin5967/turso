@@ -715,7 +715,71 @@ fn handle_meta_command(
 // SQL execution
 // ---------------------------------------------------------------------------
 
+/// The CLI's open block failed: a statement errored inside it. PostgreSQL aborts the block at
+/// the error, so until it ends every statement is 25P02, COMMIT (END, ROLLBACK, ABORT) ends it as
+/// ROLLBACK and ROLLBACK TO a savepoint recovers it, as the server's fail_block does. A script's
+/// later COMMIT committed the failed block's other statements (found by wire-rev-uw2 N4's red).
+/// One CLI process holds one connection, so the state is the process's.
+static BLOCK_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn execute_sql(
+    conn: &Connection,
+    sql: &str,
+    table_config: &TableConfig,
+    expanded: bool,
+    w: &mut dyn Write,
+) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    if conn.inner().get_auto_commit() {
+        BLOCK_FAILED.store(false, Relaxed);
+    }
+    if !BLOCK_FAILED.load(Relaxed) {
+        let had_error = run_statements(conn, sql, table_config, expanded, w);
+        if had_error && !conn.inner().get_auto_commit() {
+            BLOCK_FAILED.store(true, Relaxed);
+        }
+        return had_error;
+    }
+    let statements = turso_pg::split_statements(sql).unwrap_or_else(|_| vec![sql.to_string()]);
+    for (i, statement) in statements.iter().enumerate() {
+        match turso_pg::failed_block_verb(statement) {
+            turso_pg::FailedBlockVerb::Ends { chain } => {
+                if let Err(e) = conn.execute("ROLLBACK") {
+                    let _ = writeln!(w, "Error: {e}");
+                    return true;
+                }
+                conn.tx_event(turso_pg::TxEvent::Ended { committed: false }, statement);
+                BLOCK_FAILED.store(false, Relaxed);
+                if chain {
+                    if let Err(e) = conn.execute("BEGIN") {
+                        let _ = writeln!(w, "Error: {e}");
+                        return true;
+                    }
+                }
+            }
+            turso_pg::FailedBlockVerb::RollbackTo => {
+                if run_statements(conn, statement, table_config, expanded, w) {
+                    return true;
+                }
+                BLOCK_FAILED.store(false, Relaxed);
+            }
+            turso_pg::FailedBlockVerb::Other => {
+                let _ = writeln!(
+                    w,
+                    "Error: current transaction is aborted, commands ignored until end of transaction block"
+                );
+                return true;
+            }
+        }
+        if !BLOCK_FAILED.load(Relaxed) && i + 1 < statements.len() {
+            return execute_sql(conn, &statements[i + 1..].join(";\n"), table_config, expanded, w);
+        }
+    }
+    false
+}
+
+/// Run `sql`'s statements in order, stopping at the first error; true when one failed.
+fn run_statements(
     conn: &Connection,
     sql: &str,
     table_config: &TableConfig,

@@ -1233,6 +1233,36 @@ pub fn is_commit(sql: &str) -> bool {
     }
 }
 
+/// What a statement does to a failed (aborted) block, as PostgreSQL reads it: COMMIT, END,
+/// ROLLBACK, ABORT and PREPARE TRANSACTION end it as ROLLBACK (`chain` for AND CHAIN, which opens
+/// a new block), ROLLBACK TO a savepoint recovers it, and every other statement is 25P02.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailedBlockVerb {
+    Ends { chain: bool },
+    RollbackTo,
+    Other,
+}
+
+/// [`FailedBlockVerb`] of `sql`, read from its parse (Other for text that does not parse).
+pub fn failed_block_verb(sql: &str) -> FailedBlockVerb {
+    use turso_pg_parser::pg_query::protobuf::TransactionStmtKind as K;
+    use turso_pg_parser::pg_query::NodeRef;
+    let Ok(parsed) = turso_pg_parser::parse(sql) else {
+        return FailedBlockVerb::Other;
+    };
+    let nodes = parsed.protobuf.nodes();
+    let Some(NodeRef::TransactionStmt(t)) = nodes.first().map(|n| &n.0) else {
+        return FailedBlockVerb::Other;
+    };
+    match K::try_from(t.kind).ok() {
+        Some(K::TransStmtCommit | K::TransStmtRollback | K::TransStmtPrepare) => {
+            FailedBlockVerb::Ends { chain: t.chain }
+        }
+        Some(K::TransStmtRollbackTo) => FailedBlockVerb::RollbackTo,
+        _ => FailedBlockVerb::Other,
+    }
+}
+
 /// The one statement `sql` is when it holds no separator but a trailing one (no literal, comment or
 /// dollar quote can make it two), borrowed: [`split_statements`]' first case, which a server can
 /// take without the split's Vec and copy (L5).
