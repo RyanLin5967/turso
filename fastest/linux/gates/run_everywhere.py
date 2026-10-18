@@ -393,14 +393,21 @@ def self_test():
         rows(("good.py", good), ("labelna.py", ('print("SELF-TEST PASS: a root case counted N/A-on-noroot: under sudo x")',
                                                 'print("TALLY ran=1 pass=1 na=0 fail=0")', "sys.exit(0)")))
         rc, out = cli(t)
-        cases.append(("uw5 L4: a PASS line whose label names N/A-on-noroot: is no N/A line (the row passes, rc 0)",
-                      rc == 0 and "PASS a/labelna.py" in out))
+        # FLAGGED TEST EDIT (linux-rev-uw5 N2, a tightening): such a line is no N/A, AND it is refused: a case that says
+        # PASS while naming an N/A cause ("PASS ... (N/A-on-noroot: skipped)") is the respelled skip, so the row fails
+        cases.append(("uw5 N2: a PASS line that also names an N/A cause is refused (rc 1, the line called ambiguous)",
+                      rc == 1 and "labelna.py" in out and "ambiguous" in out))
         rows(("good.py", good), ("labelna2.py", ('print("SELF-TEST PASS: a case named N/A-on-noroot: x")',
                                                  'print("T3LIB self-test N/A-on-noroot: case y")',
                                                  'print("TALLY ran=1 pass=1 na=1 fail=0")', "sys.exit(3)")))
         rc, out = cli(t)
-        cases.append(("uw5 L4: beside such a label, the row's one real N/A line is counted once (na=1 agrees, rc 3)",
-                      rc == 3 and "N/A a/labelna2.py" in out))
+        cases.append(("uw5 N2: beside a real N/A line, an ambiguous PASS line still refuses the row (rc 1)",
+                      rc == 1 and "labelna2.py" in out and "ambiguous" in out))
+        rows(("good.py", good), ("realna.py", ('print("T3LIB self-test N/A-on-noroot: case y")',
+                                               'print("TALLY ran=0 pass=0 na=1 fail=0")', "sys.exit(3)")))
+        rc, out = cli(t)
+        cases.append(("uw5 L4: a real N/A-outcome line alone is the N/A outcome (na=1 agrees, rc 3)",
+                      rc == 3 and "N/A a/realna.py" in out))
         for f_ in os.listdir(os.path.join(t, "a")):
             os.remove(os.path.join(t, "a", f_))
         open(os.path.join(t, "a", "good.py"), "w").write(ok_py)
