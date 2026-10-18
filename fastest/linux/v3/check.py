@@ -26,6 +26,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import v3cell  # noqa: E402
 sys.path.insert(0, os.path.join(os.path.dirname(HERE), "gates"))
+import tally  # noqa: E402  the one outcome record every self-test prints (gates/tally.py, linux-rev-uw2 MED 1)
 import hostbin  # noqa: E402  every "bash" here is hostbin's bash 5+, never the caller's PATH's (the platform class)
 
 
@@ -2148,8 +2149,10 @@ def main(argv):
     # B: blkflush.py's own fire-check
     bt = rd(os.path.join(OUT, "B", "selftest.txt")) or ""
     m = re.search(r"BLKFLUSH SELF-TEST (\d+)/(\d+) PASS\s*$", bt)
+    # the summary line AND the self-test's own TALLY agreeing with its rc (gates/tally.py): a summary read alone is
+    # wording, the TALLY is the outcome (the lead's 2026-10-18 order on truncated self-test output)
     check("B:selftest", rc_of(os.path.join(OUT, "B", "selftest.rc")) == 0 and m is not None and m.group(1) == m.group(2)
-          and int(m.group(2)) > 0, {"tail": bt[-300:], "rc": rc_of(os.path.join(OUT, "B", "selftest.rc"))},
+          and int(m.group(2)) > 0 and tally.judge(bt, 0)[0] == "pass", {"tail": bt[-300:], "rc": rc_of(os.path.join(OUT, "B", "selftest.rc"))},
           "blkflush.py self-test: the parser and the window attribution on planted text (rc 0, n/n with n > 0)")
     br = rj(os.path.join(OUT, "B", "report.json")) or {}
     lp_dev = (rd(os.path.join(OUT, "B", "loopdev.txt")) or "").strip().replace("/dev/", "")
@@ -2188,13 +2191,13 @@ def main(argv):
     st = rd(os.path.join(OUT, "B", "batchgate-selftest.txt")) or ""
     m = re.search(r"BATCHGATE SELF-TEST (\d+)/(\d+) PASS\s*$", st)
     check("S:batchgate", rc_of(os.path.join(OUT, "B", "batchgate-selftest.rc")) == 0 and m is not None
-          and m.group(1) == m.group(2) and int(m.group(2)) > 0, {"tail": st[-400:]},
+          and m.group(1) == m.group(2) and int(m.group(2)) > 0 and tally.judge(st, 0)[0] == "pass", {"tail": st[-400:]},
           "batchgate.py self-test in this cell (the flush gate on the banked cells, every verdict-shape refusal by its "
           "own reason, the T3 rule): the binding's rules are tested in the verdict that relies on them")
     st = rd(os.path.join(OUT, "B", "check-selftest.txt")) or ""
     m = re.search(r"CHECK SELF-TEST (\d+)/(\d+) PASS\s*$", st)
     check("S:check", rc_of(os.path.join(OUT, "B", "check-selftest.rc")) == 0 and m is not None
-          and m.group(1) == m.group(2) and int(m.group(2)) > 0, {"tail": st[-400:]},
+          and m.group(1) == m.group(2) and int(m.group(2)) > 0 and tally.judge(st, 0)[0] == "pass", {"tail": st[-400:]},
           "check.py --self-test in this cell: the checker's own leaf, virtualization, linkage, qualifier, MODE SENSE "
           "byte and harness rules each fire on planted records")
 

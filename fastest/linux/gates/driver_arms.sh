@@ -17,7 +17,8 @@ FAILED=""
 arm() { local n=$1 want=$2 rc=0; shift 2; "$@" > "$OUT/contract-$n.txt" 2>&1 || rc=$?
   tail -1 "$OUT/contract-$n.txt"
   [ $rc -eq "$want" ] || { echo "arm $n: rc $rc, want $want ($OUT/contract-$n.txt)"; FAILED="$FAILED $n"; }; }
-arm selftest 0 python3 -B "$C" self-test
+# judged by its TALLY and rc (gates/run_selftest.sh), not by the tail of its output
+arm selftest 0 bash "$HERE/run_selftest.sh" python3 -B "$C" self-test
 # each run's record directory starts empty, so a rerun into the same OUT never replays a stale warmup-live.json (fresh
 # read of 7a8c3a817..0802dd739, finding 3)
 rm -rf "$OUT"/contract-k1 "$OUT"/contract-k2 "$OUT"/contract-k3
