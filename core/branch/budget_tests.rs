@@ -1582,6 +1582,44 @@ fn trunk_for_fc(db: &Arc<Database>) {
     db.connect().unwrap().create_branch("fc-dirty").unwrap();
 }
 
+/// This thread's id: pthread_threadid_np on Apple; off Apple the KERNEL thread id by raw syscall(2)
+/// (SYS_gettid), never `libc::gettid`, which glibc has only from 2.30: the RHEL 8 iccad hosts run 2.28,
+/// where a build links and the call SIGSEGVs (fastest-budgets, uwrun budgets-segv-1). Off Apple
+/// `thread_table` is None, so the table checks have no data there; the id keeps them compiling and
+/// distinct per thread.
+fn this_thread_id() -> u64 {
+    #[cfg(target_vendor = "apple")]
+    {
+        let mut me = 0u64;
+        // SAFETY: this thread's own id into a local.
+        unsafe { libc::pthread_threadid_np(0, &mut me) };
+        me
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        // SAFETY: gettid(2) has no preconditions and cannot fail.
+        unsafe { libc::syscall(libc::SYS_gettid) as u64 }
+    }
+}
+
+/// `this_thread_id` names the calling thread, distinctly per thread, on every libc: on Linux it is
+/// the kernel's id, read back from /proc/thread-self (a link to `<pid>/task/<tid>`).
+#[test]
+fn this_thread_id_is_the_calling_thread_s_own() {
+    let ids: Vec<u64> = (0..4).map(|_| std::thread::spawn(this_thread_id).join().unwrap()).collect();
+    let mut distinct = ids.clone();
+    distinct.sort();
+    distinct.dedup();
+    assert_eq!(distinct.len(), ids.len(), "CLAIM: two threads got one id: {ids:?}");
+    assert!(ids.iter().all(|&i| i != 0), "CLAIM: a thread id is 0: {ids:?}");
+    #[cfg(target_os = "linux")]
+    {
+        let link = std::fs::read_link("/proc/thread-self").expect("premise: /proc/thread-self is readable");
+        let tid: u64 = link.file_name().and_then(|f| f.to_str()).and_then(|f| f.parse().ok()).expect("premise: <pid>/task/<tid>");
+        assert_eq!(this_thread_id(), tid, "CLAIM: this_thread_id is not the kernel thread id (link {link:?})");
+    }
+}
+
 /// getppid by raw syscall(2), the one call the shim cannot see: BSD/macOS number 39; on Linux the
 /// platform's own SYS_getppid (39 there is getpid on x86_64 and umount2 on aarch64: integ-rev-1017).
 #[cfg(target_vendor = "apple")]
@@ -1791,19 +1829,7 @@ fn run_instruments(cell: &str) -> String {
             .map(|_| {
                 let (stop, ids, unlisted, roles, go, done) = (stop.clone(), ids.clone(), unlisted.clone(), roles.clone(), go.clone(), done.clone());
                 std::thread::spawn(move || {
-                    #[cfg(target_vendor = "apple")]
-                    let me = {
-                        let mut me = 0u64;
-                        // SAFETY: this thread's own id into a local.
-                        unsafe { libc::pthread_threadid_np(0, &mut me) };
-                        me
-                    };
-                    // Off Apple `thread_table` is None, so this block's table checks have no data there;
-                    // the kernel thread id keeps it compiling and distinct per thread (a Linux test build
-                    // failed E0425 here, ecetesla2 2026-10-18).
-                    // SAFETY: gettid has no preconditions.
-                    #[cfg(not(target_vendor = "apple"))]
-                    let me = unsafe { libc::gettid() } as u64;
+                    let me = this_thread_id();
                     ids.lock().unwrap().push(me);
                     while !roles.load(Acquire) {
                         std::thread::park_timeout(std::time::Duration::from_millis(1));
