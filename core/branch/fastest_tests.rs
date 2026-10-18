@@ -15330,61 +15330,69 @@ fn add_column_checks_its_new_check_against_every_existing_row() {
 }
 
 /// L5's module (queue a-f review): an ordinary writable virtual table with no rows, so a write to
-/// it runs VBegin, which looks the table up in the connection's registry by id.
-#[derive(Debug, turso_ext::VTabModuleDerive, Default)]
-struct L5VTabModule;
+/// it runs VBegin, which looks the table up in the connection's registry by id. In its own module
+/// because the derive names the extension traits unqualified.
+mod l5_vtab {
+    use crate::sync::Arc;
+    use turso_ext::{
+        Connection, ResultCode, VTabCursor, VTabKind, VTabModule, VTabModuleDerive, VTable, Value,
+    };
 
-#[derive(Debug)]
-struct L5Table;
+    #[derive(Debug, VTabModuleDerive, Default)]
+    pub(super) struct L5VTabModule;
 
-#[derive(Debug)]
-struct L5Cursor;
+    #[derive(Debug)]
+    pub(super) struct L5Table;
 
-impl turso_ext::VTabModule for L5VTabModule {
-    type Table = L5Table;
-    const VTAB_KIND: turso_ext::VTabKind = turso_ext::VTabKind::VirtualTable;
-    const NAME: &'static str = "l5_vtab";
-    const READONLY: bool = false;
+    #[derive(Debug)]
+    pub(super) struct L5Cursor;
 
-    fn create(_args: &[turso_ext::Value]) -> Result<(String, Self::Table), turso_ext::ResultCode> {
-        Ok(("CREATE TABLE x (v INTEGER)".to_string(), L5Table))
-    }
-}
+    impl VTabModule for L5VTabModule {
+        type Table = L5Table;
+        const VTAB_KIND: VTabKind = VTabKind::VirtualTable;
+        const NAME: &'static str = "l5_vtab";
+        const READONLY: bool = false;
 
-impl turso_ext::VTable for L5Table {
-    type Cursor = L5Cursor;
-    type Error = String;
-
-    fn open(&self, _conn: Option<Arc<turso_ext::Connection>>) -> Result<Self::Cursor, Self::Error> {
-        Ok(L5Cursor)
-    }
-
-    fn insert(&mut self, _args: &[turso_ext::Value]) -> Result<i64, Self::Error> {
-        Ok(1)
-    }
-}
-
-impl turso_ext::VTabCursor for L5Cursor {
-    type Error = String;
-
-    fn filter(&mut self, _args: &[turso_ext::Value], _idx_info: Option<(&str, i32)>) -> turso_ext::ResultCode {
-        turso_ext::ResultCode::EOF
+        fn create(_args: &[Value]) -> Result<(String, Self::Table), ResultCode> {
+            Ok(("CREATE TABLE x (v INTEGER)".to_string(), L5Table))
+        }
     }
 
-    fn rowid(&self) -> i64 {
-        0
+    impl VTable for L5Table {
+        type Cursor = L5Cursor;
+        type Error = String;
+
+        fn open(&self, _conn: Option<Arc<Connection>>) -> Result<Self::Cursor, Self::Error> {
+            Ok(L5Cursor)
+        }
+
+        fn insert(&mut self, _args: &[Value]) -> Result<i64, Self::Error> {
+            Ok(1)
+        }
     }
 
-    fn column(&self, _idx: u32) -> Result<turso_ext::Value, Self::Error> {
-        Ok(turso_ext::Value::null())
-    }
+    impl VTabCursor for L5Cursor {
+        type Error = String;
 
-    fn eof(&self) -> bool {
-        true
-    }
+        fn filter(&mut self, _args: &[Value], _idx_info: Option<(&str, i32)>) -> ResultCode {
+            ResultCode::EOF
+        }
 
-    fn next(&mut self) -> turso_ext::ResultCode {
-        turso_ext::ResultCode::EOF
+        fn rowid(&self) -> i64 {
+            0
+        }
+
+        fn column(&self, _idx: u32) -> Result<Value, Self::Error> {
+            Ok(Value::null())
+        }
+
+        fn eof(&self) -> bool {
+            true
+        }
+
+        fn next(&mut self) -> ResultCode {
+            ResultCode::EOF
+        }
     }
 }
 
@@ -15400,7 +15408,7 @@ fn a_rolled_back_drop_of_a_virtual_table_leaves_it_writable() {
     let db = open_at(&dir.path().join("l5.db"), DatabaseOpts::new());
     let c = db.connect().unwrap();
     c.register_static_extension(|api| unsafe {
-        L5VTabModule::register_L5VTabModule(api);
+        l5_vtab::L5VTabModule::register_L5VTabModule(api);
     });
     c.execute("CREATE VIRTUAL TABLE vt USING l5_vtab").unwrap();
     c.execute("INSERT INTO vt VALUES (1)").expect("premise: a write to the virtual table works");
