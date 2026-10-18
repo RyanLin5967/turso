@@ -353,6 +353,34 @@ def self_test():
         open(csh, "w").write('#!/bin/bash\n# echo "TALLY ran=1 pass=1 na=0 fail=0"\necho x\n')
         cases.append(("uw3 LOW 5: a source whose only TALLY is in a comment does not print one (.py and .sh)",
                       not pt(cpy) and not pt(csh)))
+        # linux-rev-uw4 LOW 4: the same class past full-line comments: a TALLY in a trailing comment, a heredoc body, a
+        # statically dead branch, a print to another file, or a .line() of some other object prints nothing when run.
+        # Each plant must read silent; each honest form must still read as printing
+        def plant(name, text):
+            f_ = os.path.join(t, name)
+            open(f_, "w").write(text)
+            return pt(f_)
+        tl = 'TALLY ran=1 pass=1 na=0 fail=0'
+        silent_plants = [
+            ("a trailing comment", "trail_test.sh", f'#!/bin/bash\ntrue  # echo "{tl}"\n'),
+            ("a heredoc body", "heredoc_test.sh", f"#!/bin/bash\ncat > /dev/null <<'EOF2'\necho \"{tl}\"\nEOF2\n"),
+            ("an <<- heredoc body", "heredoc2_test.sh", f'#!/bin/bash\ncat > /dev/null <<-EOF2\n\techo "{tl}"\n\tEOF2\n'),
+            ("an if False branch", "dead.py", f'if False:\n    print("{tl}")\n'),
+            ("a while 0 body", "dead2.py", f'while 0:\n    print("{tl}")\n'),
+            ("a print to another file", "tofile.py", f'print("{tl}", file=open("/dev/null", "w"))\n'),
+            ("a .line() of another object", "otherline.py", 'class X:\n    def line(self):\n        return "x"\nprint(X().line())\n'),
+        ]
+        honest_plants = [
+            ("an echo with a trailing comment", "honest_test.sh", f'#!/bin/bash\necho "{tl}"  # gates/tally.py\n'),
+            ("a printf after a heredoc ends", "honest2_test.sh", f"#!/bin/bash\ncat > /dev/null <<'EOF2'\nx\nEOF2\nprintf '%s\\n' '{tl}'\n"),
+            ("an echo after ${{#x}} on the line", "honest3_test.sh", f'#!/bin/bash\nx=ab; n=${{#x}}; echo "{tl}"\n'),
+            ("a print of tally.line()", "honest.py", 'import tally\nprint(tally.line(1, 1, 0, 0))\n'),
+            ("an f-string print to stdout", "honest2.py", 'import sys\np = 1\nprint(f"TALLY ran={p} pass={p} na=0 fail=0", file=sys.stdout)\n'),
+        ]
+        for what, name, text in silent_plants:
+            cases.append((f"uw4 LOW 4: a TALLY only in {what} does not print one", not plant(name, text)))
+        for what, name, text in honest_plants:
+            cases.append((f"uw4 LOW 4: {what} still prints a TALLY", plant(name, text)))
         silent = [r[0] for r in rows_ if os.path.isfile(os.path.join(real, r[0])) and not pt(os.path.join(real, r[0]))]
         cases.append(("every real row's source prints a TALLY line (none silent: %s)" % (silent or "none"), not silent))
         for victim in ("gates/warmup_conformance.py", "gates/driver_contract.py"):

@@ -267,6 +267,22 @@ def self_test():
         ("uw3 LOW 3: a control with its honest TALLY and summary is green",
          lambda: cg(0, "TALLY ran=3 pass=3 na=0 fail=0\nV3L SELF-TEST 3/3 PASS\n")),
     ]
+    # linux-rev-uw4 LOW 7: the SECOND unmutated control (the copy in the mutants' temp layout) is judged as the first
+    # is, by control_green plus the in-place total; the red reaches layout_control_ok through a fallback with today's
+    # rule (rc 0, no FAIL lines, the same summary)
+    lc = globals().get("layout_control_ok", lambda rc2, out2, total2, total: rc2 == 0 and " FAIL: " not in out2
+                       and total2 == total)
+    s3 = "V3L SELF-TEST 3/3 PASS"
+    cases += [
+        ("uw4 LOW 7: a temp-layout control whose summary matches but which prints no TALLY is not the control",
+         lambda: not lc(0, s3 + "\n", s3, s3)),
+        ("uw4 LOW 7: a temp-layout control whose TALLY disagrees with its rc (fail=1 at rc 0) is not the control",
+         lambda: not lc(0, "TALLY ran=3 pass=2 na=0 fail=1\n" + s3 + "\n", s3, s3)),
+        ("uw4 LOW 7: an honest temp-layout control with the in-place total is the control",
+         lambda: lc(0, "TALLY ran=3 pass=3 na=0 fail=0\n" + s3 + "\n", s3, s3)),
+        ("uw4 LOW 7: an honest temp-layout control with another total is not the control",
+         lambda: not lc(0, "TALLY ran=2 pass=2 na=0 fail=0\nV3L SELF-TEST 2/2 PASS\n", "V3L SELF-TEST 2/2 PASS", s3)),
+    ]
     bad = 0
     for name, f in cases:
         try:

@@ -40,10 +40,13 @@ pd=$(mktemp -d) || exit 2
 trap 'rm -rf "$pd"' EXIT
 printf '[package]\nname = "x"\n\n[[bench]]\nname = "one"\nrequired-features = ["simulator"]\n' > "$pd/one.toml"
 printf '[package]\nname = "x"\n\n[[bench]]\nname = "multi"\nharness = false\nrequired-features = [\n    "simulator",\n    "fuzz",\n]\n' > "$pd/multi.toml"
-printf '[package]\nname = "x"\n\n[features]\nrequired-features = ["notatarget"]\n\n[[example]]\nname = "e"\n' > "$pd/none.toml"
+# linux-rev-uw4 LOW 3 (FLAGGED TEST EDIT, a strengthening): the old none.toml expected EMPTY output, which a parser
+# printing nothing also gave; the same non-target key now sits beside an [[example]] and a [[test]] whose
+# requirements must be read, so the case fails both a parser that reads nothing and one that reads [[bench]] only
+printf '[package]\nname = "x"\n\n[features]\nrequired-features = ["notatarget"]\n\n[[example]]\nname = "e"\nrequired-features = ["fts"]\n\n[[test]]\nname = "t"\nrequired-features = ["simulator"]\n' > "$pd/none.toml"
 pcase "a one-line required-features array is read" '[ "$(required_features "$pd/one.toml" | tr "\n" " ")" = "simulator " ]'
 pcase "uw3 LOW 5: a multi-line required-features array is read whole" '[ "$(required_features "$pd/multi.toml" | tr "\n" " ")" = "fuzz simulator " ]'
-pcase "a key outside [[bench]]/[[example]]/[[test]] is not a target's requirement" '[ -z "$(required_features "$pd/none.toml")" ]'
+pcase "uw4 LOW 3: a key outside [[bench]]/[[example]]/[[test]] is not a target's requirement; [[example]] and [[test]] requirements are" '[ "$(required_features "$pd/none.toml" | tr "\n" " ")" = "fts simulator " ]'
 [ $pf = 0 ] || { echo "TALLY ran=$((pp + pf + 1)) pass=$pp na=0 fail=$((pf + 1))"; echo "CARGO-ALL-TARGETS FAIL: its parser"; exit 1; }
 req=$(required_features core/Cargo.toml) || { echo "CARGO-ALL-TARGETS REFUSED: core/Cargo.toml could not be parsed"; exit 2; }
 miss=""
