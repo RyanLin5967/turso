@@ -324,7 +324,9 @@ pub fn sqlite_builtins_resolved_differently(dialect: &dyn Dialect, min_names: us
     };
     let mut different = Vec::new();
     for (name, _) in &names {
-        for arity in 0..=8 {
+        // 0..=32 (dialect code review LOW-6: 0..=8 left the arities of the long variadic builtins, such
+        // as json_object's pairs, unchecked).
+        for arity in 0..=32 {
             let want = shape(sqlite::resolve_builtin_function(name, arity));
             let got = shape(dialect.resolve_function(name, arity));
             if want != got {
@@ -792,12 +794,18 @@ mod tests {
             shadow.iter().any(|d| d.starts_with("abs/")),
             "premise (negative control): a dialect shadowing abs was not caught: {shadow:?}"
         );
-        let dialects: [(&str, &dyn Dialect); 5] = [
+        // Every core test dialect that claims SQLite's functions (dialect code review LOW-6: 5 of them were
+        // checked). Left out by design: NoFunctionsDialect (it resolves none), ShadowAbs (the negative
+        // control above), and ParkingDialect's `park_here` (not a SQLite name, so not in the list).
+        let dialects: [(&str, &dyn Dialect); 8] = [
             ("SqliteDialect", &SqliteDialect),
             ("ClientOnlyDialect", &ClientOnlyDialect),
             ("MarkingDialect", &MarkingDialect),
             ("ReparseDialect", &ReparseDialect::default()),
             ("StrictTestDialect", &StrictTestDialect),
+            ("TestDialect", &TestDialect::default()),
+            ("ParkingDialect", &ParkingDialect::default()),
+            ("PgKeyTestDialect", &PgKeyTestDialect),
         ];
         let mut failed = Vec::new();
         for (name, d) in dialects {
