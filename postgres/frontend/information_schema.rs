@@ -359,10 +359,11 @@ fn load_pg_indexes(conn: &Connection) -> Result<Vec<Vec<Value>>> {
                 text(name.as_str()),
                 text(indexname.clone()),
                 Value::Null,
-                text(format!(
-                    "CREATE {}INDEX {indexname} ON public.{name} USING btree ({})",
-                    if unique { "UNIQUE " } else { "" },
-                    cols.join(", ")
+                text(crate::catalog::pg_index_definition(
+                    unique,
+                    &indexname,
+                    name,
+                    &cols.iter().map(|c| crate::catalog::pg_ident(c)).collect::<Vec<_>>(),
                 )),
             ]);
         };

@@ -157,12 +157,7 @@ fn exec_quote_literal(value: &Value) -> Value {
         Value::Text(t) => t.as_str().to_string(),
         other => other.to_string(),
     };
-    let quoted = if text.contains('\\') {
-        format!("E'{}'", text.replace('\\', "\\\\").replace('\'', "''"))
-    } else {
-        crate::catalog::quote_literal(&text)
-    };
-    Value::build_text(quoted)
+    Value::build_text(crate::catalog::pg_quote_literal(&text))
 }
 
 fn exec_pg_encoding_to_char(encoding: i64) -> Value {
@@ -444,7 +439,7 @@ fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option<String> {
                 let cols: Vec<String> = btree
                     .primary_key_columns
                     .iter()
-                    .map(|(name, _)| name.clone())
+                    .map(|(name, _)| crate::catalog::pg_ident(name))
                     .collect();
                 return Some(format!("PRIMARY KEY ({})", cols.join(", ")));
             }
@@ -453,7 +448,8 @@ fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option<String> {
 
         for us in &btree.unique_sets {
             if constraint_oid == target_oid {
-                let col_names: Vec<&str> = us.columns.iter().map(|c| c.name.as_str()).collect();
+                let col_names: Vec<String> =
+                    us.columns.iter().map(|c| crate::catalog::pg_ident(&c.name)).collect();
                 let kw = if us.is_primary_key {
                     "PRIMARY KEY"
                 } else {
@@ -466,11 +462,13 @@ fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option<String> {
 
         for fk in &btree.foreign_keys {
             if constraint_oid == target_oid {
-                let child_cols = fk.child_columns.join(", ");
-                let parent_cols = fk.parent_columns.join(", ");
+                let names = |cols: &[String]| {
+                    cols.iter().map(|c| crate::catalog::pg_ident(c)).collect::<Vec<_>>().join(", ")
+                };
+                let (child_cols, parent_cols) = (names(&fk.child_columns), names(&fk.parent_columns));
                 let mut def = format!(
                     "FOREIGN KEY ({child_cols}) REFERENCES {}({parent_cols})",
-                    fk.parent_table
+                    crate::catalog::pg_ident(&fk.parent_table)
                 );
                 let on_update = ref_act_to_char(&fk.on_update);
                 let on_delete = ref_act_to_char(&fk.on_delete);
@@ -508,7 +506,6 @@ fn pg_get_indexdef(conn: &Connection, target_oid: i64) -> Option<String> {
                 continue;
             }
             if index_oid == target_oid {
-                let unique = if idx.unique { "UNIQUE " } else { "" };
                 let cols: Vec<String> = idx
                     .columns
                     .iter()
@@ -516,15 +513,12 @@ fn pg_get_indexdef(conn: &Connection, target_oid: i64) -> Option<String> {
                         if let Some(expr) = &col.expr {
                             expr.to_string()
                         } else {
-                            col.name.clone()
+                            crate::catalog::pg_ident(&col.name)
                         }
                     })
                     .collect();
-                let mut def = format!(
-                    "CREATE {unique}INDEX {} ON {table_name} USING btree ({})",
-                    idx.name,
-                    cols.join(", ")
-                );
+                let mut def =
+                    crate::catalog::pg_index_definition(idx.unique, &idx.name, table_name, &cols);
                 if let Some(where_clause) = &idx.where_clause {
                     def.push_str(&format!(" WHERE {where_clause}"));
                 }

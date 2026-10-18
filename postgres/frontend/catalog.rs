@@ -43,6 +43,39 @@ pub(crate) fn quote_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
+/// A name as PostgreSQL prints it in text it shows a client (pg_get_indexdef, pg_indexes,
+/// pg_get_constraintdef, quote_ident()): quoted only when it must be, by its quote_identifier
+/// rules (turso_pg_parser::quote_identifier). Engine text takes [`quote_ident`], which always
+/// quotes; these are the frontend's two quoting functions for names, one per reader (review
+/// wire-quote LOW-1).
+pub(crate) fn pg_ident(name: &str) -> String {
+    turso_pg_parser::quote_identifier(name)
+}
+
+/// A value as PostgreSQL's quote_literal() prints it: `E'...'` with each backslash doubled when
+/// it holds one, so the text reads back the same whatever standard_conforming_strings is (recorded:
+/// pg18-rev-quote-low.out, quote_literal(E'a\\b') is E'a\\\\b'); otherwise [`quote_literal`].
+pub(crate) fn pg_quote_literal(value: &str) -> String {
+    if value.contains('\\') {
+        format!("E'{}'", value.replace('\\', "\\\\").replace('\'', "''"))
+    } else {
+        quote_literal(value)
+    }
+}
+
+/// An index's definition as pg_get_indexdef and pg_indexes print it in PostgreSQL 18.6: names by
+/// [`pg_ident`], the table qualified by its schema (recorded: CREATE INDEX "i j" ON public."a b"
+/// USING btree (x), pg18-rev-quote-low.out). `columns` are printed as given (an expression's text).
+pub(crate) fn pg_index_definition(unique: bool, index: &str, table: &str, columns: &[String]) -> String {
+    format!(
+        "CREATE {}INDEX {} ON public.{} USING btree ({})",
+        if unique { "UNIQUE " } else { "" },
+        pg_ident(index),
+        pg_ident(table),
+        columns.join(", ")
+    )
+}
+
 /// `sql` marked as this frontend's own SQLite ([`SQLITE_TEXT_MARKER`]).
 pub(crate) fn sqlite_text(sql: impl AsRef<str>) -> String {
     format!("{SQLITE_TEXT_MARKER}{}", sql.as_ref())
@@ -3670,153 +3703,6 @@ impl InternalVirtualTable for PgGetTableDefTable {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// pg_get_constraintdef / pg_get_indexdef helper functions
-// ──────────────────────────────────────────────────────────────────────
-
-/// Format a referential action character code to SQL clause text.
-#[allow(dead_code)]
-fn ref_act_to_sql(code: &str) -> &'static str {
-    match code {
-        "c" => "CASCADE",
-        "n" => "SET NULL",
-        "d" => "SET DEFAULT",
-        "r" => "RESTRICT",
-        _ => "NO ACTION",
-    }
-}
-
-/// Look up a constraint by OID and return its definition string.
-/// Uses the same OID assignment as PgConstraintCursor::load_constraints.
-#[allow(dead_code)]
-pub fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option<String> {
-    let schema = conn.current_schema();
-    let tables = user_tables_sorted(&schema);
-    let num_tables = tables.len() as i64;
-
-    // Build index_name -> index_oid map (same as pg_constraint)
-    let mut next_index_oid = USER_TABLE_OID_START + num_tables;
-    for (table_name, _) in &tables {
-        for idx in schema.get_indices(table_name) {
-            if !idx.ephemeral {
-                next_index_oid += 1;
-            }
-        }
-    }
-
-    let mut constraint_oid = next_index_oid;
-
-    for (_, table) in &tables {
-        let btree = match table.as_ref() {
-            Table::BTree(bt) => bt,
-            _ => continue,
-        };
-
-        // Synthesized PK for rowid-alias tables
-        let has_pk_in_unique_sets = btree.unique_sets.iter().any(|us| us.is_primary_key);
-        if !has_pk_in_unique_sets && !btree.primary_key_columns.is_empty() {
-            if constraint_oid == target_oid {
-                let cols: Vec<String> = btree
-                    .primary_key_columns
-                    .iter()
-                    .map(|(name, _)| name.clone())
-                    .collect();
-                return Some(format!("PRIMARY KEY ({})", cols.join(", ")));
-            }
-            constraint_oid += 1;
-        }
-
-        // PK / UNIQUE from unique_sets
-        for us in &btree.unique_sets {
-            if constraint_oid == target_oid {
-                let col_names: Vec<&str> = us.columns.iter().map(|c| c.name.as_str()).collect();
-                let kw = if us.is_primary_key {
-                    "PRIMARY KEY"
-                } else {
-                    "UNIQUE"
-                };
-                return Some(format!("{kw} ({})", col_names.join(", ")));
-            }
-            constraint_oid += 1;
-        }
-
-        // FK constraints
-        for fk in &btree.foreign_keys {
-            if constraint_oid == target_oid {
-                let child_cols = fk.child_columns.join(", ");
-                let parent_cols = fk.parent_columns.join(", ");
-                let mut def = format!(
-                    "FOREIGN KEY ({child_cols}) REFERENCES {}({parent_cols})",
-                    fk.parent_table
-                );
-                let on_update = ref_act_to_char(&fk.on_update);
-                let on_delete = ref_act_to_char(&fk.on_delete);
-                if on_update != "a" {
-                    def.push_str(&format!(" ON UPDATE {}", ref_act_to_sql(on_update)));
-                }
-                if on_delete != "a" {
-                    def.push_str(&format!(" ON DELETE {}", ref_act_to_sql(on_delete)));
-                }
-                return Some(def);
-            }
-            constraint_oid += 1;
-        }
-
-        // CHECK constraints
-        for chk in &btree.check_constraints {
-            if constraint_oid == target_oid {
-                return Some(format!("CHECK ({})", chk.expr));
-            }
-            constraint_oid += 1;
-        }
-    }
-
-    None
-}
-
-/// Look up an index by OID and return its definition (CREATE INDEX ...).
-/// Uses the same OID assignment as PgIndexCursor::load_indexes / PgClassTable.
-#[allow(dead_code)]
-pub fn pg_get_indexdef(conn: &Connection, target_oid: i64) -> Option<String> {
-    let schema = conn.current_schema();
-    let tables = user_tables_sorted(&schema);
-    let num_tables = tables.len() as i64;
-
-    let mut index_oid = USER_TABLE_OID_START + num_tables;
-    for (table_name, _) in &tables {
-        for idx in schema.get_indices(table_name) {
-            if idx.ephemeral {
-                continue;
-            }
-            if index_oid == target_oid {
-                let unique = if idx.unique { "UNIQUE " } else { "" };
-                let cols: Vec<String> = idx
-                    .columns
-                    .iter()
-                    .map(|col| {
-                        if let Some(expr) = &col.expr {
-                            expr.to_string()
-                        } else {
-                            col.name.clone()
-                        }
-                    })
-                    .collect();
-                let mut def = format!(
-                    "CREATE {unique}INDEX {} ON {table_name} USING btree ({})",
-                    idx.name,
-                    cols.join(", ")
-                );
-                if let Some(where_clause) = &idx.where_clause {
-                    def.push_str(&format!(" WHERE {where_clause}"));
-                }
-                return Some(def);
-            }
-            index_oid += 1;
-        }
-    }
-
-    None
-}
-
 // TODO: Fix tests to use correct API
 #[cfg(test)]
 #[allow(dead_code)]
