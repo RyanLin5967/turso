@@ -13734,7 +13734,11 @@ fn a_kept_statement_reprepared_after_a_setting_change_keeps_the_search_path() {
         ("SET client_min_messages", false, "SET client_min_messages TO notice"),
         ("SAVEPOINT", true, "SAVEPOINT a"),
         ("SET foreign_keys = off", false, "SET foreign_keys = off"),
-        ("ALTER TABLE s.t ADD COLUMN", false, "ALTER TABLE s.t ADD COLUMN y INT"),
+        // A CREATE in s, not an ALTER of s.t: with p1 bound on s.t, PostgreSQL refuses ALTER TABLE
+        // s.t with 55006 (CheckTableNotInUse: the bound portal holds it; reviews/uw2-raws
+        // round1-pg-all.txt s04), so that arm could never run in PostgreSQL. A DDL that does not
+        // touch t bumps the engine's prepare generation the same way.
+        ("CREATE TABLE s.u", false, "CREATE TABLE s.u (y INT)"),
     ] {
         let mut a = server.connect();
         a.q("SET search_path TO s").ok("path");
@@ -15014,13 +15018,17 @@ fn a_copy_through_a_flipping_link_never_reads_outside_the_grant() {
             flips
         })
     };
-    let (mut loaded, mut refused, mut other) = (0, 0, Vec::new());
+    let (mut loaded, mut refused, mut unreadable, mut other) = (0, 0, 0, Vec::new());
     let deadline = Instant::now() + Duration::from_secs(10);
     while loaded + refused < 2000 && Instant::now() < deadline {
         let r = a.q(&format!("COPY t FROM '{}'", link.display()));
         match &r.error {
             None => loaded += 1,
             Some(e) if e.code == "42501" => refused += 1,
+            // Linux's path walk racing a rename over the link can open the link's directory
+            // (MEASURED on ecetesla1's local disk, fliptest.py: 1 EISDIR in 20,000 plain opens, 0
+            // on NFS): a read error inside the grant, which loads nothing.
+            Some(e) if e.message.contains("cannot read") && e.message.contains("Is a directory") => unreadable += 1,
             Some(e) => {
                 if other.len() < 5 {
                     other.push(format!("{} {}", e.code, e.message));
@@ -15037,7 +15045,7 @@ fn a_copy_through_a_flipping_link_never_reads_outside_the_grant() {
     }
     // The race was run, not skipped: COPYs both loaded and were refused while the link flipped.
     if loaded == 0 || refused == 0 || flips < 100 {
-        wrong.push(format!("the race did not run: {loaded} loaded, {refused} refused, {flips} flips"));
+        wrong.push(format!("the race did not run: {loaded} loaded, {refused} refused, {unreadable} unreadable, {flips} flips"));
     }
     if !other.is_empty() {
         wrong.push(format!("other answers: {other:?}"));
