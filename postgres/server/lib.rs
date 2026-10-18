@@ -158,6 +158,8 @@ impl<'a> Backoff<'a> {
     /// A post-write Busy must finish: dropping it can commit its rows, so reporting 57014
     /// would tell the client a committed write failed (C37 M2, lead ruling for C42).
     fn wait_for_commit_completion(&mut self) -> bool {
+        #[cfg(test)]
+        commit_busy_test::observed();
         self.wait_in(WaitMode::CommitCompletion)
             .expect("commit completion does not check statement interrupts")
     }
@@ -169,6 +171,8 @@ impl<'a> Backoff<'a> {
         let deadline = *self.deadline.get_or_insert(now + self.lock_wait);
         let delay =
             std::time::Duration::from_millis(DELAYS_MS[self.attempt.min(DELAYS_MS.len() - 1)]);
+        #[cfg(test)]
+        let delay = commit_busy_test::floor(&mode, delay);
         self.attempt += 1;
         if now + delay > deadline {
             return Ok(false);
@@ -179,6 +183,37 @@ impl<'a> Backoff<'a> {
             .waits;
         drop(waits.wait_while(waits.uses(), now + delay, mode, |_| true)?);
         Ok(true)
+    }
+}
+
+/// Test-only instruments of the post-write Busy wait, on the waiting thread (integ-rev-1017: the
+/// timeout test raced its 1 ms deadline against parse and prepare, so it was cancelled before any
+/// Busy). `observed` counts the post-write Busy waits; `floor` makes each such wait last at least
+/// the armed floor, so a statement_timeout can expire INSIDE it. Off (0) unless a test arms it.
+#[cfg(test)]
+mod commit_busy_test {
+    use std::cell::Cell;
+    thread_local! {
+        static WAITS: Cell<usize> = const { Cell::new(0) };
+        static FLOOR_MS: Cell<u64> = const { Cell::new(0) };
+    }
+    pub(super) fn observed() {
+        WAITS.with(|w| w.set(w.get() + 1));
+    }
+    pub(super) fn waits() -> usize {
+        WAITS.with(Cell::get)
+    }
+    pub(super) fn arm(floor_ms: u64) {
+        WAITS.with(|w| w.set(0));
+        FLOOR_MS.with(|f| f.set(floor_ms));
+    }
+    pub(super) fn floor(mode: &super::WaitMode<'_>, delay: std::time::Duration) -> std::time::Duration {
+        match mode {
+            super::WaitMode::CommitCompletion => {
+                delay.max(std::time::Duration::from_millis(FLOOR_MS.with(Cell::get)))
+            }
+            _ => delay,
+        }
     }
 }
 
@@ -7872,7 +7907,10 @@ mod tests {
     /// settings read the same before and after. This D0 session already holds synchronous and
     /// fullfsync off, so the SHOWs name the values it does not hold (full, on), and a premise says
     /// so: a SHOW of the held value could change nothing, and the pin could not fail (ruled
-    /// c9c821dd8d, P8).
+    /// c9c821dd8d, P8). PRAGMA fullfsync exists only on Apple (core's PragmaName::Fullfsync is
+    /// cfg(target_vendor = "apple")), so its half of the premise and its SHOW row are Apple's; the
+    /// rest runs on every platform (lead ruling 2026-10-18, integ-rev-1017: on Linux the premise
+    /// read [] and the test failed there for that alone).
     #[test]
     fn show_cannot_change_an_engine_setting() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -7890,19 +7928,25 @@ mod tests {
                 .ok()
                 .and_then(|mut stmt| stmt.run_collect_rows().ok())
         };
-        let before = (pragma("synchronous"), pragma("fullfsync"));
+        let apple = cfg!(target_vendor = "apple");
+        let held = || {
+            (
+                pragma("synchronous"),
+                if apple { pragma("fullfsync") } else { None },
+            )
+        };
+        let before = held();
         let off = Some(vec![vec![Value::from_i64(0)]]);
         assert_eq!(
             before,
-            (off.clone(), off),
-            "premise: the D0 session holds synchronous and fullfsync off, values the SHOWs differ from"
+            (off.clone(), if apple { off } else { None }),
+            "premise: the D0 session holds synchronous (and on Apple fullfsync) off, values the SHOWs differ from"
         );
-        for sql in [
-            "SHOW \"synchronous = full\"",
-            "SHOW \"fullfsync = on\"",
-            "SHOW wal_checkpoint",
-            "SHOW synchronous",
-        ] {
+        let mut shows = vec!["SHOW \"synchronous = full\"", "SHOW wal_checkpoint", "SHOW synchronous"];
+        if apple {
+            shows.insert(1, "SHOW \"fullfsync = on\"");
+        }
+        for sql in shows {
             let codes: Vec<String> = s
                 .simple(sql)
                 .into_iter()
@@ -7913,11 +7957,7 @@ mod tests {
                 .collect();
             assert_eq!(codes, vec!["42704".to_string()], "{sql}");
         }
-        assert_eq!(
-            (pragma("synchronous"), pragma("fullfsync")),
-            before,
-            "a SHOW changed an engine setting"
-        );
+        assert_eq!(held(), before, "a SHOW changed an engine setting");
     }
 
     /// Wire review 17 item 7: a CHECKPOINT with a comment is the server's CHECKPOINT, read with no
@@ -8456,7 +8496,11 @@ mod tests {
     /// when its statement_timeout passes during the wait: dropped there, a write with RETURNING is
     /// committed by the engine's reset, so the 57014 it answered reported as cancelled a write that
     /// was stored (measured: 57014 with its row stored; fresh-context review of the ultrareview
-    /// fixes, on finding 9's Backoff).
+    /// fixes, on finding 9's Backoff). FLAGGED SPEC REPAIR (lead-approved, integ-rev-1017): with a
+    /// 1 ms timeout armed before parse and prepare, the statement was cancelled before it reached
+    /// the commit (about 1.1-1.2 ms to its first step on iccad5), a correct 57014. Now the timeout
+    /// (50 ms) expires INSIDE the post-write Busy wait, which the test floor holds for 300 ms; the
+    /// Busy wait is a premise, so without it the test refuses and never passes.
     #[test]
     fn a_write_whose_commit_meets_busy_is_not_cancelled_by_its_timeout() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -8464,12 +8508,24 @@ mod tests {
         ok(&s, "CREATE TABLE t(id INT, v TEXT)");
         ok(&s, "INSERT INTO t VALUES (1, 'a')");
         ok(&s, "SELECT turso_branch_create('c')");
-        ok(&s, "SET statement_timeout = 1");
+        ok(&s, "SET statement_timeout = 50");
         s.shared
             .db
             .branch_failpoint(Some(turso_core::branch::BranchFailpoint::TrunkDecisionBusy));
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        commit_busy_test::arm(300);
+        let started = std::time::Instant::now();
         let replies = s.simple("INSERT INTO t VALUES (9, 'x') RETURNING id");
+        let took = started.elapsed();
+        let waits = commit_busy_test::waits();
+        commit_busy_test::arm(0);
+        assert!(
+            waits >= 1,
+            "premise not met: the write's commit met no Busy (no post-write wait), so the timeout was not tested"
+        );
+        assert!(
+            took >= std::time::Duration::from_millis(50),
+            "premise not met: the statement took {took:?}, so its 50 ms timeout never passed during the wait"
+        );
         let conn = s.shared.db.connect().unwrap();
         let count = conn
             .prepare("SELECT count(*) FROM t WHERE id = 9")
