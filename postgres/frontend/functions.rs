@@ -98,10 +98,21 @@ pub(crate) fn exec_scalar(conn: &Connection, name: &str, args: &[Value]) -> Resu
             },
         )),
         "pg_backend_pid" => Ok(Value::from_i64(std::process::id() as i64)),
-        // The database's files on disk, in bytes, whatever name is asked (a server serves one
-        // database): the database file and its WAL. A branch reports the database's.
+        // The database's files on disk, in bytes: the database file and its WAL. A branch reports
+        // the database's. A name is the one database pg_database lists here; any other is
+        // PostgreSQL's 3D000 (found by the E5' differential, wire-e5l5-fc85e82fc: every name
+        // answered this database's size). An oid is taken as before.
         "pg_database_size" => {
             let path = conn.db_file_path();
+            if let Some(Value::Text(t)) = args.first() {
+                let name = t.as_str();
+                if name != crate::catalog::db_name_from_path(&path) {
+                    return Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
+                        SqlErrorKind::InvalidCatalogName,
+                        format!("database \"{name}\" does not exist"),
+                    )));
+                }
+            }
             let size = |p: &str| std::fs::metadata(p).map(|m| m.len() as i64).unwrap_or(0);
             Ok(Value::from_i64(size(&path) + size(&format!("{path}-wal"))))
         }
