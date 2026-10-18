@@ -2740,6 +2740,10 @@ pub fn translate_create_type(
 }
 
 /// Build canonical CREATE TYPE SQL from a normalized name and parsed body.
+///
+/// The type, base, parameter and field-type names are the parser's TOKENS (`"m'x"` with its
+/// quotes) and are written as given; quoting them again made the reparse register a type named
+/// with its quotes (`CREATE TYPE """m'x"""`). Field names are `Name`s and are quoted.
 fn build_create_type_sql(name: &str, body: &ast::CreateTypeBody) -> String {
     use crate::util::quote_identifier as quote_ident;
     use crate::util::escape_sql_string_literal as quote_string_literal;
@@ -2756,22 +2760,22 @@ fn build_create_type_sql(name: &str, body: &ast::CreateTypeBody) -> String {
             let mut sql = if params.is_empty() {
                 format!(
                     "CREATE TYPE {} BASE {}",
-                    quote_ident(name),
-                    quote_ident(base)
+                    name,
+                    base
                 )
             } else {
                 let param_strs: Vec<String> = params
                     .iter()
                     .map(|p| match &p.ty {
-                        Some(ty) => format!("{} {}", quote_ident(&p.name), ty),
-                        None => quote_ident(&p.name),
+                        Some(ty) => format!("{} {}", p.name, ty),
+                        None => p.name.clone(),
                     })
                     .collect();
                 format!(
                     "CREATE TYPE {}({}) BASE {}",
-                    quote_ident(name),
+                    name,
                     param_strs.join(", "),
-                    quote_ident(base)
+                    base
                 )
             };
             if let Some(ref encode) = encode {
@@ -2802,13 +2806,13 @@ fn build_create_type_sql(name: &str, body: &ast::CreateTypeBody) -> String {
                     format!(
                         "{} {}",
                         quote_ident(f.name.as_str()),
-                        quote_ident(&f.field_type.name)
+                        &f.field_type.name
                     )
                 })
                 .collect();
             format!(
                 "CREATE TYPE {} AS STRUCT({})",
-                quote_ident(name),
+                name,
                 field_strs.join(", ")
             )
         }
@@ -2819,13 +2823,13 @@ fn build_create_type_sql(name: &str, body: &ast::CreateTypeBody) -> String {
                     format!(
                         "{} {}",
                         quote_ident(f.name.as_str()),
-                        quote_ident(&f.field_type.name)
+                        &f.field_type.name
                     )
                 })
                 .collect();
             format!(
                 "CREATE TYPE {} AS UNION({})",
-                quote_ident(name),
+                name,
                 variant_strs.join(", ")
             )
         }
@@ -2955,7 +2959,7 @@ pub fn translate_drop_type(
     // Check if any table uses this type
     for (_, table) in resolver.schema().tables.iter() {
         for col in table.columns() {
-            if normalize_ident(&col.ty_str) == normalized_name {
+            if crate::schema::type_key(&col.ty_str) == crate::schema::type_key(&normalized_name) {
                 bail_parse_error!(
                     "cannot drop type {normalized_name}: used by column {} in table {}",
                     col.name.as_deref().unwrap_or("?"),
@@ -2967,7 +2971,7 @@ pub fn translate_drop_type(
 
     // Check if any other type/domain depends on this type
     for (name, td) in resolver.schema().type_registry.iter() {
-        if normalize_ident(td.base()) == normalized_name {
+        if crate::schema::type_key(td.base()) == crate::schema::type_key(&normalized_name) {
             bail_parse_error!(
                 "cannot drop type {}: type {} depends on it",
                 normalized_name,

@@ -184,6 +184,45 @@ pub const SEQ_BACKING_TABLE_PREFIX: &str = "__turso_internal_seq_";
 pub const AUTOINCREMENT_SEQ_PREFIX: &str = "__turso_internal_autoincrement_";
 
 /// Name of the hidden sequence owned by an AUTOINCREMENT table.
+/// The type registry's key for a type named by `token`, a type name as the parser gives it (CREATE
+/// TYPE's, CREATE DOMAIN's, DROP's, a column's declared type, a base type): its quoting undone and
+/// its case folded, so `"m'x"` declared on a column is the type created as `"m'x"`, and `"plain"`
+/// the type `plain` (a registry keyed by the token itself made a quoted name a different type).
+/// Only text that is ONE quoted token is dequoted: a declared type such as `"t"(5)` or `'a' b` is
+/// folded as it stands (never `Name::from_string`, which asserts on a quote it cannot close).
+pub(crate) fn type_key(token: &str) -> String {
+    let b = token.as_bytes();
+    let one_quoted = b.len() >= 2
+        && matches!(b[0], b'"' | b'\'' | b'`')
+        && b[b.len() - 1] == b[0]
+        && {
+            // Every inner quote character is doubled, so the closing one is the last byte.
+            let q = b[0];
+            let inner = &b[1..b.len() - 1];
+            let mut i = 0;
+            let mut ok = true;
+            while i < inner.len() {
+                if inner[i] == q {
+                    if inner.get(i + 1) == Some(&q) {
+                        i += 2;
+                        continue;
+                    }
+                    ok = false;
+                    break;
+                }
+                i += 1;
+            }
+            ok
+        };
+    if one_quoted {
+        turso_parser::ast::Name::from_string(token).as_str().to_lowercase()
+    } else if b.len() >= 2 && b[0] == b'[' && b[b.len() - 1] == b']' && !token[1..token.len() - 1].contains(']') {
+        token[1..token.len() - 1].to_lowercase()
+    } else {
+        token.to_lowercase()
+    }
+}
+
 pub fn autoincrement_sequence_name(table_name: &str) -> String {
     String::from(AUTOINCREMENT_SEQ_PREFIX) + table_name
 }
@@ -985,14 +1024,14 @@ impl Schema {
         if !is_strict {
             return None;
         }
-        self.type_registry.get(&type_name.to_lowercase())
+        self.type_registry.get(&type_key(type_name))
     }
 
     /// Look up a custom type definition by name without a strictness check.
     /// Only use this for operations that aren't column-scoped (e.g. DROP TYPE,
     /// CREATE TABLE validation, CAST).
     pub fn get_type_def_unchecked(&self, type_name: &str) -> Option<&Arc<TypeDef>> {
-        self.type_registry.get(&type_name.to_lowercase())
+        self.type_registry.get(&type_key(type_name))
     }
 
     /// Resolve a custom type fully: look it up (with strictness gate) and chase
@@ -1012,7 +1051,7 @@ impl Schema {
     /// Resolve a custom type fully without a strictness check.
     /// Returns `Ok(None)` if the type is not in the registry.
     pub fn resolve_type_unchecked(&self, type_name: &str) -> crate::Result<Option<ResolvedType>> {
-        let key = type_name.to_lowercase();
+        let key = type_key(type_name);
         if !self.type_registry.contains_key(&key) {
             return Ok(None);
         }
@@ -1021,7 +1060,7 @@ impl Schema {
     }
 
     pub fn remove_type(&mut self, type_name: &str) {
-        self.type_registry.remove(&type_name.to_lowercase());
+        self.type_registry.remove(&type_key(type_name));
     }
 
     /// Chase the base type chain: domain_a → domain_b → integer
@@ -1034,7 +1073,7 @@ impl Schema {
     ) -> crate::Result<(String, Vec<Arc<TypeDef>>)> {
         let mut chain = vec![];
         let mut visited = std::collections::HashSet::new();
-        let mut current = type_name.to_lowercase();
+        let mut current = type_key(type_name);
 
         loop {
             if !visited.insert(current.clone()) {
@@ -1045,7 +1084,7 @@ impl Schema {
             match self.type_registry.get(&current) {
                 Some(td) => {
                     chain.try_push(Arc::clone(td))?;
-                    current = td.base().to_lowercase();
+                    current = type_key(td.base());
                 }
                 None => {
                     // current is not in the registry — it's a primitive
@@ -1069,7 +1108,7 @@ impl Schema {
                 let type_def =
                     TypeDef::from_create_type(&type_name, &body, false, sql.to_string())?;
                 self.type_registry
-                    .insert(type_name.to_lowercase(), Arc::new(type_def));
+                    .insert(type_key(&type_name), Arc::new(type_def));
             }
             Ok(Some(Cmd::Stmt(Stmt::CreateDomain {
                 domain_name,
@@ -1088,7 +1127,7 @@ impl Schema {
                     sql.to_string(),
                 );
                 self.type_registry
-                    .insert(domain_name.to_lowercase(), Arc::new(type_def));
+                    .insert(type_key(&domain_name), Arc::new(type_def));
             }
             _ => {
                 return Err(crate::LimboError::ParseError(format!(
