@@ -3391,6 +3391,11 @@ fn a_merge_resolves_a_check_through_the_database_s_dialect() {
         fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<turso_parser::ast::Stmt> {
             sqlite::parse_table_sql_ast(sql)
         }
+        // Its replay text is SQLite (it goes through SQLite's table_sql_for_replay).
+        fn table_sql_for_replay_stored(&self, sql: &str) -> crate::Result<crate::connection::StoredSql> {
+            Ok(crate::connection::StoredSql::sqlite(self.table_sql_for_replay(sql)?))
+        }
+
         fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
             sqlite::table_sql_for_replay(sql)
         }

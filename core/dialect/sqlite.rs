@@ -54,6 +54,11 @@ impl super::Dialect for SqliteDialect {
         parse_table_sql_ast(sql)
     }
 
+    // Its replay text is SQLite (it goes through SQLite's table_sql_for_replay).
+    fn table_sql_for_replay_stored(&self, sql: &str) -> crate::Result<crate::connection::StoredSql> {
+        Ok(crate::connection::StoredSql::sqlite(self.table_sql_for_replay(sql)?))
+    }
+
     fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
         table_sql_for_replay(sql)
     }

@@ -1475,6 +1475,11 @@ impl crate::Dialect for CountingReparseDialect {
     fn parse_table_sql_ast(&self, sql: &str) -> Result<turso_parser::ast::Stmt> {
         crate::Dialect::parse_table_sql_ast(&SqliteDialect, sql)
     }
+    // Its replay text is SQLite (it goes through SQLite's table_sql_for_replay).
+    fn table_sql_for_replay_stored(&self, sql: &str) -> crate::Result<crate::connection::StoredSql> {
+        Ok(crate::connection::StoredSql::sqlite(self.table_sql_for_replay(sql)?))
+    }
+
     fn table_sql_for_replay(&self, sql: &str) -> Result<String> {
         crate::Dialect::table_sql_for_replay(&SqliteDialect, sql)
     }

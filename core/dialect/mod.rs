@@ -96,12 +96,11 @@ pub trait Dialect: Send + Sync + 'static {
     fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String>;
 
     /// `table_sql_for_replay` with the syntax the returned text is in (dialect design REVISION 2 item 4):
-    /// VACUUM prepares the text with that parser and stores the row's own bytes verbatim. Default:
-    /// SQLite syntax, which holds for a dialect whose replay text is SQLite (SqliteDialect). A frontend
-    /// whose replay text is its own DDL (PostgresDialect) returns `StoredSql::client` for those rows.
-    fn table_sql_for_replay_stored(&self, sql: &str) -> crate::Result<crate::connection::StoredSql> {
-        Ok(crate::connection::StoredSql::sqlite(self.table_sql_for_replay(sql)?))
-    }
+    /// VACUUM prepares the text with that parser and stores the row's own bytes verbatim. REQUIRED, with
+    /// no default (dialect code review MED-4: a default labelled every replayed row SQLite, which is wrong
+    /// for any dialect whose replay text is its own): a dialect whose replay text is SQLite returns
+    /// `StoredSql::sqlite`, a frontend whose replay text is its own DDL `StoredSql::client` for those rows.
+    fn table_sql_for_replay_stored(&self, sql: &str) -> crate::Result<crate::connection::StoredSql>;
 
     /// Produce the SQL text to store in `sqlite_schema` for a
     /// `CREATE TABLE`.
@@ -384,6 +383,11 @@ mod tests {
             sqlite::parse_table_sql_ast(sql)
         }
 
+        // Its replay text is SQLite (it goes through SQLite's table_sql_for_replay).
+        fn table_sql_for_replay_stored(&self, sql: &str) -> crate::Result<crate::connection::StoredSql> {
+            Ok(crate::connection::StoredSql::sqlite(self.table_sql_for_replay(sql)?))
+        }
+
         fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
             let sql = sql.strip_prefix("/* test */ ").unwrap_or(sql);
             sqlite::table_sql_for_replay(sql)
@@ -477,6 +481,11 @@ mod tests {
         fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<turso_parser::ast::Stmt> {
             sqlite::parse_table_sql_ast(sql)
         }
+        // Its replay text is SQLite (it goes through SQLite's table_sql_for_replay).
+        fn table_sql_for_replay_stored(&self, sql: &str) -> crate::Result<crate::connection::StoredSql> {
+            Ok(crate::connection::StoredSql::sqlite(self.table_sql_for_replay(sql)?))
+        }
+
         fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
             sqlite::table_sql_for_replay(sql)
         }
@@ -651,6 +660,11 @@ mod tests {
         fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<turso_parser::ast::Stmt> {
             sqlite::parse_table_sql_ast(Self::unmark(sql)?)
         }
+        // Its replay text is SQLite (it goes through SQLite's table_sql_for_replay).
+        fn table_sql_for_replay_stored(&self, sql: &str) -> crate::Result<crate::connection::StoredSql> {
+            Ok(crate::connection::StoredSql::sqlite(self.table_sql_for_replay(sql)?))
+        }
+
         fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
             sqlite::table_sql_for_replay(Self::unmark(sql)?)
         }
@@ -747,6 +761,11 @@ mod tests {
             fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<turso_parser::ast::Stmt> {
                 sqlite::parse_table_sql_ast(sql)
             }
+            // Its replay text is SQLite (it goes through SQLite's table_sql_for_replay).
+            fn table_sql_for_replay_stored(&self, sql: &str) -> crate::Result<crate::connection::StoredSql> {
+                Ok(crate::connection::StoredSql::sqlite(self.table_sql_for_replay(sql)?))
+            }
+
             fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
                 sqlite::table_sql_for_replay(sql)
             }
@@ -1054,6 +1073,11 @@ mod tests {
         fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<turso_parser::ast::Stmt> {
             sqlite::parse_table_sql_ast(sql)
         }
+        // Its replay text is SQLite (it goes through SQLite's table_sql_for_replay).
+        fn table_sql_for_replay_stored(&self, sql: &str) -> crate::Result<crate::connection::StoredSql> {
+            Ok(crate::connection::StoredSql::sqlite(self.table_sql_for_replay(sql)?))
+        }
+
         fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
             sqlite::table_sql_for_replay(sql)
         }
@@ -1170,6 +1194,11 @@ mod tests {
         fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<turso_parser::ast::Stmt> {
             sqlite::parse_table_sql_ast(sql)
         }
+        // Its replay text is SQLite (it goes through SQLite's table_sql_for_replay).
+        fn table_sql_for_replay_stored(&self, sql: &str) -> crate::Result<crate::connection::StoredSql> {
+            Ok(crate::connection::StoredSql::sqlite(self.table_sql_for_replay(sql)?))
+        }
+
         fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
             sqlite::table_sql_for_replay(sql)
         }
@@ -1243,6 +1272,11 @@ mod tests {
         fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<turso_parser::ast::Stmt> {
             let sql = sql.strip_prefix(Self::PREFIX).unwrap_or(sql);
             sqlite::parse_table_sql_ast(sql)
+        }
+
+        // Its replay text is SQLite (it goes through SQLite's table_sql_for_replay).
+        fn table_sql_for_replay_stored(&self, sql: &str) -> crate::Result<crate::connection::StoredSql> {
+            Ok(crate::connection::StoredSql::sqlite(self.table_sql_for_replay(sql)?))
         }
 
         fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
@@ -1642,6 +1676,11 @@ mod tests {
 
         fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<turso_parser::ast::Stmt> {
             sqlite::parse_table_sql_ast(sql)
+        }
+
+        // Its replay text is SQLite (it goes through SQLite's table_sql_for_replay).
+        fn table_sql_for_replay_stored(&self, sql: &str) -> crate::Result<crate::connection::StoredSql> {
+            Ok(crate::connection::StoredSql::sqlite(self.table_sql_for_replay(sql)?))
         }
 
         fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
@@ -2081,6 +2120,11 @@ mod tests {
 
         fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<turso_parser::ast::Stmt> {
             sqlite::parse_table_sql_ast(Self::own(sql).unwrap_or(sql))
+        }
+
+        // Its replay text is SQLite (it goes through SQLite's table_sql_for_replay).
+        fn table_sql_for_replay_stored(&self, sql: &str) -> crate::Result<crate::connection::StoredSql> {
+            Ok(crate::connection::StoredSql::sqlite(self.table_sql_for_replay(sql)?))
         }
 
         fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
