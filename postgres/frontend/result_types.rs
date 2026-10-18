@@ -367,6 +367,16 @@ fn expression_type(node: &PgNode) -> Option<u32> {
             return Some(INT8);
         }
         Node::AConst(c) => matches!(c.val, Some(Val::Boolval(_))),
+        // The sequence functions and pg_database_size are bigint in PostgreSQL, whatever their
+        // arguments; the engine gave them no type, so they were announced text (found by the E5'
+        // differential, wire-e5-f312d1e13).
+        Node::FuncCall(call)
+            if func_name(call).is_some_and(|n| {
+                matches!(n.as_str(), "nextval" | "currval" | "setval" | "lastval" | "pg_database_size")
+            }) =>
+        {
+            return Some(INT8);
+        }
         Node::BoolExpr(_) | Node::NullTest(_) | Node::BooleanTest(_) => true,
         // NULLIF is its first argument's type.
         Node::AExpr(e) if e.kind() == AExprKind::AexprNullif => {
@@ -813,6 +823,8 @@ fn scalar_result(name: &str) -> Option<u32> {
         | "quote_ident" | "quote_literal" | "format" | "current_schema" | "current_database"
         | "version" => TEXT,
         "row_number" | "rank" | "dense_rank" | "ntile" => INT8,
+        // bigint in PostgreSQL (found by the E5' differential, wire-e5-f312d1e13).
+        "nextval" | "currval" | "setval" | "lastval" | "pg_database_size" => INT8,
         // float8-only in PostgreSQL, whatever numeric argument they are given, and computed as a
         // float by the engine (random() as the translator scales it).
         "percent_rank" | "cume_dist" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan"

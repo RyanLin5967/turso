@@ -5126,6 +5126,10 @@ fn resolve_pg_type_for_column(stmt: &turso_core::Statement, idx: usize) -> Type 
     // libpq/psql/JDBC see structured data they can introspect.
     let mut base = match info.kind {
         ColumnTypeKind::Struct | ColumnTypeKind::Union => Type::JSONB,
+        // The engine's exact numeric (a NUMERIC(p, s) column) is PostgreSQL's numeric: it was
+        // float8 by the name table below, whose NUMERIC is the SQLite affinity of a bare NUMERIC
+        // (a Builtin, stored as a float). Found by the E5' differential (wire-e5-f312d1e13).
+        ColumnTypeKind::Custom if info.declared_name.eq_ignore_ascii_case("numeric") => Type::NUMERIC,
         _ => {
             // Prefer the declared name (the user-visible type), then fall
             // back to the resolved base for custom/domain types whose
