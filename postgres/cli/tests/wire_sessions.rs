@@ -14988,3 +14988,32 @@ fn drop_schema_public_cascade_drops_a_table_named_like_sqlite() {
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// wire-rev-uw1 M1: a column type no type has went into the stored CREATE TABLE text as it was
+/// written (map_pg_type passed unknown names through, and core prints a type's name bare), so a
+/// quoted type like "text, evil int" became table text of its own. PG 18.6 answers 42704
+/// 'type "text, evil int" does not exist' and creates nothing (recorded: pg18-rev-uw1-type.out).
+#[test]
+fn a_column_type_that_names_no_type_is_42704() {
+    let dir = Scratch::new("unknown-type");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    for (sql, name) in [
+        ("CREATE TABLE t1(a \"text, evil int\")", "text, evil int"),
+        ("CREATE TABLE t2(a \"m x\")", "m x"),
+        ("CREATE TABLE t3(a nosuchtype)", "nosuchtype"),
+    ] {
+        let r = a.q(sql);
+        let want = format!("type \"{name}\" does not exist");
+        match &r.error {
+            Some(e) if e.code == "42704" && e.message == want => {}
+            other => wrong.push(format!("{sql}: want 42704 {want:?}, got {other:?}")),
+        }
+    }
+    let r = a.q("SELECT count(*) FROM pg_class WHERE relname IN ('t1', 't2', 't3')");
+    if r.rows != vec![vec![Some("0".to_string())]] {
+        wrong.push(format!("tables created by the refused statements: {:?} {:?}", r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
