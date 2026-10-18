@@ -659,9 +659,9 @@ impl<'a> Resolver<'a> {
                     return Ok(database_id);
                 }
             }
-            return Err(LimboError::ParseError(format!(
-                "no such object: {object_name}"
-            ).into()));
+            // A relation that no schema on the search path holds: PostgreSQL's 42P01 (fastest-wire, pg18-rev-eh1.out
+            // #13), not an unclassified parse error (42601).
+            crate::bail_parse_error!(SqlErrorKind::UndefinedTable; "no such object: {}", object_name);
         }
 
         if self.with_schema(crate::MAIN_DB_ID, |schema| {
