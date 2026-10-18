@@ -601,6 +601,14 @@ mod tests {
         fn parse_table_sql(&self, sql: &str, root_page: i64) -> crate::Result<BTreeTable> {
             BTreeTable::from_sql(Self::unmark(sql)?, root_page)
         }
+        // Red-column port of bd044eb44's fixture: its own-form formatters (marked client text), so the
+        // control (the client's renamed row) is valid; owns_stored_table_sql does not exist here.
+        fn format_rewritten_table_sql(&self, stmt: &turso_parser::ast::Stmt) -> crate::Result<String> {
+            Ok(format!("/* client */ client: {stmt}"))
+        }
+        fn format_altered_table_sql(&self, table: &BTreeTable) -> crate::Result<String> {
+            Ok(format!("/* client */ client: {}", table.to_sql()))
+        }
         fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<turso_parser::ast::Stmt> {
             sqlite::parse_table_sql_ast(Self::unmark(sql)?)
         }
@@ -883,9 +891,17 @@ mod tests {
         }
         let reopened = open().connect().and_then(|c| {
             c.prepare("client: SELECT x, z FROM helper2")?.run_collect_rows()?;
-            c.prepare("client: SELECT y FROM mine2")?.run_collect_rows()
+            c.prepare("client: SELECT y FROM mine2")?.run_collect_rows()?;
+            c.prepare("client: SELECT name, sql FROM sqlite_schema WHERE name IN ('helper2', 'mine2') ORDER BY name")?
+                .run_collect_rows()
         });
-        assert!(reopened.is_ok(), "CLAIM: RENAME or ALTER changed whose form a row is in, so the database did not reopen: {reopened:?}");
+        let rows = match reopened {
+            Ok(rows) => format!("{rows:?}"),
+            Err(e) => panic!("CLAIM: RENAME or ALTER changed whose form a row is in, so the database did not reopen: {e}"),
+        };
+        let (helper, mine) = rows.split_once("mine2").unwrap_or((rows.as_str(), ""));
+        assert!(mine.contains("/* client */"), "premise (control): the client's renamed row is still the dialect's: {rows}");
+        assert!(!helper.contains("/* client */"), "CLAIM: RENAME or ALTER marked the engine's row as the dialect's: {rows}");
     }
 
     /// A dialect that parks one translation in the middle: resolving the function `park_here()`
