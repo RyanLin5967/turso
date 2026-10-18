@@ -3783,7 +3783,11 @@ impl Database {
 
 // Optimized for fast get() operations and supports unlimited attached databases.
 pub(crate) struct DatabaseCatalog {
-    pub(crate) name_to_index: HashMap<String, usize>,
+    /// Keyed by the name case-folded (`normalize_ident`): names match in any case, as SQLite's do.
+    name_to_index: HashMap<String, usize>,
+    /// Each database's name as written at ATTACH (fastest-wire: `"MixedCase"` listed as mixedcase),
+    /// for every list and every message.
+    display_names: HashMap<usize, String>,
     allocated: Vec<u64>,
     pub(crate) index_to_data: HashMap<usize, (Arc<Database>, Arc<Pager>)>,
 }
@@ -3793,6 +3797,7 @@ impl DatabaseCatalog {
     pub(crate) fn new() -> Self {
         Self {
             name_to_index: HashMap::default(),
+            display_names: HashMap::default(),
             index_to_data: HashMap::default(),
             allocated: vec![3], // 0 | 1, as those are reserved for main and temp
         }
@@ -3805,14 +3810,21 @@ impl DatabaseCatalog {
     }
 
     pub(crate) fn get_name_by_index(&self, index: usize) -> Option<String> {
-        self.name_to_index
-            .iter()
-            .find(|(_, &idx)| idx == index)
-            .map(|(name, _)| name.clone())
+        self.display_names.get(&index).cloned()
+    }
+
+    /// The index of the database named `s`, in any case.
+    pub(crate) fn index_of(&self, s: &str) -> Option<usize> {
+        self.name_to_index.get(&crate::util::normalize_ident(s)).copied()
+    }
+
+    /// Every attached database's name as written, with its index.
+    pub(crate) fn names(&self) -> impl Iterator<Item = (&str, usize)> + '_ {
+        self.display_names.iter().map(|(&idx, name)| (name.as_str(), idx))
     }
 
     pub(crate) fn get_database_by_name(&self, s: &str) -> Option<(usize, Arc<Database>)> {
-        match self.name_to_index.get(s) {
+        match self.name_to_index.get(&crate::util::normalize_ident(s)) {
             None => None,
             Some(idx) => self
                 .index_to_data
@@ -3830,14 +3842,16 @@ impl DatabaseCatalog {
     }
 
     fn add(&mut self, s: &str) -> usize {
+        let key = crate::util::normalize_ident(s);
         turso_assert!(
-            !self.name_to_index.contains_key(s),
+            !self.name_to_index.contains_key(&key),
             "lib: database name already exists in catalog",
             { "name": s }
         );
 
         let index = self.allocate_index();
-        self.name_to_index.insert(s.to_string(), index);
+        self.name_to_index.insert(key, index);
+        self.display_names.insert(index, s.to_string());
         index
     }
 
@@ -3848,10 +3862,11 @@ impl DatabaseCatalog {
     }
 
     pub(crate) fn remove(&mut self, s: &str) -> Option<usize> {
-        if let Some(index) = self.name_to_index.remove(s) {
+        if let Some(index) = self.name_to_index.remove(&crate::util::normalize_ident(s)) {
             // Should be impossible to remove main or temp.
             turso_assert_greater_than_or_equal!(index, 2);
             self.deallocate_index(index);
+            self.display_names.remove(&index);
             self.index_to_data.remove(&index);
             Some(index)
         } else {

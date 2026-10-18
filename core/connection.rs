@@ -3400,12 +3400,7 @@ impl Connection {
     }
 
     pub fn attached_database_names(&self) -> Vec<String> {
-        self.attached_databases
-            .read()
-            .name_to_index
-            .keys()
-            .cloned()
-            .collect()
+        self.attached_databases.read().names().map(|(n, _)| n.to_string()).collect()
     }
 
     pub fn experimental_views_enabled(&self) -> bool {
@@ -3685,10 +3680,7 @@ impl Connection {
     }
 
     pub(crate) fn is_attached(&self, alias: &str) -> bool {
-        self.attached_databases
-            .read()
-            .name_to_index
-            .contains_key(alias)
+        self.attached_databases.read().index_of(alias).is_some()
     }
 
     /// Returns the reserved-space value inherited from the main connection's pager.
@@ -4096,7 +4088,7 @@ impl Connection {
         // must not hold the write lock during the rollback.
         let database_id = {
             let attached_dbs = self.attached_databases.read();
-            match attached_dbs.name_to_index.get(alias).copied() {
+            match attached_dbs.index_of(alias) {
                 Some(id) => id,
                 None => {
                     return Err(LimboError::InvalidArgument(format!(
@@ -4148,12 +4140,7 @@ impl Connection {
 
     /// List all attached database aliases
     pub fn list_attached_databases(&self) -> Vec<String> {
-        self.attached_databases
-            .read()
-            .name_to_index
-            .keys()
-            .cloned()
-            .collect()
+        self.attached_databases.read().names().map(|(n, _)| n.to_string()).collect()
     }
 
     /// Invoke `f` with a slice of all non-main database (index, pager) pairs
@@ -4303,14 +4290,14 @@ impl Connection {
 
         // Add attached databases
         let attached_dbs = self.attached_databases.read();
-        for (alias, &seq_number) in attached_dbs.name_to_index.iter() {
+        for (alias, seq_number) in attached_dbs.names() {
             let file_path = if let Some((db, _pager)) = attached_dbs.index_to_data.get(&seq_number)
             {
                 Self::get_canonical_path_for_database(db)
             } else {
                 String::new()
             };
-            databases.push((seq_number, alias.clone(), file_path));
+            databases.push((seq_number, alias.to_string(), file_path));
         }
 
         // Sort by sequence number to ensure consistent ordering
@@ -5937,7 +5924,7 @@ mod tests {
     // given a attached 'alias', return the Database and Pager for that attached database
     fn attached_entry(conn: &Connection, alias: &str) -> (Arc<Database>, Arc<Pager>) {
         let catalog = conn.attached_databases.read();
-        let index = *catalog.name_to_index.get(alias).unwrap();
+        let index = catalog.index_of(alias).unwrap();
         catalog.index_to_data.get(&index).unwrap().clone()
     }
 

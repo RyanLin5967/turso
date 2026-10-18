@@ -79,10 +79,11 @@ pub fn translate_attach(
             });
         }
         Expr::Id(id) => {
-            // For ATTACH, identifiers should be treated as name strings
-            // Use normalize_ident to strip quotes from double-quoted identifiers
+            // For ATTACH, identifiers should be treated as name strings: the name as written, its
+            // quotes undone (the catalog matches it in any case; fastest-wire: normalize_ident here
+            // folded "MixedCase" to mixedcase in every list).
             program.emit_insn(Insn::String8 {
-                value: normalize_ident(id.as_str()),
+                value: id.as_str().to_string(),
                 dest: arg_reg + 1,
             });
         }
