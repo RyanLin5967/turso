@@ -3313,7 +3313,7 @@ pub enum TxStmt {
 
 /// Run `tx` on `conn` from the engine's AST: no SQL text is parsed for it.
 fn run_tx(conn: &Arc<Connection>, tx: TxStmt) -> Result<()> {
-    use turso_parser::ast::{Name, Stmt};
+    use turso_parser::ast::Stmt;
     let (stmt, text) = match tx {
         TxStmt::Begin => (
             Stmt::Begin {
@@ -3332,22 +3332,22 @@ fn run_tx(conn: &Arc<Connection>, tx: TxStmt) -> Result<()> {
         ),
         TxStmt::Savepoint(name) => (
             Stmt::Savepoint {
-                name: Name::from_string(name),
+                name: turso_pg_parser::translator::pg_name(name),
             },
-            format!("SAVEPOINT {name}"),
+            format!("SAVEPOINT {}", crate::catalog::quote_ident(name)),
         ),
         TxStmt::Release(name) => (
             Stmt::Release {
-                name: Name::from_string(name),
+                name: turso_pg_parser::translator::pg_name(name),
             },
-            format!("RELEASE SAVEPOINT {name}"),
+            format!("RELEASE SAVEPOINT {}", crate::catalog::quote_ident(name)),
         ),
         TxStmt::RollbackTo(name) => (
             Stmt::Rollback {
                 tx_name: None,
-                savepoint_name: Some(Name::from_string(name)),
+                savepoint_name: Some(turso_pg_parser::translator::pg_name(name)),
             },
-            format!("ROLLBACK TO SAVEPOINT {name}"),
+            format!("ROLLBACK TO SAVEPOINT {}", crate::catalog::quote_ident(name)),
         ),
     };
     conn.prepare_translated_stmt(stmt, &text)?.run_ignore_rows()
