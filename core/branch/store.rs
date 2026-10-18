@@ -246,6 +246,9 @@ pub(crate) struct BranchStore {
     /// (a fork(2) child has no such thread to join): `None` for a volatile or trunk-only store, and
     /// if it could not be started (the close then writes the last word).
     confirm_writer: Mutex<Option<(u32, crate::thread::JoinHandle<()>)>>,
+    /// LEAP L1's stub fire-check seams (`async_stub_mutants`): their scratch file, opened at the
+    /// first mutated create.
+    mutant_scratch: std::sync::Mutex<Option<std::fs::File>>,
     /// The name filter's build after open (`start_name_filter`), and its stop flag (set at drop).
     /// Every name-filter thread started (a build, a growth, a rebuild) and the process that started
     /// it (review REVIEW-claude-namefilter-2 MED-1: one slot let close leave a build holding a catalog
@@ -5242,13 +5245,18 @@ pub(crate) fn mutant(name: &str) -> bool {
 /// fastest-engine's registered mutants (PREREG v1 §8, amendment 36): `FE_MUTANT` names one
 /// deliberate defect, so each red test can be shown to fail on its mutant from the same test
 /// binary. TEST BUILDS ONLY: a production binary has no mutant to switch on. Read once per process.
+///
+/// PREREG-v1 amendment 2 registers the `fe-mutants` cargo feature, off by default: it makes this
+/// gate `any(test, feature = "fe-mutants")` and changes nothing else, so AD-T5's fire-check binary
+/// (an integration test, where the lib's `cfg(test)` is not set) can switch a mutant on. A binary
+/// built with it is void for every reading but the fire-checks.
 pub(crate) fn fe_mutant(name: &str) -> bool {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "fe-mutants"))]
     {
         static ON: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
         ON.get_or_init(|| std::env::var("FE_MUTANT").ok()).as_deref() == Some(name)
     }
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "fe-mutants")))]
     {
         let _ = name;
         false
@@ -5426,6 +5434,7 @@ impl BranchStore {
             ckpt_worker: Arc::new(Mutex::new(WorkerSlot::default())),
             flight_jobs: Arc::new((std::sync::Mutex::new((0, 0)), std::sync::Condvar::new())),
             confirm_writer: Mutex::new(None),
+            mutant_scratch: std::sync::Mutex::new(None),
             name_filter_build: Mutex::new(Vec::new()),
             name_filter_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             flight_hold: Arc::new(AtomicU8::new(0)),
@@ -5732,6 +5741,7 @@ impl BranchStore {
             ckpt_worker: Arc::new(Mutex::new(WorkerSlot::default())),
             flight_jobs: Arc::new((std::sync::Mutex::new((0, 0)), std::sync::Condvar::new())),
             confirm_writer: Mutex::new(None),
+            mutant_scratch: std::sync::Mutex::new(None),
             name_filter_build: Mutex::new(Vec::new()),
             name_filter_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             flight_hold: Arc::new(AtomicU8::new(0)),
@@ -6917,6 +6927,60 @@ impl BranchStore {
     pub(crate) fn gather_counters(&self) -> [u64; 2] {
         let g = self.group.lock();
         [g.gathers, g.gathers_expired]
+    }
+
+    /// LEAP L2(b): the chunks and segments inserts built themselves (`BranchTable::inline_allocs`).
+    pub(crate) fn table_inline_allocs(&self) -> u64 {
+        self.inner.lock().branches.inline_allocs()
+    }
+
+    /// Fill the branch table's pool to its bounds now, as the background writer would (AD-T5's
+    /// provisioning hook), and return the ids its spare chunks cover.
+    pub(crate) fn provision_table_pool(&self) -> u64 {
+        Self::refill_table_pool(&self.inner);
+        self.inner.lock().branches.spare_ids()
+    }
+
+    /// LEAP L1's stub: the AD-T5 fire-check seams (PREREG-v1 amendment 2), live in `fe-mutants`
+    /// builds only, once per async create, on the creating thread. `create_path_pwrite` writes one
+    /// byte, and `create_path_fullfsync` makes one full flush (F_FULLFSYNC on Apple, fsync
+    /// elsewhere), of a scratch file beside the store's log, so under AD-T5's trace root.
+    /// `record_alloc_on_create` makes one allocation.
+    pub(crate) fn async_stub_mutants(&self) {
+        if fe_mutant("record_alloc_on_create") {
+            std::hint::black_box(Vec::<u8>::with_capacity(16));
+        }
+        let (pwrite, full) = (fe_mutant("create_path_pwrite"), fe_mutant("create_path_fullfsync"));
+        if !pwrite && !full {
+            return;
+        }
+        let mut slot = self.mutant_scratch.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.is_none() {
+            let Some(log) = self.log_path() else { return };
+            let mut path = log.into_os_string();
+            path.push("-fe-mutant-scratch");
+            *slot = std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(path).ok();
+        }
+        let Some(file) = slot.as_ref() else { return };
+        if pwrite {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::FileExt;
+                let _ = file.write_at(&[0u8], 0);
+            }
+        }
+        if full {
+            #[cfg(target_vendor = "apple")]
+            {
+                use std::os::fd::AsRawFd;
+                // SAFETY: fcntl on a descriptor this File owns.
+                let _ = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) };
+            }
+            #[cfg(not(target_vendor = "apple"))]
+            {
+                let _ = file.sync_all();
+            }
+        }
     }
 
     /// LEAP L3's diagnosis, observation only: nanoseconds held in gathers and spent writing flights.

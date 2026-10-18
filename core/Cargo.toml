@@ -68,6 +68,10 @@ codspeed = ["bench"]
 optimizer_params = ["serde", "dep:serde_json"]
 stacker = ["dep:stacker"]
 percentile = []
+# PREREG-v1 amendment 2 (the AD class): `fe_mutant` reads FE_MUTANT outside the lib's cfg(test) too,
+# for AD-T5's fire-check binary (core/tests/async_s0.rs) only. Off by default; a credited, pgwire,
+# timed or reading binary built with it is void.
+fe-mutants = []
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { workspace = true, features = [

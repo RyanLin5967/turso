@@ -119,6 +119,7 @@ pub fn backfill_io() -> [u64; 2] {
 pub(crate) fn count_backfill_io(which: usize) {
     BACKFILL_IO[which].fetch_add(1, crate::sync::atomic::Ordering::Relaxed);
 }
+pub mod async_api;
 pub(crate) mod catalog;
 pub(crate) mod derive;
 #[doc(hidden)]

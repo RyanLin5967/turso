@@ -168,6 +168,11 @@ impl<T: Preimage> BranchTable<T> {
         self.inline_allocs
     }
 
+    /// The ids the pool's spare chunks cover.
+    pub(crate) fn spare_ids(&self) -> u64 {
+        (self.spare_chunks.len() * CHUNK) as u64
+    }
+
     /// (segment, chunk within it, slot within the chunk).
     fn at(id: &BranchId) -> (usize, usize, usize) {
         let i = usize::try_from(id.0).expect("a branch id fits usize");
