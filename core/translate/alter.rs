@@ -22,7 +22,7 @@ use crate::{
     },
     util::{
         check_expr_references_column, escape_sql_string_literal, normalize_ident,
-        parse_numeric_literal, rewrite_check_expr_table_refs, rewrite_trigger_cmd_table_refs,
+        parse_numeric_literal, quote_identifier, rewrite_check_expr_table_refs, rewrite_trigger_cmd_table_refs,
         rewrite_view_sql_for_column_rename,
     },
     vdbe::{
@@ -69,7 +69,8 @@ fn schema_table_name_for_db(resolver: &Resolver, database_id: usize) -> String {
         let db_name = resolver
             .get_database_name_by_index(database_id)
             .unwrap_or_else(|| "main".to_string());
-        format!("{db_name}.{SQLITE_TABLEID}")
+        // Quoted (wire: ONE QUOTING FUNCTION class).
+        format!("{}.{SQLITE_TABLEID}", quote_identifier(&db_name))
     }
 }
 

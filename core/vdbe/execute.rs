@@ -29,7 +29,7 @@ use crate::types::{
     IOCompletions, IOResult, ImmutableRecord, IndexInfo, SeekResult, Text, ValueIterator,
 };
 use crate::util::{
-    escape_sql_string_literal, normalize_ident, rename_identifiers,
+    escape_sql_string_literal, normalize_ident, quote_identifier, rename_identifiers,
     rename_identifiers_scoped_when_clause, rewrite_check_expr_table_refs,
     rewrite_column_level_fk_parent_columns_if_needed, rewrite_column_references_if_needed,
     rewrite_fk_parent_cols_if_self_ref, rewrite_fk_parent_table_if_needed,
@@ -14614,7 +14614,8 @@ pub fn op_parse_schema(
         let db_name = conn
             .get_database_name_by_index(*db)
             .unwrap_or_else(|| "main".to_string());
-        format!("{db_name}.sqlite_schema")
+        // Quoted (wire: ONE QUOTING FUNCTION class): a database named `s"x` broke this text.
+        format!("{}.sqlite_schema", quote_identifier(&db_name))
     } else {
         SCHEMA_TABLE_NAME.to_string()
     };
@@ -14989,12 +14990,14 @@ fn drive_init_cdc_version(
             },
             StepResult::Done => match inner.phase {
                 OpInitCdcVersionPhase::CheckTable => {
+                    // Quoted (wire: ONE QUOTING FUNCTION class): a capture table named `my cdc` broke this.
+                    let quoted_cdc = quote_identifier(cdc_table_name);
                     let create_sql = match version {
                         CdcVersion::V1 => format!(
-                            "CREATE TABLE IF NOT EXISTS {cdc_table_name} (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)",
+                            "CREATE TABLE IF NOT EXISTS {quoted_cdc} (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)",
                         ),
                         CdcVersion::V2 => format!(
-                            "CREATE TABLE IF NOT EXISTS {cdc_table_name} (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_txn_id INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)",
+                            "CREATE TABLE IF NOT EXISTS {quoted_cdc} (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_txn_id INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)",
                         ),
                     };
                     inner.stmt = prepare_cdc_internal(conn, create_sql)?;
@@ -16674,7 +16677,7 @@ pub fn op_drop_column(
 
     conn.with_schema(*db, |schema| -> crate::Result<()> {
         for (view_name, view) in schema.views.iter() {
-            let view_select_sql = format!("SELECT * FROM {view_name}");
+            let view_select_sql = format!("SELECT * FROM {}", view_in_db(&conn, *db, view_name));
             let _ = conn.prepare(view_select_sql.as_str()).map_err(|e| {
                 LimboError::ParseError(format!(
                     "cannot drop column \"{}\": referenced in VIEW {view_name}: {}. {e}",
@@ -17044,7 +17047,7 @@ pub fn op_alter_column(
                     .get_column_at(*column_index)
                     .expect("column being ALTERed should be in schema");
                 for (view_name, view) in schema.views.iter() {
-                    let view_select_sql = format!("SELECT * FROM {view_name}");
+                    let view_select_sql = format!("SELECT * FROM {}", view_in_db(&conn, *db, view_name));
                     let _ = conn.prepare(view_select_sql.as_str()).map_err(|e| {
                         LimboError::ParseError(format!(
                             "cannot rename column \"{}\": referenced in VIEW {view_name}: {}. {e}",
@@ -20104,5 +20107,15 @@ mod tests {
             result.is_ok(),
             "Negating a blob subscript with invalid UTF-8 text should not panic"
         );
+    }
+}
+
+/// A view of database `db` named in engine text: quoted, and qualified by its database unless it is main's (wire:
+/// ONE QUOTING FUNCTION class). DROP/RENAME COLUMN's probe named an attached database's view bare, so it resolved in
+/// main; and a view named `v"x` broke the probe's text.
+fn view_in_db(conn: &Connection, db: usize, view_name: &str) -> String {
+    match conn.get_database_name_by_index(db) {
+        Some(name) if db != crate::MAIN_DB_ID => format!("{}.{}", quote_identifier(&name), quote_identifier(view_name)),
+        _ => quote_identifier(view_name),
     }
 }

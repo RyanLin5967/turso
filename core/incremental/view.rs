@@ -463,10 +463,16 @@ impl IncrementalView {
         let table_name = name.name.as_str();
 
         // Build the fully qualified name
+        // Quoted (wire: ONE QUOTING FUNCTION class): this name is interpolated into the view's
+        // own SELECT text (`SELECT .. FROM {qualified}`).
         let qualified_name = if let Some(ref db) = name.db_name {
-            format!("{db}.{table_name}")
+            format!(
+                "{}.{}",
+                crate::util::quote_identifier(db.as_str()),
+                crate::util::quote_identifier(table_name)
+            )
         } else {
-            table_name.to_string()
+            crate::util::quote_identifier(table_name)
         };
 
         // Skip CTEs - they're not real tables

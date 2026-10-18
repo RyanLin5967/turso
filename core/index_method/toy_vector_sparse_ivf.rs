@@ -326,11 +326,13 @@ impl IndexMethod for VectorSparseInvertedIndexMethod {
     ) -> Result<Arc<dyn IndexMethodAttachment>> {
         let query_pattern1 = format!(
             "SELECT vector_distance_jaccard({}, ?) as distance FROM {} ORDER BY distance LIMIT ?",
-            configuration.columns[0].name, configuration.table_name
+            crate::util::quote_identifier(&configuration.columns[0].name),
+            crate::util::quote_identifier(&configuration.table_name)
         );
         let query_pattern2 = format!(
             "SELECT vector_distance_jaccard(?, {}) as distance FROM {} ORDER BY distance LIMIT ?",
-            configuration.columns[0].name, configuration.table_name
+            crate::util::quote_identifier(&configuration.columns[0].name),
+            crate::util::quote_identifier(&configuration.table_name)
         );
         Ok(Arc::new(VectorSparseInvertedIndexMethodAttachment {
             configuration: configuration.clone(),
