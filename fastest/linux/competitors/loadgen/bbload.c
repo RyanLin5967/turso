@@ -1371,6 +1371,10 @@ int main(int argc, char **argv) {
     for (int s = 0; s < S.nstep; s++) hdr_init(1, INT64_C(3600000000000), 3, &hs[s]);
     for (int s = 0; s < NA; s++) hdr_init(1, INT64_C(3600000000000), 3, &ha[s]);
     uint64_t meas = 0, meas_ok = 0, meas_err = 0, in_window_done = 0, drain = 0;
+    /* comp-rev-dolt250 HIGH-1: a failed op is a failure in EVERY phase. Only measured failures used to count, so a
+     * warm-up or drain op lost to a recovered server panic (sql-serial narrows Dolt's delete race, it does not close
+     * it) left the run rc 0 and appeared nowhere. */
+    uint64_t warm_err = 0, drain_err = 0, other_err = 0;
     double sum = 0;
     uint64_t *late = malloc((total ? total : 1) * sizeof *late);
     size_t nlate = 0;
@@ -1390,6 +1394,11 @@ int main(int argc, char **argv) {
         }
         if (o->end >= g_tm0 && o->end <= g_tm1 && o->ok) in_window_done++;
         if (o->phase == PH_DRAIN) drain++;
+        if (!o->ok && o->phase != PH_MEAS) {
+            if (o->phase == PH_WARM) warm_err++;
+            else if (o->phase == PH_DRAIN) drain_err++;
+            else other_err++;
+        }
         if (o->phase != PH_MEAS) continue;
         meas++;
         uint64_t base = o->intended > o->free ? o->intended : o->free;
@@ -1472,6 +1481,14 @@ int main(int argc, char **argv) {
      * registered per-run cap, and a run it ended is reported, not judged: rc 0, verdict "capped", capped: true and its
      * counts; timedrun.py alone applies PREREG's tiers (>= 1000 ok complete, 100-999 p50 only, fewer failed). */
     else if (meas_err && !ALLOW_ERR) { rc = 3; verdict = "REFUSED: measured operations failed (see errors.txt; --allow-errors to accept)"; }
+    else if ((warm_err || drain_err || other_err || g_reconnects) && !ALLOW_ERR) {
+        /* comp-rev-dolt250 HIGH-1: a lost home connection is a failure too, even when the next op succeeds on the new one */
+        rc = 3;
+        snprintf(vbuf, sizeof vbuf, "REFUSED: %llu warm-up, %llu drain and %llu other op(s) failed, %llu home "
+                 "reconnect(s) (see errors.txt; --allow-errors to accept)", (unsigned long long)warm_err,
+                 (unsigned long long)drain_err, (unsigned long long)other_err, (unsigned long long)g_reconnects);
+        verdict = vbuf;
+    }
     else if (OPEN_LOOP && (late_p99 > MAX_SEND_LATE_US || pool_p99 > MAX_SEND_LATE_US)) {
         rc = 3; /* the macOS bbload's amendment 48 rule (competitors review 2 item 3) */
         snprintf(vbuf, sizeof vbuf, "VOID: p99 send lateness %.1f us (pool-wide %.1f us) > %.0f us", late_p99, pool_p99, MAX_SEND_LATE_US);
@@ -1491,6 +1508,9 @@ int main(int argc, char **argv) {
             (unsigned long long)g_warm.claimed, total, (unsigned long long)g_reconnects,
             win > 0 ? meas_ok / win : 0, win > 0 ? in_window_done / win : 0, cpu, win > 0 ? cpu / win : 0,
             v1run ? v1run : "", (unsigned long long)MARKB);
+    fprintf(f, "\"warmup_err\":%llu,\"drain_err\":%llu,\"other_err\":%llu,\"failed_ops\":%llu,", /* HIGH-1: every phase */
+            (unsigned long long)warm_err, (unsigned long long)drain_err, (unsigned long long)other_err,
+            (unsigned long long)(meas_err + warm_err + drain_err + other_err));
     fprintf(f, "\"clock\":\"%s\",\"hooks\":%d,", BB_CLOCK_NAME, BB_HOOKS); /* Linux port: which clock stamped the ops */
     fprintf(f, "\"capped\":%s,\"max_window_s\":%.3f,", g_cap_hit ? "true" : "false", MAXWIN_S);
     fprintf(f, "\"after_steps\":%d,\"skip_after\":%s,\"no_drain\":%s,", S.nafter, SKIP_AFTER ? "true" : "false",
