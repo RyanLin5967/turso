@@ -1087,7 +1087,8 @@ impl CompiledRecipe {
             &syms,
             conn.experimental_custom_types_enabled(),
             conn.get_dqs_dml().into(),
-            Arc::new(crate::dialect::SqliteDialect),
+            // The database's dialect (dialect code review MED-3: it was SqliteDialect).
+            conn.dialect(),
             &None,
         );
         let columns = table.columns();

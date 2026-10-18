@@ -332,7 +332,8 @@ impl CompiledExpression {
             syms,
             true,
             DoubleQuotedDml::Enabled,
-            std::sync::Arc::new(crate::dialect::SqliteDialect),
+            // The database's dialect, as a plain view's (dialect code review MED-3: it was SqliteDialect).
+            connection.dialect(),
             &None,
         );
 
