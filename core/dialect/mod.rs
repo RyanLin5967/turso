@@ -933,9 +933,17 @@ mod tests {
         }
         let reopened = open().connect().and_then(|c| {
             c.prepare("client: SELECT x, z FROM helper2")?.run_collect_rows()?;
-            c.prepare("client: SELECT y FROM mine2")?.run_collect_rows()
+            c.prepare("client: SELECT y FROM mine2")?.run_collect_rows()?;
+            c.prepare("client: SELECT name, sql FROM sqlite_schema WHERE name IN ('helper2', 'mine2') ORDER BY name")?
+                .run_collect_rows()
         });
-        assert!(reopened.is_ok(), "CLAIM: RENAME or ALTER changed whose form a row is in, so the database did not reopen: {reopened:?}");
+        let rows = match reopened {
+            Ok(rows) => format!("{rows:?}"),
+            Err(e) => panic!("CLAIM: RENAME or ALTER changed whose form a row is in, so the database did not reopen: {e}"),
+        };
+        let (helper, mine) = rows.split_once("mine2").unwrap_or((rows.as_str(), ""));
+        assert!(mine.contains("/* client */"), "premise (control): the client's renamed row is still the dialect's: {rows}");
+        assert!(!helper.contains("/* client */"), "CLAIM: RENAME or ALTER marked the engine's row as the dialect's: {rows}");
     }
 
     /// A dialect that parks one translation in the middle: resolving the function `park_here()`
