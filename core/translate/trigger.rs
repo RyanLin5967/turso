@@ -504,7 +504,8 @@ pub fn translate_drop_trigger(
         if if_exists {
             return Ok(());
         }
-        bail_parse_error!("no such trigger: {}", normalized_trigger_name);
+        // PostgreSQL's 42704 (undefined_object; engine-rev-quote42 MED-1).
+        bail_parse_error!(crate::error::SqlErrorKind::UndefinedObject; "no such trigger: {}", normalized_trigger_name);
     }
 
     let opts = ProgramBuilderOpts::new(1, 30, 1);

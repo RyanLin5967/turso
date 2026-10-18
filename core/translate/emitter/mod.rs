@@ -629,10 +629,14 @@ impl<'a> Resolver<'a> {
             .try_collect()?)
     }
 
+    /// `missing`: the kind of the refusal when the name is on no schema and no entry of the search
+    /// path names one (the caller's: UndefinedTable for a relation, UndefinedObject for an index or
+    /// a trigger; engine-rev-quote42 MED-1).
     fn resolve_unqualified_existing_database_id<F>(
         &self,
         object_name: &str,
         schema_contains_object: F,
+        missing: SqlErrorKind,
     ) -> Result<usize>
     where
         F: Fn(&Schema, &str) -> bool,
@@ -649,19 +653,29 @@ impl<'a> Resolver<'a> {
         }
 
         if let Some(search_path) = &self.unqualified_database_search_path {
+            let mut first_existing = None;
             for schema_name in search_path {
                 let Some(database_id) = self.resolve_search_path_database_id(schema_name) else {
                     continue;
                 };
+                first_existing.get_or_insert(database_id);
                 if self.with_schema(database_id, |schema| {
                     schema_contains_object(schema, object_name)
                 }) {
                     return Ok(database_id);
                 }
             }
-            // A relation that no schema on the search path holds: PostgreSQL's 42P01 (fastest-wire, pg18-rev-eh1.out
-            // #13), not an unclassified parse error (42601).
-            crate::bail_parse_error!(SqlErrorKind::UndefinedTable; "no such object: {}", object_name);
+            // A miss: the caller looks in the path's first schema that exists and gives its own
+            // refusal, with its kind, or honours its IF EXISTS (engine-rev-quote42 MED-2: DROP ...
+            // IF EXISTS nope under ["public"] was refused here), as the miss without a search path
+            // falls back to main below.
+            if let Some(database_id) = first_existing {
+                return Ok(database_id);
+            }
+            // No schema of the path exists: PostgreSQL's 42P01 for a relation (fastest-wire,
+            // pg18-rev-eh1.out #13) and 42704 for an index or a trigger, never an unclassified
+            // parse error (42601).
+            crate::bail_parse_error!(missing; "no such object: {}", object_name);
         }
 
         if self.with_schema(crate::MAIN_DB_ID, |schema| {
@@ -741,6 +755,7 @@ impl<'a> Resolver<'a> {
             return self.resolve_unqualified_existing_database_id(
                 table_name,
                 Self::schema_has_table_like_object,
+                SqlErrorKind::UndefinedTable,
             );
         }
 
@@ -751,6 +766,7 @@ impl<'a> Resolver<'a> {
         self.resolve_unqualified_existing_database_id(
             table_name,
             Self::schema_has_table_like_object,
+            SqlErrorKind::UndefinedTable,
         )
     }
 
@@ -763,7 +779,7 @@ impl<'a> Resolver<'a> {
         }
 
         let index_name = normalize_ident(qualified_name.name.as_str());
-        self.resolve_unqualified_existing_database_id(&index_name, Self::schema_has_index)
+        self.resolve_unqualified_existing_database_id(&index_name, Self::schema_has_index, SqlErrorKind::UndefinedObject)
     }
 
     pub(crate) fn resolve_existing_trigger_database_id(
@@ -775,7 +791,7 @@ impl<'a> Resolver<'a> {
         }
 
         let trigger_name = qualified_name.name.as_str();
-        self.resolve_unqualified_existing_database_id(trigger_name, Self::schema_has_trigger)
+        self.resolve_unqualified_existing_database_id(trigger_name, Self::schema_has_trigger, SqlErrorKind::UndefinedObject)
     }
 
     /// Resolve database ID from a qualified name

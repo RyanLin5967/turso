@@ -1232,10 +1232,13 @@ pub fn translate_drop_index(
         if if_exists {
             return Ok(());
         } else {
-            return Err(crate::error::LimboError::InvalidArgument(format!(
-                "No such index: {}",
-                &idx_name
-            ).into()));
+            // PostgreSQL's 42704 (undefined_object; engine-rev-quote42 MED-1), the variant kept.
+            return Err(crate::error::LimboError::InvalidArgument(
+                crate::error::SqlErrorMessage::classified(
+                    crate::error::SqlErrorKind::UndefinedObject,
+                    format!("No such index: {}", &idx_name),
+                ),
+            ));
         }
     }
     // Return an error if the index is an auto-generated constraint-backing index.
