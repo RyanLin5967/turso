@@ -811,6 +811,12 @@ impl Group {
     fn land(&self, end: u64, class: SyncClass, ok: bool, confirm: Option<Confirm>) -> bool {
         let mut g = self.lock();
         g.flushing = false;
+        // LEAP L3: the cohort the next leader gathers for, counted at the landing while this flight's
+        // riders are still inside their wait: the riders plus whoever buffered meanwhile, about C in
+        // a closed loop. Counted at the take it was only the waiters then, the other half (about
+        // C/2), which the half already waiting satisfies, so the alternation stayed (lane raws
+        // 0766726bfe: C=64, 96 flushes for 48 rounds with and without the gather).
+        g.cohort = self.awaiting.load(Ordering::Acquire);
         let mut replaced = None;
         let accepted = ok && self.accepts();
         if accepted {
@@ -6445,8 +6451,6 @@ impl BranchStore {
                     Ok(Some(flight)) if !flight.is_empty() => {
                         g.flushing = true;
                         g.flights += 1;
-                        // The cohort this flight carries, for the next leader's gather.
-                        g.cohort = group.awaiting.load(Ordering::Acquire);
                         if upgrade && flight.len() == 0 {
                             g.upgrades += 1;
                         }
