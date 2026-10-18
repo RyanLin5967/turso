@@ -269,7 +269,10 @@ def self_test():
         rc, out = cli(t)
         cases.append(("uw2 MED 1: a tally with na=1 under exit 0 is REFUSED (the tally and the rc disagree)",
                       rc == 1 and "lies.py" in out and "disagree" in out))
-        rows(("good.py", good), ("failna.py", ('print("FAIL: case z")', 'print("TALLY ran=1 pass=0 na=1 fail=1")', "sys.exit(3)")))
+        # uw3 LOW 3: the row also names an N/A cause, so only the tally's own fail count can refuse it (without that line
+        # the older rule, 'rc 3 with no N/A line', refused it too, and a mutant dropping tally's rc-3 fail check passed)
+        rows(("good.py", good), ("failna.py", ('print("FAIL: case z")', 'print("N/A-on-busy-host: case z2")',
+                                               'print("TALLY ran=1 pass=0 na=1 fail=1")', "sys.exit(3)")))
         rc, out = cli(t)
         cases.append(("uw2 LOW 5: a row that failed a case is never classed N/A, whatever its rc",
                       rc == 1 and "failna.py" in out and "N/A failna.py" not in out))
@@ -311,8 +314,16 @@ def self_test():
         # caught by reading it, before any run; and a real row with its TALLY print removed is refused when run
         real = os.path.dirname(HERE)
         rows_, _ = table(real)
-        silent = [r[0] for r in rows_ if os.path.isfile(os.path.join(real, r[0]))
-                  and "TALLY ran=" not in open(os.path.join(real, r[0]), errors="replace").read()]
+        # uw3 LOW 5: by PARSING, not by text (a comment naming 'TALLY ran=' satisfied the text check). The red reaches
+        # prints_tally through a fallback with today's text check, so it fails at its claim
+        pt = globals().get("prints_tally", lambda p: "TALLY ran=" in open(p, errors="replace").read())
+        cpy = os.path.join(t, "comment_only.py")
+        open(cpy, "w").write('import sys\n# TALLY ran= was printed here\nprint("x")\n')
+        csh = os.path.join(t, "comment_only_test.sh")
+        open(csh, "w").write('#!/bin/bash\n# echo "TALLY ran=1 pass=1 na=0 fail=0"\necho x\n')
+        cases.append(("uw3 LOW 5: a source whose only TALLY is in a comment does not print one (.py and .sh)",
+                      not pt(cpy) and not pt(csh)))
+        silent = [r[0] for r in rows_ if os.path.isfile(os.path.join(real, r[0])) and not pt(os.path.join(real, r[0]))]
         cases.append(("every real row's source prints a TALLY line (none silent: %s)" % (silent or "none"), not silent))
         for victim in ("gates/warmup_conformance.py", "gates/driver_contract.py"):
             vt = open(os.path.join(real, victim)).read()

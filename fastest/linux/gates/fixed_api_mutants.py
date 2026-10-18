@@ -209,6 +209,12 @@ def self_test():
              ("a row whose target is absent is a stale table",
               any("found 0 times" in x for x in table_problems(
                   [("t", "synthetic", "t3", "t3lib.sh", T3LIB, "no such line\n", "", "x", "")])))]
+    # linux-rev-uw3 LOW 4: an unmutated control is judged by control_ok (its TALLY with its rc: pass, or N/A); these
+    # cases make it fire. The red reaches it through a fallback with the rc-only rule
+    cok = globals().get("control_ok", lambda out, rc: rc in (0, 3))
+    cases += [("uw3 LOW 4: a control at rc 0 with no TALLY is not green", not cok("all fine\n", 0)),
+              ("uw3 LOW 4: a control at rc 3 whose TALLY has fail=1 is not green", not cok("TALLY ran=1 pass=0 na=1 fail=1\n", 3)),
+              ("uw3 LOW 4: a control with its honest TALLY at rc 0 is green", cok("TALLY ran=2 pass=2 na=0 fail=0\n", 0))]
     bad = 0
     for n, ok in cases:
         bad += not ok

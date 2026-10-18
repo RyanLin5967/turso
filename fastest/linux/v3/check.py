@@ -1511,6 +1511,17 @@ def self_test():
     # sixth review M3: the call paths themselves -- check_real and cell_leaf_check on planted copies of a banked
     # write-back batch (run 37528595878, x86 ext4loop on NVMe, a VM)
     real_selftest(chk)
+    # linux-rev-uw3 LOW 4: the fire-check's judgement of a self-test's output (B:selftest, S:batchgate, S:check) is one
+    # helper, selftest_output_ok, and these cases make it fire: a passing summary with no TALLY, or a TALLY that
+    # disagrees with the rc, is not ok. The red reaches it through a fallback with the summary-and-rc rule alone
+    so_ok = globals().get("selftest_output_ok", lambda text, rc, name: rc == 0 and re.search(
+        name + r" SELF-TEST (\d+)/(\d+) PASS\s*$", text) is not None)
+    chk("uw3 LOW 4: a self-test output whose summary says PASS but which has no TALLY is not ok",
+        not so_ok("BLKFLUSH SELF-TEST 3/3 PASS\n", 0, "BLKFLUSH"))
+    chk("uw3 LOW 4: a TALLY that disagrees with the rc (na=1 at rc 0) is not ok",
+        not so_ok("TALLY ran=3 pass=3 na=1 fail=0\nBATCHGATE SELF-TEST 3/3 PASS\n", 0, "BATCHGATE"))
+    chk("uw3 LOW 4: a PASS summary with its honest TALLY at rc 0 is ok",
+        so_ok("TALLY ran=3 pass=3 na=0 fail=0\nCHECK SELF-TEST 3/3 PASS\n", 0, "CHECK"))
     ok = all(res) and len(res) > 0
     print(f"TALLY ran={len(res)} pass={sum(res)} na={len(SELF_TEST_NA)} fail={len(res) - sum(res)}")  # gates/tally.py
     print("CHECK SELF-TEST %d/%d %s" % (sum(res), len(res), "PASS" if ok else "FAIL")

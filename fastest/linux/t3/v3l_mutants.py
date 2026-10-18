@@ -248,6 +248,16 @@ def self_test():
         ("LOW 15: main() whose temp layout lacks testdata returns 2 before any mutant runs",
          lambda: main_case("layout")),
     ]
+    # linux-rev-uw3 LOW 3: the unmutated control is judged by control_green (its TALLY with its rc), not by its summary
+    # line; the red reaches it through a fallback with today's rule (rc 0, no FAIL lines, summary ending ' PASS')
+    cg = globals().get("control_green", lambda rc, out: rc == 0 and " FAIL: " not in out and any(
+        ln.startswith("V3L SELF-TEST") and ln.endswith(" PASS") for ln in out.splitlines()))
+    cases += [
+        ("uw3 LOW 3: a control whose summary ends PASS but which prints no TALLY is not green",
+         lambda: not cg(0, "V3L SELF-TEST 3/3 PASS\n")),
+        ("uw3 LOW 3: a control with its honest TALLY and summary is green",
+         lambda: cg(0, "TALLY ran=3 pass=3 na=0 fail=0\nV3L SELF-TEST 3/3 PASS\n")),
+    ]
     bad = 0
     for name, f in cases:
         try:

@@ -302,7 +302,7 @@ def self_test():
 
     # linux-rev-uw1 MED 3: busy-host evidence comes from the WINDOW's own samples (a ps CPU% is a lifetime average:
     # the reviewer's 30 s burner read 57-94% while idle), of a foreign, non-kernel process outside the test's tree
-    def evid(label, rows, exclude=(), gap_at=None):
+    def evid(label, rows, exclude=(), gap_at=None, foreign_ticks=0.0):
         f = os.path.join(d, f"evid-{label}.tsv")
         with open(f, "w") as o:
             o.write("#start\t0\tcell=ST\tinterval=1.0\tload=()\n")
@@ -312,7 +312,7 @@ def self_test():
                 for pid, comm, pct, kind, start, n in rows:
                     if start <= i < start + n:
                         o.write(f"{t_:.3f}\t{pid}\t{comm}\t{pct}\t{kind}\n")
-                o.write(f"#tick\t{t_:.3f}\t0\t0.0\t50.0\n")
+                o.write(f"#tick\t{t_:.3f}\t{foreign_ticks}\t0.0\t50.0\n")
             o.write("#stop\t20.000\tstop-file\tload=()\n")
         return busy_evidence(f, exclude)
     synthetic_evid = [
@@ -330,6 +330,30 @@ def self_test():
         # is a foreign process: a record that is also unusable (here a 4 s gap) is not a busy host, burner or not
         ("uw2 LOW 3: a VOID that is also an unusable record (a 4 s gap) is no busy-host evidence, burner or not",
          evid("gap", [(12, "java", 90.0, "foreign", 2, 15)], gap_at=8) == []),
+    ]
+    # linux-rev-uw3 MED 1: a live case's BURNERS must be seen to have run in its own window record: a VALID-wanting case
+    # needs the SUT's CPU (sut_max) to show its SUT burners; the VOID-wanting case needs rule 2 to name one of ITS OWN
+    # burner pids. The red reaches burners_ran through a fallback with today's behaviour (no check: True), so it fails
+    # at these claims, not at setup
+    ran = globals().get("burners_ran", lambda v, burners, mine: True)
+    two_sut = [(True, 1, 17), (True, 1, 17)]
+    synthetic_evid += [
+        ("uw3 MED 1: two SUT burners that never burned (sut_max 0) are refused", not ran({"sut_max": 0.0, "reasons": []}, two_sut, {1, 2})),
+        ("uw3 MED 1: two SUT burners seen at 190% pass", ran({"sut_max": 190.0, "reasons": []}, two_sut, {1, 2})),
+        ("uw3 MED 1: a SUT child that never burned (sut_max 0) is refused",
+         not ran({"sut_max": 0.0, "reasons": []}, [("child", 3, 9)], {1, 2})),
+        ("uw3 MED 1: a VOID named on another process (pid 999, not ours) does not show OUR burner ran",
+         not ran({"sut_max": 0.0, "reasons": ["foreign process 999 (java) above 50% for >= 5 s"]}, [(False, 3, 9)], {41, 42})),
+        ("uw3 MED 1: a VOID naming our own burner pid 42 shows it ran",
+         ran({"sut_max": 0.0, "reasons": ["foreign process 42 (python3) above 50% for >= 5 s"]}, [(False, 3, 9)], {41, 42})),
+        # uw3 LOW 6: a host busy only by rule 1 (many processes each under 50%, together over 100%) is busy-host
+        # evidence, naming them, as long as they are outside the test's own tree
+        ("uw3 LOW 6: four foreign processes at 40% each (rule 1 only) are busy-host evidence",
+         len(evid("r1", [(31, "a", 40.0, "foreign", 0, 20), (32, "b", 40.0, "foreign", 0, 20), (33, "c", 40.0, "foreign", 0, 20),
+                         (34, "d", 40.0, "foreign", 0, 20)], foreign_ticks=160.0)) >= 3),
+        ("uw3 LOW 6: the same rule-1 load from the test's own tree is no evidence",
+         evid("r1own", [(31, "a", 40.0, "foreign", 0, 20), (32, "b", 40.0, "foreign", 0, 20), (33, "c", 40.0, "foreign", 0, 20),
+                        (34, "d", 40.0, "foreign", 0, 20)], exclude={31, 32, 33, 34}, foreign_ticks=160.0) == []),
     ]
     for label, ok in synthetic_evid:
         bad += not ok
