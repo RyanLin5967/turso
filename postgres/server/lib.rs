@@ -7449,12 +7449,18 @@ mod tests {
     /// literal). Also flagged: `{x:?}` in engine text, an engine literal that ends by opening a
     /// quote (concatenation), a bare quoted placeholder anywhere, and one placeholder written on
     /// both sides of another (`{q}{v}{q}`). The head is read in any case, past leading
-    /// placeholders, commas and parens (wire-rev-uw1 M5), and a client message is exempt only when
-    /// it holds no SQL clause (FROM, WHERE, VALUES, SET, INTO, =). BLIND SPOTS (stated, not
-    /// covered): a quote in a variable spliced in other ways (`.replace`, `+`, a `{}` positional
-    /// pair), an UNquoted identifier placeholder (`INSERT INTO {} ...`, which quote_ident output
-    /// also fills), a message-shaped literal with no clause word, and text assembled from parts
-    /// none of which is SQL-led or a continuation.
+    /// placeholders, commas, parens, semicolons, `\r` and SQL comments (wire-rev-uw1 M5,
+    /// wire-rev-uw2 N6). SINCE wire-rev-uw2 N6 (20 evasions led by words the keyword list did not
+    /// name) a quoted placeholder (`'{x}'`, `\"{x}\"`, `\x27{x}`) in ANY literal is engine
+    /// text unless the literal is a client message, an allowlist: at least two lower-case words,
+    /// and, after any PostgreSQL `VERB: ` prefix, no SQL mark (a word only SQL uses in any case,
+    /// an English-ambiguous SQL word in upper case, an operator, `;`, a comment, `', `), or one
+    /// of the hand-read MESSAGES_WITH_SQL_WORDS. The CLI's main.rs is in scope (its \d queries).
+    /// BLIND SPOTS (stated, not covered): a quote in a variable spliced in other ways (`.replace`,
+    /// `+`, a `{}` positional pair), an UNquoted identifier placeholder (`INSERT INTO {} ...`,
+    /// which quote_ident output also fills), lower-case SQL made only of English-ambiguous words
+    /// (`x like '{v}' escape` has `escape`, but `{c} in ('{v}')` has `('`; `{c} like '{v}'
+    /// limit` passes), and files outside postgres/frontend, the translator and the CLI.
     #[test]
     fn engine_text_from_any_literal_is_quoted_by_the_one_quoting_function() {
         // Statement verbs and clause words, matched in any case at the literal's head, past
@@ -7469,6 +7475,32 @@ mod tests {
         ];
         // Clause words whose presence makes a literal SQL even past an exempting colon or phrase.
         const CLAUSES: [&str; 6] = [" FROM ", " WHERE ", " VALUES", " SET ", " INTO ", " = "];
+        // A client message is the allowlisted case of a literal with a quoted placeholder
+        // (wire-rev-uw2 N6): its text after any PostgreSQL `VERB: ` prefix holds at least two
+        // lower-case words, and no SQL mark: a word only SQL uses (in any case), one of the
+        // English-ambiguous SQL words in upper case, an operator, a separator or a comment.
+        const SQL_ONLY_WORDS: [&str; 26] = [
+            "SELECT", "INSERT", "UPDATE", "PRAGMA", "ATTACH", "DETACH", "SAVEPOINT", "VACUUM",
+            "REINDEX", "TRUNCATE", "RETURNING", "HAVING", "WHERE", "JOIN", "UNION", "VALUES",
+            "ESCAPE", "COLLATE", "GLOB", "REGEXP", "ILIKE", "NULLIF", "COALESCE", "REFERENCES",
+            "UPSERT", "EXPLAIN",
+        ];
+        const SQL_UPPER_WORDS: [&str; 39] = [
+            "DELETE", "CREATE", "DROP", "ALTER", "RELEASE", "ROLLBACK", "WITH", "BEGIN", "COMMIT",
+            "END", "SET", "COPY", "CASE", "WHEN", "THEN", "ELSE", "REPLACE", "AND", "OR", "FROM",
+            "AS", "IN", "ON", "LIKE", "CHECK", "DEFAULT", "CAST", "IS", "NOT", "NULL", "BETWEEN",
+            "ORDER", "GROUP", "LIMIT", "INTO", "TABLE", "INDEX", "VIEW", "CONSTRAINT",
+        ];
+        // Client messages that hold SQL words themselves, each read by hand (the literal's start
+        // as written): an allowlist, so a new one is flagged until it is read. The two COPY
+        // fragments are the `what` of "COPY {what} is not supported".
+        const MESSAGES_WITH_SQL_WORDS: [&str; 5] = [
+            "ALTER TABLE ADD CONSTRAINT: table \\\"{table}\\\" was not created by CREATE TABLE in ",
+            "ALTER TABLE ADD CONSTRAINT: table \\\"{table}\\\" was created by CREATE TABLE AS, so it ",
+            "DELETE ... USING on \\\"{target}\\\", which declares columns named rowid, ",
+            "format \\\"{val}\\\"",
+            "option \\\"{name}\\\"",
+        ];
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut files: Vec<_> = std::fs::read_dir(root.join("../frontend"))
             .unwrap()
@@ -7476,6 +7508,8 @@ mod tests {
             .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("rs"))
             .collect();
         files.push(root.join("../parser/translator.rs"));
+        // The CLI builds catalog queries for its \d commands (wire-rev-uw2 N6: out of scope).
+        files.push(root.join("../cli/main.rs"));
         let mut wrong = Vec::new();
         let mut seen = 0;
         for path in &files {
@@ -7483,6 +7517,7 @@ mod tests {
             for exempt in [
                 "pub(crate) fn quote_ident(",
                 "pub(crate) fn quote_literal(",
+                "pub(crate) fn pg_quote_literal(",
                 "pub fn sql_string(",
                 "pub fn sql_quoted(",
             ] {
@@ -7496,20 +7531,29 @@ mod tests {
                 seen += 1;
                 let mut head = lit.as_str();
                 loop {
-                    let t = head
+                    let mut t = head
                         .trim_start()
                         .trim_start_matches("\\n")
+                        .trim_start_matches("\\r")
                         .trim_start_matches("\\t")
                         .trim_start_matches("\\\n")
                         .trim_start_matches("{SQLITE_TEXT_MARKER}")
                         .trim_start_matches("/* turso:sqlite */ ");
+                    // A leading SQL comment, line or block (wire-rev-uw2 N6).
+                    if let Some(rest) = t.strip_prefix("--") {
+                        t = rest.find("\\n").map_or("", |e| &rest[e + 2..]);
+                    } else if let Some(rest) = t.strip_prefix("/*") {
+                        t = rest.find("*/").map_or("", |e| &rest[e + 2..]);
+                    }
                     if t.len() == head.len() {
                         break;
                     }
                     head = t;
                 }
                 loop {
-                    let t = head.trim_start_matches(|c: char| c.is_whitespace() || c == ',' || c == '(');
+                    let t = head.trim_start_matches(|c: char| {
+                        c.is_whitespace() || c == ',' || c == '(' || c == ')' || c == ';'
+                    });
                     match t.strip_prefix('{').and_then(|r| r.find('}').map(|e| &r[e + 1..])) {
                         Some(rest) if !t.starts_with("{{") => head = rest,
                         _ => {
@@ -7525,7 +7569,7 @@ mod tests {
                         upper.starts_with(k)
                             && !upper[k.len()..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
                     });
-                let quoted_hole = ["'", "\\\"", "\"", "`"].iter().any(|q| {
+                let quoted_hole = ["'", "\\\"", "\"", "`", "\\x27", "\\x22", "\\u{27}", "\\u{22}"].iter().any(|q| {
                     lit.match_indices(&format!("{q}{{")).any(|(i, _)| !lit[i + q.len()..].starts_with("{{"))
                         || lit.match_indices(&format!("}}{q}")).any(|(i, _)| i == 0 || &lit[i - 1..i] != "}")
                         || lit.contains(&format!("{q}%{{"))
@@ -7539,11 +7583,44 @@ mod tests {
                     .min()
                     .unwrap_or(lit.len());
                 let sql_clause = CLAUSES.iter().any(|c| lit.to_ascii_uppercase().contains(c));
-                let message = !sql_clause
-                    && (lit.find(": ").is_some_and(|c| c < first_hole)
-                        || ["is not supported", "violates ", "does not exist", "cannot ", " was not ", " was created "]
-                            .iter()
-                            .any(|p| lit.contains(p)));
+                // SQL marks no client message holds: an upper-case SQL word anywhere, an
+                // operator, a statement separator or a comment (wire-rev-uw2 N6: fragments led by
+                // ESCAPE, COLLATE, DEFAULT, REFERENCES, WHEN, GLOB, IS NOT, CHECK, NULLIF or END,
+                // or by `x = `, `'{v}', 1`, passed the keyword-led test).
+                // PostgreSQL's message form puts the statement's words before a colon that comes
+                // before any quoted placeholder (`COPY FROM: cannot read '{f}'`): only the text
+                // after that colon must be free of SQL marks, and the head may be SQL-led.
+                let colon = lit.find(": ").filter(|c| *c < first_hole);
+                let tail = colon.map_or(lit.as_str(), |c| &lit[c + 2..]);
+                // Whole words of the tail, outside placeholders (`FROM-clause` is one word).
+                let words: Vec<String> = {
+                    let mut plain = String::new();
+                    let mut depth = 0;
+                    for c in tail.chars() {
+                        match c {
+                            '{' => depth += 1,
+                            '}' if depth > 0 => depth -= 1,
+                            _ if depth == 0 => plain.push(c),
+                            _ => {}
+                        }
+                    }
+                    plain
+                        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+                        .filter(|w| !w.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                };
+                let sql_marks = words.iter().any(|w| {
+                    SQL_ONLY_WORDS.iter().any(|k| w.eq_ignore_ascii_case(k))
+                        || SQL_UPPER_WORDS.contains(&w.as_str())
+                }) || [" = ", "<>", "!=", ";", "--", "/*", "', ", "('"].iter().any(|m| tail.contains(m));
+                let english = lit
+                    .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+                    .filter(|w| w.len() >= 2 && w.chars().all(|c| c.is_ascii_lowercase()))
+                    .count()
+                    >= 2;
+                let message = MESSAGES_WITH_SQL_WORDS.iter().any(|m| lit.starts_with(m))
+                    || (!sql_clause && !sql_marks && english && (colon.is_some() || !led));
                 // `{x:?}` prints quotes of its own; a literal that opens a quote at its end is
                 // half of a concatenation (`"... \"" + x`); a bare quoted placeholder is a
                 // quoting fragment wherever it is used.
@@ -7564,7 +7641,10 @@ mod tests {
                 let bare = ["'", "\\\""].iter().any(|q| {
                     lit.starts_with(&format!("{q}{{")) && lit.ends_with(&format!("}}{q}")) && lit.matches('{').count() == 1
                 });
-                if bare || wrapped_by_name || (led && (quoted_hole || debug_hole || open_quote) && !message) {
+                // Any literal with a quoted placeholder is engine text unless it is a client
+                // message: an allowlist, not a list of SQL heads (wire-rev-uw2 N6: every new
+                // head the keyword list did not name got past it).
+                if bare || wrapped_by_name || ((quoted_hole || (led && (debug_hole || open_quote))) && !message) {
                     wrong.push(format!("{}:{line}: {lit}", path.display()));
                 }
             }
