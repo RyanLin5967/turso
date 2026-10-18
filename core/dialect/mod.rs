@@ -1111,10 +1111,12 @@ mod tests {
                 wrong.push(format!("{entry}: {e}"));
             }
         };
+        // FLAGGED fixture repair after its first run (3121bd7d5): a frontend's SQLite text may not create a
+        // table (R11), so the frontend-kind entries write into a table the engine made.
         check("execute(client)", c.execute("client: CREATE TABLE t0(x)"));
         check("execute_engine", c.execute_engine(EngineSql::new("CREATE TABLE t1(x); INSERT INTO t1 VALUES (1)"), Origin::Root));
-        check("execute_sqlite", c.execute_sqlite("CREATE TABLE t2(x); INSERT INTO t2 VALUES (1)"));
-        check("execute_with(frontend)", c.execute_with("CREATE TABLE t3(x); INSERT INTO t3 VALUES (1)", SqlKind::frontend(), Origin::Root));
+        check("execute_sqlite", c.execute_sqlite("INSERT INTO t1 VALUES (2); INSERT INTO t1 VALUES (3)"));
+        check("execute_with(frontend)", c.execute_with("INSERT INTO t1 VALUES (4); INSERT INTO t1 VALUES (5)", SqlKind::frontend(), Origin::Root));
         check("execute_with(client)", c.execute_with("client: CREATE TABLE t4(x)", SqlKind::client(), Origin::Root));
         assert!(wrong.is_empty(), "CLAIM: an execute entry ran its text under another kind: {wrong:#?}");
     }
