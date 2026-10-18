@@ -13,6 +13,9 @@ where class is
           started with setsid keep their environment, so they stay inside);
   kernel  a kernel thread (no command line);
   foreign everything else, the sampler itself excluded.
+The first time a foreign pid is recorded, an `#owner` row names it: pid, uid, user, and the uwrun run it belongs to
+(for this account's processes, the <NAME> of the <prefix>-runs/<NAME>/ its cwd is under; "-" otherwise). Owners only
+name busy-host evidence; they never change a verdict, and our own other runs are foreign like anyone's.
 Each tick also writes a `#tick` row (t, foreign_sum, kernel_sum, sut_sum), so a tick in which nothing
 foreign ran is on the record as a zero, not as a missing row.
 
@@ -36,6 +39,32 @@ import sys
 import time
 
 HZ = os.sysconf("SC_CLK_TCK")
+
+
+RUN_RE = re.compile(r"/[A-Za-z0-9_.-]+-runs/([A-Za-z0-9_-]+)(?:/|$)")
+
+
+def owner_of(pid):
+    """(uid, user, run) of PID, or None when it is gone. RUN is the uwrun run the process belongs to: for a process of
+    THIS account, the <NAME> of the OUTERMOST <prefix>-runs/<NAME>/ its cwd is under (uwrun's host-local layout, the
+    run dir under /var/tmp or /dev/shm; a runs dir nested inside a run is still that run's), else "-". Another user's cwd cannot be read, so their run is always "-"."""
+    import pwd
+    try:
+        uid = os.stat(f"/proc/{pid}").st_uid
+    except OSError:
+        return None
+    try:
+        user = pwd.getpwuid(uid).pw_name
+    except KeyError:
+        user = str(uid)
+    run = "-"
+    if uid == os.getuid():
+        try:
+            m = RUN_RE.search(os.readlink(f"/proc/{pid}/cwd"))
+            run = m.group(1) if m else "-"
+        except OSError:
+            pass
+    return uid, user, run
 
 
 def read_procs(cell):
@@ -96,6 +125,7 @@ def sample(path, cell, interval, stop_file, max_s):
     t0 = time.monotonic()
     prev = read_procs(cell)
     prev_t = t0
+    owned = set()
     with open(path, "w") as f:
         f.write(f"#start\t{time.time():.3f}\tcell={cell}\tinterval={interval}\tload={os.getloadavg()}\n")
         while True:
@@ -111,6 +141,11 @@ def sample(path, cell, interval, stop_file, max_s):
                     continue
                 pct = 100.0 * used / HZ / dt
                 sums[cls] += pct
+                if cls == "foreign" and pid not in owned:
+                    owned.add(pid)
+                    o = owner_of(pid)
+                    if o:
+                        f.write(f"#owner\t{pid}\t{o[0]}\t{o[1]}\t{o[2]}\n")
                 f.write(f"{now - t0:.3f}\t{pid}\t{comm}\t{pct:.1f}\t{cls}\n")
             f.write(f"#tick\t{now - t0:.3f}\t{sums['foreign']:.1f}\t{sums['kernel']:.1f}\t{sums['sut']:.1f}\n")
             f.flush()
@@ -129,10 +164,12 @@ def busy_evidence(path, exclude=(), interval_default=1.0):
     whose pid is not in EXCLUDE (the self-test's own tree) and that the record shows above 50% for 5 s or more (rule
     2's own run-length). A ps CPU% is a lifetime average and proves nothing about the window (the reviewer's idle
     burner read 57-94%). Returns ["comm pid N", ...]; an empty list is no evidence."""
-    per, interval = {}, interval_default
+    per, interval, owners = {}, interval_default, {}
     for line in open(path):
         p = line.rstrip("\n").split("\t")
-        if p[0] == "#start":
+        if p[0] == "#owner" and len(p) == 5:
+            owners[int(p[1])] = (p[3], p[4])
+        elif p[0] == "#start":
             for x in p[1:]:
                 if x.startswith("interval="):
                     interval = float(x.split("=")[1])
@@ -164,7 +201,14 @@ def busy_evidence(path, exclude=(), interval_default=1.0):
         if ticks and over / len(ticks) > 0.05:
             top = sorted(per.items(), key=lambda kv: -sum(p for _t, p in kv[1]))[:4]
             out = [f"{comm} pid {pid}" for (pid, comm), _r in top]
-    return out
+    # who: each named process's owner from the sampler's #owner rows (the lead's 2026-10-18 order), never guessed
+    def who(e):
+        pid = int(e.rsplit(" pid ", 1)[1])
+        if pid not in owners:
+            return f"{e} (owner unrecorded)"
+        user, run = owners[pid]
+        return f"{e} (user {user}, our run {run})" if run != "-" else f"{e} (user {user})"
+    return [who(e) for e in out]
 
 
 def burners_ran(v, burners, mine):
@@ -335,10 +379,12 @@ def self_test():
 
     # linux-rev-uw1 MED 3: busy-host evidence comes from the WINDOW's own samples (a ps CPU% is a lifetime average:
     # the reviewer's 30 s burner read 57-94% while idle), of a foreign, non-kernel process outside the test's tree
-    def evid(label, rows, exclude=(), gap_at=None, foreign_ticks=0.0):
+    def evid(label, rows, exclude=(), gap_at=None, foreign_ticks=0.0, owners=()):
         f = os.path.join(d, f"evid-{label}.tsv")
         with open(f, "w") as o:
             o.write("#start\t0\tcell=ST\tinterval=1.0\tload=()\n")
+            for pid, uid, user, run in owners:
+                o.write(f"#owner\t{pid}\t{uid}\t{user}\t{run}\n")
             t_ = 0.0
             for i in range(20):
                 t_ += 4.0 if gap_at == i else 1.0
@@ -387,6 +433,62 @@ def self_test():
         ("uw3 LOW 6: the same rule-1 load from the test's own tree is no evidence",
          evid("r1own", [(31, "a", 40.0, "foreign", 0, 20), (32, "b", 40.0, "foreign", 0, 20), (33, "c", 40.0, "foreign", 0, 20),
                         (34, "d", 40.0, "foreign", 0, 20)], exclude={31, 32, 33, 34}, foreign_ticks=160.0) == []),
+    ]
+    # the lead's 2026-10-18 order (M1's quiet baseline VOIDed on eceubuntu2 and ecetesla3 by "node-MainThread"
+    # processes nobody could name afterwards): busy-host evidence names each process's OWNER, user and, for a process
+    # of this account, the uwrun run it belongs to (its cwd under <prefix>-runs/<NAME>/), from #owner rows the sampler
+    # writes when it first records a foreign pid. The busy rule itself does NOT exclude our own runs: a window shared
+    # with another of our runs is as loaded as one shared with a stranger, and T3 times only quiet windows. The red
+    # reaches owner_of through a fallback with today's behaviour (nothing recorded: None)
+    own = globals().get("owner_of", lambda pid: None)
+    import pwd
+    me_user = pwd.getpwuid(os.getuid()).pw_name
+    # the probe dir must sit under no OTHER runs dir: d is under TMPDIR, which uwrun puts inside the run's own dir
+    # (<user>-runs/<NAME>/tmp), so a probe under d is rightly named by that outer run (green run 1, ecetesla2)
+    base = next(b for b in ("/dev/shm", "/tmp", d) if os.access(b, os.W_OK))
+    pd = tempfile.mkdtemp(dir=base)
+    rd = os.path.join(pd, "x-runs", "probe-run", "work")
+    os.makedirs(rd)
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], cwd=rd)
+    nd = os.path.join(pd, "x-runs", "outer-run", "work", "y-runs", "inner-run")
+    os.makedirs(nd)
+    nested = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], cwd=nd)
+    try:
+        got_child = own(child.pid)
+        got_nested = own(nested.pid)
+    finally:
+        for c_ in (child, nested):
+            c_.kill(); c_.wait()
+    import shutil
+    shutil.rmtree(pd, ignore_errors=True)
+    got_self = own(os.getpid())
+    # sample() itself: a foreign child burning for 2 s is recorded, and the record carries an #owner row for it
+    srec, sstop = os.path.join(d, "owner-sample.tsv"), os.path.join(d, "owner-sample.stop")
+    burn = subprocess.Popen([sys.executable, "-c", "import time\nt=time.monotonic()\nwhile time.monotonic()-t<3: pass"])
+    sp = subprocess.Popen([sys.executable, "-B", os.path.abspath(__file__), "sample", srec, "--cell", "OWNERPROBE",
+                           "--interval", "0.5", "--stop-file", sstop, "--max-s", "10"])
+    burn.wait()
+    open(sstop, "w").close()
+    sp.wait()
+    srows = [ln.rstrip("\n").split("\t") for ln in open(srec)]
+    burn_owner = [r for r in srows if r[0] == "#owner" and r[1] == str(burn.pid)]
+    synthetic_evid += [
+        ("owner: busy-host evidence names another user's process by its user",
+         evid("own1", [(7, "node-MainThread", 90.0, "foreign", 2, 8)], owners=[(7, 4242, "alice", "-")])
+         == ["node-MainThread pid 7 (user alice)"]),
+        ("owner: busy-host evidence names a process of OUR account by its uwrun run",
+         evid("own2", [(7, "node-MainThread", 90.0, "foreign", 2, 8)], owners=[(7, 1000, me_user, "moonshot-x")])
+         == [f"node-MainThread pid 7 (user {me_user}, our run moonshot-x)"]),
+        ("owner: a process with no #owner row is named as unrecorded, never guessed",
+         evid("own3", [(7, "java", 90.0, "foreign", 2, 8)]) == ["java pid 7 (owner unrecorded)"]),
+        ("owner: owner_of names a child of ours by our user and by the run its cwd is under",
+         got_child is not None and got_child[1:] == (me_user, "probe-run")),
+        ("owner: a runs dir nested inside a run is still the outer run's (uwrun's own dir is the outermost)",
+         got_nested is not None and got_nested[2] == "outer-run"),
+        ("owner: owner_of names our own process with no run when its cwd is under none",
+         got_self is not None and got_self[1] == me_user),
+        ("owner: sample() writes an #owner row for a foreign pid it records, with our user",
+         len(burn_owner) == 1 and burn_owner[0][3] == me_user),
     ]
     for label, ok in synthetic_evid:
         bad += not ok
