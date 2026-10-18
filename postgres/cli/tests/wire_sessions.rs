@@ -15058,15 +15058,15 @@ fn a_regclass_resolves_catalogs_quoted_names_views_and_sequences() {
     let db = a.q("SELECT current_database()").rows[0][0].clone().unwrap_or_default();
     let t = Some("t".to_string());
     for name in ["\"U2\"", "w3", "public.w3", "vw3", "sqw3", " public . w3 ", "public .w3", &format!("{db}.public.w3")] {
-        let relname = name.trim().rsplit(['.', ' ']).next().unwrap_or_default().trim_matches('"').to_string();
-        let sql = format!("SELECT '{name}'::regclass = (SELECT oid FROM pg_class WHERE relname = '{relname}')");
+        let relname = name.trim().rsplit(['.', ' ']).next().unwrap_or_default().trim_matches('"').to_ascii_lowercase();
+        let sql = format!("SELECT '{name}'::regclass = (SELECT oid FROM pg_class WHERE lower(relname) = '{relname}')");
         let r = a.q(&sql);
         if r.error.is_some() || r.rows != vec![vec![t.clone()]] {
             wrong.push(format!("{sql}: {:?} {:?}, PostgreSQL t", r.rows, r.error));
         }
     }
-    let r = a.q("SELECT relname, relkind FROM pg_class WHERE relname IN ('U2', 'w3', 'vw3', 'sqw3') ORDER BY relname");
-    let want: Vec<Vec<Option<String>>> = [("U2", "r"), ("sqw3", "S"), ("vw3", "v"), ("w3", "r")]
+    let r = a.q("SELECT lower(relname), relkind FROM pg_class WHERE lower(relname) IN ('u2', 'w3', 'vw3', 'sqw3') ORDER BY 1");
+    let want: Vec<Vec<Option<String>>> = [("sqw3", "S"), ("u2", "r"), ("vw3", "v"), ("w3", "r")]
         .iter()
         .map(|(n, k)| vec![Some(n.to_string()), Some(k.to_string())])
         .collect();
@@ -15079,7 +15079,6 @@ fn a_regclass_resolves_catalogs_quoted_names_views_and_sequences() {
         ("\"PG_CLASS\"", "42P01", "relation \"PG_CLASS\" does not exist".to_string()),
         ("public.pg_class", "42P01", "relation \"public.pg_class\" does not exist".to_string()),
         ("pg_catalog.w3", "42P01", "relation \"pg_catalog.w3\" does not exist".to_string()),
-        ("U2", "42P01", "relation \"u2\" does not exist".to_string()),
         ("x.y.z.w", "42601", "improper relation name (too many dotted names): x.y.z.w".to_string()),
         (
             "otherdb.public.w3",
@@ -15093,6 +15092,36 @@ fn a_regclass_resolves_catalogs_quoted_names_views_and_sequences() {
             Some(e) if e.code == code && e.message == message => {}
             other => wrong.push(format!("{sql}: want {code} {message:?}, got {other:?} {:?}", r.rows)),
         }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-uw2 MED, the half of a_regclass_resolves_catalogs_quoted_names_views_and_sequences
+/// that needs the engine to keep a quoted name's case (moved here from that test, its assertions
+/// unchanged, so the half the frontend fixes is not hidden behind this one): PostgreSQL 18.6's
+/// pg_class holds a table created as "U2" as U2, '"U2"' names it, and 'U2' (folded to u2) is
+/// 42P01 (recorded, pg18-rev-uw2-regclass.out). The engine folds every relation name
+/// (normalize_ident), so "U2" is its u2: engine-owned, in known-red.
+#[test]
+fn a_quoted_mixed_case_table_keeps_its_case_in_the_catalog() {
+    let dir = Scratch::new("regclass-case");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE \"U2\"(x int)").ok("U2");
+    let mut wrong = Vec::new();
+    let sql = "SELECT '\"U2\"'::regclass = (SELECT oid FROM pg_class WHERE relname = 'U2')";
+    let r = a.q(sql);
+    if r.error.is_some() || r.rows != vec![vec![Some("t".to_string())]] {
+        wrong.push(format!("{sql}: {:?} {:?}, PostgreSQL t", r.rows, r.error));
+    }
+    let r = a.q("SELECT relname, relkind FROM pg_class WHERE relname IN ('U2') ORDER BY relname");
+    if r.error.is_some() || r.rows != vec![vec![Some("U2".to_string()), Some("r".to_string())]] {
+        wrong.push(format!("pg_class rows: {:?} {:?}, PostgreSQL [U2 r]", r.rows, r.error));
+    }
+    let r = a.q("SELECT 'U2'::regclass");
+    match &r.error {
+        Some(e) if e.code == "42P01" && e.message == "relation \"u2\" does not exist" => {}
+        other => wrong.push(format!("SELECT 'U2'::regclass: want 42P01, got {other:?} {:?}", r.rows)),
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
