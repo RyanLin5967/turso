@@ -3092,6 +3092,30 @@ fn create_allocates_no_table_of_every_branch_under_the_store_mutex() {
     );
 }
 
+/// LEAP L2(b) (ASYNC-DESIGN R1.2, "the branch table never allocates on the create path"): while
+/// the live branches grow by 23,040 from 10^4, no create allocates a branch-table chunk (64 states,
+/// 23,552 B at 368 B a state) or a directory segment (24 KiB) under the store mutex: both come from
+/// a pool the store's background writer refills off the mutex. The bound, 8 KiB, sits below either
+/// (registered here, before the first run); the name, records and log frames a create allocates
+/// there are far below it.
+#[test]
+fn leap_l2b_a_create_allocates_no_table_chunk_under_the_store_mutex() {
+    if in_child() {
+        return;
+    }
+    let c = cell("growth_n1e4");
+    let threads = &c.ops["growth_thread"];
+    let creates: u64 = threads.iter().map(|t| t["creates"]).sum();
+    assert_eq!(creates, GROWTH, "premise: every growth create counted");
+    let worst = threads.iter().map(|t| t["max_held_alloc_bytes"]).max().unwrap();
+    assert!(
+        worst <= 8 << 10,
+        "LEAP L2(b) not reached: a create allocated {worst} bytes under the store mutex while the live \
+         branches grew by {GROWTH} (a table chunk of {} states is about 23,552 B); budget 8 KiB",
+        super::table::CHUNK
+    );
+}
+
 // ---- connect by name: a resident branch, just created ----
 
 /// A resident branch's name and state are in memory (names map, states): connecting reads,
