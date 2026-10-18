@@ -252,12 +252,16 @@ fn run_waiting(
 }
 
 /// A relation a session's open block holds: the database it is in (the branch's name, empty for
-/// the trunk), its schema when the statement named one (public as main), and its name, lowercase.
+/// the trunk), its schema when the statement named one (public as main), and its name, lowercase
+/// (the engine's catalog compares names ASCII case folded), with both as the statement wrote them
+/// (libpg_query's: a quoted name as written, dots included), for messages and view lookups.
 #[derive(Clone, PartialEq, Eq, Debug)]
 struct BlockRead {
     db: String,
     schema: Option<String>,
     name: String,
+    schema_as_written: Option<String>,
+    name_as_written: String,
 }
 
 impl BlockRead {
@@ -275,14 +279,72 @@ impl BlockRead {
 fn relation(db: &str, schema: Option<&str>, name: &str) -> BlockRead {
     BlockRead {
         db: db.to_string(),
-        schema: schema.map(|s| {
-            if s.eq_ignore_ascii_case("public") {
-                "main".to_string()
-            } else {
-                s.to_ascii_lowercase()
-            }
-        }),
+        schema: schema.map(schema_key),
         name: name.to_ascii_lowercase(),
+        schema_as_written: schema.map(str::to_string),
+        name_as_written: name.to_string(),
+    }
+}
+
+/// A schema's name as [`BlockRead::schema`] keys it: public as main, ASCII case folded.
+fn schema_key(schema: &str) -> String {
+    if schema.eq_ignore_ascii_case("public") {
+        "main".to_string()
+    } else {
+        schema.to_ascii_lowercase()
+    }
+}
+
+/// The statements of `sql` that take PostgreSQL's AccessExclusiveLock, parsed only when the text
+/// names one of their verbs (DROP, ALTER, TRUNCATE; RENAME is an ALTER): a cost gate, as every
+/// such statement spells its verb, and the kind itself is read from the parse tree. None when
+/// there is none.
+fn exclusive_statements(sql: &str) -> Option<Vec<turso_pg_parser::translator::PgExclusiveDdl>> {
+    let names = |word: &[u8]| sql.as_bytes().windows(word.len()).any(|w| w.eq_ignore_ascii_case(word));
+    if !(names(b"drop") || names(b"alter") || names(b"truncate")) {
+        return None;
+    }
+    let parsed = turso_pg_parser::parse(sql).ok()?;
+    let statements = turso_pg_parser::translator::exclusive_ddl(&parsed);
+    (!statements.is_empty()).then_some(statements)
+}
+
+/// What one [`turso_pg_parser::translator::PgLockTarget`] locks, resolved in the dropping
+/// session's database: a relation (an index as its table), or every relation of a schema.
+/// Unresolved for an index no schema holds (the statement fails on its own).
+enum LockTarget {
+    Relation(BlockRead),
+    Schema(String),
+    Unresolved,
+}
+
+fn lock_target(
+    conn: &PgConnection,
+    db: &str,
+    target: &turso_pg_parser::translator::PgLockTarget,
+) -> LockTarget {
+    use turso_pg_parser::translator::PgLockTarget;
+    match target {
+        PgLockTarget::Relation((schema, name)) => LockTarget::Relation(relation(db, schema.as_deref(), name)),
+        PgLockTarget::Index(index) => match conn.index_relation(index) {
+            Some((schema, table)) => LockTarget::Relation(relation(db, schema.as_deref(), &table)),
+            None => LockTarget::Unresolved,
+        },
+        PgLockTarget::Schema(schema) => LockTarget::Schema(schema.clone()),
+    }
+}
+
+/// Whether a read holds what `target` locks: a relation by [`BlockRead::matches`]; a schema when
+/// the read names it, or names no schema and the schema holds a relation of its name (read in
+/// the dropping session's catalog).
+fn lock_target_holds(conn: &PgConnection, target: &LockTarget, read: &BlockRead) -> bool {
+    match target {
+        LockTarget::Relation(t) => t.matches(read),
+        LockTarget::Schema(schema) => match &read.schema {
+            Some(s) => *s == schema_key(schema),
+            None => conn.schema_holds_relation(schema, &read.name_as_written),
+        },
+        LockTarget::Unresolved => false,
     }
 }
 
@@ -1489,7 +1551,7 @@ struct SessionState {
     done_portals: std::collections::HashSet<String>,
     /// The named portals bound and not yet run to completion or closed, with their statement's
     /// text: each holds the relations it reads, so a DROP TABLE of one is 55006 as in PostgreSQL
-    /// (lead ruling 2026-10-18, pg18-rev-bl1.out #19; [`Session::drop_of_a_held_relation`]).
+    /// (lead ruling 2026-10-18, pg18-rev-bl1.out #19; [`Session::ddl_of_a_held_relation`]).
     held_portals: std::collections::HashMap<String, String>,
     /// The completion tag of each query portal that returned all its rows (its verb's, `SELECT`,
     /// `INSERT 0`, ...), which a further Execute answers with 0 rows, as PostgreSQL does (wire
@@ -1735,16 +1797,17 @@ impl Session {
         }
     }
 
-    /// A DROP TABLE of a relation this session's open named portal reads: PostgreSQL's
-    /// CheckTableNotInUse answer, 55006 (recorded, pg18-rev-bl1.out #19). Free unless a named
-    /// portal is held: then the statement and each held portal's statement are parsed, and
-    /// relations match by name, and by schema when both name one (public is main). BLIND SPOTS:
-    /// a held portal's view or function body is not looked through, and two schemas' tables of
-    /// one name match when either side is unqualified.
-    fn drop_of_a_held_relation(&self, sql: &str) -> Option<Box<ErrorInfo>> {
-        if !sql.as_bytes().windows(4).any(|w| w.eq_ignore_ascii_case(b"drop")) {
-            return None;
-        }
+    /// A statement that would drop or rewrite a relation this session's own open named portal
+    /// reads: PostgreSQL's CheckTableNotInUse answer, 55006, naming that relation (recorded:
+    /// pg18-rev-bl1.out #19; reviews/uw2-raws/round1-pg-all.txt s01-s16): DROP TABLE, DROP SCHEMA
+    /// ... CASCADE, ALTER TABLE and TRUNCATE ([`turso_pg_parser::translator::PgExclusiveVerb::in_use_verb`]); RENAME, DROP
+    /// INDEX and DROP VIEW run under the portal, as there. Free unless a named portal is held and
+    /// the text names one of the verbs: then the statement and each held portal's statement are
+    /// parsed, the portal's relations closed under its views
+    /// ([`turso_pg::PgConnection::relations_through_views`]), and matched as [`lock_target_holds`]
+    /// matches. BLIND SPOTS: a held portal's function body is not looked through, and two
+    /// schemas' tables of one name match when either side is unqualified.
+    fn ddl_of_a_held_relation(&self, conn: &PgConnection, sql: &str) -> Option<Box<ErrorInfo>> {
         let held: Vec<String> = {
             let st = self.state();
             if st.held_portals.is_empty() {
@@ -1752,32 +1815,33 @@ impl Session {
             }
             st.held_portals.values().cloned().collect()
         };
-        let parsed = turso_pg_parser::parse(sql).ok()?;
-        let drop = turso_pg_parser::translator::drop_objects(&parsed)?;
-        if !matches!(drop.kind, turso_pg_parser::translator::PgDropKind::Table) {
-            return None;
-        }
-        let schema = |s: &str| if s.eq_ignore_ascii_case("public") { "main".to_string() } else { s.to_ascii_lowercase() };
+        let statements = exclusive_statements(sql)?;
+        let db = self.current_db();
+        let mut reads: Vec<BlockRead> = Vec::new();
         for held_sql in &held {
-            let Ok(reads) = turso_pg_parser::parse(held_sql) else { continue };
-            for table in reads.tables() {
-                let (ts, tn) = match table.rsplit_once('.') {
-                    Some((s, n)) => (Some(schema(s)), n.to_ascii_lowercase()),
-                    None => (None, table.to_ascii_lowercase()),
-                };
-                for (ds, dn) in &drop.objects {
-                    let same_schema = match (&ts, ds) {
-                        (Some(a), Some(b)) => *a == schema(b),
-                        _ => true,
+            let Ok(parsed) = turso_pg_parser::parse(held_sql) else { continue };
+            let named = turso_pg_parser::translator::named_relations(&parsed);
+            for (schema, name) in conn.relations_through_views(&named) {
+                let read = relation(&db, schema.as_deref(), &name);
+                if !reads.contains(&read) {
+                    reads.push(read);
+                }
+            }
+        }
+        for ddl in &statements {
+            let Some(verb) = ddl.verb.in_use_verb() else { continue };
+            for target in &ddl.targets {
+                let target = lock_target(conn, &db, target);
+                if let Some(read) = reads.iter().find(|r| lock_target_holds(conn, &target, r)) {
+                    let name = match &target {
+                        LockTarget::Relation(t) => &t.name_as_written,
+                        LockTarget::Schema(_) => &read.name_as_written,
+                        LockTarget::Unresolved => continue,
                     };
-                    if same_schema && tn == dn.to_ascii_lowercase() {
-                        return Some(error(
-                            SqlErrorKind::ObjectInUse,
-                            format!(
-                                "cannot DROP TABLE \"{dn}\" because it is being used by active queries in this session"
-                            ),
-                        ));
-                    }
+                    return Some(error(
+                        SqlErrorKind::ObjectInUse,
+                        format!("cannot {verb} \"{name}\" because it is being used by active queries in this session"),
+                    ));
                 }
             }
         }
@@ -1804,8 +1868,8 @@ impl Session {
             self.shared.block_readers.fetch_add(1, Ordering::Relaxed);
             Vec::new()
         });
-        for t in tables {
-            let read = relation(&db, t.rsplit_once('.').map(|(s, _)| s), t.rsplit('.').next().unwrap_or(&t));
+        for (schema, name) in tables {
+            let read = relation(&db, schema.as_deref(), &name);
             if !mine.contains(&read) {
                 mine.push(read);
             }
@@ -1823,35 +1887,53 @@ impl Session {
         }
     }
 
-    /// A DROP TABLE of a relation another session's open block holds: 55P03, PostgreSQL's answer
-    /// once its lock_timeout passes (recorded, pg18-rev-bl3.out #19). It is a rerunnable 55P03, so
-    /// engine_statement waits it out on the session's Backoff (its lock_timeout, or the server's
-    /// lock wait) and answers this message at the last attempt. Free while no session holds a
-    /// block's reads, and for any statement that does not name DROP. BLIND SPOTS: a read in
-    /// autocommit holds nothing (its statement's own run is the engine's), and a DROP inside a
-    /// block does not make a later reader in another session wait.
-    fn drop_waits_for_other_readers(&self, sql: &str) -> Option<Box<ErrorInfo>> {
-        if self.shared.block_readers.load(Ordering::Relaxed) == 0
-            || !sql.as_bytes().windows(4).any(|w| w.eq_ignore_ascii_case(b"drop"))
-        {
+    /// A statement that takes PostgreSQL's AccessExclusiveLock ([`turso_pg_parser::translator::PgExclusiveVerb`]: DROP TABLE,
+    /// VIEW, SEQUENCE or INDEX, DROP SCHEMA ... CASCADE, ALTER TABLE, RENAME, TRUNCATE) on a
+    /// relation another session's open block holds: 55P03, PostgreSQL's answer once its
+    /// lock_timeout passes (recorded: pg18-rev-bl3.out #19; reviews/uw2-raws/round1-pg-all.txt
+    /// x01-x12, round1-pg-run2.txt y01-y09). It is a rerunnable 55P03, so engine_statement waits
+    /// it out on the session's Backoff (its lock_timeout, or the server's lock wait) and answers
+    /// this message at the last attempt. The other sessions' reads are closed under their views
+    /// ([`turso_pg::PgConnection::relations_through_views`], read here, outside the shared lock),
+    /// so a DROP TABLE ... CASCADE of a table a block read through a view waits; an index is its
+    /// table's. Free while no session holds a block's reads, and for any statement whose text
+    /// names none of DROP, ALTER and TRUNCATE (a cost gate only: the kind is the parse tree's).
+    /// BLIND SPOTS: a read in autocommit holds nothing (its statement's own run is the engine's),
+    /// a DDL inside a block does not make a later reader in another session wait, and two
+    /// schemas' tables of one name match when either side is unqualified (it waits, never
+    /// drops under a reader).
+    fn ddl_waits_for_other_readers(&self, conn: &PgConnection, sql: &str) -> Option<Box<ErrorInfo>> {
+        if self.shared.block_readers.load(Ordering::Relaxed) == 0 {
             return None;
         }
-        let parsed = turso_pg_parser::parse(sql).ok()?;
-        let drop = turso_pg_parser::translator::drop_objects(&parsed)?;
-        if !matches!(drop.kind, turso_pg_parser::translator::PgDropKind::Table) {
-            return None;
-        }
+        let statements = exclusive_statements(sql)?;
         let db = self.current_db();
-        let targets: Vec<BlockRead> = drop
-            .objects
+        let others: Vec<Vec<BlockRead>> = {
+            let all = self.shared.block_reads.lock().unwrap_or_else(|e| e.into_inner());
+            all.iter()
+                .filter(|(key, _)| **key != self.key)
+                .map(|(_, reads)| reads.iter().filter(|r| r.db == db).cloned().collect::<Vec<_>>())
+                .filter(|reads| !reads.is_empty())
+                .collect()
+        };
+        if others.is_empty() {
+            return None;
+        }
+        let targets: Vec<LockTarget> = statements
             .iter()
-            .map(|(schema, name)| relation(&db, schema.as_deref(), name))
+            .flat_map(|ddl| ddl.targets.iter())
+            .map(|t| lock_target(conn, &db, t))
             .collect();
-        let all = self.shared.block_reads.lock().unwrap_or_else(|e| e.into_inner());
-        let held = all
-            .iter()
-            .filter(|(key, _)| **key != self.key)
-            .any(|(_, reads)| reads.iter().any(|r| targets.iter().any(|t| t.matches(r))));
+        let held = others.iter().any(|reads| {
+            let named: Vec<turso_pg_parser::translator::PgRelationName> = reads
+                .iter()
+                .map(|r| (r.schema_as_written.clone(), r.name_as_written.clone()))
+                .collect();
+            conn.relations_through_views(&named)
+                .iter()
+                .map(|(schema, name)| relation(&db, schema.as_deref(), name))
+                .any(|read| targets.iter().any(|t| lock_target_holds(conn, t, &read)))
+        });
         held.then(|| error(SqlErrorKind::LockNotAvailable, "canceling statement due to lock timeout".to_string()))
     }
 
@@ -2809,10 +2891,10 @@ impl Session {
             info,
             started: None,
         };
-        if let Some(info) = self.drop_of_a_held_relation(sql) {
+        if let Some(info) = self.ddl_of_a_held_relation(conn, sql) {
             return Err(unprepared(info));
         }
-        if let Some(info) = self.drop_waits_for_other_readers(sql) {
+        if let Some(info) = self.ddl_waits_for_other_readers(conn, sql) {
             return Err(unprepared(info));
         }
 

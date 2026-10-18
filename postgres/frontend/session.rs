@@ -62,9 +62,10 @@ pub(crate) struct PgConnectionInner {
     /// deleted when the block commits, kept when it rolls back (review wire-quote MED-3,
     /// wire-rev-uw1 M2).
     dropped_schemas: parking_lot::Mutex<Vec<(String, Option<String>)>>,
-    /// The relations statements prepared inside the open block named (libpg_query's tables(),
-    /// `schema.name` or `name`), for the server to take ([`PgConnection::take_block_reads`]).
-    block_reads: parking_lot::Mutex<Vec<String>>,
+    /// The relations statements prepared inside the open block named (each RangeVar's schema and
+    /// name, [`turso_pg_parser::translator::named_relations`]), for the server to take
+    /// ([`PgConnection::take_block_reads`]).
+    block_reads: parking_lot::Mutex<Vec<turso_pg_parser::translator::PgRelationName>>,
     /// Which server files a COPY FROM 'file' may read (review wire-quote LOW-3).
     server_files: ServerFiles,
 }
@@ -433,8 +434,134 @@ impl PgConnection {
     }
 
     /// The relations named by statements prepared inside the open block since the last take.
-    pub fn take_block_reads(&self) -> Vec<String> {
+    pub fn take_block_reads(&self) -> Vec<turso_pg_parser::translator::PgRelationName> {
         std::mem::take(&mut *self.inner.block_reads.lock())
+    }
+
+    /// `reads` and every relation they read through views, closed: a view's stored query is read
+    /// for the relations it names, and those again, as PostgreSQL's rewriter locks a view's base
+    /// relations with the view (recorded: reviews/uw2-raws/round1-pg-all.txt x09, s08). A view is
+    /// found as [`PgConnection::stored_relation`] finds it; one read once (a circular definition
+    /// ends). BLIND SPOTS: a view whose stored text libpg_query cannot read (SQLite's own
+    /// rendering) adds nothing, and an unqualified name inside a view is kept unqualified.
+    pub fn relations_through_views(
+        &self,
+        reads: &[turso_pg_parser::translator::PgRelationName],
+    ) -> Vec<turso_pg_parser::translator::PgRelationName> {
+        let mut out: Vec<turso_pg_parser::translator::PgRelationName> = Vec::new();
+        let mut next: Vec<turso_pg_parser::translator::PgRelationName> = reads.to_vec();
+        while let Some(read) = next.pop() {
+            if out.iter().any(|r| same_relation_name(r, &read)) {
+                continue;
+            }
+            if let Some(found) = self.stored_relation(read.0.as_deref(), &read.1) {
+                if found.kind == "view" {
+                    let sql = catalog::decode_stored_pg_schema_sql(&found.sql).unwrap_or(&found.sql);
+                    if let Some(base) = turso_pg_parser::parse(sql)
+                        .ok()
+                        .and_then(|p| turso_pg_parser::translator::view_query_relations(&p))
+                    {
+                        next.extend(base);
+                    }
+                }
+            }
+            out.push(read);
+        }
+        out
+    }
+
+    /// The table an index belongs to, found as [`PgConnection::stored_relation`] finds a name,
+    /// in the schema the index names (or the one found holding it), as a qualified name.
+    pub fn index_relation(
+        &self,
+        index: &turso_pg_parser::translator::PgRelationName,
+    ) -> Option<turso_pg_parser::translator::PgRelationName> {
+        let found = self.stored_relation(index.0.as_deref(), &index.1)?;
+        (found.kind == "index").then(|| (Some(found.schema), found.table))
+    }
+
+    /// Whether schema `schema` (public is main) holds a table or view named `name`.
+    pub fn schema_holds_relation(&self, schema: &str, name: &str) -> bool {
+        self.stored_relation(Some(schema), name)
+            .is_some_and(|found| found.kind == "table" || found.kind == "view")
+    }
+
+    /// The catalog row (sqlite_schema) of the object named `name`, in `schema` when given
+    /// (public is main), else in the first schema of the session's search path holding the name
+    /// (public as main; with no path set, main and then the attached schemas, as the engine
+    /// resolves an unqualified name). Read by root statements, so each read ends with it (a
+    /// nested one left an attached database's read open: wire-rev-uw2 N2). None when nothing
+    /// holds the name or a read fails.
+    fn stored_relation(&self, schema: Option<&str>, name: &str) -> Option<StoredRelation> {
+        let databases: Vec<String> = match schema {
+            Some(s) if s.eq_ignore_ascii_case("public") || s == "main" => vec!["main".to_string()],
+            Some(s) => vec![s.to_string()],
+            None => {
+                let path = self.search_path();
+                if path.is_empty() {
+                    let mut all = vec!["main".to_string()];
+                    let mut attached = self.inner.conn.attached_database_names();
+                    attached.sort();
+                    all.extend(attached);
+                    all
+                } else {
+                    path.iter()
+                        .map(|e| if e.eq_ignore_ascii_case("public") { "main".to_string() } else { e.clone() })
+                        .collect()
+                }
+            }
+        };
+        for database in databases {
+            // main's objects are read from the connection's in-memory schema, with no query.
+            if database == "main" {
+                let schema = self.inner.conn.current_schema();
+                let found = |kind: &str, table: &str, sql: &str| StoredRelation {
+                    kind: kind.to_string(),
+                    table: table.to_string(),
+                    sql: sql.to_string(),
+                    schema: "public".to_string(),
+                };
+                if let Some(view) = schema.get_view(name) {
+                    return Some(found("view", &view.name, &view.sql));
+                }
+                if let Some(table) = schema.get_table(name) {
+                    return Some(found("table", table.get_name(), ""));
+                }
+                if let Some(index) = schema
+                    .indexes
+                    .values()
+                    .flatten()
+                    .find(|i| i.name.eq_ignore_ascii_case(name))
+                {
+                    return Some(found("index", &index.table_name, ""));
+                }
+                continue;
+            }
+            let sql = catalog::sqlite_text(format!(
+                "SELECT type, tbl_name, sql FROM {}.sqlite_schema WHERE name = {} COLLATE NOCASE",
+                catalog::quote_ident(&database),
+                catalog::quote_literal(name)
+            ));
+            let Ok(mut stmt) = self.inner.conn.prepare_sqlite(&sql) else {
+                continue;
+            };
+            let Ok(rows) = stmt.run_collect_rows() else {
+                continue;
+            };
+            let text = |v: Option<&Value>| match v {
+                Some(Value::Text(t)) => t.as_str().to_string(),
+                _ => String::new(),
+            };
+            if let Some(row) = rows.first() {
+                return Some(StoredRelation {
+                    kind: text(row.first()),
+                    table: text(row.get(1)),
+                    sql: text(row.get(2)),
+                    schema: database,
+                });
+            }
+        }
+        None
     }
 
     /// SET lock_timeout, in milliseconds; 0 when unset or set to 0 (see
@@ -1267,9 +1394,9 @@ fn prepare_statement_parsed(
     // PostgreSQL's parse analysis locks them: the server takes them for its cross-session DROP
     // wait (lead ruling 2026-10-18, pg18-rev-bl3.out #19), from this parse, never a second one.
     if !pg_conn.conn.get_auto_commit() {
-        let tables = parse_result.tables();
-        if !tables.is_empty() {
-            pg_conn.block_reads.lock().extend(tables);
+        let relations = turso_pg_parser::translator::named_relations(&parse_result);
+        if !relations.is_empty() {
+            pg_conn.block_reads.lock().extend(relations);
         }
     }
     let special = Special::of(&parse_result);
@@ -3827,6 +3954,30 @@ fn handle_pg_copy_from(pg_conn: &Arc<PgConnectionInner>, stmt: &PgCopyFromStmt) 
         }
         Ok(rows_inserted)
     })
+}
+
+/// One catalog row [`PgConnection::stored_relation`] found: its type (table, view, index, ...),
+/// the table it belongs to (its own name for a table or view), its stored SQL, and the PostgreSQL
+/// schema it is in (public for main).
+struct StoredRelation {
+    kind: String,
+    table: String,
+    sql: String,
+    schema: String,
+}
+
+/// Whether two relation names name one relation as this engine's catalog does: names compare as
+/// SQLite compares them (ASCII case folded), schemas when both name one (public is main).
+fn same_relation_name(
+    a: &turso_pg_parser::translator::PgRelationName,
+    b: &turso_pg_parser::translator::PgRelationName,
+) -> bool {
+    let schema = |s: &str| if s.eq_ignore_ascii_case("public") { "main".to_string() } else { s.to_string() };
+    a.1.eq_ignore_ascii_case(&b.1)
+        && match (&a.0, &b.0) {
+            (Some(x), Some(y)) => schema(x) == schema(y),
+            _ => a.0 == b.0,
+        }
 }
 
 /// The database holding `table` on the session's search path, as the engine resolves an

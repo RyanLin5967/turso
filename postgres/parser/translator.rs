@@ -6489,6 +6489,238 @@ pub fn drop_objects(parse_result: &ParseResult) -> Option<PgDropObjectsStmt> {
     })
 }
 
+/// A relation as a statement names it: its schema when written, and its name, each as libpg_query
+/// gives it (a quoted name as written, dots included; an unquoted one folded).
+pub type PgRelationName = (Option<String>, String);
+
+/// One RangeVar's [`PgRelationName`]. None for a catalog-qualified name (`db.s.t`), which names no
+/// relation of this database.
+fn range_var_name(v: &pg_query::protobuf::RangeVar) -> Option<PgRelationName> {
+    if !v.catalogname.is_empty() {
+        return None;
+    }
+    let schema = (!v.schemaname.is_empty()).then(|| v.schemaname.clone());
+    Some((schema, v.relname.clone()))
+}
+
+/// Every relation the statements of `parse` name, each RangeVar pg_query's walk reaches (FROM
+/// items, joins, subqueries and sublinks, CTE bodies, DML and DDL targets), once. A reference to a
+/// CTE is included too, so a CTE that shares a table's name over-holds that table, never
+/// under-holds it. BLIND SPOT: a node pg_query's walk does not visit (it names the ones it does,
+/// node_enum.rs) is not read.
+pub fn named_relations(parse: &ParseResult) -> Vec<PgRelationName> {
+    let mut out: Vec<PgRelationName> = Vec::new();
+    for (node, ..) in parse.protobuf.nodes() {
+        if let pg_query::NodeRef::RangeVar(v) = node {
+            if let Some(name) = range_var_name(v) {
+                if !out.contains(&name) {
+                    out.push(name);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The relations a CREATE VIEW's query names ([`named_relations`] of the query alone, not the
+/// view's own name). None when `parse` is not one CREATE VIEW.
+pub fn view_query_relations(parse: &ParseResult) -> Option<Vec<PgRelationName>> {
+    use pg_query::protobuf::node::Node;
+    let raw = parse.protobuf.stmts.first()?;
+    let Some(Node::ViewStmt(view)) = raw.stmt.as_ref()?.node.as_ref() else {
+        return None;
+    };
+    let query = view.query.as_ref()?.node.as_ref()?;
+    let mut out: Vec<PgRelationName> = Vec::new();
+    for (node, ..) in query.nodes() {
+        if let pg_query::NodeRef::RangeVar(v) = node {
+            if let Some(name) = range_var_name(v) {
+                if !out.contains(&name) {
+                    out.push(name);
+                }
+            }
+        }
+    }
+    Some(out)
+}
+
+/// A statement that takes PostgreSQL's AccessExclusiveLock on relations: it must wait for every
+/// other session's block that holds one of them ([`PgExclusiveDdl::targets`]), and some of them
+/// are refused under this session's own open portal ([`PgExclusiveVerb::in_use_verb`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PgExclusiveVerb {
+    DropTable,
+    DropView,
+    DropSequence,
+    DropIndex,
+    /// DROP SCHEMA ... CASCADE (without CASCADE a schema holding a relation is 2BP01, decided
+    /// before any relation is touched).
+    DropSchemaCascade,
+    /// Any ALTER TABLE: every subcommand this frontend runs (ADD, DROP, ALTER COLUMN, its type,
+    /// its default, NOT NULL, constraints) rewrites or re-validates the table. Over-held for the
+    /// few PostgreSQL takes a weaker lock for (SET STATISTICS, VALIDATE CONSTRAINT), never
+    /// under-held.
+    AlterTable,
+    /// ALTER TABLE/VIEW ... RENAME, of the relation or of a column or constraint.
+    Rename,
+    Truncate,
+}
+
+impl PgExclusiveVerb {
+    /// The verb PostgreSQL's CheckTableNotInUse names when the statement meets a table this
+    /// session's own open portal reads (55006, recorded: reviews/uw2-raws/round1-pg-all.txt
+    /// s01-s16): DROP TABLE, a schema CASCADE (as the DROP TABLE of the held table), ALTER TABLE
+    /// and TRUNCATE. None for the ones it runs under the portal: RENAME, DROP INDEX, DROP VIEW,
+    /// DROP SEQUENCE.
+    pub fn in_use_verb(self) -> Option<&'static str> {
+        match self {
+            PgExclusiveVerb::DropTable | PgExclusiveVerb::DropSchemaCascade => Some("DROP TABLE"),
+            PgExclusiveVerb::AlterTable => Some("ALTER TABLE"),
+            PgExclusiveVerb::Truncate => Some("TRUNCATE"),
+            PgExclusiveVerb::DropView
+            | PgExclusiveVerb::DropSequence
+            | PgExclusiveVerb::DropIndex
+            | PgExclusiveVerb::Rename => None,
+        }
+    }
+}
+
+/// What a [`PgExclusiveDdl`] locks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PgLockTarget {
+    /// A table, view or sequence, by name.
+    Relation(PgRelationName),
+    /// An index, by name: PostgreSQL's index_drop locks the index's table too.
+    Index(PgRelationName),
+    /// Every relation of a schema, as libpg_query gives its name.
+    Schema(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PgExclusiveDdl {
+    pub verb: PgExclusiveVerb,
+    pub targets: Vec<PgLockTarget>,
+}
+
+/// Every statement of `parse` that takes an AccessExclusiveLock ([`PgExclusiveVerb`]), with what
+/// it locks, read from the parse tree's own nodes (never from text a client can write). Empty for
+/// every other statement.
+pub fn exclusive_ddl(parse: &ParseResult) -> Vec<PgExclusiveDdl> {
+    use pg_query::protobuf::node::Node;
+    use pg_query::protobuf::{DropBehavior, ObjectType};
+
+    let relation_of = |node: &pg_query::protobuf::Node| match node.node.as_ref() {
+        Some(Node::RangeVar(v)) => range_var_name(v),
+        _ => None,
+    };
+    let mut out = Vec::new();
+    for raw in &parse.protobuf.stmts {
+        let Some(node) = raw.stmt.as_ref().and_then(|s| s.node.as_ref()) else {
+            continue;
+        };
+        let ddl = match node {
+            Node::DropStmt(drop) => {
+                let remove_type = ObjectType::try_from(drop.remove_type).ok();
+                if remove_type == Some(ObjectType::ObjectSchema) {
+                    if DropBehavior::try_from(drop.behavior).ok() != Some(DropBehavior::DropCascade) {
+                        continue;
+                    }
+                    let targets = drop
+                        .objects
+                        .iter()
+                        .filter_map(|obj| match obj.node.as_ref() {
+                            Some(Node::String(s)) => Some(PgLockTarget::Schema(s.sval.clone())),
+                            _ => None,
+                        })
+                        .collect();
+                    PgExclusiveDdl { verb: PgExclusiveVerb::DropSchemaCascade, targets }
+                } else {
+                    let verb = match remove_type {
+                        Some(ObjectType::ObjectTable) => PgExclusiveVerb::DropTable,
+                        Some(ObjectType::ObjectView) | Some(ObjectType::ObjectMatview) => {
+                            PgExclusiveVerb::DropView
+                        }
+                        Some(ObjectType::ObjectSequence) => PgExclusiveVerb::DropSequence,
+                        Some(ObjectType::ObjectIndex) => PgExclusiveVerb::DropIndex,
+                        _ => continue,
+                    };
+                    let mut targets = Vec::with_capacity(drop.objects.len());
+                    for obj in &drop.objects {
+                        let Some(Node::List(list)) = obj.node.as_ref() else {
+                            continue;
+                        };
+                        let names: Vec<&str> = list
+                            .items
+                            .iter()
+                            .filter_map(|item| match item.node.as_ref() {
+                                Some(Node::String(s)) => Some(s.sval.as_str()),
+                                _ => None,
+                            })
+                            .collect();
+                        let name = match names.as_slice() {
+                            [name] => (None, name.to_string()),
+                            [schema, name] => (Some(schema.to_string()), name.to_string()),
+                            _ => continue,
+                        };
+                        targets.push(if verb == PgExclusiveVerb::DropIndex {
+                            PgLockTarget::Index(name)
+                        } else {
+                            PgLockTarget::Relation(name)
+                        });
+                    }
+                    PgExclusiveDdl { verb, targets }
+                }
+            }
+            Node::AlterTableStmt(alter) => {
+                if ObjectType::try_from(alter.objtype).ok() != Some(ObjectType::ObjectTable) {
+                    continue;
+                }
+                let Some(name) = alter.relation.as_ref().and_then(range_var_name) else {
+                    continue;
+                };
+                PgExclusiveDdl {
+                    verb: PgExclusiveVerb::AlterTable,
+                    targets: vec![PgLockTarget::Relation(name)],
+                }
+            }
+            Node::RenameStmt(rename) => {
+                let target = match ObjectType::try_from(rename.rename_type).ok() {
+                    Some(
+                        ObjectType::ObjectTable
+                        | ObjectType::ObjectView
+                        | ObjectType::ObjectMatview
+                        | ObjectType::ObjectSequence
+                        | ObjectType::ObjectColumn
+                        | ObjectType::ObjectTabconstraint,
+                    ) => rename.relation.as_ref().and_then(range_var_name).map(PgLockTarget::Relation),
+                    Some(ObjectType::ObjectIndex) => {
+                        rename.relation.as_ref().and_then(range_var_name).map(PgLockTarget::Index)
+                    }
+                    _ => None,
+                };
+                let Some(target) = target else {
+                    continue;
+                };
+                PgExclusiveDdl { verb: PgExclusiveVerb::Rename, targets: vec![target] }
+            }
+            Node::TruncateStmt(truncate) => PgExclusiveDdl {
+                verb: PgExclusiveVerb::Truncate,
+                targets: truncate
+                    .relations
+                    .iter()
+                    .filter_map(relation_of)
+                    .map(PgLockTarget::Relation)
+                    .collect(),
+            },
+            _ => continue,
+        };
+        if !ddl.targets.is_empty() {
+            out.push(ddl);
+        }
+    }
+    out
+}
+
 /// Returns true if the parse result is a REFRESH MATERIALIZED VIEW statement.
 /// Turso materialized views are live (auto-updating), so REFRESH is a no-op.
 pub fn is_refresh_matview(parse_result: &ParseResult) -> bool {
