@@ -221,8 +221,28 @@ def self_test():
         ("live: a SUT parent's child without the marker, a full core for 9 s, is the SUT", [("child", 3, 9)], "VALID"),
     ]
     bad = 0
+    # the host-property class (2026-10-18, a shared RHEL 8.10 host with other users' processes): a live case that wants
+    # VALID needs a QUIET host, which the first case, a window with no burner, measures. When that baseline is VOID the
+    # host itself is busy, so those cases are N/A-on-busy-host, printed and never counted as a pass; the VOID-wanting
+    # case still runs, as a busy host cannot excuse a missed burner. On the T3 box (quiet by its own preflight) all run.
+    busy = None
     for label, burners, want in live:
+        if busy and want == "VALID":
+            print(f"N/A-on-busy-host: self-test {label}: the quiet baseline was VOID ({busy}); a busy host cannot "
+                  "show VALID", flush=True)
+            continue
         out = window(label.split(": ")[1].replace(" ", "_")[:24], burners)
+        if not burners and out != "VALID":
+            # busy only on evidence that is not the sampler's: another user's process at 50%+ CPU by ps right after.
+            # Without that evidence a VOID baseline is a FAIL (a sampler that voids everything must not read as busy)
+            r = subprocess.run(["ps", "-eo", "uid=,pcpu=,comm="], capture_output=True, text=True)
+            others = [ln.split(None, 2) for ln in r.stdout.splitlines() if len(ln.split(None, 2)) == 3]
+            others = [f"{c} uid {u} {pc}%" for u, pc, c in others
+                      if u.isdigit() and int(u) != os.getuid() and float(pc) >= 50.0]
+            if others:
+                busy = f"the no-burner window gave {out}; other users' processes: {', '.join(others[:4])}"
+                print(f"N/A-on-busy-host: self-test {label}: {busy}", flush=True)
+                continue
         ok = out == want
         bad += not ok
         print(f"self-test {'PASS' if ok else 'FAIL'}: {label}: want {want}, got {out}")

@@ -68,6 +68,10 @@ refuses2() { "$@"; [ $? = 2 ]; }
 # printed and never counted as a pass (gates/platforms.tsv, the platform-inheritance class, 2026-10-15)
 na=0
 linux_check() { if [ "$(uname -s)" = Linux ]; then check "$@"; else na=$((na + 1)); echo "T3LIB self-test N/A-on-$(uname -s | tr A-Z a-z): $1"; fi; }
+# the host-property class (2026-10-18, a real RHEL 8.10 host with no root): a case that needs root states it, and on a
+# host without passwordless sudo it is N/A-on-noroot, printed and never counted as a pass, as linux_check is off Linux
+root_check() { if [ "$(uname -s)" != Linux ]; then linux_check "$@"; elif sudo -n true 2> /dev/null; then check "$@"
+               else na=$((na + 1)); echo "T3LIB self-test N/A-on-noroot: $1"; fi; }
 mkdir -p "$T/dev"; : > "$T/dev/nvme1n1"; : > "$T/dev/nvme2n1"
 REAL1=$(readlink -f "$T/dev/nvme1n1")
 ln -sfn "$T/dev/nvme1n1" "$T/dev/by-id-x"
@@ -282,7 +286,7 @@ check "LOW 4: production t3_pin on a node it cannot open refuses (rc 2) and leav
   '( source "$HERE/t3lib.sh"; sudo() { shift; "$@"; }; t3_pin "$T/no-such-node"; [ $? = 2 ] && [ -z "${T3PIN_PID:-}" ] )'
 # the real probe on a real filesystem (review 6 LOW 6: the test replaced t3_blkid outright, so its body never ran)
 U6=0b9e2d6c-3f1a-4c7e-9a55-0d3c6a1f2e47
-linux_check "LOW 6: production t3_blkid reads TYPE and UUID from a real ext4 image (needs mkfs.ext4 and sudo -n)" \
+root_check "LOW 6: production t3_blkid reads TYPE and UUID from a real ext4 image (needs mkfs.ext4 and sudo -n)" \
   '( source "$HERE/t3lib.sh"; command -v mkfs.ext4 > /dev/null || { echo "mkfs.ext4 missing"; exit 1; }
      truncate -s 8M "$T/img" && mkfs.ext4 -q -F -U "$U6" "$T/img" &&
      [ "$(t3_blkid TYPE "$T/img")" = ext4 ] && [ "$(t3_blkid UUID "$T/img")" = "$U6" ] )'
@@ -422,9 +426,11 @@ check "host_quiet stops each active timer, its running service and each active c
    [ -z \"\$(ls \"$T/sc/active\")\" ] && grep -qx \"timer${TAB}apt-daily.timer\" \"$T/quiet.tsv\" &&
    grep -qx \"service${TAB}apt-daily.service\" \"$T/quiet.tsv\" && grep -qx \"clock${TAB}lima-guestagent\" \"$T/quiet.tsv\" &&
    grep -qx \"clock${TAB}systemd-timesyncd\" \"$T/quiet.tsv\" && ! grep -q snap-repair \"$T/quiet.tsv\""
+# TEST EDIT, flagged (the host-property class, 2026-10-18): the listing is sorted in C collation, as the expected text
+# is; RHEL 8.10's en_US ls order put apt-daily.timer first, a locale's order and not a different set
 check "host_unquiet restarts exactly the timers and clock adjusters it stopped (a timer starts its service itself)" \
   "env $QENV \"$BASH\" -c 'source \"\$0\"; host_unquiet \"\$1\"' \"$HERE/t3lib.sh\" \"$T/quiet.tsv\" &&
-   [ \"\$(ls \"$T/sc/active\" | tr '\n' ' ')\" = 'apt-daily-upgrade.timer apt-daily.timer lima-guestagent systemd-timesyncd ' ]"
+   [ \"\$(ls \"$T/sc/active\" | LC_ALL=C sort | tr '\n' ' ')\" = 'apt-daily-upgrade.timer apt-daily.timer lima-guestagent systemd-timesyncd ' ]"
 quiet_setup "apt-daily.timer" "apt-daily.timer" "0.5 0.5"
 check "a timer still active after its stop refuses, naming it" \
   "! env $QENV \"$BASH\" -c 'source \"\$0\"; host_quiet \"\$1\"' \"$HERE/t3lib.sh\" \"$T/quiet.tsv\" && grep -q 'apt-daily.timer' \"$T/out.txt\""
