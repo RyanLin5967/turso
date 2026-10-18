@@ -29,7 +29,13 @@ fn column_default(expr: ast::Expr) -> ast::ColumnConstraint {
 /// the expression. engine_text_from_any_literal_is_quoted_by_the_one_quoting_function (server
 /// tests) holds the translator to it.
 pub fn sql_string(value: &str) -> ast::Literal {
-    ast::Literal::String(format!("'{}'", value.replace('\'', "''")))
+    ast::Literal::String(sql_quoted(value))
+}
+
+/// `value` as SQL string-literal text: quoted, each `'` doubled. The one place this translator
+/// writes a quote around a value (sql_string, the SET value and default deparse texts).
+pub fn sql_quoted(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 /// THE constructor of an engine name from a libpg_query-sourced string (review wire-quote HIGH-1):
@@ -6110,7 +6116,7 @@ impl PgSetValue {
     pub fn to_sql_string(&self) -> String {
         match self {
             PgSetValue::Identifier(value) => value.clone(),
-            PgSetValue::StringLiteral(value) => format!("'{}'", value.replace('\'', "''")),
+            PgSetValue::StringLiteral(value) => sql_quoted(value),
             PgSetValue::Number(value) => value.clone(),
             PgSetValue::Bool(value) => {
                 if *value {
@@ -6715,15 +6721,15 @@ fn deparse_default_expr(node: &pg_query::protobuf::Node) -> Option<String> {
     match &node.node {
         Some(Node::Integer(i)) => Some(i.ival.to_string()),
         Some(Node::Float(f)) => Some(f.fval.clone()),
-        Some(Node::String(s)) => Some(format!("'{}'", s.sval.replace('\'', "''"))),
+        Some(Node::String(s)) => Some(sql_quoted(&s.sval)),
         Some(Node::AConst(a_const)) => {
             if let Some(ref val) = a_const.val {
                 use pg_query::protobuf::a_const::Val;
                 match val {
                     Val::Ival(i) => Some(i.ival.to_string()),
                     Val::Fval(f) => Some(f.fval.clone()),
-                    Val::Sval(s) => Some(format!("'{}'", s.sval.replace('\'', "''"))),
-                    Val::Bsval(s) => Some(format!("'{}'", s.bsval.clone())),
+                    Val::Sval(s) => Some(sql_quoted(&s.sval)),
+                    Val::Bsval(s) => Some(sql_quoted(&s.bsval)),
                     Val::Boolval(b) => Some(if b.boolval { "1" } else { "0" }.to_string()),
                 }
             } else if a_const.isnull {
