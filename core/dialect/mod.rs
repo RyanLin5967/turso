@@ -1138,8 +1138,10 @@ mod tests {
         let reprepares0 = s.metrics().reprepares;
         c.set_cache_size(c.get_cache_size() + 1);
         let rows = s.run_collect_rows();
-        assert!(s.metrics().reprepares > reprepares0, "premise: the statement was re-prepared");
+        // FLAGGED reorder (dialect code review LOW-7): the claim first, so a re-prepare that reaches the
+        // client parser (and errors before the counter moves) reads as CLAIM, not as a broken premise.
         assert!(matches!(&rows, Ok(r) if r.len() == 1), "CLAIM: a re-prepared engine statement reached the client parser: {rows:?}");
+        assert!(s.metrics().reprepares > reprepares0, "premise: the statement was re-prepared");
     }
 
     /// A dialect that parks one translation in the middle: resolving the function `park_here()`
