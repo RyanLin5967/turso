@@ -3743,7 +3743,13 @@ fn leap_l3_creates_per_flush_rise_with_the_clients() {
             let (acks, flushes) = (s["acks"], s[FULL]);
             assert!(flushes > 0, "{spec}: {arm}: no flush counted: the instrument saw nothing");
             let per = acks as f64 / flushes as f64;
-            let _ = write!(seen, " C={c}/{arm} {per:.2} ({acks}/{flushes});");
+            // FLAGGED, diagnostic text only: the gather's own counters beside each ratio.
+            let _ = write!(
+                seen,
+                " C={c}/{arm} {per:.2} ({acks}/{flushes}; gathers {} expired {});",
+                s.get("gathers").copied().unwrap_or(0),
+                s.get("gathers_expired").copied().unwrap_or(0)
+            );
             if c <= 64 && per < 0.9 * c as f64 {
                 let _ = writeln!(failures, "  C={c}: {arm}: {acks} acknowledgements over {flushes} flushes = {per:.2} per flush, budget >= {:.1}", 0.9 * c as f64);
             }
