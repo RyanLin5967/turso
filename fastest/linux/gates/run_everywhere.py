@@ -137,6 +137,18 @@ def na_causes(out):
     return causes
 
 
+def ambiguous_lines(out):
+    """the lines that carry an outcome word (PASS or FAIL) BEFORE an 'N/A-on-<cause>' token (linux-rev-uw5 N2): such a
+    line is no N/A line (na_causes) and no honest PASS either ('PASS ... (N/A-on-noroot: skipped)'), so the row is
+    refused rather than read either way"""
+    amb = []
+    for ln in out.splitlines():
+        m = re.search(r"N/A-on-([A-Za-z0-9_-]+)", ln)
+        if m and re.search(r"\b(PASS|FAIL)\b", ln[:m.start()]):
+            amb.append(ln)
+    return amb
+
+
 def this_platform():
     return "linux" if sys.platform.startswith("linux") else sys.platform
 
@@ -229,6 +241,10 @@ def run(root, plat=None, timeout=1800, allow_na=None):
         # a wording match); every N/A case also names its cause in an "N/A-on-<cause>" line (MED 2's totals)
         outcome, t_, probs = tally.judge(out, rc if rc is not None else -1)
         row_na = na_causes(out)
+        amb = ambiguous_lines(out)
+        if amb:
+            probs = probs + [f"ambiguous: {len(amb)} PASS or FAIL line(s) also name an N/A cause (a respelled skip)"]
+            outcome = "fail"
         if rc == 0 and row_na:
             probs = probs + [f"printed {len(row_na)} N/A line(s) but exited 0: an N/A must exit 3"]
             outcome = "fail"
@@ -393,14 +409,21 @@ def self_test():
         rows(("good.py", good), ("labelna.py", ('print("SELF-TEST PASS: a root case counted N/A-on-noroot: under sudo x")',
                                                 'print("TALLY ran=1 pass=1 na=0 fail=0")', "sys.exit(0)")))
         rc, out = cli(t)
-        cases.append(("uw5 L4: a PASS line whose label names N/A-on-noroot: is no N/A line (the row passes, rc 0)",
-                      rc == 0 and "PASS a/labelna.py" in out))
+        # FLAGGED TEST EDIT (linux-rev-uw5 N2, a tightening): such a line is no N/A, AND it is refused: a case that says
+        # PASS while naming an N/A cause ("PASS ... (N/A-on-noroot: skipped)") is the respelled skip, so the row fails
+        cases.append(("uw5 N2: a PASS line that also names an N/A cause is refused (rc 1, the line called ambiguous)",
+                      rc == 1 and "labelna.py" in out and "ambiguous" in out))
         rows(("good.py", good), ("labelna2.py", ('print("SELF-TEST PASS: a case named N/A-on-noroot: x")',
                                                  'print("T3LIB self-test N/A-on-noroot: case y")',
                                                  'print("TALLY ran=1 pass=1 na=1 fail=0")', "sys.exit(3)")))
         rc, out = cli(t)
-        cases.append(("uw5 L4: beside such a label, the row's one real N/A line is counted once (na=1 agrees, rc 3)",
-                      rc == 3 and "N/A a/labelna2.py" in out))
+        cases.append(("uw5 N2: beside a real N/A line, an ambiguous PASS line still refuses the row (rc 1)",
+                      rc == 1 and "labelna2.py" in out and "ambiguous" in out))
+        rows(("good.py", good), ("realna.py", ('print("T3LIB self-test N/A-on-noroot: case y")',
+                                               'print("TALLY ran=0 pass=0 na=1 fail=0")', "sys.exit(3)")))
+        rc, out = cli(t)
+        cases.append(("uw5 L4: a real N/A-outcome line alone is the N/A outcome (na=1 agrees, rc 3)",
+                      rc == 3 and "N/A a/realna.py" in out))
         for f_ in os.listdir(os.path.join(t, "a")):
             os.remove(os.path.join(t, "a", f_))
         open(os.path.join(t, "a", "good.py"), "w").write(ok_py)

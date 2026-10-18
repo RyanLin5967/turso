@@ -349,6 +349,12 @@ def decide(path, interval_default=1.0):
     return v
 
 
+def outcome(bad, n_na, busy=None):
+    """the self-test's outcome: "fail" on any failure, else "na" when ANY case was N/A (busy host, or the pid-1 case
+    under root; linux-rev-uw5 N1: it followed the busy flag, so a root run read pass with na=1), else "pass"."""
+    return "fail" if bad else "na" if n_na else "pass"
+
+
 def self_test():
     import subprocess
     import tempfile
@@ -685,9 +691,18 @@ def self_test():
         bad += not ok
         n_pass += ok
         print(f"self-test {'PASS' if ok else 'FAIL'}: {label}: want {want}, got {got}")
+    # linux-rev-uw5 N1: the outcome follows the N/A COUNT, not the busy flag (under root the pid-1 case is N/A with no
+    # busy host, and "pass" with na=1 was refused by tally); the red reaches outcome() through today's rule
+    oc = globals().get("outcome", lambda bad_, n_na_, busy_: "fail" if bad_ else "na" if busy_ else "pass")
+    for label, ok in [("uw5 N1: an N/A case with no busy host makes the outcome na, never pass", oc(0, 1, None) == "na"),
+                      ("uw5 N1: a failure outranks an N/A", oc(1, 1, None) == "fail"),
+                      ("uw5 N1: no N/A and no failure is pass", oc(0, 0, None) == "pass")]:
+        bad += not ok
+        n_pass += ok
+        print(f"self-test {'PASS' if ok else 'FAIL'}: {label}")
     print(f"TALLY ran={n_pass + bad} pass={n_pass} na={n_na} fail={bad}")  # gates/tally.py
     # an N/A is its own outcome, never a pass (linux-rev-uw1 HIGH 1): "fail", "na" (some case did not run) or "pass"
-    return "fail" if bad else "na" if busy else "pass"
+    return outcome(bad, n_na, busy)
 
 
 def main(a):
