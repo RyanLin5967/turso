@@ -29,7 +29,8 @@ def line(passed, failed, na=0):
 
 def judge(text, rc):
     """-> (outcome, tally or None, problems). outcome: 'pass', 'na' or 'fail'; problems refuse the row."""
-    found = [LINE_RE.match(ln.strip()) for ln in text.splitlines() if ln.strip().startswith("TALLY")]
+    # a tally line is one that begins "TALLY ran" (a test may print "TALLY ..." prose, as tally.py's own self-test does)
+    found = [LINE_RE.match(ln.strip()) for ln in text.splitlines() if ln.strip().startswith("TALLY ran")]
     if not found:
         return "fail", None, ["no TALLY line (every self-test row prints one: TALLY ran= pass= na= fail=)"]
     if len(found) > 1:
@@ -65,6 +66,7 @@ def self_test():
         ("no tally refuses", judge("PASS everything\n", 0)[2] != []),
         ("two tallies refuse", judge("TALLY ran=1 pass=1 na=0 fail=0\nTALLY ran=1 pass=1 na=0 fail=0", 0)[2] != []),
         ("a malformed tally refuses", judge("TALLY ran=1 pass=1", 0)[2] != []),
+        ("a line that only mentions TALLY is not a tally (no tally: refused)", judge("TALLY self-test PASS: x", 0)[2] != []),
         ("rc 0 with na=1 refuses", judge("TALLY ran=1 pass=1 na=1 fail=0", 0)[2] != []),
         ("rc 0 with nothing run refuses", judge("TALLY ran=0 pass=0 na=0 fail=0", 0)[2] != []),
         ("rc 3 with fail=1 refuses (a failure is never N/A)", judge("TALLY ran=1 pass=0 na=1 fail=1", 3)[2] != []),
