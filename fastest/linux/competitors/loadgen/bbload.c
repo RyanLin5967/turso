@@ -652,9 +652,52 @@ static int my_fail(conn_t *x, char *why, size_t wsz) {
     return -1;
 }
 
+/* Wait until FD is readable or the deadline DL (now_ns) passes (comp-rev-67b2 LOW-B). */
+static int wait_readable(int fd, uint64_t dl, char *why, size_t wsz) {
+    for (;;) {
+        uint64_t n = now_ns();
+        if (n >= dl) { snprintf(why, wsz, "the server did not answer within %.1f s", CLOSE_TIMEOUT_S); return -1; }
+        struct pollfd pf = {fd, POLLIN, 0};
+        int pr = poll(&pf, 1, (int)((dl - n) / 1000000 + 1));
+        if (pr > 0) return 0;
+        if (pr < 0 && errno != EINTR) { snprintf(why, wsz, "poll: %s", strerror(errno)); return -1; }
+    }
+}
+
+/* One SELECT 1 on X, bounded by SECS: 0 when the server answered it, -1 (WHY) when the connection is gone, the
+ * query failed, or no answer came in time (comp-rev-b15 LOW-1, comp-rev-67b2 LOW-B). */
+static int conn_probe(conn_t *x, double secs, char *why, size_t wsz) {
+    uint64_t dl = now_ns() + (uint64_t)(secs * 1e9);
+    if (x->proto == P_PG) {
+        if (!x->pg || PQstatus(x->pg) != CONNECTION_OK) { snprintf(why, wsz, "connection not open"); return -1; }
+        if (!PQsendQuery(x->pg, "SELECT 1")) { snprintf(why, wsz, "%s", PQerrorMessage(x->pg)); return -1; }
+        int fd = PQsocket(x->pg);
+        while (PQisBusy(x->pg)) {
+            if (wait_readable(fd, dl, why, wsz) != 0) return -1;
+            if (!PQconsumeInput(x->pg)) { snprintf(why, wsz, "%s", PQerrorMessage(x->pg)); return -1; }
+        }
+        int bad = 0;
+        PGresult *r;
+        while ((r = PQgetResult(x->pg))) {
+            if (PQresultStatus(r) != PGRES_TUPLES_OK && !bad) { snprintf(why, wsz, "%s", PQresultErrorMessage(r)); bad = 1; }
+            PQclear(r);
+        }
+        if (!bad && PQstatus(x->pg) != CONNECTION_OK) { snprintf(why, wsz, "%s", PQerrorMessage(x->pg)); bad = 1; }
+        return bad ? -1 : 0;
+    }
+    if (!x->my) { snprintf(why, wsz, "connection lost earlier (closed after a lost-connection error)"); return -1; }
+    if (mysql_send_query(x->my, "SELECT 1", 8) != 0) return my_fail(x, why, wsz);
+    if (wait_readable((int)mysql_get_socket(x->my), dl, why, wsz) != 0) return -1;
+    if (mysql_read_query_result(x->my) != 0) return my_fail(x, why, wsz);
+    MYSQL_RES *res = mysql_store_result(x->my);
+    if (res) mysql_free_result(res);
+    return 0;
+}
+
 /* Run one statement; need_rows: it must affect >= 1 row. */
 static int conn_exec(conn_t *x, const char *sql, int need_rows, char *why, size_t wsz) {
     if (x->proto == P_PG) {
+        if (!x->pg) { snprintf(why, wsz, "connection closed earlier (lost or hung)"); return -1; }
         PGresult *r = PQexec(x->pg, sql);
         ExecStatusType st = PQresultStatus(r);
         int rc = 0;
@@ -1084,8 +1127,17 @@ done:
      * never noticed: libpq's status and a MySQL handle change only when used. One untimed SELECT 1 on the home
      * connection after the last op: a failure is counted (other_err) and refuses the run. A handle already closed
      * after a lost-connection error was counted when it was lost. */
+    /* comp-rev-67b2 LOW-B: the check is BOUNDED (conn_probe, CLOSE_TIMEOUT_S): a home backend that hangs is blamed
+     * on the home connection (other_err, rc 3) within that bound, not reported as an ops stall (rc 4) after
+     * --stall-s; the dead or hung handle is then closed so teardown fails at once instead of waiting on it.
+     * LOW-C, stated: this SELECT 1 runs after this client's last op, untimed and recorded nowhere, but with
+     * --no-drain at C > 1 it can overlap other clients' measured ops, and it falls inside a labelling run's strace
+     * window. It writes nothing (no flush expected; not straced to prove it) and --no-drain cells are refused. */
     if (c->home.pg || c->home.my) {
-        if (conn_exec(&c->home, "SELECT 1", 0, w, sizeof w) != 0) other_fail("home connection lost (found after the last op)", w);
+        if (conn_probe(&c->home, CLOSE_TIMEOUT_S, w, sizeof w) != 0) {
+            other_fail("home connection lost (found after the last op)", w);
+            conn_close(&c->home);
+        }
     }
     for (int k = 0; k < S.nteardown; k++) {
         char t[8192];
