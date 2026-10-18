@@ -7051,3 +7051,41 @@ mod format_tests {
         }
     }
 }
+
+/// engine-rev-l2b HIGH B (its probe, as a red; LEAP L2(c), R1.7 "no first touch"): writing a fresh
+/// log segment faults no page in, in every build, the release build included, where the compiler may
+/// turn the zeroing pre-fault into an untouched zeroed allocation. The control, an untouched Vec of
+/// the same size, must fault, or the instrument sees nothing. Linux (getrusage RUSAGE_THREAD).
+#[cfg(all(test, target_os = "linux"))]
+mod log_segment_prefault_tests {
+    use super::*;
+
+    fn minflt() -> i64 {
+        // SAFETY: a zeroed out-struct filled by the call.
+        let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+        unsafe { libc::getrusage(libc::RUSAGE_THREAD, &mut ru) };
+        ru.ru_minflt
+    }
+
+    #[test]
+    fn a_fresh_log_segment_faults_no_page_when_written() {
+        let mut keep = Vec::new();
+        let (mut seg, mut ctl) = (0i64, 0i64);
+        for _ in 0..64 {
+            let mut v = log_segment();
+            let f0 = minflt();
+            v.resize(LOG_SEGMENT, 1);
+            seg += minflt() - f0;
+            keep.push(v);
+            let mut c: Vec<u8> = Vec::with_capacity(LOG_SEGMENT);
+            let f0 = minflt();
+            c.resize(LOG_SEGMENT, 1);
+            ctl += minflt() - f0;
+            keep.push(c);
+        }
+        std::hint::black_box(&keep);
+        let pages = (64 * LOG_SEGMENT / 4096) as i64;
+        assert!(ctl >= pages / 2, "premise: the untouched control faulted ({ctl} of {pages} pages)");
+        assert!(seg <= 8, "CLAIM: writing 64 fresh log segments faulted {seg} pages in (control {ctl})");
+    }
+}
