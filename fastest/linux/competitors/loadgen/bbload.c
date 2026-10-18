@@ -252,6 +252,9 @@ static char *g_errs[MAXERR];
 static uint64_t g_errn[MAXERR];
 static int g_nerr;
 static uint64_t g_reconnects;
+/* comp-rev-failcount MED-1: failures outside an op -- a teardown statement, a reconnect, a setup statement re-run on a
+ * reconnected home connection -- counted (summary other_err) and named in errors.txt; they used to be dropped */
+static uint64_t g_other_err;
 
 #ifdef __APPLE__
 #define BB_CLOCK_NAME "CLOCK_UPTIME_RAW"
@@ -315,6 +318,13 @@ static int err_index(const char *msg) {
     if (i < MAXERR) g_errn[i]++;
     pthread_mutex_unlock(&g_mu);
     return i < MAXERR ? i : MAXERR - 1;
+}
+/* MED-1: one failure outside an op, counted in g_other_err and named in errors.txt as "WHAT: WHY" */
+static void other_fail(const char *what, const char *why) {
+    char m[512];
+    snprintf(m, sizeof m, "%s: %s", what, why);
+    (void)err_index(m);
+    __atomic_fetch_add(&g_other_err, 1, __ATOMIC_RELAXED);
 }
 
 /* ---------- spec ---------- */
@@ -756,8 +766,17 @@ static void reconnect_home(client_t *c) {
         note_backend(c, 0, 0, &c->home);
         for (int k = 0; k < S.nsetup; k++) {
             char t[8192];
-            if (expand(S.setup[k], &x, t, sizeof t, w) == 0) conn_exec(&c->home, t, 0, w, sizeof w);
+            /* MED-1: a setup statement that fails on the new connection (pg18-create-copy's SET file_copy_method)
+             * is a failure, not a silently different session */
+            if (expand(S.setup[k], &x, t, sizeof t, w) != 0 || conn_exec(&c->home, t, 0, w, sizeof w) != 0)
+                other_fail("setup on a reconnected home connection", w);
         }
+    } else {
+        other_fail("reconnect", w);
+        /* comp-rev-failcount LOW-4: a dead server made the clients spin through failed ops (967 in about 1 s); a
+         * failed reconnect waits 10 ms. Failure path only: such a run is refused anyway. */
+        struct timespec ts = {0, 10 * 1000 * 1000};
+        nanosleep(&ts, NULL);
     }
     __atomic_fetch_add(&g_reconnects, 1, __ATOMIC_RELAXED);
 }
@@ -1063,7 +1082,8 @@ static void *client_main(void *arg) {
 done:
     for (int k = 0; k < S.nteardown; k++) {
         char t[8192];
-        if (expand(S.teardown[k], &x0, t, sizeof t, w) == 0) conn_exec(&c->home, t, 0, w, sizeof w);
+        if (expand(S.teardown[k], &x0, t, sizeof t, w) != 0 || conn_exec(&c->home, t, 0, w, sizeof w) != 0)
+            other_fail("teardown", w); /* MED-1: a failed teardown is a failure */
     }
     conn_close(&c->home);
     if (S.proto == P_MYSQL) mysql_thread_end();
@@ -1390,7 +1410,9 @@ int main(int argc, char **argv) {
     /* comp-rev-dolt250 HIGH-1: a failed op is a failure in EVERY phase. Only measured failures used to count, so a
      * warm-up or drain op lost to a recovered server panic (sql-serial narrows Dolt's delete race, it does not close
      * it) left the run rc 0 and appeared nowhere. */
-    uint64_t warm_err = 0, drain_err = 0, other_err = 0;
+    /* other_err: failures outside any op (teardown, reconnect, reconnect setup: MED-1), plus a recorded op in no
+     * phase above, which claim_op never makes today (comp-rev-failcount LOW-1) */
+    uint64_t warm_err = 0, drain_err = 0, other_err = __atomic_load_n(&g_other_err, __ATOMIC_ACQUIRE);
     double sum = 0;
     uint64_t *late = malloc((total ? total : 1) * sizeof *late);
     size_t nlate = 0;
