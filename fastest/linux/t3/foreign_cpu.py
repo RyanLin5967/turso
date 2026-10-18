@@ -13,8 +13,9 @@ where class is
           started with setsid keep their environment, so they stay inside);
   kernel  a kernel thread (no command line);
   foreign everything else, the sampler itself excluded.
-The first time a foreign pid is recorded, an `#owner` row names it: pid, uid, user, and the uwrun run it belongs to
-(for this account's processes, the <NAME> of the <prefix>-runs/<NAME>/ its cwd is under; "-" otherwise). Owners only
+The first time a foreign pid is recorded, an `#owner` row names it: pid, uid, login and the uwrun run it belongs to.
+The login and run are written for this account's processes only (the run is the first component of its cwd under
+uwrun's run roots, see run_roots); any other uid gets "-" for both, so another user's login is never recorded. Owners only
 name busy-host evidence; they never change a verdict, and our own other runs are foreign like anyone's.
 Each tick also writes a `#tick` row (t, foreign_sum, kernel_sum, sut_sum), so a tick in which nothing
 foreign ran is on the record as a zero, not as a missing row.
@@ -41,30 +42,51 @@ import time
 HZ = os.sysconf("SC_CLK_TCK")
 
 
-RUN_RE = re.compile(r"/[A-Za-z0-9_.-]+-runs/([A-Za-z0-9_-]+)(?:/|$)")
+_LOGIN = {}
 
 
-def owner_of(pid):
-    """(uid, user, run) of PID, or None when it is gone. RUN is the uwrun run the process belongs to: for a process of
-    THIS account, the <NAME> of the OUTERMOST <prefix>-runs/<NAME>/ its cwd is under (uwrun's host-local layout, the
-    run dir under /var/tmp or /dev/shm; a runs dir nested inside a run is still that run's), else "-". Another user's cwd cannot be read, so their run is always "-"."""
-    import pwd
+def _login(uid):
+    """uid -> login, looked up once per uid (linux-rev-uw4 E4: NSS, sss on the UW hosts, took up to 7 ms a call inside
+    the sampler's tick loop)"""
+    if uid not in _LOGIN:
+        import pwd
+        try:
+            _LOGIN[uid] = pwd.getpwuid(uid).pw_name
+        except KeyError:
+            _LOGIN[uid] = str(uid)
+    return _LOGIN[uid]
+
+
+def run_roots():
+    """uwrun's own run roots for this account: /var/tmp/<login>-runs, /dev/shm/<login>-runs (host-local) and ~/runs
+    (the NFS home's links, and a --nfs run's real dir), each resolved"""
+    me = _login(os.getuid())
+    return [os.path.realpath(r) for r in (f"/var/tmp/{me}-runs", f"/dev/shm/{me}-runs", os.path.expanduser("~/runs"))]
+
+
+def owner_of(pid, roots=None):
+    """(uid, login, run) of PID, or None when it is gone.
+    - LOGIN is this account's login for its own processes and "-" for any other uid: another user's login is never
+      written (linux-rev-uw4 E6: committed raws carried one); their uid identifies them.
+    - RUN is the uwrun run one of OUR processes belongs to: the first path component under one of ROOTS (default
+      run_roots()) of its cwd, so a runs dir nested inside a run is still that run's, and a directory that merely ends
+      in "-runs" elsewhere is no run (linux-rev-uw4 E2); "-" otherwise. Another user's cwd cannot be read."""
     try:
         uid = os.stat(f"/proc/{pid}").st_uid
     except OSError:
         return None
-    try:
-        user = pwd.getpwuid(uid).pw_name
-    except KeyError:
-        user = str(uid)
+    if uid != os.getuid():
+        return uid, "-", "-"
     run = "-"
-    if uid == os.getuid():
-        try:
-            m = RUN_RE.search(os.readlink(f"/proc/{pid}/cwd"))
-            run = m.group(1) if m else "-"
-        except OSError:
-            pass
-    return uid, user, run
+    try:
+        cwd = os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        cwd = ""
+    for r in (run_roots() if roots is None else [os.path.realpath(x) for x in roots]):
+        if cwd.startswith(r + "/"):
+            run = cwd[len(r) + 1:].split("/", 1)[0] or "-"
+            break
+    return uid, _login(uid), run
 
 
 def read_procs(cell):
@@ -168,7 +190,7 @@ def busy_evidence(path, exclude=(), interval_default=1.0):
     for line in open(path):
         p = line.rstrip("\n").split("\t")
         if p[0] == "#owner" and len(p) == 5:
-            owners[int(p[1])] = (p[3], p[4])
+            owners[int(p[1])] = (int(p[2]), p[3], p[4])
         elif p[0] == "#start":
             for x in p[1:]:
                 if x.startswith("interval="):
@@ -206,20 +228,42 @@ def busy_evidence(path, exclude=(), interval_default=1.0):
         pid = int(e.rsplit(" pid ", 1)[1])
         if pid not in owners:
             return f"{e} (owner unrecorded)"
-        user, run = owners[pid]
+        uid, user, run = owners[pid]
+        if uid != os.getuid():
+            return f"{e} (another user, uid {uid})"
         return f"{e} (user {user}, our run {run})" if run != "-" else f"{e} (user {user})"
     return [who(e) for e in out]
 
 
-def burners_ran(v, burners, mine):
+def burners_ran(v, burners, mine, rec=None):
     """linux-rev-uw3 MED 1: a live case's burners were SEEN to run in its window's decide() record V. Each SUT burner
     (True, or a SUT parent's "child") must show in the SUT's CPU: sut_max at least 80% per SUT burner. A foreign
     burner (False) must be what voided the window: a rule-2 reason naming one of MINE (this case's own burner pids). A
-    case with no burner is trivially true. Without this the live cases passed with burners that never burned."""
+    case with no burner is trivially true. Without this the live cases passed with burners that never burned.
+    linux-rev-uw4 MED 1: sut_max is the SUT TOTAL, so a parent burning alone satisfied a "child" case (mutants F1, no
+    child forked, and F2, also without the ancestry rule, survived). A "child" burner is seen only when the record REC
+    has a sut-class process that is NOT in MINE (the child is the parent's own fork, so never in MINE) at 80% or more
+    for 5 samples or more (rule 2's run-length); without REC a child is never seen."""
     sut = [b for b in burners if b[0] is True or b[0] == "child"]
     foreign = [b for b in burners if b[0] is False]
     if sut and (v.get("sut_max") or 0.0) < 80.0 * len(sut):
         return False
+    # linux-rev-uw4 LOW 5: and an upper bound: a burner is one core, so a SUT total above 120% per SUT burner (plus 20
+    # for the self-test's own short-lived helpers) is a sampler that over-counts (mutant F6, 10x), not a burner seen
+    if sut and (v.get("sut_max") or 0.0) > 120.0 * len(sut) + 20.0:
+        return False
+    children = [b for b in burners if b[0] == "child"]
+    if children:
+        if rec is None:
+            return False
+        hot = {}
+        for line in open(rec):
+            p = line.rstrip("\n").split("\t")
+            if not p[0].startswith("#") and len(p) == 5 and p[4] == "sut" and int(p[1]) not in mine \
+                    and 80.0 <= float(p[3]) <= 120.0:
+                hot[int(p[1])] = hot.get(int(p[1]), 0) + 1
+        if sum(1 for n in hot.values() if n >= 5) < len(children):
+            return False
     if foreign:
         pids = {int(m.group(1)) for m in (re.match(r"foreign process (\d+) ", r) for r in v.get("reasons") or []) if m}
         if not pids & set(mine):
@@ -352,7 +396,7 @@ def self_test():
                 print(f"N/A-on-busy-host: self-test {label}: {busy}", flush=True)
                 continue
         # linux-rev-uw3 MED 1: the verdict counts only when the case's own burners were seen to run in its record
-        seen = burners_ran(decide(rec), burners, mine)
+        seen = burners_ran(decide(rec), burners, mine, rec=rec)
         ok = out == want and seen
         bad += not ok
         n_pass += ok
@@ -380,20 +424,27 @@ def self_test():
     # linux-rev-uw1 MED 3: busy-host evidence comes from the WINDOW's own samples (a ps CPU% is a lifetime average:
     # the reviewer's 30 s burner read 57-94% while idle), of a foreign, non-kernel process outside the test's tree
     def evid(label, rows, exclude=(), gap_at=None, foreign_ticks=0.0, owners=()):
+        return busy_evidence(evid_file(label, rows, gap_at, foreign_ticks, owners), exclude)
+
+    def evid_file(label, rows, gap_at=None, foreign_ticks=0.0, owners=()):
         f = os.path.join(d, f"evid-{label}.tsv")
         with open(f, "w") as o:
             o.write("#start\t0\tcell=ST\tinterval=1.0\tload=()\n")
             for pid, uid, user, run in owners:
                 o.write(f"#owner\t{pid}\t{uid}\t{user}\t{run}\n")
             t_ = 0.0
+            any_sut = any(r[3] == "sut" for r in rows)
             for i in range(20):
                 t_ += 4.0 if gap_at == i else 1.0
+                sut_sum = 0.0
                 for pid, comm, pct, kind, start, n in rows:
                     if start <= i < start + n:
                         o.write(f"{t_:.3f}\t{pid}\t{comm}\t{pct}\t{kind}\n")
-                o.write(f"#tick\t{t_:.3f}\t{foreign_ticks}\t0.0\t50.0\n")
+                        sut_sum += pct if kind == "sut" else 0.0
+                # the tick's SUT sum is the rows' own when the fixture has SUT rows (uw4 MED 1), else the old constant
+                o.write(f"#tick\t{t_:.3f}\t{foreign_ticks}\t0.0\t{sut_sum if any_sut else 50.0}\n")
             o.write("#stop\t20.000\tstop-file\tload=()\n")
-        return busy_evidence(f, exclude)
+        return f
     synthetic_evid = [
         ("MED 3: a foreign process at 60% for 6 window samples is busy-host evidence",
          [p_.split(" ")[0] for p_ in evid("busy", [(7, "java", 60.0, "foreign", 3, 6)])] == ["java"]),
@@ -416,9 +467,40 @@ def self_test():
     # at these claims, not at setup
     ran = globals().get("burners_ran", lambda v, burners, mine: True)
     two_sut = [(True, 1, 17), (True, 1, 17)]
+
+    # linux-rev-uw4 MED 1: a "child" burner is seen only when a SUT-class process that is NOT one of the case's own
+    # (mine: the parent and the self-test) burns, in the window's own per-process rows: sut_max is the SUT TOTAL, so
+    # the parent burning alone (F1: no child forked; F2: also no ancestry rule) satisfied it. The record is passed as
+    # rec=; the red reaches it through a fallback to today's call
+    def ran_rec(v, burners, mine, rec):
+        try:
+            return ran(v, burners, mine, rec=rec)
+        except TypeError:
+            return ran(v, burners, mine)
+
+    def sut_rec(label, rows):
+        return evid_file(label, [(pid, "python3", pct, "sut", start, n) for pid, pct, start, n in rows])
+    child = [("child", 3, 9)]
+    par_only = sut_rec("paronly", [(41, 99.0, 3, 9)])
+    par_child = sut_rec("parchild", [(41, 0.2, 3, 9), (77, 99.0, 3, 9)])
+    brief_child = sut_rec("briefchild", [(41, 0.2, 3, 9), (77, 99.0, 3, 2)])
+    x10_child = sut_rec("x10child", [(41, 2.0, 3, 9), (77, 990.0, 3, 9)])
+    synthetic_evid += [
+        ("uw4 MED 1: a child case whose SUT CPU is all the parent's (pid 41, ours) is refused: no child burned",
+         not ran_rec(decide(par_only), child, {40, 41}, par_only)),
+        ("uw4 MED 1: a child case whose SUT CPU comes from a SUT process not ours (pid 77) shows the child ran",
+         ran_rec(decide(par_child), child, {40, 41}, par_child)),
+        ("uw4 MED 1: a child seen at 99% for only 2 s (under rule 2's 5 s) is not seen to run",
+         not ran_rec(decide(brief_child), child, {40, 41}, brief_child)),
+        ("uw4 LOW 5: a child read at 990% (10x one core) is refused",
+         not ran_rec(decide(x10_child), child, {40, 41}, x10_child)),
+    ]
     synthetic_evid += [
         ("uw3 MED 1: two SUT burners that never burned (sut_max 0) are refused", not ran({"sut_max": 0.0, "reasons": []}, two_sut, {1, 2})),
         ("uw3 MED 1: two SUT burners seen at 190% pass", ran({"sut_max": 190.0, "reasons": []}, two_sut, {1, 2})),
+        # linux-rev-uw4 LOW 5: an upper bound too: a sampler that over-counts CPU 10x (mutant F6) is not "seen to run"
+        ("uw4 LOW 5: two SUT burners read at 1900% (10x two cores) are refused",
+         not ran({"sut_max": 1900.0, "reasons": []}, two_sut, {1, 2})),
         ("uw3 MED 1: a SUT child that never burned (sut_max 0) is refused",
          not ran({"sut_max": 0.0, "reasons": []}, [("child", 3, 9)], {1, 2})),
         ("uw3 MED 1: a VOID named on another process (pid 999, not ours) does not show OUR burner ran",
@@ -440,29 +522,55 @@ def self_test():
     # writes when it first records a foreign pid. The busy rule itself does NOT exclude our own runs: a window shared
     # with another of our runs is as loaded as one shared with a stranger, and T3 times only quiet windows. The red
     # reaches owner_of through a fallback with today's behaviour (nothing recorded: None)
-    own = globals().get("owner_of", lambda pid: None)
+    own_ = globals().get("owner_of", lambda pid: None)
+
+    # linux-rev-uw4 E2: the run is read only under uwrun's own run roots, passed as roots= so the test can plant one;
+    # the red reaches it through a fallback to today's call (FLAGGED TEST EDIT: E2 and E6 change this block's spec)
+    def own(pid, roots=None):
+        try:
+            return own_(pid, roots=roots) if roots is not None else own_(pid)
+        except TypeError:
+            return own_(pid)
     import pwd
-    me_user = pwd.getpwuid(os.getuid()).pw_name
-    # the probe dir must sit under no OTHER runs dir: d is under TMPDIR, which uwrun puts inside the run's own dir
-    # (<user>-runs/<NAME>/tmp), so a probe under d is rightly named by that outer run (green run 1, ecetesla2)
+    import shutil
+    me_uid, me_user = os.getuid(), pwd.getpwuid(os.getuid()).pw_name
     base = next(b for b in ("/dev/shm", "/tmp", d) if os.access(b, os.W_OK))
     pd = tempfile.mkdtemp(dir=base)
-    rd = os.path.join(pd, "x-runs", "probe-run", "work")
-    os.makedirs(rd)
-    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], cwd=rd)
-    nd = os.path.join(pd, "x-runs", "outer-run", "work", "y-runs", "inner-run")
-    os.makedirs(nd)
-    nested = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], cwd=nd)
+    root = os.path.join(pd, f"{me_user}-runs")
+
+    def sleeper(cwd):
+        os.makedirs(cwd, exist_ok=True)
+        return subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], cwd=cwd)
+    procs_ = {
+        "child": sleeper(os.path.join(root, "probe-run", "work")),
+        "nested": sleeper(os.path.join(root, "outer-run", "work", "y-runs", "inner-run")),
+        # E2: a directory merely ending in "-runs", outside every run root, is no run
+        "notes": sleeper(os.path.join(pd, "notes-runs", "README")),
+        # E3: a process whose cwd is / is under no run
+        "slash": sleeper("/"),
+    }
     try:
-        got_child = own(child.pid)
-        got_nested = own(nested.pid)
+        got = {k: own(v.pid, roots=[root]) for k, v in procs_.items()}
+        got_default_slash = own(procs_["slash"].pid)
+        got_pid1 = own(1)
     finally:
-        for c_ in (child, nested):
+        for c_ in procs_.values():
             c_.kill(); c_.wait()
-    import shutil
-    shutil.rmtree(pd, ignore_errors=True)
-    got_self = own(os.getpid())
-    # sample() itself: a foreign child burning for 2 s is recorded, and the record carries an #owner row for it
+        shutil.rmtree(pd, ignore_errors=True)
+    # E4: the uid -> login lookup (NSS, sss on these hosts: up to 7 ms) is made once per uid, not once per new pid
+    calls = [0]
+    real_getpwuid = pwd.getpwuid
+
+    def counting(uid):
+        calls[0] += 1
+        return real_getpwuid(uid)
+    pwd.getpwuid = counting
+    try:
+        for _ in range(50):
+            own(os.getpid())
+    finally:
+        pwd.getpwuid = real_getpwuid
+    # sample() itself: a foreign child burning for 3 s is recorded, and the record carries an #owner row for it
     srec, sstop = os.path.join(d, "owner-sample.tsv"), os.path.join(d, "owner-sample.stop")
     burn = subprocess.Popen([sys.executable, "-c", "import time\nt=time.monotonic()\nwhile time.monotonic()-t<3: pass"])
     sp = subprocess.Popen([sys.executable, "-B", os.path.abspath(__file__), "sample", srec, "--cell", "OWNERPROBE",
@@ -472,21 +580,28 @@ def self_test():
     sp.wait()
     srows = [ln.rstrip("\n").split("\t") for ln in open(srec)]
     burn_owner = [r for r in srows if r[0] == "#owner" and r[1] == str(burn.pid)]
+    other = me_uid + 4242
     synthetic_evid += [
-        ("owner: busy-host evidence names another user's process by its user",
-         evid("own1", [(7, "node-MainThread", 90.0, "foreign", 2, 8)], owners=[(7, 4242, "alice", "-")])
-         == ["node-MainThread pid 7 (user alice)"]),
+        # E6: another user's login is never printed (committed raws carried one): their uid only
+        ("uw4 E6: busy-host evidence names another user's process by uid, never by login",
+         evid("own1", [(7, "node-MainThread", 90.0, "foreign", 2, 8)], owners=[(7, other, "alice", "-")])
+         == [f"node-MainThread pid 7 (another user, uid {other})"]),
         ("owner: busy-host evidence names a process of OUR account by its uwrun run",
-         evid("own2", [(7, "node-MainThread", 90.0, "foreign", 2, 8)], owners=[(7, 1000, me_user, "moonshot-x")])
+         evid("own2", [(7, "node-MainThread", 90.0, "foreign", 2, 8)], owners=[(7, me_uid, me_user, "moonshot-x")])
          == [f"node-MainThread pid 7 (user {me_user}, our run moonshot-x)"]),
         ("owner: a process with no #owner row is named as unrecorded, never guessed",
          evid("own3", [(7, "java", 90.0, "foreign", 2, 8)]) == ["java pid 7 (owner unrecorded)"]),
         ("owner: owner_of names a child of ours by our user and by the run its cwd is under",
-         got_child is not None and got_child[1:] == (me_user, "probe-run")),
+         got["child"] is not None and got["child"][1:] == (me_user, "probe-run")),
         ("owner: a runs dir nested inside a run is still the outer run's (uwrun's own dir is the outermost)",
-         got_nested is not None and got_nested[2] == "outer-run"),
-        ("owner: owner_of names our own process with no run when its cwd is under none",
-         got_self is not None and got_self[1] == me_user),
+         got["nested"] is not None and got["nested"][2] == "outer-run"),
+        ("uw4 E2: a cwd under a directory ending in -runs but outside every run root is no run",
+         got["notes"] is not None and got["notes"][2] == "-"),
+        ("uw4 E3: our own process whose cwd is / has user us and run - (with the planted root and the default roots)",
+         got["slash"] == (me_uid, me_user, "-") and got_default_slash == (me_uid, me_user, "-")),
+        ("uw4 E4: the login of a uid is looked up once, not once per lookup (50 lookups)", calls[0] <= 1),
+        ("uw4 E6: owner_of on pid 1 (another uid: root's init) records its uid and no login and no run",
+         os.getuid() == 0 or (got_pid1 is not None and got_pid1[0] != me_uid and got_pid1[1:] == ("-", "-"))),
         ("owner: sample() writes an #owner row for a foreign pid it records, with our user",
          len(burn_owner) == 1 and burn_owner[0][3] == me_user),
     ]
