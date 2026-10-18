@@ -14290,6 +14290,13 @@ fn a_failed_ddl_leaves_no_in_memory_schema_change_on_the_routes_the_first_fix_mi
             continue;
         }
         let names = rows(&c, "SELECT name FROM temp.sqlite_schema ORDER BY name");
+        // FLAGGED, sharpened after its first run (red 5bced0bb6, green a66b4fba3): a failed read of
+        // the file's schema is itself a failure, never "not on the file".
+        if names.starts_with("Err") {
+            failed.push(format!("{case}: reading temp.sqlite_schema after the failed CTAS: {names}"));
+            let _ = c.execute("ROLLBACK");
+            continue;
+        }
         // Inside BEGIN the failed statement may roll the whole transaction back (a too): whatever the
         // file kept, the in-memory temp schema must say the same.
         for t in ["a", "b"] {
