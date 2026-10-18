@@ -144,9 +144,12 @@ impl<T: Preimage> BranchTable<T> {
         )
     }
 
-    /// Whether the pool is low enough that the writer should refill it.
+    /// Whether the pool is low enough that the writer should refill it. Never for a table that has
+    /// never held a branch (engine-rev-l2b MED: an empty store held about 400 KB of spares): its
+    /// first insert builds its own segment and chunk, counted, and the pool fills after it.
     pub(crate) fn pool_low(&self) -> bool {
-        self.spare_chunks.len() <= CHUNK_POOL_LOW || self.spare_segments.is_empty()
+        self.chunk_allocs > 0
+            && (self.spare_chunks.len() <= CHUNK_POOL_LOW || self.spare_segments.is_empty())
     }
 
     /// Keep `spares` in the pool, up to its bounds (no allocation: the capacity is reserved). What
@@ -511,7 +514,7 @@ mod tests {
     fn a_branch_table_takes_its_chunks_from_the_pool_and_keeps_emptied_ones() {
         let mut t: BranchTable<u64> = BranchTable::new();
         assert_eq!(t.pool_need(), (CHUNK_POOL, SEG_POOL));
-        assert!(t.pool_low());
+        assert!(!t.pool_low(), "a table that never held a branch asked for a pool");
         let surplus = t.add_spares(BranchTable::new_spares((CHUNK_POOL + 3, SEG_POOL + 1)));
         assert_eq!((surplus.chunks.len(), surplus.segments.len()), (3, 1), "the surplus was kept");
         assert_eq!(t.pool_need(), (0, 0));
