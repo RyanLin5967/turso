@@ -5961,6 +5961,13 @@ fn pg_type_name_to_ast_type(type_name: &pg_query::protobuf::TypeName) -> Option<
         "TEXT" | "VARCHAR" | "CHAR" | "BPCHAR" | "NAME" | "UUID" | "DATE" | "TIME" | "TIMETZ"
         | "TIMESTAMP" | "TIMESTAMPTZ" | "INTERVAL" | "INET" | "JSON" | "JSONB" | "XML" | "CIDR"
         | "MACADDR" | "BIT" | "VARBIT" | "TSVECTOR" | "TSQUERY" => "TEXT",
+        // The built-in types map_pg_type keeps as text or a number (wire-rev-uw2 LOW): a cast to
+        // one was left to its operand and '[1,2)'::int4range answered 0 (pg18-rev-uw2-casts.out).
+        "INT4RANGE" | "INT8RANGE" | "NUMRANGE" | "TSRANGE" | "TSTZRANGE" | "DATERANGE"
+        | "INT4MULTIRANGE" | "INT8MULTIRANGE" | "NUMMULTIRANGE" | "TSMULTIRANGE"
+        | "TSTZMULTIRANGE" | "DATEMULTIRANGE" | "INT2VECTOR" | "OIDVECTOR" | "TID" | "PG_LSN"
+        | "TXID_SNAPSHOT" | "PG_SNAPSHOT" => "TEXT",
+        "XID" | "XID8" | "CID" => "INTEGER",
         "BYTEA" | "BLOB" => "BLOB",
         _ => return None,
     };

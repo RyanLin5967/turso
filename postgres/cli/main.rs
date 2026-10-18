@@ -311,11 +311,11 @@ fn cmd_describe_table(conn: &Connection, table_name: &str, w: &mut dyn Write) {
                 let _ = writeln!(w, "Table: {table_name}");
                 let _ = writeln!(w, "{table}");
             } else {
-                let _ = writeln!(w, "Did not find any relation named \"{table_name}\".");
+                let _ = writeln!(w, "Table \"{table_name}\" not found.");
             }
         }
         Ok(None) => {
-            let _ = writeln!(w, "Did not find any relation named \"{table_name}\".");
+            let _ = writeln!(w, "Table \"{table_name}\" not found.");
         }
         Err(e) => {
             let _ = writeln!(w, "Error: {e}");

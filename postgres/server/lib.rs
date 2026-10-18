@@ -2602,7 +2602,24 @@ impl Session {
             if st.aborted {
                 match st.read_marks.last() {
                     Some((_, held)) => self.keep_block_reads(*held),
-                    None => self.release_block_reads(),
+                    None => {
+                        self.release_block_reads();
+                        // A block with no savepoint that failed is over in PostgreSQL but for
+                        // its ROLLBACK: AbortTransaction releases every lock at the error, the
+                        // statement's write lock too (round1-pg-all.txt r08). The engine kept
+                        // its transaction, and a failed INSERT's write lock with it, so another
+                        // session's DROP was 'Database is busy'. It is rolled back now; the
+                        // session stays failed (25P02) until the client ends the block, which
+                        // answers ROLLBACK. With a savepoint the transaction stays, for ROLLBACK
+                        // TO (BLIND SPOT: a failed subtransaction's write lock is held until then).
+                        let conn = match &st.branch {
+                            Some((_, conn)) => Some(conn.clone()),
+                            None => st.trunk.clone(),
+                        };
+                        if let Some(conn) = conn {
+                            let _ = conn.roll_back_or_break();
+                        }
+                    }
                 }
             }
             return;
