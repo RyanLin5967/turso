@@ -137,6 +137,18 @@ def na_causes(out):
     return causes
 
 
+def ambiguous_lines(out):
+    """the lines that carry an outcome word (PASS or FAIL) BEFORE an 'N/A-on-<cause>' token (linux-rev-uw5 N2): such a
+    line is no N/A line (na_causes) and no honest PASS either ('PASS ... (N/A-on-noroot: skipped)'), so the row is
+    refused rather than read either way"""
+    amb = []
+    for ln in out.splitlines():
+        m = re.search(r"N/A-on-([A-Za-z0-9_-]+)", ln)
+        if m and re.search(r"\b(PASS|FAIL)\b", ln[:m.start()]):
+            amb.append(ln)
+    return amb
+
+
 def this_platform():
     return "linux" if sys.platform.startswith("linux") else sys.platform
 
@@ -229,6 +241,10 @@ def run(root, plat=None, timeout=1800, allow_na=None):
         # a wording match); every N/A case also names its cause in an "N/A-on-<cause>" line (MED 2's totals)
         outcome, t_, probs = tally.judge(out, rc if rc is not None else -1)
         row_na = na_causes(out)
+        amb = ambiguous_lines(out)
+        if amb:
+            probs = probs + [f"ambiguous: {len(amb)} PASS or FAIL line(s) also name an N/A cause (a respelled skip)"]
+            outcome = "fail"
         if rc == 0 and row_na:
             probs = probs + [f"printed {len(row_na)} N/A line(s) but exited 0: an N/A must exit 3"]
             outcome = "fail"
