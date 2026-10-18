@@ -58,9 +58,10 @@ pub(crate) struct PgConnectionInner {
     /// statement (review wire-quote MED-3's class: the server read it from the client's text, and
     /// a leading comment hid it).
     public_schema_only: bool,
-    /// The files of the schemas this session dropped inside its open block, deleted when the
-    /// block commits and forgotten when it rolls back (review wire-quote MED-3).
-    dropped_schema_files: parking_lot::Mutex<Vec<String>>,
+    /// The schemas this session dropped inside its open block, with their files: detached and
+    /// deleted when the block commits, kept when it rolls back (review wire-quote MED-3,
+    /// wire-rev-uw1 M2).
+    dropped_schemas: parking_lot::Mutex<Vec<(String, Option<String>)>>,
     /// The relations statements prepared inside the open block named (libpg_query's tables(),
     /// `schema.name` or `name`), for the server to take ([`PgConnection::take_block_reads`]).
     block_reads: parking_lot::Mutex<Vec<String>>,
@@ -416,7 +417,7 @@ impl PgConnection {
                 search_path_stamp: std::sync::atomic::AtomicU64::new(0),
                 warnings: parking_lot::Mutex::new(Vec::new()),
                 public_schema_only,
-                dropped_schema_files: parking_lot::Mutex::new(Vec::new()),
+                dropped_schemas: parking_lot::Mutex::new(Vec::new()),
                 block_reads: parking_lot::Mutex::new(Vec::new()),
                 server_files,
             }),
@@ -660,9 +661,17 @@ impl PgConnection {
         let gucs = &mut state.gucs;
         match event {
             TxEvent::Ended { committed } => {
-                let dropped = std::mem::take(&mut *self.inner.dropped_schema_files.lock());
+                let dropped = std::mem::take(&mut *self.inner.dropped_schemas.lock());
                 if committed {
-                    dropped.iter().for_each(|path| remove_schema_file(path));
+                    for (name, path) in &dropped {
+                        if let Err(e) = detach_schema(&self.inner.conn, name) {
+                            tracing::warn!("the dropped schema {name} could not be detached: {e}");
+                            continue;
+                        }
+                        if let Some(path) = path {
+                            remove_schema_file(path);
+                        }
+                    }
                 }
                 if let (false, Some(start)) = (committed, gucs.block_start.take()) {
                     gucs.session = start;
@@ -1033,6 +1042,25 @@ fn split_script(sql: &str) -> Vec<String> {
         return vec![body.to_string()];
     }
     turso_pg_parser::split_statements_lenient(sql).unwrap_or_else(|_| vec![trimmed.to_string()])
+}
+
+/// Whether `sql` is a COMMIT (or END), as libpg_query parses it: for a caller that runs
+/// statements itself and reports the end of a block ([`PgConnection::tx_event`]), as the CLI does
+/// (wire-rev-uw1 M2: only the server reported a block's end, so a CLI block's SET LOCALs and its
+/// dropped schemas were never settled).
+pub fn is_commit(sql: &str) -> bool {
+    use turso_pg_parser::pg_query::protobuf::TransactionStmtKind;
+    use turso_pg_parser::pg_query::NodeRef;
+    let Ok(parsed) = turso_pg_parser::parse(sql) else {
+        return false;
+    };
+    let nodes = parsed.protobuf.nodes();
+    match nodes.first().map(|n| &n.0) {
+        Some(NodeRef::TransactionStmt(t)) => {
+            TransactionStmtKind::try_from(t.kind).ok() == Some(TransactionStmtKind::TransStmtCommit)
+        }
+        _ => false,
+    }
 }
 
 /// The one statement `sql` is when it holds no separator but a trailing one (no literal, comment or
@@ -1575,7 +1603,9 @@ fn try_prepare_special(
             noop_statement(&pg_conn.conn)?
         }
         Special::DropSchema(stmt) => {
-            refuse_schema_ddl(pg_conn, &stmt.name)?;
+            for name in &stmt.names {
+                refuse_schema_ddl(pg_conn, name)?;
+            }
             handle_pg_drop_schema(pg_conn, &stmt)?;
             noop_statement(&pg_conn.conn)?
         }
@@ -2577,40 +2607,52 @@ fn schema_file_path(conn: &Connection, schema_name: &str) -> String {
 
 fn handle_pg_drop_schema(pg_conn: &Arc<PgConnectionInner>, stmt: &PgDropSchemaStmt) -> Result<()> {
     let conn = &pg_conn.conn;
-    // As libpg_query gives it: an unquoted name already lowercased, a quoted one as written
-    // (review wire-quote LOW-4: a quoted name was lowercased here).
-    let name = stmt.name.clone();
-    if name == "public" {
-        return handle_pg_drop_schema_public(conn, stmt.cascade);
-    }
-
-    if !schema_exists(conn, &name)? {
-        if stmt.if_exists {
+    // Every name is resolved before anything is dropped, as PostgreSQL's RemoveObjects does
+    // (recorded, pg18-rev-uw1-schema.out): a missing one is 3F000 and nothing is dropped, or under
+    // IF EXISTS a NOTICE and skipped. public is only `public` exactly (wire-rev-uw1 M3).
+    let mut found = Vec::with_capacity(stmt.names.len());
+    for name in &stmt.names {
+        if name == "public" || schema_exists(conn, name)? {
+            found.push(name.as_str());
+        } else if stmt.if_exists {
             // PostgreSQL's notice for the missing schema (recorded, pg18-c53-dropnotice.out).
-            skipping_notice(pg_conn, "schema", &stmt.name);
-            return Ok(());
+            skipping_notice(pg_conn, "schema", name);
+        } else {
+            return Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
+                SqlErrorKind::InvalidSchemaName,
+                format!("schema \"{name}\" does not exist"),
+            )));
         }
-        return Err(LimboError::ParseError(format!(
-            "schema \"{name}\" does not exist"
-        ).into()));
     }
-
-    if stmt.cascade {
-        drop_all_tables_in_schema(conn, &name)?;
-    }
-
-    execute_sqlite_internal(conn, catalog::sqlite_text(format!("DETACH {}", catalog::quote_ident(&name))))?;
-    // The file of the schema resolved and detached, never one read from the client's text; at
-    // once outside a block, at the block's COMMIT inside one ([`PgConnection::tx_event`]).
-    // An in-memory main database's schemas have no file of their own here.
-    let path = schema_file_path(conn, &name);
-    if conn.db_file_path() == ":memory:" {
-    } else if conn.get_auto_commit() {
-        remove_schema_file(&path);
-    } else {
-        pg_conn.dropped_schema_files.lock().push(path);
+    for name in found {
+        if name == "public" {
+            handle_pg_drop_schema_public(conn, stmt.cascade)?;
+            continue;
+        }
+        if stmt.cascade {
+            drop_all_tables_in_schema(conn, name)?;
+        }
+        // The engine refuses a DETACH inside a transaction, so inside a block the schema is
+        // detached, and its file deleted, at the block's COMMIT, and kept at its ROLLBACK
+        // ([`PgConnection::tx_event`]; wire-rev-uw1 M2: a DROP SCHEMA in a CLI block failed
+        // 'database s is locked'). The file is the one of the schema resolved here, never one
+        // read from the client's text. An in-memory main database's schemas have no file here.
+        let path = (conn.db_file_path() != ":memory:").then(|| schema_file_path(conn, name));
+        if conn.get_auto_commit() {
+            detach_schema(conn, name)?;
+            if let Some(path) = &path {
+                remove_schema_file(path);
+            }
+        } else {
+            pg_conn.dropped_schemas.lock().push((name.to_string(), path));
+        }
     }
     Ok(())
+}
+
+/// DETACH a schema's database.
+fn detach_schema(conn: &Arc<Connection>, name: &str) -> Result<()> {
+    execute_sqlite_internal(conn, catalog::sqlite_text(format!("DETACH {}", catalog::quote_ident(name))))
 }
 
 /// A dropped schema's database file and its WAL and SHM files. A file already gone is no error.
@@ -2628,7 +2670,9 @@ fn remove_schema_file(path: &str) {
 /// The branch server's refusal of schema DDL ([`PgConnection::new_server`]): any schema but
 /// public, as the parsed statement names it.
 fn refuse_schema_ddl(pg_conn: &Arc<PgConnectionInner>, name: &str) -> Result<()> {
-    if pg_conn.public_schema_only && !name.eq_ignore_ascii_case("public") {
+    // Exactly public: a quoted "PUBLIC" is a schema of its own (wire-rev-uw1 M3: compared without
+    // case, it passed here, and DROP SCHEMA "PUBLIC" CASCADE then dropped every public table).
+    if pg_conn.public_schema_only && name != "public" {
         return Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
             SqlErrorKind::FeatureNotSupported,
             "schemas other than public are not supported by the branch server: its branches cover \
@@ -3940,7 +3984,9 @@ fn get_table_columns(
 }
 
 fn list_user_tables(conn: &Arc<Connection>, schema_name: Option<&str>) -> Result<Vec<String>> {
-    let filter = "type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso_internal_%'";
+    // `_` escaped: unescaped it is any character, so a user table named sqlitexy was taken for
+    // an internal one and left behind by DROP SCHEMA public CASCADE (wire-rev-uw1 LOW-2).
+    let filter = r"type='table' AND name NOT LIKE 'sqlite\_%' ESCAPE '\' AND name NOT LIKE '\_\_turso\_internal\_%' ESCAPE '\'";
     let sql = match schema_name {
         Some(name) => catalog::sqlite_text(format!(
             "SELECT name FROM {}.sqlite_schema WHERE {filter}",

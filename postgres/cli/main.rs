@@ -722,7 +722,24 @@ fn execute_sql(
 ) -> bool {
     let runner = conn.query_runner(sql.as_bytes());
     let mut had_error = false;
+    // A block that a statement ends is reported to the session, as the server reports it
+    // (wire-rev-uw1 M2): a COMMIT that ran settles the block's SETs and its dropped schemas,
+    // anything else that ended it rolls them back.
+    let mut in_block = !conn.inner().get_auto_commit();
     for mut output in runner {
+        let mut ran_ok = false;
+        let mut text = String::new();
+        if let Ok(Some(ref stmt)) = output {
+            text = stmt.get_sql().to_string();
+        }
+        let ended = |ok: bool, text: &str, in_block: &mut bool| {
+            let now = !conn.inner().get_auto_commit();
+            if *in_block && !now {
+                let committed = ok && turso_pg::is_commit(text);
+                conn.tx_event(turso_pg::TxEvent::Ended { committed }, text);
+            }
+            *in_block = now;
+        };
         match output {
             Ok(Some(ref mut stmt)) => {
                 let result = if expanded {
@@ -730,14 +747,17 @@ fn execute_sql(
                 } else {
                     print_result_set(stmt, table_config, w)
                 };
+                ran_ok = result.is_ok();
+                ended(ran_ok, &text, &mut in_block);
                 if let Err(e) = result {
                     let _ = writeln!(w, "Error: {e}");
                     had_error = true;
                     break;
                 }
             }
-            Ok(None) => {}
+            Ok(None) => ended(true, &text, &mut in_block),
             Err(ref e) => {
+                ended(false, &text, &mut in_block);
                 let _ = writeln!(w, "Error: {e}");
                 had_error = true;
                 break;

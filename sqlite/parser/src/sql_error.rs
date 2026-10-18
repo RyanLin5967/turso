@@ -54,6 +54,7 @@ pub enum SqlErrorKind {
     ObjectInUse,
     InsufficientPrivilege,
     InvalidName,
+    InvalidSchemaName,
     TooManyConnections,
     Warning,
     SuccessfulCompletion,
