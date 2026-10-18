@@ -10,6 +10,28 @@ use pg_query::{NodeRef, ParseResult};
 use turso_parser::ast;
 use turso_parser::ast::GroupBy;
 
+/// A column's DEFAULT: a literal as it is, any other expression parenthesized. SQLite's grammar
+/// takes `DEFAULT (expr)` and never a bare call, and core stores the column's text for good after
+/// ALTER (BTreeTable::to_sql prints the default as given), so a serial's `DEFAULT nextval(...)`
+/// left a table that no later open could parse (first host run of the review wire-quote MED-2
+/// red: a plain `xy` with a serial, after DROP COLUMN, failed every reopen with near "(").
+fn column_default(expr: ast::Expr) -> ast::ColumnConstraint {
+    ast::ColumnConstraint::Default(Box::new(match expr {
+        e @ (ast::Expr::Literal(_) | ast::Expr::Parenthesized(_)) => e,
+        e => ast::Expr::Parenthesized(vec![Box::new(e)]),
+    }))
+}
+
+/// THE constructor of an engine string literal from a value (review wire-quote MED-1, MED-2,
+/// LOW-5): the value quoted, each `'` doubled. An ast::Literal::String holds its SQL text with
+/// the quotes, and core stores that text (a CREATE TYPE's ENCODE, a column DEFAULT) and parses it
+/// again at every schema load, so a value pasted inside bare quotes broke the reload or changed
+/// the expression. engine_text_from_any_literal_is_quoted_by_the_one_quoting_function (server
+/// tests) holds the translator to it.
+pub fn sql_string(value: &str) -> ast::Literal {
+    ast::Literal::String(format!("'{}'", value.replace('\'', "''")))
+}
+
 /// THE constructor of an engine name from a libpg_query-sourced string (review wire-quote HIGH-1):
 /// libpg_query has already unquoted it, so the string IS the name, and a leading `"`, `'`, `` ` ``
 /// or `[` is part of it. ast::Name::from_string re-read such a lead as SQL quoting: it asserted on
@@ -855,9 +877,7 @@ impl PostgreSQLTranslator {
             default_expr = Some(ast::Expr::FunctionCall {
                 name: pg_name("nextval"),
                 distinctness: None,
-                args: vec![Box::new(ast::Expr::Literal(ast::Literal::String(format!(
-                    "'{seq_name}'"
-                ))))],
+                args: vec![Box::new(ast::Expr::Literal(sql_string(&seq_name)))],
                 order_by: vec![],
                 within_group: vec![],
                 filter_over: ast::FunctionTail {
@@ -902,7 +922,7 @@ impl PostgreSQLTranslator {
         if let Some(expr) = default_expr {
             constraints.push(ast::NamedColumnConstraint {
                 name: None,
-                constraint: ast::ColumnConstraint::Default(Box::new(expr)),
+                constraint: column_default(expr),
             });
         }
 
@@ -1240,9 +1260,7 @@ impl PostgreSQLTranslator {
                 }),
                 ConstrType::ConstrUnique => Some(ast::ColumnConstraint::Unique(None)),
                 ConstrType::ConstrDefault => match constraint.raw_expr.as_ref() {
-                    Some(raw_expr) => Some(ast::ColumnConstraint::Default(Box::new(
-                        self.translate_expr(raw_expr)?,
-                    ))),
+                    Some(raw_expr) => Some(column_default(self.translate_expr(raw_expr)?)),
                     None => None,
                 },
                 _ => None,
@@ -1682,11 +1700,25 @@ impl PostgreSQLTranslator {
             .collect();
         let has_explicit_columns = !columns.is_empty();
 
-        // Translate body (VALUES or SELECT)
-        let select_stmt_node = insert
-            .select_stmt
-            .as_ref()
-            .ok_or_else(|| ParseError::ParseError("INSERT missing VALUES or SELECT".into()))?;
+        // INSERT ... DEFAULT VALUES: libpg_query gives no select_stmt (PostgreSQL's grammar takes
+        // no column list with it). Found by the review wire-quote MED-2 red's first host run: it
+        // was refused as "INSERT missing VALUES or SELECT".
+        let Some(select_stmt_node) = insert.select_stmt.as_ref() else {
+            if insert.on_conflict_clause.is_some() {
+                return Err(ParseError::ParseError(SqlErrorMessage::classified(
+                    SqlErrorKind::FeatureNotSupported,
+                    "INSERT ... DEFAULT VALUES ON CONFLICT is not supported".to_string(),
+                )));
+            }
+            return Ok(ast::Stmt::Insert {
+                with: self.translate_with_clause(&insert.with_clause)?,
+                or_conflict: None,
+                tbl_name,
+                columns: Vec::new(),
+                body: ast::InsertBody::DefaultValues,
+                returning: self.translate_returning(&insert.returning_list)?,
+            });
+        };
 
         let select_stmt = match &select_stmt_node.node {
             Some(Node::SelectStmt(select)) => select,
@@ -3566,7 +3598,7 @@ impl PostgreSQLTranslator {
                         | SqlValueFunctionOp::SvfopCurrentRole,
                     ) => {
                         // Return empty string stub for user functions
-                        Ok(ast::Expr::Literal(ast::Literal::String("''".into())))
+                        Ok(ast::Expr::Literal(sql_string("")))
                     }
                     // The bare keywords route through the frontend scalars so both
                     // syntaxes share one implementation and agree with pg_catalog.
@@ -3736,9 +3768,8 @@ impl PostgreSQLTranslator {
                 )),
                 pg_query::protobuf::a_const::Val::Sval(s) => {
                     // Turso's AST expects string literals to include surrounding single quotes
-                    // (sanitize_string strips them during bytecode emission)
-                    let quoted = format!("'{}'", s.sval.replace('\'', "''"));
-                    Ok(ast::Expr::Literal(ast::Literal::String(quoted)))
+                    // (sanitize_string strips them during bytecode emission): sql_string.
+                    Ok(ast::Expr::Literal(sql_string(&s.sval)))
                 }
                 pg_query::protobuf::a_const::Val::Fval(f) => Ok(ast::Expr::Literal(
                     ast::Literal::Numeric(decimal_numeric_literal(&f.fval)),
@@ -3879,14 +3910,16 @@ impl PostgreSQLTranslator {
                 let rhs_expr = self.translate_expr(pattern_node)?;
                 let regex_rhs = match rhs_expr {
                     ast::Expr::Literal(ast::Literal::String(ref pat)) => {
-                        // String literals in our AST include surrounding quotes
-                        let unquoted = pat
+                        // String literals in our AST hold their SQL text (sql_string): the
+                        // value is read back by undoing exactly that quoting, and the regex
+                        // quoted again by it (review wire-quote LOW-5: the doubled quotes were
+                        // kept adjacent by luck, never by the one quoting function).
+                        let value = pat
                             .strip_prefix('\'')
                             .and_then(|s| s.strip_suffix('\''))
-                            .unwrap_or(pat);
-                        let regex = similar_to_regex(unquoted);
-                        // Re-wrap with quotes for the AST
-                        ast::Expr::Literal(ast::Literal::String(format!("'{regex}'")))
+                            .unwrap_or(pat)
+                            .replace("''", "'");
+                        ast::Expr::Literal(sql_string(&similar_to_regex(&value)))
                     }
                     other => other,
                 };
@@ -5631,7 +5664,7 @@ fn translate_create_enum(
     //        ELSE RAISE(ABORT, 'invalid input value for enum <name>') END
     let in_list: Vec<Box<ast::Expr>> = labels
         .iter()
-        .map(|l| Box::new(ast::Expr::Literal(ast::Literal::String(format!("'{l}'")))))
+        .map(|l| Box::new(ast::Expr::Literal(sql_string(l))))
         .collect();
 
     let error_msg = format!("invalid input value for enum {type_name}");
@@ -5647,9 +5680,7 @@ fn translate_create_enum(
         )],
         else_expr: Some(Box::new(ast::Expr::Raise(
             ast::ResolveType::Abort,
-            Some(Box::new(ast::Expr::Literal(ast::Literal::String(format!(
-                "'{error_msg}'"
-            ))))),
+            Some(Box::new(ast::Expr::Literal(sql_string(&error_msg)))),
         ))),
     };
 
