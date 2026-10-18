@@ -13,7 +13,8 @@ where class is
           started with setsid keep their environment, so they stay inside);
   kernel  a kernel thread (no command line);
   foreign everything else, the sampler itself excluded.
-The first time a foreign pid is recorded, an `#owner` row names it: pid, uid, login and the uwrun run it belongs to.
+Each foreign pid recorded gets an `#owner` row AFTER the `#stop` row (inside the window only its uid is read, one
+stat; the owner is resolved at stop): pid, uid, login and the uwrun run it belongs to ("?" once it has exited).
 The login and run are written for this account's processes only (the run is the first component of its cwd under
 uwrun's run roots, see run_roots); any other uid gets "-" for both, so another user's login is never recorded. Owners only
 name busy-host evidence; they never change a verdict, and our own other runs are foreign like anyone's.
@@ -89,6 +90,19 @@ def owner_of(pid, roots=None):
     return uid, _login(uid), run
 
 
+def owners_at_stop(pid, uid, roots=None):
+    """the #owner fields of PID, resolved after the window (the lead's E4 order): owner_of while it still runs; once
+    it has exited, UID as recorded in the window, with this account's login and run "?" (its cwd is gone), or "-" for
+    any other uid. None when the uid was never read. Blind spot, stated: a pid the kernel reused by the stop for a
+    process of the same uid is resolved as that new process (its run may be wrong; its uid is right)."""
+    o = owner_of(pid, roots)
+    if o and (uid is None or o[0] == uid):
+        return o
+    if uid is None:
+        return None
+    return (uid, _login(uid), "?") if uid == os.getuid() else (uid, "-", "-")
+
+
 def read_procs(cell):
     """pid -> (comm, cpu_ticks, class). A process is sut when its environ carries FASTEST_CELL=<cell> OR any ancestor
     (by ppid, within this snapshot) is sut: a child of the system under test is the system under test, even when its
@@ -147,7 +161,7 @@ def sample(path, cell, interval, stop_file, max_s):
     t0 = time.monotonic()
     prev = read_procs(cell)
     prev_t = t0
-    owned = set()
+    owned = {}
     with open(path, "w") as f:
         f.write(f"#start\t{time.time():.3f}\tcell={cell}\tinterval={interval}\tload={os.getloadavg()}\n")
         while True:
@@ -164,19 +178,23 @@ def sample(path, cell, interval, stop_file, max_s):
                 pct = 100.0 * used / HZ / dt
                 sums[cls] += pct
                 if cls == "foreign" and pid not in owned:
-                    owned.add(pid)
-                    o = owner_of(pid)
-                    if o:
-                        f.write(f"#owner\t{pid}\t{o[0]}\t{o[1]}\t{o[2]}\n")
+                    # inside the window only the uid (one stat); the owner is resolved at stop (the lead's E4 order)
+                    try:
+                        owned[pid] = os.stat(f"/proc/{pid}").st_uid
+                    except OSError:
+                        owned[pid] = None
                 f.write(f"{now - t0:.3f}\t{pid}\t{comm}\t{pct:.1f}\t{cls}\n")
             f.write(f"#tick\t{now - t0:.3f}\t{sums['foreign']:.1f}\t{sums['kernel']:.1f}\t{sums['sut']:.1f}\n")
             f.flush()
             prev, prev_t = cur, now
-            if stop_file and os.path.exists(stop_file):
-                f.write(f"#stop\t{now - t0:.3f}\tstop-file\tload={os.getloadavg()}\n")
-                return 0
-            if max_s and now - t0 >= max_s:
-                f.write(f"#stop\t{now - t0:.3f}\tmax-s\tload={os.getloadavg()}\n")
+            why = "stop-file" if stop_file and os.path.exists(stop_file) else "max-s" if max_s and now - t0 >= max_s else None
+            if why:
+                f.write(f"#stop\t{now - t0:.3f}\t{why}\tload={os.getloadavg()}\n")
+                f.flush()
+                for opid, ouid in owned.items():
+                    o = owners_at_stop(opid, ouid)
+                    if o:
+                        f.write(f"#owner\t{opid}\t{o[0]}\t{o[1]}\t{o[2]}\n")
                 return 0
 
 
@@ -231,6 +249,8 @@ def busy_evidence(path, exclude=(), interval_default=1.0):
         uid, user, run = owners[pid]
         if uid != os.getuid():
             return f"{e} (another user, uid {uid})"
+        if run == "?":
+            return f"{e} (user {user}, run unknown: it exited before the stop)"
         return f"{e} (user {user}, our run {run})" if run != "-" else f"{e} (user {user})"
     return [who(e) for e in out]
 
@@ -604,6 +624,13 @@ def self_test():
          os.getuid() == 0 or (got_pid1 is not None and got_pid1[0] != me_uid and got_pid1[1:] == ("-", "-"))),
         ("owner: sample() writes an #owner row for a foreign pid it records, with our user",
          len(burn_owner) == 1 and burn_owner[0][3] == me_user),
+        # the lead's E4 order: owners are resolved at STOP, never inside the timed window (the per-pid lookups cost the
+        # sampler 2-6x CPU there, measured by linux-uw4): every #owner row follows the #stop row
+        ("uw4 E4: every #owner row is written after the #stop row (no owner lookup inside the window)",
+         bool(burn_owner) and min(i for i, r in enumerate(srows) if r[0] == "#owner")
+         > max(i for i, r in enumerate(srows) if r[0] == "#stop")),
+        ("uw4 E4: a process of ours that exited before the stop keeps its uid and login, its run unknown (?)",
+         len(burn_owner) == 1 and burn_owner[0][2] == str(me_uid) and burn_owner[0][4] == "?"),
     ]
     for label, ok in synthetic_evid:
         bad += not ok

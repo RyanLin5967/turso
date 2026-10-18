@@ -74,7 +74,7 @@ linux_check() { if [ "$(uname -s)" = Linux ]; then check "$@"; else na=$((na + 1
 # the case, which then fails, so it is never mistaken for a no-root host
 root_check() { if [ "$(uname -s)" != Linux ]; then linux_check "$@"; return; fi
                case $(sudo_state) in
-                 password) na=$((na + 1)); echo "T3LIB self-test N/A-on-noroot: $1" ;;
+                 password|denied) na=$((na + 1)); echo "T3LIB self-test N/A-on-noroot: $1" ;;
                  *) check "$@" ;;
                esac; }
 mkdir -p "$T/dev"; : > "$T/dev/nvme1n1"; : > "$T/dev/nvme2n1"
@@ -513,6 +513,17 @@ check "uw2 LOW 7: sudo_state reads a localised sudo (de_DE) as 'password', askin
   '[ "$(LANG=de_DE.UTF-8 LC_ALL=de_DE.UTF-8 T3_SUDO_BIN=$T/sudo/de sudo_state)" = password ]'
 check "LOW 6: sudo_state: any other sudo failure is an error, named" \
   'case "$(T3_SUDO_BIN=$T/sudo/err sudo_state)" in error:*resolve*) true ;; *) false ;; esac'
+# found on ecetesla3 (linux-u4-green-ecetesla3, 2026-10-18): a sudo that REFUSES this user (not in sudoers; that host
+# printed a sudoers parse error and "I'm sorry r226lin. I'm afraid I can't do that") is no root, like one that wants a
+# password: 'denied', N/A-on-noroot, not an error FAIL. The text below is that host's, verbatim
+printf '#!/bin/sh\necho "/etc/sudoers:42:9: expected host name" >&2\necho "sudo: I'"'"'m sorry r226lin. I'"'"'m afraid I can'"'"'t do that" >&2\nexit 1\n' > "$T/sudo/denied"
+printf '#!/bin/sh\necho "r226lin is not in the sudoers file.  This incident will be reported." >&2\nexit 1\n' > "$T/sudo/notin"
+chmod +x "$T/sudo/denied" "$T/sudo/notin"
+check "u4 host: sudo_state reads a sudo that refuses this user (ecetesla3's text) as 'denied'" \
+  '[ "$(T3_SUDO_BIN=$T/sudo/denied sudo_state)" = denied ]'
+check "u4 host: sudo_state reads 'not in the sudoers file' as 'denied'" '[ "$(T3_SUDO_BIN=$T/sudo/notin sudo_state)" = denied ]'
+check "u4 host: root_check counts a root case N/A-on-noroot under a denying sudo, and runs nothing" \
+  '( T3_SUDO_BIN=$T/sudo/denied; na=0; root_check "probe" "touch $T/sudo/ran" > "$T/sudo/rc.out"; [ $na = 1 ] && [ ! -e "$T/sudo/ran" ] && grep -q "N/A-on-noroot: probe" "$T/sudo/rc.out" )'
 
 echo "TALLY ran=$((pass + fail)) pass=$pass na=${na:-0} fail=$fail"  # gates/tally.py
 echo "T3LIB SELF-TEST $pass/$((pass + fail)) $([ $fail = 0 ] && echo PASS || echo FAIL)$([ $na = 0 ] || echo " ($na N/A: off Linux or without root)")"
