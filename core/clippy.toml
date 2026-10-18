@@ -27,4 +27,5 @@ disallowed-methods = [
     { path = "turso_core::connection::Connection::execute_with", reason = "engine code builds its own SQLite text: use prepare_engine/execute_engine (dialect design REVISION 2)" },
     { path = "turso_core::connection::SqlKind::client", reason = "engine code builds its own SQLite text: use prepare_engine/execute_engine (dialect design REVISION 2)" },
     { path = "turso_core::connection::SqlKind::frontend", reason = "engine code builds its own SQLite text: use prepare_engine/execute_engine (dialect design REVISION 2)" },
+    { path = "turso_core::connection::Connection::prepare_translated_cmd_with_kind", reason = "engine code builds its own SQLite text: use prepare_engine/execute_engine (dialect design REVISION 2)" },
 ]

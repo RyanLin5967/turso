@@ -995,6 +995,13 @@ mod tests {
         check("prepare_with(frontend)", c.prepare_with("SELECT 1", SqlKind::frontend(), Origin::Nested).map(|s| source(&s)), SqlSource::Frontend);
         check("consume_stmt", c.consume_stmt("SELECT 1").map(|o| source(&o.expect("a statement").0)), SqlSource::Client);
         check("query", c.query("SELECT 1").map(|o| source(&o.expect("a statement"))), SqlSource::Client);
+        let translated = crate::dialect::sqlite::parse("SELECT 1").unwrap().0.unwrap();
+        check(
+            "prepare_translated_cmd_with_kind(frontend)",
+            c.prepare_translated_cmd_with_kind(translated, "SELECT 1", crate::PrepareOptions::default(), SqlKind::frontend(), Origin::Root)
+                .map(|s| source(&s)),
+            SqlSource::Frontend,
+        );
         assert!(wrong.is_empty(), "CLAIM: an entry's statement does not carry its text's kind: {wrong:#?}");
     }
 

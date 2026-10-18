@@ -1370,7 +1370,25 @@ impl Connection {
         input: &str,
         prepare_options: PrepareOptions,
     ) -> Result<Statement> {
-        self.prepare_cmd_with_input_and_origin(cmd, input, StatementOrigin::Root, prepare_options)
+        self.prepare_cmd_with_input_and_origin(cmd, input, StatementOrigin::Root, prepare_options, SqlKind::client())
+    }
+
+    /// An already-translated command whose `input` text is of `kind` (dialect design REVISION 2 item 5):
+    /// a frontend that translates its client's text to an AST and keeps canonical SQLite as the input (a
+    /// prereq: `prereq.to_string()`) passes `SqlKind::frontend()`, so a re-prepare parses that text as
+    /// SQLite, and it cannot create a table. A replay kind is refused here.
+    #[doc(hidden)]
+    #[allow(clippy::disallowed_methods, reason = "an entry point: it delegates to the shared preparation with the kind it states (dialect design R1)")]
+    pub fn prepare_translated_cmd_with_kind(
+        self: &Arc<Connection>,
+        cmd: ast::Cmd,
+        input: &str,
+        prepare_options: PrepareOptions,
+        kind: SqlKind,
+        origin: Origin,
+    ) -> Result<Statement> {
+        refuse_foreign_replay(&kind)?;
+        self.prepare_cmd_with_input_and_origin(cmd, input, origin.into(), prepare_options, kind)
     }
 
     #[turso_macros::trace_stack]
@@ -1381,6 +1399,7 @@ impl Connection {
         input: &str,
         origin: StatementOrigin,
         prepare_options: PrepareOptions,
+        kind: SqlKind,
     ) -> Result<Statement> {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
@@ -1390,7 +1409,6 @@ impl Connection {
             self.start_nested();
         }
         let result = (|| {
-            let kind = SqlKind::client();
             let (program, pager, mode) = self.compile_cmd(cmd, input, &prepare_options, &kind)?;
             // Kept with the statement: a re-prepare translates under them (wire-rework B-H2).
             Ok(Statement::new_with_origin(
