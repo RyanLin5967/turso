@@ -15216,6 +15216,32 @@ fn an_exact_numeric_column_and_the_sequence_functions_carry_postgresqls_types() 
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// Found by the E5' differential on iccad11 at fc85e82fc (uwrun wire-e5l5-fc85e82fc; PG 18.6 in its
+/// pg.jsonl): pg_database_size('microbench') answered this database's size for a name that is no
+/// database here; PostgreSQL answers 3D000 'database "microbench" does not exist' (one mismatch in
+/// each of the 14 BranchBench micro runs). The database pg_database lists still answers its size.
+#[test]
+fn pg_database_size_of_a_database_that_does_not_exist_is_3d000() {
+    let dir = Scratch::new("dbsize");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    match a.q("SELECT pg_database_size('microbench')").error {
+        Some(e) if e.code == "3D000" && e.message == "database \"microbench\" does not exist" => {}
+        other => wrong.push(format!("pg_database_size('microbench'): want 3D000, got {other:?}")),
+    }
+    for sql in [
+        "SELECT pg_database_size(current_database()) > 0",
+        "SELECT pg_database_size(datname) > 0 FROM pg_database",
+    ] {
+        let r = a.q(sql);
+        if r.error.is_some() || r.rows != vec![vec![Some("t".to_string())]] {
+            wrong.push(format!("{sql}: {:?} {:?}", r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-uw2 N5: a schema-qualified type was refused 42704 'type "public m" does not exist',
 /// its parts joined with a blank, so a pg_dump restore, which writes public.<type> for every enum
 /// and domain column, failed at its first such table. PostgreSQL 18.6 takes public.m and
