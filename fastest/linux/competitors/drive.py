@@ -533,16 +533,41 @@ def selftest():
         print(("PASS" if got == want else "FAIL"), f"barrier_off({opts!r}) = {got}")
         bad += got != want
         n += 1
-    # comp review 1 LOW 35: a REAL run (FT_DRY=0) refuses a volatile RAM disk and any loop device in the chain
+    # comp review 1 LOW 35: a REAL run (FT_DRY=0) refuses a volatile RAM disk and any loop device in the chain.
+    # comp-rev-89ec-b3c3 MED 4: and it is an ALLOWLIST: a known drive_class, flush_reaches_drive "yes" or
+    # "n/a: write-through", and drive_class, flush_reaches_drive and chain all present; a flush that reaches nothing
+    # ("no": barriers off or a write-through layer), "unknown" and a record missing a key are refused. (The allowed
+    # records carry the flush key every resolve() record has; before MED 4 the fixtures left it out.)
     rp = globals().get("real_problem")
+    dd = {"drive_class": "write-back+fua", "chain": ["nvme1n1"], "flush_reaches_drive": "yes"}
     for name, rec, want_ok in (
-            ("a data disk", {"drive_class": "write-back+fua", "chain": ["nvme1n1"]}, True),
-            ("a RAM disk", {"drive_class": "ram-volatile", "chain": ["ram0"]}, False),
-            ("a loop device in the chain", {"drive_class": "write-through", "chain": ["loop0", "/x.img", "sda1", "sda"]},
+            ("a data disk", dd, True),
+            ("a RAM disk", {"drive_class": "ram-volatile", "chain": ["ram0"], "flush_reaches_drive": "n/a: volatile RAM"},
              False),
-            ("a partition of a data disk", {"drive_class": "write-back+fua", "chain": ["nvme1n1p1", "nvme1n1"]}, True)):
+            ("a loop device in the chain", {"drive_class": "write-through", "chain": ["loop0", "/x.img", "sda1", "sda"],
+                                            "flush_reaches_drive": "n/a: write-through"}, False),
+            ("a partition of a data disk", dict(dd, chain=["nvme1n1p1", "nvme1n1"]), True),
+            ("a write-through data disk", dict(dd, drive_class="write-through", flush_reaches_drive="n/a: write-through"),
+             True),
+            ("a write-back disk without FUA whose flush reaches it", dict(dd, drive_class="write-back-no-fua"), True),
+            ("a data disk mounted nobarrier (flush 'no')", dict(dd, flush_reaches_drive="no"), False),
+            ("a data disk whose own cache report was unread (flush 'unknown')", dict(dd, flush_reaches_drive="unknown"),
+             False),
+            ("a record with no flush_reaches_drive", {"drive_class": "write-back+fua", "chain": ["nvme1n1"]}, False),
+            ("a record with no drive_class", {"chain": ["nvme1n1"], "flush_reaches_drive": "yes"}, False),
+            ("a record with no chain", {"drive_class": "write-back+fua", "flush_reaches_drive": "yes"}, False),
+            ("an unknown drive_class", dict(dd, drive_class="write-back"), False),
+            ("an unknown flush value", dict(dd, flush_reaches_drive="probably"), False)):
         why = rp(rec) if rp else "no real_problem() in drive.py"
-        ok_ = (why is None) == want_ok
+        # a refusal must be for its own reason
+        reason = {"a RAM disk": "ram-volatile", "a loop device in the chain": "loop device",
+                  "a data disk mounted nobarrier (flush 'no')": "flush_reaches_drive 'no'",
+                  "a data disk whose own cache report was unread (flush 'unknown')": "flush_reaches_drive 'unknown'",
+                  "a record with no flush_reaches_drive": "no flush_reaches_drive",
+                  "a record with no drive_class": "no drive_class", "a record with no chain": "no chain",
+                  "an unknown drive_class": "drive_class 'write-back'",
+                  "an unknown flush value": "flush_reaches_drive 'probably'"}.get(name, "")
+        ok_ = (why is None) == want_ok and (want_ok or reason in why)
         print(("PASS" if ok_ else "FAIL"), f"real run on {name} -> {why or 'allowed'}")
         bad += not ok_
         n += 1
