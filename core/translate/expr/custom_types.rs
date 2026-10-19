@@ -3368,4 +3368,28 @@ mod tests {
         }
         assert!(bad.is_empty(), "CLAIM: a domain over numeric answered by its index unlike a scan: {bad:#?}");
     }
+
+    /// Fresh-context review of this lane's fixes (item 5): a materialized subquery's typed numeric
+    /// column compares through numeric's '=' in a scan (c8c6dd210), but a probe of the
+    /// subquery through an ephemeral index on it compares the key plainly with the column's
+    /// decoded text, so the answer could depend on the plan: `s = 2` against '2.00'. Expected
+    /// values are PostgreSQL 18.6's numeric comparison for this exact SQL (UW run
+    /// typesrev2bd-oracle5; artie raw frontier/fastest/lanes/engine/raw/pg18-types-rev2bd-4.txt
+    /// e0503a1e62), never ours. The join probes the CTE once per row of n.
+    #[test]
+    fn a_materialized_numeric_column_answers_by_a_probe_as_by_a_scan() {
+        let conn = open();
+        conn.execute("CREATE TABLE n(id INTEGER PRIMARY KEY, b numeric(8, 2)) STRICT").unwrap();
+        conn.execute("INSERT INTO n VALUES (1, 1.00), (2, 2.00), (3, NULL), (4, 10.00)").unwrap();
+        let bad = diverging(
+            &conn,
+            &[
+                ("WITH q AS MATERIALIZED (SELECT b AS s FROM n) SELECT count(*) FROM q WHERE s = 2", "1"),
+                ("WITH q AS MATERIALIZED (SELECT b AS s FROM n) SELECT count(*) FROM n JOIN q ON q.s = 2", "4"),
+                ("WITH q AS MATERIALIZED (SELECT b AS s FROM n) SELECT count(*) FROM n JOIN q ON q.s > 1.5", "8"),
+            ],
+            "PostgreSQL 18",
+        );
+        assert!(bad.is_empty(), "CLAIM: a materialized numeric column answered by a probe unlike a scan: {bad:#?}");
+    }
 }
