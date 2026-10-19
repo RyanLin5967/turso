@@ -125,13 +125,13 @@ def main():
     # The zero-create controls read 0 file writes and 0 flushes on the creating thread (amendment 2,
     # Fire-checks), unmutated, on BOTH binaries, every control by its arm and run (engine-rev-l2b
     # MED: the markers carried no run, so only the last control was checked, on one binary). A
-    # binary that ran an arm and traced none of its controls refuses.
+    # binary that read a run and traced no control for that run refuses.
     for label, rr, cc in (("fire-check", base_r, base_c), ("reading", read_r, read_c)):
-        arms_read = {k[0] for k, v in rr.items() if not k[0].startswith("control_") and "void" not in v}
-        for arm in arms_read:
-            if not any(k[0] == f"control_{arm}" for k in cc):
-                print(f"CONTROL {label} {arm}: no control window traced")
-                failed.append(f"control {label} {arm} untraced")
+        # Per run (engine-rev-l2b LOW): every non-void reading's own control, at the same run.
+        for arm, run_no in sorted(k for k, v in rr.items() if not k[0].startswith("control_") and "void" not in v):
+            if (f"control_{arm}", run_no) not in cc:
+                print(f"CONTROL {label} {arm} run={run_no}: no control window traced")
+                failed.append(f"control {label} {arm} run={run_no} untraced")
         for key, c in cc.items():
             if key[0].startswith("control_") and (c.get("writes", 0) or c.get("flushes", 0)):
                 print(f"CONTROL {label} {key}: {c.get('writes', 0)} writes, {c.get('flushes', 0)} flushes (must be 0)")
