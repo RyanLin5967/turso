@@ -1,0 +1,50 @@
+>> Q CREATE TABLE vc2(id int PRIMARY KEY, v varchar(10))
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO vc2 VALUES (1, 'abc'), (2, 'de')
+   C INSERT 0 2
+   Z I
+>> Q ALTER TABLE vc2 ALTER COLUMN v TYPE varchar(2)
+   E S=ERROR C=22001 M=value too long for type character varying(2)
+   Z I
+>> Q SELECT id, v FROM vc2 ORDER BY id
+   T oids=[23, 1043]
+   D ['1', 'abc']
+   D ['2', 'de']
+   C SELECT 2
+   Z I
+>> Q ALTER TABLE vc2 ALTER COLUMN v TYPE varchar(5)
+   C ALTER TABLE
+   Z I
+>> Q SELECT id, v FROM vc2 ORDER BY id
+   T oids=[23, 1043]
+   D ['1', 'abc']
+   D ['2', 'de']
+   C SELECT 2
+   Z I
+>> Q INSERT INTO vc2 VALUES (3, 'abcde')
+   C INSERT 0 1
+   Z I
+>> Q ALTER TABLE vc2 ADD COLUMN w varchar(2) DEFAULT 'abc'
+   E S=ERROR C=22001 M=value too long for type character varying(2)
+   Z I
+>> Q ALTER TABLE vc2 ADD COLUMN w varchar(3) DEFAULT 'abc'
+   C ALTER TABLE
+   Z I
+>> Q SELECT id, v, w FROM vc2 ORDER BY id
+   T oids=[23, 1043, 1043]
+   D ['1', 'abc', 'abc']
+   D ['2', 'de', 'abc']
+   D ['3', 'abcde', 'abc']
+   C SELECT 3
+   Z I
+>> Q ALTER TABLE vc2 ALTER COLUMN id TYPE bigint
+   C ALTER TABLE
+   Z I
+>> Q SELECT id, v FROM vc2 ORDER BY id
+   T oids=[20, 1043]
+   D ['1', 'abc']
+   D ['2', 'de']
+   D ['3', 'abcde']
+   C SELECT 3
+   Z I

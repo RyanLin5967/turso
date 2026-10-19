@@ -12367,6 +12367,13 @@ replays_postgresql!(
     "pg18-wirefuzz-arithmetic_result_columns_are_typed_by_postgresqls_operators.out",
     []
 );
+// wire-rev-629f4b926 HIGH-2: ALTER COLUMN TYPE and ADD COLUMN ... DEFAULT are write paths: each row (the default) is
+// coerced to the new type, a value too long refuses the ALTER (22001), and the column stays readable either way.
+replays_postgresql!(
+    pg18_wirefuzz_alter_column_type_and_add_column_default_coerce_every_row_replays_as_postgresql_answered,
+    "pg18-wirefuzz-alter_column_type_and_add_column_default_coerce_every_row.out",
+    []
+);
 replays_postgresql!(
     pg18_wirefuzz_the_connected_database_is_current_database_and_in_pg_database_replays_as_postgresql_answered,
     "pg18-wirefuzz-the_connected_database_is_current_database_and_in_pg_database.out",
