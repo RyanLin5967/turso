@@ -1,0 +1,42 @@
+>> Q CREATE TABLE m(id int PRIMARY KEY, r real, i int, s smallint, b bigint, n numeric(8,2), f float8, d date, ts timestamp, tz timestamptz, t text, bo boolean)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO m VALUES (1, 1.5, 2, 3, 4, 5.25, 6.5, '2026-10-19', '2026-10-19 10:00:00', '2026-10-19 10:00:00+00:00', 'x', true)
+   C INSERT 0 1
+   Z I
+>> Q SELECT r * 2, n + r, r * i, r + r, r * f FROM m
+   T oids=[701, 701, 701, 700, 701]
+   D ['3', '6.75', '3', '3', '9.75']
+   C SELECT 1
+   Z I
+>> Q SELECT s + s, s + i, i + b, b * n, n * f, i / 2 FROM m
+   T oids=[21, 23, 20, 1700, 701, 23]
+   D ['6', '5', '6', '21.00', '34.125', '1']
+   C SELECT 1
+   Z I
+>> Q SELECT d - d, 1 + d, d + 1, d - 1 FROM m
+   T oids=[23, 1082, 1082, 1082]
+   D ['0', '2026-10-20', '2026-10-20', '2026-10-18']
+   C SELECT 1
+   Z I
+>> Q SELECT ts - ts, tz - tz FROM m
+   T oids=[1186, 1186]
+   D ['00:00:00', '00:00:00']
+   C SELECT 1
+   Z I
+>> Q SELECT '5' + i, i + '5' FROM m
+   T oids=[23, 23]
+   D ['7', '7']
+   C SELECT 1
+   Z I
+>> Q SELECT t + 1 FROM m
+   E S=ERROR C=42883 M=operator does not exist: text + integer
+   Z I
+>> Q SELECT bo + 1 FROM m
+   E S=ERROR C=42883 M=operator does not exist: boolean + integer
+   Z I
+>> Q SELECT i % 2, b % 3 FROM m
+   T oids=[23, 20]
+   D ['0', '1']
+   C SELECT 1
+   Z I

@@ -1677,7 +1677,7 @@ fn prepare_statement_parsed(
                 &pg_conn.view_cache,
                 &attached,
             )
-            .map_err(LimboError::ParseError)?;
+            .map_err(LimboError::InvalidArgument)?;
             types.params = walked.params;
             types.untyped = walked.untyped;
             types.assignments = walked.assignments;

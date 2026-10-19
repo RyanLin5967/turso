@@ -973,22 +973,76 @@ fn takes_text(name: &str) -> bool {
     )
 }
 
-/// The wider of two numeric types (PostgreSQL's arithmetic promotes int to numeric to float8);
-/// otherwise the first.
-fn wider(a: u32, b: u32) -> u32 {
-    let rank = |t: u32| match t {
-        INT2 => 1,
-        INT4 => 2,
-        INT8 => 3,
-        NUMERIC => 4,
-        FLOAT4 => 5,
-        FLOAT8 => 6,
-        _ => 0,
-    };
-    if rank(a) > 0 && rank(b) > rank(a) {
-        b
-    } else {
-        a
+/// What an arithmetic operator over two typed operands gives ([`arithmetic`]).
+enum Arithmetic {
+    /// PostgreSQL's result type.
+    Type(u32),
+    /// A combination this table does not model: left to the engine's type.
+    Unknown,
+    /// No such operator in PostgreSQL (42883): a character or boolean operand.
+    NoOperator,
+}
+
+/// The result type PostgreSQL 18 resolves `a op b` to, for op one of + - * / % (operator
+/// resolution over pg_operator, recorded: pg18-wirefuzz-arithmetic_result_columns_are_typed_by_
+/// postgresqls_operators.out; wire-rev-2a68496d0 M1, where the old wider() typed real * int float4,
+/// date - date date and timestamp - timestamp timestamp). Numbers: two integers the wider integer,
+/// any numeric numeric, float4 with float4 float4, any other float float8. Dates and times: date -
+/// date int4, date +/- an integer date, an integer + date date, timestamp(tz) - timestamp(tz)
+/// interval. A character or boolean operand has no arithmetic operator.
+fn arithmetic(op: &str, a: u32, b: u32) -> Arithmetic {
+    const DATE: u32 = 1082;
+    const TIMESTAMP: u32 = 1114;
+    const TIMESTAMPTZ: u32 = 1184;
+    const INTERVAL: u32 = 1186;
+    let int = |t: u32| matches!(t, INT2 | INT4 | INT8);
+    let num = |t: u32| int(t) || matches!(t, NUMERIC | FLOAT4 | FLOAT8);
+    let chars = |t: u32| matches!(t, TEXT | VARCHAR | BOOL | 1042);
+    if !matches!(op, "+" | "-" | "*" | "/" | "%") {
+        return Arithmetic::Unknown;
+    }
+    if chars(a) || chars(b) {
+        return Arithmetic::NoOperator;
+    }
+    if num(a) && num(b) {
+        let rank = |t: u32| match t {
+            INT2 => 1,
+            INT4 => 2,
+            _ => 3,
+        };
+        return Arithmetic::Type(if int(a) && int(b) {
+            if rank(a) >= rank(b) { a } else { b }
+        } else if a == FLOAT4 && b == FLOAT4 {
+            FLOAT4
+        } else if matches!(a, FLOAT4 | FLOAT8) || matches!(b, FLOAT4 | FLOAT8) {
+            FLOAT8
+        } else {
+            NUMERIC
+        });
+    }
+    match (a, op, b) {
+        (DATE, "-", DATE) => Arithmetic::Type(INT4),
+        (DATE, "+" | "-", t) | (t, "+", DATE) if int(t) => Arithmetic::Type(DATE),
+        (TIMESTAMP | TIMESTAMPTZ, "-", TIMESTAMP | TIMESTAMPTZ) => Arithmetic::Type(INTERVAL),
+        _ => Arithmetic::Unknown,
+    }
+}
+
+/// A type's name as PostgreSQL writes it in "operator does not exist: a op b".
+fn type_name(t: u32) -> &'static str {
+    match t {
+        INT2 => "smallint",
+        INT4 => "integer",
+        INT8 => "bigint",
+        NUMERIC => "numeric",
+        FLOAT4 => "real",
+        FLOAT8 => "double precision",
+        TEXT => "text",
+        VARCHAR => "character varying",
+        BOOL => "boolean",
+        1042 => "character",
+        1082 => "date",
+        _ => "unknown",
     }
 }
 
@@ -2143,8 +2197,18 @@ impl Infer<'_> {
                 if op == Some("||") {
                     return Some(TEXT);
                 }
+                // An untyped string literal takes the other operand's type, as PostgreSQL resolves
+                // an unknown ('5' + i is int4; wire-rev-2a68496d0 M1: it was text).
+                let untyped = |x: Option<&PgNode>| {
+                    matches!(x.and_then(|x| x.node.as_ref()), Some(Node::AConst(c)) if matches!(c.val, Some(Val::Sval(_))))
+                };
                 let l = e.lexpr.as_deref().and_then(|l| self.type_of(l, scope));
                 let r = e.rexpr.as_deref().and_then(|r| self.type_of(r, scope));
+                let (l, r) = match (l, r) {
+                    (Some(_), Some(b)) if untyped(e.lexpr.as_deref()) && !untyped(e.rexpr.as_deref()) => (Some(b), Some(b)),
+                    (Some(a), Some(_)) if untyped(e.rexpr.as_deref()) && !untyped(e.lexpr.as_deref()) => (Some(a), Some(a)),
+                    other => other,
+                };
                 // A side with no type types the expression only when it is a parameter, which
                 // takes the other side's type (`$1 + 1`); any other untyped operand (a function the
                 // walk does not know) leaves the expression untyped, so a parameter compared with
@@ -2154,7 +2218,19 @@ impl Infer<'_> {
                     matches!(x.and_then(|x| x.node.as_ref()), Some(Node::ParamRef(_)))
                 };
                 match (l, r) {
-                    (Some(a), Some(b)) => Some(wider(a, b)),
+                    (Some(a), Some(b)) => match arithmetic(op.unwrap_or(""), a, b) {
+                        Arithmetic::Type(t) => Some(t),
+                        Arithmetic::Unknown => None,
+                        Arithmetic::NoOperator => {
+                            self.first_refusal.borrow_mut().get_or_insert_with(|| {
+                                Some(SqlErrorMessage::classified(
+                                    SqlErrorKind::UndefinedFunction,
+                                    format!("operator does not exist: {} {} {}", type_name(a), op.unwrap_or(""), type_name(b)),
+                                ))
+                            });
+                            None
+                        }
+                    },
                     (Some(a), None) if param(e.rexpr.as_deref()) => Some(a),
                     (None, Some(b)) if param(e.lexpr.as_deref()) => Some(b),
                     // A unary operator (`-x`) has no left side.

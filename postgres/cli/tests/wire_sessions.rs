@@ -12365,7 +12365,15 @@ replays_postgresql!(
 replays_postgresql!(
     pg18_wirefuzz_arithmetic_result_columns_are_typed_by_postgresqls_operators_replays_as_postgresql_answered,
     "pg18-wirefuzz-arithmetic_result_columns_are_typed_by_postgresqls_operators.out",
-    []
+    [
+        (2, "PGDIV-TIMESTAMPTZ-SHORT-OFFSET error-code [engine]: a timestamptz literal with a two-digit offset ('+00') is refused XX000 'invalid timestamp value' (core's timestamptz ENCODE checks datetime(value), which takes only '+00:00') where PG stores it"),
+        (3, "PGDIV-TIMESTAMPTZ-SHORT-OFFSET value [engine]: a cascade of #2, the table is empty here; the column types agree (the rows are compared in pg18-wirefuzz-arithmetic_over_rows_answers_as_postgresql_does.out)"),
+        (4, "PGDIV-TIMESTAMPTZ-SHORT-OFFSET value [engine]: a cascade of #2, the table is empty here; the column types agree (the rows are compared in pg18-wirefuzz-arithmetic_over_rows_answers_as_postgresql_does.out)"),
+        (5, "PGDIV-TIMESTAMPTZ-SHORT-OFFSET value [engine]: a cascade of #2, the table is empty here; the column types agree (the rows are compared in pg18-wirefuzz-arithmetic_over_rows_answers_as_postgresql_does.out)"),
+        (6, "PGDIV-TIMESTAMPTZ-SHORT-OFFSET value [engine]: a cascade of #2, the table is empty here; the column types agree (the rows are compared in pg18-wirefuzz-arithmetic_over_rows_answers_as_postgresql_does.out)"),
+        (7, "PGDIV-TIMESTAMPTZ-SHORT-OFFSET value [engine]: a cascade of #2, the table is empty here; the column types agree (the rows are compared in pg18-wirefuzz-arithmetic_over_rows_answers_as_postgresql_does.out)"),
+        (10, "PGDIV-TIMESTAMPTZ-SHORT-OFFSET value [engine]: a cascade of #2, the table is empty here; the column types agree (the rows are compared in pg18-wirefuzz-arithmetic_over_rows_answers_as_postgresql_does.out)"),
+    ]
 );
 // wire-rev-629f4b926 HIGH-2: ALTER COLUMN TYPE and ADD COLUMN ... DEFAULT are write paths: each row (the default) is
 // coerced to the new type, a value too long refuses the ALTER (22001), and the column stays readable either way.
@@ -12378,6 +12386,17 @@ replays_postgresql!(
         (8, "PGDIV-VARCHAR-OVERFLOW-CODE error-code [engine]: the value too long is refused, as in PG, with XX000 'value too long for varchar' (core's varchar ENCODE, a RAISE with no kind) where PG answers 22001 (engine 58045fb81 + the wire's sqlstate arm, at integration)"),
         (11, "PGDIV-ALTER-COLUMN-SAME-NAME value [engine]: the engine's ALTER COLUMN refuses a new definition that keeps the column's name (core alter.rs: 'duplicate column name' for the column itself), so a type change that fits is 42601 where PG answers ALTER TABLE (a PRIMARY KEY column is also refused there)"),
         (12, "PGDIV-ALTER-COLUMN-SAME-NAME value [engine]: a cascade of #11: id stays int4 (23) where PG made it bigint (20); the rows agree"),
+    ]
+);
+// The M1 scenario again with a timestamptz literal the engine reads ('+00:00'), so the arithmetic's rows are compared
+// too (the first recording's '+00' is refused by the engine, which empties the table there).
+replays_postgresql!(
+    pg18_wirefuzz_arithmetic_over_rows_answers_as_postgresql_does_replays_as_postgresql_answered,
+    "pg18-wirefuzz-arithmetic_over_rows_answers_as_postgresql_does.out",
+    [
+        (4, "PGDIV-NUMERIC-ARITH-SCALE value [engine]: bigint * numeric(8,2) answers 21 where PG answers 21.00 (the engine's numeric product drops the scale of its operand)"),
+        (5, "PGDIV-DATE-ARITHMETIC value [wire]: SILENT: 1 + date, date + 1 and date - 1 answer 2027, 2027 and 2025 (the date's text read as a number) where PG answers 2026-10-20, 2026-10-20, 2026-10-18; date - date agrees (0). The translation must add days to a date (typed by the walk)"),
+        (6, "PGDIV-INTERVAL-TEXT value [engine]: timestamp - timestamp and timestamptz - timestamptz answer 0 where PG answers the interval 00:00:00 (typed interval, 1186, on both sides)"),
     ]
 );
 replays_postgresql!(
