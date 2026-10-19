@@ -3188,10 +3188,13 @@ const FLIGHT_END: u64 = 8 + 1 + 4 + 4;
 /// thread; a declared spinner making none, and a thread the window spawned, do not make it foreign
 /// (the window keeps exactly its own 7, and the spawn's 5); a hold during which another thread
 /// ran is unattributable, never counted as held. Forced both ways, in the instruments' child.
-/// Apple only (budgets-port-adversary LOW-1): it claims syscall COUNTS, which only Apple's kernel gives
-/// (Linux has none, so every count is None there and the claim cannot hold); the syscall budgets are
-/// Mac-owed, and the Linux thread rule is claimed by the counters test instead.
-#[cfg(target_vendor = "apple")]
+/// budgets-rev-39bb7fd43 LOW-2 (FLAGGED, restoring Linux coverage that a804c91c5 dropped): the THREAD-RULE half
+/// runs wherever the thread table is read (Apple and Linux); the syscall-COUNT half is Apple only (Linux has no
+/// kernel count, so every count is None there; the syscall budgets are Mac-owed). On Linux the hold claims are
+/// vacuous (with no count every hold is unattributed) and are not asserted. fc_spawned_outlives may read
+/// ThreadGone instead of ThreadNew on Linux (budgets-port-adversary saw 2 once, a race between the two);
+/// either is a refusal, so it is asserted refused for one of them there.
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
 #[test]
 fn the_budget_syscall_counts_are_attributed_by_thread() {
     if in_child() {
@@ -3199,47 +3202,62 @@ fn the_budget_syscall_counts_are_attributed_by_thread() {
     }
     let c = cell("instruments");
     let row = |op: &str| c.ops.get(op).and_then(|s| s.first()).unwrap_or_else(|| panic!("{op}: no sample")).clone();
-    // Two modes: the per-thread counter (`feshim`) loaded, which attributes a window another thread
-    // ran in exactly (here the window's own 0, the helper's 10 excluded), or not, which refuses it.
-    let shim = row("fc_shim_loaded")["loaded"] == 1;
+    let reason = |op: &str| row(op)["refusal"];
+    // The thread rule, both platforms.
     let foreign = row("fc_foreign_window");
     assert!(foreign["foreign_threads"] >= 1, "premise: the helper thread did not run inside the window: {foreign:?}");
-    // FLAGGED, lead-ordered (probe-adversary item 3, DECISIONS newest): a foreign thread with
-    // syscalls REFUSES the window in both modes. The shim used to exclude its calls (Some(0)).
-    assert!(foreign.get("syscalls").is_none(), "CLAIM: a window another thread made syscalls in kept a syscall count (counter loaded: {shim}): {foreign:?}");
-    assert_eq!(foreign["shim_loaded"], u64::from(shim), "CLAIM: the sample does not record the probe's mode: {foreign:?}");
-    let quiet = row("fc_shim_quiet_foreign");
-    assert!(quiet["foreign_threads"] >= 1, "premise: the spinning helper did not run inside the window: {quiet:?}");
-    if shim {
-        assert_eq!(quiet.get("syscalls").copied(), Some(7), "CLAIM: the shim path did not accept a window whose only foreign thread made no syscall, at its own 7: {quiet:?}");
-    } else {
-        assert!(quiet.get("syscalls").is_none(), "CLAIM: a window another thread ran in kept a count with no shim: {quiet:?}");
-    }
-    for op in ["fc_shim_compensation", "fc_gone_thread", "fc_too_many_threads", "fc_spawned_outlives", "fc_shim_unseen_foreign"] {
-        let r = row(op);
-        assert!(r.get("syscalls").is_none(), "CLAIM: {op} kept a syscall count (counter loaded: {shim}): {r:?}");
-    }
-    // Each refused for its own reason (probe-adversary-2 L4: `probe::Refusal`).
-    let reason = |op: &str| row(op)["refusal"];
     assert!(row("fc_too_many_threads")["unlisted_callers"] >= 1, "premise: no thread past the table's 48 slots made a call");
     assert_eq!(reason("fc_too_many_threads"), probe::Refusal::Table as u64, "CLAIM: fc_too_many_threads refused for another reason");
     assert_eq!(reason("fc_gone_thread"), probe::Refusal::ThreadGone as u64, "CLAIM: fc_gone_thread refused for another reason");
-    assert_eq!(reason("fc_spawned_outlives"), probe::Refusal::ThreadNew as u64, "CLAIM: fc_spawned_outlives refused for another reason");
-    if shim {
-        assert_eq!(reason("fc_shim_unseen_foreign"), probe::Refusal::SumMismatch as u64, "CLAIM: fc_shim_unseen_foreign refused for another reason");
-    }
     let spinner = row("fc_spinner_window");
-    assert_eq!(spinner.get("syscalls").copied(), Some(7), "CLAIM: a declared spinner made the window foreign, or the count moved: {spinner:?}");
+    assert_eq!(spinner["foreign_threads"], 0, "CLAIM: a declared spinner made the window foreign: {spinner:?}");
     let spawned = row("fc_spawned_window");
     assert_eq!(spawned["foreign_threads"], 0, "CLAIM: a thread the window spawned was counted foreign: {spawned:?}");
-    assert!(spawned.get("syscalls").is_some_and(|n| *n >= 5), "CLAIM: the spawned thread's 5 syscalls were not counted: {spawned:?}");
-    let hold = row("fc_foreign_hold");
-    // FLAGGED, lead-ordered (probe-adversary item 3): the helper makes syscalls inside the hold, so the
-    // hold is unattributable in both modes (the shim used to attribute it, 0 held).
-    assert_eq!(hold["held_unattributed"], 1, "CLAIM: a hold another thread made syscalls in was attributed (counter loaded: {shim}): {hold:?}");
-    assert_eq!(hold["held_syscalls"], 0, "CLAIM: another thread's syscalls were counted as held: {hold:?}");
     let nothing = row("fc_nothing");
-    assert_eq!((nothing["foreign_threads"], nothing["held_unattributed"]), (0, 0), "CLAIM: an empty window was not attributed: {nothing:?}");
+    assert_eq!(nothing["foreign_threads"], 0, "CLAIM: an empty window had a foreign thread: {nothing:?}");
+    #[cfg(target_os = "linux")]
+    {
+        let r = reason("fc_spawned_outlives");
+        assert!(
+            r == probe::Refusal::ThreadNew as u64 || r == probe::Refusal::ThreadGone as u64,
+            "CLAIM: fc_spawned_outlives was not refused as ThreadNew or ThreadGone ({r})"
+        );
+    }
+    // The syscall counts and the shim, Apple only.
+    #[cfg(target_vendor = "apple")]
+    {
+        // Two modes: the per-thread counter (`feshim`) loaded, which attributes a window another thread
+        // ran in exactly (here the window's own 0, the helper's 10 excluded), or not, which refuses it.
+        let shim = row("fc_shim_loaded")["loaded"] == 1;
+        // FLAGGED, lead-ordered (probe-adversary item 3, DECISIONS newest): a foreign thread with
+        // syscalls REFUSES the window in both modes. The shim used to exclude its calls (Some(0)).
+        assert!(foreign.get("syscalls").is_none(), "CLAIM: a window another thread made syscalls in kept a syscall count (counter loaded: {shim}): {foreign:?}");
+        assert_eq!(foreign["shim_loaded"], u64::from(shim), "CLAIM: the sample does not record the probe's mode: {foreign:?}");
+        let quiet = row("fc_shim_quiet_foreign");
+        assert!(quiet["foreign_threads"] >= 1, "premise: the spinning helper did not run inside the window: {quiet:?}");
+        if shim {
+            assert_eq!(quiet.get("syscalls").copied(), Some(7), "CLAIM: the shim path did not accept a window whose only foreign thread made no syscall, at its own 7: {quiet:?}");
+        } else {
+            assert!(quiet.get("syscalls").is_none(), "CLAIM: a window another thread ran in kept a count with no shim: {quiet:?}");
+        }
+        for op in ["fc_shim_compensation", "fc_gone_thread", "fc_too_many_threads", "fc_spawned_outlives", "fc_shim_unseen_foreign"] {
+            let r = row(op);
+            assert!(r.get("syscalls").is_none(), "CLAIM: {op} kept a syscall count (counter loaded: {shim}): {r:?}");
+        }
+        // Each refused for its own reason (probe-adversary-2 L4: `probe::Refusal`).
+        assert_eq!(reason("fc_spawned_outlives"), probe::Refusal::ThreadNew as u64, "CLAIM: fc_spawned_outlives refused for another reason");
+        if shim {
+            assert_eq!(reason("fc_shim_unseen_foreign"), probe::Refusal::SumMismatch as u64, "CLAIM: fc_shim_unseen_foreign refused for another reason");
+        }
+        assert_eq!(spinner.get("syscalls").copied(), Some(7), "CLAIM: a declared spinner made the window foreign, or the count moved: {spinner:?}");
+        assert!(spawned.get("syscalls").is_some_and(|n| *n >= 5), "CLAIM: the spawned thread's 5 syscalls were not counted: {spawned:?}");
+        let hold = row("fc_foreign_hold");
+        // FLAGGED, lead-ordered (probe-adversary item 3): the helper makes syscalls inside the hold, so the
+        // hold is unattributable in both modes (the shim used to attribute it, 0 held).
+        assert_eq!(hold["held_unattributed"], 1, "CLAIM: a hold another thread made syscalls in was attributed (counter loaded: {shim}): {hold:?}");
+        assert_eq!(hold["held_syscalls"], 0, "CLAIM: another thread's syscalls were counted as held: {hold:?}");
+        assert_eq!(nothing["held_unattributed"], 0, "CLAIM: an empty window was not attributed: {nothing:?}");
+    }
 }
 
 /// Probe-adversary item 1: a run labelled a shim run (`FE_SHIM_RUN`, set by feshim-run) whose shim is
