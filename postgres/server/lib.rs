@@ -2882,7 +2882,7 @@ impl Session {
 
     /// The assignment targets of the parameters of the statement Describe prepared for `sql`
     /// ([`turso_pg::StatementTypes::assignments`]); none when nothing is kept for the text.
-    fn described_assignments(&self, sql: &str) -> Vec<(u32, turso_pg::AssignTarget)> {
+    fn described_assignments(&self, sql: &str) -> Vec<(turso_pg::AssignSource, turso_pg::AssignTarget)> {
         let st = self.state();
         st.described.for_sql(sql).map(|d| d.types.assignments.clone()).unwrap_or_default()
     }
@@ -4611,7 +4611,10 @@ impl ExtendedQueryHandler for Session {
                 // plan_cache_mode; here it is always generic from the sixth.
                 if portal.statement.id.is_empty() || portal.statement.statement.custom_binds() <= 5 {
                     let assignments = self.described_assignments(&portal.statement.statement.sql);
-                    check_assignments(&portal, &assignments)?;
+                    if !assignments.is_empty() {
+                        let conn = self.current(&mut self.state()).map_err(PgWireError::UserError)?;
+                        check_assignments(&conn, &portal, &assignments)?;
+                    }
                 }
             }
         }
@@ -5635,7 +5638,7 @@ fn bind_portal_parameters_limited(
     stmt: &mut turso_core::Statement,
     portal: &Portal<Parsed>,
     types: &[Type],
-    _assignments: &[(u32, turso_pg::AssignTarget)],
+    _assignments: &[(turso_pg::AssignSource, turso_pg::AssignTarget)],
 ) -> PgWireResult<()> {
     // The assignments are checked at Bind only (custom plans, Session::on_bind); at Execute the
     // engine's column types coerce each stored value, as PostgreSQL's generic plan does.
@@ -5660,23 +5663,72 @@ fn bind_portal_parameters_limited(
 /// is cut by the column's own type when the engine stores it, for each column apart
 /// (wire-rev-629f4b926 HIGH-1, MED-1: the cut of a shared value reached a wider column, RETURNING
 /// and WHERE). NULL is not checked.
-fn check_assignments(portal: &Portal<Parsed>, assignments: &[(u32, turso_pg::AssignTarget)]) -> PgWireResult<()> {
-    use turso_pg::AssignTarget;
-    for &(n, target) in assignments {
-        // The value as the client sent it, in text format: what PostgreSQL's input function reads
-        // and the coercion judges. BLIND SPOT: a binary-format value is not judged here (the
-        // engine's column type judges it at Execute).
-        let Some(i) = usize::try_from(n).ok().and_then(|n| n.checked_sub(1)) else {
-            continue;
-        };
+fn check_assignments(
+    conn: &PgConnection,
+    portal: &Portal<Parsed>,
+    assignments: &[(turso_pg::AssignSource, turso_pg::AssignTarget)],
+) -> PgWireResult<()> {
+    use turso_pg::{AssignSource, AssignTarget};
+    // A parameter's value as the client sent it, in text format: what PostgreSQL's input function
+    // reads. BLIND SPOT: a binary-format value is not judged here (the engine's column type judges
+    // it at Execute).
+    let sent = |i: usize| -> Option<&str> {
         if portal.parameter_format.is_binary(i) {
-            continue;
+            return None;
         }
-        let Some(Some(bytes)) = portal.parameters.get(i) else {
-            continue;
-        };
-        let Ok(text) = std::str::from_utf8(bytes) else {
-            continue;
+        portal.parameters.get(i)?.as_ref().and_then(|b| std::str::from_utf8(b).ok())
+    };
+    for (source, target) in assignments {
+        let target = *target;
+        let owned: String;
+        let text: &str = match source {
+            AssignSource::Param(n) => {
+                let Some(text) = usize::try_from(*n).ok().and_then(|n| n.checked_sub(1)).and_then(sent) else {
+                    continue;
+                };
+                text
+            }
+            // The expression's value from the bound values, as PostgreSQL's custom plan folds it
+            // (wire-rev-629f4b926 MED-3). An expression the frontend cannot prepare or evaluate is
+            // left to the engine at Execute.
+            AssignSource::Expr(sql) => {
+                let Ok((mut probe, _)) = conn.prepare_typed(sql) else { continue };
+                let mut bound = true;
+                for i in 0..portal.parameters.len() {
+                    let index = NonZero::new(i + 1).expect("i + 1 >= 1");
+                    if probe.parameters().has_index(index) {
+                        let value = match portal.parameters.get(i) {
+                            Some(None) => Value::Null,
+                            _ => match sent(i) {
+                                Some(t) => Value::build_text(t.to_string()),
+                                None => {
+                                    bound = false;
+                                    break;
+                                }
+                            },
+                        };
+                        if probe.bind_at(index, value).is_err() {
+                            bound = false;
+                            break;
+                        }
+                    }
+                }
+                if !bound {
+                    continue;
+                }
+                let Ok(rows) = probe.run_collect_rows() else { continue };
+                match rows.first().and_then(|r| r.first()) {
+                    Some(Value::Text(t)) => {
+                        owned = t.as_str().to_string();
+                        owned.as_str()
+                    }
+                    Some(v @ Value::Numeric(_)) => {
+                        owned = v.to_string();
+                        owned.as_str()
+                    }
+                    _ => continue,
+                }
+            }
         };
         let refusal = match target {
             AssignTarget::VarChar(len) => text

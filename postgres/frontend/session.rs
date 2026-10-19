@@ -4590,6 +4590,18 @@ static NON_IMMUTABLE: std::sync::LazyLock<Vec<&'static str>> = std::sync::LazyLo
         .collect()
 });
 
+/// Whether the function named `name` (bare, lowercased) is immutable in PostgreSQL 18.6 as far as
+/// [`NON_IMMUTABLE`] tells (a name it does not list).
+pub(crate) fn is_immutable_call(name: &str) -> bool {
+    NON_IMMUTABLE.binary_search(&name).is_err()
+}
+
+/// Whether a cast to the type named `name` reads through an immutable input function
+/// ([`STABLE_INPUT`] does not list it).
+pub(crate) fn has_immutable_input(name: &str) -> bool {
+    STABLE_INPUT.binary_search(&name.to_ascii_lowercase().as_str()).is_err()
+}
+
 /// Whether `call` names a function [`NON_IMMUTABLE`] lists, bare or pg_catalog-qualified.
 fn calls_non_immutable(call: &turso_pg_parser::pg_query::protobuf::FuncCall) -> bool {
     use turso_pg_parser::pg_query::protobuf::node::Node;

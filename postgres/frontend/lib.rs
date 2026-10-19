@@ -6,7 +6,7 @@ mod information_schema;
 mod pg_settings;
 pub mod phase;
 mod result_types;
-pub use result_types::{element_of, AssignTarget, StatementTypes};
+pub use result_types::{element_of, AssignSource, AssignTarget, StatementTypes};
 mod session;
 mod sqlstate;
 pub use sqlstate::sqlstate;

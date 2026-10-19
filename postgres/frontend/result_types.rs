@@ -615,7 +615,18 @@ pub struct Walked {
     pub columns: Vec<Option<u32>>,
     /// Each bare $n assigned to a column with a length or a precision, in column order
     /// ([`StatementTypes::assignments`]).
-    pub assignments: Vec<(u32, AssignTarget)>,
+    pub assignments: Vec<(AssignSource, AssignTarget)>,
+}
+
+/// What is assigned to a column whose type has a length or precision ([`StatementTypes::assignments`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AssignSource {
+    /// A bare $n: the bound value as the client sent it.
+    Param(u32),
+    /// An immutable expression over parameters and constants only ($1 || '', upper($1)), as one
+    /// PostgreSQL `SELECT <expression>` whose $n are the statement's: its value at Bind, which
+    /// PostgreSQL's custom plan folds and coerces (wire-rev-629f4b926 MED-3).
+    Expr(String),
 }
 
 /// A column a bound value is coerced to on assignment, as PostgreSQL's Bind coerces it under a
@@ -641,7 +652,7 @@ pub struct StatementTypes {
     /// per $n and cut the shared value). Recorded: recordings/pg18-bind-varchar.out,
     /// reviews/wire-629f4b926-raws/pg18-probe.out. BLIND SPOT: a $n inside an expression
     /// ($1 || '', upper($1)) is coerced by the engine at Execute (MED-3).
-    pub assignments: Vec<(u32, AssignTarget)>,
+    pub assignments: Vec<(AssignSource, AssignTarget)>,
     /// The type OID of each $n its context types, by n; one missing is untyped (text, as
     /// PostgreSQL resolves a parameter nothing types). Sparse, so a statement's highest $n sizes
     /// nothing (wire review 8 item 3).
@@ -867,7 +878,7 @@ struct Infer<'a> {
     schema: &'a Schema,
     types: std::collections::BTreeMap<u32, u32>,
     /// Each assigned $n's target, in order ([`StatementTypes::assignments`]).
-    assignments: Vec<(u32, AssignTarget)>,
+    assignments: Vec<(AssignSource, AssignTarget)>,
     /// Parameters compared with an expression no context types (see [`parameter_types`]).
     compared_untyped: std::collections::BTreeSet<u32>,
     /// The CTEs in scope, innermost last: name and columns.
@@ -1068,8 +1079,11 @@ impl Infer<'_> {
     /// `node`, if it is a bare parameter, is assigned to a column with `target`: recorded once per
     /// assignment, in the order met (the columns' order).
     fn assign_length(&mut self, node: &PgNode, target: Option<AssignTarget>) {
-        if let (Some(n), Some(target)) = (param(node), target) {
-            self.assignments.push((n, target));
+        let Some(target) = target else { return };
+        if let Some(n) = param(node) {
+            self.assignments.push((AssignSource::Param(n), target));
+        } else if let Some(sql) = folded_probe(node) {
+            self.assignments.push((AssignSource::Expr(sql), target));
         }
     }
 
@@ -2431,6 +2445,53 @@ fn cast_type(cast: &turso_pg_parser::pg_query::protobuf::TypeCast) -> Option<u32
         _ => return None,
     };
     u32::try_from(sqlite_type_to_pg_oid(name)).ok()
+}
+
+/// `SELECT <node>` when `node` is an expression PostgreSQL folds at Bind: it holds a parameter, and
+/// nothing but parameters, constants, immutable function calls, operators and casts to types whose
+/// input is immutable ([`AssignSource::Expr`]). Deparsed from a parsed `SELECT 1` whose one target is
+/// replaced, so every field the deparser reads is a parsed one.
+fn folded_probe(node: &PgNode) -> Option<String> {
+    fn pure(node: &PgNode, params: &mut bool) -> bool {
+        let Some(n) = node.node.as_ref() else { return false };
+        let all = |v: &[PgNode], p: &mut bool| v.iter().all(|x| pure(x, p));
+        match n {
+            Node::ParamRef(_) => {
+                *params = true;
+                true
+            }
+            Node::AConst(_) => true,
+            Node::FuncCall(f) => {
+                f.over.is_none()
+                    && f.agg_filter.is_none()
+                    && !f.agg_star
+                    && func_name(f).is_some_and(|name| crate::session::is_immutable_call(&name))
+                    && all(&f.args, params)
+            }
+            Node::AExpr(e) => {
+                e.lexpr.as_deref().is_none_or(|l| pure(l, params)) && e.rexpr.as_deref().is_none_or(|r| pure(r, params))
+            }
+            Node::TypeCast(c) => {
+                c.type_name.as_ref().is_some_and(|t| t.names.last().is_some_and(|n| matches!(&n.node, Some(Node::String(s)) if crate::session::has_immutable_input(&s.sval))))
+                    && c.arg.as_deref().is_some_and(|a| pure(a, params))
+            }
+            Node::CoalesceExpr(c) => all(&c.args, params),
+            _ => false,
+        }
+    }
+    let mut params = false;
+    if !pure(node, &mut params) || !params {
+        return None;
+    }
+    let mut template = turso_pg_parser::pg_query::parse("SELECT 1").ok()?.protobuf;
+    let Some(Node::SelectStmt(select)) = template.stmts.first_mut()?.stmt.as_deref_mut()?.node.as_mut() else {
+        return None;
+    };
+    let Some(Node::ResTarget(t)) = select.target_list.first_mut()?.node.as_mut() else {
+        return None;
+    };
+    t.val = Some(Box::new(node.clone()));
+    turso_pg_parser::deparse(&template).ok()
 }
 
 /// The assignment target of column `column` of table `relname` ([`assign_target`]).
