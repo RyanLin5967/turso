@@ -15643,6 +15643,54 @@ fn a_cast_to_numeric_p_s_and_a_numeric_domain_column_are_numeric() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-cfdebc06d HIGH-1: a CAST to NUMERIC(p, s) is computed as the engine's REAL (96e5b7571), and
+/// a float8 holds every decimal of at most 15 significant digits exactly (DBL_DIG) but not more: past
+/// 15 the cast answered 9007199254740992 for 9007199254740993, so =, IN, GROUP BY and DISTINCT merged
+/// distinct values, and `UPDATE nb SET b = CAST(b AS NUMERIC(19,0))` changed a stored bigint. A cast
+/// of precision 15 or less keeps every digit; one above 15 is refused 0A000 before anything runs,
+/// never answered rounded (lead order, 2026-10-19T10:10Z). Recorded on iccad2,
+/// cli/tests/pg18/pg18-wirefuzz-a_cast_to_numeric_wider_than_float8_holds_is_refused_not_rounded.out (replayed).
+#[test]
+fn a_cast_to_numeric_wider_than_float8_holds_is_refused_not_rounded() {
+    let dir = Scratch::new("numeric-wide-casts");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE TABLE nb(id int, b bigint)",
+        "INSERT INTO nb VALUES (1, 9007199254740992), (2, 9007199254740993), (3, 9007199254740994)",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    let sql = "SELECT CAST('999999999999.999' AS NUMERIC(15,3)), CAST('123456789012345' AS NUMERIC(15))";
+    let r = a.q(sql);
+    let want = vec![vec![Some("999999999999.999".to_string()), Some("123456789012345".to_string())]];
+    if r.error.is_some() || r.rows != want {
+        wrong.push(format!("{sql}: rows {:?} error {:?}, PostgreSQL {want:?}", r.rows, r.error));
+    }
+    for sql in [
+        "SELECT CAST('12345678901234567.89' AS NUMERIC(20,2))",
+        "SELECT CAST('1.5' AS NUMERIC(16,2))",
+        "SELECT CAST(1 AS NUMERIC(16))",
+        "SELECT id FROM nb WHERE CAST(b AS NUMERIC(19,0)) = 9007199254740992",
+        "SELECT count(DISTINCT CAST(b AS NUMERIC(19,0))) FROM nb",
+        "SELECT CAST('9007199254740993' AS NUMERIC(19,0)) = CAST('9007199254740992' AS NUMERIC(19,0))",
+        "SELECT count(*) FROM nb GROUP BY CAST(b AS NUMERIC(19,0))",
+        "SELECT CAST('1234567890123456789012345678.0123456789' AS NUMERIC(38,10))",
+        "UPDATE nb SET b = CAST(b AS NUMERIC(19,0)) WHERE id = 2",
+    ] {
+        let r = a.q(sql);
+        if r.error.as_ref().map(|e| e.code.as_str()) != Some("0A000") {
+            wrong.push(format!("{sql}: rows {:?} error {:?}, refused 0A000 (never rounded)", r.rows, r.error));
+        }
+    }
+    let r = a.q("SELECT b FROM nb WHERE id = 2");
+    if r.rows != vec![vec![Some("9007199254740993".to_string())]] {
+        wrong.push(format!("the bigint after the refused UPDATE: {:?} {:?}, PostgreSQL 9007199254740993", r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-uw3 (pre-existing at f312d1e13): over a NUMERIC(8, 2) column, `b + 1 ... ORDER BY 1`
 /// ordered as text (123457.78 before 3.50), a wrong row order; and the column read through a view,
 /// a derived table, a CREATE TABLE AS copy or a scalar subquery was announced bytea (17) or text
