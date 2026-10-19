@@ -9281,6 +9281,72 @@ fn parse_schema_sql_for_alter(
     dialect.parse(sql).map(|(cmd, _)| cmd)
 }
 
+/// The stored CREATE TABLE text after ADD COLUMN (`definition`, as written) or DROP COLUMN
+/// (`dropped`, normalized), for `turso_alter_column_sql` (engine-rev-qaf-fix HIGH-2/3/4, MED-1;
+/// qaf-fix2 HIGH C and D). An engine row is parsed, the column added or removed, and printed through
+/// its own AST, so every clause the stored text holds survives; the schema model's `to_sql` dropped
+/// them. A dialect's own row is `owned_text`: the dialect's formatter of the altered table, made at
+/// translate time, since only the dialect can print its text (the SQLite printer under the dialect's
+/// marker made the PostgreSQL frontend's database unopenable). `None`: the text is left as it is (the
+/// change is in it already: an MVCC or temp-schema replay of a rewritten row).
+fn alter_column_sql(
+    dialect: &dyn crate::Dialect,
+    sql: &str,
+    root_page: i64,
+    definition: Option<&str>,
+    dropped: Option<&str>,
+    owned_text: &str,
+) -> Result<Option<String>> {
+    if dialect.owns_stored_table_sql(sql) {
+        return Ok((!owned_text.is_empty()).then(|| owned_text.to_string()));
+    }
+    let Some(ast::Cmd::Stmt(ast::Stmt::CreateTable {
+        tbl_name,
+        body,
+        temporary,
+        if_not_exists,
+    })) = parse_schema_sql_for_alter(dialect, "table", root_page, sql)?
+    else {
+        return Ok(None);
+    };
+    let ast::CreateTableBody::ColumnsAndConstraints {
+        mut columns,
+        constraints,
+        options,
+    } = body
+    else {
+        return Err(LimboError::InternalError(
+            "CREATE TABLE AS SELECT schemas cannot be altered".to_string(),
+        ));
+    };
+    if let Some(definition) = definition {
+        let column = Parser::new(definition.as_bytes()).parse_column_definition(true)?;
+        let added = normalize_ident(column.col_name.as_str());
+        if columns.iter().any(|c| normalize_ident(c.col_name.as_str()) == added) {
+            return Ok(None);
+        }
+        columns.push(column);
+    }
+    if let Some(dropped) = dropped {
+        let before = columns.len();
+        columns.retain(|c| normalize_ident(c.col_name.as_str()) != dropped);
+        if columns.len() == before {
+            return Ok(None);
+        }
+    }
+    let new_stmt = ast::Stmt::CreateTable {
+        tbl_name,
+        body: ast::CreateTableBody::ColumnsAndConstraints {
+            columns,
+            constraints,
+            options,
+        },
+        temporary,
+        if_not_exists,
+    };
+    Ok(Some(dialect.format_changed_table_sql(false, crate::dialect::TableChange::Rewritten(&new_stmt))?))
+}
+
 pub fn op_function(
     program: &Program,
     state: &mut ProgramState,
@@ -10621,6 +10687,40 @@ pub fn op_function(
                 };
                 state.registers[*dest].set_value(result);
             }
+            ScalarFunc::AlterColumnSql => {
+                // turso_alter_column_sql(sql, rootpage, op, table, column, definition, owned_text):
+                // ALTER TABLE's ADD/DROP COLUMN, as the value its sqlite_schema UPDATE assigns, so
+                // the row's change is captured with its true before and after (qaf-fix2 HIGH D).
+                check_arg_count!(arg_count, 7);
+                let arg = |i: usize| state.registers[*start_reg + i].get_value().clone();
+                let (sql, root_page, op) = (arg(0), arg(1), arg(2));
+                let (column, definition, owned_text) = (arg(4), arg(5), arg(6));
+                let text = |v: &Value| match v {
+                    Value::Text(t) => t.as_str().to_string(),
+                    _ => String::new(),
+                };
+                let result = match (&sql, &root_page) {
+                    (Value::Text(stored), Value::Numeric(Numeric::Integer(root))) => {
+                        let dialect = program.connection.dialect();
+                        let (definition_s, dropped_s) = (text(&definition), normalize_ident(&text(&column)));
+                        let (add, drop) = match text(&op).as_str() {
+                            "add" => (Some(definition_s.as_str()), None),
+                            "drop" => (None, Some(dropped_s.as_str())),
+                            other => {
+                                return Err(LimboError::InternalError(format!(
+                                    "turso_alter_column_sql: unknown op {other:?}"
+                                )))
+                            }
+                        };
+                        match alter_column_sql(dialect.as_ref(), stored.as_str(), *root, add, drop, &text(&owned_text))? {
+                            Some(new_sql) => Value::build_text(new_sql),
+                            None => sql.clone(),
+                        }
+                    }
+                    _ => sql.clone(),
+                };
+                state.registers[*dest].set_value(result);
+            }
             ScalarFunc::VarcharEncode => {
                 // varchar(n) (fastest-wire c15466936): the value unchanged when its length, as
                 // length() counts it, is at most n; else PostgreSQL's string_data_right_truncation.
@@ -11366,93 +11466,6 @@ pub fn op_function(
                     };
 
                     (new_name, new_tbl_name, new_sql)
-                }
-                AlterTableFunc::AddColumn | AlterTableFunc::DropColumn => {
-                    // ADD/DROP COLUMN (engine-rev-qaf-fix HIGH-2/3/4, MED-1): the table's own stored
-                    // CREATE statement, parsed, one column appended (its definition as written) or
-                    // removed, and printed as RENAME and ALTER COLUMN print theirs, so every clause the
-                    // stored text holds (a DESC key, a COLLATE or conflict clause on a constraint, a
-                    // type such as `[x,y]`) survives. The schema model's `to_sql` dropped them. Every
-                    // other row stays as it is.
-                    let table = match &state.registers[*start_reg + 5].get_value() {
-                        Value::Text(t) => normalize_ident(t.as_str()),
-                        _ => panic!("table parameter should be TEXT"),
-                    };
-                    let dropped = match &state.registers[*start_reg + 6].get_value() {
-                        Value::Text(c) => normalize_ident(c.as_str()),
-                        _ => panic!("column parameter should be TEXT"),
-                    };
-                    let definition = match &state.registers[*start_reg + 7].get_value() {
-                        Value::Text(d) => d.as_str().to_string(),
-                        _ => panic!("definition parameter should be TEXT"),
-                    };
-                    let new_sql = 'sql: {
-                        let Value::Text(sql) = sql else {
-                            break 'sql None;
-                        };
-                        if entry_type.as_str() != "table" || normalize_ident(&name) != table {
-                            break 'sql None;
-                        }
-                        let cmd = parse_schema_sql_for_alter(
-                            program.connection.dialect().as_ref(),
-                            entry_type.as_str(),
-                            *root_page,
-                            sql.as_str(),
-                        )?;
-                        let Some(ast::Cmd::Stmt(ast::Stmt::CreateTable {
-                            tbl_name: stored_name,
-                            body,
-                            temporary,
-                            if_not_exists,
-                        })) = cmd
-                        else {
-                            break 'sql None;
-                        };
-                        let ast::CreateTableBody::ColumnsAndConstraints {
-                            mut columns,
-                            constraints,
-                            options,
-                        } = body
-                        else {
-                            return Err(LimboError::InternalError(
-                                "CREATE TABLE AS SELECT schemas cannot be altered".to_string(),
-                            ));
-                        };
-                        match alter_func {
-                            AlterTableFunc::AddColumn => {
-                                let column = Parser::new(definition.as_bytes()).parse_column_definition(true)?;
-                                let added = normalize_ident(column.col_name.as_str());
-                                if columns.iter().any(|c| normalize_ident(c.col_name.as_str()) == added) {
-                                    // An already-rewritten image (MVCC or temp-schema replays): as is.
-                                    break 'sql None;
-                                }
-                                columns.push(column);
-                            }
-                            _ => {
-                                let before = columns.len();
-                                columns.retain(|c| normalize_ident(c.col_name.as_str()) != dropped);
-                                if columns.len() == before {
-                                    // An already-rewritten image (MVCC or temp-schema replays): as is.
-                                    break 'sql None;
-                                }
-                            }
-                        }
-                        let new_stmt = ast::Stmt::CreateTable {
-                            tbl_name: stored_name,
-                            body: ast::CreateTableBody::ColumnsAndConstraints {
-                                columns,
-                                constraints,
-                                options,
-                            },
-                            temporary,
-                            if_not_exists,
-                        };
-                        // The row stays in the form it was in (REVISION 2 item 8).
-                        let dialect = program.connection.dialect();
-                        let owned = dialect.owns_stored_table_sql(sql.as_str());
-                        Some(dialect.format_changed_table_sql(owned, crate::dialect::TableChange::Rewritten(&new_stmt))?)
-                    };
-                    (name, tbl_name, new_sql)
                 }
                 AlterTableFunc::AlterColumn | AlterTableFunc::RenameColumn => {
                     let table = {

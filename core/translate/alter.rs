@@ -847,80 +847,46 @@ fn emit_add_column_check_validation(
     Ok(())
 }
 
-/// Rewrite `table_name`'s CREATE TABLE row in `database_id`'s sqlite_schema with `func`
-/// (`AlterTableFunc::AddColumn` with the new column's definition as written, or `DropColumn` with
-/// the dropped column's name). It reads the row's stored SQL at run time and prints the changed
-/// statement through the parser's AST, as ALTER COLUMN's loop does, so no clause the schema model
-/// does not hold is lost (engine-rev-qaf-fix HIGH-2/3/4, MED-1). Emitted before the statement's
-/// sqlite_schema UPDATE, which then leaves the text as this wrote it.
+/// ADD or DROP COLUMN's UPDATE of `table_name`'s sqlite_schema row: `SET sql =
+/// turso_alter_column_sql(...)`, the new text made from the row's stored text at run time
+/// (`vdbe::execute::alter_column_sql`) by the UPDATE itself. So the row's change data capture has its
+/// true before-image (engine-rev-qaf-fix2 HIGH D: a separate rewrite loop ran first and `SET sql =
+/// sql` then captured the new text twice). A dialect's own row takes the dialect's formatter of the
+/// altered table (`altered`), made here (HIGH C).
 #[allow(clippy::too_many_arguments)]
-fn emit_table_sql_rewrite(
-    program: &mut ProgramBuilder,
-    resolver: &Resolver,
+fn alter_column_update(
     connection: &Arc<crate::Connection>,
-    database_id: usize,
+    qualified_schema_table: &str,
     table_name: &str,
+    op: &str,
     column: &str,
     definition: &str,
-    func: AlterTableFunc,
-) -> Result<()> {
-    let sqlite_schema = resolver
-        .with_schema(database_id, |s| s.get_btree_table(SQLITE_TABLEID))
-        .ok_or_else(|| LimboError::ParseError("sqlite_schema table not found in schema".to_string()))?;
-    let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(sqlite_schema.clone()));
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id,
-        root_page: RegisterOrLiteral::Literal(sqlite_schema.root_page),
-        db: database_id,
-    });
-    let mvcc = database_uses_mvcc(connection, database_id);
-    program.cursor_loop(cursor_id, |program, rowid| {
-        let sqlite_schema_column_len = sqlite_schema.columns().len();
-        turso_assert_eq!(sqlite_schema_column_len, 5);
-        let first_column = program.alloc_registers(sqlite_schema_column_len);
-        for i in 0..sqlite_schema_column_len {
-            program.emit_column_or_rowid(cursor_id, i, first_column + i);
-        }
-        program.emit_string8_new_reg(table_name.to_string());
-        program.mark_last_insn_constant();
-        program.emit_string8_new_reg(column.to_string());
-        program.mark_last_insn_constant();
-        program.emit_string8_new_reg(definition.to_string());
-        program.mark_last_insn_constant();
-        let out = program.alloc_registers(sqlite_schema_column_len);
-        program.emit_insn(Insn::Function {
-            constant_mask: 0,
-            start_reg: first_column,
-            dest: out,
-            func: crate::function::FuncCtx {
-                func: Func::AlterTable(func.clone()),
-                arg_count: 8,
-            },
-        });
-        let record = program.alloc_register();
-        program.emit_insn(Insn::MakeRecord {
-            start_reg: to_u32(out),
-            count: to_u32(sqlite_schema_column_len),
-            dest_reg: to_u32(record),
-            index_name: None,
-            affinity_str: None,
-        });
-        if mvcc {
-            program.emit_insn(Insn::Delete {
-                cursor_id,
-                table_name: SQLITE_TABLEID.to_string(),
-                is_part_of_update: true,
-            });
-        }
-        program.emit_insn(Insn::Insert {
-            cursor: cursor_id,
-            key_reg: rowid,
-            record_reg: record,
-            flag: crate::vdbe::insn::InsertFlags(0),
-            table_name: table_name.to_string(),
-        });
-    });
-    Ok(())
+    altered: &BTreeTable,
+) -> Result<String> {
+    let owned_text = if altered.dialect_owned {
+        connection
+            .dialect()
+            .format_changed_table_sql(true, crate::dialect::TableChange::Altered(altered))?
+    } else {
+        String::new()
+    };
+    let lit = |s: &str| escape_sql_string_literal(s);
+    let call = format!(
+        "turso_alter_column_sql(sql, rootpage, '{}', '{}', '{}', '{}', '{}')",
+        lit(op),
+        lit(table_name),
+        lit(column),
+        lit(definition),
+        lit(&owned_text)
+    );
+    Ok(format!(
+        r#"
+            UPDATE {qualified_schema_table}
+            SET sql = {call}
+            WHERE name = '{}' COLLATE NOCASE AND type = 'table'
+        "#,
+        lit(table_name)
+    ))
 }
 
 pub fn translate_alter_table(
@@ -1245,17 +1211,8 @@ pub fn translate_alter_table(
             let dropped_name = btree.columns()[dropped_index].name.clone().unwrap_or_default();
             btree.columns_mut().remove(dropped_index);
 
-            // The stored text is rewritten through its own AST, the row in the form it was in
-            // (dialect design REVISION 2 item 8); the UPDATE below then leaves it as written.
-            emit_table_sql_rewrite(program, resolver, connection, database_id, table_name, &dropped_name, "", AlterTableFunc::DropColumn)?;
-            let escaped_table_name = escape_sql_string_literal(table_name);
-            let stmt = format!(
-                r#"
-                    UPDATE {qualified_schema_table}
-                    SET sql = sql
-                    WHERE name = '{escaped_table_name}' COLLATE NOCASE AND type = 'table'
-                "#,
-            );
+            // The stored text, changed by the UPDATE itself (`alter_column_update`).
+            let stmt = alter_column_update(connection, &qualified_schema_table, table_name, "drop", &dropped_name, "", &btree)?;
 
             let mut parser = Parser::new(stmt.as_bytes());
             let cmd = parser.next_cmd().map_err(|e| {
@@ -1322,8 +1279,9 @@ pub fn translate_alter_table(
             )?
         }
         ast::AlterTableBody::AddColumn(col_def) => {
-            // The definition as written, for the stored text's rewrite (`emit_table_sql_rewrite`).
-            let definition_text = col_def.to_string();
+            // The definition as written, for the stored text's rewrite; a type DEFAULT applied below
+            // is appended to it.
+            let mut definition_text = col_def.to_string();
             let is_generated = col_def
                 .constraints
                 .iter()
@@ -1424,6 +1382,12 @@ pub fn translate_alter_table(
                 {
                     if let Some(type_default) = resolved.default_expr() {
                         column.default = Some(Box::new(type_default.clone()));
+                        // In the stored text too, or a reopen reads NULL for the rows that existed
+                        // (engine-rev-qaf-fix2 HIGH B; the schema model's to_sql carried it before
+                        // b80fa60c8). Mutant `type_default_unstored` (test builds only): as at b80fa60c8.
+                        if !crate::branch::store::fe_mutant("type_default_unstored") {
+                            definition_text.push_str(&format!(" DEFAULT ({type_default})"));
+                        }
                     }
                 }
             }
@@ -1525,17 +1489,8 @@ pub fn translate_alter_table(
             // visible to the empty-table check below.
             column = btree.columns().last().unwrap().clone();
 
-            // The stored text is rewritten through its own AST just before the UPDATE below
-            // (`emit_table_sql_rewrite`), the row in the form it was in (dialect design REVISION 2
-            // item 8); the UPDATE then leaves it as written.
-            let escaped_table_name = escape_sql_string_literal(table_name);
-            let stmt = format!(
-                r#"
-                    UPDATE {qualified_schema_table}
-                    SET sql = sql
-                    WHERE name = '{escaped_table_name}' COLLATE NOCASE AND type = 'table'
-                "#,
-            );
+            // The stored text, changed by the UPDATE itself (`alter_column_update`).
+            let stmt = alter_column_update(connection, &qualified_schema_table, table_name, "add", "", &definition_text, &btree)?;
 
             let mut parser = Parser::new(stmt.as_bytes());
             let cmd = parser.next_cmd().map_err(|e| {
@@ -1627,7 +1582,6 @@ pub fn translate_alter_table(
                 )?;
             }
 
-            emit_table_sql_rewrite(program, resolver, connection, database_id, table_name, "", &definition_text, AlterTableFunc::AddColumn)?;
             translate_update_for_schema_change(
                 update,
                 resolver,

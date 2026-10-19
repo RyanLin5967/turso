@@ -546,6 +546,7 @@ pub fn resolve_builtin_function(name: &str, arg_count: usize) -> crate::Result<O
         "validate_ipaddr" => Ok(Some(Func::Scalar(ScalarFunc::ValidateIpAddr))),
         "numeric_encode" => Ok(Some(Func::Scalar(ScalarFunc::NumericEncode))),
         "varchar_encode" => Ok(Some(Func::Scalar(ScalarFunc::VarcharEncode))),
+        "turso_alter_column_sql" => Ok(Some(Func::Scalar(ScalarFunc::AlterColumnSql))),
         "numeric_decode" => Ok(Some(Func::Scalar(ScalarFunc::NumericDecode))),
         "numeric_add" => Ok(Some(Func::Scalar(ScalarFunc::NumericAdd))),
         "numeric_sub" => Ok(Some(Func::Scalar(ScalarFunc::NumericSub))),

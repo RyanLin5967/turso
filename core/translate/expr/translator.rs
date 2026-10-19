@@ -1844,6 +1844,7 @@ pub fn translate_expr(
                         | ScalarFunc::ValidateIpAddr
                         | ScalarFunc::NumericEncode
                         | ScalarFunc::VarcharEncode
+                        | ScalarFunc::AlterColumnSql
                         | ScalarFunc::NumericDecode
                         | ScalarFunc::NumericAdd
                         | ScalarFunc::NumericSub
