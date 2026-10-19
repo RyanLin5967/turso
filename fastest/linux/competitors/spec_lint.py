@@ -174,6 +174,13 @@ def selftest():
             open(p, "w").write("\n".join(ln for ln in open(p).read().split("\n") if ln != line))
         return ed
 
+    def replace_text(f, old, new):
+        def ed(dd):
+            p = os.path.join(dd, f)
+            txt = open(p).read()
+            open(p, "w").write(txt.replace(old, new))
+        return ed
+
     def swap_steps(f):
         def ed(dd):
             p = os.path.join(dd, f)
@@ -226,6 +233,13 @@ def selftest():
             prepend_step("doltgres-c-m1.spec",
                          "connect host=127.0.0.1 port={port} user=postgres password=password dbname=postgres"),
             "doltgres-c-m1.spec: connect")
+    # the lead's Doltgres b-m1 ruling (DECISIONS 2026-10-19): doltgres-b-m1 runs `home per-cycle` and deletes its branch
+    # with an admin-sql after-step; no other spec does either
+    planted("doltgres-b-m1 without home per-cycle (Doltgres b-m1 ruling)",
+            drop_line("doltgres-b-m1.spec", "home per-cycle"), "doltgres-b-m1.spec: home lines")
+    planted("doltgres-b-m1 deleting on the home connection (Doltgres b-m1 ruling)",
+            replace_text("doltgres-b-m1.spec", "after admin-sql ", "after sql "), "doltgres-b-m1.spec: last after-step")
+    planted("home per-cycle in another spec", prepend_step("dolt-b-m1.spec", "home per-cycle"), "dolt-b-m1.spec: home lines")
     planted("an M1 connect form without its probe", drop_line("pg18-m1.spec", PROBE), "pg18-m1.spec: timed steps")
     planted("two timed steps reordered", swap_steps("dolt-b-m1.spec"), "dolt-b-m1.spec: timed steps")
     planted("an unknown spec file", lambda dd: open(os.path.join(dd, "pg18-new.spec"), "w").write("protocol pg\n"),
