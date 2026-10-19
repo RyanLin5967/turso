@@ -1095,6 +1095,28 @@ pub fn constraints_from_where_clause(
                         constraint.usable,
                         "constraint collation must match table column collation"
                     );
+                    // An indexed expression whose values are of a custom type comparing by
+                    // function (`b + 1` over numeric: numeric_eq, numeric_lt) compares through it
+                    // in a scan (`find_custom_type_operator`), but its index holds the values and
+                    // compares a key plainly, so it drives no seek (second review of the
+                    // fe-rev2bd-types fixes, item 1: `b + 1 = 3` answered nothing by the index).
+                    // Mutant `typed_expression_index_plain` (test builds only): it does, as before.
+                    if constraint.table_col_pos.is_none()
+                        && !crate::branch::store::fe_mutant("typed_expression_index_plain")
+                        && constraint.expr.as_ref().is_some_and(|e| {
+                            crate::translate::order_by::expr_custom_type(e, table_references, schema).is_some_and(
+                                |(type_def, _)| {
+                                    schema
+                                        .operator_type_of(&type_def)
+                                        .operators()
+                                        .iter()
+                                        .any(|o| o.func_name.is_some() && (o.op == "=" || o.op == "<"))
+                                },
+                            )
+                        })
+                    {
+                        continue;
+                    }
                     if let Some(table_col_pos) = constraint.table_col_pos {
                         let constrained_column = &table_reference.table.columns()[table_col_pos];
                         let table_collation = constrained_column.collation();
