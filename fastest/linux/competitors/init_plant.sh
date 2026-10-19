@@ -23,6 +23,8 @@ pg=${FT_PG18:-}
 rc=0
 FT_PY="$stub" FT_PG18="$pg" timeout 1800 bash "$HERE/run_system.sh" pg18-d2 "$MNT" "$RAW" >"$RAW.txt" 2>&1 || rc=$?
 n=$(grep -c '^FAIL server init' "$RAW/functional.txt" 2>/dev/null)
-echo "init plant ($MODE): rc $rc; ${n:-0} server-init FAIL line(s)"
-# the check (the workflow's, as it stood): the job failed, with a server-init FAIL line
-[ "$rc" != 0 ] && [ "${n:-0}" -gt 0 ]
+why=$(grep -c 'planted shared-buffers failure' "$RAW/server-init.txt" 2>/dev/null)
+echo "init plant ($MODE): rc $rc; ${n:-0} server-init FAIL line(s); the init's output names the planted failure ${why:-0} time(s)"
+# the check: the job failed, with a server-init FAIL line, and (comp-rev-89ec-b3c3 LOW 10) the init failed FOR THE
+# PLANTED REASON: run_system.sh's server-init.txt (pg18.sh init's output) holds the stub's message
+[ "$rc" != 0 ] && [ "${n:-0}" -gt 0 ] && [ "${why:-0}" -gt 0 ]
