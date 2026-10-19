@@ -1021,6 +1021,30 @@ fn index_columns_order_consumed<'a>(
             break;
         }
 
+        // An indexed expression whose values are of a custom type ordering by function (`b + 1`
+        // over numeric: numeric_lt) is sorted through it (`order_by::custom_type_comparator`),
+        // but its index holds the values in their plain order (numeric's texts: '10.00' before
+        // '3.00'), so it supplies no order (third review of the fe-rev2bd-types fixes, item 2).
+        // Mutant `typed_expression_index_order` (test builds only): it does, as before.
+        if let ColumnTarget::Expr(expr) = &target_col.target {
+            if !crate::branch::store::fe_mutant("typed_expression_index_order") {
+                // SAFETY: as in `target_matches_order_column`: the AST outlives the plan.
+                let target_expr = unsafe { &**expr };
+                let refs = TableReferences::new(vec![table_ref.clone()], Vec::new());
+                let ordered_by_function = crate::translate::order_by::expr_custom_type(target_expr, &refs, schema)
+                    .is_some_and(|(type_def, _)| {
+                        schema
+                            .operator_type_of(&type_def)
+                            .operators()
+                            .iter()
+                            .any(|o| o.op == "<" && o.func_name.is_some())
+                    });
+                if ordered_by_function {
+                    break;
+                }
+            }
+        }
+
         // Custom type columns store encoded blobs. The B-tree's byte order
         // does not match the custom type's order.
         if let ColumnTarget::Column(col_no) = &target_col.target {
