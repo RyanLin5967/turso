@@ -15991,6 +15991,63 @@ fn a_without_rowid_drop_column_never_resurfaces_the_dropped_value() {
     assert!(failed.is_empty(), "CLAIM: no row reads the dropped value (refused, or d = 9 as SQLite): {failed:#?}");
 }
 
+/// fastest-wire 1529a6674 (PGDIV-ALTER-COLUMN-SAME-NAME, recorded against PostgreSQL 18.6, #5 #11
+/// #12): ALTER COLUMN whose new definition keeps the column's own name is a change of that column,
+/// not a duplicate: `v TO v VARCHAR(20)` is accepted and keeps the rows. A definition that keeps
+/// the column's PRIMARY KEY (and its rowid alias) keeps the key, with or without a rename: the
+/// key is still enforced after it. Controls, still refused: a new name another column holds, a
+/// PRIMARY KEY added to a column that had none, and a PRIMARY KEY whose rowid-alias status the
+/// new type changes. At the base the first two are "duplicate column name" and the key ones
+/// "PRIMARY KEY constraint cannot be altered".
+#[test]
+fn alter_column_keeping_its_own_name_or_its_primary_key_is_a_change_not_a_duplicate() {
+    let _g = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("altersame.db"), DatabaseOpts::new());
+    let c = db.connect().unwrap();
+    c.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT, w TEXT)").unwrap();
+    c.execute("INSERT INTO t VALUES (1, 'abc', 'x'), (2, 'de', 'y')").unwrap();
+    let mut failed = Vec::new();
+    for sql in [
+        "ALTER TABLE t ALTER COLUMN v TO v VARCHAR(20)",
+        "ALTER TABLE t ALTER COLUMN id TO id INTEGER PRIMARY KEY",
+        "ALTER TABLE t ALTER COLUMN id TO ident INTEGER PRIMARY KEY",
+    ] {
+        if let Err(e) = c.execute(sql) {
+            failed.push(format!("{sql}: refused: {e}"));
+        }
+    }
+    let rows = adv_rows(&c, "SELECT * FROM t ORDER BY 1");
+    let want = vec![
+        vec!["1".to_string(), "abc".to_string(), "x".to_string()],
+        vec!["2".to_string(), "de".to_string(), "y".to_string()],
+    ];
+    if rows.as_ref().ok() != Some(&want) {
+        failed.push(format!("rows after the ALTERs: {rows:?}"));
+    }
+    if c.execute("INSERT INTO t VALUES (1, 'dup', 'z')").is_ok() {
+        failed.push("the kept PRIMARY KEY no longer refuses a duplicate key".to_string());
+    }
+    for sql in [
+        "ALTER TABLE t ALTER COLUMN v TO w TEXT",
+        "ALTER TABLE t ALTER COLUMN w TO w INTEGER PRIMARY KEY",
+    ] {
+        if c.execute(sql).is_ok() {
+            failed.push(format!("{sql}: accepted, must be refused"));
+        }
+    }
+    let ty = adv_rows(&c, "SELECT sql FROM sqlite_schema WHERE name = 't'");
+    if !ty.as_ref().is_ok_and(|r| r[0][0].contains("v VARCHAR(20)")) {
+        failed.push(format!("stored text: {ty:?}, not v's new type"));
+    }
+    assert!(failed.is_empty(), "CLAIM: ALTER COLUMN keeping its name or its key is a change: {failed:#?}");
+    c.execute("CREATE TABLE p(id INTEGER PRIMARY KEY, x)").unwrap();
+    assert!(
+        c.execute("ALTER TABLE p ALTER COLUMN id TO id TEXT PRIMARY KEY").is_err(),
+        "CLAIM: a kept PRIMARY KEY whose new type changes its rowid alias is refused"
+    );
+}
+
 /// engine-rev-qaf-fix2 HIGH A (REVIEW-engine-qaf-fix2-18556a956): a column type whose token keeps
 /// its quotes ("a]b") was quoted again by every AST rewrite, so ADD, ADD, ADD, DROP, RENAME, ADD grew
 /// the stored text 52, 64, 84, 120, 180, 308, 568 (SQLite 3.53.4: 47..59). The type must read back
