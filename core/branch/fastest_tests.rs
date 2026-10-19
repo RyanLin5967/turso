@@ -15466,6 +15466,47 @@ fn a_failed_statement_rollback_inside_begin_rolls_the_transaction_back() {
     );
 }
 
+/// fastest-wire 73ca2b720 (domain arm; PostgreSQL 18.6 recorded on iccad2): `CREATE DOMAIN dn AS
+/// NUMERIC(8,2)` is a domain over numeric with its precision and scale, so a column of it stores 1.5
+/// as 1.50, before and after a reopen (the domain's stored text keeps the parameters), and refuses a
+/// value past its precision. Core's CREATE DOMAIN took a base type with no parameters: the statement
+/// does not parse at the base, so red by its first claim.
+#[test]
+fn a_domain_over_a_parameterized_type_keeps_its_parameters() {
+    let _g = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("dom.db");
+    let o = || DatabaseOpts::new().with_custom_types(true);
+    let mut failed: Vec<String> = Vec::new();
+    {
+        let db = open_at(&path, o());
+        let c = db.connect().unwrap();
+        for sql in [
+            "CREATE DOMAIN dn AS numeric(8, 2)",
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, x dn) STRICT",
+            "INSERT INTO t VALUES (1, 1.5)",
+        ] {
+            if let Err(e) = c.execute(sql) {
+                failed.push(format!("`{sql}`: {e}"));
+            }
+        }
+        match adv_rows(&c, "SELECT x FROM t") {
+            Ok(r) if r.len() == 1 && r[0][0] == "1.50" => {}
+            other => failed.push(format!("before the reopen SELECT x = {other:?}, PostgreSQL 1.50")),
+        }
+    }
+    let db = open_at(&path, o());
+    let c = db.connect().unwrap();
+    match adv_rows(&c, "SELECT x FROM t") {
+        Ok(r) if r.len() == 1 && r[0][0] == "1.50" => {}
+        other => failed.push(format!("after the reopen SELECT x = {other:?}, PostgreSQL 1.50")),
+    }
+    if c.execute("INSERT INTO t VALUES (2, 1234567.5)").is_ok() {
+        failed.push("1234567.5 fit numeric(8, 2) through the domain".to_string());
+    }
+    assert!(failed.is_empty(), "CLAIM: the domain keeps numeric(8, 2): {failed:#?}");
+}
+
 /// ADV-8: a custom type named with each quote form survives a reopen as ONE type: a STRICT column
 /// declared with any spelling of it reads back, and DROP TYPE is refused while the column uses it.
 #[test]
