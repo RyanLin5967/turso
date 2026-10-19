@@ -262,6 +262,27 @@ def selftest():
     planted("doltgres-b-m1 deleting on the home connection (Doltgres b-m1 ruling)",
             replace_text("doltgres-b-m1.spec", "after admin-sql ", "after sql "), "doltgres-b-m1.spec: last after-step")
     planted("home per-cycle in another spec", prepend_step("dolt-b-m1.spec", "home per-cycle"), "dolt-b-m1.spec: home lines")
+    # comp-rev-9bc7d894a LOW 5: REG's (b) rows are a hand copy of STATEMENTS.md; statements_problems(TEXT) reads the
+    # Statements table itself and names every (b) switch row REG disagrees with. Excerpt: STATEMENTS.md's four rows as
+    # they stand (artie tools/loadgen/specs/STATEMENTS.md:21-22, 30-31), and the same with one row drifted
+    sp = globals().get("statements_problems", lambda text: None)
+    rows = (
+        "| doltgres | b | m1c-switch | `h` | sql SELECT dolt_branch('{branch}', 'main')<br>sql USE \"postgres/{branch}\" "
+        "| sql USE postgres<br>sql SELECT dolt_branch('-d', '{branch}') |\n"
+        "| doltgres | b | m1-switch | `h` | sql SELECT dolt_branch('{branch}', 'main')<br>sql USE \"postgres/{branch}\"<br>"
+        "write UPDATE t SET v = v + 1 WHERE id = {rand:1:rows} | sql USE postgres<br>sql SELECT dolt_branch('-d', "
+        "'{branch}') |\n"
+        "| dolt | b | m1c-switch | `h` | sql CALL DOLT_BRANCH('{branch}', 'main')<br>sql USE `bench/{branch}` | sql USE "
+        "bench<br>sql CALL DOLT_BRANCH('-d', '{branch}') |\n"
+        "| dolt | b | m1-switch | `h` | sql CALL DOLT_BRANCH('{branch}', 'main')<br>sql USE `bench/{branch}`<br>write "
+        "UPDATE t SET v = v + 1 WHERE id = {rand:1:rows} | sql USE bench<br>sql CALL DOLT_BRANCH('-d', '{branch}') |\n")
+    got = sp(rows)
+    ok(f"STATEMENTS.md's (b) rows as they stand agree with REG (got {got!r})", got == [])
+    drift = rows.replace("sql USE `bench/{branch}` | sql USE bench", "sql SET @@bench_head_ref = '{branch}' | sql USE bench")
+    got = sp(drift)
+    ok(f"a drifted STATEMENTS.md (b) row is named (got {got!r})", bool(got) and any("dolt-b-m1c.spec" in w for w in got))
+    got = sp(rows.replace("| dolt | b | m1-switch |", "| dolt | b | m1-gone |"))
+    ok(f"a STATEMENTS.md missing a (b) row is named (got {got!r})", bool(got) and any("dolt-b-m1.spec" in w for w in got))
     planted("an M1 connect form without its probe", drop_line("pg18-m1.spec", PROBE), "pg18-m1.spec: timed steps")
     planted("two timed steps reordered", swap_steps("dolt-b-m1.spec"), "dolt-b-m1.spec: timed steps")
     planted("an unknown spec file", lambda dd: open(os.path.join(dd, "pg18-new.spec"), "w").write("protocol pg\n"),
