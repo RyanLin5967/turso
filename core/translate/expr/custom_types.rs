@@ -772,13 +772,53 @@ pub(super) fn emit_domain_cast_constraints(
         });
     }
 
+    // A domain's CHECK reads the domain's value, as PostgreSQL's does: `reg` holds the CAST's
+    // ENCODE (its stored form), so `value` is bound to it DECODEd through the chain (engine review
+    // 2bdcd32c6 HIGH 8: over numeric(8, 2) the CHECK compared the encoded blob; numeric's operators
+    // refuse a blob, as its INSERT does). A chain with no DECODE (a domain over integer) reads `reg`
+    // as it is. Mutant `domain_takes_no_base_operator` (test builds only): `reg`, as before.
+    let value_reg = if chain.iter().any(|td| td.decode().is_some())
+        && !crate::branch::store::fe_mutant("domain_takes_no_base_operator")
+    {
+        let decoded = program.alloc_register();
+        program.emit_insn(Insn::Copy {
+            src_reg: reg,
+            dst_reg: decoded,
+            extra_amount: 0,
+        });
+        let cast_col = Column::new(
+            None,
+            chain.first().map(|td| td.name.clone()).unwrap_or_default(),
+            None,
+            None,
+            Type::Null,
+            None,
+            ColDef::default(),
+        );
+        let skip_label = program.allocate_label();
+        program.emit_insn(Insn::IsNull {
+            reg: decoded,
+            target_pc: skip_label,
+        });
+        for td in chain.iter().rev() {
+            if let Some(decode_expr) = td.decode() {
+                emit_type_expr(program, decode_expr, decoded, decoded, &cast_col, td, resolver)?;
+            }
+        }
+        program.preassign_label_to_next_insn(skip_label);
+        decoded
+    } else {
+        reg
+    };
+
     for td in chain {
         for (dc, constraint_name) in td.domain_checks.iter().zip(crate::schema::domain_check_names(td)) {
 
-            // Bind `value` → reg, translate check expr, verify truthy. `value` is a value of this
-            // domain, so a comparison of it takes the domain's base type's operators (engine
-            // review 2bdcd32c6 HIGH 8: CAST(-1 AS dpos) passed CHECK (VALUE > 0) over numeric).
-            program.id_register_overrides.insert("value", reg);
+            // Bind `value` → its register, translate check expr, verify truthy. `value` is a value
+            // of this domain, so a comparison of it takes the domain's base type's operators
+            // (engine review 2bdcd32c6 HIGH 8: CAST(-1 AS dpos) passed CHECK (VALUE > 0) over
+            // numeric).
+            program.id_register_overrides.insert("value", value_reg);
             let outer_value_type = program.id_value_type.replace(td.clone());
 
             let expr_result_reg = program.alloc_register();

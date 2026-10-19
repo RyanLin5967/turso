@@ -2183,6 +2183,7 @@ fn emit_index_column_value_new_image(
 
 /// Emit bytecode for evaluating CHECK constraints.
 /// Assumes the resolver cache is already populated with column-to-register mappings.
+#[allow(clippy::too_many_arguments)]
 fn emit_check_constraint_bytecode(
     program: &mut ProgramBuilder,
     check_constraints: &[CheckConstraint],
@@ -2191,10 +2192,97 @@ fn emit_check_constraint_bytecode(
     skip_row_label: BranchOffset,
     referenced_tables: Option<&TableReferences>,
     table_name: &str,
+    column_mappings: &[(&str, usize)],
 ) -> Result<()> {
     for check_constraint in check_constraints {
         let expr_result_reg = program.alloc_register();
+        // A domain's CHECK reads its column's value, as PostgreSQL's does (engine review 2bdcd32c6
+        // HIGH 8): the column's register holds the row's ENCODEd value, so for this check the
+        // column reads it DECODEd (a numeric domain's blob compared with a number; numeric's
+        // operators refuse a blob). A table CHECK keeps reading the stored form. Mutant
+        // `domain_takes_no_base_operator` (test builds only): the stored form, as before.
+        let cache_len = resolver.expr_to_reg_cache.len();
+        if let (Some(_), Some(col_name), Some(joined_table)) = (
+            &check_constraint.domain,
+            &check_constraint.column,
+            referenced_tables.and_then(|tables| tables.joined_tables().first()),
+        ) {
+            let is_strict = joined_table.btree().is_some_and(|bt| bt.is_strict);
+            let column = joined_table
+                .columns()
+                .iter()
+                .enumerate()
+                .find(|(_, c)| c.name.as_ref().is_some_and(|n| n.eq_ignore_ascii_case(col_name)));
+            let register = column_mappings
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(col_name))
+                .map(|(_, reg)| *reg);
+            if let (Some((idx, col)), Some(register)) = (column, register) {
+                if !crate::branch::store::fe_mutant("domain_takes_no_base_operator") {
+                    let decoded = program.alloc_register();
+                    crate::translate::expr::emit_user_facing_column_value(
+                        program, register, decoded, col, is_strict, resolver,
+                    )?;
+                    let collation = Some((col.collation(), false));
+                    resolver.cache_expr_reg(
+                        Cow::Owned(ast::Expr::Column {
+                            database: None,
+                            table: joined_table.internal_id,
+                            column: idx,
+                            is_rowid_alias: col.is_rowid_alias(),
+                        }),
+                        decoded,
+                        false,
+                        collation,
+                    );
+                    resolver.cache_expr_reg(
+                        Cow::Owned(ast::Expr::Id(ast::Name::exact(col_name.to_string()))),
+                        decoded,
+                        false,
+                        collation,
+                    );
+                    resolver.cache_expr_reg(
+                        Cow::Owned(ast::Expr::Qualified(
+                            ast::Name::exact(table_name.to_string()),
+                            ast::Name::exact(col_name.to_string()),
+                        )),
+                        decoded,
+                        false,
+                        collation,
+                    );
+                }
+            }
+        }
+        let emitted = emit_one_check_constraint(
+            program,
+            check_constraint,
+            resolver,
+            or_conflict,
+            skip_row_label,
+            referenced_tables,
+            table_name,
+            expr_result_reg,
+        );
+        resolver.expr_to_reg_cache.truncate(cache_len);
+        emitted?;
+    }
+    Ok(())
+}
 
+/// One CHECK of `emit_check_constraint_bytecode`, its column references resolved through the
+/// resolver's cache.
+#[allow(clippy::too_many_arguments)]
+fn emit_one_check_constraint(
+    program: &mut ProgramBuilder,
+    check_constraint: &CheckConstraint,
+    resolver: &mut Resolver,
+    or_conflict: ResolveType,
+    skip_row_label: BranchOffset,
+    referenced_tables: Option<&TableReferences>,
+    table_name: &str,
+    expr_result_reg: usize,
+) -> Result<()> {
+    {
         let mut rewritten_expr = check_constraint.expr.clone();
         if let Some(referenced_tables) = referenced_tables {
             let mut binding_tables = referenced_tables.clone();
@@ -2393,6 +2481,7 @@ pub(crate) fn emit_check_constraints<'a>(
         skip_row_label,
         referenced_tables,
         table_name,
+        &column_mappings,
     );
 
     // Always restore resolver state, even on error.
