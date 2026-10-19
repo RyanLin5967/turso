@@ -1,8 +1,8 @@
-# Recorded 2026-10-19T04:25:19Z (the raw file's mtime, UTC) on iccad11 by copy-stdin-pg18.sh, which runs copy-stdin-pg18.py (both beside this file; a raw protocol-v3 driver, not pgproto, so not in tests/pg18)
+# Recorded 2026-10-19T04:26:16Z (the raw file's mtime, UTC) on iccad11 by copy-stdin-pg18.sh, which runs copy-stdin-pg18.py (both beside this file; a raw protocol-v3 driver, not pgproto, so not in tests/pg18)
 # against a fresh PostgreSQL 18.6 cluster (/var/tmp/r226lin-wire/pg18/inst/bin, initdb -A trust, user postgres), then the three
 # `nofiles` lines through psql as a role without pg_read_server_files.
 # One line per round: every backend message in order (T and S omitted; G: CopyInResponse's format and column formats).
-# Parts 2 (setup2 .. int4range), 3 (setup3 .. order) and 4 (setup4 .. c4rows) were added in later recordings; every round before each is
+# Parts 2 (setup2 .. int4range), 3 (setup3 .. order) and 4 (setup4 .. rawnul) were added in later recordings; every round before each is
 # byte-identical to the recording before it (2026-10-19T01:41:31Z, 02:21:57Z, 04:06:35Z).
 postgres (PostgreSQL) 18.6
 setup          N 00000 table "cs" does not exist, skipping | C DROP TABLE | C CREATE TABLE | Z I
@@ -81,6 +81,7 @@ vtab           G format=0 columns=[0] | C COPY 1 | Z I
 partial        G format=0 columns=[0] | E 22021 invalid byte sequence for encoding "UTF8": 0xc3 0x28 | Z I
 headerbs       G format=0 columns=[0] | C COPY 1 | Z I
 c4rows         D ['5', None, None, 't', None] | D ['6', None, 'a\r', 'f', '2'] | D ['7', None, None, 't', None] | D ['31', None, None, 't', None] | D ['37', None, None, 't', None] | D [None, '5', None, 't', None] | C SELECT 6 | Z I
+rawnul         G format=0 columns=[0] | E 22021 invalid byte sequence for encoding "UTF8": 0x00 | Z I
 unexpected     G format=0 columns=[0] | E 08P01 unexpected message type 0x51 during COPY from stdin | E 08P01 terminating connection because protocol synchronization was lost | <closed>
 after          D ['16'] | C SELECT 1 | Z I
 rc=0
