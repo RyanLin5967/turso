@@ -387,8 +387,19 @@ pub(crate) fn schemas_dropped_in_block(pg_conn: &PgConnectionInner) -> Vec<Strin
 /// `SELECT * FROM otherdb.public.n` read, and `DELETE FROM otherdb.public.n` emptied, this
 /// database's n (wire-rev-5cdb70e58 MED-2; recorded,
 /// pg18-wirefuzz-a_three_part_name_must_name_this_database.out).
-fn refuse_cross_database(pg_conn: &PgConnectionInner, parse: &turso_pg_parser::pg_query::ParseResult) -> Result<()> {
+fn refuse_cross_database(
+    pg_conn: &PgConnectionInner,
+    sql: &str,
+    parse: &turso_pg_parser::pg_query::ParseResult,
+) -> Result<()> {
     use turso_pg_parser::pg_query::NodeRef;
+    // A three-part name is written with two '.' tokens, and no escape spells a separator, so a
+    // statement whose text holds fewer than two '.' names none and is not walked: the walk
+    // allocates the whole node list, which a simple write cannot pay (L5's write budget,
+    // wire-suite-322dc544d-239).
+    if sql.bytes().filter(|&b| b == b'.').nth(1).is_none() {
+        return Ok(());
+    }
     let mut this = None;
     for (n, ..) in parse.protobuf.nodes() {
         let NodeRef::RangeVar(rv) = n else { continue };
@@ -1605,7 +1616,7 @@ fn prepare_statement_parsed(
     // wait (lead ruling 2026-10-18, pg18-rev-bl3.out #19), from this parse, never a second one.
     refuse_dropped_schemas(pg_conn, &parse_result)?;
     refuse_alter_column_type_across_families(pg_conn, &parse_result)?;
-    refuse_cross_database(pg_conn, &parse_result)?;
+    refuse_cross_database(pg_conn, sql, &parse_result)?;
     if !pg_conn.conn.get_auto_commit() {
         let relations = turso_pg_parser::translator::named_relations(&parse_result);
         if !relations.is_empty() {
@@ -1675,7 +1686,13 @@ fn prepare_statement_parsed(
         types.columns = vec![None; aggregates.len()];
         // ... and for one holding min or max anywhere, whose boolean form the walk refuses
         // (wire-rev-2a68496d0 L5: in a subquery, a view, HAVING or ORDER BY it was answered).
-        let min_max = parse_result.protobuf.nodes().iter().any(|(n, ..)| {
+        // The text bounds the walk, never decides it: a name spelled min or max holds those
+        // letters, in any ASCII case, unless its letters are U& escapes, so a statement with
+        // neither is not walked for them (the node list it allocates is over L5's write budget,
+        // wire-suite-322dc544d-239).
+        let may_name = |word: &[u8]| sql.as_bytes().windows(word.len()).any(|w| w.eq_ignore_ascii_case(word));
+        let min_max = (may_name(b"min") || may_name(b"max") || may_name(b"u&"))
+            && parse_result.protobuf.nodes().iter().any(|(n, ..)| {
             matches!(n, turso_pg_parser::pg_query::NodeRef::FuncCall(f)
                 if f.funcname.last().is_some_and(|p| matches!(&p.node,
                     Some(turso_pg_parser::pg_query::protobuf::node::Node::String(s)) if s.sval.eq_ignore_ascii_case("min") || s.sval.eq_ignore_ascii_case("max"))))
