@@ -1898,20 +1898,40 @@ pub fn translate_alter_table(
                 )));
             };
 
-            if btree.get_column(col_name).is_some() {
+            // A definition that keeps the column's own name changes that column; only a name
+            // ANOTHER column holds is a duplicate (fastest-wire 1529a6674, PGDIV-ALTER-COLUMN-
+            // SAME-NAME: `ALTER COLUMN v TYPE varchar(5)` was "duplicate column name: v"). Mutant
+            // `alter_column_same_name_duplicate` (test builds only): any holder, as before.
+            if btree.get_column(col_name).is_some_and(|(i, _)| {
+                i != column_index || crate::branch::store::fe_mutant("alter_column_same_name_duplicate")
+            }) {
                 return Err(LimboError::ParseError(format!(
                     "duplicate column name: \"{col_name}\""
                 )));
             };
 
-            if definition
+            // A PRIMARY KEY in the new definition is accepted only when it KEEPS the column's own:
+            // the column was the key, AUTOINCREMENT is unchanged, and so is whether it is the
+            // rowid alias (which decides where the row's key lives on disk). Adding a key, or a
+            // kept key whose new type moves the alias, is still refused. Mutant
+            // `alter_column_kept_key_refused` (test builds only): every PRIMARY KEY refused.
+            if let Some(ast::ColumnConstraint::PrimaryKey { auto_increment, .. }) = definition
                 .constraints
                 .iter()
-                .any(|c| matches!(c.constraint, ast::ColumnConstraint::PrimaryKey { .. }))
+                .map(|c| &c.constraint)
+                .find(|c| matches!(c, ast::ColumnConstraint::PrimaryKey { .. }))
             {
-                return Err(LimboError::ParseError(
-                    "PRIMARY KEY constraint cannot be altered".to_string(),
-                ));
+                let old_column = &btree.columns()[column_index];
+                let kept = !crate::branch::store::fe_mutant("alter_column_kept_key_refused")
+                    && old_column.primary_key()
+                    && *auto_increment == btree.has_autoincrement
+                    && (Column::try_from(&definition)?.is_rowid_alias() && btree.has_rowid)
+                        == old_column.is_rowid_alias();
+                if !kept {
+                    return Err(LimboError::ParseError(
+                        "PRIMARY KEY constraint cannot be altered".to_string(),
+                    ));
+                }
             }
 
             if definition
