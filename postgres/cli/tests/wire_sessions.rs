@@ -15721,6 +15721,132 @@ fn a_parameter_assigned_to_a_varchar_column_is_refused_at_bind_when_too_long() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-629f4b926 HIGH-1, MED-2, MED-4 (its PG 18.6 probe, reviews/wire-629f4b926-raws/pg18-probe.out #8, #9, #24,
+/// #29, #50-#57) and wirefuzz W11 (uwq-w11-629f4b926-1 seed 1000401, PG's answer in the finding): a bound value is checked
+/// at Bind against EACH column it is assigned to, in column order, and never rewritten. 629f4b926 kept one length per
+/// parameter (the first column's) and replaced the bound value with its cut copy, so `INSERT INTO two VALUES (3, $1, $1)`
+/// with 'abc   ' stored b = 'abc' in a varchar(10) column (a silent change), and (b, a) with 'abcdef' passed Bind. A
+/// char(5) target was not checked at Bind; a numeric(6,2) target was not, so a later varchar's 22001 came first where PG
+/// answers 22003; and a named statement on its generic plan (from its sixth Bind) was refused at Bind where PG refuses
+/// at Execute, after BindComplete.
+#[test]
+fn a_bound_value_is_checked_at_bind_against_each_target_and_never_rewritten() {
+    let dir = Scratch::new("bind-targets");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE TABLE two(id int PRIMARY KEY, a varchar(3), b varchar(10))",
+        "CREATE TABLE ch(id int PRIMARY KEY, c char(5))",
+        "CREATE TABLE vc(id int PRIMARY KEY, v varchar(5))",
+        "INSERT INTO vc VALUES (1, 'ab')",
+        "CREATE TABLE t0(id int PRIMARY KEY, c0 numeric(6,2), c1 varchar(5))",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    let at_bind = |a: &mut Wire, sql: &str, values: &[Option<&[u8]>], code: &str, message: &str, wrong: &mut Vec<String>| {
+        let (types, error) = a.bind_round(sql, &[], values, &[]);
+        let ok = !types.contains(&b'2')
+            && error.as_ref().is_some_and(|e| e.code == code && e.message == message);
+        if !ok {
+            wrong.push(format!("{sql}: messages {:?} error {error:?}, PostgreSQL: no BindComplete, {code} {message}", String::from_utf8_lossy(&types)));
+        }
+    };
+    at_bind(&mut a, "INSERT INTO two (id, b, a) VALUES (2, $1, $1)", &[Some(b"abcdef")], "22001", "value too long for type character varying(3)", &mut wrong);
+    at_bind(&mut a, "INSERT INTO ch VALUES (1, $1)", &[Some(b"abcdef")], "22001", "value too long for type character(5)", &mut wrong);
+    at_bind(&mut a, "INSERT INTO t0 (id, c0, c1) VALUES (2, $1, $2)", &[Some(b"10000"), Some(b"O'Brien")], "22003", "numeric field overflow", &mut wrong);
+    // A parameter declared text is coerced too (#29).
+    let r = a.x("UPDATE vc SET v = $1 WHERE id = 1", &["abcdef"]);
+    if r.error.as_ref().map(|e| e.code.as_str()) != Some("22001") {
+        wrong.push(format!("declared text: {:?}, PostgreSQL 22001", r.error));
+    }
+    // The wider column is never given the narrower column's cut (#9): whatever the INSERT answers, b is not 'abc'.
+    let _ = a.bind_round("INSERT INTO two VALUES (3, $1, $1)", &[], &[Some(b"abc   ")], &[]);
+    let r = a.q("SELECT b, length(b) FROM two WHERE id = 3");
+    if r.rows == vec![vec![Some("abc".to_string()), Some("3".to_string())]] {
+        wrong.push("two.b varchar(10) stored 'abc' (length 3) for 'abc   ': the bound value was rewritten".to_string());
+    }
+    // A named statement: custom plans for its first five Binds (refused at Bind), the generic plan from the sixth
+    // (BindComplete, then 22001 at Execute), as PostgreSQL 18.6 chooses for this statement (#50-#57).
+    let mut parse = b"s1\0UPDATE vc SET v = $1 WHERE id = 1\0".to_vec();
+    parse.extend_from_slice(&0i16.to_be_bytes());
+    a.send(b'P', &parse);
+    a.send(b'S', &[]);
+    let _ = a.read_reply();
+    let round = |a: &mut Wire, value: &[u8]| -> (Vec<u8>, Option<WireError>) {
+        let mut bind = b"\0s1\0".to_vec();
+        bind.extend_from_slice(&0i16.to_be_bytes());
+        bind.extend_from_slice(&1i16.to_be_bytes());
+        bind.extend_from_slice(&(value.len() as i32).to_be_bytes());
+        bind.extend_from_slice(value);
+        bind.extend_from_slice(&0i16.to_be_bytes());
+        a.send(b'B', &bind);
+        a.send(b'E', &[0, 0, 0, 0, 0]);
+        a.send(b'S', &[]);
+        let (mut types, mut error) = (Vec::new(), None);
+        loop {
+            let mut head = [0u8; 5];
+            a.s.read_exact(&mut head).unwrap();
+            let len = i32::from_be_bytes([head[1], head[2], head[3], head[4]]) as usize;
+            let mut body = vec![0u8; len - 4];
+            a.s.read_exact(&mut body).unwrap();
+            types.push(head[0]);
+            if head[0] == b'E' && error.is_none() {
+                error = Some(error_fields(&body));
+            }
+            if head[0] == b'Z' {
+                return (types, error);
+            }
+        }
+    };
+    let (types, error) = round(&mut a, b"abcdef");
+    if types.contains(&b'2') || error.as_ref().map(|e| e.code.as_str()) != Some("22001") {
+        wrong.push(format!("s1 first Bind: {:?} {error:?}, PostgreSQL: no BindComplete, 22001", String::from_utf8_lossy(&types)));
+    }
+    for _ in 0..5 {
+        let _ = round(&mut a, b"ok");
+    }
+    let (types, error) = round(&mut a, b"abcdef");
+    if !types.contains(&b'2') || error.as_ref().map(|e| e.code.as_str()) != Some("22001") {
+        wrong.push(format!("s1 on its generic plan: {:?} {error:?}, PostgreSQL: BindComplete, then 22001", String::from_utf8_lossy(&types)));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-629f4b926 MED-5 (its PG 18.6 probe #9-#12, #33, #35): a value whose excess past varchar(n) is spaces is
+/// stored cut to n in each column on its own, and the parameter keeps its full value everywhere else. Owner:
+/// fastest-engine (core's varchar ENCODE has no excess-space rule; the wire no longer cuts a bound value).
+#[test]
+fn a_value_whose_excess_is_spaces_is_cut_per_column() {
+    let dir = Scratch::new("excess-spaces");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in ["CREATE TABLE two(id int PRIMARY KEY, a varchar(3), b varchar(10))", "CREATE TABLE vc(id int PRIMARY KEY, v varchar(5))", "INSERT INTO vc VALUES (1, 'ab')"] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    for (sql, value) in [
+        ("INSERT INTO two VALUES (3, $1, $1)", &b"abc   "[..]),
+        ("INSERT INTO two (id, b, a) VALUES (4, $1, $1)", &b"abc      "[..]),
+    ] {
+        let (_, error) = a.bind_round(sql, &[], &[Some(value)], &[]);
+        if error.is_some() {
+            wrong.push(format!("{sql}: {error:?}, PostgreSQL stores it"));
+        }
+    }
+    let r = a.q("SELECT id, a, length(a), b, length(b) FROM two ORDER BY id");
+    let row = |v: [&str; 5]| v.iter().map(|x| Some(x.to_string())).collect::<Vec<_>>();
+    let want = vec![row(["3", "abc", "3", "abc   ", "6"]), row(["4", "abc", "3", "abc      ", "9"])];
+    if r.rows != want {
+        wrong.push(format!("two: {:?}, PostgreSQL {want:?}", r.rows));
+    }
+    let r = a.q("INSERT INTO vc VALUES (20, 'ab      ')");
+    if r.error.is_some() {
+        wrong.push(format!("a literal with excess spaces: {:?}, PostgreSQL INSERT 0 1", r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-uw2 N5: a schema-qualified type was refused 42704 'type "public m" does not exist',
 /// its parts joined with a blank, so a pg_dump restore, which writes public.<type> for every enum
 /// and domain column, failed at its first such table. PostgreSQL 18.6 takes public.m and
