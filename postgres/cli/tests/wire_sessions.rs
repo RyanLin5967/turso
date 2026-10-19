@@ -7423,6 +7423,124 @@ fn copy_checks_its_table_first_and_reads_from_empty_as_a_file() {
     assert_eq!(r.status, b'I', "{sql}");
 }
 
+/// A COPY FROM STDIN is one past an apostrophe in a comment or a quoted name, and FROM STDOUT
+/// reads the client's rows too, as PostgreSQL 18.6 answers (recorded, copy-stdin-pg18.txt part
+/// 3: `quote`, `quotedname`, `fromstdout`). The STDIN reader took every apostrophe for a string's
+/// quote, so these read the file '' (42501).
+#[test]
+fn copy_from_stdin_is_read_past_quotes_and_from_stdout() {
+    let dir = Scratch::new("copystdinquote");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q(COPY_STDIN_TABLE).ok("cs");
+    a.q("CREATE TABLE \"o'b\" (v text)").ok("o'b");
+    for (sql, data) in [
+        ("/* Ryan's load */ COPY cs (id) FROM STDIN", &b"70\n"[..]),
+        ("COPY \"o'b\" FROM STDIN", b"x\n"),
+        ("COPY cs (id) FROM STDOUT", b"71\n"),
+    ] {
+        let r = a.copy(sql, &[CopyIn::Data(data)]).ok(sql);
+        assert_eq!(r.copy_ins.len(), 1, "{sql}");
+        assert_eq!(r.tags, vec!["COPY 1".to_string()], "{sql}");
+    }
+}
+
+/// COPY's escapes are bytes, and the field must be UTF-8, as PostgreSQL 18.6 reads them (recorded,
+/// copy-stdin-pg18.txt part 3): `\303\251` is é, `\377` and `\0` are 22021; a backslash before a
+/// newline is a newline in the field; `\.` not alone on its line is 22P04. The escapes were read
+/// as characters (`\303\251` stored Ã©), a backslash-newline ended the line, and `abc\.` loaded.
+#[test]
+fn copy_escapes_are_bytes_and_a_backslash_newline_is_data() {
+    let dir = Scratch::new("copystdinbytes");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE c1 (v text)").ok("c1");
+    let sql = "COPY c1 FROM STDIN";
+    for data in [&b"\\303\\251\n"[..], b"a\\\nb\n"] {
+        let r = a.copy(sql, &[CopyIn::Data(data)]).ok(sql);
+        assert_eq!(r.tags, vec!["COPY 1".to_string()], "{data:?}");
+    }
+    let r = a.q("SELECT v, length(v) FROM c1 ORDER BY v").ok("rows");
+    let row = |cells: &[&str]| cells.iter().map(|c| Some(c.to_string())).collect::<Vec<_>>();
+    assert_eq!(r.rows, vec![row(&["a\nb", "3"]), row(&["é", "1"])]);
+    for (data, code, message) in [
+        (&b"\\377\n"[..], "22021", "invalid byte sequence for encoding \"UTF8\": 0xff"),
+        (b"\\0\n", "22021", "invalid byte sequence for encoding \"UTF8\": 0x00"),
+        (b"abc\\.\n", "22P04", "end-of-copy marker is not alone on its line"),
+    ] {
+        let r = a.copy(sql, &[CopyIn::Data(data)]);
+        let e = r.err(sql);
+        assert_eq!((e.code.as_str(), e.message.as_str()), (code, message), "{data:?}");
+    }
+    assert_eq!(a.q("SELECT count(*) FROM c1").single("count"), "2");
+}
+
+/// COPY reads PostgreSQL 16's integer syntax (`0x10`, `1_000`) and refuses an integer past int8
+/// (22003), and checks DELIMITER and NULL as PostgreSQL 18.6's ProcessCopyOptions does, before any
+/// CopyInResponse (recorded, copy-stdin-pg18.txt part 3). `0x10` was 22P02; `DELIMITER ',;'` used
+/// its first character, `''` a tab, and the rest were taken.
+#[test]
+fn copy_reads_postgresqls_integer_syntax_and_checks_its_options() {
+    let dir = Scratch::new("copystdinopts");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q(COPY_STDIN_TABLE).ok("cs");
+    a.q("CREATE TABLE c1 (v text)").ok("c1");
+    let sql = "COPY cs (id) FROM STDIN";
+    let r = a.copy(sql, &[CopyIn::Data(b"0x10\n1_000\n")]).ok(sql);
+    assert_eq!(r.tags, vec!["COPY 2".to_string()], "{sql}");
+    let r = a.q("SELECT id FROM cs ORDER BY id").ok("ids");
+    assert_eq!(
+        r.rows,
+        vec![vec![Some("16".to_string())], vec![Some("1000".to_string())]]
+    );
+    let r = a.copy(sql, &[CopyIn::Data(b"99999999999999999999\n")]);
+    assert_eq!(r.err("past int8").code, "22003");
+    for (options, code, message) in [
+        ("(DELIMITER ',;')", "0A000", "COPY delimiter must be a single one-byte character"),
+        ("(DELIMITER '')", "0A000", "COPY delimiter must be a single one-byte character"),
+        ("(DELIMITER 'é')", "0A000", "COPY delimiter must be a single one-byte character"),
+        ("(DELIMITER E'\\\\')", "22023", "COPY delimiter cannot be \"\\\""),
+        ("(DELIMITER 'n')", "22023", "COPY delimiter cannot be \"n\""),
+        ("(DELIMITER E'\\n')", "22023", "COPY delimiter cannot be newline or carriage return"),
+        ("(NULL E'\\n')", "22023", "COPY null representation cannot use newline or carriage return"),
+        (
+            "(DELIMITER ',', NULL 'a,b')",
+            "22023",
+            "COPY delimiter character must not appear in the NULL specification",
+        ),
+    ] {
+        let sql = format!("COPY c1 FROM STDIN {options}");
+        let r = a.copy(&sql, &[]);
+        let e = r.err(&sql);
+        assert_eq!((e.code.as_str(), e.message.as_str()), (code, message), "{options}");
+        assert!(r.copy_ins.is_empty(), "{options}: a CopyInResponse");
+    }
+}
+
+/// COPY FROM a file with no file granted is 42501 before the table, its columns or its options are
+/// read, as PostgreSQL 18.6 refuses a role without pg_read_server_files first (recorded,
+/// copy-stdin-pg18.txt part 3: `nofiles`). Checked after the table, these were 42P01, 42703, 42601.
+#[test]
+fn copy_from_a_file_without_the_grant_is_refused_first() {
+    let dir = Scratch::new("copynofiles");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q(COPY_STDIN_TABLE).ok("cs");
+    for sql in [
+        "COPY nosuch FROM '/x'",
+        "COPY cs (zz) FROM '/x'",
+        "COPY cs FROM '/x' (NOSUCH 1)",
+    ] {
+        let e = a.q(sql).err(sql);
+        assert_eq!(
+            (e.code.as_str(), e.message.as_str()),
+            ("42501", "permission denied to COPY from a file"),
+            "{sql}"
+        );
+    }
+}
+
 /// The prepare-time `$n` guards leave nothing behind, by simple query and by Bind (wire review 17
 /// item 12: the extended arms of these guards passed without the guard). `ALTER TABLE ... ADD
 /// CONSTRAINT CHECK (v > $1)` is 42P02 and adds no CHECK: bound with 100, a row with v = 5 still
