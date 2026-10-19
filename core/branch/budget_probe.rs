@@ -1145,6 +1145,9 @@ pub(crate) fn end_owning(owned: &[&str]) -> Snapshot {
     let (threads_quiet, foreign, refusal) = if !cfg!(target_vendor = "apple") && syscalls.is_none() && WINDOW_N0.with(|n| n.get()).is_some() && n1.is_some() {
         let (own, f, r) = WINDOW_T0.with(|t0| attribute(0, &t0.borrow()[..], &WINDOW_C0.with(|c| c.get()), &t1, &c1, ends, owned, true));
         (own.is_some() && f == 0, f, if own.is_some() { refusal } else { r })
+    } else if !cfg!(target_vendor = "apple") && syscalls.is_none() {
+        // budgets-port-adversary LOW-2: no count and a table unreadable at an end: the table refused it.
+        (false, foreign, Refusal::Table)
     } else {
         (attributed.is_some(), foreign, refusal)
     };
