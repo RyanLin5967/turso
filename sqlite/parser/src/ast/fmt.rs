@@ -897,6 +897,70 @@ impl ToTokens for Stmt {
 }
 
 impl_display_for_to_tokens!(Expr);
+/// The precedence SQLite's parser gives an expression's top operator (`Parser::current_token_precedence`,
+/// 0 for OR up to 11 for a prefix `-`, `+` or `~` and 12 for a subscript); 13 for an operand. The
+/// printer parenthesizes an operand whose precedence the parser would not read back in that place:
+/// a left operand below its operator's, a right operand at or below it (the parser reads every
+/// binary operator left to right). A tree SQLite's parser built never meets either case without its
+/// own Parenthesized node, so its text is unchanged; a tree built another way, such as the PostgreSQL
+/// translator's (pg_query drops parentheses), printed `(1 + 2) * 3` as `1 + 2 * 3`, which reads back
+/// as 7 (REVIEW-engine-2bdcd32c6 HIGH 3).
+fn precedence(expr: &Expr) -> u8 {
+    match expr {
+        Expr::Binary(_, op, _) => operator_precedence(op),
+        // A negative number literal (the PostgreSQL translator's folded `-5`) reads back as a
+        // prefix minus.
+        Expr::Literal(Literal::Numeric(n)) if n.starts_with('-') => 11,
+        Expr::Unary(UnaryOperator::Not, _) => 2,
+        Expr::Unary(..) => 11,
+        Expr::Between { .. }
+        | Expr::InList { .. }
+        | Expr::InSelect { .. }
+        | Expr::InTable { .. }
+        | Expr::IsNull(_)
+        | Expr::NotNull(_)
+        | Expr::Like { .. } => 3,
+        Expr::Collate(..) => 10,
+        Expr::Subscript { .. } => 12,
+        _ => 13,
+    }
+}
+
+fn operator_precedence(op: &Operator) -> u8 {
+    match op {
+        Operator::Or => 0,
+        Operator::And => 1,
+        Operator::Equals | Operator::NotEquals | Operator::Is | Operator::IsNot => 3,
+        Operator::Less
+        | Operator::LessEquals
+        | Operator::Greater
+        | Operator::GreaterEquals
+        | Operator::ArrayContains
+        | Operator::ArrayOverlap => 4,
+        Operator::BitwiseAnd | Operator::BitwiseOr | Operator::LeftShift | Operator::RightShift => 6,
+        Operator::Add | Operator::Subtract => 7,
+        Operator::Multiply | Operator::Divide | Operator::Modulus => 8,
+        Operator::Concat | Operator::ArrowRight | Operator::ArrowRightShift => 9,
+        Operator::BitwiseNot => 11,
+    }
+}
+
+/// An operand, in parentheses when `wrap`.
+fn operand<S: TokenStream + ?Sized, C: ToSqlContext>(
+    expr: &Expr,
+    wrap: bool,
+    s: &mut S,
+    context: &C,
+) -> Result<(), S::Error> {
+    if wrap {
+        s.append(TK_LP, None)?;
+        expr.to_tokens(s, context)?;
+        s.append(TK_RP, None)
+    } else {
+        expr.to_tokens(s, context)
+    }
+}
+
 impl ToTokens for Expr {
     fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
         &self,
@@ -914,19 +978,20 @@ impl ToTokens for Expr {
                 start,
                 end,
             } => {
-                lhs.to_tokens(s, context)?;
+                operand(lhs, precedence(lhs) < 3, s, context)?;
                 if *not {
                     s.append(TK_NOT, None)?;
                 }
                 s.append(TK_BETWEEN, None)?;
-                start.to_tokens(s, context)?;
+                operand(start, precedence(start) < 3, s, context)?;
                 s.append(TK_AND, None)?;
-                end.to_tokens(s, context)
+                operand(end, precedence(end) <= 3, s, context)
             }
             Self::Binary(lhs, op, rhs) => {
-                lhs.to_tokens(s, context)?;
+                let p = operator_precedence(op);
+                operand(lhs, precedence(lhs) < p, s, context)?;
                 op.to_tokens(s, context)?;
-                rhs.to_tokens(s, context)
+                operand(rhs, precedence(rhs) <= p, s, context)
             }
             Self::Register(reg) => {
                 // This is for internal use only, not part of SQL syntax
@@ -965,7 +1030,7 @@ impl ToTokens for Expr {
                 s.append(TK_RP, None)
             }
             Self::Collate(expr, collation) => {
-                expr.to_tokens(s, context)?;
+                operand(expr, precedence(expr) < 10, s, context)?;
                 s.append(TK_COLLATE, None)?;
                 s.append(TK_ID, Some(&collation.as_ident()))
             }
@@ -1032,7 +1097,7 @@ impl ToTokens for Expr {
                 s.append(TK_ID, Some(col_name.as_ref()))
             }
             Self::InList { lhs, not, rhs } => {
-                lhs.to_tokens(s, context)?;
+                operand(lhs, precedence(lhs) < 3, s, context)?;
                 if *not {
                     s.append(TK_NOT, None)?;
                 }
@@ -1044,7 +1109,7 @@ impl ToTokens for Expr {
                 s.append(TK_RP, None)
             }
             Self::InSelect { lhs, not, rhs } => {
-                lhs.to_tokens(s, context)?;
+                operand(lhs, precedence(lhs) < 3, s, context)?;
                 if *not {
                     s.append(TK_NOT, None)?;
                 }
@@ -1059,7 +1124,7 @@ impl ToTokens for Expr {
                 rhs,
                 args,
             } => {
-                lhs.to_tokens(s, context)?;
+                operand(lhs, precedence(lhs) < 3, s, context)?;
                 if *not {
                     s.append(TK_NOT, None)?;
                 }
@@ -1073,7 +1138,7 @@ impl ToTokens for Expr {
                 Ok(())
             }
             Self::IsNull(sub_expr) => {
-                sub_expr.to_tokens(s, context)?;
+                operand(sub_expr, precedence(sub_expr) < 3, s, context)?;
                 s.append(TK_ISNULL, None)
             }
             Self::Like {
@@ -1083,22 +1148,22 @@ impl ToTokens for Expr {
                 rhs,
                 escape,
             } => {
-                lhs.to_tokens(s, context)?;
+                operand(lhs, precedence(lhs) < 3, s, context)?;
                 if *not {
                     s.append(TK_NOT, None)?;
                 }
                 op.to_tokens(s, context)?;
-                rhs.to_tokens(s, context)?;
+                operand(rhs, precedence(rhs) <= 3, s, context)?;
                 if let Some(escape) = escape {
                     s.append(TK_ESCAPE, None)?;
-                    escape.to_tokens(s, context)?;
+                    operand(escape, precedence(escape) <= 3, s, context)?;
                 }
                 Ok(())
             }
             Self::Literal(lit) => lit.to_tokens(s, context),
             Self::Name(name) => name.to_tokens(s, context),
             Self::NotNull(sub_expr) => {
-                sub_expr.to_tokens(s, context)?;
+                operand(sub_expr, precedence(sub_expr) < 3, s, context)?;
                 s.append(TK_NOTNULL, None)
             }
             Self::Parenthesized(exprs) => {
@@ -1134,7 +1199,8 @@ impl ToTokens for Expr {
             }
             Self::Unary(op, sub_expr) => {
                 op.to_tokens(s, context)?;
-                sub_expr.to_tokens(s, context)
+                let p = if matches!(op, UnaryOperator::Not) { 2 } else { 11 };
+                operand(sub_expr, precedence(sub_expr) < p, s, context)
             }
             Self::Variable(var) => {
                 if let Some(name) = var.name.as_deref() {
@@ -1152,7 +1218,7 @@ impl ToTokens for Expr {
                 s.append(TK_RBRACKET, None)
             }
             Self::Subscript { base, index } => {
-                base.to_tokens(s, context)?;
+                operand(base, precedence(base) < 12, s, context)?;
                 s.append(TK_LBRACKET, None)?;
                 index.to_tokens(s, context)?;
                 s.append(TK_RBRACKET, None)
@@ -1841,7 +1907,15 @@ impl ToTokens for ColumnConstraint {
             }
             Self::Default(expr) => {
                 s.append(TK_DEFAULT, None)?;
-                expr.to_tokens(s, context)
+                // A translated DEFAULT that is not one of the grammar's bare forms prints in
+                // parentheses, or the text does not parse back (REVIEW-engine-2bdcd32c6 HIGH 3).
+                if expr.is_bare_default() {
+                    expr.to_tokens(s, context)
+                } else {
+                    s.append(TK_LP, None)?;
+                    expr.to_tokens(s, context)?;
+                    s.append(TK_RP, None)
+                }
             }
             Self::Collate { collation_name } => {
                 s.append(TK_COLLATE, None)?;
