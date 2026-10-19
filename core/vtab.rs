@@ -355,7 +355,7 @@ impl Drop for ExtTable {
             return;
         }
         let rc = unsafe { (self.implementation.destroy)(self.ptr.load(Ordering::SeqCst) as *const c_void) };
-        if rc != ResultCode::OK {
+        if !rc.is_ok() {
             // Its DROP committed; a destroy that fails after it cannot fail the DROP.
             tracing::error!("destroying a dropped virtual table failed: {rc}");
         }
