@@ -2723,6 +2723,10 @@ fn a_thread_table_read_without_descriptors_is_refused() {
         let (one, two) = (at(1), at(2));
         assert!(two.contains(" table=listed "), "premise: with 2 free descriptors the table is read and lists the caller ({two})");
         assert!(one.contains(" table=refused ") && one.contains(" blocked=refused"), "CLAIM: with 1 free descriptor the thread table read as complete: {one}");
+        // budgets-port-adversary LOW-2: a window whose thread table could not be read at either end records
+        // that refusal (Table), not NoKernelCount.
+        let want = format!(" window_refusal={} ", probe::Refusal::Table as u64);
+        assert!(one.contains(&want), "CLAIM: a window with its thread table unreadable at both ends did not record Table ({}): {one}", probe::Refusal::Table as u64);
         return;
     }
     let (tx, rx) = std::sync::mpsc::channel::<()>();
@@ -2764,6 +2768,9 @@ fn a_thread_table_read_without_descriptors_is_refused() {
         let mut t = [probe::ThreadCpu::EMPTY; 48];
         let n = probe::thread_table(&mut t);
         let blocked = probe::others_blocked();
+        // budgets-port-adversary LOW-2: a window whose table is unreadable at both ends.
+        let _w0 = probe::begin();
+        let w1 = probe::end_owning(&[]);
         for fd in fds {
             // SAFETY: descriptors opened above.
             unsafe { libc::close(fd) };
@@ -2778,7 +2785,7 @@ fn a_thread_table_read_without_descriptors_is_refused() {
             Some(true) => "all",
             Some(false) => "some",
         };
-        println!("FD-TABLE free={free} table={table} n={n:?} blocked={blocked}");
+        println!("FD-TABLE free={free} table={table} n={n:?} blocked={blocked} window_refusal={} ", w1.refusal as u64);
     }
     // SAFETY: the limit read above.
     unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &old) };
