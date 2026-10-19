@@ -377,7 +377,7 @@ def after_problems(nm, sm, cols):
     return why
 
 
-def raw_problems(nm, d, sm):
+def raw_problems(nm, d, sm, require_ok=True):
     """What the run's raw.tsv says against its summary (comp review 1 LOW 17: the summary was trusted): one warm-up row
     per warm-up op, (competitors review 2 item 1) no measured row claimed (claim_ns; intended_ns when the raw has no
     claim_ns) at or after tm1_ns, the window's end as claim_op stamped it, and (comp review 1 MED 9) a bbload run's after columns and tput_unit
@@ -405,9 +405,11 @@ def raw_problems(nm, d, sm):
         why.append(f"{nm} run has no measured_ops count ({mo!r})")
     elif len(meas) != mo:
         why.append(f"{nm} run's raw.tsv holds {len(meas)} measured rows, its summary measured_ops {mo}")
-    # (measured_ok is checked where the summary records it, as both producers' summaries do; a summary without it is
-    # not refused here -- the warm-up plants' records are judged by this function too)
-    if mok is not None and not _count(mok):
+    # comp-rev-9bc7d894a LOW 2: a cell's runs (check()) must record measured_ok, as both producers' summaries do; only
+    # warm_check's plant records (require_ok False) may lack it
+    if mok is None and require_ok:
+        why.append(f"{nm} run has no measured_ok count (None)")
+    elif mok is not None and not _count(mok):
         why.append(f"{nm} run's measured_ok {mok!r} is not a count")
     elif mok is not None:
         nok = sum(1 for r in meas if r.get("ok") == "1")
@@ -469,7 +471,8 @@ def warm_check(d, warm_rule):
     sm = load(os.path.join(d, "summary.json"))
     if sm is None:
         return [f"no {d}/summary.json"]
-    return warm_problems("run", sm, warm_rule) + record_problems("run", sm) + raw_problems("run", d, sm)
+    # (a warm-up plant's record may lack measured_ok: comp-rev-9bc7d894a LOW 2 allows its absence here only)
+    return warm_problems("run", sm, warm_rule) + record_problems("run", sm) + raw_problems("run", d, sm, require_ok=False)
 
 
 # the lead's LOW 21 ruling: N = 1 and 1,000 are the ONLY registered tiers (comp-rev-89ec-b3c3 MED 3: an allowlist; the
