@@ -425,6 +425,19 @@ pub(super) fn find_custom_type_operator(
             (Some(f), _) | (None, Some(f)) => return Some(resolved(f)),
             (None, None) => {}
         }
+        // Neither operand a column of such a type: a value of one (`derived_operand_info`:
+        // sum(b), max(b), a derived relation's typed column, b + 1) computes by its type's
+        // operator too, the same rule (engine review 2bdcd32c6 HIGH 5, arithmetic half:
+        // `sum(b) + 1` over numeric(8, 2) was SQLite's 14.0 on the numeric text, where PostgreSQL
+        // answers 14.00). Mutant `derived_value_computes_plainly` (test builds only): SQLite's
+        // arithmetic, as before.
+        if lhs_info.is_none() && rhs_info.is_none() && !crate::branch::store::fe_mutant("derived_value_computes_plainly") {
+            let lhs_derived = derived_operand_info(e1, referenced_tables, resolver).map(with_operators);
+            let rhs_derived = derived_operand_info(e2, referenced_tables, resolver).map(with_operators);
+            if let Some(f) = defines(&lhs_derived).or_else(|| defines(&rhs_derived)) {
+                return Some(resolved(f));
+            }
+        }
     }
 
     // A comparison between operands neither of which is a column of a custom type compares
