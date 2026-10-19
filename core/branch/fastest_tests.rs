@@ -15369,7 +15369,15 @@ mod l5_vtab {
         fn insert(&mut self, _args: &[Value]) -> Result<i64, Self::Error> {
             Ok(1)
         }
+
+        fn destroy(&mut self) -> Result<(), Self::Error> {
+            DESTROYS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
     }
+
+    /// How many L5 tables have been destroyed (engine-rev-qaf-fix MED-7's red reads it).
+    pub(super) static DESTROYS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     impl VTabCursor for L5Cursor {
         type Error = String;
@@ -15895,4 +15903,33 @@ fn a_trunk_commits_barrier_never_gathers_a_cohort() {
     trunk.execute("UPDATE t SET v = 'new' WHERE id = 3").unwrap();
     let g1 = db.branches.gather_counters();
     assert_eq!(g1[0] - g0[0], 0, "CLAIM: the trunk commit's barrier held no cohort gather");
+}
+
+/// engine-rev-qaf-fix MED-7: a dropped virtual table is destroyed only once no connection holds it.
+/// Connection B's schema (shared from the database's) holds A's table; A's DROP commits, and the
+/// module's table must not be destroyed while B still holds it. Once B has moved to the new schema
+/// and every holder is gone, it is destroyed, once. Before the fix A destroyed it at its own commit,
+/// checking only A's schemas, so B held a freed table.
+#[test]
+fn a_dropped_virtual_table_is_destroyed_only_once_no_connection_holds_it() {
+    let _g = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("l5-shared.db"), DatabaseOpts::new());
+    let a = db.connect().unwrap();
+    a.register_static_extension(|api| unsafe {
+        l5_vtab::L5VTabModule::register_L5VTabModule(api);
+    });
+    a.execute("CREATE VIRTUAL TABLE vt USING l5_vtab").unwrap();
+    let b = db.connect().unwrap();
+    let held_by_b = b.schema.read().get_table("vt").is_some();
+    let d0 = l5_vtab::DESTROYS.load(std::sync::atomic::Ordering::SeqCst);
+    a.execute("DROP TABLE vt").unwrap();
+    let d1 = l5_vtab::DESTROYS.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(held_by_b, "premise: connection B's schema holds vt");
+    assert_eq!(d1 - d0, 0, "CLAIM: the table was not destroyed while connection B still held it");
+    drop(b);
+    drop(a);
+    drop(db);
+    let d2 = l5_vtab::DESTROYS.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(d2 - d0, 1, "CLAIM: once no connection held it, the table was destroyed once");
 }
