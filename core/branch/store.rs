@@ -1945,8 +1945,11 @@ struct CatState {
     links_prefilled: bool,
     /// Link fill threads this store started (observing only; links adversary 3 L2).
     links_fill_starts: u64,
-    /// A fill batch committed on this catalog, so its link columns and the cursor's table exist.
-    links_columns_made: bool,
+    /// A fill batch committed on this catalog, so its link columns and the cursor's table exist. Set
+    /// by the fill thread the moment a batch commits, WITHOUT the store mutex (links H1 reopened: a
+    /// committed batch recorded only under the mutex was starved of it by a foreground that takes it
+    /// on every operation, and past the hard limit the gate went on waiting for columns that existed).
+    links_columns_made: Arc<AtomicBool>,
     /// Checkpoint and settle counters (observing only).
     ckpt: CkptCounters,
     /// The part of `trunk_probes`/`trunk_rows` made by `trunk_written_known`'s once-per-page probe
@@ -2260,7 +2263,7 @@ impl CatState {
             links_cursor: None,
             links_prefilled: false,
             links_fill_starts: 0,
-            links_columns_made: false,
+            links_columns_made: Arc::new(AtomicBool::new(false)),
             ckpt: CkptCounters::default(),
             catalog,
             dirty: HashMap::new(),
@@ -3732,7 +3735,7 @@ impl Drop for CutGate<'_> {
 /// the writer only: left to the flipping checkpoint, that work (O(rows), a pragma the probe's row
 /// count does not see) ran under the store mutex in a sharp store (red a722957c4). Mutant
 /// `l4_fill_wal_left` (test builds only): not truncated here.
-fn run_links_fill(shared: &StoreMutex, writer: &Mutex<Catalog>, group: &Group) {
+fn run_links_fill(shared: &StoreMutex, writer: &Mutex<Catalog>, group: &Group, made: &AtomicBool) {
     // Links adversary 3 H1: progress is monotone across opens. The cursor committed with the last
     // batch is resumed while the catalog's generation is still the one it was filled under (no
     // checkpoint of any build has committed since, so the rows it covers are as they were); else
@@ -3747,7 +3750,7 @@ fn run_links_fill(shared: &StoreMutex, writer: &Mutex<Catalog>, group: &Group) {
         Ok(Some((g, at, done))) if g == generation => {
             let mut inner = shared.lock();
             if let Some(cat) = inner.cat.as_mut().filter(|c| c.filling) {
-                cat.links_columns_made = true;
+                cat.links_columns_made.store(true, Ordering::Release);
                 if done {
                     cat.links_prefilled = true;
                     cat.filling = false;
@@ -3793,6 +3796,11 @@ fn run_links_fill(shared: &StoreMutex, writer: &Mutex<Catalog>, group: &Group) {
             }
             done
         };
+        // Recorded the moment the batch commits, before anything waits for the store mutex. Mutant
+        // `l4_columns_recorded_under_mutex` (test builds only): recorded only under it, as before.
+        if batch.is_ok() && !fe_mutant("l4_columns_recorded_under_mutex") {
+            made.store(true, Ordering::Release);
+        }
         if batch.is_ok() {
             kill_point("ckpt.upgrade.batch");
         }
@@ -3815,7 +3823,7 @@ fn run_links_fill(shared: &StoreMutex, writer: &Mutex<Catalog>, group: &Group) {
             return;
         };
         if batch.is_ok() {
-            cat.links_columns_made = true;
+            cat.links_columns_made.store(true, Ordering::Release);
         }
         match batch {
             Ok(Some(next)) if cat.filling => {
@@ -6210,7 +6218,7 @@ impl BranchStore {
         // Only once a batch has made the link columns (and the cursor's table): the checkpoint then
         // changes no schema, which in a fuzzy flight would fail the store's pinned reads ("Database
         // schema changed", the oracle's in-flight check, raw ls-green2_131f8832a).
-        if past_hard && cat.links_columns_made && !fe_mutant("l4_fill_waits_past_hard_limit") {
+        if past_hard && cat.links_columns_made.load(Ordering::Acquire) && !fe_mutant("l4_fill_waits_past_hard_limit") {
             cat.filling = false;
             return false;
         }
@@ -6226,10 +6234,10 @@ impl BranchStore {
         }
         cat.filling = true;
         cat.links_cursor = None;
-        let (shared, writer, group) = (self.inner.clone(), cat.writer.clone(), self.group.clone());
+        let (shared, writer, group, made) = (self.inner.clone(), cat.writer.clone(), self.group.clone(), cat.links_columns_made.clone());
         let spawned = crate::thread::Builder::new()
             .name("branch-links-fill".to_string())
-            .spawn(move || run_links_fill(&shared, &writer, &group));
+            .spawn(move || run_links_fill(&shared, &writer, &group, &made));
         match spawned {
             Ok(handle) => {
                 *self.links_fill.lock() = Some(handle);
