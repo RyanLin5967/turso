@@ -15684,6 +15684,12 @@ fn no_create_allocates_a_table_chunk_or_segment_under_the_mutex_across_a_segment
     let db = open_at(&dir.path().join("seg.db"), opts(true, SyncClass::Fsync));
     let trunk = db.connect().unwrap();
     seed(&trunk);
+    // The store's first create builds its catalog, a separate registered red
+    // (a_first_create_makes_its_catalog_in_one_commit_off_the_store_mutex): about 2.6 MB under the
+    // mutex, measured by diag_the_create_that_allocates_megabytes_under_the_store_mutex at create 0
+    // (lane raw 78d2823373). This test is about growth across a segment, so that create is made
+    // first, unmeasured.
+    trunk.create_branch("first").unwrap();
     let worst: u64 = std::thread::scope(|s| {
         let handles: Vec<_> = (0..16u64)
             .map(|t| {
