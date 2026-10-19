@@ -652,46 +652,74 @@ static int my_fail(conn_t *x, char *why, size_t wsz) {
     return -1;
 }
 
-/* Wait until FD is readable or the deadline DL (now_ns) passes (comp-rev-67b2 LOW-B). */
-static int wait_readable(int fd, uint64_t dl, char *why, size_t wsz) {
-    for (;;) {
-        uint64_t n = now_ns();
-        if (n >= dl) { snprintf(why, wsz, "the server did not answer within %.1f s", CLOSE_TIMEOUT_S); return -1; }
-        struct pollfd pf = {fd, POLLIN, 0};
-        int pr = poll(&pf, 1, (int)((dl - n) / 1000000 + 1));
-        if (pr > 0) return 0;
-        if (pr < 0 && errno != EINTR) { snprintf(why, wsz, "poll: %s", strerror(errno)); return -1; }
+static int conn_exec(conn_t *x, const char *sql, int need_rows, char *why, size_t wsz);
+
+/* A watchdog over one blocking call on a socket (comp-rev-2404 LOW-1): unless disarmed before DL (CLOCK_REALTIME),
+ * it shuts the socket down, so every read the call is blocked in -- the first byte or any later one, in libpq or
+ * in Connector/C -- returns at once with an error. One deadline bounds the WHOLE reply. */
+typedef struct {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    int fd, done, fired;
+    struct timespec dl;
+} watch_t;
+static void *watch_main(void *p) {
+    watch_t *wd = p;
+    pthread_mutex_lock(&wd->mu);
+    while (!wd->done) {
+        if (pthread_cond_timedwait(&wd->cv, &wd->mu, &wd->dl) == ETIMEDOUT && !wd->done) {
+            wd->fired = 1;
+            shutdown(wd->fd, SHUT_RDWR);
+            break;
+        }
     }
+    pthread_mutex_unlock(&wd->mu);
+    return NULL;
 }
 
-/* One SELECT 1 on X, bounded by SECS: 0 when the server answered it, -1 (WHY) when the connection is gone, the
- * query failed, or no answer came in time (comp-rev-b15 LOW-1, comp-rev-67b2 LOW-B). */
+/* One SELECT 1 on X, the whole reply bounded by SECS: 0 when the server answered it, -1 (WHY) when the connection
+ * is gone, the query failed, the reply broke off (comp-rev-2404 MED-1: conn_exec checks a NULL result against
+ * mysql_field_count), or no complete answer came in time (comp-rev-b15 LOW-1, comp-rev-67b2 LOW-B,
+ * comp-rev-2404 LOW-1). It runs the same conn_exec every op uses, under the watchdog. */
 static int conn_probe(conn_t *x, double secs, char *why, size_t wsz) {
-    uint64_t dl = now_ns() + (uint64_t)(secs * 1e9);
-    if (x->proto == P_PG) {
-        if (!x->pg || PQstatus(x->pg) != CONNECTION_OK) { snprintf(why, wsz, "connection not open"); return -1; }
-        if (!PQsendQuery(x->pg, "SELECT 1")) { snprintf(why, wsz, "%s", PQerrorMessage(x->pg)); return -1; }
-        int fd = PQsocket(x->pg);
-        while (PQisBusy(x->pg)) {
-            if (wait_readable(fd, dl, why, wsz) != 0) return -1;
-            if (!PQconsumeInput(x->pg)) { snprintf(why, wsz, "%s", PQerrorMessage(x->pg)); return -1; }
-        }
-        int bad = 0;
-        PGresult *r;
-        while ((r = PQgetResult(x->pg))) {
-            if (PQresultStatus(r) != PGRES_TUPLES_OK && !bad) { snprintf(why, wsz, "%s", PQresultErrorMessage(r)); bad = 1; }
-            PQclear(r);
-        }
-        if (!bad && PQstatus(x->pg) != CONNECTION_OK) { snprintf(why, wsz, "%s", PQerrorMessage(x->pg)); bad = 1; }
-        return bad ? -1 : 0;
+    int fd = x->proto == P_PG ? (x->pg ? PQsocket(x->pg) : -1) : (x->my ? (int)mysql_get_socket(x->my) : -1);
+    if (fd < 0) { snprintf(why, wsz, "connection not open"); return -1; }
+    watch_t wd = {.fd = fd};
+    pthread_mutex_init(&wd.mu, NULL);
+    pthread_cond_init(&wd.cv, NULL);
+    clock_gettime(CLOCK_REALTIME, &wd.dl);
+    uint64_t ns = (uint64_t)wd.dl.tv_nsec + (uint64_t)(secs * 1e9);
+    wd.dl.tv_sec += (time_t)(ns / 1000000000u);
+    wd.dl.tv_nsec = (long)(ns % 1000000000u);
+    pthread_t th;
+    int armed = pthread_create(&th, NULL, watch_main, &wd) == 0;
+    if (!armed) { snprintf(why, wsz, "probe watchdog: pthread_create failed"); return -1; } /* never unbounded */
+    int rc = conn_exec(x, "SELECT 1", 0, why, wsz);
+    pthread_mutex_lock(&wd.mu);
+    wd.done = 1;
+    pthread_cond_signal(&wd.cv);
+    pthread_mutex_unlock(&wd.mu);
+    pthread_join(th, NULL);
+    if (wd.fired) { snprintf(why, wsz, "the server did not answer within %.1f s", secs); rc = -1; }
+    if (rc == 0 && x->proto == P_PG && (!x->pg || PQstatus(x->pg) != CONNECTION_OK)) {
+        snprintf(why, wsz, "connection not OK after the probe");
+        rc = -1;
     }
-    if (!x->my) { snprintf(why, wsz, "connection lost earlier (closed after a lost-connection error)"); return -1; }
-    if (mysql_send_query(x->my, "SELECT 1", 8) != 0) return my_fail(x, why, wsz);
-    if (wait_readable((int)mysql_get_socket(x->my), dl, why, wsz) != 0) return -1;
-    if (mysql_read_query_result(x->my) != 0) return my_fail(x, why, wsz);
-    MYSQL_RES *res = mysql_store_result(x->my);
-    if (res) mysql_free_result(res);
-    return 0;
+    pthread_cond_destroy(&wd.cv);
+    pthread_mutex_destroy(&wd.mu);
+    return rc;
+}
+
+/* Drop X without waiting on its peer (comp-rev-2404 LOW-2): shut the socket down, then free the handle. The
+ * graceful close (conn_close_sync) waits up to CLOSE_TIMEOUT_S more for a hung peer, which pushed a hung home past
+ * --stall-s <= 10 into an rc 4 stall; the probe's one deadline is now the only wait. */
+static void conn_abandon(conn_t *x) {
+    int fd = x->proto == P_PG ? (x->pg ? PQsocket(x->pg) : -1) : (x->my ? (int)mysql_get_socket(x->my) : -1);
+    if (fd >= 0) shutdown(fd, SHUT_RDWR);
+    if (x->pg) PQfinish(x->pg);
+    if (x->my) mysql_close(x->my);
+    x->pg = NULL;
+    x->my = NULL;
 }
 
 /* Run one statement; need_rows: it must affect >= 1 row. */
@@ -1127,16 +1155,18 @@ done:
      * never noticed: libpq's status and a MySQL handle change only when used. One untimed SELECT 1 on the home
      * connection after the last op: a failure is counted (other_err) and refuses the run. A handle already closed
      * after a lost-connection error was counted when it was lost. */
-    /* comp-rev-67b2 LOW-B: the check is BOUNDED (conn_probe, CLOSE_TIMEOUT_S): a home backend that hangs is blamed
-     * on the home connection (other_err, rc 3) within that bound, not reported as an ops stall (rc 4) after
-     * --stall-s; the dead or hung handle is then closed so teardown fails at once instead of waiting on it.
+    /* comp-rev-67b2 LOW-B, comp-rev-2404 LOW-1/LOW-2: the check is BOUNDED, the whole reply by one deadline
+     * (conn_probe's watchdog, CLOSE_TIMEOUT_S): a dead or hung home is blamed on the home connection (other_err,
+     * rc 3), never reported as an ops stall (rc 4). The handle is then ABANDONED (conn_abandon: no further wait on
+     * the peer), so teardown fails at once and the deadline above is the only wait: CLOSE_TIMEOUT_S (5 s) must stay
+     * below --stall-s, the stated minimum (run_system.sh uses 600 s; test_probe_shapes.py checks it at 8 s).
      * LOW-C, stated: this SELECT 1 runs after this client's last op, untimed and recorded nowhere, but with
      * --no-drain at C > 1 it can overlap other clients' measured ops, and it falls inside a labelling run's strace
      * window. It writes nothing (no flush expected; not straced to prove it) and --no-drain cells are refused. */
     if (c->home.pg || c->home.my) {
         if (conn_probe(&c->home, CLOSE_TIMEOUT_S, w, sizeof w) != 0) {
             other_fail("home connection lost (found after the last op)", w);
-            conn_close(&c->home);
+            conn_abandon(&c->home);
         }
     }
     for (int k = 0; k < S.nteardown; k++) {
