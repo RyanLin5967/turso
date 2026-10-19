@@ -88,7 +88,15 @@ pub struct PostgreSQLTranslator {
     /// them, for the caller to check against the engine's types before anything runs
     /// ([`PostgreSQLTranslator::user_column_types`]; wire-rev-uw1 M1).
     user_column_types: std::cell::RefCell<Vec<String>>,
+    /// Whether a relation of a name exists beside a table, by (the table's schema as written or
+    /// empty, the table, the name), when the caller can tell
+    /// ([`PostgreSQLTranslator::with_relation_names`]): an index with no name is named as
+    /// PostgreSQL names it, numbered past every taken name.
+    relation_taken: Option<Box<RelationTaken>>,
 }
+
+/// See [`PostgreSQLTranslator::with_relation_names`].
+type RelationTaken = dyn Fn(&str, &str, &str) -> bool;
 
 /// One WITH's CTEs: each name, with its output columns when its query names them all.
 type CteScope = Vec<(String, Option<Vec<String>>)>;
@@ -132,6 +140,15 @@ impl PostgreSQLTranslator {
         lookup: impl Fn(&str, &str) -> Option<Vec<String>> + 'static,
     ) -> Self {
         self.columns = Some(Box::new(lookup));
+        self
+    }
+
+    /// The translator, able to tell whether a relation name is taken beside a table (by the
+    /// table's schema as written or empty, the table, the name), which a CREATE INDEX with no name
+    /// needs to choose PostgreSQL's name for it ([`choose_index_name`]). With none, such an index
+    /// takes the first name, unnumbered.
+    pub fn with_relation_names(mut self, taken: impl Fn(&str, &str, &str) -> bool + 'static) -> Self {
+        self.relation_taken = Some(Box::new(taken));
         self
     }
 
@@ -1343,7 +1360,27 @@ impl PostgreSQLTranslator {
         // table's schema. It was dropped, so `CREATE UNIQUE INDEX ON s.t` indexed whichever t the
         // bare name found, enforcing on the wrong table. public is the main database, as in
         // qualified_name_from_range_var (wire review 17 item 1).
-        let index_name = pg_name(&idx.idxname);
+        // An index with no name gets PostgreSQL's (wirefuzz vs PG 18.6: it was built under the
+        // empty name, so a second was refused 42601 "index  already exists").
+        let chosen;
+        let index_name = if idx.idxname.is_empty() {
+            let columns: Vec<String> = idx
+                .index_params
+                .iter()
+                .filter_map(|p| match &p.node {
+                    Some(Node::IndexElem(e)) => Some(if e.name.is_empty() { "expr".to_string() } else { e.name.clone() }),
+                    _ => None,
+                })
+                .collect();
+            chosen = choose_index_name(&relation.relname, &columns, &|name| {
+                self.relation_taken
+                    .as_ref()
+                    .is_some_and(|taken| taken(&relation.schemaname, &relation.relname, name))
+            });
+            pg_name(&chosen)
+        } else {
+            pg_name(&idx.idxname)
+        };
         let idx_name = match schema_qualifier(&relation.schemaname) {
             SchemaQualifier::Unqualified
             | SchemaQualifier::PgCatalog
@@ -6824,6 +6861,72 @@ pub struct PgCopyFromStmt {
     pub delimiter: Option<String>,
     pub header: bool,
     pub null_string: Option<String>,
+}
+
+/// The name PostgreSQL 18 gives an index created with none (indexcmds.c ChooseIndexName with
+/// ChooseIndexColumnNames, ChooseRelationName and makeObjectName): the table, the columns ("expr"
+/// for an expression; a repeated one numbered, expr, expr1) and "idx", joined by "_", the longer of
+/// the table and column parts cut a character at a time until the name fits 63 bytes; then "idx1",
+/// "idx2", ... while `taken` says the name is any relation's (recorded, pg18-index-names.out).
+pub fn choose_index_name(table: &str, columns: &[String], taken: &dyn Fn(&str) -> bool) -> String {
+    const NAME_MAX: usize = 63;
+    let mut unique: Vec<String> = Vec::with_capacity(columns.len());
+    for c in columns {
+        let mut name = c.clone();
+        let mut n = 0;
+        while unique.contains(&name) {
+            n += 1;
+            name = format!("{c}{n}");
+        }
+        unique.push(name);
+    }
+    let mut addition = String::new();
+    for c in &unique {
+        if !addition.is_empty() {
+            addition.push('_');
+        }
+        addition.push_str(c);
+        if addition.len() >= NAME_MAX {
+            break;
+        }
+    }
+    // A prefix of whole characters at most `bytes` long.
+    let clip = |s: &str, bytes: usize| -> String {
+        let mut end = bytes.min(s.len());
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s[..end].to_string()
+    };
+    let object_name = |label: &str| {
+        let overhead = label.len() + 1 + usize::from(!addition.is_empty());
+        let avail = NAME_MAX.saturating_sub(overhead);
+        let (mut a, mut b) = (table.len(), addition.len());
+        while a + b > avail {
+            if a > b {
+                a -= 1;
+            } else {
+                b -= 1;
+            }
+        }
+        let mut name = clip(table, a);
+        if !addition.is_empty() {
+            name.push('_');
+            name.push_str(&clip(&addition, b));
+        }
+        name.push('_');
+        name.push_str(label);
+        name
+    };
+    let mut pass = 0;
+    loop {
+        let label = if pass == 0 { "idx".to_string() } else { format!("idx{pass}") };
+        let name = object_name(&label);
+        if !taken(&name) {
+            return name;
+        }
+        pass += 1;
+    }
 }
 
 /// Try to extract a COPY FROM file statement from pg_query parse output.

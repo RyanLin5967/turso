@@ -1716,6 +1716,11 @@ pub(crate) fn session_translation(
             let pg_conn = pg_conn.clone();
             PostgreSQLTranslator::new()
                 .with_columns(move |schema, table| resident_relation_columns(&pg_conn, schema, table))
+        } else if is_unnamed_index(parse_result) {
+            let pg_conn = pg_conn.clone();
+            PostgreSQLTranslator::new().with_relation_names(move |schema, table, name| {
+                relation_name_taken(&pg_conn, schema, table, name)
+            })
         } else {
             PostgreSQLTranslator::new()
         }
@@ -4233,6 +4238,50 @@ fn schema_on_search_path(pg_conn: &Arc<PgConnectionInner>, table: &str) -> Resul
         "relation \"{table}\" does not exist"
     ),
     )))
+}
+
+/// Whether `parse` is one CREATE INDEX with no name: its translation chooses PostgreSQL's name,
+/// which needs the names taken beside its table ([`relation_name_taken`]).
+fn is_unnamed_index(parse: &turso_pg_parser::pg_query::ParseResult) -> bool {
+    use turso_pg_parser::pg_query::protobuf::node::Node;
+    matches!(
+        parse.protobuf.stmts.as_slice(),
+        [raw] if matches!(raw.stmt.as_ref().and_then(|s| s.node.as_ref()),
+            Some(Node::IndexStmt(i)) if i.idxname.is_empty())
+    )
+}
+
+/// Whether `name` is a relation's (table, view, index, sequence) in the database `table` is in:
+/// the one `schema` names, as written (public, or nothing with no search path, is main), else the
+/// first on the search path holding `table`. main's are read from the in-memory schema; an attached
+/// database's from its sqlite_schema. A name that cannot be read is taken, so a failure never
+/// reuses a name.
+fn relation_name_taken(pg_conn: &Arc<PgConnectionInner>, schema: &str, table: &str, name: &str) -> bool {
+    let database = if schema.is_empty() {
+        match schema_on_search_path(pg_conn, table) {
+            Ok(Some(database)) => database,
+            Ok(None) | Err(_) => "main".to_string(),
+        }
+    } else if schema.eq_ignore_ascii_case("public") {
+        "main".to_string()
+    } else {
+        schema.to_string()
+    };
+    if database == "main" {
+        let schema = pg_conn.conn.current_schema();
+        return schema.get_table(name).is_some()
+            || schema.get_view(name).is_some()
+            || schema.indexes.values().flatten().any(|i| i.name.eq_ignore_ascii_case(name));
+    }
+    let sql = catalog::sqlite_text(format!(
+        "SELECT 1 FROM {}.sqlite_schema WHERE name = {} COLLATE NOCASE",
+        catalog::quote_ident(&database),
+        catalog::quote_literal(name)
+    ));
+    match pg_conn.conn.prepare_sqlite(&sql).and_then(|mut stmt| stmt.run_collect_rows()) {
+        Ok(rows) => !rows.is_empty(),
+        Err(_) => true,
+    }
 }
 
 /// Whether `parse` holds a DELETE ... USING anywhere (its rewrite reads the relations' declared
