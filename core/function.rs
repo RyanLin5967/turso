@@ -1490,6 +1490,11 @@ pub enum AlterTableFunc {
     RenameTable,
     AlterColumn,
     RenameColumn,
+    /// ADD COLUMN's rewrite of the table's stored CREATE statement, through the parser's AST
+    /// (engine-rev-qaf-fix HIGH-2/3/4: the schema model's `to_sql` dropped clauses it does not hold).
+    AddColumn,
+    /// DROP COLUMN's, likewise.
+    DropColumn,
 }
 
 impl Display for AlterTableFunc {
@@ -1498,6 +1503,8 @@ impl Display for AlterTableFunc {
             AlterTableFunc::RenameTable => write!(f, "limbo_rename_table"),
             AlterTableFunc::RenameColumn => write!(f, "limbo_rename_column"),
             AlterTableFunc::AlterColumn => write!(f, "limbo_alter_column"),
+            AlterTableFunc::AddColumn => write!(f, "limbo_add_column"),
+            AlterTableFunc::DropColumn => write!(f, "limbo_drop_column"),
         }
     }
 }
