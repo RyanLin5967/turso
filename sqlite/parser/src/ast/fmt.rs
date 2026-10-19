@@ -2512,6 +2512,7 @@ fn quoted_type_word_end(b: &[u8], start: usize) -> Option<usize> {
     }
     let mut i = start + 1;
     while i < b.len() {
+        count_piece_step();
         if b[i] == q {
             if b.get(i + 1) == Some(&q) {
                 i += 2;
@@ -2550,6 +2551,19 @@ fn type_name_by_words(b: &[u8]) -> Option<String> {
     Some(out)
 }
 
+// Test builds: the scan steps `type_name_by_pieces` takes on this thread, so a test can bound its
+// cost by counting at the layer that pays rather than by timing.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PIECE_STEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[inline]
+fn count_piece_step() {
+    #[cfg(test)]
+    PIECE_STEPS.with(|c| c.set(c.get() + 1));
+}
+
 /// A printing of a type name holding a `]` that reads back as itself: the name cut into pieces joined
 /// by one space each, every piece either one whole well-formed quoted token (printed as itself) or a
 /// non-empty run holding no `]` (printed bare when it is a plain type word, else bracket-quoted with
@@ -2563,6 +2577,7 @@ fn type_name_by_pieces(name: &str) -> Option<String> {
     // back[e] = (s, quoted): the piece b[s..e] ends a cut of b[..e] that starts at 0.
     let mut back: Vec<Option<(usize, bool)>> = vec![None; n + 1];
     for s in 0..n {
+        count_piece_step();
         if s > 0 && !(b[s - 1] == b' ' && back[s - 1].is_some()) {
             continue;
         }
@@ -2571,6 +2586,7 @@ fn type_name_by_pieces(name: &str) -> Option<String> {
         }
         let mut e = s;
         while e < n && b[e] != b']' {
+            count_piece_step();
             e += 1;
             if e == n || b[e] == b' ' {
                 back[e].get_or_insert((s, false));

@@ -5682,6 +5682,38 @@ mod tests {
         assert!(failed.is_empty(), "CLAIM: all {checked} parsed sequences read back as themselves; first failures: {failed:#?}");
     }
 
+    /// engine-rev 2bdcd32c6 HIGH 1, the third fresh-context attack (on aa492fb6e): the cut search
+    /// scanned from every reachable start to the next `]`, quadratic in the name, so one long type
+    /// name holding a `]` cost about 10^9 steps per print (ADD COLUMN prints it, and so does every
+    /// rewrite). Printing such names of 8,000 and 16,000 words takes at most 16 scan steps per byte
+    /// (`ast::fmt::PIECE_STEPS`, counted where the scan runs), and still reads back as itself.
+    #[test]
+    fn printing_a_long_type_name_holding_a_bracket_takes_linear_steps() {
+        let mut failed = Vec::new();
+        for words in [8_000usize, 16_000] {
+            for filler in ["a", "[' ]", "'x '''' y'"] {
+                let ty = format!("[x,y] {} \"]\"", vec![filler; words].join(" "));
+                let sql = format!("CREATE TABLE t(c {ty})");
+                let want = column_type_names(&sql).expect("premise: the long type parses");
+                let len = want[0].as_ref().map_or(0, |n| n.len());
+                let cmd = Parser::new(sql.as_bytes()).next().unwrap().unwrap();
+                crate::ast::fmt::PIECE_STEPS.with(|c| c.set(0));
+                let printed = cmd.to_string();
+                let steps = crate::ast::fmt::PIECE_STEPS.with(|c| c.get());
+                if steps > 16 * len as u64 {
+                    failed.push(format!("{words} x {filler:?}: {steps} steps for a {len}-byte name"));
+                }
+                if steps == 0 {
+                    failed.push(format!("premise: {words} x {filler:?} took the cut search (0 steps counted)"));
+                }
+                if column_type_names(&printed).ok() != Some(want) {
+                    failed.push(format!("{words} x {filler:?}: the printing does not read back as the name"));
+                }
+            }
+        }
+        assert!(failed.is_empty(), "CLAIM: a long type name holding ] prints in linear steps: {failed:#?}");
+    }
+
     #[test]
     fn test_variable_index_bounds() {
         for sql in ["SELECT ?0", "SELECT ?250001"] {
