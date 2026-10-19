@@ -1,0 +1,24 @@
+SELECT pg_database_size(NULL) IS NULL AS null_name;
+ null_name 
+-----------
+ t
+(1 row)
+
+SELECT pg_database_size(NULL::oid) IS NULL AS null_oid;
+ null_oid 
+----------
+ t
+(1 row)
+
+SELECT pg_database_size(99999::oid);
+SELECT pg_database_size('nosuch');
+SELECT pg_database_size(oid) > 0 FROM pg_database WHERE datname = current_database();
+ ?column? 
+----------
+ t
+(1 row)
+
+ERROR:  42704: database with OID 99999 does not exist
+LOCATION:  pg_database_size_oid, dbsize.c:180
+ERROR:  3D000: database "nosuch" does not exist
+LOCATION:  get_database_oid, dbcommands.c:3202

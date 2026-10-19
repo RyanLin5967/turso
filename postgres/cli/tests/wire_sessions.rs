@@ -15422,6 +15422,35 @@ fn row_descriptions_carry_postgresqls_type_sizes_and_modifiers() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-uw3 LOW-3: pg_database_size(NULL) answered this database's size, where PostgreSQL 18.6
+/// answers NULL (for a name and an oid alike), and an oid no database has answered it too, where
+/// PostgreSQL answers 42704 "database with OID 99999 does not exist". This database's own oid
+/// (pg_database's) still answers. Recorded on iccad2, cli/tests/recordings/pg18-dbsize-edges.out.
+#[test]
+fn pg_database_size_of_null_or_an_unknown_oid_answers_as_postgresql_does() {
+    let dir = Scratch::new("dbsize-edges");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    for sql in ["SELECT pg_database_size(NULL) IS NULL", "SELECT pg_database_size(NULL::oid) IS NULL"] {
+        let r = a.q(sql);
+        if r.error.is_some() || r.rows != vec![vec![Some("t".to_string())]] {
+            wrong.push(format!("{sql}: rows {:?} error {:?}, PostgreSQL t", r.rows, r.error));
+        }
+    }
+    let sql = "SELECT pg_database_size(99999::oid)";
+    match a.q(sql).error {
+        Some(e) if e.code == "42704" && e.message == "database with OID 99999 does not exist" => {}
+        other => wrong.push(format!("{sql}: {other:?}, PostgreSQL 42704")),
+    }
+    let sql = "SELECT pg_database_size(oid) >= 0 FROM pg_database WHERE datname = current_database()";
+    let r = a.q(sql);
+    if r.error.is_some() || r.rows != vec![vec![Some("t".to_string())]] {
+        wrong.push(format!("{sql}: rows {:?} error {:?}, PostgreSQL t", r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-uw2 N5: a schema-qualified type was refused 42704 'type "public m" does not exist',
 /// its parts joined with a blank, so a pg_dump restore, which writes public.<type> for every enum
 /// and domain column, failed at its first such table. PostgreSQL 18.6 takes public.m and
