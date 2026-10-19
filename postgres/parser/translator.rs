@@ -3605,6 +3605,19 @@ impl PostgreSQLTranslator {
                 // recorded, pg18/pg18-wirefuzz-a_cast_to_numeric_p_s_and_a_numeric_domain_column_are_numeric.out). A bare NUMERIC stays REAL (the
                 // bare-NUMERIC divergence, a known red).
                 if let Some((p, s)) = type_cast.type_name.as_ref().and_then(numeric_cast_size) {
+                    // The REAL below holds every decimal of at most 15 significant digits exactly
+                    // (DBL_DIG) and no wider one: past 15 it answered 9007199254740992 for
+                    // 9007199254740993, so =, IN, GROUP BY and DISTINCT merged distinct values
+                    // (wire-rev-cfdebc06d HIGH-1). A wider precision is refused before anything
+                    // runs, never rounded, until the engine's typed CAST (437f337be) reaches the wire.
+                    // A precision past PG's 1000 stays the engine's typmod refusal
+                    // (PGDIV-NUMERIC-TYPMOD-CODE).
+                    if p > 15 && p <= 1000 {
+                        return Err(ParseError::ParseError(SqlErrorMessage::classified(
+                            SqlErrorKind::FeatureNotSupported,
+                            format!("a cast to numeric({p},{s}) is not supported: precision above 15 is not held exactly"),
+                        )));
+                    }
                     // The engine's numeric type, encoded and decoded as a column of it is stored
                     // and read: a CAST to the type would leave its encoded bytes.
                     let lit = |n: i64| ast::Expr::Literal(ast::Literal::Numeric(n.to_string()));

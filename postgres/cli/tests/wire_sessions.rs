@@ -12366,6 +12366,25 @@ replays_postgresql!(
     "pg18-wirefuzz-every_write_path_refuses_a_value_too_long_for_varchar.out",
     []
 );
+// wire-rev-cfdebc06d HIGH-1: a CAST to NUMERIC(p, s) keeps every digit to precision 15 and is refused above it, never
+// rounded through the engine's REAL; the bigint the refused UPDATE would have changed reads as PostgreSQL's (#14).
+replays_postgresql!(
+    pg18_wirefuzz_a_cast_to_numeric_wider_than_float8_holds_is_refused_not_rounded_replays_as_postgresql_answered,
+    "pg18-wirefuzz-a_cast_to_numeric_wider_than_float8_holds_is_refused_not_rounded.out",
+    [
+        (3, "PGDIV-NUMERIC-CAST-FLOAT8 value [wire]: a CAST to NUMERIC(15,3) and NUMERIC(15) is computed and typed as the engine's REAL (701, every digit kept: '999999999999.999, 123456789012345') where PG types it 1700"),
+        (4, "PGDIV-NUMERIC-CAST-FLOAT8 type [wire]: the overflowing CAST(b AS NUMERIC(15,0)) is announced 701 where PG announces 1700; both answer 22003, ours with PG's DETAIL ('a field with precision 15, scale 0 must round to an absolute value less than 10^15') in its message"),
+        (5, "PGDIV-NUMERIC-CAST-WIDE refused [wire]: a CAST to NUMERIC(p,s) with p above 15 is refused 0A000 where PG answers its exact value; the engine's REAL would round it past 15 significant digits (wire-rev-cfdebc06d HIGH-1); it waits for the engine's typed CAST (437f337be)"),
+        (6, "PGDIV-NUMERIC-CAST-WIDE refused [wire]: a CAST to NUMERIC(p,s) with p above 15 is refused 0A000 where PG answers its exact value; the engine's REAL would round it past 15 significant digits (wire-rev-cfdebc06d HIGH-1); it waits for the engine's typed CAST (437f337be)"),
+        (7, "PGDIV-NUMERIC-CAST-WIDE refused [wire]: a CAST to NUMERIC(p,s) with p above 15 is refused 0A000 where PG answers its exact value; the engine's REAL would round it past 15 significant digits (wire-rev-cfdebc06d HIGH-1); it waits for the engine's typed CAST (437f337be)"),
+        (8, "PGDIV-NUMERIC-CAST-WIDE refused [wire]: a CAST to NUMERIC(p,s) with p above 15 is refused 0A000 where PG answers its exact value; the engine's REAL would round it past 15 significant digits (wire-rev-cfdebc06d HIGH-1); it waits for the engine's typed CAST (437f337be)"),
+        (9, "PGDIV-NUMERIC-CAST-WIDE refused [wire]: a CAST to NUMERIC(p,s) with p above 15 is refused 0A000 where PG answers its exact value; the engine's REAL would round it past 15 significant digits (wire-rev-cfdebc06d HIGH-1); it waits for the engine's typed CAST (437f337be)"),
+        (10, "PGDIV-NUMERIC-CAST-WIDE refused [wire]: a CAST to NUMERIC(p,s) with p above 15 is refused 0A000 where PG answers its exact value; the engine's REAL would round it past 15 significant digits (wire-rev-cfdebc06d HIGH-1); it waits for the engine's typed CAST (437f337be)"),
+        (11, "PGDIV-NUMERIC-CAST-WIDE refused [wire]: a CAST to NUMERIC(p,s) with p above 15 is refused 0A000 where PG answers its exact value; the engine's REAL would round it past 15 significant digits (wire-rev-cfdebc06d HIGH-1); it waits for the engine's typed CAST (437f337be)"),
+        (12, "PGDIV-NUMERIC-CAST-WIDE refused [wire]: a CAST to NUMERIC(p,s) with p above 15 is refused 0A000 where PG answers its exact value; the engine's REAL would round it past 15 significant digits (wire-rev-cfdebc06d HIGH-1); it waits for the engine's typed CAST (437f337be)"),
+        (13, "PGDIV-NUMERIC-CAST-WIDE refused [wire]: a CAST to NUMERIC(p,s) with p above 15 is refused 0A000 where PG answers its exact value; the engine's REAL would round it past 15 significant digits (wire-rev-cfdebc06d HIGH-1); it waits for the engine's typed CAST (437f337be)"),
+    ]
+);
 // wire-rev-2a68496d0 H1: a CAST to NUMERIC(p, s) sorts, filters and aggregates as a number over several rows (dc853383a
 // made it text to the engine: wrong rows and row order, silently). No divergence registered for the row and order arms.
 replays_postgresql!(
