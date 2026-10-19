@@ -15665,6 +15665,33 @@ fn a_negative_int4_literal_is_int4_and_a_missing_column_is_reported_first() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// Lead ruling 1(a) (PG 18.6 recorded, pg18-wirefuzz-every_write_path_refuses_a_value_too_long_for_varchar.out
+/// #13, #14): an undeclared parameter assigned to a varchar(5) column takes the column's type and length, so
+/// PostgreSQL's Bind reads 'abcdef' as varchar(5) and refuses it there, 22001 before BindComplete; here the Bind
+/// succeeded and the engine refused the Execute. A parameter the client declared text is read as text at Bind
+/// and refused only at Execute, after BindComplete, as there; a value whose excess is spaces is not refused at Bind.
+#[test]
+fn a_parameter_assigned_to_a_varchar_column_is_refused_at_bind_when_too_long() {
+    let dir = Scratch::new("bind-varchar");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE vc(id int PRIMARY KEY, v varchar(5))").ok("vc");
+    a.q("INSERT INTO vc VALUES (1, 'ab')").ok("row");
+    let mut wrong = Vec::new();
+    for sql in ["INSERT INTO vc VALUES (3, $1)", "UPDATE vc SET v = $1 WHERE id = 1"] {
+        let (types, error) = a.bind_round(sql, &[], &[Some(b"abcdef")], &[]);
+        let code = error.as_ref().map(|e| e.code.clone());
+        if types.contains(&b'2') || code.as_deref() != Some("22001") {
+            wrong.push(format!("{sql}: messages {:?} error {error:?}, PostgreSQL: no BindComplete, 22001", String::from_utf8_lossy(&types)));
+        }
+    }
+    let (types, _) = a.bind_round("UPDATE vc SET v = $1 WHERE id = 1", &[], &[Some(b"ab   ")], &[]);
+    if !types.contains(&b'2') {
+        wrong.push(format!("a value whose excess is spaces: messages {:?}, PostgreSQL: BindComplete", String::from_utf8_lossy(&types)));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-uw2 N5: a schema-qualified type was refused 42704 'type "public m" does not exist',
 /// its parts joined with a blank, so a pg_dump restore, which writes public.<type> for every enum
 /// and domain column, failed at its first such table. PostgreSQL 18.6 takes public.m and
