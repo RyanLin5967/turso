@@ -16204,6 +16204,50 @@ fn a_trunk_commits_barrier_never_gathers_a_cohort() {
 /// Connection B's schema (shared from the database's) holds A's table; A's DROP commits, and the
 /// module's table must not be destroyed while B still holds it. Once B has moved to the new schema
 /// and every holder is gone, it is destroyed, once. Before the fix A destroyed it at its own commit,
+/// engine-rev-qaf-fix2 MED 3 (predates the range, measured by the reviewer): a virtual table reached
+/// through a schema whose connection did not register it panicked on its first write
+/// (execute.rs `.expect("Could not find virtual table for VBegin")`), and its DROP failed "Could not
+/// find Virtual Table to Destroy": (a) connection B writes and drops A's table; (b) after BEGIN; DROP;
+/// CREATE; ROLLBACK the table is written and dropped. Neither panics, and every statement succeeds.
+#[test]
+fn a_virtual_table_is_written_and_dropped_through_any_schema_that_holds_it() {
+    let _g = serial();
+    let run = |c: &Arc<Connection>, sql: &str| {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| c.execute(sql))) {
+            Ok(Ok(())) => None,
+            Ok(Err(e)) => Some(format!("`{sql}`: {e}")),
+            Err(_) => Some(format!("`{sql}`: PANICKED")),
+        }
+    };
+    let mut failed: Vec<String> = Vec::new();
+    {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("vt-b.db"), DatabaseOpts::new());
+        let a = db.connect().unwrap();
+        a.register_static_extension(|api| unsafe {
+            l5_vtab::L5VTabModule::register_L5VTabModule(api);
+        });
+        a.execute("CREATE VIRTUAL TABLE vt USING l5_vtab").unwrap();
+        let b = db.connect().unwrap();
+        failed.extend(["INSERT INTO vt VALUES (1)", "DROP TABLE vt"].iter().filter_map(|sql| run(&b, sql)).map(|e| format!("(a) B {e}")));
+    }
+    {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("vt-rb.db"), DatabaseOpts::new());
+        let a = db.connect().unwrap();
+        a.register_static_extension(|api| unsafe {
+            l5_vtab::L5VTabModule::register_L5VTabModule(api);
+        });
+        a.execute("CREATE VIRTUAL TABLE vt USING l5_vtab").unwrap();
+        for sql in ["BEGIN", "DROP TABLE vt", "CREATE VIRTUAL TABLE vt USING l5_vtab", "ROLLBACK", "INSERT INTO vt VALUES (1)", "DROP TABLE vt"] {
+            if let Some(e) = run(&a, sql) {
+                failed.push(format!("(b) {e}"));
+            }
+        }
+    }
+    assert!(failed.is_empty(), "CLAIM: no panic and no refusal: {failed:#?}");
+}
+
 /// checking only A's schemas, so B held a freed table.
 #[test]
 fn a_dropped_virtual_table_is_destroyed_only_once_no_connection_holds_it() {
