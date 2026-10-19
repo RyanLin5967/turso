@@ -1469,7 +1469,14 @@ fn schema_window(cell: &str, tables: u64, out: &mut String) {
                     let forker = forker.clone();
                     std::thread::spawn(move || {
                         let (c0, w0, m0, z0, a0) = (probe::sql_counts(), super::store::thread_waits(), probe::schema_windows_met(), probe::sleeps(), probe::thread_allocs());
+                        let diag = std::env::var_os("BUDGET_PREPARE_BACKTRACE").is_some();
+                        if diag {
+                            eprintln!("DIAG-WINDOW open op={op} round={i}");
+                        }
                         let made = forker.create_branch("m-0000").map(|_| ()).map_err(|e| e.to_string());
+                        if diag {
+                            eprintln!("DIAG-WINDOW close op={op} round={i}");
+                        }
                         let (c1, w1, m1, z1, a1) = (probe::sql_counts(), super::store::thread_waits(), probe::schema_windows_met(), probe::sleeps(), probe::thread_allocs());
                         let mut s = sql_sample(&c0, &c1);
                         s.insert("alloc_bytes", delta(a0.1, a1.1));
@@ -2472,6 +2479,11 @@ fn run_child(spec: &str) -> CellData {
     };
     let stdout = std::fs::read_to_string(&stdout_path).unwrap_or_default();
     let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+    // Diagnostic only (the schema-window flake): with BUDGET_PREPARE_BACKTRACE set, the child's
+    // stderr, which then holds each prepare's backtrace and the measured fork's markers, is kept.
+    if let Some(dir) = std::env::var_os("BUDGET_PREPARE_BACKTRACE") {
+        let _ = std::fs::write(PathBuf::from(dir).join(format!("child-{spec}-{}.stderr", std::process::id())), &stderr);
+    }
     let _ = (std::fs::remove_file(&stdout_path), std::fs::remove_file(&stderr_path));
     let text = std::fs::read_to_string(&out).unwrap_or_default();
     if let Ok(dir) = std::env::var("FE_BUDGET_RAW_DIR") {
