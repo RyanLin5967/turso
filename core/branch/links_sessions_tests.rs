@@ -159,6 +159,7 @@ fn ls_hard_limit_child() {
     super::store::LINKS_FILL_PAUSE_MS.store(5_000, Ordering::Release);
     let db = open(&path);
     db.branch_wait_name_filter();
+    let busy0 = db.branches.wal_truncate_busy_for_test();
     let trunk = db.connect().unwrap();
     let mut peak = 0;
     for _ in 0..600 {
@@ -166,7 +167,9 @@ fn ls_hard_limit_child() {
         peak = peak.max(log_bytes(&path));
     }
     db.branch_checkpoint_wait();
-    println!("LS-HARD meta={} log={} peak={peak}", meta_version(&path), log_bytes(&path));
+    // Observing only (l4-rev-h1 LOW 4, measured, no assertion): busy catalog WAL truncations meanwhile.
+    let busy = db.branches.wal_truncate_busy_for_test() - busy0;
+    println!("LS-HARD meta={} log={} peak={peak} wal_busy={busy}", meta_version(&path), log_bytes(&path));
     super::store::LINKS_FILL_PAUSE_MS.store(0, Ordering::Release);
 }
 
@@ -180,7 +183,7 @@ fn past_the_hard_log_limit_the_upgrade_does_not_wait_for_the_fill() {
     let text = child("ls_hard_limit_child", &[]);
     let r = readings(&text, "LS-HARD ");
     let (meta, log, peak) = (r[0][0], r[0][1], r[0][2]);
-    println!("LS hard limit: meta {meta}, log {log}, peak {peak}");
+    println!("LS hard limit: meta {meta}, log {log}, peak {peak}, busy WAL truncations {}", r[0][3]);
     assert!(meta >= 21, "past the hard limit the store still waited for its stalled fill: meta {meta}, log peak {peak} B");
 }
 
