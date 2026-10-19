@@ -12411,6 +12411,13 @@ replays_postgresql!(
         (6, "PGDIV-DATE-INPUT-CODE error-code [engine]: refused after RowDescription as in PG, but XX000 'invalid date value' (core's date ENCODE, a RAISE with no kind) where PG answers 22007 'invalid input syntax for type date'"),
     ]
 );
+// wire-rev-5cdb70e58 MED-2: a relation named database.schema.table must name this database; any other is 0A000 in
+// SELECT, a join, INSERT, UPDATE and DELETE, where it silently read and wrote this database's table.
+replays_postgresql!(
+    pg18_wirefuzz_a_three_part_name_must_name_this_database_replays_as_postgresql_answered,
+    "pg18-wirefuzz-a_three_part_name_must_name_this_database.out",
+    []
+);
 replays_postgresql!(
     pg18_wirefuzz_the_connected_database_is_current_database_and_in_pg_database_replays_as_postgresql_answered,
     "pg18-wirefuzz-the_connected_database_is_current_database_and_in_pg_database.out",

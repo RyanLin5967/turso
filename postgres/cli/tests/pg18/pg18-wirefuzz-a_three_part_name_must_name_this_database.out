@@ -1,0 +1,32 @@
+>> Q CREATE TABLE n(id int PRIMARY KEY)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO n VALUES (1), (2)
+   C INSERT 0 2
+   Z I
+>> Q SELECT id FROM otherdb.public.n ORDER BY id
+   E S=ERROR C=0A000 M=cross-database references are not implemented: "otherdb.public.n"
+   Z I
+>> Q SELECT id FROM postgres.public.n ORDER BY id
+   T oids=[23]
+   D ['1']
+   D ['2']
+   C SELECT 2
+   Z I
+>> Q SELECT count(*) FROM n JOIN otherdb.public.n m ON m.id = n.id
+   E S=ERROR C=0A000 M=cross-database references are not implemented: "otherdb.public.n"
+   Z I
+>> Q INSERT INTO otherdb.public.n VALUES (3)
+   E S=ERROR C=0A000 M=cross-database references are not implemented: "otherdb.public.n"
+   Z I
+>> Q UPDATE otherdb.public.n SET id = 9
+   E S=ERROR C=0A000 M=cross-database references are not implemented: "otherdb.public.n"
+   Z I
+>> Q DELETE FROM otherdb.public.n
+   E S=ERROR C=0A000 M=cross-database references are not implemented: "otherdb.public.n"
+   Z I
+>> Q SELECT count(*) FROM n
+   T oids=[20]
+   D ['2']
+   C SELECT 1
+   Z I
