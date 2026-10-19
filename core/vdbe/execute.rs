@@ -6998,6 +6998,10 @@ fn init_agg_payload(func: &AggFunc, payload: &mut crate::alloc::Vec<Value>) -> R
             // We serialize to a record blob only in finalize, avoiding O(n²) re-serialization.
             payload.push(Value::from_i64(0));
         }
+        AggFunc::NumericSum => {
+            payload.push(Value::Null);
+            payload.push(Value::from_i64(0));
+        }
         AggFunc::Mode => {
             // [0] = collation bits, [1] = count, [2..] = buffered values.
             payload.push(Value::from_i64(0)); // collation (recorded at step time)
@@ -7116,6 +7120,23 @@ fn update_agg_payload(
             }
             *r_err_val = Value::from_f64(sum_state.r_err);
             *count = count.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
+        }
+        AggFunc::NumericSum => {
+            // NULL contributes nothing; every other value is a numeric (a stored encoding, or the
+            // text the column decoded to), added at PostgreSQL's scale rules.
+            if matches!(arg, Value::Null) {
+                return Ok(());
+            }
+            let value = value_to_numeric(arg)?;
+            let acc = match &payload[0] {
+                Value::Null => value,
+                prior => value_to_numeric(prior)?.add(&value)?,
+            };
+            payload[0] = Value::build_text(acc.format());
+            let Value::Numeric(Numeric::Integer(count)) = &mut payload[1] else {
+                return Err(LimboError::InternalError("NumericSum: payload[1] is not an integer".to_string()));
+            };
+            *count += 1;
         }
         AggFunc::Sum | AggFunc::Total => {
             // invariant as per init_agg_payload: payload[0] is acc (Null/Integer/Float),
@@ -7472,6 +7493,10 @@ fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
                 _ => Value::from_f64(acc.to_float_or_zero() + r_err),
             }
         }
+        AggFunc::NumericSum => match &payload[1] {
+            Value::Numeric(Numeric::Integer(0)) => Value::Null,
+            _ => payload[0].clone(),
+        },
         AggFunc::Total => {
             // Payload: [acc, r_err, approx, ovrfl, count]
             let acc = &payload[0];
@@ -8329,6 +8354,21 @@ fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut [Value]) -> Res
             };
             debug_assert!(*i > 0, "Count(*) xInverse without matching xStep");
             *i -= 1;
+        }
+        AggFunc::NumericSum => {
+            if matches!(arg, Value::Null) {
+                return Ok(());
+            }
+            let Value::Numeric(Numeric::Integer(count)) = &mut payload[1] else {
+                unreachable!("NumericSum count slot is Integer per init_agg_payload");
+            };
+            debug_assert!(*count > 0, "NumericSum xInverse without matching xStep");
+            *count -= 1;
+            payload[0] = if *count == 0 {
+                Value::Null
+            } else {
+                Value::build_text(value_to_numeric(&payload[0])?.sub(&value_to_numeric(&arg)?)?.format())
+            };
         }
         AggFunc::Sum | AggFunc::Total => {
             let parsed = classify_numeric_arg(&arg);

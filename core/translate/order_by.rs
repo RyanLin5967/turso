@@ -49,7 +49,8 @@ fn sort_comparator_from_func_name(func_name: &str) -> Option<SortComparatorType>
 ///   (its values are the source's decoded values);
 /// - `+`, `-`, `*` or `/` over such a value whose type defines that operator (the result is that
 ///   type's, unconstrained: no parameters, as PostgreSQL's numeric result has typmod -1);
-/// - `min` or `max` of one such argument, a parenthesized one, and a CAST to a registered type.
+/// - `min` or `max` of one such argument (`sum` too where the type defines `+`), a parenthesized
+///   one, and a CAST to a registered type.
 ///
 /// A column of a non-STRICT table is NOT given its declared type here: a plain NUMERIC column of a
 /// SQLite schema would otherwise order through numeric's '<' instead of SQLite's type order.
@@ -95,6 +96,15 @@ pub(crate) fn expr_custom_type(
                 && (name.as_str().eq_ignore_ascii_case("min") || name.as_str().eq_ignore_ascii_case("max")) =>
         {
             expr_custom_type(&args[0], referenced_tables, schema)
+        }
+        // A sum is the type's when the type defines `+` (`AggFunc::NumericSum` for numeric).
+        ast::Expr::FunctionCall { name, args, .. } if args.len() == 1 && name.as_str().eq_ignore_ascii_case("sum") => {
+            let (type_def, _) = expr_custom_type(&args[0], referenced_tables, schema)?;
+            type_def
+                .operators()
+                .iter()
+                .any(|o| o.op == "+")
+                .then(|| (type_def, std::vec::Vec::new()))
         }
         ast::Expr::Cast { type_name: Some(ty), .. } if ty.array_dimensions == 0 => {
             let type_def = schema.get_type_def_unchecked(&ty.name)?;

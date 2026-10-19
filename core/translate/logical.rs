@@ -2376,6 +2376,8 @@ impl<'a> LogicalPlanBuilder<'a> {
             LogicalExpr::AggregateFunction { fun, .. } => match fun {
                 AggFunc::Count | AggFunc::Count0 => Ok(Type::Integer),
                 AggFunc::Sum | AggFunc::Avg | AggFunc::Total => Ok(Type::Real),
+                // The optimizer's numeric sum yields numeric text (`numeric_sums`).
+                AggFunc::NumericSum => Ok(Type::Text),
                 AggFunc::Min | AggFunc::Max => Ok(Type::Text),
                 AggFunc::GroupConcat | AggFunc::StringAgg => Ok(Type::Text),
                 AggFunc::ArrayAgg => Ok(Type::Blob),

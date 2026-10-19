@@ -891,6 +891,32 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, resolver: &Resolver) -> Resul
     optimize_select_plan_with_cache(plan, resolver, &mut cache)
 }
 
+/// A `sum` whose argument is of a custom type whose `+` is `numeric_add` sums as numeric
+/// (`AggFunc::NumericSum`; fastest-wire ef7738ee2: sum over numeric(6, 2) of {0.00, NULL} answered
+/// '0', SQLite's sum of the decoded text, where PostgreSQL answers 0.00). Before any rewrite reads the
+/// aggregates, so a step and its final agree. Mutant `numeric_sum_as_sqlite` (test builds only): as
+/// before.
+fn numeric_sums(plan: &mut SelectPlan, resolver: &Resolver) {
+    if crate::branch::store::fe_mutant("numeric_sum_as_sqlite") {
+        return;
+    }
+    for agg in plan.aggregates.iter_mut() {
+        if agg.func != crate::function::AggFunc::Sum || agg.args.len() != 1 {
+            continue;
+        }
+        let numeric = crate::translate::order_by::expr_custom_type(&agg.args[0], &plan.table_references, resolver.schema())
+            .is_some_and(|(type_def, _)| {
+                type_def
+                    .operators()
+                    .iter()
+                    .any(|op| op.op == "+" && op.func_name.as_deref() == Some("numeric_add"))
+            });
+        if numeric {
+            agg.func = crate::function::AggFunc::NumericSum;
+        }
+    }
+}
+
 #[turso_macros::trace_stack]
 fn optimize_select_plan_with_cache(
     plan: &mut SelectPlan,
@@ -899,6 +925,7 @@ fn optimize_select_plan_with_cache(
 ) -> Result<()> {
     // Optimized recursively per nested query (`stack::NestGuard`; the crash batch, 2026-10-15).
     let _nest = crate::stack::NestGuard::enter("subqueries")?;
+    numeric_sums(plan, resolver);
     if !plan
         .non_from_clause_subqueries
         .iter()

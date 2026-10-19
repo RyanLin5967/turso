@@ -452,6 +452,11 @@ pub enum AggFunc {
     /// Stored args (post-planning): `[value, fraction]`.
     #[strum(disabled)]
     PercentileDisc,
+    /// `sum(x)` over a value of a custom type whose `+` is `numeric_add` (fastest-wire ef7738ee2):
+    /// summed as numeric, keeping the operands' scale, as PostgreSQL's numeric sum does. Set by the
+    /// optimizer (`numeric_sums`), never by name. Payload: `[acc: Null or numeric text, count]`.
+    #[strum(disabled)]
+    NumericSum,
     #[strum(disabled)]
     External(Arc<ExtFunc>),
 }
@@ -687,7 +692,8 @@ impl PartialEq for AggFunc {
             | (Self::ArrayAgg, Self::ArrayAgg)
             | (Self::Mode, Self::Mode)
             | (Self::PercentileCont, Self::PercentileCont)
-            | (Self::PercentileDisc, Self::PercentileDisc) => true,
+            | (Self::PercentileDisc, Self::PercentileDisc)
+            | (Self::NumericSum, Self::NumericSum) => true,
             (Self::External(a), Self::External(b)) => Arc::ptr_eq(a, b),
             _ => false,
         }
@@ -715,7 +721,7 @@ impl AggFunc {
             Self::Max => 1,
             Self::Min => 1,
             Self::StringAgg => 2,
-            Self::Sum => 1,
+            Self::Sum | Self::NumericSum => 1,
             Self::Total => 1,
             Self::ArrayAgg => 1,
             // Ordered-set aggregates: args are rewritten by the planner to
@@ -744,7 +750,7 @@ impl AggFunc {
             Self::Max => &[1],
             Self::Min => &[1],
             Self::StringAgg => &[2],
-            Self::Sum => &[1],
+            Self::Sum | Self::NumericSum => &[1],
             Self::Total => &[1],
             Self::ArrayAgg => &[1],
             Self::Mode => &[1],
@@ -766,7 +772,7 @@ impl AggFunc {
             Self::Max => "max",
             Self::Min => "min",
             Self::StringAgg => "string_agg",
-            Self::Sum => "sum",
+            Self::Sum | Self::NumericSum => "sum",
             Self::Total => "total",
             Self::ArrayAgg => "array_agg",
             Self::Mode => "mode",
