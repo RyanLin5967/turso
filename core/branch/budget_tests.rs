@@ -3111,6 +3111,10 @@ const FLIGHT_END: u64 = 8 + 1 + 4 + 4;
 /// thread; a declared spinner making none, and a thread the window spawned, do not make it foreign
 /// (the window keeps exactly its own 7, and the spawn's 5); a hold during which another thread
 /// ran is unattributable, never counted as held. Forced both ways, in the instruments' child.
+/// Apple only (budgets-port-adversary LOW-1): it claims syscall COUNTS, which only Apple's kernel gives
+/// (Linux has none, so every count is None there and the claim cannot hold); the syscall budgets are
+/// Mac-owed, and the Linux thread rule is claimed by the counters test instead.
+#[cfg(target_vendor = "apple")]
 #[test]
 fn the_budget_syscall_counts_are_attributed_by_thread() {
     if in_child() {
