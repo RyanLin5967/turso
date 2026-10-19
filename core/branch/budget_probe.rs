@@ -762,8 +762,10 @@ pub(crate) struct Snapshot {
 impl Snapshot {
     /// Whether the window this snapshot closed was the caller's own (no other thread ran in it): its
     /// attributed syscall count where a kernel count exists (Apple), else the thread rule alone
-    /// (`threads_quiet`). The ONE place this rule lives (the Linux port: recovery's quiet read the
-    /// attributed count directly, so every recovery window was refused off Apple, raws ctr8-budgets).
+    /// (`threads_quiet`). The one place this rule lives for every quiet flag that rests on a window
+    /// snapshot (measure_owning's, recovery's two); the memory arm's quiet has no window and is its
+    /// settle alone. (The Linux port: recovery's quiet read the attributed count directly, so every
+    /// recovery window was refused off Apple, raws ctr8-budgets.)
     pub(crate) fn own(&self) -> bool {
         self.attributed_syscalls.is_some() || (self.syscalls.is_none() && self.threads_quiet)
     }

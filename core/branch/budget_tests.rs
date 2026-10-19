@@ -4415,7 +4415,8 @@ fn leap_l4_an_open_keeps_at_most_100_bytes_resident_per_live_branch() {
 /// any other O(N) walk under the mutex that allocates nothing, reads no catalog row and counts no
 /// work (the D0 recovery instruction test sees that one, on Apple); a catalog statement that changes
 /// many rows counts one (`Stmt::exec`). Mutants env `name_filter_built_under_mutex`,
-/// `opener_filter_set`. WRITTEN NOT RUN in this form.
+/// `opener_filter_set`. Run at 242345bec (budgets-rev-242345, ecetesla1): green at base (held work 16 at
+/// both sizes), red under name_filter_built_under_mutex (10,000 against 100,000 units).
 #[test]
 fn leap_l4_an_open_holds_the_store_mutex_for_no_o_n_work() {
     if in_child() {
@@ -4433,10 +4434,12 @@ fn leap_l4_an_open_holds_the_store_mutex_for_no_o_n_work() {
         ("fg_held_alloc_bytes_sum", 4096),
         ("max_hold_alloc_bytes", 4096),
         ("max_hold_catalog_rows", 64),
-        // Linux finding (b): work that allocates nothing and reads no catalog row (filter inserts).
-        ("max_bg_hold_work", 64),
-        ("max_fg_hold_work", 64),
-        ("max_hold_work", 64),
+        // Linux finding (b): work that allocates nothing and reads no catalog row (filter inserts). Slack 0
+        // (budgets-rev-242345 LOW-1): measured 16 at 10^4 and at 10^5 with no spread, and a slack of 64 hid
+        // a planted O(N) term of one unit per 2,000 names (16 -> 50).
+        ("max_bg_hold_work", 0),
+        ("max_fg_hold_work", 0),
+        ("max_hold_work", 0),
     ] {
         let (x, y) = (sa[k], sb[k]);
         if y > x + slack {
