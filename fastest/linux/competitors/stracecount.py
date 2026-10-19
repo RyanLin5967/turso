@@ -884,7 +884,8 @@ def selftest():
                        "delete-durable": dd})
             ok(f"delete-durable {dd}: 1 delete-phase flush over 3 cycles is refused ({why})",
                cd.get("verdict", "").startswith("NOT CLEAN") and why in cd.get("verdict", ""), cd.get("verdict"))
-        r3d = dict(r, flush_by_phase={"create": 2, "delete": 3, "between": 1})
+        # (comp-rev-89ec-b3c3 LOW 5: with the per-cycle record its own counts imply, one delete flush in each of the 3)
+        r3d = dict(r, flush_by_phase={"create": 2, "delete": 3, "between": 1}, delete_zero_ops=0)
         json.dump(r3d, open(lj + ".d2", "w"))
         cd = cell({"name": "plant/dd2", "load": lj + ".d2", "idle": "none", "ops": "3", "load-s": "1", "idle-s": "0",
                    "delete-durable": "d2"})
@@ -895,6 +896,29 @@ def selftest():
         cd = cell({"name": "plant/dd0", "load": lj + ".d0", "idle": "none", "ops": "3", "load-s": "1", "idle-s": "0",
                    "delete-durable": "d0"})
         ok("control: delete-durable d0 with no delete-phase flush is ok", cd.get("verdict") == "ok", cd.get("verdict"))
+        # comp-rev-89ec-b3c3 LOW 5: the D2 check judged the RAW delete-phase mean. (a) A background writer that flushes
+        # once a second in the idle control and once per 1 s delete window passes a delete that never flushes; (b) half
+        # the cycles flushing twice and half never has mean 1. Each must be refused; count() records how many cycles'
+        # delete phase held no flush (the plant above: 1 delete-phase flush over 3 cycles, so 2 held none)
+        ok("count: the plant's cycles with no delete-phase flush (delete_zero_ops) are 2 of 3",
+           (r.get("delete_zero_ops"), r.get("phase_ops")) == (2, 3), (r.get("delete_zero_ops"), r.get("phase_ops")))
+        rbg = dict(r, flush_by_phase={"create": 2, "delete": 3, "between": 1}, delete_zero_ops=0,
+                   phase_time_s={"create": 0.3, "delete": 3.0})
+        json.dump(rbg, open(lj + ".bg", "w"))
+        idl = dict(r, flushes=3, flush_by_syscall=dict({k: 0 for k in r["flush_by_syscall"]}, fsync=3))
+        json.dump(idl, open(lj + ".idle", "w"))
+        cd = cell({"name": "plant/ddbg", "load": lj + ".bg", "idle": lj + ".idle", "ops": "3", "load-s": "3",
+                   "idle-s": "3", "delete-durable": "d2"})
+        ok("delete-durable d2: delete-phase flushes no more than the idle rate predicts are refused (LOW 5 a)",
+           cd.get("verdict", "").startswith("NOT CLEAN") and "delete not durable" in cd.get("verdict", ""),
+           cd.get("verdict"))
+        rhalf = dict(r, flush_by_phase={"create": 2, "delete": 4, "between": 1}, delete_zero_ops=2, phase_ops=4)
+        json.dump(rhalf, open(lj + ".half", "w"))
+        cd = cell({"name": "plant/ddhalf", "load": lj + ".half", "idle": "none", "ops": "4", "load-s": "1", "idle-s": "0",
+                   "delete-durable": "d2"})
+        ok("delete-durable d2: half the cycles flushing twice and half never is refused (LOW 5 b)",
+           cd.get("verdict", "").startswith("NOT CLEAN") and "delete not durable" in cd.get("verdict", ""),
+           cd.get("verdict"))
         cd = cell({"name": "plant/ddx", "load": lj, "idle": "none", "ops": "3", "load-s": "1", "idle-s": "0",
                    "delete-durable": "d1"})
         ok("a delete-durable that is neither d2, d0 nor none is refused", cd.get("verdict", "").startswith("REFUSED"),

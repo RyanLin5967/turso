@@ -37,5 +37,25 @@ class TimedVerdict(unittest.TestCase):
             self.assertTrue(is_bad and line, f"timed verdict {tv!r} in a dry={dry} job was accepted")
 
 
+class DeleteCheck(unittest.TestCase):
+    """comp-rev-89ec-b3c3 LOW 5: a delete's durability is checkable only where flushes split by op phase (C=1); a C>1
+    cell is not checked, which is sound only because its C=1 sibling is, so reduce must refuse a C=1 cell whose
+    delete-durable d2 or d0 went unchecked."""
+
+    def test_unchecked_c1_delete_is_refused(self):
+        f = getattr(reduce, "delete_check_problem", lambda name, cell: None)
+        c1 = {"name": "dolt-b-m1-c1", "delete_durable": "d2", "delete_check": "not checked: no phase split"}
+        self.assertIsNotNone(f("dolt-b-m1-c1", c1), "a C=1 d2 cell whose delete was not checked was accepted")
+        self.assertIsNotNone(f("dolt-b-m1-c1", dict(c1, delete_check=None)), "a C=1 cell with no delete_check record")
+
+    def test_controls(self):
+        f = getattr(reduce, "delete_check_problem", None)
+        self.assertIsNotNone(f, "reduce has no delete_check_problem")
+        ok = {"name": "dolt-b-m1-c1", "delete_durable": "d2", "delete_check": "checked at C=1 by op phase"}
+        self.assertIsNone(f("dolt-b-m1-c1", ok))
+        self.assertIsNone(f("dolt-select1-c1", {"delete_durable": "none"}))
+        self.assertIsNone(f("dolt-b-m1-c4", dict(ok, delete_check="not checked: no phase split (C>1 ops overlap)")))
+
+
 if __name__ == "__main__":
     unittest.main()
