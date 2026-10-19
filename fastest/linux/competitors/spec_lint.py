@@ -189,6 +189,26 @@ def selftest():
                 f"{_s}-{_f}.spec: first after-step")
         planted(f"control: {_s}-{_f} written in the registered form is accepted",
                 write_spec(_s, _f, _timed, _back), None, clean_file=f"{_s}-{_f}.spec")
+    # comp-rev-89ec-b3c3 LOW 20: the home connect line can change durability as a setup line can (a libpq options=
+    # string sets synchronous_commit for the session), so it is checked against the system's one registered line
+    def edit_connect(f, new):
+        def ed(dd):
+            p = os.path.join(dd, f)
+            txt = [new if ln.startswith("connect ") else ln for ln in open(p).read().split("\n")]
+            open(p, "w").write("\n".join(txt))
+        return ed
+
+    planted("a home connect carrying options=-csynchronous_commit=off (LOW 20)",
+            edit_connect("pg18-create.spec",
+                         "connect host=127.0.0.1 port={port} user=postgres dbname=postgres options=-csynchronous_commit=off"),
+            "pg18-create.spec: connect")
+    planted("a Dolt home connect to another database (LOW 20)",
+            edit_connect("dolt-b-m1c.spec", "connect host=127.0.0.1 port={port} user=root db=other"),
+            "dolt-b-m1c.spec: connect")
+    planted("a spec with two home connect lines (LOW 20)",
+            prepend_step("doltgres-c-m1.spec",
+                         "connect host=127.0.0.1 port={port} user=postgres password=password dbname=postgres"),
+            "doltgres-c-m1.spec: connect")
     planted("an M1 connect form without its probe", drop_line("pg18-m1.spec", PROBE), "pg18-m1.spec: timed steps")
     planted("two timed steps reordered", swap_steps("dolt-b-m1.spec"), "dolt-b-m1.spec: timed steps")
     planted("an unknown spec file", lambda dd: open(os.path.join(dd, "pg18-new.spec"), "w").write("protocol pg\n"),
