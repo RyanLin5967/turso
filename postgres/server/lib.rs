@@ -1021,6 +1021,34 @@ impl<S: std::ops::Deref<Target = SessionSockets>> Drop for Registered<S> {
 /// allows (and PostgreSQL's authentication_timeout's default); `--authentication-timeout` sets it.
 pub const DEFAULT_AUTHENTICATION_TIMEOUT_S: u64 = 60;
 
+/// Wait, during COPY FROM STDIN, until the client's next message can be read (or its stream
+/// ends), polling every 100 ms for what ends a stalled COPY ([`Session::copy_interrupted`]):
+/// Some(its message) when it came first. The caller reads at once a message already in the
+/// codec's buffer, or from a socket that is not a plain blocking one.
+fn wait_for_copy_data(
+    io: &mut pgwire::tokio::server::BlockingTcp,
+    session: &Session,
+) -> Option<String> {
+    let poll = std::time::Duration::from_millis(100);
+    let mut byte = [0u8; 1];
+    let answer = loop {
+        if io.socket.set_read_timeout(Some(poll)).is_err() {
+            break None;
+        }
+        match io.socket.peek(&mut byte) {
+            Ok(_) => break None,
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                if let Some(why) = session.copy_interrupted() {
+                    break Some(why);
+                }
+            }
+            Err(_) => break None,
+        }
+    };
+    let _ = io.socket.set_read_timeout(None);
+    answer
+}
+
 /// A frontend message's type byte, as the client sent it (0 for the startup-phase messages, which
 /// have none).
 fn frontend_message_type(msg: &PgWireFrontendMessage) -> u8 {
@@ -1131,6 +1159,37 @@ async fn serve_session(
                 io.deadline = None;
                 io.socket.set_read_timeout(None)?;
                 io.socket.set_write_timeout(None)?;
+            }
+        }
+        // A COPY FROM STDIN waiting for rows holds the engine's write lock from its first row, so
+        // its wait is watched: a CancelRequest or its statement_timeout ends it at once, with
+        // PostgreSQL's 57014, as the next message would (review wire-rev-copystdin M3; PostgreSQL
+        // answers only at that next message, its COPY blocking no other writer).
+        if matches!(socket.state(), PgWireConnectionState::CopyInProgress(_)) {
+            let buffered = !socket.read_buffer().is_empty();
+            let why = match socket.get_mut() {
+                pgwire::tokio::server::MaybeTls::Blocking(io) if !buffered => {
+                    wait_for_copy_data(io, &session)
+                }
+                _ => None,
+            };
+            if let Some(why) = why {
+                let extended = matches!(socket.state(), PgWireConnectionState::CopyInProgress(true));
+                let info = session.copy_failed(SqlErrorKind::QueryCanceled, why);
+                socket.set_transaction_status(session.transaction_status());
+                if extended {
+                    session.fail_block();
+                }
+                if let Err(io) = pgwire::tokio::server::process_error(
+                    &mut socket,
+                    PgWireError::UserError(info),
+                    extended,
+                )
+                .await
+                {
+                    break Err(io);
+                }
+                continue;
             }
         }
         let msg = {
@@ -1666,6 +1725,24 @@ struct PendingCopy {
     multi: bool,
     buffer: Vec<u8>,
     extended: bool,
+    /// The COPY's statement_timeout deadline, from its first run (None: no timeout), which ends
+    /// it while the client sends nothing too ([`Session::copy_interrupted`]).
+    deadline: Option<std::time::Instant>,
+}
+
+impl PendingCopy {
+    fn new(statements: Vec<String>, next: usize, multi: bool, extended: bool, timeout_ms: u64) -> Self {
+        Self {
+            statements,
+            next,
+            multi,
+            buffer: Vec::new(),
+            extended,
+            deadline: (timeout_ms > 0).then(|| {
+                std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms)
+            }),
+        }
+    }
 }
 
 /// The CopyData a COPY FROM STDIN loads at once: PostgreSQL's raw read buffer (RAW_BUF_SIZE). The
@@ -2225,13 +2302,9 @@ impl Session {
                     return responses;
                 }
                 responses.push(with_notices(copy_in_response(columns)));
-                self.state().copy_in = Some(PendingCopy {
-                    statements: vec![sql.to_string()],
-                    next: 0,
-                    multi: false,
-                    buffer: Vec::new(),
-                    extended: false,
-                });
+                let timeout = self.copy_timeout_ms();
+                self.state().copy_in =
+                    Some(PendingCopy::new(vec![sql.to_string()], 0, false, false, timeout));
                 return responses;
             }
             responses.push(with_notices(result.unwrap_or_else(Response::Error)));
@@ -2259,6 +2332,31 @@ impl Session {
     fn with_notices(&self, r: Response) -> (Vec<Box<ErrorInfo>>, Response) {
         let notices = std::mem::take(&mut self.state().notices);
         (self.deliverable(notices), r)
+    }
+
+    /// The session's statement_timeout, for a COPY FROM STDIN starting now (0: none).
+    fn copy_timeout_ms(&self) -> u64 {
+        let st = self.state();
+        match &st.branch {
+            Some((_, conn)) => Some(conn),
+            None => st.trunk.as_ref(),
+        }
+        .map_or(0, |conn| conn.statement_timeout_ms())
+    }
+
+    /// Whether a COPY FROM STDIN waiting for rows is to end: a CancelRequest came, or its
+    /// statement_timeout passed. PostgreSQL's two 57014 messages; None otherwise, and with no COPY
+    /// waiting.
+    fn copy_interrupted(&self) -> Option<String> {
+        let st = self.state();
+        let copy = st.copy_in.as_ref()?;
+        if self.interrupts.cancel.load(Ordering::Relaxed) {
+            return Some("canceling statement due to user request".to_string());
+        }
+        if copy.deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            return Some("canceling statement due to statement timeout".to_string());
+        }
+        None
     }
 
     /// After a statement ran: the number of columns of a COPY FROM STDIN that checked its target
@@ -2301,13 +2399,9 @@ impl Session {
                 Ok(_) if asked.is_some() => {
                     let columns = asked.expect("matched");
                     responses.push(self.with_notices(copy_in_response(columns)));
-                    self.state().copy_in = Some(PendingCopy {
-                        statements,
-                        next,
-                        multi,
-                        buffer: Vec::new(),
-                        extended: false,
-                    });
+                    let timeout = self.copy_timeout_ms();
+                    self.state().copy_in =
+                        Some(PendingCopy::new(statements, next, multi, false, timeout));
                     return;
                 }
                 Ok(r) => responses.push(self.with_notices(r)),
@@ -4738,6 +4832,10 @@ impl CopyHandler for Session {
         C::Error: std::fmt::Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        if let Some(why) = self.copy_interrupted() {
+            let ended = self.copy_end(CopyEnd::Failed(SqlErrorKind::QueryCanceled, why));
+            return self.answer_copy_end(client, ended).await;
+        }
         let piece = {
             let mut st = self.state();
             let Some(copy) = st.copy_in.as_mut() else {
@@ -4769,7 +4867,10 @@ impl CopyHandler for Session {
             .as_mut()
             .map(|copy| std::mem::take(&mut copy.buffer))
             .unwrap_or_default();
-        let ended = self.copy_end(CopyEnd::Done(data));
+        let ended = match self.copy_interrupted() {
+            Some(why) => self.copy_end(CopyEnd::Failed(SqlErrorKind::QueryCanceled, why)),
+            None => self.copy_end(CopyEnd::Done(data)),
+        };
         if ended.is_none() {
             client.set_state(PgWireConnectionState::ReadyForQuery);
             return Ok(());
@@ -5282,13 +5383,9 @@ impl ExtendedQueryHandler for Session {
         self.after_implicit(sql, result.is_err());
         // A COPY FROM STDIN that asks for its rows: on_execute answers CopyInResponse.
         if let (Ok(_), Some(columns)) = (&result, self.copy_asked()) {
-            self.state().copy_in = Some(PendingCopy {
-                statements: vec![sql.clone()],
-                next: 0,
-                multi: false,
-                buffer: Vec::new(),
-                extended: true,
-            });
+            let timeout = self.copy_timeout_ms();
+            self.state().copy_in =
+                Some(PendingCopy::new(vec![sql.clone()], 0, false, true, timeout));
             return Ok(copy_in_response(columns));
         }
         result.map_err(PgWireError::UserError)
