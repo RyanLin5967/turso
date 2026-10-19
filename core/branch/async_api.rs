@@ -1,13 +1,13 @@
-//! LEAP L1, the async-durable create (ASYNC-DESIGN §2 as Revision 1 amends it): STUBS ONLY.
-//!
-//! The stubs land first, so the reds compile and fail by assertion (§2: "each delegates to the
-//! durable path", the 35f845259 pattern). The reds are `core/tests/async_s0.rs` (AD-T5, PREREG-v1
-//! amendment 2) and the lib's T-series tests.
-//! - `create_branch_async` creates durably (D2) and acknowledges after the flight, as
-//!   `create_branch` does. Its creating thread therefore flushes and writes, and AD-T5's readings
-//!   say so.
-//! - No flusher and no housekeeping thread exists. The hold hooks report that nothing was held, so
-//!   every arm whose premise is a held thread is void.
+//! LEAP L1, the async-durable create (ASYNC-DESIGN §2 as Revision 1 amends it). The reds are
+//! `core/tests/async_s0.rs` (AD-T5, PREREG-v1 amendment 2) and the lib's T-series tests.
+//! - BUILT: `create_branch_async` buffers and applies its fork and returns, waiting for nothing;
+//!   the flusher (`branch-async-flusher`) flies it within FLY_AGE + POLL; the housekeeping thread
+//!   (`branch-housekeeping`) runs the expiry pass an async create skips (L2(a)). Both start at the
+//!   store's first async create. Async branches are found, listed and connected at once, and lost
+//!   visibly when their flight fails (§8).
+//! - NOT YET: the id floor across a crash (§9: a lost id can be reissued after a reopen, the
+//!   registered red `an_id_lost_in_a_crash_is_never_reissued`), the lag and cap fallbacks (§3),
+//!   the durable-fork watermark (`durable_through` is conservative), `Released`/`LostInCrash`.
 //! - The pool hook reports the ids the table's D2 pool covers (LEAP L2(b), 1,024), so an arm
 //!   needing a deeper pool is void.
 //! - The counters L2(c) and L1 bring (`pending_reallocs`, `pool_refills`, the flusher's) read 0.
@@ -80,56 +80,81 @@ pub struct BranchAsyncStats {
 }
 
 impl Connection {
-    /// STUB (LEAP L1): a durable create, acknowledged after its flight, as `create_branch`.
+    /// LEAP L1: create a named branch and acknowledge it once its records are buffered and
+    /// applied, before they are durable (ASYNC-DESIGN §2, §5). It is found, listed and connected at
+    /// once (§8); the flusher makes it durable within about FLY_AGE + POLL plus a flight
+    /// (`Database::branch_status`, `branch_wait_durable`), and so does any later flight, the
+    /// branch's own first write's among them. Refused unless the store can fly it: a catalog store
+    /// in a class that drains the device, not fail-stopped, with the flusher running.
     pub fn create_branch_async(self: &Arc<Self>, name: &str) -> Result<AsyncCreated> {
-        let id = self.create_branch(name)?;
-        self.db.branches.async_stub_mutants();
+        let store = &self.db.branches;
+        if let Some(why) = store.async_refusal() {
+            return Err(crate::LimboError::InvalidArgument(why.to_string()));
+        }
+        store.start_async()?;
+        let (id, lsn) = self.fork_with(Some(name), super::store::Ack::Async)?;
+        store.note_async_ack(lsn);
+        store.async_stub_mutants();
         let token = DurableToken {
             incarnation: self.db.incarnation,
-            lsn: 0,
+            lsn,
         };
-        // Mutant `async_waits_durable` (ASYNC-DESIGN §13; test and fe-mutants builds): the async
-        // path waits for durability before it returns. A no-op at the stub, which already waited;
-        // the seam is here so AD-T5's kill rule for it has a site.
-        if super::store::fe_mutant("async_waits_durable") {
-            self.db.branch_wait_durable(token)?;
-        }
         Ok(AsyncCreated {
             id,
             token,
-            durable_through: id,
+            // Every id at or below this is durable. Conservative until the durable-fork watermark
+            // lands (ASYNC-DESIGN §4 `durable_fork_id`): this create's own id when its records are
+            // durable already, else the trunk's.
+            durable_through: if store.fork_status(id) == Some(true) { id } else { BranchId::TRUNK },
         })
     }
 }
 
 impl Database {
-    /// STUB (LEAP L1): nothing is ever left to wait for, since every stub create waited.
+    /// Wait until the async create `token` names is durable, leading a flight if none is in the
+    /// air. Refused for a token of another incarnation (`branch_token_foreign`): ask
+    /// `branch_status` then.
     pub fn branch_wait_durable(&self, token: DurableToken) -> Result<()> {
-        let _ = token.lsn;
         if token.incarnation != self.incarnation {
             return Err(crate::LimboError::InvalidArgument("branch_token_foreign".to_string()));
         }
-        Ok(())
+        let store = &self.branches;
+        store.wait_durable(token.lsn, store.sync_class())
     }
 
-    /// STUB (LEAP L1): as `branch_wait_durable`.
+    /// Wait until everything buffered when called is durable.
     pub fn branch_sync(&self) -> Result<()> {
-        Ok(())
+        let store = &self.branches;
+        store.wait_durable(store.journal_lsn(), store.sync_class())
     }
 
-    /// STUB (LEAP L1): a live branch is durable (every stub create waited), any other Unknown.
+    /// Where a branch stands: `NotYetDurable` while an async create's records are not durable,
+    /// `Durable` once they are (and for any live branch not resident in memory: the catalog holds
+    /// only durable rows), `Unknown` for an id not live. It never leads a flight. NOT YET:
+    /// `Released` and `LostInCrash` (an id floor across a crash, ASYNC-DESIGN §9) read `Unknown`.
     pub fn branch_status(&self, id: BranchId) -> Result<BranchStatus> {
-        Ok(if self.branch_ids()?.contains(&id) {
-            BranchStatus::Durable
-        } else {
-            BranchStatus::Unknown
-        })
+        match self.branches.fork_status(id) {
+            Some(true) => Ok(BranchStatus::Durable),
+            Some(false) => Ok(BranchStatus::NotYetDurable),
+            None => Ok(if self.branch_ids()?.contains(&id) {
+                BranchStatus::Durable
+            } else {
+                BranchStatus::Unknown
+            }),
+        }
     }
 
-    /// The async counters: the branch table's inline allocations, the log buffer's growths and the
-    /// group's flights are measured; the rest read 0 and `measured` is false until L1 lands.
+    /// The async counters. Measured: async creates, the flusher's wakes and flights, housekeeping
+    /// passes, the branch table's inline allocations, the log buffer's growths and the group's
+    /// flights. The fallbacks, back-pressure and pool refills read 0, and `measured` stays false
+    /// until the rest of L1 lands (AD-T5 reads it).
     pub fn branch_async_stats(&self) -> BranchAsyncStats {
+        let [async_creates, flusher_wakes, flusher_flights, housekeeping_passes] = self.branches.async_counters();
         BranchAsyncStats {
+            async_creates,
+            flusher_wakes,
+            flusher_flights,
+            housekeeping_passes,
             chunk_inline_allocs: self.branches.table_inline_allocs(),
             pending_reallocs: self.branches.log_buffer_reallocs(),
             group_flights: self.branches.group_counters()[0],
@@ -138,24 +163,23 @@ impl Database {
         }
     }
 
-    /// AD-T5's hold hook for the flusher (R1.4 item 2): `true` when held. STUB: no flusher
-    /// exists, so nothing is held, and an arm that needs one held is void.
+    /// AD-T5's hold hook for the flusher (R1.4 item 2): while held it wakes and leads nothing.
+    /// `true` when the flusher runs (it starts at the store's first async create), so the hold is
+    /// real.
     #[doc(hidden)]
     pub fn branch_flusher_hold(&self, on: bool) -> bool {
-        let _ = on;
-        false
+        self.branches.async_hold(true, on)
     }
 
-    /// AD-T5's hold hook for the housekeeping thread. STUB: none exists, as above.
+    /// AD-T5's hold hook for the housekeeping thread, as `branch_flusher_hold`.
     #[doc(hidden)]
     pub fn branch_housekeeping_hold(&self, on: bool) -> bool {
-        let _ = on;
-        false
+        self.branches.async_hold(false, on)
     }
 
     /// Pre-provision the branch table's pool for `ids` more creates (AD-T5: "the pool
-    /// pre-provisioned to >= N/1024 segments") and return how many ids it now covers. STUB: the
-    /// table's D2 pool is filled to its fixed bound (LEAP L2(b)), which may cover fewer.
+    /// pre-provisioned to >= N/1024 segments") and return how many ids it now covers. The table's
+    /// D2 pool is filled to its fixed bound (LEAP L2(b)), which may cover fewer.
     #[doc(hidden)]
     pub fn branch_pool_provision(&self, ids: u64) -> u64 {
         let _ = ids;
