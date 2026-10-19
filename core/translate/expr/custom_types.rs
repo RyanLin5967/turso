@@ -2980,4 +2980,35 @@ mod tests {
         }
         assert!(bad.is_empty(), "CLAIM: a STRICT CREATE TABLE AS copy held or refused values unlike its types: {bad:#?}");
     }
+
+    /// Engine review 2bdcd32c6 HIGH 6 (raw types/probe2.out.txt): CREATE TABLE AS over numeric
+    /// arithmetic or a window sum failed "type numeric requires 2 parameter(s), got 0": the result is
+    /// numeric with no typmod (437f337be keeps the type a value carries), which a column here cannot
+    /// declare. PostgreSQL 18.6 creates both copies; its values for this exact SQL (UW run
+    /// typesrev-oracle2; artie raw frontier/fastest/lanes/engine/raw/pg18-types-rev2bd.txt
+    /// 42503e4e38) are the expected ones, never ours.
+    #[test]
+    fn create_table_as_over_numeric_arithmetic_or_a_window_sum_succeeds() {
+        let conn = open();
+        conn.execute("CREATE TABLE n(id INTEGER PRIMARY KEY, b numeric(8, 2)) STRICT").unwrap();
+        conn.execute("INSERT INTO n VALUES (1, 1.00), (2, 2.00), (3, NULL), (4, 10.00)").unwrap();
+        let mut bad = Vec::new();
+        for sql in [
+            "CREATE TABLE nc AS SELECT id, b, b + 1 AS b1 FROM n",
+            "CREATE TABLE nw AS SELECT id, sum(b) OVER () AS sw FROM n",
+        ] {
+            if let Err(e) = conn.execute(sql) {
+                bad.push(format!("{sql} refused: {e}; PostgreSQL 18 creates it"));
+            }
+        }
+        bad.extend(diverging(
+            &conn,
+            &[
+                ("SELECT id, b, b1 FROM nc ORDER BY id", "1,1.00,2.00;2,2.00,3.00;3,NULL,NULL;4,10.00,11.00"),
+                ("SELECT count(*) FROM nw", "4"),
+            ],
+            "PostgreSQL 18",
+        ));
+        assert!(bad.is_empty(), "CLAIM: CREATE TABLE AS over numeric arithmetic or a window sum failed: {bad:#?}");
+    }
 }
