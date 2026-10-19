@@ -2447,6 +2447,71 @@ impl ToTokens for CommonTableExpr {
     }
 }
 
+/// Whether a type name printed bare reads back as itself: one or more words, each separated from the
+/// next by exactly one space, and each either a plain type word (`crate::lexer::is_plain_type_word`)
+/// or one whole well-formed quoted token (`"..."`, `'...'` or `` `...` ``, its own quote doubled
+/// inside, so `"x""y"`). The parser keeps such a token whole and joins the words with one space, so
+/// the same name comes back. `"a"b"` is not one: its quoted token `"a"` runs straight into `b"`.
+fn type_name_reads_back_bare(b: &[u8]) -> bool {
+    if b.is_empty() {
+        return false;
+    }
+    let mut i = 0;
+    loop {
+        let start = i;
+        if matches!(b[i], b'"' | b'\'' | b'`') {
+            let q = b[i];
+            i += 1;
+            loop {
+                if i == b.len() {
+                    return false; // unterminated
+                }
+                if b[i] == q {
+                    if b.get(i + 1) == Some(&q) {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+        } else {
+            while i < b.len() && b[i] != b' ' {
+                i += 1;
+            }
+            if !crate::lexer::is_plain_type_word(&b[start..i]) {
+                return false;
+            }
+        }
+        if i == b.len() {
+            return true;
+        }
+        // The word must end at a single space with another word after it.
+        if b[i] != b' ' || i + 1 == b.len() {
+            return false;
+        }
+        i += 1;
+    }
+}
+
+/// The parser's registered mutants (`FE_MUTANT`, the convention of turso_core's
+/// `branch::store::fe_mutant`, which this crate cannot call): one names one deliberate defect, so a
+/// red can be shown to fail on it from the same test binary. TEST BUILDS OF THIS CRATE ONLY: any
+/// other build, turso_core's tests included, has no mutant to switch on. Read once per process.
+fn fe_mutant(name: &str) -> bool {
+    #[cfg(test)]
+    {
+        static ON: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        ON.get_or_init(|| std::env::var("FE_MUTANT").ok()).as_deref() == Some(name)
+    }
+    #[cfg(not(test))]
+    {
+        let _ = name;
+        false
+    }
+}
+
 impl_display_for_to_tokens!(Type);
 impl ToTokens for Type {
     fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
@@ -2458,15 +2523,22 @@ impl ToTokens for Type {
         // word is a plain type word, else bracket-quoted as written (`[x,y]`, `[not null]`), which the
         // parser reads back as the bracket's bytes; a name holding `]` is double-quoted (UNCHECKED:
         // whether that form reads back without its quotes).
-        let plain = !self.name.is_empty()
-            && self.name.split(' ').all(|w| crate::lexer::is_plain_type_word(w.as_bytes()));
-        // A name that still carries its own quotes (the parser keeps a quoted type token whole,
-        // `"a]b"` or `'x]y'`) prints as itself: quoting it again made every rewrite grow it
-        // (engine-rev-qaf-fix2 HIGH A: 52, 64, 84, ... 568 bytes).
-        let self_quoted = self.name.len() >= 2
-            && matches!(self.name.as_bytes()[0], b'"' | b'\'' | b'`')
-            && self.name.as_bytes()[self.name.len() - 1] == self.name.as_bytes()[0];
-        if plain || self_quoted {
+        // A word may also be a quoted token the parser kept whole, quotes and all (`"a]b"`, `'x]y'`):
+        // it prints as itself, since quoting it again made every rewrite grow it (engine-rev-qaf-fix2
+        // HIGH A: 52, 64, 84, ... 568 bytes). Only a WHOLE well-formed token counts: a bracket's
+        // `"a"b"` merely starts and ends with a quote, and printed bare it is an unterminated literal
+        // (engine-rev 2bdcd32c6 HIGH 1). Mutant `type_self_quoted_by_ends` (test builds only): the
+        // first-and-last-byte check of 0e823a4ac.
+        let bare = if fe_mutant("type_self_quoted_by_ends") {
+            let b = self.name.as_bytes();
+            let plain = !b.is_empty()
+                && self.name.split(' ').all(|w| crate::lexer::is_plain_type_word(w.as_bytes()));
+            plain
+                || (b.len() >= 2 && matches!(b[0], b'"' | b'\'' | b'`') && b[b.len() - 1] == b[0])
+        } else {
+            type_name_reads_back_bare(self.name.as_bytes())
+        };
+        if bare {
             s.append(TK_ID, Some(&self.name))?;
         } else if !self.name.contains(']') {
             s.append(TK_ID, Some(&format!("[{}]", self.name)))?;
