@@ -152,6 +152,31 @@ def driver_subcommands(text):
             for m in re.finditer(r'gen_seed\.py"\s+([a-z][a-z-]*)', ln)}
 
 
+# comp-rev-89ec-b3c3 LOW 14: what the drivers call through Python (fixture.py's parent and facts, run_system.sh's MED 11
+# stream plant, readback_repin.sh's want), as "py:<name>"
+PY_USES = {"py:facts", "py:sql_lines", "py:age_lines"}
+
+
+def generator_uses(text):
+    """Every generator use in a shell or Python text's non-comment lines: the literal `gen_seed.py" <cmd>` calls
+    (driver_subcommands); a shell wrapper -- a function whose body forwards "$@" to gen_seed.py -- and each
+    `<wrapper> <cmd>` call of it; and, after `import gen_seed [as G]`, each `gen_seed.<name>(` / `G.<name>(` call as
+    "py:<name>" (an attribute read or assignment is not a call)."""
+    lines = [ln for ln in text.splitlines() if not ln.lstrip().startswith("#")]
+    uses = driver_subcommands(text)
+    wrappers = {m.group(1) for ln in lines
+                for m in re.finditer(r'(\b[A-Za-z_][A-Za-z0-9_]*)\s*\(\)\s*\{[^}]*gen_seed\.py"\s+"\$@"', ln)}
+    for w in wrappers:
+        uses |= {m.group(1) for ln in lines for m in re.finditer(r'(?<![A-Za-z0-9_])' + re.escape(w) +
+                                                                  r'\s+([a-z][a-z-]*)', ln)}
+    names = {"gen_seed"} | {m.group(1) for ln in lines for m in re.finditer(r'import gen_seed as ([A-Za-z_]\w*)', ln)}
+    if re.search(r'\bimport gen_seed\b', "\n".join(lines)):
+        for nm in names:
+            uses |= {"py:" + m.group(1) for ln in lines
+                     for m in re.finditer(r'(?<![A-Za-z0-9_.])' + re.escape(nm) + r'\.([A-Za-z_]\w*)\s*\(', ln)}
+    return uses
+
+
 def selftest():
     bad = n = 0
 
