@@ -1,0 +1,11 @@
+>> Q SELECT pg_database_size((-1)::oid)
+   T oids=[20]
+   E S=ERROR C=42704 M=database with OID 4294967295 does not exist
+   Z I
+>> Q SELECT pg_database_size(4294967296::oid)
+   E S=ERROR C=22003 M=OID out of range
+   Z I
+>> Q SELECT pg_database_size(0::oid)
+   T oids=[20]
+   E S=ERROR C=42704 M=database with OID 0 does not exist
+   Z I

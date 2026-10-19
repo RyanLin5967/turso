@@ -12418,6 +12418,13 @@ replays_postgresql!(
     "pg18-wirefuzz-a_three_part_name_must_name_this_database.out",
     []
 );
+// wire-rev-2a68496d0 L4: an oid is unsigned: (-1)::oid is 4294967295 in the 42704 message, and 4294967296::oid is
+// refused 22003 'OID out of range' before RowDescription.
+replays_postgresql!(
+    pg18_wirefuzz_pg_database_size_reads_an_oid_as_postgresql_reads_one_replays_as_postgresql_answered,
+    "pg18-wirefuzz-pg_database_size_reads_an_oid_as_postgresql_reads_one.out",
+    []
+);
 replays_postgresql!(
     pg18_wirefuzz_the_connected_database_is_current_database_and_in_pg_database_replays_as_postgresql_answered,
     "pg18-wirefuzz-the_connected_database_is_current_database_and_in_pg_database.out",
