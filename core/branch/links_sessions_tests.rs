@@ -33,6 +33,13 @@ fn meta_version(path: &std::path::Path) -> u32 {
     cat.meta().unwrap().map_or(0, |m| m.format)
 }
 
+/// `meta_version`, or `None` when the catalog cannot be read now (a checkpoint in flight holds it:
+/// SQLite Busy, measured on iccad6 at 7a7375519, raw h1d-starved-fix): the polls inside the hold use it.
+fn try_meta_version(path: &std::path::Path) -> Option<u32> {
+    let mut cat = super::catalog::Catalog::open(&std::path::PathBuf::from(format!("{}-branch-cat", path.display())), SyncClass::Off).ok()?;
+    cat.meta().ok().map(|m| m.map_or(0, |m| m.format))
+}
+
 fn log_bytes(path: &std::path::Path) -> u64 {
     std::fs::metadata(format!("{}-branch-log", path.display())).map_or(0, |m| m.len())
 }
@@ -191,6 +198,9 @@ fn ls_fill_starved_child() {
     // The fill's committed batches are held back from the store mutex, as a foreground that takes
     // it on every operation starved them (diagnostic 4): only the hard limit can move the store.
     super::store::LINKS_FILL_HELD_BATCHES.store(0, Ordering::Release);
+    // The columns made inside the first batch (the path before e2a788823), so this test reaches the
+    // per-batch record, the backstop the column-only transaction now precedes.
+    super::store::LINKS_FILL_COLUMNS_IN_BATCH.store(true, Ordering::Release);
     super::store::LINKS_FILL_HOLD_UNRECORDED.store(true, Ordering::Release);
     let db = open(&path);
     db.branch_wait_name_filter();
@@ -214,13 +224,14 @@ fn ls_fill_starved_child() {
     // so the meta row is polled for it (wall time only bounds the wait). Then the hold is let go, and
     // only then waited on: checkpoint_wait joins the fill thread, which a hold in place never ends.
     let t = std::time::Instant::now();
-    let mut meta = meta_version(&path);
+    let mut meta = try_meta_version(&path).unwrap_or(0);
     while meta < 21 && t.elapsed() < std::time::Duration::from_secs(60) {
         std::thread::sleep(std::time::Duration::from_millis(20));
-        meta = meta_version(&path);
+        meta = try_meta_version(&path).unwrap_or(meta);
     }
     super::store::LINKS_FILL_HOLD_UNRECORDED.store(false, Ordering::Release);
     db.branch_checkpoint_wait();
+    super::store::LINKS_FILL_COLUMNS_IN_BATCH.store(false, Ordering::Release);
     println!("LS-STARVED past={} held={held} creates={k} meta={meta} log={} peak={peak}", u64::from(past), log_bytes(&path));
 }
 

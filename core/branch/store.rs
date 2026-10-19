@@ -3864,6 +3864,10 @@ pub(crate) static LINKS_FILL_FAILS: AtomicBool = AtomicBool::new(false);
 pub(crate) static LINKS_FILL_HOLD_UNRECORDED: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 pub(crate) static LINKS_FILL_HELD_BATCHES: AtomicU64 = AtomicU64::new(0);
+/// Red column 3: the knob of 7f81d8438, a no-op here (before e2a788823 the columns are always made in
+/// the first batch).
+#[cfg(test)]
+pub(crate) static LINKS_FILL_COLUMNS_IN_BATCH: AtomicBool = AtomicBool::new(false);
 
 /// A fuzzy checkpoint's cut, after its catalog commit and before its install, holding no lock but
 /// briefly the store mutex (lead review 1 item 7, review 2 #5): wait — not holding the mutex — for
