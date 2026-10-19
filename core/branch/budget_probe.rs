@@ -1498,6 +1498,10 @@ fn linux_others_blocked() -> Option<bool> {
 /// when it cannot be read (it exited).
 #[cfg(target_os = "linux")]
 fn linux_task_running(tid: u64) -> Option<bool> {
+    // engine-rev-qaf-fix MED-8's red: a read that cannot be understood, as a test hook.
+    if STAT_UNREADABLE_FOR_TEST.load(Relaxed) {
+        return None;
+    }
     // "/proc/self/task/" + digits + "/stat" + NUL, built in a stack buffer.
     let mut path = [0u8; 64];
     let head = b"/proc/self/task/";
@@ -1536,6 +1540,10 @@ fn linux_task_running(tid: u64) -> Option<bool> {
     Some(state == b'R')
 }
 
+/// Test hook (engine-rev-qaf-fix MED-8): every per-thread stat read fails to be understood.
+#[cfg(target_os = "linux")]
+pub(crate) static STAT_UNREADABLE_FOR_TEST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn linux_threads() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
@@ -1560,4 +1568,25 @@ fn linux_threads() -> Option<u64> {
     {
         None
     }
+}
+
+/// engine-rev-qaf-fix MED-8: a per-thread stat that cannot be read or parsed makes the probe
+/// refuse (None), never read as "not running": failing open let a window read "every other thread
+/// blocked" over threads it could not see.
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn others_blocked_refuses_when_a_threads_stat_cannot_be_read() {
+    let spinner_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop = spinner_stop.clone();
+    let spinner = std::thread::spawn(move || {
+        while !stop.load(Relaxed) {
+            std::hint::spin_loop();
+        }
+    });
+    STAT_UNREADABLE_FOR_TEST.store(true, Relaxed);
+    let read = others_blocked();
+    STAT_UNREADABLE_FOR_TEST.store(false, Relaxed);
+    spinner_stop.store(true, Relaxed);
+    spinner.join().unwrap();
+    assert_eq!(read, None, "CLAIM: unreadable thread states refuse the probe");
 }
