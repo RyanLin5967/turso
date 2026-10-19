@@ -7,3 +7,6 @@ that transcript format cannot carry, so no replay can read it; the test that cit
 - `pg18-typmod.out`: each RowDescription field's type size (typlen) and type modifier (atttypmod),
   read by a raw v3 client (`name:oid/typlen/typmod`). pgproto.py prints a RowDescription as its
   type OIDs alone (`T oids=[...]`). Asserted by `row_descriptions_carry_postgresqls_type_sizes_and_modifiers`.
+- `pg18-bind-varchar.out`: Parse/Bind/Execute rounds whose parameter values keep trailing spaces, recorded by
+  a raw v3 client; pgproto.py's scenario format strips the spaces around each `|||` value. Asserted by
+  `a_parameter_assigned_to_a_varchar_column_is_refused_at_bind_when_too_long`.

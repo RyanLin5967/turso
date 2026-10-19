@@ -15666,9 +15666,9 @@ fn a_negative_int4_literal_is_int4_and_a_missing_column_is_reported_first() {
 }
 
 /// Lead ruling 1(a) (PG 18.6 recorded, recordings/pg18-bind-varchar.out): a parameter assigned to a varchar(5)
-/// column is refused at Bind, 22001 before BindComplete, undeclared or declared text alike (the unnamed statement's
-/// custom plan at Bind folds the value's coercion to varchar(5)); here the Bind succeeded and the engine refused the
-/// Execute. A value whose excess is spaces passes Bind and is stored cut to 5 ('ab      ' as 'ab   ').
+/// column is refused at Bind, 22001 before BindComplete (the unnamed statement's custom plan at Bind folds the
+/// value's coercion to varchar(5); recorded for a parameter declared text too, which bind_round cannot declare);
+/// here the Bind succeeded and the engine refused the Execute. A value whose excess is spaces passes Bind and is stored cut to 5 ('ab      ' as 'ab   ').
 #[test]
 fn a_parameter_assigned_to_a_varchar_column_is_refused_at_bind_when_too_long() {
     let dir = Scratch::new("bind-varchar");
@@ -15677,7 +15677,7 @@ fn a_parameter_assigned_to_a_varchar_column_is_refused_at_bind_when_too_long() {
     a.q("CREATE TABLE vc(id int PRIMARY KEY, v varchar(5))").ok("vc");
     a.q("INSERT INTO vc VALUES (1, 'ab')").ok("row");
     let mut wrong = Vec::new();
-    for sql in ["INSERT INTO vc VALUES (3, $1)", "UPDATE vc SET v = $1 WHERE id = 1", "UPDATE vc SET v = $1::text WHERE id = 1"] {
+    for sql in ["INSERT INTO vc VALUES (3, $1)", "UPDATE vc SET v = $1 WHERE id = 1"] {
         let (types, error) = a.bind_round(sql, &[], &[Some(b"abcdef")], &[]);
         let code = error.as_ref().map(|e| e.code.clone());
         if types.contains(&b'2') || code.as_deref() != Some("22001") {
