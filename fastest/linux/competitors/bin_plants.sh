@@ -55,6 +55,22 @@ case_ "open loop refuses a connect/close step in a spec with no after-steps (LOW
 case_ "open loop refuses a step-level sql-serial in a spec with no after-steps (LOW 6)" 2 \
   "REFUSED: open loop with a sql-serial step" \
   -- "$BB" --spec "$S/open-serial.spec" --out "$(OUT bs)" --clients 1 --mode open --rate 10 --duration-s 1 --set port=1
+# the lead's ruling on Doltgres b-m1 (DECISIONS, 2026-10-19): `home per-cycle` opens a fresh home connection for each
+# cycle outside the timed window, and `after admin-sql` runs on a separate per-client admin connection after the home
+# one is closed. Grammar plants: an admin step may not be timed, per-cycle has no teardown, and a per-cycle spec is
+# accepted (it then stops at the connect)
+printf 'protocol pg\nconnect host=127.0.0.1 port={port} user=postgres dbname=postgres\nhome per-cycle\nvar branch = b_{run}_{c}_{i}\nstep sql SELECT 1\nafter sql SELECT 2\nafter admin-sql SELECT 3\n' >"$S/per-cycle.spec"
+printf 'protocol pg\nconnect host=127.0.0.1 port={port} user=postgres dbname=postgres\nstep admin-sql SELECT 1\n' >"$S/timed-admin.spec"
+printf 'protocol pg\nconnect host=127.0.0.1 port={port} user=postgres dbname=postgres\nhome per-cycle\nstep sql SELECT 1\nteardown SELECT 1\n' >"$S/per-cycle-teardown.spec"
+printf 'protocol pg\nconnect host=127.0.0.1 port={port} user=postgres dbname=postgres\nhome sometimes\nstep sql SELECT 1\n' >"$S/home-bad.spec"
+case_ "an admin-sql step may not be timed (Doltgres b-m1 ruling)" 2 "admin-sql is an after-step only" \
+  -- "$BB" --spec "$S/timed-admin.spec" --out "$(OUT ta)" --clients 1 --max-ops 1 --set port=1
+case_ "home per-cycle with a teardown is refused (the home is closed each cycle)" 2 "home per-cycle has no teardown" \
+  -- "$BB" --spec "$S/per-cycle-teardown.spec" --out "$(OUT pt)" --clients 1 --max-ops 1 --set port=1
+case_ "home takes only per-cycle" 2 "home needs 'per-cycle'" \
+  -- "$BB" --spec "$S/home-bad.spec" --out "$(OUT hb)" --clients 1 --max-ops 1 --set port=1
+case_ "control: a per-cycle spec with an admin-sql after-step passes the checks and stops at the connect" 2 "$CONN" \
+  -- "$BB" --spec "$S/per-cycle.spec" --out "$(OUT pc)" --clients 1 --max-ops 1 --set port=1
 case_ "control: open loop on pg18-select1 passes the checks and stops at the connect" 2 "$CONN" \
   -- "$BB" --spec "$SP/pg18-select1.spec" --out "$(OUT c)" --clients 1 --mode open --rate 10 --duration-s 1 --set port=1
 case_ "control: closed loop on dolt-create.spec is not refused for its after-steps" 2 "failed to connect" \
