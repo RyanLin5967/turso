@@ -2263,7 +2263,8 @@ impl CatState {
             links_cursor: None,
             links_prefilled: false,
             links_fill_starts: 0,
-            links_columns_made: Arc::new(AtomicBool::new(false)),
+            // l4-rev-h1 MED-3: a catalog reopened with its columns already made starts recorded.
+            links_columns_made: Arc::new(AtomicBool::new(catalog.links())),
             ckpt: CkptCounters::default(),
             catalog,
             dirty: HashMap::new(),
@@ -3736,6 +3737,29 @@ impl Drop for CutGate<'_> {
 /// count does not see) ran under the store mutex in a sharp store (red a722957c4). Mutant
 /// `l4_fill_wal_left` (test builds only): not truncated here.
 fn run_links_fill(shared: &StoreMutex, writer: &Mutex<Catalog>, group: &Group, made: &AtomicBool) {
+    // l4-rev-h1 HIGH 2 and MED-3: the link columns and the cursor's table are made FIRST, in a
+    // transaction of their own on the writer, before this thread takes the store mutex at all, and
+    // recorded lock-free: past the hard limit the gate can then let a checkpoint go on, however long
+    // the first row batch takes or however the store mutex starves this thread. A kill after it leaves
+    // the columns under the old meta row, a state the batches already leave between them (`links_valid`
+    // reads it as unfilled, and the next fill or checkpoint fills it). Mutant
+    // `l4_columns_in_first_batch` (test builds only): made inside the first row batch, as before.
+    if !fe_mutant("l4_columns_in_first_batch") {
+        let mut w = writer.lock();
+        let ready = w.links()
+            || match w.begin().and_then(|()| w.make_link_columns()).and_then(|()| w.commit()) {
+                Ok(()) => true,
+                Err(e) => {
+                    w.rollback();
+                    let _ = w.refresh_links();
+                    tracing::warn!("branch catalog link columns not made: {e}");
+                    false
+                }
+            };
+        if ready {
+            made.store(true, Ordering::Release);
+        }
+    }
     // Test builds (l4-rev-h1 MED-3): a fill held before it first takes the store mutex, as one starved
     // of it there would be; `LINKS_FILL_ENTRY_HELD` counts the fills that reached the hold.
     #[cfg(test)]
@@ -3757,6 +3781,8 @@ fn run_links_fill(shared: &StoreMutex, writer: &Mutex<Catalog>, group: &Group, m
     let resumed = if fe_mutant("l4_fill_cursor_forgotten") { Ok(None) } else { writer.lock().fill_cursor() };
     match resumed {
         Ok(Some((g, at, done))) if g == generation => {
+            // A cursor exists, so the columns do: recorded before the store mutex is asked for.
+            made.store(true, Ordering::Release);
             let mut inner = shared.lock();
             if let Some(cat) = inner.cat.as_mut().filter(|c| c.filling) {
                 cat.links_columns_made.store(true, Ordering::Release);
@@ -3805,16 +3831,18 @@ fn run_links_fill(shared: &StoreMutex, writer: &Mutex<Catalog>, group: &Group, m
             }
             done
         };
-        // Recorded the moment the batch commits, before anything waits for the store mutex. Mutant
-        // `l4_columns_recorded_under_mutex` (test builds only): recorded only under it, as before.
-        if batch.is_ok() && !fe_mutant("l4_columns_recorded_under_mutex") {
-            made.store(true, Ordering::Release);
-        }
         if batch.is_ok() {
             kill_point("ckpt.upgrade.batch");
         }
         if matches!(batch, Ok(None)) && !fe_mutant("l4_fill_wal_left") {
             truncate_catalog_wal(&mut writer.lock(), group, None);
+        }
+        // Recorded once the batch has committed (and, after the last, the WAL is truncated: l4-rev-h1
+        // LOW 4), before anything waits for the store mutex: the backstop where the columns were made
+        // in a batch (mutant `l4_columns_in_first_batch`). Mutant `l4_columns_recorded_under_mutex`
+        // (test builds only): recorded only under it, as before.
+        if batch.is_ok() && !fe_mutant("l4_columns_recorded_under_mutex") {
+            made.store(true, Ordering::Release);
         }
         // Test builds (links H1 reopened): a committed batch held back from the store mutex before
         // it is recorded, as the fill was starved of it by a foreground that takes it on every

@@ -870,6 +870,19 @@ impl Catalog {
     /// stand (`relink`; kill point `ckpt.upgrade.rows` after the batch's rows). Returns the last key
     /// filled, or `None` when the batch reached the last row. The meta row is not touched: the
     /// version flips only in the checkpoint transaction that commits after the last batch.
+    /// The link columns and the fill cursor's table, made in the current transaction if absent (the
+    /// fill's first, column-only transaction: l4-rev-h1 HIGH 2 / MED-3). A no-op when they exist.
+    pub(crate) fn make_link_columns(&mut self) -> Result<()> {
+        if self.links {
+            return Ok(());
+        }
+        for sql in LINK_COLUMNS {
+            self.conn.execute(sql)?;
+        }
+        self.conn.execute(LINK_FILL_TABLE)?;
+        self.refresh_links()
+    }
+
     pub(crate) fn upgrade_links_batch(&mut self, after: Option<(u64, u64)>, n: usize) -> Result<Option<(u64, u64)>> {
         if !self.links {
             for sql in LINK_COLUMNS {
