@@ -411,6 +411,11 @@ pub(crate) struct Group {
     /// no flight in the air for 5 ms in the middle of a burst, and the writer took that for the idle
     /// tail, 4, 4 and 5 words in 3 runs, raw l94). Counted without the group's lock.
     awaiting: AtomicU64,
+    /// LEAP L3: set by a waiter that may not wait out a gather (a trunk commit's barrier, which
+    /// holds the trunk's WAL write lock; `NO_GATHER`), so the gathering leader takes its flight at
+    /// once (engine-rev-qaf-fix2 MED 1: 960091ee3 kept such a barrier from LEADING a gather, not from
+    /// waiting behind another thread's, up to the bound).
+    gather_cut: AtomicBool,
     /// The leader's flight time, handed to its `land` (no lock of its own; engine-rev-qaf-fix MED-5).
     last_flight_ns: AtomicU64,
     /// The store's fail-stop flag, shared with its journal (`StoreInner::fail_stop`).
@@ -729,6 +734,7 @@ impl Group {
             confirm_cv: std::sync::Condvar::new(),
             durable_now: [AtomicU64::new(durable), AtomicU64::new(durable), AtomicU64::new(durable)],
             awaiting: AtomicU64::new(0),
+            gather_cut: AtomicBool::new(false),
             last_flight_ns: AtomicU64::new(0),
             failed,
             confirm_done: AtomicU64::new(0),
@@ -1447,9 +1453,32 @@ struct AsyncCtl {
     /// `async_clock_ns` at the oldest async acknowledgement no flight has been led for yet, or 0.
     oldest_ns: AtomicU64,
     creates: AtomicU64,
+    /// The threads' naps wait here, so a stop wakes them at once (engine-rev-qaf-fix2 MED 6: a
+    /// close joined housekeeping for up to HK_TICK, holding the branch log's lock meanwhile).
+    nap_lock: std::sync::Mutex<()>,
+    nap_cv: std::sync::Condvar,
     flusher_wakes: AtomicU64,
     flusher_flights: AtomicU64,
     housekeeping_passes: AtomicU64,
+}
+
+impl AsyncCtl {
+    /// Sleep for `d`, or until a stop: `true` if stopped.
+    fn nap(&self, d: Duration) -> bool {
+        let g = self.nap_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if self.stop.load(Ordering::Acquire) {
+            return true;
+        }
+        let _ = self.nap_cv.wait_timeout(g, d).unwrap_or_else(|e| e.into_inner());
+        self.stop.load(Ordering::Acquire)
+    }
+
+    /// Stop both threads and wake them.
+    fn halt(&self) {
+        let _g = self.nap_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.stop.store(true, Ordering::Release);
+        self.nap_cv.notify_all();
+    }
 }
 
 /// LEAP L1's flusher and housekeeping threads (ASYNC-DESIGN §6), started at the store's first
@@ -1471,8 +1500,7 @@ pub(crate) struct AsyncThreads {
 fn run_async_flusher(store: std::sync::Weak<BranchStore>, ctl: Arc<AsyncCtl>) {
     let fly_age = u64::try_from(FLY_AGE.as_nanos()).unwrap_or(u64::MAX);
     loop {
-        crate::thread::sleep(POLL);
-        if ctl.stop.load(Ordering::Acquire) {
+        if ctl.nap(POLL) {
             return;
         }
         if ctl.flusher_held.load(Ordering::Acquire) {
@@ -1516,8 +1544,7 @@ fn run_async_flusher(store: std::sync::Weak<BranchStore>, ctl: Arc<AsyncCtl>) {
 /// store.
 fn run_housekeeping(store: std::sync::Weak<BranchStore>, ctl: Arc<AsyncCtl>) {
     loop {
-        crate::thread::sleep(HK_TICK);
-        if ctl.stop.load(Ordering::Acquire) {
+        if ctl.nap(HK_TICK) {
             return;
         }
         if ctl.housekeeping_held.load(Ordering::Acquire) {
@@ -1873,11 +1900,18 @@ impl Drop for StoreGuard<'_> {
         // blocking on the group lock (see `StoreMutex::pool_notified`).
         if pool_low {
             self.store.pool_kicked.store(true, Ordering::Release);
-            if !std::thread::panicking() && !self.store.pool_notified.load(Ordering::Acquire) {
-                if let Some(kick) = self.store.pool_kicker.get() {
-                    if kick() {
-                        self.store.pool_notified.store(true, Ordering::Release);
-                    }
+            // Claimed before the kick and given back if the kick could not land (engine-rev-qaf-fix2
+            // MED 13: a late `store(true)` after a refill had cleared it left the pool unrefilled).
+            if !std::thread::panicking()
+                && self
+                    .store
+                    .pool_notified
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                let kicked = self.store.pool_kicker.get().is_some_and(|kick| kick());
+                if !kicked {
+                    self.store.pool_notified.store(false, Ordering::Release);
                 }
             }
         }
@@ -6633,6 +6667,12 @@ impl BranchStore {
                     if !blocked {
                         break;
                     }
+                    // A barrier under the WAL write lock cuts another thread's gather short rather
+                    // than wait it out. Mutant `barrier_waits_out_gather` (test builds only): it
+                    // waits, as before.
+                    if g.gathering && NO_GATHER.with(std::cell::Cell::get) && !fe_mutant("barrier_waits_out_gather") {
+                        group.gather_cut.store(true, Ordering::Release);
+                    }
                     first = false;
                     g = group.wait(g);
                 }
@@ -6653,6 +6693,7 @@ impl BranchStore {
                 {
                     g.gathering = true;
                     g.gathers += 1;
+                    group.gather_cut.store(false, Ordering::Release);
                     drop(g);
                     let held_from = Instant::now();
                     let until = held_from + bound;
@@ -6660,6 +6701,9 @@ impl BranchStore {
                     while Instant::now() < until {
                         if group.awaiting.load(Ordering::Acquire) >= cohort {
                             back = true;
+                            break;
+                        }
+                        if group.gather_cut.swap(false, Ordering::AcqRel) {
                             break;
                         }
                         crate::thread::yield_now();
@@ -7723,8 +7767,9 @@ impl BranchStore {
             match spawned {
                 Ok(handle) => threads.push((std::process::id(), handle.thread().id(), handle)),
                 Err(e) => {
-                    // The one already started stops at its next wake.
-                    t.ctl.stop.store(true, Ordering::Release);
+                    // The one already started stops at once; async stays refused for this store
+                    // (`async_refusal`).
+                    t.ctl.halt();
                     return Err(LimboError::InternalError(format!("{name} not started: {e}")));
                 }
             }
@@ -7737,6 +7782,14 @@ impl BranchStore {
     /// async needs a catalog store whose class drains the device (FullFsync on Apple, where fsync
     /// does not; Fsync or FullFsync elsewhere), and a live one.
     pub(crate) fn async_refusal(&self) -> Option<&'static str> {
+        // Until the id floor lands (ASYNC-DESIGN §9; the registered red
+        // an_id_lost_in_a_crash_is_never_reissued), an id an async create acknowledged can be lost
+        // in a crash and issued again to another branch (engine-rev-qaf-fix2 HIGH F). Outside the
+        // lib's own tests that state is unrepresentable: async is refused. The tests run the
+        // mechanism; no build a user links can.
+        if cfg!(not(test)) {
+            return Some("async creates are refused until the id floor lands (ASYNC-DESIGN §9): a lost id could be issued again");
+        }
         let device_drained = match self.class {
             SyncClass::FullFsync => true,
             SyncClass::Fsync => !cfg!(target_vendor = "apple"),
@@ -7748,6 +7801,11 @@ impl BranchStore {
         if self.group.poisoned() {
             return Some("the branch store is fail-stopped");
         }
+        // A thread that could not start halted both (engine-rev-qaf-fix2 MED 7): nothing would fly
+        // an acknowledged create.
+        if self.async_threads.ctl.stop.load(Ordering::Acquire) {
+            return Some("the branch store's async threads are stopped");
+        }
         let inner = self.inner.lock();
         if inner.files.is_none() || !(inner.catalog_mode || inner.cat.is_some()) {
             return Some("an async create needs a durable catalog store");
@@ -7758,7 +7816,7 @@ impl BranchStore {
     /// Stop and join LEAP L1's threads (`Drop`).
     fn stop_async(&self) {
         let t = &self.async_threads;
-        t.ctl.stop.store(true, Ordering::Release);
+        t.ctl.halt();
         let me = crate::thread::current().id();
         for (pid, tid, handle) in t.threads.lock().drain(..) {
             if pid != std::process::id() || tid == me {
@@ -11331,6 +11389,18 @@ impl Drop for BranchStore {
         // LEAP L1's threads (ASYNC-DESIGN §11 step 7, Drop item 3): stopped, then joined, except
         // in a fork(2) child and on the thread this drop runs on (its pass held the last handle).
         self.stop_async();
+        // Then what async creates buffered is flown (ASYNC-DESIGN G7, "Drop loses nothing";
+        // engine-rev-qaf-fix2 HIGH E: a create acked in the flusher's last FLY_AGE was lost by a
+        // clean close). A fork(2) child's flight is refused by the journal itself. Mutant
+        // `close_drops_async` (test builds only): not flown, as before.
+        if self.async_threads.started.load(Ordering::Acquire) && !self.group.poisoned() && !fe_mutant("close_drops_async") {
+            let lsn = self.journal_lsn();
+            if lsn > self.group.durable(self.class) {
+                if let Err(e) = self.wait_durable(lsn, self.class) {
+                    tracing::warn!("branch store close: the async creates' flight failed: {e}");
+                }
+            }
+        }
         let mut inner = self.inner.lock();
         let now = inner.lease.now_ms();
         // With no lease outstanding the clock's value constrains nothing, so a close writes nothing.

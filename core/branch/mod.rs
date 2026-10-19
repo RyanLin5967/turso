@@ -1095,6 +1095,11 @@ impl Connection {
                 // wait comes before the fork's own flight, which then does not contend with that
                 // commit's WAL flush (lead review 1, item 42). A fork that is not handed out is
                 // released (review item 11).
+                // An async create waits for nothing (ASYNC-DESIGN §5 step 19): its readers still wait
+                // out the commit in `settle` before they read (engine-rev-qaf-fix2 MED 5: up to 22.7
+                // ms behind a trunk writer). Mutant `async_waits_trunk_commit` (test builds only):
+                // it waits, as before.
+                let after = after.filter(|_| ack == store::Ack::Durable || store::fe_mutant("async_waits_trunk_commit"));
                 if let Some(c) = after {
                     if let Err(e) = store.wait_trunk_commit_published(c) {
                         // fastest-engine mutant `fork_failure_kept` (test builds only).
