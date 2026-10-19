@@ -3288,4 +3288,36 @@ mod tests {
         );
         assert!(bad.is_empty(), "CLAIM: SQLite's CAST(x AS NUMERIC) took numeric's operators: {bad:#?}");
     }
+
+    /// Fresh-context review of this lane's fixes (item 4): e090ecc38 types a CAST by its type only
+    /// when every DECODE of its chain is literally `value`, so CAST(1 AS boolean), whose DECODE is
+    /// `CASE WHEN value THEN 1 ELSE 0 END` (the identity on what its ENCODE stores, 0 or 1), was
+    /// announced INTEGER, and a derived relation's and a CREATE TABLE AS copy's column lost the
+    /// type. PostgreSQL 18.6 types it boolean (UW run typesrev2bd-oracle4; artie raw
+    /// frontier/fastest/lanes/engine/raw/pg18-types-rev2bd-3.txt 9294fdb8a2).
+    #[test]
+    fn a_cast_to_boolean_is_announced_boolean() {
+        let conn = open();
+        let declared = |sql: &str| {
+            conn.prepare(sql)
+                .ok()
+                .and_then(|s| s.get_column_type_info(0).ok().flatten())
+                .map(|i| i.declared_name.to_ascii_lowercase())
+        };
+        let mut bad = Vec::new();
+        if let Err(e) = conn.execute("CREATE TABLE cb AS SELECT CAST(1 AS boolean) AS f") {
+            bad.push(format!("CREATE TABLE cb AS SELECT CAST(1 AS boolean) refused: {e}"));
+        }
+        for sql in [
+            "SELECT CAST(1 AS boolean)",
+            "SELECT f FROM (SELECT CAST(0 AS boolean) AS f)",
+            "SELECT f FROM cb",
+        ] {
+            let ty = declared(sql);
+            if ty.as_deref() != Some("boolean") {
+                bad.push(format!("{sql} announced {ty:?}, not PostgreSQL's boolean"));
+            }
+        }
+        assert!(bad.is_empty(), "CLAIM: a CAST to boolean was not announced boolean: {bad:#?}");
+    }
 }
