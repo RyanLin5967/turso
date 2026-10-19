@@ -959,6 +959,17 @@ fn derive_ctas_schema(
                 return None;
             }
             let (type_def, params) = super::order_by::expr_custom_type(&col.expr, table_refs, resolver.schema())?;
+            // A value of a type whose parameters it does not carry (`b + 1` over numeric(8, 2) is
+            // numeric with no typmod, as in PostgreSQL) cannot be declared here, where numeric
+            // takes exactly its two: the column is copied without the type (ANY in a STRICT copy)
+            // instead of failing the CREATE (engine review 2bdcd32c6 HIGH 6). Mutant
+            // `ctas_keeps_unparameterized_type` (test builds only): kept, as before.
+            if params.is_empty()
+                && type_def.user_params().next().is_some()
+                && !crate::branch::store::fe_mutant("ctas_keeps_unparameterized_type")
+            {
+                return None;
+            }
             let size = match params.as_slice() {
                 [] => None,
                 [a] => Some(ast::TypeSize::MaxSize(a.clone())),
