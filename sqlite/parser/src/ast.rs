@@ -708,6 +708,21 @@ impl Expr {
         Box::new(self)
     }
 
+    /// Whether SQLite's DEFAULT grammar reads this expression as printed, without parentheses: a
+    /// literal, a bare name (read as a string), a parenthesized expression, or a signed literal or
+    /// name. These are the forms SQLite's own parser builds. Anything else, as the PostgreSQL
+    /// translator builds (`nextval('s')`, `1 + 2`, a CAST), must print as `DEFAULT (expr)`, or the
+    /// text does not parse back (REVIEW-engine-2bdcd32c6 HIGH 3).
+    pub fn is_bare_default(&self) -> bool {
+        match self {
+            Expr::Literal(_) | Expr::Id(_) | Expr::Name(_) | Expr::Parenthesized(_) => true,
+            Expr::Unary(UnaryOperator::Positive | UnaryOperator::Negative, inner) => {
+                matches!(**inner, Expr::Literal(_) | Expr::Id(_) | Expr::Name(_))
+            }
+            _ => false,
+        }
+    }
+
     pub fn unary(operator: UnaryOperator, expr: Expr) -> Expr {
         Expr::Unary(operator, Box::new(expr))
     }

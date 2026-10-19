@@ -1841,7 +1841,15 @@ impl ToTokens for ColumnConstraint {
             }
             Self::Default(expr) => {
                 s.append(TK_DEFAULT, None)?;
-                expr.to_tokens(s, context)
+                // A translated DEFAULT that is not one of the grammar's bare forms prints in
+                // parentheses, or the text does not parse back (REVIEW-engine-2bdcd32c6 HIGH 3).
+                if expr.is_bare_default() {
+                    expr.to_tokens(s, context)
+                } else {
+                    s.append(TK_LP, None)?;
+                    expr.to_tokens(s, context)?;
+                    s.append(TK_RP, None)
+                }
             }
             Self::Collate { collation_name } => {
                 s.append(TK_COLLATE, None)?;

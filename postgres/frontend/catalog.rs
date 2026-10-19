@@ -20,6 +20,46 @@ const STORED_PG_SCHEMA_PREFIX: &str = "/* turso_frontend:postgres */ ";
 /// engine review 20 HIGH 1). A reader unaware of it sees a leading comment and SQLite text.
 const STORED_PG_ALTERED_PREFIX: &str = "/* turso_frontend:postgres sqlite */ ";
 
+/// A DEFAULT read back from this frontend's SQLite-text row (`STORED_PG_ALTERED_PREFIX`), put back
+/// into the form the translator built, so information_schema's column_default and pg_attrdef read
+/// after an ALTER or a RENAME as before it (REVIEW-engine-2bdcd32c6 HIGH 3):
+/// - the rewrite printed a DEFAULT that is not one of SQLite's bare forms (`nextval('k_id_seq')`,
+///   `1 + 2`, a CAST) in the parentheses SQLite's grammar needs (`BTreeTable::to_sql`, the
+///   ColumnConstraint printer), and SQLite's parser keeps them as a Parenthesized node: exactly
+///   those, one expression that is not a bare form, are dropped (the printer adds them again at the
+///   next rewrite);
+/// - the translator reads PostgreSQL's folded negative constant `-5` as the literal `-5`, which
+///   SQLite's parser reads back as minus `5` (printed `- 5`), at the top and inside (`abs(-7)`): each
+///   is folded again. PostgreSQL folds a minus over any number constant, `-(5)` too, so no
+///   translated expression is a minus over an unsigned number literal.
+fn restore_translated_default(default: &mut Box<turso_parser::ast::Expr>) {
+    use turso_parser::ast::{Expr, Literal, UnaryOperator};
+    let unwrapped = match default.as_mut() {
+        Expr::Parenthesized(inner) if inner.len() == 1 && !inner[0].is_bare_default() => inner.pop(),
+        _ => None,
+    };
+    if let Some(inner) = unwrapped {
+        *default = inner;
+    }
+    // The callback never fails, so neither does the walk.
+    let _ = turso_core::walk_expr_mut(default.as_mut(), &mut |e: &mut Expr| {
+        let folded = match e {
+            Expr::Unary(UnaryOperator::Negative, inner) => match inner.as_ref() {
+                Expr::Literal(Literal::Numeric(n)) if !n.starts_with('-') => Some(format!("-{n}")),
+                _ => None,
+            },
+            _ => None,
+        };
+        Ok(match folded {
+            Some(n) => {
+                *e = Expr::Literal(Literal::Numeric(n));
+                turso_core::WalkControl::SkipChildren
+            }
+            None => turso_core::WalkControl::Continue,
+        })
+    });
+}
+
 #[derive(Debug)]
 pub struct PostgresDialect;
 
@@ -72,6 +112,11 @@ impl Dialect for PostgresDialect {
         if let Some(altered) = sql.strip_prefix(STORED_PG_ALTERED_PREFIX) {
             let mut table = BTreeTable::from_sql(altered, root_page)?;
             table.rowid_alias_not_null = true;
+            for column in table.columns_mut().iter_mut() {
+                if let Some(default) = column.default.as_mut() {
+                    restore_translated_default(default);
+                }
+            }
             return Ok(table);
         }
         // Schema rows written by internal SQLite paths (e.g. sqlite_sequence)
@@ -170,6 +215,20 @@ impl Dialect for PostgresDialect {
         _body: &turso_parser::ast::CreateTableBody,
     ) -> Result<String> {
         Ok(encode_pg_schema_sql(input))
+    }
+
+    // A RENAME TO or RENAME COLUMN rewrote the table's AST: it is printed as SQLite text, so it is
+    // stored in the frontend's SQLite-text form, as an ALTER's is, and read back with SQLite's parser
+    // and the NOT NULL key (`parse_table_sql`). The default stored it under the raw PostgreSQL prefix,
+    // whose reader, the PostgreSQL parser, refuses SQLite's text ("syntax error at or near STRICT")
+    // at the next reopen or RENAME (found fixing REVIEW-engine-2bdcd32c6 HIGH 3).
+    fn format_rewritten_table_sql(&self, stmt: &turso_parser::ast::Stmt) -> Result<String> {
+        let turso_parser::ast::Stmt::CreateTable { .. } = stmt else {
+            return Err(LimboError::InternalError(
+                "format_rewritten_table_sql requires CREATE TABLE".to_string(),
+            ));
+        };
+        Ok(format!("{STORED_PG_ALTERED_PREFIX}{stmt}"))
     }
 
     fn format_altered_table_sql(&self, table: &BTreeTable) -> Result<String> {
