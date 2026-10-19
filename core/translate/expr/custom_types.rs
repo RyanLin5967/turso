@@ -2933,4 +2933,51 @@ mod tests {
         }
         assert!(bad.is_empty(), "CLAIM: a plain NUMERIC column read through a derived relation was not SQLite's: {bad:#?}");
     }
+
+    /// Engine review 2bdcd32c6 HIGH 7 (raw types/probe3.out.txt): a CREATE TABLE AS that keeps a
+    /// custom type makes a STRICT copy (437f337be), and gave every other column the STRICT name of
+    /// its affinity, so `mix(b numeric(8, 2), y INTEGER) STRICT` copied text 'abc' and blob X'01'
+    /// from a non-STRICT INT column without a type check: a STRICT table holding values STRICT
+    /// forbids, which then refused an INSERT of its own rows. A copied column whose values the
+    /// STRICT name may not hold takes ANY. Expected: the values are copied as they are and the copy
+    /// takes its own rows again, as python sqlite3 3.46.1 copies and re-inserts them (`mixplain`,
+    /// UW run typesrev-oracle2; artie raw frontier/fastest/lanes/engine/raw/sqlite-types-rev2bd.txt
+    /// 42503e4e38). The control: a column copied from a STRICT INTEGER column still refuses text,
+    /// as STRICT INTEGER does in that raw (`st`).
+    #[test]
+    fn a_strict_create_table_as_copy_holds_only_values_its_types_take() {
+        let conn = open();
+        for sql in [
+            "CREATE TABLE n(id INTEGER PRIMARY KEY, k INTEGER, b numeric(8, 2)) STRICT",
+            "INSERT INTO n VALUES (1, 10, 1.00), (2, 20, 2.00)",
+            "CREATE TABLE lax(id INTEGER PRIMARY KEY, y INT)",
+            "INSERT INTO lax VALUES (1, 'abc'), (2, x'01')",
+        ] {
+            conn.execute(sql).unwrap();
+        }
+        let mut bad = Vec::new();
+        for sql in [
+            "CREATE TABLE mix AS SELECT n.b, lax.y FROM n JOIN lax USING (id)",
+            "INSERT INTO mix SELECT * FROM mix",
+            "INSERT INTO mix VALUES (5, 'abc')",
+            "CREATE TABLE keep AS SELECT n.k, n.b FROM n",
+        ] {
+            if let Err(e) = conn.execute(sql) {
+                bad.push(format!("{sql} refused: {e}; SQLite copies and inserts these values"));
+            }
+        }
+        bad.extend(diverging(
+            &conn,
+            &[(
+                "SELECT b, typeof(y), quote(y) FROM mix ORDER BY rowid",
+                "1.00,text,'abc';2.00,blob,X'01';1.00,text,'abc';2.00,blob,X'01';5.00,text,'abc'",
+            )],
+            "SQLite 3.46.1",
+        ));
+        match conn.execute("INSERT INTO keep VALUES ('abc', 1)") {
+            Err(e) if e.to_string().contains("cannot store TEXT value in INTEGER column") => {}
+            other => bad.push(format!("text into keep.k (copied from STRICT INTEGER n.k) gave {other:?}, not STRICT's refusal")),
+        }
+        assert!(bad.is_empty(), "CLAIM: a STRICT CREATE TABLE AS copy held or refused values unlike its types: {bad:#?}");
+    }
 }
