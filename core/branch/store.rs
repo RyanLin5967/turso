@@ -1952,7 +1952,7 @@ struct CatState {
     links_columns_made: Arc<AtomicBool>,
     /// The fill was stopped (`BranchStore::stop_links_fill`, at close), read by the fill thread
     /// WITHOUT the store mutex before its column-only transaction (lead ruling LOW 4): a stopped fill
-    /// makes no columns. Cleared when a fill starts.
+    /// makes no columns. A new token per spawn (l4-rev-h1 LOW-3), so an older fill keeps its own.
     links_fill_stop: Arc<AtomicBool>,
     /// Checkpoint and settle counters (observing only).
     ckpt: CkptCounters,
@@ -3768,7 +3768,11 @@ fn run_links_fill(shared: &StoreMutex, writer: &Mutex<Catalog>, group: &Group, m
     };
     // Lead ruling LOW 4: a fill stopped before it got here (a close) makes no columns; the check is
     // lock-free, as the column-only transaction is. Mutant `l4_columns_after_stop` (test builds only):
-    // not checked, as before.
+    // not checked, as before. NOT atomic with the commit (l4-rev-h1 LOW-2, documented, not closed): a stop
+    // that lands after this check and before the column-only commit leaves the columns committed under the
+    // old meta row, the state every fill writes anyway (17 with columns: links_valid reads it as unfilled,
+    // the next fill or checkpoint fills it; the kill test admits it with its facts, upgrade and branches
+    // checked). Making it atomic would need the store mutex here, which MED-3 keeps off this path.
     if stop.load(Ordering::Acquire) && !fe_mutant("l4_columns_after_stop") {
         return;
     }
@@ -6328,7 +6332,9 @@ impl BranchStore {
         }
         cat.filling = true;
         cat.links_cursor = None;
-        cat.links_fill_stop.store(false, Ordering::Release);
+        // l4-rev-h1 LOW-3: a token per spawn, never one flag reset: a fill of an earlier spawn that is still
+        // finishing keeps its own (stopped) token, and a stop reaches only the fill it was meant for.
+        cat.links_fill_stop = Arc::new(AtomicBool::new(false));
         let (shared, writer, group, made, stop) =
             (self.inner.clone(), cat.writer.clone(), self.group.clone(), cat.links_columns_made.clone(), cat.links_fill_stop.clone());
         let spawned = crate::thread::Builder::new()
