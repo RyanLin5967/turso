@@ -1621,7 +1621,11 @@ impl PgDatabaseTable {
 /// (lead MED-2; recorded, pg18-wirefuzz-the_connected_database_is_current_database_and_in_pg_database
 /// .out: a session started with database=postgres answered the file's stem, so
 /// pg_database_size('postgres') was 3D000), else the database file's stem (a session the CLI or an
-/// embedding process opened, with no startup name).
+/// embedding process opened, with no startup name). A startup name `db/branch` names `db`: the
+/// database, never the branch (the lead's LOW-3 ruling; the server strips the branch).
+/// COST (wire-rev-5cdb70e58 LOW-4, not measured): each call takes the process-wide
+/// SESSIONS_BY_CONNECTION mutex, once per evaluated row in `SELECT current_database() FROM big`;
+/// M4's per-connection frontend slot (engine e66384227) replaces the lookup.
 pub(crate) fn database_name(conn: &Connection) -> String {
     crate::session::session_of_connection(conn)
         .and_then(|session| session.database_name())

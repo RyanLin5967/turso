@@ -4308,8 +4308,11 @@ impl NoopStartupHandler for Session {
         match client.metadata().get(METADATA_DATABASE).cloned() {
             Some(database) => {
                 // The name current_database() and pg_database answer, for every connection the
-                // session opens from here (lead MED-2).
-                let _ = self.database.set(Arc::from(database.as_str()));
+                // session opens from here (lead MED-2): the DATABASE, not the branch (the lead's
+                // LOW-3 ruling): a startup name `db/branch` names `db`, and a switch to another
+                // branch keeps it. The branch is turso_branch_current()'s to answer.
+                let name = database.rsplit_once('/').map_or(database.as_str(), |(db, _)| db);
+                let _ = self.database.set(Arc::from(name));
                 self.start_on_branch(&database)
             }
             None => Ok(()),
