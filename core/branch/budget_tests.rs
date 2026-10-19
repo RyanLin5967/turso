@@ -1404,6 +1404,8 @@ impl Drop for SchemaHoldDisarm {
 /// `probe::thread_allocs`; review 2 L5). References: the schema's row
 /// count (`schema_table_rows`) and one plain `SELECT * FROM sqlite_schema` on a fresh connection
 /// (`ref_scan_page_reads`; it must prepare 1 statement and parse 0 schema rows).
+/// The database each sample is measured on: the bootstrapped file, reopened by
+/// `schema_window_reopen`.
 fn schema_window(cell: &str, tables: u64, out: &mut String) {
     use std::sync::atomic::Ordering as O;
     for i in 0..SCHEMA_ROUNDS {
@@ -1436,7 +1438,7 @@ fn schema_window(cell: &str, tables: u64, out: &mut String) {
                     db.drop_branch("boot").unwrap();
                     db.incarnation
                 };
-                let db = open_at(&path);
+                let db = schema_window_reopen(&path);
                 assert_ne!(db.incarnation, built, "{cell}: {op}: premise: the registry returned the old Database, not a reopen");
                 let ddl = db.connect().unwrap();
                 let forker = db.connect().unwrap();
@@ -1539,6 +1541,12 @@ fn schema_window(cell: &str, tables: u64, out: &mut String) {
             }
         }
     }
+}
+
+/// The schema-window cell's reopen (`schema_window`): the bootstrapped database opened again, the
+/// fixture every sample is counted on.
+fn schema_window_reopen(path: &Path) -> Arc<Database> {
+    open_at(path)
 }
 
 /// Review 2 L6's cell (`first_create`): per round, a fresh small database forked once
@@ -4068,6 +4076,62 @@ fn schema_premises(c: &CellData, op: &str, failures: &mut String) {
             let _ = writeln!(failures, "  {}: {op} #{i}: the fork thread still read a WAL write lock as held after the create", c.name);
         }
     }
+}
+
+/// The schema-window flake (lead order 2026-10-19: first_control.prepares [0, 0, 1] and wal_prepares
+/// 1 in full-suite runs on loaded hosts): a named create asks the catalog until the open's name
+/// filter is built off the mutex (`NameFilter`; `StoreInner::name_lookup`, one prepare on the
+/// create's thread), and every other create cell waits for the build (`branch_wait_name_filter`);
+/// the schema-window cell did not, so on a loaded host its fork counted the build's race as the
+/// window's cost (diag engine-diag-sw-025458: schema_t10's anchor creates, the first after the
+/// reopen, met the catalog lookup on each of its 13 runs). The claim: the cell's samples are counted on a
+/// reopen whose filter is built. Deterministic: the reopen's build is held at its scan
+/// (`NAME_SCAN_HOLD`) and let go once the fixture has returned and the filter's state was read, or
+/// after 2 s (a fixture that waits for the build returns only after that).
+#[test]
+fn a_schema_window_sample_is_counted_with_the_name_filter_built() {
+    use std::sync::atomic::{AtomicBool, Ordering as O};
+    if in_child() {
+        return;
+    }
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("schema-window-filter.db");
+    let built = {
+        let db = open_at(&path);
+        let ddl = db.connect().unwrap();
+        exec(&ddl, "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)");
+        ddl.create_branch("boot").unwrap();
+        db.drop_branch("boot").unwrap();
+        db.incarnation
+    };
+    struct Release;
+    impl Drop for Release {
+        fn drop(&mut self) {
+            super::store::NAME_SCAN_HOLD.store(0, std::sync::atomic::Ordering::Release);
+        }
+    }
+    let _r = Release;
+    let read = Arc::new(AtomicBool::new(false));
+    super::store::NAME_SCAN_HOLD.store(1, O::Release);
+    let releaser = {
+        let read = read.clone();
+        std::thread::spawn(move || {
+            let t = std::time::Instant::now();
+            while !read.load(O::Acquire) && t.elapsed() < std::time::Duration::from_secs(2) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            super::store::NAME_SCAN_HOLD.store(0, O::Release);
+        })
+    };
+    let db = schema_window_reopen(&path);
+    let filter_built = db.branch_name_filter_stats().0;
+    read.store(true, O::Release);
+    releaser.join().unwrap();
+    assert_ne!(db.incarnation, built, "premise: the registry returned the old Database, not a reopen");
+    assert!(
+        filter_built,
+        "CLAIM: the schema-window cell counts its fork before the open's name filter is built (a named create then asks the catalog: a prepare the window does not cost)"
+    );
 }
 
 /// Engine 2b (00340537c: "0 otherwise"; MED 8 678b18ba4: a fork outside the window is registered with
