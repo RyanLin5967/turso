@@ -16532,3 +16532,33 @@ fn a_close_flight_that_panics_during_an_unwind_does_not_abort_the_process() {
         stderr.lines().rev().take(15).collect::<Vec<_>>().join(" | ")
     );
 }
+
+/// engine-2bdcd32c6 LOW 5: once async had started, the close flew everything buffered, not only
+/// what async creates acknowledged: one extra sync per close, for records a store that never ran
+/// async would not fly at its close either. Two closes after every async create is durable, one
+/// with a record no create acknowledged left buffered: they issue the same syncs.
+#[test]
+fn a_close_flies_only_what_async_creates_acknowledged() {
+    let _s = serial();
+    let class = if cfg!(target_vendor = "apple") { SyncClass::FullFsync } else { SyncClass::Fsync };
+    let close_syncs = |extra: bool| {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("low5.db"), opts(true, class));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let warm = trunk.create_branch_async("warm").unwrap();
+        db.branch_wait_durable(warm.token).unwrap();
+        if extra {
+            db.branches.buffer_unacked_record_for_test();
+        }
+        drop(trunk);
+        syncs_of(|| drop(db))
+    };
+    let plain = close_syncs(false);
+    let extra = close_syncs(true);
+    assert_eq!(
+        extra, plain,
+        "CLAIM: the close synced only for what async creates acknowledged; (fsync, F_FULLFSYNC) with an \
+         unacknowledged record buffered {extra:?}, without {plain:?}"
+    );
+}

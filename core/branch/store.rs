@@ -7879,6 +7879,20 @@ impl BranchStore {
         }
     }
 
+    /// Test builds (engine-2bdcd32c6 LOW 5): buffer one record no async create acknowledged (a
+    /// lease clock stamp), so a test can see whether a close flies it.
+    #[cfg(test)]
+    pub(crate) fn buffer_unacked_record_for_test(&self) {
+        let mut inner = self.inner.lock();
+        let now = inner.lease.now_ms();
+        inner
+            .journal
+            .as_mut()
+            .expect("a started durable store")
+            .buffer(&Record::Clock { now_ms: now })
+            .unwrap();
+    }
+
     /// Whether LEAP L1's threads run in this process.
     fn async_runs(&self) -> bool {
         let t = &self.async_threads;
