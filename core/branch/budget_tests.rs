@@ -963,7 +963,11 @@ fn memory(cell: &str, built: &mut Built, out: &mut String) {
     s.insert("max_hold_work", maxima.work.0);
     s.insert("max_bg_hold_work", maxima.work.1);
     s.insert("max_fg_hold_work", maxima.work.2);
-    s.insert("max_install_hold_work", maxima.install_work);
+    // budgets-rev-242345 LOW-4 and LOW-5: each per-name site apart (`probe::WorkSite`).
+    s.insert("max_seed_hold_work", maxima.site_work[0]);
+    s.insert("max_install_hold_work", maxima.site_work[1]);
+    s.insert("max_growth_hold_work", maxima.site_work[2]);
+    s.insert("max_recovery_work", maxima.site_work[3]);
     // Review 2 M7: the opening thread's held bytes summed over every hold of the open.
     s.insert("fg_held_alloc_bytes_sum", delta(held0, held1));
     put_exceptions(&mut s, [0; 4], exc);
@@ -3186,7 +3190,7 @@ fn nothing_on_the_probes_window_path_allocates() {
                 "wal_lock_held", "persistent_live", "note_alloc", "alloc", "alloc_zeroed", "realloc", "dealloc",
                 // The Linux thread-state readers (the Linux port, 2026-10-18).
                 "owned_named", "linux_tid", "linux_read_into", "linux_task_path", "linux_task_alive", "linux_task_stat",
-                "linux_task_run_ns", "linux_each_tid", "note_held_work",
+                "linux_task_run_ns", "linux_each_tid", "note_held_work", "site_work_begin", "site_work_end",
             ][..],
         ),
         ("budget_tests.rs", include_str!("budget_tests.rs"), &["absorb_confirm", "writer_settled", "spin_settled", "settled"][..]),
@@ -3252,7 +3256,7 @@ fn nothing_on_the_probes_window_path_allocates() {
             }
         }
     }
-    assert_eq!(read, 52, "premise: every function on the window path was read:\n{found}");
+    assert_eq!(read, 54, "premise: every function on the window path was read:\n{found}");
     assert!(found.is_empty(), "the probe's window path allocates, prints, reads the environment or calls fe_mutant:\n{found}");
 }
 
@@ -4444,6 +4448,10 @@ fn leap_l4_an_open_holds_the_store_mutex_for_no_o_n_work() {
         // budgets-rev-242345 LOW-4: the install hold's work apart, so an O(N) term there under the largest
         // other hold is seen.
         ("max_install_hold_work", 0),
+        // LOW-5: every other per-name site apart too.
+        ("max_seed_hold_work", 0),
+        ("max_growth_hold_work", 0),
+        ("max_recovery_work", 0),
     ] {
         let (x, y) = (sa[k], sb[k]);
         if y > x + slack {

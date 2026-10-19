@@ -63,9 +63,10 @@ static MAX_BG_HOLD_ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
 static MAX_HOLD_WORK: AtomicU64 = AtomicU64::new(0);
 static MAX_BG_HOLD_WORK: AtomicU64 = AtomicU64::new(0);
 static MAX_FG_HOLD_WORK: AtomicU64 = AtomicU64::new(0);
-/// budgets-rev-242345 LOW-4: the most held work in one name filter INSTALL hold, kept apart, so an O(N)
-/// term there smaller than the largest other hold is not masked by the per-hold maximum.
-static MAX_INSTALL_WORK: AtomicU64 = AtomicU64::new(0);
+/// budgets-rev-242345 LOW-4 and LOW-5: the most work at each site that does per-name work (`WorkSite`),
+/// kept apart, so an O(N) term at one site smaller than the largest hold elsewhere is not masked by the
+/// per-hold maximum.
+static MAX_SITE_WORK: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 static MAX_BG_HOLD_CAT_ROWS: AtomicU64 = AtomicU64::new(0);
 // The same over holds by the thread marked foreground (review 2 M7: the opener's own holds).
 static MAX_FG_HOLD_ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -657,8 +658,8 @@ pub(crate) struct HoldMaxima {
     pub(crate) foreground: (u64, u64),
     /// Units of held work (`note_held_work`) in the largest hold: `(all, background, foreground)`.
     pub(crate) work: (u64, u64, u64),
-    /// Units of held work in the largest name filter install hold (`InstallWork`), apart.
-    pub(crate) install_work: u64,
+    /// Units of work at each `WorkSite` (indexed by it), each the largest one occurrence did, apart.
+    pub(crate) site_work: [u64; 4],
 }
 
 /// Every hold maximum at once, and start them all again from zero (review 2 L8: one call, so no
@@ -669,26 +670,45 @@ pub(crate) fn take_hold_maxima() -> HoldMaxima {
         background: (MAX_BG_HOLD_ALLOC_BYTES.swap(0, Relaxed), MAX_BG_HOLD_CAT_ROWS.swap(0, Relaxed)),
         foreground: (MAX_FG_HOLD_ALLOC_BYTES.swap(0, Relaxed), MAX_FG_HOLD_CAT_ROWS.swap(0, Relaxed)),
         work: (MAX_HOLD_WORK.swap(0, Relaxed), MAX_BG_HOLD_WORK.swap(0, Relaxed), MAX_FG_HOLD_WORK.swap(0, Relaxed)),
-        install_work: MAX_INSTALL_WORK.swap(0, Relaxed),
+        site_work: [0, 1, 2, 3].map(|i: usize| MAX_SITE_WORK[i].swap(0, Relaxed)),
     }
 }
 
-/// The work this thread does while it lives (`note_held_work`), recorded on drop into its own maximum
-/// (`HoldMaxima::install_work`): the name filter's install hold, measured apart (budgets-rev-242345
-/// LOW-4). Allocates nothing.
-pub(crate) struct InstallWork(u64);
+/// The sites whose per-name work is measured apart (budgets-rev-242345 LOW-4, LOW-5): the name filter's
+/// seed hold, its build's install hold, a growth's swap and drain holds, and recovery's replay.
+#[derive(Clone, Copy)]
+pub(crate) enum WorkSite {
+    Seed = 0,
+    Install = 1,
+    Growth = 2,
+    Recovery = 3,
+}
 
-impl InstallWork {
-    pub(crate) fn start() -> Self {
-        InstallWork(T_HELD_WORK.with(|c| c.get()))
+/// The work this thread does while it lives (`note_held_work`), recorded on every exit (its drop,
+/// unwinding included) into its site's own maximum (`HoldMaxima::site_work`). Allocates nothing.
+pub(crate) struct SiteWork(WorkSite, u64);
+
+impl SiteWork {
+    pub(crate) fn start(site: WorkSite) -> Self {
+        SiteWork(site, site_work_begin())
     }
 }
 
-impl Drop for InstallWork {
+impl Drop for SiteWork {
     fn drop(&mut self) {
-        let now = T_HELD_WORK.with(|c| c.get());
-        MAX_INSTALL_WORK.fetch_max(now.wrapping_sub(self.0), Relaxed);
+        site_work_end(self.0, self.1);
     }
+}
+
+/// This thread's work count now (`SiteWork::start`).
+pub(crate) fn site_work_begin() -> u64 {
+    T_HELD_WORK.with(|c| c.get())
+}
+
+/// The work done on this thread since `w0`, into `site`'s maximum (`SiteWork`'s drop).
+pub(crate) fn site_work_end(site: WorkSite, w0: u64) {
+    let now = T_HELD_WORK.with(|c| c.get());
+    MAX_SITE_WORK[site as usize].fetch_max(now.wrapping_sub(w0), Relaxed);
 }
 
 /// `n` units of work done on this thread (test builds call it from the store's per-item loops that

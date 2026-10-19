@@ -5321,6 +5321,9 @@ impl BranchStore {
         inner.cat = Some(cat);
         let t = Instant::now();
         let mut touched: HashMap<Slot, bool> = HashMap::new();
+        // budgets-rev-242345 LOW-5: the whole replay's work, measured apart (test builds).
+        #[cfg(test)]
+        let _site = super::budget_probe::SiteWork::start(super::budget_probe::WorkSite::Recovery);
         for (pos, record) in records.iter().enumerate() {
             let pos = pos as u64;
             match record {
@@ -5370,6 +5373,9 @@ impl BranchStore {
         stats.load_ns += ns(t);
         let mut ignored = Vec::new();
         let t = Instant::now();
+        // budgets-rev-242345 LOW-5: the whole replay's work, measured apart (test builds).
+        #[cfg(test)]
+        let _site = super::budget_probe::SiteWork::start(super::budget_probe::WorkSite::Recovery);
         for record in records {
             kill_point("recover.replay");
             inner.replay(record, &mut ignored)?;
@@ -9400,6 +9406,9 @@ impl BranchStore {
         };
         {
             let mut inner = shared.lock();
+            // budgets-rev-242345 LOW-5: this seed hold's work, measured apart (test builds).
+            #[cfg(test)]
+            let _site = super::budget_probe::SiteWork::start(super::budget_probe::WorkSite::Seed);
             let names = &mut inner.names;
             if !matches!(names.filter.state, FilterState::Unbuilt | FilterState::Overflowed) {
                 return FilterBuild::Ended;
@@ -9450,7 +9459,7 @@ impl BranchStore {
             let mut inner = shared.lock();
             // budgets-rev-242345 LOW-4: this install hold's work, measured apart (test builds).
             #[cfg(test)]
-            let _install = super::budget_probe::InstallWork::start();
+            let _site = super::budget_probe::SiteWork::start(super::budget_probe::WorkSite::Install);
             let f = &mut inner.names.filter;
             if !matches!(&f.state, FilterState::Building { pending: p } if Arc::ptr_eq(p, &pending)) {
                 return FilterBuild::Ended;
@@ -9547,6 +9556,9 @@ impl BranchStore {
             filter_pause(3);
             {
                 let mut inner = shared.lock();
+                // budgets-rev-242345 LOW-5: the growth's swap hold's work, measured apart (test builds).
+                #[cfg(test)]
+                let _site = super::budget_probe::SiteWork::start(super::budget_probe::WorkSite::Growth);
                 let f = &mut inner.names.filter;
                 if !matches!(&f.state, FilterState::Growing { table, pending: p } if Arc::ptr_eq(table, &old) && Arc::ptr_eq(p, &pending)) {
                     return;
@@ -9571,6 +9583,9 @@ impl BranchStore {
             let copied = !filter_drain_fails() && pending.copy_into(&grown);
             filter_pause(5);
             let mut inner = shared.lock();
+            // budgets-rev-242345 LOW-5: the growth's drain install hold, measured apart (test builds).
+            #[cfg(test)]
+            let _site = super::budget_probe::SiteWork::start(super::budget_probe::WorkSite::Growth);
             let f = &mut inner.names.filter;
             if matches!(&f.state, FilterState::Draining { table, pending: p } if Arc::ptr_eq(table, &grown) && Arc::ptr_eq(p, &pending)) {
                 if copied {
