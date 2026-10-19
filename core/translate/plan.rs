@@ -2552,10 +2552,15 @@ fn inherit_custom_type(column: &mut Column, expr: &ast::Expr, tables: &TableRefe
     if crate::branch::store::fe_mutant("derived_column_untyped") {
         return;
     }
-    if let Some((type_def, params)) = super::order_by::expr_custom_type(expr, tables, schema) {
+    if let Some((type_def, params)) = super::order_by::expr_value_type(expr, tables, schema) {
         column.ty_str = type_def.name.clone();
         column.ty_params = params;
         column.set_carries_custom_type(true);
+    } else if let Some(primitive) = super::order_by::cast_encoding_primitive(expr, schema) {
+        // A CAST that yields a type's ENCODE holds that encoding's primitive (engine review
+        // 2bdcd32c6 MED 9: its affinity's name, NUMERIC, announced numeric over a blob).
+        column.override_affinity(Affinity::affinity(&primitive));
+        column.ty_str = primitive;
     }
 }
 

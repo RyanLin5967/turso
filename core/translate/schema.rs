@@ -958,7 +958,7 @@ fn derive_ctas_schema(
             if !connection.experimental_custom_types_enabled() || crate::branch::store::fe_mutant("ctas_drops_custom_type") {
                 return None;
             }
-            let (type_def, params) = super::order_by::expr_custom_type(&col.expr, table_refs, resolver.schema())?;
+            let (type_def, params) = super::order_by::expr_value_type(&col.expr, table_refs, resolver.schema())?;
             // A value of a type whose parameters it does not carry (`b + 1` over numeric(8, 2) is
             // numeric with no typmod, as in PostgreSQL) cannot be declared here, where numeric
             // takes exactly its two: the column is copied without the type (ANY in a STRICT copy)

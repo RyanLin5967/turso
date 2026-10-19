@@ -55,10 +55,77 @@ fn sort_comparator_from_func_name(func_name: &str) -> Option<SortComparatorType>
 ///
 /// A column of a non-STRICT table is NOT given its declared type here: a plain NUMERIC column of a
 /// SQLite schema would otherwise order through numeric's '<' instead of SQLite's type order.
+///
+/// A CAST yields the type's ENCODE (its stored form, `CAST(42 AS cents)` is 4200), which the type's
+/// operators and sort comparator read as they read a stored value, so it is the type's here; but
+/// it does not yield the type's VALUES unless the DECODE is the value itself: `expr_value_type`
+/// is what a result, a derived column and a copy are typed by.
 pub(crate) fn expr_custom_type(
     expr: &ast::Expr,
     referenced_tables: &TableReferences,
     schema: &Schema,
+) -> Option<(std::sync::Arc<crate::schema::TypeDef>, std::vec::Vec<Box<ast::Expr>>)> {
+    custom_type_of(expr, referenced_tables, schema, false)
+}
+
+/// `expr_custom_type` for what is typed by the values themselves (a result column's announced
+/// type, a derived relation's column, a CREATE TABLE AS column, a scalar subquery's type): a CAST
+/// is its type only when the CAST yields the type's values, every DECODE in its type's chain being
+/// the value itself (date's, varchar's, a BASE-only type's); a CAST to numeric(8, 2) yields the
+/// encoded blob and is not numeric here (engine review 2bdcd32c6 MED 9: it was announced numeric
+/// over that blob, and CREATE TABLE AS re-ENCODEd it). Mutant `cast_typed_by_its_encoding` (test
+/// builds only): as `expr_custom_type`, as before.
+pub(crate) fn expr_value_type(
+    expr: &ast::Expr,
+    referenced_tables: &TableReferences,
+    schema: &Schema,
+) -> Option<(std::sync::Arc<crate::schema::TypeDef>, std::vec::Vec<Box<ast::Expr>>)> {
+    let values = !crate::branch::store::fe_mutant("cast_typed_by_its_encoding");
+    custom_type_of(expr, referenced_tables, schema, values)
+}
+
+/// Whether CAST(x AS `type_name`) yields the type's values: every type in its chain has no DECODE
+/// or decodes to `value` itself, so its ENCODE's result is what a read of a stored value gives.
+fn cast_yields_values(schema: &Schema, type_name: &str) -> bool {
+    let is_value = |e: &ast::Expr| matches!(e, ast::Expr::Id(n) | ast::Expr::Name(n) if n.as_str().eq_ignore_ascii_case("value"));
+    match schema.resolve_type_unchecked(type_name) {
+        Ok(Some(resolved)) => resolved.chain.iter().all(|td| td.decode().is_none_or(is_value)),
+        _ => false,
+    }
+}
+
+/// For a CAST that applies a custom type (as `translate_expr` does: to a domain always, to a type
+/// when the CAST gives all its parameters or it takes none; CAST(x AS NUMERIC) is SQLite's CAST)
+/// and yields its ENCODE rather than its values (`cast_yields_values`), the primitive that ENCODE
+/// stores, uppercase: what a result column or a derived relation's column holding it is (engine
+/// review 2bdcd32c6 MED 9: CAST(1.5 AS numeric(8, 2)) is a blob, announced numeric). None
+/// otherwise. Mutant `cast_typed_by_its_encoding` (test builds only): None, as before.
+pub(crate) fn cast_encoding_primitive(expr: &ast::Expr, schema: &Schema) -> Option<String> {
+    let ast::Expr::Cast { type_name: Some(ty), .. } = expr else {
+        return None;
+    };
+    if ty.array_dimensions != 0
+        || cast_yields_values(schema, &ty.name)
+        || crate::branch::store::fe_mutant("cast_typed_by_its_encoding")
+    {
+        return None;
+    }
+    let given = match &ty.size {
+        None => 0,
+        Some(ast::TypeSize::MaxSize(_)) => 1,
+        Some(ast::TypeSize::TypeSize(..)) => 2,
+    };
+    let resolved = schema.resolve_type_unchecked(&ty.name).ok().flatten()?;
+    let wanted = resolved.leaf().user_params().count();
+    (resolved.is_domain() || wanted == 0 || wanted == given).then(|| resolved.primitive.to_uppercase())
+}
+
+/// `expr_custom_type` (`values` false) or `expr_value_type` (`values` true).
+fn custom_type_of(
+    expr: &ast::Expr,
+    referenced_tables: &TableReferences,
+    schema: &Schema,
+    values: bool,
 ) -> Option<(std::sync::Arc<crate::schema::TypeDef>, std::vec::Vec<Box<ast::Expr>>)> {
     match expr {
         ast::Expr::Column { table: table_ref_id, column, .. } => {
@@ -99,8 +166,8 @@ pub(crate) fn expr_custom_type(
             // integer (PostgreSQL's date_mi), not a date. Mutant `operator_type_left_only` (test
             // builds only): the left operand's type or nothing, as before.
             let defines = |t: &std::sync::Arc<crate::schema::TypeDef>| t.operators().iter().any(|o| o.op == symbol);
-            let left = expr_custom_type(lhs, referenced_tables, schema);
-            let right = expr_custom_type(rhs, referenced_tables, schema);
+            let left = custom_type_of(lhs, referenced_tables, schema, values);
+            let right = custom_type_of(rhs, referenced_tables, schema, values);
             if crate::branch::store::fe_mutant("operator_type_left_only") {
                 let (type_def, _) = left.or(right)?;
                 return defines(&type_def).then(|| (type_def, std::vec::Vec::new()));
@@ -119,17 +186,18 @@ pub(crate) fn expr_custom_type(
             Some((type_def, std::vec::Vec::new()))
         }
         ast::Expr::Parenthesized(inner) if inner.len() == 1 => {
-            expr_custom_type(&inner[0], referenced_tables, schema)
+            custom_type_of(&inner[0], referenced_tables, schema, values)
         }
         ast::Expr::FunctionCall { name, args, .. }
             if args.len() == 1
                 && (name.as_str().eq_ignore_ascii_case("min") || name.as_str().eq_ignore_ascii_case("max")) =>
         {
-            expr_custom_type(&args[0], referenced_tables, schema)
+            custom_type_of(&args[0], referenced_tables, schema, values)
         }
-        // A sum is the type's when the type defines `+` (`AggFunc::NumericSum` for numeric).
+        // A sum is the type's when the type defines `+` (`AggFunc::NumericSum` for numeric, which
+        // reads an encoding as it reads a value and yields the numeric's text).
         ast::Expr::FunctionCall { name, args, .. } if args.len() == 1 && name.as_str().eq_ignore_ascii_case("sum") => {
-            let (type_def, _) = expr_custom_type(&args[0], referenced_tables, schema)?;
+            let (type_def, _) = custom_type_of(&args[0], referenced_tables, schema, false)?;
             type_def
                 .operators()
                 .iter()
@@ -143,6 +211,9 @@ pub(crate) fn expr_custom_type(
                 Some(ast::TypeSize::TypeSize(a, b)) => std::vec![a.clone(), b.clone()],
                 None => std::vec::Vec::new(),
             };
+            if values && !cast_yields_values(schema, &ty.name) {
+                return None;
+            }
             Some((type_def.clone(), params))
         }
         _ => None,

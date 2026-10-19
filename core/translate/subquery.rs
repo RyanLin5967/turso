@@ -1908,7 +1908,7 @@ pub fn emit_non_from_clause_subquery(
     if let (SubqueryType::RowValue { result_reg_start, num_regs: 1 }, Plan::Select(select)) = (query_type, &plan) {
         if let [column] = select.result_columns.as_slice() {
             if let Some((type_def, _)) =
-                super::order_by::expr_custom_type(&column.expr, &select.table_references, resolver.schema())
+                super::order_by::expr_value_type(&column.expr, &select.table_references, resolver.schema())
             {
                 program.scalar_subquery_types.insert(*result_reg_start, type_def.name.clone());
             }

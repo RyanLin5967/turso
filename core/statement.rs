@@ -1353,7 +1353,7 @@ impl Statement {
                 _ => None,
             };
             let typed = scalar.map(|td| (td, std::vec::Vec::new())).or_else(|| {
-                crate::translate::order_by::expr_custom_type(&column.expr, &self.program.table_references, &schema)
+                crate::translate::order_by::expr_value_type(&column.expr, &self.program.table_references, &schema)
             });
             if let Some((type_def, _)) = typed {
                 let base_type = schema
@@ -1367,6 +1367,16 @@ impl Statement {
                     array_dimensions: 0,
                     base_type,
                     kind,
+                }));
+            }
+            // A CAST that yields a custom type's ENCODE is the primitive that ENCODE stores, as
+            // what it yields (engine review 2bdcd32c6 MED 9: CAST(1.5 AS numeric(8, 2)), a blob).
+            if let Some(primitive) = crate::translate::order_by::cast_encoding_primitive(&column.expr, &schema) {
+                return Ok(Some(ColumnTypeInfo {
+                    declared_name: primitive.clone(),
+                    array_dimensions: 0,
+                    base_type: Some(primitive),
+                    kind: ColumnTypeKind::Builtin,
                 }));
             }
         }
