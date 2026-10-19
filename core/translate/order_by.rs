@@ -166,8 +166,10 @@ fn custom_type_of(
             // integer (PostgreSQL's date_mi), not a date. Mutant `operator_type_left_only` (test
             // builds only): the left operand's type or nothing, as before.
             let defines = |t: &std::sync::Arc<crate::schema::TypeDef>| t.operators().iter().any(|o| o.op == symbol);
-            let left = custom_type_of(lhs, referenced_tables, schema, values);
-            let right = custom_type_of(rhs, referenced_tables, schema, values);
+            // A domain's operand computes by its base type's operators (`Schema::operator_type_of`,
+            // as `find_custom_type_operator` dispatches it), so its result is that type's.
+            let left = custom_type_of(lhs, referenced_tables, schema, values).map(|(t, p)| (schema.operator_type_of(&t), p));
+            let right = custom_type_of(rhs, referenced_tables, schema, values).map(|(t, p)| (schema.operator_type_of(&t), p));
             if crate::branch::store::fe_mutant("operator_type_left_only") {
                 let (type_def, _) = left.or(right)?;
                 return defines(&type_def).then(|| (type_def, std::vec::Vec::new()));
@@ -198,6 +200,8 @@ fn custom_type_of(
         // reads an encoding as it reads a value and yields the numeric's text).
         ast::Expr::FunctionCall { name, args, .. } if args.len() == 1 && name.as_str().eq_ignore_ascii_case("sum") => {
             let (type_def, _) = custom_type_of(&args[0], referenced_tables, schema, false)?;
+            // A domain's sum is its base type's (engine review 2bdcd32c6 HIGH 8 residual).
+            let type_def = schema.operator_type_of(&type_def);
             type_def
                 .operators()
                 .iter()

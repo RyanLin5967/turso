@@ -907,7 +907,10 @@ fn numeric_sums(plan: &mut SelectPlan, resolver: &Resolver) {
     }
     let numeric = |arg: &ast::Expr, tables: &TableReferences| {
         crate::translate::order_by::expr_custom_type(arg, tables, resolver.schema()).is_some_and(|(type_def, _)| {
-            type_def
+            // A domain sums by its base type's `+` (engine review 2bdcd32c6 HIGH 8 residual).
+            resolver
+                .schema()
+                .operator_type_of(&type_def)
                 .operators()
                 .iter()
                 .any(|op| op.op == "+" && op.func_name.as_deref() == Some("numeric_add"))
