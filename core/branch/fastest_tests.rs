@@ -16122,6 +16122,26 @@ fn a_clean_close_keeps_every_async_create() {
     assert!(lost.is_empty(), "CLAIM: a clean close kept every async create; lost: {lost:?}");
 }
 
+/// engine-rev-qaf-fix2 LOW 1: a capture table the engine made under a mixed-case name ('full,MyCdc'
+/// keys its version row MyCdc) leaves no version row behind when it is dropped; the cleanup compared the
+/// stored name with the lowercased dropped name, so the row survived.
+#[test]
+fn dropping_a_mixed_case_capture_table_removes_its_version_row() {
+    let _g = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("cdc-drop.db"), DatabaseOpts::new());
+    let c = db.connect().unwrap();
+    c.execute("CREATE TABLE t(x)").unwrap();
+    c.execute("PRAGMA capture_data_changes_conn('full,MyCdc')").unwrap();
+    c.execute("INSERT INTO t VALUES (1)").unwrap();
+    c.execute("PRAGMA capture_data_changes_conn('off')").unwrap();
+    let before = adv_rows(&c, "SELECT count(*) FROM turso_cdc_version WHERE table_name = 'MyCdc' COLLATE NOCASE").unwrap();
+    c.execute("DROP TABLE MyCdc").unwrap();
+    let after = adv_rows(&c, "SELECT count(*) FROM turso_cdc_version WHERE table_name = 'MyCdc' COLLATE NOCASE").unwrap();
+    assert_eq!(before[0][0], "1", "premise: the capture table has its version row");
+    assert_eq!(after[0][0], "0", "CLAIM: the dropped capture table's version row is gone");
+}
+
 /// engine-rev-qaf-fix HIGH-2/3/4 and MED-1 (the stored text an ADD COLUMN rewrites loses clauses,
 /// the class of QUOTE-SWEEP F1): after ADD COLUMN and a reopen, each table answers as before, and as
 /// SQLite 3.53.1 answers the same statements (python sqlite3 on UW; artie raw uw-qaf2-sqlite-3531).
