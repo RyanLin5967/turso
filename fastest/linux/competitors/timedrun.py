@@ -609,13 +609,17 @@ RUN = {"warmup_ops": 1500, "warmup_s": 10.0005, "warmup_capped": False, "warmup_
        "window_s": 5.0, "t0_ns": T0, "tm0_ns": T0 + 10_000_500_000, "tm1_ns": T0 + 15_000_500_000,
        "clock": "CLOCK_MONOTONIC", "mode": "closed", "rate": 0.0, "clients": 1, "seed": 1, "send_late_us": None,
        "pool_late_us": None, "max_send_late_us": 100.0, "after_steps": 0, "skip_after": False, "tput_unit": "op",
-       "no_drain": False}
+       "no_drain": False, "spec": "pg18-create.spec"}
+# (comp-rev-89ec-b3c3 LOW 3: with the spec every bbload summary names; a clonebench run's op and sync are its case's)
+CB = {"mode": "b1", "op": "m1c", "sync": "d2"}
 # (comp review 1 MED 9: a bbload run's after record -- its spec's after-step count, whether --skip-after ran none, and
 # what its tput_* count: "op", or "cycle" when every op's untimed after-steps ran inside the client's loop)
 # An open-loop run's own fields (bbload --mode open --rate 100): its mode and loop, and its lateness record within the
 # 100 us bound; a fixture puts these in BOTH runs of a cell
+# (comp-rev-89ec-b3c3 LOW 1: with the timerslack_ok and fifo_violations a real open-loop bbload summary writes,
+# bbload.c's open-loop fprintf; the fixture had left them out because nothing read them)
 OPEN = {"loop": "open", "mode": "open", "rate": 100.0, "send_late_us": {"p50": 5.0, "p99": 20.0, "max": 40.0},
-        "pool_late_us": {"p50": 5.0, "p99": 20.0, "max": 40.0}}
+        "pool_late_us": {"p50": 5.0, "p99": 20.0, "max": 40.0}, "timerslack_ok": True, "fifo_violations": 0}
 # A bbload summary of a create spec with two after-steps (close, then the delete): comp review 1 MED 9's fields
 BB = {"spec": "pg18-m1c.spec", "after_steps": 2, "skip_after": False, "tput_unit": "cycle"}
 
@@ -652,6 +656,22 @@ def raw_tsv(sm, extra_rows=(), drop_warm=0, after_cols=None, claimed_rows=None):
     rows += list(extra_rows)
     for i, (ph, t) in enumerate(rows):
         out.append(f"0\t{i}\t{ph}\t1\t{i}\t{t}\t1000{tail}\n")
+    return "".join(out)
+
+
+def raw_tsv_full(sm, swap_claim_intended=False):
+    """comp-rev-89ec-b3c3 LOW 16: a raw.tsv with the clock columns a closed-loop producer writes (bbload and clonebench:
+    claim_ns, then intended_ns = start_ns, end_ns, lat_ns = end_ns - intended_ns), agreeing with summary SM; each op is
+    claimed 300 ns before it starts and takes 1000 ns. SWAP_CLAIM_INTENDED writes each row's claim_ns and intended_ns
+    values in each other's columns (a row printf whose arguments are out of order against its header)."""
+    out = ["client\tseq\tphase\tok\tclaim_ns\tintended_ns\tstart_ns\tend_ns\tlat_ns\n"]
+    wo, mo, t0, tm0 = sm.get("warmup_ops"), sm.get("measured_ops"), sm.get("t0_ns"), sm.get("tm0_ns")
+    rows = [("warmup", t0 + 1000 + 2000 * i) for i in range(wo)] + [("measure", tm0 + 1000 + 2000 * i) for i in range(mo)]
+    for i, (ph, s) in enumerate(rows):
+        c, t = s - 300, s
+        if swap_claim_intended:
+            c, t = t, c
+        out.append(f"0\t{i}\t{ph}\t1\t{c}\t{t}\t{s}\t{s + 1000}\t1000\n")
     return "".join(out)
 
 
@@ -899,6 +919,12 @@ def selftest():
          dict(tracer=clean, timed_raw=raw_tsv(dict(RUN, measured_ops=199), claimed_rows=[("measure", tm1 - 1, tm1 + 900)])), True),
         ("claim_ns: a measured row claimed at tm1 (the window is closed at the claim)",
          dict(tracer=clean, timed_raw=raw_tsv(dict(RUN, measured_ops=199), claimed_rows=[("measure", tm1, tm1 + 900)])), False),
+        # comp-rev-89ec-b3c3 LOW 4: the case above is refused by an intended-time rule too (intended tm1 + 900), so it
+        # cannot tell the claim rule from the old one; this row is claimed at tm1 but intended before it, so ONLY the
+        # claim rule refuses it (the field the rule reads is the thing under test, so the row need not be one a
+        # closed-loop client could write)
+        ("claim_ns: a measured row claimed at tm1 but intended before it (only the claim rule refuses it)",
+         dict(tracer=clean, timed_raw=raw_tsv(dict(RUN, measured_ops=199), claimed_rows=[("measure", tm1, tm1 - 1)])), False),
         # open loop: claim_op stamps tm1 at the claimed ARRIVAL's intended time, not at the claim's clock reading, so the
         # window is in intended time there whatever claim_ns says (a backlogged client claims late; a free one early)
         ("claim_ns, open loop: a measured row intended before tm1 and claimed after it (a backlog) is in the window",
@@ -925,7 +951,7 @@ def selftest():
         ("loop closed but mode open (review 2 item 13: loop must repeat bbload's mode)",
          dict(tracer=clean, lab_extra={"mode": "open"}, timed_extra={"mode": "open"}), False),
         ("control: clonebench's mode b1 with loop closed",
-         dict(tracer=clean, lab_extra={"mode": "b1"}, timed_extra={"mode": "b1"}), True),
+         dict(tracer=clean, lab_extra=CB, timed_extra=CB), True),
         ("clonebench's mode b1 with loop open",
          dict(tracer=clean, lab_extra=dict(OPEN, mode="b1"), timed_extra=dict(OPEN, mode="b1")), False),
         ("open loop, a p99 send lateness over max_send_late_us (review 2 item 3: VOID)",
@@ -984,8 +1010,49 @@ def selftest():
               timed_extra=dict(BB, skip_after=True, tput_unit="op"),
               timed_raw=raw_tsv(dict(RUN, measured_ops=200, **BB), after_cols=2)), False),
         ("control: clonebench (mode b1) runs no after-step and has no after record",
-         dict(tracer=clean, lab_extra={"mode": "b1", "after_steps": None, "skip_after": None, "tput_unit": None},
-              timed_extra={"mode": "b1", "after_steps": None, "skip_after": None, "tput_unit": None}), True),
+         dict(tracer=clean, lab_extra=dict(CB, after_steps=None, skip_after=None, tput_unit=None),
+              timed_extra=dict(CB, after_steps=None, skip_after=None, tput_unit=None)), True),
+        # comp-rev-89ec-b3c3 LOW 1: an open-loop run is judged against the REGISTERED bound (100 us), not the one it
+        # carries (bbload accepts --max-send-late-us up to 1e9), and its timer slack and FIFO record are read
+        ("open loop with its own bound lifted to 1e9 and a 5 ms p99",
+         dict(tracer=clean, lab_extra=dict(OPEN, max_send_late_us=1e9),
+              timed_extra=dict(OPEN, max_send_late_us=1e9, send_late_us={"p50": 5.0, "p99": 5000.0, "max": 9000.0})),
+         False),
+        ("open loop whose clients did not all get their timer slack",
+         dict(tracer=clean, lab_extra=OPEN, timed_extra=dict(OPEN, timerslack_ok=False)), False),
+        ("open loop with a FIFO violation", dict(tracer=clean, lab_extra=OPEN, timed_extra=dict(OPEN, fifo_violations=1)),
+         False),
+        ("open loop with no FIFO record", dict(tracer=clean, lab_extra=OPEN, timed_extra=dict(OPEN, fifo_violations=None)),
+         False),
+        # comp-rev-89ec-b3c3 LOW 2: the measured rows are counted against the summary (a raw.tsv that lost a client's
+        # rows, or whose ok column disagrees, is not the run the summary describes)
+        ("the raw rows hold one measured op fewer than measured_ops",
+         dict(tracer=clean, timed_raw=raw_tsv(dict(RUN, measured_ops=199))), False),
+        ("the raw rows hold one measured op more than measured_ops",
+         dict(tracer=clean, timed_raw=raw_tsv(dict(RUN, measured_ops=200), extra_rows=[("measure", T0 + 10_000_500_000 + 7)])),
+         False),
+        ("the raw rows' ok column disagrees with measured_ok",
+         dict(tracer=clean, timed_raw=raw_tsv(dict(RUN, measured_ops=200)).replace("\tmeasure\t1\t", "\tmeasure\t0\t", 1)),
+         False),
+        # comp-rev-89ec-b3c3 LOW 3: both runs are one command line, so each defining key must be PRESENT and equal (None
+        # == None had passed): bbload's spec too, and clonebench's op and sync
+        ("neither run records a seed", dict(tracer=clean, lab_extra={"seed": None}, timed_extra={"seed": None}), False),
+        ("the timed run ran another spec", dict(tracer=clean, timed_extra={"spec": "pg18-create-wal.spec"}), False),
+        ("neither run records its spec", dict(tracer=clean, lab_extra={"spec": None}, timed_extra={"spec": None}), False),
+        ("clonebench: the timed run ran at another sync (d0 against d2)",
+         dict(tracer=clean, lab_extra=CB, timed_extra=dict(CB, sync="d0")), False),
+        ("clonebench: the timed run ran another op", dict(tracer=clean, lab_extra=CB, timed_extra=dict(CB, op="m1")),
+         False),
+        ("clonebench: neither run records its op",
+         dict(tracer=clean, lab_extra=dict(CB, op=None), timed_extra=dict(CB, op=None)), False),
+        # comp-rev-89ec-b3c3 LOW 16: the header names the columns, but nothing checked that a row's VALUES are in that
+        # order; with claim_ns and intended_ns swapped timedrun would judge the window on the wrong field. The clock
+        # columns' relations are checked where a raw.tsv carries them: claim <= start, intended <= start <= end, and
+        # lat == end - intended (both producers measure latency from the intended start)
+        ("control: a raw.tsv with the producers' clock columns, in order",
+         dict(tracer=clean, timed_raw=raw_tsv_full(dict(RUN, measured_ops=200))), True),
+        ("a raw.tsv whose rows hold claim_ns and intended_ns in each other's columns",
+         dict(tracer=clean, timed_raw=raw_tsv_full(dict(RUN, measured_ops=200), swap_claim_intended=True)), False),
     ]
     refusal_reasons = {
         "a server task traced at the end of the timed run": ("traced during the timed run", "a sweep saw a TracerPid"),
@@ -1121,6 +1188,30 @@ def selftest():
         "a --skip-after run with after<k>_ns columns":
             ("timed run ran 0 after-step(s) (after_steps 2, skip_after True) but its raw.tsv's after columns are "
              "['after1_ns', 'after2_ns'], not none",),
+        # comp-rev-89ec-b3c3 LOWs 1-4
+        "claim_ns: a measured row claimed at tm1 but intended before it (only the claim rule refuses it)":
+            ("timed run measured 1 op(s) claimed at or after tm1",),
+        "open loop with its own bound lifted to 1e9 and a 5 ms p99":
+            ("timed run's max_send_late_us 1000000000.0 us is not the registered 100.0 us",
+             "timed run's send_late_us p99 5000.0 us is over the registered bound 100.0 us: VOID"),
+        "open loop whose clients did not all get their timer slack":
+            ("timed run's clients did not all get their 1 ns timer slack (timerslack_ok False)",),
+        "open loop with a FIFO violation": ("timed run has 1 FIFO violation(s)",),
+        "open loop with no FIFO record": ("timed run is open loop with no fifo_violations record (None)",),
+        "the raw rows hold one measured op fewer than measured_ops":
+            ("timed run's raw.tsv holds 199 measured rows, its summary measured_ops 200",),
+        "the raw rows hold one measured op more than measured_ops":
+            ("timed run's raw.tsv holds 201 measured rows, its summary measured_ops 200",),
+        "the raw rows' ok column disagrees with measured_ok":
+            ("timed run's raw.tsv holds 199 ok measured rows, its summary measured_ok 200",),
+        "neither run records a seed": ("the labelling and timed runs do not both record seed",),
+        "the timed run ran another spec": ("the labelling and timed runs differ in spec",),
+        "neither run records its spec": ("the labelling and timed runs do not both record spec",),
+        "clonebench: the timed run ran at another sync (d0 against d2)": ("the labelling and timed runs differ in sync",),
+        "clonebench: the timed run ran another op": ("the labelling and timed runs differ in op",),
+        "clonebench: neither run records its op": ("the labelling and timed runs do not both record op",),
+        "a raw.tsv whose rows hold claim_ns and intended_ns in each other's columns":
+            ("timed run's raw.tsv has 1700 row(s) whose lat_ns is not end_ns - intended_ns",),
     })
     bad = n = 0
 
