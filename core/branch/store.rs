@@ -3744,7 +3744,13 @@ fn run_links_fill(shared: &StoreMutex, writer: &Mutex<Catalog>, group: &Group, m
     // the columns under the old meta row, a state the batches already leave between them (`links_valid`
     // reads it as unfilled, and the next fill or checkpoint fills it). Mutant
     // `l4_columns_in_first_batch` (test builds only): made inside the first row batch, as before.
-    if !fe_mutant("l4_columns_in_first_batch") {
+    // Test builds: `LINKS_FILL_COLUMNS_IN_BATCH` turns the column-only transaction off, so a test can
+    // reach the backstop below (the per-batch lock-free record) on its own.
+    #[cfg(test)]
+    let in_batch = LINKS_FILL_COLUMNS_IN_BATCH.load(Ordering::Acquire);
+    #[cfg(not(test))]
+    let in_batch = false;
+    if !in_batch && !fe_mutant("l4_columns_in_first_batch") {
         let mut w = writer.lock();
         let ready = w.links()
             || match w.begin().and_then(|()| w.make_link_columns()).and_then(|()| w.commit()) {
@@ -3913,6 +3919,10 @@ pub(crate) static LINKS_FILL_HELD_BATCHES: AtomicU64 = AtomicU64::new(0);
 /// the store mutex; `LINKS_FILL_ENTRY_HELD` counts the fills that reached that point.
 #[cfg(test)]
 pub(crate) static LINKS_FILL_HOLD_AT_ENTRY: AtomicBool = AtomicBool::new(false);
+/// Test builds: the fill makes its link columns inside its first row batch, as before the column-only
+/// transaction (e2a788823), so the starved-batch test reaches the per-batch record (the backstop).
+#[cfg(test)]
+pub(crate) static LINKS_FILL_COLUMNS_IN_BATCH: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 pub(crate) static LINKS_FILL_ENTRY_HELD: AtomicU64 = AtomicU64::new(0);
 
