@@ -454,6 +454,9 @@ def count(trace, extras, root, window=None, clients=frozenset(), part=None, phas
             problems.append("phase split asked for but the window has no t0 clock pair to map the op times with")
         if ph_iv is not None and ph_off is not None:
             by_phase = {k: 0 for k in PHASES}
+    # comp-rev-89ec-b3c3 LOW 5: delete-phase flushes per op (iv order), so a D2 check can ask that EVERY cycle's delete
+    # flushed, not only that the mean reached 1
+    del_by_op = [0] * len(ph_iv) if by_phase is not None else None
     before_t0, after_t1 = 0, 0
 
     def selected(ts):
@@ -507,7 +510,12 @@ def count(trace, extras, root, window=None, clients=frozenset(), part=None, phas
                     problems.append("a flush without a -ttt stamp: the phase split cannot place it")
                     by_phase = None
                 else:
-                    by_phase[phase_of(int(round((ts - ph_off) * 1e9)), ph_iv)] += 1
+                    tns = int(round((ts - ph_off) * 1e9))
+                    phx = phase_of(tns, ph_iv)
+                    by_phase[phx] += 1
+                    if phx == "delete":
+                        import bisect
+                        del_by_op[bisect.bisect_right(ph_iv, (tns, float("inf"), float("inf"))) - 1] += 1
             by_tid.setdefault(tid, {}).setdefault(key, 0)
             by_tid[tid][key] += 1
             pm = FDPATH.match(rest)
@@ -549,6 +557,13 @@ def count(trace, extras, root, window=None, clients=frozenset(), part=None, phas
     out["flush_by_syscall"] = flush
     if phases is not None:
         out["flush_by_phase"] = by_phase  # None when the split was refused (the verdict says why)
+        if by_phase is not None and del_by_op is not None:
+            # LOW 5: of the ops whose whole delete phase lies inside the counted window [t0, t1], how many held no
+            # delete-phase flush (a D2 delete must flush in EVERY cycle)
+            inw = [k for k, (_, e, a) in enumerate(ph_iv)
+                   if (t0 is None or e / 1e9 + ph_off >= t0) and (t1 is None or a / 1e9 + ph_off <= t1)]
+            out["phase_ops"] = len(inw)
+            out["delete_zero_ops"] = sum(1 for k in inw if del_by_op[k] == 0)
         if ph_iv:  # the time the ops spent in each phase, for an idle control scaled to it
             out["phase_time_s"] = {"create": round(sum(e - s for s, e, _ in ph_iv) / 1e9, 6),
                                    "delete": round(sum(a - e for _, e, a in ph_iv) / 1e9, 6)}
@@ -717,14 +732,32 @@ def cell(a):
     dbad = []  # LOW 22: the delete's durability, checkable only where the flushes split by phase (C=1)
     if dd != "none" and isinstance(ph, dict):
         dr = ph["delete"] / ops
-        if dd == "d2" and dr < 1:
-            dbad.append(f"delete not durable: {round(dr, 4)} flushes per cycle in the delete phase, want >= 1 for a "
-                        f"D2 delete")
+        if dd == "d2":
+            # comp-rev-89ec-b3c3 LOW 5: (a) the IDLE-SUBTRACTED delete rate (per["delete"], the idle control's rate over
+            # the delete phase's time taken off), not the raw one, so a background writer cannot stand in for the delete;
+            # (b) every cycle's delete flushed (count()'s delete_zero_ops), not only the mean
+            dsub, zero = per.get("delete"), load.get("delete_zero_ops")
+            if dr < 1:
+                dbad.append(f"delete not durable: {round(dr, 4)} flushes per cycle in the delete phase, want >= 1 for a "
+                            f"D2 delete")
+            elif dsub is None:
+                dbad.append("delete not durable as far as can be told: the delete-phase flushes cannot be idle-subtracted "
+                            "(no idle rate)")
+            elif dsub < 1:
+                dbad.append(f"delete not durable: {dsub} flushes per cycle in the delete phase after the idle control's "
+                            f"rate is taken off ({round(dr, 4)} raw), want >= 1 for a D2 delete")
+            if not isinstance(zero, int) or isinstance(zero, bool):
+                dbad.append(f"delete not durable as far as can be told: no per-cycle delete record (delete_zero_ops "
+                            f"{zero!r})")
+            elif zero:
+                dbad.append(f"delete not durable: {zero} cycle(s) of {load.get('phase_ops')} with no delete-phase flush, "
+                            f"want every cycle's D2 delete to flush")
         if dd == "d0" and ph["delete"] > 0:
             dbad.append(f"a D0 delete flushed: {ph['delete']} flushes in the delete phase, want 0")
         res["delete_check"] = "checked at C=1 by op phase"
     elif dd != "none":
-        res["delete_check"] = "not checked: no phase split (C>1 ops overlap)"
+        # LOW 5: sound only because the C=1 sibling cell IS checked, which reduce.py requires (delete_check_problem)
+        res["delete_check"] = "not checked: no phase split (C>1 ops overlap); rests on the C=1 cell's check"
     res["per_op"] = per
     res["load_by_role"] = load.get("by_role", {})
     res["idle_by_role"] = idle.get("by_role", {})

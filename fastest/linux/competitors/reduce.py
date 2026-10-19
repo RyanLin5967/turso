@@ -161,6 +161,21 @@ def expected_jobs(d, repo):
     return sha, axes, names
 
 
+def delete_check_problem(cell, record):
+    """comp-rev-89ec-b3c3 LOW 5: why cell CELL's delete durability does not stand (None = it does). stracecount.py can
+    check a delete only where flushes split by op phase, at C=1; a C>1 cell's delete is not checked, which is sound only
+    because its C=1 sibling's is (PINNED_CLIENTS holds 1). So a C=1 cell whose delete-durable is d2 or d0 must say it
+    was checked."""
+    if not str(cell).endswith("-c1"):
+        return None
+    if (record or {}).get("delete_durable", "none") in ("none", None):
+        return None
+    chk = (record or {}).get("delete_check")
+    if not (isinstance(chk, str) and chk.startswith("checked at C=1")):
+        return f"a C=1 cell whose {record.get('delete_durable')} delete was not checked ({chk!r}): the C>1 cells rest on it"
+    return None
+
+
 def timed_line(name, cell, tv, dry):
     """One cell's TIMED judgement: (the TIMED line to print or None, whether it counts against the run). A smoke job
     (run-info dry=1) stands only with timed verdict 'ok-smoke', a real job (dry=0) only with 'ok'."""
@@ -174,7 +189,21 @@ def timed_line(name, cell, tv, dry):
     return None, False
 
 
+def selftest():
+    """test_reduce_concurrency.py's cases (comp-rev-89ec-b3c3 MED 3 and LOW 5), with a TALLY line for gates/tally.py, so
+    CI runs them through gates/run_selftest.sh (they had never run in CI)."""
+    import unittest
+    sys.path.insert(0, HERE)
+    import test_reduce_concurrency as t
+    r = unittest.TextTestRunner(verbosity=2, stream=sys.stdout).run(unittest.defaultTestLoader.loadTestsFromModule(t))
+    n, bad = r.testsRun, len(r.failures) + len(r.errors)
+    print(f"TALLY ran={n} pass={n - bad} na=0 fail={bad}")
+    return 1 if bad or not n else 0
+
+
 def main(argv):
+    if argv == ["selftest"]:
+        sys.exit(selftest())
     if not argv or argv[0].startswith("-"):
         sys.exit(__doc__)
     d = argv[0]
@@ -316,6 +345,10 @@ def main(argv):
             continue
         print("CELLS\t" + "\t".join([name, label] + [str(x) for x in row]))
         if c.get("verdict") != "ok":
+            bad += 1
+        dwhy = delete_check_problem(cell, c)
+        if dwhy:
+            print(f"DELETE\t{name}\t{cell}\t{dwhy}")
             bad += 1
     if missing or bad:
         print(f"# {missing} expected job(s) or cell(s) MISSING; {bad} job verdict(s) not PASS or cell verdict(s) not ok",
