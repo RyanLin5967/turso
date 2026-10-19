@@ -3248,4 +3248,36 @@ mod tests {
         );
         assert!(bad.is_empty(), "CLAIM: arithmetic over a numeric value that is not a column was SQLite's: {bad:#?}");
     }
+
+    /// Fresh-context review of this lane's fixes (item 1): `CAST(x AS NUMERIC)` gives numeric no
+    /// parameters, so `translate_expr` runs SQLite's CAST, but `order_by::expr_custom_type` typed it
+    /// numeric, and the derived-value operators of c8c6dd210 and 2f1ecab8f then sent it to numeric's
+    /// operators: `CAST('7' AS NUMERIC) / 2` was numeric_div's 3.5000000000000000 and `= 'abc'`
+    /// raised. A CAST the translator does not apply is not the type's. Expected values are python
+    /// sqlite3 3.46.1's for this exact SQL (UW run typesrev2bd-oracle4; artie raw
+    /// frontier/fastest/lanes/engine/raw/sqlite-types-rev2bd-2.txt 9294fdb8a2), never ours.
+    #[test]
+    fn a_sqlite_cast_to_numeric_keeps_sqlites_operators() {
+        let conn = open();
+        for sql in [
+            "CREATE TABLE p(id INTEGER PRIMARY KEY, x)",
+            "INSERT INTO p VALUES (1, '10'), (2, '9'), (3, 'abc')",
+        ] {
+            conn.execute(sql).unwrap();
+        }
+        let bad = diverging(
+            &conn,
+            &[
+                ("SELECT CAST('7' AS NUMERIC) / 2, typeof(CAST('7' AS NUMERIC) / 2)", "3,integer"),
+                ("SELECT typeof(CAST(1 AS NUMERIC) + 1), CAST(1 AS NUMERIC) + 1", "integer,2"),
+                ("SELECT CAST('5' AS NUMERIC) = 'abc', CAST('5' AS NUMERIC) < 'abc'", "0,1"),
+                ("SELECT CAST(5 AS NUMERIC) / 0", "NULL"),
+                ("SELECT CAST('2.5' AS NUMERIC) * 2, typeof(CAST('2.5' AS NUMERIC) * 2)", "5.0,real"),
+                ("SELECT id FROM p ORDER BY CAST(x AS NUMERIC), id", "3;2;1"),
+                ("SELECT id FROM p WHERE CAST(x AS NUMERIC) > 9.5 ORDER BY id", "1"),
+            ],
+            "SQLite 3.46.1",
+        );
+        assert!(bad.is_empty(), "CLAIM: SQLite's CAST(x AS NUMERIC) took numeric's operators: {bad:#?}");
+    }
 }
