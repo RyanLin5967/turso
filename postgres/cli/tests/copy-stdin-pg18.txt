@@ -1,0 +1,35 @@
+# Recorded 2026-10-19T01:41:31Z (the raw file's mtime, UTC) on iccad11 by copy-stdin-pg18.py (beside this file; a raw protocol-v3 driver, not pgproto, so not in tests/pg18)
+# against a fresh PostgreSQL 18.6 cluster (/var/tmp/r226lin-wire/pg18/inst/bin, initdb -A trust, user postgres).
+# One line per round: every backend message in order (T and S omitted; G: CopyInResponse's format and column formats).
+postgres (PostgreSQL) 18.6
+setup          N 00000 table "cs" does not exist, skipping | C DROP TABLE | C CREATE TABLE | Z I
+copy           G format=0 columns=[0, 0] | C COPY 2 | Z I
+rows           D ['1', 'ab'] | D ['2', None] | C SELECT 2 | Z I
+then           G format=0 columns=[0, 0] | C COPY 1 | D ['3'] | C SELECT 1 | Z I
+twice          G format=0 columns=[0] | C COPY 1 | G format=0 columns=[0] | C COPY 1 | D ['5'] | C SELECT 1 | Z I
+fail           C INSERT 0 1 | G format=0 columns=[0, 0] | E 57014 COPY from stdin failed: boom | Z I
+count          D ['5'] | C SELECT 1 | Z I
+dup            G format=0 columns=[0] | E 23505 duplicate key value violates unique constraint "cs_pkey" | Z I
+long           G format=0 columns=[0, 0] | E 22001 value too long for type character varying(5) | Z I
+overflow       G format=0 columns=[0, 0] | E 22003 numeric field overflow | Z I
+count          D ['5'] | C SELECT 1 | Z I
+begin          C BEGIN | Z T
+inblock        G format=0 columns=[0] | C COPY 1 | Z T
+failblock      G format=0 columns=[0] | E 57014 COPY from stdin failed: stop | Z E
+aborted        E 25P02 current transaction is aborted, commands ignored until end of transaction block | Z E
+rollback       C ROLLBACK | Z I
+count          D ['5'] | C SELECT 1 | Z I
+nosuch         E 42P01 relation "nosuch" does not exist | Z I
+nocol          E 42703 column "zz" of relation "cs" does not exist | Z I
+extended       1 | 2 | G format=0 columns=[0] | C COPY 2 | Z I
+count          D ['7'] | C SELECT 1 | Z I
+options        G format=0 columns=[0, 0] | C COPY 2 | Z I
+rows           D ['40', 'x'] | D ['41', None] | C SELECT 2 | Z I
+empty          G format=0 columns=[0] | C COPY 0 | Z I
+badint         G format=0 columns=[0] | E 22P02 invalid input syntax for type integer: "x" | Z I
+columns        G format=0 columns=[0, 0] | E 22P04 missing data for column "v" | Z I
+syncs          G format=0 columns=[0] | C COPY 1 | Z I
+count          D ['10'] | C SELECT 1 | Z I
+unexpected     G format=0 columns=[0] | E 08P01 unexpected message type 0x51 during COPY from stdin | E 08P01 terminating connection because protocol synchronization was lost | <closed>
+after          D ['10'] | C SELECT 1 | Z I
+rc=0
