@@ -198,6 +198,21 @@ impl Dialect for PostgresDialect {
     fn requires_custom_types(&self) -> bool {
         true
     }
+
+    /// PostgreSQL's float input reads 'Infinity', '-Infinity', 'inf' and '-inf' in any case, with
+    /// surrounding blanks, as the infinities, where SQLite's rules read 0 (the crash batch,
+    /// 2026-10-15). The engine has no NaN value, so 'NaN' is refused 0A000, as the translator's
+    /// literal path refuses it.
+    fn cast_text_to_float(&self, text: &str) -> Option<Result<f64>> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "infinity" | "+infinity" | "inf" | "+inf" => Some(Ok(f64::INFINITY)),
+            "-infinity" | "-inf" => Some(Ok(f64::NEG_INFINITY)),
+            "nan" | "+nan" | "-nan" => Some(Err(LimboError::ParseError(format!(
+                "NaN is not supported by this engine: {text:?}"
+            )))),
+            _ => None,
+        }
+    }
 }
 
 /// PostgreSQL's blank-padded `character(n)`: stored without its trailing blanks (they never count

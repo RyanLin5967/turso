@@ -167,6 +167,14 @@ pub trait Dialect: Send + Sync + 'static {
     fn requires_custom_types(&self) -> bool {
         false
     }
+
+    /// A text this dialect reads as a float in its own way, for a CAST to REAL (`Ok`), or refuses
+    /// (`Err`); `None` takes SQLite's rules, which read a text that is no number as 0. The default
+    /// for every dialect but PostgreSQL's, which reads 'Infinity' as the infinity (the crash batch,
+    /// 2026-10-15).
+    fn cast_text_to_float(&self, _text: &str) -> Option<crate::Result<f64>> {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -1313,6 +1321,102 @@ mod tests {
             "a SQLite table turns a NULL key into a new rowid"
         );
         conn.close().unwrap();
+    }
+
+    /// Engine review 20 LOW 26: the 4c paths the first red never ran, each on its own: INSERT OR
+    /// IGNORE skips a NULL-key row (the others are written); INSERT ... SELECT of a NULL key raises
+    /// NOT NULL; UPDATE SET rowid = NULL raises it; UPDATE OR IGNORE SET id = NULL leaves the row as
+    /// it was. Mutant `null_key_takes_rowid` (all paths at once) fails every arm.
+    #[test]
+    fn every_null_key_path_of_a_frontend_table_is_refused_or_skipped() {
+        fn not_null(result: &crate::Result<()>) -> bool {
+            matches!(result, Err(crate::LimboError::Constraint(m)) if m == "NOT NULL constraint failed: k.id")
+        }
+        fn ids(conn: &Arc<crate::Connection>) -> Vec<i64> {
+            conn.prepare("SELECT id FROM k ORDER BY id")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap()
+                .iter()
+                .map(|row| row[0].as_int().unwrap())
+                .collect()
+        }
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(&io, "pgkey-paths.db", Arc::new(PgKeyTestDialect)).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE k (id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+        conn.execute("CREATE TABLE src (x INTEGER)").unwrap();
+        conn.execute("INSERT INTO src VALUES (NULL)").unwrap();
+        let ignored = conn.execute("INSERT OR IGNORE INTO k VALUES (1, 'a'), (NULL, 'skipped'), (2, 'b')");
+        assert!(ignored.is_ok(), "INSERT OR IGNORE with a NULL key failed: {ignored:?}");
+        assert_eq!(ids(&conn), vec![1, 2], "CLAIM: INSERT OR IGNORE did not skip the NULL-key row alone");
+        let selected = conn.execute("INSERT INTO k (id, v) SELECT x, 's' FROM src");
+        assert!(not_null(&selected), "CLAIM: INSERT ... SELECT of a NULL key: {selected:?}");
+        let rowid = conn.execute("UPDATE k SET rowid = NULL WHERE id = 1");
+        assert!(not_null(&rowid), "CLAIM: UPDATE SET rowid = NULL: {rowid:?}");
+        let update_ignored = conn.execute("UPDATE OR IGNORE k SET id = NULL WHERE id = 2");
+        assert!(update_ignored.is_ok(), "UPDATE OR IGNORE SET id = NULL failed: {update_ignored:?}");
+        assert_eq!(ids(&conn), vec![1, 2], "CLAIM: the refused and skipped statements changed the table");
+    }
+
+    /// Engine review 20 LOW 24: a multi-row UPDATE inside BEGIN whose third row sets the NOT NULL
+    /// key to NULL raises NOT NULL, and must undo the rows it already changed: the statement journal
+    /// counted NOT NULL columns among the SET targets but skipped the rowid and its alias, so none was
+    /// opened and the first two rows' new keys stayed. After COMMIT the keys are as before. Mutant
+    /// `update_key_journal_skipped`.
+    #[test]
+    fn a_multi_row_update_failing_the_key_not_null_undoes_its_own_rows() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(&io, "pgkey-update.db", Arc::new(PgKeyTestDialect)).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE k (id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+        conn.execute("INSERT INTO k VALUES (1, 'a'), (2, 'b'), (3, 'c')").unwrap();
+        conn.execute("BEGIN").unwrap();
+        let updated = conn.execute("UPDATE k SET id = CASE WHEN id = 3 THEN NULL ELSE id + 10 END");
+        assert!(
+            matches!(&updated, Err(crate::LimboError::Constraint(m)) if m == "NOT NULL constraint failed: k.id"),
+            "premise: the NULL key raised NOT NULL: {updated:?}"
+        );
+        conn.execute("COMMIT").unwrap();
+        let ids: Vec<i64> = conn
+            .prepare("SELECT id FROM k ORDER BY id")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap()
+            .iter()
+            .map(|row| row[0].as_int().unwrap())
+            .collect();
+        assert_eq!(ids, vec![1, 2, 3], "CLAIM: the failed UPDATE kept the keys it had already changed");
+    }
+
+    /// Engine review 20 item 12: the NOT NULL key check's statement-journal term matters only where
+    /// nothing else opens the journal: under statement-level OR REPLACE (default ABORT already does).
+    /// `INSERT OR REPLACE` of two rows whose second key is NULL raises NOT NULL (OR REPLACE has no
+    /// default to substitute for a key), and undoes only its own first row: after COMMIT the
+    /// table holds the earlier statement's row alone. Mutant `notnull_key_journal_dropped`.
+    #[test]
+    fn an_or_replace_insert_with_a_null_key_undoes_only_its_own_rows() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(&io, "pgkey-replace.db", Arc::new(PgKeyTestDialect)).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE k (id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+        conn.execute("BEGIN").unwrap();
+        conn.execute("INSERT INTO k VALUES (3, 'three')").unwrap();
+        let replaced = conn.execute("INSERT OR REPLACE INTO k VALUES (5, 'five'), (NULL, 'n')");
+        assert!(
+            matches!(&replaced, Err(crate::LimboError::Constraint(m)) if m == "NOT NULL constraint failed: k.id"),
+            "premise: the NULL key raised NOT NULL under OR REPLACE: {replaced:?}"
+        );
+        conn.execute("COMMIT").unwrap();
+        let ids: Vec<i64> = conn
+            .prepare("SELECT id FROM k ORDER BY id")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap()
+            .iter()
+            .map(|row| row[0].as_int().unwrap())
+            .collect();
+        assert_eq!(ids, vec![3], "CLAIM: the failed OR REPLACE INSERT did not undo its own first row");
     }
 
     /// Engine review 20 HIGH 1, the branch arm: a branch forked after ALTER TABLE ADD COLUMN on a

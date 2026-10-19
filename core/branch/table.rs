@@ -17,7 +17,7 @@
 
 use super::BranchId;
 
-const CHUNK: usize = 1024;
+pub(crate) const CHUNK: usize = 1024;
 
 struct Chunk<T> {
     entries: Box<[Option<(BranchId, T)>]>,
