@@ -2513,12 +2513,14 @@ pub fn translate_drop_table(
         program.emit_column_or_rowid(ver_cursor_id, 0, ver_table_name_reg);
 
         let continue_ver_label = program.allocate_label();
+        // Case-blind, as the version row is keyed by the name as stored (ed62a1213: 'full,MyCdc'
+        // keys MyCdc) and the dropped name here is lowercased (engine-rev-qaf-fix2 LOW 1).
         program.emit_insn(Insn::Ne {
             lhs: ver_table_name_reg,
             rhs: dropped_name_reg,
             target_pc: continue_ver_label,
             flags: CmpInsFlags::default(),
-            collation: None,
+            collation: Some(crate::translate::collate::CollationSeq::NoCase),
         });
 
         if let (Some(index), Some(cursor_id)) = (&version_index, ver_index_cursor_id) {
