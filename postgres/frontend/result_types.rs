@@ -908,8 +908,10 @@ fn scalar_result(name: &str) -> Option<u32> {
         "lower" | "upper" | "btrim" | "ltrim" | "rtrim" | "trim" | "substr" | "substring"
         | "replace" | "concat" | "concat_ws" | "left" | "right" | "lpad" | "rpad" | "repeat"
         | "reverse" | "md5" | "initcap" | "translate" | "split_part" | "chr" | "to_char"
-        | "quote_ident" | "quote_literal" | "format" | "current_schema" | "current_database"
-        | "version" => TEXT,
+        | "quote_ident" | "quote_literal" | "format" | "current_schema" | "version" => TEXT,
+        // name in PostgreSQL (recorded, pg18-wirefuzz-the_connected_database_is_current_database_
+        // and_in_pg_database.out #1: 19).
+        "current_database" => NAME,
         "row_number" | "rank" | "dense_rank" | "ntile" => INT8,
         // bigint in PostgreSQL (found by the E5' differential, wire-e5-f312d1e13).
         "nextval" | "currval" | "setval" | "pg_database_size" => INT8,

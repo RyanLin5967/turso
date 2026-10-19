@@ -1392,6 +1392,9 @@ struct Session {
     interrupts: Arc<Interrupts>,
     /// The session's BackendKeyData: (process id, secret key).
     key: (i32, i32),
+    /// The database the client named at startup, set once there: the name every connection the
+    /// session opens answers to in current_database() and pg_database (lead MED-2).
+    database: std::sync::OnceLock<Arc<str>>,
 }
 
 
@@ -1741,6 +1744,7 @@ impl Session {
             min_messages: std::sync::atomic::AtomicU8::new(7),
             interrupts,
             key: (pid, secret),
+            database: std::sync::OnceLock::new(),
         }
     }
 
@@ -1776,7 +1780,7 @@ impl Session {
     }
 
     fn open_trunk(&self) -> SqlResult<PgConnection> {
-        let conn = PgConnection::new_server(self.shared.db.connect().map_err(|e| engine_info(&e))?, self.shared.server_files());
+        let conn = PgConnection::new_server(self.shared.db.connect().map_err(|e| engine_info(&e))?, self.shared.server_files(), self.database.get().cloned());
         self.arm(conn.inner());
         attach_schema_files(&conn, &self.shared.db_file);
         Ok(conn)
@@ -2054,7 +2058,7 @@ impl Session {
                 ));
             }
         };
-        let conn = PgConnection::new_server(conn, self.shared.server_files());
+        let conn = PgConnection::new_server(conn, self.shared.server_files(), self.database.get().cloned());
         self.arm(conn.inner());
         self.state().branch = Some((branch.into(), conn));
         Ok(())
@@ -3191,7 +3195,7 @@ impl Session {
                         let opened = self
                             .waiting(|| self.shared.db.connect_named(&name))
                             .map_err(|e| self.switch_error(&name, &e, "ERROR"))?;
-                        let next = PgConnection::new_server(opened, self.shared.server_files());
+                        let next = PgConnection::new_server(opened, self.shared.server_files(), self.database.get().cloned());
                         self.arm(next.inner());
                         next.adopt_session_of(conn);
                         st.branch = Some((name.as_ref().into(), next));
@@ -3216,7 +3220,7 @@ impl Session {
                             return Err(self.switch_error(&name, &e, "ERROR"));
                         }
                     };
-                    let next = PgConnection::new_server(opened, self.shared.server_files());
+                    let next = PgConnection::new_server(opened, self.shared.server_files(), self.database.get().cloned());
                     self.arm(next.inner());
                     next.adopt_session_of(conn);
                     st.branch.replace((name.as_ref().into(), next))
@@ -4271,7 +4275,12 @@ impl NoopStartupHandler for Session {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         match client.metadata().get(METADATA_DATABASE).cloned() {
-            Some(database) => self.start_on_branch(&database),
+            Some(database) => {
+                // The name current_database() and pg_database answer, for every connection the
+                // session opens from here (lead MED-2).
+                let _ = self.database.set(Arc::from(database.as_str()));
+                self.start_on_branch(&database)
+            }
             None => Ok(()),
         }
     }

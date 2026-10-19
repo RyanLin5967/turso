@@ -1616,6 +1616,19 @@ impl PgDatabaseTable {
     }
 }
 
+/// The name this connection's database answers to, as current_database(), pg_database and
+/// information_schema give it: the database the client named at startup, as PostgreSQL answers
+/// (lead MED-2; recorded, pg18-wirefuzz-the_connected_database_is_current_database_and_in_pg_database
+/// .out: a session started with database=postgres answered the file's stem, so
+/// pg_database_size('postgres') was 3D000), else the database file's stem (a session the CLI or an
+/// embedding process opened, with no startup name).
+pub(crate) fn database_name(conn: &Connection) -> String {
+    crate::session::session_of_connection(conn)
+        .and_then(|session| session.database_name())
+        .map(|name| name.to_string())
+        .unwrap_or_else(|| db_name_from_path(conn.db_file_path()))
+}
+
 /// Shared by the pg_database virtual table and current_database() so both
 /// report the same database name.
 pub(crate) fn db_name_from_path(path: &str) -> String {
@@ -1718,7 +1731,7 @@ impl InternalVirtualTableCursor for PgDatabaseCursor {
         _idx_num: i32,
     ) -> Result<bool, LimboError> {
         self.current_row = 0;
-        let db_name = db_name_from_path(self.conn.db_file_path());
+        let db_name = database_name(self.conn.as_ref());
         self.rows = vec![vec![
             Value::from_i64(DATABASE_OID),    // oid
             Value::build_text(db_name),       // datname

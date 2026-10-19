@@ -68,6 +68,10 @@ pub(crate) struct PgConnectionInner {
     block_reads: parking_lot::Mutex<Vec<turso_pg_parser::translator::PgRelationName>>,
     /// Which server files a COPY FROM 'file' may read (review wire-quote LOW-3).
     server_files: ServerFiles,
+    /// The database the client named at startup ([`crate::catalog::database_name`]); None for a
+    /// session with no startup (the CLI's, an embedding process's). Shared, so a branch switch
+    /// that opens a connection allocates nothing for it (L5).
+    database_name: Option<Arc<str>>,
 }
 
 /// The files a client's COPY FROM 'file' may read. PostgreSQL grants them by role
@@ -413,6 +417,23 @@ fn refuse_dropped_schemas(pg_conn: &PgConnectionInner, parse: &turso_pg_parser::
     }
 }
 
+impl PgConnectionInner {
+    /// The database the client named at startup, if it named one.
+    pub(crate) fn database_name(&self) -> Option<Arc<str>> {
+        self.database_name.clone()
+    }
+}
+
+/// [`session_of`] for a connection reached by reference (a scalar function's, a catalog table's):
+/// the registry is keyed by the connection's address, which is the same.
+pub(crate) fn session_of_connection(conn: &Connection) -> Option<Arc<PgConnectionInner>> {
+    SESSIONS_BY_CONNECTION
+        .lock()
+        .get(&(conn as *const Connection as usize))
+        .and_then(std::sync::Weak::upgrade)
+        .filter(|inner| std::ptr::eq(Arc::as_ptr(&inner.conn), conn))
+}
+
 /// The session of the engine connection `conn`, if one is alive.
 pub(crate) fn session_of(conn: &Arc<Connection>) -> Option<Arc<PgConnectionInner>> {
     SESSIONS_BY_CONNECTION
@@ -435,17 +456,24 @@ impl Drop for PgConnectionInner {
 
 impl PgConnection {
     pub fn new(conn: Arc<Connection>) -> Self {
-        Self::open(conn, false, ServerFiles::Any)
+        Self::open(conn, false, ServerFiles::Any, None)
     }
 
     /// A branch server session: as [`PgConnection::new`], except that CREATE SCHEMA and DROP
     /// SCHEMA of any schema but public are refused (0A000), by the statement's kind, and COPY
     /// FROM 'file' reads only the files `files` grants.
-    pub fn new_server(conn: Arc<Connection>, files: ServerFiles) -> Self {
-        Self::open(conn, true, files)
+    /// `database` is the name the client gave at startup, which current_database() and pg_database
+    /// answer ([`crate::catalog::database_name`]).
+    pub fn new_server(conn: Arc<Connection>, files: ServerFiles, database: Option<Arc<str>>) -> Self {
+        Self::open(conn, true, files, database)
     }
 
-    fn open(conn: Arc<Connection>, public_schema_only: bool, server_files: ServerFiles) -> Self {
+    fn open(
+        conn: Arc<Connection>,
+        public_schema_only: bool,
+        server_files: ServerFiles,
+        database_name: Option<Arc<str>>,
+    ) -> Self {
         aliases::install(&conn);
         // PostgreSQL enforces every foreign key; the engine only under PRAGMA foreign_keys.
         conn.set_foreign_keys_enabled(true);
@@ -464,6 +492,7 @@ impl PgConnection {
                 dropped_schemas: parking_lot::Mutex::new(Vec::new()),
                 block_reads: parking_lot::Mutex::new(Vec::new()),
                 server_files,
+                database_name,
             }),
         };
         SESSIONS_BY_CONNECTION

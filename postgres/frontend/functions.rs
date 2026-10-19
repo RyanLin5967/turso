@@ -84,9 +84,7 @@ pub(crate) fn exec_scalar(conn: &Connection, name: &str, args: &[Value]) -> Resu
         "booleq" => Ok(Value::from_i64((args.first() == args.get(1)) as i64)),
         "boolne" => Ok(Value::from_i64((args.first() != args.get(1)) as i64)),
         "version" => Ok(exec_version()),
-        "current_database" => Ok(Value::build_text(crate::catalog::db_name_from_path(
-            conn.db_file_path(),
-        ))),
+        "current_database" => Ok(Value::build_text(crate::catalog::database_name(conn))),
         // pg_catalog presents every user object under the hardcoded "public"
         // namespace, so that is always the current schema.
         "current_schema" => Ok(Value::build_text("public")),
@@ -110,7 +108,7 @@ pub(crate) fn exec_scalar(conn: &Connection, name: &str, args: &[Value]) -> Resu
                 Some(Value::Null) => return Ok(Value::Null),
                 Some(Value::Text(t)) => {
                     let name = t.as_str();
-                    if name != crate::catalog::db_name_from_path(&path) {
+                    if name != crate::catalog::database_name(conn) {
                         return Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
                             SqlErrorKind::InvalidCatalogName,
                             format!("database \"{name}\" does not exist"),
@@ -231,7 +229,7 @@ fn exec_pg_regclass(conn: &Connection, args: &[Value]) -> Result<Value> {
         [name] => (None, name.clone()),
         [schema, name] => (Some(schema.clone()), name.clone()),
         [database, schema, name] => {
-            if *database != crate::catalog::db_name_from_path(conn.db_file_path()) {
+            if *database != crate::catalog::database_name(conn) {
                 return Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
                     SqlErrorKind::FeatureNotSupported,
                     format!("cross-database references are not implemented: \"{}\"", parts.join(".")),

@@ -229,7 +229,7 @@ fn load_columns(conn: &Connection) -> Result<Vec<Vec<Value>>> {
     // The catalog columns of every view name the database as current_database() and pg_database
     // do, by the file's stem, so `WHERE table_catalog = current_database()` keeps every row (wire
     // review 2 item 10).
-    let catalog = crate::catalog::db_name_from_path(conn.db_file_path());
+    let catalog = crate::catalog::database_name(conn);
     let mut rows = Vec::new();
     for (name, table) in user_tables_sorted(&schema) {
         for (i, col) in table.columns().iter().enumerate() {
@@ -266,7 +266,7 @@ fn load_columns(conn: &Connection) -> Result<Vec<Vec<Value>>> {
 
 fn load_tables(conn: &Connection) -> Result<Vec<Vec<Value>>> {
     let schema = conn.current_schema();
-    let catalog = crate::catalog::db_name_from_path(conn.db_file_path());
+    let catalog = crate::catalog::database_name(conn);
     let mut rows: Vec<Vec<Value>> = user_tables_sorted(&schema)
         .into_iter()
         .map(|(name, _)| {
@@ -293,7 +293,7 @@ fn load_tables(conn: &Connection) -> Result<Vec<Vec<Value>>> {
 
 fn load_table_constraints(conn: &Connection) -> Result<Vec<Vec<Value>>> {
     let schema = conn.current_schema();
-    let catalog = crate::catalog::db_name_from_path(conn.db_file_path());
+    let catalog = crate::catalog::database_name(conn);
     let mut rows = Vec::new();
     for (name, table) in user_tables_sorted(&schema) {
         let Table::BTree(bt) = table.as_ref() else {
@@ -318,7 +318,7 @@ fn load_table_constraints(conn: &Connection) -> Result<Vec<Vec<Value>>> {
 
 fn load_key_column_usage(conn: &Connection) -> Result<Vec<Vec<Value>>> {
     let schema = conn.current_schema();
-    let catalog = crate::catalog::db_name_from_path(conn.db_file_path());
+    let catalog = crate::catalog::database_name(conn);
     let mut rows = Vec::new();
     for (name, table) in user_tables_sorted(&schema) {
         let Table::BTree(bt) = table.as_ref() else {
