@@ -124,12 +124,16 @@ const LOG_SEGMENT_SLOTS: usize = 1024;
 
 /// One log-buffer segment, every page written once so its first use faults nothing in.
 fn log_segment() -> Vec<u8> {
-    // Written, not `vec![0; n]` (which may take untouched zeroed pages from the OS), and kept from
-    // being elided as a dead store.
-    let mut v = Vec::with_capacity(LOG_SEGMENT);
-    v.resize(LOG_SEGMENT, 0u8);
-    std::hint::black_box(v.as_mut_slice());
-    v.clear();
+    // One non-zero volatile write per page, so the page is really touched: a zeroing `resize` can be
+    // turned by the optimizer into an untouched zeroed allocation (engine-rev-l2b HIGH B: 882 of 960
+    // pages faulted in later in a release build), and a volatile store cannot be elided.
+    let mut v: Vec<u8> = Vec::with_capacity(LOG_SEGMENT);
+    let base = v.as_mut_ptr();
+    for at in (0..LOG_SEGMENT).step_by(4096) {
+        // SAFETY: `at` < LOG_SEGMENT, within the capacity just allocated; the bytes are never read
+        // as initialized (the Vec stays empty).
+        unsafe { std::ptr::write_volatile(base.add(at), 1u8) };
+    }
     v
 }
 
@@ -2123,7 +2127,10 @@ impl Journal {
         let drop_pending = from.saturating_sub(file_from) as usize;
         if drop_pending > 0 {
             self.pending.drain(..drop_pending);
-            self.pending_slots = slots_named(&self.pending);
+            // In place, keeping the slots' reservation (engine-rev-l2b MED: a fresh Vec dropped it).
+            let named = slots_named(&self.pending);
+            self.pending_slots.clear();
+            self.pending_slots.extend_from_slice(&named);
         }
         if class.syncs() {
             if let Err(e) = fsync_dir_of(&self.files.log, class) {
