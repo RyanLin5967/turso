@@ -66,7 +66,8 @@ const PROMPT_CONT: &str = "tursopg-> ";
 
 #[derive(Parser, Debug)]
 #[command(name = "tursopg")]
-#[command(author, version, about = "PostgreSQL-compatible micro database")]
+#[command(author, about = "PostgreSQL-compatible micro database")]
+#[command(version = concat!(env!("CARGO_PKG_VERSION"), " source ", env!("TURSOPG_SOURCE_SHA")))]
 struct Opts {
     #[clap(index = 1, help = "Database file", default_value = ":memory:")]
     database: Option<PathBuf>,

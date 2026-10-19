@@ -11,6 +11,14 @@ use syntect::parsing::SyntaxSet;
 fn main() {
     println!("cargo::rerun-if-changed=../../cli/SQL.sublime-syntax");
     println!("cargo::rerun-if-changed=build.rs");
+    // The source sha a harness names at build time (TURSOPG_SOURCE_SHA), printed by --version, so
+    // the harness can check the binary it runs is the one it built (wire-rev-uw3 HIGH-1: a shared
+    // target's binary passed an mtime check and was stamped with another sha). Empty when unset.
+    println!("cargo::rerun-if-env-changed=TURSOPG_SOURCE_SHA");
+    println!(
+        "cargo::rustc-env=TURSOPG_SOURCE_SHA={}",
+        env::var("TURSOPG_SOURCE_SHA").unwrap_or_default()
+    );
 
     let out_dir = env::var_os("OUT_DIR").unwrap();
     let syntax =
