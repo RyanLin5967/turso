@@ -5762,25 +5762,44 @@ fn check_assignments(
 }
 
 /// Whether decimal `text` overflows numeric(`precision`, `scale`): more than precision - scale
-/// integer digits once rounded half away from zero to `scale` places (numeric's apply_typmod).
-/// Text that is no plain decimal is not judged here (its parameter's type read it already).
+/// integer digits once rounded half away from zero to `scale` places (numeric's apply_typmod). An
+/// exponent moves the point ('1e5' is 100000), and an infinity never fits a typmod, as numeric_in
+/// reads them (wire-rev-cfdebc06d LOW-3); NaN fits every typmod. Text that is no decimal is not
+/// judged here (its parameter's type read it already).
 fn numeric_overflows(text: &str, precision: u32, scale: i32) -> bool {
     let t = text.trim();
     let t = t.strip_prefix(['-', '+']).unwrap_or(t);
-    let (int, frac) = t.split_once('.').unwrap_or((t, ""));
+    if t.eq_ignore_ascii_case("infinity") || t.eq_ignore_ascii_case("inf") {
+        return true;
+    }
+    let (mantissa, exponent) = match t.find(['e', 'E']) {
+        Some(at) => match t[at + 1..].parse::<i64>() {
+            Ok(e) => (&t[..at], e),
+            Err(_) => return false,
+        },
+        None => (t, 0),
+    };
+    let (int, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
     if int.is_empty() && frac.is_empty() || !int.bytes().all(|b| b.is_ascii_digit()) || !frac.bytes().all(|b| b.is_ascii_digit()) {
         return false;
     }
-    // The digits as one number, rounded to `scale` places.
+    // The digits as one number, the point after `point` of them (it may lie past either end).
     let mut digits: Vec<u8> = int.bytes().chain(frac.bytes()).map(|b| b - b'0').collect();
-    let point = int.len() as i64; // digits before the point
-    let keep = point + i64::from(scale); // digits kept
+    let lead = digits.iter().take_while(|d| **d == 0).count();
+    if lead == digits.len() {
+        return false;
+    }
+    digits.drain(..lead);
+    let Some(mut point) = (int.len() as i64).checked_add(exponent).and_then(|p| p.checked_sub(lead as i64)) else {
+        return exponent > 0;
+    };
+    // Rounded to `scale` places: `keep` digits are kept.
+    let keep = point.saturating_add(i64::from(scale));
     if keep < 0 {
         return false;
     }
-    let keep = keep as usize;
-    let mut point = point as usize;
-    if keep < digits.len() {
+    if (keep as u64) < digits.len() as u64 {
+        let keep = keep as usize;
         let round_up = digits[keep] >= 5;
         digits.truncate(keep);
         if round_up {
@@ -5800,10 +5819,13 @@ fn numeric_overflows(text: &str, precision: u32, scale: i32) -> bool {
                 }
             }
         }
+        if digits.iter().all(|d| *d == 0) {
+            return false;
+        }
     }
-    // Integer digits after rounding, leading zeros dropped.
-    let significant = digits[..point.min(digits.len())].iter().skip_while(|d| **d == 0).count();
-    significant as i64 > i64::from(precision) - i64::from(scale)
+    // Integer digits after rounding: the first digit is not zero, so they are `point` (a dropped
+    // digit past the kept ones, under a negative scale, is still an integer digit).
+    point > i64::from(precision) - i64::from(scale)
 }
 
 /// Every value `portal` holds, read by its parameter's type and format, as PostgreSQL's
