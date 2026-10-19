@@ -4150,21 +4150,25 @@ fn handle_pg_copy_from(pg_conn: &Arc<PgConnectionInner>, stmt: &PgCopyFromStmt) 
     std::io::Read::read_to_end(&mut open_server_file(&pg_conn.server_files, &stmt.filename)?, &mut data).map_err(|e| {
         LimboError::ParseError(format!("COPY FROM: cannot read '{}': {}", stmt.filename, e).into())
     })?;
-    // The rows go in atomically: in a transaction of their own, or, inside one already open (a
-    // client's block, or the implicit block of a multi-statement query or a pipeline), under a
-    // savepoint, so a failed COPY undoes its own rows and leaves the block to its owner. Its own
-    // BEGIN was refused inside any open transaction (wire review 4 item 2). An undo that fails
-    // breaks the connection, as for ALTER's rebuild (own_transaction). Read line by line in
-    // PostgreSQL's batches, as the client's rows are ([`CopyLoader`]).
-    own_transaction(pg_conn, "__turso_copy", "COPY FROM", || {
-        let mut loader = CopyLoader::new(Arc::new(target), stmt);
-        loader.feed(pg_conn, &data, true)?;
-        Ok(loader.rows)
-    })
+    // Read in pieces as the client's rows are ([`CopyLoader`]), one line at a time: the file's
+    // lines were all split first, a range per line on top of the file (review wire-rev-copystdin2
+    // L4). The rows go in atomically at the end ([`CopyLoader::finish`]).
+    let mut loader = CopyLoader::new(Arc::new(target), stmt);
+    let mut pieces = data.chunks(COPY_FILE_PIECE).peekable();
+    if pieces.peek().is_none() {
+        loader.feed(pg_conn, &[], true)?;
+    }
+    while let Some(piece) = pieces.next() {
+        loader.feed(pg_conn, piece, pieces.peek().is_none())?;
+    }
+    Ok(loader.rows)
 }
 
+/// The piece of a file COPY FROM reads at once, as the server's piece of CopyData.
+const COPY_FILE_PIECE: usize = 65536;
+
 /// The longest line COPY reads: PostgreSQL's MaxAllocSize, past which its line buffer cannot grow
-/// (54000 "out of memory"). The server sets it at startup ([`set_copy_line_limit`]).
+/// (54000). The server sets it at startup ([`set_copy_line_limit`]).
 static COPY_LINE_LIMIT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0x3fff_ffff);
 
 /// The longest line COPY reads, process-wide, before it refuses with 54000 (the server's
@@ -4175,29 +4179,37 @@ pub fn set_copy_line_limit(bytes: usize) {
 
 /// PostgreSQL's multi-insert buffer: rows are inserted once 1000 are read, or their lines hold
 /// 64 KB (CopyMultiInsertBufferFull's MAX_BUFFERED_TUPLES, MAX_BUFFERED_BYTES; the bytes are the
-/// lines', where PostgreSQL counts its tuples'), and at the end.
+/// lines', as PostgreSQL's line_buf counts them: the review's `order-bytes` agrees), and at the end.
 const COPY_BATCH_ROWS: usize = 1000;
 const COPY_BATCH_BYTES: usize = 65535;
 
-/// COPY FROM's loader, fed the data in pieces as it comes ([`CopyLoader::feed`]): each complete
-/// line is read (UTF-8, its fields, their input checks, in that order) as it arrives and its row
-/// kept in a batch, which is inserted when full, as PostgreSQL's CopyFrom reads and flushes. So a
-/// line's error beats any later line's, and an insert's error (23505) beats a later line's once
-/// its batch was full (recorded, copy-stdin-pg18.txt part 6 `S1`, `S2`, `S6`, `S6b`). Memory is
-/// the unfinished line, one batch and the piece being read. Every line was parsed first, held as
-/// a row of Strings each, then checked, then inserted: about 93 bytes of memory per byte of
-/// input (review wire-rev-copystdin H1, M1).
-#[derive(Clone)]
+/// COPY FROM's loader, fed the data in pieces as it comes ([`CopyLoader::feed`]). Each complete line
+/// is read as it arrives (UTF-8, its fields, their input checks, in that order), so a line's error
+/// beats any later line's (recorded, copy-stdin-pg18.txt part 6 `S1`, `S2`). Its rows are kept in
+/// PostgreSQL's batches; a full batch goes to a spill file, not the table, so the COPY takes the
+/// engine's single write lock only at its end, inserting everything in one transaction of its
+/// own (or a savepoint in a block): another session's write runs while the client sends (review
+/// wire-rev-copystdin2 M2: inserting each batch as it filled held the lock across the client's
+/// waits, and other writers met 55P03). An insert's error keeps PostgreSQL's order: when a line
+/// fails, the full batches before it, which PostgreSQL would have inserted by then, are inserted
+/// (and rolled back) first, so their 23505 is the COPY's (`S6`), and a batch not yet full is not
+/// (`S6b`). Memory is the unfinished line, one batch and a piece; the unfinished line grows in
+/// place and is scanned once (review wire-rev-copystdin2 H1: it was re-joined, rescanned and
+/// re-copied for every piece, and the loader cloned for every piece).
 struct CopyLoader {
     target: Arc<CopyTarget>,
     delimiter: char,
     null_string: String,
     skip_header: bool,
     lines: crate::copy::CopyLines,
-    /// The unfinished line: the bytes after the last complete one.
+    /// The unfinished line: the bytes after the last complete one, then each new piece.
     carry: Vec<u8>,
     batch: Vec<crate::copy::CopyRow>,
     batch_bytes: usize,
+    /// The full batches, in order, to insert at the end.
+    spill: Option<CopySpill>,
+    /// The data has all been read (a retried end inserts without reading it again).
+    read: bool,
     /// Rows inserted.
     rows: usize,
 }
@@ -4217,42 +4229,54 @@ impl CopyLoader {
             carry: Vec::new(),
             batch: Vec::new(),
             batch_bytes: 0,
+            spill: None,
+            read: false,
             rows: 0,
         }
     }
 
-    /// The next piece of the data; `last` when it is the end.
+    /// The next piece of the data; `last` when it is the end, when the rows are inserted.
     fn feed(&mut self, pg_conn: &Arc<PgConnectionInner>, data: &[u8], last: bool) -> Result<()> {
-        let joined;
-        let buf: &[u8] = if self.carry.is_empty() {
-            data
-        } else {
-            joined = [std::mem::take(&mut self.carry).as_slice(), data].concat();
-            &joined
-        };
-        let limit = COPY_LINE_LIMIT.load(std::sync::atomic::Ordering::Relaxed);
-        let (lines, used) = self.lines.split(buf, last)?;
-        for range in lines {
-            let line = &buf[range];
-            if line.len() > limit {
-                return Err(line_too_long(line.len()));
+        if !self.read {
+            if let Err(e) = self.read_piece(data, last) {
+                return Err(self.fail(pg_conn, e));
             }
-            if std::mem::take(&mut self.skip_header) {
-                continue;
-            }
-            self.read_line(pg_conn, line)?;
+            self.read = last;
         }
-        if buf.len() - used > limit {
-            return Err(line_too_long(buf.len() - used));
-        }
-        self.carry = buf[used..].to_vec();
         if last {
-            self.flush(pg_conn)?;
+            self.finish(pg_conn)?;
         }
         Ok(())
     }
 
-    fn read_line(&mut self, pg_conn: &Arc<PgConnectionInner>, line: &[u8]) -> Result<()> {
+    fn read_piece(&mut self, data: &[u8], last: bool) -> Result<()> {
+        let limit = COPY_LINE_LIMIT.load(std::sync::atomic::Ordering::Relaxed);
+        self.carry.extend_from_slice(data);
+        let carry = std::mem::take(&mut self.carry);
+        let result = (|| {
+            let (lines, used) = self.lines.split(&carry, last)?;
+            for range in lines {
+                let line = &carry[range];
+                if line.len() > limit {
+                    return Err(line_too_long(limit));
+                }
+                if std::mem::take(&mut self.skip_header) {
+                    continue;
+                }
+                self.read_line(line)?;
+            }
+            if carry.len() - used > limit {
+                return Err(line_too_long(limit));
+            }
+            Ok(used)
+        })();
+        self.carry = carry;
+        let used = result?;
+        self.carry.drain(..used);
+        Ok(())
+    }
+
+    fn read_line(&mut self, line: &[u8]) -> Result<()> {
         let mut row = crate::copy::copy_row(line, self.delimiter, &self.null_string, &self.target.columns)?;
         for (value, input) in row.iter_mut().zip(&self.target.input_types) {
             if let (Some(s), Some(input)) = (value.as_mut(), input) {
@@ -4264,42 +4288,190 @@ impl CopyLoader {
         self.batch.push(row);
         self.batch_bytes += line.len();
         if self.batch.len() >= COPY_BATCH_ROWS || self.batch_bytes >= COPY_BATCH_BYTES {
-            self.flush(pg_conn)?;
+            let spill = match &mut self.spill {
+                Some(spill) => spill,
+                None => self.spill.insert(CopySpill::new()?),
+            };
+            spill.write(std::mem::take(&mut self.batch))?;
+            self.batch_bytes = 0;
         }
         Ok(())
     }
 
-    fn flush(&mut self, pg_conn: &Arc<PgConnectionInner>) -> Result<()> {
-        if self.batch.is_empty() {
-            return Ok(());
+    /// A line failed with `e`: PostgreSQL had inserted every full batch before it, so their
+    /// insert's error, if any, is the COPY's (in a transaction or savepoint rolled back at once).
+    /// A lock wait or any failure of the spill itself leaves `e` the answer.
+    fn fail(&mut self, pg_conn: &Arc<PgConnectionInner>, e: LimboError) -> LimboError {
+        let Some(spill) = &mut self.spill else {
+            return e;
+        };
+        let target = &self.target;
+        let inserted = own_transaction(pg_conn, "__turso_copy", "COPY FROM", || {
+            insert_copy_rows(pg_conn, target, spill.rows()?)?;
+            Err(LimboError::InternalError("rolled back".to_string()))
+        });
+        match inserted {
+            Err(LimboError::InternalError(m)) if m == "rolled back" => e,
+            Err(LimboError::Busy | LimboError::BusySnapshot) => e,
+            Err(insert) => insert,
+            Ok(()) => e,
         }
-        let mut insert = pg_conn.conn.prepare_sqlite(&self.target.insert_sql)?;
-        for row in std::mem::take(&mut self.batch) {
-            for (i, value) in row.into_iter().enumerate() {
-                let index = NonZero::new(i + 1).unwrap();
+    }
+
+    /// Every row, the spilled batches' then the last batch's, in one transaction of its own (a
+    /// savepoint in a block); a retry after a lock wait inserts them all again (none went in).
+    fn finish(&mut self, pg_conn: &Arc<PgConnectionInner>) -> Result<()> {
+        let target = &self.target;
+        let spill = &mut self.spill;
+        let batch = &self.batch;
+        let rows = own_transaction(pg_conn, "__turso_copy", "COPY FROM", || {
+            let mut n = 0;
+            if let Some(spill) = spill {
+                n += insert_copy_rows(pg_conn, target, spill.rows()?)?;
+            }
+            n += insert_copy_rows(pg_conn, target, batch.iter().cloned().map(Ok))?;
+            Ok(n)
+        })?;
+        self.rows = rows;
+        Ok(())
+    }
+}
+
+/// Insert `rows` into `target`: how many went in.
+fn insert_copy_rows(
+    pg_conn: &Arc<PgConnectionInner>,
+    target: &CopyTarget,
+    rows: impl Iterator<Item = Result<crate::copy::CopyRow>>,
+) -> Result<usize> {
+    let mut insert = pg_conn.conn.prepare_sqlite(&target.insert_sql)?;
+    let mut n = 0;
+    for row in rows {
+        for (i, value) in row?.into_iter().enumerate() {
+            let index = NonZero::new(i + 1).unwrap();
+            match value {
+                Some(s) => insert.bind_at(index, Value::build_text(s))?,
+                None => insert.bind_at(index, Value::Null)?,
+            }
+        }
+        insert.run_ignore_rows()?;
+        insert.reset()?;
+        insert.clear_bindings();
+        n += 1;
+    }
+    Ok(n)
+}
+
+/// COPY's full batches, written to an unlinked temporary file until the COPY inserts them: per row
+/// its number of values, then each value's length (u32::MAX for NULL) and bytes.
+struct CopySpill {
+    file: std::fs::File,
+    writer: std::io::BufWriter<std::fs::File>,
+}
+
+impl CopySpill {
+    fn new() -> Result<Self> {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let io = |e: std::io::Error| {
+            LimboError::InternalError(format!("COPY FROM: the spill file failed: {e}"))
+        };
+        let path = std::env::temp_dir().join(format!(
+            "turso-copy-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(io)?;
+        // Unlinked at once: the file goes with its last handle, however the COPY ends.
+        let _ = std::fs::remove_file(&path);
+        let writer = std::io::BufWriter::new(file.try_clone().map_err(io)?);
+        Ok(Self { file, writer })
+    }
+
+    fn write(&mut self, rows: Vec<crate::copy::CopyRow>) -> Result<()> {
+        use std::io::Write;
+        let io = |e: std::io::Error| {
+            LimboError::InternalError(format!("COPY FROM: the spill file failed: {e}"))
+        };
+        for row in rows {
+            self.writer.write_all(&(row.len() as u32).to_le_bytes()).map_err(io)?;
+            for value in row {
                 match value {
-                    Some(s) => insert.bind_at(index, Value::build_text(s))?,
-                    None => insert.bind_at(index, Value::Null)?,
+                    Some(s) => {
+                        self.writer.write_all(&(s.len() as u32).to_le_bytes()).map_err(io)?;
+                        self.writer.write_all(s.as_bytes()).map_err(io)?;
+                    }
+                    None => self.writer.write_all(&u32::MAX.to_le_bytes()).map_err(io)?,
                 }
             }
-            insert.run_ignore_rows()?;
-            insert.reset()?;
-            insert.clear_bindings();
-            self.rows += 1;
         }
-        self.batch_bytes = 0;
         Ok(())
+    }
+
+    /// Every row written, from the first.
+    fn rows(&mut self) -> Result<impl Iterator<Item = Result<crate::copy::CopyRow>>> {
+        use std::io::{Read, Seek, Write};
+        let io = |e: std::io::Error| {
+            LimboError::InternalError(format!("COPY FROM: the spill file failed: {e}"))
+        };
+        self.writer.flush().map_err(io)?;
+        let mut file = self.file.try_clone().map_err(io)?;
+        let end = file.seek(std::io::SeekFrom::End(0)).map_err(io)?;
+        file.seek(std::io::SeekFrom::Start(0)).map_err(io)?;
+        let mut reader = std::io::BufReader::new(file.take(end));
+        let word = move |reader: &mut std::io::BufReader<std::io::Take<std::fs::File>>| {
+            let mut b = [0u8; 4];
+            match reader.read_exact(&mut b) {
+                Ok(()) => Ok(Some(u32::from_le_bytes(b))),
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
+                Err(e) => Err(io(e)),
+            }
+        };
+        Ok(std::iter::from_fn(move || {
+            let count = match word(&mut reader) {
+                Ok(Some(count)) => count,
+                Ok(None) => return None,
+                Err(e) => return Some(Err(e)),
+            };
+            let mut row = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                match word(&mut reader) {
+                    Ok(Some(u32::MAX)) => row.push(None),
+                    Ok(Some(len)) => {
+                        let mut bytes = vec![0u8; len as usize];
+                        if let Err(e) = reader.read_exact(&mut bytes) {
+                            return Some(Err(io(e)));
+                        }
+                        match String::from_utf8(bytes) {
+                            Ok(s) => row.push(Some(s)),
+                            Err(e) => return Some(Err(LimboError::InternalError(e.to_string()))),
+                        }
+                    }
+                    Ok(None) => {
+                        return Some(Err(LimboError::InternalError(
+                            "COPY FROM: the spill file ended inside a row".to_string(),
+                        )))
+                    }
+                    Err(e) => return Some(Err(e)),
+                }
+            }
+            Some(Ok(row))
+        }))
     }
 }
 
-/// PostgreSQL's answer to a line past its line buffer's limit: 54000 "out of memory".
-fn line_too_long(bytes: usize) -> LimboError {
-    let limit = COPY_LINE_LIMIT.load(std::sync::atomic::Ordering::Relaxed);
+/// PostgreSQL 18.6's answer to a line past its line buffer's limit (54000; review
+/// wire-rev-copystdin2 L2, recorded `limit:1073742000`), with the limit this server has.
+fn line_too_long(limit: usize) -> LimboError {
     LimboError::InvalidArgument(SqlErrorMessage::classified(
         SqlErrorKind::ProgramLimitExceeded,
-        format!("out of memory: a COPY line of {bytes} bytes or more is past the {limit}-byte limit"),
+        format!("string buffer exceeds maximum allowed length ({limit} bytes)"),
     ))
 }
+
 
 /// COPY FROM STDIN, in its two runs ([`CopyStdin`]): with no end set, its target is checked as
 /// PostgreSQL checks it before CopyInResponse (the table and columns, then the options: 42P01,
@@ -4318,10 +4490,7 @@ fn handle_pg_copy_from_stdin(
                 .to_string(),
         )));
     };
-    let (end, loader) = {
-        let state = copy.lock();
-        (state.end.clone(), state.loader.clone())
-    };
+    let end = copy.lock().end.clone();
     let missing = || {
         LimboError::InternalError("COPY FROM STDIN's rows came with no COPY waiting".to_string())
     };
@@ -4343,23 +4512,19 @@ fn handle_pg_copy_from_stdin(
                 message.clone(),
             )))
         }
-        // A piece is read into a copy of the loader, kept only when the piece is read whole: a
-        // run the server repeats (a lock wait's retry, before any row went in) starts from the
-        // same state. Its rows go into the block the server keeps open for the COPY (the
-        // client's, or the implicit one), which a failure fails or rolls back.
+        // The loader is taken for the piece and put back after, never copied. A piece only reads
+        // (no row goes in before the end, [`CopyLoader`]), so a run the server repeats after a
+        // lock wait is the end's insert, which [`CopyLoader::feed`] does again without reading.
         Some(CopyEnd::Chunk(bytes)) | Some(CopyEnd::Done(bytes)) => {
             let last = matches!(end.as_deref(), Some(CopyEnd::Done(_)));
-            let mut loader = loader.ok_or_else(missing)?;
-            // On an error the kept loader stays as it was, for a retry; the next COPY replaces it.
-            loader.feed(pg_conn, bytes, last)?;
-            let mut state = copy.lock();
-            if last {
-                state.loader = None;
-                Ok(loader.rows)
-            } else {
-                state.loader = Some(loader);
-                Ok(0)
+            let mut loader = copy.lock().loader.take().ok_or_else(missing)?;
+            let fed = loader.feed(pg_conn, bytes, last);
+            let rows = loader.rows;
+            if !last || fed.is_err() {
+                copy.lock().loader = Some(loader);
             }
+            fed?;
+            Ok(if last { rows } else { 0 })
         }
     }
 }
@@ -4644,6 +4809,14 @@ enum CopyInput {
     /// checked these at its insert, after every check here, so a varchar's 22001 later in the row
     /// came first (wirefuzz wire-fuzz4 seed 255; recorded, copy-stdin-pg18.txt part 5).
     Numeric(i64, i64),
+    /// boolean, float8 ("double precision") or float4 ("real"), uuid: read as boolin, float8in /
+    /// float4in and uuid_in read them, while the line is read; the engine raised their errors at
+    /// the batch's insert, after a later line's (review wire-rev-copystdin2 M3; recorded
+    /// `order-bool`, `order-float`, `order-uuid`). Other types (date, time, json, ...) are still
+    /// the engine's, at the insert.
+    Boolean,
+    Float(&'static str),
+    Uuid,
 }
 
 fn copy_input_type(col: &turso_core::schema::Column) -> Option<CopyInput> {
@@ -4660,23 +4833,79 @@ fn copy_input_type(col: &turso_core::schema::Column) -> Option<CopyInput> {
         ("int8", _) => Some(CopyInput::Ranged("bigint", i64::MIN.into(), i64::MAX.into())),
         ("varchar", Some(n)) => usize::try_from(n).ok().map(|n| CopyInput::Length(n, false)),
         ("bpchar", Some(n)) => usize::try_from(n).ok().map(|n| CopyInput::Length(n, true)),
+        ("bool", _) => Some(CopyInput::Boolean),
+        ("float8", _) => Some(CopyInput::Float("double precision")),
+        ("float4", _) => Some(CopyInput::Float("real")),
+        ("uuid", _) => Some(CopyInput::Uuid),
         _ => None,
     }
+}
+
+/// A boolean as PostgreSQL's parse_bool_with_len reads it, past white space: any prefix of true,
+/// false, yes, no; on, off and of; 1 and 0; in any case. None for anything else.
+fn pg_boolean(field: &str) -> Option<bool> {
+    let text = field
+        .trim_matches(|c: char| matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c'))
+        .to_ascii_lowercase();
+    let prefix = |word: &str| !text.is_empty() && word.starts_with(text.as_str());
+    match text.as_bytes().first()? {
+        b't' if prefix("true") => Some(true),
+        b'f' if prefix("false") => Some(false),
+        b'y' if prefix("yes") => Some(true),
+        b'n' if prefix("no") => Some(false),
+        b'o' if text == "on" => Some(true),
+        b'o' if text.len() >= 2 && prefix("off") => Some(false),
+        b'1' if text == "1" => Some(true),
+        b'0' if text == "0" => Some(false),
+        _ => None,
+    }
+}
+
+/// A uuid as PostgreSQL's string_to_uuid reads it: an optional `{...}`, 32 hex digits, a hyphen
+/// allowed after any group of 4 but the last, nothing else (no white space): its canonical text.
+fn pg_uuid(field: &str) -> Option<String> {
+    let b = field.as_bytes();
+    let (mut i, braces) = match b.first() {
+        Some(b'{') => (1, true),
+        _ => (0, false),
+    };
+    let mut hex = String::with_capacity(32);
+    for pair in 0..16 {
+        let (a, c) = (*b.get(i)?, *b.get(i + 1)?);
+        if !a.is_ascii_hexdigit() || !c.is_ascii_hexdigit() {
+            return None;
+        }
+        hex.push(a.to_ascii_lowercase() as char);
+        hex.push(c.to_ascii_lowercase() as char);
+        i += 2;
+        if b.get(i) == Some(&b'-') && pair % 2 == 1 && pair < 15 {
+            i += 1;
+        }
+    }
+    if braces {
+        if b.get(i) != Some(&b'}') {
+            return None;
+        }
+        i += 1;
+    }
+    (i == b.len()).then(|| {
+        format!("{}-{}-{}-{}-{}", &hex[0..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..32])
+    })
 }
 
 /// A numeric's text as numeric_in reads it (white space around it, a sign, digits with one
 /// optional point, an optional exponent, PostgreSQL 16's underscores between digits), checked
 /// against numeric(p, s): Ok(true) when it fits once rounded half away from zero to s places,
 /// Ok(false) past it, Err(()) for text that is no numeric. NaN fits; Infinity does not.
-fn numeric_fits(field: &str, p: i64, s: i64) -> std::result::Result<bool, ()> {
+fn numeric_fits(field: &str, p: i64, s: i64) -> std::result::Result<NumericFit, ()> {
     let text = field.trim_matches(|c: char| matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c'));
     let body = text.strip_prefix(['+', '-']).unwrap_or(text);
     let lower = body.to_ascii_lowercase();
     if lower == "nan" && body.len() == text.len() {
-        return Ok(true);
+        return Ok(NumericFit::Fits);
     }
     if lower == "infinity" || lower == "inf" {
-        return Ok(false);
+        return Ok(NumericFit::Overflow);
     }
     let b = body.as_bytes();
     let mut digits: Vec<u8> = Vec::new();
@@ -4697,21 +4926,43 @@ fn numeric_fits(field: &str, p: i64, s: i64) -> std::result::Result<bool, ()> {
     if digits.is_empty() {
         return Err(());
     }
+    // The exponent: a sign, then digits with underscores between them, as numeric_in reads it
+    // (`1e1_0` is 1e10); its size is held to ±2·10^9, past which only its sign matters: far
+    // above, any nonzero digit overflows; far below, the value rounds to 0 (review
+    // wire-rev-copystdin2 L3: PostgreSQL `1e2000000` 22003, `1e-2000000` 0.00; both were 22P02).
     let mut exponent: i64 = 0;
     if i < b.len() {
-        let e = &body[i + 1..];
-        let e = e.strip_prefix('+').unwrap_or(e);
-        exponent = e.parse::<i64>().map_err(|_| ())?;
-        if e.is_empty() || exponent.abs() > 1_000_000 {
+        let e = &b[i + 1..];
+        let (negative, e) = match e.first() {
+            Some(b'-') => (true, &e[1..]),
+            Some(b'+') => (false, &e[1..]),
+            _ => (false, e),
+        };
+        if e.is_empty() || !e[0].is_ascii_digit() || !e[e.len() - 1].is_ascii_digit() {
             return Err(());
         }
+        for (k, &c) in e.iter().enumerate() {
+            match c {
+                b'0'..=b'9' => {
+                    exponent = (exponent * 10 + i64::from(c - b'0')).min(2_000_000_000);
+                }
+                b'_' if e[k + 1].is_ascii_digit() && e[k - 1].is_ascii_digit() => {}
+                _ => return Err(()),
+            }
+        }
+        if negative {
+            exponent = -exponent;
+        }
+    }
+    if !digits.iter().any(|&d| d != 0) {
+        return Ok(NumericFit::Zero);
     }
     // The integer digits end at `int_len` (may be negative or past the digits).
     let mut int_len = point.unwrap_or(digits.len()) as i64 + exponent;
     // Round half away from zero at s places.
     let keep = int_len + s;
     if keep < 0 {
-        return Ok(true);
+        return Ok(NumericFit::Zero);
     }
     if (keep as usize) < digits.len() {
         let round_up = digits[keep as usize] >= 5;
@@ -4737,7 +4988,22 @@ fn numeric_fits(field: &str, p: i64, s: i64) -> std::result::Result<bool, ()> {
     // The integer part's digits past its leading zeros.
     let leading_zeros = digits.iter().take_while(|&&d| d == 0).count() as i64;
     let significant = int_len - leading_zeros.min(int_len.max(0));
-    Ok(significant <= p - s)
+    if significant > p - s {
+        return Ok(NumericFit::Overflow);
+    }
+    if digits.iter().all(|&d| d == 0) {
+        return Ok(NumericFit::Zero);
+    }
+    Ok(NumericFit::Fits)
+}
+
+/// [`numeric_fits`]'s answer: the value fits as written, rounds to 0 (stored as `0`, which the
+/// engine reads whatever the exponent was: `1e-2000000` was its 22003 "value overflows numeric
+/// format"), or overflows.
+enum NumericFit {
+    Fits,
+    Zero,
+    Overflow,
 }
 
 /// Why [`pg_integer`] refused a field: its syntax (22P02) or its range (22003).
@@ -4843,9 +5109,75 @@ impl CopyInput {
                     ),
                 }
             }
+            CopyInput::Boolean => match pg_boolean(field) {
+                Some(value) => {
+                    let canonical = if value { "true" } else { "false" };
+                    Ok((field != canonical).then(|| canonical.to_string()))
+                }
+                None => refuse(
+                    SqlErrorKind::InvalidTextRepresentation,
+                    format!("invalid input syntax for type boolean: \"{field}\""),
+                ),
+            },
+            CopyInput::Uuid => match pg_uuid(field) {
+                Some(canonical) => Ok((field != canonical).then_some(canonical)),
+                None => refuse(
+                    SqlErrorKind::InvalidTextRepresentation,
+                    format!("invalid input syntax for type uuid: \"{field}\""),
+                ),
+            },
+            CopyInput::Float(ty) => {
+                // float8in / float4in: leading and trailing white space, then strtod's number,
+                // NaN or [+-]Infinity / inf in any case; past the type's range 22003 (one that
+                // rounds to 0 from nonzero digits, too). A hex float (strtod's 0x) is left to the
+                // engine, as is NaN, which this engine holds no value for.
+                let text = field.trim_matches(|c: char| {
+                    matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c')
+                });
+                let body = text.trim_start_matches(['+', '-']);
+                if body.len() >= 2 && body[..2].eq_ignore_ascii_case("0x")
+                    || body.eq_ignore_ascii_case("nan")
+                {
+                    return Ok(None);
+                }
+                let infinite_word = body.eq_ignore_ascii_case("infinity")
+                    || body.eq_ignore_ascii_case("inf");
+                let (finite, zero) = if *ty == "real" {
+                    match text.parse::<f32>() {
+                        Ok(v) => (v.is_finite(), v == 0.0),
+                        Err(_) => (false, false),
+                    }
+                } else {
+                    match text.parse::<f64>() {
+                        Ok(v) => (v.is_finite(), v == 0.0),
+                        Err(_) => (false, false),
+                    }
+                };
+                let parsed = if *ty == "real" {
+                    text.parse::<f32>().is_ok()
+                } else {
+                    text.parse::<f64>().is_ok()
+                };
+                if !parsed || body.is_empty() || body.starts_with(['+', '-']) {
+                    return refuse(
+                        SqlErrorKind::InvalidTextRepresentation,
+                        format!("invalid input syntax for type {ty}: \"{field}\""),
+                    );
+                }
+                let mantissa = body.split(['e', 'E']).next().unwrap_or("");
+                let nonzero = mantissa.bytes().any(|c| (b'1'..=b'9').contains(&c));
+                if (!finite && !infinite_word) || (zero && nonzero) {
+                    return refuse(
+                        SqlErrorKind::NumericValueOutOfRange,
+                        format!("\"{field}\" is out of range for type {ty}"),
+                    );
+                }
+                Ok((text != field).then(|| text.to_string()))
+            }
             CopyInput::Numeric(p, s) => match numeric_fits(field, *p, *s) {
-                Ok(true) => Ok(None),
-                Ok(false) => refuse(
+                Ok(NumericFit::Fits) => Ok(None),
+                Ok(NumericFit::Zero) => Ok((field != "0").then(|| "0".to_string())),
+                Ok(NumericFit::Overflow) => refuse(
                     SqlErrorKind::NumericValueOutOfRange,
                     "numeric field overflow".to_string(),
                 ),

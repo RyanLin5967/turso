@@ -130,17 +130,26 @@ enum Eol {
 /// `bsnewline`, `dotnotalone`, `escapedcr`, parts 6 `S3` .. `dotcrnl`). The lines were cut at
 /// each LF with a CR before it dropped, so a bare CR was data, mixed ends loaded and CR-only data
 /// was one line (review wire-rev-copystdin M2).
+///
+/// The reader keeps its place: bytes it has scanned and found no line end in are not scanned
+/// again when more data comes ([`CopyLines::split`] resumes where it stopped), so a line of L bytes
+/// arriving in pieces costs O(L). Each piece rescanned the unfinished line from its start, O(L² /
+/// 64 KiB) (review wire-rev-copystdin2 H1).
 #[derive(Clone, Debug, Default)]
 pub struct CopyLines {
     eol: Option<Eol>,
     /// `\.` was read: the rest of the data is not read.
     ended: bool,
+    /// Where the next scan resumes in the caller's buffer (after it drained the bytes the last
+    /// split consumed): the unfinished line's bytes before it hold no line end.
+    resume: usize,
 }
 
 impl CopyLines {
     /// The complete lines at the front of `buf` (byte ranges, their ends cut off) and how many
-    /// bytes they take; the rest is an unfinished line, for the caller to hold until more data
-    /// comes. With `last` (the data ends at `buf`'s end) the rest is the last line.
+    /// bytes they take; the rest is an unfinished line, for the caller to keep at the front of the
+    /// buffer it passes next time, with the new data after it. With `last` (the data ends at
+    /// `buf`'s end) the rest is the last line. Scanning starts where the last call stopped.
     pub fn split(
         &mut self,
         buf: &[u8],
@@ -151,28 +160,32 @@ impl CopyLines {
             return Ok((lines, buf.len()));
         }
         let literal = |what: &str| Err(bad_format(format!("literal {what} found in data")));
-        let (mut start, mut i) = (0, 0);
+        let not_alone = || Err(bad_format("end-of-copy marker is not alone on its line".to_string()));
+        let start_at = self.resume.min(buf.len());
+        let (mut start, mut i) = (0, start_at);
+        // Where to resume: at the end of the data, or at a byte whose meaning the next one decides.
+        let mut stop = buf.len();
         while i < buf.len() {
             match buf[i] {
                 b'\\' if buf.get(i + 1) == Some(&b'.') => {
                     if i != start {
-                        return Err(bad_format(
-                            "end-of-copy marker is not alone on its line".to_string(),
-                        ));
+                        return not_alone();
                     }
                     let after = i + 2;
                     let end = match (buf.get(after), buf.get(after + 1)) {
-                        (None, _) if !last => return Ok((lines, start)),
+                        (None, _) if !last => {
+                            stop = i;
+                            break;
+                        }
                         (None, _) => None,
                         (Some(b'\n'), _) => Some(Eol::Nl),
-                        (Some(b'\r'), None) if !last => return Ok((lines, start)),
+                        (Some(b'\r'), None) if !last => {
+                            stop = i;
+                            break;
+                        }
                         (Some(b'\r'), Some(b'\n')) => Some(Eol::CrNl),
                         (Some(b'\r'), _) => Some(Eol::Cr),
-                        _ => {
-                            return Err(bad_format(
-                                "end-of-copy marker is not alone on its line".to_string(),
-                            ))
-                        }
+                        _ => return not_alone(),
                     };
                     if let (Some(style), Some(end)) = (self.eol, end) {
                         if style != end {
@@ -183,13 +196,15 @@ impl CopyLines {
                         }
                     }
                     self.ended = true;
+                    self.resume = 0;
                     return Ok((lines, buf.len()));
                 }
                 // The escaped byte is data: ASCII (a newline, a CR, the delimiter) or the lead
                 // byte of a character, whose continuation bytes are never special.
                 b'\\' => {
                     if i + 1 == buf.len() && !last {
-                        return Ok((lines, start));
+                        stop = i;
+                        break;
                     }
                     i += 2;
                 }
@@ -197,7 +212,8 @@ impl CopyLines {
                     let next = buf.get(i + 1).copied();
                     if next.is_none() && !last && self.eol != Some(Eol::Cr) {
                         // CR or CRLF: the next byte decides.
-                        return Ok((lines, start));
+                        stop = i;
+                        break;
                     }
                     let style = match self.eol {
                         Some(style) => style,
@@ -231,10 +247,13 @@ impl CopyLines {
                 _ => i += 1,
             }
         }
+        // An escape's second byte may sit past the end (i jumped by 2): resume at the end.
+        let stop = stop.min(buf.len()).max(start);
         if last && start < buf.len() {
             lines.push(start..buf.len());
             start = buf.len();
         }
+        self.resume = stop.max(start) - start;
         Ok((lines, start))
     }
 }

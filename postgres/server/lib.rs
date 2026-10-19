@@ -1234,11 +1234,20 @@ async fn serve_session(
                     } else {
                         warn!("session ended before startup: the client's stream ended");
                     }
+                } else if matches!(socket.get_ref(),
+                    pgwire::tokio::server::MaybeTls::Blocking(io) if io.timed_out)
+                {
+                    // A started session has no read deadline: a read that timed out is a bug
+                    // (a socket timeout left set), never the client's end.
+                    error!("session ended: a read timed out on a session with no read deadline");
+                } else {
+                    info!("session ended: the client's stream ended");
                 }
                 break Ok(());
             }
         };
         if matches!(msg, PgWireFrontendMessage::Terminate(_)) {
+            info!("session ended: Terminate");
             break Ok(());
         }
         if let Some(info) = refused_before_startup(&socket.state(), &msg) {
@@ -1425,6 +1434,9 @@ async fn serve_session(
             }
         }
     };
+    if let Err(e) = &result {
+        warn!("session ended: {e}");
+    }
     // The session's branch and in-use entry go first; the socket closes when it drops below.
     session.end();
     drop(socket);
@@ -1716,9 +1728,10 @@ struct SessionState {
 /// is in, which runs after it as in PostgreSQL (`statements[next + 1..]`, `multi` when the Query
 /// held more than one statement and so runs in an implicit block), the CopyData not yet read
 /// (under [`COPY_PIECE`] bytes: each piece is loaded as it fills, [`Session::copy_end`]), and
-/// whether an Execute started it (the extended protocol, which ends at Sync). The COPY runs in a
-/// block from its first run to its end, the implicit one begun for it outside any other, so its
-/// pieces load atomically and hold the engine's write lock between messages (postgres/COMPAT.md).
+/// whether an Execute started it (the extended protocol, which ends at Sync). A piece is read, not
+/// inserted: the rows go in at the COPY's end (turso_pg's CopyLoader), so a COPY holds the
+/// engine's write lock across its client's waits only when the block it runs in already does
+/// (postgres/COMPAT.md).
 struct PendingCopy {
     statements: Vec<String>,
     next: usize,
@@ -2294,13 +2307,12 @@ impl Session {
             let result = self.run(sql, None, None, &Format::UnifiedText);
             self.after_implicit(sql, result.is_err());
             let mut responses = Replies::new();
-            // A COPY FROM STDIN that asks for its rows: CopyInResponse, the rest after them. Outside
-            // a block it runs in an implicit one, begun now, so its pieces load atomically.
+            // A COPY FROM STDIN that asks for its rows: CopyInResponse, the rest after them. A lone
+            // COPY opens no block: its rows go in at its end, in a transaction of their own
+            // (turso_pg's CopyLoader), so it holds no lock while its client sends (review
+            // wire-rev-copystdin2 M2: an implicit block begun here held the write lock from the
+            // first batch to CopyDone).
             if let (Ok(_), Some(columns)) = (&result, self.copy_asked()) {
-                if let Err(e) = self.begin_implicit(sql, None, false) {
-                    responses.push(with_notices(Response::Error(e)));
-                    return responses;
-                }
                 responses.push(with_notices(copy_in_response(columns)));
                 let timeout = self.copy_timeout_ms();
                 self.state().copy_in =
@@ -2708,7 +2720,7 @@ impl Session {
         self.lock_timeout_ms
             .store(conn.lock_timeout_ms(), Ordering::Relaxed);
         // A CancelRequest or statement_timeout stops this statement (dropped at its end).
-        let _interrupts = self.interrupts.begin(conn.statement_timeout_ms());
+        let armed = self.interrupts.begin(conn.statement_timeout_ms());
         self.min_messages
             .store(conn.min_messages_rank(), Ordering::Relaxed);
         let in_tx = !conn.inner().get_auto_commit();
@@ -2881,6 +2893,12 @@ impl Session {
                 })
             }
         };
+        // The statement is over: a cancel or a timeout is for it alone. Disarmed before the undo
+        // below (a failed block's rollback, mark_block_reads): armed, the cancel that stopped the
+        // statement stopped its rollback too, which broke the connection, and the session's next
+        // statement ended it with 08006 (review wire-rev-copystdin2 M1: a cancel during a
+        // streaming COPY, 3 trials in 6).
+        drop(armed);
         // The frontend could not undo a failed statement: the connection's state is unknown, so the
         // session ends (FATAL 08006, which serve_session ends the session on) instead of serving
         // more statements on it (wire review 2 item 1). Read from the connection's flag, not the
