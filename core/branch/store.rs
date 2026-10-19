@@ -15729,6 +15729,68 @@ mod group_tests {
 }
 
 #[cfg(test)]
+mod gather_cut_tests {
+    use super::*;
+
+    /// engine-2bdcd32c6 MED 10 (engine-rev-qaf-fix2 MED 1's fix shipped without a killing test): a
+    /// waiter that may not wait out a cohort gather (a trunk commit's barrier, holding the trunk's
+    /// WAL write lock: `NO_GATHER`) cuts another thread's gather short. A leader is made to gather
+    /// with a bound of 10 s (its cohort larger than the waiters, its flight times 100 s); a barrier
+    /// waiting for the same bytes must be done well inside that bound. Mutant
+    /// `barrier_waits_out_gather`: it waits the gather out.
+    #[test]
+    fn a_barrier_cuts_another_threads_gather_short() {
+        const BOUND: Duration = Duration::from_secs(10);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gather.db");
+        let store = Arc::new(
+            BranchStore::open(BranchDurability::Durable { sync: SyncClass::Fsync }, None, path.to_str().unwrap()).unwrap(),
+        );
+        let lsn = {
+            let mut inner = store.inner.lock();
+            // A fresh store starts its files at its first create; started here instead.
+            inner.ensure_backing(4096, &store.group).unwrap();
+            let journal = inner.journal.as_mut().expect("premise: a started store has its journal");
+            journal.buffer(&Record::Clock { now_ms: 1 }).unwrap();
+            journal.lsn()
+        };
+        assert!(store.group.durable(SyncClass::Fsync) < lsn, "premise: the record is not durable yet");
+        {
+            let mut g = store.group.lock();
+            g.cohort = 8;
+            g.flight_times = [u64::try_from(BOUND.as_nanos()).unwrap() * 10; FLIGHT_TIMES];
+            g.flights_timed = FLIGHT_TIMES as u64;
+            assert_eq!(g.gather_bound(), BOUND, "premise: the gather's bound");
+        }
+        let leader = {
+            let store = store.clone();
+            std::thread::spawn(move || store.wait_durable(lsn, SyncClass::Fsync))
+        };
+        let started = Instant::now();
+        while !store.group.lock().gathering {
+            assert!(started.elapsed() < Duration::from_secs(5), "premise: the leader gathers");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let barrier = {
+            let store = store.clone();
+            std::thread::spawn(move || {
+                let _no_gather = NoGather::set(true);
+                let t = Instant::now();
+                let r = store.wait_durable(lsn, SyncClass::Fsync);
+                (r, t.elapsed())
+            })
+        };
+        let (waited, took) = barrier.join().unwrap();
+        leader.join().unwrap().unwrap();
+        waited.unwrap();
+        assert!(
+            took < BOUND / 2,
+            "CLAIM: the barrier cut the gather short; it waited {took:?} of the gather's {BOUND:?}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod compaction_wait_tests {
     use super::*;
 

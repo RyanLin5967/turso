@@ -16434,3 +16434,49 @@ fn a_close_with_the_flusher_mid_flight_releases_the_log_and_keeps_its_create() {
          log was released and the create kept: {reopened:?}"
     );
 }
+
+/// engine-2bdcd32c6 MED 10 (engine-rev-qaf-fix2 MED 5's fix shipped without a killing test): an
+/// async create from the trunk does not wait out a trunk commit inside its commit gate (ASYNC-DESIGN
+/// §5 step 19); the branch's readers do, in `settle`. A trunk commit is held at
+/// `HOLD_TRUNK_DECIDED` while another connection creates async: the create must return while the
+/// commit is still held. Mutant `async_waits_trunk_commit`: it waits for the commit's publication,
+/// as a D2 create does.
+#[test]
+fn an_async_create_does_not_wait_out_a_trunk_commit_inside_its_gate() {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    let _s = serial();
+    let class = if cfg!(target_vendor = "apple") { SyncClass::FullFsync } else { SyncClass::Fsync };
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("async-gate.db"), opts(true, class));
+    let a = db.connect().unwrap();
+    seed(&a);
+    // A live child first: the trunk's first child is forked under the WAL write lock instead.
+    let warm = a.create_branch_async("warm").unwrap();
+    db.branch_wait_durable(warm.token).unwrap();
+    let hold = db.branches.trunk_commit_hold.clone();
+    hold.store(super::store::HOLD_TRUNK_DECIDED, Ordering::Release);
+    let writer = {
+        let a = a.clone();
+        std::thread::spawn(move || a.execute("UPDATE t SET v = 'held' WHERE id = 7").map(|_| ()))
+    };
+    wait_hold(&hold, super::store::HOLD_TRUNK_DECIDED);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let creator = {
+        let db = db.clone();
+        std::thread::spawn(move || {
+            let b = db.connect().unwrap();
+            let _ = tx.send(b.create_branch_async("behind").map(|c| c.id));
+        })
+    };
+    let while_held = rx.recv_timeout(Duration::from_secs(5));
+    let still_held = hold.load(Ordering::Acquire) == super::store::HOLD_TRUNK_DECIDED | super::store::HOLD_ARRIVED;
+    hold.store(0, Ordering::Release);
+    writer.join().unwrap().unwrap();
+    creator.join().unwrap();
+    assert!(still_held, "premise: the trunk commit was held throughout");
+    assert!(
+        matches!(while_held, Ok(Ok(_))),
+        "CLAIM: the async create returned while the trunk commit was held in its gate: {while_held:?}"
+    );
+}
