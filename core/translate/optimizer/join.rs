@@ -1114,7 +1114,32 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
     // The DP algorithm has O(2^n) complexity which becomes prohibitively slow
     // beyond ~12 tables. The greedy algorithm is O(n²) and produces good
     // (though not always optimal) plans.
-    let where_terms = build_where_term_info(where_clause, table_references, subqueries)?;
+    let mut where_terms = build_where_term_info(where_clause, table_references, subqueries)?;
+    // An equality one side of which is a value of a custom type comparing by function (numeric's
+    // numeric_eq, a domain's base type's) compares through it in a nested loop
+    // (`find_custom_type_operator`), but a hash join hashes and compares its keys plainly, so it
+    // keys no hash join (third review of the fe-rev2bd-types fixes, item 1: numeric(8, 2) =
+    // numeric(8, 3) found no pair, '0.50' against '0.500'). Mutant `typed_equality_hash_joined`
+    // (test builds only): it does, as before.
+    if !crate::branch::store::fe_mutant("typed_equality_hash_joined") {
+        for (term, info) in where_clause.iter().zip(where_terms.iter_mut()) {
+            let turso_parser::ast::Expr::Binary(lhs, _, rhs) = &term.expr else {
+                continue;
+            };
+            let compares_by_type = |side: &turso_parser::ast::Expr| {
+                crate::translate::order_by::expr_custom_type(side, table_references, schema).is_some_and(|(type_def, _)| {
+                    schema
+                        .operator_type_of(&type_def)
+                        .operators()
+                        .iter()
+                        .any(|o| o.op == "=" && o.func_name.is_some())
+                })
+            };
+            if info.equal_tables.is_some() && (compares_by_type(lhs) || compares_by_type(rhs)) {
+                info.equal_tables = None;
+            }
+        }
+    }
     if num_tables > GREEDY_JOIN_THRESHOLD {
         return compute_greedy_join_order(
             joined_tables,
