@@ -246,6 +246,18 @@ def selftest():
         bad += not cond
         n += 1
 
+    # comp-rev-9bc7d894a LOW 4: a row's label names the statements its specs time. Variant (b) times PREREG N7's USE
+    # switch since 35f8a4130, so its label must say USE, never the checkout it timed before (read from the specs
+    # themselves: each (b) spec's second timed step)
+    here = os.path.dirname(os.path.abspath(__file__))
+    for row in ROWS:
+        if not str(row[1]).startswith("(b) "):
+            continue
+        for spec in (s for s in row[3:5] if s):
+            steps = [ln for ln in open(os.path.join(here, "loadgen", "specs", spec + ".spec")) if ln.startswith("step ")]
+            sw = steps[1].split(None, 2)[2].strip() if len(steps) > 1 else ""
+            ok(f"(b) label {row[1]!r} names {spec}'s switch {sw!r}",
+               sw.startswith("USE ") and "USE" in row[1] and "checkout" not in row[1].lower())
     reg = {"pg18-d2": "18.6", "dolt": "2.4.1", "doltgres": "1.4.0"}
     first = {"pg18-d2": "postgres (PostgreSQL) {} (Ubuntu 18.6-1.pgdg24.04+2)", "dolt": "dolt version {}",
              "doltgres": "Doltgres version {}"}
