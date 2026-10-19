@@ -4411,7 +4411,9 @@ fn relation_name_taken(pg_conn: &Arc<PgConnectionInner>, schema: &str, table: &s
         let schema = pg_conn.conn.current_schema();
         return schema.get_table(name).is_some()
             || schema.get_view(name).is_some()
-            || schema.indexes.values().flatten().any(|i| i.name.eq_ignore_ascii_case(name));
+            || schema.indexes.values().flatten().any(|i| i.name.eq_ignore_ascii_case(name))
+            // A sequence is a relation too (wire-rev-2a68496d0 M2: an index took a sequence's name).
+            || schema.sequences.keys().any(|k| k.eq_ignore_ascii_case(name));
     }
     let sql = catalog::sqlite_text(format!(
         "SELECT 1 FROM {}.sqlite_schema WHERE name = {} COLLATE NOCASE",

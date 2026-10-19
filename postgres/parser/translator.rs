@@ -1386,7 +1386,17 @@ impl PostgreSQLTranslator {
                 .index_params
                 .iter()
                 .filter_map(|p| match &p.node {
-                    Some(Node::IndexElem(e)) => Some(if e.name.is_empty() { "expr".to_string() } else { e.name.clone() }),
+                    // An expression is named as FigureIndexColname names it: a function by its name, a
+                    // cast by its operand's name, anything without one (an operator) "expr"
+                    // (wire-rev-2a68496d0 M2; recorded).
+                    Some(Node::IndexElem(e)) => Some(if !e.name.is_empty() {
+                        e.name.clone()
+                    } else {
+                        match e.expr.as_deref().map(figure_colname) {
+                            Some(name) if name != "?column?" => name,
+                            _ => "expr".to_string(),
+                        }
+                    }),
                     _ => None,
                 })
                 .collect();
