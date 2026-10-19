@@ -1421,7 +1421,7 @@ struct Parsed {
     scan: ParamScan,
     params: OnceLock<Vec<Type>>,
     columns: OnceLock<Vec<(String, Type)>>,
-    /// How many Binds this statement has had ([`Parsed::custom_binds`]), shared by its clones (a
+    /// How many plans this statement has had ([`Parsed::count_plan`]), shared by its clones (a
     /// portal's copy of the statement is the statement).
     binds: Arc<std::sync::atomic::AtomicU32>,
 }
@@ -1463,10 +1463,17 @@ impl Parsed {
         }
     }
 
-    /// Count a Bind of this statement and return its number (1 for the first): PostgreSQL plans a
-    /// named statement custom for its first five Binds ([`Session::on_bind`]).
-    fn custom_binds(&self) -> u32 {
-        self.binds.fetch_add(1, std::sync::atomic::Ordering::Relaxed).saturating_add(1)
+    /// The number this statement's next plan would have (1 for the first): PostgreSQL plans a
+    /// statement custom for its first five plans ([`Session::on_bind`]).
+    fn next_plan(&self) -> u32 {
+        self.binds.load(std::sync::atomic::Ordering::Relaxed).saturating_add(1)
+    }
+
+    /// Count a plan of this statement: a Bind that passed its checks. A refused Bind built no
+    /// plan, so it is not counted, as num_custom_plans counts only plans built
+    /// (wire-rev-cfdebc06d LOW-1).
+    fn count_plan(&self) {
+        self.binds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Fix the statement's parameter types at the first call, and refuse any later call whose
@@ -4603,19 +4610,21 @@ impl ExtendedQueryHandler for Session {
                 .map_err(PgWireError::UserError)?;
             if params.len() == portal.parameters.len() {
                 decode_portal_parameters(&portal, &params)?;
-                // A custom plan coerces each assignment at Bind; PostgreSQL 18.6 plans the
-                // unnamed statement custom at every Bind and a named one custom for its first five
-                // Binds, then generic, which coerces at Execute (wire-rev-629f4b926 MED-2; the
-                // probe's #50-#57). BLIND SPOT: PostgreSQL's choice from the sixth Bind is by cost
-                // (a generic plan costlier than the customs' average stays custom) and by
-                // plan_cache_mode; here it is always generic from the sixth.
-                if portal.statement.id.is_empty() || portal.statement.statement.custom_binds() <= 5 {
+                // A custom plan coerces each assignment at Bind; PostgreSQL 18.6 plans a
+                // statement, the unnamed one included, custom for its first five plans, then
+                // generic, which coerces at Execute (wire-rev-629f4b926 MED-2, the probe's #50-#57;
+                // wire-rev-cfdebc06d LOW-2, #92: the unnamed statement parsed once and bound seven
+                // times). BLIND SPOT: PostgreSQL's choice from the sixth plan is by cost (a generic
+                // plan costlier than the customs' average stays custom) and by plan_cache_mode;
+                // here it is always generic from the sixth.
+                if portal.statement.statement.next_plan() <= 5 {
                     let assignments = self.described_assignments(&portal.statement.statement.sql);
                     if !assignments.is_empty() {
                         let conn = self.current(&mut self.state()).map_err(PgWireError::UserError)?;
-                        check_assignments(&conn, &portal, &assignments)?;
+                        check_assignments(&conn, &portal, &params, &assignments)?;
                     }
                 }
+                portal.statement.statement.count_plan();
             }
         }
         // A named portal lives until its Close or its transaction's end: binding the name again
@@ -5666,14 +5675,18 @@ fn bind_portal_parameters_limited(
 fn check_assignments(
     conn: &PgConnection,
     portal: &Portal<Parsed>,
+    types: &[Type],
     assignments: &[(turso_pg::AssignSource, turso_pg::AssignTarget)],
 ) -> PgWireResult<()> {
     use turso_pg::{AssignSource, AssignTarget};
-    // A parameter's value as the client sent it, in text format: what PostgreSQL's input function
-    // reads. BLIND SPOT: a binary-format value is not judged here (the engine's column type judges
-    // it at Execute).
+    // A parameter's value as the client sent it: what PostgreSQL's input function reads. The binary
+    // form of text, varchar and char is the value's UTF-8 bytes, so it is judged as the text form
+    // is (wire-rev-cfdebc06d MED-1: Npgsql and asyncpg bind binary). BLIND SPOT: a binary value
+    // of any other type is not judged here (the engine's column type judges it at Execute).
     let sent = |i: usize| -> Option<&str> {
-        if portal.parameter_format.is_binary(i) {
+        if portal.parameter_format.is_binary(i)
+            && !types.get(i).is_some_and(|t| *t == Type::TEXT || *t == Type::VARCHAR || *t == Type::BPCHAR)
+        {
             return None;
         }
         portal.parameters.get(i)?.as_ref().and_then(|b| std::str::from_utf8(b).ok())
