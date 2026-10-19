@@ -15542,6 +15542,60 @@ fn setval_and_pg_database_size_type_their_parameters() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// Found by the wire differential fuzzer against PostgreSQL 18.6 (wirefuzz, uwrun wire-fuzz3-1 on
+/// iccad2; PG's answers in the findings' pg_answer): an INSERT naming a column the table does not
+/// have is refused 42601 "table t0 has no column named c1" (the engine's parse error), where
+/// PostgreSQL answers 42703 'column "c1" of relation "t0" does not exist'. Owner: fastest-engine
+/// (the kind must come from the engine's error, never from its text).
+#[test]
+fn an_insert_naming_a_missing_column_is_42703() {
+    let dir = Scratch::new("insert-42703");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE t0 (id int PRIMARY KEY, c0 double precision)").ok("t0");
+    let mut wrong = Vec::new();
+    let sql = "INSERT INTO t0 (id, c0, c1) VALUES (12, 3.0, 'ab')";
+    for (protocol, r) in [("simple", a.q(sql)), ("extended", a.x(sql, &[]))] {
+        if r.error.as_ref().map(|e| e.code.as_str()) != Some("42703") {
+            wrong.push(format!("{protocol} {sql}: {:?}, PostgreSQL 42703", r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Found by the wire differential fuzzer against PostgreSQL 18.6 (wirefuzz, wire-fuzz3-1 on
+/// iccad2): sum over a NUMERIC(6, 2) column holding 0.00 and NULL answers '0' where PostgreSQL
+/// answers '0.00' (a numeric sum keeps its operands' scale), and an UPDATE assigning 10000 to a
+/// NUMERIC(6, 2) column is refused by PostgreSQL even when no row matches (22003 "numeric field
+/// overflow": the constant is coerced when the statement is planned), where here it answers
+/// UPDATE 0. Owner: fastest-engine (core's numeric type).
+#[test]
+fn a_numeric_sum_keeps_its_scale_and_an_overflowing_constant_is_22003() {
+    let dir = Scratch::new("numeric-sum-scale");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE TABLE t0 (id int PRIMARY KEY, c0 numeric(6,2))",
+        "INSERT INTO t0 (id, c0) VALUES (1, 0)",
+        "INSERT INTO t0 (id, c0) VALUES (2, NULL)",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    let sql = "SELECT sum(c0), min(c0), max(c0) FROM t0";
+    let r = a.q(sql);
+    let want = vec![vec![Some("0.00".to_string()), Some("0.00".to_string()), Some("0.00".to_string())]];
+    if r.error.is_some() || r.rows != want {
+        wrong.push(format!("{sql}: rows {:?} error {:?}, PostgreSQL {want:?}", r.rows, r.error));
+    }
+    let sql = "UPDATE t0 SET c0 = 10000 WHERE id = 3";
+    let r = a.q(sql);
+    if r.error.as_ref().map(|e| e.code.as_str()) != Some("22003") {
+        wrong.push(format!("{sql}: tags {:?} error {:?}, PostgreSQL 22003", r.tags, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-uw2 N5: a schema-qualified type was refused 42704 'type "public m" does not exist',
 /// its parts joined with a blank, so a pg_dump restore, which writes public.<type> for every enum
 /// and domain column, failed at its first such table. PostgreSQL 18.6 takes public.m and
