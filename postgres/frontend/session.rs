@@ -4305,10 +4305,11 @@ fn refuse_copy_options(stmt: &PgCopyFromStmt) -> Result<()> {
         );
     }
     if "\\.abcdefghijklmnopqrstuvwxyz0123456789".contains(delimiter) {
-        let mut text = String::from("COPY delimiter cannot be \"");
-        text.push_str(delimiter);
-        text.push('"');
-        return refuse(SqlErrorKind::InvalidParameterValue, text);
+        // "COPY {what}", as "COPY {what} is not supported" is built: a client message, which the
+        // quoting guard (engine_text_from_any_literal_is_quoted_by_the_one_quoting_function)
+        // reads as hand-quoted SQL when a COPY-led literal holds the quotes.
+        let what = format!("delimiter cannot be \"{delimiter}\"");
+        return refuse(SqlErrorKind::InvalidParameterValue, format!("COPY {what}"));
     }
     if null.contains(delimiter) {
         return refuse(
