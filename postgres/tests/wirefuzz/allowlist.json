@@ -63,5 +63,14 @@
   "stop": true,
   "known_red": "a_numeric_sum_keeps_its_scale_and_an_overflowing_constant_is_22003",
   "reason": "PostgreSQL refuses an overflowing numeric constant at plan time even when no row matches; here UPDATE 0 (owner fastest-engine); the states may differ, so the sequence stops"
+ },
+ {
+  "id": "bare-numeric-literal-3.0",
+  "aspect": "rows",
+  "pg": "[[\"3.0\"]]",
+  "ours": "[[\"3\"]]",
+  "tid": "T_CONST",
+  "known_red": "a_negative_zero_literal_is_written_as_postgresql_writes_it",
+  "reason": "the generator's literal 3.0 is numeric '3.0' in PostgreSQL and the engine's REAL '3' here (the bare-NUMERIC divergence; owner fastest-engine); a constant, so both states agree"
  }
 ]
