@@ -203,5 +203,13 @@ rec("partial", copy(c, "COPY c4 (v) FROM STDIN", [("data", b"\\303(\n")]))
 rec("headerbs", copy(c, "COPY c4 (id) FROM STDIN (HEADER)", [("data", b"a\\\nb\n7\n")]))
 rec("c4rows", q(c, "SELECT id, s, v, v IS NULL, length(v) FROM c4 ORDER BY id"))
 rec("rawnul", copy(c, "COPY c4 (v) FROM STDIN", [("data", b"x\0y\n")]))
+# Part 5 (wirefuzz wire-fuzz4 seed 255): the first failing column in a row is the one reported,
+# numeric(p,s) overflow among them.
+rec("setup5", q(c, "DROP TABLE IF EXISTS t0; CREATE TABLE t0 (id int PRIMARY KEY, c0 numeric(6,2)); ALTER TABLE t0 ADD COLUMN c1 varchar(5)"))
+rec("numfirst", copy(c, "COPY t0 (id, c0, c1) FROM STDIN", [("data", b"6\t1234.567\tZz\n7\t10000\tabcdef\n")]))
+rec("varfirst", copy(c, "COPY t0 (id, c1, c0) FROM STDIN", [("data", b"7\tabcdef\t10000\n")]))
+rec("numround", copy(c, "COPY t0 (id, c0) FROM STDIN", [("data", b"8\t9999.995\n")]))
+rec("numok", copy(c, "COPY t0 (id, c0) FROM STDIN", [("data", b"9\t9999.994\n10\t-0.005\n11\t1e3\n")]))
+rec("t0rows", q(c, "SELECT id, c0 FROM t0 ORDER BY id"))
 rec("unexpected", copy(c, "COPY cs (id) FROM STDIN", [("query", "SELECT 1")]))
 rec("after", q(C(), "SELECT count(*) FROM cs"))
