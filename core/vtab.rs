@@ -343,6 +343,7 @@ static VTAB_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 /// `DROP TABLE` committed (`ExtVirtualTable::destroy_when_unused`): a connection whose schema, or a
 /// program or cursor of whose, still holds the table never sees it freed (engine-rev-qaf-fix MED-7:
 /// the dropping connection destroyed it at its commit, checking only its own schemas).
+#[derive(Debug)]
 struct ExtTable {
     implementation: Arc<VTabModuleImpl>,
     ptr: AtomicPtr<c_void>,
