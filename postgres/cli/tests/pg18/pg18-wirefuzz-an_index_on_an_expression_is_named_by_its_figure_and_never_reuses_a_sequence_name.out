@@ -1,0 +1,30 @@
+>> Q CREATE TABLE ix(a int, b text)
+   C CREATE TABLE
+   Z I
+>> Q CREATE INDEX ON ix (lower(b))
+   C CREATE INDEX
+   Z I
+>> Q CREATE INDEX ON ix ((a::text))
+   C CREATE INDEX
+   Z I
+>> Q CREATE INDEX ON ix ((b || 'x'))
+   C CREATE INDEX
+   Z I
+>> Q CREATE SEQUENCE ix_b_idx
+   C CREATE SEQUENCE
+   Z I
+>> Q CREATE INDEX ON ix (b)
+   C CREATE INDEX
+   Z I
+>> Q DROP INDEX ix_lower_idx
+   C DROP INDEX
+   Z I
+>> Q DROP INDEX ix_a_idx
+   C DROP INDEX
+   Z I
+>> Q DROP INDEX ix_expr_idx
+   C DROP INDEX
+   Z I
+>> Q DROP INDEX ix_b_idx1
+   C DROP INDEX
+   Z I

@@ -12425,6 +12425,13 @@ replays_postgresql!(
     "pg18-wirefuzz-pg_database_size_reads_an_oid_as_postgresql_reads_one.out",
     []
 );
+// wire-rev-2a68496d0 M2: an expression index column is named as FigureIndexColname names it (lower(b) lower, a::text a,
+// an operator expr), and a sequence's name is taken like any relation's.
+replays_postgresql!(
+    pg18_wirefuzz_an_index_on_an_expression_is_named_by_its_figure_and_never_reuses_a_sequence_name_replays_as_postgresql_answered,
+    "pg18-wirefuzz-an_index_on_an_expression_is_named_by_its_figure_and_never_reuses_a_sequence_name.out",
+    []
+);
 replays_postgresql!(
     pg18_wirefuzz_the_connected_database_is_current_database_and_in_pg_database_replays_as_postgresql_answered,
     "pg18-wirefuzz-the_connected_database_is_current_database_and_in_pg_database.out",
