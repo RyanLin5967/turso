@@ -105,7 +105,9 @@ impl Connection {
             // Every id at or below this is durable. Conservative until the durable-fork watermark
             // lands (ASYNC-DESIGN §4 `durable_fork_id`): this create's own id when its records are
             // durable already, else the trunk's.
-            durable_through: if store.fork_status(id) == Some(true) { id } else { BranchId::TRUNK },
+            // Read without the store mutex (engine-rev-qaf-fix2 LOW 7: fork_status took a third hold
+            // per async create).
+            durable_through: if store.durable_at(lsn) { id } else { BranchId::TRUNK },
         })
     }
 }

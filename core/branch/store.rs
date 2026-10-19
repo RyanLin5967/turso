@@ -1509,6 +1509,8 @@ pub(crate) struct AsyncThreads {
     /// Each thread with the process that started it (a fork(2) child joins none of its parent's).
     threads: Mutex<Vec<(u32, crate::thread::ThreadId, crate::thread::JoinHandle<()>)>>,
     started: AtomicBool,
+    /// Whether the store is a durable catalog store (`async_refusal`), read once.
+    durable_catalog: std::sync::OnceLock<bool>,
 }
 
 /// `branch-async-flusher` (ASYNC-DESIGN §6.1): every POLL, once the oldest async acknowledgement
@@ -7830,8 +7832,13 @@ impl BranchStore {
         if self.async_threads.ctl.stop.load(Ordering::Acquire) {
             return Some("the branch store's async threads are stopped");
         }
-        let inner = self.inner.lock();
-        if inner.files.is_none() || !(inner.catalog_mode || inner.cat.is_some()) {
+        // Whether the store is a durable catalog store does not change after open: read under the
+        // store mutex once, not per create (engine-rev-qaf-fix2 LOW 7).
+        let catalog = *self.async_threads.durable_catalog.get_or_init(|| {
+            let inner = self.inner.lock();
+            inner.files.is_some() && (inner.catalog_mode || inner.cat.is_some())
+        });
+        if !catalog {
             return Some("an async create needs a durable catalog store");
         }
         None
@@ -7923,6 +7930,11 @@ impl BranchStore {
     pub(crate) fn fork_status(&self, id: BranchId) -> Option<bool> {
         let fork_lsn = self.inner.lock().branches.get(&id).map(|st| st.fork_lsn)?;
         Some(self.group.durable(self.class) >= fork_lsn)
+    }
+
+    /// Whether the log's first `lsn` bytes are durable in the store's class (no lock).
+    pub(crate) fn durable_at(&self, lsn: u64) -> bool {
+        self.group.durable(self.class) >= lsn
     }
 
     /// The log's end now (LEAP L1, `Database::branch_sync`): 0 for a volatile store.
@@ -9087,7 +9099,13 @@ impl BranchStore {
             let Some(st) = inner.branches.get(&id) else {
                 return Ok(());
             };
-            if st.async_ack && self.group.poisoned() && st.fork_lsn > self.group.durable(self.class) {
+            // Mutant `lost_async_found` (test builds only, engine-rev-qaf-fix2 LOW 10): found, as at
+            // the stub.
+            if st.async_ack
+                && self.group.poisoned()
+                && st.fork_lsn > self.group.durable(self.class)
+                && !fe_mutant("lost_async_found")
+            {
                 return Err(branch_create_lost(id));
             }
             let gate = self.trunk_commits.load(Ordering::Acquire);

@@ -1611,9 +1611,18 @@ fn others_blocked_refuses_when_a_threads_stat_cannot_be_read() {
             std::hint::spin_loop();
         }
     });
+    // Reset on every exit, a panic included (engine-rev-qaf-fix2 LOW 4: the global hook stayed set
+    // for the rest of the process if others_blocked panicked).
+    struct Unset;
+    impl Drop for Unset {
+        fn drop(&mut self) {
+            STAT_UNREADABLE_FOR_TEST.store(false, Relaxed);
+        }
+    }
+    let unset = Unset;
     STAT_UNREADABLE_FOR_TEST.store(true, Relaxed);
     let read = others_blocked();
-    STAT_UNREADABLE_FOR_TEST.store(false, Relaxed);
+    drop(unset);
     spinner_stop.store(true, Relaxed);
     spinner.join().unwrap();
     assert_eq!(read, None, "CLAIM: unreadable thread states refuse the probe");

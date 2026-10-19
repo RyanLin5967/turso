@@ -89,7 +89,9 @@ pub(crate) struct BranchTable<T: Preimage> {
     /// Directory reallocations, and the chunk pointers they moved (observation only).
     dir_grows: u64,
     dir_moved: u64,
-    /// Chunks allocated since the table was made (r13-compose I6, observation only).
+    /// Chunks the table has put to use since it was made, taken from the pool or allocated inline
+    /// (r13-compose I6; LEAP L2(b)'s pool_low gates on it being non-zero, so a table that never held a
+    /// branch keeps no spares). Not an allocation count since the pool (engine-rev-qaf-fix2 LOW 14).
     chunk_allocs: u64,
     /// LEAP L2(b)'s pool: emptied or pre-allocated chunks and segments, at most `CHUNK_POOL` and
     /// `SEG_POOL` (their capacity is reserved at `new`, so keeping one never allocates).
