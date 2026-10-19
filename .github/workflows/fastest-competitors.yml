@@ -90,6 +90,8 @@ jobs:
           timeout 120 bash fastest/linux/gates/run_selftest.sh python3 -B fastest/linux/competitors/spec_lint.py selftest    # comp review 1 MED 6
           timeout 120 bash fastest/linux/gates/run_selftest.sh python3 -B fastest/linux/gates/sweeper_record.py selftest  # MED 12: the shared reader
           timeout 120 bash fastest/linux/gates/run_selftest.sh python3 -B fastest/linux/competitors/raw_schema.py selftest  # the one raw.tsv schema
+          timeout 120 bash fastest/linux/gates/run_selftest.sh python3 -B fastest/linux/competitors/reduce.py selftest  # comp-rev-89ec-b3c3 MED 3, LOW 5
+          timeout 60 bash fastest/linux/gates/run_selftest.sh bash fastest/linux/gates/test_sweeper_cpu.sh  # comp-rev-89ec-b3c3 LOW 19
           timeout 600 bash fastest/linux/competitors/plant_real.sh "$RUNNER_TEMP/plant-real"
           # the drive class (SMOKE erratum E3): known answers, then drive.py live on this runner's own disk, kept with
           # the build's hardware record. Not a gate: the cells' disk is each run job's, recorded and refused there.
