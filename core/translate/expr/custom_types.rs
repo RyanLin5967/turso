@@ -234,9 +234,14 @@ fn derived_operand_info(
     }
     // By the values it yields (`expr_value_type`): a CAST that yields its type's ENCODE (numeric's
     // blob) is not an operand of the type's operators, which refuse a blob (review of this lane's
-    // fixes, item 1).
-    let (type_def, _) =
-        crate::translate::order_by::expr_value_type(expr, referenced_tables?, resolver.schema())?;
+    // fixes, item 1). Mutant `unapplied_cast_typed` (test builds only): `expr_custom_type`, as
+    // before.
+    let typed = if crate::branch::store::fe_mutant("unapplied_cast_typed") {
+        crate::translate::order_by::expr_custom_type
+    } else {
+        crate::translate::order_by::expr_value_type
+    };
+    let (type_def, _) = typed(expr, referenced_tables?, resolver.schema())?;
     Some(ExprCustomTypeInfo {
         type_name: type_def.name.to_lowercase(),
         column: None,
