@@ -89,7 +89,17 @@ def lit(v, ty):
 def gen(seed, n):
     """The sequence for `seed`: a list of statements {tid, lit, sql, params, copy, turso_only, ordered}."""
     rnd = random.Random(seed)
-    tables, seq, ids, state = {}, [], {}, {"tx": False, "sp": []}
+    tables, seq, ids, state = {}, [], {}, {"tx": False, "sp": [], "snap": None, "sp_snap": {}}
+    # The schema as of BEGIN and as of each savepoint, restored on ROLLBACK and ROLLBACK TO, so a column or table
+    # added in a rolled-back block is not used afterwards (wire-rev-2a68496d0 L10: 60 INSERTs into a column that no
+    # longer existed).
+    snap = lambda: ({t: list(c) for t, c in tables.items()}, dict(ids), tcount[0])
+
+    def restore(sn):
+        tables.clear()
+        tables.update({t: list(c) for t, c in sn[0].items()})
+        ids.clear()
+        ids.update(sn[1])
     tcount = [0]
 
     def add(tid, lit_sql, sql=None, params=None, copy=None, turso_only=False, ordered=False):
@@ -177,7 +187,7 @@ def gen(seed, n):
             add("T_DROP", "DROP TABLE %s" % t)
         elif r < 0.88:
             if not state["tx"]:
-                state["tx"], state["sp"] = True, []
+                state["tx"], state["sp"], state["snap"], state["sp_snap"] = True, [], snap(), {}
                 add("T_BEGIN", "BEGIN")
             else:
                 k = rnd.random()
@@ -186,14 +196,17 @@ def gen(seed, n):
                     add("T_COMMIT", "COMMIT")
                 elif k < 0.55:
                     state["tx"] = False
+                    restore(state["snap"])
                     add("T_ROLLBACK", "ROLLBACK")
                 elif k < 0.75:
                     sp = "s%d" % len(state["sp"])
                     state["sp"].append(sp)
+                    state["sp_snap"][sp] = snap()
                     add("T_SAVEPOINT", "SAVEPOINT %s" % sp)
                 elif state["sp"]:
                     sp = rnd.choice(state["sp"])
                     if k < 0.9:
+                        restore(state["sp_snap"][sp])
                         add("T_ROLLBACK_TO", "ROLLBACK TO SAVEPOINT %s" % sp)
                     else:
                         state["sp"] = state["sp"][:state["sp"].index(sp)]
