@@ -15795,3 +15795,26 @@ fn diag_the_create_that_allocates_megabytes_under_the_store_mutex() {
         }
     });
 }
+
+/// engine-rev-qaf-fix HIGH-1 (F7's regression, no red until now): capture into an engine-made c1
+/// (v2), then a switch to 'full,C1' names the same table in another case. It must keep c1's version
+/// (no second version row in another case) and keep writing the v2 layout into it: both writes of t
+/// are rows naming t. bc6bbaeda made the existence check case-blind, so the switch found the table,
+/// found no version row under 'C1', pinned V1 as for a legacy table, and wrote v1-layout rows into
+/// the v2 table (measured by the reviewer: rows [[1,t],[2,""],[3,"2"]]).
+#[test]
+fn a_switch_to_the_capture_table_in_another_case_keeps_its_version_and_layout() {
+    let _g = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("cdc-case2.db"), DatabaseOpts::new());
+    let c = db.connect().unwrap();
+    c.execute("CREATE TABLE t(x)").unwrap();
+    c.execute("PRAGMA capture_data_changes_conn('full,c1')").unwrap();
+    c.execute("INSERT INTO t VALUES (1)").unwrap();
+    c.execute("PRAGMA capture_data_changes_conn('full,C1')").unwrap();
+    c.execute("INSERT INTO t VALUES (2)").unwrap();
+    let versions = adv_rows(&c, "SELECT table_name, version FROM turso_cdc_version ORDER BY table_name").unwrap();
+    assert_eq!(versions, vec![vec!["c1".to_string(), "v2".to_string()]], "CLAIM: one version row, c1's v2, whatever case the switch named it in");
+    let named_t = adv_rows(&c, "SELECT count(*) FROM c1 WHERE table_name = 't'").unwrap();
+    assert_eq!(named_t[0][0], "2", "CLAIM: both writes of t are v2-layout rows naming t");
+}
