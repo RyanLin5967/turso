@@ -199,6 +199,16 @@ def selftest():
            check_after_tm1(run_c("c_late", [(0, 0, "measure", 1, 0, tm1c, tm1c + 900)], closed)) != [])
         ok("after-tm1, open loop: a row intended at tm1 but claimed before it is refused",
            check_after_tm1(run_c("o_late", [(0, 0, "measure", 1, 0, tm1c - 900, tm1c)], dict(closed, loop="open"))) != [])
+        # comp-rev-89ec-b3c3 LOW 4: c_late is refused by an intended-time rule too (intended tm1 + 900); this row is
+        # claimed at tm1 and intended before it, so only the claim rule refuses it
+        ok("after-tm1, closed loop: a row claimed at tm1 but intended before it is refused (only the claim rule can)",
+           check_after_tm1(run_c("c_late2", [(0, 0, "measure", 1, 0, tm1c, tm1c - 1)], closed)) != [])
+        # ... and a run that measured nothing passes neither check (a zero-collected pass)
+        ok("after-tm1: a run with no measured row is refused",
+           check_after_tm1(run_c("c_empty", [(0, 0, "warmup", 1, 0, t0 + 1, t0 + 2)], closed)) != [])
+        ok("same: two runs with no measured row are refused",
+           check_same(run_c("e1", [(0, 0, "warmup", 1, 0, t0 + 1, t0 + 2)], closed),
+                      run_c("e2", [(0, 0, "warmup", 1, 0, t0 + 1, t0 + 2)], closed)) != [])
     print(f"TALLY ran={n} pass={n - bad} na=0 fail={bad}")  # gates/tally.py (linux-rev-uw2 MED 1)
     print(f"sched_check selftest: {n - bad}/{n}")
     return 1 if bad else 0
