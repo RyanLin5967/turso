@@ -3591,7 +3591,20 @@ impl PostgreSQLTranslator {
                             over_clause: None,
                         },
                     };
-                    return Ok(call("numeric_decode", vec![call("numeric_encode", vec![*expr, lit(p), lit(s)])]));
+                    // ... and read back as a REAL, so it sorts, compares and aggregates as a number:
+                    // numeric_decode alone is TEXT to the engine, which ordered 10.00 before 2.50 and
+                    // filtered and aggregated as strings (wire-rev-2a68496d0 H1, a silent regression
+                    // of dc853383a). The value keeps the cast's rounding and overflow; its text and
+                    // type are the engine's REAL's (2.5, float8) until the engine's typed CAST
+                    // (437f337be) reaches the wire (a registered divergence).
+                    return Ok(ast::Expr::Cast {
+                        expr: Box::new(call("numeric_decode", vec![call("numeric_encode", vec![*expr, lit(p), lit(s)])])),
+                        type_name: Some(ast::Type {
+                            name: "REAL".to_string(),
+                            size: None,
+                            array_dimensions: 0,
+                        }),
+                    });
                 }
                 let type_name = match type_cast.type_name.as_ref() {
                     Some(t) => pg_type_name_to_ast_type(t).or_else(|| self.engine_type(t)),

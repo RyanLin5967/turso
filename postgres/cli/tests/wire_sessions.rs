@@ -12350,7 +12350,15 @@ replays_postgresql!(
 replays_postgresql!(
     pg18_wirefuzz_a_cast_to_numeric_sorts_filters_and_aggregates_as_a_number_replays_as_postgresql_answered,
     "pg18-wirefuzz-a_cast_to_numeric_sorts_filters_and_aggregates_as_a_number.out",
-    []
+    [
+        (13, "PGDIV-NUMERIC-CAST-FLOAT8 value [wire]: a CAST to NUMERIC(p,s) is computed and typed as the engine's REAL (701, '2.5, 10') where PG types it 1700 with its scale ('2.50, 10.00'); it sorts and compares as a number (wire-rev-2a68496d0 H1); numeric waits for the engine's typed CAST (437f337be)"),
+        (14, "PGDIV-NUMERIC-CAST-FLOAT8 value [wire]: a CAST to NUMERIC(p,s) is computed and typed as the engine's REAL (701, '123456.78, 2.5') where PG types it 1700 with its scale ('123456.78, 2.50'); it sorts and compares as a number (wire-rev-2a68496d0 H1); numeric waits for the engine's typed CAST (437f337be)"),
+        (15, "PGDIV-NUMERIC-TYPMOD-CODE value [engine]: NUMERIC(2,-1), a negative scale PG 15+ accepts (123 rounds to 120), is refused 23000 by the engine's numeric_encode"),
+        (16, "PGDIV-NUMERIC-TYPMOD-CODE error-code [engine]: NUMERIC(1001,2) is refused 23000 (the engine's numeric_encode, a Constraint error) where PG answers 22023"),
+        (17, "PGDIV-NUMERIC-TYPMOD-CODE error-code [engine]: NUMERIC(2,5) is refused 23000 'scale must not exceed precision' where PG accepts the type and answers 22003 numeric field overflow"),
+        (18, "PGDIV-NUMERIC-CAST-FLOAT8 value [wire]: a CAST to NUMERIC(p,s) is computed and typed as the engine's REAL (701, '2, 4, 6') where PG types it 1700 with its scale ('2.00, 4.00, 6.00'); it sorts and compares as a number (wire-rev-2a68496d0 H1); numeric waits for the engine's typed CAST (437f337be)"),
+        (19, "PGDIV-NUMERIC-CAST-FLOAT8 value [wire]: a CAST to NUMERIC(p,s) is computed and typed as the engine's REAL (701, '2.5') where PG types it 1700 with its scale ('2.50'); it sorts and compares as a number (wire-rev-2a68496d0 H1); numeric waits for the engine's typed CAST (437f337be)"),
+    ]
 );
 replays_postgresql!(
     pg18_wirefuzz_the_connected_database_is_current_database_and_in_pg_database_replays_as_postgresql_answered,
@@ -12371,6 +12379,10 @@ replays_postgresql!(
     pg18_wirefuzz_a_cast_to_numeric_p_s_and_a_numeric_domain_column_are_numeric_replays_as_postgresql_answered,
     "pg18-wirefuzz-a_cast_to_numeric_p_s_and_a_numeric_domain_column_are_numeric.out",
     [
+        (1, "PGDIV-NUMERIC-CAST-FLOAT8 value [wire]: a CAST to NUMERIC(p,s) is computed and typed as the engine's REAL (701, '1.5') where PG types it 1700 with its scale ('1.50'); it sorts and compares as a number (wire-rev-2a68496d0 H1); numeric waits for the engine's typed CAST (437f337be)"),
+        (2, "PGDIV-NUMERIC-CAST-FLOAT8 value [wire]: a CAST to NUMERIC(p,s) is computed and typed as the engine's REAL (701, '1.5') where PG types it 1700 with its scale ('1.50'); it sorts and compares as a number (wire-rev-2a68496d0 H1); numeric waits for the engine's typed CAST (437f337be)"),
+        (3, "PGDIV-NUMERIC-CAST-FLOAT8 value [wire]: a CAST to NUMERIC(p,s) is computed and typed as the engine's REAL (701, '1.01') where PG types it 1700 with its scale ('1.01'); it sorts and compares as a number (wire-rev-2a68496d0 H1); numeric waits for the engine's typed CAST (437f337be)"),
+        (4, "PGDIV-NUMERIC-CAST-FLOAT8 value [wire]: a CAST to NUMERIC(p,s) is computed and typed as the engine's REAL (701, '123456.79') where PG types it 1700 with its scale ('123456.79'); it sorts and compares as a number (wire-rev-2a68496d0 H1); numeric waits for the engine's typed CAST (437f337be)"),
         (8, "PGDIV-NUMERIC-DOMAIN value [engine]: a domain over NUMERIC(8,2) is the engine's REAL: 1.5 typed 701 where PG says 1.50 typed 1700 (core's CREATE DOMAIN takes no base type parameters; engine f4683e89d adds them, unmerged)"),
     ]
 );

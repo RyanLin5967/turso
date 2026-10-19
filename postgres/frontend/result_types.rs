@@ -437,12 +437,9 @@ fn expression_type(node: &PgNode) -> Option<u32> {
                 .ok()?;
                 return array_of(element);
             }
-            // A cast to NUMERIC(p, s) is the engine's exact numeric (the translator encodes and
-            // decodes it): numeric, as in PostgreSQL (wire-rev-uw3 MED-4). A bare NUMERIC is the
-            // engine's REAL and stays its type.
-            if turso_pg_parser::translator::numeric_cast_size(type_name).is_some() {
-                return Some(NUMERIC);
-            }
+            // A cast to NUMERIC(p, s) is announced as the engine computes it, a REAL (float8): its
+            // value is rounded to the scale and read back as a REAL so it sorts as a number
+            // (wire-rev-2a68496d0 H1); numeric (1700) waits for the engine's typed CAST.
             return match type_name.names.last()?.node.as_ref()? {
                 Node::String(s) if s.sval == "bool" => Some(BOOL),
                 Node::String(s) if s.sval == "float4" => Some(FLOAT4),
@@ -2304,6 +2301,11 @@ fn cast_type(cast: &turso_pg_parser::pg_query::protobuf::TypeCast) -> Option<u32
     let type_name = cast.type_name.as_ref()?;
     if !type_name.array_bounds.is_empty() {
         return None;
+    }
+    // A cast to NUMERIC(p, s) is computed as a REAL (the translator, wire-rev-2a68496d0 H1), and
+    // typed as what is computed: float8, as an aggregate over it is.
+    if turso_pg_parser::translator::numeric_cast_size(type_name).is_some() {
+        return Some(FLOAT8);
     }
     let name = match type_name.names.last()?.node.as_ref()? {
         Node::String(s) => s.sval.as_str(),
