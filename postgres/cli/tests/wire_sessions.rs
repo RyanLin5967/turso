@@ -15225,9 +15225,6 @@ fn pg_database_size_of_a_database_that_does_not_exist_is_3d000() {
     let dir = Scratch::new("dbsize");
     let server = Server::start(&dir.db(), &[]);
     let mut a = server.connect();
-    // A table and a row, so the files hold pages (a fresh, empty database here is 0 bytes on disk).
-    a.q("CREATE TABLE t(x int)").ok("t");
-    a.q("INSERT INTO t VALUES (1)").ok("row");
     let mut wrong = Vec::new();
     match a.q("SELECT pg_database_size('microbench')").error {
         Some(e) if e.code == "3D000" && e.message == "database \"microbench\" does not exist" => {}
