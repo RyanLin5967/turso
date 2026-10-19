@@ -15245,6 +15245,54 @@ fn pg_database_size_of_a_database_that_does_not_exist_is_3d000() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// Found by the wire differential fuzzer against PostgreSQL 18.6 (wirefuzz, uwrun wire-fuzz1 on
+/// iccad11 and wire-fuzz2 on iccad2 at 72a36c7dd; artie lanes/wire/raw/wire-fuzz1 and wire-fuzz2,
+/// PG's answers in each finding's pg_answer): a smallint column was announced int4 (23) where
+/// PostgreSQL announces int2 (21), bare, under WHERE and in RETURNING; bigint * 2 int4 where PG
+/// says int8 (20); length(varchar) text (25) where PG says int4; numeric(6,2) / 4 float8 (701)
+/// where PG says numeric (1700); min and max over varchar varchar (1043) where PG, which has them
+/// for text only, says text (25); and max over boolean was answered where PG has no such function
+/// (42883 "function max(boolean) does not exist"). Over both protocols.
+#[test]
+fn computed_and_smallint_result_columns_carry_postgresqls_types() {
+    let dir = Scratch::new("fuzz-types");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE TABLE ft(id int PRIMARY KEY, s smallint, b bigint, v varchar(5), n numeric(6,2), f boolean)",
+        "INSERT INTO ft VALUES (1, 7, 9, 'ab', 2.50, true)",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    for (sql, oids) in [
+        ("SELECT s FROM ft ORDER BY id", vec![21u32]),
+        ("SELECT id, s FROM ft WHERE s >= 1 ORDER BY id", vec![23, 21]),
+        ("SELECT id, b * 2 FROM ft ORDER BY id", vec![23, 20]),
+        ("SELECT id, length(v) FROM ft ORDER BY id", vec![23, 23]),
+        ("SELECT id, n / 4 FROM ft ORDER BY id", vec![23, 1700]),
+        ("SELECT count(*), min(v), max(v) FROM ft", vec![20, 25, 25]),
+    ] {
+        for (protocol, r) in [("simple", a.q(sql)), ("extended", a.x(sql, &[]))] {
+            if r.error.is_some() || r.oids != Some(oids.clone()) {
+                wrong.push(format!("{protocol} {sql}: oids {:?} error {:?}, PostgreSQL {oids:?}", r.oids, r.error));
+            }
+        }
+    }
+    let sql = "INSERT INTO ft (id, s) VALUES (2, 3) RETURNING id, s";
+    let r = a.q(sql);
+    if r.error.is_some() || r.oids != Some(vec![23, 21]) {
+        wrong.push(format!("{sql}: oids {:?} error {:?}, PostgreSQL [23, 21]", r.oids, r.error));
+    }
+    let sql = "SELECT count(*), max(f) FROM ft";
+    for (protocol, r) in [("simple", a.q(sql)), ("extended", a.x(sql, &[]))] {
+        if r.error.as_ref().map(|e| e.code.as_str()) != Some("42883") {
+            wrong.push(format!("{protocol} {sql}: rows {:?} error {:?}, PostgreSQL 42883", r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-uw2 N5: a schema-qualified type was refused 42704 'type "public m" does not exist',
 /// its parts joined with a blank, so a pg_dump restore, which writes public.<type> for every enum
 /// and domain column, failed at its first such table. PostgreSQL 18.6 takes public.m and
