@@ -3392,4 +3392,31 @@ mod tests {
         );
         assert!(bad.is_empty(), "CLAIM: a materialized numeric column answered by a probe unlike a scan: {bad:#?}");
     }
+
+    /// Second fresh-context review of this lane's fixes (item 1): since c8c6dd210 a scan compares
+    /// `b + 1 = 3` over numeric(8, 2) through numeric_eq (the value is numeric's text '3.00'), but an
+    /// index on the expression `b + 1` sought the plain key 3 among those texts, and a range on it
+    /// compared text with a number by SQLite's type order: the answer depended on the plan.
+    /// Expected values are PostgreSQL 18.6's for this exact SQL with that index (UW run
+    /// typesrev2bd-oracle6; artie raw frontier/fastest/lanes/engine/raw/pg18-types-rev2bd-5.txt
+    /// 6fbfd1c0d1), never ours, by the index and by a scan (NOT INDEXED).
+    #[test]
+    fn an_index_on_a_numeric_expression_answers_as_a_scan() {
+        let conn = open();
+        for sql in [
+            "CREATE TABLE n(id INTEGER PRIMARY KEY, b numeric(8, 2)) STRICT",
+            "INSERT INTO n VALUES (1, 2.00), (2, 9.00), (3, NULL)",
+            "CREATE INDEX nb1 ON n(b + 1)",
+        ] {
+            conn.execute(sql).unwrap();
+        }
+        let mut bad = Vec::new();
+        for (pred, want) in [("b + 1 = 3", "1"), ("b + 1 = 10", "2"), ("b + 1 > 2", "1;2"), ("b + 1 < 4", "1")] {
+            for from in ["n", "n NOT INDEXED"] {
+                let sql = format!("SELECT id FROM {from} WHERE {pred} ORDER BY id");
+                bad.extend(diverging(&conn, &[(sql.as_str(), want)], "PostgreSQL 18"));
+            }
+        }
+        assert!(bad.is_empty(), "CLAIM: an index on a numeric expression answered unlike a scan: {bad:#?}");
+    }
 }
