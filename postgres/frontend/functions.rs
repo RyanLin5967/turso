@@ -102,16 +102,31 @@ pub(crate) fn exec_scalar(conn: &Connection, name: &str, args: &[Value]) -> Resu
         // the database's. A name is the one database pg_database lists here; any other is
         // PostgreSQL's 3D000 (found by the E5' differential, wire-e5l5-fc85e82fc: every name
         // answered this database's size). An oid is taken as before.
+        // NULL answers NULL, and an oid is pg_database's one oid or 42704, as PostgreSQL 18.6
+        // answers (wire-rev-uw3 LOW-3; recorded, recordings/pg18-dbsize-edges.out).
         "pg_database_size" => {
             let path = conn.db_file_path();
-            if let Some(Value::Text(t)) = args.first() {
-                let name = t.as_str();
-                if name != crate::catalog::db_name_from_path(&path) {
-                    return Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
-                        SqlErrorKind::InvalidCatalogName,
-                        format!("database \"{name}\" does not exist"),
-                    )));
+            match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(Value::Text(t)) => {
+                    let name = t.as_str();
+                    if name != crate::catalog::db_name_from_path(&path) {
+                        return Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
+                            SqlErrorKind::InvalidCatalogName,
+                            format!("database \"{name}\" does not exist"),
+                        )));
+                    }
                 }
+                Some(v) => {
+                    if v.as_int() != Some(crate::catalog::DATABASE_OID) {
+                        let oid = v.as_int().map_or_else(|| v.to_string(), |o| o.to_string());
+                        return Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
+                            SqlErrorKind::UndefinedObject,
+                            format!("database with OID {oid} does not exist"),
+                        )));
+                    }
+                }
+                None => {}
             }
             let size = |p: &str| std::fs::metadata(p).map(|m| m.len() as i64).unwrap_or(0);
             Ok(Value::from_i64(size(&path) + size(&format!("{path}-wal"))))

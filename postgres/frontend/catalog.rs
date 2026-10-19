@@ -1602,6 +1602,9 @@ impl InternalVirtualTableCursor for PgProcCursor {
     }
 }
 
+/// The one database's oid, as pg_database lists it (pg_database_size(oid) answers for it alone).
+pub(crate) const DATABASE_OID: i64 = 16384;
+
 /// Virtual table implementation for pg_catalog.pg_database
 /// Returns one row per database, deriving the name from the database file path.
 #[derive(Debug)]
@@ -1717,7 +1720,7 @@ impl InternalVirtualTableCursor for PgDatabaseCursor {
         self.current_row = 0;
         let db_name = db_name_from_path(self.conn.db_file_path());
         self.rows = vec![vec![
-            Value::from_i64(16384),           // oid
+            Value::from_i64(DATABASE_OID),    // oid
             Value::build_text(db_name),       // datname
             Value::from_i64(10),              // datdba (bootstrap superuser OID)
             Value::from_i64(6),               // encoding (UTF8)
