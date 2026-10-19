@@ -10581,6 +10581,36 @@ pub fn op_function(
                 };
                 state.registers[*dest].set_value(result);
             }
+            ScalarFunc::VarcharEncode => {
+                // varchar(n) (fastest-wire c15466936): the value unchanged when its length, as
+                // length() counts it, is at most n; else PostgreSQL's string_data_right_truncation.
+                // As the CASE it replaces, an n or a length that is NULL refuses too.
+                check_arg_count!(arg_count, 2);
+                let val = state.registers[*start_reg].get_value().clone();
+                let maxlen = state.registers[*start_reg + 1].get_value().clone();
+                let fits = match (&val, &maxlen) {
+                    (Value::Null, _) => true,
+                    (_, Value::Numeric(Numeric::Integer(n))) => {
+                        let len = match &val {
+                            Value::Text(t) => t.as_str().chars().count() as i64,
+                            Value::Blob(b) => b.len() as i64,
+                            other => other.to_string().chars().count() as i64,
+                        };
+                        len <= *n
+                    }
+                    _ => false,
+                };
+                if !fits {
+                    let n = match &maxlen {
+                        Value::Numeric(Numeric::Integer(n)) => n.to_string(),
+                        other => other.to_string(),
+                    };
+                    return Err(LimboError::StringDataRightTruncation(format!(
+                        "value too long for type character varying({n})"
+                    )));
+                }
+                state.registers[*dest].set_value(val);
+            }
             ScalarFunc::NumericEncode => {
                 check_arg_count!(arg_count, 3);
                 let val = &state.registers[*start_reg];

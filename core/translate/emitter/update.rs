@@ -93,6 +93,51 @@ fn rowid_update_info(
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]
+/// PostgreSQL coerces a constant that a SET assigns to its column's type when it plans the
+/// statement (constant folding runs the type's input and length coercions), so a value the type
+/// refuses is refused even when no row matches (fastest-wire c15466936: `UPDATE vc SET v = 'abcdef'
+/// WHERE id = 1` on varchar(5) is 22001 there, UPDATE 0 here). So each SET of a custom-typed column
+/// of a STRICT table (where ENCODE applies) to a non-NULL literal ENCODEs that literal once, here,
+/// before any row is read, into a scratch register; the per-row ENCODE is unchanged. Only literals:
+/// another constant expression is still checked per row. Mutant `update_constant_unchecked` (test
+/// builds only): not here, as before.
+fn emit_update_constant_encodes(program: &mut ProgramBuilder, resolver: &Resolver, plan: &UpdatePlan) -> Result<()> {
+    if crate::branch::store::fe_mutant("update_constant_unchecked") {
+        return Ok(());
+    }
+    let Some(btree) = plan.target_table.table.btree() else {
+        return Ok(());
+    };
+    if !btree.is_strict {
+        return Ok(());
+    }
+    for set in &plan.set_clauses {
+        if !matches!(&*set.expr, ast::Expr::Literal(l) if !matches!(l, ast::Literal::Null)) {
+            continue;
+        }
+        let Some(col) = btree.columns().get(set.column_index) else {
+            continue;
+        };
+        if col.is_array() || col.ty_str.is_empty() {
+            continue;
+        }
+        let Ok(Some(resolved)) = resolver.schema().resolve_type_unchecked(&col.ty_str) else {
+            continue;
+        };
+        if resolved.chain.iter().all(|td| td.encode().is_none()) {
+            continue;
+        }
+        let reg = program.alloc_register();
+        translate_expr(program, None, &set.expr, reg, resolver)?;
+        for td in &resolved.chain {
+            if let Some(encode_expr) = td.encode() {
+                crate::translate::expr::emit_type_expr(program, encode_expr, reg, reg, col, td, resolver)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn emit_program_for_update(
     connection: &Arc<Connection>,
     resolver: &Resolver,
@@ -104,6 +149,7 @@ pub fn emit_program_for_update(
     program
         .flags
         .set_has_statement_conflict(plan.or_conflict.is_some());
+    emit_update_constant_encodes(program, resolver, &plan)?;
 
     // Open an ephemeral table for buffering RETURNING results.
     // All DML completes before any RETURNING rows are yielded to the caller.

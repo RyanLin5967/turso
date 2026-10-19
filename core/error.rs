@@ -89,6 +89,11 @@ pub enum LimboError {
     Raise(turso_parser::ast::ResolveType, String),
     #[error("RaiseIgnore")]
     RaiseIgnore,
+    /// A value too long for its type's declared length (varchar(n)), in PostgreSQL's words: its
+    /// string_data_right_truncation, typed so a server answers it by kind, never by message
+    /// (fastest-wire c15466936, 22001).
+    #[error("{0}")]
+    StringDataRightTruncation(String),
     #[error("Extension error: {0}")]
     ExtensionError(String),
     #[error("integer overflow")]
@@ -186,7 +191,8 @@ impl LimboError {
     /// shell appends after a runtime error message ("... (19)").
     pub fn sqlite_result_code(&self) -> i32 {
         match self {
-            Self::Constraint(_) | Self::ForeignKeyConstraint(_) | Self::Raise(..) => 19,
+            // StringDataRightTruncation: 19, as the RAISE(ABORT) varchar's ENCODE used before it.
+            Self::Constraint(_) | Self::ForeignKeyConstraint(_) | Self::Raise(..) | Self::StringDataRightTruncation(_) => 19,
             Self::Busy | Self::BusySnapshot | Self::StatementsInProgress(_) => 5,
             Self::TableLocked => 6,
             Self::ReadOnly => 8,
@@ -220,6 +226,7 @@ impl LimboError {
                 | Self::InvalidFormatter(_)
                 | Self::IntegerOverflow
                 | Self::TooBig
+                | Self::StringDataRightTruncation(_)
         )
     }
 }

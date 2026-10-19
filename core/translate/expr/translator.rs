@@ -1843,6 +1843,7 @@ pub fn translate_expr(
                         | ScalarFunc::IntToBoolean
                         | ScalarFunc::ValidateIpAddr
                         | ScalarFunc::NumericEncode
+                        | ScalarFunc::VarcharEncode
                         | ScalarFunc::NumericDecode
                         | ScalarFunc::NumericAdd
                         | ScalarFunc::NumericSub

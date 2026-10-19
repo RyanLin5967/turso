@@ -884,6 +884,8 @@ pub enum ScalarFunc {
     ValidateIpAddr,
     // Numeric type functions
     NumericEncode,
+    /// varchar(n)'s ENCODE: the value as it is, or a StringDataRightTruncation past n characters.
+    VarcharEncode,
     NumericDecode,
     NumericAdd,
     NumericSub,
@@ -1013,6 +1015,7 @@ impl Deterministic for ScalarFunc {
             | ScalarFunc::IntToBoolean
             | ScalarFunc::ValidateIpAddr
             | ScalarFunc::NumericEncode
+            | ScalarFunc::VarcharEncode
             | ScalarFunc::NumericDecode
             | ScalarFunc::NumericAdd
             | ScalarFunc::NumericSub
@@ -1161,6 +1164,7 @@ impl Display for ScalarFunc {
             Self::IntToBoolean => "int_to_boolean",
             Self::ValidateIpAddr => "validate_ipaddr",
             Self::NumericEncode => "numeric_encode",
+            Self::VarcharEncode => "varchar_encode",
             Self::NumericDecode => "numeric_decode",
             Self::NumericAdd => "numeric_add",
             Self::NumericSub => "numeric_sub",
@@ -1317,6 +1321,7 @@ impl ScalarFunc {
             | Self::NumericLt
             | Self::NumericEq => &[2],
             Self::NumericEncode => &[3],
+            Self::VarcharEncode => &[2],
             // Array construction / element access
             Self::Array => &[-1], // variable arity
             Self::ArrayElement => &[2],
