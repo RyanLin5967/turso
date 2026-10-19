@@ -1727,7 +1727,7 @@ struct StoreMutex {
     start_due: AtomicBool,
     starter: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
     /// LEAP L2(b): the branch table's pool fell low in a hold, set by that hold's unlock
-    /// (`StoreGuard`'s drop). The background writer refills the pool off the mutex
+    /// (`StoreGuard`'s drop) once its claim of `pool_notified` succeeded. The background writer refills the pool off the mutex
     /// (`BranchStore::refill_table_pool`) at its next wake, and clears it.
     pool_kicked: AtomicBool,
     /// The writer was woken for this refill (`pool_kicker` returned true). The wake is sent under
@@ -1930,11 +1930,20 @@ impl Drop for StoreGuard<'_> {
         // LEAP L2(b): a pool that fell low is flagged, and the writer woken once per refill, never
         // blocking on the group lock (see `StoreMutex::pool_notified`).
         if pool_low {
-            self.store.pool_kicked.store(true, Ordering::Release);
+            // Mutant `pool_kicked_before_claim` (test builds only): flagged before the claim, by
+            // every low unlock, as at da850ed1c.
+            if fe_mutant("pool_kicked_before_claim") {
+                self.store.pool_kicked.store(true, Ordering::Release);
+            }
             #[cfg(test)]
             pause_at(Some(&self.store.pool_claim_hold), HOLD_POOL_CLAIM);
             // Claimed before the kick and given back if the kick could not land (engine-rev-qaf-fix2
             // MED 13: a late `store(true)` after a refill had cleared it left the pool unrefilled).
+            // Flagged only by the unlock whose claim succeeded, after its claim (engine-2bdcd32c6
+            // MED 3: an unlock that flagged, then claimed only after a refill had cleared both, left
+            // the claim set with nothing flagged, so no later unlock woke the writer). An unlock
+            // whose claim fails leaves the flag to the claimant, whose refill reads the pool after
+            // clearing both.
             if !std::thread::panicking()
                 && self
                     .store
@@ -1942,6 +1951,7 @@ impl Drop for StoreGuard<'_> {
                     .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok()
             {
+                self.store.pool_kicked.store(true, Ordering::Release);
                 let kicked = self.store.pool_kicker.get().is_some_and(|kick| kick());
                 if !kicked {
                     self.store.pool_notified.store(false, Ordering::Release);
