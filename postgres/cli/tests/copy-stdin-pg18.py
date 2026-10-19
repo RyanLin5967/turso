@@ -168,5 +168,27 @@ rec("escrows", q(c, "SELECT v, length(v) FROM c1 ORDER BY v"))
 rec("nosuchopt", copy(c, "COPY nosuch FROM STDIN (NOSUCH 1)", [("data", b"1\n")]))
 rec("fromempty", q(c, "COPY cs FROM ''"))
 rec("int4range", copy(c, "COPY cs (id) FROM STDIN", [("data", b"3000000000\n")]))
+# Part 3 (second review, of b74a48d82): quotes before STDIN, FROM STDOUT, non-ASCII escapes,
+# backslash-newline, \. not alone, PostgreSQL 16 integer syntax, option checks, line-by-line order.
+rec("setup3", q(c, "DROP TABLE IF EXISTS \"o'b\", cp3; CREATE TABLE \"o'b\" (v text); CREATE TABLE cp3 (id int PRIMARY KEY, v text)"))
+rec("quote", copy(c, "/* Ryan's load */ COPY cs (id) FROM STDIN", [("data", b"70\n")]))
+rec("quotedname", copy(c, "COPY \"o'b\" FROM STDIN", [("data", b"x\n")]))
+rec("fromstdout", copy(c, "COPY cs (id) FROM STDOUT", [("data", b"71\n")]))
+rec("count", q(c, "SELECT count(*) FROM cs"))
+rec("utf8esc", copy(c, "COPY c1 FROM STDIN", [("data", b"\\303\\251\n")]))
+rec("badbyte", copy(c, "COPY c1 FROM STDIN", [("data", b"\\377\n")]))
+rec("nul", copy(c, "COPY c1 FROM STDIN", [("data", b"\\0\n")]))
+rec("bsnewline", copy(c, "COPY c1 FROM STDIN", [("data", b"a\\\nb\n")]))
+rec("dotnotalone", copy(c, "COPY c1 FROM STDIN", [("data", b"abc\\.\n")]))
+rec("c1rows", q(c, "SELECT v, length(v) FROM c1 WHERE v NOT IN ('', 'AA', 'a\tb', 'x\ty') ORDER BY v"))
+rec("intsyntax", copy(c, "COPY cs (id) FROM STDIN", [("data", b"0x10\n1_000\n")]))
+rec("introws", q(c, "SELECT id FROM cs WHERE id IN (16, 1000) ORDER BY id"))
+rec("int8over", copy(c, "COPY cb (id) FROM STDIN", [("data", b"99999999999999999999\n")]))
+for label, opts in [("delim2", "(DELIMITER ',;')"), ("delimbs", "(DELIMITER E'\\\\')"),
+                    ("delimn", "(DELIMITER 'n')"), ("delimnl", "(DELIMITER E'\\n')"),
+                    ("nullnl", "(NULL E'\\n')"), ("nulldelim", "(DELIMITER ',', NULL 'a,b')"),
+                    ("delimempty", "(DELIMITER '')"), ("delimutf8", "(DELIMITER 'é')")]:
+    rec(label, copy(c, "COPY c1 FROM STDIN " + opts, [("data", b"z\n")]))
+rec("order", copy(c, "COPY cp3 (id) FROM STDIN", [("data", b"1\n1\nx\ty\n")]))
 rec("unexpected", copy(c, "COPY cs (id) FROM STDIN", [("query", "SELECT 1")]))
 rec("after", q(C(), "SELECT count(*) FROM cs"))

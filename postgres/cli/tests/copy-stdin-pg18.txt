@@ -1,7 +1,9 @@
-# Recorded 2026-10-19T02:21:57Z (the raw file's mtime, UTC) on iccad11 by copy-stdin-pg18.py (beside this file; a raw protocol-v3 driver, not pgproto, so not in tests/pg18)
-# against a fresh PostgreSQL 18.6 cluster (/var/tmp/r226lin-wire/pg18/inst/bin, initdb -A trust, user postgres).
+# Recorded 2026-10-19T04:06:35Z (the raw file's mtime, UTC) on iccad11 by copy-stdin-pg18.sh, which runs copy-stdin-pg18.py (both beside this file; a raw protocol-v3 driver, not pgproto, so not in tests/pg18)
+# against a fresh PostgreSQL 18.6 cluster (/var/tmp/r226lin-wire/pg18/inst/bin, initdb -A trust, user postgres), then the three
+# `nofiles` lines through psql as a role without pg_read_server_files.
 # One line per round: every backend message in order (T and S omitted; G: CopyInResponse's format and column formats).
-# Re-recorded with "Part 2" (setup2 .. int4range) added; the rounds before it are byte-identical to the first recording (2026-10-19T01:41:31Z).
+# Part 2 (setup2 .. int4range) and part 3 (setup3 .. order) were added in later recordings; every round before each is
+# byte-identical to the recording before it (2026-10-19T01:41:31Z, 02:21:57Z).
 postgres (PostgreSQL) 18.6
 setup          N 00000 table "cs" does not exist, skipping | C DROP TABLE | C CREATE TABLE | Z I
 copy           G format=0 columns=[0, 0] | C COPY 2 | Z I
@@ -46,6 +48,32 @@ escrows        D ['', '0'] | D ['AA', '2'] | D ['a\tb', '3'] | D ['x\ty', '3'] |
 nosuchopt      E 42P01 relation "nosuch" does not exist | Z I
 fromempty      E 58P01 could not open file "" for reading: No such file or directory | Z I
 int4range      G format=0 columns=[0] | E 22003 value "3000000000" is out of range for type integer | Z I
+setup3         N 00000 table "o'b" does not exist, skipping | N 00000 table "cp3" does not exist, skipping | C DROP TABLE | C CREATE TABLE | C CREATE TABLE | Z I
+quote          G format=0 columns=[0] | C COPY 1 | Z I
+quotedname     G format=0 columns=[0] | C COPY 1 | Z I
+fromstdout     G format=0 columns=[0] | C COPY 1 | Z I
+count          D ['14'] | C SELECT 1 | Z I
+utf8esc        G format=0 columns=[0] | C COPY 1 | Z I
+badbyte        G format=0 columns=[0] | E 22021 invalid byte sequence for encoding "UTF8": 0xff | Z I
+nul            G format=0 columns=[0] | E 22021 invalid byte sequence for encoding "UTF8": 0x00 | Z I
+bsnewline      G format=0 columns=[0] | C COPY 1 | Z I
+dotnotalone    G format=0 columns=[0] | E 22P04 end-of-copy marker is not alone on its line | Z I
+c1rows         D ['a\nb', '3'] | D ['é', '1'] | C SELECT 2 | Z I
+intsyntax      G format=0 columns=[0] | C COPY 2 | Z I
+introws        D ['16'] | D ['1000'] | C SELECT 2 | Z I
+int8over       G format=0 columns=[0] | E 22003 value "99999999999999999999" is out of range for type bigint | Z I
+delim2         E 0A000 COPY delimiter must be a single one-byte character | Z I
+delimbs        E 22023 COPY delimiter cannot be "\" | Z I
+delimn         E 22023 COPY delimiter cannot be "n" | Z I
+delimnl        E 22023 COPY delimiter cannot be newline or carriage return | Z I
+nullnl         E 22023 COPY null representation cannot use newline or carriage return | Z I
+nulldelim      E 22023 COPY delimiter character must not appear in the NULL specification | Z I
+delimempty     E 0A000 COPY delimiter must be a single one-byte character | Z I
+delimutf8      E 0A000 COPY delimiter must be a single one-byte character | Z I
+order          G format=0 columns=[0] | E 22P04 extra data after last expected column | Z I
 unexpected     G format=0 columns=[0] | E 08P01 unexpected message type 0x51 during COPY from stdin | E 08P01 terminating connection because protocol synchronization was lost | <closed>
-after          D ['12'] | C SELECT 1 | Z I
+after          D ['16'] | C SELECT 1 | Z I
 rc=0
+nofiles        COPY nosuch FROM '/x' -> ERROR:  42501: permission denied to COPY from a file
+nofiles        COPY cs (zz) FROM '/x' -> ERROR:  42501: permission denied to COPY from a file
+nofiles        COPY cs FROM '/x' (NOSUCH 1) -> ERROR:  42501: permission denied to COPY from a file
