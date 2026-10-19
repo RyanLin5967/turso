@@ -17,8 +17,8 @@ never compared; one that FAILS is a finding (turso_only_error), since its failur
 alone (an aborted block).
 
 ALLOWLIST (allowlist.json): the known divergences, each an EXACT tuple (aspect, the PostgreSQL value, ours, and
-the template id when the entry names one), never a pattern; each names its registered red test (known_red) and
-its reason, or the run is refused. A divergence that matches an entry is counted under
+the template id), never a pattern; each names its template, the wire-suite test that registers it (known_red, which
+must exist) and its reason, or the run is refused; an entry may also require our answer's tags (ours_tag). A divergence that matches an entry is counted under
 that entry and, unless the entry says "stop", the sequence goes on (a type or tag difference leaves both
 databases in the same state); one that matches none is a FINDING, and the sequence stops there (what follows may
 only cascade from it).
@@ -362,10 +362,15 @@ def diffs(st, pg, tu):
     return out
 
 
-def allowed(allow, st, d):
+def allowed(allow, st, d, ours=None):
+    """The entry matching divergence `d` of statement `st` exactly: aspect, both values, the template, and, when the
+    entry names one, our answer's tags (ours_tag: `UPDATE 0` keeps a no-row entry from absorbing a row that matched
+    and was silently written; wire-rev-2a68496d0 M3)."""
     aspect, pv, tv = d
     for e in allow:
-        if e["aspect"] == aspect and e["pg"] == pv and e["ours"] == tv and e.get("tid", st["tid"]) == st["tid"]:
+        if e["aspect"] == aspect and e["pg"] == pv and e["ours"] == tv and e["tid"] == st["tid"]:
+            if "ours_tag" in e and " | ".join((ours or {}).get("tags", [])) != e["ours_tag"]:
+                continue
             return e
     return None
 
@@ -396,7 +401,7 @@ def run_seq(seq, extended, pg, other, allow, plant=False):
             compared += 1
             stop = False
             for d in diffs(st, ra, rb):
-                e = allowed(allow, st, d)
+                e = allowed(allow, st, d, rb)
                 if e:
                     hits.append(e["id"])
                     stop = stop or e.get("stop", False)
@@ -458,10 +463,22 @@ def main(argv):
     ids = [e["id"] for e in allow]
     if len(set(ids)) != len(ids):
         sys.exit("REFUSED: duplicate allowlist ids")
-    # An entry is a registered known-red divergence: it names its red test and why, or it is refused.
+    # An entry is a registered known-red divergence of ONE template: it names the template, the test that registers
+    # the divergence (a test that exists in the wire suite), and why, or the run is refused (wire-rev-2a68496d0 M3,
+    # L3: an entry with no tid matched every template and absorbed a COPY refusal; a known_red naming no test passed).
+    # The suite beside this tool in the tree, or in a shard's src/ (shard.sh and the W11 kit copy the tool out).
+    suite = [p for p in (os.path.join(HERE, "..", "..", "cli", "tests", "wire_sessions.rs"),
+                         os.path.join(HERE, "..", "src", "postgres", "cli", "tests", "wire_sessions.rs"))
+             if os.path.exists(p)]
+    if allow and not suite:
+        sys.exit("REFUSED: no wire_sessions.rs to check the allowlist's known_red tests against")
+    tests = open(suite[0]).read() if suite else ""
     for e in allow:
-        if not e.get("known_red") or not e.get("reason") or not {"id", "aspect", "pg", "ours"} <= set(e):
-            sys.exit("REFUSED: allowlist entry %r lacks id, aspect, pg, ours, known_red or reason" % e.get("id"))
+        if not e.get("known_red") or not e.get("reason") or not e.get("tid") or not {"id", "aspect", "pg", "ours"} <= set(e):
+            sys.exit("REFUSED: allowlist entry %r lacks id, aspect, pg, ours, tid, known_red or reason" % e.get("id"))
+        name = e["known_red"]
+        if ("fn %s(" % name) not in tests and ("\n    %s,\n" % name) not in tests:
+            sys.exit("REFUSED: allowlist entry %r names no test of the wire suite: %s" % (e["id"], name))
     if a.mode == "replay":
         a.seeds = "%d-%d" % (a.seed, a.seed)
     lo, hi = (int(x) for x in a.seeds.split("-"))
