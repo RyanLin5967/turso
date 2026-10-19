@@ -897,6 +897,8 @@ pub enum ScalarFunc {
     AlterColumnSql,
     NumericDecode,
     NumericAdd,
+    DatePlus,
+    DateMinus,
     NumericSub,
     NumericMul,
     NumericDiv,
@@ -1032,7 +1034,9 @@ impl Deterministic for ScalarFunc {
             | ScalarFunc::NumericMul
             | ScalarFunc::NumericDiv
             | ScalarFunc::NumericLt
-            | ScalarFunc::NumericEq => true,
+            | ScalarFunc::NumericEq
+            | ScalarFunc::DatePlus
+            | ScalarFunc::DateMinus => true,
             ScalarFunc::Array
             | ScalarFunc::ArrayElement
             | ScalarFunc::ArraySetElement
@@ -1178,6 +1182,8 @@ impl Display for ScalarFunc {
             Self::AlterColumnSql => "turso_alter_column_sql",
             Self::NumericDecode => "numeric_decode",
             Self::NumericAdd => "numeric_add",
+            Self::DatePlus => "date_plus",
+            Self::DateMinus => "date_minus",
             Self::NumericSub => "numeric_sub",
             Self::NumericMul => "numeric_mul",
             Self::NumericDiv => "numeric_div",
@@ -1330,7 +1336,9 @@ impl ScalarFunc {
             | Self::NumericMul
             | Self::NumericDiv
             | Self::NumericLt
-            | Self::NumericEq => &[2],
+            | Self::NumericEq
+            | Self::DatePlus
+            | Self::DateMinus => &[2],
             Self::NumericEncode => &[3],
             Self::VarcharEncode => &[2],
             Self::AlterColumnSql => &[7],

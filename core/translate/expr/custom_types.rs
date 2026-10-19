@@ -338,6 +338,43 @@ pub(super) fn find_custom_type_operator(
         }
     };
 
+    // An arithmetic operator a type defines (numeric's '+', date's '-') is that type's
+    // PostgreSQL operator with every operand it can take: its function receives the other
+    // operand as given, whatever it is (a constant, another type's column, a plain column, an
+    // expression), and refuses what PostgreSQL has no operator for (fastest-wire 68f301ef0: date had
+    // none, so `d + 1` added its text as a number; bigint * numeric took the plain '*' and lost the
+    // scale). When only one side's type defines it, that side's; when both do, the left one's. A comparison keeps the rules below
+    // (its operand must be compatible), since an index seek encodes that operand. Mutant
+    // `arithmetic_operand_must_be_compatible` (test builds only): as before.
+    let arithmetic = matches!(
+        op,
+        ast::Operator::Add | ast::Operator::Subtract | ast::Operator::Multiply | ast::Operator::Divide
+    ) && !crate::branch::store::fe_mutant("arithmetic_operand_must_be_compatible");
+    if arithmetic {
+        let defines = |info: &Option<ExprCustomTypeInfo>| {
+            info.as_ref().and_then(|i| {
+                i.type_def
+                    .operators()
+                    .iter()
+                    .find(|o| o.op == op_str)
+                    .and_then(|o| o.func_name.clone())
+            })
+        };
+        let resolved = |func_name: String| ResolvedOperator {
+            func_name,
+            swap_args: false,
+            negate: false,
+            encode_info: None,
+        };
+        match (defines(&lhs_info), defines(&rhs_info)) {
+            // Both sides' types define it (two numerics; or a date and a numeric, which
+            // PostgreSQL has no operator for): the left one's, which refuses an operand it
+            // cannot take rather than answering the plain arithmetic of two texts.
+            (Some(f), _) | (None, Some(f)) => return Some(resolved(f)),
+            (None, None) => {}
+        }
+    }
+
     // Case 1: Both operands are custom type columns of the SAME type.
     if let (Some(ref lhs), Some(ref rhs)) = (&lhs_info, &rhs_info) {
         if lhs.type_name == rhs.type_name {

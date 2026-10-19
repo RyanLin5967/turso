@@ -237,6 +237,59 @@ fn value_to_numeric(val: &Value) -> Result<crate::numeric::decimal::PgNumeric> {
 /// (`value_to_numeric`). Mutant `numeric_operator_reads_blob` (test builds only): read as an
 /// encoding, as before. The range (review 21 MED 10) and the zero's exponent (Codex C25 HIGH 3)
 /// are the type's own (`PgNumeric::new`).
+/// `date_plus` / `date_minus` (the date type's '+' and '-'): a date operand is the type's stored
+/// text, YYYY-MM-DD; a day count is an integer. Mutant `date_arithmetic_as_text` (test builds
+/// only): the date's text added as a number, as before.
+fn date_arithmetic(lhs: &Value, rhs: &Value, minus: bool) -> Result<Value> {
+    use chrono::NaiveDate;
+    if matches!(lhs, Value::Null) || matches!(rhs, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let as_date = |v: &Value| match v {
+        Value::Text(t) => NaiveDate::parse_from_str(t.as_str(), "%Y-%m-%d").ok(),
+        _ => None,
+    };
+    let as_days = |v: &Value| match v {
+        Value::Numeric(Numeric::Integer(i)) => Some(*i),
+        _ => None,
+    };
+    let op = if minus { "-" } else { "+" };
+    let refuse = || {
+        LimboError::InvalidArgument(format!(
+            "operator does not exist: {} {op} {}",
+            date_operand_kind(lhs),
+            date_operand_kind(rhs)
+        ))
+    };
+    let shifted = |d: NaiveDate, days: i64| -> Result<Value> {
+        let moved = chrono::Duration::try_days(days)
+            .and_then(|delta| d.checked_add_signed(delta))
+            .ok_or_else(|| LimboError::InvalidArgument("date out of range".to_string()))?;
+        Ok(Value::build_text(moved.format("%Y-%m-%d").to_string()))
+    };
+    if crate::branch::store::fe_mutant("date_arithmetic_as_text") {
+        let n = |v: &Value| v.to_string().split('-').next().and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+        return Ok(Value::from_i64(if minus { n(lhs) - n(rhs) } else { n(lhs) + n(rhs) }));
+    }
+    match (as_date(lhs), as_date(rhs), as_days(lhs), as_days(rhs), minus) {
+        (Some(d), _, _, Some(n), false) => shifted(d, n),
+        (_, Some(d), Some(n), _, false) => shifted(d, n),
+        (Some(d), _, _, Some(n), true) => shifted(d, n.checked_neg().ok_or_else(refuse)?),
+        (Some(a), Some(b), _, _, true) => Ok(Value::from_i64(a.signed_duration_since(b).num_days())),
+        _ => Err(refuse()),
+    }
+}
+
+fn date_operand_kind(v: &Value) -> &'static str {
+    match v {
+        Value::Text(t) if chrono::NaiveDate::parse_from_str(t.as_str(), "%Y-%m-%d").is_ok() => "date",
+        Value::Numeric(Numeric::Integer(_)) => "integer",
+        Value::Numeric(_) => "numeric",
+        Value::Text(_) => "text",
+        _ => "unknown",
+    }
+}
+
 fn numeric_operand(val: &Value) -> Result<crate::numeric::decimal::PgNumeric> {
     if matches!(val, Value::Blob(_)) && !crate::branch::store::fe_mutant("numeric_operator_reads_blob") {
         return Err(LimboError::Constraint(format!(
@@ -10851,6 +10904,18 @@ pub fn op_function(
                         Value::build_text(res.format())
                     }
                 };
+                state.registers[*dest].set_value(result);
+            }
+            ScalarFunc::DatePlus | ScalarFunc::DateMinus => {
+                // The date type's '+' and '-' (fastest-wire 68f301ef0), PostgreSQL's operators:
+                // date + int4 and int4 + date are date (date_pli, integer_pl_date), date - int4 is
+                // date (date_mii), date - date is the int4 count of days (date_mi). Any other pair
+                // has no operator in PostgreSQL and is refused; NULL in, NULL out.
+                check_arg_count!(arg_count, 2);
+                let lhs = state.registers[*start_reg].get_value().clone();
+                let rhs = state.registers[*start_reg + 1].get_value().clone();
+                let minus = matches!(scalar_func, ScalarFunc::DateMinus);
+                let result = date_arithmetic(&lhs, &rhs, minus)?;
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::NumericLt | ScalarFunc::NumericEq => {

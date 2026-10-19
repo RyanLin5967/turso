@@ -881,7 +881,7 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
         #[cfg(feature = "json")]
         "CREATE TYPE jsonb(value text) BASE blob ENCODE jsonb(value) DECODE json(value)",
         "CREATE TYPE varchar(value text, maxlen integer) BASE text ENCODE varchar_encode(value, maxlen) DECODE value OPERATOR '<'",
-        "CREATE TYPE date(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN date(value) IS NULL THEN RAISE(ABORT, 'invalid date value') ELSE date(value) END DECODE value OPERATOR '<'",
+        "CREATE TYPE date(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN date(value) IS NULL THEN RAISE(ABORT, 'invalid date value') ELSE date(value) END DECODE value OPERATOR '<' OPERATOR '+' date_plus OPERATOR '-' date_minus",
         // ENCODE preserves sub-second precision through strftime + a rtrim pair
         // that strips trailing zeros and the dangling dot, matching PostgreSQL's
         // text format: whole seconds render as `HH:MM:SS` (no .000), trailing

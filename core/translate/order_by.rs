@@ -47,8 +47,9 @@ fn sort_comparator_from_func_name(func_name: &str) -> Option<SortComparatorType>
 /// - a column of a STRICT table of a registered type (its values are read decoded);
 /// - a column of a FROM subquery or view that `JoinedTable::new_subquery` gave its source's type
 ///   (its values are the source's decoded values);
-/// - `+`, `-`, `*` or `/` over such a value whose type defines that operator (the result is that
-///   type's, unconstrained: no parameters, as PostgreSQL's numeric result has typmod -1);
+/// - `+`, `-`, `*` or `/` with an operand whose type defines that operator, the left one first (the
+///   result is that type's, unconstrained: no parameters, as PostgreSQL's numeric result has typmod
+///   -1), except date - date, the day count;
 /// - `min` or `max` of one such argument (`sum` too where the type defines `+`), a parenthesized
 ///   one, and a CAST to a registered type.
 ///
@@ -80,13 +81,30 @@ pub(crate) fn expr_custom_type(
                 ast::Operator::Divide => "/",
                 _ => return None,
             };
-            let (type_def, _) = expr_custom_type(lhs, referenced_tables, schema)
-                .or_else(|| expr_custom_type(rhs, referenced_tables, schema))?;
-            type_def
-                .operators()
-                .iter()
-                .any(|o| o.op == symbol)
-                .then(|| (type_def, std::vec::Vec::new()))
+            // The side whose type defines the operator, the left one first, as
+            // `find_custom_type_operator` dispatches it (fastest-wire 68f301ef0: bigint * numeric is
+            // numeric's, though bigint is the left operand). date - date is the day count, an
+            // integer (PostgreSQL's date_mi), not a date. Mutant `operator_type_left_only` (test
+            // builds only): the left operand's type or nothing, as before.
+            let defines = |t: &std::sync::Arc<crate::schema::TypeDef>| t.operators().iter().any(|o| o.op == symbol);
+            let left = expr_custom_type(lhs, referenced_tables, schema);
+            let right = expr_custom_type(rhs, referenced_tables, schema);
+            if crate::branch::store::fe_mutant("operator_type_left_only") {
+                let (type_def, _) = left.or(right)?;
+                return defines(&type_def).then(|| (type_def, std::vec::Vec::new()));
+            }
+            let is_date = |t: &Option<(std::sync::Arc<crate::schema::TypeDef>, std::vec::Vec<Box<ast::Expr>>)>| {
+                t.as_ref().is_some_and(|(d, _)| {
+                    d.operators().iter().any(|o| o.op == "-" && o.func_name.as_deref() == Some("date_minus"))
+                })
+            };
+            if symbol == "-" && is_date(&left) && is_date(&right) {
+                return None;
+            }
+            let (type_def, _) = left
+                .filter(|(t, _)| defines(t))
+                .or_else(|| right.filter(|(t, _)| defines(t)))?;
+            Some((type_def, std::vec::Vec::new()))
         }
         ast::Expr::Parenthesized(inner) if inner.len() == 1 => {
             expr_custom_type(&inner[0], referenced_tables, schema)
