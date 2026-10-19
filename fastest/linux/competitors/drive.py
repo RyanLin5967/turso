@@ -303,15 +303,36 @@ def resolve(mnt, sysfs="/sys", devof=dev_of, mountof=mount_of):
             "flush_reaches_drive": flush, "flush_why": why}
 
 
+# comp-rev-89ec-b3c3 MED 4: the drive classes and flush verdicts a REAL run may stand on (an allowlist)
+REAL_CLASSES = ("write-through", "write-back+fua", "write-back-no-fua")
+REAL_FLUSH = ("yes", "n/a: write-through")
+
+
 def real_problem(r):
-    """Comp review 1 LOW 35: why a REAL run (run_system.sh FT_DRY=0) may not run on the record R's storage (None = it
-    may): a volatile RAM disk, or a loop device anywhere in the chain (a file on another filesystem, whose flush is an
-    fsync of that file: not the drive the class names)."""
-    if r.get("drive_class") == "ram-volatile":
+    """Comp review 1 LOW 35 and comp-rev-89ec-b3c3 MED 4: why a REAL run (run_system.sh FT_DRY=0) may not run on the
+    record R's storage (None = it may). An ALLOWLIST: R must carry drive_class, flush_reaches_drive and chain; the class
+    must be one of REAL_CLASSES (not ram-volatile: nothing survives power; not a value this code does not know); the
+    flush must reach the drive, or the leaf be write-through (REAL_FLUSH: not "no", barriers off or a write-through
+    layer, and not "unknown", the drive's own report unread); and no loop device may be in the chain (a file on another
+    filesystem, whose flush is an fsync of that file: not the drive the class names)."""
+    if not isinstance(r, dict):
+        return f"a drive record that is not an object ({type(r).__name__})"
+    for k in ("drive_class", "flush_reaches_drive", "chain"):
+        if k not in r:
+            return f"a drive record with no {k}"
+    cls, flush, chain = r["drive_class"], r["flush_reaches_drive"], r["chain"]
+    if cls == "ram-volatile":
         return "the drive class is ram-volatile: nothing survives power"
-    loops = [x for x in r.get("chain", []) if re.fullmatch(r"loop\d+", str(x))]
+    if cls not in REAL_CLASSES:
+        return f"drive_class {cls!r}, not one of {REAL_CLASSES}"
+    if flush not in REAL_FLUSH:
+        return (f"flush_reaches_drive {flush!r} ({r.get('flush_why', 'no flush_why')}): a real run needs one of "
+                f"{REAL_FLUSH}")
+    if not isinstance(chain, list) or not chain:
+        return f"chain {chain!r} is not a device list"
+    loops = [x for x in chain if re.fullmatch(r"loop\d+", str(x))]
     if loops:
-        return f"loop device(s) {loops} in the chain {'>'.join(map(str, r.get('chain', [])))}"
+        return f"loop device(s) {loops} in the chain {'>'.join(map(str, chain))}"
     return None
 
 
