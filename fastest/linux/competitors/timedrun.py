@@ -405,9 +405,11 @@ def raw_problems(nm, d, sm):
         why.append(f"{nm} run has no measured_ops count ({mo!r})")
     elif len(meas) != mo:
         why.append(f"{nm} run's raw.tsv holds {len(meas)} measured rows, its summary measured_ops {mo}")
-    if not _count(mok):
-        why.append(f"{nm} run has no measured_ok count ({mok!r})")
-    else:
+    # (measured_ok is checked where the summary records it, as both producers' summaries do; a summary without it is
+    # not refused here -- the warm-up plants' records are judged by this function too)
+    if mok is not None and not _count(mok):
+        why.append(f"{nm} run's measured_ok {mok!r} is not a count")
+    elif mok is not None:
         nok = sum(1 for r in meas if r.get("ok") == "1")
         if nok != mok:
             why.append(f"{nm} run's raw.tsv holds {nok} ok measured rows, its summary measured_ok {mok}")
