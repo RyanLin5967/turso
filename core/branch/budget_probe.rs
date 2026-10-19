@@ -1477,10 +1477,13 @@ fn linux_others_blocked() -> Option<bool> {
                     continue;
                 }
                 match linux_task_running(tid) {
-                    Some(false) => {}
-                    Some(true) => all = all.map(|_| false),
+                    TaskState::Running(false) => {}
+                    TaskState::Running(true) => all = all.map(|_| false),
                     // A thread that exited between the list and its read is not running.
-                    None => {}
+                    TaskState::Gone => {}
+                    // Any other failure refuses: unread is not "not running" (engine-rev-qaf-fix
+                    // MED-8: it failed open).
+                    TaskState::Unreadable => all = None,
                 }
             }
         }
@@ -1497,10 +1500,10 @@ fn linux_others_blocked() -> Option<bool> {
 /// Whether thread `tid` of this process is running (`R`), from `/proc/self/task/<tid>/stat`; `None`
 /// when it cannot be read (it exited).
 #[cfg(target_os = "linux")]
-fn linux_task_running(tid: u64) -> Option<bool> {
+fn linux_task_running(tid: u64) -> TaskState {
     // engine-rev-qaf-fix MED-8's red: a read that cannot be understood, as a test hook.
     if STAT_UNREADABLE_FOR_TEST.load(Relaxed) {
-        return None;
+        return TaskState::Unreadable;
     }
     // "/proc/self/task/" + digits + "/stat" + NUL, built in a stack buffer.
     let mut path = [0u8; 64];
@@ -1526,18 +1529,35 @@ fn linux_task_running(tid: u64) -> Option<bool> {
     // SAFETY: a NUL-terminated path; the descriptor is closed below.
     let fd = unsafe { libc::open(path.as_ptr().cast(), libc::O_RDONLY) };
     if fd < 0 {
-        return None;
+        // ENOENT/ESRCH: the thread exited after the listing. Anything else is unread.
+        let errno = std::io::Error::last_os_error().raw_os_error();
+        return if matches!(errno, Some(libc::ENOENT) | Some(libc::ESRCH)) {
+            TaskState::Gone
+        } else {
+            TaskState::Unreadable
+        };
     }
     let mut buf = [0u8; 512];
     // SAFETY: `buf` is writable for its length.
     let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
     // SAFETY: the descriptor opened above.
     unsafe { libc::close(fd) };
-    let text = buf.get(..usize::try_from(n).ok()?)?;
+    let Some(text) = usize::try_from(n).ok().and_then(|n| buf.get(..n)) else {
+        return TaskState::Unreadable;
+    };
     // The command name (field 2) is parenthesised and may hold spaces: the state follows its ')'.
-    let close = text.iter().rposition(|&b| b == b')')?;
-    let state = *text.get(close + 2)?;
-    Some(state == b'R')
+    let Some(state) = text.iter().rposition(|&b| b == b')').and_then(|close| text.get(close + 2)) else {
+        return TaskState::Unreadable;
+    };
+    TaskState::Running(*state == b'R')
+}
+
+/// One thread's state as `/proc/self/task/<tid>/stat` gives it.
+#[cfg(target_os = "linux")]
+enum TaskState {
+    Running(bool),
+    Gone,
+    Unreadable,
 }
 
 /// Test hook (engine-rev-qaf-fix MED-8): every per-thread stat read fails to be understood.
