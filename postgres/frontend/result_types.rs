@@ -372,7 +372,7 @@ fn expression_type(node: &PgNode) -> Option<u32> {
         // differential, wire-e5-f312d1e13).
         Node::FuncCall(call)
             if func_name(call).is_some_and(|n| {
-                matches!(n.as_str(), "nextval" | "currval" | "setval" | "lastval" | "pg_database_size")
+                matches!(n.as_str(), "nextval" | "currval" | "setval" | "pg_database_size")
             }) =>
         {
             return Some(INT8);
@@ -881,7 +881,7 @@ fn scalar_result(name: &str) -> Option<u32> {
         | "version" => TEXT,
         "row_number" | "rank" | "dense_rank" | "ntile" => INT8,
         // bigint in PostgreSQL (found by the E5' differential, wire-e5-f312d1e13).
-        "nextval" | "currval" | "setval" | "lastval" | "pg_database_size" => INT8,
+        "nextval" | "currval" | "setval" | "pg_database_size" => INT8,
         // float8-only in PostgreSQL, whatever numeric argument they are given, and computed as a
         // float by the engine (random() as the translator scales it).
         "percent_rank" | "cume_dist" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan"

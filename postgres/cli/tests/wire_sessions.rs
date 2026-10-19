@@ -12673,7 +12673,7 @@ replays_postgresql!(
     [
         (3, "PGDIV-CATALOG-NAME-TYPES value [wire]: pg_indexes.indexname typed 25 text; PG 19 name (rows agree)"),
         (4, "PGDIV-CATALOG-NAME-TYPES value [wire]: pg_indexes.indexname typed 25 text; PG 19 name (rows agree)"),
-        (5, "PGDIV-EXPR-TYPE-TEXT value [wire]: pg_database_size() typed 25 text; PG 20 int8 (the byte count 24728 vs 8443583 is cluster-dependent and cannot agree)"),
+        (5, "PGDIV-EXPR-TYPE-TEXT value [wire]: pg_database_size()'s byte count (24728 vs 8443583) is cluster-dependent and cannot agree (its type, 25 here before 391f105a1, is PG's 20 int8 since)"),
     ]
 );
 replays_postgresql!(
