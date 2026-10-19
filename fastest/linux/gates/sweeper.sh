@@ -16,7 +16,8 @@
 #   sweeper pid=P nice=N clk_tck=K                              the sweeper subshell, its nice after the renice
 #   TRACED PHASE ROLE pid tid tracerpid                         one per traced task a sweep found
 #   SWEEP PHASE <EPOCHREALTIME> cmd=N:MAX srv=N:MAX cpu=T       tasks read, largest TracerPid, and the sweeper's own
-#                                                               utime+stime in clock ticks ('?' when unreadable)
+#                                                               utime+stime, plus its reaped children's, in clock ticks
+#                                                               ('?' when unreadable)
 # PHASE is start, mid or end. Builtins only inside the loop (no fork per sweep); each task's status file is read once,
 # whole (a read loop stopping at TracerPid regenerated the seq_file about 8 times a task: comp review 1 MED 12). The
 # period is 0.1 s; a reader's gap bound (competitors/timedrun.py GAP_S 0.25 s) must leave room for a sweep's own time.
@@ -38,15 +39,18 @@ proc_tree() {
   done
 }
 
-# sweeper_cpu -> SWEEPER_CPU: this shell's own utime+stime in clock ticks (fields 14 and 15 of its stat; after
-# "pid (comm) ", state is index 0), or '?' when unreadable (a reader refuses it rather than read a made-up 0)
+# sweeper_cpu -> SWEEPER_CPU: this shell's utime+stime plus the cutime+cstime of the children it has reaped, in clock
+# ticks (fields 14-17 of its stat; after "pid (comm) ", state is index 0), or '?' when unreadable (a reader refuses it
+# rather than read a made-up 0). comp-rev-89ec-b3c3 LOW 19: without the FIFO every sleep between sweeps is a sleep(1)
+# child, whose CPU only cutime/cstime hold (gates/test_sweeper_cpu.sh)
 sweeper_cpu() {
   local st=""
   local -a sf
   { IFS= read -r -d '' st <"/proc/$BASHPID/stat"; } 2>/dev/null
   read -r -a sf <<<"${st##*) }"
   SWEEPER_CPU="?"
-  [[ ${sf[11]:-} =~ ^[0-9]+$ && ${sf[12]:-} =~ ^[0-9]+$ ]] && SWEEPER_CPU=$((sf[11] + sf[12]))
+  [[ ${sf[11]:-} =~ ^[0-9]+$ && ${sf[12]:-} =~ ^[0-9]+$ && ${sf[13]:-} =~ ^[0-9]+$ && ${sf[14]:-} =~ ^[0-9]+$ ]] &&
+    SWEEPER_CPU=$((sf[11] + sf[12] + sf[13] + sf[14]))
 }
 
 # tracer_sweep PHASE CMDPID SRVPID -> its TRACED lines and one SWEEP line

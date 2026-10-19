@@ -4,7 +4,8 @@ same instrument, and the same reading of it, in every timed run; competitors/tim
 call it).
 
 From an OUT.tracer.tsv it reads the sweeper's header ("sweeper pid=P nice=N clk_tck=K") and, per sweep, the
-utime+stime ticks the sweeper read from its own /proc stat (cpu=T), and gives the sweeper's CPU between the sweeps
+utime+stime (plus its reaped children's cutime+cstime, comp-rev-89ec-b3c3 LOW 19) ticks the sweeper read from its own
+/proc stat (cpu=T), and gives the sweeper's CPU between the sweeps
 bracketing a measured window [T0, T1] (realtime seconds; the last sweep at or before T0, the first at or after T1):
 sweeper_cpu_s, sweeper_cpu_span_s, sweeper_nice, sweeper_clk_tck. REFUSED (no record): no header, a nice other than
 SWEEPER_NICE, a sweep with no cpu= (or '?': unreadable), CPU that went backwards, no sweeps bracketing the window.
