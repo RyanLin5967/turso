@@ -15887,6 +15887,39 @@ fn a_parameter_assigned_to_a_varchar_column_is_refused_at_bind_when_too_long() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-cfdebc06d LOW-4, LOW-5: an operator between two untyped string literals is 42725 'operator is not unique:
+/// unknown + unknown' in PG 18.6 (ours said 42883 text + text); and an operator over integers cast to int2 or int8 is
+/// typed by those casts (int8 + int2 is 20, int2 + int2 is 21), where the walk did not reach a cast and the engine's
+/// INTEGER announced 23. Recorded on iccad2,
+/// cli/tests/pg18/pg18-wirefuzz-operators_over_unknown_and_cast_integers_resolve_as_postgresql_resolves_them.out (replayed).
+#[test]
+fn operators_over_unknown_and_cast_integers_resolve_as_postgresql_resolves_them() {
+    let dir = Scratch::new("operators-unknown-casts");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    for (sql, op) in [("SELECT '1' + '2'", "+"), ("SELECT '1' * '2' AS p", "*")] {
+        let r = a.q(sql);
+        let message = format!("operator is not unique: unknown {op} unknown");
+        if !r.error.as_ref().is_some_and(|e| e.code == "42725" && e.message == message) {
+            wrong.push(format!("{sql}: rows {:?} error {:?}, PostgreSQL 42725 {message}", r.rows, r.error));
+        }
+    }
+    for (sql, oids, row) in [
+        ("SELECT 1 + '2'", vec![23], vec!["3"]),
+        ("SELECT 9007199254740993::int8 + 1::int2", vec![20], vec!["9007199254740994"]),
+        ("SELECT 2::int2 + 2::int2, 2::int2 * 3", vec![21, 23], vec!["4", "6"]),
+        ("SELECT 2::int8 - 1, 7::int2 % 2::int2", vec![20, 21], vec!["1", "1"]),
+    ] {
+        let r = a.q(sql);
+        let rows = vec![row.iter().map(|x| Some(x.to_string())).collect::<Vec<_>>()];
+        if r.error.is_some() || r.oids.as_ref() != Some(&oids) || r.rows != rows {
+            wrong.push(format!("{sql}: oids {:?} rows {:?} error {:?}, PostgreSQL {oids:?} {rows:?}", r.oids, r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-cfdebc06d LOW-3 (its PG 18.6 probe #33, #35, #36): a value bound to a numeric(6,2) column is judged at
 /// Bind as numeric_in reads it: '1e5' is 100000 and 'Infinity' never fits a typmod, both 22003 before BindComplete, and
 /// so is '1.5e10' declared float8. They got BindComplete, then 22003 or 22P02 at Execute; a negative scale counted kept
