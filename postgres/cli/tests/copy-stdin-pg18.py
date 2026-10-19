@@ -3,7 +3,7 @@
 copy_from_stdin_* (wire_sessions.rs): every backend message of each round, in order, as one line:
 type byte and its readable content (G: format and column formats, C: tag, E/N: SQLSTATE and message,
 Z: status, D: row). Run against PostgreSQL 18.6 for the expectations, and against tursopg to compare."""
-import socket, struct, sys
+import socket, struct, sys, time
 
 HOST, PORT = sys.argv[1], int(sys.argv[2])
 DB = sys.argv[3] if len(sys.argv) > 3 else "postgres"
@@ -24,8 +24,19 @@ class C:
             body += k.encode() + b"\0" + v.encode() + b"\0"
         body += b"\0"
         self.s.sendall(struct.pack("!i", len(body) + 4) + body)
-        while self.read()[0] != b"Z":
-            pass
+        self.key = None
+        while True:
+            t, b = self.read()
+            if t == b"K":
+                self.key = b
+            if t == b"Z":
+                break
+
+    def cancel(self):
+        """A CancelRequest for this session, on a connection of its own."""
+        s = socket.create_connection((HOST, PORT))
+        s.sendall(struct.pack("!ii", 16, 80877102) + self.key)
+        s.close()
 
     def read(self):
         while len(self.buf) < 5:
@@ -211,5 +222,59 @@ rec("varfirst", copy(c, "COPY t0 (id, c1, c0) FROM STDIN", [("data", b"7\tabcdef
 rec("numround", copy(c, "COPY t0 (id, c0) FROM STDIN", [("data", b"8\t9999.995\n")]))
 rec("numok", copy(c, "COPY t0 (id, c0) FROM STDIN", [("data", b"9\t9999.994\n10\t-0.005\n11\t1e3\n")]))
 rec("t0rows", q(c, "SELECT id, c0 FROM t0 ORDER BY id"))
+# Part 6 (review wire-rev-copystdin of 4b2f90346): line-at-a-time error order (S1, S2, S6), the
+# line-ending style (S3, S4, S5, and \. after another style), cancel and statement_timeout during
+# a stalled COPY, a table named from.
+rec("setup6", q(c, "DROP TABLE IF EXISTS r1, r2, r3, r4, r6, \"from\"; CREATE TABLE r1 (id int); CREATE TABLE r2 (v varchar(2)); CREATE TABLE r3 (v text); CREATE TABLE r4 (id int); CREATE TABLE r6 (id int PRIMARY KEY); CREATE TABLE \"from\" (id int)"))
+rec("S1", copy(c, "COPY r1 FROM STDIN", [("data", b"x\n1\t2\n")]))
+rec("S2", copy(c, "COPY r2 FROM STDIN", [("data", b"abc\nx\ty\n")]))
+rec("S3", copy(c, "COPY r3 FROM STDIN", [("data", b"a\rb\n")]))
+rec("S4", copy(c, "COPY r4 FROM STDIN", [("data", b"1\r2\r")]))
+rec("S5", copy(c, "COPY r4 FROM STDIN", [("data", b"1\r\n2\n")]))
+rec("nlcr", copy(c, "COPY r3 FROM STDIN", [("data", b"a\nb\rc\n")]))
+rec("crnlcr", copy(c, "COPY r3 FROM STDIN", [("data", b"a\r\nb\rc\r\n")]))
+rec("dotstyle", copy(c, "COPY r3 FROM STDIN", [("data", b"a\r\n\\.\n")]))
+rec("dotcrnl", copy(c, "COPY r3 FROM STDIN", [("data", b"q\r\n\\.\r\n")]))
+rec("r4count", q(c, "SELECT count(*) FROM r4"))
+q(c, "INSERT INTO r6 VALUES (1)")
+rec("S6", copy(c, "COPY r6 FROM STDIN", [("data", b"".join(b"%d\n" % i for i in range(1, 5001)) + b"bad\tline\n")]))
+rec("S6b", copy(c, "COPY r6 FROM STDIN", [("data", b"".join(b"%d\n" % i for i in range(2, 1000)) + b"1\nbad\tline\n")]))
+rec("from", copy(c, "COPY public.\"from\" FROM STDIN", [("data", b"1\n")]))
+rec("from2", copy(c, "COPY public.from FROM STDIN", [("data", b"2\n")]))
+rec("fromcount", q(c, "SELECT count(*) FROM \"from\""))
+# A stalled COPY: a CancelRequest from another connection (is anything answered within 3 s? then
+# what does the next CopyData, and CopyDone, get?), then statement_timeout the same way. Another
+# session's INSERT into the same table while the COPY stalls.
+def stalled(label, sql, before):
+    c.send(msg(b"Q", sql))
+    g = c.until(stop=b"G")
+    c.send(msg(b"d", b"held\n"))
+    time.sleep(0.5)
+    before()
+    c.s.settimeout(3)
+    try:
+        g += ["within 3s:"] + c.until()
+        rec(label, g)
+        c.s.settimeout(30)
+        return
+    except socket.timeout:
+        g += ["nothing within 3s"]
+    c.s.settimeout(30)
+    c.send(msg(b"d", b"more\n"), msg(b"c", b""))
+    rec(label, g + ["after CopyData, CopyDone:"] + c.until())
+stalled("cancel", b"COPY r3 FROM STDIN\0", c.cancel)
+rec("settimeout", q(c, "SET statement_timeout = 1000"))
+stalled("timeout", b"COPY r3 FROM STDIN\0", lambda: time.sleep(1.5))
+rec("resettimeout", q(c, "RESET statement_timeout"))
+o = C()
+o.s.settimeout(5)
+def other():
+    t0 = time.time()
+    try:
+        rec("otherinsert", q(o, "INSERT INTO r3 VALUES ('other')") + ["%.1fs" % (time.time() - t0)])
+    except socket.timeout:
+        rec("otherinsert", ["no answer in 5s"])
+stalled("stall", b"INSERT INTO r3 VALUES ('first'); COPY r3 FROM STDIN\0", other)
+rec("r3count", q(c, "SELECT count(*) FROM r3 WHERE v = 'held'"))
 rec("unexpected", copy(c, "COPY cs (id) FROM STDIN", [("query", "SELECT 1")]))
 rec("after", q(C(), "SELECT count(*) FROM cs"))

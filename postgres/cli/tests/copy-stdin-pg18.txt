@@ -1,9 +1,10 @@
-# Recorded 2026-10-19T05:06:50Z (the raw file's mtime, UTC) on iccad11 by copy-stdin-pg18.sh, which runs copy-stdin-pg18.py (both beside this file; a raw protocol-v3 driver, not pgproto, so not in tests/pg18)
+# Recorded 2026-10-19T05:23:21Z (the raw file's mtime, UTC) on iccad11 by copy-stdin-pg18.sh, which runs copy-stdin-pg18.py (both beside this file; a raw protocol-v3 driver, not pgproto, so not in tests/pg18)
 # against a fresh PostgreSQL 18.6 cluster (/var/tmp/r226lin-wire/pg18/inst/bin, initdb -A trust, user postgres), then the three
 # `nofiles` lines through psql as a role without pg_read_server_files.
 # One line per round: every backend message in order (T and S omitted; G: CopyInResponse's format and column formats).
-# Parts 2 (setup2 .. int4range), 3 (setup3 .. order), 4 (setup4 .. rawnul) and 5 (setup5 .. t0rows, wirefuzz wire-fuzz4 seed 255) were added in later recordings; every round before each is
-# byte-identical to the recording before it (2026-10-19T01:41:31Z, 02:21:57Z, 04:06:35Z, 04:26:16Z).
+# Parts 2 (setup2 .. int4range), 3 (setup3 .. order), 4 (setup4 .. rawnul), 5 (setup5 .. t0rows, wirefuzz wire-fuzz4 seed 255) and
+# 6 (setup6 .. r3count, review wire-rev-copystdin of 4b2f90346; its stall rounds wait 3 s for an answer, then send CopyData and CopyDone) were added in later recordings; every round before each is
+# byte-identical to the recording before it (2026-10-19T01:41:31Z, 02:21:57Z, 04:06:35Z, 04:26:16Z, 05:06:50Z).
 postgres (PostgreSQL) 18.6
 setup          N 00000 table "cs" does not exist, skipping | C DROP TABLE | C CREATE TABLE | Z I
 copy           G format=0 columns=[0, 0] | C COPY 2 | Z I
@@ -88,6 +89,29 @@ varfirst       G format=0 columns=[0, 0, 0] | E 22001 value too long for type ch
 numround       G format=0 columns=[0, 0] | E 22003 numeric field overflow | Z I
 numok          G format=0 columns=[0, 0] | C COPY 3 | Z I
 t0rows         D ['9', '9999.99'] | D ['10', '-0.01'] | D ['11', '1000.00'] | C SELECT 3 | Z I
+setup6         N 00000 table "r1" does not exist, skipping | N 00000 table "r2" does not exist, skipping | N 00000 table "r3" does not exist, skipping | N 00000 table "r4" does not exist, skipping | N 00000 table "r6" does not exist, skipping | N 00000 table "from" does not exist, skipping | C DROP TABLE | C CREATE TABLE | C CREATE TABLE | C CREATE TABLE | C CREATE TABLE | C CREATE TABLE | C CREATE TABLE | Z I
+S1             G format=0 columns=[0] | E 22P02 invalid input syntax for type integer: "x" | Z I
+S2             G format=0 columns=[0] | E 22001 value too long for type character varying(2) | Z I
+S3             G format=0 columns=[0] | E 22P04 literal newline found in data | Z I
+S4             G format=0 columns=[0] | C COPY 2 | Z I
+S5             G format=0 columns=[0] | E 22P04 literal newline found in data | Z I
+nlcr           G format=0 columns=[0] | E 22P04 literal carriage return found in data | Z I
+crnlcr         G format=0 columns=[0] | E 22P04 literal carriage return found in data | Z I
+dotstyle       G format=0 columns=[0] | E 22P04 end-of-copy marker does not match previous newline style | Z I
+dotcrnl        G format=0 columns=[0] | C COPY 1 | Z I
+r4count        D ['2'] | C SELECT 1 | Z I
+S6             G format=0 columns=[0] | E 23505 duplicate key value violates unique constraint "r6_pkey" | Z I
+S6b            G format=0 columns=[0] | E 22P04 extra data after last expected column | Z I
+from           G format=0 columns=[0] | C COPY 1 | Z I
+from2          G format=0 columns=[0] | C COPY 1 | Z I
+fromcount      D ['2'] | C SELECT 1 | Z I
+cancel         G format=0 columns=[0] | nothing within 3s | after CopyData, CopyDone: | E 57014 canceling statement due to user request | Z I
+settimeout     C SET | Z I
+timeout        G format=0 columns=[0] | nothing within 3s | after CopyData, CopyDone: | E 57014 canceling statement due to statement timeout | Z I
+resettimeout   C RESET | Z I
+otherinsert    C INSERT 0 1 | Z I | 0.0s
+stall          C INSERT 0 1 | G format=0 columns=[0] | nothing within 3s | after CopyData, CopyDone: | C COPY 2 | Z I
+r3count        D ['1'] | C SELECT 1 | Z I
 unexpected     G format=0 columns=[0] | E 08P01 unexpected message type 0x51 during COPY from stdin | E 08P01 terminating connection because protocol synchronization was lost | <closed>
 after          D ['16'] | C SELECT 1 | Z I
 rc=0
