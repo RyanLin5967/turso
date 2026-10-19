@@ -15519,6 +15519,29 @@ fn a_numeric_column_orders_and_types_as_numeric_through_every_relation() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-uw3 LOW-6 (its pgprobe against PostgreSQL 18.6 on iccad11): the parameter of
+/// setval('sq', $1) was described text (25), PostgreSQL's bigint (20); its third, is_called, bool
+/// (16); and pg_database_size($1)'s text, PostgreSQL's name (19).
+#[test]
+fn setval_and_pg_database_size_type_their_parameters() {
+    let dir = Scratch::new("fn-params");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE SEQUENCE sq").ok("sq");
+    let mut wrong = Vec::new();
+    for (sql, params) in [
+        ("SELECT setval('sq', $1)", vec![20u32]),
+        ("SELECT setval('sq', $1, $2)", vec![20, 16]),
+        ("SELECT pg_database_size($1)", vec![19]),
+    ] {
+        let r = a.describe_statement(sql);
+        if r.error.is_some() || r.params != Some(params.clone()) {
+            wrong.push(format!("{sql}: params {:?} error {:?}, PostgreSQL {params:?}", r.params, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-uw2 N5: a schema-qualified type was refused 42704 'type "public m" does not exist',
 /// its parts joined with a blank, so a pg_dump restore, which writes public.<type> for every enum
 /// and domain column, failed at its first such table. PostgreSQL 18.6 takes public.m and
