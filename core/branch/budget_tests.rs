@@ -2743,6 +2743,9 @@ fn a_thread_table_read_without_descriptors_is_refused() {
             churn[at..].split_whitespace().next().unwrap().parse().unwrap()
         };
         assert!(field("complete") + field("incomplete") >= 1, "premise: every churned read was refused, so none was judged: {churn}");
+        // budgets-rev-39bb7fd43 addendum MED-1: the churn must have FIRED (some read refused by the errno check:
+        // a descriptor was held while a task was opened), or a clean count proves nothing.
+        assert!(field("refused") >= 1, "premise: no churned read was refused, so the churn never took the last descriptor: {churn}");
         assert_eq!(field("incomplete"), 0, "CLAIM: under descriptor churn a thread table skipped a live task and was not refused: {churn}");
         return;
     }
@@ -2815,6 +2818,10 @@ fn a_thread_table_read_without_descriptors_is_refused() {
                     // SAFETY: a NUL-terminated path; the descriptor is closed at once.
                     let fd = unsafe { libc::open(b"/dev/null\0".as_ptr().cast(), libc::O_RDONLY | libc::O_CLOEXEC) };
                     if fd >= 0 {
+                        // Held briefly (the reviewer's REV2 spun 50 times here), so a table read overlaps the hold.
+                        for _ in 0..50 {
+                            std::hint::spin_loop();
+                        }
                         // SAFETY: opened above.
                         unsafe { libc::close(fd) };
                     }
@@ -2823,7 +2830,7 @@ fn a_thread_table_read_without_descriptors_is_refused() {
         };
         std::thread::sleep(std::time::Duration::from_millis(20));
         let mut t = [probe::ThreadCpu::EMPTY; 48];
-        let base = probe::thread_table(&mut t).unwrap_or(0);
+        let base = probe::thread_table(&mut t).expect("premise: the thread table could not be read before the descriptors were filled");
         let mut fds = Vec::with_capacity(256);
         loop {
             // SAFETY: a NUL-terminated path.
