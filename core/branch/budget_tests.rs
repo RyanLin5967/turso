@@ -3780,7 +3780,7 @@ fn the_thread_state_readers_read_blocked_and_running_threads() {
     // under taskset -c 0), and a try counts only if the spinner's own progress count moved between the
     // two readings (it provably ran). 20 counted tries are required; fewer than 20 in 2,000 refuses the
     // premise, never passes. BLIND SPOT (budgets-rev-39bb7fd43 LOW-1, measured): PINNED to one CPU this claim
-    // cannot see a stale reader (a schedstat read survived 5/5 pinned): the reader's sleep forces a context
+    // cannot see a stale reader (a schedstat reader survived 7/7 pinned runs, budgets-rev-39bb7fd43): the reader's sleep forces a context
     // switch, which brings schedstat up to date. Pinned, it shows only that no false red remains; the
     // stale-reader evidence is the UNPINNED run (that mutant killed in 25 of 26 unpinned runs).
     let (mut counted, mut tries) = (0u32, 0u32);
