@@ -12399,6 +12399,14 @@ replays_postgresql!(
         (6, "PGDIV-INTERVAL-TEXT value [engine]: timestamp - timestamp and timestamptz - timestamptz answer 0 where PG answers the interval 00:00:00 (typed interval, 1186, on both sides)"),
     ]
 );
+// wire-rev-5cdb70e58 MED-1 and LOW-1: PostgreSQL's planner folds each immutable constant part on its own, so its error
+// precedes RowDescription even beside now() or CURRENT_TIMESTAMP; a cast through a stable input function (regclass,
+// date) is not folded, so its error follows RowDescription.
+replays_postgresql!(
+    pg18_wirefuzz_each_immutable_part_folds_on_its_own_replays_as_postgresql_answered,
+    "pg18-wirefuzz-each_immutable_part_folds_on_its_own.out",
+    []
+);
 replays_postgresql!(
     pg18_wirefuzz_the_connected_database_is_current_database_and_in_pg_database_replays_as_postgresql_answered,
     "pg18-wirefuzz-the_connected_database_is_current_database_and_in_pg_database.out",

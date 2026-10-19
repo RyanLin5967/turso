@@ -1,0 +1,31 @@
+>> Q SELECT encode('abc', 'nosuch'), now() IS NOT NULL
+   E S=ERROR C=22023 M=unrecognized encoding: "nosuch"
+   Z I
+>> Q SELECT now() IS NOT NULL, encode('abc', 'nosuch')
+   E S=ERROR C=22023 M=unrecognized encoding: "nosuch"
+   Z I
+>> Q SELECT pg_database_size(99999::oid), encode('abc', 'nosuch')
+   E S=ERROR C=22023 M=unrecognized encoding: "nosuch"
+   Z I
+>> Q SELECT length(encode('abc', 'nosuch')) + extract(year from now())
+   E S=ERROR C=22023 M=unrecognized encoding: "nosuch"
+   Z I
+>> Q SELECT 'nosuch'::text::regclass
+   T oids=[2205]
+   E S=ERROR C=42P01 M=relation "nosuch" does not exist
+   Z I
+>> Q SELECT 'x'::text::date
+   T oids=[1082]
+   E S=ERROR C=22007 M=invalid input syntax for type date: "x"
+   Z I
+>> Q SELECT CURRENT_TIMESTAMP IS NOT NULL, encode('abc', 'nosuch')
+   E S=ERROR C=22023 M=unrecognized encoding: "nosuch"
+   Z I
+>> Q SELECT encode('abc', 'nosuch')
+   E S=ERROR C=22023 M=unrecognized encoding: "nosuch"
+   Z I
+>> Q SELECT now() IS NOT NULL
+   T oids=[16]
+   D ['t']
+   C SELECT 1
+   Z I
