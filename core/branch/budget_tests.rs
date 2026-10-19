@@ -2732,6 +2732,18 @@ fn a_thread_table_read_without_descriptors_is_refused() {
         // that refusal (Table), not NoKernelCount.
         let want = format!(" window_refusal={} ", probe::Refusal::Table as u64);
         assert!(one.contains(&want), "CLAIM: a window with its thread table unreadable at both ends did not record Table ({}): {one}", probe::Refusal::Table as u64);
+        // budgets-rev-39bb7fd43 MED-1 (its REV2): under descriptor CHURN (2 free, another thread opening and
+        // closing), a per-task open may fail EMFILE while the caller is still listed, so only the errno check
+        // (not the caller check) can refuse a table that skipped a live task. CLAIM: no read is an incomplete
+        // table. Premise: some reads were not refused (else nothing was judged).
+        let churn = text.lines().find_map(|l| l.find("FD-CHURN ").map(|i| l[i..].to_string())).unwrap_or_else(|| panic!("premise: no churn reading:\n{text}"));
+        let field = |k: &str| -> u64 {
+            let tag = format!(" {k}=");
+            let at = churn.find(&tag).unwrap_or_else(|| panic!("premise: no {k} in {churn}")) + tag.len();
+            churn[at..].split_whitespace().next().unwrap().parse().unwrap()
+        };
+        assert!(field("complete") + field("incomplete") >= 1, "premise: every churned read was refused, so none was judged: {churn}");
+        assert_eq!(field("incomplete"), 0, "CLAIM: under descriptor churn a thread table skipped a live task and was not refused: {churn}");
         return;
     }
     let (tx, rx) = std::sync::mpsc::channel::<()>();
@@ -2791,6 +2803,57 @@ fn a_thread_table_read_without_descriptors_is_refused() {
             Some(false) => "some",
         };
         println!("FD-TABLE free={free} table={table} n={n:?} blocked={blocked} window_refusal={} ", w1.refusal as u64);
+    }
+    // budgets-rev-39bb7fd43 MED-1 (its REV2): 2 descriptors free, one churn thread opening and closing /dev/null,
+    // 5000 table reads. Base: the live tasks counted (complete) before the table is filled, the churn thread among them.
+    {
+        let churning = Arc::new(AtomicBool::new(true));
+        let churn = {
+            let churning = churning.clone();
+            std::thread::spawn(move || {
+                while churning.load(Acquire) {
+                    // SAFETY: a NUL-terminated path; the descriptor is closed at once.
+                    let fd = unsafe { libc::open(b"/dev/null\0".as_ptr().cast(), libc::O_RDONLY | libc::O_CLOEXEC) };
+                    if fd >= 0 {
+                        // SAFETY: opened above.
+                        unsafe { libc::close(fd) };
+                    }
+                }
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut t = [probe::ThreadCpu::EMPTY; 48];
+        let base = probe::thread_table(&mut t).unwrap_or(0);
+        let mut fds = Vec::with_capacity(256);
+        loop {
+            // SAFETY: a NUL-terminated path.
+            let fd = unsafe { libc::open(b"/dev/null\0".as_ptr().cast(), libc::O_RDONLY | libc::O_CLOEXEC) };
+            if fd < 0 {
+                break;
+            }
+            fds.push(fd);
+        }
+        for _ in 0..2 {
+            if let Some(fd) = fds.pop() {
+                // SAFETY: a descriptor opened above.
+                unsafe { libc::close(fd) };
+            }
+        }
+        let (mut complete, mut incomplete, mut refused) = (0u64, 0u64, 0u64);
+        for _ in 0..5000 {
+            match probe::thread_table(&mut t) {
+                None => refused += 1,
+                Some(n) if n >= base => complete += 1,
+                Some(_) => incomplete += 1,
+            }
+        }
+        for fd in fds {
+            // SAFETY: descriptors opened above.
+            unsafe { libc::close(fd) };
+        }
+        churning.store(false, Release);
+        churn.join().unwrap();
+        println!("FD-CHURN base={base} reads=5000 complete={complete} incomplete={incomplete} refused={refused} ");
     }
     // SAFETY: the limit read above.
     unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &old) };
