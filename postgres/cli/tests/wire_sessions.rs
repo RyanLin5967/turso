@@ -7719,6 +7719,39 @@ fn copy_from_stdin_streams_its_rows_in_bounded_memory() {
     );
 }
 
+/// COPY's line-ending style is its first line's, as PostgreSQL 18.6's CopyReadLineText fixes it
+/// (recorded, copy-stdin-pg18.txt part 6, the review wire-rev-copystdin M2's S3, S4, S5): CR-only
+/// data loads (S4); a bare CR then an LF (S3) or CRLF then a bare LF (S5) is 22P04 "literal
+/// newline found in data", a CR in LF or CRLF data "literal carriage return found in data", and
+/// `\.` ended in another style "end-of-copy marker does not match previous newline style"; nothing
+/// of a refused COPY loads. A CR before LF was dropped and every other CR kept as data, so S3 and
+/// S5 loaded and S4 was one line.
+#[test]
+fn copy_reads_the_first_lines_end_as_the_datas_style() {
+    let dir = Scratch::new("copyeol");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE r3 (v text)").ok("r3");
+    a.q("CREATE TABLE r4 (id int)").ok("r4");
+    let r = a.copy("COPY r4 FROM STDIN", &[CopyIn::Data(b"1\r2\r")]).ok("S4");
+    assert_eq!(r.tags, vec!["COPY 2".to_string()], "S4: CR-only data");
+    for (table, data, message) in [
+        ("r3", &b"a\rb\n"[..], "literal newline found in data"),
+        ("r4", b"1\r\n2\n", "literal newline found in data"),
+        ("r3", b"a\nb\rc\n", "literal carriage return found in data"),
+        ("r3", b"a\r\nb\rc\r\n", "literal carriage return found in data"),
+        ("r3", b"a\r\n\\.\n", "end-of-copy marker does not match previous newline style"),
+    ] {
+        let sql = format!("COPY {table} FROM STDIN");
+        let e = a.copy(&sql, &[CopyIn::Data(data)]).err(&sql);
+        assert_eq!((e.code.as_str(), e.message.as_str()), ("22P04", message), "{data:?}");
+    }
+    let r = a.copy("COPY r3 FROM STDIN", &[CopyIn::Data(b"q\r\n\\.\r\n")]).ok("CRLF \\.");
+    assert_eq!(r.tags, vec!["COPY 1".to_string()]);
+    assert_eq!(a.q("SELECT count(*) FROM r4").single("count"), "2");
+    assert_eq!(a.q("SELECT count(*) FROM r3").single("count"), "1");
+}
+
 /// A COPY line past `--copy-line-limit` bytes is refused with 54000, as PostgreSQL refuses a line
 /// past its line buffer's limit (MaxAllocSize; review wire-rev-copystdin H1's byte cap), whether
 /// it comes in one CopyData or across several, and loads nothing; a line at the limit loads.
