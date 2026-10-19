@@ -1540,8 +1540,16 @@ fn linux_task_running(tid: u64) -> TaskState {
     let mut buf = [0u8; 512];
     // SAFETY: `buf` is writable for its length.
     let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+    // Read before close, which may set errno itself.
+    let read_errno = (n < 0).then(|| std::io::Error::last_os_error().raw_os_error()).flatten();
     // SAFETY: the descriptor opened above.
     unsafe { libc::close(fd) };
+    // A thread that exits between the open and the read fails the read with ESRCH (or reads
+    // nothing): gone, as at the open (the whole-lib suite at 18556a956 refused budget_child's windows
+    // on both kinds, raws artie 192c15645a and f149c7c839).
+    if matches!(read_errno, Some(libc::ESRCH) | Some(libc::ENOENT)) || n == 0 {
+        return TaskState::Gone;
+    }
     let Some(text) = usize::try_from(n).ok().and_then(|n| buf.get(..n)) else {
         return TaskState::Unreadable;
     };
