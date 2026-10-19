@@ -1847,14 +1847,18 @@ pub(crate) static PROBE_EMFILE_TID: AtomicU64 = AtomicU64::new(0);
 /// ENOMEM...: unknown, which a reader must refuse; budgets-port-adversary HIGH-1).
 #[cfg(target_os = "linux")]
 fn linux_task_alive(tid: u64) -> Option<bool> {
-    // budgets-rev-39bb7fd43 MED-1: the injected open failure (`PROBE_EMFILE_TID`) reads as EMFILE does: unknown.
-    if tid != 0 && PROBE_EMFILE_TID.load(Relaxed) == tid {
-        return None;
-    }
     let mut path = [0u8; 64];
     let used = linux_task_path(tid, b"", &mut path);
-    // SAFETY: a NUL-terminated path; the descriptor is closed below.
-    let fd = unsafe { libc::open(path[..used].as_ptr().cast(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+    // budgets-rev-39bb7fd43 MED-1 (its addendum MED-1): the injected failure (`PROBE_EMFILE_TID`) is the OPEN
+    // failing with errno EMFILE, so the errno classification below is what the test exercises.
+    let fd = if tid != 0 && PROBE_EMFILE_TID.load(Relaxed) == tid {
+        // SAFETY: this thread's errno, set as a failed open sets it.
+        unsafe { *libc::__errno_location() = libc::EMFILE };
+        -1
+    } else {
+        // SAFETY: a NUL-terminated path; the descriptor is closed below.
+        unsafe { libc::open(path[..used].as_ptr().cast(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) }
+    };
     if fd < 0 {
         // SAFETY: this thread's errno, read right after the failed call.
         let errno = unsafe { *libc::__errno_location() };
