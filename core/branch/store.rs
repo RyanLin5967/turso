@@ -2813,6 +2813,10 @@ struct FrozenNames {
 /// node in 37-39 of 40 creates, raws l35-diag-alloc).
 #[cfg(test)]
 pub(crate) static FILTER_NOTE_ALLOCS: AtomicU64 = AtomicU64::new(0);
+/// Test builds (budgets-rev-242345 MED-7): the next note into a `Ready` filter owes a growth, past
+/// half full or not (taken by that note).
+#[cfg(test)]
+pub(crate) static FILTER_GROW_NEXT: AtomicBool = AtomicBool::new(false);
 
 /// Test hooks for the name filter's growth (review REVIEW-claude-namefilter H1): the growth's drain
 /// copy fails (`FILTER_DRAIN_FAILS`), and the growth thread pauses at stage `FILTER_PAUSE_AT`
@@ -3080,7 +3084,12 @@ impl NameFilter {
             FilterState::Building { pending } => pending.insert(h),
             FilterState::Ready { table } => {
                 let fits = table.insert(h);
-                if fits && table.wants_room() && self.owed.is_none() {
+                let wants_room = table.wants_room();
+                // Test builds (budgets-rev-242345 MED-7): `FILTER_GROW_NEXT` makes the next note owe a
+                // growth whatever the fill, so the budget suite runs one at a chosen size.
+                #[cfg(test)]
+                let wants_room = wants_room || FILTER_GROW_NEXT.swap(false, Ordering::AcqRel);
+                if fits && wants_room && self.owed.is_none() {
                     // Mutant `name_filter_never_shrinks` (test builds only): always grown.
                     if self.live.saturating_mul(4) < table.len() as u64 && !fe_mutant("name_filter_never_shrinks") {
                         self.live = self.live.saturating_add(1);

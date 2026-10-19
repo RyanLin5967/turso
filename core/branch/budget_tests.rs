@@ -973,6 +973,23 @@ fn memory(cell: &str, built: &mut Built, out: &mut String) {
     put_exceptions(&mut s, [0; 4], exc);
     s.insert("quiet", u64::from(settled));
     line(out, cell, "memory", 0, &s);
+    // budgets-rev-242345 MED-7: a growth of the filter the open built, its two holds (swap, drain) measured
+    // apart. The build sizes the table under half full, so the next create is made to owe one
+    // (`FILTER_GROW_NEXT`); the growth then copies every name, as any growth does. `growth_runs` is the
+    // premise: the growth site ran.
+    let base = probe::threads();
+    let _ = probe::take_hold_maxima();
+    super::store::FILTER_GROW_NEXT.store(true, std::sync::atomic::Ordering::Release);
+    db.connect().unwrap().create_branch(&format!("{cell}-grow")).unwrap();
+    db.branch_wait_name_filter();
+    let settled = quiesce(&db, base);
+    super::store::FILTER_GROW_NEXT.store(false, std::sync::atomic::Ordering::Release);
+    let m = probe::take_hold_maxima();
+    let mut g = Sample::new();
+    g.insert("max_growth_hold_work", m.site_work[2]);
+    g.insert("growth_runs", m.site_runs[2]);
+    g.insert("quiet", u64::from(settled));
+    line(out, cell, "growth", 0, &g);
 }
 
 /// The confirmation arm (review 6 #1's fix: the word leaves the create path for a background
@@ -4459,6 +4476,30 @@ fn leap_l4_an_open_holds_the_store_mutex_for_no_o_n_work() {
         }
     }
     assert!(failures.is_empty(), "an open's store-mutex holds grow with the live branches:\n{failures}");
+}
+
+/// budgets-rev-242345 MED-7: a growth of the name filter holds the store mutex for no more work at 10^5
+/// live branches than at 10^4 (slack 0, as the other per-site keys): the memory cells' `growth` line,
+/// one growth forced at the next create (`FILTER_GROW_NEXT`). PREMISE: the growth site ran at both sizes
+/// (its two holds: at least 2 runs), so a growth that never ran cannot read as 0 units. The open
+/// test's own max_growth_hold_work key reads 0/0 by construction (no growth in the open). Mutant
+/// `name_filter_growth_work_one_in_10000`.
+#[test]
+fn leap_l4_a_name_filter_growth_holds_the_store_mutex_for_no_o_n_work() {
+    if in_child() {
+        return;
+    }
+    let (a, b) = (cell("mem_n1e4"), cell("mem_n1e5"));
+    let (ga, gb) = (&a.ops["growth"][0], &b.ops["growth"][0]);
+    assert!(ga["quiet"] == 1 && gb["quiet"] == 1, "premise: both growth samples quiet (10^4: {}, 10^5: {})", ga["quiet"], gb["quiet"]);
+    assert!(
+        ga["growth_runs"] >= 2 && gb["growth_runs"] >= 2,
+        "premise: a growth ran (both its holds) at both sizes (runs: {} at {N_LARGE}, {} at {N_HUGE})",
+        ga["growth_runs"],
+        gb["growth_runs"]
+    );
+    let (x, y) = (ga["max_growth_hold_work"], gb["max_growth_hold_work"]);
+    assert!(y <= x, "a name filter growth's store-mutex holds grow with the live branches: max_growth_hold_work {x} at {N_LARGE}, {y} at {N_HUGE}; budget <= {x} + 0");
 }
 
 /// The confirm arm's rounds as pairs `(a, reference)` of the same round, both quiet (review 2 H6: the

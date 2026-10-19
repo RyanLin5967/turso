@@ -67,6 +67,9 @@ static MAX_FG_HOLD_WORK: AtomicU64 = AtomicU64::new(0);
 /// kept apart, so an O(N) term at one site smaller than the largest hold elsewhere is not masked by the
 /// per-hold maximum.
 static MAX_SITE_WORK: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// budgets-rev-242345 MED-7: how many times each site ran, so a site that never ran reads as a refused
+/// premise, never as 0 units of work.
+static SITE_RUNS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 static MAX_BG_HOLD_CAT_ROWS: AtomicU64 = AtomicU64::new(0);
 // The same over holds by the thread marked foreground (review 2 M7: the opener's own holds).
 static MAX_FG_HOLD_ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -660,6 +663,8 @@ pub(crate) struct HoldMaxima {
     pub(crate) work: (u64, u64, u64),
     /// Units of work at each `WorkSite` (indexed by it), each the largest one occurrence did, apart.
     pub(crate) site_work: [u64; 4],
+    /// How many times each `WorkSite` ran (MED-7).
+    pub(crate) site_runs: [u64; 4],
 }
 
 /// Every hold maximum at once, and start them all again from zero (review 2 L8: one call, so no
@@ -671,6 +676,7 @@ pub(crate) fn take_hold_maxima() -> HoldMaxima {
         foreground: (MAX_FG_HOLD_ALLOC_BYTES.swap(0, Relaxed), MAX_FG_HOLD_CAT_ROWS.swap(0, Relaxed)),
         work: (MAX_HOLD_WORK.swap(0, Relaxed), MAX_BG_HOLD_WORK.swap(0, Relaxed), MAX_FG_HOLD_WORK.swap(0, Relaxed)),
         site_work: [0, 1, 2, 3].map(|i: usize| MAX_SITE_WORK[i].swap(0, Relaxed)),
+        site_runs: [0, 1, 2, 3].map(|i: usize| SITE_RUNS[i].swap(0, Relaxed)),
     }
 }
 
@@ -709,6 +715,7 @@ pub(crate) fn site_work_begin() -> u64 {
 pub(crate) fn site_work_end(site: WorkSite, w0: u64) {
     let now = T_HELD_WORK.with(|c| c.get());
     MAX_SITE_WORK[site as usize].fetch_max(now.wrapping_sub(w0), Relaxed);
+    SITE_RUNS[site as usize].fetch_add(1, Relaxed);
 }
 
 /// `n` units of work done on this thread (test builds call it from the store's per-item loops that
