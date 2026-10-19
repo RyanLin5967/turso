@@ -15874,3 +15874,25 @@ fn add_column_keeps_every_clause_of_the_stored_table_across_a_reopen() {
     }
     assert!(failed.is_empty(), "CLAIM: ADD COLUMN keeps the stored table's clauses: {failed:#?}");
 }
+
+/// engine-rev-qaf-fix MED-3: a trunk commit's durability barrier waits holding the trunk's WAL write
+/// lock, so it must never hold a LEAP L3 cohort gather (every trunk writer would queue behind it).
+/// With flights timed and a cohort of 8 owed, a trunk commit that retains a pre-image for a live
+/// child leads its flight with no gather.
+#[test]
+fn a_trunk_commits_barrier_never_gathers_a_cohort() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("barrier-gather.db"), opts(false, SyncClass::Fsync));
+    let trunk = db.connect().unwrap();
+    seed_wide(&trunk);
+    for i in 0..4 {
+        trunk.create_branch(&format!("timed-{i}")).unwrap();
+    }
+    let _child = trunk.fork_branch().unwrap();
+    db.branches.set_cohort_for_test(8);
+    let g0 = db.branches.gather_counters();
+    trunk.execute("UPDATE t SET v = 'new' WHERE id = 3").unwrap();
+    let g1 = db.branches.gather_counters();
+    assert_eq!(g1[0] - g0[0], 0, "CLAIM: the trunk commit's barrier held no cohort gather");
+}

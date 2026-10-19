@@ -7003,6 +7003,12 @@ impl BranchStore {
         }
     }
 
+    /// Test builds: set the cohort the next leader gathers for (engine-rev-qaf-fix MED-3's red).
+    #[cfg(test)]
+    pub(crate) fn set_cohort_for_test(&self, cohort: u64) {
+        self.group.lock().cohort = cohort;
+    }
+
     /// LEAP L3's diagnosis, observation only: nanoseconds held in gathers and spent writing flights.
     pub(crate) fn gather_and_flight_ns(&self) -> [u64; 2] {
         let g = self.group.lock();
