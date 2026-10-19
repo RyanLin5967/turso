@@ -16499,3 +16499,68 @@ fn user_sql_cannot_call_the_alter_rewrite_scalar() {
     }
     assert!(failed.is_empty(), "CLAIM: user SQL cannot call turso_alter_column_sql: {failed:#?}");
 }
+
+/// engine-rev 2bdcd32c6 MED 5, the fresh-context attack on c0545ed0f: the resolver's gate left the
+/// schema validators' own lookup (`Func::resolve_function`) open, so a generated column (CREATE
+/// TABLE, ADD COLUMN), an expression index or a partial index's WHERE could still store a call to
+/// `turso_alter_column_sql`, and PRAGMA function_list listed it. In every statement below it answers
+/// exactly as an unknown function of the same arguments does (the negative control
+/// `turso_no_such_scalar`), and function_list does not list it.
+#[test]
+fn the_alter_rewrite_scalar_answers_user_sql_as_an_unknown_function_does() {
+    let _g = serial();
+    let args = "('CREATE TABLE t(a)', 2, 'add', 't', '', 'b INT', '')";
+    let cases: &[(&[&str], &str)] = &[
+        (&[], "SELECT {F}{A}"),
+        (&[], "CREATE TABLE z(q CHECK ({F}{A} IS NOT NULL))"),
+        (&[], "CREATE TABLE g1(x, g AS ({F}{A}) VIRTUAL)"),
+        (&["CREATE TABLE g2(x)"], "ALTER TABLE g2 ADD COLUMN g AS ({F}{A}) VIRTUAL"),
+        (&["CREATE TABLE ix(x)"], "CREATE INDEX ixe ON ix({F}{A})"),
+        (&["CREATE TABLE ip(x)"], "CREATE INDEX ipw ON ip(x) WHERE {F}{A} IS NOT NULL"),
+        (&["CREATE TABLE ix2(x)", "INSERT INTO ix2 VALUES (1)"], "CREATE INDEX ixe2 ON ix2({F}{A})"),
+        (&[], "CREATE VIEW vv AS SELECT {F}{A} AS k"),
+    ];
+    let outcome = |f: &str| -> Vec<String> {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("unk.db"), DatabaseOpts::new().with_generated_columns(true));
+        let c = db.connect().unwrap();
+        cases
+            .iter()
+            .map(|(setup, stmt)| {
+                for s in *setup {
+                    if let Err(e) = c.execute(s) {
+                        return format!("setup `{s}` failed: {e}");
+                    }
+                }
+                let sql = stmt.replace("{F}", f).replace("{A}", args);
+                match c.prepare(&sql).and_then(|mut s| s.run_collect_rows()) {
+                    Ok(_) => format!("{stmt}: accepted"),
+                    Err(e) => format!("{stmt}: refused: {}", e.to_string().replace(f, "{F}")),
+                }
+            })
+            .collect()
+    };
+    let subject = outcome("turso_alter_column_sql");
+    let control = outcome("turso_no_such_scalar");
+    let mut failed: Vec<String> = subject
+        .iter()
+        .zip(&control)
+        .filter(|(s, c)| s != c)
+        .map(|(s, c)| format!("{s}  <-- an unknown function: {c}"))
+        .collect();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("fl.db"), DatabaseOpts::new());
+    let c = db.connect().unwrap();
+    match adv_rows(&c, "PRAGMA function_list") {
+        Ok(rows) => {
+            if rows.iter().any(|r| r.first().is_some_and(|n| n == "turso_alter_column_sql")) {
+                failed.push("PRAGMA function_list lists turso_alter_column_sql".to_string());
+            }
+            if !rows.iter().any(|r| r.first().is_some_and(|n| n == "abs")) {
+                failed.push(format!("premise: PRAGMA function_list lists abs ({} rows)", rows.len()));
+            }
+        }
+        Err(e) => failed.push(format!("premise: PRAGMA function_list: {e}")),
+    }
+    assert!(failed.is_empty(), "CLAIM: user SQL sees turso_alter_column_sql as an unknown function: {failed:#?}");
+}

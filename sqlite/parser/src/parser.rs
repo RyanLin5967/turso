@@ -5573,6 +5573,45 @@ mod tests {
         assert!(failed.is_empty(), "CLAIM: every column type reads back as itself: {failed:#?}");
     }
 
+    /// engine-rev 2bdcd32c6 HIGH 1, the fresh-context attack on b6e14769f: a type name that holds a
+    /// `]` (inside a quoted word) and cannot print bare (a bracketed word that is not a plain type
+    /// word) took the whole-name double-quote form, `"""a]b"" x,y"`, which reads back as another name
+    /// and grows on every rewrite. Each such type, printed and parsed again, has the same name, and
+    /// printing it again changes nothing; so does it as a CAST type.
+    #[test]
+    fn a_column_type_holding_a_bracket_and_a_bracketed_word_reads_back_as_itself() {
+        let mut failed = Vec::new();
+        for ty in [r#""a]b" [x,y]"#, "'x]y' [1]", r#""a]b" [not null]"#, r#"[x,y] "a]b""#, r#"int "a]b" [x y]"#] {
+            let sql = format!("CREATE TABLE t(id INTEGER PRIMARY KEY, c {ty})");
+            let want = match column_type_names(&sql) {
+                Ok(names) => names,
+                Err(e) => {
+                    failed.push(format!("{ty}: premise, `{sql}` does not parse: {e}"));
+                    continue;
+                }
+            };
+            let printed = Parser::new(sql.as_bytes()).next().unwrap().unwrap().to_string();
+            match column_type_names(&printed) {
+                Ok(got) if got == want => {
+                    let again = Parser::new(printed.as_bytes()).next().unwrap().unwrap().to_string();
+                    if again != printed {
+                        failed.push(format!("{ty}: printed `{printed}`, printed again `{again}`"));
+                    }
+                }
+                Ok(got) => failed.push(format!("{ty}: printed `{printed}` reads back as {got:?}, was {want:?}")),
+                Err(e) => failed.push(format!("{ty}: printed `{printed}` does not parse: {e}")),
+            }
+            let cast = format!("SELECT CAST(1 AS {ty})");
+            let printed = Parser::new(cast.as_bytes()).next().unwrap().unwrap().to_string();
+            let again = Parser::new(printed.as_bytes()).next().map(|r| r.map(|c| c.to_string()));
+            match again {
+                Some(Ok(again)) if again == printed => {}
+                other => failed.push(format!("{ty}: CAST printed `{printed}`, read back and printed: {other:?}")),
+            }
+        }
+        assert!(failed.is_empty(), "CLAIM: a type holding a bracket reads back as itself: {failed:#?}");
+    }
+
     #[test]
     fn test_variable_index_bounds() {
         for sql in ["SELECT ?0", "SELECT ?250001"] {
