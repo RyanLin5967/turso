@@ -15874,6 +15874,137 @@ fn a_switch_to_the_capture_table_in_another_case_keeps_its_version_and_layout() 
     assert_eq!(named_t[0][0], "2", "CLAIM: both writes of t are v2-layout rows naming t");
 }
 
+/// engine-rev-qaf-fix2 HIGH A (REVIEW-engine-qaf-fix2-18556a956): a column type whose token keeps
+/// its quotes ("a]b") was quoted again by every AST rewrite, so ADD, ADD, ADD, DROP, RENAME, ADD grew
+/// the stored text 52, 64, 84, 120, 180, 308, 568 (SQLite 3.53.4: 47..59). The type must read back
+/// the same after every step and after a reopen, and the text grow by no more than what the steps add.
+#[test]
+fn a_quoted_column_type_survives_every_rewrite_unchanged() {
+    let _g = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("qtype.db");
+    let ty_of_c = |c: &Arc<Connection>| {
+        adv_rows(c, "SELECT type FROM pragma_table_info('t') WHERE name = 'c'").ok().and_then(|r| r.first().map(|row| row[0].clone()))
+    };
+    let len = |c: &Arc<Connection>| adv_rows(c, "SELECT length(sql) FROM sqlite_schema WHERE name = 't'").map(|r| r[0][0].parse::<i64>().unwrap_or(-1));
+    let mut failed: Vec<String> = Vec::new();
+    {
+        let db = open_at(&path, DatabaseOpts::new());
+        let c = db.connect().unwrap();
+        c.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, c \"a]b\")").unwrap();
+        let ty0 = ty_of_c(&c);
+        let len0 = len(&c).unwrap();
+        for sql in [
+            "ALTER TABLE t ADD COLUMN z1",
+            "ALTER TABLE t ADD COLUMN z2",
+            "ALTER TABLE t ADD COLUMN z3",
+            "ALTER TABLE t DROP COLUMN z3",
+            "ALTER TABLE t RENAME COLUMN z2 TO y2",
+            "ALTER TABLE t ADD COLUMN z4",
+        ] {
+            c.execute(sql).unwrap();
+            if ty_of_c(&c) != ty0 {
+                failed.push(format!("after `{sql}` c's type is {:?}, was {ty0:?}", ty_of_c(&c)));
+            }
+        }
+        // Three columns of at most 4 characters each, with their separators, beyond the start.
+        let grown = len(&c).unwrap() - len0;
+        if grown > 3 * 6 {
+            failed.push(format!("the stored text grew by {grown} for three short columns"));
+        }
+        drop(c);
+        drop(db);
+        let db = open_at(&path, DatabaseOpts::new());
+        let c = db.connect().unwrap();
+        if ty_of_c(&c) != ty0 {
+            failed.push(format!("after a reopen c's type is {:?}, was {ty0:?}", ty_of_c(&c)));
+        }
+    }
+    assert!(failed.is_empty(), "CLAIM: the quoted type is stored once, unchanged: {failed:#?}");
+}
+
+/// engine-rev-qaf-fix2 HIGH B: ADD COLUMN of a custom type that has a DEFAULT, with no DEFAULT of its
+/// own, applied the type's default in memory only; the stored text lost it, so after a reopen a NOT NULL
+/// column read NULL for the rows that existed (the baseline stored `DEFAULT 50`).
+#[test]
+fn an_added_custom_type_column_keeps_its_type_default_across_a_reopen() {
+    let _g = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("tdef.db");
+    let o = || DatabaseOpts::new().with_custom_types(true);
+    {
+        let db = open_at(&path, o());
+        let c = db.connect().unwrap();
+        for sql in [
+            "CREATE TYPE cents(value integer) BASE integer ENCODE value * 100 DECODE value / 100 DEFAULT 50",
+            "CREATE TABLE t1(id INTEGER PRIMARY KEY, x text) STRICT",
+            "INSERT INTO t1 VALUES (1, 'a')",
+            "ALTER TABLE t1 ADD COLUMN amount cents NOT NULL",
+        ] {
+            c.execute(sql).unwrap();
+        }
+        assert_eq!(adv_rows(&c, "SELECT amount FROM t1").unwrap(), vec![vec!["50".to_string()]], "premise: the type default applies before the reopen");
+    }
+    let db = open_at(&path, o());
+    let c = db.connect().unwrap();
+    assert_eq!(
+        adv_rows(&c, "SELECT amount FROM t1").ok(),
+        Some(vec![vec!["50".to_string()]]),
+        "CLAIM: after a reopen the NOT NULL column still reads its type's default"
+    );
+}
+
+/// engine-rev-qaf-fix2 HIGH D: ADD COLUMN and DROP COLUMN with capture 'full' recorded a schema-row
+/// change whose before-image equals its after-image (the rewrite had already replaced the row when
+/// `SET sql = sql` read it). The ADD's after-image is longer than its before-image, the DROP's shorter.
+#[test]
+fn an_add_or_drop_column_captures_the_schema_row_before_and_after() {
+    let _g = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("cdc-alter.db"), DatabaseOpts::new());
+    let c = db.connect().unwrap();
+    c.execute("CREATE TABLE t(a, b)").unwrap();
+    c.execute("PRAGMA capture_data_changes_conn('full')").unwrap();
+    c.execute("ALTER TABLE t ADD COLUMN zz").unwrap();
+    c.execute("ALTER TABLE t DROP COLUMN zz").unwrap();
+    let rows = adv_rows(
+        &c,
+        "SELECT length(before), length(after) FROM turso_cdc WHERE table_name = 'sqlite_schema' AND change_type = 0 ORDER BY change_id",
+    )
+    .unwrap();
+    let n = |r: &Vec<String>, i: usize| r[i].parse::<i64>().unwrap_or(-1);
+    assert_eq!(rows.len(), 2, "premise: one schema-row update per ALTER: {rows:?}");
+    assert!(n(&rows[0], 0) < n(&rows[0], 1), "CLAIM: the ADD's after-image is longer than its before-image: {rows:?}");
+    assert!(n(&rows[1], 0) > n(&rows[1], 1), "CLAIM: the DROP's after-image is shorter than its before-image: {rows:?}");
+}
+
+/// engine-rev-qaf-fix2 HIGH E (ASYNC-DESIGN G7, "Drop loses nothing"): a clean close flies the
+/// buffered async creates. An async create acknowledged and then closed at once was gone after the
+/// reopen (42/168 and 173/299 reopens on UW). Each of 20 creates, closed straight after its ack, is
+/// found after the reopen.
+#[test]
+fn a_clean_close_keeps_every_async_create() {
+    let _s = serial();
+    let class = if cfg!(target_vendor = "apple") { SyncClass::FullFsync } else { SyncClass::Fsync };
+    let mut lost = Vec::new();
+    for i in 0..20 {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("close.db");
+        {
+            let db = open_at(&path, opts(true, class));
+            let trunk = db.connect().unwrap();
+            seed(&trunk);
+            trunk.create_branch_async("warm").unwrap();
+            trunk.create_branch_async(&format!("closed-{i}")).unwrap();
+        }
+        let db = open_at(&path, opts(true, class));
+        if db.branch_named(&format!("closed-{i}")).ok().flatten().is_none() {
+            lost.push(i);
+        }
+    }
+    assert!(lost.is_empty(), "CLAIM: a clean close kept every async create; lost: {lost:?}");
+}
+
 /// engine-rev-qaf-fix HIGH-2/3/4 and MED-1 (the stored text an ADD COLUMN rewrites loses clauses,
 /// the class of QUOTE-SWEEP F1): after ADD COLUMN and a reopen, each table answers as before, and as
 /// SQLite 3.53.1 answers the same statements (python sqlite3 on UW; artie raw uw-qaf2-sqlite-3531).
