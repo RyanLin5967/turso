@@ -15748,3 +15748,44 @@ fn a_failed_flight_loses_async_creates_visibly() {
     assert!(trunk.create_branch_async("next").is_err(), "CLAIM: the next async create is refused");
     assert!(held, "premise: the flusher was held");
 }
+
+/// Diagnostic, never fails (the segment-crossing L2(b) test found one create allocating about
+/// 2.6 MB under the store mutex near 72,000 branches, lane raws 44f57b34b3 / 92f7246c8a): the same
+/// workload, each thread recording every allocation of at least 1 MiB with its backtrace.
+#[test]
+fn diag_the_create_that_allocates_megabytes_under_the_store_mutex() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("diag-mb.db"), opts(true, SyncClass::Fsync));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    std::thread::scope(|s| {
+        for t in 0..16u64 {
+            let db = &db;
+            s.spawn(move || {
+                let c = db.connect().unwrap();
+                super::budget_probe::record_big(1 << 20);
+                for i in 0..4_500u64 {
+                    let name = format!("mb-{t}-{i}");
+                    loop {
+                        let a = super::budget_probe::thread_allocs();
+                        let r = c.create_branch(&name);
+                        let b = super::budget_probe::thread_allocs();
+                        if b.3 - a.3 > 8 << 10 {
+                            println!("DIAG-MB thread={t} create={i} held_bytes={} live={}", b.3 - a.3, db.branch_ids().map(|v| v.len()).unwrap_or(0));
+                        }
+                        match r {
+                            Ok(_) => break,
+                            Err(LimboError::Busy) => continue,
+                            Err(e) => panic!("create {name}: {e}"),
+                        }
+                    }
+                }
+                let (_, _, traces) = super::budget_probe::recorded_allocs();
+                for tr in traces.iter().take(3) {
+                    println!("DIAG-MB thread={t} trace:\n{tr}");
+                }
+            });
+        }
+    });
+}
