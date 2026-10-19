@@ -15451,6 +15451,38 @@ fn pg_database_size_of_null_or_an_unknown_oid_answers_as_postgresql_does() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-uw3 MED-4: a cast to NUMERIC(p, s) was cast to the engine's REAL, so it was announced
+/// float8 (701) and written as a float ('1.5'), where PostgreSQL 18.6 types it numeric (1700) and
+/// rounds it to the scale ('1.50', '1.01', '123456.79'); and a column of a domain over
+/// NUMERIC(8, 2) was announced 701 where PostgreSQL announces numeric. Recorded on iccad2,
+/// cli/tests/recordings/pg18-numeric-casts.out.
+#[test]
+fn a_cast_to_numeric_p_s_and_a_numeric_domain_column_are_numeric() {
+    let dir = Scratch::new("numeric-casts");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    for (sql, text) in [
+        ("SELECT CAST(1.5 AS NUMERIC(8,2))", "1.50"),
+        ("SELECT 1.5::numeric(8,2)", "1.50"),
+        ("SELECT CAST(1.005 AS NUMERIC(8,2))", "1.01"),
+        ("SELECT CAST(123456.789 AS NUMERIC(8,2))", "123456.79"),
+    ] {
+        let r = a.q(sql);
+        if r.error.is_some() || r.oids != Some(vec![1700]) || r.rows != vec![vec![Some(text.to_string())]] {
+            wrong.push(format!("{sql}: oids {:?} rows {:?} error {:?}, PostgreSQL [1700] {text}", r.oids, r.rows, r.error));
+        }
+    }
+    for sql in ["CREATE DOMAIN dn AS NUMERIC(8,2)", "CREATE TABLE dt(x dn)", "INSERT INTO dt VALUES (1.5)"] {
+        a.q(sql).ok(sql);
+    }
+    let r = a.q("SELECT x FROM dt");
+    if r.error.is_some() || r.oids != Some(vec![1700]) || r.rows != vec![vec![Some("1.50".to_string())]] {
+        wrong.push(format!("SELECT x FROM dt: oids {:?} rows {:?} error {:?}, PostgreSQL [1700] 1.50", r.oids, r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-uw2 N5: a schema-qualified type was refused 42704 'type "public m" does not exist',
 /// its parts joined with a blank, so a pg_dump restore, which writes public.<type> for every enum
 /// and domain column, failed at its first such table. PostgreSQL 18.6 takes public.m and
