@@ -880,7 +880,13 @@ impl Catalog {
             self.conn.execute(sql)?;
         }
         self.conn.execute(LINK_FILL_TABLE)?;
-        self.refresh_links()
+        self.refresh_links()?;
+        // The same step as in `upgrade_links_batch`: the columns added, not yet committed. A kill here
+        // leaves the store without them (a_kill_at_every_step_of_the_upgrade_leaves_the_store_17_or_21;
+        // without this point the column-only transaction never reached it, and that test's premise,
+        // "the child was killed there", failed at e2a788823 on iccad6, raw h1c-modules).
+        super::store::kill_point("ckpt.upgrade.columns");
+        Ok(())
     }
 
     pub(crate) fn upgrade_links_batch(&mut self, after: Option<(u64, u64)>, n: usize) -> Result<Option<(u64, u64)>> {
