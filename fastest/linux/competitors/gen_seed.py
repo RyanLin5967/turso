@@ -239,6 +239,26 @@ def selftest():
     for p in sorted(glob.glob(os.path.join(here, "*.sh"))):
         found |= driver_subcommands(open(p).read())
     ok(f"the drivers' gen_seed.py calls are exactly {sorted(SUBCMDS)} (found {sorted(found)})", found == SUBCMDS)
+    # comp-rev-89ec-b3c3 LOW 14: the scan above sees only the literal `gen_seed.py" <cmd>`, so a shell wrapper (a
+    # function that forwards "$@" to gen_seed.py, as readback_repin.sh's gs does) and a Python import (fixture.py,
+    # run_system.sh's MED 11 plant, readback_repin.sh's want) were invisible. generator_uses() sees all three; every use
+    # in this directory's shell and Python files must be one of SUBCMDS or PY_USES
+    gu = globals().get("generator_uses", driver_subcommands)
+    wrap = 'gs() { python3 -B "$HERE/gen_seed.py" "$@"; }\nx=$(gs expect --rows 5)\n'
+    ok(f"generator scan fires on a wrapper's call (gs expect): {sorted(gu(wrap))}", gu(wrap) == {"expect"})
+    imp = 'python3 -B -c "import sys; import gen_seed as g; print(g.expect(5))"\n'
+    ok(f"generator scan fires on an imported call (g.expect): {sorted(gu(imp))}", gu(imp) == {"py:expect"})
+    imp2 = "import gen_seed  # noqa\nrows = gen_seed.sql_lines(3)\ngen_seed.sql_lines = counted\n"
+    ok(f"generator scan reads gen_seed.<name>( as a call, not an assignment: {sorted(gu(imp2))}",
+       gu(imp2) == {"py:sql_lines"})
+    py_uses = globals().get("PY_USES", set())
+    uses = set()
+    for p in sorted(glob.glob(os.path.join(here, "*.sh")) + glob.glob(os.path.join(here, "*.py"))):
+        if os.path.basename(p) != "gen_seed.py":
+            uses |= gu(open(p).read())
+    want_uses = SUBCMDS | {"py:facts", "py:sql_lines", "py:age_lines"}
+    ok(f"every generator use in the drivers is listed (SUBCMDS and PY_USES {sorted(py_uses)}): found {sorted(uses)}",
+       uses == want_uses and uses == SUBCMDS | py_uses)
     # comp review 1 LOW 27: the pg read-back hashes each row ONCE (an OFFSET 0 subquery is not flattened, so md5 runs
     # once per row there, not twelve times in the hex-digit sum), and the mysql one already does
     for dial in ("pg", "mysql"):
