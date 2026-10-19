@@ -611,11 +611,18 @@ pub struct Walked {
     /// A plain SELECT's result columns' types, in order, as the walk read them (empty for any other
     /// statement): [`aggregate_types`] takes the aggregates' from these.
     pub columns: Vec<Option<u32>>,
+    /// The varchar(n) length of the column each $n is assigned to ([`StatementTypes::lengths`]).
+    pub lengths: std::collections::BTreeMap<u32, u32>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct StatementTypes {
     pub columns: Vec<Option<u32>>,
+    /// The length n of the varchar(n) column each $n is assigned to (an INSERT value, an UPDATE or
+    /// ON CONFLICT SET), by n: PostgreSQL's Bind coerces such a value to varchar(n), so one past n
+    /// is refused there (22001) and one whose excess is spaces is cut to n (lead ruling 1(a);
+    /// recorded, recordings/pg18-bind-varchar.out).
+    pub lengths: std::collections::BTreeMap<u32, u32>,
     /// The type OID of each $n its context types, by n; one missing is untyped (text, as
     /// PostgreSQL resolves a parameter nothing types). Sparse, so a statement's highest $n sizes
     /// nothing (wire review 8 item 3).
@@ -743,6 +750,7 @@ fn parameter_types_with(
     let mut infer = Infer {
         schema,
         types: std::collections::BTreeMap::new(),
+        lengths: std::collections::BTreeMap::new(),
         compared_untyped: std::collections::BTreeSet::new(),
         ctes: Vec::new(),
         views: Vec::new(),
@@ -777,6 +785,7 @@ fn parameter_types_with(
         params: infer.types,
         untyped,
         columns,
+        lengths: infer.lengths,
     })
 }
 
@@ -832,6 +841,8 @@ type Found = Option<Option<u32>>;
 struct Infer<'a> {
     schema: &'a Schema,
     types: std::collections::BTreeMap<u32, u32>,
+    /// Each assigned $n's varchar(n) length ([`StatementTypes::lengths`]).
+    lengths: std::collections::BTreeMap<u32, u32>,
     /// Parameters compared with an expression no context types (see [`parameter_types`]).
     compared_untyped: std::collections::BTreeSet<u32>,
     /// The CTEs in scope, innermost last: name and columns.
@@ -972,6 +983,13 @@ impl Infer<'_> {
     fn set(&mut self, node: &PgNode, ty: Option<u32>) {
         if let (Some(n), Some(ty)) = (param(node), ty) {
             self.types.entry(n).or_insert(ty);
+        }
+    }
+
+    /// `node`, if it is a bare parameter, is assigned to a varchar(`length`) column.
+    fn assign_length(&mut self, node: &PgNode, length: Option<u32>) {
+        if let (Some(n), Some(length)) = (param(node), length) {
+            self.lengths.entry(n).or_insert(length);
         }
     }
 
@@ -1313,6 +1331,7 @@ impl Infer<'_> {
         let mut walk = Infer {
             schema: self.schema,
             types: std::collections::BTreeMap::new(),
+            lengths: std::collections::BTreeMap::new(),
             compared_untyped: std::collections::BTreeSet::new(),
             ctes: Vec::new(),
             views,
@@ -1448,6 +1467,22 @@ impl Infer<'_> {
         // schema's) types nothing, and every value parameter is refused untyped (42P18) rather
         // than typed from public's table of the name (wire review 14 item 3).
         let relname = self.main_relname(&rel.schemaname, &rel.relname);
+        let lengths: Vec<Option<u32>> = match &relname {
+            None => Vec::new(),
+            Some(relname) if insert.cols.is_empty() => self
+                .schema
+                .get_btree_table(relname)
+                .map(|t| t.columns().iter().map(varchar_length).collect())
+                .unwrap_or_default(),
+            Some(relname) => insert
+                .cols
+                .iter()
+                .map(|c| match c.node.as_ref() {
+                    Some(Node::ResTarget(t)) => declared_length(self.schema, relname, &t.name),
+                    _ => None,
+                })
+                .collect(),
+        };
         let columns: Vec<Option<u32>> = match &relname {
             None => Vec::new(),
             Some(relname) if insert.cols.is_empty() => self
@@ -1492,13 +1527,17 @@ impl Infer<'_> {
                     for (item, ty) in l.items.iter().zip(&columns) {
                         self.set(item, *ty);
                     }
+                    for (item, len) in l.items.iter().zip(&lengths) {
+                        self.assign_length(item, *len);
+                    }
                 }
             }
             if s.values_lists.is_empty() {
-                for (target, ty) in s.target_list.iter().zip(&columns) {
+                for ((target, ty), len) in s.target_list.iter().zip(&columns).zip(&lengths) {
                     if let Some(Node::ResTarget(t)) = target.node.as_ref() {
                         if let Some(val) = t.val.as_deref() {
                             self.set(val, *ty);
+                            self.assign_length(val, *len);
                         }
                     }
                 }
@@ -1551,6 +1590,7 @@ impl Infer<'_> {
                 continue;
             };
             let column = declared_type(self.schema, relname, &t.name);
+            let length = declared_length(self.schema, relname, &t.name);
             if let Some(Node::MultiAssignRef(m)) = val.node.as_ref() {
                 if let Some(Node::RowExpr(row)) = m.source.as_deref().and_then(|s| s.node.as_ref())
                 {
@@ -1559,12 +1599,14 @@ impl Infer<'_> {
                         .and_then(|i| row.args.get(i))
                     {
                         self.set(item, column);
+                        self.assign_length(item, length);
                         self.expr(item, scope);
                     }
                 }
                 continue;
             }
             self.set(val, column);
+            self.assign_length(val, length);
             self.expr(val, scope);
         }
     }
@@ -2161,6 +2203,7 @@ impl Infer<'_> {
         let mut walk = Infer {
             schema: self.schema,
             types: std::collections::BTreeMap::new(),
+            lengths: std::collections::BTreeMap::new(),
             compared_untyped: std::collections::BTreeSet::new(),
             ctes: self.ctes.clone(),
             views: self.views.clone(),
@@ -2267,6 +2310,28 @@ fn cast_type(cast: &turso_pg_parser::pg_query::protobuf::TypeCast) -> Option<u32
         _ => return None,
     };
     u32::try_from(sqlite_type_to_pg_oid(name)).ok()
+}
+
+/// The length n of column `column` of table `relname` when it is declared varchar(n).
+fn declared_length(schema: &Schema, relname: &str, column: &str) -> Option<u32> {
+    let table = schema.get_btree_table(relname)?;
+    let (_, col) = table.get_column(column)?;
+    varchar_length(col)
+}
+
+/// A column's n when it is the engine's varchar(n) (the translator's mapping of VARCHAR(n) and
+/// CHAR(n)): its type is varchar and its one parameter an integer literal.
+fn varchar_length(col: &Column) -> Option<u32> {
+    if !col.ty_str.eq_ignore_ascii_case("varchar") || col.array_dimensions() > 0 {
+        return None;
+    }
+    match col.ty_params.as_slice() {
+        [p] => match p.as_ref() {
+            turso_parser::ast::Expr::Literal(turso_parser::ast::Literal::Numeric(n)) => n.parse().ok(),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// The type OID of column `column` of table `relname`, as declared.

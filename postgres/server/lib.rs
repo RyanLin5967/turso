@@ -2869,6 +2869,13 @@ impl Session {
         }
     }
 
+    /// The varchar(n) lengths of the parameters the statement Describe prepared for `sql` assigns
+    /// to columns ([`turso_pg::StatementTypes::lengths`]); none when nothing is kept for the text.
+    fn described_lengths(&self, sql: &str) -> std::collections::BTreeMap<u32, u32> {
+        let st = self.state();
+        st.described.for_sql(sql).map(|d| d.types.lengths.clone()).unwrap_or_default()
+    }
+
     /// The statement a Describe prepared for this Execute, if it is this text on this connection.
     fn take_described(
         &self,
@@ -3036,7 +3043,7 @@ impl Session {
                     .map(|(i, ty)| (stmt.get_column_name(i).into_owned(), ty.clone()))
                     .collect();
                 parsed.fix_columns(&named).map_err(unprepared)?;
-                bind_portal_parameters(&mut stmt, portal, &params)
+                bind_portal_parameters_limited(&mut stmt, portal, &params, &types.lengths)
                     .map_err(|e| unprepared(wire_info(e)))?
             }
             // Nothing binds a parameter over the simple protocol, so a $n names none: 42P02, as
@@ -4568,7 +4575,9 @@ impl ExtendedQueryHandler for Session {
                 .described_parameters(&portal.statement.statement.sql, &portal.statement.parameter_types)
                 .map_err(PgWireError::UserError)?;
             if params.len() == portal.parameters.len() {
-                decode_portal_parameters(&portal, &params)?;
+                let mut values = decode_portal_parameters(&portal, &params)?;
+                let lengths = self.described_lengths(&portal.statement.statement.sql);
+                coerce_assigned_lengths(&mut values, &lengths)?;
             }
         }
         // A named portal lives until its Close or its transaction's end: binding the name again
@@ -5583,13 +5592,55 @@ fn bind_portal_parameters(
     portal: &Portal<Parsed>,
     types: &[Type],
 ) -> PgWireResult<()> {
-    for (i, value) in decode_portal_parameters(portal, types)?.into_iter().enumerate() {
+    bind_portal_parameters_limited(stmt, portal, types, &Default::default())
+}
+
+/// [`bind_portal_parameters`], each value assigned to a varchar(n) column first coerced to it
+/// ([`coerce_assigned_lengths`]).
+fn bind_portal_parameters_limited(
+    stmt: &mut turso_core::Statement,
+    portal: &Portal<Parsed>,
+    types: &[Type],
+    lengths: &std::collections::BTreeMap<u32, u32>,
+) -> PgWireResult<()> {
+    let mut values = decode_portal_parameters(portal, types)?;
+    coerce_assigned_lengths(&mut values, lengths)?;
+    for (i, value) in values.into_iter().enumerate() {
         let index = NonZero::new(i + 1).expect("i + 1 >= 1");
         // A parameter with no engine slot (declared but unused, or in a clause the engine folds
         // away) binds nothing.
         if stmt.parameters().has_index(index) {
             stmt.bind_at(index, value)
                 .map_err(|e| PgWireError::UserError(engine_info(&e)))?;
+        }
+    }
+    Ok(())
+}
+
+/// Each value assigned to a varchar(n) column ([`turso_pg::StatementTypes::lengths`]) coerced to
+/// varchar(n) as PostgreSQL's Bind does (its custom plan folds the coercion): a text value past n
+/// characters is refused 22001, unless every character past n is a space, when it is cut to n
+/// (varchar's typmod coercion; lead ruling 1(a), recorded, recordings/pg18-bind-varchar.out).
+fn coerce_assigned_lengths(
+    values: &mut [Value],
+    lengths: &std::collections::BTreeMap<u32, u32>,
+) -> PgWireResult<()> {
+    for (&n, &length) in lengths {
+        let Some(Value::Text(text)) = usize::try_from(n).ok().and_then(|n| values.get_mut(n.checked_sub(1)?)) else {
+            continue;
+        };
+        let s = text.as_str();
+        let Some((cut, _)) = s.char_indices().nth(length as usize) else {
+            continue;
+        };
+        if s[cut..].chars().all(|c| c == ' ') {
+            let kept = s[..cut].to_string();
+            *values.get_mut(n as usize - 1).expect("read above") = Value::build_text(kept);
+        } else {
+            return Err(PgWireError::UserError(error(
+                SqlErrorKind::StringDataRightTruncation,
+                format!("value too long for type character varying({length})"),
+            )));
         }
     }
     Ok(())

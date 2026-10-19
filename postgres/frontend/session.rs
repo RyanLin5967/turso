@@ -1600,6 +1600,7 @@ fn prepare_statement_parsed(
             .map_err(LimboError::ParseError)?;
             types.params = walked.params;
             types.untyped = walked.untyped;
+            types.lengths = walked.lengths;
             types.columns = crate::result_types::aggregate_types(&aggregates, &walked.columns);
         }
         // The columns whose type PostgreSQL's grammar fixes (a boolean expression, a float4 cast),
