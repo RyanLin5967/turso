@@ -896,23 +896,49 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, resolver: &Resolver) -> Resul
 /// '0', SQLite's sum of the decoded text, where PostgreSQL answers 0.00). Before any rewrite reads the
 /// aggregates, so a step and its final agree. Mutant `numeric_sum_as_sqlite` (test builds only): as
 /// before.
+///
+/// A window's `sum` too (engine review 2bdcd32c6 MED 6: only the plan's aggregates were walked, so
+/// `sum(b) OVER (...)` over numeric(8, 2) answered SQLite's 1.0 where PostgreSQL answers 1.00): its
+/// argument as rewritten to read the window's source subquery, whose column carries the type.
+/// Mutant `window_sum_as_sqlite` (test builds only): a window's sum is SQLite's, as before.
 fn numeric_sums(plan: &mut SelectPlan, resolver: &Resolver) {
     if crate::branch::store::fe_mutant("numeric_sum_as_sqlite") {
         return;
     }
+    let numeric = |arg: &ast::Expr, tables: &TableReferences| {
+        crate::translate::order_by::expr_custom_type(arg, tables, resolver.schema()).is_some_and(|(type_def, _)| {
+            type_def
+                .operators()
+                .iter()
+                .any(|op| op.op == "+" && op.func_name.as_deref() == Some("numeric_add"))
+        })
+    };
     for agg in plan.aggregates.iter_mut() {
         if agg.func != crate::function::AggFunc::Sum || agg.args.len() != 1 {
             continue;
         }
-        let numeric = crate::translate::order_by::expr_custom_type(&agg.args[0], &plan.table_references, resolver.schema())
-            .is_some_and(|(type_def, _)| {
-                type_def
-                    .operators()
-                    .iter()
-                    .any(|op| op.op == "+" && op.func_name.as_deref() == Some("numeric_add"))
-            });
-        if numeric {
+        if numeric(&agg.args[0], &plan.table_references) {
             agg.func = crate::function::AggFunc::NumericSum;
+        }
+    }
+    if crate::branch::store::fe_mutant("window_sum_as_sqlite") {
+        return;
+    }
+    let Some(window) = plan.window.as_mut() else {
+        return;
+    };
+    for function in window.functions.iter_mut() {
+        if !matches!(function.func, crate::function::AccumulatorFunc::Agg(crate::function::AggFunc::Sum)) {
+            continue;
+        }
+        let Some(rewritten) = &function.rewritten else {
+            continue;
+        };
+        let ast::Expr::FunctionCall { args, .. } = &rewritten.expr else {
+            continue;
+        };
+        if args.len() == 1 && numeric(&args[0], &plan.table_references) {
+            function.func = crate::function::AccumulatorFunc::Agg(crate::function::AggFunc::NumericSum);
         }
     }
 }
