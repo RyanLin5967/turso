@@ -410,7 +410,9 @@ def warm_check(d, warm_rule):
     return warm_problems("run", sm, warm_rule) + record_problems("run", sm) + raw_problems("run", d, sm)
 
 
-REGISTERED_PREBRANCH_MAX = 1000  # the lead's LOW 21 ruling: N = 1 and 1,000 are the registered tiers
+# the lead's LOW 21 ruling: N = 1 and 1,000 are the ONLY registered tiers (comp-rev-89ec-b3c3 MED 3: an allowlist; the
+# rule had kept out only N above 1,000, so the workflow default 20, or 500, or 0, read 'ok')
+REGISTERED_PREBRANCH = (1, 1000)
 
 
 def prebranch_record(celldir):
@@ -528,11 +530,11 @@ def write_verdict(celldir, n, why, warm_rule, cap, dry):
            "capped": {"labelling": lab.get("capped", False), "timed": t.get("capped", False)},
            # MED 5: a capped timed run with 100-999 ok ops is complete with p50 only (PREREG FINAL-CANDIDATE :214)
            "tier": tier(t) if t else None, "p50_only": tier(t) == "p50_only" if t else None}
-    # The lead's LOW 21 ruling: the prebranch (N, clients, bound) is recorded; a real cell beyond the registered 1,000
-    # is exploratory and never credited until an annex row registers it
+    # The lead's LOW 21 ruling: the prebranch (N, clients, bound) is recorded; a real cell at any N other than the
+    # registered 1 and 1,000 (MED 3) is exploratory and never credited until an annex row registers it
     pre, _ = prebranch_record(celldir)
     out["prebranch"] = pre
-    if out["verdict"] == "ok" and pre and pre["prebranch"] > REGISTERED_PREBRANCH_MAX:
+    if out["verdict"] == "ok" and (not pre or pre["prebranch"] not in REGISTERED_PREBRANCH):
         out["verdict"] = "ok-exploratory-n"
     try:  # the live-branch counts around both runs, as run_system.sh read them (HIGH 1)
         out["live_branches"] = dict(ln.split() for ln in open(os.path.join(celldir, "live.tsv")) if len(ln.split()) == 2)

@@ -390,8 +390,8 @@ no_plant_before_cells() {
   expect "no test plant ran on MNT before the measured cells (LOW 25)" "$ran" none
 }
 timedrun_check() {
-  # the lead's LOW 21 ruling: the cell's prebranch (N, clients, bound) goes into timed.json; beyond 1,000 it is
-  # exploratory, never credited
+  # the lead's LOW 21 ruling: the cell's prebranch (N, clients, bound) goes into timed.json; at any N other than
+  # the registered 1 and 1,000 it is exploratory, never credited, and reduce.py fails the run (comp-rev-89ec-b3c3 MED 3)
   echo "prebranch=$PREBRANCH prebranch_c=$PREBRANCH_C prebranch_s=$PREBRANCH_S" >"$1/prebranch.txt"
   # the one raw.tsv schema (raw_schema.py; VM --dry-block defect 2), checked on what each run actually wrote
   local rs

@@ -166,8 +166,9 @@ def timed_line(name, cell, tv, dry):
     (run-info dry=1) stands only with timed verdict 'ok-smoke', a real job (dry=0) only with 'ok'."""
     want_tv = {"1": "ok-smoke", "0": "ok"}.get(dry)
     if tv == "ok-exploratory-n" and want_tv == "ok":
-        # the lead's LOW 21 ruling: a prebranch beyond the registered 1,000 is exploratory, never credited
-        return f"TIMED\t{name}\t{cell}\t{tv} (exploratory: N beyond the registered 1,000, NOT CREDITED)", False
+        # the lead's LOW 21 ruling: a prebranch other than the registered 1 and 1,000 is exploratory, never credited,
+        # and so it fails the run (comp-rev-89ec-b3c3 MED 3: it had been a printed line only, and the run exited 0)
+        return f"TIMED\t{name}\t{cell}\t{tv} (exploratory: N not a registered tier (1 or 1,000), NOT CREDITED)", True
     if tv != want_tv:
         return f"TIMED\t{name}\t{cell}\t{tv} (want {want_tv!r} for run-info dry={dry!r})", True
     return None, False
