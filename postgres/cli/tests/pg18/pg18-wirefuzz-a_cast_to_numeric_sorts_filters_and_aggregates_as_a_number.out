@@ -1,0 +1,98 @@
+>> Q CREATE TABLE n(id int PRIMARY KEY, b numeric(8,2))
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO n VALUES (1, 2.50), (2, 123456.78), (3, 10.00)
+   C INSERT 0 3
+   Z I
+>> Q CREATE TABLE n2(id int PRIMARY KEY, f float8)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO n2 VALUES (1, 9.5), (2, 10.25), (3, 100)
+   C INSERT 0 3
+   Z I
+>> Q SELECT id FROM n ORDER BY CAST(b AS NUMERIC(10,2))
+   T oids=[23]
+   D ['1']
+   D ['3']
+   D ['2']
+   C SELECT 3
+   Z I
+>> Q SELECT id FROM n WHERE CAST(b AS NUMERIC(10,2)) > 5 ORDER BY id
+   T oids=[23]
+   D ['2']
+   D ['3']
+   C SELECT 2
+   Z I
+>> Q SELECT id FROM n WHERE CAST(b AS NUMERIC(10,2)) = 2.5 ORDER BY id
+   T oids=[23]
+   D ['1']
+   C SELECT 1
+   Z I
+>> Q SELECT id FROM n ORDER BY CAST(id*5 AS NUMERIC(8,2)) DESC
+   T oids=[23]
+   D ['3']
+   D ['2']
+   D ['1']
+   C SELECT 3
+   Z I
+>> Q SELECT count(*) FROM n2 WHERE CAST(f AS NUMERIC(8,2)) BETWEEN 9 AND 11
+   T oids=[20]
+   D ['2']
+   C SELECT 1
+   Z I
+>> Q SELECT id FROM n2 ORDER BY f::numeric(8,2) DESC
+   T oids=[23]
+   D ['3']
+   D ['2']
+   D ['1']
+   C SELECT 3
+   Z I
+>> Q SELECT id FROM n2 ORDER BY f::numeric(8,2)
+   T oids=[23]
+   D ['1']
+   D ['2']
+   D ['3']
+   C SELECT 3
+   Z I
+>> Q SELECT id, CAST(f AS NUMERIC(8,2)) > 10 FROM n2 ORDER BY id
+   T oids=[23, 16]
+   D ['1', 'f']
+   D ['2', 't']
+   D ['3', 't']
+   C SELECT 3
+   Z I
+>> Q SELECT CAST(b AS NUMERIC(10,2)) AS x FROM n ORDER BY x
+   T oids=[1700]
+   D ['2.50']
+   D ['10.00']
+   D ['123456.78']
+   C SELECT 3
+   Z I
+>> Q SELECT max(CAST(b AS NUMERIC(10,2))), min(CAST(b AS NUMERIC(10,2))) FROM n
+   T oids=[1700, 1700]
+   D ['123456.78', '2.50']
+   C SELECT 1
+   Z I
+>> Q SELECT CAST(123 AS NUMERIC(2,-1))
+   T oids=[1700]
+   D ['120']
+   C SELECT 1
+   Z I
+>> Q SELECT CAST(1 AS NUMERIC(1001,2))
+   E S=ERROR C=22023 M=NUMERIC precision 1001 must be between 1 and 1000
+   Z I
+>> Q SELECT CAST(1 AS NUMERIC(2,5))
+   E S=ERROR C=22003 M=numeric field overflow
+   Z I
+>> Q SELECT CAST(id AS NUMERIC(8,2)) * 2 FROM n ORDER BY id
+   T oids=[1700]
+   D ['2.00']
+   D ['4.00']
+   D ['6.00']
+   C SELECT 3
+   Z I
+>> Q SELECT 1.5::decimal(8,2) + 1
+   T oids=[1700]
+   D ['2.50']
+   C SELECT 1
+   Z I

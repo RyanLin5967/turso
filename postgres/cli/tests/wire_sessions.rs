@@ -12345,6 +12345,13 @@ replays_postgresql!(
     "pg18-wirefuzz-every_write_path_refuses_a_value_too_long_for_varchar.out",
     []
 );
+// wire-rev-2a68496d0 H1: a CAST to NUMERIC(p, s) sorts, filters and aggregates as a number over several rows (dc853383a
+// made it text to the engine: wrong rows and row order, silently). No divergence registered for the row and order arms.
+replays_postgresql!(
+    pg18_wirefuzz_a_cast_to_numeric_sorts_filters_and_aggregates_as_a_number_replays_as_postgresql_answered,
+    "pg18-wirefuzz-a_cast_to_numeric_sorts_filters_and_aggregates_as_a_number.out",
+    []
+);
 replays_postgresql!(
     pg18_wirefuzz_the_connected_database_is_current_database_and_in_pg_database_replays_as_postgresql_answered,
     "pg18-wirefuzz-the_connected_database_is_current_database_and_in_pg_database.out",
