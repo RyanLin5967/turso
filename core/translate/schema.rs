@@ -969,6 +969,25 @@ fn derive_ctas_schema(
         })
         .collect();
     let strict = custom.iter().any(Option::is_some);
+    // In a STRICT copy, a column without a custom type takes the STRICT name of its affinity only
+    // when its values are known to be of it: a column of a STRICT table that is not of a custom
+    // type (its rows already passed that check). Any other value (a non-STRICT table's column, an
+    // expression) may be of any type, so the column is ANY, as SQLite's copy keeps it (engine review
+    // 2bdcd32c6 HIGH 7: `y INTEGER` copied text 'abc' and blob X'01' from a non-STRICT INT column
+    // unchecked, into a STRICT table that then refused its own rows). Mutant
+    // `ctas_strict_names_unchecked` (test builds only): every column its affinity's name, and no
+    // TypeCheck at the insert (`emit_ctas_insert`), as before.
+    let strict_typed_source = |expr: &ast::Expr| {
+        let ast::Expr::Column { table, column, .. } = expr else {
+            return false;
+        };
+        table_refs.find_table_by_internal_id(*table).is_some_and(|(_, t)| {
+            matches!(t, crate::schema::Table::BTree(bt) if bt.is_strict)
+                && t.get_column_at(*column)
+                    .is_some_and(|c| !c.is_array() && resolver.schema().get_type_def(&c.ty_str, true).is_none())
+        })
+    };
+    let unchecked_names = crate::branch::store::fe_mutant("ctas_strict_names_unchecked");
 
     let mut sql_parts = Vec::with_capacity(result_columns.len());
     let mut col_defs = Vec::with_capacity(result_columns.len());
@@ -981,6 +1000,7 @@ fn derive_ctas_schema(
                 array_dimensions: 0,
             }
             .to_string(),
+            (None, true) if !unchecked_names && !strict_typed_source(&col.expr) => "ANY".to_string(),
             (None, true) => match col.declared_type(table_refs) {
                 "INT" => "INTEGER",
                 "REAL" => "REAL",
@@ -1093,6 +1113,10 @@ fn emit_ctas_insert(
     let ctas_btree = Arc::new(create_table(table_name, body, 0)?);
     let ctas_btree_strict = ctas_btree.is_strict;
     let ctas_columns = ctas_btree.columns().to_vec();
+    // A STRICT copy's rows are checked as an INSERT's are after its ENCODE (engine review 2bdcd32c6
+    // HIGH 7): a value its column's type does not take refuses the copy instead of being stored.
+    let ctas_type_check = (ctas_btree_strict && !crate::branch::store::fe_mutant("ctas_strict_names_unchecked"))
+        .then(|| BTreeTable::type_check_table_ref(&ctas_btree, resolver.schema()));
     let new_table_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(ctas_btree));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: new_table_cursor_id,
@@ -1131,6 +1155,14 @@ fn emit_ctas_insert(
             table_name,
             &layout,
         )?;
+    }
+    if let Some(table_reference) = ctas_type_check {
+        program.emit_insn(Insn::TypeCheck {
+            start_reg: result_start_reg,
+            count: col_count,
+            check_generated: true,
+            table_reference,
+        });
     }
     let record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
