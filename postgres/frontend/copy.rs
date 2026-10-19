@@ -37,16 +37,8 @@ pub fn parse_copy_rows(
     columns: &[String],
 ) -> Result<Vec<CopyRow>> {
     let mut rows = Vec::new();
-    let bad_format = |text: String| {
-        LimboError::InvalidArgument(SqlErrorMessage::classified(SqlErrorKind::BadCopyFileFormat, text))
-    };
 
-    for line in data.lines() {
-        // End-of-data marker (used in STDIN mode, but handle it for files too)
-        if line == "\\." {
-            break;
-        }
-
+    for line in split_copy_lines(data)? {
         // Every line is a row, an empty one included: one empty field, as PostgreSQL's
         // CopyReadAttributesText reads it (an empty string for a one-column COPY, else 22P04;
         // recorded, copy-stdin-pg18.txt `escapes`). Empty lines were skipped.
@@ -62,17 +54,82 @@ pub fn parse_copy_rows(
             .iter()
             .map(|field| {
                 if *field == null_string {
-                    None
+                    Ok(None)
                 } else {
-                    Some(unescape_copy_field(field))
+                    unescape_copy_field(field).map(Some)
                 }
             })
-            .collect();
+            .collect::<Result<_>>()?;
 
         rows.push(row);
     }
 
     Ok(rows)
+}
+
+fn bad_format(text: String) -> LimboError {
+    LimboError::InvalidArgument(SqlErrorMessage::classified(SqlErrorKind::BadCopyFileFormat, text))
+}
+
+/// PostgreSQL's 22021 for bytes that are not UTF-8 (the client's encoding), naming the first bad
+/// sequence as PostgreSQL does (`0xff`, `0xc3 0x28`); a NUL byte is one too (0x00), as PostgreSQL
+/// refuses it in text.
+pub fn invalid_utf8(bad: &[u8]) -> LimboError {
+    let shown: Vec<String> = bad.iter().map(|b| format!("0x{b:02x}")).collect();
+    LimboError::InvalidArgument(SqlErrorMessage::classified(
+        SqlErrorKind::CharacterNotInRepertoire,
+        format!("invalid byte sequence for encoding \"UTF8\": {}", shown.join(" ")),
+    ))
+}
+
+/// `bytes` as UTF-8 text with no NUL, or [`invalid_utf8`] naming the first bad sequence.
+pub fn copy_text(bytes: &[u8]) -> Result<&str> {
+    let text = std::str::from_utf8(bytes).map_err(|e| {
+        let bad = &bytes[e.valid_up_to()..];
+        invalid_utf8(&bad[..e.error_len().unwrap_or(bad.len()).min(bad.len())])
+    })?;
+    if text.contains('\0') {
+        return Err(invalid_utf8(&[0]));
+    }
+    Ok(text)
+}
+
+/// The data's lines, as PostgreSQL's CopyReadLineText reads them: a newline ends a line (a
+/// carriage return before it is dropped) unless a backslash escapes it, so `a\<LF>b` is one line
+/// holding a newline in its field; `\.` alone on its line ends the data, and `\.` anywhere else is
+/// 22P04 "end-of-copy marker is not alone on its line" (PostgreSQL 18; recorded,
+/// copy-stdin-pg18.txt `bsnewline`, `dotnotalone`). `lines()` ended a line at an escaped newline,
+/// and loaded `abc\.` as `abc.`.
+fn split_copy_lines(data: &str) -> Result<Vec<&str>> {
+    let b = data.as_bytes();
+    let mut lines = Vec::new();
+    let (mut start, mut i) = (0, 0);
+    while i < b.len() {
+        match b[i] {
+            b'\\' if b.get(i + 1) == Some(&b'.') => {
+                let ends = matches!(b.get(i + 2), None | Some(b'\n') | Some(b'\r'));
+                if i == start && ends {
+                    return Ok(lines);
+                }
+                return Err(bad_format("end-of-copy marker is not alone on its line".to_string()));
+            }
+            // The escaped byte is data: ASCII (a newline, the delimiter) or the lead byte of a
+            // character, whose continuation bytes are never a newline or a backslash.
+            b'\\' => i += 2,
+            b'\n' => {
+                let end = if i > start && b[i - 1] == b'\r' { i - 1 } else { i };
+                lines.push(&data[start..end]);
+                i += 1;
+                start = i;
+            }
+            _ => i += 1,
+        }
+    }
+    if start < b.len() {
+        let end = if b[b.len() - 1] == b'\r' { b.len() - 1 } else { b.len() };
+        lines.push(&data[start..end.max(start)]);
+    }
+    Ok(lines)
 }
 
 /// A line's fields as written (escapes still in them), split at each delimiter that no backslash
@@ -95,23 +152,32 @@ fn split_copy_fields(line: &str, delimiter: char) -> Vec<&str> {
 }
 
 /// Unescape backslash sequences in a COPY text field, as PostgreSQL's text format reads them:
-/// `\b \f \n \r \t \v`, an octal `\N`, `\NN` or `\NNN`, a hex `\xH` or `\xHH` (a byte; one that
-/// is not ASCII is kept as its character), and a backslash before any other character is that
-/// character.
-fn unescape_copy_field(field: &str) -> String {
-    let mut result = String::with_capacity(field.len());
+/// `\b \f \n \r \t \v`, an octal `\N`, `\NN` or `\NNN` and a hex `\xH` or `\xHH`, each one BYTE,
+/// and a backslash before any other character is that character. The bytes must make UTF-8 with
+/// no NUL, else 22021 as PostgreSQL's pg_verifymbstr answers (recorded, copy-stdin-pg18.txt
+/// `utf8esc`, `badbyte`, `nul`): `\303\251` is é. Each escape was taken as the character of its
+/// number, so `\303\251` stored Ã© and `\377` stored ÿ.
+fn unescape_copy_field(field: &str) -> Result<String> {
+    if !field.contains('\\') {
+        return Ok(field.to_string());
+    }
+    let mut result: Vec<u8> = Vec::with_capacity(field.len());
     let mut chars = field.chars().peekable();
+    fn push(result: &mut Vec<u8>, c: char) {
+        let mut buf = [0u8; 4];
+        result.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+    }
 
     while let Some(c) = chars.next() {
         if c == '\\' {
             match chars.next() {
-                Some('\\') => result.push('\\'),
-                Some('t') => result.push('\t'),
-                Some('n') => result.push('\n'),
-                Some('r') => result.push('\r'),
-                Some('b') => result.push('\x08'),
-                Some('f') => result.push('\x0C'),
-                Some('v') => result.push('\x0B'),
+                Some('\\') => result.push(b'\\'),
+                Some('t') => result.push(b'\t'),
+                Some('n') => result.push(b'\n'),
+                Some('r') => result.push(b'\r'),
+                Some('b') => result.push(0x08),
+                Some('f') => result.push(0x0C),
+                Some('v') => result.push(0x0B),
                 Some(d @ '0'..='7') => {
                     let mut value = d.to_digit(8).unwrap_or(0);
                     for _ in 0..2 {
@@ -123,7 +189,7 @@ fn unescape_copy_field(field: &str) -> String {
                             None => break,
                         }
                     }
-                    result.push(char::from((value & 0xff) as u8));
+                    result.push((value & 0xff) as u8);
                 }
                 Some('x') if chars.peek().is_some_and(|c| c.is_ascii_hexdigit()) => {
                     let mut value = 0;
@@ -136,21 +202,18 @@ fn unescape_copy_field(field: &str) -> String {
                             None => break,
                         }
                     }
-                    result.push(char::from(value as u8));
+                    result.push(value as u8);
                 }
-                Some(other) => {
-                    result.push(other);
-                }
-                None => {
-                    result.push('\\');
-                }
+                Some(other) => push(&mut result, other),
+                None => result.push(b'\\'),
             }
         } else {
-            result.push(c);
+            push(&mut result, c);
         }
     }
 
-    result
+    copy_text(&result)?;
+    Ok(String::from_utf8(result).expect("checked by copy_text"))
 }
 
 #[cfg(test)]

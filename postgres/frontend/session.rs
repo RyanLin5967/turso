@@ -4131,10 +4131,15 @@ fn opened_path(_file: &std::fs::File) -> Option<std::path::PathBuf> {
     None
 }
 
-/// COPY FROM a file, checked in PostgreSQL's order: the table and columns (DoCopy opens the
-/// relation first), the options, then the file (recorded, copy-stdin-pg18.txt `nosuchopt`: 42P01
-/// before 42601; the options were checked first).
+/// COPY FROM a file, checked in PostgreSQL's order: the role's file grant (DoCopy refuses a role
+/// without pg_read_server_files first; here a server granting no directory, 42501), the table and
+/// columns (then DoCopy opens the relation), the options, then the file (recorded,
+/// copy-stdin-pg18.txt `nosuchopt`, `nofiles`). A grant of one directory depends on the file's
+/// path, so it is read when the file is opened, after the table.
 fn handle_pg_copy_from(pg_conn: &Arc<PgConnectionInner>, stmt: &PgCopyFromStmt) -> Result<usize> {
+    if matches!(pg_conn.server_files, ServerFiles::None) {
+        open_server_file(&pg_conn.server_files, &stmt.filename)?;
+    }
     let target = copy_target(pg_conn, stmt)?;
     refuse_copy_options(stmt)?;
     let mut data = String::new();
@@ -4145,8 +4150,8 @@ fn handle_pg_copy_from(pg_conn: &Arc<PgConnectionInner>, stmt: &PgCopyFromStmt) 
 }
 
 /// COPY FROM STDIN, in its two runs ([`CopyStdin`]): with no end set, its target is checked as
-/// PostgreSQL checks it before CopyInResponse (its options, then the table and columns: 0A000,
-/// 42601, 42P01, 42703) and the request for its rows is left for the server, 0 loaded; with the
+/// PostgreSQL checks it before CopyInResponse (the table and columns, then the options: 42P01,
+/// 42703, 0A000, 42601, 22023) and the request for its rows is left for the server, 0 loaded; with the
 /// client's data, the rows are loaded as COPY FROM a file loads them; with a CopyFail, its error.
 /// A connection no server serves has no client to send the rows: 0A000.
 fn handle_pg_copy_from_stdin(
@@ -4178,43 +4183,86 @@ fn handle_pg_copy_from_stdin(
             Ok(0)
         }
         Some(CopyEnd::Data(bytes)) => {
-            // The client's encoding is UTF8 (FIXED_SETTINGS): any other byte sequence is
-            // PostgreSQL's 22021.
-            let data = str::from_utf8(bytes).map_err(|e| {
-                let bad = &bytes[e.valid_up_to()..];
-                let len = e.error_len().unwrap_or(bad.len()).min(bad.len());
-                let shown: Vec<String> = bad[..len].iter().map(|b| format!("0x{b:02x}")).collect();
-                LimboError::InvalidArgument(SqlErrorMessage::classified(
-                    SqlErrorKind::CharacterNotInRepertoire,
-                    format!("invalid byte sequence for encoding \"UTF8\": {}", shown.join(" ")),
-                ))
-            })?;
+            // The client's encoding is UTF8 (FIXED_SETTINGS): any other byte sequence, or a NUL,
+            // is PostgreSQL's 22021.
+            let data = crate::copy::copy_text(bytes)?;
             load_copy_rows(pg_conn, stmt, &target, data)
         }
     }
 }
 
-/// Whether the text holds the word STDIN in any case, outside a string literal: a COPY FROM
-/// STDIN's must, as `FROM ''` holds it only in a comment or identifier at most (BLIND SPOT: `COPY
-/// t FROM '' -- stdin` is read as STDIN).
+/// Whether a COPY's text reads from the client: the token after its FROM keyword is the bare word
+/// STDIN or STDOUT (PostgreSQL's copy_file_name takes either; recorded, copy-stdin-pg18.txt
+/// `fromstdout`), read as the lexer reads it, past comments (`--`, nested `/* */`), string literals
+/// (`''` doubled, an E'' string's backslash escapes) and quoted names (`""` doubled). A COPY's
+/// first top-level FROM is its source (a column named from is quoted). Read as a run of
+/// apostrophes, an apostrophe in a comment or a quoted name hid STDIN (the second review of
+/// b74a48d82), and a table or column named stdin made `FROM ''` read the client.
 fn names_stdin(sql: &str) -> bool {
     let b = sql.as_bytes();
-    let mut quoted = false;
+    let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c >= 0x80;
+    let mut after_from = false;
     let mut i = 0;
     while i < b.len() {
-        match b[i] {
-            b'\'' => quoted = !quoted,
-            _ if !quoted
-                && b[i..].len() >= 5
-                && b[i..i + 5].eq_ignore_ascii_case(b"stdin")
-                && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_'))
-                && b.get(i + 5).is_none_or(|c| !(c.is_ascii_alphanumeric() || *c == b'_')) =>
-            {
-                return true
+        let c = b[i];
+        if c.is_ascii_whitespace() {
+            i += 1;
+        } else if c == b'-' && b.get(i + 1) == Some(&b'-') {
+            i += b[i..].iter().position(|&c| c == b'\n').unwrap_or(b.len() - i);
+        } else if c == b'/' && b.get(i + 1) == Some(&b'*') {
+            let mut depth = 0;
+            while i < b.len() {
+                if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+                    depth += 1;
+                    i += 2;
+                } else if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
+                    depth -= 1;
+                    i += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    i += 1;
+                }
             }
-            _ => {}
+        } else if c == b'\'' || c == b'"' {
+            if after_from {
+                return false;
+            }
+            // An E'' string reads backslash escapes; its E was the word just before, adjacent.
+            let escapes = c == b'\'' && i > 0 && b[i - 1].eq_ignore_ascii_case(&b'e')
+                && (i < 2 || !word(b[i - 2]));
+            i += 1;
+            while i < b.len() {
+                if escapes && b[i] == b'\\' {
+                    i += 2;
+                } else if b[i] == c {
+                    if b.get(i + 1) == Some(&c) {
+                        i += 2;
+                    } else {
+                        i += 1;
+                        break;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+        } else if word(c) {
+            let start = i;
+            while i < b.len() && word(b[i]) {
+                i += 1;
+            }
+            let token = &b[start..i];
+            if after_from {
+                return token.eq_ignore_ascii_case(b"stdin") || token.eq_ignore_ascii_case(b"stdout");
+            }
+            after_from = token.eq_ignore_ascii_case(b"from");
+        } else {
+            if after_from {
+                return false;
+            }
+            i += 1;
         }
-        i += 1;
     }
     false
 }
@@ -4229,6 +4277,44 @@ fn refuse_copy_options(stmt: &PgCopyFromStmt) -> Result<()> {
         return Err(LimboError::ParseError(
             SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, "COPY FROM ... WHERE is not supported".to_string()),
         ));
+    }
+    // DELIMITER and NULL, as PostgreSQL 18.6's ProcessCopyOptions checks them, in its order
+    // (recorded, copy-stdin-pg18.txt part 3: `delim2` .. `delimutf8`). The delimiter's first
+    // character was used whatever the rest, a tab for '', and every other value was taken.
+    let refuse = |kind, text: String| {
+        Err(LimboError::InvalidArgument(SqlErrorMessage::classified(kind, text)))
+    };
+    let delimiter = stmt.delimiter.as_deref().unwrap_or("\t");
+    let null = stmt.null_string.as_deref().unwrap_or("\\N");
+    if delimiter.len() != 1 {
+        return refuse(
+            SqlErrorKind::FeatureNotSupported,
+            "COPY delimiter must be a single one-byte character".to_string(),
+        );
+    }
+    if delimiter == "\n" || delimiter == "\r" {
+        return refuse(
+            SqlErrorKind::InvalidParameterValue,
+            "COPY delimiter cannot be newline or carriage return".to_string(),
+        );
+    }
+    if null.contains(['\n', '\r']) {
+        return refuse(
+            SqlErrorKind::InvalidParameterValue,
+            "COPY null representation cannot use newline or carriage return".to_string(),
+        );
+    }
+    if "\\.abcdefghijklmnopqrstuvwxyz0123456789".contains(delimiter) {
+        let mut text = String::from("COPY delimiter cannot be \"");
+        text.push_str(delimiter);
+        text.push('"');
+        return refuse(SqlErrorKind::InvalidParameterValue, text);
+    }
+    if null.contains(delimiter) {
+        return refuse(
+            SqlErrorKind::InvalidParameterValue,
+            "COPY delimiter character must not appear in the NULL specification".to_string(),
+        );
     }
     Ok(())
 }
@@ -4334,9 +4420,9 @@ enum CopyInput {
     /// case); the range is not (a bigserial takes 3000000000; an integer past int4 is stored, the
     /// engine's PGDIV-INT-RANGE, and a regclass name is the engine's refusal, as before).
     Integer,
-    /// smallint or bigint (the engine's own types, unambiguous): syntax and range, as
-    /// [`crate::functions::validate_pg_input`] checks them.
-    Ranged(&'static str),
+    /// smallint or bigint (the engine's own types, unambiguous): PostgreSQL 16's syntax and the
+    /// type's range (22003 worded for it), stored as decimal digits.
+    Ranged(&'static str, i128, i128),
     /// varchar(n) (`false`) or char(n) (`true`): past n characters 22001, unless the excess is
     /// all spaces, which PostgreSQL cuts off (varchar_input, bpchar_input).
     Length(usize, bool),
@@ -4349,12 +4435,52 @@ fn copy_input_type(col: &turso_core::schema::Column) -> Option<CopyInput> {
     let (_, udt, len, ..) = crate::information_schema::column_type(col);
     match (udt.as_str(), len) {
         ("int4", _) => Some(CopyInput::Integer),
-        ("int2", _) => Some(CopyInput::Ranged("int2")),
-        ("int8", _) => Some(CopyInput::Ranged("int8")),
+        ("int2", _) => Some(CopyInput::Ranged("smallint", i16::MIN.into(), i16::MAX.into())),
+        ("int8", _) => Some(CopyInput::Ranged("bigint", i64::MIN.into(), i64::MAX.into())),
         ("varchar", Some(n)) => usize::try_from(n).ok().map(|n| CopyInput::Length(n, false)),
         ("bpchar", Some(n)) => usize::try_from(n).ok().map(|n| CopyInput::Length(n, true)),
         _ => None,
     }
+}
+
+/// An integer as PostgreSQL 16's int4in/int8in read it: ASCII white space around it, a sign,
+/// then decimal digits or a 0x, 0o or 0b prefix and its digits, a single underscore allowed
+/// between two digits. None for anything else; Some(None) for one past i128.
+fn pg_integer(field: &str) -> Option<Option<i128>> {
+    let text = field.trim_matches(|c: char| c.is_ascii_whitespace());
+    let (negative, body) = match text.as_bytes().first() {
+        Some(b'-') => (true, &text[1..]),
+        Some(b'+') => (false, &text[1..]),
+        _ => (false, text),
+    };
+    let lower = body.get(..2).map(str::to_ascii_lowercase);
+    let (radix, digits) = match lower.as_deref() {
+        Some("0x") => (16, &body[2..]),
+        Some("0o") => (8, &body[2..]),
+        Some("0b") => (2, &body[2..]),
+        _ => (10, body),
+    };
+    let bytes = digits.as_bytes();
+    if bytes.is_empty() || bytes[0] == b'_' || bytes[bytes.len() - 1] == b'_' {
+        return None;
+    }
+    let mut value: Option<i128> = Some(0);
+    let mut last_underscore = false;
+    for &c in bytes {
+        if c == b'_' {
+            if last_underscore {
+                return None;
+            }
+            last_underscore = true;
+            continue;
+        }
+        last_underscore = false;
+        let digit = (c as char).to_digit(radix)?;
+        value = value
+            .and_then(|v| v.checked_mul(i128::from(radix)))
+            .and_then(|v| v.checked_add(i128::from(digit)));
+    }
+    Some(value.map(|v| if negative { -v } else { v }))
 }
 
 impl CopyInput {
@@ -4364,21 +4490,37 @@ impl CopyInput {
             Err(LimboError::InvalidArgument(SqlErrorMessage::classified(kind, text)))
         };
         match self {
-            CopyInput::Integer => {
-                // int4in skips ASCII white space around the digits.
-                let digits = field.trim_matches(|c: char| c.is_ascii_whitespace());
-                if digits.parse::<i128>().is_ok() {
-                    Ok(None)
-                } else {
-                    refuse(
-                        SqlErrorKind::InvalidTextRepresentation,
-                        format!("invalid input syntax for type integer: \"{field}\""),
-                    )
+            // PostgreSQL 16's integer syntax, stored as its decimal digits (the engine reads no
+            // 0x or 1_000); past int8 22003, as no column stored as INTEGER takes it (recorded,
+            // copy-stdin-pg18.txt `intsyntax`, `int8over`; worded for integer, BLIND SPOT for a
+            // bigserial, where PostgreSQL says bigint).
+            CopyInput::Integer => match pg_integer(field) {
+                Some(Some(value)) if i64::try_from(value).is_ok() => {
+                    let decimal = value.to_string();
+                    Ok((decimal != field).then_some(decimal))
                 }
-            }
-            CopyInput::Ranged(ty) => match crate::functions::validate_pg_input(field, ty) {
-                Some((message, kind)) => refuse(kind, message),
-                None => Ok(None),
+                Some(_) => refuse(
+                    SqlErrorKind::NumericValueOutOfRange,
+                    format!("value \"{field}\" is out of range for type integer"),
+                ),
+                None => refuse(
+                    SqlErrorKind::InvalidTextRepresentation,
+                    format!("invalid input syntax for type integer: \"{field}\""),
+                ),
+            },
+            CopyInput::Ranged(ty, min, max) => match pg_integer(field) {
+                Some(Some(value)) if (*min..=*max).contains(&value) => {
+                    let decimal = value.to_string();
+                    Ok((decimal != field).then_some(decimal))
+                }
+                Some(_) => refuse(
+                    SqlErrorKind::NumericValueOutOfRange,
+                    format!("value \"{field}\" is out of range for type {ty}"),
+                ),
+                None => refuse(
+                    SqlErrorKind::InvalidTextRepresentation,
+                    format!("invalid input syntax for type {ty}: \"{field}\""),
+                ),
             },
             CopyInput::Length(n, blank_padded) => {
                 if field.chars().count() <= *n {
