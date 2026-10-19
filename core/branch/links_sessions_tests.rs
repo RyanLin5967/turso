@@ -177,6 +177,63 @@ fn past_the_hard_log_limit_the_upgrade_does_not_wait_for_the_fill() {
     assert!(meta >= 21, "past the hard limit the store still waited for its stalled fill: meta {meta}, log peak {peak} B");
 }
 
+// ---- past the hard limit, a fill starved of the store mutex (links H1 reopened) ----
+
+#[test]
+fn ls_fill_starved_child() {
+    if !in_child() {
+        return;
+    }
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("f.db");
+    older_store(&path, 1_000);
+    super::journal::set_compact_threshold(4 << 10);
+    // The fill's committed batches are held back from the store mutex, as a foreground that takes
+    // it on every operation starved them (diagnostic 4): only the hard limit can move the store.
+    super::store::LINKS_FILL_HELD_BATCHES.store(0, Ordering::Release);
+    super::store::LINKS_FILL_HOLD_UNRECORDED.store(true, Ordering::Release);
+    let db = open(&path);
+    db.branch_wait_name_filter();
+    let trunk = db.connect().unwrap();
+    let mut peak = 0;
+    let mut k = 0;
+    while !(db.branches.past_hard_limit_for_test() && super::store::LINKS_FILL_HELD_BATCHES.load(Ordering::Acquire) >= 1) && k < 20_000 {
+        let _ = trunk.fork_branch().unwrap().into_id();
+        peak = peak.max(log_bytes(&path));
+        k += 1;
+    }
+    let past = db.branches.past_hard_limit_for_test();
+    let held = super::store::LINKS_FILL_HELD_BATCHES.load(Ordering::Acquire);
+    // Operations past the hard limit, with the batch still held: each may start the checkpoint.
+    for _ in 0..50 {
+        let _ = trunk.fork_branch().unwrap().into_id();
+        peak = peak.max(log_bytes(&path));
+    }
+    db.branch_checkpoint_wait();
+    let meta = meta_version(&path);
+    super::store::LINKS_FILL_HOLD_UNRECORDED.store(false, Ordering::Release);
+    println!("LS-STARVED past={} held={held} creates={k} meta={meta} log={} peak={peak}", u64::from(past), log_bytes(&path));
+}
+
+/// Links H1 reopened (core-integrator, red alone 6/6 at 91c0ea8d2; diagnostic 3: 405 checks past the
+/// hard limit waited, columns never seen as made; diagnostic 4: the first batch COMMITTED, then sat
+/// waiting for the store mutex to record it): past the hard log limit, a fill batch that has
+/// committed but not yet been recorded under the store mutex must not hold the upgrade. The hold is
+/// a test hook, so this fails on every host, not only on a slow one.
+#[test]
+fn past_the_hard_log_limit_a_fill_batch_starved_of_the_store_mutex_does_not_hold_the_upgrade() {
+    if in_child() {
+        return;
+    }
+    let text = child("ls_fill_starved_child", &[]);
+    let r = readings(&text, "LS-STARVED ");
+    let (past, held, meta, peak) = (r[0][0], r[0][1], r[0][3], r[0][5]);
+    println!("LS starved: past {past}, held {held}, meta {meta}, peak {peak}");
+    assert_eq!(past, 1, "premise: the log never passed the hard limit (peak {peak} B)");
+    assert!(held >= 1, "premise: no fill batch committed and was held");
+    assert!(meta >= 21, "past the hard limit the upgrade waited for a fill batch it could not see: meta {meta}, log peak {peak} B");
+}
+
 // ---- L1: two explicit checkpoints ----
 
 #[test]

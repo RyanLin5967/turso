@@ -3799,6 +3799,17 @@ fn run_links_fill(shared: &StoreMutex, writer: &Mutex<Catalog>, group: &Group) {
         if matches!(batch, Ok(None)) && !fe_mutant("l4_fill_wal_left") {
             truncate_catalog_wal(&mut writer.lock(), group, None);
         }
+        // Test builds (links H1 reopened): a committed batch held back from the store mutex before
+        // it is recorded, as the fill was starved of it by a foreground that takes it on every
+        // operation (diagnostic 4, ecetesla1 and iccad6: the batch committed, and the gate never saw
+        // its columns).
+        #[cfg(test)]
+        if batch.is_ok() {
+            LINKS_FILL_HELD_BATCHES.fetch_add(1, Ordering::AcqRel);
+            while LINKS_FILL_HOLD_UNRECORDED.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
         let mut inner = shared.lock();
         let Some(cat) = inner.cat.as_mut() else {
             return;
@@ -3847,6 +3858,12 @@ fn run_links_fill(shared: &StoreMutex, writer: &Mutex<Catalog>, group: &Group) {
 pub(crate) static LINKS_FILL_PAUSE_MS: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 pub(crate) static LINKS_FILL_FAILS: AtomicBool = AtomicBool::new(false);
+/// Test builds (links H1 reopened): while set, a committed fill batch waits before it takes the store
+/// mutex to record itself; `LINKS_FILL_HELD_BATCHES` counts the batches that reached that point.
+#[cfg(test)]
+pub(crate) static LINKS_FILL_HOLD_UNRECORDED: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+pub(crate) static LINKS_FILL_HELD_BATCHES: AtomicU64 = AtomicU64::new(0);
 
 /// A fuzzy checkpoint's cut, after its catalog commit and before its install, holding no lock but
 /// briefly the store mutex (lead review 1 item 7, review 2 #5): wait — not holding the mutex — for
@@ -9097,6 +9114,12 @@ impl BranchStore {
     #[cfg(test)]
     pub(crate) fn wal_truncate_busy_for_test(&self) -> u64 {
         self.group.wal_truncate_busy.load(Ordering::Relaxed)
+    }
+
+    /// Test builds (links H1 reopened): whether the log is past the hard limit now.
+    #[cfg(test)]
+    pub(crate) fn past_hard_limit_for_test(&self) -> bool {
+        self.inner.lock().journal.as_ref().is_some_and(Journal::past_hard_limit)
     }
 
     /// Test builds (links adversary 3): `(filling, prefilled, fill threads started)`.
