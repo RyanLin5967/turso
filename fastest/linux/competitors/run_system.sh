@@ -563,11 +563,15 @@ du_total() { du -sB1 -c "$@" 2>/dev/null | awk '$2 == "total" {print $1}'; }
 # and the whole store (PG the cluster's data directory), each into the array DUP
 # pg_parent_dir OID -> DATA/base/OID, the template p's directory (comp-rev-89ec-b3c3 LOW 9: an empty oid named
 # DATA/base/, all of it, as the parent)
-pg_parent_dir() { echo "$DATA/base/$1"; }
+pg_parent_dir() {
+  [[ $1 =~ ^[1-9][0-9]*$ ]] || { echo "REFUSED: template p's oid [$1] is not a count" >&2; return 1; }
+  echo "$DATA/base/$1"
+}
 parent_du_paths() {
-  local oid
+  local oid dir
   case $KIND in
-    pg) oid=$(sqlq "SELECT oid FROM pg_database WHERE datname = 'p'"); DUP=("$(pg_parent_dir "$oid")") ;;
+    pg) oid=$(sqlq "SELECT oid FROM pg_database WHERE datname = 'p'")
+        if dir=$(pg_parent_dir "$oid"); then DUP=("$dir"); else fail "parent du paths: template p's oid [$oid] is not a count"; DUP=(); fi ;;
     dolt) DUP=("$DATA/dbs/bench") ;;
     doltgres) DUP=("$DATA/databases") ;;
     b1) DUP=("$ROOT/parent.db") ;;
@@ -592,7 +596,8 @@ parent_du_before_prebranch() {
     expect "pg_parent_dir refuses an empty or non-count oid (LOW 9)" "${got:-every planted oid refused}" "every planted oid refused"
   fi
   parent_du_paths
-  PARENT_DU0=$(du_total "${DUP[@]}")
+  # (an empty path list would make du measure the working directory)
+  if [ ${#DUP[@]} -eq 0 ]; then PARENT_DU0=""; else PARENT_DU0=$(du_total "${DUP[@]}"); fi
   [[ $PARENT_DU0 =~ ^[1-9][0-9]*$ ]] || fail "parent du before the prebranch [$PARENT_DU0] of ${DUP[*]} is not a count"
 }
 # server_fixture -- RAW/fixture.json for the parent this server just seeded (gate-6 review, t3run item 4): du of the
@@ -836,6 +841,14 @@ server_main() {
     { fail "server binary: $(cat "$RAW/binary-check.txt")"; return; }
   pass "server binary: $(cat "$RAW/binary-check.txt")"
   srv start "$DATA" 2>&1 | tee "$RAW/server-start.txt" || { fail "server start: $(tail -1 "$RAW/server-start.txt")"; return; }
+  # The server log every log-reading check slices (DATA.log: pg_waits, the delete and template waits, the panic greps)
+  # must be the server's log. Found by the LOW 15 probe (artie runs/uw-20261019-pgw-rh): a PG build whose
+  # postgresql.conf.sample turns logging_collector on (PGDG's RHEL 8 package) writes only "redirecting log output to
+  # logging collector process" there, so every such check reads nothing and the template waits read as 0.
+  if [ "$KIND" = pg ]; then
+    expect "the server log is the server's (it names the start: database system is ready to accept connections)" \
+      "$(grep -c 'database system is ready to accept connections' "$DATA.log" 2>/dev/null)" 1
+  fi
   srv seed "$DATA" "$ROWS" "$AGE" | tee "$RAW/seed.txt" || { cp "$DATA".gc.* "$RAW/" 2>/dev/null; fail "seed"; return; }
   # the GC's own record, banked with the job (MED 9: gc.txt was never banked): client output, log slice, verdict
   for f in "$DATA".gc.txt "$DATA".gc.log "$DATA".gc.verdict "$DATA".gc-settings.txt "$DATA".gc-settings.verdict; do
