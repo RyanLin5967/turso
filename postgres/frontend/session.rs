@@ -421,14 +421,14 @@ fn refuse_cross_database(
 }
 
 /// An ALTER COLUMN TYPE the engine cannot do as PostgreSQL does is refused 0A000 before anything
-/// runs. The engine changes the column's declaration and keeps every stored value as it was, so a
-/// type of another family (text to integer, integer to boolean) or a narrower integer would keep
-/// values the new type does not hold (PostgreSQL rewrites each row, or refuses 42804 / 22003).
-/// Allowed: within the character types (text, varchar, char), within the integers to as wide or
-/// wider, an integer to numeric or a float, numeric to numeric or a float, a float to a float; a
-/// length or precision is checked over every row by the translator's coercion check
-/// (alter_coercion_checks; wire-rev-629f4b926 HIGH-2). A column the walk cannot find is left to the
-/// engine's refusal.
+/// runs. The engine changes the column's declaration and keeps every stored value as it was, so
+/// only a change whose stored form is the same is allowed: text and varchar to text or varchar,
+/// and an integer to one as wide or wider. Every other change would keep values the new type does
+/// not hold: another family (text to integer), a narrower integer, int to numeric (raw integers
+/// under a numeric DECODE), numeric to numeric or a float (PG rounds 1.2345 to 1.23), float8 to
+/// real, and anything to or from char, which PG pads (wire-rev-cfdebc06d MED-3). A length is
+/// checked over every row by the translator's coercion check (alter_coercion_checks;
+/// wire-rev-629f4b926 HIGH-2). A column the walk cannot find is left to the engine's refusal.
 fn refuse_alter_column_type_across_families(
     pg_conn: &PgConnectionInner,
     parse: &turso_pg_parser::pg_query::ParseResult,
@@ -472,19 +472,16 @@ fn refuse_alter_column_type_across_families(
         // (family, integer width): the width orders the integers.
         let family = |t: &str| -> Option<(u8, u8)> {
             Some(match t {
-                "text" | "varchar" | "bpchar" | "char" | "character" | "character varying" => (0, 0),
+                "text" | "varchar" | "character varying" => (0, 0),
                 "int2" | "smallint" => (1, 2),
                 "int4" | "int" | "integer" | "serial" => (1, 4),
                 "int8" | "bigint" | "bigserial" => (1, 8),
-                "numeric" | "decimal" => (2, 0),
-                "float4" | "real" | "float8" | "double precision" | "double" | "float" => (3, 0),
                 _ => return None,
             })
         };
         let allowed = match (family(&old), family(&new)) {
-            (Some((a, _)), Some((b, _))) if a == b && a != 1 => true,
+            (Some((0, _)), Some((0, _))) => true,
             (Some((1, w_old)), Some((1, w_new))) => w_new >= w_old,
-            (Some((1, _)), Some((2 | 3, _))) | (Some((2, _)), Some((3, _))) => true,
             _ => false,
         };
         if !allowed {

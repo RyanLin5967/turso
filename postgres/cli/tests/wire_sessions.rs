@@ -12422,10 +12422,10 @@ replays_postgresql!(
     "pg18-wirefuzz-alter_column_type_and_add_column_default_coerce_every_row.out",
     [
         (3, "PGDIV-VARCHAR-OVERFLOW-CODE error-code [engine]: the value too long is refused, as in PG, with XX000 'value too long for varchar' (core's varchar ENCODE, a RAISE with no kind) where PG answers 22001 (engine 58045fb81 + the wire's sqlstate arm, at integration)"),
-        (5, "PGDIV-ALTER-COLUMN-SAME-NAME value [engine]: the engine's ALTER COLUMN refuses a new definition that keeps the column's name (core alter.rs: 'duplicate column name' for the column itself), so a type change that fits is 42601 where PG answers ALTER TABLE"),
+        (5, "PGDIV-ALTER-COLUMN-SAME-NAME value [wire]: the engine's ALTER COLUMN refuses a new definition that keeps the column's name (core alter.rs: 'duplicate column name' for the column itself), so a type change that fits is 42601 where PG answers ALTER TABLE"),
         (8, "PGDIV-VARCHAR-OVERFLOW-CODE error-code [engine]: the value too long is refused, as in PG, with XX000 'value too long for varchar' (core's varchar ENCODE, a RAISE with no kind) where PG answers 22001 (engine 58045fb81 + the wire's sqlstate arm, at integration)"),
-        (11, "PGDIV-ALTER-COLUMN-SAME-NAME value [engine]: the engine's ALTER COLUMN refuses a new definition that keeps the column's name (core alter.rs: 'duplicate column name' for the column itself), so a type change that fits is 42601 where PG answers ALTER TABLE (a PRIMARY KEY column is also refused there)"),
-        (12, "PGDIV-ALTER-COLUMN-SAME-NAME value [engine]: a cascade of #11: id stays int4 (23) where PG made it bigint (20); the rows agree"),
+        (11, "PGDIV-ALTER-COLUMN-SAME-NAME value [wire]: the engine's ALTER COLUMN refuses a new definition that keeps the column's name (core alter.rs: 'duplicate column name' for the column itself), so a type change that fits is 42601 where PG answers ALTER TABLE (a PRIMARY KEY column is also refused there)"),
+        (12, "PGDIV-ALTER-COLUMN-SAME-NAME value [wire]: a cascade of #11: id stays int4 (23) where PG made it bigint (20); the rows agree"),
     ]
 );
 // The M1 scenario again with a timestamptz literal the engine reads ('+00:00'), so the arithmetic's rows are compared
