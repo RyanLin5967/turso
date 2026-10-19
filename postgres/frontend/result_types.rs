@@ -649,8 +649,9 @@ pub struct StatementTypes {
     /// constant expressions, so an error in one is raised before the executor starts and before
     /// RowDescription, where a query that reads a relation or a function's rows raises it after
     /// (C53, PGDIV-ERROR-BEFORE-ROWDESC; recorded: `SELECT encode('abc', 'nosuch')` errors alone,
-    /// `SELECT x / 0 FROM nd` after its RowDescription). BLIND SPOT: a volatile function (random())
-    /// is not folded there, and its error comes after RowDescription.
+    /// `SELECT x / 0 FROM nd` after its RowDescription). A stable or volatile function is not folded there (random(),
+    /// pg_database_size(): PostgreSQL 18.6's list, pg18-nonimmutable-functions.list), so a statement
+    /// calling one raises after RowDescription, as PostgreSQL does.
     pub folds_at_plan: bool,
     /// For each result column of a plain SELECT, the parameter number when the column is a bare
     /// `$n`: the server announces such a column as that parameter's type, declared or inferred,

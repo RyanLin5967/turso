@@ -4287,8 +4287,8 @@ fn relation_name_taken(pg_conn: &Arc<PgConnectionInner>, schema: &str, table: &s
 /// Whether `parse` holds a DELETE ... USING anywhere (its rewrite reads the relations' declared
 /// columns): the statement itself, EXPLAIN's, a CTE's. The text is read for the word first, so any
 /// other statement pays one byte scan and no tree walk.
-/// [`crate::StatementTypes::folds_at_plan`]: the statement is a SELECT or VALUES with no FROM and
-/// no set operation.
+/// [`crate::StatementTypes::folds_at_plan`]: the statement is a SELECT or VALUES with no FROM, no
+/// set operation and no call of a stable or volatile function ([`calls_non_immutable`]).
 fn folds_at_plan(parse: &turso_pg_parser::pg_query::ParseResult) -> bool {
     use turso_pg_parser::pg_query::protobuf::{node::Node, SetOperation};
     let Some(Some(Node::SelectStmt(select))) = parse
@@ -4300,7 +4300,42 @@ fn folds_at_plan(parse: &turso_pg_parser::pg_query::ParseResult) -> bool {
     else {
         return false;
     };
-    select.from_clause.is_empty() && select.op() == SetOperation::SetopNone
+    select.from_clause.is_empty()
+        && select.op() == SetOperation::SetopNone
+        && !parse.protobuf.nodes().iter().any(|(n, ..)| {
+            matches!(n, turso_pg_parser::pg_query::NodeRef::FuncCall(call) if calls_non_immutable(call))
+        })
+}
+
+/// PostgreSQL 18.6's functions that are stable or volatile in every overload (recorded,
+/// pg18-nonimmutable-functions.list): the planner folds immutable calls only, so a statement
+/// calling one raises its error at execution, after RowDescription (pg_database_size(99999::oid):
+/// recorded, pg18-wirefuzz-pg_database_size_of_null_or_an_unknown_oid_answers_as_postgresql_does
+/// .out #3, #4). BLIND SPOT: a name with immutable and other overloads (31 of them) is taken as
+/// folded.
+static NON_IMMUTABLE: std::sync::LazyLock<Vec<&'static str>> = std::sync::LazyLock::new(|| {
+    include_str!("pg18-nonimmutable-functions.list")
+        .lines()
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect()
+});
+
+/// Whether `call` names a function [`NON_IMMUTABLE`] lists, bare or pg_catalog-qualified.
+fn calls_non_immutable(call: &turso_pg_parser::pg_query::protobuf::FuncCall) -> bool {
+    use turso_pg_parser::pg_query::protobuf::node::Node;
+    let names: Vec<&str> = call
+        .funcname
+        .iter()
+        .filter_map(|n| match &n.node {
+            Some(Node::String(s)) => Some(s.sval.as_str()),
+            _ => None,
+        })
+        .collect();
+    let name = match names.as_slice() {
+        [name] | ["pg_catalog", name] => name.to_ascii_lowercase(),
+        _ => return false,
+    };
+    NON_IMMUTABLE.binary_search(&name.as_str()).is_ok()
 }
 
 pub(crate) fn is_delete_using(sql: &str, parse: &turso_pg_parser::pg_query::ParseResult) -> bool {
