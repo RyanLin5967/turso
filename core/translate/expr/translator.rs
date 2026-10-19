@@ -410,7 +410,7 @@ pub fn translate_expr(
 
             // Check if either operand has a custom type with a matching operator
             if let Some(resolved) =
-                find_custom_type_operator(e1, e2, op, referenced_tables, resolver)
+                find_custom_type_operator(e1, e2, op, referenced_tables, resolver, program.id_value_type.as_ref())
             {
                 let result_reg = emit_custom_type_operator(
                     program,

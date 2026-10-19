@@ -1042,6 +1042,30 @@ impl Schema {
         self.type_registry.get(&type_key(type_name))
     }
 
+    /// The type whose operators a value of `td` takes: `td` itself, or, for a domain, the first
+    /// registered type down its base chain that is not a domain (a domain over numeric compares
+    /// and orders as numeric, as PostgreSQL's domains do; engine review 2bdcd32c6 HIGH 8: a domain's
+    /// TypeDef has no operators of its own, so its CHECK compared the stored blob). A domain over a
+    /// primitive has none to take: `td`. Mutant `domain_takes_no_base_operator` (test builds only):
+    /// `td`, as before.
+    pub(crate) fn operator_type_of(&self, td: &Arc<TypeDef>) -> Arc<TypeDef> {
+        if !td.is_domain || crate::branch::store::fe_mutant("domain_takes_no_base_operator") {
+            return td.clone();
+        }
+        let mut current = td.clone();
+        // A chain is acyclic (CREATE DOMAIN refuses a cycle); the bound only guards a corrupt registry.
+        for _ in 0..64 {
+            if !current.is_domain {
+                return current;
+            }
+            match self.get_type_def_unchecked(current.base()) {
+                Some(next) => current = next.clone(),
+                None => break,
+            }
+        }
+        td.clone()
+    }
+
     /// Look up a custom type definition by name without a strictness check.
     /// Only use this for operations that aren't column-scoped (e.g. DROP TYPE,
     /// CREATE TABLE validation, CAST).

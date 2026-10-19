@@ -320,6 +320,11 @@ pub struct ProgramBuilder {
     /// When set, `Expr::Id("value")` resolves to the register holding the input value,
     /// and type parameter names resolve to registers holding their concrete values.
     pub id_register_overrides: IdOverrides,
+    /// While a domain's CHECK is translated for a value outside any table (CAST to the domain,
+    /// `emit_domain_cast_constraints`), the domain whose value `Expr::Id("value")` holds, so a
+    /// comparison of it takes its base type's operators (`find_custom_type_operator`; engine review
+    /// 2bdcd32c6 HIGH 8). None otherwise.
+    pub id_value_type: Option<Arc<crate::schema::TypeDef>>,
     /// While an expression is translated inside a catch region ([Insn::CatchBegin]), the region's
     /// target: a RAISE(ABORT|FAIL|ROLLBACK) jumps there instead of halting, so the refusal it
     /// stands for leaves the statement running, as a function's refused value does.
@@ -779,6 +784,7 @@ impl ProgramBuilder {
             trigger_conflict_override: None,
             cursor_overrides: HashMap::default(),
             id_register_overrides: IdOverrides::default(),
+            id_value_type: None,
             catch_raise_target: None,
             hash_build_signatures: HashMap::default(),
             hash_tables_to_keep_open: BitSet::default(),

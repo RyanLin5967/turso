@@ -328,10 +328,34 @@ pub(super) fn find_custom_type_operator(
     op: &ast::Operator,
     referenced_tables: Option<&TableReferences>,
     resolver: &Resolver,
+    value_type: Option<&Arc<TypeDef>>,
 ) -> Option<ResolvedOperator> {
     let op_str = operator_to_str(op)?;
-    let lhs_info = expr_custom_type_info(e1, referenced_tables, resolver);
-    let rhs_info = expr_custom_type_info(e2, referenced_tables, resolver);
+    // `value` in a domain CHECK translated outside any table (CAST to the domain) is a value of
+    // that domain (`ProgramBuilder::id_value_type`).
+    let value_info = |e: &ast::Expr| {
+        let td = value_type?;
+        matches!(e, ast::Expr::Id(name) if name.as_str().eq_ignore_ascii_case("value")).then(|| ExprCustomTypeInfo {
+            type_name: td.name.to_lowercase(),
+            column: None,
+            type_def: td.clone(),
+        })
+    };
+    // A value of a domain takes its base type's operators (`Schema::operator_type_of`).
+    let with_operators = |info: ExprCustomTypeInfo| {
+        let type_def = resolver.schema().operator_type_of(&info.type_def);
+        ExprCustomTypeInfo {
+            type_name: type_def.name.to_lowercase(),
+            column: info.column,
+            type_def,
+        }
+    };
+    let lhs_info = expr_custom_type_info(e1, referenced_tables, resolver)
+        .or_else(|| value_info(e1))
+        .map(with_operators);
+    let rhs_info = expr_custom_type_info(e2, referenced_tables, resolver)
+        .or_else(|| value_info(e2))
+        .map(with_operators);
 
     // Try to find a direct or derived operator match on a type definition.
     let find_in_type_def = |type_def: &TypeDef| -> Option<(String, bool, bool)> {
@@ -417,8 +441,8 @@ pub(super) fn find_custom_type_operator(
     );
     let (lhs_info, rhs_info) = if comparison && lhs_info.is_none() && rhs_info.is_none() {
         (
-            derived_operand_info(e1, referenced_tables, resolver),
-            derived_operand_info(e2, referenced_tables, resolver),
+            derived_operand_info(e1, referenced_tables, resolver).map(with_operators),
+            derived_operand_info(e2, referenced_tables, resolver).map(with_operators),
         )
     } else {
         (lhs_info, rhs_info)
@@ -751,13 +775,18 @@ pub(super) fn emit_domain_cast_constraints(
     for td in chain {
         for (dc, constraint_name) in td.domain_checks.iter().zip(crate::schema::domain_check_names(td)) {
 
-            // Bind `value` → reg, translate check expr, verify truthy
+            // Bind `value` → reg, translate check expr, verify truthy. `value` is a value of this
+            // domain, so a comparison of it takes the domain's base type's operators (engine
+            // review 2bdcd32c6 HIGH 8: CAST(-1 AS dpos) passed CHECK (VALUE > 0) over numeric).
             program.id_register_overrides.insert("value", reg);
+            let outer_value_type = program.id_value_type.replace(td.clone());
 
             let expr_result_reg = program.alloc_register();
-            translate_expr(program, None, &dc.check, expr_result_reg, resolver)?;
+            let translated = translate_expr(program, None, &dc.check, expr_result_reg, resolver);
 
+            program.id_value_type = outer_value_type;
             program.id_register_overrides.remove("value");
+            translated?;
 
             let passed_label = program.allocate_label();
 

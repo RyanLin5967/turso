@@ -173,6 +173,8 @@ pub(crate) fn custom_type_comparator(
         }
     }
     let (type_def, _) = expr_custom_type(expr, referenced_tables, schema)?;
+    // A domain orders by its base type's '<' (engine review 2bdcd32c6 HIGH 8).
+    let type_def = schema.operator_type_of(&type_def);
     type_def
         .operators()
         .iter()
