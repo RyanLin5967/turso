@@ -15293,6 +15293,56 @@ fn computed_and_smallint_result_columns_carry_postgresqls_types() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// Found by the wire differential fuzzer against PostgreSQL 18.6 (wirefuzz, wire-fuzz1 and
+/// wire-fuzz2): a CREATE INDEX with no name was built under the empty name, so the second one
+/// was refused 42601 "index  already exists", where PostgreSQL chooses a name (ChooseRelationName):
+/// table, columns ("expr" for an expression) and "idx" joined by "_", each part cut to fit 63
+/// bytes, and a number after "idx" while the name is any relation's. Recorded on iccad2,
+/// cli/tests/pg18/pg18-index-names.out.
+#[test]
+fn an_index_with_no_name_is_named_as_postgresql_names_it() {
+    let dir = Scratch::new("index-names");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let long = "abcdefghijabcdefghijabcdefghijabcdefghij";
+    let mut wrong = Vec::new();
+    for sql in [
+        "CREATE TABLE ix(a int, b text)".to_string(),
+        "CREATE INDEX ON ix (a)".to_string(),
+        "CREATE INDEX ON ix (a)".to_string(),
+        "CREATE INDEX ON ix (a, b)".to_string(),
+        "CREATE TABLE ix_b_idx(x int)".to_string(),
+        "CREATE INDEX ON ix (b)".to_string(),
+        "CREATE UNIQUE INDEX ON ix (b)".to_string(),
+        "CREATE INDEX ON ix ((a + 1))".to_string(),
+        "CREATE INDEX ON ix ((a + 1))".to_string(),
+        format!("CREATE TABLE {long}({long} int)"),
+        format!("CREATE INDEX ON {long} ({long})"),
+    ] {
+        let r = a.q(&sql);
+        if r.error.is_some() {
+            wrong.push(format!("{sql}: {:?}", r.error));
+        }
+    }
+    for name in [
+        "abcdefghijabcdefghijabcdefghi_abcdefghijabcdefghijabcdefghi_idx",
+        "ix_a_b_idx",
+        "ix_a_idx",
+        "ix_a_idx1",
+        "ix_b_idx1",
+        "ix_b_idx2",
+        "ix_expr_idx",
+        "ix_expr_idx1",
+    ] {
+        let sql = format!("DROP INDEX {name}");
+        let r = a.q(&sql);
+        if r.error.is_some() {
+            wrong.push(format!("{sql}: {:?} (PostgreSQL names this index)", r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-uw2 N5: a schema-qualified type was refused 42704 'type "public m" does not exist',
 /// its parts joined with a blank, so a pg_dump restore, which writes public.<type> for every enum
 /// and domain column, failed at its first such table. PostgreSQL 18.6 takes public.m and
