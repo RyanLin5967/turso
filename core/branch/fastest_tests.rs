@@ -15810,6 +15810,32 @@ fn a_failed_flight_loses_async_creates_visibly() {
     assert!(held, "premise: the flusher was held");
 }
 
+/// engine-rev-qaf-fix2 MED 8 (ASYNC-DESIGN §8): a connection already open on an async create whose
+/// flight then fails stops reading it. resolve_into refused only an in-doubt branch, so the open
+/// connection read on, and its status stayed NotYetDurable for good.
+#[test]
+fn an_open_connection_on_a_lost_async_create_stops_reading_it() {
+    let _s = serial();
+    let class = if cfg!(target_vendor = "apple") { SyncClass::FullFsync } else { SyncClass::Fsync };
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("lostopen.db"), opts(true, class));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    trunk.create_branch_async("warm").unwrap();
+    let held = db.branch_flusher_hold(true);
+    db.branch_failpoint(Some(BranchFailpoint::GroupFlightFails));
+    trunk.create_branch_async("doomed").unwrap();
+    let open = db.connect_named("doomed").unwrap();
+    db.branch_flusher_hold(false);
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < until && db.branch_ids().map(|ids| ids.len() > 1).unwrap_or(false) {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let read = adv_rows(&open, "SELECT count(*) FROM t");
+    assert!(read.is_err(), "CLAIM: the open connection on the lost create stops reading it: {read:?}");
+    assert!(held, "premise: the flusher was held");
+}
+
 /// Diagnostic, never fails (the segment-crossing L2(b) test found one create allocating about
 /// 2.6 MB under the store mutex near 72,000 branches, lane raws 44f57b34b3 / 92f7246c8a): the same
 /// workload, each thread recording every allocation of at least 1 MiB with its backtrace.
