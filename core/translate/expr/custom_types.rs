@@ -3494,4 +3494,32 @@ mod tests {
         );
         assert!(bad.is_empty(), "CLAIM: a join on numeric values answered unlike numeric's equality: {bad:#?}");
     }
+
+    /// Third fresh-context review of this lane's fixes (item 2): ORDER BY over a numeric
+    /// expression sorts through numeric's '<' (437f337be), but an index on the expression could
+    /// supply the order instead, the order of the numeric texts it holds ('10.00' before '3.00'),
+    /// and min/max read from its ends. Expected values are PostgreSQL 18.6's for this exact SQL
+    /// with that index (UW run typesrev2bd-oracle8; artie raw
+    /// frontier/fastest/lanes/engine/raw/pg18-types-rev2bd-7.txt f79da8dc72), never ours.
+    #[test]
+    fn an_index_on_a_numeric_expression_supplies_no_text_order() {
+        let conn = open();
+        for sql in [
+            "CREATE TABLE n(id INTEGER PRIMARY KEY, b numeric(8, 2)) STRICT",
+            "INSERT INTO n VALUES (1, 2.00), (2, 9.00), (4, 0.50)",
+            "CREATE INDEX nb1 ON n(b + 1)",
+        ] {
+            conn.execute(sql).unwrap();
+        }
+        let bad = diverging(
+            &conn,
+            &[
+                ("SELECT id FROM n ORDER BY b + 1", "4;1;2"),
+                ("SELECT id FROM n ORDER BY b + 1 DESC", "2;1;4"),
+                ("SELECT max(b + 1), min(b + 1) FROM n", "10.00,1.50"),
+            ],
+            "PostgreSQL 18",
+        );
+        assert!(bad.is_empty(), "CLAIM: an index on a numeric expression supplied the order of its texts: {bad:#?}");
+    }
 }
