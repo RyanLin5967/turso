@@ -188,6 +188,21 @@ pub struct Parser<'a> {
 /// 1000-deep tree still overflows a default 8 MiB thread stack in debug builds.
 pub const MAX_EXPR_DEPTH: usize = 100;
 
+/// The type name `text` reads back as where a column type or a CAST type stands: None unless all of
+/// `text` is one type name, with no size and no array suffix. The printer checks a printing it built
+/// against this (engine-rev 2bdcd32c6 HIGH 1).
+pub(crate) fn read_back_type_name(text: &str) -> Option<String> {
+    let mut p = Parser::new(text.as_bytes());
+    let ty = p.parse_type().ok()??;
+    if ty.size.is_some() || ty.array_dimensions != 0 {
+        return None;
+    }
+    match p.peek() {
+        Ok(None) => Some(ty.name),
+        _ => None,
+    }
+}
+
 impl<'a> Iterator for Parser<'a> {
     type Item = Result<Cmd>;
 

@@ -2525,9 +2525,9 @@ fn quoted_type_word_end(b: &[u8], start: usize) -> Option<usize> {
     None // unterminated
 }
 
-/// A type name holding a `]`, printed word by word so that it reads back as itself: a quoted word or
-/// a plain one as itself, any other word bracket-quoted (`"a]b" x,y` prints `"a]b" [x,y]`). None when
-/// some word can be neither (a raw word holding `]`, which the parser never produces).
+/// A type name holding a `]`, printed word by word as a28c82f07 printed it: a quoted word or a plain
+/// one as itself, any other word bracket-quoted. It misreads a bracket's content that holds spaces
+/// or quotes, so only mutant `type_pieces_cut_at_spaces` uses it; [`type_name_by_pieces`] prints.
 fn type_name_by_words(b: &[u8]) -> Option<String> {
     let mut out = String::new();
     for (k, w) in type_name_words(b)?.iter().enumerate() {
@@ -2548,6 +2548,53 @@ fn type_name_by_words(b: &[u8]) -> Option<String> {
         }
     }
     Some(out)
+}
+
+/// A printing of a type name holding a `]` that reads back as itself: the name cut into pieces joined
+/// by one space each, every piece either one whole well-formed quoted token (printed as itself) or a
+/// non-empty run holding no `]` (printed bare when it is a plain type word, else bracket-quoted with
+/// its spaces and quotes). A bracket's content may hold spaces and quotes, so the cut points are
+/// searched for, not taken at the spaces (engine-rev 2bdcd32c6 HIGH 1: `a  "]"` from `[a ] "]"`, and
+/// `"x " ]"` from `["x] " ]"`, have no cut at the spaces alone). The parser's own tokens are always
+/// such a cut, so one exists for every parsed name; the result is checked by reading it back.
+fn type_name_by_pieces(name: &str) -> Option<String> {
+    let b = name.as_bytes();
+    let n = b.len();
+    // back[e] = (s, quoted): the piece b[s..e] ends a cut of b[..e] that starts at 0.
+    let mut back: Vec<Option<(usize, bool)>> = vec![None; n + 1];
+    for s in 0..n {
+        if s > 0 && !(b[s - 1] == b' ' && back[s - 1].is_some()) {
+            continue;
+        }
+        if let Some(e) = quoted_type_word_end(b, s) {
+            back[e].get_or_insert((s, true));
+        }
+        let mut e = s;
+        while e < n && b[e] != b']' {
+            e += 1;
+            if e == n || b[e] == b' ' {
+                back[e].get_or_insert((s, false));
+            }
+        }
+    }
+    let mut pieces = Vec::new();
+    let mut e = n;
+    loop {
+        let (s, quoted) = back[e]?;
+        let t = std::str::from_utf8(&b[s..e]).ok()?;
+        pieces.push(if quoted || crate::lexer::is_plain_type_word(t.as_bytes()) {
+            t.to_string()
+        } else {
+            format!("[{t}]")
+        });
+        if s == 0 {
+            break;
+        }
+        e = s - 1;
+    }
+    pieces.reverse();
+    let out = pieces.join(" ");
+    (crate::parser::read_back_type_name(&out).as_deref() == Some(name)).then_some(out)
 }
 
 /// The parser's registered mutants (`FE_MUTANT`, the convention of turso_core's
@@ -2576,9 +2623,10 @@ impl ToTokens for Type {
     ) -> Result<(), S::Error> {
         // The name prints so that it reads back as itself (engine-rev-qaf-fix HIGH-4): bare when every
         // word is a plain type word, else bracket-quoted as written (`[x,y]`, `[not null]`), which the
-        // parser reads back as the bracket's bytes; a name holding `]` prints word by word. Only a
-        // name no parse produces (a raw word holding `]`) is left to the whole-name double quote,
-        // which does NOT read back as itself (the parser keeps a quoted type token's quotes).
+        // parser reads back as the bracket's bytes; a name holding `]` prints piece by piece
+        // (`type_name_by_pieces`). Only a name no parse produces (one with no such cut) is left to
+        // the whole-name double quote, which does NOT read back as itself (the parser keeps a
+        // quoted type token's quotes).
         // A word may also be a quoted token the parser kept whole, quotes and all (`"a]b"`, `'x]y'`):
         // it prints as itself, since quoting it again made every rewrite grow it (engine-rev-qaf-fix2
         // HIGH A: 52, 64, 84, ... 568 bytes). Only a WHOLE well-formed token counts: a bracket's
@@ -2598,14 +2646,19 @@ impl ToTokens for Type {
             s.append(TK_ID, Some(&self.name))?;
         } else if !self.name.contains(']') {
             s.append(TK_ID, Some(&format!("[{}]", self.name)))?;
-        } else if let Some(by_words) = type_name_by_words(self.name.as_bytes())
-            .filter(|_| !fe_mutant("type_bracket_name_double_quoted"))
-        {
-            // A `]` sits inside a quoted word (`"a]b" [x,y]`): word by word, each read back as written.
-            // The whole-name double quote below keeps its quotes when read back, so it grew the name
-            // on every rewrite (engine-rev 2bdcd32c6 HIGH 1, the attack on b6e14769f). Mutant
-            // `type_bracket_name_double_quoted` (test builds of this crate only): straight to it.
-            s.append(TK_ID, Some(&by_words))?;
+        } else if let Some(by_pieces) = if fe_mutant("type_bracket_name_double_quoted") {
+            None
+        } else if fe_mutant("type_pieces_cut_at_spaces") {
+            type_name_by_words(self.name.as_bytes())
+        } else {
+            type_name_by_pieces(&self.name)
+        } {
+            // A `]` sits inside a quoted word (`"a]b" [x,y]`): piece by piece, each read back as
+            // written. The whole-name double quote below keeps its quotes when read back, so it grew
+            // the name on every rewrite (engine-rev 2bdcd32c6 HIGH 1, the attack on b6e14769f).
+            // Mutants (test builds of this crate only): `type_bracket_name_double_quoted`, straight to
+            // it; `type_pieces_cut_at_spaces`, a28c82f07's cut at every space.
+            s.append(TK_ID, Some(&by_pieces))?;
         } else {
             s.append(TK_ID, Some(&format!("\"{}\"", self.name.replace('"', "\"\""))))?;
         }
