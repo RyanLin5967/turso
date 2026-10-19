@@ -485,9 +485,22 @@ pub(super) fn find_custom_type_operator(
         return None;
     }
 
+    // A comparison operand that is a value of the other side's own type (b + 10, b * 1.0, a
+    // derived relation's typed column, against a column b of numeric) compares through the type's
+    // operator, as two columns of it do (second review of the fe-rev2bd-types fixes, item 2:
+    // `b < b + 10` compared texts). Mutant `column_against_value_plain` (test builds only): only a
+    // compatible constant, as before.
+    let same_type_value = |e: &ast::Expr, info: &ExprCustomTypeInfo| {
+        comparison
+            && !crate::branch::store::fe_mutant("column_against_value_plain")
+            && derived_operand_info(e, referenced_tables, resolver)
+                .map(with_operators)
+                .is_some_and(|d| d.type_name == info.type_name)
+    };
+
     // Case 2: LHS is custom type, RHS is a constant operand.
     if let Some(ref lhs) = lhs_info {
-        if operand_compatible(e2, lhs.type_def.value_input_type(), resolver) {
+        if operand_compatible(e2, lhs.type_def.value_input_type(), resolver) || same_type_value(e2, lhs) {
             if let Some((func_name, swap_args, negate)) = find_in_type_def(&lhs.type_def) {
                 return Some(ResolvedOperator {
                     func_name,
@@ -501,7 +514,7 @@ pub(super) fn find_custom_type_operator(
 
     // Case 3: RHS is custom type, LHS is a constant operand (reversed).
     if let Some(ref rhs) = rhs_info {
-        if operand_compatible(e1, rhs.type_def.value_input_type(), resolver) {
+        if operand_compatible(e1, rhs.type_def.value_input_type(), resolver) || same_type_value(e1, rhs) {
             if let Some((func_name, swap_args, negate)) = find_in_type_def(&rhs.type_def) {
                 return Some(ResolvedOperator {
                     func_name,
@@ -575,7 +588,13 @@ pub(crate) fn key_takes_type_operator(
             info.type_name.eq_ignore_ascii_case(type_name)
                 || seek_type_of(resolver.schema(), &info.type_def).name.eq_ignore_ascii_case(&type_def.name)
         }
-        None => operand_compatible(key, type_def.value_input_type(), resolver),
+        // A value of the column's own type (`find_custom_type_operator`'s `same_type_value`).
+        None => {
+            operand_compatible(key, type_def.value_input_type(), resolver)
+                || (!crate::branch::store::fe_mutant("column_against_value_plain")
+                    && derived_operand_info(key, referenced_tables, resolver)
+                        .is_some_and(|d| seek_type_of(resolver.schema(), &d.type_def).name.eq_ignore_ascii_case(&type_def.name)))
+        }
     }
 }
 
