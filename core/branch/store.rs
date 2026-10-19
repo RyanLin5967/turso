@@ -2556,6 +2556,10 @@ pub(crate) const HOLD_POOL_CLAIM: u8 = 23;
 /// (`verify_frozen_rows`), as `FE_CAPTURE_VERIFY` does for a whole run; and the differences found.
 #[cfg(test)]
 pub(crate) static CAPTURE_VERIFY_FORCED: AtomicBool = AtomicBool::new(false);
+/// Test builds (engine-2bdcd32c6 LOW 4): the next `BranchStore::wait_durable` in this process
+/// panics, once.
+#[cfg(test)]
+pub(crate) static PANIC_NEXT_WAIT_FOR_TEST: AtomicBool = AtomicBool::new(false);
 /// Test builds (review L2d M2): fuzzy installs that took their retired names and child keys under
 /// the store mutex, how many of them had a retired child generation, and the allocations this
 /// thread made taking them (none may be: they are freed after the mutex).
@@ -6615,6 +6619,10 @@ impl BranchStore {
     /// is in the air: an ordinary one if anything is buffered, an UPGRADE one if the bytes were made
     /// durable only in a weaker class (see [`Group`]). Called WITHOUT the store mutex.
     pub(crate) fn wait_durable(&self, lsn: u64, class: SyncClass) -> Result<()> {
+        #[cfg(test)]
+        if PANIC_NEXT_WAIT_FOR_TEST.swap(false, Ordering::AcqRel) {
+            panic!("test failpoint: this wait_durable panics (PANIC_NEXT_WAIT_FOR_TEST)");
+        }
         #[cfg(test)]
         let hold = Some(&*self.trunk_commit_hold);
         #[cfg(not(test))]

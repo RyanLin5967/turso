@@ -16480,3 +16480,55 @@ fn an_async_create_does_not_wait_out_a_trunk_commit_inside_its_gate() {
         "CLAIM: the async create returned while the trunk commit was held in its gate: {while_held:?}"
     );
 }
+
+/// engine-2bdcd32c6 LOW 4: the close's flight of what async creates buffered (`Drop`) was not
+/// wrapped in catch_unwind, unlike the flusher's. A store dropped while its caller's thread unwinds
+/// whose flight panics then panics inside a panic, and the process aborts. A child process (this
+/// test, re-run with FE_LOW4_CHILD) holds the flusher, makes an async create, arms the
+/// `PANIC_NEXT_WAIT_FOR_TEST` failpoint and panics holding every handle; it must finish its test
+/// rather than abort.
+#[test]
+fn a_close_flight_that_panics_during_an_unwind_does_not_abort_the_process() {
+    let class = if cfg!(target_vendor = "apple") { SyncClass::FullFsync } else { SyncClass::Fsync };
+    if let Ok(path) = std::env::var("FE_LOW4_CHILD") {
+        let db = open_at(Path::new(&path), opts(true, class));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let warm = trunk.create_branch_async("warm").unwrap();
+        db.branch_wait_durable(warm.token).unwrap();
+        assert!(db.branch_flusher_hold(true), "premise: the flusher runs and is held");
+        db.branch_housekeeping_hold(true);
+        trunk.create_branch_async("unflown").unwrap();
+        super::store::PANIC_NEXT_WAIT_FOR_TEST.store(true, std::sync::atomic::Ordering::Release);
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _held = (trunk, db);
+            panic!("LOW4: the caller's own panic, with the store's last handles on its stack");
+        }));
+        assert!(caught.is_err(), "premise: the caller panicked");
+        println!("LOW4-CHILD-DONE");
+        return;
+    }
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("low4.db");
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "branch::fastest_tests::a_close_flight_that_panics_during_an_unwind_does_not_abort_the_process",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("FE_LOW4_CHILD", &path)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() && stdout.contains("LOW4-CHILD-DONE"),
+        "CLAIM: the child finished rather than aborting; status {:?}\nstdout, last lines first: {}\nstderr, last lines first: {}",
+        out.status,
+        stdout.lines().rev().take(15).collect::<Vec<_>>().join(" | "),
+        stderr.lines().rev().take(15).collect::<Vec<_>>().join(" | ")
+    );
+}
