@@ -381,6 +381,34 @@ pub(crate) fn schemas_dropped_in_block(pg_conn: &PgConnectionInner) -> Vec<Strin
     pg_conn.dropped_schemas.lock().iter().map(|(name, _)| name.clone()).collect()
 }
 
+/// A relation named database.schema.name must name this database (its startup name, as
+/// current_database() answers): any other is PostgreSQL's 0A000 'cross-database references are not
+/// implemented', in every statement and FROM item. The translator drops the database part, so
+/// `SELECT * FROM otherdb.public.n` read, and `DELETE FROM otherdb.public.n` emptied, this
+/// database's n (wire-rev-5cdb70e58 MED-2; recorded,
+/// pg18-wirefuzz-a_three_part_name_must_name_this_database.out).
+fn refuse_cross_database(pg_conn: &PgConnectionInner, parse: &turso_pg_parser::pg_query::ParseResult) -> Result<()> {
+    use turso_pg_parser::pg_query::NodeRef;
+    let mut this = None;
+    for (n, ..) in parse.protobuf.nodes() {
+        let NodeRef::RangeVar(rv) = n else { continue };
+        if rv.catalogname.is_empty() {
+            continue;
+        }
+        let this = this.get_or_insert_with(|| crate::catalog::database_name(pg_conn.conn.as_ref()));
+        if rv.catalogname != *this {
+            return Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
+                SqlErrorKind::FeatureNotSupported,
+                format!(
+                    "cross-database references are not implemented: \"{}.{}.{}\"",
+                    rv.catalogname, rv.schemaname, rv.relname
+                ),
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// An ALTER COLUMN TYPE the engine cannot do as PostgreSQL does is refused 0A000 before anything
 /// runs. The engine changes the column's declaration and keeps every stored value as it was, so a
 /// type of another family (text to integer, integer to boolean) or a narrower integer would keep
@@ -1577,6 +1605,7 @@ fn prepare_statement_parsed(
     // wait (lead ruling 2026-10-18, pg18-rev-bl3.out #19), from this parse, never a second one.
     refuse_dropped_schemas(pg_conn, &parse_result)?;
     refuse_alter_column_type_across_families(pg_conn, &parse_result)?;
+    refuse_cross_database(pg_conn, &parse_result)?;
     if !pg_conn.conn.get_auto_commit() {
         let relations = turso_pg_parser::translator::named_relations(&parse_result);
         if !relations.is_empty() {
