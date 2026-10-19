@@ -2010,6 +2010,9 @@ impl<G: std::ops::DerefMut<Target = StoreInner>> Drop for Counted<G> {
 struct StoreInner {
     arena: Option<Arena>,
     journal: Option<Journal>,
+    /// LEAP L2(c): a fresh durable store's log buffers, made at open, for the journal its first
+    /// create starts (`LogBuffers`); dropped when the open recovers a journal of its own.
+    log_buffers: Option<super::journal::LogBuffers>,
     /// `Some` for a durable store.
     files: Option<BranchFiles>,
     sync: SyncClass,
@@ -5866,6 +5869,7 @@ impl BranchStore {
                             }
                         }
                         inner.journal = Some(journal);
+                        inner.log_buffers = None;
                     }
                 }
                 inner
@@ -6254,6 +6258,7 @@ impl BranchStore {
         let mut journal = recovered.journal;
         journal.share_fail_stop(&inner.fail_stop);
         inner.journal = Some(journal);
+        inner.log_buffers = None;
         stats.arena_ns = ns(t);
         Ok(())
     }
@@ -11421,6 +11426,9 @@ impl StoreInner {
         Self {
             arena: None,
             journal: None,
+            // LEAP L2(c): the log buffers the first create's journal takes, made here, at open,
+            // outside every create's hold (`LogBuffers`).
+            log_buffers: files.as_ref().map(|_| super::journal::LogBuffers::new()),
             files,
             sync,
             next_id: 1,
@@ -12246,7 +12254,7 @@ impl StoreInner {
                         self.failpoint = None;
                     }
                     let mut journal =
-                        Journal::open_fresh_with(files, page_size, self.sync, fail_lock)?;
+                        Journal::open_fresh_with(files, page_size, self.sync, fail_lock, self.log_buffers.take())?;
                     // The arm's format version, in the header `start` writes (amendment 15).
                     journal.set_format(super::journal::format_version(self.splice));
                     journal.share_fail_stop(&self.fail_stop);

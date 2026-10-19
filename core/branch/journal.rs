@@ -142,6 +142,27 @@ fn log_segment() -> Vec<u8> {
     v
 }
 
+/// A journal's two log segments and its slot reservation (LEAP L2(c)), made where no store mutex is
+/// held: a fresh store makes them at open (`StoreInner::fresh_mode`) and the journal its first
+/// create starts takes them, so that create allocates none of them in its hold (a D0 store's first
+/// create held 184,723 bytes under the mutex at 458b9bffd, about 131 KB of it the two segments:
+/// a_d0_create_allocates_at_most_64_kib_under_the_store_mutex_as_branches_grow on iccad10).
+pub(crate) struct LogBuffers {
+    pending: Vec<u8>,
+    slots: Vec<Slot>,
+    recycled: Vec<u8>,
+}
+
+impl LogBuffers {
+    pub(crate) fn new() -> Self {
+        Self {
+            pending: log_segment(),
+            slots: Vec::with_capacity(LOG_SEGMENT_SLOTS),
+            recycled: log_segment(),
+        }
+    }
+}
+
 const FORMAT_VERSION: u32 = 17;
 const SPLICE_FORMAT_VERSION: u32 = 18;
 
@@ -1458,7 +1479,7 @@ impl Journal {
 
     /// The first half of `create`: lock the log and check it holds no state. Writes nothing.
     pub(crate) fn open_fresh(files: &BranchFiles, page_size: usize, sync: SyncClass) -> Result<Journal> {
-        Self::open_fresh_with(files, page_size, sync, false)
+        Self::open_fresh_with(files, page_size, sync, false, None)
     }
 
     /// `open_fresh`, with the `CreateLockFails` failpoint.
@@ -1467,7 +1488,10 @@ impl Journal {
         page_size: usize,
         sync: SyncClass,
         fail_lock: bool,
+        buffers: Option<LogBuffers>,
     ) -> Result<Journal> {
+        // Made here only when the caller had none ready (a test, or a store started over).
+        let buffers = buffers.unwrap_or_else(LogBuffers::new);
         refuse_links(files, files.cat.exists())?;
         // Lock before touching anything, so a refused create has truncated nothing.
         if fail_lock {
@@ -1496,8 +1520,8 @@ impl Journal {
             page_size: page_size as u32,
             generation: 0,
             len: 0,
-            pending: log_segment(),
-            pending_slots: Vec::with_capacity(LOG_SEGMENT_SLOTS),
+            pending: buffers.pending,
+            pending_slots: buffers.slots,
             pending_reallocs: 0,
             snapshot_len: 0,
             sync,
@@ -1508,7 +1532,7 @@ impl Journal {
             fail_next_take: false,
             fail_next_confirm: false,
             shared: None,
-            recycled: Arc::new(std::sync::Mutex::new(Some(log_segment()))),
+            recycled: Arc::new(std::sync::Mutex::new(Some(buffers.recycled))),
             retired: None,
             fail_next_replacement_sync: AtomicBool::new(false),
             format: FORMAT_VERSION,
