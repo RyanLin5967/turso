@@ -7325,6 +7325,104 @@ fn an_unexpected_message_during_copy_from_stdin_ends_the_session() {
     assert_eq!(b.q("SELECT count(*) FROM cs").single("count"), "0");
 }
 
+/// A COPY FROM STDIN behind a comment is a COPY on both protocols, as PostgreSQL 18.6 reads it
+/// (recorded, copy-stdin-pg18.txt part 2: `comment`, `extcomment`): "COPY 1", no RowDescription.
+/// The server read the statement's kind from its text with no comment skipped, so it answered
+/// the second run as a query, and over the extended protocol failed after loading the rows.
+#[test]
+fn copy_from_stdin_behind_a_comment_is_a_copy_on_both_protocols() {
+    let dir = Scratch::new("copystdincomment");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q(COPY_STDIN_TABLE).ok("cs");
+    let sql = "/* lead */ COPY cs (id) FROM STDIN";
+    let r = a.copy(sql, &[CopyIn::Data(b"60\n")]).ok(sql);
+    assert_eq!(r.tags, vec!["COPY 1".to_string()], "{sql}");
+    assert!(r.names.is_none(), "{sql}: a RowDescription");
+    let sql = "-- lead\nCOPY cs (id) FROM STDIN";
+    let r = a.x_copy(sql, CopyIn::Data(b"61\n")).ok(sql);
+    assert_eq!(r.tags, vec!["COPY 1".to_string()], "{sql}");
+    assert_eq!(r.status, b'I', "{sql}");
+    assert_eq!(a.q("SELECT count(*) FROM cs").single("count"), "2");
+}
+
+/// COPY reads each field as PostgreSQL 18.6's text format and input functions read it (recorded,
+/// copy-stdin-pg18.txt part 2): a bigserial takes a value past int4's range; a varchar(3) or
+/// char(2) value whose excess is spaces is cut to the length, and one whose excess is anything
+/// else (a leading space included) is 22001; a backslash before the delimiter, `\101` and `\x41`
+/// are data, and an empty line is one empty field. Checked as int4, a bigserial's 3000000000 was
+/// 22003; the length check read the value trimmed, so '  abc' passed it; the parser split on the
+/// delimiter before reading escapes, read no octal or hex escape, and skipped an empty line.
+#[test]
+fn copy_reads_text_fields_as_postgresqls_input_functions_do() {
+    let dir = Scratch::new("copystdinfields");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE cb (id bigserial PRIMARY KEY, v varchar(3), w char(2))")
+        .ok("cb");
+    a.q("CREATE TABLE c1 (v text)").ok("c1");
+    let sql = "COPY cb (id, v) FROM STDIN";
+    let r = a
+        .copy(sql, &[CopyIn::Data(b"3000000000\tab \n3000000001\tabc  \n")])
+        .ok(sql);
+    assert_eq!(r.tags, vec!["COPY 2".to_string()], "{sql}");
+    let r = a.q("SELECT id, v, length(v) FROM cb ORDER BY id").ok("spaces");
+    let row = |cells: &[&str]| cells.iter().map(|c| Some(c.to_string())).collect::<Vec<_>>();
+    assert_eq!(
+        r.rows,
+        vec![row(&["3000000000", "ab ", "3"]), row(&["3000000001", "abc", "3"])]
+    );
+    let sql = "COPY cb (id, w) FROM STDIN";
+    a.copy(sql, &[CopyIn::Data(b"1\tx   \n")]).ok("char(2) with spaces past it");
+    for (sql, data, message) in [
+        ("COPY cb (id, w) FROM STDIN", &b"2\txyz\n"[..], "value too long for type character(2)"),
+        (
+            "COPY cb (id, v) FROM STDIN",
+            b"3\t  abc\n",
+            "value too long for type character varying(3)",
+        ),
+    ] {
+        let r = a.copy(sql, &[CopyIn::Data(data)]);
+        let e = r.err(sql);
+        assert_eq!((e.code.as_str(), e.message.as_str()), ("22001", message), "{sql}");
+    }
+    let sql = "COPY c1 FROM STDIN";
+    let r = a
+        .copy(sql, &[CopyIn::Data(b"a\\tb\nx\\\ty\n\\101\\x41\n\n")])
+        .ok(sql);
+    assert_eq!(r.tags, vec!["COPY 4".to_string()], "{sql}");
+    let r = a.q("SELECT v, length(v) FROM c1 ORDER BY v").ok("escapes");
+    assert_eq!(
+        r.rows,
+        vec![row(&["", "0"]), row(&["AA", "2"]), row(&["a\tb", "3"]), row(&["x\ty", "3"])]
+    );
+}
+
+/// COPY checks its table before its options, as PostgreSQL 18.6 opens the relation first
+/// (recorded, copy-stdin-pg18.txt part 2: `nosuchopt`, 42P01), and `COPY t FROM ''` names a file,
+/// refused with no CopyInResponse (PostgreSQL's superuser: 58P01; here no file is granted). The
+/// parse gives STDIN and '' the same empty file name, so '' asked the client for rows.
+#[test]
+fn copy_checks_its_table_first_and_reads_from_empty_as_a_file() {
+    let dir = Scratch::new("copystdinorder");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q(COPY_STDIN_TABLE).ok("cs");
+    let sql = "COPY nosuch FROM STDIN (NOSUCH 1)";
+    let r = a.copy(sql, &[]);
+    let e = r.err(sql);
+    assert_eq!(
+        (e.code.as_str(), e.message.as_str()),
+        ("42P01", "relation \"nosuch\" does not exist"),
+        "{sql}"
+    );
+    let sql = "COPY cs FROM ''";
+    let r = a.copy(sql, &[]);
+    assert!(r.error.is_some(), "{sql}: no error");
+    assert!(r.copy_ins.is_empty(), "{sql}: a CopyInResponse");
+    assert_eq!(r.status, b'I', "{sql}");
+}
+
 /// The prepare-time `$n` guards leave nothing behind, by simple query and by Bind (wire review 17
 /// item 12: the extended arms of these guards passed without the guard). `ALTER TABLE ... ADD
 /// CONSTRAINT CHECK (v > $1)` is 42P02 and adds no CHECK: bound with 100, a row with v = 5 still
