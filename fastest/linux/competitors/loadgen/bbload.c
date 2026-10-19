@@ -83,6 +83,16 @@
  *                                 concurrent map read and map write, in 2.4.1 and the registered 2.5.0). It NARROWS
  *                                 that race and does not close it: a serialized delete still reads other sessions'
  *                                 state unlocked while they CHECKOUT (comp-rev-dolt250 HIGH-1)
+ *   home per-cycle                (the lead's Doltgres b-m1 ruling, DECISIONS 2026-10-19) a FRESH home connection for
+ *                                 every cycle, opened with its setup BEFORE the cycle's claim (outside the timed window
+ *                                 and the op's latency; raw.tsv home_connect_ns, untimed) and closed before the cycle's
+ *                                 first admin-sql after-step, or at its end. No teardown. Doltgres 1.4.0 poisons a
+ *                                 connection that wrote on a branch once that branch is deleted, wherever the delete runs
+ *                                 (tools/doltgres_use_probe.sh, artie 44b1e4dd86), so a write-then-delete cycle cannot
+ *                                 reuse one home connection there.
+ *   after admin-sql <sql>         as after sql, on the client's ADMIN connection (home per-cycle only; opened once per
+ *                                 client with the home conninfo), after the home connection is closed; admin-sql steps
+ *                                 come last
  *   teardown <sql>                once per connection at the end, untimed
  *   c1b <step> <label>            with --c1b-run RUN: an OPSTART "<label>" before the op's first byte and an ACK
  *                                 "<label>" right after step <step> (1-based) is acknowledged, into the C1b trace
@@ -167,7 +177,7 @@ enum { P_PG = 0, P_MYSQL = 1 };
 enum { K_SQL, K_WRITE, K_CONNECT, K_CLOSE };
 enum { PH_INIT = 0, PH_WARM = 1, PH_MEAS = 2, PH_DRAIN = 3, PH_ABORT = 4 };
 
-typedef struct { int k; char *t; int serial; } step_t;
+typedef struct { int k; char *t; int serial; int admin; } step_t; /* admin: run on the client's admin connection */
 typedef struct {
     int proto;
     char *connect;
@@ -177,6 +187,7 @@ typedef struct {
     int nafter; step_t after[MAXAFTER];
     int nteardown; char *teardown[MAXLIST];
     char *c1blab[MAXSTEPS];
+    int home_per_cycle; /* `home per-cycle`: a fresh home connection each cycle (the lead's Doltgres b-m1 ruling) */
 } spec_t;
 
 typedef struct { int proto; PGconn *pg; MYSQL *my; } conn_t;
@@ -192,12 +203,14 @@ typedef struct {
     struct { uint64_t lo, hi; } serial_waits[MAXSTEPS + MAXAFTER];
     uint64_t step_end[MAXSTEPS];
     uint64_t aft_start, aft_end[MAXAFTER]; /* comp review 1 MED 9: the after-steps' start and each one's end */
+    uint64_t home_connect_ns; /* home per-cycle: this cycle's home connect (and setup), before its claim, untimed */
 } oprec;
 
 typedef struct {
     int id;
     pthread_t th;
     conn_t home;
+    conn_t admin; /* home per-cycle: the per-client admin connection the admin-sql after-steps run on */
     uint64_t rng;
     oprec *rec;
     size_t nrec, cap;
@@ -340,7 +353,9 @@ static int parse_step(char *rest, step_t *st, char *why) {
     if (*arg) *arg++ = 0;
     arg = trim(arg);
     st->serial = 0;
+    st->admin = 0;
     if (!strcmp(kw, "sql")) st->k = K_SQL;
+    else if (!strcmp(kw, "admin-sql")) { st->k = K_SQL; st->admin = 1; }
     else if (!strcmp(kw, "sql-serial")) { st->k = K_SQL; st->serial = 1; }
     else if (!strcmp(kw, "write")) st->k = K_WRITE;
     else if (!strcmp(kw, "connect")) st->k = K_CONNECT;
@@ -377,6 +392,10 @@ static int load_spec(const char *path, char **text) {
             else sprintf(why, "protocol must be pg or mysql");
             have_proto = 1;
         } else if (!strcmp(kw, "connect")) S.connect = strdup(rest);
+        else if (!strcmp(kw, "home")) {
+            if (!strcmp(rest, "per-cycle")) S.home_per_cycle = 1;
+            else sprintf(why, "home needs 'per-cycle'");
+        }
         else if (!strcmp(kw, "var")) {
             char *eq = strchr(rest, '=');
             if (!eq || S.nvar >= MAXLIST) sprintf(why, "var needs 'name = template'");
@@ -385,7 +404,10 @@ static int load_spec(const char *path, char **text) {
         else if (!strcmp(kw, "teardown") && S.nteardown < MAXLIST) S.teardown[S.nteardown++] = strdup(rest);
         else if (!strcmp(kw, "step")) {
             if (S.nstep >= MAXSTEPS) sprintf(why, "more than %d steps", MAXSTEPS);
-            else if (parse_step(rest, &S.step[S.nstep], why) == 0) S.nstep++;
+            else if (parse_step(rest, &S.step[S.nstep], why) == 0) {
+                if (S.step[S.nstep].admin) sprintf(why, "admin-sql is an after-step only (an admin connection is never timed)");
+                else S.nstep++;
+            }
         } else if (!strcmp(kw, "c1b")) {
             char *sp = rest;
             while (*sp && *sp != ' ' && *sp != '\t') sp++;
@@ -405,6 +427,22 @@ static int load_spec(const char *path, char **text) {
         fprintf(stderr, "bbload: spec needs protocol, connect and at least one step\n");
         return -1;
     }
+    int nadmin = 0;
+    for (int k = 0; k < S.nafter; k++) nadmin += S.after[k].admin;
+    if (S.home_per_cycle && S.nteardown) {
+        fprintf(stderr, "bbload: home per-cycle has no teardown (the home connection is closed each cycle)\n");
+        return -1;
+    }
+    if (nadmin && !S.home_per_cycle) {
+        fprintf(stderr, "bbload: admin-sql after-steps need home per-cycle\n");
+        return -1;
+    }
+    for (int k = 1; k < S.nafter; k++)
+        if (S.after[k - 1].admin && !S.after[k].admin) {
+            fprintf(stderr, "bbload: an after-step on the home connection after an admin-sql one (the home is closed "
+                            "before the first admin-sql)\n");
+            return -1;
+        }
     return 0;
 }
 
@@ -837,7 +875,7 @@ static int run_step(client_t *c, conn_t *cur, int *have_branch, const step_t *st
         *have_branch = 1;
         return 0;
     }
-    conn_t *target = *have_branch ? cur : &c->home;
+    conn_t *target = st->admin ? &c->admin : *have_branch ? cur : &c->home;
     if (!st->serial) return conn_exec(target, text, st->k == K_WRITE, why, wsz);
     /* sql-serial: no two clients run one at the same time (Dolt's DOLT_BRANCH('-d') from concurrent sessions races
      * validateBranchNotActiveInAnySession: in 2.4.1 AND the registered 2.5.0 it can recover a nil-pointer panic or kill
@@ -1098,11 +1136,20 @@ static void *client_main(void *arg) {
     if (S.proto == P_MYSQL) mysql_thread_init();
     char ci[4096], w[512];
     ctx_t x0 = {.c = c->id, .i = 0, .rng = &c->rng};
+    uint64_t hc0 = now_ns();
     int fail = expand(S.connect, &x0, ci, sizeof ci, w) != 0 || conn_open(&c->home, ci, NULL, w, sizeof w) != 0;
     if (!fail) note_backend(c, 0, 0, &c->home);
     for (int k = 0; !fail && k < S.nsetup; k++) {
         char t[8192];
         fail = expand(S.setup[k], &x0, t, sizeof t, w) != 0 || conn_exec(&c->home, t, 0, w, sizeof w) != 0;
+    }
+    uint64_t hc_ns = now_ns() - hc0; /* home per-cycle: the first cycle's home connect is this one */
+    /* home per-cycle (the lead's Doltgres b-m1 ruling): the admin connection the admin-sql after-steps (the deletes)
+     * run on, opened once per client with the home conninfo; a branch delete never runs on a connection that wrote
+     * on that branch (Doltgres 1.4.0 poisons it: tools/doltgres_use_probe.sh, artie 44b1e4dd86) */
+    if (!fail && S.home_per_cycle) {
+        fail = conn_open(&c->admin, ci, NULL, w, sizeof w) != 0;
+        if (!fail) note_backend(c, 0, 2, &c->admin);
     }
     pthread_mutex_lock(&g_mu);
     if (fail) { snprintf(c->err, sizeof c->err, "%s", w); c->state = -1; g_nfailed++; }
@@ -1125,8 +1172,29 @@ static void *client_main(void *arg) {
     for (uint32_t seq = 0;; seq++) {
         oprec r;
         memset(&r, 0, sizeof r);
+        /* home per-cycle: this cycle's home connection, opened (and set up) BEFORE the claim, so it is outside the
+         * timed window and outside the op's latency; its cost is home_connect_ns. The first cycle uses the one opened
+         * at start. A failed connect is this op's failure. */
+        char hcw[512] = "";
+        if (S.home_per_cycle && seq > 0) {
+            char hci[4096];
+            ctx_t xh = {.c = c->id, .i = seq, .rng = &c->rng};
+            uint64_t h0 = now_ns();
+            if (expand(S.connect, &xh, hci, sizeof hci, hcw) != 0 || conn_open(&c->home, hci, NULL, hcw, sizeof hcw) != 0) {
+                if (!hcw[0]) snprintf(hcw, sizeof hcw, "per-cycle home connect failed");
+            } else {
+                note_backend(c, seq, 0, &c->home);
+                for (int k = 0; k < S.nsetup && !hcw[0]; k++) {
+                    char t[8192];
+                    if (expand(S.setup[k], &xh, t, sizeof t, hcw) != 0 || conn_exec(&c->home, t, 0, hcw, sizeof hcw) != 0)
+                        if (!hcw[0]) snprintf(hcw, sizeof hcw, "per-cycle home setup failed");
+                }
+            }
+            hc_ns = now_ns() - h0;
+        }
         /* every phase decision at the claim (claim_op); open loop: the claim is the next arrival, sent at its time */
         claim_t kc = claim_op(c->id);
+        if (kc.stop && S.home_per_cycle && seq > 0) (void)conn_close_sync(&c->home, w, sizeof w);
         if (kc.stop) goto done;
         int ph = kc.ph;
         if (OPEN_LOOP) {
@@ -1165,9 +1233,11 @@ static void *client_main(void *arg) {
             if (bad || expand(S.c1blab[k], &x, c1bl[k], sizeof c1bl[k], w) != 0) { c1bl[k][0] = 0; continue; }
             c1b_opstart(&C1B, ((uint64_t)c->id << 40) | ((uint64_t)seq << 8) | (uint64_t)k, c1bl[k]);
         }
+        r.home_connect_ns = S.home_per_cycle ? hc_ns : 0;
         r.start = now_ns();
         r.intended = OPEN_LOOP ? kc.intended : r.start;
-        if (bad) { r.ok = 0; r.err = (int16_t)err_index(w); }
+        if (hcw[0]) { r.ok = 0; r.err = (int16_t)err_index(hcw); }
+        else if (bad) { r.ok = 0; r.err = (int16_t)err_index(w); }
         for (int k = 0; k < S.nstep && r.ok; k++) {
             if (run_step(c, &cur, &have_branch, &S.step[k], &x, w, sizeof w) != 0) { r.ok = 0; r.err = (int16_t)err_index(w); }
             else if (HAVE_C1B && S.c1blab[k] && c1bl[k][0]) c1b_ack(&C1B, ((uint64_t)c->id << 40) | ((uint64_t)seq << 8) | (uint64_t)k, c1bl[k]);
@@ -1179,17 +1249,25 @@ static void *client_main(void *arg) {
         /* comp review 1 MED 9: each after-step timed apart, as the macOS bbload does (4010ff3b06:1027-1035): it ends at
          * aft_end[k], after<k+1>_ns in raw.tsv, hdr_after<k+1>.txt and summary after_us; nafter: the after-steps run */
         r.aft_start = now_ns();
-        for (int k = 0; !SKIP_AFTER && k < S.nafter; r.aft_end[k] = now_ns(), r.nafter = (uint8_t)++k)
+        for (int k = 0; !SKIP_AFTER && k < S.nafter; r.aft_end[k] = now_ns(), r.nafter = (uint8_t)++k) {
+            /* home per-cycle: the home connection is closed before the first admin-sql step (the delete), inside
+             * that step's after time */
+            if (S.after[k].admin && (c->home.pg || c->home.my) && conn_close_sync(&c->home, w, sizeof w) != 0) {
+                int e = err_index(w);
+                if (r.ok) { r.ok = 0; r.err = (int16_t)(1000 + e); }
+            }
             if (run_step(c, &cur, &have_branch, &S.after[k], &x, w, sizeof w) != 0) {
                 int e = err_index(w);
                 if (r.ok) { r.ok = 0; r.err = (int16_t)(1000 + e); } /* the op succeeded; its after-step did not */
             }
+        }
         if (have_branch && conn_close_sync(&cur, w, sizeof w) != 0) {
             int e = err_index(w);
             if (r.ok) { r.ok = 0; r.err = (int16_t)(1000 + e); }
         }
+        if (S.home_per_cycle && (c->home.pg || c->home.my)) (void)conn_close_sync(&c->home, w, sizeof w);
         r.after_end = now_ns();
-        if (!conn_alive(&c->home)) reconnect_home(c);
+        if (!S.home_per_cycle && !conn_alive(&c->home)) reconnect_home(c);
         record(c, &r);
         op_done(ph);
         free_since = r.after_end;
@@ -1212,6 +1290,13 @@ done:; /* an empty statement: the declaration of hdl below may not follow a labe
      * --no-drain at C > 1 it can overlap other clients' measured ops, and it falls inside a labelling run's strace
      * window. It writes nothing (no flush expected; not straced to prove it) and --no-drain cells are refused. */
     uint64_t hdl = now_ns() + (uint64_t)(CLOSE_TIMEOUT_S * 1e9);
+    if (S.home_per_cycle && (c->admin.pg || c->admin.my)) { /* the home is closed each cycle: probe the admin one */
+        if (conn_probe(&c->admin, CLOSE_TIMEOUT_S, w, sizeof w) != 0) {
+            other_fail("admin connection lost (found after the last op)", w);
+            conn_abandon(&c->admin);
+        }
+        (void)conn_close_until(&c->admin, hdl, w, sizeof w);
+    }
     if (c->home.pg || c->home.my) {
         if (conn_probe(&c->home, CLOSE_TIMEOUT_S, w, sizeof w) != 0) {
             other_fail("home connection lost (found after the last op)", w);
@@ -1521,7 +1606,8 @@ int main(int argc, char **argv) {
     fprintf(f, "client\tseq\tphase\tok\tarrival\tfree_ns\tclaim_ns\tintended_ns\tstart_ns\tend_ns\tlat_ns\tsend_late_ns");
     for (int s = 0; s < S.nstep; s++) fprintf(f, "\tstep%d_ns", s + 1);
     for (int s = 0; s < NA; s++) fprintf(f, "\tafter%d_ns", s + 1); /* the macOS columns (4010ff3b06:1183) */
-    fprintf(f, "\tafter_ns\tserial_wait_ns\tserial_waits\terr\n"); /* serial_wait*: Codex C04 */
+    /* serial_wait*: Codex C04; home_connect_ns: home per-cycle only, the cycle's untimed home connect */
+    fprintf(f, "\tafter_ns\tserial_wait_ns\tserial_waits%s\terr\n", S.home_per_cycle ? "\thome_connect_ns" : "");
     for (size_t r = 0; r < total; r++) {
         oprec *o = &all[r];
         uint64_t base = o->intended > o->free ? o->intended : o->free;
@@ -1545,6 +1631,7 @@ int main(int argc, char **argv) {
         for (unsigned w = 0; w < o->nserial_waits; w++)
             fprintf(f, "%s%llu-%llu", w ? ";" : "", (unsigned long long)o->serial_waits[w].lo,
                     (unsigned long long)o->serial_waits[w].hi);
+        if (S.home_per_cycle) fprintf(f, "\t%llu", (unsigned long long)o->home_connect_ns);
         fprintf(f, "\t%d\n", o->err);
     }
     if (fclose(f) != 0) { fprintf(stderr, "bbload: raw.tsv close failed\n"); return 2; }
@@ -1559,7 +1646,10 @@ int main(int argc, char **argv) {
     fprintf(f, "client\tseq\tkind\t%s\n", S.proto == P_PG ? "backend_pid" : "connection_id");
     for (int i = 0; i < C; i++)
         for (size_t b = 0; b < CL[i].nbk; b++) {
-            if (CL[i].bk[b].kind == 0) fprintf(f, "%d\t-\thome\t%ld\n", i, CL[i].bk[b].id);
+            /* home per-cycle: a cycle's fresh home is "home" with its op seq; the admin connection is "admin" */
+            if (CL[i].bk[b].kind == 0 && S.home_per_cycle) fprintf(f, "%d\t%u\thome\t%ld\n", i, CL[i].bk[b].seq, CL[i].bk[b].id);
+            else if (CL[i].bk[b].kind == 0) fprintf(f, "%d\t-\thome\t%ld\n", i, CL[i].bk[b].id);
+            else if (CL[i].bk[b].kind == 2) fprintf(f, "%d\t-\tadmin\t%ld\n", i, CL[i].bk[b].id);
             else fprintf(f, "%d\t%u\tstep\t%ld\n", i, CL[i].bk[b].seq, CL[i].bk[b].id);
         }
     if (fclose(f) != 0) { fprintf(stderr, "bbload: backends.tsv close failed\n"); return 2; }
@@ -1718,6 +1808,7 @@ int main(int argc, char **argv) {
             (unsigned long long)(meas_err + warm_err + drain_err + other_err));
     fprintf(f, "\"clock\":\"%s\",\"hooks\":%d,", BB_CLOCK_NAME, BB_HOOKS); /* Linux port: which clock stamped the ops */
     fprintf(f, "\"capped\":%s,\"max_window_s\":%.3f,", g_cap_hit ? "true" : "false", MAXWIN_S);
+    fprintf(f, "\"home_per_cycle\":%s,", S.home_per_cycle ? "true" : "false");
     fprintf(f, "\"after_steps\":%d,\"skip_after\":%s,\"no_drain\":%s,", S.nafter, SKIP_AFTER ? "true" : "false",
             NO_DRAIN ? "true" : "false");
     /* comp review 1 MED 9: what tput_* count. A client claims its next op only after this op's untimed after-steps,
