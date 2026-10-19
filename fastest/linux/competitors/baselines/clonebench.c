@@ -720,7 +720,7 @@ static int num_d(const char *flag, const char *v, double lo, double hi, double *
     *out = d;
     return 0;
 }
-static int num_u(const char *flag, const char *v, uint64_t lo, uint64_t hi, uint64_t *out) {
+static int num_u_as(const char *who, const char *flag, const char *v, uint64_t lo, uint64_t hi, uint64_t *out) {
     uint64_t x = 0;
     int okv = v && *v;
     for (const char *p = v; okv && *p; p++) {
@@ -729,12 +729,16 @@ static int num_u(const char *flag, const char *v, uint64_t lo, uint64_t hi, uint
         else x = x * 10 + dg;
     }
     if (!okv || x < lo || x > hi) {
-        fprintf(stderr, "clonebench run: %s needs a whole number in [%llu, %llu], got '%s'\n", flag,
+        fprintf(stderr, "%s: %s needs a whole number in [%llu, %llu], got '%s'\n", who, flag,
                 (unsigned long long)lo, (unsigned long long)hi, v ? v : "");
         return -1;
     }
     *out = x;
     return 0;
+}
+
+static int num_u(const char *flag, const char *v, uint64_t lo, uint64_t hi, uint64_t *out) {
+    return num_u_as("clonebench run", flag, v, lo, hi, out);
 }
 
 static int cmd_run(int argc, char **argv) {
@@ -1031,8 +1035,18 @@ static int cmd_par(int argc, char **argv) {
         if (!strcmp(argv[i], "--src") && i + 1 < argc) src = argv[++i];
         else if (!strcmp(argv[i], "--dir") && i + 1 < argc) dir = argv[++i];
         else if (!strcmp(argv[i], "--out") && i + 1 < argc) out = argv[++i];
-        else if (!strcmp(argv[i], "--procs") && i + 1 < argc) procs = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--n") && i + 1 < argc) n = atol(argv[++i]);
+        /* comp-rev-9bc7d894a LOW 6: strict, as `clonebench run`'s flags */
+        else if (!strcmp(argv[i], "--procs") && i + 1 < argc) {
+            uint64_t pv;
+            if (num_u_as("clonebench par", argv[i], argv[i + 1], 1, 4096, &pv)) return 2;
+            procs = (int)pv;
+            i++;
+        } else if (!strcmp(argv[i], "--n") && i + 1 < argc) {
+            uint64_t nv;
+            if (num_u_as("clonebench par", argv[i], argv[i + 1], 1, (uint64_t)LONG_MAX, &nv)) return 2;
+            n = (long)nv;
+            i++;
+        }
         else { fprintf(stderr, "clonebench par: bad argument %s\n", argv[i]); return 2; }
     }
     if (!src || !dir || !out || procs < 1 || n < procs) { fprintf(stderr, "usage: clonebench par --src F --dir D --procs P --n N --out O\n"); return 2; }

@@ -412,7 +412,8 @@ static int load_spec(const char *path, char **text) {
             char *sp = rest;
             while (*sp && *sp != ' ' && *sp != '\t') sp++;
             if (*sp) *sp++ = 0;
-            int k = atoi(rest);
+            uint64_t kv64 = 0; /* comp-rev-9bc7d894a LOW 6: the whole index (atoi read "1x" as 1) */
+            int k = parse_u64(rest, 1, MAXSTEPS, &kv64) ? 0 : (int)kv64;
             sp = trim(sp);
             if (k < 1 || k > MAXSTEPS || !*sp) sprintf(why, "c1b needs '<step 1..%d> <label>'", MAXSTEPS);
             else S.c1blab[k - 1] = strdup(sp);
@@ -532,6 +533,7 @@ static int kv_parse(const char *s, kv_t *kv, char *why) {
     return 0;
 }
 
+static int parse_u64(const char *v, uint64_t lo, uint64_t hi, uint64_t *out); /* below, with num_u */
 static int conn_open(conn_t *x, const char *base, const char *over, char *why, size_t wsz) {
     memset(x, 0, sizeof *x);
     x->proto = S.proto;
@@ -612,7 +614,14 @@ static int conn_open(conn_t *x, const char *base, const char *over, char *why, s
     unsigned port = 3306;
     for (int i = 0; i < kv.n; i++) {
         if (!strcmp(kv.k[i], "host")) host = kv.v[i];
-        else if (!strcmp(kv.k[i], "port")) port = (unsigned)atoi(kv.v[i]);
+        else if (!strcmp(kv.k[i], "port")) { /* comp-rev-9bc7d894a LOW 6: it was atoi (port=3306x connected to 3306) */
+            uint64_t pv;
+            if (parse_u64(kv.v[i], 1, 65535, &pv)) {
+                snprintf(why, wsz, "mysql conninfo: port needs a whole number in [1, 65535], got '%s'", kv.v[i]);
+                return -1;
+            }
+            port = (unsigned)pv;
+        }
         else if (!strcmp(kv.k[i], "user")) user = kv.v[i];
         else if (!strcmp(kv.k[i], "password")) pass = kv.v[i];
         else if (!strcmp(kv.k[i], "db") || !strcmp(kv.k[i], "dbname")) db = kv.v[i];
@@ -1447,7 +1456,7 @@ int main(int argc, char **argv) {
             return 2;
 #endif
         }
-        else if (!strcmp(a, "--v1-mark-base") && v) MARKB = strtoull(argv[++i], NULL, 0);
+        NUMU("--v1-mark-base", MARKB, 0, UINT64_MAX) /* comp-rev-9bc7d894a LOW 6: base 0 read "0x1g" as 1 */
         else if (!strcmp(a, "--c1b-run") && v) {
 #if BB_HOOKS
             const char *why = "?";
