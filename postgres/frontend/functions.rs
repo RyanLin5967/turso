@@ -25,7 +25,8 @@ pub(crate) fn resolve_scalar(name: &str, arg_count: usize) -> bool {
         | "current_schemas"
         | "int2send"
         | "int4send"
-        | "int8send" => &[1],
+        | "int8send"
+        | "pg_regclass" => &[1],
         "format_type" | "pg_get_constraintdef" | "pg_get_indexdef" | "obj_description" => &[1, 2],
         "pg_get_expr" => &[2, 3],
         "to_char" | "pg_input_is_valid" | "booleq" | "boolne" | "col_description" | "bpchareq"
@@ -56,6 +57,7 @@ pub(crate) fn exec_scalar(conn: &Connection, name: &str, args: &[Value]) -> Resu
         }
         "pg_get_constraintdef" => Ok(exec_pg_get_constraintdef(conn, int_arg(0, 0))),
         "pg_get_indexdef" => Ok(exec_pg_get_indexdef(conn, int_arg(0, 0))),
+        "pg_regclass" => exec_pg_regclass(conn, args),
         "pg_encoding_to_char" => Ok(exec_pg_encoding_to_char(int_arg(0, 0))),
         "format_type" => Ok(exec_pg_format_type(int_arg(0, 0), int_arg(1, -1))),
         "encode" => exec_encode(args),
@@ -100,10 +102,36 @@ pub(crate) fn exec_scalar(conn: &Connection, name: &str, args: &[Value]) -> Resu
             },
         )),
         "pg_backend_pid" => Ok(Value::from_i64(std::process::id() as i64)),
-        // The database's files on disk, in bytes, whatever name is asked (a server serves one
-        // database): the database file and its WAL. A branch reports the database's.
+        // The database's files on disk, in bytes: the database file and its WAL. A branch reports
+        // the database's. A name is the one database pg_database lists here; any other is
+        // PostgreSQL's 3D000 (found by the E5' differential, wire-e5l5-fc85e82fc: every name
+        // answered this database's size). An oid is taken as before.
+        // NULL answers NULL, and an oid is pg_database's one oid or 42704, as PostgreSQL 18.6
+        // answers (wire-rev-uw3 LOW-3; recorded, recordings/pg18-dbsize-edges.out).
         "pg_database_size" => {
             let path = conn.db_file_path();
+            match args.first() {
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(Value::Text(t)) => {
+                    let name = t.as_str();
+                    if name != crate::catalog::db_name_from_path(&path) {
+                        return Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
+                            SqlErrorKind::InvalidCatalogName,
+                            format!("database \"{name}\" does not exist"),
+                        )));
+                    }
+                }
+                Some(v) => {
+                    if v.as_int() != Some(crate::catalog::DATABASE_OID) {
+                        let oid = v.as_int().map_or_else(|| v.to_string(), |o| o.to_string());
+                        return Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
+                            SqlErrorKind::UndefinedObject,
+                            format!("database with OID {oid} does not exist"),
+                        )));
+                    }
+                }
+                None => {}
+            }
             let size = |p: &str| std::fs::metadata(p).map(|m| m.len() as i64).unwrap_or(0);
             Ok(Value::from_i64(size(&path) + size(&format!("{path}-wal"))))
         }
@@ -161,12 +189,7 @@ fn exec_quote_literal(value: &Value) -> Value {
         Value::Text(t) => t.as_str().to_string(),
         other => other.to_string(),
     };
-    let quoted = if text.contains('\\') {
-        format!("E'{}'", text.replace('\\', "\\\\").replace('\'', "''"))
-    } else {
-        format!("'{}'", text.replace('\'', "''"))
-    };
-    Value::build_text(quoted)
+    Value::build_text(crate::catalog::pg_quote_literal(&text))
 }
 
 fn exec_pg_encoding_to_char(encoding: i64) -> Value {
@@ -183,6 +206,65 @@ fn exec_pg_get_constraintdef(conn: &Connection, oid: i64) -> Value {
         Some(s) => Value::build_text(s),
         None => Value::Null,
     }
+}
+
+/// `value::regclass`: the named relation's pg_class oid (recorded, pg18-rev-regclass.out). A
+/// number is taken as an oid; text is read as PostgreSQL's regclassin reads it, an identifier
+/// list (an unquoted part folded to lower case, a quoted part as written, `public.` the main
+/// schema): a missing relation is 42P01 'relation "<name>" does not exist', a malformed name
+/// 42602 'invalid name syntax'. NULL stays NULL.
+fn exec_pg_regclass(conn: &Connection, args: &[Value]) -> Result<Value> {
+    let text = match args.first() {
+        None | Some(Value::Null) => return Ok(Value::Null),
+        Some(Value::Text(t)) => t.as_str().to_string(),
+        Some(other) => match other.as_int() {
+            Some(oid) => return Ok(Value::from_i64(oid)),
+            None => other.to_string(),
+        },
+    };
+    let invalid = || {
+        LimboError::InvalidArgument(SqlErrorMessage::classified(
+            SqlErrorKind::InvalidName,
+            "invalid name syntax".to_string(),
+        ))
+    };
+    let parts = crate::catalog::identifier_list(&text).ok_or_else(invalid)?;
+    // makeRangeVarFromNameList: a third part is a database, which must be this one (0A000
+    // otherwise), and a fourth is 42601 (recorded, pg18-rev-uw2-regclass.out).
+    let (schema, name) = match parts.as_slice() {
+        [name] => (None, name.clone()),
+        [schema, name] => (Some(schema.clone()), name.clone()),
+        [database, schema, name] => {
+            if *database != crate::catalog::db_name_from_path(conn.db_file_path()) {
+                return Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
+                    SqlErrorKind::FeatureNotSupported,
+                    format!("cross-database references are not implemented: \"{}\"", parts.join(".")),
+                )));
+            }
+            (Some(schema.clone()), name.clone())
+        }
+        _ => {
+            return Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
+                SqlErrorKind::SyntaxError,
+                format!("improper relation name (too many dotted names): {}", parts.join(".")),
+            )))
+        }
+    };
+    // pg_catalog comes first on every search path, as PostgreSQL puts it (wire-rev-uw2 H3:
+    // 'pg_class'::regclass was 42P01; PG 18.6 answers 1259); public names only user relations.
+    let found = match schema.as_deref() {
+        None => crate::catalog::catalog_relation_oid(&name)
+            .or_else(|| crate::catalog::relation_oid(&conn.current_schema(), &name)),
+        Some("pg_catalog") => crate::catalog::catalog_relation_oid(&name),
+        Some("public") => crate::catalog::relation_oid(&conn.current_schema(), &name),
+        Some(_) => None,
+    };
+    found.map(Value::from_i64).ok_or_else(|| {
+        LimboError::InvalidArgument(SqlErrorMessage::classified(
+            SqlErrorKind::UndefinedTable,
+            format!("relation \"{}\" does not exist", parts.join(".")),
+        ))
+    })
 }
 
 fn exec_pg_get_indexdef(conn: &Connection, oid: i64) -> Value {
@@ -473,7 +555,7 @@ fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option<String> {
                 let cols: Vec<String> = btree
                     .primary_key_columns
                     .iter()
-                    .map(|(name, _)| name.clone())
+                    .map(|(name, _)| crate::catalog::pg_ident(name))
                     .collect();
                 return Some(format!("PRIMARY KEY ({})", cols.join(", ")));
             }
@@ -482,7 +564,8 @@ fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option<String> {
 
         for us in &btree.unique_sets {
             if constraint_oid == target_oid {
-                let col_names: Vec<&str> = us.columns.iter().map(|c| c.name.as_str()).collect();
+                let col_names: Vec<String> =
+                    us.columns.iter().map(|c| crate::catalog::pg_ident(&c.name)).collect();
                 let kw = if us.is_primary_key {
                     "PRIMARY KEY"
                 } else {
@@ -495,11 +578,13 @@ fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option<String> {
 
         for fk in &btree.foreign_keys {
             if constraint_oid == target_oid {
-                let child_cols = fk.child_columns.join(", ");
-                let parent_cols = fk.parent_columns.join(", ");
+                let names = |cols: &[String]| {
+                    cols.iter().map(|c| crate::catalog::pg_ident(c)).collect::<Vec<_>>().join(", ")
+                };
+                let (child_cols, parent_cols) = (names(&fk.child_columns), names(&fk.parent_columns));
                 let mut def = format!(
                     "FOREIGN KEY ({child_cols}) REFERENCES {}({parent_cols})",
-                    fk.parent_table
+                    crate::catalog::pg_ident(&fk.parent_table)
                 );
                 let on_update = ref_act_to_char(&fk.on_update);
                 let on_delete = ref_act_to_char(&fk.on_delete);
@@ -537,7 +622,6 @@ fn pg_get_indexdef(conn: &Connection, target_oid: i64) -> Option<String> {
                 continue;
             }
             if index_oid == target_oid {
-                let unique = if idx.unique { "UNIQUE " } else { "" };
                 let cols: Vec<String> = idx
                     .columns
                     .iter()
@@ -545,15 +629,12 @@ fn pg_get_indexdef(conn: &Connection, target_oid: i64) -> Option<String> {
                         if let Some(expr) = &col.expr {
                             expr.to_string()
                         } else {
-                            col.name.clone()
+                            crate::catalog::pg_ident(&col.name)
                         }
                     })
                     .collect();
-                let mut def = format!(
-                    "CREATE {unique}INDEX {} ON {table_name} USING btree ({})",
-                    idx.name,
-                    cols.join(", ")
-                );
+                let mut def =
+                    crate::catalog::pg_index_definition(idx.unique, &idx.name, table_name, &cols);
                 if let Some(where_clause) = &idx.where_clause {
                     def.push_str(&format!(" WHERE {where_clause}"));
                 }

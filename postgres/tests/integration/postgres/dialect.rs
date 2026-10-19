@@ -2017,10 +2017,12 @@ fn test_postgres_order_by_nulls_first_last(db: TempDatabase) {
         results
     };
 
-    // Default ASC ordering treats NULLs as smallest, matching PostgreSQL.
+    // Default ASC ordering puts NULLs LAST, as PostgreSQL does: they sort as larger than every
+    // value (recorded on PostgreSQL 18.6 with this table: artie ef23b9bda3 pg18-rev-host1.out
+    // #8, and pg18-nullorder.out). The expectation was NULLs first, SQLite's order.
     assert_eq!(
         run("SELECT v FROM t ORDER BY v"),
-        vec![None, None, Some(5), Some(10), Some(20)]
+        vec![Some(5), Some(10), Some(20), None, None]
     );
     assert_eq!(
         run("SELECT v FROM t ORDER BY v NULLS FIRST"),
@@ -2416,9 +2418,18 @@ fn test_postgres_insert_default(db: TempDatabase) {
     conn.execute("INSERT INTO t (id, name, score) VALUES (2, 'alice', DEFAULT), (3, DEFAULT, 99)")
         .unwrap();
 
-    // All columns DEFAULT
-    conn.execute("INSERT INTO t (id, name, score) VALUES (DEFAULT, DEFAULT, DEFAULT)")
-        .unwrap();
+    // All columns DEFAULT: id has no default, so DEFAULT is NULL there, and PostgreSQL 18.6
+    // refuses it 23502 (recorded with this very table: artie ef23b9bda3 pg18-rev-host1.out #4,
+    // 'null value in column "id" of relation "t" violates not-null constraint'). The expectation
+    // was SQLite's: an auto-assigned rowid 4.
+    let err = conn
+        .execute("INSERT INTO t (id, name, score) VALUES (DEFAULT, DEFAULT, DEFAULT)")
+        .expect_err("PostgreSQL refuses a NULL primary key");
+    assert_eq!(
+        err.sql_error_kind(),
+        turso_parser::sql_error::SqlErrorKind::NotNullViolation,
+        "{err}"
+    );
 
     // Verify results
     let mut stmt = conn
@@ -2440,15 +2451,13 @@ fn test_postgres_insert_default(db: TempDatabase) {
             _ => {}
         }
     }
-    // id=DEFAULT → NULL (no default defined), all others get their defaults
-    // INTEGER PRIMARY KEY with NULL → auto-assigned rowid
+    // The refused row is not stored (pg18-rev-host1.out #5: rows 1-3).
     assert_eq!(
         results,
         vec![
             "1,unknown,42", // name=DEFAULT → 'unknown'
             "2,alice,0",    // score=DEFAULT → 0
             "3,unknown,99", // name=DEFAULT → 'unknown'
-            "4,unknown,0",  // all DEFAULT
         ]
     );
 }

@@ -1,0 +1,56 @@
+>> CONN a
+>> [a] Q CREATE TABLE c(x int)
+   C CREATE TABLE
+   Z I
+>> [a] Q INSERT INTO c VALUES (1)
+   C INSERT 0 1
+   Z I
+>> [a] Q CREATE TABLE d(x int)
+   C CREATE TABLE
+   Z I
+>> [a] Q INSERT INTO d VALUES (1)
+   C INSERT 0 1
+   Z I
+>> [a] PARSE sc - SELECT x FROM c
+>> [a] SYNC
+   ParseComplete
+   Z I
+>> CONN b
+>> [b] Q DROP TABLE c
+   C DROP TABLE
+   Z I
+>> CONN a
+>> [a] BIND - sc - -
+>> [a] EXEC - 0
+>> [a] SYNC
+   E S=ERROR C=42P01 M=relation "c" does not exist
+   Z I
+>> [a] Q BEGIN
+   C BEGIN
+   Z T
+>> [a] PARSE sd - SELECT x FROM d
+>> [a] SYNC
+   ParseComplete
+   Z T
+>> CONN b
+>> [b] Q SET lock_timeout = '500ms'
+   C SET
+   Z I
+>> [b] Q DROP TABLE d
+   E S=ERROR C=55P03 M=canceling statement due to lock timeout
+   Z I
+>> CONN a
+>> [a] BIND - sd - -
+>> [a] EXEC - 0
+>> [a] SYNC
+   BindComplete
+   D ['1']
+   C SELECT 1
+   Z T
+>> [a] Q COMMIT
+   C COMMIT
+   Z I
+>> CONN b
+>> [b] Q DROP TABLE d
+   C DROP TABLE
+   Z I

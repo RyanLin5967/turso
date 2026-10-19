@@ -1,0 +1,105 @@
+>> Q SET TimeZone = 'interval'
+   E S=ERROR C=22023 M=invalid value for parameter "TimeZone": "interval"
+   Z I
+>> Q SET TimeZone = 'interval x'
+   E S=ERROR C=22023 M=invalid value for parameter "TimeZone": "interval x"
+   Z I
+>> Q SET TIME ZONE INTERVAL '1 day'
+   E S=ERROR C=22023 M=invalid value for parameter "TimeZone": "INTERVAL '1 day'"
+   Z I
+>> Q SET TIME ZONE INTERVAL '1 month'
+   E S=ERROR C=22023 M=invalid value for parameter "TimeZone": "INTERVAL '1 mon'"
+   Z I
+>> Q SET TIME ZONE INTERVAL '+05:00' HOUR TO MINUTE
+   C SET
+   Z I
+>> Q SET TIME ZONE INTERVAL 'x'
+   E S=ERROR C=22007 M=invalid input syntax for type interval: "x"
+   Z I
+>> Q SET TimeZone = '200'
+   E S=ERROR C=22023 M=invalid value for parameter "TimeZone": "200"
+   Z I
+>> Q SET TimeZone = '167'
+   C SET
+   Z I
+>> Q SET TimeZone = '168'
+   E S=ERROR C=22023 M=invalid value for parameter "TimeZone": "168"
+   Z I
+>> Q SET TimeZone = '-167'
+   C SET
+   Z I
+>> Q SET TimeZone = 'UTC+200'
+   E S=ERROR C=22023 M=invalid value for parameter "TimeZone": "UTC+200"
+   Z I
+>> Q SET TimeZone = 'UTC+167'
+   C SET
+   Z I
+>> Q SET TimeZone = 'UTC+168'
+   E S=ERROR C=22023 M=invalid value for parameter "TimeZone": "UTC+168"
+   Z I
+>> Q SET TimeZone = 'UTC+3:99'
+   E S=ERROR C=22023 M=invalid value for parameter "TimeZone": "UTC+3:99"
+   Z I
+>> Q SET TimeZone = 'UTC+3:59'
+   C SET
+   Z I
+>> Q SET TimeZone = 'UTC+3:60'
+   E S=ERROR C=22023 M=invalid value for parameter "TimeZone": "UTC+3:60"
+   Z I
+>> Q SET TimeZone = 'EST5EDT,M3.2.0/1:2:3:4,M11.1.0'
+   E S=ERROR C=22023 M=invalid value for parameter "TimeZone": "EST5EDT,M3.2.0/1:2:3:4,M11.1.0"
+   Z I
+>> Q SET TimeZone = 'EST5EDT,M3.2.0/1:2:3,M11.1.0'
+   C SET
+   Z I
+>> Q SET TimeZone = '<>5'
+   C SET
+   Z I
+>> Q SET TimeZone = '<AB>5'
+   C SET
+   Z I
+>> Q SET TimeZone = ' 5'
+   C SET
+   Z I
+>> Q SET TimeZone = '0x5'
+   C SET
+   Z I
+>> Q SET TimeZone = 'nan(1)'
+   C SET
+   Z I
+>> Q SET TimeZone = 'UTC+005'
+   C SET
+   Z I
+>> Q SET TimeZone = 'UTC+100'
+   C SET
+   Z I
+>> Q SET TimeZone = 'AB3'
+   C SET
+   Z I
+>> Q SET TimeZone = 'A_B5'
+   C SET
+   Z I
+>> Q SET TimeZone = 'EST5EDT;M3.2.0;M11.1.0'
+   E S=ERROR C=22023 M=invalid value for parameter "TimeZone": "EST5EDT;M3.2.0;M11.1.0"
+   Z I
+>> Q SET TimeZone = '05:30'
+   C SET
+   Z I
+>> Q SET TimeZone = '+5:3'
+   C SET
+   Z I
+>> Q SET TimeZone = '+05:30:15'
+   E S=ERROR C=22023 M=time zone "+05:30:15" appears to use leap seconds
+   Z I
+>> Q SET TimeZone = 'CST7CDT,M4.1.0,M10.5.0'
+   C SET
+   Z I
+>> Q SET TimeZone = 'UTC-2'
+   C SET
+   Z I
+>> Q SET TimeZone = '-1.5'
+   C SET
+   Z I
+>> Q SET TimeZone = 'UTC'
+   C SET
+   Z I

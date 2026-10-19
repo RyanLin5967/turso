@@ -24,7 +24,7 @@ pub struct PgConnection {
     inner: Arc<PgConnectionInner>,
 }
 
-struct PgConnectionInner {
+pub(crate) struct PgConnectionInner {
     conn: Arc<Connection>,
     /// A parking_lot lock, as is the view cache's: std's Mutex on Apple boxes its pthread mutex at
     /// the first lock, one allocation per new connection paid inside the branch switch that opens
@@ -53,6 +53,34 @@ struct PgConnectionInner {
     /// NOTICE such as DROP ... IF EXISTS's for a missing object), which the server sends before
     /// the statement's result ([`PgConnection::take_warnings`]).
     warnings: parking_lot::Mutex<Vec<(&'static str, SqlErrorKind, String)>>,
+    /// The branch server's sessions ([`PgConnection::new_server`]): no schema but public may be
+    /// created or dropped (its branches cover the one schema), decided here from the parsed
+    /// statement (review wire-quote MED-3's class: the server read it from the client's text, and
+    /// a leading comment hid it).
+    public_schema_only: bool,
+    /// The schemas this session dropped inside its open block, with their files: detached and
+    /// deleted when the block commits, kept when it rolls back (review wire-quote MED-3,
+    /// wire-rev-uw1 M2).
+    dropped_schemas: parking_lot::Mutex<Vec<(String, Option<String>)>>,
+    /// The relations statements prepared inside the open block named (each RangeVar's schema and
+    /// name, [`turso_pg_parser::translator::named_relations`]), for the server to take
+    /// ([`PgConnection::take_block_reads`]).
+    block_reads: parking_lot::Mutex<Vec<turso_pg_parser::translator::PgRelationName>>,
+    /// Which server files a COPY FROM 'file' may read (review wire-quote LOW-3).
+    server_files: ServerFiles,
+}
+
+/// The files a client's COPY FROM 'file' may read. PostgreSQL grants them by role
+/// (pg_read_server_files); this server has no roles, so a branch server's operator grants a
+/// directory (--copy-from-dir) or none, and the CLI and an embedding process read their own files.
+#[derive(Clone, Debug)]
+pub enum ServerFiles {
+    /// The process's own user's files (the CLI, an embedding).
+    Any,
+    /// Only files whose real path lies under this real directory.
+    Under(std::path::PathBuf),
+    /// None: every COPY FROM 'file' is 42501.
+    None,
 }
 
 /// The source of [`PgConnectionInner::search_path_stamp`]'s values.
@@ -140,7 +168,7 @@ fn shown_ms(ms: u64) -> String {
 
 /// The savepoint a SAVEPOINT, RELEASE or ROLLBACK TO statement names, lowercased as PostgreSQL
 /// folds an unquoted name; None when it cannot be read.
-fn savepoint_name(sql: &str) -> Option<String> {
+pub fn savepoint_name(sql: &str) -> Option<String> {
     let parsed = turso_pg_parser::parse(sql).ok()?;
     let stmt = parsed.protobuf.stmts.first()?.stmt.as_ref()?.node.as_ref()?;
     match stmt {
@@ -344,12 +372,94 @@ pub fn open_database_with_io(
     )
 }
 
+/// Each engine connection's session ([`PgConnectionInner`]), by the connection's address, for the
+/// engine's re-prepare: [`crate::catalog::PostgresDialect`]'s `parse_for_reprepare` gets the
+/// engine connection only and translates as the session's prepare does through it (ONE
+/// TRANSLATION PATH, the wire line review M1-M4). An entry is removed when its session drops.
+static SESSIONS_BY_CONNECTION: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<usize, std::sync::Weak<PgConnectionInner>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// The schemas the session's open block dropped, whose DETACH waits for its COMMIT: until then
+/// each is gone for the session's statements ([`refuse_dropped_schemas`], pg_namespace) and can
+/// be created again (wire-rev-uw2 N4).
+pub(crate) fn schemas_dropped_in_block(pg_conn: &PgConnectionInner) -> Vec<String> {
+    pg_conn.dropped_schemas.lock().iter().map(|(name, _)| name.clone()).collect()
+}
+
+/// 3F000 'schema "s" does not exist' for a statement that names a relation in a schema this
+/// session's open block dropped (wire-rev-uw2 N4: CREATE TABLE s.u ran, and the COMMIT then
+/// deleted s.u with s's file; PG 18.6 answers 3F000, r5-pg.txt m2c). Free while no schema was
+/// dropped in the block.
+fn refuse_dropped_schemas(pg_conn: &PgConnectionInner, parse: &turso_pg_parser::pg_query::ParseResult) -> Result<()> {
+    use turso_pg_parser::pg_query::protobuf::node::Node;
+    let dropped = {
+        let dropped = pg_conn.dropped_schemas.lock();
+        if dropped.is_empty() {
+            return Ok(());
+        }
+        dropped.iter().map(|(name, _)| name.clone()).collect::<Vec<_>>()
+    };
+    let mut schemas: Vec<String> = turso_pg_parser::translator::named_relations(parse)
+        .into_iter()
+        .filter_map(|(schema, _)| schema)
+        .collect();
+    // CREATE TABLE's own relation is not on pg_query's walk.
+    for raw in &parse.protobuf.stmts {
+        if let Some(Node::CreateStmt(create)) = raw.stmt.as_ref().and_then(|s| s.node.as_ref()) {
+            if let Some(rel) = &create.relation {
+                if !rel.schemaname.is_empty() {
+                    schemas.push(rel.schemaname.clone());
+                }
+            }
+        }
+    }
+    match schemas.iter().find(|s| dropped.contains(s)) {
+        Some(schema) => Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
+            SqlErrorKind::InvalidSchemaName,
+            format!("schema \"{schema}\" does not exist"),
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// The session of the engine connection `conn`, if one is alive.
+pub(crate) fn session_of(conn: &Arc<Connection>) -> Option<Arc<PgConnectionInner>> {
+    SESSIONS_BY_CONNECTION
+        .lock()
+        .get(&(Arc::as_ptr(conn) as usize))
+        .and_then(std::sync::Weak::upgrade)
+        .filter(|inner| Arc::ptr_eq(&inner.conn, conn))
+}
+
+impl Drop for PgConnectionInner {
+    fn drop(&mut self) {
+        let key = Arc::as_ptr(&self.conn) as usize;
+        let mut sessions = SESSIONS_BY_CONNECTION.lock();
+        // Only this session's own entry: another may since have registered the same address.
+        if sessions.get(&key).is_some_and(|w| w.strong_count() == 0) {
+            sessions.remove(&key);
+        }
+    }
+}
+
 impl PgConnection {
     pub fn new(conn: Arc<Connection>) -> Self {
+        Self::open(conn, false, ServerFiles::Any)
+    }
+
+    /// A branch server session: as [`PgConnection::new`], except that CREATE SCHEMA and DROP
+    /// SCHEMA of any schema but public are refused (0A000), by the statement's kind, and COPY
+    /// FROM 'file' reads only the files `files` grants.
+    pub fn new_server(conn: Arc<Connection>, files: ServerFiles) -> Self {
+        Self::open(conn, true, files)
+    }
+
+    fn open(conn: Arc<Connection>, public_schema_only: bool, server_files: ServerFiles) -> Self {
         aliases::install(&conn);
         // PostgreSQL enforces every foreign key; the engine only under PRAGMA foreign_keys.
         conn.set_foreign_keys_enabled(true);
-        Self {
+        let pg = Self {
             inner: Arc::new(PgConnectionInner {
                 conn,
                 session_state: parking_lot::Mutex::new(SessionState::default()),
@@ -360,12 +470,151 @@ impl PgConnection {
                 min_messages: std::sync::atomic::AtomicU8::new(7),
                 search_path_stamp: std::sync::atomic::AtomicU64::new(0),
                 warnings: parking_lot::Mutex::new(Vec::new()),
+                public_schema_only,
+                dropped_schemas: parking_lot::Mutex::new(Vec::new()),
+                block_reads: parking_lot::Mutex::new(Vec::new()),
+                server_files,
             }),
-        }
+        };
+        SESSIONS_BY_CONNECTION
+            .lock()
+            .insert(Arc::as_ptr(&pg.inner.conn) as usize, Arc::downgrade(&pg.inner));
+        pg
     }
 
     pub fn inner(&self) -> &Arc<Connection> {
         &self.inner.conn
+    }
+
+    /// The relations named by statements prepared inside the open block since the last take.
+    pub fn take_block_reads(&self) -> Vec<turso_pg_parser::translator::PgRelationName> {
+        std::mem::take(&mut *self.inner.block_reads.lock())
+    }
+
+    /// `reads` and every relation they read through views, closed: a view's stored query is read
+    /// for the relations it names, and those again, as PostgreSQL's rewriter locks a view's base
+    /// relations with the view (recorded: reviews/uw2-raws/round1-pg-all.txt x09, s08). A view is
+    /// found as [`PgConnection::stored_relation`] finds it; one read once (a circular definition
+    /// ends). BLIND SPOTS: a view whose stored text libpg_query cannot read (SQLite's own
+    /// rendering) adds nothing, and an unqualified name inside a view is kept unqualified.
+    pub fn relations_through_views(
+        &self,
+        reads: &[turso_pg_parser::translator::PgRelationName],
+    ) -> Vec<turso_pg_parser::translator::PgRelationName> {
+        let mut out: Vec<turso_pg_parser::translator::PgRelationName> = Vec::new();
+        let mut next: Vec<turso_pg_parser::translator::PgRelationName> = reads.to_vec();
+        while let Some(read) = next.pop() {
+            if out.iter().any(|r| same_relation_name(r, &read)) {
+                continue;
+            }
+            if let Some(found) = self.stored_relation(read.0.as_deref(), &read.1) {
+                if found.kind == "view" {
+                    let sql = catalog::decode_stored_pg_schema_sql(&found.sql).unwrap_or(&found.sql);
+                    if let Some(base) = turso_pg_parser::parse(sql)
+                        .ok()
+                        .and_then(|p| turso_pg_parser::translator::view_query_relations(&p))
+                    {
+                        next.extend(base);
+                    }
+                }
+            }
+            out.push(read);
+        }
+        out
+    }
+
+    /// The table an index belongs to, found as [`PgConnection::stored_relation`] finds a name,
+    /// in the schema the index names (or the one found holding it), as a qualified name.
+    pub fn index_relation(
+        &self,
+        index: &turso_pg_parser::translator::PgRelationName,
+    ) -> Option<turso_pg_parser::translator::PgRelationName> {
+        let found = self.stored_relation(index.0.as_deref(), &index.1)?;
+        (found.kind == "index").then(|| (Some(found.schema), found.table))
+    }
+
+    /// Whether schema `schema` (public is main) holds a table or view named `name`.
+    pub fn schema_holds_relation(&self, schema: &str, name: &str) -> bool {
+        self.stored_relation(Some(schema), name)
+            .is_some_and(|found| found.kind == "table" || found.kind == "view")
+    }
+
+    /// The catalog row (sqlite_schema) of the object named `name`, in `schema` when given
+    /// (public is main), else in the first schema of the session's search path holding the name
+    /// (public as main; with no path set, main and then the attached schemas, as the engine
+    /// resolves an unqualified name). Read by root statements, so each read ends with it (a
+    /// nested one left an attached database's read open: wire-rev-uw2 N2). None when nothing
+    /// holds the name or a read fails.
+    fn stored_relation(&self, schema: Option<&str>, name: &str) -> Option<StoredRelation> {
+        let databases: Vec<String> = match schema {
+            Some(s) if s.eq_ignore_ascii_case("public") || s == "main" => vec!["main".to_string()],
+            Some(s) => vec![s.to_string()],
+            None => {
+                let path = self.search_path();
+                if path.is_empty() {
+                    let mut all = vec!["main".to_string()];
+                    let mut attached = self.inner.conn.attached_database_names();
+                    attached.sort();
+                    all.extend(attached);
+                    all
+                } else {
+                    path.iter()
+                        .map(|e| if e.eq_ignore_ascii_case("public") { "main".to_string() } else { e.clone() })
+                        .collect()
+                }
+            }
+        };
+        for database in databases {
+            // main's objects are read from the connection's in-memory schema, with no query.
+            if database == "main" {
+                let schema = self.inner.conn.current_schema();
+                let found = |kind: &str, table: &str, sql: &str| StoredRelation {
+                    kind: kind.to_string(),
+                    table: table.to_string(),
+                    sql: sql.to_string(),
+                    schema: "public".to_string(),
+                };
+                if let Some(view) = schema.get_view(name) {
+                    return Some(found("view", &view.name, &view.sql));
+                }
+                if let Some(table) = schema.get_table(name) {
+                    return Some(found("table", table.get_name(), ""));
+                }
+                if let Some(index) = schema
+                    .indexes
+                    .values()
+                    .flatten()
+                    .find(|i| i.name.eq_ignore_ascii_case(name))
+                {
+                    return Some(found("index", &index.table_name, ""));
+                }
+                continue;
+            }
+            let sql = catalog::sqlite_text(format!(
+                "SELECT type, tbl_name, sql FROM {}.sqlite_schema WHERE name = {} COLLATE NOCASE",
+                catalog::quote_ident(&database),
+                catalog::quote_literal(name)
+            ));
+            let Ok(mut stmt) = self.inner.conn.prepare_sqlite(&sql) else {
+                continue;
+            };
+            let Ok(rows) = stmt.run_collect_rows() else {
+                continue;
+            };
+            let text = |v: Option<&Value>| match v {
+                Some(Value::Text(t)) => t.as_str().to_string(),
+                _ => String::new(),
+            };
+            if let Some(row) = rows.first() {
+                return Some(StoredRelation {
+                    kind: text(row.first()),
+                    table: text(row.get(1)),
+                    sql: text(row.get(2)),
+                    schema: database,
+                });
+            }
+        }
+        None
     }
 
     /// SET lock_timeout, in milliseconds; 0 when unset or set to 0 (see
@@ -556,7 +805,7 @@ impl PgConnection {
     }
 
     pub fn pragma_update(&self, name: &str, value: impl std::fmt::Display) -> Result<()> {
-        let sql = format!("PRAGMA {name} = {value}");
+        let sql = catalog::sqlite_text(format!("PRAGMA {name} = {value}"));
         let mut stmt = self.inner.conn.prepare_internal(sql)?;
         stmt.run_ignore_rows()
     }
@@ -592,6 +841,18 @@ impl PgConnection {
         let gucs = &mut state.gucs;
         match event {
             TxEvent::Ended { committed } => {
+                let dropped = std::mem::take(&mut *self.inner.dropped_schemas.lock());
+                if committed {
+                    for (name, path) in &dropped {
+                        if let Err(e) = detach_schema(&self.inner.conn, name) {
+                            tracing::warn!("the dropped schema {name} could not be detached: {e}");
+                            continue;
+                        }
+                        if let Some(path) = path {
+                            remove_schema_file(path);
+                        }
+                    }
+                }
                 if let (false, Some(start)) = (committed, gucs.block_start.take()) {
                     gucs.session = start;
                 }
@@ -894,16 +1155,23 @@ pub fn attach_schema_files(conn: &PgConnection, db_file: &str) {
             continue;
         };
         let Some(schema) = name
-            .strip_prefix("turso-postgres-schema-")
+            .strip_prefix(SCHEMA_FILE_PREFIX)
             .and_then(|s| s.strip_suffix(".db"))
+            .and_then(schema_of_file_name)
         else {
             continue;
         };
+        let schema = schema.as_str();
         let path = entry.path().to_string_lossy().to_string();
-        let sql = format!("ATTACH '{path}' AS \"{schema}\"");
-        tracing::info!("Auto-attaching PG schema '{}' from {}", schema, path);
+        let sql = catalog::sqlite_text(format!(
+            "ATTACH {} AS {}",
+            catalog::quote_literal(&path),
+            catalog::quote_ident(schema)
+        ));
+        // Log text, not SQL: the name in Rust's own quoting ({:?}), never a hand-quoted hole.
+        tracing::info!("Auto-attaching PG schema {:?} from {}", schema, path);
         if let Err(e) = conn.inner().execute(&sql) {
-            tracing::warn!("Failed to attach schema '{}': {}", schema, e);
+            tracing::warn!("Failed to attach schema {:?}: {}", schema, e);
         }
     }
 }
@@ -955,6 +1223,55 @@ fn split_script(sql: &str) -> Vec<String> {
         return vec![body.to_string()];
     }
     turso_pg_parser::split_statements_lenient(sql).unwrap_or_else(|_| vec![trimmed.to_string()])
+}
+
+/// Whether `sql` is a COMMIT (or END), as libpg_query parses it: for a caller that runs
+/// statements itself and reports the end of a block ([`PgConnection::tx_event`]), as the CLI does
+/// (wire-rev-uw1 M2: only the server reported a block's end, so a CLI block's SET LOCALs and its
+/// dropped schemas were never settled).
+pub fn is_commit(sql: &str) -> bool {
+    use turso_pg_parser::pg_query::protobuf::TransactionStmtKind;
+    use turso_pg_parser::pg_query::NodeRef;
+    let Ok(parsed) = turso_pg_parser::parse(sql) else {
+        return false;
+    };
+    let nodes = parsed.protobuf.nodes();
+    match nodes.first().map(|n| &n.0) {
+        Some(NodeRef::TransactionStmt(t)) => {
+            TransactionStmtKind::try_from(t.kind).ok() == Some(TransactionStmtKind::TransStmtCommit)
+        }
+        _ => false,
+    }
+}
+
+/// What a statement does to a failed (aborted) block, as PostgreSQL reads it: COMMIT, END,
+/// ROLLBACK, ABORT and PREPARE TRANSACTION end it as ROLLBACK (`chain` for AND CHAIN, which opens
+/// a new block), ROLLBACK TO a savepoint recovers it, and every other statement is 25P02.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailedBlockVerb {
+    Ends { chain: bool },
+    RollbackTo,
+    Other,
+}
+
+/// [`FailedBlockVerb`] of `sql`, read from its parse (Other for text that does not parse).
+pub fn failed_block_verb(sql: &str) -> FailedBlockVerb {
+    use turso_pg_parser::pg_query::protobuf::TransactionStmtKind as K;
+    use turso_pg_parser::pg_query::NodeRef;
+    let Ok(parsed) = turso_pg_parser::parse(sql) else {
+        return FailedBlockVerb::Other;
+    };
+    let nodes = parsed.protobuf.nodes();
+    let Some(NodeRef::TransactionStmt(t)) = nodes.first().map(|n| &n.0) else {
+        return FailedBlockVerb::Other;
+    };
+    match K::try_from(t.kind).ok() {
+        Some(K::TransStmtCommit | K::TransStmtRollback | K::TransStmtPrepare) => {
+            FailedBlockVerb::Ends { chain: t.chain }
+        }
+        Some(K::TransStmtRollbackTo) => FailedBlockVerb::RollbackTo,
+        _ => FailedBlockVerb::Other,
+    }
 }
 
 /// The one statement `sql` is when it holds no separator but a trailing one (no literal, comment or
@@ -1110,6 +1427,17 @@ fn prepare_statement_parsed(
     }
 
     reject_sqlite_catalog_access(sql)?;
+    // A kind is never carried by text a client can write (review wire-line2 H1, the lead's class):
+    // the marker is the frontend's own SQLite's, and this text is stored as the statement's SQL,
+    // which an engine re-prepare would then read as SQLite instead of the PostgreSQL statement
+    // checked here. Client text that starts with it is refused. BLIND SPOT, closed only by the
+    // engine's typed text kind at integration: a statement's text is still what decides its parse.
+    if sql.starts_with(crate::catalog::SQLITE_TEXT_MARKER.trim_end()) {
+        return Err(LimboError::ParseError(SqlErrorMessage::classified(
+            SqlErrorKind::SyntaxError,
+            "a statement may not start with the frontend's internal marker comment",
+        )));
+    }
 
     // One parse serves both the special forms and the translation (it was two), and a Parse
     // message's serves its classification too (C53).
@@ -1146,6 +1474,16 @@ fn prepare_statement_parsed(
     } else {
         Vec::new()
     };
+    // Inside a block, the relations this statement names are held to the block's end, as
+    // PostgreSQL's parse analysis locks them: the server takes them for its cross-session DROP
+    // wait (lead ruling 2026-10-18, pg18-rev-bl3.out #19), from this parse, never a second one.
+    refuse_dropped_schemas(pg_conn, &parse_result)?;
+    if !pg_conn.conn.get_auto_commit() {
+        let relations = turso_pg_parser::translator::named_relations(&parse_result);
+        if !relations.is_empty() {
+            pg_conn.block_reads.lock().extend(relations);
+        }
+    }
     let special = Special::of(&parse_result);
     drop(parsing);
     let performs = special.as_ref().is_some_and(Special::performs);
@@ -1197,7 +1535,15 @@ fn prepare_statement_parsed(
         // An aggregate's result type is read through the walk, as a parameter's is, so its
         // argument's relation is the one the engine reads (wire review 17 item 15): the walk runs
         // for a statement with a parameter or an aggregate result column.
-        let aggregates = crate::result_types::aggregate_targets(&parse_result);
+        let mut aggregates = crate::result_types::aggregate_targets(&parse_result);
+        // A column computed by arithmetic or a fixed-type function is typed by the walk too
+        // (wirefuzz vs PG 18.6); the two lists line up whenever both are non-empty.
+        let computed = crate::result_types::computed_targets(&parse_result);
+        if computed.len() == aggregates.len() {
+            for (aggregate, computed) in aggregates.iter_mut().zip(computed) {
+                *aggregate |= computed;
+            }
+        }
         types.columns = vec![None; aggregates.len()];
         if !used.is_empty() || aggregates.contains(&true) {
             // A parameter compared with something no context types is refused (42P18) by the
@@ -1262,44 +1608,7 @@ fn prepare_statement_parsed(
     // lookup refuses one. An INSERT whose VALUES lists, with no column list, hold DEFAULT names its
     // positions from the in-memory schema alone (no catalog query). No other statement pays for a
     // lookup.
-    let translator = || {
-        if is_delete_using(sql, &parse_result) {
-            let pg_conn = pg_conn.clone();
-            PostgreSQLTranslator::new()
-                .with_columns(move |schema, table| relation_columns(&pg_conn, schema, table))
-        } else if is_positional_insert_default(sql, &parse_result)
-            || has_alias_column_list(&parse_result)
-        {
-            let pg_conn = pg_conn.clone();
-            PostgreSQLTranslator::new()
-                .with_columns(move |schema, table| resident_relation_columns(&pg_conn, schema, table))
-        } else {
-            PostgreSQLTranslator::new()
-        }
-    };
-    let first = translator();
-    let mut translated = first
-        .translate_with_prereqs(&parse_result)
-        .map_err(crate::session::pg_parse_error)?;
-    // A cast to a type that is not built-in is kept by name only when it is the engine's own (a
-    // domain, a custom type), so the engine runs its CHECKs: `CAST(-5 AS dm)` returned -5 (the
-    // domain CHECK class's PG 18.6 replay, 2026-10-15). Looked up, and translated again, only for
-    // a statement that casts to such a name.
-    let unmapped = first.unmapped_cast_types();
-    if !unmapped.is_empty() {
-        let schema = pg_conn.conn.current_schema();
-        let known: std::collections::HashSet<String> = unmapped
-            .into_iter()
-            .filter(|name| schema.get_type_def_unchecked(name).is_some())
-            .collect();
-        if !known.is_empty() {
-            translated = translator()
-                .with_known_types(known)
-                .translate_with_prereqs(&parse_result)
-                .map_err(crate::session::pg_parse_error)?;
-        }
-    }
-    reject_catalog_dml(translated.cmd.stmt())?;
+    let translated = session_translation(pg_conn, sql, &parse_result, false)?;
     drop(translating);
     // A statement with prerequisites (a CREATE TABLE's SERIAL sequences) is performed below, keys
     // and all, so the server has no keys left to resolve.
@@ -1344,11 +1653,7 @@ fn prepare_statement_parsed(
         // leading columns. Asked again, the translator reads the table's columns and names them, on
         // this refusal path only, so a positional INSERT that fits pays for no lookup.
         if prepared.is_err() && is_positional_insert_values(&parse_result) {
-            let lookup_conn = pg_conn.clone();
-            let retried = PostgreSQLTranslator::new()
-                .with_columns(move |schema, table| resident_relation_columns(&lookup_conn, schema, table))
-                .translate_with_prereqs(&parse_result)
-                .map_err(crate::session::pg_parse_error)?;
+            let retried = session_translation(pg_conn, sql, &parse_result, true)?;
             return pg_conn
                 .conn
                 .prepare_translated_cmd_with_options(retried.cmd, sql, options.clone())
@@ -1363,7 +1668,8 @@ fn prepare_statement_parsed(
     // steps a no-op; a Describe declined it above.
     own_transaction(pg_conn, "__turso_create_prereqs", "CREATE TABLE", || {
         for prereq in translated.prereqs {
-            let input = prereq.to_string();
+            // The prerequisite's own SQLite text, marked, for a re-prepare (review wire-line2 LOW-2).
+            let input = catalog::sqlite_text(prereq.to_string());
             pg_conn
                 .conn
                 .prepare_translated_stmt_with_options(prereq, &input, options.clone())?
@@ -1379,6 +1685,171 @@ fn prepare_statement_parsed(
         }
     })?;
     noop_statement(&pg_conn.conn).map(Some)
+}
+
+/// THE translation of a statement, for the session's prepare and for the engine's re-prepare of it
+/// alike (ONE TRANSLATION PATH, the wire line review M1-M4: the re-prepare translated with a plain
+/// translator, so a DELETE ... USING lost its column lookup, a domain cast its CHECK, and
+/// 92257e453's refusal list over-refused a CTE alias and any text with "default").
+/// - A DELETE ... USING reads its relations' declared columns (wire review 13 item 5, review 15
+///   item 7), wherever it sits (EXPLAIN's, a CTE's: wire review 16 item 21); a translator with no
+///   lookup refuses one.
+/// - An INSERT whose VALUES lists, with no column list, hold DEFAULT, or a FROM item with an alias
+///   column list, names its positions from the in-memory schema alone (no catalog query).
+/// - `positional_retry`: a positional INSERT the engine refused at its first compile (a VALUES list
+///   of another length than the table's) is asked again with the in-memory column lookup, which
+///   names the columns. The re-prepare takes that translator for every positional INSERT VALUES:
+///   it cannot see a compile failure, and naming the columns is the same statement when the
+///   lengths agree.
+/// - A cast to a type that is not built-in is kept by name only when it is the engine's own (a
+///   domain, a custom type), so the engine runs its CHECKs (`CAST(-5 AS dm)` returned -5: the
+///   domain CHECK class's PG 18.6 replay, 2026-10-15).
+/// No other statement pays for a lookup. The lookups read the session's CURRENT search path; at an
+/// engine re-prepare the compile uses the PrepareOptions saved at the prepare, so the two agree only
+/// while the path has not changed since (review wire-line2 LOW-1; a kept statement's key enforces
+/// that through its path stamp, and the engine's statement does not).
+pub(crate) fn session_translation(
+    pg_conn: &Arc<PgConnectionInner>,
+    sql: &str,
+    parse_result: &turso_pg_parser::pg_query::ParseResult,
+    positional_retry: bool,
+) -> Result<turso_pg_parser::translator::TranslateResult> {
+    let translator = || {
+        if is_delete_using(sql, parse_result) {
+            let pg_conn = pg_conn.clone();
+            PostgreSQLTranslator::new()
+                .with_columns(move |schema, table| relation_columns(&pg_conn, schema, table))
+        } else if positional_retry
+            || is_positional_insert_default(sql, parse_result)
+            || has_alias_column_list(parse_result)
+        {
+            let pg_conn = pg_conn.clone();
+            PostgreSQLTranslator::new()
+                .with_columns(move |schema, table| resident_relation_columns(&pg_conn, schema, table))
+        } else if is_unnamed_index(parse_result) {
+            let pg_conn = pg_conn.clone();
+            PostgreSQLTranslator::new().with_relation_names(move |schema, table, name| {
+                relation_name_taken(&pg_conn, schema, table, name)
+            })
+        } else {
+            PostgreSQLTranslator::new()
+        }
+    };
+    let first = translator();
+    let mut translated = first
+        .translate_with_prereqs(parse_result)
+        .map_err(translation_error)?;
+    // A column type no built-in type covers must be a type the engine knows: otherwise it is
+    // PostgreSQL's 42704 with its message, before anything runs (wire-rev-uw1 M1; recorded,
+    // pg18-rev-uw1-type.out). The engine refused it as 42601 'unknown datatype'.
+    let user_types = first.user_column_types();
+    if !user_types.is_empty() {
+        let schema = pg_conn.conn.current_schema();
+        if let Some(missing) = user_types
+            .iter()
+            .find(|name| schema.get_type_def_unchecked(&name.to_lowercase()).is_none())
+        {
+            // information_schema's domains (cardinal_number, sql_identifier, ...) exist in
+            // PostgreSQL, so not 42704: they are not served here (wire-rev-uw2 N5).
+            if missing.starts_with("information_schema.") {
+                return Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
+                    SqlErrorKind::FeatureNotSupported,
+                    format!("type \"{missing}\" is not supported"),
+                )));
+            }
+            return Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
+                SqlErrorKind::UndefinedObject,
+                format!("type \"{missing}\" does not exist"),
+            )));
+        }
+    }
+    let unmapped = first.unmapped_cast_types();
+    if !unmapped.is_empty() {
+        let schema = pg_conn.conn.current_schema();
+        // A cast to a type neither the engine nor PostgreSQL has is 42704, as there; it was left
+        // to the operand's own type, so CREATE TABLE AS and DEFAULT ran (wire-rev-uw2 LOW;
+        // recorded, pg18-rev-uw2-casts.out). A PostgreSQL type this frontend does not model keeps
+        // the old pass-through.
+        if let Some(missing) = unmapped.iter().find(|name| {
+            schema.get_type_def_unchecked(name).is_none() && !is_postgresql_type_name(name)
+        }) {
+            return Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
+                SqlErrorKind::UndefinedObject,
+                format!("type \"{missing}\" does not exist"),
+            )));
+        }
+        let known: std::collections::HashSet<String> = unmapped
+            .into_iter()
+            .filter(|name| schema.get_type_def_unchecked(name).is_some())
+            .collect();
+        if !known.is_empty() {
+            translated = translator()
+                .with_known_types(known)
+                .translate_with_prereqs(parse_result)
+                .map_err(translation_error)?;
+        }
+    }
+    reject_catalog_dml(translated.cmd.stmt())?;
+    Ok(translated)
+}
+
+/// A translation's refusal as the engine error it is reported with: PostgreSQL's own message, with
+/// no "Parse error: " prefix, for the conditions whose text this frontend writes as PostgreSQL's
+/// (42704 'access method "x" does not exist', 42P16 'column "a" has pseudo-type x'; wire-rev-uw2
+/// LOW), and a parse error as before for every other.
+fn translation_error(e: turso_pg_parser::ParseError) -> LimboError {
+    let message: SqlErrorMessage = e.into();
+    match message.kind() {
+        Some(SqlErrorKind::UndefinedObject | SqlErrorKind::InvalidTableDefinition) => {
+            LimboError::InvalidArgument(message)
+        }
+        _ => LimboError::ParseError(message),
+    }
+}
+
+/// PostgreSQL 18.6's pg_catalog type names but the pg_* ones (recorded: pg18-rev-uw2-casts.out,
+/// 98 of the 473, array types left out), for [`is_postgresql_type_name`].
+const PG_CATALOG_TYPE_NAMES: &[&str] = &[
+    "aclitem", "any", "anyarray", "anycompatible", "anycompatiblearray",
+    "anycompatiblemultirange", "anycompatiblenonarray", "anycompatiblerange", "anyelement",
+    "anyenum", "anymultirange", "anynonarray", "anyrange", "bit", "bool", "box", "bpchar",
+    "bytea", "char", "cid", "cidr", "circle", "cstring", "date", "datemultirange", "daterange",
+    "event_trigger", "fdw_handler", "float4", "float8", "gtsvector", "index_am_handler", "inet",
+    "int2", "int2vector", "int4", "int4multirange", "int4range", "int8", "int8multirange",
+    "int8range", "internal", "interval", "json", "jsonb", "jsonpath", "language_handler",
+    "line", "lseg", "macaddr", "macaddr8", "money", "name", "numeric", "nummultirange",
+    "numrange", "oid", "oidvector", "path", "point", "polygon", "record", "refcursor",
+    "regclass", "regcollation", "regconfig", "regdictionary", "regnamespace", "regoper",
+    "regoperator", "regproc", "regprocedure", "regrole", "regtype", "table_am_handler", "text",
+    "tid", "time", "timestamp", "timestamptz", "timetz", "trigger", "tsm_handler",
+    "tsmultirange", "tsquery", "tsrange", "tstzmultirange", "tstzrange", "tsvector",
+    "txid_snapshot", "unknown", "uuid", "varbit", "varchar", "void", "xid", "xid8", "xml"
+];
+
+/// Whether `name` (lower case, as a cast target's last part) may be a PostgreSQL type: one of
+/// pg_catalog's (an array type `_x` by its element), any pg_* name (pg_catalog's own row types and
+/// pg_lsn-like types, not listed), or one of information_schema's domains.
+fn is_postgresql_type_name(name: &str) -> bool {
+    let base = name.strip_prefix('_').unwrap_or(name);
+    PG_CATALOG_TYPE_NAMES.contains(&base)
+        || base.starts_with("pg_")
+        || matches!(base, "cardinal_number" | "character_data" | "sql_identifier" | "time_stamp" | "yes_or_no")
+}
+
+/// The engine's re-prepare of a statement this session prepared: through
+/// [`session_translation`], as the prepare translated it.
+pub(crate) fn reprepare_translation(
+    pg_conn: &Arc<PgConnectionInner>,
+    sql: &str,
+    parse_result: &turso_pg_parser::pg_query::ParseResult,
+) -> Result<ast::Cmd> {
+    let translated =
+        session_translation(pg_conn, sql, parse_result, is_positional_insert_values(parse_result))?;
+    // A statement with prerequisites (a CREATE TABLE's SERIAL sequences) re-prepared between its
+    // prepare and its step (a schema change inside own_transaction): its prerequisites already ran
+    // in the same transaction, so the statement alone is compiled again (review wire-line2 LOW-3:
+    // it was refused, failing the CREATE in that race).
+    Ok(translated.cmd)
 }
 
 fn reject_catalog_dml(stmt: &ast::Stmt) -> Result<()> {
@@ -1431,10 +1902,14 @@ fn try_prepare_special(
         Special::Set(set_stmt) => handle_pg_set(pg_conn, &set_stmt)?,
         Special::Show(show_stmt) => handle_pg_show(pg_conn, &show_stmt)?,
         Special::CreateSchema(stmt) => {
-            handle_pg_create_schema(&pg_conn.conn, &stmt)?;
+            refuse_schema_ddl(pg_conn, &stmt.name)?;
+            handle_pg_create_schema(pg_conn, &stmt)?;
             noop_statement(&pg_conn.conn)?
         }
         Special::DropSchema(stmt) => {
+            for name in &stmt.names {
+                refuse_schema_ddl(pg_conn, name)?;
+            }
             handle_pg_drop_schema(pg_conn, &stmt)?;
             noop_statement(&pg_conn.conn)?
         }
@@ -1446,7 +1921,9 @@ fn try_prepare_special(
         // PostgreSQL's CHECKPOINT writes every dirty page to the data files; a WAL checkpoint that
         // copies every frame back into the database file and truncates the log is the same act
         // here.
-        Special::Checkpoint => pg_conn.conn.prepare("PRAGMA wal_checkpoint(TRUNCATE)")?,
+        Special::Checkpoint => pg_conn
+            .conn
+            .prepare(catalog::sqlite_text("PRAGMA wal_checkpoint(TRUNCATE)"))?,
         Special::AddConstraints(add) => {
             handle_pg_add_constraints(pg_conn, &add)?;
             noop_statement(&pg_conn.conn)?
@@ -1462,7 +1939,7 @@ fn try_prepare_special(
 }
 
 fn noop_statement(conn: &Arc<Connection>) -> Result<Statement> {
-    conn.prepare("SELECT 0 WHERE 0")
+    conn.prepare(catalog::sqlite_text("SELECT 0 WHERE 0"))
 }
 
 fn execute_sqlite_internal(conn: &Arc<Connection>, sql: impl AsRef<str>) -> Result<()> {
@@ -1581,6 +2058,64 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
         pg_conn.publish(&effective);
         Ok(())
     };
+    // SET name TO DEFAULT, RESET name and RESET ALL (recorded, pg18-rev-host1.out #13-#31): the
+    // settings this session keeps take the values it started with (Gucs::default, as no startup
+    // option sets one), under SET's scoping, so SET LOCAL ... TO DEFAULT lasts its block. Any
+    // other setting this server knows already holds its default, since a SET of one is accepted
+    // only at the value this server answers by: nothing changes. A dotted name is 0A000 and a
+    // name nobody knows 42704, as for SET.
+    if set_stmt.to_default {
+        let default = Gucs::default();
+        let reset_all = name.is_empty();
+        let kept = matches!(
+            name.as_str(),
+            "search_path" | "foreign_keys" | "lock_timeout" | "statement_timeout" | "client_min_messages"
+        );
+        if reset_all || kept {
+            assign(&|session, local, is_local| {
+                if reset_all {
+                    *session = default.clone();
+                    *local = Locals::default();
+                    return;
+                }
+                macro_rules! to_default {
+                    ($field:ident, $local:ident) => {
+                        if is_local {
+                            local.$local = Some(default.$field.clone());
+                        } else {
+                            session.$field = default.$field.clone();
+                            local.$local = None;
+                        }
+                    };
+                }
+                match name.as_str() {
+                    "search_path" => to_default!(search_path, search_path),
+                    "foreign_keys" => to_default!(foreign_keys, foreign_keys),
+                    "lock_timeout" => to_default!(lock_timeout_ms, lock_timeout_ms),
+                    "statement_timeout" => to_default!(statement_timeout_ms, statement_timeout_ms),
+                    _ => to_default!(min_messages, min_messages),
+                }
+            })?;
+            return noop_statement(&pg_conn.conn);
+        }
+        if name.contains('.') {
+            return Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
+                SqlErrorKind::FeatureNotSupported,
+                format!("SET {name} TO DEFAULT is not supported: custom configuration parameters are not supported"),
+            )));
+        }
+        let known = FIXED_SETTINGS.iter().any(|(n, _)| n.eq_ignore_ascii_case(&name))
+            || NOOP_PARAMETERS.contains(&name.as_str())
+            || name.starts_with("enable_")
+            || crate::pg_settings::is_postgresql_parameter(&name);
+        if !known {
+            return Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
+                SqlErrorKind::UndefinedObject,
+                format!("unrecognized configuration parameter \"{name}\""),
+            )));
+        }
+        return noop_statement(&pg_conn.conn);
+    }
     if name == "search_path" {
         let path = set_stmt
             .values
@@ -1617,6 +2152,8 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
         | PgSetValue::RawSql(v) => v.clone(),
         PgSetValue::Bool(b) => b.to_string(),
         PgSetValue::Null => String::new(),
+        // As PostgreSQL quotes it in its refusal: `INTERVAL '1 day'`.
+        PgSetValue::Interval { .. } => value.to_sql_string(),
     };
     let text = if name == "datestyle" {
         set_stmt
@@ -1829,35 +2366,44 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
                 lower.as_str(),
                 "utc" | "gmt" | "etc/utc" | "etc/gmt" | "z" | "zulu" | "uct" | "universal" | "0"
             );
-            // A zone PostgreSQL would know, as its check_timezone reads it (review
-            // c39799c5d..9e24b455d LOW 7, pg18-rev-c39-tzforms.out): an INTERVAL; a number of
-            // hours read whole as strtod reads it (`--5` and `inf` refused, `nan` and `5.5`
-            // accepted); a name in the host's zone database, matched without case as PostgreSQL
-            // matches it; or a POSIX TZ spec (`UTC+3`, `EST5EDT,M3.2.0,M11.1.0`, `+05:30`). A valid
-            // zone other than UTC is refused 0A000 below, as this server runs in UTC alone.
-            // BLIND SPOTS: a host zone database lacking a name PostgreSQL knows answers 22023 for
-            // it; PostgreSQL's range bound for a numeric offset is not recorded, so any finite
-            // number or NaN is valid here.
-            // UNVERIFIED beyond the recorded rows (review wire-rework C, finding (1)): the
-            // interval, strtod and tzcode grammar below follow PostgreSQL's check_timezone and
-            // tzparse as read, until one strict PG 18.6 recording of every case (LOUD-OWED).
-            if let Some(body) = lower.strip_prefix("interval") {
-                match timezone_interval(body) {
-                    TzInterval::Offset => return unsupported("this server answers only by its own setting of it"),
-                    TzInterval::NotAllowed(unit) => {
-                        return refused(format!("invalid interval value for time zone: {unit} not allowed"))
-                    }
-                    TzInterval::Malformed => {
-                        return Err(LimboError::ParseError(SqlErrorMessage::classified(
-                            SqlErrorKind::InvalidDatetimeFormat,
-                            format!("invalid input syntax for type interval: \"{text}\""),
-                        )))
-                    }
-                    TzInterval::NotOne => {}
-                }
+            // check_timezone, as PG 18.6 answered every recorded value (THE ORACLE: rev-cd-tz2,
+            // rev-l1-tz, rev-c39-tzforms, rev-c39-tzpath; a model of these rules agrees with all 82
+            // recorded rows, codes and messages). A valid zone other than UTC is refused 0A000 below,
+            // as this server runs in UTC alone. Zone names are PG 18.6's own list (zone_file).
+            if let PgSetValue::Interval { literal, .. } = value {
+                return match timezone_interval(literal) {
+                    TzInterval::Offset => unsupported("this server answers only by its own setting of it"),
+                    // Months, days, an offset of 168 hours or more, or infinity: the setting's
+                    // own refusal, the value echoed as interval_out prints it ('1 mon', '7 days',
+                    // '200:00:00', '-1 days +01:00:00', 'infinity').
+                    TzInterval::Refused(shown) => refused(format!(
+                        "invalid value for parameter \"{pg_name}\": \"INTERVAL '{shown}'\""
+                    )),
+                    // PostgreSQL's own message, with no "Parse error: " prefix (rev-cd-tz2 #6,
+                    // rev-l1-tz #19/#20: the first host run of the strict replays).
+                    TzInterval::Malformed => Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
+                        SqlErrorKind::InvalidDatetimeFormat,
+                        format!("invalid input syntax for type interval: \"{literal}\""),
+                    ))),
+                };
+            }
+            // A value starting "interval" or ":" is refused (recorded: 'interval', 'interval x',
+            // 'interval5', ':EST5').
+            if lower.starts_with("interval") || text.starts_with(':') {
+                return invalid();
             }
             let numeric = strtod_whole(&lower).is_some_and(|h| h.is_nan() || h.abs() < 168.0);
-            let valid = utc || numeric || zone_file(&text) || posix_tz(&text);
+            let valid = utc || numeric || zone_file(&text) || {
+                match posix_tz(&text) {
+                    PosixTz::Valid => true,
+                    PosixTz::Invalid => false,
+                    // An offset that is not a whole number of minutes (recorded: '+05:30:15',
+                    // 'UTC+3:59:30' refused; '+05:30:00', 'UTC+3:00:60' SET).
+                    PosixTz::LeapSeconds => {
+                        return refused(format!("time zone \"{text}\" appears to use leap seconds"))
+                    }
+                }
+            };
             if !valid {
                 return invalid();
             }
@@ -1904,119 +2450,134 @@ fn pg_parameter_name(name: &str) -> &str {
     }
 }
 
-/// PostgreSQL's encoding names and aliases, letters and digits only (pg_wchar.c's table, as
-/// client_encoding accepts them): any other is 22023.
-/// Whether `name` is a zone in the host's zone database: only name components of letters, digits,
-/// `_`, `-` and `+` (no leading `/`, no `.` or `..`, nothing empty), joined under
-/// /usr/share/zoneinfo, naming a TZif file, and not `posixrules`, which PostgreSQL refuses by name.
-/// A value that is a host path never reaches the filesystem, so no answer says whether a host file
-/// exists (review c39799c5d..9e24b455d MED 2: `/etc/passwd` replaced the base in `join` and
-/// answered 0A000, `/etc/nosuch` 22023), and a zone-directory file that is not a zone
-/// (`zone.tab`, `tzdata.zi`) is not one; PG 18.6 answers 22023 for all of them
-/// (pg18-rev-c39-tzpath.out).
+/// The zone names PostgreSQL 18.6 knows, one per line: its pg_timezone_names in full (598,
+/// recorded on iccad11, pg18-rev-host1.out). PostgreSQL reads its own tz database, never the
+/// host's, so this list replaces the host zoneinfo walk (the first host run: RHEL 8's zoneinfo
+/// lacks `Factory`, which PG 18.6 SETs).
+const PG_TIMEZONE_NAMES: &str = include_str!("pg_timezone_names.list");
+
+/// Whether `name` is a zone PostgreSQL 18.6 knows, matched without case as PostgreSQL matches zone
+/// names ('america/new_york' SETs, rev-c39-tzforms #1). A host path, a zone-directory file that is
+/// not a zone (`zone.tab`, `tzdata.zi`) and `posixrules` are not in the list, and PG 18.6 answers
+/// 22023 for all of them (pg18-rev-c39-tzpath.out); no answer reads the host's filesystem (review
+/// c39799c5d..9e24b455d MED 2).
 fn zone_file(name: &str) -> bool {
-    use std::io::Read;
-    let named = name.len() <= 255
-        && name.split('/').all(|c| {
-            !c.is_empty()
-                && c.bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'+'))
-        });
-    if !named || name.eq_ignore_ascii_case("posixrules") {
-        return false;
-    }
-    // Each component matched without case, as PostgreSQL matches zone names (a case-sensitive
-    // host filesystem found `America/New_York` and not `america/new_york`).
-    let mut path = std::path::PathBuf::from("/usr/share/zoneinfo");
-    for part in name.split('/') {
-        let exact = path.join(part);
-        if exact.exists() {
-            path = exact;
-            continue;
-        }
-        let Ok(entries) = std::fs::read_dir(&path) else {
-            return false;
-        };
-        let Some(found) = entries
-            .flatten()
-            .find(|e| e.file_name().to_str().is_some_and(|f| f.eq_ignore_ascii_case(part)))
-        else {
-            return false;
-        };
-        path = found.path();
-    }
-    let mut magic = [0u8; 4];
-    std::fs::File::open(&path)
-        .and_then(|mut f| f.read_exact(&mut magic))
-        .is_ok()
-        && &magic == b"TZif"
+    PG_TIMEZONE_NAMES.lines().any(|zone| zone.eq_ignore_ascii_case(name))
 }
 
-/// A TimeZone value's `INTERVAL '...' [qualifier]` form, as check_timezone reads it: an offset
-/// with no months or days, or refused.
+/// A TimeZone value's `INTERVAL '...' [fields]` form, as check_timezone reads it (PG 18.6,
+/// pg18-rev-cd-tz2.out and pg18-rev-l1-tz.out). The fields are read but change nothing recorded
+/// (`INTERVAL '1 month' HOUR` is still refused).
 enum TzInterval {
-    /// Not the quoted-literal form (`interval` alone, or followed by anything but a quote): read
-    /// as a zone name, which it is not.
-    NotOne,
     /// A valid offset.
     Offset,
-    /// Months or days given: 22023.
-    NotAllowed(&'static str),
-    /// A body interval_in refuses: 22007.
+    /// Refused with the setting's own message, the value as interval_out prints it.
+    Refused(String),
+    /// A literal interval_in refuses: 22007 (`x`, `inf`, `nan`).
     Malformed,
 }
 
-/// `body` is what follows `interval` in a lowercased TimeZone value: whitespace, a quoted
-/// interval literal, and an optional qualifier (`hour to minute`). The literal is `[+-]h[:m[:s]]`
-/// or a list of `<number> <unit>`; a year, month or day unit with a non-zero number is not
-/// allowed. BLIND SPOT: interval_in's full grammar (ISO 8601 `PT5H`, `@` forms, fractional
-/// units) is not read; such a body is Malformed here.
-fn timezone_interval(body: &str) -> TzInterval {
-    let rest = body.trim_start();
-    let Some(quoted) = rest.strip_prefix('\'') else {
-        return TzInterval::NotOne;
-    };
-    let Some(end) = quoted.find('\'') else {
-        return TzInterval::Malformed;
-    };
-    let (literal, tail) = (quoted[..end].trim(), quoted[end + 1..].trim());
-    let qualifier_ok = tail.is_empty()
-        || tail.split_whitespace().all(|w| {
-            matches!(w, "year" | "month" | "day" | "hour" | "minute" | "second" | "to")
-        });
-    if !qualifier_ok || literal.is_empty() {
-        return TzInterval::Malformed;
+/// `literal` read as interval_in reads the recorded forms: `infinity`; a bare number (seconds);
+/// a clock `[+-]h:m[:s]`; or a list of `<number> <unit>` and clock tokens, units years (`yr`, `y`),
+/// months (`mon`), weeks (`w`, as 7 days), days (`d`), hours (`hr`, `h`), minutes (`min`, `m`) and
+/// seconds (`sec`, `s`), singular or plural. A non-zero month or day, an offset of 168 hours or
+/// more, or infinity is refused. BLIND SPOT: interval_in's other forms (ISO 8601 `PT5H`, `@`,
+/// `ago`) read as Malformed.
+fn timezone_interval(literal: &str) -> TzInterval {
+    let l = literal.trim().to_ascii_lowercase();
+    if matches!(l.as_str(), "infinity" | "+infinity" | "-infinity") {
+        return TzInterval::Refused(literal.trim().to_string());
     }
-    let clock = |t: &str| {
-        let t = t.trim_start_matches(['+', '-']);
-        let parts: Vec<&str> = t.split(':').collect();
-        parts.len() <= 3 && parts.iter().all(|p| !p.is_empty() && p.parse::<f64>().is_ok())
+    let number = |t: &str| {
+        let t = t.strip_prefix(['+', '-']).unwrap_or(t);
+        !t.is_empty()
+            && t.bytes().all(|c| c.is_ascii_digit() || c == b'.')
+            && t.bytes().filter(|&c| c == b'.').count() <= 1
+            && t != "."
     };
-    if clock(literal) {
-        return TzInterval::Offset;
-    }
-    let words: Vec<&str> = literal.split_whitespace().collect();
-    if words.len() % 2 != 0 {
-        return TzInterval::Malformed;
-    }
-    for pair in words.chunks(2) {
-        let Ok(n) = pair[0].parse::<f64>() else {
-            return TzInterval::Malformed;
-        };
-        let unit = pair[1].trim_end_matches('s');
-        match unit {
-            "hour" | "minute" | "min" | "second" | "sec" => {}
-            "day" if n != 0.0 => return TzInterval::NotAllowed("days"),
-            "month" | "mon" | "year" if n != 0.0 => return TzInterval::NotAllowed("months"),
-            "day" | "month" | "mon" | "year" => {}
-            _ => return TzInterval::Malformed,
+    let clock = |t: &str| -> Option<f64> {
+        let sign = if t.starts_with('-') { -1.0 } else { 1.0 };
+        let parts: Vec<&str> = t.trim_start_matches(['+', '-']).split(':').collect();
+        if parts.len() < 2 || parts.len() > 3 || !parts.iter().all(|p| number(p) && !p.starts_with(['+', '-'])) {
+            return None;
         }
+        let v: Vec<f64> = parts.iter().map(|p| p.parse().unwrap_or(0.0)).collect();
+        Some(sign * (v[0] * 3600.0 + v[1] * 60.0 + v.get(2).copied().unwrap_or(0.0)))
+    };
+    let (mut months, mut days, mut secs) = (0f64, 0f64, 0f64);
+    if number(&l) {
+        secs = l.parse().unwrap_or(0.0);
+    } else if let Some(c) = clock(&l) {
+        secs = c;
+    } else {
+        let words: Vec<&str> = l.split_whitespace().collect();
+        if words.is_empty() {
+            return TzInterval::Malformed;
+        }
+        let mut i = 0;
+        while i < words.len() {
+            if let Some(c) = clock(words[i]) {
+                secs += c;
+                i += 1;
+                continue;
+            }
+            if !number(words[i]) || i + 1 >= words.len() {
+                return TzInterval::Malformed;
+            }
+            let n: f64 = words[i].parse().unwrap_or(0.0);
+            match words[i + 1] {
+                "year" | "years" | "yr" | "yrs" | "y" => months += n * 12.0,
+                "month" | "months" | "mon" | "mons" => months += n,
+                "week" | "weeks" | "w" => days += n * 7.0,
+                "day" | "days" | "d" => days += n,
+                "hour" | "hours" | "hr" | "hrs" | "h" => secs += n * 3600.0,
+                "minute" | "minutes" | "min" | "mins" | "m" => secs += n * 60.0,
+                "second" | "seconds" | "sec" | "secs" | "s" => secs += n,
+                _ => return TzInterval::Malformed,
+            }
+            i += 2;
+        }
+    }
+    let (months, days) = (months.trunc() as i64, days.trunc() as i64);
+    if months != 0 || days != 0 || secs.abs() >= 168.0 * 3600.0 {
+        return TzInterval::Refused(interval_out(months, days, secs.trunc() as i64));
     }
     TzInterval::Offset
 }
 
-/// `text` read whole as C's strtod reads a number (leading whitespace skipped; decimal, `0x` hex,
-/// `inf`/`infinity`, `nan` and `nan(...)`), or None when anything is left after it.
+/// An interval printed as PostgreSQL's interval_out prints it under IntervalStyle postgres
+/// (EncodeInterval): years and `mon`/`mons` from the months, days, then the time as hh:mm:ss, a
+/// field after a negative one signed `+` when positive, a count other than 1 plural (PG 18.6:
+/// '1 year 1 mon', '-1 days +01:00:00', '7 days', '200:00:00').
+fn interval_out(months: i64, days: i64, secs: i64) -> String {
+    let (years, mons) = (months / 12, months % 12);
+    let mut parts = Vec::new();
+    let (mut before_negative, mut zero) = (false, true);
+    for (n, unit) in [(years, "year"), (mons, "mon"), (days, "day")] {
+        if n != 0 {
+            let plus = if before_negative && n > 0 { "+" } else { "" };
+            parts.push(format!("{plus}{n} {unit}{}", if n == 1 { "" } else { "s" }));
+            before_negative = n < 0;
+            zero = false;
+        }
+    }
+    if zero || secs != 0 {
+        let sign = if secs < 0 {
+            "-"
+        } else if before_negative {
+            "+"
+        } else {
+            ""
+        };
+        let a = secs.abs();
+        parts.push(format!("{sign}{:02}:{:02}:{:02}", a / 3600, a / 60 % 60, a % 60));
+    }
+    parts.join(" ")
+}
+
+/// `text` read whole as C's strtod reads a number (leading whitespace skipped; decimal, `0x` hex
+/// with an optional `p` exponent, `inf`/`infinity`, `nan` and `nan(...)`), or None when anything
+/// is left after it.
 fn strtod_whole(text: &str) -> Option<f64> {
     let t = text.trim_start();
     let (sign, body) = match t.as_bytes().first() {
@@ -2029,7 +2590,11 @@ fn strtod_whole(text: &str) -> Option<f64> {
     }
     let lower = body.to_ascii_lowercase();
     if let Some(hex) = lower.strip_prefix("0x") {
-        let (int, frac) = hex.split_once('.').unwrap_or((hex, ""));
+        let (mantissa, exp) = match hex.split_once('p') {
+            Some((m, e)) => (m, Some(e)),
+            None => (hex, None),
+        };
+        let (int, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
         if (int.is_empty() && frac.is_empty())
             || !int.bytes().chain(frac.bytes()).all(|c| c.is_ascii_hexdigit())
         {
@@ -2044,52 +2609,63 @@ fn strtod_whole(text: &str) -> Option<f64> {
             v += c.to_digit(16)? as f64 * scale;
             scale /= 16.0;
         }
+        if let Some(e) = exp {
+            let e: i32 = e.parse().ok()?;
+            v *= 2f64.powi(e);
+        }
         return Some(sign * v);
     }
-    if lower == "nan" || (lower.starts_with("nan(") && lower.ends_with(')')
-        && lower[4..lower.len() - 1].bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_'))
-    {
+    if lower == "nan" || (lower.starts_with("nan(") && lower.ends_with(')')) {
         return Some(f64::NAN);
     }
     if lower == "inf" || lower == "infinity" {
         return Some(sign * f64::INFINITY);
     }
-    // Rust's parse also takes `infinity`/`nan` spellings and no other trailing text.
     let ok = !body.is_empty()
         && body.bytes().all(|c| c.is_ascii_digit() || matches!(c, b'.' | b'e' | b'E' | b'+' | b'-'));
     ok.then(|| body.parse::<f64>().ok()).flatten().map(|v| sign * v)
 }
 
-/// Whether `spec` is a POSIX TZ string as tzcode's tzparse reads one (UNVERIFIED beyond the
-/// recorded rows, review wire-rework C finding (1)): a standard name (`<...>`, non-empty, or
-/// getzname's run of characters other than digits, `,`, `-` and `+`), an offset
-/// `[+-]h[:m[:s]]` with hours at most 167 and minutes and seconds at most 59 (getsecs; any digit
-/// count), then optionally a daylight name, its own offset, and two rules after `,` or `;`, each
-/// `Jn` (1-365), `n` (0-365) or `Mm.w.d` (1-12, 1-5, 0-6) with an optional `/offset`. A bare
-/// offset alone (`+05:30`) is a whole spec, as PG 18.6 answered it (pg18-rev-c39-tzforms.out).
-fn posix_tz(spec: &str) -> bool {
+/// A POSIX TZ spec's reading by tzparse, as PG 18.6 answered (pg18-rev-cd-tz2.out,
+/// pg18-rev-l1-tz.out).
+enum PosixTz {
+    Valid,
+    Invalid,
+    /// Well formed, but an offset is not a whole number of minutes: 22023 "appears to use leap
+    /// seconds".
+    LeapSeconds,
+}
+
+/// `spec` as tzparse reads one: a standard name (`<...>`, empty allowed, or getzname's run of
+/// characters other than digits, `,`, `-` and `+`), an offset `[+-]h[:m[:s]]` (hours at most 167,
+/// minutes at most 59; seconds unbounded: 'UTC+3:00:60' is SET), then optionally a daylight name, its
+/// own offset, and two rules after `,` only, each `Mm.w.d` (m 1-12), `Jn` (n 1-365) or `n`, with an
+/// optional `/time` of at most three groups and hours at most 167. A bare offset alone is a whole
+/// spec. Every bound named here is a recorded one; no other is applied.
+fn posix_tz(spec: &str) -> PosixTz {
     let b = spec.as_bytes();
+    let mut offsets: Vec<u64> = Vec::new();
     let name = |i: &mut usize| -> bool {
         if b.get(*i) == Some(&b'<') {
             let Some(end) = spec[*i + 1..].find('>') else { return false };
-            if end == 0 {
-                return false;
-            }
             *i += end + 2;
             return true;
         }
         let start = *i;
         while b
             .get(*i)
-            .is_some_and(|c| !c.is_ascii_digit() && !matches!(c, b',' | b'-' | b'+' | b';'))
+            .is_some_and(|c| !c.is_ascii_digit() && !matches!(c, b',' | b'-' | b'+'))
         {
             *i += 1;
         }
         *i > start
     };
-    // getsecs: h[:m[:s]], hours up to 167, minutes and seconds up to 59.
-    let secs = |i: &mut usize| -> bool {
-        let limits = [167u32, 59, 59];
+    let mut offset = |i: &mut usize| -> bool {
+        if matches!(b.get(*i), Some(b'+' | b'-')) {
+            *i += 1;
+        }
+        let limits = [Some(167u64), Some(59), None];
+        let mut total = 0u64;
         for (g, max) in limits.iter().enumerate() {
             let start = *i;
             let mut v: u64 = 0;
@@ -2097,22 +2673,18 @@ fn posix_tz(spec: &str) -> bool {
                 v = v.saturating_mul(10).saturating_add(u64::from(c - b'0'));
                 *i += 1;
             }
-            if *i == start || v > u64::from(*max) {
+            if *i == start || max.is_some_and(|m| v > m) {
                 return false;
             }
+            total += v * [3600, 60, 1][g];
             if g < 2 && b.get(*i) == Some(&b':') {
                 *i += 1;
                 continue;
             }
-            return true;
+            break;
         }
+        offsets.push(total);
         true
-    };
-    let offset = |i: &mut usize| -> bool {
-        if matches!(b.get(*i), Some(b'+' | b'-')) {
-            *i += 1;
-        }
-        secs(i)
     };
     let mut i = 0;
     let had_name = name(&mut i);
@@ -2120,47 +2692,51 @@ fn posix_tz(spec: &str) -> bool {
         i = 0;
     }
     if !offset(&mut i) {
-        return false;
+        return PosixTz::Invalid;
     }
-    if i == b.len() {
-        return true;
-    }
-    if !had_name || !name(&mut i) {
-        return false;
-    }
-    if i < b.len() && !matches!(b[i], b',' | b';') && !offset(&mut i) {
-        return false;
-    }
-    if i == b.len() {
-        return true;
-    }
-    let num = |t: &str, lo: u32, hi: u32| t.parse::<u32>().is_ok_and(|v| (lo..=hi).contains(&v))
-        && t.bytes().all(|c| c.is_ascii_digit());
-    let rule = |r: &str| -> bool {
-        let (date, time) = r.split_once('/').unwrap_or((r, "0"));
-        let date_ok = if let Some(m) = date.strip_prefix('M') {
-            let f: Vec<&str> = m.split('.').collect();
-            f.len() == 3 && num(f[0], 1, 12) && num(f[1], 1, 5) && num(f[2], 0, 6)
-        } else if let Some(j) = date.strip_prefix('J') {
-            num(j, 1, 365)
-        } else {
-            num(date, 0, 365)
-        };
-        let tb = time.as_bytes();
-        let mut k = 0;
-        if matches!(tb.first(), Some(b'+' | b'-')) {
-            k = 1;
+    let mut finished = i == b.len();
+    if !finished {
+        if !had_name || !name(&mut i) {
+            return PosixTz::Invalid;
         }
-        let groups: Vec<&str> = time[k..].split(':').collect();
-        let time_ok = groups.len() <= 3
-            && groups.iter().enumerate().all(|(g, x)| num(x, 0, if g == 0 { 167 } else { 59 }));
-        date_ok && time_ok
-    };
-    if !matches!(b[i], b',' | b';') {
-        return false;
+        if i < b.len() && b[i] != b',' && !offset(&mut i) {
+            return PosixTz::Invalid;
+        }
+        finished = i == b.len();
     }
-    let rules: Vec<&str> = spec[i + 1..].split([',', ';']).collect();
-    rules.len() == 2 && rules.iter().all(|r| rule(r))
+    if !finished {
+        let digits = |t: &str| !t.is_empty() && t.bytes().all(|c| c.is_ascii_digit());
+        let in_range = |t: &str, lo: u64, hi: u64| t.parse::<u64>().is_ok_and(|v| (lo..=hi).contains(&v));
+        let rule = |r: &str| -> bool {
+            let (date, time) = r.split_once('/').unwrap_or((r, "0"));
+            let date_ok = if let Some(m) = date.strip_prefix('M') {
+                let f: Vec<&str> = m.split('.').collect();
+                f.len() == 3 && f.iter().all(|x| digits(x)) && in_range(f[0], 1, 12)
+            } else if let Some(j) = date.strip_prefix('J') {
+                digits(j) && in_range(j, 1, 365)
+            } else {
+                digits(date)
+            };
+            let time = time.strip_prefix(['+', '-']).unwrap_or(time);
+            let groups: Vec<&str> = time.split(':').collect();
+            date_ok
+                && groups.len() <= 3
+                && groups.iter().all(|x| digits(x))
+                && in_range(groups[0], 0, 167)
+        };
+        if b[i] != b',' {
+            return PosixTz::Invalid;
+        }
+        let rules: Vec<&str> = spec[i + 1..].split(',').collect();
+        if rules.len() != 2 || !rules.iter().all(|r| rule(r)) {
+            return PosixTz::Invalid;
+        }
+    }
+    if offsets.iter().any(|t| t % 60 != 0) {
+        PosixTz::LeapSeconds
+    } else {
+        PosixTz::Valid
+    }
 }
 
 const PG_ENCODINGS: &[&str] = &[
@@ -2199,7 +2775,7 @@ fn handle_pg_show(pg_conn: &Arc<PgConnectionInner>, show: &PgShowStmt) -> Result
             ("search_path", shown)
         }
         "foreign_keys" => {
-            let mut stmt = pg_conn.conn.prepare("PRAGMA foreign_keys")?;
+            let mut stmt = pg_conn.conn.prepare(catalog::sqlite_text("PRAGMA foreign_keys"))?;
             let rows = stmt.run_collect_rows()?;
             let on = rows
                 .first()
@@ -2239,15 +2815,38 @@ fn handle_pg_show(pg_conn: &Arc<PgConnectionInner>, show: &PgShowStmt) -> Result
             ))))
         }
     };
-    pg_conn.conn.prepare(format!(
-        "SELECT '{}' AS \"{}\"",
-        value.replace('\'', "''"),
-        column
-    ))
+    pg_conn.conn.prepare(catalog::sqlite_text(format!(
+        "SELECT {} AS {}",
+        catalog::quote_literal(&value),
+        catalog::quote_ident(column)
+    )))
 }
 
-fn handle_pg_create_schema(conn: &Arc<Connection>, stmt: &PgCreateSchemaStmt) -> Result<()> {
-    let name = stmt.name.to_lowercase();
+fn handle_pg_create_schema(pg_conn: &Arc<PgConnectionInner>, stmt: &PgCreateSchemaStmt) -> Result<()> {
+    let conn = &pg_conn.conn;
+    // As libpg_query gives it: an unquoted name already lowercased, a quoted one as written
+    // (review wire-quote LOW-4: a quoted name was lowercased here).
+    let name = stmt.name.clone();
+    // A name that folds to public is public to the engine, which folds an attached database's
+    // name: a quoted "PUBLIC" attached a second public (wire-rev-uw2 LOW). PostgreSQL creates a
+    // schema of its own for it; the engine cannot hold two names that fold alike (COMPAT).
+    if name != "public" && name.eq_ignore_ascii_case("public") {
+        if stmt.if_not_exists {
+            return Ok(());
+        }
+        return Err(LimboError::ParseError(format!("schema \"{name}\" already exists").into()));
+    }
+    // A schema this block dropped is created again: its database stays attached, emptied by the
+    // drop (CASCADE dropped its tables, or it had none), and is no longer detached at the
+    // COMMIT; a ROLLBACK restores the old one with its tables, as in PostgreSQL (wire-rev-uw2 N4:
+    // this was 'already exists'; r5-pg.txt m2d).
+    {
+        let mut dropped = pg_conn.dropped_schemas.lock();
+        if let Some(at) = dropped.iter().position(|(n, _)| *n == name) {
+            dropped.remove(at);
+            return Ok(());
+        }
+    }
     if name == "public" {
         if stmt.if_not_exists {
             return Ok(());
@@ -2269,14 +2868,70 @@ fn handle_pg_create_schema(conn: &Arc<Connection>, stmt: &PgCreateSchemaStmt) ->
     let path = schema_file_path(conn, &name);
     execute_sqlite_internal(
         conn,
-        format!("ATTACH '{}' AS \"{}\"", path.replace('\'', "''"), name),
+        catalog::sqlite_text(format!(
+            "ATTACH {} AS {}",
+            catalog::quote_literal(&path),
+            catalog::quote_ident(&name)
+        )),
     )?;
     Ok(())
 }
 
+/// The prefix of every schema's database file, beside the main database.
+const SCHEMA_FILE_PREFIX: &str = "turso-postgres-schema-";
+
+/// A schema's name as a file name (review wire-quote LOW-4): ASCII letters, digits and `_` as
+/// they are, every other byte `%XX`, so no name is a path (`/`, `..`, a NUL) and every name
+/// round-trips ([`schema_of_file_name`]). A plain name's file is named as before.
+fn schema_file_name(schema: &str) -> String {
+    let mut out = String::with_capacity(schema.len());
+    for b in schema.bytes() {
+        if b.is_ascii_alphanumeric() || b == b'_' {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// [`schema_file_name`] read back. A file an earlier version named with the schema's raw text (a
+/// quote, a space, a `%`) reads as that text, so it attaches as before: a name is decoded only
+/// when it is exactly what schema_file_name writes for the decoded name, which never encodes a
+/// letter, digit or `_` and writes two upper-case hex digits (wire-rev-uw2 MED: a%zz and p% no
+/// longer attached, and q%41 attached as qa). BLIND SPOT: an old raw name that is itself such an
+/// encoding (`a%20b`) reads as the name it encodes (`a b`).
+fn schema_of_file_name(name: &str) -> Option<String> {
+    if !name.contains('%') {
+        return Some(name.to_string());
+    }
+    match decode_schema_file_name(name) {
+        Some(decoded) if schema_file_name(&decoded) == name => Some(decoded),
+        _ => Some(name.to_string()),
+    }
+}
+
+/// `%XX` decoded; None when a `%` is not followed by two hex digits or the bytes are not UTF-8.
+fn decode_schema_file_name(name: &str) -> Option<String> {
+    let b = name.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' {
+            let hex = name.get(i + 1..i + 3)?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
 fn schema_file_path(conn: &Connection, schema_name: &str) -> String {
     let main_path = conn.db_file_path();
-    let filename = format!("turso-postgres-schema-{schema_name}.db");
+    let filename = format!("{SCHEMA_FILE_PREFIX}{}.db", schema_file_name(schema_name));
     if main_path == ":memory:" {
         filename
     } else {
@@ -2289,27 +2944,109 @@ fn schema_file_path(conn: &Connection, schema_name: &str) -> String {
 
 fn handle_pg_drop_schema(pg_conn: &Arc<PgConnectionInner>, stmt: &PgDropSchemaStmt) -> Result<()> {
     let conn = &pg_conn.conn;
-    let name = stmt.name.to_lowercase();
-    if name == "public" {
-        return handle_pg_drop_schema_public(conn, stmt.cascade);
-    }
-
-    if !schema_exists(conn, &name)? {
-        if stmt.if_exists {
-            // PostgreSQL's notice for the missing schema (recorded, pg18-c53-dropnotice.out).
-            skipping_notice(pg_conn, "schema", &stmt.name);
-            return Ok(());
+    // Every name is resolved before anything is dropped, as PostgreSQL's RemoveObjects does
+    // (recorded, pg18-rev-uw1-schema.out): a missing one is 3F000 and nothing is dropped, or under
+    // IF EXISTS a NOTICE and skipped. public is only `public` exactly (wire-rev-uw1 M3).
+    let mut found: Vec<&str> = Vec::with_capacity(stmt.names.len());
+    for name in &stmt.names {
+        // A name given twice is dropped once (wire-rev-uw2 N3: the second reported an error
+        // after the first had dropped it).
+        if found.contains(&name.as_str()) {
+            continue;
         }
-        return Err(LimboError::ParseError(format!(
-            "schema \"{name}\" does not exist"
-        ).into()));
+        let dropped_here = pg_conn.dropped_schemas.lock().iter().any(|(n, _)| n == name);
+        if name == "public" || (!dropped_here && schema_exists(conn, name)?) {
+            found.push(name.as_str());
+        } else if stmt.if_exists {
+            // PostgreSQL's notice for the missing schema (recorded, pg18-c53-dropnotice.out).
+            skipping_notice(pg_conn, "schema", name);
+        } else {
+            return Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
+                SqlErrorKind::InvalidSchemaName,
+                format!("schema \"{name}\" does not exist"),
+            )));
+        }
     }
-
-    if stmt.cascade {
-        drop_all_tables_in_schema(conn, &name)?;
+    // Without CASCADE, a schema that holds a table is not dropped, and neither is any other
+    // schema the statement names: PostgreSQL's 2BP01, checked before anything is dropped
+    // (wire-rev-uw2 N1, DATA LOSS: the file of a schema holding tables was detached and deleted).
+    if !stmt.cascade {
+        let mut holding = None;
+        for name in &found {
+            let schema = (*name != "public").then_some(*name);
+            if !list_user_tables(conn, schema)?.is_empty() {
+                holding = Some(*name);
+                break;
+            }
+        }
+        if let Some(name) = holding {
+            let message = if stmt.names.len() > 1 {
+                "cannot drop desired object(s) because other objects depend on them".to_string()
+            } else {
+                format!("cannot drop schema {} because other objects depend on it", catalog::pg_ident(name))
+            };
+            return Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
+                SqlErrorKind::DependentObjectsStillExist,
+                message,
+            )));
+        }
     }
+    for name in found {
+        if name == "public" {
+            handle_pg_drop_schema_public(conn, stmt.cascade)?;
+            continue;
+        }
+        if stmt.cascade {
+            drop_all_tables_in_schema(conn, name)?;
+        }
+        // The engine refuses a DETACH inside a transaction, so inside a block the schema is
+        // detached, and its file deleted, at the block's COMMIT, and kept at its ROLLBACK
+        // ([`PgConnection::tx_event`]; wire-rev-uw1 M2: a DROP SCHEMA in a CLI block failed
+        // 'database s is locked'). The file is the one of the schema resolved here, never one
+        // read from the client's text. An in-memory main database's schemas have no file here.
+        let path = if conn.db_file_path() != ":memory:" { attached_schema_file(conn, name)? } else { None };
+        if conn.get_auto_commit() {
+            detach_schema(conn, name)?;
+            if let Some(path) = &path {
+                remove_schema_file(path);
+            }
+        } else {
+            pg_conn.dropped_schemas.lock().push((name.to_string(), path));
+        }
+    }
+    Ok(())
+}
 
-    execute_sqlite_internal(conn, format!("DETACH \"{name}\""))?;
+/// DETACH a schema's database.
+fn detach_schema(conn: &Arc<Connection>, name: &str) -> Result<()> {
+    execute_sqlite_internal(conn, catalog::sqlite_text(format!("DETACH {}", catalog::quote_ident(name))))
+}
+
+/// A dropped schema's database file and its WAL and SHM files. A file already gone is no error.
+fn remove_schema_file(path: &str) {
+    for suffix in ["", "-wal", "-shm"] {
+        let file = format!("{path}{suffix}");
+        if let Err(e) = std::fs::remove_file(&file) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!("failed to delete the dropped schema's file {file}: {e}");
+            }
+        }
+    }
+}
+
+/// The branch server's refusal of schema DDL ([`PgConnection::new_server`]): any schema but
+/// public, as the parsed statement names it.
+fn refuse_schema_ddl(pg_conn: &Arc<PgConnectionInner>, name: &str) -> Result<()> {
+    // Exactly public: a quoted "PUBLIC" is a schema of its own (wire-rev-uw1 M3: compared without
+    // case, it passed here, and DROP SCHEMA "PUBLIC" CASCADE then dropped every public table).
+    if pg_conn.public_schema_only && name != "public" {
+        return Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
+            SqlErrorKind::FeatureNotSupported,
+            "schemas other than public are not supported by the branch server: its branches cover \
+             the one schema (CREATE SCHEMA and DROP SCHEMA are refused)"
+                .to_string(),
+        )));
+    }
     Ok(())
 }
 
@@ -2334,7 +3071,7 @@ fn skipping_notice(pg_conn: &Arc<PgConnectionInner>, kind: &str, name: &str) {
 /// worded otherwise propagates as an error, never as a skip.
 fn handle_pg_drop_objects(pg_conn: &Arc<PgConnectionInner>, stmt: &PgDropObjectsStmt) -> Result<()> {
     let conn = &pg_conn.conn;
-    let quote = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+    let quote = |s: &str| catalog::quote_ident(s);
     let mut found = Vec::with_capacity(stmt.objects.len());
     for (schema, name) in &stmt.objects {
         if let Some(schema) = schema.as_deref().filter(|s| *s != "main") {
@@ -2389,15 +3126,15 @@ fn handle_pg_drop_objects(pg_conn: &Arc<PgConnectionInner>, stmt: &PgDropObjects
             .iter()
             .try_for_each(|sql| conn.prepare(sql)?.run_ignore_rows());
     }
-    execute_sqlite_internal(conn, "SAVEPOINT turso_pg_drop_objects")?;
+    execute_sqlite_internal(conn, catalog::sqlite_text("SAVEPOINT turso_pg_drop_objects"))?;
     let dropped = found
         .iter()
         .try_for_each(|sql| conn.prepare(sql)?.run_ignore_rows());
     match dropped {
-        Ok(()) => execute_sqlite_internal(conn, "RELEASE turso_pg_drop_objects"),
+        Ok(()) => execute_sqlite_internal(conn, catalog::sqlite_text("RELEASE turso_pg_drop_objects")),
         Err(e) => {
-            let _ = execute_sqlite_internal(conn, "ROLLBACK TO turso_pg_drop_objects");
-            let _ = execute_sqlite_internal(conn, "RELEASE turso_pg_drop_objects");
+            let _ = execute_sqlite_internal(conn, catalog::sqlite_text("ROLLBACK TO turso_pg_drop_objects"));
+            let _ = execute_sqlite_internal(conn, catalog::sqlite_text("RELEASE turso_pg_drop_objects"));
             Err(e)
         }
     }
@@ -2423,13 +3160,17 @@ fn drop_refused_as_missing(kind: PgDropKind, e: &LimboError) -> bool {
 fn handle_pg_drop_schema_public(conn: &Arc<Connection>, cascade: bool) -> Result<()> {
     let table_names = list_user_tables(conn, None)?;
     if !cascade && !table_names.is_empty() {
-        return Err(LimboError::ParseError(
-            "cannot drop schema \"public\" because other objects depend on it".to_string().into(),
-        ));
+        return Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
+            SqlErrorKind::DependentObjectsStillExist,
+            "cannot drop schema public because other objects depend on it".to_string(),
+        )));
     }
 
     for table_name in table_names {
-        let mut stmt = conn.prepare(format!("DROP TABLE \"{table_name}\""))?;
+        let mut stmt = conn.prepare(catalog::sqlite_text(format!(
+            "DROP TABLE {}",
+            catalog::quote_ident(&table_name)
+        )))?;
         stmt.run_ignore_rows()?;
     }
     Ok(())
@@ -2437,7 +3178,11 @@ fn handle_pg_drop_schema_public(conn: &Arc<Connection>, cascade: bool) -> Result
 
 fn drop_all_tables_in_schema(conn: &Arc<Connection>, schema_name: &str) -> Result<()> {
     for table_name in list_user_tables(conn, Some(schema_name))? {
-        let mut stmt = conn.prepare(format!("DROP TABLE \"{schema_name}\".\"{table_name}\"",))?;
+        let mut stmt = conn.prepare(catalog::sqlite_text(format!(
+            "DROP TABLE {}.{}",
+            catalog::quote_ident(schema_name),
+            catalog::quote_ident(&table_name)
+        )))?;
         stmt.run_ignore_rows()?;
     }
     Ok(())
@@ -2473,10 +3218,10 @@ fn handle_pg_add_constraints(
     // own, and its DDL reaches SetCookie with none (wire review 2 item 1). So the lookup's rows are
     // collected and the statement dropped here, before the rebuild's first statement.
     {
-        let mut stmt = conn.prepare_internal(
+        let mut stmt = conn.prepare_internal(catalog::sqlite_text(
             "SELECT type, sql FROM sqlite_schema WHERE tbl_name = ?1 AND sql IS NOT NULL \
              ORDER BY CASE type WHEN 'table' THEN 0 WHEN 'index' THEN 1 ELSE 2 END, rowid",
-        )?;
+        ))?;
         stmt.bind_at(
             NonZero::new(1).unwrap(),
             Value::build_text(table.to_string()),
@@ -2504,7 +3249,7 @@ fn handle_pg_add_constraints(
         let name = aside_name_for(table, n);
         let taken = {
             let mut stmt =
-                conn.prepare_internal("SELECT 1 FROM sqlite_schema WHERE lower(name) = lower(?1)")?;
+                conn.prepare_internal(catalog::sqlite_text("SELECT 1 FROM sqlite_schema WHERE lower(name) = lower(?1)"))?;
             stmt.bind_at(NonZero::new(1).unwrap(), Value::build_text(name.clone()))?;
             !stmt.run_collect_rows()?.is_empty()
         };
@@ -2610,8 +3355,8 @@ fn handle_pg_add_constraints(
         .translate_with_prereqs(&parsed)
         .map_err(crate::session::pg_parse_error)?;
 
-    let quoted = format!("\"{}\"", table.replace('"', "\"\""));
-    let aside = format!("\"{}\"", aside_name.replace('"', "\"\""));
+    let quoted = catalog::quote_ident(table);
+    let aside = catalog::quote_ident(&aside_name);
     // The keys the ALTER adds, each checked against the catalog before anything is copied or
     // dropped (a key onto the table itself as far as it can be before the table's own new keys
     // exist): a refused key cost two copies of the table and an index rebuild, and an arity the
@@ -3014,7 +3759,7 @@ fn check_added_foreign_key(
     key: &AddedForeignKey,
     parent_columns: &[String],
 ) -> Result<()> {
-    let quote = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+    let quote = |s: &str| catalog::quote_ident(s);
     let not_null = key
         .columns
         .iter()
@@ -3033,7 +3778,7 @@ fn check_added_foreign_key(
          {matches}) LIMIT 1",
         quote(&key.parent)
     );
-    let orphans = conn.prepare_sqlite(&sql)?.run_collect_rows()?;
+    let orphans = conn.prepare_sqlite(catalog::sqlite_text(&sql))?.run_collect_rows()?;
     if orphans.is_empty() {
         Ok(())
     } else {
@@ -3123,7 +3868,7 @@ pub enum TxStmt {
 
 /// Run `tx` on `conn` from the engine's AST: no SQL text is parsed for it.
 fn run_tx(conn: &Arc<Connection>, tx: TxStmt) -> Result<()> {
-    use turso_parser::ast::{Name, Stmt};
+    use turso_parser::ast::Stmt;
     let (stmt, text) = match tx {
         TxStmt::Begin => (
             Stmt::Begin {
@@ -3142,22 +3887,22 @@ fn run_tx(conn: &Arc<Connection>, tx: TxStmt) -> Result<()> {
         ),
         TxStmt::Savepoint(name) => (
             Stmt::Savepoint {
-                name: Name::from_string(name),
+                name: turso_pg_parser::translator::pg_name(name),
             },
-            format!("SAVEPOINT {name}"),
+            format!("SAVEPOINT {}", crate::catalog::quote_ident(name)),
         ),
         TxStmt::Release(name) => (
             Stmt::Release {
-                name: Name::from_string(name),
+                name: turso_pg_parser::translator::pg_name(name),
             },
-            format!("RELEASE SAVEPOINT {name}"),
+            format!("RELEASE SAVEPOINT {}", crate::catalog::quote_ident(name)),
         ),
         TxStmt::RollbackTo(name) => (
             Stmt::Rollback {
                 tx_name: None,
-                savepoint_name: Some(Name::from_string(name)),
+                savepoint_name: Some(turso_pg_parser::translator::pg_name(name)),
             },
-            format!("ROLLBACK TO SAVEPOINT {name}"),
+            format!("ROLLBACK TO SAVEPOINT {}", crate::catalog::quote_ident(name)),
         ),
     };
     conn.prepare_translated_stmt(stmt, &text)?.run_ignore_rows()
@@ -3257,7 +4002,9 @@ pub const CONNECTION_BROKEN: &str = "connection broken";
 
 /// Run one statement as the engine runs a client's (a root statement), in SQLite text.
 fn execute_root(conn: &Arc<Connection>, sql: impl AsRef<str>) -> Result<()> {
-    conn.prepare_sqlite(sql)?.run_ignore_rows()
+    // Marked as this frontend's SQLite: a stored index's text was re-read as PostgreSQL and
+    // translated again (the dialect audit of 2026-10-17, C).
+    conn.prepare_sqlite(catalog::sqlite_text(sql))?.run_ignore_rows()
 }
 
 /// Run one PostgreSQL statement through this frontend, as a client's would be.
@@ -3271,6 +4018,80 @@ fn run_pg_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<()> {
         .run_ignore_rows()
 }
 
+/// The file a COPY FROM 'file' reads, opened, with PostgreSQL's privilege check: 42501
+/// 'permission denied to COPY from a file' (recorded, pg18-rev-quote-low.out) unless `files`
+/// grants it. Under a granted directory the file is opened first and the OPENED file is judged,
+/// by the path the kernel holds for it ([`opened_path`]), which must lie under the directory: a
+/// symlink in it pointing outside is refused, and so is one a local writer flips between the
+/// judgment and the open (wire-rev-uw2 MED: the real path was judged, then the client's name was
+/// opened again, and 1132 of 2673 COPYs through a flipping link read the outside file). A file
+/// that does not open is judged by its directory's real path, so its own error comes from the
+/// read. BLIND SPOTS: a hardlink inside the directory to a file outside it is read (the kernel
+/// may name either link); on a platform with no fd path (neither Linux nor macOS) every granted
+/// read is refused.
+fn open_server_file(files: &ServerFiles, filename: &str) -> Result<std::fs::File> {
+    let denied = || {
+        Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
+            SqlErrorKind::InsufficientPrivilege,
+            "permission denied to COPY from a file".to_string(),
+        )))
+    };
+    let unreadable = |e: std::io::Error| {
+        LimboError::ParseError(format!("COPY FROM: cannot read '{filename}': {e}").into())
+    };
+    match files {
+        ServerFiles::Any => std::fs::File::open(filename).map_err(unreadable),
+        ServerFiles::None => denied(),
+        ServerFiles::Under(dir) => {
+            let path = std::path::Path::new(filename);
+            match std::fs::File::open(path) {
+                Ok(file) => match opened_path(&file) {
+                    Some(real) if real.starts_with(dir) => Ok(file),
+                    _ => denied(),
+                },
+                Err(e) => {
+                    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+                    match std::fs::canonicalize(parent) {
+                        Ok(p) if p.join(path.file_name().unwrap_or_default()).starts_with(dir) => {
+                            Err(unreadable(e))
+                        }
+                        _ => denied(),
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The path the kernel holds for an open file: Linux's /proc/self/fd link.
+#[cfg(target_os = "linux")]
+fn opened_path(file: &std::fs::File) -> Option<std::path::PathBuf> {
+    use std::os::fd::AsRawFd;
+    std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).ok()
+}
+
+/// The path the kernel holds for an open file: macOS's fcntl F_GETPATH.
+#[cfg(target_os = "macos")]
+fn opened_path(file: &std::fs::File) -> Option<std::path::PathBuf> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStringExt;
+    let mut buf = vec![0u8; libc::PATH_MAX as usize];
+    // SAFETY: F_GETPATH writes at most PATH_MAX bytes, NUL included, into a buffer of that size.
+    let r = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, buf.as_mut_ptr()) };
+    if r == -1 {
+        return None;
+    }
+    let len = buf.iter().position(|&b| b == 0)?;
+    buf.truncate(len);
+    Some(std::path::PathBuf::from(std::ffi::OsString::from_vec(buf)))
+}
+
+/// No fd path on this platform: every granted read is refused ([`open_server_file`]).
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn opened_path(_file: &std::fs::File) -> Option<std::path::PathBuf> {
+    None
+}
+
 fn handle_pg_copy_from(pg_conn: &Arc<PgConnectionInner>, stmt: &PgCopyFromStmt) -> Result<usize> {
     if let Some(why) = &stmt.refused {
         return Err(LimboError::ParseError(why.clone().into()));
@@ -3281,7 +4102,8 @@ fn handle_pg_copy_from(pg_conn: &Arc<PgConnectionInner>, stmt: &PgCopyFromStmt) 
         ));
     }
     let conn = &pg_conn.conn;
-    let data = std::fs::read_to_string(&stmt.filename).map_err(|e| {
+    let mut data = String::new();
+    std::io::Read::read_to_string(&mut open_server_file(&pg_conn.server_files, &stmt.filename)?, &mut data).map_err(|e| {
         LimboError::ParseError(format!("COPY FROM: cannot read '{}': {}", stmt.filename, e).into())
     })?;
 
@@ -3292,7 +4114,7 @@ fn handle_pg_copy_from(pg_conn: &Arc<PgConnectionInner>, stmt: &PgCopyFromStmt) 
         Some(schema) => Some(schema.clone()),
         None => schema_on_search_path(pg_conn, &stmt.table_name)?,
     };
-    let quoted = |name: &str| format!("\"{}\"", name.replace('"', "\"\""));
+    let quoted = catalog::quote_ident;
     let table_name = match &schema {
         Some(schema) => format!("{}.{}", quoted(schema), quoted(&stmt.table_name)),
         None => quoted(&stmt.table_name),
@@ -3307,9 +4129,24 @@ fn handle_pg_copy_from(pg_conn: &Arc<PgConnectionInner>, stmt: &PgCopyFromStmt) 
 
     let (insert_cols, num_columns) = match &stmt.columns {
         Some(cols) => {
+            // Each named column is one the table has (42703, as PostgreSQL answers), and each is
+            // quoted by the one quoting function (review wire-line3 HIGH-1: they were pasted into
+            // the marked SQLite INSERT as written).
+            if let Some(missing) = cols
+                .iter()
+                .find(|c| !column_names.iter().any(|n| n.eq_ignore_ascii_case(c)))
+            {
+                return Err(LimboError::ParseError(SqlErrorMessage::classified(
+                    SqlErrorKind::UndefinedColumn,
+                    format!(
+                        "column \"{missing}\" of relation \"{}\" does not exist",
+                        stmt.table_name
+                    ),
+                )));
+            }
             let col_list = cols
                 .iter()
-                .map(|c| format!("\"{c}\""))
+                .map(|c| catalog::quote_ident(c))
                 .collect::<Vec<_>>()
                 .join(", ");
             (format!(" ({col_list})"), cols.len())
@@ -3318,7 +4155,9 @@ fn handle_pg_copy_from(pg_conn: &Arc<PgConnectionInner>, stmt: &PgCopyFromStmt) 
     };
 
     let placeholders = (0..num_columns).map(|_| "?").collect::<Vec<_>>().join(", ");
-    let insert_sql = format!("INSERT INTO {table_name}{insert_cols} VALUES ({placeholders})");
+    let insert_sql = catalog::sqlite_text(format!(
+        "INSERT INTO {table_name}{insert_cols} VALUES ({placeholders})"
+    ));
 
     let delimiter = stmt
         .delimiter
@@ -3357,6 +4196,30 @@ fn handle_pg_copy_from(pg_conn: &Arc<PgConnectionInner>, stmt: &PgCopyFromStmt) 
     })
 }
 
+/// One catalog row [`PgConnection::stored_relation`] found: its type (table, view, index, ...),
+/// the table it belongs to (its own name for a table or view), its stored SQL, and the PostgreSQL
+/// schema it is in (public for main).
+struct StoredRelation {
+    kind: String,
+    table: String,
+    sql: String,
+    schema: String,
+}
+
+/// Whether two relation names name one relation as this engine's catalog does: names compare as
+/// SQLite compares them (ASCII case folded), schemas when both name one (public is main).
+fn same_relation_name(
+    a: &turso_pg_parser::translator::PgRelationName,
+    b: &turso_pg_parser::translator::PgRelationName,
+) -> bool {
+    let schema = |s: &str| if s.eq_ignore_ascii_case("public") { "main".to_string() } else { s.to_string() };
+    a.1.eq_ignore_ascii_case(&b.1)
+        && match (&a.0, &b.0) {
+            (Some(x), Some(y)) => schema(x) == schema(y),
+            _ => a.0 == b.0,
+        }
+}
+
 /// The database holding `table` on the session's search path, as the engine resolves an
 /// unqualified name (core's resolve_search_path_database_id): public is main, any other entry the
 /// attached schema of its name, skipped when there is none ("$user", a schema not created), the
@@ -3385,6 +4248,50 @@ fn schema_on_search_path(pg_conn: &Arc<PgConnectionInner>, table: &str) -> Resul
         "relation \"{table}\" does not exist"
     ),
     )))
+}
+
+/// Whether `parse` is one CREATE INDEX with no name: its translation chooses PostgreSQL's name,
+/// which needs the names taken beside its table ([`relation_name_taken`]).
+fn is_unnamed_index(parse: &turso_pg_parser::pg_query::ParseResult) -> bool {
+    use turso_pg_parser::pg_query::protobuf::node::Node;
+    matches!(
+        parse.protobuf.stmts.as_slice(),
+        [raw] if matches!(raw.stmt.as_ref().and_then(|s| s.node.as_ref()),
+            Some(Node::IndexStmt(i)) if i.idxname.is_empty())
+    )
+}
+
+/// Whether `name` is a relation's (table, view, index, sequence) in the database `table` is in:
+/// the one `schema` names, as written (public, or nothing with no search path, is main), else the
+/// first on the search path holding `table`. main's are read from the in-memory schema; an attached
+/// database's from its sqlite_schema. A name that cannot be read is taken, so a failure never
+/// reuses a name.
+fn relation_name_taken(pg_conn: &Arc<PgConnectionInner>, schema: &str, table: &str, name: &str) -> bool {
+    let database = if schema.is_empty() {
+        match schema_on_search_path(pg_conn, table) {
+            Ok(Some(database)) => database,
+            Ok(None) | Err(_) => "main".to_string(),
+        }
+    } else if schema.eq_ignore_ascii_case("public") {
+        "main".to_string()
+    } else {
+        schema.to_string()
+    };
+    if database == "main" {
+        let schema = pg_conn.conn.current_schema();
+        return schema.get_table(name).is_some()
+            || schema.get_view(name).is_some()
+            || schema.indexes.values().flatten().any(|i| i.name.eq_ignore_ascii_case(name));
+    }
+    let sql = catalog::sqlite_text(format!(
+        "SELECT 1 FROM {}.sqlite_schema WHERE name = {} COLLATE NOCASE",
+        catalog::quote_ident(&database),
+        catalog::quote_literal(name)
+    ));
+    match pg_conn.conn.prepare_sqlite(&sql).and_then(|mut stmt| stmt.run_collect_rows()) {
+        Ok(rows) => !rows.is_empty(),
+        Err(_) => true,
+    }
 }
 
 /// Whether `parse` holds a DELETE ... USING anywhere (its rewrite reads the relations' declared
@@ -3533,15 +4440,18 @@ fn get_table_columns(
 ) -> Result<Vec<String>> {
     #[cfg(test)]
     TABLE_INFO_READS.with(|n| n.set(n.get() + 1));
-    // The names quoted here, once, for every caller: COPY passed its table's name as written, so
-    // a quote in it broke the PRAGMA's text.
-    let table_name = table_name.replace('\'', "''");
+    // The names quoted here, once, for every caller, by the one quoting function: COPY passed its
+    // table's name as written, so a quote in it broke the PRAGMA's text.
     let sql = match schema_name {
-        Some(schema) => format!(
-            "PRAGMA \"{}\".table_info('{table_name}')",
-            schema.replace('"', "\"\"")
-        ),
-        None => format!("PRAGMA table_info('{table_name}')"),
+        Some(schema) => catalog::sqlite_text(format!(
+            "PRAGMA {}.table_info({})",
+            catalog::quote_ident(schema),
+            catalog::quote_literal(table_name)
+        )),
+        None => catalog::sqlite_text(format!(
+            "PRAGMA table_info({})",
+            catalog::quote_literal(table_name)
+        )),
     };
     let mut stmt = conn.prepare_internal(&sql)?;
     let rows = stmt.run_collect_rows()?;
@@ -3555,12 +4465,20 @@ fn get_table_columns(
 }
 
 fn list_user_tables(conn: &Arc<Connection>, schema_name: Option<&str>) -> Result<Vec<String>> {
-    let filter = "type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso_internal_%'";
+    // `_` escaped: unescaped it is any character, so a user table named sqlitexy was taken for
+    // an internal one and left behind by DROP SCHEMA public CASCADE (wire-rev-uw1 LOW-2).
+    let filter = r"type='table' AND name NOT LIKE 'sqlite\_%' ESCAPE '\' AND name NOT LIKE '\_\_turso\_internal\_%' ESCAPE '\'";
     let sql = match schema_name {
-        Some(name) => format!("SELECT name FROM \"{name}\".sqlite_schema WHERE {filter}"),
-        None => format!("SELECT name FROM sqlite_schema WHERE {filter}"),
+        Some(name) => catalog::sqlite_text(format!(
+            "SELECT name FROM {}.sqlite_schema WHERE {filter}",
+            catalog::quote_ident(name)
+        )),
+        None => catalog::sqlite_text(format!("SELECT name FROM sqlite_schema WHERE {filter}")),
     };
-    let mut stmt = conn.prepare_internal(&sql)?;
+    // A root statement, so its read ends with it: a nested one (prepare_internal) left the
+    // attached database's read open, and the DETACH after it failed 'database s is locked'
+    // (wire-rev-uw2 N2: an empty schema's DROP SCHEMA ... CASCADE, and N1's emptiness check).
+    let mut stmt = conn.prepare_sqlite(&sql)?;
     let rows = stmt.run_collect_rows()?;
     Ok(rows
         .into_iter()
@@ -3571,14 +4489,35 @@ fn list_user_tables(conn: &Arc<Connection>, schema_name: Option<&str>) -> Result
         .collect())
 }
 
+/// Whether a schema of this name is attached, by the engine's identity for it: the engine folds
+/// an attached database's name, so a schema created as "MixedCase" is its mixedcase, and asking
+/// for it as written found nothing (wire-rev-uw2 MED: `DROP SCHEMA "MixedCase"` was 3F000).
 fn schema_exists(conn: &Arc<Connection>, schema_name: &str) -> Result<bool> {
-    let sql = format!(
-        "SELECT 1 FROM pragma_database_list WHERE name = '{}'",
-        schema_name.replace('\'', "''")
-    );
+    let sql = catalog::sqlite_text(format!(
+        "SELECT 1 FROM pragma_database_list WHERE name = {} COLLATE NOCASE",
+        catalog::quote_literal(schema_name)
+    ));
     let mut stmt = conn.prepare_internal(&sql)?;
     let rows = stmt.run_collect_rows()?;
     Ok(!rows.is_empty())
+}
+
+/// The file the engine attached schema `schema_name` from, by the engine's identity for the name
+/// ([`schema_exists`]); None for one with no file (in memory). The file deleted with a dropped
+/// schema is this one, never a name derived from the client's spelling: `CREATE SCHEMA "Foo";
+/// DROP SCHEMA foo` detached "Foo" and left its file, so it came back at the next open
+/// (wire-rev-uw2 MED).
+fn attached_schema_file(conn: &Arc<Connection>, schema_name: &str) -> Result<Option<String>> {
+    let sql = catalog::sqlite_text(format!(
+        "SELECT file FROM pragma_database_list WHERE name = {} COLLATE NOCASE",
+        catalog::quote_literal(schema_name)
+    ));
+    let mut stmt = conn.prepare_sqlite(&sql)?;
+    let rows = stmt.run_collect_rows()?;
+    Ok(rows.into_iter().find_map(|row| match row.into_iter().next() {
+        Some(Value::Text(t)) if !t.as_str().is_empty() => Some(t.as_str().to_string()),
+        _ => None,
+    }))
 }
 
 #[cfg(test)]
@@ -3588,6 +4527,46 @@ mod tests {
     fn run(conn: &crate::Connection, sql: &str) {
         let mut stmt = conn.prepare(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
         stmt.run_ignore_rows().unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+
+    /// Review wire-line2 M1: an engine re-prepare of a session's statement really goes through
+    /// PostgresDialect::parse_for_reprepare and translates as the session did. A prepared
+    /// DELETE ... USING (whose translation reads its relations' columns), with the prepare
+    /// generation bumped by a setting change (set_cache_size) before its first step, re-prepares
+    /// (the reprepares metric rises: the premise) and deletes the one matching row. MUTANT owed with
+    /// the run: the override returning `self.parse(sql)` translates with no lookup and must fail it.
+    #[test]
+    fn an_engine_reprepare_translates_as_the_session_did() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("r.db");
+        let io = Arc::new(crate::PlatformIO::new().unwrap());
+        let db = open_database_with_io(
+            io,
+            path.to_str().unwrap(),
+            crate::OpenFlags::default(),
+            crate::DatabaseOpts::new(),
+        )
+        .unwrap();
+        let conn = crate::Connection::new(db.connect().unwrap());
+        run(&conn, "CREATE TABLE a (x INT)");
+        run(&conn, "CREATE TABLE b (x INT)");
+        run(&conn, "INSERT INTO a VALUES (1), (2), (3)");
+        run(&conn, "INSERT INTO b VALUES (2)");
+        let mut stmt = conn.prepare("DELETE FROM a USING b WHERE a.x = b.x").unwrap();
+        let before = stmt.metrics().reprepares;
+        let size = conn.inner().get_cache_size();
+        conn.inner().set_cache_size(size + 1);
+        stmt.run_ignore_rows().unwrap();
+        assert!(
+            stmt.metrics().reprepares > before,
+            "premise: the statement was not re-prepared after the generation moved"
+        );
+        assert_eq!(stmt.n_change(), 1, "the re-prepared DELETE ... USING deleted the wrong rows");
+        drop(stmt);
+        let mut left = conn.prepare("SELECT x FROM a ORDER BY x").unwrap();
+        let rows = left.run_collect_rows().unwrap();
+        let xs: Vec<String> = rows.iter().map(|r| format!("{}", r[0])).collect();
+        assert_eq!(xs, ["1", "3"]);
     }
 
     /// A multi-row UPDATE inside a block whose third row sets a primary key NULL fails the key's

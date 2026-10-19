@@ -1,0 +1,81 @@
+>> [a] Q CREATE SCHEMA s
+   C CREATE SCHEMA
+   Z I
+>> [a] Q CREATE TABLE s.t(x int)
+   C CREATE TABLE
+   Z I
+>> [a] Q INSERT INTO s.t VALUES (2)
+   C INSERT 0 1
+   Z I
+>> [a] Q CREATE TABLE t(x int)
+   C CREATE TABLE
+   Z I
+>> [a] Q INSERT INTO t VALUES (1)
+   C INSERT 0 1
+   Z I
+>> [a] Q SET search_path TO s
+   C SET
+   ParameterStatus search_path=s
+   Z I
+>> [a] PARSE q1 - SELECT x FROM t
+>> [a] PARSE d1 - DROP TABLE s.t
+>> [a] BIND - d1 - -
+>> [a] EXEC - 0
+>> [a] BIND - q1 - -
+>> [a] EXEC - 0
+>> [a] SYNC
+   ParseComplete
+   ParseComplete
+   BindComplete
+   C DROP TABLE
+   E S=ERROR C=42P01 M=relation "t" does not exist
+   Z I
+>> [a] Q DROP TABLE IF EXISTS s.t
+   C DROP TABLE
+   Z I
+>> [a] Q CREATE TABLE s.t(x int)
+   C CREATE TABLE
+   Z I
+>> [a] Q INSERT INTO s.t VALUES (2)
+   C INSERT 0 1
+   Z I
+>> [a] PARSE q2 - SELECT x FROM t
+>> [a] PARSE d2 - ALTER TABLE s.t ADD COLUMN y int
+>> [a] BIND - d2 - -
+>> [a] EXEC - 0
+>> [a] BIND - q2 - -
+>> [a] EXEC - 0
+>> [a] SYNC
+   ParseComplete
+   ParseComplete
+   BindComplete
+   C ALTER TABLE
+   BindComplete
+   D ['2']
+   C SELECT 1
+   Z I
+>> [a] Q SET search_path TO DEFAULT
+   C SET
+   ParameterStatus search_path="$user", public
+   Z I
+>> [a] PARSE q3 - SELECT x FROM t
+>> [a] PARSE d3 - CREATE TEMP TABLE t(x int)
+>> [a] BIND - d3 - -
+>> [a] EXEC - 0
+>> [a] PARSE d4 - INSERT INTO t VALUES (3)
+>> [a] BIND - d4 - -
+>> [a] EXEC - 0
+>> [a] BIND - q3 - -
+>> [a] EXEC - 0
+>> [a] SYNC
+   ParseComplete
+   ParseComplete
+   BindComplete
+   C CREATE TABLE
+   ParseComplete
+   BindComplete
+   C INSERT 0 1
+   BindComplete
+   D ['3']
+   C SELECT 1
+   Z I

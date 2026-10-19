@@ -1,0 +1,50 @@
+>> [a] Q CREATE TABLE a(x int)
+   C CREATE TABLE
+   Z I
+>> [a] Q INSERT INTO a VALUES (1)
+   C INSERT 0 1
+   Z I
+>> [a] Q CREATE TABLE b(x int)
+   C CREATE TABLE
+   Z I
+>> [a] Q INSERT INTO b VALUES (1)
+   C INSERT 0 1
+   Z I
+>> [a] PARSE sa - SELECT x FROM a
+>> [a] BIND - sa - -
+>> [a] Q DROP TABLE a
+   ParseComplete
+   BindComplete
+   C DROP TABLE
+   Z I
+>> [a] EXEC - 0
+>> [a] SYNC
+   E S=ERROR C=34000 M=portal "" does not exist
+   Z I
+>> [a] PARSE sb - SELECT x FROM b
+>> [a] Q DROP TABLE b
+   ParseComplete
+   C DROP TABLE
+   Z I
+>> [a] BIND - sb - -
+>> [a] EXEC - 0
+>> [a] SYNC
+   E S=ERROR C=42P01 M=relation "b" does not exist
+   Z I
+>> [a] Q CREATE TABLE e(x int)
+   C CREATE TABLE
+   Z I
+>> [a] Q INSERT INTO e VALUES (1)
+   C INSERT 0 1
+   Z I
+>> [a] PARSE se - SELECT x FROM e
+>> [a] BIND pe se - -
+>> [a] Q DROP TABLE e
+   ParseComplete
+   BindComplete
+   E S=ERROR C=55006 M=cannot DROP TABLE "e" because it is being used by active queries in this session
+   Z I
+>> [a] EXEC pe 0
+>> [a] SYNC
+   E S=ERROR C=34000 M=portal "pe" does not exist
+   Z I

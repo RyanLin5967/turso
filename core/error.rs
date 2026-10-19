@@ -210,6 +210,8 @@ impl LimboError {
             Self::Interrupt => QueryCanceled,
             // The stack-guard class (fastest-engine): PostgreSQL's 54001, as check_stack_depth().
             Self::StackDepthLimitExceeded => StatementTooComplex,
+            // The engine's typed varchar(n) refusal (fastest-wire c15466936): 22001 by kind.
+            Self::StringDataRightTruncation(_) => StringDataRightTruncation,
             _ => InternalError,
         }
     }

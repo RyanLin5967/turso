@@ -327,13 +327,25 @@ pub fn param_targets(parse: &ParseResult) -> Vec<Option<u32>> {
         .collect()
 }
 
-/// Whether `text` (a literal pg_query gives as a float's text) is an integer literal, decimal or
-/// 0x / 0o / 0b with underscores, whose value fits int8.
-fn integer_literal_fits_i64(text: &str) -> bool {
-    let (negative, digits) = match text.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, text),
-    };
+/// The type of `text` (a literal pg_query gives as a float's text) when it is an integer literal,
+/// decimal or 0x / 0o / 0b with underscores: int4 when its value fits int4, int8 when it fits int8,
+/// None otherwise (numeric, which the engine holds as a float).
+fn integer_literal_type(text: &str) -> Option<u32> {
+    let negative = text.starts_with('-');
+    let magnitude = integer_literal_magnitude(text)?;
+    let fits = |max: u128| if negative { magnitude <= max + 1 } else { magnitude <= max };
+    if fits(i32::MAX as u128) {
+        Some(INT4)
+    } else if fits(i64::MAX as u128) {
+        Some(INT8)
+    } else {
+        None
+    }
+}
+
+/// The magnitude of an integer literal's text ([`integer_literal_type`]), None when it is none.
+fn integer_literal_magnitude(text: &str) -> Option<u128> {
+    let digits = text.strip_prefix('-').unwrap_or(text);
     let lower = digits.to_ascii_lowercase();
     let (radix, body) = if let Some(b) = lower.strip_prefix("0x") {
         (16, b)
@@ -346,13 +358,9 @@ fn integer_literal_fits_i64(text: &str) -> bool {
     };
     let clean: String = body.chars().filter(|c| *c != '_').collect();
     if clean.is_empty() || !clean.chars().all(|c| c.is_digit(radix)) {
-        return false;
+        return None;
     }
-    match u128::from_str_radix(&clean, radix) {
-        Ok(v) if negative => v <= i64::MAX as u128 + 1,
-        Ok(v) => v <= i64::MAX as u128,
-        Err(_) => false,
-    }
+    u128::from_str_radix(&clean, radix).ok()
 }
 
 /// [`expression_types`] for one expression.
@@ -363,10 +371,23 @@ fn expression_type(node: &PgNode) -> Option<u32> {
         // one, as PostgreSQL types it (recorded, pg18-diff/pg18-c33.out; Claude C33: announced
         // int4). One past int8 is numeric in PostgreSQL; the engine holds it as a float, so it is
         // left to the engine's type (the bare-NUMERIC divergence, a known red).
-        Node::AConst(c) if matches!(&c.val, Some(Val::Fval(f)) if integer_literal_fits_i64(&f.fval)) => {
-            return Some(INT8);
+        // One that fits int4 (a negative one pg_query gives as a float's text, `(-2147483648)`)
+        // is int4, as make_const types it (wirefuzz vs PG 18.6, wire-fuzz4: announced int8).
+        Node::AConst(c) if matches!(&c.val, Some(Val::Fval(f)) if integer_literal_type(&f.fval).is_some()) => {
+            let Some(Val::Fval(f)) = &c.val else { return None };
+            return integer_literal_type(&f.fval);
         }
         Node::AConst(c) => matches!(c.val, Some(Val::Boolval(_))),
+        // The sequence functions and pg_database_size are bigint in PostgreSQL, whatever their
+        // arguments; the engine gave them no type, so they were announced text (found by the E5'
+        // differential, wire-e5-f312d1e13).
+        Node::FuncCall(call)
+            if func_name(call).is_some_and(|n| {
+                matches!(n.as_str(), "nextval" | "currval" | "setval" | "pg_database_size")
+            }) =>
+        {
+            return Some(INT8);
+        }
         Node::BoolExpr(_) | Node::NullTest(_) | Node::BooleanTest(_) => true,
         // NULLIF is its first argument's type.
         Node::AExpr(e) if e.kind() == AExprKind::AexprNullif => {
@@ -415,6 +436,12 @@ fn expression_type(node: &PgNode) -> Option<u32> {
                 }))
                 .ok()?;
                 return array_of(element);
+            }
+            // A cast to NUMERIC(p, s) is the engine's exact numeric (the translator encodes and
+            // decodes it): numeric, as in PostgreSQL (wire-rev-uw3 MED-4). A bare NUMERIC is the
+            // engine's REAL and stays its type.
+            if turso_pg_parser::translator::numeric_cast_size(type_name).is_some() {
+                return Some(NUMERIC);
             }
             return match type_name.names.last()?.node.as_ref()? {
                 Node::String(s) if s.sval == "bool" => Some(BOOL),
@@ -513,6 +540,64 @@ pub fn aggregate_types(aggregates: &[bool], columns: &[Option<u32>]) -> Vec<Opti
 
 const BOOL: u32 = 16;
 const TEXT: u32 = 25;
+const VARCHAR: u32 = 1043;
+const NAME: u32 = 19;
+
+/// Which result columns of a plain SELECT (lined up as [`aggregate_targets`] lines them up) are
+/// computed from table columns and integer or string literals by arithmetic (+ - * / %) and by the
+/// scalar functions whose result type is fixed ([`scalar_result`]), with nothing else in them: the
+/// walk types them as PostgreSQL does (int8 * int4 is int8, numeric / int4 numeric, length() int4),
+/// where the engine announced int4, float8 and text (wirefuzz vs PG 18.6, wire-fuzz1/2). A decimal
+/// literal anywhere leaves the column the engine's: PostgreSQL types it numeric, and the engine
+/// holds it as a float (the bare-NUMERIC divergence, a known red). Empty when the statement is no
+/// such SELECT.
+pub fn computed_targets(parse: &ParseResult) -> Vec<bool> {
+    let [raw] = parse.protobuf.stmts.as_slice() else {
+        return Vec::new();
+    };
+    let Some(Node::SelectStmt(select)) = raw.stmt.as_ref().and_then(|s| s.node.as_ref()) else {
+        return Vec::new();
+    };
+    if select.larg.is_some() || select.rarg.is_some() {
+        return Vec::new();
+    }
+    fn plain(node: &PgNode, top: bool) -> bool {
+        use turso_pg_parser::pg_query::protobuf::{a_const::Val, AExprKind};
+        match node.node.as_ref() {
+            Some(Node::ColumnRef(c)) => !top
+                && !matches!(c.fields.last().and_then(|f| f.node.as_ref()), Some(Node::AStar(_))),
+            Some(Node::AConst(c)) => {
+                !top && (c.isnull || matches!(c.val, Some(Val::Ival(_) | Val::Sval(_))))
+            }
+            Some(Node::AExpr(e)) => {
+                e.kind() == AExprKind::AexprOp
+                    && matches!(
+                        e.name.as_slice(),
+                        [op] if matches!(op.node.as_ref(),
+                            Some(Node::String(s)) if matches!(s.sval.as_str(), "+" | "-" | "*" | "/" | "%"))
+                    )
+                    && e.lexpr.as_deref().is_none_or(|l| plain(l, false))
+                    && e.rexpr.as_deref().is_some_and(|r| plain(r, false))
+            }
+            Some(Node::FuncCall(call)) => {
+                call.over.is_none()
+                    && call.agg_filter.is_none()
+                    && !call.agg_star
+                    && func_name(call).is_some_and(|n| scalar_result(&n).is_some())
+                    && call.args.iter().all(|a| plain(a, false))
+            }
+            _ => false,
+        }
+    }
+    let mut computed = Vec::with_capacity(select.target_list.len());
+    for target in &select.target_list {
+        let Some(Node::ResTarget(t)) = target.node.as_ref() else {
+            return Vec::new();
+        };
+        computed.push(t.val.as_deref().is_some_and(|v| plain(v, true)));
+    }
+    computed
+}
 
 /// The types a statement's parse gives: its result columns' (see [`aggregate_types`]) and its
 /// parameters' (see [`parameter_types`]).
@@ -667,6 +752,7 @@ fn parameter_types_with(
         cut_views: Default::default(),
         attached,
         missing_rte: Default::default(),
+        first_refusal: Default::default(),
     };
     let mut columns = Vec::new();
     if let [raw] = parse.protobuf.stmts.as_slice() {
@@ -682,6 +768,9 @@ fn parameter_types_with(
         .collect();
     if let Some(missing) = infer.missing_rte.take() {
         return Err(missing);
+    }
+    if let Some(Some(refused)) = infer.first_refusal.take() {
+        return Err(refused);
     }
     Ok(Walked {
         params: infer.types,
@@ -770,6 +859,14 @@ struct Infer<'a> {
     /// PostgreSQL's errorMissingRTE (42P01): the statement is refused with it. Shared with the walks
     /// of the statement's own subqueries, not with a view's (wire review 17 item 5).
     missing_rte: std::rc::Rc<std::cell::RefCell<Option<SqlErrorMessage>>>,
+    /// The first of a target's refusals the walk makes itself (min/max over boolean, 42883) and
+    /// a column reference no relation in scope has, in the order the walk meets them:
+    /// `Some(Some(e))` refuses the statement with e, `Some(None)` leaves the missing column to the
+    /// engine, which reports it as PostgreSQL does first (wirefuzz vs PG 18.6, wire-fuzz4: a later
+    /// min(boolean) was refused ahead of an earlier missing column). BLIND SPOT: a reference the
+    /// walk cannot resolve that the engine can (an outer query's column) also leaves a later
+    /// refusal to the engine, which answers min/max(boolean) as before.
+    first_refusal: std::rc::Rc<std::cell::RefCell<Option<Option<SqlErrorMessage>>>>,
 }
 
 /// The stack a view's reading starts with, and the stack grown for it when less is left: each view
@@ -813,6 +910,8 @@ fn scalar_result(name: &str) -> Option<u32> {
         | "quote_ident" | "quote_literal" | "format" | "current_schema" | "current_database"
         | "version" => TEXT,
         "row_number" | "rank" | "dense_rank" | "ntile" => INT8,
+        // bigint in PostgreSQL (found by the E5' differential, wire-e5-f312d1e13).
+        "nextval" | "currval" | "setval" | "pg_database_size" => INT8,
         // float8-only in PostgreSQL, whatever numeric argument they are given, and computed as a
         // float by the engine (random() as the translator scales it).
         "percent_rank" | "cume_dist" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan"
@@ -1221,6 +1320,7 @@ impl Infer<'_> {
             cut_views: self.cut_views.clone(),
             attached: self.attached,
             missing_rte: Default::default(),
+            first_refusal: Default::default(),
         };
         let columns = walk.select(query, &Vec::new());
         Some(rename(columns, &v.aliases))
@@ -1697,6 +1797,18 @@ impl Infer<'_> {
                         self.set(arg, Some(TEXT));
                     }
                 }
+                // Functions whose argument types PostgreSQL fixes by position (wire-rev-uw3 LOW-6:
+                // they were described text): setval(regclass, bigint, bool), pg_database_size(name).
+                let positional: &[Option<u32>] = match name.as_deref() {
+                    Some("setval") => &[None, Some(INT8), Some(BOOL)],
+                    Some("pg_database_size") => &[Some(NAME)],
+                    _ => &[],
+                };
+                for (arg, ty) in f.args.iter().zip(positional) {
+                    if ty.is_some() {
+                        self.set(arg, *ty);
+                    }
+                }
                 for arg in &f.args {
                     self.expr(arg, scope);
                 }
@@ -1896,7 +2008,13 @@ impl Infer<'_> {
         use turso_pg_parser::pg_query::protobuf::a_const::Val;
         use turso_pg_parser::pg_query::protobuf::{AExprKind, SubLinkType};
         match node.node.as_ref()? {
-            Node::ColumnRef(_) => self.column(node, scope).flatten(),
+            Node::ColumnRef(_) => {
+                let found = self.column(node, scope);
+                if found.is_none() {
+                    self.first_refusal.borrow_mut().get_or_insert(None);
+                }
+                found.flatten()
+            }
             Node::FuncCall(call) => {
                 let name = func_name(call)?;
                 if let Some(t) = scalar_result(&name) {
@@ -1912,6 +2030,19 @@ impl Infer<'_> {
                     ("sum", t @ (FLOAT4 | FLOAT8)) => Some(t),
                     ("avg", INT2 | INT4 | INT8 | NUMERIC) => Some(NUMERIC),
                     ("avg", FLOAT4 | FLOAT8) => Some(FLOAT8),
+                    // PostgreSQL has min and max for text, not varchar: over a varchar they
+                    // resolve to text's (wirefuzz vs PG 18.6: announced varchar). It has none for
+                    // boolean: refused 42883, as PostgreSQL refuses it (it was answered).
+                    ("min" | "max", VARCHAR) => Some(TEXT),
+                    ("min" | "max", BOOL) => {
+                        self.first_refusal.borrow_mut().get_or_insert_with(|| {
+                            Some(SqlErrorMessage::classified(
+                                SqlErrorKind::UndefinedFunction,
+                                format!("function {name}(boolean) does not exist"),
+                            ))
+                        });
+                        None
+                    }
                     ("min" | "max" | "abs" | "sign", t) => Some(t),
                     ("ceil" | "ceiling" | "floor" | "round" | "trunc", t @ (NUMERIC | FLOAT8)) => {
                         Some(t)
@@ -2037,6 +2168,7 @@ impl Infer<'_> {
             cut_views: self.cut_views.clone(),
             attached: self.attached,
             missing_rte: self.missing_rte.clone(),
+            first_refusal: self.first_refusal.clone(),
         };
         let level = walk.from_items(&s.from_clause, scope);
         let mut inner = scope.clone();

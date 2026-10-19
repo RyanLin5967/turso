@@ -979,13 +979,18 @@ impl Drop for ServerChild {
 }
 
 fn start_tursopg_server() -> (ServerChild, u16) {
+    start_tursopg_server_with(&[])
+}
+
+/// [`start_tursopg_server`] with `extra` server arguments.
+fn start_tursopg_server_with(extra: &[&str]) -> (ServerChild, u16) {
     for _ in 0..10 {
         let port = TcpListener::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()
             .unwrap()
             .port();
-        if let Some(child) = start_tursopg_server_on(port) {
+        if let Some(child) = start_tursopg_server_on(port, extra) {
             return (ServerChild(child), port);
         }
     }
@@ -997,7 +1002,7 @@ fn start_tursopg_server() -> (ServerChild, u16) {
 /// its bind; a connect probe was answered by any listener on the port. Its stdout and stderr go to
 /// files under WIRE_SERVER_LOG_DIR, or temp/tursopg_cli_server_logs/<pid>/, kept after the test
 /// (the pipes they used were never read, so a chatty server could block on a full one).
-fn start_tursopg_server_on(port: u16) -> Option<Child> {
+fn start_tursopg_server_on(port: u16, extra: &[&str]) -> Option<Child> {
     use std::io::BufRead;
     use std::time::{Duration, Instant};
     let addr = format!("127.0.0.1:{port}");
@@ -1017,6 +1022,7 @@ fn start_tursopg_server_on(port: u16) -> Option<Child> {
         .arg(":memory:")
         .arg("--server")
         .arg(&addr)
+        .args(extra)
         .stdout(Stdio::piped())
         .stderr(Stdio::from(stderr))
         .spawn()
@@ -1056,7 +1062,7 @@ fn start_tursopg_server_on(port: u16) -> Option<Child> {
 fn a_foreign_listener_on_the_port_is_not_taken_for_the_server() {
     let foreign = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = foreign.local_addr().unwrap().port();
-    let child = start_tursopg_server_on(port);
+    let child = start_tursopg_server_on(port, &[]);
     let taken = child.is_some();
     if let Some(mut child) = child {
         child.kill().ok();
@@ -1336,7 +1342,9 @@ fn extract_command_tags(data: &[u8]) -> Vec<String> {
 
 #[test]
 fn wire_copy_from_returns_copy_n() {
-    let (mut server, port) = start_tursopg_server();
+    // Its COPY FROM reads a file it writes in the temp directory: granted (review wire-quote LOW-3).
+    let temp = std::env::temp_dir();
+    let (mut server, port) = start_tursopg_server_with(&["--copy-from-dir", temp.to_str().unwrap()]);
 
     let path = write_temp_copy_file("wire", "1\tAlice\n2\tBob\n3\tCharlie\n");
 

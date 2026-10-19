@@ -34,5 +34,9 @@ turso_parser = { workspace = true }
 turso_ext = { workspace = true, features = ["core_only"] }
 turso_pg_parser = { workspace = true }
 
+# F_GETPATH, the opened file's path a COPY FROM 'file' grant judges (session.rs open_server_file).
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = { version = "0.2.172" }
+
 [lints]
 workspace = true

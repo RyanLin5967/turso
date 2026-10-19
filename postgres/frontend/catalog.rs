@@ -21,6 +21,66 @@ const STORED_PG_SCHEMA_PREFIX: &str = "/* turso_frontend:postgres */ ";
 /// engine review 20 HIGH 1). A reader unaware of it sees a leading comment and SQLite text.
 const STORED_PG_ALTERED_PREFIX: &str = "/* turso_frontend:postgres sqlite */ ";
 
+/// The mark of text that is this frontend's (or the engine's) own SQLite, written by the code that
+/// builds it (PRAGMAs, ATTACH, DETACH, sqlite_schema lookups with `?N`, COPY's `VALUES (?, ...)`):
+/// the one text [`PostgresDialect::parse`] reads as SQLite. NO SILENT DIALECT SWITCH (lead class,
+/// 2026-10-17): text PostgreSQL parses is never read again as SQLite, whatever its translation
+/// does; the SQLite parse is taken by a mark written at the source, never guessed from a failure.
+pub(crate) const SQLITE_TEXT_MARKER: &str = "/* turso:sqlite */ ";
+
+/// THE quoting of an identifier pasted into engine text (review wire-line3 HIGH-1, the lead's
+/// class): wrapped in double quotes, each double quote doubled, so no name can end the identifier
+/// early. Every frontend SQL builder quotes a name through it, never by hand (the guard test
+/// `engine_text_is_quoted_by_the_one_quoting_function`).
+pub(crate) fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// THE quoting of a string literal pasted into engine text: wrapped in single quotes, each single
+/// quote doubled (SQLite and PostgreSQL with standard_conforming_strings on read no backslash
+/// escapes in it).
+pub(crate) fn quote_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+/// A name as PostgreSQL prints it in text it shows a client (pg_get_indexdef, pg_indexes,
+/// pg_get_constraintdef, quote_ident()): quoted only when it must be, by its quote_identifier
+/// rules (turso_pg_parser::quote_identifier). Engine text takes [`quote_ident`], which always
+/// quotes; these are the frontend's two quoting functions for names, one per reader (review
+/// wire-quote LOW-1).
+pub(crate) fn pg_ident(name: &str) -> String {
+    turso_pg_parser::quote_identifier(name)
+}
+
+/// A value as PostgreSQL's quote_literal() prints it: `E'...'` with each backslash doubled when
+/// it holds one, so the text reads back the same whatever standard_conforming_strings is (recorded:
+/// pg18-rev-quote-low.out, quote_literal(E'a\\b') is E'a\\\\b'); otherwise [`quote_literal`].
+pub(crate) fn pg_quote_literal(value: &str) -> String {
+    if value.contains('\\') {
+        format!("E'{}'", value.replace('\\', "\\\\").replace('\'', "''"))
+    } else {
+        quote_literal(value)
+    }
+}
+
+/// An index's definition as pg_get_indexdef and pg_indexes print it in PostgreSQL 18.6: names by
+/// [`pg_ident`], the table qualified by its schema (recorded: CREATE INDEX "i j" ON public."a b"
+/// USING btree (x), pg18-rev-quote-low.out). `columns` are printed as given (an expression's text).
+pub(crate) fn pg_index_definition(unique: bool, index: &str, table: &str, columns: &[String]) -> String {
+    format!(
+        "CREATE {}INDEX {} ON public.{} USING btree ({})",
+        if unique { "UNIQUE " } else { "" },
+        pg_ident(index),
+        pg_ident(table),
+        columns.join(", ")
+    )
+}
+
+/// `sql` marked as this frontend's own SQLite ([`SQLITE_TEXT_MARKER`]).
+pub(crate) fn sqlite_text(sql: impl AsRef<str>) -> String {
+    format!("{SQLITE_TEXT_MARKER}{}", sql.as_ref())
+}
+
 #[derive(Debug)]
 pub struct PostgresDialect;
 
@@ -42,9 +102,15 @@ impl Dialect for PostgresDialect {
     }
 
     fn parse(&self, sql: &str) -> Result<(Option<turso_parser::ast::Cmd>, usize)> {
-        // Engine-generated helper statements and pragmas are canonical SQLite
-        // text that pg_query rejects, so anything the PostgreSQL parser cannot
-        // handle falls back to SQLite parsing.
+        // This frontend's own SQLite, marked where it is built: read as SQLite.
+        if sql.starts_with(SQLITE_TEXT_MARKER) {
+            return turso_core::dialect::sqlite::parse(sql);
+        }
+        // Text the PostgreSQL parser rejects still falls back to SQLite, for the ENGINE's own
+        // unmarked helper statements (pragma_* table functions, VACUUM's replay, branch merge,
+        // CDC, MVCC bootstrap: the audit of 2026-10-17). That half of the class waits on
+        // fastest-engine marking them (or routing StatementOrigin::InternalHelper to the SQLite
+        // parse); then a rejected unmarked text becomes an error too.
         let Ok(parse_result) = turso_pg_parser::parse(sql) else {
             return turso_core::dialect::sqlite::parse(sql);
         };
@@ -60,30 +126,43 @@ impl Dialect for PostgresDialect {
             Some(next) => next.stmt_location as usize,
             None => sql.len(),
         };
-        // A statement whose translation reads its relations' columns (DELETE ... USING, a
-        // positional INSERT with DEFAULT, an alias column list) cannot be translated here, where
-        // no connection's lookup exists: the session's prepare builds that translator, and a
-        // statement the wire keeps is prepared again by the wire under it (review wire-rework
-        // E-M2, E-H1). Reached only by the engine's own re-prepare of such a statement; it is
-        // refused rather than translated without the lookup or read as SQLite. BLIND SPOT: a
-        // re-prepare the engine starts itself (another session's DDL mid-statement) fails here
-        // instead of re-translating; owed to fastest-engine (a Dialect parse given the
-        // re-preparing connection).
-        if crate::session::is_delete_using(sql, &parse_result)
-            || crate::session::is_positional_insert_default(sql, &parse_result)
-            || crate::session::has_alias_column_list(&parse_result)
-        {
-            return Err(turso_core::LimboError::InternalError(
-                "this statement must be prepared again by its session: its translation reads \
-                 its relations' columns"
-                    .to_string(),
-            ));
-        }
         let translator = turso_pg_parser::translator::PostgreSQLTranslator::new();
         match translator.translate(&parse_result) {
             Ok(stmt) => Ok((Some(turso_parser::ast::Cmd::Stmt(stmt)), consumed)),
-            Err(_) => turso_core::dialect::sqlite::parse(sql),
+            Err(e) => Err(LimboError::ParseError(e.into())),
         }
+    }
+
+    /// The engine's re-prepare of a statement on `conn`: when `conn` is a session's, its text is
+    /// translated as that session's prepare translated it ([`crate::session::reprepare_translation`]:
+    /// the column lookups, the known types, the positional-INSERT naming and the session's search
+    /// path), ONE TRANSLATION PATH (the wire line review M1-M4); otherwise as [`Dialect::parse`].
+    /// 92257e453's refusal list is gone: it over-refused a CTE alias and any text holding
+    /// "default", and still left a domain cast without its CHECK.
+    fn parse_for_reprepare(
+        &self,
+        sql: &str,
+        conn: &Arc<Connection>,
+    ) -> Result<(Option<turso_parser::ast::Cmd>, usize)> {
+        let Some(pg_conn) = crate::session::session_of(conn) else {
+            return self.parse(sql);
+        };
+        if sql.starts_with(SQLITE_TEXT_MARKER) {
+            return turso_core::dialect::sqlite::parse(sql);
+        }
+        let Ok(parse_result) = turso_pg_parser::parse(sql) else {
+            return turso_core::dialect::sqlite::parse(sql);
+        };
+        let stmts = &parse_result.protobuf.stmts;
+        if stmts.is_empty() {
+            return Ok((None, sql.len()));
+        }
+        let consumed = match stmts.get(1) {
+            Some(next) => next.stmt_location as usize,
+            None => sql.len(),
+        };
+        let cmd = crate::session::reprepare_translation(&pg_conn, sql, &parse_result)?;
+        Ok((Some(cmd), consumed))
     }
 
     fn parse_table_sql(&self, sql: &str, root_page: i64) -> Result<BTreeTable> {
@@ -153,6 +232,12 @@ impl Dialect for PostgresDialect {
         let Some(raw_sql) = decode_stored_pg_schema_sql(sql) else {
             return turso_core::dialect::sqlite::table_sql_for_replay(sql);
         };
+        // Client DDL stored before the marker refusal (f8f0d4b13) may start with the SQLite
+        // marker; replayed bare, the client's PostgreSQL DDL would be read as SQLite. It replays as
+        // stored, behind its PostgreSQL prefix (review wire-line3 LOW-2).
+        if raw_sql.trim_start().starts_with(SQLITE_TEXT_MARKER.trim_end()) {
+            return Ok(sql.to_string());
+        }
 
         let stmt = self.parse_table_sql_ast(sql)?;
         let turso_parser::ast::Stmt::CreateTable {
@@ -420,6 +505,145 @@ pub(crate) fn sqlite_type_to_pg_oid(ty_str: &str) -> i64 {
     }
 }
 
+/// A user table's or index's pg_class oid by its exact name, by the scheme pg_class and
+/// pg_index assign them: tables first in name order, then each table's indexes in order.
+pub(crate) fn relation_oid(schema: &Schema, name: &str) -> Option<i64> {
+    // Each relation by the engine's identity for its name, ASCII case folded: the engine folds
+    // every relation name (normalize_ident), so a table created as "T2" is the engine's t2, and
+    // '"T2"' named no relation while 'T2' named it (wire-rev-uw2 MED; recorded,
+    // pg18-rev-uw2-regclass.out). PostgreSQL's 'T2' is 42P01 for a "T2": that half, and pg_class
+    // showing "T2" as created, need the engine to keep a name's case (engine-owned, known-red).
+    let tables = user_tables_sorted(schema);
+    if let Some(i) = tables.iter().position(|(key, _)| key.eq_ignore_ascii_case(name)) {
+        return Some(USER_TABLE_OID_START + i as i64);
+    }
+    let mut index_oid = USER_TABLE_OID_START + tables.len() as i64;
+    for (table_name, _) in &tables {
+        for idx in schema.get_indices(table_name) {
+            if idx.ephemeral {
+                continue;
+            }
+            if idx.name.eq_ignore_ascii_case(name) {
+                return Some(index_oid);
+            }
+            index_oid += 1;
+        }
+    }
+    views_and_sequences_sorted(schema)
+        .iter()
+        .position(|(relname, _, _)| relname.eq_ignore_ascii_case(name))
+        .map(|i| index_oid + i as i64)
+}
+
+/// The views and sequences of `schema`, as pg_class numbers them after every index: the views by
+/// their catalog names, then the sequences by theirs, each with its name as created, its relkind
+/// (v or S) and its column count (a sequence's three: last_value, log_cnt, is_called). Both
+/// pg_class and [`relation_oid`] use it, so the two agree on each oid.
+pub(crate) fn views_and_sequences_sorted(schema: &Schema) -> Vec<(String, &'static str, i64)> {
+    let mut views: Vec<_> = schema.views.iter().collect();
+    views.sort_by_key(|(key, _)| *key);
+    let mut sequences: Vec<_> = schema.sequences.iter().collect();
+    sequences.sort_by_key(|(key, _)| *key);
+    views
+        .into_iter()
+        .map(|(_, v)| (v.name.clone(), "v", v.columns.len() as i64))
+        .chain(sequences.into_iter().map(|(_, q)| (q.name.clone(), "S", 3)))
+        .collect()
+}
+
+/// The pg_catalog relations this frontend serves, with their PostgreSQL 18.6 oids, which a
+/// regclass names (recorded, pg18-rev-uw2-regclass.out: each '<name>'::regclass::oid). The
+/// catalogs' oids are fixed by PostgreSQL's catalog headers; the views' (pg_roles, pg_tables,
+/// pg_indexes, pg_sequences) are initdb's, as 18.6 assigns them.
+const PG_CATALOG_RELATION_OIDS: &[(&str, i64)] = &[
+    ("pg_am", 2601),
+    ("pg_attrdef", 2604),
+    ("pg_attribute", 1249),
+    ("pg_class", 1259),
+    ("pg_collation", 3456),
+    ("pg_constraint", 2606),
+    ("pg_database", 1262),
+    ("pg_description", 2609),
+    ("pg_foreign_table", 3118),
+    ("pg_index", 2610),
+    ("pg_indexes", 12043),
+    ("pg_inherits", 2611),
+    ("pg_namespace", 2615),
+    ("pg_partitioned_table", 3350),
+    ("pg_policy", 3256),
+    ("pg_proc", 1255),
+    ("pg_publication", 6104),
+    ("pg_publication_namespace", 6237),
+    ("pg_publication_rel", 6106),
+    ("pg_rewrite", 2618),
+    ("pg_roles", 12000),
+    ("pg_sequences", 12048),
+    ("pg_tables", 12033),
+    ("pg_trigger", 2620),
+    ("pg_type", 1247),
+];
+
+/// The oid of the pg_catalog relation named `name` exactly, as [`PG_CATALOG_RELATION_OIDS`]
+/// holds it.
+pub(crate) fn catalog_relation_oid(name: &str) -> Option<i64> {
+    PG_CATALOG_RELATION_OIDS.iter().find(|(n, _)| *n == name).map(|(_, oid)| *oid)
+}
+
+/// `text` read as PostgreSQL reads a qualified name in a regclass (stringToQualifiedNameList,
+/// SplitIdentifierString): parts split at dots outside double quotes, blanks allowed before and
+/// after each part (' public . t ' is public.t; recorded, pg18-rev-uw2-regclass.out), an unquoted
+/// part folded to lower case and holding no blank, a quoted part as written with `""` as one
+/// quote. None for a malformed name.
+pub(crate) fn identifier_list(text: &str) -> Option<Vec<String>> {
+    let mut parts = Vec::new();
+    let mut chars = text.trim().chars().peekable();
+    loop {
+        while chars.peek().is_some_and(|c| c.is_whitespace()) {
+            chars.next();
+        }
+        let mut part = String::new();
+        if chars.peek() == Some(&'"') {
+            chars.next();
+            loop {
+                match chars.next()? {
+                    '"' if chars.peek() == Some(&'"') => {
+                        chars.next();
+                        part.push('"');
+                    }
+                    '"' => break,
+                    c => part.push(c),
+                }
+            }
+            if part.is_empty() {
+                return None;
+            }
+        } else {
+            while let Some(&c) = chars.peek() {
+                if c == '.' || c.is_whitespace() {
+                    break;
+                }
+                if c == '"' {
+                    return None;
+                }
+                part.push(c.to_ascii_lowercase());
+                chars.next();
+            }
+            if part.is_empty() {
+                return None;
+            }
+        }
+        parts.push(part);
+        while chars.peek().is_some_and(|c| c.is_whitespace()) {
+            chars.next();
+        }
+        match chars.next() {
+            None => return Some(parts),
+            Some('.') => continue,
+            Some(_) => return None,
+        }
+    }
+}
+
 /// Build a mapping from table name to OID for all user tables.
 fn table_oid_map(schema: &Schema) -> HashMap<String, i64> {
     let tables = user_tables_sorted(schema);
@@ -649,6 +873,48 @@ impl PgClassCursor {
             }
         }
 
+        // Views (relkind v) and sequences (relkind S), numbered after the indexes, as
+        // relation_oid numbers them: PostgreSQL's pg_class holds both, and a regclass of one
+        // was 42P01 (wire-rev-uw2 MED; recorded, pg18-rev-uw2-regclass.out).
+        for (relname, relkind, relnatts) in views_and_sequences_sorted(&schema) {
+            self.rows.push(vec![
+                Value::from_i64(index_oid),    // oid
+                Value::Text(relname.into()),   // relname
+                Value::from_i64(2200),         // relnamespace (public)
+                Value::from_i64(0),            // reltype
+                Value::from_i64(0),            // reloftype
+                Value::from_i64(10),           // relowner
+                Value::from_i64(0),            // relam (none)
+                Value::from_i64(0),            // relfilenode
+                Value::from_i64(0),            // reltablespace
+                Value::from_i64(0),            // relpages
+                Value::from_f64(0.0),          // reltuples
+                Value::from_i64(0),            // relallvisible
+                Value::from_i64(0),            // reltoastrelid
+                Value::from_i64(0),            // relhasindex
+                Value::from_i64(0),            // relisshared
+                Value::Text("p".into()),       // relpersistence
+                Value::Text(relkind.into()),   // relkind (view or sequence)
+                Value::from_i64(relnatts),     // relnatts
+                Value::from_i64(0),            // relchecks
+                Value::from_i64(i64::from(relkind == "v")), // relhasrules (a view's _RETURN)
+                Value::from_i64(0),            // relhastriggers
+                Value::from_i64(0),            // relhassubclass
+                Value::from_i64(0),            // relrowsecurity
+                Value::from_i64(0),            // relforcerowsecurity
+                Value::from_i64(1),            // relispopulated
+                Value::Text("n".into()),       // relreplident
+                Value::from_i64(0),            // relispartition
+                Value::from_i64(0),            // relrewrite
+                Value::from_i64(0),            // relfrozenxid
+                Value::from_i64(0),            // relminmxid
+                Value::Null,                   // relacl
+                Value::Null,                   // reloptions
+                Value::Null,                   // relpartbound
+            ]);
+            index_oid += 1;
+        }
+
         Ok(())
     }
 }
@@ -782,10 +1048,18 @@ impl PgNamespaceCursor {
             ],
         ];
 
-        // Add attached schemas (CREATE SCHEMA creates attached databases)
+        // Add attached schemas (CREATE SCHEMA creates attached databases), but one this
+        // session's open block dropped: its DETACH waits for the COMMIT, and PostgreSQL no
+        // longer lists it (wire-rev-uw2 N4; r5-pg.txt m2c).
         let schema_names = self.conn.attached_database_names();
+        let dropped = crate::session::session_of(&self.conn)
+            .map(|pg_conn| crate::session::schemas_dropped_in_block(&pg_conn))
+            .unwrap_or_default();
         let mut oid = 16384i64;
         for name in schema_names {
+            if dropped.contains(&name) {
+                continue;
+            }
             self.rows.push(vec![
                 Value::from_i64(oid),
                 Value::build_text(name),
@@ -1346,6 +1620,9 @@ impl InternalVirtualTableCursor for PgProcCursor {
     }
 }
 
+/// The one database's oid, as pg_database lists it (pg_database_size(oid) answers for it alone).
+pub(crate) const DATABASE_OID: i64 = 16384;
+
 /// Virtual table implementation for pg_catalog.pg_database
 /// Returns one row per database, deriving the name from the database file path.
 #[derive(Debug)]
@@ -1461,7 +1738,7 @@ impl InternalVirtualTableCursor for PgDatabaseCursor {
         self.current_row = 0;
         let db_name = db_name_from_path(self.conn.db_file_path());
         self.rows = vec![vec![
-            Value::from_i64(16384),           // oid
+            Value::from_i64(DATABASE_OID),    // oid
             Value::build_text(db_name),       // datname
             Value::from_i64(10),              // datdba (bootstrap superuser OID)
             Value::from_i64(6),               // encoding (UTF8)
@@ -3636,153 +3913,6 @@ impl InternalVirtualTable for PgGetTableDefTable {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// pg_get_constraintdef / pg_get_indexdef helper functions
-// ──────────────────────────────────────────────────────────────────────
-
-/// Format a referential action character code to SQL clause text.
-#[allow(dead_code)]
-fn ref_act_to_sql(code: &str) -> &'static str {
-    match code {
-        "c" => "CASCADE",
-        "n" => "SET NULL",
-        "d" => "SET DEFAULT",
-        "r" => "RESTRICT",
-        _ => "NO ACTION",
-    }
-}
-
-/// Look up a constraint by OID and return its definition string.
-/// Uses the same OID assignment as PgConstraintCursor::load_constraints.
-#[allow(dead_code)]
-pub fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option<String> {
-    let schema = conn.current_schema();
-    let tables = user_tables_sorted(&schema);
-    let num_tables = tables.len() as i64;
-
-    // Build index_name -> index_oid map (same as pg_constraint)
-    let mut next_index_oid = USER_TABLE_OID_START + num_tables;
-    for (table_name, _) in &tables {
-        for idx in schema.get_indices(table_name) {
-            if !idx.ephemeral {
-                next_index_oid += 1;
-            }
-        }
-    }
-
-    let mut constraint_oid = next_index_oid;
-
-    for (_, table) in &tables {
-        let btree = match table.as_ref() {
-            Table::BTree(bt) => bt,
-            _ => continue,
-        };
-
-        // Synthesized PK for rowid-alias tables
-        let has_pk_in_unique_sets = btree.unique_sets.iter().any(|us| us.is_primary_key);
-        if !has_pk_in_unique_sets && !btree.primary_key_columns.is_empty() {
-            if constraint_oid == target_oid {
-                let cols: Vec<String> = btree
-                    .primary_key_columns
-                    .iter()
-                    .map(|(name, _)| name.clone())
-                    .collect();
-                return Some(format!("PRIMARY KEY ({})", cols.join(", ")));
-            }
-            constraint_oid += 1;
-        }
-
-        // PK / UNIQUE from unique_sets
-        for us in &btree.unique_sets {
-            if constraint_oid == target_oid {
-                let col_names: Vec<&str> = us.columns.iter().map(|c| c.name.as_str()).collect();
-                let kw = if us.is_primary_key {
-                    "PRIMARY KEY"
-                } else {
-                    "UNIQUE"
-                };
-                return Some(format!("{kw} ({})", col_names.join(", ")));
-            }
-            constraint_oid += 1;
-        }
-
-        // FK constraints
-        for fk in &btree.foreign_keys {
-            if constraint_oid == target_oid {
-                let child_cols = fk.child_columns.join(", ");
-                let parent_cols = fk.parent_columns.join(", ");
-                let mut def = format!(
-                    "FOREIGN KEY ({child_cols}) REFERENCES {}({parent_cols})",
-                    fk.parent_table
-                );
-                let on_update = ref_act_to_char(&fk.on_update);
-                let on_delete = ref_act_to_char(&fk.on_delete);
-                if on_update != "a" {
-                    def.push_str(&format!(" ON UPDATE {}", ref_act_to_sql(on_update)));
-                }
-                if on_delete != "a" {
-                    def.push_str(&format!(" ON DELETE {}", ref_act_to_sql(on_delete)));
-                }
-                return Some(def);
-            }
-            constraint_oid += 1;
-        }
-
-        // CHECK constraints
-        for chk in &btree.check_constraints {
-            if constraint_oid == target_oid {
-                return Some(format!("CHECK ({})", chk.expr));
-            }
-            constraint_oid += 1;
-        }
-    }
-
-    None
-}
-
-/// Look up an index by OID and return its definition (CREATE INDEX ...).
-/// Uses the same OID assignment as PgIndexCursor::load_indexes / PgClassTable.
-#[allow(dead_code)]
-pub fn pg_get_indexdef(conn: &Connection, target_oid: i64) -> Option<String> {
-    let schema = conn.current_schema();
-    let tables = user_tables_sorted(&schema);
-    let num_tables = tables.len() as i64;
-
-    let mut index_oid = USER_TABLE_OID_START + num_tables;
-    for (table_name, _) in &tables {
-        for idx in schema.get_indices(table_name) {
-            if idx.ephemeral {
-                continue;
-            }
-            if index_oid == target_oid {
-                let unique = if idx.unique { "UNIQUE " } else { "" };
-                let cols: Vec<String> = idx
-                    .columns
-                    .iter()
-                    .map(|col| {
-                        if let Some(expr) = &col.expr {
-                            expr.to_string()
-                        } else {
-                            col.name.clone()
-                        }
-                    })
-                    .collect();
-                let mut def = format!(
-                    "CREATE {unique}INDEX {} ON {table_name} USING btree ({})",
-                    idx.name,
-                    cols.join(", ")
-                );
-                if let Some(where_clause) = &idx.where_clause {
-                    def.push_str(&format!(" WHERE {where_clause}"));
-                }
-                return Some(def);
-            }
-            index_oid += 1;
-        }
-    }
-
-    None
-}
-
 // TODO: Fix tests to use correct API
 #[cfg(test)]
 #[allow(dead_code)]
@@ -4302,5 +4432,79 @@ mod tests {
                 _ => {}
             }
         }
+    }
+}
+
+/// NO SILENT DIALECT SWITCH (lead class, 2026-10-17): text the PostgreSQL parser parses is never
+/// read again as SQLite; a translation failure is an error. Only text marked as this frontend's or
+/// the engine's own SQLite takes the SQLite parse.
+#[cfg(test)]
+mod dialect_switch_tests {
+    use super::*;
+
+    /// A PG statement whose translation fails but whose text is valid SQLite with another meaning
+    /// (`?1`: a prefix operator to PostgreSQL, which the translator refuses; a parameter to
+    /// SQLite) is an error, not a SQLite statement.
+    #[test]
+    fn a_pg_statement_whose_translation_fails_is_an_error() {
+        let sql = "SELECT ?1";
+        // The premise, so the red cannot pass vacuously: PostgreSQL parses it, the translator
+        // refuses it, and SQLite reads it.
+        let parsed = turso_pg_parser::parse(sql).expect("premise: libpg_query parses it");
+        assert!(
+            turso_pg_parser::translator::PostgreSQLTranslator::new()
+                .translate(&parsed)
+                .is_err(),
+            "premise: the translator refuses it"
+        );
+        assert!(
+            turso_core::dialect::sqlite::parse(sql).is_ok(),
+            "premise: SQLite reads it"
+        );
+        assert!(
+            PostgresDialect.parse(sql).is_err(),
+            "a PG statement whose translation failed was read as SQLite"
+        );
+    }
+
+    /// Review wire-line3 LOW-2: a table created before the marker refusal (f8f0d4b13) may be
+    /// stored as client text that starts with the SQLite marker. Its replay text (VACUUM) must not
+    /// start with the marker, or the replay reads the client's PostgreSQL DDL as SQLite.
+    #[test]
+    fn a_stored_marker_led_table_replays_as_postgresql() {
+        let stored = format!("{STORED_PG_SCHEMA_PREFIX}{SQLITE_TEXT_MARKER}CREATE TABLE t (x int)");
+        let replay = PostgresDialect.table_sql_for_replay(&stored).unwrap();
+        assert!(
+            !replay.trim_start().starts_with(SQLITE_TEXT_MARKER.trim_end()),
+            "the replay text starts with the SQLite marker: {replay:?}"
+        );
+    }
+
+    /// The wire line review M3: statements whose plain translation is right parse Ok through the
+    /// dialect: a CTE referenced with an alias column list (resolved with no lookup), and an
+    /// INSERT holding the string 'default' (no DEFAULT keyword). 92257e453's refusal list refused
+    /// both.
+    #[test]
+    fn a_cte_alias_and_a_default_string_parse() {
+        for sql in [
+            "WITH c(a) AS (SELECT 1) SELECT p FROM c AS x(p)",
+            "INSERT INTO t VALUES (1, 'default')",
+        ] {
+            assert!(
+                matches!(PostgresDialect.parse(sql), Ok((Some(_), _))),
+                "{sql}: {:?}",
+                PostgresDialect.parse(sql).err()
+            );
+        }
+    }
+
+    /// Text marked as this frontend's own SQLite takes the SQLite parse. (Unmarked text that
+    /// libpg_query rejects, such as a PRAGMA, still falls back to SQLite until the engine's typed
+    /// text kind lands at integration; nothing here asserts otherwise: review wire-line2 LOW-9.)
+    #[test]
+    fn marked_text_takes_the_sqlite_parse() {
+        let pragma = "PRAGMA foreign_keys";
+        assert!(PostgresDialect.parse(&format!("{SQLITE_TEXT_MARKER}{pragma}")).is_ok());
+        assert!(PostgresDialect.parse(&format!("{SQLITE_TEXT_MARKER}SELECT ?1")).is_ok());
     }
 }

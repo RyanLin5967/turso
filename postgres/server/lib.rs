@@ -158,6 +158,8 @@ impl<'a> Backoff<'a> {
     /// A post-write Busy must finish: dropping it can commit its rows, so reporting 57014
     /// would tell the client a committed write failed (C37 M2, lead ruling for C42).
     fn wait_for_commit_completion(&mut self) -> bool {
+        #[cfg(test)]
+        commit_busy_test::observed();
         self.wait_in(WaitMode::CommitCompletion)
             .expect("commit completion does not check statement interrupts")
     }
@@ -169,16 +171,53 @@ impl<'a> Backoff<'a> {
         let deadline = *self.deadline.get_or_insert(now + self.lock_wait);
         let delay =
             std::time::Duration::from_millis(DELAYS_MS[self.attempt.min(DELAYS_MS.len() - 1)]);
+        #[cfg(test)]
+        let delay = commit_busy_test::floor(&mode, delay);
         self.attempt += 1;
-        if now + delay > deadline {
+        // The last wait ends AT the deadline, so the whole lock wait is waited, as PostgreSQL's
+        // lock_timeout waits it: a delay that would pass it was skipped, giving up as much as the
+        // next delay early (measured: 55P03 after 234 ms of a 300 ms lock_timeout, iccad11).
+        if now >= deadline {
             return Ok(false);
         }
+        let delay = delay.min(deadline - now);
         let waits = &self
             .interrupts
             .expect("a waiting backoff has a session")
             .waits;
         drop(waits.wait_while(waits.uses(), now + delay, mode, |_| true)?);
         Ok(true)
+    }
+}
+
+/// Test-only instruments of the post-write Busy wait, on the waiting thread (integ-rev-1017: the
+/// timeout test raced its 1 ms deadline against parse and prepare, so it was cancelled before any
+/// Busy). `observed` counts the post-write Busy waits; `floor` makes each such wait last at least
+/// the armed floor, so a statement_timeout can expire INSIDE it. Off (0) unless a test arms it.
+#[cfg(test)]
+mod commit_busy_test {
+    use std::cell::Cell;
+    thread_local! {
+        static WAITS: Cell<usize> = const { Cell::new(0) };
+        static FLOOR_MS: Cell<u64> = const { Cell::new(0) };
+    }
+    pub(super) fn observed() {
+        WAITS.with(|w| w.set(w.get() + 1));
+    }
+    pub(super) fn waits() -> usize {
+        WAITS.with(Cell::get)
+    }
+    pub(super) fn arm(floor_ms: u64) {
+        WAITS.with(|w| w.set(0));
+        FLOOR_MS.with(|f| f.set(floor_ms));
+    }
+    pub(super) fn floor(mode: &super::WaitMode<'_>, delay: std::time::Duration) -> std::time::Duration {
+        match mode {
+            super::WaitMode::CommitCompletion => {
+                delay.max(std::time::Duration::from_millis(FLOOR_MS.with(Cell::get)))
+            }
+            _ => delay,
+        }
     }
 }
 
@@ -212,6 +251,103 @@ fn run_waiting(
     }
 }
 
+/// A relation a session's open block holds: the database it is in (the branch's name, empty for
+/// the trunk), its schema when the statement named one (public as main), and its name, lowercase
+/// (the engine's catalog compares names ASCII case folded), with both as the statement wrote them
+/// (libpg_query's: a quoted name as written, dots included), for messages and view lookups.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct BlockRead {
+    db: String,
+    schema: Option<String>,
+    name: String,
+    schema_as_written: Option<String>,
+    name_as_written: String,
+}
+
+impl BlockRead {
+    /// The same relation, by name and by schema when both name one.
+    fn matches(&self, other: &BlockRead) -> bool {
+        self.db == other.db
+            && self.name == other.name
+            && match (&self.schema, &other.schema) {
+                (Some(a), Some(b)) => a == b,
+                _ => true,
+            }
+    }
+}
+
+fn relation(db: &str, schema: Option<&str>, name: &str) -> BlockRead {
+    BlockRead {
+        db: db.to_string(),
+        schema: schema.map(schema_key),
+        name: name.to_ascii_lowercase(),
+        schema_as_written: schema.map(str::to_string),
+        name_as_written: name.to_string(),
+    }
+}
+
+/// A schema's name as [`BlockRead::schema`] keys it: public as main, ASCII case folded.
+fn schema_key(schema: &str) -> String {
+    if schema.eq_ignore_ascii_case("public") {
+        "main".to_string()
+    } else {
+        schema.to_ascii_lowercase()
+    }
+}
+
+/// The statements of `sql` that take PostgreSQL's AccessExclusiveLock, parsed only when the text
+/// names one of their verbs (DROP, ALTER, TRUNCATE; RENAME is an ALTER): a cost gate, as every
+/// such statement spells its verb, and the kind itself is read from the parse tree. None when
+/// there is none.
+fn exclusive_statements(sql: &str) -> Option<Vec<turso_pg_parser::translator::PgExclusiveDdl>> {
+    let names = |word: &[u8]| sql.as_bytes().windows(word.len()).any(|w| w.eq_ignore_ascii_case(word));
+    if !(names(b"drop") || names(b"alter") || names(b"truncate")) {
+        return None;
+    }
+    let parsed = turso_pg_parser::parse(sql).ok()?;
+    let statements = turso_pg_parser::translator::exclusive_ddl(&parsed);
+    (!statements.is_empty()).then_some(statements)
+}
+
+/// What one [`turso_pg_parser::translator::PgLockTarget`] locks, resolved in the dropping
+/// session's database: a relation (an index as its table), or every relation of a schema.
+/// Unresolved for an index no schema holds (the statement fails on its own).
+enum LockTarget {
+    Relation(BlockRead),
+    Schema(String),
+    Unresolved,
+}
+
+fn lock_target(
+    conn: &PgConnection,
+    db: &str,
+    target: &turso_pg_parser::translator::PgLockTarget,
+) -> LockTarget {
+    use turso_pg_parser::translator::PgLockTarget;
+    match target {
+        PgLockTarget::Relation((schema, name)) => LockTarget::Relation(relation(db, schema.as_deref(), name)),
+        PgLockTarget::Index(index) => match conn.index_relation(index) {
+            Some((schema, table)) => LockTarget::Relation(relation(db, schema.as_deref(), &table)),
+            None => LockTarget::Unresolved,
+        },
+        PgLockTarget::Schema(schema) => LockTarget::Schema(schema.clone()),
+    }
+}
+
+/// Whether a read holds what `target` locks: a relation by [`BlockRead::matches`]; a schema when
+/// the read names it, or names no schema and the schema holds a relation of its name (read in
+/// the dropping session's catalog).
+fn lock_target_holds(conn: &PgConnection, target: &LockTarget, read: &BlockRead) -> bool {
+    match target {
+        LockTarget::Relation(t) => t.matches(read),
+        LockTarget::Schema(schema) => match &read.schema {
+            Some(s) => *s == schema_key(schema),
+            None => conn.schema_holds_relation(schema, &read.name_as_written),
+        },
+        LockTarget::Unresolved => false,
+    }
+}
+
 /// What every session of one server shares.
 struct Shared {
     db: Arc<Database>,
@@ -230,6 +366,16 @@ struct Shared {
     /// Each live session's interrupt flags by its BackendKeyData (process id, secret key), for a
     /// CancelRequest on another connection to stop its statement.
     cancels: Mutex<std::collections::HashMap<(i32, i32), std::sync::Weak<Interrupts>>>,
+    /// The relations each session's open block has read or parsed, by its key: PostgreSQL holds
+    /// an AccessShareLock on each to the block's end, so another session's DROP TABLE of one waits
+    /// its lock_timeout and is 55P03 (lead ruling 2026-10-18, pg18-rev-bl3.out #19: ours dropped
+    /// it, and the reader's next statement in its block was 42P01). `block_readers` counts the
+    /// sessions with an entry, so no DROP pays the lock while none does.
+    block_reads: Mutex<std::collections::HashMap<(i32, i32), Vec<BlockRead>>>,
+    block_readers: AtomicUsize,
+    /// The directory whose files a client's COPY FROM 'file' may read (--copy-from-dir), as its
+    /// real path; None, no file (review wire-quote LOW-3).
+    copy_from_dir: Option<std::path::PathBuf>,
     /// The next session's process id.
     next_pid: std::sync::atomic::AtomicI32,
     /// How long a client has to complete its startup (TursoPgServer::with_startup_timeout).
@@ -402,6 +548,14 @@ enum BranchUse {
 }
 
 impl Shared {
+    /// What a session's COPY FROM 'file' may read ([`TursoPgServer::with_copy_from_dir`]).
+    fn server_files(&self) -> turso_pg::ServerFiles {
+        match &self.copy_from_dir {
+            Some(dir) => turso_pg::ServerFiles::Under(dir.clone()),
+            None => turso_pg::ServerFiles::None,
+        }
+    }
+
     fn new(
         db: Arc<Database>,
         db_file: String,
@@ -418,6 +572,9 @@ impl Shared {
             in_use_waiters: AtomicUsize::new(0),
             in_use_wait: IN_USE_WAIT,
             cancels: Mutex::new(std::collections::HashMap::new()),
+            block_reads: Mutex::new(std::collections::HashMap::new()),
+            block_readers: AtomicUsize::new(0),
+            copy_from_dir: None,
             next_pid: std::sync::atomic::AtomicI32::new(1),
             startup_timeout: std::time::Duration::from_secs(DEFAULT_AUTHENTICATION_TIMEOUT_S),
             sessions: Arc::new(SessionSockets::default()),
@@ -619,6 +776,16 @@ impl TursoPgServer {
             interrupt_count,
             threads: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Grant client COPY FROM 'file' the files under `dir` (its real path, resolved now). With
+    /// no grant a branch server reads no file for a client (42501).
+    pub fn with_copy_from_dir(mut self, dir: &std::path::Path) -> std::io::Result<Self> {
+        let real = std::fs::canonicalize(dir)?;
+        Arc::get_mut(&mut self.shared)
+            .expect("set before the server runs")
+            .copy_from_dir = Some(real);
+        Ok(self)
     }
 
     /// How long a client has to complete its startup (PostgreSQL's authentication_timeout).
@@ -1361,6 +1528,11 @@ struct SessionState {
     /// A statement failed inside a transaction block: as in PostgreSQL, everything but the block's
     /// end (or a ROLLBACK TO SAVEPOINT) is refused with 25P02 until then.
     aborted: bool,
+    /// The open block's savepoints, innermost last, each with how many block reads the session
+    /// held when it was set: a ROLLBACK TO one releases the reads taken after it, as PostgreSQL
+    /// releases a subtransaction's locks, and an error releases the innermost subtransaction's
+    /// reads, or every read when there is none (wire-rev-uw2 LOW; round1-pg-all.txt r07, r08).
+    read_marks: Vec<(String, usize)>,
     /// The branch a switch just left, released in [`Shared`]'s map when the switch's statement ends.
     left: Option<compact_str::CompactString>,
     /// The session's connection is in the implicit transaction block PostgreSQL wraps a
@@ -1382,6 +1554,10 @@ struct SessionState {
     /// The named portals that ran to completion without rows, or failed: a second Execute of one
     /// is 55000, never a second run (wire review 12 item 5).
     done_portals: std::collections::HashSet<String>,
+    /// The named portals bound and not yet run to completion or closed, with their statement's
+    /// text: each holds the relations it reads, so a DROP TABLE of one is 55006 as in PostgreSQL
+    /// (lead ruling 2026-10-18, pg18-rev-bl1.out #19; [`Session::ddl_of_a_held_relation`]).
+    held_portals: std::collections::HashMap<String, String>,
     /// The completion tag of each query portal that returned all its rows (its verb's, `SELECT`,
     /// `INSERT 0`, ...), which a further Execute answers with 0 rows, as PostgreSQL does (wire
     /// review 15 item 17: it answered SELECT 0 for every portal).
@@ -1436,9 +1612,8 @@ struct QueryFailure {
 /// so its identity cannot be reused by a later snapshot: review wire-rework B-L2, the version
 /// number could repeat after a ROLLBACK TO), and the session's search path, which translation
 /// resolves unqualified names by (B-H1). A kept statement is reused only under an equal key. The
-/// engine's own settings (foreign_keys and the PRAGMA-level ones) are not in it: the engine
-/// re-prepares a statement whose prepare generation they moved (B-H2's root is that reprepare,
-/// fastest-engine's).
+/// engine's own settings (foreign_keys and the PRAGMA-level ones) and its attached and temp
+/// schemas reach it through `generation`, the engine's prepare generation (E-H1).
 struct PrepareKey {
     conn: Arc<turso_core::Connection>,
     schema: Arc<turso_core::schema::Schema>,
@@ -1601,7 +1776,7 @@ impl Session {
     }
 
     fn open_trunk(&self) -> SqlResult<PgConnection> {
-        let conn = PgConnection::new(self.shared.db.connect().map_err(|e| engine_info(&e))?);
+        let conn = PgConnection::new_server(self.shared.db.connect().map_err(|e| engine_info(&e))?, self.shared.server_files());
         self.arm(conn.inner());
         attach_schema_files(&conn, &self.shared.db_file);
         Ok(conn)
@@ -1621,8 +1796,150 @@ impl Session {
     /// A named portal's statement ran to completion without rows, or failed: it does not run again.
     fn portal_done(&self, name: &str) {
         if name != DEFAULT_NAME {
-            self.state().done_portals.insert(name.to_string());
+            let mut st = self.state();
+            st.done_portals.insert(name.to_string());
+            st.held_portals.remove(name);
         }
+    }
+
+    /// A statement that would drop or rewrite a relation this session's own open named portal
+    /// reads: PostgreSQL's CheckTableNotInUse answer, 55006, naming that relation (recorded:
+    /// pg18-rev-bl1.out #19; reviews/uw2-raws/round1-pg-all.txt s01-s16): DROP TABLE, DROP SCHEMA
+    /// ... CASCADE, ALTER TABLE and TRUNCATE ([`turso_pg_parser::translator::PgExclusiveVerb::in_use_verb`]); RENAME, DROP
+    /// INDEX and DROP VIEW run under the portal, as there. Free unless a named portal is held and
+    /// the text names one of the verbs: then the statement and each held portal's statement are
+    /// parsed, the portal's relations closed under its views
+    /// ([`turso_pg::PgConnection::relations_through_views`]), and matched as [`lock_target_holds`]
+    /// matches. BLIND SPOTS: a held portal's function body is not looked through, and two
+    /// schemas' tables of one name match when either side is unqualified.
+    fn ddl_of_a_held_relation(&self, conn: &PgConnection, sql: &str) -> Option<Box<ErrorInfo>> {
+        let held: Vec<String> = {
+            let st = self.state();
+            if st.held_portals.is_empty() {
+                return None;
+            }
+            st.held_portals.values().cloned().collect()
+        };
+        let statements = exclusive_statements(sql)?;
+        let db = self.current_db();
+        let mut reads: Vec<BlockRead> = Vec::new();
+        for held_sql in &held {
+            let Ok(parsed) = turso_pg_parser::parse(held_sql) else { continue };
+            let named = turso_pg_parser::translator::named_relations(&parsed);
+            for (schema, name) in conn.relations_through_views(&named) {
+                let read = relation(&db, schema.as_deref(), &name);
+                if !reads.contains(&read) {
+                    reads.push(read);
+                }
+            }
+        }
+        for ddl in &statements {
+            let Some(verb) = ddl.verb.in_use_verb() else { continue };
+            for target in &ddl.targets {
+                let target = lock_target(conn, &db, target);
+                if let Some(read) = reads.iter().find(|r| lock_target_holds(conn, &target, r)) {
+                    let name = match &target {
+                        LockTarget::Relation(t) => &t.name_as_written,
+                        LockTarget::Schema(_) => &read.name_as_written,
+                        LockTarget::Unresolved => continue,
+                    };
+                    return Some(error(
+                        SqlErrorKind::ObjectInUse,
+                        format!("cannot {verb} \"{name}\" because it is being used by active queries in this session"),
+                    ));
+                }
+            }
+        }
+        None
+    }
+
+    /// The database a statement of this session runs in, as [`BlockRead::db`] names it.
+    fn current_db(&self) -> String {
+        self.state().branch.as_ref().map(|(name, _)| name.to_string()).unwrap_or_default()
+    }
+
+    /// Inside a block, the relations the frontend's prepare of a statement named (its one parse)
+    /// are held until the block ends, as PostgreSQL's parse analysis takes AccessShareLock on
+    /// each and keeps it to the transaction's end. Taken after every engine statement and every
+    /// Parse. Free when nothing was named.
+    fn note_block_reads(&self, conn: &PgConnection) {
+        let tables = conn.take_block_reads();
+        if tables.is_empty() {
+            return;
+        }
+        let db = self.current_db();
+        let mut all = self.shared.block_reads.lock().unwrap_or_else(|e| e.into_inner());
+        let mine = all.entry(self.key).or_insert_with(|| {
+            self.shared.block_readers.fetch_add(1, Ordering::Relaxed);
+            Vec::new()
+        });
+        for (schema, name) in tables {
+            let read = relation(&db, schema.as_deref(), &name);
+            if !mine.contains(&read) {
+                mine.push(read);
+            }
+        }
+    }
+
+    /// The block ended (or the session did): its relations are released.
+    fn release_block_reads(&self) {
+        if self.shared.block_readers.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+        let mut all = self.shared.block_reads.lock().unwrap_or_else(|e| e.into_inner());
+        if all.remove(&self.key).is_some() {
+            self.shared.block_readers.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A statement that takes PostgreSQL's AccessExclusiveLock ([`turso_pg_parser::translator::PgExclusiveVerb`]: DROP TABLE,
+    /// VIEW, SEQUENCE or INDEX, DROP SCHEMA ... CASCADE, ALTER TABLE, RENAME, TRUNCATE) on a
+    /// relation another session's open block holds: 55P03, PostgreSQL's answer once its
+    /// lock_timeout passes (recorded: pg18-rev-bl3.out #19; reviews/uw2-raws/round1-pg-all.txt
+    /// x01-x12, round1-pg-run2.txt y01-y09). It is a rerunnable 55P03, so engine_statement waits
+    /// it out on the session's Backoff (its lock_timeout, or the server's lock wait) and answers
+    /// this message at the last attempt. The other sessions' reads are closed under their views
+    /// ([`turso_pg::PgConnection::relations_through_views`], read here, outside the shared lock),
+    /// so a DROP TABLE ... CASCADE of a table a block read through a view waits; an index is its
+    /// table's. Free while no session holds a block's reads, and for any statement whose text
+    /// names none of DROP, ALTER and TRUNCATE (a cost gate only: the kind is the parse tree's).
+    /// BLIND SPOTS: a read in autocommit holds nothing (its statement's own run is the engine's),
+    /// a DDL inside a block does not make a later reader in another session wait, and two
+    /// schemas' tables of one name match when either side is unqualified (it waits, never
+    /// drops under a reader).
+    fn ddl_waits_for_other_readers(&self, conn: &PgConnection, sql: &str) -> Option<Box<ErrorInfo>> {
+        if self.shared.block_readers.load(Ordering::Relaxed) == 0 {
+            return None;
+        }
+        let statements = exclusive_statements(sql)?;
+        let db = self.current_db();
+        let others: Vec<Vec<BlockRead>> = {
+            let all = self.shared.block_reads.lock().unwrap_or_else(|e| e.into_inner());
+            all.iter()
+                .filter(|(key, _)| **key != self.key)
+                .map(|(_, reads)| reads.iter().filter(|r| r.db == db).cloned().collect::<Vec<_>>())
+                .filter(|reads| !reads.is_empty())
+                .collect()
+        };
+        if others.is_empty() {
+            return None;
+        }
+        let targets: Vec<LockTarget> = statements
+            .iter()
+            .flat_map(|ddl| ddl.targets.iter())
+            .map(|t| lock_target(conn, &db, t))
+            .collect();
+        let held = others.iter().any(|reads| {
+            let named: Vec<turso_pg_parser::translator::PgRelationName> = reads
+                .iter()
+                .map(|r| (r.schema_as_written.clone(), r.name_as_written.clone()))
+                .collect();
+            conn.relations_through_views(&named)
+                .iter()
+                .map(|(schema, name)| relation(&db, schema.as_deref(), name))
+                .any(|read| targets.iter().any(|t| lock_target_holds(conn, t, &read)))
+        });
+        held.then(|| error(SqlErrorKind::LockNotAvailable, "canceling statement due to lock timeout".to_string()))
     }
 
     /// The end of an extended-protocol round, at a Sync whether or not its body was well formed
@@ -1635,7 +1952,15 @@ impl Session {
             st.described.clear();
             std::mem::take(&mut st.notices)
         };
-        (self.deliverable(notices), self.transaction_status())
+        let status = self.transaction_status();
+        // A round that ends outside a block has ended every block it ran, an implicit one
+        // included, by whatever path (end_implicit, fail_block, after_implicit, a failure): the
+        // reads they held go (wire-rev-uw2 H2: a multi-statement Query's implicit block kept its
+        // reads to the session's end, and every other session's DROP of one was 55P03).
+        if matches!(status, TransactionStatus::Idle) {
+            self.release_block_reads();
+        }
+        (self.deliverable(notices), status)
     }
 
     /// The ParameterStatus PostgreSQL sends ahead of a ReadyForQuery for a reported setting
@@ -1682,6 +2007,7 @@ impl Session {
         }
         let mut st = self.state();
         st.done_portals.clear();
+        st.held_portals.clear();
         let ended = std::mem::take(&mut st.portals);
         for name in &ended {
             st.bad_result_codes.remove(name);
@@ -1728,7 +2054,7 @@ impl Session {
                 ));
             }
         };
-        let conn = PgConnection::new(conn);
+        let conn = PgConnection::new_server(conn, self.shared.server_files());
         self.arm(conn.inner());
         self.state().branch = Some((branch.into(), conn));
         Ok(())
@@ -1976,6 +2302,7 @@ impl Session {
             if in_tx && conn.inner().get_auto_commit() {
                 let committed = result.is_ok() && verb == TxVerb::Commit && !aborted;
                 conn.tx_event(turso_pg::TxEvent::Ended { committed }, sql);
+                self.release_block_reads();
             } else if in_tx && result.is_ok() && matches!(verb, TxVerb::Chain { .. }) {
                 // AND CHAIN ends the block and opens the next in one statement, so the engine is
                 // never in autocommit between them: the block's end is reported here (C41-M1 /
@@ -1986,6 +2313,7 @@ impl Session {
                 // SETs, not roll them back (review c39799c5d..9e24b455d LOW 5).
                 let committed = matches!(verb, TxVerb::Chain { commit: true }) && !aborted;
                 conn.tx_event(turso_pg::TxEvent::Ended { committed }, sql);
+                self.release_block_reads();
             } else if result.is_ok() {
                 let event = match verb {
                     TxVerb::Savepoint => Some(turso_pg::TxEvent::Savepoint),
@@ -2193,14 +2521,6 @@ impl Session {
                  new one"
                     .to_string(),
             )),
-            None if schema_ddl(sql).is_some_and(|name| !name.eq_ignore_ascii_case("public")) => {
-                Err(error(
-                    SqlErrorKind::FeatureNotSupported,
-                    "schemas other than public are not supported by the branch server: its \
-                     branches cover the one schema (CREATE SCHEMA and DROP SCHEMA are refused)"
-                        .to_string(),
-                ))
-            }
             None => {
                 drop(st);
                 let r = self.engine_statement(&conn, sql, verb, portal, format);
@@ -2261,7 +2581,92 @@ impl Session {
         if result.is_ok() && verb == TxVerb::RollbackTo {
             st.aborted = false;
         }
+        self.mark_block_reads(&mut st, sql, verb, result.is_ok());
         result
+    }
+
+    /// The block reads' savepoint marks after a statement ([`SessionState::read_marks`]): a
+    /// SAVEPOINT marks the reads held, a ROLLBACK TO releases those taken after its savepoint,
+    /// a RELEASE merges, a failed block releases its innermost subtransaction's reads (all of
+    /// them with no savepoint), and a block's end clears the marks.
+    fn mark_block_reads(&self, st: &mut SessionState, sql: &str, verb: TxVerb, ok: bool) {
+        let in_block = match &st.branch {
+            Some((_, conn)) => !conn.inner().get_auto_commit(),
+            None => st.trunk.as_ref().is_some_and(|conn| !conn.inner().get_auto_commit()),
+        };
+        if !in_block {
+            st.read_marks.clear();
+            return;
+        }
+        if !ok {
+            if st.aborted {
+                match st.read_marks.last() {
+                    Some((_, held)) => self.keep_block_reads(*held),
+                    None => {
+                        self.release_block_reads();
+                        // A block with no savepoint that failed is over in PostgreSQL but for
+                        // its ROLLBACK: AbortTransaction releases every lock at the error, the
+                        // statement's write lock too (round1-pg-all.txt r08). The engine kept
+                        // its transaction, and a failed INSERT's write lock with it, so another
+                        // session's DROP was 'Database is busy'. It is rolled back now; the
+                        // session stays failed (25P02) until the client ends the block, which
+                        // answers ROLLBACK. With a savepoint the transaction stays, for ROLLBACK
+                        // TO (BLIND SPOT: a failed subtransaction's write lock is held until then).
+                        let conn = match &st.branch {
+                            Some((_, conn)) => Some(conn.clone()),
+                            None => st.trunk.clone(),
+                        };
+                        if let Some(conn) = conn {
+                            let _ = conn.roll_back_or_break();
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        let name = || turso_pg::savepoint_name(sql);
+        match verb {
+            TxVerb::Savepoint => {
+                if let Some(name) = name() {
+                    let held = self.block_read_count();
+                    st.read_marks.push((name, held));
+                }
+            }
+            TxVerb::RollbackTo => {
+                if let Some(at) = name().and_then(|n| st.read_marks.iter().rposition(|(m, _)| *m == n)) {
+                    let held = st.read_marks[at].1;
+                    st.read_marks.truncate(at + 1);
+                    self.keep_block_reads(held);
+                }
+            }
+            TxVerb::Release => {
+                if let Some(at) = name().and_then(|n| st.read_marks.iter().rposition(|(m, _)| *m == n)) {
+                    st.read_marks.truncate(at);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// How many block reads the session holds.
+    fn block_read_count(&self) -> usize {
+        if self.shared.block_readers.load(Ordering::Relaxed) == 0 {
+            return 0;
+        }
+        let all = self.shared.block_reads.lock().unwrap_or_else(|e| e.into_inner());
+        all.get(&self.key).map_or(0, Vec::len)
+    }
+
+    /// Keep the session's first `held` block reads and release the rest (all of them at 0).
+    fn keep_block_reads(&self, held: usize) {
+        if held == 0 {
+            self.release_block_reads();
+            return;
+        }
+        let mut all = self.shared.block_reads.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(mine) = all.get_mut(&self.key) {
+            mine.truncate(held);
+        }
     }
 
     /// CHECKPOINT is the trunk's, as PostgreSQL's is the cluster's, so a session on a branch runs it
@@ -2349,12 +2754,18 @@ impl Session {
         let conn = self
             .current(&mut self.state())
             .map_err(PgWireError::UserError)?;
-        match conn.parse_step(&parsed.sql, msg).map_err(engine_error)? {
+        // The key is read BEFORE the prepare (the wire line review L5): a change landing during
+        // the compile then makes the key differ, never a stale statement match a fresh key.
+        let key = PrepareKey::of(&conn);
+        let step = conn.parse_step(&parsed.sql, msg);
+        // A Parse inside a block holds what it names (pg18-rev-bl3.out #19).
+        self.note_block_reads(&conn);
+        match step.map_err(engine_error)? {
             Some((stmt, types)) => {
                 parameter_types(&types, declared).map_err(PgWireError::UserError)?;
                 self.state().described.put(Described {
                     conn: conn.inner().clone(),
-                    key: PrepareKey::of(&conn),
+                    key,
                     sql: parsed.sql.clone(),
                     stmt,
                     types,
@@ -2405,11 +2816,15 @@ impl Session {
         // Never the prepare that performs a statement (ALTER ADD CONSTRAINT, COPY FROM, SET,
         // CREATE/DROP SCHEMA): the frontend declines those from the parse, they keep nothing and
         // answer NoData, and Execute performs them once (wire review 2 item 2, review 3 item 2).
-        match conn.prepare_for_describe(sql) {
+        // Read before the prepare, as in parse_step (L5).
+        let key = PrepareKey::of(&conn);
+        let prepared = conn.prepare_for_describe(sql);
+        self.note_block_reads(&conn);
+        match prepared {
             Ok(Some((stmt, types))) => {
                 self.state().described.put(Described {
                     conn: conn.inner().clone(),
-                    key: PrepareKey::of(&conn),
+                    key,
                     sql: sql.to_string(),
                     stmt,
                     types,
@@ -2468,6 +2883,12 @@ impl Session {
         if self.state().described.for_sql(sql).is_none() {
             return None;
         }
+        // The schema another session published is taken first, as describe_prepare does (the
+        // wire line review M1: Execute checked a kept statement against a schema it had not
+        // refreshed, so cross-session DDL between Parse and Execute reached the engine's
+        // re-prepare). BLIND SPOT, the engine's: maybe_update_schema compares the main schema's
+        // version only, so another session's DDL in an attached schema is not seen here.
+        conn.inner().maybe_update_schema();
         let key = PrepareKey::of(conn);
         let mut st = self.state();
         st.described.take(sql, &key).map(|d| (d.stmt, d.types))
@@ -2567,14 +2988,22 @@ impl Session {
             info,
             started: None,
         };
+        if let Some(info) = self.ddl_of_a_held_relation(conn, sql) {
+            return Err(unprepared(info));
+        }
+        if let Some(info) = self.ddl_waits_for_other_readers(conn, sql) {
+            return Err(unprepared(info));
+        }
+
         let described = portal.and_then(|_| self.take_described(conn, sql));
         let (mut stmt, types) = match described {
             Some(kept) => kept,
-            None => conn
-                .prepare_typed(sql)
-                .map_err(|e| unprepared(engine_info(&e)))?,
+            None => {
+                let prepared = conn.prepare_typed(sql);
+                self.note_block_reads(conn);
+                prepared.map_err(|e| unprepared(engine_info(&e)))?
+            }
         };
-        self.shared.cleanup_dropped_schema_file(sql);
         // A statement that ends the transaction, as the translator read it, is never stepped
         // again, whatever the verb reader made of its text (wire review 13 item 1).
         if types.commits || types.rolls_back {
@@ -2769,7 +3198,7 @@ impl Session {
                         let opened = self
                             .waiting(|| self.shared.db.connect_named(&name))
                             .map_err(|e| self.switch_error(&name, &e, "ERROR"))?;
-                        let next = PgConnection::new(opened);
+                        let next = PgConnection::new_server(opened, self.shared.server_files());
                         self.arm(next.inner());
                         next.adopt_session_of(conn);
                         st.branch = Some((name.as_ref().into(), next));
@@ -2794,7 +3223,7 @@ impl Session {
                             return Err(self.switch_error(&name, &e, "ERROR"));
                         }
                     };
-                    let next = PgConnection::new(opened);
+                    let next = PgConnection::new_server(opened, self.shared.server_files());
                     self.arm(next.inner());
                     next.adopt_session_of(conn);
                     st.branch.replace((name.as_ref().into(), next))
@@ -2907,6 +3336,7 @@ impl Session {
     /// terminates or goes, before its socket closes (serve_session), and again, as a no-op, when
     /// the session drops.
     fn end(&self) {
+        self.release_block_reads();
         let mut st = self.state();
         st.described.clear();
         st.implicit = false;
@@ -2928,57 +3358,6 @@ impl Drop for Session {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&self.key);
-    }
-}
-
-impl Shared {
-    /// After a DROP SCHEMA query succeeds, delete the schema's database file.
-    /// Uses simple string matching to detect DROP SCHEMA statements.
-    fn cleanup_dropped_schema_file(&self, query: &str) {
-        if self.db_file == ":memory:" {
-            return;
-        }
-        // Simple detection: look for DROP SCHEMA pattern. Every other statement is turned away
-        // before the lowered copy, so a write pays no allocation here (L5).
-        let head = query.trim_start().as_bytes();
-        if head.len() < 4 || !head[..4].eq_ignore_ascii_case(b"drop") {
-            return;
-        }
-        let trimmed = query.trim().to_lowercase();
-        if !trimmed.starts_with("drop schema") {
-            return;
-        }
-        // Extract schema name: "drop schema [if exists] <name> [cascade|restrict]"
-        let rest = trimmed.strip_prefix("drop schema").unwrap().trim();
-        let rest = rest
-            .strip_prefix("if exists")
-            .map(|s| s.trim())
-            .unwrap_or(rest);
-        // Take the first word as the schema name
-        let name = rest
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .trim_matches('"');
-        if name.is_empty() || name == "public" {
-            return;
-        }
-        let parent = std::path::Path::new(&self.db_file)
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."));
-        let schema_file = parent.join(format!("turso-postgres-schema-{name}.db"));
-        if schema_file.exists() {
-            if let Err(e) = std::fs::remove_file(&schema_file) {
-                tracing::warn!("Failed to delete schema file {:?}: {}", schema_file, e);
-            } else {
-                tracing::info!("Deleted schema file {:?}", schema_file);
-            }
-            // Also clean up WAL and SHM files
-            let wal = schema_file.with_extension("db-wal");
-            let shm = schema_file.with_extension("db-shm");
-            let _ = std::fs::remove_file(wal);
-            let _ = std::fs::remove_file(shm);
-        }
     }
 }
 
@@ -3324,31 +3703,6 @@ fn commit_failed(conn: &PgConnection, mut info: Box<ErrorInfo>) -> Box<ErrorInfo
     info
 }
 
-/// The schema a CREATE SCHEMA or DROP SCHEMA names (`[IF [NOT] EXISTS] name`, quotes dropped), if
-/// `sql` is one. In server mode only public passes (wire review 1 item 16): each session attaches
-/// the schema files that exist when it opens, so a schema created or dropped while others run
-/// leaves sessions that disagree about it, and a branch would not cover it.
-fn schema_ddl(sql: &str) -> Option<&str> {
-    let mut words = sql
-        .split(|c: char| c.is_ascii_whitespace() || c == ';')
-        .filter(|w| !w.is_empty());
-    let verb = words.next()?;
-    if !(verb.eq_ignore_ascii_case("CREATE") || verb.eq_ignore_ascii_case("DROP")) {
-        return None;
-    }
-    if !words.next()?.eq_ignore_ascii_case("SCHEMA") {
-        return None;
-    }
-    let mut name = words.next()?;
-    while ["IF", "NOT", "EXISTS"]
-        .iter()
-        .any(|k| name.eq_ignore_ascii_case(k))
-    {
-        name = words.next()?;
-    }
-    Some(name.trim_matches('"'))
-}
-
 /// Whether `sql` is CHECKPOINT alone, which the server runs itself ([`Session::checkpoint`]), read
 /// as PostgreSQL's lexer reads it: whitespace (a vertical tab included), comments and empty
 /// statements around it. A comment was a second word, so `CHECKPOINT -- x` went to the engine as
@@ -3466,9 +3820,10 @@ fn inline_one_row(f: &str, pg_type: &Type, value: &[u8]) -> Option<pgwire::messa
         && m.push(&0i32.to_be_bytes())
         && m.push(&0i16.to_be_bytes())
         && m.push(&pg_type.oid().to_be_bytes())
-        // pgwire's FieldInfo sends type size and modifier 0 (its From<&FieldInfo>), and so must this.
-        && m.push(&0i16.to_be_bytes())
-        && m.push(&0i32.to_be_bytes())
+        // The type's size and no modifier, as pgwire's From<&FieldInfo> sends them (vendored
+        // change 12), so the inline reply stays byte for byte pgwire's.
+        && m.push(&pgwire::api::results::type_size(pg_type.oid()).to_be_bytes())
+        && m.push(&(-1i32).to_be_bytes())
         && m.push(&0i16.to_be_bytes())
         && m.push(b"D")
         && m.push(&(i32::try_from(d_len).ok()?).to_be_bytes())
@@ -4249,6 +4604,12 @@ impl ExtendedQueryHandler for Session {
             if !st.portals.contains(&portal.name) {
                 st.portals.push(portal.name.clone());
             }
+            if portal.name != DEFAULT_NAME && portal.statement.statement.call.is_none() {
+                st.held_portals
+                    .insert(portal.name.clone(), portal.statement.statement.sql.clone());
+            } else {
+                st.held_portals.remove(&portal.name);
+            }
         }
         client.portal_store().put_portal(Arc::new(portal));
         client
@@ -4446,6 +4807,11 @@ impl ExtendedQueryHandler for Session {
         if name == DEFAULT_NAME && !suspended {
             client.portal_store().rm_portal(name);
         }
+        // Run to completion, a portal no longer holds its relations (PostgreSQL's MarkPortalDone
+        // ends its executor); a suspended one still does.
+        if !suspended {
+            self.state().held_portals.remove(name);
+        }
         Ok(())
     }
 
@@ -4459,7 +4825,10 @@ impl ExtendedQueryHandler for Session {
         let name = message.name.as_deref().unwrap_or(DEFAULT_NAME);
         match message.target_type {
             TARGET_TYPE_BYTE_STATEMENT => client.portal_store().rm_statement(name),
-            TARGET_TYPE_BYTE_PORTAL => client.portal_store().rm_portal(name),
+            TARGET_TYPE_BYTE_PORTAL => {
+                self.state().held_portals.remove(name);
+                client.portal_store().rm_portal(name)
+            }
             _ => {}
         }
         client
@@ -4740,6 +5109,10 @@ fn field_info(
         .map(|i| {
             let name = stmt.get_column_name(i).into_owned();
             let format = result_format(format, i, columns)?;
+            // Type modifier -1 (none) for every column: a declared column's length or precision
+            // (varchar(5) 9, numeric(8,2) 524294) is in its core Column's ty_params, which no
+            // Statement accessor gives (asked of fastest-engine; known red,
+            // row_descriptions_carry_postgresqls_type_sizes_and_modifiers).
             Ok(FieldInfo::new(name, None, None, pg_type(i), format))
         })
         .collect()
@@ -4765,6 +5138,19 @@ fn resolve_pg_type_for_column(stmt: &turso_core::Statement, idx: usize) -> Type 
     // libpq/psql/JDBC see structured data they can introspect.
     let mut base = match info.kind {
         ColumnTypeKind::Struct | ColumnTypeKind::Union => Type::JSONB,
+        // The engine's exact numeric (a NUMERIC(p, s) column) is PostgreSQL's numeric: it was
+        // float8 by the name table below, whose NUMERIC is the SQLite affinity of a bare NUMERIC
+        // (a Builtin, stored as a float). Found by the E5' differential (wire-e5-f312d1e13).
+        ColumnTypeKind::Custom if info.declared_name.eq_ignore_ascii_case("numeric") => Type::NUMERIC,
+        // A smallint column is PostgreSQL's int2: the name table below gives the SQLite affinity,
+        // INTEGER, int4 (wirefuzz vs PG 18.6, wire-fuzz1/2). Binary int2 refuses a stored value
+        // past its range (22003); the engine does not refuse one on INSERT (PGDIV-INT-RANGE).
+        _ if ["smallint", "int2", "smallserial"]
+            .iter()
+            .any(|n| info.declared_name.eq_ignore_ascii_case(n)) =>
+        {
+            Type::INT2
+        }
         _ => {
             // Prefer the declared name (the user-visible type), then fall
             // back to the resolved base for custom/domain types whose
@@ -6965,11 +7351,18 @@ mod tests {
                 }
                 let text = std::fs::read_to_string(&path).unwrap();
                 let rel = path.strip_prefix(&root).unwrap().to_string_lossy().to_string();
-                // A file some lib.rs of these crates declares as `#[cfg(test)] mod <stem>;`.
+                // A file some lib.rs of these crates declares as a test module: `mod <stem>;` under
+                // any test cfg, `#[cfg(test)]` or `#[cfg(all(test, unix))]` alike (the integration
+                // review's LOW-1: the frontend's stack_guard_tests was scanned as product).
                 let stem = rel.trim_end_matches(".rs").to_string();
                 let declared_test = [server.join("lib.rs"), root.join("lib.rs")].iter().any(|lib| {
                     std::fs::read_to_string(lib)
-                        .map(|l| l.contains(&format!("#[cfg(test)]\nmod {stem};")))
+                        .map(|l| {
+                            let lines: Vec<&str> = l.lines().collect();
+                            lines.windows(2).any(|w| {
+                                is_test_cfg(w[0]) && w[1].trim() == format!("mod {stem};")
+                            })
+                        })
                         .unwrap_or(false)
                 });
                 if declared_test {
@@ -6995,6 +7388,406 @@ mod tests {
         assert!(violations.is_empty(), "SQLSTATE literals outside the table:\n{}", violations.join("\n"));
     }
 
+    /// Review wire-quote MED-3's class: every server session refuses schema DDL by the statement's
+    /// kind (PgConnection::new_server), so the server's product code opens none with
+    /// PgConnection::new, which would let a schema be created or dropped on the server.
+    #[test]
+    fn every_server_session_is_a_server_session() {
+        let product = strip_test_modules(include_str!("lib.rs"));
+        let opened = product.matches("PgConnection::new_server(").count();
+        assert!(opened >= 4, "premise: the server opens its sessions in {opened} places");
+        let plain: Vec<usize> = product
+            .lines()
+            .enumerate()
+            // Every spelling: turso_pg's re-export `turso_pg::Connection::new(` too (wire-rev-uw1 M5).
+            .filter(|(_, l)| l.contains("Connection::new(") && !l.trim_start().starts_with("//"))
+            .map(|(n, _)| n + 1)
+            .collect();
+        assert!(plain.is_empty(), "sessions opened with PgConnection::new at lines {plain:?}");
+    }
+
+    /// Review wire-quote HIGH-1: every engine name built from a libpg_query-sourced string goes
+    /// through ONE constructor, turso_pg_parser::translator::pg_name (Name::exact: the string is
+    /// the name, never re-read as quoting). Name::from_string re-reads a leading quote, so it
+    /// appears in none of the translator's or the frontend's product sources.
+    #[test]
+    fn libpg_query_names_take_the_one_name_constructor() {
+        let mut found = Vec::new();
+        for (file, source) in [
+            ("parser/translator.rs", include_str!("../parser/translator.rs")),
+            ("frontend/session.rs", include_str!("../frontend/session.rs")),
+            ("frontend/catalog.rs", include_str!("../frontend/catalog.rs")),
+            ("frontend/functions.rs", include_str!("../frontend/functions.rs")),
+            ("frontend/lib.rs", include_str!("../frontend/lib.rs")),
+            ("frontend/aliases.rs", include_str!("../frontend/aliases.rs")),
+            ("frontend/copy.rs", include_str!("../frontend/copy.rs")),
+            ("frontend/information_schema.rs", include_str!("../frontend/information_schema.rs")),
+            ("frontend/pg_settings.rs", include_str!("../frontend/pg_settings.rs")),
+            ("frontend/phase.rs", include_str!("../frontend/phase.rs")),
+            ("frontend/result_types.rs", include_str!("../frontend/result_types.rs")),
+            ("frontend/sqlstate.rs", include_str!("../frontend/sqlstate.rs")),
+        ] {
+            for (n, line) in source.lines().enumerate() {
+                if line.contains("Name::from_string(") && !line.trim_start().starts_with("//") {
+                    found.push(format!("{file}:{}: {}", n + 1, line.trim()));
+                }
+            }
+        }
+        assert!(found.is_empty(), "names re-read as quoting:\n{}", found.join("\n"));
+    }
+
+    /// Review wire-line3 HIGH-1, the lead's class: ONE quoting function for every identifier and
+    /// literal the frontend pastes into engine text (catalog::quote_ident, catalog::quote_literal).
+    /// No format! string in the frontend's product sources that builds SQL (it starts with an SQL
+    /// keyword) wraps a placeholder in quotes itself (`\"{..}\"` or `'{..}'`), and no format! string
+    /// is a bare quoting fragment, outside the two quoting functions. COPY's `format!("\"{c}\"")`
+    /// pasted client column names unescaped into marked SQLite text.
+    #[test]
+    fn engine_text_is_quoted_by_the_one_quoting_function() {
+        const KEYWORDS: [&str; 18] = [
+            "SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ATTACH", "DETACH", "PRAGMA",
+            "ALTER", "SAVEPOINT", "RELEASE", "ROLLBACK", "WITH", "BEGIN", "COMMIT", "VACUUM", "REINDEX",
+        ];
+        let frontend = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../frontend");
+        let mut wrong = Vec::new();
+        let mut literals_seen = 0;
+        for entry in std::fs::read_dir(&frontend).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let mut text = strip_test_modules(&std::fs::read_to_string(&path).unwrap());
+            for exempt in ["pub(crate) fn quote_ident(", "pub(crate) fn quote_literal("] {
+                if let Some(start) = text.find(exempt) {
+                    let end = start + text[start..].find("\n}\n").expect("its end");
+                    let kept = "\n".repeat(text[start..end].matches('\n').count());
+                    text.replace_range(start..end, &kept);
+                }
+            }
+            let mut from = 0;
+            while let Some(k) = text[from..].find("format!(") {
+                let at = from + k + "format!(".len();
+                from = at;
+                let rest = text[at..].trim_start();
+                let Some(body) = rest.strip_prefix('"') else { continue };
+                let b = body.as_bytes();
+                let mut e = 0;
+                while e < b.len() && b[e] != b'"' {
+                    if b[e] == b'\\' {
+                        e += 1;
+                    }
+                    e += 1;
+                }
+                let lit = &body[..e.min(body.len())];
+                literals_seen += 1;
+                let fragment = |l: &str| {
+                    let wrapped = |open: &str, close: &str| {
+                        l.match_indices(open).any(|(i, _)| {
+                            l[i + open.len()..].find('}').is_some_and(|j| {
+                                l[i + open.len() + j + 1..].starts_with(close)
+                            })
+                        })
+                    };
+                    wrapped("\\\"{", "\\\"") || wrapped("'{", "'")
+                };
+                let head = lit.trim_start_matches("\\n").trim_start();
+                let sql = KEYWORDS.iter().any(|k| head.starts_with(k)) && !lit.contains(": ");
+                let bare = lit == "\\\"{}\\\"" || lit == "'{}'" || (lit.starts_with("\\\"{") && lit.ends_with("}\\\"") && lit.matches('{').count() == 1);
+                if (sql && fragment(lit)) || bare {
+                    let line = text[..at].matches('\n').count() + 1;
+                    wrong.push(format!("{}:{line}: {lit}", path.display()));
+                }
+            }
+        }
+        assert!(literals_seen > 100, "premise: the scan read {literals_seen} format! strings");
+        assert!(wrong.is_empty(), "engine text quoted by hand:\n{}", wrong.join("\n"));
+    }
+
+    /// Every string literal of `text` (normal and raw, `r#"..."#`), as written between its quotes,
+    /// with its 1-based line. Char literals and comments are skipped.
+    fn string_literals(text: &str) -> Vec<(usize, String)> {
+        let b = text.as_bytes();
+        let (mut out, mut i) = (Vec::new(), 0);
+        let line = |at: usize| text[..at].matches('\n').count() + 1;
+        while i < b.len() {
+            match b[i] {
+                b'/' if b.get(i + 1) == Some(&b'/') => {
+                    i += text[i..].find('\n').unwrap_or(text.len() - i);
+                }
+                b'/' if b.get(i + 1) == Some(&b'*') => {
+                    i += text[i..].find("*/").map_or(text.len() - i, |e| e + 2);
+                }
+                b'\'' => {
+                    // A char literal ('x', '\'', '\u{..}') or a lifetime ('a): skip either.
+                    let rest = &text[i + 1..];
+                    i += 1 + match rest.find('\'') {
+                        Some(e) if e <= 10 && !rest[..e].contains(char::is_whitespace) => e + 1,
+                        _ => 0,
+                    };
+                }
+                b'r' if (b.get(i + 1) == Some(&b'"') || b.get(i + 1) == Some(&b'#'))
+                    && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_')) =>
+                {
+                    let hashes = text[i + 1..].bytes().take_while(|&c| c == b'#').count();
+                    let open = i + 1 + hashes;
+                    if b.get(open) != Some(&b'"') {
+                        i += 1;
+                        continue;
+                    }
+                    let close = format!("\"{}", "#".repeat(hashes));
+                    let end = text[open + 1..].find(&close).map_or(text.len(), |e| open + 1 + e);
+                    out.push((line(i), text[open + 1..end].to_string()));
+                    i = end + close.len();
+                }
+                b'"' => {
+                    let mut e = i + 1;
+                    while e < b.len() && b[e] != b'"' {
+                        e += if b[e] == b'\\' { 2 } else { 1 };
+                    }
+                    out.push((line(i), text[i + 1..e.min(b.len())].to_string()));
+                    i = e + 1;
+                }
+                _ => i += 1,
+            }
+        }
+        out
+    }
+
+    /// Review wire-quote MED-4: the format!-only, keyword-led scan missed every planted evasion
+    /// and never read postgres/parser. This one reads every string literal (format!, format_args!,
+    /// write!, raw strings, plain literals later concatenated) of the frontend AND the translator,
+    /// outside test modules and the quoting functions. A literal is engine text when, past blanks,
+    /// `\n` and the SQLite marker, it starts with an SQL keyword in any case or with a clause
+    /// fragment (` WHERE`, ` AND`, ...); such a literal must not hold a quote character next to a
+    /// placeholder of any form (`'{x}'`, `'%{x}%'`, `\"{s}.{t}\"`, `{x:?}`). And the translator
+    /// builds a string literal only through sql_string (no `Literal::String(format!(` or of a
+    /// literal). Also flagged: `{x:?}` in engine text, an engine literal that ends by opening a
+    /// quote (concatenation), a bare quoted placeholder anywhere, and one placeholder written on
+    /// both sides of another (`{q}{v}{q}`). The head is read in any case, past leading
+    /// placeholders, commas, parens, semicolons, `\r` and SQL comments (wire-rev-uw1 M5,
+    /// wire-rev-uw2 N6). SINCE wire-rev-uw2 N6 (20 evasions led by words the keyword list did not
+    /// name) a quoted placeholder (`'{x}'`, `\"{x}\"`, `\x27{x}`) in ANY literal is engine
+    /// text unless the literal is a client message, an allowlist: at least two lower-case words,
+    /// and, after any PostgreSQL `VERB: ` prefix, no SQL mark (a word only SQL uses in any case,
+    /// an English-ambiguous SQL word in upper case, an operator, `;`, a comment, `', `), or one
+    /// of the hand-read MESSAGES_WITH_SQL_WORDS. The CLI's main.rs is in scope (its \d queries).
+    /// BLIND SPOTS (stated, not covered): a quote in a variable spliced in other ways (`.replace`,
+    /// `+`, a `{}` positional pair), an UNquoted identifier placeholder (`INSERT INTO {} ...`,
+    /// which quote_ident output also fills), lower-case SQL made only of English-ambiguous words
+    /// (`x like '{v}' escape` has `escape`, but `{c} in ('{v}')` has `('`; `{c} like '{v}'
+    /// limit` passes), and files outside postgres/frontend, the translator and the CLI.
+    #[test]
+    fn engine_text_from_any_literal_is_quoted_by_the_one_quoting_function() {
+        // Statement verbs and clause words, matched in any case at the literal's head, past
+        // blanks, an escaped newline, the SQLite marker, any leading placeholders (`{sel} WHERE
+        // ...`) and a leading comma or paren (`", '{v}'"`, a VALUES continuation): wire-rev-uw1 M5.
+        const KEYWORDS: [&str; 44] = [
+            "SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ATTACH", "DETACH", "PRAGMA",
+            "ALTER", "SAVEPOINT", "RELEASE", "ROLLBACK", "WITH", "BEGIN", "COMMIT", "VACUUM",
+            "REINDEX", "VALUES", "SET", "COPY", "CASE", "REPLACE", "EXPLAIN", "ANALYZE", "TRUNCATE",
+            "UPSERT", "WHERE", "AND", "OR", "FROM", "AS", "IN", "ON", "LIKE", "JOIN", "ORDER",
+            "GROUP", "LIMIT", "RETURNING", "HAVING", "UNION", "INTO", "NOT",
+        ];
+        // Clause words whose presence makes a literal SQL even past an exempting colon or phrase.
+        const CLAUSES: [&str; 6] = [" FROM ", " WHERE ", " VALUES", " SET ", " INTO ", " = "];
+        // A client message is the allowlisted case of a literal with a quoted placeholder
+        // (wire-rev-uw2 N6): its text after any PostgreSQL `VERB: ` prefix holds at least two
+        // lower-case words, and no SQL mark: a word only SQL uses (in any case), one of the
+        // English-ambiguous SQL words in upper case, an operator, a separator or a comment.
+        const SQL_ONLY_WORDS: [&str; 26] = [
+            "SELECT", "INSERT", "UPDATE", "PRAGMA", "ATTACH", "DETACH", "SAVEPOINT", "VACUUM",
+            "REINDEX", "TRUNCATE", "RETURNING", "HAVING", "WHERE", "JOIN", "UNION", "VALUES",
+            "ESCAPE", "COLLATE", "GLOB", "REGEXP", "ILIKE", "NULLIF", "COALESCE", "REFERENCES",
+            "UPSERT", "EXPLAIN",
+        ];
+        const SQL_UPPER_WORDS: [&str; 39] = [
+            "DELETE", "CREATE", "DROP", "ALTER", "RELEASE", "ROLLBACK", "WITH", "BEGIN", "COMMIT",
+            "END", "SET", "COPY", "CASE", "WHEN", "THEN", "ELSE", "REPLACE", "AND", "OR", "FROM",
+            "AS", "IN", "ON", "LIKE", "CHECK", "DEFAULT", "CAST", "IS", "NOT", "NULL", "BETWEEN",
+            "ORDER", "GROUP", "LIMIT", "INTO", "TABLE", "INDEX", "VIEW", "CONSTRAINT",
+        ];
+        // Client messages that hold SQL words themselves, each read by hand (the literal's start
+        // as written): an allowlist, so a new one is flagged until it is read. The two COPY
+        // fragments are the `what` of "COPY {what} is not supported".
+        const MESSAGES_WITH_SQL_WORDS: [&str; 5] = [
+            "ALTER TABLE ADD CONSTRAINT: table \\\"{table}\\\" was not created by CREATE TABLE in ",
+            "ALTER TABLE ADD CONSTRAINT: table \\\"{table}\\\" was created by CREATE TABLE AS, so it ",
+            "DELETE ... USING on \\\"{target}\\\", which declares columns named rowid, ",
+            "format \\\"{val}\\\"",
+            "option \\\"{name}\\\"",
+        ];
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files: Vec<_> = std::fs::read_dir(root.join("../frontend"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("rs"))
+            .collect();
+        files.push(root.join("../parser/translator.rs"));
+        // The CLI builds catalog queries for its \d commands (wire-rev-uw2 N6: out of scope).
+        files.push(root.join("../cli/main.rs"));
+        let mut wrong = Vec::new();
+        let mut seen = 0;
+        for path in &files {
+            let mut text = strip_test_modules(&std::fs::read_to_string(path).unwrap());
+            for exempt in [
+                "pub(crate) fn quote_ident(",
+                "pub(crate) fn quote_literal(",
+                "pub(crate) fn pg_quote_literal(",
+                "pub fn sql_string(",
+                "pub fn sql_quoted(",
+            ] {
+                if let Some(start) = text.find(exempt) {
+                    let end = start + text[start..].find("\n}\n").expect("its end");
+                    let kept = "\n".repeat(text[start..end].matches('\n').count());
+                    text.replace_range(start..end, &kept);
+                }
+            }
+            for (line, lit) in string_literals(&text) {
+                seen += 1;
+                let mut head = lit.as_str();
+                loop {
+                    let mut t = head
+                        .trim_start()
+                        .trim_start_matches("\\n")
+                        .trim_start_matches("\\r")
+                        .trim_start_matches("\\t")
+                        .trim_start_matches("\\\n")
+                        .trim_start_matches("{SQLITE_TEXT_MARKER}")
+                        .trim_start_matches("/* turso:sqlite */ ");
+                    // A leading SQL comment, line or block (wire-rev-uw2 N6).
+                    if let Some(rest) = t.strip_prefix("--") {
+                        t = rest.find("\\n").map_or("", |e| &rest[e + 2..]);
+                    } else if let Some(rest) = t.strip_prefix("/*") {
+                        t = rest.find("*/").map_or("", |e| &rest[e + 2..]);
+                    }
+                    if t.len() == head.len() {
+                        break;
+                    }
+                    head = t;
+                }
+                loop {
+                    let t = head.trim_start_matches(|c: char| {
+                        c.is_whitespace() || c == ',' || c == '(' || c == ')' || c == ';'
+                    });
+                    match t.strip_prefix('{').and_then(|r| r.find('}').map(|e| &r[e + 1..])) {
+                        Some(rest) if !t.starts_with("{{") => head = rest,
+                        _ => {
+                            head = t;
+                            break;
+                        }
+                    }
+                }
+                let upper = head.to_ascii_uppercase();
+                let continues = lit.trim_start().starts_with(',') || lit.trim_start().starts_with('(');
+                let led = continues
+                    || KEYWORDS.iter().any(|k| {
+                        upper.starts_with(k)
+                            && !upper[k.len()..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+                    });
+                let quoted_hole = ["'", "\\\"", "\"", "`", "\\x27", "\\x22", "\\u{27}", "\\u{22}"].iter().any(|q| {
+                    lit.match_indices(&format!("{q}{{")).any(|(i, _)| !lit[i + q.len()..].starts_with("{{"))
+                        || lit.match_indices(&format!("}}{q}")).any(|(i, _)| i == 0 || &lit[i - 1..i] != "}")
+                        || lit.contains(&format!("{q}%{{"))
+                });
+                // An error message reads like SQL but is text for the client: PostgreSQL's
+                // message form (`ALTER TABLE ADD CONSTRAINT: table "t" ...`, a colon BEFORE any
+                // quoted placeholder) or one of its phrases. A colon after the hole does not exempt.
+                let first_hole = ["'{", "\\\"{", "`{", "'%{"]
+                    .iter()
+                    .filter_map(|h| lit.find(h))
+                    .min()
+                    .unwrap_or(lit.len());
+                let sql_clause = CLAUSES.iter().any(|c| lit.to_ascii_uppercase().contains(c));
+                // SQL marks no client message holds: an upper-case SQL word anywhere, an
+                // operator, a statement separator or a comment (wire-rev-uw2 N6: fragments led by
+                // ESCAPE, COLLATE, DEFAULT, REFERENCES, WHEN, GLOB, IS NOT, CHECK, NULLIF or END,
+                // or by `x = `, `'{v}', 1`, passed the keyword-led test).
+                // PostgreSQL's message form puts the statement's words before a colon that comes
+                // before any quoted placeholder (`COPY FROM: cannot read '{f}'`): only the text
+                // after that colon must be free of SQL marks, and the head may be SQL-led.
+                let colon = lit.find(": ").filter(|c| *c < first_hole);
+                let tail = colon.map_or(lit.as_str(), |c| &lit[c + 2..]);
+                // Whole words of the tail, outside placeholders (`FROM-clause` is one word).
+                let words: Vec<String> = {
+                    let mut plain = String::new();
+                    let mut depth = 0;
+                    for c in tail.chars() {
+                        match c {
+                            '{' => depth += 1,
+                            '}' if depth > 0 => depth -= 1,
+                            _ if depth == 0 => plain.push(c),
+                            _ => {}
+                        }
+                    }
+                    plain
+                        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+                        .filter(|w| !w.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                };
+                let sql_marks = words.iter().any(|w| {
+                    SQL_ONLY_WORDS.iter().any(|k| w.eq_ignore_ascii_case(k))
+                        || SQL_UPPER_WORDS.contains(&w.as_str())
+                }) || [" = ", "<>", "!=", ";", "--", "/*", "', ", "('"].iter().any(|m| tail.contains(m));
+                let english = lit
+                    .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+                    .filter(|w| w.len() >= 2 && w.chars().all(|c| c.is_ascii_lowercase()))
+                    .count()
+                    >= 2;
+                let message = MESSAGES_WITH_SQL_WORDS.iter().any(|m| lit.starts_with(m))
+                    || (!sql_clause && !sql_marks && english && (colon.is_some() || !led));
+                // `{x:?}` prints quotes of its own; a literal that opens a quote at its end is
+                // half of a concatenation (`"... \"" + x`); a bare quoted placeholder is a
+                // quoting fragment wherever it is used.
+                let debug_hole = lit.contains(":?}");
+                // A quote passed in as an argument and written around another placeholder
+                // (`{q}{v}{q}`, `q = '\''`): the same named placeholder on both sides of one.
+                let wrapped_by_name = {
+                    let names: Vec<(usize, usize, &str)> = lit
+                        .match_indices('{')
+                        .filter_map(|(i, _)| lit[i + 1..].find('}').map(|e| (i, i + 1 + e + 1, &lit[i + 1..i + 1 + e])))
+                        .collect();
+                    names.windows(3).any(|w| {
+                        w[0].1 == w[1].0 && w[1].1 == w[2].0 && !w[0].2.is_empty() && w[0].2 == w[2].2
+                    })
+                };
+                let open_quote = (lit.ends_with('\'') && lit.matches('\'').count() % 2 == 1)
+                    || (lit.ends_with("\\\"") && lit.matches("\\\"").count() % 2 == 1);
+                let bare = ["'", "\\\""].iter().any(|q| {
+                    lit.starts_with(&format!("{q}{{")) && lit.ends_with(&format!("}}{q}")) && lit.matches('{').count() == 1
+                });
+                // Any literal with a quoted placeholder is engine text unless it is a client
+                // message: an allowlist, not a list of SQL heads (wire-rev-uw2 N6: every new
+                // head the keyword list did not name got past it).
+                if bare || wrapped_by_name || ((quoted_hole || (led && (debug_hole || open_quote))) && !message) {
+                    wrong.push(format!("{}:{line}: {lit}", path.display()));
+                }
+            }
+            if path.ends_with("translator.rs") {
+                for (n, l) in text.lines().enumerate() {
+                    let t = l.trim_start();
+                    if l.contains("Literal::String(format!(") || l.contains("Literal::String(\"") {
+                        wrong.push(format!("{}:{}: {t}", path.display(), n + 1));
+                    }
+                }
+            }
+        }
+        assert!(seen > 1000, "premise: the scan read {seen} string literals");
+        assert!(wrong.is_empty(), "engine text quoted by hand:\n{}", wrong.join("\n"));
+    }
+
+    /// Review wire-line3 LOW-6: matching_close skips an escaped-quote char literal whole (it read
+    /// the closing quote of `'\''` as a new opener) and nested block comments.
+    #[test]
+    fn matching_close_skips_escaped_char_literals_and_nested_comments() {
+        assert_eq!(matching_close("('\\'','(')", 0, b'(', b')'), Some(9));
+        // Nested: with the inner `*/` read as the comment's end, the `(` after it opens and the
+        // last `)` closes only that one (None).
+        assert_eq!(matching_close("(/* a /* x */ ( */ y)", 0, b'(', b')'), Some(20));
+        // A control: a paren in a string and in a char literal is not counted.
+        assert_eq!(matching_close("(\"(\" ')' (x))", 0, b'(', b')'), Some(12));
+    }
+
     /// Every quoted five-character token of digits and capitals with at least one digit, found
     /// wherever it sits (no quote parity elsewhere can hide one), with its 1-based line.
     fn sqlstate_literals(text: &str) -> Vec<(usize, String)> {
@@ -7010,15 +7803,136 @@ mod tests {
             .collect()
     }
 
-    /// `text` less each `#[cfg(test)]` + `mod <name> {` span (its newlines kept), through its matching brace; braces
-    /// inside string and char literals and comments are not counted. An unmatched span keeps the
-    /// rest of the file (read, never skipped).
+    /// The index of the `close` that matches the `open` at `at` in `text`, counting neither inside
+    /// string, raw-string and char literals nor inside comments (a lifetime is not a char literal);
+    /// None when it is never closed.
+    fn matching_close(text: &str, at: usize, open: u8, close: u8) -> Option<usize> {
+        let b = text.as_bytes();
+        let (mut i, mut depth) = (at, 0i64);
+        while i < b.len() {
+            match b[i] {
+                b'/' if b.get(i + 1) == Some(&b'/') => {
+                    while i < b.len() && b[i] != b'\n' {
+                        i += 1;
+                    }
+                }
+                b'/' if b.get(i + 1) == Some(&b'*') => {
+                    // Rust block comments nest (review wire-line3 LOW-6).
+                    let mut nest = 1;
+                    i += 2;
+                    while i + 1 < b.len() && nest > 0 {
+                        if b[i] == b'/' && b[i + 1] == b'*' {
+                            nest += 1;
+                            i += 2;
+                        } else if b[i] == b'*' && b[i + 1] == b'/' {
+                            nest -= 1;
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    i -= 1;
+                }
+                b'r' if matches!(b.get(i + 1), Some(b'#') | Some(b'"'))
+                    && !b[i.saturating_sub(1)].is_ascii_alphanumeric() =>
+                {
+                    let mut j = i + 1;
+                    while b.get(j) == Some(&b'#') {
+                        j += 1;
+                    }
+                    if b.get(j) == Some(&b'"') {
+                        let end = format!("\"{}", "#".repeat(j - i - 1));
+                        i = text[j + 1..].find(&end).map_or(b.len(), |n| j + 1 + n + end.len() - 1);
+                    }
+                }
+                b'"' => {
+                    i += 1;
+                    while i < b.len() && b[i] != b'"' {
+                        if b[i] == b'\\' {
+                            i += 1;
+                        }
+                        i += 1;
+                    }
+                }
+                b'\'' => {
+                    // `'\X'`: the closing quote comes after the escaped character, which may
+                    // itself be a quote (`'\''`: it was read as the close, and the real close as
+                    // a new opener; review wire-line3 LOW-6).
+                    if b.get(i + 1) == Some(&b'\\') {
+                        if let Some(n) = text.get(i + 3..).and_then(|t| t.find('\'')) {
+                            i += 3 + n;
+                        }
+                    } else if b.get(i + 2) == Some(&b'\'') {
+                        i += 2;
+                    }
+                }
+                c if c == open => depth += 1,
+                c if c == close => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// Whether `line` is a cfg attribute that holds only under test: `#[cfg(test)]`,
+    /// `#[cfg(all(test, ...))]`; never one with `not(` or `any(` in it. Quoted strings are dropped
+    /// before the words are read, so `feature = "test-utils"` is not `test` (review wire-line2
+    /// LOW-6).
+    fn is_test_cfg(line: &str) -> bool {
+        let l = line.trim();
+        let unquoted: String = l
+            .split('"')
+            .enumerate()
+            .filter(|(i, _)| i % 2 == 0)
+            .map(|(_, part)| part)
+            .collect();
+        l.starts_with("#[cfg(")
+            && l.ends_with(")]")
+            && !unquoted.contains("not(")
+            && !unquoted.contains("any(")
+            && unquoted
+                .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .any(|w| w == "test")
+    }
+
+    /// Where the next `<test cfg line>\nmod ` starts in `rest`.
+    fn next_test_mod(rest: &str) -> Option<usize> {
+        let mut from = 0;
+        while let Some(k) = rest[from..].find("#[cfg(") {
+            let at = from + k;
+            let line_end = rest[at..].find('\n').map(|n| at + n).unwrap_or(rest.len());
+            // Other attributes may sit between the cfg and the mod (`#[allow(dead_code)]`).
+            let mut next = line_end;
+            while rest[next..].starts_with("\n#[") {
+                next = rest[next + 1..].find('\n').map(|n| next + 1 + n).unwrap_or(rest.len());
+            }
+            if is_test_cfg(&rest[at..line_end]) && rest[next..].starts_with("\nmod ") {
+                return Some(at);
+            }
+            from = at + 1;
+        }
+        None
+    }
+
+    /// `text` less each test-cfg `mod <name> {` span (its newlines kept), through its matching
+    /// brace; braces inside string and char literals and comments are not counted. An unmatched span
+    /// keeps the rest of the file (read, never skipped).
     fn strip_test_modules(text: &str) -> String {
         let mut out = String::new();
         let mut rest = text;
-        while let Some(at) = rest.find("#[cfg(test)]\nmod ") {
+        while let Some(at) = next_test_mod(rest) {
             let after = &rest[at..];
-            let line_end = after.find('\n').map(|n| n + 1).unwrap_or(after.len());
+            let mut line_end = after.find('\n').map(|n| n + 1).unwrap_or(after.len());
+            // Past any attribute lines between the cfg and the mod.
+            while after[line_end..].starts_with("#[") {
+                line_end += after[line_end..].find('\n').map(|n| n + 1).unwrap_or(after.len() - line_end);
+            }
             let header_end = after[line_end..].find('\n').map(|n| line_end + n).unwrap_or(after.len());
             let header = &after[line_end..header_end];
             if !header.trim_end().ends_with('{') {
@@ -7160,21 +8074,22 @@ mod tests {
     #[test]
     fn every_assign_call_propagates_its_refusal() {
         let source = include_str!("../frontend/session.rs");
-        let lines: Vec<&str> = source.lines().collect();
+        // Each call's own closing parenthesis, found by matching it (the wire line review L2: the
+        // next `});` or `})?;` line could be another call's, so `}).ok();` passed), and what
+        // follows it must be `?`: the outcome is propagated, whatever the formatting.
+        // Parentheses inside string and char literals and comments are not counted (review
+        // wire-line2 LOW-5: a "(" in a closure body shifted the close).
         let (mut calls, mut dropped) = (0, Vec::new());
-        for (i, line) in lines.iter().enumerate() {
-            if !line.contains("assign(&|") {
-                continue;
-            }
+        let b = source.as_bytes();
+        let mut from = 0;
+        while let Some(k) = source[from..].find("assign(&|") {
+            let open = from + k + "assign".len();
             calls += 1;
-            let close = lines[i + 1..]
-                .iter()
-                .position(|l| matches!(l.trim(), "});" | "})?;"))
-                .map(|k| i + 1 + k)
-                .expect("the call's closing line");
-            if lines[close].trim() != "})?;" {
-                dropped.push(i + 1);
+            match matching_close(source, open, b'(', b')') {
+                Some(j) if b.get(j + 1) == Some(&b'?') => {}
+                _ => dropped.push(source[..open].matches('\n').count() + 1),
             }
+            from = open;
         }
         assert!(calls >= 5, "found {calls} assign calls, not the five known");
         assert!(dropped.is_empty(), "assign calls whose Result is dropped, at session.rs lines {dropped:?}");
@@ -7547,7 +8462,10 @@ mod tests {
     /// settings read the same before and after. This D0 session already holds synchronous and
     /// fullfsync off, so the SHOWs name the values it does not hold (full, on), and a premise says
     /// so: a SHOW of the held value could change nothing, and the pin could not fail (ruled
-    /// c9c821dd8d, P8).
+    /// c9c821dd8d, P8). PRAGMA fullfsync exists only on Apple (core's PragmaName::Fullfsync is
+    /// cfg(target_vendor = "apple")), so its half of the premise and its SHOW row are Apple's; the
+    /// rest runs on every platform (lead ruling 2026-10-18, integ-rev-1017: on Linux the premise
+    /// read [] and the test failed there for that alone).
     #[test]
     fn show_cannot_change_an_engine_setting() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -7565,19 +8483,25 @@ mod tests {
                 .ok()
                 .and_then(|mut stmt| stmt.run_collect_rows().ok())
         };
-        let before = (pragma("synchronous"), pragma("fullfsync"));
+        let apple = cfg!(target_vendor = "apple");
+        let held = || {
+            (
+                pragma("synchronous"),
+                if apple { pragma("fullfsync") } else { None },
+            )
+        };
+        let before = held();
         let off = Some(vec![vec![Value::from_i64(0)]]);
         assert_eq!(
             before,
-            (off.clone(), off),
-            "premise: the D0 session holds synchronous and fullfsync off, values the SHOWs differ from"
+            (off.clone(), if apple { off } else { None }),
+            "premise: the D0 session holds synchronous (and on Apple fullfsync) off, values the SHOWs differ from"
         );
-        for sql in [
-            "SHOW \"synchronous = full\"",
-            "SHOW \"fullfsync = on\"",
-            "SHOW wal_checkpoint",
-            "SHOW synchronous",
-        ] {
+        let mut shows = vec!["SHOW \"synchronous = full\"", "SHOW wal_checkpoint", "SHOW synchronous"];
+        if apple {
+            shows.insert(1, "SHOW \"fullfsync = on\"");
+        }
+        for sql in shows {
             let codes: Vec<String> = s
                 .simple(sql)
                 .into_iter()
@@ -7588,11 +8512,7 @@ mod tests {
                 .collect();
             assert_eq!(codes, vec!["42704".to_string()], "{sql}");
         }
-        assert_eq!(
-            (pragma("synchronous"), pragma("fullfsync")),
-            before,
-            "a SHOW changed an engine setting"
-        );
+        assert_eq!(held(), before, "a SHOW changed an engine setting");
     }
 
     /// Wire review 17 item 7: a CHECKPOINT with a comment is the server's CHECKPOINT, read with no
@@ -8210,7 +9130,11 @@ mod tests {
     /// when its statement_timeout passes during the wait: dropped there, a write with RETURNING is
     /// committed by the engine's reset, so the 57014 it answered reported as cancelled a write that
     /// was stored (measured: 57014 with its row stored; fresh-context review of the ultrareview
-    /// fixes, on finding 9's Backoff).
+    /// fixes, on finding 9's Backoff). FLAGGED SPEC REPAIR (lead-approved, integ-rev-1017): with a
+    /// 1 ms timeout armed before parse and prepare, the statement was cancelled before it reached
+    /// the commit (about 1.1-1.2 ms to its first step on iccad5), a correct 57014. Now the timeout
+    /// (50 ms) expires INSIDE the post-write Busy wait, which the test floor holds for 300 ms; the
+    /// Busy wait is a premise, so without it the test refuses and never passes.
     #[test]
     fn a_write_whose_commit_meets_busy_is_not_cancelled_by_its_timeout() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -8218,12 +9142,24 @@ mod tests {
         ok(&s, "CREATE TABLE t(id INT, v TEXT)");
         ok(&s, "INSERT INTO t VALUES (1, 'a')");
         ok(&s, "SELECT turso_branch_create('c')");
-        ok(&s, "SET statement_timeout = 1");
+        ok(&s, "SET statement_timeout = 50");
         s.shared
             .db
             .branch_failpoint(Some(turso_core::branch::BranchFailpoint::TrunkDecisionBusy));
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        commit_busy_test::arm(300);
+        let started = std::time::Instant::now();
         let replies = s.simple("INSERT INTO t VALUES (9, 'x') RETURNING id");
+        let took = started.elapsed();
+        let waits = commit_busy_test::waits();
+        commit_busy_test::arm(0);
+        assert!(
+            waits >= 1,
+            "premise not met: the write's commit met no Busy (no post-write wait), so the timeout was not tested"
+        );
+        assert!(
+            took >= std::time::Duration::from_millis(50),
+            "premise not met: the statement took {took:?}, so its 50 ms timeout never passed during the wait"
+        );
         let conn = s.shared.db.connect().unwrap();
         let count = conn
             .prepare("SELECT count(*) FROM t WHERE id = 9")

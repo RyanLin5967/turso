@@ -217,6 +217,8 @@ struct Reply {
     oids: Option<Vec<u32>>,
     /// The column names of the last RowDescription, if one came.
     names: Option<Vec<String>>,
+    /// The type size and type modifier of each column of the last RowDescription, if one came.
+    sizes: Option<Vec<(i16, i32)>>,
     /// The BackendKeyData's body, if one came.
     key: Option<Vec<u8>>,
     tags: Vec<String>,
@@ -540,6 +542,7 @@ impl Wire {
                     let mut p = 2;
                     let mut oids = Vec::with_capacity(n);
                     let mut names = Vec::with_capacity(n);
+                    let mut sizes = Vec::with_capacity(n);
                     for _ in 0..n {
                         let end = p + body[p..].iter().position(|&c| c == 0).unwrap();
                         names.push(String::from_utf8_lossy(&body[p..end]).into_owned());
@@ -550,10 +553,15 @@ impl Wire {
                             body[p + 8],
                             body[p + 9],
                         ]));
+                        sizes.push((
+                            i16::from_be_bytes([body[p + 10], body[p + 11]]),
+                            i32::from_be_bytes([body[p + 12], body[p + 13], body[p + 14], body[p + 15]]),
+                        ));
                         p += 18;
                     }
                     r.oids = Some(oids);
                     r.names = Some(names);
+                    r.sizes = Some(sizes);
                 }
                 b'D' => {
                     let n = i16::from_be_bytes([body[0], body[1]]) as usize;
@@ -5350,7 +5358,8 @@ fn an_extended_checkpoint_outside_a_block_empties_the_wal() {
 #[test]
 fn an_extended_copy_from_loads_its_rows_once() {
     let dir = Scratch::new("copyext");
-    let server = Server::start(&dir.db(), &[]);
+    // Its COPY FROM reads a file the test wrote in its scratch: granted (review wire-quote LOW-3).
+    let server = Server::start(&dir.db(), &["--copy-from-dir", dir.0.to_str().unwrap()]);
     let mut a = seeded(&server);
     let file = dir.0.join("rows.tsv");
     std::fs::write(&file, "2\ttwo\n3\tthree\n").unwrap();
@@ -6225,7 +6234,8 @@ fn an_extended_alter_add_constraint_adds_it_once() {
 #[test]
 fn describe_never_performs_a_statement_behind_a_comment() {
     let dir = Scratch::new("extaltercomment");
-    let server = Server::start(&dir.db(), &[]);
+    // Its COPY FROM reads a file the test wrote in its scratch: granted (review wire-quote LOW-3).
+    let server = Server::start(&dir.db(), &["--copy-from-dir", dir.0.to_str().unwrap()]);
     let mut a = server.connect();
     a.q("CREATE TABLE e5(id INT, v INT)").ok("table");
     a.q("INSERT INTO e5 VALUES (1, 10)").ok("row");
@@ -7022,7 +7032,8 @@ fn a_correlated_generate_series_column_is_scoped_to_its_select() {
 #[test]
 fn copy_from_runs_inside_the_block_it_is_in() {
     let dir = Scratch::new("copyblock");
-    let server = Server::start(&dir.db(), &[]);
+    // Its COPY FROM reads a file the test wrote in its scratch: granted (review wire-quote LOW-3).
+    let server = Server::start(&dir.db(), &["--copy-from-dir", dir.0.to_str().unwrap()]);
     let mut a = server.connect();
     a.q("CREATE TABLE cp(id INT, v TEXT)").ok("cp");
     let good = dir.0.join("good.tsv");
@@ -7063,7 +7074,8 @@ fn copy_from_runs_inside_the_block_it_is_in() {
 #[test]
 fn copy_refuses_an_option_it_does_not_implement() {
     let dir = Scratch::new("copyopts");
-    let server = Server::start(&dir.db(), &[]);
+    // Its COPY FROM reads a file the test wrote in its scratch: granted (review wire-quote LOW-3).
+    let server = Server::start(&dir.db(), &["--copy-from-dir", dir.0.to_str().unwrap()]);
     let mut a = server.connect();
     a.q("CREATE TABLE co(id INT, v TEXT)").ok("co");
     let rows = dir.0.join("rows.tsv");
@@ -7100,7 +7112,8 @@ fn copy_refuses_an_option_it_does_not_implement() {
 #[test]
 fn a_prepare_time_statement_is_refused_before_it_runs() {
     let dir = Scratch::new("copywhere");
-    let server = Server::start(&dir.db(), &[]);
+    // Its COPY FROM reads a file the test wrote in its scratch: granted (review wire-quote LOW-3).
+    let server = Server::start(&dir.db(), &["--copy-from-dir", dir.0.to_str().unwrap()]);
     let mut a = server.connect();
     a.q("CREATE TABLE cw(id INT, v TEXT)").ok("cw");
     let rows = dir.0.join("rows.tsv");
@@ -12033,6 +12046,12 @@ mod recorded {
         b
     }
 
+    thread_local! {
+        /// The recording is pgraw.py's, which also prints ParameterStatus and EmptyQueryResponse
+        /// lines (pgproto.py prints neither).
+        static PGRAW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
     fn read_until_ready(w: &mut Wire) -> Vec<String> {
         let mut lines = Vec::new();
         loop {
@@ -12044,7 +12063,16 @@ mod recorded {
             let len = i32::from_be_bytes([head[1], head[2], head[3], head[4]]) as usize;
             let mut body = vec![0u8; len - 4];
             w.s.read_exact(&mut body).unwrap();
-            if let Some(l) = describe(head[0], &body) {
+            if PGRAW.with(std::cell::Cell::get) && matches!(head[0], b'S' | b'I') {
+                if head[0] == b'I' {
+                    lines.push("EmptyQueryResponse".to_string());
+                } else {
+                    let text = String::from_utf8_lossy(&body);
+                    let mut kv = text.trim_end_matches('\0').splitn(2, '\0');
+                    let (k, v) = (kv.next().unwrap_or(""), kv.next().unwrap_or(""));
+                    lines.push(format!("ParameterStatus {k}={v}"));
+                }
+            } else if let Some(l) = describe(head[0], &body) {
                 lines.push(l);
             }
             if head[0] == b'Z' {
@@ -12099,10 +12127,66 @@ mod recorded {
                 w.s.write_all(&out).unwrap();
                 read_until_ready(w)
             }
+            // As pgraw.py sends a Query: any queued messages first (pgproto.py recordings never
+            // queue before one, so their replay is unchanged).
             "Q" => {
-                w.s.write_all(&frame(b'Q', &c(rest))).unwrap();
+                let mut out = std::mem::take(pending);
+                out.extend(frame(b'Q', &c(rest)));
+                w.s.write_all(&out).unwrap();
                 read_until_ready(w)
             }
+            // pgraw.py's verbs (frontier/fastest/lanes/wire/raw/loud-20261015/pg18-diff/pgraw.py),
+            // for the recordings of named statements, format codes and several sessions (the line
+            // review reds: rev-bl1, rev-bl3, rev-eh1, rev-pin-path, rev-low5-chain).
+            "PARSE" => {
+                let (name, rest) = rest.split_once(' ').unwrap();
+                let (oids, sql) = rest.split_once(' ').unwrap();
+                let oid_list: Vec<u32> = if oids == "-" {
+                    Vec::new()
+                } else {
+                    oids.split(',').map(|o| o.parse().unwrap()).collect()
+                };
+                let mut b = c(if name == "-" { "" } else { name });
+                b.extend(c(sql));
+                b.extend_from_slice(&(oid_list.len() as u16).to_be_bytes());
+                for o in &oid_list {
+                    b.extend_from_slice(&o.to_be_bytes());
+                }
+                pending.extend(frame(b'P', &b));
+                Vec::new()
+            }
+            "BIND" => {
+                let parts: Vec<&str> = rest.split("|||").map(str::trim).collect();
+                let head: Vec<&str> = parts[0].split_whitespace().collect();
+                let dash = |x: &str| if x == "-" { String::new() } else { x.to_string() };
+                let codes = |x: &str| -> Vec<i16> {
+                    if x == "-" { Vec::new() } else { x.split(',').map(|k| k.parse().unwrap()).collect() }
+                };
+                let mut b = c(&dash(head[0]));
+                b.extend(c(&dash(head[1])));
+                let pcodes = codes(head[2]);
+                b.extend_from_slice(&(pcodes.len() as u16).to_be_bytes());
+                for k in &pcodes {
+                    b.extend_from_slice(&k.to_be_bytes());
+                }
+                b.extend(bind_values(&parts[1..]));
+                let rcodes = codes(head[3]);
+                b.extend_from_slice(&(rcodes.len() as u16).to_be_bytes());
+                for k in &rcodes {
+                    b.extend_from_slice(&k.to_be_bytes());
+                }
+                pending.extend(frame(b'B', &b));
+                Vec::new()
+            }
+            "EXEC" => {
+                let mut it = rest.split_whitespace();
+                let (portal, n) = (it.next().unwrap(), it.next().unwrap());
+                let mut b = c(if portal == "-" { "" } else { portal });
+                b.extend_from_slice(&n.parse::<i32>().unwrap().to_be_bytes());
+                pending.extend(frame(b'E', &b));
+                Vec::new()
+            }
+            "SYNC" => send(w, pending, "S"),
             "X" | "D" => {
                 let (oids, rest) = rest.split_once(' ').unwrap();
                 let parts: Vec<&str> = rest.split("|||").map(str::trim).collect();
@@ -12170,13 +12254,40 @@ mod recorded {
         let cmds = parse(recording);
         assert!(!cmds.is_empty(), "refused: recording {name} has no command");
         let dir = Scratch::new(&format!("rec{}", name.len()));
-        let server = Server::start(&dir.db(), &[]);
-        let mut w = server.connect();
-        let mut pending = Vec::new();
+        // Every recording was made as PostgreSQL's superuser, who may COPY FROM any server file:
+        // the replay's server is granted every file (review wire-quote LOW-3).
+        let server = Server::start(&dir.db(), &["--copy-from-dir", "/"]);
+        // pgraw.py's sessions: `CONN <name>` switches to one, connecting it first if new, and
+        // each of its commands is prefixed `[<name>] `; the first session is "a".
+        let mut sessions: Vec<(String, Wire, Vec<u8>)> = vec![("a".to_string(), server.connect(), Vec::new())];
+        PGRAW.with(|p| {
+            p.set(cmds.iter().any(|c| c.text.starts_with('[') || c.text.starts_with("CONN ")))
+        });
+        let mut current = 0;
         let mut report = String::new();
         let mut differing = Vec::new();
         for (i, cmd) in cmds.iter().enumerate() {
-            let got = send(&mut w, &mut pending, &cmd.text);
+            let got = if let Some(conn) = cmd.text.strip_prefix("CONN ") {
+                current = match sessions.iter().position(|(n, ..)| n == conn) {
+                    Some(k) => k,
+                    None => {
+                        sessions.push((conn.to_string(), server.connect(), Vec::new()));
+                        sessions.len() - 1
+                    }
+                };
+                Vec::new()
+            } else {
+                let text = match cmd.text.strip_prefix('[') {
+                    Some(rest) => {
+                        let (who, text) = rest.split_once("] ").expect("a [session] prefix");
+                        assert_eq!(who, sessions[current].0, "{name}: a command for another session");
+                        text
+                    }
+                    None => cmd.text.as_str(),
+                };
+                let (_, w, pending) = &mut sessions[current];
+                send(w, pending, text)
+            };
             let n = i + 1;
             let registered = divergences.iter().find(|(k, _)| *k == n);
             let agrees = same(&cmd.want, &got);
@@ -12584,17 +12695,13 @@ replays_postgresql!(
     pg18_audit2_alter_table_add_constraint_is_validated_and_atomic_replays_as_postgresql_answered,
     "pg18-audit2-alter_table_add_constraint_is_validated_and_atomic.out",
     [
-        (7, "PGDIV-NUMERIC-OID-FLOAT8 value [wire]: NUMERIC(p,s) column n typed 701 float8 in RowDescription; PG 1700 (text '12.50' agrees)"),
         (8, "PGDIV-CONSTRAINT-MESSAGE error-text [wire]: ALTER TABLE ADD FOREIGN KEY 23503 both; ours 'violates the foreign key constraint it adds: a row's key (pid) is not present in table \"p\"' vs PG '... violates foreign key constraint \"c_pid_fkey\"'"),
-        (10, "PGDIV-NUMERIC-OID-FLOAT8 value [wire]: NUMERIC(p,s) column n typed 701 float8; PG 1700 (same as #7, not a cascade)"),
     ]
 );
 replays_postgresql!(
     pg18_audit2_alter_table_add_constraint_takes_effect_and_keeps_the_rows_replays_as_postgresql_answered,
     "pg18-audit2-alter_table_add_constraint_takes_effect_and_keeps_the_rows.out",
     [
-        (6, "PGDIV-NUMERIC-OID-FLOAT8 value [wire]: NUMERIC(p,s) column n typed 701 float8; PG 1700 (text agrees)"),
-        (10, "PGDIV-NUMERIC-OID-FLOAT8 value [wire]: NUMERIC(p,s) column n typed 701 float8; PG 1700 (text agrees)"),
         (11, "PGDIV-CONSTRAINT-MESSAGE error-text [wire]: 23505 both; ours 'UNIQUE constraint failed: c.id' vs PG '... unique constraint \"c_pkey\"'"),
         (12, "PGDIV-CONSTRAINT-MESSAGE error-text [wire]: 23502 both; ours 'NOT NULL constraint failed: c.id' vs PG 'null value in column \"id\" of relation \"c\" violates not-null constraint'"),
         (13, "PGDIV-CONSTRAINT-MESSAGE error-text [wire]: 23503 both; ours 'FOREIGN KEY constraint failed' vs PG '... violates foreign key constraint \"c_pid_fkey\"'"),
@@ -12635,7 +12742,6 @@ replays_postgresql!(
     pg18_audit2_char_n_is_blank_padded_as_in_postgres_replays_as_postgresql_answered,
     "pg18-audit2-char_n_is_blank_padded_as_in_postgres.out",
     [
-        (5, "PGDIV-EXPR-TYPE-TEXT value [wire]: length(char(n)) typed 25 text in RowDescription; PG 23 int4 (value 3 agrees)"),
         (6, "PGDIV-CHAR-OVERFLOW-CODE error-code [wire]: char(6) overflow: PG 22001 'value too long for type character(6)'; ours XX000 'value too long for type character'"),
     ]
 );
@@ -12679,7 +12785,7 @@ replays_postgresql!(
     [
         (3, "PGDIV-CATALOG-NAME-TYPES value [wire]: pg_indexes.indexname typed 25 text; PG 19 name (rows agree)"),
         (4, "PGDIV-CATALOG-NAME-TYPES value [wire]: pg_indexes.indexname typed 25 text; PG 19 name (rows agree)"),
-        (5, "PGDIV-EXPR-TYPE-TEXT value [wire]: pg_database_size() typed 25 text; PG 20 int8 (the byte count 24728 vs 8443583 is cluster-dependent and cannot agree)"),
+        (5, "PGDIV-EXPR-TYPE-TEXT value [wire]: pg_database_size()'s byte count (24728 vs 8443583) is cluster-dependent and cannot agree (its type, 25 here before 391f105a1, is PG's 20 int8 since)"),
     ]
 );
 replays_postgresql!(
@@ -12795,7 +12901,6 @@ replays_postgresql!(
     "pg18-audit3-a_numeric_division_by_zero_is_22012.out",
     [
         (1, "PGDIV-SCHEMA-REFUSED cluster-state [cluster]: DROP SCHEMA IF EXISTS s; DROP SCHEMA public: ours refuses the whole query 0A000"),
-        (4, "PGDIV-NUMERIC-OID-FLOAT8 value [wire]: SELECT x / 0 FROM nd: RowDescription then 22012 as in PG (C53), but the column is typed 701 where PG types it 1700"),
     ]
 );
 replays_postgresql!(
@@ -13539,18 +13644,138 @@ fn foreign_keys_cannot_be_turned_off_over_pending_deferred_violations() {
 replays_postgresql!(pg18_c44_m2_sets_replays_as_postgresql_answered, "pg18-c44-m2-sets.out", []);
 // Review c39799c5d..9e24b455d MED 2: a TimeZone value naming a host path (or a zone-directory file that
 // is not a zone) is PostgreSQL's 22023, so no answer tells a client which host files exist.
-replays_postgresql!(pg18_rev_c39_tzpath_replays_as_postgresql_answered, "pg18-rev-c39-tzpath.out", []);
+// Registered from the first host run, iccad11 9f5839a88 diff (rows read one by one; DECISIONS: only from a run's diff).
+replays_postgresql!(
+    pg18_rev_c39_tzpath_replays_as_postgresql_answered,
+    "pg18-rev-c39-tzpath.out",
+    [
+        (7, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = America/New_York refused 0A000 (PG: SET)"),
+    ]
+);
 // C53 follow-up (Codex C56's NEEDS-CLAUDE, frontier/codex/reports/C56-protocol-dependency.md): a
 // retained named statement whose relation was dropped is refused at Bind (42P01, before
 // BindComplete), where PostgreSQL's GetCachedPlan revalidates it, not at Execute.
-replays_postgresql!(pg18_c56_schema_prepared_replays_as_postgresql_answered, "pg18-c56-schema-prepared.out", []);
+// Registered from the host run iccad11 ff9f1bdfe diff (each row read).
+replays_postgresql!(
+    pg18_c56_schema_prepared_replays_as_postgresql_answered,
+    "pg18-c56-schema-prepared.out",
+    [
+        (8, "PGDIV-PUBLIC-SCHEMA-NOOP cluster-state [cluster]: DROP SCHEMA public CASCADE drops c56_prepared but sends no 'drop cascades to table c56_prepared' NOTICE (the review's #5; B2 ruling, DECISIONS 2026-10-17T06:24:21Z)"),
+        (12, "PGDIV-PUBLIC-SCHEMA-NOOP cluster-state [cluster]: CREATE SCHEMA public after it fails 42601 'schema \"public\" already exists' (the review's #7; #11, the review's #6, is NEVER registered)"),
+    ]
+);
 // Review c39799c5d..9e24b455d LOWs 6, 7, 8, 9, 11 (one class: a SET value is valid or not as
 // PostgreSQL's check hooks decide, before this server's own refusal of a valid value it does not
 // act on). Strict until a run's diff registers the intended 0A000 rows (PGDIV-SET-REFUSED), each
 // from a read of that diff.
-replays_postgresql!(pg18_rev_c39_tzforms_replays_as_postgresql_answered, "pg18-rev-c39-tzforms.out", []);
+// Registered from the first host run, iccad11 9f5839a88 diff (rows read one by one; DECISIONS: only from a run's diff).
+replays_postgresql!(
+    pg18_rev_c39_tzforms_replays_as_postgresql_answered,
+    "pg18-rev-c39-tzforms.out",
+    [
+        (1, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = america/new_york refused 0A000 (PG: SET)"),
+        (2, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = AMERICA/NEW_YORK refused 0A000 (PG: SET)"),
+        (3, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = UTC+3 refused 0A000 (PG: SET)"),
+        (4, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = EST5EDT,M3.2.0,M11.1.0 refused 0A000 (PG: SET)"),
+        (6, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = nan refused 0A000 (PG: SET)"),
+        (9, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = +05:30 refused 0A000 (PG: SET)"),
+        (10, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = 5.5 refused 0A000 (PG: SET)"),
+        (11, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = INTERVAL '+05:00' refused 0A000 (PG: SET)"),
+        (8, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = Factory refused 0A000 (PG: SET); registered from the host run iccad11 ff9f1bdfe, after zone names became PG 18.6's own list"),
+    ]
+);
 replays_postgresql!(pg18_rev_c39_misc_replays_as_postgresql_answered, "pg18-rev-c39-misc.out", []);
-replays_postgresql!(pg18_rev_c39_enc_replays_as_postgresql_answered, "pg18-rev-c39-enc.out", []);
+// Registered from the first host run, iccad11 9f5839a88 diff (rows read one by one; DECISIONS: only from a run's diff).
+replays_postgresql!(
+    pg18_rev_c39_enc_replays_as_postgresql_answered,
+    "pg18-rev-c39-enc.out",
+    [
+        (1, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = sqlascii refused 0A000 (PG: SET)"),
+        (4, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = eucjp refused 0A000 (PG: SET)"),
+        (5, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = euccn refused 0A000 (PG: SET)"),
+        (6, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = euckr refused 0A000 (PG: SET)"),
+        (7, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = euctw refused 0A000 (PG: SET)"),
+        (8, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = eucjis2004 refused 0A000 (PG: SET)"),
+        (9, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = muleinternal: 0A000 both; PG says invalid value, ours not supported"),
+        (10, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = latin1 refused 0A000 (PG: SET)"),
+        (11, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = latin2 refused 0A000 (PG: SET)"),
+        (12, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = latin3 refused 0A000 (PG: SET)"),
+        (13, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = latin4 refused 0A000 (PG: SET)"),
+        (14, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = latin5 refused 0A000 (PG: SET)"),
+        (15, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = latin6 refused 0A000 (PG: SET)"),
+        (16, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = latin7 refused 0A000 (PG: SET)"),
+        (17, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = latin8 refused 0A000 (PG: SET)"),
+        (18, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = latin9 refused 0A000 (PG: SET)"),
+        (19, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = latin10 refused 0A000 (PG: SET)"),
+        (20, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = win1256 refused 0A000 (PG: SET)"),
+        (21, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = win1258 refused 0A000 (PG: SET)"),
+        (22, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = win866 refused 0A000 (PG: SET)"),
+        (23, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = win874 refused 0A000 (PG: SET)"),
+        (24, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = koi8r refused 0A000 (PG: SET)"),
+        (25, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = koi8 refused 0A000 (PG: SET)"),
+        (26, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = win1251 refused 0A000 (PG: SET)"),
+        (27, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = win1252 refused 0A000 (PG: SET)"),
+        (28, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = iso88595 refused 0A000 (PG: SET)"),
+        (29, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = iso88596 refused 0A000 (PG: SET)"),
+        (30, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = iso88597 refused 0A000 (PG: SET)"),
+        (31, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = iso88598 refused 0A000 (PG: SET)"),
+        (32, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = win1250 refused 0A000 (PG: SET)"),
+        (33, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = win1253 refused 0A000 (PG: SET)"),
+        (34, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = win1254 refused 0A000 (PG: SET)"),
+        (35, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = win1255 refused 0A000 (PG: SET)"),
+        (36, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = win1257 refused 0A000 (PG: SET)"),
+        (37, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = koi8u refused 0A000 (PG: SET)"),
+        (38, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = sjis refused 0A000 (PG: SET)"),
+        (39, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = big5 refused 0A000 (PG: SET)"),
+        (40, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = gbk refused 0A000 (PG: SET)"),
+        (41, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = uhc refused 0A000 (PG: SET)"),
+        (42, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = gb18030 refused 0A000 (PG: SET)"),
+        (43, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = johab refused 0A000 (PG: SET)"),
+        (44, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = shiftjis2004 refused 0A000 (PG: SET)"),
+        (45, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = alt refused 0A000 (PG: SET)"),
+        (46, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = win refused 0A000 (PG: SET)"),
+        (47, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = mskanji refused 0A000 (PG: SET)"),
+        (48, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = shiftjis refused 0A000 (PG: SET)"),
+        (49, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = tcvn refused 0A000 (PG: SET)"),
+        (50, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = tcvn5712 refused 0A000 (PG: SET)"),
+        (51, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = vscii refused 0A000 (PG: SET)"),
+        (52, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = abc refused 0A000 (PG: SET)"),
+        (53, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = iso885910 refused 0A000 (PG: SET)"),
+        (54, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = iso885913 refused 0A000 (PG: SET)"),
+        (55, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = iso885914 refused 0A000 (PG: SET)"),
+        (56, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = iso885915 refused 0A000 (PG: SET)"),
+        (57, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = iso885916 refused 0A000 (PG: SET)"),
+        (58, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = iso88591 refused 0A000 (PG: SET)"),
+        (59, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = iso88592 refused 0A000 (PG: SET)"),
+        (60, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = iso88593 refused 0A000 (PG: SET)"),
+        (61, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = iso88594 refused 0A000 (PG: SET)"),
+        (62, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = iso88599 refused 0A000 (PG: SET)"),
+        (78, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = windows1250 refused 0A000 (PG: SET)"),
+        (79, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = windows1251 refused 0A000 (PG: SET)"),
+        (80, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = windows1252 refused 0A000 (PG: SET)"),
+        (81, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = windows1253 refused 0A000 (PG: SET)"),
+        (82, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = windows1254 refused 0A000 (PG: SET)"),
+        (83, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = windows1255 refused 0A000 (PG: SET)"),
+        (84, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = windows1256 refused 0A000 (PG: SET)"),
+        (85, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = windows1257 refused 0A000 (PG: SET)"),
+        (86, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = windows1258 refused 0A000 (PG: SET)"),
+        (87, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = windows866 refused 0A000 (PG: SET)"),
+        (88, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = windows874 refused 0A000 (PG: SET)"),
+        (89, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = windows932 refused 0A000 (PG: SET)"),
+        (90, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = windows936 refused 0A000 (PG: SET)"),
+        (91, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = windows949 refused 0A000 (PG: SET)"),
+        (92, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = windows950 refused 0A000 (PG: SET)"),
+        (93, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = win932 refused 0A000 (PG: SET)"),
+        (94, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = win936 refused 0A000 (PG: SET)"),
+        (95, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = win949 refused 0A000 (PG: SET)"),
+        (96, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = win950 refused 0A000 (PG: SET)"),
+        (99, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = Latin-1 refused 0A000 (PG: SET)"),
+        (100, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = ISO-8859-1 refused 0A000 (PG: SET)"),
+        (101, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = EUC_JP refused 0A000 (PG: SET)"),
+        (102, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = SHIFT_JIS_2004 refused 0A000 (PG: SET)"),
+        (103, "PGDIV-SET-REFUSED ours-only [ours-only]: SET client_encoding = GB-18030 refused 0A000 (PG: SET)"),
+    ]
+);
 
 /// Named extended-protocol messages, for the kept-statement reds below.
 fn named_parse(w: &mut Wire, name: &str, sql: &str) {
@@ -13623,7 +13848,11 @@ fn a_kept_statement_reprepared_after_a_setting_change_keeps_the_search_path() {
         ("SET client_min_messages", false, "SET client_min_messages TO notice"),
         ("SAVEPOINT", true, "SAVEPOINT a"),
         ("SET foreign_keys = off", false, "SET foreign_keys = off"),
-        ("ALTER TABLE s.t ADD COLUMN", false, "ALTER TABLE s.t ADD COLUMN y INT"),
+        // A CREATE in s, not an ALTER of s.t: with p1 bound on s.t, PostgreSQL refuses ALTER TABLE
+        // s.t with 55006 (CheckTableNotInUse: the bound portal holds it; reviews/uw2-raws
+        // round1-pg-all.txt s04), so that arm could never run in PostgreSQL. A DDL that does not
+        // touch t bumps the engine's prepare generation the same way.
+        ("CREATE TABLE s.u", false, "CREATE TABLE s.u (y INT)"),
     ] {
         let mut a = server.connect();
         a.q("SET search_path TO s").ok("path");
@@ -13682,21 +13911,39 @@ fn a_kept_statement_is_not_reused_across_ddl_the_key_did_not_see() {
     let dir = Scratch::new("kept-attached");
     let server = two_schemas(&dir);
     let mut wrong = Vec::new();
-    for (label, path, ddl, want) in [
-        ("DROP TABLE s.t", true, &["DROP TABLE s.t"][..], Err("42P01")),
-        ("ALTER TABLE s.t ADD COLUMN", true, &["ALTER TABLE s.t ADD COLUMN y INT"][..], Ok("2")),
+    // (label, under search_path s, statements run first, the kept statement, the DDL in the round,
+    // the answer wanted: an error code, the rows, or the last command tag). The temp arm is a kept
+    // DELETE ... USING over a temp t created in the round (the wire line review M5: a kept SELECT
+    // read the temp table's 3 at the base too, since the engine's re-prepare resolves temp
+    // first; a DELETE ... USING re-prepared by the engine has no column lookup and errors).
+    let arms: [(&str, bool, &[&str], &str, &[&str], Result<&str, &str>); 3] = [
+        ("DROP TABLE s.t", true, &[], "SELECT x FROM t", &["DROP TABLE s.t"], Err("42P01")),
         (
-            "a temp t",
-            false,
-            &["CREATE TEMP TABLE t(x INT)", "INSERT INTO t VALUES (3)"][..],
-            Ok("3"),
+            "ALTER TABLE s.t ADD COLUMN",
+            true,
+            &[],
+            "SELECT x FROM t",
+            &["ALTER TABLE s.t ADD COLUMN y INT"],
+            Ok("2"),
         ),
-    ] {
+        (
+            "a temp t under a kept DELETE ... USING",
+            false,
+            &["CREATE TABLE u(x INT)", "INSERT INTO u VALUES (3)"],
+            "DELETE FROM t USING u WHERE t.x = u.x",
+            &["CREATE TEMP TABLE t(x INT)", "INSERT INTO t VALUES (3)"],
+            Ok("DELETE 1"),
+        ),
+    ];
+    for (label, path, before, kept, ddl, want) in arms {
         let mut a = server.connect();
         if path {
             a.q("SET search_path TO s").ok("path");
         }
-        named_parse(&mut a, "sq", "SELECT x FROM t");
+        for sql in before {
+            a.q(sql).ok(sql);
+        }
+        named_parse(&mut a, "sq", kept);
         for (i, sql) in ddl.iter().enumerate() {
             let name = format!("d{i}");
             named_parse(&mut a, &name, sql);
@@ -13711,6 +13958,11 @@ fn a_kept_statement_is_not_reused_across_ddl_the_key_did_not_see() {
             Err(code) => {
                 if r.error.as_ref().map(|e| e.code.as_str()) != Some(code) || !r.rows.is_empty() {
                     wrong.push(format!("{label}: want {code}, got rows {:?} error {:?}", r.rows, r.error));
+                }
+            }
+            Ok(v) if v.starts_with("DELETE") => {
+                if r.error.is_some() || r.tags.last().map(String::as_str) != Some(v) {
+                    wrong.push(format!("{label}: want {v}, got tags {:?} error {:?}", r.tags, r.error));
                 }
             }
             Ok(v) => {
@@ -13777,4 +14029,2503 @@ fn a_named_statement_bound_after_a_search_path_change_reads_the_new_path() {
     let r = a.read_reply();
     assert!(r.error.is_none(), "{:?}", r.error);
     assert_eq!(r.rows, vec![vec![Some("2".to_string())]], "the read under search_path s");
+}
+
+/// Read `n` backend messages after a Flush, returning their tags (no ReadyForQuery comes).
+fn read_tags(w: &mut Wire, n: usize) -> Vec<u8> {
+    use std::io::Read;
+    (0..n)
+        .map(|_| {
+            let mut tag = [0u8; 1];
+            w.s.read_exact(&mut tag).unwrap();
+            let mut len = [0u8; 4];
+            w.s.read_exact(&mut len).unwrap();
+            let mut body = vec![0u8; i32::from_be_bytes(len) as usize - 4];
+            w.s.read_exact(&mut body).unwrap();
+            tag[0]
+        })
+        .collect()
+}
+
+/// The wire line review M1 and M2 (ONE TRANSLATION PATH): a statement Parsed and Bound, then
+/// another session's DDL, then its Execute: the engine re-prepares it on the schema change, and
+/// that re-prepare must translate it as the session did. A DELETE ... USING keeps its column
+/// lookup (DELETE 1; it was refused, "must be prepared again by its session"), and a cast to a
+/// domain keeps its CHECK (23514; it returned -5).
+/// ITS RED BASE (lead ruling 2026-10-18; host batch rg6, iccad11) is 2102d79ac (= bddd29f79^), with
+/// this test's file: there the engine re-prepared the kept statement and the DELETE was a SQLite
+/// syntax error and the cast -5, the stated reason. It PASSES at 269737907, 0b846e86f and
+/// 140da7b76, because since bddd29f79 the wire itself re-prepares a kept statement whose schema
+/// moved, so this test no longer reaches the engine's re-prepare: it pins the end-to-end answer.
+/// The override itself is held by the frontend's an_engine_reprepare_translates_as_the_session_did
+/// (red at 269737907 plus that test, and the mutant "the override returns self.parse" killed).
+#[test]
+fn a_reprepare_after_another_sessions_ddl_translates_as_the_session_did() {
+    let dir = Scratch::new("reprepare-xsession");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut b = server.connect();
+    a.q("CREATE TABLE a(x INT)").ok("a");
+    a.q("CREATE TABLE b(x INT)").ok("b");
+    a.q("INSERT INTO a VALUES (1), (2), (3)").ok("rows a");
+    a.q("INSERT INTO b VALUES (2)").ok("rows b");
+    a.q("CREATE DOMAIN dm AS INT CHECK (VALUE > 0)").ok("domain");
+    let mut wrong = Vec::new();
+    for (i, (sql, ddl)) in [
+        ("DELETE FROM a USING b WHERE a.x = b.x", "CREATE TABLE z1(i INT)"),
+        ("SELECT CAST(-5 AS dm)", "CREATE TABLE z2(i INT)"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let name = format!("k{i}");
+        named_parse(&mut a, &name, sql);
+        named_bind(&mut a, "", &name);
+        a.send(b'H', &[]);
+        let tags = read_tags(&mut a, 2);
+        if tags != b"12" {
+            wrong.push(format!("{sql}: Parse and Bind answered {tags:?}"));
+        }
+        b.q(ddl).ok(ddl);
+        named_execute(&mut a, "");
+        a.send(b'S', &[]);
+        let r = a.read_reply();
+        if i == 0 {
+            if r.error.is_some() || r.tags.last().map(String::as_str) != Some("DELETE 1") {
+                wrong.push(format!("{sql}: tags {:?} error {:?}", r.tags, r.error));
+            }
+        } else if r.error.as_ref().map(|e| e.code.as_str()) != Some("23514") {
+            wrong.push(format!("{sql}: rows {:?} error {:?}", r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    let left = a.q("SELECT x FROM a ORDER BY x");
+    assert_eq!(left.rows, vec![vec![Some("1".to_string())], vec![Some("3".to_string())]]);
+}
+// The wire line review M6 and L3, and review C finding (1): every TimeZone value it names, recorded
+// on PG 18.6 (SET TIME ZONE INTERVAL '1 day' 22023, 'x' 22007, the 167-hour bound, '<>5' accepted,
+// ';' refused ...), and SET LOCAL outside a block: the warning BEFORE the value's error. Strict
+// until a run's diff registers the intended 0A000 rows (valid zones this server does not act on).
+// Registered from the first host run, iccad11 9f5839a88 diff (rows read one by one; DECISIONS: only from a run's diff).
+replays_postgresql!(
+    pg18_rev_cd_tz2_replays_as_postgresql_answered,
+    "pg18-rev-cd-tz2.out",
+    [
+        (5, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = INTERVAL '+05:00' refused 0A000 (PG: SET)"),
+        (8, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = 167 refused 0A000 (PG: SET)"),
+        (10, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = -167 refused 0A000 (PG: SET)"),
+        (12, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = UTC+167 refused 0A000 (PG: SET)"),
+        (15, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = UTC+3:59 refused 0A000 (PG: SET)"),
+        (18, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = EST5EDT,M3.2.0/1:2:3,M11.1.0 refused 0A000 (PG: SET)"),
+        (19, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = <>5 refused 0A000 (PG: SET)"),
+        (20, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = <AB>5 refused 0A000 (PG: SET)"),
+        (21, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone =  5 refused 0A000 (PG: SET)"),
+        (22, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = 0x5 refused 0A000 (PG: SET)"),
+        (23, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = nan(1) refused 0A000 (PG: SET)"),
+        (24, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = UTC+005 refused 0A000 (PG: SET)"),
+        (25, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = UTC+100 refused 0A000 (PG: SET)"),
+        (26, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = AB3 refused 0A000 (PG: SET)"),
+        (27, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = A_B5 refused 0A000 (PG: SET)"),
+        (29, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = 05:30 refused 0A000 (PG: SET)"),
+        (30, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = +5:3 refused 0A000 (PG: SET)"),
+        (32, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = CST7CDT,M4.1.0,M10.5.0 refused 0A000 (PG: SET)"),
+        (33, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = UTC-2 refused 0A000 (PG: SET)"),
+        (34, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = -1.5 refused 0A000 (PG: SET)"),
+    ]
+);
+// Registered from the first host run, iccad11 9f5839a88 diff (rows read one by one; DECISIONS: only from a run's diff).
+replays_postgresql!(
+    pg18_rev_cd_setlocal_replays_as_postgresql_answered,
+    "pg18-rev-cd-setlocal.out",
+    [
+        (2, "PGDIV-SET-REFUSED ours-only [ours-only]: SET LOCAL TimeZone = America/New_York outside a block: the 25P01 warning as PG sends it, then refused 0A000 (PG: SET)"),
+    ]
+);
+// The line-review reds, from PG 18.6 recordings (pgraw.py: named statements and several
+// sessions; artie 2d9c4aa18b, 23bf38368a): B-L1 and B1 (a same-session DROP mid-round), B-L3 (another
+// session's DROP between Parse and Bind, in autocommit and in a block), E-H1 (the kept statement
+// across DROP, ADD COLUMN and a temp table in the round), the search_path re-analysis pin, and the
+// c39 LOW 5 AND CHAIN arms. Strict until a run's diff registers the intended rows.
+// Registered from the host run iccad11 ff9f1bdfe diff (each row read).
+replays_postgresql!(
+    pg18_rev_bl1_replays_as_postgresql_answered,
+    "pg18-rev-bl1.out",
+    [
+        (14, "PGDIV-SQLITE-NAME-MESSAGE error-text [wire]: 42P01 both at the Bind after the DROP (B1); ours 'Parse error: no such table: b' vs PG 'relation \"b\" does not exist'"),
+    ]
+);
+// Registered from the host run iccad11 ff9f1bdfe diff (each row read).
+replays_postgresql!(
+    pg18_rev_bl3_replays_as_postgresql_answered,
+    "pg18-rev-bl3.out",
+    [
+        (13, "PGDIV-SQLITE-NAME-MESSAGE error-text [wire]: 42P01 both; ours 'Parse error: no such table: c' vs PG 'relation \"c\" does not exist'"),
+    ]
+);
+// Registered from the first host run, iccad11 9f5839a88 diff (rows read one by one; DECISIONS: only from a run's diff).
+replays_postgresql!(
+    pg18_rev_eh1_replays_as_postgresql_answered,
+    "pg18-rev-eh1.out",
+    [
+        (1, "PGDIV-SCHEMA-REFUSED cluster-state [cluster]: [a] Q CREATE SCHEMA s: ours refuses 0A000 (schemas other than public)"),
+        (2, "PGDIV-SCHEMA-REFUSED cluster-state [cluster]: [a] Q CREATE TABLE s.t(x int): XX000 no such database (the schema was refused)"),
+        (3, "PGDIV-SCHEMA-REFUSED cluster-state [cluster]: [a] Q INSERT INTO s.t VALUES (2): XX000 no such database (the schema was refused)"),
+        (13, "PGDIV-SCHEMA-REFUSED cluster-state [cluster]: a cascade of #1's refusal: under search_path s, `t` resolves to no table (s was never created), so the round fails at its first Parse 42601 'no such object: t'"),
+        (14, "PGDIV-SCHEMA-REFUSED cluster-state [cluster]: a cascade of #1's refusal: DROP TABLE IF EXISTS s.t notices that schema s does not exist (PG drops the s.t it created)"),
+        (15, "PGDIV-SCHEMA-REFUSED cluster-state [cluster]: [a] Q CREATE TABLE s.t(x int): XX000 no such database (the schema was refused)"),
+        (16, "PGDIV-SCHEMA-REFUSED cluster-state [cluster]: [a] Q INSERT INTO s.t VALUES (2): XX000 no such database (the schema was refused)"),
+        (23, "PGDIV-SCHEMA-REFUSED cluster-state [cluster]: a cascade of #1's refusal: under search_path s, `t` resolves to no table (s was never created), so the round fails at its first Parse 42601 'no such object: t'"),
+        (34, "PGDIV-SCHEMA-REFUSED cluster-state [cluster]: a cascade of #1's refusal: under search_path s, `t` resolves to no table (s was never created), so the round fails at its first Parse 42601 'no such object: t'"),
+    ]
+);
+// Registered from the first host run, iccad11 9f5839a88 diff (rows read one by one; DECISIONS: only from a run's diff).
+replays_postgresql!(
+    pg18_rev_pin_path_replays_as_postgresql_answered,
+    "pg18-rev-pin-path.out",
+    [
+        (1, "PGDIV-SCHEMA-REFUSED cluster-state [cluster]: [a] Q CREATE SCHEMA s: ours refuses 0A000 (schemas other than public)"),
+        (2, "PGDIV-SCHEMA-REFUSED cluster-state [cluster]: [a] Q CREATE TABLE s.t(x int): XX000 no such database (the schema was refused)"),
+        (3, "PGDIV-SCHEMA-REFUSED cluster-state [cluster]: [a] Q INSERT INTO s.t VALUES (2): XX000 no such database (the schema was refused)"),
+        (11, "PGDIV-SCHEMA-REFUSED cluster-state [cluster]: a cascade of #1's refusal: under search_path s, `t` resolves to no table (s was never created), so the round fails at its first Parse 42601 'no such object: t'"),
+    ]
+);
+// Registered from the first host run, iccad11 9f5839a88 diff (rows read one by one; DECISIONS: only from a run's diff).
+replays_postgresql!(
+    pg18_rev_low5_chain_replays_as_postgresql_answered,
+    "pg18-rev-low5-chain.out",
+    [
+        (3, "PGDIV-SQLITE-NAME-MESSAGE error-text [wire]: 42P01 both; ours 'Parse error: no such table: nosuch' vs PG 'relation \"nosuch\" does not exist'"),
+        (11, "PGDIV-SQLITE-NAME-MESSAGE error-text [wire]: 42P01 both; ours 'Parse error: no such table: nosuch' vs PG 'relation \"nosuch\" does not exist'"),
+    ]
+);
+
+/// Review wire-line2 H1 (lead: a kind is never carried by text a client can write): client SQL
+/// that starts with the frontend's SQLite marker is refused (42601), on both protocols, so an engine
+/// re-prepare can never read a statement the session checked as PostgreSQL as SQLite instead. Its
+/// own SQLite text is marked by the frontend alone.
+#[test]
+fn client_text_cannot_carry_the_sqlite_marker() {
+    let dir = Scratch::new("marker-forge");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    for sql in [
+        "/* turso:sqlite */ SELECT 1",
+        "  /* turso:sqlite */ SELECT 1",
+        "SELECT 1; /* turso:sqlite */ SELECT 2",
+    ] {
+        let r = a.q(sql);
+        if r.error.as_ref().map(|e| e.code.as_str()) != Some("42601") {
+            wrong.push(format!("simple {sql:?}: tags {:?} error {:?}", r.tags, r.error));
+        }
+    }
+    let r = a.x("/* turso:sqlite */ SELECT 1", &[]);
+    if r.error.as_ref().map(|e| e.code.as_str()) != Some("42601") {
+        wrong.push(format!("extended: tags {:?} error {:?}", r.tags, r.error));
+    }
+    // The control: the same text without the marker, and the marker's words elsewhere.
+    a.q("SELECT 1").ok("control");
+    a.q("SELECT '/* turso:sqlite */ '").ok("the marker inside a literal");
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Review wire-line2 M3: each TimeZone row of PG 18.6's rev-cd-tz2 recording classified as
+/// PostgreSQL classified it, whatever this server's own answer to a valid value: an error row gets
+/// the same SQLSTATE, a `SET` row gets SET or this server's 0A000 (a valid zone it does not act
+/// on). Two messages exactly: #4's month echoed as interval_out prints it ('1 mon'), and #32's
+/// leap-seconds refusal. The strict replay, which needs the 0A000 rows registered from a run, stays
+/// beside it.
+#[test]
+fn every_recorded_timezone_value_is_classified_as_postgresql_did() {
+    // Both recordings (rev-l1-tz: the cases the reviews owed, review wire-line3 LOW-3/LOW-4), and
+    // EVERY error row's message compared exactly (LOW-5: two of 35 were).
+    let recording = [
+        include_str!("pg18/pg18-rev-cd-tz2.out"),
+        include_str!("pg18/pg18-rev-l1-tz.out"),
+    ]
+    .join("\n");
+    let dir = Scratch::new("tz-classify");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    let mut rows = 0;
+    let mut lines = recording.lines().peekable();
+    while let Some(line) = lines.next() {
+        let Some(sql) = line.strip_prefix(">> Q ") else { continue };
+        let mut answer = Vec::new();
+        while let Some(l) = lines.peek() {
+            if l.starts_with(">> ") {
+                break;
+            }
+            answer.push(lines.next().unwrap().trim().to_string());
+        }
+        rows += 1;
+        let pg_error = answer.iter().find_map(|l| l.strip_prefix("E S=ERROR C="));
+        let r = a.q(sql);
+        match pg_error {
+            Some(rest) => {
+                let (code, message) = rest.split_at(5);
+                let message = message.trim_start().strip_prefix("M=").unwrap_or("");
+                match &r.error {
+                    Some(e) if e.code == code => {
+                        if e.message != message {
+                            wrong.push(format!("{sql}: message {:?}, PostgreSQL {:?}", e.message, message));
+                        }
+                    }
+                    other => wrong.push(format!("{sql}: PostgreSQL {code}, ours {other:?}")),
+                }
+            }
+            None => match &r.error {
+                None => {}
+                Some(e) if e.code == "0A000" => {}
+                Some(e) => wrong.push(format!("{sql}: PostgreSQL SET, ours {} {}", e.code, e.message)),
+            },
+        }
+    }
+    assert!(rows >= 62, "premise: {rows} recorded rows");
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Review wire-line3 HIGH-1 (lead class: ONE quoting function for every identifier and literal the
+/// frontend pastes into engine text). COPY FROM's column list names only columns the table has
+/// (42703, as PostgreSQL answers, and no row lands), and a column name holding a double quote is
+/// quoted, not pasted: `"a""b"` loads (COPY 1; PostgreSQL 18.6's answer). Both went into the
+/// marked SQLite INSERT as written.
+#[test]
+fn copy_names_only_the_tables_columns_and_quotes_each() {
+    let dir = Scratch::new("copy-columns");
+    let file = dir.0.join("rows.tsv");
+    std::fs::write(&file, "1\n").unwrap();
+    // Its COPY FROM reads a file the test wrote in its scratch: granted (review wire-quote LOW-3).
+    let server = Server::start(&dir.db(), &["--copy-from-dir", dir.0.to_str().unwrap()]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE t (a int, b text)").ok("t");
+    a.q("CREATE TABLE q (\"a\"\"b\" int)").ok("q");
+    let mut wrong = Vec::new();
+    let r = a.q(&format!("COPY t (nosuch) FROM '{}'", file.display()));
+    if r.error.as_ref().map(|e| e.code.as_str()) != Some("42703") {
+        wrong.push(format!("an unknown column: tags {:?} error {:?}", r.tags, r.error));
+    }
+    if a.q("SELECT count(*) FROM t").single("count") != "0" {
+        wrong.push("an unknown column's COPY inserted a row".to_string());
+    }
+    let r = a.q(&format!("COPY q (\"a\"\"b\") FROM '{}'", file.display()));
+    if r.error.is_some() || r.tags != ["COPY 1"] {
+        wrong.push(format!("a quoted column: tags {:?} error {:?}", r.tags, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Review wire-line3 MED-1 and MED-2: a schema or table name holding a double quote reaches ATTACH,
+/// DETACH, the schema lookups and DROP SCHEMA ... CASCADE's DROP TABLE quoted (PostgreSQL's answers:
+/// CREATE SCHEMA, CREATE TABLE, DROP SCHEMA), and a public table whose name holds quotes and a dot
+/// is dropped by DROP SCHEMA public CASCADE without touching s.victim, which another table's name
+/// only resembles.
+#[test]
+fn schema_and_table_names_holding_quotes_are_quoted_in_engine_text() {
+    // The server refuses CREATE SCHEMA and DROP SCHEMA of any schema but public (0A000, since
+    // 5ab82f374), so the schema statements run through the CLI, the same frontend's builders (the
+    // ATTACH of a schema file, DROP SCHEMA ... CASCADE's DROP TABLE text); the server then opens
+    // the schema files at session open (their ATTACH) and runs DROP SCHEMA public CASCADE. The
+    // first host run (iccad11, 9f5839a88) found this red's premise wrong: CREATE SCHEMA was sent
+    // to the server.
+    let dir = Scratch::new("quoted-names");
+    let mut wrong = Vec::new();
+    let cli = |sql: &str, wrong: &mut Vec<String>| {
+        let out = Command::new(env!("CARGO_BIN_EXE_tursopg"))
+            .arg(dir.db())
+            .arg(sql)
+            .stdin(Stdio::null())
+            .output()
+            .expect("the CLI");
+        if !out.status.success() {
+            wrong.push(format!(
+                "CLI {sql}: {}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+    };
+    for sql in [
+        "CREATE SCHEMA \"s\"\"x\"",
+        "CREATE TABLE \"s\"\"x\".t (a int)",
+        "DROP SCHEMA \"s\"\"x\" CASCADE",
+        "CREATE SCHEMA \"s\"\"y\"",
+        "CREATE TABLE \"s\"\"y\".t (a int)",
+        "CREATE SCHEMA s",
+        "CREATE TABLE s.victim (x int)",
+    ] {
+        cli(sql, &mut wrong);
+    }
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "SELECT count(*) FROM \"s\"\"y\".t",
+        "CREATE TABLE \"s\"\".\"\"victim\" (x int)",
+        "DROP SCHEMA public CASCADE",
+    ] {
+        if let Some(e) = a.q(sql).error {
+            wrong.push(format!("{sql}: {} {}", e.code, e.message));
+        }
+    }
+    let r = a.q("SELECT count(*) FROM s.victim");
+    if r.error.is_some() {
+        wrong.push(format!("s.victim was dropped by DROP SCHEMA public CASCADE: {:?}", r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+// Registered from the first host run, iccad11 9f5839a88 diff (rows read one by one; DECISIONS: only from a run's diff).
+replays_postgresql!(
+    pg18_rev_l1_tz_replays_as_postgresql_answered,
+    "pg18-rev-l1-tz.out",
+    [
+        (1, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = +05:30:00 refused 0A000 (PG: SET)"),
+        (3, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = UTC+3:00:60 refused 0A000 (PG: SET)"),
+        (5, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = UTC+3:00:00 refused 0A000 (PG: SET)"),
+        (6, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = 0.001 refused 0A000 (PG: SET)"),
+        (9, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = A;B5 refused 0A000 (PG: SET)"),
+        (11, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = 0x1p3 refused 0A000 (PG: SET)"),
+        (22, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = INTERVAL '5 hrs' refused 0A000 (PG: SET)"),
+        (23, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = INTERVAL '1 h' refused 0A000 (PG: SET)"),
+        (26, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = INTERVAL '5' refused 0A000 (PG: SET)"),
+    ]
+);
+
+/// The first host run (iccad11, RHEL 8, 9f5839a88): zone_file read the HOST's zone database, and
+/// RHEL 8's lacks `Factory`, so a zone PostgreSQL knows answered 22023 there (rev-c39-tzforms #8;
+/// the blind spot zone_file's caller states). PostgreSQL reads its own tz database, so every name
+/// in PG 18.6's pg_timezone_names (recorded in full, pg18-rev-host1.out) is a valid TimeZone on
+/// any host: SET for a UTC spelling, else this server's 0A000, never 22023.
+#[test]
+fn every_zone_postgresql_knows_is_a_valid_timezone() {
+    let recording = include_str!("pg18/pg18-rev-host1.out");
+    let names: Vec<&str> = recording
+        .lines()
+        .skip_while(|l| !l.ends_with("Q SELECT name FROM pg_timezone_names ORDER BY name"))
+        .skip(2)
+        .take_while(|l| l.starts_with("   D ['"))
+        .map(|l| &l["   D ['".len()..l.len() - "']".len()])
+        .collect();
+    assert_eq!(names.len(), 598, "premise: the recording's SELECT 598 rows are read");
+    let dir = Scratch::new("pg-zones");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    for name in &names {
+        if let Some(e) = a.q(&format!("SET TimeZone = '{name}'")).error {
+            if e.code != "0A000" {
+                wrong.push(format!("{name}: {} {}", e.code, e.message));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+// Registered from the host run iccad11 ff9f1bdfe diff (each row read).
+replays_postgresql!(
+    pg18_rev_host1_replays_as_postgresql_answered,
+    "pg18-rev-host1.out",
+    [
+        (4, "PGDIV-CONSTRAINT-MESSAGE error-text [wire]: 23502 both; ours 'NOT NULL constraint failed: t.id' vs PG 'null value in column \"id\" of relation \"t\" violates not-null constraint'"),
+        (35, "PGDIV-CURSOR-REFUSED ours-only [ours-only]: DECLARE CURSOR outside a block: PG BindComplete then 25P01 at Execute; ours 0A000 at Bind"),
+        (40, "PGDIV-CURSOR-REFUSED ours-only [ours-only]: DECLARE CURSOR in a block: PG DECLARE CURSOR; ours 0A000 at Bind, which fails the block"),
+        (45, "PGDIV-CALL-REFUSED ours-only [ours-only]: CALL nosuch(): PG 42883 at Parse; ours ParseComplete then 0A000 at Bind"),
+        (46, "PGDIV-PG-TIMEZONE-NAMES value [wire]: no pg_timezone_names view (42P01)"),
+        (47, "PGDIV-SET-REFUSED ours-only [ours-only]: SET timezone = Factory refused 0A000 (PG: SET)"),
+        (48, "PGDIV-CLUSTER-SETTINGS cluster-state [cluster]: RESET TimeZone: the recording cluster's default is America/New_York (ParameterStatus); ours stays UTC, sending none"),
+        (49, "PGDIV-PG-TIMEZONE-NAMES value [wire]: no pg_timezone_names view (42P01)"),
+    ]
+);
+
+/// Review wire-quote HIGH-1 (artie 8280634a2f): libpg_query hands the translator names already
+/// unquoted, and Name::from_string read a leading `"`, `'`, `` ` `` or `[` as SQL quoting again: it
+/// asserted on the closing quote (a panic, which aborts every session under the release
+/// profile's panic = "abort"), and stripped the quotes of a name that holds them, so `"""t"""`
+/// named `t`. A quote-led name is a name: an unknown one is 42P01 with the session alive, and a
+/// table named `"t"` is not `t`.
+#[test]
+fn a_quote_led_identifier_is_a_name_not_quoting() {
+    let dir = Scratch::new("quote-led");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    for sql in [
+        "SELECT * FROM \"\"\"a\"",
+        "SELECT * FROM \"'a\"",
+        "SELECT * FROM \"[a\"",
+        "SELECT * FROM \"`a\"",
+    ] {
+        let r = a.q(sql);
+        if r.error.as_ref().map(|e| e.code.as_str()) != Some("42P01") {
+            wrong.push(format!("{sql}: want 42P01, got {:?}", r.error));
+        }
+        if let Some(e) = a.q("SELECT 1").error {
+            wrong.push(format!("after {sql}: the session is gone: {e:?}"));
+            return assert!(wrong.is_empty(), "{wrong:#?}");
+        }
+    }
+    for sql in [
+        "CREATE TABLE \"\"\"t\"\"\" (x int)",
+        "CREATE TABLE t (y int)",
+        "INSERT INTO t VALUES (7)",
+        "BEGIN",
+        "SAVEPOINT \"\"\"s\"",
+        "RELEASE SAVEPOINT \"\"\"s\"",
+        "COMMIT",
+    ] {
+        if let Some(e) = a.q(sql).error {
+            wrong.push(format!("{sql}: {} {}", e.code, e.message));
+        }
+    }
+    let quoted = a.q("SELECT count(*) FROM \"\"\"t\"\"\"");
+    if quoted.error.is_some() || quoted.rows != vec![vec![Some("0".to_string())]] {
+        wrong.push(format!("the table named \"t\" (empty): {:?} {:?}", quoted.rows, quoted.error));
+    }
+    let plain = a.q("SELECT y FROM t");
+    if plain.error.is_some() || plain.rows != vec![vec![Some("7".to_string())]] {
+        wrong.push(format!("the table named t: {:?} {:?}", plain.rows, plain.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Review wire-quote MED-1: an ENUM's labels and its type name went into the stored CREATE TYPE
+/// text as `'{l}'` and `'invalid input value for enum {type_name}'`, unescaped, and that text is
+/// parsed again at every schema load. A label holding a quote (`a'b`) broke the reload. After a
+/// restart the type still reads and checks its labels.
+#[test]
+fn an_enum_label_or_type_name_holding_a_quote_survives_a_restart() {
+    let dir = Scratch::new("enum-quote");
+    let mut wrong = Vec::new();
+    {
+        let server = Server::start(&dir.db(), &[]);
+        let mut a = server.connect();
+        for sql in ["CREATE TYPE m AS ENUM ('a''b', 'c')", "CREATE TYPE \"m'x\" AS ENUM ('z')"] {
+            if let Some(e) = a.q(sql).error {
+                wrong.push(format!("{sql}: {} {}", e.code, e.message));
+            }
+        }
+    }
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let r = a.q("SELECT 'a''b'::m");
+    if r.error.is_some() || r.rows != vec![vec![Some("a'b".to_string())]] {
+        wrong.push(format!("after a restart, 'a''b'::m: {:?} {:?}", r.rows, r.error));
+    }
+    let r = a.q("SELECT 'z'::\"m'x\"");
+    if r.error.is_some() || r.rows != vec![vec![Some("z".to_string())]] {
+        wrong.push(format!("after a restart, 'z'::\"m'x\": {:?} {:?}", r.rows, r.error));
+    }
+    if a.q("SELECT 'q'::m").error.is_none() {
+        wrong.push("after a restart, 'q'::m is accepted: the label check is gone".to_string());
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Review wire-quote MED-2: a serial column's default `nextval('{table}_{col}_seq')` pasted the
+/// table name unescaped into a string literal, and ALTER stores that text for good. In a table
+/// named `x'y` the stored default no longer parsed. After DROP COLUMN, a reconnect and a restart,
+/// INSERT ... DEFAULT VALUES still takes the serial.
+#[test]
+fn a_serial_in_a_table_named_with_a_quote_survives_alter_and_a_restart() {
+    let dir = Scratch::new("serial-quote");
+    let mut wrong = Vec::new();
+    {
+        let server = Server::start(&dir.db(), &[]);
+        let mut a = server.connect();
+        for sql in ["CREATE TABLE \"x'y\" (id serial, a int)", "ALTER TABLE \"x'y\" DROP COLUMN a"] {
+            if let Some(e) = a.q(sql).error {
+                wrong.push(format!("{sql}: {} {}", e.code, e.message));
+            }
+        }
+        let mut b = server.connect();
+        let r = b.q("INSERT INTO \"x'y\" DEFAULT VALUES");
+        if r.error.is_some() || r.tags.last().map(String::as_str) != Some("INSERT 0 1") {
+            wrong.push(format!("after a reconnect: {:?} {:?}", r.tags, r.error));
+        }
+    }
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let r = a.q("INSERT INTO \"x'y\" DEFAULT VALUES");
+    if r.error.is_some() || r.tags.last().map(String::as_str) != Some("INSERT 0 1") {
+        wrong.push(format!("after a restart: {:?} {:?}", r.tags, r.error));
+    }
+    let r = a.q("SELECT max(id) FROM \"x'y\"");
+    if r.error.is_some() || r.rows != vec![vec![Some("2".to_string())]] {
+        wrong.push(format!("the serial's values: {:?} {:?}", r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Found by the first host run of the review wire-quote MED-2 red: with no quote anywhere, a serial
+/// column's table no longer opened after ALTER TABLE ... DROP COLUMN. ALTER stores the table as
+/// SQLite text with the default as given, `DEFAULT nextval ('xy_id_seq')`, and SQLite's grammar
+/// takes only `DEFAULT (expr)` for a call, so every later open failed with near "(". Also INSERT
+/// ... DEFAULT VALUES was refused ("INSERT missing VALUES or SELECT").
+#[test]
+fn a_serial_survives_drop_column_and_a_restart() {
+    let dir = Scratch::new("serial-alter");
+    let mut wrong = Vec::new();
+    {
+        let server = Server::start(&dir.db(), &[]);
+        let mut a = server.connect();
+        for sql in [
+            "CREATE TABLE xy (id serial, a int)",
+            "INSERT INTO xy DEFAULT VALUES",
+            "ALTER TABLE xy DROP COLUMN a",
+        ] {
+            if let Some(e) = a.q(sql).error {
+                wrong.push(format!("{sql}: {} {}", e.code, e.message));
+            }
+        }
+    }
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let r = a.q("INSERT INTO xy DEFAULT VALUES");
+    if r.error.is_some() || r.tags.last().map(String::as_str) != Some("INSERT 0 1") {
+        wrong.push(format!("after a restart: {:?} {:?}", r.tags, r.error));
+    }
+    let r = a.q("SELECT id FROM xy ORDER BY id");
+    if r.error.is_some() || r.rows != vec![vec![Some("1".to_string())], vec![Some("2".to_string())]] {
+        wrong.push(format!("the serial's values: {:?} {:?}", r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// One CLI process per statement on `dir`'s database, its stdout and whether it succeeded.
+fn cli_one(dir: &Scratch, sql: &str) -> (bool, String) {
+    let out = Command::new(env!("CARGO_BIN_EXE_tursopg"))
+        .arg(dir.db())
+        .arg(sql)
+        .stdin(Stdio::null())
+        .output()
+        .expect("the CLI");
+    (
+        out.status.success(),
+        format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)),
+    )
+}
+
+/// Review wire-quote MED-3: the schema file of a dropped schema was chosen by hand-parsing the
+/// client's text, in the server only, after prepare and before commit. Through the CLI nothing
+/// deleted it, so the next open attached the dropped schema again; `DROP SCHEMA IF EXISTS "my x"`
+/// read as `my`; `"s""x"` read as `s""x`. The frontend deletes the file of the schema it
+/// resolved and detached, once the DROP is committed. The `"my x"` arm is a CONTROL, not a red
+/// (wire-rev-uw1 LOW-1): it cannot fail at its base, since the old deleter ran only in the server
+/// and this test goes through the CLI, and the server refused the statement first anyway; the
+/// `s"x` and `gone` arms are the ones red at the base (out/med3-red).
+#[test]
+fn a_dropped_schemas_file_is_the_resolved_schemas_and_goes_at_commit() {
+    let dir = Scratch::new("drop-schema-file");
+    let mut wrong = Vec::new();
+    let mut must = |sql: &str, wrong: &mut Vec<String>| {
+        let (ok, out) = cli_one(&dir, sql);
+        if !ok {
+            wrong.push(format!("{sql}: {out}"));
+        }
+        out
+    };
+    for sql in [
+        "CREATE SCHEMA my",
+        "CREATE TABLE my.t (x int)",
+        "INSERT INTO my.t VALUES (1)",
+        "DROP SCHEMA IF EXISTS \"my x\"",
+        "CREATE SCHEMA \"s\"\"x\"",
+        "DROP SCHEMA \"s\"\"x\"",
+        "CREATE SCHEMA \"s\"\"x\"",
+        "CREATE SCHEMA gone",
+        "DROP SCHEMA gone",
+        "CREATE SCHEMA gone",
+    ] {
+        must(sql, &mut wrong);
+    }
+    let out = must("SELECT count(*) FROM my.t", &mut wrong);
+    if !out.contains('1') {
+        wrong.push(format!("my.t after DROP SCHEMA IF EXISTS \"my x\": {out}"));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// The server refuses CREATE SCHEMA and DROP SCHEMA of any schema but public (5ab82f374), and it
+/// read the statement's kind from the client's text: a leading comment hid it, so the frontend
+/// ran the DDL on the server. The refusal is decided from the parsed statement.
+#[test]
+fn the_servers_schema_refusal_reads_the_statement_not_its_text() {
+    let dir = Scratch::new("schema-refusal");
+    cli_script(&dir, b"CREATE SCHEMA s;\nCREATE TABLE s.t(x INT);\nINSERT INTO s.t VALUES (2);\n");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    for sql in [
+        "/* c */ CREATE SCHEMA n",
+        "-- c\nCREATE SCHEMA n",
+        "/* c */ DROP SCHEMA s CASCADE",
+        "SELECT 1; DROP SCHEMA s CASCADE",
+    ] {
+        let r = a.q(sql);
+        if r.error.as_ref().map(|e| e.code.as_str()) != Some("0A000") {
+            wrong.push(format!("{sql}: want 0A000, got {:?}", r.error));
+        }
+    }
+    let r = a.q("SELECT x FROM s.t");
+    if r.error.is_some() || r.rows != vec![vec![Some("2".to_string())]] {
+        wrong.push(format!("s.t after the refused DROPs: {:?} {:?}", r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Lead ruling 2026-10-18 on rev-bl1 #19: a DROP TABLE of a table this session's own open named
+/// portal reads is refused, as PostgreSQL refuses it (55006 'cannot DROP TABLE "e" because it is
+/// being used by active queries in this session'), since a dropped table under a live cursor risks
+/// a wrong answer or a crash. Ours dropped it. A portal that ran to completion, or was closed, no
+/// longer holds its table; an unrelated table drops as before.
+#[test]
+fn a_drop_of_a_table_an_open_portal_reads_is_55006() {
+    let dir = Scratch::new("drop-held");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for t in ["e", "f", "g", "other"] {
+        a.q(&format!("CREATE TABLE {t}(x int)")).ok(t);
+        a.q(&format!("INSERT INTO {t} VALUES (1)")).ok(t);
+    }
+    let mut wrong = Vec::new();
+    a.q("BEGIN").ok("begin");
+    named_parse(&mut a, "se", "SELECT x FROM e");
+    named_bind(&mut a, "pe", "se");
+    let r = a.q("DROP TABLE e");
+    if r.error.as_ref().map(|e| e.code.as_str()) != Some("55006") {
+        wrong.push(format!("DROP TABLE e under the open portal pe: {:?}", r.error));
+    }
+    a.q("ROLLBACK").ok("rollback");
+    a.q("BEGIN").ok("begin");
+    named_parse(&mut a, "so", "SELECT x FROM e");
+    named_bind(&mut a, "po", "so");
+    a.send(b'S', &[]);
+    a.read_reply();
+    if let Some(e) = a.q("DROP TABLE other").error {
+        wrong.push(format!("DROP TABLE other (no portal reads it): {} {}", e.code, e.message));
+    }
+    a.q("COMMIT").ok("commit");
+    a.q("BEGIN").ok("begin");
+    named_parse(&mut a, "sf", "SELECT x FROM f");
+    named_bind(&mut a, "pf", "sf");
+    named_execute(&mut a, "pf");
+    a.send(b'S', &[]);
+    a.read_reply();
+    if let Some(e) = a.q("DROP TABLE f").error {
+        wrong.push(format!("DROP TABLE f after pf ran to completion: {} {}", e.code, e.message));
+    }
+    named_parse(&mut a, "sg", "SELECT x FROM g");
+    named_bind(&mut a, "pg", "sg");
+    a.send(b'C', b"Ppg\0");
+    a.send(b'S', &[]);
+    a.read_reply();
+    if let Some(e) = a.q("DROP TABLE g").error {
+        wrong.push(format!("DROP TABLE g after pg was closed: {} {}", e.code, e.message));
+    }
+    a.q("COMMIT").ok("commit");
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Lead ruling 2026-10-18 on rev-bl3 #19: another session's DROP TABLE of a table this session's
+/// open block has parsed waits its lock_timeout and is 55P03, as PostgreSQL's AccessShareLock
+/// makes it (pg18-rev-bl3.out). Ours dropped it, and the reader's Bind in its block was 42P01, so
+/// the reader's snapshot did not keep the table: not a consistent read to register, a defect.
+/// After the reader's block ends the DROP runs; in autocommit a Parse holds nothing.
+#[test]
+fn another_sessions_drop_waits_for_a_blocks_read_and_is_55p03() {
+    let dir = Scratch::new("drop-xsession");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut b = server.connect();
+    for t in ["c", "d"] {
+        a.q(&format!("CREATE TABLE {t}(x int)")).ok(t);
+        a.q(&format!("INSERT INTO {t} VALUES (1)")).ok(t);
+    }
+    let mut wrong = Vec::new();
+    a.q("BEGIN").ok("begin");
+    named_parse(&mut a, "sd", "SELECT x FROM d");
+    a.send(b'S', &[]);
+    a.read_reply();
+    b.q("SET lock_timeout = '300ms'").ok("lock_timeout");
+    let started = Instant::now();
+    let r = b.q("DROP TABLE d");
+    if r.error.as_ref().map(|e| e.code.as_str()) != Some("55P03") {
+        wrong.push(format!("b's DROP TABLE d under a's block: {:?}", r.error));
+    } else if started.elapsed() < Duration::from_millis(250) {
+        wrong.push(format!("b's 55P03 came after {:?}, before its lock_timeout", started.elapsed()));
+    }
+    named_bind(&mut a, "", "sd");
+    named_execute(&mut a, "");
+    a.send(b'S', &[]);
+    let r = a.read_reply();
+    if r.error.is_some() || r.rows != vec![vec![Some("1".to_string())]] {
+        wrong.push(format!("a's read in its block after b's DROP: {:?} {:?}", r.rows, r.error));
+    }
+    a.q("COMMIT").ok("commit");
+    if let Some(e) = b.q("DROP TABLE d").error {
+        wrong.push(format!("b's DROP TABLE d after a's block ended: {} {}", e.code, e.message));
+    }
+    named_parse(&mut a, "sc", "SELECT x FROM c");
+    a.send(b'S', &[]);
+    a.read_reply();
+    if let Some(e) = b.q("DROP TABLE c").error {
+        wrong.push(format!("b's DROP TABLE c after a's autocommit Parse: {} {}", e.code, e.message));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-uw2 H1: the cross-session wait covered only a literal DROP TABLE, so every other
+/// statement that invalidates a block's read ran at once, and the reader's Bind in its block was
+/// 42P01 (42703 for a type change). PostgreSQL 18.6 makes each wait its lock_timeout and answers
+/// 55P03, and the reader then reads its rows (recorded by the reviewer: artie 718f73d7c1,
+/// reviews/uw2-raws/round1-pg-all.txt x01-x12 and round1-pg-run2.txt y01-y09): ALTER TABLE
+/// RENAME, ADD COLUMN, DROP COLUMN and ALTER COLUMN TYPE, TRUNCATE, DROP INDEX of the read
+/// table's index, DROP SCHEMA public CASCADE (the branch server's one schema), DROP TABLE of a
+/// name holding a dot, DROP TABLE ... CASCADE of a table read through a view, and DROP VIEW; and
+/// a DROP TABLE whose name is qualified on one side only. A statement that touches nothing the
+/// block read runs at once.
+#[test]
+fn every_ddl_that_invalidates_a_blocks_read_waits_and_is_55p03() {
+    let dir = Scratch::new("ddl-xsession");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut b = server.connect();
+    for sql in [
+        "CREATE TABLE d(x int, y int)",
+        "INSERT INTO d VALUES (1, 1)",
+        "CREATE INDEX di ON d(x)",
+        "CREATE VIEW dv AS SELECT x FROM d",
+        "CREATE TABLE \"a.b\"(x int)",
+        "INSERT INTO \"a.b\" VALUES (1)",
+        "CREATE TABLE other(x int)",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    b.q("SET lock_timeout = '300ms'").ok("lock_timeout");
+    let mut wrong = Vec::new();
+    for (read, ddl) in [
+        ("SELECT x FROM d", "ALTER TABLE d RENAME TO d2"),
+        ("SELECT x FROM d", "ALTER TABLE d ADD COLUMN z int"),
+        ("SELECT x FROM d", "ALTER TABLE d DROP COLUMN y"),
+        ("SELECT x FROM d", "ALTER TABLE d ALTER COLUMN x TYPE text"),
+        ("SELECT x FROM d", "TRUNCATE d"),
+        ("SELECT x FROM d", "DROP INDEX di"),
+        ("SELECT x FROM d", "DROP SCHEMA public CASCADE"),
+        ("SELECT x FROM public.d", "DROP TABLE d"),
+        ("SELECT x FROM d", "DROP TABLE public.d"),
+        ("SELECT x FROM \"a.b\"", "DROP TABLE \"a.b\""),
+        ("SELECT x FROM dv", "DROP TABLE d CASCADE"),
+        ("SELECT x FROM dv", "DROP VIEW dv"),
+    ] {
+        a.q("BEGIN").ok("begin");
+        named_parse(&mut a, "", read);
+        a.send(b'S', &[]);
+        a.read_reply();
+        let started = Instant::now();
+        let r = b.q(ddl);
+        let waited = started.elapsed();
+        match &r.error {
+            Some(e) if e.code == "55P03" && waited >= Duration::from_millis(250) => {}
+            Some(e) => wrong.push(format!("{ddl} under a's block read {read:?}: {} {} after {waited:?}", e.code, e.message)),
+            None => wrong.push(format!("{ddl} under a's block read {read:?}: ran, after {waited:?}")),
+        }
+        named_bind(&mut a, "", "");
+        named_execute(&mut a, "");
+        a.send(b'S', &[]);
+        let r = a.read_reply();
+        if r.error.is_some() || r.rows != vec![vec![Some("1".to_string())]] {
+            wrong.push(format!("a's {read:?} in its block after b's {ddl}: {:?} {:?}", r.rows, r.error));
+        }
+        a.q("COMMIT").ok("commit");
+    }
+    a.q("BEGIN").ok("begin");
+    named_parse(&mut a, "", "SELECT x FROM d");
+    a.send(b'S', &[]);
+    a.read_reply();
+    for ddl in ["ALTER TABLE other ADD COLUMN z int", "TRUNCATE other", "DROP TABLE other"] {
+        let started = Instant::now();
+        if let Some(e) = b.q(ddl).error {
+            wrong.push(format!("{ddl} (a's block read only d): {} {} after {:?}", e.code, e.message, started.elapsed()));
+        }
+    }
+    a.q("COMMIT").ok("commit");
+    if let Some(e) = b.q("TRUNCATE d").error {
+        wrong.push(format!("TRUNCATE d after a's block ended: {} {}", e.code, e.message));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-uw2 MED (same-session 55006 bypasses): with a named portal open on a read, PostgreSQL
+/// 18.6 refuses, 55006, every statement that would drop or rewrite a relation the portal reads,
+/// naming that relation, and runs the ones its CheckTableNotInUse does not cover (recorded by the
+/// reviewer: artie 718f73d7c1, reviews/uw2-raws/round1-pg-all.txt s01-s16). Ours refused only a
+/// literal DROP TABLE of a name as written: DROP SCHEMA public CASCADE and TRUNCATE ran under the
+/// portal, a name holding a dot was split at the dot, and a table read through a view was not
+/// seen. ALTER TABLE RENAME, DROP INDEX and DROP VIEW of the portal's own view run, as in PG.
+#[test]
+fn ddl_under_this_sessions_open_portal_follows_postgresql() {
+    let dir = Scratch::new("ddl-held");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE TABLE e(x int, y int)",
+        "INSERT INTO e VALUES (1, 1)",
+        "CREATE INDEX ei ON e(x)",
+        "CREATE VIEW v AS SELECT x FROM e",
+        "CREATE TABLE \"a.b\"(x int)",
+        "INSERT INTO \"a.b\" VALUES (1)",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    let in_use = |verb: &str, name: &str| {
+        format!("cannot {verb} \"{name}\" because it is being used by active queries in this session")
+    };
+    let mut wrong = Vec::new();
+    for (i, case) in [
+        ("SELECT x FROM e", "DROP SCHEMA public CASCADE", Some(in_use("DROP TABLE", "e"))),
+        ("SELECT x FROM e", "ALTER TABLE e DROP COLUMN y", Some(in_use("ALTER TABLE", "e"))),
+        ("SELECT x FROM e", "TRUNCATE e", Some(in_use("TRUNCATE", "e"))),
+        ("SELECT x FROM v", "DROP TABLE e CASCADE", Some(in_use("DROP TABLE", "e"))),
+        ("SELECT x FROM \"a.b\"", "DROP TABLE \"a.b\"", Some(in_use("DROP TABLE", "a.b"))),
+        ("WITH w AS (SELECT x FROM e) SELECT x FROM w", "DROP TABLE e", Some(in_use("DROP TABLE", "e"))),
+        ("SELECT 1 FROM (SELECT x FROM e) q", "DROP TABLE e", Some(in_use("DROP TABLE", "e"))),
+        ("SELECT x FROM e", "ALTER TABLE e RENAME TO e2", None),
+        ("SELECT x FROM e", "DROP INDEX ei", None),
+        ("SELECT x FROM v", "DROP VIEW v", None),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (read, ddl, want) = case;
+        let stmt = format!("sh{i}");
+        a.q("BEGIN").ok("begin");
+        named_parse(&mut a, &stmt, read);
+        named_bind(&mut a, "ph", &stmt);
+        a.send(b'S', &[]);
+        a.read_reply();
+        let r = a.q(ddl);
+        match (&r.error, &want) {
+            (Some(e), Some(w)) if e.code == "55006" && e.message == *w => {}
+            (None, None) => {}
+            (got, _) => wrong.push(format!(
+                "{ddl} under the open portal on {read:?}: {:?}, PostgreSQL {}",
+                got.as_ref().map(|e| (&e.code, &e.message)),
+                want.as_deref().map_or("runs".to_string(), |w| format!("55006 {w:?}"))
+            )),
+        }
+        a.q("ROLLBACK").ok("rollback");
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-uw2 LOW: a block's reads were held to the block's end even past a ROLLBACK TO the
+/// savepoint before them and past an error that failed the block, so another session's DROP
+/// waited and was 55P03. PostgreSQL 18.6 releases a subtransaction's locks at its ROLLBACK TO and
+/// a failed block's at the error (recorded by the reviewer: artie 718f73d7c1,
+/// reviews/uw2-raws/round1-pg-all.txt r07, r08: the other session's DROP runs within 50 ms).
+#[test]
+fn a_blocks_reads_end_at_rollback_to_and_at_its_error() {
+    let dir = Scratch::new("reads-subxact");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut b = server.connect();
+    for t in ["d1", "d2", "d3"] {
+        a.q(&format!("CREATE TABLE {t}(x int)")).ok(t);
+        a.q(&format!("INSERT INTO {t} VALUES (1)")).ok(t);
+    }
+    a.q("CREATE TABLE u(x int PRIMARY KEY)").ok("u");
+    a.q("INSERT INTO u VALUES (1)").ok("u");
+    b.q("SET lock_timeout = '50ms'").ok("lock_timeout");
+    let mut wrong = Vec::new();
+    // r07: the read after SAVEPOINT s is released by ROLLBACK TO s; the one before it is kept.
+    a.q("BEGIN").ok("begin");
+    a.q("SELECT x FROM d3").ok("read d3");
+    a.q("SAVEPOINT s").ok("savepoint");
+    a.q("SELECT x FROM d1").ok("read d1");
+    a.q("ROLLBACK TO SAVEPOINT s").ok("rollback to");
+    if let Some(e) = b.q("DROP TABLE d1").error {
+        wrong.push(format!("b's DROP TABLE d1 after a's ROLLBACK TO s: {} {}", e.code, e.message));
+    }
+    match b.q("DROP TABLE d3").error {
+        Some(e) if e.code == "55P03" => {}
+        other => wrong.push(format!("b's DROP TABLE d3 (read before SAVEPOINT s): want 55P03, got {other:?}")),
+    }
+    a.q("ROLLBACK").ok("rollback");
+    // r08: a statement that fails inside a block ends the block's reads at the error. r08's own
+    // statement, SELECT ... WHERE x = 1/0, does not fail on this engine (integer division by zero
+    // is NULL here: known-red integer_division_by_zero_is_22012), so the failing statement reads
+    // d2 and fails at run time on a key: the same error-in-a-block path.
+    a.q("BEGIN").ok("begin");
+    let r = a.q("INSERT INTO u SELECT x FROM d2");
+    if r.error.as_ref().map(|e| e.code.as_str()) != Some("23505") {
+        wrong.push(format!("premise: a's INSERT INTO u SELECT x FROM d2 fails 23505: {:?}", r.error));
+    }
+    if let Some(e) = b.q("DROP TABLE d2").error {
+        wrong.push(format!("b's DROP TABLE d2 while a's block is failed: {} {}", e.code, e.message));
+    }
+    a.q("ROLLBACK").ok("rollback");
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Review wire-quote LOW-2: pg_get_indexdef, pg_indexes.indexdef and pg_get_constraintdef printed
+/// identifiers unquoted, so pg_dump-style output of a name like `a b` did not read back. PostgreSQL
+/// 18.6 quotes each by quote_identifier and qualifies the index's table (recorded with these very
+/// statements: artie b2e3e87f75, pg18-rev-quote-low.out).
+#[test]
+fn definitions_quote_their_identifiers_as_postgresql_does() {
+    let dir = Scratch::new("defs-quoted");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE TABLE \"a b\"(x int, \"Y\" int, id int PRIMARY KEY)",
+        "CREATE INDEX \"i j\" ON \"a b\"(x)",
+        "CREATE UNIQUE INDEX plain ON \"a b\"(\"Y\")",
+        "CREATE TABLE \"c d\"(r int REFERENCES \"a b\"(id), CONSTRAINT \"u k\" UNIQUE (r))",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    for (sql, want) in [
+        ("SELECT pg_get_indexdef(oid) FROM pg_class WHERE relname = 'i j'", "CREATE INDEX \"i j\" ON public.\"a b\" USING btree (x)"),
+        ("SELECT pg_get_indexdef(oid) FROM pg_class WHERE relname = 'plain'", "CREATE UNIQUE INDEX plain ON public.\"a b\" USING btree (\"Y\")"),
+        ("SELECT indexdef FROM pg_indexes WHERE indexname = 'i j'", "CREATE INDEX \"i j\" ON public.\"a b\" USING btree (x)"),
+        (
+            "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE contype = 'f'",
+            "FOREIGN KEY (r) REFERENCES \"a b\"(id)",
+        ),
+    ] {
+        let r = a.q(sql);
+        if r.error.is_some() || r.rows != vec![vec![Some(want.to_string())]] {
+            wrong.push(format!("{sql}: {:?} {:?}, PostgreSQL {want:?}", r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Review wire-quote LOW-4: a schema's name went into its database file's path as it is, so a
+/// name holding `/` named a path in a directory that does not exist (the CREATE failed), and `..`
+/// could step out of the database's directory. Each schema's file lies in the database's own
+/// directory, under a name that encodes the schema's, and the schema is attached again by its
+/// own name at the next open. Engine-owned and not asserted here (sent to fastest-engine): a table
+/// in such a schema (core prints database names bare in its own text, 9a58832f5 held), and a
+/// quoted mixed-case name, which the engine's attached names lowercase.
+#[test]
+fn a_schema_name_is_never_a_path() {
+    let dir = Scratch::new("schema-path");
+    let mut wrong = Vec::new();
+    for sql in ["CREATE SCHEMA \"a/b\"", "CREATE SCHEMA \"..\"", "CREATE SCHEMA \"q%z\""] {
+        let (ok, out) = cli_one(&dir, sql);
+        if !ok {
+            wrong.push(format!("{sql}: {out}"));
+        }
+    }
+    let (_, names) = cli_one(&dir, "SELECT nspname FROM pg_namespace ORDER BY nspname");
+    for want in ["a/b", "..", "q%z"] {
+        if !names.lines().any(|l| l.split('│').any(|c| c.trim() == want)) {
+            wrong.push(format!("after a reopen, schema {want} is not attached: {names}"));
+        }
+    }
+    let files: Vec<String> = std::fs::read_dir(&dir.0)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.starts_with("turso-postgres-schema-") && n.ends_with(".db"))
+        .collect();
+    if files.len() != 3 {
+        wrong.push(format!("want 3 schema files in the database's directory, found {files:?}"));
+    }
+    let parent = dir.0.parent().expect("the scratch has a parent");
+    let strays: Vec<_> = std::fs::read_dir(parent)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.starts_with("turso-postgres-schema-"))
+        .collect();
+    if !strays.is_empty() {
+        wrong.push(format!("schema files outside the database's directory: {strays:?}"));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Review wire-quote LOW-3: a client's COPY FROM 'file' read any file the server process can
+/// read. PostgreSQL requires pg_read_server_files (a role without it: 42501 'permission denied to
+/// COPY from a file', recorded: artie b2e3e87f75 pg18-rev-quote-low.out). This server has no roles,
+/// so its operator grants server files by directory: --copy-from-dir DIR lets COPY read a file
+/// whose real path lies under DIR, and without it no file is read.
+#[test]
+fn copy_from_a_server_file_needs_the_servers_grant() {
+    let dir = Scratch::new("copy-grant");
+    let inside = dir.0.join("granted");
+    std::fs::create_dir_all(&inside).unwrap();
+    let ok_file = inside.join("rows.tsv");
+    std::fs::write(&ok_file, "1\n2\n").unwrap();
+    let outside = dir.0.join("outside.tsv");
+    std::fs::write(&outside, "3\n").unwrap();
+    let escape = inside.join("escape.tsv");
+    std::os::unix::fs::symlink(&outside, &escape).unwrap();
+    let mut wrong = Vec::new();
+    {
+        let server = Server::start(&dir.db(), &[]);
+        let mut a = server.connect();
+        a.q("CREATE TABLE t(x int)").ok("t");
+        let r = a.q(&format!("COPY t FROM '{}'", ok_file.display()));
+        if r.error.as_ref().map(|e| e.code.as_str()) != Some("42501") {
+            wrong.push(format!("no grant, COPY from a file: {:?} {:?}", r.tags, r.error));
+        }
+    }
+    // Checked before the granted half, whose flag a server without the grant does not take.
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    let grant = inside.to_string_lossy().to_string();
+    let server = Server::start(&dir.db(), &["--copy-from-dir", &grant]);
+    let mut a = server.connect();
+    let r = a.q(&format!("COPY t FROM '{}'", ok_file.display()));
+    if r.error.is_some() || r.tags.last().map(String::as_str) != Some("COPY 2") {
+        wrong.push(format!("granted dir, COPY from a file in it: {:?} {:?}", r.tags, r.error));
+    }
+    for file in [&outside, &escape] {
+        let r = a.q(&format!("COPY t FROM '{}'", file.display()));
+        if r.error.as_ref().map(|e| e.code.as_str()) != Some("42501") {
+            wrong.push(format!("granted dir, COPY from {}: {:?} {:?}", file.display(), r.tags, r.error));
+        }
+    }
+    let r = a.q("SELECT count(*) FROM t");
+    if r.rows != vec![vec![Some("2".to_string())]] {
+        wrong.push(format!("rows loaded: {:?}", r.rows));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-uw2 MED, the COPY grant's check-then-read race: the grant was checked on the file's
+/// real path, then the file was opened again by the name the client gave, so a link inside the
+/// granted directory that a local writer flips between a file in it and one outside loaded the
+/// outside file (the reviewer: 1132 of 2673 COPYs in 20 s). The file opened is the file judged:
+/// a COPY through the flipping link loads the inside file or is refused 42501, never the outside
+/// one, whatever the timing.
+#[test]
+fn a_copy_through_a_flipping_link_never_reads_outside_the_grant() {
+    let dir = Scratch::new("copy-race");
+    let inside = dir.0.join("granted");
+    std::fs::create_dir_all(&inside).unwrap();
+    let real = inside.join("real.tsv");
+    std::fs::write(&real, "1\n").unwrap();
+    let outside = dir.0.join("outside.tsv");
+    std::fs::write(&outside, "3\n").unwrap();
+    let link = inside.join("flip.tsv");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let grant = inside.to_string_lossy().to_string();
+    let server = Server::start(&dir.db(), &["--copy-from-dir", &grant]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE t(x int)").ok("t");
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flipper = {
+        let (stop, link, real, outside) = (stop.clone(), link.clone(), real.clone(), outside.clone());
+        let tmp = inside.join("flip.tmp");
+        std::thread::spawn(move || {
+            let mut flips = 0u64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let target = if flips % 2 == 0 { &outside } else { &real };
+                let _ = std::fs::remove_file(&tmp);
+                std::os::unix::fs::symlink(target, &tmp).unwrap();
+                std::fs::rename(&tmp, &link).unwrap();
+                flips += 1;
+            }
+            flips
+        })
+    };
+    let (mut loaded, mut refused, mut unreadable, mut other) = (0, 0, 0, Vec::new());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while loaded + refused < 2000 && Instant::now() < deadline {
+        let r = a.q(&format!("COPY t FROM '{}'", link.display()));
+        match &r.error {
+            None => loaded += 1,
+            Some(e) if e.code == "42501" => refused += 1,
+            // Linux's path walk racing a rename over the link can open the link's directory
+            // (MEASURED on ecetesla1's local disk, fliptest.py: 1 EISDIR in 20,000 plain opens, 0
+            // on NFS): a read error inside the grant, which loads nothing.
+            Some(e) if e.message.contains("cannot read") && e.message.contains("Is a directory") => unreadable += 1,
+            Some(e) => {
+                if other.len() < 5 {
+                    other.push(format!("{} {}", e.code, e.message));
+                }
+            }
+        }
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let flips = flipper.join().unwrap();
+    let mut wrong = Vec::new();
+    let r = a.q("SELECT count(*) FROM t WHERE x = 3");
+    if r.rows != vec![vec![Some("0".to_string())]] {
+        wrong.push(format!("rows loaded from the file outside the grant: {:?} {:?}", r.rows, r.error));
+    }
+    // The race was run, not skipped: COPYs both loaded and were refused while the link flipped.
+    if loaded == 0 || refused == 0 || flips < 100 {
+        wrong.push(format!("the race did not run: {loaded} loaded, {refused} refused, {unreadable} unreadable, {flips} flips"));
+    }
+    if !other.is_empty() {
+        wrong.push(format!("other answers: {other:?}"));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Lead ruling 2026-10-18 (found answering the engine's dialect question 2): CREATE INDEX ...
+/// USING gin, hash or any access method but btree silently built a btree, so the client believed
+/// it had an index of a kind it does not have (pg_indexes then said btree). Refused (0A000), as
+/// this server builds btree indexes only; USING btree and no USING build one as before.
+#[test]
+fn an_index_access_method_other_than_btree_is_refused() {
+    let dir = Scratch::new("index-am");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE t(x int, y int)").ok("t");
+    let mut wrong = Vec::new();
+    for am in ["gin", "gist", "hash", "brin", "spgist"] {
+        let sql = format!("CREATE INDEX i_{am} ON t USING {am} (x)");
+        let r = a.q(&sql);
+        if r.error.as_ref().map(|e| e.code.as_str()) != Some("0A000") {
+            wrong.push(format!("{sql}: want 0A000, got {:?} {:?}", r.tags, r.error));
+        }
+    }
+    for sql in ["CREATE INDEX i_b ON t USING btree (x)", "CREATE INDEX i_d ON t (y)"] {
+        if let Some(e) = a.q(sql).error {
+            wrong.push(format!("{sql}: {} {}", e.code, e.message));
+        }
+    }
+    let r = a.q("SELECT count(*) FROM pg_indexes WHERE tablename = 't'");
+    if r.rows != vec![vec![Some("2".to_string())]] {
+        wrong.push(format!("indexes on t: {:?} {:?}", r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-uw2 LOW: USING "BTREE" built a btree and an unknown method was 0A000. PostgreSQL 18.6
+/// names an access method exactly, so a quoted "BTREE" and an unknown one are 42704 'access
+/// method "..." does not exist', and an unquoted BTREE is btree (recorded: pg18-rev-uw2-lows.out).
+#[test]
+fn an_access_method_that_does_not_exist_is_42704() {
+    let dir = Scratch::new("index-am-names");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE amx(x int, y int)").ok("amx");
+    let mut wrong = Vec::new();
+    for (sql, message) in [
+        ("CREATE INDEX amx_q ON amx USING \"BTREE\" (x)", "access method \"BTREE\" does not exist"),
+        ("CREATE INDEX amx_n ON amx USING nosuch (x)", "access method \"nosuch\" does not exist"),
+    ] {
+        let r = a.q(sql);
+        match &r.error {
+            Some(e) if e.code == "42704" && e.message == message => {}
+            other => wrong.push(format!("{sql}: want 42704 {message:?}, got {other:?} {:?}", r.tags)),
+        }
+    }
+    if let Some(e) = a.q("CREATE INDEX amx_u ON amx USING BTREE (x)").error {
+        wrong.push(format!("USING BTREE (unquoted): {} {}", e.code, e.message));
+    }
+    let r = a.q("SELECT indexname FROM pg_indexes WHERE tablename = 'amx' ORDER BY 1");
+    if r.rows != vec![vec![Some("amx_u".to_string())]] {
+        wrong.push(format!("indexes on amx: {:?} {:?}, want amx_u alone", r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-uw2 LOW, M1's edge cases (the reviewer's PG 18.6 runs: artie 718f73d7c1,
+/// reviews/uw2-raws/r5-pg.txt t_6 ... t_63): eight built-in types PostgreSQL takes as column
+/// types were 42704 (int4range, daterange, int2vector, oidvector, xid, tid, pg_lsn,
+/// txid_snapshot); a pseudo-type was 42704 where PostgreSQL says 42P16 'column "a" has
+/// pseudo-type anyelement' (void was taken); and the SQLite name blob and a quoted "INT4" (a
+/// built-in's name in another case is no type) were taken where PostgreSQL says 42704. Not here:
+/// a quoted "M" for an enum m, which names m to the engine (it folds type names; COMPAT).
+#[test]
+fn a_column_type_is_read_as_postgresql_reads_it() {
+    let dir = Scratch::new("column-types");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    for (i, ty) in ["int4range", "daterange", "int2vector", "oidvector", "xid", "tid", "pg_lsn", "txid_snapshot"]
+        .iter()
+        .enumerate()
+    {
+        let sql = format!("CREATE TABLE tb_{i} (a {ty})");
+        if let Some(e) = a.q(&sql).error {
+            wrong.push(format!("{sql}: {} {}, PostgreSQL CREATE TABLE", e.code, e.message));
+        }
+    }
+    for (i, ty) in ["anyelement", "record", "void", "trigger", "unknown"].iter().enumerate() {
+        let sql = format!("CREATE TABLE tp_{i} (a {ty})");
+        let want = format!("column \"a\" has pseudo-type {ty}");
+        match a.q(&sql).error {
+            Some(e) if e.code == "42P16" && e.message == want => {}
+            other => wrong.push(format!("{sql}: want 42P16 {want:?}, got {other:?}")),
+        }
+    }
+    for (sql, want) in [
+        ("CREATE TABLE t_18 (a blob)", "type \"blob\" does not exist"),
+        ("CREATE TABLE t_23 (a \"INT4\")", "type \"INT4\" does not exist"),
+    ] {
+        match a.q(sql).error {
+            Some(e) if e.code == "42704" && e.message == want => {}
+            other => wrong.push(format!("{sql}: want 42704 {want:?}, got {other:?}")),
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-uw2 LOW (M1's edges): a cast to a type that does not exist was left to its operand's
+/// own type, so `CREATE TABLE ... AS SELECT 1::nosuchtype` and a `DEFAULT 1::nosuchtype` ran.
+/// PostgreSQL 18.6 refuses each, and a bare SELECT, 42704 'type "nosuchtype" does not exist', and
+/// takes a cast to a built-in type this frontend does not model ('[1,2)'::int4range) (recorded
+/// with these statements on iccad11: pg18-rev-uw2-casts.out).
+#[test]
+fn a_cast_to_a_type_that_does_not_exist_is_42704() {
+    let dir = Scratch::new("cast-nosuchtype");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    for sql in [
+        "CREATE TABLE cx_as AS SELECT 1::nosuchtype AS a",
+        "CREATE TABLE cx_def (a int DEFAULT 1::nosuchtype)",
+        "SELECT 1::nosuchtype",
+    ] {
+        match a.q(sql).error {
+            Some(e) if e.code == "42704" && e.message == "type \"nosuchtype\" does not exist" => {}
+            other => wrong.push(format!("{sql}: want 42704, got {other:?}")),
+        }
+    }
+    let r = a.q("SELECT '[1,2)'::int4range");
+    if r.error.is_some() || r.rows != vec![vec![Some("[1,2)".to_string())]] {
+        wrong.push(format!("SELECT '[1,2)'::int4range: {:?} {:?}", r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Found by the E5' differential on iccad11 at f312d1e13 (uwrun wire-e5-f312d1e13, e5host.sh; PG
+/// 18.6 answers in its pg.jsonl): a NUMERIC(p, s) or DECIMAL(p, s) column, stored as the engine's
+/// exact numeric, was announced float8 (701) where PostgreSQL announces numeric (1700): 1000 type
+/// mismatches in BranchBench micro READ and RANGE_READ (stock.s_ytd DECIMAL(8, 0)); and nextval,
+/// currval, setval and pg_database_size, bigint (20) in PostgreSQL, were announced text (25): 6
+/// type mismatches in the E2 workload. A bare NUMERIC stays the float it is stored as (COMPAT).
+#[test]
+fn an_exact_numeric_column_and_the_sequence_functions_carry_postgresqls_types() {
+    let dir = Scratch::new("numeric-oids");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE TABLE n(a DECIMAL(8, 0), b NUMERIC(8, 2))",
+        "INSERT INTO n VALUES (0, 1.5)",
+        "CREATE SEQUENCE sq",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    for (sql, oids, rows) in [
+        ("SELECT a, b FROM n", vec![1700u32, 1700], vec![vec![Some("0".to_string()), Some("1.50".to_string())]]),
+        ("SELECT nextval('sq')", vec![20], vec![vec![Some("1".to_string())]]),
+        ("SELECT currval('sq')", vec![20], vec![vec![Some("1".to_string())]]),
+        ("SELECT setval('sq', 5)", vec![20], vec![vec![Some("5".to_string())]]),
+    ] {
+        let r = a.q(sql);
+        if r.error.is_some() || r.oids != Some(oids.clone()) || r.rows != rows {
+            wrong.push(format!("{sql}: oids {:?} rows {:?} error {:?}, PostgreSQL {oids:?} {rows:?}", r.oids, r.rows, r.error));
+        }
+    }
+    let r = a.q("SELECT pg_database_size(current_database())");
+    if r.error.is_some() || r.oids != Some(vec![20]) {
+        wrong.push(format!("pg_database_size: oids {:?} error {:?}, PostgreSQL [20]", r.oids, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Found by the E5' differential on iccad11 at fc85e82fc (uwrun wire-e5l5-fc85e82fc; PG 18.6 in its
+/// pg.jsonl): pg_database_size('microbench') answered this database's size for a name that is no
+/// database here; PostgreSQL answers 3D000 'database "microbench" does not exist' (one mismatch in
+/// each of the 14 BranchBench micro runs). The database pg_database lists still answers its size.
+#[test]
+fn pg_database_size_of_a_database_that_does_not_exist_is_3d000() {
+    let dir = Scratch::new("dbsize");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    match a.q("SELECT pg_database_size('microbench')").error {
+        Some(e) if e.code == "3D000" && e.message == "database \"microbench\" does not exist" => {}
+        other => wrong.push(format!("pg_database_size('microbench'): want 3D000, got {other:?}")),
+    }
+    for sql in [
+        "SELECT pg_database_size(current_database()) > 0",
+        "SELECT pg_database_size(datname) > 0 FROM pg_database",
+    ] {
+        let r = a.q(sql);
+        if r.error.is_some() || r.rows != vec![vec![Some("t".to_string())]] {
+            wrong.push(format!("{sql}: {:?} {:?}", r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Found by the wire differential fuzzer against PostgreSQL 18.6 (wirefuzz, uwrun wire-fuzz1 on
+/// iccad11 and wire-fuzz2 on iccad2 at 72a36c7dd; artie lanes/wire/raw/wire-fuzz1 and wire-fuzz2,
+/// PG's answers in each finding's pg_answer): a smallint column was announced int4 (23) where
+/// PostgreSQL announces int2 (21), bare, under WHERE and in RETURNING; bigint * 2 int4 where PG
+/// says int8 (20); length(varchar) text (25) where PG says int4; numeric(6,2) / 4 float8 (701)
+/// where PG says numeric (1700); min and max over varchar varchar (1043) where PG, which has them
+/// for text only, says text (25); and max over boolean was answered where PG has no such function
+/// (42883 "function max(boolean) does not exist"). Over both protocols.
+#[test]
+fn computed_and_smallint_result_columns_carry_postgresqls_types() {
+    let dir = Scratch::new("fuzz-types");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE TABLE ft(id int PRIMARY KEY, s smallint, b bigint, v varchar(5), n numeric(6,2), f boolean)",
+        "INSERT INTO ft VALUES (1, 7, 9, 'ab', 2.50, true)",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    for (sql, oids) in [
+        ("SELECT s FROM ft ORDER BY id", vec![21u32]),
+        ("SELECT id, s FROM ft WHERE s >= 1 ORDER BY id", vec![23, 21]),
+        ("SELECT id, b * 2 FROM ft ORDER BY id", vec![23, 20]),
+        ("SELECT id, length(v) FROM ft ORDER BY id", vec![23, 23]),
+        ("SELECT id, n / 4 FROM ft ORDER BY id", vec![23, 1700]),
+        ("SELECT count(*), min(v), max(v) FROM ft", vec![20, 25, 25]),
+    ] {
+        for (protocol, r) in [("simple", a.q(sql)), ("extended", a.x(sql, &[]))] {
+            if r.error.is_some() || r.oids != Some(oids.clone()) {
+                wrong.push(format!("{protocol} {sql}: oids {:?} error {:?}, PostgreSQL {oids:?}", r.oids, r.error));
+            }
+        }
+    }
+    let sql = "INSERT INTO ft (id, s) VALUES (2, 3) RETURNING id, s";
+    let r = a.q(sql);
+    if r.error.is_some() || r.oids != Some(vec![23, 21]) {
+        wrong.push(format!("{sql}: oids {:?} error {:?}, PostgreSQL [23, 21]", r.oids, r.error));
+    }
+    let sql = "SELECT count(*), max(f) FROM ft";
+    for (protocol, r) in [("simple", a.q(sql)), ("extended", a.x(sql, &[]))] {
+        if r.error.as_ref().map(|e| e.code.as_str()) != Some("42883") {
+            wrong.push(format!("{protocol} {sql}: rows {:?} error {:?}, PostgreSQL 42883", r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Found by the wire differential fuzzer against PostgreSQL 18.6 (wirefuzz, wire-fuzz1 and
+/// wire-fuzz2): a CREATE INDEX with no name was built under the empty name, so the second one
+/// was refused 42601 "index  already exists", where PostgreSQL chooses a name (ChooseRelationName):
+/// table, columns ("expr" for an expression) and "idx" joined by "_", each part cut to fit 63
+/// bytes, and a number after "idx" while the name is any relation's. Recorded on iccad2,
+/// cli/tests/recordings/pg18-index-names.out.
+#[test]
+fn an_index_with_no_name_is_named_as_postgresql_names_it() {
+    let dir = Scratch::new("index-names");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let long = "abcdefghijabcdefghijabcdefghijabcdefghij";
+    let mut wrong = Vec::new();
+    for sql in [
+        "CREATE TABLE ix(a int, b text)".to_string(),
+        "CREATE INDEX ON ix (a)".to_string(),
+        "CREATE INDEX ON ix (a)".to_string(),
+        "CREATE INDEX ON ix (a, b)".to_string(),
+        "CREATE TABLE ix_b_idx(x int)".to_string(),
+        "CREATE INDEX ON ix (b)".to_string(),
+        "CREATE UNIQUE INDEX ON ix (b)".to_string(),
+        "CREATE INDEX ON ix ((a + 1))".to_string(),
+        "CREATE INDEX ON ix ((a + 1))".to_string(),
+        format!("CREATE TABLE {long}({long} int)"),
+        format!("CREATE INDEX ON {long} ({long})"),
+    ] {
+        let r = a.q(&sql);
+        if r.error.is_some() {
+            wrong.push(format!("{sql}: {:?}", r.error));
+        }
+    }
+    for name in [
+        "abcdefghijabcdefghijabcdefghi_abcdefghijabcdefghijabcdefghi_idx",
+        "ix_a_b_idx",
+        "ix_a_idx",
+        "ix_a_idx1",
+        "ix_b_idx1",
+        "ix_b_idx2",
+        "ix_expr_idx",
+        "ix_expr_idx1",
+    ] {
+        let sql = format!("DROP INDEX {name}");
+        let r = a.q(&sql);
+        if r.error.is_some() {
+            wrong.push(format!("{sql}: {:?} (PostgreSQL names this index)", r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Found by the wire differential fuzzer against PostgreSQL 18.6 (wirefuzz, wire-fuzz1 and
+/// wire-fuzz2; PG's answers in the findings' pg_answer): a value too long for varchar(5) is refused
+/// XX000 "value too long for varchar" (the engine's varchar type raises it with RAISE(ABORT)),
+/// where PostgreSQL answers 22001 "value too long for type character varying(5)"; and an UPDATE
+/// assigning such a constant is refused by PostgreSQL even when no row matches (the constant is
+/// coerced when the statement is planned), where here it answers UPDATE 0. Owner: fastest-engine
+/// (core's varchar type).
+#[test]
+fn a_value_too_long_for_varchar_is_22001_as_postgresql_answers() {
+    let dir = Scratch::new("varchar-22001");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE vc(id int PRIMARY KEY, v varchar(5))").ok("vc");
+    let mut wrong = Vec::new();
+    for sql in [
+        "INSERT INTO vc VALUES (1, 'abcdef')",
+        "UPDATE vc SET v = 'abcdef' WHERE id = 1",
+    ] {
+        let r = a.q(sql);
+        match &r.error {
+            Some(e) if e.code == "22001" && e.message == "value too long for type character varying(5)" => {}
+            _ => wrong.push(format!("{sql}: tags {:?} error {:?}, PostgreSQL 22001", r.tags, r.error)),
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-uw3 MED-1: every RowDescription field carried type size 0 and type modifier 0
+/// (pgwire's From<&FieldInfo>), where PostgreSQL 18.6 sends each type's size (int4 4, int8 8, bool
+/// 1, a variable-length type -1) and the column's modifier (-1 for none, varchar(5) 9, numeric(8,2)
+/// 524294, char(3) 7); a numeric with modifier 0 is an invalid one (a driver reads its scale from
+/// it). Recorded on iccad2, cli/tests/recordings/pg18-typmod.out. Compared where the type OID agrees with
+/// PostgreSQL's (an OID mismatch is another divergence); at least 20 columns must.
+#[test]
+fn row_descriptions_carry_postgresqls_type_sizes_and_modifiers() {
+    let dir = Scratch::new("typmod");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let create = "CREATE TABLE tm(a int2, b int4, c int8, d bool, e float4, f float8, g text, h varchar(5), \
+                  i numeric(8,2), j numeric, k char(3), l date, m timestamp, n timestamptz, o uuid, p bytea, \
+                  q json, r jsonb, s time, t varchar)";
+    a.q(create).ok(create);
+    let mut wrong = Vec::new();
+    let mut compared = 0;
+    for (sql, pg) in [
+        ("SELECT * FROM tm", vec![
+            (21u32, 2i16, -1i32), (23, 4, -1), (20, 8, -1), (16, 1, -1), (700, 4, -1), (701, 8, -1), (25, -1, -1),
+            (1043, -1, 9), (1700, -1, 524294), (1700, -1, -1), (1042, -1, 7), (1082, 4, -1), (1114, 8, -1),
+            (1184, 8, -1), (2950, 16, -1), (17, -1, -1), (114, -1, -1), (3802, -1, -1), (1083, 8, -1),
+            (1043, -1, -1),
+        ]),
+        ("SELECT a + 1 AS x, i * 2 AS y, h || 'z' AS z, count(*) AS w FROM tm GROUP BY a, i, h",
+            vec![(23, 4, -1), (1700, -1, -1), (25, -1, -1), (20, 8, -1)]),
+        ("SELECT 1 AS one, 'x' AS lit, true AS b", vec![(23, 4, -1), (25, -1, -1), (16, 1, -1)]),
+    ] {
+        for (protocol, r) in [("simple", a.q(sql)), ("extended", a.x(sql, &[]))] {
+            let (Some(oids), Some(sizes)) = (r.oids.clone(), r.sizes.clone()) else {
+                wrong.push(format!("{protocol} {sql}: no RowDescription, error {:?}", r.error));
+                continue;
+            };
+            for (i, (oid, (len, modifier))) in oids.iter().zip(sizes).enumerate() {
+                let Some(&(pg_oid, pg_len, pg_mod)) = pg.get(i) else { continue };
+                if *oid != pg_oid {
+                    continue;
+                }
+                compared += 1;
+                if (len, modifier) != (pg_len, pg_mod) {
+                    wrong.push(format!("{protocol} {sql} column {i} (oid {oid}): size {len} modifier {modifier}, PostgreSQL {pg_len} {pg_mod}"));
+                }
+            }
+        }
+    }
+    assert!(compared >= 20, "premise: only {compared} columns had PostgreSQL's type OID");
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-uw3 LOW-3: pg_database_size(NULL) answered this database's size, where PostgreSQL 18.6
+/// answers NULL (for a name and an oid alike), and an oid no database has answered it too, where
+/// PostgreSQL answers 42704 "database with OID 99999 does not exist". This database's own oid
+/// (pg_database's) still answers. Recorded on iccad2, cli/tests/recordings/pg18-dbsize-edges.out.
+#[test]
+fn pg_database_size_of_null_or_an_unknown_oid_answers_as_postgresql_does() {
+    let dir = Scratch::new("dbsize-edges");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    for sql in ["SELECT pg_database_size(NULL) IS NULL", "SELECT pg_database_size(NULL::oid) IS NULL"] {
+        let r = a.q(sql);
+        if r.error.is_some() || r.rows != vec![vec![Some("t".to_string())]] {
+            wrong.push(format!("{sql}: rows {:?} error {:?}, PostgreSQL t", r.rows, r.error));
+        }
+    }
+    let sql = "SELECT pg_database_size(99999::oid)";
+    match a.q(sql).error {
+        Some(e) if e.code == "42704" && e.message == "database with OID 99999 does not exist" => {}
+        other => wrong.push(format!("{sql}: {other:?}, PostgreSQL 42704")),
+    }
+    let sql = "SELECT pg_database_size(oid) >= 0 FROM pg_database WHERE datname = current_database()";
+    let r = a.q(sql);
+    if r.error.is_some() || r.rows != vec![vec![Some("t".to_string())]] {
+        wrong.push(format!("{sql}: rows {:?} error {:?}, PostgreSQL t", r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-uw3 MED-4: a cast to NUMERIC(p, s) was cast to the engine's REAL, so it was announced
+/// float8 (701) and written as a float ('1.5'), where PostgreSQL 18.6 types it numeric (1700) and
+/// rounds it to the scale ('1.50', '1.01', '123456.79'); and a column of a domain over
+/// NUMERIC(8, 2) was announced 701 where PostgreSQL announces numeric. Recorded on iccad2,
+/// cli/tests/recordings/pg18-numeric-casts.out.
+#[test]
+fn a_cast_to_numeric_p_s_and_a_numeric_domain_column_are_numeric() {
+    let dir = Scratch::new("numeric-casts");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    for (sql, text) in [
+        ("SELECT CAST(1.5 AS NUMERIC(8,2))", "1.50"),
+        ("SELECT 1.5::numeric(8,2)", "1.50"),
+        ("SELECT CAST(1.005 AS NUMERIC(8,2))", "1.01"),
+        ("SELECT CAST(123456.789 AS NUMERIC(8,2))", "123456.79"),
+    ] {
+        let r = a.q(sql);
+        if r.error.is_some() || r.oids != Some(vec![1700]) || r.rows != vec![vec![Some(text.to_string())]] {
+            wrong.push(format!("{sql}: oids {:?} rows {:?} error {:?}, PostgreSQL [1700] {text}", r.oids, r.rows, r.error));
+        }
+    }
+    for sql in ["CREATE DOMAIN dn AS NUMERIC(8,2)", "CREATE TABLE dt(x dn)", "INSERT INTO dt VALUES (1.5)"] {
+        a.q(sql).ok(sql);
+    }
+    let r = a.q("SELECT x FROM dt");
+    if r.error.is_some() || r.oids != Some(vec![1700]) || r.rows != vec![vec![Some("1.50".to_string())]] {
+        wrong.push(format!("SELECT x FROM dt: oids {:?} rows {:?} error {:?}, PostgreSQL [1700] 1.50", r.oids, r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-uw3 (pre-existing at f312d1e13): over a NUMERIC(8, 2) column, `b + 1 ... ORDER BY 1`
+/// ordered as text (123457.78 before 3.50), a wrong row order; and the column read through a view,
+/// a derived table, a CREATE TABLE AS copy or a scalar subquery was announced bytea (17) or text
+/// (25) where PostgreSQL 18.6 announces numeric (1700). Recorded on iccad2,
+/// cli/tests/recordings/pg18-numeric-derived.out.
+#[test]
+fn a_numeric_column_orders_and_types_as_numeric_through_every_relation() {
+    let dir = Scratch::new("numeric-derived");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE TABLE n(id int, b numeric(8,2))",
+        "INSERT INTO n VALUES (1, 2.50), (2, 123456.78), (3, 10.00)",
+        "CREATE VIEW v AS SELECT b FROM n",
+        "CREATE TABLE c AS SELECT b FROM n",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    let rows = |v: &[&str]| v.iter().map(|x| vec![Some(x.to_string())]).collect::<Vec<_>>();
+    let mut wrong = Vec::new();
+    for (sql, want) in [
+        ("SELECT b + 1 AS x FROM n ORDER BY 1", rows(&["3.50", "11.00", "123457.78"])),
+        ("SELECT b FROM n ORDER BY b", rows(&["2.50", "10.00", "123456.78"])),
+        ("SELECT b FROM v ORDER BY b", rows(&["2.50", "10.00", "123456.78"])),
+        ("SELECT b FROM (SELECT b FROM n) d ORDER BY b", rows(&["2.50", "10.00", "123456.78"])),
+        ("SELECT b FROM c ORDER BY b", rows(&["2.50", "10.00", "123456.78"])),
+        ("SELECT (SELECT max(b) FROM n) AS m", rows(&["123456.78"])),
+    ] {
+        let r = a.q(sql);
+        if r.error.is_some() || r.oids != Some(vec![1700]) || r.rows != want {
+            wrong.push(format!("{sql}: oids {:?} rows {:?} error {:?}, PostgreSQL [1700] {want:?}", r.oids, r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-uw3 LOW-6 (its pgprobe against PostgreSQL 18.6 on iccad11): the parameter of
+/// setval('sq', $1) was described text (25), PostgreSQL's bigint (20); its third, is_called, bool
+/// (16); and pg_database_size($1)'s text, PostgreSQL's name (19).
+#[test]
+fn setval_and_pg_database_size_type_their_parameters() {
+    let dir = Scratch::new("fn-params");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE SEQUENCE sq").ok("sq");
+    let mut wrong = Vec::new();
+    for (sql, params) in [
+        ("SELECT setval('sq', $1)", vec![20u32]),
+        ("SELECT setval('sq', $1, $2)", vec![20, 16]),
+        ("SELECT pg_database_size($1)", vec![19]),
+    ] {
+        let r = a.describe_statement(sql);
+        if r.error.is_some() || r.params != Some(params.clone()) {
+            wrong.push(format!("{sql}: params {:?} error {:?}, PostgreSQL {params:?}", r.params, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Found by the wire differential fuzzer against PostgreSQL 18.6 (wirefuzz, uwrun wire-fuzz3-1 on
+/// iccad2; PG's answers in the findings' pg_answer): an INSERT naming a column the table does not
+/// have is refused 42601 "table t0 has no column named c1" (the engine's parse error), where
+/// PostgreSQL answers 42703 'column "c1" of relation "t0" does not exist'. Owner: fastest-engine
+/// (the kind must come from the engine's error, never from its text).
+#[test]
+fn an_insert_naming_a_missing_column_is_42703() {
+    let dir = Scratch::new("insert-42703");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE t0 (id int PRIMARY KEY, c0 double precision)").ok("t0");
+    let mut wrong = Vec::new();
+    let sql = "INSERT INTO t0 (id, c0, c1) VALUES (12, 3.0, 'ab')";
+    for (protocol, r) in [("simple", a.q(sql)), ("extended", a.x(sql, &[]))] {
+        if r.error.as_ref().map(|e| e.code.as_str()) != Some("42703") {
+            wrong.push(format!("{protocol} {sql}: {:?}, PostgreSQL 42703", r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Found by the wire differential fuzzer against PostgreSQL 18.6 (wirefuzz, wire-fuzz3-1 on
+/// iccad2): sum over a NUMERIC(6, 2) column holding 0.00 and NULL answers '0' where PostgreSQL
+/// answers '0.00' (a numeric sum keeps its operands' scale), and an UPDATE assigning 10000 to a
+/// NUMERIC(6, 2) column is refused by PostgreSQL even when no row matches (22003 "numeric field
+/// overflow": the constant is coerced when the statement is planned), where here it answers
+/// UPDATE 0. Owner: fastest-engine (core's numeric type).
+#[test]
+fn a_numeric_sum_keeps_its_scale_and_an_overflowing_constant_is_22003() {
+    let dir = Scratch::new("numeric-sum-scale");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE TABLE t0 (id int PRIMARY KEY, c0 numeric(6,2))",
+        "INSERT INTO t0 (id, c0) VALUES (1, 0)",
+        "INSERT INTO t0 (id, c0) VALUES (2, NULL)",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    let sql = "SELECT sum(c0), min(c0), max(c0) FROM t0";
+    let r = a.q(sql);
+    let want = vec![vec![Some("0.00".to_string()), Some("0.00".to_string()), Some("0.00".to_string())]];
+    if r.error.is_some() || r.rows != want {
+        wrong.push(format!("{sql}: rows {:?} error {:?}, PostgreSQL {want:?}", r.rows, r.error));
+    }
+    let sql = "UPDATE t0 SET c0 = 10000 WHERE id = 3";
+    let r = a.q(sql);
+    if r.error.as_ref().map(|e| e.code.as_str()) != Some("22003") {
+        wrong.push(format!("{sql}: tags {:?} error {:?}, PostgreSQL 22003", r.tags, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Found by the wire differential fuzzer against PostgreSQL 18.6 (wirefuzz, wire-fuzz4 on iccad2;
+/// PG's answers in the findings' pg_answer): (1) `SELECT (-2147483648)`, which pg_query gives as a
+/// float's text, was announced int8 where PostgreSQL announces int4 (make_const: an integer that
+/// fits int4 is int4); (2) over a boolean c0 and no column c1, `SELECT count(*), sum(c1), min(c0)`
+/// was refused 42883 for min(boolean), where PostgreSQL reports the missing column first (42703).
+#[test]
+fn a_negative_int4_literal_is_int4_and_a_missing_column_is_reported_first() {
+    let dir = Scratch::new("fuzz4");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE t0 (id int PRIMARY KEY, c0 boolean)").ok("t0");
+    let mut wrong = Vec::new();
+    let sql = "SELECT (-2147483648) AS c";
+    for (protocol, r) in [("simple", a.q(sql)), ("extended", a.x(sql, &[]))] {
+        if r.error.is_some() || r.oids != Some(vec![23]) || r.rows != vec![vec![Some("-2147483648".to_string())]] {
+            wrong.push(format!("{protocol} {sql}: oids {:?} rows {:?} error {:?}, PostgreSQL [23]", r.oids, r.rows, r.error));
+        }
+    }
+    let sql = "SELECT count(*), sum(c1), min(c0) FROM t0";
+    for (protocol, r) in [("simple", a.q(sql)), ("extended", a.x(sql, &[]))] {
+        if r.error.as_ref().map(|e| e.code.as_str()) != Some("42703") {
+            wrong.push(format!("{protocol} {sql}: {:?}, PostgreSQL 42703", r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-uw2 N5: a schema-qualified type was refused 42704 'type "public m" does not exist',
+/// its parts joined with a blank, so a pg_dump restore, which writes public.<type> for every enum
+/// and domain column, failed at its first such table. PostgreSQL 18.6 takes public.m and
+/// public.dm as m and dm (recorded by the reviewer: artie 718f73d7c1,
+/// reviews/uw2-raws/r5-pg.txt t_21, t_29), in a column and in a cast.
+#[test]
+fn a_schema_qualified_type_is_its_type() {
+    let dir = Scratch::new("qualified-type");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in ["CREATE TYPE m AS ENUM ('a')", "CREATE DOMAIN dm AS int CHECK (VALUE > 0)"] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    for sql in [
+        "CREATE TABLE t_21 (a public.m)",
+        "CREATE TABLE t_29 (a public.dm)",
+        "CREATE TABLE t_pc (a pg_catalog.int4)",
+        "INSERT INTO t_21 VALUES ('a')",
+        "INSERT INTO t_29 VALUES (5)",
+    ] {
+        if let Some(e) = a.q(sql).error {
+            wrong.push(format!("{sql}: {} {}", e.code, e.message));
+        }
+    }
+    for (sql, want) in [
+        ("SELECT a FROM t_21", "a"),
+        ("SELECT a FROM t_29", "5"),
+        ("SELECT 'a'::public.m", "a"),
+    ] {
+        let r = a.q(sql);
+        if r.error.is_some() || r.rows != vec![vec![Some(want.to_string())]] {
+            wrong.push(format!("{sql}: {:?} {:?}, PostgreSQL {want}", r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Found by the review wire-quote LOW-2 red: '...'::regclass was a cast to INTEGER, so every name
+/// answered 0 and a catalog query by regclass (conrelid = 't'::regclass, as psql and drivers send)
+/// matched nothing, silently. PostgreSQL 18.6 resolves the name to its pg_class oid, reading it as
+/// an identifier list, and refuses a missing relation 42P01 and a malformed name 42602 (recorded
+/// with these statements: artie 3b69c8dab8, pg18-rev-regclass.out).
+#[test]
+fn a_regclass_names_its_relations_oid() {
+    let dir = Scratch::new("regclass");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in ["CREATE TABLE \"a b\"(x int)", "CREATE TABLE t2(x int)", "CREATE INDEX ij ON t2(x)"] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    let r = a.q(
+        "SELECT '\"a b\"'::regclass = (SELECT oid FROM pg_class WHERE relname = 'a b'), \
+         'T2'::regclass = (SELECT oid FROM pg_class WHERE relname = 't2'), \
+         'public.t2'::regclass = (SELECT oid FROM pg_class WHERE relname = 't2'), \
+         'ij'::regclass = (SELECT oid FROM pg_class WHERE relname = 'ij')",
+    );
+    let t = Some("t".to_string());
+    if r.error.is_some() || r.rows != vec![vec![t.clone(), t.clone(), t.clone(), t]] {
+        wrong.push(format!("the four names: {:?} {:?}", r.rows, r.error));
+    }
+    for (sql, code, message) in [
+        ("SELECT 'nosuch'::regclass", "42P01", "relation \"nosuch\" does not exist"),
+        ("SELECT 'a b'::regclass", "42602", "invalid name syntax"),
+    ] {
+        let r = a.q(sql);
+        match &r.error {
+            Some(e) if e.code == code && e.message == message => {}
+            other => wrong.push(format!("{sql}: want {code} {message:?}, got {other:?} {:?}", r.rows)),
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-uw2 H3 and the regclass MED and LOW: '...'::regclass refused every catalog name 42P01
+/// ('pg_class', 'pg_catalog.pg_class', 'pg_namespace'), so a catalog join on
+/// `classoid = 'pg_class'::regclass` that ran at the base failed; a quoted mixed-case table was
+/// found by its folded name and not by its own; views and sequences were 42P01; blanks around
+/// the dot were 42602; and over-qualified names were 42602. PostgreSQL 18.6 (recorded with these
+/// statements: pg18-rev-uw2-regclass.out) resolves pg_catalog first, with its fixed oids
+/// (pg_class 1259), reads a quoted part as written and an unquoted one folded, has every view
+/// and sequence in pg_class (relkind v and S), allows blanks around each part, refuses four parts
+/// 42601 and another database's name 0A000, and takes the current database's.
+#[test]
+fn a_regclass_resolves_catalogs_quoted_names_views_and_sequences() {
+    let dir = Scratch::new("regclass-uw2");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE TABLE \"U2\"(x int)",
+        "CREATE TABLE w3(x int)",
+        "CREATE VIEW vw3 AS SELECT x FROM w3",
+        "CREATE SEQUENCE sqw3",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    for (name, oid) in [
+        ("pg_class", "1259"),
+        ("pg_namespace", "2615"),
+        ("pg_attribute", "1249"),
+        ("pg_roles", "12000"),
+        ("pg_proc", "1255"),
+        ("pg_database", "1262"),
+        ("pg_am", "2601"),
+        ("pg_type", "1247"),
+        ("pg_collation", "3456"),
+        ("pg_attrdef", "2604"),
+        ("pg_description", "2609"),
+        ("pg_publication", "6104"),
+        ("pg_publication_namespace", "6237"),
+        ("pg_publication_rel", "6106"),
+        ("pg_sequences", "12048"),
+        ("pg_constraint", "2606"),
+        ("pg_index", "2610"),
+        ("pg_inherits", "2611"),
+        ("pg_rewrite", "2618"),
+        ("pg_foreign_table", "3118"),
+        ("pg_partitioned_table", "3350"),
+        ("pg_trigger", "2620"),
+        ("pg_policy", "3256"),
+        ("pg_tables", "12033"),
+        ("pg_indexes", "12043"),
+        ("pg_catalog.pg_class", "1259"),
+        ("pg_catalog.pg_namespace", "2615"),
+        ("PG_CLASS", "1259"),
+    ] {
+        let sql = format!("SELECT '{name}'::regclass::oid");
+        let r = a.q(&sql);
+        if r.error.is_some() || r.rows != vec![vec![Some(oid.to_string())]] {
+            wrong.push(format!("{sql}: {:?} {:?}, PostgreSQL {oid}", r.rows, r.error));
+        }
+    }
+    let db = a.q("SELECT current_database()").rows[0][0].clone().unwrap_or_default();
+    let t = Some("t".to_string());
+    for name in ["\"U2\"", "w3", "public.w3", "vw3", "sqw3", " public . w3 ", "public .w3", &format!("{db}.public.w3")] {
+        let relname = name.trim().rsplit(['.', ' ']).next().unwrap_or_default().trim_matches('"').to_ascii_lowercase();
+        let sql = format!("SELECT '{name}'::regclass = (SELECT oid FROM pg_class WHERE lower(relname) = '{relname}')");
+        let r = a.q(&sql);
+        if r.error.is_some() || r.rows != vec![vec![t.clone()]] {
+            wrong.push(format!("{sql}: {:?} {:?}, PostgreSQL t", r.rows, r.error));
+        }
+    }
+    let r = a.q("SELECT lower(relname), relkind FROM pg_class WHERE lower(relname) IN ('u2', 'w3', 'vw3', 'sqw3') ORDER BY 1");
+    let want: Vec<Vec<Option<String>>> = [("sqw3", "S"), ("u2", "r"), ("vw3", "v"), ("w3", "r")]
+        .iter()
+        .map(|(n, k)| vec![Some(n.to_string()), Some(k.to_string())])
+        .collect();
+    if r.error.is_some() || r.rows != want {
+        wrong.push(format!("pg_class rows: {:?} {:?}, PostgreSQL {want:?}", r.rows, r.error));
+    }
+    for (name, code, message) in [
+        ("pg_input_error_info", "42P01", "relation \"pg_input_error_info\" does not exist".to_string()),
+        ("pg_get_tabledef", "42P01", "relation \"pg_get_tabledef\" does not exist".to_string()),
+        ("\"PG_CLASS\"", "42P01", "relation \"PG_CLASS\" does not exist".to_string()),
+        ("public.pg_class", "42P01", "relation \"public.pg_class\" does not exist".to_string()),
+        ("pg_catalog.w3", "42P01", "relation \"pg_catalog.w3\" does not exist".to_string()),
+        ("x.y.z.w", "42601", "improper relation name (too many dotted names): x.y.z.w".to_string()),
+        (
+            "otherdb.public.w3",
+            "0A000",
+            "cross-database references are not implemented: \"otherdb.public.w3\"".to_string(),
+        ),
+    ] {
+        let sql = format!("SELECT '{name}'::regclass");
+        let r = a.q(&sql);
+        match &r.error {
+            Some(e) if e.code == code && e.message == message => {}
+            other => wrong.push(format!("{sql}: want {code} {message:?}, got {other:?} {:?}", r.rows)),
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-uw2 MED, the half of a_regclass_resolves_catalogs_quoted_names_views_and_sequences
+/// that needs the engine to keep a quoted name's case (moved here from that test, its assertions
+/// unchanged, so the half the frontend fixes is not hidden behind this one): PostgreSQL 18.6's
+/// pg_class holds a table created as "U2" as U2, '"U2"' names it, and 'U2' (folded to u2) is
+/// 42P01 (recorded, pg18-rev-uw2-regclass.out); and for a table created unquoted as t2, '"T2"'
+/// is 42P01 (moved here, unchanged, from a_regclass_names_its_relations_oid; recorded, artie
+/// 3b69c8dab8 pg18-rev-regclass.out), since "T2" and t2 are two names there. The engine folds
+/// every relation name (normalize_ident), so "U2" is its u2 and "T2" its t2, and regclass names
+/// a relation by the engine's identity, as every other statement does: engine-owned, in
+/// known-red.
+#[test]
+fn a_quoted_mixed_case_table_keeps_its_case_in_the_catalog() {
+    let dir = Scratch::new("regclass-case");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE \"U2\"(x int)").ok("U2");
+    a.q("CREATE TABLE t2(x int)").ok("t2");
+    let mut wrong = Vec::new();
+    let r = a.q("SELECT '\"T2\"'::regclass");
+    match &r.error {
+        Some(e) if e.code == "42P01" && e.message == "relation \"T2\" does not exist" => {}
+        other => wrong.push(format!("SELECT '\"T2\"'::regclass (t2 created unquoted): want 42P01, got {other:?} {:?}", r.rows)),
+    }
+    let sql = "SELECT '\"U2\"'::regclass = (SELECT oid FROM pg_class WHERE relname = 'U2')";
+    let r = a.q(sql);
+    if r.error.is_some() || r.rows != vec![vec![Some("t".to_string())]] {
+        wrong.push(format!("{sql}: {:?} {:?}, PostgreSQL t", r.rows, r.error));
+    }
+    let r = a.q("SELECT relname, relkind FROM pg_class WHERE relname IN ('U2') ORDER BY relname");
+    if r.error.is_some() || r.rows != vec![vec![Some("U2".to_string()), Some("r".to_string())]] {
+        wrong.push(format!("pg_class rows: {:?} {:?}, PostgreSQL [U2 r]", r.rows, r.error));
+    }
+    let r = a.q("SELECT 'U2'::regclass");
+    match &r.error {
+        Some(e) if e.code == "42P01" && e.message == "relation \"u2\" does not exist" => {}
+        other => wrong.push(format!("SELECT 'U2'::regclass: want 42P01, got {other:?} {:?}", r.rows)),
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-uw1 M3 (DESTRUCTIVE at 56e4400d9): the server's refusal compared "public" without
+/// case, and the frontend then lowercased the name, so DROP SCHEMA "PUBLIC" CASCADE dropped every
+/// public table. A quoted "PUBLIC" is a schema of its own: PG 18.6 answers 3F000 'schema "PUBLIC"
+/// does not exist' and drops nothing (recorded: artie aebf97e89c, pg18-rev-uw1-schema.out). The
+/// server refuses it as every schema but public (0A000); the CLI answers PG's 3F000.
+#[test]
+fn a_quoted_public_is_not_public() {
+    let dir = Scratch::new("quoted-public");
+    let mut wrong = Vec::new();
+    {
+        let server = Server::start(&dir.db(), &[]);
+        let mut a = server.connect();
+        a.q("CREATE TABLE keep(x int)").ok("keep");
+        a.q("INSERT INTO keep VALUES (1)").ok("row");
+        let r = a.q("DROP SCHEMA \"PUBLIC\" CASCADE");
+        if r.error.as_ref().map(|e| e.code.as_str()) != Some("0A000") {
+            wrong.push(format!("server DROP SCHEMA \"PUBLIC\" CASCADE: {:?}", r.error));
+        }
+        let r = a.q("SELECT count(*) FROM keep");
+        if r.rows != vec![vec![Some("1".to_string())]] {
+            wrong.push(format!("server: keep after it: {:?} {:?}", r.rows, r.error));
+        }
+    }
+    let (ok, out) = cli_one(&dir, "DROP SCHEMA \"PUBLIC\" CASCADE");
+    if ok || !out.contains("schema \"PUBLIC\" does not exist") {
+        wrong.push(format!("CLI DROP SCHEMA \"PUBLIC\" CASCADE: ok {ok}: {out}"));
+    }
+    let (_, out) = cli_one(&dir, "SELECT count(*) FROM keep");
+    if !out.contains('1') {
+        wrong.push(format!("CLI: keep after it: {out}"));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-uw1 M4: DROP SCHEMA read only its first name, so `DROP SCHEMA s, nosuch CASCADE`
+/// dropped s and skipped nosuch silently, and the server's refusal checked only the first. PG 18.6
+/// checks every name first: 3F000 for nosuch and s kept; with IF EXISTS a NOTICE for nosuch and s
+/// dropped (recorded: pg18-rev-uw1-schema.out). On the server, any name but public is refused.
+#[test]
+fn drop_schema_reads_every_name() {
+    let dir = Scratch::new("drop-schemas");
+    let mut wrong = Vec::new();
+    for sql in ["CREATE SCHEMA s", "CREATE TABLE s.t (x int)", "CREATE TABLE keep (x int)"] {
+        let (ok, out) = cli_one(&dir, sql);
+        if !ok {
+            wrong.push(format!("{sql}: {out}"));
+        }
+    }
+    let (ok, out) = cli_one(&dir, "DROP SCHEMA s, nosuch CASCADE");
+    if ok || !out.contains("schema \"nosuch\" does not exist") {
+        wrong.push(format!("DROP SCHEMA s, nosuch CASCADE: ok {ok}: {out}"));
+    }
+    let (ok, out) = cli_one(&dir, "SELECT count(*) FROM s.t");
+    if !ok {
+        wrong.push(format!("s.t after the refused DROP: {out}"));
+    }
+    {
+        let server = Server::start(&dir.db(), &[]);
+        let mut a = server.connect();
+        let r = a.q("DROP SCHEMA public, s CASCADE");
+        if r.error.as_ref().map(|e| e.code.as_str()) != Some("0A000") {
+            wrong.push(format!("server DROP SCHEMA public, s CASCADE: {:?}", r.error));
+        }
+        if a.q("SELECT count(*) FROM keep").error.is_some() {
+            wrong.push("server: keep was dropped by the refused DROP".to_string());
+        }
+    }
+    let (ok, out) = cli_one(&dir, "DROP SCHEMA IF EXISTS nosuch, s CASCADE");
+    if !ok {
+        wrong.push(format!("DROP SCHEMA IF EXISTS nosuch, s CASCADE: {out}"));
+    }
+    let (ok, _) = cli_one(&dir, "SELECT count(*) FROM s.t");
+    if ok {
+        wrong.push("s.t after DROP SCHEMA IF EXISTS nosuch, s CASCADE still reads".to_string());
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-uw1 M2: the frontend deletes a dropped schema's file at its block's COMMIT, but only
+/// the server reported a block's end to it, and the server refuses every DROP SCHEMA but public's:
+/// the CLI, the one place a DROP SCHEMA can run in a block, never deleted the file, so the schema
+/// came back at the next open. Through the CLI, BEGIN; DROP SCHEMA s CASCADE; COMMIT, then a new
+/// process can CREATE SCHEMA s; and a DROP rolled back keeps the schema and its table.
+#[test]
+fn a_schema_dropped_in_a_cli_block_goes_at_commit_and_stays_at_rollback() {
+    let dir = Scratch::new("drop-schema-block");
+    let mut wrong = Vec::new();
+    for sql in ["CREATE SCHEMA s", "CREATE TABLE s.t (x int)", "CREATE SCHEMA r", "CREATE TABLE r.t (x int)"] {
+        let (ok, out) = cli_one(&dir, sql);
+        if !ok {
+            wrong.push(format!("{sql}: {out}"));
+        }
+    }
+    cli_script(&dir, b"BEGIN;\nDROP SCHEMA s CASCADE;\nCOMMIT;\n");
+    let (ok, out) = cli_one(&dir, "CREATE SCHEMA s");
+    if !ok {
+        wrong.push(format!("CREATE SCHEMA s after the block's COMMIT: {out}"));
+    }
+    let rolled = Command::new(env!("CARGO_BIN_EXE_tursopg"))
+        .arg(dir.db())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .and_then(|mut c| {
+            c.stdin.take().unwrap().write_all(b"BEGIN;\nDROP SCHEMA r CASCADE;\nROLLBACK;\n")?;
+            c.wait_with_output()
+        })
+        .expect("the CLI");
+    let (ok, out) = cli_one(&dir, "SELECT count(*) FROM r.t");
+    if !ok {
+        wrong.push(format!(
+            "r.t after a DROP SCHEMA rolled back: {out} (the block: {})",
+            String::from_utf8_lossy(&rolled.stdout)
+        ));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-uw1 LOW-2: DROP SCHEMA public CASCADE listed the user tables with NOT LIKE 'sqlite_%',
+/// where `_` is any character, so a table named sqliteXy was left behind. Every user table goes.
+#[test]
+fn drop_schema_public_cascade_drops_a_table_named_like_sqlite() {
+    let dir = Scratch::new("drop-public-like");
+    let mut wrong = Vec::new();
+    for sql in ["CREATE TABLE sqlitexy (x int)", "CREATE TABLE plain (x int)", "DROP SCHEMA public CASCADE"] {
+        let (ok, out) = cli_one(&dir, sql);
+        if !ok {
+            wrong.push(format!("{sql}: {out}"));
+        }
+    }
+    for t in ["sqlitexy", "plain"] {
+        let (ok, _) = cli_one(&dir, &format!("SELECT count(*) FROM {t}"));
+        if ok {
+            wrong.push(format!("{t} survived DROP SCHEMA public CASCADE"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-uw1 M1: a column type no type has went into the stored CREATE TABLE text as it was
+/// written (map_pg_type passed unknown names through, and core prints a type's name bare), so a
+/// quoted type like "text, evil int" became table text of its own. PG 18.6 answers 42704
+/// 'type "text, evil int" does not exist' and creates nothing (recorded: pg18-rev-uw1-type.out).
+#[test]
+fn a_column_type_that_names_no_type_is_42704() {
+    let dir = Scratch::new("unknown-type");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    for (sql, name) in [
+        ("CREATE TABLE t1(a \"text, evil int\")", "text, evil int"),
+        ("CREATE TABLE t2(a \"m x\")", "m x"),
+        ("CREATE TABLE t3(a nosuchtype)", "nosuchtype"),
+    ] {
+        let r = a.q(sql);
+        let want = format!("type \"{name}\" does not exist");
+        match &r.error {
+            Some(e) if e.code == "42704" && e.message == want => {}
+            other => wrong.push(format!("{sql}: want 42704 {want:?}, got {other:?}")),
+        }
+    }
+    let r = a.q("SELECT count(*) FROM pg_class WHERE relname IN ('t1', 't2', 't3')");
+    if r.rows != vec![vec![Some("0".to_string())]] {
+        wrong.push(format!("tables created by the refused statements: {:?} {:?}", r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-uw1 HIGH-1 (engine-owned; the engine's fix is fastest-engine a3e80f1b4): core rebuilt
+/// a foreign key's child table and column names with Name::from_string, which reads a leading
+/// quote as SQL quoting again: a child named `"c` (or a column `"x`) asserted on a cascade, which
+/// aborts the release server, and a child named `'victim'` (quotes in its name) was read as
+/// `victim`, so a cascade reached the wrong table. Each cascade runs on the right table, and the
+/// session lives on.
+#[test]
+fn a_cascade_into_a_quote_led_child_runs_on_that_child() {
+    let dir = Scratch::new("fk-quote-led");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE TABLE p (id int PRIMARY KEY)",
+        "INSERT INTO p VALUES (1), (2), (3)",
+        "CREATE TABLE \"\"\"c\" (\"\"\"x\" int REFERENCES p(id) ON DELETE CASCADE)",
+        "INSERT INTO \"\"\"c\" VALUES (1)",
+        "CREATE TABLE \"\"\"n\" (\"\"\"y\" int REFERENCES p(id) ON DELETE SET NULL ON UPDATE CASCADE)",
+        "INSERT INTO \"\"\"n\" VALUES (2)",
+        "CREATE TABLE victim (v int REFERENCES p(id) ON DELETE CASCADE)",
+        "INSERT INTO victim VALUES (3)",
+        "CREATE TABLE \"'victim'\" (v int REFERENCES p(id) ON DELETE CASCADE)",
+        "INSERT INTO \"'victim'\" VALUES (3)",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    let mut check = |a: &mut Wire, sql: &str, want: &str, wrong: &mut Vec<String>| {
+        let r = a.q(sql);
+        if r.error.is_some() || r.rows != vec![vec![Some(want.to_string())]] {
+            wrong.push(format!("{sql}: want {want}, got {:?} {:?}", r.rows, r.error));
+        }
+    };
+    for (sql, then, want) in [
+        ("DELETE FROM p WHERE id = 1", "SELECT count(*) FROM \"\"\"c\"", "0"),
+        ("UPDATE p SET id = 20 WHERE id = 2", "SELECT \"\"\"y\" FROM \"\"\"n\"", "20"),
+        ("DELETE FROM p WHERE id = 20", "SELECT count(*) FROM \"\"\"n\" WHERE \"\"\"y\" IS NULL", "1"),
+        ("DELETE FROM p WHERE id = 3", "SELECT count(*) FROM \"'victim'\"", "0"),
+    ] {
+        if let Some(e) = a.q(sql).error {
+            wrong.push(format!("{sql}: {} {}", e.code, e.message));
+        }
+        if a.q("SELECT 1").error.is_some() {
+            wrong.push(format!("after {sql}: the session is gone"));
+            return assert!(wrong.is_empty(), "{wrong:#?}");
+        }
+        check(&mut a, then, want, &mut wrong);
+    }
+    check(&mut a, "SELECT count(*) FROM victim", "0", &mut wrong);
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// The arms d5a24b3db took out of a_schema_name_is_never_a_path, restored as their own test (lead
+/// ruling 2026-10-18: a narrowing may never make a known bug invisible). ENGINE-OWNED (owner
+/// fastest-engine; in known-red until its fixes land): a table in a schema whose name needs
+/// quoting fails in core's own text, which prints database names bare (9a58832f5, held), and the
+/// engine's attached names lowercase a quoted mixed-case schema (sent to fastest-engine).
+#[test]
+fn a_schema_whose_name_needs_quoting_holds_tables_and_keeps_its_case() {
+    let dir = Scratch::new("schema-quoted-tables");
+    let mut wrong = Vec::new();
+    for sql in [
+        "CREATE SCHEMA \"a/b\"",
+        "CREATE TABLE \"a/b\".t (x int)",
+        "INSERT INTO \"a/b\".t VALUES (1)",
+        "CREATE SCHEMA \"..\"",
+        "CREATE TABLE \"..\".t (x int)",
+        "CREATE SCHEMA \"MixedCase\"",
+        "CREATE TABLE \"MixedCase\".t (x int)",
+    ] {
+        let (ok, out) = cli_one(&dir, sql);
+        if !ok {
+            wrong.push(format!("{sql}: {out}"));
+        }
+    }
+    for (sql, want) in [
+        ("SELECT x FROM \"a/b\".t", "1"),
+        ("SELECT count(*) FROM \"..\".t", "0"),
+        ("SELECT count(*) FROM \"MixedCase\".t", "0"),
+    ] {
+        let (ok, out) = cli_one(&dir, sql);
+        if !ok || !out.contains(want) {
+            wrong.push(format!("after a reopen, {sql}: {out}"));
+        }
+    }
+    let (_, names) = cli_one(&dir, "SELECT nspname FROM pg_namespace ORDER BY nspname");
+    if !names.contains("MixedCase") {
+        wrong.push(format!("the quoted name MixedCase was not kept as written: {names}"));
+    }
+    // The reviewer's DROP arms (wire-rev-uw2 MED, c1 and c6), as PostgreSQL answers them: "Foo"
+    // and foo are two names, so DROP SCHEMA foo is 3F000 and "Foo" stays; "MixedCase" drops by
+    // its own name.
+    let (ok, _) = cli_one(&dir, "CREATE SCHEMA \"Foo\"");
+    if !ok {
+        wrong.push("CREATE SCHEMA \"Foo\"".to_string());
+    }
+    let (ok, out) = cli_one(&dir, "DROP SCHEMA foo");
+    if ok || !out.contains("schema \"foo\" does not exist") {
+        wrong.push(format!("DROP SCHEMA foo with only \"Foo\": ok {ok}: {out}"));
+    }
+    let (ok, out) = cli_one(&dir, "DROP SCHEMA \"MixedCase\" CASCADE");
+    if !ok {
+        wrong.push(format!("DROP SCHEMA \"MixedCase\" CASCADE: {out}"));
+    }
+    let (_, names) = cli_one(&dir, "SELECT nspname FROM pg_namespace ORDER BY nspname");
+    if !names.contains("Foo") || names.to_lowercase().contains("mixedcase") {
+        wrong.push(format!("after the DROPs, want Foo and no MixedCase: {names}"));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-uw2 MED, b2284ce36's schema-name regressions (the reviewer's c1, c6, c5, RAN against
+/// the base). The engine folds an attached database's name, so a schema created as "Foo" is its
+/// foo; the frontend then looked the name up as written and derived the file to delete from the
+/// name it was given: `CREATE SCHEMA "Foo"; DROP SCHEMA foo` answered DROP SCHEMA and left
+/// "Foo"'s file, so the schema came back at the next open; `DROP SCHEMA "MixedCase"` was 3F000
+/// 'does not exist'; and the files an earlier version named with a schema's raw text holding `%`
+/// (a%zz, p%) no longer attached, and q%41 attached as qa. Whatever DROP SCHEMA answers, a
+/// schema it reports dropped is gone with its file, and one it refuses stays; a mixed-case schema
+/// drops by its own name; an old raw file attaches by its raw name, as at the base.
+#[test]
+fn a_schemas_file_goes_with_the_schema_the_engine_dropped() {
+    let dir = Scratch::new("schema-file-names");
+    let files = |dir: &Scratch| {
+        let mut names: Vec<String> = std::fs::read_dir(&dir.0)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with("turso-postgres-schema-") && n.ends_with(".db"))
+            .collect();
+        names.sort();
+        names
+    };
+    let listed = |dir: &Scratch, name: &str| {
+        let (_, names) = cli_one(dir, "SELECT nspname FROM pg_namespace ORDER BY nspname");
+        names.lines().any(|l| l.split('│').any(|c| c.trim() == name))
+    };
+    let mut wrong = Vec::new();
+    let (ok, out) = cli_one(&dir, "CREATE SCHEMA \"Foo\"");
+    if !ok {
+        wrong.push(format!("CREATE SCHEMA \"Foo\": {out}"));
+    }
+    let (dropped, out) = cli_one(&dir, "DROP SCHEMA foo");
+    let foo_listed = listed(&dir, "foo") || listed(&dir, "Foo");
+    if dropped && (foo_listed || !files(&dir).is_empty()) {
+        wrong.push(format!(
+            "DROP SCHEMA foo answered success, then at the next open: listed {foo_listed}, files {:?}",
+            files(&dir)
+        ));
+    }
+    if !dropped && (!out.contains("does not exist") || !foo_listed) {
+        wrong.push(format!("DROP SCHEMA foo refused, and the schema is listed {foo_listed}: {out}"));
+    }
+    let _ = cli_one(&dir, "DROP SCHEMA IF EXISTS \"Foo\"");
+    let (ok, out) = cli_one(&dir, "CREATE SCHEMA \"MixedCase\"");
+    if !ok {
+        wrong.push(format!("CREATE SCHEMA \"MixedCase\": {out}"));
+    }
+    let (ok, out) = cli_one(&dir, "DROP SCHEMA \"MixedCase\"");
+    if !ok {
+        wrong.push(format!("DROP SCHEMA \"MixedCase\" by its own name: {out}"));
+    }
+    if listed(&dir, "mixedcase") || listed(&dir, "MixedCase") || !files(&dir).is_empty() {
+        wrong.push(format!("after DROP SCHEMA \"MixedCase\": files {:?}", files(&dir)));
+    }
+    let (ok, out) = cli_one(&dir, "CREATE SCHEMA qz");
+    if !ok {
+        wrong.push(format!("CREATE SCHEMA qz: {out}"));
+    }
+    let source = dir.0.join("turso-postgres-schema-qz.db");
+    for raw in ["a%zz", "q%41", "p%"] {
+        std::fs::copy(&source, dir.0.join(format!("turso-postgres-schema-{raw}.db"))).unwrap();
+    }
+    for raw in ["a%zz", "q%41", "p%", "qz"] {
+        if !listed(&dir, raw) {
+            let (_, names) = cli_one(&dir, "SELECT nspname FROM pg_namespace ORDER BY nspname");
+            wrong.push(format!("the old raw file of {raw} did not attach as {raw}: {names}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Found by wire-rev-uw2 N4's red through the CLI: a statement that failed inside a CLI block left
+/// the block open and working, so a later COMMIT committed the block's other statements, the
+/// failed one's neighbours included (a script's BEGIN; DROP SCHEMA s CASCADE; CREATE TABLE s.u
+/// [fails]; COMMIT dropped s and its tables, where PostgreSQL keeps them). PostgreSQL aborts the
+/// block at the error: every later statement is 25P02 'current transaction is aborted, commands
+/// ignored until end of transaction block', COMMIT ends it as ROLLBACK, and ROLLBACK TO a
+/// savepoint recovers it (the server's fail_block; recorded there, pg18 recordings of the
+/// server's failed-block replays). The CLI keeps that state across a script's lines.
+#[test]
+fn a_cli_block_that_failed_commits_nothing() {
+    let dir = Scratch::new("cli-failed-block");
+    let script = |input: &str| {
+        let mut cli = Command::new(env!("CARGO_BIN_EXE_tursopg"))
+            .arg(dir.db())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("the CLI");
+        cli.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+        let out = cli.wait_with_output().expect("the CLI");
+        format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
+    };
+    let mut wrong = Vec::new();
+    let (ok, out) = cli_one(&dir, "CREATE TABLE f(x int)");
+    if !ok {
+        wrong.push(format!("CREATE TABLE f: {out}"));
+    }
+    let out = script("BEGIN;\nINSERT INTO f VALUES (1);\nSELECT nosuch FROM f;\nINSERT INTO f VALUES (2);\nCOMMIT;\n");
+    if !out.contains("current transaction is aborted, commands ignored until end of transaction block") {
+        wrong.push(format!("the INSERT after the failed SELECT in the block: {out}"));
+    }
+    let (_, out) = cli_one(&dir, "SELECT count(*) FROM f");
+    if !out.lines().any(|l| l.split('│').any(|c| c.trim() == "0")) {
+        wrong.push(format!("rows of the failed block after its COMMIT (want 0): {out}"));
+    }
+    let out = script(
+        "BEGIN;\nINSERT INTO f VALUES (10);\nSAVEPOINT a;\nSELECT nosuch FROM f;\nROLLBACK TO a;\n\
+         INSERT INTO f VALUES (11);\nCOMMIT;\n",
+    );
+    let (_, count) = cli_one(&dir, "SELECT count(*) FROM f WHERE x >= 10");
+    if !count.lines().any(|l| l.split('│').any(|c| c.trim() == "2")) {
+        wrong.push(format!("a block recovered by ROLLBACK TO keeps 10 and 11: {out} / {count}"));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-uw2 LOW: through the CLI, CREATE SCHEMA "PUBLIC" attached a database the engine
+/// names public (it folds an attached name), so pg_namespace listed public twice. PostgreSQL 18.6
+/// creates a schema "PUBLIC" of its own (recorded: pg18-rev-uw2-lows.out); the engine cannot hold
+/// two schemas whose names fold alike, so the CLI refuses it as the public it is, 'schema
+/// "PUBLIC" already exists', and lists public once (COMPAT: folded names).
+#[test]
+fn a_schema_named_public_in_another_case_is_public() {
+    let dir = Scratch::new("schema-public-case");
+    let mut wrong = Vec::new();
+    let (ok, out) = cli_one(&dir, "CREATE SCHEMA \"PUBLIC\"");
+    if ok || !out.contains("schema \"PUBLIC\" already exists") {
+        wrong.push(format!("CREATE SCHEMA \"PUBLIC\": ok {ok}: {out}"));
+    }
+    let (_, names) = cli_one(&dir, "SELECT nspname FROM pg_namespace ORDER BY nspname");
+    let publics = names.lines().filter(|l| l.split('│').any(|c| c.trim().eq_ignore_ascii_case("public"))).count();
+    if publics != 1 {
+        wrong.push(format!("pg_namespace lists public {publics} times: {names}"));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-uw2 N4: inside a CLI block, a DROP SCHEMA's DETACH waits for COMMIT, and until then
+/// the dropped schema still answered: pg_namespace listed it, and CREATE TABLE s.u succeeded, so
+/// the COMMIT then deleted s.u with the schema's file (DATA LOSS of a table the block had just
+/// made); and dropping then re-creating the schema in one block failed 'already exists'.
+/// PostgreSQL 18.6 (the reviewer's runs, artie 718f73d7c1 reviews/uw2-raws/r5-pg.txt m2c, m2d):
+/// after the drop pg_namespace has no s and s.u is 3F000 'schema "s" does not exist' (the block
+/// then rolls back, s and s.t are kept); a re-created s takes new tables, and they are there
+/// after the COMMIT.
+#[test]
+fn a_schema_dropped_in_a_block_is_gone_until_it_is_created_again() {
+    let dir = Scratch::new("drop-schema-in-block");
+    let script = |input: &str| {
+        let mut cli = Command::new(env!("CARGO_BIN_EXE_tursopg"))
+            .arg(dir.db())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("the CLI");
+        cli.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+        let out = cli.wait_with_output().expect("the CLI");
+        format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
+    };
+    let mut wrong = Vec::new();
+    for sql in ["CREATE SCHEMA s", "CREATE TABLE s.t (x int)", "CREATE SCHEMA q", "CREATE TABLE q.t (x int)"] {
+        let (ok, out) = cli_one(&dir, sql);
+        if !ok {
+            wrong.push(format!("{sql}: {out}"));
+        }
+    }
+    let out = script(
+        "BEGIN;\nDROP SCHEMA s CASCADE;\nSELECT 'listed' FROM pg_namespace WHERE nspname = 's';\n\
+         SELECT 'unlisted' WHERE NOT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 's');\n\
+         CREATE TABLE s.u (x int);\nCOMMIT;\n",
+    );
+    let listed = out.lines().any(|l| l.split('│').any(|c| c.trim() == "listed"));
+    if listed || !out.contains("unlisted") {
+        wrong.push(format!("pg_namespace after the in-block DROP SCHEMA s: {out}"));
+    }
+    if !out.contains("schema \"s\" does not exist") {
+        wrong.push(format!("CREATE TABLE s.u after the in-block DROP SCHEMA s: {out}"));
+    }
+    let (ok, out) = cli_one(&dir, "SELECT count(*) FROM s.t");
+    if !ok {
+        wrong.push(format!("s.t after the block that failed: {out}"));
+    }
+    let out = script(
+        "BEGIN;\nDROP SCHEMA q CASCADE;\nCREATE SCHEMA q;\nCREATE TABLE q.u (x int);\n\
+         INSERT INTO q.u VALUES (5);\nCOMMIT;\n",
+    );
+    if out.contains("rror") {
+        wrong.push(format!("drop and re-create q in one block: {out}"));
+    }
+    let (ok, out) = cli_one(&dir, "SELECT x FROM q.u");
+    if !ok || !out.contains('5') {
+        wrong.push(format!("q.u after the COMMIT: ok {ok}: {out}"));
+    }
+    let (ok, out) = cli_one(&dir, "SELECT x FROM q.t");
+    if ok {
+        wrong.push(format!("q.t, dropped with the old q, still reads: {out}"));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-uw2 N1, DATA LOSS: through the CLI, DROP SCHEMA without CASCADE on a schema that holds
+/// a table detached it and deleted its file, so the table and its rows were gone, in autocommit,
+/// inside a block, and for `DROP SCHEMA a, b` where only b holds one. PostgreSQL 18.6 refuses with
+/// 2BP01 and drops nothing (wire-rev-uw2's PG runs, artie 718f73d7c1 reviews/uw2-raws/r5-pg.txt:
+/// m2e, m4a, m4c). Also N2 (an empty schema's DROP ... CASCADE failed 'database s is locked') and
+/// N3 (`DROP SCHEMA s, s CASCADE` dropped s, then reported an error; PG drops it once).
+#[test]
+fn drop_schema_without_cascade_keeps_a_schema_that_holds_tables() {
+    let dir = Scratch::new("drop-schema-restrict");
+    let mut wrong = Vec::new();
+    let mut must = |sql: &str, wrong: &mut Vec<String>| {
+        let (ok, out) = cli_one(&dir, sql);
+        if !ok {
+            wrong.push(format!("{sql}: {out}"));
+        }
+    };
+    for sql in [
+        "CREATE SCHEMA s",
+        "CREATE TABLE s.t (x int)",
+        "INSERT INTO s.t VALUES (1)",
+        "CREATE SCHEMA a",
+        "CREATE SCHEMA b",
+        "CREATE TABLE b.t (x int)",
+        "INSERT INTO b.t VALUES (2)",
+    ] {
+        must(sql, &mut wrong);
+    }
+    let (ok, out) = cli_one(&dir, "DROP SCHEMA s");
+    if ok || !out.contains("cannot drop schema s because other objects depend on it") {
+        wrong.push(format!("DROP SCHEMA s (non-empty): ok {ok}: {out}"));
+    }
+    let block = Command::new(env!("CARGO_BIN_EXE_tursopg"))
+        .arg(dir.db())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .and_then(|mut c| {
+            c.stdin.take().unwrap().write_all(b"BEGIN;\nDROP SCHEMA s;\nCOMMIT;\n")?;
+            c.wait_with_output()
+        })
+        .expect("the CLI");
+    let _ = block;
+    let (ok, out) = cli_one(&dir, "DROP SCHEMA a, b");
+    if ok || !out.contains("cannot drop desired object(s) because other objects depend on them") {
+        wrong.push(format!("DROP SCHEMA a, b (b non-empty): ok {ok}: {out}"));
+    }
+    for (sql, want) in [("SELECT x FROM s.t", "1"), ("SELECT x FROM b.t", "2")] {
+        let (ok, out) = cli_one(&dir, sql);
+        if !ok || !out.contains(want) {
+            wrong.push(format!("after the refused DROPs, {sql}: {out}"));
+        }
+    }
+    let (_, names) = cli_one(&dir, "SELECT nspname FROM pg_namespace ORDER BY nspname");
+    if !names.lines().any(|l| l.split('│').any(|c| c.trim() == "a")) {
+        wrong.push(format!("schema a was dropped by the refused DROP SCHEMA a, b: {names}"));
+    }
+    for sql in ["DROP SCHEMA a CASCADE", "DROP SCHEMA IF EXISTS nosuch CASCADE", "DROP SCHEMA s, s CASCADE"] {
+        must(sql, &mut wrong);
+    }
+    let (ok, _) = cli_one(&dir, "SELECT x FROM s.t");
+    if ok {
+        wrong.push("s.t reads after DROP SCHEMA s, s CASCADE".to_string());
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-uw2 H2, a LOCK LEAK from 3605da9f2: a multi-statement simple Query in autocommit runs
+/// in an implicit block, so its reads were noted, and nothing released them when that block
+/// ended: every other session's DROP TABLE of what it read then waited its lock_timeout and was
+/// 55P03, until the session ran a block of its own or left. PG and the base drop at once. Reads
+/// are held to the end of the block that made them, an implicit one included, in both protocols.
+#[test]
+fn an_implicit_blocks_reads_end_with_it() {
+    let dir = Scratch::new("implicit-reads");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut b = server.connect();
+    for t in ["d", "e"] {
+        a.q(&format!("CREATE TABLE {t}(x int)")).ok(t);
+    }
+    let mut wrong = Vec::new();
+    a.q("SELECT x FROM d; SELECT 2").ok("a multi-statement query");
+    named_parse(&mut a, "", "SELECT x FROM e");
+    named_bind(&mut a, "", "");
+    named_execute(&mut a, "");
+    a.send(b'S', &[]);
+    a.read_reply();
+    b.q("SET lock_timeout = '300ms'").ok("lock_timeout");
+    for t in ["d", "e"] {
+        let started = Instant::now();
+        if let Some(e) = b.q(&format!("DROP TABLE {t}")).error {
+            wrong.push(format!("b's DROP TABLE {t} after a's implicit block ended: {} {} after {:?}", e.code, e.message, started.elapsed()));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }

@@ -109,6 +109,14 @@ struct Opts {
 
     #[clap(
         long,
+        help = "With --server: the directory whose files a client's COPY FROM 'file' may read \
+                (by real path); without it a client reads no server file (42501), as a \
+                PostgreSQL role without pg_read_server_files"
+    )]
+    copy_from_dir: Option<PathBuf>,
+
+    #[clap(
+        long,
         default_value_t = turso_pg_server::DEFAULT_AUTHENTICATION_TIMEOUT_S,
         value_parser = clap::value_parser!(u64).range(1..=600),
         help = "With --server: how long a client has to complete its startup before the session \
@@ -262,14 +270,15 @@ fn cmd_list_tables(conn: &Connection, w: &mut dyn Write) {
 }
 
 fn cmd_describe_table(conn: &Connection, table_name: &str, w: &mut dyn Write) {
-    let safe_name = table_name.replace('\'', "''");
+    // Quoted by the one literal-quoting function (wire-rev-uw2 N6: quoted here by hand).
+    let name_literal = turso_pg::sql_quoted(table_name);
     let sql = format!(
         "SELECT a.attname, t.typname, a.attnotnull, COALESCE(d.adbin, ''), a.attnum \
          FROM pg_attribute a \
          JOIN pg_class c ON a.attrelid = c.oid \
          JOIN pg_type t ON a.atttypid = t.oid \
          LEFT JOIN pg_attrdef d ON a.attrelid = d.adrelid AND a.attnum = d.adnum \
-         WHERE c.relname = '{safe_name}' AND a.attnum > 0 AND a.attisdropped = 0 \
+         WHERE c.relname = {name_literal} AND a.attnum > 0 AND a.attisdropped = 0 \
          ORDER BY a.attnum"
     );
     match conn.query(&sql) {
@@ -302,11 +311,11 @@ fn cmd_describe_table(conn: &Connection, table_name: &str, w: &mut dyn Write) {
                 let _ = writeln!(w, "Table: {table_name}");
                 let _ = writeln!(w, "{table}");
             } else {
-                let _ = writeln!(w, "Table '{table_name}' not found.");
+                let _ = writeln!(w, "Table \"{table_name}\" not found.");
             }
         }
         Ok(None) => {
-            let _ = writeln!(w, "Table '{table_name}' not found.");
+            let _ = writeln!(w, "Table \"{table_name}\" not found.");
         }
         Err(e) => {
             let _ = writeln!(w, "Error: {e}");
@@ -539,7 +548,8 @@ fn cmd_describe_table_extended(conn: &Connection, table_name: &str, w: &mut dyn 
     // First show the regular column description
     cmd_describe_table(conn, table_name, w);
 
-    let safe_name = table_name.replace('\'', "''");
+    // Quoted by the one literal-quoting function (wire-rev-uw2 N6: quoted here by hand).
+    let name_literal = turso_pg::sql_quoted(table_name);
 
     // Show indexes
     let idx_sql = format!(
@@ -547,7 +557,7 @@ fn cmd_describe_table_extended(conn: &Connection, table_name: &str, w: &mut dyn 
          FROM pg_index i \
          JOIN pg_class c ON i.indexrelid = c.oid \
          JOIN pg_class c2 ON i.indrelid = c2.oid \
-         WHERE c2.relname = '{safe_name}' \
+         WHERE c2.relname = {name_literal} \
          ORDER BY c.relname"
     );
     if let Ok(Some(mut rows)) = conn.query(&idx_sql) {
@@ -569,7 +579,7 @@ fn cmd_describe_table_extended(conn: &Connection, table_name: &str, w: &mut dyn 
         "SELECT conname, contype \
          FROM pg_constraint con \
          JOIN pg_class c ON con.conrelid = c.oid \
-         WHERE c.relname = '{safe_name}' \
+         WHERE c.relname = {name_literal} \
          ORDER BY conname"
     );
     if let Ok(Some(mut rows)) = conn.query(&con_sql) {
@@ -705,7 +715,71 @@ fn handle_meta_command(
 // SQL execution
 // ---------------------------------------------------------------------------
 
+/// The CLI's open block failed: a statement errored inside it. PostgreSQL aborts the block at
+/// the error, so until it ends every statement is 25P02, COMMIT (END, ROLLBACK, ABORT) ends it as
+/// ROLLBACK and ROLLBACK TO a savepoint recovers it, as the server's fail_block does. A script's
+/// later COMMIT committed the failed block's other statements (found by wire-rev-uw2 N4's red).
+/// One CLI process holds one connection, so the state is the process's.
+static BLOCK_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn execute_sql(
+    conn: &Connection,
+    sql: &str,
+    table_config: &TableConfig,
+    expanded: bool,
+    w: &mut dyn Write,
+) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    if conn.inner().get_auto_commit() {
+        BLOCK_FAILED.store(false, Relaxed);
+    }
+    if !BLOCK_FAILED.load(Relaxed) {
+        let had_error = run_statements(conn, sql, table_config, expanded, w);
+        if had_error && !conn.inner().get_auto_commit() {
+            BLOCK_FAILED.store(true, Relaxed);
+        }
+        return had_error;
+    }
+    let statements = turso_pg::split_statements(sql).unwrap_or_else(|_| vec![sql.to_string()]);
+    for (i, statement) in statements.iter().enumerate() {
+        match turso_pg::failed_block_verb(statement) {
+            turso_pg::FailedBlockVerb::Ends { chain } => {
+                if let Err(e) = conn.execute("ROLLBACK") {
+                    let _ = writeln!(w, "Error: {e}");
+                    return true;
+                }
+                conn.tx_event(turso_pg::TxEvent::Ended { committed: false }, statement);
+                BLOCK_FAILED.store(false, Relaxed);
+                if chain {
+                    if let Err(e) = conn.execute("BEGIN") {
+                        let _ = writeln!(w, "Error: {e}");
+                        return true;
+                    }
+                }
+            }
+            turso_pg::FailedBlockVerb::RollbackTo => {
+                if run_statements(conn, statement, table_config, expanded, w) {
+                    return true;
+                }
+                BLOCK_FAILED.store(false, Relaxed);
+            }
+            turso_pg::FailedBlockVerb::Other => {
+                let _ = writeln!(
+                    w,
+                    "Error: current transaction is aborted, commands ignored until end of transaction block"
+                );
+                return true;
+            }
+        }
+        if !BLOCK_FAILED.load(Relaxed) && i + 1 < statements.len() {
+            return execute_sql(conn, &statements[i + 1..].join(";\n"), table_config, expanded, w);
+        }
+    }
+    false
+}
+
+/// Run `sql`'s statements in order, stopping at the first error; true when one failed.
+fn run_statements(
     conn: &Connection,
     sql: &str,
     table_config: &TableConfig,
@@ -714,7 +788,24 @@ fn execute_sql(
 ) -> bool {
     let runner = conn.query_runner(sql.as_bytes());
     let mut had_error = false;
+    // A block that a statement ends is reported to the session, as the server reports it
+    // (wire-rev-uw1 M2): a COMMIT that ran settles the block's SETs and its dropped schemas,
+    // anything else that ended it rolls them back.
+    let mut in_block = !conn.inner().get_auto_commit();
     for mut output in runner {
+        let mut ran_ok = false;
+        let mut text = String::new();
+        if let Ok(Some(ref stmt)) = output {
+            text = stmt.get_sql().to_string();
+        }
+        let ended = |ok: bool, text: &str, in_block: &mut bool| {
+            let now = !conn.inner().get_auto_commit();
+            if *in_block && !now {
+                let committed = ok && turso_pg::is_commit(text);
+                conn.tx_event(turso_pg::TxEvent::Ended { committed }, text);
+            }
+            *in_block = now;
+        };
         match output {
             Ok(Some(ref mut stmt)) => {
                 let result = if expanded {
@@ -722,14 +813,17 @@ fn execute_sql(
                 } else {
                     print_result_set(stmt, table_config, w)
                 };
+                ran_ok = result.is_ok();
+                ended(ran_ok, &text, &mut in_block);
                 if let Err(e) = result {
                     let _ = writeln!(w, "Error: {e}");
                     had_error = true;
                     break;
                 }
             }
-            Ok(None) => {}
+            Ok(None) => ended(true, &text, &mut in_block),
             Err(ref e) => {
+                ended(false, &text, &mut in_block);
                 let _ = writeln!(w, "Error: {e}");
                 had_error = true;
                 break;
@@ -1085,6 +1179,10 @@ fn main() -> anyhow::Result<()> {
             interrupt_count,
         )
         .with_startup_timeout(std::time::Duration::from_secs(opts.authentication_timeout));
+        let server = match &opts.copy_from_dir {
+            Some(dir) => server.with_copy_from_dir(dir)?,
+            None => server,
+        };
         return server.run();
     }
 
