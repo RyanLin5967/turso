@@ -12366,6 +12366,13 @@ replays_postgresql!(
     "pg18-wirefuzz-every_write_path_refuses_a_value_too_long_for_varchar.out",
     []
 );
+// wire-rev-cfdebc06d MED-4: a decimal literal of more than 15 significant digits is stored with every digit, in a
+// numeric column and as text, on INSERT and UPDATE; a float8 column keeps the nearest double.
+replays_postgresql!(
+    pg18_wirefuzz_a_long_decimal_literal_is_stored_with_every_digit_replays_as_postgresql_answered,
+    "pg18-wirefuzz-a_long_decimal_literal_is_stored_with_every_digit.out",
+    []
+);
 // wire-rev-cfdebc06d HIGH-1: a CAST to NUMERIC(p, s) keeps every digit to precision 15 and is refused above it, never
 // rounded through the engine's REAL; the bigint the refused UPDATE would have changed reads as PostgreSQL's (#14).
 replays_postgresql!(

@@ -1955,6 +1955,25 @@ impl PostgreSQLTranslator {
     /// in VALUES — omitting the column achieves the same effect.
     /// Columns with DEFAULT in only SOME rows keep the DEFAULT as NULL.
     // The Box<Expr> is required by ast::OneSelect::Values(Vec<Vec<Box<Expr>>>)
+    /// A value assigned to a column (an INSERT VALUES item, an UPDATE SET source). A plain decimal
+    /// literal of more than 15 significant digits is handed to the column as its text: as a REAL
+    /// (the engine's reading of a decimal literal) it was rounded before a numeric column's
+    /// ENCODE, which reads text exactly (12345678901234567.89 stored 12345678901234568.00;
+    /// wire-rev-cfdebc06d MED-4). The column's affinity reads the text as a float or integer
+    /// column read the REAL, and a text column keeps PostgreSQL's digits. Only an assigned bare
+    /// literal: in an expression the text would compare and sort as text.
+    fn translate_assigned(&self, node: &pg_query::protobuf::Node) -> Result<ast::Expr, ParseError> {
+        use pg_query::protobuf::{a_const::Val, node::Node};
+        if let Some(Node::AConst(c)) = &node.node {
+            if let Some(Val::Fval(f)) = &c.val {
+                if long_plain_decimal(&f.fval) {
+                    return Ok(ast::Expr::Literal(sql_string(&f.fval)));
+                }
+            }
+        }
+        self.translate_expr(node)
+    }
+
     #[allow(clippy::vec_box, clippy::type_complexity)]
     fn translate_values(
         &self,
@@ -1996,7 +2015,7 @@ impl PostgreSQLTranslator {
                         .iter()
                         .enumerate()
                         .filter(|(i, _)| !default_mask.get(*i).copied().unwrap_or(false))
-                        .map(|(_, item)| Ok(Box::new(self.translate_expr(item)?)))
+                        .map(|(_, item)| Ok(Box::new(self.translate_assigned(item)?)))
                         .collect::<Result<Vec<_>, ParseError>>()?;
                     rows.push(row);
                 }
@@ -2100,7 +2119,7 @@ impl PostgreSQLTranslator {
                     }
                     sets.push(ast::Set {
                         col_names: vec![col_name],
-                        expr: Box::new(self.translate_expr(val)?),
+                        expr: Box::new(self.translate_assigned(val)?),
                     });
                 }
                 _ => {
@@ -6040,6 +6059,17 @@ fn float_literal(text: &str, type_name: &str) -> Result<ast::Expr, ParseError> {
 /// parse_numeric_literal assumes SQLite's grammar checked the text, so `0b1000..0` (2^31) hit its
 /// unreachable!() and ended the session (the PostgreSQL regression corpus, numerology.sql). A
 /// non-decimal value past u128 is computed as a float. Any other text is passed on as it is.
+/// Whether `text` is a plain decimal (optional '-', digits with one '.', no exponent, no '_')
+/// holding more than 15 significant digits, more than a float8 holds exactly (DBL_DIG).
+fn long_plain_decimal(text: &str) -> bool {
+    let body = text.strip_prefix('-').unwrap_or(text);
+    if body.bytes().filter(|&b| b == b'.').count() != 1 || !body.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+        return false;
+    }
+    let digits: String = body.chars().filter(|c| *c != '.').collect();
+    digits.trim_start_matches('0').trim_end_matches('0').len() > 15
+}
+
 fn decimal_numeric_literal(text: &str) -> String {
     let (negative, body) = match text.strip_prefix('-') {
         Some(rest) => (true, rest),
