@@ -923,8 +923,13 @@ impl Catalog {
             rows.extend(more);
         }
         let keys: Vec<(u64, u64)> = rows.iter().map(|r| Ok((get(r, 1)?, get(r, 2)?))).collect::<Result<_>>()?;
+        // Mutant `l4_upgrade_batch_links_nothing` (test builds only; l4-rev-h1 MED-1, its falsifier
+        // REVIEW_SKIP_RELINK): the batch links no row, so the link columns stay NULL under a committed batch.
+        let skip = super::store::fe_mutant("l4_upgrade_batch_links_nothing");
         for &(p, f) in &keys {
-            self.relink(p, f)?;
+            if !skip {
+                self.relink(p, f)?;
+            }
         }
         super::store::kill_point("ckpt.upgrade.rows");
         Ok(if keys.len() < n { None } else { keys.last().copied() })
