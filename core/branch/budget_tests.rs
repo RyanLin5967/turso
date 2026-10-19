@@ -2469,6 +2469,37 @@ fn run_instruments(cell: &str) -> String {
     // harness's own in-window work (the thread count, the declared spin, the confirmation absorb, the
     // settle waits, the confirm counts) is inside the counts, so it must move none of them.
     put("fc_measure_empty", &measure(&db, base, || {}).1);
+    // budgets-port-adversary HIGH-2 (its ADV4): a harness window an undeclared thread ran a 5 ms burst in,
+    // the thread blocked at both ends (so the thread count and the settle checks pass): it must not be
+    // quiet. The base is taken with that thread already parked.
+    {
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let h = std::thread::Builder::new()
+            .name("fc-foreign-burst".into())
+            .spawn(move || {
+                while go_rx.recv().is_ok() {
+                    let t = std::time::Instant::now();
+                    while t.elapsed() < std::time::Duration::from_millis(5) {
+                        std::hint::spin_loop();
+                    }
+                    let _ = done_tx.send(());
+                }
+            })
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let b = probe::threads();
+        put(
+            "fc_measure_foreign",
+            &measure(&db, b, || {
+                go_tx.send(()).unwrap();
+                let _ = done_rx.recv();
+            })
+            .1,
+        );
+        drop(go_tx);
+        h.join().unwrap();
+    }
     out
 }
 
@@ -3105,6 +3136,15 @@ fn the_budget_counters_count_exactly_what_was_done() {
     // read. Off Apple no kernel syscall count exists, so quiet cannot rest on an attributed count there.
     #[cfg(any(target_vendor = "apple", target_os = "linux"))]
     assert_eq!(get("fc_measure_empty", "quiet"), 1, "CLAIM: an empty harness window is not quiet, so no cell of this platform can pass");
+    // budgets-port-adversary HIGH-2: the refusal fires, on every platform. Each refused or foreign window
+    // reads NOT threads-quiet, and a harness window an undeclared thread ran a burst in is NOT quiet (mutant
+    // probe_threads_quiet_always: every window threads-quiet off Apple).
+    for op in ["fc_foreign_window", "fc_thread_new_quiet", "fc_gone_thread", "fc_too_many_threads", "fc_measure_foreign"] {
+        assert_eq!(get(op, "threads_quiet"), 0, "CLAIM: {op}, a window the thread rule refuses, reads threads-quiet");
+    }
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    assert!(get("fc_measure_foreign", "foreign_threads") >= 1, "premise: fc_measure_foreign's burst thread was not seen running in the window");
+    assert_eq!(get("fc_measure_foreign", "quiet"), 0, "CLAIM: a window a foreign thread ran a 5 ms burst in is quiet");
     for op in ["fc_thread_new_quiet", "fc_foreign_window", "fc_measure_empty"] {
         for k in ["allocs", "alloc_bytes", "held_allocs"] {
             assert_eq!(get(op, k), 0, "{op}: a window whose own work allocates nothing moved {k}: the instrument or the harness allocated inside it");
