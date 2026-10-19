@@ -11600,8 +11600,24 @@ impl StoreCore {
         if self.async_threads.started.load(Ordering::Acquire) && !self.group.poisoned() && !fe_mutant("close_drops_async") {
             let lsn = self.journal_lsn();
             if lsn > self.group.durable(self.class) {
-                if let Err(e) = self.wait_durable(lsn, self.class) {
-                    tracing::warn!("branch store close: the async creates' flight failed: {e}");
+                // Under catch_unwind, as the flusher's flights are (engine-2bdcd32c6 LOW 4): a
+                // close runs while its caller's thread may be unwinding, where a second panic
+                // aborts the process. A panic fail-stops the store, as the flusher's does. Mutant
+                // `close_flight_unguarded` (test builds only): not caught, as at da850ed1c.
+                let fly = || self.wait_durable(lsn, self.class);
+                let flown = if fe_mutant("close_flight_unguarded") {
+                    Ok(fly())
+                } else {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(fly))
+                };
+                match flown {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => tracing::warn!("branch store close: the async creates' flight failed: {e}"),
+                    Err(_) => {
+                        tracing::warn!("branch store close: the async creates' flight panicked; the store fail-stops");
+                        let mut g = self.group.lock();
+                        self.group.fail(&mut g);
+                    }
                 }
             }
         }
