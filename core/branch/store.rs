@@ -2177,8 +2177,8 @@ impl<G: std::ops::DerefMut<Target = StoreInner>> Drop for Counted<G> {
 struct StoreInner {
     arena: Option<Arena>,
     journal: Option<Journal>,
-    /// LEAP L2(c): a fresh durable store's log buffers, made at open, for the journal its first
-    /// create starts (`LogBuffers`); dropped when the open recovers a journal of its own.
+    /// LEAP L2(c): a fresh durable store's log buffers, made at the end of an open that recovered
+    /// no journal, for the journal its first create starts (`LogBuffers`).
     log_buffers: Option<super::journal::LogBuffers>,
     /// `Some` for a durable store.
     files: Option<BranchFiles>,
@@ -5908,7 +5908,7 @@ impl StoreCore {
         if targets.arena && !memory {
             prewarm::warm_files(&[BranchFiles::for_db(db_path).arena.as_path()], warm, &mut warmed)?;
         }
-        let inner = match durability {
+        let mut inner = match durability {
             BranchDurability::Volatile => {
                 if !memory && BranchFiles::for_db(db_path).exist() {
                     return Err(LimboError::InvalidArgument(format!(
@@ -6045,7 +6045,6 @@ impl StoreCore {
                             }
                         }
                         inner.journal = Some(journal);
-                        inner.log_buffers = None;
                     }
                 }
                 inner
@@ -6072,6 +6071,14 @@ impl StoreCore {
                 inner
             }
         };
+        // LEAP L2(c): the log buffers the first create's journal takes, made here, outside every
+        // create's hold, and only when the open recovered no journal of its own (engine-2bdcd32c6
+        // LOW 6: every open of a durable store made them, a recovering one threw them away, and
+        // `fresh_again` made another set). Mutant `log_buffers_every_open` (test builds only):
+        // made by every open, as at da850ed1c.
+        if inner.files.is_some() && (inner.journal.is_none() || fe_mutant("log_buffers_every_open")) {
+            inner.log_buffers = Some(super::journal::LogBuffers::new());
+        }
         // Every byte the open buffered was flushed by the recovery itself (single-threaded).
         let opened_lsn = inner.journal.as_ref().map_or(0, |j| j.lsn() - j.pending_len());
         let mut store = Self {
@@ -6435,7 +6442,6 @@ impl StoreCore {
         let mut journal = recovered.journal;
         journal.share_fail_stop(&inner.fail_stop);
         inner.journal = Some(journal);
-        inner.log_buffers = None;
         stats.arena_ns = ns(t);
         Ok(())
     }
@@ -11724,9 +11730,8 @@ impl StoreInner {
         Self {
             arena: None,
             journal: None,
-            // LEAP L2(c): the log buffers the first create's journal takes, made here, at open,
-            // outside every create's hold (`LogBuffers`).
-            log_buffers: files.as_ref().map(|_| super::journal::LogBuffers::new()),
+            // LEAP L2(c): made by the open once it has recovered no journal (`open_resolved`).
+            log_buffers: None,
             files,
             sync,
             next_id: 1,
