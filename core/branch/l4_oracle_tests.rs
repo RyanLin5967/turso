@@ -484,8 +484,18 @@ fn a_kill_at_every_step_of_the_upgrade_leaves_the_store_17_or_21() {
         let db = reopen_and_check(&path, point);
         // (ii) and (iii):
         assert_eq!(db.branches.links_known_and_catalog_format_for_test().1, Some(21), "{point}: not upgraded by the next checkpoint");
+        let mut conns = Vec::new();
         for name in ["first", "u0", "u1", "u2"] {
-            db.connect_named(name).unwrap_or_else(|e| panic!("{point}: {name} is gone: {e}"));
+            conns.push(db.connect_named(name).unwrap_or_else(|e| panic!("{point}: {name} is gone: {e}")));
         }
+        // l4-rev-h1 MED-1 (its h1rev10/strengthen.py; FLAGGED stricter): (i) again with every branch
+        // RESIDENT, so their links, read from the link columns, are compared with the catalog's rows (with
+        // none resident the check reads no link content: mutant l4_upgrade_batch_links_nothing survived it).
+        let known = db.branches.links_known_and_catalog_format_for_test();
+        println!("{point}: resident check, links known/format {known:?}");
+        if let Err(e) = db.branches.l4_facts_check_for_test() {
+            panic!("{point}: with the branches resident, an L4 fact disagrees: {e}");
+        }
+        drop(conns);
     }
 }
