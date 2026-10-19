@@ -181,7 +181,9 @@ pub(super) fn emit_custom_type_operator_on_regs(
 /// Info about a column with a custom type, extracted from an expression.
 pub(super) struct ExprCustomTypeInfo {
     type_name: String,
-    column: Column,
+    /// The column, for a direct column reference; None for a derived value
+    /// (`derived_operand_info`). Only mutant `operand_keeps_column_typmod` reads it.
+    column: Option<Column>,
     type_def: Arc<TypeDef>,
 }
 
@@ -206,11 +208,37 @@ pub(super) fn expr_custom_type_info(
             .get_type_def(type_name, table.is_strict())?;
         return Some(ExprCustomTypeInfo {
             type_name: type_name.to_lowercase(),
-            column: col.clone(),
+            column: Some(col.clone()),
             type_def: Arc::clone(type_def),
         });
     }
     None
+}
+
+/// The custom type of a comparison operand that is not a column of one: a value whose type
+/// `order_by::expr_custom_type` knows (an aggregate over such a column, `sum(b)` of numeric, which
+/// is numeric text; a derived relation's typed column; an operator result the type defines).
+/// Engine review 2bdcd32c6 HIGH 5: `sum(b) = 13` over numeric(8, 2) compared the text '13.00'
+/// with the number 13 by SQLite's type order (false), and `HAVING sum(b) > 5` kept every group,
+/// where PostgreSQL compares numerics. Used only when neither operand is a column of a custom
+/// type, so a column's own rules (and an index seek's, `key_takes_type_operator`) are unchanged.
+/// Mutant `derived_value_compares_plainly` (test builds only): None, the plain comparison, as
+/// before.
+fn derived_operand_info(
+    expr: &ast::Expr,
+    referenced_tables: Option<&TableReferences>,
+    resolver: &Resolver,
+) -> Option<ExprCustomTypeInfo> {
+    if crate::branch::store::fe_mutant("derived_value_compares_plainly") {
+        return None;
+    }
+    let (type_def, _) =
+        crate::translate::order_by::expr_custom_type(expr, referenced_tables?, resolver.schema())?;
+    Some(ExprCustomTypeInfo {
+        type_name: type_def.name.to_lowercase(),
+        column: None,
+        type_def,
+    })
 }
 
 /// Get the effective type name of a literal expression.
@@ -262,11 +290,11 @@ pub(super) struct OperatorEncodeInfo {
 /// The column an operand meets, for mutant `operand_keeps_column_typmod` alone: built in test
 /// builds only (engine review 16 #22: a `Column` clone per prepare that production never read).
 fn encode_info(
-    column: &Column,
+    column: Option<&Column>,
     type_def: &Arc<TypeDef>,
     which: EncodeArg,
 ) -> Option<OperatorEncodeInfo> {
-    cfg!(test).then(|| OperatorEncodeInfo {
+    column.filter(|_| cfg!(test)).map(|column| OperatorEncodeInfo {
         column: column.clone(),
         type_def: type_def.clone(),
         which,
@@ -375,6 +403,27 @@ pub(super) fn find_custom_type_operator(
         }
     }
 
+    // A comparison between operands neither of which is a column of a custom type compares
+    // through the type of the values they yield, when one is known (`derived_operand_info`:
+    // `sum(b) = 13` over numeric), by the cases below.
+    let comparison = matches!(
+        op,
+        ast::Operator::Equals
+            | ast::Operator::NotEquals
+            | ast::Operator::Less
+            | ast::Operator::LessEquals
+            | ast::Operator::Greater
+            | ast::Operator::GreaterEquals
+    );
+    let (lhs_info, rhs_info) = if comparison && lhs_info.is_none() && rhs_info.is_none() {
+        (
+            derived_operand_info(e1, referenced_tables, resolver),
+            derived_operand_info(e2, referenced_tables, resolver),
+        )
+    } else {
+        (lhs_info, rhs_info)
+    };
+
     // Case 1: Both operands are custom type columns of the SAME type.
     if let (Some(ref lhs), Some(ref rhs)) = (&lhs_info, &rhs_info) {
         if lhs.type_name == rhs.type_name {
@@ -399,7 +448,7 @@ pub(super) fn find_custom_type_operator(
                     func_name,
                     swap_args,
                     negate,
-                    encode_info: encode_info(&lhs.column, &lhs.type_def, EncodeArg::Second),
+                    encode_info: encode_info(lhs.column.as_ref(), &lhs.type_def, EncodeArg::Second),
                 });
             }
         }
@@ -413,7 +462,7 @@ pub(super) fn find_custom_type_operator(
                     func_name,
                     swap_args,
                     negate,
-                    encode_info: encode_info(&rhs.column, &rhs.type_def, EncodeArg::First),
+                    encode_info: encode_info(rhs.column.as_ref(), &rhs.type_def, EncodeArg::First),
                 });
             }
         }
