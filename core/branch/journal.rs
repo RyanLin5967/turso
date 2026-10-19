@@ -3564,14 +3564,8 @@ fn fresh_nonce(old: u32) -> u32 {
 /// The arena slots the records in `frames` (whole encoded frames, as `Journal::pending` holds
 /// them) name: what `Journal::buffer` pushes to `pending_slots`, re-derived after a prefix of the
 /// buffer was dropped (F-FZ). A frame that does not decode names nothing.
-fn slots_named(frames: &[u8]) -> Vec<Slot> {
-    let mut out = Vec::new();
-    slots_named_into(frames, &mut out);
-    out
-}
-
-/// `slots_named`, appended to `out` (a rewrite's `pending_slots`, keeping its reservation, with no
-/// list of its own; each decoded Commit still allocates its pages, on this rewrite path only).
+/// Appended to `out` (a rewrite's `pending_slots`, keeping its reservation, with no list of its
+/// own; each decoded Commit still allocates its pages, on this rewrite path only).
 fn slots_named_into(frames: &[u8], out: &mut Vec<Slot>) {
     let mut pos = 0;
     while let Some(head) = frames.get(pos..pos + FRAME_HEADER_LEN) {
