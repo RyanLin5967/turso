@@ -15880,6 +15880,34 @@ fn a_parameter_assigned_to_a_varchar_column_is_refused_at_bind_when_too_long() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-cfdebc06d MED-4 (pre-existing): a decimal literal is the engine's REAL, so one of more than 15 significant
+/// digits was rounded before the column's ENCODE saw it: `INSERT INTO nm VALUES (1, 12345678901234567.89, ...)` stored
+/// 12345678901234568.00 in a numeric(20,2) column, and two distinct literals became one row value (a silent change on
+/// write). PG 18.6 stores every digit, in a numeric column and as text in a text column, and a float8 column keeps the
+/// nearest double as before. Recorded on iccad2,
+/// cli/tests/pg18/pg18-wirefuzz-a_long_decimal_literal_is_stored_with_every_digit.out (replayed).
+#[test]
+fn a_long_decimal_literal_is_stored_with_every_digit() {
+    let dir = Scratch::new("long-decimal-literal");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE TABLE nm(id int, n numeric(20,2), w numeric(38,10), f float8, t text)",
+        "INSERT INTO nm VALUES (1, 12345678901234567.89, 1234567890123456789012345678.0123456789, 0.30000000000000004, 12345678901234567.89)",
+        "INSERT INTO nm VALUES (2, 12345678901234567.88, -1234567890123456789012345678.0123456789, 1.7976931348623157, -0.12345678901234567)",
+        "UPDATE nm SET n = 12345678901234567.87, t = 0.12345678901234567 WHERE id = 2",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    let r = a.q("SELECT id, n, w, f, t FROM nm ORDER BY id");
+    let row = |v: [&str; 5]| v.iter().map(|x| Some(x.to_string())).collect::<Vec<_>>();
+    let want = vec![
+        row(["1", "12345678901234567.89", "1234567890123456789012345678.0123456789", "0.30000000000000004", "12345678901234567.89"]),
+        row(["2", "12345678901234567.87", "-1234567890123456789012345678.0123456789", "1.7976931348623157", "0.12345678901234567"]),
+    ];
+    assert_eq!((r.rows, r.error), (want, None), "PostgreSQL stores every digit of a decimal literal");
+}
+
 /// wire-rev-cfdebc06d MED-3 (its PG 18.6 probe #109-#136): the engine's ALTER COLUMN keeps every stored value as it
 /// was, so the only type changes it could make as PostgreSQL does are those whose stored form is the same: within text
 /// and varchar, and an integer to a wider one. The allowlist also let through int to numeric (raw integers under a
