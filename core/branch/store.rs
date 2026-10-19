@@ -4436,6 +4436,9 @@ impl CkptWorker {
         #[cfg(test)]
         super::budget_probe::persistent_started();
         let spawned = crate::thread::Builder::new().name("branch-checkpoint".to_string()).spawn(move || {
+            // budgets-port-adversary MED-1: a window owns this thread by its registration (test builds).
+            #[cfg(test)]
+            let _owned = super::budget_probe::register_owned_thread("branch-checkpoint");
             while let Ok(job) = rx.recv() {
                 // While it runs a checkpoint the worker is NOT parked: the budgets' probe counts it
                 // a live thread then, as it counted the per-checkpoint thread this replaced, so a
@@ -6837,6 +6840,9 @@ impl BranchStore {
         match crate::thread::Builder::new()
             .name("branch-confirm".to_string())
             .spawn(move || {
+                // budgets-port-adversary MED-1: owned by registration (test builds).
+                #[cfg(test)]
+                let _owned = super::budget_probe::register_owned_thread("branch-confirm");
                 run_confirm_writer(group, store);
                 #[cfg(test)]
                 super::budget_probe::persistent_ended();
@@ -6882,6 +6888,8 @@ impl BranchStore {
             let jobs = self.flight_jobs.clone();
             jobs.0.lock().unwrap_or_else(|e| e.into_inner()).0 += 1;
             let handle = crate::thread::Builder::new().name("branch-checkpoint".to_string()).spawn(move || {
+                #[cfg(test)]
+                let _owned = super::budget_probe::register_owned_thread("branch-checkpoint");
                 job();
                 CkptWorker::finished(&jobs);
             });

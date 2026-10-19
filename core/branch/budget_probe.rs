@@ -1723,22 +1723,62 @@ pub(crate) fn thread_table(out: &mut [ThreadCpu]) -> Option<usize> {
 }
 
 /// A store thread that a window may own (`end_owning`), registered by the thread itself at its start
-/// under its full name; deregistered when the guard drops. budgets-port-adversary MED-1 (the red: not yet
-/// consulted by `owned_named`).
-pub(crate) struct OwnedThread;
+/// under its full name; deregistered when the guard drops. budgets-port-adversary MED-1: on Linux a
+/// window owns a thread by this registration (its tid), never by its comm, which is cut at 15 bytes and
+/// inherited by an unnamed child. A registry with no free slot leaves the thread unregistered, so a
+/// window it runs in is foreign (refused), never wrongly owned. Allocates nothing.
+pub(crate) struct OwnedThread(Option<usize>);
+
+const OWNED_SLOTS: usize = 64;
+static OWNED_TID: [AtomicU64; OWNED_SLOTS] = [const { AtomicU64::new(0) }; OWNED_SLOTS];
+static OWNED_NAME: [AtomicU64; OWNED_SLOTS] = [const { AtomicU64::new(0) }; OWNED_SLOTS];
+
+/// FNV-1a of a thread name (the full name, not the comm). Allocates nothing.
+fn name_key(name: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in name {
+        h = (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3);
+    }
+    h | 1
+}
 
 /// Register the calling thread as the store thread `name` (`OwnedThread`).
 pub(crate) fn register_owned_thread(name: &str) -> OwnedThread {
+    #[cfg(target_os = "linux")]
+    {
+        let tid = linux_tid();
+        for (i, slot) in OWNED_TID.iter().enumerate() {
+            if slot.compare_exchange(0, tid, Relaxed, Relaxed).is_ok() {
+                OWNED_NAME[i].store(name_key(name.as_bytes()), Release);
+                return OwnedThread(Some(i));
+            }
+        }
+    }
     let _ = name;
-    OwnedThread
+    OwnedThread(None)
+}
+
+impl Drop for OwnedThread {
+    fn drop(&mut self) {
+        if let Some(i) = self.0 {
+            OWNED_NAME[i].store(0, Release);
+            OWNED_TID[i].store(0, Release);
+        }
+    }
 }
 
 /// Whether `t` is one of the threads named in `owned`. On Linux a thread name is the kernel's comm,
 /// cut at 15 bytes (TASK_COMM_LEN), so `owned` is compared cut the same way there.
 fn owned_named(t: &ThreadCpu, owned: &[&str]) -> bool {
+    // budgets-port-adversary MED-1: on Linux by the thread's registration (`register_owned_thread`), by
+    // tid and full name; the comm (cut at 15 bytes, inherited by unnamed children) is never trusted.
+    if cfg!(target_os = "linux") {
+        return OWNED_TID.iter().zip(OWNED_NAME.iter()).any(|(tid, key)| {
+            tid.load(Acquire) == t.id && t.id != 0 && owned.iter().any(|o| key.load(Acquire) == name_key(o.as_bytes()))
+        });
+    }
     let end = t.name.iter().position(|c| *c == 0).unwrap_or(t.name.len());
-    let cut = if cfg!(target_os = "linux") { 15 } else { usize::MAX };
-    owned.iter().any(|o| &o.as_bytes()[..o.len().min(cut)] == &t.name[..end])
+    owned.iter().any(|o| o.as_bytes() == &t.name[..end])
 }
 
 /// This thread's kernel id (the raw syscall: glibc before 2.30 has no gettid wrapper).

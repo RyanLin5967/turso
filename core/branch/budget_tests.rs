@@ -3430,6 +3430,9 @@ fn nothing_on_the_probes_window_path_allocates() {
                 // The Linux thread-state readers (the Linux port, 2026-10-18).
                 "owned_named", "linux_tid", "linux_read_into", "linux_task_path", "linux_task_alive", "linux_task_stat",
                 "linux_task_run_ns", "linux_each_tid", "note_held_work", "site_work_begin", "site_work_end",
+                // budgets-port-adversary MED-1: ownership by registration (owned_named's key; a store thread's
+                // registration, which may run inside a window).
+                "name_key", "register_owned_thread",
             ][..],
         ),
         ("budget_tests.rs", include_str!("budget_tests.rs"), &["absorb_confirm", "writer_settled", "spin_settled", "settled"][..]),
@@ -3495,7 +3498,7 @@ fn nothing_on_the_probes_window_path_allocates() {
             }
         }
     }
-    assert_eq!(read, 54, "premise: every function on the window path was read:\n{found}");
+    assert_eq!(read, 56, "premise: every function on the window path was read:\n{found}");
     assert!(found.is_empty(), "the probe's window path allocates, prints, reads the environment or calls fe_mutant:\n{found}");
 }
 
