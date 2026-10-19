@@ -117,7 +117,12 @@ pub(crate) fn exec_scalar(conn: &Connection, name: &str, args: &[Value]) -> Resu
                 }
                 Some(v) => {
                     if v.as_int() != Some(crate::catalog::DATABASE_OID) {
-                        let oid = v.as_int().map_or_else(|| v.to_string(), |o| o.to_string());
+                        // An oid is unsigned: oidin reads -1 as 4294967295 (wire-rev-2a68496d0 L4;
+                        // recorded, pg18-wirefuzz-pg_database_size_reads_an_oid_as_postgresql_reads_one.out).
+                        let oid = v.as_int().map_or_else(
+                            || v.to_string(),
+                            |o| if (i64::from(i32::MIN)..0).contains(&o) { (o + (1i64 << 32)).to_string() } else { o.to_string() },
+                        );
                         return Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
                             SqlErrorKind::UndefinedObject,
                             format!("database with OID {oid} does not exist"),

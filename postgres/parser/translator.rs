@@ -3624,6 +3624,28 @@ impl PostgreSQLTranslator {
                         }),
                     });
                 }
+                // An integer literal cast to oid outside oidin's range (-2147483648 ..= 4294967295) is
+                // 22003 'OID out of range', before anything runs, as PostgreSQL folds it
+                // (wire-rev-2a68496d0 L4). BLIND SPOT: a column or expression cast to oid is unchecked.
+                if type_cast.type_name.as_ref().is_some_and(|t| {
+                    t.array_bounds.is_empty()
+                        && t.names.last().is_some_and(|n| matches!(&n.node, Some(pg_query::protobuf::node::Node::String(s)) if s.sval == "oid"))
+                }) {
+                    let literal = match arg.node.as_ref() {
+                        Some(pg_query::protobuf::node::Node::AConst(c)) => match &c.val {
+                            Some(pg_query::protobuf::a_const::Val::Ival(i)) => Some(i64::from(i.ival)),
+                            Some(pg_query::protobuf::a_const::Val::Fval(f)) => f.fval.parse::<i64>().ok().or(Some(i64::MAX)),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if literal.is_some_and(|v| !(i64::from(i32::MIN)..=i64::from(u32::MAX)).contains(&v)) {
+                        return Err(ParseError::ParseError(SqlErrorMessage::classified(
+                            SqlErrorKind::NumericValueOutOfRange,
+                            "OID out of range".to_string(),
+                        )));
+                    }
+                }
                 // A cast to date, timestamp or timestamptz goes through the engine's own type, whose
                 // ENCODE checks the value: as TEXT, 'x'::text::date answered 'x' where PostgreSQL
                 // answers 22007 (wire-rev-5cdb70e58's queued item; recorded,

@@ -1930,7 +1930,7 @@ pub(crate) fn session_translation(
 fn translation_error(e: turso_pg_parser::ParseError) -> LimboError {
     let message: SqlErrorMessage = e.into();
     match message.kind() {
-        Some(SqlErrorKind::UndefinedObject | SqlErrorKind::InvalidTableDefinition) => {
+        Some(SqlErrorKind::UndefinedObject | SqlErrorKind::InvalidTableDefinition | SqlErrorKind::NumericValueOutOfRange) => {
             LimboError::InvalidArgument(message)
         }
         _ => LimboError::ParseError(message),
