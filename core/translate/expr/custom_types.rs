@@ -3419,4 +3419,30 @@ mod tests {
         }
         assert!(bad.is_empty(), "CLAIM: an index on a numeric expression answered unlike a scan: {bad:#?}");
     }
+
+    /// Second fresh-context review of this lane's fixes (item 2): a numeric column compared with a
+    /// numeric value that is neither a constant nor a column (b + 10, b * 1.0, a derived relation's
+    /// typed column) took the plain comparison of their texts, since the column's rule takes only a
+    /// compatible constant: `b < b + 10` missed 2.00 ('2.00' < '12.00' is false as text), and
+    /// `b = b * 1.0` compared '2.00' with '2.000'. A value of the column's own type compares through
+    /// the type's operator, as two columns of it do. Expected values are PostgreSQL 18.6's for this
+    /// exact SQL (UW run typesrev2bd-oracle6; artie raw
+    /// frontier/fastest/lanes/engine/raw/pg18-types-rev2bd-5.txt 6fbfd1c0d1), never ours.
+    #[test]
+    fn a_numeric_column_compares_with_a_numeric_value_through_numerics_operators() {
+        let conn = open();
+        conn.execute("CREATE TABLE n(id INTEGER PRIMARY KEY, b numeric(8, 2)) STRICT").unwrap();
+        conn.execute("INSERT INTO n VALUES (1, 1.00), (2, 2.00), (3, NULL), (4, 10.00)").unwrap();
+        let bad = diverging(
+            &conn,
+            &[
+                ("SELECT count(*) FROM n WHERE b < b + 10", "3"),
+                ("SELECT count(*) FROM n WHERE b = b * 1.0", "3"),
+                ("SELECT count(*) FROM n WHERE b + 10 > b", "3"),
+                ("SELECT n.id FROM n JOIN (SELECT b * 1.0 AS s FROM n) q ON n.b = q.s ORDER BY n.id", "1;2;4"),
+            ],
+            "PostgreSQL 18",
+        );
+        assert!(bad.is_empty(), "CLAIM: a numeric column compared with a numeric value as text: {bad:#?}");
+    }
 }
