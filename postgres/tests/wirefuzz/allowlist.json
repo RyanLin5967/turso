@@ -1,11 +1,67 @@
 [
- {"id": "bare-numeric-literal", "aspect": "oid", "pg": 1700, "ours": 701, "tid": "T_CONST",
+ {
+  "id": "bare-numeric-literal",
+  "aspect": "oid",
+  "pg": 1700,
+  "ours": 701,
+  "tid": "T_CONST",
   "known_red": "a_negative_zero_literal_is_written_as_postgresql_writes_it",
-  "reason": "a decimal literal is numeric in PostgreSQL and the engine's REAL here (the bare-NUMERIC divergence, E5-QUEUE M1b; owner fastest-engine)"},
- {"id": "varchar-overflow-insert", "aspect": "sqlstate", "pg": "22001", "ours": "XX000",
+  "reason": "a decimal literal is numeric in PostgreSQL and the engine's REAL here (the bare-NUMERIC divergence, E5-QUEUE M1b; owner fastest-engine)"
+ },
+ {
+  "id": "varchar-overflow-insert",
+  "aspect": "sqlstate",
+  "pg": "22001",
+  "ours": "XX000",
   "known_red": "a_value_too_long_for_varchar_is_22001_as_postgresql_answers",
-  "reason": "core's varchar type refuses with RAISE(ABORT), XX000, where PostgreSQL answers 22001; both refuse, so both states agree (owner fastest-engine)"},
- {"id": "varchar-overflow-update-no-row", "aspect": "sqlstate", "pg": "22001", "ours": null, "tid": "T_UPDATE", "stop": true,
+  "reason": "core's varchar type refuses with RAISE(ABORT), XX000, where PostgreSQL answers 22001; both refuse, so both states agree (owner fastest-engine)"
+ },
+ {
+  "id": "varchar-overflow-update-no-row",
+  "aspect": "sqlstate",
+  "pg": "22001",
+  "ours": null,
+  "tid": "T_UPDATE",
+  "stop": true,
   "known_red": "a_value_too_long_for_varchar_is_22001_as_postgresql_answers",
-  "reason": "PostgreSQL refuses a too-long constant at plan time even when no row matches; here UPDATE 0. The states may differ (an aborted block on one side), so the sequence stops (owner fastest-engine)"}
+  "reason": "PostgreSQL refuses a too-long constant at plan time even when no row matches; here UPDATE 0. The states may differ (an aborted block on one side), so the sequence stops (owner fastest-engine)"
+ },
+ {
+  "id": "int4-overflow-unrefused",
+  "aspect": "sqlstate",
+  "pg": "22003",
+  "ours": null,
+  "tid": "T_SELECT_EXPR",
+  "stop": true,
+  "known_red": "a_bigint_sum_and_arithmetic_past_int8_answer_as_postgresql_does",
+  "reason": "integer arithmetic past its range answers the out-of-range value here, 22003 in PostgreSQL (the integer range class, PGDIV-INT-RANGE; owner fastest-engine); PostgreSQL's block aborts, so the sequence stops"
+ },
+ {
+  "id": "int8-sum-overflow",
+  "aspect": "sqlstate",
+  "pg": null,
+  "ours": "22003",
+  "tid": "T_SELECT_AGG",
+  "stop": true,
+  "known_red": "a_bigint_sum_and_arithmetic_past_int8_answer_as_postgresql_does",
+  "reason": "sum(int8) past the int8 range is 22003 here, a numeric in PostgreSQL (the integer range class; owner fastest-engine); our block aborts, so the sequence stops"
+ },
+ {
+  "id": "insert-missing-column-code",
+  "aspect": "sqlstate",
+  "pg": "42703",
+  "ours": "42601",
+  "known_red": "an_insert_naming_a_missing_column_is_42703",
+  "reason": "both refuse; the engine's 'has no column named' parse error is 42601, PostgreSQL's 42703 (owner fastest-engine)"
+ },
+ {
+  "id": "numeric-overflow-update-no-row",
+  "aspect": "sqlstate",
+  "pg": "22003",
+  "ours": null,
+  "tid": "T_UPDATE",
+  "stop": true,
+  "known_red": "a_numeric_sum_keeps_its_scale_and_an_overflowing_constant_is_22003",
+  "reason": "PostgreSQL refuses an overflowing numeric constant at plan time even when no row matches; here UPDATE 0 (owner fastest-engine); the states may differ, so the sequence stops"
+ }
 ]
