@@ -15483,6 +15483,42 @@ fn a_cast_to_numeric_p_s_and_a_numeric_domain_column_are_numeric() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-uw3 (pre-existing at f312d1e13): over a NUMERIC(8, 2) column, `b + 1 ... ORDER BY 1`
+/// ordered as text (123457.78 before 3.50), a wrong row order; and the column read through a view,
+/// a derived table, a CREATE TABLE AS copy or a scalar subquery was announced bytea (17) or text
+/// (25) where PostgreSQL 18.6 announces numeric (1700). Recorded on iccad2,
+/// cli/tests/recordings/pg18-numeric-derived.out.
+#[test]
+fn a_numeric_column_orders_and_types_as_numeric_through_every_relation() {
+    let dir = Scratch::new("numeric-derived");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE TABLE n(id int, b numeric(8,2))",
+        "INSERT INTO n VALUES (1, 2.50), (2, 123456.78), (3, 10.00)",
+        "CREATE VIEW v AS SELECT b FROM n",
+        "CREATE TABLE c AS SELECT b FROM n",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    let rows = |v: &[&str]| v.iter().map(|x| vec![Some(x.to_string())]).collect::<Vec<_>>();
+    let mut wrong = Vec::new();
+    for (sql, want) in [
+        ("SELECT b + 1 AS x FROM n ORDER BY 1", rows(&["3.50", "11.00", "123457.78"])),
+        ("SELECT b FROM n ORDER BY b", rows(&["2.50", "10.00", "123456.78"])),
+        ("SELECT b FROM v ORDER BY b", rows(&["2.50", "10.00", "123456.78"])),
+        ("SELECT b FROM (SELECT b FROM n) d ORDER BY b", rows(&["2.50", "10.00", "123456.78"])),
+        ("SELECT b FROM c ORDER BY b", rows(&["2.50", "10.00", "123456.78"])),
+        ("SELECT (SELECT max(b) FROM n) AS m", rows(&["123456.78"])),
+    ] {
+        let r = a.q(sql);
+        if r.error.is_some() || r.oids != Some(vec![1700]) || r.rows != want {
+            wrong.push(format!("{sql}: oids {:?} rows {:?} error {:?}, PostgreSQL [1700] {want:?}", r.oids, r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-uw2 N5: a schema-qualified type was refused 42704 'type "public m" does not exist',
 /// its parts joined with a blank, so a pg_dump restore, which writes public.<type> for every enum
 /// and domain column, failed at its first such table. PostgreSQL 18.6 takes public.m and
