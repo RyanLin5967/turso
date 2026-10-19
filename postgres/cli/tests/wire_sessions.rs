@@ -15880,6 +15880,48 @@ fn a_parameter_assigned_to_a_varchar_column_is_refused_at_bind_when_too_long() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-cfdebc06d MED-3 (its PG 18.6 probe #109-#136): the engine's ALTER COLUMN keeps every stored value as it
+/// was, so the only type changes it could make as PostgreSQL does are those whose stored form is the same: within text
+/// and varchar, and an integer to a wider one. The allowlist also let through int to numeric (raw integers under a
+/// numeric DECODE), numeric to float8 or to another numeric (PG rounds 1.2345 to 1.23 for numeric(6,2)), float8 to
+/// real (PG gives 1.2345679) and varchar to char (PG pads); today the engine's same-name refusal (42601) stops them, and
+/// the day it accepts them each would keep values the new type does not hold. Each is refused 0A000 here, and the
+/// stored values are unchanged.
+#[test]
+fn an_alter_column_type_that_would_change_the_stored_form_is_refused() {
+    let dir = Scratch::new("alter-stored-form");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE TABLE af(id int PRIMARY KEY, i int, n numeric(10,4), f float8, v varchar(5), t text)",
+        "INSERT INTO af VALUES (1, 7, 1.2345, 1.23456789, 'ab', 'cd')",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    for sql in [
+        "ALTER TABLE af ALTER COLUMN i TYPE numeric(10,2)",
+        "ALTER TABLE af ALTER COLUMN i TYPE float8",
+        "ALTER TABLE af ALTER COLUMN n TYPE numeric(6,2)",
+        "ALTER TABLE af ALTER COLUMN n TYPE numeric",
+        "ALTER TABLE af ALTER COLUMN n TYPE float8",
+        "ALTER TABLE af ALTER COLUMN f TYPE real",
+        "ALTER TABLE af ALTER COLUMN v TYPE char(5)",
+        "ALTER TABLE af ALTER COLUMN t TYPE char(5)",
+    ] {
+        let r = a.q(sql);
+        if r.error.as_ref().map(|e| e.code.as_str()) != Some("0A000") {
+            wrong.push(format!("{sql}: tags {:?} error {:?}, refused 0A000 (the stored values would stay unconverted)", r.tags, r.error));
+        }
+    }
+    let r = a.q("SELECT i, n, f, v, t FROM af");
+    let want = vec![["7", "1.2345", "1.23456789", "ab", "cd"].iter().map(|x| Some(x.to_string())).collect::<Vec<_>>()];
+    if r.rows != want {
+        wrong.push(format!("af after the refusals: {:?} {:?}, want {want:?}", r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-cfdebc06d MED-1 and LOW-1 (its PG 18.6 probe, reviews/wire-cfdebc06d-raws/pg18-probe.out #44-#46, #78-#85).
 /// MED-1: a text value bound in BINARY format is its UTF-8 bytes, which PostgreSQL's custom plan coerces at Bind like the
 /// text form; 9d424aef5 skipped every binary value, so with no matching row `UPDATE vc SET v = $1 WHERE id = 99` answered
