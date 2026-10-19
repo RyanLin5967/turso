@@ -3781,6 +3781,10 @@ fn run_links_fill(shared: &StoreMutex, writer: &Mutex<Catalog>, group: &Group, m
                     if nth == 0 {
                         LINKS_FILL_FIRST_MADE_COLUMNS.store(true, Ordering::Release);
                     }
+                    // Lead ruling HIGH 1: the columns committed under the old meta row (17 with link
+                    // columns), the state a_kill_at_every_step_of_the_upgrade_leaves_the_store_17_or_21
+                    // admits only with its facts, upgrade and branches checked.
+                    kill_point("ckpt.upgrade.colonly");
                     true
                 }
                 Err(e) => {

@@ -821,9 +821,10 @@ impl Catalog {
     }
 
     /// Whether the rows' links are valid (links adversary L2): the columns exist AND the meta row
-    /// carries a version that keeps them (21, 22). Columns under an older meta row (a state no build
-    /// writes) hold nothing meaningful: their NULLs are not "no neighbour", and the upgrade fills
-    /// them as any 17-20 catalog's.
+    /// carries a version that keeps them (21, 22). Columns under an older meta row (the state the
+    /// fill's column-only commit and its batches leave, until the flipping checkpoint) hold nothing
+    /// meaningful: their NULLs are not "no neighbour", and the upgrade fills them as any 17-20
+    /// catalog's.
     pub(crate) fn links_valid(&self) -> bool {
         self.links && self.recorded.is_some_and(super::journal::carries_links)
     }
@@ -880,6 +881,13 @@ impl Catalog {
             self.conn.execute(sql)?;
         }
         self.conn.execute(LINK_FILL_TABLE)?;
+        // Mutant `l4_upgrade_columns_committed_alone` (test builds only), as in `upgrade_links_batch`:
+        // committed before the kill point, so a kill there leaves 17 with the columns (the kill
+        // test's fire-check at `ckpt.upgrade.columns`).
+        if super::store::fe_mutant("l4_upgrade_columns_committed_alone") {
+            self.conn.execute("COMMIT")?;
+            self.conn.execute("BEGIN")?;
+        }
         self.refresh_links()?;
         // The same step as in `upgrade_links_batch`: the columns added, not yet committed. A kill here
         // leaves the store without them (a_kill_at_every_step_of_the_upgrade_leaves_the_store_17_or_21;
