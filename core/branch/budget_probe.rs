@@ -1567,14 +1567,19 @@ fn each_thread(mut each: impl FnMut(bool, bool)) -> Option<()> {
     #[cfg(target_os = "linux")]
     {
         let me = linux_tid();
-        let mut ok = true;
+        let (mut ok, mut saw_me) = (true, false);
         linux_each_tid(|tid| match linux_task_stat(tid) {
-            Some((state, _)) if state != b'Z' && state != b'X' => each(tid == me, state == b'S' || state == b'D'),
+            Some((state, _)) if state != b'Z' && state != b'X' => {
+                saw_me |= tid == me;
+                each(tid == me, state == b'S' || state == b'D')
+            }
             Some(_) => {}
-            // Gone between the listing and the read: an exited thread, as on Mach, is not listed.
-            None => ok &= !linux_task_alive(tid),
+            // Gone between the listing and the read (ENOENT/ESRCH only): an exited thread, as on Mach,
+            // is not listed. Any other failure (EMFILE: budgets-port-adversary HIGH-1) refuses.
+            None => ok &= linux_task_alive(tid) == Some(false),
         })?;
-        ok.then_some(())
+        // A reading that does not list the caller is not a reading of this process (HIGH-1).
+        (ok && saw_me).then_some(())
     }
     #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
     {
@@ -1686,25 +1691,29 @@ pub(crate) fn thread_table(out: &mut [ThreadCpu]) -> Option<usize> {
     {
         let me = linux_tid();
         let mut n = 0usize;
-        let mut ok = true;
+        let (mut ok, mut saw_me) = (true, false);
         linux_each_tid(|tid| {
+            // Gone (ENOENT/ESRCH) is skipped; any other failure to read a task refuses the table
+            // (budgets-port-adversary HIGH-1: EMFILE read as "gone" gave a complete, empty table).
             let Some((state, name)) = linux_task_stat(tid) else {
-                ok &= !linux_task_alive(tid);
+                ok &= linux_task_alive(tid) == Some(false);
                 return;
             };
             if state == b'Z' || state == b'X' {
                 return;
             }
             let Some(cpu_ns) = linux_task_run_ns(tid) else {
-                ok &= !linux_task_alive(tid);
+                ok &= linux_task_alive(tid) == Some(false);
                 return;
             };
             if let Some(slot) = out.get_mut(n) {
                 *slot = ThreadCpu { id: tid, cpu_ns, me: tid == me, name, waiting: state == b'S' || state == b'D' };
             }
+            saw_me |= tid == me;
             n += 1;
         })?;
-        ok.then_some(n)
+        // A table that does not list the caller is not a reading of this process (HIGH-1).
+        (ok && saw_me).then_some(n)
     }
     #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
     {
@@ -1773,19 +1782,23 @@ fn linux_task_path(tid: u64, leaf: &[u8], out: &mut [u8; 64]) -> usize {
     i + 1
 }
 
-/// Whether task `tid` still exists (its /proc directory opens).
+/// Whether task `tid` still exists: `Some(true)` if its /proc directory opens, `Some(false)` only if the
+/// open fails because the task is gone (ENOENT, ESRCH), `None` on any other failure (EMFILE, ENFILE,
+/// ENOMEM...: unknown, which a reader must refuse; budgets-port-adversary HIGH-1).
 #[cfg(target_os = "linux")]
-fn linux_task_alive(tid: u64) -> bool {
+fn linux_task_alive(tid: u64) -> Option<bool> {
     let mut path = [0u8; 64];
     let used = linux_task_path(tid, b"", &mut path);
     // SAFETY: a NUL-terminated path; the descriptor is closed below.
     let fd = unsafe { libc::open(path[..used].as_ptr().cast(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
     if fd < 0 {
-        return false;
+        // SAFETY: this thread's errno, read right after the failed call.
+        let errno = unsafe { *libc::__errno_location() };
+        return (errno == libc::ENOENT || errno == libc::ESRCH).then_some(false);
     }
     // SAFETY: the descriptor opened above.
     unsafe { libc::close(fd) };
-    true
+    Some(true)
 }
 
 /// Task `tid`'s state letter and name (comm, NUL-padded) from its `stat`.
