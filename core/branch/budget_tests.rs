@@ -3136,15 +3136,19 @@ fn the_budget_counters_count_exactly_what_was_done() {
     // read. Off Apple no kernel syscall count exists, so quiet cannot rest on an attributed count there.
     #[cfg(any(target_vendor = "apple", target_os = "linux"))]
     assert_eq!(get("fc_measure_empty", "quiet"), 1, "CLAIM: an empty harness window is not quiet, so no cell of this platform can pass");
-    // budgets-port-adversary HIGH-2: the refusal fires, on every platform. Each refused or foreign window
-    // reads NOT threads-quiet, and a harness window an undeclared thread ran a burst in is NOT quiet (mutant
-    // probe_threads_quiet_always: every window threads-quiet off Apple).
-    for op in ["fc_foreign_window", "fc_thread_new_quiet", "fc_gone_thread", "fc_too_many_threads", "fc_measure_foreign"] {
-        assert_eq!(get(op, "threads_quiet"), 0, "CLAIM: {op}, a window the thread rule refuses, reads threads-quiet");
+    // budgets-port-adversary HIGH-2: the off-Apple refusal fires. Where no kernel count exists (Linux),
+    // each refused or foreign window reads NOT threads-quiet, and a harness window an undeclared thread ran
+    // a burst in is NOT quiet (mutant probe_threads_quiet_always: every window threads-quiet off Apple). On
+    // Apple quiet rests on the attributed count, and the shim may attribute a syscall-free foreign burst
+    // exactly (fc_shim_quiet_foreign), so these claims are Linux's.
+    #[cfg(target_os = "linux")]
+    {
+        for op in ["fc_foreign_window", "fc_thread_new_quiet", "fc_gone_thread", "fc_too_many_threads", "fc_measure_foreign"] {
+            assert_eq!(get(op, "threads_quiet"), 0, "CLAIM: {op}, a window the thread rule refuses, reads threads-quiet");
+        }
+        assert!(get("fc_measure_foreign", "foreign_threads") >= 1, "premise: fc_measure_foreign's burst thread was not seen running in the window");
+        assert_eq!(get("fc_measure_foreign", "quiet"), 0, "CLAIM: a window a foreign thread ran a 5 ms burst in is quiet");
     }
-    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
-    assert!(get("fc_measure_foreign", "foreign_threads") >= 1, "premise: fc_measure_foreign's burst thread was not seen running in the window");
-    assert_eq!(get("fc_measure_foreign", "quiet"), 0, "CLAIM: a window a foreign thread ran a 5 ms burst in is quiet");
     for op in ["fc_thread_new_quiet", "fc_foreign_window", "fc_measure_empty"] {
         for k in ["allocs", "alloc_bytes", "held_allocs"] {
             assert_eq!(get(op, k), 0, "{op}: a window whose own work allocates nothing moved {k}: the instrument or the harness allocated inside it");
