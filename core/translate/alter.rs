@@ -893,7 +893,7 @@ fn emit_table_sql_rewrite(
             start_reg: first_column,
             dest: out,
             func: crate::function::FuncCtx {
-                func: Func::AlterTable(func),
+                func: Func::AlterTable(func.clone()),
                 arg_count: 8,
             },
         });
