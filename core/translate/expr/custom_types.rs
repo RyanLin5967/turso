@@ -3170,4 +3170,41 @@ mod tests {
         }
         assert!(bad.is_empty(), "CLAIM: a CAST to a custom type was announced as a type it does not yield: {bad:#?}");
     }
+
+    /// The HIGH 8 class's residual (engine review 2bdcd32c6 HIGH 8; found by probe
+    /// typesrev2bd-probeA at 323655cfe): with a domain over numeric(8, 2) taking numeric's
+    /// operators, its `+` is numeric's (a + 1 is 2.50) but its sum was still SQLite's (real 11.5),
+    /// because the numeric sum is chosen by the argument type's own `+` and a domain has none.
+    /// Expected values are PostgreSQL 18.6's for this exact SQL (UW run typesrev2bd-oracle3; artie
+    /// raw frontier/fastest/lanes/engine/raw/pg18-types-rev2bd-2.txt 83ba1bd4ed), never ours: sum
+    /// of a domain over numeric is numeric 11.50, a window's too. `a + 1` is the control.
+    #[test]
+    fn a_sum_over_a_domain_over_numeric_sums_as_numeric() {
+        let conn = open();
+        for sql in [
+            "CREATE DOMAIN dpos AS numeric(8, 2) CHECK (VALUE > 0)",
+            "CREATE TABLE d(id INTEGER PRIMARY KEY, a dpos) STRICT",
+            "INSERT INTO d VALUES (1, 1.5), (2, 10)",
+        ] {
+            conn.execute(sql).unwrap();
+        }
+        let mut bad = diverging(
+            &conn,
+            &[
+                ("SELECT a + 1 FROM d ORDER BY id", "2.50;11.00"),
+                ("SELECT sum(a) FROM d", "11.50"),
+                ("SELECT sum(a) OVER (ORDER BY id) FROM d ORDER BY id", "1.50;11.50"),
+            ],
+            "PostgreSQL 18",
+        );
+        let ty = conn
+            .prepare("SELECT sum(a) FROM d")
+            .ok()
+            .and_then(|s| s.get_column_type_info(0).ok().flatten())
+            .map(|i| i.declared_name.to_ascii_lowercase());
+        if ty.as_deref() != Some("numeric") {
+            bad.push(format!("sum(a) announced {ty:?}, not PostgreSQL's numeric"));
+        }
+        assert!(bad.is_empty(), "CLAIM: a sum over a domain over numeric was not numeric's: {bad:#?}");
+    }
 }
