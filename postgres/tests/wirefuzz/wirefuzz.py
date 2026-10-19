@@ -13,10 +13,12 @@ COMPARED, per statement, on both sides: the SQLSTATE (exact; an error on one sid
 CommandComplete tags (exact), the RowDescription type OIDs (exact), the ReadyForQuery status, and the rows (as a
 sequence when the statement orders every row by a key, else as a multiset; float columns by value, every other
 column by its text). The branch functions, which PostgreSQL has no equivalent of, run on tursopg only and are
-never compared.
+never compared; one that FAILS is a finding (turso_only_error), since its failure changed this side's state
+alone (an aborted block).
 
 ALLOWLIST (allowlist.json): the known divergences, each an EXACT tuple (aspect, the PostgreSQL value, ours, and
-the template id when the entry names one), never a pattern. A divergence that matches an entry is counted under
+the template id when the entry names one), never a pattern; each names its registered red test (known_red) and
+its reason, or the run is refused. A divergence that matches an entry is counted under
 that entry and, unless the entry says "stop", the sequence goes on (a type or tag difference leaves both
 databases in the same state); one that matches none is a FINDING, and the sequence stops there (what follows may
 only cascade from it).
@@ -247,6 +249,12 @@ class Pg:
         self.n = 0
 
     def fresh(self):
+        # The previous run's database is dropped first: a shrink makes hundreds of runs, and their databases
+        # filled the host's disk (wire-fuzz1, 53100).
+        if self.n:
+            c = proto.Conn(self.port, "postgres")
+            c.simple("DROP DATABASE IF EXISTS fz%d WITH (FORCE)" % self.n)
+            c.close()
         self.n += 1
         name = "fz%d" % self.n
         c = proto.Conn(self.port, "postgres")
@@ -368,8 +376,15 @@ def run_seq(seq, extended, pg, other, allow, plant=False):
     try:
         for i, st in enumerate(seq):
             if st["turso_only"]:
+                # Excluded from comparison, never from view: one that fails changed the session's state on
+                # this side alone (an aborted block, wire-fuzz1 seed 31), so its failure is the finding.
                 if isinstance(other, Turso):
-                    execute(b, st, extended)
+                    rb = execute(b, st, extended)
+                    if rb["error"]:
+                        finding = {"index": i, "tid": st["tid"], "aspect": "turso_only_error", "pg": None,
+                                   "ours": rb["error"][0], "sql": st["lit"], "params": st["params"],
+                                   "pg_answer": None, "ours_answer": rb}
+                        break
                 continue
             ra = execute(a, st, extended)
             sql_b = None
@@ -441,6 +456,10 @@ def main(argv):
     ids = [e["id"] for e in allow]
     if len(set(ids)) != len(ids):
         sys.exit("REFUSED: duplicate allowlist ids")
+    # An entry is a registered known-red divergence: it names its red test and why, or it is refused.
+    for e in allow:
+        if not e.get("known_red") or not e.get("reason") or not {"id", "aspect", "pg", "ours"} <= set(e):
+            sys.exit("REFUSED: allowlist entry %r lacks id, aspect, pg, ours, known_red or reason" % e.get("id"))
     if a.mode == "replay":
         a.seeds = "%d-%d" % (a.seed, a.seed)
     lo, hi = (int(x) for x in a.seeds.split("-"))
