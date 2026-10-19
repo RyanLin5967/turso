@@ -268,6 +268,16 @@ pub(crate) fn wal_lock_held() -> bool {
 
 /// A statement was prepared on this thread.
 pub(crate) fn statement_prepared() {
+    // Diagnostic only (the schema-window flake, lead 2026-10-19): with BUDGET_PREPARE_BACKTRACE set,
+    // each prepare prints its thread and backtrace to stderr, so a run that counts one can say where.
+    if std::env::var_os("BUDGET_PREPARE_BACKTRACE").is_some() {
+        eprintln!(
+            "DIAG-PREPARE thread={:?} wal_held={}\n{}",
+            std::thread::current().name(),
+            wal_lock_held(),
+            std::backtrace::Backtrace::force_capture()
+        );
+    }
     bump(&T_PREPARES, 1);
     if DEPTH.try_with(|d| d.get()).unwrap_or(0) > 0 {
         bump(&T_HELD_PREPARES, 1);
