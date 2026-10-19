@@ -81,7 +81,20 @@ done
 # and stops at the missing parent (its sq_open refusal)
 case_ "clonebench --memstatus 2 is refused" 2 "--memstatus needs 0 or 1" \
   -- "$CB" run --mode b1 --op m1c --parent "$S/no-parent.db" --dir "$S" --clients 1 --max-ops 1 --out "$(OUT ms)" --memstatus 2
-case_ "control: clonebench --memstatus 1 passes the flag checks and stops at the missing parent" 2 "no-parent.db" \
-  -- "$CB" run --mode b1 --op m1c --parent "$S/no-parent.db" --dir "$S" --clients 1 --max-ops 1 --out "$(OUT ms1)" --memstatus 1
+# comp-rev-89ec-b3c3 HIGH 1: the control's --dir used to be SCRATCH itself ($RUNNER_TEMP/bin-plants on CI), which
+# clonebench's directory guard (clonebench.c guard_dir: XFS or btrfs, and a *.noindex component; it runs after the flag
+# checks, before the parent's open) refused, so the control could never print no-parent.db and the build job failed.
+# It now runs in SCRATCH/b1.noindex. Where that directory is XFS or btrfs, the control must reach the parent's open
+# (no-parent.db); elsewhere (a CI build runner's ext4) it must stop at the guard's filesystem refusal. Either way
+# --memstatus 1 got past every flag check, which is all the control proves; which of the two is expected comes from
+# the directory's own filesystem type, stated in the case name.
+MS=$S/b1.noindex
+mkdir -p "$MS" || exit 2
+case "$(stat -f -c %T "$MS" 2>/dev/null)" in
+  xfs|btrfs) ms_want="no-parent.db" ms_why="XFS/btrfs: stops at the missing parent" ;;
+  *) ms_want="not xfs or btrfs (FICLONE)" ms_why="$(stat -f -c %T "$MS" 2>/dev/null): stops at the directory guard" ;;
+esac
+case_ "control: clonebench --memstatus 1 passes the flag checks ($ms_why)" 2 "$ms_want" \
+  -- "$CB" run --mode b1 --op m1c --parent "$MS/no-parent.db" --dir "$MS" --clients 1 --max-ops 1 --out "$(OUT ms1)" --memstatus 1
 if [ $bad = 0 ]; then echo "VERDICT PASS $n/$n"; else echo "VERDICT FAIL $((n - bad))/$n"; fi
 [ $bad = 0 ]
