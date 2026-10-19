@@ -4429,13 +4429,21 @@ enum CopyInput {
     /// varchar(n) (`false`) or char(n) (`true`): past n characters 22001, unless the excess is
     /// all spaces, which PostgreSQL cuts off (varchar_input, bpchar_input).
     Length(usize, bool),
+    /// numeric(p, s): syntax (22P02) and, rounded to s places, fewer than p - s integer digits
+    /// (22003 "numeric field overflow"), as numeric_in and apply_typmod check them. The engine
+    /// checked these at its insert, after every check here, so a varchar's 22001 later in the row
+    /// came first (wirefuzz wire-fuzz4 seed 255; recorded, copy-stdin-pg18.txt part 5).
+    Numeric(i64, i64),
 }
 
 fn copy_input_type(col: &turso_core::schema::Column) -> Option<CopyInput> {
     if col.array_dimensions() > 0 {
         return None;
     }
-    let (_, udt, len, ..) = crate::information_schema::column_type(col);
+    let (_, udt, len, precision, _, scale) = crate::information_schema::column_type(col);
+    if let ("numeric", Some(p), Some(s)) = (udt.as_str(), precision, scale) {
+        return Some(CopyInput::Numeric(p, s));
+    }
     match (udt.as_str(), len) {
         ("int4", _) => Some(CopyInput::Integer),
         ("int2", _) => Some(CopyInput::Ranged("smallint", i16::MIN.into(), i16::MAX.into())),
@@ -4444,6 +4452,82 @@ fn copy_input_type(col: &turso_core::schema::Column) -> Option<CopyInput> {
         ("bpchar", Some(n)) => usize::try_from(n).ok().map(|n| CopyInput::Length(n, true)),
         _ => None,
     }
+}
+
+/// A numeric's text as numeric_in reads it (white space around it, a sign, digits with one
+/// optional point, an optional exponent, PostgreSQL 16's underscores between digits), checked
+/// against numeric(p, s): Ok(true) when it fits once rounded half away from zero to s places,
+/// Ok(false) past it, Err(()) for text that is no numeric. NaN fits; Infinity does not.
+fn numeric_fits(field: &str, p: i64, s: i64) -> std::result::Result<bool, ()> {
+    let text = field.trim_matches(|c: char| matches!(c, ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c'));
+    let body = text.strip_prefix(['+', '-']).unwrap_or(text);
+    let lower = body.to_ascii_lowercase();
+    if lower == "nan" && body.len() == text.len() {
+        return Ok(true);
+    }
+    if lower == "infinity" || lower == "inf" {
+        return Ok(false);
+    }
+    let b = body.as_bytes();
+    let mut digits: Vec<u8> = Vec::new();
+    let mut point: Option<usize> = None;
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            c @ b'0'..=b'9' => digits.push(c - b'0'),
+            b'.' if point.is_none() => point = Some(digits.len()),
+            b'_' if i > 0
+                && b[i - 1].is_ascii_digit()
+                && b.get(i + 1).is_some_and(u8::is_ascii_digit) => {}
+            b'e' | b'E' => break,
+            _ => return Err(()),
+        }
+        i += 1;
+    }
+    if digits.is_empty() {
+        return Err(());
+    }
+    let mut exponent: i64 = 0;
+    if i < b.len() {
+        let e = &body[i + 1..];
+        let e = e.strip_prefix('+').unwrap_or(e);
+        exponent = e.parse::<i64>().map_err(|_| ())?;
+        if e.is_empty() || exponent.abs() > 1_000_000 {
+            return Err(());
+        }
+    }
+    // The integer digits end at `int_len` (may be negative or past the digits).
+    let mut int_len = point.unwrap_or(digits.len()) as i64 + exponent;
+    // Round half away from zero at s places.
+    let keep = int_len + s;
+    if keep < 0 {
+        return Ok(true);
+    }
+    if (keep as usize) < digits.len() {
+        let round_up = digits[keep as usize] >= 5;
+        digits.truncate(keep as usize);
+        if round_up {
+            let mut k = digits.len();
+            loop {
+                if k == 0 {
+                    digits.insert(0, 1);
+                    int_len += 1;
+                    break;
+                }
+                k -= 1;
+                if digits[k] == 9 {
+                    digits[k] = 0;
+                } else {
+                    digits[k] += 1;
+                    break;
+                }
+            }
+        }
+    }
+    // The integer part's digits past its leading zeros.
+    let leading_zeros = digits.iter().take_while(|&&d| d == 0).count() as i64;
+    let significant = int_len - leading_zeros.min(int_len.max(0));
+    Ok(significant <= p - s)
 }
 
 /// Why [`pg_integer`] refused a field: its syntax (22P02) or its range (22003).
@@ -4549,6 +4633,17 @@ impl CopyInput {
                     ),
                 }
             }
+            CopyInput::Numeric(p, s) => match numeric_fits(field, *p, *s) {
+                Ok(true) => Ok(None),
+                Ok(false) => refuse(
+                    SqlErrorKind::NumericValueOutOfRange,
+                    "numeric field overflow".to_string(),
+                ),
+                Err(()) => refuse(
+                    SqlErrorKind::InvalidTextRepresentation,
+                    format!("invalid input syntax for type numeric: \"{field}\""),
+                ),
+            },
             CopyInput::Length(n, blank_padded) => {
                 if field.chars().count() <= *n {
                     return Ok(None);
