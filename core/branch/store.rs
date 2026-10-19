@@ -51,7 +51,7 @@
 //!   else freed. A rolled-back transaction returns its reservations.
 //! * on the **trunk**, the page as it was before the transaction is CAPTURED while the trunk has a
 //!   live child, and the decision is taken at the commit against the epoch there
-//!   (`BranchStore::begin_trunk_commit`, F-L on the durable store): a page a live child can still
+//!   (`StoreCore::begin_trunk_commit`, F-L on the durable store): a page a live child can still
 //!   see has its pre-image copied into a slot and retained, durably, before the commit's first
 //!   frame, so neither the commit nor a later checkpoint that moves the new version into the
 //!   database file can reach the child, and a child forked while the transaction is open is seen.
@@ -230,7 +230,96 @@ use crate::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering
 use crate::sync::{Arc, Mutex};
 use crate::{LimboError, Result};
 
+/// The branch store as its users hold it (`Arc<BranchStore>`): a handle on `StoreCore`, the store's
+/// state. The store's own background threads (LEAP L1's flusher and housekeeping) reach the state
+/// only through a `Weak<StoreCore>`, upgraded for one pass at a time, and never hold a handle. So
+/// the last handle's drop always runs on a user's thread, and it shuts the store down before it
+/// returns (`StoreCore::shut_down`): the threads stopped and joined, what async creates
+/// acknowledged flown, the branch log's lock released (engine-2bdcd32c6 MED 1, MED 2: when the
+/// threads upgraded a weak reference on the store itself, the caller's drop could return while a
+/// pass held the store, and `Drop` ran later on that thread: a process exiting meanwhile lost its
+/// creates, and a reopen at once was refused, the log still held).
 pub(crate) struct BranchStore {
+    core: Arc<StoreCore>,
+}
+
+impl std::ops::Deref for BranchStore {
+    type Target = StoreCore;
+    fn deref(&self) -> &StoreCore {
+        &self.core
+    }
+}
+
+impl BranchStore {
+    fn from_core(core: StoreCore) -> Self {
+        Self { core: Arc::new(core) }
+    }
+
+    /// `StoreCore::open_with_flags`, as a handle.
+    #[cfg(test)]
+    pub(crate) fn open_with_flags(
+        durability: BranchDurability,
+        default_lease: Option<Duration>,
+        splice: bool,
+        db_path: &str,
+        read_only: bool,
+    ) -> Result<Self> {
+        StoreCore::open_with_flags(durability, default_lease, splice, db_path, read_only).map(Self::from_core)
+    }
+
+    /// `StoreCore::open_with_checkpoint`, as a handle.
+    pub(crate) fn open_with_checkpoint(
+        durability: BranchDurability,
+        default_lease: Option<Duration>,
+        splice: bool,
+        checkpoint: Option<super::BranchCheckpoint>,
+        db_path: &str,
+        read_only: bool,
+    ) -> Result<Self> {
+        StoreCore::open_with_checkpoint(durability, default_lease, splice, checkpoint, db_path, read_only)
+            .map(Self::from_core)
+    }
+
+    /// `StoreCore::open`, as a handle.
+    #[cfg(test)]
+    pub(crate) fn open(durability: BranchDurability, default_lease: Option<Duration>, db_path: &str) -> Result<Self> {
+        StoreCore::open(durability, default_lease, db_path).map(Self::from_core)
+    }
+
+    /// `StoreCore::open_mode`, as a handle.
+    #[cfg(test)]
+    pub(crate) fn open_mode(
+        durability: BranchDurability,
+        default_lease: Option<Duration>,
+        splice: bool,
+        db_path: &str,
+    ) -> Result<Self> {
+        StoreCore::open_mode(durability, default_lease, splice, db_path).map(Self::from_core)
+    }
+
+    /// `StoreCore::start_async`: the threads get a weak reference on the state, never this handle.
+    pub(crate) fn start_async(&self) -> Result<()> {
+        self.core.start_async()
+    }
+}
+
+impl Drop for BranchStore {
+    /// The last handle: the store shuts down here, on the dropping thread, before this returns.
+    /// Mutant `close_leaves_async_threads` (test builds only): it does not, and the shutdown runs
+    /// when the state's last strong reference goes, which a thread's pass may hold, as at
+    /// da850ed1c.
+    fn drop(&mut self) {
+        if !fe_mutant("close_leaves_async_threads") {
+            self.core.shut_down();
+        }
+    }
+}
+
+/// The branch store's state, behind `BranchStore`'s handles and LEAP L1's threads' weak
+/// references.
+pub(crate) struct StoreCore {
+    /// `shut_down` ran (it runs once: at the last handle's drop, or at this state's own drop).
+    shut: AtomicBool,
     /// Shared with a fuzzy checkpoint's thread, which takes it for its install (F-FZ).
     inner: Arc<StoreMutex>,
     /// What this open's prewarm did to files other than the catalog (r12-catload; the catalog's
@@ -434,7 +523,7 @@ pub(crate) struct Group {
     /// log sequence number to make durable in the free class, 0 for none, `UPGRADE_IN_AIR` while
     /// one is led. Armed by `mature` under the store mutex; led by the store's background writer
     /// (`run_confirm_writer`), off every acknowledgement path (engine review 13 MED 2), as a sync
-    /// that holds no flight slot (`BranchStore::sync_upgrade`; engine review 18 HIGH 1), OUTSIDE
+    /// that holds no flight slot (`StoreCore::sync_upgrade`; engine review 18 HIGH 1), OUTSIDE
     /// two counted exceptions (C15 ruling, fastest DECISIONS 2026-10-15T04:15:07Z): the hard-cap
     /// fallback (`upgrade_overdue`, counted `hardcap_upgrades`) and the first raise of the header's
     /// class, which holds the flight slot (`Upgrade::exclusive`, counted `header_raise_exclusive`).
@@ -444,8 +533,8 @@ pub(crate) struct Group {
     /// memory and slot safety bound, a counted exception (`hardcap_upgrades`).
     upgrade_overdue: AtomicBool,
     /// A compaction that syncs (DECISIONS c9c821dd8d): `COMPACT_DUE` once the operation that found
-    /// the log past the threshold owed it (`BranchStore::maybe_compact`), `COMPACT_RUNNING` while
-    /// the background writer leads it (`BranchStore::lead_compaction`), off every acknowledgement
+    /// the log past the threshold owed it (`StoreCore::maybe_compact`), `COMPACT_RUNNING` while
+    /// the background writer leads it (`StoreCore::lead_compaction`), off every acknowledgement
     /// path; `COMPACT_IDLE` otherwise. Owed only from idle, so an operation finding the log still
     /// long while one runs neither wakes the writer nor owes a second.
     compact_due: AtomicU8,
@@ -461,7 +550,7 @@ pub(crate) struct Group {
     #[cfg(test)]
     held_cut_from: AtomicU64,
     /// This group, for a branch catalog's own store to forward its catalog's failed syncs to as
-    /// they happen (`BranchStore::link_drain_parent`; engine review 21 MED 5). Set by
+    /// they happen (`StoreCore::link_drain_parent`; engine review 21 MED 5). Set by
     /// `Group::shared`.
     me: crate::sync::OnceLock<crate::sync::Weak<Group>>,
     /// Test builds (fastest-budgets, review C14): notifications of `confirm_cv`, each counted under
@@ -517,7 +606,7 @@ const FLIGHT_TIMES: usize = 16;
 const UPGRADE_HARD_CAP: usize = 4;
 
 /// How long the held-free upgrade's leader waits for the Release it was armed for to be written by
-/// its own operation's flight (`BranchStore::lead_upgrade`; engine review 21 LOW 15). Past it the
+/// its own operation's flight (`StoreCore::lead_upgrade`; engine review 21 LOW 15). Past it the
 /// upgrade covers what is written, and the frees still held arm the next one.
 const UPGRADE_WRITE_WAIT: Duration = Duration::from_millis(100);
 
@@ -605,7 +694,7 @@ struct GroupState {
     /// (A synchronous flush under the store mutex still may: the install copies what it wrote.)
     cutting: bool,
     /// A fuzzy checkpoint of a D0 store whose log rewrites sync is syncing the arena, outside any
-    /// flight (`BranchStore::settle_arena`; engine review 9 #8): it cleared the arena's dirty mark,
+    /// flight (`StoreCore::settle_arena`; engine review 9 #8): it cleared the arena's dirty mark,
     /// so no flight that syncs may be taken until it lands — such a flight would find the arena
     /// clean and land its records durable over slots not yet synced. Flights that only write (D0's
     /// own) go on; so does the confirmation writer.
@@ -628,13 +717,13 @@ struct GroupState {
     /// Compactions the background writer led (DECISIONS c9c821dd8d; observation only), and
     /// compactions that synced inline, on the operation that found the log past the threshold:
     /// past the hard limit with the writer behind, with no writer, or in a sharp catalog store. An
-    /// exception counter (`BranchStore::exception_counters`): an operation that paid it is not
+    /// exception counter (`StoreCore::exception_counters`): an operation that paid it is not
     /// credited.
     #[cfg(test)]
     background_compactions: u64,
     inline_compaction_syncs: u64,
     /// Fuzzy checkpoints that failed Busy at `settle_ordered`'s bound (engine review 18 MED 4;
-    /// observation only, `BranchStore::settle_timeouts`): each lost its install for a threshold of
+    /// observation only, `StoreCore::settle_timeouts`): each lost its install for a threshold of
     /// log. A run of creates and first writes expects 0.
     settle_timeouts: u64,
     /// The C15 ruling's two counted exceptions (2026-10-15T04:15:07Z; `BranchStore::
@@ -664,7 +753,7 @@ struct GroupState {
     /// Test builds (fastest-budgets, review 2 L3, review C14): which of its condition-variable waits
     /// the confirmation writer is in (`CONFIRM_PARK_*`, 0 for none; set as it enters one, cleared as
     /// the wait returns, both under this lock), the notifications of `confirm_cv` it had seen when it
-    /// entered it, and the waits it has entered (`BranchStore::confirm_park_for_test`).
+    /// entered it, and the waits it has entered (`StoreCore::confirm_park_for_test`).
     #[cfg(test)]
     confirm_parked: u8,
     #[cfg(test)]
@@ -916,7 +1005,7 @@ impl Group {
         accepted
     }
 
-    /// A held-free upgrade's sync returned (`BranchStore::sync_upgrade`): it is no longer in the air,
+    /// A held-free upgrade's sync returned (`StoreCore::sync_upgrade`): it is no longer in the air,
     /// and an `exclusive` one (it wrote the header's raised class) releases the flight slot it held.
     /// A failed one fail-stops the store, as a failed flight does. Marks nothing: the upgrade does
     /// that under the store mutex (`mark_upgraded`), once no rewrite has run since its take.
@@ -1002,7 +1091,7 @@ impl Group {
         }
     }
 
-    /// A held-free upgrade's landing (`BranchStore::sync_upgrade`), called holding the store mutex:
+    /// A held-free upgrade's landing (`StoreCore::sync_upgrade`), called holding the store mutex:
     /// every byte below `end` is durable in `class` and every weaker one, unless the store
     /// fail-stopped meanwhile. It had no frames, so it does not move the log's last flight;
     /// `confirm`, that flight's confirmation (engine review 21 MED 6), is offered to the writer.
@@ -1026,7 +1115,7 @@ impl Group {
         self.durable_now[class_index(class)].load(Ordering::Acquire)
     }
 
-    /// An ordered flight's outcome (`BranchStore::order_for_trunk`): on success every byte below
+    /// An ordered flight's outcome (`StoreCore::order_for_trunk`): on success every byte below
     /// `end` is written and ordered; it is durable only once `trunk_wal_synced` says so. A flight
     /// that carried frames is now the log's last flight, so the earlier flight's queued word is
     /// dropped: it can never match the LAST flight (engine review 8 #9; mutant
@@ -1235,7 +1324,7 @@ pub(crate) fn confirm_quiet_for_test() -> Duration {
 /// on unix (engine review 8 #11), and off unix it holds the slot (`SlotRelease`). A flight whose sync
 /// did not prove stable storage (`Confirm::proved`) waits for the close. Nothing is written once
 /// the store is fail-stopped. It also leads a raised D0 store's held-free upgrades
-/// (`BranchStore::lead_upgrade`), each one sync holding no flight slot, and returns the frees each
+/// (`StoreCore::lead_upgrade`), each one sync holding no flight slot, and returns the frees each
 /// covers under the store mutex (engine review 13 MED 2, review 18 HIGH 1 and #12).
 fn run_confirm_writer(group: Arc<Group>, store: Arc<StoreMutex>) {
     let _exit = WriterExit(&group);
@@ -1254,7 +1343,7 @@ fn run_confirm_writer(group: Arc<Group>, store: Arc<StoreMutex>) {
             drop(g);
             #[cfg(test)]
             pause_at(Some(&group.confirm_hold), HOLD_UPGRADE_DUE);
-            BranchStore::lead_upgrade(&store, &group);
+            StoreCore::lead_upgrade(&store, &group);
             g = group.lock();
             continue;
         }
@@ -1262,7 +1351,7 @@ fn run_confirm_writer(group: Arc<Group>, store: Arc<StoreMutex>) {
         // it low (`StoreMutex::pool_kicked`).
         if store.pool_kicked.load(Ordering::Acquire) && !group.poisoned() {
             drop(g);
-            BranchStore::refill_table_pool(&store);
+            StoreCore::refill_table_pool(&store);
             g = group.lock();
             continue;
         }
@@ -1273,7 +1362,7 @@ fn run_confirm_writer(group: Arc<Group>, store: Arc<StoreMutex>) {
             drop(g);
             #[cfg(test)]
             pause_at(Some(&group.confirm_hold), HOLD_COMPACT_DUE);
-            BranchStore::lead_compaction(&store, &group);
+            StoreCore::lead_compaction(&store, &group);
             g = group.lock();
             continue;
         }
@@ -1352,7 +1441,7 @@ fn run_confirm_writer(group: Arc<Group>, store: Arc<StoreMutex>) {
 }
 
 /// Catch-up passes of a background compaction's cut before it copies what is left under the store
-/// mutex (`BranchStore::cut_in_background`; DECISIONS bd0d845f97).
+/// mutex (`StoreCore::cut_in_background`; DECISIONS bd0d845f97).
 const COMPACT_CATCH_UPS: usize = 3;
 
 /// Test builds: no catch-up pass, so the cut always takes the counted tail path (the plant of
@@ -1410,7 +1499,7 @@ impl Drop for Compacting<'_> {
 }
 
 /// A held-free upgrade in the air (`Group::upgrade_due` == `UPGRADE_IN_AIR`), reset to none
-/// when its leader is done, however it is done (`BranchStore::lead_upgrade`).
+/// when its leader is done, however it is done (`StoreCore::lead_upgrade`).
 struct InAir<'a>(&'a AtomicU64);
 
 impl Drop for InAir<'_> {
@@ -1500,9 +1589,10 @@ impl AsyncCtl {
 }
 
 /// LEAP L1's flusher and housekeeping threads (ASYNC-DESIGN §6), started at the store's first
-/// async create (`BranchStore::start_async`) and stopped and joined at `Drop`, after the name
-/// filter. Each holds the store weakly and upgrades it for one pass at a time, so the last handle
-/// can be dropped on one of them: that thread is then not joined (`Drop`).
+/// async create (`StoreCore::start_async`) and stopped and joined at the store's shutdown
+/// (`StoreCore::shut_down`), after the name filter. Each holds the store's state weakly
+/// (`Weak<StoreCore>`) and upgrades it for one pass at a time, never a `BranchStore` handle, so the
+/// last handle's drop, which joins them, is never theirs (engine-2bdcd32c6 MED 1, MED 2).
 #[derive(Default)]
 pub(crate) struct AsyncThreads {
     ctl: Arc<AsyncCtl>,
@@ -1517,7 +1607,7 @@ pub(crate) struct AsyncThreads {
 /// not yet flown is FLY_AGE old, it waits for the newest one's bytes, leading the flight if none
 /// is in the air (`wait_durable`, holding no lock). Re-armed after the flight for any acknowledged
 /// since. Mutant `flusher_never_flies` (test builds only): it wakes and leads nothing.
-fn run_async_flusher(store: std::sync::Weak<BranchStore>, ctl: Arc<AsyncCtl>) {
+fn run_async_flusher(store: std::sync::Weak<StoreCore>, ctl: Arc<AsyncCtl>) {
     let fly_age = u64::try_from(FLY_AGE.as_nanos()).unwrap_or(u64::MAX);
     loop {
         if ctl.nap(POLL) {
@@ -1565,7 +1655,7 @@ fn run_async_flusher(store: std::sync::Weak<BranchStore>, ctl: Arc<AsyncCtl>) {
 /// `branch-housekeeping` (ASYNC-DESIGN §6.2 as built so far): every HK_TICK, one
 /// `housekeeping_pass`, the expiry pass async creates do not run (L2(a)). A panic fail-stops the
 /// store.
-fn run_housekeeping(store: std::sync::Weak<BranchStore>, ctl: Arc<AsyncCtl>) {
+fn run_housekeeping(store: std::sync::Weak<StoreCore>, ctl: Arc<AsyncCtl>) {
     loop {
         if ctl.nap(HK_TICK) {
             return;
@@ -1685,7 +1775,7 @@ impl ForkHoldCounters {
     }
 }
 
-/// A trunk fork's hold of the trunk's WAL write lock, for [`BranchStore::record_fork`]: `ns` 0 and
+/// A trunk fork's hold of the trunk's WAL write lock, for [`StoreCore::record_fork`]: `ns` 0 and
 /// `locked` false for a fork that never took it.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct WalHold {
@@ -1694,7 +1784,7 @@ pub(crate) struct WalHold {
 }
 
 thread_local! {
-    /// Nanoseconds this thread has held the store mutex through [`BranchStore::lock_counted`] since
+    /// Nanoseconds this thread has held the store mutex through [`StoreCore::lock_counted`] since
     /// the last [`take_counted_hold`] (fastest-engine M1 item 5; observing only). A fork resets it
     /// when it begins and takes it when it ends, so it holds exactly that fork's holds: forks do
     /// not nest, and a thread runs one at a time.
@@ -1714,21 +1804,21 @@ struct StoreMutex {
     compacting: AtomicU64,
     /// Lock acquisitions that arrived while `compacting` was odd, or during which it moved:
     /// operations that waited behind a background compaction's sync under the mutex (an exception
-    /// counter, `BranchStore::exception_counters`). One that arrived in the margins (before the
+    /// counter, `StoreCore::exception_counters`). One that arrived in the margins (before the
     /// writer locked, or after it unlocked) and did not wait is counted too: an overcount, never a
     /// miss (`StoreMutex::lock`).
     compaction_waits: AtomicU64,
-    /// A fuzzy checkpoint an operation owes (`BranchStore::maybe_compact`), and what starts it:
+    /// A fuzzy checkpoint an operation owes (`StoreCore::maybe_compact`), and what starts it:
     /// sent by the guard's unlock (`StoreGuard`'s drop), so owing a start and sending it are ONE
     /// operation, whatever path the hold took (review REVIEW-claude-engine-L2d M1: an expiry, a
     /// lease, an open and an erroring create owed starts no call ever sent). Set once, by
-    /// `BranchStore::install_starter`; unset (a store built for a test without one), nothing is
+    /// `StoreCore::install_starter`; unset (a store built for a test without one), nothing is
     /// sent and the next owing operation owes it again.
     start_due: AtomicBool,
     starter: std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>,
     /// LEAP L2(b): the branch table's pool fell low in a hold, set by that hold's unlock
     /// (`StoreGuard`'s drop) once its claim of `pool_notified` succeeded. The background writer refills the pool off the mutex
-    /// (`BranchStore::refill_table_pool`) at its next wake, and clears it.
+    /// (`StoreCore::refill_table_pool`) at its next wake, and clears it.
     pool_kicked: AtomicBool,
     /// The writer was woken for this refill (`pool_kicker` returned true). The wake is sent under
     /// the group lock, so it cannot fall between the writer's check of `pool_kicked` and its wait,
@@ -2184,7 +2274,7 @@ struct StoreInner {
     /// first, and read by every write path through `Journal::check_live` (review B-F1).
     fail_stop: Arc<AtomicBool>,
     /// The device the branch log and arena are on (`files_device`), `NO_DEVICE` until both are
-    /// open; shared with `BranchStore::files_dev`.
+    /// open; shared with `StoreCore::files_dev`.
     files_dev: Arc<AtomicU64>,
     /// The log sequence number that makes the newest fork durable: a listing waits for it, so no
     /// branch is listed before its fork is durable (review C-F4).
@@ -2462,21 +2552,21 @@ fn expire_batch() -> usize {
 
 
 /// How long a fork's creator, or an open of a new branch, waits for the trunk commit it forks after
-/// to be published before it is `Busy` (`BranchStore::wait_trunk_commit_published`).
+/// to be published before it is `Busy` (`StoreCore::wait_trunk_commit_published`).
 const PUBLISH_WAIT: Duration = Duration::from_secs(60);
 
-/// What a trunk fork's registration did (F-L on the durable store; see `BranchStore::fork_trunk`).
+/// What a trunk fork's registration did (F-L on the durable store; see `StoreCore::fork_trunk`).
 pub(crate) enum TrunkFork {
     /// Registered and applied; durable once `lsn` is, and, when `after` is set, readable once the
     /// trunk commit holding the gate at that count is published. The creator waits for both with
     /// every lock released (`wait_trunk_commit_published`, then `wait_durable`), and so does any
-    /// other opener of the branch (`BranchStore::settle`; review A-F3).
+    /// other opener of the branch (`StoreCore::settle`; review A-F3).
     Forked { id: BranchId, lsn: u64, after: Option<u64> },
     /// The trunk has no live child, so this fork would be the first: fork under the WAL write lock.
     NeedsWriterLock,
 }
 
-/// F-FZ hook stages (`BranchStore::checkpoint_hold`): the writer has written the captured rows and
+/// F-FZ hook stages (`StoreCore::checkpoint_hold`): the writer has written the captured rows and
 /// not committed; or it has committed and the install has not run; or the install has run and
 /// phase 4 (the catalog WAL's PASSIVE and TRUNCATE checkpoints) has not (engine review 17 MED 3).
 pub(crate) const HOLD_BEFORE_COMMIT: u8 = 2;
@@ -2487,54 +2577,54 @@ pub(crate) const HOLD_BEFORE_WAL_TRUNCATE: u8 = 4;
 /// Or-ed into the hook's stage once the flight has arrived there (tests wait for it).
 pub(crate) const HOLD_ARRIVED: u8 = 0x80;
 
-/// fastest-engine (test hook `BranchStore::trunk_commit_hold`): a trunk commit waits here, its copy
+/// fastest-engine (test hook `StoreCore::trunk_commit_hold`): a trunk commit waits here, its copy
 /// decisions taken and its commit gate OPEN, before its barrier and its first frame.
 #[cfg(test)]
 pub(crate) const HOLD_TRUNK_DECIDED: u8 = 4;
 
-/// fastest-engine (test hook `BranchStore::trunk_commit_hold`, same atomic): a group flight's leader
+/// fastest-engine (test hook `StoreCore::trunk_commit_hold`, same atomic): a group flight's leader
 /// waits here, its flight taken from the buffer and not yet written, so a test can act while an
 /// operation's records are in the air. On a fuzzy checkpoint's hook (`checkpoint_hold`): the flight
 /// its thread leads to settle its capture (engine review 9 #8).
 #[cfg(test)]
 pub(crate) const HOLD_FLIGHT_TAKEN: u8 = 5;
 
-/// fastest-engine (test hook `BranchStore::trunk_commit_hold`, same atomic): a trunk commit waits
+/// fastest-engine (test hook `StoreCore::trunk_commit_hold`, same atomic): a trunk commit waits
 /// here, its pre-image barrier done and its commit gate open, before its first frame.
 #[cfg(test)]
 pub(crate) const HOLD_TRUNK_BARRIER_DONE: u8 = 6;
 
-/// fastest-engine (test hook `BranchStore::trunk_commit_hold`, same atomic): a lock-free trunk
+/// fastest-engine (test hook `StoreCore::trunk_commit_hold`, same atomic): a lock-free trunk
 /// fork waits here, its read snapshot taken, before it registers.
 #[cfg(test)]
 pub(crate) const HOLD_FORK_REGISTERING: u8 = 7;
 
-/// fastest-engine (test hook `BranchStore::trunk_commit_hold`, same atomic): a flush made under
+/// fastest-engine (test hook `StoreCore::trunk_commit_hold`, same atomic): a flush made under
 /// the store mutex (`flush_locked`) waits here, its flight taken and in the air, before it writes
 /// (engine review 9 #3).
 #[cfg(test)]
 pub(crate) const HOLD_LOCKED_FLUSH: u8 = 8;
 
-/// fastest-engine (test hook `BranchStore::trunk_commit_hold`, same atomic): a release waits here,
+/// fastest-engine (test hook `StoreCore::trunk_commit_hold`, same atomic): a release waits here,
 /// its Release buffered and applied, the store mutex released, before it waits for its flight
 /// (engine review 8 #14: a trunk commit's barrier then orders the Release).
 #[cfg(test)]
 pub(crate) const HOLD_RELEASE_BUFFERED: u8 = 9;
 
-/// fastest-engine (test hook `BranchStore::trunk_commit_hold`, same atomic): a DDL commit on this
+/// fastest-engine (test hook `StoreCore::trunk_commit_hold`, same atomic): a DDL commit on this
 /// store's trunk waits here after publishing its pages and before publishing its schema
 /// (`Pager::commit_tx`; engine 2b: a trunk fork in that window). Per store (engine review 16 #14:
 /// the process-wide `SCHEMA_PUBLISH_HOLD` it replaces could catch any test's DDL commit).
 #[cfg(test)]
 pub(crate) const HOLD_SCHEMA_PUBLISH: u8 = 10;
 
-/// fastest-engine (test hook `BranchStore::trunk_commit_hold`, same atomic): `Database::drop_branch`
+/// fastest-engine (test hook `StoreCore::trunk_commit_hold`, same atomic): `Database::drop_branch`
 /// waits here, the name looked up, before its release takes the store mutex (engine review 14
 /// MED 7: the open check and the release are one hold).
 #[cfg(test)]
 pub(crate) const HOLD_DROP_LOOKED_UP: u8 = 11;
 
-/// fastest-engine (test hook `BranchStore::trunk_commit_hold`, same atomic):
+/// fastest-engine (test hook `StoreCore::trunk_commit_hold`, same atomic):
 /// `Database::connect_named` waits here, the name looked up, before it opens the branch (engine
 /// review 14 MED 9: a drop that lands in between).
 #[cfg(test)]
@@ -2566,7 +2656,7 @@ pub(crate) const HOLD_POOL_CLAIM: u8 = 23;
 /// (`verify_frozen_rows`), as `FE_CAPTURE_VERIFY` does for a whole run; and the differences found.
 #[cfg(test)]
 pub(crate) static CAPTURE_VERIFY_FORCED: AtomicBool = AtomicBool::new(false);
-/// Test builds (engine-2bdcd32c6 LOW 4): the next `BranchStore::wait_durable` in this process
+/// Test builds (engine-2bdcd32c6 LOW 4): the next `StoreCore::wait_durable` in this process
 /// panics, once.
 #[cfg(test)]
 pub(crate) static PANIC_NEXT_WAIT_FOR_TEST: AtomicBool = AtomicBool::new(false);
@@ -2992,7 +3082,7 @@ struct BranchState {
     /// A named server branch's name (fastest-engine M1 item 4); taken at its release, which frees it.
     name: Option<Arc<str>>,
     /// The log sequence number that makes this branch's fork durable; 0 for a branch loaded from
-    /// disk, which is durable already (`BranchStore::settle`; review C-F4).
+    /// disk, which is durable already (`StoreCore::settle`; review C-F4).
     fork_lsn: u64,
     /// LEAP L1: acknowledged before its fork was durable (`create_branch_async`), so it is found,
     /// listed and connected at once (ASYNC-DESIGN §8), and lost visibly if its flight fails.
@@ -3283,7 +3373,7 @@ fn filter_drain_fails() -> bool {
 /// A fixed-capacity set of nonzero `u64` keys (open addressing, linear probing): the name filter's
 /// table (lead ruling 2026-10-15). Its slots are allocated once, at construction, so an insert never
 /// allocates; a full table refuses instead of growing, and the filter grows by copying into a
-/// larger table OFF the store mutex (`BranchStore::grow_name_filter`). The slots are atomics so that
+/// larger table OFF the store mutex (`StoreCore::grow_name_filter`). The slots are atomics so that
 /// copy can read a table the store keeps inserting into under its mutex; an insert claims a slot
 /// with a compare-and-swap, so two inserters (the store, and a copy into a table already
 /// installed) never lose a key. Nothing is ever removed.
@@ -3371,14 +3461,14 @@ impl FilterTable {
 /// held, so a create of a NEW name — every successful server create — is answered "free" without a
 /// catalog query under the store mutex. Insert-only: a released name stays in it, and costs one
 /// query if it is ever looked up again; a hash collision costs the same. Built off the mutex after
-/// open from the catalog's names (`BranchStore::start_name_filter`) plus every name applied while
+/// open from the catalog's names (`StoreCore::start_name_filter`) plus every name applied while
 /// the build ran; until then, lookups query the catalog as before. Empty and built at once for a
 /// store with no catalog yet.
 ///
 /// A create allocates NOTHING here, by construction (lead ruling 2026-10-15; before, a B-tree bulk-
 /// built with full leaves split a node in 37-39 of 40 creates, raws l35-diag-alloc): the tables are
 /// fixed-size (`FilterTable`), a note fills a slot, and a table past half full owes a growth, which
-/// `BranchStore::grow_name_filter` makes off the mutex into a table twice the size.
+/// `StoreCore::grow_name_filter` makes off the mutex into a table twice the size.
 ///
 /// ONE state (`FilterState`, review REVIEW-claude-namefilter H1, DECISIONS: the class of a half-
 /// updated filter): the tables, and what a note and a lookup do with them, are a single value,
@@ -3491,7 +3581,7 @@ enum FilterWork {
     Rebuild,
 }
 
-/// How one attempt of a name filter's build ended (`BranchStore::build_name_filter`): `Failed` is
+/// How one attempt of a name filter's build ended (`StoreCore::build_name_filter`): `Failed` is
 /// retried with backoff, `Ended` (built, overflowed into an owed rebuild, or a state another thread
 /// moved) is not.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4442,7 +4532,7 @@ struct ReleaseInAir {
     name: Option<Arc<str>>,
 }
 
-/// What `BranchStore::start_flight` did (review 4 #2): only `Failed` backs the next attempt off.
+/// What `StoreCore::start_flight` did (review 4 #2): only `Failed` backs the next attempt off.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FlightStart {
     /// A fuzzy checkpoint is in flight now, on a thread of its own.
@@ -4513,7 +4603,7 @@ struct Captured {
     settle_class: SyncClass,
     /// A D0 store whose log rewrites sync (engine review 9 #8): its flights sync nothing, so once
     /// what the capture covers is written the checkpoint syncs the arena itself, under group
-    /// exclusion and only if a slot was written since its last sync (`BranchStore::settle_arena`),
+    /// exclusion and only if a slot was written since its last sync (`StoreCore::settle_arena`),
     /// before the catalog commit names the slots. The log is not synced: the cut supersedes it.
     settle_arena: bool,
     /// The store's fail-stop flag (shared with its journal and group): read just before the catalog
@@ -4820,8 +4910,8 @@ fn settle_start(over_hard: &AtomicBool, inner: &mut StoreInner, started: FlightS
     }
 }
 
-/// `BranchStore::dispatch_flight`, given the worker and its job counts (also the starter of owed
-/// checkpoints', `BranchStore::install_starter`).
+/// `StoreCore::dispatch_flight`, given the worker and its job counts (also the starter of owed
+/// checkpoints', `StoreCore::install_starter`).
 fn dispatch_to(
     ckpt_worker: &Mutex<WorkerSlot>,
     flight_jobs: &Arc<(std::sync::Mutex<(u64, u64)>, std::sync::Condvar)>,
@@ -4900,7 +4990,7 @@ fn run_owed_start(ctx: FlightCtx) {
             return;
         }
         let mut job: Option<CkptJob> = None;
-        let started = BranchStore::start_flight_with(&ctx, &mut inner, None, &mut |j| {
+        let started = StoreCore::start_flight_with(&ctx, &mut inner, None, &mut |j| {
             job = Some(j);
             Ok(())
         });
@@ -4912,7 +5002,7 @@ fn run_owed_start(ctx: FlightCtx) {
     }
 }
 
-/// The store's parts a fuzzy checkpoint's start and flight use (`BranchStore::flight_ctx`).
+/// The store's parts a fuzzy checkpoint's start and flight use (`StoreCore::flight_ctx`).
 struct FlightCtx {
     inner: Arc<StoreMutex>,
     group: Arc<Group>,
@@ -4923,7 +5013,7 @@ struct FlightCtx {
     installs: Arc<(std::sync::Mutex<u64>, std::sync::Condvar)>,
 }
 
-/// `BranchStore::mature`, given the store's group and class.
+/// `StoreCore::mature`, given the store's group and class.
 fn mature_with(group: &Group, store_class: SyncClass, inner: &mut StoreInner) {
     // Releases durable now no longer need reporting by a stopped store (engine review 7 #3).
     if !inner.releases_in_air.is_empty() {
@@ -5014,7 +5104,7 @@ fn run_flight(
         if !fe_mutant("commit_unsettled") {
             #[cfg(test)]
             let syncs = thread_syncs();
-            let settled = BranchStore::wait_durable_on(
+            let settled = StoreCore::wait_durable_on(
                 &inner,
                 &group,
                 (!cap.settle_arena).then_some(&*hold),
@@ -5025,8 +5115,8 @@ fn run_flight(
                 if cap.settle_arena {
                     #[cfg(test)]
                     pause_at(Some(&*hold), HOLD_BEFORE_SETTLE);
-                    BranchStore::settle_ordered(&group, cap.deferred_lsn)
-                        .and_then(|()| BranchStore::settle_arena(&inner, &group, &hold, cap.fail_arena_sync))
+                    StoreCore::settle_ordered(&group, cap.deferred_lsn)
+                        .and_then(|()| StoreCore::settle_arena(&inner, &group, &hold, cap.fail_arena_sync))
                 } else {
                     Ok(())
                 }
@@ -5198,7 +5288,7 @@ fn run_flight(
 
 type CkptJob = Box<dyn FnOnce() + Send>;
 
-/// The fuzzy checkpoints' persistent thread (`BranchStore::dispatch_flight`): runs each checkpoint
+/// The fuzzy checkpoints' persistent thread (`StoreCore::dispatch_flight`): runs each checkpoint
 /// handed to it in turn (only one is ever in flight), counting it finished even if it panicked, and
 /// exits when its channel closes (the store's `Drop`). Counted a persistent store thread for the
 /// budgets' probe while it is parked, as the confirmation writer is, and a live one while it runs
@@ -5249,7 +5339,7 @@ impl CkptWorker {
     }
 }
 
-/// A name's lookup under the store mutex (`BranchStore::lookup_named_locked`).
+/// A name's lookup under the store mutex (`StoreCore::lookup_named_locked`).
 enum NamedLookup {
     Found(BranchId),
     /// No branch holds the name; `own_release` is its newest Release still in the air.
@@ -5263,7 +5353,7 @@ pub(crate) struct Wait<'a> {
     pub(crate) interrupted: &'a dyn Fn() -> bool,
 }
 
-/// Test builds: `BranchStore::starter_probe`.
+/// Test builds: `StoreCore::starter_probe`.
 #[cfg(test)]
 #[derive(Clone)]
 pub(crate) struct StarterProbe {
@@ -5391,7 +5481,7 @@ fn begin_cut<'a>(inner: &StoreMutex, group: &'a Group, cap: &Captured) -> Option
 /// log, so it drops after the guard: if a fuzzy checkpoint is in flight and the log is past twice
 /// the threshold, the operation waits for the install without holding the store mutex. It waits
 /// on the install counter, 60 s at most (a flight that never installs is a bug, logged, not a hang).
-struct Backpressure<'a>(&'a BranchStore);
+struct Backpressure<'a>(&'a StoreCore);
 
 impl Drop for Backpressure<'_> {
     fn drop(&mut self) {
@@ -5552,7 +5642,7 @@ fn held_trace(label: &'static str) {
     let _ = label;
 }
 
-/// A branch page's reservation (`BranchStore::first_write_branch`): its slot and, for a file arena,
+/// A branch page's reservation (`StoreCore::first_write_branch`): its slot and, for a file arena,
 /// where the commit writes it, so `commit_pages` can write it before it takes the store mutex.
 #[derive(Clone)]
 pub(crate) struct Reserved {
@@ -5631,7 +5721,7 @@ fn gone(id: BranchId) -> LimboError {
     LimboError::InternalError(format!("branch {} does not exist", id.0))
 }
 
-impl BranchStore {
+impl StoreCore {
     /// `open`, for a database opened read-only or not (review 4 C2, the lead's decision; it
     /// replaces review 3's outright refusal, which made such a database unreadable read-only for
     /// good, since branch files are never removed).
@@ -5694,6 +5784,7 @@ impl BranchStore {
 
     fn trunk_only() -> Self {
         let store = Self {
+            shut: AtomicBool::new(false),
             inner: Arc::new(StoreMutex::new(StoreInner::fresh(None, SyncClass::Off, None))),
             prewarm: PrewarmStats::default(),
             ckpt_worker: Arc::new(Mutex::new(WorkerSlot::default())),
@@ -5984,6 +6075,7 @@ impl BranchStore {
         // Every byte the open buffered was flushed by the recovery itself (single-threaded).
         let opened_lsn = inner.journal.as_ref().map_or(0, |j| j.lsn() - j.pending_len());
         let mut store = Self {
+            shut: AtomicBool::new(false),
             fuzzy,
             group: Group::shared(opened_lsn, inner.fail_stop.clone()),
             class: inner.sync,
@@ -7656,7 +7748,7 @@ impl BranchStore {
     fn start_flight_with(
         ctx: &FlightCtx,
         inner: &mut StoreInner,
-        store: Option<&BranchStore>,
+        store: Option<&StoreCore>,
         dispatch: &mut dyn FnMut(CkptJob) -> std::io::Result<()>,
     ) -> FlightStart {
         ckpt_held("capture.begin");
@@ -7807,7 +7899,7 @@ impl BranchStore {
         if t.started.load(Ordering::Acquire) {
             return Ok(());
         }
-        type Body = fn(std::sync::Weak<BranchStore>, Arc<AsyncCtl>);
+        type Body = fn(std::sync::Weak<StoreCore>, Arc<AsyncCtl>);
         let bodies: [(&str, Body); 2] =
             [("branch-async-flusher", run_async_flusher), ("branch-housekeeping", run_housekeeping)];
         for (name, body) in bodies {
@@ -7878,7 +7970,7 @@ impl BranchStore {
         None
     }
 
-    /// Stop and join LEAP L1's threads (`Drop`).
+    /// Stop and join LEAP L1's threads (`shut_down`).
     fn stop_async(&self) {
         let t = &self.async_threads;
         t.ctl.halt();
@@ -11453,11 +11545,23 @@ impl BranchStore {
     }
 }
 
-impl Drop for BranchStore {
+impl Drop for StoreCore {
+    /// A state dropped with no handle having shut it down (one never handed out, or mutant
+    /// `close_leaves_async_threads`) shuts down here.
+    fn drop(&mut self) {
+        self.shut_down();
+    }
+}
+
+impl StoreCore {
     /// A clean close stamps the lease clock, so the time spent open is not lost with the process.
     /// (A crash loses the time since the last stamp, which extends leases and never shortens one.)
-    /// A fuzzy checkpoint in flight is finished first: its thread holds the store's files.
-    fn drop(&mut self) {
+    /// A fuzzy checkpoint in flight is finished first: its thread holds the store's files. Runs
+    /// once (`shut`).
+    fn shut_down(&self) {
+        if self.shut.swap(true, Ordering::AcqRel) {
+            return;
+        }
         self.flight_hold.store(0, Ordering::Release);
         #[cfg(test)]
         self.group.confirm_hold.store(0, Ordering::Release);
@@ -11484,8 +11588,10 @@ impl Drop for BranchStore {
         // The name filter's build holds the store's files too: stopped, then joined.
         self.name_filter_stop.store(true, Ordering::Release);
         self.wait_name_filter();
-        // LEAP L1's threads (ASYNC-DESIGN §11 step 7, Drop item 3): stopped, then joined, except
-        // in a fork(2) child and on the thread this drop runs on (its pass held the last handle).
+        // LEAP L1's threads (ASYNC-DESIGN §11 step 7, Drop item 3): stopped, then joined, a pass
+        // in progress first finishing and letting the state go, except in a fork(2) child and on
+        // the thread this runs on (only a state whose last reference a pass held: one no handle
+        // shut down, as under mutant `close_leaves_async_threads`).
         self.stop_async();
         // Then what async creates buffered is flown (ASYNC-DESIGN G7, "Drop loses nothing";
         // engine-rev-qaf-fix2 HIGH E: a create acked in the flusher's last FLY_AGE was lost by a
@@ -11656,7 +11762,7 @@ impl StoreInner {
     }
 
     /// Ruling 85a032f01's guard over the branch log and arena as opened (`one_device`), recording
-    /// their device for `BranchStore::note_trunk_wal` (review 3 #3).
+    /// their device for `StoreCore::note_trunk_wal` (review 3 #3).
     fn files_device(&self, log: Option<u64>, arena: Option<u64>) -> Result<()> {
         super::journal::one_device(log, arena)?;
         self.files_dev.store(log.unwrap_or(NO_DEVICE), Ordering::Release);
@@ -12444,7 +12550,7 @@ impl StoreInner {
                     let mut catalog = Catalog::open(&files.cat, self.sync)?;
                     // Its failed syncs reach this store's at-risk decision as they happen
                     // (engine review 21 MED 5).
-                    catalog.link_drain_parent(BranchStore::group_handle(group));
+                    catalog.link_drain_parent(StoreCore::group_handle(group));
                     if catalog.meta()?.is_some() {
                         return Err(LimboError::LockingError(format!(
                             "branch catalog {} gained state after this branch store opened: \
@@ -14915,7 +15021,7 @@ impl Lineage {
 }
 
 #[cfg(test)]
-impl BranchStore {
+impl StoreCore {
     /// Catalog trunk versions reaped since the last checkpoint (C-P; 0 for other modes).
     fn trunk_gone_len(&self) -> u64 {
         self.inner.lock().cat.as_ref().map_or(0, |c| c.trunk_gone.len() as u64)
