@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""spec_lint.py [--dir DIR] | selftest -- the Linux specs' timed steps against the registered statements (lane
+"""spec_lint.py [--dir DIR] | selftest | statements STATEMENTS.md -- the Linux specs' timed steps against the registered statements (lane
 fastest-linux-comp; comp review 1 MED 6).
 
 REG below transcribes the PREREG's §6 Statements table (artie frontier/fastest/tools/loadgen/specs/STATEMENTS.md,
@@ -91,6 +91,32 @@ HOME = {"pg18-": "connect host=127.0.0.1 port={port} user=postgres dbname=postgr
 # the lead's Doltgres b-m1 ruling (DECISIONS 2026-10-19): the specs that run `home per-cycle`, each with its delete as
 # its LAST after-step, on the admin connection (Doltgres 1.4.0 poisons a connection that wrote on a deleted branch)
 PER_CYCLE = {"doltgres-b-m1.spec": "after admin-sql SELECT dolt_branch('-d', '{branch}')"}
+
+
+def statements_problems(text):
+    """comp-rev-9bc7d894a LOW 5: REG's variant (b) switch rows against STATEMENTS.md's Statements table TEXT (artie
+    frontier/fastest/tools/loadgen/specs/STATEMENTS.md). Each row '| system | b | m1c-switch or m1-switch | conninfo |
+    steps | after |' gives the timed steps and the first after-step, '<br>'-separated, as 'sql X' / 'write X'; REG must
+    hold exactly those for {system}-b-m1c.spec / {system}-b-m1.spec. Returns the disagreements ([] = none)."""
+    want = {}
+    for ln in text.splitlines():
+        cells = [c.strip() for c in ln.strip().strip("|").split("|")]
+        if len(cells) < 6 or cells[1] != "b" or cells[2] not in ("m1c-switch", "m1-switch"):
+            continue
+        f = f"{cells[0]}-b-{'m1c' if cells[2] == 'm1c-switch' else 'm1'}.spec"
+        want[f] = (["step " + s.strip() for s in cells[4].split("<br>")],
+                   "after " + cells[5].split("<br>")[0].strip())
+    why = []
+    for f in ("dolt-b-m1c.spec", "dolt-b-m1.spec", "doltgres-b-m1c.spec", "doltgres-b-m1.spec"):
+        if f not in want:
+            why.append(f"{f}: no (b) {f.split('-b-')[1][:-5]}-switch row in STATEMENTS.md")
+            continue
+        steps, back = want[f]
+        if REG[f][2] != steps:
+            why.append(f"{f}: REG times {REG[f][2]}, STATEMENTS.md {steps}")
+        if REG[f][4] != back:
+            why.append(f"{f}: REG switches back with {REG[f][4]!r}, STATEMENTS.md {back!r}")
+    return why
 
 
 def home_of(f):
@@ -299,6 +325,16 @@ def selftest():
 def main(a):
     if a == ["selftest"]:
         return selftest()
+    if len(a) == 2 and a[0] == "statements":  # comp-rev-9bc7d894a LOW 5: REG's (b) rows against STATEMENTS.md itself
+        try:
+            why = statements_problems(open(a[1], errors="replace").read())
+        except OSError as e:
+            print(f"spec_lint statements: REFUSED: {e}")
+            return 2
+        for w in why:
+            print("FAIL", w)
+        print("spec_lint statements: " + ("REG's (b) rows match STATEMENTS.md" if not why else f"{len(why)} problem(s)"))
+        return 0 if not why else 1
     d = SPECS
     if a[:1] == ["--dir"] and len(a) == 2:
         d = a[1]
