@@ -63,6 +63,8 @@ pub enum SqlErrorKind {
     // pg_input_error_info's conditions (review c39799c5d..9e24b455d MED 1).
     StringDataRightTruncation,
     InvalidDatetimeFormat,
+    // COPY FROM's data format (a line with too few or too many fields).
+    BadCopyFileFormat,
 }
 
 /// A diagnostic's text and optional, explicitly assigned SQL condition.

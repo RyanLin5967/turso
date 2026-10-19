@@ -116,7 +116,7 @@ fn opt_int(i: Option<i64>) -> Value {
 
 /// A column's declared type as information_schema reports it: (data_type, udt_name,
 /// character_maximum_length, numeric_precision, numeric_precision_radix, numeric_scale).
-type ColumnType = (
+pub(crate) type ColumnType = (
     String,
     String,
     Option<i64>,
@@ -125,7 +125,7 @@ type ColumnType = (
     Option<i64>,
 );
 
-fn column_type(col: &turso_core::schema::Column) -> ColumnType {
+pub(crate) fn column_type(col: &turso_core::schema::Column) -> ColumnType {
     let lower = col.ty_str.trim().to_ascii_lowercase();
     // A custom type's parameters (varchar(n), numeric(p, s), bpchar(n)) are kept apart from its
     // name; a plain type's are part of the declared text.

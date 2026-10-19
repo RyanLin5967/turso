@@ -10,14 +10,15 @@ use turso_core::{Connection, LimboError, PrepareOptions, Result, Statement, Valu
 use turso_parser::ast::{self};
 use turso_pg_parser::translator::{
     is_checkpoint, is_comment_on, is_refresh_matview, try_extract_add_constraints,
-    try_extract_branch_call, try_extract_copy_from, try_extract_create_schema,
+    try_extract_branch_call, try_extract_copy_from_any,
+    try_extract_create_schema,
     try_extract_drop_objects, try_extract_drop_schema, try_extract_set, try_extract_show,
     PgAddConstraints, PgBranchArg, PgBranchCall, PgCopyFromStmt, PgCreateSchemaStmt, PgDropKind,
     PgDropObjectsStmt, PgDropSchemaStmt, PgSetStmt, PgSetValue,
     PgShowStmt, PostgreSQLTranslator, BRANCH_FUNCTION_PREFIX,
 };
 
-use crate::copy::parse_copy_text_format;
+use crate::copy::parse_copy_rows;
 
 #[derive(Clone)]
 pub struct PgConnection {
@@ -68,6 +69,32 @@ pub(crate) struct PgConnectionInner {
     block_reads: parking_lot::Mutex<Vec<turso_pg_parser::translator::PgRelationName>>,
     /// Which server files a COPY FROM 'file' may read (review wire-quote LOW-3).
     server_files: ServerFiles,
+    /// COPY FROM STDIN's exchange with the wire server ([`PgConnection::take_copy_asked`],
+    /// [`PgConnection::set_copy_end`]); None on a connection no server serves (the CLI, an
+    /// embedding), where nobody can send the rows and COPY FROM STDIN is refused.
+    copy_stdin: Option<parking_lot::Mutex<CopyStdin>>,
+}
+
+/// COPY FROM STDIN runs twice on its connection: first with no end set, when it checks its target
+/// (options, table, columns) and asks for its rows (`asked`, the number of columns, which the
+/// server answers with CopyInResponse); then, the client's copy ended, with `end` set, when it
+/// loads the rows, or fails as the client asked. Both runs are ordinary statements, so the
+/// server's block, notice and failure handling covers each as it covers any statement. `end` is
+/// read, never taken, so a run the server repeats (a lock wait's retry) loads the same rows; the
+/// server clears it after the run.
+#[derive(Default)]
+struct CopyStdin {
+    asked: Option<usize>,
+    end: Option<Arc<CopyEnd>>,
+}
+
+/// How the client ended a COPY FROM STDIN ([`PgConnection::set_copy_end`]).
+#[derive(Debug)]
+pub enum CopyEnd {
+    /// Its CopyData, in order, up to CopyDone.
+    Data(Vec<u8>),
+    /// Its CopyFail, or a message COPY cannot take: the COPY fails with this error.
+    Failed(SqlErrorKind, String),
 }
 
 /// The files a client's COPY FROM 'file' may read. PostgreSQL grants them by role
@@ -464,6 +491,9 @@ impl PgConnection {
                 dropped_schemas: parking_lot::Mutex::new(Vec::new()),
                 block_reads: parking_lot::Mutex::new(Vec::new()),
                 server_files,
+                // A branch server's session is the one a client can send COPY's rows to.
+                copy_stdin: public_schema_only
+                    .then(|| parking_lot::Mutex::new(CopyStdin::default())),
             }),
         };
         SESSIONS_BY_CONNECTION
@@ -474,6 +504,22 @@ impl PgConnection {
 
     pub fn inner(&self) -> &Arc<Connection> {
         &self.inner.conn
+    }
+
+    /// After a statement ran: Some(the number of columns) when it was a COPY FROM STDIN that
+    /// checked its target and now waits for the client's rows, for the server to answer with
+    /// CopyInResponse and, once the client ends the copy, to run the statement again with
+    /// [`PgConnection::set_copy_end`] set. Taken: None after.
+    pub fn take_copy_asked(&self) -> Option<usize> {
+        self.inner.copy_stdin.as_ref()?.lock().asked.take()
+    }
+
+    /// How the client ended the COPY FROM STDIN the next run of the statement loads (or fails
+    /// with); None clears it, which the server does after that run.
+    pub fn set_copy_end(&self, end: Option<CopyEnd>) {
+        if let Some(copy) = &self.inner.copy_stdin {
+            copy.lock().end = end.map(Arc::new);
+        }
     }
 
     /// The relations named by statements prepared inside the open block since the last take.
@@ -1318,6 +1364,7 @@ enum Special {
     Checkpoint,
     AddConstraints(PgAddConstraints),
     CopyFrom(PgCopyFromStmt),
+    CopyFromStdin(PgCopyFromStmt),
 }
 
 impl Special {
@@ -1349,14 +1396,17 @@ impl Special {
         if let Some(add) = try_extract_add_constraints(parse_result) {
             return Some(Special::AddConstraints(add));
         }
-        if let Some(stmt) = try_extract_copy_from(parse_result) {
-            return Some(Special::CopyFrom(stmt));
+        match try_extract_copy_from_any(parse_result) {
+            Some((stmt, false)) => return Some(Special::CopyFrom(stmt)),
+            Some((stmt, true)) => return Some(Special::CopyFromStdin(stmt)),
+            None => {}
         }
         None
     }
 
     /// Whether preparing it performs it: SET, CREATE SCHEMA, DROP SCHEMA, ALTER TABLE ADD
-    /// CONSTRAINT's rebuild and COPY FROM's import run in the prepare.
+    /// CONSTRAINT's rebuild and COPY FROM's import run in the prepare (COPY FROM STDIN's check,
+    /// request and load too, see [`CopyStdin`]).
     fn performs(&self) -> bool {
         matches!(
             self,
@@ -1366,6 +1416,7 @@ impl Special {
                 | Special::DropObjects(_)
                 | Special::AddConstraints(_)
                 | Special::CopyFrom(_)
+                | Special::CopyFromStdin(_)
         )
     }
 }
@@ -1907,6 +1958,12 @@ fn try_prepare_special(
         }
         Special::CopyFrom(stmt) => {
             let rows_inserted = handle_pg_copy_from(pg_conn, &stmt)?;
+            let stmt = noop_statement(&pg_conn.conn)?;
+            stmt.set_n_change(rows_inserted as i64);
+            stmt
+        }
+        Special::CopyFromStdin(stmt) => {
+            let rows_inserted = handle_pg_copy_from_stdin(pg_conn, &stmt)?;
             let stmt = noop_statement(&pg_conn.conn)?;
             stmt.set_n_change(rows_inserted as i64);
             stmt
@@ -4070,6 +4127,64 @@ fn opened_path(_file: &std::fs::File) -> Option<std::path::PathBuf> {
 }
 
 fn handle_pg_copy_from(pg_conn: &Arc<PgConnectionInner>, stmt: &PgCopyFromStmt) -> Result<usize> {
+    refuse_copy_options(stmt)?;
+    let mut data = String::new();
+    std::io::Read::read_to_string(&mut open_server_file(&pg_conn.server_files, &stmt.filename)?, &mut data).map_err(|e| {
+        LimboError::ParseError(format!("COPY FROM: cannot read '{}': {}", stmt.filename, e).into())
+    })?;
+    let target = copy_target(pg_conn, stmt)?;
+    load_copy_rows(pg_conn, stmt, &target, &data)
+}
+
+/// COPY FROM STDIN, in its two runs ([`CopyStdin`]): with no end set, its target is checked as
+/// PostgreSQL checks it before CopyInResponse (its options, then the table and columns: 0A000,
+/// 42601, 42P01, 42703) and the request for its rows is left for the server, 0 loaded; with the
+/// client's data, the rows are loaded as COPY FROM a file loads them; with a CopyFail, its error.
+/// A connection no server serves has no client to send the rows: 0A000.
+fn handle_pg_copy_from_stdin(
+    pg_conn: &Arc<PgConnectionInner>,
+    stmt: &PgCopyFromStmt,
+) -> Result<usize> {
+    let Some(copy) = &pg_conn.copy_stdin else {
+        return Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
+            SqlErrorKind::FeatureNotSupported,
+            "COPY FROM STDIN is answered only by the wire server, which reads the rows from the \
+             client; use COPY FROM a file here"
+                .to_string(),
+        )));
+    };
+    let end = copy.lock().end.clone();
+    refuse_copy_options(stmt)?;
+    match end.as_deref() {
+        None => {
+            let target = copy_target(pg_conn, stmt)?;
+            copy.lock().asked = Some(target.columns.len());
+            Ok(0)
+        }
+        Some(CopyEnd::Failed(kind, message)) => Err(LimboError::InvalidArgument(
+            SqlErrorMessage::classified(*kind, message.clone()),
+        )),
+        Some(CopyEnd::Data(bytes)) => {
+            // The client's encoding is UTF8 (FIXED_SETTINGS): any other byte sequence is
+            // PostgreSQL's 22021.
+            let data = str::from_utf8(bytes).map_err(|e| {
+                let bad = &bytes[e.valid_up_to()..];
+                let len = e.error_len().unwrap_or(bad.len()).min(bad.len());
+                let shown: Vec<String> = bad[..len].iter().map(|b| format!("0x{b:02x}")).collect();
+                LimboError::InvalidArgument(SqlErrorMessage::classified(
+                    SqlErrorKind::CharacterNotInRepertoire,
+                    format!("invalid byte sequence for encoding \"UTF8\": {}", shown.join(" ")),
+                ))
+            })?;
+            let target = copy_target(pg_conn, stmt)?;
+            load_copy_rows(pg_conn, stmt, &target, data)
+        }
+    }
+}
+
+/// The options COPY FROM refuses before it reads any row: one PostgreSQL knows that this COPY
+/// does not implement, one it does not know or given twice (the parse's `refused`), and a WHERE.
+fn refuse_copy_options(stmt: &PgCopyFromStmt) -> Result<()> {
     if let Some(why) = &stmt.refused {
         return Err(LimboError::ParseError(why.clone().into()));
     }
@@ -4078,12 +4193,22 @@ fn handle_pg_copy_from(pg_conn: &Arc<PgConnectionInner>, stmt: &PgCopyFromStmt) 
             SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, "COPY FROM ... WHERE is not supported".to_string()),
         ));
     }
-    let conn = &pg_conn.conn;
-    let mut data = String::new();
-    std::io::Read::read_to_string(&mut open_server_file(&pg_conn.server_files, &stmt.filename)?, &mut data).map_err(|e| {
-        LimboError::ParseError(format!("COPY FROM: cannot read '{}': {}", stmt.filename, e).into())
-    })?;
+    Ok(())
+}
 
+/// What a COPY FROM loads into: its INSERT, the columns it fills (as named, or the table's), and
+/// for each the type whose input COPY checks before the engine stores the value
+/// ([`copy_input_type`]).
+struct CopyTarget {
+    insert_sql: String,
+    columns: Vec<String>,
+    input_types: Vec<Option<String>>,
+}
+
+/// The table and columns of a COPY FROM, checked as PostgreSQL checks them before it reads a row:
+/// a table that does not exist is 42P01, a named column it does not have 42703.
+fn copy_target(pg_conn: &Arc<PgConnectionInner>, stmt: &PgCopyFromStmt) -> Result<CopyTarget> {
+    let conn = &pg_conn.conn;
     // An unqualified table is found through the search path, as the engine finds every other
     // statement's; COPY's INSERT was prepared with no path, so `COPY t` under `search_path TO s,
     // public` filled public.t (wire review 18 item 22).
@@ -4097,14 +4222,16 @@ fn handle_pg_copy_from(pg_conn: &Arc<PgConnectionInner>, stmt: &PgCopyFromStmt) 
         None => quoted(&stmt.table_name),
     };
     let column_names = get_table_columns(conn, &stmt.table_name, schema.as_deref())?;
+    // No columns: no such table (PostgreSQL's 42P01, as for any relation that does not exist; it
+    // was 42601 "COPY FROM: table 't' not found or has no columns").
     if column_names.is_empty() {
-        return Err(LimboError::ParseError(format!(
-            "COPY FROM: table '{}' not found or has no columns",
-            stmt.table_name
-        ).into()));
+        return Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
+            SqlErrorKind::UndefinedTable,
+            format!("relation \"{}\" does not exist", stmt.table_name),
+        )));
     }
 
-    let (insert_cols, num_columns) = match &stmt.columns {
+    let (insert_cols, columns) = match &stmt.columns {
         Some(cols) => {
             // Each named column is one the table has (42703, as PostgreSQL answers), and each is
             // quoted by the one quoting function (review wire-line3 HIGH-1: they were pasted into
@@ -4113,7 +4240,7 @@ fn handle_pg_copy_from(pg_conn: &Arc<PgConnectionInner>, stmt: &PgCopyFromStmt) 
                 .iter()
                 .find(|c| !column_names.iter().any(|n| n.eq_ignore_ascii_case(c)))
             {
-                return Err(LimboError::ParseError(SqlErrorMessage::classified(
+                return Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
                     SqlErrorKind::UndefinedColumn,
                     format!(
                         "column \"{missing}\" of relation \"{}\" does not exist",
@@ -4126,16 +4253,68 @@ fn handle_pg_copy_from(pg_conn: &Arc<PgConnectionInner>, stmt: &PgCopyFromStmt) 
                 .map(|c| catalog::quote_ident(c))
                 .collect::<Vec<_>>()
                 .join(", ");
-            (format!(" ({col_list})"), cols.len())
+            (format!(" ({col_list})"), cols.clone())
         }
-        None => (String::new(), column_names.len()),
+        None => (String::new(), column_names),
     };
 
-    let placeholders = (0..num_columns).map(|_| "?").collect::<Vec<_>>().join(", ");
+    let placeholders = (0..columns.len()).map(|_| "?").collect::<Vec<_>>().join(", ");
     let insert_sql = catalog::sqlite_text(format!(
         "INSERT INTO {table_name}{insert_cols} VALUES ({placeholders})"
     ));
+    // The declared types are read from the main schema's in-memory table; a table in an attached
+    // schema has none read here (BLIND SPOT: its values reach the engine unchecked, as before, so a
+    // varchar overflow there is the engine's XX000, not 22001).
+    let in_main = schema
+        .as_deref()
+        .is_none_or(|s| s.eq_ignore_ascii_case("main"));
+    let table = in_main
+        .then(|| conn.current_schema().get_btree_table(&stmt.table_name))
+        .flatten();
+    let input_types = columns
+        .iter()
+        .map(|name| {
+            table
+                .as_ref()
+                .and_then(|t| t.get_column(name).and_then(|(_, col)| copy_input_type(col)))
+        })
+        .collect();
+    Ok(CopyTarget {
+        insert_sql,
+        columns,
+        input_types,
+    })
+}
 
+/// The type whose text input COPY checks itself before the engine stores a field, as
+/// PostgreSQL's input function reads it, for the types whose check
+/// ([`crate::functions::validate_pg_input`]) is PostgreSQL's: the integers (22P02 for text that is
+/// not one, 22003 out of range) and a varchar(n) or char(n) (22001 past its length). The engine
+/// answered these 23000 "datatype mismatch" and XX000 "value too long for varchar" (recorded,
+/// cli/tests/copy-stdin-pg18.txt). Every other type, and an array, is left to the engine.
+fn copy_input_type(col: &turso_core::schema::Column) -> Option<String> {
+    if col.array_dimensions() > 0 {
+        return None;
+    }
+    let (_, udt, len, ..) = crate::information_schema::column_type(col);
+    match (udt.as_str(), len) {
+        ("int2" | "int4" | "int8", _) => Some(udt),
+        ("varchar", Some(n)) => Some(format!("varchar({n})")),
+        ("bpchar", Some(n)) => Some(format!("char({n})")),
+        _ => None,
+    }
+}
+
+/// Load COPY text-format `data` into `target` as `stmt`'s options read it, atomically (see below):
+/// the number of rows loaded.
+fn load_copy_rows(
+    pg_conn: &Arc<PgConnectionInner>,
+    stmt: &PgCopyFromStmt,
+    target: &CopyTarget,
+    data: &str,
+) -> Result<usize> {
+    let conn = &pg_conn.conn;
+    let insert_sql = &target.insert_sql;
     let delimiter = stmt
         .delimiter
         .as_ref()
@@ -4143,10 +4322,14 @@ fn handle_pg_copy_from(pg_conn: &Arc<PgConnectionInner>, stmt: &PgCopyFromStmt) 
         .unwrap_or('\t');
     let null_string = stmt.null_string.as_deref().unwrap_or("\\N");
 
-    let mut rows = parse_copy_text_format(&data, delimiter, null_string, num_columns)?;
-    if stmt.header && !rows.is_empty() {
-        rows.remove(0);
-    }
+    // HEADER: the first line is skipped unread, as PostgreSQL skips it (it was parsed as a row,
+    // so a header with another number of fields failed the COPY).
+    let data = if stmt.header {
+        data.split_once('\n').map_or("", |(_, rest)| rest)
+    } else {
+        data
+    };
+    let rows = parse_copy_rows(data, delimiter, null_string, &target.columns)?;
 
     let rows_inserted = rows.len();
     // The rows go in atomically: in a transaction of their own, or, inside one already open (a
@@ -4156,12 +4339,23 @@ fn handle_pg_copy_from(pg_conn: &Arc<PgConnectionInner>, stmt: &PgCopyFromStmt) 
     // An undo that fails breaks the connection, as for ALTER's rebuild (own_transaction): it left
     // some of the rows in a transaction nobody can name.
     own_transaction(pg_conn, "__turso_copy", "COPY FROM", || {
-        let mut insert_stmt = conn.prepare_sqlite(&insert_sql)?;
+        let mut insert_stmt = conn.prepare_sqlite(insert_sql)?;
         for row in &rows {
             for (i, val) in row.iter().enumerate() {
                 let index = NonZero::new(i + 1).unwrap();
                 match val {
-                    Some(s) => insert_stmt.bind_at(index, Value::build_text(s.clone()))?,
+                    Some(s) => {
+                        if let Some(ty) = &target.input_types[i] {
+                            if let Some((message, kind)) =
+                                crate::functions::validate_pg_input(s, ty)
+                            {
+                                return Err(LimboError::InvalidArgument(
+                                    SqlErrorMessage::classified(kind, message),
+                                ));
+                            }
+                        }
+                        insert_stmt.bind_at(index, Value::build_text(s.clone()))?
+                    }
                     None => insert_stmt.bind_at(index, Value::Null)?,
                 }
             }

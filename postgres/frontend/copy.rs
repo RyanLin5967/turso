@@ -9,20 +9,39 @@
 //! - Lines starting with `\.` = end of data
 
 use crate::{LimboError, Result};
+use turso_parser::sql_error::{SqlErrorKind, SqlErrorMessage};
 
 /// A parsed row from COPY text format: each element is None for NULL, Some for a value.
 type CopyRow = Vec<Option<String>>;
 
-/// Parse COPY text format data into rows of column values.
+/// [`parse_copy_rows`] for `num_columns` columns named column1, column2, ...
+#[cfg(test)]
 pub fn parse_copy_text_format(
     data: &str,
     delimiter: char,
     null_string: &str,
     num_columns: usize,
 ) -> Result<Vec<CopyRow>> {
-    let mut rows = Vec::new();
+    let columns: Vec<String> = (1..=num_columns).map(|i| format!("column{i}")).collect();
+    parse_copy_rows(data, delimiter, null_string, &columns)
+}
 
-    for (line_num, line) in data.lines().enumerate() {
+/// Parse COPY text format data into rows of values for `columns`, the columns COPY loads, in
+/// order. A line with fewer fields than columns, or more, is 22P04 as PostgreSQL's CopyReadAttributes
+/// answers it ("missing data for column \"v\"", "extra data after last expected column"); it was
+/// 42601 "COPY: line N: expected 2 columns, got 1" (recorded, cli/tests/copy-stdin-pg18.txt).
+pub fn parse_copy_rows(
+    data: &str,
+    delimiter: char,
+    null_string: &str,
+    columns: &[String],
+) -> Result<Vec<CopyRow>> {
+    let mut rows = Vec::new();
+    let bad_format = |text: String| {
+        LimboError::InvalidArgument(SqlErrorMessage::classified(SqlErrorKind::BadCopyFileFormat, text))
+    };
+
+    for line in data.lines() {
         // End-of-data marker (used in STDIN mode, but handle it for files too)
         if line == "\\." {
             break;
@@ -34,13 +53,11 @@ pub fn parse_copy_text_format(
         }
 
         let fields: Vec<&str> = line.split(delimiter).collect();
-        if fields.len() != num_columns {
-            return Err(LimboError::ParseError(format!(
-                "COPY: line {}: expected {} columns, got {}",
-                line_num + 1,
-                num_columns,
-                fields.len()
-            ).into()));
+        if fields.len() > columns.len() {
+            return Err(bad_format("extra data after last expected column".to_string()));
+        }
+        if let Some(missing) = columns.get(fields.len()) {
+            return Err(bad_format(format!("missing data for column \"{missing}\"")));
         }
 
         let row: CopyRow = fields

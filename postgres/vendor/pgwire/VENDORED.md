@@ -93,3 +93,11 @@ Every change from the crate is listed here, newest last; `diff -r` against the c
     encryption request"), as PostgreSQL 18.6 does (recorded for SSL: artie pg18-diff/pg18-ssl3.out),
     and the connection ends. A pipelined second SSLRequest got 0A000, and a pipelined
     StartupMessage was served.
+12. `tokio/server.rs` `process_message` (COPY FROM STDIN, wirefuzz against PostgreSQL 18.6): after a CopyDone the
+    copy handler answers the rest of the round itself and owns the connection state: a simple-protocol
+    COPY's CommandComplete, the statements after it in the Query (one may be a second COPY, which leaves
+    the state in CopyInProgress again), and ReadyForQuery with the session's real transaction status;
+    an extended one's CommandComplete, the state back to ReadyForQuery for the Sync. Upstream set
+    ReadyForQuery and sent ReadyForQuery Idle after every simple-protocol CopyDone, whatever the block
+    was. On the handler's error a simple-protocol COPY's state goes back to ReadyForQuery as before,
+    for `process_error`; `send_ready_for_query`'s import, used only there, is dropped.

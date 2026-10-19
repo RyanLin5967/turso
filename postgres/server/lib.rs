@@ -39,18 +39,19 @@ use tracing::{error, info, warn};
 use turso_core::{CheckpointMode, Database, LimboError, Value};
 use turso_pg::{
     attach_schema_files, branch_call, element_of, pg_bool, read_parse_message, single_statement,
-    split_statements, ParseMessage, PgBranchArg, PgBranchCall, PgConnection, StatementTypes,
+    split_statements, CopyEnd, ParseMessage, PgBranchArg, PgBranchCall, PgConnection, StatementTypes,
     TxStmt,
 };
 use turso_pg_parser::{pg_space, scan_params, skip_blank, sql_comment, ParamScan};
 
 use pgwire::api::auth::noop::NoopStartupHandler;
 use pgwire::api::auth::{DefaultServerParameterProvider, StartupHandler};
+use pgwire::api::copy::CopyHandler;
 use pgwire::api::portal::{Format, Portal, PortalExecutionState};
 use pgwire::api::query::{send_ready_for_query, ExtendedQueryHandler, SimpleQueryHandler};
 use pgwire::api::results::{
     DataRowEncoder, DescribePortalResponse, DescribeStatementResponse, FieldFormat, FieldInfo,
-    QueryResponse, Response, Tag,
+    CopyResponse, QueryResponse, Response, Tag,
 };
 use pgwire::api::stmt::{QueryParser, StoredStatement};
 use pgwire::api::store::PortalStore;
@@ -59,6 +60,7 @@ use pgwire::api::{
     PgWireServerHandlers, Type, DEFAULT_NAME, METADATA_DATABASE,
 };
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
+use pgwire::messages::copy::{CopyData, CopyDone, CopyFail, CopyInResponse};
 use pgwire::messages::data::{DataRow, NoData, ParameterDescription, RowDescription};
 use pgwire::messages::extendedquery::{
     Bind, BindComplete, Close, CloseComplete, Describe, Execute, Parse, ParseComplete,
@@ -1019,6 +1021,31 @@ impl<S: std::ops::Deref<Target = SessionSockets>> Drop for Registered<S> {
 /// allows (and PostgreSQL's authentication_timeout's default); `--authentication-timeout` sets it.
 pub const DEFAULT_AUTHENTICATION_TIMEOUT_S: u64 = 60;
 
+/// A frontend message's type byte, as the client sent it (0 for the startup-phase messages, which
+/// have none).
+fn frontend_message_type(msg: &PgWireFrontendMessage) -> u8 {
+    match msg {
+        PgWireFrontendMessage::Query(_) => b'Q',
+        PgWireFrontendMessage::Parse(_) => b'P',
+        PgWireFrontendMessage::Close(_) => b'C',
+        PgWireFrontendMessage::Bind(_) => b'B',
+        PgWireFrontendMessage::Describe(_) => b'D',
+        PgWireFrontendMessage::Execute(_) => b'E',
+        PgWireFrontendMessage::PortalSuspended(_) => b's',
+        PgWireFrontendMessage::Flush(_) => b'H',
+        PgWireFrontendMessage::Sync(_) => b'S',
+        PgWireFrontendMessage::Terminate(_) => b'X',
+        PgWireFrontendMessage::CopyData(_) => b'd',
+        PgWireFrontendMessage::CopyFail(_) => b'f',
+        PgWireFrontendMessage::CopyDone(_) => b'c',
+        PgWireFrontendMessage::PasswordMessageFamily(_) => b'p',
+        PgWireFrontendMessage::Malformed(kind, ..) => *kind,
+        PgWireFrontendMessage::SslNegotiation(_)
+        | PgWireFrontendMessage::Startup(_)
+        | PgWireFrontendMessage::CancelRequest(_) => 0,
+    }
+}
+
 /// Before startup completes the session reads its startup's own messages alone: a malformed
 /// message of any kind, or any extended-protocol message (Parse, Bind, Close, Describe, Execute,
 /// Flush, Sync), is answered FATAL 08P01 and the session ends, as PostgreSQL ends a session that
@@ -1081,14 +1108,14 @@ async fn serve_session(
         );
         return Ok(());
     };
-    // The handlers by their concrete types: the session, and pgwire's no-op ones for COPY FROM
-    // STDIN, cancel and error logging. Taken through PgWireServerHandlers' `impl Trait` returns,
-    // the codec's statement type borrowed the handler set, which the socket outlived (E0597 at
-    // the 376e950aa gate check).
+    // The handlers by their concrete types: the session (COPY FROM STDIN's rows too), the cancel
+    // handler, and pgwire's no-op one for error logging. Taken through PgWireServerHandlers'
+    // `impl Trait` returns, the codec's statement type borrowed the handler set, which the socket
+    // outlived (E0597 at the 376e950aa gate check).
     let startup_handler = session.clone();
     let simple_query_handler = session.clone();
     let extended_query_handler = session.clone();
-    let copy_handler = Arc::new(NoopHandler);
+    let copy_handler = session.clone();
     let cancel_handler = Arc::new(CancelSessions(session.shared.clone()));
     let error_handler = NoopHandler;
     let mut started = false;
@@ -1224,14 +1251,61 @@ async fn serve_session(
                 continue;
             }
         }
+        // During COPY FROM STDIN the client sends CopyData, CopyDone or CopyFail, and Flush and Sync
+        // are ignored, as PostgreSQL 18.6's CopyGetData reads them (pgwire ignored every other
+        // message too). Any other message fails the COPY and ends the session: ERROR 08P01
+        // "unexpected message type 0x51 during COPY from stdin", then FATAL 08P01, as PostgreSQL
+        // answers (recorded, cli/tests/copy-stdin-pg18.txt). A malformed CopyData, CopyDone or
+        // CopyFail fails the COPY with its own error, answered below as any malformed message is.
+        if matches!(socket.state(), PgWireConnectionState::CopyInProgress(_)) {
+            let unexpected = match &msg {
+                PgWireFrontendMessage::CopyData(_)
+                | PgWireFrontendMessage::CopyDone(_)
+                | PgWireFrontendMessage::CopyFail(_)
+                | PgWireFrontendMessage::Flush(_)
+                | PgWireFrontendMessage::Sync(_) => None,
+                PgWireFrontendMessage::Malformed(b'H' | b'S', ..) => continue,
+                PgWireFrontendMessage::Malformed(b'd' | b'c' | b'f', _, message) => {
+                    session.copy_failed(SqlErrorKind::ProtocolViolation, message.clone());
+                    socket.set_transaction_status(session.transaction_status());
+                    None
+                }
+                other => Some(frontend_message_type(other)),
+            };
+            if let Some(kind) = unexpected {
+                let info = session.copy_failed(
+                    SqlErrorKind::ProtocolViolation,
+                    format!("unexpected message type 0x{kind:02X} during COPY from stdin"),
+                );
+                let fatal = ErrorInfo::new(
+                    "FATAL".to_string(),
+                    kind_code(SqlErrorKind::ProtocolViolation).to_string(),
+                    "terminating connection because protocol synchronization was lost".to_string(),
+                );
+                let sent = async {
+                    socket
+                        .feed(PgWireBackendMessage::ErrorResponse((*info).into()))
+                        .await?;
+                    socket
+                        .send(PgWireBackendMessage::ErrorResponse(fatal.into()))
+                        .await
+                }
+                .await;
+                break sent.map_err(std::io::Error::other);
+            }
+        }
         let is_extended_query = match socket.state() {
             PgWireConnectionState::CopyInProgress(extended) => extended,
             _ => msg.is_extended_query(),
         };
-        // A Sync or a simple query can end the transaction; its named portals go with it.
+        // A Sync or a simple query can end the transaction; its named portals go with it. So can
+        // the end of a simple Query's COPY FROM STDIN, which ends the Query.
         let may_end_transaction = matches!(
             msg,
-            PgWireFrontendMessage::Sync(_) | PgWireFrontendMessage::Query(_)
+            PgWireFrontendMessage::Sync(_)
+                | PgWireFrontendMessage::Query(_)
+                | PgWireFrontendMessage::CopyDone(_)
+                | PgWireFrontendMessage::CopyFail(_)
         );
         if let Err(mut e) = pgwire::tokio::server::process_message(
             msg,
@@ -1574,6 +1648,34 @@ struct SessionState {
     /// path as SET gave it ([`Session::changed_parameters`]); None while it is the one startup
     /// announced.
     reported_path: Option<(u64, Vec<String>, String)>,
+    /// A COPY FROM STDIN that sent CopyInResponse and is reading the client's rows
+    /// ([`Session::copy_end`]); None otherwise.
+    copy_in: Option<PendingCopy>,
+}
+
+/// A COPY FROM STDIN waiting for the client's rows: its statement, the rest of the simple Query it
+/// is in, which runs after it as in PostgreSQL (`statements[next + 1..]`, `multi` when the Query
+/// held more than one statement and so runs in an implicit block), the CopyData so far, and
+/// whether an Execute started it (the extended protocol, which ends at Sync).
+struct PendingCopy {
+    statements: Vec<String>,
+    next: usize,
+    multi: bool,
+    data: Vec<u8>,
+    extended: bool,
+}
+
+/// What [`Session::copy_end`] left to answer: a simple Query's replies from the COPY on, or an
+/// Execute's COPY result (its CommandComplete, or the error that fails the round to Sync).
+enum CopyEnded {
+    Simple(Replies),
+    Extended(SqlResult<Response>),
+}
+
+/// The CopyInResponse of a COPY FROM STDIN of `columns` columns: text format, as every column is
+/// (PostgreSQL's text COPY; recorded, cli/tests/copy-stdin-pg18.txt).
+fn copy_in_response(columns: usize) -> Response {
+    Response::CopyIn(CopyResponse::new(0, columns, vec![0; columns]))
 }
 
 /// An engine statement's failure, with whether it got as far as running: a COMMIT or ROLLBACK that
@@ -2108,6 +2210,18 @@ impl Session {
             let result = self.run(sql, None, None, &Format::UnifiedText);
             self.after_implicit(sql, result.is_err());
             let mut responses = Replies::new();
+            // A COPY FROM STDIN that asks for its rows: CopyInResponse, the rest after them.
+            if let (Ok(_), Some(columns)) = (&result, self.copy_asked()) {
+                responses.push(with_notices(copy_in_response(columns)));
+                self.state().copy_in = Some(PendingCopy {
+                    statements: vec![sql.to_string()],
+                    next: 0,
+                    multi: false,
+                    data: Vec::new(),
+                    extended: false,
+                });
+                return responses;
+            }
             responses.push(with_notices(result.unwrap_or_else(Response::Error)));
             if let Err(e) = self.end_implicit() {
                 responses.push(with_notices(Response::Error(e)));
@@ -2125,7 +2239,37 @@ impl Session {
         let mut responses = Replies::with_capacity(statements.len());
         // More than one statement: one implicit transaction, as in PostgreSQL (wire review 1 item 8).
         let multi = statements.len() > 1;
-        for sql in &statements {
+        self.run_simple(statements, 0, multi, &mut responses);
+        responses
+    }
+
+    /// The notices the session's statements raised since the last reply, with `r`.
+    fn with_notices(&self, r: Response) -> (Vec<Box<ErrorInfo>>, Response) {
+        let notices = std::mem::take(&mut self.state().notices);
+        (self.deliverable(notices), r)
+    }
+
+    /// After a statement ran: the number of columns of a COPY FROM STDIN that checked its target
+    /// and asks for the client's rows (turso_pg's `take_copy_asked`), taken; None for any other
+    /// statement. Read from the session's open connection, never opening one.
+    fn copy_asked(&self) -> Option<usize> {
+        let st = self.state();
+        let conn = match &st.branch {
+            Some((_, conn)) => Some(conn),
+            None => st.trunk.as_ref(),
+        }?;
+        conn.take_copy_asked()
+    }
+
+    /// The statements of one simple Query from `from` on, `multi` when it holds more than one,
+    /// which then run in its implicit block: each in order up to and including the first that
+    /// fails, then the block's end. A COPY FROM STDIN that asks for its rows ends `responses` with
+    /// its CopyInResponse instead, the Query kept in the session ([`PendingCopy`]) for
+    /// [`Session::copy_end`] to go on from once the client ends the copy, as PostgreSQL runs the
+    /// rest of a Query after its COPY.
+    fn run_simple(&self, statements: Vec<String>, from: usize, multi: bool, responses: &mut Replies) {
+        for next in from..statements.len() {
+            let sql = statements[next].as_str();
             // A query of one statement was read above as a whole and is no call: it is not read
             // again (wire review 13 item 6).
             let call = if multi { branch_call(sql) } else { None };
@@ -2140,18 +2284,99 @@ impl Session {
             // in PostgreSQL, where end_implicit committed it and answered idle (wire review 16
             // item 6). With no block open after_implicit returns at once.
             self.after_implicit(sql, result.is_err());
+            let asked = self.copy_asked();
             match result {
-                Ok(r) => responses.push(with_notices(r)),
+                Ok(_) if asked.is_some() => {
+                    let columns = asked.expect("matched");
+                    responses.push(self.with_notices(copy_in_response(columns)));
+                    self.state().copy_in = Some(PendingCopy {
+                        statements,
+                        next,
+                        multi,
+                        data: Vec::new(),
+                        extended: false,
+                    });
+                    return;
+                }
+                Ok(r) => responses.push(self.with_notices(r)),
                 Err(e) => {
-                    responses.push(with_notices(Response::Error(e)));
+                    responses.push(self.with_notices(Response::Error(e)));
                     break;
                 }
             }
         }
         if let Err(e) = self.end_implicit() {
-            responses.push(with_notices(Response::Error(e)));
+            responses.push(self.with_notices(Response::Error(e)));
         }
-        responses
+    }
+
+    /// A COPY FROM STDIN the client failed (CopyFail) or broke off (a message COPY cannot take):
+    /// its second run fails with `kind` and `message` ([`Session::copy_end`]), failing or rolling
+    /// back its block; the error to answer. Over the simple protocol the Query ends there, so any
+    /// notice of that run is not sent (none is raised by a failing COPY today).
+    fn copy_failed(&self, kind: SqlErrorKind, message: String) -> Box<ErrorInfo> {
+        let fallback = error(kind, message.clone());
+        match self.copy_end(CopyEnd::Failed(kind, message)) {
+            Some(CopyEnded::Simple(responses)) => responses
+                .into_iter()
+                .find_map(|(_, r)| match r {
+                    Response::Error(e) => Some(e),
+                    _ => None,
+                })
+                .unwrap_or(fallback),
+            Some(CopyEnded::Extended(Err(e))) => e,
+            _ => fallback,
+        }
+    }
+
+    /// The client ended a COPY FROM STDIN (`end`: its rows at CopyDone, or the error of its
+    /// CopyFail or of a message COPY cannot take): the COPY runs again with it, loading its rows or
+    /// failing (turso_pg's CopyStdin), through [`Session::run`] as any statement runs, so a failure
+    /// fails or rolls back the block it is in. Over the simple protocol the rest of its Query then
+    /// runs, as in PostgreSQL (none after a failure), and the Query's block ends; over the extended
+    /// protocol the round goes on to Sync, so its result is returned alone, its notices left for
+    /// Sync. None when no COPY was waiting.
+    fn copy_end(&self, end: CopyEnd) -> Option<CopyEnded> {
+        let PendingCopy {
+            statements,
+            next,
+            multi,
+            extended,
+            ..
+        } = self.state().copy_in.take()?;
+        let sql = statements[next].as_str();
+        // The connection the COPY's first run asked on: no statement ran since.
+        let conn = {
+            let st = self.state();
+            match &st.branch {
+                Some((_, conn)) => Some(conn.clone()),
+                None => st.trunk.clone(),
+            }
+        };
+        if let Some(conn) = &conn {
+            conn.set_copy_end(Some(end));
+        }
+        let result = self.run(sql, None, None, &Format::UnifiedText);
+        if let Some(conn) = &conn {
+            conn.set_copy_end(None);
+        }
+        // A request a run with its end set cannot make is never left behind.
+        let _ = self.copy_asked();
+        self.after_implicit(sql, result.is_err());
+        if extended {
+            return Some(CopyEnded::Extended(result));
+        }
+        let mut responses = Replies::new();
+        let failed = result.is_err();
+        responses.push(self.with_notices(result.unwrap_or_else(Response::Error)));
+        if failed {
+            if let Err(e) = self.end_implicit() {
+                responses.push(self.with_notices(Response::Error(e)));
+            }
+        } else {
+            self.run_simple(statements, next + 1, multi, &mut responses);
+        }
+        Some(CopyEnded::Simple(responses))
     }
 
     /// Open the implicit transaction block PostgreSQL runs a multi-statement query, or a pipeline
@@ -4308,6 +4533,29 @@ impl SimpleQueryHandler for Session {
         } else {
             self.simple_with_notices(&query.query)
         };
+        self.answer_simple(client, responses).await
+    }
+
+    async fn do_query<C>(&self, _client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
+    where
+        C: ClientInfo + Unpin + Send + Sync,
+    {
+        Ok(self.simple(query))
+    }
+}
+
+impl Session {
+    /// A simple Query's reply from `responses` on ([`SimpleQueryHandler::on_query`], and after a
+    /// COPY FROM STDIN's rows, [`CopyHandler::on_copy_done`]): each result with its notices, then
+    /// ReadyForQuery with the session's real status, in one flush. A COPY FROM STDIN asking for its
+    /// rows ends the reply with its CopyInResponse, flushed, and the connection in COPY's state:
+    /// no ReadyForQuery until the copy ends, as in PostgreSQL.
+    async fn answer_simple<C>(&self, client: &mut C, responses: Replies) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
         let encoding = turso_pg::phase::enter(turso_pg::phase::Phase::Encode);
         let feeding = turso_pg::phase::span(turso_pg::phase::Span::Feed);
         for (notices, response) in responses {
@@ -4379,8 +4627,21 @@ impl SimpleQueryHandler for Session {
                 }
                 // A branch call's reply, encoded by the fast path (inline_one_row).
                 Response::Inline(m) => client.feed(PgWireBackendMessage::Inline(m)).await?,
-                // This server answers COPY FROM a file itself and never streams COPY.
-                Response::CopyIn(_) | Response::CopyOut(_) | Response::CopyBoth(_) => {
+                // COPY FROM STDIN asks for its rows: always the reply's last (run_simple).
+                Response::CopyIn(copy) => {
+                    client
+                        .feed(PgWireBackendMessage::CopyInResponse(CopyInResponse::new(
+                            copy.format,
+                            copy.columns as i16,
+                            copy.column_formats,
+                        )))
+                        .await?;
+                    client.set_state(PgWireConnectionState::CopyInProgress(false));
+                    client.flush().await?;
+                    return Ok(());
+                }
+                // This server streams no COPY TO.
+                Response::CopyOut(_) | Response::CopyBoth(_) => {
                     return Err(PgWireError::UserError(error(
                         SqlErrorKind::FeatureNotSupported,
                         "COPY over the protocol is not supported".to_string(),
@@ -4418,12 +4679,81 @@ impl SimpleQueryHandler for Session {
         client.flush().await?;
         Ok(())
     }
+}
 
-    async fn do_query<C>(&self, _client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
+/// COPY FROM STDIN's rows, read as the client sends them: CopyData appended to the waiting COPY,
+/// CopyDone and CopyFail ending it ([`Session::copy_end`]). pgwire's NoopHandler answered every
+/// CopyData with FATAL 08P01, and its copy loop sent ReadyForQuery Idle whatever the block was.
+#[async_trait]
+impl CopyHandler for Session {
+    async fn on_copy_data<C>(&self, _client: &mut C, copy_data: CopyData) -> PgWireResult<()>
     where
-        C: ClientInfo + Unpin + Send + Sync,
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        Ok(self.simple(query))
+        if let Some(copy) = self.state().copy_in.as_mut() {
+            copy.data.extend_from_slice(&copy_data.data);
+        }
+        Ok(())
+    }
+
+    /// The rows are loaded (or refused) by the COPY's second run. Over the simple protocol the
+    /// reply is the rest of the Query's, with ReadyForQuery (vendored pgwire change 12: pgwire
+    /// sends none after this); over the extended protocol the COPY's CommandComplete, or its error,
+    /// which fails the round to Sync (serve_session).
+    async fn on_copy_done<C>(&self, client: &mut C, _done: CopyDone) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let data = self
+            .state()
+            .copy_in
+            .as_mut()
+            .map(|copy| std::mem::take(&mut copy.data))
+            .unwrap_or_default();
+        match self.copy_end(CopyEnd::Data(data)) {
+            Some(CopyEnded::Simple(responses)) => self.answer_simple(client, responses).await,
+            Some(CopyEnded::Extended(result)) => {
+                client.set_state(PgWireConnectionState::ReadyForQuery);
+                match result {
+                    Ok(Response::Execution(tag)) => {
+                        client
+                            .feed(PgWireBackendMessage::CommandComplete(tag.into()))
+                            .await?;
+                        Ok(())
+                    }
+                    Ok(_) => Err(PgWireError::UserError(error(
+                        SqlErrorKind::InternalError,
+                        "internal error: COPY FROM STDIN completed with rows".to_string(),
+                    ))),
+                    Err(e) => Err(PgWireError::UserError(e)),
+                }
+            }
+            None => {
+                client.set_state(PgWireConnectionState::ReadyForQuery);
+                Ok(())
+            }
+        }
+    }
+
+    /// CopyFail: the COPY fails with PostgreSQL's 57014 "COPY from stdin failed: <message>", its
+    /// block failed or rolled back as for any failed statement; the error goes out through
+    /// serve_session's error path, with ReadyForQuery's status set here from the session.
+    async fn on_copy_fail<C>(&self, client: &mut C, fail: CopyFail) -> PgWireError
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let failed = self.copy_failed(
+            SqlErrorKind::QueryCanceled,
+            format!("COPY from stdin failed: {}", fail.message),
+        );
+        client.set_transaction_status(self.transaction_status());
+        PgWireError::UserError(failed)
     }
 }
 
@@ -4755,8 +5085,29 @@ impl ExtendedQueryHandler for Session {
                             "internal error: an inline reply reached an Execute".to_string(),
                         )));
                     }
-                    // This server answers COPY FROM a file itself and never streams COPY.
-                    Response::CopyIn(_) | Response::CopyOut(_) | Response::CopyBoth(_) => {
+                    // COPY FROM STDIN asks for its rows (do_query): CopyInResponse, flushed, as the
+                    // client sends nothing more until it has it (libpq's Sync after Execute
+                    // arrives during COPY and is ignored, as PostgreSQL ignores it). The portal
+                    // ran; its end is the COPY's (on_copy_done), the round's at Sync.
+                    Response::CopyIn(copy) => {
+                        self.portal_done(name);
+                        client
+                            .feed(PgWireBackendMessage::CopyInResponse(CopyInResponse::new(
+                                copy.format,
+                                copy.columns as i16,
+                                copy.column_formats,
+                            )))
+                            .await?;
+                        if name == DEFAULT_NAME {
+                            client.portal_store().rm_portal(name);
+                        }
+                        self.state().held_portals.remove(name);
+                        client.set_state(PgWireConnectionState::CopyInProgress(true));
+                        client.flush().await?;
+                        return Ok(());
+                    }
+                    // This server streams no COPY TO.
+                    Response::CopyOut(_) | Response::CopyBoth(_) => {
                         return Err(PgWireError::UserError(error(
                             SqlErrorKind::FeatureNotSupported,
                             "COPY over the protocol is not supported".to_string(),
@@ -4851,6 +5202,17 @@ impl ExtendedQueryHandler for Session {
             .begin_implicit(sql, call.as_ref(), true)
             .and_then(|()| self.run(sql, call, Some(portal), &portal.result_column_format));
         self.after_implicit(sql, result.is_err());
+        // A COPY FROM STDIN that asks for its rows: on_execute answers CopyInResponse.
+        if let (Ok(_), Some(columns)) = (&result, self.copy_asked()) {
+            self.state().copy_in = Some(PendingCopy {
+                statements: vec![sql.clone()],
+                next: 0,
+                multi: false,
+                data: Vec::new(),
+                extended: true,
+            });
+            return Ok(copy_in_response(columns));
+        }
         result.map_err(PgWireError::UserError)
     }
 

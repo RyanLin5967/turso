@@ -67,5 +67,6 @@ pub fn sqlstate(kind: SqlErrorKind) -> &'static str {
         SuccessfulCompletion => "00000",
         StringDataRightTruncation => "22001",
         InvalidDatetimeFormat => "22007",
+        BadCopyFileFormat => "22P04",
     }
 }

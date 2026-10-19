@@ -16,7 +16,7 @@ use tokio_util::codec::{Decoder, Encoder, Framed, FramedParts};
 use crate::api::auth::StartupHandler;
 use crate::api::cancel::CancelHandler;
 use crate::api::copy::CopyHandler;
-use crate::api::query::{send_ready_for_query, ExtendedQueryHandler, SimpleQueryHandler};
+use crate::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
 use crate::api::{
     ClientInfo, ClientPortalStore, DefaultClient, ErrorHandler, PgWireConnectionState,
     PgWireServerHandlers,
@@ -213,30 +213,18 @@ where
                     copy_handler.on_copy_data(socket, copy_data).await?;
                 }
                 PgWireFrontendMessage::CopyDone(copy_done) => {
+                    // Vendored change 12: the handler answers the end of the copy (the rest of a
+                    // simple Query and its ReadyForQuery, with the session's real status) and
+                    // sets the state; upstream sent ReadyForQuery Idle here whatever the block.
                     let result = copy_handler.on_copy_done(socket, copy_done).await;
-                    if !is_extended_query {
+                    if result.is_err() && !is_extended_query {
                         // If the copy was initiated from a simple protocol
                         // query, we should leave the CopyInProgress state
                         // before returning the error in order to resume normal
                         // operation after handling it in process_error.
                         socket.set_state(PgWireConnectionState::ReadyForQuery);
                     }
-                    match result {
-                        Ok(_) => {
-                            if !is_extended_query {
-                                // If the copy was initiated from a simple protocol
-                                // query, notify the client that we are not ready
-                                // for the next query.
-                                send_ready_for_query(socket, TransactionStatus::Idle).await?
-                            } else {
-                                // In the extended protocol (at least as
-                                // implemented by rust-postgres) we get a Sync
-                                // after the CopyDone, so we should let the
-                                // on_sync handler send the ReadyForQuery.
-                            }
-                        }
-                        err => return err,
-                    }
+                    return result;
                 }
                 PgWireFrontendMessage::CopyFail(copy_fail) => {
                     let error = copy_handler.on_copy_fail(socket, copy_fail).await;

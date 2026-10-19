@@ -13196,7 +13196,6 @@ replays_postgresql!(
     "pg18-audit3-copy_from_runs_inside_the_block_it_is_in.out",
     [
         (1, "PGDIV-SCHEMA-REFUSED cluster-state [cluster]: DROP SCHEMA IF EXISTS s; DROP SCHEMA public: ours refuses the whole query 0A000"),
-        (15, "PGDIV-COPY-INPUT-CODE error-code [wire]: COPY of a non-integer into INT: PG 22P02 invalid input syntax for type integer: \"not-a-number\"; ours 23000 'cannot store TEXT value in INTEGER column cp.id (19)'"),
     ]
 );
 replays_postgresql!(

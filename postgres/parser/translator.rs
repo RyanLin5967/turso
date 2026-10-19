@@ -6829,6 +6829,20 @@ pub struct PgCopyFromStmt {
 /// Try to extract a COPY FROM file statement from pg_query parse output.
 /// Returns None if the statement is not a COPY FROM with a filename.
 pub fn try_extract_copy_from(parse_result: &ParseResult) -> Option<PgCopyFromStmt> {
+    try_extract_copy_from_any(parse_result).and_then(|(stmt, stdin)| (!stdin).then_some(stmt))
+}
+
+/// Try to extract a COPY FROM STDIN statement, whose rows the client sends over the protocol
+/// (CopyData up to CopyDone), from pg_query parse output: the same table, columns and options as
+/// COPY FROM a file reads ([`try_extract_copy_from`]), its `filename` empty. None for any other
+/// statement (a file, PROGRAM, COPY TO).
+pub fn try_extract_copy_from_stdin(parse_result: &ParseResult) -> Option<PgCopyFromStmt> {
+    try_extract_copy_from_any(parse_result).and_then(|(stmt, stdin)| stdin.then_some(stmt))
+}
+
+/// COPY FROM a file or FROM STDIN (true), in one walk of the parse: one reader of the table,
+/// columns and options for both. None for any other statement (PROGRAM, COPY TO).
+pub fn try_extract_copy_from_any(parse_result: &ParseResult) -> Option<(PgCopyFromStmt, bool)> {
     use pg_query::NodeRef;
 
     let nodes = parse_result.protobuf.nodes();
@@ -6839,10 +6853,12 @@ pub fn try_extract_copy_from(parse_result: &ParseResult) -> Option<PgCopyFromStm
         return None;
     };
 
-    // Only handle COPY FROM with a file path (not STDIN, not COPY TO)
-    if !copy.is_from || copy.filename.is_empty() || copy.is_program {
+    // COPY FROM a file path or STDIN (not PROGRAM, not COPY TO). pg_query leaves the filename
+    // empty for STDIN.
+    if !copy.is_from || copy.is_program {
         return None;
     }
+    let stdin = copy.filename.is_empty();
 
     let relation = copy.relation.as_ref()?;
     let table_name = relation.relname.clone();
@@ -6945,17 +6961,20 @@ pub fn try_extract_copy_from(parse_result: &ParseResult) -> Option<PgCopyFromStm
         }
     }
 
-    Some(PgCopyFromStmt {
-        has_where: copy.where_clause.is_some(),
-        refused,
-        table_name,
-        schema_name,
-        columns,
-        filename: copy.filename.clone(),
-        delimiter,
-        header,
-        null_string,
-    })
+    Some((
+        PgCopyFromStmt {
+            has_where: copy.where_clause.is_some(),
+            refused,
+            table_name,
+            schema_name,
+            columns,
+            filename: copy.filename.clone(),
+            delimiter,
+            header,
+            null_string,
+        },
+        stdin,
+    ))
 }
 
 /// Parse a SQL referential action string to an AST RefAct.
