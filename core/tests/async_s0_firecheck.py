@@ -17,6 +17,7 @@ A VOID arm on either side is no kill. Exit 0 only if every registered fire-check
 otherwise; exit 2 if nothing could be read at all (a run that read nothing has not passed).
 
 usage: python3 core/tests/async_s0_firecheck.py OUTDIR   (from the repo root, release builds)
+       python3 core/tests/async_s0_firecheck.py --self-test   (the RUNS parse, fired both ways)
 """
 import hashlib
 import json
@@ -31,8 +32,44 @@ FLUSH = re.compile(r"\b(fsync|fdatasync)\(|\bfcntl\(\d+<[^>]*>, F_FULLFSYNC")
 WRITE = re.compile(r"\b(pwrite64|write|writev|pwritev2?)\((\d+)<([^>]*)>")
 MARK = re.compile(r'AD-T5 WINDOW (OPEN|CLOSE) arm=(\S+)(?: run=(\d+))?')
 READING = re.compile(r"^AD-T5 READING (.*)$")
-# async_s0.rs RUNS: the registered runs per arm.
-RUNS = 5
+RUNS_DECL = re.compile(r"^const RUNS: usize = (\d+);$", re.M)
+
+
+def registered_runs(source):
+    """async_s0.rs's RUNS, the registered runs per arm, read from the source the binaries are built
+    from (engine-2bdcd32c6 LOW 7: a hand copy here could drift from it). Refused (exit 2) unless
+    the source declares it exactly once."""
+    with open(source) as f:
+        found = RUNS_DECL.findall(f.read())
+    if len(found) != 1:
+        sys.exit(f"REFUSED: {source} declares `const RUNS: usize` {len(found)} times, not once")
+    return int(found[0])
+
+
+def self_test():
+    """The parse fired both ways: a planted RUNS = 7 reads 7; no declaration, or two, is refused."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "async_s0.rs")
+        for text, want in [
+            ("const N_LIVE: u64 = 10_000;\nconst RUNS: usize = 7;\nconst MAX_LIVE_RUNS: usize = 20;\n", 7),
+            ("const MAX_LIVE_RUNS: usize = 20;\n", "refused"),
+            ("const RUNS: usize = 5;\nconst RUNS: usize = 6;\n", "refused"),
+        ]:
+            with open(path, "w") as f:
+                f.write(text)
+            try:
+                got = registered_runs(path)
+            except SystemExit:
+                got = "refused"
+            if got != want:
+                sys.exit(f"SELF-TEST FAILED: {text!r} read {got!r}, want {want!r}")
+    print(f"self-test ok; {SOURCE} declares RUNS = {registered_runs(SOURCE)}")
+
+
+SOURCE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "async_s0.rs")
+# The registered runs per arm: set by main from SOURCE, never typed here.
+RUNS = None
 
 
 def build(features):
@@ -108,8 +145,14 @@ def run(binary, mutant, outdir, label):
 
 
 def main():
+    global RUNS
+    if sys.argv[1:] == ["--self-test"]:
+        self_test()
+        return
     if len(sys.argv) != 2:
         sys.exit(__doc__)
+    RUNS = registered_runs(SOURCE)
+    print(f"registered runs per arm (async_s0.rs RUNS): {RUNS}")
     outdir = sys.argv[1]
     os.makedirs(outdir, exist_ok=True)
     reading_bin = build(None)
