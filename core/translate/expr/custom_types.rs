@@ -1251,6 +1251,34 @@ mod tests {
         );
     }
 
+    /// fastest-wire c15466936 (wirefuzz against PostgreSQL 18.6): a value too long for varchar(n) is
+    /// refused as a classified string-data-right-truncation error in PostgreSQL's words ("value too
+    /// long for type character varying(5)"; 22001 on the wire), not as a RAISE whose message the wire
+    /// would have to read; and an UPDATE assigning such a constant is refused even when no row matches,
+    /// since PostgreSQL coerces the constant to the column's type when it plans the statement. A value
+    /// that fits is the control. At the base the INSERT raises 'value too long for varchar' and the
+    /// UPDATE answers 0 rows: red by its claim.
+    #[test]
+    fn a_value_too_long_for_varchar_is_a_truncation_error_even_when_no_row_matches() {
+        let conn = open();
+        conn.execute("CREATE TABLE vc(id INTEGER PRIMARY KEY, v varchar(5)) STRICT")
+            .unwrap();
+        conn.execute("INSERT INTO vc VALUES (2, 'abcde')").unwrap();
+        let mut wrong = Vec::new();
+        for sql in ["INSERT INTO vc VALUES (1, 'abcdef')", "UPDATE vc SET v = 'abcdef' WHERE id = 1"] {
+            match conn.execute(sql) {
+                Err(e)
+                    if format!("{e:?}").starts_with("StringDataRightTruncation(")
+                        && e.to_string() == "value too long for type character varying(5)" => {}
+                other => wrong.push(format!("{sql}: {other:?}")),
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "CLAIM: each is refused as StringDataRightTruncation, in PostgreSQL's words: {wrong:#?}"
+        );
+    }
+
     /// Engine review 20 item 9: 1d8bf442e's catch region covered only types with a function '=', so
     /// a built-in with a RAISE in its ENCODE, a bare '<' and no '=' (varchar(n), smallint, the
     /// date/time types) still raised through an indexed equality: `v = 'abcdef'` on varchar(3)

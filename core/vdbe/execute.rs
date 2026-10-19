@@ -1,4 +1,5 @@
 use crate::error::{SqlErrorKind, SqlErrorMessage};
+use crate::connection::{EngineSql, Origin};
 use crate::alloc::{
     DynAllocator, TryClone, TursoAllocExt, TursoIteratorExt, TursoSliceExt,
     TursoTryWithCapacityExt, TursoVecExt,
@@ -30,7 +31,7 @@ use crate::types::{
     IOCompletions, IOResult, ImmutableRecord, IndexInfo, SeekResult, Text, ValueIterator,
 };
 use crate::util::{
-    escape_sql_string_literal, normalize_ident, rename_identifiers,
+    escape_sql_string_literal, normalize_ident, quote_identifier, rename_identifiers,
     rename_identifiers_scoped_when_clause, rewrite_check_expr_table_refs,
     rewrite_column_level_fk_parent_columns_if_needed, rewrite_column_references_if_needed,
     rewrite_fk_parent_cols_if_self_ref, rewrite_fk_parent_table_if_needed,
@@ -512,6 +513,7 @@ pub fn op_drop_index(
     load_insn!(DropIndex { index, db }, insn);
     let conn = program.connection.clone();
     let is_mvcc = conn.mv_store_for_db(*db).is_some();
+    state.note_schema_change(&conn, *db);
     conn.with_database_schema_mut(*db, |schema| {
         // In MVCC mode, track dropped index root pages so integrity_check knows about them.
         // The btree pages won't be freed until checkpoint, so integrity_check needs to
@@ -1688,15 +1690,14 @@ pub fn op_vdestroy(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(VDestroy { db: _, table_name }, insn);
     let conn = program.connection.clone();
-    {
-        let Some(vtab) = conn.syms.write().vtabs.remove(table_name) else {
-            mark_unlikely();
-            return Err(crate::LimboError::InternalError(
-                "Could not find Virtual Table to Destroy".to_string(),
-            ));
-        };
-        vtab.destroy()?;
-    }
+    // Destroyed when the transaction commits without it (`Connection::defer_vtab_destroy`).
+    let Some(vtab) = conn.syms.read().vtabs.get(table_name).cloned() else {
+        mark_unlikely();
+        return Err(crate::LimboError::InternalError(
+            "Could not find Virtual Table to Destroy".to_string(),
+        ));
+    };
+    conn.defer_vtab_destroy(vtab);
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -4996,6 +4997,7 @@ pub fn op_auto_commit(
             if !*rollback {
                 conn.index_methods_on_transaction_committed();
             }
+            conn.end_capture_at_begin(false);
             conn.clear_tx_poison();
             conn.clear_named_savepoints();
         }
@@ -5056,6 +5058,7 @@ pub fn op_auto_commit(
                 }
                 conn.rollback_attached_wal_txns();
                 conn.rollback_temp_schema();
+                conn.end_capture_at_begin(true);
                 conn.index_methods_on_transaction_rolled_back();
                 conn.set_tx_state(TransactionState::None);
                 conn.auto_commit.store(true, Ordering::SeqCst);
@@ -5075,6 +5078,8 @@ pub fn op_auto_commit(
                 }
                 // Pre-check deferred FKs; leave tx open and do NOT clear violations
                 check_deferred_fk_on_commit(&conn)?;
+                // The capture setting from BEGIN is dropped only once the COMMIT succeeds (below):
+                // a COMMIT refused with Busy reopens the transaction, and its ROLLBACK restores it.
                 conn.auto_commit.store(true, Ordering::SeqCst);
                 state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
             }
@@ -5084,6 +5089,7 @@ pub fn op_auto_commit(
                     "rollback-only marker leaked outside an explicit transaction"
                 );
                 conn.auto_commit.store(false, Ordering::SeqCst);
+                conn.remember_capture_at_begin();
                 return Ok(InsnFunctionStepResult::Done);
             }
         }
@@ -5131,6 +5137,8 @@ pub fn op_auto_commit(
         }
         Err(err) => return Err(err),
     };
+    // After a ROLLBACK the setting was already restored and taken; after a COMMIT it stands.
+    conn.end_capture_at_begin(false);
 
     if mv_store.is_none() {
         pager.clear_savepoints()?;
@@ -5254,6 +5262,7 @@ pub fn op_savepoint(
                         main_schema_snapshot,
                         temp_schema_snapshot,
                         staged_schema_snapshot,
+                        capture_data_changes: (*conn.get_capture_data_changes_info()).clone(),
                     };
                     // Mirror onto attached/temp pagers. If any pager fails
                     // mid-flight, earlier ones already opened a savepoint
@@ -5292,6 +5301,7 @@ pub fn op_savepoint(
                             "rollback-only marker leaked outside an explicit transaction"
                         );
                         conn.auto_commit.store(false, Ordering::SeqCst);
+                        conn.remember_capture_at_begin();
                     }
 
                     state.pc += 1;
@@ -5377,15 +5387,7 @@ pub fn op_savepoint(
             // consistent across tables / indexes / sequences without any
             // I/O.
             if let Some(info) = frame_info {
-                *conn.schema.write() = info.main_schema_snapshot;
-                if let Some(temp_db) = conn.temp.database.read().as_ref() {
-                    match info.temp_schema_snapshot {
-                        Some(snap) => *temp_db.db.schema.lock() = snap,
-                        None => *temp_db.db.schema.lock() = conn.empty_temp_schema(),
-                    }
-                }
-                *conn.database_schemas().write() = info.staged_schema_snapshot;
-                conn.bump_prepare_context_generation();
+                conn.restore_schema_snapshot(info);
             }
 
             // Invalidate cached schema cookies on ALL pagers whose pages may
@@ -5614,6 +5616,10 @@ pub fn op_program(
                             0,
                             crate::statement::StatementOrigin::Subprogram,
                             false,
+                            // A subprogram never re-prepares (statement.rs asserts it) and writes no
+                            // schema row of its own, so its kind is read by nothing (dialect
+                            // adversary-2 Q2); engine text, not the parent's, until a reader needs it.
+                            crate::connection::SqlKind::engine(),
                         ))
                     };
 
@@ -10581,6 +10587,36 @@ pub fn op_function(
                 };
                 state.registers[*dest].set_value(result);
             }
+            ScalarFunc::VarcharEncode => {
+                // varchar(n) (fastest-wire c15466936): the value unchanged when its length, as
+                // length() counts it, is at most n; else PostgreSQL's string_data_right_truncation.
+                // As the CASE it replaces, an n or a length that is NULL refuses too.
+                check_arg_count!(arg_count, 2);
+                let val = state.registers[*start_reg].get_value().clone();
+                let maxlen = state.registers[*start_reg + 1].get_value().clone();
+                let fits = match (&val, &maxlen) {
+                    (Value::Null, _) => true,
+                    (_, Value::Numeric(Numeric::Integer(n))) => {
+                        let len = match &val {
+                            Value::Text(t) => t.as_str().chars().count() as i64,
+                            Value::Blob(b) => b.len() as i64,
+                            other => other.to_string().chars().count() as i64,
+                        };
+                        len <= *n
+                    }
+                    _ => false,
+                };
+                if !fits {
+                    let n = match &maxlen {
+                        Value::Numeric(Numeric::Integer(n)) => n.to_string(),
+                        other => other.to_string(),
+                    };
+                    return Err(LimboError::StringDataRightTruncation(format!(
+                        "value too long for type character varying({n})"
+                    )));
+                }
+                state.registers[*dest].set_value(val);
+            }
             ScalarFunc::NumericEncode => {
                 check_arg_count!(arg_count, 3);
                 let val = &state.registers[*start_reg];
@@ -11176,10 +11212,12 @@ pub fn op_function(
                                         },
                                     };
                                     Some(
-                                        program
-                                            .connection
-                                            .dialect()
-                                            .format_rewritten_table_sql(&new_stmt)?,
+                                        {
+                                            // The row stays in the form it was in (REVISION 2 item 8).
+                                            let dialect = program.connection.dialect();
+                                            let owned = dialect.owns_stored_table_sql(sql.as_str());
+                                            dialect.format_changed_table_sql(owned, crate::dialect::TableChange::Rewritten(&new_stmt))?
+                                        },
                                     )
                                 } else {
                                     // Other tables: only emit if we actually changed their FK targets.
@@ -11197,10 +11235,12 @@ pub fn op_function(
                                         },
                                     };
                                     Some(
-                                        program
-                                            .connection
-                                            .dialect()
-                                            .format_rewritten_table_sql(&new_stmt)?,
+                                        {
+                                            // The row stays in the form it was in (REVISION 2 item 8).
+                                            let dialect = program.connection.dialect();
+                                            let owned = dialect.owns_stored_table_sql(sql.as_str());
+                                            dialect.format_changed_table_sql(owned, crate::dialect::TableChange::Rewritten(&new_stmt))?
+                                        },
                                     )
                                 }
                             }
@@ -11292,6 +11332,93 @@ pub fn op_function(
                     };
 
                     (new_name, new_tbl_name, new_sql)
+                }
+                AlterTableFunc::AddColumn | AlterTableFunc::DropColumn => {
+                    // ADD/DROP COLUMN (engine-rev-qaf-fix HIGH-2/3/4, MED-1): the table's own stored
+                    // CREATE statement, parsed, one column appended (its definition as written) or
+                    // removed, and printed as RENAME and ALTER COLUMN print theirs, so every clause the
+                    // stored text holds (a DESC key, a COLLATE or conflict clause on a constraint, a
+                    // type such as `[x,y]`) survives. The schema model's `to_sql` dropped them. Every
+                    // other row stays as it is.
+                    let table = match &state.registers[*start_reg + 5].get_value() {
+                        Value::Text(t) => normalize_ident(t.as_str()),
+                        _ => panic!("table parameter should be TEXT"),
+                    };
+                    let dropped = match &state.registers[*start_reg + 6].get_value() {
+                        Value::Text(c) => normalize_ident(c.as_str()),
+                        _ => panic!("column parameter should be TEXT"),
+                    };
+                    let definition = match &state.registers[*start_reg + 7].get_value() {
+                        Value::Text(d) => d.as_str().to_string(),
+                        _ => panic!("definition parameter should be TEXT"),
+                    };
+                    let new_sql = 'sql: {
+                        let Value::Text(sql) = sql else {
+                            break 'sql None;
+                        };
+                        if entry_type.as_str() != "table" || normalize_ident(&name) != table {
+                            break 'sql None;
+                        }
+                        let cmd = parse_schema_sql_for_alter(
+                            program.connection.dialect().as_ref(),
+                            entry_type.as_str(),
+                            *root_page,
+                            sql.as_str(),
+                        )?;
+                        let Some(ast::Cmd::Stmt(ast::Stmt::CreateTable {
+                            tbl_name: stored_name,
+                            body,
+                            temporary,
+                            if_not_exists,
+                        })) = cmd
+                        else {
+                            break 'sql None;
+                        };
+                        let ast::CreateTableBody::ColumnsAndConstraints {
+                            mut columns,
+                            constraints,
+                            options,
+                        } = body
+                        else {
+                            return Err(LimboError::InternalError(
+                                "CREATE TABLE AS SELECT schemas cannot be altered".to_string(),
+                            ));
+                        };
+                        match alter_func {
+                            AlterTableFunc::AddColumn => {
+                                let column = Parser::new(definition.as_bytes()).parse_column_definition(true)?;
+                                let added = normalize_ident(column.col_name.as_str());
+                                if columns.iter().any(|c| normalize_ident(c.col_name.as_str()) == added) {
+                                    // An already-rewritten image (MVCC or temp-schema replays): as is.
+                                    break 'sql None;
+                                }
+                                columns.push(column);
+                            }
+                            _ => {
+                                let before = columns.len();
+                                columns.retain(|c| normalize_ident(c.col_name.as_str()) != dropped);
+                                if columns.len() == before {
+                                    // An already-rewritten image (MVCC or temp-schema replays): as is.
+                                    break 'sql None;
+                                }
+                            }
+                        }
+                        let new_stmt = ast::Stmt::CreateTable {
+                            tbl_name: stored_name,
+                            body: ast::CreateTableBody::ColumnsAndConstraints {
+                                columns,
+                                constraints,
+                                options,
+                            },
+                            temporary,
+                            if_not_exists,
+                        };
+                        // The row stays in the form it was in (REVISION 2 item 8).
+                        let dialect = program.connection.dialect();
+                        let owned = dialect.owns_stored_table_sql(sql.as_str());
+                        Some(dialect.format_changed_table_sql(owned, crate::dialect::TableChange::Rewritten(&new_stmt))?)
+                    };
+                    (name, tbl_name, new_sql)
                 }
                 AlterTableFunc::AlterColumn | AlterTableFunc::RenameColumn => {
                     let table = {
@@ -11569,10 +11696,12 @@ pub fn op_function(
                                     if_not_exists,
                                 };
                                 Some(
-                                    program
-                                        .connection
-                                        .dialect()
-                                        .format_rewritten_table_sql(&new_stmt)?,
+                                    {
+                                        // The row stays in the form it was in (REVISION 2 item 8).
+                                        let dialect = program.connection.dialect();
+                                        let owned = dialect.owns_stored_table_sql(sql.as_str());
+                                        dialect.format_changed_table_sql(owned, crate::dialect::TableChange::Rewritten(&new_stmt))?
+                                    },
                                 )
                             }
                             // Trigger SQL is rewritten by separate UPDATE statements
@@ -13729,6 +13858,7 @@ pub fn op_drop_table(
     let conn = program.connection.clone();
     let is_mvcc = conn.mv_store_for_db(*db).is_some();
     {
+        state.note_schema_change(&conn, *db);
         conn.with_database_schema_mut(*db, |schema| {
             // In MVCC mode, track dropped root pages so integrity_check knows about them.
             // The btree pages won't be freed until checkpoint, so integrity_check needs
@@ -13764,6 +13894,7 @@ pub fn op_drop_table(
         // also nuke temp triggers that target `temp.t` or `aux.t`.
         if *db != crate::TEMP_DB_ID && conn.temp.database.read().is_some() {
             let dropped_db = *db;
+            state.note_schema_change(&conn, crate::TEMP_DB_ID);
             conn.with_database_schema_mut(crate::TEMP_DB_ID, |temp_schema| {
                 temp_schema.remove_triggers_for_table_with_db(table_name, dropped_db);
             })?;
@@ -13781,6 +13912,7 @@ pub fn op_drop_view(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(DropView { db, view_name }, insn);
     let conn = program.connection.clone();
+    state.note_schema_change(&conn, *db);
     conn.with_database_schema_mut(*db, |schema| {
         schema.remove_view(view_name).ok();
         schema.broken_views.remove(view_name);
@@ -13797,6 +13929,7 @@ pub fn op_drop_type(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(DropType { db, type_name }, insn);
     let conn = program.connection.clone();
+    state.note_schema_change(&conn, *db);
     conn.with_database_schema_mut(*db, |schema| {
         schema.remove_type(type_name);
     })?;
@@ -13829,6 +13962,7 @@ pub fn op_add_sequence(
         *cycle,
     )?;
     let conn = program.connection.clone();
+    state.note_schema_change(&conn, *db);
     conn.with_database_schema_mut(*db, |schema| {
         schema
             .sequences
@@ -13846,6 +13980,7 @@ pub fn op_drop_sequence(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(DropSequence { db, seq_name }, insn);
     let conn = program.connection.clone();
+    state.note_schema_change(&conn, *db);
     conn.with_database_schema_mut(*db, |schema| {
         schema.remove_sequence(seq_name);
     })?;
@@ -13868,6 +14003,7 @@ pub fn op_add_type(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(AddType { db, sql }, insn);
     let conn = program.connection.clone();
+    state.note_schema_change(&conn, *db);
     conn.with_database_schema_mut(*db, |schema| schema.add_type_from_sql(sql))??;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -14480,6 +14616,7 @@ pub fn op_drop_trigger(
     load_insn!(DropTrigger { db, trigger_name }, insn);
 
     let conn = program.connection.clone();
+    state.note_schema_change(&conn, *db);
     conn.with_database_schema_mut(*db, |schema| {
         schema.remove_trigger(trigger_name).ok();
     })?;
@@ -14620,7 +14757,8 @@ pub fn op_parse_schema(
         let db_name = conn
             .get_database_name_by_index(*db)
             .unwrap_or_else(|| "main".to_string());
-        format!("{db_name}.sqlite_schema")
+        // Quoted (wire: ONE QUOTING FUNCTION class): a database named `s"x` broke this text.
+        format!("{}.sqlite_schema", quote_identifier(&db_name))
     } else {
         SCHEMA_TABLE_NAME.to_string()
     };
@@ -14629,7 +14767,7 @@ pub fn op_parse_schema(
     } else {
         format!("SELECT * FROM {schema_table}")
     };
-    let mut stmt = conn.prepare_internal(sql)?;
+    let mut stmt = conn.prepare_engine(EngineSql::new(sql), Origin::Nested)?;
     // ParseSchema runs as a nested helper statement inside the parent schema
     // mutation. It only reads sqlite_schema, so a statement subtransaction is
     // unnecessary and can contend with the parent's subjournal on temp/attached
@@ -14785,8 +14923,10 @@ fn op_parse_schema_step(
                     materialized_view_info,
                     dbsp_state_roots,
                     dbsp_state_index_roots,
+                    &conn.dialect(),
                 );
 
+                state.note_schema_change(conn, db);
                 // Store the modified schema back
                 if db == crate::TEMP_DB_ID {
                     // TEMP: write directly to `temp_db.db.schema` — the single
@@ -14876,13 +15016,17 @@ pub struct OpInitCdcVersionInner {
     phase: OpInitCdcVersionPhase,
     stmt: crate::Statement,
     cdc_table_exists: bool,
+    /// The capture table's name as sqlite_schema stores it, when it exists (found in any case):
+    /// the version table is keyed by it, so a switch naming it in another case reads its row
+    /// (engine-rev-qaf-fix HIGH-1).
+    stored_name: Option<String>,
     actual_version: Option<CdcVersion>,
 }
 
 pub type OpInitCdcVersionState = Option<Box<OpInitCdcVersionInner>>;
 
 fn prepare_cdc_internal(conn: &Arc<Connection>, sql: String) -> Result<crate::Statement> {
-    let stmt = conn.prepare_internal(sql)?;
+    let stmt = conn.prepare_engine(EngineSql::new(sql), Origin::Nested)?;
     stmt.program
         .prepared
         .needs_stmt_subtransactions
@@ -14918,26 +15062,36 @@ pub fn op_init_cdc_version(
             return Ok(InsnFunctionStepResult::Step);
         }
 
-        // If CDC is already enabled, re-parse with current version and exit
+        // If CDC is already enabled INTO THIS TABLE, re-parse with current version and exit
         // early. Idempotent; avoids CDC capturing its own table creation when
-        // the pragma is called multiple times.
+        // the pragma is called multiple times. A switch to another table goes on to create it
+        // (the early exit ignored the name: `'full,c2'` while capturing into c1 left the
+        // connection capturing into a c2 that never existed, so every write failed).
         if let Some(info) = conn.get_capture_data_changes_info().as_ref() {
-            let opts = CaptureDataChangesInfo::parse(cdc_mode, info.version)?;
-            state.pending_cdc_info = Some(opts);
-            state.pc += 1;
-            return Ok(InsnFunctionStepResult::Step);
+            if info.table == cdc_table_name.as_str() {
+                let opts = CaptureDataChangesInfo::parse(cdc_mode, info.version)?;
+                state.pending_cdc_info = Some(opts);
+                state.pc += 1;
+                return Ok(InsnFunctionStepResult::Step);
+            }
         }
 
+        // The tables are created by NESTED statements, whose schema notes are their own: this
+        // statement keeps the snapshot its rollback restores (adversary of 5650219c0, HIGH 1).
+        state.note_schema_change(&conn, crate::MAIN_DB_ID);
         let stmt = prepare_cdc_internal(
             &conn,
             format!(
-                "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='{escaped_cdc_table_name}'",
+                // COLLATE NOCASE: names match in any case (QUOTE-SWEEP F7: 'full,MyCdc' missed a legacy
+                // table mycdc and recorded the current version over its v1 layout).
+                "SELECT name FROM sqlite_schema WHERE type='table' AND name='{escaped_cdc_table_name}' COLLATE NOCASE",
             ),
         )?;
         *state.active_op_state.init_cdc_version() = Some(Box::new(OpInitCdcVersionInner {
             phase: OpInitCdcVersionPhase::CheckTable,
             stmt,
             cdc_table_exists: false,
+            stored_name: None,
             actual_version: None,
         }));
     }
@@ -14948,7 +15102,6 @@ pub fn op_init_cdc_version(
         version,
         cdc_mode,
         cdc_table_name,
-        &escaped_cdc_table_name,
     );
     // Any error tears down the parked state machine so a subsequent step on the
     // same ProgramState (without an explicit reset) starts fresh instead of
@@ -14965,7 +15118,6 @@ fn drive_init_cdc_version(
     version: &CdcVersion,
     cdc_mode: &str,
     cdc_table_name: &str,
-    escaped_cdc_table_name: &str,
 ) -> Result<InsnFunctionStepResult> {
     loop {
         let inner = state.active_op_state.init_cdc_version().as_mut().unwrap();
@@ -14981,6 +15133,10 @@ fn drive_init_cdc_version(
                 OpInitCdcVersionPhase::CheckTable => {
                     // Any row means the table exists; keep stepping until Done.
                     inner.cdc_table_exists = true;
+                    let row = inner.stmt.row().expect("row should be present");
+                    if let crate::Value::Text(text) = row.get::<&crate::Value>(0)? {
+                        inner.stored_name = Some(text.to_string());
+                    }
                 }
                 OpInitCdcVersionPhase::ReadVersion => {
                     let row = inner.stmt.row().expect("row should be present");
@@ -14995,12 +15151,14 @@ fn drive_init_cdc_version(
             },
             StepResult::Done => match inner.phase {
                 OpInitCdcVersionPhase::CheckTable => {
+                    // Quoted (wire: ONE QUOTING FUNCTION class): a capture table named `my cdc` broke this.
+                    let quoted_cdc = quote_identifier(cdc_table_name);
                     let create_sql = match version {
                         CdcVersion::V1 => format!(
-                            "CREATE TABLE IF NOT EXISTS {cdc_table_name} (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)",
+                            "CREATE TABLE IF NOT EXISTS {quoted_cdc} (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)",
                         ),
                         CdcVersion::V2 => format!(
-                            "CREATE TABLE IF NOT EXISTS {cdc_table_name} (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_txn_id INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)",
+                            "CREATE TABLE IF NOT EXISTS {quoted_cdc} (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_txn_id INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)",
                         ),
                     };
                     inner.stmt = prepare_cdc_internal(conn, create_sql)?;
@@ -15016,27 +15174,32 @@ fn drive_init_cdc_version(
                     inner.phase = OpInitCdcVersionPhase::CreateVersionTable;
                 }
                 OpInitCdcVersionPhase::CreateVersionTable => {
-                    // If the CDC table pre-existed without a version row, it's
-                    // a legacy v1 table — pin to V1 regardless of the requested
-                    // version.
+                    // If the CDC table pre-existed without a version row (in any case), it's a
+                    // legacy v1 table — pin to V1 regardless of the requested version. Keyed by the
+                    // name sqlite_schema stores, and inserted only when no row names the table in
+                    // any case: a switch naming an engine-made c1 as C1 pinned V1 under 'C1' and
+                    // wrote v1 rows into a v2 table (engine-rev-qaf-fix HIGH-1).
                     let version_to_insert = if inner.cdc_table_exists {
                         CdcVersion::V1
                     } else {
                         *version
                     };
+                    let key = escape_sql_string_literal(inner.stored_name.as_deref().unwrap_or(cdc_table_name));
                     inner.stmt = prepare_cdc_internal(
                         conn,
                         format!(
-                            "INSERT OR IGNORE INTO {TURSO_CDC_VERSION_TABLE_NAME} (table_name, version) VALUES ('{escaped_cdc_table_name}', '{version_to_insert}')",
+                            "INSERT OR IGNORE INTO {TURSO_CDC_VERSION_TABLE_NAME} (table_name, version) SELECT '{key}', '{version_to_insert}' WHERE NOT EXISTS (SELECT 1 FROM {TURSO_CDC_VERSION_TABLE_NAME} WHERE table_name = '{key}' COLLATE NOCASE)",
                         ),
                     )?;
                     inner.phase = OpInitCdcVersionPhase::InsertVersion;
                 }
                 OpInitCdcVersionPhase::InsertVersion => {
+                    // The row naming the table as stored, else one naming it in another case.
+                    let key = escape_sql_string_literal(inner.stored_name.as_deref().unwrap_or(cdc_table_name));
                     inner.stmt = prepare_cdc_internal(
                         conn,
                         format!(
-                            "SELECT version FROM {TURSO_CDC_VERSION_TABLE_NAME} WHERE table_name = '{escaped_cdc_table_name}'",
+                            "SELECT version FROM {TURSO_CDC_VERSION_TABLE_NAME} WHERE table_name = '{key}' COLLATE NOCASE ORDER BY table_name = '{key}' DESC LIMIT 1",
                         ),
                     )?;
                     inner.phase = OpInitCdcVersionPhase::ReadVersion;
@@ -15197,6 +15360,9 @@ pub fn op_set_cookie(
         },
         insn
     );
+    if matches!(cookie, Cookie::SchemaVersion) {
+        state.note_schema_change(&program.connection, *db);
+    }
     let pager = program.get_pager_from_database_index(db)?;
     let mv_store = program.connection.mv_store_for_db(*db);
     if let Some(mv_store) = mv_store.as_ref() {
@@ -16268,12 +16434,12 @@ fn regenerate_trigger_sql(trigger: &crate::schema::Trigger) -> String {
 
     let trigger_name = QualifiedName {
         db_name: None,
-        name: Name::from_string(&trigger.name),
+        name: Name::exact(trigger.name.clone()),
         alias: None,
     };
     let tbl_name = QualifiedName {
         db_name: None,
-        name: Name::from_string(&trigger.table_name),
+        name: Name::exact(trigger.table_name.clone()),
         alias: None,
     };
     create_trigger_to_sql(
@@ -16382,6 +16548,7 @@ pub fn op_rename_table(
 
     let conn = program.connection.clone();
 
+    state.note_schema_change(&conn, *db);
     conn.with_database_schema_mut(*db, |schema| -> crate::Result<()> {
         if let Some(mut indexes) = schema.indexes.remove(&normalized_from) {
             let autoindex_prefix = format!("sqlite_autoindex_{normalized_from}_");
@@ -16517,6 +16684,7 @@ pub fn op_rename_table(
     })??;
 
     if *db != crate::TEMP_DB_ID && conn.temp.database.read().is_some() {
+        state.note_schema_change(&conn, crate::TEMP_DB_ID);
         conn.with_database_schema_mut(crate::TEMP_DB_ID, |schema| -> crate::Result<()> {
             // A TEMP trigger may run on a table in another database. Triggers
             // are found by the name of that table. When the table is renamed,
@@ -16603,6 +16771,7 @@ pub fn op_drop_column(
             .clone()
     });
 
+    state.note_schema_change(&conn, *db);
     conn.with_database_schema_mut(*db, |schema| -> Result<()> {
         let table = schema
             .tables
@@ -16649,6 +16818,7 @@ pub fn op_drop_column(
     // Shift left pos_in_table in all indexes, and self-table placeholders in generated column
     // expressions, to account for the dropped column. For example, if the dropped column had index
     // 2, then anything that was indexed on column 3 or higher should be decremented by 1.
+    state.note_schema_change(&conn, *db);
     conn.with_database_schema_mut(*db, |schema| -> Result<()> {
         if let Some(indexes) = schema.indexes.get_mut(&normalized_table_name) {
             for index in indexes {
@@ -16680,8 +16850,8 @@ pub fn op_drop_column(
 
     conn.with_schema(*db, |schema| -> crate::Result<()> {
         for (view_name, view) in schema.views.iter() {
-            let view_select_sql = format!("SELECT * FROM {view_name}");
-            let _ = conn.prepare(view_select_sql.as_str()).map_err(|e| {
+            let view_select_sql = format!("SELECT * FROM {}", view_in_db(&conn, *db, view_name));
+            let _ = conn.prepare_engine(EngineSql::new(view_select_sql.as_str()), Origin::Root).map_err(|e| {
                 LimboError::ParseError(format!(
                     "cannot drop column \"{}\": referenced in VIEW {view_name}: {}. {e}",
                     column_name, view.sql,
@@ -16708,6 +16878,7 @@ pub fn op_add_column(
     let new_check_constraints = data.check_constraints.try_to_vec()?;
     let new_foreign_keys = data.foreign_keys.try_to_vec()?;
 
+    state.note_schema_change(&conn, data.db);
     conn.with_database_schema_mut(data.db, |schema| -> Result<()> {
         let table_ref = schema
             .tables
@@ -16752,6 +16923,7 @@ pub fn op_recipe_install(
         return Ok(InsnFunctionStepResult::Step);
     }
     let conn = program.connection.clone();
+    state.note_schema_change(&conn, crate::MAIN_DB_ID);
     conn.with_database_schema_mut(crate::MAIN_DB_ID, |schema| {
         crate::recipe::install_in_schema(
             schema,
@@ -16861,6 +17033,7 @@ pub fn op_alter_column(
         Vec::new()
     };
 
+    state.note_schema_change(&conn, *db);
     conn.with_database_schema_mut(*db, |schema| -> Result<()> {
         let table_arc = schema
             .tables
@@ -17013,6 +17186,8 @@ pub fn op_alter_column(
     if *rename {
         // Update in-memory trigger objects for the renamed column in both the
         // altered schema and temp, since temp triggers may reference main/attached tables.
+        state.note_schema_change(&conn, *db);
+        state.note_schema_change(&conn, crate::TEMP_DB_ID);
         with_relevant_trigger_schemas_mut(&conn, *db, |schema| {
             for triggers in schema.triggers.values_mut() {
                 for trigger_arc in triggers.iter_mut() {
@@ -17029,6 +17204,7 @@ pub fn op_alter_column(
         })?;
 
         for (view_db, view_name, rewritten) in view_rewrites {
+            state.note_schema_change(&conn, view_db);
             conn.with_database_schema_mut(view_db, move |schema| -> crate::Result<()> {
                 if let Some(view_arc) = schema.views.get_mut(&view_name) {
                     let view = Arc::make_mut(view_arc);
@@ -17050,8 +17226,8 @@ pub fn op_alter_column(
                     .get_column_at(*column_index)
                     .expect("column being ALTERed should be in schema");
                 for (view_name, view) in schema.views.iter() {
-                    let view_select_sql = format!("SELECT * FROM {view_name}");
-                    let _ = conn.prepare(view_select_sql.as_str()).map_err(|e| {
+                    let view_select_sql = format!("SELECT * FROM {}", view_in_db(&conn, *db, view_name));
+                    let _ = conn.prepare_engine(EngineSql::new(view_select_sql.as_str()), Origin::Root).map_err(|e| {
                         LimboError::ParseError(format!(
                             "cannot rename column \"{}\": referenced in VIEW {view_name}: {}. {e}",
                             old_column_name, view.sql,
@@ -18324,6 +18500,8 @@ impl Drop for MvccBootstrapGuard {
             self.connection.promote_to_regular_connection();
         }
         self.connection.db.mv_store.store(None);
+        // The MV store is compiled into every connection's programs (review c42b MED-3, LOW-2).
+        self.connection.db.bump_prepare_context_generation();
     }
 }
 
@@ -18595,6 +18773,8 @@ fn op_journal_mode_inner(
                     // bootstrap yield restores in-memory state.
                     let guard = MvccBootstrapGuard::new(program.connection.clone());
                     program.connection.db.mv_store.store(Some(mv_store.clone()));
+                    // Every connection compiled the old mode in (review C42 MED-7).
+                    program.connection.db.bump_prepare_context_generation();
                     program.connection.demote_to_mvcc_connection();
                     state.active_op_state.journal_mode().bootstrap_guard = Some(guard);
                     state.active_op_state.journal_mode().bootstrap_state =
@@ -18606,6 +18786,8 @@ fn op_journal_mode_inner(
 
                 if matches!(new_mode, journal_mode::JournalMode::Wal) {
                     program.connection.db.mv_store.store(None);
+                    // Every connection compiled the old mode in (review C42 MED-7).
+                    program.connection.db.bump_prepare_context_generation();
                 }
 
                 // Return result
@@ -18890,7 +19072,7 @@ fn op_vacuum_into_inner(
         }
 
         state.op_vacuum_state = VacuumOpState::IntoFile(Box::new(VacuumIntoOpContext {
-            escaped_schema_name: schema_name.replace('"', "\"\""),
+            escaped_schema_name: crate::util::escape_identifier(&schema_name),
             source_db_id,
             ..Default::default()
         }));
@@ -18941,8 +19123,9 @@ fn op_vacuum_into_inner(
                 // BEGIN and pragma helpers here are blocking convenience wrappers;
                 // async work starts with the schema scan in vacuum_target_build_step.
                 let source_db = program.connection.get_source_database(source_db_id);
-                program.connection.execute("BEGIN")?;
+                program.connection.execute_engine(EngineSql::new("BEGIN"), Origin::Root)?;
                 state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
+                #[allow(clippy::disallowed_methods, reason = "pragma_query is engine-kind (prepare_engine) (dialect design R1)")]
                 let page_size: u32 = extract_pragma_int(
                     &program
                         .connection
@@ -19078,7 +19261,7 @@ fn op_vacuum_into_inner(
 
             VacuumIntoOpPhase::Done => {
                 // Commit the source transaction started in Init.
-                program.connection.execute("COMMIT")?;
+                program.connection.execute_engine(EngineSql::new("COMMIT"), Origin::Root)?;
                 state.auto_txn_cleanup = TxnCleanup::None;
 
                 state.pc += 1;
@@ -20104,5 +20287,15 @@ mod tests {
             result.is_ok(),
             "Negating a blob subscript with invalid UTF-8 text should not panic"
         );
+    }
+}
+
+/// A view of database `db` named in engine text: quoted, and qualified by its database unless it is main's (wire:
+/// ONE QUOTING FUNCTION class). DROP/RENAME COLUMN's probe named an attached database's view bare, so it resolved in
+/// main; and a view named `v"x` broke the probe's text.
+fn view_in_db(conn: &Connection, db: usize, view_name: &str) -> String {
+    match conn.get_database_name_by_index(db) {
+        Some(name) if db != crate::MAIN_DB_ID => format!("{}.{}", quote_identifier(&name), quote_identifier(view_name)),
+        _ => quote_identifier(view_name),
     }
 }

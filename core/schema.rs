@@ -185,6 +185,51 @@ pub const SEQ_BACKING_TABLE_PREFIX: &str = "__turso_internal_seq_";
 pub const AUTOINCREMENT_SEQ_PREFIX: &str = "__turso_internal_autoincrement_";
 
 /// Name of the hidden sequence owned by an AUTOINCREMENT table.
+/// The type registry's key for a type named by `token`, a type name as the parser gives it (CREATE
+/// TYPE's, CREATE DOMAIN's, DROP's, a column's declared type, a base type): its quoting undone and
+/// its case folded, so `"m'x"` declared on a column is the type created as `"m'x"`, and `"plain"`
+/// the type `plain` (a registry keyed by the token itself made a quoted name a different type).
+/// Only text that is ONE quoted token is dequoted: a declared type such as `"t"(5)` or `'a' b` is
+/// folded as it stands (never `Name::from_string`, which asserts on a quote it cannot close).
+pub(crate) fn type_key(token: &str) -> String {
+    let b = token.as_bytes();
+    if is_one_quoted_token(token) {
+        turso_parser::ast::Name::from_string(token).as_str().to_lowercase()
+    } else if b.len() >= 2 && b[0] == b'[' && b[b.len() - 1] == b']' && !token[1..token.len() - 1].contains(']') {
+        token[1..token.len() - 1].to_lowercase()
+    } else {
+        token.to_lowercase()
+    }
+}
+
+/// Whether `text` is ONE complete quoted token (`"m'x"`, `'a''b'`, `` `c` ``): a quote character
+/// first and last, and every one between them doubled.
+pub(crate) fn is_one_quoted_token(text: &str) -> bool {
+    let b = text.as_bytes();
+    b.len() >= 2
+        && matches!(b[0], b'"' | b'\'' | b'`')
+        && b[b.len() - 1] == b[0]
+        && {
+            // Every inner quote character is doubled, so the closing one is the last byte.
+            let q = b[0];
+            let inner = &b[1..b.len() - 1];
+            let mut i = 0;
+            let mut ok = true;
+            while i < inner.len() {
+                if inner[i] == q {
+                    if inner.get(i + 1) == Some(&q) {
+                        i += 2;
+                        continue;
+                    }
+                    ok = false;
+                    break;
+                }
+                i += 1;
+            }
+            ok
+        }
+}
+
 pub fn autoincrement_sequence_name(table_name: &str) -> String {
     String::from(AUTOINCREMENT_SEQ_PREFIX) + table_name
 }
@@ -827,7 +872,7 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
         "CREATE TYPE json(value text) BASE text ENCODE json(value) DECODE value",
         #[cfg(feature = "json")]
         "CREATE TYPE jsonb(value text) BASE blob ENCODE jsonb(value) DECODE json(value)",
-        "CREATE TYPE varchar(value text, maxlen integer) BASE text ENCODE CASE WHEN length(value) <= maxlen THEN value ELSE RAISE(ABORT, 'value too long for varchar') END DECODE value OPERATOR '<'",
+        "CREATE TYPE varchar(value text, maxlen integer) BASE text ENCODE varchar_encode(value, maxlen) DECODE value OPERATOR '<'",
         "CREATE TYPE date(value text) BASE text ENCODE CASE WHEN value IS NULL THEN NULL WHEN date(value) IS NULL THEN RAISE(ABORT, 'invalid date value') ELSE date(value) END DECODE value OPERATOR '<'",
         // ENCODE preserves sub-second precision through strftime + a rtrim pair
         // that strips trailing zeros and the dangling dot, matching PostgreSQL's
@@ -986,14 +1031,14 @@ impl Schema {
         if !is_strict {
             return None;
         }
-        self.type_registry.get(&type_name.to_lowercase())
+        self.type_registry.get(&type_key(type_name))
     }
 
     /// Look up a custom type definition by name without a strictness check.
     /// Only use this for operations that aren't column-scoped (e.g. DROP TYPE,
     /// CREATE TABLE validation, CAST).
     pub fn get_type_def_unchecked(&self, type_name: &str) -> Option<&Arc<TypeDef>> {
-        self.type_registry.get(&type_name.to_lowercase())
+        self.type_registry.get(&type_key(type_name))
     }
 
     /// Resolve a custom type fully: look it up (with strictness gate) and chase
@@ -1013,7 +1058,7 @@ impl Schema {
     /// Resolve a custom type fully without a strictness check.
     /// Returns `Ok(None)` if the type is not in the registry.
     pub fn resolve_type_unchecked(&self, type_name: &str) -> crate::Result<Option<ResolvedType>> {
-        let key = type_name.to_lowercase();
+        let key = type_key(type_name);
         if !self.type_registry.contains_key(&key) {
             return Ok(None);
         }
@@ -1022,7 +1067,7 @@ impl Schema {
     }
 
     pub fn remove_type(&mut self, type_name: &str) {
-        self.type_registry.remove(&type_name.to_lowercase());
+        self.type_registry.remove(&type_key(type_name));
     }
 
     /// Chase the base type chain: domain_a → domain_b → integer
@@ -1035,7 +1080,7 @@ impl Schema {
     ) -> crate::Result<(String, Vec<Arc<TypeDef>>)> {
         let mut chain = vec![];
         let mut visited = std::collections::HashSet::new();
-        let mut current = type_name.to_lowercase();
+        let mut current = type_key(type_name);
 
         loop {
             if !visited.insert(current.clone()) {
@@ -1046,7 +1091,7 @@ impl Schema {
             match self.type_registry.get(&current) {
                 Some(td) => {
                     chain.try_push(Arc::clone(td))?;
-                    current = td.base().to_lowercase();
+                    current = type_key(td.base());
                 }
                 None => {
                     // current is not in the registry — it's a primitive
@@ -1070,7 +1115,7 @@ impl Schema {
                 let type_def =
                     TypeDef::from_create_type(&type_name, &body, false, sql.to_string())?;
                 self.type_registry
-                    .insert(type_name.to_lowercase(), Arc::new(type_def));
+                    .insert(type_key(&type_name), Arc::new(type_def));
             }
             Ok(Some(Cmd::Stmt(Stmt::CreateDomain {
                 domain_name,
@@ -1089,7 +1134,7 @@ impl Schema {
                     sql.to_string(),
                 );
                 self.type_registry
-                    .insert(domain_name.to_lowercase(), Arc::new(type_def));
+                    .insert(type_key(&domain_name), Arc::new(type_def));
             }
             _ => {
                 return Err(crate::LimboError::ParseError(format!(
@@ -1556,7 +1601,7 @@ impl Schema {
         mv_cursor: Option<Arc<RwLock<MvCursor>>>,
         pager: &Arc<Pager>,
         syms: &SymbolTable,
-        dialect: &dyn crate::dialect::Dialect,
+        dialect: &Arc<dyn crate::dialect::Dialect>,
     ) -> Result<IOResult<()>> {
         let result = self.make_from_btree_internal(state, mv_cursor, pager, syms, dialect);
         if result.is_err() {
@@ -1576,7 +1621,7 @@ impl Schema {
         mv_cursor: Option<Arc<RwLock<MvCursor>>>,
         pager: &Arc<Pager>,
         syms: &SymbolTable,
-        dialect: &dyn crate::dialect::Dialect,
+        dialect: &Arc<dyn crate::dialect::Dialect>,
     ) -> Result<IOResult<()>> {
         loop {
             tracing::debug!("make_from_btree: state.phase={:?}", state.phase);
@@ -1683,7 +1728,7 @@ impl Schema {
                         &mut acc.dbsp_state_index_roots,
                         &mut acc.materialized_view_info,
                         &|_| None,
-                        dialect,
+                        dialect.as_ref(),
                     )?;
 
                     state.phase = MakeFromBtreePhase::Advancing;
@@ -1719,6 +1764,7 @@ impl Schema {
                             acc.materialized_view_info,
                             acc.dbsp_state_roots,
                             acc.dbsp_state_index_roots,
+                            dialect,
                         )?;
 
                         state.phase = MakeFromBtreePhase::Done;
@@ -1931,11 +1977,14 @@ impl Schema {
     }
 
     /// Populate materialized views parsed from the schema.
+    /// `dialect`: the database's, which the views' expressions resolve through (dialect code review
+    /// MED-3).
     pub fn populate_materialized_views(
         &mut self,
         materialized_view_info: HashMap<String, (String, i64)>,
         dbsp_state_roots: HashMap<String, i64>,
         dbsp_state_index_roots: HashMap<String, i64>,
+        dialect: &Arc<dyn crate::Dialect>,
     ) -> Result<()> {
         for (view_name, (sql, main_root)) in materialized_view_info {
             // Look up the DBSP state root for this view
@@ -1973,12 +2022,13 @@ impl Schema {
             }
 
             // Create the IncrementalView with all root pages
-            let incremental_view = IncrementalView::from_sql(
+            let incremental_view = IncrementalView::from_sql_with_dialect(
                 &sql,
                 self,
                 main_root,
                 dbsp_state_root,
                 dbsp_state_index_root,
+                dialect,
             )?;
             let referenced_tables = incremental_view.get_referenced_table_names();
 
@@ -1998,6 +2048,7 @@ impl Schema {
                 check_constraints: vec![],
                 rowid_alias_conflict_clause: None,
                 rowid_alias_not_null: false,
+                dialect_owned: false,
                 unique_sets: vec![],
                 has_virtual_columns: false,
                 logical_to_physical_map,
@@ -2155,7 +2206,8 @@ impl Schema {
                     };
                     self.add_virtual_table(vtab)?;
                 } else {
-                    let table = dialect.parse_table_sql(sql, root_page)?;
+                    let mut table = dialect.parse_table_sql(sql, root_page)?;
+                    table.dialect_owned = dialect.owns_stored_table_sql(sql);
 
                     if table.has_virtual_columns && !self.generated_columns_enabled {
                         return Err(LimboError::ParseError(format!(
@@ -2740,6 +2792,7 @@ impl TryClone for BTreeTable {
             check_constraints: self.check_constraints.try_clone()?,
             rowid_alias_conflict_clause: self.rowid_alias_conflict_clause,
             rowid_alias_not_null: self.rowid_alias_not_null,
+            dialect_owned: self.dialect_owned,
             has_virtual_columns: self.has_virtual_columns,
             logical_to_physical_map: self.logical_to_physical_map.try_clone()?,
             column_dependencies: Default::default(),
@@ -3393,6 +3446,11 @@ pub struct BTreeTable {
     /// false for SQLite tables, whose INTEGER PRIMARY KEY turns a NULL into a new rowid
     /// (fastest-engine 4c).
     pub rowid_alias_not_null: bool,
+    /// Whose form the table's stored row is in (dialect design REVISION 2 item 8): true iff the
+    /// database's dialect recognises the row as its own (`Dialect::owns_stored_table_sql`, set by the
+    /// schema loader), so RENAME and ALTER rewrite it in that dialect's form; false for an engine row
+    /// (canonical SQLite), which they keep canonical. A RENAME or ALTER never changes it.
+    pub dialect_owned: bool,
     pub has_virtual_columns: bool,
     pub logical_to_physical_map: Vec<usize>,
     column_dependencies: ResetOnClone<OnceLock<GeneratedColGraph>>,
@@ -3461,6 +3519,7 @@ impl BTreeTable {
             check_constraints,
             rowid_alias_conflict_clause,
             rowid_alias_not_null: false,
+            dialect_owned: false,
             has_virtual_columns,
             logical_to_physical_map,
             column_dependencies: Default::default(),
@@ -3644,6 +3703,20 @@ impl BTreeTable {
         Ok(())
     }
 
+    /// The name SQL text the engine builds uses for this table's rowid: the first of `rowid`,
+    /// `_rowid_` and `oid` that no ordinary column takes (a rowid-alias column named so names the rowid
+    /// itself), as SQLite resolves them; `None` when all three are taken, and such text must refuse.
+    /// QUOTE-SWEEP-4a97c9c36 F3: the merge's and a materialized view's text said `rowid`, which a
+    /// column named rowid shadows, so they addressed the rows by that column.
+    pub fn rowid_name(&self) -> Option<&'static str> {
+        ["rowid", "_rowid_", "oid"].into_iter().find(|n| {
+            !self
+                .columns()
+                .iter()
+                .any(|c| !c.is_rowid_alias() && c.name.as_deref().is_some_and(|cn| cn.eq_ignore_ascii_case(n)))
+        })
+    }
+
     pub fn get_rowid_alias_column(&self) -> Option<(usize, &Column)> {
         self.columns
             .iter()
@@ -3791,7 +3864,9 @@ impl BTreeTable {
                 if i > 0 {
                     sql.push_str(", ");
                 }
-                sql.push_str(&col.0);
+                // Quoted (QUOTE-SWEEP-4a97c9c36 F1: printed bare, so a name like `a b` or `order`
+                // stored a row that did not reparse after ALTER ADD/DROP COLUMN).
+                sql.push_str(&quote_ident(&col.0));
             }
             sql.push(')');
         }
@@ -3802,17 +3877,17 @@ impl BTreeTable {
                 if i > 0 {
                     sql.push_str(", ");
                 }
-                sql.push_str(col);
+                sql.push_str(&quote_ident(col));
             }
             sql.push_str(") REFERENCES ");
-            sql.push_str(&fk.parent_table);
+            sql.push_str(&quote_ident(&fk.parent_table));
             if !fk.parent_columns.is_empty() {
                 sql.push('(');
                 for (i, col) in fk.parent_columns.iter().enumerate() {
                     if i > 0 {
                         sql.push_str(", ");
                     }
-                    sql.push_str(col);
+                    sql.push_str(&quote_ident(col));
                 }
                 sql.push(')');
             }
@@ -4598,7 +4673,10 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         let col_name = match expr {
                             Expr::Id(id) => normalize_ident(id.as_str()),
                             Expr::Literal(Literal::String(value)) => {
-                                value.trim_matches('\'').to_owned()
+                                // As SQL reads the literal: the outer quotes off, each '' one '
+                                // (QUOTE-SWEEP F13: trim_matches kept the doubling and took any
+                                // quote at the name's edge).
+                                crate::translate::expr::sanitize_string(value)
                             }
                             expr => {
                                 bail_parse_error!("unsupported primary key expression: {}", expr)
@@ -4629,7 +4707,10 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         let col_name = match expr {
                             Expr::Id(id) => id.as_str().to_string(),
                             Expr::Literal(Literal::String(value)) => {
-                                value.trim_matches('\'').to_owned()
+                                // As SQL reads the literal: the outer quotes off, each '' one '
+                                // (QUOTE-SWEEP F13: trim_matches kept the doubling and took any
+                                // quote at the name's edge).
+                                crate::translate::expr::sanitize_string(value)
                             }
                             expr => {
                                 bail_parse_error!("unsupported unique key expression: {}", expr)
@@ -5119,6 +5200,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         check_constraints,
         rowid_alias_conflict_clause,
         rowid_alias_not_null: false,
+        dialect_owned: false,
         has_virtual_columns: false,
         logical_to_physical_map: vec![],
         column_dependencies: Default::default(),
@@ -5712,6 +5794,7 @@ pub fn sqlite_schema_table() -> Result<BTreeTable> {
         check_constraints: try_vec![]?,
         rowid_alias_conflict_clause: None,
         rowid_alias_not_null: false,
+        dialect_owned: false,
         unique_sets: try_vec![]?,
         has_virtual_columns: false,
         logical_to_physical_map,
@@ -6669,6 +6752,7 @@ mod tests {
             check_constraints: vec![],
             rowid_alias_conflict_clause: None,
             rowid_alias_not_null: false,
+            dialect_owned: false,
             has_virtual_columns: false,
             logical_to_physical_map,
             column_dependencies: Default::default(),

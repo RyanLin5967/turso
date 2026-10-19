@@ -47,6 +47,7 @@
 //! ROWID table. Batches of more than one member, the physical install and the page-granular
 //! validators of b161e861d are not ported (D-M8).
 
+use crate::connection::{EngineSql, Origin};
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
@@ -188,7 +189,7 @@ fn fk_name(r: &ResolvedFkRef) -> String {
 }
 
 fn quote(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
+    crate::util::double_quote_identifier(name)
 }
 
 /// The ordinary rowid table rooted at `root`, if there is one a merge may write.
@@ -197,6 +198,8 @@ fn table_at(schema: &Schema, root: i64) -> Option<Arc<BTreeTable>> {
         Table::BTree(bt)
             if bt.root_page == root
                 && bt.has_rowid
+                // Its rows are addressed by a rowid name no column shadows (QUOTE-SWEEP F3).
+                && bt.rowid_name().is_some()
                 && !bt.name.starts_with("sqlite_")
                 && !bt.columns().iter().any(|c| c.is_generated()) =>
         {
@@ -371,7 +374,7 @@ impl Merger {
     /// trunk write transaction it rolls back.
     #[doc(hidden)]
     pub fn derive_only(&mut self, branch: &Branch) -> Result<DerivedReport> {
-        self.trunk.execute("BEGIN IMMEDIATE")?;
+        self.trunk.execute_engine(EngineSql::new("BEGIN IMMEDIATE"), Origin::Root)?;
         let result = (|| -> Result<DerivedReport> {
             let pager = self.trunk.pager.load().clone();
             let view = self.store.merge_view(branch.id())?;
@@ -383,7 +386,7 @@ impl Merger {
                 owned: view.owned.len() as u64,
             })
         })();
-        self.trunk.execute("ROLLBACK")?;
+        self.trunk.execute_engine(EngineSql::new("ROLLBACK"), Origin::Root)?;
         result
     }
 
@@ -501,16 +504,16 @@ impl Merger {
     ) -> Result<MergeOutcome> {
         // BEGIN IMMEDIATE checks the schema cookie once it holds the write lock, so from here to
         // COMMIT the merger's schema is the trunk's.
-        self.trunk.execute("BEGIN IMMEDIATE")?;
+        self.trunk.execute_engine(EngineSql::new("BEGIN IMMEDIATE"), Origin::Root)?;
         let result = self.validate_and_install(branch, policy, fk_on, land);
         match &result {
             Ok(outcome) if outcome.refused.is_none() => {
-                if let Err(err) = self.trunk.execute("COMMIT") {
-                    let _ = self.trunk.execute("ROLLBACK");
+                if let Err(err) = self.trunk.execute_engine(EngineSql::new("COMMIT"), Origin::Root) {
+                    let _ = self.trunk.execute_engine(EngineSql::new("ROLLBACK"), Origin::Root);
                     return Err(err);
                 }
             }
-            _ => self.trunk.execute("ROLLBACK")?,
+            _ => self.trunk.execute_engine(EngineSql::new("ROLLBACK"), Origin::Root)?,
         }
         result
     }
@@ -717,21 +720,21 @@ impl Merger {
         prep: &Prepared,
         fk_on: bool,
     ) -> Result<Option<String>> {
-        self.trunk.execute(format!("SAVEPOINT {MEMBER}"))?;
+        self.trunk.execute_engine(EngineSql::new(format!("SAVEPOINT {MEMBER}")), Origin::Root)?;
         let installed = self.install_checked(branch, from, prep, fk_on);
         match installed {
             Ok(None) => {
-                self.trunk.execute(format!("RELEASE {MEMBER}"))?;
+                self.trunk.execute_engine(EngineSql::new(format!("RELEASE {MEMBER}")), Origin::Root)?;
                 Ok(None)
             }
             Ok(Some(reason)) => {
-                self.trunk.execute(format!("ROLLBACK TO {MEMBER}"))?;
-                self.trunk.execute(format!("RELEASE {MEMBER}"))?;
+                self.trunk.execute_engine(EngineSql::new(format!("ROLLBACK TO {MEMBER}")), Origin::Root)?;
+                self.trunk.execute_engine(EngineSql::new(format!("RELEASE {MEMBER}")), Origin::Root)?;
                 Ok(Some(reason))
             }
             Err(err) => {
-                let _ = self.trunk.execute(format!("ROLLBACK TO {MEMBER}"));
-                let _ = self.trunk.execute(format!("RELEASE {MEMBER}"));
+                let _ = self.trunk.execute_engine(EngineSql::new(format!("ROLLBACK TO {MEMBER}")), Origin::Root);
+                let _ = self.trunk.execute_engine(EngineSql::new(format!("RELEASE {MEMBER}")), Origin::Root);
                 Err(err)
             }
         }
@@ -794,11 +797,12 @@ impl Merger {
                     .map(|c| quote(c.name.as_deref().unwrap_or("")))
                     .collect();
                 let sql = format!(
-                    "SELECT {} FROM {} WHERE rowid = ?1",
+                    "SELECT {} FROM {} WHERE {} = ?1",
                     cols.join(", "),
-                    quote(&table.name)
+                    quote(&table.name),
+                    table.rowid_name().expect("table_at admits only a table with an unshadowed rowid name")
                 );
-                selects.insert(root, from.prepare(sql)?);
+                selects.insert(root, from.prepare_engine(EngineSql::new(sql), Origin::Root)?);
             }
             let select = selects.get_mut(&root).expect("just prepared");
             select.bind_at(1.try_into().unwrap(), Value::from_i64(rowid))?;
@@ -940,11 +944,18 @@ impl Merger {
                     fk_name(r)
                 ));
             }
+            if r.child_table.rowid_name().is_none() {
+                return Err(format!(
+                    "foreign key {}: every rowid name of the child is a column's, which a merge does not check",
+                    fk_name(r)
+                ));
+            }
             let parent_cols: Vec<String> = r.parent_cols.iter().map(|c| quote(c)).collect();
             let key_sql = format!(
-                "SELECT {} FROM {} WHERE rowid = ?1",
+                "SELECT {} FROM {} WHERE {} = ?1",
                 parent_cols.join(", "),
-                quote(&table.name)
+                quote(&table.name),
+                table.rowid_name().expect("table_at admits only a table with an unshadowed rowid name")
             );
             out.push(ParentFk {
                 name: fk_name(r),
@@ -959,7 +970,7 @@ impl Merger {
 
     fn prepare_fk(&self, r: &ResolvedFkRef, sql: String) -> std::result::Result<Statement, String> {
         self.trunk
-            .prepare(sql)
+            .prepare_engine(EngineSql::new(sql), Origin::Root)
             .map_err(|err| format!("foreign key {} cannot be checked: {err}", fk_name(r)))
     }
 
@@ -980,9 +991,10 @@ impl Merger {
             .map(|cc| format!("c.{} IS NOT NULL", quote(cc)))
             .collect();
         Ok(format!(
-            "SELECT 1 FROM {} AS c WHERE c.rowid = ?1 AND {} AND NOT EXISTS \
+            "SELECT 1 FROM {} AS c WHERE c.{} = ?1 AND {} AND NOT EXISTS \
              (SELECT 1 FROM {} AS p WHERE {})",
             quote(&r.child_table.name),
+            r.child_table.rowid_name().unwrap_or("rowid"),
             not_null.join(" AND "),
             quote(&parent.name),
             matches.join(" AND ")
@@ -1014,10 +1026,12 @@ impl Merger {
             })
             .collect();
         format!(
-            "SELECT c.rowid FROM {} AS p JOIN {} AS c ON {} WHERE p.rowid = ?1",
+            "SELECT c.{} FROM {} AS p JOIN {} AS c ON {} WHERE p.{} = ?1",
+            child.rowid_name().unwrap_or("rowid"),
             quote(&parent.name),
             quote(&child.name),
-            matches.join(" AND ")
+            matches.join(" AND "),
+            parent.rowid_name().unwrap_or("rowid")
         )
     }
 
@@ -1044,7 +1058,7 @@ impl Merger {
                 }
                 let stmt = match theirs.entry((root, i)) {
                     Entry::Occupied(e) => e.into_mut(),
-                    Entry::Vacant(e) => e.insert(from.prepare(&side.key_sql)?),
+                    Entry::Vacant(e) => e.insert(from.prepare_engine(EngineSql::new(&side.key_sql), Origin::Root)?),
                 };
                 if first_row(stmt, rowid)?.as_ref() == Some(&ours) {
                     continue;
@@ -1116,6 +1130,9 @@ impl Merger {
             .collect();
         let alias = table.get_rowid_alias_column().map(|(i, _)| i);
         let t = quote(&table.name);
+        let rowid = table.rowid_name().ok_or_else(|| {
+            LimboError::InternalError(format!("merge: every rowid name of {} is a column's", table.name))
+        })?;
         // The rowid alias stays out of the SET list (b161e861d: assigning it runs a two-pass
         // update through an ephemeral table). OR ABORT overrides a constraint-level ON CONFLICT
         // REPLACE, so installing a row can never delete a row only the trunk has.
@@ -1128,7 +1145,7 @@ impl Merger {
             .collect();
         let or_abort = " OR ABORT";
         let update = (!sets.is_empty())
-            .then(|| format!("UPDATE{or_abort} {t} SET {} WHERE rowid = ?1", sets.join(", ")));
+            .then(|| format!("UPDATE{or_abort} {t} SET {} WHERE {rowid} = ?1", sets.join(", ")));
         let insert = match alias {
             Some(_) if names.len() == 1 => {
                 format!("INSERT OR IGNORE INTO {t}({}) VALUES (?1)", names[0])
@@ -1144,17 +1161,17 @@ impl Merger {
             None => {
                 let params: Vec<String> = (2..=names.len() + 1).map(|i| format!("?{i}")).collect();
                 format!(
-                    "INSERT{or_abort} INTO {t}(rowid, {}) VALUES (?1, {})",
+                    "INSERT{or_abort} INTO {t}({rowid}, {}) VALUES (?1, {})",
                     names.join(", "),
                     params.join(", ")
                 )
             }
         };
-        let delete = format!("DELETE FROM {t} WHERE rowid = ?1");
+        let delete = format!("DELETE FROM {t} WHERE {rowid} = ?1");
         Ok(TableStmts {
-            update: update.map(|sql| self.trunk.prepare(sql)).transpose()?,
-            insert: self.trunk.prepare(insert)?,
-            delete: self.trunk.prepare(delete)?,
+            update: update.map(|sql| self.trunk.prepare_engine(EngineSql::new(sql), Origin::Root)).transpose()?,
+            insert: self.trunk.prepare_engine(EngineSql::new(insert), Origin::Root)?,
+            delete: self.trunk.prepare_engine(EngineSql::new(delete), Origin::Root)?,
             columns: names.len(),
             alias,
         })

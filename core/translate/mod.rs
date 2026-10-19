@@ -82,8 +82,9 @@ pub fn translate(
     syms: &SymbolTable,
     query_mode: QueryMode,
     input: &str,
-    origin: crate::statement::StatementOrigin,
     prepare_options: &PrepareOptions,
+    kind: &crate::connection::SqlKind,
+    prepare_generation: u64,
 ) -> Result<Program> {
     tracing::trace!("querying {}", input);
     let change_cnt_on = matches!(
@@ -106,6 +107,9 @@ pub fn translate(
         // These options will be extended whithin each translate program
         ProgramBuilderOpts::new(1, 32, 2),
     ));
+    // Keyed at the generation the caller read before it read any state the key covers (review
+    // c42b MED-4): a change landing after that re-prepares this program instead of being missed.
+    program.set_prepare_generation(prepare_generation);
     program.set_mvcc_enabled(connection.mvcc_enabled());
 
     program.prologue();
@@ -117,15 +121,14 @@ pub fn translate(
         syms,
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
-        // Engine-generated helper statements are always SQLite text and
-        // must resolve functions with SQLite semantics regardless of the
-        // database's dialect — the same invariant as unmarked schema rows.
-        if matches!(origin, crate::statement::StatementOrigin::InternalHelper) {
-            Arc::new(crate::dialect::SqliteDialect) as Arc<dyn crate::dialect::Dialect>
-        } else {
-            connection.dialect()
-        },
+        // Functions always resolve through the database's dialect (dialect design REVISION 2 item 1):
+        // engine text names only SQLite builtins, which every dialect resolves as SQLite does (R10's
+        // contract), and the CHECK, DEFAULT and trigger expressions an engine statement compiles
+        // belong to the database (R6a). How the statement's own schema row is stored is decided by
+        // its source, never by this dialect (`Resolver::sql_source`).
+        connection.dialect(),
         &prepare_options.unqualified_database_search_path,
+        kind.source().clone(),
     );
     // A branch merge applying row images compiles with no triggers (see `branch::merge`).
     resolver.triggers_disabled = connection.row_image_apply();
@@ -148,6 +151,22 @@ pub fn translate(
     program.epilogue(schema);
 
     program.build(connection, change_cnt_on, input)
+}
+
+/// The bytes stored for the statement's own schema row when it replays one (dialect design REVISION 2
+/// item 1): `Some(bytes)` iff the source is a replay. Refused if the replayed row names another object.
+/// Only the statement's own row: its implicit rows (an autoindex, a sequence table, sqlite_sequence)
+/// keep the engine text they get.
+pub(crate) fn replayed_own_row(resolver: &Resolver, own_name: &str) -> Result<Option<String>> {
+    match &resolver.sql_source {
+        crate::connection::SqlSource::Replay { name, bytes } => {
+            if crate::util::normalize_ident(own_name) != crate::util::normalize_ident(name) {
+                crate::bail_parse_error!("a replayed CREATE names {}, its source row is {}", own_name, name);
+            }
+            Ok(Some(bytes.to_string()))
+        }
+        _ => Ok(None),
+    }
 }
 
 // TODO: for now leaving the return value as a Program. But ideally to support nested parsing of arbitraty
@@ -267,8 +286,8 @@ pub fn translate_inner(
             when_clause,
             commands,
         } => {
-            // Reconstruct SQL for storage
-            let sql = trigger::create_trigger_to_sql(
+            // Reconstruct SQL for storage; a replay keeps its row's bytes (REVISION 2 item 1).
+            let sql = replayed_own_row(&resolver, trigger_name.name.as_str())?.unwrap_or_else(|| trigger::create_trigger_to_sql(
                 temporary,
                 if_not_exists,
                 &trigger_name,
@@ -278,7 +297,7 @@ pub fn translate_inner(
                 for_each_row,
                 when_clause.as_deref(),
                 &commands,
-            );
+            ));
             trigger::translate_create_trigger(
                 trigger_name,
                 resolver,
@@ -600,8 +619,9 @@ mod tests {
             &empty_syms,
             QueryMode::Normal,
             "",
-            crate::statement::StatementOrigin::Root,
             &crate::connection::PrepareOptions::default(),
+            &crate::connection::SqlKind::client(),
+            0, // review c42b MED-4: these tests check translation errors only
         );
         let err = result.unwrap_err().to_string();
         assert!(
@@ -684,8 +704,9 @@ mod tests {
             &syms,
             QueryMode::Normal,
             "",
-            crate::statement::StatementOrigin::Root,
             &crate::connection::PrepareOptions::default(),
+            &crate::connection::SqlKind::client(),
+            0, // review c42b MED-4: these tests check translation errors only
         )
         .expect_err("translation should fail with malformed sqlite_sequence");
         match err {
@@ -728,8 +749,9 @@ mod tests {
             &syms,
             QueryMode::Normal,
             "",
-            crate::statement::StatementOrigin::Root,
             &crate::connection::PrepareOptions::default(),
+            &crate::connection::SqlKind::client(),
+            0, // review c42b MED-4: these tests check translation errors only
         )
         .expect_err("translation should fail with missing sqlite_sequence");
         match err {

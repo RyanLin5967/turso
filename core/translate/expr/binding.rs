@@ -651,7 +651,8 @@ pub fn bind_and_rewrite_expr<'a>(
                                             let col_name = col.name.clone().unwrap_or_else(|| {
                                                 format!("column{}", col_idx + 1)
                                             });
-                                            let quoted_col_name = format!("'{col_name}'");
+                                            // Escaped (QUOTE-SWEEP F5: sanitize_string un-doubles it).
+                                            let quoted_col_name = format!("'{}'", crate::util::escape_sql_string_literal(&col_name));
                                             args.push(Box::new(ast::Expr::Literal(
                                                 ast::Literal::String(quoted_col_name),
                                             )));
@@ -702,7 +703,13 @@ pub fn bind_and_rewrite_expr<'a>(
 /// validated as `Expr::Literal(Literal::String(_))` during bind-time checks.
 pub(super) fn extract_string_literal(expr: &ast::Expr) -> crate::Result<String> {
     match expr {
-        ast::Expr::Literal(ast::Literal::String(s)) => Ok(s.trim_matches('\'').to_string()),
+        // As SQL reads it: the outer quotes off and each `''` one `'` (it was trim_matches, which
+        // kept the doubling and took every edge quote: fastest-wire).
+        ast::Expr::Literal(ast::Literal::String(s)) if s.len() >= 2 && s.starts_with('\'') && s.ends_with('\'') => {
+            Ok(sanitize_string(s))
+        }
+        // A literal built without its quotes (not the parser's form) is taken as written, as before.
+        ast::Expr::Literal(ast::Literal::String(s)) => Ok(s.clone()),
         _ => crate::bail_parse_error!("expected a string literal argument"),
     }
 }
@@ -877,7 +884,7 @@ pub(super) fn make_field_access_expr(
             column: col_idx,
             is_rowid_alias,
         }),
-        field: ast::Name::from_bytes(field_name.as_bytes()),
+        field: ast::Name::exact(field_name.to_string()),
         resolved,
     }
 }
@@ -927,10 +934,10 @@ pub(super) fn try_resolve_nested_field_access<'a>(
                 column: m.col_idx,
                 is_rowid_alias: m.is_rowid_alias,
             }),
-            field: ast::Name::from_bytes(mid_name.as_bytes()),
+            field: ast::Name::exact(mid_name.to_string()),
             resolved: None,
         }),
-        field: ast::Name::from_bytes(leaf_name.as_bytes()),
+        field: ast::Name::exact(leaf_name.to_string()),
         resolved: None,
     };
 

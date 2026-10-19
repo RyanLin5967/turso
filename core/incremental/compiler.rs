@@ -260,18 +260,29 @@ impl DeltaSet {
 
     /// Create a DeltaSet from a HashMap
     pub fn from_map(deltas: HashMap<String, Delta>) -> Self {
-        Self { deltas }
+        let mut set = Self::new();
+        for (name, delta) in deltas {
+            set.insert(name, delta);
+        }
+        set
+    }
+
+    /// The key a table is filed under: its name case-folded, as SQL matches names, so a write to
+    /// `"Mixed"` reaches a view whose SELECT wrote `"Mixed"`, `mixed` or `MIXED` (a materialized
+    /// view over a mixed-case table was not even populated).
+    fn key(table_name: &str) -> String {
+        crate::util::normalize_ident(table_name)
     }
 
     /// Add a delta for a table
     pub fn insert(&mut self, table_name: String, delta: Delta) {
-        self.deltas.insert(table_name, delta);
+        self.deltas.insert(Self::key(&table_name), delta);
     }
 
     /// Get delta for a table, returns empty delta if not found
     pub fn get(&self, table_name: &str) -> Delta {
         self.deltas
-            .get(table_name)
+            .get(&Self::key(table_name))
             .cloned()
             .unwrap_or_else(Delta::new)
     }
@@ -855,6 +866,9 @@ impl DbspCircuit {
 /// Compiler from LogicalPlan to DBSP Circuit
 pub struct DbspCompiler {
     circuit: DbspCircuit,
+    /// The dialect the view's expressions resolve through: the database's (`with_dialect`; dialect
+    /// code review MED-3), SQLite until it is set.
+    dialect: crate::sync::Arc<dyn crate::Dialect>,
 }
 
 impl DbspCompiler {
@@ -870,7 +884,14 @@ impl DbspCompiler {
                 internal_state_root,
                 internal_state_index_root,
             ),
+            dialect: crate::sync::Arc::new(SqliteDialect),
         }
+    }
+
+    /// Resolve the view's expressions through `dialect`, the database's.
+    pub fn with_dialect(mut self, dialect: crate::sync::Arc<dyn crate::Dialect>) -> Self {
+        self.dialect = dialect;
+        self
     }
 
     /// Resolve join condition columns to determine which side each column belongs to.
@@ -967,7 +988,7 @@ impl DbspCompiler {
                 let mut compiled_exprs = Vec::new();
                 let mut aliases = Vec::new();
                 for expr in &proj.exprs {
-                    let (compiled, alias) = Self::compile_expression(expr, input_schema)?;
+                    let (compiled, alias) = Self::compile_expression(expr, input_schema, &self.dialect)?;
                     compiled_exprs.push(compiled);
                     aliases.push(alias);
                 }
@@ -1026,7 +1047,7 @@ impl DbspCompiler {
                     let mut aliases = Vec::new();
                     let mut output_names = Vec::new();
                     for (i, expr) in projection_exprs.iter().enumerate() {
-                        let (compiled, _alias) = Self::compile_expression(expr, input_schema)?;
+                        let (compiled, _alias) = Self::compile_expression(expr, input_schema, &self.dialect)?;
                         compiled_exprs.push(compiled);
                         if i < input_schema.columns.len() {
                             aliases.push(None);
@@ -1621,11 +1642,12 @@ impl DbspCompiler {
     fn compile_expression(
         expr: &LogicalExpr,
         input_schema: &LogicalSchema,
+        dialect: &crate::sync::Arc<dyn crate::Dialect>,
     ) -> Result<(CompiledExpression, Option<String>)> {
         // Check for alias first
         if let LogicalExpr::Alias { expr, alias } = expr {
             // For aliases, compile the underlying expression and return with alias
-            let (compiled, _) = Self::compile_expression(expr, input_schema)?;
+            let (compiled, _) = Self::compile_expression(expr, input_schema, dialect)?;
             return Ok((compiled, Some(alias.clone())));
         }
 
@@ -1647,7 +1669,9 @@ impl DbspCompiler {
 
         // Create an internal connection for expression compilation
         let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect))?;
+        // The expressions compile through this connection's dialect: the database's (dialect code
+        // review MED-3: it was SqliteDialect, so a view's dialect-only function was "no such function").
+        let db = Database::open_file(io, ":memory:", dialect.clone())?;
         let internal_conn = db.connect()?;
         internal_conn.set_query_only(true);
         internal_conn.auto_commit.store(false, Ordering::SeqCst);
@@ -1700,7 +1724,7 @@ impl DbspCompiler {
                     Value::Text(t) => {
                         // Add quotes for string literals as translate_expr expects them
                         // Also escape any single quotes in the string
-                        let escaped = t.to_string().replace('\'', "''");
+                        let escaped = crate::util::escape_sql_string_literal(&t.to_string());
                         ast::Literal::String(format!("'{escaped}'"))
                     }
                     Value::Blob(b) => ast::Literal::Blob(format!("X'{}'", hex::encode(b))),

@@ -958,6 +958,13 @@ pub struct ProgramState {
     pub(crate) is_active_write: bool,
     /// Whether begin_statement was called (savepoint + FK bookkeeping active).
     has_stmt_transaction: bool,
+    /// The connection's in-memory schemas as they were before this statement's first change to
+    /// one (`note_schema_change`). A statement rollback puts them back: the pagers undo the
+    /// statement's pages, so a schema object it added (a table whose root page the rollback took
+    /// back) must go too, or the next allocation hands that page to another table.
+    schema_undo: Option<crate::connection::RollbackFrameInfo>,
+    /// Whether begin_statement opened an MVCC savepoint (the MVCC twin of `uses_subjournal`).
+    uses_mvcc_savepoint: bool,
     pub n_change: AtomicI64,
     pub n_total_change: AtomicI64,
 }
@@ -1027,6 +1034,8 @@ impl ProgramState {
             uses_subjournal: false,
             is_active_write: false,
             has_stmt_transaction: false,
+            schema_undo: None,
+            uses_mvcc_savepoint: false,
             attached_savepoint_pagers: Vec::new(),
             n_change: AtomicI64::new(0),
             n_total_change: AtomicI64::new(0),
@@ -1178,6 +1187,8 @@ impl ProgramState {
         self.op_vacuum_state = VacuumOpState::None;
         self.view_delta_state = ViewDeltaCommitState::NotStarted;
         self.auto_txn_cleanup = TxnCleanup::None;
+        self.schema_undo = None;
+        self.uses_mvcc_savepoint = false;
         self.fk_immediate_violations_during_stmt
             .store(0, Ordering::SeqCst);
         self.fk_deferred_violations_when_stmt_started
@@ -1389,6 +1400,7 @@ impl ProgramState {
             if let Some(mv_store) = connection.mv_store().as_ref() {
                 if let Some(tx_id) = connection.get_mv_tx_id() {
                     mv_store.begin_savepoint(tx_id);
+                    self.uses_mvcc_savepoint = true;
                 }
             } else {
                 // Non-MVCC mode: use pager savepoints
@@ -1417,6 +1429,26 @@ impl ProgramState {
         self.fk_immediate_violations_during_stmt
             .store(0, Ordering::Release);
         Ok(IOResult::Done(()))
+    }
+
+    /// Called by every opcode before it changes database `db`'s in-memory schema on this
+    /// connection. The first call keeps the schemas for a statement rollback, and each call marks
+    /// the transaction as a schema change so a transaction rollback restores the committed schema:
+    /// before this, only SetCookie marked it, so a DDL that failed between its ParseSchema or
+    /// AddType and its SetCookie kept an in-memory table whose root page the rollback freed.
+    pub(crate) fn note_schema_change(&mut self, connection: &Connection, db: usize) {
+        if self.schema_undo.is_none() {
+            self.schema_undo = Some(connection.schema_snapshot());
+        }
+        if db == crate::MAIN_DB_ID {
+            if let TransactionState::Write { .. } = connection.get_tx_state() {
+                connection.set_tx_state(TransactionState::Write {
+                    schema_did_change: true,
+                });
+            }
+        } else if db == crate::TEMP_DB_ID && connection.temp.database.read().is_some() {
+            connection.mark_temp_schema_did_change();
+        }
     }
 
     /// End a statement subtransaction.
@@ -1516,6 +1548,24 @@ impl ProgramState {
                     None
                 };
 
+                // The pagers rolled this statement's pages back, so its in-memory schema changes go:
+                // only when a savepoint was rolled back and the rollback succeeded (adversary of
+                // 5650219c0, LOWs 4 and 5: in autocommit nothing is rolled back here, and a
+                // transaction rollback restores the committed schema itself).
+                let rolled_back_pages = std::mem::take(&mut self.uses_mvcc_savepoint)
+                    || self.uses_subjournal
+                    || !attached_pagers.is_empty();
+                if let Some(undo) = self.schema_undo.take() {
+                    if rolled_back_pages && pager_err.is_none() {
+                        connection.restore_schema_snapshot(undo);
+                        // As ROLLBACK TO does: the cookies cached before the rollback are stale.
+                        pager.set_schema_cookie(None);
+                        for p in &attached_pagers {
+                            p.set_schema_cookie(None);
+                        }
+                    }
+                }
+
                 // Always restore FK violation counters on statement rollback,
                 // regardless of whether a pager savepoint was opened.
                 // Mirrors SQLite's vdbeCloseStatement (vdbeaux.c:3243-3246).
@@ -1531,6 +1581,7 @@ impl ProgramState {
                 }
             }
         };
+        self.uses_mvcc_savepoint = false;
         if self.uses_subjournal {
             pager.stop_use_subjournal();
             self.uses_subjournal = false;
@@ -1734,6 +1785,15 @@ impl PrepareContext {
         Self {
             database_ptr: connection.database_ptr(),
             generation: connection.prepare_context_generation(),
+        }
+    }
+
+    /// `from_connection`, keyed at a generation read earlier (before translation; review c42b
+    /// MED-4).
+    pub fn from_connection_at(connection: &Connection, generation: u64) -> Self {
+        Self {
+            database_ptr: connection.database_ptr(),
+            generation,
         }
     }
 
@@ -3109,6 +3169,7 @@ impl Program {
                 // is rolling back the whole MVCC transaction.
             }
             let must_rollback_tx_if_needed = can_autocommit_now || changed_shared_mvcc_auto_txn;
+            let mut statement_rollback_failed = false;
             if err.is_some() && !pager.is_checkpointing() {
                 // For ON CONFLICT FAIL, do NOT rollback the statement savepoint —
                 // changes made before the error should persist.
@@ -3122,6 +3183,7 @@ impl Program {
                         pager,
                         EndStatement::RollbackSavepoint,
                     ) {
+                        statement_rollback_failed = true;
                         capture_abort_error(
                             &mut abort_error,
                             end_stmt_err,
@@ -3304,6 +3366,7 @@ impl Program {
                                 pager,
                                 EndStatement::RollbackSavepoint,
                             ) {
+                                statement_rollback_failed = true;
                                 capture_abort_error(
                                     &mut abort_error,
                                     end_stmt_err,
@@ -3338,6 +3401,14 @@ impl Program {
                         }
                     }
                 },
+            }
+            // A statement whose own rollback failed left part of itself in its transaction, and
+            // its schema undo was skipped: as SQLite's sqlite3VdbeHalt does when
+            // vdbeCloseStatement fails (sqlite3RollbackAll, sqlite3CloseSavepoints, autoCommit = 1),
+            // the whole transaction rolls back. Queue a-f review L6.
+            if statement_rollback_failed && !self.connection.get_auto_commit() {
+                self.rollback_current_txn(pager);
+                self.connection.clear_named_savepoints();
             }
         }
         if state.uses_subjournal {

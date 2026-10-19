@@ -332,8 +332,11 @@ impl CompiledExpression {
             syms,
             true,
             DoubleQuotedDml::Enabled,
-            std::sync::Arc::new(crate::dialect::SqliteDialect),
+            // The database's dialect, as a plain view's (dialect code review MED-3: it was SqliteDialect).
+            connection.dialect(),
             &None,
+            // A view's expressions compile no CREATE: no row of its own is stored.
+            crate::connection::SqlSource::Engine,
         );
 
         // Translate the transformed expression to bytecode

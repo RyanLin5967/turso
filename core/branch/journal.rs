@@ -113,6 +113,56 @@ const SNAP_MAGIC: &[u8; 8] = b"TFBRSNP1";
 /// keeps (`scan_base`). A 15 or 16 reader resets that log and loses them, so the layout, unchanged,
 /// takes a new number that reader refuses; this build refuses a 15 or 16 store in turn, never
 /// reinterprets it (red `a_store_needing_the_older_log_replay_is_refused_by_an_older_format`).
+/// LEAP L2(c) (ASYNC-DESIGN R1.7): the log buffer's two segments, allocated at open and every page
+/// touched then, so no record buffered and no flight taken grows one or faults a page in: one is
+/// `pending`, the other is the last flight's, returned before it lands (`Flight`'s drop). 64 KiB is
+/// DESIGN §3's flight cap ("the size measured as flat"); a flight past it grows its segment,
+/// counted (`pending_reallocs`). L1 sizes them from CAP_BYTES (R1.10).
+const LOG_SEGMENT: usize = 64 << 10;
+/// Slots named by one segment's records, reserved likewise (`pending_slots`).
+const LOG_SEGMENT_SLOTS: usize = 1024;
+
+/// One log-buffer segment, every page written once so its first use faults nothing in.
+fn log_segment() -> Vec<u8> {
+    // One non-zero volatile write per page, so the page is really touched: a zeroing `resize` can be
+    // turned by the optimizer into an untouched zeroed allocation (engine-rev-l2b HIGH B: 882 of 960
+    // pages faulted in later in a release build), and a volatile store cannot be elided.
+    // The first byte, then every page boundary after it (the buffer need not start on one: stepping
+    // 4 KiB from its base skipped the last of the 17 pages a mid-page start spans, engine-rev-l2b
+    // LOW), so every page the buffer covers is written.
+    let mut v: Vec<u8> = Vec::with_capacity(LOG_SEGMENT);
+    let base = v.as_mut_ptr();
+    let first_boundary = (4096 - (base as usize % 4096)) % 4096;
+    // SAFETY: every offset written is < LOG_SEGMENT, within the capacity just allocated; the bytes
+    // are never read as initialized (the Vec stays empty).
+    unsafe { std::ptr::write_volatile(base, 1u8) };
+    for at in (first_boundary..LOG_SEGMENT).step_by(4096) {
+        unsafe { std::ptr::write_volatile(base.add(at), 1u8) };
+    }
+    v
+}
+
+/// A journal's two log segments and its slot reservation (LEAP L2(c)), made where no store mutex is
+/// held: a fresh store makes them at open (`StoreInner::fresh_mode`) and the journal its first
+/// create starts takes them, so that create allocates none of them in its hold (a D0 store's first
+/// create held 184,723 bytes under the mutex at 458b9bffd, about 131 KB of it the two segments:
+/// a_d0_create_allocates_at_most_64_kib_under_the_store_mutex_as_branches_grow on iccad10).
+pub(crate) struct LogBuffers {
+    pending: Vec<u8>,
+    slots: Vec<Slot>,
+    recycled: Vec<u8>,
+}
+
+impl LogBuffers {
+    pub(crate) fn new() -> Self {
+        Self {
+            pending: log_segment(),
+            slots: Vec::with_capacity(LOG_SEGMENT_SLOTS),
+            recycled: log_segment(),
+        }
+    }
+}
+
 const FORMAT_VERSION: u32 = 17;
 const SPLICE_FORMAT_VERSION: u32 = 18;
 
@@ -1157,6 +1207,10 @@ pub(crate) struct Journal {
     pending: Vec<u8>,
     /// Arena slots named by records still in `pending` (the failpoint reports them as orphans).
     pub(crate) pending_slots: Vec<Slot>,
+    /// Observation only (ASYNC-DESIGN R1.7's `pending_reallocs`, LEAP L2(c)): how many times
+    /// buffering a record or taking a flight grew `pending`, `pending_slots` or a flight's bytes,
+    /// i.e. allocated under the store mutex.
+    pending_reallocs: u64,
     snapshot_len: u64,
     sync: SyncClass,
     /// Set by an I/O failure, or a failpoint standing in for a crash. From then on nothing more is
@@ -1425,7 +1479,7 @@ impl Journal {
 
     /// The first half of `create`: lock the log and check it holds no state. Writes nothing.
     pub(crate) fn open_fresh(files: &BranchFiles, page_size: usize, sync: SyncClass) -> Result<Journal> {
-        Self::open_fresh_with(files, page_size, sync, false)
+        Self::open_fresh_with(files, page_size, sync, false, None)
     }
 
     /// `open_fresh`, with the `CreateLockFails` failpoint.
@@ -1434,7 +1488,10 @@ impl Journal {
         page_size: usize,
         sync: SyncClass,
         fail_lock: bool,
+        buffers: Option<LogBuffers>,
     ) -> Result<Journal> {
+        // Made here only when the caller had none ready (a test, or a store started over).
+        let buffers = buffers.unwrap_or_else(LogBuffers::new);
         refuse_links(files, files.cat.exists())?;
         // Lock before touching anything, so a refused create has truncated nothing.
         if fail_lock {
@@ -1463,8 +1520,9 @@ impl Journal {
             page_size: page_size as u32,
             generation: 0,
             len: 0,
-            pending: Vec::new(),
-            pending_slots: Vec::new(),
+            pending: buffers.pending,
+            pending_slots: buffers.slots,
+            pending_reallocs: 0,
             snapshot_len: 0,
             sync,
             poisoned: Arc::new(AtomicBool::new(false)),
@@ -1474,7 +1532,7 @@ impl Journal {
             fail_next_take: false,
             fail_next_confirm: false,
             shared: None,
-            recycled: Arc::new(std::sync::Mutex::new(None)),
+            recycled: Arc::new(std::sync::Mutex::new(Some(buffers.recycled))),
             retired: None,
             fail_next_replacement_sync: AtomicBool::new(false),
             format: FORMAT_VERSION,
@@ -1670,8 +1728,9 @@ impl Journal {
             page_size,
             generation,
             len: 0,
-            pending: Vec::new(),
-            pending_slots: Vec::new(),
+            pending: log_segment(),
+            pending_slots: Vec::with_capacity(LOG_SEGMENT_SLOTS),
+            pending_reallocs: 0,
             snapshot_len,
             sync,
             poisoned: Arc::new(AtomicBool::new(false)),
@@ -1681,7 +1740,7 @@ impl Journal {
             fail_next_take: false,
             fail_next_confirm: false,
             shared: None,
-            recycled: Arc::new(std::sync::Mutex::new(None)),
+            recycled: Arc::new(std::sync::Mutex::new(Some(log_segment()))),
             retired: None,
             fail_next_replacement_sync: AtomicBool::new(false),
             format,
@@ -2097,7 +2156,9 @@ impl Journal {
         let drop_pending = from.saturating_sub(file_from) as usize;
         if drop_pending > 0 {
             self.pending.drain(..drop_pending);
-            self.pending_slots = slots_named(&self.pending);
+            // In place, keeping the slots' reservation (engine-rev-l2b MED: a fresh Vec dropped it).
+            self.pending_slots.clear();
+            slots_named_into(&self.pending, &mut self.pending_slots);
         }
         if class.syncs() {
             if let Err(e) = fsync_dir_of(&self.files.log, class) {
@@ -2514,6 +2575,20 @@ impl Journal {
     /// Queue a record. It reaches the file only through [`Journal::flush`].
     pub(crate) fn buffer(&mut self, record: &Record) -> Result<()> {
         self.check_live()?;
+        let caps = (self.pending.capacity(), self.pending_slots.capacity());
+        let result = self.buffer_counted(record);
+        if (self.pending.capacity(), self.pending_slots.capacity()) != caps {
+            self.pending_reallocs += 1;
+        }
+        result
+    }
+
+    /// The log buffer's growths so far (`pending_reallocs`).
+    pub(crate) fn pending_reallocs(&self) -> u64 {
+        self.pending_reallocs
+    }
+
+    fn buffer_counted(&mut self, record: &Record) -> Result<()> {
         // Encoded in place after its frame header, which is filled in once the payload's length and
         // checksum are known; room for the flight's end frame is kept, so `take_flight` need not
         // reallocate. Mutant `record_encoded_aside` (test builds only): through a Vec of its own,
@@ -2791,7 +2866,13 @@ impl Journal {
         } else {
             self.recycled.lock().ok().and_then(|mut slot| slot.take())
         };
-        let mut bytes = std::mem::replace(&mut self.pending, next.unwrap_or_default());
+        let next = next.unwrap_or_else(|| {
+            // The segment the last flight returns before it lands was not back (mutant
+            // `flight_buffer_not_recycled`, or a flight that never wrote): one allocated here.
+            self.pending_reallocs += 1;
+            log_segment()
+        });
+        let mut bytes = std::mem::replace(&mut self.pending, next);
         let names_slots = !self.pending_slots.is_empty();
         self.pending_slots.clear();
         self.pending_class = SyncClass::Off;
@@ -2803,6 +2884,9 @@ impl Journal {
         // The flight's end frame goes in the same write, built by `Flight::write` with no lock held
         // (review 2 #8); its room is reserved here. An upgrade has no frames and no end.
         if !bytes.is_empty() {
+            if bytes.capacity() - bytes.len() < END_FRAME_LEN {
+                self.pending_reallocs += 1;
+            }
             bytes.reserve_exact(END_FRAME_LEN);
             self.len += END_FRAME_LEN as u64;
             self.last_names_slots = names_slots;
@@ -3504,8 +3588,9 @@ fn fresh_nonce(old: u32) -> u32 {
 /// The arena slots the records in `frames` (whole encoded frames, as `Journal::pending` holds
 /// them) name: what `Journal::buffer` pushes to `pending_slots`, re-derived after a prefix of the
 /// buffer was dropped (F-FZ). A frame that does not decode names nothing.
-fn slots_named(frames: &[u8]) -> Vec<Slot> {
-    let mut out = Vec::new();
+/// Appended to `out` (a rewrite's `pending_slots`, keeping its reservation, with no list of its
+/// own; each decoded Commit still allocates its pages, on this rewrite path only).
+fn slots_named_into(frames: &[u8], out: &mut Vec<Slot>) {
     let mut pos = 0;
     while let Some(head) = frames.get(pos..pos + FRAME_HEADER_LEN) {
         let len = u32::from_le_bytes(head[0..4].try_into().expect("four bytes")) as usize;
@@ -3520,7 +3605,6 @@ fn slots_named(frames: &[u8]) -> Vec<Slot> {
         }
         pos = start + len;
     }
-    out
 }
 
 /// One group flight (fastest-engine M1 item 2; gc 389b474b4): frames taken from a journal's buffer
@@ -7000,5 +7084,43 @@ mod format_tests {
             let want = if written.syncs() && rewrite { END_SYNCED_TAG } else { END_TAG };
             assert_eq!(tag, want, "written in {written:?}, rewritten syncing={rewrite}: the end frame's tag");
         }
+    }
+}
+
+/// engine-rev-l2b HIGH B (its probe, as a red; LEAP L2(c), R1.7 "no first touch"): writing a fresh
+/// log segment faults no page in, in every build, the release build included, where the compiler may
+/// turn the zeroing pre-fault into an untouched zeroed allocation. The control, an untouched Vec of
+/// the same size, must fault, or the instrument sees nothing. Linux (getrusage RUSAGE_THREAD).
+#[cfg(all(test, target_os = "linux"))]
+mod log_segment_prefault_tests {
+    use super::*;
+
+    fn minflt() -> i64 {
+        // SAFETY: a zeroed out-struct filled by the call.
+        let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+        unsafe { libc::getrusage(libc::RUSAGE_THREAD, &mut ru) };
+        ru.ru_minflt
+    }
+
+    #[test]
+    fn a_fresh_log_segment_faults_no_page_when_written() {
+        let mut keep = Vec::new();
+        let (mut seg, mut ctl) = (0i64, 0i64);
+        for _ in 0..64 {
+            let mut v = log_segment();
+            let f0 = minflt();
+            v.resize(LOG_SEGMENT, 1);
+            seg += minflt() - f0;
+            keep.push(v);
+            let mut c: Vec<u8> = Vec::with_capacity(LOG_SEGMENT);
+            let f0 = minflt();
+            c.resize(LOG_SEGMENT, 1);
+            ctl += minflt() - f0;
+            keep.push(c);
+        }
+        std::hint::black_box(&keep);
+        let pages = (64 * LOG_SEGMENT / 4096) as i64;
+        assert!(ctl >= pages / 2, "premise: the untouched control faulted ({ctl} of {pages} pages)");
+        assert!(seg <= 8, "CLAIM: writing 64 fresh log segments faulted {seg} pages in (control {ctl})");
     }
 }

@@ -328,6 +328,9 @@ pub struct Statement {
     /// under the same ones, never defaults (wire-rework review B-H2; PG re-analyses a kept
     /// statement under the session's search_path).
     prepare_options: PrepareOptions,
+    /// What this statement's text is (`SqlKind`: its syntax and its source), fixed where the text was
+    /// made: a re-prepare parses it with the same parser (the wire's NO SILENT DIALECT SWITCH class).
+    kind: crate::connection::SqlKind,
 }
 
 crate::assert::assert_send_sync!(Statement);
@@ -358,11 +361,14 @@ impl Statement {
         crate::vdbe::execute::index_method_register_transaction_all(&mut self.state, connection)
     }
 
+    /// `kind` has no default (dialect design REVISION 1 item 6): a constructor that forgets it does
+    /// not compile.
     pub fn new(
         program: vdbe::Program,
         pager: Arc<Pager>,
         query_mode: QueryMode,
         tail_offset: usize,
+        kind: crate::connection::SqlKind,
     ) -> Self {
         Self::new_with_origin(
             program,
@@ -371,6 +377,7 @@ impl Statement {
             tail_offset,
             StatementOrigin::Root,
             false,
+            kind,
         )
     }
 
@@ -382,6 +389,7 @@ impl Statement {
         tail_offset: usize,
         origin: StatementOrigin,
         nested_guard_active: bool,
+        kind: crate::connection::SqlKind,
     ) -> Self {
         let (max_registers, cursor_count) = match query_mode {
             QueryMode::Normal => (program.max_registers, program.cursor_ref.len()),
@@ -409,7 +417,13 @@ impl Statement {
             is_blob_handle: false,
             nested_guard_active,
             prepare_options: PrepareOptions::default(),
+            kind,
         }
+    }
+
+    /// What this statement's text is (its syntax and source), fixed where the text was made.
+    pub(crate) fn kind(&self) -> &crate::connection::SqlKind {
+        &self.kind
     }
 
     /// The options this statement was prepared under, kept for its re-prepares.
@@ -900,6 +914,14 @@ impl Statement {
         #[cfg(test)]
         crate::branch::budget_probe::statement_prepared();
         tracing::trace!("repreparing statement");
+        // A subprogram (a trigger's, an FK action's) is compiled inside its parent under the
+        // parent's search path, which its own Statement does not carry (review reprepare LOW-B2):
+        // re-prepared alone it would resolve under defaults. Its parent re-prepares first at its
+        // own Init, so this is unreachable; refused if it ever is.
+        turso_assert!(
+            self.origin != StatementOrigin::Subprogram,
+            "a subprogram statement re-prepared on its own, without its parent's prepare options"
+        );
         let conn = self.program.connection.clone();
         let main_pager = conn.pager.load().clone();
 
@@ -960,8 +982,17 @@ impl Statement {
         // publish new btree roots without bumping the schema cookie, so
         // same-version reprepare still refreshes it.
         conn.refresh_schema_from_shared_for_reprepare();
+        // The key before the re-parse and re-translation read any state it covers (review c42b
+        // MED-4).
+        let prepare_generation = conn.prepare_context_generation();
         let new_program = {
-            let (cmd, _) = conn.parse_sql(&self.program.sql)?;
+            // Through the dialect's connection-aware hook (wire-rework E-M2): a frontend whose
+            // translation needs the connection re-translates as its own prepare did.
+            let (cmd, _) = match self.kind.syntax() {
+                crate::connection::Syntax::Client => conn.db.dialect().parse_for_reprepare(&self.program.sql, &conn)?,
+                // SQLite text re-parsed as SQLite (the wire's NO SILENT DIALECT SWITCH class).
+                crate::connection::Syntax::Sqlite => crate::dialect::sqlite::parse(&self.program.sql)?,
+            };
             let cmd = cmd.expect("Same SQL string should be able to be parsed");
 
             let syms = conn.syms.read();
@@ -981,8 +1012,9 @@ impl Statement {
                 &syms,
                 mode,
                 &self.program.sql,
-                self.origin,
                 prepare_options,
+                &self.kind,
+                prepare_generation,
             )?
         };
 

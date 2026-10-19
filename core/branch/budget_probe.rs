@@ -1424,9 +1424,145 @@ pub(crate) fn threads() -> Option<u64> {
 /// (review 2 M6).
 pub(crate) fn others_blocked() -> Option<bool> {
     let mut all = true;
-    each_thread(|me, blocked| all &= me || blocked)?;
-    Some(all)
+    if each_thread(|me, blocked| all &= me || blocked).is_some() {
+        return Some(all);
+    }
+    linux_others_blocked()
 }
+
+/// Linux: whether every thread but the caller is blocked, from each `/proc/self/task/<tid>/stat`'s
+/// state (field 3): anything but `R` (running) counts as blocked, as a Mach thread off the run queue
+/// does above. Read by raw syscalls into stack buffers (getdents64 for the task list): no
+/// allocation, so it can be read inside a window whose allocations are counted (its syscalls are
+/// not counted off Apple). `None` where any part cannot be read: the window refuses (review 2 M6).
+/// Blind spot, stated: a thread that is runnable but not yet on a CPU reads `R` and counts as not
+/// blocked, which only makes a window refuse or wait, never settle early.
+fn linux_others_blocked() -> Option<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: gettid(2) has no preconditions (not libc::gettid: glibc 2.30+, see budget_tests).
+        let me = unsafe { libc::syscall(libc::SYS_gettid) } as u64;
+        // SAFETY: a NUL-terminated path; the descriptor is closed below.
+        let dir = unsafe { libc::open(b"/proc/self/task\0".as_ptr().cast(), libc::O_RDONLY | libc::O_DIRECTORY) };
+        if dir < 0 {
+            return None;
+        }
+        let mut all = Some(true);
+        let mut buf = [0u8; 4096];
+        'read: loop {
+            // SAFETY: `buf` is writable for its length; the descriptor is a directory.
+            let n = unsafe { libc::syscall(libc::SYS_getdents64, dir, buf.as_mut_ptr(), buf.len()) };
+            if n < 0 {
+                all = None;
+                break;
+            }
+            if n == 0 {
+                break;
+            }
+            let mut off = 0usize;
+            while off + 19 <= n as usize {
+                // linux_dirent64: d_ino u64, d_off i64, d_reclen u16, d_type u8, d_name NUL-terminated.
+                let reclen = u16::from_ne_bytes([buf[off + 16], buf[off + 17]]) as usize;
+                if reclen == 0 {
+                    all = None;
+                    break 'read;
+                }
+                let name = &buf[off + 19..off + reclen];
+                let name = &name[..name.iter().position(|&b| b == 0).unwrap_or(name.len())];
+                off += reclen;
+                let Some(tid) = std::str::from_utf8(name).ok().and_then(|t| t.parse::<u64>().ok()) else {
+                    continue; // "." and ".."
+                };
+                if tid == me {
+                    continue;
+                }
+                match linux_task_running(tid) {
+                    TaskState::Running(false) => {}
+                    TaskState::Running(true) => all = all.map(|_| false),
+                    // A thread that exited between the list and its read is not running.
+                    TaskState::Gone => {}
+                    // Any other failure refuses: unread is not "not running" (engine-rev-qaf-fix
+                    // MED-8: it failed open).
+                    TaskState::Unreadable => all = None,
+                }
+            }
+        }
+        // SAFETY: the descriptor opened above.
+        unsafe { libc::close(dir) };
+        all
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// Whether thread `tid` of this process is running (`R`), from `/proc/self/task/<tid>/stat`; `None`
+/// when it cannot be read (it exited).
+#[cfg(target_os = "linux")]
+fn linux_task_running(tid: u64) -> TaskState {
+    // engine-rev-qaf-fix MED-8's red: a read that cannot be understood, as a test hook.
+    if STAT_UNREADABLE_FOR_TEST.load(Relaxed) {
+        return TaskState::Unreadable;
+    }
+    // "/proc/self/task/" + digits + "/stat" + NUL, built in a stack buffer.
+    let mut path = [0u8; 64];
+    let head = b"/proc/self/task/";
+    path[..head.len()].copy_from_slice(head);
+    let mut digits = [0u8; 20];
+    let (mut d, mut v) = (0usize, tid);
+    loop {
+        digits[d] = b'0' + (v % 10) as u8;
+        d += 1;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    let mut at = head.len();
+    for i in (0..d).rev() {
+        path[at] = digits[i];
+        at += 1;
+    }
+    let tail = b"/stat\0";
+    path[at..at + tail.len()].copy_from_slice(tail);
+    // SAFETY: a NUL-terminated path; the descriptor is closed below.
+    let fd = unsafe { libc::open(path.as_ptr().cast(), libc::O_RDONLY) };
+    if fd < 0 {
+        // ENOENT/ESRCH: the thread exited after the listing. Anything else is unread.
+        let errno = std::io::Error::last_os_error().raw_os_error();
+        return if matches!(errno, Some(libc::ENOENT) | Some(libc::ESRCH)) {
+            TaskState::Gone
+        } else {
+            TaskState::Unreadable
+        };
+    }
+    let mut buf = [0u8; 512];
+    // SAFETY: `buf` is writable for its length.
+    let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+    // SAFETY: the descriptor opened above.
+    unsafe { libc::close(fd) };
+    let Some(text) = usize::try_from(n).ok().and_then(|n| buf.get(..n)) else {
+        return TaskState::Unreadable;
+    };
+    // The command name (field 2) is parenthesised and may hold spaces: the state follows its ')'.
+    let Some(state) = text.iter().rposition(|&b| b == b')').and_then(|close| text.get(close + 2)) else {
+        return TaskState::Unreadable;
+    };
+    TaskState::Running(*state == b'R')
+}
+
+/// One thread's state as `/proc/self/task/<tid>/stat` gives it.
+#[cfg(target_os = "linux")]
+enum TaskState {
+    Running(bool),
+    Gone,
+    Unreadable,
+}
+
+/// Test hook (engine-rev-qaf-fix MED-8): every per-thread stat read fails to be understood.
+#[cfg(target_os = "linux")]
+pub(crate) static STAT_UNREADABLE_FOR_TEST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn linux_threads() -> Option<u64> {
     #[cfg(target_os = "linux")]
@@ -1452,4 +1588,25 @@ fn linux_threads() -> Option<u64> {
     {
         None
     }
+}
+
+/// engine-rev-qaf-fix MED-8: a per-thread stat that cannot be read or parsed makes the probe
+/// refuse (None), never read as "not running": failing open let a window read "every other thread
+/// blocked" over threads it could not see.
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn others_blocked_refuses_when_a_threads_stat_cannot_be_read() {
+    let spinner_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop = spinner_stop.clone();
+    let spinner = std::thread::spawn(move || {
+        while !stop.load(Relaxed) {
+            std::hint::spin_loop();
+        }
+    });
+    STAT_UNREADABLE_FOR_TEST.store(true, Relaxed);
+    let read = others_blocked();
+    STAT_UNREADABLE_FOR_TEST.store(false, Relaxed);
+    spinner_stop.store(true, Relaxed);
+    spinner.join().unwrap();
+    assert_eq!(read, None, "CLAIM: unreadable thread states refuse the probe");
 }

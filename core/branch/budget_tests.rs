@@ -769,6 +769,9 @@ fn shared(cell: &str, db: &Arc<Database>, c: u64, out: &mut String) {
         let go = std::sync::atomic::AtomicBool::new(false);
         let e0 = exceptions(db);
         let s0 = sync_counts();
+        let gathers0 = db.branches.gather_counters();
+        let ns0 = db.branches.gather_and_flight_ns();
+        let wall0 = std::time::Instant::now();
         // Per client, from its start to its last acknowledgement: the store's condition-variable
         // waits (`store::thread_waits`, one per wait call, so a futile wake-up that waits again
         // counts again), and the most any one acknowledgement waited (review 2 H5: a sum is a mean,
@@ -865,11 +868,20 @@ fn shared(cell: &str, db: &Arc<Database>, c: u64, out: &mut String) {
             }
             per
         });
+        let wall_ns = wall0.elapsed().as_nanos() as u64;
         let s1 = sync_counts();
         let e1 = exceptions(db);
+        let gathers1 = db.branches.gather_counters();
+        let ns1 = db.branches.gather_and_flight_ns();
         let mut m = Sample::new();
         put_exceptions(&mut m, e0, e1);
         m.insert("threads", c);
+        // LEAP L3, observation only: the cohort gathers the leaders held, and those that expired.
+        m.insert("gathers", gathers1[0] - gathers0[0]);
+        m.insert("gathers_expired", gathers1[1] - gathers0[1]);
+        m.insert("gather_ns", ns1[0] - ns0[0]);
+        m.insert("flight_ns", ns1[1] - ns0[1]);
+        m.insert("wall_ns", wall_ns);
         m.insert("acks", c * rounds * if cfw { 2 } else { 1 });
         m.insert("full_fsync", s1.full_fsync - s0.full_fsync);
         m.insert("fsync", s1.fsync - s0.fsync);
@@ -3080,6 +3092,30 @@ fn create_allocates_no_table_of_every_branch_under_the_store_mutex() {
     );
 }
 
+/// LEAP L2(b) (ASYNC-DESIGN R1.2, "the branch table never allocates on the create path"): while
+/// the live branches grow by 23,040 from 10^4, no create allocates a branch-table chunk (64 states,
+/// 23,552 B at 368 B a state) or a directory segment (24 KiB) under the store mutex: both come from
+/// a pool the store's background writer refills off the mutex. The bound, 8 KiB, sits below either
+/// (registered here, before the first run); the name, records and log frames a create allocates
+/// there are far below it.
+#[test]
+fn leap_l2b_a_create_allocates_no_table_chunk_under_the_store_mutex() {
+    if in_child() {
+        return;
+    }
+    let c = cell("growth_n1e4");
+    let threads = &c.ops["growth_thread"];
+    let creates: u64 = threads.iter().map(|t| t["creates"]).sum();
+    assert_eq!(creates, GROWTH, "premise: every growth create counted");
+    let worst = threads.iter().map(|t| t["max_held_alloc_bytes"]).max().unwrap();
+    assert!(
+        worst <= 8 << 10,
+        "LEAP L2(b) not reached: a create allocated {worst} bytes under the store mutex while the live \
+         branches grew by {GROWTH} (a table chunk of {} states is about 23,552 B); budget 8 KiB",
+        super::table::CHUNK
+    );
+}
+
 // ---- connect by name: a resident branch, just created ----
 
 /// A resident branch's name and state are in memory (names map, states): connecting reads,
@@ -3738,7 +3774,19 @@ fn leap_l3_creates_per_flush_rise_with_the_clients() {
             let (acks, flushes) = (s["acks"], s[FULL]);
             assert!(flushes > 0, "{spec}: {arm}: no flush counted: the instrument saw nothing");
             let per = acks as f64 / flushes as f64;
-            let _ = write!(seen, " C={c}/{arm} {per:.2} ({acks}/{flushes});");
+            // FLAGGED, diagnostic text only: the gather's own counters beside each ratio.
+            // FLAGGED, diagnostic text only (LEAP L3's diagnosis; host timing, never credited): the
+            // mean gather and flight in µs, and the cell's wall time per acknowledgement.
+            let mean_us = |ns: &str, n: u64| s.get(ns).copied().unwrap_or(0) as f64 / n.max(1) as f64 / 1e3;
+            let gathers = s.get("gathers").copied().unwrap_or(0);
+            let _ = write!(
+                seen,
+                " C={c}/{arm} {per:.2} ({acks}/{flushes}; gathers {gathers} expired {}; gather {:.0} us, flight {:.0} us, wall {:.0} us/ack);",
+                s.get("gathers_expired").copied().unwrap_or(0),
+                mean_us("gather_ns", gathers),
+                mean_us("flight_ns", flushes),
+                mean_us("wall_ns", acks),
+            );
             if c <= 64 && per < 0.9 * c as f64 {
                 let _ = writeln!(failures, "  C={c}: {arm}: {acks} acknowledgements over {flushes} flushes = {per:.2} per flush, budget >= {:.1}", 0.9 * c as f64);
             }
@@ -4765,4 +4813,50 @@ fn a_cell_whose_window_moved_an_exception_counter_is_not_credited() {
         text.contains("not credited") && text.contains("exc_inline_compaction_syncs moved"),
         "exc_sharp was refused, but not as a moved exception counter (DECISIONS bd0d845f97):\n{text}"
     );
+}
+
+/// The Linux port of `probe::others_blocked` (LEAP L3's cells refused on Linux: "whether the other
+/// threads are blocked cannot be read on this platform"), fired both ways: with one other thread
+/// spinning it reads `false`; once that thread parks, `true` within 10 s. Apple reads it from Mach
+/// (`each_thread`), as before.
+#[cfg(target_os = "linux")]
+#[test]
+fn others_blocked_reads_a_spinning_thread_and_a_parked_one_on_linux() {
+    use std::sync::atomic::{AtomicBool, Ordering::{Acquire, Release}};
+    let (spin, park) = (Arc::new(AtomicBool::new(true)), Arc::new(AtomicBool::new(false)));
+    let t = {
+        let (spin, park) = (spin.clone(), park.clone());
+        std::thread::spawn(move || {
+            while spin.load(Acquire) {
+                std::hint::spin_loop();
+            }
+            while !park.load(Acquire) {
+                std::thread::park_timeout(std::time::Duration::from_millis(50));
+            }
+        })
+    };
+    // The spinner must be seen running at least once (a busy host may deschedule it for a moment).
+    let start = std::time::Instant::now();
+    let mut saw_running = false;
+    while start.elapsed() < std::time::Duration::from_secs(10) {
+        if probe::others_blocked() == Some(false) {
+            saw_running = true;
+            break;
+        }
+    }
+    spin.store(false, Release);
+    let start = std::time::Instant::now();
+    let mut saw_blocked = false;
+    while start.elapsed() < std::time::Duration::from_secs(10) {
+        if probe::others_blocked() == Some(true) {
+            saw_blocked = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    park.store(true, Release);
+    t.thread().unpark();
+    t.join().unwrap();
+    assert!(saw_running, "CLAIM: others_blocked never read a spinning thread as running");
+    assert!(saw_blocked, "CLAIM: others_blocked never read a parked thread as blocked");
 }

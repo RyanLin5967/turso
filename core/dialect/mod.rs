@@ -15,6 +15,14 @@ pub mod sqlite;
 use crate::error::{SqlErrorKind, SqlErrorMessage};
 pub use sqlite::SqliteDialect;
 
+/// What a RENAME or an ALTER did to a table, for `Dialect::format_changed_table_sql`.
+pub enum TableChange<'a> {
+    /// RENAME rebuilt the table's CREATE statement.
+    Rewritten(&'a turso_parser::ast::Stmt),
+    /// ADD/DROP COLUMN changed the table in place.
+    Altered(&'a crate::schema::BTreeTable),
+}
+
 /// SQL dialect layered on top of the engine.
 ///
 /// Every [`crate::Database`] carries a dialect, supplied explicitly by
@@ -39,6 +47,20 @@ pub trait Dialect: Send + Sync + 'static {
     /// canonical SQLite text produced by the engine AST formatter because
     /// engine-generated and AST-only statements use that representation.
     fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)>;
+
+    /// Parse `sql` again for a statement the engine re-prepares on `conn` (after a
+    /// prepare-generation bump or another session's schema change), so a frontend whose
+    /// translation needs the connection (its schema, for a column lookup: DELETE ... USING, a
+    /// positional INSERT with DEFAULT, an alias column list) re-translates as its own prepare did
+    /// (wire-rework review E-M2). Default: [`Dialect::parse`], for dialects that need no
+    /// connection.
+    fn parse_for_reprepare(
+        &self,
+        sql: &str,
+        _conn: &crate::sync::Arc<crate::Connection>,
+    ) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+        self.parse(sql)
+    }
 
     /// Parse a `sqlite_schema` `type='table'` row's SQL into a table
     /// definition.
@@ -73,6 +95,13 @@ pub trait Dialect: Send + Sync + 'static {
     /// internal engine tables must retain the SQLite fallback used by the
     /// schema parsing methods.
     fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String>;
+
+    /// `table_sql_for_replay` with the syntax the returned text is in (dialect design REVISION 2 item 4):
+    /// VACUUM prepares the text with that parser and stores the row's own bytes verbatim. REQUIRED, with
+    /// no default (dialect code review MED-4: a default labelled every replayed row SQLite, which is wrong
+    /// for any dialect whose replay text is its own): a dialect whose replay text is SQLite returns
+    /// `StoredSql::sqlite`, a frontend whose replay text is its own DDL `StoredSql::client` for those rows.
+    fn table_sql_for_replay_stored(&self, sql: &str) -> crate::Result<crate::connection::StoredSql>;
 
     /// Produce the SQL text to store in `sqlite_schema` for a
     /// `CREATE TABLE`.
@@ -112,6 +141,27 @@ pub trait Dialect: Send + Sync + 'static {
     /// connect (fastest-engine; engine review 20 HIGH 1).
     fn format_altered_table_sql(&self, table: &crate::schema::BTreeTable) -> crate::Result<String> {
         Ok(table.to_sql())
+    }
+
+    /// Whether `sql`, a stored `sqlite_schema` table row, is in this dialect's own form (dialect design
+    /// REVISION 2 item 8): the schema loader records the answer on the table (`BTreeTable::dialect_owned`),
+    /// so a RENAME or ALTER rewrites the row in the same form it was in. Required, with no default: a
+    /// default of "none" would canonicalise a frontend's own rows on ALTER, and one of "all" would
+    /// re-mark the engine's rows (review dialect LOW-9), so each dialect must say. SQLite owns none.
+    fn owns_stored_table_sql(&self, sql: &str) -> bool;
+
+    /// The stored text of a table row that a RENAME or an ALTER changed (dialect design REVISION 1 item 2,
+    /// REVISION 2 item 8): a row stays in the form it was in. `dialect_owned` is the row's owner as the
+    /// loader recorded it (`BTreeTable::dialect_owned`). An engine row (not the dialect's) is written as
+    /// canonical SQLite; the dialect's own row through its own formatters (`format_rewritten_table_sql`,
+    /// `format_altered_table_sql`). The engine calls only this.
+    fn format_changed_table_sql(&self, dialect_owned: bool, change: TableChange<'_>) -> crate::Result<String> {
+        match (dialect_owned, change) {
+            (false, TableChange::Rewritten(stmt)) => Ok(stmt.to_string()),
+            (false, TableChange::Altered(table)) => Ok(table.to_sql()),
+            (true, TableChange::Rewritten(stmt)) => self.format_rewritten_table_sql(stmt),
+            (true, TableChange::Altered(table)) => self.format_altered_table_sql(table),
+        }
     }
 
     /// Install the dialect's catalog tables into a freshly constructed
@@ -198,6 +248,108 @@ pub trait Dialect: Send + Sync + 'static {
     }
 }
 
+/// The SQLite builtin function names, read from `sqlite::resolve_builtin_function`'s own source (dialect
+/// design REVISION 2 item 7, R10), with whether each arm sits under `#[cfg(feature = "json")]`. Read from the
+/// source, not a typed list, so a builtin added there is in the contract the day it lands. Every quoted
+/// name in a match-arm pattern of that function's top-level match counts (alternations included).
+#[cfg(any(test, feature = "dialect_contract"))]
+#[doc(hidden)]
+pub fn sqlite_builtin_names() -> Vec<(String, bool)> {
+    const SRC: &str = include_str!("sqlite.rs");
+    let Some(start) = SRC.find("pub fn resolve_builtin_function(") else {
+        return Vec::new();
+    };
+    // The function body: from its first `{` to the matching `}`, skipping strings (the arms hold
+    // format strings with braces) and line comments.
+    let bytes = SRC.as_bytes();
+    let Some(open) = SRC[start..].find('{').map(|i| start + i) else {
+        return Vec::new();
+    };
+    let (mut depth, mut i, mut end) = (0i32, open, SRC.len());
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    i += if bytes[i] == b'\\' { 2 } else { 1 };
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = i;
+                    break;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let mut names = Vec::new();
+    let mut json = false;
+    for line in SRC[open..end].lines() {
+        let t = line.trim_start();
+        if t.starts_with("#[cfg(feature = \"json\")]") {
+            json = true;
+            continue;
+        }
+        if t.starts_with('"') {
+            if let Some(arrow) = t.find("=>") {
+                let pattern = &t[..arrow];
+                let pattern = pattern.split(" if ").next().unwrap_or(pattern);
+                for part in pattern.split('|') {
+                    let p = part.trim().trim_matches('"');
+                    if !p.is_empty() && p.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+                        names.push((p.to_string(), json));
+                    }
+                }
+            }
+        }
+        if !t.starts_with("#[") && !t.is_empty() {
+            json = false;
+        }
+    }
+    names
+}
+
+/// The builtin (name, arity) pairs that `dialect` resolves differently from SQLite (R10: functions always
+/// resolve through the database's dialect, so a dialect must give every SQLite builtin SQLite's meaning).
+/// Compared at every arity from 0 to 8: both errors, both `None`, or both `Some` with equal `Func`, where
+/// two `Func`s are equal iff their `Debug` forms are (`Func` has no `PartialEq`). Err if the source read
+/// yielded fewer than `min_names`: a contract that collected nothing would pass vacuously.
+#[cfg(any(test, feature = "dialect_contract"))]
+#[doc(hidden)]
+pub fn sqlite_builtins_resolved_differently(dialect: &dyn Dialect, min_names: usize) -> Result<Vec<String>, String> {
+    let names = sqlite_builtin_names();
+    if names.len() < min_names {
+        return Err(format!("the builtin source read found {} names, fewer than {min_names}: the read is broken", names.len()));
+    }
+    let shape = |r: crate::Result<Option<crate::Func>>| match r {
+        Err(_) => "Err".to_string(),
+        Ok(None) => "None".to_string(),
+        Ok(Some(f)) => format!("Some({f:?})"),
+    };
+    let mut different = Vec::new();
+    for (name, _) in &names {
+        // 0..=32 (dialect code review LOW-6: 0..=8 left the arities of the long variadic builtins, such
+        // as json_object's pairs, unchecked).
+        for arity in 0..=32 {
+            let want = shape(sqlite::resolve_builtin_function(name, arity));
+            let got = shape(dialect.resolve_function(name, arity));
+            if want != got {
+                different.push(format!("{name}/{arity}: sqlite {want}, dialect {got}"));
+            }
+        }
+    }
+    Ok(different)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,6 +373,9 @@ mod tests {
         fn name(&self) -> &'static str {
             "test"
         }
+        fn owns_stored_table_sql(&self, sql: &str) -> bool {
+            sql.starts_with("/* test */ ")
+        }
 
         fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
             self.statement_parse_calls.fetch_add(1, Ordering::SeqCst);
@@ -241,6 +396,11 @@ mod tests {
         fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<turso_parser::ast::Stmt> {
             let sql = sql.strip_prefix("/* test */ ").unwrap_or(sql);
             sqlite::parse_table_sql_ast(sql)
+        }
+
+        // Its replay text is SQLite (it goes through SQLite's table_sql_for_replay).
+        fn table_sql_for_replay_stored(&self, sql: &str) -> crate::Result<crate::connection::StoredSql> {
+            Ok(crate::connection::StoredSql::sqlite(self.table_sql_for_replay(sql)?))
         }
 
         fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
@@ -306,6 +466,896 @@ mod tests {
         }
     }
 
+    /// A frontend dialect that parses ONLY its own client text (marked `client: `) and refuses
+    /// everything else, so any engine helper whose SQLite text goes through `Dialect::parse` fails
+    /// instead of silently switching dialects (the wire's NO SILENT DIALECT SWITCH class).
+    struct ClientOnlyDialect;
+
+    impl Dialect for ClientOnlyDialect {
+        fn name(&self) -> &'static str {
+            "client-only"
+        }
+        fn owns_stored_table_sql(&self, _sql: &str) -> bool {
+            false
+        }
+        fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+            // The tail after a client statement holds no statement (an `execute` loop parses it to
+            // find that out), so it is not engine text: no statement, as every real dialect answers.
+            if sql.trim().is_empty() {
+                return Ok((None, sql.len()));
+            }
+            let Some(rest) = sql.strip_prefix("client: ") else {
+                return Err(crate::LimboError::ParseError(format!("client-only dialect refused engine text: {sql}").into()));
+            };
+            let (cmd, offset) = sqlite::parse(rest)?;
+            Ok((cmd, "client: ".len() + offset))
+        }
+        fn parse_table_sql(&self, sql: &str, root_page: i64) -> crate::Result<BTreeTable> {
+            BTreeTable::from_sql(sql, root_page)
+        }
+        fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<turso_parser::ast::Stmt> {
+            sqlite::parse_table_sql_ast(sql)
+        }
+        // Its replay text is SQLite (it goes through SQLite's table_sql_for_replay).
+        fn table_sql_for_replay_stored(&self, sql: &str) -> crate::Result<crate::connection::StoredSql> {
+            Ok(crate::connection::StoredSql::sqlite(self.table_sql_for_replay(sql)?))
+        }
+
+        fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
+            sqlite::table_sql_for_replay(sql)
+        }
+        fn format_table_sql(
+            &self,
+            input: &str,
+            _tbl_name: &turso_parser::ast::QualifiedName,
+            _body: &turso_parser::ast::CreateTableBody,
+        ) -> crate::Result<String> {
+            Ok(input.strip_prefix("client: ").unwrap_or(input).to_string())
+        }
+        fn resolve_function(&self, name: &str, arg_count: usize) -> crate::Result<Option<crate::function::Func>> {
+            sqlite::resolve_builtin_function(name, arg_count)
+        }
+        fn register_catalog(&self, schema: &mut crate::schema::Schema, enable_custom_types: bool) -> crate::Result<()> {
+            sqlite::register_builtin_catalog(schema, enable_custom_types)
+        }
+    }
+
+    /// The wire's NO SILENT DIALECT SWITCH class (fastest-wire DIALECT-SWITCH-AUDIT, 297bbe33cd):
+    /// the engine's own helper statements are SQLite text, parsed as SQLite whatever the
+    /// database's dialect, never handed to the frontend's parser (where text it rejects used to fall
+    /// back to SQLite, and text it accepts could mean something else). Each case runs an engine
+    /// path that prepares helper SQL, on a database whose dialect refuses all but client text: the
+    /// pragma table functions, VACUUM, ALTER TABLE's schema rewrite, CDC capture and the MVCC
+    /// journal-mode switch. At bcf8e75a0 helpers went through `Dialect::parse`.
+    #[cfg(all(feature = "fs", not(target_family = "wasm")))]
+    #[test]
+    fn engine_helper_sql_is_parsed_as_sqlite_whatever_the_dialect() {
+        let dir = tempfile::tempdir().unwrap();
+        let io: Arc<dyn IO> = Arc::new(crate::io::PlatformIO::new().unwrap());
+        let open = |name: &str| {
+            let db = Database::open_file_with_flags(
+                io.clone(),
+                dir.path().join(name).to_str().unwrap(),
+                OpenFlags::Create,
+                DatabaseOpts::new().with_vacuum(true),
+                None,
+                Arc::new(ClientOnlyDialect),
+            )
+            .unwrap();
+            let conn = db.connect().unwrap();
+            conn.execute("client: CREATE TABLE t(x INTEGER)").unwrap();
+            conn.execute("client: INSERT INTO t VALUES (1)").unwrap();
+            (db, conn)
+        };
+        let mut failed = Vec::new();
+        let mut case = |what: &str, r: crate::Result<()>| {
+            if let Err(e) = r {
+                failed.push(format!("{what}: {e}"));
+            }
+        };
+        let (_db, c) = open("pragma.db");
+        case("pragma table function", c.prepare("client: SELECT name FROM pragma_table_info('t')").and_then(|mut s| s.run_collect_rows()).map(drop));
+        let (_db, c) = open("vacuum.db");
+        case("VACUUM", c.execute("client: VACUUM"));
+        let (_db, c) = open("alter.db");
+        case("ALTER TABLE ADD COLUMN", c.execute("client: ALTER TABLE t ADD COLUMN y INTEGER").and_then(|()| c.execute("client: INSERT INTO t VALUES (2, 3)")));
+        let (_db, c) = open("cdc.db");
+        case("CDC capture", c.execute("client: PRAGMA capture_data_changes_conn('id')").and_then(|()| c.execute("client: INSERT INTO t VALUES (2)")));
+        let (_db, c) = open("mvcc.db");
+        case("MVCC switch", c.execute("client: PRAGMA journal_mode = 'mvcc'").and_then(|()| c.execute("client: INSERT INTO t VALUES (2)")));
+        assert!(failed.is_empty(), "CLAIM: engine helper SQL went through the frontend dialect's parser: {failed:#?}");
+    }
+
+    /// Dialect design R5 (review dialect MED-4): the engine sites that still hand their own SQLite text
+    /// to the client path. Under a dialect that refuses all but client text, each must still work:
+    /// - DROP COLUMN's view probe (`SELECT * FROM {view}`, vdbe/execute.rs);
+    /// - `Connection::pragma()` (`PRAGMA {name}({value})`);
+    /// - the stats load at open (stats.rs `STATS_QUERY`, whose error is swallowed, so a refused query left
+    ///   the planner with no stats, silently). Its control: the same sequence under SqliteDialect has the
+    ///   table's stats after the reopen.
+    /// Not covered here (stated): the FTS and toy-vector backing tables (feature- and flag-gated; R3's
+    /// reopen covers their storage), and extension SQL (ext/vtab_xconnect.rs, which needs a loaded
+    /// extension).
+    /// At 846697d35 each went through `Dialect::parse`.
+    #[cfg(all(feature = "fs", not(target_family = "wasm")))]
+    #[test]
+    fn the_engine_sites_on_the_client_path_reach_sqlite() {
+        let dir = tempfile::tempdir().unwrap();
+        let io: Arc<dyn IO> = Arc::new(crate::io::PlatformIO::new().unwrap());
+        let open = |name: &str, dialect: Arc<dyn Dialect>| {
+            Database::open_file_with_flags(
+                io.clone(),
+                dir.path().join(name).to_str().unwrap(),
+                OpenFlags::Create,
+                DatabaseOpts::new(),
+                None,
+                dialect,
+            )
+            .unwrap()
+        };
+        let mut failed = Vec::new();
+        {
+            let db = open("probe.db", Arc::new(ClientOnlyDialect));
+            let c = db.connect().unwrap();
+            let r = c
+                .execute("client: CREATE TABLE t2(a, b)")
+                .and_then(|()| c.execute("client: CREATE VIEW v AS SELECT a FROM t2"))
+                .and_then(|()| c.execute("client: ALTER TABLE t2 DROP COLUMN b"));
+            if let Err(e) = r {
+                failed.push(format!("DROP COLUMN's view probe: {e}"));
+            }
+            if let Err(e) = c.pragma("table_info", "t2") {
+                failed.push(format!("Connection::pragma(): {e}"));
+            }
+        }
+        // The stats load at open, with its control.
+        let analyzed = |name: &str, dialect: Arc<dyn Dialect>, prefix: &str| -> crate::Result<bool> {
+            {
+                let db = open(name, dialect.clone());
+                let c = db.connect()?;
+                c.execute(format!("{prefix}CREATE TABLE s(a INTEGER)"))?;
+                c.execute(format!("{prefix}CREATE INDEX si ON s(a)"))?;
+                c.execute(format!("{prefix}INSERT INTO s VALUES (1), (2), (3)"))?;
+                c.execute(format!("{prefix}ANALYZE"))?;
+            }
+            let db = open(name, dialect);
+            let c = db.connect()?;
+            let has = c.schema.read().analyze_stats.table_stats("s").is_some();
+            Ok(has)
+        };
+        match analyzed("stats-control.db", Arc::new(SqliteDialect), "") {
+            Ok(true) => {}
+            other => failed.push(format!("premise: under SqliteDialect the reopened database has no stats for s: {other:?}")),
+        }
+        match analyzed("stats.db", Arc::new(ClientOnlyDialect), "client: ") {
+            Ok(true) => {}
+            other => failed.push(format!("the stats load at open (STATS_QUERY): the reopened database has no stats for s: {other:?}")),
+        }
+        assert!(failed.is_empty(), "CLAIM: an engine site handed its own SQLite text to the client parser: {failed:#?}");
+    }
+
+    /// `ClientOnlyDialect`, storing tables as a frontend does: `format_table_sql` marks the text
+    /// it stores (`/* client */ `), and marked text must be the dialect's own (`client: ...`), as a
+    /// frontend parses its marked rows with its own parser; unmarked rows fall back to SQLite.
+    struct MarkingDialect;
+
+    impl MarkingDialect {
+        fn unmark(sql: &str) -> crate::Result<&str> {
+            match sql.strip_prefix("/* client */ ") {
+                Some(marked) => marked.strip_prefix("client: ").ok_or_else(|| {
+                    crate::LimboError::ParseError(format!("a marked row that is not client text: {sql}").into())
+                }),
+                None => Ok(sql),
+            }
+        }
+    }
+
+    impl Dialect for MarkingDialect {
+        fn name(&self) -> &'static str {
+            "marking"
+        }
+        fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+            ClientOnlyDialect.parse(sql)
+        }
+        fn parse_table_sql(&self, sql: &str, root_page: i64) -> crate::Result<BTreeTable> {
+            BTreeTable::from_sql(Self::unmark(sql)?, root_page)
+        }
+        // Its own rows are the marked ones (the dialect design's owner bit, REVISION 2 item 8).
+        fn owns_stored_table_sql(&self, sql: &str) -> bool {
+            sql.starts_with("/* client */ ")
+        }
+        // Its own form for its own rows changed by RENAME or ALTER: marked client text, as it stores
+        // them (REVISION 2 item 8: a changed row stays in the form it was in).
+        fn format_rewritten_table_sql(&self, stmt: &turso_parser::ast::Stmt) -> crate::Result<String> {
+            Ok(format!("/* client */ client: {stmt}"))
+        }
+        fn format_altered_table_sql(&self, table: &BTreeTable) -> crate::Result<String> {
+            Ok(format!("/* client */ client: {}", table.to_sql()))
+        }
+        fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<turso_parser::ast::Stmt> {
+            sqlite::parse_table_sql_ast(Self::unmark(sql)?)
+        }
+        // Its replay text is SQLite (it goes through SQLite's table_sql_for_replay).
+        fn table_sql_for_replay_stored(&self, sql: &str) -> crate::Result<crate::connection::StoredSql> {
+            Ok(crate::connection::StoredSql::sqlite(self.table_sql_for_replay(sql)?))
+        }
+
+        fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
+            sqlite::table_sql_for_replay(Self::unmark(sql)?)
+        }
+        fn format_table_sql(
+            &self,
+            input: &str,
+            _tbl_name: &turso_parser::ast::QualifiedName,
+            _body: &turso_parser::ast::CreateTableBody,
+        ) -> crate::Result<String> {
+            Ok(format!("/* client */ {input}"))
+        }
+        fn resolve_function(&self, name: &str, arg_count: usize) -> crate::Result<Option<crate::function::Func>> {
+            sqlite::resolve_builtin_function(name, arg_count)
+        }
+        fn register_catalog(&self, schema: &mut crate::schema::Schema, enable_custom_types: bool) -> crate::Result<()> {
+            sqlite::register_builtin_catalog(schema, enable_custom_types)
+        }
+    }
+
+    /// The wire's NO SILENT DIALECT SWITCH class, stored side (lead order): an engine helper's
+    /// CREATE TABLE (CDC's capture table, MVCC's metadata table) stores SQLite text, never its text
+    /// through the frontend's `format_table_sql`, which marks it as the frontend's own and makes the
+    /// frontend's parser read it at the next open. Each database is created under `MarkingDialect`
+    /// with a client table, the helper's table made, closed, and reopened: it must load and read.
+    /// At 7b5093ef0 the helper's text went through the dialect's formatter.
+    #[cfg(all(feature = "fs", not(target_family = "wasm")))]
+    #[test]
+    fn an_engine_helper_s_table_stores_sqlite_text_and_reopens_under_any_dialect() {
+        let dir = tempfile::tempdir().unwrap();
+        let io: Arc<dyn IO> = Arc::new(crate::io::PlatformIO::new().unwrap());
+        let open = |name: &str| {
+            Database::open_file_with_flags(
+                io.clone(),
+                dir.path().join(name).to_str().unwrap(),
+                OpenFlags::Create,
+                DatabaseOpts::new(),
+                None,
+                Arc::new(MarkingDialect),
+            )
+        };
+        let mut failed = Vec::new();
+        for (name, make_helper_table) in [
+            ("cdc.db", "client: PRAGMA capture_data_changes_conn('id')"),
+            ("mvcc.db", "client: PRAGMA journal_mode = 'mvcc'"),
+        ] {
+            {
+                let db = open(name).unwrap();
+                let conn = db.connect().unwrap();
+                conn.execute("client: CREATE TABLE t(x INTEGER)").unwrap();
+                if let Err(e) = conn.execute(make_helper_table).and_then(|()| conn.execute("client: INSERT INTO t VALUES (1)")) {
+                    failed.push(format!("{name}: premise: the helper's table was not made: {e}"));
+                    continue;
+                }
+            }
+            let reopened = open(name).and_then(|db| {
+                let conn = db.connect()?;
+                conn.prepare("client: SELECT x FROM t")?.run_collect_rows().map(drop)
+            });
+            if let Err(e) = reopened {
+                failed.push(format!("{name}: {e}"));
+            }
+        }
+        assert!(failed.is_empty(), "CLAIM: a database whose engine helper made a table does not reopen under its dialect: {failed:#?}");
+    }
+
+    /// R10 (dialect design REVISION 2 item 7): every core dialect gives every SQLite builtin SQLite's meaning,
+    /// so resolving functions always through the database's dialect changes nothing for SQLite names. The
+    /// names come from `resolve_builtin_function`'s source (`sqlite_builtin_names`); the read must find at
+    /// least the count it found at its own commit, and the json-gated subset likewise. Negative control: a
+    /// dialect that shadows `abs` must be caught (else the comparison is blind).
+    #[test]
+    fn every_core_dialect_resolves_every_sqlite_builtin_as_sqlite_does() {
+        // Measured at this test's commit (ecetesla2, uwrun engine-step3-reds-1): 214 names, 28 json-gated.
+        const MIN_NAMES: usize = 214;
+        const MIN_JSON: usize = 28;
+        let names = super::sqlite_builtin_names();
+        let json = names.iter().filter(|(_, j)| *j).count();
+        assert!(names.len() >= MIN_NAMES, "premise: the builtin source read found {} names, fewer than {MIN_NAMES}", names.len());
+        assert!(json >= MIN_JSON, "premise: the builtin source read found {json} json-gated names, fewer than {MIN_JSON}");
+        struct ShadowAbs;
+        impl Dialect for ShadowAbs {
+            fn name(&self) -> &'static str {
+                "shadow-abs"
+            }
+            fn owns_stored_table_sql(&self, _sql: &str) -> bool {
+                false
+            }
+            fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+                sqlite::parse(sql)
+            }
+            fn parse_table_sql(&self, sql: &str, root_page: i64) -> crate::Result<BTreeTable> {
+                BTreeTable::from_sql(sql, root_page)
+            }
+            fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<turso_parser::ast::Stmt> {
+                sqlite::parse_table_sql_ast(sql)
+            }
+            // Its replay text is SQLite (it goes through SQLite's table_sql_for_replay).
+            fn table_sql_for_replay_stored(&self, sql: &str) -> crate::Result<crate::connection::StoredSql> {
+                Ok(crate::connection::StoredSql::sqlite(self.table_sql_for_replay(sql)?))
+            }
+
+            fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
+                sqlite::table_sql_for_replay(sql)
+            }
+            fn format_table_sql(
+                &self,
+                input: &str,
+                _tbl_name: &turso_parser::ast::QualifiedName,
+                _body: &turso_parser::ast::CreateTableBody,
+            ) -> crate::Result<String> {
+                Ok(input.to_string())
+            }
+            fn resolve_function(&self, name: &str, arg_count: usize) -> crate::Result<Option<crate::function::Func>> {
+                if name.eq_ignore_ascii_case("abs") {
+                    return sqlite::resolve_builtin_function("sign", arg_count);
+                }
+                sqlite::resolve_builtin_function(name, arg_count)
+            }
+            fn register_catalog(&self, schema: &mut crate::schema::Schema, enable_custom_types: bool) -> crate::Result<()> {
+                sqlite::register_builtin_catalog(schema, enable_custom_types)
+            }
+        }
+        let shadow = super::sqlite_builtins_resolved_differently(&ShadowAbs, MIN_NAMES).unwrap();
+        assert!(
+            shadow.iter().any(|d| d.starts_with("abs/")),
+            "premise (negative control): a dialect shadowing abs was not caught: {shadow:?}"
+        );
+        // Every core test dialect that claims SQLite's functions (dialect code review LOW-6: 5 of them were
+        // checked). Left out by design: NoFunctionsDialect (it resolves none), ShadowAbs (the negative
+        // control above), and ParkingDialect's `park_here` (not a SQLite name, so not in the list).
+        let dialects: [(&str, &dyn Dialect); 8] = [
+            ("SqliteDialect", &SqliteDialect),
+            ("ClientOnlyDialect", &ClientOnlyDialect),
+            ("MarkingDialect", &MarkingDialect),
+            ("ReparseDialect", &ReparseDialect::default()),
+            ("StrictTestDialect", &StrictTestDialect),
+            ("TestDialect", &TestDialect::default()),
+            ("ParkingDialect", &ParkingDialect::default()),
+            ("PgKeyTestDialect", &PgKeyTestDialect),
+        ];
+        let mut failed = Vec::new();
+        for (name, d) in dialects {
+            match super::sqlite_builtins_resolved_differently(d, MIN_NAMES) {
+                Ok(diff) if diff.is_empty() => {}
+                Ok(diff) => failed.push(format!("{name}: {} pairs differ, first {:?}", diff.len(), &diff[..diff.len().min(4)])),
+                Err(e) => failed.push(format!("{name}: {e}")),
+            }
+        }
+        assert!(failed.is_empty(), "CLAIM: a core dialect resolves a SQLite builtin differently from SQLite: {failed:#?}");
+    }
+
+    /// R11 (dialect design REVISION 2 item 9): a frontend's canonical SQLite text never creates a table (a
+    /// frontend makes its tables through its own parser, as the wire does with run_pg_statement): a CREATE
+    /// TABLE, CTAS included, under `SqlKind::frontend()` is refused with a named error and stores nothing.
+    /// Control: the same CREATE under `SqlKind::client()` works.
+    #[test]
+    fn a_frontend_create_table_is_refused() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(&io, "frontend-create.db", Arc::new(SqliteDialect)).unwrap();
+        let c = db.connect().unwrap();
+        let run = |sql: &str, kind: crate::SqlKind| {
+            c.prepare_with(sql, kind, crate::Origin::Root).and_then(|mut s| s.run_ignore_rows())
+        };
+        let mut failed = Vec::new();
+        if let Err(e) = run("CREATE TABLE ok(a)", crate::SqlKind::client()) {
+            failed.push(format!("premise (control): a client CREATE TABLE failed: {e}"));
+        }
+        for sql in ["CREATE TABLE f(a)", "CREATE TABLE g AS SELECT 1 AS a"] {
+            match run(sql, crate::SqlKind::frontend()) {
+                Err(e) if e.to_string().contains("frontend") => {}
+                other => failed.push(format!("{sql}: not refused by name: {other:?}")),
+            }
+        }
+        let rows = c
+            .prepare("SELECT name FROM sqlite_schema WHERE name IN ('f', 'g')")
+            .and_then(|mut s| s.run_collect_rows())
+            .unwrap();
+        if !rows.is_empty() {
+            failed.push(format!("a refused frontend CREATE stored a row: {rows:?}"));
+        }
+        assert!(failed.is_empty(), "CLAIM: a frontend's text created a table: {failed:#?}");
+    }
+
+    /// R3 (dialect design REVISION 2 item 1; reviews dialect HIGH-2, adversary-2 H1): VACUUM keeps every
+    /// schema row BYTE FOR BYTE. Under MarkingDialect (which marks the client rows it stores), a database with a
+    /// marked client table, an AUTOINCREMENT + UNIQUE table (whose CREATE also writes an autoindex, a sequence
+    /// table and sqlite_sequence), a composite-key table, an index, a view, a trigger and an ALTERed table is
+    /// VACUUMed. `SELECT type, name, tbl_name, sql FROM sqlite_schema` must be identical before, after, and
+    /// after a reopen. Premise: the marking dialect marked the client rows. At 846697d35 VACUUM replayed the
+    /// unmarked replay text through prepare_sqlite and stored it unmarked.
+    #[cfg(all(feature = "fs", not(target_family = "wasm")))]
+    #[test]
+    fn vacuum_keeps_every_schema_row_byte_for_byte() {
+        let dir = tempfile::tempdir().unwrap();
+        let io: Arc<dyn IO> = Arc::new(crate::io::PlatformIO::new().unwrap());
+        let path = dir.path().join("r3.db");
+        let open = || {
+            Database::open_file_with_flags(
+                io.clone(),
+                path.to_str().unwrap(),
+                OpenFlags::Create,
+                DatabaseOpts::new().with_vacuum(true).with_views(true),
+                None,
+                Arc::new(MarkingDialect),
+            )
+            .unwrap()
+        };
+        let rows = |c: &Arc<crate::Connection>| {
+            c.prepare("client: SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY type, name")
+                .and_then(|mut s| s.run_collect_rows())
+                .map(|rows| rows.iter().map(|r| format!("{r:?}")).collect::<Vec<_>>())
+        };
+        let before = {
+            let db = open();
+            let c = db.connect().unwrap();
+            for sql in [
+                "client: CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, u TEXT UNIQUE, w INTEGER)",
+                "client: CREATE TABLE p(a, b, PRIMARY KEY (a, b))",
+                "client: CREATE TABLE plain(x INTEGER)",
+                "client: CREATE INDEX ti ON t(w)",
+                "client: CREATE VIEW tv AS SELECT id FROM t",
+                "client: CREATE TRIGGER tt AFTER INSERT ON plain BEGIN UPDATE t SET w = 0 WHERE id = new.x; END",
+                "client: ALTER TABLE plain ADD COLUMN y INTEGER",
+                "client: INSERT INTO t(u, w) VALUES ('a', 1), ('b', 2)",
+                "client: INSERT INTO p VALUES (1, 2)",
+                "client: INSERT INTO plain VALUES (1, 2)",
+            ] {
+                c.execute(sql).unwrap_or_else(|e| panic!("premise: {sql}: {e}"));
+            }
+            let before = rows(&c).unwrap();
+            assert!(
+                before.iter().any(|r| r.contains("/* client */")),
+                "premise: the marking dialect marked no client row: {before:#?}"
+            );
+            if let Err(e) = c.execute("client: VACUUM") {
+                panic!("CLAIM: VACUUM failed: {e}");
+            }
+            let after = rows(&c).unwrap();
+            assert_eq!(before, after, "CLAIM: VACUUM changed a schema row's bytes");
+            before
+        };
+        let db = open();
+        let c = db.connect().unwrap();
+        assert_eq!(before, rows(&c).unwrap(), "CLAIM: after VACUUM and a reopen, a schema row's bytes changed");
+    }
+
+    /// R7 (dialect design REVISION 1 item 2, REVISION 2 item 8; review dialect LOW-9): RENAME and ALTER never
+    /// change whose form a row is in. Under MarkingDialect, an engine-made table is stored plain (step 3);
+    /// a client's RENAME of it, and a client's ADD COLUMN on it, must keep it plain, so it reopens (a marked
+    /// row must be the dialect's own text, which this one is not). Control: the client table renamed beside it
+    /// reopens. At b9b7f34ea RENAME re-formatted every row through the dialect (`format_rewritten_table_sql`),
+    /// marking the engine's row.
+    #[cfg(all(feature = "fs", not(target_family = "wasm")))]
+    #[test]
+    fn rename_and_alter_keep_an_engine_row_plain() {
+        let dir = tempfile::tempdir().unwrap();
+        let io: Arc<dyn IO> = Arc::new(crate::io::PlatformIO::new().unwrap());
+        let path = dir.path().join("r7.db");
+        let open = || {
+            Database::open_file_with_flags(
+                io.clone(),
+                path.to_str().unwrap(),
+                OpenFlags::Create,
+                DatabaseOpts::new(),
+                None,
+                Arc::new(MarkingDialect),
+            )
+            .unwrap()
+        };
+        {
+            let db = open();
+            let c = db.connect().unwrap();
+            c.execute_engine(crate::connection::EngineSql::new("CREATE TABLE helper(x INTEGER)"), crate::Origin::Root)
+                .expect("premise: the engine made its table");
+            c.execute("client: CREATE TABLE mine(y INTEGER)").expect("premise: the client made its table");
+            let helper_row = c
+                .prepare("client: SELECT sql FROM sqlite_schema WHERE name = 'helper'")
+                .and_then(|mut s| s.run_collect_rows())
+                .unwrap();
+            assert!(
+                !format!("{helper_row:?}").contains("/* client */"),
+                "premise: the engine's row is stored plain: {helper_row:?}"
+            );
+            for sql in [
+                "client: ALTER TABLE helper RENAME TO helper2",
+                "client: ALTER TABLE helper2 ADD COLUMN z INTEGER",
+                "client: ALTER TABLE mine RENAME TO mine2",
+            ] {
+                c.execute(sql).unwrap_or_else(|e| panic!("premise: {sql}: {e}"));
+            }
+        }
+        let reopened = open().connect().and_then(|c| {
+            c.prepare("client: SELECT x, z FROM helper2")?.run_collect_rows()?;
+            c.prepare("client: SELECT y FROM mine2")?.run_collect_rows()?;
+            c.prepare("client: SELECT name, sql FROM sqlite_schema WHERE name IN ('helper2', 'mine2') ORDER BY name")?
+                .run_collect_rows()
+        });
+        let rows = match reopened {
+            Ok(rows) => format!("{rows:?}"),
+            Err(e) => panic!("CLAIM: RENAME or ALTER changed whose form a row is in, so the database did not reopen: {e}"),
+        };
+        let (helper, mine) = rows.split_once("mine2").unwrap_or((rows.as_str(), ""));
+        assert!(mine.contains("/* client */"), "premise (control): the client's renamed row is still the dialect's: {rows}");
+        assert!(!helper.contains("/* client */"), "CLAIM: RENAME or ALTER marked the engine's row as the dialect's: {rows}");
+    }
+
+    /// R7b (dialect code review MED-1): the halves R7 could not see. R7's later ADD COLUMN rewrites the
+    /// renamed engine row from the in-memory owner bit, which erased a mark the RENAME made, so forcing
+    /// every RENAME owner site to "owned" left R7 green. Here, apart: (a) a client's RENAME ALONE of an
+    /// engine-made table keeps its row plain, read straight after and after a reopen; (b) a client's ADD
+    /// COLUMN on a client table keeps its row the dialect's (marked).
+    #[cfg(all(feature = "fs", not(target_family = "wasm")))]
+    #[test]
+    fn a_rename_alone_keeps_an_engine_row_plain_and_add_column_keeps_a_client_row_marked() {
+        let dir = tempfile::tempdir().unwrap();
+        let io: Arc<dyn IO> = Arc::new(crate::io::PlatformIO::new().unwrap());
+        let path = dir.path().join("r7b.db");
+        let open = || {
+            Database::open_file_with_flags(
+                io.clone(),
+                path.to_str().unwrap(),
+                OpenFlags::Create,
+                DatabaseOpts::new(),
+                None,
+                Arc::new(MarkingDialect),
+            )
+            .unwrap()
+        };
+        let row = |c: &Arc<crate::Connection>, name: &str| {
+            c.prepare(format!("client: SELECT sql FROM sqlite_schema WHERE name = '{name}'"))
+                .and_then(|mut s| s.run_collect_rows())
+                .map(|r| format!("{r:?}"))
+        };
+        let mut failed: Vec<String> = Vec::new();
+        {
+            let db = open();
+            let c = db.connect().unwrap();
+            c.execute_engine(crate::connection::EngineSql::new("CREATE TABLE helper(x INTEGER)"), crate::Origin::Root)
+                .expect("premise: the engine made its table");
+            c.execute("client: CREATE TABLE mine(y INTEGER)").expect("premise: the client made its table");
+            c.execute("client: ALTER TABLE helper RENAME TO helper2").expect("premise: the RENAME ran");
+            c.execute("client: ALTER TABLE mine ADD COLUMN w INTEGER").expect("premise: the ADD COLUMN ran");
+            match row(&c, "helper2") {
+                Ok(r) if !r.contains("/* client */") && r.contains("helper2") => {}
+                other => failed.push(format!("(a) straight after the RENAME alone, the engine's row is {other:?}, want plain")),
+            }
+            match row(&c, "mine") {
+                Ok(r) if r.contains("/* client */") && r.contains(" w ") => {}
+                other => failed.push(format!("(b) after ADD COLUMN, the client's row is {other:?}, want marked, with w")),
+            }
+        }
+        let c = open().connect().unwrap();
+        match c.prepare("client: SELECT x FROM helper2").and_then(|mut s| s.run_collect_rows()) {
+            Ok(_) => {}
+            Err(e) => failed.push(format!("(a) after a reopen, helper2 does not read: {e}")),
+        }
+        match row(&c, "helper2") {
+            Ok(r) if !r.contains("/* client */") => {}
+            other => failed.push(format!("(a) after a reopen, the engine's row is {other:?}, want plain")),
+        }
+        match row(&c, "mine") {
+            Ok(r) if r.contains("/* client */") => {}
+            other => failed.push(format!("(b) after a reopen, the client's row is {other:?}, want marked")),
+        }
+        assert!(failed.is_empty(), "CLAIM: a RENAME alone or an ADD COLUMN changed whose form a row is in: {failed:#?}");
+    }
+
+    /// The frontend-context slot (dialect design REVISION 1, fastest-wire's M4): set once, read back as the
+    /// frontend's own type, refused on a second set, and gone once the frontend drops its session (the
+    /// connection holds it weakly). A new API, so no red at a base: the claims are pinned here.
+    #[test]
+    fn a_frontend_context_is_set_once_and_held_weakly() {
+        struct Session(u32);
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(&io, "frontend-context.db", Arc::new(SqliteDialect)).unwrap();
+        let c = db.connect().unwrap();
+        assert!(c.frontend_context().is_none(), "CLAIM: a fresh connection has a frontend context");
+        let session: std::sync::Arc<dyn std::any::Any + Send + Sync> = std::sync::Arc::new(Session(7));
+        c.set_frontend_context(std::sync::Arc::downgrade(&session)).unwrap();
+        let got = c.frontend_context().expect("CLAIM: the context set is not read back");
+        assert_eq!(got.downcast_ref::<Session>().map(|s| s.0), Some(7), "CLAIM: the context is not the frontend's own type");
+        drop(got);
+        let other: std::sync::Arc<dyn std::any::Any + Send + Sync> = std::sync::Arc::new(Session(8));
+        assert!(c.set_frontend_context(std::sync::Arc::downgrade(&other)).is_err(), "CLAIM: a second set was not refused");
+        assert_eq!(
+            c.frontend_context().and_then(|g| g.downcast_ref::<Session>().map(|s| s.0)),
+            Some(7),
+            "CLAIM: a refused second set replaced the first"
+        );
+        drop(session);
+        assert!(c.frontend_context().is_none(), "CLAIM: the connection kept the dropped session alive");
+    }
+
+    /// R4 (review dialect MED-3, structural half): every entry gives its statement the kind of the text it
+    /// was given, and the statement keeps it (it defaulted to Client in `execute_text`). Type-enforced since
+    /// a9afc6c0c (no constructor without a kind); pinned here per entry.
+    #[test]
+    fn every_entry_s_statement_carries_the_kind_of_its_text() {
+        use crate::connection::{EngineSql, Origin, SqlKind, SqlSource};
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(&io, "kinds.db", Arc::new(SqliteDialect)).unwrap();
+        let c = db.connect().unwrap();
+        let source = |s: &crate::Statement| s.kind().source().clone();
+        let mut wrong = Vec::new();
+        let mut check = |entry: &str, got: crate::Result<SqlSource>, want: SqlSource| match got {
+            Ok(g) if g == want => {}
+            other => wrong.push(format!("{entry}: {other:?}, want {want:?}")),
+        };
+        check("prepare", c.prepare("SELECT 1").map(|s| source(&s)), SqlSource::Client);
+        check("prepare_sqlite", c.prepare_sqlite("SELECT 1").map(|s| source(&s)), SqlSource::Frontend);
+        check("prepare_internal", c.prepare_internal("SELECT 1").map(|s| source(&s)), SqlSource::Frontend);
+        check("prepare_engine", c.prepare_engine(EngineSql::new("SELECT 1"), Origin::Root).map(|s| source(&s)), SqlSource::Engine);
+        check("prepare_with(client)", c.prepare_with("SELECT 1", SqlKind::client(), Origin::Root).map(|s| source(&s)), SqlSource::Client);
+        check("prepare_with(frontend)", c.prepare_with("SELECT 1", SqlKind::frontend(), Origin::Nested).map(|s| source(&s)), SqlSource::Frontend);
+        check("consume_stmt", c.consume_stmt("SELECT 1").map(|o| source(&o.expect("a statement").0)), SqlSource::Client);
+        check("query", c.query("SELECT 1").map(|o| source(&o.expect("a statement"))), SqlSource::Client);
+        let translated = crate::dialect::sqlite::parse("SELECT 1").unwrap().0.unwrap();
+        check(
+            "prepare_translated_cmd_with_kind(frontend)",
+            c.prepare_translated_cmd_with_kind(translated, "SELECT 1", crate::PrepareOptions::default(), SqlKind::frontend(), Origin::Root)
+                .map(|s| source(&s)),
+            SqlSource::Frontend,
+        );
+        assert!(wrong.is_empty(), "CLAIM: an entry's statement does not carry its text's kind: {wrong:#?}");
+    }
+
+    /// R4b (dialect code review MED-5): the EXECUTE entries carry their text's kind too, the class R4's doc
+    /// names (it defaulted to Client in `execute_text`) and R4 did not check: under ClientOnlyDialect, which
+    /// refuses any text not marked `client: `, `execute_engine`, `execute_sqlite` and `execute_with(frontend)`
+    /// run plain SQLite text, and `execute` runs client text. Control: `execute` of plain text is refused
+    /// (client text goes to the dialect). Forcing `execute_text`'s statements to the client kind fails this.
+    #[test]
+    fn every_execute_entry_runs_its_text_with_its_kind() {
+        use crate::connection::{EngineSql, Origin, SqlKind};
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(&io, "execute-kinds.db", Arc::new(ClientOnlyDialect)).unwrap();
+        let c = db.connect().unwrap();
+        assert!(c.execute("CREATE TABLE plain(x)").is_err(), "premise (control): execute sends its text to the dialect, which refuses plain text");
+        let mut wrong = Vec::new();
+        let mut check = |entry: &str, r: crate::Result<()>| {
+            if let Err(e) = r {
+                wrong.push(format!("{entry}: {e}"));
+            }
+        };
+        // FLAGGED fixture repair after its first run (3121bd7d5): a frontend's SQLite text may not create a
+        // table (R11), so the frontend-kind entries write into a table the engine made.
+        check("execute(client)", c.execute("client: CREATE TABLE t0(x)"));
+        check("execute_engine", c.execute_engine(EngineSql::new("CREATE TABLE t1(x); INSERT INTO t1 VALUES (1)"), Origin::Root));
+        check("execute_sqlite", c.execute_sqlite("INSERT INTO t1 VALUES (2); INSERT INTO t1 VALUES (3)"));
+        check("execute_with(frontend)", c.execute_with("INSERT INTO t1 VALUES (4); INSERT INTO t1 VALUES (5)", SqlKind::frontend(), Origin::Root));
+        check("execute_with(client)", c.execute_with("client: CREATE TABLE t4(x)", SqlKind::client(), Origin::Root));
+        assert!(wrong.is_empty(), "CLAIM: an execute entry ran its text under another kind: {wrong:#?}");
+    }
+
+    /// R8 (dialect design R8, review dialect LOW-6): an engine statement keeps its kind through a re-prepare,
+    /// so a re-prepared engine statement never reaches a strict dialect's parser. Under ClientOnlyDialect an
+    /// engine SELECT is prepared, a keyed setting changes (the statement must re-prepare: premise), and it
+    /// runs again. A guard: the class was fixed at 7b5093ef0 (the kind on the Statement) and is
+    /// type-enforced since a9afc6c0c.
+    #[test]
+    fn an_engine_statement_keeps_its_kind_through_a_reprepare() {
+        use crate::connection::{EngineSql, Origin};
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(&io, "reprepare-kind.db", Arc::new(ClientOnlyDialect)).unwrap();
+        let c = db.connect().unwrap();
+        c.execute("client: CREATE TABLE t(x INTEGER)").unwrap();
+        c.execute("client: INSERT INTO t VALUES (1)").unwrap();
+        let mut s = c.prepare_engine(EngineSql::new("SELECT x FROM t"), Origin::Root).unwrap();
+        assert_eq!(s.run_collect_rows().unwrap().len(), 1, "premise: the engine SELECT ran");
+        s.reset().unwrap();
+        let reprepares0 = s.metrics().reprepares;
+        c.set_cache_size(c.get_cache_size() + 1);
+        let rows = s.run_collect_rows();
+        // FLAGGED reorder (dialect code review LOW-7): the claim first, so a re-prepare that reaches the
+        // client parser (and errors before the counter moves) reads as CLAIM, not as a broken premise.
+        assert!(matches!(&rows, Ok(r) if r.len() == 1), "CLAIM: a re-prepared engine statement reached the client parser: {rows:?}");
+        assert!(s.metrics().reprepares > reprepares0, "premise: the statement was re-prepared");
+    }
+
+    /// A dialect that parks one translation in the middle: resolving the function `park_here()`
+    /// signals `parked` and waits for `go`, recording whether `go` (not the bound) ended the park
+    /// (review c42b MED-4).
+    #[derive(Default)]
+    struct ParkingDialect {
+        parked: crate::sync::atomic::AtomicBool,
+        go: crate::sync::atomic::AtomicBool,
+        released_by_go: crate::sync::atomic::AtomicBool,
+    }
+
+    impl Dialect for ParkingDialect {
+        fn name(&self) -> &'static str {
+            "parking"
+        }
+        fn owns_stored_table_sql(&self, _sql: &str) -> bool {
+            false
+        }
+        fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+            sqlite::parse(sql)
+        }
+        fn parse_table_sql(&self, sql: &str, root_page: i64) -> crate::Result<BTreeTable> {
+            BTreeTable::from_sql(sql, root_page)
+        }
+        fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<turso_parser::ast::Stmt> {
+            sqlite::parse_table_sql_ast(sql)
+        }
+        // Its replay text is SQLite (it goes through SQLite's table_sql_for_replay).
+        fn table_sql_for_replay_stored(&self, sql: &str) -> crate::Result<crate::connection::StoredSql> {
+            Ok(crate::connection::StoredSql::sqlite(self.table_sql_for_replay(sql)?))
+        }
+
+        fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
+            sqlite::table_sql_for_replay(sql)
+        }
+        fn format_table_sql(
+            &self,
+            input: &str,
+            _tbl_name: &turso_parser::ast::QualifiedName,
+            _body: &turso_parser::ast::CreateTableBody,
+        ) -> crate::Result<String> {
+            Ok(input.to_string())
+        }
+        fn resolve_function(&self, name: &str, arg_count: usize) -> crate::Result<Option<crate::function::Func>> {
+            if name.eq_ignore_ascii_case("park_here") {
+                if !self.parked.swap(true, Ordering::SeqCst) {
+                    let t = std::time::Instant::now();
+                    while !self.go.load(Ordering::SeqCst) && t.elapsed() < std::time::Duration::from_secs(30) {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    self.released_by_go.store(self.go.load(Ordering::SeqCst), Ordering::SeqCst);
+                }
+                return sqlite::resolve_builtin_function("random", arg_count);
+            }
+            sqlite::resolve_builtin_function(name, arg_count)
+        }
+        fn register_catalog(&self, schema: &mut crate::schema::Schema, enable_custom_types: bool) -> crate::Result<()> {
+            sqlite::register_builtin_catalog(schema, enable_custom_types)
+        }
+    }
+
+    /// Review c42b MED-4: a program is keyed at the prepare generation read BEFORE its translation
+    /// reads the state it keys, so a keyed change landing during translation re-prepares it. The
+    /// prepare parks inside translation (at `park_here()`, after `translate` read `mvcc_enabled`);
+    /// another thread changes a keyed setting of the same connection (`set_cache_size`, a
+    /// change-only setter that bumps the generation and touches no schema); the prepare finishes.
+    /// Stepped, the statement must re-prepare. At 7b74fa9fa the key was read at `build`, after the
+    /// change, so the program matched and never re-prepared.
+    ///
+    /// Not the review's journal switch: switching to MVCC bootstraps a metadata table, a schema
+    /// change, which re-prepares the parked statement at the base too (by reading, UNVERIFIED), so
+    /// that red could not tell the base from the fix. The setter isolates the generation.
+    #[test]
+    fn a_keyed_change_during_translation_re_prepares_the_program() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let dialect = Arc::new(ParkingDialect::default());
+        let db = open_db(&io, "park.db", dialect.clone()).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        let changer = {
+            let conn = conn.clone();
+            let dialect = dialect.clone();
+            std::thread::spawn(move || {
+                let t = std::time::Instant::now();
+                while !dialect.parked.load(Ordering::SeqCst) {
+                    if t.elapsed() > std::time::Duration::from_secs(10) {
+                        dialect.go.store(true, Ordering::SeqCst);
+                        return None;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                let before = conn.prepare_context_generation();
+                conn.set_cache_size(conn.get_cache_size() + 1);
+                let after = conn.prepare_context_generation();
+                dialect.go.store(true, Ordering::SeqCst);
+                Some((before, after))
+            })
+        };
+        let mut stmt = conn.prepare("SELECT park_here(), x FROM t").unwrap();
+        let moved = changer.join().unwrap();
+        assert!(moved.is_some(), "premise: the prepare never reached park_here()");
+        let (before, after) = moved.unwrap();
+        assert!(after > before, "premise: the setter moved the prepare generation ({before} -> {after})");
+        assert!(
+            dialect.released_by_go.load(Ordering::SeqCst),
+            "premise: the change landed while the translation was parked (the park ended at its bound)"
+        );
+        let reprepares0 = stmt.metrics().reprepares;
+        let rows = stmt.run_collect_rows();
+        assert!(matches!(&rows, Ok(r) if r.len() == 1), "premise: the statement read its row: {rows:?}");
+        assert!(
+            stmt.metrics().reprepares > reprepares0,
+            "CLAIM: a program whose translation straddled a keyed change was not re-prepared"
+        );
+    }
+
+    /// A dialect that counts its connection-aware re-parses (wire-rework E-M2).
+    #[derive(Default)]
+    struct ReparseDialect {
+        reparses: AtomicUsize,
+    }
+
+    impl Dialect for ReparseDialect {
+        fn name(&self) -> &'static str {
+            "reparse-test"
+        }
+        fn owns_stored_table_sql(&self, _sql: &str) -> bool {
+            false
+        }
+        fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+            sqlite::parse(sql)
+        }
+        fn parse_for_reprepare(
+            &self,
+            sql: &str,
+            conn: &crate::sync::Arc<crate::Connection>,
+        ) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+            assert!(!conn.is_closed(), "the re-preparing connection is open");
+            self.reparses.fetch_add(1, Ordering::SeqCst);
+            sqlite::parse(sql)
+        }
+        fn parse_table_sql(&self, sql: &str, root_page: i64) -> crate::Result<BTreeTable> {
+            BTreeTable::from_sql(sql, root_page)
+        }
+        fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<turso_parser::ast::Stmt> {
+            sqlite::parse_table_sql_ast(sql)
+        }
+        // Its replay text is SQLite (it goes through SQLite's table_sql_for_replay).
+        fn table_sql_for_replay_stored(&self, sql: &str) -> crate::Result<crate::connection::StoredSql> {
+            Ok(crate::connection::StoredSql::sqlite(self.table_sql_for_replay(sql)?))
+        }
+
+        fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
+            sqlite::table_sql_for_replay(sql)
+        }
+        fn format_table_sql(
+            &self,
+            input: &str,
+            _tbl_name: &turso_parser::ast::QualifiedName,
+            _body: &turso_parser::ast::CreateTableBody,
+        ) -> crate::Result<String> {
+            Ok(input.to_string())
+        }
+        fn resolve_function(&self, name: &str, arg_count: usize) -> crate::Result<Option<crate::function::Func>> {
+            sqlite::resolve_builtin_function(name, arg_count)
+        }
+        fn register_catalog(&self, schema: &mut crate::schema::Schema, enable_custom_types: bool) -> crate::Result<()> {
+            sqlite::register_builtin_catalog(schema, enable_custom_types)
+        }
+    }
+
+    /// Wire-rework review E-M2 (lead order): a statement the ENGINE re-prepares (here after a real
+    /// setting change bumps the prepare generation) is re-parsed through the dialect's
+    /// connection-aware hook, with the re-preparing connection, so a frontend can re-translate as
+    /// its own prepare did. At b119a4f1e `Statement::reprepare` called `Dialect::parse`, which has
+    /// no connection. Premise: the statement was re-prepared.
+    #[test]
+    fn an_engine_reprepare_reparses_through_the_dialect_with_its_connection() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let dialect = Arc::new(ReparseDialect::default());
+        let db = open_db(&io, "reparse.db", dialect.clone()).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(x INTEGER)").unwrap();
+        conn.execute("INSERT INTO t VALUES (7)").unwrap();
+        let mut stmt = conn.prepare("SELECT x FROM t").unwrap();
+        assert_eq!(stmt.run_collect_rows().unwrap().len(), 1, "premise: the SELECT reads its row");
+        stmt.reset().unwrap();
+        let reprepares0 = stmt.metrics().reprepares;
+        conn.set_cache_size(conn.get_cache_size() + 1);
+        assert_eq!(stmt.run_collect_rows().unwrap().len(), 1, "premise: the re-prepared SELECT reads its row");
+        assert!(stmt.metrics().reprepares > reprepares0, "premise: the statement was re-prepared");
+        assert!(
+            dialect.reparses.load(Ordering::SeqCst) >= 1,
+            "CLAIM: the engine re-prepared without the dialect's connection-aware re-parse"
+        );
+    }
+
     /// Stores table definitions in syntax that SQLite cannot parse and always
     /// adds its marker, so replay tests detect repeated storage formatting.
     struct StrictTestDialect;
@@ -317,6 +1367,9 @@ mod tests {
     impl Dialect for StrictTestDialect {
         fn name(&self) -> &'static str {
             "strict-test"
+        }
+        fn owns_stored_table_sql(&self, sql: &str) -> bool {
+            sql.starts_with(Self::PREFIX)
         }
 
         fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
@@ -331,6 +1384,11 @@ mod tests {
         fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<turso_parser::ast::Stmt> {
             let sql = sql.strip_prefix(Self::PREFIX).unwrap_or(sql);
             sqlite::parse_table_sql_ast(sql)
+        }
+
+        // Its replay text is SQLite (it goes through SQLite's table_sql_for_replay).
+        fn table_sql_for_replay_stored(&self, sql: &str) -> crate::Result<crate::connection::StoredSql> {
+            Ok(crate::connection::StoredSql::sqlite(self.table_sql_for_replay(sql)?))
         }
 
         fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
@@ -716,6 +1774,9 @@ mod tests {
         fn name(&self) -> &'static str {
             "nofuncs"
         }
+        fn owns_stored_table_sql(&self, _sql: &str) -> bool {
+            false
+        }
 
         fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
             sqlite::parse(sql)
@@ -727,6 +1788,11 @@ mod tests {
 
         fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<turso_parser::ast::Stmt> {
             sqlite::parse_table_sql_ast(sql)
+        }
+
+        // Its replay text is SQLite (it goes through SQLite's table_sql_for_replay).
+        fn table_sql_for_replay_stored(&self, sql: &str) -> crate::Result<crate::connection::StoredSql> {
+            Ok(crate::connection::StoredSql::sqlite(self.table_sql_for_replay(sql)?))
         }
 
         fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
@@ -1145,6 +2211,9 @@ mod tests {
         fn name(&self) -> &'static str {
             "pgkey-test"
         }
+        fn owns_stored_table_sql(&self, sql: &str) -> bool {
+            Self::own(sql).is_some()
+        }
 
         fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
             sqlite::parse(sql)
@@ -1163,6 +2232,11 @@ mod tests {
 
         fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<turso_parser::ast::Stmt> {
             sqlite::parse_table_sql_ast(Self::own(sql).unwrap_or(sql))
+        }
+
+        // Its replay text is SQLite (it goes through SQLite's table_sql_for_replay).
+        fn table_sql_for_replay_stored(&self, sql: &str) -> crate::Result<crate::connection::StoredSql> {
+            Ok(crate::connection::StoredSql::sqlite(self.table_sql_for_replay(sql)?))
         }
 
         fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {

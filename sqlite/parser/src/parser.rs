@@ -4809,18 +4809,32 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// The name of CREATE TYPE and DROP TYPE as written: an identifier token with its quotes kept,
+    /// or a bracket-quoted name given as the double-quoted token naming the same identifier
+    /// (`[m x]` as `"m x"`), the one quoted form the type registry's key, the stored SQL and its
+    /// reparse all read alike (`schema::type_key`, `build_create_type_sql`). Queue a-f review L1:
+    /// `CREATE TYPE [m x]` was refused; kept as `[m x]` (7870317a3) it was stored as `"[m x]"`,
+    /// another type, so `"m x"` on a column was unknown (lane raw uw-glibc228-lib-branch-83450678a).
+    fn parse_type_name(&mut self) -> Result<String> {
+        if let Some(tok) = self.peek()? {
+            if tok.token_type == TK_LBRACKET && !self.peeked_empty_brackets() {
+                let name = self.parse_bracket_quoted_name()?;
+                return Ok(format!("\"{}\"", name.as_str().replace('"', "\"\"")));
+            }
+        }
+        match self.eat()? {
+            Some(tok) if tok.token_type == TK_ID => Ok(from_bytes(tok.as_bytes())),
+            _ => Err(Error::ParseError("expected type name".to_owned())),
+        }
+    }
+
     /// Parse `CREATE TYPE [IF NOT EXISTS] name AS STRUCT(...) | UNION(...)`
     /// or `CREATE TYPE [IF NOT EXISTS] name[(param, ...)] BASE base_type ...`
     fn parse_create_type(&mut self) -> Result<Stmt> {
         eat_assert!(self, TK_TYPE);
         let if_not_exists = self.parse_if_not_exists()?;
 
-        // Parse type name
-        let name_tok = self.eat()?;
-        let type_name = match name_tok {
-            Some(tok) if tok.token_type == TK_ID => from_bytes(tok.as_bytes()),
-            _ => return Err(Error::ParseError("expected type name".to_owned())),
-        };
+        let type_name = self.parse_type_name()?;
 
         // Check for AS STRUCT/UNION syntax
         if let Some(tok) = self.peek()? {
@@ -5281,11 +5295,7 @@ impl<'a> Parser<'a> {
             TK_TYPE => {
                 eat_assert!(self, TK_TYPE);
                 let if_exists = self.parse_if_exists()?;
-                let name_tok = self.eat()?;
-                let type_name = match name_tok {
-                    Some(tok) if tok.token_type == TK_ID => from_bytes(tok.as_bytes()),
-                    _ => return Err(Error::ParseError("expected type name".to_owned())),
-                };
+                let type_name = self.parse_type_name()?;
                 Ok(Stmt::DropType {
                     if_exists,
                     type_name,

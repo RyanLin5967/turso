@@ -1768,8 +1768,8 @@ fn emit_fk_action_subprogram(
 /// Build a QualifiedName with db_name set for non-main databases.
 fn qualified_table_name(table_name: &str, db_name: Option<&str>) -> QualifiedName {
     QualifiedName {
-        db_name: db_name.map(Name::from_string),
-        name: Name::from_string(table_name),
+        db_name: db_name.map(|d| Name::exact(d.to_string())),
+        name: Name::exact(table_name.to_string()),
         alias: None,
     }
 }
@@ -1803,7 +1803,7 @@ fn generate_set_null_stmt(
     let sets: Vec<ast::Set> = child_cols
         .iter()
         .map(|col| ast::Set {
-            col_names: vec![Name::from_string(col)],
+            col_names: vec![Name::exact(col.to_string())],
             expr: Box::new(Expr::Literal(Literal::Null)),
         })
         .collect();
@@ -1837,7 +1837,7 @@ fn generate_set_default_stmt(
                 .map(|d| (**d).clone())
                 .unwrap_or(Expr::Literal(Literal::Null));
             ast::Set {
-                col_names: vec![Name::from_string(col)],
+                col_names: vec![Name::exact(col.to_string())],
                 expr: Box::new(default_expr),
             }
         })
@@ -1872,7 +1872,7 @@ fn generate_cascade_update_stmt(
                 .new_param_index(i)
                 .expect("new params required for cascade update");
             ast::Set {
-                col_names: vec![Name::from_string(col)],
+                col_names: vec![Name::exact(col.to_string())],
                 expr: Box::new(Expr::Variable(ast::Variable::indexed(
                     u32::try_from(param_idx.get())
                         .ok()
@@ -1904,7 +1904,7 @@ fn build_fk_match_where_clause(child_cols: &[String], ctx: &FkSubprogramContext)
     for (i, col) in child_cols.iter().enumerate() {
         let param_idx = ctx.old_param_index(i);
         let cond = Expr::Binary(
-            Box::new(Expr::Id(Name::from_string(col))),
+            Box::new(Expr::Id(Name::exact(col.to_string()))),
             ast::Operator::Equals,
             Box::new(Expr::Variable(ast::Variable::indexed(
                 u32::try_from(param_idx.get())

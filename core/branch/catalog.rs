@@ -60,11 +60,12 @@
 //! held to CAPTURE what changed since the last checkpoint and to install the result, never across
 //! the catalog writes, the commit or the WAL backfill. A second connection ([`Catalog::writer`])
 //! writes the captured rows while the store's own connection serves on-demand reads from a snapshot
-//! pinned at the capture ([`Catalog::begin_read_snapshot`]), which in-memory state overrides exactly
+//! pinned at the capture ([`Catalog::begin_snapshot_tx`], [`Catalog::pin_snapshot`]), which in-memory state overrides exactly
 //! as it does between checkpoints. The capture appends a `Record::Checkpoint` to the log (ARIES's
 //! begin-checkpoint record), so the log is cut to what follows it only after the commit, and a crash
 //! between the two replays just that suffix (see `Journal::recover_catalog`).
 
+use crate::connection::{EngineSql, Origin};
 use std::num::NonZero;
 use std::path::Path;
 
@@ -301,7 +302,7 @@ impl Stmt {
     /// The compiled statement, compiling it the first time.
     fn get(&mut self) -> Result<&mut Statement> {
         if self.stmt.is_none() {
-            self.stmt = Some(Box::new(self.conn.prepare(self.sql)?));
+            self.stmt = Some(Box::new(self.conn.prepare_engine(EngineSql::new(self.sql), Origin::Root)?));
         }
         Ok(self.stmt.as_mut().expect("compiled above"))
     }
@@ -443,11 +444,11 @@ mod census_tests {
         let dir = tempfile::TempDir::new().unwrap();
         let cat = Catalog::open(&dir.path().join("c.db"), SyncClass::Off).unwrap();
         cat.conn
-            .execute("CREATE TABLE plant(k INTEGER PRIMARY KEY, v INTEGER NOT NULL)")
+            .execute_engine(EngineSql::new("CREATE TABLE plant(k INTEGER PRIMARY KEY, v INTEGER NOT NULL)"), Origin::Root)
             .unwrap();
         for (k, v) in [(5i64, 5i64), ((1 << 21) - 1, (1 << 23) - 1), (1 << 21, 1 << 23)] {
             cat.conn
-                .execute(format!("INSERT INTO plant VALUES ({k}, {v})"))
+                .execute_engine(EngineSql::new(format!("INSERT INTO plant VALUES ({k}, {v})")), Origin::Root)
                 .unwrap();
         }
         let shape = cat.shape().unwrap();
@@ -580,14 +581,14 @@ impl Catalog {
         // (test builds only): each statement its own commit, as before.
         let one = !crate::branch::store::fe_mutant("catalog_schema_per_statement");
         if one {
-            conn.execute("BEGIN")?;
+            conn.execute_engine(EngineSql::new("BEGIN"), Origin::Root)?;
         }
-        let created = SCHEMA.iter().try_for_each(|sql| conn.execute(*sql));
+        let created = SCHEMA.iter().try_for_each(|sql| conn.execute_engine(EngineSql::new(*sql), Origin::Root));
         if one {
             match created {
-                Ok(()) => conn.execute("COMMIT")?,
+                Ok(()) => conn.execute_engine(EngineSql::new("COMMIT"), Origin::Root)?,
                 Err(e) => {
-                    let _ = conn.execute("ROLLBACK");
+                    let _ = conn.execute_engine(EngineSql::new("ROLLBACK"), Origin::Root);
                     return Err(e);
                 }
             }
@@ -620,16 +621,16 @@ impl Catalog {
 
     /// Set a connection's pragmas and prepare every statement on it.
     fn prepared(db: Arc<Database>, conn: Arc<Connection>, sync: SyncClass) -> Result<Catalog> {
-        conn.execute(if sync.syncs() {
+        conn.execute_engine(EngineSql::new(if sync.syncs() {
             "PRAGMA synchronous = FULL"
         } else {
             "PRAGMA synchronous = OFF"
-        })?;
+        }), Origin::Root)?;
         // D2: the catalog's commits are F_FULLFSYNC, as the log's and the arena's are.
         if sync == SyncClass::FullFsync {
-            conn.execute("PRAGMA fullfsync = ON")?;
+            conn.execute_engine(EngineSql::new("PRAGMA fullfsync = ON"), Origin::Root)?;
         }
-        conn.execute(format!("PRAGMA cache_size = {}", cat_cache_pages()))?;
+        conn.execute_engine(EngineSql::new(format!("PRAGMA cache_size = {}", cat_cache_pages())), Origin::Root)?;
         let p = |sql: &'static str| -> Result<Stmt> { Stmt::new(&conn, sql) };
         Ok(Catalog {
             meta_all: p("SELECT k, v FROM meta")?,
@@ -733,8 +734,8 @@ impl Catalog {
         if class == self.sync {
             return Ok(());
         }
-        self.conn.execute(if class.syncs() { "PRAGMA synchronous = FULL" } else { "PRAGMA synchronous = OFF" })?;
-        self.conn.execute(if class == SyncClass::FullFsync { "PRAGMA fullfsync = ON" } else { "PRAGMA fullfsync = OFF" })?;
+        self.conn.execute_engine(EngineSql::new(if class.syncs() { "PRAGMA synchronous = FULL" } else { "PRAGMA synchronous = OFF" }), Origin::Root)?;
+        self.conn.execute_engine(EngineSql::new(if class == SyncClass::FullFsync { "PRAGMA fullfsync = ON" } else { "PRAGMA fullfsync = OFF" }), Origin::Root)?;
         self.sync = class;
         Ok(())
     }
@@ -756,7 +757,7 @@ impl Catalog {
             }
             Prewarm::Interior | Prewarm::Buffer => {
                 let ints = |conn: &Arc<Connection>, sql: &str| -> Result<Vec<u64>> {
-                    conn.prepare(sql)?
+                    conn.prepare_engine(EngineSql::new(sql), Origin::Root)?
                         .run_collect_rows()?
                         .iter()
                         .map(|row| get(row, 0))
@@ -766,7 +767,7 @@ impl Catalog {
                 if mode == Prewarm::Buffer {
                     st.cache_pages = st.cache_pages.max(n + 64);
                     self.conn
-                        .execute(format!("PRAGMA cache_size = {}", st.cache_pages))?;
+                        .execute_engine(EngineSql::new(format!("PRAGMA cache_size = {}", st.cache_pages)), Origin::Root)?;
                 }
                 // Page 1 is sqlite_schema's root; every other tree's root is listed in it.
                 let mut roots = vec![1u64];
@@ -876,16 +877,16 @@ impl Catalog {
     /// with the `cli_only` feature. Unprepared statements, outside `counters`: an instrument. It
     /// writes nothing: the transaction only reads, and is rolled back.
     pub(crate) fn shape(&self) -> Result<super::CatalogShape> {
-        self.conn.execute("BEGIN")?;
+        self.conn.execute_engine(EngineSql::new("BEGIN"), Origin::Root)?;
         let shape = self.shape_in_read_tx();
-        let _ = self.conn.execute("ROLLBACK");
+        let _ = self.conn.execute_engine(EngineSql::new("ROLLBACK"), Origin::Root);
         shape
     }
 
     fn shape_in_read_tx(&self) -> Result<super::CatalogShape> {
         let bad = |what: String| LimboError::Corrupt(format!("branch catalog shape: {what}"));
         let one_int = |sql: &str| -> Result<u64> {
-            let rows = self.conn.prepare(sql)?.run_collect_rows()?;
+            let rows = self.conn.prepare_engine(EngineSql::new(sql), Origin::Root)?.run_collect_rows()?;
             rows.first()
                 .and_then(|r| r.first())
                 .and_then(Value::as_int)
@@ -902,7 +903,7 @@ impl Catalog {
         let mut roots = vec![("sqlite_schema".to_string(), 1u64)];
         for row in self
             .conn
-            .prepare("SELECT name, rootpage FROM sqlite_schema WHERE rootpage > 0 ORDER BY name")?
+            .prepare_engine(EngineSql::new("SELECT name, rootpage FROM sqlite_schema WHERE rootpage > 0 ORDER BY name"), Origin::Root)?
             .run_collect_rows()?
         {
             match (row.first(), row.get(1).and_then(Value::as_int)) {
@@ -972,12 +973,12 @@ impl Catalog {
     }
 
     pub(crate) fn begin(&mut self) -> Result<()> {
-        self.conn.execute("BEGIN")?;
+        self.conn.execute_engine(EngineSql::new("BEGIN"), Origin::Root)?;
         Ok(())
     }
 
     pub(crate) fn commit(&mut self) -> Result<()> {
-        self.conn.execute("COMMIT")?;
+        self.conn.execute_engine(EngineSql::new("COMMIT"), Origin::Root)?;
         Ok(())
     }
 
@@ -988,7 +989,7 @@ impl Catalog {
     pub(crate) fn truncate_wal(&mut self) -> Result<Vec<i64>> {
         let rows = self
             .conn
-            .prepare("PRAGMA wal_checkpoint(TRUNCATE)")?
+            .prepare_engine(EngineSql::new("PRAGMA wal_checkpoint(TRUNCATE)"), Origin::Root)?
             .run_collect_rows()?;
         Ok(rows
             .first()
@@ -1000,7 +1001,7 @@ impl Catalog {
     #[cfg(test)]
     pub(crate) fn ints(&self, sql: &str) -> Result<Vec<u64>> {
         self.conn
-            .prepare(sql)?
+            .prepare_engine(EngineSql::new(sql), Origin::Root)?
             .run_collect_rows()?
             .iter()
             .map(|row| get(row, 0))
@@ -1015,7 +1016,7 @@ impl Catalog {
         for sql in LOOKUPS {
             let rows = self
                 .conn
-                .prepare(format!("EXPLAIN QUERY PLAN {sql}"))?
+                .prepare_engine(EngineSql::new(format!("EXPLAIN QUERY PLAN {sql}")), Origin::Root)?
                 .run_collect_rows()?;
             let lines = rows
                 .iter()
@@ -1027,7 +1028,7 @@ impl Catalog {
     }
 
     pub(crate) fn rollback(&mut self) {
-        let _ = self.conn.execute("ROLLBACK");
+        let _ = self.conn.execute_engine(EngineSql::new("ROLLBACK"), Origin::Root);
     }
 
     pub(crate) fn put_meta(&mut self, m: &Meta) -> Result<()> {
@@ -1048,11 +1049,18 @@ impl Catalog {
         Ok(())
     }
 
-    /// Pin a read snapshot on this connection (F-FZ phase 1): a deferred BEGIN takes its snapshot
-    /// at its first read, so one is made now, before the checkpoint's writer can commit. Every read
-    /// on this connection until [`Catalog::end_read_snapshot`] sees the catalog as of here.
-    pub(crate) fn begin_read_snapshot(&mut self) -> Result<()> {
-        self.begin_tx.rows(&[], &mut self.counters)?;
+    /// A read snapshot on this connection is pinned in two steps (F-FZ phase 1), this then
+    /// [`Catalog::pin_snapshot`]: a deferred BEGIN takes its snapshot at its first read, so one is
+    /// made at once, before the checkpoint's writer can commit. Every read on this connection until
+    /// [`Catalog::end_read_snapshot`] sees the catalog as of there. This first step begins the
+    /// transaction (deferred: nothing read yet).
+    pub(crate) fn begin_snapshot_tx(&mut self) -> Result<()> {
+        self.begin_tx.rows(&[], &mut self.counters).map(drop)
+    }
+
+    /// The second step after [`Catalog::begin_snapshot_tx`]: the first read, which pins the
+    /// snapshot (the meta rows); a failure rolls the transaction back.
+    pub(crate) fn pin_snapshot(&mut self) -> Result<()> {
         if let Err(e) = self.meta_all.rows(&[], &mut self.counters) {
             self.rollback();
             return Err(e);
@@ -1060,7 +1068,7 @@ impl Catalog {
         Ok(())
     }
 
-    /// End the snapshot [`Catalog::begin_read_snapshot`] pinned (F-FZ phase 3). It wrote nothing,
+    /// End the snapshot [`Catalog::pin_snapshot`] pinned (F-FZ phase 3). It wrote nothing,
     /// so a failure to end it is a failure to release a read mark only.
     pub(crate) fn end_read_snapshot(&mut self) {
         if let Err(e) = self.commit_tx.rows(&[], &mut self.counters) {
@@ -1098,7 +1106,7 @@ impl Catalog {
 
     pub(crate) fn wal_passive(&mut self) -> Result<()> {
         self.conn
-            .prepare("PRAGMA wal_checkpoint(PASSIVE)")?
+            .prepare_engine(EngineSql::new("PRAGMA wal_checkpoint(PASSIVE)"), Origin::Root)?
             .run_collect_rows()?;
         Ok(())
     }
@@ -1623,15 +1631,15 @@ pub fn catalog_only_fixture(path: &Path, n: u64, d: u64, measure: bool, seed: u6
             cat.begin()?;
             let bulk = cat
                 .conn
-                .execute(format!(
+                .execute_engine(EngineSql::new(format!(
                     "INSERT INTO branch(id, parent, fork_epoch, epoch, released, lease, n_children) \
                      SELECT value, 0, value - 1, 0, 0, NULL, 0 FROM generate_series({lo}, {hi})"
-                ))
+                )), Origin::Root)
                 .and_then(|_| {
-                    cat.conn.execute(format!(
+                    cat.conn.execute_engine(EngineSql::new(format!(
                         "INSERT INTO cur(k, slot, born, crc) SELECT (value << 32) | (2 + value % 1000), \
                          value, 0, 0 FROM generate_series({lo}, {hi})"
-                    ))
+                    )), Origin::Root)
                 });
             if bulk.is_err() {
                 // No table-valued generate_series here: the same rows, one statement each.
@@ -1651,7 +1659,7 @@ pub fn catalog_only_fixture(path: &Path, n: u64, d: u64, measure: bool, seed: u6
             lo = hi + 1;
         }
         cat.truncate_wal()?;
-        let rows = cat.conn.prepare("SELECT count(*) FROM cur")?.run_collect_rows()?;
+        let rows = cat.conn.prepare_engine(EngineSql::new("SELECT count(*) FROM cur"), Origin::Root)?.run_collect_rows()?;
         let count = rows.first().map_or(Ok(0), |r| get(r, 0))?;
         if count != n {
             return Err(LimboError::InternalError(format!(

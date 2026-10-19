@@ -1338,7 +1338,7 @@ fn prepare_statement_parsed(
         let _planning = enter(Phase::Plan);
         let prepared = pg_conn
             .conn
-            .prepare_translated_cmd_with_options(translated.cmd, sql, &options);
+            .prepare_translated_cmd_with_options(translated.cmd, sql, options.clone());
         // A positional INSERT whose VALUES lists are of another length than the table's is refused
         // by the engine, which takes only the full length; PostgreSQL fills a shorter list's
         // leading columns. Asked again, the translator reads the table's columns and names them, on
@@ -1351,7 +1351,7 @@ fn prepare_statement_parsed(
                 .map_err(crate::session::pg_parse_error)?;
             return pg_conn
                 .conn
-                .prepare_translated_cmd_with_options(retried.cmd, sql, &options)
+                .prepare_translated_cmd_with_options(retried.cmd, sql, options.clone())
                 .map(Some);
         }
         return prepared.map(Some);
@@ -1366,12 +1366,12 @@ fn prepare_statement_parsed(
             let input = prereq.to_string();
             pg_conn
                 .conn
-                .prepare_translated_stmt_with_options(prereq, &input, &options)?
+                .prepare_translated_stmt_with_options(prereq, &input, options.clone())?
                 .run_ignore_rows()?;
         }
         pg_conn
             .conn
-            .prepare_translated_cmd_with_options(translated.cmd, sql, &options)?
+            .prepare_translated_cmd_with_options(translated.cmd, sql, options.clone())?
             .run_ignore_rows()?;
         match new_table_keys.as_deref() {
             Some(table) => check_table_keys(&pg_conn.conn, table),

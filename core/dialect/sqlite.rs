@@ -39,6 +39,9 @@ impl super::Dialect for SqliteDialect {
     fn name(&self) -> &'static str {
         "sqlite"
     }
+    fn owns_stored_table_sql(&self, _sql: &str) -> bool {
+        false
+    }
 
     fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
         parse(sql)
@@ -50,6 +53,11 @@ impl super::Dialect for SqliteDialect {
 
     fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<turso_parser::ast::Stmt> {
         parse_table_sql_ast(sql)
+    }
+
+    // Its replay text is SQLite (it goes through SQLite's table_sql_for_replay).
+    fn table_sql_for_replay_stored(&self, sql: &str) -> crate::Result<crate::connection::StoredSql> {
+        Ok(crate::connection::StoredSql::sqlite(self.table_sql_for_replay(sql)?))
     }
 
     fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
@@ -538,6 +546,7 @@ pub fn resolve_builtin_function(name: &str, arg_count: usize) -> crate::Result<O
         "int_to_boolean" => Ok(Some(Func::Scalar(ScalarFunc::IntToBoolean))),
         "validate_ipaddr" => Ok(Some(Func::Scalar(ScalarFunc::ValidateIpAddr))),
         "numeric_encode" => Ok(Some(Func::Scalar(ScalarFunc::NumericEncode))),
+        "varchar_encode" => Ok(Some(Func::Scalar(ScalarFunc::VarcharEncode))),
         "numeric_decode" => Ok(Some(Func::Scalar(ScalarFunc::NumericDecode))),
         "numeric_add" => Ok(Some(Func::Scalar(ScalarFunc::NumericAdd))),
         "numeric_sub" => Ok(Some(Func::Scalar(ScalarFunc::NumericSub))),

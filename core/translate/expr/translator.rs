@@ -1976,6 +1976,7 @@ pub fn translate_expr(
                         | ScalarFunc::IntToBoolean
                         | ScalarFunc::ValidateIpAddr
                         | ScalarFunc::NumericEncode
+                        | ScalarFunc::VarcharEncode
                         | ScalarFunc::NumericDecode
                         | ScalarFunc::NumericAdd
                         | ScalarFunc::NumericSub
@@ -2281,7 +2282,8 @@ pub fn translate_expr(
                                 .name
                                 .clone()
                                 .unwrap_or_else(|| format!("column{}", col_idx + 1));
-                            let quoted_col_name = format!("'{col_name}'");
+                            // Escaped (QUOTE-SWEEP F5: sanitize_string un-doubles it).
+                            let quoted_col_name = format!("'{}'", crate::util::escape_sql_string_literal(&col_name));
                             args.push(Box::new(ast::Expr::Literal(ast::Literal::String(
                                 quoted_col_name,
                             ))));

@@ -320,7 +320,7 @@ pub fn parse_recipe_name(name: &str) -> Option<u64> {
 }
 
 fn quote_ident(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
+    crate::util::double_quote_identifier(name)
 }
 
 /// The persisted text of a recipe: `UPDATE "t" SET "c" = e, ... [WHERE p]`, from the statement's
@@ -1087,8 +1087,11 @@ impl CompiledRecipe {
             &syms,
             conn.experimental_custom_types_enabled(),
             conn.get_dqs_dml().into(),
-            Arc::new(crate::dialect::SqliteDialect),
+            // The database's dialect (dialect code review MED-3: it was SqliteDialect).
+            conn.dialect(),
             &None,
+            // A recipe's expressions compile no CREATE: no row of its own is stored.
+            crate::connection::SqlSource::Engine,
         );
         let columns = table.columns();
         let n = columns.len();

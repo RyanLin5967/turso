@@ -1,0 +1,31 @@
+# R1 (dialect design REVISION 2 item 2, 2.1): every entry that compiles text without the engine's own kind.
+# Generated from lanes/engine/r1/methods.txt (one canonical path per line; clippy.toml has no globs).
+# Engine code uses Connection::prepare_engine / execute_engine (EngineSql) or prepare_replay; a
+# definition that delegates carries #[allow(clippy::disallowed_methods, reason = "...")].
+disallowed-methods = [
+    { path = "turso_core::connection::Connection::prepare", reason = "engine code builds its own SQLite text: use prepare_engine/execute_engine (dialect design REVISION 2)" },
+    { path = "turso_core::connection::Connection::prepare_sqlite", reason = "engine code builds its own SQLite text: use prepare_engine/execute_engine (dialect design REVISION 2)" },
+    { path = "turso_core::connection::Connection::prepare_internal", reason = "engine code builds its own SQLite text: use prepare_engine/execute_engine (dialect design REVISION 2)" },
+    { path = "turso_core::connection::Connection::query", reason = "engine code builds its own SQLite text: use prepare_engine/execute_engine (dialect design REVISION 2)" },
+    { path = "turso_core::connection::Connection::execute", reason = "engine code builds its own SQLite text: use prepare_engine/execute_engine (dialect design REVISION 2)" },
+    { path = "turso_core::connection::Connection::execute_sqlite", reason = "engine code builds its own SQLite text: use prepare_engine/execute_engine (dialect design REVISION 2)" },
+    { path = "turso_core::connection::Connection::_prepare", reason = "engine code builds its own SQLite text: use prepare_engine/execute_engine (dialect design REVISION 2)" },
+    { path = "turso_core::connection::Connection::prepare_text_with_origin", reason = "engine code builds its own SQLite text: use prepare_engine/execute_engine (dialect design REVISION 2)" },
+    { path = "turso_core::connection::Connection::prepare_execute_batch", reason = "engine code builds its own SQLite text: use prepare_engine/execute_engine (dialect design REVISION 2)" },
+    { path = "turso_core::connection::Connection::consume_stmt", reason = "engine code builds its own SQLite text: use prepare_engine/execute_engine (dialect design REVISION 2)" },
+    { path = "turso_core::connection::Connection::query_runner", reason = "engine code builds its own SQLite text: use prepare_engine/execute_engine (dialect design REVISION 2)" },
+    { path = "turso_core::connection::Connection::run_cmd", reason = "engine code builds its own SQLite text: use prepare_engine/execute_engine (dialect design REVISION 2)" },
+    { path = "turso_core::connection::Connection::pragma", reason = "engine code builds its own SQLite text: use prepare_engine/execute_engine (dialect design REVISION 2)" },
+    { path = "turso_core::connection::Connection::pragma_query", reason = "engine code builds its own SQLite text: use prepare_engine/execute_engine (dialect design REVISION 2)" },
+    { path = "turso_core::connection::Connection::pragma_update", reason = "engine code builds its own SQLite text: use prepare_engine/execute_engine (dialect design REVISION 2)" },
+    { path = "turso_core::connection::Connection::prepare_translated_stmt", reason = "engine code builds its own SQLite text: use prepare_engine/execute_engine (dialect design REVISION 2)" },
+    { path = "turso_core::connection::Connection::prepare_translated_stmt_with_options", reason = "engine code builds its own SQLite text: use prepare_engine/execute_engine (dialect design REVISION 2)" },
+    { path = "turso_core::connection::Connection::prepare_translated_cmd", reason = "engine code builds its own SQLite text: use prepare_engine/execute_engine (dialect design REVISION 2)" },
+    { path = "turso_core::connection::Connection::prepare_translated_cmd_with_options", reason = "engine code builds its own SQLite text: use prepare_engine/execute_engine (dialect design REVISION 2)" },
+    { path = "turso_core::connection::Connection::prepare_with", reason = "engine code builds its own SQLite text: use prepare_engine/execute_engine (dialect design REVISION 2)" },
+    { path = "turso_core::connection::Connection::execute_with", reason = "engine code builds its own SQLite text: use prepare_engine/execute_engine (dialect design REVISION 2)" },
+    { path = "turso_core::connection::SqlKind::client", reason = "engine code builds its own SQLite text: use prepare_engine/execute_engine (dialect design REVISION 2)" },
+    { path = "turso_core::connection::SqlKind::frontend", reason = "engine code builds its own SQLite text: use prepare_engine/execute_engine (dialect design REVISION 2)" },
+    { path = "turso_core::connection::Connection::prepare_translated_cmd_with_kind", reason = "engine code builds its own SQLite text: use prepare_engine/execute_engine (dialect design REVISION 2)" },
+    { path = "turso_core::connection::SqlKind::replay", reason = "engine code builds its own SQLite text: use prepare_engine/execute_engine (dialect design REVISION 2)" },
+]

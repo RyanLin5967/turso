@@ -12,7 +12,6 @@ use super::{
     update::translate_update_for_schema_change,
 };
 use crate::{
-    error::SQLITE_CONSTRAINT_CHECK,
     function::{AlterTableFunc, Func},
     schema::{CheckConstraint, Column, ColumnLayout, ForeignKey, Table, RESERVED_TABLE_PREFIXES},
     translate::{
@@ -23,7 +22,7 @@ use crate::{
     },
     util::{
         check_expr_references_column, escape_sql_string_literal, normalize_ident,
-        parse_numeric_literal, rewrite_check_expr_table_refs, rewrite_trigger_cmd_table_refs,
+        parse_numeric_literal, quote_identifier, rewrite_check_expr_table_refs, rewrite_trigger_cmd_table_refs,
         rewrite_view_sql_for_column_rename,
     },
     vdbe::{
@@ -70,7 +69,8 @@ fn schema_table_name_for_db(resolver: &Resolver, database_id: usize) -> String {
         let db_name = resolver
             .get_database_name_by_index(database_id)
             .unwrap_or_else(|| "main".to_string());
-        format!("{db_name}.{SQLITE_TABLEID}")
+        // Quoted (wire: ONE QUOTING FUNCTION class).
+        format!("{}.{SQLITE_TABLEID}", quote_identifier(&db_name))
     }
 }
 
@@ -713,14 +713,17 @@ fn emit_add_virtual_column_validation(
     Ok(())
 }
 
-/// Validate CHECK constraints on a newly added column against the column's DEFAULT value.
+/// Validate the new column's CHECK constraints (its own and its domain's) against every existing
+/// row, as SQLite does (alter.c's `pragma_quick_check` after the change; 3.53.1 refuses
+/// `ALTER TABLE a ADD COLUMN c CHECK (c IS NOT NULL)` over a row) and as PostgreSQL verifies a new
+/// constraint against the table's rows. Each row is read as it reads after the change: its stored
+/// columns, plus the new column's DEFAULT (the domain's when the column has none, else NULL).
 ///
-/// When a table has existing rows, the new column gets the DEFAULT value (or NULL).
-/// If that value would violate a CHECK constraint, the ALTER TABLE must be rejected.
-/// This emits bytecode that:
-/// 1. Checks if the table has any rows (Rewind)
-/// 2. Evaluates the CHECK expression with the column reference substituted by the DEFAULT
-/// 3. Halts with a CHECK constraint error if the result is false
+/// Engine review queue a-f M1: the earlier check returned early without a DEFAULT, on the premise
+/// that NULL passes every CHECK (which `c IS NOT NULL` refutes), and evaluated the CHECK with the
+/// DEFAULT substituted and no row, so a CHECK naming another column could not be evaluated at all.
+/// Divergence kept: SQLite's quick_check also re-verifies the table's earlier CHECKs, which only a
+/// row stored under `ignore_check_constraints` can fail; PostgreSQL does not, and neither does this.
 #[allow(clippy::too_many_arguments)]
 fn emit_add_column_check_validation(
     program: &mut ProgramBuilder,
@@ -728,141 +731,198 @@ fn emit_add_column_check_validation(
     original_btree: &Arc<BTreeTable>,
     new_column_name: &str,
     column: &Column,
-    constraints: &[ast::NamedColumnConstraint],
     resolver: &Resolver,
+    connection: &Arc<crate::Connection>,
     database_id: usize,
 ) -> Result<()> {
-    // Determine the effective default value. If no DEFAULT, existing rows get NULL,
-    // which always passes CHECK per SQL standard (NULL is not false).
-    let default_expr = match &column.default {
-        Some(expr) if !crate::util::expr_contains_null(expr) => *expr.clone(),
-        _ => return Ok(()),
-    };
-
-    // Collect CHECK constraints from column-level constraints + domain CHECKs.
-    // Domain CHECKs use `value` as placeholder which must be rewritten to the column name.
-    // The fourth element is the domain a CHECK comes from (its failure is the domain's, in
-    // PostgreSQL's words: `schema::domain_check_failure`).
-    #[allow(clippy::type_complexity)]
-    let mut all_checks: Vec<(Option<String>, Option<String>, Box<ast::Expr>, Option<String>)> = constraints
+    // The CHECKs this ADD COLUMN adds: the column's own (pushed above) and its domain's
+    // (`propagate_domain_constraints`), which name the new column.
+    let new_column = normalize_ident(new_column_name);
+    let added = original_btree.check_constraints.len().min(btree.check_constraints.len());
+    let new_checks: Vec<CheckConstraint> = btree.check_constraints[added..]
         .iter()
-        .filter_map(|c| {
-            if let ast::ColumnConstraint::Check { expr, source } = &c.constraint {
-                Some((
-                    c.name.as_ref().map(|n| n.as_str().to_string()),
-                    source.clone(),
-                    expr.clone(),
-                    None,
-                ))
-            } else {
-                None
-            }
-        })
+        .filter(|c| c.column.as_deref().is_some_and(|n| normalize_ident(n) == new_column))
+        .cloned()
         .collect();
-
-    if let Ok(Some(resolved)) = resolver
-        .schema()
-        .resolve_type(&column.ty_str, btree.is_strict)
-    {
-        if resolved.is_domain() {
-            for td in &resolved.chain {
-                for (dc, name) in td.domain_checks.iter().zip(crate::schema::domain_check_names(td)) {
-                    let rewritten =
-                        crate::schema::rewrite_value_to_column(&dc.check, new_column_name);
-                    all_checks.push((Some(name), None, rewritten, Some(td.name.clone())));
-                }
-            }
-        }
-    }
-
-    if all_checks.is_empty() {
+    if new_checks.is_empty() || connection.check_constraints_ignored() {
         return Ok(());
     }
 
-    let table_name = &btree.name;
-    let col_name_lower = normalize_ident(new_column_name);
+    let type_default = resolver
+        .schema()
+        .resolve_type(&column.ty_str, btree.is_strict)
+        .ok()
+        .flatten()
+        .and_then(|r| r.default_expr().cloned());
+    let default_expr = column
+        .default
+        .as_deref()
+        .or(type_default.as_ref())
+        .cloned()
+        .unwrap_or(ast::Expr::Literal(ast::Literal::Null));
 
-    // Open the table to check if it has rows.
-    let check_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(original_btree.clone()));
+    let mut table = btree.clone();
+    table.prepare_generated_columns()?;
+    let (new_column_idx, _) = table.get_column(new_column_name).ok_or_else(|| {
+        LimboError::ParseError(format!(
+            "new column unexpectedly missing from table {}",
+            table.name
+        ).into())
+    })?;
+
+    let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(original_btree.clone()));
     program.emit_insn(Insn::OpenRead {
-        cursor_id: check_cursor_id,
+        cursor_id,
         root_page: original_btree.root_page,
         db: database_id,
     });
 
-    let skip_check_label = program.allocate_label();
+    let skip_label = program.allocate_label();
+    let loop_start = program.allocate_label();
     program.emit_insn(Insn::Rewind {
-        cursor_id: check_cursor_id,
-        pc_if_empty: skip_check_label,
+        cursor_id,
+        pc_if_empty: skip_label,
+    });
+    program.preassign_label_to_next_insn(loop_start);
+
+    let rowid_reg = program.alloc_register();
+    program.emit_insn(Insn::RowId {
+        cursor_id,
+        dest: rowid_reg,
     });
 
-    // Table has rows -- evaluate each CHECK constraint with the default value substituted.
-    for (constraint_name, check_source, check_expr, domain) in &all_checks {
-        let mut substituted = *check_expr.clone();
-
-        // Replace references to the new column with the default value expression.
-        let _ = walk_expr_mut(
-            &mut substituted,
-            &mut |e: &mut ast::Expr| -> Result<WalkControl> {
-                match e {
-                    ast::Expr::Id(name) if normalize_ident(name.as_str()) == col_name_lower => {
-                        *e = default_expr.clone();
-                        Ok(WalkControl::SkipChildren)
-                    }
-                    ast::Expr::Qualified(tbl, col)
-                        if normalize_ident(tbl.as_str()) == normalize_ident(table_name)
-                            && normalize_ident(col.as_str()) == col_name_lower =>
-                    {
-                        *e = default_expr.clone();
-                        Ok(WalkControl::SkipChildren)
-                    }
-                    _ => Ok(WalkControl::Continue),
-                }
-            },
+    let layout = table.column_layout()?;
+    let base_dest_reg = program.alloc_registers(layout.column_count());
+    for (idx, table_column) in table.columns().iter().enumerate() {
+        if idx == new_column_idx {
+            translate_expr(
+                program,
+                None,
+                &default_expr,
+                layout.to_register(base_dest_reg, idx),
+                resolver,
+            )?;
+            continue;
+        }
+        if table_column.is_virtual_generated() || table_column.is_rowid_alias() {
+            continue;
+        }
+        program.emit_column_or_rowid(
+            cursor_id,
+            layout.to_reg_offset(idx),
+            layout.to_register(base_dest_reg, idx),
         );
-
-        let result_reg = program.alloc_register();
-        translate_expr(program, None, &substituted, result_reg, resolver)?;
-
-        // CHECK passes if the result is NULL or non-zero (truthy).
-        let check_passed_label = program.allocate_label();
-
-        program.emit_insn(Insn::IsNull {
-            reg: result_reg,
-            target_pc: check_passed_label,
-        });
-
-        program.emit_insn(Insn::If {
-            reg: result_reg,
-            target_pc: check_passed_label,
-            jump_if_null: false,
-        });
-
-        // CHECK failed -- halt with constraint error. SQLite reports the
-        // constraint name, or the expression's source text as written.
-        let name = match (constraint_name, check_source) {
-            (Some(name), _) => name.clone(),
-            (None, Some(source)) => crate::util::check_source_for_error(source),
-            (None, None) => format!("{check_expr}"),
-        };
-        let (err_code, description) = match domain {
-            Some(domain) => (
-                crate::error::SQLITE_CONSTRAINT_CHECK_DOMAIN,
-                crate::schema::domain_check_failure(domain, &name),
-            ),
-            None => (SQLITE_CONSTRAINT_CHECK, name),
-        };
-        program.emit_insn(Insn::Halt {
-            err_code,
-            description,
-            on_error: None,
-            description_reg: None,
-        });
-
-        program.preassign_label_to_next_insn(check_passed_label);
     }
 
-    program.preassign_label_to_next_insn(skip_check_label);
+    let dml_ctx = DmlColumnContext::layout(table.columns(), base_dest_reg, rowid_reg, layout);
+    if table.columns().iter().any(|c| c.is_virtual_generated()) {
+        let table_arc = Arc::new(table.clone());
+        compute_virtual_columns(program, &table.columns_topo_sort()?, &dml_ctx, resolver, &table_arc)?;
+    }
+
+    let mut check_resolver = resolver.fork();
+    let skip_row_label = program.allocate_label();
+    emit_check_constraints(
+        program,
+        &new_checks,
+        &mut check_resolver,
+        table.name.as_str(),
+        rowid_reg,
+        table
+            .columns()
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, col)| col.name.as_deref().map(|name| (name, dml_ctx.to_column_reg(idx)))),
+        connection,
+        ast::ResolveType::Abort,
+        skip_row_label,
+        None,
+    )?;
+    program.preassign_label_to_next_insn(skip_row_label);
+
+    program.emit_insn(Insn::Next {
+        cursor_id,
+        pc_if_next: loop_start,
+        fullscan: false,
+    });
+
+    program.preassign_label_to_next_insn(skip_label);
+    Ok(())
+}
+
+/// Rewrite `table_name`'s CREATE TABLE row in `database_id`'s sqlite_schema with `func`
+/// (`AlterTableFunc::AddColumn` with the new column's definition as written, or `DropColumn` with
+/// the dropped column's name). It reads the row's stored SQL at run time and prints the changed
+/// statement through the parser's AST, as ALTER COLUMN's loop does, so no clause the schema model
+/// does not hold is lost (engine-rev-qaf-fix HIGH-2/3/4, MED-1). Emitted before the statement's
+/// sqlite_schema UPDATE, which then leaves the text as this wrote it.
+#[allow(clippy::too_many_arguments)]
+fn emit_table_sql_rewrite(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    connection: &Arc<crate::Connection>,
+    database_id: usize,
+    table_name: &str,
+    column: &str,
+    definition: &str,
+    func: AlterTableFunc,
+) -> Result<()> {
+    let sqlite_schema = resolver
+        .with_schema(database_id, |s| s.get_btree_table(SQLITE_TABLEID))
+        .ok_or_else(|| LimboError::ParseError("sqlite_schema table not found in schema".to_string().into()))?;
+    let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(sqlite_schema.clone()));
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id,
+        root_page: RegisterOrLiteral::Literal(sqlite_schema.root_page),
+        db: database_id,
+    });
+    let mvcc = database_uses_mvcc(connection, database_id);
+    program.cursor_loop(cursor_id, |program, rowid| {
+        let sqlite_schema_column_len = sqlite_schema.columns().len();
+        turso_assert_eq!(sqlite_schema_column_len, 5);
+        let first_column = program.alloc_registers(sqlite_schema_column_len);
+        for i in 0..sqlite_schema_column_len {
+            program.emit_column_or_rowid(cursor_id, i, first_column + i);
+        }
+        program.emit_string8_new_reg(table_name.to_string());
+        program.mark_last_insn_constant();
+        program.emit_string8_new_reg(column.to_string());
+        program.mark_last_insn_constant();
+        program.emit_string8_new_reg(definition.to_string());
+        program.mark_last_insn_constant();
+        let out = program.alloc_registers(sqlite_schema_column_len);
+        program.emit_insn(Insn::Function {
+            constant_mask: 0,
+            start_reg: first_column,
+            dest: out,
+            func: crate::function::FuncCtx {
+                func: Func::AlterTable(func.clone()),
+                arg_count: 8,
+            },
+        });
+        let record = program.alloc_register();
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: to_u32(out),
+            count: to_u32(sqlite_schema_column_len),
+            dest_reg: to_u32(record),
+            index_name: None,
+            affinity_str: None,
+        });
+        if mvcc {
+            program.emit_insn(Insn::Delete {
+                cursor_id,
+                table_name: SQLITE_TABLEID.to_string(),
+                is_part_of_update: true,
+            });
+        }
+        program.emit_insn(Insn::Insert {
+            cursor: cursor_id,
+            key_reg: rowid,
+            record_reg: record,
+            flag: crate::vdbe::insn::InsertFlags(0),
+            table_name: table_name.to_string(),
+        });
+    });
     Ok(())
 }
 
@@ -1185,15 +1245,17 @@ pub fn translate_alter_table(
                 }
             }
 
+            let dropped_name = btree.columns()[dropped_index].name.clone().unwrap_or_default();
             btree.columns_mut().remove(dropped_index);
 
-            let sql = escape_sql_string_literal(&connection.dialect().format_altered_table_sql(&btree)?);
-
+            // The stored text is rewritten through its own AST, the row in the form it was in
+            // (dialect design REVISION 2 item 8); the UPDATE below then leaves it as written.
+            emit_table_sql_rewrite(program, resolver, connection, database_id, table_name, &dropped_name, "", AlterTableFunc::DropColumn)?;
             let escaped_table_name = escape_sql_string_literal(table_name);
             let stmt = format!(
                 r#"
                     UPDATE {qualified_schema_table}
-                    SET sql = '{sql}'
+                    SET sql = sql
                     WHERE name = '{escaped_table_name}' COLLATE NOCASE AND type = 'table'
                 "#,
             );
@@ -1263,6 +1325,8 @@ pub fn translate_alter_table(
             )?
         }
         ast::AlterTableBody::AddColumn(col_def) => {
+            // The definition as written, for the stored text's rewrite (`emit_table_sql_rewrite`).
+            let definition_text = col_def.to_string();
             let is_generated = col_def
                 .constraints
                 .iter()
@@ -1464,12 +1528,14 @@ pub fn translate_alter_table(
             // visible to the empty-table check below.
             column = btree.columns().last().unwrap().clone();
 
-            let escaped = escape_sql_string_literal(&connection.dialect().format_altered_table_sql(&btree)?);
+            // The stored text is rewritten through its own AST just before the UPDATE below
+            // (`emit_table_sql_rewrite`), the row in the form it was in (dialect design REVISION 2
+            // item 8); the UPDATE then leaves it as written.
             let escaped_table_name = escape_sql_string_literal(table_name);
             let stmt = format!(
                 r#"
                     UPDATE {qualified_schema_table}
-                    SET sql = '{escaped}'
+                    SET sql = sql
                     WHERE name = '{escaped_table_name}' COLLATE NOCASE AND type = 'table'
                 "#,
             );
@@ -1558,12 +1624,13 @@ pub fn translate_alter_table(
                     &original_btree,
                     &new_column_name,
                     &column,
-                    &constraints,
                     resolver,
+                    connection,
                     database_id,
                 )?;
             }
 
+            emit_table_sql_rewrite(program, resolver, connection, database_id, table_name, "", &definition_text, AlterTableFunc::AddColumn)?;
             translate_update_for_schema_change(
                 update,
                 resolver,
@@ -2224,12 +2291,15 @@ pub fn translate_alter_table(
             // Update view SQL for renamed columns
             for (view_database_id, view_name, new_sql) in views_to_rewrite {
                 let escaped_sql = escape_sql_string_literal(&new_sql);
+                // Escaped as the trigger branches' names are (QUOTE-SWEEP-4a97c9c36 F4: a view named
+                // `v' OR 1 OR '` made this UPDATE rewrite every sqlite_schema row).
+                let escaped_view_name = escape_sql_string_literal(&view_name);
                 let view_schema_table = schema_table_name_for_db(resolver, view_database_id);
                 let update_stmt = format!(
                     r#"
                         UPDATE {view_schema_table}
                         SET sql = '{escaped_sql}'
-                        WHERE name = '{view_name}' COLLATE NOCASE AND type = 'view'
+                        WHERE name = '{escaped_view_name}' COLLATE NOCASE AND type = 'view'
                     "#,
                 );
 
@@ -2694,7 +2764,7 @@ fn rewrite_trigger_sql_for_column_rename(
                 for col in &mut cols {
                     let col_norm = normalize_ident(col.as_str());
                     if col_norm == old_col_norm {
-                        *col = ast::Name::from_string(new_col_norm.clone());
+                        *col = ast::Name::exact(new_col_norm.clone());
                     }
                 }
                 ast::TriggerEvent::UpdateOf(cols)
@@ -2726,7 +2796,7 @@ fn rewrite_trigger_sql_for_column_rename(
                             && is_renaming_trigger_table
                             && trigger_table.get_column(&col_norm).is_some()
                         {
-                            *col = ast::Name::from_string(&*new_col_norm);
+                            *col = ast::Name::exact(new_col_norm.to_string());
                         }
                     }
                     Ok(WalkControl::Continue)
@@ -2924,7 +2994,7 @@ fn apply_expr_column_ref_with_context(
             if ns_norm.eq_ignore_ascii_case("new") || ns_norm.eq_ignore_ascii_case("old") {
                 if is_renaming_trigger_table && trigger_table.get_column(&col_norm).is_some() {
                     if let Some(new_col_norm) = mode.rewritten_name() {
-                        *col = ast::Name::from_string(new_col_norm);
+                        *col = ast::Name::exact(new_col_norm.to_string());
                     } else {
                         return Err(no_such_column_error(&error_column_ref));
                     }
@@ -2939,7 +3009,7 @@ fn apply_expr_column_ref_with_context(
             {
                 let _ = (ctx_name_norm, is_renaming_ctx);
                 if let Some(new_col_norm) = mode.rewritten_name() {
-                    *col = ast::Name::from_string(new_col_norm);
+                    *col = ast::Name::exact(new_col_norm.to_string());
                 } else {
                     return Err(no_such_column_error(&error_column_ref));
                 }
@@ -2955,13 +3025,13 @@ fn apply_expr_column_ref_with_context(
                     if ctx_is_different_table {
                         return Err(no_such_column_error(&error_column_ref));
                     }
-                    *col = ast::Name::from_string(new_col_norm);
+                    *col = ast::Name::exact(new_col_norm.to_string());
                 } else {
                     return Err(no_such_column_error(&error_column_ref));
                 }
             } else if from_target_qualifiers.contains(&ns_norm) {
                 if let Some(new_col_norm) = mode.rewritten_name() {
-                    *col = ast::Name::from_string(new_col_norm);
+                    *col = ast::Name::exact(new_col_norm.to_string());
                 } else {
                     return Err(no_such_column_error(&error_column_ref));
                 }
@@ -2977,7 +3047,7 @@ fn apply_expr_column_ref_with_context(
                 if ctx_table.get_column(&col_norm).is_some() {
                     if is_renaming_ctx {
                         if let Some(new_col_norm) = mode.rewritten_name() {
-                            *e = ast::Expr::Id(ast::Name::from_string(new_col_norm));
+                            *e = ast::Expr::Id(ast::Name::exact(new_col_norm.to_string()));
                         } else {
                             return Err(no_such_column_error(old_col_norm));
                         }
@@ -3000,7 +3070,7 @@ fn apply_expr_column_ref_with_context(
                 || !from_target_qualifiers.is_empty()
             {
                 if let Some(new_col_norm) = mode.rewritten_name() {
-                    *e = ast::Expr::Id(ast::Name::from_string(new_col_norm));
+                    *e = ast::Expr::Id(ast::Name::exact(new_col_norm.to_string()));
                 } else {
                     return Err(no_such_column_error(old_col_norm));
                 }
@@ -3204,7 +3274,7 @@ fn apply_upsert_for_column_rename(
                 for col_name in &mut set.col_names {
                     if col_name.as_str().eq_ignore_ascii_case(old_col_norm) {
                         if let Some(new_col_norm) = mode.rewritten_name() {
-                            *col_name = ast::Name::from_string(new_col_norm);
+                            *col_name = ast::Name::exact(new_col_norm.to_string());
                         } else {
                             return Err(no_such_column_error(old_col_norm));
                         }
@@ -3723,7 +3793,7 @@ fn apply_trigger_cmd_for_column_rename(
                     for col_name in &mut set.col_names {
                         if col_name.as_str().eq_ignore_ascii_case(old_col_norm) {
                             if let Some(new_col_norm) = mode.rewritten_name() {
-                                *col_name = ast::Name::from_string(new_col_norm);
+                                *col_name = ast::Name::exact(new_col_norm.to_string());
                             } else {
                                 return Err(no_such_column_error(old_col_norm));
                             }
@@ -3789,7 +3859,7 @@ fn apply_trigger_cmd_for_column_rename(
                 for col_name in col_names.iter_mut() {
                     if col_name.as_str().eq_ignore_ascii_case(old_col_norm) {
                         if let Some(new_col_norm) = mode.rewritten_name() {
-                            *col_name = ast::Name::from_string(new_col_norm);
+                            *col_name = ast::Name::exact(new_col_norm.to_string());
                         } else {
                             return Err(no_such_column_error(old_col_norm));
                         }
@@ -3928,7 +3998,7 @@ fn rename_excluded_column_refs(
             if ns.as_str().eq_ignore_ascii_case("excluded")
                 && col.as_str().eq_ignore_ascii_case(old_col_norm)
             {
-                *col = ast::Name::from_string(new_col_norm);
+                *col = ast::Name::exact(new_col_norm.to_string());
             }
         }
         Ok(WalkControl::Continue)

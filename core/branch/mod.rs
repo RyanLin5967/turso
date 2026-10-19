@@ -119,6 +119,7 @@ pub fn backfill_io() -> [u64; 2] {
 pub(crate) fn count_backfill_io(which: usize) {
     BACKFILL_IO[which].fetch_add(1, crate::sync::atomic::Ordering::Relaxed);
 }
+pub mod async_api;
 pub(crate) mod catalog;
 pub(crate) mod derive;
 #[doc(hidden)]
@@ -901,7 +902,7 @@ impl Branch {
         store::take_counted_hold();
         // Early release (fastest-engine M1 item 2): the fork is applied and every lock released;
         // the branch is handed out only once its records are durable.
-        let forked = store.fork_branch(self.id, None).and_then(|(id, lsn)| {
+        let forked = store.fork_branch(self.id, None, store::Ack::Durable).and_then(|(id, lsn)| {
             store.wait_durable(lsn, store.sync_class()).inspect_err(|_| {
                 // Not handed out, so released (review item 11).
                 let _ = store.release_handle(id);
@@ -997,7 +998,7 @@ impl Connection {
     /// Fork a branch from whatever this connection is on: the trunk, or the branch it was opened
     /// on. The branch sees the committed state at the moment of the fork.
     pub fn fork_branch(self: &Arc<Connection>) -> Result<Branch> {
-        let id = self.fork_with(None)?;
+        let (id, _) = self.fork_with(None, store::Ack::Durable)?;
         Ok(Branch::new(self.db.clone(), id))
     }
 
@@ -1008,11 +1009,13 @@ impl Connection {
     /// database. The name is unique among unreleased branches, and is durable with the fork: both
     /// are one log record.
     pub fn create_branch(self: &Arc<Connection>, name: &str) -> Result<BranchId> {
-        self.fork_with(Some(name))
+        self.fork_with(Some(name), store::Ack::Durable).map(|(id, _)| id)
     }
 
-    /// A fork from this connection's position, named or not, durable when it returns.
-    fn fork_with(self: &Arc<Connection>, name: Option<&str>) -> Result<BranchId> {
+    /// A fork from this connection's position, named or not, with the log position that makes it
+    /// durable: durable when it returns (`Ack::Durable`), or only buffered and applied
+    /// (`Ack::Async`, LEAP L1: `create_branch_async`).
+    pub(crate) fn fork_with(self: &Arc<Connection>, name: Option<&str>, ack: store::Ack) -> Result<(BranchId, u64)> {
         // First: on a read-only handle of a database with branches, nothing below would refuse.
         self.db.branches.refuse_if_trunk_only("fork")?;
         if self.get_tx_state() != TransactionState::None {
@@ -1038,14 +1041,18 @@ impl Connection {
         // fastest-engine item 5: this fork's store-mutex holds, counted from here.
         store::take_counted_hold();
         let forked = match pager.branch_id() {
-            Some(parent) => store.fork_branch(parent, name).map(|(id, lsn)| (id, None, lsn)),
-            None => self.fork_trunk(&pager, name).map(|(id, wal, lsn)| (id, Some(wal), lsn)),
+            Some(parent) => store.fork_branch(parent, name, ack).map(|(id, lsn)| (id, None, lsn)),
+            None => self.fork_trunk(&pager, name, ack).map(|(id, wal, lsn)| (id, Some(wal), lsn)),
         };
         // Early release (fastest-engine M1 item 2): the fork is applied and every lock is released,
         // the trunk's WAL write lock included; the branch is handed out only once its records are
         // durable.
-        let forked = forked.and_then(|(id, wal, lsn)| match store.wait_durable(lsn, store.sync_class()) {
-            Ok(()) => Ok((id, wal)),
+        // An async create (LEAP L1) waits for nothing: its records ride a later flight, the
+        // flusher's or an operation's. Mutant `async_waits_durable` (test and fe-mutants builds):
+        // it waits, as a D2 create does.
+        let waits = ack == store::Ack::Durable || store::fe_mutant("async_waits_durable");
+        let forked = forked.and_then(|(id, wal, lsn)| match if waits { store.wait_durable(lsn, store.sync_class()) } else { Ok(()) } {
+            Ok(()) => Ok((id, wal, lsn)),
             Err(e) => {
                 // Not handed out, so released (review item 11): on a live store the Release rides
                 // the next flight; a fail-stopped one keeps it pending (`release_handle`).
@@ -1057,9 +1064,9 @@ impl Connection {
             }
         });
         let held = store::take_counted_hold();
-        let (id, wal) = forked?;
+        let (id, wal, lsn) = forked?;
         store.record_fork(held, wal);
-        Ok(id)
+        Ok((id, lsn))
     }
 
     /// Fork the trunk. A trunk commit takes its copy decisions at its serialization point, against
@@ -1077,11 +1084,12 @@ impl Connection {
         self: &Arc<Connection>,
         pager: &Arc<Pager>,
         name: Option<&str>,
+        ack: store::Ack,
     ) -> Result<(BranchId, store::WalHold, u64)> {
         let store = &self.db.branches;
         let seen = store.trunk_commit_seq();
         pager.begin_read_tx()?;
-        let forked = self.fork_trunk_registered(pager, Some(seen), name);
+        let forked = self.fork_trunk_registered(pager, Some(seen), name, ack);
         pager.end_read_tx();
         match forked? {
             store::TrunkFork::Forked { id, lsn, after } => {
@@ -1101,7 +1109,7 @@ impl Connection {
                 }
                 Ok((id, store::WalHold::default(), lsn))
             }
-            store::TrunkFork::NeedsWriterLock => self.fork_trunk_locked(pager, name),
+            store::TrunkFork::NeedsWriterLock => self.fork_trunk_locked(pager, name, ack),
         }
     }
 
@@ -1111,6 +1119,7 @@ impl Connection {
         self: &Arc<Connection>,
         pager: &Arc<Pager>,
         name: Option<&str>,
+        ack: store::Ack,
     ) -> Result<(BranchId, store::WalHold, u64)> {
         const SNAPSHOT_RETRIES: usize = 8;
         let mut attempt = 0;
@@ -1133,7 +1142,7 @@ impl Connection {
             }
             // fastest-engine item 5: the WAL write lock is held from here to `end_write_tx`.
             let locked = std::time::Instant::now();
-            let forked = self.fork_trunk_registered(pager, None, name);
+            let forked = self.fork_trunk_registered(pager, None, name, ack);
             pager.end_write_tx();
             let wal = store::WalHold {
                 ns: u64::try_from(locked.elapsed().as_nanos()).unwrap_or(u64::MAX),
@@ -1157,6 +1166,7 @@ impl Connection {
         pager: &Arc<Pager>,
         seen: Option<u64>,
         name: Option<&str>,
+        ack: store::Ack,
     ) -> Result<store::TrunkFork> {
         #[cfg(test)]
         crate::branch::budget_probe::fork_registration();
@@ -1188,7 +1198,7 @@ impl Connection {
             None => None,
         };
         let page_size = pager.get_page_size_unchecked().get() as usize;
-        self.db.branches.fork_trunk(schema, page_size, seen, name)
+        self.db.branches.fork_trunk(schema, page_size, seen, name, ack)
     }
 
     /// The schema this connection's open read snapshot holds, re-read from its pages into the
@@ -1448,26 +1458,25 @@ impl Database {
     /// refuses to drop a database in use; a `Branch` handle's release instead keeps the branch
     /// whole until its connection closes).
     pub fn drop_branch(&self, name: &str) -> Result<Reaped> {
+        // The lookup, the open check and the release in ONE store-mutex hold (budget
+        // delete_takes_the_store_mutex_at_most_twice): no window between them exists to race.
+        // The test hook still parks before it (`HOLD_DROP_LOOKED_UP`), so a connect made there wins
+        // and the drop is refused as in use. Mutant `drop_check_separate_hold`: the old separate
+        // holds below.
+        if !crate::branch::store::fe_mutant("drop_check_separate_hold") {
+            self.branches.pause_drop_looked_up();
+            return self.branches.drop_named(name);
+        }
+        // The mutant's arm (test builds only; engine review 14 MED 7): the lookup, the open check
+        // and the release in separate holds, the release unchecked, so a connect in the window
+        // between them wins and the drop still releases.
         let id = self
             .branches
             .branch_named(name)?
             .ok_or_else(|| store::untyped_branch_error(LimboError::NoSuchBranch(name.to_string())))?;
-        // A concurrent drop and re-create of the same name between the lookup and the release can
-        // only make this release the OLD branch twice: the second release reports success once
-        // the first one's Release is durable (both callers wanted it gone, and it is), and the new
-        // branch is never touched (its id differs). A connect between the lookup and the release
-        // is refused by the release's own open check, made under the same store-mutex hold as the
-        // release (engine review 14 MED 7). Mutant `drop_check_separate_hold` (test builds only):
-        // the open check in a hold of its own before that window, the release unchecked after it.
-        let separate = crate::branch::store::fe_mutant("drop_check_separate_hold");
-        if separate {
-            self.branches.refuse_if_open(id)?;
-        }
+        self.branches.refuse_if_open(id)?;
         self.branches.pause_drop_looked_up();
-        if separate {
-            return self.branches.release_handle(id);
-        }
-        self.branches.release_named(id)
+        self.branches.release_handle(id)
     }
 
     /// Every unreleased branch, attached or not. Refused on a read-only handle of a database with
@@ -1520,9 +1529,11 @@ impl Database {
     }
 
     /// [`Database::branch_compact_now`] for a client's session (a wire CHECKPOINT; review
-    /// C42-M1): its wait for a fuzzy checkpoint in flight ends at `until` (`LimboError::Busy`, so
-    /// the caller's lock-wait schedule decides) or as soon as `interrupted` says so (the session's
-    /// cancel or statement_timeout: `LimboError::Interrupt`). Nothing is compacted then.
+    /// C42-M1, MED-2). BOUNDED: its wait for a fuzzy checkpoint in flight and its wait for the
+    /// store mutex each end at `until` (`LimboError::Busy`, so the caller's lock-wait schedule
+    /// decides) or as soon as `interrupted` says so (the session's cancel or statement_timeout:
+    /// `LimboError::Interrupt`), and nothing is compacted then. NOT bounded: the compaction itself,
+    /// once it holds the mutex (its own I/O and syncs, which no caller can stop half way).
     #[doc(hidden)]
     pub fn branch_compact_now_within(&self, until: std::time::Instant, interrupted: &dyn Fn() -> bool) -> Result<()> {
         self.branches.compact_now_within(Some(&store::Wait { until, interrupted }))
@@ -1589,8 +1600,12 @@ impl Database {
         self.branches.checkpoint_fuzzy_now()
     }
 
-    /// Make a fuzzy checkpoint in flight wait at `stage`: 2, its rows written and not committed;
-    /// 3, committed and not installed. Any other value (0) releases it.
+    /// Make a fuzzy checkpoint in flight wait at `stage` until this is called with another value
+    /// (0 releases it): `CHECKPOINT_HOLD_BEFORE_COMMIT`, its rows written and not committed, or
+    /// `CHECKPOINT_HOLD_AFTER_COMMIT`, committed and not installed, in every build; test builds
+    /// have more stages. `branch_checkpoint_held` reads `stage | CHECKPOINT_HOLD_ARRIVED` once the
+    /// flight waits there. The hook is one atomic load in the checkpoint's own writer thread,
+    /// never on a create's or a commit's acknowledgement path.
     #[doc(hidden)]
     pub fn branch_checkpoint_hold(&self, stage: u8) {
         self.branches.checkpoint_hold(stage);
@@ -1815,6 +1830,18 @@ mod tests {
         assert_ne!(BranchId::TRUNK, BranchId(1));
     }
 }
+
+/// `Database::branch_checkpoint_hold`'s stage in every build: a fuzzy checkpoint's flight waits
+/// with its rows written and not committed, so a frontend's test (fastest-wire's server-side red
+/// for review C42-M1) can hold one flight in the air and see a client's CHECKPOINT end at its bound.
+#[doc(hidden)]
+pub const CHECKPOINT_HOLD_BEFORE_COMMIT: u8 = store::HOLD_BEFORE_COMMIT;
+/// `Database::branch_checkpoint_hold`'s stage in every build: committed and not installed.
+#[doc(hidden)]
+pub const CHECKPOINT_HOLD_AFTER_COMMIT: u8 = store::HOLD_AFTER_COMMIT;
+/// Or-ed into `Database::branch_checkpoint_held`'s value once the flight waits at its stage.
+#[doc(hidden)]
+pub const CHECKPOINT_HOLD_ARRIVED: u8 = store::HOLD_ARRIVED;
 
 /// Whether this build has the default-off `measure-word-hold` feature (`measure_word_hold`): a
 /// measuring harness refuses a run whose binaries lack it. Always present, so it can be asked.

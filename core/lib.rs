@@ -125,7 +125,10 @@ pub use cdc::{
     CaptureDataChangesExt, CaptureDataChangesInfo, CaptureDataChangesMode, CdcVersion,
     CDC_VERSION_CURRENT,
 };
-pub use connection::{resolve_ext_path, Connection, PrepareOptions, Row, StepResult, SymbolTable};
+pub use connection::{
+    resolve_ext_path, Connection, Origin, PrepareOptions, Row, SqlKind, SqlSource, StepResult, StoredSql, SymbolTable,
+    Syntax,
+};
 pub(crate) use connection::{AtomicTransactionState, TransactionState};
 #[cfg(feature = "simulator")]
 pub use database::{clear_database_registry, SharedWalTestingSnapshot};
@@ -185,6 +188,10 @@ pub use turso_macros::{
 pub use turso_parser::ast::EqpFormat;
 pub use types::{IOResult, Value, ValueBlob, ValueRef};
 pub use util::IOExt;
+/// The engine's one always-quoting identifier helper, for a binding that builds SQL text
+/// (QUOTE-SWEEP-4a97c9c36 F8: the C binding spliced a table name into PRAGMA text bare).
+#[doc(hidden)]
+pub use util::double_quote_identifier;
 pub use vdbe::{
     builder::QueryMode, explain::EXPLAIN_COLUMNS, explain::EXPLAIN_QUERY_PLAN_COLUMNS,
     explain::EXPLAIN_QUERY_PLAN_JSON_COLUMNS, FromValueRow, PrepareContext, PreparedProgram,
@@ -282,6 +289,7 @@ impl<'a> QueryRunner<'a> {
 impl Iterator for QueryRunner<'_> {
     type Item = Result<Option<Statement>>;
 
+    #[allow(clippy::disallowed_methods, reason = "the query runner is the client entry: it runs client text (dialect design R1)")]
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(err) = self.pending_error.take() {
             return Some(Err(err));

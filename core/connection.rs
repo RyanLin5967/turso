@@ -145,6 +145,9 @@ pub(crate) struct NamedSavepointFrame {
     /// SAVEPOINT begin. Cheap — values are `Arc`. Used by ROLLBACK TO
     /// to restore staged DDL on attached databases.
     pub(crate) staged_schema_snapshot: HashMap<usize, Arc<Schema>>,
+    /// The CDC capture setting at SAVEPOINT begin. ROLLBACK TO puts it back, because the
+    /// rollback also undoes the capture table a later switch created.
+    pub(crate) capture_data_changes: Option<CaptureDataChangesInfo>,
 }
 
 /// Info returned by `rollback_named_savepoint_frame` so callers can
@@ -164,6 +167,130 @@ impl Drop for SchemaReparseGuard {
         self.connection
             .schema_reparse_in_progress
             .store(false, Ordering::SeqCst);
+    }
+}
+
+/// What a statement's text is (dialect design REVISION 2, NOTES 9433759f13): which parser reads it
+/// (`Syntax`) and where it came from (`SqlSource`), fixed where the text is made and carried on the
+/// `Statement`, so every re-prepare and retry reads it the same way. Its fields are private: the
+/// constructors are the only way in. (Step 1 of the build order: the plumbing, behaviour unchanged;
+/// the source does not yet decide storage or the resolver.)
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SqlKind {
+    syntax: Syntax,
+    source: SqlSource,
+}
+
+/// Which parser reads a statement's text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Syntax {
+    /// SQLite's parser, whatever the database's dialect.
+    Sqlite,
+    /// The database dialect's parser (`Dialect::parse`, `Dialect::parse_for_reprepare`).
+    Client,
+}
+
+/// Where a statement's text came from: what decides how a schema row it writes is stored.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SqlSource {
+    /// Engine-built SQLite text.
+    Engine,
+    /// A client's text, in the dialect's syntax.
+    Client,
+    /// A frontend's own canonical SQLite text for its client's objects.
+    Frontend,
+    /// A stored schema row replayed (VACUUM): the statement's OWN row keeps these bytes.
+    Replay { name: crate::sync::Arc<str>, bytes: crate::sync::Arc<str> },
+}
+
+impl SqlKind {
+    /// Engine-built SQLite text.
+    pub(crate) fn engine() -> Self {
+        Self { syntax: Syntax::Sqlite, source: SqlSource::Engine }
+    }
+    /// A client's statement, in the database dialect's syntax.
+    pub fn client() -> Self {
+        Self { syntax: Syntax::Client, source: SqlSource::Client }
+    }
+    /// A frontend's own canonical SQLite text.
+    pub fn frontend() -> Self {
+        Self { syntax: Syntax::Sqlite, source: SqlSource::Frontend }
+    }
+    /// A stored schema row replayed (`Connection::prepare_replay` only): its own row keeps `bytes`.
+    pub(crate) fn replay(syntax: Syntax, name: &str, bytes: &str) -> Self {
+        Self {
+            syntax,
+            source: SqlSource::Replay { name: crate::sync::Arc::from(name), bytes: crate::sync::Arc::from(bytes) },
+        }
+    }
+    /// Which parser reads this text.
+    pub fn syntax(&self) -> Syntax {
+        self.syntax
+    }
+    /// Where this text came from.
+    pub fn source(&self) -> &SqlSource {
+        &self.source
+    }
+}
+
+/// How a frontend's statement runs: on its own (it may open and commit its transaction), or nested
+/// inside the statement that is running (no re-prepare on a schema change; reserved names allowed).
+/// The crate's own `StatementOrigin` (with its `Subprogram`) is never reachable from outside.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Origin {
+    Root,
+    Nested,
+}
+
+impl From<Origin> for StatementOrigin {
+    fn from(origin: Origin) -> Self {
+        match origin {
+            Origin::Root => StatementOrigin::Root,
+            Origin::Nested => StatementOrigin::InternalHelper,
+        }
+    }
+}
+
+/// The engine's own SQLite text: the only argument `prepare_engine` and `execute_engine` take, so
+/// engine code names, at every call, that the text it hands the engine is its own SQLite (dialect
+/// design REVISION 2; R1 enforces that engine code reaches no other entry).
+pub(crate) struct EngineSql<'a>(std::borrow::Cow<'a, str>);
+
+impl<'a> EngineSql<'a> {
+    /// Engine-built text: a literal, a `format!`, or a borrowed engine string.
+    pub(crate) fn new(sql: impl Into<std::borrow::Cow<'a, str>>) -> Self {
+        Self(sql.into())
+    }
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A replay is the engine's own (`Connection::prepare_replay`): no frontend entry may carry one.
+fn refuse_foreign_replay(kind: &SqlKind) -> Result<()> {
+    if matches!(kind.source(), SqlSource::Replay { .. }) {
+        return Err(LimboError::InvalidArgument(
+            "a replay kind is the engine's own: prepare it with prepare_replay".to_string().into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Stored text with the syntax it is in, as a dialect reports it (`Dialect::table_sql_for_replay`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredSql {
+    pub syntax: Syntax,
+    pub sql: crate::sync::Arc<str>,
+}
+
+impl StoredSql {
+    /// Stored text in SQLite's syntax.
+    pub fn sqlite(sql: impl Into<crate::sync::Arc<str>>) -> Self {
+        Self { syntax: Syntax::Sqlite, sql: sql.into() }
+    }
+    /// Stored text in the dialect's syntax.
+    pub fn client(sql: impl Into<crate::sync::Arc<str>>) -> Self {
+        Self { syntax: Syntax::Client, sql: sql.into() }
     }
 }
 
@@ -378,6 +505,15 @@ pub struct Connection {
     /// Per-database schema cache (database_index -> schema)
     /// Loaded lazily to avoid copying all schemas on connection open
     pub(super) database_schemas: RwLock<HashMap<usize, Arc<Schema>>>,
+    /// The attached databases' shared schema versions this connection last adopted, summed
+    /// (`maybe_update_schema`; wire-rev-line M1). Versions only grow, so the sum moves whenever
+    /// any one does. `u64::MAX`: not read yet.
+    pub(super) attached_schemas_seen: AtomicU64,
+    /// A frontend's per-connection context (its session), set once when the frontend makes the
+    /// session, read with no lock and no allocation (fastest-wire's M4: the wire found its session
+    /// for a connection through a global mutex-guarded map on the branch-switch path). Weak, so the
+    /// connection never keeps the session alive.
+    pub(super) frontend_context: std::sync::OnceLock<std::sync::Weak<dyn std::any::Any + Send + Sync>>,
     /// Whether to automatically commit transaction
     pub(crate) auto_commit: AtomicBool,
     pub(super) transaction_state: AtomicTransactionState,
@@ -412,6 +548,14 @@ pub struct Connection {
     #[cfg(feature = "conn_raw_api")]
     pub(super) mvcc_log_metadata: RwLock<HashMap<String, String>>,
     pub(super) capture_data_changes: RwLock<Option<CaptureDataChangesInfo>>,
+    /// The capture setting at this explicit transaction's BEGIN (`Some`: inside one), put back by
+    /// its rollback: a PRAGMA inside BEGIN takes effect at its own Halt, so `BEGIN; switch the
+    /// capture table; ROLLBACK` left capture on a table the rollback removed (adversary of
+    /// d806241ea, MED 4).
+    pub(super) capture_data_changes_at_begin: RwLock<Option<Option<CaptureDataChangesInfo>>>,
+    /// Virtual tables a DROP TABLE of this transaction removed, destroyed (the module's table
+    /// freed) only when the transaction commits without them (`finish_vtab_destroys`).
+    pub(super) pending_vtab_destroys: RwLock<Vec<Arc<crate::VirtualTable>>>,
     /// CDC v2: transaction ID for grouping CDC records by transaction.
     /// -1 means unset (will be assigned on first CDC write in the transaction).
     pub(crate) cdc_transaction_id: AtomicI64,
@@ -875,7 +1019,11 @@ impl Connection {
     /// one is reprepared before it runs. Read only (for frontends measuring re-prepares).
     #[inline]
     pub fn prepare_context_generation(&self) -> u64 {
-        self.prepare_context_generation.load(Ordering::Acquire)
+        // This connection's own generation plus its database's (review C42 MED-7): either moving
+        // moves the sum, since both only grow.
+        self.prepare_context_generation
+            .load(Ordering::Acquire)
+            .wrapping_add(self.db.prepare_context_generation.load(Ordering::Acquire))
     }
 
     /// check if connection executes nested program (so it must not do any "finalization" work as parent program will handle it)
@@ -963,12 +1111,15 @@ impl Connection {
         self: &Arc<Connection>,
         cmd: Cmd,
         input: &str,
-        origin: StatementOrigin,
         prepare_options: &PrepareOptions,
+        kind: &SqlKind,
     ) -> Result<(Program, Arc<Pager>, QueryMode)> {
         #[cfg(test)]
         crate::branch::budget_probe::statement_prepared();
         self.maybe_update_schema();
+        // The key before any state it covers is read (review c42b MED-4): the symbols, schema,
+        // pager, CDC and journal mode below are all read after it.
+        let prepare_generation = self.prepare_context_generation();
 
         let syms = self.syms.read();
         let pager = self.pager.load().clone();
@@ -983,8 +1134,9 @@ impl Connection {
             &syms,
             mode,
             input,
-            origin,
             prepare_options,
+            kind,
+            prepare_generation,
         ) {
             Ok(program) => Ok((program, pager, mode)),
             Err(err) if self.should_retry_cross_process_schema_lookup(&err)? => {
@@ -994,13 +1146,20 @@ impl Connection {
                 drop(syms);
                 let cmd = {
                     crate::stack::trace_stack!("schema_retry_parse");
-                    let (cmd, _) = self.parse_sql(input)?;
+                    // A re-parse after another process's schema change: client text goes through
+                    // the dialect's connection-aware hook, as `Statement::reprepare`'s does (review
+                    // c42b LOW-3); SQLite text stays SQLite.
+                    let (cmd, _) = match kind.syntax() {
+                        Syntax::Client => self.db.dialect().parse_for_reprepare(input, self)?,
+                        Syntax::Sqlite => crate::dialect::sqlite::parse(input)?,
+                    };
                     let Some(cmd) = cmd else {
                         return Err(err);
                     };
                     cmd
                 };
                 self.maybe_update_schema();
+                let prepare_generation = self.prepare_context_generation();
                 let syms = self.syms.read();
                 let pager = self.pager.load().clone();
                 let mode = QueryMode::new(&cmd);
@@ -1015,8 +1174,9 @@ impl Connection {
                     &syms,
                     mode,
                     input,
-                    origin,
                     prepare_options,
+                    kind,
+                    prepare_generation,
                 )
                 .map(|program| (program, pager, mode))
             }
@@ -1024,29 +1184,96 @@ impl Connection {
         }
     }
 
+    #[allow(clippy::disallowed_methods, reason = "an entry point: it delegates to the shared preparation with the kind it states (dialect design R1)")]
     pub fn prepare(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
         self._prepare(sql)
     }
 
+    /// Prepare SQLite text, parsed as SQLite whatever the database's dialect (`SqlKind::frontend`), and
+    /// re-prepared as SQLite too.
+    #[allow(clippy::disallowed_methods, reason = "an entry point: it delegates to the shared preparation with the kind it states (dialect design R1)")]
     pub fn prepare_sqlite(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
-        self.prepare_with_origin(sql, StatementOrigin::Root)
+        self.prepare_text_with_origin(sql, StatementOrigin::Root, SqlKind::frontend())
     }
 
+    /// A frontend's nested SQLite statement (it runs inside the statement that is running). The
+    /// engine's own nested statements use `prepare_engine(.., Origin::Nested)`.
     #[doc(hidden)]
+    #[allow(clippy::disallowed_methods, reason = "an entry point: it delegates to the shared preparation with the kind it states (dialect design R1)")]
     pub fn prepare_internal(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
-        self.prepare_with_origin(sql, StatementOrigin::InternalHelper)
+        self.prepare_text_with_origin(sql, StatementOrigin::InternalHelper, SqlKind::frontend())
+    }
+
+    /// The engine's own SQLite text (dialect design REVISION 2): parsed as SQLite, its kind
+    /// `SqlKind::engine()`, whatever the database's dialect. The only entry engine code uses.
+    #[allow(clippy::disallowed_methods, reason = "an entry point: it delegates to the shared preparation with the kind it states (dialect design R1)")]
+    pub(crate) fn prepare_engine(self: &Arc<Connection>, sql: EngineSql<'_>, origin: Origin) -> Result<Statement> {
+        self.prepare_text_with_origin(sql.as_str(), origin.into(), SqlKind::engine())
+    }
+
+    /// Prepare the CREATE that recreates one stored schema row (VACUUM; dialect design REVISION 2 items 1
+    /// and 6, 2.1): the bytes stored for the statement's own row are `entry.sql` verbatim, and the text
+    /// prepared is what the dialect reports for that row (`Dialect::table_sql_for_replay_stored` for a
+    /// table; the row itself for an index, view or trigger, whose rows are canonical SQLite). The
+    /// statement's implicit rows (an autoindex, a sequence table, sqlite_sequence) keep their engine
+    /// text. Two copies (name and sql into the kind's `Arc<str>`s), in VACUUM only.
+    #[allow(clippy::disallowed_methods, reason = "an entry point: it delegates to the shared preparation with the kind it states (dialect design R1)")]
+    #[allow(clippy::disallowed_methods, reason = "the one place a replay kind is built: the entry's own name and bytes (R1, dialect code review MED-2)")]
+    pub(crate) fn prepare_replay(
+        self: &Arc<Connection>,
+        entry: &crate::vdbe::vacuum::SchemaEntry,
+        origin: Origin,
+    ) -> Result<Statement> {
+        // A storage-backed table's row is the dialect's to read back; every other row (an index, a view,
+        // a trigger, a virtual table's rootpage-0 row) is canonical SQLite, prepared as VACUUM always has.
+        let parse = match entry.entry_type {
+            crate::vdbe::vacuum::SchemaEntryType::Table if entry.rootpage != 0 => {
+                self.db.dialect().table_sql_for_replay_stored(&entry.sql)?
+            }
+            _ => StoredSql::sqlite(entry.sql.as_str()),
+        };
+        let kind = SqlKind::replay(parse.syntax, &entry.name, &entry.sql);
+        self.prepare_text_with_origin(&*parse.sql, origin.into(), kind)
+    }
+
+    /// `execute` of the engine's own SQLite text: every statement in it, kind `SqlKind::engine()`.
+    #[allow(clippy::disallowed_methods, reason = "an entry point: it delegates to the shared preparation with the kind it states (dialect design R1)")]
+    pub(crate) fn execute_engine(self: &Arc<Connection>, sql: EngineSql<'_>, origin: Origin) -> Result<()> {
+        self.execute_text(sql.as_str(), SqlKind::engine(), origin.into())
+    }
+
+    /// A frontend's statement with the kind it says its text is (`SqlKind::client()` or
+    /// `SqlKind::frontend()`) and how it runs. A replay is the engine's own (`prepare_replay`) and is
+    /// refused here.
+    #[doc(hidden)]
+    #[allow(clippy::disallowed_methods, reason = "an entry point: it delegates to the shared preparation with the kind it states (dialect design R1)")]
+    pub fn prepare_with(self: &Arc<Connection>, sql: impl AsRef<str>, kind: SqlKind, origin: Origin) -> Result<Statement> {
+        refuse_foreign_replay(&kind)?;
+        self.prepare_text_with_origin(sql, origin.into(), kind)
+    }
+
+    /// `execute` with the kind its text is and how it runs (as `prepare_with`).
+    #[doc(hidden)]
+    #[allow(clippy::disallowed_methods, reason = "an entry point: it delegates to the shared preparation with the kind it states (dialect design R1)")]
+    pub fn execute_with(self: &Arc<Connection>, sql: impl AsRef<str>, kind: SqlKind, origin: Origin) -> Result<()> {
+        refuse_foreign_replay(&kind)?;
+        self.execute_text(sql.as_ref(), kind, origin.into())
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
+    #[allow(clippy::disallowed_methods, reason = "an entry point: it delegates to the shared preparation with the kind it states (dialect design R1)")]
     pub fn _prepare(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
-        self.prepare_with_origin(sql, StatementOrigin::Root)
+        // The client's text, stated (dialect code review LOW-4: prepare_with_origin, now gone, derived
+        // the kind from the origin, a default that could be wrong; it had no other caller).
+        self.prepare_text_with_origin(sql, StatementOrigin::Root, SqlKind::client())
     }
 
     #[turso_macros::trace_stack]
-    pub(crate) fn prepare_with_origin(
+    fn prepare_text_with_origin(
         self: &Arc<Connection>,
         sql: impl AsRef<str>,
         origin: StatementOrigin,
+        kind: SqlKind,
     ) -> Result<Statement> {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
@@ -1067,7 +1294,7 @@ impl Connection {
 
             let (cmd, byte_offset_end) = {
                 crate::stack::trace_stack!("parse");
-                self.parse_sql(sql)?
+                self.parse_text(sql, kind.syntax())?
             };
             let cmd = match cmd {
                 Some(cmd) => cmd,
@@ -1081,7 +1308,7 @@ impl Connection {
                 .unwrap()
                 .trim();
             let prepare_options = PrepareOptions::default();
-            let (program, pager, mode) = self.compile_cmd(cmd, input, origin, &prepare_options)?;
+            let (program, pager, mode) = self.compile_cmd(cmd, input, &prepare_options, &kind)?;
 
             Ok(Statement::new_with_origin(
                 program,
@@ -1090,6 +1317,7 @@ impl Connection {
                 byte_offset_end,
                 origin,
                 needs_nested_guard,
+                kind,
             ))
         })();
         if result.is_err() && needs_nested_guard {
@@ -1105,6 +1333,7 @@ impl Connection {
     /// parsing through [`Dialect::parse`](crate::Dialect::parse), while the
     /// original text remains available for schema storage, diagnostics, and
     /// later re-preparation through the dialect.
+    #[allow(clippy::disallowed_methods, reason = "an entry point: it delegates to the shared preparation with the kind it states (dialect design R1)")]
     pub fn prepare_translated_stmt(
         self: &Arc<Connection>,
         stmt: ast::Stmt,
@@ -1113,41 +1342,66 @@ impl Connection {
         self.prepare_translated_cmd(ast::Cmd::Stmt(stmt), input)
     }
 
+    #[allow(clippy::disallowed_methods, reason = "an entry point: it delegates to the shared preparation with the kind it states (dialect design R1)")]
     pub fn prepare_translated_stmt_with_options(
         self: &Arc<Connection>,
         stmt: ast::Stmt,
         input: &str,
-        prepare_options: &PrepareOptions,
+        prepare_options: PrepareOptions,
     ) -> Result<Statement> {
         self.prepare_translated_cmd_with_options(ast::Cmd::Stmt(stmt), input, prepare_options)
     }
 
     /// Prepare an already-translated command while keeping the original SQL
     /// text.
+    #[allow(clippy::disallowed_methods, reason = "an entry point: it delegates to the shared preparation with the kind it states (dialect design R1)")]
     pub fn prepare_translated_cmd(
         self: &Arc<Connection>,
         cmd: ast::Cmd,
         input: &str,
     ) -> Result<Statement> {
-        self.prepare_translated_cmd_with_options(cmd, input, &PrepareOptions::default())
+        self.prepare_translated_cmd_with_options(cmd, input, PrepareOptions::default())
     }
 
+    /// The options are taken by value and kept with the statement for its re-prepares
+    /// (wire-rework B-H2), so a prepare clones nothing (wire-rev-line L6).
+    #[allow(clippy::disallowed_methods, reason = "an entry point: it delegates to the shared preparation with the kind it states (dialect design R1)")]
     pub fn prepare_translated_cmd_with_options(
         self: &Arc<Connection>,
         cmd: ast::Cmd,
         input: &str,
-        prepare_options: &PrepareOptions,
+        prepare_options: PrepareOptions,
     ) -> Result<Statement> {
-        self.prepare_cmd_with_input_and_origin(cmd, input, StatementOrigin::Root, prepare_options)
+        self.prepare_cmd_with_input_and_origin(cmd, input, StatementOrigin::Root, prepare_options, SqlKind::client())
+    }
+
+    /// An already-translated command whose `input` text is of `kind` (dialect design REVISION 2 item 5):
+    /// a frontend that translates its client's text to an AST and keeps canonical SQLite as the input (a
+    /// prereq: `prereq.to_string()`) passes `SqlKind::frontend()`, so a re-prepare parses that text as
+    /// SQLite, and it cannot create a table. A replay kind is refused here.
+    #[doc(hidden)]
+    #[allow(clippy::disallowed_methods, reason = "an entry point: it delegates to the shared preparation with the kind it states (dialect design R1)")]
+    pub fn prepare_translated_cmd_with_kind(
+        self: &Arc<Connection>,
+        cmd: ast::Cmd,
+        input: &str,
+        prepare_options: PrepareOptions,
+        kind: SqlKind,
+        origin: Origin,
+    ) -> Result<Statement> {
+        refuse_foreign_replay(&kind)?;
+        self.prepare_cmd_with_input_and_origin(cmd, input, origin.into(), prepare_options, kind)
     }
 
     #[turso_macros::trace_stack]
+    #[allow(clippy::disallowed_methods, reason = "an entry point: it delegates to the shared preparation with the kind it states (dialect design R1)")]
     fn prepare_cmd_with_input_and_origin(
         self: &Arc<Connection>,
         cmd: ast::Cmd,
         input: &str,
         origin: StatementOrigin,
-        prepare_options: &PrepareOptions,
+        prepare_options: PrepareOptions,
+        kind: SqlKind,
     ) -> Result<Statement> {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
@@ -1157,7 +1411,7 @@ impl Connection {
             self.start_nested();
         }
         let result = (|| {
-            let (program, pager, mode) = self.compile_cmd(cmd, input, origin, prepare_options)?;
+            let (program, pager, mode) = self.compile_cmd(cmd, input, &prepare_options, &kind)?;
             // Kept with the statement: a re-prepare translates under them (wire-rework B-H2).
             Ok(Statement::new_with_origin(
                 program,
@@ -1166,8 +1420,9 @@ impl Connection {
                 0,
                 origin,
                 needs_nested_guard,
+                kind,
             )
-            .with_prepare_options(prepare_options.clone()))
+            .with_prepare_options(prepare_options))
         })();
         if result.is_err() && needs_nested_guard {
             self.end_nested();
@@ -1472,7 +1727,8 @@ impl Connection {
             Ok::<_, crate::alloc::TryReserveError>(())
         })??;
 
-        let stmt = self.prepare("SELECT * FROM sqlite_schema")?;
+        // Engine helper text: SQLite whatever the dialect (the NO SILENT DIALECT SWITCH class).
+        let stmt = self.prepare_engine(EngineSql::new("SELECT * FROM sqlite_schema"), Origin::Root)?;
 
         // MVCC bootstrap connection gets the "baseline" from the DB file and ignores anything in MV store
         let mv_tx = if self.is_mvcc_bootstrap_connection() {
@@ -1517,7 +1773,7 @@ impl Connection {
                         &mut inner.fresh,
                         &self.syms.read(),
                         &attached_resolver,
-                        self.db.dialect().as_ref(),
+                        &self.db.dialect(),
                     ));
 
                     // Rehydrate built-in table-valued functions captured at init.
@@ -1643,10 +1899,10 @@ impl Connection {
                             *schema = inner.fresh.try_clone()?;
                             Ok::<_, crate::alloc::TryReserveError>(())
                         })??;
-                        let stmt = self.prepare_internal(format!(
+                        let stmt = self.prepare_engine(EngineSql::new(format!(
                             "SELECT name, sql FROM {}",
                             crate::schema::TURSO_TYPES_TABLE_NAME
-                        ))?;
+                        )), Origin::Nested)?;
                         inner.phase = ReparsePhase::LoadTypes {
                             stmt: Box::new(stmt),
                             type_rows: Vec::new(),
@@ -1742,6 +1998,7 @@ impl Connection {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
+    #[allow(clippy::disallowed_methods, reason = "an entry point: it delegates to the shared preparation with the kind it states (dialect design R1)")]
     pub fn prepare_execute_batch(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<()> {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
@@ -1760,15 +2017,17 @@ impl Connection {
             let input = str::from_utf8(&remaining.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
+            let kind = SqlKind::client();
             let (program, pager, mode) =
-                self.compile_cmd(cmd, input, StatementOrigin::Root, &prepare_options)?;
-            Statement::new(program, pager, mode, 0).run_ignore_rows()?;
+                self.compile_cmd(cmd, input, &prepare_options, &kind)?;
+            Statement::new(program, pager, mode, 0, kind).run_ignore_rows()?;
             remaining = &remaining[byte_offset_end..];
         }
         Ok(())
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
+    #[allow(clippy::disallowed_methods, reason = "an entry point: it delegates to the shared preparation with the kind it states (dialect design R1)")]
     pub fn query(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Option<Statement>> {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
@@ -1787,6 +2046,7 @@ impl Connection {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
+    #[allow(clippy::disallowed_methods, reason = "an entry point: it delegates to the shared preparation with the kind it states (dialect design R1)")]
     pub(crate) fn run_cmd(
         self: &Arc<Connection>,
         cmd: Cmd,
@@ -1796,9 +2056,10 @@ impl Connection {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         let prepare_options = PrepareOptions::default();
+        let kind = SqlKind::client();
         let (program, pager, mode) =
-            self.compile_cmd(cmd, input, StatementOrigin::Root, &prepare_options)?;
-        let stmt = Statement::new(program, pager, mode, 0);
+            self.compile_cmd(cmd, input, &prepare_options, &kind)?;
+        let stmt = Statement::new(program, pager, mode, 0, kind);
         Ok(Some(stmt))
     }
 
@@ -1810,22 +2071,35 @@ impl Connection {
     /// TODO: make this api async
     #[instrument(skip_all, level = Level::DEBUG)]
     #[turso_macros::trace_stack]
+    #[allow(clippy::disallowed_methods, reason = "an entry point: it delegates to the shared preparation with the kind it states (dialect design R1)")]
     pub fn execute(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<()> {
+        self.execute_text(sql.as_ref(), SqlKind::client(), Origin::Root)
+    }
+
+    /// `execute` of SQLite text, parsed as SQLite whatever the database's dialect (`SqlKind::frontend`): for
+    /// the engine's own helper statements and a frontend's SQLite text.
+    #[allow(clippy::disallowed_methods, reason = "an entry point: it delegates to the shared preparation with the kind it states (dialect design R1)")]
+    pub fn execute_sqlite(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<()> {
+        self.execute_text(sql.as_ref(), SqlKind::frontend(), Origin::Root)
+    }
+
+    #[turso_macros::trace_stack]
+    fn execute_text(self: &Arc<Connection>, sql: &str, kind: SqlKind, origin: Origin) -> Result<()> {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
-        let sql = sql.as_ref();
         let mut remaining = sql;
         let prepare_options = PrepareOptions::default();
-        while let (Some(cmd), byte_offset_end) = self.parse_sql(remaining)? {
+        while let (Some(cmd), byte_offset_end) = self.parse_text(remaining, kind.syntax())? {
             let input = str::from_utf8(&remaining.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
-            let (program, pager, mode) =
-                self.compile_cmd(cmd, input, StatementOrigin::Root, &prepare_options)?;
+            let origin = StatementOrigin::from(origin);
+            let (program, pager, mode) = self.compile_cmd(cmd, input, &prepare_options, &kind)?;
             {
                 crate::stack::trace_stack!("run");
-                Statement::new(program, pager.clone(), mode, 0).run_ignore_rows()?;
+                // The kind travels with the statement (review dialect MED-3: it defaulted to Client).
+                Statement::new_with_origin(program, pager.clone(), mode, 0, origin, false, kind.clone()).run_ignore_rows()?;
             }
             remaining = &remaining[byte_offset_end..];
         }
@@ -1833,6 +2107,7 @@ impl Connection {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
+    #[allow(clippy::disallowed_methods, reason = "an entry point: it delegates to the shared preparation with the kind it states (dialect design R1)")]
     pub fn consume_stmt(
         self: &Arc<Connection>,
         sql: impl AsRef<str>,
@@ -1845,14 +2120,23 @@ impl Connection {
             .unwrap()
             .trim();
         let prepare_options = PrepareOptions::default();
+        let kind = SqlKind::client();
         let (program, pager, mode) =
-            self.compile_cmd(cmd, input, StatementOrigin::Root, &prepare_options)?;
-        let stmt = Statement::new(program, pager, mode, 0);
+            self.compile_cmd(cmd, input, &prepare_options, &kind)?;
+        let stmt = Statement::new(program, pager, mode, 0, kind);
         Ok(Some((stmt, byte_offset_end)))
     }
 
     pub(crate) fn parse_sql(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
         self.db.dialect().parse(sql)
+    }
+
+    /// `sql` parsed by the parser its `syntax` names.
+    pub(crate) fn parse_text(&self, sql: &str, syntax: Syntax) -> Result<(Option<Cmd>, usize)> {
+        match syntax {
+            Syntax::Client => self.db.dialect().parse(sql),
+            Syntax::Sqlite => crate::dialect::sqlite::parse(sql),
+        }
     }
 
     #[cfg(feature = "fs")]
@@ -1906,9 +2190,11 @@ impl Connection {
         }
         let conn = db.connect()?;
         if let Some(cipher) = opts.cipher {
+            #[allow(clippy::disallowed_methods, reason = "pragma_update is engine-kind (prepare_engine) (dialect design R1)")]
             let _ = conn.pragma_update("cipher", format!("'{cipher}'"));
         }
         if let Some(hexkey) = opts.hexkey {
+            #[allow(clippy::disallowed_methods, reason = "pragma_update is engine-kind (prepare_engine) (dialect design R1)")]
             let _ = conn.pragma_update("hexkey", format!("'{hexkey}'"));
         }
         Ok((io, conn))
@@ -2030,10 +2316,10 @@ impl Connection {
         if !has_types_table {
             return Ok(Vec::new());
         }
-        let mut type_stmt = self.prepare_internal(format!(
+        let mut type_stmt = self.prepare_engine(EngineSql::new(format!(
             "SELECT name, sql FROM {}",
             crate::schema::TURSO_TYPES_TABLE_NAME
-        ))?;
+        )), Origin::Nested)?;
         let mut type_rows = Vec::new();
         type_stmt.run_with_row_callback(|row| {
             type_rows.push(row.get::<&str>(1)?.to_string());
@@ -2073,6 +2359,39 @@ impl Connection {
             }
             *self.schema.write() = adopted;
             self.bump_prepare_context_generation();
+        }
+        // The main schema's lock first let go: no attached schema's lock is taken under it.
+        drop(schema);
+        // The attached databases too (wire-rev-line M1: another session's DDL on an attached
+        // schema was never adopted between statements). Their shared schemas are read directly,
+        // so adopting means dropping this connection's older staged copies and re-preparing.
+        // Locks in the connection's order: `attached_databases`, then `database_schemas` (review
+        // c42b LOW-C).
+        if self.has_no_open_transaction_state() {
+            let attached = self.attached_databases.read();
+            let mut seen: u64 = 0;
+            // No attached database: nothing to read (review c42b LOW-A).
+            if !attached.index_to_data.is_empty() {
+                for (&idx, (db, _pager)) in attached.index_to_data.iter() {
+                    let version = db.schema.lock().schema_version;
+                    seen = attached_schemas_fold(seen, idx, Arc::as_ptr(db) as usize, version);
+                    let stale = self.database_schemas.read().get(&idx).is_some_and(|s| s.schema_version < version);
+                    if stale {
+                        self.database_schemas.write().remove(&idx);
+                    }
+                }
+            }
+            drop(attached);
+            // `u64::MAX` is "not read yet".
+            let seen = seen.min(u64::MAX - 1);
+            // A load first, a store only on a change (review c42b LOW-A: the swap was unconditional).
+            let before = self.attached_schemas_seen.load(Ordering::Acquire);
+            if before != seen {
+                self.attached_schemas_seen.store(seen, Ordering::Release);
+                if before != u64::MAX {
+                    self.bump_prepare_context_generation();
+                }
+            }
         }
     }
 
@@ -2775,6 +3094,22 @@ impl Connection {
     ) -> crate::sync::RwLockReadGuard<'_, Option<CaptureDataChangesInfo>> {
         self.capture_data_changes.read()
     }
+    /// At an explicit BEGIN, or a SAVEPOINT that opens the transaction: remember the capture
+    /// setting a rollback puts back.
+    pub(crate) fn remember_capture_at_begin(&self) {
+        let now = self.capture_data_changes.read().clone();
+        *self.capture_data_changes_at_begin.write() = Some(now);
+    }
+
+    /// At a COMMIT (the setting stands) or a ROLLBACK (`restore`: the setting at BEGIN comes back).
+    pub(crate) fn end_capture_at_begin(&self, restore: bool) {
+        if let Some(at_begin) = self.capture_data_changes_at_begin.write().take() {
+            if restore {
+                self.set_capture_data_changes_info(at_begin);
+            }
+        }
+    }
+
     pub fn set_capture_data_changes_info(&self, opts: Option<CaptureDataChangesInfo>) {
         let mut cdc = self.capture_data_changes.write();
         if *cdc == opts {
@@ -2927,9 +3262,8 @@ impl Connection {
         // would deadlock against the schema write lock.
         let mut rows_data: Vec<(String, String, String, i64, Option<String>)> = Vec::new();
         {
-            let mut rows = self
-                .query("SELECT * FROM sqlite_schema")?
-                .expect("query must be parsed to statement");
+            // Engine helper text: SQLite whatever the dialect (the NO SILENT DIALECT SWITCH class).
+            let mut rows = self.prepare_engine(EngineSql::new("SELECT * FROM sqlite_schema"), Origin::Root)?;
             rows.run_with_row_callback(|row| {
                 let ty = row.get::<&str>(0)?.to_string();
                 let name = row.get::<&str>(1)?.to_string();
@@ -2994,6 +3328,7 @@ impl Connection {
                 materialized_view_info,
                 dbsp_state_roots,
                 dbsp_state_index_roots,
+                &self.dialect(),
             ) {
                 Ok(()) => {}
                 Err(LimboError::ExtensionError(msg)) => eprintln!("Warning: {msg}"),
@@ -3009,8 +3344,9 @@ impl Connection {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
+        // Engine-built PRAGMA text: SQLite whatever the dialect (the NO SILENT DIALECT SWITCH class).
         let pragma = format!("PRAGMA {pragma_name}");
-        let mut stmt = self.prepare(pragma)?;
+        let mut stmt = self.prepare_engine(EngineSql::new(pragma), Origin::Root)?;
         stmt.run_collect_rows()
     }
 
@@ -3027,8 +3363,22 @@ impl Connection {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
         let pragma = format!("PRAGMA {pragma_name} = {pragma_value}");
-        let mut stmt = self.prepare(pragma)?;
+        let mut stmt = self.prepare_engine(EngineSql::new(pragma), Origin::Root)?;
         stmt.run_collect_rows()
+    }
+
+    /// Attach a frontend's context to this connection, once (the session that owns it). A second
+    /// set is refused, never overwritten.
+    pub fn set_frontend_context(&self, context: std::sync::Weak<dyn std::any::Any + Send + Sync>) -> Result<()> {
+        self.frontend_context.set(context).map_err(|_| {
+            LimboError::InvalidArgument("this connection's frontend context is already set".to_string().into())
+        })
+    }
+
+    /// The frontend's context, if one was set and is still alive: an atomic load and a refcount
+    /// increment, with no lock and no allocation. A frontend downcasts it to its own session type.
+    pub fn frontend_context(&self) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
+        self.frontend_context.get().and_then(std::sync::Weak::upgrade)
     }
 
     /// The SQL dialect of the database this connection belongs to.
@@ -3058,12 +3408,7 @@ impl Connection {
     }
 
     pub fn attached_database_names(&self) -> Vec<String> {
-        self.attached_databases
-            .read()
-            .name_to_index
-            .keys()
-            .cloned()
-            .collect()
+        self.attached_databases.read().names().map(|(n, _)| n.to_string()).collect()
     }
 
     /// The column names `table` declares in `database` (main, temp or an attached database's
@@ -3277,8 +3622,9 @@ impl Connection {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
+        // Engine-built PRAGMA text: SQLite whatever the dialect (review dialect MED-4).
         let pragma = format!("PRAGMA {pragma_name}({pragma_value})");
-        let mut stmt = self.prepare(pragma)?;
+        let mut stmt = self.prepare_engine(EngineSql::new(pragma), Origin::Root)?;
         let mut results = Vec::new();
         loop {
             match stmt.step()? {
@@ -3330,9 +3676,12 @@ impl Connection {
                 // We don't update the shared db.schema until after the WAL commit, so
                 // other connections won't see uncommitted schema changes (which would
                 // cause SchemaUpdated mismatches).
+                // `attached_databases` before `database_schemas`, the connection's lock order
+                // (review c42b LOW-C: the catalog was read inside the schemas' write lock); the
+                // catalog is let go before `f` runs.
+                let attached_dbs = self.attached_databases.read();
                 let mut schemas = self.database_schemas.write();
                 let schema_arc = schemas.entry(database_id).or_insert_with(|| {
-                    let attached_dbs = self.attached_databases.read();
                     let (db, _pager) = attached_dbs
                         .index_to_data
                         .get(&database_id)
@@ -3340,6 +3689,7 @@ impl Connection {
                     let schema = db.schema.lock().clone();
                     schema
                 });
+                drop(attached_dbs);
                 let schema = Schema::try_make_mut(schema_arc)?;
                 let result = f(schema);
                 self.bump_prepare_context_generation();
@@ -3417,10 +3767,7 @@ impl Connection {
     }
 
     pub(crate) fn is_attached(&self, alias: &str) -> bool {
-        self.attached_databases
-            .read()
-            .name_to_index
-            .contains_key(alias)
+        self.attached_databases.read().index_of(alias).is_some()
     }
 
     /// Returns the reserved-space value inherited from the main connection's pager.
@@ -3733,6 +4080,8 @@ impl Connection {
                             init.db.experimental_mvcc_passive_checkpoint_enabled(),
                         )?;
                         init.db.mv_store.store(Some(mv_store));
+                        // The MV store is compiled into every connection's programs (review c42b MED-3, LOW-2).
+                        init.db.bump_prepare_context_generation();
                         *state = AttachDatabaseState::Bootstrap(Box::new(
                             AttachDatabaseBootstrapState {
                                 alias: init.alias.clone(),
@@ -3826,7 +4175,7 @@ impl Connection {
         // must not hold the write lock during the rollback.
         let database_id = {
             let attached_dbs = self.attached_databases.read();
-            match attached_dbs.name_to_index.get(alias).copied() {
+            match attached_dbs.index_of(alias) {
                 Some(id) => id,
                 None => {
                     return Err(LimboError::InvalidArgument(format!(
@@ -3878,12 +4227,7 @@ impl Connection {
 
     /// List all attached database aliases
     pub fn list_attached_databases(&self) -> Vec<String> {
-        self.attached_databases
-            .read()
-            .name_to_index
-            .keys()
-            .cloned()
-            .collect()
+        self.attached_databases.read().names().map(|(n, _)| n.to_string()).collect()
     }
 
     /// Invoke `f` with a slice of all non-main database (index, pager) pairs
@@ -3949,9 +4293,11 @@ impl Connection {
         if database_id == crate::TEMP_DB_ID {
             return;
         }
+        // `attached_databases` before `database_schemas`, the connection's lock order (review c42b
+        // LOW-C: this took them the other way round).
+        let attached_dbs = self.attached_databases.read();
         let mut schemas = self.database_schemas.write();
         if let Some(local_schema) = schemas.remove(&database_id) {
-            let attached_dbs = self.attached_databases.read();
             if let Some((db, _pager)) = attached_dbs.index_to_data.get(&database_id) {
                 *db.schema.lock() = local_schema;
             }
@@ -4031,14 +4377,14 @@ impl Connection {
 
         // Add attached databases
         let attached_dbs = self.attached_databases.read();
-        for (alias, &seq_number) in attached_dbs.name_to_index.iter() {
+        for (alias, seq_number) in attached_dbs.names() {
             let file_path = if let Some((db, _pager)) = attached_dbs.index_to_data.get(&seq_number)
             {
                 Self::get_canonical_path_for_database(db)
             } else {
                 String::new()
             };
-            databases.push((seq_number, alias.clone(), file_path));
+            databases.push((seq_number, alias.to_string(), file_path));
         }
 
         // Sort by sequence number to ensure consistent ordering
@@ -4344,9 +4690,9 @@ impl Connection {
     ) -> Result<crate::types::IOResult<()>> {
         use crate::types::IOResult;
         if stmt.is_none() {
-            let escaped = backing_table_name.replace('"', "\"\"");
-            let sql = format!("SELECT start, inc, min, max, cycle FROM \"{escaped}\" LIMIT 1");
-            let prepared = self.prepare_internal(sql).map_err(|err| {
+            let quoted = crate::util::double_quote_identifier(&backing_table_name);
+            let sql = format!("SELECT start, inc, min, max, cycle FROM {quoted} LIMIT 1");
+            let prepared = self.prepare_engine(EngineSql::new(sql), Origin::Nested).map_err(|err| {
                 LimboError::Corrupt(format!(
                     "internal sequence backing table \"{backing_table_name}\" for sequence \
                      \"{seq_name}\": cannot prepare descriptor SELECT: {err}"
@@ -4421,12 +4767,12 @@ impl Connection {
     ) -> Result<crate::types::IOResult<()>> {
         use crate::types::IOResult;
         if stmt.is_none() {
-            let escaped = backing_table_name.replace('"', "\"\"");
+            let quoted = crate::util::double_quote_identifier(&backing_table_name);
             let direction = if seq.increment_by >= 0 { "DESC" } else { "ASC" };
             let sql = format!(
-                "SELECT value, is_called FROM \"{escaped}\" ORDER BY value {direction} LIMIT 1"
+                "SELECT value, is_called FROM {quoted} ORDER BY value {direction} LIMIT 1"
             );
-            let prepared = self.prepare_internal(sql).map_err(|err| {
+            let prepared = self.prepare_engine(EngineSql::new(sql), Origin::Nested).map_err(|err| {
                 LimboError::Corrupt(format!(
                     "internal sequence backing table \"{backing_table_name}\" for sequence \
                      \"{}\": cannot prepare watermark SELECT: {err}",
@@ -4516,9 +4862,9 @@ impl Connection {
                     if !has_seq_table {
                         return Ok(IOResult::Done(()));
                     }
-                    let stmt = self.prepare_internal(format!(
+                    let stmt = self.prepare_engine(EngineSql::new(format!(
                         "SELECT name, seq FROM {SQLITE_SEQUENCE_TABLE_NAME}"
-                    ))?;
+                    )), Origin::Nested)?;
                     *state = SyncAutoincrementState::ReadSeqRows {
                         stmt: Box::new(stmt),
                         rows: Vec::new(),
@@ -4556,10 +4902,10 @@ impl Connection {
                             }
                             // Read current backing watermark; only upsert if we'd
                             // actually advance it (avoids needless writes on boot).
-                            let escaped = backing_table_name.replace('"', "\"\"");
-                            let stmt = self.prepare_internal(format!(
-                                "SELECT MAX(value) FROM \"{escaped}\""
-                            ))?;
+                            let quoted = crate::util::double_quote_identifier(&backing_table_name);
+                            let stmt = self.prepare_engine(EngineSql::new(format!(
+                                "SELECT MAX(value) FROM {quoted}"
+                            )), Origin::Nested)?;
                             *sub = SyncRowStep::ReadMax {
                                 backing_table_name,
                                 stmt: Box::new(stmt),
@@ -4597,14 +4943,14 @@ impl Connection {
                             // inc=1, min=1, max=i64::MAX, cycle=0) — mirror what
                             // the translator emits when CREATE TABLE bytecode
                             // creates the backing table for an AUTOINCREMENT column.
-                            let escaped = backing_table_name.replace('"', "\"\"");
+                            let quoted = crate::util::double_quote_identifier(&backing_table_name);
                             let insert_sql = format!(
-                                "INSERT OR REPLACE INTO \"{escaped}\"\
+                                "INSERT OR REPLACE INTO {quoted}\
                                  (value, is_called, start, inc, min, max, cycle) \
                                  VALUES ({watermark}, 1, 1, 1, 1, {}, 0)",
                                 i64::MAX
                             );
-                            let stmt = self.prepare_internal(insert_sql)?;
+                            let stmt = self.prepare_engine(EngineSql::new(insert_sql), Origin::Nested)?;
                             *sub = SyncRowStep::Upsert {
                                 stmt: Box::new(stmt),
                             };
@@ -4675,12 +5021,17 @@ impl Connection {
     pub fn set_sync_type(&self, value: crate::io::FileSyncType) {
         // Read by PRAGMA fullfsync's compiled answer (translate/pragma.rs): bumped on a change
         // (engine-rev-setter MED-1).
+        // Bumped only if what the pager reports changed (review C42 LOW-7: off Apple the pager has one
+        // sync type and ignores the set, so nothing compiled in changes).
         let pager = self.pager.load();
-        if pager.get_sync_type() == value {
+        let before = pager.get_sync_type();
+        if before == value {
             return;
         }
         pager.set_sync_type(value);
-        self.bump_prepare_context_generation();
+        if pager.get_sync_type() != before {
+            self.bump_prepare_context_generation();
+        }
     }
 
     /// Creates a HashSet of modules that have been loaded
@@ -5187,6 +5538,31 @@ impl Connection {
         )
     }
 
+    /// The connection's in-memory schemas (main, temp and the staged attached copies), for a later
+    /// `restore_schema_snapshot`. Cheap: `Arc` clones.
+    pub(crate) fn schema_snapshot(&self) -> RollbackFrameInfo {
+        self.with_savepoint_schema_snapshot(|main, temp, staged| RollbackFrameInfo {
+            main_schema_snapshot: main,
+            temp_schema_snapshot: temp,
+            staged_schema_snapshot: staged,
+        })
+    }
+
+    /// Put back the in-memory schemas a `schema_snapshot` (or a savepoint frame) holds, after the
+    /// pagers rolled the pages they describe back. Statements prepared under the discarded schemas
+    /// re-prepare.
+    pub(crate) fn restore_schema_snapshot(&self, info: RollbackFrameInfo) {
+        *self.schema.write() = info.main_schema_snapshot;
+        if let Some(temp_db) = self.temp.database.read().as_ref() {
+            match info.temp_schema_snapshot {
+                Some(snap) => *temp_db.db.schema.lock() = snap,
+                None => *temp_db.db.schema.lock() = self.empty_temp_schema(),
+            }
+        }
+        *self.database_schemas().write() = info.staged_schema_snapshot;
+        self.bump_prepare_context_generation();
+    }
+
     pub(crate) fn release_named_savepoint_frame(&self, name: &str) -> SavepointResult {
         let mut savepoints = self.named_savepoints.write();
         let Some(target_idx) = savepoints
@@ -5213,9 +5589,12 @@ impl Connection {
             temp_schema_snapshot: frame.temp_schema_snapshot.clone(),
             staged_schema_snapshot: frame.staged_schema_snapshot.clone(),
         };
+        let capture = frame.capture_data_changes.clone();
         // ROLLBACK TO keeps the target savepoint itself on the stack;
         // only nested savepoints above it are discarded.
         savepoints.truncate(target_idx + 1);
+        drop(savepoints);
+        self.set_capture_data_changes_info(capture);
         Some(info)
     }
 
@@ -5285,7 +5664,54 @@ impl Connection {
         entries
     }
 
+    /// DROP TABLE of a virtual table (VDestroy): its destruction waits for the transaction's
+    /// outcome. Destroying at the DROP (as before) freed the module's table while the schema it was
+    /// dropped from could still come back (a ROLLBACK, a ROLLBACK TO, a failed statement) holding
+    /// it, and while other connections' schemas, the database's included, still held it: a later
+    /// use of the table read a freed pointer. Queue a-f review L5.
+    pub(crate) fn defer_vtab_destroy(&self, vtab: Arc<crate::VirtualTable>) {
+        self.pending_vtab_destroys.write().push(vtab);
+    }
+
+    /// The transaction ended: on a commit, each dropped virtual table that no schema of this
+    /// connection holds any more (a statement or savepoint rollback can have restored it) leaves
+    /// the registry and is marked to be destroyed when its last holder, in any connection, lets go;
+    /// on a rollback, none is. A destroy that fails then cannot fail the DROP, so it is logged.
+    fn finish_vtab_destroys(&self, committed: bool) {
+        let pending = std::mem::take(&mut *self.pending_vtab_destroys.write());
+        if pending.is_empty() || !committed {
+            return;
+        }
+        let (main, temp, staged) =
+            self.with_savepoint_schema_snapshot(|main, temp, staged| (main, temp, staged));
+        let held = |vtab: &Arc<crate::VirtualTable>| {
+            std::iter::once(&main)
+                .chain(temp.iter())
+                .chain(staged.values())
+                .any(|schema| {
+                    schema.tables.values().any(|t| {
+                        matches!(t.as_ref(), crate::schema::Table::Virtual(v) if Arc::ptr_eq(v, vtab))
+                    })
+                })
+        };
+        for vtab in pending {
+            if held(&vtab) {
+                continue;
+            }
+            {
+                let mut syms = self.syms.write();
+                if syms.vtabs.get(&vtab.name).is_some_and(|v| Arc::ptr_eq(v, &vtab)) {
+                    syms.vtabs.remove(&vtab.name);
+                }
+            }
+            // Destroyed when the last holder lets go: another connection's schema, program or
+            // cursor may still hold this table (engine-rev-qaf-fix MED-7).
+            vtab.destroy_when_unused();
+        }
+    }
+
     pub(crate) fn index_methods_on_transaction_committed(&self) {
+        self.finish_vtab_destroys(true);
         let entries = self.take_index_method_transaction_cursors();
         tracing::trace!(
             attachments = entries.len(),
@@ -5298,6 +5724,7 @@ impl Connection {
     }
 
     pub(crate) fn index_methods_on_transaction_rolled_back(&self) {
+        self.finish_vtab_destroys(false);
         let entries = self.take_index_method_transaction_cursors();
         tracing::trace!(
             attachments = entries.len(),
@@ -5346,6 +5773,10 @@ impl Connection {
             self.auto_commit.store(true, Ordering::SeqCst);
         }
         self.rollback_attached_wal_txns();
+        self.end_capture_at_begin(true);
+        // The temp pager was rolled back with the attached ones; its in-memory schema goes back to
+        // the last committed one too (adversary of 5650219c0, HIGH 2: only COMMIT/ROLLBACK did it).
+        self.rollback_temp_schema();
         self.index_methods_on_transaction_rolled_back();
         self.set_tx_state(TransactionState::None);
         self.clear_tx_poison();
@@ -5380,6 +5811,7 @@ impl Connection {
         }
 
         self.rollback_temp_schema();
+        self.end_capture_at_begin(true);
         self.clear_tx_poison();
         self.set_cdc_transaction_id(-1);
         self.clear_named_savepoints();
@@ -5630,7 +6062,7 @@ mod tests {
     // given a attached 'alias', return the Database and Pager for that attached database
     fn attached_entry(conn: &Connection, alias: &str) -> (Arc<Database>, Arc<Pager>) {
         let catalog = conn.attached_databases.read();
-        let index = *catalog.name_to_index.get(alias).unwrap();
+        let index = catalog.index_of(alias).unwrap();
         catalog.index_to_data.get(&index).unwrap().clone()
     }
 
@@ -5952,4 +6384,17 @@ mod tests {
         );
         Ok(())
     }
+}
+
+/// One attached database's schema version folded into `acc`, with its index and identity (review
+/// c42b LOW-B: a plain sum of versions let one version rising and another falling cancel out, so
+/// only ATTACH's and DETACH's own bumps covered a changed set). Each entry is mixed (splitmix64)
+/// and the mixes are summed, so the fold does not depend on the catalog's iteration order.
+pub(crate) fn attached_schemas_fold(acc: u64, idx: usize, db: usize, version: u32) -> u64 {
+    let mut z = (idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ (db as u64).rotate_left(32)
+        ^ u64::from(version).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    acc.wrapping_add(z ^ (z >> 31))
 }

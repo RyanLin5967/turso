@@ -3041,18 +3041,22 @@ fn a_failed_capture_check_under_the_whole_run_switch_aborts_the_process() {
 fn a_statement_reprepared_after_a_setting_change_keeps_its_search_path() {
     let _s = serial();
     let dir = tempfile::TempDir::new().unwrap();
-    let db = open_at(&dir.path().join("search-path-main.db"), DatabaseOpts::new());
+    // Setup completed before its first run (lead ruling "reprepare red invalid"): ATTACH is off by
+    // default (DatabaseOpts derives Default; translate/attach.rs refuses), so the red never reached
+    // its claim.
+    let db = open_at(&dir.path().join("search-path-main.db"), DatabaseOpts::new().with_attach(true));
     let c = db.connect().unwrap();
     c.execute("CREATE TABLE t(x INTEGER)").unwrap();
     c.execute("INSERT INTO t VALUES (1)").unwrap();
     let other = dir.path().join("search-path-s.db");
-    c.execute(format!("ATTACH '{}' AS s", other.display())).unwrap();
+    let attached = c.execute(format!("ATTACH '{}' AS s", other.display()));
+    assert!(attached.is_ok(), "premise: ATTACH succeeded: {attached:?}");
     c.execute("CREATE TABLE s.t(x INTEGER)").unwrap();
     c.execute("INSERT INTO s.t VALUES (2)").unwrap();
     let sql = "SELECT x FROM t";
     let (cmd, _) = c.parse_sql(sql).unwrap();
     let options = crate::connection::PrepareOptions { unqualified_database_search_path: Some(vec!["s".to_string()]) };
-    let mut stmt = c.prepare_translated_cmd_with_options(cmd.unwrap(), sql, &options).unwrap();
+    let mut stmt = c.prepare_translated_cmd_with_options(cmd.unwrap(), sql, options).unwrap();
     let read = |stmt: &mut crate::Statement| -> Vec<i64> {
         let mut out = Vec::new();
         loop {
@@ -3076,33 +3080,595 @@ fn a_statement_reprepared_after_a_setting_change_keeps_its_search_path() {
     assert_eq!(after, vec![2], "CLAIM: re-prepared after a setting change, the SELECT read {after:?}, not s.t's row: the search path was dropped");
 }
 
+/// Review C42 LOW-7: off Apple the pager has one sync type (fsync) and `set_sync_type` changes
+/// nothing PRAGMA fullfsync compiles in, so it must never bump: at 8a77618a5 setting FullFsync passed
+/// the "differs from the pager's" check on every call and re-prepared everything each time.
+#[cfg(not(target_vendor = "apple"))]
+#[test]
+fn off_apple_set_sync_type_never_bumps_the_prepare_generation() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("sync-type-off-apple.db"), DatabaseOpts::new());
+    let c = db.connect().unwrap();
+    let g0 = c.prepare_context_generation();
+    c.set_sync_type(crate::io::FileSyncType::FullFsync);
+    c.set_sync_type(crate::io::FileSyncType::FullFsync);
+    assert_eq!(c.get_sync_type(), crate::io::FileSyncType::Fsync, "premise: off Apple the pager's sync type stays fsync");
+    assert_eq!(c.prepare_context_generation(), g0, "CLAIM: set_sync_type bumped the prepare generation though nothing it compiles in changed");
+}
+
+/// Review C42 MED-7 (lead ruling): a journal-mode switch changes what translation compiles in for
+/// EVERY connection of the database (`Connection::mvcc_enabled` reads the Database's MV store), so it
+/// bumps a database-wide generation every connection's prepare key reads. At f6186c900 only the
+/// switching connection's own setters bumped, so B's cached programs kept the WAL compilation.
+#[test]
+fn a_journal_mode_switch_on_one_connection_moves_every_connection_s_prepare_generation() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("journal-switch-generation.db"), DatabaseOpts::new());
+    let a = db.connect().unwrap();
+    let b = db.connect().unwrap();
+    a.execute("CREATE TABLE t(x INTEGER)").unwrap();
+    let _cached = b.prepare("INSERT INTO t VALUES (1)").unwrap();
+    let g0 = b.prepare_context_generation();
+    let switched = a.execute("PRAGMA journal_mode = 'mvcc'");
+    assert!(switched.is_ok(), "premise: the journal-mode switch succeeded: {switched:?}");
+    assert!(a.mvcc_enabled(), "premise: the database is in MVCC mode after the switch");
+    assert_ne!(
+        b.prepare_context_generation(),
+        g0,
+        "CLAIM: another connection's journal-mode switch left this connection's prepare generation alone: its cached programs keep the old mode"
+    );
+}
+
+/// Review C42 LOW-4: `PRAGMA auto_vacuum` compiles the pager's mode in as a constant, so setting a
+/// different mode (allowed until page 1 exists) bumps the prepare generation. At 1b0e4f2e7
+/// `persist_auto_vacuum_mode` changed it with no bump.
+#[test]
+fn setting_auto_vacuum_moves_the_prepare_generation() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("auto-vacuum-generation.db"), DatabaseOpts::new().with_autovacuum(true));
+    let c = db.connect().unwrap();
+    let mode0 = c.get_pager().get_auto_vacuum_mode();
+    let g0 = c.prepare_context_generation();
+    c.execute("PRAGMA auto_vacuum = FULL").unwrap();
+    assert_ne!(c.get_pager().get_auto_vacuum_mode(), mode0, "premise: the auto-vacuum mode changed");
+    assert_ne!(c.prepare_context_generation(), g0, "CLAIM: PRAGMA auto_vacuum changed the mode and left the prepare generation alone");
+}
+
+/// Wire-rev-line M1 (lead order): `maybe_update_schema` compared only the MAIN schema's version, so
+/// another session's DDL on an ATTACHED database was never adopted between statements: this
+/// connection's cached programs kept the old attached schema. Two connections, each with s
+/// attached; B adds a column to s.t; A's adoption step must move A's prepare generation, and A's
+/// next statement reads the new column.
+#[test]
+fn another_session_s_ddl_on_an_attached_schema_is_adopted_between_statements() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("attached-adopt-main.db"), DatabaseOpts::new().with_attach(true));
+    let other = dir.path().join("attached-adopt-s.db");
+    let attach = format!("ATTACH '{}' AS s", other.display());
+    let a = db.connect().unwrap();
+    let b = db.connect().unwrap();
+    let attached = (a.execute(&attach), b.execute(&attach));
+    assert!(attached.0.is_ok() && attached.1.is_ok(), "premise: both connections attached s: {attached:?}");
+    a.execute("CREATE TABLE s.t(x INTEGER)").unwrap();
+    a.execute("INSERT INTO s.t VALUES (1)").unwrap();
+    a.maybe_update_schema();
+    let g0 = a.prepare_context_generation();
+    let altered = b.execute("ALTER TABLE s.t ADD COLUMN y INTEGER");
+    assert!(altered.is_ok(), "premise: B's ALTER on the attached table succeeded: {altered:?}");
+    a.maybe_update_schema();
+    let moved = a.prepare_context_generation() != g0;
+    let read = a.prepare("SELECT y FROM s.t").and_then(|mut st| st.run_collect_rows());
+    assert!(read.is_ok(), "CLAIM: A's next statement did not see B's new column on the attached table: {read:?}");
+    assert!(moved, "CLAIM: A's adoption step left its prepare generation alone after B's DDL on the attached schema: A's cached programs keep the old one");
+}
+
+/// Review c42b MED-3 and LOW-2, as a class: whether the database is MVCC is compiled into every
+/// connection's programs (`Connection::mvcc_enabled` reads `Database::mv_store`), so EVERY install
+/// or removal of the MV store bumps the database-wide prepare generation (C42 MED-7) next to it.
+/// At 0b3abfefc the journal switch's two sites did, but not the bootstrap guard's removal
+/// (vdbe/execute.rs), the external-restore reload's install and removal (database.rs), the open's
+/// lazy install, or the attach's. Static: every `mv_store.store(` in core's source is followed,
+/// within three lines, by a `bump_prepare_context_generation()`.
+#[test]
+fn every_mv_store_install_or_removal_bumps_the_database_wide_generation() {
+    let core = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut sites = 0usize;
+    let mut unbumped = Vec::new();
+    let mut dirs = vec![core.to_path_buf()];
+    while let Some(d) = dirs.pop() {
+        for e in std::fs::read_dir(&d).unwrap() {
+            let path = e.unwrap().path();
+            if path.is_dir() {
+                if path.file_name().is_some_and(|n| n != "target") {
+                    dirs.push(path);
+                }
+                continue;
+            }
+            if !path.extension().is_some_and(|x| x == "rs") || path.ends_with("branch/fastest_tests.rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            let lines: Vec<&str> = text.lines().collect();
+            for (i, l) in lines.iter().enumerate() {
+                if l.trim_start().starts_with("//") || !l.contains("mv_store.store(") {
+                    continue;
+                }
+                sites += 1;
+                let bumped = lines[i + 1..(i + 4).min(lines.len())].iter().any(|n| n.contains("bump_prepare_context_generation()"));
+                if !bumped {
+                    unbumped.push(format!("{}:{}", path.strip_prefix(core).unwrap().display(), i + 1));
+                }
+            }
+        }
+    }
+    assert!(sites >= 7, "premise: the scan found {sites} MV-store stores, fewer than the 7 known");
+    assert!(unbumped.is_empty(), "CLAIM: MV-store installs or removals with no database-wide generation bump: {unbumped:?}");
+}
+
+/// The prepare-generation bump sites in one source file's text, per enclosing function, as
+/// `every_prepare_generation_bump_site_is_audited` pins them (review c42b LOW-4). Read with comment
+/// lines dropped and all whitespace removed, so a call or a raw write rustfmt splits over lines is
+/// one site; a raw write is any atomic write method on the field; the bump functions' own bodies are
+/// their definitions, not sites. Each site is keyed by the nearest `fn NAME` above it.
+fn bump_sites(text: &str) -> std::collections::BTreeMap<String, usize> {
+    const WRITES: &[&str] = &["fetch_add(", "fetch_sub(", "fetch_max(", "fetch_or(", "fetch_update(", "store(", "swap("];
+    let lines: Vec<&str> = text.lines().collect();
+    let mut s = String::new();
+    let mut line_of = Vec::new();
+    for (i, l) in lines.iter().enumerate() {
+        if l.trim_start().starts_with("//") {
+            continue;
+        }
+        for c in l.chars().filter(|c| !c.is_whitespace()) {
+            line_of.extend(std::iter::repeat_n(i, c.len_utf8()));
+            s.push(c);
+        }
+    }
+    let definition = "fnbump_prepare_context_generation(&self){";
+    let mut from = 0;
+    while let Some(k) = s[from..].find(definition) {
+        let start = from + k;
+        let end = s[start..].find('}').map_or(s.len(), |e| start + e + 1);
+        s.replace_range(start..end, &"#".repeat(end - start));
+        from = end;
+    }
+    let mut patterns = vec!["bump_prepare_context_generation()".to_string()];
+    for close in ["", ")"] {
+        for w in WRITES {
+            patterns.push(format!("prepare_context_generation{close}.{w}"));
+        }
+    }
+    let fn_name = |line: &str| -> Option<String> {
+        let mut rest = line;
+        while let Some(k) = rest.find("fn ") {
+            let starts_word = !rest[..k].chars().next_back().is_some_and(|c| c.is_alphanumeric() || c == '_');
+            let after = &rest[k + 3..];
+            let name = &after[..after.find(|c: char| !(c.is_alphanumeric() || c == '_')).unwrap_or(after.len())];
+            if starts_word && !name.is_empty() {
+                return Some(name.to_string());
+            }
+            rest = after;
+        }
+        None
+    };
+    let mut sites = std::collections::BTreeMap::new();
+    for pattern in &patterns {
+        for (k, _) in s.match_indices(pattern.as_str()) {
+            let name = (0..=line_of[k])
+                .rev()
+                .filter(|&j| !lines[j].trim_start().starts_with("//"))
+                .find_map(|j| fn_name(lines[j]))
+                .unwrap_or_else(|| "?".to_string());
+            *sites.entry(name).or_insert(0) += 1;
+        }
+    }
+    sites
+}
+
+/// All of a file's bump sites (the planted-form red of review c42b LOW-4 counts with this).
+fn bump_site_count(text: &str) -> usize {
+    bump_sites(text).values().sum()
+}
+
+/// Review c42b LOW-4, second half: the gate pins each site to its enclosing function, so a bump
+/// removed in one function and added in another of the same file changes what the gate sees.
+#[test]
+fn the_bump_site_scan_sees_a_site_move_between_functions_of_one_file() {
+    let before = "fn a(&self) {\n    self.bump_prepare_context_generation();\n}\nfn b(&self) {}\n";
+    let after = "fn a(&self) {}\nfn b(&self) {\n    self.bump_prepare_context_generation();\n}\n";
+    assert_eq!(bump_site_count(before), bump_site_count(after), "premise: the move keeps the count");
+    assert_ne!(bump_sites(before), bump_sites(after), "CLAIM: a bump moved between functions of one file is invisible to the scan");
+}
+
+/// HIGH (wire-rev-uw1, lead order): engine code rebuilt ALREADY-UNQUOTED stored names with
+/// `Name::from_string`, which parses quoting: a name that starts with a quote character asserts (with
+/// panic = abort, a release server dies), and a name written with its own quotes ('victim') is dequoted
+/// into another table's name. Each case runs and every failure is listed (a panic is caught per case):
+/// - an FK ON DELETE CASCADE into a child table `"x` (fkeys.rs qualified_table_name);
+/// - an FK cascade into a child table `'victim'` beside a table `victim`: only `'victim'`'s rows go;
+/// - an FK ON UPDATE CASCADE and ON DELETE SET NULL through a quote-led column `"c` (fkeys.rs columns);
+/// - RENAME COLUMN to a quote-led name referenced by a CHECK and an index (alter.rs);
+/// - ALTER TABLE RENAME of a table whose trigger is named `"tr` (execute.rs regenerate_trigger_sql).
+/// At cd1e5624c each went through Name::from_string.
+#[test]
+fn engine_code_rebuilds_stored_names_exactly() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("exact-names.db"), DatabaseOpts::new());
+    let c = db.connect().unwrap();
+    let mut failed: Vec<String> = Vec::new();
+    fn case(c: &Arc<Connection>, failed: &mut Vec<String>, name: &str, sqls: &[&str]) {
+        let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> crate::Result<()> {
+            for sql in sqls {
+                c.execute(sql)?;
+            }
+            Ok(())
+        }));
+        match run {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => failed.push(format!("{name}: {e}")),
+            Err(p) => failed.push(format!(
+                "{name}: PANIC {}",
+                p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default()
+            )),
+        }
+    }
+    case(&c, &mut failed, "FK cascade into \"x", &[
+        "PRAGMA foreign_keys = ON",
+        "CREATE TABLE p(id INTEGER PRIMARY KEY)",
+        "CREATE TABLE \"\"\"x\"(pid INTEGER REFERENCES p(id) ON DELETE CASCADE)",
+        "INSERT INTO p VALUES (1)",
+        "INSERT INTO \"\"\"x\" VALUES (1)",
+        "DELETE FROM p WHERE id = 1",
+    ]);
+    case(&c, &mut failed, "FK cascade into 'victim' beside victim", &[
+        "CREATE TABLE p2(id INTEGER PRIMARY KEY)",
+        "CREATE TABLE victim(pid INTEGER)",
+        "CREATE TABLE \"'victim'\"(pid INTEGER REFERENCES p2(id) ON DELETE CASCADE)",
+        "INSERT INTO p2 VALUES (1)",
+        "INSERT INTO victim VALUES (1)",
+        "INSERT INTO \"'victim'\" VALUES (1)",
+        "DELETE FROM p2 WHERE id = 1",
+    ]);
+    let count = |sql: &str| c.prepare(sql).and_then(|mut s| s.run_collect_rows()).map(|r| r[0][0].to_string());
+    if !failed.iter().any(|f| f.starts_with("FK cascade into 'victim'")) {
+        match (count("SELECT count(*) FROM victim"), count("SELECT count(*) FROM \"'victim'\"")) {
+            (Ok(v), Ok(q)) if v == "1" && q == "0" => {}
+            other => failed.push(format!("FK cascade into 'victim': the cascade hit the wrong table (victim, 'victim') = {other:?}")),
+        }
+    }
+    case(&c, &mut failed, "FK ON UPDATE CASCADE / SET NULL through column \"c", &[
+        "CREATE TABLE p3(id INTEGER PRIMARY KEY)",
+        "CREATE TABLE c3(\"\"\"c\" INTEGER REFERENCES p3(id) ON UPDATE CASCADE ON DELETE SET NULL)",
+        "INSERT INTO p3 VALUES (1)",
+        "INSERT INTO c3 VALUES (1)",
+        "UPDATE p3 SET id = 2 WHERE id = 1",
+        "DELETE FROM p3 WHERE id = 2",
+    ]);
+    case(&c, &mut failed, "RENAME COLUMN to \"n", &[
+        "CREATE TABLE r(a INTEGER CHECK (a >= 0))",
+        "CREATE INDEX ri ON r(a)",
+        "ALTER TABLE r RENAME COLUMN a TO \"\"\"n\"",
+        "INSERT INTO r VALUES (1)",
+    ]);
+    case(&c, &mut failed, "RENAME of a table whose trigger is \"tr", &[
+        "CREATE TABLE tt(a INTEGER)",
+        "CREATE TABLE log(a INTEGER)",
+        "CREATE TRIGGER \"\"\"tr\" AFTER INSERT ON tt BEGIN INSERT INTO log VALUES (new.a); END",
+        "ALTER TABLE tt RENAME TO tt2",
+        "INSERT INTO tt2 VALUES (5)",
+    ]);
+    assert!(failed.is_empty(), "CLAIM: engine code re-parsed a stored name as quoted text: {failed:#?}");
+}
+
+/// R6a (dialect design REVISION 2 item 1; adversary-2 H1, its RAN probe made the red): a branch MERGE compiles
+/// the target table's CHECK, DEFAULT and trigger expressions, which belong to the database, so they resolve
+/// through the database's dialect. A dialect-only function `dfn` (= abs) in a CHECK: a branch updates a row,
+/// MERGE must succeed. Control: the same with `abs`. At 846697d35 merge's apply statements compiled under
+/// SQLite names and failed "no such function: dfn".
+#[test]
+fn a_merge_resolves_a_check_through_the_database_s_dialect() {
+    use super::merge::{MergePolicy, Merger, Validation};
+    use crate::dialect::sqlite;
+    use crate::schema::BTreeTable;
+    struct DfnDialect;
+    impl crate::Dialect for DfnDialect {
+        fn name(&self) -> &'static str {
+            "dfn"
+        }
+        fn owns_stored_table_sql(&self, _sql: &str) -> bool {
+            false
+        }
+        fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+            sqlite::parse(sql)
+        }
+        fn parse_table_sql(&self, sql: &str, root_page: i64) -> crate::Result<BTreeTable> {
+            BTreeTable::from_sql(sql, root_page)
+        }
+        fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<turso_parser::ast::Stmt> {
+            sqlite::parse_table_sql_ast(sql)
+        }
+        // Its replay text is SQLite (it goes through SQLite's table_sql_for_replay).
+        fn table_sql_for_replay_stored(&self, sql: &str) -> crate::Result<crate::connection::StoredSql> {
+            Ok(crate::connection::StoredSql::sqlite(self.table_sql_for_replay(sql)?))
+        }
+
+        fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
+            sqlite::table_sql_for_replay(sql)
+        }
+        fn format_table_sql(
+            &self,
+            input: &str,
+            _t: &turso_parser::ast::QualifiedName,
+            _b: &turso_parser::ast::CreateTableBody,
+        ) -> crate::Result<String> {
+            Ok(input.to_string())
+        }
+        fn resolve_function(&self, name: &str, arg_count: usize) -> crate::Result<Option<crate::function::Func>> {
+            if name.eq_ignore_ascii_case("dfn") {
+                return sqlite::resolve_builtin_function("abs", arg_count);
+            }
+            sqlite::resolve_builtin_function(name, arg_count)
+        }
+        fn register_catalog(&self, schema: &mut crate::schema::Schema, e: bool) -> crate::Result<()> {
+            sqlite::register_builtin_catalog(schema, e)
+        }
+    }
+    let _s = serial();
+    let mut failed = Vec::new();
+    for f in ["abs", "dfn"] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let db = Database::open_file_with_flags(
+            io,
+            dir.path().join("m.db").to_str().unwrap(),
+            OpenFlags::Create,
+            DatabaseOpts::new().with_branch_durability(BranchDurability::Catalog { sync: SyncClass::Off }),
+            None,
+            Arc::new(DfnDialect),
+        )
+        .unwrap();
+        let trunk = db.connect().unwrap();
+        trunk
+            .execute(format!("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT, w INTEGER CHECK ({f}(w) >= 0))"))
+            .unwrap_or_else(|e| panic!("premise ({f}): the table was not made: {e}"));
+        for id in 1..=50 {
+            trunk.execute(format!("INSERT INTO t(id, v, w) VALUES ({id}, 'v{id}', {id})")).unwrap();
+        }
+        let b = trunk.fork_branch().unwrap();
+        b.connect().unwrap().execute("UPDATE t SET w = 777 WHERE id = 5").unwrap();
+        let b_id = b.into_id();
+        let mut merger = Merger::new(trunk.clone()).unwrap();
+        let out = merger.merge(db.branch(b_id).unwrap(), MergePolicy { validation: Validation::BaseRead, keep_merged: false });
+        let w = trunk.prepare("SELECT w FROM t WHERE id = 5").and_then(|mut s| s.run_collect_rows());
+        match (&out, &w) {
+            (Ok(_), Ok(rows)) if rows.first().and_then(|r| r.first()).is_some_and(|v| v.to_string() == "777") => {}
+            _ => failed.push(format!("{f}: merge={:?}, w={w:?}", out.as_ref().map(|o| (o.refused, o.rows_changed)))),
+        }
+    }
+    assert!(
+        !failed.iter().any(|x| x.starts_with("abs:")),
+        "premise (control): the merge failed with a SQLite builtin in the CHECK: {failed:?}"
+    );
+    assert!(failed.is_empty(), "CLAIM: a merge compiled a table's CHECK under SQLite's function names: {failed:?}");
+}
+
+/// fastest-wire (the ONE QUOTING FUNCTION class, core side; wire 98ca163a2 on iccad11): engine text that names a
+/// database, table or view interpolated the name unquoted, so a name holding a quote or a space broke the text the
+/// engine itself built. Instances, each a case here:
+/// - `op_parse_schema`'s `{db}.sqlite_schema` (vdbe/execute.rs): CREATE TABLE in an attached database `s"x`;
+/// - ALTER's `schema_table_name_for_db` (translate/alter.rs): ALTER TABLE in it;
+/// - the stored CREATE VIEW text (translate/view.rs): a view `v"x`, reopened;
+/// - DROP/RENAME COLUMN's view probe `SELECT * FROM {view}` (vdbe/execute.rs): a view `w x` over the altered table;
+/// - the CDC table's DDL and lookups (vdbe/execute.rs): a capture table `my cdc`;
+/// - the same probes for an ATTACHED database's views, which named the view unqualified (so they resolved in main):
+///   a view vv of `s"x` over a table that renames and drops a column.
+/// Every case runs and every failure is listed. At 8d6f81233 the attached case failed with "non-terminated literal".
+#[test]
+fn engine_text_quotes_every_name_it_interpolates() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("quoting.db");
+    let side = dir.path().join("side.db");
+    let mut failed: Vec<String> = Vec::new();
+    {
+        let db = open_at(&path, DatabaseOpts::new().with_attach(true));
+        let c = db.connect().unwrap();
+        let mut case = |name: &str, sqls: &[String]| {
+            for sql in sqls {
+                if let Err(e) = c.execute(sql) {
+                    failed.push(format!("{name}: {sql}: {e}"));
+                    return;
+                }
+            }
+        };
+        case(
+            "attached database s\"x",
+            &[
+                format!("ATTACH '{}' AS \"s\"\"x\"", side.to_str().unwrap()),
+                "CREATE TABLE \"s\"\"x\".t(a)".into(),
+                "INSERT INTO \"s\"\"x\".t VALUES (1)".into(),
+                "ALTER TABLE \"s\"\"x\".t ADD COLUMN b".into(),
+                "CREATE INDEX \"s\"\"x\".ti ON t(a)".into(),
+                "DROP TABLE \"s\"\"x\".t".into(),
+            ],
+        );
+        case(
+            "a view of an attached database, probed in that database",
+            &[
+                "CREATE TABLE \"s\"\"x\".base2(a, b)".into(),
+                "CREATE VIEW \"s\"\"x\".vv AS SELECT a FROM base2".into(),
+                "ALTER TABLE \"s\"\"x\".base2 RENAME COLUMN b TO b2".into(),
+                "ALTER TABLE \"s\"\"x\".base2 DROP COLUMN b2".into(),
+            ],
+        );
+        case("view v\"x", &["CREATE VIEW \"v\"\"x\" AS SELECT 1 AS a".into()]);
+        case(
+            "view w x over an altered table",
+            &[
+                "CREATE TABLE base(a, b)".into(),
+                "CREATE VIEW \"w x\" AS SELECT a FROM base".into(),
+                "ALTER TABLE base DROP COLUMN b".into(),
+                "ALTER TABLE base RENAME COLUMN a TO a2".into(),
+            ],
+        );
+        case(
+            "CDC table my cdc",
+            &[
+                "PRAGMA capture_data_changes_conn('full,my cdc')".into(),
+                "CREATE TABLE z(a)".into(),
+                "INSERT INTO z VALUES (1)".into(),
+            ],
+        );
+        if !failed.iter().any(|f| f.starts_with("CDC")) {
+            match c.prepare("SELECT count(*) FROM \"my cdc\"").and_then(|mut s| s.run_collect_rows()) {
+                Ok(rows) if rows.first().and_then(|r| r.first()).is_some_and(|v| v.to_string() != "0") => {}
+                other => failed.push(format!("CDC table my cdc: no captured row: {other:?}")),
+            }
+        }
+    }
+    let db = open_at(&path, DatabaseOpts::new().with_attach(true));
+    let c = db.connect().unwrap();
+    for (name, sql) in [("view v\"x, reopened", "SELECT a FROM \"v\"\"x\""), ("view w x, reopened", "SELECT * FROM \"w x\"")] {
+        if let Err(e) = c.prepare(sql).and_then(|mut s| s.run_collect_rows()) {
+            failed.push(format!("{name}: {sql}: {e}"));
+        }
+    }
+    assert!(failed.is_empty(), "CLAIM: engine-built text broke on a name it did not quote: {failed:#?}");
+}
+
+/// Review c42b LOW-B: the attached-schemas fold sees a changed set whose versions sum the same
+/// (x 4 -> 12 while s at 10 is replaced by s2 at 2: a plain sum stayed 14 and saw nothing), and it
+/// does not depend on the catalog's iteration order. No red at the base: the fold is new.
+#[test]
+fn the_attached_schemas_fold_sees_a_changed_set_with_the_same_sum() {
+    use crate::connection::attached_schemas_fold as fold;
+    let (x, s, s2) = (0x1000usize, 0x2000usize, 0x3000usize);
+    let before = fold(fold(0, 2, x, 4), 3, s, 10);
+    let after = fold(fold(0, 2, x, 12), 3, s2, 2);
+    assert_eq!(4 + 10, 12 + 2, "premise: the plain sums agree");
+    assert_ne!(before, after, "CLAIM: the fold missed a changed attached set whose versions sum the same");
+    assert_eq!(fold(fold(0, 3, s, 10), 2, x, 4), before, "CLAIM: the fold depends on iteration order");
+}
+
+/// Review c42b LOW-4: the bump-site scan counts every form a bump is written in, so a site rustfmt
+/// splits over two lines (`self.prepare_context_generation` then `.fetch_add(`, as the two bump
+/// definitions themselves are written) cannot hide from the audit gate. Planted texts: each
+/// form counts once; comments and the bump functions' own bodies count zero. At 01d412f8e the
+/// scan read one line at a time, so the two-line form counted zero.
+#[test]
+fn the_bump_site_scan_counts_every_form_of_a_bump() {
+    let one_line = "fn a(&self) {\n    self.prepare_context_generation.fetch_add(1, Ordering::Release);\n}\n";
+    let two_line = "fn a(&self) {\n    self.prepare_context_generation\n        .fetch_add(1, Ordering::Release);\n}\n";
+    let ext_two_line = "fn a() {\n    (*ctx.prepare_context_generation)\n        .fetch_add(1, Ordering::Release);\n}\n";
+    let call = "fn a(&self) {\n    self.db\n        .bump_prepare_context_generation();\n}\n";
+    let stored = "fn a(&self) {\n    self.prepare_context_generation\n        .store(0, Ordering::Release);\n}\n";
+    let comment = "fn a(&self) {\n    // self.prepare_context_generation.fetch_add(1, Ordering::Release);\n}\n";
+    let definition = "pub(crate) fn bump_prepare_context_generation(&self) {\n    self.prepare_context_generation\n        .fetch_add(1, Ordering::Release);\n}\n";
+    let mut wrong = Vec::new();
+    for (name, text, want) in [
+        ("one line", one_line, 1),
+        ("two lines", two_line, 1),
+        ("an extension's two lines", ext_two_line, 1),
+        ("a split call", call, 1),
+        ("a store", stored, 1),
+        ("a comment", comment, 0),
+        ("the bump's own definition", definition, 0),
+    ] {
+        let got = bump_site_count(text);
+        if got != want {
+            wrong.push(format!("{name}: counted {got}, want {want}"));
+        }
+    }
+    assert!(wrong.is_empty(), "CLAIM: the bump-site scan miscounts a form of a bump: {wrong:?}");
+}
+
 /// Review engine-rev-setter LOW-2: the audit of every prepare-generation bump (49e10e02a's message
 /// said 37 and missed five) is pinned here, per file, so a new bump site fails this gate until it
 /// is audited (and the setter class above says whether it should be change-only). Counts calls of
 /// `bump_prepare_context_generation()` and the extensions' raw `prepare_context_generation)
 /// .fetch_add(`, outside comments and the function's own definition. Audited at 09e8b26b0:
-/// - connection.rs 37: the change-only setters (17: set_temp_store and the 16 of 49e10e02a and
-///   09e8b26b0); schema, attach,
+/// - MV-store installs and removals (review c42b MED-3, LOW-2): connection.rs +1 (the attach's),
+///   database.rs 3 (the open's lazy install, the restore reload's install and removal),
+///   vdbe/execute.rs +1 (the bootstrap guard's removal).
+/// - connection.rs 39: the change-only setters (17: set_temp_store and the 16 of 49e10e02a and
+///   09e8b26b0); an attached schema's adoption on a change (wire-rev-line M1); schema, attach,
 ///   detach, rollback and collation events that are themselves changes; set_busy_handler, the
 ///   encryption setters and the mvcc thresholds, unconditional (not comparable, or rare).
 /// - ext/mod.rs 4: extension registration (functions, vtabs), each a change.
 /// - mvcc/database/checkpoint_state_machine.rs 1: an unconditional schema reload, itself a change.
-/// - storage/pager.rs 1: rollback of a schema change. translate/pragma.rs 1: cache_spill, on a
-///   change. vdbe/execute.rs 1: savepoint schema restore. vdbe/mod.rs 1: an abandoned MVCC commit's
-///   schema removed.
+/// - storage/pager.rs 1: rollback of a schema change. translate/pragma.rs 2: cache_spill and
+///   auto_vacuum, each on a change (review C42 LOW-4). vdbe/execute.rs 3: savepoint schema restore, and the journal-mode switch's two
+///   Database-wide bumps (MV store installed, removed; review C42 MED-7). vdbe/mod.rs 1: an
+///   abandoned MVCC commit's schema removed.
+/// - Also counted (review C42 LOW-6): a raw `prepare_context_generation.fetch_add(` on one line.
+/// - Since review c42b LOW-4: every form (`bump_sites`: split over lines, any atomic write), pinned
+///   per enclosing function, so a site moved within a file is seen.
 #[test]
 fn every_prepare_generation_bump_site_is_audited() {
-    const AUDITED: &[(&str, usize)] = &[
-        ("connection.rs", 37),
-        ("ext/mod.rs", 4),
-        ("mvcc/database/checkpoint_state_machine.rs", 1),
-        ("storage/pager.rs", 1),
-        ("translate/pragma.rs", 1),
-        ("vdbe/execute.rs", 1),
-        ("vdbe/mod.rs", 1),
+    // Per enclosing function (review c42b LOW-4). The per-file totals are the audited ones below
+    // (connection.rs 39, database.rs 3, ext/mod.rs 4, mvcc/database/checkpoint_state_machine.rs 1,
+    // storage/pager.rs 1, translate/pragma.rs 2, vdbe/execute.rs 4, vdbe/mod.rs 1); the split by
+    // function came from an independent scan (a Python script over the source, not this one), checked
+    // against those classes. `database.rs` `header_validation` is the open's lazy install; `vdbe/
+    // execute.rs` `drop` is the bootstrap guard's.
+    const AUDITED: &[(&str, &str, usize)] = &[
+        ("connection.rs", "attach_database_with_config", 2),
+        ("connection.rs", "detach_database", 1),
+        ("connection.rs", "maybe_update_schema", 2),
+        ("connection.rs", "publish_database_schema", 1),
+        ("connection.rs", "refresh_schema_from_shared_for_reprepare", 1),
+        ("connection.rs", "register_external_collation", 1),
+        ("connection.rs", "register_internal_vtab", 1),
+        ("connection.rs", "register_virtual_table", 1),
+        ("connection.rs", "reset_page_size", 1),
+        // ROLLBACK TO's schema restore, moved here from op_savepoint (5650219c0) and shared with a
+        // statement rollback's restore (end_statement): the schemas it installs are new.
+        ("connection.rs", "restore_schema_snapshot", 1),
+        ("connection.rs", "rollback_attached_mvcc_txs", 1),
+        ("connection.rs", "rollback_attached_wal_txns", 1),
+        ("connection.rs", "rollback_temp_schema", 1),
+        ("connection.rs", "set_busy_handler", 1),
+        ("connection.rs", "set_busy_timeout", 1),
+        ("connection.rs", "set_cache_size", 1),
+        ("connection.rs", "set_capture_data_changes_info", 1),
+        ("connection.rs", "set_check_constraints_ignored", 1),
+        ("connection.rs", "set_count_changes", 1),
+        ("connection.rs", "set_data_sync_retry", 1),
+        ("connection.rs", "set_dml_require_where", 1),
+        ("connection.rs", "set_dqs_dml", 1),
+        ("connection.rs", "set_encryption_cipher", 1),
+        ("connection.rs", "set_encryption_key", 1),
+        ("connection.rs", "set_foreign_keys_enabled", 1),
+        ("connection.rs", "set_full_column_names", 1),
+        ("connection.rs", "set_mvcc_checkpoint_threshold", 1),
+        ("connection.rs", "set_mvcc_gc_threshold", 1),
+        ("connection.rs", "set_query_only", 1),
+        ("connection.rs", "set_recipe_backfill", 1),
+        ("connection.rs", "set_row_image_apply", 1),
+        ("connection.rs", "set_short_column_names", 1),
+        ("connection.rs", "set_sync_mode", 1),
+        ("connection.rs", "set_sync_type", 1),
+        ("connection.rs", "set_temp_store", 1),
+        ("connection.rs", "unregister_external_collation", 1),
+        ("connection.rs", "with_database_schema_mut", 2),
+        ("database.rs", "header_validation", 1),
+        ("database.rs", "reload_wal_after_external_restore", 2),
+        ("ext/mod.rs", "register_aggregate_function", 1),
+        ("ext/mod.rs", "register_scalar_function_with_options", 1),
+        ("ext/mod.rs", "register_vtab_module", 1),
+        ("ext/mod.rs", "unregister_function", 1),
+        ("mvcc/database/checkpoint_state_machine.rs", "publish_checkpointed_schema_roots", 1),
+        ("storage/pager.rs", "rollback", 1),
+        ("translate/pragma.rs", "update_pragma", 2),
+        ("vdbe/execute.rs", "drop", 1),
+        ("vdbe/execute.rs", "op_journal_mode_inner", 2),
+        ("vdbe/mod.rs", "cleanup_abandoned_mvcc_commit", 1),
     ];
     let core = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut found: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut found: std::collections::BTreeMap<(String, String), usize> = Default::default();
     let mut dirs = vec![core.to_path_buf()];
     while let Some(d) = dirs.pop() {
         for e in std::fs::read_dir(&d).unwrap() {
@@ -3113,20 +3679,15 @@ fn every_prepare_generation_bump_site_is_audited() {
                 }
             } else if path.extension().is_some_and(|x| x == "rs") && !path.ends_with("branch/fastest_tests.rs") {
                 let text = std::fs::read_to_string(&path).unwrap();
-                let n: usize = text
-                    .lines()
-                    .map(str::trim)
-                    .filter(|l| !l.starts_with("//") && !l.contains("fn bump_prepare_context_generation"))
-                    .map(|l| l.matches("bump_prepare_context_generation()").count() + l.matches("prepare_context_generation).fetch_add(").count())
-                    .sum();
-                if n > 0 {
-                    let rel = path.strip_prefix(core).unwrap().to_string_lossy().replace('\\', "/");
-                    found.insert(rel, n);
+                let rel = path.strip_prefix(core).unwrap().to_string_lossy().replace('\\', "/");
+                for (function, n) in bump_sites(&text) {
+                    found.insert((rel.clone(), function), n);
                 }
             }
         }
     }
-    let audited: std::collections::BTreeMap<String, usize> = AUDITED.iter().map(|&(f, n)| (f.to_string(), n)).collect();
+    let audited: std::collections::BTreeMap<(String, String), usize> =
+        AUDITED.iter().map(|&(f, function, n)| ((f.to_string(), function.to_string()), n)).collect();
     assert!(!found.is_empty(), "premise: the scan found no bump site: it is broken");
     assert_eq!(found, audited, "CLAIM: the prepare-generation bump sites differ from the audited list: audit the new ones (and the setter class) and update AUDITED with each one's reason");
 }
@@ -3154,7 +3715,8 @@ fn every_setter_whose_value_translation_reads_bumps_the_prepare_generation() {
             }
         }
     }
-    let setter = regex::Regex::new(r"\n    pub(?:\(crate\))? fn set_(\w+)\(&self[^{]*\{").unwrap();
+    // Review C42 LOW-5: pub(super) and generic setters, and the Arc-receiver form, are scanned too.
+    let setter = regex::Regex::new(r"\n    pub(?:\((?:crate|super)\))? fn set_(\w+)(?:<[^>]*>)?\((?:&self|self: &Arc<Self>)[^{]*\{").unwrap();
     let mut checked = Vec::new();
     let mut missing = Vec::new();
     for m in setter.captures_iter(&conn) {
@@ -3183,7 +3745,18 @@ fn every_setter_whose_value_translation_reads_bumps_the_prepare_generation() {
             }
         }
     }
-    assert!(checked.len() >= 10, "premise: only {} setters found read under translate/ ({checked:?}): the scan is broken", checked.len());
+    // Review C42 LOW-5: the EXACT derived set (a Python run of the same scan over 498074b78), so a
+    // partial break of the scan, or a new setter read in translation, fails here until it is looked
+    // at, not only a scan that finds fewer than ten.
+    const DERIVED: &[&str] = &[
+        "busy_timeout", "cache_size", "capture_data_changes_info", "check_constraints_ignored", "count_changes",
+        "data_sync_retry", "dml_require_where", "dqs_dml", "foreign_keys_enabled", "full_column_names",
+        "mvcc_checkpoint_threshold", "mvcc_gc_threshold", "query_only", "row_image_apply", "short_column_names",
+        "sync_mode", "sync_type", "temp_store",
+    ];
+    let mut sorted = checked.clone();
+    sorted.sort();
+    assert_eq!(sorted, DERIVED, "premise: the setters read under translate/ differ from the derived set: a broken scan, or a new setter to classify");
     assert!(
         missing.is_empty(),
         "CLAIM: setters whose value translation reads never bump the prepare generation (cached programs keep the old value): {missing:?}"
@@ -3251,6 +3824,22 @@ fn a_setter_given_the_value_it_holds_leaves_the_prepare_generation_alone() {
     let v = c.get_pager().get_spill_enabled();
     let pragma = |on: bool| c.execute(format!("PRAGMA cache_spill = {}", if on { 1 } else { 0 })).unwrap();
     check("PRAGMA cache_spill", &|| pragma(v), &|| pragma(!v), &|| pragma(v));
+    // Review C42 MED-6: the four setters 09e8b26b0 made change-only (a mutant bumping any of them
+    // unconditionally survived the static red, which reads only that the body bumps).
+    let v = c.check_constraints_ignored();
+    check("set_check_constraints_ignored", &|| c.set_check_constraints_ignored(v), &|| c.set_check_constraints_ignored(!v), &|| c.set_check_constraints_ignored(v));
+    let v = c.get_dml_require_where();
+    check("set_dml_require_where", &|| c.set_dml_require_where(v), &|| c.set_dml_require_where(!v), &|| c.set_dml_require_where(v));
+    let v = c.get_count_changes();
+    check("set_count_changes", &|| c.set_count_changes(v), &|| c.set_count_changes(!v), &|| c.set_count_changes(v));
+    // Only Apple's pager distinguishes the two (elsewhere both are fsync, and the setter does not
+    // change what PRAGMA fullfsync answers, so it must not bump at all: review C42 LOW-7).
+    #[cfg(target_vendor = "apple")]
+    {
+        let v = c.get_sync_type();
+        let w = if v == crate::io::FileSyncType::FullFsync { crate::io::FileSyncType::Fsync } else { crate::io::FileSyncType::FullFsync };
+        check("set_sync_type", &|| c.set_sync_type(v), &|| c.set_sync_type(w), &|| c.set_sync_type(v));
+    }
     let v = c.get_busy_timeout();
     let w = v + std::time::Duration::from_millis(7);
     check("set_busy_timeout", &|| c.set_busy_timeout(v), &|| c.set_busy_timeout(w), &|| c.set_busy_timeout(v));
@@ -3476,7 +4065,7 @@ fn a_client_checkpoint_s_wait_for_a_flight_ends_at_its_deadline_or_its_interrupt
             let begun = std::time::Instant::now();
             let interrupted = move || interrupt_after.is_some_and(|d| begun.elapsed() >= d);
             let r = db.branch_compact_now_within(begun + until, &interrupted);
-            let _ = tx.send(r.map_err(|e| e.to_string()));
+            let _ = tx.send((r, begun.elapsed()));
         });
         rx.recv_timeout(std::time::Duration::from_secs(30))
     };
@@ -3484,10 +4073,362 @@ fn a_client_checkpoint_s_wait_for_a_flight_ends_at_its_deadline_or_its_interrupt
     let interrupted = call(std::time::Duration::from_secs(600), Some(std::time::Duration::from_millis(100)));
     db.branch_checkpoint_hold(0);
     db.branch_checkpoint_wait();
-    let at_deadline = at_deadline.expect("CLAIM: a client's CHECKPOINT waited past its 300 ms deadline for the flight in flight (no return in 30 s)");
-    let interrupted = interrupted.expect("CLAIM: a client's CHECKPOINT went on waiting for the flight after its interrupt (no return in 30 s)");
-    assert!(at_deadline.is_err(), "CLAIM: at its deadline the CHECKPOINT reported success with the flight still held");
-    assert!(interrupted.as_ref().is_err_and(|e| e.to_lowercase().contains("interrupt")), "CLAIM: an interrupted CHECKPOINT did not report the interrupt: {interrupted:?}");
+    let (at_deadline, took) = at_deadline.expect("CLAIM: a client's CHECKPOINT waited past its 300 ms deadline for the flight in flight (no return in 30 s)");
+    let (interrupted, _) = interrupted.expect("CLAIM: a client's CHECKPOINT went on waiting for the flight after its interrupt (no return in 30 s)");
+    // Review C42 MED-4 (FLAGGED: this red's own assertions sharpened before it first ran): by
+    // variant, not by text; not before the deadline; and a positive control.
+    assert!(matches!(at_deadline, Err(LimboError::Busy)), "CLAIM: at its deadline the CHECKPOINT did not report Busy: {at_deadline:?}");
+    assert!(took >= std::time::Duration::from_millis(300), "CLAIM: the CHECKPOINT gave up before its 300 ms deadline ({took:?})");
+    assert!(matches!(interrupted, Err(LimboError::Interrupt)), "CLAIM: an interrupted CHECKPOINT did not report the interrupt: {interrupted:?}");
+    // New records since the held checkpoint's cut, so a compaction has something to cut.
+    for _ in 0..8 {
+        let _ = trunk.fork_branch().unwrap().into_id();
+    }
+    let log0 = db.branches.log_len_for_test();
+    let unheld = db.branch_compact_now_within(std::time::Instant::now() + std::time::Duration::from_secs(10), &|| false);
+    assert!(unheld.is_ok(), "CLAIM (positive control): with no flight held, a bounded CHECKPOINT failed: {unheld:?}");
+    assert!(db.branches.log_len_for_test() < log0, "CLAIM (positive control): the bounded CHECKPOINT compacted nothing (log {log0} -> {})", db.branches.log_len_for_test());
+}
+
+/// Review C42 MED-2 (lead ruling "C42-M1 review, bounded end to end"): a client's CHECKPOINT is
+/// bounded END TO END, its wait for the store mutex too, not only its wait for a flight. Another
+/// thread holds the store mutex (as a background compaction's sync or a sharp compact would);
+/// `branch_compact_now_within` must return `Busy` at its 300 ms deadline (not before it), and
+/// `Interrupt` once its interrupt says so, each within 30 s. At 7c698b9b5 the mutex was taken with
+/// no bound after the bounded join.
+#[test]
+fn a_client_checkpoint_s_wait_for_the_store_mutex_ends_at_its_deadline_or_its_interrupt() {
+    use std::sync::atomic::{AtomicBool, Ordering::{Acquire, Release}};
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(
+        &dir.path().join("checkpoint-mutex-within.db"),
+        opts(true, SyncClass::Fsync).with_branch_checkpoint(super::BranchCheckpoint::Fuzzy),
+    );
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let _ = trunk.fork_branch().unwrap().into_id();
+    let (held, release) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+    // Named apart from `Ordering::Release`, which this test imports (review c42b HIGH-2: E0255).
+    struct ReleaseOnDrop(Arc<AtomicBool>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+    let _release = ReleaseOnDrop(release.clone());
+    let holder = {
+        let (db, held, release) = (db.clone(), held.clone(), release.clone());
+        std::thread::spawn(move || db.branches.hold_store_mutex_for_test(&held, &release))
+    };
+    let t = std::time::Instant::now();
+    while !held.load(Acquire) {
+        assert!(t.elapsed() < std::time::Duration::from_secs(10), "premise: the holder never took the store mutex");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let call = |until: std::time::Duration, interrupt_after: Option<std::time::Duration>| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let db = db.clone();
+        std::thread::spawn(move || {
+            let begun = std::time::Instant::now();
+            let interrupted = move || interrupt_after.is_some_and(|d| begun.elapsed() >= d);
+            let r = db.branch_compact_now_within(begun + until, &interrupted);
+            let _ = tx.send((r, begun.elapsed()));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(30))
+    };
+    let at_deadline = call(std::time::Duration::from_millis(300), None);
+    let interrupted = call(std::time::Duration::from_secs(600), Some(std::time::Duration::from_millis(100)));
+    release.store(true, Release);
+    holder.join().unwrap();
+    let (r, took) = at_deadline.expect("CLAIM: a client's CHECKPOINT waited for the store mutex past its 300 ms deadline (no return in 30 s)");
+    assert!(matches!(r, Err(LimboError::Busy)), "CLAIM: at its deadline the CHECKPOINT did not report Busy: {r:?}");
+    assert!(took >= std::time::Duration::from_millis(300), "CLAIM: the CHECKPOINT gave up before its deadline ({took:?})");
+    let (r, _) = interrupted.expect("CLAIM: a client's CHECKPOINT went on waiting for the store mutex after its interrupt (no return in 30 s)");
+    assert!(matches!(r, Err(LimboError::Interrupt)), "CLAIM: an interrupted CHECKPOINT did not report the interrupt: {r:?}");
+}
+
+/// Review c42b MED-2: BOTH client checkpoints are bounded end to end. `checkpoint_now(deadline)` (the
+/// wire's CHECKPOINT on a catalog store) took the store mutex unbounded, at its first line and in
+/// `checkpoint_fuzzy_now`. Another thread holds the mutex; with a 300 ms deadline it must answer
+/// `Ok(false)` (no install before the deadline) within 30 s, not before the deadline.
+#[test]
+fn checkpoint_now_s_wait_for_the_store_mutex_ends_at_its_deadline() {
+    use std::sync::atomic::{AtomicBool, Ordering::Acquire};
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(
+        &dir.path().join("checkpoint-now-mutex.db"),
+        opts(true, SyncClass::Fsync).with_branch_checkpoint(super::BranchCheckpoint::Fuzzy),
+    );
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let _ = trunk.fork_branch().unwrap().into_id();
+    let (held, release) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+    struct ReleaseOnDrop(Arc<AtomicBool>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+    let _release = ReleaseOnDrop(release.clone());
+    let holder = {
+        let (db, held, release) = (db.clone(), held.clone(), release.clone());
+        std::thread::spawn(move || db.branches.hold_store_mutex_for_test(&held, &release))
+    };
+    let t = std::time::Instant::now();
+    while !held.load(Acquire) {
+        assert!(t.elapsed() < std::time::Duration::from_secs(10), "premise: the holder never took the store mutex");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    {
+        let db = db.clone();
+        std::thread::spawn(move || {
+            let begun = std::time::Instant::now();
+            let r = db.branch_checkpoint_now(std::time::Duration::from_millis(300));
+            let _ = tx.send((r, begun.elapsed()));
+        });
+    }
+    let answered = rx.recv_timeout(std::time::Duration::from_secs(30));
+    release.store(true, std::sync::atomic::Ordering::Release);
+    holder.join().unwrap();
+    let (r, took) = answered.expect("CLAIM: checkpoint_now waited for the store mutex past its 300 ms deadline (no answer in 30 s)");
+    assert!(took >= std::time::Duration::from_millis(300), "CLAIM: checkpoint_now gave up before its deadline ({took:?})");
+    assert!(matches!(r, Ok(false)), "CLAIM: checkpoint_now held off by the mutex past its deadline answered {r:?}, not Ok(false)");
+}
+
+/// `branch_checkpoint_now(deadline)` on its own thread while the flight it starts is held at
+/// `stage`, released after `release_after`; its answer and how long it took (`None`: no answer in
+/// 30 s). Premise (review c42b LOW-6): the held flight is `checkpoint_now`'s own. Every flight the
+/// forks started is waited for first, so the fuzzy-flights-started counter moves by exactly one
+/// by the time the hold is reached; a `maybe_compact` flight in the air would have sent
+/// `checkpoint_now` down its other branch, and a revert of the own-flight join would survive.
+fn checkpoint_now_with_its_flight_held(
+    db: &Arc<Database>,
+    stage: u8,
+    deadline: std::time::Duration,
+    release_after: std::time::Duration,
+) -> Option<(crate::Result<bool>, std::time::Duration)> {
+    let trunk = db.connect().unwrap();
+    for _ in 0..8 {
+        let _ = trunk.fork_branch().unwrap().into_id();
+    }
+    db.branch_checkpoint_wait();
+    let started0 = db.branch_checkpoint_counters()[1];
+    db.branch_checkpoint_hold(stage);
+    let (tx, rx) = std::sync::mpsc::channel();
+    {
+        let db = db.clone();
+        std::thread::spawn(move || {
+            let begun = std::time::Instant::now();
+            let r = db.branch_checkpoint_now(deadline);
+            let _ = tx.send((r, begun.elapsed()));
+        });
+    }
+    let t = std::time::Instant::now();
+    while db.branch_checkpoint_held() != stage | super::store::HOLD_ARRIVED {
+        assert!(t.elapsed() < std::time::Duration::from_secs(10), "premise: the checkpoint_now flight never reached hold {stage}");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let started = db.branch_checkpoint_counters()[1] - started0;
+    if started != 1 {
+        db.branch_checkpoint_hold(0);
+        panic!("premise: {started} fuzzy flights started after the settle, not exactly checkpoint_now's own");
+    }
+    std::thread::sleep(release_after.saturating_sub(t.elapsed()));
+    db.branch_checkpoint_hold(0);
+    let r = rx.recv_timeout(std::time::Duration::from_secs(30)).ok();
+    db.branch_checkpoint_wait();
+    r
+}
+
+/// Review c42b LOW-5 (C42 LOW-1 was fixed with no red): `checkpoint_now` takes any deadline, so a
+/// client asking to wait without bound (`Duration::MAX`) gets its checkpoint (`Ok(true)`) rather
+/// than an `Instant` overflow. Answered on its own thread within 30 s. Expected red at
+/// 5eca7a09a^ (`started + deadline` panicked: the thread dies and no answer comes).
+#[test]
+fn checkpoint_now_with_no_bound_on_its_wait_installs() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(
+        &dir.path().join("checkpoint-now-max.db"),
+        opts(true, SyncClass::Fsync).with_branch_checkpoint(super::BranchCheckpoint::Fuzzy),
+    );
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    for _ in 0..8 {
+        let _ = trunk.fork_branch().unwrap().into_id();
+    }
+    db.branch_checkpoint_wait();
+    let installed0 = db.branch_checkpoint_counters()[0];
+    let (tx, rx) = std::sync::mpsc::channel();
+    {
+        let db = db.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(db.branch_checkpoint_now(std::time::Duration::MAX));
+        });
+    }
+    let r = rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("CLAIM: checkpoint_now(Duration::MAX) gave no answer in 30 s (its thread died or hung)");
+    assert!(matches!(r, Ok(true)), "CLAIM: checkpoint_now(Duration::MAX) on a fuzzy store answered {r:?}, not Ok(true)");
+    assert!(db.branch_checkpoint_counters()[0] > installed0, "CLAIM: Ok(true) with no checkpoint installed");
+}
+
+/// Review c42b LOW-8 (C42 LOW-2 was fixed with no red): a bounded compaction's wait for a flight
+/// evaluates the caller's interrupt with the flight-jobs mutex let go, so an interrupt that touches
+/// the store's flights does not deadlock. A fuzzy flight is held before its commit; the compaction
+/// waits for it with an interrupt that itself waits for every flight (`branch_checkpoint_wait`,
+/// which takes that mutex) and then interrupts; the hold is released 200 ms after the interrupt is
+/// first called. It must answer `Interrupt` within 30 s. Expected red at 5eca7a09a^: the interrupt
+/// ran with the mutex held, and its wait relocked it on the same thread.
+#[test]
+fn a_bounded_compaction_s_interrupt_may_wait_for_the_flights() {
+    use std::sync::atomic::{AtomicBool, Ordering::{Acquire, Release}};
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(
+        &dir.path().join("compact-interrupt-unlocked.db"),
+        opts(true, SyncClass::Fsync).with_branch_checkpoint(super::BranchCheckpoint::Fuzzy),
+    );
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    for _ in 0..8 {
+        let _ = trunk.fork_branch().unwrap().into_id();
+    }
+    db.branch_checkpoint_wait();
+    struct Unhold(Arc<Database>);
+    impl Drop for Unhold {
+        fn drop(&mut self) {
+            self.0.branch_checkpoint_hold(0);
+        }
+    }
+    let _unhold = Unhold(db.clone());
+    db.branch_checkpoint_hold(super::store::HOLD_BEFORE_COMMIT);
+    assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: a fuzzy flight started");
+    let t = std::time::Instant::now();
+    while db.branch_checkpoint_held() != super::store::HOLD_BEFORE_COMMIT | super::store::HOLD_ARRIVED {
+        assert!(t.elapsed() < std::time::Duration::from_secs(10), "premise: the flight never reached its hold");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let called = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = std::sync::mpsc::channel();
+    {
+        let (db, called) = (db.clone(), called.clone());
+        std::thread::spawn(move || {
+            let begun = std::time::Instant::now();
+            let interrupted = || {
+                called.store(true, Release);
+                db.branch_checkpoint_wait();
+                true
+            };
+            let _ = tx.send(db.branch_compact_now_within(begun + std::time::Duration::from_secs(600), &interrupted));
+        });
+    }
+    let t = std::time::Instant::now();
+    while !called.load(Acquire) {
+        assert!(t.elapsed() < std::time::Duration::from_secs(10), "premise: the compaction never evaluated its interrupt");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    db.branch_checkpoint_hold(0);
+    let r = rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("CLAIM: the compaction's interrupt deadlocked on the flight-jobs mutex (no answer in 30 s)");
+    assert!(matches!(r, Err(LimboError::Interrupt)), "CLAIM: the interrupted compaction answered {r:?}, not Interrupt");
+}
+
+/// Review c42b LOW-4 (measurement, not a red: the gain is a probability): 8 threads create
+/// branches in a loop while `branch_compact_now_within(now + 2 s)` is called 20 times; prints how
+/// many calls answered Busy. Run at 4e6665378 (the 1 ms poll) and at the parked `lock_within` and
+/// compare. `#[ignore]`: owed in the build plan.
+#[test]
+#[ignore]
+fn measure_bounded_compactions_busy_under_saturated_creates() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("lock-within-busy.db"), opts(true, SyncClass::Off));
+    seed(&db.connect().unwrap());
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let creators: Vec<_> = (0..8)
+        .map(|t| {
+            let (db, stop) = (db.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let conn = db.connect().unwrap();
+                let mut i = 0u64;
+                while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                    let _ = conn.create_branch(&format!("c{t}-{i}"));
+                    i += 1;
+                }
+            })
+        })
+        .collect();
+    let mut busy = 0;
+    for _ in 0..20 {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        if matches!(db.branch_compact_now_within(until, &|| false), Err(LimboError::Busy)) {
+            busy += 1;
+        }
+    }
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    for c in creators {
+        c.join().unwrap();
+    }
+    println!("LOW4_MEASURE busy={busy} of 20");
+}
+
+/// Review C42 MED-3: `checkpoint_now` whose own flight INSTALLED but whose WAL truncation ran past
+/// the deadline reports the install (`Ok(true)`), as its doc says (`Ok(false)`: none did before
+/// the deadline). The flight is held at `HOLD_BEFORE_WAL_TRUNCATE`, after its install, past a
+/// 300 ms deadline. At b3fad32f8 the bounded join's Busy mapped to `Ok(false)`.
+#[test]
+fn checkpoint_now_reports_an_install_whose_truncation_ran_past_its_deadline() {
+    let _s = serial();
+    // The truncation's hold is reached only when the catalog WAL is due (review c42b HIGH-3: 50 rows
+    // and 8 forks never reach 4 MiB, so the red failed at its premise at its base and its fix).
+    let _always = CatalogWalTruncateAlways::set();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(
+        &dir.path().join("checkpoint-now-installed.db"),
+        opts(true, SyncClass::Fsync).with_branch_checkpoint(super::BranchCheckpoint::Fuzzy),
+    );
+    seed(&db.connect().unwrap());
+    let installed0 = db.branch_checkpoint_counters()[0];
+    let (r, took) = checkpoint_now_with_its_flight_held(
+        &db,
+        super::store::HOLD_BEFORE_WAL_TRUNCATE,
+        std::time::Duration::from_millis(300),
+        std::time::Duration::from_secs(1),
+    )
+    .expect("premise: checkpoint_now answered within 30 s");
+    assert!(db.branch_checkpoint_counters()[0] > installed0, "premise: the flight installed");
+    assert!(took >= std::time::Duration::from_millis(300), "premise: the answer came after the deadline ({took:?})");
+    assert!(matches!(r, Ok(true)), "CLAIM: checkpoint_now reported {r:?} for a checkpoint that installed before its deadline ran out");
+}
+
+/// Review C42 MED-5: `checkpoint_now`'s join of the flight IT started is bounded by its deadline
+/// (C42-M1 bounded it; nothing tested it, so reverting to the unbounded join survived). The flight
+/// is held before its commit (`HOLD_BEFORE_COMMIT`), so nothing installs; with a 300 ms deadline
+/// `checkpoint_now` must answer `Ok(false)` within 30 s, the hold released only after 5 s.
+#[test]
+fn checkpoint_now_s_join_of_its_own_flight_ends_at_its_deadline() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(
+        &dir.path().join("checkpoint-now-bounded.db"),
+        opts(true, SyncClass::Fsync).with_branch_checkpoint(super::BranchCheckpoint::Fuzzy),
+    );
+    seed(&db.connect().unwrap());
+    let (r, took) = checkpoint_now_with_its_flight_held(
+        &db,
+        super::store::HOLD_BEFORE_COMMIT,
+        std::time::Duration::from_millis(300),
+        std::time::Duration::from_secs(5),
+    )
+    .expect("premise: checkpoint_now answered within 30 s of its flight's release");
+    assert!(took < std::time::Duration::from_secs(5), "CLAIM: checkpoint_now waited for its own flight past its 300 ms deadline ({took:?}: the hold was released at 5 s)");
+    assert!(matches!(r, Ok(false)), "CLAIM: checkpoint_now with no install before its deadline answered {r:?}");
 }
 
 /// Review 2 #5: a checkpoint that failed is not retried by the very next operation — the log is
@@ -4625,7 +5566,17 @@ fn a_store_missing_its_log_or_arena_is_refused_at_open() {
             Ok(_) => panic!("{arm}: the store opened"),
             Err(e) => e.to_string(),
         };
-        assert!(refused.contains(&gone), "{arm}: the refusal does not name the missing file: {refused}");
+        // FLAGGED fixture repair (lane tip suite 4a97c9c36 on ecetesla2 under uwrun v5's TMPDIR): the
+        // refusal names the file by its canonical path, which a TMPDIR spelled through a link differs
+        // from; either spelling names it.
+        let canonical_gone = format!(
+            "{}{missing}",
+            std::fs::canonicalize(&path).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| base.to_string())
+        );
+        assert!(
+            refused.contains(&gone) || refused.contains(&canonical_gone),
+            "{arm}: the refusal does not name the missing file: {refused}"
+        );
         if let Some(bytes) = log_bytes {
             assert!(std::fs::read(&log).unwrap() == bytes, "{arm}: the refused open changed the log");
         }
@@ -4754,6 +5705,103 @@ fn a_lookup_by_name_waits_for_the_release_it_reports() {
     }
 }
 
+/// Review delete MED-1: a DROP of a name whose Release is still in the air does not answer
+/// NoSuchBranch before that Release is durable (after a crash the branch would come back under the
+/// name), as a lookup does not (`a_lookup_by_name_waits_for_the_release_it_reports`). 838c41999
+/// copied the lookup's wait into `drop_named`, where neither lookup mutant reached it. Mutants
+/// `drop_miss_no_release_wait` and (once the lookup is shared) `lookup_no_release_wait`.
+#[test]
+fn a_drop_miss_waits_for_its_own_names_release() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("drop-miss-wait.db"), opts(catalog, SyncClass::Fsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        trunk.create_branch("x").unwrap();
+        let hold = db.branches.trunk_commit_hold.clone();
+        hold.store(super::store::HOLD_FLIGHT_TAKEN, std::sync::atomic::Ordering::Release);
+        let dropper = {
+            let db = db.clone();
+            std::thread::spawn(move || db.drop_branch("x").map(|_| ()))
+        };
+        wait_hold(&hold, super::store::HOLD_FLIGHT_TAKEN);
+        let before = db.branches.group_counters();
+        let second = {
+            let db = db.clone();
+            std::thread::spawn(move || db.drop_branch("x").map(|_| ()))
+        };
+        let blocked = blocked_in_wait_durable(&db, before, &second);
+        hold.store(0, std::sync::atomic::Ordering::Release);
+        dropper.join().unwrap().unwrap();
+        let missed = second.join().unwrap();
+        assert!(blocked, "catalog={catalog}: a drop answered for a name whose Release was not yet durable");
+        assert!(
+            matches!(missed, Err(LimboError::NoSuchBranch(ref n)) if n == "x"),
+            "catalog={catalog}: the second drop, after the release, is NoSuchBranch: {missed:?}"
+        );
+    }
+}
+
+/// Review delete LOW-6: a drop of a branch whose fork never became durable (its create's flight
+/// failed) does not say the branch "comes back at the next open": the reopen will not have that
+/// fork. Since 838c41999 the drop runs the release without settling the fork first, so the release's
+/// failure message is reached for such a branch.
+///
+/// Repaired per review c42b MED-5: the first version dropped x AFTER its create had failed, which
+/// never reaches that message (the create's own discarded release left x `ReleasePending`, so the
+/// drop answered "takes no release"), so its premise fired at its base and at the fix. Now the
+/// creator is parked with x's flight taken (`HOLD_FLIGHT_TAKEN`; `GroupFlightFails`, consumed by
+/// x's buffer, fails that flight's write); the drop of x runs on another thread and waits on the
+/// group; the hold is released, the flight fails, and the drop's release fails with it. Expected
+/// RED at 06ef0cff8^ (the message promised the branch comes back).
+#[test]
+fn a_drop_of_a_branch_whose_fork_failed_does_not_promise_it_comes_back() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("drop-failed-fork.db"), opts(catalog, SyncClass::Fsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let _anchor = trunk.fork_branch().unwrap().into_id();
+        let hold = db.branches.trunk_commit_hold.clone();
+        struct HoldOff(Arc<crate::sync::atomic::AtomicU8>);
+        impl Drop for HoldOff {
+            fn drop(&mut self) {
+                self.0.store(0, std::sync::atomic::Ordering::Release);
+            }
+        }
+        let _release = HoldOff(hold.clone());
+        db.branch_failpoint(Some(BranchFailpoint::GroupFlightFails));
+        hold.store(super::store::HOLD_FLIGHT_TAKEN, std::sync::atomic::Ordering::Release);
+        let creator = {
+            let db = db.clone();
+            std::thread::spawn(move || db.connect().unwrap().create_branch("x").map(|_| ()))
+        };
+        wait_hold(&hold, super::store::HOLD_FLIGHT_TAKEN);
+        let before = db.branches.group_counters();
+        let dropper = {
+            let db = db.clone();
+            std::thread::spawn(move || db.drop_branch("x").map(|_| ()))
+        };
+        let waited = blocked_in_wait_durable(&db, before, &dropper);
+        hold.store(0, std::sync::atomic::Ordering::Release);
+        let created = creator.join().unwrap();
+        let dropped = dropper.join().unwrap();
+        assert!(created.is_err(), "catalog={catalog}: premise: x's create failed with its flight");
+        assert!(waited, "catalog={catalog}: premise: the drop of x waited on the group while x's flight was held: {dropped:?}");
+        // The drop reached the release (a NoSuchBranch would pass the claim without testing it).
+        assert!(
+            matches!(dropped, Err(LimboError::InternalError(ref m)) if m.contains("not released durably")),
+            "catalog={catalog}: premise: the drop of x reached the release and failed there: {dropped:?}"
+        );
+        assert!(
+            !dropped.as_ref().is_err_and(|e| e.to_string().contains("comes back")),
+            "catalog={catalog}: CLAIM: the drop of a branch whose fork never became durable said it comes back: {dropped:?}"
+        );
+    }
+}
+
 /// fastest-wire (the typed branch errors): `Database::drop_branch` released a named branch that
 /// still had an open connection, as a handle's release does (the branch kept whole until the
 /// connection closes). A server's DROP of a database in use must be refused instead, as
@@ -4786,10 +5834,11 @@ fn a_named_branch_with_an_open_connection_is_not_dropped() {
 /// Engine review 14 MED 7: nothing showed that `Database::drop_branch`'s open check and its
 /// release are one hold of the store mutex. Under a regression to check-then-act across two holds,
 /// a drop and a concurrent `connect_named` would both succeed and the Release would be written
-/// under a live connection. A drop parked between its lookup and its release
-/// (`HOLD_DROP_LOOKED_UP`) while a `connect_named` runs on this thread: the connect wins, and the
-/// drop is then refused as `BranchInUse`; the two never both succeed. Mutant
-/// `drop_check_separate_hold`.
+/// under a live connection. A drop parked at `HOLD_DROP_LOOKED_UP` while a `connect_named` runs on
+/// this thread: the connect wins, and the drop is then refused as `BranchInUse`; the two never both
+/// succeed. Since 838c41999 the lookup and the release are ONE hold and the park is before it, so on
+/// the default arm this is a sequential connect-then-drop (its subject, the window, is gone; review
+/// delete LOW-4); it still kills mutant `drop_check_separate_hold`, which reopens the window.
 #[test]
 fn a_drop_and_a_connect_never_both_win_a_named_branch() {
     let _s = serial();
@@ -9932,6 +10981,16 @@ fn catalog_only_names(db: &Arc<Database>, trunk: &Arc<Connection>, k: usize) -> 
     // The eviction runs at a fuzzy checkpoint's install (`evict_clean`).
     assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: the evicting fuzzy checkpoint started");
     db.branch_checkpoint_wait();
+    // FLAGGED fixture repair (lead rule for item f; DECISIONS owed): cap 1 keeps ONE state resident,
+    // and the trunk is not in the branch table, so one of these names stays: on Linux it is the
+    // highest id, cat-only-003, in 10 of 10 runs over a debug and a release build (probe
+    // engine-filter-dump-2, ecetesla2; artie 2f8ecd03b6). The survivor is read from the engine's
+    // own state and only it is left out of the controls; every other name must be evicted.
+    let survivors: Vec<&String> = names.iter().filter(|n| db.branches.name_resident_for_test(n)).collect();
+    assert!(survivors.len() <= 1, "premise: cap 1 left {} of these names resident: {survivors:?}", survivors.len());
+    let survivors: Vec<String> = survivors.into_iter().cloned().collect();
+    let names: Vec<String> = names.into_iter().filter(|n| !survivors.contains(n)).collect();
+    assert!(names.len() + 1 >= k, "premise: more than the one survivor was left out ({} of {k} kept)", names.len());
     for n in &names {
         assert!(!db.branches.name_resident_for_test(n), "premise: {n} is still resident after the eviction");
     }
@@ -10279,6 +11338,201 @@ fn a_failed_filter_drain_s_overflow_still_answers_for_a_pending_name() {
     BUILD_SEED_HOLD.store(0, Release);
     db.branch_wait_name_filter();
     assert!(!absent, "CLAIM: after a failed drain the overflowed filter answered absent for a name only its pending table held");
+}
+
+/// Review filter3 MED-1: LOW-F2's class has a red that can fire again. Since N1 the first refusal
+/// in `a_refusing_answer_s_table_is_not_freed_under_the_store_mutex` respills into the spare, so
+/// nothing is retired and that test passes whatever `retire_table` does. Here the burst goes on
+/// until the answer ENDS (`name_filter_refusals_for_test().3`: the spare is used by the first
+/// refusal, so a later one ends it and retires the old sink and the spare, both their last
+/// references). Premise: the filter then answers nothing. No note may free anything. Mutant
+/// `filter_retire_frees_in_place` (retired tables freed under the mutex) is its killer.
+#[test]
+fn an_answer_that_ends_on_a_refusal_frees_nothing_under_the_store_mutex() {
+    use super::store::{FILTER_NOTE_FREED_MAX, HOLD_ARRIVED, NAME_SCAN_HOLD};
+    use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+    let _s = serial();
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            NAME_SCAN_HOLD.store(0, Release);
+        }
+    }
+    let _r = Reset;
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("answer-ends-free.db"), opts(true, SyncClass::Off));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    trunk.create_branch("held").unwrap();
+    db.branch_wait_name_filter();
+    NAME_SCAN_HOLD.store(1, Release);
+    let t = std::time::Instant::now();
+    let mut n = 0u32;
+    while NAME_SCAN_HOLD.load(Acquire) != 1 | HOLD_ARRIVED {
+        let name = format!("cycle-{n:05}");
+        trunk.create_branch(&name).unwrap();
+        db.drop_branch(&name).unwrap();
+        n += 1;
+        assert!(t.elapsed() < std::time::Duration::from_secs(30), "premise: no natural shrink's rebuild reached its scan ({n} cycles)");
+    }
+    let ended0 = db.branches.name_filter_refusals_for_test().3;
+    FILTER_NOTE_FREED_MAX.store(0, Release);
+    while db.branches.name_filter_refusals_for_test().3 == ended0 {
+        trunk.create_branch(&format!("burst-{n:05}")).unwrap();
+        n += 1;
+        assert!(n < 1 << 20, "premise: the Building answer never ended");
+    }
+    let built = db.branches.name_filter_stats().0;
+    let freed = FILTER_NOTE_FREED_MAX.load(Relaxed);
+    let respilled = db.branches.name_filter_refusals_for_test().2;
+    NAME_SCAN_HOLD.store(0, Release);
+    db.branch_wait_name_filter();
+    assert!(respilled >= 1, "premise: the first refusal respilled into the spare before a later one ended the answer");
+    assert!(!built, "premise: the ended answer leaves the filter answering nothing");
+    assert_eq!(freed, 0, "CLAIM: a note freed {freed} bytes under the store mutex when the answer ended (its tables are retired, freed after the unlock)");
+}
+
+/// Review c42b LOW-9 (the filter3 instrument note, as a class): a name-filter failpoint armed by one
+/// test is consumed only by a build of a store that test's thread started, never by another
+/// test's store that happens to build first. Armed here; a store opened and built on ANOTHER
+/// thread must build with no failed scan and leave the failpoint armed. At 1631f38cf the flags
+/// were process-global and the first build anywhere consumed them.
+#[test]
+fn a_name_filter_failpoint_armed_by_one_thread_spares_another_thread_s_store() {
+    use super::store::NAME_SCAN_FAILS;
+    use std::sync::atomic::Ordering::{Acquire, Release};
+    let _s = serial();
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            NAME_SCAN_FAILS.store(false, Release);
+        }
+    }
+    let _r = Reset;
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("failpoint-scope.db");
+    let incarnation = {
+        let db = open_at(&path, opts(true, SyncClass::Off));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        trunk.create_branch("kept").unwrap();
+        db.branch_compact_now().unwrap();
+        db.branch_wait_name_filter();
+        db.incarnation
+    };
+    NAME_SCAN_FAILS.store(true, Release);
+    let failed = std::thread::spawn(move || {
+        let db = reopen(&path, opts(true, SyncClass::Off), incarnation);
+        db.branch_wait_name_filter();
+        let (built, _, _, _, failed) = db.branch_name_filter_stats();
+        (built, failed)
+    })
+    .join()
+    .unwrap();
+    assert!(failed.0, "premise: the other thread's store built its name filter");
+    assert_eq!(failed.1, 0, "CLAIM: a store another thread started consumed this thread's failpoint (a failed scan)");
+    assert!(NAME_SCAN_FAILS.load(Acquire), "CLAIM: this thread's failpoint was consumed by another thread's store");
+}
+
+/// Review filter3 L3: the BUILD's failed drain overflows answering from its new table and its pending
+/// one, as the growth's does; a name noted into the pending table only (created while the reopen's
+/// build is held at its scan, so the scan and the table lack it) must not be answered absent once
+/// Overflowed, held there by the rebuild's seed hold. Failpoint `BUILD_DRAIN_FAILS`; killer of
+/// mutant `filter_build_answer_drops_pending` (the growth site's mutant had the only killer).
+#[test]
+fn a_failed_build_drain_s_overflow_still_answers_for_a_pending_name() {
+    use super::store::{BUILD_DRAIN_FAILS, BUILD_SEED_HOLD, HOLD_ARRIVED, NAME_SCAN_HOLD};
+    use std::sync::atomic::Ordering::{Acquire, Release};
+    let _s = serial();
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            BUILD_DRAIN_FAILS.store(false, Release);
+            BUILD_SEED_HOLD.store(0, Release);
+            NAME_SCAN_HOLD.store(0, Release);
+        }
+    }
+    let _r = Reset;
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("build-drain-overflow.db");
+    let incarnation = {
+        let db = open_at(&path, opts(true, SyncClass::Off));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        for i in 0..16 {
+            trunk.create_branch(&format!("kept-{i:02}")).unwrap();
+        }
+        db.branch_compact_now().unwrap();
+        db.incarnation
+    };
+    NAME_SCAN_HOLD.store(1, Release);
+    BUILD_DRAIN_FAILS.store(true, Release);
+    let db = reopen(&path, opts(true, SyncClass::Off), incarnation);
+    let t = std::time::Instant::now();
+    while NAME_SCAN_HOLD.load(Acquire) != 1 | HOLD_ARRIVED {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        assert!(t.elapsed() < std::time::Duration::from_secs(30), "premise: the reopen's build never reached its scan");
+    }
+    let trunk = db.connect().unwrap();
+    trunk.create_branch("victim").unwrap();
+    NAME_SCAN_HOLD.store(0, Release);
+    while db.branches.name_filter_state_for_test().0 != "Overflowed" {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        assert!(t.elapsed() < std::time::Duration::from_secs(60), "premise: the failed build drain never overflowed the filter");
+    }
+    assert!(!BUILD_DRAIN_FAILS.load(Acquire), "premise: the failpoint was consumed by the build");
+    BUILD_SEED_HOLD.store(1, Release);
+    trunk.create_branch("starts-the-rebuild").unwrap();
+    while BUILD_SEED_HOLD.load(Acquire) != 1 | HOLD_ARRIVED {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        assert!(t.elapsed() < std::time::Duration::from_secs(60), "premise: the overflow's rebuild never began");
+    }
+    assert_eq!(db.branches.name_filter_state_for_test().0, "Overflowed", "premise: still Overflowed, held before the rebuild's seed");
+    let absent = db.branches.name_filter_says_absent_for_test("victim");
+    BUILD_SEED_HOLD.store(0, Release);
+    db.branch_wait_name_filter();
+    assert!(!absent, "CLAIM: after a failed build drain the overflowed filter answered absent for a name only its pending table held");
+}
+
+/// Review filter3 L5: a build attempt whose catalog scan failed frees nothing inside its store-mutex
+/// hold (N2's rule: no filter-thread hold frees anything). At dd9d97b1d the failed-scan arm's error
+/// (a String) dropped before the guard on `return FilterBuild::Failed`. Failpoint
+/// `NAME_SCAN_FAILS` on a reopen's build; the retry builds it.
+#[test]
+fn a_failed_build_scan_frees_nothing_under_the_store_mutex() {
+    use super::store::{FILTER_HOLD_FREED_MAX, FILTER_HOLD_FREES_ARMED, NAME_SCAN_FAILS};
+    use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+    let _s = serial();
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FILTER_HOLD_FREES_ARMED.store(false, Release);
+            NAME_SCAN_FAILS.store(false, Release);
+        }
+    }
+    let _r = Reset;
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("failed-scan-free.db");
+    let incarnation = {
+        let db = open_at(&path, opts(true, SyncClass::Off));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        for i in 0..16 {
+            trunk.create_branch(&format!("kept-{i:02}")).unwrap();
+        }
+        db.branch_compact_now().unwrap();
+        db.incarnation
+    };
+    FILTER_HOLD_FREED_MAX.store(0, Release);
+    FILTER_HOLD_FREES_ARMED.store(true, Release);
+    NAME_SCAN_FAILS.store(true, Release);
+    let db = reopen(&path, opts(true, SyncClass::Off), incarnation);
+    db.branch_wait_name_filter();
+    FILTER_HOLD_FREES_ARMED.store(false, Release);
+    assert!(!NAME_SCAN_FAILS.load(Acquire), "premise: the reopen's build met the failing scan");
+    assert_eq!(db.branch_name_filter_stats().4, 1, "premise: one failed scan was counted");
+    let freed = FILTER_HOLD_FREED_MAX.load(Relaxed);
+    assert_eq!(freed, 0, "CLAIM: a name-filter thread freed {freed} bytes inside a store-mutex hold (a failed scan's error)");
 }
 
 /// Class (e), the store mutex's lifecycle audit (DECISIONS 994f7d41e0; the lead's order with
@@ -10947,7 +12201,13 @@ fn a_fuzzy_checkpoint_issues_at_most_two_syscalls_under_the_store_mutex() {
         for _ in 0..30 {
             let _ = trunk.fork_branch().unwrap().into_id();
         }
-        super::store::CKPT_HELD_SYSCALLS.lock().unwrap().clear();
+        {
+            // Reserved too (review delete LOW-7): a push that reallocates mid-checkpoint would land
+            // its syscalls, if any, in the next span.
+            let mut s = super::store::CKPT_HELD_SYSCALLS.lock().unwrap();
+            s.clear();
+            s.reserve(32);
+        }
         {
             let mut t = super::store::CKPT_HELD_THREADS.lock().unwrap();
             t.clear();
@@ -10976,6 +12236,19 @@ fn a_fuzzy_checkpoint_issues_at_most_two_syscalls_under_the_store_mutex() {
             span("install.quiesced", "install.installed"),
             span("install.installed", "install.marked"),
         );
+        // FLAGGED instrument change (diagnostic only; the claim and its sum are unchanged): the
+        // capture's span split at its read snapshot's two steps, so a red names its syscalls. Read
+        // with no foreign check (review delete MED-2): a sub-span's own thread check would refuse
+        // rounds the judged spans accept, so the judged rounds stay as they were.
+        let quiet = |a: &str, b: &str| match (at(a), at(b)) {
+            (Some(i), Some(j)) => points[j].1 - points[i].1,
+            _ => u64::MAX,
+        };
+        let in_capture = (
+            quiet("capture.matured", "capture.tx_begun"),
+            quiet("capture.tx_begun", "capture.snapshot_pinned"),
+            quiet("capture.snapshot_pinned", "capture.captured"),
+        );
         let inside = (
             span("install.quiesced", "install.snapshot_ended"),
             span("install.snapshot_ended", "install.before_cut"),
@@ -10986,12 +12259,19 @@ fn a_fuzzy_checkpoint_issues_at_most_two_syscalls_under_the_store_mutex() {
             refused.push(format!("round {round}: {foreign:?}"));
             continue;
         }
+        // A point that was never recorded (no syscall counter on this platform, or a hook that did not
+        // fire) is unattributable, never a count: as u64::MAX it overflowed the sum (a panic on Linux,
+        // ecetesla2 2026-10-18, uw-bp-a1-heldsys_ccf6488ce), or would wrap into a false red.
+        if [capture.0, capture.1, install.0, install.1, install.2].contains(&u64::MAX) {
+            refused.push(format!("round {round}: a held-syscall point is missing ({} recorded)", points.len()));
+            continue;
+        }
         judged += 1;
         let total = capture.0 + capture.1 + install.0 + install.1 + install.2;
         if total > 2 {
             over.push(format!(
-                "round {round}: {total} syscalls held: capture [to matured {}, capture {}], install [quiesce {}, install {} (snapshot end {}, to cut {}, cut {}, after {}), mark {}]",
-                capture.0, capture.1, install.0, install.1, inside.0, inside.1, inside.2, inside.3, install.2
+                "round {round}: {total} syscalls held: capture [to matured {}, capture {} (to tx begun {}, snapshot pin {}, after {})], install [quiesce {}, install {} (snapshot end {}, to cut {}, cut {}, after {}), mark {}]",
+                capture.0, capture.1, in_capture.0, in_capture.1, in_capture.2, install.0, install.1, inside.0, inside.1, inside.2, inside.3, install.2
             ));
         }
     }
@@ -11903,6 +13183,51 @@ fn a_create_behind_a_background_compaction_is_counted() {
     eventually("the background compaction never ran", || db.branches.background_compactions() >= 1);
 }
 
+/// Review c42b MED-1: a bounded CHECKPOINT that waited behind the background compaction's sync
+/// under the mutex is counted as an operation that waited (`branch_exception_counters()[3]`), as
+/// `lock()` counts one: "an overcount, never a miss". `lock_within` read `compacting` only at the
+/// successful `try_lock`, after the compaction had cleared it. The fixture of
+/// `a_create_behind_a_background_compaction_is_counted`, with `branch_compact_now_within` as the
+/// waiter.
+#[test]
+fn a_bounded_checkpoint_behind_a_background_compaction_is_counted() {
+    let _s = serial();
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            super::store::COMPACT_CATCH_UPS_OFF.store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+    let _restore = Restore;
+    super::store::COMPACT_CATCH_UPS_OFF.store(true, std::sync::atomic::Ordering::Release);
+    let dir = tempfile::TempDir::new().unwrap();
+    let (db, trunk, x, _) = raised_d0_with_a_kept_pre_image(&dir.path().join("bounded-compact-wait.db"), false, true);
+    let _x = x.into_id();
+    db.branches.confirm_hold_for_test(super::store::HOLD_COMPACT_TAIL);
+    let _t = Threshold::set(8 << 10);
+    let t = std::time::Instant::now();
+    while !db.branches.compaction_owed_for_test() {
+        let _ = trunk.fork_branch().unwrap().into_id();
+        assert!(t.elapsed() < std::time::Duration::from_secs(30), "premise: no create owed a compaction");
+    }
+    eventually("premise: the background compaction never reached its hold", || {
+        db.branches.confirm_held_for_test() == super::store::HOLD_COMPACT_TAIL | super::store::HOLD_ARRIVED
+    });
+    let before = db.branch_exception_counters();
+    let waiter = {
+        let db = db.clone();
+        std::thread::spawn(move || db.branch_compact_now_within(std::time::Instant::now() + std::time::Duration::from_secs(10), &|| false))
+    };
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let waited_while_held = !waiter.is_finished();
+    db.branches.confirm_hold_for_test(0);
+    let joined = waiter.join().unwrap();
+    let after = db.branch_exception_counters();
+    assert!(waited_while_held, "premise: the bounded CHECKPOINT did not wait behind the compaction's hold");
+    assert!(joined.is_ok(), "premise: the bounded CHECKPOINT failed: {joined:?}");
+    assert!(after[3] > before[3], "CLAIM: a bounded CHECKPOINT that waited behind the background compaction was not counted");
+}
+
 /// C15 ruling (fastest DECISIONS 2026-10-15T04:15:07Z), exception (a), the hard-cap fallback: with
 /// the bound forced to 1 and the background writer held where it found the upgrade due, every
 /// held-free upgrade is led by a freeing operation past the hard cap, and each is counted
@@ -12547,4 +13872,2070 @@ fn a_frameless_full_commit_after_a_synced_one_syncs_nothing() {
             "catalog={catalog}: CLAIM: a commit with no frames after a synced one synced the WAL (fsync, full fsync)"
         );
     }
+}
+
+/// CORRUPTION (fastest-wire's "short read on page 2", lead order b): a DDL statement that changes the
+/// connection's IN-MEMORY schema and then fails leaves that change in place while the pager rolls
+/// its pages back. `persist_type_definition` creates `__turso_internal_types` lazily with
+/// CreateBtree + ParseSchema, then runs AddType, then SetCookie. Rollback restores the in-memory
+/// schema only when SetCookie marked the transaction, so an AddType failure keeps a table whose root
+/// page the file never got. The next table is given that page, and the next CREATE TYPE writes its
+/// row INTO the user's table: at cd1e5624c `SELECT * FROM u` returned [1], ["m3"] after a reopen
+/// (probe engine-probe-shortread-4 on ecetesla2). Statement rollback inside BEGIN restores no
+/// in-memory schema at all, so the same holds there. Each case runs, and every failure is listed.
+#[test]
+fn a_failed_ddl_leaves_no_in_memory_schema_change() {
+    use turso_parser::ast;
+    let _g = serial();
+    let opts = || DatabaseOpts::new().with_custom_types(true);
+    // A CREATE TYPE whose AddType fails at run time: the stored SQL text does not reparse.
+    fn failing_create_type(c: &Arc<Connection>) -> crate::Result<()> {
+        let (Some(mut cmd), _) =
+            crate::dialect::sqlite::parse("CREATE TYPE m(value text) BASE text ENCODE 'p' DECODE value").unwrap()
+        else {
+            panic!("fixture: no command")
+        };
+        let ast::Cmd::Stmt(ast::Stmt::CreateType {
+            body: ast::CreateTypeBody::CustomType { encode: Some(e), .. },
+            ..
+        }) = &mut cmd
+        else {
+            panic!("fixture: not a CREATE TYPE with ENCODE")
+        };
+        **e = ast::Expr::Literal(ast::Literal::String("'a'b'".to_string()));
+        c.prepare_translated_cmd(cmd, "CREATE TYPE m(value text) BASE text ENCODE 'p' DECODE value")
+            .and_then(|mut s| s.run_ignore_rows())
+    }
+    fn rows(c: &Arc<Connection>, sql: &str) -> String {
+        format!("{:?}", c.prepare(sql).and_then(|mut s| s.run_collect_rows()))
+    }
+    let mut failed: Vec<String> = Vec::new();
+    for explicit in [false, true] {
+        let case = if explicit { "inside BEGIN" } else { "autocommit" };
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("stale.db");
+        {
+            let db = open_at(&path, opts());
+            let c = db.connect().unwrap();
+            c.execute("CREATE TABLE a(x)").unwrap();
+            if explicit {
+                c.execute("BEGIN").unwrap();
+            }
+            let r = failing_create_type(&c);
+            if r.is_ok() {
+                panic!("premise ({case}): the fixture CREATE TYPE must fail at AddType");
+            }
+            if c.schema.read().get_btree_table(crate::schema::TURSO_TYPES_TABLE_NAME).is_some() {
+                failed.push(format!(
+                    "{case}: after the failed CREATE TYPE ({r:?}) the in-memory schema still holds {} (sqlite_schema: {})",
+                    crate::schema::TURSO_TYPES_TABLE_NAME,
+                    rows(&c, "SELECT name, rootpage FROM sqlite_schema")
+                ));
+            }
+            for sql in ["CREATE TABLE u(y)", "INSERT INTO u VALUES (1)", "CREATE TYPE m3(value text) BASE text"] {
+                if let Err(e) = c.execute(sql) {
+                    failed.push(format!("{case}: {sql}: {e}"));
+                }
+            }
+            if explicit {
+                if let Err(e) = c.execute("COMMIT") {
+                    failed.push(format!("{case}: COMMIT: {e}"));
+                }
+            }
+            let integrity = rows(&c, "PRAGMA integrity_check");
+            if !integrity.contains("\"ok\"") {
+                failed.push(format!("{case}: integrity_check before the reopen: {integrity}"));
+            }
+        }
+        let db = open_at(&path, opts());
+        let c = db.connect().unwrap();
+        let u = c.prepare("SELECT * FROM u").and_then(|mut s| s.run_collect_rows());
+        let one_row_of_1 = matches!(&u, Ok(r) if r.len() == 1 && r[0].len() == 1 && r[0][0].to_string() == "1");
+        if !one_row_of_1 {
+            failed.push(format!("{case}: after the reopen `SELECT * FROM u` = {u:?}, want the one row (1)"));
+        }
+    }
+    assert!(failed.is_empty(), "CLAIM: a failed DDL left its in-memory schema change: {failed:#?}");
+}
+
+/// The held-flight hook a frontend's test uses (lead order d, for fastest-wire's server-side C42-M1
+/// red), through its public names only: `Database::branch_checkpoint_hold(CHECKPOINT_HOLD_BEFORE_COMMIT)`
+/// holds the next fuzzy checkpoint's flight in every build, `branch_checkpoint_held` shows it
+/// arrived, and a bounded CHECKPOINT (`branch_compact_now_within`) then returns `Busy` at its 300 ms
+/// deadline, not before it; released, the flight installs and a bounded CHECKPOINT compacts.
+#[test]
+fn the_public_checkpoint_hold_holds_one_flight_and_a_bounded_checkpoint_ends_busy() {
+    use crate::branch::{CHECKPOINT_HOLD_ARRIVED, CHECKPOINT_HOLD_BEFORE_COMMIT};
+    let _s = serial();
+    struct Release(Arc<Database>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.branch_checkpoint_hold(0);
+        }
+    }
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(
+        &dir.path().join("public-hold.db"),
+        opts(true, SyncClass::Fsync).with_branch_checkpoint(super::BranchCheckpoint::Fuzzy),
+    );
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    for _ in 0..8 {
+        let _ = trunk.fork_branch().unwrap().into_id();
+    }
+    let _release = Release(db.clone());
+    db.branch_checkpoint_hold(CHECKPOINT_HOLD_BEFORE_COMMIT);
+    assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: a fuzzy checkpoint started");
+    let t = std::time::Instant::now();
+    while db.branch_checkpoint_held() != CHECKPOINT_HOLD_BEFORE_COMMIT | CHECKPOINT_HOLD_ARRIVED {
+        assert!(t.elapsed() < std::time::Duration::from_secs(10), "CLAIM: the flight never reached the public hold");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    {
+        let db = db.clone();
+        std::thread::spawn(move || {
+            let begun = std::time::Instant::now();
+            let r = db.branch_compact_now_within(begun + std::time::Duration::from_millis(300), &|| false);
+            let _ = tx.send((r, begun.elapsed()));
+        });
+    }
+    let held = rx.recv_timeout(std::time::Duration::from_secs(30));
+    db.branch_checkpoint_hold(0);
+    db.branch_checkpoint_wait();
+    let (r, took) = held.expect("CLAIM: a bounded CHECKPOINT waited past its deadline for the held flight (no return in 30 s)");
+    assert!(matches!(r, Err(LimboError::Busy)), "CLAIM: at its deadline the CHECKPOINT did not report Busy: {r:?}");
+    assert!(took >= std::time::Duration::from_millis(300), "CLAIM: the CHECKPOINT gave up before its 300 ms deadline ({took:?})");
+    for _ in 0..8 {
+        let _ = trunk.fork_branch().unwrap().into_id();
+    }
+    let log0 = db.branches.log_len_for_test();
+    let unheld = db.branch_compact_now_within(std::time::Instant::now() + std::time::Duration::from_secs(10), &|| false);
+    assert!(unheld.is_ok(), "CLAIM (positive control): released, a bounded CHECKPOINT failed: {unheld:?}");
+    assert!(db.branches.log_len_for_test() < log0, "CLAIM (positive control): the bounded CHECKPOINT compacted nothing (log {log0} -> {})", db.branches.log_len_for_test());
+}
+
+/// engine-rev-quote42 H1 and H2 (lead order c): names that carry a double quote, end to end.
+/// - H1: a table-valued pragma's argument went into `PRAGMA name="arg"` unescaped (pragma.rs), so
+///   `pragma_table_info('a"b')` was a parse error while a caller's own `'a""b'` worked.
+/// - H2: `PRAGMA capture_data_changes_conn('full,my"cdc')` failed at 9a58832f5: the capture table's
+///   AUTOINCREMENT sequence backing table was created by `CREATE TABLE "<prefix>my"cdc"(...)`
+///   (sequence.rs, lexer error at offset 69 = 14 + the 52-byte prefix + 2 + 1; probe
+///   engine-probe-q42-1 on ecetesla2).
+/// Each case runs and every failure is listed.
+#[test]
+fn names_with_a_double_quote_work_in_pragma_functions_and_cdc_tables() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("quote42.db"), DatabaseOpts::new());
+    let c = db.connect().unwrap();
+    let mut failed: Vec<String> = Vec::new();
+    let rows = |sql: &str| c.prepare(sql).and_then(|mut s| s.run_collect_rows());
+    c.execute("CREATE TABLE \"a\"\"b\"(x INTEGER, y TEXT)").unwrap();
+    match rows("SELECT name FROM pragma_table_info('a\"b')") {
+        Ok(r) if r.iter().map(|row| row[0].to_string()).collect::<Vec<_>>() == ["x", "y"] => {}
+        other => failed.push(format!("H1: pragma_table_info('a\"b') = {other:?}, want the columns x, y")),
+    }
+    // A name with a quote and text after it must name a (missing) table, not end the PRAGMA.
+    match rows("SELECT name FROM pragma_table_info('a\" OR 1')") {
+        Ok(r) if r.is_empty() => {}
+        other => failed.push(format!("H1: pragma_table_info('a\" OR 1') = {other:?}, want no rows")),
+    }
+    c.execute("CREATE TABLE t(x)").unwrap();
+    match c.execute("PRAGMA capture_data_changes_conn('full,my\"cdc')") {
+        Err(e) => failed.push(format!("H2: PRAGMA capture_data_changes_conn('full,my\"cdc'): {e}")),
+        Ok(()) => {
+            if let Err(e) = c.execute("INSERT INTO t VALUES (1)") {
+                failed.push(format!("H2: INSERT under capture into my\"cdc: {e}"));
+            }
+            match rows("SELECT count(*) FROM \"my\"\"cdc\" WHERE table_name = 't'") {
+                Ok(r) if r.len() == 1 && r[0][0].to_string() == "1" => {}
+                other => failed.push(format!("H2: the capture table my\"cdc holds {other:?}, want one change of t")),
+            }
+        }
+    }
+    assert!(failed.is_empty(), "CLAIM: a name with a double quote broke engine-built SQL: {failed:#?}");
+}
+
+/// Found while finding engine-rev-quote42 H2's mechanism (probe engine-probe-cdcswitch-1, ecetesla2):
+/// `PRAGMA capture_data_changes_conn('full,c2')` while capture into `c1` is on returned Ok and never
+/// created `c2`; InitCdcVersion's early exit for an enabled connection ignored the table name, so
+/// every later write on the connection failed "no such table: c2". A switch must create the new
+/// table and capture into it, and leave the old one as it was.
+#[test]
+fn switching_capture_to_another_table_while_on_creates_it_and_captures_there() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("cdc-switch.db"), DatabaseOpts::new());
+    let c = db.connect().unwrap();
+    let count = |sql: &str| c.prepare(sql).and_then(|mut s| s.run_collect_rows()).map(|r| r[0][0].to_string());
+    c.execute("CREATE TABLE t(x)").unwrap();
+    c.execute("PRAGMA capture_data_changes_conn('full,c1')").unwrap();
+    c.execute("INSERT INTO t VALUES (1)").unwrap();
+    assert_eq!(count("SELECT count(*) FROM c1 WHERE table_name = 't'").ok().as_deref(), Some("1"), "premise: c1 captured the first insert");
+    let mut failed: Vec<String> = Vec::new();
+    if let Err(e) = c.execute("PRAGMA capture_data_changes_conn('full,c2')") {
+        failed.push(format!("the switch to c2: {e}"));
+    }
+    if let Err(e) = c.execute("INSERT INTO t VALUES (2)") {
+        failed.push(format!("an insert after the switch: {e}"));
+    }
+    match count("SELECT count(*) FROM c2 WHERE table_name = 't'") {
+        Ok(n) if n == "1" => {}
+        other => failed.push(format!("c2 holds {other:?} changes of t, want 1")),
+    }
+    match count("SELECT count(*) FROM c1 WHERE table_name = 't'") {
+        Ok(n) if n == "1" => {}
+        other => failed.push(format!("c1 holds {other:?} changes of t after the switch, want still 1")),
+    }
+    assert!(failed.is_empty(), "CLAIM: switching capture to another table while on did not capture there: {failed:#?}");
+}
+
+/// engine-rev-quote42 MED-3 (lead order c): the DISCRIMINATING attached-view red for 9a58832f5's
+/// view_in_db. main holds a view `vv` over a table that has nothing to drop, and the attached
+/// database `side` holds a view of the SAME name that selects `b` from side.base2. DROP COLUMN b
+/// on side.base2 must be refused for side.vv; a probe that resolves `vv` bare finds main's view,
+/// which compiles fine without b, and lets the drop through.
+#[test]
+fn dropping_a_column_an_attached_view_selects_is_refused_when_main_has_a_view_of_that_name() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("main-vv.db"), DatabaseOpts::new().with_attach(true));
+    let c = db.connect().unwrap();
+    c.execute("CREATE TABLE good(a INTEGER)").unwrap();
+    c.execute("CREATE VIEW vv AS SELECT a FROM good").unwrap();
+    let side = dir.path().join("side.db");
+    c.execute(format!("ATTACH DATABASE '{}' AS side", side.display())).unwrap();
+    c.execute("CREATE TABLE side.base2(a INTEGER, b INTEGER)").unwrap();
+    c.execute("CREATE VIEW side.vv AS SELECT b FROM base2").unwrap();
+    let r = c.execute("ALTER TABLE side.base2 DROP COLUMN b");
+    let still = c.prepare("SELECT b FROM side.base2").and_then(|mut s| s.run_collect_rows());
+    assert!(
+        r.is_err() && still.is_ok(),
+        "CLAIM: DROP COLUMN b on side.base2 was not refused for side.vv (main.vv, of the same name, does not select b): drop {r:?}, then SELECT b {still:?}"
+    );
+}
+
+/// engine-rev-quote42 LOWs (lead order c): reds for the subsystems 9a58832f5 quoted by reading
+/// alone, each with a name that carries a double quote (the `w x` case above has only a space):
+/// - the toy-vector index method's query patterns (table `v"x`, column `e"m`);
+/// - a materialized view's per-table populate SELECT (table `m"t`);
+/// - DROP/RENAME COLUMN's view probe for a view `q"x` over the altered table;
+/// - with `--features fts`, the FTS index method's query patterns (table `f"t`, column `b"o`).
+/// Each case runs, and every failure is listed.
+#[test]
+fn engine_text_quotes_a_double_quote_in_index_method_view_and_probe_names() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(
+        &dir.path().join("lows.db"),
+        DatabaseOpts::new().with_index_method(true).with_views(true),
+    );
+    let c = db.connect().unwrap();
+    let mut failed: Vec<String> = Vec::new();
+    let rows = |sql: &str| c.prepare(sql).and_then(|mut s| s.run_collect_rows());
+    let mut case = |name: &str, sqls: &[&str], check: &str, want_rows: usize| {
+        for sql in sqls {
+            if let Err(e) = c.execute(sql) {
+                failed.push(format!("{name}: {sql}: {e}"));
+                return;
+            }
+        }
+        match rows(check) {
+            Ok(r) if r.len() == want_rows => {}
+            other => failed.push(format!("{name}: {check} = {other:?}, want {want_rows} row(s)")),
+        }
+    };
+    case(
+        "toy-vector index on v\"x(e\"m)",
+        &[
+            "CREATE TABLE \"v\"\"x\"(\"e\"\"m\" BLOB)",
+            "CREATE INDEX vi ON \"v\"\"x\" USING toy_vector_sparse_ivf (\"e\"\"m\")",
+            "INSERT INTO \"v\"\"x\" VALUES (vector32_sparse('[0, 1, 0, 2]'))",
+        ],
+        "SELECT vector_distance_jaccard(\"e\"\"m\", vector32_sparse('[0, 1, 0, 2]')) AS d FROM \"v\"\"x\" ORDER BY d LIMIT 1",
+        1,
+    );
+    case(
+        "materialized view over m\"t",
+        &[
+            "CREATE TABLE \"m\"\"t\"(a INTEGER)",
+            "INSERT INTO \"m\"\"t\" VALUES (1)",
+            "CREATE MATERIALIZED VIEW mv AS SELECT a FROM \"m\"\"t\"",
+            "INSERT INTO \"m\"\"t\" VALUES (2)",
+        ],
+        "SELECT a FROM mv",
+        2,
+    );
+    case(
+        "view q\"x over an altered table",
+        &[
+            "CREATE TABLE base3(a, b)",
+            "CREATE VIEW \"q\"\"x\" AS SELECT a FROM base3",
+            "ALTER TABLE base3 DROP COLUMN b",
+            "ALTER TABLE base3 RENAME COLUMN a TO a2",
+            "INSERT INTO base3 VALUES (7)",
+        ],
+        "SELECT * FROM \"q\"\"x\"",
+        1,
+    );
+    #[cfg(feature = "fts")]
+    case(
+        "FTS index on f\"t(b\"o)",
+        &[
+            "CREATE TABLE \"f\"\"t\"(\"b\"\"o\" TEXT)",
+            "CREATE INDEX fi ON \"f\"\"t\" USING fts (\"b\"\"o\")",
+            "INSERT INTO \"f\"\"t\" VALUES ('hello world')",
+        ],
+        "SELECT * FROM \"f\"\"t\" WHERE fts_match(\"b\"\"o\", 'hello')",
+        1,
+    );
+    assert!(failed.is_empty(), "CLAIM: engine-built text broke on a double quote in a name: {failed:#?}");
+}
+
+/// fastest-wire (binding.rs extract_string_literal, lead order c): a function's string-literal
+/// name argument kept SQL's `''` doubling and lost every edge quote, since it was
+/// `trim_matches('\'')`: `nextval('s''q')` looked up `s''q`, and `nextval('q''')` looked up `q`
+/// (probe engine-probe-fmt-1, ecetesla2). Each case runs, and every failure is listed.
+#[test]
+fn a_string_literal_name_argument_is_read_as_sql_reads_it() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("seq-literal.db"), DatabaseOpts::new());
+    let c = db.connect().unwrap();
+    let mut failed: Vec<String> = Vec::new();
+    for (create, call) in [
+        ("CREATE SEQUENCE \"s'q\"", "SELECT nextval('s''q')"),
+        ("CREATE SEQUENCE \"q'\"", "SELECT nextval('q''')"),
+        ("CREATE SEQUENCE \"'lead\"", "SELECT nextval('''lead')"),
+    ] {
+        c.execute(create).unwrap();
+        match c.prepare(call).and_then(|mut s| s.run_collect_rows()) {
+            Ok(r) if r.len() == 1 && r[0][0].to_string() == "1" => {}
+            other => failed.push(format!("{call} after {create}: {other:?}, want 1")),
+        }
+    }
+    assert!(failed.is_empty(), "CLAIM: a string-literal name argument was not read as SQL reads it: {failed:#?}");
+}
+
+/// Found checking fastest-wire's CreateType fmt report (probes engine-probe-fmt-1 and
+/// engine-probe-type-1, ecetesla2): a type name is the parser's TOKEN (`"m'x"`, quotes included),
+/// and the type registry was keyed by that token while the canonical SQL quoted it again
+/// (`CREATE TYPE """m'x"""`), so the type the reparse registered was named `"m'x"` WITH its quotes
+/// and a STRICT column declared `"m'x"` was "unknown datatype". (The fmt itself prints the token,
+/// which round-trips: probe 1.) A type is one type however its name is quoted: here `"m'x"` and a
+/// plain type declared `"plain2"`, across a reopen, then dropped. Every failure is listed.
+#[test]
+fn a_custom_type_is_one_type_however_its_name_is_quoted() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("quoted-types.db");
+    let mut failed: Vec<String> = Vec::new();
+    {
+        let db = open_at(&path, DatabaseOpts::new().with_custom_types(true));
+        let c = db.connect().unwrap();
+        for sql in [
+            "CREATE TYPE \"m'x\"(value text) BASE text ENCODE lower(value) DECODE value",
+            "CREATE TYPE plain2(value text) BASE text ENCODE lower(value) DECODE value",
+            "CREATE TABLE ut(a \"m'x\", b \"plain2\") STRICT",
+            "INSERT INTO ut VALUES ('v', 'w')",
+        ] {
+            if let Err(e) = c.execute(sql) {
+                failed.push(format!("{sql}: {e}"));
+            }
+        }
+    }
+    let db = open_at(&path, DatabaseOpts::new().with_custom_types(true));
+    let c = db.connect().unwrap();
+    if let Err(e) = c.execute("INSERT INTO ut VALUES ('v2', 'w2')") {
+        failed.push(format!("after the reopen, INSERT INTO ut: {e}"));
+    }
+    // FLAGGED fixture repair after its first green run (4cd12779e): no ORDER BY, since a custom type
+    // with no OPERATOR '<' cannot be ordered (that refusal is the type's, not this claim's); sorted here.
+    match c.prepare("SELECT a, b FROM ut").and_then(|mut s| s.run_collect_rows()) {
+        Ok(r) if {
+            let mut got = r.iter().map(|row| (row[0].to_string(), row[1].to_string())).collect::<Vec<_>>();
+            got.sort();
+            got == [("v".to_string(), "w".to_string()), ("v2".to_string(), "w2".to_string())]
+        } => {}
+        other => failed.push(format!("after the reopen, ut = {other:?}, want (v, w), (v2, w2)")),
+    }
+    for sql in ["DROP TABLE ut", "DROP TYPE \"m'x\"", "DROP TYPE \"plain2\""] {
+        if let Err(e) = c.execute(sql) {
+            failed.push(format!("{sql}: {e}"));
+        }
+    }
+    assert!(failed.is_empty(), "CLAIM: a quoted custom type name was not one type: {failed:#?}");
+}
+
+/// The fresh adversary of 5650219c0 (a failed DDL leaves no in-memory schema change; review agent
+/// a6328a11fc233f21c, read-only, schedules UNRUN until this red): three routes the fix missed.
+/// - HIGH 1, nested DDL: `PRAGMA capture_data_changes_conn` creates its tables through NESTED
+///   statements, whose snapshots are their own, so when the PRAGMA failed after the nested CREATE
+///   inside BEGIN, the statement rollback took the pages and kept `turso_cdc` in memory.
+/// - HIGH 2, TEMP: a whole-transaction rollback never restored the temp schema
+///   (`rollback_current_txn_state` rolled the temp pager back only): a TEMP CTAS that fails after
+///   its ParseSchema, in autocommit and inside BEGIN.
+/// - MED 3, MVCC: its transaction rollback restored the schema only on a version bump, which a
+///   failed CREATE TYPE (AddType before SetCookie) never made.
+/// Each case runs on its own database, and every failure is listed.
+#[test]
+fn a_failed_ddl_leaves_no_in_memory_schema_change_on_the_routes_the_first_fix_missed() {
+    use turso_parser::ast;
+    let _g = serial();
+    let mut failed: Vec<String> = Vec::new();
+    let rows = |c: &Arc<Connection>, sql: &str| format!("{:?}", c.prepare(sql).and_then(|mut s| s.run_collect_rows()));
+    // HIGH 1.
+    {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("cdc-nested.db"), DatabaseOpts::new());
+        let c = db.connect().unwrap();
+        c.execute("CREATE TABLE turso_cdc_version(a, b)").unwrap();
+        c.execute("BEGIN").unwrap();
+        let r = c.execute("PRAGMA unstable_capture_data_changes_conn('full')");
+        if r.is_ok() {
+            failed.push("HIGH 1 premise: the PRAGMA over a turso_cdc_version without its columns succeeded".to_string());
+        } else if c.schema.read().get_btree_table("turso_cdc").is_some() {
+            failed.push(format!("HIGH 1: after the failed PRAGMA ({r:?}) the in-memory schema holds turso_cdc"));
+        }
+        let _ = c.execute("ROLLBACK");
+    }
+    // HIGH 2, autocommit and inside BEGIN.
+    for explicit in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("temp-ctas.db"), DatabaseOpts::new());
+        let c = db.connect().unwrap();
+        c.execute("CREATE TEMP TABLE src(j)").unwrap();
+        c.execute("INSERT INTO src VALUES ('{')").unwrap();
+        if explicit {
+            c.execute("BEGIN").unwrap();
+            c.execute("CREATE TEMP TABLE a(x)").unwrap();
+        }
+        let r = c.execute("CREATE TEMP TABLE b AS SELECT json(j) FROM temp.src");
+        let case = if explicit { "HIGH 2 inside BEGIN" } else { "HIGH 2 autocommit" };
+        if r.is_ok() {
+            failed.push(format!("{case} premise: the CTAS over malformed JSON succeeded"));
+            continue;
+        }
+        let names = rows(&c, "SELECT name FROM temp.sqlite_schema ORDER BY name");
+        // FLAGGED, sharpened after its first run (red 5bced0bb6, green a66b4fba3): a failed read of
+        // the file's schema is itself a failure, never "not on the file".
+        if names.starts_with("Err") {
+            failed.push(format!("{case}: reading temp.sqlite_schema after the failed CTAS: {names}"));
+            let _ = c.execute("ROLLBACK");
+            continue;
+        }
+        // Inside BEGIN the failed statement may roll the whole transaction back (a too): whatever the
+        // file kept, the in-memory temp schema must say the same.
+        for t in ["a", "b"] {
+            let in_memory = c
+                .temp
+                .database
+                .read()
+                .as_ref()
+                .is_some_and(|tdb| tdb.db.schema.lock().get_btree_table(t).is_some());
+            let on_file = names.contains(&format!("value: \"{t}\""));
+            if in_memory != on_file {
+                failed.push(format!("{case}: temp table {t} in memory={in_memory}, in temp.sqlite_schema={on_file} ({names}) after {r:?}"));
+            }
+        }
+        let _ = c.execute("ROLLBACK");
+    }
+    // MED 3.
+    {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("mvcc-type.db"), DatabaseOpts::new().with_custom_types(true));
+        let c = db.connect().unwrap();
+        c.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        assert!(c.mvcc_enabled(), "premise: the database is in MVCC mode");
+        let (Some(mut cmd), _) =
+            crate::dialect::sqlite::parse("CREATE TYPE m(value text) BASE text ENCODE 'p' DECODE value").unwrap()
+        else {
+            panic!("fixture: no command")
+        };
+        let ast::Cmd::Stmt(ast::Stmt::CreateType { body: ast::CreateTypeBody::CustomType { encode: Some(e), .. }, .. }) = &mut cmd else {
+            panic!("fixture: not a CREATE TYPE with ENCODE")
+        };
+        **e = ast::Expr::Literal(ast::Literal::String("'a'b'".to_string()));
+        let r = c
+            .prepare_translated_cmd(cmd, "CREATE TYPE m(value text) BASE text ENCODE 'p' DECODE value")
+            .and_then(|mut s| s.run_ignore_rows());
+        if r.is_ok() {
+            failed.push("MED 3 premise: the fixture CREATE TYPE succeeded".to_string());
+        } else if c.schema.read().get_btree_table(crate::schema::TURSO_TYPES_TABLE_NAME).is_some() {
+            failed.push(format!("MED 3: after the failed CREATE TYPE under MVCC ({r:?}) the in-memory schema holds {}", crate::schema::TURSO_TYPES_TABLE_NAME));
+        }
+    }
+    assert!(failed.is_empty(), "CLAIM: a failed DDL left its in-memory schema change: {failed:#?}");
+}
+
+/// The fresh adversary of 3e4c0a12b^..d806241ea (review agent ad597da8d5542fa0b, read-only;
+/// schedules UNRUN until this red). Each case on its own database; every failure is listed.
+/// - HIGH 1: `CREATE TYPE "integer"` passed the built-in guard (it read the token, quotes kept)
+///   and type_key then registered `integer`, which every STRICT INTEGER column resolves to.
+/// - MED 2: `CREATE TYPE "Foo"; DROP TYPE foo` removed the registry entry but not the stored row
+///   (matched by the token), so the type came back at the next open.
+/// - MED 3: a STRUCT field typed `[a,b]` (the parser strips brackets) was stored as `a,b`.
+/// - MED 4: `BEGIN; switch the capture table; ROLLBACK` left capture on the rolled-back table.
+#[test]
+fn quoted_type_names_and_cdc_switches_hold_what_the_adversary_attacked() {
+    let mut failed: Vec<String> = Vec::new();
+    let opts = || DatabaseOpts::new().with_custom_types(true);
+    // HIGH 1.
+    {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("builtin.db"), opts());
+        let c = db.connect().unwrap();
+        for name in ["\"integer\"", "\"TEXT\"", "\"any\""] {
+            if c.execute(format!("CREATE TYPE {name}(value text) BASE text ENCODE 'x' DECODE value")).is_ok() {
+                failed.push(format!("HIGH 1: CREATE TYPE {name} was accepted: a built-in type's name"));
+            }
+        }
+        if c.execute("CREATE DOMAIN \"text\" AS integer CHECK (value > 0)").is_ok() {
+            failed.push("HIGH 1: CREATE DOMAIN \"text\" was accepted: a built-in type's name".to_string());
+        }
+    }
+    // MED 2.
+    {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("drop-type.db");
+        {
+            let db = open_at(&path, opts());
+            let c = db.connect().unwrap();
+            c.execute("CREATE TYPE \"Foo\"(value text) BASE text").unwrap();
+            if let Err(e) = c.execute("DROP TYPE foo") {
+                failed.push(format!("MED 2: DROP TYPE foo after CREATE TYPE \"Foo\": {e}"));
+            }
+        }
+        let db = open_at(&path, opts());
+        let c = db.connect().unwrap();
+        if c.schema.read().get_type_def_unchecked("foo").is_some() {
+            failed.push("MED 2: the dropped type foo is back after a reopen".to_string());
+        }
+    }
+    // MED 3.
+    {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("struct.db"), opts());
+        let c = db.connect().unwrap();
+        c.execute("CREATE TYPE \"a,b\"(value text) BASE text").unwrap();
+        if let Err(e) = c.execute("CREATE TYPE s AS STRUCT(f [a,b])") {
+            failed.push(format!("MED 3: CREATE TYPE s AS STRUCT(f [a,b]): {e}"));
+        }
+    }
+    // MED 4.
+    {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("cdc-rollback.db"), DatabaseOpts::new());
+        let c = db.connect().unwrap();
+        c.execute("CREATE TABLE t(x)").unwrap();
+        c.execute("PRAGMA capture_data_changes_conn('full,c1')").unwrap();
+        c.execute("BEGIN").unwrap();
+        c.execute("PRAGMA capture_data_changes_conn('full,c2')").unwrap();
+        c.execute("ROLLBACK").unwrap();
+        if let Err(e) = c.execute("INSERT INTO t VALUES (1)") {
+            failed.push(format!("MED 4: a write after BEGIN; switch to c2; ROLLBACK: {e}"));
+        }
+        match c.prepare("SELECT count(*) FROM c1 WHERE table_name = 't'").and_then(|mut s| s.run_collect_rows()) {
+            Ok(r) if r[0][0].to_string() == "1" => {}
+            other => failed.push(format!("MED 4: after the rolled-back switch, c1 holds {other:?} changes of t, want 1")),
+        }
+    }
+    assert!(failed.is_empty(), "CLAIM: quoted type names or a rolled-back CDC switch broke: {failed:#?}");
+}
+
+/// Dialect code review MED-2: the replay kind's name check (`translate::replayed_own_row`) is
+/// guarded. A replayed table row whose name is not its CREATE's name must be refused at prepare, and
+/// the matching row must prepare (positive control). Deleting the check made no test fail before;
+/// this one does (mutant run on ecetesla2, banked with this commit's report).
+#[test]
+fn a_replayed_row_whose_name_is_not_its_creates_name_is_refused() {
+    use crate::vdbe::vacuum::{SchemaEntry, SchemaEntryType};
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("replay-name.db"), DatabaseOpts::new());
+    let c = db.connect().unwrap();
+    let entry = |name: &str| SchemaEntry {
+        entry_type: SchemaEntryType::Table,
+        name: name.to_string(),
+        tbl_name: name.to_string(),
+        rootpage: 2,
+        sql: "CREATE TABLE b(x)".to_string(),
+    };
+    let matching = c.prepare_replay(&entry("b"), crate::connection::Origin::Root);
+    assert!(matching.is_ok(), "premise (positive control): a replayed row named as its CREATE did not prepare: {:?}", matching.err());
+    match c.prepare_replay(&entry("a"), crate::connection::Origin::Root) {
+        Err(e) if e.to_string().contains("a replayed CREATE names") => {}
+        other => panic!("CLAIM: a replayed row named a whose CREATE names b was not refused by the name check: {:?}", other.map(|_| ())),
+    }
+}
+
+/// Dialect code review MED-3: a materialized view compiles its expressions through the database's
+/// dialect, as a plain view does. `incremental/expr_compiler.rs` built its resolver with
+/// `SqliteDialect`, so `CREATE MATERIALIZED VIEW .. AS SELECT dfn(x) ..` failed "no such function:
+/// dfn" under a dialect whose `dfn` is abs (not a regression: the base gives the same). Control: the
+/// plain view with the same expression.
+#[test]
+fn a_materialized_view_resolves_functions_through_the_database_s_dialect() {
+    use crate::dialect::sqlite;
+    use crate::schema::BTreeTable;
+    struct MvDfnDialect;
+    impl crate::Dialect for MvDfnDialect {
+        fn name(&self) -> &'static str {
+            "mvdfn"
+        }
+        fn owns_stored_table_sql(&self, _sql: &str) -> bool {
+            false
+        }
+        fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
+            sqlite::parse(sql)
+        }
+        fn parse_table_sql(&self, sql: &str, root_page: i64) -> crate::Result<BTreeTable> {
+            BTreeTable::from_sql(sql, root_page)
+        }
+        fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<turso_parser::ast::Stmt> {
+            sqlite::parse_table_sql_ast(sql)
+        }
+        fn table_sql_for_replay_stored(&self, sql: &str) -> crate::Result<crate::connection::StoredSql> {
+            Ok(crate::connection::StoredSql::sqlite(self.table_sql_for_replay(sql)?))
+        }
+        fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
+            sqlite::table_sql_for_replay(sql)
+        }
+        fn format_table_sql(
+            &self,
+            input: &str,
+            _t: &turso_parser::ast::QualifiedName,
+            _b: &turso_parser::ast::CreateTableBody,
+        ) -> crate::Result<String> {
+            Ok(input.to_string())
+        }
+        fn resolve_function(&self, name: &str, arg_count: usize) -> crate::Result<Option<crate::function::Func>> {
+            if name.eq_ignore_ascii_case("dfn") {
+                return sqlite::resolve_builtin_function("abs", arg_count);
+            }
+            sqlite::resolve_builtin_function(name, arg_count)
+        }
+        fn register_catalog(&self, schema: &mut crate::schema::Schema, e: bool) -> crate::Result<()> {
+            sqlite::register_builtin_catalog(schema, e)
+        }
+    }
+    let dir = tempfile::TempDir::new().unwrap();
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let db = Database::open_file_with_flags(
+        io,
+        dir.path().join("mv-dfn.db").to_str().unwrap(),
+        OpenFlags::Create,
+        DatabaseOpts::new().with_views(true),
+        None,
+        Arc::new(MvDfnDialect),
+    )
+    .unwrap();
+    let c = db.connect().unwrap();
+    c.execute("CREATE TABLE t(x INTEGER)").unwrap();
+    c.execute("INSERT INTO t VALUES (-3)").unwrap();
+    let rows = |sql: &str| c.prepare(sql).and_then(|mut s| s.run_collect_rows()).map(|r| format!("{r:?}"));
+    c.execute("CREATE VIEW v AS SELECT dfn(x) AS a FROM t").expect("premise (control): a plain view with dfn");
+    let control = rows("SELECT a FROM v");
+    assert!(control.as_ref().is_ok_and(|r| r.contains("Integer(3)")), "premise (control): the plain view reads abs(-3): {control:?}");
+    let made = c.execute("CREATE MATERIALIZED VIEW mv AS SELECT dfn(x) AS a FROM t");
+    let read = made.as_ref().map_err(|e| e.to_string()).and_then(|()| rows("SELECT a FROM mv").map_err(|e| e.to_string()));
+    assert!(
+        read.as_ref().is_ok_and(|r| r.contains("Integer(3)")),
+        "CLAIM: a materialized view did not resolve dfn through the database's dialect: create {made:?}, read {read:?}"
+    );
+}
+
+/// fastest-wire (CREATE SCHEMA "MixedCase" lists as mixedcase): an attached database's name is kept as
+/// written, as SQLite keeps it, and matched case-insensitively. translate/attach.rs folded it with
+/// normalize_ident, so `PRAGMA database_list` (and every list built from the catalog) showed
+/// `mixedcase`. Lookups by any case, and a DETACH by another case, must still work. Every failure is
+/// listed.
+#[test]
+fn an_attached_database_keeps_its_name_as_written() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("m.db"), DatabaseOpts::new().with_attach(true));
+    let c = db.connect().unwrap();
+    let mut failed: Vec<String> = Vec::new();
+    c.execute(format!("ATTACH '{}' AS \"MixedCase\"", dir.path().join("s.db").display())).unwrap();
+    let names = c.prepare("PRAGMA database_list").and_then(|mut s| s.run_collect_rows()).map(|r| format!("{r:?}"));
+    if !names.as_ref().is_ok_and(|n| n.contains("\"MixedCase\"")) {
+        failed.push(format!("PRAGMA database_list = {names:?}, want MixedCase as written"));
+    }
+    if !c.list_attached_databases().iter().any(|n| n == "MixedCase") {
+        failed.push(format!("list_attached_databases = {:?}, want MixedCase", c.list_attached_databases()));
+    }
+    for sql in ["CREATE TABLE mixedcase.t(x)", "INSERT INTO \"MIXEDCASE\".t VALUES (1)", "SELECT x FROM MixedCase.t"] {
+        if let Err(e) = c.execute(sql) {
+            failed.push(format!("{sql}: {e}"));
+        }
+    }
+    if let Err(e) = c.execute("DETACH mixedCASE") {
+        failed.push(format!("DETACH mixedCASE: {e}"));
+    }
+    assert!(failed.is_empty(), "CLAIM: an attached database's name was not kept as written and matched in any case: {failed:#?}");
+}
+
+/// Found by the LOW red at the tip and probe engine-probe-mv-1 (ecetesla2): a materialized view over
+/// a table whose name needs quotes is populated but never maintained by INSERT, and one over a
+/// mixed-case table is not even populated. INSERT keyed its view delta by the Name's display (the
+/// quoted `"s p"`), where UPDATE and DELETE use the table's own name and the view's input is named
+/// as its SELECT wrote it. Each table: insert, view, insert, update; the view must follow. Every
+/// failure is listed.
+#[test]
+fn a_materialized_view_follows_writes_to_a_table_whose_name_needs_quotes_or_case() {
+    let mut failed: Vec<String> = Vec::new();
+    for (i, (create, view_ref)) in [
+        ("\"s p\"", "\"s p\""),
+        ("\"m\"\"t\"", "\"m\"\"t\""),
+        ("\"Mixed\"", "\"Mixed\""),
+        ("Upper", "upper"),
+        ("plain", "plain"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("mv.db"), DatabaseOpts::new().with_views(true));
+        let c = db.connect().unwrap();
+        let read = |c: &Arc<Connection>| -> Result<Vec<String>, String> {
+            let mut v: Vec<String> = c
+                .prepare(format!("SELECT a FROM mv{i}"))
+                .and_then(|mut s| s.run_collect_rows())
+                .map_err(|e| e.to_string())?
+                .iter()
+                .map(|r| r[0].to_string())
+                .collect();
+            v.sort();
+            Ok(v)
+        };
+        let step = |sql: String| c.execute(&sql).map_err(|e| format!("{sql}: {e}"));
+        let r = step(format!("CREATE TABLE {create}(a INTEGER)"))
+            .and_then(|()| step(format!("INSERT INTO {create} VALUES (1)")))
+            .and_then(|()| step(format!("CREATE MATERIALIZED VIEW mv{i} AS SELECT a FROM {view_ref}")));
+        if let Err(e) = r {
+            failed.push(format!("{create}: {e}"));
+            continue;
+        }
+        match read(&c) {
+            Ok(v) if v == ["1"] => {}
+            other => failed.push(format!("{create}: populated view = {other:?}, want [1]")),
+        }
+        if let Err(e) = step(format!("INSERT INTO {view_ref} VALUES (2)")) {
+            failed.push(format!("{create}: {e}"));
+            continue;
+        }
+        match read(&c) {
+            Ok(v) if v == ["1", "2"] => {}
+            other => failed.push(format!("{create}: after INSERT the view = {other:?}, want [1, 2]")),
+        }
+        if let Err(e) = step(format!("UPDATE {create} SET a = 5 WHERE a = 1")) {
+            failed.push(format!("{create}: {e}"));
+            continue;
+        }
+        match read(&c) {
+            Ok(v) if v == ["2", "5"] => {}
+            other => failed.push(format!("{create}: after UPDATE the view = {other:?}, want [2, 5]")),
+        }
+    }
+    assert!(failed.is_empty(), "CLAIM: a materialized view did not follow its table: {failed:#?}");
+}
+
+/// The read-only quoting sweep of 4a97c9c36 (artie reviews/QUOTE-SWEEP-4a97c9c36.txt; lead order: one
+/// class, identifier and literal emission), its items reproduced. Each case on its own database, with a
+/// reopen where the claim is about the stored row; every failure is listed.
+/// - F4: RENAME COLUMN's view rewrite put the view's name into `WHERE name = '{view}'` unescaped: a view
+///   `v' OR 1 OR '` rewrote every sqlite_schema row.
+/// - F1: BTreeTable::to_sql printed table-level PRIMARY KEY and FOREIGN KEY names bare, so ALTER ADD/DROP
+///   COLUMN stored a row that does not reparse.
+/// - F2: Name::as_ident left a digit-leading name bare: RENAME TO "1t" stored an unparseable row, RENAME
+///   COLUMN to "123" turned CHECK(a > 0) into CHECK(123 > 0).
+/// - F6: true and false were printed bare: RENAME COLUMN a TO "true" made a view return 1 and a CHECK a
+///   constant.
+/// - F5: json_object(*)'s keys were wrapped in quotes unescaped, then un-doubled: a column a''b gave a'b.
+#[test]
+fn engine_built_sql_quotes_identifiers_and_escapes_literals_everywhere() {
+    let mut failed: Vec<String> = Vec::new();
+    fn steps(c: &Arc<Connection>, case: &str, sqls: &[&str], failed: &mut Vec<String>) -> bool {
+        for sql in sqls {
+            if let Err(e) = c.execute(sql) {
+                failed.push(format!("{case}: {sql}: {e}"));
+                return false;
+            }
+        }
+        true
+    }
+    fn rows(c: &Arc<Connection>, sql: &str) -> Result<Vec<Vec<String>>, String> {
+        c.prepare(sql)
+            .and_then(|mut s| s.run_collect_rows())
+            .map(|r| r.iter().map(|row| row.iter().map(|v| v.to_string()).collect()).collect())
+            .map_err(|e| e.to_string())
+    }
+    // FLAGGED fixture repair after its first run (145f76f07): a reopen that the stored rows refuse is a
+    // listed failure, not a panic that hides the cases after it.
+    let reopen = |path: &std::path::Path, case: &str, failed: &mut Vec<String>| match try_open_at(path, DatabaseOpts::new()) {
+        Ok(db) => Some(db.connect().unwrap()),
+        Err(e) => {
+            failed.push(format!("{case}: the reopen was refused: {e}"));
+            None
+        }
+    };
+    let fresh = |name: &str| {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join(format!("{name}.db"));
+        (dir, path)
+    };
+    // F4
+    {
+        let (_d, path) = fresh("f4");
+        {
+            let c = open_at(&path, DatabaseOpts::new()).connect().unwrap();
+            if steps(&c, "F4", &[
+                "CREATE TABLE t(a)",
+                "CREATE TABLE other(z)",
+                "CREATE VIEW \"v' OR 1 OR '\" AS SELECT a FROM t",
+                "CREATE VIEW \"it's\" AS SELECT a FROM t",
+                "ALTER TABLE t RENAME COLUMN a TO b",
+            ], &mut failed) {
+                match rows(&c, "SELECT sql FROM sqlite_schema WHERE name = 'other'") {
+                    Ok(r) if r.len() == 1 && r[0][0].contains("other") && !r[0][0].contains("VIEW") => {}
+                    other => failed.push(format!("F4: other's row after the rename = {other:?}")),
+                }
+            }
+        }
+        if let Some(c) = reopen(&path, "F4", &mut failed) {
+            if let Err(e) = rows(&c, "SELECT z FROM other") {
+                failed.push(format!("F4: after a reopen, other: {e}"));
+            }
+        }
+    }
+    // F1
+    {
+        let (_d, path) = fresh("f1");
+        let ok = {
+            let c = open_at(&path, DatabaseOpts::new()).connect().unwrap();
+            steps(&c, "F1", &[
+                "CREATE TABLE t(\"a b\", c, d, PRIMARY KEY(\"a b\", c))",
+                "ALTER TABLE t DROP COLUMN d",
+                "CREATE TABLE \"my p\"(\"my id\" INTEGER PRIMARY KEY)",
+                "CREATE TABLE ch(x, y, FOREIGN KEY(x) REFERENCES \"my p\"(\"my id\"))",
+                "ALTER TABLE ch ADD COLUMN z",
+                "CREATE TABLE k(\"order\", x, PRIMARY KEY(\"order\", x))",
+                "ALTER TABLE k ADD COLUMN w",
+            ], &mut failed)
+        };
+        if let Some(c) = ok.then(|| reopen(&path, "F1", &mut failed)).flatten() {
+            for sql in ["INSERT INTO t VALUES (1, 2)", "INSERT INTO ch VALUES (1, 2, 3)", "INSERT INTO k VALUES (1, 2, 3)"] {
+                if let Err(e) = c.execute(sql) {
+                    failed.push(format!("F1: after a reopen, {sql}: {e}"));
+                }
+            }
+        }
+    }
+    // F2
+    {
+        let (_d, path) = fresh("f2");
+        let ok = {
+            let c = open_at(&path, DatabaseOpts::new()).connect().unwrap();
+            steps(&c, "F2", &[
+                "CREATE TABLE t2(x)",
+                "ALTER TABLE t2 RENAME TO \"1t\"",
+                "CREATE TABLE t3(a CHECK (a > 0))",
+                "ALTER TABLE t3 RENAME COLUMN a TO \"123\"",
+            ], &mut failed)
+        };
+        if let Some(c) = ok.then(|| reopen(&path, "F2", &mut failed)).flatten() {
+            if let Err(e) = rows(&c, "SELECT x FROM \"1t\"") {
+                failed.push(format!("F2: after a reopen, \"1t\": {e}"));
+            }
+            if c.execute("INSERT INTO t3 VALUES (-1)").is_ok() {
+                failed.push("F2: after RENAME COLUMN a TO \"123\", CHECK (a > 0) let -1 in".to_string());
+            }
+        }
+    }
+    // F6
+    {
+        let (_d, path) = fresh("f6");
+        let ok = {
+            let c = open_at(&path, DatabaseOpts::new()).connect().unwrap();
+            let ok = steps(&c, "F6", &[
+                "CREATE TABLE t4(a CHECK (a > 0))",
+                "CREATE VIEW v4 AS SELECT a FROM t4",
+                "INSERT INTO t4 VALUES (5)",
+                "ALTER TABLE t4 RENAME COLUMN a TO \"true\"",
+                "CREATE TABLE u(\"true\", b, UNIQUE(\"true\", b))",
+                "ALTER TABLE u ADD COLUMN c",
+            ], &mut failed);
+            if ok {
+                match rows(&c, "SELECT * FROM v4") {
+                    Ok(r) if r == [["5".to_string()]] => {}
+                    other => failed.push(format!("F6: the view over the renamed column = {other:?}, want [[5]]")),
+                }
+                if c.execute("INSERT INTO t4 VALUES (-1)").is_ok() {
+                    failed.push("F6: after RENAME COLUMN a TO \"true\", CHECK (a > 0) let -1 in".to_string());
+                }
+            }
+            ok
+        };
+        if let Some(c) = ok.then(|| reopen(&path, "F6", &mut failed)).flatten() {
+            if let Err(e) = c.execute("INSERT INTO u VALUES (1, 2, 3)") {
+                failed.push(format!("F6: after a reopen, u: {e}"));
+            }
+        }
+    }
+    // F5
+    {
+        let (_d, path) = fresh("f5");
+        let c = open_at(&path, DatabaseOpts::new()).connect().unwrap();
+        if steps(&c, "F5", &["CREATE TABLE j(\"a''b\" INTEGER)", "INSERT INTO j VALUES (1)"], &mut failed) {
+            match rows(&c, "SELECT json_object(*) FROM j") {
+                Ok(r) if r.len() == 1 && r[0][0] == "{\"a''b\":1}" => {}
+                other => failed.push(format!("F5: json_object(*) over a column a''b = {other:?}, want {{\"a''b\":1}}")),
+            }
+        }
+    }
+    assert!(failed.is_empty(), "CLAIM: engine-built SQL emitted an identifier or a literal unquoted: {failed:#?}");
+}
+
+/// The sweep's F3 (adjacent: name shadowing): a table with an ordinary column named rowid. The branch
+/// merge addressed rows by the bare word rowid (merge.rs), which there names that column, so its UPDATE
+/// and DELETE hit the rows whose rowid COLUMN equals the key; a materialized view's populate read
+/// `*, rowid` (view.rs). A branch updates one row and deletes another; the merge must change exactly
+/// those. And a materialized view over the table must hold every row. Every failure is listed.
+#[test]
+fn a_table_with_a_column_named_rowid_is_merged_and_viewed_by_its_real_rowid() {
+    use super::merge::{MergePolicy, Merger, Validation};
+    let mut failed: Vec<String> = Vec::new();
+    {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(
+            &dir.path().join("m.db"),
+            DatabaseOpts::new().with_branch_durability(BranchDurability::Catalog { sync: SyncClass::Off }),
+        );
+        let trunk = db.connect().unwrap();
+        trunk.execute("CREATE TABLE t(rowid TEXT, v INTEGER)").unwrap();
+        // Real rowids 1..=3; the column named rowid holds '2', '3', '1', so the two disagree on every row.
+        for (col, v) in [("2", 10), ("3", 20), ("1", 30)] {
+            trunk.execute(format!("INSERT INTO t VALUES ('{col}', {v})")).unwrap();
+        }
+        let b = trunk.fork_branch().unwrap();
+        {
+            let bc = b.connect().unwrap();
+            bc.execute("UPDATE t SET v = 11 WHERE _rowid_ = 1").unwrap();
+            bc.execute("DELETE FROM t WHERE _rowid_ = 3").unwrap();
+        }
+        let b_id = b.into_id();
+        let mut merger = Merger::new(trunk.clone()).unwrap();
+        let out = merger.merge(db.branch(b_id).unwrap(), MergePolicy { validation: Validation::BaseRead, keep_merged: false });
+        if let Err(e) = &out {
+            failed.push(format!("merge: {e}"));
+        }
+        let got: Vec<(String, String, String)> = trunk
+            .prepare("SELECT _rowid_, rowid, v FROM t ORDER BY _rowid_")
+            .and_then(|mut s| s.run_collect_rows())
+            .map(|r| r.iter().map(|row| (row[0].to_string(), row[1].to_string(), row[2].to_string())).collect())
+            .unwrap_or_default();
+        let want = vec![("1".into(), "2".into(), "11".into()), ("2".into(), "3".into(), "20".into())];
+        if got != want {
+            failed.push(format!("merge: trunk (real rowid, rowid column, v) = {got:?}, want {want:?}"));
+        }
+    }
+    {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("v.db"), DatabaseOpts::new().with_views(true));
+        let c = db.connect().unwrap();
+        for sql in [
+            "CREATE TABLE r(rowid TEXT, v INTEGER)",
+            "INSERT INTO r VALUES ('x', 1)",
+            "INSERT INTO r VALUES ('x', 2)",
+            "CREATE MATERIALIZED VIEW mvr AS SELECT v FROM r",
+        ] {
+            if let Err(e) = c.execute(sql) {
+                failed.push(format!("view: {sql}: {e}"));
+            }
+        }
+        match c.prepare("SELECT v FROM mvr ORDER BY v").and_then(|mut s| s.run_collect_rows()) {
+            Ok(r) if r.iter().map(|row| row[0].to_string()).collect::<Vec<_>>() == ["1", "2"] => {}
+            other => failed.push(format!("view: mvr = {other:?}, want [1, 2]")),
+        }
+    }
+    assert!(failed.is_empty(), "CLAIM: a column named rowid shadowed the real rowid: {failed:#?}");
+}
+
+// ===== The queue a-f adversary's tests (engine-rev-queue-af, artie reviews/engine-queue-af-tests/), verbatim: the lead's order uses them as reds =====
+
+// ===== ADVERSARY (queue a-f review, 2026-10-18): routes of the failed-DDL class =====
+
+fn adv_failing_create_type(c: &Arc<Connection>) -> crate::Result<()> {
+    use turso_parser::ast;
+    let (Some(mut cmd), _) =
+        crate::dialect::sqlite::parse("CREATE TYPE m(value text) BASE text ENCODE 'p' DECODE value").unwrap()
+    else {
+        panic!("fixture: no command")
+    };
+    let ast::Cmd::Stmt(ast::Stmt::CreateType { body: ast::CreateTypeBody::CustomType { encode: Some(e), .. }, .. }) = &mut cmd else {
+        panic!("fixture: not a CREATE TYPE with ENCODE")
+    };
+    **e = ast::Expr::Literal(ast::Literal::String("'a'b'".to_string()));
+    c.prepare_translated_cmd(cmd, "CREATE TYPE m(value text) BASE text ENCODE 'p' DECODE value")
+        .and_then(|mut s| s.run_ignore_rows())
+}
+
+fn adv_rows(c: &Arc<Connection>, sql: &str) -> crate::Result<Vec<Vec<String>>> {
+    c.prepare(sql)
+        .and_then(|mut s| s.run_collect_rows())
+        .map(|r| r.into_iter().map(|row| row.into_iter().map(|v| v.to_string()).collect()).collect())
+}
+
+/// Every (kind, name, root) the connection's in-memory schema for `db_id` holds that its
+/// `<schema>.sqlite_schema` does not, and the reverse.
+fn adv_divergence(c: &Arc<Connection>, db_id: usize, schema_name: &str) -> Vec<String> {
+    let mut mem: std::collections::BTreeSet<(String, String, i64)> = Default::default();
+    c.with_schema(db_id, |s| {
+        for (name, t) in &s.tables {
+            if let crate::schema::Table::BTree(b) = t.as_ref() {
+                if b.root_page > 0 && !name.eq_ignore_ascii_case("sqlite_schema") && !name.eq_ignore_ascii_case("sqlite_temp_schema") {
+                    mem.insert(("table".into(), b.name.to_lowercase(), b.root_page));
+                }
+            }
+        }
+        for v in s.indexes.values() {
+            for i in v {
+                if i.root_page > 0 && !i.ephemeral {
+                    mem.insert(("index".into(), i.name.to_lowercase(), i.root_page));
+                }
+            }
+        }
+    });
+    let disk: std::collections::BTreeSet<(String, String, i64)> =
+        match adv_rows(c, &format!("SELECT type, name, rootpage FROM {schema_name}.sqlite_schema WHERE rootpage > 0 AND type IN ('table','index')")) {
+            Ok(r) => r.into_iter().map(|r| (r[0].clone(), r[1].to_lowercase(), r[2].parse().unwrap())).collect(),
+            Err(e) => return vec![format!("reading {schema_name}.sqlite_schema: {e}")],
+        };
+    let mut out = Vec::new();
+    for m in mem.difference(&disk) {
+        out.push(format!("in memory only: {m:?}"));
+    }
+    for d in disk.difference(&mem) {
+        out.push(format!("on file only: {d:?}"));
+    }
+    out
+}
+
+/// ADV-1: the red's sequence on a NAMED BRANCH connection (the fork's own pager, whose rollback
+/// restores the schema from the branch store).
+#[test]
+fn adv_a_failed_ddl_on_a_branch_leaves_no_in_memory_schema_change() {
+    let _g = serial();
+    let mut failed: Vec<String> = Vec::new();
+    for catalog in [false, true] {
+        for explicit in [false, true] {
+            let case = format!("catalog={catalog} {}", if explicit { "inside BEGIN" } else { "autocommit" });
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("br.db");
+            let o = || opts(catalog, SyncClass::Fsync).with_custom_types(true);
+            {
+                let db = open_at(&path, o());
+                let trunk = db.connect().unwrap();
+                trunk.execute("CREATE TABLE a(x)").unwrap();
+                trunk.create_branch("b").unwrap();
+                let c = db.connect_named("b").unwrap();
+                if explicit {
+                    c.execute("BEGIN").unwrap();
+                }
+                let r = adv_failing_create_type(&c);
+                if r.is_ok() {
+                    panic!("premise ({case}): the fixture CREATE TYPE must fail");
+                }
+                if c.schema.read().get_btree_table(crate::schema::TURSO_TYPES_TABLE_NAME).is_some() {
+                    failed.push(format!("{case}: after the failed CREATE TYPE ({r:?}) the branch's in-memory schema holds the types table"));
+                }
+                for d in adv_divergence(&c, crate::MAIN_DB_ID, "main") {
+                    failed.push(format!("{case}: after the failure: {d}"));
+                }
+                for sql in ["CREATE TABLE u(y)", "INSERT INTO u VALUES (1)", "CREATE TYPE m3(value text) BASE text"] {
+                    if let Err(e) = c.execute(sql) {
+                        failed.push(format!("{case}: {sql}: {e}"));
+                    }
+                }
+                if explicit {
+                    if let Err(e) = c.execute("COMMIT") {
+                        failed.push(format!("{case}: COMMIT: {e}"));
+                    }
+                }
+                for d in adv_divergence(&c, crate::MAIN_DB_ID, "main") {
+                    failed.push(format!("{case}: after the commit: {d}"));
+                }
+                match adv_rows(&c, "PRAGMA integrity_check") {
+                    Ok(r) if r.len() == 1 && r[0][0] == "ok" => {}
+                    other => failed.push(format!("{case}: integrity_check on the branch: {other:?}")),
+                }
+            }
+            let db = open_at(&path, o());
+            let c = db.connect_named("b").unwrap();
+            let u = adv_rows(&c, "SELECT * FROM u");
+            if !matches!(&u, Ok(r) if r.len() == 1 && r[0] == vec!["1".to_string()]) {
+                failed.push(format!("{case}: after the reopen the branch's `SELECT * FROM u` = {u:?}, want [[1]]"));
+            }
+            let a = adv_rows(&c, "SELECT count(*) FROM a");
+            if !matches!(&a, Ok(r) if r[0][0] == "0") {
+                failed.push(format!("{case}: after the reopen the branch's `SELECT count(*) FROM a` = {a:?}"));
+            }
+        }
+    }
+    assert!(failed.is_empty(), "CLAIM: a failed DDL on a branch left an in-memory schema change: {failed:#?}");
+}
+
+/// ADV-2: an ATTACHED database's CTAS that fails after its ParseSchema, in autocommit and inside
+/// BEGIN; then the attached file must hold what its in-memory schema says.
+#[test]
+fn adv_a_failed_attached_ctas_leaves_no_in_memory_schema_change() {
+    let _g = serial();
+    let mut failed: Vec<String> = Vec::new();
+    for explicit in [false, true] {
+        let case = if explicit { "inside BEGIN" } else { "autocommit" };
+        let dir = tempfile::TempDir::new().unwrap();
+        let main = dir.path().join("m.db");
+        let aux = dir.path().join("aux.db");
+        {
+            let db = open_at(&main, DatabaseOpts::new().with_attach(true));
+            let c = db.connect().unwrap();
+            c.execute(format!("ATTACH '{}' AS aux", aux.display())).unwrap();
+            c.execute("CREATE TABLE aux.src(j)").unwrap();
+            c.execute("INSERT INTO aux.src VALUES ('{')").unwrap();
+            if explicit {
+                c.execute("BEGIN").unwrap();
+                c.execute("CREATE TABLE aux.a(x)").unwrap();
+            }
+            let r = c.execute("CREATE TABLE aux.b AS SELECT json(j) FROM aux.src");
+            if r.is_ok() {
+                panic!("premise ({case}): the CTAS over malformed JSON must fail");
+            }
+            let id = c.get_database_id_by_name("aux").unwrap();
+            for d in adv_divergence(&c, id, "aux") {
+                failed.push(format!("{case}: after the failed CTAS ({r:?}): {d}"));
+            }
+            for sql in ["CREATE TABLE aux.u(y)", "INSERT INTO aux.u VALUES (1)", "CREATE TABLE aux.w(z)", "INSERT INTO aux.w VALUES (2)"] {
+                if let Err(e) = c.execute(sql) {
+                    failed.push(format!("{case}: {sql}: {e}"));
+                }
+            }
+            if explicit {
+                let _ = c.execute("COMMIT").map_err(|e| failed.push(format!("{case}: COMMIT: {e}")));
+            }
+            for d in adv_divergence(&c, id, "aux") {
+                failed.push(format!("{case}: after the commit: {d}"));
+            }
+        }
+        let db = open_at(&aux, DatabaseOpts::new());
+        let c = db.connect().unwrap();
+        for (sql, want) in [("SELECT * FROM u", "1"), ("SELECT * FROM w", "2")] {
+            let r = adv_rows(&c, sql);
+            if !matches!(&r, Ok(r) if r.len() == 1 && r[0] == vec![want.to_string()]) {
+                failed.push(format!("{case}: after the reopen of aux `{sql}` = {r:?}"));
+            }
+        }
+        match adv_rows(&c, "PRAGMA integrity_check") {
+            Ok(r) if r.len() == 1 && r[0][0] == "ok" => {}
+            other => failed.push(format!("{case}: integrity_check of aux: {other:?}")),
+        }
+    }
+    assert!(failed.is_empty(), "CLAIM: a failed attached DDL left an in-memory schema change: {failed:#?}");
+}
+
+/// ADV-3: other DDL failing at run time (unique index over duplicates, ADD COLUMN whose CHECK
+/// fails on an existing row, DROP TABLE of an FK parent with a child row), each in autocommit,
+/// inside BEGIN and inside a SAVEPOINT with no BEGIN; then the file must hold what memory says.
+#[test]
+fn adv_other_failed_ddl_leaves_no_in_memory_schema_change() {
+    let _g = serial();
+    let mut failed: Vec<String> = Vec::new();
+    let setups: [(&str, &[&str], &str); 4] = [
+        ("unique index", &["CREATE TABLE a(x)", "INSERT INTO a VALUES (1), (1)"], "CREATE UNIQUE INDEX ia ON a(x)"),
+        ("add column check", &["CREATE TABLE a(x)", "INSERT INTO a VALUES (1)"], "ALTER TABLE a ADD COLUMN c INTEGER CHECK (c IS NOT NULL)"),
+        ("drop fk parent", &["PRAGMA foreign_keys = ON", "CREATE TABLE a(id INTEGER PRIMARY KEY)", "CREATE TABLE ch(pid REFERENCES a(id))", "INSERT INTO a VALUES (1)", "INSERT INTO ch VALUES (1)"], "DROP TABLE a"),
+        ("ctas", &["CREATE TABLE a(j)", "INSERT INTO a VALUES ('{')"], "CREATE TABLE b AS SELECT json(j) FROM a"),
+    ];
+    for (what, setup, ddl) in setups {
+        for mode in ["autocommit", "BEGIN", "SAVEPOINT"] {
+            let case = format!("{what} / {mode}");
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("o.db");
+            {
+                let db = open_at(&path, DatabaseOpts::new());
+                let c = db.connect().unwrap();
+                for s in setup {
+                    c.execute(*s).unwrap();
+                }
+                match mode {
+                    "BEGIN" => c.execute("BEGIN").unwrap(),
+                    "SAVEPOINT" => c.execute("SAVEPOINT s").unwrap(),
+                    _ => {}
+                }
+                let r = c.execute(ddl);
+                if r.is_ok() {
+                    failed.push(format!("{case}: premise: `{ddl}` succeeded"));
+                    continue;
+                }
+                for d in adv_divergence(&c, crate::MAIN_DB_ID, "main") {
+                    failed.push(format!("{case}: after the failure ({r:?}): {d}"));
+                }
+                if what == "add column check" {
+                    let cols = c.schema.read().get_btree_table("a").map(|t| t.columns().len());
+                    let sql = adv_rows(&c, "SELECT sql FROM sqlite_schema WHERE name = 'a'");
+                    if cols != Some(1) {
+                        failed.push(format!("{case}: after the failed ADD COLUMN the in-memory a has {cols:?} columns, file sql {sql:?}"));
+                    }
+                }
+                for sql in ["CREATE TABLE u(y)", "INSERT INTO u VALUES (1)", "CREATE TABLE w(z)", "INSERT INTO w VALUES (2)"] {
+                    if let Err(e) = c.execute(sql) {
+                        failed.push(format!("{case}: {sql}: {e}"));
+                    }
+                }
+                match mode {
+                    "BEGIN" => {
+                        let _ = c.execute("COMMIT").map_err(|e| failed.push(format!("{case}: COMMIT: {e}")));
+                    }
+                    "SAVEPOINT" => {
+                        let _ = c.execute("RELEASE s").map_err(|e| failed.push(format!("{case}: RELEASE: {e}")));
+                    }
+                    _ => {}
+                }
+                for d in adv_divergence(&c, crate::MAIN_DB_ID, "main") {
+                    failed.push(format!("{case}: after the commit: {d}"));
+                }
+            }
+            let db = open_at(&path, DatabaseOpts::new());
+            let c = db.connect().unwrap();
+            for (sql, want) in [("SELECT * FROM u", "1"), ("SELECT * FROM w", "2")] {
+                let r = adv_rows(&c, sql);
+                if !matches!(&r, Ok(r) if r.len() == 1 && r[0] == vec![want.to_string()]) {
+                    failed.push(format!("{case}: after the reopen `{sql}` = {r:?}"));
+                }
+            }
+            match adv_rows(&c, "PRAGMA integrity_check") {
+                Ok(r) if r.len() == 1 && r[0][0] == "ok" => {}
+                other => failed.push(format!("{case}: integrity_check: {other:?}")),
+            }
+        }
+    }
+    assert!(failed.is_empty(), "CLAIM: a failed DDL left an in-memory schema change: {failed:#?}");
+}
+
+/// ADV-4: a failed CREATE TYPE inside SAVEPOINT s (no BEGIN), then ROLLBACK TO s, then more DDL and
+/// RELEASE; and the same with a DROP TABLE that commits in between.
+#[test]
+fn adv_a_failed_create_type_under_a_named_savepoint() {
+    let _g = serial();
+    let mut failed: Vec<String> = Vec::new();
+    for rollback_to in [false, true] {
+        let case = if rollback_to { "ROLLBACK TO s" } else { "no ROLLBACK TO" };
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("sp.db");
+        let o = || DatabaseOpts::new().with_custom_types(true);
+        {
+            let db = open_at(&path, o());
+            let c = db.connect().unwrap();
+            c.execute("CREATE TABLE a(x)").unwrap();
+            c.execute("SAVEPOINT s").unwrap();
+            c.execute("CREATE TABLE p(q)").unwrap();
+            let r = adv_failing_create_type(&c);
+            assert!(r.is_err(), "premise: the fixture CREATE TYPE fails");
+            if rollback_to {
+                let _ = c.execute("ROLLBACK TO s").map_err(|e| failed.push(format!("{case}: ROLLBACK TO: {e}")));
+            }
+            for d in adv_divergence(&c, crate::MAIN_DB_ID, "main") {
+                failed.push(format!("{case}: after the failure: {d}"));
+            }
+            for sql in ["CREATE TABLE u(y)", "INSERT INTO u VALUES (1)", "CREATE TYPE m3(value text) BASE text", "RELEASE s"] {
+                if let Err(e) = c.execute(sql) {
+                    failed.push(format!("{case}: {sql}: {e}"));
+                }
+            }
+            for d in adv_divergence(&c, crate::MAIN_DB_ID, "main") {
+                failed.push(format!("{case}: after RELEASE: {d}"));
+            }
+        }
+        let db = open_at(&path, o());
+        let c = db.connect().unwrap();
+        let u = adv_rows(&c, "SELECT * FROM u");
+        if !matches!(&u, Ok(r) if r.len() == 1 && r[0] == vec!["1".to_string()]) {
+            failed.push(format!("{case}: after the reopen `SELECT * FROM u` = {u:?}"));
+        }
+        match adv_rows(&c, "PRAGMA integrity_check") {
+            Ok(r) if r.len() == 1 && r[0][0] == "ok" => {}
+            other => failed.push(format!("{case}: integrity_check: {other:?}")),
+        }
+    }
+    assert!(failed.is_empty(), "CLAIM: {failed:#?}");
+}
+
+
+// ===== ADVERSARY 2 (queue a-f review): CDC capture setting across savepoint routes =====
+
+/// ADV-5: the capture setting a rollback must put back, on the routes e19e8907f's BEGIN-time
+/// snapshot does not see: a transaction opened by SAVEPOINT (no BEGIN) then ROLLBACK, and
+/// ROLLBACK TO a savepoint taken before the switch. After each, a write to t must succeed and be
+/// captured in c1 (the table capture was on before the rolled-back switch).
+#[test]
+fn adv_a_rolled_back_cdc_switch_on_savepoint_routes() {
+    let _g = serial();
+    let mut failed: Vec<String> = Vec::new();
+    let routes: [(&str, &[&str]); 5] = [
+        ("SAVEPOINT s; switch; ROLLBACK", &["SAVEPOINT s", "PRAGMA capture_data_changes_conn('full,c2')", "ROLLBACK"]),
+        ("SAVEPOINT s; switch; ROLLBACK TO s; RELEASE s", &["SAVEPOINT s", "PRAGMA capture_data_changes_conn('full,c2')", "ROLLBACK TO s", "RELEASE s"]),
+        ("BEGIN; SAVEPOINT s; switch; ROLLBACK TO s; COMMIT", &["BEGIN", "SAVEPOINT s", "PRAGMA capture_data_changes_conn('full,c2')", "ROLLBACK TO s", "COMMIT"]),
+        ("BEGIN; switch; COMMIT (control)", &["BEGIN", "PRAGMA capture_data_changes_conn('full,c2')", "COMMIT"]),
+        ("BEGIN; switch; ROLLBACK (e19e8907f's route)", &["BEGIN", "PRAGMA capture_data_changes_conn('full,c2')", "ROLLBACK"]),
+    ];
+    for (case, steps) in routes {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("cdc-sp.db"), DatabaseOpts::new());
+        let c = db.connect().unwrap();
+        c.execute("CREATE TABLE t(x)").unwrap();
+        c.execute("PRAGMA capture_data_changes_conn('full,c1')").unwrap();
+        let mut ok = true;
+        for s in steps {
+            if let Err(e) = c.execute(*s) {
+                failed.push(format!("{case}: `{s}`: {e}"));
+                ok = false;
+                break;
+            }
+        }
+        if !ok {
+            continue;
+        }
+        let committed_switch = case.contains("control");
+        let c2_exists = adv_rows(&c, "SELECT count(*) FROM sqlite_schema WHERE name = 'c2'");
+        if let Err(e) = c.execute("INSERT INTO t VALUES (1)") {
+            failed.push(format!("{case}: a write after the route: {e} (c2 in sqlite_schema: {c2_exists:?})"));
+            continue;
+        }
+        let want_table = if committed_switch { "c2" } else { "c1" };
+        match adv_rows(&c, &format!("SELECT count(*) FROM {want_table} WHERE table_name = 't'")) {
+            Ok(r) if r[0][0] == "1" => {}
+            other => failed.push(format!("{case}: {want_table} holds {other:?} changes of t, want 1")),
+        }
+    }
+    assert!(failed.is_empty(), "CLAIM: a rolled-back CDC switch left capture on the wrong table: {failed:#?}");
+}
+
+/// H6, the route ADV-5 does not take: a COMMIT refused with Busy before anything of it committed
+/// leaves its transaction open (`undo_commit_transition_after_busy`), so a ROLLBACK that follows
+/// must still put back the capture setting from BEGIN. Before the fix the refused COMMIT had
+/// already dropped that setting, so the switch to c2 outlived the rollback that removed c2.
+#[test]
+fn a_rollback_after_a_busy_commit_puts_the_capture_setting_back() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("busy-cdc.db"), opts(catalog, SyncClass::Fsync));
+        let a = db.connect().unwrap();
+        seed_wide(&a);
+        let _child = a.fork_branch().unwrap();
+        a.execute("PRAGMA capture_data_changes_conn('full,c1')").unwrap();
+        a.execute("BEGIN").unwrap();
+        a.execute("PRAGMA capture_data_changes_conn('full,c2')").unwrap();
+        a.execute("UPDATE t SET v = 'new' WHERE id = 3").unwrap();
+        db.branch_failpoint(Some(BranchFailpoint::TrunkDecisionBusy));
+        let first = a.execute("COMMIT");
+        assert!(
+            matches!(first, Err(LimboError::Busy)),
+            "catalog={catalog}: premise: the decision pass was refused: {first:?}"
+        );
+        a.execute("ROLLBACK").unwrap();
+        let c2 = adv_rows(&a, "SELECT count(*) FROM sqlite_schema WHERE name = 'c2'");
+        assert_eq!(c2.as_ref().ok().map(|r| r[0][0].as_str()), Some("0"), "catalog={catalog}: premise: the rollback removed c2: {c2:?}");
+        let write = a.execute("UPDATE t SET v = 'after' WHERE id = 4");
+        assert!(write.is_ok(), "catalog={catalog}: CLAIM: a write after the rollback is captured somewhere that exists: {write:?}");
+        let c1 = adv_rows(&a, "SELECT count(*) FROM c1 WHERE table_name = 't'");
+        assert_eq!(c1.as_ref().ok().map(|r| r[0][0].as_str()), Some("1"), "catalog={catalog}: CLAIM: c1 captures the write: {c1:?}");
+    }
+}
+
+/// ADV-6 (probe, never fails): a capture table named in another case than it was created in.
+#[test]
+fn adv_probe_cdc_case_variant_name() {
+    let _g = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("cdc-case.db"), DatabaseOpts::new());
+    let c = db.connect().unwrap();
+    c.execute("CREATE TABLE t(x)").unwrap();
+    println!("ADV6 on c1: {:?}", c.execute("PRAGMA capture_data_changes_conn('full,c1')"));
+    println!("ADV6 insert1: {:?}", c.execute("INSERT INTO t VALUES (1)"));
+    println!("ADV6 switch to C1: {:?}", c.execute("PRAGMA capture_data_changes_conn('full,C1')"));
+    println!("ADV6 insert2: {:?}", c.execute("INSERT INTO t VALUES (2)"));
+    println!("ADV6 version rows: {:?}", adv_rows(&c, "SELECT * FROM turso_cdc_version"));
+    println!("ADV6 c1 rows: {:?}", adv_rows(&c, "SELECT change_id, table_name FROM c1"));
+    println!("ADV6 schema: {:?}", adv_rows(&c, "SELECT type, name FROM sqlite_schema"));
+}
+
+/// ADV-7 (probe, never fails): ADD COLUMN whose CHECK an existing row violates. SQLite 3.51.0
+/// refuses it ("CHECK constraint failed"); what does the engine do?
+#[test]
+fn adv_probe_add_column_check_on_existing_rows() {
+    let _g = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("addcol.db"), DatabaseOpts::new());
+    let c = db.connect().unwrap();
+    c.execute("CREATE TABLE a(x)").unwrap();
+    c.execute("INSERT INTO a VALUES (1)").unwrap();
+    println!("ADV7 add column: {:?}", c.execute("ALTER TABLE a ADD COLUMN c INTEGER CHECK (c IS NOT NULL)"));
+    println!("ADV7 rows: {:?}", adv_rows(&c, "SELECT * FROM a"));
+    println!("ADV7 integrity: {:?}", adv_rows(&c, "PRAGMA integrity_check"));
+    println!("ADV7 update same row: {:?}", c.execute("UPDATE a SET x = 2"));
+}
+
+/// M1 (queue a-f review): ADD COLUMN verifies its new CHECK against every existing row, the row
+/// read as it reads after the change (stored columns plus the new column's DEFAULT, else NULL).
+/// Each expectation is SQLite 3.53.1's answer to the same statements (Python's sqlite3 on UW host
+/// ecetesla1, uwrun engine-m1-sqlite, raw banked in artie engine raw/uw-m1-sqlite-3531.txt), not
+/// the engine's. A refused ADD COLUMN leaves the table as it was.
+#[test]
+fn add_column_checks_its_new_check_against_every_existing_row() {
+    let _g = serial();
+    let mut failed: Vec<String> = Vec::new();
+    let cases: [(&str, &[&str], &str, bool); 7] = [
+        ("no DEFAULT, c IS NOT NULL", &["CREATE TABLE a(x)", "INSERT INTO a VALUES (1)"], "ALTER TABLE a ADD COLUMN c INTEGER CHECK (c IS NOT NULL)", false),
+        ("DEFAULT NULL, c IS NOT NULL", &["CREATE TABLE a(x)", "INSERT INTO a VALUES (1)"], "ALTER TABLE a ADD COLUMN c INTEGER DEFAULT NULL CHECK (c IS NOT NULL)", false),
+        ("no DEFAULT, c > 0 (NULL passes)", &["CREATE TABLE a(x)", "INSERT INTO a VALUES (1)"], "ALTER TABLE a ADD COLUMN c INTEGER CHECK (c > 0)", true),
+        ("a CHECK naming another column, the row fails it", &["CREATE TABLE a(x)", "INSERT INTO a VALUES (-1)"], "ALTER TABLE a ADD COLUMN c INTEGER CHECK (x > 0 OR c IS NOT NULL)", false),
+        ("a CHECK naming another column, the row passes it", &["CREATE TABLE a(x)", "INSERT INTO a VALUES (5)"], "ALTER TABLE a ADD COLUMN c INTEGER CHECK (x > 0 OR c IS NOT NULL)", true),
+        ("DEFAULT 0, c > 0", &["CREATE TABLE a(x)", "INSERT INTO a VALUES (1)"], "ALTER TABLE a ADD COLUMN c INTEGER DEFAULT 0 CHECK (c > 0)", false),
+        ("an empty table, c IS NOT NULL", &["CREATE TABLE a(x)"], "ALTER TABLE a ADD COLUMN c INTEGER CHECK (c IS NOT NULL)", true),
+    ];
+    for (case, setup, alter, sqlite_accepts) in cases {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("addcol-check.db"), DatabaseOpts::new());
+        let c = db.connect().unwrap();
+        for sql in setup {
+            c.execute(*sql).unwrap();
+        }
+        let before = adv_rows(&c, "SELECT * FROM a");
+        let r = c.execute(alter);
+        if r.is_ok() != sqlite_accepts {
+            failed.push(format!("{case}: `{alter}` gave {r:?}; SQLite 3.53.1 {}", if sqlite_accepts { "accepts it" } else { "refuses it: CHECK constraint failed" }));
+            continue;
+        }
+        let cols = adv_rows(&c, "SELECT count(*) FROM pragma_table_info('a')");
+        let want_cols = if sqlite_accepts { "2" } else { "1" };
+        if cols.as_ref().ok().map(|r| r[0][0].as_str()) != Some(want_cols) {
+            failed.push(format!("{case}: a has {cols:?} columns after `{alter}`, want {want_cols}"));
+        }
+        if !sqlite_accepts {
+            let after = adv_rows(&c, "SELECT * FROM a");
+            if after.as_ref().ok() != before.as_ref().ok() {
+                failed.push(format!("{case}: the refused ADD COLUMN changed the rows: {before:?} -> {after:?}"));
+            }
+            match adv_rows(&c, "PRAGMA integrity_check") {
+                Ok(r) if r.len() == 1 && r[0][0] == "ok" => {}
+                other => failed.push(format!("{case}: integrity_check after the refusal: {other:?}")),
+            }
+        }
+    }
+    assert!(failed.is_empty(), "CLAIM: ADD COLUMN answers as SQLite does over existing rows: {failed:#?}");
+}
+
+/// L5's module (queue a-f review): an ordinary writable virtual table with no rows, so a write to
+/// it runs VBegin, which looks the table up in the connection's registry by id. In its own module
+/// because the derive names the extension traits unqualified.
+mod l5_vtab {
+    use crate::sync::Arc;
+    use turso_ext::{
+        Connection, ResultCode, VTabCursor, VTabKind, VTabModule, VTabModuleDerive, VTable, Value,
+    };
+
+    #[derive(Debug, VTabModuleDerive, Default)]
+    pub(super) struct L5VTabModule;
+
+    #[derive(Debug)]
+    pub(super) struct L5Table;
+
+    #[derive(Debug)]
+    pub(super) struct L5Cursor;
+
+    impl VTabModule for L5VTabModule {
+        type Table = L5Table;
+        const VTAB_KIND: VTabKind = VTabKind::VirtualTable;
+        const NAME: &'static str = "l5_vtab";
+        const READONLY: bool = false;
+
+        fn create(_args: &[Value]) -> Result<(String, Self::Table), ResultCode> {
+            Ok(("CREATE TABLE x (v INTEGER)".to_string(), L5Table))
+        }
+    }
+
+    impl VTable for L5Table {
+        type Cursor = L5Cursor;
+        type Error = String;
+
+        fn open(&self, _conn: Option<Arc<Connection>>) -> Result<Self::Cursor, Self::Error> {
+            Ok(L5Cursor)
+        }
+
+        fn insert(&mut self, _args: &[Value]) -> Result<i64, Self::Error> {
+            Ok(1)
+        }
+
+        fn destroy(&mut self) -> Result<(), Self::Error> {
+            DESTROYS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// How many L5 tables have been destroyed (engine-rev-qaf-fix MED-7's red reads it).
+    pub(super) static DESTROYS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    impl VTabCursor for L5Cursor {
+        type Error = String;
+
+        fn filter(&mut self, _args: &[Value], _idx_info: Option<(&str, i32)>) -> ResultCode {
+            ResultCode::EOF
+        }
+
+        fn rowid(&self) -> i64 {
+            0
+        }
+
+        fn column(&self, _idx: u32) -> Result<Value, Self::Error> {
+            Ok(Value::null())
+        }
+
+        fn eof(&self) -> bool {
+            true
+        }
+
+        fn next(&mut self) -> ResultCode {
+            ResultCode::EOF
+        }
+    }
+}
+
+/// L5 (queue a-f review, by reading): DROP TABLE of a virtual table inside a transaction that is
+/// then rolled back. The rollback restores the schema's virtual table, so a write to it after the
+/// rollback must work as it did before the DROP (SQLite reconnects the module): before the fix
+/// VDestroy had removed the table from the connection's registry, and VBegin panicked ("Could not
+/// find virtual table for VBegin").
+#[test]
+fn a_rolled_back_drop_of_a_virtual_table_leaves_it_writable() {
+    let _g = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("l5.db"), DatabaseOpts::new());
+    let c = db.connect().unwrap();
+    c.register_static_extension(|api| unsafe {
+        l5_vtab::L5VTabModule::register_L5VTabModule(api);
+    });
+    c.execute("CREATE VIRTUAL TABLE vt USING l5_vtab").unwrap();
+    c.execute("INSERT INTO vt VALUES (1)").expect("premise: a write to the virtual table works");
+    c.execute("BEGIN").unwrap();
+    c.execute("DROP TABLE vt").unwrap();
+    c.execute("ROLLBACK").unwrap();
+    let in_schema = adv_rows(&c, "SELECT count(*) FROM sqlite_schema WHERE name = 'vt'");
+    assert_eq!(in_schema.as_ref().ok().map(|r| r[0][0].as_str()), Some("1"), "premise: the rollback kept vt: {in_schema:?}");
+    let write = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| c.execute("INSERT INTO vt VALUES (2)")));
+    match write {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => panic!("CLAIM: a write to vt after the rolled-back DROP works: {e}"),
+        Err(_) => panic!("CLAIM: a write to vt after the rolled-back DROP works: it panicked"),
+    }
+}
+
+/// L6 (queue a-f review, by reading): inside BEGIN, a statement fails after a write and its own
+/// rollback then fails (an I/O error reading the subjournal, by the test failpoint). SQLite 3.51.0
+/// rolls the whole transaction back and returns to autocommit (vdbeaux.c sqlite3VdbeHalt: a failed
+/// vdbeCloseStatement runs sqlite3RollbackAll, sqlite3CloseSavepoints, autoCommit = 1; artie raw
+/// uw-l6-sqlite-vdbeaux-3510.txt). Before the fix the transaction stayed open holding the failed
+/// statement's first row, and a COMMIT would have made it durable.
+#[test]
+fn a_failed_statement_rollback_inside_begin_rolls_the_transaction_back() {
+    let _g = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("l6.db"), DatabaseOpts::new());
+    let c = db.connect().unwrap();
+    c.execute("CREATE TABLE u(x UNIQUE)").unwrap();
+    c.execute("INSERT INTO u VALUES (1)").unwrap();
+    c.execute("BEGIN").unwrap();
+    c.execute("INSERT INTO u VALUES (10)").unwrap();
+    let fail = crate::storage::pager::Pager::fail_next_statement_rollback();
+    fail.store(true, std::sync::atomic::Ordering::SeqCst);
+    let r = c.execute("INSERT INTO u VALUES (2), (1)");
+    let consumed = !fail.swap(false, std::sync::atomic::Ordering::SeqCst);
+    assert!(r.is_err(), "premise: the second row violates UNIQUE: {r:?}");
+    assert!(consumed, "premise: the failing statement's own rollback ran (and failed)");
+    assert!(c.get_auto_commit(), "CLAIM: the failed statement rollback ended the transaction");
+    let commit = c.execute("COMMIT");
+    assert!(commit.is_err(), "CLAIM: no transaction is left to commit: {commit:?}");
+    let rows = adv_rows(&c, "SELECT x FROM u ORDER BY x");
+    assert_eq!(
+        rows.as_ref().ok().map(|r| r.iter().map(|row| row[0].clone()).collect::<Vec<_>>()),
+        Some(vec!["1".to_string()]),
+        "CLAIM: the transaction's rows are gone, the committed one stays: {rows:?}"
+    );
+}
+
+/// ADV-8: a custom type named with each quote form survives a reopen as ONE type: a STRICT column
+/// declared with any spelling of it reads back, and DROP TYPE is refused while the column uses it.
+#[test]
+fn adv_quoted_type_names_survive_a_reopen() {
+    let _g = serial();
+    let mut failed: Vec<String> = Vec::new();
+    let o = || DatabaseOpts::new().with_custom_types(true);
+    for (create, used) in [
+        ("\"m'x\"", "\"m'x\""),
+        ("[m x]", "\"m x\""),
+        ("`Mb`", "mb"),
+        ("\"q\"\"t\"", "\"q\"\"t\""),
+    ] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("qt.db");
+        {
+            let db = open_at(&path, o());
+            let c = db.connect().unwrap();
+            for sql in [
+                format!("CREATE TYPE {create}(value text) BASE text"),
+                format!("CREATE TABLE s(v {used}) STRICT"),
+                "INSERT INTO s VALUES ('hello')".to_string(),
+            ] {
+                if let Err(e) = c.execute(&sql) {
+                    failed.push(format!("{create}: `{sql}`: {e}"));
+                }
+            }
+        }
+        let db = open_at(&path, o());
+        let c = db.connect().unwrap();
+        match adv_rows(&c, "SELECT v FROM s") {
+            Ok(r) if r.len() == 1 && r[0][0] == "hello" => {}
+            other => failed.push(format!("{create}: after the reopen SELECT v FROM s = {other:?}")),
+        }
+        if c.execute(format!("DROP TYPE {create}")).is_ok() {
+            failed.push(format!("{create}: DROP TYPE succeeded while s.v uses it"));
+        }
+        if let Err(e) = c.execute("INSERT INTO s VALUES ('again')") {
+            failed.push(format!("{create}: an insert after the reopen: {e}"));
+        }
+        if let Err(e) = c.execute(format!("CREATE TABLE s2(v {create}) STRICT")) {
+            failed.push(format!("{create}: a second STRICT table after the reopen: {e}"));
+        }
+    }
+    assert!(failed.is_empty(), "CLAIM: {failed:#?}");
+}
+
+/// The reviewer's H5 (adv5's merge probe, made an assertion): a table with an ordinary column named
+/// rowid, a branch that updates one row, deletes another and inserts one that takes the freed real
+/// rowid. The merge must leave the trunk exactly as the branch reads it.
+#[test]
+fn adv_merge_with_a_rowid_column_keeps_every_branch_change() {
+    use super::merge::{MergePolicy, Merger, Validation};
+    let _g = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("mr.db"), opts(false, SyncClass::Fsync));
+    let trunk = db.connect().unwrap();
+    trunk.execute("CREATE TABLE t(rowid INTEGER, v TEXT)").unwrap();
+    trunk.execute("INSERT INTO t(rowid, v) VALUES (3, 'r1'), (1, 'r2'), (2, 'r3')").unwrap();
+    let b = trunk.fork_branch().unwrap();
+    let branch_view = {
+        let c = b.connect().unwrap();
+        c.execute("UPDATE t SET v = 'changed' WHERE _rowid_ = 1").unwrap();
+        c.execute("DELETE FROM t WHERE _rowid_ = 3").unwrap();
+        c.execute("INSERT INTO t(rowid, v) VALUES (9, 'new')").unwrap();
+        adv_rows(&c, "SELECT _rowid_, rowid, v FROM t ORDER BY _rowid_").unwrap()
+    };
+    let mut merger = Merger::new(trunk.clone()).unwrap();
+    let out = merger.merge(b, MergePolicy { validation: Validation::BaseRead, keep_merged: false });
+    let trunk_view = adv_rows(&trunk, "SELECT _rowid_, rowid, v FROM t ORDER BY _rowid_").unwrap();
+    assert!(
+        out.is_ok() && trunk_view == branch_view,
+        "CLAIM: the merge of a table with a column named rowid lost a branch change: merge {:?}, trunk {trunk_view:?}, branch {branch_view:?}",
+        out.as_ref().map(|o| (o.refused.clone(), o.rows_changed))
+    );
+}
+
+/// LEAP L2(c) (ASYNC-DESIGN R1.7, "no growth and no first touch in the log buffer"): the log's
+/// buffers are allocated at open, so no create, at C = 1 from the first one after open or at C = 16
+/// with flights of every size up to 16 creates, grows one (`pending_reallocs`, counted wherever
+/// buffering a record or taking a flight grows a buffer under the store mutex). Both arms, eager and
+/// catalog.
+#[test]
+fn no_create_grows_the_log_buffer_from_the_first_one_after_open() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("ring.db"), opts(catalog, SyncClass::Fsync));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let r0 = db.branches.log_buffer_reallocs();
+        for i in 0..50 {
+            trunk.create_branch(&format!("one-{i}")).unwrap();
+        }
+        let r1 = db.branches.log_buffer_reallocs();
+        std::thread::scope(|s| {
+            for t in 0..16 {
+                let db = &db;
+                s.spawn(move || {
+                    let c = db.connect().unwrap();
+                    for i in 0..40 {
+                        c.create_branch(&format!("many-{t}-{i}")).unwrap();
+                    }
+                });
+            }
+        });
+        let r2 = db.branches.log_buffer_reallocs();
+        assert_eq!(
+            (r1 - r0, r2 - r1),
+            (0, 0),
+            "catalog={catalog}: CLAIM: no create grew the log buffer (C=1 from the first create after open, then C=16)"
+        );
+    }
+}
+
+/// LEAP L1, ASYNC-DESIGN T4 (ASYNC-1), the no-wait law: with the flusher and housekeeping held,
+/// 1,000 named async creates on one thread lead no flight and wait for none. The group's flights
+/// and locked flushes do not move, the creating thread issues no sync (`thread_syncs`), and every
+/// create reads NotYetDurable. Catalog store (async is catalog-only, ASYNC §1), in the store class
+/// async requires. At the stub commit each create is durable (D2), so the flights move: red by
+/// its claim. The hold premise is checked after the claims, so a stub that holds nothing fails at
+/// the claim, the stated reason.
+#[test]
+fn an_async_create_leads_no_flight_and_waits_for_none() {
+    let _s = serial();
+    let class = if cfg!(target_vendor = "apple") { SyncClass::FullFsync } else { SyncClass::Fsync };
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("t4.db"), opts(true, class));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    for i in 0..10 {
+        trunk.create_branch_async(&format!("warm-{i}")).unwrap();
+    }
+    let held = (db.branch_flusher_hold(true), db.branch_housekeeping_hold(true));
+    let g0 = db.branches.group_counters();
+    let s0 = super::store::thread_syncs();
+    let mut created = Vec::with_capacity(1000);
+    for i in 0..1000 {
+        created.push(trunk.create_branch_async(&format!("t4-{i}")).unwrap());
+    }
+    let s1 = super::store::thread_syncs();
+    let g1 = db.branches.group_counters();
+    let not_yet = created
+        .iter()
+        .filter(|c| matches!(db.branch_status(c.id), Ok(super::async_api::BranchStatus::NotYetDurable)))
+        .count();
+    db.branch_flusher_hold(false);
+    db.branch_housekeeping_hold(false);
+    assert_eq!(
+        (g1[0] - g0[0], g1[1] - g0[1]),
+        (0, 0),
+        "CLAIM: 1,000 async creates led no flight and no locked flush (flights, locked_flushes)"
+    );
+    assert_eq!(s1 - s0, 0, "CLAIM: the creating thread issued no sync");
+    assert_eq!(not_yet, 1000, "CLAIM: every async create reads NotYetDurable while the flusher is held");
+    assert_eq!(held, (true, true), "premise: the flusher and housekeeping were held");
+}
+
+/// LEAP L1, ASYNC-DESIGN T8 (ASYNC-3), flusher liveness: one async create and nothing else is made
+/// durable by the flusher. `branch_status` is polled (it never leads a flight) with a 10 s
+/// deadline until Durable; the flusher led at least one flight, and the creating thread issued no
+/// sync. At the stub the create is durable at once on its own thread (D2), so the sync claim and the
+/// flusher claim fail.
+#[test]
+fn the_flusher_makes_an_idle_async_create_durable() {
+    let _s = serial();
+    let class = if cfg!(target_vendor = "apple") { SyncClass::FullFsync } else { SyncClass::Fsync };
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("t8.db"), opts(true, class));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    // The store's first create builds its catalog (syncs on the creating thread), the separate
+    // registered red a_first_create_makes_its_catalog_in_one_commit_off_the_store_mutex; ASYNC-DESIGN
+    // §9 "Fresh store" makes that create cold by design. It is made first, unmeasured, and waited
+    // for, so this measures the flusher alone (FLAGGED fixture repair, as T4 and T23 warm first).
+    let warm = trunk.create_branch_async("warm").unwrap();
+    db.branch_wait_durable(warm.token).unwrap();
+    let f0 = db.branch_async_stats().flusher_flights;
+    let s0 = super::store::thread_syncs();
+    let created = trunk.create_branch_async("idle").unwrap();
+    let s1 = super::store::thread_syncs();
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut durable = false;
+    while std::time::Instant::now() < until {
+        if matches!(db.branch_status(created.id), Ok(super::async_api::BranchStatus::Durable)) {
+            durable = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let f1 = db.branch_async_stats().flusher_flights;
+    assert_eq!(s1 - s0, 0, "CLAIM: the creating thread issued no sync");
+    assert!(f1 > f0, "CLAIM: the flusher led a flight ({f0} -> {f1})");
+    assert!(durable, "CLAIM: the idle async create read Durable within 10 s");
+}
+
+/// LEAP L1, ASYNC-DESIGN T23 (ASYNC-10), visibility: with the flusher held, an async create is in
+/// `branch_ids()` and `branch_named()` at once, with no flight led. At the stub every create leads
+/// its own flight, so the flights claim fails.
+#[test]
+fn async_creates_are_listed_and_found_at_once() {
+    let _s = serial();
+    let class = if cfg!(target_vendor = "apple") { SyncClass::FullFsync } else { SyncClass::Fsync };
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("t23.db"), opts(true, class));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    trunk.create_branch_async("warm").unwrap();
+    let held = db.branch_flusher_hold(true);
+    let g0 = db.branches.group_counters();
+    let created = trunk.create_branch_async("seen").unwrap();
+    let listed = db.branch_ids().unwrap().contains(&created.id);
+    let found = db.branch_named("seen").unwrap();
+    let g1 = db.branches.group_counters();
+    db.branch_flusher_hold(false);
+    assert_eq!(g1[0] - g0[0], 0, "CLAIM: the async create led no flight");
+    assert!(listed, "CLAIM: the async create is in branch_ids() at once");
+    assert_eq!(found, Some(created.id), "CLAIM: the async create is found by name at once");
+    assert!(held, "premise: the flusher was held");
+}
+
+/// LEAP L2(b) across a directory segment (engine-rev-l2b MED: the budget red's growth cell stops at
+/// 33,040 ids, inside the first 65,536-id segment, so a segment taken from the pool was never
+/// exercised): 16 threads create 72,000 named branches, past the first segment, and no create
+/// allocates more than 8 KiB under the store mutex (a chunk is about 23,552 B, a segment 24 KiB).
+#[test]
+fn no_create_allocates_a_table_chunk_or_segment_under_the_mutex_across_a_segment() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("seg.db"), opts(true, SyncClass::Fsync));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    // The store's first create builds its catalog, a separate registered red
+    // (a_first_create_makes_its_catalog_in_one_commit_off_the_store_mutex): about 2.6 MB under the
+    // mutex, measured by diag_the_create_that_allocates_megabytes_under_the_store_mutex at create 0
+    // (lane raw 78d2823373). This test is about growth across a segment, so that create is made
+    // first, unmeasured.
+    trunk.create_branch("first").unwrap();
+    let worst: u64 = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..16u64)
+            .map(|t| {
+                let db = &db;
+                s.spawn(move || {
+                    let c = db.connect().unwrap();
+                    let mut worst = 0;
+                    for i in 0..4_500u64 {
+                        let name = format!("seg-{t}-{i}");
+                        // A trunk fork refused Busy (16 writers on one trunk) is retried, each
+                        // attempt measured.
+                        loop {
+                            let a = super::budget_probe::thread_allocs();
+                            let r = c.create_branch(&name);
+                            let b = super::budget_probe::thread_allocs();
+                            worst = worst.max(b.3 - a.3);
+                            match r {
+                                Ok(_) => break,
+                                Err(LimboError::Busy) => continue,
+                                Err(e) => panic!("create {name}: {e}"),
+                            }
+                        }
+                    }
+                    worst
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).max().unwrap()
+    });
+    let live = db.branch_ids().unwrap().len();
+    assert!(live >= 72_000, "premise: the table grew past one 65,536-id segment ({live} live)");
+    assert!(worst <= 8 << 10, "CLAIM: no create allocated more than 8 KiB under the store mutex across a segment; one allocated {worst}");
+}
+
+/// LEAP L1, ASYNC-DESIGN T11 (ASYNC-5), a failed flight loses async creates visibly: async creates
+/// acknowledged while the flusher is held, then its flight fails (GroupFlightFails). The lost name
+/// is gone from `branch_ids` and `branch_named`; `connect_named` refuses it; the next async create
+/// is refused (the store is fail-stopped). At the stub the failpoint fails the create's own flight,
+/// so the create itself returns the error instead of being acknowledged: red by the first claim.
+#[test]
+fn a_failed_flight_loses_async_creates_visibly() {
+    let _s = serial();
+    let class = if cfg!(target_vendor = "apple") { SyncClass::FullFsync } else { SyncClass::Fsync };
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("t11.db"), opts(true, class));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    trunk.create_branch_async("warm").unwrap();
+    let held = db.branch_flusher_hold(true);
+    db.branch_failpoint(Some(BranchFailpoint::GroupFlightFails));
+    let acked = trunk.create_branch_async("doomed");
+    assert!(acked.is_ok(), "CLAIM: the async create was acknowledged before its flight: {:?}", acked.as_ref().err());
+    let id = acked.unwrap().id;
+    db.branch_flusher_hold(false);
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < until && db.branch_ids().map(|ids| ids.contains(&id)).unwrap_or(false) {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(!db.branch_ids().unwrap_or_default().contains(&id), "CLAIM: the lost create left branch_ids");
+    assert!(db.branch_named("doomed").ok().flatten().is_none(), "CLAIM: the lost name is not found");
+    assert!(db.connect_named("doomed").is_err(), "CLAIM: connect_named refuses the lost create");
+    assert!(trunk.create_branch_async("next").is_err(), "CLAIM: the next async create is refused");
+    assert!(held, "premise: the flusher was held");
+}
+
+/// Diagnostic, never fails (the segment-crossing L2(b) test found one create allocating about
+/// 2.6 MB under the store mutex near 72,000 branches, lane raws 44f57b34b3 / 92f7246c8a): the same
+/// workload, each thread recording every allocation of at least 1 MiB with its backtrace.
+#[test]
+fn diag_the_create_that_allocates_megabytes_under_the_store_mutex() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("diag-mb.db"), opts(true, SyncClass::Fsync));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    std::thread::scope(|s| {
+        for t in 0..16u64 {
+            let db = &db;
+            s.spawn(move || {
+                let c = db.connect().unwrap();
+                super::budget_probe::record_big(1 << 20);
+                for i in 0..4_500u64 {
+                    let name = format!("mb-{t}-{i}");
+                    loop {
+                        let a = super::budget_probe::thread_allocs();
+                        let r = c.create_branch(&name);
+                        let b = super::budget_probe::thread_allocs();
+                        if b.3 - a.3 > 8 << 10 {
+                            println!("DIAG-MB thread={t} create={i} held_bytes={} live={}", b.3 - a.3, db.branch_ids().map(|v| v.len()).unwrap_or(0));
+                        }
+                        match r {
+                            Ok(_) => break,
+                            Err(LimboError::Busy) => continue,
+                            Err(e) => panic!("create {name}: {e}"),
+                        }
+                    }
+                }
+                let (_, _, traces) = super::budget_probe::recorded_allocs();
+                for tr in traces.iter().take(3) {
+                    println!("DIAG-MB thread={t} trace:\n{tr}");
+                }
+            });
+        }
+    });
+}
+
+/// engine-rev-qaf-fix HIGH-1 (F7's regression, no red until now): capture into an engine-made c1
+/// (v2), then a switch to 'full,C1' names the same table in another case. It must keep c1's version
+/// (no second version row in another case) and keep writing the v2 layout into it: both writes of t
+/// are rows naming t. bc6bbaeda made the existence check case-blind, so the switch found the table,
+/// found no version row under 'C1', pinned V1 as for a legacy table, and wrote v1-layout rows into
+/// the v2 table (measured by the reviewer: rows [[1,t],[2,""],[3,"2"]]).
+#[test]
+fn a_switch_to_the_capture_table_in_another_case_keeps_its_version_and_layout() {
+    let _g = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("cdc-case2.db"), DatabaseOpts::new());
+    let c = db.connect().unwrap();
+    c.execute("CREATE TABLE t(x)").unwrap();
+    c.execute("PRAGMA capture_data_changes_conn('full,c1')").unwrap();
+    c.execute("INSERT INTO t VALUES (1)").unwrap();
+    c.execute("PRAGMA capture_data_changes_conn('full,C1')").unwrap();
+    c.execute("INSERT INTO t VALUES (2)").unwrap();
+    let versions = adv_rows(&c, "SELECT table_name, version FROM turso_cdc_version ORDER BY table_name").unwrap();
+    assert_eq!(versions, vec![vec!["c1".to_string(), "v2".to_string()]], "CLAIM: one version row, c1's v2, whatever case the switch named it in");
+    let named_t = adv_rows(&c, "SELECT count(*) FROM c1 WHERE table_name = 't'").unwrap();
+    assert_eq!(named_t[0][0], "2", "CLAIM: both writes of t are v2-layout rows naming t");
+}
+
+/// engine-rev-qaf-fix HIGH-2/3/4 and MED-1 (the stored text an ADD COLUMN rewrites loses clauses,
+/// the class of QUOTE-SWEEP F1): after ADD COLUMN and a reopen, each table answers as before, and as
+/// SQLite 3.53.1 answers the same statements (python sqlite3 on UW; artie raw uw-qaf2-sqlite-3531).
+/// - a PRIMARY KEY (a DESC) table reopens and reads;
+/// - UNIQUE (a COLLATE NOCASE) still refuses 'a' after 'A';
+/// - a column typed `[x,y]` stays one column (two after the added one);
+/// - UNIQUE ON CONFLICT REPLACE still replaces.
+#[test]
+fn add_column_keeps_every_clause_of_the_stored_table_across_a_reopen() {
+    let _g = serial();
+    let mut failed: Vec<String> = Vec::new();
+    let cases: [(&str, &[&str], &[&str], &str, &str); 4] = [
+        ("PRIMARY KEY DESC", &["CREATE TABLE t(a INTEGER, b, PRIMARY KEY (a DESC))", "INSERT INTO t VALUES (1, 'x')"], &[], "SELECT count(*) FROM t", "1"),
+        ("UNIQUE COLLATE NOCASE", &["CREATE TABLE t(a TEXT, UNIQUE (a COLLATE NOCASE))", "INSERT INTO t VALUES ('A')"], &["INSERT OR IGNORE INTO t VALUES ('a', 0)"], "SELECT count(*) FROM t", "1"),
+        ("type [x,y]", &["CREATE TABLE t(a [x,y])"], &[], "SELECT count(*) FROM pragma_table_info('t')", "2"),
+        ("UNIQUE ON CONFLICT REPLACE", &["CREATE TABLE t(a UNIQUE ON CONFLICT REPLACE, v)", "INSERT INTO t VALUES (1, 'old')"], &["INSERT INTO t VALUES (1, 'new', 0)"], "SELECT v FROM t", "new"),
+    ];
+    for (case, setup, after, query, want) in cases {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("keep.db");
+        {
+            let db = open_at(&path, DatabaseOpts::new());
+            let c = db.connect().unwrap();
+            for sql in setup {
+                c.execute(*sql).unwrap();
+            }
+            if let Err(e) = c.execute("ALTER TABLE t ADD COLUMN z") {
+                failed.push(format!("{case}: ADD COLUMN: {e}"));
+                continue;
+            }
+        }
+        let reopened = std::panic::catch_unwind(|| open_at(&path, DatabaseOpts::new()));
+        let Ok(db) = reopened else {
+            failed.push(format!("{case}: the reopen panicked"));
+            continue;
+        };
+        let c = match db.connect() {
+            Ok(c) => c,
+            Err(e) => {
+                failed.push(format!("{case}: connect after the reopen: {e}"));
+                continue;
+            }
+        };
+        for sql in after {
+            if let Err(e) = c.execute(*sql) {
+                failed.push(format!("{case}: `{sql}` after the reopen: {e}"));
+            }
+        }
+        match adv_rows(&c, query) {
+            Ok(r) if r.first().map(|row| row[0].as_str()) == Some(want) => {}
+            other => failed.push(format!("{case}: `{query}` after the reopen = {other:?}, SQLite answers {want}")),
+        }
+    }
+    assert!(failed.is_empty(), "CLAIM: ADD COLUMN keeps the stored table's clauses: {failed:#?}");
+}
+
+/// engine-rev-qaf-fix MED-3: a trunk commit's durability barrier waits holding the trunk's WAL write
+/// lock, so it must never hold a LEAP L3 cohort gather (every trunk writer would queue behind it).
+/// With flights timed and a cohort of 8 owed, a trunk commit that retains a pre-image for a live
+/// child leads its flight with no gather.
+#[test]
+fn a_trunk_commits_barrier_never_gathers_a_cohort() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("barrier-gather.db"), opts(false, SyncClass::Fsync));
+    let trunk = db.connect().unwrap();
+    seed_wide(&trunk);
+    for i in 0..4 {
+        trunk.create_branch(&format!("timed-{i}")).unwrap();
+    }
+    let _child = trunk.fork_branch().unwrap();
+    db.branches.set_cohort_for_test(8);
+    let g0 = db.branches.gather_counters();
+    trunk.execute("UPDATE t SET v = 'new' WHERE id = 3").unwrap();
+    let g1 = db.branches.gather_counters();
+    assert_eq!(g1[0] - g0[0], 0, "CLAIM: the trunk commit's barrier held no cohort gather");
+}
+
+/// engine-rev-qaf-fix MED-7: a dropped virtual table is destroyed only once no connection holds it.
+/// Connection B's schema (shared from the database's) holds A's table; A's DROP commits, and the
+/// module's table must not be destroyed while B still holds it. Once B has moved to the new schema
+/// and every holder is gone, it is destroyed, once. Before the fix A destroyed it at its own commit,
+/// checking only A's schemas, so B held a freed table.
+#[test]
+fn a_dropped_virtual_table_is_destroyed_only_once_no_connection_holds_it() {
+    let _g = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("l5-shared.db"), DatabaseOpts::new());
+    let a = db.connect().unwrap();
+    a.register_static_extension(|api| unsafe {
+        l5_vtab::L5VTabModule::register_L5VTabModule(api);
+    });
+    a.execute("CREATE VIRTUAL TABLE vt USING l5_vtab").unwrap();
+    let b = db.connect().unwrap();
+    let held_by_b = b.schema.read().get_table("vt").is_some();
+    let d0 = l5_vtab::DESTROYS.load(std::sync::atomic::Ordering::SeqCst);
+    a.execute("DROP TABLE vt").unwrap();
+    let d1 = l5_vtab::DESTROYS.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(held_by_b, "premise: connection B's schema holds vt");
+    assert_eq!(d1 - d0, 0, "CLAIM: the table was not destroyed while connection B still held it");
+    drop(b);
+    drop(a);
+    drop(db);
+    let d2 = l5_vtab::DESTROYS.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(d2 - d0, 1, "CLAIM: once no connection held it, the table was destroyed once");
 }

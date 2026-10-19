@@ -29,6 +29,9 @@ default = [
 ]
 tracing_release = ["tracing/release_max_level_info"]
 conn_raw_api = []
+# The dialect function contract (dialect design R10) for a frontend's own tests: exposes
+# dialect::sqlite_builtin_names and dialect::sqlite_builtins_resolved_differently. Off by default.
+dialect_contract = []
 # MEASUREMENT ONLY, never in a shipped build (off by default): lets a measuring binary hold back
 # the branch store's confirmation word, as the budget tests' hold_word(true) does, so no background
 # thread runs in a later measured window (fastest-wire's pre-registered FULL verdict, judged
@@ -65,6 +68,10 @@ codspeed = ["bench"]
 optimizer_params = ["serde", "dep:serde_json"]
 stacker = ["dep:stacker"]
 percentile = []
+# PREREG-v1 amendment 2 (the AD class): `fe_mutant` reads FE_MUTANT outside the lib's cfg(test) too,
+# for AD-T5's fire-check binary (core/tests/async_s0.rs) only. Off by default; a credited, pgwire,
+# timed or reading binary built with it is void.
+fe-mutants = []
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { workspace = true, features = [
