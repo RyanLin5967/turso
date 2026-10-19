@@ -1,0 +1,21 @@
+>> Q CREATE TABLE rb(id int, bo boolean)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO rb VALUES (1, true)
+   C INSERT 0 1
+   Z I
+>> Q SELECT (SELECT max(bo) FROM rb)
+   E S=ERROR C=42883 M=function max(boolean) does not exist
+   Z I
+>> Q CREATE VIEW rv AS SELECT max(bo) AS m FROM rb
+   E S=ERROR C=42883 M=function max(boolean) does not exist
+   Z I
+>> Q SELECT id FROM rb GROUP BY id ORDER BY max(bo)
+   E S=ERROR C=42883 M=function max(boolean) does not exist
+   Z I
+>> Q SELECT id FROM rb GROUP BY id HAVING max(bo)
+   E S=ERROR C=42883 M=function max(boolean) does not exist
+   Z I
+>> Q SELECT min(bo) FROM rb
+   E S=ERROR C=42883 M=function min(boolean) does not exist
+   Z I

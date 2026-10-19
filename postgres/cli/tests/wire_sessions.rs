@@ -12432,6 +12432,13 @@ replays_postgresql!(
     "pg18-wirefuzz-an_index_on_an_expression_is_named_by_its_figure_and_never_reuses_a_sequence_name.out",
     []
 );
+// wire-rev-2a68496d0 L5: min and max over boolean are refused 42883 wherever they stand: a scalar subquery, a view's
+// query, ORDER BY and HAVING, as in the target list.
+replays_postgresql!(
+    pg18_wirefuzz_min_and_max_over_boolean_are_refused_everywhere_replays_as_postgresql_answered,
+    "pg18-wirefuzz-min_and_max_over_boolean_are_refused_everywhere.out",
+    []
+);
 replays_postgresql!(
     pg18_wirefuzz_the_connected_database_is_current_database_and_in_pg_database_replays_as_postgresql_answered,
     "pg18-wirefuzz-the_connected_database_is_current_database_and_in_pg_database.out",
