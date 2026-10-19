@@ -341,6 +341,8 @@ static void other_fail(const char *what, const char *why) {
 }
 
 /* ---------- spec ---------- */
+static int parse_u64(const char *v, uint64_t lo, uint64_t hi, uint64_t *out); /* below, with num_u (the c1b index and
+                                                                                 the MySQL port use it first) */
 static char *trim(char *s) {
     while (*s == ' ' || *s == '\t') s++;
     char *e = s + strlen(s);
@@ -533,7 +535,6 @@ static int kv_parse(const char *s, kv_t *kv, char *why) {
     return 0;
 }
 
-static int parse_u64(const char *v, uint64_t lo, uint64_t hi, uint64_t *out); /* below, with num_u */
 static int conn_open(conn_t *x, const char *base, const char *over, char *why, size_t wsz) {
     memset(x, 0, sizeof *x);
     x->proto = S.proto;
