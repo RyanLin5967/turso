@@ -1610,6 +1610,29 @@ fn find_best_access_method_for_subquery(
     // subquery could probe. Because the index is ephemeral, we can order its
     // key columns to fit the chosen seek shape: equality columns first, then
     // range-only columns, then the remaining payload columns.
+    // A column that carries a custom type whose comparison is a function (numeric's numeric_eq and
+    // numeric_lt, for a domain its base type's) compares through it in a scan
+    // (`find_custom_type_operator`), but an ephemeral index's probe compares its key plainly with
+    // the stored (decoded) values, so no constraint on it drives a probe; it stays a filter
+    // (review of the fe-rev2bd-types fixes, item 5: `n JOIN q ON q.s = 2` over a materialized
+    // numeric column answered 0 by the probe where the scan answers 4). Mutant
+    // `derived_probe_compares_plainly` (test builds only): it drives one, as before.
+    let compares_by_type = |c: &Constraint| -> bool {
+        if crate::branch::store::fe_mutant("derived_probe_compares_plainly") {
+            return false;
+        }
+        let Some(col) = c.table_col_pos.and_then(|pos| subquery.columns.get(pos)) else {
+            return false;
+        };
+        col.carries_custom_type()
+            && schema.get_type_def_unchecked(&col.ty_str).is_some_and(|t| {
+                schema
+                    .operator_type_of(t)
+                    .operators()
+                    .iter()
+                    .any(|o| o.func_name.is_some() && (o.op == "=" || o.op == "<"))
+            })
+    };
     let usable: Vec<(usize, &Constraint)> = rhs_constraints
         .constraints
         .iter()
@@ -1625,6 +1648,7 @@ fn find_best_access_method_for_subquery(
                         | ast::Operator::LessEquals
                 )
             ) && c.can_drive_index_seek(&subquery.columns, false)
+                && !compares_by_type(c)
         })
         .collect();
 
