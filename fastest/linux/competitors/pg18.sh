@@ -66,6 +66,9 @@ init)
     # comp review 1 LOW 19: each log line names its database (%d), so a cell's template waits are told from the
     # per-cycle DROP's (fthelp.py pgwaits)
     echo "log_line_prefix = '%m [%p] %d '"
+    # the log goes where every log-reading check reads it (DATA.log, the server's stderr): a build whose sample turns
+    # logging_collector on (PGDG's RHEL 8 package) wrote only "redirecting log output" there (artie 263e07ba76)
+    echo "logging_collector = off"
     if [ "$MODE" = d2 ]; then
       echo "wal_sync_method = fdatasync"  # Linux port: fsync_writethrough is macOS/Windows only
       echo "fsync = on"
