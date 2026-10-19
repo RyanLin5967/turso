@@ -190,5 +190,17 @@ for label, opts in [("delim2", "(DELIMITER ',;')"), ("delimbs", "(DELIMITER E'\\
                     ("delimempty", "(DELIMITER '')"), ("delimutf8", "(DELIMITER 'é')")]:
     rec(label, copy(c, "COPY c1 FROM STDIN " + opts, [("data", b"z\n")]))
 rec("order", copy(c, "COPY cp3 (id) FROM STDIN", [("data", b"1\n1\nx\ty\n")]))
+# Part 4 (third review, of fc5a6be1f): prefixed underscores, numeric option values, escaped CR,
+# overflow then junk, \v around an integer, an incomplete UTF-8 sequence, HEADER over an escaped newline.
+rec("setup4", q(c, "DROP TABLE IF EXISTS c4; CREATE TABLE c4 (id int, s smallint, v text)"))
+rec("prefixus", copy(c, "COPY c4 (id) FROM STDIN", [("data", b"0b_10_0101\n0x_1F\n")]))
+rec("delimnum", copy(c, "COPY c4 (v) FROM STDIN (DELIMITER 1)", [("data", b"z\n")]))
+rec("nullnum", copy(c, "COPY c4 (id, v) FROM STDIN (NULL 0)", [("data", b"5\t0\n")]))
+rec("escapedcr", copy(c, "COPY c4 (id, v) FROM STDIN", [("data", b"6\ta\\\r\n")]))
+rec("overjunk", copy(c, "COPY c4 (id) FROM STDIN", [("data", b"99999999999999999999x\n")]))
+rec("vtab", copy(c, "COPY c4 (s) FROM STDIN", [("data", b"\\v5\n")]))
+rec("partial", copy(c, "COPY c4 (v) FROM STDIN", [("data", b"\\303(\n")]))
+rec("headerbs", copy(c, "COPY c4 (id) FROM STDIN (HEADER)", [("data", b"a\\\nb\n7\n")]))
+rec("c4rows", q(c, "SELECT id, s, v, v IS NULL, length(v) FROM c4 ORDER BY id"))
 rec("unexpected", copy(c, "COPY cs (id) FROM STDIN", [("query", "SELECT 1")]))
 rec("after", q(C(), "SELECT count(*) FROM cs"))
