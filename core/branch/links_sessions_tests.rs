@@ -314,6 +314,53 @@ fn past_the_hard_log_limit_a_fill_starved_at_its_start_does_not_hold_the_upgrade
     assert!(meta_held >= 21, "past the hard limit the upgrade waited for a fill held at its start: meta {meta_held}, log peak {peak} B");
 }
 
+// ---- lead ruling LOW 4: a stopped fill makes no columns ----
+
+#[test]
+fn ls_fill_stopped_child() {
+    if !in_child() {
+        return;
+    }
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("c.db");
+    older_store(&path, 300);
+    super::journal::set_compact_threshold(4 << 10);
+    super::store::LINKS_FILL_BEFORE_COLUMNS_HELD.store(0, Ordering::Release);
+    super::store::LINKS_FILL_FIRST_MADE_COLUMNS.store(false, Ordering::Release);
+    super::store::LINKS_FILL_HOLD_BEFORE_COLUMNS.store(true, Ordering::Release);
+    let db = open(&path);
+    db.branch_wait_name_filter();
+    let trunk = db.connect().unwrap();
+    let mut k = 0;
+    while super::store::LINKS_FILL_BEFORE_COLUMNS_HELD.load(Ordering::Acquire) == 0 && k < 20_000 {
+        let _ = trunk.fork_branch().unwrap().into_id();
+        k += 1;
+    }
+    let held = super::store::LINKS_FILL_BEFORE_COLUMNS_HELD.load(Ordering::Acquire);
+    // Stopped as a close stops it, while it waits before its column-only transaction; then let go.
+    db.branches.stop_links_fill_for_test();
+    super::store::LINKS_FILL_HOLD_BEFORE_COLUMNS.store(false, Ordering::Release);
+    db.branch_checkpoint_wait();
+    // Only the fill that was held and stopped is judged (a later checkpoint may start a fill of its own).
+    let made = super::store::LINKS_FILL_FIRST_MADE_COLUMNS.load(Ordering::Acquire);
+    println!("LS-STOPPED held={held} creates={k} first_made={}", u64::from(made));
+}
+
+/// Lead ruling LOW 4 (l4-rev-h1 re-review): a fill stopped (as a close stops it) before its
+/// column-only transaction makes no columns: it checks that it is still filling first.
+#[test]
+fn a_fill_stopped_before_its_columns_makes_none() {
+    if in_child() {
+        return;
+    }
+    let text = child("ls_fill_stopped_child", &[]);
+    let r = readings(&text, "LS-STOPPED ");
+    let (held, made) = (r[0][0], r[0][2]);
+    println!("LS stopped: held {held}, the stopped fill made its columns {made}");
+    assert!(held >= 1, "premise: no fill thread reached its column-only transaction and was held");
+    assert_eq!(made, 0, "a fill stopped before its column-only transaction still made the columns");
+}
+
 // ---- L1: two explicit checkpoints ----
 
 #[test]

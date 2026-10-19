@@ -3750,11 +3750,28 @@ fn run_links_fill(shared: &StoreMutex, writer: &Mutex<Catalog>, group: &Group, m
     let in_batch = LINKS_FILL_COLUMNS_IN_BATCH.load(Ordering::Acquire);
     #[cfg(not(test))]
     let in_batch = false;
+    // Test builds (lead ruling LOW 4 on l4-rev-h1's re-review): a fill held before its column-only
+    // transaction; `LINKS_FILL_BEFORE_COLUMNS_HELD` counts the fills that reached the hold, and this
+    // fill's place among them is `nth` (0: the first).
+    #[cfg(test)]
+    let nth = {
+        let nth = LINKS_FILL_BEFORE_COLUMNS_HELD.fetch_add(1, Ordering::AcqRel);
+        while LINKS_FILL_HOLD_BEFORE_COLUMNS.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        nth
+    };
     if !in_batch && !fe_mutant("l4_columns_in_first_batch") {
         let mut w = writer.lock();
         let ready = w.links()
             || match w.begin().and_then(|()| w.make_link_columns()).and_then(|()| w.commit()) {
-                Ok(()) => true,
+                Ok(()) => {
+                    #[cfg(test)]
+                    if nth == 0 {
+                        LINKS_FILL_FIRST_MADE_COLUMNS.store(true, Ordering::Release);
+                    }
+                    true
+                }
                 Err(e) => {
                     w.rollback();
                     let _ = w.refresh_links();
@@ -3925,6 +3942,15 @@ pub(crate) static LINKS_FILL_HOLD_AT_ENTRY: AtomicBool = AtomicBool::new(false);
 pub(crate) static LINKS_FILL_COLUMNS_IN_BATCH: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 pub(crate) static LINKS_FILL_ENTRY_HELD: AtomicU64 = AtomicU64::new(0);
+/// Test builds (lead ruling LOW 4): while set, a fill thread waits before its column-only transaction;
+/// `LINKS_FILL_BEFORE_COLUMNS_HELD` counts the fills that reached that point;
+/// `LINKS_FILL_FIRST_MADE_COLUMNS`: the first of them committed its column-only transaction.
+#[cfg(test)]
+pub(crate) static LINKS_FILL_HOLD_BEFORE_COLUMNS: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+pub(crate) static LINKS_FILL_BEFORE_COLUMNS_HELD: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+pub(crate) static LINKS_FILL_FIRST_MADE_COLUMNS: AtomicBool = AtomicBool::new(false);
 
 /// A fuzzy checkpoint's cut, after its catalog commit and before its install, holding no lock but
 /// briefly the store mutex (lead review 1 item 7, review 2 #5): wait — not holding the mutex — for
@@ -6323,6 +6349,13 @@ impl BranchStore {
         // (test builds only): no wait, as before.
         while !fe_mutant("l4_second_compaction_busy") && self.inner.lock().cat.as_ref().is_some_and(|c| c.filling) {
             std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// The link fill stops after the batch it is in (links adversary L4), as at close.
+    fn stop_links_fill(&self) {
+        if let Some(cat) = self.inner.lock().cat.as_mut() {
+            cat.filling = false;
         }
     }
 
@@ -9197,6 +9230,12 @@ impl BranchStore {
         (inner.children.moved.len(), inner.children.relinked.len())
     }
 
+    /// Test builds (lead ruling LOW 4): stop the link fill as a close does, without closing.
+    #[cfg(test)]
+    pub(crate) fn stop_links_fill_for_test(&self) {
+        self.stop_links_fill();
+    }
+
     /// Test builds: whether this store's catalog has the link columns (format 21/22 or upgraded).
     #[cfg(test)]
     pub(crate) fn catalog_links_for_test(&self) -> bool {
@@ -9357,9 +9396,7 @@ impl Drop for BranchStore {
         self.group.confirm_hold.store(0, Ordering::Release);
         // The link fill stops after the batch it is in (links adversary L4): the next open fills
         // again from the first row.
-        if let Some(cat) = self.inner.lock().cat.as_mut() {
-            cat.filling = false;
-        }
+        self.stop_links_fill();
         self.join_flights();
         // The name filter's build holds the store's files too: stopped, then joined.
         self.name_filter_stop.store(true, Ordering::Release);
