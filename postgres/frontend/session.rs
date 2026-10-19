@@ -4367,14 +4367,23 @@ fn handle_pg_copy_from_stdin(
 /// Whether a COPY's text reads from the client: the token after its FROM keyword is the bare word
 /// STDIN or STDOUT (PostgreSQL's copy_file_name takes either; recorded, copy-stdin-pg18.txt
 /// `fromstdout`), read as the lexer reads it, past comments (`--`, nested `/* */`), string literals
-/// (`''` doubled, an E'' string's backslash escapes) and quoted names (`""` doubled). A COPY's
-/// first top-level FROM is its source (a column named from is quoted). Read as a run of
+/// (`''` doubled, an E'' string's backslash escapes) and quoted names (`""` doubled). The FROM is
+/// the one after the relation (a qualified name, whose parts after a dot may be reserved words:
+/// `COPY public.from FROM STDIN`, recorded `from2`) and its column list. Read as a run of
 /// apostrophes, an apostrophe in a comment or a quoted name hid STDIN (the second review of
-/// b74a48d82), and a table or column named stdin made `FROM ''` read the client.
+/// b74a48d82), a table or column named stdin made `FROM ''` read the client, and a relation named
+/// from was taken for the FROM (review wire-rev-copystdin L1).
 fn names_stdin(sql: &str) -> bool {
+    /// A token of the text, as the lexer reads it.
+    #[derive(PartialEq)]
+    enum Tok<'a> {
+        Word(&'a [u8]),
+        Quoted,
+        Punct(u8),
+    }
     let b = sql.as_bytes();
     let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c >= 0x80;
-    let mut after_from = false;
+    let mut toks = Vec::new();
     let mut i = 0;
     while i < b.len() {
         let c = b[i];
@@ -4399,12 +4408,12 @@ fn names_stdin(sql: &str) -> bool {
                 }
             }
         } else if c == b'\'' || c == b'"' {
-            if after_from {
-                return false;
-            }
             // An E'' string reads backslash escapes; its E was the word just before, adjacent.
             let escapes = c == b'\'' && i > 0 && b[i - 1].eq_ignore_ascii_case(&b'e')
                 && (i < 2 || !word(b[i - 2]));
+            if escapes {
+                toks.pop();
+            }
             i += 1;
             while i < b.len() {
                 if escapes && b[i] == b'\\' {
@@ -4420,24 +4429,54 @@ fn names_stdin(sql: &str) -> bool {
                     i += 1;
                 }
             }
+            toks.push(Tok::Quoted);
         } else if word(c) {
             let start = i;
             while i < b.len() && word(b[i]) {
                 i += 1;
             }
-            let token = &b[start..i];
-            if after_from {
-                return token.eq_ignore_ascii_case(b"stdin") || token.eq_ignore_ascii_case(b"stdout");
-            }
-            after_from = token.eq_ignore_ascii_case(b"from");
+            toks.push(Tok::Word(&b[start..i]));
         } else {
-            if after_from {
-                return false;
-            }
+            toks.push(Tok::Punct(c));
             i += 1;
         }
     }
-    false
+    let is = |t: Option<&Tok>, w: &[u8]| matches!(t, Some(Tok::Word(x)) if x.eq_ignore_ascii_case(w));
+    let mut t = toks.iter();
+    if !is(t.next(), b"copy") {
+        return false;
+    }
+    // The relation: a name, then `.name` parts, each a word (a reserved one such as `from` too)
+    // or a quoted name.
+    let mut next = t.next();
+    loop {
+        if !matches!(next, Some(Tok::Word(_) | Tok::Quoted)) {
+            return false;
+        }
+        next = t.next();
+        if next != Some(&Tok::Punct(b'.')) {
+            break;
+        }
+        next = t.next();
+    }
+    // The column list.
+    if next == Some(&Tok::Punct(b'(')) {
+        let mut depth = 1;
+        while depth > 0 {
+            match t.next() {
+                Some(Tok::Punct(b'(')) => depth += 1,
+                Some(Tok::Punct(b')')) => depth -= 1,
+                Some(_) => {}
+                None => return false,
+            }
+        }
+        next = t.next();
+    }
+    if !is(next, b"from") {
+        return false;
+    }
+    let source = t.next();
+    is(source, b"stdin") || is(source, b"stdout")
 }
 
 /// The options COPY FROM refuses before it reads any row: one PostgreSQL knows that this COPY
