@@ -5195,9 +5195,12 @@ fn a_schema_window_reread_allocates_at_most_linearly_in_tables() {
 }
 
 /// Review 2 L6 (an engine FIX, one-time per database): a store's first create creates its catalog,
-/// under the store mutex: `Catalog::open` runs 13 `CREATE ... IF NOT EXISTS` statements, each its
-/// own commit, sets 2 pragmas and prepares 42 statements, then the meta row commits in a transaction
-/// of its own. Budgets, against the reopened reference in the same cell (both creates are a trunk's
+/// under the store mutex (`ensure_backing`). As measured by fastest-engine at turso 6a30fba7c
+/// (engine-fcdiag-6a30fba7c-iccad4, artie 81fcf7f004; this text was written against an older catalog,
+/// whose 13 CREATEs each committed and 42 statements were prepared eagerly): the schema is ONE
+/// transaction and statements are compiled lazily, and each first create compiles 40 statements
+/// there (26 in the schema closure, 8 pragmas on 2 connections, 2 lazy meta statements, 2 BEGIN/COMMIT,
+/// 1 + 1 for the meta transaction), the meta row committing in a transaction of its own. Budgets, against the reopened reference in the same cell (both creates are a trunk's
 /// first child, so both take the trunk's WAL write lock once):
 /// * the catalog is created in ONE commit: the fresh create's write transactions exceed the
 ///   reference's by at most 1 (the schema and the meta row together; 13 + 1 on macOS at the time it was written; on Linux, at e40d9c2e2, fresh 3 against the reference's 1, budgets-rev-242345 LOW-12);
