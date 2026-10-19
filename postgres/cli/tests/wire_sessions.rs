@@ -6662,8 +6662,9 @@ fn primary_key_columns_are_reported_not_null() {
 }
 
 /// information_schema's catalog columns name the database current_database() and pg_database
-/// name (the file's stem), so `WHERE table_catalog = current_database()` keeps every row; they
-/// said "turso" whatever the file (wire review 2 item 10).
+/// name (the database the client named at startup since ea5d59c84, the lead's MED-2 ruling; the
+/// file's stem before), so `WHERE table_catalog = current_database()` keeps every row; they said
+/// "turso" whatever the file (wire review 2 item 10).
 #[test]
 fn information_schema_catalog_is_the_current_database() {
     let dir = Scratch::new("infocatalog");
@@ -6674,8 +6675,8 @@ fn information_schema_catalog_is_the_current_database() {
         .ok("c");
     assert_eq!(
         a.q("SELECT current_database()").single("current_database"),
-        "w",
-        "premise: the database is named after its file"
+        "postgres",
+        "premise: the database is named as the client named it at startup"
     );
     for (view, catalogs) in [
         ("tables", &["table_catalog"][..]),
