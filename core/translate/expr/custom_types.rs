@@ -1388,6 +1388,83 @@ mod tests {
         );
     }
 
+    /// fastest-wire 0b092d531 (PGDIV, recorded against PostgreSQL 18.6): varchar(n)'s length coercion
+    /// cuts a value whose characters past n are all spaces to n characters and stores it; only a
+    /// non-space past n is refused (22001). Per column, at the store: a bound 'abc   ' stores 'abc' in
+    /// varchar(3), a literal 'ab      ' stores 'ab   ' in varchar(5), an UPDATE assigns the cut value;
+    /// a tab past n is not a space and is refused, and 'abcdef' still is. A comparison is not an
+    /// assignment: `v = 'abc   '` finds no 'abc' (PostgreSQL compares the texts), by the seek of an
+    /// index on v and by a scan alike. At the base each store raises 'value too long'.
+    #[test]
+    fn a_varchar_value_whose_excess_is_spaces_is_cut_to_its_length() {
+        let conn = open();
+        conn.execute("CREATE TABLE vc(id INTEGER PRIMARY KEY, v varchar(5), w varchar(3)) STRICT")
+            .unwrap();
+        conn.execute("CREATE INDEX vcw ON vc(w)").unwrap();
+        let mut wrong = Vec::new();
+        let stored = |conn: &Arc<crate::Connection>, id: i64| -> Option<(String, String)> {
+            let mut stmt = conn.prepare(&format!("SELECT v, w FROM vc WHERE id = {id}")).ok()?;
+            let rows = stmt.run_collect_rows().ok()?;
+            let row = rows.first()?;
+            Some((row[0].to_string(), row[1].to_string()))
+        };
+        for (sql, id, want) in [
+            ("INSERT INTO vc VALUES (20, 'ab      ', 'x')", 20, ("ab   ", "x")),
+            ("INSERT INTO vc VALUES (21, 'abcde ', 'abc   ')", 21, ("abcde", "abc")),
+        ] {
+            if let Err(e) = conn.execute(sql) {
+                wrong.push(format!("{sql}: {e}"));
+            } else if stored(&conn, id) != Some((want.0.to_string(), want.1.to_string())) {
+                wrong.push(format!("{sql}: stored {:?}, PostgreSQL {want:?}", stored(&conn, id)));
+            }
+        }
+        match conn.prepare("INSERT INTO vc VALUES (22, 'p', ?1)").and_then(|mut s| {
+            s.bind_at(1.try_into().unwrap(), Value::build_text("abc   "))?;
+            s.run_collect_rows()
+        }) {
+            Ok(_) if stored(&conn, 22) == Some(("p".to_string(), "abc".to_string())) => {}
+            other => wrong.push(format!("bound 'abc   ' into varchar(3): {other:?}, stored {:?}", stored(&conn, 22))),
+        }
+        match conn.execute("UPDATE vc SET v = 'xy        ' WHERE id = 20") {
+            Ok(_) if stored(&conn, 20).map(|r| r.0) == Some("xy   ".to_string()) => {}
+            other => wrong.push(format!("UPDATE to 'xy        ': {other:?}, stored {:?}", stored(&conn, 20))),
+        }
+        for sql in ["INSERT INTO vc VALUES (23, 'abcde\t', 'x')", "INSERT INTO vc VALUES (24, 'abcdef', 'x')"] {
+            match conn.execute(sql) {
+                Err(e) if e.to_string() == "value too long for type character varying(5)" => {}
+                other => wrong.push(format!("{sql}: {other:?}, PostgreSQL refuses it (22001)")),
+            }
+        }
+        assert!(wrong.is_empty(), "CLAIM: PostgreSQL's excess-space rule, per column: {wrong:#?}");
+        answers_by_both_plans(
+            &conn,
+            "vc",
+            "vcw",
+            &[("w = 'abc'", None, 2), ("w = 'abc   '", None, 0), ("w = ?1", Some(Value::build_text("abc   ")), 0)],
+        );
+    }
+
+    /// A range over an indexed varchar(n) or smallint column with a bound its ENCODE refuses ('value
+    /// too long', 'out of range') answers what a scan answers: the bound compares as itself. Engine
+    /// review 20 item 9 made a refused key's seek EMPTY, which is right for '=' and wrong for a
+    /// range: `v < 'abcdef'` over varchar(3) holds 'abc', and `s < 40000` over smallint holds 7.
+    #[test]
+    fn a_range_with_a_bound_the_type_refuses_answers_as_a_scan_does() {
+        let conn = open();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v varchar(3), s smallint) STRICT")
+            .unwrap();
+        conn.execute("CREATE INDEX tv ON t(v)").unwrap();
+        conn.execute("CREATE INDEX ts ON t(s)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'abc', 7)").unwrap();
+        answers_by_both_plans(
+            &conn,
+            "t",
+            "tv",
+            &[("v < 'abcdef'", None, 1), ("v > 'abcdef'", None, 0), ("v <= 'abd   '", None, 1)],
+        );
+        answers_by_both_plans(&conn, "t", "ts", &[("s < 40000", None, 1), ("s > -40000", None, 1), ("s > 40000", None, 0)]);
+    }
+
     /// Engine review 20 LOW 27 (b): 150a70db0's arm, a type whose value input is `any` (numeric)
     /// takes any non-literal constant operand but a COLLATE one, had no test: `x = abs(-1.5)` and
     /// `x = 1 + 1` on numeric(10, 2) find 1.50 and 2.00, through the type's '=', as a scan.
