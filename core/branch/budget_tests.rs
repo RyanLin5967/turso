@@ -4860,7 +4860,7 @@ fn a_schema_window_reread_allocates_at_most_linearly_in_tables() {
 /// of its own. Budgets, against the reopened reference in the same cell (both creates are a trunk's
 /// first child, so both take the trunk's WAL write lock once):
 /// * the catalog is created in ONE commit: the fresh create's write transactions exceed the
-///   reference's by at most 1 (the schema and the meta row together; today 13 + 1);
+///   reference's by at most 1 (the schema and the meta row together; 13 + 1 on macOS at the time it was written; on Linux, at e40d9c2e2, fresh 3 against the reference's 1, budgets-rev-242345 LOW-12);
 /// * nothing is compiled under the store mutex to create it: `held_prepares` equal to the
 ///   reference's (the catalog's creation needs nothing the mutex guards: it can be made and
 ///   prepared before the mutex is taken, or at the open);
