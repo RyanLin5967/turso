@@ -60,7 +60,9 @@ def run(binary, mutant, outdir, label):
         env["FE_MUTANT"] = mutant
     trace = os.path.join(outdir, f"{label}.strace")
     proc = subprocess.run(
-        ["strace", "-f", "-y", "-e", f"trace={SYSCALLS}", "-o", trace, binary, "--test-threads=1", "--nocapture"],
+        # -s 256: strace's default 32-character strings cut the window markers short, so the
+        # strict arms never joined their readings (engine-rev-l2b HIGH C).
+        ["strace", "-f", "-y", "-s", "256", "-e", f"trace={SYSCALLS}", "-o", trace, binary, "--test-threads=1", "--nocapture"],
         env=env, capture_output=True, text=True,
     )
     with open(os.path.join(outdir, f"{label}.out"), "w") as f:
@@ -113,32 +115,61 @@ def main():
     print(f"reading binary {reading_bin} sha256={sha256(reading_bin)}")
     print(f"fire-check binary {fire_bin} sha256={sha256(fire_bin)}")
     base_r, base_c = run(fire_bin, None, outdir, "fire-unmutated")
-    run(reading_bin, None, outdir, "reading")
     if not base_r:
         print("NOTHING READ: the unmutated fire-check binary printed no reading (every arm void?)")
         sys.exit(2)
     failed = []
+    # The zero-create controls read 0 file writes and 0 flushes on the creating thread (amendment 2,
+    # Fire-checks), unmutated.
+    for key, c in base_c.items():
+        if key[0] == "control" and (c.get("writes", 0) or c.get("flushes", 0)):
+            print(f"CONTROL {key}: {c.get('writes', 0)} writes, {c.get('flushes', 0)} flushes (must be 0)")
+            failed.append(f"control {key}")
+    # The equality between the binaries: per arm (live; strict at N = 1000), each count's maximum
+    # over the unmutated runs must be the same on the reading and the fire-check binary.
+    read_r, read_c = run(reading_bin, None, outdir, "reading-equality")
+    for arm in ("live", "strict_n1000"):
+        for count in ("writes", "flushes"):
+            a = max((v.get(count, 0) for k, v in base_c.items() if k[0] == arm), default=None)
+            b = max((v.get(count, 0) for k, v in read_c.items() if k[0] == arm), default=None)
+            if a != b:
+                print(f"EQUALITY {arm} {count}: fire-check {a}, reading {b} (the fire-checks are void)")
+                failed.append(f"equality {arm} {count}")
+        for count in ("allocs", "chunk_inline_allocs"):
+            a = max((int(v[count]) for k, v in base_r.items() if k[0] == arm and count in v), default=None)
+            b = max((int(v[count]) for k, v in read_r.items() if k[0] == arm and count in v), default=None)
+            if a != b:
+                print(f"EQUALITY {arm} {count}: fire-check {a}, reading {b} (the fire-checks are void)")
+                failed.append(f"equality {arm} {count}")
     for mutant in MUTANTS:
         mr, mc = run(fire_bin, mutant, outdir, f"fire-{mutant}")
-        fired = False
+        # Each registered fire-check must fire in the live AND the strict arm (amendment 2,
+        # "Fire-checks, each in the live and the strict arm"); async_waits_durable's registered
+        # amount is the strict arm at N = 2 only.
+        arms = ("strict_n2",) if mutant == "async_waits_durable" else ("live", "strict_n1000")
+        fired_in = {arm: False for arm in arms}
         for key, base in base_r.items():
             arm = key[0]
+            if arm not in fired_in:
+                continue
             mut = mr.get(key)
             if mut is None or "void" in base or "void" in mut:
                 continue
             n = int(base.get("n", "0"))
             bc, mcnt = base_c.get(key, {}), mc.get(key, {})
             if mutant == "create_path_pwrite":
-                fired |= mcnt.get("writes", 0) - bc.get("writes", 0) == n
+                hit = mcnt.get("writes", 0) - bc.get("writes", 0) == n
             elif mutant == "create_path_fullfsync":
-                fired |= mcnt.get("flushes", 0) - bc.get("flushes", 0) == n
+                hit = mcnt.get("flushes", 0) - bc.get("flushes", 0) == n
             elif mutant == "record_alloc_on_create":
-                fired |= int(mut["allocs"]) - int(base["allocs"]) == n
+                hit = int(mut["allocs"]) - int(base["allocs"]) == n
             elif mutant == "chunk_inline":
-                fired |= int(mut["chunk_inline_allocs"]) > 0 and int(mut["allocs"]) > int(base["allocs"])
-            elif mutant == "async_waits_durable" and arm == "strict_n2":
-                fired |= mcnt.get("flushes", 0) - bc.get("flushes", 0) >= 1
-        print(f"FIRE-CHECK {mutant}: {'FIRED' if fired else 'DID NOT FIRE'}")
+                hit = int(mut["chunk_inline_allocs"]) > 0 and int(mut["allocs"]) > int(base["allocs"])
+            else:
+                hit = mcnt.get("flushes", 0) - bc.get("flushes", 0) >= 1
+            fired_in[arm] |= hit
+        fired = all(fired_in.values())
+        print(f"FIRE-CHECK {mutant}: {'FIRED' if fired else 'DID NOT FIRE'} {fired_in}")
         if not fired:
             failed.append(mutant)
     sys.exit(1 if failed else 0)
