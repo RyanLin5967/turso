@@ -3170,4 +3170,41 @@ mod tests {
         }
         assert!(bad.is_empty(), "CLAIM: a CAST to a custom type was announced as a type it does not yield: {bad:#?}");
     }
+
+    #[test]
+    fn probe_typesrev_side_effects() {
+        let conn = open();
+        for sql in [
+            "CREATE DOMAIN dpos AS numeric(8, 2) CHECK (VALUE > 0)",
+            "CREATE TABLE d(id INTEGER PRIMARY KEY, a dpos) STRICT",
+            "INSERT INTO d VALUES (1, 1.5), (2, 10)",
+            "PRAGMA integrity_check",
+            "SELECT sum(a), typeof(sum(a)) FROM d",
+            "SELECT a + 1, typeof(a + 1) FROM d ORDER BY id",
+            "SELECT a FROM d ORDER BY a DESC",
+            "CREATE TABLE tc(id INTEGER PRIMARY KEY, b numeric(8, 2) CHECK (b > 0)) STRICT",
+            "INSERT INTO tc VALUES (1, 1.5)",
+            "INSERT INTO tc VALUES (2, -1)",
+            "CREATE TABLE n(id INTEGER PRIMARY KEY, b numeric(8, 2)) STRICT",
+            "INSERT INTO n VALUES (1, 1.00), (2, 2.00), (3, NULL), (4, 10.00)",
+            "SELECT sum(b) + 1 FROM n",
+            "SELECT b FROM n WHERE b = (SELECT max(b) FROM n)",
+            "SELECT n.id FROM n JOIN (SELECT b AS bb FROM n) q ON n.b = q.bb ORDER BY n.id",
+            "CREATE TABLE vc(id INTEGER PRIMARY KEY, v varchar(5)) STRICT",
+            "INSERT INTO vc VALUES (1, 'abc')",
+            "UPDATE OR IGNORE vc SET v = 'abcdef' WHERE id = 1",
+            "SELECT v FROM vc",
+            "SELECT CAST('1.5' AS NUMERIC), typeof(CAST('1.5' AS NUMERIC))",
+            "CREATE TABLE p(id INTEGER PRIMARY KEY, x NUMERIC)",
+            "INSERT INTO p VALUES (1, 5), (2, 'abc')",
+            "SELECT x FROM (SELECT x FROM p) WHERE x = 5",
+            "SELECT count(*) FROM (SELECT b FROM n) WHERE b > 1.5",
+        ] {
+            println!("PROBE {sql} => {:?}", table_of(&conn, sql));
+        }
+        for sql in ["SELECT CAST(1.5 AS numeric(8, 2))", "SELECT sum(b) FROM n", "SELECT a FROM d", "SELECT CAST('2024-01-02' AS date)"] {
+            let ty = conn.prepare(sql).ok().and_then(|s| s.get_column_type_info(0).ok().flatten()).map(|i| (i.declared_name, i.base_type));
+            println!("PROBE-TI {sql} => {ty:?}");
+        }
+    }
 }
