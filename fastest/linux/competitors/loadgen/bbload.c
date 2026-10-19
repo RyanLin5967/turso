@@ -1315,7 +1315,12 @@ int main(int argc, char **argv) {
 #define NUMU(flag, var, lo, hi) else if (!strcmp(a, flag) && v) { if (num_u(flag, v, lo, hi, &var)) return 2; i++; }
         if (!strcmp(a, "--spec") && v) specp = argv[++i];
         else if (!strcmp(a, "--out") && v) out = argv[++i];
-        else if (!strcmp(a, "--clients") && v) C = atoi(argv[++i]);
+        else if (!strcmp(a, "--clients") && v) { /* comp-rev-89ec-b3c3 LOW 7: it was atoi ("4x" ran 4 clients) */
+            uint64_t cv;
+            if (num_u(a, v, 1, 100000, &cv)) return 2;
+            C = (int)cv;
+            i++;
+        }
         else if (!strcmp(a, "--mode") && v) { OPEN_LOOP = !strcmp(v, "open"); if (strcmp(v, "open") && strcmp(v, "closed")) { fprintf(stderr, "bbload: --mode closed|open\n"); return 2; } i++; }
         NUMD("--rate", RATE, 1e-6, 1e9)
         else if (!strcmp(a, "--warmup-s") && v) { if (num_d(a, v, 0, 1e7, &WARM_S)) return 2; warm_legacy = 1; i++; }
@@ -1337,7 +1342,15 @@ int main(int argc, char **argv) {
         NUMD("--duration-s", DUR_S, 0, 1e7)
         NUMU("--min-ops", MIN_OPS, 0, UINT64_MAX)
         NUMU("--max-ops", MAX_OPS, 0, UINT64_MAX)
-        NUMD("--max-window-s", MAXWIN_S, 0, 1e8)
+        /* comp-rev-89ec-b3c3 LOW 7: a bound, never "none" -- 0 was accepted (clonebench read 0 as no bound) */
+        else if (!strcmp(a, "--max-window-s") && v) {
+            if (num_d(a, v, 0, 1e8, &MAXWIN_S)) return 2;
+            if (!(MAXWIN_S > 0)) {
+                fprintf(stderr, "bbload: --max-window-s needs a number in (0, 1e+08] (a bound, never 'none'), got '%s'\n", v);
+                return 2;
+            }
+            i++;
+        }
         NUMD("--stall-s", STALL_S, 0, 1e7)
         NUMD("--max-send-late-us", MAX_SEND_LATE_US, 0, 1e9)
         else if (!strcmp(a, "--run-tag") && v) snprintf(RUNTAG, sizeof RUNTAG, "%s", argv[++i]);
@@ -1405,11 +1418,17 @@ int main(int argc, char **argv) {
     char *spectext = NULL;
     if (load_spec(specp, &spectext) != 0) return 2;
     if (OPEN_LOOP) { /* the macOS bbload's review 4 M6 (comp review 1 LOW 23, review 2 item 5) */
-        int branch = 0;
-        for (int k = 0; k < S.nstep; k++) branch |= S.step[k].k == K_CONNECT || S.step[k].k == K_CLOSE || S.step[k].serial;
-        if (S.nafter || branch) {
-            fprintf(stderr, "bbload: REFUSED: open loop with after-steps, a branch connection or sql-serial would charge "
-                            "their time to the server as queueing; run it closed loop\n");
+        /* comp-rev-89ec-b3c3 LOW 6: each clause its own reason (one message for all three let a case pass whichever
+         * clause fired, so a mutant dropping one passed every case) */
+        int conn = 0, serial = 0;
+        for (int k = 0; k < S.nstep; k++) {
+            conn |= S.step[k].k == K_CONNECT || S.step[k].k == K_CLOSE;
+            serial |= S.step[k].serial;
+        }
+        const char *what = S.nafter ? "after-steps" : conn ? "a connect or close step" : serial ? "a sql-serial step" : NULL;
+        if (what) {
+            fprintf(stderr, "bbload: REFUSED: open loop with %s: its time would be charged to the server as queueing; "
+                            "run it closed loop\n", what);
             return 2;
         }
     }
@@ -1631,7 +1650,11 @@ int main(int argc, char **argv) {
         pool_p50 = pct(pl, npl, 50) / 1e3;
         pool_p99 = pct(pl, npl, 99) / 1e3;
         pool_max = npl ? pl[npl - 1] / 1e3 : 0;
-        /* FIFO: a measured arrival that waited > 50 us although some LATER arrival had been claimed before it was */
+        /* FIFO: a measured arrival that waited > 50 us although some LATER arrival had been claimed before it was.
+         * comp-rev-89ec-b3c3 LOW 8: claim_op takes the arrival's index and its claim time in ONE critical section
+         * (g_claim_mu), so with this claim path the count is 0 by construction: it shows that nothing claimed out of
+         * arrival order, not that a scheduler kept FIFO. timedrun.py record_problems refuses a non-zero (or missing)
+         * count, so a change that splits that section is caught there; the macOS bbload records the same field. */
         uint64_t *csuf = malloc((na + 1) * sizeof *csuf);
         csuf[na] = UINT64_MAX;
         for (size_t i = na; i-- > 0;) csuf[i] = byarr[i]->claim < csuf[i + 1] ? byarr[i]->claim : csuf[i + 1];

@@ -103,6 +103,7 @@ static inline void c1b_opstart(c1b_client *c, uint64_t op, const char *l) { (voi
 static inline void c1b_ack(c1b_client *c, uint64_t op, const char *l) { (void)c; (void)op; (void)l; }
 #endif
 #include <errno.h>
+#include <limits.h>
 #include <hdr/hdr_histogram.h>
 #include <pthread.h>
 #include <sqlite3.h>
@@ -325,8 +326,10 @@ static volatile uint64_t g_exited;
 static struct rusage g_ru0, g_ru1;
 static uint64_t g_fl0, g_fl1;
 static int g_tp_tm0 = -2, g_tp_tm1 = -2; /* MED 4: own TracerPid at the window's start and end (-2: never reached) */
-/* --max-window-s S (gate-6 review, t3run item 16): the registered per-run cap as a bound on the measured window (0: none). */
-static double MAXWIN_S;
+/* --max-window-s S (gate-6 review, t3run item 16): the registered per-run cap as a bound on the measured window.
+ * comp-rev-89ec-b3c3 LOW 7: always a bound, as bbload's (default 3600 s; 0 is refused). It used to default to 0, "none",
+ * so --max-ops -1 (strtoull: 2^64-1) ran until the outer timeout. */
+static double MAXWIN_S = 3600;
 static uint64_t DUR_NS, MAXWIN_NS; /* DUR_S and MAXWIN_S truncated to ns once */
 static int CAPPED;
 static int g_dirfd;
@@ -704,6 +707,36 @@ static int cmp_rec(const void *a, const void *b) {
     return x->start < y->start ? -1 : x->start > y->start;
 }
 
+/* comp-rev-89ec-b3c3 LOW 7: strict numeric flags, bbload's num_d / num_u (the whole string, finite, in range, or
+ * exit 2); every numeric flag of `clonebench run` goes through them (atoi, atof and strtoull took "4x", "nan", "-1") */
+static int num_d(const char *flag, const char *v, double lo, double hi, double *out) {
+    char *e = NULL;
+    errno = 0;
+    double d = v ? strtod(v, &e) : 0;
+    if (!v || !*v || !e || *e || errno || !isfinite(d) || d < lo || d > hi) {
+        fprintf(stderr, "clonebench run: %s needs a number in [%g, %g], got '%s'\n", flag, lo, hi, v ? v : "");
+        return -1;
+    }
+    *out = d;
+    return 0;
+}
+static int num_u(const char *flag, const char *v, uint64_t lo, uint64_t hi, uint64_t *out) {
+    uint64_t x = 0;
+    int okv = v && *v;
+    for (const char *p = v; okv && *p; p++) {
+        uint64_t dg = (uint64_t)(*p - '0');
+        if (*p < '0' || *p > '9' || x > (UINT64_MAX - dg) / 10) okv = 0;
+        else x = x * 10 + dg;
+    }
+    if (!okv || x < lo || x > hi) {
+        fprintf(stderr, "clonebench run: %s needs a whole number in [%llu, %llu], got '%s'\n", flag,
+                (unsigned long long)lo, (unsigned long long)hi, v ? v : "");
+        return -1;
+    }
+    *out = x;
+    return 0;
+}
+
 static int cmd_run(int argc, char **argv) {
     const char *out = NULL, *v1run = NULL;
     int warm_rule_flag = 0, warm_legacy = 0; /* MED 7: --warmup and --warmup-ops may not be mixed */
@@ -716,13 +749,26 @@ static int cmd_run(int argc, char **argv) {
         else if (!strcmp(a, "--sync") && v) { SYNC_D0 = !strcmp(v, "d0") ? 1 : !strcmp(v, "d2") ? 0 : -1; i++; }
         else if (!strcmp(a, "--parent") && v) PARENT = argv[++i];
         else if (!strcmp(a, "--dir") && v) BDIR = argv[++i];
-        else if (!strcmp(a, "--clients") && v) C = atoi(argv[++i]);
+        else if (!strcmp(a, "--clients") && v) {
+            uint64_t cv;
+            if (num_u(a, v, 1, 100000, &cv)) return 2;
+            C = (int)cv;
+            i++;
+        }
         else if (!strcmp(a, "--out") && v) out = argv[++i];
-        else if (!strcmp(a, "--max-ops") && v) MAX_OPS = strtoull(argv[++i], NULL, 10);
-        else if (!strcmp(a, "--min-ops") && v) MIN_OPS = strtoull(argv[++i], NULL, 10);
-        else if (!strcmp(a, "--duration-s") && v) DUR_S = atof(argv[++i]);
-        else if (!strcmp(a, "--warmup-ops") && v) { WARM_OPS = strtoull(argv[++i], NULL, 10); warm_legacy = 1; }
-        else if (!strcmp(a, "--max-window-s") && v) MAXWIN_S = atof(argv[++i]);
+        else if (!strcmp(a, "--max-ops") && v) { if (num_u(a, v, 0, UINT64_MAX, &MAX_OPS)) return 2; i++; }
+        else if (!strcmp(a, "--min-ops") && v) { if (num_u(a, v, 0, UINT64_MAX, &MIN_OPS)) return 2; i++; }
+        else if (!strcmp(a, "--duration-s") && v) { if (num_d(a, v, 0, 1e7, &DUR_S)) return 2; i++; }
+        else if (!strcmp(a, "--warmup-ops") && v) { if (num_u(a, v, 0, UINT64_MAX, &WARM_OPS)) return 2; warm_legacy = 1; i++; }
+        else if (!strcmp(a, "--max-window-s") && v) {
+            if (num_d(a, v, 0, 1e8, &MAXWIN_S)) return 2;
+            if (!(MAXWIN_S > 0)) {
+                fprintf(stderr, "clonebench run: --max-window-s needs a number in (0, 1e+08] (a bound, never 'none'), "
+                                "got '%s'\n", v);
+                return 2;
+            }
+            i++;
+        }
         else if (!strcmp(a, "--warmup") && v) {  /* PREREG annex A23 */
             unsigned long long wo; double ws, wm; char extra;
             /* S and MAX_S finite (A23-AM1: MAX_S is a bound, 0 ends the warm-up at the first claim) and at most 1e7 s,
@@ -737,11 +783,16 @@ static int cmd_run(int argc, char **argv) {
             warm_rule_flag = 1;
             i++;
         }
-        else if (!strcmp(a, "--hold-us") && v) HOLD_US = strtoull(argv[++i], NULL, 10);
-        else if (!strcmp(a, "--rows") && v) ROWS = atol(argv[++i]);
-        else if (!strcmp(a, "--seed") && v) SEED = strtoull(argv[++i], NULL, 10);
+        else if (!strcmp(a, "--hold-us") && v) { if (num_u(a, v, 0, 60000000, &HOLD_US)) return 2; i++; }
+        else if (!strcmp(a, "--rows") && v) {
+            uint64_t rv;
+            if (num_u(a, v, 0, (uint64_t)LONG_MAX, &rv)) return 2;
+            ROWS = (long)rv;
+            i++;
+        }
+        else if (!strcmp(a, "--seed") && v) { if (num_u(a, v, 0, UINT64_MAX, &SEED)) return 2; i++; }
         else if (!strcmp(a, "--v1-run") && v) v1run = argv[++i];
-        else if (!strcmp(a, "--v1-mark-base") && v) MARKB = strtoull(argv[++i], NULL, 0);
+        else if (!strcmp(a, "--v1-mark-base") && v) { if (num_u(a, v, 0, UINT64_MAX, &MARKB)) return 2; i++; }
         else if (!strcmp(a, "--drop")) DROP = 1;
         else if (!strcmp(a, "--no-drain")) NO_DRAIN = 1;
         else if (!strcmp(a, "--memstatus") && v) { MEMSTATUS = !strcmp(v, "1") ? 1 : !strcmp(v, "0") ? 0 : -1; i++; }
