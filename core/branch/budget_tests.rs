@@ -979,6 +979,7 @@ fn memory(cell: &str, built: &mut Built, out: &mut String) {
     // premise: the growth site ran.
     let base = probe::threads();
     let _ = probe::take_hold_maxima();
+    let e0 = exceptions(&db);
     super::store::FILTER_GROW_NEXT.store(true, std::sync::atomic::Ordering::Release);
     db.connect().unwrap().create_branch(&format!("{cell}-grow")).unwrap();
     db.branch_wait_name_filter();
@@ -988,6 +989,7 @@ fn memory(cell: &str, built: &mut Built, out: &mut String) {
     let mut g = Sample::new();
     g.insert("max_growth_hold_work", m.site_work[2]);
     g.insert("growth_runs", m.site_runs[2]);
+    put_exceptions(&mut g, e0, exceptions(&db));
     g.insert("quiet", u64::from(settled));
     line(out, cell, "growth", 0, &g);
 }
