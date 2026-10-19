@@ -287,6 +287,14 @@ def run_problems(nm, sm, warm_rule, cap):
 
 CLOCKS = ("CLOCK_MONOTONIC", "CLOCK_BOOTTIME")  # clocks that never step back (bbload's _Static_assert)
 PAIR_KEYS = ("loop", "mode", "rate", "clients", "seed")  # one command line: both runs of a cell share these
+# comp-rev-89ec-b3c3 LOW 3: and the keys that define each producer's command, which both runs must RECORD (None ==
+# None had passed): bbload (mode closed/open) runs one spec at one seed and rate; clonebench (b1/b0) has no seed or
+# rate, and its command is its op and sync
+PAIR_KEYS_BY_PRODUCER = {"bbload": ("loop", "mode", "rate", "clients", "seed", "spec"),
+                         "clonebench": ("loop", "mode", "clients", "op", "sync")}
+# comp-rev-89ec-b3c3 LOW 1: PREREG M3's open-loop lateness bound; a run is judged against it, not against the bound it
+# carries (bbload accepts --max-send-late-us up to 1e9)
+REGISTERED_MAX_SEND_LATE_US = 100.0
 
 
 def record_problems(nm, sm):
@@ -312,17 +320,30 @@ def record_problems(nm, sm):
     elif nd:
         why.append(f"{nm} run ran with --no-drain: its last measured ops ran under falling load (LOW 40's drain off)")
     if loop == "open":
-        bound = sm.get("max_send_late_us")
+        bound, reg = sm.get("max_send_late_us"), REGISTERED_MAX_SEND_LATE_US
         if not isinstance(bound, (int, float)) or isinstance(bound, bool):
             why.append(f"{nm} run is open loop with no max_send_late_us")
         else:
+            if bound != reg:  # LOW 1: the run's own bound is the one under test
+                why.append(f"{nm} run's max_send_late_us {float(bound)} us is not the registered {reg} us (PREREG M3)")
             for k in ("send_late_us", "pool_late_us"):
                 v = sm.get(k)
                 p99 = v.get("p99") if isinstance(v, dict) else None
                 if not isinstance(p99, (int, float)) or isinstance(p99, bool):
                     why.append(f"{nm} run is open loop with no {k} p99")
-                elif p99 > bound:
-                    why.append(f"{nm} run's {k} p99 {p99} us is over its bound {bound} us: VOID")
+                elif p99 > min(bound, reg):
+                    why.append(f"{nm} run's {k} p99 {p99} us is over "
+                               + (f"its bound {bound} us: VOID" if bound <= reg else f"the registered bound {reg} us: VOID"))
+        # LOW 1: written by bbload and judged here (they were written and never read)
+        ts = sm.get("timerslack_ok")
+        if ts is not True:
+            why.append(f"{nm} run's clients did not all get their 1 ns timer slack (timerslack_ok {ts!r})")
+        fv = sm.get("fifo_violations")
+        if not _count(fv):
+            why.append(f"{nm} run is open loop with no fifo_violations record ({fv!r})")
+        elif fv:
+            why.append(f"{nm} run has {fv} FIFO violation(s): a measured arrival waited although a later one was claimed "
+                       f"before it")
     return why
 
 
@@ -376,6 +397,38 @@ def raw_problems(nm, d, sm):
     nwarm = sum(1 for r in rows if r["phase"] == "warmup")
     if _count(wo) and nwarm != wo:
         why.append(f"{nm} run's raw.tsv holds {nwarm} warm-up rows, its summary warmup_ops {wo}")
+    # comp-rev-89ec-b3c3 LOW 2: the measured rows are the run the summary describes (a raw.tsv that lost one client's
+    # rows had kept its 'ok', with a latency file that is a subset)
+    meas = [r for r in rows if r["phase"] == "measure"]
+    mo, mok = sm.get("measured_ops"), sm.get("measured_ok")
+    if not _count(mo):
+        why.append(f"{nm} run has no measured_ops count ({mo!r})")
+    elif len(meas) != mo:
+        why.append(f"{nm} run's raw.tsv holds {len(meas)} measured rows, its summary measured_ops {mo}")
+    if not _count(mok):
+        why.append(f"{nm} run has no measured_ok count ({mok!r})")
+    else:
+        nok = sum(1 for r in meas if r.get("ok") == "1")
+        if nok != mok:
+            why.append(f"{nm} run's raw.tsv holds {nok} ok measured rows, its summary measured_ok {mok}")
+    # comp-rev-89ec-b3c3 LOW 16: a row's VALUES in its header's order, where the raw carries the clock columns (both
+    # producers do): claim <= start, intended <= start <= end, and lat == end - intended (each producer measures latency
+    # from the intended start: bbload end - intended, clonebench end - start with intended = start)
+    clk = ("claim_ns", "intended_ns", "start_ns", "end_ns", "lat_ns")
+    if all(c in cols for c in clk):
+        bad_lat = bad_order = 0
+        try:
+            for r in rows:
+                c, t, s, e, lat = (int(r[k]) for k in clk)
+                bad_order += not (c <= s and t <= s <= e)
+                bad_lat += lat != e - t
+        except (ValueError, TypeError):
+            return why + [f"{nm} run's raw.tsv has a clock column that is not a count"]
+        if bad_order:
+            why.append(f"{nm} run's raw.tsv has {bad_order} row(s) out of clock order (claim <= start, intended <= start "
+                       f"<= end)")
+        if bad_lat:
+            why.append(f"{nm} run's raw.tsv has {bad_lat} row(s) whose lat_ns is not end_ns - intended_ns")
     tm1 = sm.get("tm1_ns")
     if not _count(tm1) or not tm1:
         why.append(f"{nm} run has no tm1_ns: its window's end in intended time is unknown")
@@ -398,8 +451,15 @@ def raw_problems(nm, d, sm):
 def pair_problems(lab, t):
     """Both runs of a cell are one command line (run_system.sh bb_args / cb_args): they must agree on PAIR_KEYS
     (competitors review 2 items 2 and 10)."""
-    return [f"the labelling and timed runs differ in {k}: {lab.get(k)!r} against {t.get(k)!r}"
-            for k in PAIR_KEYS if lab.get(k) != t.get(k)]
+    # comp-rev-89ec-b3c3 LOW 3: the producer's own defining keys, each present in both runs (None == None had passed);
+    # a mode that is neither producer's is record_problems' refusal, and the common PAIR_KEYS still apply to it
+    modes = {lab.get("mode"), t.get("mode")}
+    keys = (PAIR_KEYS_BY_PRODUCER["clonebench"] if modes <= {"b1", "b0"} else
+            PAIR_KEYS_BY_PRODUCER["bbload"] if modes <= {"closed", "open"} else PAIR_KEYS)
+    return [f"the labelling and timed runs do not both record {k}: {lab.get(k)!r} and {t.get(k)!r}"
+            if lab.get(k) is None or t.get(k) is None else
+            f"the labelling and timed runs differ in {k}: {lab.get(k)!r} against {t.get(k)!r}"
+            for k in keys if lab.get(k) is None or t.get(k) is None or lab.get(k) != t.get(k)]
 
 
 def warm_check(d, warm_rule):
