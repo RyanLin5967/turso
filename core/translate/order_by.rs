@@ -110,14 +110,29 @@ pub(crate) fn cast_encoding_primitive(expr: &ast::Expr, schema: &Schema) -> Opti
     {
         return None;
     }
+    if !cast_applies_type(schema, ty) {
+        return None;
+    }
+    let resolved = schema.resolve_type_unchecked(&ty.name).ok().flatten()?;
+    Some(resolved.primitive.to_uppercase())
+}
+
+/// Whether `translate_expr` applies the custom type a CAST names (its `ast::Expr::Cast` arm): a
+/// domain always; a type when the CAST gives all the parameters it takes, or it takes none.
+/// Otherwise (CAST(x AS NUMERIC)) the CAST is SQLite's, by the name's affinity.
+fn cast_applies_type(schema: &Schema, ty: &ast::Type) -> bool {
     let given = match &ty.size {
         None => 0,
         Some(ast::TypeSize::MaxSize(_)) => 1,
         Some(ast::TypeSize::TypeSize(..)) => 2,
     };
-    let resolved = schema.resolve_type_unchecked(&ty.name).ok().flatten()?;
-    let wanted = resolved.leaf().user_params().count();
-    (resolved.is_domain() || wanted == 0 || wanted == given).then(|| resolved.primitive.to_uppercase())
+    match schema.resolve_type_unchecked(&ty.name) {
+        Ok(Some(resolved)) => {
+            let wanted = resolved.leaf().user_params().count();
+            resolved.is_domain() || wanted == 0 || wanted == given
+        }
+        _ => false,
+    }
 }
 
 /// `expr_custom_type` (`values` false) or `expr_value_type` (`values` true).
@@ -216,6 +231,13 @@ fn custom_type_of(
                 None => std::vec::Vec::new(),
             };
             if values && !cast_yields_values(schema, &ty.name) {
+                return None;
+            }
+            // A CAST the translator does not apply is SQLite's CAST, of no custom type: one that
+            // gives a type fewer parameters than it takes (CAST(x AS NUMERIC); review of this
+            // lane's fixes, item 1: its value took numeric's operators). Mutant
+            // `unapplied_cast_typed` (test builds only): typed, as before.
+            if !cast_applies_type(schema, ty) && !crate::branch::store::fe_mutant("unapplied_cast_typed") {
                 return None;
             }
             Some((type_def.clone(), params))
