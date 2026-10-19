@@ -1317,6 +1317,38 @@ mod tests {
         assert!(wrong.is_empty(), "CLAIM: a numeric sum and constant as PostgreSQL: {wrong:#?}");
     }
 
+    /// Lead ruling 2026-10-19 (fastest-wire 68f301ef0, PostgreSQL 18.6 recorded: timestamp -
+    /// timestamp and timestamptz - timestamptz are the interval '00:00:00'): with no interval type,
+    /// arithmetic over timestamp, timestamptz and time is REFUSED as not supported (0A000 at the
+    /// wire), never answered. At the base each is the plain arithmetic of two texts, silently: ts -
+    /// ts answered 0 and ts + 1 2027. Each refusal is `LimboError::FeatureNotSupported`, "interval
+    /// arithmetic is not supported", even over an empty operand row set's single row with NULLs.
+    /// date - date (a day count) is the control.
+    #[test]
+    fn timestamp_and_time_arithmetic_is_refused_until_an_interval_type_exists() {
+        let conn = open();
+        conn.execute("CREATE TABLE s(id INTEGER PRIMARY KEY, a timestamp, b timestamp, z timestamptz, y timestamptz, t time, u time, d date, e date) STRICT").unwrap();
+        conn.execute(
+            "INSERT INTO s VALUES (1, '2026-10-19 10:00:00', '2026-10-19 09:00:00', '2026-10-19 10:00:00+00:00', '2026-10-19 10:00:00+00:00', '10:00:00', '09:00:00', '2026-10-19', '2026-10-18')",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO s(id) VALUES (2)").unwrap();
+        let mut wrong = Vec::new();
+        for expr in ["a - b", "z - y", "t - u", "a + 1", "1 + a", "a - 1", "z + 1", "t + 1"] {
+            for id in [1, 2] {
+                match conn.prepare(&format!("SELECT {expr} FROM s WHERE id = {id}")).and_then(|mut s| s.run_collect_rows()) {
+                    Err(e) if format!("{e:?}").starts_with("FeatureNotSupported(") && e.to_string() == "interval arithmetic is not supported" => {}
+                    other => wrong.push(format!("{expr} (row {id}): {other:?}")),
+                }
+            }
+        }
+        match conn.prepare("SELECT d - e FROM s WHERE id = 1").and_then(|mut s| s.run_collect_rows()) {
+            Ok(rows) if rows[0][0].to_string() == "1" => {}
+            other => wrong.push(format!("control d - e: {other:?}")),
+        }
+        assert!(wrong.is_empty(), "CLAIM: refused as not supported, never answered: {wrong:#?}");
+    }
+
     /// fastest-wire 68f301ef0 (PostgreSQL 18.6 recorded on iccad2): a timestamptz literal whose
     /// offset has no minutes ('+00', '-03') or no colon ('+0530') is a valid PostgreSQL input, stored
     /// as the instant it names; here the ENCODE's datetime(value) took only '+HH:MM' and refused it
