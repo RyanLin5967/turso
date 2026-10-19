@@ -2664,6 +2664,99 @@ fn uncredited(c: &CellData) -> String {
 
 /// Whether this process is a budget child (whose parent tests must not run: they would spawn
 /// children of their own).
+/// budgets-port-adversary HIGH-1 (its ADV1): with one descriptor left, every per-task open in
+/// /proc/self/task fails with EMFILE, and a reader that takes any open failure for "the task is gone"
+/// skips every task and reports a complete, empty table (`Some(0)`; others_blocked `Some(true)` while a
+/// thread spins): a guard that cannot read its input falls through to allow. CLAIM: such a table is
+/// refused (None), and so is others_blocked. Positive control: with two descriptors left the table is
+/// read and lists the caller. In a child of its own (it lowers RLIMIT_NOFILE and fills the table).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_thread_table_read_without_descriptors_is_refused() {
+    use std::sync::atomic::{AtomicBool, Ordering::{Acquire, Release}};
+    if std::env::var_os("FE_FD_TABLE_CHILD").is_none() {
+        if in_child() || std::env::var_os("FE_FLAGS_CHILD").is_some() || std::env::var_os("FE_ARM_CHILD").is_some() || std::env::var_os("FE_THREAD_STATE_CHILD").is_some() {
+            return;
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["branch::budget_tests::a_thread_table_read_without_descriptors_is_refused", "--exact", "--test-threads=1", "--nocapture"])
+            .env("FE_FD_TABLE_CHILD", "1")
+            .env_remove("FE_BUDGET_CHILD")
+            .output()
+            .unwrap();
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        let at = |free: u64| {
+            let tag = format!("FD-TABLE free={free} ");
+            text.lines().find(|l| l.starts_with(&tag)).unwrap_or_else(|| panic!("premise: no reading with {free} free descriptors:\n{text}")).to_string()
+        };
+        let (one, two) = (at(1), at(2));
+        assert!(two.contains(" table=listed "), "premise: with 2 free descriptors the table is read and lists the caller ({two})");
+        assert!(one.contains(" table=refused ") && one.contains(" blocked=refused"), "CLAIM: with 1 free descriptor the thread table read as complete: {one}");
+        return;
+    }
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let parked = std::thread::Builder::new().name("fd-adv-parked".into()).spawn(move || {
+        let _ = rx.recv();
+    });
+    let stop = Arc::new(AtomicBool::new(false));
+    let spinner = {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            while !stop.load(Acquire) {
+                std::hint::spin_loop();
+            }
+        })
+    };
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let mut old = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    // SAFETY: a valid out-pointer.
+    assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut old) }, 0);
+    let low = libc::rlimit { rlim_cur: old.rlim_max.min(256), rlim_max: old.rlim_max };
+    // SAFETY: a soft limit at or under the hard one.
+    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &low) }, 0);
+    for free in [1usize, 2] {
+        let mut fds = Vec::with_capacity(256);
+        loop {
+            // SAFETY: a NUL-terminated path.
+            let fd = unsafe { libc::open(b"/dev/null\0".as_ptr().cast(), libc::O_RDONLY | libc::O_CLOEXEC) };
+            if fd < 0 {
+                break;
+            }
+            fds.push(fd);
+        }
+        for _ in 0..free {
+            if let Some(fd) = fds.pop() {
+                // SAFETY: a descriptor opened above.
+                unsafe { libc::close(fd) };
+            }
+        }
+        let mut t = [probe::ThreadCpu::EMPTY; 48];
+        let n = probe::thread_table(&mut t);
+        let blocked = probe::others_blocked();
+        for fd in fds {
+            // SAFETY: descriptors opened above.
+            unsafe { libc::close(fd) };
+        }
+        let table = match n {
+            None => "refused",
+            Some(n) if n >= 3 && t.iter().any(|x| x.me) => "listed",
+            Some(_) => "incomplete",
+        };
+        let blocked = match blocked {
+            None => "refused",
+            Some(true) => "all",
+            Some(false) => "some",
+        };
+        println!("FD-TABLE free={free} table={table} n={n:?} blocked={blocked}");
+    }
+    // SAFETY: the limit read above.
+    unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &old) };
+    stop.store(true, Release);
+    spinner.join().unwrap();
+    tx.send(()).unwrap();
+    parked.unwrap().join().unwrap();
+}
+
 fn in_child() -> bool {
     std::env::var_os("FE_BUDGET_CHILD").is_some()
 }
