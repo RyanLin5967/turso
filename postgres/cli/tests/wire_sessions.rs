@@ -7829,6 +7829,250 @@ fn copy_from_stdin_into_a_table_named_from() {
     assert_eq!(a.q("SELECT count(*) FROM \"from\"").single("count"), "2");
 }
 
+/// The server's CPU time (utime + stime, clock ticks) from /proc/PID/stat.
+#[cfg(target_os = "linux")]
+fn server_cpu_ticks(pid: u32) -> u64 {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+    let after = &stat[stat.rfind(')').expect("comm") + 2..];
+    let fields: Vec<&str> = after.split(' ').collect();
+    // utime and stime are fields 14 and 15 of stat, 12 and 13 after the comm.
+    fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap()
+}
+
+/// One COPY over the simple protocol of `data` sent in 64 KiB CopyData messages: its reply.
+fn copy_in_pieces(a: &mut Wire, sql: &str, data: &[u8]) -> Reply {
+    let mut body = sql.as_bytes().to_vec();
+    body.push(0);
+    a.send(b'Q', &body);
+    let mut r = Reply::default();
+    assert!(a.read_into(&mut r, true), "{sql}: no CopyInResponse");
+    for piece in data.chunks(65536) {
+        a.send(b'd', piece);
+    }
+    a.send(b'c', &[]);
+    a.read_into(&mut r, false);
+    r
+}
+
+/// A long COPY line costs what its bytes cost: the server's CPU time to load one 32 MiB line, sent
+/// in 64 KiB CopyData messages, is at most 3 times its CPU time to load the same 32 MiB as 32
+/// lines of 1 MiB. PRE-REGISTERED here before the fix was measured: the bound is 3x, one
+/// instrument (/proc/PID/stat utime + stime of the server) and one moment for both loads. Each
+/// piece re-joined, rescanned and re-copied the unfinished line, so a line of L bytes cost about
+/// L² / 64 KiB, about 32 times the 1 MiB lines' cost for the 32 MiB one; 32 MiB took 44.9 s
+/// where PostgreSQL 18.6 takes 0.4 s (review wire-rev-copystdin2 H1, runs rvw9707-t3, -pg).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_single_long_copy_line_costs_what_its_bytes_cost() {
+    let dir = Scratch::new("copylongline");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.s.set_read_timeout(Some(Duration::from_secs(900))).unwrap();
+    a.q("CREATE TABLE ll (v text)").ok("ll");
+    let mib = 1024 * 1024;
+    let mut one = vec![b'x'; 32 * mib - 1];
+    one.push(b'\n');
+    let mut many = Vec::with_capacity(32 * mib);
+    for _ in 0..32 {
+        many.extend(std::iter::repeat_n(b'y', mib - 1));
+        many.push(b'\n');
+    }
+    let sql = "COPY ll FROM STDIN";
+    let before = server_cpu_ticks(server.pid());
+    let r = copy_in_pieces(&mut a, sql, &many).ok("32 lines of 1 MiB");
+    assert_eq!(r.tags, vec!["COPY 32".to_string()]);
+    let middle = server_cpu_ticks(server.pid());
+    let r = copy_in_pieces(&mut a, sql, &one).ok("one line of 32 MiB");
+    assert_eq!(r.tags, vec!["COPY 1".to_string()]);
+    let after = server_cpu_ticks(server.pid());
+    let (lines, line) = (middle - before, after - middle);
+    assert!(
+        line <= 3 * lines.max(1),
+        "one 32 MiB line took {line} ticks of server CPU, 32 lines of 1 MiB {lines} (bound 3x)"
+    );
+    assert_eq!(
+        a.q("SELECT max(length(v)) FROM ll").single("length"),
+        (32 * mib - 1).to_string()
+    );
+}
+
+/// A statement a CancelRequest or statement_timeout stops inside a client's block leaves the
+/// session usable: 57014, then 25P02 until the block ends, then ROLLBACK, as in PostgreSQL; and
+/// a CancelRequest during a streaming COPY, trial after trial on one connection, always answers
+/// 57014 or the COPY and leaves the session usable (PostgreSQL 40 of 40; review
+/// wire-rev-copystdin2 M1, run rvw9707-pg race). The cancel stayed armed while the failed block
+/// was rolled back, so the rollback was cancelled too, which broke the connection: the next
+/// statement was FATAL 08006 "connection broken: an earlier undo failed", 3 trials in 6.
+#[test]
+fn a_cancel_leaves_the_session_usable_after_its_block_is_undone() {
+    let dir = Scratch::new("cancelundo");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.s.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+    let key = a.key.clone().expect("BackendKeyData at startup");
+    let cancel = || {
+        let mut s = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+        let mut m = ((8 + key.len()) as i32).to_be_bytes().to_vec();
+        m.extend_from_slice(&80877102i32.to_be_bytes());
+        m.extend_from_slice(&key);
+        s.write_all(&m).unwrap();
+    };
+    let slow = "SELECT count(*) FROM generate_series(1, 1000000000000000)";
+    a.q("BEGIN").ok("begin");
+    let mut q = vec![b'Q'];
+    q.extend_from_slice(&((slow.len() + 5) as i32).to_be_bytes());
+    q.extend_from_slice(slow.as_bytes());
+    q.push(0);
+    a.s.write_all(&q).unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    cancel();
+    let r = a.read_reply();
+    assert_eq!(r.err("cancelled in a block").code, "57014");
+    assert_eq!(r.status, b'E');
+    assert_eq!(a.q("SELECT 1").err("the failed block").code, "25P02");
+    let r = a.q("ROLLBACK").ok("the block's end");
+    assert_eq!(r.tags, vec!["ROLLBACK".to_string()]);
+    a.q("SET statement_timeout = 300").ok("timeout");
+    a.q("BEGIN").ok("begin");
+    assert_eq!(a.q(slow).err("timed out in a block").code, "57014");
+    a.q("ROLLBACK").ok("the block's end after a timeout");
+    a.q("RESET statement_timeout").ok("reset");
+    a.q("SELECT 1").ok("the session after both");
+    // A cancel during a streaming COPY, on one connection.
+    a.q("CREATE TABLE cr (v text)").ok("cr");
+    let mut row = vec![b'y'; 99];
+    row.push(b'\n');
+    let data = row.repeat(65536 * 48 / 100);
+    for (trial, k) in [5usize, 5, 20, 5, 5, 20].into_iter().enumerate() {
+        a.send(b'Q', b"COPY cr FROM STDIN\0");
+        let mut r = Reply::default();
+        assert!(a.read_into(&mut r, true), "trial {trial}: no CopyInResponse");
+        for (i, piece) in data.chunks(65536).enumerate() {
+            a.send(b'd', piece);
+            if i == k {
+                cancel();
+                std::thread::sleep(Duration::from_millis(300));
+            }
+        }
+        a.send(b'c', &[]);
+        a.read_into(&mut r, false);
+        assert!(
+            r.error.as_ref().is_some_and(|e| e.code == "57014") || r.tags.len() == 1,
+            "trial {trial}: {r:?}"
+        );
+        assert_eq!(r.status, b'I', "trial {trial}");
+        a.q("SELECT 1").ok(&format!("trial {trial}: the session after the cancel"));
+    }
+}
+
+/// A lone COPY FROM STDIN holds no write lock while its client sends: another session's INSERT
+/// runs while the COPY waits for more rows, as in PostgreSQL 18.6 and before streaming (review
+/// wire-rev-copystdin2 M2, `hold-loaded`: PostgreSQL and 4b2f90346 INSERT 0 1 in 0.0 s; e85654d8c
+/// 55P03 after the other session's 2 s lock_timeout). The COPY's rows go in at its end (or as far
+/// as PostgreSQL's batches would have gone, to report an insert's error first).
+#[test]
+fn a_lone_copy_holds_no_write_lock_while_its_client_sends() {
+    let dir = Scratch::new("copyhold");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut b = server.connect();
+    a.q("CREATE TABLE h (id int)").ok("h");
+    a.q("CREATE TABLE h2 (id int)").ok("h2");
+    a.send(b'Q', b"COPY h FROM STDIN\0");
+    let mut r = Reply::default();
+    assert!(a.read_into(&mut r, true), "no CopyInResponse");
+    let rows: Vec<u8> = (1..=20000).flat_map(|i| format!("{i}\n").into_bytes()).collect();
+    for piece in rows.chunks(65536) {
+        a.send(b'd', piece);
+    }
+    std::thread::sleep(Duration::from_millis(1000));
+    b.q("SET lock_timeout = 2000").ok("lock_timeout");
+    let r2 = b.q("INSERT INTO h2 VALUES (1)").ok("another session's INSERT during the COPY");
+    assert_eq!(r2.tags, vec!["INSERT 0 1".to_string()]);
+    a.send(b'c', &[]);
+    a.read_into(&mut r, false);
+    let r = r.ok("the COPY");
+    assert_eq!(r.tags, vec!["COPY 20000".to_string()]);
+    assert_eq!(a.q("SELECT count(*) FROM h").single("count"), "20000");
+}
+
+/// A boolean, float or uuid field's input error is its line's, so it wins over a later line's
+/// error, as PostgreSQL 18.6's input functions raise it while the line is read (review
+/// wire-rev-copystdin2 M3, run rvw9707-pg `order-*`); the engine raised these at the batch's
+/// insert, after the later line's 22P04. Well-formed values of the three load.
+#[test]
+fn copy_reads_boolean_float_and_uuid_fields_as_postgresql_does() {
+    let dir = Scratch::new("copytypes");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for (table, ty, bad, message, good) in [
+        ("tb", "boolean", "maybe", "invalid input syntax for type boolean: \"maybe\"", "true\nf\n"),
+        (
+            "tf",
+            "double precision",
+            "abc",
+            "invalid input syntax for type double precision: \"abc\"",
+            "1.5\n-2e3\n",
+        ),
+        (
+            "tu",
+            "uuid",
+            "nope",
+            "invalid input syntax for type uuid: \"nope\"",
+            "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11\nA0EEBC999C0B4EF8BB6D6BB9BD380A11\n",
+        ),
+    ] {
+        a.q(&format!("CREATE TABLE {table} (v {ty})")).ok(table);
+        let sql = format!("COPY {table} FROM STDIN");
+        let data = format!("{bad}\n1\t2\n");
+        let e = a.copy(&sql, &[CopyIn::Data(data.as_bytes())]).err(&sql);
+        assert_eq!((e.code.as_str(), e.message.as_str()), ("22P02", message), "{ty}");
+        let r = a.copy(&sql, &[CopyIn::Data(good.as_bytes())]).ok(&sql);
+        assert_eq!(r.tags, vec!["COPY 2".to_string()], "{ty}");
+    }
+}
+
+/// A line past the limit is refused with PostgreSQL 18.6's text for it, "string buffer exceeds
+/// maximum allowed length (N bytes)" (review wire-rev-copystdin2 L2, run rvw9707-pg
+/// `limit:1073742000`: 54000 with N 1073741823); N is the limit here, --copy-line-limit's.
+#[test]
+fn a_copy_line_past_its_limit_answers_postgresqls_text() {
+    let dir = Scratch::new("copylimittext");
+    let server = Server::start(&dir.db(), &["--copy-line-limit", "100000"]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE c (v text)").ok("c");
+    let mut long = vec![b'y'; 100001];
+    long.push(b'\n');
+    let e = a.copy("COPY c FROM STDIN", &[CopyIn::Data(&long)]).err("past the limit");
+    assert_eq!(
+        (e.code.as_str(), e.message.as_str()),
+        ("54000", "string buffer exceeds maximum allowed length (100000 bytes)")
+    );
+}
+
+/// numeric(p,s) reads an exponent as numeric_in does: one past any digits is overflow (22003),
+/// one far below rounds to 0 and loads, and its digits may hold underscores (review
+/// wire-rev-copystdin2 L3: PostgreSQL 18.6 `1e2000000` 22003, `1e-2000000` 0.00, `1e1_0` 22003;
+/// these were 22P02).
+#[test]
+fn copy_reads_a_numeric_exponent_as_postgresql_does() {
+    let dir = Scratch::new("copyexp");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE ne (n numeric(6,2))").ok("ne");
+    let sql = "COPY ne FROM STDIN";
+    for data in ["1e2000000\n", "1e1_0\n"] {
+        let e = a.copy(sql, &[CopyIn::Data(data.as_bytes())]).err(data);
+        assert_eq!(
+            (e.code.as_str(), e.message.as_str()),
+            ("22003", "numeric field overflow"),
+            "{data:?}"
+        );
+    }
+    let r = a.copy(sql, &[CopyIn::Data(b"1e-2000000\n")]).ok("a tiny value");
+    assert_eq!(r.tags, vec!["COPY 1".to_string()]);
+}
+
 /// A COPY line past `--copy-line-limit` bytes is refused with 54000, as PostgreSQL refuses a line
 /// past its line buffer's limit (MaxAllocSize; review wire-rev-copystdin H1's byte cap), whether
 /// it comes in one CopyData or across several, and loads nothing; a line at the limit loads.
