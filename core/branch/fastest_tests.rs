@@ -16371,3 +16371,138 @@ fn a_dropped_virtual_table_is_destroyed_only_once_no_connection_holds_it() {
     let d2 = l5_vtab::DESTROYS.load(std::sync::atomic::Ordering::SeqCst);
     assert_eq!(d2 - d0, 1, "CLAIM: once no connection held it, the table was destroyed once");
 }
+
+/// Opens `path` without unwrapping, so a schema that no longer parses is a test failure with its
+/// reason, not a panic inside the helper.
+fn try_open_at(path: &Path, opts: DatabaseOpts) -> crate::Result<Arc<Database>> {
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    Database::open_file_with_flags(io, path.to_str().unwrap(), OpenFlags::Create, opts, None, Arc::new(SqliteDialect))
+}
+
+/// engine-rev 2bdcd32c6 HIGH 1 (REVIEW-engine-2bdcd32c6): a bracketed type whose contents start and
+/// end with the same quote (`["a"b"]`, `['x'y']`, `` [`a`b`] ``) was printed bare, an unterminated
+/// literal: CREATE was refused ("non-terminated literal"; SQLite 3.53.4 accepts it), and a table
+/// SQLite wrote, after one ADD COLUMN, or a view's CAST after a RENAME COLUMN, left a schema neither
+/// Turso nor SQLite could open. Each case is created, altered, reopened and read, and keeps its type.
+#[test]
+fn a_bracketed_type_holding_quotes_survives_an_alter_and_a_reopen() {
+    let _g = serial();
+    let mut failed: Vec<String> = Vec::new();
+    for (i, ty) in [r#"["a"b"]"#, "['x'y']", "[`a`b`]"].into_iter().enumerate() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join(format!("bq{i}.db"));
+        let ty_of_c = |c: &Arc<Connection>| {
+            adv_rows(c, "SELECT type FROM pragma_table_info('t') WHERE name = 'c'").ok().and_then(|r| r.first().map(|row| row[0].clone()))
+        };
+        let ty0 = {
+            let db = open_at(&path, DatabaseOpts::new());
+            let c = db.connect().unwrap();
+            let steps = [
+                format!("CREATE TABLE t(id INTEGER PRIMARY KEY, c {ty}, w)"),
+                "INSERT INTO t VALUES (1, 'v', 'w')".to_string(),
+                "CREATE TABLE t2(id INTEGER PRIMARY KEY, c, w)".to_string(),
+                format!("CREATE VIEW v AS SELECT CAST(c AS {ty}) AS k FROM t2"),
+                "ALTER TABLE t ADD COLUMN z".to_string(),
+                "ALTER TABLE t2 RENAME COLUMN c TO cc".to_string(),
+            ];
+            let mut ty0 = None;
+            for sql in &steps {
+                if let Err(e) = c.execute(sql) {
+                    failed.push(format!("{ty}: `{sql}`: {e}"));
+                }
+                if sql.starts_with("INSERT") {
+                    ty0 = ty_of_c(&c);
+                }
+            }
+            if ty_of_c(&c) != ty0 {
+                failed.push(format!("{ty}: after the ALTERs c's type is {:?}, was {ty0:?}", ty_of_c(&c)));
+            }
+            ty0
+        };
+        match try_open_at(&path, DatabaseOpts::new()).and_then(|db| db.connect().map(|c| (db, c))) {
+            Ok((_db, c)) => {
+                if ty_of_c(&c) != ty0 {
+                    failed.push(format!("{ty}: after the reopen c's type is {:?}, was {ty0:?}", ty_of_c(&c)));
+                }
+                for sql in ["SELECT c, w, z FROM t", "SELECT k FROM v"] {
+                    if let Err(e) = adv_rows(&c, sql) {
+                        failed.push(format!("{ty}: after the reopen `{sql}`: {e}"));
+                    }
+                }
+            }
+            Err(e) => failed.push(format!("{ty}: the reopen failed: {e}")),
+        }
+    }
+    assert!(failed.is_empty(), "CLAIM: a bracketed type holding quotes is stored so that it reads back: {failed:#?}");
+}
+
+/// engine-rev 2bdcd32c6 HIGH 2: ADD COLUMN of a generated column whose custom type has a DEFAULT
+/// appended the type's DEFAULT to the stored text (`g cents AS (x) VIRTUAL DEFAULT (50)`), and the
+/// reopen then refused the table ("generated column "g" cannot have a DEFAULT value"); 8feb0bf1b's
+/// parent reopened. The stored text has no DEFAULT, and the reopen reads the column as before.
+#[test]
+fn an_added_generated_column_of_a_custom_type_with_a_default_reopens() {
+    let _g = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("gdef.db");
+    let o = || DatabaseOpts::new().with_custom_types(true).with_generated_columns(true);
+    let before = {
+        let db = open_at(&path, o());
+        let c = db.connect().unwrap();
+        for sql in [
+            "CREATE TYPE cents(value integer) BASE integer ENCODE value * 100 DECODE value / 100 DEFAULT 50",
+            "CREATE TABLE t1(id INTEGER PRIMARY KEY, x integer) STRICT",
+            "INSERT INTO t1 VALUES (1, 7)",
+            "ALTER TABLE t1 ADD COLUMN g cents GENERATED ALWAYS AS (x) VIRTUAL",
+        ] {
+            c.execute(sql).unwrap();
+        }
+        let stored = adv_rows(&c, "SELECT sql FROM sqlite_schema WHERE name = 't1'").unwrap();
+        assert!(
+            !stored[0][0].to_ascii_uppercase().contains("DEFAULT"),
+            "CLAIM: the generated column's stored text has no DEFAULT: {stored:?}"
+        );
+        adv_rows(&c, "SELECT id, x, g FROM t1").unwrap()
+    };
+    let (_db, c) = match try_open_at(&path, o()).and_then(|db| db.connect().map(|c| (db, c))) {
+        Ok(dc) => dc,
+        Err(e) => panic!("CLAIM: the table reopens after the ADD of a generated custom-type column: {e}"),
+    };
+    assert_eq!(adv_rows(&c, "SELECT id, x, g FROM t1").ok(), Some(before), "CLAIM: the reopen reads the generated column as before");
+}
+
+/// engine-rev 2bdcd32c6 MED 5: the internal scalar `turso_alter_column_sql`, which only ALTER's own
+/// sqlite_schema UPDATE needs, resolved from user SQL: a SELECT answered it, and a CHECK naming it
+/// was stored, a schema neither SQLite nor an older Turso can open. User SQL is refused it as
+/// SQLite 3.53.4 refuses an unknown function ("no such function"); ADD and DROP COLUMN, which use
+/// it, still work.
+#[test]
+fn user_sql_cannot_call_the_alter_rewrite_scalar() {
+    let _g = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("acs.db"), DatabaseOpts::new());
+    let c = db.connect().unwrap();
+    let mut failed: Vec<String> = Vec::new();
+    let call = "turso_alter_column_sql('CREATE TABLE t(a)', 2, 'add', 't', '', 'b INT', '')";
+    for sql in [
+        format!("SELECT {call}"),
+        format!("CREATE TABLE z(q CHECK ({call} IS NOT NULL))"),
+        format!("SELECT 1 WHERE {call} IS NOT NULL"),
+    ] {
+        match c.prepare(&sql).and_then(|mut s| s.run_collect_rows()) {
+            Ok(rows) => failed.push(format!("`{sql}` was accepted: {rows:?}")),
+            Err(e) if e.to_string().contains("no such function") => {}
+            Err(e) => failed.push(format!("`{sql}` failed, but not as an unknown function: {e}")),
+        }
+    }
+    for sql in ["CREATE TABLE t(a)", "ALTER TABLE t ADD COLUMN b INT", "ALTER TABLE t DROP COLUMN a"] {
+        if let Err(e) = c.execute(sql) {
+            failed.push(format!("control `{sql}`: {e}"));
+        }
+    }
+    let cols = adv_rows(&c, "SELECT name FROM pragma_table_info('t')").unwrap_or_default();
+    if cols != vec![vec!["b".to_string()]] {
+        failed.push(format!("control: t's columns after ADD b and DROP a are {cols:?}"));
+    }
+    assert!(failed.is_empty(), "CLAIM: user SQL cannot call turso_alter_column_sql: {failed:#?}");
+}

@@ -5510,6 +5510,69 @@ mod tests {
         }
     }
 
+    /// The column type names of a CREATE TABLE, or why `sql` gives none.
+    fn column_type_names(sql: &str) -> std::result::Result<Vec<Option<String>>, String> {
+        let cmd = Parser::new(sql.as_bytes())
+            .next()
+            .ok_or_else(|| "no command".to_string())?
+            .map_err(|e| e.to_string())?;
+        match cmd {
+            Cmd::Stmt(Stmt::CreateTable {
+                body: CreateTableBody::ColumnsAndConstraints { columns, .. },
+                ..
+            }) => Ok(columns
+                .iter()
+                .map(|c| c.col_type.as_ref().map(|t| t.name.clone()))
+                .collect()),
+            other => Err(format!("not a CREATE TABLE: {other:?}")),
+        }
+    }
+
+    /// engine-rev 2bdcd32c6 HIGH 1 (REVIEW-engine-2bdcd32c6): a type name counted as carrying its own
+    /// quotes when only its first and last bytes were the same quote, so `["a"b"]` (name `"a"b"`)
+    /// printed bare as an unterminated literal and the stored schema could not be opened by Turso or
+    /// SQLite; `"a]b" int` was quoted again and read back as another name. Each type below, printed
+    /// and parsed again, has the same name, and printing it again changes nothing.
+    #[test]
+    fn a_column_type_prints_so_that_it_reads_back_as_itself() {
+        let mut failed = Vec::new();
+        for ty in [
+            r#"["a"b"]"#,
+            "['x'y']",
+            "[`a`b`]",
+            r#""a]b" int"#,
+            r#"int "a]b""#,
+            r#"["a" "b"]"#,
+            r#""a]b""#,
+            r#""x""y""#,
+            "'str type'",
+            "`back tick`",
+            "[a  b]",
+            "[x,y]",
+        ] {
+            let sql = format!("CREATE TABLE t(id INTEGER PRIMARY KEY, c {ty})");
+            let want = match column_type_names(&sql) {
+                Ok(names) => names,
+                Err(e) => {
+                    failed.push(format!("{ty}: premise, `{sql}` does not parse: {e}"));
+                    continue;
+                }
+            };
+            let printed = Parser::new(sql.as_bytes()).next().unwrap().unwrap().to_string();
+            match column_type_names(&printed) {
+                Ok(got) if got == want => {
+                    let again = Parser::new(printed.as_bytes()).next().unwrap().unwrap().to_string();
+                    if again != printed {
+                        failed.push(format!("{ty}: printed `{printed}`, printed again `{again}`"));
+                    }
+                }
+                Ok(got) => failed.push(format!("{ty}: printed `{printed}` reads back as {got:?}, was {want:?}")),
+                Err(e) => failed.push(format!("{ty}: printed `{printed}` does not parse: {e}")),
+            }
+        }
+        assert!(failed.is_empty(), "CLAIM: every column type reads back as itself: {failed:#?}");
+    }
+
     #[test]
     fn test_variable_index_bounds() {
         for sql in ["SELECT ?0", "SELECT ?250001"] {
