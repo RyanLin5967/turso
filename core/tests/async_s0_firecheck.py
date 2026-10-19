@@ -31,6 +31,8 @@ FLUSH = re.compile(r"\b(fsync|fdatasync)\(|\bfcntl\(\d+<[^>]*>, F_FULLFSYNC")
 WRITE = re.compile(r"\b(pwrite64|write|writev|pwritev2?)\((\d+)<([^>]*)>")
 MARK = re.compile(r'AD-T5 WINDOW (OPEN|CLOSE) arm=(\S+)(?: run=(\d+))?')
 READING = re.compile(r"^AD-T5 READING (.*)$")
+# async_s0.rs RUNS: the registered runs per arm.
+RUNS = 5
 
 
 def build(features):
@@ -119,25 +121,34 @@ def main():
         print("NOTHING READ: the unmutated fire-check binary printed no reading (every arm void?)")
         sys.exit(2)
     failed = []
-    # The zero-create controls read 0 file writes and 0 flushes on the creating thread (amendment 2,
-    # Fire-checks), unmutated.
-    for key, c in base_c.items():
-        if key[0] == "control" and (c.get("writes", 0) or c.get("flushes", 0)):
-            print(f"CONTROL {key}: {c.get('writes', 0)} writes, {c.get('flushes', 0)} flushes (must be 0)")
-            failed.append(f"control {key}")
-    # The equality between the binaries: per arm (live; strict at N = 1000), each count's maximum
-    # over the unmutated runs must be the same on the reading and the fire-check binary.
     read_r, read_c = run(reading_bin, None, outdir, "reading-equality")
+    # The zero-create controls read 0 file writes and 0 flushes on the creating thread (amendment 2,
+    # Fire-checks), unmutated, on BOTH binaries, every control by its arm and run (engine-rev-l2b
+    # MED: the markers carried no run, so only the last control was checked, on one binary). A
+    # binary that ran an arm and traced none of its controls refuses.
+    for label, rr, cc in (("fire-check", base_r, base_c), ("reading", read_r, read_c)):
+        arms_read = {k[0] for k, v in rr.items() if not k[0].startswith("control_") and "void" not in v}
+        for arm in arms_read:
+            if not any(k[0] == f"control_{arm}" for k in cc):
+                print(f"CONTROL {label} {arm}: no control window traced")
+                failed.append(f"control {label} {arm} untraced")
+        for key, c in cc.items():
+            if key[0].startswith("control_") and (c.get("writes", 0) or c.get("flushes", 0)):
+                print(f"CONTROL {label} {key}: {c.get('writes', 0)} writes, {c.get('flushes', 0)} flushes (must be 0)")
+                failed.append(f"control {label} {key}")
+    # The equality between the binaries: per arm (live; strict at N = 1000), each count's maximum
+    # over the registered unmutated runs (0..RUNS; the live arm's extra parity runs differ in number
+    # between binaries, engine-rev-l2b MED) must be the same on the reading and the fire-check binary.
     for arm in ("live", "strict_n1000"):
         for count in ("writes", "flushes"):
-            a = max((v.get(count, 0) for k, v in base_c.items() if k[0] == arm), default=None)
-            b = max((v.get(count, 0) for k, v in read_c.items() if k[0] == arm), default=None)
+            a = max((v.get(count, 0) for k, v in base_c.items() if k[0] == arm and k[1] < RUNS), default=None)
+            b = max((v.get(count, 0) for k, v in read_c.items() if k[0] == arm and k[1] < RUNS), default=None)
             if a != b:
                 print(f"EQUALITY {arm} {count}: fire-check {a}, reading {b} (the fire-checks are void)")
                 failed.append(f"equality {arm} {count}")
         for count in ("allocs", "chunk_inline_allocs"):
-            a = max((int(v[count]) for k, v in base_r.items() if k[0] == arm and count in v), default=None)
-            b = max((int(v[count]) for k, v in read_r.items() if k[0] == arm and count in v), default=None)
+            a = max((int(v[count]) for k, v in base_r.items() if k[0] == arm and k[1] < RUNS and count in v), default=None)
+            b = max((int(v[count]) for k, v in read_r.items() if k[0] == arm and k[1] < RUNS and count in v), default=None)
             if a != b:
                 print(f"EQUALITY {arm} {count}: fire-check {a}, reading {b} (the fire-checks are void)")
                 failed.append(f"equality {arm} {count}")

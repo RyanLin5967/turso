@@ -361,8 +361,10 @@ fn run_arm(arm: Arm, run: usize) -> Result<Reading, Void> {
 }
 
 /// The same-duration zero-create control: the creating thread opens a window, makes no store
-/// call, and parks on the same untimed condvar for `window`, woken by another thread.
-fn zero_create_control(window: Duration) -> u64 {
+/// call, and parks on the same untimed condvar for `window`, woken by another thread. Its markers
+/// name the arm and run it follows (`arm=control_<arm> run=<run>`), so the driver checks every
+/// control, not only the last (engine-rev-l2b MED: each mapped to one key).
+fn zero_create_control(window: Duration, of: &str, run: usize) -> u64 {
     let parked = Arc::new((Mutex::new(false), Condvar::new()));
     let waker = {
         let parked = parked.clone();
@@ -374,7 +376,7 @@ fn zero_create_control(window: Duration) -> u64 {
         })
     };
     let tid = creating_tid();
-    eprintln!("AD-T5 WINDOW OPEN arm=control tid={tid}");
+    eprintln!("AD-T5 WINDOW OPEN arm=control_{of} run={run} tid={tid}");
     let a0 = thread_allocs();
     {
         let (m, cv) = &*parked;
@@ -384,9 +386,9 @@ fn zero_create_control(window: Duration) -> u64 {
         }
     }
     let allocs = thread_allocs() - a0;
-    eprintln!("AD-T5 WINDOW CLOSE arm=control tid={tid}");
+    eprintln!("AD-T5 WINDOW CLOSE arm=control_{of} run={run} tid={tid}");
     let _ = waker.join();
-    println!("AD-T5 READING arm=control tid={tid} allocs={allocs} window_us={} {}", window.as_micros(), feature_line());
+    println!("AD-T5 READING arm=control_{of} run={run} tid={tid} allocs={allocs} window_us={} {}", window.as_micros(), feature_line());
     allocs
 }
 
@@ -401,7 +403,7 @@ fn runs(arm: Arm, first: usize, count: usize) -> Vec<Reading> {
     for run in first..first + count {
         match run_arm(arm, run) {
             Ok(mut r) => {
-                r.control_allocs = zero_create_control(r.window);
+                r.control_allocs = zero_create_control(r.window, &arm.name(), run);
                 out.push(r);
             }
             Err(void) => panic!("AD-T5 VOID arm={} run={run}: {void}", arm.name()),
