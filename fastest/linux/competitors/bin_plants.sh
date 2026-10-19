@@ -101,6 +101,20 @@ for cv in 4x 0 -1 ""; do
 done
 case_ "bbload --max-window-s 0 is refused (a bound, never 'none')" 2 "--max-window-s needs a number" \
   -- "$BB" --spec "$SP/pg18-select1.spec" --out "$(OUT mw0)" --clients 1 --max-ops 1 --max-window-s 0 --set port=1
+# comp-rev-9bc7d894a LOW 6: the numeric parses LOW 7's fix left loose -- bbload's MySQL port (atoi: port=1x connected
+# to 1), --v1-mark-base (strtoull base 0: "0x1g" read 1), a spec's c1b step index, and clonebench par's --procs/--n
+case_ "bbload: a MySQL port that is not a whole number is refused (LOW 6)" 2 "mysql conninfo: port needs a whole number" \
+  -- "$BB" --spec "$SP/dolt-select1.spec" --out "$(OUT mp)" --clients 1 --max-ops 1 --set port=1x
+case_ "bbload --v1-mark-base 0x1g is refused (LOW 6)" 2 "--v1-mark-base needs a whole number" \
+  -- "$BB" --spec "$SP/pg18-select1.spec" --out "$(OUT mb)" --clients 1 --max-ops 1 --v1-mark-base 0x1g --set port=1
+printf 'protocol pg\nconnect host=127.0.0.1 port={port} user=postgres dbname=postgres\nstep sql SELECT 1\nc1b 1x lab\n' >"$S/c1b-bad.spec"
+case_ "a c1b step index that is not a whole number is refused (LOW 6)" 2 "c1b needs '<step 1.." \
+  -- "$BB" --spec "$S/c1b-bad.spec" --out "$(OUT cb1)" --clients 1 --max-ops 1 --set port=1
+for fl in "--procs 2x" "--n 10x" "--procs -1"; do
+  fk=${fl%% *} fv=${fl#* }
+  case_ "clonebench par $fl is refused (LOW 6)" 2 "clonebench par: $fk needs a whole number" \
+    -- "$CB" par --src "$S/b1.noindex/no-src.db" --dir "$S/b1.noindex" --out "$(OUT par)" --procs 1 --n 2 "$fk" "$fv"
+done
 for fl in "--clients 4x" "--clients 0" "--max-ops -1" "--max-ops 1x" "--min-ops x" "--duration-s nan" \
           "--max-window-s 0" "--max-window-s 1e9" "--warmup-ops -1" "--hold-us 1.5" "--rows 10x" "--seed x" \
           "--v1-mark-base x"; do
