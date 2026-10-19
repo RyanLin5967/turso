@@ -14893,6 +14893,10 @@ pub struct OpInitCdcVersionInner {
     phase: OpInitCdcVersionPhase,
     stmt: crate::Statement,
     cdc_table_exists: bool,
+    /// The capture table's name as sqlite_schema stores it, when it exists (found in any case):
+    /// the version table is keyed by it, so a switch naming it in another case reads its row
+    /// (engine-rev-qaf-fix HIGH-1).
+    stored_name: Option<String>,
     actual_version: Option<CdcVersion>,
 }
 
@@ -14957,13 +14961,14 @@ pub fn op_init_cdc_version(
             format!(
                 // COLLATE NOCASE: names match in any case (QUOTE-SWEEP F7: 'full,MyCdc' missed a legacy
                 // table mycdc and recorded the current version over its v1 layout).
-                "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='{escaped_cdc_table_name}' COLLATE NOCASE",
+                "SELECT name FROM sqlite_schema WHERE type='table' AND name='{escaped_cdc_table_name}' COLLATE NOCASE",
             ),
         )?;
         *state.active_op_state.init_cdc_version() = Some(Box::new(OpInitCdcVersionInner {
             phase: OpInitCdcVersionPhase::CheckTable,
             stmt,
             cdc_table_exists: false,
+            stored_name: None,
             actual_version: None,
         }));
     }
@@ -14974,7 +14979,6 @@ pub fn op_init_cdc_version(
         version,
         cdc_mode,
         cdc_table_name,
-        &escaped_cdc_table_name,
     );
     // Any error tears down the parked state machine so a subsequent step on the
     // same ProgramState (without an explicit reset) starts fresh instead of
@@ -14991,7 +14995,6 @@ fn drive_init_cdc_version(
     version: &CdcVersion,
     cdc_mode: &str,
     cdc_table_name: &str,
-    escaped_cdc_table_name: &str,
 ) -> Result<InsnFunctionStepResult> {
     loop {
         let inner = state.active_op_state.init_cdc_version().as_mut().unwrap();
@@ -15007,6 +15010,10 @@ fn drive_init_cdc_version(
                 OpInitCdcVersionPhase::CheckTable => {
                     // Any row means the table exists; keep stepping until Done.
                     inner.cdc_table_exists = true;
+                    let row = inner.stmt.row().expect("row should be present");
+                    if let crate::Value::Text(text) = row.get::<&crate::Value>(0)? {
+                        inner.stored_name = Some(text.to_string());
+                    }
                 }
                 OpInitCdcVersionPhase::ReadVersion => {
                     let row = inner.stmt.row().expect("row should be present");
@@ -15044,27 +15051,32 @@ fn drive_init_cdc_version(
                     inner.phase = OpInitCdcVersionPhase::CreateVersionTable;
                 }
                 OpInitCdcVersionPhase::CreateVersionTable => {
-                    // If the CDC table pre-existed without a version row, it's
-                    // a legacy v1 table — pin to V1 regardless of the requested
-                    // version.
+                    // If the CDC table pre-existed without a version row (in any case), it's a
+                    // legacy v1 table — pin to V1 regardless of the requested version. Keyed by the
+                    // name sqlite_schema stores, and inserted only when no row names the table in
+                    // any case: a switch naming an engine-made c1 as C1 pinned V1 under 'C1' and
+                    // wrote v1 rows into a v2 table (engine-rev-qaf-fix HIGH-1).
                     let version_to_insert = if inner.cdc_table_exists {
                         CdcVersion::V1
                     } else {
                         *version
                     };
+                    let key = escape_sql_string_literal(inner.stored_name.as_deref().unwrap_or(cdc_table_name));
                     inner.stmt = prepare_cdc_internal(
                         conn,
                         format!(
-                            "INSERT OR IGNORE INTO {TURSO_CDC_VERSION_TABLE_NAME} (table_name, version) VALUES ('{escaped_cdc_table_name}', '{version_to_insert}')",
+                            "INSERT OR IGNORE INTO {TURSO_CDC_VERSION_TABLE_NAME} (table_name, version) SELECT '{key}', '{version_to_insert}' WHERE NOT EXISTS (SELECT 1 FROM {TURSO_CDC_VERSION_TABLE_NAME} WHERE table_name = '{key}' COLLATE NOCASE)",
                         ),
                     )?;
                     inner.phase = OpInitCdcVersionPhase::InsertVersion;
                 }
                 OpInitCdcVersionPhase::InsertVersion => {
+                    // The row naming the table as stored, else one naming it in another case.
+                    let key = escape_sql_string_literal(inner.stored_name.as_deref().unwrap_or(cdc_table_name));
                     inner.stmt = prepare_cdc_internal(
                         conn,
                         format!(
-                            "SELECT version FROM {TURSO_CDC_VERSION_TABLE_NAME} WHERE table_name = '{escaped_cdc_table_name}'",
+                            "SELECT version FROM {TURSO_CDC_VERSION_TABLE_NAME} WHERE table_name = '{key}' COLLATE NOCASE ORDER BY table_name = '{key}' DESC LIMIT 1",
                         ),
                     )?;
                     inner.phase = OpInitCdcVersionPhase::ReadVersion;
