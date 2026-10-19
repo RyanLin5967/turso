@@ -1544,9 +1544,14 @@ fn schema_window(cell: &str, tables: u64, out: &mut String) {
 }
 
 /// The schema-window cell's reopen (`schema_window`): the bootstrapped database opened again, the
-/// fixture every sample is counted on.
+/// fixture every sample is counted on, with its name filter built before anything is counted, as
+/// every other create cell has it (`branch_wait_name_filter`): until the build lands a named create
+/// asks the catalog, which is the open's cost, not the window's
+/// (`a_schema_window_sample_is_counted_with_the_name_filter_built`).
 fn schema_window_reopen(path: &Path) -> Arc<Database> {
-    open_at(path)
+    let db = open_at(path);
+    db.branch_wait_name_filter();
+    db
 }
 
 /// Review 2 L6's cell (`first_create`): per round, a fresh small database forked once
