@@ -43,6 +43,18 @@ case_ "open loop refuses after-steps (dolt-create.spec: after sql-serial)" 2 "RE
   -- "$BB" --spec "$SP/dolt-create.spec" --out "$(OUT a)" --clients 1 --mode open --rate 10 --duration-s 1 --set port=1
 case_ "open loop refuses a connect/close step (pg18-m1c.spec)" 2 "REFUSED: open loop with after-steps" \
   -- "$BB" --spec "$SP/pg18-m1c.spec" --out "$(OUT b)" --clients 1 --mode open --rate 10 --duration-s 1 --set port=1
+# comp-rev-89ec-b3c3 LOW 6: pg18-m1c.spec has after-steps too, and both clauses printed one message, so the case above
+# passed whether or not a connect/close step was checked (a mutant dropping it passed every case), and a step-level
+# sql-serial was never planted. Specs with NO after-steps, each with one of the two, written here (plants, never a
+# registered spec): each is refused for its own reason.
+printf 'protocol pg\nconnect host=127.0.0.1 port={port} user=postgres dbname=postgres\nvar branch = b_{run}_{c}_{i}\nstep sql SELECT 1\nstep connect dbname=postgres\nstep sql SELECT 1\nstep close\n' >"$S/open-connect.spec"
+printf 'protocol pg\nconnect host=127.0.0.1 port={port} user=postgres dbname=postgres\nstep sql-serial SELECT 1\n' >"$S/open-serial.spec"
+case_ "open loop refuses a connect/close step in a spec with no after-steps (LOW 6)" 2 \
+  "REFUSED: open loop with a connect or close step" \
+  -- "$BB" --spec "$S/open-connect.spec" --out "$(OUT bc)" --clients 1 --mode open --rate 10 --duration-s 1 --set port=1
+case_ "open loop refuses a step-level sql-serial in a spec with no after-steps (LOW 6)" 2 \
+  "REFUSED: open loop with a sql-serial step" \
+  -- "$BB" --spec "$S/open-serial.spec" --out "$(OUT bs)" --clients 1 --mode open --rate 10 --duration-s 1 --set port=1
 case_ "control: open loop on pg18-select1 passes the checks and stops at the connect" 2 "$CONN" \
   -- "$BB" --spec "$SP/pg18-select1.spec" --out "$(OUT c)" --clients 1 --mode open --rate 10 --duration-s 1 --set port=1
 case_ "control: closed loop on dolt-create.spec is not refused for its after-steps" 2 "failed to connect" \
@@ -64,6 +76,23 @@ case_ "--duration-s nan is refused" 2 "--duration-s needs a number" \
   -- "$BB" --spec "$SP/pg18-select1.spec" --out "$(OUT du)" --clients 1 --duration-s nan --set port=1
 case_ "--max-window-s 1e9 is refused (its ns would overflow the window clock)" 2 "--max-window-s needs a number" \
   -- "$BB" --spec "$SP/pg18-select1.spec" --out "$(OUT mw)" --clients 1 --max-ops 1 --max-window-s 1e9 --set port=1
+# comp-rev-89ec-b3c3 LOW 7: "every numeric flag" (bbload.c:39) -- --clients was atoi ("4x" ran 4 clients), and
+# --max-window-s 0 was accepted where clonebench reads 0 as "no bound"; clonebench's own numeric flags were not checked
+# at all (--max-ops -1 became 2^64-1, which with no window bound ran until the outer timeout)
+for cv in 4x 0 -1 ""; do
+  case_ "bbload --clients '$cv' is refused" 2 "--clients needs a whole number" \
+    -- "$BB" --spec "$SP/pg18-select1.spec" --out "$(OUT cl)" --clients "$cv" --max-ops 1 --set port=1
+done
+case_ "bbload --max-window-s 0 is refused (a bound, never 'none')" 2 "--max-window-s needs a number" \
+  -- "$BB" --spec "$SP/pg18-select1.spec" --out "$(OUT mw0)" --clients 1 --max-ops 1 --max-window-s 0 --set port=1
+for fl in "--clients 4x" "--clients 0" "--max-ops -1" "--max-ops 1x" "--min-ops x" "--duration-s nan" \
+          "--max-window-s 0" "--max-window-s 1e9" "--warmup-ops -1" "--hold-us 1.5" "--rows 10x" "--seed x" \
+          "--v1-mark-base x"; do
+  fk=${fl%% *} fv=${fl#* }
+  case_ "clonebench $fl is refused (LOW 7)" 2 "clonebench run: $fk needs a" \
+    -- "$CB" run --mode b1 --op m1c --parent "$S/b1.noindex/no-parent.db" --dir "$S/b1.noindex" --out "$(OUT cb)" \
+    --clients 1 --max-ops 1 "$fk" "$fv"
+done
 # --- the live decision, replayed with backsteps (review 2 item 4): both binaries, the same answers
 printf '0\n5\n3\n' >"$S/trace-back"           # a claim judged with an older time than the one before it
 printf '0\n1\n2\n' >"$S/trace-sorted"
