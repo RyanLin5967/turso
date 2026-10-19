@@ -3571,6 +3571,28 @@ impl PostgreSQLTranslator {
                         },
                     });
                 }
+                // A cast to NUMERIC(p, s) or NUMERIC(p) is a cast to the engine's exact numeric of
+                // that precision and scale, as a NUMERIC(p, s) column is declared: it was cast to
+                // REAL, a float announced float8 and not rounded to the scale (wire-rev-uw3 MED-4;
+                // recorded, recordings/pg18-numeric-casts.out). A bare NUMERIC stays REAL (the
+                // bare-NUMERIC divergence, a known red).
+                if let Some((p, s)) = type_cast.type_name.as_ref().and_then(numeric_cast_size) {
+                    // The engine's numeric type, encoded and decoded as a column of it is stored
+                    // and read: a CAST to the type would leave its encoded bytes.
+                    let lit = |n: i64| ast::Expr::Literal(ast::Literal::Numeric(n.to_string()));
+                    let call = |name: &str, args: Vec<ast::Expr>| ast::Expr::FunctionCall {
+                        name: pg_name(name),
+                        distinctness: None,
+                        args: args.into_iter().map(Box::new).collect(),
+                        order_by: vec![],
+                        within_group: vec![],
+                        filter_over: ast::FunctionTail {
+                            filter_clause: None,
+                            over_clause: None,
+                        },
+                    };
+                    return Ok(call("numeric_decode", vec![call("numeric_encode", vec![*expr, lit(p), lit(s)])]));
+                }
                 let type_name = match type_cast.type_name.as_ref() {
                     Some(t) => pg_type_name_to_ast_type(t).or_else(|| self.engine_type(t)),
                     None => None,
@@ -6118,6 +6140,44 @@ fn extract_type_name(col_def: &pg_query::protobuf::ColumnDef) -> Result<String, 
 
 /// Extract integer type modifiers from a column definition.
 /// For `varchar(50)` this returns `[50]`, for `numeric(10, 2)` returns `[10, 2]`.
+/// The precision and scale of a cast to NUMERIC(p, s) or NUMERIC(p) (DECIMAL alike, scale 0), as
+/// the column declaration's map_pg_type gives them; None for any other type or a bare NUMERIC.
+pub fn numeric_cast_size(type_name: &pg_query::protobuf::TypeName) -> Option<(i64, i64)> {
+    use pg_query::protobuf::a_const::Val;
+    use pg_query::protobuf::node::Node;
+    if !type_name.array_bounds.is_empty() {
+        return None;
+    }
+    let name = type_name.names.last().and_then(|n| match &n.node {
+        Some(Node::String(s)) => Some(s.sval.to_ascii_lowercase()),
+        _ => None,
+    })?;
+    if name != "numeric" && name != "decimal" {
+        return None;
+    }
+    let mods: Vec<i64> = type_name
+        .typmods
+        .iter()
+        .filter_map(|node| match &node.node {
+            Some(Node::Integer(i)) => Some(i.ival as i64),
+            Some(Node::AConst(c)) => match &c.val {
+                Some(Val::Ival(i)) => Some(i.ival as i64),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    if mods.len() != type_name.typmods.len() {
+        return None;
+    }
+    let (p, s) = match mods.as_slice() {
+        [p, s] => (*p, *s),
+        [p] => (*p, 0),
+        _ => return None,
+    };
+    Some((p, s))
+}
+
 fn extract_integer_typmods(col_def: &pg_query::protobuf::ColumnDef) -> Vec<i64> {
     use pg_query::protobuf::a_const::Val;
     use pg_query::protobuf::node::Node;

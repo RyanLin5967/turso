@@ -426,6 +426,12 @@ fn expression_type(node: &PgNode) -> Option<u32> {
                 .ok()?;
                 return array_of(element);
             }
+            // A cast to NUMERIC(p, s) is the engine's exact numeric (the translator encodes and
+            // decodes it): numeric, as in PostgreSQL (wire-rev-uw3 MED-4). A bare NUMERIC is the
+            // engine's REAL and stays its type.
+            if turso_pg_parser::translator::numeric_cast_size(type_name).is_some() {
+                return Some(NUMERIC);
+            }
             return match type_name.names.last()?.node.as_ref()? {
                 Node::String(s) if s.sval == "bool" => Some(BOOL),
                 Node::String(s) if s.sval == "float4" => Some(FLOAT4),
