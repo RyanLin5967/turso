@@ -1525,7 +1525,15 @@ fn prepare_statement_parsed(
         // An aggregate's result type is read through the walk, as a parameter's is, so its
         // argument's relation is the one the engine reads (wire review 17 item 15): the walk runs
         // for a statement with a parameter or an aggregate result column.
-        let aggregates = crate::result_types::aggregate_targets(&parse_result);
+        let mut aggregates = crate::result_types::aggregate_targets(&parse_result);
+        // A column computed by arithmetic or a fixed-type function is typed by the walk too
+        // (wirefuzz vs PG 18.6); the two lists line up whenever both are non-empty.
+        let computed = crate::result_types::computed_targets(&parse_result);
+        if computed.len() == aggregates.len() {
+            for (aggregate, computed) in aggregates.iter_mut().zip(computed) {
+                *aggregate |= computed;
+            }
+        }
         types.columns = vec![None; aggregates.len()];
         if !used.is_empty() || aggregates.contains(&true) {
             // A parameter compared with something no context types is refused (42P18) by the

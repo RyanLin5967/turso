@@ -523,6 +523,63 @@ pub fn aggregate_types(aggregates: &[bool], columns: &[Option<u32>]) -> Vec<Opti
 
 const BOOL: u32 = 16;
 const TEXT: u32 = 25;
+const VARCHAR: u32 = 1043;
+
+/// Which result columns of a plain SELECT (lined up as [`aggregate_targets`] lines them up) are
+/// computed from table columns and integer or string literals by arithmetic (+ - * / %) and by the
+/// scalar functions whose result type is fixed ([`scalar_result`]), with nothing else in them: the
+/// walk types them as PostgreSQL does (int8 * int4 is int8, numeric / int4 numeric, length() int4),
+/// where the engine announced int4, float8 and text (wirefuzz vs PG 18.6, wire-fuzz1/2). A decimal
+/// literal anywhere leaves the column the engine's: PostgreSQL types it numeric, and the engine
+/// holds it as a float (the bare-NUMERIC divergence, a known red). Empty when the statement is no
+/// such SELECT.
+pub fn computed_targets(parse: &ParseResult) -> Vec<bool> {
+    let [raw] = parse.protobuf.stmts.as_slice() else {
+        return Vec::new();
+    };
+    let Some(Node::SelectStmt(select)) = raw.stmt.as_ref().and_then(|s| s.node.as_ref()) else {
+        return Vec::new();
+    };
+    if select.larg.is_some() || select.rarg.is_some() {
+        return Vec::new();
+    }
+    fn plain(node: &PgNode, top: bool) -> bool {
+        use turso_pg_parser::pg_query::protobuf::{a_const::Val, AExprKind};
+        match node.node.as_ref() {
+            Some(Node::ColumnRef(c)) => !top
+                && !matches!(c.fields.last().and_then(|f| f.node.as_ref()), Some(Node::AStar(_))),
+            Some(Node::AConst(c)) => {
+                !top && (c.isnull || matches!(c.val, Some(Val::Ival(_) | Val::Sval(_))))
+            }
+            Some(Node::AExpr(e)) => {
+                e.kind() == AExprKind::AexprOp
+                    && matches!(
+                        e.name.as_slice(),
+                        [op] if matches!(op.node.as_ref(),
+                            Some(Node::String(s)) if matches!(s.sval.as_str(), "+" | "-" | "*" | "/" | "%"))
+                    )
+                    && e.lexpr.as_deref().is_none_or(|l| plain(l, false))
+                    && e.rexpr.as_deref().is_some_and(|r| plain(r, false))
+            }
+            Some(Node::FuncCall(call)) => {
+                call.over.is_none()
+                    && call.agg_filter.is_none()
+                    && !call.agg_star
+                    && func_name(call).is_some_and(|n| scalar_result(&n).is_some())
+                    && call.args.iter().all(|a| plain(a, false))
+            }
+            _ => false,
+        }
+    }
+    let mut computed = Vec::with_capacity(select.target_list.len());
+    for target in &select.target_list {
+        let Some(Node::ResTarget(t)) = target.node.as_ref() else {
+            return Vec::new();
+        };
+        computed.push(t.val.as_deref().is_some_and(|v| plain(v, true)));
+    }
+    computed
+}
 
 /// The types a statement's parse gives: its result columns' (see [`aggregate_types`]) and its
 /// parameters' (see [`parameter_types`]).
@@ -1924,6 +1981,19 @@ impl Infer<'_> {
                     ("sum", t @ (FLOAT4 | FLOAT8)) => Some(t),
                     ("avg", INT2 | INT4 | INT8 | NUMERIC) => Some(NUMERIC),
                     ("avg", FLOAT4 | FLOAT8) => Some(FLOAT8),
+                    // PostgreSQL has min and max for text, not varchar: over a varchar they
+                    // resolve to text's (wirefuzz vs PG 18.6: announced varchar). It has none for
+                    // boolean: refused 42883, as PostgreSQL refuses it (it was answered).
+                    ("min" | "max", VARCHAR) => Some(TEXT),
+                    ("min" | "max", BOOL) => {
+                        self.missing_rte.borrow_mut().get_or_insert_with(|| {
+                            SqlErrorMessage::classified(
+                                SqlErrorKind::UndefinedFunction,
+                                format!("function {name}(boolean) does not exist"),
+                            )
+                        });
+                        None
+                    }
                     ("min" | "max" | "abs" | "sign", t) => Some(t),
                     ("ceil" | "ceiling" | "floor" | "round" | "trunc", t @ (NUMERIC | FLOAT8)) => {
                         Some(t)

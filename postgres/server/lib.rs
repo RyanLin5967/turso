@@ -5130,6 +5130,15 @@ fn resolve_pg_type_for_column(stmt: &turso_core::Statement, idx: usize) -> Type 
         // float8 by the name table below, whose NUMERIC is the SQLite affinity of a bare NUMERIC
         // (a Builtin, stored as a float). Found by the E5' differential (wire-e5-f312d1e13).
         ColumnTypeKind::Custom if info.declared_name.eq_ignore_ascii_case("numeric") => Type::NUMERIC,
+        // A smallint column is PostgreSQL's int2: the name table below gives the SQLite affinity,
+        // INTEGER, int4 (wirefuzz vs PG 18.6, wire-fuzz1/2). Binary int2 refuses a stored value
+        // past its range (22003); the engine does not refuse one on INSERT (PGDIV-INT-RANGE).
+        _ if ["smallint", "int2", "smallserial"]
+            .iter()
+            .any(|n| info.declared_name.eq_ignore_ascii_case(n)) =>
+        {
+            Type::INT2
+        }
         _ => {
             // Prefer the declared name (the user-visible type), then fall
             // back to the resolved base for custom/domain types whose
