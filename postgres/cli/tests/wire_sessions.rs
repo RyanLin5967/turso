@@ -15880,6 +15880,105 @@ fn a_parameter_assigned_to_a_varchar_column_is_refused_at_bind_when_too_long() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-cfdebc06d MED-1 and LOW-1 (its PG 18.6 probe, reviews/wire-cfdebc06d-raws/pg18-probe.out #44-#46, #78-#85).
+/// MED-1: a text value bound in BINARY format is its UTF-8 bytes, which PostgreSQL's custom plan coerces at Bind like the
+/// text form; 9d424aef5 skipped every binary value, so with no matching row `UPDATE vc SET v = $1 WHERE id = 99` answered
+/// BindComplete and UPDATE 0 where PG answers 22001 (Npgsql and asyncpg send binary). LOW-1: a refused Bind built no plan,
+/// so it does not count toward the five custom plans; failed Binds counted, so the sixth refused value got BindComplete
+/// and XX000 at Execute where PG refuses it at Bind, 22001, every time.
+#[test]
+fn a_binary_text_value_and_a_refused_bind_are_judged_as_postgresql_judges_them() {
+    let dir = Scratch::new("bind-binary");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE TABLE ch(id int PRIMARY KEY, c char(5))",
+        "CREATE TABLE vc(id int PRIMARY KEY, v varchar(5))",
+        "INSERT INTO vc VALUES (1, 'ab')",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    // Every message type of one reply, through ReadyForQuery, and its first error.
+    let raw = |a: &mut Wire| -> (Vec<u8>, Option<WireError>) {
+        let (mut types, mut error) = (Vec::new(), None);
+        loop {
+            let mut head = [0u8; 5];
+            a.s.read_exact(&mut head).unwrap();
+            let len = i32::from_be_bytes([head[1], head[2], head[3], head[4]]) as usize;
+            let mut body = vec![0u8; len - 4];
+            a.s.read_exact(&mut body).unwrap();
+            types.push(head[0]);
+            if head[0] == b'E' && error.is_none() {
+                error = Some(error_fields(&body));
+            }
+            if head[0] == b'Z' {
+                return (types, error);
+            }
+        }
+    };
+    // Parse with $1 declared text (25), Bind it in binary format, Execute, Sync.
+    let binary = |a: &mut Wire, sql: &str, value: &[u8]| -> (Vec<u8>, Option<WireError>) {
+        let mut parse = vec![0u8];
+        parse.extend_from_slice(sql.as_bytes());
+        parse.push(0);
+        parse.extend_from_slice(&1i16.to_be_bytes());
+        parse.extend_from_slice(&25i32.to_be_bytes());
+        a.send(b'P', &parse);
+        let mut bind = vec![0u8, 0u8];
+        bind.extend_from_slice(&1i16.to_be_bytes());
+        bind.extend_from_slice(&1i16.to_be_bytes());
+        bind.extend_from_slice(&1i16.to_be_bytes());
+        bind.extend_from_slice(&(value.len() as i32).to_be_bytes());
+        bind.extend_from_slice(value);
+        bind.extend_from_slice(&0i16.to_be_bytes());
+        a.send(b'B', &bind);
+        a.send(b'E', &[0, 0, 0, 0, 0]);
+        a.send(b'S', &[]);
+        raw(a)
+    };
+    for (sql, message) in [
+        ("UPDATE vc SET v = $1 WHERE id = 99", "value too long for type character varying(5)"),
+        ("UPDATE vc SET v = $1 WHERE id = 1", "value too long for type character varying(5)"),
+        ("INSERT INTO vc VALUES (2, $1)", "value too long for type character varying(5)"),
+        ("INSERT INTO ch VALUES (1, $1)", "value too long for type character(5)"),
+    ] {
+        let (types, error) = binary(&mut a, sql, b"abcdef");
+        if types.contains(&b'2') || !error.as_ref().is_some_and(|e| e.code == "22001" && e.message == message) {
+            wrong.push(format!("binary {sql}: messages {:?} error {error:?}, PostgreSQL: no BindComplete, 22001 {message}", String::from_utf8_lossy(&types)));
+        }
+    }
+    let r = a.q("SELECT v FROM vc WHERE id = 1");
+    if r.rows != vec![vec![Some("ab".to_string())]] {
+        wrong.push(format!("vc row 1 after the refused binary UPDATE: {:?}, PostgreSQL 'ab'", r.rows));
+    }
+    // A named statement bound seven times with a value too long: each Bind is refused, so none is a plan.
+    let mut parse = b"s4\0INSERT INTO vc VALUES ($1, $2)\0".to_vec();
+    parse.extend_from_slice(&0i16.to_be_bytes());
+    a.send(b'P', &parse);
+    a.send(b'S', &[]);
+    let _ = raw(&mut a);
+    for i in 0..7 {
+        let id = (70 + i).to_string();
+        let mut bind = b"\0s4\0".to_vec();
+        bind.extend_from_slice(&0i16.to_be_bytes());
+        bind.extend_from_slice(&2i16.to_be_bytes());
+        for v in [id.as_bytes(), b"abcdef".as_slice()] {
+            bind.extend_from_slice(&(v.len() as i32).to_be_bytes());
+            bind.extend_from_slice(v);
+        }
+        bind.extend_from_slice(&0i16.to_be_bytes());
+        a.send(b'B', &bind);
+        a.send(b'E', &[0, 0, 0, 0, 0]);
+        a.send(b'S', &[]);
+        let (types, error) = raw(&mut a);
+        if types.contains(&b'2') || error.as_ref().map(|e| e.code.as_str()) != Some("22001") {
+            wrong.push(format!("refused Bind {}: messages {:?} error {error:?}, PostgreSQL: no BindComplete, 22001", i + 1, String::from_utf8_lossy(&types)));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-629f4b926 HIGH-1, MED-2, MED-4 (its PG 18.6 probe, reviews/wire-629f4b926-raws/pg18-probe.out #8, #9, #24,
 /// #29, #50-#57) and wirefuzz W11 (uwq-w11-629f4b926-1 seed 1000401, PG's answer in the finding): a bound value is checked
 /// at Bind against EACH column it is assigned to, in column order, and never rewritten. 629f4b926 kept one length per
