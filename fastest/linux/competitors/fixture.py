@@ -80,6 +80,19 @@ REGISTERED_OUTCOMES = {"pg18-d2": {"last_vacuum": "true", "last_analyze": "true"
                               "autoindex": "0"}}
 
 
+# B1's table as SQLite reads it (comp review 1 LOW 30): one count per statement, run by the pinned sqlite3 on the
+# parent (fixture.py sqlite) and, in the selftest, on real tables of each shape through Python's sqlite3
+SCHEMA_SQL = ("SELECT count(*) FROM sqlite_schema WHERE name LIKE 'sqlite_autoindex_t%'",)
+SCHEMA_KEYS = ("autoindex",)
+
+
+def schema_evidence(counts):
+    """SCHEMA_SQL's replies, in order (None: not read) -> {SCHEMA_KEYS[i]: reply}."""
+    if counts is None or len(counts) != len(SCHEMA_KEYS):
+        return {k: "unread" for k in SCHEMA_KEYS}
+    return dict(zip(SCHEMA_KEYS, (str(c) for c in counts)))
+
+
 def maint_problem(f):
     """Why a fixture's maintenance record is not its system's registered one (None = it is): the steps after the aging
     (MED 10), the steps before it, and the recorded outcomes (LOW 24)."""
@@ -288,14 +301,13 @@ def sqlite(av):
                 f.write(h + "\n")
     # the engine's own size; the parent's contents are judged by the read-back triple (gen_seed.py readback-sqlite,
     # MED 3), so no count|sum is recorded here (LOW 27: count_sum had no reader)
-    # ... and (comp review 1 LOW 30) the schema as SQLite reads it: the autoindexes on t (0 when id is the rowid)
-    q = subprocess.run([sq3, path, "PRAGMA page_count; PRAGMA page_size; "
-                        "SELECT count(*) FROM sqlite_schema WHERE name LIKE 'sqlite_autoindex_t%';"],
+    # ... and (comp review 1 LOW 30) the schema as SQLite reads it (SCHEMA_SQL, schema_evidence)
+    q = subprocess.run([sq3, path, "PRAGMA page_count; PRAGMA page_size; " + " ".join(s + ";" for s in SCHEMA_SQL)],
                        capture_output=True, text=True, timeout=600)
     lines = q.stdout.split()
-    ok = q.returncode == 0 and len(lines) == 3 and all(x.isdigit() for x in lines)
+    ok = q.returncode == 0 and len(lines) == 2 + len(SCHEMA_SQL) and all(x.isdigit() for x in lines)
     eng = int(lines[0]) * int(lines[1]) if ok else None
-    ev["autoindex"] = lines[2] if ok else "unread"
+    ev.update(schema_evidence(lines[2:] if ok else None))
     print(json.dumps({"file": path, "rows": rows, "age_updates": age, "engine_bytes": eng, "stream_sha256": dg,
                       "maintenance": "journal_mode=WAL; load; wal_checkpoint(TRUNCATE); aged %d; wal_checkpoint(TRUNCATE)"
                       % age, "evidence": " ".join(f"{k}={v}" for k, v in ev.items())}))
@@ -320,7 +332,10 @@ def selftest():
                 "b1": "journal_mode=WAL; load; wal_checkpoint(TRUNCATE); aged 0; wal_checkpoint(TRUNCATE)"}
     ev_of = {"pg18-d2": {"last_vacuum": "true", "last_analyze": "true", "redo_after_vacuum": "true"},
              "dolt": {"gc_verdict": "ok"}, "doltgres": {"gc_verdict": "ok"},
-             "b1": {"journal_mode": "wal", "header_18_19": "2,2", "checkpoints": "0|0|0;0|0|0", "autoindex": "0"}}
+             "b1": {"journal_mode": "wal", "header_18_19": "2,2", "checkpoints": "0|0|0;0|0|0", "autoindex": "0",
+                    # comp-rev-89ec-b3c3 LOW 12: a rowid table's id as the rowid alias, as SQLite reads it (one pk
+                    # column, id INTEGER, no pk index); the fields every real B1 record carries from the fix on
+                    "pk_cols": "1", "id_integer_pk": "1", "pk_index": "0"}}
 
     def v(**kw):
         d = dict(base)
@@ -404,6 +419,22 @@ def selftest():
         ("every system's registered maintenance, unaged",
          [v(), v(system="dolt"), v(system="doltgres"), v(system="b1")], True),
     ]
+    # comp-rev-89ec-b3c3 LOW 12: SCHEMA_SQL itself, run on real tables of each shape (Python's sqlite3; the parent's is
+    # read by the pinned sqlite3 CLI), its replies through schema_evidence into the B1 record that compare judges. Zero
+    # autoindexes also holds for a WITHOUT ROWID table and for a table with no primary key, where id is not the rowid.
+    import sqlite3 as _sq
+    for create, want in (("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)", True),
+                         ("CREATE TABLE t (id INTEGER NOT NULL PRIMARY KEY, v INTEGER)", True),
+                         ("CREATE TABLE t (id INT PRIMARY KEY, v INTEGER)", False),
+                         ("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER) WITHOUT ROWID", False),
+                         ("CREATE TABLE t (id INTEGER, v INTEGER)", False),
+                         ("CREATE TABLE t (id INTEGER, v INTEGER, PRIMARY KEY (id, v))", False)):
+        con = _sq.connect(":memory:")
+        con.execute(create)
+        reply = [con.execute(s).fetchone()[0] for s in SCHEMA_SQL]
+        con.close()
+        cases.append((f"B1 schema as SQLite reads it: {create}",
+                      [v(), v(system="b1", maintenance_evidence=dict(ev_of["b1"], **schema_evidence(reply)))], want))
     bad = 0
     for name, fx, want in cases:
         why = compare(fx)
