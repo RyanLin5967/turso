@@ -1390,8 +1390,15 @@ pub fn translate_alter_table(
 
             // If a column has no explicit DEFAULT but its custom type defines
             // one, propagate the type-level DEFAULT to the column so that
-            // existing rows get the type default instead of NULL.
-            if column.default.is_none() {
+            // existing rows get the type default instead of NULL. Never to a generated column, whose
+            // value is its expression: a DEFAULT on one is refused when the stored text is read back
+            // ("generated column cannot have a DEFAULT value"; engine-rev 2bdcd32c6 HIGH 2: 8feb0bf1b
+            // stored `g cents AS (x) VIRTUAL DEFAULT (50)`). Kept off the in-memory column too, which
+            // a later rewrite from the schema model would print. Mutant `generated_takes_type_default`
+            // (test builds only): as at 8feb0bf1b.
+            if column.default.is_none()
+                && (!is_generated || crate::branch::store::fe_mutant("generated_takes_type_default"))
+            {
                 if let Ok(Some(resolved)) = resolver
                     .schema()
                     .resolve_type(&column.ty_str, btree.is_strict)
