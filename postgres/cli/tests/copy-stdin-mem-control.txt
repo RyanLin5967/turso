@@ -12,3 +12,7 @@ copy 16 MiB rows=262144 rowbytes=64: G format=0 columns=[0] | C COPY 262144 | Z 
 ## copy-memctl3 (the fix's tree)
 insert 64 MiB rows=1048576 rowbytes=64: C INSERT 0 1048576 | Z I | VmHWM kB before 59504 after 218096 rise 158592 (2.42x input) 28s
 insert 64 MiB rows=65536 rowbytes=1024: C INSERT 0 65536 | Z I | VmHWM kB before 57332 after 244024 rise 186692 (2.85x input) 9s
+## copy-memfix (the tip 83e44ec7e's tree, built by uwrun run copy-fix8-wt), after the fix: COPY equals the engine alone
+copy 64 MiB rows=1048576 rowbytes=64: G format=0 columns=[0] | C COPY 1048576 | Z I | VmHWM kB before 59072 after 217952 rise 158880 (2.42x input) 78s
+copy 16 MiB rows=8388608 rowbytes=2: G format=0 columns=[0] | C COPY 8388608 | Z I | VmHWM kB before 59804 after 212168 rise 152364 (9.30x input) 1075s
+insert 16 MiB rows=8388608 rowbytes=2: C INSERT 0 8388608 | Z I | VmHWM kB before 59372 after 211212 rise 151840 (9.27x input) 669s
