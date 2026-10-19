@@ -452,6 +452,11 @@ pub enum AggFunc {
     /// Stored args (post-planning): `[value, fraction]`.
     #[strum(disabled)]
     PercentileDisc,
+    /// `sum(x)` over a value of a custom type whose `+` is `numeric_add` (fastest-wire ef7738ee2):
+    /// summed as numeric, keeping the operands' scale, as PostgreSQL's numeric sum does. Set by the
+    /// optimizer (`numeric_sums`), never by name. Payload: `[acc: Null or numeric text, count]`.
+    #[strum(disabled)]
+    NumericSum,
     #[strum(disabled)]
     External(Arc<ExtFunc>),
 }
@@ -687,7 +692,8 @@ impl PartialEq for AggFunc {
             | (Self::ArrayAgg, Self::ArrayAgg)
             | (Self::Mode, Self::Mode)
             | (Self::PercentileCont, Self::PercentileCont)
-            | (Self::PercentileDisc, Self::PercentileDisc) => true,
+            | (Self::PercentileDisc, Self::PercentileDisc)
+            | (Self::NumericSum, Self::NumericSum) => true,
             (Self::External(a), Self::External(b)) => Arc::ptr_eq(a, b),
             _ => false,
         }
@@ -715,7 +721,7 @@ impl AggFunc {
             Self::Max => 1,
             Self::Min => 1,
             Self::StringAgg => 2,
-            Self::Sum => 1,
+            Self::Sum | Self::NumericSum => 1,
             Self::Total => 1,
             Self::ArrayAgg => 1,
             // Ordered-set aggregates: args are rewritten by the planner to
@@ -744,7 +750,7 @@ impl AggFunc {
             Self::Max => &[1],
             Self::Min => &[1],
             Self::StringAgg => &[2],
-            Self::Sum => &[1],
+            Self::Sum | Self::NumericSum => &[1],
             Self::Total => &[1],
             Self::ArrayAgg => &[1],
             Self::Mode => &[1],
@@ -766,7 +772,7 @@ impl AggFunc {
             Self::Max => "max",
             Self::Min => "min",
             Self::StringAgg => "string_agg",
-            Self::Sum => "sum",
+            Self::Sum | Self::NumericSum => "sum",
             Self::Total => "total",
             Self::ArrayAgg => "array_agg",
             Self::Mode => "mode",
@@ -886,6 +892,9 @@ pub enum ScalarFunc {
     NumericEncode,
     /// varchar(n)'s ENCODE: the value as it is, or a StringDataRightTruncation past n characters.
     VarcharEncode,
+    /// `turso_alter_column_sql(sql, rootpage, op, table, column, definition, owned_text)`: ALTER
+    /// TABLE ADD/DROP COLUMN's new stored text, assigned by its sqlite_schema UPDATE.
+    AlterColumnSql,
     NumericDecode,
     NumericAdd,
     NumericSub,
@@ -1016,6 +1025,7 @@ impl Deterministic for ScalarFunc {
             | ScalarFunc::ValidateIpAddr
             | ScalarFunc::NumericEncode
             | ScalarFunc::VarcharEncode
+            | ScalarFunc::AlterColumnSql
             | ScalarFunc::NumericDecode
             | ScalarFunc::NumericAdd
             | ScalarFunc::NumericSub
@@ -1165,6 +1175,7 @@ impl Display for ScalarFunc {
             Self::ValidateIpAddr => "validate_ipaddr",
             Self::NumericEncode => "numeric_encode",
             Self::VarcharEncode => "varchar_encode",
+            Self::AlterColumnSql => "turso_alter_column_sql",
             Self::NumericDecode => "numeric_decode",
             Self::NumericAdd => "numeric_add",
             Self::NumericSub => "numeric_sub",
@@ -1322,6 +1333,7 @@ impl ScalarFunc {
             | Self::NumericEq => &[2],
             Self::NumericEncode => &[3],
             Self::VarcharEncode => &[2],
+            Self::AlterColumnSql => &[7],
             // Array construction / element access
             Self::Array => &[-1], // variable arity
             Self::ArrayElement => &[2],
@@ -1495,11 +1507,6 @@ pub enum AlterTableFunc {
     RenameTable,
     AlterColumn,
     RenameColumn,
-    /// ADD COLUMN's rewrite of the table's stored CREATE statement, through the parser's AST
-    /// (engine-rev-qaf-fix HIGH-2/3/4: the schema model's `to_sql` dropped clauses it does not hold).
-    AddColumn,
-    /// DROP COLUMN's, likewise.
-    DropColumn,
 }
 
 impl Display for AlterTableFunc {
@@ -1508,8 +1515,6 @@ impl Display for AlterTableFunc {
             AlterTableFunc::RenameTable => write!(f, "limbo_rename_table"),
             AlterTableFunc::RenameColumn => write!(f, "limbo_rename_column"),
             AlterTableFunc::AlterColumn => write!(f, "limbo_alter_column"),
-            AlterTableFunc::AddColumn => write!(f, "limbo_add_column"),
-            AlterTableFunc::DropColumn => write!(f, "limbo_drop_column"),
         }
     }
 }

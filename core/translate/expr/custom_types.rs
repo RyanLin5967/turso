@@ -700,6 +700,30 @@ pub(super) fn emit_domain_cast_constraints(
     Ok(())
 }
 
+/// The parameters the domain chain from `type_name` gives `type_def`: the base parameters of the
+/// domain whose base is `type_def` (`TypeDef::domain_base_params`), or none.
+/// Mutant `domain_params_ignored` (test builds only): none, as before.
+fn domain_base_params(resolver: &Resolver, type_name: &str, type_def: &TypeDef) -> Vec<Box<ast::Expr>> {
+    if crate::branch::store::fe_mutant("domain_params_ignored") {
+        return Vec::new();
+    }
+    let schema = resolver.schema();
+    let target = crate::schema::type_key(&type_def.name);
+    let mut current = schema.get_type_def_unchecked(type_name);
+    // A chain is acyclic (CREATE DOMAIN refuses a cycle); the bound only guards a corrupt registry.
+    for _ in 0..64 {
+        let Some(td) = current else { break };
+        if !td.is_domain {
+            break;
+        }
+        if crate::schema::type_key(td.base()) == target {
+            return td.domain_base_params.clone();
+        }
+        current = schema.get_type_def_unchecked(td.base());
+    }
+    Vec::new()
+}
+
 /// Emit bytecode for a custom type encode/decode expression.
 /// Sets up `value` to reference `value_reg`, and type parameter overrides
 /// from `column.ty_params` matched against `type_def.params`.
@@ -722,8 +746,17 @@ pub(crate) fn emit_type_expr(
         // Skip `value` param (already handled above); match remaining params
         // against the user-provided ty_params by position.
         let user_params: Vec<_> = type_def.user_params().collect();
+        // A column naming a domain with no parameters of its own takes the ones its domain gave
+        // this type (`CREATE DOMAIN dn AS numeric(8, 2)`; fastest-wire 73ca2b720).
+        let domain_params;
+        let params: &[Box<ast::Expr>] = if column.ty_params.is_empty() {
+            domain_params = domain_base_params(resolver, &column.ty_str, type_def);
+            &domain_params
+        } else {
+            &column.ty_params
+        };
         for (i, param) in user_params.iter().enumerate() {
-            if let Some(param_expr) = column.ty_params.get(i) {
+            if let Some(param_expr) = params.get(i) {
                 let reg = program.alloc_register();
                 translate_expr(program, None, param_expr, reg, resolver)?;
                 program.id_register_overrides.insert(&param.name, reg);
@@ -1249,6 +1282,79 @@ mod tests {
             rows,
             vec![vec![Value::build_text("integer"), Value::from_i64(10), Value::build_text("real")]]
         );
+    }
+
+    /// fastest-wire ef7738ee2 (wirefuzz against PostgreSQL 18.6, wire-fuzz3-1): sum over a
+    /// numeric(6, 2) column holding 0.00 and NULL is numeric 0.00, keeping its operands' scale (here
+    /// '0', SQLite's sum of the decoded text), and is typed numeric; and an UPDATE assigning 10000 to
+    /// it is refused even when no row matches ("numeric field overflow", PostgreSQL's 22003 at plan
+    /// time). Red by the sum claim at the base.
+    #[test]
+    fn a_numeric_sum_keeps_its_scale_and_an_overflowing_constant_is_refused() {
+        let conn = open();
+        conn.execute("CREATE TABLE t0(id INTEGER PRIMARY KEY, c0 numeric(6, 2)) STRICT")
+            .unwrap();
+        conn.execute("INSERT INTO t0 VALUES (1, 0.00), (2, NULL)").unwrap();
+        let mut wrong = Vec::new();
+        let stmt = conn.prepare("SELECT sum(c0) FROM t0");
+        let ty = stmt
+            .as_ref()
+            .ok()
+            .and_then(|s| s.get_column_type_info(0).ok().flatten())
+            .map(|i| i.declared_name.to_ascii_lowercase());
+        let got = stmt.and_then(|mut s| s.run_collect_rows());
+        if !matches!(&got, Ok(rows) if rows.len() == 1 && rows[0][0].to_text() == Some("0.00")) || ty.as_deref() != Some("numeric") {
+            wrong.push(format!("sum(c0) = {got:?} typed {ty:?}, PostgreSQL 0.00 numeric"));
+        }
+        match conn.execute("UPDATE t0 SET c0 = 10000 WHERE id = 3") {
+            Err(e) if e.to_string().contains("numeric field overflow") => {}
+            other => wrong.push(format!("UPDATE c0 = 10000 matching no row: {other:?}, PostgreSQL 22003")),
+        }
+        assert!(wrong.is_empty(), "CLAIM: a numeric sum and constant as PostgreSQL: {wrong:#?}");
+    }
+
+    /// fastest-wire 76b5a2550 (wire-rev-uw3; PostgreSQL 18.6 recorded on iccad2,
+    /// pg18-numeric-derived.out): over a numeric(8, 2) column holding 2.50, 123456.78 and 10.00, a
+    /// direct `ORDER BY b` orders as numbers, but `b + 1 ... ORDER BY 1` and `b` read through a view,
+    /// a derived table and a CREATE TABLE AS copy ordered as text (10.00, 123456.78, 2.50): a silent
+    /// wrong row order. Each result column is also typed numeric, as PostgreSQL types it, a scalar
+    /// subquery's max(b) included (`get_column_type_info`'s declared name). The direct column is
+    /// the control. Red by its claims at the base.
+    #[test]
+    fn a_numeric_column_orders_and_types_as_numeric_through_every_relation() {
+        let conn = open();
+        for sql in [
+            "CREATE TABLE n(id INTEGER PRIMARY KEY, b numeric(8, 2)) STRICT",
+            "INSERT INTO n VALUES (1, 2.50), (2, 123456.78), (3, 10.00)",
+            "CREATE VIEW v AS SELECT b FROM n",
+            "CREATE TABLE c AS SELECT b FROM n",
+        ] {
+            conn.execute(sql).unwrap();
+        }
+        let mut wrong = Vec::new();
+        for (sql, want) in [
+            ("SELECT b FROM n ORDER BY b", &["2.50", "10.00", "123456.78"][..]),
+            ("SELECT b + 1 AS x FROM n ORDER BY 1", &["3.50", "11.00", "123457.78"][..]),
+            ("SELECT b FROM v ORDER BY b", &["2.50", "10.00", "123456.78"][..]),
+            ("SELECT b FROM (SELECT b FROM n) d ORDER BY b", &["2.50", "10.00", "123456.78"][..]),
+            ("SELECT b FROM c ORDER BY b", &["2.50", "10.00", "123456.78"][..]),
+            ("SELECT (SELECT max(b) FROM n) AS m", &["123456.78"][..]),
+        ] {
+            let stmt = conn.prepare(sql);
+            let ty = stmt
+                .as_ref()
+                .ok()
+                .and_then(|s| s.get_column_type_info(0).ok().flatten())
+                .map(|i| i.declared_name.to_ascii_lowercase());
+            let got = stmt.and_then(|mut s| s.run_collect_rows()).map(|rows| {
+                rows.iter().map(|r| r[0].to_text().unwrap_or("NULL").to_string()).collect::<Vec<_>>()
+            });
+            let want: Vec<String> = want.iter().map(|w| w.to_string()).collect();
+            if got.as_ref().ok() != Some(&want) || ty.as_deref() != Some("numeric") {
+                wrong.push(format!("{sql}: rows {got:?} type {ty:?}, PostgreSQL {want:?} numeric"));
+            }
+        }
+        assert!(wrong.is_empty(), "CLAIM: numeric through every relation, as PostgreSQL: {wrong:#?}");
     }
 
     /// fastest-wire c15466936 (wirefuzz against PostgreSQL 18.6): a value too long for varchar(n) is

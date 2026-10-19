@@ -342,6 +342,10 @@ pub struct ProgramBuilder {
     free_cursor_ids: Vec<usize>,
     next_hash_table_id: usize,
     pub table_references: TableReferences,
+    /// The custom type a scalar subquery's result register carries, by that register
+    /// (`emit_non_from_clause_subquery`), for `Statement::get_column_type_info` (fastest-wire
+    /// 76b5a2550: `(SELECT max(b) FROM n)` over numeric is numeric, as PostgreSQL types it).
+    pub scalar_subquery_types: std::collections::HashMap<usize, String>,
     /// Current parsing nesting level
     nested_level: usize,
     init_label: BranchOffset,
@@ -752,6 +756,7 @@ impl ProgramBuilder {
             parameters: Parameters::new(),
             result_columns: Vec::new(),
             table_references: TableReferences::new(vec![], vec![]),
+            scalar_subquery_types: std::collections::HashMap::new(),
             collation: None,
             nested_level: 0,
             // These labels will be filled when `prologue()` is called
@@ -2293,6 +2298,7 @@ impl ProgramBuilder {
             readonly: self.flags.readonly(),
             result_columns: self.result_columns,
             table_references: self.table_references,
+            scalar_subquery_types: self.scalar_subquery_types,
             sql: sql.to_string(),
             needs_stmt_subtransactions: crate::Arc::new(crate::AtomicBool::new(
                 needs_stmt_subtransactions,

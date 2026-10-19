@@ -15466,6 +15466,47 @@ fn a_failed_statement_rollback_inside_begin_rolls_the_transaction_back() {
     );
 }
 
+/// fastest-wire 73ca2b720 (domain arm; PostgreSQL 18.6 recorded on iccad2): `CREATE DOMAIN dn AS
+/// NUMERIC(8,2)` is a domain over numeric with its precision and scale, so a column of it stores 1.5
+/// as 1.50, before and after a reopen (the domain's stored text keeps the parameters), and refuses a
+/// value past its precision. Core's CREATE DOMAIN took a base type with no parameters: the statement
+/// does not parse at the base, so red by its first claim.
+#[test]
+fn a_domain_over_a_parameterized_type_keeps_its_parameters() {
+    let _g = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("dom.db");
+    let o = || DatabaseOpts::new().with_custom_types(true);
+    let mut failed: Vec<String> = Vec::new();
+    {
+        let db = open_at(&path, o());
+        let c = db.connect().unwrap();
+        for sql in [
+            "CREATE DOMAIN dn AS numeric(8, 2)",
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, x dn) STRICT",
+            "INSERT INTO t VALUES (1, 1.5)",
+        ] {
+            if let Err(e) = c.execute(sql) {
+                failed.push(format!("`{sql}`: {e}"));
+            }
+        }
+        match adv_rows(&c, "SELECT x FROM t") {
+            Ok(r) if r.len() == 1 && r[0][0] == "1.50" => {}
+            other => failed.push(format!("before the reopen SELECT x = {other:?}, PostgreSQL 1.50")),
+        }
+    }
+    let db = open_at(&path, o());
+    let c = db.connect().unwrap();
+    match adv_rows(&c, "SELECT x FROM t") {
+        Ok(r) if r.len() == 1 && r[0][0] == "1.50" => {}
+        other => failed.push(format!("after the reopen SELECT x = {other:?}, PostgreSQL 1.50")),
+    }
+    if c.execute("INSERT INTO t VALUES (2, 1234567.5)").is_ok() {
+        failed.push("1234567.5 fit numeric(8, 2) through the domain".to_string());
+    }
+    assert!(failed.is_empty(), "CLAIM: the domain keeps numeric(8, 2): {failed:#?}");
+}
+
 /// ADV-8: a custom type named with each quote form survives a reopen as ONE type: a STRICT column
 /// declared with any spelling of it reads back, and DROP TYPE is refused while the column uses it.
 #[test]
@@ -15769,6 +15810,64 @@ fn a_failed_flight_loses_async_creates_visibly() {
     assert!(held, "premise: the flusher was held");
 }
 
+/// LEAP L2(a) inside L1 (engine-rev-qaf-fix2 MED 11: no test killed mutant async_expires_inline):
+/// an async create runs no expiry pass of its own, and the housekeeping thread runs it. With the
+/// housekeeping thread held, a leased branch whose lease ran out is still listed after an async
+/// create; once released, it is reaped within 10 s.
+#[test]
+fn an_async_create_leaves_expiry_to_the_housekeeping_thread() {
+    let _s = serial();
+    let class = if cfg!(target_vendor = "apple") { SyncClass::FullFsync } else { SyncClass::Fsync };
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(
+        &dir.path().join("hk-expiry.db"),
+        opts(true, class).with_branch_lease(Some(std::time::Duration::from_millis(50))),
+    );
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    trunk.create_branch_async("warm").unwrap();
+    let held = db.branch_housekeeping_hold(true);
+    let leased = trunk.fork_branch().unwrap().into_id();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    trunk.create_branch_async("after-expiry").unwrap();
+    let still = db.branch_ids().unwrap().contains(&leased);
+    db.branch_housekeeping_hold(false);
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < until && db.branch_ids().unwrap().contains(&leased) {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let reaped = !db.branch_ids().unwrap().contains(&leased);
+    assert!(held, "premise: the housekeeping thread was held");
+    assert!(still, "CLAIM: the async create ran no expiry pass of its own (the expired branch was reaped inline)");
+    assert!(reaped, "CLAIM: the housekeeping thread reaped the expired branch within 10 s");
+}
+
+/// engine-rev-qaf-fix2 MED 8 (ASYNC-DESIGN §8): a connection already open on an async create whose
+/// flight then fails stops reading it. resolve_into refused only an in-doubt branch, so the open
+/// connection read on, and its status stayed NotYetDurable for good.
+#[test]
+fn an_open_connection_on_a_lost_async_create_stops_reading_it() {
+    let _s = serial();
+    let class = if cfg!(target_vendor = "apple") { SyncClass::FullFsync } else { SyncClass::Fsync };
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("lostopen.db"), opts(true, class));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    trunk.create_branch_async("warm").unwrap();
+    let held = db.branch_flusher_hold(true);
+    db.branch_failpoint(Some(BranchFailpoint::GroupFlightFails));
+    trunk.create_branch_async("doomed").unwrap();
+    let open = db.connect_named("doomed").unwrap();
+    db.branch_flusher_hold(false);
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < until && db.branch_ids().map(|ids| ids.len() > 1).unwrap_or(false) {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let read = adv_rows(&open, "SELECT count(*) FROM t");
+    assert!(read.is_err(), "CLAIM: the open connection on the lost create stops reading it: {read:?}");
+    assert!(held, "premise: the flusher was held");
+}
+
 /// Diagnostic, never fails (the segment-crossing L2(b) test found one create allocating about
 /// 2.6 MB under the store mutex near 72,000 branches, lane raws 44f57b34b3 / 92f7246c8a): the same
 /// workload, each thread recording every allocation of at least 1 MiB with its backtrace.
@@ -15831,6 +15930,238 @@ fn a_switch_to_the_capture_table_in_another_case_keeps_its_version_and_layout() 
     assert_eq!(versions, vec![vec!["c1".to_string(), "v2".to_string()]], "CLAIM: one version row, c1's v2, whatever case the switch named it in");
     let named_t = adv_rows(&c, "SELECT count(*) FROM c1 WHERE table_name = 't'").unwrap();
     assert_eq!(named_t[0][0], "2", "CLAIM: both writes of t are v2-layout rows naming t");
+}
+
+/// engine-rev-qaf-fix2 MED 16 (predates the range; SQLite 3.53.4 by the reviewer): DROP COLUMN of a
+/// column that another column's CHECK names (`b CHECK (b > a)`) is refused, as SQLite refuses it.
+/// Here it was accepted, and every later INSERT failed "no such column: a".
+#[test]
+fn drop_column_refuses_a_column_another_columns_check_names() {
+    let _g = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("dropchk.db"), DatabaseOpts::new());
+    let c = db.connect().unwrap();
+    c.execute("CREATE TABLE t(a, b CHECK (b > a), c)").unwrap();
+    c.execute("INSERT INTO t VALUES (1, 2, 3)").unwrap();
+    let dropped = c.execute("ALTER TABLE t DROP COLUMN a");
+    assert!(dropped.is_err(), "CLAIM: DROP COLUMN a is refused while b's CHECK names it");
+    c.execute("INSERT INTO t VALUES (5, 6, 7)").unwrap();
+}
+
+/// engine-rev-qaf-fix2 MED 17 (predates the range; SQLite 3.53.4 gives x,1,9): on a WITHOUT ROWID
+/// table (an experimental feature here), DROP COLUMN c then ADD COLUMN d DEFAULT 9 read the dropped
+/// value back as d (x,1,2): the drop rewrote no stored row. The claim is the safety property: no row
+/// reads a dropped value. Either the DROP is refused, or d reads 9 before and after a reopen.
+#[test]
+fn a_without_rowid_drop_column_never_resurfaces_the_dropped_value() {
+    let _g = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("wr.db");
+    let o = || DatabaseOpts::new().with_without_rowid(true);
+    let want = vec![vec!["x".to_string(), "1".to_string(), "9".to_string()], vec!["y".to_string(), "1".to_string(), "9".to_string()]];
+    let mut failed = Vec::new();
+    let refused;
+    {
+        let db = open_at(&path, o());
+        let c = db.connect().unwrap();
+        for sql in [
+            "CREATE TABLE t(a TEXT, b, c, PRIMARY KEY (a)) WITHOUT ROWID",
+            "INSERT INTO t VALUES ('x', 1, 2)",
+            "INSERT INTO t VALUES ('y', 1, 2)",
+        ] {
+            c.execute(sql).unwrap();
+        }
+        refused = c.execute("ALTER TABLE t DROP COLUMN c").is_err();
+        if !refused {
+            c.execute("ALTER TABLE t ADD COLUMN d DEFAULT 9").unwrap();
+            let got = adv_rows(&c, "SELECT a, b, d FROM t ORDER BY a");
+            if got.as_ref().ok() != Some(&want) {
+                failed.push(format!("before the reopen: {got:?}"));
+            }
+        }
+    }
+    if !refused {
+        let db = open_at(&path, o());
+        let c = db.connect().unwrap();
+        let got = adv_rows(&c, "SELECT a, b, d FROM t ORDER BY a");
+        if got.as_ref().ok() != Some(&want) {
+            failed.push(format!("after the reopen: {got:?}"));
+        }
+    }
+    assert!(failed.is_empty(), "CLAIM: no row reads the dropped value (refused, or d = 9 as SQLite): {failed:#?}");
+}
+
+/// engine-rev-qaf-fix2 HIGH A (REVIEW-engine-qaf-fix2-18556a956): a column type whose token keeps
+/// its quotes ("a]b") was quoted again by every AST rewrite, so ADD, ADD, ADD, DROP, RENAME, ADD grew
+/// the stored text 52, 64, 84, 120, 180, 308, 568 (SQLite 3.53.4: 47..59). The type must read back
+/// the same after every step and after a reopen, and the text grow by no more than what the steps add.
+#[test]
+fn a_quoted_column_type_survives_every_rewrite_unchanged() {
+    let _g = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("qtype.db");
+    let ty_of_c = |c: &Arc<Connection>| {
+        adv_rows(c, "SELECT type FROM pragma_table_info('t') WHERE name = 'c'").ok().and_then(|r| r.first().map(|row| row[0].clone()))
+    };
+    let len = |c: &Arc<Connection>| adv_rows(c, "SELECT length(sql) FROM sqlite_schema WHERE name = 't'").map(|r| r[0][0].parse::<i64>().unwrap_or(-1));
+    let mut failed: Vec<String> = Vec::new();
+    {
+        let db = open_at(&path, DatabaseOpts::new());
+        let c = db.connect().unwrap();
+        c.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, c \"a]b\")").unwrap();
+        let ty0 = ty_of_c(&c);
+        let len0 = len(&c).unwrap();
+        for sql in [
+            "ALTER TABLE t ADD COLUMN z1",
+            "ALTER TABLE t ADD COLUMN z2",
+            "ALTER TABLE t ADD COLUMN z3",
+            "ALTER TABLE t DROP COLUMN z3",
+            "ALTER TABLE t RENAME COLUMN z2 TO y2",
+            "ALTER TABLE t ADD COLUMN z4",
+        ] {
+            c.execute(sql).unwrap();
+            if ty_of_c(&c) != ty0 {
+                failed.push(format!("after `{sql}` c's type is {:?}, was {ty0:?}", ty_of_c(&c)));
+            }
+        }
+        // Three columns of at most 4 characters each, with their separators, beyond the start.
+        let grown = len(&c).unwrap() - len0;
+        if grown > 3 * 6 {
+            failed.push(format!("the stored text grew by {grown} for three short columns"));
+        }
+        drop(c);
+        drop(db);
+        let db = open_at(&path, DatabaseOpts::new());
+        let c = db.connect().unwrap();
+        if ty_of_c(&c) != ty0 {
+            failed.push(format!("after a reopen c's type is {:?}, was {ty0:?}", ty_of_c(&c)));
+        }
+    }
+    assert!(failed.is_empty(), "CLAIM: the quoted type is stored once, unchanged: {failed:#?}");
+}
+
+/// engine-rev-qaf-fix2 LOW 19: a type written "my type" or [my type] reads back as the same type
+/// after ADD COLUMN and a reopen (18556a956 had stored "my type" as ["my type"]).
+#[test]
+fn spaced_type_names_read_back_unchanged_after_a_rewrite_and_a_reopen() {
+    let _g = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("spaced.db");
+    let types = |c: &Arc<Connection>| adv_rows(c, "SELECT name, type FROM pragma_table_info('t') WHERE name IN ('p', 'q') ORDER BY name").ok();
+    let before;
+    {
+        let db = open_at(&path, DatabaseOpts::new());
+        let c = db.connect().unwrap();
+        c.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, p \"my type\", q [my type])").unwrap();
+        before = types(&c);
+        c.execute("ALTER TABLE t ADD COLUMN z").unwrap();
+        assert_eq!(types(&c), before, "CLAIM: the types read back unchanged after ADD COLUMN");
+    }
+    let db = open_at(&path, DatabaseOpts::new());
+    let c = db.connect().unwrap();
+    assert_eq!(types(&c), before, "CLAIM: the types read back unchanged after a reopen");
+}
+
+/// engine-rev-qaf-fix2 HIGH B: ADD COLUMN of a custom type that has a DEFAULT, with no DEFAULT of its
+/// own, applied the type's default in memory only; the stored text lost it, so after a reopen a NOT NULL
+/// column read NULL for the rows that existed (the baseline stored `DEFAULT 50`).
+#[test]
+fn an_added_custom_type_column_keeps_its_type_default_across_a_reopen() {
+    let _g = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("tdef.db");
+    let o = || DatabaseOpts::new().with_custom_types(true);
+    {
+        let db = open_at(&path, o());
+        let c = db.connect().unwrap();
+        for sql in [
+            "CREATE TYPE cents(value integer) BASE integer ENCODE value * 100 DECODE value / 100 DEFAULT 50",
+            "CREATE TABLE t1(id INTEGER PRIMARY KEY, x text) STRICT",
+            "INSERT INTO t1 VALUES (1, 'a')",
+            "ALTER TABLE t1 ADD COLUMN amount cents NOT NULL",
+        ] {
+            c.execute(sql).unwrap();
+        }
+        assert_eq!(adv_rows(&c, "SELECT amount FROM t1").unwrap(), vec![vec!["50".to_string()]], "premise: the type default applies before the reopen");
+    }
+    let db = open_at(&path, o());
+    let c = db.connect().unwrap();
+    assert_eq!(
+        adv_rows(&c, "SELECT amount FROM t1").ok(),
+        Some(vec![vec!["50".to_string()]]),
+        "CLAIM: after a reopen the NOT NULL column still reads its type's default"
+    );
+}
+
+/// engine-rev-qaf-fix2 HIGH D: ADD COLUMN and DROP COLUMN with capture 'full' recorded a schema-row
+/// change whose before-image equals its after-image (the rewrite had already replaced the row when
+/// `SET sql = sql` read it). The ADD's after-image is longer than its before-image, the DROP's shorter.
+#[test]
+fn an_add_or_drop_column_captures_the_schema_row_before_and_after() {
+    let _g = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("cdc-alter.db"), DatabaseOpts::new());
+    let c = db.connect().unwrap();
+    c.execute("CREATE TABLE t(a, b)").unwrap();
+    c.execute("PRAGMA capture_data_changes_conn('full')").unwrap();
+    c.execute("ALTER TABLE t ADD COLUMN zz").unwrap();
+    c.execute("ALTER TABLE t DROP COLUMN zz").unwrap();
+    let rows = adv_rows(
+        &c,
+        "SELECT length(before), length(after) FROM turso_cdc WHERE table_name = 'sqlite_schema' AND change_type = 0 ORDER BY change_id",
+    )
+    .unwrap();
+    let n = |r: &Vec<String>, i: usize| r[i].parse::<i64>().unwrap_or(-1);
+    assert_eq!(rows.len(), 2, "premise: one schema-row update per ALTER: {rows:?}");
+    assert!(n(&rows[0], 0) < n(&rows[0], 1), "CLAIM: the ADD's after-image is longer than its before-image: {rows:?}");
+    assert!(n(&rows[1], 0) > n(&rows[1], 1), "CLAIM: the DROP's after-image is shorter than its before-image: {rows:?}");
+}
+
+/// engine-rev-qaf-fix2 HIGH E (ASYNC-DESIGN G7, "Drop loses nothing"): a clean close flies the
+/// buffered async creates. An async create acknowledged and then closed at once was gone after the
+/// reopen (42/168 and 173/299 reopens on UW). Each of 20 creates, closed straight after its ack, is
+/// found after the reopen.
+#[test]
+fn a_clean_close_keeps_every_async_create() {
+    let _s = serial();
+    let class = if cfg!(target_vendor = "apple") { SyncClass::FullFsync } else { SyncClass::Fsync };
+    let mut lost = Vec::new();
+    for i in 0..20 {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("close.db");
+        {
+            let db = open_at(&path, opts(true, class));
+            let trunk = db.connect().unwrap();
+            seed(&trunk);
+            trunk.create_branch_async("warm").unwrap();
+            trunk.create_branch_async(&format!("closed-{i}")).unwrap();
+        }
+        let db = open_at(&path, opts(true, class));
+        if db.branch_named(&format!("closed-{i}")).ok().flatten().is_none() {
+            lost.push(i);
+        }
+    }
+    assert!(lost.is_empty(), "CLAIM: a clean close kept every async create; lost: {lost:?}");
+}
+
+/// engine-rev-qaf-fix2 LOW 1: a capture table the engine made under a mixed-case name ('full,MyCdc'
+/// keys its version row MyCdc) leaves no version row behind when it is dropped; the cleanup compared the
+/// stored name with the lowercased dropped name, so the row survived.
+#[test]
+fn dropping_a_mixed_case_capture_table_removes_its_version_row() {
+    let _g = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("cdc-drop.db"), DatabaseOpts::new());
+    let c = db.connect().unwrap();
+    c.execute("CREATE TABLE t(x)").unwrap();
+    c.execute("PRAGMA capture_data_changes_conn('full,MyCdc')").unwrap();
+    c.execute("INSERT INTO t VALUES (1)").unwrap();
+    c.execute("PRAGMA capture_data_changes_conn('off')").unwrap();
+    let before = adv_rows(&c, "SELECT count(*) FROM turso_cdc_version WHERE table_name = 'MyCdc' COLLATE NOCASE").unwrap();
+    c.execute("DROP TABLE MyCdc").unwrap();
+    let after = adv_rows(&c, "SELECT count(*) FROM turso_cdc_version WHERE table_name = 'MyCdc' COLLATE NOCASE").unwrap();
+    assert_eq!(before[0][0], "1", "premise: the capture table has its version row");
+    assert_eq!(after[0][0], "0", "CLAIM: the dropped capture table's version row is gone");
 }
 
 /// engine-rev-qaf-fix HIGH-2/3/4 and MED-1 (the stored text an ADD COLUMN rewrites loses clauses,
@@ -15915,6 +16246,50 @@ fn a_trunk_commits_barrier_never_gathers_a_cohort() {
 /// Connection B's schema (shared from the database's) holds A's table; A's DROP commits, and the
 /// module's table must not be destroyed while B still holds it. Once B has moved to the new schema
 /// and every holder is gone, it is destroyed, once. Before the fix A destroyed it at its own commit,
+/// engine-rev-qaf-fix2 MED 3 (predates the range, measured by the reviewer): a virtual table reached
+/// through a schema whose connection did not register it panicked on its first write
+/// (execute.rs `.expect("Could not find virtual table for VBegin")`), and its DROP failed "Could not
+/// find Virtual Table to Destroy": (a) connection B writes and drops A's table; (b) after BEGIN; DROP;
+/// CREATE; ROLLBACK the table is written and dropped. Neither panics, and every statement succeeds.
+#[test]
+fn a_virtual_table_is_written_and_dropped_through_any_schema_that_holds_it() {
+    let _g = serial();
+    let run = |c: &Arc<Connection>, sql: &str| {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| c.execute(sql))) {
+            Ok(Ok(())) => None,
+            Ok(Err(e)) => Some(format!("`{sql}`: {e}")),
+            Err(_) => Some(format!("`{sql}`: PANICKED")),
+        }
+    };
+    let mut failed: Vec<String> = Vec::new();
+    {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("vt-b.db"), DatabaseOpts::new());
+        let a = db.connect().unwrap();
+        a.register_static_extension(|api| unsafe {
+            l5_vtab::L5VTabModule::register_L5VTabModule(api);
+        });
+        a.execute("CREATE VIRTUAL TABLE vt USING l5_vtab").unwrap();
+        let b = db.connect().unwrap();
+        failed.extend(["INSERT INTO vt VALUES (1)", "DROP TABLE vt"].iter().filter_map(|sql| run(&b, sql)).map(|e| format!("(a) B {e}")));
+    }
+    {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("vt-rb.db"), DatabaseOpts::new());
+        let a = db.connect().unwrap();
+        a.register_static_extension(|api| unsafe {
+            l5_vtab::L5VTabModule::register_L5VTabModule(api);
+        });
+        a.execute("CREATE VIRTUAL TABLE vt USING l5_vtab").unwrap();
+        for sql in ["BEGIN", "DROP TABLE vt", "CREATE VIRTUAL TABLE vt USING l5_vtab", "ROLLBACK", "INSERT INTO vt VALUES (1)", "DROP TABLE vt"] {
+            if let Some(e) = run(&a, sql) {
+                failed.push(format!("(b) {e}"));
+            }
+        }
+    }
+    assert!(failed.is_empty(), "CLAIM: no panic and no refusal: {failed:#?}");
+}
+
 /// checking only A's schemas, so B held a freed table.
 #[test]
 fn a_dropped_virtual_table_is_destroyed_only_once_no_connection_holds_it() {

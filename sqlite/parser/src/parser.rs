@@ -5071,6 +5071,18 @@ impl<'a> Parser<'a> {
             Some(tok) if tok.token_type == TK_ID => from_bytes(tok.as_bytes()),
             _ => return Err(Error::ParseError("expected base type name".to_owned())),
         };
+        // The base type's parameters, `numeric(8, 2)` (fastest-wire 73ca2b720), as a column type's.
+        let mut base_type_params = Vec::new();
+        if self.peek()?.is_some_and(|t| t.token_type == TK_LP) {
+            eat_assert!(self, TK_LP);
+            loop {
+                base_type_params.push(self.parse_signed()?);
+                let tok = eat_expect!(self, TK_RP, TK_COMMA);
+                if tok.token_type == TK_RP {
+                    break;
+                }
+            }
+        }
 
         let mut default = None;
         let mut not_null = false;
@@ -5150,6 +5162,7 @@ impl<'a> Parser<'a> {
             if_not_exists,
             domain_name,
             base_type,
+            base_type_params,
             default,
             not_null,
             constraints,

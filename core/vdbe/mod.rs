@@ -1734,6 +1734,8 @@ pub struct PreparedProgram {
     pub readonly: bool,
     pub result_columns: Vec<ResultSetColumn>,
     pub table_references: TableReferences,
+    /// See `ProgramBuilder::scalar_subquery_types`.
+    pub scalar_subquery_types: std::collections::HashMap<usize, String>,
     pub sql: String,
     /// Whether the statement needs to be wrapped in a statement subtransaction
     /// when run as part of an interactive (non-autocommit) transaction.

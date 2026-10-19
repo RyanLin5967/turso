@@ -1691,7 +1691,11 @@ pub fn op_vdestroy(
     load_insn!(VDestroy { db: _, table_name }, insn);
     let conn = program.connection.clone();
     // Destroyed when the transaction commits without it (`Connection::defer_vtab_destroy`).
-    let Some(vtab) = conn.syms.read().vtabs.get(table_name).cloned() else {
+    // The registry of the connection that made it, else the schema this connection holds it in
+    // (engine-rev-qaf-fix2 MED 3: another connection's DROP failed here).
+    let registered = conn.syms.read().vtabs.get(table_name).cloned();
+    let vtab = registered.or_else(|| conn.schema.read().get_table(table_name).and_then(|t| t.virtual_table()));
+    let Some(vtab) = vtab else {
         mark_unlikely();
         return Err(crate::LimboError::InternalError(
             "Could not find Virtual Table to Destroy".to_string(),
@@ -1716,14 +1720,14 @@ pub fn op_vbegin(
         .vtab_id()
         .expect("VBegin on non ext-virtual table cursor");
     let mut states = program.connection.vtab_txn_states.write();
-    if states.insert(vtab_id) {
-        // Only begin a new transaction if one is not already active for this virtual table module
-        let vtabs = &program.connection.syms.read().vtabs;
-        let vtab = vtabs
-            .iter()
-            .find(|p| p.1.id().eq(&vtab_id))
-            .expect("Could not find virtual table for VBegin");
-        vtab.1.begin()?;
+    // Only begin a new transaction if one is not already active for this virtual table module; the
+    // participant is the table the cursor holds (`VirtualTableCursor::ext_table`).
+    if !states.contains_key(&vtab_id) {
+        let table = cursor.ext_table().ok_or_else(|| {
+            LimboError::InternalError("VBegin on a cursor that holds no external table".to_string())
+        })?;
+        table.begin()?;
+        states.insert(vtab_id, table);
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -3837,16 +3841,8 @@ pub fn halt(
 /// Call xCommit on all virtual tables that participated in the current transaction.
 pub(crate) fn vtab_commit_all(conn: &Connection) -> crate::Result<()> {
     let mut set = conn.vtab_txn_states.write();
-    if set.is_empty() {
-        return Ok(());
-    }
-    let reg = &conn.syms.read().vtabs;
-    for id in set.drain() {
-        let vtab = reg
-            .iter()
-            .find(|(_, vtab)| vtab.id() == id)
-            .expect("vtab must exist");
-        vtab.1.commit()?;
+    for (_, table) in set.drain() {
+        table.commit()?;
     }
     Ok(())
 }
@@ -4037,16 +4033,8 @@ pub(crate) fn index_method_register_transaction_all(
 /// Rollback all virtual tables that are part of the current transaction.
 fn vtab_rollback_all(conn: &Connection) -> crate::Result<()> {
     let mut set = conn.vtab_txn_states.write();
-    if set.is_empty() {
-        return Ok(());
-    }
-    let reg = &conn.syms.read().vtabs;
-    for id in set.drain() {
-        let vtab = reg
-            .iter()
-            .find(|(_, vtab)| vtab.id() == id)
-            .expect("vtab must exist");
-        vtab.1.rollback()?;
+    for (_, table) in set.drain() {
+        table.rollback()?;
     }
     Ok(())
 }
@@ -7004,6 +6992,10 @@ fn init_agg_payload(func: &AggFunc, payload: &mut crate::alloc::Vec<Value>) -> R
             // We serialize to a record blob only in finalize, avoiding O(n²) re-serialization.
             payload.push(Value::from_i64(0));
         }
+        AggFunc::NumericSum => {
+            payload.push(Value::Null);
+            payload.push(Value::from_i64(0));
+        }
         AggFunc::Mode => {
             // [0] = collation bits, [1] = count, [2..] = buffered values.
             payload.push(Value::from_i64(0)); // collation (recorded at step time)
@@ -7122,6 +7114,23 @@ fn update_agg_payload(
             }
             *r_err_val = Value::from_f64(sum_state.r_err);
             *count = count.checked_add(1).ok_or(LimboError::IntegerOverflow)?;
+        }
+        AggFunc::NumericSum => {
+            // NULL contributes nothing; every other value is a numeric (a stored encoding, or the
+            // text the column decoded to), added at PostgreSQL's scale rules.
+            if matches!(arg, Value::Null) {
+                return Ok(());
+            }
+            let value = value_to_numeric(arg)?;
+            let acc = match &payload[0] {
+                Value::Null => value,
+                prior => value_to_numeric(prior)?.add(&value)?,
+            };
+            payload[0] = Value::build_text(acc.format());
+            let Value::Numeric(Numeric::Integer(count)) = &mut payload[1] else {
+                return Err(LimboError::InternalError("NumericSum: payload[1] is not an integer".to_string()));
+            };
+            *count += 1;
         }
         AggFunc::Sum | AggFunc::Total => {
             // invariant as per init_agg_payload: payload[0] is acc (Null/Integer/Float),
@@ -7478,6 +7487,10 @@ fn finalize_agg_payload(func: &AggFunc, payload: &[Value]) -> Result<Value> {
                 _ => Value::from_f64(acc.to_float_or_zero() + r_err),
             }
         }
+        AggFunc::NumericSum => match &payload[1] {
+            Value::Numeric(Numeric::Integer(0)) => Value::Null,
+            _ => payload[0].clone(),
+        },
         AggFunc::Total => {
             // Payload: [acc, r_err, approx, ovrfl, count]
             let acc = &payload[0];
@@ -8335,6 +8348,21 @@ fn inverse_agg_payload(func: &AggFunc, arg: Value, payload: &mut [Value]) -> Res
             };
             debug_assert!(*i > 0, "Count(*) xInverse without matching xStep");
             *i -= 1;
+        }
+        AggFunc::NumericSum => {
+            if matches!(arg, Value::Null) {
+                return Ok(());
+            }
+            let Value::Numeric(Numeric::Integer(count)) = &mut payload[1] else {
+                unreachable!("NumericSum count slot is Integer per init_agg_payload");
+            };
+            debug_assert!(*count > 0, "NumericSum xInverse without matching xStep");
+            *count -= 1;
+            payload[0] = if *count == 0 {
+                Value::Null
+            } else {
+                Value::build_text(value_to_numeric(&payload[0])?.sub(&value_to_numeric(&arg)?)?.format())
+            };
         }
         AggFunc::Sum | AggFunc::Total => {
             let parsed = classify_numeric_arg(&arg);
@@ -9245,6 +9273,72 @@ fn parse_schema_sql_for_alter(
         return Ok(Some(ast::Cmd::Stmt(stmt)));
     }
     dialect.parse(sql).map(|(cmd, _)| cmd)
+}
+
+/// The stored CREATE TABLE text after ADD COLUMN (`definition`, as written) or DROP COLUMN
+/// (`dropped`, normalized), for `turso_alter_column_sql` (engine-rev-qaf-fix HIGH-2/3/4, MED-1;
+/// qaf-fix2 HIGH C and D). An engine row is parsed, the column added or removed, and printed through
+/// its own AST, so every clause the stored text holds survives; the schema model's `to_sql` dropped
+/// them. A dialect's own row is `owned_text`: the dialect's formatter of the altered table, made at
+/// translate time, since only the dialect can print its text (the SQLite printer under the dialect's
+/// marker made the PostgreSQL frontend's database unopenable). `None`: the text is left as it is (the
+/// change is in it already: an MVCC or temp-schema replay of a rewritten row).
+fn alter_column_sql(
+    dialect: &dyn crate::Dialect,
+    sql: &str,
+    root_page: i64,
+    definition: Option<&str>,
+    dropped: Option<&str>,
+    owned_text: &str,
+) -> Result<Option<String>> {
+    if dialect.owns_stored_table_sql(sql) {
+        return Ok((!owned_text.is_empty()).then(|| owned_text.to_string()));
+    }
+    let Some(ast::Cmd::Stmt(ast::Stmt::CreateTable {
+        tbl_name,
+        body,
+        temporary,
+        if_not_exists,
+    })) = parse_schema_sql_for_alter(dialect, "table", root_page, sql)?
+    else {
+        return Ok(None);
+    };
+    let ast::CreateTableBody::ColumnsAndConstraints {
+        mut columns,
+        constraints,
+        options,
+    } = body
+    else {
+        return Err(LimboError::InternalError(
+            "CREATE TABLE AS SELECT schemas cannot be altered".to_string(),
+        ));
+    };
+    if let Some(definition) = definition {
+        let column = Parser::new(definition.as_bytes()).parse_column_definition(true)?;
+        let added = normalize_ident(column.col_name.as_str());
+        if columns.iter().any(|c| normalize_ident(c.col_name.as_str()) == added) {
+            return Ok(None);
+        }
+        columns.push(column);
+    }
+    if let Some(dropped) = dropped {
+        let before = columns.len();
+        columns.retain(|c| normalize_ident(c.col_name.as_str()) != dropped);
+        if columns.len() == before {
+            return Ok(None);
+        }
+    }
+    let new_stmt = ast::Stmt::CreateTable {
+        tbl_name,
+        body: ast::CreateTableBody::ColumnsAndConstraints {
+            columns,
+            constraints,
+            options,
+        },
+        temporary,
+        if_not_exists,
+    };
+    Ok(Some(dialect.format_changed_table_sql(false, crate::dialect::TableChange::Rewritten(&new_stmt))?))
 }
 
 pub fn op_function(
@@ -10587,6 +10681,40 @@ pub fn op_function(
                 };
                 state.registers[*dest].set_value(result);
             }
+            ScalarFunc::AlterColumnSql => {
+                // turso_alter_column_sql(sql, rootpage, op, table, column, definition, owned_text):
+                // ALTER TABLE's ADD/DROP COLUMN, as the value its sqlite_schema UPDATE assigns, so
+                // the row's change is captured with its true before and after (qaf-fix2 HIGH D).
+                check_arg_count!(arg_count, 7);
+                let arg = |i: usize| state.registers[*start_reg + i].get_value().clone();
+                let (sql, root_page, op) = (arg(0), arg(1), arg(2));
+                let (column, definition, owned_text) = (arg(4), arg(5), arg(6));
+                let text = |v: &Value| match v {
+                    Value::Text(t) => t.as_str().to_string(),
+                    _ => String::new(),
+                };
+                let result = match (&sql, &root_page) {
+                    (Value::Text(stored), Value::Numeric(Numeric::Integer(root))) => {
+                        let dialect = program.connection.dialect();
+                        let (definition_s, dropped_s) = (text(&definition), normalize_ident(&text(&column)));
+                        let (add, drop) = match text(&op).as_str() {
+                            "add" => (Some(definition_s.as_str()), None),
+                            "drop" => (None, Some(dropped_s.as_str())),
+                            other => {
+                                return Err(LimboError::InternalError(format!(
+                                    "turso_alter_column_sql: unknown op {other:?}"
+                                )))
+                            }
+                        };
+                        match alter_column_sql(dialect.as_ref(), stored.as_str(), *root, add, drop, &text(&owned_text))? {
+                            Some(new_sql) => Value::build_text(new_sql),
+                            None => sql.clone(),
+                        }
+                    }
+                    _ => sql.clone(),
+                };
+                state.registers[*dest].set_value(result);
+            }
             ScalarFunc::VarcharEncode => {
                 // varchar(n) (fastest-wire c15466936): the value unchanged when its length, as
                 // length() counts it, is at most n; else PostgreSQL's string_data_right_truncation.
@@ -11332,93 +11460,6 @@ pub fn op_function(
                     };
 
                     (new_name, new_tbl_name, new_sql)
-                }
-                AlterTableFunc::AddColumn | AlterTableFunc::DropColumn => {
-                    // ADD/DROP COLUMN (engine-rev-qaf-fix HIGH-2/3/4, MED-1): the table's own stored
-                    // CREATE statement, parsed, one column appended (its definition as written) or
-                    // removed, and printed as RENAME and ALTER COLUMN print theirs, so every clause the
-                    // stored text holds (a DESC key, a COLLATE or conflict clause on a constraint, a
-                    // type such as `[x,y]`) survives. The schema model's `to_sql` dropped them. Every
-                    // other row stays as it is.
-                    let table = match &state.registers[*start_reg + 5].get_value() {
-                        Value::Text(t) => normalize_ident(t.as_str()),
-                        _ => panic!("table parameter should be TEXT"),
-                    };
-                    let dropped = match &state.registers[*start_reg + 6].get_value() {
-                        Value::Text(c) => normalize_ident(c.as_str()),
-                        _ => panic!("column parameter should be TEXT"),
-                    };
-                    let definition = match &state.registers[*start_reg + 7].get_value() {
-                        Value::Text(d) => d.as_str().to_string(),
-                        _ => panic!("definition parameter should be TEXT"),
-                    };
-                    let new_sql = 'sql: {
-                        let Value::Text(sql) = sql else {
-                            break 'sql None;
-                        };
-                        if entry_type.as_str() != "table" || normalize_ident(&name) != table {
-                            break 'sql None;
-                        }
-                        let cmd = parse_schema_sql_for_alter(
-                            program.connection.dialect().as_ref(),
-                            entry_type.as_str(),
-                            *root_page,
-                            sql.as_str(),
-                        )?;
-                        let Some(ast::Cmd::Stmt(ast::Stmt::CreateTable {
-                            tbl_name: stored_name,
-                            body,
-                            temporary,
-                            if_not_exists,
-                        })) = cmd
-                        else {
-                            break 'sql None;
-                        };
-                        let ast::CreateTableBody::ColumnsAndConstraints {
-                            mut columns,
-                            constraints,
-                            options,
-                        } = body
-                        else {
-                            return Err(LimboError::InternalError(
-                                "CREATE TABLE AS SELECT schemas cannot be altered".to_string(),
-                            ));
-                        };
-                        match alter_func {
-                            AlterTableFunc::AddColumn => {
-                                let column = Parser::new(definition.as_bytes()).parse_column_definition(true)?;
-                                let added = normalize_ident(column.col_name.as_str());
-                                if columns.iter().any(|c| normalize_ident(c.col_name.as_str()) == added) {
-                                    // An already-rewritten image (MVCC or temp-schema replays): as is.
-                                    break 'sql None;
-                                }
-                                columns.push(column);
-                            }
-                            _ => {
-                                let before = columns.len();
-                                columns.retain(|c| normalize_ident(c.col_name.as_str()) != dropped);
-                                if columns.len() == before {
-                                    // An already-rewritten image (MVCC or temp-schema replays): as is.
-                                    break 'sql None;
-                                }
-                            }
-                        }
-                        let new_stmt = ast::Stmt::CreateTable {
-                            tbl_name: stored_name,
-                            body: ast::CreateTableBody::ColumnsAndConstraints {
-                                columns,
-                                constraints,
-                                options,
-                            },
-                            temporary,
-                            if_not_exists,
-                        };
-                        // The row stays in the form it was in (REVISION 2 item 8).
-                        let dialect = program.connection.dialect();
-                        let owned = dialect.owns_stored_table_sql(sql.as_str());
-                        Some(dialect.format_changed_table_sql(owned, crate::dialect::TableChange::Rewritten(&new_stmt))?)
-                    };
-                    (name, tbl_name, new_sql)
                 }
                 AlterTableFunc::AlterColumn | AlterTableFunc::RenameColumn => {
                     let table = {

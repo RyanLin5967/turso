@@ -268,6 +268,16 @@ pub(crate) fn wal_lock_held() -> bool {
 
 /// A statement was prepared on this thread.
 pub(crate) fn statement_prepared() {
+    // Diagnostic only (the schema-window flake, lead 2026-10-19): with BUDGET_PREPARE_BACKTRACE set,
+    // each prepare prints its thread and backtrace to stderr, so a run that counts one can say where.
+    if std::env::var_os("BUDGET_PREPARE_BACKTRACE").is_some() {
+        eprintln!(
+            "DIAG-PREPARE thread={:?} wal_held={}\n{}",
+            std::thread::current().name(),
+            wal_lock_held(),
+            std::backtrace::Backtrace::force_capture()
+        );
+    }
     bump(&T_PREPARES, 1);
     if DEPTH.try_with(|d| d.get()).unwrap_or(0) > 0 {
         bump(&T_HELD_PREPARES, 1);
@@ -1540,8 +1550,16 @@ fn linux_task_running(tid: u64) -> TaskState {
     let mut buf = [0u8; 512];
     // SAFETY: `buf` is writable for its length.
     let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+    // Read before close, which may set errno itself.
+    let read_errno = (n < 0).then(|| std::io::Error::last_os_error().raw_os_error()).flatten();
     // SAFETY: the descriptor opened above.
     unsafe { libc::close(fd) };
+    // A thread that exits between the open and the read fails the read with ESRCH (or reads
+    // nothing): gone, as at the open (the whole-lib suite at 18556a956 refused budget_child's windows
+    // on both kinds, raws artie 192c15645a and f149c7c839).
+    if matches!(read_errno, Some(libc::ESRCH) | Some(libc::ENOENT)) || n == 0 {
+        return TaskState::Gone;
+    }
     let Some(text) = usize::try_from(n).ok().and_then(|n| buf.get(..n)) else {
         return TaskState::Unreadable;
     };
@@ -1603,9 +1621,18 @@ fn others_blocked_refuses_when_a_threads_stat_cannot_be_read() {
             std::hint::spin_loop();
         }
     });
+    // Reset on every exit, a panic included (engine-rev-qaf-fix2 LOW 4: the global hook stayed set
+    // for the rest of the process if others_blocked panicked).
+    struct Unset;
+    impl Drop for Unset {
+        fn drop(&mut self) {
+            STAT_UNREADABLE_FOR_TEST.store(false, Relaxed);
+        }
+    }
+    let unset = Unset;
     STAT_UNREADABLE_FOR_TEST.store(true, Relaxed);
     let read = others_blocked();
-    STAT_UNREADABLE_FOR_TEST.store(false, Relaxed);
+    drop(unset);
     spinner_stop.store(true, Relaxed);
     spinner.join().unwrap();
     assert_eq!(read, None, "CLAIM: unreadable thread states refuse the probe");

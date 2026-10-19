@@ -398,6 +398,7 @@ pub fn translate_inner(
             if_not_exists,
             domain_name,
             base_type,
+            base_type_params,
             default,
             not_null,
             constraints,
@@ -408,6 +409,7 @@ pub fn translate_inner(
             schema::translate_create_domain(
                 &domain_name,
                 &base_type,
+                &base_type_params,
                 not_null,
                 &constraints,
                 default,

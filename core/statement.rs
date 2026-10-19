@@ -1209,6 +1209,36 @@ impl Statement {
         }
     }
 
+    /// A result column's declared type parameters as integers (fastest-wire's ask, wire-rev-uw3
+    /// MED-1: PostgreSQL's RowDescription carries each column's atttypmod, built from them): for a
+    /// result column that is a direct reference to a table column (the `Expr::Column` path
+    /// `get_column_decltype` follows), that column's `ty_params`, each an integer literal (`[5]` for
+    /// varchar(5), `[8, 2]` for numeric(8,2), `[]` for no parameters); `None` for any other result
+    /// column, or when a parameter is not an integer literal (signed with a unary minus or plus
+    /// included). EXPLAIN and EXPLAIN QUERY PLAN columns have none: `None`.
+    pub fn get_column_type_params(&self, idx: usize) -> Option<Vec<i64>> {
+        use turso_parser::ast::{Expr, Literal, UnaryOperator};
+        if self.query_mode != QueryMode::Normal {
+            return None;
+        }
+        let column = self.program.result_columns.get(idx)?;
+        let Expr::Column { table, column: column_idx, .. } = &column.expr else {
+            return None;
+        };
+        let (_, table_ref) = self.program.table_references.find_table_by_internal_id(*table)?;
+        let table_column = table_ref.get_column_at(*column_idx)?;
+        fn integer(e: &Expr) -> Option<i64> {
+            match e {
+                Expr::Literal(Literal::Numeric(n)) => n.parse::<i64>().ok(),
+                Expr::Unary(UnaryOperator::Negative, inner) => integer(inner)?.checked_neg(),
+                Expr::Unary(UnaryOperator::Positive, inner) => integer(inner),
+                Expr::Parenthesized(v) if v.len() == 1 => integer(&v[0]),
+                _ => None,
+            }
+        }
+        table_column.ty_params.iter().map(|p| integer(p)).collect()
+    }
+
     /// Returns rich type information for a result column.
     ///
     /// This is Turso's single entry point for "what is the type of this
@@ -1304,6 +1334,41 @@ impl Statement {
                 base_type,
                 kind,
             }));
+        }
+        // An expression whose values are of a custom type (an operator the type defines, min/max,
+        // a CAST to it; `order_by::expr_custom_type`) is that type, as PostgreSQL types it
+        // (fastest-wire 76b5a2550: `b + 1` over numeric).
+        {
+            let schema = self.program.connection.schema.read();
+            let scalar = match &column.expr {
+                turso_parser::ast::Expr::SubqueryResult {
+                    query_type: turso_parser::ast::SubqueryType::RowValue { result_reg_start, num_regs: 1 },
+                    ..
+                } => self
+                    .program
+                    .scalar_subquery_types
+                    .get(result_reg_start)
+                    .and_then(|name| schema.get_type_def_unchecked(name))
+                    .cloned(),
+                _ => None,
+            };
+            let typed = scalar.map(|td| (td, std::vec::Vec::new())).or_else(|| {
+                crate::translate::order_by::expr_custom_type(&column.expr, &self.program.table_references, &schema)
+            });
+            if let Some((type_def, _)) = typed {
+                let base_type = schema
+                    .resolve_type_unchecked(&type_def.name)
+                    .ok()
+                    .flatten()
+                    .map(|r| r.primitive.to_uppercase());
+                let kind = if type_def.is_domain { ColumnTypeKind::Domain } else { ColumnTypeKind::Custom };
+                return Ok(Some(ColumnTypeInfo {
+                    declared_name: type_def.name.clone(),
+                    array_dimensions: 0,
+                    base_type,
+                    kind,
+                }));
+            }
         }
         // Not a table column: infer the result primitive from the
         // expression's shape (literal value type, operand types of a binary
@@ -1787,6 +1852,33 @@ mod tests {
             Arc::new(SqliteDialect),
         )?;
         db.connect()
+    }
+
+    /// fastest-wire's ask (wire-rev-uw3 MED-1, RowDescription typmod; PG 18.6 recorded in the wire's
+    /// pg18-typmod.out): a table column's declared parameters reach the statement as integers, an
+    /// expression's do not. At the stub every column answers None: red by its claim.
+    #[test]
+    fn a_result_columns_type_params_are_its_table_columns() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file_with_flags(
+            io,
+            ":memory:",
+            OpenFlags::Create,
+            DatabaseOpts::new().with_custom_types(true),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v varchar(5), n numeric(8, 2), x text) STRICT")
+            .unwrap();
+        let stmt = conn.prepare("SELECT v, n, x, v || 'a', 1 FROM t").unwrap();
+        let got: Vec<Option<Vec<i64>>> = (0..5).map(|i| stmt.get_column_type_params(i)).collect();
+        assert_eq!(
+            got,
+            vec![Some(vec![5]), Some(vec![8, 2]), Some(vec![]), None, None],
+            "CLAIM: varchar(5), numeric(8, 2), text, then two expressions"
+        );
     }
 
     #[test]

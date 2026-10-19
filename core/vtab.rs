@@ -326,6 +326,20 @@ impl VirtualTableCursor {
         }
     }
 
+    /// The external module table this cursor reads, as a handle that can begin, commit and roll back
+    /// it: a transaction's participant is the table the cursor holds, never a lookup in the
+    /// connection's registry, which a table reached through another connection's schema, or
+    /// restored by a ROLLBACK, is missing from (engine-rev-qaf-fix2 MED 3: VBegin panicked).
+    pub(crate) fn ext_table(&self) -> Option<ExtVirtualTable> {
+        match &self.inner {
+            VirtualTableCursorInner::External(cursor) => Some(ExtVirtualTable {
+                implementation: cursor.implementation.clone(),
+                table: cursor._table.clone(),
+            }),
+            _ => None,
+        }
+    }
+
     pub(crate) fn vtab_id(&self) -> Option<u64> {
         match &self.inner {
             VirtualTableCursorInner::Pragma(_) => None,
@@ -481,7 +495,7 @@ impl ExtVirtualTable {
         self.table.destroy_on_drop.store(true, Ordering::Release);
     }
 
-    fn commit(&self) -> crate::Result<()> {
+    pub(crate) fn commit(&self) -> crate::Result<()> {
         let rc = unsafe { (self.implementation.commit)(self.table.ptr.load(Ordering::SeqCst)) };
         match rc {
             ResultCode::OK => Ok(()),
@@ -489,7 +503,7 @@ impl ExtVirtualTable {
         }
     }
 
-    fn begin(&self) -> crate::Result<()> {
+    pub(crate) fn begin(&self) -> crate::Result<()> {
         let rc = unsafe { (self.implementation.begin)(self.table.ptr.load(Ordering::SeqCst)) };
         match rc {
             ResultCode::OK => Ok(()),
@@ -497,7 +511,7 @@ impl ExtVirtualTable {
         }
     }
 
-    fn rollback(&self) -> crate::Result<()> {
+    pub(crate) fn rollback(&self) -> crate::Result<()> {
         let rc = unsafe { (self.implementation.rollback)(self.table.ptr.load(Ordering::SeqCst)) };
         match rc {
             ResultCode::OK => Ok(()),
