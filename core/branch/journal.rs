@@ -127,11 +127,16 @@ fn log_segment() -> Vec<u8> {
     // One non-zero volatile write per page, so the page is really touched: a zeroing `resize` can be
     // turned by the optimizer into an untouched zeroed allocation (engine-rev-l2b HIGH B: 882 of 960
     // pages faulted in later in a release build), and a volatile store cannot be elided.
+    // The first byte, then every page boundary after it (the buffer need not start on one: stepping
+    // 4 KiB from its base skipped the last of the 17 pages a mid-page start spans, engine-rev-l2b
+    // LOW), so every page the buffer covers is written.
     let mut v: Vec<u8> = Vec::with_capacity(LOG_SEGMENT);
     let base = v.as_mut_ptr();
-    for at in (0..LOG_SEGMENT).step_by(4096) {
-        // SAFETY: `at` < LOG_SEGMENT, within the capacity just allocated; the bytes are never read
-        // as initialized (the Vec stays empty).
+    let first_boundary = (4096 - (base as usize % 4096)) % 4096;
+    // SAFETY: every offset written is < LOG_SEGMENT, within the capacity just allocated; the bytes
+    // are never read as initialized (the Vec stays empty).
+    unsafe { std::ptr::write_volatile(base, 1u8) };
+    for at in (first_boundary..LOG_SEGMENT).step_by(4096) {
         unsafe { std::ptr::write_volatile(base.add(at), 1u8) };
     }
     v
@@ -2128,9 +2133,8 @@ impl Journal {
         if drop_pending > 0 {
             self.pending.drain(..drop_pending);
             // In place, keeping the slots' reservation (engine-rev-l2b MED: a fresh Vec dropped it).
-            let named = slots_named(&self.pending);
             self.pending_slots.clear();
-            self.pending_slots.extend_from_slice(&named);
+            slots_named_into(&self.pending, &mut self.pending_slots);
         }
         if class.syncs() {
             if let Err(e) = fsync_dir_of(&self.files.log, class) {
@@ -3562,6 +3566,13 @@ fn fresh_nonce(old: u32) -> u32 {
 /// buffer was dropped (F-FZ). A frame that does not decode names nothing.
 fn slots_named(frames: &[u8]) -> Vec<Slot> {
     let mut out = Vec::new();
+    slots_named_into(frames, &mut out);
+    out
+}
+
+/// `slots_named`, appended to `out` (a rewrite's `pending_slots`, keeping its reservation, with no
+/// list of its own; each decoded Commit still allocates its pages, on this rewrite path only).
+fn slots_named_into(frames: &[u8], out: &mut Vec<Slot>) {
     let mut pos = 0;
     while let Some(head) = frames.get(pos..pos + FRAME_HEADER_LEN) {
         let len = u32::from_le_bytes(head[0..4].try_into().expect("four bytes")) as usize;
@@ -3576,7 +3587,6 @@ fn slots_named(frames: &[u8]) -> Vec<Slot> {
         }
         pos = start + len;
     }
-    out
 }
 
 /// One group flight (fastest-engine M1 item 2; gc 389b474b4): frames taken from a journal's buffer
