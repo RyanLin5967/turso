@@ -4803,7 +4803,9 @@ fn a_schema_window_reread_allocates_at_most_linearly_in_tables() {
 ///   reference's by at most 1 (the schema and the meta row together; today 13 + 1);
 /// * nothing is compiled under the store mutex to create it: `held_prepares` equal to the
 ///   reference's (the catalog's creation needs nothing the mutex guards: it can be made and
-///   prepared before the mutex is taken, or at the open).
+///   prepared before the mutex is taken, or at the open);
+/// * and it allocates at most 8 KiB under the store mutex beyond the reference's (engine-rev-l2b:
+///   bytes, not only commits and statements; the bound leap_l2b uses).
 ///
 /// Flushes are reported, not budgeted (the fresh create also makes the log and the arena). Expected
 /// RED today, so no mutant against it can earn a kill before a green baseline exists (review C08). The review's split-transaction mutant is today's code, so this red at base is its
@@ -4832,6 +4834,14 @@ fn a_first_create_makes_its_catalog_in_one_commit_off_the_store_mutex() {
     let held = least(&fresh[..], "held_prepares").saturating_sub(most(&reference[..], "held_prepares"));
     if held > 0 {
         let _ = writeln!(failures, "  the catalog's creation compiled {held} statements under the store mutex; budget 0");
+    }
+    // engine-rev-l2b (via fastest-engine): a byte bound under the store mutex, so a fix that commits once
+    // and compiles nothing there cannot still allocate the ~2.6 MB the creation holds today (2,604,646 B at
+    // create 0 with 15 live, lane raw 78d2823373). The same instrument and bound as leap_l2b (the thread's
+    // allocation bytes under the mutex), over the reopened reference.
+    let held_bytes = least(&fresh[..], "held_alloc_bytes").saturating_sub(most(&reference[..], "held_alloc_bytes"));
+    if held_bytes > 8 << 10 {
+        let _ = writeln!(failures, "  the catalog's creation allocated {held_bytes} B under the store mutex; budget <= 8 KiB");
     }
     println!(
         "first create: fresh {}..{} F_FULLFSYNC, {}..{} fsync; reopened {}..{} F_FULLFSYNC, {}..{} fsync",
