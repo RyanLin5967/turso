@@ -2697,4 +2697,55 @@ mod tests {
         }
         assert!(bad.is_empty(), "CLAIM: numeric zero diverged from PostgreSQL 18 (a timeout: it never finished): {bad:?}");
     }
+
+    /// Every row of `sql` on `conn`, each value as its display text (NULL as "NULL"), or the error.
+    fn table_of(conn: &Arc<crate::Connection>, sql: &str) -> Result<Vec<Vec<String>>, String> {
+        let rows = conn.prepare(sql).and_then(|mut s| s.run_collect_rows()).map_err(|e| e.to_string())?;
+        Ok(rows
+            .iter()
+            .map(|r| r.iter().map(|v| if matches!(v, Value::Null) { "NULL".to_string() } else { v.to_string() }).collect())
+            .collect())
+    }
+
+    /// Runs each `(sql, want)` on `conn` and lists every one whose rows are not `want` (rows joined
+    /// by ';', values by ','), naming `source` as the oracle.
+    fn diverging(conn: &Arc<crate::Connection>, cases: &[(&str, &str)], source: &str) -> Vec<String> {
+        let mut bad = Vec::new();
+        for (sql, want) in cases {
+            let got = table_of(conn, sql).map(|rows| rows.iter().map(|r| r.join(",")).collect::<Vec<_>>().join(";"));
+            if got.as_deref() != Ok(*want) {
+                bad.push(format!("{sql} gave {got:?}, not {source}'s {want:?}"));
+            }
+        }
+        bad
+    }
+
+    /// Engine review 2bdcd32c6 HIGH 5 (artie frontier/fastest/reviews/REVIEW-engine-2bdcd32c6.md, raw
+    /// types/probe2.out.txt): sum over numeric(8, 2) is the numeric text '13.00' (97e6bf4cb), but a
+    /// comparison of it was not dispatched through numeric's operators, so it compared as text
+    /// against a number: `sum(b) = 13` and `sum(b) < 100` were false, and `HAVING sum(b) > 5` kept
+    /// every group. A value of a custom type that is not a column (an aggregate of one, a derived
+    /// relation's typed column) compares through the type's operator, as PostgreSQL compares a
+    /// numeric. Expected values are PostgreSQL 18's semantics for numeric comparison (numeric =,
+    /// <, > against an integer constant), not run here; booleans as SQLite's 1 and 0. The direct
+    /// column comparison is the control.
+    #[test]
+    fn a_numeric_aggregate_or_derived_value_compares_through_numerics_operators() {
+        let conn = open();
+        conn.execute("CREATE TABLE n(id INTEGER PRIMARY KEY, b numeric(8, 2)) STRICT").unwrap();
+        conn.execute("INSERT INTO n VALUES (1, 1.00), (2, 2.00), (3, NULL), (4, 10.00)").unwrap();
+        let bad = diverging(
+            &conn,
+            &[
+                ("SELECT b = 10 FROM n WHERE id = 4", "1"),
+                ("SELECT sum(b) = 13, sum(b) < 100, sum(b) > 5, sum(b) = 13.00, sum(b) <> 13 FROM n", "1,1,1,1,0"),
+                ("SELECT id FROM n GROUP BY id HAVING sum(b) > 5 ORDER BY id", "4"),
+                ("SELECT id FROM n GROUP BY id HAVING sum(b) < 1.5 ORDER BY id", "1"),
+                ("SELECT s = 13, s < 100 FROM (SELECT sum(b) AS s FROM n)", "1,1"),
+                ("SELECT max(b) = 10, min(b) < 2 FROM n", "1,1"),
+            ],
+            "PostgreSQL 18",
+        );
+        assert!(bad.is_empty(), "CLAIM: a numeric aggregate or derived value compared as text: {bad:#?}");
+    }
 }
