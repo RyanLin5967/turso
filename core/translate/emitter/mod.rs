@@ -212,6 +212,24 @@ pub struct Resolver<'a> {
     /// Compile with no triggers: the connection is applying a branch merge's row images
     /// (`Connection::row_image_apply`).
     pub(crate) triggers_disabled: bool,
+    /// True only while ALTER TABLE ADD/DROP COLUMN translates its own sqlite_schema UPDATE
+    /// ([`Self::allow_alter_column_sql`]): only then does `turso_alter_column_sql` resolve. User SQL
+    /// calling it is "no such function", as in SQLite (engine-rev 2bdcd32c6 MED 5: a SELECT answered
+    /// it, and a CHECK naming it stored a schema neither SQLite nor an older Turso opens). Forks copy it.
+    alter_column_sql_allowed: std::cell::Cell<bool>,
+}
+
+/// While alive, its [`Resolver`] resolves `turso_alter_column_sql`; dropping it restores the
+/// resolver's previous setting.
+pub(crate) struct AlterColumnSqlScope<'r, 'a> {
+    resolver: &'r Resolver<'a>,
+    was: bool,
+}
+
+impl Drop for AlterColumnSqlScope<'_, '_> {
+    fn drop(&mut self) {
+        self.resolver.alter_column_sql_allowed.set(self.was);
+    }
 }
 
 #[derive(Clone)]
@@ -331,6 +349,7 @@ impl<'a> Resolver<'a> {
             fk_action_compile_stack: FkActionCompileStack::default(),
             unqualified_database_search_path: unqualified_database_search_path.clone(),
             triggers_disabled: false,
+            alter_column_sql_allowed: std::cell::Cell::new(false),
         }
     }
 
@@ -366,7 +385,15 @@ impl<'a> Resolver<'a> {
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
             unqualified_database_search_path: self.unqualified_database_search_path.clone(),
             triggers_disabled: self.triggers_disabled,
+            alter_column_sql_allowed: std::cell::Cell::new(self.alter_column_sql_allowed.get()),
         }
+    }
+
+    /// Lets this resolver resolve `turso_alter_column_sql` until the returned scope drops: for the
+    /// engine's own ALTER TABLE ADD/DROP COLUMN UPDATE of sqlite_schema only.
+    pub(crate) fn allow_alter_column_sql(&self) -> AlterColumnSqlScope<'_, 'a> {
+        let was = self.alter_column_sql_allowed.replace(true);
+        AlterColumnSqlScope { resolver: self, was }
     }
 
     pub fn fork_with_expr_cache(&self) -> Resolver<'a> {
@@ -393,6 +420,7 @@ impl<'a> Resolver<'a> {
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
             unqualified_database_search_path: self.unqualified_database_search_path.clone(),
             triggers_disabled: self.triggers_disabled,
+            alter_column_sql_allowed: std::cell::Cell::new(self.alter_column_sql_allowed.get()),
         }
     }
 
@@ -516,6 +544,18 @@ impl<'a> Resolver<'a> {
         // The dialect owns the function name surface of user SQL; extension
         // functions resolve after it.
         match self.dialect.resolve_function(func_name, arg_count)? {
+            // Engine-internal: only ALTER's own UPDATE resolves it (MED 5); anywhere else it is as
+            // unknown as in SQLite. Mutant `alter_column_sql_user_callable` (test builds only): as at
+            // 8feb0bf1b, callable from any SQL.
+            Some(Func::Scalar(crate::function::ScalarFunc::AlterColumnSql))
+                if !self.alter_column_sql_allowed.get()
+                    && !crate::branch::store::fe_mutant("alter_column_sql_user_callable") =>
+            {
+                Ok(self
+                    .symbol_table
+                    .resolve_function(func_name, arg_count)
+                    .map(Func::External))
+            }
             Some(func) => Ok(Some(func)),
             None => Ok(self
                 .symbol_table

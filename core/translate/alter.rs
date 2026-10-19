@@ -1260,6 +1260,8 @@ pub fn translate_alter_table(
                 None
             };
 
+            // The UPDATE calls turso_alter_column_sql, which user SQL cannot (engine-rev 2bdcd32c6 MED 5).
+            let _alter_sql = resolver.allow_alter_column_sql();
             translate_update_for_schema_change(
                 update,
                 resolver,
@@ -1605,6 +1607,8 @@ pub fn translate_alter_table(
                 )?;
             }
 
+            // The UPDATE calls turso_alter_column_sql, which user SQL cannot (engine-rev 2bdcd32c6 MED 5).
+            let _alter_sql = resolver.allow_alter_column_sql();
             translate_update_for_schema_change(
                 update,
                 resolver,
