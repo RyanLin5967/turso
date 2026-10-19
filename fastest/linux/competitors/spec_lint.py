@@ -88,6 +88,11 @@ HOME = {"pg18-": "connect host=127.0.0.1 port={port} user=postgres dbname=postgr
         "dolt-": "connect host=127.0.0.1 port={port} user=root db=bench"}
 
 
+# the lead's Doltgres b-m1 ruling (DECISIONS 2026-10-19): the specs that run `home per-cycle`, each with its delete as
+# its LAST after-step, on the admin connection (Doltgres 1.4.0 poisons a connection that wrote on a deleted branch)
+PER_CYCLE = {"doltgres-b-m1.spec": "after admin-sql SELECT dolt_branch('-d', '{branch}')"}
+
+
 def home_of(f):
     """The registered home connect line for spec file F (the longest matching prefix: doltgres- before dolt-)."""
     return next((HOME[p] for p in sorted(HOME, key=len, reverse=True) if f.startswith(p)), None)
@@ -126,6 +131,13 @@ def lint(d):
             why.append(f"{f}: connect lines {got_conn}, registered [{home_of(f)!r}] (a connect string can change the "
                        f"session's durability)")
         got_after = [ln for ln in lines if ln.startswith("after ")]
+        got_home = [ln for ln in lines if ln.startswith("home ")]
+        want_home = ["home per-cycle"] if f in PER_CYCLE else []
+        if got_home != want_home:
+            why.append(f"{f}: home lines {got_home}, registered {want_home} (the Doltgres b-m1 ruling)")
+        if f in PER_CYCLE and got_after[-1:] != [PER_CYCLE[f]]:
+            why.append(f"{f}: last after-step {got_after[-1:]}, registered {PER_CYCLE[f]!r} (the delete on the admin "
+                       f"connection)")
         if back is not None and got_after[:1] != [back]:
             why.append(f"{f}: first after-step {got_after[:1]}, registered switch-back {back}")
     for f in sorted(REG):
@@ -171,13 +183,20 @@ def selftest():
     def drop_line(f, line):
         def ed(dd):
             p = os.path.join(dd, f)
-            open(p, "w").write("\n".join(ln for ln in open(p).read().split("\n") if ln != line))
+            # (read BEFORE opening for write: the one-line form truncated the file first and planted an EMPTY spec, so
+            # every drop_line plant was refused for "protocol []", not for the line it dropped)
+            txt = open(p).read().split("\n")
+            if line not in txt:
+                raise AssertionError(f"drop_line: {line!r} is not in {f}: the plant would plant nothing")
+            open(p, "w").write("\n".join(ln for ln in txt if ln != line))
         return ed
 
     def replace_text(f, old, new):
         def ed(dd):
             p = os.path.join(dd, f)
             txt = open(p).read()
+            if old not in txt:
+                raise AssertionError(f"replace_text: {old!r} is not in {f}: the plant would plant nothing")
             open(p, "w").write(txt.replace(old, new))
         return ed
 
@@ -200,8 +219,11 @@ def selftest():
     def write_spec(sysname, form, steps, back):
         def ed(dd):
             f = f"{sysname}-{form}.spec"
+            # (and, for a PER_CYCLE spec, the Doltgres b-m1 ruling's lines, so the control is the registered form whole)
+            pc = f in PER_CYCLE
             open(os.path.join(dd, f), "w").write(
-                "\n".join([f"protocol {REG[f][0]}", home_of(f), BRANCH] + steps + [back]) + "\n")
+                "\n".join([f"protocol {REG[f][0]}", home_of(f)] + (["home per-cycle"] if pc else []) + [BRANCH]
+                          + steps + [back] + ([PER_CYCLE[f]] if pc else [])) + "\n")
         return ed
 
     for _s, _f in (("dolt", "b-m1c"), ("dolt", "b-m1"), ("doltgres", "b-m1c"), ("doltgres", "b-m1")):
