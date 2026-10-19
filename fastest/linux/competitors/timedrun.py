@@ -721,11 +721,13 @@ def raw_tsv(sm, extra_rows=(), drop_warm=0, after_cols=None, claimed_rows=None):
     return "".join(out)
 
 
-def raw_tsv_full(sm, swap_claim_intended=False):
+def raw_tsv_full(sm, swap_claim_intended=False, end_before_start_row=None):
     """comp-rev-89ec-b3c3 LOW 16: a raw.tsv with the clock columns a closed-loop producer writes (bbload and clonebench:
     claim_ns, then intended_ns = start_ns, end_ns, lat_ns = end_ns - intended_ns), agreeing with summary SM; each op is
     claimed 300 ns before it starts and takes 1000 ns. SWAP_CLAIM_INTENDED writes each row's claim_ns and intended_ns
-    values in each other's columns (a row printf whose arguments are out of order against its header)."""
+    values in each other's columns (a row printf whose arguments are out of order against its header).
+    END_BEFORE_START_ROW: that row (0-based, warm-up rows first) ends 5 ns before it starts, its lat_ns still
+    end - intended (so only the clock-order guard can refuse it)."""
     out = ["client\tseq\tphase\tok\tclaim_ns\tintended_ns\tstart_ns\tend_ns\tlat_ns\n"]
     wo, mo, t0, tm0 = sm.get("warmup_ops"), sm.get("measured_ops"), sm.get("t0_ns"), sm.get("tm0_ns")
     rows = [("warmup", t0 + 1000 + 2000 * i) for i in range(wo)] + [("measure", tm0 + 1000 + 2000 * i) for i in range(mo)]
@@ -733,7 +735,8 @@ def raw_tsv_full(sm, swap_claim_intended=False):
         c, t = s - 300, s
         if swap_claim_intended:
             c, t = t, c
-        out.append(f"0\t{i}\t{ph}\t1\t{c}\t{t}\t{s}\t{s + 1000}\t1000\n")
+        e = s - 5 if i == end_before_start_row else s + 1000
+        out.append(f"0\t{i}\t{ph}\t1\t{c}\t{t}\t{s}\t{e}\t{e - s}\n")  # lat from the TRUE intended start, s
     return "".join(out)
 
 
@@ -1115,6 +1118,13 @@ def selftest():
          dict(tracer=clean, timed_raw=raw_tsv_full(dict(RUN, measured_ops=200))), True),
         ("a raw.tsv whose rows hold claim_ns and intended_ns in each other's columns",
          dict(tracer=clean, timed_raw=raw_tsv_full(dict(RUN, measured_ops=200), swap_claim_intended=True)), False),
+        # (the guards timedrun_mutants found no case reaching, artie runs/uw-20261019-g2-*: each its own reason)
+        ("a timed summary with no measured_ops", dict(tracer=clean, timed_extra={"measured_ops": None}), False),
+        ("a timed summary whose measured_ok is not a count", dict(tracer=clean, timed_extra={"measured_ok": "x"}), False),
+        ("a raw.tsv row that ends before it starts",
+         dict(tracer=clean, timed_raw=raw_tsv_full(dict(RUN, measured_ops=200), end_before_start_row=1600)), False),
+        ("a raw.tsv with a clock column that is not a count",
+         dict(tracer=clean, timed_raw=raw_tsv_full(dict(RUN, measured_ops=200)).replace("\t1000\n", "\tx\n", 1)), False),
     ]
     refusal_reasons = {
         "a server task traced at the end of the timed run": ("traced during the timed run", "a sweep saw a TracerPid"),
@@ -1274,6 +1284,10 @@ def selftest():
         "clonebench: neither run records its op": ("the labelling and timed runs do not both record op",),
         "a raw.tsv whose rows hold claim_ns and intended_ns in each other's columns":
             ("timed run's raw.tsv has 1700 row(s) whose lat_ns is not end_ns - intended_ns",),
+        "a timed summary with no measured_ops": ("timed run has no measured_ops count (None)",),
+        "a timed summary whose measured_ok is not a count": ("timed run's measured_ok 'x' is not a count",),
+        "a raw.tsv row that ends before it starts": ("timed run's raw.tsv has 1 row(s) out of clock order",),
+        "a raw.tsv with a clock column that is not a count": ("timed run's raw.tsv has a clock column that is not a count",),
     })
     bad = n = 0
 
