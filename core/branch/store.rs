@@ -408,6 +408,8 @@ pub(crate) struct Group {
     /// no flight in the air for 5 ms in the middle of a burst, and the writer took that for the idle
     /// tail, 4, 4 and 5 words in 3 runs, raw l94). Counted without the group's lock.
     awaiting: AtomicU64,
+    /// The leader's flight time, handed to its `land` (no lock of its own; engine-rev-qaf-fix MED-5).
+    last_flight_ns: AtomicU64,
     /// The store's fail-stop flag, shared with its journal (`StoreInner::fail_stop`).
     failed: Arc<AtomicBool>,
     /// The confirmation last WRITTEN (`Confirm::key`, 0 for none; raised by `fetch_max`, as keys
@@ -724,6 +726,7 @@ impl Group {
             confirm_cv: std::sync::Condvar::new(),
             durable_now: [AtomicU64::new(durable), AtomicU64::new(durable), AtomicU64::new(durable)],
             awaiting: AtomicU64::new(0),
+            last_flight_ns: AtomicU64::new(0),
             failed,
             confirm_done: AtomicU64::new(0),
             confirms_written: AtomicU64::new(0),
@@ -871,6 +874,14 @@ impl Group {
     fn land(&self, end: u64, class: SyncClass, ok: bool, confirm: Option<Confirm>) -> bool {
         let mut g = self.lock();
         g.flushing = false;
+        // The flight's write and sync time, set by its leader just before (LEAP L3's bound).
+        let took = self.last_flight_ns.swap(0, Ordering::AcqRel);
+        if took > 0 {
+            g.flight_ns += took;
+            if ok {
+                g.record_flight(took);
+            }
+        }
         // LEAP L3: the cohort the next leader gathers for, counted at the landing while this flight's
         // riders are still inside their wait: the riders plus whoever buffered meanwhile, about C in
         // a closed loop. Counted at the take it was only the waiters then, the other half (about
@@ -6589,14 +6600,9 @@ impl BranchStore {
             } else {
                 flight.write()
             });
-            {
-                let took = written_from.elapsed().as_nanos() as u64;
-                let mut g = group.lock();
-                g.flight_ns += took;
-                if written.is_ok() {
-                    g.record_flight(took);
-                }
-            }
+            // Recorded by the landing, in the group lock it takes anyway (engine-rev-qaf-fix MED-5:
+            // a lock of its own per flight).
+            group.last_flight_ns.store(written_from.elapsed().as_nanos() as u64, Ordering::Release);
             if written.is_err() {
                 // Fail-stops the group and the journal in one step (they share the flag), and
                 // wakes the waiters, some of whom hold the store mutex while they wait.
