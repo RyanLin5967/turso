@@ -12360,6 +12360,13 @@ replays_postgresql!(
         (19, "PGDIV-NUMERIC-CAST-FLOAT8 value [wire]: a CAST to NUMERIC(p,s) is computed and typed as the engine's REAL (701, '2.5') where PG types it 1700 with its scale ('2.50'); it sorts and compares as a number (wire-rev-2a68496d0 H1); numeric waits for the engine's typed CAST (437f337be)"),
     ]
 );
+// wire-rev-2a68496d0 M1: arithmetic result columns typed by PostgreSQL's operator resolution (24ebb32af's walk typed real
+// * int float4, date - date date, ts - ts timestamp, '5' + i text, and answered text + 1 and boolean + 1).
+replays_postgresql!(
+    pg18_wirefuzz_arithmetic_result_columns_are_typed_by_postgresqls_operators_replays_as_postgresql_answered,
+    "pg18-wirefuzz-arithmetic_result_columns_are_typed_by_postgresqls_operators.out",
+    []
+);
 replays_postgresql!(
     pg18_wirefuzz_the_connected_database_is_current_database_and_in_pg_database_replays_as_postgresql_answered,
     "pg18-wirefuzz-the_connected_database_is_current_database_and_in_pg_database.out",
