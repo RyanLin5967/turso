@@ -238,6 +238,66 @@ fn past_the_hard_log_limit_a_fill_batch_starved_of_the_store_mutex_does_not_hold
     assert!(meta >= 21, "past the hard limit the upgrade waited for a fill batch it could not see: meta {meta}, log peak {peak} B");
 }
 
+#[test]
+fn ls_fill_entry_starved_child() {
+    if !in_child() {
+        return;
+    }
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("e.db");
+    older_store(&path, 1_000);
+    super::journal::set_compact_threshold(4 << 10);
+    // The fill thread is held at its start, before it first takes the store mutex, as a fill
+    // starved of it there would be (l4-rev-h1 MED-3).
+    super::store::LINKS_FILL_ENTRY_HELD.store(0, Ordering::Release);
+    super::store::LINKS_FILL_HOLD_AT_ENTRY.store(true, Ordering::Release);
+    let db = open(&path);
+    db.branch_wait_name_filter();
+    let trunk = db.connect().unwrap();
+    let mut peak = 0;
+    let mut k = 0;
+    while !(db.branches.past_hard_limit_for_test() && super::store::LINKS_FILL_ENTRY_HELD.load(Ordering::Acquire) >= 1) && k < 20_000 {
+        let _ = trunk.fork_branch().unwrap().into_id();
+        peak = peak.max(log_bytes(&path));
+        k += 1;
+    }
+    let past = db.branches.past_hard_limit_for_test();
+    let held = super::store::LINKS_FILL_ENTRY_HELD.load(Ordering::Acquire);
+    for _ in 0..50 {
+        let _ = trunk.fork_branch().unwrap().into_id();
+        peak = peak.max(log_bytes(&path));
+    }
+    // Read before the hold is let go: what the 50 operations started with the fill held. A checkpoint
+    // they started runs on a thread of its own, so the meta row is polled for it (wall time only bounds
+    // the wait; a fill that held the upgrade never gets there).
+    let t = std::time::Instant::now();
+    let mut meta_held = meta_version(&path);
+    while meta_held < 21 && t.elapsed() < std::time::Duration::from_secs(60) {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        meta_held = meta_version(&path);
+    }
+    super::store::LINKS_FILL_HOLD_AT_ENTRY.store(false, Ordering::Release);
+    db.branch_checkpoint_wait();
+    println!("LS-ENTRY past={} held={held} creates={k} meta_held={meta_held} meta={} peak={peak}", u64::from(past), meta_version(&path));
+}
+
+/// l4-rev-h1 MED-3: past the hard log limit, a fill held at its start, before it first takes the store
+/// mutex (as one starved of it there would be), must not hold the upgrade. Read while the fill is
+/// still held, so only a checkpoint the operations started can have flipped the meta row.
+#[test]
+fn past_the_hard_log_limit_a_fill_starved_at_its_start_does_not_hold_the_upgrade() {
+    if in_child() {
+        return;
+    }
+    let text = child("ls_fill_entry_starved_child", &[]);
+    let r = readings(&text, "LS-ENTRY ");
+    let (past, held, meta_held, peak) = (r[0][0], r[0][1], r[0][3], r[0][5]);
+    println!("LS entry-starved: past {past}, held {held}, meta while held {meta_held}, peak {peak}");
+    assert_eq!(past, 1, "premise: the log never passed the hard limit (peak {peak} B)");
+    assert!(held >= 1, "premise: no fill thread reached its start and was held");
+    assert!(meta_held >= 21, "past the hard limit the upgrade waited for a fill held at its start: meta {meta_held}, log peak {peak} B");
+}
+
 // ---- L1: two explicit checkpoints ----
 
 #[test]

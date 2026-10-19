@@ -3736,6 +3736,15 @@ impl Drop for CutGate<'_> {
 /// count does not see) ran under the store mutex in a sharp store (red a722957c4). Mutant
 /// `l4_fill_wal_left` (test builds only): not truncated here.
 fn run_links_fill(shared: &StoreMutex, writer: &Mutex<Catalog>, group: &Group, made: &AtomicBool) {
+    // Test builds (l4-rev-h1 MED-3): a fill held before it first takes the store mutex, as one starved
+    // of it there would be; `LINKS_FILL_ENTRY_HELD` counts the fills that reached the hold.
+    #[cfg(test)]
+    {
+        LINKS_FILL_ENTRY_HELD.fetch_add(1, Ordering::AcqRel);
+        while LINKS_FILL_HOLD_AT_ENTRY.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
     // Links adversary 3 H1: progress is monotone across opens. The cursor committed with the last
     // batch is resumed while the catalog's generation is still the one it was filled under (no
     // checkpoint of any build has committed since, so the rows it covers are as they were); else
@@ -3872,6 +3881,12 @@ pub(crate) static LINKS_FILL_FAILS: AtomicBool = AtomicBool::new(false);
 pub(crate) static LINKS_FILL_HOLD_UNRECORDED: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 pub(crate) static LINKS_FILL_HELD_BATCHES: AtomicU64 = AtomicU64::new(0);
+/// Test builds (l4-rev-h1 MED-3): while set, a fill thread waits at its start, before it first takes
+/// the store mutex; `LINKS_FILL_ENTRY_HELD` counts the fills that reached that point.
+#[cfg(test)]
+pub(crate) static LINKS_FILL_HOLD_AT_ENTRY: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+pub(crate) static LINKS_FILL_ENTRY_HELD: AtomicU64 = AtomicU64::new(0);
 
 /// A fuzzy checkpoint's cut, after its catalog commit and before its install, holding no lock but
 /// briefly the store mutex (lead review 1 item 7, review 2 #5): wait — not holding the mutex — for
