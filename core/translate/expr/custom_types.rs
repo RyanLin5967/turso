@@ -3464,4 +3464,34 @@ mod tests {
         );
         assert!(bad.is_empty(), "CLAIM: a numeric column compared with a numeric value as text: {bad:#?}");
     }
+
+    /// Third fresh-context review of this lane's fixes (item 1): a join on numeric values compares
+    /// through numeric_eq in a nested loop, but a hash join hashes and compares the values
+    /// plainly, so `t1.b = t2.c * 1.0` ('0.50' against '0.500') and numeric(8, 2) against
+    /// numeric(8, 3) found no pair when the planner chose a hash join. Expected values are
+    /// PostgreSQL 18.6's for this exact SQL (UW run typesrev2bd-oracle7; artie raw
+    /// frontier/fastest/lanes/engine/raw/pg18-types-rev2bd-6.txt), never ours. The same-typmod
+    /// join is the control. 100 unindexed rows a side, so a hash join is worth planning.
+    #[test]
+    fn a_join_on_numeric_values_answers_as_numerics_equality_by_any_plan() {
+        let conn = open();
+        for sql in [
+            "CREATE TABLE t1(id INTEGER PRIMARY KEY, b numeric(8, 2)) STRICT",
+            "CREATE TABLE t2(id INTEGER PRIMARY KEY, c numeric(8, 2), d numeric(8, 3)) STRICT",
+            "INSERT INTO t1 WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 100) SELECT i, i / 2.0 FROM s",
+            "INSERT INTO t2 WITH RECURSIVE s(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM s WHERE i < 100) SELECT i, i / 2.0, i / 2.0 FROM s",
+        ] {
+            conn.execute(sql).unwrap();
+        }
+        let bad = diverging(
+            &conn,
+            &[
+                ("SELECT count(*) FROM t1 JOIN t2 ON t1.b = t2.c", "100"),
+                ("SELECT count(*) FROM t1 JOIN t2 ON t1.b = t2.c * 1.0", "100"),
+                ("SELECT count(*) FROM t1 JOIN t2 ON t1.b = t2.d", "100"),
+            ],
+            "PostgreSQL 18",
+        );
+        assert!(bad.is_empty(), "CLAIM: a join on numeric values answered unlike numeric's equality: {bad:#?}");
+    }
 }
