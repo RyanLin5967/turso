@@ -134,6 +134,8 @@ jobs:
         run: |
           timeout 120 bash fastest/linux/gates/run_selftest.sh python3 -B fastest/linux/competitors/sched_check.py selftest
           timeout 600 bash fastest/linux/competitors/bin_plants.sh dist "$RUNNER_TEMP/bin-plants"
+          # comp-rev-2404: bbload's end-of-run home probe against fake PG/MySQL servers (no real server needed)
+          timeout 300 bash fastest/linux/gates/run_selftest.sh python3 -B fastest/linux/competitors/loadgen/test_probe_shapes.py --binary dist/bbload
           timeout 300 bash fastest/linux/competitors/fetch_dolt_plant.sh "$RUNNER_TEMP/fetch-dolt-plant"  # comp review 1 LOW 38
       - uses: actions/upload-artifact@v4
         with:
