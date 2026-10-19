@@ -1209,6 +1209,17 @@ impl Statement {
         }
     }
 
+    /// A result column's declared type parameters as integers (fastest-wire's ask, wire-rev-uw3
+    /// MED-1: PostgreSQL's RowDescription carries each column's atttypmod, built from them): for a
+    /// result column that is a direct reference to a table column (the `Expr::Column` path
+    /// `get_column_decltype` follows), that column's `ty_params`, each an integer literal (`[5]` for
+    /// varchar(5), `[8, 2]` for numeric(8,2), `[]` for no parameters); `None` for any other result
+    /// column, or when a parameter is not an integer literal. STUB: `None` always.
+    pub fn get_column_type_params(&self, idx: usize) -> Option<Vec<i64>> {
+        let _ = idx;
+        None
+    }
+
     /// Returns rich type information for a result column.
     ///
     /// This is Turso's single entry point for "what is the type of this
@@ -1787,6 +1798,33 @@ mod tests {
             Arc::new(SqliteDialect),
         )?;
         db.connect()
+    }
+
+    /// fastest-wire's ask (wire-rev-uw3 MED-1, RowDescription typmod; PG 18.6 recorded in the wire's
+    /// pg18-typmod.out): a table column's declared parameters reach the statement as integers, an
+    /// expression's do not. At the stub every column answers None: red by its claim.
+    #[test]
+    fn a_result_columns_type_params_are_its_table_columns() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file_with_flags(
+            io,
+            ":memory:",
+            OpenFlags::Create,
+            DatabaseOpts::new().with_custom_types(true),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v varchar(5), n numeric(8, 2), x text) STRICT")
+            .unwrap();
+        let stmt = conn.prepare("SELECT v, n, x, v || 'a', 1 FROM t").unwrap();
+        let got: Vec<Option<Vec<i64>>> = (0..5).map(|i| stmt.get_column_type_params(i)).collect();
+        assert_eq!(
+            got,
+            vec![Some(vec![5]), Some(vec![8, 2]), Some(vec![]), None, None],
+            "CLAIM: varchar(5), numeric(8, 2), text, then two expressions"
+        );
     }
 
     #[test]
