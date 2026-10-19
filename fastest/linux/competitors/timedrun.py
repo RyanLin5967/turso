@@ -1150,8 +1150,11 @@ def selftest():
            f"timed.json sweeper_cpu_s, sweeper_cpu_span_s, sweeper_nice = {got!r}, want (0.04, [100.1, 100.3], 19)")
     # The lead's LOW 21 ruling: N = 1 and 1,000 are the registered tiers, so a real cell whose prebranch is beyond 1,000
     # is exploratory, never credited ('ok-exploratory-n', not 'ok'); timed.json records the prebranch's N, clients and
-    # bound. A smoke cell stays 'ok-smoke'.
-    for pre, dry_in, want in ((1000, "0", "ok"), (1001, "0", "ok-exploratory-n"), (100000, "0", "ok-exploratory-n"),
+    # bound. A smoke cell stays 'ok-smoke'. comp-rev-89ec-b3c3 MED 3: ONLY 1 and 1,000 are registered, so a real cell
+    # at the workflow default 20, at 500 or at 0 is exploratory too (it was 'ok': only N above 1,000 was kept out).
+    for pre, dry_in, want in ((1000, "0", "ok"), (1, "0", "ok"), (1001, "0", "ok-exploratory-n"),
+                              (100000, "0", "ok-exploratory-n"), (20, "0", "ok-exploratory-n"),
+                              (500, "0", "ok-exploratory-n"), (0, "0", "ok-exploratory-n"), (20, "1", "ok-smoke"),
                               (100000, "1", "ok-smoke")):
         with tempfile.TemporaryDirectory() as root:
             dd = fixture(root, "pre", tracer=clean, prebranch=f"prebranch={pre} prebranch_c=8 prebranch_s=3600")
