@@ -2551,6 +2551,26 @@ fn type_name_by_words(b: &[u8]) -> Option<String> {
     Some(out)
 }
 
+/// For quote `q`: `ends[j]` is the index just past the closing `q` of a quoted token whose body is
+/// read from `j` on (a doubled `qq` stays inside it), or None when it is never closed; so a token
+/// opening at `s` ends at `ends[s + 1]`, as [`quoted_type_word_end`] scans it. One right-to-left
+/// pass; `ends` has `b.len() + 2` entries.
+fn quote_closing_ends(b: &[u8], q: u8) -> Vec<Option<usize>> {
+    let n = b.len();
+    let mut ends = vec![None; n + 2];
+    for j in (0..n).rev() {
+        count_piece_step();
+        ends[j] = if b[j] != q {
+            ends[j + 1]
+        } else if b.get(j + 1) == Some(&q) {
+            ends[j + 2]
+        } else {
+            Some(j + 1)
+        };
+    }
+    ends
+}
+
 // Test builds: the scan steps `type_name_by_pieces` takes on this thread, so a test can bound its
 // cost by counting at the layer that pays rather than by timing.
 #[cfg(test)]
@@ -2576,13 +2596,33 @@ fn type_name_by_pieces(name: &str) -> Option<String> {
     let n = b.len();
     // back[e] = (s, quoted): the piece b[s..e] ends a cut of b[..e] that starts at 0.
     let mut back: Vec<Option<(usize, bool)>> = vec![None; n + 1];
+    // Linear in the name (engine-rev 2bdcd32c6 HIGH 1, the third attack: scanning from every start
+    // was quadratic, about 10^9 steps for a 100 KB name). A quoted piece's end comes from one
+    // right-to-left pass per quote kind, and a run's scan is skipped for a start inside a run an
+    // earlier start already scanned: its ends are a subset of that scan's, all already marked (and
+    // `get_or_insert` keeps the earlier mark). Mutant `type_pieces_quadratic_scan` (test builds of
+    // this crate only): every start scans again.
+    let quadratic = fe_mutant("type_pieces_quadratic_scan");
+    let closes = [b'"', b'\'', b'`'].map(|q| quote_closing_ends(b, q));
+    let mut scanned_to = 0;
     for s in 0..n {
         count_piece_step();
         if s > 0 && !(b[s - 1] == b' ' && back[s - 1].is_some()) {
             continue;
         }
-        if let Some(e) = quoted_type_word_end(b, s) {
-            back[e].get_or_insert((s, true));
+        let kind = match b[s] {
+            b'"' => Some(0),
+            b'\'' => Some(1),
+            b'`' => Some(2),
+            _ => None,
+        };
+        if let Some(e) = kind.and_then(|k| closes[k][s + 1]) {
+            if e == n || b[e] == b' ' {
+                back[e].get_or_insert((s, true));
+            }
+        }
+        if s < scanned_to && !quadratic {
+            continue;
         }
         let mut e = s;
         while e < n && b[e] != b']' {
@@ -2592,6 +2632,7 @@ fn type_name_by_pieces(name: &str) -> Option<String> {
                 back[e].get_or_insert((s, false));
             }
         }
+        scanned_to = e;
     }
     let mut pieces = Vec::new();
     let mut e = n;
