@@ -16040,6 +16040,28 @@ fn a_quoted_column_type_survives_every_rewrite_unchanged() {
     assert!(failed.is_empty(), "CLAIM: the quoted type is stored once, unchanged: {failed:#?}");
 }
 
+/// engine-rev-qaf-fix2 LOW 19: a type written "my type" or [my type] reads back as the same type
+/// after ADD COLUMN and a reopen (18556a956 had stored "my type" as ["my type"]).
+#[test]
+fn spaced_type_names_read_back_unchanged_after_a_rewrite_and_a_reopen() {
+    let _g = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("spaced.db");
+    let types = |c: &Arc<Connection>| adv_rows(c, "SELECT name, type FROM pragma_table_info('t') WHERE name IN ('p', 'q') ORDER BY name").ok();
+    let before;
+    {
+        let db = open_at(&path, DatabaseOpts::new());
+        let c = db.connect().unwrap();
+        c.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, p \"my type\", q [my type])").unwrap();
+        before = types(&c);
+        c.execute("ALTER TABLE t ADD COLUMN z").unwrap();
+        assert_eq!(types(&c), before, "CLAIM: the types read back unchanged after ADD COLUMN");
+    }
+    let db = open_at(&path, DatabaseOpts::new());
+    let c = db.connect().unwrap();
+    assert_eq!(types(&c), before, "CLAIM: the types read back unchanged after a reopen");
+}
+
 /// engine-rev-qaf-fix2 HIGH B: ADD COLUMN of a custom type that has a DEFAULT, with no DEFAULT of its
 /// own, applied the type's default in memory only; the stored text lost it, so after a reopen a NOT NULL
 /// column read NULL for the rows that existed (the baseline stored `DEFAULT 50`).
