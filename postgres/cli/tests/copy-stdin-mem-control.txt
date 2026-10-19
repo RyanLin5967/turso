@@ -1,0 +1,14 @@
+# The memory control for copy_from_stdin_streams_its_rows_in_bounded_memory (wire_sessions.rs), raw.
+# Instrument: /proc/PID/status VmHWM of a debug tursopg server, read before the load and after its reply; one fresh
+# server and database per case; ecetesla1 through uwrun, 2026-10-19. Driver: copy-stdin-mem.sh and copy-stdin-mem.py beside this
+# file (mem.sh and mem.py in the runs; copy-memctl1 ran them with port 56951, copy-memctl3 with 56961).
+# `insert` is the engine alone (INSERT INTO m SELECT ... FROM generate_series, one statement); `copy` is COPY FROM STDIN
+# in 64 KiB CopyData messages. Binary: copy-memctl1 ran 85e2c72c1 (before streaming); copy-memctl3 ran the streaming
+# fix's working tree (insert does not reach COPY's code). copy-memctl1's two last cases died: a second run (copy-memctl2,
+# discarded) took the same port; they are not used.
+## copy-memctl1 (85e2c72c1)
+insert 16 MiB rows=262144 rowbytes=64: C INSERT 0 262144 | Z I | VmHWM kB before 59292 after 99316 rise 40024 (2.44x input) 7s
+copy 16 MiB rows=262144 rowbytes=64: G format=0 columns=[0] | C COPY 262144 | Z I | VmHWM kB before 59320 after 168848 rise 109528 (6.69x input) 19s
+## copy-memctl3 (the fix's tree)
+insert 64 MiB rows=1048576 rowbytes=64: C INSERT 0 1048576 | Z I | VmHWM kB before 59504 after 218096 rise 158592 (2.42x input) 28s
+insert 64 MiB rows=65536 rowbytes=1024: C INSERT 0 65536 | Z I | VmHWM kB before 57332 after 244024 rise 186692 (2.85x input) 9s

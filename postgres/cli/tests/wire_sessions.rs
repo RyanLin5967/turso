@@ -7621,6 +7621,135 @@ fn copy_reports_a_rows_first_failing_column() {
     assert_eq!(r.tags, vec!["COPY 3".to_string()], "{sql}");
 }
 
+/// COPY reads, checks and inserts line by line in PostgreSQL's batches (1000 rows), so the first
+/// failing line wins, for COPY FROM a file too (recorded, copy-stdin-pg18.txt part 6, the review
+/// wire-rev-copystdin M1's S1, S2, S6): `x` on line 1 is 22P02 before line 2's extra field
+/// (22P04); `abc` into varchar(2) is 22001 before it; a duplicate key on line 1 is 23505 once the
+/// first 1000 rows are inserted, before line 5001's bad line; a duplicate within the first 1000
+/// rows is found only at their insert, after line 1000's bad line (22P04). Every line was parsed
+/// before any was checked or inserted, so each of these was 22P04.
+#[test]
+fn copy_reports_the_first_failing_line() {
+    let dir = Scratch::new("copyfirstline");
+    let server = Server::start(&dir.db(), &["--copy-from-dir", dir.0.to_str().unwrap()]);
+    let mut a = server.connect();
+    for t in ["r1 (id int)", "r2 (v varchar(2))", "r6 (id int PRIMARY KEY)"] {
+        a.q(&format!("CREATE TABLE {t}")).ok(t);
+    }
+    a.q("INSERT INTO r6 VALUES (1)").ok("r6 row");
+    let s6: Vec<u8> = (1..=5000)
+        .flat_map(|i| format!("{i}\n").into_bytes())
+        .chain(b"bad\tline\n".iter().copied())
+        .collect();
+    let s6b: Vec<u8> = (2..1000)
+        .flat_map(|i| format!("{i}\n").into_bytes())
+        .chain(b"1\nbad\tline\n".iter().copied())
+        .collect();
+    let cases: [(&str, &[u8], &str, &str); 4] = [
+        ("r1", b"x\n1\t2\n", "22P02", "invalid input syntax for type integer: \"x\""),
+        ("r2", b"abc\nx\ty\n", "22001", "value too long for type character varying(2)"),
+        ("r6", &s6, "23505", ""),
+        ("r6", &s6b, "22P04", "extra data after last expected column"),
+    ];
+    for (table, data, code, message) in cases {
+        let sql = format!("COPY {table} FROM STDIN");
+        let e = a.copy(&sql, &[CopyIn::Data(data)]).err(&sql);
+        assert_eq!(e.code, code, "{sql}: {e:?}");
+        if !message.is_empty() {
+            assert_eq!(e.message, message, "{sql}");
+        }
+        let file = dir.0.join(format!("{table}.tsv"));
+        std::fs::write(&file, data).unwrap();
+        let sql = format!("COPY {table} FROM '{}'", file.display());
+        let e = a.q(&sql).err(&sql);
+        assert_eq!(e.code, code, "{sql} (a file): {e:?}");
+    }
+    assert_eq!(a.q("SELECT count(*) FROM r6").single("count"), "1");
+}
+
+/// COPY FROM STDIN streams its rows into the table, holding one piece, one batch and the
+/// unfinished line, so a 64 MiB COPY of 64-byte rows raises the server's peak memory (VmHWM) by at
+/// most 4 times the input. PRE-REGISTERED before the streaming fix was measured: the bound is 4x;
+/// its control, the engine alone loading the same 64 MiB in one INSERT ... SELECT, rose 2.42x
+/// (64-byte rows) and 2.85x (1024-byte rows) on ecetesla1, debug build (uwrun run copy-memctl3,
+/// cli/tests/copy-stdin-mem-control.txt), so the engine's own transaction is most of the 4x and
+/// COPY may add little. Before the fix every row was held as Strings until CopyDone: 6.69x for
+/// 16 MiB of 64-byte rows (copy-memctl1), about 93x for 1-byte rows (review wire-rev-copystdin H1).
+#[cfg(target_os = "linux")]
+#[test]
+fn copy_from_stdin_streams_its_rows_in_bounded_memory() {
+    let dir = Scratch::new("copymem");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE m (v text)").ok("m");
+    let hwm_kb = || {
+        let status = std::fs::read_to_string(format!("/proc/{}/status", server.pid())).unwrap();
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix("VmHWM:"))
+            .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
+            .expect("VmHWM")
+    };
+    let input: u64 = 64 * 1024 * 1024;
+    let mut row = vec![b'x'; 63];
+    row.push(b'\n');
+    let piece: Vec<u8> = row.repeat(1024);
+    let before = hwm_kb();
+    let sql = "COPY m FROM STDIN";
+    let mut body = sql.as_bytes().to_vec();
+    body.push(0);
+    a.send(b'Q', &body);
+    let mut r = Reply::default();
+    assert!(a.read_into(&mut r, true), "no CopyInResponse");
+    for _ in 0..input / piece.len() as u64 {
+        a.send(b'd', &piece);
+    }
+    a.send(b'c', &[]);
+    a.read_into(&mut r, false);
+    let r = r.ok(sql);
+    assert_eq!(r.tags, vec![format!("COPY {}", input / 64)]);
+    let rise = (hwm_kb() - before) * 1024;
+    assert!(
+        rise <= 4 * input,
+        "VmHWM rose {rise} bytes for {input} bytes of COPY ({:.2}x; the bound is 4x)",
+        rise as f64 / input as f64
+    );
+}
+
+/// A COPY line past `--copy-line-limit` bytes is refused with 54000, as PostgreSQL refuses a line
+/// past its line buffer's limit (MaxAllocSize; review wire-rev-copystdin H1's byte cap), whether
+/// it comes in one CopyData or across several, and loads nothing; a line at the limit loads.
+#[test]
+fn copy_refuses_a_line_past_its_limit() {
+    let dir = Scratch::new("copylinelimit");
+    let server = Server::start(&dir.db(), &["--copy-line-limit", "100000"]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE c (v text)").ok("c");
+    let sql = "COPY c FROM STDIN";
+    let mut fits = vec![b'x'; 100000];
+    fits.push(b'\n');
+    let r = a.copy(sql, &[CopyIn::Data(&fits)]).ok("a line at the limit");
+    assert_eq!(r.tags, vec!["COPY 1".to_string()]);
+    let mut long = vec![b'y'; 100001];
+    long.push(b'\n');
+    let e = a.copy(sql, &[CopyIn::Data(&long)]).err("a line past the limit");
+    assert_eq!(e.code, "54000", "{e:?}");
+    // The same line in 1000-byte CopyData messages: refused once its unfinished part passes it.
+    let mut body = sql.as_bytes().to_vec();
+    body.push(0);
+    a.send(b'Q', &body);
+    let mut r = Reply::default();
+    assert!(a.read_into(&mut r, true), "no CopyInResponse");
+    for piece in long.chunks(1000) {
+        a.send(b'd', piece);
+    }
+    a.send(b'c', &[]);
+    a.read_into(&mut r, false);
+    assert_eq!(r.err("pieces past the limit").code, "54000");
+    assert_eq!(r.status, b'I');
+    assert_eq!(a.q("SELECT count(*) FROM c").single("count"), "1");
+}
+
 /// COPY FROM a file with no file granted is 42501 before the table, its columns or its options are
 /// read, as PostgreSQL 18.6 refuses a role without pg_read_server_files first (recorded,
 /// copy-stdin-pg18.txt part 3: `nofiles`). Checked after the table, these were 42P01, 42703, 42601.
