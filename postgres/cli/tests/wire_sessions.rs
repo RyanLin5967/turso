@@ -15898,6 +15898,37 @@ fn a_value_whose_excess_is_spaces_is_cut_per_column() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-5cdb70e58 LOW-5 and the lead's LOW-3 ruling (current_database() names the DATABASE, not the branch): a
+/// startup name that is not 'postgres' is the name current_database(), pg_database and pg_database_size answer to,
+/// and a startup name carrying a branch ('shopdb/main', the trunk) names the database part alone, 'shopdb'.
+/// PostgreSQL answers its startup name (recorded for 'postgres': pg18-wirefuzz-the_connected_database_is_current_
+/// database_and_in_pg_database.out); the branch suffix is this server's own.
+#[test]
+fn current_database_names_the_startup_database_without_its_branch() {
+    let dir = Scratch::new("dbname-branch");
+    let server = Server::start(&dir.db(), &[]);
+    let mut wrong = Vec::new();
+    for (startup, want) in [("shopdb", "shopdb"), ("shopdb/main", "shopdb")] {
+        let mut a = server.connect_to(startup).unwrap_or_else(|e| panic!("{startup}: {e:?}"));
+        for (sql, rows) in [
+            ("SELECT current_database()", vec![vec![Some(want.to_string())]]),
+            ("SELECT datname FROM pg_database", vec![vec![Some(want.to_string())]]),
+            ("SELECT pg_database_size(current_database()) >= 0", vec![vec![Some("t".to_string())]]),
+        ] {
+            let r = a.q(sql);
+            if r.error.is_some() || r.rows != rows {
+                wrong.push(format!("startup {startup}: {sql}: rows {:?} error {:?}, want {rows:?}", r.rows, r.error));
+            }
+        }
+        let sql = format!("SELECT pg_database_size('{want}') >= 0");
+        let r = a.q(&sql);
+        if r.error.is_some() {
+            wrong.push(format!("startup {startup}: {sql}: {:?}", r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-uw2 N5: a schema-qualified type was refused 42704 'type "public m" does not exist',
 /// its parts joined with a blank, so a pg_dump restore, which writes public.<type> for every enum
 /// and domain column, failed at its first such table. PostgreSQL 18.6 takes public.m and
