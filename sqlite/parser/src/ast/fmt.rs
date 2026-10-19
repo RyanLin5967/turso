@@ -2460,7 +2460,13 @@ impl ToTokens for Type {
         // whether that form reads back without its quotes).
         let plain = !self.name.is_empty()
             && self.name.split(' ').all(|w| crate::lexer::is_plain_type_word(w.as_bytes()));
-        if plain {
+        // A name that still carries its own quotes (the parser keeps a quoted type token whole,
+        // `"a]b"` or `'x]y'`) prints as itself: quoting it again made every rewrite grow it
+        // (engine-rev-qaf-fix2 HIGH A: 52, 64, 84, ... 568 bytes).
+        let self_quoted = self.name.len() >= 2
+            && matches!(self.name.as_bytes()[0], b'"' | b'\'' | b'`')
+            && self.name.as_bytes()[self.name.len() - 1] == self.name.as_bytes()[0];
+        if plain || self_quoted {
             s.append(TK_ID, Some(&self.name))?;
         } else if !self.name.contains(']') {
             s.append(TK_ID, Some(&format!("[{}]", self.name)))?;
