@@ -7752,6 +7752,83 @@ fn copy_reads_the_first_lines_end_as_the_datas_style() {
     assert_eq!(a.q("SELECT count(*) FROM r3").single("count"), "1");
 }
 
+/// A stalled COPY FROM STDIN is ended by a CancelRequest or by statement_timeout while its client
+/// sends nothing (57014, PostgreSQL's two messages), so the engine's write lock it holds from its
+/// first row is let go and another session's write runs (review wire-rev-copystdin M3, S12).
+/// PostgreSQL answers both only at the stalled client's next CopyData or CopyDone (recorded,
+/// copy-stdin-pg18.txt part 6 `cancel`, `timeout`), as its COPY blocks no other writer; here the
+/// stall holds every writer, so the answer comes as soon as the server sees the cancel or the
+/// deadline (a divergence in timing only, postgres/COMPAT.md). Neither ended the wait before.
+#[test]
+fn a_stalled_copy_from_stdin_ends_at_a_cancel_or_its_statement_timeout() {
+    let dir = Scratch::new("copystall");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut b = server.connect();
+    a.q("CREATE TABLE r10 (v text)").ok("r10");
+    let start = |a: &mut Wire, sql: &str| {
+        let mut body = sql.as_bytes().to_vec();
+        body.push(0);
+        a.send(b'Q', &body);
+        let mut r = Reply::default();
+        assert!(a.read_into(&mut r, true), "{sql}: no CopyInResponse");
+        a.send(b'd', b"held\n");
+        r
+    };
+    // A CancelRequest from another connection.
+    let mut r = start(&mut a, "INSERT INTO r10 VALUES ('first'); COPY r10 FROM STDIN");
+    std::thread::sleep(Duration::from_millis(300));
+    let key = a.key.clone().expect("BackendKeyData at startup");
+    let mut cancel = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+    let mut m = ((8 + key.len()) as i32).to_be_bytes().to_vec();
+    m.extend_from_slice(&80877102i32.to_be_bytes());
+    m.extend_from_slice(&key);
+    cancel.write_all(&m).unwrap();
+    drop(cancel);
+    a.read_into(&mut r, false);
+    let e = r.err("cancelled COPY");
+    assert_eq!(
+        (e.code.as_str(), e.message.as_str()),
+        ("57014", "canceling statement due to user request")
+    );
+    assert_eq!(r.status, b'I');
+    let r = b.q("INSERT INTO r10 VALUES ('other')").ok("another session's write");
+    assert_eq!(r.tags, vec!["INSERT 0 1".to_string()]);
+    // statement_timeout.
+    a.q("SET statement_timeout = 500").ok("set");
+    let mut r = start(&mut a, "COPY r10 FROM STDIN");
+    let started = Instant::now();
+    a.read_into(&mut r, false);
+    let e = r.err("timed-out COPY");
+    assert_eq!(
+        (e.code.as_str(), e.message.as_str()),
+        ("57014", "canceling statement due to statement timeout")
+    );
+    assert!(started.elapsed() < Duration::from_secs(20), "{:?}", started.elapsed());
+    a.q("RESET statement_timeout").ok("reset");
+    // The INSERT and both COPYs' rows are gone; the other session's row stays.
+    assert_eq!(a.q("SELECT count(*) FROM r10").single("count"), "1");
+}
+
+/// A relation named from is a relation: `COPY public.from FROM STDIN` reads the client's rows, as
+/// in PostgreSQL 18.6 (recorded, copy-stdin-pg18.txt part 6 `from`, `from2`). The FROM reader took
+/// the relation's `from` for the COPY's FROM, so it read the file '' (review wire-rev-copystdin L1).
+#[test]
+fn copy_from_stdin_into_a_table_named_from() {
+    let dir = Scratch::new("copyfrom");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE \"from\" (id int)").ok("from");
+    for (sql, data) in [
+        ("COPY public.\"from\" FROM STDIN", &b"1\n"[..]),
+        ("COPY public.from FROM STDIN", b"2\n"),
+    ] {
+        let r = a.copy(sql, &[CopyIn::Data(data)]).ok(sql);
+        assert_eq!(r.tags, vec!["COPY 1".to_string()], "{sql}");
+    }
+    assert_eq!(a.q("SELECT count(*) FROM \"from\"").single("count"), "2");
+}
+
 /// A COPY line past `--copy-line-limit` bytes is refused with 54000, as PostgreSQL refuses a line
 /// past its line buffer's limit (MaxAllocSize; review wire-rev-copystdin H1's byte cap), whether
 /// it comes in one CopyData or across several, and loads nothing; a line at the limit loads.
