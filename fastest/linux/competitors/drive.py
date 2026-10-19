@@ -41,6 +41,11 @@ import tempfile
 MAX_DEPTH = 8
 CLASSES = ("write-through", "write-back+fua", "write-back-no-fua", "ram-volatile")
 RAM_DISK = re.compile(r"^(ram|zram)\d+$")
+# BLIND SPOT, stated (comp-rev-9bc7d894a LOW 8): RAM disks are recognised by NAME. A RAM-backed device that reports a
+# drive cache (scsi_debug, a LIO ramdisk LUN behind an sd name) classifies as a real write-back or write-through disk
+# and passes real_problem. RAM-backed devices with no cache report (pmem, nbd) fail closed (Unread, flush "unknown").
+# Also, real_problem allowlists the class and the flush separately, not as a pair; only a hand-made record can pair
+# them wrongly (resolve() never yields write-back with "n/a: write-through").
 
 
 class Undetermined(Exception):

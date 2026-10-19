@@ -183,7 +183,8 @@ jobs:
       FT_WARMUP: ${{ inputs.warmup || '1000:10:2' }}
       FT_DRY: "1"
       # SMOKE: a small aging and a few live branches, so both fixture paths run on every system (gate-6 item 4);
-      # the registered T3 values are 1e5 UPDATEs and N in {1, 1e4}.
+      # the registered T3 values are 1e5 UPDATEs and N in {1, 1000} (the lead's LOW 21 ruling; timedrun.py
+      # REGISTERED_PREBRANCH: any other N reads ok-exploratory-n and fails reduce; comp-rev-9bc7d894a LOW 7).
       FT_AGE: ${{ inputs.age || '200' }}
       FT_PREBRANCH: ${{ inputs.prebranch || '20' }}
     steps:

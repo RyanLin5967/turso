@@ -320,7 +320,10 @@ cb_args() { # cb_args OP SYNC BDIR C N OUT -> CBA: the one clonebench command li
 # directories, DATA/base/<oid> (stracecount by_base_db). A forced CHECKPOINT writes its record, fsyncs pg_control,
 # pg_logical, pg_xact and the rest whether or not anything is dirty, so the whole post part was above 0 even for a
 # FILE_COPY create, which defers nothing (12-14 flushes at K=3, 0 under base/, T3 dry run x-pg18-d2); those are kept
-# apart as checkpoint_other_flushes. Then the K branches are dropped and checkpointed, untraced, and the live-branch
+# apart as checkpoint_other_flushes. CORRECTED (comp-rev-9bc7d894a LOW 3): not all of them are fixed. At K=3 a WAL_LOG
+# spec's checkpoint_other_flushes is 18 against FILE_COPY's 12 (global/* 3: pg_database's heap and indexes; pg_wal 3),
+# so a kept WAL_LOG create also defers a few flushes OUTSIDE base/<oid>, which per_create leaves out: an undercount of
+# the competitor's kept cost (about 2 of 304 per create), in the direction that never flatters us. Then the K branches are dropped and checkpointed, untraced, and the live-branch
 # count must be back at LIVE0.
 kept_arm() {
   local spec=$1 d=$2 k=$KEPT_K kd="$2/kept" tag i rc=0 oid
