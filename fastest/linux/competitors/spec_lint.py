@@ -81,6 +81,18 @@ for _sys, _proto, _back, _steps4 in (
                                            "step connect dbname=postgres/{branch}"))):
     for _form, _steps in _dolt(*_steps4).items():
         REG[f"{_sys}-{_form}.spec"] = (_proto, True, _steps, []) + ((_back,) if _form in ("b-m1c", "b-m1") else ())
+# comp-rev-89ec-b3c3 LOW 20: each system's ONE home connect line, as every Linux spec of it carries it (a connect string
+# can change durability as a setup line can: options=-csynchronous_commit=off), by spec file prefix
+HOME = {"pg18-": "connect host=127.0.0.1 port={port} user=postgres dbname=postgres",
+        "doltgres-": "connect host=127.0.0.1 port={port} user=postgres password=password dbname=postgres",
+        "dolt-": "connect host=127.0.0.1 port={port} user=root db=bench"}
+
+
+def home_of(f):
+    """The registered home connect line for spec file F (the longest matching prefix: doltgres- before dolt-)."""
+    return next((HOME[p] for p in sorted(HOME, key=len, reverse=True) if f.startswith(p)), None)
+
+
 # never a credited cell: the cap and warm-up plants' fixed-cost ops, the C1b-traced helper, the drop helper
 UNREGISTERED = {"pg18-sleep5.spec", "pg18-sleep20.spec", "pg18-m1-c1b.spec", "pg18-m1-drop.spec"}
 
@@ -109,6 +121,10 @@ def lint(d):
         got_setup = [ln for ln in lines if ln.startswith("setup ")]
         if got_setup != setups:
             why.append(f"{f}: setup lines {got_setup}, registered {setups} (a setup can change the session's durability)")
+        got_conn = [ln for ln in lines if ln.startswith("connect ")]
+        if got_conn != [home_of(f)]:
+            why.append(f"{f}: connect lines {got_conn}, registered [{home_of(f)!r}] (a connect string can change the "
+                       f"session's durability)")
         got_after = [ln for ln in lines if ln.startswith("after ")]
         if back is not None and got_after[:1] != [back]:
             why.append(f"{f}: first after-step {got_after[:1]}, registered switch-back {back}")
@@ -172,12 +188,13 @@ def selftest():
     planted("Doltgres variant (a) times a no-op dolt_checkout('main')",
             prepend_step("doltgres-a-m1.spec", "step sql SELECT dolt_checkout('main')"), "doltgres-a-m1.spec: timed steps")
     # comp-rev-89ec-b3c3 MED 1: the old (b) switch, CALL DOLT_CHECKOUT / SELECT dolt_checkout, is refused, timed or as
-    # the switch-back. Each plant writes the whole file, so it holds whatever the real spec says.
+    # the switch-back. Each plant writes the whole file, so it holds whatever the real spec says. (Its home connect is
+    # the system's registered one, home_of: LOW 20 checks it, and the control below must be the registered form whole.)
     def write_spec(sysname, form, steps, back):
         def ed(dd):
-            proto = REG[f"{sysname}-{form}.spec"][0]
-            open(os.path.join(dd, f"{sysname}-{form}.spec"), "w").write(
-                "\n".join([f"protocol {proto}", "connect host=127.0.0.1 port={port}", BRANCH] + steps + [back]) + "\n")
+            f = f"{sysname}-{form}.spec"
+            open(os.path.join(dd, f), "w").write(
+                "\n".join([f"protocol {REG[f][0]}", home_of(f), BRANCH] + steps + [back]) + "\n")
         return ed
 
     for _s, _f in (("dolt", "b-m1c"), ("dolt", "b-m1"), ("doltgres", "b-m1c"), ("doltgres", "b-m1")):
