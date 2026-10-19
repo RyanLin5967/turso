@@ -209,9 +209,13 @@ fn ls_fill_starved_child() {
         let _ = trunk.fork_branch().unwrap().into_id();
         peak = peak.max(log_bytes(&path));
     }
+    // The hold is let go BEFORE the wait: checkpoint_wait joins the fill thread, which a hold still
+    // in place would never let end. Whatever the 50 operations started is now in flight or done; once
+    // let go the fill may finish its rows, but with no operation after it nothing flips the meta row
+    // unless a checkpoint started above.
+    super::store::LINKS_FILL_HOLD_UNRECORDED.store(false, Ordering::Release);
     db.branch_checkpoint_wait();
     let meta = meta_version(&path);
-    super::store::LINKS_FILL_HOLD_UNRECORDED.store(false, Ordering::Release);
     println!("LS-STARVED past={} held={held} creates={k} meta={meta} log={} peak={peak}", u64::from(past), log_bytes(&path));
 }
 
