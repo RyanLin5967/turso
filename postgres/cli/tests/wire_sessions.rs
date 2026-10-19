@@ -217,6 +217,8 @@ struct Reply {
     oids: Option<Vec<u32>>,
     /// The column names of the last RowDescription, if one came.
     names: Option<Vec<String>>,
+    /// The type size and type modifier of each column of the last RowDescription, if one came.
+    sizes: Option<Vec<(i16, i32)>>,
     /// The BackendKeyData's body, if one came.
     key: Option<Vec<u8>>,
     tags: Vec<String>,
@@ -540,6 +542,7 @@ impl Wire {
                     let mut p = 2;
                     let mut oids = Vec::with_capacity(n);
                     let mut names = Vec::with_capacity(n);
+                    let mut sizes = Vec::with_capacity(n);
                     for _ in 0..n {
                         let end = p + body[p..].iter().position(|&c| c == 0).unwrap();
                         names.push(String::from_utf8_lossy(&body[p..end]).into_owned());
@@ -550,10 +553,15 @@ impl Wire {
                             body[p + 8],
                             body[p + 9],
                         ]));
+                        sizes.push((
+                            i16::from_be_bytes([body[p + 10], body[p + 11]]),
+                            i32::from_be_bytes([body[p + 12], body[p + 13], body[p + 14], body[p + 15]]),
+                        ));
                         p += 18;
                     }
                     r.oids = Some(oids);
                     r.names = Some(names);
+                    r.sizes = Some(sizes);
                 }
                 b'D' => {
                     let n = i16::from_be_bytes([body[0], body[1]]) as usize;
@@ -15364,6 +15372,55 @@ fn a_value_too_long_for_varchar_is_22001_as_postgresql_answers() {
             _ => wrong.push(format!("{sql}: tags {:?} error {:?}, PostgreSQL 22001", r.tags, r.error)),
         }
     }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-uw3 MED-1: every RowDescription field carried type size 0 and type modifier 0
+/// (pgwire's From<&FieldInfo>), where PostgreSQL 18.6 sends each type's size (int4 4, int8 8, bool
+/// 1, a variable-length type -1) and the column's modifier (-1 for none, varchar(5) 9, numeric(8,2)
+/// 524294, char(3) 7); a numeric with modifier 0 is an invalid one (a driver reads its scale from
+/// it). Recorded on iccad2, cli/tests/pg18/pg18-typmod.out. Compared where the type OID agrees with
+/// PostgreSQL's (an OID mismatch is another divergence); at least 20 columns must.
+#[test]
+fn row_descriptions_carry_postgresqls_type_sizes_and_modifiers() {
+    let dir = Scratch::new("typmod");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let create = "CREATE TABLE tm(a int2, b int4, c int8, d bool, e float4, f float8, g text, h varchar(5), \
+                  i numeric(8,2), j numeric, k char(3), l date, m timestamp, n timestamptz, o uuid, p bytea, \
+                  q json, r jsonb, s time, t varchar)";
+    a.q(create).ok(create);
+    let mut wrong = Vec::new();
+    let mut compared = 0;
+    for (sql, pg) in [
+        ("SELECT * FROM tm", vec![
+            (21u32, 2i16, -1i32), (23, 4, -1), (20, 8, -1), (16, 1, -1), (700, 4, -1), (701, 8, -1), (25, -1, -1),
+            (1043, -1, 9), (1700, -1, 524294), (1700, -1, -1), (1042, -1, 7), (1082, 4, -1), (1114, 8, -1),
+            (1184, 8, -1), (2950, 16, -1), (17, -1, -1), (114, -1, -1), (3802, -1, -1), (1083, 8, -1),
+            (1043, -1, -1),
+        ]),
+        ("SELECT a + 1 AS x, i * 2 AS y, h || 'z' AS z, count(*) AS w FROM tm GROUP BY a, i, h",
+            vec![(23, 4, -1), (1700, -1, -1), (25, -1, -1), (20, 8, -1)]),
+        ("SELECT 1 AS one, 'x' AS lit, true AS b", vec![(23, 4, -1), (25, -1, -1), (16, 1, -1)]),
+    ] {
+        for (protocol, r) in [("simple", a.q(sql)), ("extended", a.x(sql, &[]))] {
+            let (Some(oids), Some(sizes)) = (r.oids.clone(), r.sizes.clone()) else {
+                wrong.push(format!("{protocol} {sql}: no RowDescription, error {:?}", r.error));
+                continue;
+            };
+            for (i, (oid, (len, modifier))) in oids.iter().zip(sizes).enumerate() {
+                let Some(&(pg_oid, pg_len, pg_mod)) = pg.get(i) else { continue };
+                if *oid != pg_oid {
+                    continue;
+                }
+                compared += 1;
+                if (len, modifier) != (pg_len, pg_mod) {
+                    wrong.push(format!("{protocol} {sql} column {i} (oid {oid}): size {len} modifier {modifier}, PostgreSQL {pg_len} {pg_mod}"));
+                }
+            }
+        }
+    }
+    assert!(compared >= 20, "premise: only {compared} columns had PostgreSQL's type OID");
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
