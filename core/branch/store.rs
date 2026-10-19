@@ -16142,7 +16142,15 @@ mod l2b_kick_tests {
             BranchStore::open(BranchDurability::Durable { sync: SyncClass::Off }, None, path.to_str().unwrap()).unwrap(),
         );
         assert!(store.confirm_writer.lock().is_some(), "premise: the background writer runs");
-        assert!(pool_full_within(&store, Duration::from_secs(10)), "premise: the pool starts full");
+        // A fresh store's pool is filled by the writer's first refill, which a low unlock asks for
+        // (red 8df6450e7 asserted a full pool at open and failed on that premise on ecetesla3 and
+        // iccad9, never reaching its claim).
+        {
+            let mut guard = store.inner.lock();
+            guard.branches.drain_pool_for_test();
+            drop(guard);
+        }
+        assert!(pool_full_within(&store, Duration::from_secs(10)), "premise: an ordinary low unlock got the pool filled");
         std::thread::sleep(Duration::from_millis(100));
         assert!(!store.inner.pool_kicked.load(Ordering::Acquire), "premise: quiescent, nothing flagged");
         assert!(!store.inner.pool_notified.load(Ordering::Acquire), "premise: quiescent, nothing claimed");
