@@ -327,13 +327,25 @@ pub fn param_targets(parse: &ParseResult) -> Vec<Option<u32>> {
         .collect()
 }
 
-/// Whether `text` (a literal pg_query gives as a float's text) is an integer literal, decimal or
-/// 0x / 0o / 0b with underscores, whose value fits int8.
-fn integer_literal_fits_i64(text: &str) -> bool {
-    let (negative, digits) = match text.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, text),
-    };
+/// The type of `text` (a literal pg_query gives as a float's text) when it is an integer literal,
+/// decimal or 0x / 0o / 0b with underscores: int4 when its value fits int4, int8 when it fits int8,
+/// None otherwise (numeric, which the engine holds as a float).
+fn integer_literal_type(text: &str) -> Option<u32> {
+    let negative = text.starts_with('-');
+    let magnitude = integer_literal_magnitude(text)?;
+    let fits = |max: u128| if negative { magnitude <= max + 1 } else { magnitude <= max };
+    if fits(i32::MAX as u128) {
+        Some(INT4)
+    } else if fits(i64::MAX as u128) {
+        Some(INT8)
+    } else {
+        None
+    }
+}
+
+/// The magnitude of an integer literal's text ([`integer_literal_type`]), None when it is none.
+fn integer_literal_magnitude(text: &str) -> Option<u128> {
+    let digits = text.strip_prefix('-').unwrap_or(text);
     let lower = digits.to_ascii_lowercase();
     let (radix, body) = if let Some(b) = lower.strip_prefix("0x") {
         (16, b)
@@ -346,13 +358,9 @@ fn integer_literal_fits_i64(text: &str) -> bool {
     };
     let clean: String = body.chars().filter(|c| *c != '_').collect();
     if clean.is_empty() || !clean.chars().all(|c| c.is_digit(radix)) {
-        return false;
+        return None;
     }
-    match u128::from_str_radix(&clean, radix) {
-        Ok(v) if negative => v <= i64::MAX as u128 + 1,
-        Ok(v) => v <= i64::MAX as u128,
-        Err(_) => false,
-    }
+    u128::from_str_radix(&clean, radix).ok()
 }
 
 /// [`expression_types`] for one expression.
@@ -363,8 +371,11 @@ fn expression_type(node: &PgNode) -> Option<u32> {
         // one, as PostgreSQL types it (recorded, pg18-diff/pg18-c33.out; Claude C33: announced
         // int4). One past int8 is numeric in PostgreSQL; the engine holds it as a float, so it is
         // left to the engine's type (the bare-NUMERIC divergence, a known red).
-        Node::AConst(c) if matches!(&c.val, Some(Val::Fval(f)) if integer_literal_fits_i64(&f.fval)) => {
-            return Some(INT8);
+        // One that fits int4 (a negative one pg_query gives as a float's text, `(-2147483648)`)
+        // is int4, as make_const types it (wirefuzz vs PG 18.6, wire-fuzz4: announced int8).
+        Node::AConst(c) if matches!(&c.val, Some(Val::Fval(f)) if integer_literal_type(&f.fval).is_some()) => {
+            let Some(Val::Fval(f)) = &c.val else { return None };
+            return integer_literal_type(&f.fval);
         }
         Node::AConst(c) => matches!(c.val, Some(Val::Boolval(_))),
         // The sequence functions and pg_database_size are bigint in PostgreSQL, whatever their
@@ -741,6 +752,7 @@ fn parameter_types_with(
         cut_views: Default::default(),
         attached,
         missing_rte: Default::default(),
+        first_refusal: Default::default(),
     };
     let mut columns = Vec::new();
     if let [raw] = parse.protobuf.stmts.as_slice() {
@@ -756,6 +768,9 @@ fn parameter_types_with(
         .collect();
     if let Some(missing) = infer.missing_rte.take() {
         return Err(missing);
+    }
+    if let Some(Some(refused)) = infer.first_refusal.take() {
+        return Err(refused);
     }
     Ok(Walked {
         params: infer.types,
@@ -844,6 +859,14 @@ struct Infer<'a> {
     /// PostgreSQL's errorMissingRTE (42P01): the statement is refused with it. Shared with the walks
     /// of the statement's own subqueries, not with a view's (wire review 17 item 5).
     missing_rte: std::rc::Rc<std::cell::RefCell<Option<SqlErrorMessage>>>,
+    /// The first of a target's refusals the walk makes itself (min/max over boolean, 42883) and
+    /// a column reference no relation in scope has, in the order the walk meets them:
+    /// `Some(Some(e))` refuses the statement with e, `Some(None)` leaves the missing column to the
+    /// engine, which reports it as PostgreSQL does first (wirefuzz vs PG 18.6, wire-fuzz4: a later
+    /// min(boolean) was refused ahead of an earlier missing column). BLIND SPOT: a reference the
+    /// walk cannot resolve that the engine can (an outer query's column) also leaves a later
+    /// refusal to the engine, which answers min/max(boolean) as before.
+    first_refusal: std::rc::Rc<std::cell::RefCell<Option<Option<SqlErrorMessage>>>>,
 }
 
 /// The stack a view's reading starts with, and the stack grown for it when less is left: each view
@@ -1297,6 +1320,7 @@ impl Infer<'_> {
             cut_views: self.cut_views.clone(),
             attached: self.attached,
             missing_rte: Default::default(),
+            first_refusal: Default::default(),
         };
         let columns = walk.select(query, &Vec::new());
         Some(rename(columns, &v.aliases))
@@ -1984,7 +2008,13 @@ impl Infer<'_> {
         use turso_pg_parser::pg_query::protobuf::a_const::Val;
         use turso_pg_parser::pg_query::protobuf::{AExprKind, SubLinkType};
         match node.node.as_ref()? {
-            Node::ColumnRef(_) => self.column(node, scope).flatten(),
+            Node::ColumnRef(_) => {
+                let found = self.column(node, scope);
+                if found.is_none() {
+                    self.first_refusal.borrow_mut().get_or_insert(None);
+                }
+                found.flatten()
+            }
             Node::FuncCall(call) => {
                 let name = func_name(call)?;
                 if let Some(t) = scalar_result(&name) {
@@ -2005,11 +2035,11 @@ impl Infer<'_> {
                     // boolean: refused 42883, as PostgreSQL refuses it (it was answered).
                     ("min" | "max", VARCHAR) => Some(TEXT),
                     ("min" | "max", BOOL) => {
-                        self.missing_rte.borrow_mut().get_or_insert_with(|| {
-                            SqlErrorMessage::classified(
+                        self.first_refusal.borrow_mut().get_or_insert_with(|| {
+                            Some(SqlErrorMessage::classified(
                                 SqlErrorKind::UndefinedFunction,
                                 format!("function {name}(boolean) does not exist"),
-                            )
+                            ))
                         });
                         None
                     }
@@ -2138,6 +2168,7 @@ impl Infer<'_> {
             cut_views: self.cut_views.clone(),
             attached: self.attached,
             missing_rte: self.missing_rte.clone(),
+            first_refusal: self.first_refusal.clone(),
         };
         let level = walk.from_items(&s.from_clause, scope);
         let mut inner = scope.clone();
