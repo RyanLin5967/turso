@@ -3011,4 +3011,42 @@ mod tests {
         ));
         assert!(bad.is_empty(), "CLAIM: CREATE TABLE AS over numeric arithmetic or a window sum failed: {bad:#?}");
     }
+
+    /// Engine review 2bdcd32c6 MED 6 (raw types/probe2.out.txt): a window sum over numeric(8, 2)
+    /// never became the numeric sum (97e6bf4cb's optimizer pass walked only the plan's aggregates),
+    /// so `sum(b) OVER (...)` answered SQLite's 1.0, 3.0 where PostgreSQL answers 1.00, 3.00, and the
+    /// numeric sum's inverse step (a frame that drops rows) was never reached. Expected values are
+    /// PostgreSQL 18.6's for this exact SQL (UW run typesrev-oracle2; artie raw
+    /// frontier/fastest/lanes/engine/raw/pg18-types-rev2bd.txt 42503e4e38), never ours. A frame of
+    /// `1 PRECEDING AND CURRENT ROW` drops a row at every step (the inverse); `OVER ()` does not.
+    #[test]
+    fn a_window_sum_over_numeric_sums_as_numeric() {
+        let conn = open();
+        conn.execute("CREATE TABLE n(id INTEGER PRIMARY KEY, b numeric(8, 2)) STRICT").unwrap();
+        conn.execute("INSERT INTO n VALUES (1, 1.00), (2, 2.00), (3, NULL), (4, 10.00)").unwrap();
+        let mut bad = diverging(
+            &conn,
+            &[
+                (
+                    "SELECT id, sum(b) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM n ORDER BY id",
+                    "1,1.00;2,3.00;3,2.00;4,10.00",
+                ),
+                (
+                    "SELECT id, sum(b) OVER (ORDER BY id ROWS BETWEEN 1 FOLLOWING AND 1 FOLLOWING) FROM n ORDER BY id",
+                    "1,2.00;2,NULL;3,10.00;4,NULL",
+                ),
+                ("SELECT id, sum(b) OVER () FROM n ORDER BY id", "1,13.00;2,13.00;3,13.00;4,13.00"),
+            ],
+            "PostgreSQL 18",
+        );
+        match conn.execute("CREATE TABLE nw AS SELECT id, sum(b) OVER () AS sw FROM n") {
+            Ok(()) => bad.extend(diverging(
+                &conn,
+                &[("SELECT id, sw FROM nw ORDER BY id", "1,13.00;2,13.00;3,13.00;4,13.00")],
+                "PostgreSQL 18",
+            )),
+            Err(e) => bad.push(format!("CREATE TABLE nw AS SELECT id, sum(b) OVER () refused: {e}")),
+        }
+        assert!(bad.is_empty(), "CLAIM: a window sum over numeric was not numeric's: {bad:#?}");
+    }
 }
