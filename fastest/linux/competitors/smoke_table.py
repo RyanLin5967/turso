@@ -85,14 +85,17 @@ ROWS = [
     # (a) times only the create since comp review 1 MED 6 (it timed a no-op checkout of main before): rows of runs
     # before that commit measured different work under this label (SMOKE.md errata)
     (DOLT, "(a) DOLT_CHECKOUT('-b', b) on a session at main", "dolt", "dolt-a-m1c", "dolt-a-m1"),
-    (DOLT, "(b) DOLT_BRANCH(b, main) + DOLT_CHECKOUT(b)", "dolt", "dolt-b-m1c", "dolt-b-m1"),
+    # (b) times PREREG N7's USE switch since 35f8a4130 (comp-rev-89ec-b3c3 MED 1; it timed DOLT_CHECKOUT(b) /
+    # dolt_checkout(b) before): rows of runs before that commit measured a different switch under the old label
+    # (SMOKE.md errata), and doltgres-b-m1 opens a fresh home connection per cycle since 943a7b9db
+    (DOLT, "(b) DOLT_BRANCH(b, main) + USE `bench/b`", "dolt", "dolt-b-m1c", "dolt-b-m1"),
     (DOLT, "(c) DOLT_BRANCH(b, main) + connect bench/b + SELECT 1", "dolt", "dolt-c-m1c",
      "dolt-c-m1"),
     (DOLT, "DOLT_BRANCH(b, main) alone", "dolt", "dolt-create", None),
     (DOLT, "SELECT 1 floor", "dolt", "dolt-select1", None),
     (DOLTGRES, "(a) dolt_checkout('-b', b) on a session at main", "doltgres", "doltgres-a-m1c",
      "doltgres-a-m1"),
-    (DOLTGRES, "(b) dolt_branch(b, main) + dolt_checkout(b)", "doltgres", "doltgres-b-m1c", "doltgres-b-m1"),
+    (DOLTGRES, "(b) dolt_branch(b, main) + USE \"postgres/b\"", "doltgres", "doltgres-b-m1c", "doltgres-b-m1"),
     (DOLTGRES, "(c) dolt_branch(b, main) + connect postgres/b + SELECT 1", "doltgres", "doltgres-c-m1c",
      "doltgres-c-m1"),
     (DOLTGRES, "dolt_branch(b, main) alone", "doltgres", "doltgres-create", None),
