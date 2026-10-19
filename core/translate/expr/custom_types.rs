@@ -2881,4 +2881,56 @@ mod tests {
         ));
         assert!(bad.is_empty(), "CLAIM: a domain over numeric did not check, compare or order as numeric: {bad:#?}");
     }
+
+    /// Engine review 2bdcd32c6 HIGH 4 (raws types/probe1-3): with custom types on, a plain NUMERIC
+    /// or DECIMAL column of a non-STRICT table read through a subquery, a view or a CTE was taken for
+    /// the custom numeric type: the derived column's type name is its affinity's, "NUMERIC", and
+    /// `order_by::expr_custom_type` looked it up ignoring STRICT. So sum(d) was numeric text, a text
+    /// row errored "invalid numeric value", INT64_MAX + INT64_MAX summed past the integer range, and
+    /// CREATE TABLE AS from the view failed "numeric requires 2 parameter(s)". Such a column is
+    /// SQLite's, typed only by a custom type its source carries. Expected values are python sqlite3
+    /// 3.46.1's for this exact SQL (UW run typesrev-oracle2; artie raw
+    /// frontier/fastest/lanes/engine/raw/sqlite-types-rev2bd.txt 42503e4e38), never ours.
+    #[test]
+    fn a_plain_numeric_column_through_a_derived_relation_stays_sqlites() {
+        let conn = open();
+        for sql in [
+            "CREATE TABLE p(id INTEGER PRIMARY KEY, x NUMERIC, d DECIMAL(10,2))",
+            "INSERT INTO p VALUES (1, 5, 1.5), (2, 'abc', 2.25), (3, 1.5, 3)",
+            "CREATE VIEW pv AS SELECT x, d FROM p",
+            "CREATE TABLE big(id INTEGER PRIMARY KEY, x NUMERIC)",
+            "INSERT INTO big VALUES (1, 9223372036854775807), (2, 9223372036854775807)",
+        ] {
+            conn.execute(sql).unwrap();
+        }
+        let mut bad = diverging(
+            &conn,
+            &[
+                ("SELECT typeof(sum(d)), sum(d) FROM (SELECT d FROM p)", "real,6.75"),
+                ("SELECT sum(d) = 6.75, sum(d) > 100 FROM (SELECT d FROM p)", "1,0"),
+                ("WITH c AS (SELECT d FROM p) SELECT typeof(sum(d)), sum(d) FROM c", "real,6.75"),
+                ("SELECT typeof(sum(d)), sum(d) FROM pv", "real,6.75"),
+                ("SELECT typeof(sum(x)), sum(x) FROM (SELECT x FROM p)", "real,6.5"),
+                ("SELECT typeof(sum(x)), sum(x) FROM pv", "real,6.5"),
+                ("SELECT x FROM (SELECT x FROM p) ORDER BY x", "1.5;5;abc"),
+            ],
+            "SQLite 3.46.1",
+        );
+        match table_of(&conn, "SELECT sum(x) FROM (SELECT x FROM big)") {
+            Err(e) if e.contains("integer overflow") => {}
+            other => bad.push(format!("sum of two INT64_MAX through a subquery gave {other:?}, not SQLite's integer overflow")),
+        }
+        match conn.execute("CREATE TABLE pc AS SELECT x FROM pv") {
+            Ok(()) => bad.extend(diverging(
+                &conn,
+                &[
+                    ("SELECT sql FROM sqlite_schema WHERE name = 'pc'", "CREATE TABLE pc(x NUM)"),
+                    ("SELECT typeof(x), x FROM pc ORDER BY rowid", "integer,5;text,abc;real,1.5"),
+                ],
+                "SQLite 3.46.1",
+            )),
+            Err(e) => bad.push(format!("CREATE TABLE pc AS SELECT x FROM pv refused: {e}; SQLite creates pc(x NUM)")),
+        }
+        assert!(bad.is_empty(), "CLAIM: a plain NUMERIC column read through a derived relation was not SQLite's: {bad:#?}");
+    }
 }
