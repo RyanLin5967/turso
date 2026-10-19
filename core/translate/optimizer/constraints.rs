@@ -340,7 +340,8 @@ fn in_seek_refused(schema: &Schema, table_reference: &JoinedTable, column: usize
     };
     schema
         .get_type_def(&col.ty_str, table_reference.table.is_strict())
-        .is_some_and(|t| t.encode().is_some() || crate::translate::expr::type_eq_function(t).is_some())
+        .map(|t| crate::translate::expr::seek_type_of(schema, t))
+        .is_some_and(|t| t.encode().is_some() || crate::translate::expr::type_eq_function(&t).is_some())
 }
 
 /// Return true when an expression names a custom text order.
@@ -1109,12 +1110,12 @@ pub fn constraints_from_where_clause(
                         // can only where the type's '=' agrees with equality of the encodings
                         // (engine review 20 item 8: tag's instr '=' is coarser, so the seek
                         // missed rows the '=' finds; `eq_agrees_with_encoding`).
-                        if let Some(type_def) = schema.get_type_def(
-                            &constrained_column.ty_str,
-                            table_reference.table.is_strict(),
-                        ) {
+                        if let Some(type_def) = schema
+                            .get_type_def(&constrained_column.ty_str, table_reference.table.is_strict())
+                            .map(|t| crate::translate::expr::seek_type_of(schema, t))
+                        {
                             if constraint.operator != ast::Operator::Equals.into()
-                                || !crate::translate::expr::eq_agrees_with_encoding(type_def)
+                                || !crate::translate::expr::eq_agrees_with_encoding(&type_def)
                             {
                                 continue;
                             }

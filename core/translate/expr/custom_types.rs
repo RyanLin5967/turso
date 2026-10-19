@@ -569,9 +569,26 @@ pub(crate) fn key_takes_type_operator(
     resolver: &Resolver,
 ) -> bool {
     match expr_custom_type_info(key, referenced_tables, resolver) {
-        Some(info) => info.type_name.eq_ignore_ascii_case(type_name),
+        // A domain's key is its base type's (`seek_type_of`), as `find_custom_type_operator`
+        // compares it.
+        Some(info) => {
+            info.type_name.eq_ignore_ascii_case(type_name)
+                || seek_type_of(resolver.schema(), &info.type_def).name.eq_ignore_ascii_case(&type_def.name)
+        }
         None => operand_compatible(key, type_def.value_input_type(), resolver),
     }
+}
+
+/// The type an index on a column of `type_def` is sought and checked by: a domain's base type
+/// (`Schema::operator_type_of`), whose ENCODE made the index's keys and whose '=' a scan compares
+/// with (review of this lane's fixes, item 3: a domain over numeric sought its raw key among
+/// numeric's encoded blobs, so `a = 10` answered by the index unlike the scan). Mutant
+/// `domain_seek_by_its_own_typedef` (test builds only): `type_def`, as before.
+pub(crate) fn seek_type_of(schema: &crate::schema::Schema, type_def: &Arc<TypeDef>) -> Arc<TypeDef> {
+    if crate::branch::store::fe_mutant("domain_seek_by_its_own_typedef") {
+        return type_def.clone();
+    }
+    schema.operator_type_of(type_def)
 }
 
 pub(crate) fn seek_key_eq_function(type_def: &TypeDef) -> Option<&str> {

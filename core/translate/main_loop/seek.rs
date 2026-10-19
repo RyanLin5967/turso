@@ -55,9 +55,11 @@ fn encode_seek_keys_for_custom_types(
             .schema()
             .get_type_def(&table_col.ty_str, table.is_strict())
         {
-            Some(td) => td,
+            // A domain's key is its base type's (`seek_type_of`).
+            Some(td) => crate::translate::expr::seek_type_of(resolver.schema(), td),
             None => continue,
         };
+        let type_def = &type_def;
         let encode_expr = match type_def.encode() {
             Some(e) => e,
             None => continue,

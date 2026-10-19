@@ -3302,7 +3302,8 @@ fn seek_term_rechecked_by_type_eq(
     resolver
         .schema()
         .get_type_def(&column.ty_str, table.table.is_strict())
-        .is_some_and(|type_def| crate::translate::expr::seek_key_eq_function(type_def).is_some())
+        .map(|type_def| crate::translate::expr::seek_type_of(resolver.schema(), type_def))
+        .is_some_and(|type_def| crate::translate::expr::seek_key_eq_function(&type_def).is_some())
 }
 
 fn mark_partial_index_predicate_terms_consumed(
