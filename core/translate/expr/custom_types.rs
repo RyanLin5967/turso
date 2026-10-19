@@ -1317,6 +1317,38 @@ mod tests {
         assert!(wrong.is_empty(), "CLAIM: a numeric sum and constant as PostgreSQL: {wrong:#?}");
     }
 
+    /// fastest-wire 68f301ef0 (PostgreSQL 18.6 recorded on iccad2): a timestamptz literal whose
+    /// offset has no minutes ('+00', '-03') or no colon ('+0530') is a valid PostgreSQL input, stored
+    /// as the instant it names; here the ENCODE's datetime(value) took only '+HH:MM' and refused it
+    /// 'invalid timestamp value'. Stored as UTC text, as the '+00:00' control is. Recorded: '+00';
+    /// '-03', '+0530' and '-0330' by PostgreSQL's ISO 8601 offset forms, not recorded here.
+    #[test]
+    fn a_timestamptz_offset_without_minutes_or_colon_is_accepted() {
+        let conn = open();
+        conn.execute("CREATE TABLE z(id INTEGER PRIMARY KEY, t timestamptz) STRICT").unwrap();
+        let mut wrong = Vec::new();
+        for (id, lit, want) in [
+            (1, "2026-10-19 10:00:00+00:00", "2026-10-19 10:00:00"),
+            (2, "2026-10-19 10:00:00+00", "2026-10-19 10:00:00"),
+            (3, "2026-10-19 10:00:00-03", "2026-10-19 13:00:00"),
+            (4, "2026-10-19 10:00:00+0530", "2026-10-19 04:30:00"),
+            (5, "2026-10-19 10:00:00.5-0330", "2026-10-19 13:30:00.5"),
+        ] {
+            if let Err(e) = conn.execute(&format!("INSERT INTO z VALUES ({id}, '{lit}')")) {
+                wrong.push(format!("{lit}: refused: {e}"));
+                continue;
+            }
+            let got = conn
+                .prepare(&format!("SELECT t FROM z WHERE id = {id}"))
+                .and_then(|mut s| s.run_collect_rows())
+                .map(|r| r[0][0].to_string());
+            if got.as_ref().ok().map(String::as_str) != Some(want) {
+                wrong.push(format!("{lit}: stored {got:?}, PostgreSQL's instant {want}"));
+            }
+        }
+        assert!(wrong.is_empty(), "CLAIM: PostgreSQL's timestamptz offsets: {wrong:#?}");
+    }
+
     /// fastest-wire 68f301ef0 (PostgreSQL 18.6 recorded on iccad2,
     /// pg18-wirefuzz-arithmetic_over_rows_answers_as_postgresql_does.out): arithmetic over a date
     /// and over a numeric meeting another type answers as PostgreSQL's operators do. SILENT at the
