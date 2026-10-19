@@ -433,9 +433,9 @@ fn measure_owning<R>(db: &Arc<Database>, base: Option<u64>, owned: &[&str], f: i
     // A window whose work synced a flight and started no checkpoint (which may take the word
     // itself) must have absorbed the word's write.
     let absorbed = !synced || left || confirms == 1 || WORD_HELD.load(std::sync::atomic::Ordering::Acquire);
-    // The Linux port (2026-10-18): where no kernel syscall count exists, the window is the caller's own
-    // when the thread rule says so (`Snapshot::threads_quiet`); where one exists, its attribution.
-    let own = s1.attributed_syscalls.is_some() || (s1.syscalls.is_none() && s1.threads_quiet);
+    // The Linux port (2026-10-18): the window is the caller's own by `Snapshot::own` (its attribution
+    // where a kernel count exists, the thread rule where none does).
+    let own = s1.own();
     let attributed = own && s1.held_unattributed == s0.held_unattributed;
     let quiet = settled && back && parked && absorbed && attributed && (left || s["allocs_process"] == s["allocs"]);
 
@@ -582,10 +582,10 @@ fn recover(cell: &str, built: &mut Built, opens: u64, out: &mut String) -> (Arc<
         let mut a = sample_of(&s0, &s_open, &Outside::zero(log0), &o1);
         // Class (b): a recovery window is the opening thread's and the threads the open spawned;
         // another thread that ran inside it makes it unattributable (`probe::end`).
-        a.insert("quiet", u64::from(t0 == base && t_open == base && s_open.attributed_syscalls.is_some()));
+        a.insert("quiet", u64::from(t0 == base && t_open == base && s_open.own()));
         line(out, cell, "recovery_open", r, &a);
         let mut b = sample_of(&s0, &s_all, &Outside::zero(log0), &o1);
-        b.insert("quiet", u64::from(t0 == base && settled && s_all.attributed_syscalls.is_some()));
+        b.insert("quiet", u64::from(t0 == base && settled && s_all.own()));
         line(out, cell, "recovery", r, &b);
         db = Some(opened);
     }
