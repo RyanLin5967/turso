@@ -198,7 +198,9 @@ def gen(seed, n):
                     else:
                         state["sp"] = state["sp"][:state["sp"].index(sp)]
                         add("T_RELEASE", "RELEASE SAVEPOINT %s" % sp)
-        elif r < 0.90:
+        elif r < 0.90 and not state["tx"]:
+            # Outside a block only: a branch call is refused inside one (25001, as PostgreSQL refuses CREATE
+            # DATABASE there), which wire-fuzz2 reported 14 times as turso_only_error.
             add("T_BRANCH", "SELECT turso_branch_create('fz_%d_%d')" % (seed, len(seq)), turso_only=True)
         elif r < 0.93:
             add("T_ERR_MISSING", "SELECT * FROM nosuch_%d" % rnd.randint(0, 3))
