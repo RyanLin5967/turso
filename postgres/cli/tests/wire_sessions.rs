@@ -7694,6 +7694,9 @@ fn copy_from_stdin_streams_its_rows_in_bounded_memory() {
     let mut row = vec![b'x'; 63];
     row.push(b'\n');
     let piece: Vec<u8> = row.repeat(1024);
+    // A debug server loads 1M rows in tens of seconds; the client's 30 s read timeout would end
+    // the read before the reply, not the bound (275ee8333's red failed so).
+    a.s.set_read_timeout(Some(Duration::from_secs(900))).unwrap();
     let before = hwm_kb();
     let sql = "COPY m FROM STDIN";
     let mut body = sql.as_bytes().to_vec();
