@@ -3207,4 +3207,32 @@ mod tests {
         }
         assert!(bad.is_empty(), "CLAIM: a sum over a domain over numeric was not numeric's: {bad:#?}");
     }
+
+    /// The HIGH 5 class's arithmetic half (engine review 2bdcd32c6 HIGH 5; raw types/probe2 and
+    /// probe typesrev2bd-probeA at 323655cfe): an arithmetic operator a type defines takes every
+    /// operand of a COLUMN of that type (da850ed1c), but a numeric value that is not a column (sum(b),
+    /// max(b), a derived relation's typed column, b + 1) took SQLite's arithmetic on its text:
+    /// `sum(b) + 1` was 14.0 and `(b + 1) * 2` 4.0 where PostgreSQL answers 14.00 and 4.00, though
+    /// both are typed numeric. Expected values are PostgreSQL 18.6's for this exact SQL (UW run
+    /// typesrev2bd-oracle3; artie raw frontier/fastest/lanes/engine/raw/pg18-types-rev2bd-2.txt
+    /// 83ba1bd4ed), never ours; the derived column is read WHERE bb IS NOT NULL so the row order does
+    /// not depend on where NULL sorts. `b * 2` over the column is the control.
+    #[test]
+    fn arithmetic_over_a_numeric_aggregate_or_derived_value_is_numerics() {
+        let conn = open();
+        conn.execute("CREATE TABLE n(id INTEGER PRIMARY KEY, b numeric(8, 2)) STRICT").unwrap();
+        conn.execute("INSERT INTO n VALUES (1, 1.00), (2, 2.00), (3, NULL), (4, 10.00)").unwrap();
+        let bad = diverging(
+            &conn,
+            &[
+                ("SELECT b * 2 FROM n WHERE id = 4", "20.00"),
+                ("SELECT sum(b) + 1, sum(b) - 0.5, max(b) * 2 FROM n", "14.00,12.50,20.00"),
+                ("SELECT s + 1, 1 + s FROM (SELECT sum(b) AS s FROM n) q", "14.00,14.00"),
+                ("SELECT bb * 2 FROM (SELECT b AS bb FROM n) q WHERE bb IS NOT NULL ORDER BY bb", "2.00;4.00;20.00"),
+                ("SELECT (b + 1) * 2 FROM n ORDER BY id", "4.00;6.00;NULL;22.00"),
+            ],
+            "PostgreSQL 18",
+        );
+        assert!(bad.is_empty(), "CLAIM: arithmetic over a numeric value that is not a column was SQLite's: {bad:#?}");
+    }
 }
