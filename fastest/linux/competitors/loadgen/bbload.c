@@ -750,6 +750,11 @@ static int conn_exec(conn_t *x, const char *sql, int need_rows, char *why, size_
     do {
         MYSQL_RES *res = mysql_store_result(x->my);
         if (res) mysql_free_result(res);
+        /* comp-rev-2404 MED-1, measured: a NULL result is an error whenever mysql_errno says so. The field-count
+         * check alone failed open: when the connection dies after the metadata (count, definition, EOF), Connector/C
+         * clears field_count while it tears the connection down, so field_count == 0 read as "no result set" (rc 0;
+         * test_probe_shapes mysql metaclose at 268e769d5, artie 7dc85006a4) */
+        else if (mysql_errno(x->my) != 0) return my_fail(x, why, wsz);
         else if (mysql_field_count(x->my) == 0) affected += mysql_affected_rows(x->my);
         else return my_fail(x, why, wsz);
         status = mysql_next_result(x->my);
