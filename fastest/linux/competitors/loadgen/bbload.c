@@ -1194,7 +1194,7 @@ static void *client_main(void *arg) {
         op_done(ph);
         free_since = r.after_end;
     }
-done:
+done:; /* an empty statement: the declaration of hdl below may not follow a label in C17 (-Wc23-extensions) */
     /* comp-rev-b15 LOW-1: a home connection that died while idle (every op on branch connections, no teardown) was
      * never noticed: libpq's status and a MySQL handle change only when used. One untimed SELECT 1 on the home
      * connection after the last op: a failure is counted (other_err) and refuses the run. A handle already closed
