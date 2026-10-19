@@ -1673,7 +1673,14 @@ fn prepare_statement_parsed(
             }
         }
         types.columns = vec![None; aggregates.len()];
-        if !used.is_empty() || aggregates.contains(&true) {
+        // ... and for one holding min or max anywhere, whose boolean form the walk refuses
+        // (wire-rev-2a68496d0 L5: in a subquery, a view, HAVING or ORDER BY it was answered).
+        let min_max = parse_result.protobuf.nodes().iter().any(|(n, ..)| {
+            matches!(n, turso_pg_parser::pg_query::NodeRef::FuncCall(f)
+                if f.funcname.last().is_some_and(|p| matches!(&p.node,
+                    Some(turso_pg_parser::pg_query::protobuf::node::Node::String(s)) if s.sval.eq_ignore_ascii_case("min") || s.sval.eq_ignore_ascii_case("max"))))
+        });
+        if !used.is_empty() || aggregates.contains(&true) || min_max {
             // A parameter compared with something no context types is refused (42P18) by the
             // server, which alone reads the types the client declared (wire review 8 item 7,
             // review 11 item 1).

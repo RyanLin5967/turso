@@ -1144,6 +1144,13 @@ impl Infer<'_> {
                 }
                 self.ctes.truncate(ctes);
             }
+            // A view's query is walked for its refusals alone (min/max over boolean: wire-rev-2a68496d0
+            // L5); a CREATE VIEW has no result columns or parameters of its own here.
+            Some(Node::ViewStmt(v)) => {
+                if let Some(Node::SelectStmt(q)) = v.query.as_deref().and_then(|q| q.node.as_ref()) {
+                    let _ = self.select(q, &scope);
+                }
+            }
             Some(Node::DeleteStmt(d)) => {
                 let ctes = self.with(d.with_clause.as_ref(), &scope);
                 if let Some(rel) = d.relation.as_ref() {
@@ -1917,6 +1924,13 @@ impl Infer<'_> {
             Some(Node::NullTest(n)) => self.exprs(n.arg.as_deref(), scope),
             Some(Node::FuncCall(f)) => {
                 let name = func_name(f);
+                // min and max over boolean are refused wherever they stand, as in the target list
+                // ([`Infer::type_of`]): HAVING, ORDER BY (wire-rev-2a68496d0 L5).
+                if matches!(name.as_deref(), Some("min" | "max")) && f.over.is_none() {
+                    if !f.args.is_empty() {
+                        let _ = self.type_of(node, scope);
+                    }
+                }
                 if name.as_deref().is_some_and(takes_text) {
                     for arg in &f.args {
                         self.set(arg, Some(TEXT));
