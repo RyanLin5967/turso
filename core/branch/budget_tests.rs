@@ -1619,7 +1619,9 @@ fn first_create(cell: &str, out: &mut String) {
             let (c0, f0) = (probe::sql_counts(), probe::window_syncs());
             let p0 = super::sync_counts();
             let o0 = super::store::own_sync_counts();
+            let h0 = probe::thread_allocs();
             trunk.create_branch("m-0000").unwrap();
+            let h1 = probe::thread_allocs();
             let (c1, f1) = (probe::sql_counts(), probe::window_syncs());
             let p1 = super::sync_counts();
             let o1 = super::store::own_sync_counts();
@@ -1631,6 +1633,10 @@ fn first_create(cell: &str, out: &mut String) {
             s.insert("fsync_process", p1.fsync - p0.fsync);
             s.insert("full_fsync_own", o1.full_fsync - o0.full_fsync);
             s.insert("fsync_own", o1.fsync - o0.fsync);
+            // budgets-rev-242345 addendum 4 MED-11: the calling thread's allocations under a store mutex in
+            // the window (the create runs on it), which the 8 KiB bound reads; it was never recorded.
+            s.insert("held_allocs", h1.2 - h0.2);
+            s.insert("held_alloc_bytes", h1.3 - h0.3);
             line(out, cell, op, i, &s);
         }
     }
