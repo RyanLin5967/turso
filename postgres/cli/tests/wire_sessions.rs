@@ -15887,6 +15887,66 @@ fn a_parameter_assigned_to_a_varchar_column_is_refused_at_bind_when_too_long() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-cfdebc06d LOW-3 (its PG 18.6 probe #33, #35, #36): a value bound to a numeric(6,2) column is judged at
+/// Bind as numeric_in reads it: '1e5' is 100000 and 'Infinity' never fits a typmod, both 22003 before BindComplete, and
+/// so is '1.5e10' declared float8. They got BindComplete, then 22003 or 22P02 at Execute; a negative scale counted kept
+/// digits, so numeric(2,-1) took 1000.
+#[test]
+fn a_bound_exponent_or_infinity_overflows_numeric_at_bind() {
+    let dir = Scratch::new("bind-numeric-forms");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE nm(id int PRIMARY KEY, n numeric(6,2))").ok("create");
+    let mut wrong = Vec::new();
+    // Parse with the declared types, Bind one text value, Execute, Sync: every message type of the reply.
+    let round = |a: &mut Wire, sql: &str, declared: &[i32], value: &[u8]| -> (Vec<u8>, Option<WireError>) {
+        let mut parse = vec![0u8];
+        parse.extend_from_slice(sql.as_bytes());
+        parse.push(0);
+        parse.extend_from_slice(&(declared.len() as i16).to_be_bytes());
+        for t in declared {
+            parse.extend_from_slice(&t.to_be_bytes());
+        }
+        a.send(b'P', &parse);
+        let mut bind = vec![0u8, 0u8];
+        bind.extend_from_slice(&0i16.to_be_bytes());
+        bind.extend_from_slice(&1i16.to_be_bytes());
+        bind.extend_from_slice(&(value.len() as i32).to_be_bytes());
+        bind.extend_from_slice(value);
+        bind.extend_from_slice(&0i16.to_be_bytes());
+        a.send(b'B', &bind);
+        a.send(b'E', &[0, 0, 0, 0, 0]);
+        a.send(b'S', &[]);
+        let (mut types, mut error) = (Vec::new(), None);
+        loop {
+            let mut head = [0u8; 5];
+            a.s.read_exact(&mut head).unwrap();
+            let len = i32::from_be_bytes([head[1], head[2], head[3], head[4]]) as usize;
+            let mut body = vec![0u8; len - 4];
+            a.s.read_exact(&mut body).unwrap();
+            types.push(head[0]);
+            if head[0] == b'E' && error.is_none() {
+                error = Some(error_fields(&body));
+            }
+            if head[0] == b'Z' {
+                return (types, error);
+            }
+        }
+    };
+    for (id, declared, value) in [(4, &[][..], "1e5"), (6, &[][..], "Infinity"), (7, &[701][..], "1.5e10")] {
+        let sql = format!("INSERT INTO nm VALUES ({id}, $1)");
+        let (types, error) = round(&mut a, &sql, declared, value.as_bytes());
+        if types.contains(&b'2') || !error.as_ref().is_some_and(|e| e.code == "22003" && e.message == "numeric field overflow") {
+            wrong.push(format!("{sql} with '{value}' declared {declared:?}: messages {:?} error {error:?}, PostgreSQL: no BindComplete, 22003 numeric field overflow", String::from_utf8_lossy(&types)));
+        }
+    }
+    let r = a.q("SELECT count(*) FROM nm");
+    if r.rows != vec![vec![Some("0".to_string())]] {
+        wrong.push(format!("nm holds {:?} rows after the refusals", r.rows));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-cfdebc06d MED-4 (pre-existing): a decimal literal is the engine's REAL, so one of more than 15 significant
 /// digits was rounded before the column's ENCODE saw it: `INSERT INTO nm VALUES (1, 12345678901234567.89, ...)` stored
 /// 12345678901234568.00 in a numeric(20,2) column, and two distinct literals became one row value (a silent change on
