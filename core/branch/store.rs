@@ -11597,8 +11597,16 @@ impl StoreCore {
         // engine-rev-qaf-fix2 HIGH E: a create acked in the flusher's last FLY_AGE was lost by a
         // clean close). A fork(2) child's flight is refused by the journal itself. Mutant
         // `close_drops_async` (test builds only): not flown, as before.
+        // Flown to the newest async acknowledgement, not to the log's end (engine-2bdcd32c6 LOW 5:
+        // a record no async create acknowledged cost one more sync per close, where a store that
+        // never ran async flies nothing at its close). Mutant `close_flies_everything` (test
+        // builds only): to the log's end, as at da850ed1c.
         if self.async_threads.started.load(Ordering::Acquire) && !self.group.poisoned() && !fe_mutant("close_drops_async") {
-            let lsn = self.journal_lsn();
+            let lsn = if fe_mutant("close_flies_everything") {
+                self.journal_lsn()
+            } else {
+                self.async_threads.ctl.acked_lsn.load(Ordering::Acquire)
+            };
             if lsn > self.group.durable(self.class) {
                 // Under catch_unwind, as the flusher's flights are (engine-2bdcd32c6 LOW 4): a
                 // close runs while its caller's thread may be unwinding, where a second panic
