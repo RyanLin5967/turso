@@ -20,6 +20,9 @@
  *                                                    line, non-decreasing): one line, "stop_at=I warm_ops=N capped=0|1"
  *                                                    or "stop_at=none warm_ops=N capped=none" (the shared cross-driver
  *                                                    test fastest/linux/gates/warmup_conformance.py; A23)
+ *   bbload --warmup-decide OPS:S:MAX_S < TRACE       the same claims through warm_step, the decision the live claims
+ *                                                    make, accepting times that step back: one line ending
+ *                                                    " backsteps=B" (competitors review 2 item 4: bin_plants.sh)
  *          [--duration-s S] [--min-ops N]            the measured window ends when both are reached
  *          [--max-ops N]                             closed loop: end the window after exactly N measured ops
  *          [--max-window-s S]                        refuse (exit 3) if min-ops is not reached by then (default 3600);
@@ -28,21 +31,38 @@
  *                                                    timedrun.py applies PREREG's tiers (MED 5)
  *          [--run-tag T] [--seed S] [--set k=v]... [--v1-run NAME [--v1-mark-base B]] [--c1b-run NAME]
  *          [--stall-s S] [--allow-errors] [--skip-after]       --skip-after: run no after-step (summary.json skip_after)
+ *          [--no-drain]                              claims stop at the window's end: exactly --max-ops ops run (the
+ *                                                    driver's prebranch at C>1; summary.json no_drain; comp review 1
+ *                                                    LOW 21) -- a measured cell keeps the drain load (timedrun.py)
+ *          [--max-send-late-us U]                  open loop: a p99 send or pool lateness above U (default 100) is
+ *                                                    VOID, exit 3 (the macOS bbload's amendment 48 rule)
+ *   Every numeric flag takes the whole string, finite and in range, or exits 2 (the macOS num_d/num_u, review 4 M8).
  *   With no warm-up at all (OPS, S and MAX_S all 0, the default) the run starts in the measured window, so a
  *   --max-ops N run makes exactly N ops (there is no warm phase to add ops to); A23 gives 0:0:0 the same 0 warm-up ops.
  *   summary.json records the warm-up as decided: warmup_ops (the claims before the ending one), warmup_end_ns (the
  *   ending claim, ns since t0), warmup_capped, warmup_last_claim_ns (the last warm-up claim; null with none), and
  *   warmup_backsteps (claims judged with an older time than the one judged before them; 0 in both loop modes: each
- *   claim's time is fixed under the claim lock, see claim_warm and claim_open), and loop (closed | open).
+ *   claim's time is fixed under the claim lock, see claim_op), and loop (closed | open).
  *
  * One OS thread and one connection per client (C up to 1024+), blocking libpq or MariaDB-connector calls, so each
- * thread timestamps its own operation. Clock: CLOCK_UPTIME_RAW, the clock the V1 shim stamps its events with.
+ * thread timestamps its own operation. Clock: BB_CLOCK (CLOCK_MONOTONIC unless rebuilt with CLOCK_BOOTTIME; see the
+ * LINUX PORT notes); the macOS original stamps CLOCK_UPTIME_RAW, the V1 shim's clock.
  *
- * Latency is measured from the INTENDED send time. Closed loop: intended = actual send, think time 0. Open loop:
- * ONE Poisson arrival stream at R for the whole run, seeded by --seed alone and starting at t0 (the macOS bbload's,
- * artie 4010ff3b06; PREREG annex A23): a free client claims the next arrival under the claim lock and waits for it;
- * a late op still counts from its intended time, and every op intended inside the window is run even after the window
- * closes, so queueing is never hidden (AG9). (Before A23 each client followed its own Poisson schedule at R/C.)
+ * Every phase decision is made AT A CLAIM, under one lock (claim_op, the macOS bbload's at artie 4010ff3b06; comp
+ * review 1 LOW 40, review 2 item 1): the client whose claim finds the warm-up done stamps tm0 at the claim's time, the
+ * claim that finds the window full stamps tm1 and fixes the measured count, and later claims are unmeasured DRAIN ops
+ * that keep the load on until every measured op has completed. Closed loop: a claim's time is now_ns(), read under
+ * the lock. Latency is measured from the INTENDED send time. Closed loop: intended = actual send, think time 0. Open
+ * loop: ONE Poisson arrival stream at R for the whole run, seeded by --seed alone and starting at t0 (the macOS
+ * bbload's; DECISIONS 2026-10-09T14:01:06Z): a free client claims the next arrival under the claim lock, the
+ * window is defined in that intended time, and the client then sends it at its intended time; a late op still counts
+ * from its intended time, and every op intended inside the window is measured, so queueing is never hidden (AG9).
+ * Open loop records send_late = start - max(intended, the client's free time), pool_late (the earliest free time of
+ * any later-claiming client in place of its own), fifo_violations, seed, schedule_hash (FNV-1a over intended - t0 of
+ * the warm-up and measured arrivals, in arrival order) and schedule_arrivals, as the macOS bbload does; client
+ * threads ask for a 1 ns timer slack (PR_SET_TIMERSLACK; summary timerslack_ok). Open loop REFUSES (rc 2) a spec with
+ * after-steps, a connect/close step or sql-serial: their time would be charged to the server as queueing (the macOS
+ * review 4 M6; comp review 1 LOW 23, review 2 item 5).
  * An operation is the spec's steps run in order; no step is sent before the previous one is acknowledged.
  *
  * Spec file (one directive per line, '#' comments; templates: {c} client, {i} op number of that client,
@@ -56,17 +76,22 @@
  *   step write <sql>              timed; must succeed AND affect >= 1 row
  *   step connect <overrides>      timed; open a new connection (home conninfo + overrides) that becomes current
  *   step close                    timed; close the current non-home connection
- *   after sql|write|connect|close untimed, after every op (also after a failed one); recorded as after_ns
+ *   after sql|write|connect|close untimed, after every op (also after a failed one); recorded as after_ns (all of
+ *                                 them and the closing of a branch connection) and each apart as after<k>_ns
  *   after sql-serial <sql>        as after sql, but no two clients run a sql-serial statement at the same time (Dolt's
- *                                 branch deletes: 2.4.1 panics on concurrent DOLT_BRANCH('-d'))
+ *                                 branch deletes: concurrent DOLT_BRANCH('-d') can panic or kill the server, a fatal
+ *                                 concurrent map read and map write, in 2.4.1 and the registered 2.5.0). It NARROWS
+ *                                 that race and does not close it: a serialized delete still reads other sessions'
+ *                                 state unlocked while they CHECKOUT (comp-rev-dolt250 HIGH-1)
  *   teardown <sql>                once per connection at the end, untimed
  *   c1b <step> <label>            with --c1b-run RUN: an OPSTART "<label>" before the op's first byte and an ACK
  *                                 "<label>" right after step <step> (1-based) is acknowledged, into the C1b trace
  *                                 (tools/c1b); label = "<phase>:<detail>", templates allowed
  * A non-home connection still open at the end of an op is closed, untimed.
  *
- * Output (OUT must not exist): spec.txt, raw.tsv (one row per op), hdr_total.txt and hdr_step<k>.txt (HDR
- * percentile distributions of the measured ops), errors.txt, summary.json.
+ * Output (OUT must not exist): spec.txt, raw.tsv (one row per op), hdr_total.txt, hdr_step<k>.txt and
+ * hdr_after<k>.txt (HDR percentile distributions of the measured ops; no after-step file under --skip-after),
+ * errors.txt, summary.json (tput_unit: "cycle" when after-steps ran, so tput_* count an op and its after-steps; "op").
  * V1 marks (--v1-run): a server stays attached to one V1 run for its whole life, so each invocation marks in its
  * own namespace B (default: (epoch seconds & 0x7fffff) << 32, written to summary.json as v1_mark_base). C=1: op seq
  * k is marked B+k+1 from just before its first byte to its acknowledgement, then V1_MARK_IDLE|(B+k+1) until the
@@ -78,7 +103,8 @@
  * Every change is an #if block; the macOS branches are the original lines. On Linux:
  *   - clock: CLOCK_MONOTONIC (clock_gettime / clock_nanosleep TIMER_ABSTIME), recorded in summary.json as "clock".
  *     It is the clock bpf_ktime_get_ns() reads, so an eBPF flush counter can share it; a shim on another clock
- *     must rebuild with -DBB_CLOCK=<clock> -DBB_CLOCK_NAME=\"<clock>\" (clock_nanosleep rejects CLOCK_MONOTONIC_RAW).
+ *     must rebuild with -DBB_CLOCK=<clock> -DBB_CLOCK_NAME=\"<clock>\" (clock_nanosleep rejects CLOCK_MONOTONIC_RAW),
+ *     and only CLOCK_MONOTONIC or CLOCK_BOOTTIME builds (a _Static_assert; review 2 item 8).
  *   - the V1/C1b hooks are compiled only with BB_HOOKS=1 (default: 1 on macOS, 0 elsewhere). With them off,
  *     --v1-run and --c1b-run REFUSE (rc 2) instead of running unmarked. BB_HOOKS=1 off macOS is a build error
  *     until the Linux shim lands from lane fastest-linux-flush.
@@ -128,6 +154,9 @@ static inline void c1b_ack(c1b_client *c, uint64_t op, const char *l) { (void)c;
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <time.h>
+#ifdef __linux__
+#include <sys/prctl.h> /* PR_SET_TIMERSLACK for the open-loop clients (competitors review 2 item 3) */
+#endif
 
 #define MAXSTEPS 8
 #define MAXAFTER 8
@@ -153,14 +182,16 @@ typedef struct {
 typedef struct { int proto; PGconn *pg; MYSQL *my; } conn_t;
 
 typedef struct {
-    uint32_t client, seq;
-    uint8_t phase, ok, nsteps, pad;
+    uint32_t client, seq, arrival; /* arrival: the open-loop arrival index (0 closed loop), as the macOS oprec */
+    uint8_t phase, ok, nsteps, nafter; /* nafter: the after-steps run (0 under --skip-after) */
     int16_t err;
+    uint64_t free, claim; /* the client's free time (its previous op's after_end, or t0) and the claim's time */
     uint64_t intended, start, end, after_end;
     uint64_t serial_wait_ns;
     unsigned nserial_waits;
     struct { uint64_t lo, hi; } serial_waits[MAXSTEPS + MAXAFTER];
     uint64_t step_end[MAXSTEPS];
+    uint64_t aft_start, aft_end[MAXAFTER]; /* comp review 1 MED 9: the after-steps' start and each one's end */
 } oprec;
 
 typedef struct {
@@ -182,10 +213,12 @@ typedef struct {
 static spec_t S;
 static int C = 1, OPEN_LOOP = 0, ALLOW_ERR = 0;
 static int SKIP_AFTER = 0; /* --skip-after: run no after-step (the driver's designated branches, which must stay) */
-static double RATE = 0, WARM_S = 0, WARM_MAX_S = 0, DUR_S = 0, MAXWIN_S = 3600, STALL_S = 120;
+static int NO_DRAIN = 0;   /* --no-drain: claims stop at the window's end (the prebranch; comp review 1 LOW 21) */
+static double RATE = 0, WARM_S = 0, WARM_MAX_S = 0, DUR_S = 0, MAXWIN_S = 3600, STALL_S = 120, MAX_SEND_LATE_US = 100;
 static const double CLOSE_TIMEOUT_S = 5;
 static char WARM_RULE[64] = "";
 static uint64_t WARM_OPS = 0, MIN_OPS = 0, MAX_OPS = 0, SEED = 1, MARKB = 0;
+static uint64_t DUR_NS, MAXWIN_NS; /* DUR_S and MAXWIN_S truncated to ns once, as the warm-up's seconds are */
 static char RUNTAG[64];
 static int NSET; static char *SETK[MAXLIST], *SETV[MAXLIST];
 static v1_hdr *V1;
@@ -195,14 +228,22 @@ static int HAVE_C1B;
 
 static volatile int g_phase = PH_INIT;
 static volatile uint64_t g_t0, g_tm0, g_tm1; /* run start, window start, window end (0 = not yet) */
-static volatile uint64_t g_warm_claimed, g_meas_claimed, g_completed;
-/* PREREG annex A23: the warm-up is decided at each claim under g_claim_mu (claim_warm), as the macOS claim_op decides
- * under g_claim. WARM_S_NS and WARM_MAX_NS are the rule's seconds truncated to ns once, as (uint64_t)(S * 1e9). */
+static volatile uint64_t g_completed, g_exited;
+/* Claim state (claim_op, the macOS bbload's at artie 4010ff3b06): every phase decision is made under g_claim_mu, so a
+ * measured op can never be claimed after the window closed, and the measured count is exact. WARM_S_NS and
+ * WARM_MAX_NS are the warm-up rule's seconds truncated to ns once, as (uint64_t)(S * 1e9) (PREREG annex A23). */
 static pthread_mutex_t g_claim_mu = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t WARM_S_NS, WARM_MAX_NS;
-static int g_warm_capped, g_warm_any; /* g_warm_any: a warm-up op was claimed, so g_warm_last_ns is set */
-static uint64_t g_warm_end_ns, g_warm_last_ns;
-static struct rusage g_ru0; /* the process's usage at the window's start (the ending claim, or t0 with no warm-up) */
+/* The warm-up's decision state, the one warm_step updates for the live claims and for --warmup-decide: claimed (the
+ * warm-up ops claimed so far), the previous claim's time (prev_el) and the backsteps judged against it, the last
+ * warm-up claim (last_el, with any), and the ending claim (end_el, capped). Times are ns since t0. */
+typedef struct { uint64_t claimed, prev_el, backsteps, last_el, end_el; int any, capped; } warm_state;
+static warm_state g_warm;
+static uint64_t g_meas_claimed, g_meas_final, g_meas_done, g_drain_claimed;
+static volatile int g_all_done, g_cap_hit;
+static uint64_t g_arr_idx, g_arr_t, g_arr_rng; /* the open-loop arrival stream (claim_op) */
+static volatile int g_timerslack_ok = 1; /* open loop: every client got its 1 ns timer slack */
+static struct rusage g_ru0, g_ru1; /* the process's usage at the window's start and end (both stamped at claims) */
 static int g_nready, g_nfailed;
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_serial_mu = PTHREAD_MUTEX_INITIALIZER; /* one sql-serial statement at a time, all clients */
@@ -211,6 +252,9 @@ static char *g_errs[MAXERR];
 static uint64_t g_errn[MAXERR];
 static int g_nerr;
 static uint64_t g_reconnects;
+/* comp-rev-failcount MED-1: failures outside an op -- a teardown statement, a reconnect, a setup statement re-run on a
+ * reconnected home connection -- counted (summary other_err) and named in errors.txt; they used to be dropped */
+static uint64_t g_other_err;
 
 #ifdef __APPLE__
 #define BB_CLOCK_NAME "CLOCK_UPTIME_RAW"
@@ -231,6 +275,11 @@ static void sleep_until(uint64_t t_ns) {
 #ifndef BB_CLOCK_NAME
 #error "-DBB_CLOCK=<clock> needs -DBB_CLOCK_NAME=\"<its name>\""
 #endif
+/* Competitors review 2 item 8: "0 backsteps by construction" and every window holds only for a clock that never steps
+ * back, so CLOCK_REALTIME and CLOCK_TAI (accepted by -DBB_CLOCK before) are a build error; timedrun.py refuses a
+ * summary whose "clock" is not one of these two names. */
+_Static_assert(BB_CLOCK == CLOCK_MONOTONIC || BB_CLOCK == CLOCK_BOOTTIME,
+               "BB_CLOCK must be CLOCK_MONOTONIC or CLOCK_BOOTTIME (a clock that never steps back)");
 static uint64_t now_ns(void) {
     struct timespec ts;
     clock_gettime(BB_CLOCK, &ts);
@@ -269,6 +318,13 @@ static int err_index(const char *msg) {
     if (i < MAXERR) g_errn[i]++;
     pthread_mutex_unlock(&g_mu);
     return i < MAXERR ? i : MAXERR - 1;
+}
+/* MED-1: one failure outside an op, counted in g_other_err and named in errors.txt as "WHAT: WHY" */
+static void other_fail(const char *what, const char *why) {
+    char m[512];
+    snprintf(m, sizeof m, "%s: %s", what, why);
+    (void)err_index(m);
+    __atomic_fetch_add(&g_other_err, 1, __ATOMIC_RELAXED);
 }
 
 /* ---------- spec ---------- */
@@ -535,7 +591,14 @@ static int conn_open(conn_t *x, const char *base, const char *over, char *why, s
 }
 
 /* Verbatim from artie 4010ff3b06: wait for backend exit before a following DROP. */
+/* conn_close_sync with the wait for the peer's EOF bounded by an absolute deadline DL (now_ns) instead of
+ * CLOSE_TIMEOUT_S from now (comp-rev-a145 LOW-4: the end-of-run home probe and the home's final close share one
+ * deadline). A deadline already passed closes without waiting. */
+static int conn_close_until(conn_t *x, uint64_t dl, char *why, size_t wsz);
 static int conn_close_sync(conn_t *x, char *why, size_t wsz) {
+    return conn_close_until(x, now_ns() + (uint64_t)(CLOSE_TIMEOUT_S * 1e9), why, wsz);
+}
+static int conn_close_until(conn_t *x, uint64_t dl, char *why, size_t wsz) {
     int s = -1, rc = 0, dup_errno = 0;
     if (x->pg) {
         int fd = PQsocket(x->pg);
@@ -555,11 +618,10 @@ static int conn_close_sync(conn_t *x, char *why, size_t wsz) {
         return -1;
     }
     if (s < 0) return 0;
-    uint64_t dl = now_ns() + (uint64_t)(CLOSE_TIMEOUT_S * 1e9);
     char b[512];
     for (;;) {
         uint64_t n = now_ns();
-        if (n >= dl) { snprintf(why, wsz, "close: the server did not close the connection within %.1f s", CLOSE_TIMEOUT_S); rc = -1; break; }
+        if (n >= dl) { snprintf(why, wsz, "close: the server did not close the connection by the close deadline"); rc = -1; break; } /* comp-rev-acd4 LOW-3: a shared deadline may have left less than CLOSE_TIMEOUT_S */
         struct pollfd pf = {s, POLLIN, 0};
         int pr = poll(&pf, 1, (int)((dl - n) / 1000000 + 1));
         if (pr < 0) { if (errno == EINTR) continue; snprintf(why, wsz, "close: poll: %s", strerror(errno)); rc = -1; break; }
@@ -585,9 +647,124 @@ static int conn_alive(conn_t *x) {
     return x->my != NULL;
 }
 
+/* A failed MySQL call: the error text into WHY; a lost connection (2006, 2013) closes and NULLs the handle (MED-2). */
+static int my_fail(conn_t *x, char *why, size_t wsz) {
+    unsigned e = mysql_errno(x->my);
+    snprintf(why, wsz, "%s", mysql_error(x->my));
+    if (e == 2006 || e == 2013) {
+        mysql_close(x->my);
+        x->my = NULL;
+    }
+    return -1;
+}
+
+static int conn_exec(conn_t *x, const char *sql, int need_rows, char *why, size_t wsz);
+
+/* A watchdog over one blocking call on a socket (comp-rev-2404 LOW-1): unless disarmed before its deadline, it shuts
+ * the socket down, so every read the call is blocked in -- the first byte or any later one, in libpq or in
+ * Connector/C -- returns at once with an error. One deadline bounds the WHOLE reply.
+ * comp-rev-a145 LOW-1: the deadline is on CLOCK_MONOTONIC (pthread_condattr_setclock) wherever the platform has it;
+ * macOS has no condattr clock, so there it is a RELATIVE wait (pthread_cond_timedwait_relative_np), which no
+ * wall-clock step moves either. LOW-2: it shuts down its own dup() of the socket, so a number that libpq or my_fail
+ * has already closed and the kernel has handed to another socket can never be the one shut down. */
+typedef struct {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    int fd, done, fired;
+    struct timespec dl; /* absolute CLOCK_MONOTONIC deadline; on macOS the relative bound */
+} watch_t;
+static void *watch_main(void *p) {
+    watch_t *wd = p;
+    pthread_mutex_lock(&wd->mu);
+#ifdef __APPLE__
+    uint64_t end = now_ns() + (uint64_t)wd->dl.tv_sec * 1000000000u + (uint64_t)wd->dl.tv_nsec;
+#endif
+    while (!wd->done) {
+#ifdef __APPLE__
+        uint64_t n = now_ns();
+        struct timespec rel = {0, 0};
+        if (n < end) { rel.tv_sec = (time_t)((end - n) / 1000000000u); rel.tv_nsec = (long)((end - n) % 1000000000u); }
+        int r = n >= end ? ETIMEDOUT : pthread_cond_timedwait_relative_np(&wd->cv, &wd->mu, &rel);
+#else
+        int r = pthread_cond_timedwait(&wd->cv, &wd->mu, &wd->dl);
+#endif
+        if (r == ETIMEDOUT && !wd->done) {
+            wd->fired = 1;
+            shutdown(wd->fd, SHUT_RDWR);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&wd->mu);
+    return NULL;
+}
+
+/* One SELECT 1 on X, the whole reply bounded by SECS: 0 when the server answered it, -1 (WHY) when the connection
+ * is gone, the query failed, the reply broke off (comp-rev-2404 MED-1: conn_exec fails a NULL result whenever
+ * mysql_errno is set), or no complete answer came in time (comp-rev-b15 LOW-1, comp-rev-67b2 LOW-B,
+ * comp-rev-2404 LOW-1). It runs the same conn_exec every op uses, under the watchdog. */
+static int conn_probe(conn_t *x, double secs, char *why, size_t wsz) {
+    int fd = x->proto == P_PG ? (x->pg ? PQsocket(x->pg) : -1) : (x->my ? (int)mysql_get_socket(x->my) : -1);
+    if (fd < 0) { snprintf(why, wsz, "connection not open"); return -1; }
+    int dfd = dup(fd); /* LOW-2: the watchdog's own reference to this socket */
+    if (dfd < 0) { snprintf(why, wsz, "probe watchdog: dup: %s", strerror(errno)); return -1; } /* never unbounded */
+    watch_t wd = {.fd = dfd};
+    pthread_mutex_init(&wd.mu, NULL);
+    pthread_condattr_t ca;
+    pthread_condattr_init(&ca);
+#ifdef __APPLE__
+    wd.dl.tv_sec = (time_t)secs;
+    wd.dl.tv_nsec = (long)((secs - (double)(time_t)secs) * 1e9);
+#else
+    pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
+    clock_gettime(CLOCK_MONOTONIC, &wd.dl);
+    uint64_t ns = (uint64_t)wd.dl.tv_nsec + (uint64_t)(secs * 1e9);
+    wd.dl.tv_sec += (time_t)(ns / 1000000000u);
+    wd.dl.tv_nsec = (long)(ns % 1000000000u);
+#endif
+    pthread_cond_init(&wd.cv, &ca);
+    pthread_condattr_destroy(&ca);
+    pthread_t th;
+    int armed = pthread_create(&th, NULL, watch_main, &wd) == 0;
+    if (!armed) { /* never unbounded */
+        snprintf(why, wsz, "probe watchdog: pthread_create failed");
+        close(dfd);
+        pthread_cond_destroy(&wd.cv);
+        pthread_mutex_destroy(&wd.mu);
+        return -1;
+    }
+    int rc = conn_exec(x, "SELECT 1", 0, why, wsz);
+    pthread_mutex_lock(&wd.mu);
+    wd.done = 1;
+    pthread_cond_signal(&wd.cv);
+    pthread_mutex_unlock(&wd.mu);
+    pthread_join(th, NULL);
+    close(dfd);
+    if (wd.fired) { snprintf(why, wsz, "the server did not answer within %.1f s", secs); rc = -1; }
+    if (rc == 0 && x->proto == P_PG && (!x->pg || PQstatus(x->pg) != CONNECTION_OK)) {
+        snprintf(why, wsz, "connection not OK after the probe");
+        rc = -1;
+    }
+    pthread_cond_destroy(&wd.cv);
+    pthread_mutex_destroy(&wd.mu);
+    return rc;
+}
+
+/* Drop X without waiting on its peer (comp-rev-2404 LOW-2): shut the socket down, then free the handle. The
+ * graceful close (conn_close_sync) waits up to CLOSE_TIMEOUT_S more for a hung peer, which pushed a hung home past
+ * --stall-s <= 10 into an rc 4 stall; the probe's one deadline is now the only wait. */
+static void conn_abandon(conn_t *x) {
+    int fd = x->proto == P_PG ? (x->pg ? PQsocket(x->pg) : -1) : (x->my ? (int)mysql_get_socket(x->my) : -1);
+    if (fd >= 0) shutdown(fd, SHUT_RDWR);
+    if (x->pg) PQfinish(x->pg);
+    if (x->my) mysql_close(x->my);
+    x->pg = NULL;
+    x->my = NULL;
+}
+
 /* Run one statement; need_rows: it must affect >= 1 row. */
 static int conn_exec(conn_t *x, const char *sql, int need_rows, char *why, size_t wsz) {
     if (x->proto == P_PG) {
+        if (!x->pg) { snprintf(why, wsz, "connection closed earlier (lost or hung)"); return -1; }
         PGresult *r = PQexec(x->pg, sql);
         ExecStatusType st = PQresultStatus(r);
         int rc = 0;
@@ -601,16 +778,26 @@ static int conn_exec(conn_t *x, const char *sql, int need_rows, char *why, size_
         PQclear(r);
         return rc;
     }
-    if (mysql_real_query(x->my, sql, (unsigned long)strlen(sql)) != 0) { snprintf(why, wsz, "%s", mysql_error(x->my)); return -1; }
+    /* comp-rev-failcount MED-2: a MySQL connection that reported it is gone (CR_SERVER_GONE_ERROR 2006, CR_SERVER_LOST
+     * 2013) is closed and NULLed here, so conn_alive sees it and reconnect_home reopens and COUNTS it (g_reconnects);
+     * conn_alive used to read x->my != NULL, true for a dead handle, so a lost MySQL home connection was never
+     * counted and every later op on it failed with "server has gone away" instead. */
+    if (!x->my) { snprintf(why, wsz, "connection lost earlier (closed after a lost-connection error)"); return -1; }
+    if (mysql_real_query(x->my, sql, (unsigned long)strlen(sql)) != 0) return my_fail(x, why, wsz);
     my_ulonglong affected = 0;
     int status;
     do {
         MYSQL_RES *res = mysql_store_result(x->my);
         if (res) mysql_free_result(res);
+        /* comp-rev-2404 MED-1, measured: a NULL result is an error whenever mysql_errno says so. The field-count
+         * check alone failed open: when the connection dies after the metadata (count, definition, EOF), Connector/C
+         * clears field_count while it tears the connection down, so field_count == 0 read as "no result set" (rc 0;
+         * test_probe_shapes mysql metaclose at 268e769d5, artie 7dc85006a4) */
+        else if (mysql_errno(x->my) != 0) return my_fail(x, why, wsz);
         else if (mysql_field_count(x->my) == 0) affected += mysql_affected_rows(x->my);
-        else { snprintf(why, wsz, "%s", mysql_error(x->my)); return -1; }
+        else return my_fail(x, why, wsz);
         status = mysql_next_result(x->my);
-        if (status > 0) { snprintf(why, wsz, "%s", mysql_error(x->my)); return -1; }
+        if (status > 0) return my_fail(x, why, wsz);
     } while (status == 0);
     if (need_rows && affected < 1) { snprintf(why, wsz, "write affected 0 rows: %.120s", sql); return -1; }
     return 0;
@@ -652,8 +839,15 @@ static int run_step(client_t *c, conn_t *cur, int *have_branch, const step_t *st
     }
     conn_t *target = *have_branch ? cur : &c->home;
     if (!st->serial) return conn_exec(target, text, st->k == K_WRITE, why, wsz);
-    /* sql-serial: no two clients run one at the same time (Dolt 2.4.1's DOLT_BRANCH('-d') from concurrent sessions
-     * panics the server; lead review 62430d8bf..b49fb656a HIGH 1). Used in untimed after-steps only. */
+    /* sql-serial: no two clients run one at the same time (Dolt's DOLT_BRANCH('-d') from concurrent sessions races
+     * validateBranchNotActiveInAnySession: in 2.4.1 AND the registered 2.5.0 it can recover a nil-pointer panic or kill
+     * the server with a fatal concurrent map read and map write; artie runs/uw-20261018-pc241 (2.4.1 dies without
+     * churn) and runs/uw-20261018-dolt250churn4-b29acc86b (2.5.0); lead review 62430d8bf..b49fb656a HIGH 1). This
+     * NARROWS the race and does not close it (comp-rev-dolt250 HIGH-1: serialized, 2.5.0 still recovered panics at
+     * session.go:1752 <- dolt_branch.go:345). The delete reads every other session's dbState (lookupDbState,
+     * session.go:276) without that session's lock, and the conflicting writer can be another session's CHECKOUT,
+     * which no lock here orders. So a failed op in a serialized Dolt cell is a failure the cell reports, never
+     * something serialization rules out. Used in untimed after-steps only. */
     uint64_t wait_start = now_ns();
     pthread_mutex_lock(&g_serial_mu);
     uint64_t wait_end = now_ns();
@@ -687,8 +881,17 @@ static void reconnect_home(client_t *c) {
         note_backend(c, 0, 0, &c->home);
         for (int k = 0; k < S.nsetup; k++) {
             char t[8192];
-            if (expand(S.setup[k], &x, t, sizeof t, w) == 0) conn_exec(&c->home, t, 0, w, sizeof w);
+            /* MED-1: a setup statement that fails on the new connection (pg18-create-copy's SET file_copy_method)
+             * is a failure, not a silently different session */
+            if (expand(S.setup[k], &x, t, sizeof t, w) != 0 || conn_exec(&c->home, t, 0, w, sizeof w) != 0)
+                other_fail("setup on a reconnected home connection", w);
         }
+    } else {
+        other_fail("reconnect", w);
+        /* comp-rev-failcount LOW-4: a dead server made the clients spin through failed ops (967 in about 1 s); a
+         * failed reconnect waits 10 ms. Failure path only: such a run is refused anyway. */
+        struct timespec ts = {0, 10 * 1000 * 1000};
+        nanosleep(&ts, NULL);
     }
     __atomic_fetch_add(&g_reconnects, 1, __ATOMIC_RELAXED);
 }
@@ -697,7 +900,7 @@ static void reconnect_home(client_t *c) {
  * LOW 14; PREREG annex A23): at a claim, with CLAIMED warm-up ops claimed before it and EL ns since t0, the warm-up
  * ends at this claim when CLAIMED >= OPS and EL >= S_NS (done) or EL >= MAX_NS (capped). 0: go on, this claim is a
  * warm-up op; 1: it ends done; 2: it ends capped. Verbatim from the macOS bbload (artie 4010ff3b06), whose claim_op
- * is the validated implementation (A23-AM1); claim_warm decides with it, and --warmup-replay replays it. */
+ * is the validated implementation (A23-AM1); warm_step (claim_op's decision) calls it, and --warmup-replay replays it. */
 static int warm_ends(uint64_t claimed, uint64_t el, uint64_t ops, uint64_t s_ns, uint64_t max_ns) {
     int done = claimed >= ops && el >= s_ns;
     return done ? 1 : el >= max_ns ? 2 : 0;
@@ -705,7 +908,7 @@ static int warm_ends(uint64_t claimed, uint64_t el, uint64_t ops, uint64_t s_ns,
 
 /* --warmup-replay OPS:S:MAX_S < TRACE: warm_ends on claim times read from stdin (integer ns since t0, one per line,
  * non-decreasing). Prints "stop_at=I warm_ops=N capped=0|1", or "stop_at=none warm_ops=N capped=none" when the trace
- * ends first; seconds become ns as claim_warm makes them, (uint64_t)(S * 1e9). Verbatim from the macOS bbload (artie
+ * ends first; seconds become ns as claim_op makes them, (uint64_t)(S * 1e9). Verbatim from the macOS bbload (artie
  * 4010ff3b06), so the shared harness (fastest/linux/gates/warmup_conformance.py) feeds every driver the same claims. */
 static int warmup_replay(const char *rule) {
     unsigned long long ops;
@@ -740,66 +943,154 @@ static int warmup_replay(const char *rule) {
     return 0;
 }
 
-/* The claims, serialized under g_claim_mu as the macOS claim_op serializes under g_claim (A23; this port used to
- * decide the warm-up on a 1 ms main-thread poll of the claimed count, comparing seconds as doubles, with MAX_S 0 as no
- * limit). Each claim's time T is fixed INSIDE the lock, so claims are judged in lock order with non-decreasing times:
- *   closed loop (claim_warm): T = now_ns(), read after taking the lock, as claim_op reads it after taking g_claim
- *     (fastest-linux's LOW on f6c2dbb2f: it was read before the lock, so a slower claimant could be judged later with
- *     an older time);
- *   open loop (claim_open): the macOS claim_op's open-loop arrivals at artie 4010ff3b06, verbatim: every claim takes
- *     the NEXT arrival of ONE Poisson arrival stream for the whole run, T = g_arr_t, then g_arr_t +=
- *     -log(unif(&g_arr_rng)) * 1e9 / RATE, the stream seeded by --seed alone (g_arr_rng in main) and starting at
- *     g_arr_t = g_t0; the warm-up is decided at T in the same critical section, and the client then waits until T.
- *     The Linux and macOS open-loop arrivals now match (the lead's reversal of its correction on 0138d2128: this port
- *     drew one schedule per client, whose claims reached the lock out of intended order). The macOS claim_op also
- *     numbers each arrival (k.arrival = g_arr_idx++) for its per-op records; this port's raw.tsv carries no arrival
- *     column, so it keeps no index.
- * warm_decide_locked T (g_claim_mu held, phase PH_WARM) returns PH_WARM when this claim is a warm-up op, else PH_MEAS:
- * the claim that ends the warm-up opens the window at T and is its first measured op. g_warm_backsteps counts claims
- * judged with an older time than the one judged before them: 0 in both loop modes by construction, recorded so
- * timedrun.py can refuse a run where it is not. */
-static uint64_t g_claim_prev_el, g_warm_backsteps;
-static uint64_t g_arr_t, g_arr_rng; /* the open-loop arrival stream (claim_open) */
-static int warm_decide_locked(uint64_t t) {
-    uint64_t el = t > g_t0 ? t - g_t0 : 0;
-    if (el < g_claim_prev_el) g_warm_backsteps++;
-    g_claim_prev_el = el;
-    int end = warm_ends(g_warm_claimed, el, WARM_OPS, WARM_S_NS, WARM_MAX_NS);
+/* warm_step -- one warm-up claim at EL ns since t0 (BEFORE_T0: the claim's time read before t0, counted as a step back
+ * instead of clamped silently; competitors review 2 item 8), judged by warm_ends against W. The ONE decision function:
+ * claim_op calls it for every live warm-up claim, and --warmup-decide for every trace line (review 2 item 4: the
+ * replay used to re-implement the loop, so it could never reach the backstep path). Returns warm_ends' answer: 0 this
+ * claim is a warm-up op, 1 it ends the warm-up done, 2 capped. */
+static int warm_step(warm_state *w, uint64_t el, int before_t0, uint64_t ops, uint64_t s_ns, uint64_t max_ns) {
+    if (before_t0 || el < w->prev_el) w->backsteps++;
+    w->prev_el = el;
+    int end = warm_ends(w->claimed, el, ops, s_ns, max_ns);
     if (end) {
-        g_warm_capped = end == 2;
-        g_warm_end_ns = el;
+        w->capped = end == 2;
+        w->end_el = el;
+        return end;
+    }
+    w->last_el = el;
+    w->any = 1;
+    w->claimed++;
+    return 0;
+}
+
+/* --warmup-decide OPS:S:MAX_S < TRACE: claim times (integer ns since t0, one per line, in ANY order) through warm_step,
+ * the live decision. Prints "stop_at=I warm_ops=N capped=0|1 backsteps=B", or "stop_at=none warm_ops=N capped=none
+ * backsteps=B" when the trace ends first. The rule is parsed as --warmup parses it. */
+static int warmup_decide(const char *rule) {
+    unsigned long long ops;
+    double s, m;
+    char tail;
+    if (rule[0] < '0' || rule[0] > '9' || sscanf(rule, "%llu:%lf:%lf%c", &ops, &s, &m, &tail) != 3 || !isfinite(s) ||
+        !isfinite(m) || !(s >= 0) || !(m >= 0) || s > 1e7 || m > 1e7) {
+        fprintf(stderr, "bbload: --warmup-decide OPS:S:MAX_S (OPS an integer, S and MAX_S finite seconds in [0, 1e7]): %s\n", rule);
+        return 2;
+    }
+    warm_state w;
+    memset(&w, 0, sizeof w);
+    char line[64];
+    while (fgets(line, sizeof line, stdin)) {
+        if (line[0] == '\n') continue;
+        char *e;
+        errno = 0;
+        unsigned long long el = strtoull(line, &e, 10);
+        if (line[0] < '0' || line[0] > '9' || (*e != '\n' && *e != '\0') || errno) {
+            fprintf(stderr, "bbload: --warmup-decide: bad trace line: %s", line);
+            return 2;
+        }
+        int end = warm_step(&w, el, 0, ops, (uint64_t)(s * 1e9), (uint64_t)(m * 1e9));
+        if (end) {
+            printf("stop_at=%llu warm_ops=%llu capped=%d backsteps=%llu\n", (unsigned long long)w.claimed,
+                   (unsigned long long)w.claimed, end == 2, (unsigned long long)w.backsteps);
+            return 0;
+        }
+    }
+    printf("stop_at=none warm_ops=%llu capped=none backsteps=%llu\n", (unsigned long long)w.claimed,
+           (unsigned long long)w.backsteps);
+    return 0;
+}
+
+/* claim_op -- every phase decision, made at a claim under g_claim_mu: the macOS bbload's claim_op at artie 4010ff3b06,
+ * ported (comp review 1 LOW 40, review 2 item 1; this port's main thread used to end the window on a 1 ms wall-clock
+ * poll that counted started ops, and offered no drain load). The claim's time T is read UNDER the lock (closed loop:
+ * now_ns(); fastest-linux's LOW on f6c2dbb2f), or, open loop, is the intended time of the NEXT arrival of the run's ONE
+ * Poisson stream, taken under the lock exactly as claim_op takes it (T = g_arr_t, then g_arr_t +=
+ * -log(unif(&g_arr_rng)) * 1e9 / RATE; seeded by --seed alone, from g_arr_t = g_t0). At T:
+ *   - in the warm-up, warm_step decides; the claim that ends it stamps tm0 = T and is the first measured op;
+ *   - in the window, the claim that finds it full (--duration-s and --min-ops, or --max-ops, or past --max-window-s:
+ *     capped) stamps tm1 = T and fixes the measured count; that claim and every later one is an unmeasured DRAIN op,
+ *     run to keep the load on until every measured op has completed (op_done), and then claims stop.
+ * The window is therefore in intended time in open loop: which arrivals are measured does not depend on how fast the
+ * system serves them. self_tracerpid() (a /proc read) runs after the unlock (review 2 item 6). CID: the claiming
+ * client, used only by the PLANT_CLAIM_TIME_EARLY build (build.sh bbload-plant-claim-early), which reproduces the
+ * defect 0138d2128 fixed -- the time read before the lock, with a 20-200 us sleep on odd clients -- so
+ * run_system.sh's claim-time plant can show warmup_backsteps fire. */
+typedef struct { int ph, stop, opened, closed; uint32_t arrival; uint64_t intended, claim; } claim_t;
+
+static void all_done_locked(void) {
+    if (!g_all_done) __atomic_store_n(&g_all_done, 1, __ATOMIC_RELEASE);
+}
+
+static claim_t claim_op(int cid) {
+    claim_t k;
+    memset(&k, 0, sizeof k);
+#ifdef PLANT_CLAIM_TIME_EARLY
+    uint64_t early = now_ns();
+    if (cid & 1) usleep((useconds_t)(20 + (early >> 4) % 181));
+#else
+    (void)cid;
+#endif
+    pthread_mutex_lock(&g_claim_mu);
+#ifdef PLANT_CLAIM_TIME_EARLY
+    uint64_t now = early, t = now;
+#else
+    uint64_t now = now_ns(), t = now;
+#endif
+    k.claim = now;
+    int ph = __atomic_load_n(&g_phase, __ATOMIC_ACQUIRE);
+    if (ph == PH_ABORT || (ph == PH_DRAIN && g_meas_done >= g_meas_final)) { k.stop = 1; goto out; }
+    if (OPEN_LOOP) {
+        k.arrival = (uint32_t)g_arr_idx++;
+        k.intended = t = g_arr_t;
+        g_arr_t += (uint64_t)(-log(unif(&g_arr_rng)) * 1e9 / RATE);
+    }
+    if (ph == PH_WARM) {
+        if (!warm_step(&g_warm, t >= g_t0 ? t - g_t0 : 0, t < g_t0, WARM_OPS, WARM_S_NS, WARM_MAX_NS)) {
+            k.ph = PH_WARM;
+            goto out;
+        }
         getrusage(RUSAGE_SELF, &g_ru0);
         __atomic_store_n(&g_tm0, t, __ATOMIC_RELEASE);
         __atomic_store_n(&g_phase, PH_MEAS, __ATOMIC_RELEASE);
         if (V1 && C > 1) v1_set_mark(V1, MARKB + PH_MEAS);
-        g_tp_tm0 = self_tracerpid();
-        return PH_MEAS;
+        k.opened = 1;
+        ph = PH_MEAS;
     }
-    g_warm_last_ns = el;
-    g_warm_any = 1;
-    g_warm_claimed++;
-    return PH_WARM;
+    if (ph == PH_MEAS) {
+        uint64_t el = t > g_tm0 ? t - g_tm0 : 0;
+        /* The duration/min-ops clause applies only when one of them was asked for: with --max-ops alone,
+         * "el >= 0 && claimed >= 0" would hold at once and close the window before any op was measured. */
+        int timed = DUR_S > 0 || MIN_OPS > 0;
+        int end = (timed && el >= DUR_NS && g_meas_claimed >= MIN_OPS) || (MAX_OPS && g_meas_claimed >= MAX_OPS);
+        if (!end && el > MAXWIN_NS) { end = 1; g_cap_hit = 1; }
+        if (!end) { g_meas_claimed++; k.ph = PH_MEAS; goto out; }
+        g_meas_final = g_meas_claimed;
+        getrusage(RUSAGE_SELF, &g_ru1);
+        __atomic_store_n(&g_tm1, t, __ATOMIC_RELEASE);
+        __atomic_store_n(&g_phase, PH_DRAIN, __ATOMIC_RELEASE);
+        if (V1 && C > 1) v1_set_mark(V1, MARKB + PH_DRAIN);
+        k.closed = 1;
+        if (g_meas_done >= g_meas_final) { all_done_locked(); k.stop = 1; goto out; }
+    }
+    /* comp review 1 LOW 21: --no-drain (the driver's prebranch, at C>1): claims stop at the window's end, so exactly
+     * --max-ops ops run and every one is kept; a measured cell keeps the drain (timedrun.py refuses no_drain) */
+    if (NO_DRAIN) { k.stop = 1; goto out; }
+    g_drain_claimed++;
+    k.ph = PH_DRAIN; /* a drain op: keeps the load on while measured ops are still running */
+out:
+    pthread_mutex_unlock(&g_claim_mu);
+    if (k.opened) g_tp_tm0 = self_tracerpid();
+    if (k.closed) g_tp_tm1 = self_tracerpid();
+    return k;
 }
 
-/* claim_warm -- a closed-loop claim in the warm-up: its time read under the lock, the warm-up decided at it */
-static int claim_warm(void) {
+/* op_done PH -- an op of phase PH completed: a measured one counts toward the end of the drain (claim_op's stop) */
+static void op_done(int ph) {
+    __atomic_fetch_add(&g_completed, 1, __ATOMIC_RELEASE);
+    if (ph != PH_MEAS) return;
     pthread_mutex_lock(&g_claim_mu);
-    int ph = g_phase;
-    if (ph == PH_WARM) ph = warm_decide_locked(now_ns());
+    g_meas_done++;
+    if (__atomic_load_n(&g_phase, __ATOMIC_ACQUIRE) == PH_DRAIN && g_meas_done >= g_meas_final) all_done_locked();
     pthread_mutex_unlock(&g_claim_mu);
-    return ph;
-}
-
-/* claim_open T -- an open-loop claim, in every phase: the next arrival of the run's one stream into *T and, during
- * the warm-up, the decision at it, in one critical section (the macOS claim_op, 4010ff3b06). Returns the phase. */
-static int claim_open(uint64_t *t) {
-    pthread_mutex_lock(&g_claim_mu);
-    *t = g_arr_t;
-    g_arr_t += (uint64_t)(-log(unif(&g_arr_rng)) * 1e9 / RATE);
-    int ph = g_phase;
-    if (ph == PH_WARM) ph = warm_decide_locked(*t);
-    pthread_mutex_unlock(&g_claim_mu);
-    return ph;
 }
 
 static void *client_main(void *arg) {
@@ -819,37 +1110,37 @@ static void *client_main(void *arg) {
     pthread_cond_broadcast(&g_cv);
     while (__atomic_load_n(&g_phase, __ATOMIC_ACQUIRE) == PH_INIT) pthread_cond_wait(&g_cv, &g_mu);
     pthread_mutex_unlock(&g_mu);
-    if (fail || g_phase == PH_ABORT) return NULL;
+    if (fail || __atomic_load_n(&g_phase, __ATOMIC_ACQUIRE) == PH_ABORT) {
+        __atomic_fetch_add(&g_exited, 1, __ATOMIC_RELEASE);
+        return NULL;
+    }
+#ifdef __linux__
+    /* competitors review 2 item 3: an open-loop client's wake-up lateness is charged to the server, so ask for the
+     * finest timer slack (the kernel's default is 50 us for a non-RT thread); summary.json records whether every
+     * client got it, as the macOS bbload records rt_policy_ok for its time-constraint policy */
+    if (OPEN_LOOP && prctl(PR_SET_TIMERSLACK, 1UL, 0UL, 0UL, 0UL) != 0) __atomic_store_n(&g_timerslack_ok, 0, __ATOMIC_RELAXED);
+#endif
 
-    uint64_t intended = g_t0;
+    uint64_t free_since = g_t0;
     for (uint32_t seq = 0;; seq++) {
         oprec r;
         memset(&r, 0, sizeof r);
-        int ph;
+        /* every phase decision at the claim (claim_op); open loop: the claim is the next arrival, sent at its time */
+        claim_t kc = claim_op(c->id);
+        if (kc.stop) goto done;
+        int ph = kc.ph;
         if (OPEN_LOOP) {
-            /* A23: the next arrival of the run's one stream, and the warm-up decided at it, under the claim lock (the
-             * macOS claim_op); then wait for it. An op intended before the window's end is measured even when it is
-             * claimed after the window closed (AG9), so DRAIN reads as measured here. */
-            int cur = claim_open(&intended);
-            if (cur == PH_ABORT) goto done;
-            for (;;) { /* wait for the intended time in slices, so the window end is noticed */
-                uint64_t tm1 = __atomic_load_n(&g_tm1, __ATOMIC_ACQUIRE);
-                if ((tm1 && intended >= tm1) || g_phase == PH_ABORT) goto done;
+            for (;;) { /* wait for the intended time in slices, so an abort or the end of the drain is noticed */
+                if (__atomic_load_n(&g_phase, __ATOMIC_ACQUIRE) == PH_ABORT) goto done;
+                if (ph == PH_DRAIN && __atomic_load_n(&g_all_done, __ATOMIC_ACQUIRE)) goto done;
                 uint64_t n = now_ns();
-                if (n >= intended) break;
-                sleep_until(intended - n > 10000000 ? n + 10000000 : intended);
-            }
-            ph = cur == PH_WARM ? PH_WARM : PH_MEAS;
-            if (ph == PH_MEAS) __atomic_fetch_add(&g_meas_claimed, 1, __ATOMIC_RELAXED);
-        } else {
-            ph = __atomic_load_n(&g_phase, __ATOMIC_ACQUIRE);
-            if (ph == PH_WARM) ph = claim_warm(); /* A23: decided at this claim, its time read under g_claim_mu */
-            if (ph >= PH_DRAIN) goto done;
-            if (ph == PH_MEAS) {
-                uint64_t k = __atomic_fetch_add(&g_meas_claimed, 1, __ATOMIC_RELAXED);
-                if (MAX_OPS && k >= MAX_OPS) goto done;
+                if (n >= kc.intended) break;
+                sleep_until(kc.intended - n > 10000000 ? n + 10000000 : kc.intended);
             }
         }
+        r.arrival = kc.arrival;
+        r.claim = kc.claim;
+        r.free = free_since;
         ctx_t x = {.c = c->id, .i = seq, .rng = &c->rng, .nv = S.nvar, .op = &r};
         char vbuf[MAXLIST][1024];
         int bad = 0;
@@ -875,7 +1166,7 @@ static void *client_main(void *arg) {
             c1b_opstart(&C1B, ((uint64_t)c->id << 40) | ((uint64_t)seq << 8) | (uint64_t)k, c1bl[k]);
         }
         r.start = now_ns();
-        r.intended = OPEN_LOOP ? intended : r.start;
+        r.intended = OPEN_LOOP ? kc.intended : r.start;
         if (bad) { r.ok = 0; r.err = (int16_t)err_index(w); }
         for (int k = 0; k < S.nstep && r.ok; k++) {
             if (run_step(c, &cur, &have_branch, &S.step[k], &x, w, sizeof w) != 0) { r.ok = 0; r.err = (int16_t)err_index(w); }
@@ -885,7 +1176,10 @@ static void *client_main(void *arg) {
         }
         r.end = now_ns();
         if (V1 && C == 1) v1_set_mark(V1, V1_MARK_IDLE | (MARKB + seq + 1));
-        for (int k = 0; !SKIP_AFTER && k < S.nafter; k++)
+        /* comp review 1 MED 9: each after-step timed apart, as the macOS bbload does (4010ff3b06:1027-1035): it ends at
+         * aft_end[k], after<k+1>_ns in raw.tsv, hdr_after<k+1>.txt and summary after_us; nafter: the after-steps run */
+        r.aft_start = now_ns();
+        for (int k = 0; !SKIP_AFTER && k < S.nafter; r.aft_end[k] = now_ns(), r.nafter = (uint8_t)++k)
             if (run_step(c, &cur, &have_branch, &S.after[k], &x, w, sizeof w) != 0) {
                 int e = err_index(w);
                 if (r.ok) { r.ok = 0; r.err = (int16_t)(1000 + e); } /* the op succeeded; its after-step did not */
@@ -897,15 +1191,41 @@ static void *client_main(void *arg) {
         r.after_end = now_ns();
         if (!conn_alive(&c->home)) reconnect_home(c);
         record(c, &r);
-        __atomic_fetch_add(&g_completed, 1, __ATOMIC_RELEASE);
+        op_done(ph);
+        free_since = r.after_end;
     }
-done:
+done:; /* an empty statement: the declaration of hdl below may not follow a label in C17 (-Wc23-extensions) */
+    /* comp-rev-b15 LOW-1: a home connection that died while idle (every op on branch connections, no teardown) was
+     * never noticed: libpq's status and a MySQL handle change only when used. One untimed SELECT 1 on the home
+     * connection after the last op: a failure is counted (other_err) and refuses the run. A handle already closed
+     * after a lost-connection error was counted when it was lost. */
+    /* comp-rev-67b2 LOW-B, comp-rev-2404 LOW-1/LOW-2: the check is BOUNDED, the whole reply by one deadline
+     * (conn_probe's watchdog, CLOSE_TIMEOUT_S): a dead or hung home is blamed on the home connection (other_err,
+     * rc 3), never reported as an ops stall (rc 4). A failed handle is then ABANDONED (conn_abandon: no further
+     * wait on the peer), so teardown fails at once. comp-rev-a145 LOW-4: on the SUCCESS path too, the home's final
+     * close waits only for what is left of the same deadline (conn_close_until HDL), so probe plus final close never
+     * exceed CLOSE_TIMEOUT_S together. --stall-s must be above CLOSE_TIMEOUT_S (main refuses it otherwise:
+     * LOW-3; run_system.sh uses 600 s, test_probe_shapes.py 8 s). Teardown statements, when a spec has them, run
+     * between the two and are NOT under this deadline (no registered spec has one). A final close that runs out of
+     * the deadline is not counted, as before: the server answered the probe, so the home was alive.
+     * LOW-C, stated: this SELECT 1 runs after this client's last op, untimed and recorded nowhere, but with
+     * --no-drain at C > 1 it can overlap other clients' measured ops, and it falls inside a labelling run's strace
+     * window. It writes nothing (no flush expected; not straced to prove it) and --no-drain cells are refused. */
+    uint64_t hdl = now_ns() + (uint64_t)(CLOSE_TIMEOUT_S * 1e9);
+    if (c->home.pg || c->home.my) {
+        if (conn_probe(&c->home, CLOSE_TIMEOUT_S, w, sizeof w) != 0) {
+            other_fail("home connection lost (found after the last op)", w);
+            conn_abandon(&c->home);
+        }
+    }
     for (int k = 0; k < S.nteardown; k++) {
         char t[8192];
-        if (expand(S.teardown[k], &x0, t, sizeof t, w) == 0) conn_exec(&c->home, t, 0, w, sizeof w);
+        if (expand(S.teardown[k], &x0, t, sizeof t, w) != 0 || conn_exec(&c->home, t, 0, w, sizeof w) != 0)
+            other_fail("teardown", w); /* MED-1: a failed teardown is a failure */
     }
-    conn_close(&c->home);
+    (void)conn_close_until(&c->home, hdl, w, sizeof w); /* LOW-4: the rest of the probe's deadline, not 5 s more */
     if (S.proto == P_MYSQL) mysql_thread_end();
+    __atomic_fetch_add(&g_exited, 1, __ATOMIC_RELEASE); /* the main thread waits for every client to exit */
     return NULL;
 }
 
@@ -913,6 +1233,56 @@ done:
 static int cmp_rec(const void *a, const void *b) {
     const oprec *x = a, *y = b;
     return x->start < y->start ? -1 : x->start > y->start;
+}
+/* The macOS bbload's helpers for the open-loop records (artie 4010ff3b06): arrival order, u64 order, and the
+ * nearest-rank percentile */
+static int cmp_arrival(const void *a, const void *b) {
+    const oprec *x = *(oprec *const *)a, *y = *(oprec *const *)b;
+    return x->arrival < y->arrival ? -1 : x->arrival > y->arrival;
+}
+static int cmp_u64(const void *a, const void *b) {
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return x < y ? -1 : x > y;
+}
+static double pct(const uint64_t *v, size_t n, double p) {
+    if (!n) return 0;
+    size_t i = (size_t)ceil(p / 100.0 * (double)n);
+    return (double)v[i ? i - 1 : 0];
+}
+
+/* Strict numeric flags (the macOS bbload's num_d / num_u, review 4 M8; competitors review 2 items 2 and 7): the whole
+ * string, a finite value, inside the range, or exit 2. parse_u64 is digits only, with no overflow. */
+static int num_d(const char *flag, const char *v, double lo, double hi, double *out) {
+    char *e = NULL;
+    errno = 0;
+    double d = v ? strtod(v, &e) : 0;
+    if (!v || !*v || !e || *e || errno || !isfinite(d) || d < lo || d > hi) {
+        fprintf(stderr, "bbload: %s needs a number in [%g, %g], got '%s'\n", flag, lo, hi, v ? v : "");
+        return -1;
+    }
+    *out = d;
+    return 0;
+}
+static int parse_u64(const char *v, uint64_t lo, uint64_t hi, uint64_t *out) {
+    if (!v || !*v) return -1;
+    uint64_t x = 0;
+    for (const char *p = v; *p; p++) {
+        if (*p < '0' || *p > '9') return -1;
+        uint64_t d = (uint64_t)(*p - '0');
+        if (x > (UINT64_MAX - d) / 10) return -1;
+        x = x * 10 + d;
+    }
+    if (x < lo || x > hi) return -1;
+    *out = x;
+    return 0;
+}
+static int num_u(const char *flag, const char *v, uint64_t lo, uint64_t hi, uint64_t *out) {
+    if (parse_u64(v, lo, hi, out)) {
+        fprintf(stderr, "bbload: %s needs a whole number in [%llu, %llu], got '%s'\n", flag, (unsigned long long)lo,
+                (unsigned long long)hi, v ? v : "");
+        return -1;
+    }
+    return 0;
 }
 
 static void hdr_out(struct hdr_histogram *h, const char *dir, const char *name) {
@@ -926,21 +1296,30 @@ static void hdr_out(struct hdr_histogram *h, const char *dir, const char *name) 
 
 int main(int argc, char **argv) {
     if (argc == 3 && !strcmp(argv[1], "--warmup-replay")) return warmup_replay(argv[2]); /* PREREG annex A23 */
+    if (argc == 3 && !strcmp(argv[1], "--warmup-decide")) return warmup_decide(argv[2]); /* review 2 item 4 */
     const char *specp = NULL, *out = NULL, *v1run = NULL;
     int warm_rule_flag = 0, warm_legacy = 0; /* MED 7: --warmup and --warmup-ops/--warmup-s may not be mixed */
 #ifdef __APPLE__
     mach_timebase_info(&TB);
 #endif
-    snprintf(RUNTAG, sizeof RUNTAG, "r%llx", (unsigned long long)(time(NULL) & 0xffffffff));
+    {   /* comp review 1 MED 7: the default tag had one-second resolution, so back-to-back runs (the driver's
+         * designates) made the same branch names; it is now the realtime second plus its ~1 us fraction */
+        struct timespec rt;
+        clock_gettime(CLOCK_REALTIME, &rt);
+        snprintf(RUNTAG, sizeof RUNTAG, "r%llx%05lx", (unsigned long long)(rt.tv_sec & 0xffffffff),
+                 (unsigned long)(rt.tv_nsec >> 10) & 0xfffffUL);
+    }
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : NULL;
+#define NUMD(flag, var, lo, hi) else if (!strcmp(a, flag) && v) { if (num_d(flag, v, lo, hi, &var)) return 2; i++; }
+#define NUMU(flag, var, lo, hi) else if (!strcmp(a, flag) && v) { if (num_u(flag, v, lo, hi, &var)) return 2; i++; }
         if (!strcmp(a, "--spec") && v) specp = argv[++i];
         else if (!strcmp(a, "--out") && v) out = argv[++i];
         else if (!strcmp(a, "--clients") && v) C = atoi(argv[++i]);
         else if (!strcmp(a, "--mode") && v) { OPEN_LOOP = !strcmp(v, "open"); if (strcmp(v, "open") && strcmp(v, "closed")) { fprintf(stderr, "bbload: --mode closed|open\n"); return 2; } i++; }
-        else if (!strcmp(a, "--rate") && v) RATE = atof(argv[++i]);
-        else if (!strcmp(a, "--warmup-s") && v) { WARM_S = atof(argv[++i]); warm_legacy = 1; }
-        else if (!strcmp(a, "--warmup-ops") && v) { WARM_OPS = strtoull(argv[++i], NULL, 10); warm_legacy = 1; }
+        NUMD("--rate", RATE, 1e-6, 1e9)
+        else if (!strcmp(a, "--warmup-s") && v) { if (num_d(a, v, 0, 1e7, &WARM_S)) return 2; warm_legacy = 1; i++; }
+        else if (!strcmp(a, "--warmup-ops") && v) { if (num_u(a, v, 0, UINT64_MAX, &WARM_OPS)) return 2; warm_legacy = 1; i++; }
         else if (!strcmp(a, "--warmup") && v) {  /* gate-6 review, t3run item 3: OPS:S:MAX_S; PREREG annex A23 */
             unsigned long long wo; double ws, wm; char extra;
             /* S and MAX_S finite (A23-AM1: MAX_S is a bound, 0 ends the warm-up at the first claim) and at most 1e7 s,
@@ -955,13 +1334,14 @@ int main(int argc, char **argv) {
             warm_rule_flag = 1;
             i++;
         }
-        else if (!strcmp(a, "--duration-s") && v) DUR_S = atof(argv[++i]);
-        else if (!strcmp(a, "--min-ops") && v) MIN_OPS = strtoull(argv[++i], NULL, 10);
-        else if (!strcmp(a, "--max-ops") && v) MAX_OPS = strtoull(argv[++i], NULL, 10);
-        else if (!strcmp(a, "--max-window-s") && v) MAXWIN_S = atof(argv[++i]);
-        else if (!strcmp(a, "--stall-s") && v) STALL_S = atof(argv[++i]);
+        NUMD("--duration-s", DUR_S, 0, 1e7)
+        NUMU("--min-ops", MIN_OPS, 0, UINT64_MAX)
+        NUMU("--max-ops", MAX_OPS, 0, UINT64_MAX)
+        NUMD("--max-window-s", MAXWIN_S, 0, 1e8)
+        NUMD("--stall-s", STALL_S, 0, 1e7)
+        NUMD("--max-send-late-us", MAX_SEND_LATE_US, 0, 1e9)
         else if (!strcmp(a, "--run-tag") && v) snprintf(RUNTAG, sizeof RUNTAG, "%s", argv[++i]);
-        else if (!strcmp(a, "--seed") && v) SEED = strtoull(argv[++i], NULL, 10);
+        NUMU("--seed", SEED, 0, UINT64_MAX)
         else if (!strcmp(a, "--v1-run") && v) {
             v1run = argv[++i];
 #if !BB_HOOKS
@@ -982,6 +1362,7 @@ int main(int argc, char **argv) {
         }
         else if (!strcmp(a, "--allow-errors")) ALLOW_ERR = 1;
         else if (!strcmp(a, "--skip-after")) SKIP_AFTER = 1;
+        else if (!strcmp(a, "--no-drain")) NO_DRAIN = 1;
         else if (!strcmp(a, "--set") && v) {
             char *eq = strchr(argv[++i], '=');
             if (!eq || NSET >= MAXLIST) { fprintf(stderr, "bbload: --set k=v\n"); return 2; }
@@ -989,8 +1370,16 @@ int main(int argc, char **argv) {
             SETK[NSET] = argv[i];
             SETV[NSET++] = eq + 1;
         } else { fprintf(stderr, "bbload: bad argument %s (see the header of bbload.c)\n", a); return 2; }
+#undef NUMD
+#undef NUMU
     }
     if (!specp || !out || C < 1) { fprintf(stderr, "usage: bbload --spec FILE --out DIR --clients C ...\n"); return 2; }
+    /* comp-rev-a145 LOW-3: the end-of-run home probe and the final home close share one CLOSE_TIMEOUT_S deadline,
+     * so a --stall-s at or below it would report a slow or hung home as an ops stall (rc 4): refused */
+    if (STALL_S <= CLOSE_TIMEOUT_S) {
+        fprintf(stderr, "bbload: --stall-s %.3f must be above the home probe's %.1f s bound\n", STALL_S, CLOSE_TIMEOUT_S);
+        return 2;
+    }
     if (warm_rule_flag && warm_legacy) {  /* lead review 62430d8bf..b49fb656a MED 7 */
         fprintf(stderr, "bbload: REFUSED: --warmup OPS:S:MAX_S together with --warmup-ops/--warmup-s (the effective "
                         "warm-up and the recorded rule would differ)\n");
@@ -1008,11 +1397,22 @@ int main(int argc, char **argv) {
     }
     WARM_S_NS = (uint64_t)(WARM_S * 1e9);
     WARM_MAX_NS = (uint64_t)(WARM_MAX_S * 1e9);
+    DUR_NS = (uint64_t)(DUR_S * 1e9);
+    MAXWIN_NS = (uint64_t)(MAXWIN_S * 1e9);
     if (OPEN_LOOP && RATE <= 0) { fprintf(stderr, "bbload: open loop needs --rate > 0\n"); return 2; }
     if (OPEN_LOOP && MAX_OPS) { fprintf(stderr, "bbload: --max-ops is closed-loop only\n"); return 2; }
     if (DUR_S <= 0 && MIN_OPS == 0 && MAX_OPS == 0) { fprintf(stderr, "bbload: set --duration-s, --min-ops or --max-ops\n"); return 2; }
     char *spectext = NULL;
     if (load_spec(specp, &spectext) != 0) return 2;
+    if (OPEN_LOOP) { /* the macOS bbload's review 4 M6 (comp review 1 LOW 23, review 2 item 5) */
+        int branch = 0;
+        for (int k = 0; k < S.nstep; k++) branch |= S.step[k].k == K_CONNECT || S.step[k].k == K_CLOSE || S.step[k].serial;
+        if (S.nafter || branch) {
+            fprintf(stderr, "bbload: REFUSED: open loop with after-steps, a branch connection or sql-serial would charge "
+                            "their time to the server as queueing; run it closed loop\n");
+            return 2;
+        }
+    }
     if (mkdir(out, 0755) != 0) { fprintf(stderr, "bbload: REFUSED: out dir %s must not exist: %s\n", out, strerror(errno)); return 2; }
     if (v1run) {
 #if BB_HOOKS
@@ -1029,7 +1429,7 @@ int main(int argc, char **argv) {
     /* The connector must be initialised once before any thread calls mysql_init. */
     if (S.proto == P_MYSQL && mysql_library_init(0, NULL, NULL)) { fprintf(stderr, "bbload: mysql_library_init failed\n"); return 2; }
     CL = calloc((size_t)C, sizeof *CL);
-    /* The open-loop arrival stream, verbatim from the macOS bbload at artie 4010ff3b06 (claim_open draws it) */
+    /* The open-loop arrival stream, verbatim from the macOS bbload at artie 4010ff3b06 (claim_op draws it) */
     g_arr_rng = (SEED * 0xA24BAED4963EE407ULL) ^ 0x9FB21C651E98DF25ULL; /* the arrival stream: --seed alone (#25) */
     if (!g_arr_rng) g_arr_rng = 1;
     pthread_attr_t at;
@@ -1045,12 +1445,17 @@ int main(int argc, char **argv) {
     while (g_nready + g_nfailed < C) pthread_cond_wait(&g_cv, &g_mu);
     int failed = g_nfailed;
     /* No warm-up asked for (all of OPS, S and MAX_S zero): the run starts in the measured phase, so --max-ops N makes
-     * exactly N ops. With a warm phase the first 1 ms tick let every client claim a warm op first, so an untimed
-     * N-op run (the prebranch) made about N + C (lead review 62430d8bf..b49fb656a, MED 3 / HIGH 1). */
+     * exactly N ops at C=1 (claim_op ends the window at the claim of op N+1, after op N completed, and stops). With a
+     * warm phase an untimed N-op run would make warm-up ops too (lead review 62430d8bf..b49fb656a, MED 3 / HIGH 1).
+     * The window's start state is stamped BEFORE the phase opens, so a claim cannot close the window first. */
     int nowarm = WARM_OPS == 0 && WARM_S == 0 && WARM_MAX_S == 0;
     g_t0 = now_ns();
     g_arr_t = g_t0; /* the arrival stream starts at t0 (macOS bbload, 4010ff3b06), set under g_mu before any claim */
-    if (nowarm && !failed) __atomic_store_n(&g_tm0, g_t0, __ATOMIC_RELEASE);
+    if (nowarm && !failed) {
+        getrusage(RUSAGE_SELF, &g_ru0);
+        g_tp_tm0 = self_tracerpid();
+        __atomic_store_n(&g_tm0, g_t0, __ATOMIC_RELEASE);
+    }
     __atomic_store_n(&g_phase, failed ? PH_ABORT : (nowarm ? PH_MEAS : PH_WARM), __ATOMIC_RELEASE);
     pthread_cond_broadcast(&g_cv);
     pthread_mutex_unlock(&g_mu);
@@ -1061,47 +1466,28 @@ int main(int argc, char **argv) {
         return 2;
     }
     if (V1 && C > 1) v1_set_mark(V1, MARKB + (nowarm ? PH_MEAS : PH_WARM));
-    struct rusage ru1;
-    if (nowarm) { getrusage(RUSAGE_SELF, &g_ru0); g_tp_tm0 = self_tracerpid(); }
+    /* Every phase is decided at the claims (claim_op): this thread only watches for a stall and for every client to
+     * exit, which they do once the drain has seen every measured op complete. */
     uint64_t last_done = 0, last_progress = now_ns();
-    int stalled = 0, short_window = 0;
+    int stalled = 0;
     for (;;) {
         struct timespec ts = {0, 1000000};
         nanosleep(&ts, NULL);
-        /* The phase first, then the clock: a claim that ended the warm-up stored g_tm0 before PH_MEAS (release), so a
-         * clock read after this acquire is not before it (the guard below keeps a cross-CPU read from going negative). */
-        int ph = __atomic_load_n(&g_phase, __ATOMIC_ACQUIRE);
+        if (__atomic_load_n(&g_exited, __ATOMIC_ACQUIRE) >= (uint64_t)C) break;
         uint64_t n = now_ns(), done = __atomic_load_n(&g_completed, __ATOMIC_ACQUIRE);
         if (done != last_done) { last_done = done; last_progress = n; }
         else if ((n - last_progress) / 1e9 > STALL_S) { stalled = 1; break; }
-        /* the warm-up is no longer decided here: claim_warm decides it at each claim (PREREG annex A23) */
-        if (ph == PH_MEAS) {
-            uint64_t tm0 = __atomic_load_n(&g_tm0, __ATOMIC_ACQUIRE);
-            double el = n > tm0 ? (n - tm0) / 1e9 : 0;
-            /* The duration/min-ops clause applies only when one of them was asked for: with --max-ops alone,
-             * "el >= 0 && claimed >= 0" held at once and closed the window before any op was measured. */
-            int timed = DUR_S > 0 || MIN_OPS > 0;
-            int end = (timed && el >= DUR_S && g_meas_claimed >= MIN_OPS) || (MAX_OPS && g_meas_claimed >= MAX_OPS);
-            if (!end && el > MAXWIN_S) { end = 1; short_window = 1; }
-            if (end) {
-                getrusage(RUSAGE_SELF, &ru1);
-                __atomic_store_n(&g_tm1, n, __ATOMIC_RELEASE);
-                __atomic_store_n(&g_phase, PH_DRAIN, __ATOMIC_RELEASE);
-                if (V1 && C > 1) v1_set_mark(V1, MARKB + PH_DRAIN);
-                g_tp_tm1 = self_tracerpid();
-                break;
-            }
-        }
     }
     if (stalled) {
         fprintf(stderr, "bbload: STALL: no operation completed for %.0f s (phase %d, completed %llu); exiting without draining\n",
-                STALL_S, g_phase, (unsigned long long)g_completed);
+                STALL_S, __atomic_load_n(&g_phase, __ATOMIC_ACQUIRE), (unsigned long long)g_completed);
         _exit(4);
     }
     for (int i = 0; i < C; i++) pthread_join(CL[i].th, NULL);
     if (V1) v1_set_mark(V1, 0);
 
-    /* Raw first. */
+    /* Raw first. NA: the after-steps every op ran (none under --skip-after), each timed apart (comp review 1 MED 9) */
+    const int NA = SKIP_AFTER ? 0 : S.nafter;
     size_t total = 0;
     for (int i = 0; i < C; i++) total += CL[i].nrec;
     oprec *all = malloc((total ? total : 1) * sizeof *all);
@@ -1111,18 +1497,28 @@ int main(int argc, char **argv) {
     snprintf(p, sizeof p, "%s/raw.tsv", out);
     f = fopen(p, "w");
     if (!f) { fprintf(stderr, "bbload: raw.tsv: %s\n", strerror(errno)); return 2; }
-    fprintf(f, "client\tseq\tphase\tok\tintended_ns\tstart_ns\tend_ns\tlat_ns");
+    /* The macOS bbload's columns (artie 4010ff3b06) for the claim: arrival, free_ns, claim_ns, and send_late_ns =
+     * start - max(intended, free), empty in closed loop (0 by construction there) */
+    fprintf(f, "client\tseq\tphase\tok\tarrival\tfree_ns\tclaim_ns\tintended_ns\tstart_ns\tend_ns\tlat_ns\tsend_late_ns");
     for (int s = 0; s < S.nstep; s++) fprintf(f, "\tstep%d_ns", s + 1);
-    fprintf(f, "\tafter_ns\tserial_wait_ns\tserial_waits\terr\n");
+    for (int s = 0; s < NA; s++) fprintf(f, "\tafter%d_ns", s + 1); /* the macOS columns (4010ff3b06:1183) */
+    fprintf(f, "\tafter_ns\tserial_wait_ns\tserial_waits\terr\n"); /* serial_wait*: Codex C04 */
     for (size_t r = 0; r < total; r++) {
         oprec *o = &all[r];
-        fprintf(f, "%u\t%u\t%s\t%u\t%llu\t%llu\t%llu\t%llu", o->client, o->seq,
-                o->phase == PH_MEAS ? "measure" : o->phase == PH_WARM ? "warmup" : "drain", o->ok,
-                (unsigned long long)o->intended, (unsigned long long)o->start, (unsigned long long)o->end,
-                (unsigned long long)(o->end - o->intended));
+        uint64_t base = o->intended > o->free ? o->intended : o->free;
+        fprintf(f, "%u\t%u\t%s\t%u\t%u\t%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t", o->client, o->seq,
+                o->phase == PH_MEAS ? "measure" : o->phase == PH_WARM ? "warmup" : "drain", o->ok, o->arrival,
+                (unsigned long long)o->free, (unsigned long long)o->claim, (unsigned long long)o->intended,
+                (unsigned long long)o->start, (unsigned long long)o->end, (unsigned long long)(o->end - o->intended));
+        if (OPEN_LOOP) fprintf(f, "%llu", (unsigned long long)(o->start > base ? o->start - base : 0));
         uint64_t prev = o->start;
         for (int s = 0; s < S.nstep; s++) {
             if (s < o->nsteps) { fprintf(f, "\t%llu", (unsigned long long)(o->step_end[s] - prev)); prev = o->step_end[s]; }
+            else fprintf(f, "\t");
+        }
+        prev = o->aft_start;
+        for (int s = 0; s < NA; s++) {
+            if (s < o->nafter) { fprintf(f, "\t%llu", (unsigned long long)(o->aft_end[s] - prev)); prev = o->aft_end[s]; }
             else fprintf(f, "\t");
         }
         fprintf(f, "\t%llu\t%llu\t", (unsigned long long)(o->after_end - o->end),
@@ -1150,12 +1546,21 @@ int main(int argc, char **argv) {
     if (fclose(f) != 0) { fprintf(stderr, "bbload: backends.tsv close failed\n"); return 2; }
 
     /* Summary from the raw records. */
-    struct hdr_histogram *ht, *hs[MAXSTEPS];
+    struct hdr_histogram *ht, *hs[MAXSTEPS], *ha[MAXAFTER];
     hdr_init(1, INT64_C(3600000000000), 3, &ht);
     for (int s = 0; s < S.nstep; s++) hdr_init(1, INT64_C(3600000000000), 3, &hs[s]);
-    uint64_t meas = 0, meas_ok = 0, meas_err = 0, in_window_done = 0;
+    for (int s = 0; s < NA; s++) hdr_init(1, INT64_C(3600000000000), 3, &ha[s]);
+    uint64_t meas = 0, meas_ok = 0, meas_err = 0, in_window_done = 0, drain = 0;
+    /* comp-rev-dolt250 HIGH-1: a failed op is a failure in EVERY phase. Only measured failures used to count, so a
+     * warm-up or drain op lost to a recovered server panic (sql-serial narrows Dolt's delete race, it does not close
+     * it) left the run rc 0 and appeared nowhere. */
+    /* other_err: failures outside any op (teardown, reconnect, reconnect setup: MED-1), plus a recorded op in no
+     * phase above, which claim_op never makes today (comp-rev-failcount LOW-1) */
+    uint64_t warm_err = 0, drain_err = 0, other_err = __atomic_load_n(&g_other_err, __ATOMIC_ACQUIRE);
     double sum = 0;
-    long double inflight_ns = 0;
+    uint64_t *late = malloc((total ? total : 1) * sizeof *late);
+    size_t nlate = 0;
+    long double inflight_ns = 0; /* Codex C04: effective concurrency */
     long double serial_waiter_ns = 0;
     for (size_t r = 0; r < total; r++) {
         oprec *o = &all[r];
@@ -1170,8 +1575,16 @@ int main(int argc, char **argv) {
             if (hi > lo) serial_waiter_ns += hi - lo;
         }
         if (o->end >= g_tm0 && o->end <= g_tm1 && o->ok) in_window_done++;
+        if (o->phase == PH_DRAIN) drain++;
+        if (!o->ok && o->phase != PH_MEAS) {
+            if (o->phase == PH_WARM) warm_err++;
+            else if (o->phase == PH_DRAIN) drain_err++;
+            else other_err++;
+        }
         if (o->phase != PH_MEAS) continue;
         meas++;
+        uint64_t base = o->intended > o->free ? o->intended : o->free;
+        late[nlate++] = o->start > base ? o->start - base : 0;
         if (!o->ok) { meas_err++; continue; }
         meas_ok++;
         uint64_t lat = o->end - o->intended;
@@ -1179,9 +1592,59 @@ int main(int argc, char **argv) {
         hdr_record_value(ht, (int64_t)lat);
         uint64_t prev = o->start;
         for (int s = 0; s < o->nsteps; s++) { hdr_record_value(hs[s], (int64_t)(o->step_end[s] - prev)); prev = o->step_end[s]; }
+        prev = o->aft_start;
+        for (int s = 0; s < o->nafter && s < NA; s++) { hdr_record_value(ha[s], (int64_t)(o->aft_end[s] - prev)); prev = o->aft_end[s]; }
     }
     hdr_out(ht, out, "hdr_total.txt");
     for (int s = 0; s < S.nstep; s++) { char nm[32]; snprintf(nm, sizeof nm, "hdr_step%d.txt", s + 1); hdr_out(hs[s], out, nm); }
+    for (int s = 0; s < NA; s++) { char nm[32]; snprintf(nm, sizeof nm, "hdr_after%d.txt", s + 1); hdr_out(ha[s], out, nm); }
+    qsort(late, nlate, sizeof *late, cmp_u64);
+    double late_p50 = pct(late, nlate, 50) / 1e3, late_p99 = pct(late, nlate, 99) / 1e3, late_max = nlate ? late[nlate - 1] / 1e3 : 0;
+    free(late);
+    /* Open loop, as the macOS bbload computes them (artie 4010ff3b06; competitors review 2 items 2 and 3): pool_late
+     * (another client's harness delay counts too), FIFO violations, and the schedule hash over the warm-up and
+     * measured arrivals (FNV-1a over each intended - t0's 8 little-endian bytes, in arrival order) */
+    double pool_p50 = 0, pool_p99 = 0, pool_max = 0;
+    uint64_t sched_hash = 1469598103934665603ULL, sched_n = 0;
+    long fifo_bad = -1;
+    if (OPEN_LOOP && total) {
+        oprec **byarr = malloc(total * sizeof *byarr);
+        size_t na = 0;
+        for (size_t r = 0; r < total; r++) byarr[na++] = &all[r];
+        qsort(byarr, na, sizeof *byarr, cmp_arrival);
+        uint64_t *suf = malloc((na + 1) * sizeof *suf), *pl = malloc((na ? na : 1) * sizeof *pl);
+        suf[na] = UINT64_MAX;
+        for (size_t i = na; i-- > 0;) suf[i] = byarr[i]->free < suf[i + 1] ? byarr[i]->free : suf[i + 1];
+        size_t npl = 0;
+        for (size_t i = 0; i < na; i++) {
+            oprec *o = byarr[i];
+            if (o->phase != PH_DRAIN) {
+                uint64_t off = o->intended - g_t0;
+                for (int b = 0; b < 8; b++) { sched_hash ^= (off >> (8 * b)) & 0xff; sched_hash *= 1099511628211ULL; }
+                sched_n++;
+            }
+            if (o->phase != PH_MEAS) continue;
+            uint64_t base = o->intended > suf[i] ? o->intended : suf[i];
+            pl[npl++] = o->start > base ? o->start - base : 0;
+        }
+        qsort(pl, npl, sizeof *pl, cmp_u64);
+        pool_p50 = pct(pl, npl, 50) / 1e3;
+        pool_p99 = pct(pl, npl, 99) / 1e3;
+        pool_max = npl ? pl[npl - 1] / 1e3 : 0;
+        /* FIFO: a measured arrival that waited > 50 us although some LATER arrival had been claimed before it was */
+        uint64_t *csuf = malloc((na + 1) * sizeof *csuf);
+        csuf[na] = UINT64_MAX;
+        for (size_t i = na; i-- > 0;) csuf[i] = byarr[i]->claim < csuf[i + 1] ? byarr[i]->claim : csuf[i + 1];
+        fifo_bad = 0;
+        for (size_t i = 0; i < na; i++) {
+            oprec *a = byarr[i];
+            if (a->phase == PH_MEAS && a->start > a->intended + 50000 && csuf[i + 1] < a->claim) fifo_bad++;
+        }
+        free(csuf);
+        free(suf);
+        free(pl);
+        free(byarr);
+    }
     double win = (g_tm1 - g_tm0) / 1e9;
     double mean_inflight = g_tm1 > g_tm0 ? (double)(inflight_ns / (g_tm1 - g_tm0)) : 0;
     int sql_serial = 0;
@@ -1190,17 +1653,31 @@ int main(int argc, char **argv) {
     double mean_serial_waiters = g_tm1 > g_tm0 ? (double)(serial_waiter_ns / (g_tm1 - g_tm0)) : 0;
     double effective_c = C - mean_serial_waiters;
     int reduced_concurrency = effective_c < C - 0.5;
-    double cpu = (ru1.ru_utime.tv_sec - g_ru0.ru_utime.tv_sec) + (ru1.ru_utime.tv_usec - g_ru0.ru_utime.tv_usec) / 1e6 +
-                 (ru1.ru_stime.tv_sec - g_ru0.ru_stime.tv_sec) + (ru1.ru_stime.tv_usec - g_ru0.ru_stime.tv_usec) / 1e6;
+    double cpu = (g_ru1.ru_utime.tv_sec - g_ru0.ru_utime.tv_sec) + (g_ru1.ru_utime.tv_usec - g_ru0.ru_utime.tv_usec) / 1e6 +
+                 (g_ru1.ru_stime.tv_sec - g_ru0.ru_stime.tv_sec) + (g_ru1.ru_stime.tv_usec - g_ru0.ru_stime.tv_usec) / 1e6;
     int rc = 0;
     const char *verdict = "ok";
+    char vbuf[256];
     if (meas_ok == 0) { rc = 3; verdict = "REFUSED: no measured operation succeeded"; }
     /* gate-6 review, t3run item 16; lead review 62430d8bf..b49fb656a MED 5: with --max-ops, the window cap is the
      * registered per-run cap, and a run it ended is reported, not judged: rc 0, verdict "capped", capped: true and its
      * counts; timedrun.py alone applies PREREG's tiers (>= 1000 ok complete, 100-999 p50 only, fewer failed). */
     else if (meas_err && !ALLOW_ERR) { rc = 3; verdict = "REFUSED: measured operations failed (see errors.txt; --allow-errors to accept)"; }
-    else if (short_window && MAX_OPS) verdict = "capped";
-    else if (short_window && !MAX_OPS) { rc = 3; verdict = "REFUSED: --min-ops not reached within --max-window-s"; }
+    else if ((warm_err || drain_err || other_err || g_reconnects) && !ALLOW_ERR) {
+        /* comp-rev-dolt250 HIGH-1: a lost home connection is a failure too, even when the next op succeeds on the new one */
+        rc = 3;
+        snprintf(vbuf, sizeof vbuf, "REFUSED: %llu warm-up, %llu drain and %llu other op(s) failed, %llu home "
+                 "reconnect(s) (see errors.txt; --allow-errors to accept)", (unsigned long long)warm_err,
+                 (unsigned long long)drain_err, (unsigned long long)other_err, (unsigned long long)g_reconnects);
+        verdict = vbuf;
+    }
+    else if (OPEN_LOOP && (late_p99 > MAX_SEND_LATE_US || pool_p99 > MAX_SEND_LATE_US)) {
+        rc = 3; /* the macOS bbload's amendment 48 rule (competitors review 2 item 3) */
+        snprintf(vbuf, sizeof vbuf, "VOID: p99 send lateness %.1f us (pool-wide %.1f us) > %.0f us", late_p99, pool_p99, MAX_SEND_LATE_US);
+        verdict = vbuf;
+    }
+    else if (g_cap_hit && MAX_OPS) verdict = "capped";
+    else if (g_cap_hit && !MAX_OPS) { rc = 3; verdict = "REFUSED: --min-ops not reached within --max-window-s"; }
     snprintf(p, sizeof p, "%s/summary.json", out);
     f = fopen(p, "w");
     fprintf(f, "{\"verdict\":\"%s\",\"rc\":%d,\"spec\":\"%s\",\"run_tag\":\"%s\",\"clients\":%d,\"mode\":\"%s\",\"rate\":%.3f,"
@@ -1210,19 +1687,44 @@ int main(int argc, char **argv) {
                "\"client_cpu_s\":%.3f,\"client_cpu_cores\":%.3f,\"v1_run\":\"%s\",\"v1_mark_base\":%llu,",
             verdict, rc, specp, RUNTAG, C, OPEN_LOOP ? "open" : "closed", RATE, S.proto == P_PG ? "pg" : "mysql", win,
             (unsigned long long)meas, (unsigned long long)meas_ok, (unsigned long long)meas_err,
-            (unsigned long long)g_warm_claimed, total, (unsigned long long)g_reconnects,
+            (unsigned long long)g_warm.claimed, total, (unsigned long long)g_reconnects,
             win > 0 ? meas_ok / win : 0, win > 0 ? in_window_done / win : 0, cpu, win > 0 ? cpu / win : 0,
             v1run ? v1run : "", (unsigned long long)MARKB);
+    fprintf(f, "\"warmup_err\":%llu,\"drain_err\":%llu,\"other_err\":%llu,\"failed_ops\":%llu,", /* HIGH-1: every phase */
+            (unsigned long long)warm_err, (unsigned long long)drain_err, (unsigned long long)other_err,
+            (unsigned long long)(meas_err + warm_err + drain_err + other_err));
     fprintf(f, "\"clock\":\"%s\",\"hooks\":%d,", BB_CLOCK_NAME, BB_HOOKS); /* Linux port: which clock stamped the ops */
-    fprintf(f, "\"capped\":%s,\"max_window_s\":%.3f,", short_window ? "true" : "false", MAXWIN_S);
-    fprintf(f, "\"after_steps\":%d,\"skip_after\":%s,", S.nafter, SKIP_AFTER ? "true" : "false");
-    fprintf(f, "\"tm0_ns\":%llu,\"tm1_ns\":%llu,\"mean_inflight\":%.12f,"
-               "\"mean_serial_waiters\":%.12f,\"effective_c\":%.12f,\"sql_serial\":%s,"
+    fprintf(f, "\"capped\":%s,\"max_window_s\":%.3f,", g_cap_hit ? "true" : "false", MAXWIN_S);
+    fprintf(f, "\"after_steps\":%d,\"skip_after\":%s,\"no_drain\":%s,", S.nafter, SKIP_AFTER ? "true" : "false",
+            NO_DRAIN ? "true" : "false");
+    /* comp review 1 MED 9: what tput_* count. A client claims its next op only after this op's untimed after-steps,
+     * so with after-steps run they count CYCLES (an op and its after-steps), not ops. A branch connection's close
+     * with no after-step (--skip-after, or pg18-m1-c1b) is also untimed client work before the next claim, and is
+     * not in this label: no throughput is read from those runs (the driver's designated branches, the kept arm and
+     * the C1b helper) */
+    fprintf(f, "\"tput_unit\":\"%s\",", NA ? "cycle" : "op");
+    /* claim_op's window, stamped at claims on the run's clock (t0, tm0, tm1), the measured count it fixed, and the
+     * drain ops it ran after tm1 (comp review 1 LOW 40, review 2 item 1); the arrival stream's identity (seed always;
+     * schedule_hash and schedule_arrivals in open loop) and its lateness record (review 2 items 2 and 3) */
+    fprintf(f, "\"t0_ns\":%llu,\"tm0_ns\":%llu,\"tm1_ns\":%llu,\"drain_ops\":%llu,\"drain_claims\":%llu,\"seed\":%llu,",
+            (unsigned long long)g_t0, (unsigned long long)g_tm0, (unsigned long long)g_tm1, (unsigned long long)drain,
+            (unsigned long long)g_drain_claimed, (unsigned long long)SEED);
+    if (OPEN_LOOP)
+        fprintf(f, "\"send_late_us\":{\"p50\":%.2f,\"p99\":%.2f,\"max\":%.2f},\"pool_late_us\":{\"p50\":%.2f,\"p99\":%.2f,\"max\":%.2f},"
+                   "\"fifo_violations\":%ld,\"schedule_hash\":\"%016llx\",\"schedule_arrivals\":%llu,\"timerslack_ok\":%s,",
+                late_p50, late_p99, late_max, pool_p50, pool_p99, pool_max, fifo_bad, (unsigned long long)sched_hash,
+                (unsigned long long)sched_n, g_timerslack_ok ? "true" : "false");
+    else fprintf(f, "\"send_late_us\":null,\"pool_late_us\":null,\"fifo_violations\":null,\"schedule_hash\":null,"
+                    "\"schedule_arrivals\":null,\"timerslack_ok\":null,");
+    fprintf(f, "\"max_send_late_us\":%.1f,", MAX_SEND_LATE_US);
+    /* Codex C04 (sql-serial per the lead's corrected rule, DECISIONS 4317e92c2b): the effective concurrency and its
+     * label (tm0_ns and tm1_ns are written once, above) */
+    fprintf(f, "\"mean_inflight\":%.12f,\"mean_serial_waiters\":%.12f,\"effective_c\":%.12f,\"sql_serial\":%s,"
                "\"concurrency_label\":\"%s\",\"c_label_credit\":%s,\"serial_delete_note\":\"%s\",",
-            (unsigned long long)g_tm0, (unsigned long long)g_tm1, mean_inflight, mean_serial_waiters, effective_c,
+            mean_inflight, mean_serial_waiters, effective_c,
             sql_serial ? "true" : "false", reduced_concurrency ? "REDUCED-CONCURRENCY" : "registered",
             reduced_concurrency ? "false" : "true",
-            sql_serial && C > 1 ? "Dolt 2.4.1 concurrent-delete panic: deletes serialized; see DECISIONS 2026-10-09T18:51:35Z" : "");
+            sql_serial && C > 1 ? "Dolt 2.4.1/2.5.0 concurrent-delete panic and server crash: deletes serialized, which narrows the race and does not close it; see DECISIONS 2026-10-09T18:51:35Z" : "");
     {   /* MED 4: the measured window on CLOCK_REALTIME (the tracer sweeps' clock), mapped through one offset read now,
          * and the load generator's own TracerPid at its start and end */
         struct timespec rt;
@@ -1234,14 +1736,14 @@ int main(int argc, char **argv) {
     /* MED 7: the recorded rule is formatted from the EFFECTIVE values, never copied from the command line */
     snprintf(WARM_RULE, sizeof WARM_RULE, "%llu:%g:%g", (unsigned long long)WARM_OPS, WARM_S, WARM_MAX_S);
     fprintf(f, "\"warmup_rule\":\"%s\",\"warmup_s\":%.6f,", WARM_RULE, g_tm0 > g_t0 ? (g_tm0 - g_t0) / 1e9 : 0.0);
-    /* PREREG annex A23: the warm-up as claim_warm decided it -- the ending claim (ns since t0; 0 with no warm-up),
-     * whether it ended capped, and the last warm-up claim (null when none was claimed) -- so timedrun.py can check
-     * the decision exactly instead of within a poll's slack */
-    fprintf(f, "\"warmup_capped\":%s,\"warmup_end_ns\":", g_warm_capped ? "true" : "false");
-    if (g_tm0) fprintf(f, "%llu,", (unsigned long long)g_warm_end_ns); else fprintf(f, "null,");
+    /* PREREG annex A23: the warm-up as claim_op decided it (warm_step) -- the ending claim (ns since t0; 0 with no
+     * warm-up), whether it ended capped, the last warm-up claim (null when none was claimed) and the backsteps -- so
+     * timedrun.py can check the decision exactly instead of within a poll's slack */
+    fprintf(f, "\"warmup_capped\":%s,\"warmup_end_ns\":", g_warm.capped ? "true" : "false");
+    if (g_tm0) fprintf(f, "%llu,", (unsigned long long)g_warm.end_el); else fprintf(f, "null,");
     fprintf(f, "\"warmup_last_claim_ns\":");
-    if (g_warm_any) fprintf(f, "%llu,", (unsigned long long)g_warm_last_ns); else fprintf(f, "null,");
-    fprintf(f, "\"warmup_backsteps\":%llu,\"loop\":\"%s\",", (unsigned long long)g_warm_backsteps,
+    if (g_warm.any) fprintf(f, "%llu,", (unsigned long long)g_warm.last_el); else fprintf(f, "null,");
+    fprintf(f, "\"warmup_backsteps\":%llu,\"loop\":\"%s\",", (unsigned long long)g_warm.backsteps,
             OPEN_LOOP ? "open" : "closed"); /* loop: the run's loop mode (timedrun.py applies the order checks to both) */
     fprintf(f, "\"lat_us\":{\"p50\":%.1f,\"p90\":%.1f,\"p99\":%.1f,\"p999\":%s%.1f%s,\"max\":%.1f,\"mean\":%.1f},",
             hdr_value_at_percentile(ht, 50) / 1e3, hdr_value_at_percentile(ht, 90) / 1e3, hdr_value_at_percentile(ht, 99) / 1e3,
@@ -1252,6 +1754,14 @@ int main(int argc, char **argv) {
         fprintf(f, "%s{\"step\":%d,\"kind\":\"%s\",\"p50\":%.1f,\"p99\":%.1f}", s ? "," : "", s + 1,
                 S.step[s].k == K_SQL ? "sql" : S.step[s].k == K_WRITE ? "write" : S.step[s].k == K_CONNECT ? "connect" : "close",
                 hdr_value_at_percentile(hs[s], 50) / 1e3, hdr_value_at_percentile(hs[s], 99) / 1e3);
+    /* comp review 1 MED 9: each after-step apart over the measured ok ops, as the macOS after_us (4010ff3b06:1470) --
+     * M4's separately timed delete; a sql-serial step's time includes its wait for the one-at-a-time lock */
+    fprintf(f, "],\"after_us\":[");
+    for (int s = 0; s < NA; s++)
+        fprintf(f, "%s{\"after\":%d,\"kind\":\"%s\",\"p50\":%.1f,\"p99\":%.1f}", s ? "," : "", s + 1,
+                S.after[s].serial ? "sql-serial" : S.after[s].k == K_SQL ? "sql" : S.after[s].k == K_WRITE ? "write"
+                : S.after[s].k == K_CONNECT ? "connect" : "close",
+                hdr_value_at_percentile(ha[s], 50) / 1e3, hdr_value_at_percentile(ha[s], 99) / 1e3);
     fprintf(f, "],\"errors\":%d}\n", g_nerr);
     fclose(f);
     printf("bbload %s: C=%d %s window %.2fs measured %llu ok %llu err %llu  tput %.1f/s  p50 %.1f us p99 %.1f us  client cpu %.2f cores -> %s\n",

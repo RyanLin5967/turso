@@ -16,9 +16,9 @@ What SHOULD be there is never taken from what is there (review finding 11):
 A matrix with include:/exclude: entries is refused (this parser reads only the runner, fs and system lists).
 Prints, tab-separated:
   JOBS     artifact, firecheck verdict, functional verdict, failed functional lines
-  TIMED    artifact, cell, timed.json verdict (only the cells whose timed run is not ok; 'ok-smoke-warmup' is ok
-           only in a smoke job, run-info dry=1)
-  PARAMS   one line: the run's one cap_s and warm-up rule, or why the jobs differ (MED 7)
+  TIMED    artifact, cell, timed.json verdict (only the cells whose timed run is not what the job needs: 'ok-smoke'
+           in a smoke job, run-info dry=1; 'ok' in a real one, dry=0; comp review 1 LOW 15)
+  PARAMS   one line: the run's one cap_s, warm-up rule and dry value, or why the jobs differ (MED 7, LOW 15)
   FIXTURE  one line: the run's one parent fixture, or why the jobs' fixtures differ
   DRIVES   artifact, drive class (drive.py CLASSES), whether a flush reaches the drive (no filesystem in the chain
            mounted nobarrier), disks, device chain
@@ -229,23 +229,30 @@ def main(argv):
                 tv = json.load(open(tj)).get("verdict")
             except (OSError, ValueError) as e:
                 tv = f"MISSING ({e.__class__.__name__})"
-            # MED 7: 'ok-smoke-warmup' (a clean cell warmed up by the CI smoke cap, not the registered rule) stands
-            # only in a smoke job (run-info dry=1); a real run needs 'ok'
-            if tv != "ok" and not (tv == "ok-smoke-warmup" and run_param(a, "dry") == "1"):
-                print(f"TIMED\t{name}\t{cell}\t{tv}")
+            # MED 7 and comp review 1 LOW 15: a smoke job (run-info dry=1) stands only with 'ok-smoke' (timedrun.py
+            # gives a clean smoke cell that verdict whatever its rule, so it can never read 'ok'), a real job (dry=0)
+            # only with 'ok'
+            want_tv = {"1": "ok-smoke", "0": "ok"}.get(run_param(a, "dry"))
+            if tv == "ok-exploratory-n" and want_tv == "ok":
+                # the lead's LOW 21 ruling: a prebranch beyond the registered 1,000 is exploratory, never credited
+                print(f"TIMED\t{name}\t{cell}\t{tv} (exploratory: N beyond the registered 1,000, NOT CREDITED)")
+            elif tv != want_tv:
+                print(f"TIMED\t{name}\t{cell}\t{tv} (want {want_tv!r} for run-info dry={run_param(a, 'dry')!r})")
                 bad += 1
-    # MED 7: one cap and one warm-up rule for every job of the run (each job's run/run-info.txt)
+    # MED 7: one cap, one warm-up rule and (comp review 1 LOW 15) one dry value for every job of the run (each job's
+    # run/run-info.txt): a run mixing smoke and real jobs is no run
     params = {}
     for name in names:
         if name in present:
-            params.setdefault((run_param(os.path.join(d, name), "cap_s"), run_param(os.path.join(d, name), "warmup")),
-                              []).append(name)
+            jd = os.path.join(d, name)
+            params.setdefault((run_param(jd, "cap_s"), run_param(jd, "warmup"), run_param(jd, "dry")), []).append(name)
     if len(params) != 1 or None in {v for k in params for v in k}:
-        print("PARAMS\tall jobs\tREFUSED: the jobs ran with different (cap_s, warmup) or recorded none: "
+        print("PARAMS\tall jobs\tREFUSED: the jobs ran with different (cap_s, warmup, dry) or recorded none: "
               + "; ".join(f"{k} on {len(v)} job(s)" for k, v in params.items()))
         bad += 1
     else:
-        print(f"PARAMS\tall jobs\tone cap and rule: cap_s={next(iter(params))[0]} warmup={next(iter(params))[1]}")
+        cap_s, warmup, dry = next(iter(params))
+        print(f"PARAMS\tall jobs\tone cap, rule and dry: cap_s={cap_s} warmup={warmup} dry={dry}")
     # One parent fixture for every system of the run (gate-6 review, t3run item 4): every present job's
     # run/fixture.json must name the same rows, aging, live branches and generator digest (fixture.py compare).
     fxs = []
@@ -264,18 +271,18 @@ def main(argv):
     bad += 1 if fwhy else 0
     # The drive class each job ran on (lead ruling, artie DECISIONS 6b0bef481b; SMOKE erratum E3): run/drive.json from
     # drive.py, which run_system.sh writes before any cell; a present job without a readable one is not a pass.
-    # A class outside drive.CLASSES, or no flush_reaches_drive boolean, is not a record (review of e11a3c993, findings
-    # 3 and 11).
+    # A class outside drive.CLASSES, or a flush_reaches_drive outside drive.FLUSH, is not a record (review of e11a3c993,
+    # findings 3 and 11; comp review 1 LOW 13 made it "yes", "no", "n/a: ..." or "unknown", no longer a boolean).
     print("DRIVES\tartifact\tdrive_class\tflush_reaches_drive\tdisks\tchain")
     for name in names:
         if name not in present:
             continue
         try:
             dj = json.load(open(os.path.join(d, name, "run", "drive.json")))
-            if dj["drive_class"] not in drive.CLASSES or not isinstance(dj["flush_reaches_drive"], bool):
+            if dj["drive_class"] not in drive.CLASSES or dj["flush_reaches_drive"] not in drive.FLUSH:
                 raise ValueError(f"drive_class {dj['drive_class']!r}, flush_reaches_drive "
                                  f"{dj['flush_reaches_drive']!r}")
-            row = [dj["drive_class"], "yes" if dj["flush_reaches_drive"] else "no",
+            row = [dj["drive_class"], dj["flush_reaches_drive"],
                    ",".join(f"{x['name']}({x['model']})" for x in dj["disks"]), ">".join(dj["chain"])]
         except (OSError, ValueError, KeyError, TypeError) as e:
             print(f"DRIVES\t{name}\tMISSING ({e.__class__.__name__}: {e})")

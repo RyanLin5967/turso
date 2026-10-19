@@ -7,9 +7,9 @@
 #   dolt.sh init  DATA PORT         DATA must not exist (*.noindex). DOLT_ROOT_PATH=DATA/root holds the global
 #                                   config (never ~/.dolt; metrics and version check off, see common.sh);
 #                                   database "bench" in DATA/dbs/bench; cfg in DATA/cfg
-#   dolt.sh start DATA [V1RUN]      `dolt sql-server -H 127.0.0.1 -P PORT --data-dir DATA/dbs --doltcfg-dir DATA/cfg
-#                                   --max-connections 1100`, cwd DATA, detached; pid -> DATA.ftpid, log -> DATA.log
-#   dolt.sh seed  DATA ROWS [AGE]   bench.t(ROWS rows), DOLT_COMMIT on main; AGE>0: aged, DOLT_COMMIT, DOLT_GC
+#   dolt.sh start DATA [V1RUN]      `dolt sql-server --config DATA/config.yaml` (127.0.0.1:PORT, data DATA/dbs, cfg DATA/cfg,
+#                                   max_connections 1100, auto_gc_behavior enable: true), cwd DATA, detached; pid -> DATA.ftpid, log -> DATA.log
+#   dolt.sh seed  DATA ROWS [AGE]   bench.t(ROWS rows), DOLT_COMMIT on main, aged by AGE (0: none), DOLT_COMMIT, DOLT_GC (always)
 #   dolt.sh sql   DATA SQL          one statement through the MariaDB client
 #   dolt.sh stop  DATA              SIGTERM to the recorded pid only; waits for exit
 # Branch ops (specs in ../loadgen/specs): CALL DOLT_CHECKOUT('-b', b) [BranchBench's create], or DOLT_BRANCH + checkout.
@@ -38,14 +38,29 @@ start)
   [ -d "$DATA/dbs/bench/.dolt" ] || die "REFUSED: $DATA is not initialised"
   dolt_quiet_root "$DATA/root"
   require_port_free "$(port_of)"
-  launch "$PIDF" "$LOG" "$DATA" "$V1" "$FT_DOLT" sql-server -H 127.0.0.1 -P "$(port_of)" --data-dir "$DATA/dbs" \
-    --doltcfg-dir "$DATA/cfg" --max-connections 1100 -l warning
-  wait_ready "$PIDF" "$DATA/dbs" "$LOG" 120 my -N -e "SELECT 1"
+  # comp review 1 LOW 28: one explicit config, banked with the job, stating the auto-GC behaviour at the vendor default
+  # the probe read from Dolt 2.4.1 and the registered 2.5.0 (dolt_auto_gc_enabled ON; artie
+  # runs/loud-20261015/probe-dolt-gc, artie runs/uw-20261018-dolt250-4078bf83b) instead of
+  # leaving it implicit; the other settings are the flags this used to pass
+  cat >"$DATA/config.yaml" <<EOF
+log_level: warning
+behavior:
+  auto_gc_behavior:
+    enable: true
+listener:
+  host: 127.0.0.1
+  port: $(port_of)
+  max_connections: 1100
+data_dir: $DATA/dbs
+cfg_dir: $DATA/cfg
+EOF
+  launch "$PIDF" "$LOG" "$DATA" "$V1" "$FT_DOLT" sql-server --config "$DATA/config.yaml"
+  wait_ready "$PIDF" "$DATA/config.yaml" "$LOG" 120 my -N -e "SELECT 1"
   ;;
 seed)
   ROWS=${3:-}
   [ -n "$ROWS" ] || die "usage: dolt.sh seed DATA ROWS"
-  alive "$PIDF" "$DATA/dbs" || die "REFUSED: no running server recorded for $DATA"
+  alive "$PIDF" "$DATA/config.yaml" || die "REFUSED: no running server recorded for $DATA"
   AGE=${4:-0}
   # Each stream's sha256 is recorded by the process that piped it (DATA.seed-{sql,age}.sha256; lead review MED 3).
   "$FT_PY" -B "$FT_HERE/gen_seed.py" sql --rows "$ROWS" --digest-out "$DATA.seed-sql.sha256" | my bench
@@ -59,12 +74,14 @@ seed)
   # then DOLT_GC. The server's GC settings are recorded beside it.
   my -N bench -e "CALL DOLT_COMMIT('-am', 'age', '--allow-empty')" >/dev/null
   my -N bench -e "SHOW VARIABLES LIKE '%gc%'" >"$DATA.gc-settings.txt" 2>&1 || echo "rc=$? (not read)" >>"$DATA.gc-settings.txt"
+  # comp review 1 LOW 28: the record is judged (empty, failed or GC-less is refused); run_system.sh fails the job on it
+  "$FT_PY" -B "$FT_HERE/fthelp.py" gcsettings "$DATA.gc-settings.txt" >"$DATA.gc-settings.verdict" || true
   # DOLT_GC, judged by an allowlist (lead review 62430d8bf..b49fb656a MED 9: the old check exempted a lost
-  # connection, which is what a recovered panic or a failed handshake looks like; in 2.4.1 DOLT_GC does not end the
+  # connection, which is what a recovered panic or a failed handshake looks like; in 2.4.1 and 2.5.0 DOLT_GC does not end the
   # calling session): client rc 0, its output exactly the status 0, and no panic in the server log written since the
   # CALL (fthelp.py gcverdict); a failed GC fails the seed, and the store size is recorded on both sides of it.
   gc_before=$(du -sB1 "$DATA/dbs/bench" | cut -f1)
-  gc_log0=$(stat -c %s "$LOG")
+  gc_log0=$(file_size "$LOG")
   gcrc=0
   my -N bench -e "CALL DOLT_GC()" >"$DATA.gc.txt" 2>&1 || gcrc=$?
   tail -c +$((gc_log0 + 1)) "$LOG" >"$DATA.gc.log"
@@ -72,6 +89,7 @@ seed)
     die "REFUSED: DOLT_GC: $(cat "$DATA.gc.verdict")"
   echo "gc_store_bytes before=$gc_before after=$(du -sB1 "$DATA/dbs/bench" | cut -f1)"
   echo "maintenance: DOLT_COMMIT seed; aged $AGE; DOLT_COMMIT age; DOLT_GC"
+  echo "evidence: gc_verdict=$(head -1 "$DATA.gc.verdict" | tr -d ' ')"  # comp review 1 LOW 24: the GC's outcome
   echo "seeded bench.t rows=$(my -N bench -e 'SELECT count(*) FROM t') branch=$(my -N bench -e 'SELECT active_branch()')"
   ;;
 sql)
@@ -80,7 +98,7 @@ sql)
   my -N bench -e "$SQL"
   ;;
 stop)
-  stop_pid "$PIDF" "$DATA/dbs" TERM 120
+  stop_pid "$PIDF" "$DATA/config.yaml" TERM 120
   ;;
 *) die "unknown command $cmd" ;;
 esac

@@ -16,7 +16,12 @@
   fthelp.py gcverdict RC GCOUT LOG
                                   the seed's DOLT_GC / dolt_gc verdict (MED 9): ok only for client rc 0, an output of
                                   exactly a GC_OK status, and no panic in the server log written since the CALL
-  fthelp.py selftest              known answers for gcverdict and ops
+  fthelp.py pgwaits LOG TEMPLATE_OUT DELETE_OUT
+                                  a PG server log slice's CountOtherDBBackends events (comp review 1 LOW 19):
+                                  TEMPLATE_OUT gets the template's (autovacuum_terminated_in_window, counting the
+                                  unattributed too, template_busy_errors, unattributed_autovacuum_terminated),
+                                  DELETE_OUT the per-cycle DROP's (delete_autovacuum_terminated, delete_busy_errors)
+  fthelp.py selftest              known answers for gcverdict, ops and pg_waits
 """
 import csv
 import json
@@ -117,7 +122,7 @@ GC_OK = ("0", "{0}")  # DOLT_GC's status with -N (Dolt) / -At (Doltgres): an all
 
 def gc_verdict(rc, out, log):
     """Why the seed's GC did not succeed ([] = it did): the client's rc must be 0, its whole output exactly one GC_OK
-    status (no carve-out for a lost connection: in Dolt 2.4.1 DOLT_GC does not end the calling session, and a lost
+    status (no carve-out for a lost connection: in Dolt 2.4.1 and 2.5.0 DOLT_GC does not end the calling session, and a lost
     connection is what a recovered panic or a failed handshake looks like), and the server log written since the CALL
     must hold no panic."""
     why = []
@@ -129,6 +134,69 @@ def gc_verdict(rc, out, log):
         why.append("the server log since the CALL holds a panic: " + next(
             (ln.strip()[:160] for ln in log.splitlines() if re.search(r"panic", ln, re.I)), ""))
     return why
+
+
+def gc_settings_problem(text):
+    """Comp review 1 LOW 28: why the seed's GC settings record cannot say what GC the server ran with (None = it can):
+    an empty record, a failed query (dolt.sh / doltgres.sh append 'rc=N (not read)'), or rows none of which names a
+    GC setting (name<TAB>value from Dolt, name|value from Doltgres). The explicit config.yaml pinning
+    behavior.auto_gc_behavior at the vendor default is owed: the default is unverified here (a probe of each binary)."""
+    rows = [ln for ln in text.splitlines() if ln.strip()]
+    if not rows:
+        return "the GC settings record is empty"
+    if any(re.match(r"rc=\d+ \(not read\)", ln) or ln.startswith("ERROR") for ln in rows):
+        return f"the GC settings query failed: {rows[-1][:160]!r}"
+    kv = {re.split(r"[\t|]", ln, 1)[0].strip().lower(): (re.split(r"[\t|]", ln, 1) + [""])[1].strip() for ln in rows}
+    if not any("gc" in nm for nm in kv):
+        return f"no GC setting among {list(kv)[:8]}"
+    # the probes (artie runs/loud-20261015/probe-dolt-gc, artie runs/uw-20261018-dolt250-4078bf83b): Dolt 2.4.1, Dolt 2.5.0
+    # and Doltgres 1.4.0 default it on, and dolt.sh /
+    # doltgres.sh now pin it on in config.yaml; the record must show that setting at that value
+    if kv.get("dolt_auto_gc_enabled", "").upper() not in ("ON", "1"):
+        return f"dolt_auto_gc_enabled is {kv.get('dolt_auto_gc_enabled')!r}, not on (the pinned vendor default)"
+    return None
+
+
+AV_TERM = re.compile(r"\[(\d+)\]\s+(?:(\S+)\s+)?FATAL:\s+terminating autovacuum process due to administrator command")
+AV_CTX = re.compile(r"\[(\d+)\]\s+(?:\S+\s+)?CONTEXT:\s+automatic (?:vacuum|analyze) of table \"([^\".]+)\.")
+BUSY_DELETE = re.compile(r"(?<!source )database \"([^\"]+)\" is being accessed by other users")
+
+
+def pg_waits(log, template="p"):
+    """Comp review 1 LOW 19: the CountOtherDBBackends events of a PG server log slice, the template's apart from the
+    delete's. CREATE DATABASE ... TEMPLATE p and the per-cycle DROP DATABASE both terminate autovacuum workers on their
+    database and error after 5 s if another backend stays; the template's are 'source database "p" ...' and
+    terminations on p, the delete's are 'database "b_..." ...' and terminations on a branch. A termination's database
+    is its log_line_prefix %d (pg18.sh sets '%m [%p] %d '), else the CONTEXT line its worker logs next ('automatic
+    vacuum of table "db.schema.t"'); one naming no database is unattributed (UNVERIFIED here whether PG 18 fills %d for
+    an autovacuum worker, which has no client port) and the caller keeps it in the template flag."""
+    out = {"template_autovacuum_terminated": 0, "template_busy_errors": 0, "delete_autovacuum_terminated": 0,
+           "delete_busy_errors": 0, "unattributed_autovacuum_terminated": 0}
+    pending = {}  # pid -> True while a termination with no %d waits for its CONTEXT line
+
+    def term(db):
+        k = ("template" if db == template else "delete") + "_autovacuum_terminated"
+        out[k] += 1
+    for ln in log.splitlines():
+        m = AV_TERM.search(ln)
+        if m:
+            if m.group(2):
+                term(m.group(2))
+            else:
+                if pending.pop(m.group(1), False):
+                    out["unattributed_autovacuum_terminated"] += 1
+                pending[m.group(1)] = True
+            continue
+        m = AV_CTX.search(ln)
+        if m and pending.pop(m.group(1), False):
+            term(m.group(2))
+            continue
+        if f'source database "{template}" is being accessed by other users' in ln:
+            out["template_busy_errors"] += 1
+        elif BUSY_DELETE.search(ln):
+            out["delete_busy_errors"] += 1
+    out["unattributed_autovacuum_terminated"] += len(pending)
+    return out
 
 
 def selftest():
@@ -200,6 +268,48 @@ def selftest():
         ok(f"a row with ok not 0 or 1 is refused (got {got})", isinstance(got, str))
         got = counts("empty", cb_head)
         ok(f"control: a header-only raw.tsv is (0, 0, 0), which the cell then refuses (got {got})", got == (0, 0, 0))
+    # comp review 1 LOW 19: a PG server log's template waits apart from the DROP's (both run CountOtherDBBackends): the
+    # CREATE's 'source database "p"' error and autovacuum terminations on p are the template's; the DROP's 'database
+    # "b_..."' error and terminations on a branch are the delete's; a termination naming no database (no %d, no
+    # CONTEXT) is unattributed and stays in the template flag. Known answers by hand, in PG's log format with
+    # log_line_prefix '%m [%p] %d ' (an autovacuum worker's %d may be empty: then its CONTEXT names the table)
+    pw = globals().get("pg_waits")
+    T = "2026-10-15 03:00:00.100 UTC"
+    log = "".join(f"{T} {ln}\n" for ln in (
+        "[2001] p FATAL:  terminating autovacuum process due to administrator command",
+        "[2002] b_r1_0_3 FATAL:  terminating autovacuum process due to administrator command",
+        "[2003] postgres ERROR:  source database \"p\" is being accessed by other users",
+        "[2003] postgres DETAIL:  There is 1 other session using the database.",
+        "[2004] postgres ERROR:  database \"b_r1_0_4\" is being accessed by other users",
+        "[2005]  FATAL:  terminating autovacuum process due to administrator command",
+        "[2005]  CONTEXT:  automatic vacuum of table \"p.public.t\"",
+        "[2006]  FATAL:  terminating autovacuum process due to administrator command",
+        "[2006]  CONTEXT:  automatic analyze of table \"b_r1_0_5.public.t\"",
+        "[2007]  FATAL:  terminating autovacuum process due to administrator command",
+        "[2008] postgres LOG:  checkpoint complete"))
+    want = {"template_autovacuum_terminated": 2, "template_busy_errors": 1, "delete_autovacuum_terminated": 2,
+            "delete_busy_errors": 1, "unattributed_autovacuum_terminated": 1}
+    got = pw(log) if pw else "no pg_waits() in fthelp.py"
+    ok(f"pg_waits: template 2+1, delete 2+1, unattributed 1 (got {got})", got == want)
+    got = pw("") if pw else None
+    ok(f"pg_waits: an empty log is all zeros (got {got})", got == {k: 0 for k in want})
+    # comp review 1 LOW 28: the seed's GC settings record (dolt.sh SHOW VARIABLES LIKE '%gc%'; doltgres.sh pg_settings
+    # LIKE '%gc%') is refused when empty, when its query failed, or when no row is a GC setting
+    gs = globals().get("gc_settings_problem")
+    for name, text, want_ok in (
+            ("Dolt's variables, tab-separated", "dolt_gc_lag\t0\ndolt_auto_gc_enabled\t1\n", True),
+            ("Doltgres's pg_settings rows, |-separated", "dolt_auto_gc_enabled|on\n", True),
+            ("an empty record", "", False),
+            ("a failed query", "ERROR 2013 (HY000): Lost connection\nrc=1 (not read)\n", False),
+            ("rows, none a GC setting", "max_connections\t1100\n", False),
+            # the probe (artie runs/loud-20261015/probe-dolt-gc): both binaries default dolt_auto_gc_enabled on, and the
+            # explicit config.yaml now pins it on; the record must show THAT setting at that value
+            ("GC rows without dolt_auto_gc_enabled", "dolt_stats_gc_enabled\tON\n", False),
+            ("auto GC off", "dolt_auto_gc_enabled\tOFF\n", False),
+            ("Doltgres's auto GC as SHOW reports it (1)", "dolt_auto_gc_enabled|1\n", True)):
+        why = gs(text) if gs else "no gc_settings_problem() in fthelp.py"
+        ok(f"gc settings record: {name} -> {'ok' if not why else why}", (not why) == want_ok)
+    print(f"TALLY ran={n} pass={n - bad} na=0 fail={bad}")  # gates/tally.py (linux-rev-uw2 MED 1)
     print(f"fthelp selftest: {n - bad}/{n}")
     return 1 if bad else 0
 
@@ -212,6 +322,30 @@ if __name__ == "__main__":
         sys.exit(0 if not why else 1)
     if len(sys.argv) == 2 and sys.argv[1] == "selftest":
         sys.exit(selftest())
+    if len(sys.argv) == 3 and sys.argv[1] == "gcsettings":  # the seed's GC settings record (LOW 28)
+        try:
+            why = gc_settings_problem(open(sys.argv[2], errors="replace").read())
+        except OSError as e:
+            why = f"unreadable: {e}"
+        print("ok" if not why else "REFUSED: " + why)
+        sys.exit(0 if not why else 1)
+    if len(sys.argv) == 5 and sys.argv[1] == "pgwaits":  # LOG TEMPLATE_WAITS_OUT DELETE_WAITS_OUT (LOW 19)
+        try:
+            w = pg_waits(open(sys.argv[2], errors="replace").read())
+        except OSError as e:
+            sys.exit(f"REFUSED: pgwaits: {e}")
+        # the template record keeps its old keys (timedrun.py and stracecount read them); an unattributed termination
+        # may be the template's, so it is counted there too
+        with open(sys.argv[3], "w") as f:
+            f.write(f"autovacuum_terminated_in_window="
+                    f"{w['template_autovacuum_terminated'] + w['unattributed_autovacuum_terminated']} "
+                    f"template_busy_errors={w['template_busy_errors']} "
+                    f"unattributed_autovacuum_terminated={w['unattributed_autovacuum_terminated']}\n")
+        with open(sys.argv[4], "w") as f:
+            f.write(f"delete_autovacuum_terminated={w['delete_autovacuum_terminated']} "
+                    f"delete_busy_errors={w['delete_busy_errors']}\n")
+        print(" ".join(f"{k}={v}" for k, v in w.items()))
+        sys.exit(0)
     if len(sys.argv) in (3, 4) and sys.argv[1] == "ops":
         ops(sys.argv[2], int(sys.argv[3]) if len(sys.argv) == 4 else 1)
     elif len(sys.argv) == 3 and sys.argv[1] == "branch":

@@ -4,19 +4,29 @@
 PREREG :173: timed T3 runs carry no tracer. Every cell therefore has TWO runs of the identical bbload/clonebench
 command: the traced LABELLING run (CELLDIR/bb/, strace attached: the flush counts, never a latency) and the untraced
 TIMED run (CELLDIR/timed/: the only latency file a summary may use). The driver (trace.sh timed_run) sweeps the
-TracerPid of every task of the command's process tree and the server's at the start, every 0.05 s and at the end,
-appending to CELLDIR/timed.tracer.tsv (tracer_sweep's format), and writes the run's exit status to CELLDIR/timed.rc;
+TracerPid of every task of the command's process tree and the server's at the start, every 0.1 s and at the end,
+appending to CELLDIR/timed.tracer.tsv (tracer_sweep's format), from a sweeper subshell at nice 19 that records its own
+utime+stime per sweep (comp review 1 MED 12: timed.json sweeper_cpu_s, its CPU over the window, a cost ours does not
+carry), and writes the run's exit status to CELLDIR/timed.rc;
 the load generator records its own TracerPid at the window's start and end (summary.json tracerpid_tm0/tm1).
 
-  timedrun.py check CELLDIR N RULE LIVE CAP
+  timedrun.py warm-check OUTDIR RULE
+                                one run dir's A23 warm-up record, its own fields (clock, loop and mode, open-loop
+                                lateness) and its raw rows (warm-up count, nothing measured at or after tm1): ok or
+                                REFUSED, exit 0 or 1 (run_system.sh's live warm-up plants)
+  timedrun.py check CELLDIR N RULE LIVE CAP DRY
+                                DRY is run_system.sh's FT_DRY (comp review 1 LOW 15): a clean smoke cell (1) is
+                                'ok-smoke', never 'ok'; any DRY but 0 or 1 refuses. Writes
                                 CELLDIR/timed.json; exit 0 only when the timed run exists, exited 0, measured
                                 exactly N ops like the labelling run, the tracer record shows it untraced throughout
                                 (tracer_problems: no TracerPid, no gap over GAP_S, sweeps bracketing the window, both
                                 roles swept; MED 4), both runs recorded the warm-up RULE AND did it (run_problems,
                                 MED 6: the warm-up as decided at each claim by PREREG annex A23's rule, checked exactly
                                 from the record warmup_ops / warmup_end_ns / warmup_capped / warmup_last_claim_ns
-                                (warm_problems); the window bound is CAP, capped only with a window at its bound), and
-                                the live-branch count held at LIVE: CELLDIR/live.tsv's four
+                                (warm_problems); the window bound is CAP, capped only with a window at its bound, and
+                                never past it uncapped), each run's record (record_problems) and raw rows
+                                (raw_problems), both runs one command line (pair_problems: loop, mode, rate, clients,
+                                seed), and the live-branch count held at LIVE: CELLDIR/live.tsv's four
                                 counts (label_before, label_after, timed_before, timed_after) all equal LIVE (lead
                                 review 62430d8bf..b49fb656a HIGH 1: every create is followed by an untimed delete,
                                 so N is the same before and after each run and the same for every cell)
@@ -36,6 +46,7 @@ the load generator records its own TracerPid at the window's start and end (summ
                                 DECISIONS 6b0bef481b); anything else prints why and exits 2
   timedrun.py selftest          known-answer fixtures for check; exit 0 only if every verdict is as expected
 """
+import csv
 import json
 import os
 import re
@@ -51,7 +62,19 @@ def load(path):
         return None
 
 
-GAP_S = 0.25  # the longest stretch of the timed run allowed without a tracer sweep (trace.sh sweeps every 0.05 s)
+GAP_S = 0.25  # the longest stretch of the timed run allowed without a tracer sweep (trace.sh sweeps every 0.1 s)
+# comp review 1 MED 12, the lead's ruling: one sweeper (gates/sweeper.sh) and ONE reader of its record
+# (gates/sweeper_record.py, shared with t3run.sh), whose own selftest plants every refusal
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "gates"))
+import sweeper_record as _sweeper  # noqa: E402
+
+SWEEPER_NICE = _sweeper.SWEEPER_NICE
+
+
+def sweeper_record(lines, summary):
+    """The shared reader over this run's measured window (the summary's tm0_realtime_s, tm1_realtime_s)."""
+    sm = summary or {}
+    return _sweeper.sweeper_record(lines, sm.get("tm0_realtime_s"), sm.get("tm1_realtime_s"))
 
 
 def tracer_problems(path, summary):
@@ -116,6 +139,7 @@ def tracer_problems(path, summary):
     for k in ("tracerpid_tm0", "tracerpid_tm1"):
         if sm.get(k) != 0:
             why.append(f"the load generator's own {k} is {sm.get(k)!r}, not 0")
+    why += sweeper_record(lines, summary)[1]  # comp review 1 MED 12: the sweeper's own cost must be known
     return why
 
 
@@ -131,10 +155,10 @@ def ops(c, n1, n4, total=""):
     (one number for every C and every system), else N1 at C=1 and N4 otherwise; None for a non-count."""
     def count(x):  # a positive decimal count, else None (LOW 13: int("0x10") raised and N=0 passed)
         return int(x) if str(x).isdigit() and int(x) > 0 else None
+    if count(c) is None:  # comp review 1 LOW 16: C first, even when the total is given (FT_CLIENTS=0 passed)
+        return None
     if total not in ("", None):
         return count(total)
-    if count(c) is None:
-        return None
     return count(n1) if int(c) == 1 else count(n4)
 
 
@@ -243,7 +267,8 @@ def warm_problems(nm, sm, warm_rule):
 
 def run_problems(nm, sm, warm_rule, cap):
     """MED 6: what the run DID against what it was told -- its warm-up as decided (warm_problems, PREREG annex A23),
-    its window bound must be the cap, and a run that says capped must have a window at least its bound."""
+    its window bound must be the cap, a run that says capped must have a window at least its bound, and (comp review 1
+    LOW 17) a run that does not say capped must not have run past it."""
     why = warm_problems(nm, sm, warm_rule)
     if cap is not None:
         mw, w = sm.get("max_window_s"), sm.get("window_s")
@@ -255,7 +280,151 @@ def run_problems(nm, sm, warm_rule, cap):
             why.append(f"{nm} run's window bound {mw!r} is not the cap {cap!r}")
         elif sm.get("capped") is True and (not isinstance(w, (int, float)) or w < mw):
             why.append(f"{nm} run says capped but its window {w!r} s is shorter than its bound {mw!r} s")
+        elif sm.get("capped") is not True and isinstance(w, (int, float)) and w > mw + 0.01:
+            why.append(f"{nm} run says not capped but its window {w!r} s ran past its bound {mw!r} s")
     return why
+
+
+CLOCKS = ("CLOCK_MONOTONIC", "CLOCK_BOOTTIME")  # clocks that never step back (bbload's _Static_assert)
+PAIR_KEYS = ("loop", "mode", "rate", "clients", "seed")  # one command line: both runs of a cell share these
+
+
+def record_problems(nm, sm):
+    """What the record must say about itself (competitors review 2): its clock never steps back (item 8); its loop
+    repeats bbload's mode, or is closed for clonebench (mode b1/b0; item 13); and an open-loop run carries its lateness
+    record within its own bound, the macOS bbload's VOID rule (item 3)."""
+    why = []
+    if sm.get("clock") not in CLOCKS:
+        why.append(f"{nm} run's clock {sm.get('clock')!r} is not one that never steps back ({' or '.join(CLOCKS)})")
+    loop, mode = sm.get("loop"), sm.get("mode")
+    if loop in ("closed", "open"):  # an invalid loop is warm_problems' refusal
+        if mode in ("closed", "open"):
+            if loop != mode:
+                why.append(f"{nm} run's loop {loop!r} does not repeat its mode {mode!r}")
+        elif mode in ("b1", "b0"):
+            if loop != "closed":
+                why.append(f"{nm} run is clonebench (mode {mode!r}), closed loop only, but says loop {loop!r}")
+        else:
+            why.append(f"{nm} run's mode {mode!r} is neither bbload's (closed, open) nor clonebench's (b1, b0)")
+    nd = sm.get("no_drain")  # comp review 1 LOW 21: --no-drain is the prebranch's flag, never a measured cell's
+    if not isinstance(nd, bool):
+        why.append(f"{nm} run has no no_drain record ({nd!r})")
+    elif nd:
+        why.append(f"{nm} run ran with --no-drain: its last measured ops ran under falling load (LOW 40's drain off)")
+    if loop == "open":
+        bound = sm.get("max_send_late_us")
+        if not isinstance(bound, (int, float)) or isinstance(bound, bool):
+            why.append(f"{nm} run is open loop with no max_send_late_us")
+        else:
+            for k in ("send_late_us", "pool_late_us"):
+                v = sm.get(k)
+                p99 = v.get("p99") if isinstance(v, dict) else None
+                if not isinstance(p99, (int, float)) or isinstance(p99, bool):
+                    why.append(f"{nm} run is open loop with no {k} p99")
+                elif p99 > bound:
+                    why.append(f"{nm} run's {k} p99 {p99} us is over its bound {bound} us: VOID")
+    return why
+
+
+def after_problems(nm, sm, cols):
+    """Comp review 1 MED 9: a bbload run (mode closed or open) times each after-step apart, as the macOS bbload does
+    (4010ff3b06:1183): raw.tsv columns after1_ns .. afterK_ns, K its spec's after_steps, and none when --skip-after ran
+    no after-step (skip_after); and it names what its tput_* count (tput_unit): 'cycle' -- an op plus its untimed
+    after-steps, which run inside the client's loop before its next claim -- when after-steps ran, else 'op'.
+    clonebench (mode b1, b0) runs no after-step and has no after record; any other mode is record_problems' refusal."""
+    why = []
+    if sm.get("mode") not in ("closed", "open"):
+        return why  # (not a literal []: timedrun_mutants.py reads a returned list literal as a refusal to delete)
+    na, skip = sm.get("after_steps"), sm.get("skip_after")
+    if not _count(na):
+        why.append(f"{nm} run has no after_steps record ({na!r})")
+    if not isinstance(skip, bool):
+        why.append(f"{nm} run has no skip_after record ({skip!r})")
+    if why:
+        return why
+    # (na is a count here; the guard keeps the columns check from raising when the refusal above is deleted, so a
+    # timedrun_mutants.py mutant of it reads as a clean verdict -- a crash is not a kill)
+    k = 0 if skip or not _count(na) else na
+    got = {c for c in cols if re.fullmatch(r"after\d+_ns", c)}
+    want = {f"after{i + 1}_ns" for i in range(k)}
+    if got != want:
+        why.append(f"{nm} run ran {k} after-step(s) (after_steps {na}, skip_after {skip}) but its raw.tsv's after "
+                   f"columns are {sorted(got) or 'none'}, not {sorted(want) or 'none'}")
+    unit = "cycle" if k else "op"
+    if sm.get("tput_unit") != unit:
+        why.append(f"{nm} run's tput_unit {sm.get('tput_unit')!r} is not {unit!r} ({k} after-step(s) ran per op)")
+    return why
+
+
+def raw_problems(nm, d, sm):
+    """What the run's raw.tsv says against its summary (comp review 1 LOW 17: the summary was trusted): one warm-up row
+    per warm-up op, (competitors review 2 item 1) no measured row claimed (claim_ns; intended_ns when the raw has no
+    claim_ns) at or after tm1_ns, the window's end as claim_op stamped it, and (comp review 1 MED 9) a bbload run's after columns and tput_unit
+    (after_problems)."""
+    p = os.path.join(d, "raw.tsv")
+    try:
+        with open(p) as f:
+            rd = csv.DictReader(f, delimiter="\t")
+            rows = list(rd)
+            cols = rd.fieldnames or []
+    except OSError:
+        return [f"{nm} run has no raw.tsv"]
+    if "phase" not in cols or "intended_ns" not in cols:
+        return [f"{nm} run's raw.tsv has no phase or intended_ns column"]
+    why = after_problems(nm, sm, cols)
+    wo = sm.get("warmup_ops")
+    nwarm = sum(1 for r in rows if r["phase"] == "warmup")
+    if _count(wo) and nwarm != wo:
+        why.append(f"{nm} run's raw.tsv holds {nwarm} warm-up rows, its summary warmup_ops {wo}")
+    tm1 = sm.get("tm1_ns")
+    if not _count(tm1) or not tm1:
+        why.append(f"{nm} run has no tm1_ns: its window's end in intended time is unknown")
+    else:
+        # the lead's claim_ns ruling: the window is judged on the field claim_op stamped tm1 with. Closed loop: the
+        # claim's clock reading (claim_ns); intended_ns is the op's start there, which at C > 1 can fall after tm1 for an
+        # op claimed before it (a false refusal). Open loop: the claimed arrival's intended time (intended_ns), whatever
+        # the claim's clock read (a backlogged client claims late, a free one early). Without claim_ns, intended_ns.
+        closed = sm.get("loop") == "closed"
+        key, word = ("claim_ns", "claimed") if closed and "claim_ns" in cols else ("intended_ns", "intended")
+        try:
+            late = sum(1 for r in rows if r["phase"] == "measure" and int(r[key]) >= tm1)
+        except (ValueError, TypeError):
+            return why + [f"{nm} run's raw.tsv has an {key} that is not a count"]
+        if late:
+            why.append(f"{nm} run measured {late} op(s) {word} at or after tm1 {tm1}")
+    return why
+
+
+def pair_problems(lab, t):
+    """Both runs of a cell are one command line (run_system.sh bb_args / cb_args): they must agree on PAIR_KEYS
+    (competitors review 2 items 2 and 10)."""
+    return [f"the labelling and timed runs differ in {k}: {lab.get(k)!r} against {t.get(k)!r}"
+            for k in PAIR_KEYS if lab.get(k) != t.get(k)]
+
+
+def warm_check(d, warm_rule):
+    """One run dir's warm-up and record, as run_system.sh's live plants judge them (timedrun.py warm-check)."""
+    sm = load(os.path.join(d, "summary.json"))
+    if sm is None:
+        return [f"no {d}/summary.json"]
+    return warm_problems("run", sm, warm_rule) + record_problems("run", sm) + raw_problems("run", d, sm)
+
+
+REGISTERED_PREBRANCH_MAX = 1000  # the lead's LOW 21 ruling: N = 1 and 1,000 are the registered tiers
+
+
+def prebranch_record(celldir):
+    """CELLDIR/prebranch.txt (run_system.sh: 'prebranch=N prebranch_c=C prebranch_s=S'), as {key: int}; (None, why)
+    when it is missing or not three counts."""
+    p = os.path.join(celldir, "prebranch.txt")
+    try:
+        kv = dict(re.findall(r"(\w+)=(\S+)", open(p).read()))
+    except OSError:
+        return None, "no prebranch record prebranch.txt: the cell's N, its clients and its bound are unknown"
+    keys = ("prebranch", "prebranch_c", "prebranch_s")
+    if not all(str(kv.get(k, "")).isdigit() for k in keys):
+        return None, f"prebranch record {kv} is not three counts ({', '.join(keys)})"
+    return {k: int(kv[k]) for k in keys}, None
 
 
 def check(celldir, n, warm_rule=None, live=None, cap=None):
@@ -273,8 +442,14 @@ def check(celldir, n, warm_rule=None, live=None, cap=None):
         return f"measured {got} ops, not N={n}"
     if not lab:
         why.append("no labelling run summary")
-    elif short(lab):
-        why.append("labelling run " + short(lab))
+    else:
+        if short(lab):
+            why.append("labelling run " + short(lab))
+        # comp-rev-failcount LOW-3: the labelling run's own verdict and rc, as the timed run's below (bbload refuses a
+        # run with any failed op, rc 3; a refused labelling run must not label a credited cell)
+        want_lv = "capped" if lab.get("capped") is True else "ok"
+        if lab.get("verdict") != want_lv or lab.get("rc") != 0:
+            why.append(f"labelling run verdict {lab.get('verdict')} rc {lab.get('rc')} (want {want_lv}, 0)")
     t = load(os.path.join(celldir, "timed", "summary.json"))
     if t is None or not os.path.exists(os.path.join(celldir, "timed", "raw.tsv")):
         why.append("no timed run (timed/summary.json and timed/raw.tsv): only the traced labelling run's latency")
@@ -292,13 +467,20 @@ def check(celldir, n, warm_rule=None, live=None, cap=None):
     if rc != "0":
         why.append(f"timed run exit status {rc}")
     if warm_rule is not None:  # gate-6 review, t3run item 3: the registered rule, the same for both runs
-        for nm, sm in (("labelling", lab), ("timed", t)):
+        for nm, sm, sub in (("labelling", lab, "bb"), ("timed", t, "timed")):
             got = (sm or {}).get("warmup_rule")
             if got != warm_rule:
                 why.append(f"{nm} run warm-up rule {got!r}, not the registered {warm_rule!r}")
-            if sm:  # MED 6: and what each run DID against that rule and the cap
+            if sm:  # MED 6: and what each run DID against that rule and the cap, its record, and its raw rows
                 why += run_problems(nm, sm, warm_rule, cap)
+                why += record_problems(nm, sm)
+                why += raw_problems(nm, os.path.join(celldir, sub), sm)
+    if lab and t:
+        why += pair_problems(lab, t)
     why += tracer_problems(os.path.join(celldir, "timed.tracer.tsv"), t)  # MED 4
+    pre, pwhy = prebranch_record(celldir)  # the lead's LOW 21 ruling: every cell records its prebranch
+    if pwhy:
+        why.append(pwhy)
     if live is not None:  # lead review 62430d8bf..b49fb656a HIGH 1: N held at LIVE around both runs
         got = {}
         try:
@@ -317,11 +499,17 @@ def check(celldir, n, warm_rule=None, live=None, cap=None):
     return why
 
 
-def final_verdict(why, warm_rule=None, cap=None):
-    """MED 7: 'ok' only for a clean cell whose rule is the REGISTERED one at its cap, rule(CAP), compared as an exact
-    string; a clean cell warmed up by any other rule (the CI smoke cap) is 'ok-smoke-warmup', never 'ok'."""
+def final_verdict(why, warm_rule, cap, dry):
+    """MED 7: 'ok' only for a clean cell of a REAL run (DRY "0") whose rule is the REGISTERED one at its cap,
+    rule(CAP), compared as an exact string; a clean real cell warmed up by any other rule is 'ok-smoke-warmup'. Comp
+    review 1 LOW 15: a SMOKE run (DRY "1", run_system.sh FT_DRY) is 'ok-smoke' whatever its rule, so a smoke run can
+    never read 'ok'; any other DRY is refused (no default that can be wrong)."""
     if why:
         return "REFUSED: " + "; ".join(why)
+    if dry not in ("0", "1"):
+        return f"REFUSED: FT_DRY [{dry!r}] is neither 0 nor 1"
+    if dry == "1":
+        return "ok-smoke"
     try:
         registered = rule(cap) if cap is not None else None
     except (TypeError, ValueError):
@@ -329,20 +517,34 @@ def final_verdict(why, warm_rule=None, cap=None):
     return "ok" if registered is not None and warm_rule == registered else "ok-smoke-warmup"
 
 
-def write_verdict(celldir, n, why, warm_rule=None, cap=None):
+def write_verdict(celldir, n, why, warm_rule, cap, dry):
     lab = load(os.path.join(celldir, "bb", "summary.json")) or {}
     t = load(os.path.join(celldir, "timed", "summary.json")) or {}
-    out = {"verdict": final_verdict(why, warm_rule, cap), "latency_file": "timed/raw.tsv", "warmup_rule": warm_rule,
+    out = {"verdict": final_verdict(why, warm_rule, cap, dry), "dry": dry, "latency_file": "timed/raw.tsv",
+           "warmup_rule": warm_rule,
            "registered_rule": rule(cap) if cap is not None else None,
            "labelling_dir": "bb", "ops_total": n,
            "labelling_measured_ops": lab.get("measured_ops"), "timed_measured_ops": t.get("measured_ops"),
            "capped": {"labelling": lab.get("capped", False), "timed": t.get("capped", False)},
            # MED 5: a capped timed run with 100-999 ok ops is complete with p50 only (PREREG FINAL-CANDIDATE :214)
            "tier": tier(t) if t else None, "p50_only": tier(t) == "p50_only" if t else None}
+    # The lead's LOW 21 ruling: the prebranch (N, clients, bound) is recorded; a real cell beyond the registered 1,000
+    # is exploratory and never credited until an annex row registers it
+    pre, _ = prebranch_record(celldir)
+    out["prebranch"] = pre
+    if out["verdict"] == "ok" and pre and pre["prebranch"] > REGISTERED_PREBRANCH_MAX:
+        out["verdict"] = "ok-exploratory-n"
     try:  # the live-branch counts around both runs, as run_system.sh read them (HIGH 1)
         out["live_branches"] = dict(ln.split() for ln in open(os.path.join(celldir, "live.tsv")) if len(ln.split()) == 2)
     except OSError:
         out["live_branches"] = None
+    # comp review 1 MED 12: the tracer sweeper's own CPU over the window (null only in a cell check() refused)
+    try:
+        tl = open(os.path.join(celldir, "timed.tracer.tsv")).read().splitlines()
+    except OSError:
+        tl = []
+    rec, _ = sweeper_record(tl, t)
+    out.update(rec or {"sweeper_cpu_s": None, "sweeper_cpu_span_s": None, "sweeper_nice": None, "sweeper_clk_tck": None})
     # LOW 15: the timed run's own template waits (PG; run_system.sh's timed.template_waits.txt), recorded and FLAGGED
     # like the labelling run's in cell.json, never dropped
     tw = os.path.join(celldir, "timed.template_waits.txt")
@@ -350,6 +552,11 @@ def write_verdict(celldir, n, why, warm_rule=None, cap=None):
         w = {k: int(v) for k, v in re.findall(r"(\w+)=(\d+)", open(tw).read())}
         out["template_waits"] = w
         out["template_waits_flagged"] = any(w.values())
+    # comp review 1 LOW 19: the per-cycle DROP's own CountOtherDBBackends events (fthelp.py pgwaits), recorded apart and
+    # never in the template flag
+    dw = os.path.join(celldir, "timed.delete_waits.txt")
+    if os.path.exists(dw):
+        out["delete_waits"] = {k: int(v) for k, v in re.findall(r"(\w+)=(\d+)", open(dw).read())}
     with open(os.path.join(celldir, "timed.json"), "w") as f:
         json.dump(out, f)
     return out
@@ -362,16 +569,21 @@ RULE = "1000:10:180"  # the registered warm-up at a 1800 s cap
 LIVE = 21  # PREBRANCH 20 live branches + Dolt's main
 
 
-def trace_rec(sweeps=None, traced=(), roles="cmd=500 srv=100 tree=children"):
-    """A timed.tracer.tsv in trace.sh's tracer_sweep format (MED 4): one "SWEEP phase t cmd=N:MAX srv=N:MAX" line per
-    sweep, a "TRACED phase role pid tid tracerpid" line per traced task. Default: start 100.00, a sweep every 0.05 s
-    to 100.40, end 100.45, every task untraced, around a window [100.1, 100.3]."""
+def trace_rec(sweeps=None, traced=(), roles="cmd=500 srv=100 tree=children", sweeper="pid=600 nice=19 clk_tck=100",
+              cpu=True):
+    """A timed.tracer.tsv in trace.sh's tracer_sweep format (MED 4): one "SWEEP phase t cmd=N:MAX srv=N:MAX cpu=T"
+    line per sweep, a "TRACED phase role pid tid tracerpid" line per traced task. Default: start 100.00, a sweep every
+    0.05 s to 100.40, end 100.45, every task untraced, around a window [100.1, 100.3]. Comp review 1 MED 12: the
+    sweeper's own header (SWEEPER; None: none) and, per sweep, its own utime+stime in clock ticks (cpu=T: a sweep
+    tuple's 7th element, else the sweep's index, one tick per sweep; CPU false: no cpu= field)."""
     if sweeps is None:
         sweeps = ([("start", 100.0, 3, 0, 12, 0)] + [("mid", round(100.05 + 0.05 * k, 2), 3, 0, 12, 0) for k in range(8)]
                   + [("end", 100.45, 0, 0, 12, 0)])
-    out = [f"roles {roles}\n"]
-    for ph, t, cn, cm, sn, sm in sweeps:
-        out.append(f"SWEEP {ph} {t:.6f} cmd={cn}:{cm} srv={sn}:{sm}\n")
+    out = [f"roles {roles}\n"] + ([f"sweeper {sweeper}\n"] if sweeper is not None else [])
+    for i, s in enumerate(sweeps):
+        ph, t, cn, cm, sn, sm = s[:6]
+        c = f" cpu={s[6] if len(s) > 6 else i}" if cpu else ""
+        out.append(f"SWEEP {ph} {t:.6f} cmd={cn}:{cm} srv={sn}:{sm}{c}\n")
     for tr in traced:
         out.append("TRACED " + " ".join(str(x) for x in tr) + "\n")
     return "".join(out)
@@ -384,17 +596,69 @@ CAP = 1800  # the registered per-run cap the fixtures' runs were bounded by
 # the last warm-up claim before it (warmup_last_claim_ns; null with no warm-up op): here 1500 ops claimed, the last at
 # 9.9998 s (OPS met, S not yet), and the 1501st claim at 10.0005 s ends it done. warmup_backsteps: the claims judged
 # with an older time than the claim judged before them (0: every claim was judged in time order, as claim_op's are);
-# loop: the run's loop mode, closed (each claim's time read under the claim lock) or open (each client's own intended
-# times, decided in lock order).
+# loop: the run's loop mode, closed (each claim's time read under the claim lock) or open (the next arrival of the
+# run's one Poisson stream, taken under the claim lock, as the macOS claim_op at 4010ff3b06 takes it; competitors
+# review 2 item 14). claim_op's window on the run's clock (t0_ns, tm0_ns at the ending warm-up claim, tm1_ns 5 s
+# later), the clock itself, the mode, rate, clients and seed both runs of a cell must share, and the open-loop
+# lateness record (null in closed loop) -- competitors review 2 items 1, 2, 3, 8, 10 and 13.
+T0 = 1_000_000_000_000
 RUN = {"warmup_ops": 1500, "warmup_s": 10.0005, "warmup_capped": False, "warmup_end_ns": 10_000_500_000,
        "warmup_last_claim_ns": 9_999_800_000, "warmup_backsteps": 0, "loop": "closed", "max_window_s": 1800.0,
-       "window_s": 5.0}
+       "window_s": 5.0, "t0_ns": T0, "tm0_ns": T0 + 10_000_500_000, "tm1_ns": T0 + 15_000_500_000,
+       "clock": "CLOCK_MONOTONIC", "mode": "closed", "rate": 0.0, "clients": 1, "seed": 1, "send_late_us": None,
+       "pool_late_us": None, "max_send_late_us": 100.0, "after_steps": 0, "skip_after": False, "tput_unit": "op",
+       "no_drain": False}
+# (comp review 1 MED 9: a bbload run's after record -- its spec's after-step count, whether --skip-after ran none, and
+# what its tput_* count: "op", or "cycle" when every op's untimed after-steps ran inside the client's loop)
+# An open-loop run's own fields (bbload --mode open --rate 100): its mode and loop, and its lateness record within the
+# 100 us bound; a fixture puts these in BOTH runs of a cell
+OPEN = {"loop": "open", "mode": "open", "rate": 100.0, "send_late_us": {"p50": 5.0, "p99": 20.0, "max": 40.0},
+        "pool_late_us": {"p50": 5.0, "p99": 20.0, "max": 40.0}}
+# A bbload summary of a create spec with two after-steps (close, then the delete): comp review 1 MED 9's fields
+BB = {"spec": "pg18-m1c.spec", "after_steps": 2, "skip_after": False, "tput_unit": "cycle"}
+
+
+def raw_tsv(sm, extra_rows=(), drop_warm=0, after_cols=None, claimed_rows=None):
+    """A raw.tsv agreeing with summary SM: warmup_ops warm-up rows intended from t0 on, measured_ops measured rows
+    intended from tm0 on (all before tm1), then EXTRA_ROWS (phase, intended_ns); DROP_WARM warm-up rows left out;
+    AFTER_COLS after<k>_ns columns (default: the summary's after_steps when they ran, as bbload writes them).
+    CLAIMED_ROWS (a list, possibly empty) adds a claim_ns column, each row claimed at its intended time, then those
+    rows (phase, claim_ns, intended_ns) (the lead's claim_ns ruling: one meaning per field)."""
+    if after_cols is None:
+        na = sm.get("after_steps")
+        after_cols = na if isinstance(na, int) and sm.get("skip_after") is not True else 0
+    if claimed_rows is not None:
+        base = raw_tsv(sm, extra_rows, drop_warm, after_cols).splitlines()
+        tail = "".join("\t10" for _ in range(after_cols))
+        out = [base[0].replace("\tintended_ns", "\tclaim_ns\tintended_ns") + "\n"]
+        for ln in base[1:]:
+            f = ln.split("\t")
+            out.append("\t".join(f[:5] + [f[5]] + f[5:]) + "\n")
+        n = len(base) - 1
+        for i, (ph, c, t) in enumerate(claimed_rows):
+            out.append(f"0\t{n + i}\t{ph}\t1\t{n + i}\t{c}\t{t}\t1000{tail}\n")
+        return "".join(out)
+    out = ["client\tseq\tphase\tok\tarrival\tintended_ns\tlat_ns" + "".join(f"\tafter{k + 1}_ns" for k in range(after_cols))
+           + "\n"]
+    tail = "".join("\t10" for _ in range(after_cols))
+    wo, mo, t0, tm0 = sm.get("warmup_ops"), sm.get("measured_ops"), sm.get("t0_ns"), sm.get("tm0_ns")
+    rows = []
+    if isinstance(wo, int) and isinstance(t0, int):
+        rows += [("warmup", t0 + i) for i in range(max(0, wo - drop_warm))]
+    if isinstance(mo, int) and isinstance(tm0, int):
+        rows += [("measure", tm0 + i) for i in range(mo)]
+    rows += list(extra_rows)
+    for i, (ph, t) in enumerate(rows):
+        out.append(f"0\t{i}\t{ph}\t1\t{i}\t{t}\t1000{tail}\n")
+    return "".join(out)
 
 
 def fixture(root, name, n=200, timed=True, rc=0, timed_ops=None, tracer=None, lab_rule=RULE, timed_rule=RULE,
             lab_ops=None, capped=False, live="held", self_tp=(0, 0), window=(100.1, 100.3), lab=True, raw=True,
-            rc_file=None, lab_extra=None, timed_extra=None):
-    """One cell; lab_extra / timed_extra override single summary fields (MED 6: one defect per case)."""
+            rc_file=None, lab_extra=None, timed_extra=None, timed_raw=None, prebranch="prebranch=20 prebranch_c=4 prebranch_s=1800"):
+    """One cell; lab_extra / timed_extra override single summary fields (MED 6: one defect per case). Each run's
+    raw.tsv agrees with its summary (raw_tsv) unless TIMED_RAW gives the timed one's text (one defect per case).
+    PREBRANCH: run_system.sh's prebranch.txt for the cell (the lead's LOW 21 ruling; None: no record)."""
     d = os.path.join(root, name)
     os.makedirs(os.path.join(d, "bb"))
     if live == "held":
@@ -402,6 +666,9 @@ def fixture(root, name, n=200, timed=True, rc=0, timed_ops=None, tracer=None, la
     if live is not None:  # None: no live.tsv at all
         with open(os.path.join(d, "live.tsv"), "w") as f:
             f.write("".join(f"{k}\t{v}\n" for k, v in live.items()))
+    if prebranch is not None:
+        with open(os.path.join(d, "prebranch.txt"), "w") as f:
+            f.write(prebranch + "\n")
     lo = n if lab_ops is None else lab_ops
     run = dict(RUN, window_s=1800.0 if capped else RUN["window_s"])
     if lab:
@@ -410,6 +677,8 @@ def fixture(root, name, n=200, timed=True, rc=0, timed_ops=None, tracer=None, la
         ls.update(lab_extra or {})
         with open(os.path.join(d, "bb", "summary.json"), "w") as f:
             json.dump(ls, f)
+        with open(os.path.join(d, "bb", "raw.tsv"), "w") as f:
+            f.write(raw_tsv(ls))
     if timed:
         os.makedirs(os.path.join(d, "timed"))
         to = n if timed_ops is None else timed_ops
@@ -424,7 +693,7 @@ def fixture(root, name, n=200, timed=True, rc=0, timed_ops=None, tracer=None, la
             json.dump(sm, f)
         if raw:
             with open(os.path.join(d, "timed", "raw.tsv"), "w") as f:
-                f.write("client\tseq\tphase\tok\tlat_ns\n0\t0\tmeasure\t1\t1000\n")
+                f.write(raw_tsv(sm) if timed_raw is None else timed_raw)
         with open(os.path.join(d, "timed.rc"), "w") as f:
             f.write(f"{rc if rc_file is None else rc_file}\n")
     if tracer is not None:
@@ -502,6 +771,11 @@ def selftest():
         ("the timed run's raw.tsv missing (summary present)", dict(tracer=clean, raw=False), False),
         ("the timed summary says fail with rc 0", dict(tracer=clean, timed_extra={"verdict": "fail"}), False),
         ("the timed summary says ok with rc 3", dict(tracer=clean, timed_extra={"rc": 3}), False),
+        # comp-rev-failcount LOW-3: the labelling run's own verdict and rc were never read, so a refused labelling run
+        # (bbload rc 3: failed ops) whose counts look whole could label a credited cell
+        ("the labelling summary says REFUSED with rc 3",
+         dict(tracer=clean, lab_extra={"verdict": "REFUSED: 1 warm-up, 0 drain and 0 other op(s) failed", "rc": 3}), False),
+        ("the labelling summary says ok with rc 3", dict(tracer=clean, lab_extra={"rc": 3}), False),
         ("the timed run's exit status file says 1", dict(tracer=clean, rc_file=1), False),
         ("capped with 1200 ops but 50 ok (the tier counts ok ops)",
          dict(tracer=clean, capped=True, lab_ops=1200, timed_ops=1200, timed_extra={"measured_ok": 50},
@@ -553,20 +827,26 @@ def selftest():
         # claim_op at 4010ff3b06, draws every open-loop arrival from ONE run-wide stream under the claim lock, so its
         # claims are judged in arrival order and backsteps are 0 in both loop modes; the port now draws that stream.
         # The loop field stays in the record; the two order checks apply in both modes again.
+        # Competitors review 2 items 10-12: an open-loop cell is open in BOTH runs (the labelling and timed runs are one
+        # command line), and one defect per case: the closed-loop duplicate of the backsteps case and the open-loop
+        # case that planted backsteps AND a late last claim are gone (each caught nothing the others miss)
         ("A23: an open-loop record with backsteps is refused (one shared arrival stream: 0 backsteps in both modes)",
-         dict(tracer=clean, timed_extra={"loop": "open", "warmup_backsteps": 3}), False),
-        ("A23: the same record in closed loop is refused",
-         dict(tracer=clean, timed_extra={"loop": "closed", "warmup_backsteps": 3}), False),
-        ("A23: open loop, the ending claim's intended time older than the last warm-up claim's: refused",
-         dict(tracer=clean, timed_extra={"loop": "open", "warmup_backsteps": 1, "warmup_ops": 1000,
-                                         "warmup_last_claim_ns": 10_000_600_000}), False),
+         dict(tracer=clean, lab_extra=OPEN, timed_extra=dict(OPEN, warmup_backsteps=3)), False),
         ("A23: open loop, the last warm-up claim after the ending claim even with backsteps 0: refused",
-         dict(tracer=clean, timed_extra={"loop": "open", "warmup_ops": 1000, "warmup_last_claim_ns": 10_000_600_000}),
+         dict(tracer=clean, lab_extra=OPEN, timed_extra=dict(OPEN, warmup_ops=1000, warmup_last_claim_ns=10_000_600_000)),
          False),
         ("A23: a shared-stream open-loop record (0 backsteps, claims in arrival order) is accepted",
-         dict(tracer=clean, timed_extra={"loop": "open", "warmup_backsteps": 0}), True),
-        ("A23: no loop mode in the record", dict(tracer=clean, timed_extra={"loop": None}), False),
-        ("A23: a loop mode that is neither closed nor open", dict(tracer=clean, timed_extra={"loop": "b1"}), False),
+         dict(tracer=clean, lab_extra=OPEN, timed_extra=dict(OPEN, warmup_backsteps=0)), True),
+        ("A23: open loop, no warmup_backsteps record: refused (the closed-loop twin is above)",
+         dict(tracer=clean, lab_extra=OPEN, timed_extra=dict(OPEN, warmup_backsteps=None)), False),
+        ("A23: open loop, a warm-up that left before S and before MAX_S: refused",
+         dict(tracer=clean, lab_extra=OPEN, timed_extra=dict(OPEN, warmup_ops=1000, warmup_s=1.0,
+                                                             warmup_end_ns=1_000_000_000, warmup_last_claim_ns=999_000_000)),
+         False),
+        ("A23: no loop mode in the record (both runs)",
+         dict(tracer=clean, lab_extra={"loop": None}, timed_extra={"loop": None}), False),
+        ("A23: a loop mode that is neither closed nor open (both runs)",
+         dict(tracer=clean, lab_extra={"loop": "b1"}, timed_extra={"loop": "b1"}), False),
         ("the labelling run's warm-up left early",
          dict(tracer=clean, lab_extra={"warmup_ops": 1000, "warmup_s": 1.0, "warmup_end_ns": 1_000_000_000,
                                        "warmup_last_claim_ns": 999_000_000}), False),
@@ -603,6 +883,108 @@ def selftest():
         ("warm-up capped before MAX_S",
          dict(tracer=clean, timed_extra={"warmup_ops": 500, "warmup_capped": True}), False),
     ]
+    # Competitors review 2 items 1, 2, 3, 8, 10, 13 and review 1 LOW 17: what the record says against what the raw rows
+    # and the other run say (each case one defect; the controls must pass every check)
+    tm1 = RUN["tm1_ns"]
+    cases += [
+        ("a measured row intended at tm1 (the window is closed in intended time at tm1)",
+         dict(tracer=clean, timed_raw=raw_tsv(dict(RUN, measured_ops=200), extra_rows=[("measure", tm1)])), False),
+        ("control: a drain row intended after tm1 is not a measured one",
+         dict(tracer=clean, timed_raw=raw_tsv(dict(RUN, measured_ops=200), extra_rows=[("drain", tm1 + 5)])), True),
+        # the lead's claim_ns ruling (comp lane's find): closed loop at C > 1, intended_ns is the op's START, so a measured
+        # op CLAIMED before tm1 can start after it; the window is judged at the claim (claim_ns), when the raw has one
+        ("claim_ns: a measured row claimed before tm1 that started after it (closed loop at C > 1) is in the window",
+         dict(tracer=clean, timed_raw=raw_tsv(dict(RUN, measured_ops=199), claimed_rows=[("measure", tm1 - 1, tm1 + 900)])), True),
+        ("claim_ns: a measured row claimed at tm1 (the window is closed at the claim)",
+         dict(tracer=clean, timed_raw=raw_tsv(dict(RUN, measured_ops=199), claimed_rows=[("measure", tm1, tm1 + 900)])), False),
+        # open loop: claim_op stamps tm1 at the claimed ARRIVAL's intended time, not at the claim's clock reading, so the
+        # window is in intended time there whatever claim_ns says (a backlogged client claims late; a free one early)
+        ("claim_ns, open loop: a measured row intended before tm1 and claimed after it (a backlog) is in the window",
+         dict(tracer=clean, lab_extra=OPEN, timed_extra=OPEN,
+              timed_raw=raw_tsv(dict(RUN, measured_ops=199, **OPEN), claimed_rows=[("measure", tm1 + 900, tm1 - 1)])), True),
+        ("claim_ns, open loop: a measured row intended at tm1 and claimed before it",
+         dict(tracer=clean, lab_extra=OPEN, timed_extra=OPEN,
+              timed_raw=raw_tsv(dict(RUN, measured_ops=199, **OPEN), claimed_rows=[("measure", tm1 - 900, tm1)])), False),
+        ("no tm1_ns in the timed summary", dict(tracer=clean, timed_extra={"tm1_ns": None}), False),
+        ("the raw rows hold one warm-up op fewer than warmup_ops (LOW 17: the summary is not trusted)",
+         dict(tracer=clean, timed_raw=raw_tsv(dict(RUN, measured_ops=200), drop_warm=1)), False),
+        ("an uncapped run whose window ran past its bound (LOW 17)",
+         dict(tracer=clean, timed_extra={"window_s": 1800.5}), False),
+        ("the timed run used another seed (review 2 item 2)", dict(tracer=clean, timed_extra={"seed": 2}), False),
+        ("the timed run used another rate", dict(tracer=clean, lab_extra=OPEN, timed_extra=dict(OPEN, rate=200.0)), False),
+        ("the timed run used another client count", dict(tracer=clean, timed_extra={"clients": 4}), False),
+        ("labelling closed, timed open (review 2 item 10: the control used to accept this mixed cell)",
+         dict(tracer=clean, timed_extra=OPEN), False),
+        ("a clock that can step back (CLOCK_REALTIME; review 2 item 8)",
+         dict(tracer=clean, lab_extra={"clock": "CLOCK_REALTIME"}, timed_extra={"clock": "CLOCK_REALTIME"}), False),
+        ("no clock recorded", dict(tracer=clean, lab_extra={"clock": None}, timed_extra={"clock": None}), False),
+        ("control: CLOCK_BOOTTIME is accepted",
+         dict(tracer=clean, lab_extra={"clock": "CLOCK_BOOTTIME"}, timed_extra={"clock": "CLOCK_BOOTTIME"}), True),
+        ("loop closed but mode open (review 2 item 13: loop must repeat bbload's mode)",
+         dict(tracer=clean, lab_extra={"mode": "open"}, timed_extra={"mode": "open"}), False),
+        ("control: clonebench's mode b1 with loop closed",
+         dict(tracer=clean, lab_extra={"mode": "b1"}, timed_extra={"mode": "b1"}), True),
+        ("clonebench's mode b1 with loop open",
+         dict(tracer=clean, lab_extra=dict(OPEN, mode="b1"), timed_extra=dict(OPEN, mode="b1")), False),
+        ("open loop, a p99 send lateness over max_send_late_us (review 2 item 3: VOID)",
+         dict(tracer=clean, lab_extra=OPEN,
+              timed_extra=dict(OPEN, send_late_us={"p50": 5.0, "p99": 150.0, "max": 300.0})), False),
+        ("open loop, a p99 pool lateness over max_send_late_us",
+         dict(tracer=clean, lab_extra=OPEN,
+              timed_extra=dict(OPEN, pool_late_us={"p50": 5.0, "p99": 101.0, "max": 300.0})), False),
+        ("open loop with no lateness record", dict(tracer=clean, lab_extra=OPEN, timed_extra=dict(OPEN, send_late_us=None)),
+         False),
+        ("open loop with no max_send_late_us bound", dict(tracer=clean, lab_extra=OPEN,
+                                                          timed_extra=dict(OPEN, max_send_late_us=None)), False),
+        ("a mode that is neither bbload's nor clonebench's (both runs)",
+         dict(tracer=clean, lab_extra={"mode": "x"}, timed_extra={"mode": "x"}), False),
+        # comp review 1 LOW 21: --no-drain (claims stop at the window's end) is the prebranch's, which must create
+        # exactly N at C>1; a measured cell keeps the drain load on (LOW 40), so a cell run with it is refused
+        ("a cell run with --no-drain (both runs)", dict(tracer=clean, lab_extra={"no_drain": True},
+                                                        timed_extra={"no_drain": True}), False),
+        ("a cell with no no_drain record", dict(tracer=clean, timed_extra={"no_drain": None}), False),
+        # the lead's LOW 21 ruling: the prebranch (N, its clients and its bound) is recorded for every cell
+        ("a cell with no prebranch record", dict(tracer=clean, prebranch=None), False),
+        ("a cell whose prebranch record is not counts", dict(tracer=clean, prebranch="prebranch=x"), False),
+        # comp review 1 MED 12: the sweeper is a cost beside the competitors' timed runs only, so its own CPU is part of
+        # the record (timed.json sweeper_cpu_s, below), and it runs at nice 19
+        ("the sweep lines carry no sweeper CPU", dict(tracer=trace_rec(cpu=False)), False),
+        ("no sweeper header", dict(tracer=trace_rec(sweeper=None)), False),
+        ("the sweeper ran at nice 0", dict(tracer=trace_rec(sweeper="pid=600 nice=0 clk_tck=100")), False),
+        ("the sweeper's CPU went backwards",
+         dict(tracer=trace_rec(sw[:3] + [("mid", 100.15, 3, 0, 12, 0, 0)] + sw[4:] + [("end", 100.45, 0, 0, 12, 0)])),
+         False),
+        # comp review 1 MED 9: a bbload run with after-steps times each one apart (after<k>_ns, the macOS columns) and
+        # says its throughput is per CYCLE; --skip-after runs none (BB: a create spec's bbload summary)
+        ("control: a bbload cycle run with after1_ns and after2_ns and tput_unit cycle",
+         dict(tracer=clean, lab_extra=BB, timed_extra=BB), True),
+        ("a bbload run with after-steps but no after<k>_ns columns",
+         dict(tracer=clean, lab_extra=BB, timed_extra=BB,
+              timed_raw=raw_tsv(dict(RUN, measured_ops=200, **BB), after_cols=0)), False),
+        ("a bbload run with after-steps and only after1_ns of 2",
+         dict(tracer=clean, lab_extra=BB, timed_extra=BB,
+              timed_raw=raw_tsv(dict(RUN, measured_ops=200, **BB), after_cols=1)), False),
+        ("a bbload run with no tput_unit", dict(tracer=clean, lab_extra=BB, timed_extra=dict(BB, tput_unit=None)), False),
+        ("a bbload cycle run that says tput_unit op", dict(tracer=clean, lab_extra=BB, timed_extra=dict(BB, tput_unit="op")),
+         False),
+        ("control: --skip-after needs no after columns and is per op",
+         dict(tracer=clean, lab_extra=dict(BB, skip_after=True, tput_unit="op"),
+              timed_extra=dict(BB, skip_after=True, tput_unit="op")), True),
+        ("a bbload run with no after_steps record", dict(tracer=clean, timed_extra={"after_steps": None}), False),
+        ("a bbload run with no skip_after record", dict(tracer=clean, timed_extra={"skip_after": None}), False),
+        ("a bbload run with no after-steps that says tput_unit cycle",
+         dict(tracer=clean, timed_extra={"tput_unit": "cycle"}), False),
+        ("a bbload run with an after3_ns column past its 2 after-steps",
+         dict(tracer=clean, lab_extra=BB, timed_extra=BB,
+              timed_raw=raw_tsv(dict(RUN, measured_ops=200, **BB), after_cols=3)), False),
+        ("a --skip-after run with after<k>_ns columns",
+         dict(tracer=clean, lab_extra=dict(BB, skip_after=True, tput_unit="op"),
+              timed_extra=dict(BB, skip_after=True, tput_unit="op"),
+              timed_raw=raw_tsv(dict(RUN, measured_ops=200, **BB), after_cols=2)), False),
+        ("control: clonebench (mode b1) runs no after-step and has no after record",
+         dict(tracer=clean, lab_extra={"mode": "b1", "after_steps": None, "skip_after": None, "tput_unit": None},
+              timed_extra={"mode": "b1", "after_steps": None, "skip_after": None, "tput_unit": None}), True),
+    ]
     refusal_reasons = {
         "a server task traced at the end of the timed run": ("traced during the timed run", "a sweep saw a TracerPid"),
         "a server task traced at its start": ("traced during the timed run", "a sweep saw a TracerPid"),
@@ -635,6 +1017,8 @@ def selftest():
         "the timed run's raw.tsv missing (summary present)": ("no timed run (timed/summary.json",),
         "the timed summary says fail with rc 0": ("timed run verdict fail rc 0",),
         "the timed summary says ok with rc 3": ("timed run verdict ok rc 3",),
+        "the labelling summary says REFUSED with rc 3": ("labelling run verdict REFUSED: 1 warm-up",),
+        "the labelling summary says ok with rc 3": ("labelling run verdict ok rc 3",),
         "the timed run's exit status file says 1": ("timed run exit status 1",),
         "capped with 1200 ops but 50 ok (the tier counts ok ops)": ("timed run capped with 50 ok ops",),
         "a warm-up that left before S and before MAX_S (1000 ops, 1.0 s of 10 s)": ("timed run left its warm-up early",),
@@ -654,13 +1038,8 @@ def selftest():
         "A23: no warmup_backsteps in the record": ("has no warmup_backsteps record",),
         "A23: an open-loop record with backsteps is refused (one shared arrival stream: 0 backsteps in both modes)":
             ("with an older time than the claim judged before them",),
-        "A23: the same record in closed loop is refused": ("with an older time than the claim judged before them",),
-        "A23: open loop, the ending claim's intended time older than the last warm-up claim's: refused":
-            ("with an older time than the claim judged before them", "is after its ending claim"),
         "A23: open loop, the last warm-up claim after the ending claim even with backsteps 0: refused":
             ("is after its ending claim",),
-        "A23: no loop mode in the record": ("is neither closed nor open",),
-        "A23: a loop mode that is neither closed nor open": ("is neither closed nor open",),
         "the labelling run's warm-up left early": ("labelling run left its warm-up early",),
         "a window bound that is not the registered cap": ("is not the cap",),
         "capped although the window was shorter than its bound": ("is shorter than its bound",),
@@ -678,6 +1057,69 @@ def selftest():
         "missing measured window": ("summary has no measured window",),
         "warm-up capped before MAX_S": ("before MAX_S",),
     }
+    # The comp branch's refusal cases, each pinned to its own guard's reason as C01 pins main's (the merge of fork main
+    # ae41319fe; the four keys of cases that competitors review 2 items 10-12 deleted or renamed are dropped above)
+    refusal_reasons.update({
+        "A23: open loop, no warmup_backsteps record: refused (the closed-loop twin is above)":
+            ("timed run has no warmup_backsteps record",),
+        "A23: open loop, a warm-up that left before S and before MAX_S: refused": ("timed run left its warm-up early",),
+        "A23: no loop mode in the record (both runs)":
+            ("labelling run's loop mode None is neither closed nor open", "timed run's loop mode None is neither closed nor open"),
+        "A23: a loop mode that is neither closed nor open (both runs)":
+            ("labelling run's loop mode 'b1' is neither closed nor open", "timed run's loop mode 'b1' is neither closed nor open"),
+        "a measured row intended at tm1 (the window is closed in intended time at tm1)":
+            ("timed run measured 1 op(s) intended at or after tm1",),
+        "claim_ns: a measured row claimed at tm1 (the window is closed at the claim)":
+            ("timed run measured 1 op(s) claimed at or after tm1",),
+        "claim_ns, open loop: a measured row intended at tm1 and claimed before it":
+            ("timed run measured 1 op(s) intended at or after tm1",),
+        "no tm1_ns in the timed summary": ("timed run has no tm1_ns",),
+        "the raw rows hold one warm-up op fewer than warmup_ops (LOW 17: the summary is not trusted)":
+            ("timed run's raw.tsv holds 1499 warm-up rows, its summary warmup_ops 1500",),
+        "an uncapped run whose window ran past its bound (LOW 17)": ("timed run says not capped but its window 1800.5 s",),
+        "the timed run used another seed (review 2 item 2)": ("the labelling and timed runs differ in seed",),
+        "the timed run used another rate": ("the labelling and timed runs differ in rate",),
+        "the timed run used another client count": ("the labelling and timed runs differ in clients",),
+        "labelling closed, timed open (review 2 item 10: the control used to accept this mixed cell)":
+            ("the labelling and timed runs differ in loop", "the labelling and timed runs differ in mode"),
+        "a clock that can step back (CLOCK_REALTIME; review 2 item 8)":
+            ("timed run's clock 'CLOCK_REALTIME' is not one that never steps back",),
+        "no clock recorded": ("timed run's clock None is not one that never steps back",),
+        "loop closed but mode open (review 2 item 13: loop must repeat bbload's mode)":
+            ("timed run's loop 'closed' does not repeat its mode 'open'",),
+        "clonebench's mode b1 with loop open": ("timed run is clonebench (mode 'b1'), closed loop only",),
+        "open loop, a p99 send lateness over max_send_late_us (review 2 item 3: VOID)":
+            ("timed run's send_late_us p99 150.0 us is over its bound 100.0 us: VOID",),
+        "open loop, a p99 pool lateness over max_send_late_us":
+            ("timed run's pool_late_us p99 101.0 us is over its bound 100.0 us: VOID",),
+        "open loop with no lateness record": ("timed run is open loop with no send_late_us p99",),
+        "open loop with no max_send_late_us bound": ("timed run is open loop with no max_send_late_us",),
+        "a cell run with --no-drain (both runs)":
+            ("labelling run ran with --no-drain", "timed run ran with --no-drain"),
+        "a cell with no no_drain record": ("timed run has no no_drain record",),
+        "a cell with no prebranch record": ("no prebranch record prebranch.txt",),
+        "a cell whose prebranch record is not counts": ("prebranch record",),
+        "the sweep lines carry no sweeper CPU": ("has no sweeper CPU (cpu=)",),
+        "no sweeper header": ("tracer record has no sweeper header",),
+        "the sweeper ran at nice 0": ("the sweeper ran at nice 0, not 19",),
+        "the sweeper's CPU went backwards": ("the sweeper's CPU went backwards",),
+        "a mode that is neither bbload's nor clonebench's (both runs)":
+            ("labelling run's mode 'x' is neither bbload's (closed, open) nor clonebench's (b1, b0)",
+             "timed run's mode 'x' is neither bbload's (closed, open) nor clonebench's (b1, b0)"),
+        "a bbload run with after-steps but no after<k>_ns columns":
+            ("timed run ran 2 after-step(s) (after_steps 2, skip_after False) but its raw.tsv's after columns are none",),
+        "a bbload run with after-steps and only after1_ns of 2": ("after columns are ['after1_ns'], not",),
+        "a bbload run with no tput_unit": ("timed run's tput_unit None is not 'cycle'",),
+        "a bbload cycle run that says tput_unit op": ("timed run's tput_unit 'op' is not 'cycle'",),
+        "a bbload run with no after_steps record": ("timed run has no after_steps record",),
+        "a bbload run with no skip_after record": ("timed run has no skip_after record",),
+        "a bbload run with no after-steps that says tput_unit cycle": ("timed run's tput_unit 'cycle' is not 'op'",),
+        "a bbload run with an after3_ns column past its 2 after-steps":
+            ("after columns are ['after1_ns', 'after2_ns', 'after3_ns'], not",),
+        "a --skip-after run with after<k>_ns columns":
+            ("timed run ran 0 after-step(s) (after_steps 2, skip_after True) but its raw.tsv's after columns are "
+             "['after1_ns', 'after2_ns'], not none",),
+    })
     bad = n = 0
 
     def ok(cond, line):  # counts its own cases (LOW 27: the total came from padding `cases` with None)
@@ -698,21 +1140,91 @@ def selftest():
                 expected = refusal_reasons.get(name, ())
                 ok(bool(expected) and all(any(reason in line for line in why) for reason in expected),
                    f"reason: {name} -> expected {expected!r}; got {why!r}")
+    # comp review 1 MED 12: timed.json records the sweeper's own CPU between the sweeps bracketing the window: in the
+    # clean record the last sweep at or before tm0 (100.1) is 100.10 with cpu=2 ticks and the first at or after tm1
+    # (100.3) is 100.30 with cpu=6, so (6 - 2) / clk_tck 100 = 0.04 s over [100.1, 100.3] (by hand, not by the subject)
+    with tempfile.TemporaryDirectory() as root:
+        tj = write_verdict(fixture(root, "sweeper", tracer=clean), 200, [], RULE, CAP, "1")
+        got = (tj.get("sweeper_cpu_s"), tj.get("sweeper_cpu_span_s"), tj.get("sweeper_nice"))
+        ok(isinstance(got[0], float) and abs(got[0] - 0.04) < 1e-12 and got[1] == [100.1, 100.3] and got[2] == 19,
+           f"timed.json sweeper_cpu_s, sweeper_cpu_span_s, sweeper_nice = {got!r}, want (0.04, [100.1, 100.3], 19)")
+    # The lead's LOW 21 ruling: N = 1 and 1,000 are the registered tiers, so a real cell whose prebranch is beyond 1,000
+    # is exploratory, never credited ('ok-exploratory-n', not 'ok'); timed.json records the prebranch's N, clients and
+    # bound. A smoke cell stays 'ok-smoke'.
+    for pre, dry_in, want in ((1000, "0", "ok"), (1001, "0", "ok-exploratory-n"), (100000, "0", "ok-exploratory-n"),
+                              (100000, "1", "ok-smoke")):
+        with tempfile.TemporaryDirectory() as root:
+            dd = fixture(root, "pre", tracer=clean, prebranch=f"prebranch={pre} prebranch_c=8 prebranch_s=3600")
+            tj = write_verdict(dd, 200, [], RULE, str(CAP), dry_in)
+            got = (tj.get("verdict"), tj.get("prebranch"))
+            ok(got == (want, {"prebranch": pre, "prebranch_c": 8, "prebranch_s": 3600}),
+               f"timed.json at prebranch {pre}, dry {dry_in}: {got!r}, want ({want!r}, the record)")
+    # ... and the bracket guard alone (in a cell, tracer_problems' own "no sweep before the window" refuses first)
+    rec, why = sweeper_record(clean.splitlines(), {"tm0_realtime_s": 99.0, "tm1_realtime_s": 100.3})
+    ok(rec is None and any("no sweeps bracket the measured window" in w for w in why),
+       f"sweeper_record with no sweep at or before tm0 -> {rec!r}, {why!r} (want None and the bracket reason)")
     # gate-6 review, t3run item 12: ops is ONE total per run for every system; FT_OPS_TOTAL overrides N1/N4 for all C
     for args, want in (((1, 200, 300, ""), 200), ((4, 200, 300, ""), 300), ((4, 200, 300, "5000"), 5000),
-                       ((1, 200, 300, "5000"), 5000), ((1, 200, 300, "x"), None), ((1, 200, 300, "0"), None)):
+                       ((1, 200, 300, "5000"), 5000), ((1, 200, 300, "x"), None), ((1, 200, 300, "0"), None),
+                       # comp review 1 LOW 16: C is validated even when FT_OPS_TOTAL is given
+                       (("x", 200, 300, "5000"), None), ((0, 200, 300, "5000"), None)):
         got = ops(*args)
         ok(got == want, f"ops{args} = {got!r}, want {want!r}")
     why = warm_problems("timed", RUN, "unreadable")
     ok(any("warm-up rule 'unreadable' unreadable" in line for line in why),
        f"reason: unreadable warm-up rule -> {why!r}")
+
+    def fv(*a):  # final_verdict, its arity named in the case (comp review 1 LOW 15 adds DRY)
+        try:
+            return final_verdict(*a)
+        except TypeError as e:
+            return f"TypeError: {e}"
     # MED 7: the verdict is computed against the registered rule at the cap, rule(CAP), never the run's own: a clean
-    # cell that warmed up by any other rule (the CI smoke 1000:10:2) is 'ok-smoke-warmup', never 'ok'
-    for why_in, rule_in, cap_in, want in (([], "1000:10:180", "1800", "ok"), ([], "1000:10:2", "1800", "ok-smoke-warmup"),
-                                          ([], "1000:10:6", "60", "ok"), (["x"], "1000:10:180", "1800", "REFUSED: x"),
-                                          ([], "1000:10:180.0", "1800", "ok-smoke-warmup")):
-        got = final_verdict(why_in, rule_in, cap_in)
-        ok(got == want, f"final_verdict({why_in}, {rule_in}, cap {cap_in}) = {got!r}, want {want!r}")
+    # cell that warmed up by any other rule (the CI smoke 1000:10:2) is 'ok-smoke-warmup', never 'ok'. Comp review 1
+    # LOW 15: a smoke run (DRY 1) is 'ok-smoke' whatever its rule, so a smoke run can never read 'ok'; a real run (DRY
+    # 0) is judged by the rule; any other DRY is refused.
+    for why_in, rule_in, cap_in, dry_in, want in (
+            ([], "1000:10:180", "1800", "0", "ok"), ([], "1000:10:2", "1800", "0", "ok-smoke-warmup"),
+            ([], "1000:10:6", "60", "0", "ok"), (["x"], "1000:10:180", "1800", "0", "REFUSED: x"),
+            ([], "1000:10:180.0", "1800", "0", "ok-smoke-warmup"),
+            ([], "1000:10:180", "1800", "1", "ok-smoke"), ([], "1000:10:2", "1800", "1", "ok-smoke"),
+            (["x"], "1000:10:180", "1800", "1", "REFUSED: x"),
+            ([], "1000:10:180", "1800", "", "REFUSED: FT_DRY [''] is neither 0 nor 1"),
+            ([], "1000:10:180", "1800", "yes", "REFUSED: FT_DRY ['yes'] is neither 0 nor 1")):
+        got = fv(why_in, rule_in, cap_in, dry_in)
+        ok(got == want, f"final_verdict({why_in}, {rule_in}, cap {cap_in}, dry {dry_in!r}) = {got!r}, want {want!r}")
+    # The warm-up of one run dir, as run_system.sh's live plants judge it (timedrun.py warm-check OUTDIR RULE: the A23
+    # record, the record's own fields and its raw rows)
+    wc = globals().get("warm_check")
+    # (raw: raw_tsv's kwargs, or the raw.tsv text itself, or None for none; reason: the refusal's own text, pinned as
+    # C01 pins the cell cases -- and raw_problems' early refusals, which no cell case reaches alone, are here)
+    with tempfile.TemporaryDirectory() as root:
+        for name, sm_extra, raw_kw, want, reason in (
+                ("warm-check: a clean run", {}, {}, True, None),
+                ("warm-check: raw warm-up rows one short of warmup_ops", {}, {"drop_warm": 1}, False,
+                 "run's raw.tsv holds 1499 warm-up rows, its summary warmup_ops 1500"),
+                ("warm-check: a backstep", {"warmup_backsteps": 1}, {}, False,
+                 "with an older time than the claim judged before them"),
+                ("warm-check: a clock that steps back", {"clock": "CLOCK_TAI"}, {}, False,
+                 "run's clock 'CLOCK_TAI' is not one that never steps back"),
+                ("warm-check: no raw.tsv", {}, None, False, "run has no raw.tsv"),
+                ("warm-check: a raw.tsv with no phase column", {}, "client\tseq\n0\t0\n", False,
+                 "run's raw.tsv has no phase or intended_ns column"),
+                ("warm-check: an intended_ns that is not a count", {},
+                 "client\tseq\tphase\tok\tarrival\tintended_ns\tlat_ns\n0\t0\tmeasure\t1\t0\tx\t1000\n", False,
+                 "run's raw.tsv has an intended_ns that is not a count")):
+            dd = os.path.join(root, name.replace(" ", "_").replace(":", ""))
+            os.makedirs(dd)
+            sm = dict(RUN, measured_ops=50, warmup_rule=RULE, **sm_extra)
+            with open(os.path.join(dd, "summary.json"), "w") as f:
+                json.dump(sm, f)
+            if raw_kw is not None:
+                with open(os.path.join(dd, "raw.tsv"), "w") as f:
+                    f.write(raw_kw if isinstance(raw_kw, str) else raw_tsv(sm, **raw_kw))
+            why = wc(dd, RULE) if wc else ["no warm_check() in timedrun.py"]
+            ok((not why) == want, f"{name} -> {'ok' if not why else '; '.join(why)}")
+            if reason is not None:
+                ok(any(reason in line for line in why), f"reason: {name} -> expected {reason!r}; got {why!r}")
     # MED 5: the tier of a capped run, at the registered boundaries (one owner: tier())
     for ok_ops, capped, want in ((1000, True, "complete"), (999, True, "p50_only"), (100, True, "p50_only"),
                                  (99, True, None), (0, True, None), (200, False, "complete")):
@@ -782,16 +1294,23 @@ def selftest():
                 expected.append("is not PREREG :210's rule at the registered cap")
             ok(bool(expected) and all(reason in (why or "") for reason in expected),
                f"reason: real cap={cap!r} warmup={warm!r}: expected {expected!r}, got {why!r}")
+    print(f"TALLY ran={n} pass={n - bad} na=0 fail={bad}")  # gates/tally.py (linux-rev-uw2 MED 1)
     print(f"timedrun selftest: {n - bad}/{n}")
     return 1 if bad else 0
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 7 and sys.argv[1] == "check":
+    if len(sys.argv) == 8 and sys.argv[1] == "check":
         n = int(sys.argv[3])
         why = check(sys.argv[2], n, sys.argv[4], sys.argv[5], sys.argv[6])
-        print(json.dumps(write_verdict(sys.argv[2], n, why, sys.argv[4], sys.argv[6])))
-        sys.exit(0 if not why else 1)  # ok and ok-smoke-warmup both exit 0; reduce.py tells them apart
+        out = write_verdict(sys.argv[2], n, why, sys.argv[4], sys.argv[6], sys.argv[7])
+        print(json.dumps(out))
+        # ok, ok-smoke and ok-smoke-warmup exit 0 (reduce.py tells them apart); a refused cell or DRY exits 1
+        sys.exit(0 if out["verdict"].startswith("ok") else 1)
+    if len(sys.argv) == 4 and sys.argv[1] == "warm-check":  # OUTDIR RULE: run_system.sh's live warm-up plants
+        why = warm_check(sys.argv[2], sys.argv[3])
+        print("ok" if not why else "REFUSED: " + "; ".join(why))
+        sys.exit(0 if not why else 1)
     if len(sys.argv) == 3 and sys.argv[1] == "tier":  # SUMMARY.JSON: run_system.sh's cap plants (MED 5)
         print(tier(load(sys.argv[2])) or "failed")
         sys.exit(0)
