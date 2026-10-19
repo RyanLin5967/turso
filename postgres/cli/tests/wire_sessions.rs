@@ -229,6 +229,8 @@ struct Reply {
     parameters: Vec<(String, String)>,
     /// The ReadyForQuery transaction status byte: b'I' idle, b'T' in a transaction, b'E' failed.
     status: u8,
+    /// Every CopyInResponse of the reply, in order: its overall format and its column formats.
+    copy_ins: Vec<(i8, Vec<i16>)>,
 }
 
 impl Reply {
@@ -522,13 +524,76 @@ impl Wire {
         self.read_reply()
     }
 
+    /// One simple Query that may run COPY FROM STDIN: at each CopyInResponse the next of `answers`
+    /// is sent (its data as one CopyData then CopyDone, a CopyFail, or another message in COPY's
+    /// place), and the reply is read on to ReadyForQuery or the server closing the connection. The
+    /// CopyInResponses are in the reply's `copy_ins`.
+    fn copy(&mut self, sql: &str, answers: &[CopyIn]) -> Reply {
+        let mut body = sql.as_bytes().to_vec();
+        body.push(0);
+        self.send(b'Q', &body);
+        let mut r = Reply::default();
+        let mut answers = answers.iter();
+        while self.read_into(&mut r, true) {
+            match answers.next() {
+                Some(answer) => self.answer_copy_in(answer),
+                None => panic!("{sql}: a CopyInResponse this test sends nothing for"),
+            }
+        }
+        r
+    }
+
+    fn answer_copy_in(&mut self, answer: &CopyIn) {
+        match answer {
+            CopyIn::Data(data) => {
+                if !data.is_empty() {
+                    self.send(b'd', data);
+                }
+                self.send(b'c', &[]);
+            }
+            CopyIn::Fail(why) => {
+                let mut body = why.as_bytes().to_vec();
+                body.push(0);
+                self.send(b'f', &body);
+            }
+            CopyIn::Message(tag, body) => self.send(*tag, body),
+        }
+    }
+
+    /// COPY FROM STDIN over the extended protocol as libpq sends it: Parse, Bind, Execute and Sync,
+    /// then, at the CopyInResponse, `answer` and one more Sync (libpq's after CopyDone; the first
+    /// arrives during COPY, where PostgreSQL ignores it).
+    fn x_copy(&mut self, sql: &str, answer: CopyIn) -> Reply {
+        let mut parse = vec![0u8];
+        parse.extend_from_slice(sql.as_bytes());
+        parse.extend_from_slice(&[0, 0, 0]);
+        self.send(b'P', &parse);
+        self.send(b'B', &[0, 0, 0, 0, 0, 0, 0, 0]);
+        self.send(b'E', &[0, 0, 0, 0, 0]);
+        self.send(b'S', &[]);
+        let mut r = Reply::default();
+        if self.read_into(&mut r, true) {
+            self.answer_copy_in(&answer);
+            self.send(b'S', &[]);
+            self.read_into(&mut r, false);
+        }
+        r
+    }
+
     /// Read messages up to and including ReadyForQuery (or the server closing the connection).
     fn read_reply(&mut self) -> Reply {
         let mut r = Reply::default();
+        self.read_into(&mut r, false);
+        r
+    }
+
+    /// [`Wire::read_reply`] into `r`; with `at_copy_in`, a CopyInResponse also ends the read, and
+    /// the return says whether one did.
+    fn read_into(&mut self, r: &mut Reply, at_copy_in: bool) -> bool {
         loop {
             let mut tag = [0u8; 1];
             if self.s.read_exact(&mut tag).is_err() {
-                return r;
+                return false;
             }
             let mut len = [0u8; 4];
             self.s.read_exact(&mut len).unwrap();
@@ -598,14 +663,34 @@ impl Wire {
                         r.error = Some(error_fields(&body));
                     }
                 }
+                b'G' => {
+                    let n = i16::from_be_bytes([body[1], body[2]]) as usize;
+                    let formats = (0..n)
+                        .map(|i| i16::from_be_bytes([body[3 + 2 * i], body[4 + 2 * i]]))
+                        .collect();
+                    r.copy_ins.push((body[0] as i8, formats));
+                    if at_copy_in {
+                        return true;
+                    }
+                }
                 b'Z' => {
                     r.status = body[0];
-                    return r;
+                    return false;
                 }
                 _ => {}
             }
         }
     }
+}
+
+/// What the client sends at a CopyInResponse ([`Wire::copy`], [`Wire::x_copy`]).
+enum CopyIn<'a> {
+    /// The data as one CopyData, then CopyDone (no CopyData when it is empty).
+    Data(&'a [u8]),
+    /// CopyFail with this message.
+    Fail(&'a str),
+    /// Another message (type byte, body) in COPY's place.
+    Message(u8, &'a [u8]),
 }
 
 fn cstr(b: &[u8]) -> String {
@@ -7012,6 +7097,232 @@ fn a_prepare_time_statement_is_refused_before_it_runs() {
     a.q(&format!("COPY cw FROM '{}'", rows.display()))
         .ok("a plain COPY still imports");
     assert_eq!(count(&mut a), "2");
+}
+
+/// The table every COPY FROM STDIN test loads, as PostgreSQL 18.6 was recorded loading it
+/// (postgres/cli/tests/copy-stdin-pg18.txt, its recorder copy-stdin-pg18.py beside it).
+const COPY_STDIN_TABLE: &str =
+    "CREATE TABLE cs (id int PRIMARY KEY, v varchar(5), n numeric(6,2))";
+
+/// COPY FROM STDIN over the simple protocol answers as PostgreSQL 18.6 does (recorded,
+/// copy-stdin-pg18.txt): a CopyInResponse in text format with one text column per named column,
+/// the client's CopyData up to CopyDone loaded, then "COPY n" and ReadyForQuery; the statements
+/// after it in the same Query run after its data, a second COPY in the Query asks for its own
+/// data, no data loads nothing ("COPY 0"), and DELIMITER, NULL and HEADER are read as COPY FROM
+/// a file reads them. It was refused 42601 "COPY is handled at the postgres frontend layer"
+/// (wirefuzz against PostgreSQL 18.6: 38 of 95 findings).
+#[test]
+fn copy_from_stdin_loads_its_rows_and_runs_the_statements_after_it() {
+    let dir = Scratch::new("copystdin");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q(COPY_STDIN_TABLE).ok("cs");
+    let sql = "COPY cs (id, v) FROM STDIN";
+    let r = a.copy(sql, &[CopyIn::Data(b"1\tab\n2\t\\N\n")]).ok(sql);
+    assert_eq!(r.copy_ins, vec![(0, vec![0, 0])], "{sql}: CopyInResponse");
+    assert_eq!(r.tags, vec!["COPY 2".to_string()], "{sql}");
+    assert_eq!(r.status, b'I', "{sql}");
+    let r = a.q("SELECT id, v FROM cs ORDER BY id").ok("rows");
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![Some("1".to_string()), Some("ab".to_string())],
+            vec![Some("2".to_string()), None]
+        ]
+    );
+
+    let sql = "COPY cs (id, v) FROM STDIN; SELECT count(*) FROM cs";
+    let r = a.copy(sql, &[CopyIn::Data(b"3\tc\n")]).ok(sql);
+    assert_eq!(r.copy_ins.len(), 1, "{sql}");
+    assert_eq!(r.tags, vec!["COPY 1".to_string(), "SELECT 1".to_string()], "{sql}");
+    assert_eq!(r.rows, vec![vec![Some("3".to_string())]], "{sql}");
+    assert_eq!(r.status, b'I', "{sql}");
+
+    let sql = "COPY cs (id) FROM STDIN; COPY cs (id) FROM STDIN; SELECT count(*) FROM cs";
+    let r = a
+        .copy(sql, &[CopyIn::Data(b"4\n"), CopyIn::Data(b"5\n")])
+        .ok(sql);
+    assert_eq!(r.copy_ins, vec![(0, vec![0]), (0, vec![0])], "{sql}");
+    assert_eq!(
+        r.tags,
+        vec!["COPY 1".to_string(), "COPY 1".to_string(), "SELECT 1".to_string()],
+        "{sql}"
+    );
+    assert_eq!(r.rows, vec![vec![Some("5".to_string())]], "{sql}");
+
+    let sql = "COPY cs (id, v) FROM STDIN (DELIMITER ',', NULL 'nil', HEADER)";
+    let r = a.copy(sql, &[CopyIn::Data(b"id,v\n40,x\n41,nil\n")]).ok(sql);
+    assert_eq!(r.tags, vec!["COPY 2".to_string()], "{sql}");
+    let r = a.q("SELECT id, v FROM cs WHERE id >= 40 ORDER BY id").ok("options");
+    assert_eq!(
+        r.rows,
+        vec![
+            vec![Some("40".to_string()), Some("x".to_string())],
+            vec![Some("41".to_string()), None]
+        ]
+    );
+
+    let sql = "COPY cs (id) FROM STDIN";
+    let r = a.copy(sql, &[CopyIn::Data(b"")]).ok(sql);
+    assert_eq!(r.tags, vec!["COPY 0".to_string()], "{sql}: no data");
+    assert_eq!(a.q("SELECT count(*) FROM cs").single("count"), "7");
+}
+
+/// A COPY FROM STDIN that fails answers PostgreSQL 18.6's SQLSTATE and loads none of its rows
+/// (recorded, copy-stdin-pg18.txt): CopyFail is 57014 "COPY from stdin failed: <its message>" and,
+/// in a multi-statement Query, rolls back the implicit block (the INSERT before it) and runs
+/// nothing after it; a duplicate key is 23505, a value too long for varchar(5) 22001, numeric(6,2)
+/// overflow 22003, an integer that is not one 22P02, a short line 22P04, each after the
+/// CopyInResponse and each leaving the session idle. A table or column that does not exist is
+/// refused before any CopyInResponse (42P01, 42703).
+#[test]
+fn copy_from_stdin_failures_answer_postgresqls_codes_and_load_nothing() {
+    let dir = Scratch::new("copystdinfail");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q(COPY_STDIN_TABLE).ok("cs");
+    a.q("INSERT INTO cs (id) VALUES (1)").ok("one row");
+    let count = |a: &mut Wire| a.q("SELECT count(*) FROM cs").single("count");
+
+    let sql = "INSERT INTO cs (id) VALUES (10); COPY cs (id, v) FROM STDIN; SELECT 1";
+    let r = a.copy(sql, &[CopyIn::Fail("boom")]);
+    let e = r.err(sql);
+    assert_eq!(
+        (e.code.as_str(), e.message.as_str()),
+        ("57014", "COPY from stdin failed: boom"),
+        "{sql}"
+    );
+    assert_eq!(r.tags, vec!["INSERT 0 1".to_string()], "{sql}: ran after the COPY");
+    assert_eq!(r.copy_ins.len(), 1, "{sql}");
+    assert!(r.rows.is_empty(), "{sql}: SELECT 1 ran after the failed COPY");
+    assert_eq!(r.status, b'I', "{sql}");
+    assert_eq!(count(&mut a), "1", "{sql}: the implicit block was kept");
+
+    for (data, column, code, message) in [
+        (&b"6\n1\n"[..], "id", "23505", None),
+        (b"7\tabcdef\n", "v", "22001", Some("value too long for type character varying(5)")),
+        (b"8\t10000\n", "n", "22003", None),
+        (b"x\n", "id", "22P02", Some("invalid input syntax for type integer: \"x\"")),
+        (b"50\n", "v", "22P04", Some("missing data for column \"v\"")),
+    ] {
+        let sql = if column == "id" {
+            "COPY cs (id) FROM STDIN".to_string()
+        } else {
+            format!("COPY cs (id, {column}) FROM STDIN")
+        };
+        let label = format!("{sql} <- {:?}", String::from_utf8_lossy(data));
+        let r = a.copy(&sql, &[CopyIn::Data(data)]);
+        let e = r.err(&label);
+        assert_eq!(e.code, code, "{label}: {e:?}");
+        if let Some(message) = message {
+            assert_eq!(e.message, message, "{label}");
+        }
+        assert_eq!(r.copy_ins.len(), 1, "{label}: no CopyInResponse");
+        assert_eq!(r.status, b'I', "{label}");
+        assert_eq!(count(&mut a), "1", "{label}: rows loaded");
+    }
+
+    for (sql, code, message) in [
+        ("COPY nosuch FROM STDIN", "42P01", "relation \"nosuch\" does not exist"),
+        (
+            "COPY cs (id, zz) FROM STDIN",
+            "42703",
+            "column \"zz\" of relation \"cs\" does not exist",
+        ),
+    ] {
+        let r = a.copy(sql, &[]);
+        let e = r.err(sql);
+        assert_eq!((e.code.as_str(), e.message.as_str()), (code, message), "{sql}");
+        assert!(r.copy_ins.is_empty(), "{sql}: a CopyInResponse for a refused COPY");
+        assert_eq!(r.status, b'I', "{sql}");
+    }
+}
+
+/// ReadyForQuery after a COPY FROM STDIN carries the session's real transaction status, as
+/// PostgreSQL 18.6's does (recorded, copy-stdin-pg18.txt): 'T' after a COPY inside BEGIN, 'E'
+/// after one that failed there (CopyFail), and in the failed block a COPY is 25P02 with no
+/// CopyInResponse; ROLLBACK undoes the block's COPY. pgwire's copy loop answered 'I' whatever the
+/// block was.
+#[test]
+fn copy_from_stdin_in_a_block_reports_the_blocks_status() {
+    let dir = Scratch::new("copystdinblock");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q(COPY_STDIN_TABLE).ok("cs");
+    let sql = "COPY cs (id) FROM STDIN";
+    a.q("BEGIN").ok("begin");
+    let r = a.copy(sql, &[CopyIn::Data(b"20\n")]).ok(sql);
+    assert_eq!(r.tags, vec!["COPY 1".to_string()]);
+    assert_eq!(r.status, b'T', "a COPY in a block");
+    let r = a.copy(sql, &[CopyIn::Fail("stop")]);
+    assert_eq!(r.err("CopyFail in a block").code, "57014");
+    assert_eq!(r.status, b'E', "a failed COPY in a block");
+    let r = a.copy(sql, &[]);
+    assert_eq!(r.err("COPY in a failed block").code, "25P02");
+    assert!(r.copy_ins.is_empty(), "a CopyInResponse in a failed block");
+    assert_eq!(r.status, b'E');
+    let r = a.q("ROLLBACK").ok("rollback");
+    assert_eq!(r.status, b'I');
+    assert_eq!(a.q("SELECT count(*) FROM cs").single("count"), "0");
+}
+
+/// COPY FROM STDIN over the extended protocol, as libpq sends it (Parse, Bind, Execute, Sync, then
+/// CopyData, CopyDone, Sync), loads its rows: one CopyInResponse, "COPY 2" and one ReadyForQuery,
+/// the Sync sent during COPY ignored, as PostgreSQL 18.6 answers (recorded, copy-stdin-pg18.txt).
+/// Flush and Sync during a simple-protocol COPY are ignored too.
+#[test]
+fn copy_from_stdin_over_the_extended_protocol_loads_its_rows() {
+    let dir = Scratch::new("copystdinext");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q(COPY_STDIN_TABLE).ok("cs");
+    let sql = "COPY cs (id) FROM STDIN";
+    let r = a.x_copy(sql, CopyIn::Data(b"30\n31\n")).ok(sql);
+    assert_eq!(r.copy_ins, vec![(0, vec![0])], "{sql}");
+    assert_eq!(r.tags, vec!["COPY 2".to_string()], "{sql}");
+    assert_eq!(r.status, b'I', "{sql}");
+    assert_eq!(a.q("SELECT count(*) FROM cs").single("count"), "2");
+    // A ReadyForQuery the ignored Sync wrongly got would answer the next query's read.
+    assert_eq!(a.q("SELECT 7").single("after"), "7");
+
+    let mut body = sql.as_bytes().to_vec();
+    body.push(0);
+    a.send(b'Q', &body);
+    let mut r = Reply::default();
+    assert!(a.read_into(&mut r, true), "no CopyInResponse");
+    a.send(b'H', &[]);
+    a.send(b'S', &[]);
+    a.send(b'd', b"51\n");
+    a.send(b'S', &[]);
+    a.send(b'c', &[]);
+    a.read_into(&mut r, false);
+    let r = r.ok("Flush and Sync during COPY");
+    assert_eq!(r.tags, vec!["COPY 1".to_string()]);
+    assert_eq!(r.status, b'I');
+    assert_eq!(a.q("SELECT count(*) FROM cs").single("count"), "3");
+}
+
+/// A message other than CopyData, CopyDone, CopyFail, Flush or Sync during COPY FROM STDIN ends
+/// the session, as in PostgreSQL 18.6 (recorded, copy-stdin-pg18.txt): 08P01 "unexpected message
+/// type 0x51 during COPY from stdin", then the connection closes ("terminating connection because
+/// protocol synchronization was lost"); the COPY loads nothing.
+#[test]
+fn an_unexpected_message_during_copy_from_stdin_ends_the_session() {
+    let dir = Scratch::new("copystdinunexpected");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q(COPY_STDIN_TABLE).ok("cs");
+    let sql = "COPY cs (id) FROM STDIN";
+    let r = a.copy(sql, &[CopyIn::Message(b'Q', b"SELECT 1\0")]);
+    let e = r.err(sql);
+    assert_eq!(
+        (e.code.as_str(), e.message.as_str()),
+        ("08P01", "unexpected message type 0x51 during COPY from stdin"),
+        "{sql}"
+    );
+    assert_eq!(r.status, 0, "{sql}: the session went on (a ReadyForQuery came)");
+    let mut b = server.connect();
+    assert_eq!(b.q("SELECT count(*) FROM cs").single("count"), "0");
 }
 
 /// The prepare-time `$n` guards leave nothing behind, by simple query and by Bind (wire review 17
