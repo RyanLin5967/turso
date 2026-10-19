@@ -3,6 +3,9 @@
 Written by the fresh reviewer comp-rev-2404 (its fakesrv.py, scratchpad rev2414/), taken in unchanged apart from this
 header for test_probe_shapes.py (comp-rev-2404 MED-1, LOW-1). Speaks just enough of each protocol for bbload: PG
 trust startup with sslmode/gssencmode off (bbload forces both), MySQL native-password handshake (any password).
+Added for comp-rev-a145: mode late (both protocols: the probe is answered after 4.5 s, and Terminate/Quit is
+answered by closing 4.5 s later); mode metaclose3 (mysql: a STEP's 'SELECT 3' gets count+def+EOF, then the server
+closes the socket); every connection is closed when it ends (LOW-5).
 Every query is answered with one row, except the text 'SELECT 1' (the probe; steps use SELECT 2), which gets MODE:
   pg:    silent | noz (T,D,C then stall, no ReadyForQuery) | partial (3 bytes of T then stall)
   mysql: silent | colcount (column-count packet then stall) | metastall (count+def+EOF then stall)
@@ -50,9 +53,16 @@ def pg_conn(s, cid):
         body = rd(s, n - 4)
         if t == b"X":
             log("conn", cid, "terminate")
+            if MODE == "late":  # a slow peer is slow to close too (comp-rev-a145 LOW-4)
+                time.sleep(4.5)
             return
         q = body.rstrip(b"\0").decode()
         log("conn", cid, "query", q)
+        if q == "SELECT 1" and MODE == "late":
+            log("conn", cid, "probe -> late 4.5 s")
+            time.sleep(4.5)
+            s.sendall(T + D + C + Z)
+            continue
         if q == "SELECT 1" and MODE != "normal":
             log("conn", cid, "probe -> mode", MODE)
             if MODE == "noz":
@@ -91,6 +101,8 @@ def my_conn(s, cid):
         seq, body = myread(s)
         if body[:1] == b"\x01":
             log("conn", cid, "quit")
+            if MODE == "late":  # a slow peer is slow to close too (comp-rev-a145 LOW-4)
+                time.sleep(4.5)
             return
         q = body[1:].decode()
         log("conn", cid, "cmd", body[:1], q)
@@ -98,7 +110,18 @@ def my_conn(s, cid):
             s.sendall(mypkt(1, b"\x00\x00\x00\x02\x00\x00\x00"))
             continue
         cc, cd, e1 = mypkt(1, b"\x01"), mypkt(2, coldef), mypkt(3, eof)
-        if q == "SELECT 1" and MODE != "normal":
+        if q == "SELECT 3" and MODE == "metaclose3":  # a MEASURED op's reply breaks after the metadata
+            log("conn", cid, "step SELECT 3 -> metadata then close")
+            s.sendall(cc + cd + e1)
+            time.sleep(0.2)
+            s.close()
+            return
+        if q == "SELECT 1" and MODE == "late":
+            log("conn", cid, "probe -> late 4.5 s")
+            time.sleep(4.5)
+            s.sendall(cc + cd + e1 + mypkt(4, lenc(b"1")) + mypkt(5, eof))
+            continue
+        if q == "SELECT 1" and MODE not in ("normal", "metaclose3"):
             log("conn", cid, "probe -> mode", MODE)
             if MODE == "colcount":
                 s.sendall(cc)
@@ -119,6 +142,13 @@ def serve(c, cid):
         (pg_conn if PROTO == "pg" else my_conn)(c, cid)
     except (EOFError, OSError) as e:
         log("conn", cid, "ended", type(e).__name__)
+    finally:
+        # comp-rev-a145 LOW-5: close as a real server does after Terminate/Quit (or any end), so a client's close
+        # sees EOF at once; the controls used to take 5.0 s waiting out bbload's close bound
+        try:
+            c.close()
+        except OSError:
+            pass
 
 
 ls = socket.socket()
