@@ -1251,6 +1251,35 @@ mod tests {
         );
     }
 
+    /// fastest-wire ef7738ee2 (wirefuzz against PostgreSQL 18.6, wire-fuzz3-1): sum over a
+    /// numeric(6, 2) column holding 0.00 and NULL is numeric 0.00, keeping its operands' scale (here
+    /// '0', SQLite's sum of the decoded text), and is typed numeric; and an UPDATE assigning 10000 to
+    /// it is refused even when no row matches ("numeric field overflow", PostgreSQL's 22003 at plan
+    /// time). Red by the sum claim at the base.
+    #[test]
+    fn a_numeric_sum_keeps_its_scale_and_an_overflowing_constant_is_refused() {
+        let conn = open();
+        conn.execute("CREATE TABLE t0(id INTEGER PRIMARY KEY, c0 numeric(6, 2)) STRICT")
+            .unwrap();
+        conn.execute("INSERT INTO t0 VALUES (1, 0.00), (2, NULL)").unwrap();
+        let mut wrong = Vec::new();
+        let stmt = conn.prepare("SELECT sum(c0) FROM t0");
+        let ty = stmt
+            .as_ref()
+            .ok()
+            .and_then(|s| s.get_column_type_info(0).ok().flatten())
+            .map(|i| i.declared_name.to_ascii_lowercase());
+        let got = stmt.and_then(|mut s| s.run_collect_rows());
+        if !matches!(&got, Ok(rows) if rows.len() == 1 && rows[0][0].to_text() == Some("0.00")) || ty.as_deref() != Some("numeric") {
+            wrong.push(format!("sum(c0) = {got:?} typed {ty:?}, PostgreSQL 0.00 numeric"));
+        }
+        match conn.execute("UPDATE t0 SET c0 = 10000 WHERE id = 3") {
+            Err(e) if e.to_string().contains("numeric field overflow") => {}
+            other => wrong.push(format!("UPDATE c0 = 10000 matching no row: {other:?}, PostgreSQL 22003")),
+        }
+        assert!(wrong.is_empty(), "CLAIM: a numeric sum and constant as PostgreSQL: {wrong:#?}");
+    }
+
     /// fastest-wire 76b5a2550 (wire-rev-uw3; PostgreSQL 18.6 recorded on iccad2,
     /// pg18-numeric-derived.out): over a numeric(8, 2) column holding 2.50, 123456.78 and 10.00, a
     /// direct `ORDER BY b` orders as numbers, but `b + 1 ... ORDER BY 1` and `b` read through a view,
