@@ -1421,6 +1421,9 @@ struct Parsed {
     scan: ParamScan,
     params: OnceLock<Vec<Type>>,
     columns: OnceLock<Vec<(String, Type)>>,
+    /// How many Binds this statement has had ([`Parsed::custom_binds`]), shared by its clones (a
+    /// portal's copy of the statement is the statement).
+    binds: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl Parsed {
@@ -1439,6 +1442,7 @@ impl Parsed {
             scan,
             params: OnceLock::new(),
             columns: OnceLock::new(),
+            binds: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         }
     }
 
@@ -1455,7 +1459,14 @@ impl Parsed {
             },
             params: OnceLock::new(),
             columns: OnceLock::new(),
+            binds: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         }
+    }
+
+    /// Count a Bind of this statement and return its number (1 for the first): PostgreSQL plans a
+    /// named statement custom for its first five Binds ([`Session::on_bind`]).
+    fn custom_binds(&self) -> u32 {
+        self.binds.fetch_add(1, std::sync::atomic::Ordering::Relaxed).saturating_add(1)
     }
 
     /// Fix the statement's parameter types at the first call, and refuse any later call whose
@@ -2869,11 +2880,11 @@ impl Session {
         }
     }
 
-    /// The varchar(n) lengths of the parameters the statement Describe prepared for `sql` assigns
-    /// to columns ([`turso_pg::StatementTypes::lengths`]); none when nothing is kept for the text.
-    fn described_lengths(&self, sql: &str) -> std::collections::BTreeMap<u32, u32> {
+    /// The assignment targets of the parameters of the statement Describe prepared for `sql`
+    /// ([`turso_pg::StatementTypes::assignments`]); none when nothing is kept for the text.
+    fn described_assignments(&self, sql: &str) -> Vec<(u32, turso_pg::AssignTarget)> {
         let st = self.state();
-        st.described.for_sql(sql).map(|d| d.types.lengths.clone()).unwrap_or_default()
+        st.described.for_sql(sql).map(|d| d.types.assignments.clone()).unwrap_or_default()
     }
 
     /// The statement a Describe prepared for this Execute, if it is this text on this connection.
@@ -3043,7 +3054,7 @@ impl Session {
                     .map(|(i, ty)| (stmt.get_column_name(i).into_owned(), ty.clone()))
                     .collect();
                 parsed.fix_columns(&named).map_err(unprepared)?;
-                bind_portal_parameters_limited(&mut stmt, portal, &params, &types.lengths)
+                bind_portal_parameters_limited(&mut stmt, portal, &params, &types.assignments)
                     .map_err(|e| unprepared(wire_info(e)))?
             }
             // Nothing binds a parameter over the simple protocol, so a $n names none: 42P02, as
@@ -4575,9 +4586,17 @@ impl ExtendedQueryHandler for Session {
                 .described_parameters(&portal.statement.statement.sql, &portal.statement.parameter_types)
                 .map_err(PgWireError::UserError)?;
             if params.len() == portal.parameters.len() {
-                let mut values = decode_portal_parameters(&portal, &params)?;
-                let lengths = self.described_lengths(&portal.statement.statement.sql);
-                coerce_assigned_lengths(&mut values, &lengths)?;
+                decode_portal_parameters(&portal, &params)?;
+                // A custom plan coerces each assignment at Bind; PostgreSQL 18.6 plans the
+                // unnamed statement custom at every Bind and a named one custom for its first five
+                // Binds, then generic, which coerces at Execute (wire-rev-629f4b926 MED-2; the
+                // probe's #50-#57). BLIND SPOT: PostgreSQL's choice from the sixth Bind is by cost
+                // (a generic plan costlier than the customs' average stays custom) and by
+                // plan_cache_mode; here it is always generic from the sixth.
+                if portal.statement.id.is_empty() || portal.statement.statement.custom_binds() <= 5 {
+                    let assignments = self.described_assignments(&portal.statement.statement.sql);
+                    check_assignments(&portal, &assignments)?;
+                }
             }
         }
         // A named portal lives until its Close or its transaction's end: binding the name again
@@ -5592,19 +5611,19 @@ fn bind_portal_parameters(
     portal: &Portal<Parsed>,
     types: &[Type],
 ) -> PgWireResult<()> {
-    bind_portal_parameters_limited(stmt, portal, types, &Default::default())
+    bind_portal_parameters_limited(stmt, portal, types, &[])
 }
 
-/// [`bind_portal_parameters`], each value assigned to a varchar(n) column first coerced to it
-/// ([`coerce_assigned_lengths`]).
+/// [`bind_portal_parameters`], for a statement whose assignment targets are known.
 fn bind_portal_parameters_limited(
     stmt: &mut turso_core::Statement,
     portal: &Portal<Parsed>,
     types: &[Type],
-    lengths: &std::collections::BTreeMap<u32, u32>,
+    _assignments: &[(u32, turso_pg::AssignTarget)],
 ) -> PgWireResult<()> {
-    let mut values = decode_portal_parameters(portal, types)?;
-    coerce_assigned_lengths(&mut values, lengths)?;
+    // The assignments are checked at Bind only (custom plans, Session::on_bind); at Execute the
+    // engine's column types coerce each stored value, as PostgreSQL's generic plan does.
+    let values = decode_portal_parameters(portal, types)?;
     for (i, value) in values.into_iter().enumerate() {
         let index = NonZero::new(i + 1).expect("i + 1 >= 1");
         // A parameter with no engine slot (declared but unused, or in a clause the engine folds
@@ -5617,33 +5636,93 @@ fn bind_portal_parameters_limited(
     Ok(())
 }
 
-/// Each value assigned to a varchar(n) column ([`turso_pg::StatementTypes::lengths`]) coerced to
-/// varchar(n) as PostgreSQL's Bind does (its custom plan folds the coercion): a text value past n
-/// characters is refused 22001, unless every character past n is a space, when it is cut to n
-/// (varchar's typmod coercion; lead ruling 1(a), recorded, recordings/pg18-bind-varchar.out).
-fn coerce_assigned_lengths(
-    values: &mut [Value],
-    lengths: &std::collections::BTreeMap<u32, u32>,
-) -> PgWireResult<()> {
-    for (&n, &length) in lengths {
-        let Some(Value::Text(text)) = usize::try_from(n).ok().and_then(|n| values.get_mut(n.checked_sub(1)?)) else {
+/// Each bound value checked against every column it is assigned to ([`turso_pg::StatementTypes::
+/// assignments`], in the columns' order), as PostgreSQL's Bind coerces each assignment under a
+/// custom plan: the first that fails refuses the Bind, varchar(n) past n characters with anything
+/// but spaces past n and char(n) past n once trailing spaces are dropped 22001, numeric(p, s) past
+/// p - s integer digits once rounded to s 22003. The values are never changed: an excess of spaces
+/// is cut by the column's own type when the engine stores it, for each column apart
+/// (wire-rev-629f4b926 HIGH-1, MED-1: the cut of a shared value reached a wider column, RETURNING
+/// and WHERE). NULL is not checked.
+fn check_assignments(portal: &Portal<Parsed>, assignments: &[(u32, turso_pg::AssignTarget)]) -> PgWireResult<()> {
+    use turso_pg::AssignTarget;
+    for &(n, target) in assignments {
+        // The value as the client sent it, in text format: what PostgreSQL's input function reads
+        // and the coercion judges. BLIND SPOT: a binary-format value is not judged here (the
+        // engine's column type judges it at Execute).
+        let Some(i) = usize::try_from(n).ok().and_then(|n| n.checked_sub(1)) else {
             continue;
         };
-        let s = text.as_str();
-        let Some((cut, _)) = s.char_indices().nth(length as usize) else {
+        if portal.parameter_format.is_binary(i) {
+            continue;
+        }
+        let Some(Some(bytes)) = portal.parameters.get(i) else {
             continue;
         };
-        if s[cut..].chars().all(|c| c == ' ') {
-            let kept = s[..cut].to_string();
-            *values.get_mut(n as usize - 1).expect("read above") = Value::build_text(kept);
-        } else {
-            return Err(PgWireError::UserError(error(
-                SqlErrorKind::StringDataRightTruncation,
-                format!("value too long for type character varying({length})"),
-            )));
+        let Ok(text) = std::str::from_utf8(bytes) else {
+            continue;
+        };
+        let refusal = match target {
+            AssignTarget::VarChar(len) => text
+                .char_indices()
+                .nth(len as usize)
+                .filter(|(cut, _)| !text[*cut..].chars().all(|c| c == ' '))
+                .map(|_| (SqlErrorKind::StringDataRightTruncation, format!("value too long for type character varying({len})"))),
+            AssignTarget::BpChar(len) => (text.trim_end_matches(' ').chars().count() > len as usize)
+                .then(|| (SqlErrorKind::StringDataRightTruncation, format!("value too long for type character({len})"))),
+            AssignTarget::Numeric(precision, scale) => numeric_overflows(&text, precision, scale)
+                .then(|| (SqlErrorKind::NumericValueOutOfRange, "numeric field overflow".to_string())),
+        };
+        if let Some((kind, message)) = refusal {
+            return Err(PgWireError::UserError(error(kind, message)));
         }
     }
     Ok(())
+}
+
+/// Whether decimal `text` overflows numeric(`precision`, `scale`): more than precision - scale
+/// integer digits once rounded half away from zero to `scale` places (numeric's apply_typmod).
+/// Text that is no plain decimal is not judged here (its parameter's type read it already).
+fn numeric_overflows(text: &str, precision: u32, scale: i32) -> bool {
+    let t = text.trim();
+    let t = t.strip_prefix(['-', '+']).unwrap_or(t);
+    let (int, frac) = t.split_once('.').unwrap_or((t, ""));
+    if int.is_empty() && frac.is_empty() || !int.bytes().all(|b| b.is_ascii_digit()) || !frac.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    // The digits as one number, rounded to `scale` places.
+    let mut digits: Vec<u8> = int.bytes().chain(frac.bytes()).map(|b| b - b'0').collect();
+    let point = int.len() as i64; // digits before the point
+    let keep = point + i64::from(scale); // digits kept
+    if keep < 0 {
+        return false;
+    }
+    let keep = keep as usize;
+    let mut point = point as usize;
+    if keep < digits.len() {
+        let round_up = digits[keep] >= 5;
+        digits.truncate(keep);
+        if round_up {
+            let mut i = digits.len();
+            loop {
+                if i == 0 {
+                    digits.insert(0, 1);
+                    point += 1;
+                    break;
+                }
+                i -= 1;
+                if digits[i] == 9 {
+                    digits[i] = 0;
+                } else {
+                    digits[i] += 1;
+                    break;
+                }
+            }
+        }
+    }
+    // Integer digits after rounding, leading zeros dropped.
+    let significant = digits[..point.min(digits.len())].iter().skip_while(|d| **d == 0).count();
+    significant as i64 > i64::from(precision) - i64::from(scale)
 }
 
 /// Every value `portal` holds, read by its parameter's type and format, as PostgreSQL's
