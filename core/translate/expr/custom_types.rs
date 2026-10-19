@@ -1218,6 +1218,50 @@ mod tests {
         );
     }
 
+    /// fastest-wire 76b5a2550 (wire-rev-uw3; PostgreSQL 18.6 recorded on iccad2,
+    /// pg18-numeric-derived.out): over a numeric(8, 2) column holding 2.50, 123456.78 and 10.00, a
+    /// direct `ORDER BY b` orders as numbers, but `b + 1 ... ORDER BY 1` and `b` read through a view,
+    /// a derived table and a CREATE TABLE AS copy ordered as text (10.00, 123456.78, 2.50): a silent
+    /// wrong row order. Each result column is also typed numeric, as PostgreSQL types it, a scalar
+    /// subquery's max(b) included (`get_column_type_info`'s declared name). The direct column is
+    /// the control. Red by its claims at the base.
+    #[test]
+    fn a_numeric_column_orders_and_types_as_numeric_through_every_relation() {
+        let conn = open();
+        for sql in [
+            "CREATE TABLE n(id INTEGER PRIMARY KEY, b numeric(8, 2)) STRICT",
+            "INSERT INTO n VALUES (1, 2.50), (2, 123456.78), (3, 10.00)",
+            "CREATE VIEW v AS SELECT b FROM n",
+            "CREATE TABLE c AS SELECT b FROM n",
+        ] {
+            conn.execute(sql).unwrap();
+        }
+        let mut wrong = Vec::new();
+        for (sql, want) in [
+            ("SELECT b FROM n ORDER BY b", &["2.50", "10.00", "123456.78"][..]),
+            ("SELECT b + 1 AS x FROM n ORDER BY 1", &["3.50", "11.00", "123457.78"][..]),
+            ("SELECT b FROM v ORDER BY b", &["2.50", "10.00", "123456.78"][..]),
+            ("SELECT b FROM (SELECT b FROM n) d ORDER BY b", &["2.50", "10.00", "123456.78"][..]),
+            ("SELECT b FROM c ORDER BY b", &["2.50", "10.00", "123456.78"][..]),
+            ("SELECT (SELECT max(b) FROM n) AS m", &["123456.78"][..]),
+        ] {
+            let stmt = conn.prepare(sql);
+            let ty = stmt
+                .as_ref()
+                .ok()
+                .and_then(|s| s.get_column_type_info(0).ok().flatten())
+                .map(|i| i.declared_name.to_ascii_lowercase());
+            let got = stmt.and_then(|mut s| s.run_collect_rows()).map(|rows| {
+                rows.iter().map(|r| r[0].to_text().unwrap_or("NULL").to_string()).collect::<Vec<_>>()
+            });
+            let want: Vec<String> = want.iter().map(|w| w.to_string()).collect();
+            if got.as_ref().ok() != Some(&want) || ty.as_deref() != Some("numeric") {
+                wrong.push(format!("{sql}: rows {got:?} type {ty:?}, PostgreSQL {want:?} numeric"));
+            }
+        }
+        assert!(wrong.is_empty(), "CLAIM: numeric through every relation, as PostgreSQL: {wrong:#?}");
+    }
+
     /// fastest-wire c15466936 (wirefuzz against PostgreSQL 18.6): a value too long for varchar(n) is
     /// refused as a classified string-data-right-truncation error in PostgreSQL's words ("value too
     /// long for type character varying(5)"; 22001 on the wire), not as a RAISE whose message the wire
