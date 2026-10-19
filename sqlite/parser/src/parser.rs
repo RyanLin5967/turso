@@ -5612,6 +5612,61 @@ mod tests {
         assert!(failed.is_empty(), "CLAIM: a type holding a bracket reads back as itself: {failed:#?}");
     }
 
+    /// engine-rev 2bdcd32c6 HIGH 1, the second fresh-context attack (on a28c82f07): a bracket's
+    /// content may hold spaces and quotes, so splitting the name at its spaces misreads it:
+    /// `[a ] "]"` (name `a  "]"`), `["x] " ]"` (name `"x " ]"`) still took the whole-name double
+    /// quote and read back as another name. Every sequence of one to three type tokens drawn from the
+    /// forms below, as a column type and as a CAST type, prints so that it reads back as the same name
+    /// and prints the same again.
+    #[test]
+    fn every_short_sequence_of_type_tokens_reads_back_as_itself() {
+        let forms = [
+            "x", "int", "\"a]b\"", "\"x \"", "'s'", "`b`", "[a ]", "[ x]", "[ ]", "[\"x]", "[x,y]",
+            "[not null]", "\" ]\"", "\"]\"", "[']", "\"a\"\"b\"", "[a b]", "']'", "[`]",
+        ];
+        let mut seqs: Vec<String> = forms.iter().map(|f| f.to_string()).collect();
+        for a in forms {
+            for b in forms {
+                seqs.push(format!("{a} {b}"));
+                for c in forms {
+                    seqs.push(format!("{a} {b} {c}"));
+                }
+            }
+        }
+        let (mut failed, mut checked, mut unparsed) = (Vec::new(), 0usize, 0usize);
+        for ty in &seqs {
+            let sql = format!("CREATE TABLE t(c {ty})");
+            let Ok(want) = column_type_names(&sql) else {
+                unparsed += 1;
+                continue;
+            };
+            checked += 1;
+            let printed = Parser::new(sql.as_bytes()).next().unwrap().unwrap().to_string();
+            match column_type_names(&printed) {
+                Ok(got) if got == want => {
+                    let again = Parser::new(printed.as_bytes()).next().unwrap().unwrap().to_string();
+                    if again != printed {
+                        failed.push(format!("{ty}: printed `{printed}`, printed again `{again}`"));
+                    }
+                }
+                Ok(got) => failed.push(format!("{ty}: printed `{printed}` reads back as {got:?}, was {want:?}")),
+                Err(e) => failed.push(format!("{ty}: printed `{printed}` does not parse: {e}")),
+            }
+            let cast = format!("SELECT CAST(1 AS {ty})");
+            if let Some(Ok(cmd)) = Parser::new(cast.as_bytes()).next() {
+                let printed = cmd.to_string();
+                let again = Parser::new(printed.as_bytes()).next().map(|r| r.map(|c| c.to_string()));
+                match again {
+                    Some(Ok(again)) if again == printed => {}
+                    other => failed.push(format!("{ty}: CAST printed `{printed}`, read back and printed: {other:?}")),
+                }
+            }
+        }
+        assert!(unparsed * 2 < seqs.len(), "premise: most sequences parse ({unparsed} of {} do not)", seqs.len());
+        failed.truncate(40);
+        assert!(failed.is_empty(), "CLAIM: all {checked} parsed sequences read back as themselves; first failures: {failed:#?}");
+    }
+
     #[test]
     fn test_variable_index_bounds() {
         for sql in ["SELECT ?0", "SELECT ?250001"] {

@@ -16564,3 +16564,53 @@ fn the_alter_rewrite_scalar_answers_user_sql_as_an_unknown_function_does() {
     }
     assert!(failed.is_empty(), "CLAIM: user SQL sees turso_alter_column_sql as an unknown function: {failed:#?}");
 }
+
+/// engine-rev 2bdcd32c6 MED 5, the second fresh-context attack (on d6e12795e): the planner's own
+/// lookup of aggregates and windows still knew the name, so `turso_alter_column_sql(*)` answered
+/// "wrong number of arguments" and an OVER call "may not be used as a window function" where an
+/// unknown function answers "no such function". Every call shape below answers exactly as the
+/// unknown `turso_no_such_scalar` does.
+#[test]
+fn every_call_shape_of_the_alter_rewrite_scalar_answers_as_an_unknown_function_does() {
+    let _g = serial();
+    let a7 = "('CREATE TABLE t(a)', 2, 'add', 't', '', 'b INT', '')";
+    let stmts = [
+        "SELECT {F}(*)".to_string(),
+        format!("SELECT {{F}}{a7} OVER ()"),
+        "SELECT {F}(*) OVER ()".to_string(),
+        "SELECT {F}()".to_string(),
+        "SELECT {F}(1)".to_string(),
+        format!("SELECT {{F}}{a7} FILTER (WHERE 1)"),
+        format!("SELECT DISTINCT {{F}}{a7}"),
+        format!("SELECT count(*) FROM (SELECT 1 AS k) GROUP BY {{F}}{a7}"),
+        format!("SELECT 1 ORDER BY {{F}}{a7}"),
+        "CREATE TABLE gz(x, g AS ({F}(*)) VIRTUAL)".to_string(),
+        "CREATE TABLE gz1(x, g AS ({F}(1)) VIRTUAL)".to_string(),
+        "CREATE TABLE cz(x CHECK ({F}(*) IS NOT NULL))".to_string(),
+        "CREATE TABLE cz1(x CHECK ({F}(x) IS NOT NULL))".to_string(),
+    ];
+    let outcome = |f: &str| -> Vec<String> {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("shape.db"), DatabaseOpts::new().with_generated_columns(true));
+        let c = db.connect().unwrap();
+        stmts
+            .iter()
+            .map(|stmt| {
+                let sql = stmt.replace("{F}", f);
+                match c.prepare(&sql).and_then(|mut s| s.run_collect_rows()) {
+                    Ok(_) => format!("{stmt}: accepted"),
+                    Err(e) => format!("{stmt}: refused: {}", e.to_string().replace(f, "{F}")),
+                }
+            })
+            .collect()
+    };
+    let subject = outcome("turso_alter_column_sql");
+    let control = outcome("turso_no_such_scalar");
+    let failed: Vec<String> = subject
+        .iter()
+        .zip(&control)
+        .filter(|(s, c)| s != c)
+        .map(|(s, c)| format!("{s}  <-- an unknown function: {c}"))
+        .collect();
+    assert!(failed.is_empty(), "CLAIM: every call shape answers as an unknown function: {failed:#?}");
+}
