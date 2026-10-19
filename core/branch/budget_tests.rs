@@ -4891,7 +4891,9 @@ fn a_first_create_makes_its_catalog_in_one_commit_off_the_store_mutex() {
     // and compiles nothing there cannot still allocate the ~2.6 MB the creation holds today (2,604,646 B at
     // create 0 with 15 live, lane raw 78d2823373). The same instrument and bound as leap_l2b (the thread's
     // allocation bytes under the mutex), over the reopened reference.
-    let held_bytes = least(&fresh[..], "held_alloc_bytes").saturating_sub(most(&reference[..], "held_alloc_bytes"));
+    // budgets-rev-242345 LOW-9 (FLAGGED, stricter): the MOST any fresh sample held against the LEAST any
+    // reference did, so every fresh sample is bounded, not only the best one.
+    let held_bytes = most(&fresh[..], "held_alloc_bytes").saturating_sub(least(&reference[..], "held_alloc_bytes"));
     if held_bytes > 8 << 10 {
         let _ = writeln!(failures, "  the catalog's creation allocated {held_bytes} B under the store mutex; budget <= 8 KiB");
     }
