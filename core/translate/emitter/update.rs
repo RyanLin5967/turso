@@ -105,6 +105,13 @@ fn emit_update_constant_encodes(program: &mut ProgramBuilder, resolver: &Resolve
     if crate::branch::store::fe_mutant("update_constant_unchecked") {
         return Ok(());
     }
+    // An UPDATE with SQLite's OR clause is not PostgreSQL's statement: SQLite checks a value per
+    // row, under the clause's resolution, so `UPDATE OR IGNORE ... WHERE <no row>` succeeds (engine
+    // review 2bdcd32c6 MED 7: it was refused here, at plan time). Mutant
+    // `or_update_constant_checked` (test builds only): checked here too, as before.
+    if plan.or_conflict.is_some() && !crate::branch::store::fe_mutant("or_update_constant_checked") {
+        return Ok(());
+    }
     let Some(btree) = plan.target_table.table.btree() else {
         return Ok(());
     };
