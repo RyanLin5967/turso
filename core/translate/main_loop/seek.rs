@@ -62,6 +62,9 @@ fn encode_seek_keys_for_custom_types(
             Some(e) => e,
             None => continue,
         };
+        if encode_keeps_the_value(encode_expr) && !crate::branch::store::fe_mutant("varchar_seek_key_cut") {
+            continue;
+        }
         let reg = start_reg + i;
         let skip_label = program.allocate_label();
         program.emit_insn(Insn::IsNull {
@@ -259,6 +262,23 @@ fn emit_seek_key_encode_or_empty(
         target_pc: key.loop_end,
     });
     Ok(())
+}
+
+/// varchar(n)'s ENCODE is its length coercion, `varchar_encode(value, maxlen)`: a value that fits
+/// is stored as given, so a seek key compares as itself and is not coerced. Coercing it cut a key
+/// whose excess is spaces ('abc   ' to 'abc') and found a row PostgreSQL's comparison does not
+/// (fastest-wire 0b092d531: a comparison is not an assignment), and it refused a key too long for
+/// n, which an equality rightly finds nowhere but a range must still compare. Mutant
+/// `varchar_seek_key_cut` (test builds only): the key coerced, as before.
+fn encode_keeps_the_value(encode_expr: &turso_parser::ast::Expr) -> bool {
+    use turso_parser::ast::Expr;
+    match encode_expr {
+        Expr::FunctionCall { name, args, .. } => {
+            name.as_str().eq_ignore_ascii_case("varchar_encode")
+                && matches!(args.first().map(|a| &**a), Some(Expr::Id(v)) if v.as_str().eq_ignore_ascii_case("value"))
+        }
+        _ => false,
+    }
 }
 
 /// Engine review 20 item 9: a seek key of a custom type with no function '=' (varchar(n),

@@ -10712,10 +10712,23 @@ pub fn op_function(
             ScalarFunc::VarcharEncode => {
                 // varchar(n) (fastest-wire c15466936): the value unchanged when its length, as
                 // length() counts it, is at most n; else PostgreSQL's string_data_right_truncation.
-                // As the CASE it replaces, an n or a length that is NULL refuses too.
+                // As the CASE it replaces, an n or a length that is NULL refuses too. PostgreSQL's
+                // excess-space rule (varchar(), fastest-wire 0b092d531): a text whose characters
+                // past n are all spaces (U+0020 only) is cut to n characters and stored. Mutant
+                // `varchar_excess_spaces_refused` (test builds only): refused, as before.
                 check_arg_count!(arg_count, 2);
-                let val = state.registers[*start_reg].get_value().clone();
+                let mut val = state.registers[*start_reg].get_value().clone();
                 let maxlen = state.registers[*start_reg + 1].get_value().clone();
+                if let (Value::Text(t), Value::Numeric(Numeric::Integer(n))) = (&val, &maxlen) {
+                    if *n >= 0 && !crate::branch::store::fe_mutant("varchar_excess_spaces_refused") {
+                        let s = t.as_str();
+                        if let Some((cut, _)) = s.char_indices().nth(*n as usize) {
+                            if s[cut..].bytes().all(|b| b == b' ') {
+                                val = Value::build_text(s[..cut].to_string());
+                            }
+                        }
+                    }
+                }
                 let fits = match (&val, &maxlen) {
                     (Value::Null, _) => true,
                     (_, Value::Numeric(Numeric::Integer(n))) => {
