@@ -7841,8 +7841,13 @@ impl BranchStore {
         // an_id_lost_in_a_crash_is_never_reissued), an id an async create acknowledged can be lost
         // in a crash and issued again to another branch (engine-rev-qaf-fix2 HIGH F). Outside the
         // lib's own tests that state is unrepresentable: async is refused. The tests run the
-        // mechanism; no build a user links can.
-        if cfg!(not(test)) {
+        // mechanism; no build a user links can. AD-T5's fire-check binary (`fe-mutants`, PREREG-v1
+        // amendment 2: the one binary that may carry it, whose readings fill no slot) runs it too
+        // (engine-2bdcd32c6 MED 4: refused, every async_s0 arm was VOID at its warm-up), and so does
+        // nothing a user links: the feature is off by default and voids any credited binary that
+        // carries it. Mutant `fire_check_build_refuses_async` (fe-mutants builds): refused there
+        // too, as at da850ed1c.
+        if cfg!(not(test)) && (cfg!(not(feature = "fe-mutants")) || fe_mutant("fire_check_build_refuses_async")) {
             return Some("async creates are refused until the id floor lands (ASYNC-DESIGN §9): a lost id could be issued again");
         }
         let device_drained = match self.class {
