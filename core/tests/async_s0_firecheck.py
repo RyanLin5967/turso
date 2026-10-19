@@ -140,6 +140,12 @@ def main():
     # over the registered unmutated runs (0..RUNS; the live arm's extra parity runs differ in number
     # between binaries, engine-rev-l2b MED) must be the same on the reading and the fire-check binary.
     for arm in ("live", "strict_n1000"):
+        # An arm neither trace windowed cannot be equal by default (engine-rev-qaf-fix2 LOW 9: two
+        # empty traces compared equal, None == None).
+        if not any(k[0] == arm and k[1] < RUNS for k in base_c) or not any(k[0] == arm and k[1] < RUNS for k in read_c):
+            print(f"EQUALITY {arm}: no window traced on one binary (refusing)")
+            failed.append(f"equality {arm} untraced")
+            continue
         for count in ("writes", "flushes"):
             a = max((v.get(count, 0) for k, v in base_c.items() if k[0] == arm and k[1] < RUNS), default=None)
             b = max((v.get(count, 0) for k, v in read_c.items() if k[0] == arm and k[1] < RUNS), default=None)
