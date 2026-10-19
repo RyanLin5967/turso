@@ -2797,4 +2797,59 @@ mod tests {
         );
         assert!(bad.is_empty(), "CLAIM: a numeric aggregate or derived value compared as text: {bad:#?}");
     }
+
+    /// Engine review 2bdcd32c6 HIGH 8 (raw types/probe3.out.txt): a domain over numeric(8, 2) took
+    /// none of numeric's operators (a domain's TypeDef has none of its own), so its CHECK compared
+    /// the stored encoding, a blob, with the number: `dpos CHECK (VALUE > 0)` accepted -1 and 0.001
+    /// (stored 0.00), `dneg CHECK (VALUE < 0)` refused -1 and 1, and CAST(-1 AS dpos) passed; a
+    /// WHERE comparison and an ORDER BY of such a column were not numeric's either. A value of a
+    /// domain takes its base type's operators, as PostgreSQL's domains do. Expected values are
+    /// PostgreSQL 18.6's for this exact SQL (UW run typesrev-oracle2, zonky embedded-postgres
+    /// 18.6.0; artie raw frontier/fastest/lanes/engine/raw/pg18-types-rev2bd.txt 42503e4e38), never
+    /// ours; the refusal message is PG's own, here without its SQLSTATE (23514).
+    #[test]
+    fn a_domain_over_numeric_checks_compares_and_orders_as_numeric() {
+        let conn = open();
+        for sql in [
+            "CREATE DOMAIN dpos AS numeric(8, 2) CHECK (VALUE > 0)",
+            "CREATE DOMAIN dneg AS numeric(8, 2) CHECK (VALUE < 0)",
+            "CREATE TABLE d(id INTEGER PRIMARY KEY, a dpos, b dneg) STRICT",
+        ] {
+            conn.execute(sql).unwrap();
+        }
+        let pos = r#"value for domain dpos violates check constraint "dpos_check""#;
+        let neg = r#"value for domain dneg violates check constraint "dneg_check""#;
+        let mut bad = Vec::new();
+        for (sql, want) in [
+            ("INSERT INTO d(id, a) VALUES (1, -1)", Err(pos)),
+            ("INSERT INTO d(id, a) VALUES (2, 0.001)", Err(pos)),
+            ("INSERT INTO d(id, a) VALUES (3, 1.5)", Ok(())),
+            ("INSERT INTO d(id, b) VALUES (4, -1)", Ok(())),
+            ("INSERT INTO d(id, b) VALUES (5, 1)", Err(neg)),
+            ("INSERT INTO d(id, a) VALUES (6, 10), (7, 9)", Ok(())),
+            ("UPDATE d SET a = -2 WHERE id = 3", Err(pos)),
+            ("SELECT CAST(-1 AS dpos)", Err(pos)),
+            ("SELECT CAST(-3 AS dneg)", Ok(())),
+        ] {
+            let got = conn.prepare(sql).and_then(|mut s| s.run_collect_rows()).map(|_| ()).map_err(|e| e.to_string());
+            let ok = match (&got, want) {
+                (Ok(()), Ok(())) => true,
+                (Err(m), Err(w)) => m == w,
+                _ => false,
+            };
+            if !ok {
+                bad.push(format!("{sql} gave {got:?}, not PostgreSQL 18's {want:?}"));
+            }
+        }
+        bad.extend(diverging(
+            &conn,
+            &[
+                ("SELECT id FROM d WHERE a > 5 ORDER BY id", "6;7"),
+                ("SELECT a FROM d WHERE a IS NOT NULL ORDER BY a", "1.50;9.00;10.00"),
+                ("SELECT id, a, b FROM d ORDER BY id", "3,1.50,NULL;4,NULL,-1.00;6,10.00,NULL;7,9.00,NULL"),
+            ],
+            "PostgreSQL 18",
+        ));
+        assert!(bad.is_empty(), "CLAIM: a domain over numeric did not check, compare or order as numeric: {bad:#?}");
+    }
 }
