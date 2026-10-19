@@ -9458,6 +9458,14 @@ impl BranchStore {
                         f.overflow();
                         return FilterBuild::Ended;
                     }
+                    // Mutant `name_filter_install_work_one_in_10000` (test builds only; budgets-rev-242345
+                    // LOW-4): an O(N) term in the install hold, one insert per 10,000 scanned names, smaller
+                    // than the fixed 16-unit hold that the per-hold maximum reads.
+                    if fe_mutant("name_filter_install_work_one_in_10000") {
+                        for i in 0..table.len() / 10_000 {
+                            let _ = table.insert(0x9e37_79b9_7f4a_7c15 ^ i as u64);
+                        }
+                    }
                     f.live = (table.len() + pending.len()) as u64;
                     f.state = FilterState::Draining { table: table.clone(), pending: pending.clone() };
                     f.builds += 1;
