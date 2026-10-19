@@ -5650,6 +5650,18 @@ impl Column {
     pub fn set_hidden(&mut self, v: bool) {
         self.info.set_hidden(v)
     }
+    /// Whether a derived relation's column (a FROM subquery, a view, a CTE) carries the custom
+    /// type its source's values have (`plan::inherit_custom_type`), so `ty_str` names that type.
+    /// Otherwise its `ty_str` is only its affinity's name ("NUMERIC"), never a custom type (engine
+    /// review 2bdcd32c6 HIGH 4).
+    #[inline]
+    pub fn carries_custom_type(&self) -> bool {
+        self.info.carries_custom_type()
+    }
+    #[inline]
+    pub fn set_carries_custom_type(&mut self, v: bool) {
+        self.info.set_carries_custom_type(v)
+    }
     #[inline]
     pub fn is_array(&self) -> bool {
         self.info.is_array()
@@ -7578,6 +7590,9 @@ mod column_info {
     const F_NOTNULL: u32 = 4;
     const F_UNIQUE: u32 = 8;
     const F_HIDDEN: u32 = 16;
+    // Bit 26 (after the array dimensions): a derived relation's column carries its source's
+    // custom type (`Column::carries_custom_type`).
+    const F_CARRIES_CUSTOM_TYPE: u32 = 1 << 26;
 
     // pack Type and Collation in the remaining bits
     const TYPE_SHIFT: u32 = 5;
@@ -7684,6 +7699,16 @@ mod column_info {
         #[inline]
         pub fn set_hidden(&mut self, v: bool) {
             self.set_flag(F_HIDDEN, v);
+        }
+
+        #[inline]
+        pub fn carries_custom_type(&self) -> bool {
+            self.0 & F_CARRIES_CUSTOM_TYPE != 0
+        }
+
+        #[inline]
+        pub fn set_carries_custom_type(&mut self, v: bool) {
+            self.set_flag(F_CARRIES_CUSTOM_TYPE, v);
         }
 
         #[inline]

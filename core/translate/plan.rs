@@ -2555,6 +2555,7 @@ fn inherit_custom_type(column: &mut Column, expr: &ast::Expr, tables: &TableRefe
     if let Some((type_def, params)) = super::order_by::expr_custom_type(expr, tables, schema) {
         column.ty_str = type_def.name.clone();
         column.ty_params = params;
+        column.set_carries_custom_type(true);
     }
 }
 

@@ -67,8 +67,20 @@ pub(crate) fn expr_custom_type(
             if col.is_array() || col.ty_str.is_empty() {
                 return None;
             }
+            // A derived relation's column is of a custom type only when it carries its source's
+            // (`Column::carries_custom_type`): otherwise its type name is its affinity's, and a
+            // plain NUMERIC column of a non-STRICT table read through a subquery, a view or a CTE
+            // was taken for the custom numeric type (engine review 2bdcd32c6 HIGH 4). Mutant
+            // `derived_affinity_taken_for_custom_type` (test builds only): any registered name, as
+            // before.
             let type_def = match table {
-                crate::schema::Table::FromClauseSubquery(_) => schema.get_type_def_unchecked(&col.ty_str),
+                crate::schema::Table::FromClauseSubquery(_)
+                    if col.carries_custom_type()
+                        || crate::branch::store::fe_mutant("derived_affinity_taken_for_custom_type") =>
+                {
+                    schema.get_type_def_unchecked(&col.ty_str)
+                }
+                crate::schema::Table::FromClauseSubquery(_) => None,
                 _ => schema.get_type_def(&col.ty_str, table.is_strict()),
             }?;
             Some((type_def.clone(), col.ty_params.clone()))
