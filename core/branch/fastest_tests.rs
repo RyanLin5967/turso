@@ -16372,13 +16372,6 @@ fn a_dropped_virtual_table_is_destroyed_only_once_no_connection_holds_it() {
     assert_eq!(d2 - d0, 1, "CLAIM: once no connection held it, the table was destroyed once");
 }
 
-/// Opens `path` without unwrapping, so a schema that no longer parses is a test failure with its
-/// reason, not a panic inside the helper.
-fn try_open_at(path: &Path, opts: DatabaseOpts) -> crate::Result<Arc<Database>> {
-    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
-    Database::open_file_with_flags(io, path.to_str().unwrap(), OpenFlags::Create, opts, None, Arc::new(SqliteDialect))
-}
-
 /// engine-rev 2bdcd32c6 HIGH 1 (REVIEW-engine-2bdcd32c6): a bracketed type whose contents start and
 /// end with the same quote (`["a"b"]`, `['x'y']`, `` [`a`b`] ``) was printed bare, an unterminated
 /// literal: CREATE was refused ("non-terminated literal"; SQLite 3.53.4 accepts it), and a table
