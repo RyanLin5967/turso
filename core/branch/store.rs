@@ -2021,8 +2021,9 @@ impl Drop for StoreGuard<'_> {
         // blocking on the group lock (see `StoreMutex::pool_notified`).
         if pool_low {
             // Mutant `pool_kicked_before_claim` (test builds only): flagged before the claim, by
-            // every low unlock, as at da850ed1c.
-            if fe_mutant("pool_kicked_before_claim") {
+            // every low unlock, and not again after the claim, as at da850ed1c.
+            let flagged_early = fe_mutant("pool_kicked_before_claim");
+            if flagged_early {
                 self.store.pool_kicked.store(true, Ordering::Release);
             }
             #[cfg(test)]
@@ -2041,7 +2042,9 @@ impl Drop for StoreGuard<'_> {
                     .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok()
             {
-                self.store.pool_kicked.store(true, Ordering::Release);
+                if !flagged_early {
+                    self.store.pool_kicked.store(true, Ordering::Release);
+                }
                 let kicked = self.store.pool_kicker.get().is_some_and(|kick| kick());
                 if !kicked {
                     self.store.pool_notified.store(false, Ordering::Release);
