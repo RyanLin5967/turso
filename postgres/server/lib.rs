@@ -3813,9 +3813,10 @@ fn inline_one_row(f: &str, pg_type: &Type, value: &[u8]) -> Option<pgwire::messa
         && m.push(&0i32.to_be_bytes())
         && m.push(&0i16.to_be_bytes())
         && m.push(&pg_type.oid().to_be_bytes())
-        // pgwire's FieldInfo sends type size and modifier 0 (its From<&FieldInfo>), and so must this.
-        && m.push(&0i16.to_be_bytes())
-        && m.push(&0i32.to_be_bytes())
+        // The type's size and no modifier, as pgwire's From<&FieldInfo> sends them (vendored
+        // change 12), so the inline reply stays byte for byte pgwire's.
+        && m.push(&pgwire::api::results::type_size(pg_type.oid()).to_be_bytes())
+        && m.push(&(-1i32).to_be_bytes())
         && m.push(&0i16.to_be_bytes())
         && m.push(b"D")
         && m.push(&(i32::try_from(d_len).ok()?).to_be_bytes())
@@ -5101,6 +5102,10 @@ fn field_info(
         .map(|i| {
             let name = stmt.get_column_name(i).into_owned();
             let format = result_format(format, i, columns)?;
+            // Type modifier -1 (none) for every column: a declared column's length or precision
+            // (varchar(5) 9, numeric(8,2) 524294) is in its core Column's ty_params, which no
+            // Statement accessor gives (asked of fastest-engine; known red,
+            // row_descriptions_carry_postgresqls_type_sizes_and_modifiers).
             Ok(FieldInfo::new(name, None, None, pg_type(i), format))
         })
         .collect()

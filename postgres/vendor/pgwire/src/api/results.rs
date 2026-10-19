@@ -92,6 +92,26 @@ pub struct FieldInfo {
     format: FieldFormat,
     #[new(default)]
     format_options: Arc<FormatOptions>,
+    /// The column's type modifier (atttypmod): -1, none, unless set (tursopg change 12).
+    #[new(value = "-1")]
+    type_modifier: i32,
+}
+
+/// A type's size as pg_type.typlen gives it for the types PostgreSQL 18 sends with a fixed size;
+/// -1 (variable length) for every other (tursopg change 12).
+pub fn type_size(oid: u32) -> i16 {
+    match oid {
+        16 | 18 => 1,                        // bool, "char"
+        21 => 2,                             // int2
+        23 | 26 | 700 | 1082 | 28 | 29 => 4, // int4, oid, float4, date, xid, cid
+        20 | 701 | 1083 | 1114 | 1184 | 790 | 3220 => 8, // int8, float8, time, timestamp(tz), money, pg_lsn
+        1266 => 12,                          // timetz
+        2950 | 1186 => 16,                   // uuid, interval
+        829 => 6,                            // macaddr
+        774 => 8,                            // macaddr8
+        19 => 64,                            // name
+        _ => -1,
+    }
 }
 
 impl FieldInfo {
@@ -123,6 +143,15 @@ impl FieldInfo {
         self.format_options = format_options;
         self
     }
+
+    pub fn type_modifier(&self) -> i32 {
+        self.type_modifier
+    }
+
+    pub fn with_type_modifier(mut self, type_modifier: i32) -> Self {
+        self.type_modifier = type_modifier;
+        self
+    }
 }
 
 impl From<&FieldInfo> for FieldDescription {
@@ -132,9 +161,8 @@ impl From<&FieldInfo> for FieldDescription {
             fi.table_id.unwrap_or(0),  // table_id
             fi.column_id.unwrap_or(0), // column_id
             fi.datatype.oid(),         // type_id
-            // TODO: type size and modifier
-            0,
-            0,
+            type_size(fi.datatype.oid()),
+            fi.type_modifier,
             fi.format.value(),
         )
     }
@@ -149,6 +177,7 @@ impl From<FieldDescription> for FieldInfo {
             Type::from_oid(value.type_id).unwrap_or(Type::UNKNOWN),
             FieldFormat::from(value.format_code),
         )
+        .with_type_modifier(value.type_modifier)
     }
 }
 

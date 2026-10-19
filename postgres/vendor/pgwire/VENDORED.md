@@ -93,3 +93,7 @@ Every change from the crate is listed here, newest last; `diff -r` against the c
     encryption request"), as PostgreSQL 18.6 does (recorded for SSL: artie pg18-diff/pg18-ssl3.out),
     and the connection ends. A pipelined second SSLRequest got 0A000, and a pipelined
     StartupMessage was served.
+12. `api/results.rs` (wire-rev-uw3 MED-1): `From<&FieldInfo> for FieldDescription` sends the type's
+    size (`type_size`, pg_type.typlen for the fixed-size types, -1 otherwise) and the field's type
+    modifier, a new `FieldInfo` field (`type_modifier`, -1 unless `with_type_modifier` sets it), in
+    place of 0 and 0 (the crate's TODO); `From<FieldDescription> for FieldInfo` keeps the modifier.
