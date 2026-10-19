@@ -15818,3 +15818,59 @@ fn a_switch_to_the_capture_table_in_another_case_keeps_its_version_and_layout() 
     let named_t = adv_rows(&c, "SELECT count(*) FROM c1 WHERE table_name = 't'").unwrap();
     assert_eq!(named_t[0][0], "2", "CLAIM: both writes of t are v2-layout rows naming t");
 }
+
+/// engine-rev-qaf-fix HIGH-2/3/4 and MED-1 (the stored text an ADD COLUMN rewrites loses clauses,
+/// the class of QUOTE-SWEEP F1): after ADD COLUMN and a reopen, each table answers as before, and as
+/// SQLite 3.53.1 answers the same statements (python sqlite3 on UW; artie raw uw-qaf2-sqlite-3531).
+/// - a PRIMARY KEY (a DESC) table reopens and reads;
+/// - UNIQUE (a COLLATE NOCASE) still refuses 'a' after 'A';
+/// - a column typed `[x,y]` stays one column (two after the added one);
+/// - UNIQUE ON CONFLICT REPLACE still replaces.
+#[test]
+fn add_column_keeps_every_clause_of_the_stored_table_across_a_reopen() {
+    let _g = serial();
+    let mut failed: Vec<String> = Vec::new();
+    let cases: [(&str, &[&str], &[&str], &str, &str); 4] = [
+        ("PRIMARY KEY DESC", &["CREATE TABLE t(a INTEGER, b, PRIMARY KEY (a DESC))", "INSERT INTO t VALUES (1, 'x')"], &[], "SELECT count(*) FROM t", "1"),
+        ("UNIQUE COLLATE NOCASE", &["CREATE TABLE t(a TEXT, UNIQUE (a COLLATE NOCASE))", "INSERT INTO t VALUES ('A')"], &["INSERT OR IGNORE INTO t VALUES ('a', 0)"], "SELECT count(*) FROM t", "1"),
+        ("type [x,y]", &["CREATE TABLE t(a [x,y])"], &[], "SELECT count(*) FROM pragma_table_info('t')", "2"),
+        ("UNIQUE ON CONFLICT REPLACE", &["CREATE TABLE t(a UNIQUE ON CONFLICT REPLACE, v)", "INSERT INTO t VALUES (1, 'old')"], &["INSERT INTO t VALUES (1, 'new', 0)"], "SELECT v FROM t", "new"),
+    ];
+    for (case, setup, after, query, want) in cases {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("keep.db");
+        {
+            let db = open_at(&path, DatabaseOpts::new());
+            let c = db.connect().unwrap();
+            for sql in setup {
+                c.execute(*sql).unwrap();
+            }
+            if let Err(e) = c.execute("ALTER TABLE t ADD COLUMN z") {
+                failed.push(format!("{case}: ADD COLUMN: {e}"));
+                continue;
+            }
+        }
+        let reopened = std::panic::catch_unwind(|| open_at(&path, DatabaseOpts::new()));
+        let Ok(db) = reopened else {
+            failed.push(format!("{case}: the reopen panicked"));
+            continue;
+        };
+        let c = match db.connect() {
+            Ok(c) => c,
+            Err(e) => {
+                failed.push(format!("{case}: connect after the reopen: {e}"));
+                continue;
+            }
+        };
+        for sql in after {
+            if let Err(e) = c.execute(*sql) {
+                failed.push(format!("{case}: `{sql}` after the reopen: {e}"));
+            }
+        }
+        match adv_rows(&c, query) {
+            Ok(r) if r.first().map(|row| row[0].as_str()) == Some(want) => {}
+            other => failed.push(format!("{case}: `{query}` after the reopen = {other:?}, SQLite answers {want}")),
+        }
+    }
+    assert!(failed.is_empty(), "CLAIM: ADD COLUMN keeps the stored table's clauses: {failed:#?}");
+}
