@@ -561,10 +561,13 @@ du_total() { du -sB1 -c "$@" 2>/dev/null | awk '$2 == "total" {print $1}'; }
 # parent_du_paths / store_du_paths -- comp review 1 LOW 26: the parent's own files (what server_fixture's --du names:
 # PG the template p's directory, Dolt and Doltgres their whole store, which BEFORE the prebranch is the parent alone)
 # and the whole store (PG the cluster's data directory), each into the array DUP
+# pg_parent_dir OID -> DATA/base/OID, the template p's directory (comp-rev-89ec-b3c3 LOW 9: an empty oid named
+# DATA/base/, all of it, as the parent)
+pg_parent_dir() { echo "$DATA/base/$1"; }
 parent_du_paths() {
   local oid
   case $KIND in
-    pg) oid=$(sqlq "SELECT oid FROM pg_database WHERE datname = 'p'"); DUP=("$DATA/base/$oid") ;;
+    pg) oid=$(sqlq "SELECT oid FROM pg_database WHERE datname = 'p'"); DUP=("$(pg_parent_dir "$oid")") ;;
     dolt) DUP=("$DATA/dbs/bench") ;;
     doltgres) DUP=("$DATA/databases") ;;
     b1) DUP=("$ROOT/parent.db") ;;
@@ -581,6 +584,13 @@ store_du_paths() {
 # parent_du_before_prebranch -> PARENT_DU0 (LOW 26), or the job fails
 parent_du_before_prebranch() {
   local -a DUP
+  if [ "$KIND" = pg ]; then  # comp-rev-89ec-b3c3 LOW 9: the oid guard, planted (no server needed)
+    local o got=""
+    for o in "" "x" "16384 1" "-1"; do
+      pg_parent_dir "$o" >/dev/null 2>&1 && got="$got [$o] accepted"
+    done
+    expect "pg_parent_dir refuses an empty or non-count oid (LOW 9)" "${got:-every planted oid refused}" "every planted oid refused"
+  fi
   parent_du_paths
   PARENT_DU0=$(du_total "${DUP[@]}")
   [[ $PARENT_DU0 =~ ^[1-9][0-9]*$ ]] || fail "parent du before the prebranch [$PARENT_DU0] of ${DUP[*]} is not a count"
@@ -910,6 +920,38 @@ server_main() {
     "$(count_branches)" "$((LIVE0 + NDES))"
   srv stop "$DATA" | tee -a "$RAW/server-stop.txt" || fail "server stop by recorded pid"
   cp "$DATA.log" "$RAW/server_log.txt" 2>/dev/null
+  if [ "$KIND" = dolt ] || [ "$KIND" = doltgres ]; then autogc_plant; fi
+}
+
+# autogc_plant -- comp-rev-89ec-b3c3 LOW 13 (after the cells and the job's own server, LOW 25): the pinned auto-GC
+# setting (config.yaml behavior.auto_gc_behavior enable: true) is the binaries' own default, so a record reading ON
+# cannot show the config took effect. Two small stores on the job's port, one after the other: FT_AUTOGC_ENABLE=false
+# must read off and its GC settings record be REFUSED by fthelp.py gcsettings; =true must read on and be ok.
+autogc_plant() {
+  local en d v f
+  mkdir -p "$RAW/plants"
+  for en in false true; do
+    d="$ROOT/plant-autogc-$en"
+    if FT_AUTOGC_ENABLE=$en srv init "$d" "$PORT" >"$RAW/plants/autogc-$en-init.txt" 2>&1 &&
+       FT_AUTOGC_ENABLE=$en srv start "$d" >"$RAW/plants/autogc-$en-start.txt" 2>&1 &&
+       srv seed "$d" 10 0 >"$RAW/plants/autogc-$en-seed.txt" 2>&1; then
+      v=$(head -1 "$d.gc-settings.verdict" 2>/dev/null)
+    else
+      v="plant store did not start or seed: $(tail -1 "$RAW/plants/autogc-$en-seed.txt" "$RAW/plants/autogc-$en-start.txt" 2>/dev/null | tr '\n' ' ' | cut -c1-200)"
+    fi
+    for f in "$d.gc-settings.txt" "$d.gc-settings.verdict" "$d/config.yaml"; do
+      [ -e "$f" ] && cp "$f" "$RAW/plants/autogc-$en-$(basename "$f")"
+    done
+    srv stop "$d" >>"$RAW/plants/autogc-$en-stop.txt" 2>&1 || fail "autogc plant ($en): stop by recorded pid"
+    if [ "$en" = false ]; then
+      case $v in
+        "REFUSED: dolt_auto_gc_enabled is "*", not on"*) pass "autogc plant: enable false reads off and is refused ($v)" ;;
+        *) fail "autogc plant: enable false must read off and be REFUSED by fthelp.py gcsettings; got [$v]" ;;
+      esac
+    else
+      expect "autogc plant: enable true reads on (fthelp.py gcsettings)" "$v" ok
+    fi
+  done
 }
 
 pg_clone_proof() {
