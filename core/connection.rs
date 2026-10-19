@@ -5596,8 +5596,8 @@ impl Connection {
 
     /// The transaction ended: on a commit, each dropped virtual table that no schema of this
     /// connection holds any more (a statement or savepoint rollback can have restored it) leaves
-    /// the registry and is destroyed; on a rollback, none is. A destroy that fails after the commit
-    /// cannot fail the DROP any more, so it is logged.
+    /// the registry and is marked to be destroyed when its last holder, in any connection, lets go;
+    /// on a rollback, none is. A destroy that fails then cannot fail the DROP, so it is logged.
     fn finish_vtab_destroys(&self, committed: bool) {
         let pending = std::mem::take(&mut *self.pending_vtab_destroys.write());
         if pending.is_empty() || !committed {
@@ -5625,9 +5625,9 @@ impl Connection {
                     syms.vtabs.remove(&vtab.name);
                 }
             }
-            if let Err(e) = vtab.destroy() {
-                tracing::error!("destroying dropped virtual table {} after its commit: {e}", vtab.name);
-            }
+            // Destroyed when the last holder lets go: another connection's schema, program or
+            // cursor may still hold this table (engine-rev-qaf-fix MED-7).
+            vtab.destroy_when_unused();
         }
     }
 
