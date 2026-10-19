@@ -12630,7 +12630,6 @@ replays_postgresql!(
     pg18_audit2_char_n_is_blank_padded_as_in_postgres_replays_as_postgresql_answered,
     "pg18-audit2-char_n_is_blank_padded_as_in_postgres.out",
     [
-        (5, "PGDIV-EXPR-TYPE-TEXT value [wire]: length(char(n)) typed 25 text in RowDescription; PG 23 int4 (value 3 agrees)"),
         (6, "PGDIV-CHAR-OVERFLOW-CODE error-code [wire]: char(6) overflow: PG 22001 'value too long for type character(6)'; ours XX000 'value too long for type character'"),
     ]
 );
@@ -12790,7 +12789,6 @@ replays_postgresql!(
     "pg18-audit3-a_numeric_division_by_zero_is_22012.out",
     [
         (1, "PGDIV-SCHEMA-REFUSED cluster-state [cluster]: DROP SCHEMA IF EXISTS s; DROP SCHEMA public: ours refuses the whole query 0A000"),
-        (4, "PGDIV-NUMERIC-OID-FLOAT8 value [wire]: SELECT x / 0 FROM nd: RowDescription then 22012 as in PG (C53), but the column is typed 701 where PG types it 1700"),
     ]
 );
 replays_postgresql!(
@@ -15303,7 +15301,7 @@ fn computed_and_smallint_result_columns_carry_postgresqls_types() {
 /// was refused 42601 "index  already exists", where PostgreSQL chooses a name (ChooseRelationName):
 /// table, columns ("expr" for an expression) and "idx" joined by "_", each part cut to fit 63
 /// bytes, and a number after "idx" while the name is any relation's. Recorded on iccad2,
-/// cli/tests/pg18/pg18-index-names.out.
+/// cli/tests/recordings/pg18-index-names.out.
 #[test]
 fn an_index_with_no_name_is_named_as_postgresql_names_it() {
     let dir = Scratch::new("index-names");
@@ -15379,7 +15377,7 @@ fn a_value_too_long_for_varchar_is_22001_as_postgresql_answers() {
 /// (pgwire's From<&FieldInfo>), where PostgreSQL 18.6 sends each type's size (int4 4, int8 8, bool
 /// 1, a variable-length type -1) and the column's modifier (-1 for none, varchar(5) 9, numeric(8,2)
 /// 524294, char(3) 7); a numeric with modifier 0 is an invalid one (a driver reads its scale from
-/// it). Recorded on iccad2, cli/tests/pg18/pg18-typmod.out. Compared where the type OID agrees with
+/// it). Recorded on iccad2, cli/tests/recordings/pg18-typmod.out. Compared where the type OID agrees with
 /// PostgreSQL's (an OID mismatch is another divergence); at least 20 columns must.
 #[test]
 fn row_descriptions_carry_postgresqls_type_sizes_and_modifiers() {
