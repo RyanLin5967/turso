@@ -2732,21 +2732,13 @@ fn a_thread_table_read_without_descriptors_is_refused() {
         // that refusal (Table), not NoKernelCount.
         let want = format!(" window_refusal={} ", probe::Refusal::Table as u64);
         assert!(one.contains(&want), "CLAIM: a window with its thread table unreadable at both ends did not record Table ({}): {one}", probe::Refusal::Table as u64);
-        // budgets-rev-39bb7fd43 MED-1 (its REV2): under descriptor CHURN (2 free, another thread opening and
-        // closing), a per-task open may fail EMFILE while the caller is still listed, so only the errno check
-        // (not the caller check) can refuse a table that skipped a live task. CLAIM: no read is an incomplete
-        // table. Premise: some reads were not refused (else nothing was judged).
-        let churn = text.lines().find_map(|l| l.find("FD-CHURN ").map(|i| l[i..].to_string())).unwrap_or_else(|| panic!("premise: no churn reading:\n{text}"));
-        let field = |k: &str| -> u64 {
-            let tag = format!(" {k}=");
-            let at = churn.find(&tag).unwrap_or_else(|| panic!("premise: no {k} in {churn}")) + tag.len();
-            churn[at..].split_whitespace().next().unwrap().parse().unwrap()
-        };
-        assert!(field("complete") + field("incomplete") >= 1, "premise: every churned read was refused, so none was judged: {churn}");
-        // budgets-rev-39bb7fd43 addendum MED-1: the churn must have FIRED (some read refused by the errno check:
-        // a descriptor was held while a task was opened), or a clean count proves nothing.
-        assert!(field("refused") >= 1, "premise: no churned read was refused, so the churn never took the last descriptor: {churn}");
-        assert_eq!(field("incomplete"), 0, "CLAIM: under descriptor churn a thread table skipped a live task and was not refused: {churn}");
+        // budgets-rev-39bb7fd43 MED-1 (FLAGGED: replaces 299d9fb23/5055c67b7's churn arm, which was bimodal on
+        // iccad9, 5000 or 0 of 5000 reads refused in 5 of 6 runs, so neither its claim nor its premise could be
+        // relied on): one live task's /proc opens fail as with EMFILE (`probe::PROBE_EMFILE_TID`), the caller
+        // still listed, so only the errno check can refuse. CLAIM: the table and others_blocked refuse.
+        let inj = text.lines().find_map(|l| l.find("FD-INJECT ").map(|i| l[i..].to_string())).unwrap_or_else(|| panic!("premise: no injected reading:\n{text}"));
+        assert!(inj.contains(" tid_known=1 "), "premise: the injected thread's id was not read: {inj}");
+        assert!(inj.contains(" table=refused ") && inj.contains(" blocked=refused "), "CLAIM: a table with a live task unreadable for want of a descriptor was not refused: {inj}");
         return;
     }
     let (tx, rx) = std::sync::mpsc::channel::<()>();
@@ -2754,9 +2746,12 @@ fn a_thread_table_read_without_descriptors_is_refused() {
         let _ = rx.recv();
     });
     let stop = Arc::new(AtomicBool::new(false));
+    let spinner_tid = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let spinner = {
-        let stop = stop.clone();
+        let (stop, spinner_tid) = (stop.clone(), spinner_tid.clone());
         std::thread::spawn(move || {
+            // SAFETY: the raw syscall (glibc before 2.30 has no gettid wrapper); it cannot fail.
+            spinner_tid.store(unsafe { libc::syscall(libc::SYS_gettid) } as u64, Release);
             while !stop.load(Acquire) {
                 std::hint::spin_loop();
             }
@@ -2807,60 +2802,25 @@ fn a_thread_table_read_without_descriptors_is_refused() {
         };
         println!("FD-TABLE free={free} table={table} n={n:?} blocked={blocked} window_refusal={} ", w1.refusal as u64);
     }
-    // budgets-rev-39bb7fd43 MED-1 (its REV2): 2 descriptors free, one churn thread opening and closing /dev/null,
-    // 5000 table reads. Base: the live tasks counted (complete) before the table is filled, the churn thread among them.
+    // budgets-rev-39bb7fd43 MED-1: the spinner's /proc opens fail as with EMFILE (injected), the caller listed.
     {
-        let churning = Arc::new(AtomicBool::new(true));
-        let churn = {
-            let churning = churning.clone();
-            std::thread::spawn(move || {
-                while churning.load(Acquire) {
-                    // SAFETY: a NUL-terminated path; the descriptor is closed at once.
-                    let fd = unsafe { libc::open(b"/dev/null\0".as_ptr().cast(), libc::O_RDONLY | libc::O_CLOEXEC) };
-                    if fd >= 0 {
-                        // Held briefly (the reviewer's REV2 spun 50 times here), so a table read overlaps the hold.
-                        for _ in 0..50 {
-                            std::hint::spin_loop();
-                        }
-                        // SAFETY: opened above.
-                        unsafe { libc::close(fd) };
-                    }
-                }
-            })
-        };
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        let tid = spinner_tid.load(Acquire);
+        probe::PROBE_EMFILE_TID.store(tid, Release);
         let mut t = [probe::ThreadCpu::EMPTY; 48];
-        let base = probe::thread_table(&mut t).expect("premise: the thread table could not be read before the descriptors were filled");
-        let mut fds = Vec::with_capacity(256);
-        loop {
-            // SAFETY: a NUL-terminated path.
-            let fd = unsafe { libc::open(b"/dev/null\0".as_ptr().cast(), libc::O_RDONLY | libc::O_CLOEXEC) };
-            if fd < 0 {
-                break;
-            }
-            fds.push(fd);
-        }
-        for _ in 0..2 {
-            if let Some(fd) = fds.pop() {
-                // SAFETY: a descriptor opened above.
-                unsafe { libc::close(fd) };
-            }
-        }
-        let (mut complete, mut incomplete, mut refused) = (0u64, 0u64, 0u64);
-        for _ in 0..5000 {
-            match probe::thread_table(&mut t) {
-                None => refused += 1,
-                Some(n) if n >= base => complete += 1,
-                Some(_) => incomplete += 1,
-            }
-        }
-        for fd in fds {
-            // SAFETY: descriptors opened above.
-            unsafe { libc::close(fd) };
-        }
-        churning.store(false, Release);
-        churn.join().unwrap();
-        println!("FD-CHURN base={base} reads=5000 complete={complete} incomplete={incomplete} refused={refused} ");
+        let n = probe::thread_table(&mut t);
+        let blocked = probe::others_blocked();
+        probe::PROBE_EMFILE_TID.store(0, Release);
+        let table = match n {
+            None => "refused",
+            Some(n) if n >= 3 && t.iter().any(|x| x.me) && t[..n.min(48)].iter().any(|x| x.id == tid) => "listed",
+            Some(_) => "incomplete",
+        };
+        let blocked = match blocked {
+            None => "refused",
+            Some(true) => "all",
+            Some(false) => "some",
+        };
+        println!("FD-INJECT tid_known={} table={table} n={n:?} blocked={blocked} ", u64::from(tid != 0));
     }
     // SAFETY: the limit read above.
     unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &old) };

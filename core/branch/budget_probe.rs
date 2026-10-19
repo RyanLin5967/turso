@@ -1836,11 +1836,21 @@ fn linux_task_path(tid: u64, leaf: &[u8], out: &mut [u8; 64]) -> usize {
     i + 1
 }
 
+/// budgets-rev-39bb7fd43 MED-1: the task whose /proc opens fail as with EMFILE (0: none), so the errno
+/// half of HIGH-1's fix is tested deterministically: a live task, the caller still listed, an open that fails
+/// for want of a descriptor. Descriptor churn could not force it (bimodal on iccad9: 5000 or 0 of 5000 reads
+/// refused in 5 of 6 runs).
+pub(crate) static PROBE_EMFILE_TID: AtomicU64 = AtomicU64::new(0);
+
 /// Whether task `tid` still exists: `Some(true)` if its /proc directory opens, `Some(false)` only if the
 /// open fails because the task is gone (ENOENT, ESRCH), `None` on any other failure (EMFILE, ENFILE,
 /// ENOMEM...: unknown, which a reader must refuse; budgets-port-adversary HIGH-1).
 #[cfg(target_os = "linux")]
 fn linux_task_alive(tid: u64) -> Option<bool> {
+    // budgets-rev-39bb7fd43 MED-1: the injected open failure (`PROBE_EMFILE_TID`) reads as EMFILE does: unknown.
+    if tid != 0 && PROBE_EMFILE_TID.load(Relaxed) == tid {
+        return None;
+    }
     let mut path = [0u8; 64];
     let used = linux_task_path(tid, b"", &mut path);
     // SAFETY: a NUL-terminated path; the descriptor is closed below.
@@ -1858,6 +1868,9 @@ fn linux_task_alive(tid: u64) -> Option<bool> {
 /// Task `tid`'s state letter and name (comm, NUL-padded) from its `stat`.
 #[cfg(target_os = "linux")]
 fn linux_task_stat(tid: u64) -> Option<(u8, [u8; 32])> {
+    if tid != 0 && PROBE_EMFILE_TID.load(Relaxed) == tid {
+        return None;
+    }
     let mut path = [0u8; 64];
     let used = linux_task_path(tid, b"stat", &mut path);
     let mut buf = [0u8; 512];
