@@ -7592,6 +7592,35 @@ fn copy_reads_numbers_options_and_lines_as_postgresql_does() {
     );
 }
 
+/// A row's first failing column is the one COPY reports, as PostgreSQL 18.6 reads a row's fields in
+/// order (wirefuzz wire-fuzz4 seed 255; recorded, copy-stdin-pg18.txt part 5): numeric(6,2)'s
+/// 10000 (22003) before varchar(5)'s 'abcdef' (22001), and 22001 first when the varchar column
+/// comes first; 9999.995 rounds past numeric(6,2) (22003), 9999.994, -0.005 and 1e3 load. The
+/// varchar check ran before any insert and the numeric one in the engine's insert, so 22001 came
+/// first whatever the column order.
+#[test]
+fn copy_reports_a_rows_first_failing_column() {
+    let dir = Scratch::new("copyfirstcol");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE t0 (id int PRIMARY KEY, c0 numeric(6,2))").ok("t0");
+    a.q("ALTER TABLE t0 ADD COLUMN c1 varchar(5)").ok("c1");
+    for (sql, data, code) in [
+        ("COPY t0 (id, c0, c1) FROM STDIN", &b"6\t1234.567\tZz\n7\t10000\tabcdef\n"[..], "22003"),
+        ("COPY t0 (id, c1, c0) FROM STDIN", b"7\tabcdef\t10000\n", "22001"),
+        ("COPY t0 (id, c0) FROM STDIN", b"8\t9999.995\n", "22003"),
+    ] {
+        let r = a.copy(sql, &[CopyIn::Data(data)]);
+        assert_eq!(r.err(sql).code, code, "{sql} <- {:?}", String::from_utf8_lossy(data));
+    }
+    assert_eq!(a.q("SELECT count(*) FROM t0").single("count"), "0");
+    let sql = "COPY t0 (id, c0) FROM STDIN";
+    let r = a
+        .copy(sql, &[CopyIn::Data(b"9\t9999.994\n10\t-0.005\n11\t1e3\n")])
+        .ok(sql);
+    assert_eq!(r.tags, vec!["COPY 3".to_string()], "{sql}");
+}
+
 /// COPY FROM a file with no file granted is 42501 before the table, its columns or its options are
 /// read, as PostgreSQL 18.6 refuses a role without pg_read_server_files first (recorded,
 /// copy-stdin-pg18.txt part 3: `nofiles`). Checked after the table, these were 42P01, 42703, 42601.
