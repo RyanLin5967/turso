@@ -2788,6 +2788,83 @@ fn a_thread_table_read_without_descriptors_is_refused() {
     parked.unwrap().join().unwrap();
 }
 
+/// budgets-port-adversary MED-1 (its ADV2): on Linux a thread name is the kernel's comm, cut at 15 bytes,
+/// and an unnamed thread inherits its creator's, so owning `branch-checkpoint` by name also owned a thread
+/// named `branch-checkpoint-foreign` and any unnamed child of a `branch-checkpoint` thread. CLAIM: a window
+/// owns a store thread by the thread's own registration (`probe::register_owned_thread`, by id), so both of
+/// those run as FOREIGN; controls: an unrelated name is foreign, a registered `branch-checkpoint` thread is
+/// owned. In a child of its own (its windows need no other test's threads).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_window_owns_a_store_thread_by_its_registration_not_its_name() {
+    use std::sync::mpsc::channel;
+    if std::env::var_os("FE_OWNED_TID_CHILD").is_none() {
+        if in_child() || std::env::var_os("FE_FLAGS_CHILD").is_some() || std::env::var_os("FE_ARM_CHILD").is_some() || std::env::var_os("FE_THREAD_STATE_CHILD").is_some() || std::env::var_os("FE_FD_TABLE_CHILD").is_some() {
+            return;
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["branch::budget_tests::a_window_owns_a_store_thread_by_its_registration_not_its_name", "--exact", "--test-threads=1", "--nocapture"])
+            .env("FE_OWNED_TID_CHILD", "1")
+            .env_remove("FE_BUDGET_CHILD")
+            .output()
+            .unwrap();
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        let foreign = |case: &str| -> u64 {
+            let tag = format!("OWNED case={case} foreign=");
+            let l = text.lines().find(|l| l.starts_with(&tag)).unwrap_or_else(|| panic!("premise: no reading of case {case}:\n{text}"));
+            l[tag.len()..].split_whitespace().next().unwrap().parse().unwrap()
+        };
+        assert!(foreign("unrelated") >= 1, "premise: an unrelated thread's burst was not foreign");
+        assert_eq!(foreign("registered"), 0, "premise: a registered branch-checkpoint thread's burst was foreign");
+        assert!(foreign("prefix") >= 1, "CLAIM: a thread named branch-checkpoint-foreign was owned by a window owning branch-checkpoint");
+        assert!(foreign("inherited") >= 1, "CLAIM: an unnamed child of a branch-checkpoint thread was owned by a window owning branch-checkpoint");
+        return;
+    }
+    // One burst in a window owning branch-checkpoint: the thread is spawned and parked first (so the window
+    // sees no new thread), then let go for 5 ms of spinning, then parked again before the window ends.
+    let run = |case: &str, name: Option<&'static str>, register: bool, via_parent: bool| {
+        let (go_tx, go_rx) = channel::<()>();
+        let (done_tx, done_rx) = channel::<()>();
+        let body = move || {
+            let _owned = register.then(|| probe::register_owned_thread("branch-checkpoint"));
+            while go_rx.recv().is_ok() {
+                let t = std::time::Instant::now();
+                while t.elapsed() < std::time::Duration::from_millis(5) {
+                    std::hint::spin_loop();
+                }
+                let _ = done_tx.send(());
+            }
+        };
+        let spawn = move || {
+            let b = std::thread::Builder::new();
+            let b = match name {
+                Some(n) => b.name(n.into()),
+                None => b,
+            };
+            b.spawn(body).unwrap()
+        };
+        let h = if via_parent {
+            // The parent is named branch-checkpoint and spawns the burst thread unnamed; it waits in join.
+            std::thread::Builder::new().name("branch-checkpoint".into()).spawn(move || spawn().join().unwrap()).unwrap()
+        } else {
+            spawn()
+        };
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let _s0 = probe::begin();
+        go_tx.send(()).unwrap();
+        let _ = done_rx.recv();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let s1 = probe::end_owning(&["branch-checkpoint"]);
+        println!("OWNED case={case} foreign={} quiet={}", s1.foreign, u64::from(s1.threads_quiet));
+        drop(go_tx);
+        h.join().unwrap();
+    };
+    run("unrelated", Some("unrelated-name"), false, false);
+    run("registered", Some("branch-checkpoint"), true, false);
+    run("prefix", Some("branch-checkpoint-foreign"), false, false);
+    run("inherited", None, false, true);
+}
+
 fn in_child() -> bool {
     std::env::var_os("FE_BUDGET_CHILD").is_some()
 }

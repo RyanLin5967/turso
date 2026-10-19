@@ -1722,6 +1722,17 @@ pub(crate) fn thread_table(out: &mut [ThreadCpu]) -> Option<usize> {
     }
 }
 
+/// A store thread that a window may own (`end_owning`), registered by the thread itself at its start
+/// under its full name; deregistered when the guard drops. budgets-port-adversary MED-1 (the red: not yet
+/// consulted by `owned_named`).
+pub(crate) struct OwnedThread;
+
+/// Register the calling thread as the store thread `name` (`OwnedThread`).
+pub(crate) fn register_owned_thread(name: &str) -> OwnedThread {
+    let _ = name;
+    OwnedThread
+}
+
 /// Whether `t` is one of the threads named in `owned`. On Linux a thread name is the kernel's comm,
 /// cut at 15 bytes (TASK_COMM_LEN), so `owned` is compared cut the same way there.
 fn owned_named(t: &ThreadCpu, owned: &[&str]) -> bool {
