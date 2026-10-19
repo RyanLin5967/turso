@@ -1690,7 +1690,11 @@ pub fn op_vdestroy(
     load_insn!(VDestroy { db: _, table_name }, insn);
     let conn = program.connection.clone();
     // Destroyed when the transaction commits without it (`Connection::defer_vtab_destroy`).
-    let Some(vtab) = conn.syms.read().vtabs.get(table_name).cloned() else {
+    // The registry of the connection that made it, else the schema this connection holds it in
+    // (engine-rev-qaf-fix2 MED 3: another connection's DROP failed here).
+    let registered = conn.syms.read().vtabs.get(table_name).cloned();
+    let vtab = registered.or_else(|| conn.schema.read().get_table(table_name).and_then(|t| t.virtual_table()));
+    let Some(vtab) = vtab else {
         mark_unlikely();
         return Err(crate::LimboError::InternalError(
             "Could not find Virtual Table to Destroy".to_string(),
@@ -1715,14 +1719,14 @@ pub fn op_vbegin(
         .vtab_id()
         .expect("VBegin on non ext-virtual table cursor");
     let mut states = program.connection.vtab_txn_states.write();
-    if states.insert(vtab_id) {
-        // Only begin a new transaction if one is not already active for this virtual table module
-        let vtabs = &program.connection.syms.read().vtabs;
-        let vtab = vtabs
-            .iter()
-            .find(|p| p.1.id().eq(&vtab_id))
-            .expect("Could not find virtual table for VBegin");
-        vtab.1.begin()?;
+    // Only begin a new transaction if one is not already active for this virtual table module; the
+    // participant is the table the cursor holds (`VirtualTableCursor::ext_table`).
+    if !states.contains_key(&vtab_id) {
+        let table = cursor.ext_table().ok_or_else(|| {
+            LimboError::InternalError("VBegin on a cursor that holds no external table".to_string())
+        })?;
+        table.begin()?;
+        states.insert(vtab_id, table);
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -3831,16 +3835,8 @@ pub fn halt(
 /// Call xCommit on all virtual tables that participated in the current transaction.
 pub(crate) fn vtab_commit_all(conn: &Connection) -> crate::Result<()> {
     let mut set = conn.vtab_txn_states.write();
-    if set.is_empty() {
-        return Ok(());
-    }
-    let reg = &conn.syms.read().vtabs;
-    for id in set.drain() {
-        let vtab = reg
-            .iter()
-            .find(|(_, vtab)| vtab.id() == id)
-            .expect("vtab must exist");
-        vtab.1.commit()?;
+    for (_, table) in set.drain() {
+        table.commit()?;
     }
     Ok(())
 }
@@ -4031,16 +4027,8 @@ pub(crate) fn index_method_register_transaction_all(
 /// Rollback all virtual tables that are part of the current transaction.
 fn vtab_rollback_all(conn: &Connection) -> crate::Result<()> {
     let mut set = conn.vtab_txn_states.write();
-    if set.is_empty() {
-        return Ok(());
-    }
-    let reg = &conn.syms.read().vtabs;
-    for id in set.drain() {
-        let vtab = reg
-            .iter()
-            .find(|(_, vtab)| vtab.id() == id)
-            .expect("vtab must exist");
-        vtab.1.rollback()?;
+    for (_, table) in set.drain() {
+        table.rollback()?;
     }
     Ok(())
 }
