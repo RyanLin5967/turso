@@ -502,6 +502,15 @@ run_server_cell() { # run_server_cell SPEC C
         "$(python3 -B -c 'import json, sys; k = json.load(open(sys.argv[1])); print(k.get("verdict") == "ok" and (k.get("per_create") or 0) > 0)' "$d/kept.json" 2>&1 | tail -1)" \
         True
     fi
+    # comp-rev-89ec-b3c3 MED 2: the arm's negative control. A FILE_COPY create copies and fsyncs the template's files
+    # inside CREATE DATABASE and touches nothing after (these specs only create), so its kept branch leaves NO
+    # deferred write. A count that is above 0 here is counting the forced CHECKPOINT's own fixed flushes (its record,
+    # pg_control, pg_logical, pg_xact ...), which it does whether or not a kept branch left anything.
+    if [ "$spec" = pg18-create ] || [ "$spec" = pg18-create-copy ]; then
+      expect "kept arm $spec-c1: deferred flushes per kept create == 0 (FILE_COPY flushed at create: the negative control)" \
+        "$(python3 -B -c 'import json, sys; k = json.load(open(sys.argv[1])); print(k.get("verdict") == "ok" and k.get("per_create") == 0)' "$d/kept.json" 2>&1 | tail -1)" \
+        True
+    fi
   fi
   timedrun_check "$d" "$n" "$spec-c$c"
   count "$d/idle"
