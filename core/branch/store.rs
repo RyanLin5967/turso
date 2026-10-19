@@ -1473,6 +1473,24 @@ impl AsyncCtl {
         self.stop.load(Ordering::Acquire)
     }
 
+    /// While `held` is set, wait on the untimed condvar a release or a stop wakes (AD-T5's held
+    /// premise, amendment 2: engine-rev-qaf-fix2 MED 9 found a held thread polling every POLL).
+    /// `true` if stopped.
+    fn wait_released(&self, held: &AtomicBool) -> bool {
+        let mut g = self.nap_lock.lock().unwrap_or_else(|e| e.into_inner());
+        while held.load(Ordering::Acquire) && !self.stop.load(Ordering::Acquire) {
+            g = self.nap_cv.wait(g).unwrap_or_else(|e| e.into_inner());
+        }
+        self.stop.load(Ordering::Acquire)
+    }
+
+    /// Set or clear a hold, waking a held thread on release.
+    fn set_held(&self, held: &AtomicBool, on: bool) {
+        let _g = self.nap_lock.lock().unwrap_or_else(|e| e.into_inner());
+        held.store(on, Ordering::Release);
+        self.nap_cv.notify_all();
+    }
+
     /// Stop both threads and wake them.
     fn halt(&self) {
         let _g = self.nap_lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -1504,6 +1522,9 @@ fn run_async_flusher(store: std::sync::Weak<BranchStore>, ctl: Arc<AsyncCtl>) {
             return;
         }
         if ctl.flusher_held.load(Ordering::Acquire) {
+            if ctl.wait_released(&ctl.flusher_held) {
+                return;
+            }
             continue;
         }
         let Some(store) = store.upgrade() else { return };
@@ -1548,6 +1569,9 @@ fn run_housekeeping(store: std::sync::Weak<BranchStore>, ctl: Arc<AsyncCtl>) {
             return;
         }
         if ctl.housekeeping_held.load(Ordering::Acquire) {
+            if ctl.wait_released(&ctl.housekeeping_held) {
+                return;
+            }
             continue;
         }
         let Some(store) = store.upgrade() else { return };
@@ -7843,7 +7867,7 @@ impl BranchStore {
     pub(crate) fn async_hold(&self, flusher: bool, on: bool) -> bool {
         let ctl = &self.async_threads.ctl;
         let flag = if flusher { &ctl.flusher_held } else { &ctl.housekeeping_held };
-        flag.store(on, Ordering::Release);
+        ctl.set_held(flag, on);
         self.async_runs()
     }
 
@@ -10035,6 +10059,14 @@ impl BranchStore {
         // One atomic load on the hot path: a branch can be in doubt only once the store stopped.
         if inner.fail_stop.load(Ordering::Acquire) {
             inner.refuse_in_doubt(id)?;
+            // An async create whose fork is not durable is lost (ASYNC-DESIGN §8): a connection
+            // already open on it stops reading it (engine-rev-qaf-fix2 MED 8). Mutant
+            // `lost_async_still_reads` (test builds only): it reads on, as before.
+            if let Some(st) = inner.branches.get(&id) {
+                if st.async_ack && st.fork_lsn > self.group.durable(self.class) && !fe_mutant("lost_async_still_reads") {
+                    return Err(branch_create_lost(id));
+                }
+            }
         }
         self.resolve_calls.fetch_add(1, Ordering::Relaxed);
         let (mut levels, mut examined) = (0, 0);
