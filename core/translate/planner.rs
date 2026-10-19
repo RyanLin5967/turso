@@ -63,6 +63,20 @@ struct CteDefinition {
     references_itself: bool,
 }
 
+/// The planner's lookup of an aggregate or window function a user wrote. The engine-internal
+/// `turso_alter_column_sql` is unknown to it, so its star, OVER and FILTER forms answer as an
+/// unknown function's do (engine-rev 2bdcd32c6 MED 5: they answered "wrong number of arguments" and
+/// "may not be used as a window function"). ALTER's own call is a plain scalar call, which this
+/// lookup only classifies; the resolver still resolves it inside ALTER's scope. Mutant
+/// `planner_sees_alter_column_sql` (test builds only): the lookup as before.
+fn resolve_planned_function(name: &str, arg_count: usize) -> Result<Option<Func>> {
+    if crate::branch::store::fe_mutant("planner_sees_alter_column_sql") {
+        Func::resolve_function(name, arg_count)
+    } else {
+        Func::resolve_user_function(name, arg_count)
+    }
+}
+
 fn collect_cte_definitions(with: With, program: &mut ProgramBuilder) -> Result<Vec<CteDefinition>> {
     let mut definitions = Vec::with_capacity(with.ctes.len());
     let mut referenced_table_names_by_cte = Vec::with_capacity(with.ctes.len());
@@ -563,7 +577,7 @@ pub fn resolve_window_and_aggregate_functions(
                 let args_count = args.len();
                 let distinctness = Distinctness::from_ast(distinctness.as_ref());
 
-                match Func::resolve_function(name.as_str(), args_count)? {
+                match resolve_planned_function(name.as_str(), args_count)? {
                     Some(Func::Agg(f)) => {
                         if let Some(over_clause) = filter_over.over_clause.as_ref() {
                             link_with_window(
@@ -650,7 +664,7 @@ pub fn resolve_window_and_aggregate_functions(
                 }
             }
             Expr::FunctionCallStar { name, filter_over } => {
-                match Func::resolve_function(name.as_str(), 0)? {
+                match resolve_planned_function(name.as_str(), 0)? {
                     Some(Func::Agg(f)) => {
                         if let Some(over_clause) = filter_over.over_clause.as_ref() {
                             link_with_window(
