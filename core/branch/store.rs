@@ -1742,6 +1742,9 @@ struct StoreMutex {
     /// Test builds: the starter's hold (`HOLD_STARTER_SENDING`), per store.
     #[cfg(test)]
     starter_hold: AtomicU8,
+    /// Test builds: a low-pool unlock's hold before its claim (`HOLD_POOL_CLAIM`), per store.
+    #[cfg(test)]
+    pool_claim_hold: AtomicU8,
     /// Test builds: mutant `owed_start_sent_late` has skipped this store's first owed send.
     #[cfg(test)]
     late_skipped: AtomicBool,
@@ -1761,6 +1764,8 @@ impl StoreMutex {
             pool_kicker: std::sync::OnceLock::new(),
             #[cfg(test)]
             starter_hold: AtomicU8::new(0),
+            #[cfg(test)]
+            pool_claim_hold: AtomicU8::new(0),
             #[cfg(test)]
             late_skipped: AtomicBool::new(false),
             #[cfg(test)]
@@ -1926,6 +1931,8 @@ impl Drop for StoreGuard<'_> {
         // blocking on the group lock (see `StoreMutex::pool_notified`).
         if pool_low {
             self.store.pool_kicked.store(true, Ordering::Release);
+            #[cfg(test)]
+            pause_at(Some(&self.store.pool_claim_hold), HOLD_POOL_CLAIM);
             // Claimed before the kick and given back if the kick could not land (engine-rev-qaf-fix2
             // MED 13: a late `store(true)` after a refill had cleared it left the pool unrefilled).
             if !std::thread::panicking()
@@ -2541,6 +2548,10 @@ pub(crate) const HOLD_BEFORE_ROWS: u8 = 21;
 /// (review REVIEW-claude-engine-M1 MED-1: a store closing meanwhile).
 #[cfg(test)]
 pub(crate) const HOLD_STARTER_SENDING: u8 = 22;
+/// An unlock that found the branch table's pool low, held just before it claims the writer's
+/// wake (`StoreMutex::pool_notified`; engine-2bdcd32c6 MED 3), on `StoreMutex::pool_claim_hold`.
+#[cfg(test)]
+pub(crate) const HOLD_POOL_CLAIM: u8 = 23;
 /// Test builds: compare every fuzzy checkpoint's copy-on-write rows with the capture's own
 /// (`verify_frozen_rows`), as `FE_CAPTURE_VERIFY` does for a whole run; and the differences found.
 #[cfg(test)]
@@ -15868,6 +15879,82 @@ mod l2b_kick_tests {
         assert!(
             rx.recv_timeout(Duration::from_secs(10)).is_ok(),
             "CLAIM: a low pool's unlock under the group lock returned (it deadlocked on the pool's wake)"
+        );
+    }
+
+    fn pool_full_within(store: &BranchStore, within: Duration) -> bool {
+        let started = Instant::now();
+        while started.elapsed() < within {
+            if store.inner.lock().branches.pool_need() == (0, 0) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        false
+    }
+
+    /// engine-2bdcd32c6 MED 3 (MED 13 not closed; the reviewer's l2_rev2 interleaving, here on the
+    /// real unlock): an unlocker U that found the pool low is held just before its claim
+    /// (`HOLD_POOL_CLAIM`) while another low unlock gets the pool refilled and the writer goes
+    /// quiet. When U then claims and kicks, a later low pool must still be refilled. At da850ed1c
+    /// U had already flagged `pool_kicked` before the hold, the refill cleared it, and U's late
+    /// claim left `pool_notified` set with nothing flagged: no unlock woke the writer again
+    /// (reviewer: refilled=false need_after=(16,1), twice on ecetesla2).
+    #[test]
+    fn a_late_pool_claim_never_strands_the_refill() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("late-claim.db");
+        let store = Arc::new(
+            BranchStore::open(BranchDurability::Durable { sync: SyncClass::Off }, None, path.to_str().unwrap()).unwrap(),
+        );
+        assert!(store.confirm_writer.lock().is_some(), "premise: the background writer runs");
+        assert!(pool_full_within(&store, Duration::from_secs(10)), "premise: the pool starts full");
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!store.inner.pool_kicked.load(Ordering::Acquire), "premise: quiescent, nothing flagged");
+        assert!(!store.inner.pool_notified.load(Ordering::Acquire), "premise: quiescent, nothing claimed");
+        // U: a hold that leaves the pool low, its unlock held before the claim.
+        store.inner.pool_claim_hold.store(HOLD_POOL_CLAIM, Ordering::Release);
+        let u = {
+            let store = store.clone();
+            std::thread::spawn(move || {
+                let mut guard = store.inner.lock();
+                guard.branches.drain_pool_for_test();
+                assert!(guard.branches.pool_low(), "premise: U leaves the pool low");
+                drop(guard);
+            })
+        };
+        let started = Instant::now();
+        while store.inner.pool_claim_hold.load(Ordering::Acquire) != HOLD_POOL_CLAIM | HOLD_ARRIVED {
+            assert!(started.elapsed() < Duration::from_secs(10), "premise: U's unlock reached its hold");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // U': another low unlock, whole; the writer refills and goes quiet.
+        {
+            let mut guard = store.inner.lock();
+            guard.branches.drain_pool_for_test();
+            drop(guard);
+        }
+        let refilled_first = pool_full_within(&store, Duration::from_secs(10));
+        std::thread::sleep(Duration::from_millis(200));
+        // U claims and kicks now, late.
+        store.inner.pool_claim_hold.store(0, Ordering::Release);
+        u.join().unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(refilled_first, "premise: U''s unlock got the pool refilled");
+        // Ordinary low unlocks, as creates make them.
+        for _ in 0..50 {
+            let mut guard = store.inner.lock();
+            guard.branches.drain_pool_for_test();
+            drop(guard);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let refilled = pool_full_within(&store, Duration::from_secs(10));
+        let need = store.inner.lock().branches.pool_need();
+        assert!(
+            refilled,
+            "CLAIM: after a late claim a low pool is still refilled; need={need:?} kicked={} notified={}",
+            store.inner.pool_kicked.load(Ordering::Acquire),
+            store.inner.pool_notified.load(Ordering::Acquire)
         );
     }
 }
