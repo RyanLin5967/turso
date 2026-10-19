@@ -381,6 +381,85 @@ pub(crate) fn schemas_dropped_in_block(pg_conn: &PgConnectionInner) -> Vec<Strin
     pg_conn.dropped_schemas.lock().iter().map(|(name, _)| name.clone()).collect()
 }
 
+/// An ALTER COLUMN TYPE the engine cannot do as PostgreSQL does is refused 0A000 before anything
+/// runs. The engine changes the column's declaration and keeps every stored value as it was, so a
+/// type of another family (text to integer, integer to boolean) or a narrower integer would keep
+/// values the new type does not hold (PostgreSQL rewrites each row, or refuses 42804 / 22003).
+/// Allowed: within the character types (text, varchar, char), within the integers to as wide or
+/// wider, an integer to numeric or a float, numeric to numeric or a float, a float to a float; a
+/// length or precision is checked over every row by the translator's coercion check
+/// (alter_coercion_checks; wire-rev-629f4b926 HIGH-2). A column the walk cannot find is left to the
+/// engine's refusal.
+fn refuse_alter_column_type_across_families(
+    pg_conn: &PgConnectionInner,
+    parse: &turso_pg_parser::pg_query::ParseResult,
+) -> Result<()> {
+    use turso_pg_parser::pg_query::protobuf::{node::Node, AlterTableType};
+    let [raw] = parse.protobuf.stmts.as_slice() else {
+        return Ok(());
+    };
+    let Some(Node::AlterTableStmt(alter)) = raw.stmt.as_ref().and_then(|s| s.node.as_ref()) else {
+        return Ok(());
+    };
+    let Some(rel) = alter.relation.as_ref() else {
+        return Ok(());
+    };
+    for cmd in &alter.cmds {
+        let Some(Node::AlterTableCmd(cmd)) = cmd.node.as_ref() else {
+            continue;
+        };
+        if cmd.subtype() != AlterTableType::AtAlterColumnType {
+            continue;
+        }
+        let Some(Node::ColumnDef(def)) = cmd.def.as_ref().and_then(|d| d.node.as_ref()) else {
+            continue;
+        };
+        let new = def
+            .type_name
+            .as_ref()
+            .and_then(|t| t.names.iter().rev().find_map(|n| match &n.node {
+                Some(Node::String(s)) if s.sval != "pg_catalog" => Some(s.sval.to_ascii_lowercase()),
+                _ => None,
+            }))
+            .unwrap_or_default();
+        let schema = pg_conn.conn.current_schema();
+        let Some(table) = schema.get_btree_table(&rel.relname) else {
+            continue;
+        };
+        let Some((_, col)) = table.get_column(&cmd.name) else {
+            continue;
+        };
+        let old = col.ty_str.to_ascii_lowercase();
+        // (family, integer width): the width orders the integers.
+        let family = |t: &str| -> Option<(u8, u8)> {
+            Some(match t {
+                "text" | "varchar" | "bpchar" | "char" | "character" | "character varying" => (0, 0),
+                "int2" | "smallint" => (1, 2),
+                "int4" | "int" | "integer" | "serial" => (1, 4),
+                "int8" | "bigint" | "bigserial" => (1, 8),
+                "numeric" | "decimal" => (2, 0),
+                "float4" | "real" | "float8" | "double precision" | "double" | "float" => (3, 0),
+                _ => return None,
+            })
+        };
+        let allowed = match (family(&old), family(&new)) {
+            (Some((a, _)), Some((b, _))) if a == b && a != 1 => true,
+            (Some((1, w_old)), Some((1, w_new))) => w_new >= w_old,
+            (Some((1, _)), Some((2 | 3, _))) | (Some((2, _)), Some((3, _))) => true,
+            _ => false,
+        };
+        if !allowed {
+            return Err(LimboError::ParseError(SqlErrorMessage::classified(
+                SqlErrorKind::FeatureNotSupported,
+                format!(
+                    "ALTER COLUMN TYPE from {old} to {new} is not supported: the engine would keep the column's values unconverted"
+                ),
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// 3F000 'schema "s" does not exist' for a statement that names a relation in a schema this
 /// session's open block dropped (wire-rev-uw2 N4: CREATE TABLE s.u ran, and the COMMIT then
 /// deleted s.u with s's file; PG 18.6 answers 3F000, r5-pg.txt m2c). Free while no schema was
@@ -1497,6 +1576,7 @@ fn prepare_statement_parsed(
     // PostgreSQL's parse analysis locks them: the server takes them for its cross-session DROP
     // wait (lead ruling 2026-10-18, pg18-rev-bl3.out #19), from this parse, never a second one.
     refuse_dropped_schemas(pg_conn, &parse_result)?;
+    refuse_alter_column_type_across_families(pg_conn, &parse_result)?;
     if !pg_conn.conn.get_auto_commit() {
         let relations = turso_pg_parser::translator::named_relations(&parse_result);
         if !relations.is_empty() {

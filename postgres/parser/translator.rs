@@ -503,11 +503,15 @@ impl PostgreSQLTranslator {
             NodeRef::ExplainStmt(explain) => self.translate_explain(explain)?,
             node => ast::Cmd::Stmt(self.translate_node(node)?),
         };
+        // ALTER COLUMN TYPE and ADD COLUMN ... DEFAULT are write paths: each row (the default) is
+        // coerced to the new type first, so one that does not fit refuses the ALTER, in the ALTER's
+        // own transaction (wire-rev-629f4b926 HIGH-2).
+        let prereqs = match &cmd {
+            ast::Cmd::Stmt(ast::Stmt::AlterTable(alter)) => alter_coercion_checks(alter)?,
+            _ => vec![],
+        };
 
-        Ok(TranslateResult {
-            prereqs: vec![],
-            cmd,
-        })
+        Ok(TranslateResult { prereqs, cmd })
     }
 
     fn translate_node(&self, node: NodeRef<'_>) -> Result<ast::Stmt, ParseError> {
@@ -1175,7 +1179,21 @@ impl PostgreSQLTranslator {
                         ));
                     }
                 };
-                let col = self.translate_column_def(col_def)?;
+                // A USING expression would decide each row's new value; it is refused rather than
+                // ignored (each row was kept as it was).
+                if col_def.raw_default.is_some() {
+                    return Err(ParseError::ParseError(SqlErrorMessage::classified(
+                        SqlErrorKind::FeatureNotSupported,
+                        "ALTER COLUMN TYPE ... USING is not supported".to_string(),
+                    )));
+                }
+                let mut col = self.translate_column_def(col_def)?;
+                // libpg_query names the column in the command, not in its ColumnDef: the new
+                // definition had the empty name, so the engine renamed the column to "" and every
+                // later reference to it was 42703 (wire-rev-629f4b926 HIGH-2).
+                if col_def.colname.is_empty() {
+                    col.col_name = pg_name(&cmd.name);
+                }
                 ast::AlterTableBody::AlterColumn {
                     old: pg_name(&cmd.name),
                     new: col,
@@ -6934,6 +6952,41 @@ pub struct PgCopyFromStmt {
     pub delimiter: Option<String>,
     pub header: bool,
     pub null_string: Option<String>,
+}
+
+/// The statements an ALTER TABLE runs first, in its own transaction, so a value that does not fit
+/// its new type refuses it: ALTER COLUMN TYPE to a type with a length or precision reads every row
+/// through a CAST to the new type, and ADD COLUMN with a DEFAULT casts the default, the type's
+/// ENCODE raising for one too long or out of range, as PostgreSQL's rewrite and its default's
+/// coercion refuse them (22001, 22003; wire-rev-629f4b926 HIGH-2, recorded
+/// pg18-wirefuzz-alter_column_type_and_add_column_default_coerce_every_row.out). None for a type
+/// with no parameters: its values are kept, as the type family check before translation allows.
+fn alter_coercion_checks(alter: &ast::AlterTable) -> Result<Vec<ast::Stmt>, ParseError> {
+    let (column, ty, default) = match &alter.body {
+        ast::AlterTableBody::AlterColumn { old, new } => (Some(old.clone()), new.col_type.clone(), None),
+        ast::AlterTableBody::AddColumn(col) => (
+            None,
+            col.col_type.clone(),
+            col.constraints.iter().find_map(|c| match &c.constraint {
+                ast::ColumnConstraint::Default(e) => Some(e.clone()),
+                _ => None,
+            }),
+        ),
+        _ => return Ok(vec![]),
+    };
+    let Some(ty) = ty.filter(|t| t.size.is_some()) else {
+        return Ok(vec![]);
+    };
+    let sql = match (column, default) {
+        (Some(column), _) => format!("SELECT CAST({column} AS {ty}) FROM {}", alter.name),
+        (None, Some(default)) => format!("SELECT CAST({default} AS {ty})"),
+        (None, None) => return Ok(vec![]),
+    };
+    let mut parser = turso_parser::parser::Parser::new(sql.as_bytes());
+    match parser.next_cmd() {
+        Ok(Some(ast::Cmd::Stmt(stmt))) => Ok(vec![stmt]),
+        _ => Err(ParseError::ParseError(format!("ALTER TABLE: cannot check the new type: {sql}").into())),
+    }
 }
 
 /// The name PostgreSQL 18 gives an index created with none (indexcmds.c ChooseIndexName with
