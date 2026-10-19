@@ -15970,6 +15970,34 @@ fn current_database_names_the_startup_database_without_its_branch() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-629f4b926 MED-3 (its PG 18.6 probe #13-#17): a parameter inside an expression assigned to a varchar(5)
+/// column ($1 || '', $1::text, upper($1), coalesce($1, 'z'), $1::varchar(10)) is coerced at Bind by PostgreSQL's custom
+/// plan, which folds the expression: 'abcdef' is 22001 before BindComplete. Here the Bind passes and the engine refuses
+/// the Execute (XX000). Owner: fastest-wire (the Bind check reads bare parameters only; StatementTypes::assignments).
+#[test]
+fn a_parameter_inside_an_assigned_expression_is_coerced_at_bind() {
+    let dir = Scratch::new("bind-expr");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in ["CREATE TABLE vc(id int PRIMARY KEY, v varchar(5))", "INSERT INTO vc VALUES (1, 'ab')"] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    for sql in [
+        "UPDATE vc SET v = $1 || '' WHERE id = 1",
+        "UPDATE vc SET v = $1::text WHERE id = 1",
+        "UPDATE vc SET v = upper($1) WHERE id = 1",
+        "UPDATE vc SET v = coalesce($1, 'z') WHERE id = 1",
+        "INSERT INTO vc VALUES (9, $1::varchar(10))",
+    ] {
+        let (types, error) = a.bind_round(sql, &[], &[Some(b"abcdef")], &[]);
+        if types.contains(&b'2') || error.as_ref().map(|e| e.code.as_str()) != Some("22001") {
+            wrong.push(format!("{sql}: messages {:?} error {error:?}, PostgreSQL: no BindComplete, 22001", String::from_utf8_lossy(&types)));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-uw2 N5: a schema-qualified type was refused 42704 'type "public m" does not exist',
 /// its parts joined with a blank, so a pg_dump restore, which writes public.<type> for every enum
 /// and domain column, failed at its first such table. PostgreSQL 18.6 takes public.m and
