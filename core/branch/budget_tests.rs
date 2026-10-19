@@ -4410,8 +4410,10 @@ fn leap_l4_an_open_keeps_at_most_100_bytes_resident_per_live_branch() {
 /// by recovery_of_named_branches_is_independent_of_live_branches_on_the_opening_thread (the
 /// backstop, red at base: +14 allocations). base14 (f5e9d5693): background 147,464 B at 10^4 ->
 /// 1,179,656 B at 10^5 (the filter set's table, built under the mutex; fixed by fastest-engine
-/// f315c960d, unrun). BLIND SPOTS: an O(N) walk under the mutex that allocates nothing and reads no
-/// catalog row (the D0 recovery instruction test sees that one); a catalog statement that changes
+/// f315c960d, unrun). Linux finding (b): the held WORK counter (`note_held_work`, one unit per name
+/// filter insert) bounds an O(N) fill of the filter under the mutex on every platform. BLIND SPOTS:
+/// any other O(N) walk under the mutex that allocates nothing, reads no catalog row and counts no
+/// work (the D0 recovery instruction test sees that one, on Apple); a catalog statement that changes
 /// many rows counts one (`Stmt::exec`). Mutants env `name_filter_built_under_mutex`,
 /// `opener_filter_set`. WRITTEN NOT RUN in this form.
 #[test]
@@ -4431,6 +4433,10 @@ fn leap_l4_an_open_holds_the_store_mutex_for_no_o_n_work() {
         ("fg_held_alloc_bytes_sum", 4096),
         ("max_hold_alloc_bytes", 4096),
         ("max_hold_catalog_rows", 64),
+        // Linux finding (b): work that allocates nothing and reads no catalog row (filter inserts).
+        ("max_bg_hold_work", 64),
+        ("max_fg_hold_work", 64),
+        ("max_hold_work", 64),
     ] {
         let (x, y) = (sa[k], sb[k]);
         if y > x + slack {
