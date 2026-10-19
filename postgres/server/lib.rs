@@ -1657,6 +1657,10 @@ struct SessionState {
 /// is in, which runs after it as in PostgreSQL (`statements[next + 1..]`, `multi` when the Query
 /// held more than one statement and so runs in an implicit block), the CopyData so far, and
 /// whether an Execute started it (the extended protocol, which ends at Sync).
+/// BLIND SPOTS (postgres/COMPAT.md): the rows are held here whole until CopyDone, not streamed
+/// into the table as PostgreSQL streams them; the session's interrupts are armed only while each
+/// of the COPY's two runs runs, so a CancelRequest or statement_timeout does not end the wait for
+/// the rows; and outside a block nothing holds the table between the runs.
 struct PendingCopy {
     statements: Vec<String>,
     next: usize,
@@ -4533,7 +4537,11 @@ impl SimpleQueryHandler for Session {
         } else {
             self.simple_with_notices(&query.query)
         };
-        self.answer_simple(client, responses).await
+        let answered = self.answer_simple(client, responses).await;
+        if answered.is_err() {
+            self.abandon_copy(client);
+        }
+        answered
     }
 
     async fn do_query<C>(&self, _client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
@@ -4545,6 +4553,20 @@ impl SimpleQueryHandler for Session {
 }
 
 impl Session {
+    /// A reply that failed before it reached a COPY FROM STDIN's CopyInResponse (a row of an
+    /// earlier query in the Query that could not be sent): the waiting COPY fails, as the rest of a
+    /// failed Query does, so no PendingCopy, and no implicit block held open for it, outlives the
+    /// Query; ReadyForQuery's status (serve_session's error path) is read after.
+    fn abandon_copy<C: ClientInfo>(&self, client: &mut C) {
+        if self.state().copy_in.is_some() {
+            self.copy_failed(
+                SqlErrorKind::InternalError,
+                "COPY FROM STDIN abandoned: the reply before it failed".to_string(),
+            );
+            client.set_transaction_status(self.transaction_status());
+        }
+    }
+
     /// A simple Query's reply from `responses` on ([`SimpleQueryHandler::on_query`], and after a
     /// COPY FROM STDIN's rows, [`CopyHandler::on_copy_done`]): each result with its notices, then
     /// ReadyForQuery with the session's real status, in one flush. A COPY FROM STDIN asking for its
@@ -4715,7 +4737,13 @@ impl CopyHandler for Session {
             .map(|copy| std::mem::take(&mut copy.data))
             .unwrap_or_default();
         match self.copy_end(CopyEnd::Data(data)) {
-            Some(CopyEnded::Simple(responses)) => self.answer_simple(client, responses).await,
+            Some(CopyEnded::Simple(responses)) => {
+                let answered = self.answer_simple(client, responses).await;
+                if answered.is_err() {
+                    self.abandon_copy(client);
+                }
+                answered
+            }
             Some(CopyEnded::Extended(result)) => {
                 client.set_state(PgWireConnectionState::ReadyForQuery);
                 match result {
@@ -6546,7 +6574,11 @@ fn sqlite_type_to_pg_type(type_str: &str) -> Type {
 /// PG statements handled by `try_prepare_pg()` that return a dummy SELECT
 /// but should produce a command-tag response, not a result set.
 fn is_pg_non_query(sql: &str) -> bool {
-    let upper = sql.trim().to_uppercase();
+    // From the statement's first token, past whitespace and comments, as command_tag reads it: a
+    // comment-led COPY FROM STDIN was answered as a query (RowDescription, SELECT 0), and failed
+    // after loading its rows over the extended protocol (the fresh-context review of c4f957d64).
+    let start = skip_blank(sql.as_bytes(), 0).unwrap_or(sql.len());
+    let upper = sql[start..].trim().to_uppercase();
     upper.starts_with("COPY")
         || upper.starts_with("CREATE SCHEMA")
         // Every DROP: none returns rows, and one the frontend performs while preparing it (DROP

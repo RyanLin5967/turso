@@ -47,12 +47,10 @@ pub fn parse_copy_rows(
             break;
         }
 
-        // Skip empty lines at the end of file
-        if line.is_empty() {
-            continue;
-        }
-
-        let fields: Vec<&str> = line.split(delimiter).collect();
+        // Every line is a row, an empty one included: one empty field, as PostgreSQL's
+        // CopyReadAttributesText reads it (an empty string for a one-column COPY, else 22P04;
+        // recorded, copy-stdin-pg18.txt `escapes`). Empty lines were skipped.
+        let fields = split_copy_fields(line, delimiter);
         if fields.len() > columns.len() {
             return Err(bad_format("extra data after last expected column".to_string()));
         }
@@ -77,10 +75,32 @@ pub fn parse_copy_rows(
     Ok(rows)
 }
 
-/// Unescape backslash sequences in a COPY text field.
+/// A line's fields as written (escapes still in them), split at each delimiter that no backslash
+/// escapes: a backslash and the character after it are one unit of data, so `x\<TAB>y` is one
+/// field, as in PostgreSQL's text format. The line was split at every delimiter.
+fn split_copy_fields(line: &str, delimiter: char) -> Vec<&str> {
+    let mut fields = Vec::new();
+    let mut start = 0;
+    let mut chars = line.char_indices();
+    while let Some((i, c)) = chars.next() {
+        if c == '\\' {
+            chars.next();
+        } else if c == delimiter {
+            fields.push(&line[start..i]);
+            start = i + c.len_utf8();
+        }
+    }
+    fields.push(&line[start..]);
+    fields
+}
+
+/// Unescape backslash sequences in a COPY text field, as PostgreSQL's text format reads them:
+/// `\b \f \n \r \t \v`, an octal `\N`, `\NN` or `\NNN`, a hex `\xH` or `\xHH` (a byte; one that
+/// is not ASCII is kept as its character), and a backslash before any other character is that
+/// character.
 fn unescape_copy_field(field: &str) -> String {
     let mut result = String::with_capacity(field.len());
-    let mut chars = field.chars();
+    let mut chars = field.chars().peekable();
 
     while let Some(c) = chars.next() {
         if c == '\\' {
@@ -92,6 +112,32 @@ fn unescape_copy_field(field: &str) -> String {
                 Some('b') => result.push('\x08'),
                 Some('f') => result.push('\x0C'),
                 Some('v') => result.push('\x0B'),
+                Some(d @ '0'..='7') => {
+                    let mut value = d.to_digit(8).unwrap_or(0);
+                    for _ in 0..2 {
+                        match chars.peek().and_then(|c| c.to_digit(8)) {
+                            Some(digit) => {
+                                value = value * 8 + digit;
+                                chars.next();
+                            }
+                            None => break,
+                        }
+                    }
+                    result.push(char::from((value & 0xff) as u8));
+                }
+                Some('x') if chars.peek().is_some_and(|c| c.is_ascii_hexdigit()) => {
+                    let mut value = 0;
+                    for _ in 0..2 {
+                        match chars.peek().and_then(|c| c.to_digit(16)) {
+                            Some(digit) => {
+                                value = value * 16 + digit;
+                                chars.next();
+                            }
+                            None => break,
+                        }
+                    }
+                    result.push(char::from(value as u8));
+                }
                 Some(other) => {
                     result.push(other);
                 }

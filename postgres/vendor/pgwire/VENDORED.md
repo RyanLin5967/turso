@@ -100,4 +100,6 @@ Every change from the crate is listed here, newest last; `diff -r` against the c
     an extended one's CommandComplete, the state back to ReadyForQuery for the Sync. Upstream set
     ReadyForQuery and sent ReadyForQuery Idle after every simple-protocol CopyDone, whatever the block
     was. On the handler's error a simple-protocol COPY's state goes back to ReadyForQuery as before,
-    for `process_error`; `send_ready_for_query`'s import, used only there, is dropped.
+    for `process_error`; `send_ready_for_query`'s import, used only there, is dropped. The crate's
+    own `examples/copy.rs` (not built here) is left as it was, so its handler, which sends no
+    ReadyForQuery, would leave its client waiting under this change.

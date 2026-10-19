@@ -1525,7 +1525,12 @@ fn prepare_statement_parsed(
             pg_conn.block_reads.lock().extend(relations);
         }
     }
-    let special = Special::of(&parse_result);
+    let special = match Special::of(&parse_result) {
+        // The parse gives STDIN and the file '' one empty name: a COPY whose text never says
+        // STDIN reads the file '' (refused as that file is), never the client's rows.
+        Some(Special::CopyFromStdin(stmt)) if !names_stdin(sql) => Some(Special::CopyFrom(stmt)),
+        special => special,
+    };
     drop(parsing);
     let performs = special.as_ref().is_some_and(Special::performs);
     if describe && performs {
@@ -4126,13 +4131,16 @@ fn opened_path(_file: &std::fs::File) -> Option<std::path::PathBuf> {
     None
 }
 
+/// COPY FROM a file, checked in PostgreSQL's order: the table and columns (DoCopy opens the
+/// relation first), the options, then the file (recorded, copy-stdin-pg18.txt `nosuchopt`: 42P01
+/// before 42601; the options were checked first).
 fn handle_pg_copy_from(pg_conn: &Arc<PgConnectionInner>, stmt: &PgCopyFromStmt) -> Result<usize> {
+    let target = copy_target(pg_conn, stmt)?;
     refuse_copy_options(stmt)?;
     let mut data = String::new();
     std::io::Read::read_to_string(&mut open_server_file(&pg_conn.server_files, &stmt.filename)?, &mut data).map_err(|e| {
         LimboError::ParseError(format!("COPY FROM: cannot read '{}': {}", stmt.filename, e).into())
     })?;
-    let target = copy_target(pg_conn, stmt)?;
     load_copy_rows(pg_conn, stmt, &target, &data)
 }
 
@@ -4154,16 +4162,21 @@ fn handle_pg_copy_from_stdin(
         )));
     };
     let end = copy.lock().end.clone();
+    // The client's CopyFail is the COPY's error, whatever else has changed since it asked.
+    if let Some(CopyEnd::Failed(kind, message)) = end.as_deref() {
+        return Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
+            *kind,
+            message.clone(),
+        )));
+    }
+    // The table and columns, then the options, as for a file (handle_pg_copy_from).
+    let target = copy_target(pg_conn, stmt)?;
     refuse_copy_options(stmt)?;
     match end.as_deref() {
-        None => {
-            let target = copy_target(pg_conn, stmt)?;
+        None | Some(CopyEnd::Failed(..)) => {
             copy.lock().asked = Some(target.columns.len());
             Ok(0)
         }
-        Some(CopyEnd::Failed(kind, message)) => Err(LimboError::InvalidArgument(
-            SqlErrorMessage::classified(*kind, message.clone()),
-        )),
         Some(CopyEnd::Data(bytes)) => {
             // The client's encoding is UTF8 (FIXED_SETTINGS): any other byte sequence is
             // PostgreSQL's 22021.
@@ -4176,10 +4189,34 @@ fn handle_pg_copy_from_stdin(
                     format!("invalid byte sequence for encoding \"UTF8\": {}", shown.join(" ")),
                 ))
             })?;
-            let target = copy_target(pg_conn, stmt)?;
             load_copy_rows(pg_conn, stmt, &target, data)
         }
     }
+}
+
+/// Whether the text holds the word STDIN in any case, outside a string literal: a COPY FROM
+/// STDIN's must, as `FROM ''` holds it only in a comment or identifier at most (BLIND SPOT: `COPY
+/// t FROM '' -- stdin` is read as STDIN).
+fn names_stdin(sql: &str) -> bool {
+    let b = sql.as_bytes();
+    let mut quoted = false;
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'\'' => quoted = !quoted,
+            _ if !quoted
+                && b[i..].len() >= 5
+                && b[i..i + 5].eq_ignore_ascii_case(b"stdin")
+                && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_'))
+                && b.get(i + 5).is_none_or(|c| !(c.is_ascii_alphanumeric() || *c == b'_')) =>
+            {
+                return true
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
 }
 
 /// The options COPY FROM refuses before it reads any row: one PostgreSQL knows that this COPY
@@ -4202,7 +4239,7 @@ fn refuse_copy_options(stmt: &PgCopyFromStmt) -> Result<()> {
 struct CopyTarget {
     insert_sql: String,
     columns: Vec<String>,
-    input_types: Vec<Option<String>>,
+    input_types: Vec<Option<CopyInput>>,
 }
 
 /// The table and columns of a COPY FROM, checked as PostgreSQL checks them before it reads a row:
@@ -4286,22 +4323,81 @@ fn copy_target(pg_conn: &Arc<PgConnectionInner>, stmt: &PgCopyFromStmt) -> Resul
     })
 }
 
-/// The type whose text input COPY checks itself before the engine stores a field, as
-/// PostgreSQL's input function reads it, for the types whose check
-/// ([`crate::functions::validate_pg_input`]) is PostgreSQL's: the integers (22P02 for text that is
-/// not one, 22003 out of range) and a varchar(n) or char(n) (22001 past its length). The engine
-/// answered these 23000 "datatype mismatch" and XX000 "value too long for varchar" (recorded,
+/// A field's text input COPY checks itself before the engine stores it, as PostgreSQL's input
+/// function reads it, where the engine's answer differs: 23000 "datatype mismatch" for text that
+/// is no integer, XX000 "value too long for varchar" past a length (recorded,
 /// cli/tests/copy-stdin-pg18.txt). Every other type, and an array, is left to the engine.
-fn copy_input_type(col: &turso_core::schema::Column) -> Option<String> {
+enum CopyInput {
+    /// A column the engine stores as INTEGER: PostgreSQL's integer, and also serial, bigserial,
+    /// smallserial, oid and the reg* and xid types (the translator's map), which the declaration
+    /// no longer tells apart. So only the syntax is checked (22P02, worded for integer, the common
+    /// case); the range is not (a bigserial takes 3000000000; an integer past int4 is stored, the
+    /// engine's PGDIV-INT-RANGE, and a regclass name is the engine's refusal, as before).
+    Integer,
+    /// smallint or bigint (the engine's own types, unambiguous): syntax and range, as
+    /// [`crate::functions::validate_pg_input`] checks them.
+    Ranged(&'static str),
+    /// varchar(n) (`false`) or char(n) (`true`): past n characters 22001, unless the excess is
+    /// all spaces, which PostgreSQL cuts off (varchar_input, bpchar_input).
+    Length(usize, bool),
+}
+
+fn copy_input_type(col: &turso_core::schema::Column) -> Option<CopyInput> {
     if col.array_dimensions() > 0 {
         return None;
     }
     let (_, udt, len, ..) = crate::information_schema::column_type(col);
     match (udt.as_str(), len) {
-        ("int2" | "int4" | "int8", _) => Some(udt),
-        ("varchar", Some(n)) => Some(format!("varchar({n})")),
-        ("bpchar", Some(n)) => Some(format!("char({n})")),
+        ("int4", _) => Some(CopyInput::Integer),
+        ("int2", _) => Some(CopyInput::Ranged("int2")),
+        ("int8", _) => Some(CopyInput::Ranged("int8")),
+        ("varchar", Some(n)) => usize::try_from(n).ok().map(|n| CopyInput::Length(n, false)),
+        ("bpchar", Some(n)) => usize::try_from(n).ok().map(|n| CopyInput::Length(n, true)),
         _ => None,
+    }
+}
+
+impl CopyInput {
+    /// The field as the engine is to store it (None: as it is), or PostgreSQL's error for it.
+    fn read(&self, field: &str) -> Result<Option<String>> {
+        let refuse = |kind, text: String| {
+            Err(LimboError::InvalidArgument(SqlErrorMessage::classified(kind, text)))
+        };
+        match self {
+            CopyInput::Integer => {
+                // int4in skips ASCII white space around the digits.
+                let digits = field.trim_matches(|c: char| c.is_ascii_whitespace());
+                if digits.parse::<i128>().is_ok() {
+                    Ok(None)
+                } else {
+                    refuse(
+                        SqlErrorKind::InvalidTextRepresentation,
+                        format!("invalid input syntax for type integer: \"{field}\""),
+                    )
+                }
+            }
+            CopyInput::Ranged(ty) => match crate::functions::validate_pg_input(field, ty) {
+                Some((message, kind)) => refuse(kind, message),
+                None => Ok(None),
+            },
+            CopyInput::Length(n, blank_padded) => {
+                if field.chars().count() <= *n {
+                    return Ok(None);
+                }
+                if field.trim_end_matches(' ').chars().count() <= *n {
+                    return Ok(Some(field.chars().take(*n).collect()));
+                }
+                let ty = if *blank_padded {
+                    "character"
+                } else {
+                    "character varying"
+                };
+                refuse(
+                    SqlErrorKind::StringDataRightTruncation,
+                    format!("value too long for type {ty}({n})"),
+                )
+            }
+        }
     }
 }
 
@@ -4345,16 +4441,11 @@ fn load_copy_rows(
                 let index = NonZero::new(i + 1).unwrap();
                 match val {
                     Some(s) => {
-                        if let Some(ty) = &target.input_types[i] {
-                            if let Some((message, kind)) =
-                                crate::functions::validate_pg_input(s, ty)
-                            {
-                                return Err(LimboError::InvalidArgument(
-                                    SqlErrorMessage::classified(kind, message),
-                                ));
-                            }
-                        }
-                        insert_stmt.bind_at(index, Value::build_text(s.clone()))?
+                        let stored = match &target.input_types[i] {
+                            Some(input) => input.read(s)?,
+                            None => None,
+                        };
+                        insert_stmt.bind_at(index, Value::build_text(stored.unwrap_or_else(|| s.clone())))?
                     }
                     None => insert_stmt.bind_at(index, Value::Null)?,
                 }
