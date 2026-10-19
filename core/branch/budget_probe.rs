@@ -63,6 +63,9 @@ static MAX_BG_HOLD_ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
 static MAX_HOLD_WORK: AtomicU64 = AtomicU64::new(0);
 static MAX_BG_HOLD_WORK: AtomicU64 = AtomicU64::new(0);
 static MAX_FG_HOLD_WORK: AtomicU64 = AtomicU64::new(0);
+/// budgets-rev-242345 LOW-4: the most held work in one name filter INSTALL hold, kept apart, so an O(N)
+/// term there smaller than the largest other hold is not masked by the per-hold maximum.
+static MAX_INSTALL_WORK: AtomicU64 = AtomicU64::new(0);
 static MAX_BG_HOLD_CAT_ROWS: AtomicU64 = AtomicU64::new(0);
 // The same over holds by the thread marked foreground (review 2 M7: the opener's own holds).
 static MAX_FG_HOLD_ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -654,6 +657,8 @@ pub(crate) struct HoldMaxima {
     pub(crate) foreground: (u64, u64),
     /// Units of held work (`note_held_work`) in the largest hold: `(all, background, foreground)`.
     pub(crate) work: (u64, u64, u64),
+    /// Units of held work in the largest name filter install hold (`InstallWork`), apart.
+    pub(crate) install_work: u64,
 }
 
 /// Every hold maximum at once, and start them all again from zero (review 2 L8: one call, so no
@@ -664,6 +669,25 @@ pub(crate) fn take_hold_maxima() -> HoldMaxima {
         background: (MAX_BG_HOLD_ALLOC_BYTES.swap(0, Relaxed), MAX_BG_HOLD_CAT_ROWS.swap(0, Relaxed)),
         foreground: (MAX_FG_HOLD_ALLOC_BYTES.swap(0, Relaxed), MAX_FG_HOLD_CAT_ROWS.swap(0, Relaxed)),
         work: (MAX_HOLD_WORK.swap(0, Relaxed), MAX_BG_HOLD_WORK.swap(0, Relaxed), MAX_FG_HOLD_WORK.swap(0, Relaxed)),
+        install_work: MAX_INSTALL_WORK.swap(0, Relaxed),
+    }
+}
+
+/// The work this thread does while it lives (`note_held_work`), recorded on drop into its own maximum
+/// (`HoldMaxima::install_work`): the name filter's install hold, measured apart (budgets-rev-242345
+/// LOW-4). Allocates nothing.
+pub(crate) struct InstallWork(u64);
+
+impl InstallWork {
+    pub(crate) fn start() -> Self {
+        InstallWork(T_HELD_WORK.with(|c| c.get()))
+    }
+}
+
+impl Drop for InstallWork {
+    fn drop(&mut self) {
+        let now = T_HELD_WORK.with(|c| c.get());
+        MAX_INSTALL_WORK.fetch_max(now.wrapping_sub(self.0), Relaxed);
     }
 }
 

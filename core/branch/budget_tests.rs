@@ -963,6 +963,7 @@ fn memory(cell: &str, built: &mut Built, out: &mut String) {
     s.insert("max_hold_work", maxima.work.0);
     s.insert("max_bg_hold_work", maxima.work.1);
     s.insert("max_fg_hold_work", maxima.work.2);
+    s.insert("max_install_hold_work", maxima.install_work);
     // Review 2 M7: the opening thread's held bytes summed over every hold of the open.
     s.insert("fg_held_alloc_bytes_sum", delta(held0, held1));
     put_exceptions(&mut s, [0; 4], exc);
@@ -4440,6 +4441,9 @@ fn leap_l4_an_open_holds_the_store_mutex_for_no_o_n_work() {
         ("max_bg_hold_work", 0),
         ("max_fg_hold_work", 0),
         ("max_hold_work", 0),
+        // budgets-rev-242345 LOW-4: the install hold's work apart, so an O(N) term there under the largest
+        // other hold is seen.
+        ("max_install_hold_work", 0),
     ] {
         let (x, y) = (sa[k], sb[k]);
         if y > x + slack {

@@ -9448,6 +9448,9 @@ impl BranchStore {
         let scanned = scanned.map(|(table, unbuilt)| (Arc::new(table), unbuilt));
         let table = {
             let mut inner = shared.lock();
+            // budgets-rev-242345 LOW-4: this install hold's work, measured apart (test builds).
+            #[cfg(test)]
+            let _install = super::budget_probe::InstallWork::start();
             let f = &mut inner.names.filter;
             if !matches!(&f.state, FilterState::Building { pending: p } if Arc::ptr_eq(p, &pending)) {
                 return FilterBuild::Ended;
