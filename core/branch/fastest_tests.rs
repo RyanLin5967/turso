@@ -16505,6 +16505,11 @@ fn a_close_flight_that_panics_during_an_unwind_does_not_abort_the_process() {
             panic!("LOW4: the caller's own panic, with the store's last handles on its stack");
         }));
         assert!(caught.is_err(), "premise: the caller panicked");
+        // The close's flight took the failpoint: it panicked inside the unwind, not something else.
+        assert!(
+            !super::store::PANIC_NEXT_WAIT_FOR_TEST.load(std::sync::atomic::Ordering::Acquire),
+            "premise: the close's flight reached the failpoint and panicked"
+        );
         println!("LOW4-CHILD-DONE");
         return;
     }
