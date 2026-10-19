@@ -973,6 +973,16 @@ pub fn translate_alter_table(
     match alter_table {
         ast::AlterTableBody::DropColumn(column_name) => {
             let column_name = column_name.as_str();
+            // A WITHOUT ROWID table's rows live in its primary-key index, which the row rewrite below
+            // does not write (it opens the table as a rowid table), so the dropped value stayed in
+            // every row and came back as the next added column (engine-rev-qaf-fix2 MED 17; SQLite
+            // drops it). Refused until that rewrite exists: no row may read a dropped value. Mutant
+            // `without_rowid_drop_unrefused` (test builds only): accepted, as before.
+            if !btree.has_rowid && !crate::branch::store::fe_mutant("without_rowid_drop_unrefused") {
+                return Err(LimboError::ParseError(format!(
+                    "cannot drop column \"{column_name}\" of WITHOUT ROWID table {table_name}: not supported yet"
+                )));
+            }
 
             // A table can have no columns (PostgreSQL's `CREATE TABLE t ()`): then the column to
             // drop is not there, which the lookup below says. It was an assertion that killed the
@@ -1095,14 +1105,20 @@ pub fn translate_alter_table(
             }
 
             // Handle CHECK constraints:
-            // - Column-level CHECK constraints for the dropped column are silently removed
-            // - Table-level CHECK constraints referencing the dropped column cause an error
+            // - The dropped column's own column-level CHECK constraints are silently removed
+            // - Any other CHECK, table-level or on another column, that references the dropped column
+            //   causes an error, as in SQLite (engine-rev-qaf-fix2 MED 16: `b CHECK (b > a)` let a be
+            //   dropped, and every later INSERT failed "no such column: a")
             for check in &btree.check_constraints {
-                if check.column.is_some() {
-                    // Column-level constraint: will be removed below
+                if check
+                    .column
+                    .as_ref()
+                    .is_some_and(|col| normalize_ident(col) == normalize_ident(column_name))
+                {
+                    // The dropped column's own constraint: removed below
                     continue;
                 }
-                // Table-level constraint: check if it references the dropped column
+                // Another constraint: check if it references the dropped column
                 if check_expr_references_column(&check.expr, &col_normalized) {
                     return Err(LimboError::ParseError(format!(
                         "error in table {table_name} after drop column: no such column: {column_name}"
