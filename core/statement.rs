@@ -1214,10 +1214,29 @@ impl Statement {
     /// result column that is a direct reference to a table column (the `Expr::Column` path
     /// `get_column_decltype` follows), that column's `ty_params`, each an integer literal (`[5]` for
     /// varchar(5), `[8, 2]` for numeric(8,2), `[]` for no parameters); `None` for any other result
-    /// column, or when a parameter is not an integer literal. STUB: `None` always.
+    /// column, or when a parameter is not an integer literal (signed with a unary minus or plus
+    /// included). EXPLAIN and EXPLAIN QUERY PLAN columns have none: `None`.
     pub fn get_column_type_params(&self, idx: usize) -> Option<Vec<i64>> {
-        let _ = idx;
-        None
+        use turso_parser::ast::{Expr, Literal, UnaryOperator};
+        if self.query_mode != QueryMode::Normal {
+            return None;
+        }
+        let column = self.program.result_columns.get(idx)?;
+        let Expr::Column { table, column: column_idx, .. } = &column.expr else {
+            return None;
+        };
+        let (_, table_ref) = self.program.table_references.find_table_by_internal_id(*table)?;
+        let table_column = table_ref.get_column_at(*column_idx)?;
+        fn integer(e: &Expr) -> Option<i64> {
+            match e {
+                Expr::Literal(Literal::Numeric(n)) => n.parse::<i64>().ok(),
+                Expr::Unary(UnaryOperator::Negative, inner) => integer(inner)?.checked_neg(),
+                Expr::Unary(UnaryOperator::Positive, inner) => integer(inner),
+                Expr::Parenthesized(v) if v.len() == 1 => integer(&v[0]),
+                _ => None,
+            }
+        }
+        table_column.ty_params.iter().map(|p| integer(p)).collect()
     }
 
     /// Returns rich type information for a result column.
