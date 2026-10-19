@@ -273,15 +273,13 @@ jobs:
           FT_SQLITE3: ${{ github.workspace }}/dist/sqlite3
           FT_FIRECHECK: ${{ github.workspace }}/fastest-raw/firecheck/firecheck.txt
         run: |
-          mkdir -p "$MNT/init-plant" "$RUNNER_TEMP/init-plant-bin"
-          stub="$RUNNER_TEMP/init-plant-bin/py"
-          printf '#!/bin/sh\ncase "$*" in *pins.py\\ shared-buffers*) echo "planted shared-buffers failure" >&2; exit 1 ;; esac\nexec python3 "$@"\n' >"$stub"
-          chmod +x "$stub"
+          # comp-rev-89ec-b3c3 LOW 10: the plant and its check are init_plant.sh (runnable off CI); its wrong-reason
+          # control (init failing for another reason) must make the check refuse, exit 1
+          timeout 1900 bash fastest/linux/competitors/init_plant.sh "$MNT/init-plant" "$RAW/init-plant"
           rc=0
-          FT_PY="$stub" timeout 1800 bash fastest/linux/competitors/run_system.sh pg18-d2 "$MNT/init-plant" \
-            "$RAW/init-plant" >"$RAW/init-plant.txt" 2>&1 || rc=$?
-          echo "init plant: rc $rc; $(grep -c 'FAIL server init' "$RAW/init-plant/functional.txt" 2>/dev/null) server-init FAIL line(s)"
-          [ "$rc" != 0 ] && grep -q '^FAIL server init' "$RAW/init-plant/functional.txt"
+          timeout 1900 bash fastest/linux/competitors/init_plant.sh "$MNT/init-plant-wrong" "$RAW/init-plant-wrong" \
+            wrong-reason || rc=$?
+          [ "$rc" = 1 ] || { echo "init plant control: an init that failed for another reason gave rc $rc, not 1"; exit 1; }
       # Comp review 1 LOW 32's plant: a budget of 1 s must leave every B1 cell "NOT RUN: budget" and fail the run (the
       # budget path had never run). Its own directory on the same filesystem, so the measured run above is untouched.
       - name: Budget plant (b1, FT_BUDGET_S=1)
