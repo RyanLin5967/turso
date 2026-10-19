@@ -4436,7 +4436,10 @@ fn leap_l4_an_open_keeps_at_most_100_bytes_resident_per_live_branch() {
 /// filter insert) bounds an O(N) fill of the filter under the mutex on every platform. BLIND SPOTS:
 /// any other O(N) walk under the mutex that allocates nothing, reads no catalog row and counts no
 /// work (the D0 recovery instruction test sees that one, on Apple); a catalog statement that changes
-/// many rows counts one (`Stmt::exec`). Mutants env `name_filter_built_under_mutex`,
+/// many rows counts one (`Stmt::exec`); max_recovery_work counts only `note_held_work`, whose one
+/// caller is `FilterTable::insert`, so it reads 0 for replay and an O(N) replay loop of any other kind
+/// (map inserts) is invisible to it (budgets-rev-242345 LOW-8: named, not instrumented; replay's own
+/// cost is O(records since the checkpoint), which a slack in N could not bound). Mutants env `name_filter_built_under_mutex`,
 /// `opener_filter_set`. Run at 242345bec (budgets-rev-242345, ecetesla1): green at base (held work 16 at
 /// both sizes), red under name_filter_built_under_mutex (10,000 against 100,000 units).
 #[test]
