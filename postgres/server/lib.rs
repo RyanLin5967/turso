@@ -3074,7 +3074,20 @@ impl Session {
             error,
             started: None,
         };
-        let r = if let Some(table) = types.new_table_keys.as_deref() {
+        // The immutable constant parts of a statement that does not fold whole raise before
+        // RowDescription, as PostgreSQL's planner folds each on its own (StatementTypes::fold_probe;
+        // wire-rev-5cdb70e58 MED-1). A probe the frontend cannot prepare is skipped: only a value
+        // its parts raise counts.
+        let folded_error = match types.fold_probe.as_deref().filter(|_| query) {
+            Some(probe) => match conn.prepare_typed(probe) {
+                Ok((mut folded, _)) => folded.run_ignore_rows().err(),
+                Err(_) => None,
+            },
+            None => None,
+        };
+        let r = if let Some(e) = folded_error {
+            Err(unstarted(PgWireError::UserError(engine_info(&e))))
+        } else if let Some(table) = types.new_table_keys.as_deref() {
             create_with_keys(conn, &mut stmt, sql, table, backoff).map_err(unstarted)
         } else if !query {
             execute_non_query(&mut stmt, sql, backoff, portal.is_none()).map_err(unstarted)

@@ -1688,6 +1688,7 @@ fn prepare_statement_parsed(
         // 2026-10-15).
         types.param_targets = crate::result_types::param_targets(&parse_result);
         types.folds_at_plan = folds_at_plan(&parse_result);
+        types.fold_probe = if types.folds_at_plan { None } else { fold_probe(&parse_result) };
         // A table's width, for a `*` beside a typed column, from the in-memory schema alone.
         let tables = |schema: &str, table: &str| resident_relation_columns(pg_conn, schema, table);
         let fixed = crate::result_types::expression_types(&parse_result, &tables);
@@ -4412,9 +4413,130 @@ fn folds_at_plan(parse: &turso_pg_parser::pg_query::ParseResult) -> bool {
     };
     select.from_clause.is_empty()
         && select.op() == SetOperation::SetopNone
-        && !parse.protobuf.nodes().iter().any(|(n, ..)| {
-            matches!(n, turso_pg_parser::pg_query::NodeRef::FuncCall(call) if calls_non_immutable(call))
-        })
+        && !parse.protobuf.nodes().iter().any(|(n, ..)| not_immutable(n))
+}
+
+/// Whether a node of the tree is itself a stable or volatile computation: a call of one
+/// ([`calls_non_immutable`]), a cast through a stable input function (to date, timestamp,
+/// timestamptz, interval, regclass, ...: [`STABLE_INPUT`], so `'nosuch'::text::regclass` raises
+/// after RowDescription, wire-rev-5cdb70e58 LOW-1), or a SQL value function (CURRENT_TIMESTAMP,
+/// CURRENT_USER). BLIND SPOT: a stable operator (timestamptz + interval) is taken as immutable.
+fn not_immutable(n: &turso_pg_parser::pg_query::NodeRef) -> bool {
+    use turso_pg_parser::pg_query::NodeRef;
+    match n {
+        NodeRef::FuncCall(call) => calls_non_immutable(call),
+        NodeRef::TypeCast(cast) => cast.type_name.as_ref().is_some_and(|t| {
+            t.array_bounds.is_empty()
+                && t.names.iter().rev().find_map(|n| match &n.node {
+                    Some(turso_pg_parser::pg_query::protobuf::node::Node::String(s)) => Some(s.sval.to_ascii_lowercase()),
+                    _ => None,
+                })
+                .is_some_and(|name| STABLE_INPUT.binary_search(&name.as_str()).is_ok())
+        }),
+        NodeRef::SqlvalueFunction(_) => true,
+        _ => false,
+    }
+}
+
+/// PostgreSQL 18.6's base and range types whose input function is stable or volatile (pg_type
+/// typinput's provolatile; recorded on iccad2, fresh initdb, 2026-10-19), sorted.
+const STABLE_INPUT: [&str; 32] = [
+    "aclitem", "date", "datemultirange", "daterange", "int4multirange", "int4range",
+    "int8multirange", "int8range", "interval", "money", "nummultirange", "numrange", "regclass",
+    "regcollation", "regconfig", "regdictionary", "regnamespace", "regoper", "regoperator",
+    "regproc", "regprocedure", "regrole", "regtype", "time", "timestamp", "timestamptz", "timetz",
+    "tsmultirange", "tsrange", "tstzmultirange", "tstzrange", "xml",
+];
+
+/// [`crate::StatementTypes::fold_probe`]: the immutable constant parts of a no-FROM SELECT's
+/// targets and WHERE, each a maximal subtree with no stable or volatile part and no column, as one
+/// SELECT; None for any other statement or when there is none. A bare constant cannot raise and is
+/// left out.
+fn fold_probe(parse: &turso_pg_parser::pg_query::ParseResult) -> Option<String> {
+    use turso_pg_parser::pg_query::protobuf::{node::Node, Node as PgNode, ResTarget, SelectStmt, SetOperation};
+    let [raw] = parse.protobuf.stmts.as_slice() else {
+        return None;
+    };
+    let Some(Node::SelectStmt(select)) = raw.stmt.as_ref().and_then(|s| s.node.as_ref()) else {
+        return None;
+    };
+    if !select.from_clause.is_empty() || select.op() != SetOperation::SetopNone || !select.values_lists.is_empty() {
+        return None;
+    }
+    // Immutable and constant all the way down: literals, and calls, operators, casts and the
+    // conditional forms over them; anything else (a column, a parameter, a subquery, a node this
+    // reads no further) is not.
+    fn pure(node: &PgNode) -> bool {
+        let Some(n) = node.node.as_ref() else { return false };
+        let all = |v: &[PgNode]| v.iter().all(pure);
+        match n {
+            Node::AConst(_) => true,
+            Node::FuncCall(f) => {
+                f.over.is_none() && f.agg_filter.is_none() && !f.agg_star && !calls_non_immutable(f) && all(&f.args)
+            }
+            Node::AExpr(e) => e.lexpr.as_deref().is_none_or(pure) && e.rexpr.as_deref().is_none_or(pure),
+            Node::TypeCast(c) => {
+                !not_immutable(&turso_pg_parser::pg_query::NodeRef::TypeCast(c.as_ref())) && c.arg.as_deref().is_some_and(pure)
+            }
+            Node::BoolExpr(b) => all(&b.args),
+            Node::CoalesceExpr(c) => all(&c.args),
+            Node::MinMaxExpr(m) => all(&m.args),
+            Node::NullTest(t) => t.arg.as_deref().is_some_and(pure),
+            _ => false,
+        }
+    }
+    fn collect(node: &PgNode, out: &mut Vec<PgNode>) {
+        let Some(n) = node.node.as_ref() else { return };
+        if matches!(n, Node::AConst(_)) {
+            return;
+        }
+        if pure(node) {
+            out.push(node.clone());
+            return;
+        }
+        let children: Vec<&PgNode> = match n {
+            Node::FuncCall(f) => f.args.iter().collect(),
+            Node::AExpr(e) => e.lexpr.iter().chain(e.rexpr.iter()).map(|b| b.as_ref()).collect(),
+            Node::TypeCast(c) => c.arg.iter().map(|b| b.as_ref()).collect(),
+            Node::BoolExpr(b) => b.args.iter().collect(),
+            Node::CoalesceExpr(c) => c.args.iter().collect(),
+            Node::MinMaxExpr(m) => m.args.iter().collect(),
+            Node::NullTest(t) => t.arg.iter().map(|b| b.as_ref()).collect(),
+            _ => Vec::new(),
+        };
+        for c in children {
+            collect(c, out);
+        }
+    }
+    let mut parts = Vec::new();
+    for target in &select.target_list {
+        if let Some(Node::ResTarget(t)) = target.node.as_ref() {
+            if let Some(val) = t.val.as_deref() {
+                collect(val, &mut parts);
+            }
+        }
+    }
+    if let Some(w) = select.where_clause.as_deref() {
+        collect(w, &mut parts);
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    // The statement's own SelectStmt, its targets replaced and its WHERE dropped: a SelectStmt
+    // built from defaults carries enum fields libpg_query's deparser asserts on (op, limit_option
+    // 0 = UNDEFINED), which aborted the server.
+    let mut probe: SelectStmt = select.as_ref().clone();
+    probe.where_clause = None;
+    probe.target_list = parts
+            .into_iter()
+            .map(|val| PgNode {
+                node: Some(Node::ResTarget(Box::new(ResTarget {
+                    val: Some(Box::new(val)),
+                    ..Default::default()
+                }))),
+            })
+            .collect();
+    Node::SelectStmt(Box::new(probe)).deparse().ok()
 }
 
 /// PostgreSQL 18.6's functions that are stable or volatile in every overload (recorded,

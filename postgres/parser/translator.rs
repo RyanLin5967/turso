@@ -3624,6 +3624,30 @@ impl PostgreSQLTranslator {
                         }),
                     });
                 }
+                // A cast to date, timestamp or timestamptz goes through the engine's own type, whose
+                // ENCODE checks the value: as TEXT, 'x'::text::date answered 'x' where PostgreSQL
+                // answers 22007 (wire-rev-5cdb70e58's queued item; recorded,
+                // pg18-wirefuzz-each_immutable_part_folds_on_its_own.out #6).
+                let checked = type_cast.type_name.as_ref().and_then(|t| {
+                    if !t.array_bounds.is_empty() {
+                        return None;
+                    }
+                    t.names.iter().rev().find_map(|n| match &n.node {
+                        Some(pg_query::protobuf::node::Node::String(s)) => Some(s.sval.to_ascii_lowercase()),
+                        _ => None,
+                    })
+                    .filter(|n| matches!(n.as_str(), "date" | "timestamp" | "timestamptz"))
+                });
+                if let Some(name) = checked {
+                    return Ok(ast::Expr::Cast {
+                        expr,
+                        type_name: Some(ast::Type {
+                            name,
+                            size: None,
+                            array_dimensions: 0,
+                        }),
+                    });
+                }
                 let type_name = match type_cast.type_name.as_ref() {
                     Some(t) => pg_type_name_to_ast_type(t).or_else(|| self.engine_type(t)),
                     None => None,

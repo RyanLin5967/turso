@@ -443,6 +443,11 @@ fn expression_type(node: &PgNode) -> Option<u32> {
             return match type_name.names.last()?.node.as_ref()? {
                 Node::String(s) if s.sval == "bool" => Some(BOOL),
                 Node::String(s) if s.sval == "float4" => Some(FLOAT4),
+                // The translator casts to the engine's own date and timestamp types (each value
+                // checked by its ENCODE): typed as PostgreSQL types them.
+                Node::String(s) if s.sval == "date" => Some(1082),
+                Node::String(s) if s.sval == "timestamp" => Some(1114),
+                Node::String(s) if s.sval == "timestamptz" => Some(1184),
                 _ => None,
             };
         }
@@ -674,6 +679,12 @@ pub struct StatementTypes {
     /// pg_database_size(): PostgreSQL 18.6's list, pg18-nonimmutable-functions.list), so a statement
     /// calling one raises after RowDescription, as PostgreSQL does.
     pub folds_at_plan: bool,
+    /// A no-FROM SELECT that calls something stable or volatile (so it does not fold whole,
+    /// [`StatementTypes::folds_at_plan`]): its immutable constant parts, as one SELECT (PostgreSQL
+    /// text), run before RowDescription, so an error in one of them comes first, as PostgreSQL's
+    /// planner folds each such part on its own (`SELECT encode('abc', 'nosuch'), now()` sends only
+    /// its 22023; wire-rev-5cdb70e58 MED-1). None when there is no such part.
+    pub fold_probe: Option<String>,
     /// For each result column of a plain SELECT, the parameter number when the column is a bare
     /// `$n`: the server announces such a column as that parameter's type, declared or inferred,
     /// as PostgreSQL does (it was text; the PG 18 differential's finding (c)). Empty when the

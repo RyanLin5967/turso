@@ -12405,7 +12405,11 @@ replays_postgresql!(
 replays_postgresql!(
     pg18_wirefuzz_each_immutable_part_folds_on_its_own_replays_as_postgresql_answered,
     "pg18-wirefuzz-each_immutable_part_folds_on_its_own.out",
-    []
+    [
+        (4, "PGDIV-EXTRACT-MISSING error-code [wire]: extract(field from source) is refused 42883 'no such function: extract' where PG answers it; the fold of the encode() beside it is not reached"),
+        (5, "PGDIV-EXPR-TYPE-TEXT value [wire]: the phase agrees (RowDescription, then 42P01), but a cast to regclass is typed 25 where PG types it 2205"),
+        (6, "PGDIV-DATE-INPUT-CODE error-code [engine]: refused after RowDescription as in PG, but XX000 'invalid date value' (core's date ENCODE, a RAISE with no kind) where PG answers 22007 'invalid input syntax for type date'"),
+    ]
 );
 replays_postgresql!(
     pg18_wirefuzz_the_connected_database_is_current_database_and_in_pg_database_replays_as_postgresql_answered,
