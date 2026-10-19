@@ -1322,7 +1322,7 @@ mod tests {
     /// arithmetic over timestamp, timestamptz and time is REFUSED as not supported (0A000 at the
     /// wire), never answered. At the base each is the plain arithmetic of two texts, silently: ts -
     /// ts answered 0 and ts + 1 2027. Each refusal is `LimboError::FeatureNotSupported`, "interval
-    /// arithmetic is not supported", even over an empty operand row set's single row with NULLs.
+    /// arithmetic is not supported", over a row of NULLs too.
     /// date - date (a day count) is the control.
     #[test]
     fn timestamp_and_time_arithmetic_is_refused_until_an_interval_type_exists() {

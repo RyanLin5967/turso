@@ -94,6 +94,11 @@ pub enum LimboError {
     /// (fastest-wire c15466936, 22001).
     #[error("{0}")]
     StringDataRightTruncation(String),
+    /// A feature this engine does not have, refused where answering would be wrong: arithmetic
+    /// that needs an interval type (lead ruling 2026-10-19). Typed so a server answers it by kind
+    /// (PostgreSQL's feature_not_supported, 0A000).
+    #[error("{0}")]
+    FeatureNotSupported(String),
     #[error("Extension error: {0}")]
     ExtensionError(String),
     #[error("integer overflow")]

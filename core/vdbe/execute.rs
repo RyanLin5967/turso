@@ -10926,6 +10926,20 @@ pub fn op_function(
                 };
                 state.registers[*dest].set_value(result);
             }
+            ScalarFunc::TemporalPlus | ScalarFunc::TemporalMinus => {
+                // timestamp's, timestamptz's and time's '+' and '-' (lead ruling 2026-10-19): every
+                // one PostgreSQL has takes or makes an interval, which this engine has no type for,
+                // so each is refused, a NULL operand too (PostgreSQL decides by type, not value).
+                // The plain '+' and '-' they replace answered the texts' arithmetic: ts - ts was 0.
+                // Mutant `temporal_arithmetic_answers` (test builds only): answers NULL instead.
+                check_arg_count!(arg_count, 2);
+                if !crate::branch::store::fe_mutant("temporal_arithmetic_answers") {
+                    return Err(LimboError::FeatureNotSupported(
+                        "interval arithmetic is not supported".to_string(),
+                    ));
+                }
+                state.registers[*dest].set_value(Value::Null);
+            }
             ScalarFunc::TimestamptzOffset => {
                 // timestamptz's input (fastest-wire 68f301ef0): PostgreSQL's ISO 8601 offsets of
                 // hours only or with no colon ('+00', '-0330') written '+HH:MM', the one form
