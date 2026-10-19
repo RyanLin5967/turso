@@ -12327,6 +12327,27 @@ fn every_pg18_recording_has_one_replay() {
     assert_eq!(files, replayed, "the recordings in tests/pg18 against the replays declared here");
 }
 
+/// wire-rev-2a68496d0 L1: every PostgreSQL recording in tests/recordings/ (the formats a replay cannot read; its
+/// README says which) is cited by a test of this file, so no recording sits there that nothing asserts. The README
+/// names each file and is no recording itself.
+#[test]
+fn every_recording_outside_pg18_is_cited_by_a_test() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/recordings");
+    let files: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|f| f != "README.md")
+        .collect();
+    assert!(!files.is_empty(), "refused: no recording in {}", dir.display());
+    let source = include_str!("wire_sessions.rs");
+    let readme = std::fs::read_to_string(dir.join("README.md")).expect("recordings/README.md");
+    let uncited: Vec<&String> = files
+        .iter()
+        .filter(|f| !source.contains(&format!("recordings/{f}")) || !readme.contains(f.as_str()))
+        .collect();
+    assert!(uncited.is_empty(), "recordings no test cites, or the README does not name: {uncited:?}");
+}
+
 macro_rules! replays_postgresql {
     ($test:ident, $file:literal, [$(($n:literal, $why:literal)),* $(,)?]) => {
         #[test]
