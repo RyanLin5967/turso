@@ -530,6 +530,7 @@ pub fn aggregate_types(aggregates: &[bool], columns: &[Option<u32>]) -> Vec<Opti
 const BOOL: u32 = 16;
 const TEXT: u32 = 25;
 const VARCHAR: u32 = 1043;
+const NAME: u32 = 19;
 
 /// Which result columns of a plain SELECT (lined up as [`aggregate_targets`] lines them up) are
 /// computed from table columns and integer or string literals by arithmetic (+ - * / %) and by the
@@ -1770,6 +1771,18 @@ impl Infer<'_> {
                 if name.as_deref().is_some_and(takes_text) {
                     for arg in &f.args {
                         self.set(arg, Some(TEXT));
+                    }
+                }
+                // Functions whose argument types PostgreSQL fixes by position (wire-rev-uw3 LOW-6:
+                // they were described text): setval(regclass, bigint, bool), pg_database_size(name).
+                let positional: &[Option<u32>] = match name.as_deref() {
+                    Some("setval") => &[None, Some(INT8), Some(BOOL)],
+                    Some("pg_database_size") => &[Some(NAME)],
+                    _ => &[],
+                };
+                for (arg, ty) in f.args.iter().zip(positional) {
+                    if ty.is_some() {
+                        self.set(arg, *ty);
                     }
                 }
                 for arg in &f.args {
