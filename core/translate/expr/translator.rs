@@ -1853,7 +1853,8 @@ pub fn translate_expr(
                         | ScalarFunc::NumericLt
                         | ScalarFunc::NumericEq
                         | ScalarFunc::DatePlus
-                        | ScalarFunc::DateMinus => translate_function(
+                        | ScalarFunc::DateMinus
+                        | ScalarFunc::TimestamptzOffset => translate_function(
                             program,
                             args,
                             referenced_tables,

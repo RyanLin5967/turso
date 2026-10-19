@@ -280,6 +280,26 @@ fn date_arithmetic(lhs: &Value, rhs: &Value, minus: bool) -> Result<Value> {
     }
 }
 
+/// `s` with a trailing UTC offset of the form `+HH` or `+HHMM` (or `-`), after a time of day
+/// (`HH:MM`, seconds and a fraction optional), written `+HH:MM`; `None` when `s` has no such
+/// offset. A date's own `-DD` is never one: the offset must follow a time's digit. Mutant
+/// `tz_offset_unrewritten` (test builds only): never rewritten, as before.
+fn pg_offset_with_colon(s: &str) -> Option<String> {
+    if crate::branch::store::fe_mutant("tz_offset_unrewritten") {
+        return None;
+    }
+    let sign = s.rfind(['+', '-'])?;
+    let (head, digits) = (&s[..sign], &s[sign + 1..]);
+    if !(digits.len() == 2 || digits.len() == 4) || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if !head.ends_with(|c: char| c.is_ascii_digit()) || !head.rsplit(' ').next().is_some_and(|t| t.contains(':')) {
+        return None;
+    }
+    let (hh, mm) = digits.split_at(2);
+    Some(format!("{head}{}{hh}:{}", &s[sign..sign + 1], if mm.is_empty() { "00" } else { mm }))
+}
+
 fn date_operand_kind(v: &Value) -> &'static str {
     match v {
         Value::Text(t) if chrono::NaiveDate::parse_from_str(t.as_str(), "%Y-%m-%d").is_ok() => "date",
@@ -10903,6 +10923,21 @@ pub fn op_function(
                         };
                         Value::build_text(res.format())
                     }
+                };
+                state.registers[*dest].set_value(result);
+            }
+            ScalarFunc::TimestamptzOffset => {
+                // timestamptz's input (fastest-wire 68f301ef0): PostgreSQL's ISO 8601 offsets of
+                // hours only or with no colon ('+00', '-0330') written '+HH:MM', the one form
+                // datetime() takes; any other value unchanged.
+                check_arg_count!(arg_count, 1);
+                let val = state.registers[*start_reg].get_value().clone();
+                let result = match &val {
+                    Value::Text(t) => match pg_offset_with_colon(t.as_str()) {
+                        Some(s) => Value::build_text(s),
+                        None => val,
+                    },
+                    _ => val,
                 };
                 state.registers[*dest].set_value(result);
             }
