@@ -12395,7 +12395,7 @@ replays_postgresql!(
     "pg18-wirefuzz-arithmetic_over_rows_answers_as_postgresql_does.out",
     [
         (4, "PGDIV-NUMERIC-ARITH-SCALE value [engine]: bigint * numeric(8,2) answers 21 where PG answers 21.00 (the engine's numeric product drops the scale of its operand)"),
-        (5, "PGDIV-DATE-ARITHMETIC value [wire]: SILENT: 1 + date, date + 1 and date - 1 answer 2027, 2027 and 2025 (the date's text read as a number) where PG answers 2026-10-20, 2026-10-20, 2026-10-18; date - date agrees (0). The translation must add days to a date (typed by the walk)"),
+        (5, "PGDIV-DATE-ARITHMETIC value [engine]: SILENT: 1 + date, date + 1 and date - 1 answer 2027, 2027 and 2025 (the date's text read as a number) where PG answers 2026-10-20, 2026-10-20, 2026-10-18; date - date agrees (0). Core's date type (core/schema.rs) defines no '+' or '-' operator, so the engine adds as numbers"),
         (6, "PGDIV-INTERVAL-TEXT value [engine]: timestamp - timestamp and timestamptz - timestamptz answer 0 where PG answers the interval 00:00:00 (typed interval, 1186, on both sides)"),
     ]
 );
