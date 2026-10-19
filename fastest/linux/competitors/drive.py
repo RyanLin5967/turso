@@ -445,6 +445,11 @@ def selftest():
     b0 = {MNTX: ("/mnt/fastest-xfs", "/dev/loop0", "btrfs", "rw,barrier=0"), BACK: ("/", "/dev/sda1", "ext4", "rw")}
     cases.append(("barrier=0 on the run's own filesystem over a write-through leaf (nothing to drain either way)",
                   loop_on("write through", "0", "Virtual Disk", mounts=b0), "write-through", None, "n/a: write-through"))
+    # comp-rev-89ec-b3c3 LOW 11: the case above sits over a write-through leaf, where flush_verdict answers before it
+    # reads any mount, so nothing tested barriers off on MNT's OWN filesystem where it matters: over a write-back leaf
+    cases.append(("barrier=0 on the run's own filesystem over a write-back NVMe with FUA",
+                  loop_on("write back", "1", "MSFT NVMe Accelerator v1.0", "nvme0n1", "nvme0n1p1", b0),
+                  "write-back+fua", None, "no"))
     cases.append(("mount options cannot be read", loop_on("write through", "0", "Virtual Disk", mounts={}), None, None,
                   None))
 
