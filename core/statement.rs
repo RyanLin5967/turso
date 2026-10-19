@@ -1335,6 +1335,41 @@ impl Statement {
                 kind,
             }));
         }
+        // An expression whose values are of a custom type (an operator the type defines, min/max,
+        // a CAST to it; `order_by::expr_custom_type`) is that type, as PostgreSQL types it
+        // (fastest-wire 76b5a2550: `b + 1` over numeric).
+        {
+            let schema = self.program.connection.schema.read();
+            let scalar = match &column.expr {
+                turso_parser::ast::Expr::SubqueryResult {
+                    query_type: turso_parser::ast::SubqueryType::RowValue { result_reg_start, num_regs: 1 },
+                    ..
+                } => self
+                    .program
+                    .scalar_subquery_types
+                    .get(result_reg_start)
+                    .and_then(|name| schema.get_type_def_unchecked(name))
+                    .cloned(),
+                _ => None,
+            };
+            let typed = scalar.map(|td| (td, std::vec::Vec::new())).or_else(|| {
+                crate::translate::order_by::expr_custom_type(&column.expr, &self.program.table_references, &schema)
+            });
+            if let Some((type_def, _)) = typed {
+                let base_type = schema
+                    .resolve_type_unchecked(&type_def.name)
+                    .ok()
+                    .flatten()
+                    .map(|r| r.primitive.to_uppercase());
+                let kind = if type_def.is_domain { ColumnTypeKind::Domain } else { ColumnTypeKind::Custom };
+                return Ok(Some(ColumnTypeInfo {
+                    declared_name: type_def.name.clone(),
+                    array_dimensions: 0,
+                    base_type,
+                    kind,
+                }));
+            }
+        }
         // Not a table column: infer the result primitive from the
         // expression's shape (literal value type, operand types of a binary
         // op, the CAST target, etc.).

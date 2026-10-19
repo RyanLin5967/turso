@@ -910,7 +910,7 @@ fn derive_ctas_schema(
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     connection: &Arc<Connection>,
-) -> Result<(CtasInfo, Vec<ColumnDefinition>)> {
+) -> Result<(CtasInfo, Vec<ColumnDefinition>, bool)> {
     let plan = prepare_select_plan(
         select,
         resolver,
@@ -946,11 +946,52 @@ fn derive_ctas_schema(
         *count += 1;
     }
 
+    // The copy keeps a custom type its SELECT's values carry (fastest-wire 76b5a2550: PostgreSQL's
+    // CREATE TABLE AS keeps numeric(8, 2); this copied it as an untyped column whose values ordered
+    // as text). With one, the table is STRICT, so the type ENCODEs, DECODEs and orders its values,
+    // and every other column takes the STRICT name of its affinity (NUMERIC and none are ANY).
+    // Only with custom types on: a plain SQLite CTAS is unchanged. Mutant `ctas_drops_custom_type`
+    // (test builds only): as before.
+    let custom: Vec<Option<(String, Option<ast::TypeSize>)>> = result_columns
+        .iter()
+        .map(|col| {
+            if !connection.experimental_custom_types_enabled() || crate::branch::store::fe_mutant("ctas_drops_custom_type") {
+                return None;
+            }
+            let (type_def, params) = super::order_by::expr_custom_type(&col.expr, table_refs, resolver.schema())?;
+            let size = match params.as_slice() {
+                [] => None,
+                [a] => Some(ast::TypeSize::MaxSize(a.clone())),
+                [a, b] => Some(ast::TypeSize::TypeSize(a.clone(), b.clone())),
+                _ => return None,
+            };
+            Some((type_def.name.clone(), size))
+        })
+        .collect();
+    let strict = custom.iter().any(Option::is_some);
+
     let mut sql_parts = Vec::with_capacity(result_columns.len());
     let mut col_defs = Vec::with_capacity(result_columns.len());
 
-    for (col, name) in result_columns.iter().zip(names) {
-        let ty = col.declared_type(table_refs);
+    for ((col, name), custom) in result_columns.iter().zip(names).zip(custom) {
+        let ty: String = match (&custom, strict) {
+            (Some((type_name, size)), _) => ast::Type {
+                name: type_name.clone(),
+                size: size.clone(),
+                array_dimensions: 0,
+            }
+            .to_string(),
+            (None, true) => match col.declared_type(table_refs) {
+                "INT" => "INTEGER",
+                "REAL" => "REAL",
+                "TEXT" => "TEXT",
+                "BLOB" => "BLOB",
+                _ => "ANY",
+            }
+            .to_string(),
+            (None, false) => col.declared_type(table_refs).to_string(),
+        };
+        let ty = ty.as_str();
 
         let quoted = quote_identifier(&name);
         if ty.is_empty() {
@@ -959,14 +1000,18 @@ fn derive_ctas_schema(
             sql_parts.push(format!("{quoted} {ty}"));
         }
 
-        let col_type = if ty.is_empty() {
-            None
-        } else {
-            Some(ast::Type {
+        let col_type = match custom {
+            Some((type_name, size)) => Some(ast::Type {
+                name: type_name,
+                size,
+                array_dimensions: 0,
+            }),
+            None if ty.is_empty() => None,
+            None => Some(ast::Type {
                 name: ty.to_string(),
                 size: None,
                 array_dimensions: 0,
-            })
+            }),
         };
         col_defs.push(ColumnDefinition {
             col_name: ast::Name::exact(name),
@@ -977,9 +1022,13 @@ fn derive_ctas_schema(
 
     let info = CtasInfo {
         plan,
-        schema_sql: format!("CREATE TABLE {table_name}({})", sql_parts.join(",")),
+        schema_sql: format!(
+            "CREATE TABLE {table_name}({}){}",
+            sql_parts.join(","),
+            if strict { " STRICT" } else { "" }
+        ),
     };
-    Ok((info, col_defs))
+    Ok((info, col_defs, strict))
 }
 
 /// Emit bytecode to populate a newly-created CTAS table from the SELECT.
@@ -1042,6 +1091,8 @@ fn emit_ctas_insert(
 
     // Open the new table for writing using the root page from CreateBtree.
     let ctas_btree = Arc::new(create_table(table_name, body, 0)?);
+    let ctas_btree_strict = ctas_btree.is_strict;
+    let ctas_columns = ctas_btree.columns().to_vec();
     let new_table_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(ctas_btree));
     program.emit_insn(Insn::OpenWrite {
         cursor_id: new_table_cursor_id,
@@ -1066,6 +1117,21 @@ fn emit_ctas_insert(
             "CTAS internal error: result column start register not set".into(),
         )
     })?;
+    // A STRICT copy (one that keeps a custom type, `derive_ctas_schema`) ENCODEs its custom-typed
+    // columns, as an INSERT does: the SELECT yields their decoded values (fastest-wire 76b5a2550).
+    if ctas_btree_strict {
+        let columns: Vec<_> = ctas_columns.iter().cloned().collect();
+        let layout = crate::schema::ColumnLayout::from_columns(&columns)?;
+        crate::translate::expr::emit_custom_type_encode_columns(
+            program,
+            resolver,
+            &columns,
+            result_start_reg,
+            None,
+            table_name,
+            &layout,
+        )?;
+    }
     let record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
         start_reg: to_u32(result_start_reg),
@@ -1145,17 +1211,21 @@ pub fn translate_create_table(
     // regular ColumnsAndConstraints body + separate SELECT for data insertion.
     let (body, ctas_info) = match body {
         ast::CreateTableBody::AsSelect(select) => {
-            let (info, col_defs) = derive_ctas_schema(
+            let (info, col_defs, strict) = derive_ctas_schema(
                 select,
                 &tbl_name.name.as_ident(),
                 resolver,
                 program,
                 connection,
             )?;
+            let mut options = ast::TableOptions::empty();
+            if strict {
+                options.strict_text = Some("STRICT".to_string());
+            }
             let body = ast::CreateTableBody::ColumnsAndConstraints {
                 columns: col_defs,
                 constraints: vec![],
-                options: ast::TableOptions::empty(),
+                options,
             };
             (body, Some(info))
         }

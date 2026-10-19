@@ -41,10 +41,80 @@ fn sort_comparator_from_func_name(func_name: &str) -> Option<SortComparatorType>
     }
 }
 
-/// For an ORDER BY expression that is a column reference to a custom type,
-/// returns the SortComparatorType if the type has a `<` operator with a known
-/// comparator. Returns None otherwise, which causes the sorter to use encoded
-/// blob ordering instead of silently wrong results.
+/// The custom type of the values `expr` yields, with the type parameters they were made under, or
+/// `None` (fastest-wire 76b5a2550: the type was known only for a direct table column, so a value read
+/// through a view, a derived table or an arithmetic operator ordered and typed as its base):
+/// - a column of a STRICT table of a registered type (its values are read decoded);
+/// - a column of a FROM subquery or view that `JoinedTable::new_subquery` gave its source's type
+///   (its values are the source's decoded values);
+/// - `+`, `-`, `*` or `/` over such a value whose type defines that operator (the result is that
+///   type's, unconstrained: no parameters, as PostgreSQL's numeric result has typmod -1);
+/// - `min` or `max` of one such argument, a parenthesized one, and a CAST to a registered type.
+///
+/// A column of a non-STRICT table is NOT given its declared type here: a plain NUMERIC column of a
+/// SQLite schema would otherwise order through numeric's '<' instead of SQLite's type order.
+pub(crate) fn expr_custom_type(
+    expr: &ast::Expr,
+    referenced_tables: &TableReferences,
+    schema: &Schema,
+) -> Option<(std::sync::Arc<crate::schema::TypeDef>, std::vec::Vec<Box<ast::Expr>>)> {
+    match expr {
+        ast::Expr::Column { table: table_ref_id, column, .. } => {
+            let (_, table) = referenced_tables.find_table_by_internal_id(*table_ref_id)?;
+            let col = table.get_column_at(*column)?;
+            if col.is_array() || col.ty_str.is_empty() {
+                return None;
+            }
+            let type_def = match table {
+                crate::schema::Table::FromClauseSubquery(_) => schema.get_type_def_unchecked(&col.ty_str),
+                _ => schema.get_type_def(&col.ty_str, table.is_strict()),
+            }?;
+            Some((type_def.clone(), col.ty_params.clone()))
+        }
+        ast::Expr::Binary(lhs, op, rhs) => {
+            let symbol = match op {
+                ast::Operator::Add => "+",
+                ast::Operator::Subtract => "-",
+                ast::Operator::Multiply => "*",
+                ast::Operator::Divide => "/",
+                _ => return None,
+            };
+            let (type_def, _) = expr_custom_type(lhs, referenced_tables, schema)
+                .or_else(|| expr_custom_type(rhs, referenced_tables, schema))?;
+            type_def
+                .operators()
+                .iter()
+                .any(|o| o.op == symbol)
+                .then(|| (type_def, std::vec::Vec::new()))
+        }
+        ast::Expr::Parenthesized(inner) if inner.len() == 1 => {
+            expr_custom_type(&inner[0], referenced_tables, schema)
+        }
+        ast::Expr::FunctionCall { name, args, .. }
+            if args.len() == 1
+                && (name.as_str().eq_ignore_ascii_case("min") || name.as_str().eq_ignore_ascii_case("max")) =>
+        {
+            expr_custom_type(&args[0], referenced_tables, schema)
+        }
+        ast::Expr::Cast { type_name: Some(ty), .. } if ty.array_dimensions == 0 => {
+            let type_def = schema.get_type_def_unchecked(&ty.name)?;
+            let params = match &ty.size {
+                Some(ast::TypeSize::MaxSize(a)) => std::vec![a.clone()],
+                Some(ast::TypeSize::TypeSize(a, b)) => std::vec![a.clone(), b.clone()],
+                None => std::vec::Vec::new(),
+            };
+            Some((type_def.clone(), params))
+        }
+        _ => None,
+    }
+}
+
+/// For an ORDER BY expression whose values are of a custom type (`expr_custom_type`: a STRICT
+/// column, a derived relation's typed column, an operator over one), the SortComparatorType of the
+/// type's `<` operator when the sorter knows it (its comparators read a stored encoding and a
+/// decoded value alike). Returns None otherwise, which causes the sorter to use encoded
+/// blob ordering instead of silently wrong results. Mutant `derived_type_unordered` (test builds
+/// only): only a direct STRICT column, as before.
 pub(crate) fn custom_type_comparator(
     expr: &ast::Expr,
     referenced_tables: &TableReferences,
@@ -62,18 +132,25 @@ pub(crate) fn custom_type_comparator(
         if col.is_array() {
             return Some(SortComparatorType::ArrayLt);
         }
-        let type_def = schema.get_type_def(&col.ty_str, table.is_strict())?;
-        type_def
-            .operators()
-            .iter()
-            .find(|op| op.op == "<")
-            .and_then(|op| op.func_name.as_ref())
-            .and_then(|func_name| sort_comparator_from_func_name(func_name))
     } else if super::expr::expr_is_array(expr, Some(referenced_tables)) {
-        Some(SortComparatorType::ArrayLt)
-    } else {
-        None
+        return Some(SortComparatorType::ArrayLt);
     }
+    if crate::branch::store::fe_mutant("derived_type_unordered") {
+        let direct_btree_column = matches!(expr, ast::Expr::Column { table, .. }
+            if referenced_tables
+                .find_table_by_internal_id(*table)
+                .is_some_and(|(_, t)| matches!(t, crate::schema::Table::BTree(_))));
+        if !direct_btree_column {
+            return None;
+        }
+    }
+    let (type_def, _) = expr_custom_type(expr, referenced_tables, schema)?;
+    type_def
+        .operators()
+        .iter()
+        .find(|op| op.op == "<")
+        .and_then(|op| op.func_name.as_ref())
+        .and_then(|func_name| sort_comparator_from_func_name(func_name))
 }
 
 /// For a result column expression that is a column reference to a custom type,

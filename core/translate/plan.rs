@@ -2467,6 +2467,7 @@ impl Operation {
 fn query_output_columns(
     plan: &Plan,
     explicit_columns: Option<&[String]>,
+    schema: &crate::schema::Schema,
 ) -> Result<alloc::Vec<Column>> {
     let (result_columns, table_references): (&[ResultSetColumn], &TableReferences) = match plan {
         Plan::Select(select_plan) => (&select_plan.result_columns, &select_plan.table_references),
@@ -2533,8 +2534,28 @@ fn query_output_columns(
             column.set_array_dimensions(1);
         }
         column.set_collation(get_collseq_from_expr(result_expr, table_references)?);
+        // A compound's column takes no single arm's type.
+        if compound_arms.is_none() {
+            inherit_custom_type(column, result_expr, table_references, schema);
+        }
     }
     Ok(columns)
+}
+
+/// A derived relation's column (a FROM subquery, a view, a CTE) takes the custom type of the values
+/// its expression yields (`order_by::expr_custom_type`), with their type parameters: those values are
+/// the source's decoded values, so a reader orders, compares and types them as that type, as
+/// PostgreSQL does (fastest-wire 76b5a2550: a view's numeric column ordered as text and was announced
+/// bytea). The relation is not STRICT, so nothing ENCODEs or DECODEs them again. Mutant
+/// `derived_column_untyped` (test builds only): its type stays the affinity's, as before.
+fn inherit_custom_type(column: &mut Column, expr: &ast::Expr, tables: &TableReferences, schema: &crate::schema::Schema) {
+    if crate::branch::store::fe_mutant("derived_column_untyped") {
+        return;
+    }
+    if let Some((type_def, params)) = super::order_by::expr_custom_type(expr, tables, schema) {
+        column.ty_str = type_def.name.clone();
+        column.ty_params = params;
+    }
 }
 
 impl JoinedTable {
@@ -2564,6 +2585,7 @@ impl JoinedTable {
         plan: SelectPlan,
         join_info: Option<JoinInfo>,
         internal_id: TableInternalId,
+        schema: &crate::schema::Schema,
     ) -> Result<Self> {
         let mut columns = plan
             .result_columns
@@ -2596,6 +2618,7 @@ impl JoinedTable {
                 &plan.result_columns[i].expr,
                 &plan.table_references,
             )?);
+            inherit_custom_type(column, &plan.result_columns[i].expr, &plan.table_references, schema);
         }
 
         let table = Table::FromClauseSubquery(Arc::new(FromClauseSubquery {
@@ -2633,8 +2656,9 @@ impl JoinedTable {
         explicit_columns: Option<&[String]>,
         cte_id: Option<usize>,
         materialize_hint: bool,
+        schema: &crate::schema::Schema,
     ) -> Result<Self> {
-        let columns = query_output_columns(&plan, explicit_columns)?;
+        let columns = query_output_columns(&plan, explicit_columns, schema)?;
         // Get result columns and table references from the plan
         // materialize_hint is set true for explicit WITH ... AS MATERIALIZED hint.
         // Multi-reference CTEs are also detected at emission time via reference counting,
@@ -2671,8 +2695,9 @@ impl JoinedTable {
         query: &Plan,
         internal_id: TableInternalId,
         explicit_columns: Option<&[String]>,
+        schema: &crate::schema::Schema,
     ) -> Result<Self> {
-        let mut columns = query_output_columns(query, explicit_columns)?;
+        let mut columns = query_output_columns(query, explicit_columns, schema)?;
         // The recursive self-reference reads SQLite's queue table, whose
         // columns have no declared type: comparisons in the recursive term
         // see the stored value without the anchor query's affinity. Only the

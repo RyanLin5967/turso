@@ -1903,6 +1903,17 @@ pub fn emit_non_from_clause_subquery(
 ) -> Result<()> {
     // Stack-guard class (fastest-engine): a recursive entry is a nested step (`stack::NestGuard`).
     let _nest = crate::stack::NestGuard::enter("a recursive step")?;
+    // A one-column scalar subquery whose column is of a custom type yields that type
+    // (`ProgramBuilder::scalar_subquery_types`).
+    if let (SubqueryType::RowValue { result_reg_start, num_regs: 1 }, Plan::Select(select)) = (query_type, &plan) {
+        if let [column] = select.result_columns.as_slice() {
+            if let Some((type_def, _)) =
+                super::order_by::expr_custom_type(&column.expr, &select.table_references, resolver.schema())
+            {
+                program.scalar_subquery_types.insert(*result_reg_start, type_def.name.clone());
+            }
+        }
+    }
     program.nested(|program| {
         let subquery_id = program.next_subquery_eqp_id();
         match query_type {
