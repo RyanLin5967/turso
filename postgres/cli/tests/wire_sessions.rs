@@ -7518,6 +7518,80 @@ fn copy_reads_postgresqls_integer_syntax_and_checks_its_options() {
     }
 }
 
+/// COPY reads what PostgreSQL 18.6 reads (recorded, copy-stdin-pg18.txt part 4): an underscore
+/// right after 0b or 0x (37, 31); a numeric DELIMITER or NULL as its text (DELIMITER 1 is 22023,
+/// NULL 0 reads the field 0 as NULL); an escaped CR before the newline as a CR; overflow before
+/// junk as 22003; \v around a smallint as white space; an incomplete UTF-8 sequence named with its
+/// expected length (0xc3 0x28); HEADER skips a whole logical line, an escaped newline in it
+/// included. A NUL in a file is 22021 as from STDIN.
+#[test]
+fn copy_reads_numbers_options_and_lines_as_postgresql_does() {
+    let dir = Scratch::new("copypart4");
+    let server = Server::start(&dir.db(), &["--copy-from-dir", dir.0.to_str().unwrap()]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE c4 (id int, s smallint, v text)").ok("c4");
+    for (sql, data) in [
+        ("COPY c4 (id) FROM STDIN", &b"0b_10_0101\n0x_1F\n"[..]),
+        ("COPY c4 (id, v) FROM STDIN (NULL 0)", b"5\t0\n"),
+        ("COPY c4 (id, v) FROM STDIN", b"6\ta\\\r\n"),
+        ("COPY c4 (s) FROM STDIN", b"\\v5\n"),
+        ("COPY c4 (id) FROM STDIN (HEADER)", b"a\\\nb\n7\n"),
+    ] {
+        let r = a.copy(sql, &[CopyIn::Data(data)]).ok(sql);
+        assert_eq!(r.copy_ins.len(), 1, "{sql}");
+    }
+    // The NULL id last, as PostgreSQL's ORDER BY id put it, without relying on NULLS LAST.
+    let r = a
+        .q("SELECT id, s, v, v IS NULL, length(v) FROM c4 ORDER BY id IS NULL, id")
+        .ok("rows");
+    let cell = |c: &str| (c != "-").then(|| c.to_string());
+    let row = |cells: &[&str]| cells.iter().map(|c| cell(c)).collect::<Vec<_>>();
+    assert_eq!(
+        r.rows,
+        vec![
+            row(&["5", "-", "-", "t", "-"]),
+            row(&["6", "-", "a\r", "f", "2"]),
+            row(&["7", "-", "-", "t", "-"]),
+            row(&["31", "-", "-", "t", "-"]),
+            row(&["37", "-", "-", "t", "-"]),
+            row(&["-", "5", "-", "t", "-"]),
+        ]
+    );
+    for (sql, data, code, message) in [
+        (
+            "COPY c4 (v) FROM STDIN (DELIMITER 1)",
+            &b"z\n"[..],
+            "22023",
+            "COPY delimiter cannot be \"1\"",
+        ),
+        (
+            "COPY c4 (id) FROM STDIN",
+            b"99999999999999999999x\n",
+            "22003",
+            "value \"99999999999999999999x\" is out of range for type integer",
+        ),
+        (
+            "COPY c4 (v) FROM STDIN",
+            b"\\303(\n",
+            "22021",
+            "invalid byte sequence for encoding \"UTF8\": 0xc3 0x28",
+        ),
+    ] {
+        let r = a.copy(sql, &[CopyIn::Data(data)]);
+        let e = r.err(sql);
+        assert_eq!((e.code.as_str(), e.message.as_str()), (code, message), "{sql}");
+    }
+    let file = dir.0.join("nul.tsv");
+    std::fs::write(&file, b"x\0y\n").unwrap();
+    let sql = format!("COPY c4 (v) FROM '{}'", file.display());
+    let e = a.q(&sql).err(&sql);
+    assert_eq!(
+        (e.code.as_str(), e.message.as_str()),
+        ("22021", "invalid byte sequence for encoding \"UTF8\": 0x00"),
+        "a NUL in a file"
+    );
+}
+
 /// COPY FROM a file with no file granted is 42501 before the table, its columns or its options are
 /// read, as PostgreSQL 18.6 refuses a role without pg_read_server_files first (recorded,
 /// copy-stdin-pg18.txt part 3: `nofiles`). Checked after the table, these were 42P01, 42703, 42601.
