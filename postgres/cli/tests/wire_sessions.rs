@@ -13156,7 +13156,6 @@ replays_postgresql!(
         (29, "PGDIV-REAL-RANGE cascade [engine]: select * from rr returns Infinity, Infinity, -Infinity, 0 where PG has 0 rows (cascade of #25-#28)"),
         (30, "PGDIV-REAL-RANGE value [engine]: SILENT: CAST(1e39 AS real) answers 'Infinity'; PG 22003"),
         (31, "PGDIV-REAL-RANGE value [engine]: SILENT: 1e39::real answers 'Infinity'; PG 22003"),
-        (32, "PGDIV-PARSE-PREFIX error-text [wire]: '1e39'::real 22003 both; ours prefixes 'Parse error: '"),
     ]
 );
 replays_postgresql!(
