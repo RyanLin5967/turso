@@ -1244,7 +1244,9 @@ impl ScalarFunc {
                 | Self::BinRecordJsonObject
                 | Self::ConnTxnId
                 | Self::IsAutocommit
-        )
+        ) || (matches!(self, Self::AlterColumnSql)
+            // ALTER's own sqlite_schema UPDATE only (engine-rev 2bdcd32c6 MED 5).
+            && !crate::branch::store::fe_mutant("alter_column_sql_in_schema_lookups"))
     }
 
     /// Returns the valid arities for this function.
@@ -1669,6 +1671,23 @@ impl Func {
     /// that classify translated AST.
     pub fn resolve_function(name: &str, arg_count: usize) -> Result<Option<Self>, LimboError> {
         crate::dialect::sqlite::resolve_builtin_function(name, arg_count)
+    }
+
+    /// [`Self::resolve_function`] for a schema validator checking an expression a user wrote (a
+    /// generated column, an expression index, a partial index's WHERE): the engine-internal
+    /// `turso_alter_column_sql` is unknown there, as `Resolver::resolve_function` makes it for user
+    /// SQL (engine-rev 2bdcd32c6 MED 5: these validators let a schema store a call to it). Mutant
+    /// `alter_column_sql_in_schema_lookups` (test builds only): resolves it as before, and PRAGMA
+    /// function_list lists it again.
+    pub fn resolve_user_function(name: &str, arg_count: usize) -> Result<Option<Self>, LimboError> {
+        match Self::resolve_function(name, arg_count)? {
+            Some(Func::Scalar(ScalarFunc::AlterColumnSql))
+                if !crate::branch::store::fe_mutant("alter_column_sql_in_schema_lookups") =>
+            {
+                Ok(None)
+            }
+            other => Ok(other),
+        }
     }
 
     /// Returns a list of all built-in functions for PRAGMA function_list.

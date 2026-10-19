@@ -4496,7 +4496,7 @@ pub(crate) fn validate_generated_expr(expr: &Expr) -> Result<()> {
                 bail_parse_error!("window functions prohibited in generated columns");
             }
             let arg_count = args.len();
-            let Some(func) = Func::resolve_function(name.as_str(), arg_count)? else {
+            let Some(func) = Func::resolve_user_function(name.as_str(), arg_count)? else {
                 return Err(LimboError::ParseError(format!(
                     "could not resolve function {}",
                     name.as_str()
@@ -4517,7 +4517,7 @@ pub(crate) fn validate_generated_expr(expr: &Expr) -> Result<()> {
             if filter_over.over_clause.is_some() {
                 bail_parse_error!("window functions prohibited in generated columns");
             }
-            let Some(func) = Func::resolve_function(name.as_str(), 0)? else {
+            let Some(func) = Func::resolve_user_function(name.as_str(), 0)? else {
                 return Err(LimboError::ParseError(format!(
                     "could not resolve function {}",
                     name.as_str()
@@ -6153,7 +6153,8 @@ impl Index {
         let is_tbl = |ns: &str| normalize_ident(ns) == tbl_norm;
         let is_deterministic_fn = |name: &str, argc: usize| {
             let n = normalize_ident(name);
-            Func::resolve_function(&n, argc).is_ok_and(|f| f.is_some_and(|f| f.is_deterministic()))
+            Func::resolve_user_function(&n, argc)
+                .is_ok_and(|f| f.is_some_and(|f| f.is_deterministic()))
         };
 
         let mut ok = true;

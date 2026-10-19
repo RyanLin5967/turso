@@ -1052,7 +1052,7 @@ fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
     let is_tbl = |ns: &str| normalize_ident(ns).eq_ignore_ascii_case(&tbl_norm);
     let is_deterministic_fn = |name: &str, args: &[Box<Expr>]| {
         let n = normalize_ident(name);
-        Func::resolve_function(&n, args.len())
+        Func::resolve_user_function(&n, args.len())
             .is_ok_and(|f| f.is_some_and(|f| is_deterministic_schema_function_call(&f, args)))
     };
 
