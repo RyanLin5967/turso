@@ -1121,6 +1121,10 @@ def selftest():
         # (the guards timedrun_mutants found no case reaching, artie runs/uw-20261019-g2-*: each its own reason)
         ("a timed summary with no measured_ops", dict(tracer=clean, timed_extra={"measured_ops": None}), False),
         ("a timed summary whose measured_ok is not a count", dict(tracer=clean, timed_extra={"measured_ok": "x"}), False),
+        # comp-rev-9bc7d894a LOW 2: a cell's summaries always carry measured_ok (both producers write it), so on the
+        # cell path its absence is refused; only warm_check's plant records may lack it
+        ("a timed summary with no measured_ok (the cell path)", dict(tracer=clean, timed_extra={"measured_ok": None}),
+         False),
         ("a raw.tsv row that ends before it starts",
          dict(tracer=clean, timed_raw=raw_tsv_full(dict(RUN, measured_ops=200), end_before_start_row=1600)), False),
         ("a raw.tsv with a clock column that is not a count",
@@ -1286,6 +1290,7 @@ def selftest():
             ("timed run's raw.tsv has 1700 row(s) whose lat_ns is not end_ns - intended_ns",),
         "a timed summary with no measured_ops": ("timed run has no measured_ops count (None)",),
         "a timed summary whose measured_ok is not a count": ("timed run's measured_ok 'x' is not a count",),
+        "a timed summary with no measured_ok (the cell path)": ("timed run has no measured_ok count (None)",),
         "a raw.tsv row that ends before it starts": ("timed run's raw.tsv has 1 row(s) out of clock order",),
         "a raw.tsv with a clock column that is not a count": ("timed run's raw.tsv has a clock column that is not a count",),
     })
