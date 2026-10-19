@@ -15932,6 +15932,65 @@ fn a_switch_to_the_capture_table_in_another_case_keeps_its_version_and_layout() 
     assert_eq!(named_t[0][0], "2", "CLAIM: both writes of t are v2-layout rows naming t");
 }
 
+/// engine-rev-qaf-fix2 MED 16 (predates the range; SQLite 3.53.4 by the reviewer): DROP COLUMN of a
+/// column that another column's CHECK names (`b CHECK (b > a)`) is refused, as SQLite refuses it.
+/// Here it was accepted, and every later INSERT failed "no such column: a".
+#[test]
+fn drop_column_refuses_a_column_another_columns_check_names() {
+    let _g = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("dropchk.db"), DatabaseOpts::new());
+    let c = db.connect().unwrap();
+    c.execute("CREATE TABLE t(a, b CHECK (b > a), c)").unwrap();
+    c.execute("INSERT INTO t VALUES (1, 2, 3)").unwrap();
+    let dropped = c.execute("ALTER TABLE t DROP COLUMN a");
+    assert!(dropped.is_err(), "CLAIM: DROP COLUMN a is refused while b's CHECK names it");
+    c.execute("INSERT INTO t VALUES (5, 6, 7)").unwrap();
+}
+
+/// engine-rev-qaf-fix2 MED 17 (predates the range; SQLite 3.53.4 gives x,1,9): on a WITHOUT ROWID
+/// table (an experimental feature here), DROP COLUMN c then ADD COLUMN d DEFAULT 9 read the dropped
+/// value back as d (x,1,2): the drop rewrote no stored row. The claim is the safety property: no row
+/// reads a dropped value. Either the DROP is refused, or d reads 9 before and after a reopen.
+#[test]
+fn a_without_rowid_drop_column_never_resurfaces_the_dropped_value() {
+    let _g = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("wr.db");
+    let o = || DatabaseOpts::new().with_without_rowid(true);
+    let want = vec![vec!["x".to_string(), "1".to_string(), "9".to_string()], vec!["y".to_string(), "1".to_string(), "9".to_string()]];
+    let mut failed = Vec::new();
+    let refused;
+    {
+        let db = open_at(&path, o());
+        let c = db.connect().unwrap();
+        for sql in [
+            "CREATE TABLE t(a TEXT, b, c, PRIMARY KEY (a)) WITHOUT ROWID",
+            "INSERT INTO t VALUES ('x', 1, 2)",
+            "INSERT INTO t VALUES ('y', 1, 2)",
+        ] {
+            c.execute(sql).unwrap();
+        }
+        refused = c.execute("ALTER TABLE t DROP COLUMN c").is_err();
+        if !refused {
+            c.execute("ALTER TABLE t ADD COLUMN d DEFAULT 9").unwrap();
+            let got = adv_rows(&c, "SELECT a, b, d FROM t ORDER BY a");
+            if got.as_ref().ok() != Some(&want) {
+                failed.push(format!("before the reopen: {got:?}"));
+            }
+        }
+    }
+    if !refused {
+        let db = open_at(&path, o());
+        let c = db.connect().unwrap();
+        let got = adv_rows(&c, "SELECT a, b, d FROM t ORDER BY a");
+        if got.as_ref().ok() != Some(&want) {
+            failed.push(format!("after the reopen: {got:?}"));
+        }
+    }
+    assert!(failed.is_empty(), "CLAIM: no row reads the dropped value (refused, or d = 9 as SQLite): {failed:#?}");
+}
+
 /// engine-rev-qaf-fix2 HIGH A (REVIEW-engine-qaf-fix2-18556a956): a column type whose token keeps
 /// its quotes ("a]b") was quoted again by every AST rewrite, so ADD, ADD, ADD, DROP, RENAME, ADD grew
 /// the stored text 52, 64, 84, 120, 180, 308, 568 (SQLite 3.53.4: 47..59). The type must read back
