@@ -433,10 +433,17 @@ fn a_kill_between_a_removal_and_its_siblings_relink_leaves_the_links_true() {
 /// of it (the columns added; every row linked; committed before the install; installed), the
 /// reopened store is either still 17 with no link column, or 21 with every row's links true, and
 /// its next checkpoint leaves it 21 with true links.
+/// FLAGGED spec change (lead ruling 2026-10-19T03:16:48Z, HIGH 1 of l4-rev-h1's re-review): the fill
+/// commits the link columns in a transaction of their own first (e2a788823), so "17 with the link
+/// columns" is a state every fill writes, and a kill after that commit (the new point
+/// `ckpt.upgrade.colonly`, and every later one) may leave it. It is admitted ONLY with, for that same
+/// state: (i) the L4 facts check passes on reopen and after the next checkpoint, (ii) that checkpoint
+/// reaches 21, (iii) every branch survives (all three below, for every point). A kill BEFORE that
+/// commit (`ckpt.upgrade.columns`, inside it) still admits only 17 without columns, or 21.
 #[cfg(unix)]
 #[test]
 fn a_kill_at_every_step_of_the_upgrade_leaves_the_store_17_or_21() {
-    for point in ["ckpt.upgrade.columns", "ckpt.upgrade.rows", "ckpt.written", "ckpt.installed"] {
+    for point in ["ckpt.upgrade.columns", "ckpt.upgrade.colonly", "ckpt.upgrade.rows", "ckpt.written", "ckpt.installed"] {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("upgrade.db");
         {
@@ -468,9 +475,14 @@ fn a_kill_at_every_step_of_the_upgrade_leaves_the_store_17_or_21() {
         println!("{point}: after the kill the catalog is format {format:?}, link columns {links}");
         match (format, links) {
             (Some(17), false) | (Some(21), true) => {}
+            (Some(17), true) if point != "ckpt.upgrade.columns" => {
+                println!("{point}: 17 with the link columns (column-only commit): checked by (i)-(iii) below");
+            }
             other => panic!("{point}: after the kill the catalog is {other:?} (format, link columns): neither 17 nor 21"),
         }
+        // (i) the L4 facts check, on reopen and after the next checkpoint:
         let db = reopen_and_check(&path, point);
+        // (ii) and (iii):
         assert_eq!(db.branches.links_known_and_catalog_format_for_test().1, Some(21), "{point}: not upgraded by the next checkpoint");
         for name in ["first", "u0", "u1", "u2"] {
             db.connect_named(name).unwrap_or_else(|e| panic!("{point}: {name} is gone: {e}"));
