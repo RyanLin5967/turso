@@ -102,6 +102,8 @@ def measured(d):
 
 def check_same(a, b):
     ma, mb = measured(a), measured(b)
+    if not ma or not mb:  # comp-rev-89ec-b3c3 LOW 4: two empty runs are not the same arrivals, they are no run
+        return [f"a run with no measured row ({len(ma)} and {len(mb)} measured): nothing was compared"]
     if ma == mb:
         return []
     return [f"the runs measured different arrivals: {len(ma)} and {len(mb)} measured, first difference at "
@@ -116,6 +118,8 @@ def check_after_tm1(d):
     # the lead's claim_ns ruling, timedrun.py raw_problems' rule: the field tm1 was stamped with -- the claim (claim_ns)
     # in closed loop, the claimed arrival's intended time in open loop and without claim_ns
     key, word = ("claim_ns", "claimed") if sm.get("loop") == "closed" and rows and "claim_ns" in rows[0] else ("intended_ns", "intended")
+    if not any(r["phase"] == "measure" for r in rows):  # comp-rev-89ec-b3c3 LOW 4: a zero-collected pass
+        return [f"no measured row in {d}/raw.tsv: nothing was checked against tm1"]
     late = [r for r in rows if r["phase"] == "measure" and int(r[key]) >= tm1]
     return [f"{len(late)} measured row(s) {word} at or after tm1 {tm1}"] if late else []
 
