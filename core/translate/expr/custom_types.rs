@@ -3074,4 +3074,60 @@ mod tests {
         }
         assert!(bad.is_empty(), "CLAIM: UPDATE OR IGNORE matching no row was refused: {bad:#?}");
     }
+
+    /// Engine review 2bdcd32c6 MED 9 (raw types/probe2.out.txt): a CAST to a custom type yields
+    /// the type's ENCODE, its stored form (the CAST design: `CAST(42 AS cents)` is 4200), so
+    /// CAST(1.5 AS numeric(8, 2)) is numeric's encoded blob; yet 437f337be typed it as numeric, so
+    /// `get_column_type_info` announced numeric over a blob, a derived relation's column claimed
+    /// numeric values it did not hold, and CREATE TABLE AS declared numeric(8, 2) and ENCODEd the
+    /// blob again. PostgreSQL 18.6 answers 1.50 typed numeric (UW run typesrev-oracle2; artie raw
+    /// frontier/fastest/lanes/engine/raw/pg18-types-rev2bd.txt 42503e4e38). The claim here is that
+    /// a result is never announced as a type whose values it does not hold: either PostgreSQL's
+    /// answer (1.50 announced numeric) or the blob announced as the blob it is (BLOB); and a copy
+    /// holds what its SELECT yields, as SQLite's CREATE TABLE AS does. A CAST whose type's DECODE is
+    /// the value itself (date) is that type: the control.
+    #[test]
+    fn a_cast_to_an_encoding_type_is_announced_as_what_it_yields() {
+        let conn = open();
+        let mut bad = Vec::new();
+        for sql in [
+            "SELECT CAST(1.5 AS numeric(8, 2))",
+            "SELECT c FROM (SELECT CAST(1.5 AS numeric(8, 2)) AS c)",
+        ] {
+            let stmt = conn.prepare(sql);
+            let ty = stmt
+                .as_ref()
+                .ok()
+                .and_then(|s| s.get_column_type_info(0).ok().flatten())
+                .map(|i| i.declared_name.to_ascii_lowercase());
+            let got = stmt.and_then(|mut s| s.run_collect_rows()).map(|rows| rows[0][0].clone());
+            let consistent = match (&got, ty.as_deref()) {
+                (Ok(v), Some("numeric")) => v.to_text() == Some("1.50"),
+                (Ok(Value::Blob(_)), Some("blob")) => true,
+                _ => false,
+            };
+            if !consistent {
+                bad.push(format!("{sql}: value {got:?} announced {ty:?}: neither PostgreSQL's 1.50 numeric nor a blob announced BLOB"));
+            }
+        }
+        let selected = table_of(&conn, "SELECT hex(CAST(1.5 AS numeric(8, 2)))");
+        match conn.execute("CREATE TABLE cc AS SELECT CAST(1.5 AS numeric(8, 2)) AS c") {
+            Ok(()) => {
+                let copied = table_of(&conn, "SELECT hex(c) FROM cc");
+                if copied != selected {
+                    bad.push(format!("the copy holds {copied:?}, its SELECT yields {selected:?}"));
+                }
+            }
+            Err(e) => bad.push(format!("CREATE TABLE cc AS SELECT CAST(1.5 AS numeric(8, 2)) refused: {e}")),
+        }
+        let date = conn.prepare("SELECT CAST('2024-01-02' AS date)").ok();
+        let date_ty = date
+            .as_ref()
+            .and_then(|s| s.get_column_type_info(0).ok().flatten())
+            .map(|i| i.declared_name.to_ascii_lowercase());
+        if date_ty.as_deref() != Some("date") {
+            bad.push(format!("CAST('2024-01-02' AS date) announced {date_ty:?}, not date (control)"));
+        }
+        assert!(bad.is_empty(), "CLAIM: a CAST to a custom type was announced as a type it does not yield: {bad:#?}");
+    }
 }
