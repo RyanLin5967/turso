@@ -16371,3 +16371,66 @@ fn a_dropped_virtual_table_is_destroyed_only_once_no_connection_holds_it() {
     let d2 = l5_vtab::DESTROYS.load(std::sync::atomic::Ordering::SeqCst);
     assert_eq!(d2 - d0, 1, "CLAIM: once no connection held it, the table was destroyed once");
 }
+
+/// engine-2bdcd32c6 MED 1 and MED 2 (HIGH E's residual): the last handle's drop returned while the
+/// flusher's pass held the store, so `Drop`, and with it the close's flight and the release of the
+/// branch log's lock, ran later on the flusher. A process that exited then lost its creates (8 of
+/// 200 children on ecetesla4), and a reopen at once was refused, the log still held (241 of 300 on
+/// ecetesla2). Here the flusher is held inside the create's flight (`HOLD_FLIGHT_TAKEN`) while the
+/// caller drops every handle. Once that drop has returned, a reopen must succeed and find the
+/// create.
+#[test]
+fn a_close_with_the_flusher_mid_flight_releases_the_log_and_keeps_its_create() {
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+    let _s = serial();
+    let class = if cfg!(target_vendor = "apple") { SyncClass::FullFsync } else { SyncClass::Fsync };
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("close-mid-flight.db");
+    let db = open_at(&path, opts(true, class));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let warm = trunk.create_branch_async("warm").unwrap();
+    db.branch_wait_durable(warm.token).unwrap();
+    let hold = db.branches.trunk_commit_hold.clone();
+    hold.store(super::store::HOLD_FLIGHT_TAKEN, Ordering::Release);
+    trunk.create_branch_async("mid-flight").unwrap();
+    let arrived = super::store::HOLD_FLIGHT_TAKEN | super::store::HOLD_ARRIVED;
+    let started = Instant::now();
+    while hold.load(Ordering::Acquire) != arrived {
+        if started.elapsed() > Duration::from_secs(10) {
+            hold.store(0, Ordering::Release);
+            panic!("premise: the flusher led the create's flight and was held in it");
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let dropper = std::thread::spawn(move || {
+        drop(trunk);
+        drop(db);
+        let _ = tx.send(());
+    });
+    let reopen = || try_open_at(&path, opts(true, class)).map(|db| db.branch_named("mid-flight").ok().flatten().is_some());
+    // A close that returns while the flight is held has left it, and the log, to the flusher.
+    let returned_while_held = rx.recv_timeout(Duration::from_millis(500)).is_ok();
+    let at_once = returned_while_held.then(&reopen);
+    hold.store(0, Ordering::Release);
+    if !returned_while_held {
+        rx.recv_timeout(Duration::from_secs(60)).expect("the close returned once the flight was let go");
+    }
+    dropper.join().unwrap();
+    let reopened = match at_once {
+        Some(r) => r,
+        None => reopen(),
+    };
+    // Whatever the outcome, a store the flusher may still hold is let go before the next test.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while try_open_at(&path, opts(true, class)).is_err() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        matches!(reopened, Ok(true)),
+        "CLAIM: once the close returned (it returned while the flight was held: {returned_while_held}), the \
+         log was released and the create kept: {reopened:?}"
+    );
+}
