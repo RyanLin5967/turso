@@ -15596,6 +15596,33 @@ fn a_numeric_sum_keeps_its_scale_and_an_overflowing_constant_is_22003() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// Found by the wire differential fuzzer against PostgreSQL 18.6 (wirefuzz, wire-fuzz4 on iccad2;
+/// PG's answers in the findings' pg_answer): (1) `SELECT (-2147483648)`, which pg_query gives as a
+/// float's text, was announced int8 where PostgreSQL announces int4 (make_const: an integer that
+/// fits int4 is int4); (2) over a boolean c0 and no column c1, `SELECT count(*), sum(c1), min(c0)`
+/// was refused 42883 for min(boolean), where PostgreSQL reports the missing column first (42703).
+#[test]
+fn a_negative_int4_literal_is_int4_and_a_missing_column_is_reported_first() {
+    let dir = Scratch::new("fuzz4");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE t0 (id int PRIMARY KEY, c0 boolean)").ok("t0");
+    let mut wrong = Vec::new();
+    let sql = "SELECT (-2147483648) AS c";
+    for (protocol, r) in [("simple", a.q(sql)), ("extended", a.x(sql, &[]))] {
+        if r.error.is_some() || r.oids != Some(vec![23]) || r.rows != vec![vec![Some("-2147483648".to_string())]] {
+            wrong.push(format!("{protocol} {sql}: oids {:?} rows {:?} error {:?}, PostgreSQL [23]", r.oids, r.rows, r.error));
+        }
+    }
+    let sql = "SELECT count(*), sum(c1), min(c0) FROM t0";
+    for (protocol, r) in [("simple", a.q(sql)), ("extended", a.x(sql, &[]))] {
+        if r.error.as_ref().map(|e| e.code.as_str()) != Some("42703") {
+            wrong.push(format!("{protocol} {sql}: {:?}, PostgreSQL 42703", r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-uw2 N5: a schema-qualified type was refused 42704 'type "public m" does not exist',
 /// its parts joined with a blank, so a pg_dump restore, which writes public.<type> for every enum
 /// and domain column, failed at its first such table. PostgreSQL 18.6 takes public.m and
