@@ -9559,6 +9559,12 @@ impl BranchStore {
                 // budgets-rev-242345 LOW-5: the growth's swap hold's work, measured apart (test builds).
                 #[cfg(test)]
                 let _site = super::budget_probe::SiteWork::start(super::budget_probe::WorkSite::Growth);
+                // Mutant `name_filter_growth_work_one_in_10000` (test builds only; budgets-rev-242345 MED-7):
+                // an O(N) term in both growth holds, one unit per 10,000 names in the old table.
+                #[cfg(test)]
+                if fe_mutant("name_filter_growth_work_one_in_10000") {
+                    super::budget_probe::note_held_work((old.len() / 10_000) as u64);
+                }
                 let f = &mut inner.names.filter;
                 if !matches!(&f.state, FilterState::Growing { table, pending: p } if Arc::ptr_eq(table, &old) && Arc::ptr_eq(p, &pending)) {
                     return;
@@ -9586,6 +9592,10 @@ impl BranchStore {
             // budgets-rev-242345 LOW-5: the growth's drain install hold, measured apart (test builds).
             #[cfg(test)]
             let _site = super::budget_probe::SiteWork::start(super::budget_probe::WorkSite::Growth);
+            #[cfg(test)]
+            if fe_mutant("name_filter_growth_work_one_in_10000") {
+                super::budget_probe::note_held_work((old.len() / 10_000) as u64);
+            }
             let f = &mut inner.names.filter;
             if matches!(&f.state, FilterState::Draining { table, pending: p } if Arc::ptr_eq(table, &grown) && Arc::ptr_eq(p, &pending)) {
                 if copied {
