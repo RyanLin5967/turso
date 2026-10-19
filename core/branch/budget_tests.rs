@@ -3622,11 +3622,15 @@ fn the_thread_state_readers_read_blocked_and_running_threads() {
         })
     };
     let stop = Arc::new(AtomicBool::new(false));
+    // The spinner's own progress (budgets-port-adversary MED-2): a count it moves while it runs, so a try
+    // can show the spinner RAN between two readings, whatever the load.
+    let progress = Arc::new(AtomicU64::new(0));
     let spinner = {
-        let (id, stop) = (spinner_id.clone(), stop.clone());
+        let (id, stop, progress) = (spinner_id.clone(), stop.clone(), progress.clone());
         std::thread::spawn(move || {
             id.store(platform_tid(), Release);
             while !stop.load(Acquire) {
+                progress.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 std::hint::spin_loop();
             }
         })
@@ -3670,18 +3674,28 @@ fn the_thread_state_readers_read_blocked_and_running_threads() {
     assert!(s1.cpu_ns >= s0.cpu_ns + 20_000_000, "CLAIM: 100 ms of spinning moved its CPU time {} ns -> {} ns", s0.cpu_ns, s1.cpu_ns);
     assert_eq!(p1.cpu_ns, p.cpu_ns, "CLAIM: a parked thread's CPU time moved");
     // A running thread's CPU time is current when read, not as of its last scheduler event: between
-    // two readings 200 us apart a thread that never stopped running has gained time, every time
-    // (fc_foreign_window's helper runs for well under a tick; the Linux port's run 1 read it as not
-    // having run, ecetesla4 and iccad6).
-    for i in 0..20 {
+    // two readings a thread that RAN in between has gained time, every time (fc_foreign_window's helper
+    // runs for well under a tick; the Linux port's run 1 read it as not having run, ecetesla4 and
+    // iccad6). FLAGGED, budgets-port-adversary MED-2 (load-immune; the bound unchanged): the reader
+    // sleeps 200 us instead of spinning (on one CPU its spin kept the spinner from running: 3 of 3 red
+    // under taskset -c 0), and a try counts only if the spinner's own progress count moved between the
+    // two readings (it provably ran). 20 counted tries are required; fewer than 20 in 2,000 refuses the
+    // premise, never passes.
+    let (mut counted, mut tries) = (0u32, 0u32);
+    while counted < 20 {
+        assert!(tries < 2_000, "premise: the spinner ran between two readings in only {counted} of {tries} tries");
+        tries += 1;
         let (_, a) = read();
-        let w = std::time::Instant::now();
-        while w.elapsed() < std::time::Duration::from_micros(200) {
-            std::hint::spin_loop();
-        }
+        let p0 = progress.load(Acquire);
+        std::thread::sleep(std::time::Duration::from_micros(200));
+        let p1 = progress.load(Acquire);
         let (_, b) = read();
+        if p1 == p0 {
+            continue;
+        }
         let (x, y) = (find(&a, sid).expect("CLAIM: the spinning thread vanished"), find(&b, sid).expect("CLAIM: the spinning thread vanished"));
-        assert!(y.cpu_ns > x.cpu_ns, "CLAIM: a running thread's CPU time did not move in 200 us (try {i}: {} ns -> {} ns): it is read stale", x.cpu_ns, y.cpu_ns);
+        assert!(y.cpu_ns > x.cpu_ns, "CLAIM: a thread that ran between two readings read no more CPU time (try {tries}: {} ns -> {} ns): it is read stale", x.cpu_ns, y.cpu_ns);
+        counted += 1;
     }
     assert_eq!(probe::others_blocked(), Some(false), "CLAIM: others_blocked missed the running spinner");
     let with = probe::threads().expect("CLAIM: the thread count cannot be read on this platform");
