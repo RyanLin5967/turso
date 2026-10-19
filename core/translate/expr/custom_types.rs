@@ -1280,6 +1280,60 @@ mod tests {
         assert!(wrong.is_empty(), "CLAIM: a numeric sum and constant as PostgreSQL: {wrong:#?}");
     }
 
+    /// fastest-wire 68f301ef0 (PostgreSQL 18.6 recorded on iccad2,
+    /// pg18-wirefuzz-arithmetic_over_rows_answers_as_postgresql_does.out): arithmetic over a date
+    /// and over a numeric meeting another type answers as PostgreSQL's operators do. SILENT at the
+    /// base: date has no '+' or '-', so `1 + d`, `d + 1` and `d - 1` added the date's text as a
+    /// number (2027, 2027, 2025 for 2026-10-19). Recorded: those three are 2026-10-20, 2026-10-20
+    /// and 2026-10-18, typed date, and `b * n` (bigint 2 times numeric(8, 2) 10.50) is 21.00,
+    /// numeric. By PostgreSQL's operator table (date + int4, int4 + date, date - int4 are date;
+    /// date - date is int4; numeric with an integer operand is numeric), not recorded here: `d + i`
+    /// over an INTEGER column, `d - e` = 1 and not typed date, `i * n` = 31.50, `n + i` = 13.50.
+    /// Refused as PostgreSQL refuses them (no such operator): `d + e`, `1 - d`, `d + 1.5`.
+    #[test]
+    fn date_and_numeric_arithmetic_across_types_answers_as_postgresql() {
+        let conn = open();
+        conn.execute(
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, d date, e date, n numeric(8, 2), b bigint, i INTEGER) STRICT",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, '2026-10-19', '2026-10-18', 10.50, 2, 3)").unwrap();
+        let mut wrong = Vec::new();
+        for (expr, want, ty) in [
+            ("1 + d", "2026-10-20", Some("date")),
+            ("d + 1", "2026-10-20", Some("date")),
+            ("d - 1", "2026-10-18", Some("date")),
+            ("d + i", "2026-10-22", Some("date")),
+            ("d - e", "1", None),
+            ("b * n", "21.00", Some("numeric")),
+            ("i * n", "31.50", Some("numeric")),
+            ("n + i", "13.50", Some("numeric")),
+        ] {
+            let sql = format!("SELECT {expr} FROM t");
+            let stmt = conn.prepare(&sql);
+            let got_ty = stmt
+                .as_ref()
+                .ok()
+                .and_then(|s| s.get_column_type_info(0).ok().flatten())
+                .map(|i| i.declared_name.to_ascii_lowercase());
+            let got = stmt.and_then(|mut s| s.run_collect_rows()).map(|rows| rows[0][0].to_string());
+            let ty_ok = match ty {
+                Some(t) => got_ty.as_deref() == Some(t),
+                None => got_ty.as_deref() != Some("date"),
+            };
+            if got.as_ref().ok().map(String::as_str) != Some(want) || !ty_ok {
+                wrong.push(format!("{expr}: {got:?} typed {got_ty:?}, PostgreSQL {want} typed {ty:?}"));
+            }
+        }
+        for expr in ["d + e", "1 - d", "d + 1.5"] {
+            let got = conn.prepare(&format!("SELECT {expr} FROM t")).and_then(|mut s| s.run_collect_rows());
+            if got.is_ok() {
+                wrong.push(format!("{expr}: {got:?}, PostgreSQL refuses it (no such operator)"));
+            }
+        }
+        assert!(wrong.is_empty(), "CLAIM: date and numeric arithmetic as PostgreSQL: {wrong:#?}");
+    }
+
     /// fastest-wire 76b5a2550 (wire-rev-uw3; PostgreSQL 18.6 recorded on iccad2,
     /// pg18-numeric-derived.out): over a numeric(8, 2) column holding 2.50, 123456.78 and 10.00, a
     /// direct `ORDER BY b` orders as numbers, but `b + 1 ... ORDER BY 1` and `b` read through a view,
