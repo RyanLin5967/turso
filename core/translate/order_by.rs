@@ -88,8 +88,19 @@ pub(crate) fn expr_value_type(
 /// or decodes to `value` itself, so its ENCODE's result is what a read of a stored value gives.
 fn cast_yields_values(schema: &Schema, type_name: &str) -> bool {
     let is_value = |e: &ast::Expr| matches!(e, ast::Expr::Id(n) | ast::Expr::Name(n) if n.as_str().eq_ignore_ascii_case("value"));
+    // A BUILT-IN type whose DECODE is the identity on every value its ENCODE stores, though not
+    // written as `value`: boolean's `CASE WHEN value THEN 1 ELSE 0 END` over boolean_to_int's 0
+    // or 1 (review of this lane's fixes, item 4: CAST(1 AS boolean) was announced INTEGER). An
+    // allowlist: a type not named here, or a user type, is taken by its DECODE as written. Mutant
+    // `boolean_cast_untyped` (test builds only): none, as before.
+    const DECODE_KEEPS_ITS_ENCODING: [&str; 1] = ["boolean"];
+    let keeps = |td: &crate::schema::TypeDef| {
+        td.is_builtin
+            && DECODE_KEEPS_ITS_ENCODING.iter().any(|n| td.name.eq_ignore_ascii_case(n))
+            && !crate::branch::store::fe_mutant("boolean_cast_untyped")
+    };
     match schema.resolve_type_unchecked(type_name) {
-        Ok(Some(resolved)) => resolved.chain.iter().all(|td| td.decode().is_none_or(is_value)),
+        Ok(Some(resolved)) => resolved.chain.iter().all(|td| td.decode().is_none_or(is_value) || keeps(td)),
         _ => false,
     }
 }
