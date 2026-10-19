@@ -479,28 +479,6 @@ const UPGRADE_IN_AIR: u64 = u64::MAX;
 /// uw-l3d-fae301d05: ecetesla2, flights about 5.5 ms, 241 of 241 gathers expired at C = 64).
 const COHORT_GATHER_FIXED: Duration = Duration::from_micros(50);
 
-thread_local! {
-    /// Set while this thread waits holding a lock other writers queue behind (a trunk commit's
-    /// barrier, holding the trunk's WAL write lock): its wait leads at once and never holds a
-    /// cohort gather (engine-rev-qaf-fix MED-3).
-    static NO_GATHER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// `NO_GATHER` for a scope, restored at its end.
-struct NoGather(bool);
-
-impl NoGather {
-    fn set(on: bool) -> Self {
-        NoGather(NO_GATHER.with(|g| g.replace(on)))
-    }
-}
-
-impl Drop for NoGather {
-    fn drop(&mut self) {
-        NO_GATHER.with(|g| g.set(self.0));
-    }
-}
-
 /// LEAP L3: the flights whose durations bound the cohort gather (`GroupState::gather_bound`).
 const FLIGHT_TIMES: usize = 16;
 
@@ -6506,7 +6484,7 @@ impl BranchStore {
                 // wait as the last flight carried, or for `GroupState::gather_bound` at most. At C = 1 the
                 // cohort is the leader alone, so it never holds. Mutant `no_cohort_gather` (test
                 // builds only): no hold, as before.
-                let cohort = if NO_GATHER.with(std::cell::Cell::get) { 0 } else { g.cohort };
+                let cohort = g.cohort;
                 // Mutant `cohort_gather_fixed` (test builds only): the fixed 50 µs bound, as before.
                 let bound = if fe_mutant("cohort_gather_fixed") { COHORT_GATHER_FIXED } else { g.gather_bound() };
                 if cohort > 1
@@ -9328,10 +9306,6 @@ impl BranchStore {
         let waited = if ordered {
             self.order_for_trunk(target)
         } else {
-            // A trunk commit's barrier waits holding the trunk's WAL write lock: it never holds a
-            // cohort gather, which would hold every trunk writer behind it (engine-rev-qaf-fix
-            // MED-3). Mutant `trunk_barrier_gathers` (test builds only): it may, as before.
-            let _no_gather = NoGather::set(!fe_mutant("trunk_barrier_gathers"));
             self.wait_durable(target, class)
         };
         let mut inner = self.inner.lock();
