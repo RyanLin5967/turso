@@ -15637,6 +15637,12 @@ fn the_flusher_makes_an_idle_async_create_durable() {
     let db = open_at(&dir.path().join("t8.db"), opts(true, class));
     let trunk = db.connect().unwrap();
     seed(&trunk);
+    // The store's first create builds its catalog (syncs on the creating thread), the separate
+    // registered red a_first_create_makes_its_catalog_in_one_commit_off_the_store_mutex; ASYNC-DESIGN
+    // §9 "Fresh store" makes that create cold by design. It is made first, unmeasured, and waited
+    // for, so this measures the flusher alone (FLAGGED fixture repair, as T4 and T23 warm first).
+    let warm = trunk.create_branch_async("warm").unwrap();
+    db.branch_wait_durable(warm.token).unwrap();
     let f0 = db.branch_async_stats().flusher_flights;
     let s0 = super::store::thread_syncs();
     let created = trunk.create_branch_async("idle").unwrap();
