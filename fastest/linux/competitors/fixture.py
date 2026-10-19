@@ -77,13 +77,20 @@ REGISTERED_PRE_AGE = {"pg18-d2": ["CHECKPOINT"], "dolt": ["DOLT_COMMIT seed"], "
 REGISTERED_OUTCOMES = {"pg18-d2": {"last_vacuum": "true", "last_analyze": "true", "redo_after_vacuum": "true"},
                        "dolt": {"gc_verdict": "ok"}, "doltgres": {"gc_verdict": "ok"},
                        "b1": {"journal_mode": "wal", "header_18_19": "2,2", "checkpoints": "0|0|0;0|0|0",
-                              "autoindex": "0"}}
+                              "autoindex": "0", "pk_cols": "1", "id_integer_pk": "1", "pk_index": "0"}}
 
 
 # B1's table as SQLite reads it (comp review 1 LOW 30): one count per statement, run by the pinned sqlite3 on the
 # parent (fixture.py sqlite) and, in the selftest, on real tables of each shape through Python's sqlite3
-SCHEMA_SQL = ("SELECT count(*) FROM sqlite_schema WHERE name LIKE 'sqlite_autoindex_t%'",)
-SCHEMA_KEYS = ("autoindex",)
+# comp-rev-89ec-b3c3 LOW 12: zero autoindexes also holds for a WITHOUT ROWID table and for one with no primary key, so
+# what MED 11 protects -- id IS the rowid -- is read directly: exactly one primary-key column, id, declared INTEGER
+# (SQLite's rowid-alias rule), and no primary-key index (a WITHOUT ROWID table's primary key, and an INTEGER PRIMARY KEY
+# DESC, are indexes, origin 'pk')
+SCHEMA_SQL = ("SELECT count(*) FROM sqlite_schema WHERE name LIKE 'sqlite_autoindex_t%'",
+              "SELECT count(*) FROM pragma_table_info('t') WHERE pk > 0",
+              "SELECT count(*) FROM pragma_table_info('t') WHERE pk = 1 AND name = 'id' AND upper(type) = 'INTEGER'",
+              "SELECT count(*) FROM pragma_index_list('t') WHERE origin = 'pk'")
+SCHEMA_KEYS = ("autoindex", "pk_cols", "id_integer_pk", "pk_index")
 
 
 def schema_evidence(counts):
@@ -428,7 +435,10 @@ def selftest():
                          ("CREATE TABLE t (id INT PRIMARY KEY, v INTEGER)", False),
                          ("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER) WITHOUT ROWID", False),
                          ("CREATE TABLE t (id INTEGER, v INTEGER)", False),
-                         ("CREATE TABLE t (id INTEGER, v INTEGER, PRIMARY KEY (id, v))", False)):
+                         ("CREATE TABLE t (id INTEGER, v INTEGER, PRIMARY KEY (id, v))", False),
+                         # (added with the fix: the generator's own table, and SQLite's DESC exception to the alias rule)
+                         (gen_seed.SCHEMA.rstrip(";"), True),
+                         ("CREATE TABLE t (id INTEGER PRIMARY KEY DESC, v INTEGER)", False)):
         con = _sq.connect(":memory:")
         con.execute(create)
         reply = [con.execute(s).fetchone()[0] for s in SCHEMA_SQL]
