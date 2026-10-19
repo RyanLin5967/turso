@@ -23,7 +23,7 @@ pub fn parse_copy_text_format(
     num_columns: usize,
 ) -> Result<Vec<CopyRow>> {
     let columns: Vec<String> = (1..=num_columns).map(|i| format!("column{i}")).collect();
-    parse_copy_rows(data, delimiter, null_string, &columns)
+    parse_copy_rows(data, delimiter, null_string, &columns, false)
 }
 
 /// Parse COPY text format data into rows of values for `columns`, the columns COPY loads, in
@@ -35,10 +35,13 @@ pub fn parse_copy_rows(
     delimiter: char,
     null_string: &str,
     columns: &[String],
+    header: bool,
 ) -> Result<Vec<CopyRow>> {
     let mut rows = Vec::new();
 
-    for line in split_copy_lines(data)? {
+    // HEADER: the first logical line is skipped unread, an escaped newline in it included
+    // (recorded, copy-stdin-pg18.txt `headerbs`).
+    for line in split_copy_lines(data)?.into_iter().skip(usize::from(header)) {
         // Every line is a row, an empty one included: one empty field, as PostgreSQL's
         // CopyReadAttributesText reads it (an empty string for a one-column COPY, else 22P04;
         // recorded, copy-stdin-pg18.txt `escapes`). Empty lines were skipped.
@@ -85,8 +88,16 @@ pub fn invalid_utf8(bad: &[u8]) -> LimboError {
 /// `bytes` as UTF-8 text with no NUL, or [`invalid_utf8`] naming the first bad sequence.
 pub fn copy_text(bytes: &[u8]) -> Result<&str> {
     let text = std::str::from_utf8(bytes).map_err(|e| {
+        // As report_invalid_encoding names it: as many bytes as the lead byte says the
+        // character has, as far as there are any (`\303(` is 0xc3 0x28; recorded `partial`).
         let bad = &bytes[e.valid_up_to()..];
-        invalid_utf8(&bad[..e.error_len().unwrap_or(bad.len()).min(bad.len())])
+        let len = match bad[0] {
+            0xc0..=0xdf => 2,
+            0xe0..=0xef => 3,
+            0xf0..=0xf7 => 4,
+            _ => 1,
+        };
+        invalid_utf8(&bad[..len.min(bad.len())])
     })?;
     if text.contains('\0') {
         return Err(invalid_utf8(&[0]));
@@ -104,6 +115,16 @@ fn split_copy_lines(data: &str) -> Result<Vec<&str>> {
     let b = data.as_bytes();
     let mut lines = Vec::new();
     let (mut start, mut i) = (0, 0);
+    // The byte an escape made data: a CR there is the field's, never the line end's (`a\<CR><LF>`
+    // is `a<CR>`, recorded `escapedcr`; it was cut as a CRLF, leaving `a\`).
+    let mut escaped = usize::MAX;
+    let line_end = |end: usize, escaped: usize| {
+        if end > 0 && b[end - 1] == b'\r' && escaped != end - 1 {
+            end - 1
+        } else {
+            end
+        }
+    };
     while i < b.len() {
         match b[i] {
             b'\\' if b.get(i + 1) == Some(&b'.') => {
@@ -115,9 +136,12 @@ fn split_copy_lines(data: &str) -> Result<Vec<&str>> {
             }
             // The escaped byte is data: ASCII (a newline, the delimiter) or the lead byte of a
             // character, whose continuation bytes are never a newline or a backslash.
-            b'\\' => i += 2,
+            b'\\' => {
+                escaped = i + 1;
+                i += 2;
+            }
             b'\n' => {
-                let end = if i > start && b[i - 1] == b'\r' { i - 1 } else { i };
+                let end = line_end(i, escaped).max(start);
                 lines.push(&data[start..end]);
                 i += 1;
                 start = i;
@@ -126,8 +150,8 @@ fn split_copy_lines(data: &str) -> Result<Vec<&str>> {
         }
     }
     if start < b.len() {
-        let end = if b[b.len() - 1] == b'\r' { b.len() - 1 } else { b.len() };
-        lines.push(&data[start..end.max(start)]);
+        let end = line_end(b.len(), escaped).max(start);
+        lines.push(&data[start..end]);
     }
     Ok(lines)
 }

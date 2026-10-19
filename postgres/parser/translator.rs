@@ -5533,6 +5533,21 @@ fn def_elem_string_val(def: &pg_query::protobuf::DefElem) -> Option<String> {
     }
 }
 
+/// An option's value as text, as PostgreSQL's defGetString reads one: a string, or a number or
+/// Boolean written bare (`DELIMITER 1`, `NULL 0`). Read as strings only, those were dropped, so
+/// `DELIMITER 1` used a tab and `NULL 0` kept `\N` (recorded, cli/tests/copy-stdin-pg18.txt
+/// `delimnum`, `nullnum`).
+fn def_elem_text(def: &pg_query::protobuf::DefElem) -> Option<String> {
+    use pg_query::protobuf::node::Node;
+    match &def.arg.as_deref()?.node {
+        Some(Node::String(s)) => Some(s.sval.clone()),
+        Some(Node::Integer(i)) => Some(i.ival.to_string()),
+        Some(Node::Float(f)) => Some(f.fval.clone()),
+        Some(Node::Boolean(b)) => Some(if b.boolval { "true" } else { "false" }.to_string()),
+        _ => None,
+    }
+}
+
 /// Result of mapping a PostgreSQL type: the Turso type name, array dimensions,
 /// and type parameters (e.g. `[4]` for `varchar(4)`, `[10, 2]` for `numeric(10, 2)`).
 #[derive(Debug, Clone, PartialEq)]
@@ -6918,8 +6933,8 @@ pub fn try_extract_copy_from_any(parse_result: &ParseResult) -> Option<(PgCopyFr
                 Some(val) => refused = unsupported(&format!("format \"{val}\"")),
                 None => refused = Some("COPY format requires a value".to_string().into()),
             },
-            "delimiter" => delimiter = def_elem_string_val(def),
-            "null" => null_string = def_elem_string_val(def),
+            "delimiter" => delimiter = def_elem_text(def),
+            "null" => null_string = def_elem_text(def),
             // HEADER alone is true; else a Boolean, as PostgreSQL's parse_bool reads one; MATCH,
             // which checks the header against the columns, is not implemented.
             "header" => match def.arg.as_deref().map(|a| &a.node) {

@@ -4142,11 +4142,13 @@ fn handle_pg_copy_from(pg_conn: &Arc<PgConnectionInner>, stmt: &PgCopyFromStmt) 
     }
     let target = copy_target(pg_conn, stmt)?;
     refuse_copy_options(stmt)?;
-    let mut data = String::new();
-    std::io::Read::read_to_string(&mut open_server_file(&pg_conn.server_files, &stmt.filename)?, &mut data).map_err(|e| {
+    let mut data = Vec::new();
+    std::io::Read::read_to_end(&mut open_server_file(&pg_conn.server_files, &stmt.filename)?, &mut data).map_err(|e| {
         LimboError::ParseError(format!("COPY FROM: cannot read '{}': {}", stmt.filename, e).into())
     })?;
-    load_copy_rows(pg_conn, stmt, &target, &data)
+    // The file's bytes are read as the client's rows are: UTF-8 with no NUL, else 22021 (a file
+    // that was not UTF-8 failed its read with 42601, and a NUL was stored).
+    load_copy_rows(pg_conn, stmt, &target, crate::copy::copy_text(&data)?)
 }
 
 /// COPY FROM STDIN, in its two runs ([`CopyStdin`]): with no end set, its target is checked as
@@ -4444,44 +4446,76 @@ fn copy_input_type(col: &turso_core::schema::Column) -> Option<CopyInput> {
     }
 }
 
-/// An integer as PostgreSQL 16's int4in/int8in read it: ASCII white space around it, a sign,
-/// then decimal digits or a 0x, 0o or 0b prefix and its digits, a single underscore allowed
-/// between two digits. None for anything else; Some(None) for one past i128.
-fn pg_integer(field: &str) -> Option<Option<i128>> {
-    let text = field.trim_matches(|c: char| c.is_ascii_whitespace());
-    let (negative, body) = match text.as_bytes().first() {
-        Some(b'-') => (true, &text[1..]),
-        Some(b'+') => (false, &text[1..]),
-        _ => (false, text),
-    };
-    let lower = body.get(..2).map(str::to_ascii_lowercase);
-    let (radix, digits) = match lower.as_deref() {
-        Some("0x") => (16, &body[2..]),
-        Some("0o") => (8, &body[2..]),
-        Some("0b") => (2, &body[2..]),
-        _ => (10, body),
-    };
-    let bytes = digits.as_bytes();
-    if bytes.is_empty() || bytes[0] == b'_' || bytes[bytes.len() - 1] == b'_' {
-        return None;
+/// Why [`pg_integer`] refused a field: its syntax (22P02) or its range (22003).
+enum IntError {
+    Syntax,
+    Range,
+}
+
+/// An integer in [min, max] as PostgreSQL 16's pg_strtoint32/64_safe read it: white space
+/// (isspace's, \v and \f included) around it, a sign, then decimal digits or a 0x, 0o or 0b prefix
+/// and its digits; an underscore must be followed by a digit, and may follow the prefix but not
+/// begin a decimal (recorded, copy-stdin-pg18.txt `prefixus`, `vtab`). A value past the range is
+/// Range as soon as its digits pass it, junk after them or not (`overjunk`), as there.
+fn pg_integer(field: &str, min: i128, max: i128) -> std::result::Result<i128, IntError> {
+    let space = |c: u8| matches!(c, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c);
+    let b = field.as_bytes();
+    let mut i = 0;
+    while i < b.len() && space(b[i]) {
+        i += 1;
     }
-    let mut value: Option<i128> = Some(0);
-    let mut last_underscore = false;
-    for &c in bytes {
-        if c == b'_' {
-            if last_underscore {
-                return None;
-            }
-            last_underscore = true;
-            continue;
+    let negative = match b.get(i) {
+        Some(b'-') => {
+            i += 1;
+            true
         }
-        last_underscore = false;
-        let digit = (c as char).to_digit(radix)?;
-        value = value
-            .and_then(|v| v.checked_mul(i128::from(radix)))
-            .and_then(|v| v.checked_add(i128::from(digit)));
+        Some(b'+') => {
+            i += 1;
+            false
+        }
+        _ => false,
+    };
+    let radix: u32 = match (b.get(i), b.get(i + 1).map(u8::to_ascii_lowercase)) {
+        (Some(b'0'), Some(b'x')) => 16,
+        (Some(b'0'), Some(b'o')) => 8,
+        (Some(b'0'), Some(b'b')) => 2,
+        _ => 10,
+    };
+    if radix != 10 {
+        i += 2;
     }
-    Some(value.map(|v| if negative { -v } else { v }))
+    let bound: u128 = if negative { min.unsigned_abs() } else { max.unsigned_abs() };
+    let digit = |c: u8| (c as char).to_digit(radix);
+    let first = i;
+    let mut value: u128 = 0;
+    while i < b.len() {
+        if let Some(d) = digit(b[i]) {
+            value = value * u128::from(radix) + u128::from(d);
+            if value > bound {
+                return Err(IntError::Range);
+            }
+            i += 1;
+        } else if b[i] == b'_' && (radix != 10 || i > first) {
+            // An underscore needs a digit after it.
+            if !b.get(i + 1).is_some_and(|&c| digit(c).is_some()) {
+                return Err(IntError::Syntax);
+            }
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    if i == first {
+        return Err(IntError::Syntax);
+    }
+    while i < b.len() && space(b[i]) {
+        i += 1;
+    }
+    if i != b.len() {
+        return Err(IntError::Syntax);
+    }
+    let value = value as i128;
+    Ok(if negative { -value } else { value })
 }
 
 impl CopyInput {
@@ -4495,34 +4529,26 @@ impl CopyInput {
             // 0x or 1_000); past int8 22003, as no column stored as INTEGER takes it (recorded,
             // copy-stdin-pg18.txt `intsyntax`, `int8over`; worded for integer, BLIND SPOT for a
             // bigserial, where PostgreSQL says bigint).
-            CopyInput::Integer => match pg_integer(field) {
-                Some(Some(value)) if i64::try_from(value).is_ok() => {
-                    let decimal = value.to_string();
-                    Ok((decimal != field).then_some(decimal))
+            CopyInput::Integer | CopyInput::Ranged(..) => {
+                let (ty, min, max) = match self {
+                    CopyInput::Ranged(ty, min, max) => (*ty, *min, *max),
+                    _ => ("integer", i64::MIN.into(), i64::MAX.into()),
+                };
+                match pg_integer(field, min, max) {
+                    Ok(value) => {
+                        let decimal = value.to_string();
+                        Ok((decimal != field).then_some(decimal))
+                    }
+                    Err(IntError::Range) => refuse(
+                        SqlErrorKind::NumericValueOutOfRange,
+                        format!("value \"{field}\" is out of range for type {ty}"),
+                    ),
+                    Err(IntError::Syntax) => refuse(
+                        SqlErrorKind::InvalidTextRepresentation,
+                        format!("invalid input syntax for type {ty}: \"{field}\""),
+                    ),
                 }
-                Some(_) => refuse(
-                    SqlErrorKind::NumericValueOutOfRange,
-                    format!("value \"{field}\" is out of range for type integer"),
-                ),
-                None => refuse(
-                    SqlErrorKind::InvalidTextRepresentation,
-                    format!("invalid input syntax for type integer: \"{field}\""),
-                ),
-            },
-            CopyInput::Ranged(ty, min, max) => match pg_integer(field) {
-                Some(Some(value)) if (*min..=*max).contains(&value) => {
-                    let decimal = value.to_string();
-                    Ok((decimal != field).then_some(decimal))
-                }
-                Some(_) => refuse(
-                    SqlErrorKind::NumericValueOutOfRange,
-                    format!("value \"{field}\" is out of range for type {ty}"),
-                ),
-                None => refuse(
-                    SqlErrorKind::InvalidTextRepresentation,
-                    format!("invalid input syntax for type {ty}: \"{field}\""),
-                ),
-            },
+            }
             CopyInput::Length(n, blank_padded) => {
                 if field.chars().count() <= *n {
                     return Ok(None);
@@ -4561,14 +4587,9 @@ fn load_copy_rows(
         .unwrap_or('\t');
     let null_string = stmt.null_string.as_deref().unwrap_or("\\N");
 
-    // HEADER: the first line is skipped unread, as PostgreSQL skips it (it was parsed as a row,
-    // so a header with another number of fields failed the COPY).
-    let data = if stmt.header {
-        data.split_once('\n').map_or("", |(_, rest)| rest)
-    } else {
-        data
-    };
-    let rows = parse_copy_rows(data, delimiter, null_string, &target.columns)?;
+    // HEADER: the first logical line is skipped unread, as PostgreSQL skips it (it was parsed as a
+    // row, so a header with another number of fields failed the COPY).
+    let rows = parse_copy_rows(data, delimiter, null_string, &target.columns, stmt.header)?;
 
     let rows_inserted = rows.len();
     // The rows go in atomically: in a transaction of their own, or, inside one already open (a
