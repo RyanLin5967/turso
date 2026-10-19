@@ -959,6 +959,10 @@ fn memory(cell: &str, built: &mut Built, out: &mut String) {
     s.insert("max_bg_hold_catalog_rows", bg_rows);
     s.insert("max_fg_hold_alloc_bytes", maxima.foreground.0);
     s.insert("max_fg_hold_catalog_rows", maxima.foreground.1);
+    // Linux finding (b): held work that allocates nothing (filter inserts), per hold.
+    s.insert("max_hold_work", maxima.work.0);
+    s.insert("max_bg_hold_work", maxima.work.1);
+    s.insert("max_fg_hold_work", maxima.work.2);
     // Review 2 M7: the opening thread's held bytes summed over every hold of the open.
     s.insert("fg_held_alloc_bytes_sum", delta(held0, held1));
     put_exceptions(&mut s, [0; 4], exc);
@@ -3181,7 +3185,7 @@ fn nothing_on_the_probes_window_path_allocates() {
                 "wal_lock_held", "persistent_live", "note_alloc", "alloc", "alloc_zeroed", "realloc", "dealloc",
                 // The Linux thread-state readers (the Linux port, 2026-10-18).
                 "owned_named", "linux_tid", "linux_read_into", "linux_task_path", "linux_task_alive", "linux_task_stat",
-                "linux_task_run_ns", "linux_each_tid",
+                "linux_task_run_ns", "linux_each_tid", "note_held_work",
             ][..],
         ),
         ("budget_tests.rs", include_str!("budget_tests.rs"), &["absorb_confirm", "writer_settled", "spin_settled", "settled"][..]),
@@ -3247,7 +3251,7 @@ fn nothing_on_the_probes_window_path_allocates() {
             }
         }
     }
-    assert_eq!(read, 51, "premise: every function on the window path was read:\n{found}");
+    assert_eq!(read, 52, "premise: every function on the window path was read:\n{found}");
     assert!(found.is_empty(), "the probe's window path allocates, prints, reads the environment or calls fe_mutant:\n{found}");
 }
 

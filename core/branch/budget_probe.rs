@@ -56,6 +56,13 @@ static MAX_HOLD_CAT_ROWS: AtomicU64 = AtomicU64::new(0);
 /// work (the name filter's build), whose O(N) hold a larger fixed hold of the foreground thread
 /// would otherwise mask in the all-threads maximum.
 static MAX_BG_HOLD_ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Linux finding (b): the most units of held WORK (`note_held_work`) in one store-mutex hold, by any
+/// thread, by background threads and by the foreground one. Work that allocates nothing and reads no
+/// catalog row is invisible to the other hold maxima on every platform (a filter table pre-sized off
+/// the mutex and filled under it: mutant name_filter_built_under_mutex survived on both glibc kinds).
+static MAX_HOLD_WORK: AtomicU64 = AtomicU64::new(0);
+static MAX_BG_HOLD_WORK: AtomicU64 = AtomicU64::new(0);
+static MAX_FG_HOLD_WORK: AtomicU64 = AtomicU64::new(0);
 static MAX_BG_HOLD_CAT_ROWS: AtomicU64 = AtomicU64::new(0);
 // The same over holds by the thread marked foreground (review 2 M7: the opener's own holds).
 static MAX_FG_HOLD_ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -115,6 +122,9 @@ thread_local! {
     static T_CAT_ROWS: Cell<u64> = const { Cell::new(0) };
     /// `(held allocation bytes, catalog rows)` of this thread when it took its outermost store mutex.
     static HOLD_START: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+    /// This thread's units of held work (`note_held_work`), and their count at its outermost lock.
+    static T_HELD_WORK: Cell<u64> = const { Cell::new(0) };
+    static HOLD_START_WORK: Cell<u64> = const { Cell::new(0) };
     /// The outermost hold's site, and this thread's (held allocations, catalog statements) at its
     /// start (the lifecycle audit).
     static HOLD_SITE: Cell<Option<&'static std::panic::Location<'static>>> = const { Cell::new(None) };
@@ -461,6 +471,7 @@ pub(crate) fn store_locked_at(site: &'static std::panic::Location<'static>) {
     if depth == 1 {
         let get = |c: &'static std::thread::LocalKey<Cell<u64>>| c.with(|c| c.get());
         HOLD_START.with(|h| h.set((get(&T_HELD_ALLOC_BYTES), get(&T_CAT_ROWS))));
+        HOLD_START_WORK.with(|h| h.set(get(&T_HELD_WORK)));
         HOLD_SITE.with(|h| h.set(Some(site)));
         HOLD_START2.with(|h| h.set((get(&T_HELD_ALLOCS), get(&T_CAT_STMTS))));
         // Counters review 4 LOW-F: Acquire, paired with `arm`'s Release. The audit disarms as
@@ -523,14 +534,18 @@ pub(crate) fn store_unlocked_of(own: Option<(usize, bool)>) {
         let get = |c: &'static std::thread::LocalKey<Cell<u64>>| c.with(|c| c.get());
         let (bytes0, rows0) = HOLD_START.with(|h| h.get());
         let (bytes, rows) = (get(&T_HELD_ALLOC_BYTES).wrapping_sub(bytes0), get(&T_CAT_ROWS).wrapping_sub(rows0));
+        let work = get(&T_HELD_WORK).wrapping_sub(HOLD_START_WORK.with(|h| h.get()));
         MAX_HOLD_ALLOC_BYTES.fetch_max(bytes, Relaxed);
         MAX_HOLD_CAT_ROWS.fetch_max(rows, Relaxed);
+        MAX_HOLD_WORK.fetch_max(work, Relaxed);
         if FOREGROUND.with(|f| f.get()) {
             MAX_FG_HOLD_ALLOC_BYTES.fetch_max(bytes, Relaxed);
             MAX_FG_HOLD_CAT_ROWS.fetch_max(rows, Relaxed);
+            MAX_FG_HOLD_WORK.fetch_max(work, Relaxed);
         } else {
             MAX_BG_HOLD_ALLOC_BYTES.fetch_max(bytes, Relaxed);
             MAX_BG_HOLD_CAT_ROWS.fetch_max(rows, Relaxed);
+            MAX_BG_HOLD_WORK.fetch_max(work, Relaxed);
         }
         // Review 2 L7: the kernel count is read only when an armed hold sampled it at its lock.
         // Class (b): the hold's syscalls are this thread's only if no other thread ran during it
@@ -637,6 +652,8 @@ pub(crate) struct HoldMaxima {
     pub(crate) all: (u64, u64),
     pub(crate) background: (u64, u64),
     pub(crate) foreground: (u64, u64),
+    /// Units of held work (`note_held_work`) in the largest hold: `(all, background, foreground)`.
+    pub(crate) work: (u64, u64, u64),
 }
 
 /// Every hold maximum at once, and start them all again from zero (review 2 L8: one call, so no
@@ -646,7 +663,16 @@ pub(crate) fn take_hold_maxima() -> HoldMaxima {
         all: (MAX_HOLD_ALLOC_BYTES.swap(0, Relaxed), MAX_HOLD_CAT_ROWS.swap(0, Relaxed)),
         background: (MAX_BG_HOLD_ALLOC_BYTES.swap(0, Relaxed), MAX_BG_HOLD_CAT_ROWS.swap(0, Relaxed)),
         foreground: (MAX_FG_HOLD_ALLOC_BYTES.swap(0, Relaxed), MAX_FG_HOLD_CAT_ROWS.swap(0, Relaxed)),
+        work: (MAX_HOLD_WORK.swap(0, Relaxed), MAX_BG_HOLD_WORK.swap(0, Relaxed), MAX_FG_HOLD_WORK.swap(0, Relaxed)),
     }
+}
+
+/// `n` units of work done on this thread (test builds call it from the store's per-item loops that
+/// allocate nothing, a name filter insert): counted per store-mutex hold into the hold maxima
+/// (`HoldMaxima::work`), so an O(N) loop moved under the mutex is seen on every platform. Allocates
+/// nothing.
+pub(crate) fn note_held_work(n: u64) {
+    bump(&T_HELD_WORK, n);
 }
 
 /// Mark the calling thread as the foreground (measuring) thread, or unmark it.

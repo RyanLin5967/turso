@@ -2913,6 +2913,10 @@ impl FilterTable {
     /// Insert `h`; `false` if the table is full: a probe that meets a taken slot once 7/8 of the
     /// slots are taken refuses (so a probe is bounded). Allocates nothing.
     fn insert(&self, h: u64) -> bool {
+        // Linux finding (b): one unit of work, so a fill of this table under the store mutex is
+        // counted per hold (`budget_probe::note_held_work`).
+        #[cfg(test)]
+        super::budget_probe::note_held_work(1);
         let k = Self::key(h);
         let mask = self.cap() - 1;
         let mut i = (k as usize) & mask;
