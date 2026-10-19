@@ -2453,46 +2453,101 @@ impl ToTokens for CommonTableExpr {
 /// inside, so `"x""y"`). The parser keeps such a token whole and joins the words with one space, so
 /// the same name comes back. `"a"b"` is not one: its quoted token `"a"` runs straight into `b"`.
 fn type_name_reads_back_bare(b: &[u8]) -> bool {
+    type_name_words(b).is_some_and(|words| {
+        words.iter().all(|w| match w {
+            TypeWord::Quoted(_) => true,
+            TypeWord::Raw(t) => crate::lexer::is_plain_type_word(t),
+        })
+    })
+}
+
+/// One word of a type name, as [`type_name_words`] splits it.
+enum TypeWord<'a> {
+    /// One whole well-formed quoted token, quotes included; it may hold spaces.
+    Quoted(&'a [u8]),
+    /// Anything else, up to the next space.
+    Raw(&'a [u8]),
+}
+
+/// Splits a type name into the words the parser joined with one space each. A word that starts with
+/// a quote and is one whole well-formed quoted token (its own quote doubled inside, ending at a space
+/// or at the end) is `Quoted`; any other word runs to the next space and is `Raw`. None for an empty
+/// name or an empty word (two spaces in a row, or a leading or trailing space).
+fn type_name_words(b: &[u8]) -> Option<Vec<TypeWord<'_>>> {
     if b.is_empty() {
-        return false;
+        return None;
     }
+    let mut words = Vec::new();
     let mut i = 0;
     loop {
         let start = i;
-        if matches!(b[i], b'"' | b'\'' | b'`') {
-            let q = b[i];
-            i += 1;
-            loop {
-                if i == b.len() {
-                    return false; // unterminated
-                }
-                if b[i] == q {
-                    if b.get(i + 1) == Some(&q) {
-                        i += 2;
-                        continue;
-                    }
-                    i += 1;
-                    break;
-                }
-                i += 1;
-            }
+        if let Some(end) = quoted_type_word_end(b, start) {
+            words.push(TypeWord::Quoted(&b[start..end]));
+            i = end;
         } else {
             while i < b.len() && b[i] != b' ' {
                 i += 1;
             }
-            if !crate::lexer::is_plain_type_word(&b[start..i]) {
-                return false;
+            if i == start {
+                return None;
             }
+            words.push(TypeWord::Raw(&b[start..i]));
         }
         if i == b.len() {
-            return true;
+            return Some(words);
         }
-        // The word must end at a single space with another word after it.
-        if b[i] != b' ' || i + 1 == b.len() {
-            return false;
+        i += 1; // the one space between words
+        if i == b.len() {
+            return None;
+        }
+    }
+}
+
+/// The end of the well-formed quoted token starting at `start`, if one starts there and ends at a
+/// space or at the end of `b`.
+fn quoted_type_word_end(b: &[u8], start: usize) -> Option<usize> {
+    let q = *b.get(start)?;
+    if !matches!(q, b'"' | b'\'' | b'`') {
+        return None;
+    }
+    let mut i = start + 1;
+    while i < b.len() {
+        if b[i] == q {
+            if b.get(i + 1) == Some(&q) {
+                i += 2;
+                continue;
+            }
+            let end = i + 1;
+            return (end == b.len() || b[end] == b' ').then_some(end);
         }
         i += 1;
     }
+    None // unterminated
+}
+
+/// A type name holding a `]`, printed word by word so that it reads back as itself: a quoted word or
+/// a plain one as itself, any other word bracket-quoted (`"a]b" x,y` prints `"a]b" [x,y]`). None when
+/// some word can be neither (a raw word holding `]`, which the parser never produces).
+fn type_name_by_words(b: &[u8]) -> Option<String> {
+    let mut out = String::new();
+    for (k, w) in type_name_words(b)?.iter().enumerate() {
+        if k > 0 {
+            out.push(' ');
+        }
+        match w {
+            TypeWord::Quoted(t) => out.push_str(std::str::from_utf8(t).ok()?),
+            TypeWord::Raw(t) if crate::lexer::is_plain_type_word(t) => {
+                out.push_str(std::str::from_utf8(t).ok()?)
+            }
+            TypeWord::Raw(t) if !t.contains(&b']') => {
+                out.push('[');
+                out.push_str(std::str::from_utf8(t).ok()?);
+                out.push(']');
+            }
+            TypeWord::Raw(_) => return None,
+        }
+    }
+    Some(out)
 }
 
 /// The parser's registered mutants (`FE_MUTANT`, the convention of turso_core's
@@ -2521,8 +2576,9 @@ impl ToTokens for Type {
     ) -> Result<(), S::Error> {
         // The name prints so that it reads back as itself (engine-rev-qaf-fix HIGH-4): bare when every
         // word is a plain type word, else bracket-quoted as written (`[x,y]`, `[not null]`), which the
-        // parser reads back as the bracket's bytes; a name holding `]` is double-quoted (UNCHECKED:
-        // whether that form reads back without its quotes).
+        // parser reads back as the bracket's bytes; a name holding `]` prints word by word. Only a
+        // name no parse produces (a raw word holding `]`) is left to the whole-name double quote,
+        // which does NOT read back as itself (the parser keeps a quoted type token's quotes).
         // A word may also be a quoted token the parser kept whole, quotes and all (`"a]b"`, `'x]y'`):
         // it prints as itself, since quoting it again made every rewrite grow it (engine-rev-qaf-fix2
         // HIGH A: 52, 64, 84, ... 568 bytes). Only a WHOLE well-formed token counts: a bracket's
@@ -2542,6 +2598,14 @@ impl ToTokens for Type {
             s.append(TK_ID, Some(&self.name))?;
         } else if !self.name.contains(']') {
             s.append(TK_ID, Some(&format!("[{}]", self.name)))?;
+        } else if let Some(by_words) = type_name_by_words(self.name.as_bytes())
+            .filter(|_| !fe_mutant("type_bracket_name_double_quoted"))
+        {
+            // A `]` sits inside a quoted word (`"a]b" [x,y]`): word by word, each read back as written.
+            // The whole-name double quote below keeps its quotes when read back, so it grew the name
+            // on every rewrite (engine-rev 2bdcd32c6 HIGH 1, the attack on b6e14769f). Mutant
+            // `type_bracket_name_double_quoted` (test builds of this crate only): straight to it.
+            s.append(TK_ID, Some(&by_words))?;
         } else {
             s.append(TK_ID, Some(&format!("\"{}\"", self.name.replace('"', "\"\""))))?;
         }
