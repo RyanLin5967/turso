@@ -15340,6 +15340,33 @@ fn an_index_with_no_name_is_named_as_postgresql_names_it() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// Found by the wire differential fuzzer against PostgreSQL 18.6 (wirefuzz, wire-fuzz1 and
+/// wire-fuzz2; PG's answers in the findings' pg_answer): a value too long for varchar(5) is refused
+/// XX000 "value too long for varchar" (the engine's varchar type raises it with RAISE(ABORT)),
+/// where PostgreSQL answers 22001 "value too long for type character varying(5)"; and an UPDATE
+/// assigning such a constant is refused by PostgreSQL even when no row matches (the constant is
+/// coerced when the statement is planned), where here it answers UPDATE 0. Owner: fastest-engine
+/// (core's varchar type).
+#[test]
+fn a_value_too_long_for_varchar_is_22001_as_postgresql_answers() {
+    let dir = Scratch::new("varchar-22001");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE vc(id int PRIMARY KEY, v varchar(5))").ok("vc");
+    let mut wrong = Vec::new();
+    for sql in [
+        "INSERT INTO vc VALUES (1, 'abcdef')",
+        "UPDATE vc SET v = 'abcdef' WHERE id = 1",
+    ] {
+        let r = a.q(sql);
+        match &r.error {
+            Some(e) if e.code == "22001" && e.message == "value too long for type character varying(5)" => {}
+            _ => wrong.push(format!("{sql}: tags {:?} error {:?}, PostgreSQL 22001", r.tags, r.error)),
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-uw2 N5: a schema-qualified type was refused 42704 'type "public m" does not exist',
 /// its parts joined with a blank, so a pg_dump restore, which writes public.<type> for every enum
 /// and domain column, failed at its first such table. PostgreSQL 18.6 takes public.m and
