@@ -152,6 +152,20 @@ def klass(path, root):
     return "outside:" + os.path.dirname(path)
 
 
+def base_db_flushes(by_path, root):
+    """{oid: flushes} over the paths ROOT/base/<oid> and ROOT/base/<oid>/... in BY_PATH (path -> flushes)."""
+    out = {}
+    if not root:
+        return out
+    pre = root.rstrip("/") + "/base/"
+    for p, n in by_path.items():
+        if p.startswith(pre):
+            oid = p[len(pre):].split("/", 1)[0]
+            if oid.isdigit():
+                out[oid] = out.get(oid, 0) + n
+    return out
+
+
 SPAWN = ("clone", "clone3", "fork", "vfork")
 # Roles whose flushes are the op's own work or work the op waits on (an allowlist): the server's main process, the
 # load generator's own backends (bbload backends.tsv), and the PG processes that write and flush on a backend's
@@ -552,6 +566,9 @@ def count(trace, extras, root, window=None, clients=frozenset(), part=None, phas
     out.update(other)
     out["by_class"] = by_class
     out["top_paths"] = sorted(by_path.items(), key=lambda kv: -kv[1])[:15]
+    # comp-rev-89ec-b3c3 MED 2: the flushes under each PG database directory ROOT/base/<oid> (the files in it and the
+    # directory itself), so a reader can count what ONE database's files cost; by_class folds every oid into base/*
+    out["by_base_db"] = base_db_flushes(by_path, root)
     out.update(attribute(by_tid, spawned, window, main, clients, attached))
     out["main_pid"], out["detach"] = main, detach
     # The pre-attach fd scan (trace.sh fdsync_scan): fds already open with O_SYNC/O_DSYNC when the attach completed.
@@ -907,6 +924,14 @@ def selftest():
         r5 = count(tr, [], "/x", w3)
         ok("c3: clock-pair text in the cmd= line is not a stamp (the window stays ok)", r5.get("verdict") == "ok",
            r5.get("verdict"))
+    # comp-rev-89ec-b3c3 MED 2: flushes per database directory, known answer (files, the directory itself, a fork
+    # suffix, a non-oid name, a path under another root, a root given with a trailing slash)
+    bp = {"/d/base/17386/1249": 2, "/d/base/17386/1249_fsm": 1, "/d/base/17386": 1, "/d/base/5/2602": 4,
+          "/d/base/pgsql_tmp/x": 9, "/d/global/1262": 3, "/e/base/17386/1": 7, "/d/base": 5}
+    for rt in ("/d", "/d/"):
+        got = base_db_flushes(bp, rt)
+        ok(f"by_base_db over root {rt!r}", got == {"17386": 4, "5": 4}, f"{got!r}")
+    ok("by_base_db with no root is empty", base_db_flushes(bp, None) == {}, f"{base_db_flushes(bp, None)!r}")
     print(f"TALLY ran={n} pass={n - bad} na=0 fail={bad}")  # gates/tally.py (linux-rev-uw2 MED 1)
     print(f"stracecount selftest: {n - bad}/{n}")
     return 1 if bad else 0

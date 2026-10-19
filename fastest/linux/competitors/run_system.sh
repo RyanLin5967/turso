@@ -315,10 +315,15 @@ cb_args() { # cb_args OP SYNC BDIR C N OUT -> CBA: the one clonebench command li
 # --skip-after: no close, no DROP), then one CHECKPOINT inside the same attach after a tsplit stamp. That "post" part is
 # the deferred writes a kept branch pays, which the cells' per-cycle DROP throws away (dropdb's DropDatabaseBuffers and
 # ForgetDatabaseSyncRequests run before its forced checkpoint, so the cells' deferred window reads about 0 at C=1).
-# CELLDIR/kept.json: K, the deferred flushes, per create, by class, and the count's verdict. Then the K branches are
-# dropped and checkpointed, untraced, and the live-branch count must be back at LIVE0.
+# CELLDIR/kept.json: K, the kept branches' oids, the deferred flushes, per create, by class, and the count's verdict.
+# comp-rev-89ec-b3c3 MED 2: deferred_flushes and per_create count ONLY the flushes under the K kept branches' own
+# directories, DATA/base/<oid> (stracecount by_base_db). A forced CHECKPOINT writes its record, fsyncs pg_control,
+# pg_logical, pg_xact and the rest whether or not anything is dirty, so the whole post part was above 0 even for a
+# FILE_COPY create, which defers nothing (12-14 flushes at K=3, 0 under base/, T3 dry run x-pg18-d2); those are kept
+# apart as checkpoint_other_flushes. Then the K branches are dropped and checkpointed, untraced, and the live-branch
+# count must be back at LIVE0.
 kept_arm() {
-  local spec=$1 d=$2 k=$KEPT_K kd="$2/kept" tag i rc=0
+  local spec=$1 d=$2 k=$KEPT_K kd="$2/kept" tag i rc=0 oid
   template_idle || { fail "$spec kept arm: a backend stayed on template p for 30 s"; return; }
   strace_attach "$kd" "$(server_pid)" || { fail "$spec kept arm attach"; return; }
   bb_args "$spec" 1 "$k" "$d/kept-bb" nowarm
@@ -328,13 +333,27 @@ kept_arm() {
   strace_detach "$kd"
   [ $rc -eq 0 ] || fail "$spec kept arm bbload rc=$rc ($(tail -1 "$d/kept-bb.txt"))"
   count "$kd" "$d/kept-bb/backends.tsv" post "$d/kept-deferred.json"
-  python3 -B -c 'import json, sys
-c = json.load(open(sys.argv[1])); k = int(sys.argv[2]); ok = c.get("verdict") == "ok" and isinstance(c.get("flushes"), int)
-json.dump({"spec": sys.argv[3], "k": k, "verdict": c.get("verdict"), "deferred_flushes": c.get("flushes"),
-           "per_create": c["flushes"] / k if ok else None, "by_class": c.get("by_class")}, open(sys.argv[4], "w"))' \
-    "$d/kept-deferred.json" "$k" "$spec" "$d/kept.json" || fail "$spec kept arm: kept.json"
   tag=$(jf "$d/kept-bb/summary.json" run_tag)
   [[ $tag =~ ^[a-z0-9]+$ ]] || { fail "$spec kept arm: run tag [$tag]"; return; }
+  : >"$d/kept.oids.txt"
+  for ((i = 0; i < k; i++)); do
+    oid=$(sqlq "SELECT oid FROM pg_database WHERE datname = 'b_${tag}_0_${i}'" 2>&1)
+    [[ $oid =~ ^[0-9]+$ ]] || { fail "$spec kept arm: no oid for b_${tag}_0_${i} [$oid]"; oid=none; }
+    echo "$oid" >>"$d/kept.oids.txt"
+  done
+  python3 -B -c 'import json, sys
+c = json.load(open(sys.argv[1])); k = int(sys.argv[2]); oids = open(sys.argv[5]).read().split()
+bb = c.get("by_base_db")
+ok = (c.get("verdict") == "ok" and isinstance(c.get("flushes"), int) and isinstance(bb, dict) and len(oids) == k
+      and len(set(oids)) == k and all(o.isdigit() for o in oids))
+mine = sum(bb.get(o, 0) for o in oids) if ok else None
+json.dump({"spec": sys.argv[3], "k": k, "kept_oids": oids, "verdict": c.get("verdict") if ok else "REFUSED: " + str(
+               c.get("verdict")) + " (or no by_base_db, or not K distinct oids)",
+           "deferred_flushes": mine, "per_create": mine / k if ok else None,
+           "checkpoint_other_flushes": c["flushes"] - mine if ok else None,
+           "other_base_db": {o: n for o, n in (bb or {}).items() if o not in oids}, "by_class": c.get("by_class")},
+          open(sys.argv[4], "w"))' \
+    "$d/kept-deferred.json" "$k" "$spec" "$d/kept.json" "$d/kept.oids.txt" || fail "$spec kept arm: kept.json"
   for ((i = 0; i < k; i++)); do
     sqlq "DROP DATABASE b_${tag}_0_${i}" >>"$d/kept.drops.txt" 2>&1 || fail "$spec kept arm: DROP DATABASE b_${tag}_0_${i}"
   done
