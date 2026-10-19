@@ -1,6 +1,7 @@
-# Recorded 2026-10-19T01:41:31Z (the raw file's mtime, UTC) on iccad11 by copy-stdin-pg18.py (beside this file; a raw protocol-v3 driver, not pgproto, so not in tests/pg18)
+# Recorded 2026-10-19T02:21:57Z (the raw file's mtime, UTC) on iccad11 by copy-stdin-pg18.py (beside this file; a raw protocol-v3 driver, not pgproto, so not in tests/pg18)
 # against a fresh PostgreSQL 18.6 cluster (/var/tmp/r226lin-wire/pg18/inst/bin, initdb -A trust, user postgres).
 # One line per round: every backend message in order (T and S omitted; G: CopyInResponse's format and column formats).
+# Re-recorded with "Part 2" (setup2 .. int4range) added; the rounds before it are byte-identical to the first recording (2026-10-19T01:41:31Z).
 postgres (PostgreSQL) 18.6
 setup          N 00000 table "cs" does not exist, skipping | C DROP TABLE | C CREATE TABLE | Z I
 copy           G format=0 columns=[0, 0] | C COPY 2 | Z I
@@ -30,6 +31,21 @@ badint         G format=0 columns=[0] | E 22P02 invalid input syntax for type in
 columns        G format=0 columns=[0, 0] | E 22P04 missing data for column "v" | Z I
 syncs          G format=0 columns=[0] | C COPY 1 | Z I
 count          D ['10'] | C SELECT 1 | Z I
+setup2         N 00000 table "cb" does not exist, skipping | N 00000 table "c1" does not exist, skipping | C DROP TABLE | C CREATE TABLE | C CREATE TABLE | Z I
+comment        G format=0 columns=[0] | C COPY 1 | Z I
+extcomment     1 | 2 | G format=0 columns=[0] | C COPY 1 | Z I
+count          D ['12'] | C SELECT 1 | Z I
+bigserial      G format=0 columns=[0, 0] | C COPY 2 | Z I
+spaces         D ['3000000000', 'ab ', '3'] | D ['3000000001', 'abc', '3'] | C SELECT 2 | Z I
+charpad        G format=0 columns=[0, 0] | C COPY 1 | Z I
+charrow        D ['1', 'x ', '2'] | C SELECT 1 | Z I
+charlong       G format=0 columns=[0, 0] | E 22001 value too long for type character(2) | Z I
+leadspace      G format=0 columns=[0, 0] | E 22001 value too long for type character varying(3) | Z I
+escapes        G format=0 columns=[0] | C COPY 4 | Z I
+escrows        D ['', '0'] | D ['AA', '2'] | D ['a\tb', '3'] | D ['x\ty', '3'] | C SELECT 4 | Z I
+nosuchopt      E 42P01 relation "nosuch" does not exist | Z I
+fromempty      E 58P01 could not open file "" for reading: No such file or directory | Z I
+int4range      G format=0 columns=[0] | E 22003 value "3000000000" is out of range for type integer | Z I
 unexpected     G format=0 columns=[0] | E 08P01 unexpected message type 0x51 during COPY from stdin | E 08P01 terminating connection because protocol synchronization was lost | <closed>
-after          D ['10'] | C SELECT 1 | Z I
+after          D ['12'] | C SELECT 1 | Z I
 rc=0
