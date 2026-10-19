@@ -16562,3 +16562,31 @@ fn a_close_flies_only_what_async_creates_acknowledged() {
          unacknowledged record buffered {extra:?}, without {plain:?}"
     );
 }
+
+/// engine-2bdcd32c6 LOW 6: d4d39bfeb makes a fresh store's log buffers (two touched 64 KiB log
+/// segments and 1,024 slots, `LogBuffers`) at EVERY open of a durable store, and an open that
+/// recovers a journal throws them away, after `fresh_again` has made another set. They are for the
+/// journal a fresh store's first create starts, so only an open that recovers none makes them: one
+/// set at a fresh open, none at a reopen that recovers a branch. Counted on this thread, which runs
+/// the open.
+#[test]
+fn only_an_open_that_recovers_no_journal_makes_log_buffers() {
+    let _s = serial();
+    let made = || super::journal::LOG_BUFFERS_MADE.with(std::cell::Cell::get);
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("low6.db");
+    let m0 = made();
+    let db = open_at(&path, opts(false, SyncClass::Off));
+    let fresh = made() - m0;
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    trunk.create_branch("kept").unwrap();
+    drop(trunk);
+    drop(db);
+    let m1 = made();
+    let db = open_at(&path, opts(false, SyncClass::Off));
+    let recovering = made() - m1;
+    assert!(db.branch_named("kept").unwrap().is_some(), "premise: the reopen recovered the branch from its journal");
+    assert_eq!(fresh, 1, "premise: a fresh open makes its first create's log buffers once");
+    assert_eq!(recovering, 0, "CLAIM: an open that recovered a journal made no log buffers; it made {recovering}");
+}
