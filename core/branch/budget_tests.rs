@@ -2717,8 +2717,11 @@ fn a_thread_table_read_without_descriptors_is_refused() {
             .unwrap();
         let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
         let at = |free: u64| {
+            // budgets-rev-39bb7fd43 HIGH-1 (FLAGGED harness repair, red column): the tag anywhere in a line.
             let tag = format!("FD-TABLE free={free} ");
-            text.lines().find(|l| l.starts_with(&tag)).unwrap_or_else(|| panic!("premise: no reading with {free} free descriptors:\n{text}")).to_string()
+            text.lines()
+                .find_map(|l| l.find(&tag).map(|i| l[i..].to_string()))
+                .unwrap_or_else(|| panic!("premise: no reading with {free} free descriptors:\n{text}"))
         };
         let (one, two) = (at(1), at(2));
         assert!(two.contains(" table=listed "), "premise: with 2 free descriptors the table is read and lists the caller ({two})");
@@ -2810,8 +2813,9 @@ fn a_window_owns_a_store_thread_by_its_registration_not_its_name() {
             .unwrap();
         let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
         let foreign = |case: &str| -> u64 {
+            // budgets-rev-39bb7fd43 HIGH-1 (FLAGGED harness repair, red column): the tag anywhere in a line.
             let tag = format!("OWNED case={case} foreign=");
-            let l = text.lines().find(|l| l.starts_with(&tag)).unwrap_or_else(|| panic!("premise: no reading of case {case}:\n{text}"));
+            let l = text.lines().find_map(|l| l.find(&tag).map(|i| &l[i..])).unwrap_or_else(|| panic!("premise: no reading of case {case}:\n{text}"));
             l[tag.len()..].split_whitespace().next().unwrap().parse().unwrap()
         };
         assert!(foreign("unrelated") >= 1, "premise: an unrelated thread's burst was not foreign");
