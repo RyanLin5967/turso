@@ -3320,4 +3320,35 @@ mod tests {
         }
         assert!(bad.is_empty(), "CLAIM: a CAST to boolean was not announced boolean: {bad:#?}");
     }
+
+    /// Fresh-context review of this lane's fixes (item 3): with a domain over numeric(8, 2) taking
+    /// numeric's operators (76fa781f8), a scan finds `a = 10` through numeric_eq, but an index on
+    /// the column still sought the raw key 10 among numeric's encoded blobs (the seek, the
+    /// equality's agreement check, the IN-seek refusal and the term's consumption read the domain's
+    /// own TypeDef, which has no ENCODE and no '='): the answer depended on the plan. Expected values
+    /// are PostgreSQL 18.6's for this exact SQL with that index (UW run typesrev2bd-oracle4; artie
+    /// raw frontier/fastest/lanes/engine/raw/pg18-types-rev2bd-3.txt 9294fdb8a2), by the seek and by
+    /// a scan (NOT INDEXED); that `a = 10` seeks the index is a premise.
+    #[test]
+    fn a_domain_over_numeric_answers_by_its_index_as_by_a_scan() {
+        let conn = open();
+        for sql in [
+            "CREATE DOMAIN dpos AS numeric(8, 2) CHECK (VALUE > 0)",
+            "CREATE TABLE d(id INTEGER PRIMARY KEY, a dpos) STRICT",
+            "INSERT INTO d VALUES (3, 1.5), (6, 10), (7, 9)",
+            "CREATE INDEX da ON d(a)",
+        ] {
+            conn.execute(sql).unwrap();
+        }
+        let seek = "SELECT id FROM d WHERE a = 10 ORDER BY id";
+        assert!(seeks(&conn, seek, "d", "da"), "premise: {seek} seeks index da: {:?}", plan(&conn, seek));
+        let mut bad = Vec::new();
+        for (pred, want) in [("a = 10", "6"), ("a = 1.5", "3"), ("a IN (10, 9)", "6;7"), ("a = 10.001", "")] {
+            for from in ["d", "d NOT INDEXED"] {
+                let sql = format!("SELECT id FROM {from} WHERE {pred} ORDER BY id");
+                bad.extend(diverging(&conn, &[(sql.as_str(), want)], "PostgreSQL 18"));
+            }
+        }
+        assert!(bad.is_empty(), "CLAIM: a domain over numeric answered by its index unlike a scan: {bad:#?}");
+    }
 }
