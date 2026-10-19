@@ -1,0 +1,52 @@
+>> Q CREATE TABLE n(id int, b numeric(8,2))
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO n VALUES (1, 2.50), (2, 123456.78), (3, 10.00)
+   C INSERT 0 3
+   Z I
+>> Q CREATE VIEW v AS SELECT b FROM n
+   C CREATE VIEW
+   Z I
+>> Q CREATE TABLE c AS SELECT b FROM n
+   C SELECT 3
+   Z I
+>> Q SELECT b + 1 AS x FROM n ORDER BY 1
+   T oids=[1700]
+   D ['3.50']
+   D ['11.00']
+   D ['123457.78']
+   C SELECT 3
+   Z I
+>> Q SELECT b FROM n ORDER BY b
+   T oids=[1700]
+   D ['2.50']
+   D ['10.00']
+   D ['123456.78']
+   C SELECT 3
+   Z I
+>> Q SELECT b FROM v ORDER BY b
+   T oids=[1700]
+   D ['2.50']
+   D ['10.00']
+   D ['123456.78']
+   C SELECT 3
+   Z I
+>> Q SELECT b FROM (SELECT b FROM n) d ORDER BY b
+   T oids=[1700]
+   D ['2.50']
+   D ['10.00']
+   D ['123456.78']
+   C SELECT 3
+   Z I
+>> Q SELECT b FROM c ORDER BY b
+   T oids=[1700]
+   D ['2.50']
+   D ['10.00']
+   D ['123456.78']
+   C SELECT 3
+   Z I
+>> Q SELECT (SELECT max(b) FROM n) AS m
+   T oids=[1700]
+   D ['123456.78']
+   C SELECT 1
+   Z I

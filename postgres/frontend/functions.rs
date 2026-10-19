@@ -103,7 +103,7 @@ pub(crate) fn exec_scalar(conn: &Connection, name: &str, args: &[Value]) -> Resu
         // PostgreSQL's 3D000 (found by the E5' differential, wire-e5l5-fc85e82fc: every name
         // answered this database's size). An oid is taken as before.
         // NULL answers NULL, and an oid is pg_database's one oid or 42704, as PostgreSQL 18.6
-        // answers (wire-rev-uw3 LOW-3; recorded, recordings/pg18-dbsize-edges.out).
+        // answers (wire-rev-uw3 LOW-3; recorded, pg18/pg18-wirefuzz-pg_database_size_of_null_or_an_unknown_oid_answers_as_postgresql_does.out).
         "pg_database_size" => {
             let path = conn.db_file_path();
             match args.first() {

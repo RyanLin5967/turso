@@ -1,0 +1,20 @@
+>> Q SELECT current_database()
+   T oids=[19]
+   D ['postgres']
+   C SELECT 1
+   Z I
+>> Q SELECT count(*) FROM pg_database WHERE datname = current_database()
+   T oids=[20]
+   D ['1']
+   C SELECT 1
+   Z I
+>> Q SELECT pg_database_size(current_database()) >= 0
+   T oids=[16]
+   D ['t']
+   C SELECT 1
+   Z I
+>> Q SELECT pg_database_size('postgres') >= 0
+   T oids=[16]
+   D ['t']
+   C SELECT 1
+   Z I

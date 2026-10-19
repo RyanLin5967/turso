@@ -1,0 +1,23 @@
+>> Q SELECT pg_database_size(NULL) IS NULL
+   T oids=[16]
+   D ['t']
+   C SELECT 1
+   Z I
+>> Q SELECT pg_database_size(NULL::oid) IS NULL
+   T oids=[16]
+   D ['t']
+   C SELECT 1
+   Z I
+>> Q SELECT pg_database_size(99999::oid)
+   T oids=[20]
+   E S=ERROR C=42704 M=database with OID 99999 does not exist
+   Z I
+>> Q SELECT pg_database_size('nosuch')
+   T oids=[20]
+   E S=ERROR C=3D000 M=database "nosuch" does not exist
+   Z I
+>> Q SELECT pg_database_size(oid) >= 0 FROM pg_database WHERE datname = current_database()
+   T oids=[16]
+   D ['t']
+   C SELECT 1
+   Z I

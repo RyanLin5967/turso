@@ -1,0 +1,34 @@
+>> Q SELECT CAST(1.5 AS NUMERIC(8,2))
+   T oids=[1700]
+   D ['1.50']
+   C SELECT 1
+   Z I
+>> Q SELECT 1.5::numeric(8,2)
+   T oids=[1700]
+   D ['1.50']
+   C SELECT 1
+   Z I
+>> Q SELECT CAST(1.005 AS NUMERIC(8,2))
+   T oids=[1700]
+   D ['1.01']
+   C SELECT 1
+   Z I
+>> Q SELECT CAST(123456.789 AS NUMERIC(8,2))
+   T oids=[1700]
+   D ['123456.79']
+   C SELECT 1
+   Z I
+>> Q CREATE DOMAIN dn AS NUMERIC(8,2)
+   C CREATE DOMAIN
+   Z I
+>> Q CREATE TABLE dt(x dn)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO dt VALUES (1.5)
+   C INSERT 0 1
+   Z I
+>> Q SELECT x FROM dt
+   T oids=[1700]
+   D ['1.50']
+   C SELECT 1
+   Z I

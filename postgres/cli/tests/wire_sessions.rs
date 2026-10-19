@@ -12337,6 +12337,39 @@ macro_rules! replays_postgresql {
 
 // One test per recording; a divergence list is filled only from a read of that command's diff.
 replays_postgresql!(
+    pg18_wirefuzz_the_connected_database_is_current_database_and_in_pg_database_replays_as_postgresql_answered,
+    "pg18-wirefuzz-the_connected_database_is_current_database_and_in_pg_database.out",
+    []
+);
+replays_postgresql!(
+    pg18_wirefuzz_an_index_with_no_name_is_named_as_postgresql_names_it_replays_as_postgresql_answered,
+    "pg18-wirefuzz-an_index_with_no_name_is_named_as_postgresql_names_it.out",
+    []
+);
+replays_postgresql!(
+    pg18_wirefuzz_pg_database_size_of_null_or_an_unknown_oid_answers_as_postgresql_does_replays_as_postgresql_answered,
+    "pg18-wirefuzz-pg_database_size_of_null_or_an_unknown_oid_answers_as_postgresql_does.out",
+    []
+);
+replays_postgresql!(
+    pg18_wirefuzz_a_cast_to_numeric_p_s_and_a_numeric_domain_column_are_numeric_replays_as_postgresql_answered,
+    "pg18-wirefuzz-a_cast_to_numeric_p_s_and_a_numeric_domain_column_are_numeric.out",
+    [
+        (8, "PGDIV-NUMERIC-DOMAIN value [engine]: a domain over NUMERIC(8,2) is the engine's REAL: 1.5 typed 701 where PG says 1.50 typed 1700 (core's CREATE DOMAIN takes no base type parameters; engine f4683e89d adds them, unmerged)"),
+    ]
+);
+replays_postgresql!(
+    pg18_wirefuzz_a_numeric_column_orders_and_types_as_numeric_through_every_relation_replays_as_postgresql_answered,
+    "pg18-wirefuzz-a_numeric_column_orders_and_types_as_numeric_through_every_relation.out",
+    [
+        (5, "PGDIV-NUMERIC-DERIVED value [engine]: SILENT: over NUMERIC(8,2) b + 1 ORDER BY 1 orders as text and is typed 1700 where PG orders as numbers and types 1700 (core loses the custom type outside a direct column; engine 437f337be, unmerged)"),
+        (7, "PGDIV-NUMERIC-DERIVED value [engine]: SILENT: over NUMERIC(8,2) a view's column orders as text and is typed 17 bytea where PG orders as numbers and types 1700 (core loses the custom type outside a direct column; engine 437f337be, unmerged)"),
+        (8, "PGDIV-NUMERIC-DERIVED value [engine]: SILENT: over NUMERIC(8,2) a derived table's column orders as text and is typed 17 bytea where PG orders as numbers and types 1700 (core loses the custom type outside a direct column; engine 437f337be, unmerged)"),
+        (9, "PGDIV-NUMERIC-DERIVED value [engine]: SILENT: over NUMERIC(8,2) a CREATE TABLE AS copy's column orders as text and is typed 25 text where PG orders as numbers and types 1700 (core loses the custom type outside a direct column; engine 437f337be, unmerged)"),
+        (10, "PGDIV-NUMERIC-DERIVED value [engine]: a scalar subquery over it is typed 25 text where PG types 1700 (engine 437f337be, unmerged)"),
+    ]
+);
+replays_postgresql!(
     pg18_arrays_replays_as_postgresql_answered,
     "pg18-arrays.out",
     [
@@ -15301,7 +15334,7 @@ fn computed_and_smallint_result_columns_carry_postgresqls_types() {
 /// was refused 42601 "index  already exists", where PostgreSQL chooses a name (ChooseRelationName):
 /// table, columns ("expr" for an expression) and "idx" joined by "_", each part cut to fit 63
 /// bytes, and a number after "idx" while the name is any relation's. Recorded on iccad2,
-/// cli/tests/recordings/pg18-index-names.out.
+/// cli/tests/pg18/pg18-wirefuzz-an_index_with_no_name_is_named_as_postgresql_names_it.out (replayed).
 #[test]
 fn an_index_with_no_name_is_named_as_postgresql_names_it() {
     let dir = Scratch::new("index-names");
@@ -15425,7 +15458,7 @@ fn row_descriptions_carry_postgresqls_type_sizes_and_modifiers() {
 /// wire-rev-uw3 LOW-3: pg_database_size(NULL) answered this database's size, where PostgreSQL 18.6
 /// answers NULL (for a name and an oid alike), and an oid no database has answered it too, where
 /// PostgreSQL answers 42704 "database with OID 99999 does not exist". This database's own oid
-/// (pg_database's) still answers. Recorded on iccad2, cli/tests/recordings/pg18-dbsize-edges.out.
+/// (pg_database's) still answers. Recorded on iccad2, cli/tests/pg18/pg18-wirefuzz-pg_database_size_of_null_or_an_unknown_oid_answers_as_postgresql_does.out (replayed).
 #[test]
 fn pg_database_size_of_null_or_an_unknown_oid_answers_as_postgresql_does() {
     let dir = Scratch::new("dbsize-edges");
@@ -15455,7 +15488,7 @@ fn pg_database_size_of_null_or_an_unknown_oid_answers_as_postgresql_does() {
 /// float8 (701) and written as a float ('1.5'), where PostgreSQL 18.6 types it numeric (1700) and
 /// rounds it to the scale ('1.50', '1.01', '123456.79'); and a column of a domain over
 /// NUMERIC(8, 2) was announced 701 where PostgreSQL announces numeric. Recorded on iccad2,
-/// cli/tests/recordings/pg18-numeric-casts.out.
+/// cli/tests/pg18/pg18-wirefuzz-a_cast_to_numeric_p_s_and_a_numeric_domain_column_are_numeric.out (replayed).
 #[test]
 fn a_cast_to_numeric_p_s_and_a_numeric_domain_column_are_numeric() {
     let dir = Scratch::new("numeric-casts");
@@ -15487,7 +15520,7 @@ fn a_cast_to_numeric_p_s_and_a_numeric_domain_column_are_numeric() {
 /// ordered as text (123457.78 before 3.50), a wrong row order; and the column read through a view,
 /// a derived table, a CREATE TABLE AS copy or a scalar subquery was announced bytea (17) or text
 /// (25) where PostgreSQL 18.6 announces numeric (1700). Recorded on iccad2,
-/// cli/tests/recordings/pg18-numeric-derived.out.
+/// cli/tests/pg18/pg18-wirefuzz-a_numeric_column_orders_and_types_as_numeric_through_every_relation.out (replayed).
 #[test]
 fn a_numeric_column_orders_and_types_as_numeric_through_every_relation() {
     let dir = Scratch::new("numeric-derived");

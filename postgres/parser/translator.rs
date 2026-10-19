@@ -3574,7 +3574,7 @@ impl PostgreSQLTranslator {
                 // A cast to NUMERIC(p, s) or NUMERIC(p) is a cast to the engine's exact numeric of
                 // that precision and scale, as a NUMERIC(p, s) column is declared: it was cast to
                 // REAL, a float announced float8 and not rounded to the scale (wire-rev-uw3 MED-4;
-                // recorded, recordings/pg18-numeric-casts.out). A bare NUMERIC stays REAL (the
+                // recorded, pg18/pg18-wirefuzz-a_cast_to_numeric_p_s_and_a_numeric_domain_column_are_numeric.out). A bare NUMERIC stays REAL (the
                 // bare-NUMERIC divergence, a known red).
                 if let Some((p, s)) = type_cast.type_name.as_ref().and_then(numeric_cast_size) {
                     // The engine's numeric type, encoded and decoded as a column of it is stored
@@ -6927,7 +6927,7 @@ pub struct PgCopyFromStmt {
 /// ChooseIndexColumnNames, ChooseRelationName and makeObjectName): the table, the columns ("expr"
 /// for an expression; a repeated one numbered, expr, expr1) and "idx", joined by "_", the longer of
 /// the table and column parts cut a character at a time until the name fits 63 bytes; then "idx1",
-/// "idx2", ... while `taken` says the name is any relation's (recorded, pg18-index-names.out).
+/// "idx2", ... while `taken` says the name is any relation's (recorded, pg18/pg18-wirefuzz-an_index_with_no_name_is_named_as_postgresql_names_it.out).
 pub fn choose_index_name(table: &str, columns: &[String], taken: &dyn Fn(&str) -> bool) -> String {
     const NAME_MAX: usize = 63;
     let mut unique: Vec<String> = Vec::with_capacity(columns.len());
