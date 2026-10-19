@@ -1950,6 +1950,10 @@ struct CatState {
     /// committed batch recorded only under the mutex was starved of it by a foreground that takes it
     /// on every operation, and past the hard limit the gate went on waiting for columns that existed).
     links_columns_made: Arc<AtomicBool>,
+    /// The fill was stopped (`BranchStore::stop_links_fill`, at close), read by the fill thread
+    /// WITHOUT the store mutex before its column-only transaction (lead ruling LOW 4): a stopped fill
+    /// makes no columns. Cleared when a fill starts.
+    links_fill_stop: Arc<AtomicBool>,
     /// Checkpoint and settle counters (observing only).
     ckpt: CkptCounters,
     /// The part of `trunk_probes`/`trunk_rows` made by `trunk_written_known`'s once-per-page probe
@@ -2265,6 +2269,7 @@ impl CatState {
             links_fill_starts: 0,
             // l4-rev-h1 MED-3: a catalog reopened with its columns already made starts recorded.
             links_columns_made: Arc::new(AtomicBool::new(catalog.links())),
+            links_fill_stop: Arc::new(AtomicBool::new(false)),
             ckpt: CkptCounters::default(),
             catalog,
             dirty: HashMap::new(),
@@ -3736,7 +3741,7 @@ impl Drop for CutGate<'_> {
 /// the writer only: left to the flipping checkpoint, that work (O(rows), a pragma the probe's row
 /// count does not see) ran under the store mutex in a sharp store (red a722957c4). Mutant
 /// `l4_fill_wal_left` (test builds only): not truncated here.
-fn run_links_fill(shared: &StoreMutex, writer: &Mutex<Catalog>, group: &Group, made: &AtomicBool) {
+fn run_links_fill(shared: &StoreMutex, writer: &Mutex<Catalog>, group: &Group, made: &AtomicBool, stop: &AtomicBool) {
     // l4-rev-h1 HIGH 2 and MED-3: the link columns and the cursor's table are made FIRST, in a
     // transaction of their own on the writer, before this thread takes the store mutex at all, and
     // recorded lock-free: past the hard limit the gate can then let a checkpoint go on, however long
@@ -3761,6 +3766,12 @@ fn run_links_fill(shared: &StoreMutex, writer: &Mutex<Catalog>, group: &Group, m
         }
         nth
     };
+    // Lead ruling LOW 4: a fill stopped before it got here (a close) makes no columns; the check is
+    // lock-free, as the column-only transaction is. Mutant `l4_columns_after_stop` (test builds only):
+    // not checked, as before.
+    if stop.load(Ordering::Acquire) && !fe_mutant("l4_columns_after_stop") {
+        return;
+    }
     if !in_batch && !fe_mutant("l4_columns_in_first_batch") {
         let mut w = writer.lock();
         let ready = w.links()
@@ -6313,10 +6324,12 @@ impl BranchStore {
         }
         cat.filling = true;
         cat.links_cursor = None;
-        let (shared, writer, group, made) = (self.inner.clone(), cat.writer.clone(), self.group.clone(), cat.links_columns_made.clone());
+        cat.links_fill_stop.store(false, Ordering::Release);
+        let (shared, writer, group, made, stop) =
+            (self.inner.clone(), cat.writer.clone(), self.group.clone(), cat.links_columns_made.clone(), cat.links_fill_stop.clone());
         let spawned = crate::thread::Builder::new()
             .name("branch-links-fill".to_string())
-            .spawn(move || run_links_fill(&shared, &writer, &group, &made));
+            .spawn(move || run_links_fill(&shared, &writer, &group, &made, &stop));
         match spawned {
             Ok(handle) => {
                 *self.links_fill.lock() = Some(handle);
@@ -6356,6 +6369,7 @@ impl BranchStore {
     fn stop_links_fill(&self) {
         if let Some(cat) = self.inner.lock().cat.as_mut() {
             cat.filling = false;
+            cat.links_fill_stop.store(true, Ordering::Release);
         }
     }
 
