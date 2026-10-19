@@ -3049,4 +3049,29 @@ mod tests {
         }
         assert!(bad.is_empty(), "CLAIM: a window sum over numeric was not numeric's: {bad:#?}");
     }
+
+    /// Engine review 2bdcd32c6 MED 7 (raw types/probe1.out.txt): 58045fb81 ENCODEs a SET's literal
+    /// once at plan time, as PostgreSQL coerces a constant when it plans (22001 even when no row
+    /// matches), but an UPDATE with SQLite's OR clause is not PostgreSQL's statement: `UPDATE OR
+    /// IGNORE vc SET v = 'abcdef' WHERE id = 1` over a STRICT varchar(5) column was refused with no
+    /// row to update. SQLite runs a constraint per row, so an UPDATE OR IGNORE that matches no row
+    /// succeeds and changes nothing (python sqlite3 3.46.1, UW run typesrev-oracle2; artie raw
+    /// frontier/fastest/lanes/engine/raw/sqlite-types-rev2bd.txt 42503e4e38, the CHECK (length(v) <=
+    /// 5) table). The plain UPDATE stays refused, as PostgreSQL 18.6 refuses it in that run (22001):
+    /// the control.
+    #[test]
+    fn update_or_ignore_matching_no_row_is_not_refused_by_a_plan_time_encode() {
+        let conn = open();
+        conn.execute("CREATE TABLE vc(id INTEGER PRIMARY KEY, v varchar(5)) STRICT").unwrap();
+        let mut bad = Vec::new();
+        match conn.execute("UPDATE vc SET v = 'abcdef' WHERE id = 1") {
+            Err(e) if e.to_string().contains("value too long for type character varying(5)") => {}
+            other => bad.push(format!("plain UPDATE gave {other:?}, not PostgreSQL's 22001 (control)")),
+        }
+        match conn.execute("UPDATE OR IGNORE vc SET v = 'abcdef' WHERE id = 1") {
+            Ok(()) => bad.extend(diverging(&conn, &[("SELECT changes(), count(*) FROM vc", "0,0")], "SQLite 3.46.1")),
+            Err(e) => bad.push(format!("UPDATE OR IGNORE matching no row refused: {e}; SQLite succeeds")),
+        }
+        assert!(bad.is_empty(), "CLAIM: UPDATE OR IGNORE matching no row was refused: {bad:#?}");
+    }
 }
