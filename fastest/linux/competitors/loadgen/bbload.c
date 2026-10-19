@@ -591,7 +591,14 @@ static int conn_open(conn_t *x, const char *base, const char *over, char *why, s
 }
 
 /* Verbatim from artie 4010ff3b06: wait for backend exit before a following DROP. */
+/* conn_close_sync with the wait for the peer's EOF bounded by an absolute deadline DL (now_ns) instead of
+ * CLOSE_TIMEOUT_S from now (comp-rev-a145 LOW-4: the end-of-run home probe and the home's final close share one
+ * deadline). A deadline already passed closes without waiting. */
+static int conn_close_until(conn_t *x, uint64_t dl, char *why, size_t wsz);
 static int conn_close_sync(conn_t *x, char *why, size_t wsz) {
+    return conn_close_until(x, now_ns() + (uint64_t)(CLOSE_TIMEOUT_S * 1e9), why, wsz);
+}
+static int conn_close_until(conn_t *x, uint64_t dl, char *why, size_t wsz) {
     int s = -1, rc = 0, dup_errno = 0;
     if (x->pg) {
         int fd = PQsocket(x->pg);
@@ -611,7 +618,6 @@ static int conn_close_sync(conn_t *x, char *why, size_t wsz) {
         return -1;
     }
     if (s < 0) return 0;
-    uint64_t dl = now_ns() + (uint64_t)(CLOSE_TIMEOUT_S * 1e9);
     char b[512];
     for (;;) {
         uint64_t n = now_ns();
@@ -654,20 +660,35 @@ static int my_fail(conn_t *x, char *why, size_t wsz) {
 
 static int conn_exec(conn_t *x, const char *sql, int need_rows, char *why, size_t wsz);
 
-/* A watchdog over one blocking call on a socket (comp-rev-2404 LOW-1): unless disarmed before DL (CLOCK_REALTIME),
- * it shuts the socket down, so every read the call is blocked in -- the first byte or any later one, in libpq or
- * in Connector/C -- returns at once with an error. One deadline bounds the WHOLE reply. */
+/* A watchdog over one blocking call on a socket (comp-rev-2404 LOW-1): unless disarmed before its deadline, it shuts
+ * the socket down, so every read the call is blocked in -- the first byte or any later one, in libpq or in
+ * Connector/C -- returns at once with an error. One deadline bounds the WHOLE reply.
+ * comp-rev-a145 LOW-1: the deadline is on CLOCK_MONOTONIC (pthread_condattr_setclock) wherever the platform has it;
+ * macOS has no condattr clock, so there it is a RELATIVE wait (pthread_cond_timedwait_relative_np), which no
+ * wall-clock step moves either. LOW-2: it shuts down its own dup() of the socket, so a number that libpq or my_fail
+ * has already closed and the kernel has handed to another socket can never be the one shut down. */
 typedef struct {
     pthread_mutex_t mu;
     pthread_cond_t cv;
     int fd, done, fired;
-    struct timespec dl;
+    struct timespec dl; /* absolute CLOCK_MONOTONIC deadline; on macOS the relative bound */
 } watch_t;
 static void *watch_main(void *p) {
     watch_t *wd = p;
     pthread_mutex_lock(&wd->mu);
+#ifdef __APPLE__
+    uint64_t end = now_ns() + (uint64_t)wd->dl.tv_sec * 1000000000u + (uint64_t)wd->dl.tv_nsec;
+#endif
     while (!wd->done) {
-        if (pthread_cond_timedwait(&wd->cv, &wd->mu, &wd->dl) == ETIMEDOUT && !wd->done) {
+#ifdef __APPLE__
+        uint64_t n = now_ns();
+        struct timespec rel = {0, 0};
+        if (n < end) { rel.tv_sec = (time_t)((end - n) / 1000000000u); rel.tv_nsec = (long)((end - n) % 1000000000u); }
+        int r = n >= end ? ETIMEDOUT : pthread_cond_timedwait_relative_np(&wd->cv, &wd->mu, &rel);
+#else
+        int r = pthread_cond_timedwait(&wd->cv, &wd->mu, &wd->dl);
+#endif
+        if (r == ETIMEDOUT && !wd->done) {
             wd->fired = 1;
             shutdown(wd->fd, SHUT_RDWR);
             break;
@@ -678,28 +699,46 @@ static void *watch_main(void *p) {
 }
 
 /* One SELECT 1 on X, the whole reply bounded by SECS: 0 when the server answered it, -1 (WHY) when the connection
- * is gone, the query failed, the reply broke off (comp-rev-2404 MED-1: conn_exec checks a NULL result against
- * mysql_field_count), or no complete answer came in time (comp-rev-b15 LOW-1, comp-rev-67b2 LOW-B,
+ * is gone, the query failed, the reply broke off (comp-rev-2404 MED-1: conn_exec fails a NULL result whenever
+ * mysql_errno is set), or no complete answer came in time (comp-rev-b15 LOW-1, comp-rev-67b2 LOW-B,
  * comp-rev-2404 LOW-1). It runs the same conn_exec every op uses, under the watchdog. */
 static int conn_probe(conn_t *x, double secs, char *why, size_t wsz) {
     int fd = x->proto == P_PG ? (x->pg ? PQsocket(x->pg) : -1) : (x->my ? (int)mysql_get_socket(x->my) : -1);
     if (fd < 0) { snprintf(why, wsz, "connection not open"); return -1; }
-    watch_t wd = {.fd = fd};
+    int dfd = dup(fd); /* LOW-2: the watchdog's own reference to this socket */
+    if (dfd < 0) { snprintf(why, wsz, "probe watchdog: dup: %s", strerror(errno)); return -1; } /* never unbounded */
+    watch_t wd = {.fd = dfd};
     pthread_mutex_init(&wd.mu, NULL);
-    pthread_cond_init(&wd.cv, NULL);
-    clock_gettime(CLOCK_REALTIME, &wd.dl);
+    pthread_condattr_t ca;
+    pthread_condattr_init(&ca);
+#ifdef __APPLE__
+    wd.dl.tv_sec = (time_t)secs;
+    wd.dl.tv_nsec = (long)((secs - (double)(time_t)secs) * 1e9);
+#else
+    pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
+    clock_gettime(CLOCK_MONOTONIC, &wd.dl);
     uint64_t ns = (uint64_t)wd.dl.tv_nsec + (uint64_t)(secs * 1e9);
     wd.dl.tv_sec += (time_t)(ns / 1000000000u);
     wd.dl.tv_nsec = (long)(ns % 1000000000u);
+#endif
+    pthread_cond_init(&wd.cv, &ca);
+    pthread_condattr_destroy(&ca);
     pthread_t th;
     int armed = pthread_create(&th, NULL, watch_main, &wd) == 0;
-    if (!armed) { snprintf(why, wsz, "probe watchdog: pthread_create failed"); return -1; } /* never unbounded */
+    if (!armed) { /* never unbounded */
+        snprintf(why, wsz, "probe watchdog: pthread_create failed");
+        close(dfd);
+        pthread_cond_destroy(&wd.cv);
+        pthread_mutex_destroy(&wd.mu);
+        return -1;
+    }
     int rc = conn_exec(x, "SELECT 1", 0, why, wsz);
     pthread_mutex_lock(&wd.mu);
     wd.done = 1;
     pthread_cond_signal(&wd.cv);
     pthread_mutex_unlock(&wd.mu);
     pthread_join(th, NULL);
+    close(dfd);
     if (wd.fired) { snprintf(why, wsz, "the server did not answer within %.1f s", secs); rc = -1; }
     if (rc == 0 && x->proto == P_PG && (!x->pg || PQstatus(x->pg) != CONNECTION_OK)) {
         snprintf(why, wsz, "connection not OK after the probe");
@@ -1162,12 +1201,17 @@ done:
      * after a lost-connection error was counted when it was lost. */
     /* comp-rev-67b2 LOW-B, comp-rev-2404 LOW-1/LOW-2: the check is BOUNDED, the whole reply by one deadline
      * (conn_probe's watchdog, CLOSE_TIMEOUT_S): a dead or hung home is blamed on the home connection (other_err,
-     * rc 3), never reported as an ops stall (rc 4). The handle is then ABANDONED (conn_abandon: no further wait on
-     * the peer), so teardown fails at once and the deadline above is the only wait: CLOSE_TIMEOUT_S (5 s) must stay
-     * below --stall-s, the stated minimum (run_system.sh uses 600 s; test_probe_shapes.py checks it at 8 s).
+     * rc 3), never reported as an ops stall (rc 4). A failed handle is then ABANDONED (conn_abandon: no further
+     * wait on the peer), so teardown fails at once. comp-rev-a145 LOW-4: on the SUCCESS path too, the home's final
+     * close waits only for what is left of the same deadline (conn_close_until HDL), so probe plus final close never
+     * exceed CLOSE_TIMEOUT_S together. --stall-s must be above CLOSE_TIMEOUT_S (main refuses it otherwise:
+     * LOW-3; run_system.sh uses 600 s, test_probe_shapes.py 8 s). Teardown statements, when a spec has them, run
+     * between the two and are NOT under this deadline (no registered spec has one). A final close that runs out of
+     * the deadline is not counted, as before: the server answered the probe, so the home was alive.
      * LOW-C, stated: this SELECT 1 runs after this client's last op, untimed and recorded nowhere, but with
      * --no-drain at C > 1 it can overlap other clients' measured ops, and it falls inside a labelling run's strace
      * window. It writes nothing (no flush expected; not straced to prove it) and --no-drain cells are refused. */
+    uint64_t hdl = now_ns() + (uint64_t)(CLOSE_TIMEOUT_S * 1e9);
     if (c->home.pg || c->home.my) {
         if (conn_probe(&c->home, CLOSE_TIMEOUT_S, w, sizeof w) != 0) {
             other_fail("home connection lost (found after the last op)", w);
@@ -1179,7 +1223,7 @@ done:
         if (expand(S.teardown[k], &x0, t, sizeof t, w) != 0 || conn_exec(&c->home, t, 0, w, sizeof w) != 0)
             other_fail("teardown", w); /* MED-1: a failed teardown is a failure */
     }
-    conn_close(&c->home);
+    (void)conn_close_until(&c->home, hdl, w, sizeof w); /* LOW-4: the rest of the probe's deadline, not 5 s more */
     if (S.proto == P_MYSQL) mysql_thread_end();
     __atomic_fetch_add(&g_exited, 1, __ATOMIC_RELEASE); /* the main thread waits for every client to exit */
     return NULL;
@@ -1330,6 +1374,12 @@ int main(int argc, char **argv) {
 #undef NUMU
     }
     if (!specp || !out || C < 1) { fprintf(stderr, "usage: bbload --spec FILE --out DIR --clients C ...\n"); return 2; }
+    /* comp-rev-a145 LOW-3: the end-of-run home probe and the final home close share one CLOSE_TIMEOUT_S deadline,
+     * so a --stall-s at or below it would report a slow or hung home as an ops stall (rc 4): refused */
+    if (STALL_S <= CLOSE_TIMEOUT_S) {
+        fprintf(stderr, "bbload: --stall-s %.3f must be above the home probe's %.1f s bound\n", STALL_S, CLOSE_TIMEOUT_S);
+        return 2;
+    }
     if (warm_rule_flag && warm_legacy) {  /* lead review 62430d8bf..b49fb656a MED 7 */
         fprintf(stderr, "bbload: REFUSED: --warmup OPS:S:MAX_S together with --warmup-ops/--warmup-s (the effective "
                         "warm-up and the recorded rule would differ)\n");
