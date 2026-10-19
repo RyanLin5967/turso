@@ -18,7 +18,7 @@ use turso_pg_parser::translator::{
     PgShowStmt, PostgreSQLTranslator, BRANCH_FUNCTION_PREFIX,
 };
 
-use crate::copy::parse_copy_rows;
+
 
 #[derive(Clone)]
 pub struct PgConnection {
@@ -86,13 +86,17 @@ pub(crate) struct PgConnectionInner {
 struct CopyStdin {
     asked: Option<usize>,
     end: Option<Arc<CopyEnd>>,
+    /// The COPY's loader between its runs: made by the first, fed by each piece.
+    loader: Option<CopyLoader>,
 }
 
-/// How the client ended a COPY FROM STDIN ([`PgConnection::set_copy_end`]).
+/// What the next run of a COPY FROM STDIN reads ([`PgConnection::set_copy_end`]).
 #[derive(Debug)]
 pub enum CopyEnd {
-    /// Its CopyData, in order, up to CopyDone.
-    Data(Vec<u8>),
+    /// The next piece of the client's CopyData (the server sends it in pieces of 64 KiB or more).
+    Chunk(Vec<u8>),
+    /// The last piece, at CopyDone: the COPY ends with it and answers its rows.
+    Done(Vec<u8>),
     /// Its CopyFail, or a message COPY cannot take: the COPY fails with this error.
     Failed(SqlErrorKind, String),
 }
@@ -4146,9 +4150,155 @@ fn handle_pg_copy_from(pg_conn: &Arc<PgConnectionInner>, stmt: &PgCopyFromStmt) 
     std::io::Read::read_to_end(&mut open_server_file(&pg_conn.server_files, &stmt.filename)?, &mut data).map_err(|e| {
         LimboError::ParseError(format!("COPY FROM: cannot read '{}': {}", stmt.filename, e).into())
     })?;
-    // The file's bytes are read as the client's rows are: UTF-8 with no NUL, else 22021 (a file
-    // that was not UTF-8 failed its read with 42601, and a NUL was stored).
-    load_copy_rows(pg_conn, stmt, &target, crate::copy::copy_text(&data)?)
+    // The rows go in atomically: in a transaction of their own, or, inside one already open (a
+    // client's block, or the implicit block of a multi-statement query or a pipeline), under a
+    // savepoint, so a failed COPY undoes its own rows and leaves the block to its owner. Its own
+    // BEGIN was refused inside any open transaction (wire review 4 item 2). An undo that fails
+    // breaks the connection, as for ALTER's rebuild (own_transaction). Read line by line in
+    // PostgreSQL's batches, as the client's rows are ([`CopyLoader`]).
+    own_transaction(pg_conn, "__turso_copy", "COPY FROM", || {
+        let mut loader = CopyLoader::new(Arc::new(target), stmt);
+        loader.feed(pg_conn, &data, true)?;
+        Ok(loader.rows)
+    })
+}
+
+/// The longest line COPY reads: PostgreSQL's MaxAllocSize, past which its line buffer cannot grow
+/// (54000 "out of memory"). The server sets it at startup ([`set_copy_line_limit`]).
+static COPY_LINE_LIMIT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0x3fff_ffff);
+
+/// The longest line COPY reads, process-wide, before it refuses with 54000 (the server's
+/// `--copy-line-limit`); PostgreSQL's 1 GiB - 1 by default.
+pub fn set_copy_line_limit(bytes: usize) {
+    COPY_LINE_LIMIT.store(bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// PostgreSQL's multi-insert buffer: rows are inserted once 1000 are read, or their lines hold
+/// 64 KB (CopyMultiInsertBufferFull's MAX_BUFFERED_TUPLES, MAX_BUFFERED_BYTES; the bytes are the
+/// lines', where PostgreSQL counts its tuples'), and at the end.
+const COPY_BATCH_ROWS: usize = 1000;
+const COPY_BATCH_BYTES: usize = 65535;
+
+/// COPY FROM's loader, fed the data in pieces as it comes ([`CopyLoader::feed`]): each complete
+/// line is read (UTF-8, its fields, their input checks, in that order) as it arrives and its row
+/// kept in a batch, which is inserted when full, as PostgreSQL's CopyFrom reads and flushes. So a
+/// line's error beats any later line's, and an insert's error (23505) beats a later line's once
+/// its batch was full (recorded, copy-stdin-pg18.txt part 6 `S1`, `S2`, `S6`, `S6b`). Memory is
+/// the unfinished line, one batch and the piece being read. Every line was parsed first, held as
+/// a row of Strings each, then checked, then inserted: about 93 bytes of memory per byte of
+/// input (review wire-rev-copystdin H1, M1).
+#[derive(Clone)]
+struct CopyLoader {
+    target: Arc<CopyTarget>,
+    delimiter: char,
+    null_string: String,
+    skip_header: bool,
+    lines: crate::copy::CopyLines,
+    /// The unfinished line: the bytes after the last complete one.
+    carry: Vec<u8>,
+    batch: Vec<crate::copy::CopyRow>,
+    batch_bytes: usize,
+    /// Rows inserted.
+    rows: usize,
+}
+
+impl CopyLoader {
+    fn new(target: Arc<CopyTarget>, stmt: &PgCopyFromStmt) -> Self {
+        Self {
+            target,
+            delimiter: stmt
+                .delimiter
+                .as_ref()
+                .and_then(|d| d.chars().next())
+                .unwrap_or('\t'),
+            null_string: stmt.null_string.clone().unwrap_or_else(|| "\\N".to_string()),
+            skip_header: stmt.header,
+            lines: crate::copy::CopyLines::default(),
+            carry: Vec::new(),
+            batch: Vec::new(),
+            batch_bytes: 0,
+            rows: 0,
+        }
+    }
+
+    /// The next piece of the data; `last` when it is the end.
+    fn feed(&mut self, pg_conn: &Arc<PgConnectionInner>, data: &[u8], last: bool) -> Result<()> {
+        let joined;
+        let buf: &[u8] = if self.carry.is_empty() {
+            data
+        } else {
+            joined = [std::mem::take(&mut self.carry).as_slice(), data].concat();
+            &joined
+        };
+        let limit = COPY_LINE_LIMIT.load(std::sync::atomic::Ordering::Relaxed);
+        let (lines, used) = self.lines.split(buf, last)?;
+        for range in lines {
+            let line = &buf[range];
+            if line.len() > limit {
+                return Err(line_too_long(line.len()));
+            }
+            if std::mem::take(&mut self.skip_header) {
+                continue;
+            }
+            self.read_line(pg_conn, line)?;
+        }
+        if buf.len() - used > limit {
+            return Err(line_too_long(buf.len() - used));
+        }
+        self.carry = buf[used..].to_vec();
+        if last {
+            self.flush(pg_conn)?;
+        }
+        Ok(())
+    }
+
+    fn read_line(&mut self, pg_conn: &Arc<PgConnectionInner>, line: &[u8]) -> Result<()> {
+        let mut row = crate::copy::copy_row(line, self.delimiter, &self.null_string, &self.target.columns)?;
+        for (value, input) in row.iter_mut().zip(&self.target.input_types) {
+            if let (Some(s), Some(input)) = (value.as_mut(), input) {
+                if let Some(stored) = input.read(s)? {
+                    *s = stored;
+                }
+            }
+        }
+        self.batch.push(row);
+        self.batch_bytes += line.len();
+        if self.batch.len() >= COPY_BATCH_ROWS || self.batch_bytes >= COPY_BATCH_BYTES {
+            self.flush(pg_conn)?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self, pg_conn: &Arc<PgConnectionInner>) -> Result<()> {
+        if self.batch.is_empty() {
+            return Ok(());
+        }
+        let mut insert = pg_conn.conn.prepare_sqlite(&self.target.insert_sql)?;
+        for row in std::mem::take(&mut self.batch) {
+            for (i, value) in row.into_iter().enumerate() {
+                let index = NonZero::new(i + 1).unwrap();
+                match value {
+                    Some(s) => insert.bind_at(index, Value::build_text(s))?,
+                    None => insert.bind_at(index, Value::Null)?,
+                }
+            }
+            insert.run_ignore_rows()?;
+            insert.reset()?;
+            insert.clear_bindings();
+            self.rows += 1;
+        }
+        self.batch_bytes = 0;
+        Ok(())
+    }
+}
+
+/// PostgreSQL's answer to a line past its line buffer's limit: 54000 "out of memory".
+fn line_too_long(bytes: usize) -> LimboError {
+    let limit = COPY_LINE_LIMIT.load(std::sync::atomic::Ordering::Relaxed);
+    LimboError::InvalidArgument(SqlErrorMessage::classified(
+        SqlErrorKind::ProgramLimitExceeded,
+        format!("out of memory: a COPY line of {bytes} bytes or more is past the {limit}-byte limit"),
+    ))
 }
 
 /// COPY FROM STDIN, in its two runs ([`CopyStdin`]): with no end set, its target is checked as
@@ -4168,27 +4318,48 @@ fn handle_pg_copy_from_stdin(
                 .to_string(),
         )));
     };
-    let end = copy.lock().end.clone();
-    // The client's CopyFail is the COPY's error, whatever else has changed since it asked.
-    if let Some(CopyEnd::Failed(kind, message)) = end.as_deref() {
-        return Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
-            *kind,
-            message.clone(),
-        )));
-    }
-    // The table and columns, then the options, as for a file (handle_pg_copy_from).
-    let target = copy_target(pg_conn, stmt)?;
-    refuse_copy_options(stmt)?;
+    let (end, loader) = {
+        let state = copy.lock();
+        (state.end.clone(), state.loader.clone())
+    };
+    let missing = || {
+        LimboError::InternalError("COPY FROM STDIN's rows came with no COPY waiting".to_string())
+    };
     match end.as_deref() {
-        None | Some(CopyEnd::Failed(..)) => {
-            copy.lock().asked = Some(target.columns.len());
+        None => {
+            // The table and columns, then the options, as for a file (handle_pg_copy_from).
+            let target = copy_target(pg_conn, stmt)?;
+            refuse_copy_options(stmt)?;
+            let mut state = copy.lock();
+            state.asked = Some(target.columns.len());
+            state.loader = Some(CopyLoader::new(Arc::new(target), stmt));
             Ok(0)
         }
-        Some(CopyEnd::Data(bytes)) => {
-            // The client's encoding is UTF8 (FIXED_SETTINGS): any other byte sequence, or a NUL,
-            // is PostgreSQL's 22021.
-            let data = crate::copy::copy_text(bytes)?;
-            load_copy_rows(pg_conn, stmt, &target, data)
+        // The client's CopyFail is the COPY's error, whatever else has changed since it asked.
+        Some(CopyEnd::Failed(kind, message)) => {
+            copy.lock().loader = None;
+            Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
+                *kind,
+                message.clone(),
+            )))
+        }
+        // A piece is read into a copy of the loader, kept only when the piece is read whole: a
+        // run the server repeats (a lock wait's retry, before any row went in) starts from the
+        // same state. Its rows go into the block the server keeps open for the COPY (the
+        // client's, or the implicit one), which a failure fails or rolls back.
+        Some(CopyEnd::Chunk(bytes)) | Some(CopyEnd::Done(bytes)) => {
+            let last = matches!(end.as_deref(), Some(CopyEnd::Done(_)));
+            let mut loader = loader.ok_or_else(missing)?;
+            // On an error the kept loader stays as it was, for a retry; the next COPY replaces it.
+            loader.feed(pg_conn, bytes, last)?;
+            let mut state = copy.lock();
+            if last {
+                state.loader = None;
+                Ok(loader.rows)
+            } else {
+                state.loader = Some(loader);
+                Ok(0)
+            }
         }
     }
 }
@@ -4665,57 +4836,6 @@ impl CopyInput {
     }
 }
 
-/// Load COPY text-format `data` into `target` as `stmt`'s options read it, atomically (see below):
-/// the number of rows loaded.
-fn load_copy_rows(
-    pg_conn: &Arc<PgConnectionInner>,
-    stmt: &PgCopyFromStmt,
-    target: &CopyTarget,
-    data: &str,
-) -> Result<usize> {
-    let conn = &pg_conn.conn;
-    let insert_sql = &target.insert_sql;
-    let delimiter = stmt
-        .delimiter
-        .as_ref()
-        .and_then(|d| d.chars().next())
-        .unwrap_or('\t');
-    let null_string = stmt.null_string.as_deref().unwrap_or("\\N");
-
-    // HEADER: the first logical line is skipped unread, as PostgreSQL skips it (it was parsed as a
-    // row, so a header with another number of fields failed the COPY).
-    let rows = parse_copy_rows(data, delimiter, null_string, &target.columns, stmt.header)?;
-
-    let rows_inserted = rows.len();
-    // The rows go in atomically: in a transaction of their own, or, inside one already open (a
-    // client's block, or the implicit block of a multi-statement query or a pipeline), under a
-    // savepoint, so a failed COPY undoes its own rows and leaves the block to its owner. Its own
-    // BEGIN was refused inside any open transaction (wire review 4 item 2).
-    // An undo that fails breaks the connection, as for ALTER's rebuild (own_transaction): it left
-    // some of the rows in a transaction nobody can name.
-    own_transaction(pg_conn, "__turso_copy", "COPY FROM", || {
-        let mut insert_stmt = conn.prepare_sqlite(insert_sql)?;
-        for row in &rows {
-            for (i, val) in row.iter().enumerate() {
-                let index = NonZero::new(i + 1).unwrap();
-                match val {
-                    Some(s) => {
-                        let stored = match &target.input_types[i] {
-                            Some(input) => input.read(s)?,
-                            None => None,
-                        };
-                        insert_stmt.bind_at(index, Value::build_text(stored.unwrap_or_else(|| s.clone())))?
-                    }
-                    None => insert_stmt.bind_at(index, Value::Null)?,
-                }
-            }
-            insert_stmt.run_ignore_rows()?;
-            insert_stmt.reset()?;
-            insert_stmt.clear_bindings();
-        }
-        Ok(rows_inserted)
-    })
-}
 
 /// One catalog row [`PgConnection::stored_relation`] found: its type (table, view, index, ...),
 /// the table it belongs to (its own name for a table or view), its stored SQL, and the PostgreSQL

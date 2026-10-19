@@ -65,6 +65,8 @@ pub enum SqlErrorKind {
     InvalidDatetimeFormat,
     // COPY FROM's data format (a line with too few or too many fields).
     BadCopyFileFormat,
+    // A limit an input is past (COPY's longest line).
+    ProgramLimitExceeded,
 }
 
 /// A diagnostic's text and optional, explicitly assigned SQL condition.

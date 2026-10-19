@@ -117,6 +117,14 @@ struct Opts {
 
     #[clap(
         long,
+        value_parser = clap::value_parser!(u64).range(1..=0x3fff_ffff),
+        help = "The longest line COPY FROM reads, in bytes, before it refuses the COPY with 54000 \
+                (default PostgreSQL's 1073741823, its line buffer's limit)"
+    )]
+    copy_line_limit: Option<u64>,
+
+    #[clap(
+        long,
         default_value_t = turso_pg_server::DEFAULT_AUTHENTICATION_TIMEOUT_S,
         value_parser = clap::value_parser!(u64).range(1..=600),
         help = "With --server: how long a client has to complete its startup before the session \
@@ -1167,6 +1175,9 @@ fn main() -> anyhow::Result<()> {
         .expect("Error setting Ctrl-C handler");
     }
 
+    if let Some(bytes) = opts.copy_line_limit {
+        turso_pg::set_copy_line_limit(bytes as usize);
+    }
     // Server mode: start PG wire protocol server and exit. Every session opens its own
     // connection.
     if let Some(ref address) = opts.server {

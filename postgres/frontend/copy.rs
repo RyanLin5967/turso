@@ -12,7 +12,7 @@ use crate::{LimboError, Result};
 use turso_parser::sql_error::{SqlErrorKind, SqlErrorMessage};
 
 /// A parsed row from COPY text format: each element is None for NULL, Some for a value.
-type CopyRow = Vec<Option<String>>;
+pub type CopyRow = Vec<Option<String>>;
 
 /// [`parse_copy_rows`] for `num_columns` columns named column1, column2, ...
 #[cfg(test)]
@@ -26,10 +26,9 @@ pub fn parse_copy_text_format(
     parse_copy_rows(data, delimiter, null_string, &columns, false)
 }
 
-/// Parse COPY text format data into rows of values for `columns`, the columns COPY loads, in
-/// order. A line with fewer fields than columns, or more, is 22P04 as PostgreSQL's CopyReadAttributes
-/// answers it ("missing data for column \"v\"", "extra data after last expected column"); it was
-/// 42601 "COPY: line N: expected 2 columns, got 1" (recorded, cli/tests/copy-stdin-pg18.txt).
+/// Every row of `data` at once, through the one line reader ([`CopyLines`]) and row reader
+/// ([`copy_row`]) COPY streams with: for this module's tests.
+#[cfg(test)]
 pub fn parse_copy_rows(
     data: &str,
     delimiter: char,
@@ -37,37 +36,44 @@ pub fn parse_copy_rows(
     columns: &[String],
     header: bool,
 ) -> Result<Vec<CopyRow>> {
-    let mut rows = Vec::new();
+    let mut lines = CopyLines::default();
+    let (ranges, _) = lines.split(data.as_bytes(), true)?;
+    ranges
+        .into_iter()
+        .skip(usize::from(header))
+        .map(|r| copy_row(&data.as_bytes()[r], delimiter, null_string, columns))
+        .collect()
+}
 
-    // HEADER: the first logical line is skipped unread, an escaped newline in it included
-    // (recorded, copy-stdin-pg18.txt `headerbs`).
-    for line in split_copy_lines(data)?.into_iter().skip(usize::from(header)) {
-        // Every line is a row, an empty one included: one empty field, as PostgreSQL's
-        // CopyReadAttributesText reads it (an empty string for a one-column COPY, else 22P04;
-        // recorded, copy-stdin-pg18.txt `escapes`). Empty lines were skipped.
-        let fields = split_copy_fields(line, delimiter);
-        if fields.len() > columns.len() {
-            return Err(bad_format("extra data after last expected column".to_string()));
-        }
-        if let Some(missing) = columns.get(fields.len()) {
-            return Err(bad_format(format!("missing data for column \"{missing}\"")));
-        }
-
-        let row: CopyRow = fields
-            .iter()
-            .map(|field| {
-                if *field == null_string {
-                    Ok(None)
-                } else {
-                    unescape_copy_field(field).map(Some)
-                }
-            })
-            .collect::<Result<_>>()?;
-
-        rows.push(row);
+/// One line's row for `columns`, the columns COPY loads, in order: the line must be UTF-8 with no
+/// NUL (22021), and hold one field per column, an empty line being one empty field (22P04 as
+/// PostgreSQL's CopyReadAttributesText answers: "missing data for column \"v\"", "extra data after
+/// last expected column"). A field equal to the NULL string as written is NULL; any other is
+/// unescaped ([`unescape_copy_field`]).
+pub fn copy_row(
+    line: &[u8],
+    delimiter: char,
+    null_string: &str,
+    columns: &[String],
+) -> Result<CopyRow> {
+    let line = copy_text(line)?;
+    let fields = split_copy_fields(line, delimiter);
+    if fields.len() > columns.len() {
+        return Err(bad_format("extra data after last expected column".to_string()));
     }
-
-    Ok(rows)
+    if let Some(missing) = columns.get(fields.len()) {
+        return Err(bad_format(format!("missing data for column \"{missing}\"")));
+    }
+    fields
+        .iter()
+        .map(|field| {
+            if *field == null_string {
+                Ok(None)
+            } else {
+                unescape_copy_field(field).map(Some)
+            }
+        })
+        .collect()
 }
 
 fn bad_format(text: String) -> LimboError {
@@ -105,55 +111,132 @@ pub fn copy_text(bytes: &[u8]) -> Result<&str> {
     Ok(text)
 }
 
-/// The data's lines, as PostgreSQL's CopyReadLineText reads them: a newline ends a line (a
-/// carriage return before it is dropped) unless a backslash escapes it, so `a\<LF>b` is one line
-/// holding a newline in its field; `\.` alone on its line ends the data, and `\.` anywhere else is
-/// 22P04 "end-of-copy marker is not alone on its line" (PostgreSQL 18; recorded,
-/// copy-stdin-pg18.txt `bsnewline`, `dotnotalone`). `lines()` ended a line at an escaped newline,
-/// and loaded `abc\.` as `abc.`.
-fn split_copy_lines(data: &str) -> Result<Vec<&str>> {
-    let b = data.as_bytes();
-    let mut lines = Vec::new();
-    let (mut start, mut i) = (0, 0);
-    // The byte an escape made data: a CR there is the field's, never the line end's (`a\<CR><LF>`
-    // is `a<CR>`, recorded `escapedcr`; it was cut as a CRLF, leaving `a\`).
-    let mut escaped = usize::MAX;
-    let line_end = |end: usize, escaped: usize| {
-        if end > 0 && b[end - 1] == b'\r' && escaped != end - 1 {
-            end - 1
-        } else {
-            end
+
+/// A line end: LF, CR or CRLF.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Eol {
+    Nl,
+    Cr,
+    CrNl,
+}
+
+/// COPY's line reader, as PostgreSQL 18.6's CopyReadLineText reads lines, over data that arrives
+/// in pieces ([`CopyLines::split`]). The first line's end fixes the style (LF, CR or CRLF), and any
+/// other end is 22P04 "literal carriage return found in data" / "literal newline found in data";
+/// a backslash makes the byte after it data, so `a\<LF>b` is one line holding a newline (and an
+/// escaped CR is data); `\.` alone on its line ends the data, its own end in the data's style
+/// ("end-of-copy marker does not match previous newline style"), and `\.` anywhere else is
+/// "end-of-copy marker is not alone on its line" (recorded, cli/tests/copy-stdin-pg18.txt
+/// `bsnewline`, `dotnotalone`, `escapedcr`, parts 6 `S3` .. `dotcrnl`). The lines were cut at
+/// each LF with a CR before it dropped, so a bare CR was data, mixed ends loaded and CR-only data
+/// was one line (review wire-rev-copystdin M2).
+#[derive(Clone, Debug, Default)]
+pub struct CopyLines {
+    eol: Option<Eol>,
+    /// `\.` was read: the rest of the data is not read.
+    ended: bool,
+}
+
+impl CopyLines {
+    /// The complete lines at the front of `buf` (byte ranges, their ends cut off) and how many
+    /// bytes they take; the rest is an unfinished line, for the caller to hold until more data
+    /// comes. With `last` (the data ends at `buf`'s end) the rest is the last line.
+    pub fn split(
+        &mut self,
+        buf: &[u8],
+        last: bool,
+    ) -> Result<(Vec<std::ops::Range<usize>>, usize)> {
+        let mut lines = Vec::new();
+        if self.ended {
+            return Ok((lines, buf.len()));
         }
-    };
-    while i < b.len() {
-        match b[i] {
-            b'\\' if b.get(i + 1) == Some(&b'.') => {
-                let ends = matches!(b.get(i + 2), None | Some(b'\n') | Some(b'\r'));
-                if i == start && ends {
-                    return Ok(lines);
+        let literal = |what: &str| Err(bad_format(format!("literal {what} found in data")));
+        let (mut start, mut i) = (0, 0);
+        while i < buf.len() {
+            match buf[i] {
+                b'\\' if buf.get(i + 1) == Some(&b'.') => {
+                    if i != start {
+                        return Err(bad_format(
+                            "end-of-copy marker is not alone on its line".to_string(),
+                        ));
+                    }
+                    let after = i + 2;
+                    let end = match (buf.get(after), buf.get(after + 1)) {
+                        (None, _) if !last => return Ok((lines, start)),
+                        (None, _) => None,
+                        (Some(b'\n'), _) => Some(Eol::Nl),
+                        (Some(b'\r'), None) if !last => return Ok((lines, start)),
+                        (Some(b'\r'), Some(b'\n')) => Some(Eol::CrNl),
+                        (Some(b'\r'), _) => Some(Eol::Cr),
+                        _ => {
+                            return Err(bad_format(
+                                "end-of-copy marker is not alone on its line".to_string(),
+                            ))
+                        }
+                    };
+                    if let (Some(style), Some(end)) = (self.eol, end) {
+                        if style != end {
+                            return Err(bad_format(
+                                "end-of-copy marker does not match previous newline style"
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                    self.ended = true;
+                    return Ok((lines, buf.len()));
                 }
-                return Err(bad_format("end-of-copy marker is not alone on its line".to_string()));
+                // The escaped byte is data: ASCII (a newline, a CR, the delimiter) or the lead
+                // byte of a character, whose continuation bytes are never special.
+                b'\\' => {
+                    if i + 1 == buf.len() && !last {
+                        return Ok((lines, start));
+                    }
+                    i += 2;
+                }
+                b'\r' => {
+                    let next = buf.get(i + 1).copied();
+                    if next.is_none() && !last && self.eol != Some(Eol::Cr) {
+                        // CR or CRLF: the next byte decides.
+                        return Ok((lines, start));
+                    }
+                    let style = match self.eol {
+                        Some(style) => style,
+                        None if next == Some(b'\n') => Eol::CrNl,
+                        None => Eol::Cr,
+                    };
+                    self.eol = Some(style);
+                    match style {
+                        Eol::Nl => return literal("carriage return"),
+                        Eol::Cr => {
+                            lines.push(start..i);
+                            i += 1;
+                        }
+                        Eol::CrNl if next == Some(b'\n') => {
+                            lines.push(start..i);
+                            i += 2;
+                        }
+                        Eol::CrNl => return literal("carriage return"),
+                    }
+                    start = i;
+                }
+                b'\n' => {
+                    match self.eol {
+                        None | Some(Eol::Nl) => self.eol = Some(Eol::Nl),
+                        Some(_) => return literal("newline"),
+                    }
+                    lines.push(start..i);
+                    i += 1;
+                    start = i;
+                }
+                _ => i += 1,
             }
-            // The escaped byte is data: ASCII (a newline, the delimiter) or the lead byte of a
-            // character, whose continuation bytes are never a newline or a backslash.
-            b'\\' => {
-                escaped = i + 1;
-                i += 2;
-            }
-            b'\n' => {
-                let end = line_end(i, escaped).max(start);
-                lines.push(&data[start..end]);
-                i += 1;
-                start = i;
-            }
-            _ => i += 1,
         }
+        if last && start < buf.len() {
+            lines.push(start..buf.len());
+            start = buf.len();
+        }
+        Ok((lines, start))
     }
-    if start < b.len() {
-        let end = line_end(b.len(), escaped).max(start);
-        lines.push(&data[start..end]);
-    }
-    Ok(lines)
 }
 
 /// A line's fields as written (escapes still in them), split at each delimiter that no backslash
