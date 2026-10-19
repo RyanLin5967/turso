@@ -621,7 +621,7 @@ static int conn_close_until(conn_t *x, uint64_t dl, char *why, size_t wsz) {
     char b[512];
     for (;;) {
         uint64_t n = now_ns();
-        if (n >= dl) { snprintf(why, wsz, "close: the server did not close the connection within %.1f s", CLOSE_TIMEOUT_S); rc = -1; break; }
+        if (n >= dl) { snprintf(why, wsz, "close: the server did not close the connection by the close deadline"); rc = -1; break; } /* comp-rev-acd4 LOW-3: a shared deadline may have left less than CLOSE_TIMEOUT_S */
         struct pollfd pf = {s, POLLIN, 0};
         int pr = poll(&pf, 1, (int)((dl - n) / 1000000 + 1));
         if (pr < 0) { if (errno == EINTR) continue; snprintf(why, wsz, "close: poll: %s", strerror(errno)); rc = -1; break; }
