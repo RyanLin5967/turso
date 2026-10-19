@@ -12337,6 +12337,14 @@ macro_rules! replays_postgresql {
 }
 
 // One test per recording; a divergence list is filled only from a read of that command's diff.
+// Lead ruling 1(a), 2026-10-19: every write path that can store a value past varchar(n) (INSERT, UPDATE with a
+// literal, a folded constant or a column expression, INSERT ... SELECT, ON CONFLICT DO UPDATE and DO NOTHING, bound
+// parameters) refuses it 22001 in PostgreSQL 18.6. No divergence is registered: each one is a defect.
+replays_postgresql!(
+    pg18_wirefuzz_every_write_path_refuses_a_value_too_long_for_varchar_replays_as_postgresql_answered,
+    "pg18-wirefuzz-every_write_path_refuses_a_value_too_long_for_varchar.out",
+    []
+);
 replays_postgresql!(
     pg18_wirefuzz_the_connected_database_is_current_database_and_in_pg_database_replays_as_postgresql_answered,
     "pg18-wirefuzz-the_connected_database_is_current_database_and_in_pg_database.out",

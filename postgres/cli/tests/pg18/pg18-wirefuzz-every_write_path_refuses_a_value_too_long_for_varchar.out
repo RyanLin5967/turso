@@ -1,0 +1,49 @@
+>> Q CREATE TABLE vc(id int PRIMARY KEY, v varchar(5))
+   C CREATE TABLE
+   Z I
+>> Q CREATE TABLE src(id int, s text)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO src VALUES (1, 'abcdef'), (2, 'ok')
+   C INSERT 0 2
+   Z I
+>> Q INSERT INTO vc VALUES (1, 'abcdef')
+   E S=ERROR C=22001 M=value too long for type character varying(5)
+   Z I
+>> Q INSERT INTO vc VALUES (1, 'ab')
+   C INSERT 0 1
+   Z I
+>> Q UPDATE vc SET v = 'abcdef' WHERE id = 1
+   E S=ERROR C=22001 M=value too long for type character varying(5)
+   Z I
+>> Q UPDATE vc SET v = 'abc' || 'def' WHERE id = 1
+   E S=ERROR C=22001 M=value too long for type character varying(5)
+   Z I
+>> Q UPDATE vc SET v = v || 'defg' WHERE id = 1
+   E S=ERROR C=22001 M=value too long for type character varying(5)
+   Z I
+>> Q INSERT INTO vc SELECT id + 10, s FROM src
+   E S=ERROR C=22001 M=value too long for type character varying(5)
+   Z I
+>> Q INSERT INTO vc VALUES (1, 'x') ON CONFLICT (id) DO UPDATE SET v = 'abcdef'
+   E S=ERROR C=22001 M=value too long for type character varying(5)
+   Z I
+>> Q INSERT INTO vc VALUES (1, 'x') ON CONFLICT (id) DO UPDATE SET v = excluded.v || 'yyyyy'
+   E S=ERROR C=22001 M=value too long for type character varying(5)
+   Z I
+>> Q INSERT INTO vc VALUES (2, 'abcdef') ON CONFLICT (id) DO NOTHING
+   E S=ERROR C=22001 M=value too long for type character varying(5)
+   Z I
+>> X - INSERT INTO vc VALUES ($1, $2) ||| 3 ||| abcdef
+   ParseComplete
+   E S=ERROR C=22001 M=value too long for type character varying(5)
+   Z I
+>> X - UPDATE vc SET v = $1 WHERE id = 1 ||| abcdef
+   ParseComplete
+   E S=ERROR C=22001 M=value too long for type character varying(5)
+   Z I
+>> Q SELECT id, v, length(v) FROM vc ORDER BY id
+   T oids=[23, 1043, 23]
+   D ['1', 'ab', '2']
+   C SELECT 1
+   Z I
