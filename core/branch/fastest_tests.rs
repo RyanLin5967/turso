@@ -15810,6 +15810,38 @@ fn a_failed_flight_loses_async_creates_visibly() {
     assert!(held, "premise: the flusher was held");
 }
 
+/// LEAP L2(a) inside L1 (engine-rev-qaf-fix2 MED 11: no test killed mutant async_expires_inline):
+/// an async create runs no expiry pass of its own, and the housekeeping thread runs it. With the
+/// housekeeping thread held, a leased branch whose lease ran out is still listed after an async
+/// create; once released, it is reaped within 10 s.
+#[test]
+fn an_async_create_leaves_expiry_to_the_housekeeping_thread() {
+    let _s = serial();
+    let class = if cfg!(target_vendor = "apple") { SyncClass::FullFsync } else { SyncClass::Fsync };
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(
+        &dir.path().join("hk-expiry.db"),
+        opts(true, class).with_branch_lease(Some(std::time::Duration::from_millis(50))),
+    );
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    trunk.create_branch_async("warm").unwrap();
+    let held = db.branch_housekeeping_hold(true);
+    let leased = trunk.fork_branch().unwrap().into_id();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    trunk.create_branch_async("after-expiry").unwrap();
+    let still = db.branch_ids().unwrap().contains(&leased);
+    db.branch_housekeeping_hold(false);
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < until && db.branch_ids().unwrap().contains(&leased) {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let reaped = !db.branch_ids().unwrap().contains(&leased);
+    assert!(held, "premise: the housekeeping thread was held");
+    assert!(still, "CLAIM: the async create ran no expiry pass of its own (the expired branch was reaped inline)");
+    assert!(reaped, "CLAIM: the housekeeping thread reaped the expired branch within 10 s");
+}
+
 /// engine-rev-qaf-fix2 MED 8 (ASYNC-DESIGN §8): a connection already open on an async create whose
 /// flight then fails stops reading it. resolve_into refused only an in-doubt branch, so the open
 /// connection read on, and its status stayed NotYetDurable for good.
