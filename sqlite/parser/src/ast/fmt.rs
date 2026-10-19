@@ -768,6 +768,7 @@ impl ToTokens for Stmt {
                 if_not_exists,
                 domain_name,
                 base_type,
+                base_type_params,
                 default,
                 not_null,
                 constraints,
@@ -782,6 +783,16 @@ impl ToTokens for Stmt {
                 s.append(TK_ID, Some(domain_name))?;
                 s.append(TK_AS, None)?;
                 s.append(TK_ID, Some(base_type))?;
+                if !base_type_params.is_empty() {
+                    s.append(TK_LP, None)?;
+                    for (i, p) in base_type_params.iter().enumerate() {
+                        if i > 0 {
+                            s.append(TK_COMMA, None)?;
+                        }
+                        p.to_tokens(s, context)?;
+                    }
+                    s.append(TK_RP, None)?;
+                }
                 if let Some(ref def) = default {
                     s.append(TK_DEFAULT, None)?;
                     def.to_tokens(s, context)?;

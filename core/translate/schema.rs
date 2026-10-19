@@ -2925,6 +2925,7 @@ fn build_create_type_sql(name: &str, body: &ast::CreateTypeBody) -> String {
 pub fn translate_create_domain(
     domain_name: &str,
     base_type: &str,
+    base_type_params: &[Box<ast::Expr>],
     not_null: bool,
     constraints: &[ast::DomainConstraint],
     default: Option<Box<ast::Expr>>,
@@ -2981,6 +2982,21 @@ pub fn translate_create_domain(
             .resolve_base_type_chain(&base_normalized)?;
     }
 
+    // The base type's parameters (fastest-wire 73ca2b720): as many as the base type declares, each
+    // a constant (a column type's are signed literals); a primitive takes none.
+    if !base_type_params.is_empty() {
+        let declared = resolver
+            .schema()
+            .get_type_def_unchecked(&base_normalized)
+            .map_or(0, |td| td.user_params().count());
+        if is_primitive || base_type_params.len() > declared {
+            bail_parse_error!(
+                "base type \"{base_type}\" takes {declared} parameter(s), {} given",
+                base_type_params.len()
+            );
+        }
+    }
+
     // Validate CHECK and DEFAULT expressions (reject subqueries, aggregates, etc.)
     for c in constraints {
         validate_type_expr(&c.check, "domain CHECK", resolver)?;
@@ -2992,6 +3008,10 @@ pub fn translate_create_domain(
     // Build the CREATE DOMAIN SQL for persistence
     let sql = {
         let mut s = format!("CREATE DOMAIN {normalized_name} AS {base_type}");
+        if !base_type_params.is_empty() {
+            let params: Vec<String> = base_type_params.iter().map(|p| p.to_string()).collect();
+            s.push_str(&format!("({})", params.join(", ")));
+        }
         if let Some(ref def) = default {
             s.push_str(&format!(" DEFAULT {def}"));
         }

@@ -4793,6 +4793,9 @@ impl PostgreSQLTranslator {
             if_not_exists: false,
             domain_name,
             base_type,
+            // fastest-engine: the base type's parameters (core takes them since the domain-parameters
+            // fix); none here until fastest-wire passes the PostgreSQL type's modifiers.
+            base_type_params: Vec::new(),
             default,
             not_null,
             constraints,

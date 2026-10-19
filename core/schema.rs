@@ -355,6 +355,10 @@ pub struct TypeDef {
     /// CHECK constraints from CREATE DOMAIN, stored as first-class data.
     /// Empty for regular CREATE TYPE definitions.
     pub domain_checks: std::vec::Vec<ast::DomainConstraint>,
+    /// A domain's base type parameters (`CREATE DOMAIN dn AS numeric(8, 2)`): what its base type's
+    /// ENCODE and DECODE read for their parameters when the column names the domain with none of its
+    /// own (`emit_type_expr`). Empty otherwise.
+    pub domain_base_params: std::vec::Vec<Box<ast::Expr>>,
     pub kind: TypeDefKind,
 }
 
@@ -481,6 +485,7 @@ impl TypeDef {
                 is_domain: false,
                 sql,
                 domain_checks: std::vec::Vec::new(),
+                domain_base_params: std::vec::Vec::new(),
                 kind: TypeDefKind::Custom {
                     params: params.clone(),
                     base: base.clone(),
@@ -506,6 +511,7 @@ impl TypeDef {
                     is_domain: false,
                     sql,
                     domain_checks: std::vec::Vec::new(),
+                    domain_base_params: std::vec::Vec::new(),
                     kind: TypeDefKind::Struct(StructDef {
                         fields: struct_fields,
                     }),
@@ -535,6 +541,7 @@ impl TypeDef {
                     is_domain: false,
                     sql,
                     domain_checks: std::vec::Vec::new(),
+                    domain_base_params: std::vec::Vec::new(),
                     kind: TypeDefKind::Union(UnionDef {
                         // Arc<[T]> is a shared-pointer boundary: collect directly,
                         // skipping the intermediate allocator Vec.
@@ -551,6 +558,7 @@ impl TypeDef {
     pub fn from_domain(
         domain_name: &str,
         base_type: &str,
+        base_type_params: std::vec::Vec<Box<ast::Expr>>,
         not_null: bool,
         constraints: &[ast::DomainConstraint],
         default: Option<Box<ast::Expr>>,
@@ -563,6 +571,7 @@ impl TypeDef {
             is_domain: true,
             sql,
             domain_checks: constraints.to_vec(),
+            domain_base_params: base_type_params,
             kind: TypeDefKind::Custom {
                 params: std::vec::Vec::new(),
                 base: base_type.to_string(),
@@ -1119,6 +1128,7 @@ impl Schema {
             Ok(Some(Cmd::Stmt(Stmt::CreateDomain {
                 domain_name,
                 base_type,
+                base_type_params,
                 default,
                 not_null,
                 constraints,
@@ -1127,6 +1137,7 @@ impl Schema {
                 let type_def = TypeDef::from_domain(
                     &domain_name,
                     &base_type,
+                    base_type_params,
                     not_null,
                     &constraints,
                     default,

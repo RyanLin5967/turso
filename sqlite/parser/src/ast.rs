@@ -208,6 +208,8 @@ pub enum Stmt {
         domain_name: String,
         /// base type (primitive or another domain/custom type)
         base_type: String,
+        /// the base type's parameters, as `numeric(8, 2)` gives them (fastest-wire 73ca2b720)
+        base_type_params: Vec<Box<Expr>>,
         /// default expression
         default: Option<Box<Expr>>,
         /// NOT NULL constraint

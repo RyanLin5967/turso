@@ -700,6 +700,30 @@ pub(super) fn emit_domain_cast_constraints(
     Ok(())
 }
 
+/// The parameters the domain chain from `type_name` gives `type_def`: the base parameters of the
+/// domain whose base is `type_def` (`TypeDef::domain_base_params`), or none.
+/// Mutant `domain_params_ignored` (test builds only): none, as before.
+fn domain_base_params(resolver: &Resolver, type_name: &str, type_def: &TypeDef) -> Vec<Box<ast::Expr>> {
+    if crate::branch::store::fe_mutant("domain_params_ignored") {
+        return Vec::new();
+    }
+    let schema = resolver.schema();
+    let target = crate::schema::type_key(&type_def.name);
+    let mut current = schema.get_type_def_unchecked(type_name);
+    // A chain is acyclic (CREATE DOMAIN refuses a cycle); the bound only guards a corrupt registry.
+    for _ in 0..64 {
+        let Some(td) = current else { break };
+        if !td.is_domain {
+            break;
+        }
+        if crate::schema::type_key(td.base()) == target {
+            return td.domain_base_params.clone();
+        }
+        current = schema.get_type_def_unchecked(td.base());
+    }
+    Vec::new()
+}
+
 /// Emit bytecode for a custom type encode/decode expression.
 /// Sets up `value` to reference `value_reg`, and type parameter overrides
 /// from `column.ty_params` matched against `type_def.params`.
@@ -722,8 +746,17 @@ pub(crate) fn emit_type_expr(
         // Skip `value` param (already handled above); match remaining params
         // against the user-provided ty_params by position.
         let user_params: Vec<_> = type_def.user_params().collect();
+        // A column naming a domain with no parameters of its own takes the ones its domain gave
+        // this type (`CREATE DOMAIN dn AS numeric(8, 2)`; fastest-wire 73ca2b720).
+        let domain_params;
+        let params: &[Box<ast::Expr>] = if column.ty_params.is_empty() {
+            domain_params = domain_base_params(resolver, &column.ty_str, type_def);
+            &domain_params
+        } else {
+            &column.ty_params
+        };
         for (i, param) in user_params.iter().enumerate() {
-            if let Some(param_expr) = column.ty_params.get(i) {
+            if let Some(param_expr) = params.get(i) {
                 let reg = program.alloc_register();
                 translate_expr(program, None, param_expr, reg, resolver)?;
                 program.id_register_overrides.insert(&param.name, reg);
