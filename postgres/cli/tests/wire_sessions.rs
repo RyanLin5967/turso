@@ -17363,6 +17363,47 @@ fn a_qualified_name_names_its_schema_as_written() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-4a1934c89-beb4 LOW-4 (its PG 18.6 probe #30): an UPDATE's WHERE is analysed before its SET, as
+/// transformUpdateStmt does, so `UPDATE mix SET v = $1 WHERE x = $1` describes $1 as x's numeric (1700), not v's
+/// varchar (1043), and the row x = 1 is updated.
+#[test]
+fn an_update_types_its_parameters_by_where_before_set() {
+    let dir = Scratch::new("upd-where-first");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in ["CREATE TABLE mix(id int PRIMARY KEY, x numeric(6,2), v varchar(3))", "INSERT INTO mix VALUES (1, 1, 'a')"] {
+        a.q(sql).ok(sql);
+    }
+    let sql = "UPDATE mix SET v = $1 WHERE x = $1";
+    let r = a.describe_statement(sql);
+    assert_eq!((r.params.clone(), r.error.clone()), (Some(vec![1700]), None), "Describe: PG params [1700]");
+    let r = a.x_undeclared(sql, &["1"]);
+    assert_eq!((r.tags.last().cloned(), r.error.clone()), (Some("UPDATE 1".to_string()), None), "PG updates the row x = 1");
+}
+
+/// wire-rev-4a1934c89-beb4 LOW-5 (its PG 18.6 probe #330-#337): numeric(p, s)'s precision is bounded 1 to 1000 wherever
+/// it is written, 22023 'NUMERIC precision 1001 must be between 1 and 1000' with no 'Parse error: ' prefix: CREATE
+/// DOMAIN dnum AS numeric(1001,2) was made, and CREATE TABLE and ADD COLUMN carried the prefix.
+#[test]
+fn a_numeric_precision_past_1000_is_22023_everywhere() {
+    let dir = Scratch::new("num-prec");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE nt2(n numeric(1000,2))").ok("numeric(1000,2) is allowed");
+    let mut wrong = Vec::new();
+    for sql in [
+        "CREATE TABLE nt(n numeric(1001,2))",
+        "ALTER TABLE nt2 ADD COLUMN m numeric(1001,0)",
+        "CREATE DOMAIN dnum AS numeric(1001,2)",
+    ] {
+        let r = a.q(sql);
+        if !r.error.as_ref().is_some_and(|e| e.code == "22023" && e.message == "NUMERIC precision 1001 must be between 1 and 1000") {
+            wrong.push(format!("{sql}: PG 22023 'NUMERIC precision 1001 must be between 1 and 1000'; got {:?}", r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-351702a43 LOW-6 (its PG 18.6 probe3 #161): a CASE is typed by its results (an int4 constant and an int4
 /// function: 23); the walk never typed a CASE column, and the engine announced it text (25).
 #[test]
