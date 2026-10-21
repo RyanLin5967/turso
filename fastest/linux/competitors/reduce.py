@@ -199,7 +199,8 @@ def selftest():
     # linux-rev-fc20226b9 LOW 4: a skipped case is N/A (rc 3), never a pass, and an unexpected success is a failure
     n, na = r.testsRun, len(r.skipped)
     bad = len(r.failures) + len(r.errors) + len(r.unexpectedSuccesses)
-    print(f"TALLY ran={n} pass={n - bad - na} na={na} fail={bad}")
+    # tally's ran is pass + fail: unittest's testsRun includes the skipped cases, so they come off it (linux-rev-9d6de652f LOW 1)
+    print(f"TALLY ran={n - na} pass={n - bad - na} na={na} fail={bad}")
     return 1 if bad or not n else 3 if na else 0
 
 
