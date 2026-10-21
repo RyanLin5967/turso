@@ -19,10 +19,15 @@ claim before the stop is a warm-up op, so warm_ops == stop_at.
 
   warmup_conformance.py run [--bbload BIN] [--clonebench BIN] [--fastest-profile BIN] [--record FILE]
         exit 0: all three given and every one matches every case; 3: every given one matches, but not all three
-        were given (PARTIAL, never a conformance verdict); 1: a mismatch; 2: refused (none given, a driver missing,
-        two roles naming one file or one sha256, timed out, or printing anything but one result line). Each
-        driver is reported by realpath and sha256; --record writes the verdict as JSON (rc, verdict, cases, and per
-        role path, realpath, sha256), which summarize binds to the binaries a package ran (review 5 MED 6, 7)
+        were given (PARTIAL, never a conformance verdict); 1: a mismatch; 2: refused (none given, a driver missing
+        or named without a "/", two roles with one sha256, a driver file changed during its replays, timed out,
+        printing anything but one result line, or a record that cannot be written). Each driver is hashed once and
+        every replay runs that realpath, re-hashed after (review 6 MED 3, LOW 13); --record writes the verdict as JSON
+        (rc, verdict, cases, and per role path, realpath, sha256), which summarize.py's conformance_problems binds to
+        the sha256 of each binary in the package's binaries.txt (review 5 MED 6, 7; t3run's envchecks writes it).
+        Blind spot: a wrapper script that execs another role's binary has its own sha256, so the same-driver refusal
+        cannot see it; t3run passes the built $DIST binaries, never a wrapper, and summarize's sha256 binding names
+        those
   warmup_conformance.py live BIN RECORD
         a run's LIVE decision (RECORD: {rule, claims_ns, stop_at, warm_ops, capped}, the claims it judged and what it
         decided) replayed through the same BIN's --warmup-replay: 0 the same decision, 1 different, 2 refused (review
@@ -109,32 +114,44 @@ def replay(binary, rule, trace, timeout=60):
 
 
 def identity(binary):
-    """(realpath, sha256) of a driver binary; OSError when it cannot be read"""
-    rp = os.path.realpath(binary)
+    """(realpath, sha256) of a driver binary, read in 1 MiB chunks; OSError when it cannot be read"""
+    rp, h = os.path.realpath(binary), hashlib.sha256()
     with open(rp, "rb") as f:
-        return rp, hashlib.sha256(f.read()).hexdigest()
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return rp, h.hexdigest()
 
 
 VERDICTS = {0: "PASS", 1: "FAIL", 2: "REFUSED", 3: "PARTIAL"}
 
 
 def run(drivers, record=None, timeout=60):
-    """drivers: {role: binary}; returns (rc, report lines). Each role's binary is named by realpath and sha256, and
-    two roles resolving to one file or to one sha256 are REFUSED (review 5 MED 7: the same binary under all three roles
-    gave rc 0). RECORD, when given, receives the verdict as JSON: rc, verdict, the case count, and per role its path,
-    realpath and sha256, so a package can bind the verdict to the binaries it ran (review 5 MED 6)."""
+    """drivers: {role: binary}; returns (rc, report lines). Each role's binary is hashed once (realpath, sha256),
+    every replay runs that realpath, and every role is re-hashed after its replays, so the verdict is about the bytes
+    named (review 6 MED 3, LOW 13). A bare name (no "/": hashed under the cwd, run through PATH) is REFUSED, and so
+    are two roles with one sha256 (review 5 MED 7: the same binary under all three roles gave rc 0; one realpath is
+    one sha256, so the sha256 alone decides, review 6 LOW 20). RECORD, when given, receives the verdict as JSON: rc,
+    verdict, the case count, and per role its path, realpath and sha256, so a package can bind the verdict to the
+    binaries it ran (review 5 MED 6); a record that cannot be written is rc 2."""
     out, bad, ids = [], 0, {}
 
     def done(rc, lines):
         if record:
-            with open(record, "w") as f:
-                json.dump({"rc": rc, "verdict": VERDICTS[rc], "cases": len(CASES),
-                           "drivers": {r: {"path": drivers[r], "realpath": ids[r][0], "sha256": ids[r][1]}
-                                       for r in ids}, "report": lines[-1] if lines else ""}, f, indent=1)
+            try:
+                with open(record, "w") as f:
+                    json.dump({"rc": rc, "verdict": VERDICTS[rc], "cases": len(CASES),
+                               "drivers": {r: {"path": drivers[r], "realpath": ids[r][0], "sha256": ids[r][1]}
+                                           for r in ids}, "report": lines[-1] if lines else ""}, f, indent=1)
+            except OSError as e:
+                return 2, lines + [f"warmup conformance: REFUSED: cannot write the record {record}: {e}"]
         return rc, lines
 
     if not drivers:
         return done(2, ["warmup conformance: REFUSED: no driver given"])
+    bare = sorted(r for r, b in drivers.items() if "/" not in b)
+    if bare:
+        return done(2, [f"warmup conformance: REFUSED: {', '.join(bare)} given as a bare name (hashed under the cwd, "
+                        "run through PATH: not one file); name the driver by a path"])
     try:
         for role, binary in drivers.items():
             ids[role] = identity(binary)
@@ -143,14 +160,15 @@ def run(drivers, record=None, timeout=60):
     roles = sorted(ids)
     for i, a in enumerate(roles):
         for b in roles[i + 1:]:
-            if ids[a][0] == ids[b][0] or ids[a][1] == ids[b][1]:
+            if ids[a][1] == ids[b][1]:
                 return done(2, [f"warmup conformance: REFUSED: {a} and {b} are the same driver ({ids[a][0]}, sha256 "
                                 f"{ids[a][1][:12]}...): one verdict cannot stand for two drivers"])
     for role in roles:
         out.append(f"warmup conformance: driver {role}: {ids[role][0]} sha256 {ids[role][1]}")
     got = {}
     try:
-        for name, binary in drivers.items():
+        for name in drivers:
+            binary = ids[name][0]
             for case, rule, trace, want in CASES:
                 g = replay(binary, rule, trace, timeout)
                 got[(name, case)] = g
@@ -163,6 +181,15 @@ def run(drivers, record=None, timeout=60):
                 out.append(f"warmup conformance {'PASS' if ok else 'FAIL'}: {name}: must refuse {rule!r} ({why})")
     except Refused as e:
         return done(2, out + [f"warmup conformance: REFUSED: {e}"])
+    for role in roles:
+        try:
+            now = identity(ids[role][0])[1]
+        except OSError as e:
+            return done(2, out + [f"warmup conformance: REFUSED: {role}'s driver cannot be re-read after its replays: {e}"])
+        if now != ids[role][1]:
+            return done(2, out + [f"warmup conformance: REFUSED: {role}'s driver {ids[role][0]} changed during its "
+                                  f"replays (sha256 {ids[role][1][:12]}... then {now[:12]}...): the verdict is about "
+                                  "no one file"])
     names = sorted(drivers)
     for case, _, _, _ in CASES:  # pairwise, so a report names who disagrees with whom even when both are wrong
         vals = {n: got[(n, case)] for n in names}
@@ -232,9 +259,11 @@ print(f"stop_at=none warm_ops={{claimed}} capped=none")
 
 
 def _safe(f):
+    """a case evaluated inside a guard: an exception is that case's FAIL, printed with its type and text"""
     try:
         return bool(f())
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        print(f"WARMUP-CONFORMANCE self-test case raised {type(e).__name__}: {e}")
         return False
 
 
@@ -364,9 +393,55 @@ def _self_test(d):
     cases.append(("MED 8: a live record whose claims go back in time is REFUSED (rc 2)",
                   _safe(lambda: live_rc({"rule": "5:2:180", "claims_ns": [0, 2 * S, S], "stop_at": None,
                                          "warm_ops": 3, "capped": None}) == 2), ""))
+    # review 6 MED 3: a record that cannot be written is a refusal (rc 2), never a mismatch's rc 1 or a traceback
+    cases.append(("MED 3: an unwritable --record path is REFUSED (rc 2)",
+                  _safe(lambda: run({"bbload": good_b, "clonebench": good_c, "fastest_profile": good},
+                                    record=os.path.join(d, "no-such-dir", "record.json"))[0] == 2), ""))
+    # review 6 LOW 13: the verdict is about the bytes it hashed, so run() replays those bytes (the hashed realpath),
+    # refuses a bare name (hashed under the cwd, run through PATH), and re-hashes every role after its replays
+    def variant(name, extra):
+        """the correct fake with EXTRA python run first, each time it runs"""
+        p = os.path.join(d, name)
+        with open(p, "w") as f:
+            f.write(open(good).read().replace("import sys\n", "import sys\n" + extra, 1))
+        os.chmod(p, 0o755)
+        return p
+    pathdir = os.path.join(d, "bin")
+    os.makedirs(pathdir)
+    shutil.copyfile(fake(d, "gt-onpath", cmp=">"), os.path.join(pathdir, "drv"))
+    os.chmod(os.path.join(pathdir, "drv"), 0o755)
+    shutil.copyfile(fake(d, "good-cwd"), os.path.join(d, "drv"))
+    os.chmod(os.path.join(d, "drv"), 0o755)
+    cwd, path0 = os.getcwd(), os.environ.get("PATH", "")
+    try:
+        os.chdir(d)
+        os.environ["PATH"] = pathdir + os.pathsep + path0
+        rc, rep = run({"bbload": good_b, "clonebench": good_c, "fastest_profile": "drv"})
+    finally:
+        os.chdir(cwd)
+        os.environ["PATH"] = path0
+    cases.append(("LOW 13: a bare driver name (./drv hashed, PATH's drv run) is REFUSED (rc 2)",
+                  rc == 2 and "bare name" in rep[-1], rep[-1]))
+    selfmod = variant("selfmod", "open(sys.argv[0], 'a').write('# ran\\n')\n")
+    rc, rep = run({"bbload": good_b, "clonebench": good_c, "fastest_profile": selfmod})
+    cases.append(("LOW 13: a driver whose file changes between its hash and its replays is REFUSED (rc 2)",
+                  rc == 2 and "changed" in rep[-1], rep[-1]))
+    link = os.path.join(d, "fp-link")
+    swapper = variant("swapper", "import os\n"
+                      f"os.symlink({fake(d, 'gt-swapped', cmp='>')!r}, {link + '.tmp'!r}); os.replace({link + '.tmp'!r}, {link!r})\n")
+    os.symlink(swapper, link)
+    rc, rep = run({"bbload": good_b, "clonebench": good_c, "fastest_profile": link})
+    cases.append(("LOW 13: a role given as a symlink is replayed at the realpath it was hashed at, not the link "
+                  "re-pointed mid-run (rc 0)", rc == 0, rep[-1]))
+    alias = os.path.join(d, "alias-of-bbload")
+    os.symlink(good_b, alias)
+    rc, rep = run({"bbload": good_b, "clonebench": good_c, "fastest_profile": alias})
+    cases.append(("LOW 13: a symlink to another role's driver is REFUSED (rc 2, the same driver)",
+                  rc == 2 and "same" in rep[-1], rep[-1]))
     bad = [n for n, ok, _ in cases if not ok]
     for n, ok, last in cases:
         print(f"WARMUP-CONFORMANCE self-test {'PASS' if ok else 'FAIL'}: {n}" + ("" if ok else f" ({last})"))
+    print(f"TALLY ran={len(cases)} pass={len(cases) - len(bad)} na=0 fail={len(bad)}")  # gates/tally.py
     print(f"WARMUP-CONFORMANCE SELF-TEST {len(cases) - len(bad)}/{len(cases)} {'PASS' if not bad else 'FAIL'}")
     return 0 if not bad else 1
 
