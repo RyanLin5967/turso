@@ -17121,6 +17121,45 @@ fn a_varchar_cast_through_a_view_or_derived_table_is_a_string_column() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-1de981755-rest LOW-3 (its PG 18.6 probe #210-#220): a function name is matched as written, so a quoted name
+/// with an upper-case letter or a public-qualified one names no function, 42883 with its arguments' types; only min
+/// and max were judged, so "LENGTH"('abc'), "COUNT"(*), "SUM"(a), "Upper"('a') and public.length('abc') answered, and
+/// "MAX"(NULL) answered NULL.
+#[test]
+fn a_function_name_is_matched_as_written() {
+    let dir = Scratch::new("fn-as-written");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in ["CREATE TABLE ft2(a int)", "INSERT INTO ft2 VALUES (1), (2)"] {
+        a.q(sql).ok(sql);
+    }
+    let cases: Vec<(&str, Result<Vec<&str>, &str>)> = vec![
+        ("SELECT \"max\"(a) AS a FROM ft2", Ok(vec!["2"])),
+        ("SELECT pg_catalog.max(a) AS a FROM ft2", Ok(vec!["2"])),
+        ("SELECT public.max(a) AS a FROM ft2", Err("function public.max(integer) does not exist")),
+        ("SELECT \"LENGTH\"('abc') AS a", Err("function LENGTH(unknown) does not exist")),
+        ("SELECT pg_catalog.\"length\"('abc') AS a", Ok(vec!["3"])),
+        ("SELECT \"COUNT\"(*) AS a FROM ft2", Err("function COUNT() does not exist")),
+        ("SELECT \"SUM\"(a) AS a FROM ft2", Err("function SUM(integer) does not exist")),
+        ("SELECT \"MAX\"(NULL) AS a", Err("function MAX(unknown) does not exist")),
+        ("SELECT Max(a) AS a FROM ft2", Ok(vec!["2"])),
+        ("SELECT \"Upper\"('a') AS a", Err("function Upper(unknown) does not exist")),
+        ("SELECT public.length('abc') AS a", Err("function public.length(unknown) does not exist")),
+    ];
+    let mut wrong = Vec::new();
+    for (sql, want) in &cases {
+        let r = a.q(sql);
+        let agrees = match want {
+            Ok(rows) => r.error.is_none() && r.rows == rows.iter().map(|v| vec![Some(v.to_string())]).collect::<Vec<_>>(),
+            Err(message) => r.error.as_ref().is_some_and(|e| e.code == "42883" && e.message == *message),
+        };
+        if !agrees {
+            wrong.push(format!("{sql}: PG {want:?}; got {:?} {:?}", r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-351702a43 LOW-6 (its PG 18.6 probe3 #161): a CASE is typed by its results (an int4 constant and an int4
 /// function: 23); the walk never typed a CASE column, and the engine announced it text (25).
 #[test]
