@@ -16575,7 +16575,7 @@ fn the_time_functions_keep_postgresqls_volatility() {
     if r.rows != vec![vec![Some("1".to_string()), Some("2".to_string())]] {
         wrong.push(format!("one block: distinct now() and statement_timestamp() {:?} {:?}, PostgreSQL 1 and 2", r.rows, r.error));
     }
-    let r = a.q("SELECT count(DISTINCT clock_timestamp()::text) > 1 FROM generate_series(1, 300000)");
+    let r = a.q("SELECT count(DISTINCT clock_timestamp()::text) > 1 FROM generate_series(1, 3000)");
     if r.rows != vec![vec![Some("t".to_string())]] {
         wrong.push(format!("clock_timestamp() within a query: {:?} {:?}, PostgreSQL t", r.rows, r.error));
     }
