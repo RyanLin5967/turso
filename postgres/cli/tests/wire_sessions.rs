@@ -17404,6 +17404,43 @@ fn a_numeric_precision_past_1000_is_22023_everywhere() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-4a1934c89-beb4 LOW-1 and LOW-2 (its PG 18.6 probe #36, #41, #47, #55-#57, #67, #68): a bound array for a
+/// varchar(3)[] column is read as array_in reads it at Bind: a backslash escapes in an unquoted element too ('{a\b\c}'
+/// is abc, '{ab\,c}' the one element 'ab,c', 22001), an escaped trailing blank is kept and an unescaped one dropped,
+/// a dimension decoration is read past, and ARRAY[$1] is folded with the bound value: 22001 at Bind where PG refuses,
+/// never where PG binds. The elements PG then stores are the engine's to cut (a known red), so a bound one is judged
+/// by its Bind alone.
+#[test]
+fn a_bound_varchar_array_is_read_as_array_in_reads_it() {
+    let dir = Scratch::new("va-bind");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE va(id int PRIMARY KEY, a varchar(3)[])").ok("create");
+    let long = "value too long for type character varying(3)";
+    let mut wrong = Vec::new();
+    for (k, (sql, value, refused)) in [
+        ("INSERT INTO va VALUES ($2, $1)", r"{a\b\c}", false),
+        ("INSERT INTO va VALUES ($2, $1)", r"{ab\,c}", true),
+        ("INSERT INTO va VALUES ($2, $1)", r"{abc\ }", false),
+        ("INSERT INTO va VALUES ($2, $1)", r"{ab\ \ }", false),
+        ("INSERT INTO va VALUES ($2, $1)", "[1:1]={abcd}", true),
+        ("INSERT INTO va VALUES ($2, $1)", "{{abcd},{ef}}", true),
+        ("INSERT INTO va VALUES ($2, ARRAY[$1])", "abcd", true),
+        ("INSERT INTO va VALUES ($2, ARRAY[$1]::varchar[])", "abcd", true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let id = (k + 1).to_string();
+        let r = a.x_undeclared(sql, &[value, &id]);
+        let too_long = r.error.as_ref().is_some_and(|e| e.code == "22001" && e.message == long);
+        if too_long != refused {
+            wrong.push(format!("{sql} with {value}: PG {}; got {:?} {:?}", if refused { "22001 at Bind" } else { "bound" }, r.tags, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-351702a43 LOW-6 (its PG 18.6 probe3 #161): a CASE is typed by its results (an int4 constant and an int4
 /// function: 23); the walk never typed a CASE column, and the engine announced it text (25).
 #[test]
