@@ -2611,6 +2611,20 @@ fn folded_probe(node: &PgNode) -> Option<String> {
                     && c.arg.as_deref().is_some_and(|a| pure(a, params))
             }
             Node::CoalesceExpr(c) => all(&c.args, params),
+            // A CASE, a boolean combination and a NULL test over pure parts fold too
+            // (wire-rev-351702a43 LOW-2: a CASE was left to Execute).
+            Node::CaseExpr(c) => {
+                c.arg.as_deref().is_none_or(|a| pure(a, params))
+                    && c.args.iter().all(|w| match w.node.as_ref() {
+                        Some(Node::CaseWhen(w)) => {
+                            w.expr.as_deref().is_some_and(|e| pure(e, params)) && w.result.as_deref().is_some_and(|r| pure(r, params))
+                        }
+                        _ => false,
+                    })
+                    && c.defresult.as_deref().is_none_or(|d| pure(d, params))
+            }
+            Node::BoolExpr(b) => all(&b.args, params),
+            Node::NullTest(t) => t.arg.as_deref().is_some_and(|a| pure(a, params)),
             _ => false,
         }
     }
