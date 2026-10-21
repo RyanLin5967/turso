@@ -17287,6 +17287,44 @@ fn now_with_an_argument_names_no_function() {
     assert_eq!((e.code.as_str(), e.message.as_str()), ("42883", "function now(integer) does not exist"));
 }
 
+/// wire-rev-1de981755-numeric MED-1 (its PG 18.6 probe9 #1-#7): a text column cast to an integer is read as int4in
+/// reads text, 22P02 'invalid input syntax for type integer: "2.5"' for anything but an integer, while numeric,
+/// numeric(p, s) and float8 columns round. da5854802's decimal-text arm rounded the text '2.5' to 3 and the engine's
+/// cast read '1e3' as 1.
+#[test]
+fn a_text_column_cast_to_an_integer_is_read_as_int4in_reads_it() {
+    let dir = Scratch::new("text-int");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE TABLE cb(id int PRIMARY KEY, n numeric, p numeric(10,2), f float8, s text)",
+        "INSERT INTO cb VALUES (1, 2.5, 2.5, 2.5, '2.5'), (2, 3.5, 3.5, 3.5, '3.5'), (3, -2.5, -2.5, -2.5, '1e3'), (4, 0.5, 0.5, 0.5, ' 7 ')",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    let r = a.q("SELECT id, n::int, p::int, f::int FROM cb ORDER BY id");
+    let want: Vec<Vec<Option<String>>> = [["1", "3", "3", "2"], ["2", "4", "4", "4"], ["3", "-3", "-3", "-2"], ["4", "1", "1", "0"]]
+        .iter()
+        .map(|row| row.iter().map(|v| Some(v.to_string())).collect())
+        .collect();
+    if r.error.is_some() || r.rows != want {
+        wrong.push(format!("numeric and float casts: PG {want:?}; got {:?} {:?}", r.rows, r.error));
+    }
+    for (id, want) in [(1, Err("invalid input syntax for type integer: \"2.5\"")), (3, Err("invalid input syntax for type integer: \"1e3\"")), (4, Ok("7"))] {
+        let sql = format!("SELECT id, s::int FROM cb WHERE id = {id}");
+        let r = a.q(&sql);
+        let agrees = match want {
+            Ok(v) => r.error.is_none() && r.rows == vec![vec![Some(id.to_string()), Some(v.to_string())]],
+            Err(m) => r.error.as_ref().is_some_and(|e| e.code == "22P02" && e.message == m),
+        };
+        if !agrees {
+            wrong.push(format!("{sql}: PG {want:?}; got {:?} {:?}", r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-351702a43 LOW-6 (its PG 18.6 probe3 #161): a CASE is typed by its results (an int4 constant and an int4
 /// function: 23); the walk never typed a CASE column, and the engine announced it text (25).
 #[test]
