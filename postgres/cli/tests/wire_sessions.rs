@@ -13318,8 +13318,8 @@ replays_postgresql!(
     "pg18-c33-engineerr.out",
     [
         (7, "PGDIV-SUM-INT8-NUMERIC value [engine]: sum(bigint) past int8: ours 22003 'integer overflow'; PG answers numeric 9223372036854775808"),
-        (8, "PGDIV-INT-RANGE value [engine]: SILENT: v + 1 past int8 answers '9.223372036854776e+18' typed 23; PG 20 then 22003"),
-        (9, "PGDIV-INT-RANGE value [engine]: SILENT: v * 2 answers '1.8446744073709552e+19' typed 23; PG 20 then 22003"),
+        (8, "PGDIV-INT-RANGE error-step [engine]: v + 1 past int8 is 22003 bigint out of range as PG; PG sends the RowDescription (20) first, ours refuses at the first row before it (the wire's range guard)"),
+        (9, "PGDIV-INT-RANGE error-step [engine]: v * 2 past int8 is 22003 bigint out of range as PG; PG sends the RowDescription (20) first, ours refuses before it (the wire's range guard)"),
         (10, "PGDIV-INT-RANGE value [engine]: SILENT: abs(-9223372036854775808::int8) answers 9223372036854775807 typed 25; PG 22003"),
         (11, "PGDIV-INT-RANGE value [engine]: SILENT: abs(v - max - max - 2) answers '9.223372036854776e+18' typed 25; PG 20 then 22003"),
         (14, "PGDIV-INT-RANGE error-step [engine]: v + 1 past int8 inside a block is 22003 bigint out of range and aborts it, as PG; PG sends the RowDescription first, ours refuses at the first row before it (the wire's range guard, wire-rev-7128c6f73 L3)"),
@@ -13424,7 +13424,6 @@ replays_postgresql!(
     "pg18-infcast.out",
     [
         (2, "PGDIV-NAN ours-only [ours-only]: 'NaN'::float8 refused 0A000 (engine holds no NaN); PG answers t, t"),
-        (3, "PGDIV-PARSE-PREFIX error-text [wire]: 22P02 both; ours prefixes 'Parse error: '"),
     ]
 );
 replays_postgresql!(
@@ -13547,17 +13546,16 @@ replays_postgresql!(
     pg18_c33_intrange_replays_as_postgresql_answered,
     "pg18-c33-intrange.out",
     [
-        (4, "PGDIV-INT-RANGE value [engine]: SILENT: -9223372036854775808::int8 (cast binds before minus, so 2^63 overflows) answers -9223372036854775807 typed 23; PG 22003 bigint out of range"),
+        (4, "PGDIV-INT-RANGE value [engine]: SILENT: -9223372036854775808::int8 (cast binds before minus, so 2^63 overflows) answers -9223372036854775807 typed 20; PG 22003 bigint out of range"),
         (5, "PGDIV-INT-RANGE value [engine]: SILENT: abs(-9223372036854775808::int8) answers 9223372036854775807 typed 25; PG 22003"),
-        (6, "PGDIV-INT-RANGE value [engine]: SILENT: '9223372036854775808'::int8 clamps to 9223372036854775807 typed 23; PG 22003 out of range for type bigint"),
-        (7, "PGDIV-INT-RANGE value [engine]: SILENT: 9223372036854775807 + 1 answers float '9.223372036854776e+18' typed 23; PG 22003 bigint out of range"),
-        (8, "PGDIV-INT-RANGE value [engine]: SILENT: bigint column v + 1 answers '9.223372036854776e+18' typed 23; PG RowDescription 20 then 22003"),
-        (9, "PGDIV-INT-RANGE value [engine]: SILENT: v * 2 answers '1.8446744073709552e+19' typed 23; PG 20 then 22003"),
-        (10, "PGDIV-INT-RANGE value [engine]: SILENT: -v - 2 answers '-9.223372036854776e+18' typed 23; PG 20 then 22003"),
-        (12, "PGDIV-INT-RANGE value [engine]: SILENT: int column i + 1 answers 2147483648; PG RowDescription 23 then 22003"),
-        (13, "PGDIV-INT-RANGE value [engine]: SILENT: i * 2 answers 4294967294; PG 23 then 22003"),
-        (14, "PGDIV-INT-RANGE value [engine]: SILENT: '2147483648'::int4 answers 2147483648; PG 22003 out of range for type integer"),
-        (16, "PGDIV-INT-RANGE value [engine]: SILENT: CAST(9.5e18 AS BIGINT) clamps to 9223372036854775807; PG 22003 bigint out of range"),
+        (6, "PGDIV-INT-RANGE error-text [engine]: '9223372036854775808'::int8 is 22003 as PG, saying 'integer out of range'; PG 'value \"9223372036854775808\" is out of range for type bigint'"),
+        (8, "PGDIV-INT-RANGE error-step [engine]: bigint column v + 1 is 22003 bigint out of range as PG; PG sends the RowDescription (20) first, ours refuses before it (the wire's range guard)"),
+        (9, "PGDIV-INT-RANGE error-step [engine]: v * 2 is 22003 bigint out of range as PG; PG sends the RowDescription (20) first, ours refuses before it"),
+        (10, "PGDIV-INT-RANGE error-step [engine]: -v - 2 is 22003 bigint out of range as PG; PG sends the RowDescription (20) first, ours refuses before it"),
+        (12, "PGDIV-INT-RANGE error-step [engine]: int column i + 1 is 22003 integer out of range as PG; PG sends the RowDescription (23) first, ours refuses before it"),
+        (13, "PGDIV-INT-RANGE error-step [engine]: i * 2 is 22003 integer out of range as PG; PG sends the RowDescription (23) first, ours refuses before it"),
+        (14, "PGDIV-INT-RANGE error-text [engine]: '2147483648'::int4 is 22003 as PG, saying 'integer out of range'; PG 'value \"2147483648\" is out of range for type integer'"),
+        (16, "PGDIV-INT-RANGE error-text [engine]: CAST(9.5e18 AS BIGINT) is 22003 as PG, saying 'integer out of range'; PG 'bigint out of range'"),
         (18, "PGDIV-INT-RANGE value [engine]: SILENT: INSERT of 2147483648 into an INT column succeeds; PG 22003 integer out of range"),
         (19, "PGDIV-INT-RANGE cascade [engine]: sum(i) 4294967296 vs 2147483648 because #18 stored the out-of-range row (cascade of #18)"),
         (20, "PGDIV-SUM-INT8-NUMERIC value [engine]: sum(bigint) past int8: ours 22003 'integer overflow'; PG sum(int8) is numeric and answers 9223372036854775808 typed 1700"),
@@ -16783,6 +16781,544 @@ fn interval_arithmetic_is_refused_not_answered() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-1de981755-rest HIGH-2 and MED-8 (its PG 18.6 probe #154-#176 and probe2 #33-#46; the declared-parameter,
+/// time, ORDER BY, GROUP BY and DISTINCT forms recorded on iccad2 PG 18.6, interval_time_and_timestamp_values_are_
+/// never_computed_over_text.out): the engine stores an interval as its text and has no interval arithmetic
+/// (PGDIV-INTERVAL-TEXT), so arithmetic with an interval, time or timestamp operand wherever it comes from (a column, a
+/// declared parameter, now(), a comparison in the target list), and any comparison, ordering, grouping, DISTINCT or
+/// aggregate over an interval, is refused 0A000, or answered as PostgreSQL answers it; never answered over the text.
+/// ts + $1 interval answered '2027' typed float8, time - time 1 typed float8, interval '1 day' > interval '2 hours' f,
+/// ORDER BY and max over an interval ordered its text, and count(DISTINCT i) counted '1 day' and '24 hours' apart. The
+/// cases whose interval is only a column declared interval are in interval_columns_are_never_compared_or_computed_over_text.
+#[test]
+fn interval_time_and_timestamp_values_are_never_computed_over_text() {
+    let dir = Scratch::new("interval-text");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE TABLE it1(i interval, ts timestamp, ts2 timestamp)",
+        "INSERT INTO it1 VALUES ('1 day', '2026-01-01 00:00', '2026-01-03 00:00')",
+        "CREATE TABLE it3(i interval, ts timestamp, ts2 timestamp)",
+        "INSERT INTO it3 VALUES ('1 day', '2026-01-01 00:00', '2026-01-03 00:00'), ('2 hours', '2026-01-01', '2026-01-01 01:00'), \
+         ('30 minutes', '2026-01-01', '2026-01-01')",
+        "CREATE TABLE it(i interval, ts timestamp, ts2 timestamp, tm time)",
+        "INSERT INTO it VALUES ('1 day', '2026-01-01 00:00', '2026-01-03 00:00', '10:00'), ('24 hours', '2026-01-01', \
+         '2026-01-01 01:00', '09:30'), ('30 minutes', '2026-01-01', '2026-01-01', '23:00')",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    // (statement, declared parameters (oid, value), PG 18.6's column types and rows, or its SQLSTATE)
+    type Want = Result<(Vec<u32>, Vec<Vec<&'static str>>), &'static str>;
+    let cases: Vec<(&str, Vec<(u32, &str)>, Want)> = vec![
+        ("SELECT interval '1 day' > interval '2 hours' AS a", vec![], Ok((vec![16], vec![vec!["t"]]))),
+        ("SELECT '1 day'::interval < '23 hours'::interval AS a", vec![], Ok((vec![16], vec![vec!["f"]]))),
+        ("SELECT now() + interval '1 day' > now() AS a", vec![], Ok((vec![16], vec![vec!["t"]]))),
+        ("SELECT ts2 - ts AS a FROM it1", vec![], Ok((vec![1186], vec![vec!["2 days"]]))),
+        ("SELECT count(*) FROM it1 WHERE ts2 - ts > '1 day'", vec![], Ok((vec![20], vec![vec!["1"]]))),
+        ("SELECT count(*) FROM it1 WHERE ts2 - ts > interval '1 day'", vec![], Ok((vec![20], vec![vec!["1"]]))),
+        ("SELECT count(*) FROM it1 WHERE i > interval '2 hours'", vec![], Ok((vec![20], vec![vec!["1"]]))),
+        ("SELECT -interval '1 day' AS a", vec![], Ok((vec![1186], vec![vec!["-1 days"]]))),
+        ("SELECT time '10:00' - time '09:00' AS a", vec![], Ok((vec![1186], vec![vec!["01:00:00"]]))),
+        ("SELECT ts2 - ts > interval '1 day' AS a FROM it1", vec![], Ok((vec![16], vec![vec!["t"]]))),
+        ("SELECT ts - '1 day'::interval AS a FROM it1", vec![], Ok((vec![1114], vec![vec!["2025-12-31 00:00:00"]]))),
+        ("SELECT now() + $1::interval > now() AS a", vec![(0, "1 day")], Ok((vec![16], vec![vec!["t"]]))),
+        ("SELECT now() + $1 > now() AS a", vec![(1186, "1 day")], Ok((vec![16], vec![vec!["t"]]))),
+        ("SELECT ts + $1 AS a FROM it1", vec![(1186, "1 day")], Ok((vec![1114], vec![vec!["2026-01-02 00:00:00"]]))),
+        ("SELECT $1 > interval '2 hours' AS a", vec![(1186, "1 day")], Ok((vec![16], vec![vec!["t"]]))),
+        ("SELECT $1::interval > '2 hours'::interval AS a", vec![(0, "1 day")], Ok((vec![16], vec![vec!["t"]]))),
+        (
+            "SELECT i, i < interval '3 hours' AS a FROM it3 ORDER BY ts2",
+            vec![],
+            Ok((vec![1186, 16], vec![vec!["00:30:00", "t"], vec!["02:00:00", "t"], vec!["1 day", "f"]])),
+        ),
+        ("SELECT ts2 - ts AS d FROM it3 ORDER BY ts2", vec![], Ok((vec![1186], vec![vec!["00:00:00"], vec!["01:00:00"], vec!["2 days"]]))),
+        ("SELECT count(*) FROM it3 WHERE ts2 - ts > interval '1 hour'", vec![], Ok((vec![20], vec![vec!["1"]]))),
+        ("SELECT count(*) FROM it3 WHERE i BETWEEN interval '1 hour' AND interval '3 hours'", vec![], Ok((vec![20], vec![vec!["1"]]))),
+        (
+            "SELECT CASE WHEN ts2 - ts > interval '1 hour' THEN 'long' ELSE 'short' END AS a FROM it3 ORDER BY ts2",
+            vec![],
+            Ok((vec![25], vec![vec!["short"], vec!["short"], vec!["long"]])),
+        ),
+        ("SELECT (SELECT max(ts2 - ts) FROM it3) AS a", vec![], Ok((vec![1186], vec![vec!["2 days"]]))),
+        ("SELECT $1 > $2 AS a", vec![(1186, "1 day"), (1186, "2 hours")], Ok((vec![16], vec![vec!["t"]]))),
+        ("SELECT $1 = $2 AS a", vec![(1186, "1 day"), (1186, "24 hours")], Ok((vec![16], vec![vec!["t"]]))),
+        ("SELECT $1 + $2 AS a", vec![(1114, "2026-01-01 00:00"), (1186, "1 day")], Ok((vec![1114], vec![vec!["2026-01-02 00:00:00"]]))),
+        ("SELECT $1 * 2 AS a", vec![(1186, "1 day")], Ok((vec![1186], vec![vec!["2 days"]]))),
+        ("SELECT count(*) FROM it WHERE i = $1", vec![(1186, "24 hours")], Ok((vec![20], vec![vec!["2"]]))),
+        ("SELECT count(*) FROM it WHERE i = interval '1 day'", vec![], Ok((vec![20], vec![vec!["2"]]))),
+        ("SELECT tm - time '09:00' AS a FROM it ORDER BY tm", vec![], Ok((vec![1186], vec![vec!["00:30:00"], vec!["01:00:00"], vec!["14:00:00"]]))),
+        ("SELECT tm + interval '1 hour' AS a FROM it ORDER BY tm", vec![], Ok((vec![1083], vec![vec!["10:30:00"], vec!["11:00:00"], vec!["00:00:00"]]))),
+        ("SELECT ts + 1 AS a FROM it", vec![], Err("42883")),
+        ("SELECT ts - ts2 AS a FROM it ORDER BY ts2", vec![], Ok((vec![1186], vec![vec!["00:00:00"], vec!["-01:00:00"], vec!["-2 days"]]))),
+        ("SELECT -ts AS a FROM it", vec![], Err("42883")),
+        ("SELECT date '2026-01-01' + time '10:00' AS a", vec![], Ok((vec![1114], vec![vec!["2026-01-01 10:00:00"]]))),
+        ("SELECT date '2026-01-01' + interval '1 day' AS a", vec![], Ok((vec![1114], vec![vec!["2026-01-02 00:00:00"]]))),
+        (
+            "SELECT ts, ts2 FROM it WHERE ts2 > ts + interval '1 hour'",
+            vec![],
+            Ok((vec![1114, 1114], vec![vec!["2026-01-01 00:00:00", "2026-01-03 00:00:00"]])),
+        ),
+        ("SELECT i FROM it WHERE i IN (interval '1 day')", vec![], Ok((vec![1186], vec![vec!["1 day"], vec!["24:00:00"]]))),
+    ];
+    let mut wrong = Vec::new();
+    for (sql, params, want) in &cases {
+        let declared: Vec<(u32, i16, &[u8])> = params.iter().map(|(oid, v)| (*oid, 0i16, v.as_bytes())).collect();
+        let r = if declared.is_empty() { a.q(sql) } else { a.xt(sql, &declared) };
+        let refused = r.error.as_ref().is_some_and(|e| e.code == "0A000");
+        let agrees = match want {
+            Ok((oids, rows)) => {
+                r.error.is_none()
+                    && r.oids.as_ref() == Some(oids)
+                    && r.rows == rows.iter().map(|row| row.iter().map(|v| Some(v.to_string())).collect::<Vec<_>>()).collect::<Vec<_>>()
+            }
+            Err(code) => r.error.as_ref().is_some_and(|e| e.code == *code),
+        };
+        if !(agrees || refused) {
+            wrong.push(format!("{sql} {params:?}: PG {want:?}; got oids {:?} rows {:?} error {:?}", r.oids, r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// FLAGGED TEST SPLIT (out of interval_time_and_timestamp_values_are_never_computed_over_text, red 701d67c14, before
+/// its fix; no case dropped or loosened): the cases whose interval comes only from a column declared interval. That
+/// column is stored as text (the translator maps INTERVAL to TEXT; the engine has no interval type), so nothing
+/// distinguishes it from a text column after CREATE TABLE and the wire cannot refuse what reads it. This stays red,
+/// in known-red, until the engine keeps the declared type (an interval type, as core's built-in macaddr text type
+/// keeps its name), when the walk's column_oid reads it as an interval and refuses these as the other cases.
+#[test]
+fn interval_columns_are_never_compared_or_computed_over_text() {
+    let dir = Scratch::new("interval-columns");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE TABLE it1(i interval, ts timestamp, ts2 timestamp)",
+        "INSERT INTO it1 VALUES ('1 day', '2026-01-01 00:00', '2026-01-03 00:00')",
+        "CREATE TABLE it3(i interval, ts timestamp, ts2 timestamp)",
+        "INSERT INTO it3 VALUES ('1 day', '2026-01-01 00:00', '2026-01-03 00:00'), ('2 hours', '2026-01-01', '2026-01-01 01:00'), \
+         ('30 minutes', '2026-01-01', '2026-01-01')",
+        "CREATE TABLE it(i interval, ts timestamp, ts2 timestamp, tm time)",
+        "INSERT INTO it VALUES ('1 day', '2026-01-01 00:00', '2026-01-03 00:00', '10:00'), ('24 hours', '2026-01-01', \
+         '2026-01-01 01:00', '09:30'), ('30 minutes', '2026-01-01', '2026-01-01', '23:00')",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    type Want = Result<(Vec<u32>, Vec<Vec<&'static str>>), &'static str>;
+    let cases: Vec<(&str, Vec<(u32, &str)>, Want)> = vec![
+        ("SELECT i + interval '1 hour' AS a FROM it1", vec![], Ok((vec![1186], vec![vec!["1 day 01:00:00"]]))),
+        ("SELECT i * 2 AS a FROM it1", vec![], Ok((vec![1186], vec![vec!["2 days"]]))),
+        ("SELECT ts + i AS a FROM it1", vec![], Ok((vec![1114], vec![vec!["2026-01-02 00:00:00"]]))),
+        ("SELECT count(*) FROM it1 WHERE i > '2 hours'", vec![], Ok((vec![20], vec![vec!["1"]]))),
+        ("SELECT max(i) AS a, sum(i) AS b FROM it1", vec![], Ok((vec![1186, 1186], vec![vec!["1 day", "1 day"]]))),
+        ("SELECT i FROM it3 ORDER BY i", vec![], Ok((vec![1186], vec![vec!["00:30:00"], vec!["02:00:00"], vec!["1 day"]]))),
+        ("SELECT max(i) AS a, min(i) AS b FROM it3", vec![], Ok((vec![1186, 1186], vec![vec!["1 day", "00:30:00"]]))),
+        ("SELECT avg(i) AS a FROM it3", vec![], Ok((vec![1186], vec![vec!["08:50:00"]]))),
+        (
+            "SELECT greatest(i, interval '5 hours') AS a FROM it3 ORDER BY ts2",
+            vec![],
+            Ok((vec![1186], vec![vec!["05:00:00"], vec!["05:00:00"], vec!["1 day"]])),
+        ),
+        ("SELECT count(DISTINCT i) FROM it", vec![], Ok((vec![20], vec![vec!["2"]]))),
+        ("SELECT i AS x FROM it ORDER BY x", vec![], Ok((vec![1186], vec![vec!["00:30:00"], vec!["1 day"], vec!["24:00:00"]]))),
+        ("SELECT i FROM it ORDER BY 1", vec![], Ok((vec![1186], vec![vec!["00:30:00"], vec!["1 day"], vec!["24:00:00"]]))),
+        ("SELECT i, count(*) FROM it GROUP BY i ORDER BY 2", vec![], Ok((vec![1186, 20], vec![vec!["00:30:00", "1"], vec!["1 day", "2"]]))),
+        ("SELECT DISTINCT i FROM it ORDER BY 1", vec![], Ok((vec![1186], vec![vec!["00:30:00"], vec!["1 day"]]))),
+    ];
+    let mut wrong = Vec::new();
+    for (sql, params, want) in &cases {
+        let declared: Vec<(u32, i16, &[u8])> = params.iter().map(|(oid, v)| (*oid, 0i16, v.as_bytes())).collect();
+        let r = if declared.is_empty() { a.q(sql) } else { a.xt(sql, &declared) };
+        let refused = r.error.as_ref().is_some_and(|e| e.code == "0A000");
+        let agrees = match want {
+            Ok((oids, rows)) => {
+                r.error.is_none()
+                    && r.oids.as_ref() == Some(oids)
+                    && r.rows == rows.iter().map(|row| row.iter().map(|v| Some(v.to_string())).collect::<Vec<_>>()).collect::<Vec<_>>()
+            }
+            Err(code) => r.error.as_ref().is_some_and(|e| e.code == *code),
+        };
+        if !(agrees || refused) {
+            wrong.push(format!("{sql} {params:?}: PG {want:?}; got oids {:?} rows {:?} error {:?}", r.oids, r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-1de981755-rest MED-3 and MED-2 (its PG 18.6 probe2 #1-#19, #26-#29 and probe #48, #56-#65): a relation
+/// named in another database is 0A000 'cross-database references are not implemented: "db.schema.name"' wherever it
+/// stands: REFERENCES (column and table constraint, ALTER ... ADD FOREIGN KEY), SELECT INTO, CREATE and ALTER SEQUENCE,
+/// and COMMENT ON COLUMN's four names; the reads missed them, so each acted on this database (a foreign key onto the
+/// local nu, a table, a sequence). A list naming this database's relation and a member of it (COMMENT ON COLUMN
+/// public.n.a, COMMENT ON CONSTRAINT c ON public.n, DROP TRIGGER t ON public.n) is no cross-database reference: b159ce8b8
+/// refused those 0A000.
+#[test]
+fn every_cross_database_reference_is_refused_and_only_those() {
+    let dir = Scratch::new("xdb-all");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let this = a.q("SELECT current_database()").single("current_database");
+    for sql in [
+        "CREATE TABLE nu(a int primary key)",
+        "INSERT INTO nu VALUES (1)",
+        "CREATE TABLE z3 (a int)",
+        "CREATE TABLE n(a int)",
+        "ALTER TABLE n ADD CONSTRAINT nck CHECK (a > 0)",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    let refused = |name: &str| Err(format!("0A000 cross-database references are not implemented: \"{name}\""));
+    let cases: Vec<(String, Result<&str, String>)> = vec![
+        ("CREATE TABLE z (a int REFERENCES otherdb.public.nu(a))".into(), refused("otherdb.public.nu")),
+        ("CREATE TABLE z2 (a int, FOREIGN KEY (a) REFERENCES otherdb.public.nu(a))".into(), refused("otherdb.public.nu")),
+        ("ALTER TABLE z3 ADD FOREIGN KEY (a) REFERENCES otherdb.public.nu(a)".into(), refused("otherdb.public.nu")),
+        ("ALTER TABLE z3 ADD CONSTRAINT fk2 FOREIGN KEY (a) REFERENCES otherdb.public.nu".into(), refused("otherdb.public.nu")),
+        ("INSERT INTO z3 VALUES (98)".into(), Ok("INSERT 0 1")),
+        ("SELECT 1 AS a INTO otherdb.public.si".into(), refused("otherdb.public.si")),
+        ("CREATE TABLE otherdb.public.ctas AS SELECT 1 AS a".into(), refused("otherdb.public.ctas")),
+        ("CREATE SEQUENCE otherdb.public.s2".into(), refused("otherdb.public.s2")),
+        ("ALTER SEQUENCE otherdb.public.s2 RESTART".into(), refused("otherdb.public.s2")),
+        ("COMMENT ON COLUMN otherdb.public.nu.a IS 'x'".into(), refused("otherdb.public.nu")),
+        ("COMMENT ON COLUMN public.nu.a IS 'x'".into(), Ok("COMMENT")),
+        ("COMMENT ON COLUMN nu.a IS 'see v1.2.3'".into(), Ok("COMMENT")),
+        ("COMMENT ON CONSTRAINT nu_pkey ON public.nu IS 'see 1.2'".into(), Ok("COMMENT")),
+        ("COMMENT ON COLUMN public.n.a IS 'col'".into(), Ok("COMMENT")),
+        (format!("COMMENT ON COLUMN {this}.public.n.a IS 'col4'"), Ok("COMMENT")),
+        (format!("COMMENT ON TABLE {this}.public.n IS 'tbl'"), Ok("COMMENT")),
+        ("COMMENT ON CONSTRAINT nck ON public.n IS 'ck'".into(), Ok("COMMENT")),
+    ];
+    let mut wrong = Vec::new();
+    for (sql, want) in &cases {
+        let r = a.q(sql);
+        let got = match &r.error {
+            Some(e) => Err(format!("{} {}", e.code, e.message)),
+            None => Ok(r.tags.last().cloned().unwrap_or_default()),
+        };
+        let agrees = match (want, &got) {
+            (Ok(tag), Ok(g)) => g == tag,
+            (Err(w), Err(g)) => w == g,
+            _ => false,
+        };
+        if !agrees {
+            wrong.push(format!("{sql}: PG {want:?}, got {got:?}"));
+        }
+    }
+    // Nothing acted on this database: no table z, z2, si or ctas, no sequence s2, and no foreign key on z3 (98 went in).
+    for name in ["z", "z2", "si", "ctas"] {
+        let sql = format!("SELECT * FROM {name}");
+        let r = a.q(&sql);
+        if r.error.as_ref().map(|e| e.code.as_str()) != Some("42P01") {
+            wrong.push(format!("{sql}: {:?} {:?}, wanted 42P01 (no such relation)", r.rows, r.error));
+        }
+    }
+    let r = a.q("SELECT nextval('s2')");
+    if r.error.is_none() {
+        wrong.push(format!("nextval('s2'): {:?}, wanted no sequence s2", r.rows));
+    }
+    let got = a.q("SELECT count(*) FROM z3").single("count z3");
+    if got != "1" {
+        wrong.push(format!("count z3: {got}, wanted 1"));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-1de981755-rest MED-6 (its PG 18.6 probe #4, #20): an explicit cast to char(n), character(n) or bpchar(n)
+/// cuts the value to n characters, as the varchar(n) cast does (adafc938f), and so does a cast to varchar(n)[] for each
+/// element: 'abcdef'::char(3) answered 'abcdef' and ARRAY['abcdef']::varchar(2)[] '{abcdef}'. The values are PG's; the
+/// column type of a bare cast is the varchar cut's known divergence (announced text), so either it or PG's is taken.
+#[test]
+fn an_explicit_cast_to_a_fixed_or_array_length_cuts_the_value() {
+    let dir = Scratch::new("char-cut");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    for (sql, types, row) in [
+        (
+            "SELECT 'abcdef'::char(3) AS a, 'abcdef'::character(2) AS b, 'abcdef'::bpchar(1) AS c",
+            [1042u32, 1042, 1042].as_slice(),
+            ["abc", "ab", "a"].as_slice(),
+        ),
+        ("SELECT ARRAY['abcdef']::varchar(2)[] AS a", [1015u32].as_slice(), ["{ab}"].as_slice()),
+    ] {
+        let r = a.q(sql);
+        let typed = r.oids.as_ref().is_some_and(|o| o.as_slice() == types || o.iter().all(|t| *t == 25));
+        let rows: Vec<Vec<Option<String>>> = vec![row.iter().map(|v| Some(v.to_string())).collect()];
+        if r.error.is_some() || !typed || r.rows != rows {
+            wrong.push(format!("{sql}: PG {types:?} {row:?}; got {:?} {:?} {:?}", r.oids, r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-1de981755-rest MED-9 (its PG 18.6 probe #193-#204, probe2 #84): a text literal cast to oid is read as
+/// oidin reads it, strtoul with base 0 (a leading 0 is octal, 0x hexadecimal; spaces and a sign allowed; a negative
+/// value down to -2^31 wraps), and anything else is 22P02 or 22003 as PG answers: '00012'::oid answered 12 (PG 10),
+/// '0x10' 0 (PG 16), and '1.5', '' and 'abc' were cast by the engine to 1, 0 and 0.
+#[test]
+fn a_text_literal_cast_to_oid_is_read_as_oidin_reads_it() {
+    let dir = Scratch::new("oid-in");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    for (literal, want) in [
+        ("-1", Ok("4294967295")),
+        ("4294967295", Ok("4294967295")),
+        (" 7 ", Ok("7")),
+        ("+5", Ok("5")),
+        ("-2147483648", Ok("2147483648")),
+        ("00012", Ok("10")),
+        ("0x10", Ok("16")),
+        ("010", Ok("8")),
+        ("0", Ok("0")),
+        ("4294967296", Err(("22003", "value \"4294967296\" is out of range for type oid"))),
+        ("-2147483649", Err(("22003", "value \"-2147483649\" is out of range for type oid"))),
+        ("1.5", Err(("22P02", "invalid input syntax for type oid: \"1.5\""))),
+        ("", Err(("22P02", "invalid input syntax for type oid: \"\""))),
+        ("abc", Err(("22P02", "invalid input syntax for type oid: \"abc\""))),
+    ] {
+        let sql = format!("SELECT '{literal}'::oid AS a");
+        let r = a.q(&sql);
+        let agrees = match want {
+            Ok(v) => r.error.is_none() && r.oids == Some(vec![26]) && r.rows == vec![vec![Some(v.to_string())]],
+            Err((code, message)) => r.error.as_ref().is_some_and(|e| e.code == code && e.message == message),
+        };
+        if !agrees {
+            wrong.push(format!("{sql}: PG {want:?}; got {:?} {:?} {:?}", r.oids, r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-1de981755-rest MED-7's int8 bound (its PG 18.6 recording pg18-c33-intrange.out #10): -v - 2 over int8's
+/// maximum overflows, 22003 'bigint out of range' in PG; the engine's REAL overflow rounds to exactly -2^63, which the
+/// int8 range guard let through (its lower bound was exclusive), so it answered '-9.223372036854776e+18' under int8.
+#[test]
+fn an_int8_overflow_that_rounds_to_its_minimum_is_22003() {
+    let dir = Scratch::new("int8-floor");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE big(v BIGINT, i INT)").ok("create");
+    a.q("INSERT INTO big VALUES (9223372036854775807, 2147483647), (1, 1)").ok("insert");
+    let r = a.q("SELECT -v - 2 FROM big WHERE v > 1");
+    let e = r.err("-v - 2");
+    assert_eq!((e.code.as_str(), e.message.as_str()), ("22003", "bigint out of range"), "rows {:?}", r.rows);
+}
+
+/// wire-rev-1de981755-rest MED-1 (its PG 18.6 probe #222-#232): a CASE over parameters assigned to a varchar(3)
+/// column is judged at Bind with each parameter as its type: $1 compared with 1 is an integer, so '1' <> 1 is false and
+/// 'x' goes in, and binary int4 2 = 2 is true and 'long value' is 22001 at Bind. 11b24ee50 bound every parameter as
+/// text, so '1' <> 1 and '3' > 5 were true in the engine (valid INSERTs refused 22001) and '1' = 1 false (22001 left to
+/// Execute as XX000).
+#[test]
+fn a_case_folded_at_bind_reads_each_parameter_as_its_type() {
+    let dir = Scratch::new("case-bind-typed");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE v3(c varchar(3))").ok("create");
+    let long = ("22001", "value too long for type character varying(3)");
+    let two = 2i32.to_be_bytes();
+    let cases: Vec<(&str, Vec<(u32, i16, &[u8])>, Result<(), (&str, &str)>)> = vec![
+        ("INSERT INTO v3 VALUES (CASE WHEN $1 <> 1 THEN 'long value' ELSE 'x' END)", vec![(0, 0, &b"1"[..])], Ok(())),
+        ("INSERT INTO v3 VALUES (CASE WHEN $1 = 1 THEN 'long value' ELSE 'x' END)", vec![(0, 0, &b"1"[..])], Err(long)),
+        ("INSERT INTO v3 VALUES (CASE WHEN $1 > 5 THEN 'long value' ELSE 'y' END)", vec![(0, 0, &b"3"[..])], Ok(())),
+        ("INSERT INTO v3 VALUES (CASE WHEN $1 > 5 THEN 'long value' ELSE 'y' END)", vec![(0, 0, &b"10"[..])], Err(long)),
+        ("INSERT INTO v3 VALUES (CASE WHEN $1::int > 5 THEN 'long value' ELSE 'y' END)", vec![(0, 0, &b"3"[..])], Ok(())),
+        ("INSERT INTO v3 VALUES (CASE WHEN $1 = 'a' THEN 'ok' ELSE 'long value' END)", vec![(0, 0, &b"a"[..])], Ok(())),
+        ("INSERT INTO v3 VALUES (CASE WHEN $1 THEN 'long value' ELSE 'w' END)", vec![(0, 0, &b"f"[..])], Ok(())),
+        ("INSERT INTO v3 VALUES (CASE WHEN $1 > 1.5 THEN 'long value' ELSE 'v' END)", vec![(1700, 0, &b"1"[..])], Ok(())),
+        ("INSERT INTO v3 VALUES (CASE WHEN $1 = 2 THEN 'long value' ELSE 'u' END)", vec![(23, 1, two.as_slice())], Err(long)),
+    ];
+    let mut wrong = Vec::new();
+    for (sql, params, want) in &cases {
+        let r = a.xt(sql, params);
+        let got = match &r.error {
+            Some(e) => Err((e.code.as_str(), e.message.as_str())),
+            None if r.tags.last().map(String::as_str) == Some("INSERT 0 1") => Ok(()),
+            None => Err(("no INSERT tag", "")),
+        };
+        if got != *want {
+            wrong.push(format!("{sql} {params:?}: PG {want:?}, got {got:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-1de981755-rest MED-4 (its PG 18.6 probe #89-#99, #115-#119, #130-#133, probe2 #49-#51): AND and OR are
+/// reduced as PostgreSQL's simplify_and_arguments reduces them: their arguments (nested ANDs or ORs flattened) are
+/// simplified left to right, so an immutable constant argument before the first constant that decides (false for
+/// AND, true for OR; a literal, a cast of one, NOT of one, or a comparison of integer literals) is evaluated and
+/// raises, and nothing after it is. ef15b1c6b decided on a literal alone and dropped every other argument:
+/// encode('abc', 'nosuch') = '' AND false answered f (PG 22023), (1 = 0) AND bad raised where PG answers f, and
+/// nextval('sq') > 0 AND 1 = 0 called nextval.
+#[test]
+fn and_and_or_are_simplified_as_postgresql_simplifies_them() {
+    let dir = Scratch::new("bool-simplify");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in ["CREATE TABLE ft2(a int)", "INSERT INTO ft2 VALUES (1), (2)", "CREATE SEQUENCE sq"] {
+        a.q(sql).ok(sql);
+    }
+    let bad = Err(("22023", "unrecognized encoding: \"nosuch\""));
+    let cases: Vec<(&str, Result<Vec<Vec<&str>>, (&str, &str)>)> = vec![
+        ("SELECT (1 = 0) AND encode('abc', 'nosuch') = '' AS a", Ok(vec![vec!["f"]])),
+        ("SELECT NOT true AND encode('abc', 'nosuch') = '' AS a", Ok(vec![vec!["f"]])),
+        ("SELECT false::boolean AND encode('abc', 'nosuch') = '' AS a", Ok(vec![vec!["f"]])),
+        ("SELECT NULL AND false AND encode('abc', 'nosuch') = '' AS a", Ok(vec![vec!["f"]])),
+        ("SELECT encode('abc', 'nosuch') = '' AND false AS a", bad.clone()),
+        ("SELECT true OR encode('abc', 'nosuch') = '' AS a", Ok(vec![vec!["t"]])),
+        ("SELECT (1 = 1) OR encode('abc', 'nosuch') = '' AS a", Ok(vec![vec!["t"]])),
+        ("SELECT count(*) FROM ft2 WHERE a = 1 AND false", Ok(vec![vec!["0"]])),
+        ("SELECT a FROM ft2 WHERE (a = 1 AND false) IS NOT TRUE ORDER BY a", Ok(vec![vec!["1"], vec!["2"]])),
+        ("SELECT a FROM ft2 WHERE encode('abc', 'nosuch') = '' AND false", bad.clone()),
+        ("SELECT a FROM ft2 WHERE false AND encode('abc', 'nosuch') = ''", Ok(vec![])),
+        ("SELECT a FROM ft2 WHERE a > 0 AND (1 = 0) AND encode('abc', 'nosuch') = ''", Ok(vec![])),
+        ("SELECT nextval('sq') AS a", Ok(vec![vec!["1"]])),
+        ("SELECT nextval('sq') > 0 AND 1 = 0 AS a", Ok(vec![vec!["f"]])),
+        ("SELECT nextval('sq') AS a", Ok(vec![vec!["2"]])),
+        ("SELECT a FROM ft2 WHERE nextval('sq') > 0 AND false", Ok(vec![])),
+        ("SELECT x FROM (SELECT encode('abc', 'nosuch') = '' AND false AS x) s", bad.clone()),
+        ("SELECT a FROM ft2 WHERE (a = 1 OR encode('abc', 'nosuch') = '') OR true ORDER BY a", bad.clone()),
+    ];
+    let mut wrong = Vec::new();
+    for (sql, want) in &cases {
+        let r = a.q(sql);
+        let got = match &r.error {
+            Some(e) => Err((e.code.clone(), e.message.clone())),
+            None => Ok(r.rows.clone()),
+        };
+        let agrees = match (want, &got) {
+            (Ok(rows), Ok(g)) => *g == rows.iter().map(|row| row.iter().map(|v| Some(v.to_string())).collect::<Vec<_>>()).collect::<Vec<_>>(),
+            (Err((code, message)), Err((g_code, g_message))) => code == g_code && message == g_message,
+            _ => false,
+        };
+        if !agrees {
+            wrong.push(format!("{sql}: PG {want:?}, got {got:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-1de981755-rest MED-5 (its PG 18.6 probe3 #2, #6, #9, #14-#16): a varchar(n) cast read through a view or a
+/// derived table is a string column: PG announces 1043 and writes 'abc' in text and binary. adafc938f's cut is a
+/// substr() call, whose view and derived-table column the engine typed bytea (17), refused in binary 0A000. The
+/// announced type of a varchar cast is the known text (25) divergence, so 25 or PG's 1043 is taken; never 17.
+#[test]
+fn a_varchar_cast_through_a_view_or_derived_table_is_a_string_column() {
+    let dir = Scratch::new("cut-view");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE VIEW v2 AS SELECT 'abcdef'::varchar(3) AS a",
+        "CREATE TABLE src(t text)",
+        "INSERT INTO src VALUES ('abcdef')",
+        "CREATE VIEW v5 AS SELECT t::varchar(3) AS a FROM src",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    for sql in ["SELECT a FROM v2", "SELECT a FROM (SELECT 'abcdef'::varchar(3) AS a) s", "SELECT a FROM v5"] {
+        let r = a.q(sql);
+        let typed = matches!(r.oids.as_deref(), Some([1043] | [25]));
+        if r.error.is_some() || !typed || r.rows != vec![vec![Some("abc".to_string())]] {
+            wrong.push(format!("{sql}: PG 1043 'abc'; got {:?} {:?} {:?}", r.oids, r.rows, r.error));
+        }
+    }
+    let r = a.x_binary("SELECT a FROM v2");
+    let typed = matches!(r.oids.as_deref(), Some([1043] | [25]));
+    if r.error.is_some() || !typed || r.rows != vec![vec![Some("abc".to_string())]] {
+        wrong.push(format!("binary SELECT a FROM v2: PG 1043 0x616263; got {:?} {:?} {:?}", r.oids, r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-1de981755-rest LOW-3 (its PG 18.6 probe #210-#220): a function name is matched as written, so a quoted name
+/// with an upper-case letter or a public-qualified one names no function, 42883 with its arguments' types; only min
+/// and max were judged, so "LENGTH"('abc'), "COUNT"(*), "SUM"(a), "Upper"('a') and public.length('abc') answered, and
+/// "MAX"(NULL) answered NULL.
+#[test]
+fn a_function_name_is_matched_as_written() {
+    let dir = Scratch::new("fn-as-written");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in ["CREATE TABLE ft2(a int)", "INSERT INTO ft2 VALUES (1), (2)"] {
+        a.q(sql).ok(sql);
+    }
+    let cases: Vec<(&str, Result<Vec<&str>, &str>)> = vec![
+        ("SELECT \"max\"(a) AS a FROM ft2", Ok(vec!["2"])),
+        ("SELECT pg_catalog.max(a) AS a FROM ft2", Ok(vec!["2"])),
+        ("SELECT public.max(a) AS a FROM ft2", Err("function public.max(integer) does not exist")),
+        ("SELECT \"LENGTH\"('abc') AS a", Err("function LENGTH(unknown) does not exist")),
+        ("SELECT pg_catalog.\"length\"('abc') AS a", Ok(vec!["3"])),
+        ("SELECT \"COUNT\"(*) AS a FROM ft2", Err("function COUNT() does not exist")),
+        ("SELECT \"SUM\"(a) AS a FROM ft2", Err("function SUM(integer) does not exist")),
+        ("SELECT \"MAX\"(NULL) AS a", Err("function MAX(unknown) does not exist")),
+        ("SELECT Max(a) AS a FROM ft2", Ok(vec!["2"])),
+        ("SELECT \"Upper\"('a') AS a", Err("function Upper(unknown) does not exist")),
+        ("SELECT public.length('abc') AS a", Err("function public.length(unknown) does not exist")),
+    ];
+    let mut wrong = Vec::new();
+    for (sql, want) in &cases {
+        let r = a.q(sql);
+        let agrees = match want {
+            Ok(rows) => r.error.is_none() && r.rows == rows.iter().map(|v| vec![Some(v.to_string())]).collect::<Vec<_>>(),
+            Err(message) => r.error.as_ref().is_some_and(|e| e.code == "42883" && e.message == *message),
+        };
+        if !agrees {
+            wrong.push(format!("{sql}: PG {want:?}; got {:?} {:?}", r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-1de981755-rest LOW-4 (its PG 18.6 probe #5, #6): a varchar cast's length is bounded as varchartypmodin
+/// bounds it, 22023: 'abc'::varchar(0) answered '' and varchar(10485761) answered.
+#[test]
+fn a_varchar_cast_length_is_bounded() {
+    let dir = Scratch::new("vc-bounds");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    for (sql, message) in [
+        ("SELECT 'abc'::varchar(0) AS a", "length for type varchar must be at least 1"),
+        ("SELECT 'abc'::varchar(10485761) AS a", "length for type varchar cannot exceed 10485760"),
+    ] {
+        let r = a.q(sql);
+        if !r.error.as_ref().is_some_and(|e| e.code == "22023" && e.message == message) {
+            wrong.push(format!("{sql}: PG 22023 {message}; got {:?} {:?}", r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-1de981755-rest LOW-6 (its PG 18.6 probe #206-#208): an integer expression cast to oid is its 32-bit
+/// unsigned value, as int4's binary coercion to oid reads it ((-i)::oid wrote '-1' under oid; PG 4294967295), and an
+/// oid column goes out in binary as its four bytes (refused 0A000).
+#[test]
+fn an_integer_expression_cast_to_oid_is_unsigned() {
+    let dir = Scratch::new("oid-expr");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in ["CREATE TABLE ct(i int)", "INSERT INTO ct VALUES (1), (2)"] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    for (sql, rows) in [
+        ("SELECT i::oid AS a FROM ct ORDER BY i", vec!["1", "2"]),
+        ("SELECT (-i)::oid AS a FROM ct ORDER BY i", vec!["4294967295", "4294967294"]),
+    ] {
+        let r = a.q(sql);
+        let want: Vec<Vec<Option<String>>> = rows.iter().map(|v| vec![Some(v.to_string())]).collect();
+        if r.error.is_some() || r.oids != Some(vec![26]) || r.rows != want {
+            wrong.push(format!("{sql}: PG 26 {rows:?}; got {:?} {:?} {:?}", r.oids, r.rows, r.error));
+        }
+    }
+    let r = a.x_binary("SELECT (-1)::oid AS a");
+    let want = vec![vec![Some(String::from_utf8_lossy(&[0xff, 0xff, 0xff, 0xff]).into_owned())]];
+    if r.error.is_some() || r.oids != Some(vec![26]) || r.rows != want {
+        wrong.push(format!("binary (-1)::oid: PG 26 0xffffffff; got {:?} {:?} {:?}", r.oids, r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-351702a43 LOW-6 (its PG 18.6 probe3 #161): a CASE is typed by its results (an int4 constant and an int4
 /// function: 23); the walk never typed a CASE column, and the engine announced it text (25).
 #[test]
@@ -16792,6 +17328,123 @@ fn a_case_column_is_typed_by_its_results() {
     let mut a = server.connect();
     let r = a.q("SELECT CASE WHEN now() IS NULL THEN 1 WHEN false THEN length('x') END");
     assert_eq!((r.oids, r.error), (Some(vec![23]), None), "PostgreSQL types the CASE int4");
+}
+
+/// wire-rev-1de981755-rest HIGH-1 (its PG 18.6 probe #137-#151 and probe2 #64-#70; COALESCE, GREATEST, LEAST and the
+/// string, boolean and datetime forms recorded on iccad2 PG 18.6, pg18-wirefuzz-conditional_expressions_take_
+/// postgresqls_common_type.out): CASE, COALESCE, GREATEST and LEAST take select_common_type's type (the default result
+/// first for a CASE; the category's preferred type, or the type the others implicitly coerce to; 42804 across
+/// categories; an untyped literal read as that type). 6a1cdf086 took the first typed result's type, so a wider later
+/// result was refused 22003 and a float or text value went out under int4. A form the engine cannot answer as PG (an
+/// untyped literal or a date read as another type) may be refused 0A000 instead, never answered differently.
+#[test]
+fn conditional_expressions_take_postgresqls_common_type() {
+    let dir = Scratch::new("common-type");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE ct(c bool, i int, b bigint, f float8, s smallint, r real, v varchar(5), t text, d date, ts timestamp)")
+        .ok("create");
+    a.q("INSERT INTO ct VALUES (true, 1, 5000000000, 1.5, 1, 0.5, 'ab', 'tx', '2026-01-02', '2026-01-03 04:05:06'), \
+         (false, 2, 6000000000, 2.5, 2, 1.25, 'cd', 'ty', '2026-02-03', '2026-02-04 05:06:07')")
+        .ok("insert");
+    type Want = Result<(u32, Vec<Option<&'static str>>), (&'static str, &'static str)>;
+    let s = |v: &[&'static str]| v.iter().map(|x| Some(*x)).collect::<Vec<_>>();
+    // (select list, PG 18.6's answer, whether a 0A000 refusal stands in for it)
+    let cases: Vec<(&str, Want, bool)> = vec![
+        ("CASE WHEN c THEN 1 ELSE b END", Ok((20, s(&["1", "6000000000"]))), false),
+        ("CASE WHEN c THEN i ELSE b END", Ok((20, s(&["1", "6000000000"]))), false),
+        ("CASE WHEN c THEN i ELSE f END", Ok((701, s(&["1", "2.5"]))), false),
+        ("CASE WHEN c THEN s ELSE 100000 END", Ok((23, s(&["1", "100000"]))), false),
+        ("CASE WHEN c THEN 1::int2 ELSE 100000 END", Ok((23, s(&["1", "100000"]))), false),
+        ("CASE WHEN c THEN 1 ELSE 'x' END", Err(("22P02", "invalid input syntax for type integer: \"x\"")), false),
+        ("CASE WHEN c THEN 'x' ELSE 1 END", Err(("22P02", "invalid input syntax for type integer: \"x\"")), false),
+        ("CASE WHEN c THEN i ELSE NULL END", Ok((23, vec![Some("1"), None])), false),
+        ("CASE WHEN c THEN i * 2 ELSE b * 2 END", Ok((20, s(&["2", "12000000000"]))), false),
+        ("CASE WHEN c THEN 1 ELSE 3000000000 END", Ok((20, s(&["1", "3000000000"]))), false),
+        ("CASE WHEN c THEN s ELSE i END", Ok((23, s(&["1", "2"]))), false),
+        ("CASE WHEN c THEN i ELSE 'x' || 'y' END", Err(("42804", "CASE types text and integer cannot be matched")), false),
+        ("CASE WHEN c THEN i ELSE f * 1 END", Ok((701, s(&["1", "2.5"]))), false),
+        ("CASE WHEN c THEN length('x') ELSE b END", Ok((20, s(&["1", "6000000000"]))), false),
+        ("CASE WHEN c THEN i ELSE i / 2 END", Ok((23, s(&["1", "1"]))), false),
+        ("CASE i WHEN 1 THEN 1 ELSE b END", Ok((20, s(&["1", "6000000000"]))), false),
+        ("CASE WHEN c THEN NULL ELSE f END", Ok((701, vec![None, Some("2.5")])), false),
+        ("CASE WHEN c THEN s ELSE b END", Ok((20, s(&["1", "6000000000"]))), false),
+        ("coalesce(i, b)", Ok((20, s(&["1", "2"]))), false),
+        ("coalesce(NULL, b, i)", Ok((20, s(&["5000000000", "6000000000"]))), false),
+        ("coalesce(s, 100000)", Ok((23, s(&["1", "2"]))), false),
+        ("coalesce(i, f)", Ok((701, s(&["1", "2"]))), false),
+        ("coalesce(i, 'x')", Err(("22P02", "invalid input syntax for type integer: \"x\"")), false),
+        ("coalesce(i, '7')", Ok((23, s(&["1", "2"]))), true),
+        ("coalesce(i, t)", Err(("42804", "COALESCE types integer and text cannot be matched")), false),
+        ("coalesce(s, r)", Ok((700, s(&["1", "2"]))), false),
+        ("greatest(i, b)", Ok((20, s(&["5000000000", "6000000000"]))), false),
+        ("greatest(s, 100000)", Ok((23, s(&["100000", "100000"]))), false),
+        ("least(i, f)", Ok((701, s(&["1", "2"]))), false),
+        ("least(i, t)", Err(("42804", "LEAST types integer and text cannot be matched")), false),
+        ("greatest(i, 'x')", Err(("22P02", "invalid input syntax for type integer: \"x\"")), false),
+        ("CASE WHEN c THEN v ELSE t END", Ok((25, s(&["ab", "ty"]))), false),
+        ("CASE WHEN c THEN v ELSE 'zz' END", Ok((1043, s(&["ab", "zz"]))), false),
+        ("CASE WHEN c THEN 'a' ELSE 'b' END", Ok((25, s(&["a", "b"]))), false),
+        ("CASE WHEN c THEN NULL END", Ok((25, vec![None, None])), false),
+        ("CASE WHEN c THEN d ELSE ts END", Ok((1114, s(&["2026-01-02 00:00:00", "2026-02-04 05:06:07"]))), true),
+        ("CASE WHEN c THEN 1 ELSE true END", Err(("42804", "CASE types boolean and integer cannot be matched")), false),
+        ("CASE WHEN c THEN true ELSE 'yes' END", Ok((16, s(&["t", "t"]))), true),
+        ("CASE WHEN c THEN true ELSE 'maybe' END", Err(("22P02", "invalid input syntax for type boolean: \"maybe\"")), false),
+        ("CASE WHEN c THEN i ELSE '3000000000' END", Err(("22003", "value \"3000000000\" is out of range for type integer")), false),
+        ("CASE WHEN c THEN s ELSE r END", Ok((700, s(&["1", "1.25"]))), false),
+        ("CASE WHEN c THEN f ELSE 1 END", Ok((701, s(&["1.5", "1"]))), false),
+        ("CASE WHEN c THEN b WHEN NOT c THEN s ELSE i END", Ok((20, s(&["5000000000", "2"]))), false),
+    ];
+    let mut wrong = Vec::new();
+    for (list, want, refusable) in &cases {
+        let sql = format!("SELECT {list} AS x FROM ct ORDER BY i");
+        let r = a.q(&sql);
+        let got: Result<(u32, Vec<Option<String>>), (String, String)> = match (&r.error, &r.oids) {
+            (Some(e), _) => Err((e.code.clone(), e.message.clone())),
+            (None, Some(oids)) if oids.len() == 1 => {
+                Ok((oids[0], r.rows.iter().map(|row| row[0].clone()).collect()))
+            }
+            _ => Err(("no RowDescription".into(), format!("{r:?}"))),
+        };
+        let matches = match (want, &got) {
+            (Ok((oid, rows)), Ok((g_oid, g_rows))) => {
+                oid == g_oid && rows.iter().map(|x| x.map(str::to_string)).collect::<Vec<_>>() == *g_rows
+            }
+            (Err((code, message)), Err((g_code, g_message))) => code == g_code && message == g_message,
+            _ => false,
+        };
+        let refused = matches!(&got, Err((code, _)) if code == "0A000");
+        if !(matches || (*refusable && refused)) {
+            wrong.push((sql, format!("{want:?}"), got));
+        }
+    }
+    // Binary format (probe #150, #151): the same columns as int8 and float8.
+    let bytes = |b: &[u8]| Some(String::from_utf8_lossy(b).into_owned());
+    let r = a.x_binary("SELECT CASE WHEN c THEN i ELSE b END AS x FROM ct ORDER BY i");
+    if (r.oids.clone(), r.error.clone(), r.rows.clone())
+        != (Some(vec![20]), None, vec![vec![bytes(&1i64.to_be_bytes())], vec![bytes(&6000000000i64.to_be_bytes())]])
+    {
+        wrong.push(("binary int8 CASE".into(), "int8 1, 6000000000".into(), Err((format!("{:?}", r.error), format!("{:?} {:?}", r.oids, r.rows)))));
+    }
+    let r = a.x_binary("SELECT CASE WHEN c THEN i ELSE f END AS x FROM ct ORDER BY i");
+    if (r.oids.clone(), r.error.clone(), r.rows.clone())
+        != (Some(vec![701]), None, vec![vec![bytes(&1f64.to_be_bytes())], vec![bytes(&2.5f64.to_be_bytes())]])
+    {
+        wrong.push(("binary float8 CASE".into(), "float8 1, 2.5".into(), Err((format!("{:?}", r.error), format!("{:?} {:?}", r.oids, r.rows)))));
+    }
+    // Describe (probe2 #70; the recording's three Describes): the column, and a parameter typed by the others.
+    for (sql, params, oid) in [
+        ("SELECT CASE WHEN c THEN i ELSE f END AS x FROM ct", vec![], 701),
+        ("SELECT coalesce($1, b) AS x FROM ct", vec![20], 20),
+        ("SELECT CASE WHEN c THEN $1 ELSE b END AS x FROM ct", vec![20], 20),
+        ("SELECT CASE WHEN c THEN $1 ELSE i END AS x FROM ct", vec![23], 23),
+    ] {
+        let r = a.describe_statement(sql);
+        if (r.params.clone(), r.oids.clone(), r.error.clone()) != (Some(params.clone()), Some(vec![oid]), None) {
+            wrong.push((sql.to_string(), format!("params {params:?} column {oid}"), Err((format!("{:?}", r.error), format!("{:?} {:?}", r.params, r.oids)))));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
 /// wire-rev-7128c6f73 L3 (its PG 18.6 probe4 #140-#142): an int2 or int8 result past its type is 22003 in PG ('smallint

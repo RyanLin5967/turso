@@ -578,15 +578,22 @@ pub fn computed_targets(parse: &ParseResult) -> Vec<bool> {
         match node.node.as_ref() {
             Some(Node::ColumnRef(c)) => !top
                 && !matches!(c.fields.last().and_then(|f| f.node.as_ref()), Some(Node::AStar(_))),
+            // An integer literal past int4 (pg_query gives it as a float's text) is an int8, a
+            // boolean literal a boolean, and a parameter its context's type, inside a computed
+            // column (wire-rev-1de981755-rest HIGH-1: CASE ... THEN 1 ELSE 3000000000 is int8).
             Some(Node::AConst(c)) => {
-                !top && (c.isnull || matches!(c.val, Some(Val::Ival(_) | Val::Sval(_))))
+                !top && (c.isnull
+                    || matches!(&c.val, Some(Val::Ival(_) | Val::Sval(_) | Val::Boolval(_)))
+                    || matches!(&c.val, Some(Val::Fval(f)) if integer_literal_type(&f.fval).is_some()))
             }
+            Some(Node::ParamRef(_)) => !top,
             Some(Node::AExpr(e)) => {
                 e.kind() == AExprKind::AexprOp
                     && matches!(
                         e.name.as_slice(),
                         [op] if matches!(op.node.as_ref(),
-                            Some(Node::String(s)) if matches!(s.sval.as_str(), "+" | "-" | "*" | "/" | "%"))
+                            Some(Node::String(s)) if matches!(s.sval.as_str(), "+" | "-" | "*" | "/" | "%")
+                                || (!top && s.sval == "||"))
                     )
                     && e.lexpr.as_deref().is_none_or(|l| plain(l, false))
                     && e.rexpr.as_deref().is_some_and(|r| plain(r, false))
@@ -606,6 +613,9 @@ pub fn computed_targets(parse: &ParseResult) -> Vec<bool> {
                     _ => false,
                 }) && c.defresult.as_deref().is_none_or(|d| plain(d, false))
             }
+            // COALESCE, GREATEST and LEAST are typed by their arguments as a CASE is by its results.
+            Some(Node::CoalesceExpr(c)) => c.args.iter().all(|a| plain(a, false)),
+            Some(Node::MinMaxExpr(m)) => m.args.iter().all(|a| plain(a, false)),
             // An operand cast to a type the walk names (2::int2 in 2::int2 + 2::int2 is int2, where
             // the engine's INTEGER announced int4; wire-rev-cfdebc06d LOW-5).
             Some(Node::TypeCast(c)) => {
@@ -636,6 +646,10 @@ pub struct Walked {
     pub untyped: std::collections::BTreeSet<u32>,
     /// The $n assigned to columns of two types ([`StatementTypes::inconsistent`]).
     pub inconsistent: std::collections::BTreeSet<u32>,
+    /// The bare $n that are an operand of + - * / % ([`StatementTypes::arithmetic_operands`]).
+    pub arithmetic_operands: std::collections::BTreeSet<u32>,
+    /// The bare $n that are an operand of a comparison ([`StatementTypes::compared_operands`]).
+    pub compared_operands: std::collections::BTreeSet<u32>,
     /// A plain SELECT's result columns' types, in order, as the walk read them (empty for any other
     /// statement): [`aggregate_types`] takes the aggregates' from these.
     pub columns: Vec<Option<u32>>,
@@ -700,6 +714,13 @@ pub struct StatementTypes {
     /// type, as PostgreSQL's parse analysis gives an undeclared parameter its first assignment's type
     /// (wire-rev-cfdebc06d LOW-7).
     pub inconsistent: std::collections::BTreeSet<u32>,
+    /// Every bare $n that is an operand of + - * / %: one the client declared interval, time or
+    /// timestamp is refused 0A000, as the walk refuses such arithmetic (the engine has no interval
+    /// type: ts + $1 declared interval answered '2027'; wire-rev-1de981755-rest HIGH-2).
+    pub arithmetic_operands: std::collections::BTreeSet<u32>,
+    /// Every bare $n that is an operand of a comparison: one the client declared interval is
+    /// refused 0A000 ($1 > $2 over two intervals compared their text; MED-8).
+    pub compared_operands: std::collections::BTreeSet<u32>,
     /// The translated statement is a COMMIT (`commits`) or a ROLLBACK of the whole transaction
     /// (`rolls_back`), whatever its text: the server keys its COMMIT rules on this, never on its own
     /// reading of the text, which `COMMIT<NBSP>` and other spellings it did not know slipped past
@@ -834,6 +855,7 @@ fn parameter_types_with(
         attached,
         missing_rte: Default::default(),
         first_refusal: Default::default(),
+        operand_params: Default::default(),
     };
     let mut columns = Vec::new();
     if let [raw] = parse.protobuf.stmts.as_slice() {
@@ -853,10 +875,13 @@ fn parameter_types_with(
     if let Some(Some(refused)) = infer.first_refusal.take() {
         return Err(refused);
     }
+    let (arithmetic_operands, compared_operands) = infer.operand_params.take();
     Ok(Walked {
         params: infer.types,
         untyped,
         inconsistent: infer.inconsistent,
+        arithmetic_operands,
+        compared_operands,
         columns,
         assignments: infer.assignments,
     })
@@ -956,6 +981,9 @@ struct Infer<'a> {
     /// walk cannot resolve that the engine can (an outer query's column) also leaves a later
     /// refusal to the engine, which answers min/max(boolean) as before.
     first_refusal: std::rc::Rc<std::cell::RefCell<Option<Option<SqlErrorMessage>>>>,
+    /// Each bare $n that is an operand of arithmetic (.0) or of a comparison (.1)
+    /// ([`Walked::arithmetic_operands`], [`Walked::compared_operands`]).
+    operand_params: std::rc::Rc<std::cell::RefCell<(std::collections::BTreeSet<u32>, std::collections::BTreeSet<u32>)>>,
 }
 
 /// The stack a view's reading starts with, and the stack grown for it when less is left: each view
@@ -1056,10 +1084,6 @@ enum Arithmetic {
 /// date int4, date +/- an integer date, an integer + date date, timestamp(tz) - timestamp(tz)
 /// interval. A character or boolean operand has no arithmetic operator.
 fn arithmetic(op: &str, a: u32, b: u32) -> Arithmetic {
-    const DATE: u32 = 1082;
-    const TIMESTAMP: u32 = 1114;
-    const TIMESTAMPTZ: u32 = 1184;
-    const INTERVAL: u32 = 1186;
     let int = |t: u32| matches!(t, INT2 | INT4 | INT8);
     let num = |t: u32| int(t) || matches!(t, NUMERIC | FLOAT4 | FLOAT8);
     let chars = |t: u32| matches!(t, TEXT | VARCHAR | BOOL | 1042);
@@ -1107,13 +1131,135 @@ fn type_name(t: u32) -> &'static str {
         BOOL => "boolean",
         1042 => "character",
         1082 => "date",
+        NAME => "name",
+        17 => "bytea",
+        TIME => "time without time zone",
+        TIMETZ => "time with time zone",
+        TIMESTAMP => "timestamp without time zone",
+        TIMESTAMPTZ => "timestamp with time zone",
+        INTERVAL => "interval",
         _ => "unknown",
+    }
+}
+
+const DATE: u32 = 1082;
+const TIME: u32 = 1083;
+const TIMETZ: u32 = 1266;
+const TIMESTAMP: u32 = 1114;
+const TIMESTAMPTZ: u32 = 1184;
+const INTERVAL: u32 = 1186;
+
+/// A type's category (pg_type.typcategory) and whether it is the category's preferred type, for the
+/// types the walk names; None for the rest, which [`common_of`] matches only with themselves.
+fn category(t: u32) -> Option<(char, bool)> {
+    Some(match t {
+        INT2 | INT4 | INT8 | NUMERIC | FLOAT4 => ('N', false),
+        FLOAT8 => ('N', true),
+        VARCHAR | 1042 | NAME => ('S', false),
+        TEXT => ('S', true),
+        BOOL => ('B', true),
+        DATE | TIME | TIMETZ | TIMESTAMP => ('D', false),
+        TIMESTAMPTZ => ('D', true),
+        INTERVAL => ('T', true),
+        _ => return None,
+    })
+}
+
+/// Whether pg_cast has an implicit cast from `a` to `b` (a != b), among the types [`category`] names.
+fn implicit_cast(a: u32, b: u32) -> bool {
+    let rank = |t: u32| match t {
+        INT2 => 1,
+        INT4 => 2,
+        INT8 => 3,
+        NUMERIC => 4,
+        FLOAT4 => 5,
+        FLOAT8 => 6,
+        _ => 0,
+    };
+    match (a, b) {
+        _ if rank(a) > 0 && rank(b) > 0 => rank(a) < rank(b),
+        (VARCHAR | 1042 | NAME, TEXT) | (VARCHAR, 1042) | (1042, VARCHAR) => true,
+        (DATE, TIMESTAMP | TIMESTAMPTZ) | (TIMESTAMP, TIMESTAMPTZ) | (TIME, TIMETZ) => true,
+        _ => false,
+    }
+}
+
+/// What [`common_of`] resolves a list of input types to.
+#[derive(Debug, PartialEq)]
+enum Common {
+    /// The common type.
+    Type(u32),
+    /// Two inputs of different categories: 42804 '<context> types <first> and <second> cannot be
+    /// matched'.
+    Mismatch(u32, u32),
+    /// A pair the walk cannot resolve (a type [`category`] does not name beside another type).
+    Unresolved,
+}
+
+/// PostgreSQL's select_common_type (parse_coerce.c) over the typed inputs, in PostgreSQL's order
+/// (a CASE's default result first); the untyped ones (an unknown literal, NULL, a parameter no
+/// context typed) are left out by the caller. The first input's type stands unless a later one of
+/// its category is preferred, or the first implicitly casts to it and not back; no input gives text.
+fn common_of(types: &[u32]) -> Common {
+    let Some((&first, rest)) = types.split_first() else {
+        return Common::Type(TEXT);
+    };
+    let mut common = first;
+    for &next in rest {
+        if next == common {
+            continue;
+        }
+        let (Some((pcat, preferred)), Some((ncat, _))) = (category(common), category(next)) else {
+            return Common::Unresolved;
+        };
+        if pcat != ncat {
+            return Common::Mismatch(common, next);
+        }
+        if !preferred && implicit_cast(common, next) && !implicit_cast(next, common) {
+            common = next;
+        }
+    }
+    Common::Type(common)
+}
+
+/// Whether a type is an interval, time or timestamp, whose arithmetic the engine cannot compute.
+fn is_temporal(t: Option<u32>) -> bool {
+    matches!(t, Some(TIME | TIMETZ | TIMESTAMP | TIMESTAMPTZ | INTERVAL))
+}
+
+/// Whether PostgreSQL has `a op b` for op one of + - * / with an interval, time or timestamp
+/// operand (pg_operator, through the implicit casts date to timestamp and time to timetz): interval
+/// with interval, a date, a time or a timestamp; timestamp - timestamp and time - time (an
+/// interval); date + time; interval times or over a number. timestamp + integer has none.
+fn temporal_operator(op: &str, a: u32, b: u32) -> bool {
+    let stamp = |t: u32| matches!(t, TIMESTAMP | TIMESTAMPTZ);
+    let clock = |t: u32| matches!(t, TIME | TIMETZ);
+    let dated = |t: u32| stamp(t) || clock(t) || t == DATE || t == INTERVAL;
+    let number = |t: u32| matches!(category(t), Some(('N', _)));
+    match op {
+        "+" => {
+            (a == INTERVAL && dated(b))
+                || (b == INTERVAL && dated(a))
+                || (a == DATE && clock(b))
+                || (clock(a) && b == DATE)
+        }
+        "-" => {
+            (b == INTERVAL && dated(a))
+                || ((stamp(a) || a == DATE) && (stamp(b) || b == DATE) && (stamp(a) || stamp(b)))
+                || (clock(a) && clock(b))
+        }
+        "*" => (a == INTERVAL && number(b)) || (number(a) && b == INTERVAL),
+        "/" => a == INTERVAL && number(b),
+        _ => false,
     }
 }
 
 impl Infer<'_> {
     /// Type `node` as `ty` if it is a parameter its first context has not typed yet.
     fn set(&mut self, node: &PgNode, ty: Option<u32>) {
+        // A parameter beside an interval binds as the text the engine stores, as it did when the
+        // walk read an interval column as text.
+        let ty = ty.map(|t| if t == INTERVAL { TEXT } else { t });
         if let (Some(n), Some(ty)) = (param(node), ty) {
             self.types.entry(n).or_insert(ty);
         }
@@ -1122,6 +1268,7 @@ impl Infer<'_> {
     /// `node` is assigned to a column of type `ty`: typed by it as [`Infer::set`] types, and a bare
     /// parameter a previous assignment gave another type is recorded as inconsistent.
     fn assign_type(&mut self, node: &PgNode, ty: Option<u32>) {
+        let ty = ty.map(|t| if t == INTERVAL { TEXT } else { t });
         if let (Some(n), Some(ty)) = (param(node), ty) {
             match self.assigned.get(&n) {
                 Some(first) if *first != ty => {
@@ -1165,7 +1312,7 @@ impl Infer<'_> {
     /// `a` and `b` are compared (or are the two sides of `a op b`): each parameter takes the
     /// other side's type; a parameter whose other side has none it can be given is noted (see
     /// [`parameter_types`]).
-    fn compare(&mut self, a: &PgNode, b: &PgNode, scope: &Scope) {
+    fn compare(&mut self, a: &PgNode, b: &PgNode, scope: &Scope) -> (Option<u32>, Option<u32>) {
         let (ta, tb) = (self.type_of(a, scope), self.type_of(b, scope));
         self.set(a, tb);
         self.set(b, ta);
@@ -1176,6 +1323,7 @@ impl Infer<'_> {
                 }
             }
         }
+        (ta, tb)
     }
 
     /// Whether `node` is an expression no context types, as opposed to a column of a relation the
@@ -1506,6 +1654,7 @@ impl Infer<'_> {
             attached: self.attached,
             missing_rte: Default::default(),
             first_refusal: Default::default(),
+            operand_params: Default::default(),
         };
         let columns = walk.select(query, &Vec::new());
         Some(rename(columns, &v.aliases))
@@ -1802,6 +1951,42 @@ impl Infer<'_> {
             inner.push(level);
             let columns = self.targets(&s.target_list, &inner);
             self.qual(s.where_clause.as_deref(), &inner);
+            // ORDER BY, GROUP BY and DISTINCT over an interval order and compare its text (ORDER BY
+            // i gave '1 day' before '2 hours', and '1 day' and '24 hours' were two groups;
+            // wire-rev-1de981755-rest MED-8). An item names a column by position or by its alias.
+            let item_type = |n: &PgNode| -> Option<u32> {
+                use turso_pg_parser::pg_query::protobuf::a_const::Val;
+                match n.node.as_ref() {
+                    Some(Node::AConst(c)) => match &c.val {
+                        Some(Val::Ival(i)) => usize::try_from(i.ival).ok().and_then(|k| k.checked_sub(1)).and_then(|k| columns.get(k)).and_then(|c| c.1),
+                        _ => None,
+                    },
+                    Some(Node::ColumnRef(c)) if c.fields.len() == 1 => {
+                        let name = match c.fields[0].node.as_ref() {
+                            Some(Node::String(s)) => Some(s.sval.as_str()),
+                            _ => None,
+                        };
+                        self.peek_type(n, &inner).or_else(|| columns.iter().find(|c| Some(c.0.as_str()) == name).and_then(|c| c.1))
+                    }
+                    _ => self.peek_type(n, &inner),
+                }
+            };
+            let sorted = s.sort_clause.iter().filter_map(|sort| match sort.node.as_ref() {
+                Some(Node::SortBy(b)) => b.node.as_deref(),
+                _ => None,
+            });
+            let distinct_on = s.distinct_clause.iter().filter(|d| d.node.is_some());
+            let mut interval_item = s.group_clause.iter().chain(sorted).chain(distinct_on).any(|n| item_type(n) == Some(INTERVAL));
+            // A bare DISTINCT is a list holding one empty node: every result column.
+            interval_item |= !s.distinct_clause.is_empty()
+                && s.distinct_clause.iter().all(|d| d.node.is_none())
+                && columns.iter().any(|c| c.1 == Some(INTERVAL));
+            if interval_item {
+                self.refusal(
+                    SqlErrorKind::FeatureNotSupported,
+                    "ordering, grouping or DISTINCT over interval is not supported".to_string(),
+                );
+            }
             for g in &s.group_clause {
                 self.expr(g, &inner);
             }
@@ -1955,6 +2140,26 @@ impl Infer<'_> {
                     return;
                 };
                 let kind = AExprKind::try_from(e.kind).unwrap_or(AExprKind::Undefined);
+                // A bare $n operand is recorded for its declared type, as in the target list
+                // ([`Walked::arithmetic_operands`], [`Walked::compared_operands`]): WHERE i = $1 with
+                // $1 declared interval compared the stored text (wire-rev-1de981755-rest MED-8).
+                let op = e.name.iter().find_map(|n| match &n.node {
+                    Some(Node::String(s)) => Some(s.sval.as_str()),
+                    _ => None,
+                });
+                let arithmetic = matches!(kind, AExprKind::AexprOp) && matches!(op, Some("+" | "-" | "*" | "/" | "%"));
+                let comparison = !matches!(kind, AExprKind::AexprOp | AExprKind::AexprNullif)
+                    || matches!(op, Some("=" | "<>" | "!=" | "<" | "<=" | ">" | ">="));
+                if arithmetic || comparison {
+                    let items: Vec<&PgNode> = match r.node.as_ref() {
+                        Some(Node::List(list)) => std::iter::once(l).chain(list.items.iter()).collect(),
+                        _ => vec![l, r],
+                    };
+                    for n in items.into_iter().filter_map(param) {
+                        let mut operands = self.operand_params.borrow_mut();
+                        if arithmetic { operands.0.insert(n) } else { operands.1.insert(n) };
+                    }
+                }
                 if matches!(
                     kind,
                     AExprKind::AexprLike | AExprKind::AexprIlike | AExprKind::AexprSimilar
@@ -1972,11 +2177,24 @@ impl Infer<'_> {
                     self.set(l, right.and_then(element_of));
                 } else if let Some(Node::List(list)) = r.node.as_ref() {
                     // IN (...) and BETWEEN: each item is compared with the left side.
+                    let mut temporal = false;
                     for item in &list.items {
-                        self.compare(l, item, scope);
+                        let (a, b) = self.compare(l, item, scope);
+                        temporal |= is_temporal(a) || is_temporal(b);
+                    }
+                    if temporal {
+                        self.type_of(node, scope);
                     }
                 } else {
-                    self.compare(l, r, scope);
+                    // A comparison or arithmetic over an interval, time or timestamp is judged as
+                    // in the target list ([`Infer::type_of`]: refused where the engine would
+                    // compute over the stored text; wire-rev-1de981755-rest HIGH-2, MED-8: WHERE i
+                    // > interval '2 hours' counted by text). Only then, so no other expression is
+                    // typed twice.
+                    let (a, b) = self.compare(l, r, scope);
+                    if is_temporal(a) || is_temporal(b) {
+                        self.type_of(node, scope);
+                    }
                 }
                 self.expr(l, scope);
                 self.expr(r, scope);
@@ -2040,17 +2258,19 @@ impl Infer<'_> {
                 }
                 self.exprs(f.agg_filter.as_deref(), scope);
             }
+            // A parameter among the arguments takes the others' common type ($1 in coalesce($1, b)
+            // is int8, PG 18.6 recording conditional_expressions_take_postgresqls_common_type).
             Some(Node::CoalesceExpr(c)) => {
-                let first = c.args.iter().find_map(|a| self.type_of(a, scope));
+                let common = Self::conditional_inputs(node).and_then(|(context, inputs)| self.common_type_of(context, &inputs, scope));
                 for arg in &c.args {
-                    self.set(arg, first);
+                    self.set(arg, common);
                     self.expr(arg, scope);
                 }
             }
             Some(Node::MinMaxExpr(m)) => {
-                let first = m.args.iter().find_map(|a| self.type_of(a, scope));
+                let common = Self::conditional_inputs(node).and_then(|(context, inputs)| self.common_type_of(context, &inputs, scope));
                 for arg in &m.args {
-                    self.set(arg, first);
+                    self.set(arg, common);
                     self.expr(arg, scope);
                 }
             }
@@ -2080,12 +2300,8 @@ impl Infer<'_> {
                         }
                     }
                 }
-                // The results share the first typed one's type.
-                let result = whens
-                    .iter()
-                    .filter_map(|w| w.result.as_deref())
-                    .chain(c.defresult.as_deref())
-                    .find_map(|r| self.type_of(r, scope));
+                // The results share their common type.
+                let result = Self::conditional_inputs(node).and_then(|(context, inputs)| self.common_type_of(context, &inputs, scope));
                 for r in whens
                     .iter()
                     .filter_map(|w| w.result.as_deref())
@@ -2225,6 +2441,127 @@ impl Infer<'_> {
     }
 
     /// The type `node` has where a parameter is compared with it, if the parse says.
+    /// The type of a CASE, COALESCE, GREATEST or LEAST over `inputs` (in PostgreSQL's order: a
+    /// CASE's default result first), as select_common_type resolves it ([`common_of`]), with
+    /// PostgreSQL's refusals: 42804 across categories, and an untyped literal its input function
+    /// refuses as the common type (22P02 'invalid input syntax for type integer: "x"', 22003). A
+    /// form the engine would answer otherwise than PostgreSQL is refused 0A000: an untyped literal
+    /// the common type reads (CASE ... THEN true ELSE 'yes' writes t; the engine wrote 'yes'), and a
+    /// result read as another type except numbers as wider numbers and strings as text (a date as a
+    /// timestamp writes '2026-01-02 00:00:00'). It took the first typed result's type, so a wider
+    /// later one was refused 22003 and a float went out under int4 (wire-rev-1de981755-rest HIGH-1).
+    fn common_type_of(&self, context: &str, inputs: &[&PgNode], scope: &Scope) -> Option<u32> {
+        use turso_pg_parser::pg_query::protobuf::a_const::Val;
+        let refuse = |kind: SqlErrorKind, message: String| self.refusal(kind, message);
+        let mut literals = Vec::new();
+        let mut typed = Vec::new();
+        let mut untyped = false;
+        for input in inputs {
+            match input.node.as_ref() {
+                Some(Node::AConst(c)) if c.isnull => {}
+                Some(Node::AConst(c)) if matches!(c.val, Some(Val::Sval(_))) => {
+                    if let Some(Val::Sval(s)) = &c.val {
+                        literals.push(s.sval.as_str());
+                    }
+                }
+                Some(Node::ParamRef(_)) if self.type_of(input, scope).is_none() => {}
+                _ => match self.type_of(input, scope) {
+                    Some(t) => typed.push(t),
+                    None => untyped = true,
+                },
+            }
+        }
+        if untyped {
+            return None;
+        }
+        let common = match common_of(&typed) {
+            Common::Type(t) => t,
+            Common::Mismatch(a, b) if type_name(a) != "unknown" && type_name(b) != "unknown" => {
+                return refuse(
+                    SqlErrorKind::DatatypeMismatch,
+                    format!("{context} types {} and {} cannot be matched", type_name(a), type_name(b)),
+                );
+            }
+            Common::Mismatch(..) | Common::Unresolved => return None,
+        };
+        // GREATEST and LEAST over an interval order its text (greatest(i, interval '5 hours') gave
+        // '5 hours' over '1 day'; wire-rev-1de981755-rest MED-8).
+        if common == INTERVAL && matches!(context, "GREATEST" | "LEAST") {
+            return refuse(SqlErrorKind::FeatureNotSupported, format!("{context} over interval is not supported"));
+        }
+        let string = |t: u32| matches!(category(t), Some(('S', _)));
+        if !string(common) {
+            if let Some((message, kind)) =
+                literals.iter().find_map(|l| crate::functions::validate_pg_input(l, type_name(common)))
+            {
+                return refuse(kind, message);
+            }
+            if !literals.is_empty() {
+                return refuse(
+                    SqlErrorKind::FeatureNotSupported,
+                    format!("an untyped literal read as {} in {context} is not supported; cast it", type_name(common)),
+                );
+            }
+        }
+        let number = |t: u32| matches!(category(t), Some(('N', _)));
+        if let Some(&other) = typed
+            .iter()
+            .find(|&&t| t != common && !(number(t) && number(common)) && !(matches!(t, VARCHAR | NAME) && common == TEXT))
+        {
+            return refuse(
+                SqlErrorKind::FeatureNotSupported,
+                format!("{context} reading {} as {} is not supported", type_name(other), type_name(common)),
+            );
+        }
+        Some(common)
+    }
+
+    /// Refuse the statement with `kind` and `message` unless an earlier refusal stands; None, the
+    /// refused expression's type.
+    fn refusal(&self, kind: SqlErrorKind, message: String) -> Option<u32> {
+        self.first_refusal
+            .borrow_mut()
+            .get_or_insert_with(|| Some(SqlErrorMessage::classified(kind, message)));
+        None
+    }
+
+    /// `node`'s type, as [`Infer::type_of`] gives it, for a check that must not change what the
+    /// walk refuses: an unresolvable column here (an ORDER BY alias) leaves later refusals standing.
+    fn peek_type(&self, node: &PgNode, scope: &Scope) -> Option<u32> {
+        let before = self.first_refusal.borrow().is_some();
+        let ty = self.type_of(node, scope);
+        if !before && matches!(*self.first_refusal.borrow(), Some(None)) {
+            *self.first_refusal.borrow_mut() = None;
+        }
+        ty
+    }
+
+    /// The inputs of a conditional expression and its name in PostgreSQL's 42804 message, for
+    /// [`Infer::common_type_of`]: a CASE's results with its default result first, COALESCE's and
+    /// GREATEST's or LEAST's arguments.
+    fn conditional_inputs(node: &PgNode) -> Option<(&'static str, Vec<&PgNode>)> {
+        use turso_pg_parser::pg_query::protobuf::MinMaxOp;
+        match node.node.as_ref()? {
+            Node::CaseExpr(c) => Some((
+                "CASE",
+                c.defresult
+                    .as_deref()
+                    .into_iter()
+                    .chain(c.args.iter().filter_map(|w| match w.node.as_ref() {
+                        Some(Node::CaseWhen(w)) => w.result.as_deref(),
+                        _ => None,
+                    }))
+                    .collect(),
+            )),
+            Node::CoalesceExpr(c) => Some(("COALESCE", c.args.iter().collect())),
+            Node::MinMaxExpr(m) => Some((
+                if MinMaxOp::try_from(m.op) == Ok(MinMaxOp::IsLeast) { "LEAST" } else { "GREATEST" },
+                m.args.iter().collect(),
+            )),
+            _ => None,
+        }
+    }
+
     fn type_of(&self, node: &PgNode, scope: &Scope) -> Option<u32> {
         use turso_pg_parser::pg_query::protobuf::a_const::Val;
         use turso_pg_parser::pg_query::protobuf::{AExprKind, SubLinkType};
@@ -2248,19 +2585,33 @@ impl Infer<'_> {
                         _ => None,
                     })
                     .collect();
-                let unknown_min_max = match parts.as_slice() {
-                    [name] | ["pg_catalog", name] => {
-                        (name.eq_ignore_ascii_case("min") || name.eq_ignore_ascii_case("max")) && !matches!(*name, "min" | "max")
-                    }
+                // A function PostgreSQL has none of: a name quoted with an upper-case letter (every
+                // pg_catalog function is lower case: "LENGTH", "MAX"), or one qualified by public, or
+                // min or max qualified by any schema but pg_catalog; 42883 named as written, with
+                // its arguments' types (wire-rev-351702a43 LOW-8, wire-rev-7128c6f73 L5,
+                // wire-rev-1de981755-rest LOW-3: only min and max were judged, and "MAX"(NULL)
+                // answered). An argument the walk cannot type leaves it to the engine.
+                let unknown_function = match parts.as_slice() {
+                    [name] | ["pg_catalog", name] => name.bytes().any(|b| b.is_ascii_uppercase()),
+                    ["public", _] => true,
                     [_, name] => matches!(*name, "min" | "max"),
                     _ => false,
                 };
-                if unknown_min_max {
-                    if let Some(t) = call.args.first().and_then(|a| self.type_of(a, scope)).filter(|t| type_name(*t) != "unknown") {
+                if unknown_function {
+                    use turso_pg_parser::pg_query::protobuf::a_const::Val;
+                    let types: Option<Vec<&str>> = call
+                        .args
+                        .iter()
+                        .map(|a| match a.node.as_ref() {
+                            Some(Node::AConst(c)) if c.isnull || matches!(c.val, Some(Val::Sval(_))) => Some("unknown"),
+                            _ => self.type_of(a, scope).map(type_name).filter(|n| *n != "unknown"),
+                        })
+                        .collect();
+                    if let Some(types) = types {
                         self.first_refusal.borrow_mut().get_or_insert_with(|| {
                             Some(SqlErrorMessage::classified(
                                 SqlErrorKind::UndefinedFunction,
-                                format!("function {}({}) does not exist", parts.join("."), type_name(t)),
+                                format!("function {}({}) does not exist", parts.join("."), types.join(", ")),
                             ))
                         });
                     }
@@ -2270,10 +2621,16 @@ impl Infer<'_> {
                 if let Some(t) = scalar_result(&name) {
                     return Some(t);
                 }
+                let first = call.args.first().and_then(|a| self.type_of(a, scope));
+                // An aggregate over an interval reads its text: max and min ordered it, sum and avg
+                // summed its digits, and DISTINCT kept '1 day' and '24 hours' apart
+                // (wire-rev-1de981755-rest MED-8).
+                if first == Some(INTERVAL) && (call.agg_distinct || matches!(name.as_str(), "min" | "max" | "sum" | "avg")) {
+                    return self.refusal(SqlErrorKind::FeatureNotSupported, format!("{name}() over interval is not supported"));
+                }
                 if name == "count" {
                     return Some(INT8);
                 }
-                let first = call.args.first().and_then(|a| self.type_of(a, scope));
                 match (name.as_str(), first?) {
                     ("sum", INT2 | INT4) => Some(INT8),
                     ("sum", INT8 | NUMERIC) => Some(NUMERIC),
@@ -2321,6 +2678,9 @@ impl Infer<'_> {
             }
             Node::AConst(c) => match c.val.as_ref()? {
                 Val::Ival(_) => Some(INT4),
+                // An integer past int4 is int8 in PostgreSQL's grammar; pg_query gives it as a
+                // float's text ([`integer_literal_type`]).
+                Val::Fval(f) if integer_literal_type(&f.fval).is_some() => integer_literal_type(&f.fval),
                 Val::Fval(_) => Some(NUMERIC),
                 Val::Boolval(_) => Some(BOOL),
                 // An untyped literal resolves as text against an undeclared parameter.
@@ -2340,6 +2700,28 @@ impl Infer<'_> {
                 let comparison = !matches!(kind, AExprKind::AexprOp)
                     || matches!(op, Some("=" | "<>" | "!=" | "<" | "<=" | ">" | ">="));
                 if comparison && !matches!(kind, AExprKind::AexprNullif) {
+                    // Its operands are typed for their own refusals (ts2 - ts > interval '1 day' in
+                    // the target list was answered f), and an interval compared is refused: the
+                    // engine compares its text ('1 day' > '2 hours' was f; wire-rev-1de981755-rest
+                    // HIGH-2, MED-8). A bare $n beside them is recorded for its declared type
+                    // ([`Walked::compared_operands`]).
+                    let mut operands: Vec<&PgNode> = Vec::new();
+                    for side in [e.lexpr.as_deref(), e.rexpr.as_deref()].into_iter().flatten() {
+                        match side.node.as_ref() {
+                            Some(Node::List(l)) => operands.extend(l.items.iter()),
+                            _ => operands.push(side),
+                        }
+                    }
+                    let mut interval = false;
+                    for operand in &operands {
+                        if let Some(n) = param(operand) {
+                            self.operand_params.borrow_mut().1.insert(n);
+                        }
+                        interval |= self.type_of(operand, scope) == Some(INTERVAL);
+                    }
+                    if interval {
+                        return self.refusal(SqlErrorKind::FeatureNotSupported, "interval comparison is not supported".to_string());
+                    }
                     return Some(BOOL);
                 }
                 if op == Some("||") {
@@ -2353,14 +2735,39 @@ impl Infer<'_> {
                 };
                 let l = e.lexpr.as_deref().and_then(|l| self.type_of(l, scope));
                 let r = e.rexpr.as_deref().and_then(|r| self.type_of(r, scope));
-                if matches!(op, Some("+" | "-" | "*" | "/")) && (l == Some(1186) || r == Some(1186)) {
-                    self.first_refusal.borrow_mut().get_or_insert_with(|| {
-                        Some(SqlErrorMessage::classified(
-                            SqlErrorKind::FeatureNotSupported,
-                            "interval arithmetic is not supported",
-                        ))
-                    });
-                    return None;
+                if matches!(op, Some("+" | "-" | "*" | "/" | "%")) {
+                    for side in [e.lexpr.as_deref(), e.rexpr.as_deref()].into_iter().flatten() {
+                        if let Some(n) = param(side) {
+                            self.operand_params.borrow_mut().0.insert(n);
+                        }
+                    }
+                }
+                // Arithmetic with an interval, time or timestamp operand, wherever it comes from (a
+                // column, now(), a parameter, a cast), is refused 0A000 where PostgreSQL has the
+                // operator: the engine has no interval type and computed over the stored text (ts +
+                // $1 interval answered '2027', time - time 1; wire-rev-1de981755-rest HIGH-2). Where
+                // PostgreSQL has none (timestamp + integer) it is 42883, as PostgreSQL refuses it.
+                // An untyped literal, a parameter or an untyped expression beside one takes the
+                // operator PostgreSQL resolves for it (ts + '1 day' is timestamp + interval).
+                if matches!(op, Some("+" | "-" | "*" | "/" | "%")) && (is_temporal(l) || is_temporal(r)) {
+                    let op = op.unwrap_or("");
+                    let given = |x: Option<&PgNode>| !untyped(x) && x.and_then(param).is_none();
+                    let exists = match (e.lexpr.as_deref(), l, r) {
+                        (None, _, r) => r == Some(INTERVAL) && op == "-",
+                        (Some(_), Some(a), Some(b)) if given(e.lexpr.as_deref()) && given(e.rexpr.as_deref()) => {
+                            temporal_operator(op, a, b)
+                        }
+                        _ => true,
+                    };
+                    if exists {
+                        return self.refusal(SqlErrorKind::FeatureNotSupported, "interval arithmetic is not supported".to_string());
+                    }
+                    let name = |t: Option<u32>| t.map_or("unknown", type_name);
+                    let message = match e.lexpr {
+                        None => format!("operator does not exist: {op} {}", name(r)),
+                        Some(_) => format!("operator does not exist: {} {op} {}", name(l), name(r)),
+                    };
+                    return self.refusal(SqlErrorKind::UndefinedFunction, message);
                 }
                 // Two untyped literals leave every candidate operator, as PostgreSQL finds:
                 // 42725 'operator is not unique: unknown + unknown' (wire-rev-cfdebc06d LOW-4).
@@ -2422,17 +2829,10 @@ impl Infer<'_> {
                 }
             }
             Node::BoolExpr(_) | Node::NullTest(_) | Node::BooleanTest(_) => Some(BOOL),
-            Node::CoalesceExpr(c) => c.args.iter().find_map(|a| self.type_of(a, scope)),
-            Node::MinMaxExpr(m) => m.args.iter().find_map(|a| self.type_of(a, scope)),
-            Node::CaseExpr(c) => c
-                .args
-                .iter()
-                .filter_map(|w| match w.node.as_ref() {
-                    Some(Node::CaseWhen(w)) => w.result.as_deref(),
-                    _ => None,
-                })
-                .chain(c.defresult.as_deref())
-                .find_map(|r| self.type_of(r, scope)),
+            Node::CoalesceExpr(_) | Node::MinMaxExpr(_) | Node::CaseExpr(_) => {
+                let (context, inputs) = Self::conditional_inputs(node)?;
+                self.common_type_of(context, &inputs, scope)
+            }
             Node::SubLink(l) => {
                 let kind = SubLinkType::try_from(l.sub_link_type).unwrap_or(SubLinkType::Undefined);
                 match kind {
@@ -2491,6 +2891,7 @@ impl Infer<'_> {
             attached: self.attached,
             missing_rte: self.missing_rte.clone(),
             first_refusal: self.first_refusal.clone(),
+            operand_params: self.operand_params.clone(),
         };
         let level = walk.from_items(&s.from_clause, scope);
         let mut inner = scope.clone();
@@ -2593,7 +2994,10 @@ fn cast_type(cast: &turso_pg_parser::pg_query::protobuf::TypeCast) -> Option<u32
     // An interval cast is an interval to the walk, so its arithmetic is refused as such
     // (wire-rev-7128c6f73 L4), not typed as the text the engine stores.
     if name == "interval" {
-        return Some(1186);
+        return Some(INTERVAL);
+    }
+    if name == "timetz" {
+        return Some(TIMETZ);
     }
     u32::try_from(sqlite_type_to_pg_oid(name)).ok()
 }
@@ -2748,6 +3152,12 @@ fn view_columns_traced(schema: &Schema, select: &turso_parser::ast::Select) -> b
 /// column was int4, its element untyped, and $1 text, which matched no integer element (wire
 /// review 10 item 3). None for an array of a type with no array type here.
 fn column_oid(col: &Column) -> Option<u32> {
+    // An interval column is an interval to the walk, so what reads its value is refused
+    // ([`Infer::type_of`]); the engine stores its text and announces it text.
+    let declared = col.ty_str.split('(').next().unwrap_or("").trim();
+    if declared.eq_ignore_ascii_case("interval") && col.array_dimensions() == 0 {
+        return Some(INTERVAL);
+    }
     let base = u32::try_from(sqlite_type_to_pg_oid(&col.ty_str)).ok()?;
     if col.array_dimensions() > 0 {
         array_of(base)

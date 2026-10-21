@@ -4,6 +4,7 @@ use thiserror::Error;
 pub use turso_parser::sql_error::{SqlErrorKind, SqlErrorMessage};
 
 pub mod translator;
+pub mod volatility;
 
 /// libpg_query's bindings, for callers that edit a parse tree (the frontend's table rebuild).
 pub use pg_query;

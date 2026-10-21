@@ -432,7 +432,13 @@ fn refuse_cross_database(
         }
     }
     // The statements whose relation the node walk does not reach (wire-rev-351702a43 MED-1: an
-    // ALTER ... RENAME renamed this database's table; COMMENT ON and DROP name theirs as lists).
+    // ALTER ... RENAME renamed this database's table; COMMENT ON and DROP name theirs as lists;
+    // wire-rev-1de981755-rest MED-3: REFERENCES, SELECT INTO, CREATE TABLE AS and CREATE or ALTER
+    // SEQUENCE acted on this database). A name list is a relation's by its object kind: a table,
+    // index, sequence, view or foreign table is its whole list; a column, or a constraint, trigger,
+    // rule or policy, is its list less the last name (MED-2: COMMENT ON COLUMN public.n.a and ON
+    // CONSTRAINT c ON public.n were read as database.schema.name and refused).
+    use turso_pg_parser::pg_query::protobuf::{ObjectType, RangeVar};
     let names = |list: &turso_pg_parser::pg_query::protobuf::Node| -> Vec<String> {
         match list.node.as_ref() {
             Some(Node::List(l)) => l
@@ -446,28 +452,88 @@ fn refuse_cross_database(
             _ => Vec::new(),
         }
     };
+    let relation_of = |kind: i32, list: Vec<String>| -> Option<Vec<String>> {
+        match ObjectType::try_from(kind).ok()? {
+            ObjectType::ObjectTable
+            | ObjectType::ObjectIndex
+            | ObjectType::ObjectSequence
+            | ObjectType::ObjectView
+            | ObjectType::ObjectMatview
+            | ObjectType::ObjectForeignTable => Some(list),
+            ObjectType::ObjectColumn
+            | ObjectType::ObjectTabconstraint
+            | ObjectType::ObjectTrigger
+            | ObjectType::ObjectRule
+            | ObjectType::ObjectPolicy => {
+                let mut list = list;
+                list.pop();
+                Some(list)
+            }
+            _ => None,
+        }
+    };
+    let mut check_list = |list: Option<Vec<String>>| -> Result<()> {
+        if let Some([database, schema, name]) = list.as_deref() {
+            check(database, schema, name)?;
+        }
+        Ok(())
+    };
+    let mut ranges: Vec<&RangeVar> = Vec::new();
+    // A REFERENCES clause: a column's or the table's constraint, or ALTER TABLE ... ADD.
+    fn constraint<'a>(n: &'a turso_pg_parser::pg_query::protobuf::Node, out: &mut Vec<&'a RangeVar>) {
+        if let Some(Node::Constraint(c)) = n.node.as_ref() {
+            if let Some(rv) = c.pktable.as_ref() {
+                out.push(rv);
+            }
+        }
+    }
     for raw in &parse.protobuf.stmts {
         match raw.stmt.as_ref().and_then(|s| s.node.as_ref()) {
-            Some(Node::RenameStmt(r)) => {
-                if let Some(rv) = r.relation.as_ref().filter(|rv| !rv.catalogname.is_empty()) {
-                    check(&rv.catalogname, &rv.schemaname, &rv.relname)?;
-                }
-            }
+            Some(Node::RenameStmt(r)) => ranges.extend(r.relation.as_ref()),
             Some(Node::DropStmt(d)) => {
                 for object in &d.objects {
-                    if let [database, schema, name] = names(object).as_slice() {
-                        check(database, schema, name)?;
-                    }
+                    check_list(relation_of(d.remove_type, names(object)))?;
                 }
             }
             Some(Node::CommentStmt(c)) => {
                 if let Some(object) = c.object.as_deref() {
-                    if let [database, schema, name] = names(object).as_slice() {
-                        check(database, schema, name)?;
+                    check_list(relation_of(c.objtype, names(object)))?;
+                }
+            }
+            Some(Node::CreateStmt(c)) => {
+                for element in &c.table_elts {
+                    match element.node.as_ref() {
+                        Some(Node::ColumnDef(d)) => d.constraints.iter().for_each(|k| constraint(k, &mut ranges)),
+                        _ => constraint(element, &mut ranges),
                     }
                 }
             }
+            Some(Node::AlterTableStmt(a)) => {
+                for cmd in &a.cmds {
+                    if let Some(Node::AlterTableCmd(c)) = cmd.node.as_ref() {
+                        if let Some(def) = c.def.as_deref() {
+                            match def.node.as_ref() {
+                                Some(Node::ColumnDef(d)) => d.constraints.iter().for_each(|k| constraint(k, &mut ranges)),
+                                _ => constraint(def, &mut ranges),
+                            }
+                        }
+                    }
+                }
+            }
+            Some(Node::SelectStmt(s)) => {
+                ranges.extend(s.into_clause.as_ref().and_then(|i| i.rel.as_ref()));
+            }
+            Some(Node::CreateTableAsStmt(c)) => {
+                ranges.extend(c.into.as_ref().and_then(|i| i.rel.as_ref()));
+            }
+            Some(Node::CreateSeqStmt(c)) => ranges.extend(c.sequence.as_ref()),
+            Some(Node::AlterSeqStmt(a)) => ranges.extend(a.sequence.as_ref()),
             _ => {}
+        }
+    }
+    for rv in ranges {
+        if !rv.catalogname.is_empty() {
+            check(&rv.catalogname, &rv.schemaname, &rv.relname)?;
         }
     }
     Ok(())
@@ -2040,7 +2106,48 @@ fn prepare_statement_parsed(
                 if f.funcname.last().is_some_and(|p| matches!(&p.node,
                     Some(turso_pg_parser::pg_query::protobuf::node::Node::String(s)) if s.sval.eq_ignore_ascii_case("min") || s.sval.eq_ignore_ascii_case("max"))))
         });
-        if !used.is_empty() || aggregates.contains(&true) || min_max {
+        // ... and for one calling a function PostgreSQL has none of, a quoted name with an
+        // upper-case letter or a public-qualified one, which the walk refuses 42883
+        // (wire-rev-1de981755-rest LOW-3: "LENGTH"('abc') answered). Bounded by the text as
+        // above: such a call is a quoted name right before its '(' or a "public." prefix.
+        let unknown_call = (may_name(b"\"(") || may_name(b"public."))
+            && parse_result.protobuf.nodes().iter().any(|(n, ..)| {
+                matches!(n, turso_pg_parser::pg_query::NodeRef::FuncCall(f)
+                    if f.funcname.iter().any(|p| matches!(&p.node,
+                        Some(turso_pg_parser::pg_query::protobuf::node::Node::String(s))
+                            if s.sval == "public" || s.sval.bytes().any(|b| b.is_ascii_uppercase()))))
+            });
+        // ... and for one that may read an interval, time or timestamp value, whose arithmetic and
+        // interval comparisons the walk refuses (wire-rev-1de981755-rest HIGH-2, MED-8: `WHERE ts2 >
+        // ts + interval '1 hour'` was never walked). The text bounds it as for min and max: such a
+        // value is a cast or literal (interval, time, timestamp), a function (now(),
+        // current_timestamp, localtime), or a column of a table the statement names that is
+        // declared time or timestamp, or of a view it names whose columns or text hold one.
+        // BLIND SPOTS: a column declared interval is stored as text (the engine has no interval
+        // type) and reads as text; a view over a view is judged by its own columns and text only;
+        // a view's computed columns are typed by its own walk, whose refusals stay there.
+        let temporal_declared = |ty: &str| {
+            let declared = ty.split('(').next().unwrap_or("").trim();
+            ["interval", "time", "timetz", "timestamp", "timestamptz"].iter().any(|t| declared.eq_ignore_ascii_case(t))
+        };
+        let temporal_table = |table: &turso_core::schema::Table| table.columns().iter().any(|c| temporal_declared(&c.ty_str));
+        let mentions = |text: &str, word: &[u8]| text.as_bytes().windows(word.len()).any(|w| w.eq_ignore_ascii_case(word));
+        let temporal = || {
+            may_name(b"interval")
+                || may_name(b"time")
+                || may_name(b"now")
+                || schema.tables.iter().any(|(name, table)| may_name(name.as_bytes()) && temporal_table(table.as_ref()))
+                || schema.views.iter().any(|(name, view)| {
+                    may_name(name.as_bytes())
+                        && (view.columns.iter().any(|c| temporal_declared(&c.ty_str))
+                            || [b"interval".as_slice(), b"time", b"now"].iter().any(|w| mentions(&view.sql, w))
+                            || schema
+                                .tables
+                                .iter()
+                                .any(|(table, t)| mentions(&view.sql, table.as_bytes()) && temporal_table(t.as_ref())))
+                })
+        };
+        if !used.is_empty() || aggregates.contains(&true) || min_max || unknown_call || temporal() {
             // A parameter compared with something no context types is refused (42P18) by the
             // server, which alone reads the types the client declared (wire review 8 item 7,
             // review 11 item 1).
@@ -2077,6 +2184,8 @@ fn prepare_statement_parsed(
             types.params = walked.params;
             types.untyped = walked.untyped;
             types.inconsistent = walked.inconsistent;
+            types.arithmetic_operands = walked.arithmetic_operands;
+            types.compared_operands = walked.compared_operands;
             types.assignments = walked.assignments;
             types.columns = crate::result_types::aggregate_types(&aggregates, &walked.columns);
         }
@@ -4825,7 +4934,7 @@ fn folds_at_plan(parse: &turso_pg_parser::pg_query::ParseResult) -> bool {
 
 /// Whether a node of the tree is itself a stable or volatile computation: a call of one
 /// ([`calls_non_immutable`]), a cast through a stable input function (to date, timestamp,
-/// timestamptz, interval, regclass, ...: [`STABLE_INPUT`], so `'nosuch'::text::regclass` raises
+/// timestamptz, interval, regclass, ...: [`has_immutable_input`], so `'nosuch'::text::regclass` raises
 /// after RowDescription, wire-rev-5cdb70e58 LOW-1), or a SQL value function (CURRENT_TIMESTAMP,
 /// CURRENT_USER). BLIND SPOT: a stable operator (timestamptz + interval) is taken as immutable.
 fn not_immutable(n: &turso_pg_parser::pg_query::NodeRef) -> bool {
@@ -4838,22 +4947,13 @@ fn not_immutable(n: &turso_pg_parser::pg_query::NodeRef) -> bool {
                     Some(turso_pg_parser::pg_query::protobuf::node::Node::String(s)) => Some(s.sval.to_ascii_lowercase()),
                     _ => None,
                 })
-                .is_some_and(|name| STABLE_INPUT.binary_search(&name.as_str()).is_ok())
+                .is_some_and(|name| !has_immutable_input(&name))
         }),
         NodeRef::SqlvalueFunction(_) => true,
         _ => false,
     }
 }
 
-/// PostgreSQL 18.6's base and range types whose input function is stable or volatile (pg_type
-/// typinput's provolatile; recorded on iccad2, fresh initdb, 2026-10-19), sorted.
-const STABLE_INPUT: [&str; 32] = [
-    "aclitem", "date", "datemultirange", "daterange", "int4multirange", "int4range",
-    "int8multirange", "int8range", "interval", "money", "nummultirange", "numrange", "regclass",
-    "regcollation", "regconfig", "regdictionary", "regnamespace", "regoper", "regoperator",
-    "regproc", "regprocedure", "regrole", "regtype", "time", "timestamp", "timestamptz", "timetz",
-    "tsmultirange", "tsrange", "tstzmultirange", "tstzrange", "xml",
-];
 
 /// [`crate::StatementTypes::fold_probe`]: the immutable constant parts of a no-FROM SELECT's
 /// targets and WHERE, each a maximal subtree with no stable or volatile part and no column, as one
@@ -5003,32 +5103,11 @@ fn fold_probe(parse: &turso_pg_parser::pg_query::ParseResult) -> Option<String> 
     Node::SelectStmt(Box::new(probe)).deparse().ok()
 }
 
-/// PostgreSQL 18.6's functions that are stable or volatile in every overload (recorded,
-/// pg18-nonimmutable-functions.list): the planner folds immutable calls only, so a statement
-/// calling one raises its error at execution, after RowDescription (pg_database_size(99999::oid):
-/// recorded, pg18-wirefuzz-pg_database_size_of_null_or_an_unknown_oid_answers_as_postgresql_does
-/// .out #3, #4). BLIND SPOT: a name with immutable and other overloads (31 of them) is taken as
-/// folded.
-static NON_IMMUTABLE: std::sync::LazyLock<Vec<&'static str>> = std::sync::LazyLock::new(|| {
-    include_str!("pg18-nonimmutable-functions.list")
-        .lines()
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .collect()
-});
+/// The immutability lists (PostgreSQL 18.6's), shared with the translator.
+pub(crate) use turso_pg_parser::volatility::{has_immutable_input, is_immutable_call};
 
-/// Whether the function named `name` (bare, lowercased) is immutable in PostgreSQL 18.6 as far as
-/// [`NON_IMMUTABLE`] tells (a name it does not list).
-pub(crate) fn is_immutable_call(name: &str) -> bool {
-    NON_IMMUTABLE.binary_search(&name).is_err()
-}
-
-/// Whether a cast to the type named `name` reads through an immutable input function
-/// ([`STABLE_INPUT`] does not list it).
-pub(crate) fn has_immutable_input(name: &str) -> bool {
-    STABLE_INPUT.binary_search(&name.to_ascii_lowercase().as_str()).is_err()
-}
-
-/// Whether `call` names a function [`NON_IMMUTABLE`] lists, bare or pg_catalog-qualified.
+/// Whether `call` names a function PostgreSQL 18.6 has only stable or volatile overloads of
+/// ([`is_immutable_call`]), bare or pg_catalog-qualified.
 fn calls_non_immutable(call: &turso_pg_parser::pg_query::protobuf::FuncCall) -> bool {
     use turso_pg_parser::pg_query::protobuf::node::Node;
     let names: Vec<&str> = call
@@ -5043,7 +5122,7 @@ fn calls_non_immutable(call: &turso_pg_parser::pg_query::protobuf::FuncCall) -> 
         [name] | ["pg_catalog", name] => name.to_ascii_lowercase(),
         _ => return false,
     };
-    NON_IMMUTABLE.binary_search(&name.as_str()).is_ok()
+    !is_immutable_call(&name)
 }
 
 pub(crate) fn is_delete_using(sql: &str, parse: &turso_pg_parser::pg_query::ParseResult) -> bool {

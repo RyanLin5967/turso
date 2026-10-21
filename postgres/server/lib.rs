@@ -4270,6 +4270,15 @@ fn engine_info(e: &LimboError) -> Box<ErrorInfo> {
         };
         return error(e.sql_error_kind(), message.to_string());
     }
+    // A 22P02 the translator wrote as PostgreSQL's own text ('invalid input syntax for type oid:
+    // "1.5"') goes out as that text, with no "Parse error: " prefix; it stays a parse error inside,
+    // so its condition survives a rewording (wire-rev-1de981755-rest MED-9; 3d31f21b9 moved it to
+    // another variant, and c44_rewording_a_parser_error_preserves_its_condition caught it).
+    if let LimboError::ParseError(message) = e {
+        if matches!(message.kind(), Some(SqlErrorKind::InvalidTextRepresentation | SqlErrorKind::InvalidParameterValue)) {
+            return error(e.sql_error_kind(), message.to_string());
+        }
+    }
     error(e.sql_error_kind(), e.to_string())
 }
 
@@ -5478,7 +5487,11 @@ fn past_announced_integer(val: &Value, pg_type: &Type) -> Option<&'static str> {
                 Type::INT4 => (f64::from(i32::MIN), f64::from(i32::MAX)),
                 _ => (-9.223372036854775808e18, 9.223372036854775807e18),
             };
-            (!f.is_finite() || f < lo || f >= hi + if *pg_type == Type::INT8 { 0.0 } else { 1.0 }).then_some(name)
+            // Under int8 a REAL is the engine's overflow, and one rounding to exactly -2^63 is past
+            // the range too (wire-rev-1de981755-rest MED-7: -v - 2 over int8's maximum answered
+            // -9.223372036854776e+18).
+            let below = if *pg_type == Type::INT8 { f <= lo } else { f < lo };
+            (!f.is_finite() || below || f >= hi + if *pg_type == Type::INT8 { 0.0 } else { 1.0 }).then_some(name)
         }
         _ => None,
     }
@@ -5531,7 +5544,7 @@ fn encode_row<'a>(
 /// engine's bytes under that type's name.
 /// The column types [`encode_binary`] encodes; a binary column of any other type is refused before
 /// its statement runs.
-const BINARY_ENCODED: [Type; 13] = [
+const BINARY_ENCODED: [Type; 14] = [
     Type::BOOL,
     Type::INT2,
     Type::INT4,
@@ -5545,6 +5558,9 @@ const BINARY_ENCODED: [Type; 13] = [
     Type::UNKNOWN,
     Type::JSON,
     Type::BYTEA,
+    // An oid is always an integer in the engine (an INTEGER column or a cast), sent as its four
+    // unsigned bytes (wire-rev-1de981755-rest LOW-6).
+    Type::OID,
 ];
 
 fn encode_binary(encoder: &mut DataRowEncoder, val: &Value, pg_type: &Type) -> PgWireResult<()> {
@@ -5571,6 +5587,8 @@ fn encode_binary(encoder: &mut DataRowEncoder, val: &Value, pg_type: &Type) -> P
             _ if *t == Type::INT2 => encoder.encode_field(&i16::try_from(*i).map_err(range)?),
             _ if *t == Type::INT4 => encoder.encode_field(&i32::try_from(*i).map_err(range)?),
             _ if *t == Type::INT8 => encoder.encode_field(i),
+            // An oid is its four unsigned bytes (wire-rev-1de981755-rest LOW-6: refused 0A000).
+            _ if *t == Type::OID => encoder.encode_field(&u32::try_from(*i).map_err(range)?),
             _ if *t == Type::FLOAT4 => encoder.encode_field(&(*i as f32)),
             _ if *t == Type::FLOAT8 => encoder.encode_field(&(*i as f64)),
             _ if text_like => encoder.encode_field(&i.to_string().as_str()),
@@ -5668,6 +5686,23 @@ fn parameter_types(types: &StatementTypes, declared: &[Option<Type>]) -> SqlResu
     (1..=highest.max(declared.len()))
         .map(|n| {
             if let Some(Some(t)) = declared.get(n - 1) {
+                // Declared interval, time or timestamp and an operand of arithmetic, or declared
+                // interval and compared: refused as the walk refuses such an operand of its own (the
+                // engine has no interval type: ts + $1 answered '2027', $1 > $2 compared text;
+                // wire-rev-1de981755-rest HIGH-2, MED-8).
+                let temporal = [Type::INTERVAL, Type::TIME, Type::TIMETZ, Type::TIMESTAMP, Type::TIMESTAMPTZ].contains(t);
+                if (temporal && types.arithmetic_operands.contains(&(n as u32)))
+                    || (*t == Type::INTERVAL && types.compared_operands.contains(&(n as u32)))
+                {
+                    return Err(error(
+                        SqlErrorKind::FeatureNotSupported,
+                        if *t == Type::INTERVAL && !types.arithmetic_operands.contains(&(n as u32)) {
+                            "interval comparison is not supported".to_string()
+                        } else {
+                            "interval arithmetic is not supported".to_string()
+                        },
+                    ));
+                }
                 if *t != Type::UNKNOWN {
                     return Ok(t.clone());
                 }
@@ -5776,26 +5811,18 @@ fn check_assignments(
             // The expression's value from the bound values, as PostgreSQL's custom plan folds it
             // (wire-rev-629f4b926 MED-3). An expression the frontend cannot prepare or evaluate is
             // left to the engine at Execute.
+            // Each parameter is bound as its type, as the statement's own Bind decodes it
+            // (wire-rev-1de981755-rest MED-1: bound as text, '1' <> 1 was true in the engine and a
+            // valid INSERT was refused 22001).
             AssignSource::Expr(sql) => {
                 let Ok((mut probe, _)) = conn.prepare_typed(sql) else { continue };
+                let Ok(values) = decode_portal_parameters(portal, types) else { continue };
                 let mut bound = true;
-                for i in 0..portal.parameters.len() {
+                for (i, value) in values.into_iter().enumerate() {
                     let index = NonZero::new(i + 1).expect("i + 1 >= 1");
-                    if probe.parameters().has_index(index) {
-                        let value = match portal.parameters.get(i) {
-                            Some(None) => Value::Null,
-                            _ => match sent(i) {
-                                Some(t) => Value::build_text(t.to_string()),
-                                None => {
-                                    bound = false;
-                                    break;
-                                }
-                            },
-                        };
-                        if probe.bind_at(index, value).is_err() {
-                            bound = false;
-                            break;
-                        }
+                    if probe.parameters().has_index(index) && probe.bind_at(index, value).is_err() {
+                        bound = false;
+                        break;
                     }
                 }
                 if !bound {
