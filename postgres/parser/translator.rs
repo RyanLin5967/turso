@@ -3515,6 +3515,42 @@ impl PostgreSQLTranslator {
                 }
             }
             Some(pg_query::protobuf::node::Node::TypeCast(type_cast)) => {
+                // An explicit cast to varchar(n) cuts its value to n characters, as PostgreSQL's
+                // explicit-cast length coercion does: the cast without its length, then the cut
+                // (wire-rev-351702a43 MED-5: $1::varchar(10) stored the whole text).
+                if let Some(t) = type_cast.type_name.as_ref().filter(|t| t.array_bounds.is_empty() && !t.typmods.is_empty()) {
+                    let varchar = t.names.last().is_some_and(|n| {
+                        matches!(&n.node, Some(pg_query::protobuf::node::Node::String(s))
+                            if matches!(s.sval.to_ascii_lowercase().as_str(), "varchar" | "character varying"))
+                    });
+                    if varchar {
+                        let n = match type_modifiers(t)?.as_slice() {
+                            [n] => *n,
+                            _ => {
+                                return Err(ParseError::ParseError(SqlErrorMessage::classified(
+                                    SqlErrorKind::SyntaxError,
+                                    "invalid type modifier",
+                                )))
+                            }
+                        };
+                        let mut bare = (**type_cast).clone();
+                        if let Some(bt) = bare.type_name.as_mut() {
+                            bt.typmods.clear();
+                        }
+                        let inner = self.translate_expr(&pg_query::protobuf::Node {
+                            node: Some(pg_query::protobuf::node::Node::TypeCast(Box::new(bare))),
+                        })?;
+                        let lit = |v: i64| Box::new(ast::Expr::Literal(ast::Literal::Numeric(v.to_string())));
+                        return Ok(ast::Expr::FunctionCall {
+                            name: pg_name("substr"),
+                            distinctness: None,
+                            args: vec![Box::new(inner), lit(1), lit(n)],
+                            order_by: vec![],
+                            within_group: vec![],
+                            filter_over: ast::FunctionTail { filter_clause: None, over_clause: None },
+                        });
+                    }
+                }
                 let arg = type_cast.arg.as_ref().ok_or_else(|| {
                     ParseError::ParseError("TypeCast missing inner expression".into())
                 })?;
