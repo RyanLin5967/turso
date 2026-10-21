@@ -1000,6 +1000,137 @@ fn a_crash_between_a_non_flip_cut_and_the_flip_reopens_with_every_link_right() {
 }
 
 
+// ---- h1-rev-72bfb0127 HIGH-2: a non-flip cut that changed rows behind the fill's cursor, then a crash ----
+
+/// The fill's cursor and the catalog's generation, `(cursor generation, parent, fork_epoch, done, meta
+/// generation)`, or `None` while the catalog cannot be read (a checkpoint holds it: Busy) or has no cursor.
+fn try_cursor(path: &std::path::Path) -> Option<(u64, u64, u64, u64, u64)> {
+    let mut cat = super::catalog::Catalog::open(&std::path::PathBuf::from(format!("{}-branch-cat", path.display())), SyncClass::Off).ok()?;
+    let g = cat.meta().ok()??.generation;
+    let (cg, at, done) = cat.fill_cursor().ok()??;
+    let (p, f) = at.unwrap_or((0, 0));
+    Some((cg, p, f, u64::from(done), g))
+}
+
+/// `try_cursor`, polled for up to 30 s.
+fn poll_cursor(path: &std::path::Path) -> Option<(u64, u64, u64, u64, u64)> {
+    let t = std::time::Instant::now();
+    loop {
+        if let Some(c) = try_cursor(path) {
+            return Some(c);
+        }
+        if t.elapsed() > std::time::Duration::from_secs(30) {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// The process cut short: a 19 store of 1,050 rows with a slow fill; once the fill's cursor is past the
+/// first 130 trunk forks, the store goes past the hard limit, then reaps forks 60-99 (every third) and forks
+/// a child of each of the first 30, all BEHIND the cursor; a checkpoint after them cuts the log at 19, and
+/// the process exits with no close.
+#[test]
+fn ls_nonflip_behind_child() {
+    let Ok(p) = std::env::var("FE_LS_NFB_PATH") else {
+        return;
+    };
+    let path = std::path::PathBuf::from(p);
+    let ids = ls_store_with_ids(&path, 1_000);
+    let (mark_par, mark_fe) = {
+        let cat = ls_cat(&path);
+        let sql = |c: &str| format!("SELECT {c} FROM branch WHERE id = {}", ids[130].0);
+        (ls_first(&cat, &sql("parent")), ls_first(&cat, &sql("fork_epoch")))
+    };
+    super::journal::set_compact_threshold(4 << 10);
+    super::store::LINKS_FILL_PAUSE_MS.store(1_000, Ordering::Release);
+    let db = open(&path);
+    db.branch_wait_name_filter();
+    let trunk = db.connect().unwrap();
+    // A first checkpoint starts the fill; then wait for its cursor to pass fork 130.
+    let _ = db.branch_compact_now();
+    let t = std::time::Instant::now();
+    while t.elapsed() < std::time::Duration::from_secs(60) {
+        if try_cursor(&path).is_some_and(|(_, p, f, _, _)| (p, f) > (mark_par, mark_fe)) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let mut k = 0;
+    while !db.branches.past_hard_limit_for_test() && k < 20_000 {
+        let _ = trunk.fork_branch().unwrap().into_id();
+        k += 1;
+    }
+    for id in ids.iter().skip(60).take(40).step_by(3) {
+        db.branch(*id).unwrap().reap().unwrap();
+    }
+    for id in ids.iter().take(30) {
+        let b = db.branch(*id).unwrap();
+        let _ = b.fork().unwrap().into_id();
+        let _ = b.into_id();
+    }
+    let peak = log_bytes(&path);
+    for _ in 0..200 {
+        let _ = trunk.fork_branch().unwrap().into_id();
+    }
+    let t = std::time::Instant::now();
+    while log_bytes(&path) >= peak && t.elapsed() < std::time::Duration::from_secs(30) {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let (cgen, cpar, cfe, cdone, mgen) = poll_cursor(&path).unwrap_or((0, 0, 0, 9, 9999));
+    let meta = try_meta_version(&path).unwrap_or(0);
+    println!(
+        "LS-NFBEHIND past={} meta={meta} peak={peak} log={} cgen={cgen} mgen={mgen} cpar={cpar} cfe={cfe} cdone={cdone} markpar={mark_par} markfe={mark_fe}",
+        u64::from(db.branches.past_hard_limit_for_test()),
+        log_bytes(&path)
+    );
+    std::process::exit(0);
+}
+
+/// h1-rev-72bfb0127 HIGH-2: the non-flip cut's relink is what keeps a crash's reopen right. Past the hard
+/// limit, with the fill's cursor past the rows it changes, the store reaps and forks behind the cursor; a
+/// checkpoint after those changes cuts the log at 19 and carries the cursor; the process crashes; this build
+/// reopens, resumes the fill from the carried cursor, flips, and every row's links are right by the
+/// independent oracle. Premises: past the hard limit, the log cut after the changes, still 19, the cursor
+/// carried to the catalog's generation, not done, and past the changed rows. Mutant `l4_nonflip_no_relink`
+/// (the non-flip checkpoint skips its relink, the cursor still carried) must fail it.
+#[test]
+fn a_crash_after_a_non_flip_cut_that_changed_rows_behind_the_cursor_reopens_with_every_link_right() {
+    if in_child() {
+        return;
+    }
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("nfb.db");
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["branch::links_sessions_tests::ls_nonflip_behind_child", "--exact", "--test-threads=1", "--nocapture"])
+        .env("FE_LS_NFB_PATH", &path)
+        .env_remove("FE_LS_CHILD")
+        .output()
+        .unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let r = readings(&text, "LS-NFBEHIND ");
+    assert_eq!(r.len(), 1, "premise: the crashed process reported:\n{text}");
+    let v = &r[0];
+    let (past, meta, peak, log, cgen, mgen, cpar, cfe, cdone, mpar, mfe) = (v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9], v[10]);
+    assert_eq!(past, 1, "premise: the store was past the hard limit: {text}");
+    assert!(log < peak, "premise: the log was not cut after the changes ({log} B, peak {peak} B)");
+    assert_eq!(meta, 19, "premise: the store flipped before the crash (meta {meta})");
+    assert_eq!((cgen, cdone), (mgen, 0), "premise: the cursor is not carried to the catalog's generation, or is done (cursor generation {cgen}, catalog {mgen}, done {cdone})");
+    assert!((cpar, cfe) > (mpar, mfe), "premise: the cursor ({cpar}, {cfe}) is not past the changed rows ({mpar}, {mfe})");
+    {
+        let db = open(&path);
+        db.branch_wait_name_filter();
+        db.branch_compact_now().unwrap();
+        db.branch_checkpoint_wait();
+    }
+    let (rows, wrong) = ls_wrong_links(&path).unwrap_or((0, 9999));
+    println!("LS non-flip behind the cursor: meta={} rows={rows} wrong={wrong}", meta_version(&path));
+    assert!(rows > 1_000, "premise: the rows are there ({rows})");
+    assert_eq!(meta_version(&path), 21, "the store did not upgrade after the crash");
+    assert_eq!(wrong, 0, "{wrong} of {rows} rows have wrong links after a crash past a non-flip cut that changed rows behind the cursor");
+}
+
+
 // ---- h1gap-rev-c HIGH-3 (ruling 62c11ec63d): the close-time flip relinks O(changes), not O(N) ----
 
 #[test]
