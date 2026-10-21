@@ -1588,6 +1588,21 @@ impl AsyncCtl {
     }
 }
 
+// The AD-T5 fire-check build's flag must ADD to the workspace's rustflags, never replace them
+// (fastest-engine, engine-rfl-20200c00a-iccad11, artie 5f7c86e06a): RUSTFLAGS overrides
+// .cargo/config.toml's target rustflags, so a fire-check binary built that way lost
+// `--cfg=tokio_unstable` and `-C link-args=-Wl,-z,nodelete`, two differences from the reading
+// binary beyond the gate (PREREG-v1 amendment 2: "changes nothing else"). Every target table there
+// that sets the link args sets tokio_unstable too, so its absence beside the flag refuses the build.
+// Pass the flag through `cargo --config 'target.<host>.rustflags=["--cfg=fe_ad_t5_firecheck"]'`.
+// BLIND SPOT: a RUSTFLAGS that repeats `--cfg=tokio_unstable` but drops the link args passes.
+#[cfg(all(fe_ad_t5_firecheck, not(tokio_unstable)))]
+compile_error!(
+    "fe_ad_t5_firecheck is set but tokio_unstable is not: the flag replaced .cargo/config.toml's \
+     rustflags (RUSTFLAGS?) instead of adding to them; pass it with cargo --config \
+     'target.<host>.rustflags=[\"--cfg=fe_ad_t5_firecheck\"]'"
+);
+
 /// LEAP L1's flusher and housekeeping threads (ASYNC-DESIGN §6), started at the store's first
 /// async create (`StoreCore::start_async`) and stopped and joined at the store's shutdown
 /// (`StoreCore::shut_down`), after the name filter. Each holds the store's state weakly
