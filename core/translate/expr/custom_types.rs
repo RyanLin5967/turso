@@ -4691,4 +4691,22 @@ mod tests {
         ]);
         assert!(bad.is_empty(), "CLAIM: a CAST to varchar did not order as text: {bad:#?}");
     }
+
+    /// Adopted verbatim from engine-rev-types-08caaec44 (artie 8319b0a45e,
+    /// frontier/fastest/reviews/REVIEW-engine-types-08caaec44.md and raw-engine-types-08caaec44/
+    /// zz_rev08c.rs.txt); its expected values are that review's PostgreSQL 18.6 recordings
+    /// (raw-engine-types-08caaec44/p*.pgout.txt), never ours.
+    /// MED: a function of a numeric (coalesce, CASE, nullif) compares as numeric.
+    #[test]
+    fn rev08c_a_function_of_a_numeric_compares_as_numeric() {
+        let conn = open();
+        let bad = diverging_after(&conn, &REV08C_N, &[
+            ("SELECT count(*) FROM n WHERE b > 5", "2"),
+            ("SELECT count(*) FROM n WHERE coalesce(b, 0) > 5", "2"),
+            ("SELECT count(*) FROM n WHERE coalesce(b, 0) = 10", "1"),
+            ("SELECT count(*) FROM n WHERE CASE WHEN b > 0 THEN b ELSE 0 END > 5", "2"),
+            ("SELECT count(*) FROM n WHERE nullif(b, 0) = 10", "1"),
+        ]);
+        assert!(bad.is_empty(), "CLAIM: a function of a numeric did not compare as numeric: {bad:#?}");
+    }
 }
