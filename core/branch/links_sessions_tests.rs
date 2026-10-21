@@ -34,6 +34,21 @@ fn meta_version(path: &std::path::Path) -> u32 {
     cat.meta().unwrap().map_or(0, |m| m.format)
 }
 
+/// `try_meta_version` polled for up to 30 s, 0 if it never reads (FLAGGED harness repair: amendment 28, the
+/// 5-module batch on iccad13 at 995da809f, read "meta 0" from one Busy read while a checkpoint held the catalog).
+fn poll_meta_version(path: &std::path::Path) -> u32 {
+    let t = std::time::Instant::now();
+    loop {
+        if let Some(m) = try_meta_version(path) {
+            return m;
+        }
+        if t.elapsed() > std::time::Duration::from_secs(30) {
+            return 0;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 /// `meta_version`, or `None` when the catalog cannot be read now (a checkpoint in flight holds it:
 /// SQLite Busy, measured on iccad6 at 7a7375519, raw h1d-starved-fix): the polls inside the hold use it.
 fn try_meta_version(path: &std::path::Path) -> Option<u32> {
@@ -618,7 +633,7 @@ fn ls_fill_starved_child() {
         std::thread::sleep(std::time::Duration::from_millis(20));
         log_held = log_present(&path);
     }
-    let meta = try_meta_version(&path).unwrap_or(0);
+    let meta = poll_meta_version(&path);
     super::store::LINKS_FILL_HOLD_UNRECORDED.store(false, Ordering::Release);
     db.branch_checkpoint_wait();
     super::store::LINKS_FILL_COLUMNS_IN_BATCH.store(false, Ordering::Release);
@@ -686,7 +701,7 @@ fn ls_fill_entry_starved_child() {
         std::thread::sleep(std::time::Duration::from_millis(20));
         log_held = log_present(&path);
     }
-    let meta_held = try_meta_version(&path).unwrap_or(0);
+    let meta_held = poll_meta_version(&path);
     super::store::LINKS_FILL_HOLD_AT_ENTRY.store(false, Ordering::Release);
     db.branch_checkpoint_wait();
     println!("LS-ENTRY past={} held={held} creates={k} meta_held={meta_held} meta={} peak={peak} log_held={log_held}", u64::from(past), meta_version(&path));
@@ -1235,7 +1250,7 @@ fn ls_nonflip_behind_child() {
     // The cut that covers the changes: every checkpoint after them starts after them.
     let (past2, peak) = fork_past_hard_and_cut(&db, &trunk, &path);
     let (cgen, cpar, cfe, cdone, mgen) = poll_cursor(&path).unwrap_or((0, 0, 0, 9, 9999));
-    let meta = try_meta_version(&path).unwrap_or(0);
+    let meta = poll_meta_version(&path);
     println!(
         "LS-NFBEHIND past={} meta={meta} peak={peak} log={} cgen={cgen} mgen={mgen} cpar={cpar} cfe={cfe} cdone={cdone} markpar={mark_par} markfe={mark_fe}",
         u64::from(past && past2),
@@ -1352,7 +1367,7 @@ fn ls_xbuild_cut_child() {
     start_fill_past(&db, &trunk, &path, mark);
     let (past, peak) = fork_past_hard_and_cut(&db, &trunk, &path);
     let (cgen, cpar, cfe, cdone, mgen) = poll_cursor(&path).unwrap_or((0, 0, 0, 9, 9999));
-    let meta = try_meta_version(&path).unwrap_or(0);
+    let meta = poll_meta_version(&path);
     println!(
         "LS-XBCUT past={} meta={meta} peak={peak} log={} cgen={cgen} mgen={mgen} cpar={cpar} cfe={cfe} cdone={cdone}",
         u64::from(past),
