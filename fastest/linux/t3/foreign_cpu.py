@@ -580,11 +580,17 @@ def self_test():
         got = launched[label]
         starved = [(b, pid) for b, pid in got if cpu_of.get(pid, 0.0) < 0.8 * asked(b)]
         if starved:
+            # every check this window would have made is N/A, and each prints its own cause line, so the TALLY's na
+            # and the N/A lines agree (run_everywhere refused 'na=12, but 6 N/A-on-<cause> line(s)': one line was
+            # printed for a window's several N/A)
             b, pid = starved[0]
-            print(f"N/A-on-busy-host: self-test calibration {label}: a burner ({b[4]}, duty {b[3]}) got "
-                  f"{cpu_of.get(pid, 0.0):.2f} s of CPU by its own rusage, under 80% of the {asked(b):.2f} s it asked "
-                  f"for: the host starved it, so this window checks nothing", flush=True)
-            return 0, 0, len(got) + len(verdicts)
+            why = (f"a burner ({b[4]}, duty {b[3]}) got {cpu_of.get(pid, 0.0):.2f} s of CPU by its own rusage, under 80% "
+                   f"of the {asked(b):.2f} s it asked for: the host starved it")
+            checks = [f"the {'SUT' if b_[0] else 'foreign'} {b_[4]} burner at duty {b_[3]}'s accounting"
+                      for b_, _p in got] + [what for what, _i, _f in verdicts]
+            for c in checks:
+                print(f"N/A-on-busy-host: self-test calibration {label}: {c}: {why}", flush=True)
+            return 0, 0, len(checks)
         n_ok = n_bad = 0
         for b, pid in got:
             sc, rows = sampled_cpu(rec, pid)
