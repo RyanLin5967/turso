@@ -3662,6 +3662,74 @@ impl PostgreSQLTranslator {
                         }
                     }
                 }
+                // A column or parameter cast to an integer type rounds as PostgreSQL's conversion
+                // does: a numeric (the engine's numeric decodes to text) half away from zero
+                // (numeric_int4), a float half to even (dtoi4's rint); the engine's CAST truncates
+                // (wire-rev-7128c6f73 MED-4). Integers and other text keep the engine's CAST. Only
+                // a column or a parameter, which can be read several times; BLIND SPOT: any other
+                // expression cast to an integer still truncates (PGDIV-INT-CAST-TRUNCATES).
+                if let Some(t) = type_cast.type_name.as_ref() {
+                    let integer = t.array_bounds.is_empty()
+                        && t.names.last().is_some_and(|n| {
+                            matches!(&n.node, Some(pg_query::protobuf::node::Node::String(s))
+                                if matches!(s.sval.to_ascii_lowercase().as_str(),
+                                    "int2" | "int4" | "int8" | "int" | "integer" | "smallint" | "bigint"))
+                        });
+                    let rereadable = matches!(
+                        arg.node.as_ref(),
+                        Some(pg_query::protobuf::node::Node::ColumnRef(_) | pg_query::protobuf::node::Node::ParamRef(_))
+                    );
+                    if integer && rereadable {
+                        let x = || self.translate_expr(arg);
+                        let ty = pg_type_name_to_ast_type(t);
+                        let func = |name: &str, args: Vec<ast::Expr>| ast::Expr::FunctionCall {
+                            name: pg_name(name),
+                            distinctness: None,
+                            args: args.into_iter().map(Box::new).collect(),
+                            order_by: vec![],
+                            within_group: vec![],
+                            filter_over: ast::FunctionTail { filter_clause: None, over_clause: None },
+                        };
+                        let text = |v: &str| ast::Expr::Literal(sql_string(v));
+                        let num = |v: &str| ast::Expr::Literal(ast::Literal::Numeric(v.to_string()));
+                        let cast = |e: ast::Expr| ast::Expr::Cast { expr: Box::new(e), type_name: ty.clone() };
+                        let bin = |a: ast::Expr, op: ast::Operator, b: ast::Expr| ast::Expr::Binary(Box::new(a), op, Box::new(b));
+                        // round(x) is half away from zero; a float's half-way case steps back to the
+                        // even neighbour.
+                        let away = || -> Result<ast::Expr, ParseError> { Ok(cast(func("round", vec![x()?]))) };
+                        let half_even = bin(
+                            away()?,
+                            ast::Operator::Subtract,
+                            ast::Expr::Case {
+                                base: None,
+                                when_then_pairs: vec![(
+                                    Box::new(bin(
+                                        bin(func("abs", vec![bin(x()?, ast::Operator::Subtract, func("trunc", vec![x()?]))]), ast::Operator::Equals, num("0.5")),
+                                        ast::Operator::And,
+                                        bin(bin(away()?, ast::Operator::Modulus, num("2")), ast::Operator::NotEquals, num("0")),
+                                    )),
+                                    Box::new(func("sign", vec![x()?])),
+                                )],
+                                else_expr: Some(Box::new(num("0"))),
+                            },
+                        );
+                        let decimal_text = bin(
+                            bin(func("typeof", vec![x()?]), ast::Operator::Equals, text("text")),
+                            ast::Operator::And,
+                            bin(func("instr", vec![x()?, text(".")]), ast::Operator::Greater, num("0")),
+                        );
+                        // The whole CASE is cast again, so the engine types the result as the cast's
+                        // integer (a bare CASE was typed text, 25).
+                        return Ok(cast(ast::Expr::Case {
+                            base: None,
+                            when_then_pairs: vec![
+                                (Box::new(bin(func("typeof", vec![x()?]), ast::Operator::Equals, text("real"))), Box::new(half_even)),
+                                (Box::new(decimal_text), Box::new(away()?)),
+                            ],
+                            else_expr: Some(Box::new(cast(x()?))),
+                        }));
+                    }
+                }
                 let expr = Box::new(self.translate_expr(arg)?);
                 // A regclass is the named relation's pg_class oid, resolved by the frontend's
                 // pg_regclass (recorded, pg18-rev-regclass.out); a cast to INTEGER made every

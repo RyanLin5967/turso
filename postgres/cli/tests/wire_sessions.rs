@@ -12378,7 +12378,11 @@ replays_postgresql!(
 replays_postgresql!(
     pg18_wirefuzz_casts_to_integers_and_date_arithmetic_over_casts_replays_as_postgresql_answered,
     "pg18-wirefuzz-casts_to_integers_and_date_arithmetic_over_casts.out",
-    []
+    [
+        (3, "PGDIV-INT8-CAST-TYPE type [wire]: a column cast to int8 is announced int4 (23) where PG announces 20; the values agree (the engine's INTEGER is typed 23)"),
+        (5, "PGDIV-DATE-ARITHMETIC value [engine]: SILENT: a date column minus a date cast answers 0 for 19 (the engine's plain '-' over two texts; fixed in the engine at 771f44872, not yet on this line)"),
+        (6, "PGDIV-DATE-ARITHMETIC value [engine]: SILENT: a date cast plus 1 answers 2027 for 2026-10-21 (fixed in the engine at 771f44872, not yet on this line)"),
+    ]
 );
 // wire-rev-cfdebc06d LOW-4, LOW-5: unknown + unknown is 42725, and integers cast to int2 or int8 type an operator over
 // them; text + integer in WHERE is 42883 as in PG (#9).
