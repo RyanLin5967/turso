@@ -630,3 +630,176 @@ fn a_busy_catalog_wal_truncation_is_counted() {
     assert_eq!(meta_version(&path), 21, "premise: the store upgraded");
     assert!(busy >= 1, "a truncation held busy by a reader was not counted ({busy})");
 }
+
+
+// ---- h1gap-rev-c MED-2: a fill killed between batches, an older build's checkpoint, then this build ----
+
+fn ls_cat(path: &std::path::Path) -> super::catalog::Catalog {
+    super::catalog::Catalog::open(&std::path::PathBuf::from(format!("{}-branch-cat", path.display())), SyncClass::Off).unwrap()
+}
+
+fn ls_first(cat: &super::catalog::Catalog, sql: &str) -> u64 {
+    cat.ints(sql).ok().and_then(|v| v.first().copied()).unwrap_or(9999)
+}
+
+/// An independent link oracle (the reviewer's): every row's sib_lo, sib_hi and child_max recomputed here
+/// from (id, parent, fork_epoch), read by SQL, never by the subject. `(rows, rows whose links differ)`;
+/// `None`: no link columns.
+fn ls_wrong_links(path: &std::path::Path) -> Option<(u64, u64)> {
+    let cat = ls_cat(path);
+    let enc = |c: &str| format!("SELECT CASE WHEN {c} IS NULL THEN 0 ELSE {c} + 1 END FROM branch ORDER BY id");
+    let lo = cat.ints(&enc("sib_lo")).ok()?;
+    let hi = cat.ints(&enc("sib_hi")).unwrap();
+    let cm = cat.ints(&enc("child_max")).unwrap();
+    let ids = cat.ints("SELECT id FROM branch ORDER BY id").unwrap();
+    let par = cat.ints("SELECT parent FROM branch ORDER BY id").unwrap();
+    let fe = cat.ints("SELECT fork_epoch FROM branch ORDER BY id").unwrap();
+    let mut by_parent: std::collections::HashMap<u64, Vec<u64>> = std::collections::HashMap::new();
+    for i in 0..ids.len() {
+        by_parent.entry(par[i]).or_default().push(fe[i]);
+    }
+    for v in by_parent.values_mut() {
+        v.sort_unstable();
+    }
+    let mut wrong = 0;
+    for i in 0..ids.len() {
+        let sibs = &by_parent[&par[i]];
+        let a = sibs.partition_point(|&f| f < fe[i]);
+        let b = sibs.partition_point(|&f| f <= fe[i]);
+        let want_lo = if a > 0 { sibs[a - 1] + 1 } else { 0 };
+        let want_hi = if b < sibs.len() { sibs[b] + 1 } else { 0 };
+        let want_cm = by_parent.get(&ids[i]).and_then(|v| v.last()).map_or(0, |f| f + 1);
+        if (lo[i], hi[i], cm[i]) != (want_lo, want_hi, want_cm) {
+            wrong += 1;
+        }
+    }
+    Some((ids.len() as u64, wrong))
+}
+
+/// A 19 store (an older build's): `n` trunk forks, and a child of each of the first 50 (parents detached).
+fn ls_store_with_ids(path: &std::path::Path, n: usize) -> Vec<BranchId> {
+    super::journal::CREATE_LEGACY.with(|c| c.set(true));
+    super::journal::LEGACY_FACTS.with(|c| c.set(true));
+    let ids = {
+        let db = open(path);
+        let trunk = db.connect().unwrap();
+        trunk.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+        let ids: Vec<BranchId> = (0..n).map(|_| trunk.fork_branch().unwrap().into_id()).collect();
+        for id in ids.iter().take(50) {
+            let b = db.branch(*id).unwrap();
+            let _ = b.fork().unwrap().into_id();
+            let _ = b.into_id();
+        }
+        db.branch_compact_now().unwrap();
+        db.branch_checkpoint_wait();
+        ids
+    };
+    super::journal::CREATE_LEGACY.with(|c| c.set(false));
+    super::journal::LEGACY_FACTS.with(|c| c.set(false));
+    assert_eq!(meta_version(path), 19, "premise: a 19 store");
+    ids
+}
+
+#[test]
+fn ls_kill_fill_child() {
+    let Ok(p) = std::env::var("FE_LS_KILL_PATH") else {
+        return;
+    };
+    let path = std::path::PathBuf::from(p);
+    let db = open(&path);
+    db.branch_wait_name_filter();
+    let _ = db.branch_compact_now();
+    db.branch_checkpoint_wait();
+    std::process::exit(3);
+}
+
+#[test]
+fn ls_kill_resume_child() {
+    if !in_child() {
+        return;
+    }
+    // k = 5 and 16: killed mid-fill; k = 17: killed after its last batch (1,050 rows, 64 per batch), so the
+    // resume finds the cursor done.
+    for k in [5u64, 16, 17] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("k.db");
+        let ids = ls_store_with_ids(&path, 1_000);
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["branch::links_sessions_tests::ls_kill_fill_child", "--exact", "--test-threads=1", "--nocapture"])
+            .env("FE_LS_KILL_PATH", &path)
+            .env("FE_KILL_AT", format!("ckpt.upgrade.batch:{k}"))
+            .env_remove("FE_LS_CHILD")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        let killed = status.code().is_none();
+        let killed_meta = meta_version(&path);
+        let (gen0, cursor_gen, cursor_done) = {
+            let mut cat = ls_cat(&path);
+            let g = cat.meta().unwrap().map_or(9999, |m| m.generation);
+            (g, ls_first(&cat, "SELECT generation FROM link_fill"), ls_first(&cat, "SELECT done FROM link_fill"))
+        };
+        // An older build's checkpoint between the kill and this build: it reaps behind the cursor and adds
+        // children, and moves the catalog's generation.
+        super::journal::CREATE_LEGACY.with(|c| c.set(true));
+        super::journal::LEGACY_FACTS.with(|c| c.set(true));
+        {
+            let db = open(&path);
+            db.branch_wait_name_filter();
+            for id in ids.iter().skip(60).take(40).step_by(3) {
+                db.branch(*id).unwrap().reap().unwrap();
+            }
+            for id in ids.iter().take(30).chain(ids.iter().skip(100).take(30)) {
+                let b = db.branch(*id).unwrap();
+                let _ = b.fork().unwrap().into_id();
+                let _ = b.into_id();
+            }
+            db.branch_compact_now().unwrap();
+            db.branch_checkpoint_wait();
+        }
+        super::journal::CREATE_LEGACY.with(|c| c.set(false));
+        super::journal::LEGACY_FACTS.with(|c| c.set(false));
+        let gen1 = ls_cat(&path).meta().unwrap().map_or(9999, |m| m.generation);
+        {
+            let db = open(&path);
+            db.branch_wait_name_filter();
+            let _ = db.branch_compact_now();
+            db.branch_checkpoint_wait();
+        }
+        let (rows, wrong) = ls_wrong_links(&path).unwrap_or((0, 9999));
+        println!(
+            "LS-KILL k={k} killed={} killed_meta={killed_meta} cursor_gen={cursor_gen} cursor_done={cursor_done} gen0={gen0} gen1={gen1} meta={} rows={rows} wrong={wrong}",
+            u64::from(killed),
+            meta_version(&path)
+        );
+    }
+}
+
+/// h1gap-rev-c MED-2: a fill killed after batch k (its cursor committed), then an OLDER build's checkpoint
+/// that changes rows behind the cursor and moves the generation, then this build: every row's links are
+/// right by an independent oracle (0 wrong) at meta 21. k = 5 and 16 resume mid-fill; k = 17 is after the
+/// last batch (the done cursor). Premises: killed there, still 19 with a cursor of the killed generation,
+/// the older build moved the generation; for k = 17 the cursor is done. Mutant `l4_fill_generation_ignored`
+/// must fail it.
+#[test]
+fn a_fill_killed_between_batches_and_resumed_after_an_older_builds_checkpoint_links_every_row() {
+    if in_child() {
+        return;
+    }
+    let text = child("ls_kill_resume_child", &[]);
+    let r = readings(&text, "LS-KILL ");
+    assert_eq!(r.len(), 3, "premise: three arms ran:\n{text}");
+    for v in &r {
+        let (k, killed, killed_meta, cgen, cdone, gen0, gen1, meta, rows, wrong) = (v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8], v[9]);
+        assert_eq!((killed, killed_meta), (1, 19), "k={k}: premise: killed after batch {k}, still 19");
+        assert_eq!(cgen, gen0, "k={k}: premise: the cursor is of the killed store's generation");
+        assert!(gen1 > gen0, "k={k}: premise: the older build's checkpoint moved the generation ({gen0} -> {gen1})");
+        if k == 17 {
+            assert_eq!(cdone, 1, "premise: killed after the last batch, the cursor is done");
+        }
+        assert!(rows > 1_000, "k={k}: premise: the rows are there ({rows})");
+        assert_eq!(meta, 21, "k={k}: the store did not upgrade");
+        assert_eq!(wrong, 0, "k={k}: {wrong} of {rows} rows have wrong links after the resume (a cursor resumed across a checkpoint that changed rows behind it)");
+    }
+}
