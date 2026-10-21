@@ -865,6 +865,8 @@ for FS_NOW in $FSLIST; do
   rc=$?
   # the kernel's log over the block, so a btrfs allocation failure or an ENOSPC the kernel reports is in the package
   # (summarize's enospc_problems refuses the block on one: the lead's DATA_GIB ruling)
+  # Scope, stated (t3cov-2 LOW 4): the dmesg fallback holds the whole ring buffer (earlier blocks, an earlier boot), so
+  # an old out-of-space line refuses a later block: spurious, and never a false pass.
   # t3cov-2 MED 3: its first line names the reader that succeeded ("#kernel-log source=journalctl" or "source=dmesg"),
   # and "source=none" when neither did, which refuses the block here and in summarize (never a silent empty log)
   kl="$OUT/fs-$FS_NOW/kernel-log.txt"

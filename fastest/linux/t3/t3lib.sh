@@ -383,13 +383,18 @@ EOF
 # it is running, and every active clock adjuster in T3_CLOCK_ADJUSTERS, recording each as "<kind>\t<unit>" in REC.
 # Then it judges the OUTCOME, not the list: CLOCK_REALTIME minus CLOCK_MONOTONIC (T3_CLOCKDELTA) must move by at most
 # T3_QUIET_MAX_S over a watch of T3_QUIET_WATCH_S, or it refuses, naming the movement; so an adjuster nobody listed
-# is caught by its effect. Refuses (rc 1) also when list-timers fails, a stopped unit is still active, or a clock
+# that steps the clock within that one watch (30 s, once, before the selftests) is caught by its effect; a slower one is
+# caught per window instead, by stracecount's clock pairs, and ours' latencies are CLOCK_MONOTONIC (t3cov-1b LOW 2). Refuses (rc 1) also when list-timers fails, a stopped unit is still active, or a clock
 # sample is unreadable. host_unquiet starts the recorded timers and clock adjusters again (a timer starts its own
-# service). Blind spots, stated: cron and anacron jobs and non-systemd daemons are seen only by foreign_cpu.py
-# (VOID). A slew (adjtime, the kernel PLL) moves CLOCK_REALTIME and CLOCK_MONOTONIC together, so it is invisible here
+# service), and the schedulers in T3_SCHEDULERS (cron, crond, anacron), stopped as "sched" (t3cov-1b LOW 3). Blind
+# spots, stated: a daemon that keeps its own schedule (snapd's refresh) is seen only by foreign_cpu.py (VOID), and
+# only by its CPU, never its IO. A slew (adjtime, the kernel PLL) moves CLOCK_REALTIME and CLOCK_MONOTONIC together, so it is invisible here
 # and equally to stracecount's realtime-against-monotonic check; only a step (clock_settime, ADJ_SETOFFSET) moves the
 # difference, and that is what both refuse.
 T3_CLOCK_ADJUSTERS=${T3_CLOCK_ADJUSTERS:-"systemd-timesyncd chrony chronyd ntp ntpd ntpsec openntpd lima-guestagent"}
+# the schedulers that start jobs outside systemd's timers (t3cov-1b LOW 3): stopped and recorded as the timers are, and
+# restarted by host_unquiet. Blind spot, stated: a daemon that keeps its own schedule (snapd's refresh) is not stopped
+T3_SCHEDULERS=${T3_SCHEDULERS:-"cron crond anacron"}
 t3_clockdelta() { # CLOCK_REALTIME minus CLOCK_MONOTONIC, in seconds: the default sampler (T3_CLOCKDELTA overrides it)
   python3 -B -c 'import time; print(time.clock_gettime(time.CLOCK_REALTIME) - time.clock_gettime(time.CLOCK_MONOTONIC))'
 }
@@ -420,6 +425,11 @@ host_quiet() {
       ${sc} stop "$u"; printf 'clock\t%s\n' "$u" >> "$rec"
     fi
   done
+  for u in $T3_SCHEDULERS; do
+    if unit_running "${sc}" "$u"; then
+      ${sc} stop "$u"; printf 'sched\t%s\n' "$u" >> "$rec"
+    fi
+  done
   while IFS=$'\t' read -r _ u; do
     unit_running "${sc}" "$u" && bad="$bad $u"
   done < "$rec"
@@ -440,7 +450,7 @@ host_unquiet() {
   local rec=$1 sc=${T3_SYSTEMCTL:-sudo -n systemctl} kind u rc=0
   [ -f "$rec" ] || return 0
   while IFS=$'\t' read -r kind u; do
-    case $kind in timer|clock) ${sc} start "$u" || rc=1 ;; esac
+    case $kind in timer|clock|sched) ${sc} start "$u" || rc=1 ;; esac
   done < "$rec"
   return $rc
 }

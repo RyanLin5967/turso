@@ -136,7 +136,8 @@ def tie(j, live):
     ss = w.get("stop_secs")
     if not isinstance(ss, (int, float)) or abs(claims[-1] / 1e9 - ss) > 0.0005 + 1e-9:
         bad.append(f"the live stop's claim at {claims[-1] / 1e9:.6f} s, summary stop_secs {ss!r}")
-    if cap not in (0, 1) or bool(cap) != w.get("capped"):
+    # the driver writes capped as a u8: a JSON boolean is refused, not read as 0 or 1 (t3cov-1a LOW 6: True in (0, 1))
+    if type(cap) is not int or cap not in (0, 1) or bool(cap) != w.get("capped"):
         bad.append(f"live capped {cap!r}, summary capped {w.get('capped')!r}")
     if live.get("rule") != w.get("rule"):
         bad.append(f"live rule {live.get('rule')!r}, summary rule {w.get('rule')!r}")
@@ -356,6 +357,8 @@ def self_test():
          tie(rec(), LIVE | {"claims_ns": LIVE["claims_ns"][:-1] + [2_500_000_000]}) != []),
         ("tie: a live capped 0 beside the summary's capped true fails", tie(rec(), LIVE | {"capped": 0}) != []),
         ("tie: a live rule other than the summary's fails", tie(rec(), LIVE | {"rule": "10:0:30"}) != []),
+        ("t3cov-1a LOW 6: a live capped written as a JSON boolean is refused (the driver writes a u8)",
+         tie(rec(), LIVE | {"capped": bool(LIVE["capped"])}) != []),
         ("tie: no live record (None) fails", tie(rec(), None) != []),
     ]
     # the owed ours fixture record (2026-10-16): under --seed-sql/--age-sql/--live the driver's own record of the

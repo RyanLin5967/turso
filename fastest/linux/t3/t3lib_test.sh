@@ -440,6 +440,12 @@ check "host_unquiet restarts exactly the timers and clock adjusters it stopped (
    [ \"\$(ls \"$T/sc/active\" | LC_ALL=C sort | tr '\n' ' ')\" = 'apt-daily-upgrade.timer apt-daily.timer lima-guestagent systemd-timesyncd ' ]"
 # t3cov-1b MED 1: every service a timer starts is Type=oneshot, and a running oneshot answers "activating", not "active":
 # it must be stopped and recorded too (any state but inactive or failed is running)
+# t3cov-1b LOW 3: cron (any scheduler in T3_SCHEDULERS) is stopped and recorded as "sched", and host_unquiet starts it
+quiet_setup "cron" "" "0.5 0.5"
+check "t3cov-1b LOW 3: a running cron is stopped and recorded (sched), and host_unquiet starts it again" \
+  "env $QENV \"$BASH\" -c 'source \"\$0\"; host_quiet \"\$1\"' \"$HERE/t3lib.sh\" \"$T/quiet.tsv\" &&
+   [ -z \"\$(ls \"$T/sc/active\")\" ] && grep -qx \"sched${TAB}cron\" \"$T/quiet.tsv\" &&
+   env $QENV \"$BASH\" -c 'source \"\$0\"; host_unquiet \"\$1\"' \"$HERE/t3lib.sh\" \"$T/quiet.tsv\" && [ -e \"$T/sc/active/cron\" ]"
 quiet_setup "apt-daily.timer" "" "0.5 0.5" "apt-daily.service"
 check "t3cov-1b MED 1: a timer's service that answers 'activating' (a running oneshot) is stopped and recorded" \
   "env $QENV \"$BASH\" -c 'source \"\$0\"; host_quiet \"\$1\"' \"$HERE/t3lib.sh\" \"$T/quiet.tsv\" &&

@@ -222,12 +222,16 @@ def block_record(out, fs, plp="no", dry=None):
     return rec
 
 
-def functional_verdict(text):
+def functional_verdict(text, system=None):
     """'PASS', 'FAIL' or None: the LAST 'VERDICT ' line of a competitor's functional.txt (T3 runner review LOW 21), read
-    by its first word, as run_system.sh writes it ("VERDICT PASS (dolt)", "VERDICT FAIL (b1): 6 check(s) failed")"""
-    vl = [l.split() for l in text.splitlines() if l.startswith("VERDICT ")]
-    w = vl[-1][1] if vl and len(vl[-1]) > 1 else None
-    return w if w in ("PASS", "FAIL") else None
+    by its first word, as run_system.sh writes it ("VERDICT PASS (dolt)", "VERDICT FAIL (b1): 6 check(s) failed").
+    With SYSTEM, the line must name that system in its parentheses (t3cov-1b LOW 1: a pg18 verdict in a dolt cell's
+    directory read PASS); a line naming another system, or none, is None"""
+    vl = [l for l in text.splitlines() if l.startswith("VERDICT ")]
+    m = re.match(r"VERDICT (PASS|FAIL)(?: \(([^)]*)\))?", vl[-1]) if vl else None
+    if not m or (system is not None and m.group(2) != system):
+        return None
+    return m.group(1)
 
 
 def timed_verdict_ok(v, dry):
@@ -543,7 +547,9 @@ def parent_record(d):
 def one_parent(parents):
     """ONE parent for every system in a block (gate-6 t3run HIGH 4): PARENTS = [(label, fixture.json or None)] of the
     block's measured runs; every one that has a record must name the same rows and gen_seed_sha256 as the first.
-    (A run with no record is fixture_check's to report.) Returns the refusals."""
+    (A run with no record is fixture_check's to report.) Returns the refusals. Scope, stated (t3cov-1b LOW 4): it reads
+    only those two fields; gen_seed_sha256 is the digest for (rows, age, seed 1), so the age is covered, while prebranch
+    is held to each run's own plan row (fixture_check), not across systems, which is equal only if the plan is."""
     have = [(lb, fx) for lb, fx in parents if isinstance(fx, dict)]
     if not have:
         return []
@@ -665,7 +671,7 @@ def summarize(out, sha, dry, manifest):
                 # the verdict is the LAST 'VERDICT ' line (T3 runner review LOW 21). run_system.sh exits 0 on PASS and
                 # 1 on FAIL, so a FAIL arrives at rc 1: complete raws of a failed check, its FAIL lines kept (fourth
                 # lane review LOW 21); any other rc (a kill, a refusal) is an incomplete run (LOW 12)
-                fv = functional_verdict(text)
+                fv = functional_verdict(text, system)
                 vl = [l.strip() for l in text.splitlines() if l.startswith("VERDICT ")]
                 verdict = vl[-1] if vl else None
                 rc_ = last["adapter_rc"]
@@ -819,6 +825,11 @@ def summarize(out, sha, dry, manifest):
     # OUT/STAMP). The only stamp there is; a DRY-VIRT stamp on a run that is not a dry run is a contradiction
     stamp = mode.get("stamp") or None
     mode_refusals = []
+    # t3cov-1a LOW 4: t3run writes the stamp twice (mode.txt and OUT/STAMP, on adjacent lines); both must agree
+    sp = os.path.join(out, "STAMP")
+    stamp_file = (open(sp).read().strip() or None) if os.path.exists(sp) else None
+    if stamp_file != stamp:
+        mode_refusals.append(f"OUT/STAMP says {stamp_file!r} and mode.txt {stamp!r}: one run, two stamps")
     if stamp not in (None, "DRY-VIRT"):
         mode_refusals.append(f"mode.txt names the stamp {stamp!r}; DRY-VIRT is the only stamp a run carries")
     if stamp == "DRY-VIRT" and (dry != "1" or mode.get("dry") != "1"):
@@ -1051,7 +1062,8 @@ def self_test():
              ours_fixture="plan", comp_info="plan", expected=("c1-create", "c1-m1"), verdict_text=None,
              boundary_bins=None, garbage_v3l=None, v3l_plants_record=None, conformance="match", backsteps=0,
              loop="closed", v3l_mode="dry", ours_sweeper="ok", comp_sweeper=0.04, ours_counters="ok", ours_tm="ok", ours_tp="ok",
-             stamp=None, mode_dry="1", fire_na=None, enospc=None, dryvirt="auto", klog="ok", ours_warm="ok", fifo=False):
+             stamp=None, mode_dry="1", fire_na=None, enospc=None, dryvirt="auto", klog="ok", ours_warm="ok", fifo=False,
+             stamp_file="same"):
         out = os.path.join(root, "out")
         conformance_files(out, conformance)
         w(f"{out}/stages.tsv", "stage\tstart_utc\tend_utc\tseconds\trc\nfs-xfs\ta\tb\t5\t0\nTOTAL\ta\tb\t9\t0\n")
@@ -1065,6 +1077,11 @@ def self_test():
         w(f"{out}/fslist.txt", fslist + "\n")
         w(f"{out}/mode.txt", f"dry={mode_dry}\nblock={block}\nplant=\nplp={plp}\n"
           + (f"stamp={stamp}\n" if stamp is not None else ""))
+        # TEST EDIT, flagged (t3cov-1a LOW 4): t3run writes the stamp to OUT/STAMP too; STAMP_FILE "same" writes it as
+        # t3run does, anything else is planted there
+        sf = stamp if stamp_file == "same" else stamp_file
+        if sf is not None:
+            w(f"{out}/STAMP", f"{sf}\n")
         # TEST EDIT, flagged (the lead's DATA_GIB ruling, DECISIONS 2026-10-16): a DRY-VIRT run discloses how it differs
         # from the T3 box (dry-virt.txt, t3run --dry-block); "auto" writes it for a DRY-VIRT stamp
         if (dryvirt == "auto" and stamp == "DRY-VIRT") or dryvirt is True:
@@ -1122,7 +1139,7 @@ def self_test():
                 # leaves the shared sweeper's record and timed.json; a new required record at its passing value
                 sweeper_files(a1, ours_sweeper)
             else:
-                verdict = verdict_text or ("FAIL F1: something\nVERDICT FAIL\n" if cell == "compfail"
+                verdict = verdict_text or ("FAIL F1: something\nVERDICT FAIL (dolt)\n" if cell == "compfail"
                                            else "PASS F1\nVERDICT PASS (dolt)\n")
                 w(f"{a1}/result/functional.txt", verdict)
                 info = f"dry=1 age={age} prebranch={live}" if comp_info == "plan" else comp_info
@@ -1337,7 +1354,7 @@ def self_test():
         ("ours fixture: stream digests that are not the generator's fail, naming them",
          {"ours_fixture": {"stream_sha256": {"sql": "a", "age": "x"}}}, False,
          lambda s: any("stream" in x for x in s["fixture_refusals"])),
-        ("ours fixture: a fixture.json that is not an object fails as no fixture record",
+        ("ours fixture: a fixture.json whose rows is not a count fails, naming rows",
          {"ours_fixture": {"rows": None}}, False, lambda s: any("rows" in x for x in s["fixture_refusals"])),
         ("HIGH 4: a competitor whose run-info age differs from its plan row fails",
          {"cell": "comp", "comp_info": "dry=1 age=0 prebranch=20"}, False,
@@ -1358,7 +1375,7 @@ def self_test():
          lambda s: any("FAIL F1: something" in x for x in s["failed_checks"])),
         # T3 runner review LOW 21: the verdict is the LAST VERDICT line, not 'VERDICT PASS' anywhere in the file
         ("T3 runner LOW 21: a functional.txt whose last VERDICT line is FAIL fails, despite an earlier VERDICT PASS",
-         {"cell": "comp", "verdict_text": "VERDICT PASS\nFAIL F2: later\nVERDICT FAIL\n"}, False,
+         {"cell": "comp", "verdict_text": "VERDICT PASS (dolt)\nFAIL F2: later\nVERDICT FAIL (dolt)\n"}, False,
          lambda s: any("FAIL F2: later" in x for x in s["failed_checks"])),
         # fourth lane review LOW 22: distinct pooled p50s per block (bins hand-derived with the documented rule: the
         # first bin where 2 x cumulative >= total): (10000x5, 15000x6) -> 15000; (15000x6, 25000x7) -> 25000;
@@ -1499,6 +1516,8 @@ def self_test():
          and any("DRY-VIRT" in x for x in s.get("credit_refusals") or [])),
         ("dry-block: an ordinary dry package is refused for credit as a dry run", {}, True,
          lambda s: s.get("creditable") is False and any("dry run" in x for x in s.get("credit_refusals") or [])),
+        ("t3cov-1a LOW 4: an OUT/STAMP that mode.txt does not carry fails, naming both", {"stamp_file": "DRY-VIRT"},
+         False, lambda s: any("OUT/STAMP" in x for x in s["mode_refusals"])),
         ("dry-block: a DRY-VIRT stamp on a package whose mode says dry=0 fails it, naming DRY-VIRT",
          {"stamp": "DRY-VIRT", "mode_dry": "0"}, False,
          lambda s: any("DRY-VIRT" in x for x in s.get("failed_stages", []) + s.get("parity_refusals", [])
@@ -1703,7 +1722,7 @@ def self_test():
         with open(f"{out}/cells.tsv", "a") as fh:
             fh.write("xfs\tdolt-full-c1-r1\tdolt\t1\t1\t0\tVALID\n")
         a1 = f"{out}/fs-xfs/cells/dolt-full-c1-r1/a1"
-        w(f"{a1}/result/functional.txt", "VERDICT PASS\n")
+        w(f"{a1}/result/functional.txt", "VERDICT PASS (dolt)\n")  # TEST EDIT, flagged (1b LOW 1): the writer's format
         w(f"{a1}/result/cells/c1-create/timed/summary.json", json.dumps({"warmup_rule": RULE, "measured_ops": 300,
                                                                          "warmup_backsteps": 0, "loop": "closed"}))
         # the records a competitor run writes (comp b49fb656a+): timedrun's verdict and the cells it had to produce
@@ -1752,7 +1771,7 @@ def self_test():
                                                                    "warm_ops": 3, "capped": 0, "rule": RULE}))
                     sweeper_files(a1)  # TEST EDIT, flagged (MED 12 ruling): ours' sweeper record, passing
                 else:
-                    w(f"{a1}/result/functional.txt", "VERDICT PASS\n")
+                    w(f"{a1}/result/functional.txt", f"VERDICT PASS ({system})\n")  # TEST EDIT, flagged (1b LOW 1)
                     w(f"{a1}/result/cells/c1/timed/summary.json", json.dumps({"warmup_rule": RULE,
                                                                               "measured_ops": int(ops),
                                                                               "warmup_backsteps": 0, "loop": "closed"}))
@@ -1800,6 +1819,11 @@ def self_test():
     cases.append(("writer formats: a last VERDICT FAIL (dolt) after a PASS reads as FAIL; no VERDICT line reads as None",
                   functional_verdict("VERDICT PASS (dolt)\nFAIL F1\nVERDICT FAIL (dolt): 1 check(s) failed\n") == "FAIL"
                   and functional_verdict("PASS F1\n") is None, None))
+    # t3cov-1b LOW 1: a verdict naming another system, or none, never reads as this cell's
+    cases.append(("t3cov-1b LOW 1: 'VERDICT PASS (pg18)' in a dolt cell, or a bare 'VERDICT PASS', is no verdict for it",
+                  functional_verdict("VERDICT PASS (pg18)\n", "dolt") is None
+                  and functional_verdict("VERDICT PASS\n", "dolt") is None
+                  and functional_verdict("VERDICT PASS (dolt)\n", "dolt") == "PASS", None))
     bad = [c for c in cases if not c[1]]
     for n, ok, fb in cases:
         print(f"SUMMARIZE self-test {'PASS' if ok else 'FAIL'}: {n}" + (f" (why {fb})" if fb and not ok else ""))

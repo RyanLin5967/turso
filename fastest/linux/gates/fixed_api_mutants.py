@@ -136,7 +136,9 @@ def table_problems(rows, root=LINUX):
 def copy_of(d, top):
     """a copy of fastest/linux/D under TOP, its testdata/ a symlink to the original, and every sibling directory of D
     a symlink to the original, so a test that reaches a sibling (t3lib_test.sh's ../gates/sweeper.sh) finds it (the first
-    Linux run, 2026-10-15: the t3 control refused with 68/78, its sweeper cases finding no ../gates)"""
+    Linux run, 2026-10-15: the t3 control refused with 68/78, its sweeper cases finding no ../gates) Blind spot, stated (t3cov-1a LOW 3): a sibling's
+    files are the ORIGINALS, so a mutant in D that a test reaches only through a sibling's path back into D (../gates/x
+    reaching ../t3 physically) runs unmutated and survives: this can under-report kills, never fake one."""
     dst = os.path.join(top, d)
     shutil.copytree(os.path.join(LINUX, d), dst, symlinks=True, ignore=shutil.ignore_patterns("testdata", "__pycache__"))
     if os.path.isdir(os.path.join(LINUX, d, "testdata")):

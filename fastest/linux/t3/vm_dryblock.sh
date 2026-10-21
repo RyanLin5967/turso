@@ -81,7 +81,13 @@ STOP_GIB=${HOST_STOP_GIB:-30}
     f=$(df -k / | awk 'NR == 2 { print $4 }')
     printf '%s\t%s\t%s\t%s\n' "$(date -u +%FT%TZ)" "$f" "$(du -sk "$HOME/.lima/$VM" | cut -f1)" \
       "$(du -sk "$HOME/.lima/_disks/$DISK" | cut -f1)"
-    if [[ $f =~ ^[0-9]+$ ]] && [ "$f" -lt $((STOP_GIB * 1024 * 1024)) ]; then
+    # a guard that cannot read its input stops the VM, never samples on (t3cov-1b LOW 9: an unparsed df kept sampling)
+    if ! [[ $f =~ ^[0-9]+$ ]]; then
+      echo "STOP: host free space unreadable (df gave '${f}'): stopping $VM"
+      timeout 300 limactl stop -f "$VM" > /dev/null 2>&1
+      break
+    fi
+    if [ "$f" -lt $((STOP_GIB * 1024 * 1024)) ]; then
       echo "STOP: host free $((f / 1024 / 1024)) GiB under $STOP_GIB GiB: stopping $VM"
       timeout 300 limactl stop -f "$VM" > /dev/null 2>&1
       break
