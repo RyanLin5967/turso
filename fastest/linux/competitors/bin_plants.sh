@@ -69,6 +69,11 @@ case_ "home per-cycle with a teardown is refused (the home is closed each cycle)
   -- "$BB" --spec "$S/per-cycle-teardown.spec" --out "$(OUT pt)" --clients 1 --max-ops 1 --set port=1
 case_ "home takes only per-cycle" 2 "home needs 'per-cycle'" \
   -- "$BB" --spec "$S/home-bad.spec" --out "$(OUT hb)" --clients 1 --max-ops 1 --set port=1
+# comp-rev-9bc7d894a final LOW C: open loop refuses home per-cycle (a fresh connect before every claim would be charged
+# to the server as queueing), even in a spec with no after-steps
+printf 'protocol pg\nconnect host=127.0.0.1 port={port} user=postgres dbname=postgres\nhome per-cycle\nstep sql SELECT 1\n' >"$S/open-per-cycle.spec"
+case_ "open loop refuses home per-cycle in a spec with no after-steps (LOW C)" 2 "REFUSED: open loop with home per-cycle" \
+  -- "$BB" --spec "$S/open-per-cycle.spec" --out "$(OUT opc)" --clients 1 --mode open --rate 10 --duration-s 1 --set port=1
 case_ "control: a per-cycle spec with an admin-sql after-step passes the checks and stops at the connect" 2 "$CONN" \
   -- "$BB" --spec "$S/per-cycle.spec" --out "$(OUT pc)" --clients 1 --max-ops 1 --set port=1
 case_ "control: open loop on pg18-select1 passes the checks and stops at the connect" 2 "$CONN" \
