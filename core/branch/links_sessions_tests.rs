@@ -1159,6 +1159,127 @@ fn a_crash_after_a_non_flip_cut_that_changed_rows_behind_the_cursor_reopens_with
 }
 
 
+// ---- h1-rev-72bfb0127 HIGH-1: a REAL older build between a non-flip cut and the flip ----
+
+/// This build's part of the cross-build test: a 19 store a real older build made, opened past the hard limit
+/// with a slow fill, its log cut by a non-flip checkpoint; then the process exits with no close.
+#[test]
+fn ls_xbuild_cut_child() {
+    let Ok(p) = std::env::var("FE_LS_XB_PATH") else {
+        return;
+    };
+    let path = std::path::PathBuf::from(p);
+    super::journal::set_compact_threshold(4 << 10);
+    super::store::LINKS_FILL_PAUSE_MS.store(1_000, Ordering::Release);
+    let db = open(&path);
+    db.branch_wait_name_filter();
+    let trunk = db.connect().unwrap();
+    let mut k = 0;
+    while !db.branches.past_hard_limit_for_test() && k < 20_000 {
+        let _ = trunk.fork_branch().unwrap().into_id();
+        k += 1;
+    }
+    // Let the fill's cursor pass fork 130 (the rows the older build changes), then cut.
+    std::thread::sleep(std::time::Duration::from_secs(4));
+    let peak = log_bytes(&path);
+    for _ in 0..200 {
+        let _ = trunk.fork_branch().unwrap().into_id();
+    }
+    let t = std::time::Instant::now();
+    while log_bytes(&path) >= peak && t.elapsed() < std::time::Duration::from_secs(30) {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let (cgen, cpar, cfe, cdone, mgen) = poll_cursor(&path).unwrap_or((0, 0, 0, 9, 9999));
+    let meta = try_meta_version(&path).unwrap_or(0);
+    println!(
+        "LS-XBCUT past={} meta={meta} peak={peak} log={} cgen={cgen} mgen={mgen} cpar={cpar} cfe={cfe} cdone={cdone}",
+        u64::from(db.branches.past_hard_limit_for_test()),
+        log_bytes(&path)
+    );
+    std::process::exit(0);
+}
+
+/// Run a phase of the REAL older build (`xbuild_old_overlay.rs`, built at 6619b0312 as its test binary,
+/// named by `FE_XB_OLD_BIN`), refusing one that ran no test or failed.
+fn old_build(bin: &str, phase: &str, path: &std::path::Path) -> String {
+    let out = std::process::Command::new(bin)
+        .args(["branch::xbuild_old_tests::xb_old_child", "--exact", "--test-threads=1", "--nocapture"])
+        .env("FE_XB_PHASE", phase)
+        .env("FE_XB_PATH", path)
+        .env_remove("FE_LS_CHILD")
+        .env_remove("FE_MUTANT")
+        .output()
+        .unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(text.contains("running 1 test") && text.contains(&format!("XB-OLD phase={phase} ")), "the older build's {phase} ran no test:\n{text}");
+    assert!(out.status.success(), "the older build's {phase} failed:\n{text}");
+    text
+}
+
+/// h1-rev-72bfb0127 HIGH-1 (condition (2)'s older-build half, ruling 62c11ec63d, under a REAL older build):
+/// a 19 store made by the real 19 build (6619b0312, `FE_XB_OLD_BIN`); this build past the hard limit cuts its
+/// log at 19 with its fill incomplete and the cursor carried, and crashes; the real older build then reaps and
+/// forks behind the cursor and checkpoints (moving the generation, not the cursor); this build reopens, refills
+/// and flips, and every row's links are right by the independent oracle. Premises: the older build made a 19
+/// store; the cut, still 19, the cursor carried and not done and past the changed rows; after the older
+/// session the catalog's generation moved and the cursor's did not. Mutant `l4_fill_generation_ignored` (this
+/// build resumes a cursor of another generation) must fail it. Ignored in a plain run: it needs the older
+/// build's binary, and refuses without it.
+#[test]
+#[ignore = "needs FE_XB_OLD_BIN, a real 19 build's test binary (xbuild_old_overlay.rs)"]
+fn a_crash_after_a_non_flip_cut_then_a_real_older_builds_session_reopens_with_every_link_right() {
+    if in_child() {
+        return;
+    }
+    let bin = std::env::var("FE_XB_OLD_BIN").expect("REFUSED: FE_XB_OLD_BIN (a real 19 build's test binary) is not set");
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("xb.db");
+    old_build(&bin, "make", &path);
+    assert_eq!(meta_version(&path), 19, "premise: the older build made a 19 store");
+    let ids: Vec<u64> = std::fs::read_to_string(format!("{}.ids", path.display())).unwrap().lines().map(|l| l.parse().unwrap()).collect();
+    let (mpar, mfe) = {
+        let cat = ls_cat(&path);
+        let sql = |c: &str| format!("SELECT {c} FROM branch WHERE id = {}", ids[130]);
+        (ls_first(&cat, &sql("parent")), ls_first(&cat, &sql("fork_epoch")))
+    };
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["branch::links_sessions_tests::ls_xbuild_cut_child", "--exact", "--test-threads=1", "--nocapture"])
+        .env("FE_LS_XB_PATH", &path)
+        .env_remove("FE_LS_CHILD")
+        .output()
+        .unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let r = readings(&text, "LS-XBCUT ");
+    assert_eq!(r.len(), 1, "premise: the crashed process reported:\n{text}");
+    let v = &r[0];
+    let (past, meta, peak, log, cgen, mgen, cpar, cfe, cdone) = (v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8]);
+    assert_eq!(past, 1, "premise: the store was past the hard limit: {text}");
+    assert!(log < peak, "premise: the log was not cut ({log} B, peak {peak} B)");
+    assert_eq!(meta, 19, "premise: the store flipped before the crash (meta {meta})");
+    assert_eq!((cgen, cdone), (mgen, 0), "premise: the cut did not carry an unfinished cursor (cursor generation {cgen}, catalog {mgen}, done {cdone})");
+    assert!((cpar, cfe) > (mpar, mfe), "premise: the cursor ({cpar}, {cfe}) is not past the rows the older build changes ({mpar}, {mfe})");
+    old_build(&bin, "session", &path);
+    let (cgen1, gen1) = {
+        let mut cat = ls_cat(&path);
+        (ls_first(&cat, "SELECT generation FROM link_fill"), cat.meta().unwrap().map_or(0, |m| m.generation))
+    };
+    assert!(gen1 > mgen, "premise: the older build's checkpoint did not move the generation ({mgen} -> {gen1})");
+    assert_eq!(cgen1, cgen, "premise: the older build moved the fill cursor ({cgen} -> {cgen1})");
+    assert_eq!(meta_version(&path), 19, "premise: the older build left the store at 19");
+    {
+        let db = open(&path);
+        db.branch_wait_name_filter();
+        db.branch_compact_now().unwrap();
+        db.branch_checkpoint_wait();
+    }
+    let (rows, wrong) = ls_wrong_links(&path).unwrap_or((0, 9999));
+    println!("LS real older build: gen {mgen} -> {gen1}, cursor {cgen1}; meta={} rows={rows} wrong={wrong}", meta_version(&path));
+    assert!(rows > 1_000, "premise: the rows are there ({rows})");
+    assert_eq!(meta_version(&path), 21, "the store did not upgrade after the older build's session");
+    assert_eq!(wrong, 0, "{wrong} of {rows} rows have wrong links after a real older build's session between a non-flip cut and the flip");
+}
+
+
 // ---- h1gap-rev-c HIGH-3 (ruling 62c11ec63d): the close-time flip relinks O(changes), not O(N) ----
 
 #[test]
