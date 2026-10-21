@@ -4375,7 +4375,11 @@ impl<'a> Parser<'a> {
 
                 eat_expect!(self, TK_TO);
 
-                let new = self.parse_column_definition(true)?;
+                // A column's whole new definition, constraints included (fastest-wire 1529a6674): a
+                // PRIMARY KEY or UNIQUE here is judged by the ALTER's translation, which accepts a
+                // definition keeping the column's own key and refuses adding one. ADD COLUMN keeps
+                // the parse-time refusal (`in_alter`).
+                let new = self.parse_column_definition(false)?;
 
                 Ok(Stmt::AlterTable(AlterTable {
                     name: tbl_name,
