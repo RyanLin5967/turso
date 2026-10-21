@@ -4426,7 +4426,6 @@ impl BranchStore {
             name_filter_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             flight_hold: Arc::new(AtomicU8::new(0)),
             over_hard: Arc::new(AtomicBool::new(false)),
-            #[cfg(test)]
             truncating: Arc::new(AtomicBool::new(false)),
             installs: Arc::new((std::sync::Mutex::new(0), std::sync::Condvar::new())),
             trunk_children: AtomicUsize::new(0),
@@ -4735,7 +4734,6 @@ impl BranchStore {
             name_filter_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             flight_hold: Arc::new(AtomicU8::new(0)),
             over_hard: Arc::new(AtomicBool::new(false)),
-            #[cfg(test)]
             truncating: Arc::new(AtomicBool::new(false)),
             installs: Arc::new((std::sync::Mutex::new(0), std::sync::Condvar::new())),
             unsynced: AtomicBool::new(false),
