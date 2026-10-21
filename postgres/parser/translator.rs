@@ -6199,12 +6199,6 @@ fn float_literal(text: &str, type_name: &str) -> Result<ast::Expr, ParseError> {
     literal(format!("{v:e}"))
 }
 
-/// A numeric literal as libpg_query hands it (an integer past int4 arrives as text, not Ival), in
-/// the decimal form the engine's literal parser reads: PostgreSQL 16+'s base-2, -8 and -16 integers
-/// (`0b..`, `0o..`, `0x..`) and underscores between digits become decimal digits. The engine's
-/// parse_numeric_literal assumes SQLite's grammar checked the text, so `0b1000..0` (2^31) hit its
-/// unreachable!() and ended the session (the PostgreSQL regression corpus, numerology.sql). A
-/// non-decimal value past u128 is computed as a float. Any other text is passed on as it is.
 /// THE predicate for a decimal the engine would round (wire-rev-7128c6f73 HIGH-1, the lead's ruling
 /// DECISIONS d2bf57effb): `text`, a numeric literal's or a bound numeric value's text, holds more
 /// than 15 significant digits (DBL_DIG, the most a float8 holds exactly), so as the engine's REAL
@@ -6240,6 +6234,12 @@ pub fn decimal_past_float8(text: &str) -> bool {
     digits.trim_start_matches('0').trim_end_matches('0').len() > 15
 }
 
+/// A numeric literal as libpg_query hands it (an integer past int4 arrives as text, not Ival), in
+/// the decimal form the engine's literal parser reads: PostgreSQL 16+'s base-2, -8 and -16 integers
+/// (`0b..`, `0o..`, `0x..`) and underscores between digits become decimal digits. The engine's
+/// parse_numeric_literal assumes SQLite's grammar checked the text, so `0b1000..0` (2^31) hit its
+/// unreachable!() and ended the session (the PostgreSQL regression corpus, numerology.sql). A
+/// non-decimal value past u128 is computed as a float. Any other text is passed on as it is.
 fn decimal_numeric_literal(text: &str) -> String {
     let (negative, body) = match text.strip_prefix('-') {
         Some(rest) => (true, rest),
