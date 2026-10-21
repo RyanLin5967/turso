@@ -16102,6 +16102,41 @@ fn a_bound_exponent_or_infinity_overflows_numeric_at_bind() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-351702a43 MED-4 (its PG 18.6 probe3 #162-#165): the fold probe runs the constant parts PostgreSQL's
+/// eval_const_expressions simplifies, and only those: coalesce stops at its first non-null constant, AND at a constant
+/// false, OR at a constant true, so a later bad constant is never run (PG answers; ours refused 22023); and a CASE's
+/// results are simplified unless their WHEN is constant false, so a bad constant there is 22023 as in PG (ours NULL).
+#[test]
+fn the_fold_probe_simplifies_as_postgresql_simplifies() {
+    let dir = Scratch::new("fold-shortcut");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    for (sql, want) in [
+        ("SELECT now() IS NULL AND false AND encode('abc', 'nosuch') = ''", "f"),
+        ("SELECT now() IS NOT NULL OR true OR encode('abc', 'nosuch') = ''", "t"),
+        ("SELECT coalesce(NULL, 'a', encode('abc', 'nosuch'))", "a"),
+    ] {
+        let r = a.q(sql);
+        if r.error.is_some() || r.rows != vec![vec![Some(want.to_string())]] {
+            wrong.push(format!("{sql}: rows {:?} error {:?}, PostgreSQL {want}", r.rows, r.error));
+        }
+    }
+    let r = a.q("SELECT coalesce(now()::text, 'a', encode('abc', 'nosuch'))");
+    if r.error.is_some() {
+        wrong.push(format!("coalesce(now()::text, 'a', bad): {:?}, PostgreSQL answers the timestamp", r.error));
+    }
+    let r = a.q("SELECT CASE WHEN now() IS NULL THEN encode('abc', 'nosuch') END");
+    if r.error.as_ref().map(|e| e.code.as_str()) != Some("22023") {
+        wrong.push(format!("CASE ... THEN bad: rows {:?} error {:?}, PostgreSQL 22023", r.rows, r.error));
+    }
+    let r = a.q("SELECT CASE WHEN false THEN encode('abc', 'nosuch') ELSE 'b' END");
+    if r.error.is_some() || r.rows != vec![vec![Some("b".to_string())]] {
+        wrong.push(format!("CASE WHEN false THEN bad: rows {:?} error {:?}, PostgreSQL b", r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-351702a43 MED-1 and LOW-4 (its PG 18.6 probe3 #183-#190): a three-part name naming another database is
 /// 0A000 'cross-database references are not implemented' in DROP, COMMENT ON and ALTER ... RENAME too. The RENAME
 /// renamed THIS database's table silently, COMMENT ON was accepted, and DROP answered XX000 'no such database'.
