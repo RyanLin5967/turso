@@ -2,8 +2,9 @@
 """AD-T5's fire-check driver (PREREG-v1 amendment 2), Linux: correctness evidence only (T1 is c1btrace's).
 
 Builds async_s0 twice from the checked-out sha (the reading binary, and the fire-check binary with
-`--features turso_core/fe-mutants` and RUSTFLAGS="--cfg fe_ad_t5_firecheck", which lifts HIGH F's refusal of
-async creates in that build alone) and prints both sha256s. It runs the reading binary once, and
+`--features turso_core/fe-mutants` and `cargo --config 'target.<host>.rustflags=["--cfg=fe_ad_t5_firecheck"]'`,
+which lifts HIGH F's refusal of async creates in that build alone and, unlike RUSTFLAGS, keeps
+.cargo/config.toml's rustflags) and prints both sha256s. It runs the reading binary once, and
 the fire-check binary unmutated and once per registered mutant, each under
 `strace -f -y -e trace=...`. It counts, per arm and run, the creating thread's file writes under the
 trace root and its flushes, between that thread's own WINDOW OPEN and WINDOW CLOSE markers (written
@@ -76,16 +77,31 @@ RUNS = None
 # The compiler flag that lifts HIGH F's refusal of async creates, set for the fire-check binary's
 # build alone (engine-2bdcd32c6 MED 4; lead ruling, artie DECISIONS 66b4671687: a cargo feature
 # would be turned on by --all-features). The reading binary is built without it, and refuses.
-FIRECHECK_CFG = "--cfg fe_ad_t5_firecheck"
+# It is ADDED to .cargo/config.toml's target rustflags through `cargo --config`, never set as
+# RUSTFLAGS, which replaces them: a RUSTFLAGS build lost --cfg=tokio_unstable and
+# -C link-args=-Wl,-z,nodelete (fastest-engine, artie 5f7c86e06a), two differences from the reading
+# binary beyond the gate. turso_core refuses to compile the flag without tokio_unstable.
+FIRECHECK_CFG = "--cfg=fe_ad_t5_firecheck"
+
+
+def host_triple():
+    out = subprocess.run(["rustc", "-vV"], check=True, capture_output=True, text=True).stdout
+    for line in out.splitlines():
+        if line.startswith("host: "):
+            return line[len("host: "):].strip()
+    sys.exit("REFUSED: rustc -vV printed no host triple")
 
 
 def build(features):
-    cmd = ["cargo", "test", "--release", "-p", "turso_core", "--test", "async_s0", "--no-run", "--message-format=json"]
+    cmd = ["cargo"]
+    if features:
+        cmd += ["--config", f'target.{host_triple()}.rustflags=["{FIRECHECK_CFG}"]']
+    cmd += ["test", "--release", "-p", "turso_core", "--test", "async_s0", "--no-run", "--message-format=json"]
     env = dict(os.environ)
+    # Neither binary takes RUSTFLAGS from the caller: it would replace the workspace's rustflags.
     env.pop("RUSTFLAGS", None)
     if features:
         cmd += ["--features", features]
-        env["RUSTFLAGS"] = FIRECHECK_CFG
     out = subprocess.run(cmd, check=True, capture_output=True, text=True, env=env).stdout
     for line in out.splitlines():
         try:
