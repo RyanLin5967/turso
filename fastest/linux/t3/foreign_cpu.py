@@ -418,10 +418,14 @@ def self_test():
     d = tempfile.mkdtemp()
 
     launched = {}   # window label -> [(burner, pid)], so a case can read each burner's own rows
+    cpu_of = {}     # pid -> its CPU seconds (ru_utime + ru_stime) from os.wait4: the truth, from another instrument
 
     def window(label, burners, secs=20):
-        """burners: list of (sut?, start_s, dur_s[, duty]); duty < 1 busy-loops that share of every 10 ms.
-        Returns the verdict."""
+        """burners: list of (sut?, start_s, dur_s[, duty[, kind]]); duty < 1 busy-loops that share of every 10 ms.
+        KIND (the calibration's loads; linux-rev-fc20226b9 HIGH 1) is "user" (that busy loop), "sys" (a /dev/zero
+        reader: system time) or "mtN" (N threads hashing a 16 MiB buffer, which releases the GIL: one pid at N cores);
+        a burner with a KIND stays alive, idle, for 2.5 s after it burns and then os._exit()s, so the sampler's last
+        reading of it holds all its CPU. Returns the verdict."""
         out = os.path.join(d, f"{label}.tsv")
         stop = os.path.join(d, f"{label}.stop")
         s = subprocess.Popen([sys.executable, "-B", __file__, "sample", out, "--cell", "ST", "--stop-file", stop])
@@ -441,6 +445,22 @@ def self_test():
                         f"while time.monotonic()-t<{dur}:\n"
                         f"    u=time.monotonic()\n    while time.monotonic()-u<{0.01 * duty}: pass\n"
                         f"    time.sleep({0.01 * (1 - duty)})\n")
+                if len(b) > 4:
+                    kind = b[4]
+                    if kind == "sys":
+                        body = ("f=os.open('/dev/zero', os.O_RDONLY)\n"
+                                f"while time.monotonic()-t<{dur}: os.read(f, 1 << 16)\n")
+                    elif kind.startswith("mt"):
+                        body = ("import hashlib, threading\nbuf=b'x' * (1 << 24)\n"
+                                "def w():\n"
+                                f"    while time.monotonic()-t<{dur}: hashlib.sha256(buf).digest()\n"
+                                f"ts=[threading.Thread(target=w) for _ in range({int(kind[2:])})]\n"
+                                "[x.start() for x in ts]; [x.join() for x in ts]\n")
+                    else:
+                        body = (f"while time.monotonic()-t<{dur}:\n"
+                                f"    u=time.monotonic()\n    while time.monotonic()-u<{0.01 * duty}: pass\n"
+                                f"    time.sleep({0.01 * (1 - duty)})\n")
+                    code = "import os, time\nt=time.monotonic()\n" + body + "time.sleep(2.5)\nos._exit(0)\n"
                 if sut == "child":
                     # a SUT parent (the marker in its environ) whose burning child has none: what a PostgreSQL
                     # backend looks like (the server's ps display clobbers the environ area of every child it forks)
@@ -451,7 +471,9 @@ def self_test():
                 launched.setdefault(label, []).append((b, procs[-1].pid))
             time.sleep(0.05)
         for p in procs:
-            p.wait()
+            _pid, _st, ru = os.wait4(p.pid, 0)
+            p.returncode = 0
+            cpu_of[p.pid] = ru.ru_utime + ru.ru_stime
         open(stop, "w").close()
         s.wait()
         return decide(out)["verdict"], out, {os.getpid(), s.pid} | {p.pid for p in procs}
@@ -475,46 +497,110 @@ def self_test():
     n_pass = n_na = 0
     # this self-test's own uwrun run, for late_busy: a process of ours in it may be the test's own
     own_run = (owner_of(os.getpid()) or (0, "-", "-"))[2]
-    # CALIBRATION of the sampler itself (the lead's F6 order (2); linux-rev-957573fc1 HIGH 1: one point at saturation let
-    # a capped over-count (CLAMP) and a convex under-count (SQUARE: a 68% foreign process read 45%, under rule 2) pass,
-    # because every live burner runs at about 0% or 100%). One window, run on every host whatever its load, holds
-    # known loads: SUT burners at duty 1.0, 0.68 and 0.3, and foreign burners at duty 0.68 and 0.3. Each SUT burner's
-    # median per-sample reading must land within 15 points of its duty; rule 2 must name the foreign 0.68 burner and must
-    # not name the foreign 0.3 one. Load can starve a burner but never inflate its reading, so a full-core burner read
-    # under 80% means the host starved it: the calibration is then N/A-on-busy-host, never a pass. Blind spot, stated:
-    # an error that is exact at 30%, 68% and 100% but wrong between them passes.
-    cal = [(True, 0, 8, 1.0), (True, 0, 8, 0.68), (True, 0, 8, 0.3), (False, 0, 8, 0.68), (False, 0, 8, 0.3)]
-    _cv, crec, _cm = window("calibration", cal, secs=10)
-    rows_by_pid = {}
-    for r in (ln.rstrip("\n").split("\t") for ln in open(crec)):
-        if not r[0].startswith("#") and len(r) == 5:
-            rows_by_pid.setdefault(int(r[1]), []).append(float(r[3]))
-    named = {int(m.group(1)) for m in (re.match(r"foreign process (\d+) ", x) for x in decide(crec)["reasons"]) if m}
+    # CALIBRATION of the sampler itself (the lead's F6 order (2); linux-rev-957573fc1 HIGH 1; linux-rev-fc20226b9 HIGH 1,
+    # HIGH 2, LOW 1). Run on every host whatever its load. Two kinds of check:
+    # (a) ACCOUNTING, against another instrument. Each calibration burner's CPU seconds as the sampler summed them
+    #     (pct x its tick / 100, over every row of that pid) must equal its rusage from os.wait4 (ru_utime + ru_stime)
+    #     within the sampler's own resolution: 3 clock ticks (utime and stime are each truncated to a tick, plus one for
+    #     the burner's exit) plus 0.001 s per row (pct is written to 0.1). The loads split CPU the ways real load does:
+    #     user-mode at duty 1.0, 0.68 and 0.3, system time (a /dev/zero reader) and two threads in one pid. So a sampler
+    #     that drops stime, reads one thread, offsets, quantises, scales, saturates or over-counts fails here.
+    # (b) THE VERDICT RULES AT THEIR THRESHOLDS, on the record of the window's own burners alone (other load removed, as
+    #     late_busy does): rule 2 must name a foreign burner at duty 0.56 and must not name one at 0.44; rule 1 must void
+    #     three foreign burners at 0.37 each (111%) and must not void three at 0.30 (90%).
+    # A burner whose rusage shows it got under 80% of the CPU it asked for was starved by the host: its window's checks
+    # are then N/A-on-busy-host, judged by rusage, never by the sampler under test.
+    # Blind spots, stated: (a) bounds each process's TOTAL over the window, not each sample, so an error that moves CPU
+    # between one process's samples (totals kept) passes, and could carry a run of samples across 50%; (b) is exact only
+    # outside the margins, so a foreign process within about 6 points of 50%, or three within about 11 points of 100% in
+    # total, can be misjudged by an error under those margins that (a) did not catch. Loads not covered: CPU of reaped
+    # children (cutime), processes born and dead inside one tick, threads that exit between samples, and processes whose
+    # /proc entries cannot be read.
+    def own_record(path, pids, tag):
+        """a copy of the record holding only PIDS' rows, each #tick's foreign sum recomputed from them"""
+        sums, out = {}, []
+        for line in open(path).read().splitlines():
+            q = line.split("\t")
+            if not q[0].startswith("#") and len(q) == 5:
+                if int(q[1]) not in pids:
+                    continue
+                if q[4] == "foreign":
+                    sums[q[0]] = sums.get(q[0], 0.0) + float(q[3])
+            elif q[0] == "#tick" and len(q) >= 3:
+                q[2] = f"{sums.get(q[1], 0.0):.1f}"
+                line = "\t".join(q)
+            out.append(line)
+        f_ = f"{path}.{tag}"
+        with open(f_, "w") as o_:
+            o_.write("\n".join(out) + "\n")
+        return f_
 
-    def med(pid):
-        v = sorted(rows_by_pid.get(pid, []))
-        return v[len(v) // 2] if v else None
-    cpids = launched["calibration"]
-    full = med(next(pid for b, pid in cpids if b[0] is True and b[3] == 1.0))
-    if full is not None and full < 80.0:
-        n_na += 1
-        print(f"N/A-on-busy-host: self-test F6 calibration: the full-core SUT burner read a median {full}%, "
-              f"under 80%: the host starved it, so no load point can be checked", flush=True)
-    else:
-        for b, pid in cpids:
-            m_ = med(pid)
-            if b[0] is True:
-                ok_ = m_ is not None and abs(m_ - 100.0 * b[3]) <= 15.0
-                what = f"a SUT burner at duty {b[3]} reads a median within 15 points of {100.0 * b[3]:.0f}% (median {m_})"
-            elif b[3] >= 0.5:
-                ok_ = pid in named
-                what = f"rule 2 names a foreign burner at duty {b[3]} (median {m_})"
-            else:
-                ok_ = pid not in named
-                what = f"rule 2 does not name a foreign burner at duty {b[3]} (median {m_})"
-            bad += not ok_
-            n_pass += ok_
-            print(f"self-test {'PASS' if ok_ else 'FAIL'}: F6 calibration: {what}")
+    def sampled_cpu(path, pid):
+        """(CPU seconds the sampler recorded for PID, rows): each row's pct times its own tick's length"""
+        ticks, rows = [0.0], []
+        for q in (ln.split("\t") for ln in open(path).read().splitlines()):
+            if q[0] == "#tick":
+                ticks.append(float(q[1]))
+            elif not q[0].startswith("#") and len(q) == 5 and int(q[1]) == pid:
+                rows.append((float(q[0]), float(q[3])))
+        dt = {round(t, 3): t - ticks[i] for i, t in enumerate(ticks[1:])}
+        return sum(pct * dt.get(round(t, 3), 0.0) / 100.0 for t, pct in rows), len(rows)
+
+    def asked(b):
+        k = b[4]
+        return b[2] * (int(k[2:]) if k.startswith("mt") else 1.0 if k == "sys" else b[3])
+
+    def cal(label, burners, verdicts=()):
+        """run one calibration window; check (a) for every burner and each (b) in VERDICTS, a list of
+        (what, burner indexes, predicate over (decide() of their own record, their pids))"""
+        _v, rec, _m = window(label, burners, secs=max(b[2] for b in burners) + 4)
+        got = launched[label]
+        starved = [(b, pid) for b, pid in got if cpu_of.get(pid, 0.0) < 0.8 * asked(b)]
+        if starved:
+            b, pid = starved[0]
+            print(f"N/A-on-busy-host: self-test calibration {label}: a burner ({b[4]}, duty {b[3]}) got "
+                  f"{cpu_of.get(pid, 0.0):.2f} s of CPU by its own rusage, under 80% of the {asked(b):.2f} s it asked "
+                  f"for: the host starved it, so this window checks nothing", flush=True)
+            return 0, 0, len(got) + len(verdicts)
+        n_ok = n_bad = 0
+        for b, pid in got:
+            sc, rows = sampled_cpu(rec, pid)
+            tol = 3.0 / HZ + 0.001 * rows
+            ok_ = abs(sc - cpu_of[pid]) <= tol
+            n_ok += ok_
+            n_bad += not ok_
+            print(f"self-test {'PASS' if ok_ else 'FAIL'}: calibration {label}: a {'SUT' if b[0] else 'foreign'} "
+                  f"{b[4]} burner at duty {b[3]}: the sampler's {sc:.3f} s equals its rusage {cpu_of[pid]:.3f} s "
+                  f"within {tol:.3f} s ({rows} rows)")
+        for what, idx, pred in verdicts:
+            pids = {got[i][1] for i in idx}
+            v_ = decide(own_record(rec, pids, f"own{min(idx)}"))
+            ok_ = bool(pred(v_, pids))
+            n_ok += ok_
+            n_bad += not ok_
+            print(f"self-test {'PASS' if ok_ else 'FAIL'}: calibration {label}: {what} (reasons {v_['reasons']})")
+        return n_ok, n_bad, 0
+
+    def names(v_, pids):
+        return {int(m.group(1)) for m in (re.match(r"foreign process (\d+) ", x) for x in v_["reasons"]) if m} & pids
+
+    def rule1(v_):
+        return any(x.startswith("foreign CPU > 100%") for x in v_["reasons"])
+    for args in (
+        ("cal-user", [(True, 0, 6, 1.0, "user"), (True, 0, 6, 0.68, "user"), (True, 0, 6, 0.3, "user")]),
+        ("cal-sys-mt", [(True, 0, 6, 1.0, "sys"), (True, 0, 6, 1.0, "mt2")]),
+        ("cal-rule2", [(False, 0, 8, 0.56, "user"), (False, 0, 8, 0.44, "user")],
+         [("rule 2 names a foreign burner at duty 0.56", [0], lambda v_, p_: names(v_, p_)),
+          ("rule 2 does not name a foreign burner at duty 0.44", [1], lambda v_, p_: not names(v_, p_))]),
+        ("cal-rule1", [(False, 0, 8, 0.37, "user")] * 3,
+         [("rule 1 voids three foreign burners at duty 0.37 (111%)", [0, 1, 2], lambda v_, p_: rule1(v_))]),
+        ("cal-rule1-not", [(False, 0, 8, 0.30, "user")] * 3,
+         [("rule 1 does not void three foreign burners at duty 0.30 (90%)", [0, 1, 2], lambda v_, p_: not rule1(v_))]),
+    ):
+        a_, b_, na_ = cal(*args)
+        n_pass += a_
+        bad += b_
+        n_na += na_
     for label, burners, want in live:
         # linux-rev-uw2 LOW 4: on a busy host the VOID-wanting case is N/A too: its window would VOID with or without
         # the burner, so it cannot tell a working sampler from one that voids everything
@@ -784,7 +870,7 @@ def self_test():
     # reads N/A here, not FAIL. On T3 that changes nothing: --require-all refuses any N/A.
     # LATE LOAD (found 2026-10-21 on eceubuntu4, raws linux-f6gate/linux-f6cal): the quiet baseline passed, then load
     # that arrived later VOIDed a VALID-wanting live case, which read FAIL ("SUT burners only: want VALID, got VOID")
-    # where the host, not the sampler, was at fault. Such a case is N/A-on-busy-host only on evidence that cannot be
+    # attributed to the host (UNEXPLAINED, above). Such a case is N/A-on-busy-host only on evidence that cannot be
     # this self-test's own: another uid, or a process of ours whose uwrun run is known and is not this self-test's run.
     # Ours in this run, ours with run unknown (?), unrecorded or excluded is no evidence, so the child case's own child
     # misclassified as foreign (mutant G1's shape) still FAILS. The red reaches late_busy and live_outcome through
