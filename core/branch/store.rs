@@ -3235,7 +3235,6 @@ struct ReleaseInAir {
 
 /// What `BranchStore::start_flight` did (review 4 #2): only `Failed` backs the next attempt off.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[derive(Clone, Copy)]
 enum FlightStart {
     /// A fuzzy checkpoint is in flight now, on a thread of its own.
     Started,
