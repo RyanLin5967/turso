@@ -29,6 +29,7 @@ pub(crate) fn resolve_scalar(name: &str, arg_count: usize) -> bool {
         "to_char" | "pg_input_is_valid" | "booleq" | "boolne" | "col_description" | "bpchareq"
         | "encode" | "bpcharlt" => &[2],
         "version" | "current_database" | "current_schema" | "pg_backend_pid" => &[0],
+        "now" | "transaction_timestamp" | "statement_timestamp" => &[0],
         "make_date" => &[3],
         "make_timestamp" => &[6],
         _ => return false,
@@ -45,6 +46,9 @@ pub(crate) fn exec_scalar(conn: &Connection, name: &str, args: &[Value]) -> Resu
         _ => String::new(),
     };
     match name {
+        "now" | "transaction_timestamp" | "statement_timestamp" => Ok(Value::build_text(
+            crate::session::session_time(conn, name == "statement_timestamp"),
+        )),
         // PostgreSQL refuses a date past the range (22008) where the SQLite dialect answers NULL.
         "make_date" => turso_core::make_date_or_refuse(args),
         "make_timestamp" => turso_core::make_timestamp_or_refuse(args),

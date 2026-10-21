@@ -49,6 +49,10 @@ pub(crate) struct PgConnectionInner {
     /// A stamp of the last assignment to the search path, unique across connections, 0 before any
     /// ([`PgConnection::search_path_stamp`]).
     search_path_stamp: std::sync::atomic::AtomicU64,
+    /// now()'s value for the open transaction and statement_timestamp()'s for the running statement,
+    /// read once and held (PostgreSQL's xact and statement start; wire-rev-4a1934c89-beb4 MED-7):
+    /// [`PgConnection::statement_starts`] clears them.
+    times: parking_lot::Mutex<(Option<String>, Option<String>)>,
     /// Notices a statement raised for the client ((severity, condition, message): a WARNING, or a
     /// NOTICE such as DROP ... IF EXISTS's for a missing object), which the server sends before
     /// the statement's result ([`PgConnection::take_warnings`]).
@@ -732,6 +736,17 @@ impl PgConnectionInner {
     }
 }
 
+/// now() (`statement` false) or statement_timestamp() for the session on `conn`: the value its
+/// transaction or statement first read, held until [`PgConnection::statement_starts`] clears it.
+/// A connection with no session reads the clock.
+pub(crate) fn session_time(conn: &Connection, statement: bool) -> String {
+    let read = || chrono::Utc::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string();
+    let Some(inner) = session_of_connection(conn) else { return read() };
+    let mut times = inner.times.lock();
+    let slot = if statement { &mut times.1 } else { &mut times.0 };
+    slot.get_or_insert_with(read).clone()
+}
+
 /// [`session_of`] for a connection reached by reference (a scalar function's, a catalog table's):
 /// the registry is keyed by the connection's address, which is the same.
 pub(crate) fn session_of_connection(conn: &Connection) -> Option<Arc<PgConnectionInner>> {
@@ -795,6 +810,7 @@ impl PgConnection {
                 statement_timeout_ms: std::sync::atomic::AtomicU64::new(0),
                 min_messages: std::sync::atomic::AtomicU8::new(7),
                 search_path_stamp: std::sync::atomic::AtomicU64::new(0),
+                times: parking_lot::Mutex::new((None, None)),
                 warnings: parking_lot::Mutex::new(Vec::new()),
                 public_schema_only,
                 dropped_schemas: parking_lot::Mutex::new(Vec::new()),
@@ -811,6 +827,16 @@ impl PgConnection {
 
     pub fn inner(&self) -> &Arc<Connection> {
         &self.inner.conn
+    }
+
+    /// A statement starts to run: statement_timestamp() is read anew, and outside a block so is
+    /// now(), each statement being its own transaction.
+    pub fn statement_starts(&self) {
+        let mut times = self.inner.times.lock();
+        times.1 = None;
+        if self.inner.conn.get_auto_commit() {
+            times.0 = None;
+        }
     }
 
     /// The relations named by statements prepared inside the open block since the last take.

@@ -2389,6 +2389,7 @@ impl Session {
         let verb = TxVerb::of(sql);
         let mut st = self.state();
         let conn = self.current(&mut st)?;
+        conn.statement_starts();
         // A connection an undo failed on (a rollback of an implicit block, after its statement
         // was answered) holds work nobody can name: it serves nothing more, the next statement
         // ending the session, never joining that transaction (wire review 16 item 14).

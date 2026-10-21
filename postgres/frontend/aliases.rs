@@ -8,10 +8,11 @@ pub fn install(conn: &Connection) {
 
 fn register_pg_functions(ext_api: &mut ExtensionApi) {
     unsafe {
-        register_alias(ext_api, c"now".as_ptr());
+        // clock_timestamp() alone stays an extension, registered non-deterministic, so it is read
+        // at each call; now(), transaction_timestamp() and statement_timestamp() are the
+        // dialect's, held per transaction and per statement (functions.rs; wire-rev-4a1934c89-beb4
+        // MED-2, MED-7).
         register_alias(ext_api, c"clock_timestamp".as_ptr());
-        register_alias(ext_api, c"transaction_timestamp".as_ptr());
-        register_alias(ext_api, c"statement_timestamp".as_ptr());
     }
 }
 
