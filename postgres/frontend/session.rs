@@ -552,6 +552,11 @@ impl PgConnectionInner {
 /// [`session_of`] for a connection reached by reference (a scalar function's, a catalog table's):
 /// the registry is keyed by the connection's address, which is the same.
 pub(crate) fn session_of_connection(conn: &Connection) -> Option<Arc<PgConnectionInner>> {
+    if let Some(inner) = conn.frontend_context().and_then(|c| c.downcast::<PgConnectionInner>().ok()) {
+        if std::ptr::eq(Arc::as_ptr(&inner.conn), conn) {
+            return Some(inner);
+        }
+    }
     SESSIONS_BY_CONNECTION
         .lock()
         .get(&(conn as *const Connection as usize))
@@ -561,6 +566,13 @@ pub(crate) fn session_of_connection(conn: &Connection) -> Option<Arc<PgConnectio
 
 /// The session of the engine connection `conn`, if one is alive.
 pub(crate) fn session_of(conn: &Arc<Connection>) -> Option<Arc<PgConnectionInner>> {
+    // The connection's own frontend slot first: an atomic load and a refcount, no lock and no
+    // allocation (M4: the branch-switch path found its session through the mutex-guarded map).
+    if let Some(inner) = conn.frontend_context().and_then(|c| c.downcast::<PgConnectionInner>().ok()) {
+        if Arc::ptr_eq(&inner.conn, conn) {
+            return Some(inner);
+        }
+    }
     SESSIONS_BY_CONNECTION
         .lock()
         .get(&(Arc::as_ptr(conn) as usize))
@@ -623,6 +635,10 @@ impl PgConnection {
         SESSIONS_BY_CONNECTION
             .lock()
             .insert(Arc::as_ptr(&pg.inner.conn) as usize, Arc::downgrade(&pg.inner));
+        // The connection's frontend slot, set once (M4); a connection that already holds a
+        // session's is found through the map above, as before.
+        let weak: std::sync::Weak<dyn std::any::Any + Send + Sync> = Arc::downgrade(&pg.inner) as _;
+        let _ = pg.inner.conn.set_frontend_context(weak);
         pg
     }
 
