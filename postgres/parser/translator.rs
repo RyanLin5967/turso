@@ -775,7 +775,7 @@ impl PostgreSQLTranslator {
 
         let name = col_def.colname.clone();
         let pg_type = extract_type_name(col_def)?;
-        let typmods = extract_integer_typmods(col_def);
+        let typmods = extract_integer_typmods(col_def)?;
 
         // An identity column (GENERATED ALWAYS / BY DEFAULT AS IDENTITY) is numbered as a serial
         // one is, by its own sequence: the clause was dropped, so its rows had no id.
@@ -1278,7 +1278,7 @@ impl PostgreSQLTranslator {
         let col_name = pg_name(&col_def.colname);
 
         let pg_type = extract_type_name(col_def)?;
-        let typmods = extract_integer_typmods(col_def);
+        let typmods = extract_integer_typmods(col_def)?;
         let user_type = column_type_checked(&col_def.colname, &pg_type)?;
         let mapping = map_pg_type(&pg_type, &typmods).ok_or_else(|| {
             ParseError::ParseError(format!("unsupported PostgreSQL type: {pg_type}").into())
@@ -3623,7 +3623,7 @@ impl PostgreSQLTranslator {
                 // REAL, a float announced float8 and not rounded to the scale (wire-rev-uw3 MED-4;
                 // recorded, pg18/pg18-wirefuzz-a_cast_to_numeric_p_s_and_a_numeric_domain_column_are_numeric.out). A bare NUMERIC stays REAL (the
                 // bare-NUMERIC divergence, a known red).
-                if let Some((p, s)) = type_cast.type_name.as_ref().and_then(numeric_cast_size) {
+                if let Some((p, s)) = type_cast.type_name.as_ref().map(numeric_cast_typmods).transpose()?.flatten() {
                     // The REAL below holds every decimal of at most 15 significant digits exactly
                     // (DBL_DIG) and no wider one: past 15 it answered 9007199254740992 for
                     // 9007199254740993, so =, IN, GROUP BY and DISTINCT merged distinct values
@@ -6268,65 +6268,72 @@ fn extract_type_name(col_def: &pg_query::protobuf::ColumnDef) -> Result<String, 
     Ok(name)
 }
 
-/// Extract integer type modifiers from a column definition.
-/// For `varchar(50)` this returns `[50]`, for `numeric(10, 2)` returns `[10, 2]`.
-/// The precision and scale of a cast to NUMERIC(p, s) or NUMERIC(p) (DECIMAL alike, scale 0), as
-/// the column declaration's map_pg_type gives them; None for any other type or a bare NUMERIC.
-pub fn numeric_cast_size(type_name: &pg_query::protobuf::TypeName) -> Option<(i64, i64)> {
+/// A type name's modifiers, read in ONE place for every spelling (wire-rev-351702a43 HIGH-1): an
+/// integer constant, or a string constant holding an integer, as PostgreSQL's typenameTypeMod
+/// passes both to the type's typmodin (NUMERIC('20','0') is NUMERIC(20,0)). Any other modifier is
+/// refused, never dropped: a dropped one made NUMERIC('20','0') a bare NUMERIC.
+pub fn type_modifiers(type_name: &pg_query::protobuf::TypeName) -> Result<Vec<i64>, ParseError> {
     use pg_query::protobuf::a_const::Val;
     use pg_query::protobuf::node::Node;
-    if !type_name.array_bounds.is_empty() {
-        return None;
-    }
-    let name = type_name.names.last().and_then(|n| match &n.node {
-        Some(Node::String(s)) => Some(s.sval.to_ascii_lowercase()),
-        _ => None,
-    })?;
-    if name != "numeric" && name != "decimal" {
-        return None;
-    }
-    let mods: Vec<i64> = type_name
-        .typmods
-        .iter()
-        .filter_map(|node| match &node.node {
-            Some(Node::Integer(i)) => Some(i.ival as i64),
-            Some(Node::AConst(c)) => match &c.val {
-                Some(Val::Ival(i)) => Some(i.ival as i64),
-                _ => None,
-            },
-            _ => None,
-        })
-        .collect();
-    if mods.len() != type_name.typmods.len() {
-        return None;
-    }
-    let (p, s) = match mods.as_slice() {
-        [p, s] => (*p, *s),
-        [p] => (*p, 0),
-        _ => return None,
-    };
-    Some((p, s))
-}
-
-fn extract_integer_typmods(col_def: &pg_query::protobuf::ColumnDef) -> Vec<i64> {
-    use pg_query::protobuf::a_const::Val;
-    use pg_query::protobuf::node::Node;
-
-    let Some(type_name) = &col_def.type_name else {
-        return vec![];
-    };
     type_name
         .typmods
         .iter()
-        .filter_map(|node| match &node.node {
-            Some(Node::Integer(i)) => Some(i.ival as i64),
-            Some(Node::AConst(a_const)) => match &a_const.val {
-                Some(Val::Ival(i)) => Some(i.ival as i64),
+        .map(|node| {
+            let read = match &node.node {
+                Some(Node::Integer(i)) => Some(i64::from(i.ival)),
+                Some(Node::AConst(c)) => match &c.val {
+                    Some(Val::Ival(i)) => Some(i64::from(i.ival)),
+                    Some(Val::Sval(s)) => s.sval.trim().parse::<i64>().ok(),
+                    _ => None,
+                },
                 _ => None,
-            },
-            _ => None,
+            };
+            read.ok_or_else(|| {
+                ParseError::ParseError(SqlErrorMessage::classified(
+                    SqlErrorKind::FeatureNotSupported,
+                    "a type modifier that is not an integer constant is not supported",
+                ))
+            })
         })
         .collect()
+}
+
+/// The precision and scale of a cast to NUMERIC(p, s) or NUMERIC(p) (DECIMAL alike, scale 0), as
+/// the column declaration's map_pg_type gives them; Ok(None) for any other type or a bare
+/// NUMERIC; an error for a modifier [`type_modifiers`] cannot read.
+pub fn numeric_cast_typmods(type_name: &pg_query::protobuf::TypeName) -> Result<Option<(i64, i64)>, ParseError> {
+    use pg_query::protobuf::node::Node;
+    if !type_name.array_bounds.is_empty() {
+        return Ok(None);
+    }
+    let Some(name) = type_name.names.last().and_then(|n| match &n.node {
+        Some(Node::String(s)) => Some(s.sval.to_ascii_lowercase()),
+        _ => None,
+    }) else {
+        return Ok(None);
+    };
+    if name != "numeric" && name != "decimal" {
+        return Ok(None);
+    }
+    Ok(match type_modifiers(type_name)?.as_slice() {
+        [p, s] => Some((*p, *s)),
+        [p] => Some((*p, 0)),
+        _ => None,
+    })
+}
+
+/// [`numeric_cast_typmods`] for a reader that only types (the walk): an unreadable modifier is no
+/// size here, and the translator refuses the statement.
+pub fn numeric_cast_size(type_name: &pg_query::protobuf::TypeName) -> Option<(i64, i64)> {
+    numeric_cast_typmods(type_name).ok().flatten()
+}
+
+
+fn extract_integer_typmods(col_def: &pg_query::protobuf::ColumnDef) -> Result<Vec<i64>, ParseError> {
+    match &col_def.type_name {
+        Some(type_name) => type_modifiers(type_name),
+        None => Ok(vec![]),
+    }
 }
 
 fn extract_key_columns(keys: &[pg_query::protobuf::Node]) -> Result<Vec<String>, ParseError> {
