@@ -39,6 +39,7 @@ I/O-heavy batch; the T3 registration must rule on this). A process whose environ
 import json
 import os
 import re
+import signal
 import sys
 import time
 
@@ -441,7 +442,7 @@ def self_test():
         w0 = time.monotonic()
         while time.monotonic() - w0 < 30 and s.poll() is None and not (os.path.exists(out) and os.path.getsize(out) > 0):
             time.sleep(0.02)
-        procs = []
+        procs, stopped = [], []
         t0 = time.monotonic()
         pending = sorted(burners, key=lambda b: b[1])
         while time.monotonic() - t0 < secs:
@@ -481,7 +482,12 @@ def self_test():
                             f"sys.exit(subprocess.call([sys.executable, '-c', {code!r}], env={{'PATH': '/usr/bin:/bin'}}))\n")
                 procs.append(subprocess.Popen([sys.executable, "-c", code], env=env))
                 launched.setdefault(label, []).append((b, procs[-1].pid))
+                if len(b) > 4 and b[4] == "stopped":  # a burner the host "starves": SIGSTOPped for its whole burn
+                    os.kill(procs[-1].pid, signal.SIGSTOP)
+                    stopped.append(procs[-1].pid)
             time.sleep(0.05)
+        for pid_ in stopped:
+            os.kill(pid_, signal.SIGCONT)
         for p in procs:
             _pid, _st, ru = os.wait4(p.pid, 0)
             p.returncode = 0
@@ -603,6 +609,22 @@ def self_test():
 
     def rule1(v_):
         return any(x.startswith("foreign CPU > 100%") for x in v_["reasons"])
+    # the N/A count must equal the N/A lines that name a cause, on every run (core-integrator 2026-10-21, artie
+    # 3479c695e1: run_everywhere refused "TALLY na=12, but 6 N/A-on-<cause> line(s)" once in 3 runs). A calibration
+    # window starved by the host counts each of its checks N/A; it must print one cause line for each. Probed here on a
+    # window whose one burner is SIGSTOPped for its whole burn (starved by construction), its output captured
+    import contextlib
+    import io
+    buf_ = io.StringIO()
+    with contextlib.redirect_stdout(buf_):
+        sa_, sb_, sn_ = cal("cal-starved", [(True, 0, 3, 1.0, "stopped")],
+                            [("a planted verdict check", [0], lambda v_, p_: True)])
+    lines_ = [x for x in buf_.getvalue().splitlines() if x.startswith("N/A-on-")]
+    ok_ = sn_ == 2 and sa_ == 0 and sb_ == 0 and len(lines_) == sn_
+    bad += not ok_
+    n_pass += ok_
+    print(f"self-test {'PASS' if ok_ else 'FAIL'}: a starved calibration window counts each of its checks N/A and prints "
+          f"one cause line per N/A ({sn_} N/A, {len(lines_)} line(s), {sa_} pass, {sb_} fail)")
     for args in (
         ("cal-user", [(True, 0, 6, 1.0, "user"), (True, 0, 6, 0.68, "user"), (True, 0, 6, 0.3, "user")]),
         ("cal-sys-mt", [(True, 0, 6, 1.0, "sys"), (True, 0, 6, 1.0, "mt2")]),
