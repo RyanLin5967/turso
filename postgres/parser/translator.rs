@@ -22,6 +22,48 @@ fn column_default(expr: ast::Expr) -> ast::ColumnConstraint {
     }))
 }
 
+/// PostgreSQL's oidin (uint32in_subr): strtoul with base 0 (leading spaces, a sign, 0x hexadecimal,
+/// a leading 0 octal), trailing spaces allowed, and a value that is neither a uint32 nor a negative
+/// int32 refused; 22P02 for no digits or other text, 22003 past the range, each naming the input as
+/// written. A negative value is its two's complement ('-1' is 4294967295).
+fn oid_input(input: &str) -> Result<u32, (SqlErrorKind, String)> {
+    let space = |c: char| matches!(c, ' ' | '\t' | '\n' | '\u{b}' | '\u{c}' | '\r');
+    let bad = || (SqlErrorKind::InvalidTextRepresentation, format!("invalid input syntax for type oid: \"{input}\""));
+    let range = || (SqlErrorKind::NumericValueOutOfRange, format!("value \"{input}\" is out of range for type oid"));
+    let s = input.trim_start_matches(space);
+    let (negative, s) = match s.as_bytes().first() {
+        Some(b'-') => (true, &s[1..]),
+        Some(b'+') => (false, &s[1..]),
+        _ => (false, s),
+    };
+    let hex = (s.starts_with("0x") || s.starts_with("0X")) && s[2..].starts_with(|c: char| c.is_ascii_hexdigit());
+    let (radix, body) = if hex {
+        (16, &s[2..])
+    } else if s.starts_with('0') {
+        (8, s)
+    } else {
+        (10, s)
+    };
+    let digits = body.chars().take_while(|c| c.is_digit(radix)).count();
+    if digits == 0 {
+        return Err(bad());
+    }
+    let mut value: u64 = 0;
+    for c in body[..digits].chars() {
+        let d = u64::from(c.to_digit(radix).unwrap_or(0));
+        value = value.checked_mul(u64::from(radix)).and_then(|v| v.checked_add(d)).ok_or_else(range)?;
+    }
+    if !body[digits..].trim_start_matches(space).is_empty() {
+        return Err(bad());
+    }
+    let value = if negative { value.wrapping_neg() } else { value };
+    let narrow = value as u32;
+    if value != u64::from(narrow) && value != (narrow as i32) as i64 as u64 {
+        return Err(range());
+    }
+    Ok(narrow)
+}
+
 /// THE constructor of an engine string literal from a value (review wire-quote MED-1, MED-2,
 /// LOW-5): the value quoted, each `'` doubled. An ast::Literal::String holds its SQL text with
 /// the quotes, and core stores that text (a CREATE TYPE's ENCODE, a column DEFAULT) and parses it
@@ -3542,12 +3584,18 @@ impl PostgreSQLTranslator {
                 // An explicit cast to varchar(n) cuts its value to n characters, as PostgreSQL's
                 // explicit-cast length coercion does: the cast without its length, then the cut
                 // (wire-rev-351702a43 MED-5: $1::varchar(10) stored the whole text).
+                // So does one to char(n), which then pads it with spaces to n, as bpchar's length
+                // coercion does (wire-rev-1de981755-rest MED-6: 'abcdef'::char(3) answered 'abcdef').
                 if let Some(t) = type_cast.type_name.as_ref().filter(|t| t.array_bounds.is_empty() && !t.typmods.is_empty()) {
-                    let varchar = t.names.last().is_some_and(|n| {
-                        matches!(&n.node, Some(pg_query::protobuf::node::Node::String(s))
-                            if matches!(s.sval.to_ascii_lowercase().as_str(), "varchar" | "character varying"))
-                    });
-                    if varchar {
+                    let named = |names: &[&str]| {
+                        t.names.last().is_some_and(|n| {
+                            matches!(&n.node, Some(pg_query::protobuf::node::Node::String(s))
+                                if names.contains(&s.sval.to_ascii_lowercase().as_str()))
+                        })
+                    };
+                    let varchar = named(&["varchar", "character varying"]);
+                    let bpchar = named(&["bpchar", "char", "character"]);
+                    if varchar || bpchar {
                         let n = match type_modifiers(t)?.as_slice() {
                             [n] => *n,
                             _ => {
@@ -3565,6 +3613,17 @@ impl PostgreSQLTranslator {
                             node: Some(pg_query::protobuf::node::Node::TypeCast(Box::new(bare))),
                         })?;
                         let lit = |v: i64| Box::new(ast::Expr::Literal(ast::Literal::Numeric(v.to_string())));
+                        // char(n): the value padded with n spaces, then cut to n.
+                        let inner = if bpchar {
+                            let spaces = " ".repeat(usize::try_from(n).unwrap_or(0));
+                            ast::Expr::Binary(
+                                Box::new(inner),
+                                ast::Operator::Concat,
+                                Box::new(ast::Expr::Literal(sql_string(&spaces))),
+                            )
+                        } else {
+                            inner
+                        };
                         return Ok(ast::Expr::FunctionCall {
                             name: pg_name("substr"),
                             distinctness: None,
@@ -3597,6 +3656,40 @@ impl PostgreSQLTranslator {
                         return Err(ParseError::ParseError(
                             SqlErrorMessage::classified(SqlErrorKind::FeatureNotSupported, "a cast to an array of this type is not supported"),
                         ));
+                    }
+                    // An array of varchar(n) or char(n) cuts each element: ARRAY[..] is cast element
+                    // by element (each by the scalar cut above); any other operand, whose elements
+                    // the translator cannot reach, is refused (wire-rev-1de981755-rest MED-6:
+                    // ARRAY['abcdef']::varchar(2)[] answered {abcdef}).
+                    let sized = !t.typmods.is_empty()
+                        && t.names.last().is_some_and(|n| {
+                            matches!(&n.node, Some(pg_query::protobuf::node::Node::String(s))
+                                if matches!(s.sval.to_ascii_lowercase().as_str(), "varchar" | "character varying" | "bpchar" | "char" | "character"))
+                        });
+                    if sized {
+                        let Some(pg_query::protobuf::node::Node::AArrayExpr(array)) = arg.node.as_ref() else {
+                            return Err(ParseError::ParseError(SqlErrorMessage::classified(
+                                SqlErrorKind::FeatureNotSupported,
+                                "a cast to an array of a length-limited type is supported only over ARRAY[...]",
+                            )));
+                        };
+                        let mut cut = array.clone();
+                        for element in &mut cut.elements {
+                            let mut each = t.clone();
+                            if !matches!(element.node, Some(pg_query::protobuf::node::Node::AArrayExpr(_))) {
+                                each.array_bounds.clear();
+                            }
+                            *element = pg_query::protobuf::Node {
+                                node: Some(pg_query::protobuf::node::Node::TypeCast(Box::new(pg_query::protobuf::TypeCast {
+                                    arg: Some(Box::new(element.clone())),
+                                    type_name: Some(each),
+                                    location: -1,
+                                }))),
+                            };
+                        }
+                        return self.translate_expr(&pg_query::protobuf::Node {
+                            node: Some(pg_query::protobuf::node::Node::AArrayExpr(cut)),
+                        });
                     }
                     return match arg.node.as_ref() {
                         Some(pg_query::protobuf::node::Node::AConst(c))
@@ -3825,18 +3918,13 @@ impl PostgreSQLTranslator {
                                 )));
                             }
                             Some(Val::Fval(f)) => f.fval.parse::<i64>().ok().or(Some(i64::MAX)),
+                            // A string literal is read as oidin reads it (wire-rev-1de981755-rest MED-9:
+                            // '00012' answered 12, PG 10; '1.5' went to the engine's CAST, 1).
                             Some(Val::Sval(sv)) => {
-                                let t = sv.sval.trim();
-                                match t.parse::<i64>() {
-                                    Ok(v) if range.contains(&v) => return Ok(unsigned(v)),
-                                    Ok(_) => {
-                                        return Err(ParseError::ParseError(SqlErrorMessage::classified(
-                                            SqlErrorKind::NumericValueOutOfRange,
-                                            format!("value \"{t}\" is out of range for type oid"),
-                                        )));
-                                    }
-                                    Err(_) => None,
-                                }
+                                return match oid_input(&sv.sval) {
+                                    Ok(v) => Ok(ast::Expr::Literal(ast::Literal::Numeric(v.to_string()))),
+                                    Err((kind, message)) => Err(ParseError::ParseError(SqlErrorMessage::classified(kind, message))),
+                                };
                             }
                             _ => None,
                         },
