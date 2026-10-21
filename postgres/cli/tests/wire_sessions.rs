@@ -16095,32 +16095,87 @@ fn a_bound_exponent_or_infinity_overflows_numeric_at_bind() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// wire-rev-cfdebc06d MED-4 (pre-existing): a decimal literal is the engine's REAL, so one of more than 15 significant
-/// digits was rounded before the column's ENCODE saw it: `INSERT INTO nm VALUES (1, 12345678901234567.89, ...)` stored
-/// 12345678901234568.00 in a numeric(20,2) column, and two distinct literals became one row value (a silent change on
-/// write). PG 18.6 stores every digit, in a numeric column and as text in a text column, and a float8 column keeps the
-/// nearest double as before. Recorded on iccad2,
-/// cli/tests/pg18/pg18-wirefuzz-a_long_decimal_literal_is_stored_with_every_digit.out (replayed).
+/// wire-rev-7128c6f73 HIGH-1, the lead's ruling (DECISIONS d2bf57effb; the review's PG 18.6 probe4 #3-#28, #47, probe5): a
+/// decimal of more than 15 significant digits reaches the engine as a REAL, which rounds it, so it is REFUSED 0A000 on
+/// every write path and in every comparison, never rounded and never stored as text. ef2141683 stored an INSERT VALUES
+/// literal as its text, so one literal was two values: comparisons missed the exact row, UPDATE hit the other one and
+/// UNIQUE admitted a duplicate. A decimal of at most 15 significant digits, an integer literal that fits int8, and a
+/// literal under an explicit float cast are answered as before (a float8 reads them as PG does).
 #[test]
-fn a_long_decimal_literal_is_stored_with_every_digit() {
-    let dir = Scratch::new("long-decimal-literal");
+fn a_decimal_past_15_digits_is_refused_on_every_path() {
+    let dir = Scratch::new("long-decimal-refused");
     let server = Server::start(&dir.db(), &[]);
     let mut a = server.connect();
     for sql in [
-        "CREATE TABLE nm(id int, n numeric(20,2), w numeric(38,10), f float8, t text)",
-        "INSERT INTO nm VALUES (1, 12345678901234567.89, 1234567890123456789012345678.0123456789, 0.30000000000000004, 12345678901234567.89)",
-        "INSERT INTO nm VALUES (2, 12345678901234567.88, -1234567890123456789012345678.0123456789, 1.7976931348623157, -0.12345678901234567)",
-        "UPDATE nm SET n = 12345678901234567.87, t = 0.12345678901234567 WHERE id = 2",
+        "CREATE TABLE nm(id int PRIMARY KEY, n numeric(30,2), t text, b bigint, f float8)",
+        "INSERT INTO nm VALUES (1, 1.5, 'x', 1, 0.5)",
     ] {
         a.q(sql).ok(sql);
     }
-    let r = a.q("SELECT id, n, w, f, t FROM nm ORDER BY id");
-    let row = |v: [&str; 5]| v.iter().map(|x| Some(x.to_string())).collect::<Vec<_>>();
-    let want = vec![
-        row(["1", "12345678901234567.89", "1234567890123456789012345678.0123456789", "0.30000000000000004", "12345678901234567.89"]),
-        row(["2", "12345678901234567.87", "-1234567890123456789012345678.0123456789", "1.7976931348623157", "0.12345678901234567"]),
-    ];
-    assert_eq!((r.rows, r.error), (want, None), "PostgreSQL stores every digit of a decimal literal");
+    let mut wrong = Vec::new();
+    for sql in [
+        "INSERT INTO nm VALUES (2, 12345678901234567.89, 'x', 1, 0.5)",
+        "INSERT INTO nm (id, n) SELECT 3, 12345678901234567.89",
+        "UPDATE nm SET n = 12345678901234567.88 WHERE id = 1",
+        "UPDATE nm SET (n, t) = (12345678901234567.88, 'y') WHERE id = 1",
+        "INSERT INTO nm (id, n) VALUES (1, 2) ON CONFLICT (id) DO UPDATE SET n = 12345678901234567.87",
+        "INSERT INTO nm (id, t) VALUES (4, 12345678901234567.89)",
+        "INSERT INTO nm (id, b) VALUES (5, 12345678901234567.00)",
+        "INSERT INTO nm (id, n) VALUES (6, 1234567890123456789012345678)",
+        "INSERT INTO nm (id, n) VALUES (7, 1.234567890123456789e10)",
+        "INSERT INTO nm (id, n) VALUES (8, 12_345_678_901_234_567.89)",
+        "SELECT id FROM nm WHERE n = 12345678901234567.89",
+        "SELECT n - 12345678901234567.00 FROM nm",
+        "SELECT 12345678901234567.89",
+        "CREATE TABLE nd(n numeric(30,2) DEFAULT 12345678901234567.89)",
+    ] {
+        let r = a.q(sql);
+        if r.error.as_ref().map(|e| e.code.as_str()) != Some("0A000") {
+            wrong.push(format!("{sql}: tags {:?} rows {:?} error {:?}, refused 0A000", r.tags, r.rows, r.error));
+        }
+    }
+    // Bound: as text, undeclared and declared numeric.
+    for declared in [false, true] {
+        let mut parse = vec![0u8];
+        parse.extend_from_slice(b"INSERT INTO nm (id, n) VALUES (9, $1)\0");
+        if declared {
+            parse.extend_from_slice(&1i16.to_be_bytes());
+            parse.extend_from_slice(&1700i32.to_be_bytes());
+        } else {
+            parse.extend_from_slice(&0i16.to_be_bytes());
+        }
+        a.send(b'P', &parse);
+        let value = b"12345678901234567.89";
+        let mut bind = vec![0u8, 0u8];
+        bind.extend_from_slice(&0i16.to_be_bytes());
+        bind.extend_from_slice(&1i16.to_be_bytes());
+        bind.extend_from_slice(&(value.len() as i32).to_be_bytes());
+        bind.extend_from_slice(value);
+        bind.extend_from_slice(&0i16.to_be_bytes());
+        a.send(b'B', &bind);
+        a.send(b'E', &[0, 0, 0, 0, 0]);
+        a.send(b'S', &[]);
+        let r = a.read_reply();
+        if r.error.as_ref().map(|e| e.code.as_str()) != Some("0A000") {
+            wrong.push(format!("bound '12345678901234567.89' (declared {declared}): tags {:?} error {:?}, refused 0A000", r.tags, r.error));
+        }
+    }
+    let r = a.q("SELECT count(*) FROM nm");
+    if r.rows != vec![vec![Some("1".to_string())]] {
+        wrong.push(format!("nm holds {:?} rows after the refusals, want 1", r.rows));
+    }
+    for (sql, want) in [
+        ("SELECT 1234567890123.45", "1234567890123.45"),
+        ("SELECT 9007199254740993", "9007199254740993"),
+        ("SELECT 0.30000000000000004::float8", "0.30000000000000004"),
+        ("SELECT 1e20 > 1", "t"),
+    ] {
+        let r = a.q(sql);
+        if r.error.is_some() || r.rows != vec![vec![Some(want.to_string())]] {
+            wrong.push(format!("{sql}: rows {:?} error {:?}, want {want}", r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
 /// wire-rev-cfdebc06d MED-3 (its PG 18.6 probe #109-#136): the engine's ALTER COLUMN keeps every stored value as it
