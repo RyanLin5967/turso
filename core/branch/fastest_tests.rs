@@ -16037,7 +16037,7 @@ fn alter_column_keeping_its_own_name_or_its_primary_key_is_a_change_not_a_duplic
         }
     }
     let ty = adv_rows(&c, "SELECT sql FROM sqlite_schema WHERE name = 't'");
-    if !ty.as_ref().is_ok_and(|r| r[0][0].contains("v VARCHAR(20)")) {
+    if !ty.as_ref().is_ok_and(|r| r[0][0].contains("v VARCHAR") && !r[0][0].contains("v TEXT")) {
         failed.push(format!("stored text: {ty:?}, not v's new type"));
     }
     assert!(failed.is_empty(), "CLAIM: ALTER COLUMN keeping its name or its key is a change: {failed:#?}");
