@@ -578,6 +578,21 @@ pub fn translate_expr(
                             }
                         }
 
+                        // A chain with no ENCODE (a domain over a primitive: text, integer) casts
+                        // as its primitive base does, as a BASE-only type's CAST does below
+                        // (core-integrator, artie 26f59de787: CAST(10 AS du), du a domain over
+                        // text, stayed the integer 10 and ordered as a number). Mutant
+                        // `cast_affinity_by_type_name` (test builds only): the value as given,
+                        // as before.
+                        if resolved.chain.iter().all(|td| td.encode().is_none())
+                            && !crate::branch::store::fe_mutant("cast_affinity_by_type_name")
+                        {
+                            program.emit_insn(Insn::Cast {
+                                reg: target_register,
+                                affinity: Affinity::affinity(&resolved.primitive),
+                            });
+                        }
+
                         // Validate domain constraints on the encoded value
                         emit_domain_cast_constraints(
                             program,
