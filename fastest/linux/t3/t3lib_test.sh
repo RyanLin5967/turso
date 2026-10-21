@@ -401,8 +401,9 @@ D=$(dirname "$0")/sc
 echo "$*" >> "$D/calls.txt"
 case $1 in
   list-timers) [ -f "$D/timers.broken" ] && exit 1; cat "$D/timers.txt" ;;
-  is-active) if [ -e "$D/active/$2" ]; then echo active; else echo inactive; exit 3; fi ;;
-  stop) [ -e "$D/sticky/$2" ] || rm -f "$D/active/$2" ;;
+  is-active) if [ -e "$D/active/$2" ]; then echo active; elif [ -e "$D/activating/$2" ]; then echo activating; exit 3
+             else echo inactive; exit 3; fi ;;
+  stop) [ -e "$D/sticky/$2" ] || rm -f "$D/active/$2" "$D/activating/$2" ;;
   start) touch "$D/active/$2" ;;
   *) exit 2 ;;
 esac
@@ -414,9 +415,10 @@ f=$(dirname "$0")/clock.n; n=$(cat "$f" 2>/dev/null || echo 0); echo $((n + 1)) 
 sed -n "$((n + 1))p" "$(dirname "$0")/clock.txt"
 CD
 chmod +x "$T/clockdelta"
-quiet_setup() { # quiet_setup "ACTIVE UNITS" "STICKY UNITS" "CLOCK VALUES"
-  rm -rf "$T/sc/active" "$T/sc/sticky" "$T/sc/calls.txt" "$T/sc/timers.broken" "$T/clock.n" "$T/quiet.tsv"
-  mkdir -p "$T/sc/active" "$T/sc/sticky"
+quiet_setup() { # quiet_setup "ACTIVE UNITS" "STICKY UNITS" "CLOCK VALUES" ["ACTIVATING UNITS"]
+  rm -rf "$T/sc/active" "$T/sc/sticky" "$T/sc/activating" "$T/sc/calls.txt" "$T/sc/timers.broken" "$T/clock.n" "$T/quiet.tsv"
+  mkdir -p "$T/sc/active" "$T/sc/sticky" "$T/sc/activating"
+  local a; for a in ${4:-}; do touch "$T/sc/activating/$a"; done
   local u; for u in $1; do touch "$T/sc/active/$u"; done; for u in $2; do touch "$T/sc/sticky/$u"; done
   printf '%s\n' $3 > "$T/clock.txt"
   printf '%s\n' \
@@ -436,6 +438,12 @@ check "host_quiet stops each active timer, its running service and each active c
 check "host_unquiet restarts exactly the timers and clock adjusters it stopped (a timer starts its service itself)" \
   "env $QENV \"$BASH\" -c 'source \"\$0\"; host_unquiet \"\$1\"' \"$HERE/t3lib.sh\" \"$T/quiet.tsv\" &&
    [ \"\$(ls \"$T/sc/active\" | LC_ALL=C sort | tr '\n' ' ')\" = 'apt-daily-upgrade.timer apt-daily.timer lima-guestagent systemd-timesyncd ' ]"
+# t3cov-1b MED 1: every service a timer starts is Type=oneshot, and a running oneshot answers "activating", not "active":
+# it must be stopped and recorded too (any state but inactive or failed is running)
+quiet_setup "apt-daily.timer" "" "0.5 0.5" "apt-daily.service"
+check "t3cov-1b MED 1: a timer's service that answers 'activating' (a running oneshot) is stopped and recorded" \
+  "env $QENV \"$BASH\" -c 'source \"\$0\"; host_quiet \"\$1\"' \"$HERE/t3lib.sh\" \"$T/quiet.tsv\" &&
+   [ -z \"\$(ls \"$T/sc/activating\")\" ] && grep -qx \"service${TAB}apt-daily.service\" \"$T/quiet.tsv\""
 quiet_setup "apt-daily.timer" "apt-daily.timer" "0.5 0.5"
 check "a timer still active after its stop refuses, naming it" \
   "! env $QENV \"$BASH\" -c 'source \"\$0\"; host_quiet \"\$1\"' \"$HERE/t3lib.sh\" \"$T/quiet.tsv\" && grep -q 'apt-daily.timer' \"$T/out.txt\""
