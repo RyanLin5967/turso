@@ -862,6 +862,11 @@ def self_test():
         ("uw4 E4: a process of ours that exited before the stop keeps its uid and login, its run unknown (?)",
          len(burn_owner) == 1 and burn_owner[0][2] == str(me_uid) and burn_owner[0][4] == "?"),
     ]
+    # WHAT THE LIVE EVIDENCE COVERS (linux-rev-fc20226b9 MED 1): the namespace run (linux-r957live: unshare -Urpf
+    # --mount-proc on iccad11) covers the live PASS path and the late branch's CONTROL FLOW only. Inside it the sampler saw
+    # no kernel thread, no other uid and no unreadable environ, own_run was "-", and its late N/A came through the cwd
+    # key (a mkdir'd dir under ~/runs, not a uwrun run). The another-uid late path, the only one a T3 box can take, has
+    # run on planted records only: no process of another uid can be made to burn CPU without privilege.
     # UNEXPLAINED (the lead's ruling, 2026-10-21): the eceubuntu4 FAIL that started the late-load rule (linux-f6gate and
     # linux-f6cal: a VALID baseline at load1 0.14, then BOTH cases that start SUT processes VOIDed; no VOID reasons were
     # printed, as that predates 8c400fdf3) has no verified cause. 25 reruns there all had a busy baseline, and Ubuntu
