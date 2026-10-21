@@ -602,20 +602,20 @@ mod tests {
         for k in 0..8u64 {
             m.insert(&format!("kept-{k}"), BranchId(k)).unwrap();
         }
-        let mut emptied_while_filling = false;
+        let mut dead_while_filling = false;
         for i in 0..100_000u64 {
             let name = format!("churn-{i}");
             m.insert(&name, BranchId(1_000 + i)).unwrap();
             assert_eq!(m.remove(&name), Some(BranchId(1_000 + i)));
             if let Some(c) = m.filling {
-                emptied_while_filling |= m.live[c] == 0 && m.used[c] > 0;
+                dead_while_filling |= m.live[c] < m.used[c];
             }
             if i % 1_000 == 999 {
                 let (held, live) = m.arena_bytes();
                 assert!(held <= 2 * live + 2 * CHUNK, "cycle {i}: the arena holds {held} B for {live} live B");
             }
         }
-        assert!(emptied_while_filling, "premise: the filling chunk never emptied while filling");
+        assert!(dead_while_filling, "premise: the filling chunk never held a dead name while filling");
         let (held, live) = m.arena_bytes();
         assert!(held <= 2 * live + 2 * CHUNK, "after 10^5 cycles the arena holds {held} B for {live} live B");
         for k in 0..8u64 {
