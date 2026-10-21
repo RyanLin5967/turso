@@ -16685,6 +16685,123 @@ fn a_case_column_is_typed_by_its_results() {
     assert_eq!((r.oids, r.error), (Some(vec![23]), None), "PostgreSQL types the CASE int4");
 }
 
+/// wire-rev-1de981755-rest HIGH-1 (its PG 18.6 probe #137-#151 and probe2 #64-#70; COALESCE, GREATEST, LEAST and the
+/// string, boolean and datetime forms recorded on iccad2 PG 18.6, pg18-wirefuzz-conditional_expressions_take_
+/// postgresqls_common_type.out): CASE, COALESCE, GREATEST and LEAST take select_common_type's type (the default result
+/// first for a CASE; the category's preferred type, or the type the others implicitly coerce to; 42804 across
+/// categories; an untyped literal read as that type). 6a1cdf086 took the first typed result's type, so a wider later
+/// result was refused 22003 and a float or text value went out under int4. A form the engine cannot answer as PG (an
+/// untyped literal or a date read as another type) may be refused 0A000 instead, never answered differently.
+#[test]
+fn conditional_expressions_take_postgresqls_common_type() {
+    let dir = Scratch::new("common-type");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE ct(c bool, i int, b bigint, f float8, s smallint, r real, v varchar(5), t text, d date, ts timestamp)")
+        .ok("create");
+    a.q("INSERT INTO ct VALUES (true, 1, 5000000000, 1.5, 1, 0.5, 'ab', 'tx', '2026-01-02', '2026-01-03 04:05:06'), \
+         (false, 2, 6000000000, 2.5, 2, 1.25, 'cd', 'ty', '2026-02-03', '2026-02-04 05:06:07')")
+        .ok("insert");
+    type Want = Result<(u32, Vec<Option<&'static str>>), (&'static str, &'static str)>;
+    let s = |v: &[&'static str]| v.iter().map(|x| Some(*x)).collect::<Vec<_>>();
+    // (select list, PG 18.6's answer, whether a 0A000 refusal stands in for it)
+    let cases: Vec<(&str, Want, bool)> = vec![
+        ("CASE WHEN c THEN 1 ELSE b END", Ok((20, s(&["1", "6000000000"]))), false),
+        ("CASE WHEN c THEN i ELSE b END", Ok((20, s(&["1", "6000000000"]))), false),
+        ("CASE WHEN c THEN i ELSE f END", Ok((701, s(&["1", "2.5"]))), false),
+        ("CASE WHEN c THEN s ELSE 100000 END", Ok((23, s(&["1", "100000"]))), false),
+        ("CASE WHEN c THEN 1::int2 ELSE 100000 END", Ok((23, s(&["1", "100000"]))), false),
+        ("CASE WHEN c THEN 1 ELSE 'x' END", Err(("22P02", "invalid input syntax for type integer: \"x\"")), false),
+        ("CASE WHEN c THEN 'x' ELSE 1 END", Err(("22P02", "invalid input syntax for type integer: \"x\"")), false),
+        ("CASE WHEN c THEN i ELSE NULL END", Ok((23, vec![Some("1"), None])), false),
+        ("CASE WHEN c THEN i * 2 ELSE b * 2 END", Ok((20, s(&["2", "12000000000"]))), false),
+        ("CASE WHEN c THEN 1 ELSE 3000000000 END", Ok((20, s(&["1", "3000000000"]))), false),
+        ("CASE WHEN c THEN s ELSE i END", Ok((23, s(&["1", "2"]))), false),
+        ("CASE WHEN c THEN i ELSE 'x' || 'y' END", Err(("42804", "CASE types text and integer cannot be matched")), false),
+        ("CASE WHEN c THEN i ELSE f * 1 END", Ok((701, s(&["1", "2.5"]))), false),
+        ("CASE WHEN c THEN length('x') ELSE b END", Ok((20, s(&["1", "6000000000"]))), false),
+        ("CASE WHEN c THEN i ELSE i / 2 END", Ok((23, s(&["1", "1"]))), false),
+        ("CASE i WHEN 1 THEN 1 ELSE b END", Ok((20, s(&["1", "6000000000"]))), false),
+        ("CASE WHEN c THEN NULL ELSE f END", Ok((701, vec![None, Some("2.5")])), false),
+        ("CASE WHEN c THEN s ELSE b END", Ok((20, s(&["1", "6000000000"]))), false),
+        ("coalesce(i, b)", Ok((20, s(&["1", "2"]))), false),
+        ("coalesce(NULL, b, i)", Ok((20, s(&["5000000000", "6000000000"]))), false),
+        ("coalesce(s, 100000)", Ok((23, s(&["1", "2"]))), false),
+        ("coalesce(i, f)", Ok((701, s(&["1", "2"]))), false),
+        ("coalesce(i, 'x')", Err(("22P02", "invalid input syntax for type integer: \"x\"")), false),
+        ("coalesce(i, '7')", Ok((23, s(&["1", "2"]))), true),
+        ("coalesce(i, t)", Err(("42804", "COALESCE types integer and text cannot be matched")), false),
+        ("coalesce(s, r)", Ok((700, s(&["1", "2"]))), false),
+        ("greatest(i, b)", Ok((20, s(&["5000000000", "6000000000"]))), false),
+        ("greatest(s, 100000)", Ok((23, s(&["100000", "100000"]))), false),
+        ("least(i, f)", Ok((701, s(&["1", "2"]))), false),
+        ("least(i, t)", Err(("42804", "LEAST types integer and text cannot be matched")), false),
+        ("greatest(i, 'x')", Err(("22P02", "invalid input syntax for type integer: \"x\"")), false),
+        ("CASE WHEN c THEN v ELSE t END", Ok((25, s(&["ab", "ty"]))), false),
+        ("CASE WHEN c THEN v ELSE 'zz' END", Ok((1043, s(&["ab", "zz"]))), false),
+        ("CASE WHEN c THEN 'a' ELSE 'b' END", Ok((25, s(&["a", "b"]))), false),
+        ("CASE WHEN c THEN NULL END", Ok((25, vec![None, None])), false),
+        ("CASE WHEN c THEN d ELSE ts END", Ok((1114, s(&["2026-01-02 00:00:00", "2026-02-04 05:06:07"]))), true),
+        ("CASE WHEN c THEN 1 ELSE true END", Err(("42804", "CASE types boolean and integer cannot be matched")), false),
+        ("CASE WHEN c THEN true ELSE 'yes' END", Ok((16, s(&["t", "t"]))), true),
+        ("CASE WHEN c THEN true ELSE 'maybe' END", Err(("22P02", "invalid input syntax for type boolean: \"maybe\"")), false),
+        ("CASE WHEN c THEN i ELSE '3000000000' END", Err(("22003", "value \"3000000000\" is out of range for type integer")), false),
+        ("CASE WHEN c THEN s ELSE r END", Ok((700, s(&["1", "1.25"]))), false),
+        ("CASE WHEN c THEN f ELSE 1 END", Ok((701, s(&["1.5", "1"]))), false),
+        ("CASE WHEN c THEN b WHEN NOT c THEN s ELSE i END", Ok((20, s(&["5000000000", "2"]))), false),
+    ];
+    let mut wrong = Vec::new();
+    for (list, want, refusable) in &cases {
+        let sql = format!("SELECT {list} AS x FROM ct ORDER BY i");
+        let r = a.q(&sql);
+        let got: Result<(u32, Vec<Option<String>>), (String, String)> = match (&r.error, &r.oids) {
+            (Some(e), _) => Err((e.code.clone(), e.message.clone())),
+            (None, Some(oids)) if oids.len() == 1 => {
+                Ok((oids[0], r.rows.iter().map(|row| row[0].clone()).collect()))
+            }
+            _ => Err(("no RowDescription".into(), format!("{r:?}"))),
+        };
+        let matches = match (want, &got) {
+            (Ok((oid, rows)), Ok((g_oid, g_rows))) => {
+                oid == g_oid && rows.iter().map(|x| x.map(str::to_string)).collect::<Vec<_>>() == *g_rows
+            }
+            (Err((code, message)), Err((g_code, g_message))) => code == g_code && message == g_message,
+            _ => false,
+        };
+        let refused = matches!(&got, Err((code, _)) if code == "0A000");
+        if !(matches || (*refusable && refused)) {
+            wrong.push((sql, format!("{want:?}"), got));
+        }
+    }
+    // Binary format (probe #150, #151): the same columns as int8 and float8.
+    let bytes = |b: &[u8]| Some(String::from_utf8_lossy(b).into_owned());
+    let r = a.x_binary("SELECT CASE WHEN c THEN i ELSE b END AS x FROM ct ORDER BY i");
+    if (r.oids.clone(), r.error.clone(), r.rows.clone())
+        != (Some(vec![20]), None, vec![vec![bytes(&1i64.to_be_bytes())], vec![bytes(&6000000000i64.to_be_bytes())]])
+    {
+        wrong.push(("binary int8 CASE".into(), "int8 1, 6000000000".into(), Err((format!("{:?}", r.error), format!("{:?} {:?}", r.oids, r.rows)))));
+    }
+    let r = a.x_binary("SELECT CASE WHEN c THEN i ELSE f END AS x FROM ct ORDER BY i");
+    if (r.oids.clone(), r.error.clone(), r.rows.clone())
+        != (Some(vec![701]), None, vec![vec![bytes(&1f64.to_be_bytes())], vec![bytes(&2.5f64.to_be_bytes())]])
+    {
+        wrong.push(("binary float8 CASE".into(), "float8 1, 2.5".into(), Err((format!("{:?}", r.error), format!("{:?} {:?}", r.oids, r.rows)))));
+    }
+    // Describe (probe2 #70; the recording's three Describes): the column, and a parameter typed by the others.
+    for (sql, params, oid) in [
+        ("SELECT CASE WHEN c THEN i ELSE f END AS x FROM ct", vec![], 701),
+        ("SELECT coalesce($1, b) AS x FROM ct", vec![20], 20),
+        ("SELECT CASE WHEN c THEN $1 ELSE b END AS x FROM ct", vec![20], 20),
+        ("SELECT CASE WHEN c THEN $1 ELSE i END AS x FROM ct", vec![23], 23),
+    ] {
+        let r = a.describe_statement(sql);
+        if (r.params.clone(), r.oids.clone(), r.error.clone()) != (Some(params.clone()), Some(vec![oid]), None) {
+            wrong.push((sql.to_string(), format!("params {params:?} column {oid}"), Err((format!("{:?}", r.error), format!("{:?} {:?}", r.params, r.oids)))));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-7128c6f73 L3 (its PG 18.6 probe4 #140-#142): an int2 or int8 result past its type is 22003 in PG ('smallint
 /// out of range', 'bigint out of range'); ours announced 21 or 20 and wrote '32768' or '9.223372036854776e+18' in text
 /// format (binary already refused it).
