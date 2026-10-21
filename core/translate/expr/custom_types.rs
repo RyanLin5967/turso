@@ -3646,4 +3646,27 @@ mod tests {
         ]);
         assert!(bad.is_empty(), "CLAIM: a derived CAST to numeric did not sum or order as numeric: {bad:#?}");
     }
+
+    /// Adopted verbatim from engine-rev-types-08caaec44 (artie 8319b0a45e,
+    /// frontier/fastest/reviews/REVIEW-engine-types-08caaec44.md and raw-engine-types-08caaec44/
+    /// zz_rev08c.rs.txt); its expected values are that review's PostgreSQL 18.6 recordings
+    /// (raw-engine-types-08caaec44/p*.pgout.txt), never ours.
+    /// HIGH 2: a numeric compared with an IN subquery or a scalar subquery of numeric compares as
+    /// numeric, as the EXISTS and the join over the same values do (controls).
+    #[test]
+    fn rev08c_numeric_in_and_scalar_subqueries_compare_as_numeric() {
+        let conn = open();
+        let bad = diverging_after(&conn, &[REV08C_N[0], REV08C_N[1],
+            "CREATE TABLE m(id INTEGER PRIMARY KEY, c numeric(8, 3)) STRICT",
+            "INSERT INTO m VALUES (1, 1.000), (2, 2.500), (3, 10.000), (4, -3.250)"], &[
+            ("SELECT count(*) FROM m WHERE EXISTS (SELECT 1 FROM n WHERE n.b = m.c)", "3"),
+            ("SELECT count(*) FROM m JOIN n ON n.b = m.c", "3"),
+            ("SELECT count(*) FROM m WHERE c IN (SELECT b FROM n)", "3"),
+            ("SELECT count(*) FROM n WHERE b IN (SELECT c FROM m)", "3"),
+            ("SELECT count(*) FROM n WHERE b = (SELECT max(c) FROM m)", "1"),
+            ("SELECT count(*) FROM n WHERE (SELECT max(b) FROM n) = 10", "6"),
+            ("SELECT count(*) FROM n WHERE b IN (SELECT 1.5 + 0.5)", "1"),
+        ]);
+        assert!(bad.is_empty(), "CLAIM: a numeric IN or scalar subquery did not compare as numeric: {bad:#?}");
+    }
 }
