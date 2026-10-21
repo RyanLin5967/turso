@@ -4742,7 +4742,7 @@ fn resident_relation_columns(
     match turso_pg_parser::schema_qualifier(schema) {
         SchemaQualifier::Main => columns_in("main"),
         SchemaQualifier::Unqualified => {
-            let path = pg_conn.session_state.lock().search_path.clone();
+            let path = effective_search_path(pg_conn);
             pg_conn
                 .conn
                 .resident_unqualified_table_columns(table, &path)
