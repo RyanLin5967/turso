@@ -1995,6 +1995,12 @@ struct CatState {
     /// `(batches at the deferral's start, log bytes then, B)`.
     links_batches: Arc<AtomicU64>,
     links_defer: Option<(u64, u64, u64)>,
+    /// The fill's HORIZON (amendments 32/33: under sustained creates the fill never completed, each cycle's
+    /// deferral ending on its log bound with one batch filled, while the catalog grew a cycle's creates): the
+    /// last children-index key when this process's first fill began, after its columns exist. Every row created
+    /// past it is this build's, written by a checkpoint once the link columns exist, so that checkpoint relinks
+    /// it and its neighbours (the non-flip relink); the fill need not visit it. `None` until the first fill reads it.
+    links_horizon: Option<Option<(u64, u64)>>,
     /// The fill was stopped (`BranchStore::stop_links_fill`, at close), read by the fill thread
     /// WITHOUT the store mutex before its column-only transaction (lead ruling LOW 4): a stopped fill
     /// makes no columns. A new token per spawn (l4-rev-h1 LOW-3), so an older fill keeps its own.
@@ -2316,6 +2322,7 @@ impl CatState {
             links_columns_made: Arc::new(AtomicBool::new(catalog.links())),
             links_batches: Arc::new(AtomicU64::new(0)),
             links_defer: None,
+            links_horizon: None,
             links_fill_stop: Arc::new(AtomicBool::new(false)),
             ckpt: CkptCounters::default(),
             catalog,
@@ -3940,9 +3947,35 @@ fn run_links_fill(
     // checkpoint of any build has committed since, so the rows it covers are as they were); else
     // the fill starts again from the first row. Mutant `l4_fill_cursor_forgotten` (test builds
     // only): always from the first row, as before.
-    let generation = match shared.lock().cat.as_ref() {
-        Some(c) if c.filling => c.generation,
+    let (generation, known) = match shared.lock().cat.as_ref() {
+        Some(c) if c.filling => (c.generation, c.links_horizon),
         _ => return,
+    };
+    // The horizon: read once per process, after the columns exist (above), off the store mutex. Mutants (test
+    // builds only): `l4_fill_horizon_ignored`, the fill visits every row, as before; `l4_fill_horizon_low`, it
+    // stops after its first batch (the oracle's plant).
+    let horizon = match known {
+        Some(h) => h,
+        None => {
+            let h = match writer.lock().last_child_key() {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::warn!("branch catalog link fill horizon not read: {e}");
+                    return;
+                }
+            };
+            if let Some(c) = shared.lock().cat.as_mut() {
+                c.links_horizon.get_or_insert(h);
+            }
+            h
+        }
+    };
+    let horizon = if fe_mutant("l4_fill_horizon_ignored") {
+        None
+    } else if fe_mutant("l4_fill_horizon_low") {
+        Some((0, 0))
+    } else {
+        horizon
     };
     let resumed = if fe_mutant("l4_fill_cursor_forgotten") { Ok(None) } else { writer.lock().fill_cursor() };
     match resumed {
@@ -4018,7 +4051,8 @@ fn run_links_fill(
                     if failed {
                         return Err(LimboError::InternalError("test hook: the link fill's batch failed".to_string()));
                     }
-                    let next = w.upgrade_links_batch(cursor, super::catalog::UPGRADE_BATCH)?;
+                    // Past the horizon the fill is done: every row there is relinked by the checkpoint that wrote it.
+                    let next = w.upgrade_links_batch(cursor, super::catalog::UPGRADE_BATCH)?.filter(|k| horizon.map_or(true, |h| *k < h));
                     w.put_fill_cursor(generation, next.or(cursor), next.is_none())?;
                     Ok(next)
                 })

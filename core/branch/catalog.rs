@@ -909,6 +909,16 @@ impl Catalog {
         Ok(())
     }
 
+    /// The largest key of the children index, `(parent, fork_epoch)`, or `None` with no rows: the fill's horizon.
+    /// Read once per process by the fill (off the store mutex), so its cost does not recur per batch.
+    pub(crate) fn last_child_key(&mut self) -> Result<Option<(u64, u64)>> {
+        let rows = self
+            .conn
+            .prepare("SELECT parent, fork_epoch FROM branch ORDER BY parent DESC, fork_epoch DESC LIMIT 1")?
+            .run_collect_rows()?;
+        rows.first().map(|r| Ok((get(r, 0)?, get(r, 1)?))).transpose()
+    }
+
     pub(crate) fn upgrade_links_batch(&mut self, after: Option<(u64, u64)>, n: usize) -> Result<Option<(u64, u64)>> {
         if !self.links {
             for sql in LINK_COLUMNS {
