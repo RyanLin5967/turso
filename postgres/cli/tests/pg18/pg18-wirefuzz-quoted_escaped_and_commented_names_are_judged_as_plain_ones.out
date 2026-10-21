@@ -1,0 +1,35 @@
+>> Q CREATE TABLE rb(id int, bo boolean)
+   C CREATE TABLE
+   Z I
+>> Q CREATE TABLE n(id int)
+   C CREATE TABLE
+   Z I
+>> Q SELECT "max"(bo) FROM rb
+   E S=ERROR C=42883 M=function max(boolean) does not exist
+   Z I
+>> Q SELECT U&"\006Dax"(bo) FROM rb
+   E S=ERROR C=42883 M=function max(boolean) does not exist
+   Z I
+>> Q SELECT pg_catalog.max(bo) FROM rb
+   E S=ERROR C=42883 M=function pg_catalog.max(boolean) does not exist
+   Z I
+>> Q SELECT (SELECT /* c */ MIN ( bo ) FROM rb)
+   E S=ERROR C=42883 M=function min(boolean) does not exist
+   Z I
+>> Q SELECT * FROM "otherdb"."public"."n"
+   E S=ERROR C=0A000 M=cross-database references are not implemented: "otherdb.public.n"
+   Z I
+>> Q SELECT * FROM otherdb . /* c */ public . n
+   E S=ERROR C=0A000 M=cross-database references are not implemented: "otherdb.public.n"
+   Z I
+>> Q SELECT * FROM U&"\006Ftherdb".public.n
+   E S=ERROR C=0A000 M=cross-database references are not implemented: "otherdb.public.n"
+   Z I
+>> Q DELETE FROM otherdb.public.n
+   E S=ERROR C=0A000 M=cross-database references are not implemented: "otherdb.public.n"
+   Z I
+>> Q SELECT count(*) FROM postgres.public.n
+   T oids=[20]
+   D ['0']
+   C SELECT 1
+   Z I

@@ -12366,6 +12366,13 @@ replays_postgresql!(
     "pg18-wirefuzz-every_write_path_refuses_a_value_too_long_for_varchar.out",
     []
 );
+// The text bounds of 5e6276322 (the lead's concern, 2026-10-19): a quoted, U&-escaped, schema-qualified or
+// commented spelling of min or max, and of a three-part name, is judged as its plain spelling: 42883 and 0A000 as PG.
+replays_postgresql!(
+    pg18_wirefuzz_quoted_escaped_and_commented_names_are_judged_as_plain_ones_replays_as_postgresql_answered,
+    "pg18-wirefuzz-quoted_escaped_and_commented_names_are_judged_as_plain_ones.out",
+    []
+);
 // wire-rev-cfdebc06d LOW-4, LOW-5: unknown + unknown is 42725, and integers cast to int2 or int8 type an operator over
 // them; text + integer in WHERE is 42883 as in PG (#9).
 replays_postgresql!(
