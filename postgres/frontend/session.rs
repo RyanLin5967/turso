@@ -1800,9 +1800,20 @@ fn prepare_statement_parsed(
 
     let options = {
         let state = pg_conn.session_state.lock();
-        let path = state.search_path.clone();
+        let mut path = state.search_path.clone();
+        // A path entry is looked up as written, as PostgreSQL looks a schema up: one that names no
+        // schema exactly (a quoted 'S1' beside a schema s1) is skipped here, never handed to the
+        // engine, whose resolver folds case (seen on integration base beb4d169f:
+        // the_positional_insert_lookup_takes_the_engines_order_and_spelling inserted into s1.v).
+        // A path all of whose entries were skipped stays a path (it names nothing), never None,
+        // which searches every schema.
+        let set = !path.is_empty();
+        if set {
+            let names = pg_conn.conn.attached_database_names();
+            path.retain(|e| e == "main" || names.iter().any(|n| n == e));
+        }
         PrepareOptions {
-            unqualified_database_search_path: if path.is_empty() { None } else { Some(path) },
+            unqualified_database_search_path: if set { Some(path) } else { None },
         }
     };
     if !performs {
