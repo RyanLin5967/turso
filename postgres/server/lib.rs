@@ -5790,26 +5790,18 @@ fn check_assignments(
             // The expression's value from the bound values, as PostgreSQL's custom plan folds it
             // (wire-rev-629f4b926 MED-3). An expression the frontend cannot prepare or evaluate is
             // left to the engine at Execute.
+            // Each parameter is bound as its type, as the statement's own Bind decodes it
+            // (wire-rev-1de981755-rest MED-1: bound as text, '1' <> 1 was true in the engine and a
+            // valid INSERT was refused 22001).
             AssignSource::Expr(sql) => {
                 let Ok((mut probe, _)) = conn.prepare_typed(sql) else { continue };
+                let Ok(values) = decode_portal_parameters(portal, types) else { continue };
                 let mut bound = true;
-                for i in 0..portal.parameters.len() {
+                for (i, value) in values.into_iter().enumerate() {
                     let index = NonZero::new(i + 1).expect("i + 1 >= 1");
-                    if probe.parameters().has_index(index) {
-                        let value = match portal.parameters.get(i) {
-                            Some(None) => Value::Null,
-                            _ => match sent(i) {
-                                Some(t) => Value::build_text(t.to_string()),
-                                None => {
-                                    bound = false;
-                                    break;
-                                }
-                            },
-                        };
-                        if probe.bind_at(index, value).is_err() {
-                            bound = false;
-                            break;
-                        }
+                    if probe.parameters().has_index(index) && probe.bind_at(index, value).is_err() {
+                        bound = false;
+                        break;
                     }
                 }
                 if !bound {
