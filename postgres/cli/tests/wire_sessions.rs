@@ -16445,6 +16445,32 @@ fn a_decimal_past_15_digits_is_refused_on_every_path() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-7128c6f73 L3 (its PG 18.6 probe4 #140-#142): an int2 or int8 result past its type is 22003 in PG ('smallint
+/// out of range', 'bigint out of range'); ours announced 21 or 20 and wrote '32768' or '9.223372036854776e+18' in text
+/// format (binary already refused it).
+#[test]
+fn an_integer_result_past_its_announced_type_is_22003() {
+    let dir = Scratch::new("int-result-range");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    for (sql, message) in [
+        ("SELECT 32767::int2 + 1::int2", "smallint out of range"),
+        ("SELECT 9223372036854775807::int8 + 1::int2", "bigint out of range"),
+        ("SELECT (-32768)::int2 / (-1)::int2", "smallint out of range"),
+    ] {
+        let r = a.q(sql);
+        if !r.error.as_ref().is_some_and(|e| e.code == "22003" && e.message == message) {
+            wrong.push(format!("{sql}: rows {:?} error {:?}, PostgreSQL 22003 {message}", r.rows, r.error));
+        }
+    }
+    let r = a.q("SELECT 7::int2 / 2::int2");
+    if r.error.is_some() || r.rows != vec![vec![Some("3".to_string())]] {
+        wrong.push(format!("7::int2 / 2::int2: rows {:?} error {:?}, PostgreSQL 3", r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-351702a43 LOW-3 (its PG 18.6 probe3 #168-#173): an oid is unsigned, so oidin reads a negative integer as its
 /// 32-bit two's complement ((-2147483648)::oid is 2147483648, '-1'::oid is 4294967295), a text past the range is 22003
 /// 'value "..." is out of range for type oid', and a decimal has no cast to oid (42846). Ours answered -2147483648 and -1,
