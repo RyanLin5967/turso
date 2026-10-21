@@ -28,7 +28,6 @@ pub enum SqlErrorKind {
     UndefinedFunction,
     AmbiguousFunction,
     AmbiguousParameter,
-    CannotCoerce,
     DuplicateAlias,
     StatementTooComplex,
     CannotCoerce,
