@@ -144,6 +144,60 @@ fn a_store_whose_sessions_are_shorter_than_its_fill_still_upgrades_and_cuts_its_
     assert!(last < peak, "the log was never cut: {last} B at the end, {peak} B at its peak");
 }
 
+// ---- h1gap-rev-c HIGH-3: a session that writes in a burst and goes idle ----
+
+#[test]
+fn ls_burst_idle_child() {
+    if !in_child() {
+        return;
+    }
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("b.db");
+    older_store(&path, 300);
+    super::journal::set_compact_threshold(4 << 10);
+    {
+        let db = open(&path);
+        db.branch_wait_name_filter();
+        let trunk = db.connect().unwrap();
+        while log_bytes(&path) < 6 << 10 {
+            let _ = trunk.fork_branch().unwrap().into_id();
+        }
+    }
+    println!("LS-BURST-WARM meta={} log={}", meta_version(&path), log_bytes(&path));
+    for s in 0..10u64 {
+        let prefilled = {
+            let db = open(&path);
+            db.branch_wait_name_filter();
+            let trunk = db.connect().unwrap();
+            let _ = trunk.fork_branch().unwrap().into_id();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            db.branches.links_fill_state_for_test().1
+        };
+        println!("LS-BURST s={s} prefilled={} meta={} log={}", u64::from(prefilled), meta_version(&path), log_bytes(&path));
+    }
+}
+
+/// h1gap-rev-c HIGH-3: sessions of ONE create past the threshold, then an idle before close (a process
+/// that writes in a burst and exits). The fill completes in the idle, and no operation comes after it.
+/// The store must still upgrade: in the session whose fill completed, the meta row is 21 once it closes.
+/// Premises: the warm session left a 19 store past the threshold; some session's fill completed
+/// (prefilled at its idle's end, read before close).
+#[test]
+fn a_store_whose_fill_completes_in_an_idle_session_upgrades_by_its_close() {
+    if in_child() {
+        return;
+    }
+    let text = child("ls_burst_idle_child", &[]);
+    let warm = readings(&text, "LS-BURST-WARM ");
+    assert_eq!(warm.first().map(|v| v[0]), Some(19), "premise: the warm session left a 19 store:\n{text}");
+    let r = readings(&text, "LS-BURST ");
+    assert_eq!(r.len(), 10, "premise: 10 sessions ran:\n{text}");
+    let done = r.iter().position(|v| v[1] == 1);
+    println!("LS burst-idle: first session whose fill completed {done:?}; metas {:?}", r.iter().map(|v| v[2]).collect::<Vec<_>>());
+    let done = done.unwrap_or_else(|| panic!("premise: no session's fill completed in its idle:\n{text}"));
+    assert!(r[done][2] >= 21, "the fill completed in session {done} and no operation came after it: the store did not upgrade by its close (meta {}, log {} B)", r[done][2], r[done][3]);
+}
+
 // ---- past the hard limit ----
 
 #[test]
