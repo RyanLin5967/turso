@@ -825,7 +825,12 @@ fn emit_add_column_check_validation(
     let (domain_checks, other_checks): (Vec<CheckConstraint>, Vec<CheckConstraint>) = new_checks
         .iter()
         .cloned()
-        .partition(|c| c.domain.is_some() && btree.is_strict && !crate::branch::store::fe_mutant("alter_domain_default_unchecked"));
+        .partition(|c| {
+            btree.is_strict
+                && !crate::branch::store::fe_mutant("alter_domain_default_unchecked")
+                // A table CHECK reads the value too (`emit_check_constraint_bytecode`).
+                && (c.domain.is_some() || !crate::branch::store::fe_mutant("table_check_reads_stored"))
+        });
     if !domain_checks.is_empty() {
         let mut only = ColumnMask::default();
         only.set(new_column_idx)?;

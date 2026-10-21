@@ -2202,55 +2202,77 @@ fn emit_check_constraint_bytecode(
         // operators refuse a blob). A table CHECK keeps reading the stored form. Mutant
         // `domain_takes_no_base_operator` (test builds only): the stored form, as before.
         let cache_len = resolver.expr_to_reg_cache.len();
-        if let (Some(_), Some(col_name), Some(joined_table)) = (
-            &check_constraint.domain,
-            &check_constraint.column,
-            referenced_tables.and_then(|tables| tables.joined_tables().first()),
-        ) {
+        // A CHECK reads its columns' values, as PostgreSQL's does: a column of a custom type whose
+        // chain DECODEs is read DECODEd for the check (its register holds the row's ENCODEd value).
+        // A domain's CHECK (engine review 2bdcd32c6 HIGH 8), and a table CHECK too (the lead's
+        // ruling on ac353f711: with a CAST yielding its type's value, `amount < CAST(50 AS cents)`
+        // compared the stored 4000 with 50). Mutant `table_check_reads_stored` (test builds only):
+        // a table CHECK reads the stored form, as before; mutant `domain_takes_no_base_operator`:
+        // a domain's too.
+        let columns_read: Vec<String> = match (&check_constraint.domain, &check_constraint.column) {
+            (Some(_), Some(col_name)) if !crate::branch::store::fe_mutant("domain_takes_no_base_operator") => {
+                vec![col_name.clone()]
+            }
+            (None, _) if !crate::branch::store::fe_mutant("table_check_reads_stored") => column_mappings
+                .iter()
+                .map(|(name, _)| name.to_string())
+                .filter(|name| crate::util::check_expr_references_column(&check_constraint.expr, &normalize_ident(name)))
+                .collect(),
+            _ => Vec::new(),
+        };
+        if let Some(joined_table) = referenced_tables.and_then(|tables| tables.joined_tables().first()) {
             let is_strict = joined_table.btree().is_some_and(|bt| bt.is_strict);
-            let column = joined_table
-                .columns()
-                .iter()
-                .enumerate()
-                .find(|(_, c)| c.name.as_ref().is_some_and(|n| n.eq_ignore_ascii_case(col_name)));
-            let register = column_mappings
-                .iter()
-                .find(|(name, _)| name.eq_ignore_ascii_case(col_name))
-                .map(|(_, reg)| *reg);
-            if let (Some((idx, col)), Some(register)) = (column, register) {
-                if !crate::branch::store::fe_mutant("domain_takes_no_base_operator") {
-                    let decoded = program.alloc_register();
-                    crate::translate::expr::emit_user_facing_column_value(
-                        program, register, decoded, col, is_strict, resolver,
-                    )?;
-                    let collation = Some((col.collation(), false));
-                    resolver.cache_expr_reg(
-                        Cow::Owned(ast::Expr::Column {
-                            database: None,
-                            table: joined_table.internal_id,
-                            column: idx,
-                            is_rowid_alias: col.is_rowid_alias(),
-                        }),
-                        decoded,
-                        false,
-                        collation,
-                    );
-                    resolver.cache_expr_reg(
-                        Cow::Owned(ast::Expr::Id(ast::Name::exact(col_name.to_string()))),
-                        decoded,
-                        false,
-                        collation,
-                    );
-                    resolver.cache_expr_reg(
-                        Cow::Owned(ast::Expr::Qualified(
-                            ast::Name::exact(table_name.to_string()),
-                            ast::Name::exact(col_name.to_string()),
-                        )),
-                        decoded,
-                        false,
-                        collation,
-                    );
+            for col_name in &columns_read {
+                let column = joined_table
+                    .columns()
+                    .iter()
+                    .enumerate()
+                    .find(|(_, c)| c.name.as_ref().is_some_and(|n| n.eq_ignore_ascii_case(col_name)));
+                let register = column_mappings
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case(col_name))
+                    .map(|(_, reg)| *reg);
+                let Some(((idx, col), register)) = column.zip(register) else {
+                    continue;
+                };
+                let decodes = resolver
+                    .schema()
+                    .resolve_type(&col.ty_str, is_strict)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|resolved| resolved.chain.iter().any(|td| td.decode().is_some()));
+                if !decodes {
+                    continue;
                 }
+                let decoded = program.alloc_register();
+                crate::translate::expr::emit_user_facing_column_value(program, register, decoded, col, is_strict, resolver)?;
+                let collation = Some((col.collation(), false));
+                resolver.cache_expr_reg(
+                    Cow::Owned(ast::Expr::Column {
+                        database: None,
+                        table: joined_table.internal_id,
+                        column: idx,
+                        is_rowid_alias: col.is_rowid_alias(),
+                    }),
+                    decoded,
+                    false,
+                    collation,
+                );
+                resolver.cache_expr_reg(
+                    Cow::Owned(ast::Expr::Id(ast::Name::exact(col_name.to_string()))),
+                    decoded,
+                    false,
+                    collation,
+                );
+                resolver.cache_expr_reg(
+                    Cow::Owned(ast::Expr::Qualified(
+                        ast::Name::exact(table_name.to_string()),
+                        ast::Name::exact(col_name.to_string()),
+                    )),
+                    decoded,
+                    false,
+                    collation,
+                );
             }
         }
         let emitted = emit_one_check_constraint(
