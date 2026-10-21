@@ -6026,14 +6026,20 @@ fn pg_binary_to_value(bytes: &[u8], pg_type: &Type, n: usize) -> PgWireResult<Va
         Ok(Value::from_i64(i64::from_be_bytes(
             bytes.try_into().map_err(|_| bad())?,
         )))
-    } else if *t == Type::FLOAT4 {
-        Ok(Value::from_f64(
-            f32::from_be_bytes(bytes.try_into().map_err(|_| bad())?).into(),
-        ))
-    } else if *t == Type::FLOAT8 {
-        Ok(Value::from_f64(f64::from_be_bytes(
-            bytes.try_into().map_err(|_| bad())?,
-        )))
+    } else if *t == Type::FLOAT4 || *t == Type::FLOAT8 {
+        let f = if *t == Type::FLOAT4 {
+            f64::from(f32::from_be_bytes(bytes.try_into().map_err(|_| bad())?))
+        } else {
+            f64::from_be_bytes(bytes.try_into().map_err(|_| bad())?)
+        };
+        // The engine holds no NaN (stored as NULL): refused, as the text form is (PGDIV-NAN).
+        if f.is_nan() {
+            return Err(PgWireError::UserError(error(
+                SqlErrorKind::FeatureNotSupported,
+                "NaN is not supported: the engine holds no NaN".to_string(),
+            )));
+        }
+        Ok(Value::from_f64(f))
     } else if *t == Type::BOOL {
         match bytes {
             [b] => Ok(Value::from_i64((*b != 0) as i64)),
@@ -6135,6 +6141,14 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
                 )));
             }
             let f: f64 = trimmed.parse().map_err(|_| syntax(name))?;
+            // The engine holds no NaN: a float NaN is stored as NULL, so a bound NaN is refused,
+            // as the literal is (PGDIV-NAN; wire-rev-7128c6f73 MED-3: 'NaN' read null).
+            if f.is_nan() {
+                return Err(PgWireError::UserError(error(
+                    SqlErrorKind::FeatureNotSupported,
+                    format!("NaN is not supported for type {name}: the engine holds no NaN"),
+                )));
+            }
             // A finite spelling past the type's range ('1e400'), which Rust reads as infinity.
             let infinite_spelled = trimmed
                 .trim_start_matches(['+', '-'])
