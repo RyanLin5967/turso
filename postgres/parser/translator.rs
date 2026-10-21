@@ -3496,6 +3496,27 @@ impl PostgreSQLTranslator {
             Some(pg_query::protobuf::node::Node::AConst(a_const)) => self.translate_const(a_const),
             Some(pg_query::protobuf::node::Node::AExpr(a_expr)) => self.translate_a_expr(a_expr),
             Some(pg_query::protobuf::node::Node::BoolExpr(bool_expr)) => {
+                // AND with a constant false argument is false, OR with a constant true one is
+                // true, as PostgreSQL's eval_const_expressions reduces them before anything runs:
+                // the engine hoists constant arguments and evaluates them first, so a later
+                // bad constant (encode('abc', 'nosuch') = '') was raised where PG answers
+                // (wire-rev-351702a43 MED-4). The fold probe still runs the constant parts before
+                // the deciding constant, as PG simplifies those.
+                use pg_query::protobuf::{a_const::Val, BoolExprType};
+                let deciding = match BoolExprType::try_from(bool_expr.boolop) {
+                    Ok(BoolExprType::AndExpr) => Some(false),
+                    Ok(BoolExprType::OrExpr) => Some(true),
+                    _ => None,
+                };
+                if let Some(v) = deciding {
+                    let decided = bool_expr.args.iter().any(|a| {
+                        matches!(a.node.as_ref(), Some(pg_query::protobuf::node::Node::AConst(c))
+                            if matches!(&c.val, Some(Val::Boolval(b)) if b.boolval == v))
+                    });
+                    if decided {
+                        return Ok(ast::Expr::Literal(ast::Literal::Numeric(if v { "1" } else { "0" }.to_string())));
+                    }
+                }
                 self.translate_bool_expr(bool_expr)
             }
             Some(pg_query::protobuf::node::Node::FuncCall(func_call)) => {

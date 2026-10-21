@@ -4667,8 +4667,10 @@ fn fold_probe(parse: &turso_pg_parser::pg_query::ParseResult) -> Option<String> 
             Node::TypeCast(c) => {
                 !not_immutable(&turso_pg_parser::pg_query::NodeRef::TypeCast(c.as_ref())) && c.arg.as_deref().is_some_and(pure)
             }
-            Node::BoolExpr(b) => all(&b.args),
-            Node::CoalesceExpr(c) => all(&c.args),
+            // A form whose arguments PostgreSQL simplifies only up to a constant that decides it
+            // (AND false, OR true, coalesce's first non-null constant, a CASE's constant WHEN) is
+            // never probed whole: [`collect`] descends it by those rules (wire-rev-351702a43 MED-4).
+            Node::BoolExpr(_) | Node::CoalesceExpr(_) | Node::CaseExpr(_) => false,
             Node::MinMaxExpr(m) => all(&m.args),
             Node::NullTest(t) => t.arg.as_deref().is_some_and(pure),
             _ => false,
@@ -4683,12 +4685,67 @@ fn fold_probe(parse: &turso_pg_parser::pg_query::ParseResult) -> Option<String> 
             out.push(node.clone());
             return;
         }
+        use turso_pg_parser::pg_query::protobuf::{a_const::Val, BoolExprType};
+        let constant = |node: &PgNode, b: bool| {
+            matches!(node.node.as_ref(), Some(Node::AConst(c)) if matches!(&c.val, Some(Val::Boolval(v)) if v.boolval == b))
+        };
+        let non_null_constant = |node: &PgNode| matches!(node.node.as_ref(), Some(Node::AConst(c)) if !c.isnull);
+        match n {
+            // eval_const_expressions simplifies AND's arguments in order and stops at a constant
+            // false (OR at a constant true), coalesce's at its first non-null constant, and a
+            // CASE's results unless their WHEN is a constant false, up to a constant true WHEN.
+            Node::BoolExpr(b) => {
+                let stop = match BoolExprType::try_from(b.boolop) {
+                    Ok(BoolExprType::AndExpr) => Some(false),
+                    Ok(BoolExprType::OrExpr) => Some(true),
+                    _ => None,
+                };
+                for arg in &b.args {
+                    collect(arg, out);
+                    if stop.is_some_and(|v| constant(arg, v)) {
+                        break;
+                    }
+                }
+                return;
+            }
+            Node::CoalesceExpr(c) => {
+                for arg in &c.args {
+                    collect(arg, out);
+                    if non_null_constant(arg) {
+                        break;
+                    }
+                }
+                return;
+            }
+            Node::CaseExpr(c) => {
+                if let Some(arg) = c.arg.as_deref() {
+                    collect(arg, out);
+                }
+                for w in &c.args {
+                    let Some(Node::CaseWhen(w)) = w.node.as_ref() else { continue };
+                    let Some(cond) = w.expr.as_deref() else { continue };
+                    if constant(cond, false) {
+                        continue;
+                    }
+                    collect(cond, out);
+                    if let Some(result) = w.result.as_deref() {
+                        collect(result, out);
+                    }
+                    if constant(cond, true) {
+                        return;
+                    }
+                }
+                if let Some(d) = c.defresult.as_deref() {
+                    collect(d, out);
+                }
+                return;
+            }
+            _ => {}
+        }
         let children: Vec<&PgNode> = match n {
             Node::FuncCall(f) => f.args.iter().collect(),
             Node::AExpr(e) => e.lexpr.iter().chain(e.rexpr.iter()).map(|b| b.as_ref()).collect(),
             Node::TypeCast(c) => c.arg.iter().map(|b| b.as_ref()).collect(),
-            Node::BoolExpr(b) => b.args.iter().collect(),
-            Node::CoalesceExpr(c) => c.args.iter().collect(),
             Node::MinMaxExpr(m) => m.args.iter().collect(),
             Node::NullTest(t) => t.arg.iter().map(|b| b.as_ref()).collect(),
             _ => Vec::new(),
