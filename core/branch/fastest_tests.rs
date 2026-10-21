@@ -16742,3 +16742,36 @@ fn a_cohort_gather_holds_for_its_flight_derived_bound() {
         "CLAIM: the gather held {held:?}, under half the bound a 100 ms flight sets (at least 10 ms)"
     );
 }
+
+/// fe-mutkill (survivor of the f4683e89d lib sweep): a fail-stopped store frees nothing in this
+/// process (review B-F1), the close of a connection on a branch released while it was open
+/// included. x is released while its connection is open, its Release durable (a D1 snapshot
+/// store); a compaction's arena sync then fails, which fail-stops the store and logs no record;
+/// then x's connection closes: none of x's slots is free.
+/// `a_flight_that_cannot_be_taken_fail_stops_every_later_write` fail-stops at the release itself,
+/// so no branch is released there and its close frees nothing either way. Mutant
+/// `close_frees_when_stopped`.
+#[test]
+fn a_close_frees_nothing_once_the_store_has_fail_stopped() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("close-stopped.db"), opts(false, SyncClass::Fsync));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let _anchor = trunk.fork_branch().unwrap().into_id();
+    let x = trunk.fork_branch().unwrap();
+    let xc = x.connect().unwrap();
+    write_v(&xc, 3, "x");
+    let owned = x.owned_slots();
+    assert!(!owned.is_empty(), "premise: x's write took a slot");
+    x.reap().unwrap();
+    for slot in &owned {
+        assert!(!db.branch_slot_is_free(*slot), "premise: slot {slot} is held while x's connection is open");
+    }
+    db.branch_failpoint(Some(BranchFailpoint::ArenaSyncFails));
+    assert!(db.branch_compact_now().is_err(), "premise: the compaction's arena sync failed");
+    assert_fail_stopped(trunk.fork_branch().map(|b| b.into_id()), "premise: the fork after the failed arena sync");
+    drop(xc);
+    let freed: Vec<u32> = owned.iter().copied().filter(|s| db.branch_slot_is_free(*s)).collect();
+    assert!(freed.is_empty(), "CLAIM: slots {freed:?} were freed by a close after the store fail-stopped");
+}
