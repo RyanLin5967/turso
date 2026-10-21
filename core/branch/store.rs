@@ -3897,9 +3897,15 @@ fn run_links_fill(shared: &StoreMutex, writer: &Mutex<Catalog>, group: &Group, m
                     w.rollback();
                     let _ = w.refresh_links();
                     tracing::warn!("branch catalog link columns not made: {e}");
+                    #[cfg(test)]
+                    {
+                        *LINKS_FILL_COLUMN_ERROR.lock().unwrap_or_else(|p| p.into_inner()) = e.to_string();
+                    }
                     false
                 }
             };
+        #[cfg(test)]
+        LINKS_FILL_COLUMN_TXNS[usize::from(!ready)].fetch_add(1, Ordering::AcqRel);
         if ready {
             made.store(true, Ordering::Release);
         }
@@ -4051,6 +4057,10 @@ fn run_links_fill(shared: &StoreMutex, writer: &Mutex<Catalog>, group: &Group, m
                 // L2: a failed fill backs off a threshold's worth of log, as a failed checkpoint
                 // does (`defer_compaction`), not restarted by the next operation.
                 tracing::warn!("branch catalog link fill stopped: {e}");
+                #[cfg(test)]
+                {
+                    *LINKS_FILL_COLUMN_ERROR.lock().unwrap_or_else(|p| p.into_inner()) = format!("batch: {e}");
+                }
                 cat.filling = false;
                 if let Some(journal) = inner.journal.as_mut() {
                     journal.defer_compaction();
@@ -4066,6 +4076,12 @@ fn run_links_fill(shared: &StoreMutex, writer: &Mutex<Catalog>, group: &Group, m
 /// only in a test's own child process.
 #[cfg(test)]
 pub(crate) static LINKS_FILL_PAUSE_MS: AtomicU64 = AtomicU64::new(0);
+/// Test builds (H1 no-cut diagnostic, observing only): the fill's column-only transactions that made (or found)
+/// the columns, and that failed; and the last error a fill met (its column-only transaction or a batch).
+#[cfg(test)]
+pub(crate) static LINKS_FILL_COLUMN_TXNS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+#[cfg(test)]
+pub(crate) static LINKS_FILL_COLUMN_ERROR: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 /// Test builds (h1-rev-72bfb0127 LOW-3): fill batches started by a fill a later spawn superseded.
 #[cfg(test)]
 pub(crate) static LINKS_FILL_SUPERSEDED_BATCHES: AtomicU64 = AtomicU64::new(0);
