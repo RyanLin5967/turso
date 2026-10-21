@@ -5661,6 +5661,23 @@ fn parameter_types(types: &StatementTypes, declared: &[Option<Type>]) -> SqlResu
     (1..=highest.max(declared.len()))
         .map(|n| {
             if let Some(Some(t)) = declared.get(n - 1) {
+                // Declared interval, time or timestamp and an operand of arithmetic, or declared
+                // interval and compared: refused as the walk refuses such an operand of its own (the
+                // engine has no interval type: ts + $1 answered '2027', $1 > $2 compared text;
+                // wire-rev-1de981755-rest HIGH-2, MED-8).
+                let temporal = [Type::INTERVAL, Type::TIME, Type::TIMETZ, Type::TIMESTAMP, Type::TIMESTAMPTZ].contains(t);
+                if (temporal && types.arithmetic_operands.contains(&(n as u32)))
+                    || (*t == Type::INTERVAL && types.compared_operands.contains(&(n as u32)))
+                {
+                    return Err(error(
+                        SqlErrorKind::FeatureNotSupported,
+                        if *t == Type::INTERVAL && !types.arithmetic_operands.contains(&(n as u32)) {
+                            "interval comparison is not supported".to_string()
+                        } else {
+                            "interval arithmetic is not supported".to_string()
+                        },
+                    ));
+                }
                 if *t != Type::UNKNOWN {
                     return Ok(t.clone());
                 }

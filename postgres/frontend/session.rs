@@ -2006,7 +2006,37 @@ fn prepare_statement_parsed(
                 if f.funcname.last().is_some_and(|p| matches!(&p.node,
                     Some(turso_pg_parser::pg_query::protobuf::node::Node::String(s)) if s.sval.eq_ignore_ascii_case("min") || s.sval.eq_ignore_ascii_case("max"))))
         });
-        if !used.is_empty() || aggregates.contains(&true) || min_max {
+        // ... and for one that may read an interval, time or timestamp value, whose arithmetic and
+        // interval comparisons the walk refuses (wire-rev-1de981755-rest HIGH-2, MED-8: `WHERE ts2 >
+        // ts + interval '1 hour'` was never walked). The text bounds it as for min and max: such a
+        // value is a cast or literal (interval, time, timestamp), a function (now(),
+        // current_timestamp, localtime), or a column of a table the statement names that is
+        // declared time or timestamp, or of a view it names whose columns or text hold one.
+        // BLIND SPOTS: a column declared interval is stored as text (the engine has no interval
+        // type) and reads as text; a view over a view is judged by its own columns and text only;
+        // a view's computed columns are typed by its own walk, whose refusals stay there.
+        let temporal_declared = |ty: &str| {
+            let declared = ty.split('(').next().unwrap_or("").trim();
+            ["interval", "time", "timetz", "timestamp", "timestamptz"].iter().any(|t| declared.eq_ignore_ascii_case(t))
+        };
+        let temporal_table = |table: &turso_core::schema::Table| table.columns().iter().any(|c| temporal_declared(&c.ty_str));
+        let mentions = |text: &str, word: &[u8]| text.as_bytes().windows(word.len()).any(|w| w.eq_ignore_ascii_case(word));
+        let temporal = || {
+            may_name(b"interval")
+                || may_name(b"time")
+                || may_name(b"now")
+                || schema.tables.iter().any(|(name, table)| may_name(name.as_bytes()) && temporal_table(table.as_ref()))
+                || schema.views.iter().any(|(name, view)| {
+                    may_name(name.as_bytes())
+                        && (view.columns.iter().any(|c| temporal_declared(&c.ty_str))
+                            || [b"interval".as_slice(), b"time", b"now"].iter().any(|w| mentions(&view.sql, w))
+                            || schema
+                                .tables
+                                .iter()
+                                .any(|(table, t)| mentions(&view.sql, table.as_bytes()) && temporal_table(t.as_ref())))
+                })
+        };
+        if !used.is_empty() || aggregates.contains(&true) || min_max || temporal() {
             // A parameter compared with something no context types is refused (42P18) by the
             // server, which alone reads the types the client declared (wire review 8 item 7,
             // review 11 item 1).
@@ -2043,6 +2073,8 @@ fn prepare_statement_parsed(
             types.params = walked.params;
             types.untyped = walked.untyped;
             types.inconsistent = walked.inconsistent;
+            types.arithmetic_operands = walked.arithmetic_operands;
+            types.compared_operands = walked.compared_operands;
             types.assignments = walked.assignments;
             types.columns = crate::result_types::aggregate_types(&aggregates, &walked.columns);
         }
