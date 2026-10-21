@@ -848,8 +848,10 @@ fn main() {
             gate.wait(); // every client has finished it
             let secs = t.elapsed().as_secs_f64();
             let rt1 = realtime_s();
-            let e1 = db.branch_exception_counters();
             fence.end(w);
+            // after the window's fence, as e0 is before it (t3cov-2 LOW 1): the read takes the store's group lock, so
+            // inside the marked span a writer holding it would put a futex in the window
+            let e1 = db.branch_exception_counters();
             if windows.len() + 1 == windows_wanted.len() {
                 tp1 = Some(tracer_pid());
             }
