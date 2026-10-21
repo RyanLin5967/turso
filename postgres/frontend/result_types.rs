@@ -2337,6 +2337,15 @@ impl Infer<'_> {
                 };
                 let l = e.lexpr.as_deref().and_then(|l| self.type_of(l, scope));
                 let r = e.rexpr.as_deref().and_then(|r| self.type_of(r, scope));
+                if matches!(op, Some("+" | "-" | "*" | "/")) && (l == Some(1186) || r == Some(1186)) {
+                    self.first_refusal.borrow_mut().get_or_insert_with(|| {
+                        Some(SqlErrorMessage::classified(
+                            SqlErrorKind::FeatureNotSupported,
+                            "interval arithmetic is not supported",
+                        ))
+                    });
+                    return None;
+                }
                 // Two untyped literals leave every candidate operator, as PostgreSQL finds:
                 // 42725 'operator is not unique: unknown + unknown' (wire-rev-cfdebc06d LOW-4).
                 if matches!(op, Some("+" | "-" | "*" | "/" | "%"))
@@ -2366,6 +2375,17 @@ impl Infer<'_> {
                 };
                 match (l, r) {
                     (Some(a), Some(b)) => match arithmetic(op.unwrap_or(""), a, b) {
+                        // An interval result (timestamp - timestamp): the engine has no interval
+                        // type and answered '0' (wire-rev-7128c6f73 L4), so it is refused.
+                        Arithmetic::Type(1186) => {
+                            self.first_refusal.borrow_mut().get_or_insert_with(|| {
+                                Some(SqlErrorMessage::classified(
+                                    SqlErrorKind::FeatureNotSupported,
+                                    "interval arithmetic is not supported",
+                                ))
+                            });
+                            None
+                        }
                         Arithmetic::Type(t) => Some(t),
                         Arithmetic::Unknown => None,
                         Arithmetic::NoOperator => {
@@ -2554,6 +2574,11 @@ fn cast_type(cast: &turso_pg_parser::pg_query::protobuf::TypeCast) -> Option<u32
         Node::String(s) => s.sval.as_str(),
         _ => return None,
     };
+    // An interval cast is an interval to the walk, so its arithmetic is refused as such
+    // (wire-rev-7128c6f73 L4), not typed as the text the engine stores.
+    if name == "interval" {
+        return Some(1186);
+    }
     u32::try_from(sqlite_type_to_pg_oid(name)).ok()
 }
 

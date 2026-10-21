@@ -4367,6 +4367,20 @@ impl PostgreSQLTranslator {
         {
             return Err(refuse_numeric_cast_arithmetic(op_name));
         }
+        // The engine has no interval type (PGDIV-INTERVAL-TEXT): arithmetic with an interval
+        // operand is refused, never computed over its text (wire-rev-7128c6f73 L4: now() +
+        // interval '1 day' > now() answered f).
+        let interval = |e: Option<&pg_query::protobuf::Node>| {
+            matches!(e.and_then(|e| e.node.as_ref()), Some(pg_query::protobuf::node::Node::TypeCast(c))
+                if c.type_name.as_ref().is_some_and(|t| t.names.last().is_some_and(|n|
+                    matches!(&n.node, Some(pg_query::protobuf::node::Node::String(s)) if s.sval == "interval"))))
+        };
+        if matches!(op_name, "+" | "-" | "*" | "/") && (interval(a_expr.lexpr.as_deref()) || interval(a_expr.rexpr.as_deref())) {
+            return Err(ParseError::ParseError(SqlErrorMessage::classified(
+                SqlErrorKind::FeatureNotSupported,
+                "interval arithmetic is not supported",
+            )));
+        }
         // Two unknowns (string literals or NULL) leave every candidate operator: 42725, as
         // PostgreSQL refuses it wherever the operator stands (wire-rev-7128c6f73 L2: only the
         // target list's walk refused it).
