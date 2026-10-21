@@ -7965,6 +7965,63 @@ fn a_cancel_leaves_the_session_usable_after_its_block_is_undone() {
     }
 }
 
+/// A CancelRequest, or the statement_timeout, that lands while a COPY's rows are being inserted at
+/// its end answers ERROR 57014 and leaves the session usable (SELECT 1 answers, no row stays), as
+/// PostgreSQL 18.6 answers a cancel of a COPY that is inserting (review wire-rev-copystdin2 run
+/// rvw9707-pg `race`, 40 of 40). The insert's own undo (own_transaction's ROLLBACK) ran with the
+/// interrupt still armed, so the undo was stopped too, the connection was marked broken and the
+/// session ended with FATAL 08006 (review wire-rev-copystdin3 H1, `cancelend`, `timeoutend`: 3 of
+/// 3 at b3cd80196).
+#[test]
+fn a_cancel_or_timeout_during_copys_final_insert_leaves_the_session_usable() {
+    let dir = Scratch::new("copyendcancel");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.s.set_read_timeout(Some(Duration::from_secs(600))).unwrap();
+    let key = a.key.clone().expect("BackendKeyData at startup");
+    a.q("CREATE TABLE a (id int PRIMARY KEY)").ok("a");
+    let rows: Vec<u8> = (1..=1_000_000).flat_map(|i| format!("{i}\n").into_bytes()).collect();
+    let stream = |a: &mut Wire| {
+        a.send(b'Q', b"COPY a FROM STDIN\0");
+        let mut r = Reply::default();
+        assert!(a.read_into(&mut r, true), "no CopyInResponse");
+        for piece in rows.chunks(65536) {
+            a.send(b'd', piece);
+        }
+        a.send(b'c', &[]);
+        r
+    };
+    // A cancel 1 s after CopyDone, while the rows go in.
+    let mut r = stream(&mut a);
+    std::thread::sleep(Duration::from_millis(1000));
+    let mut s = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+    let mut m = ((8 + key.len()) as i32).to_be_bytes().to_vec();
+    m.extend_from_slice(&80877102i32.to_be_bytes());
+    m.extend_from_slice(&key);
+    s.write_all(&m).unwrap();
+    drop(s);
+    a.read_into(&mut r, false);
+    let e = r.err("a cancel during the final insert");
+    assert_eq!(
+        (e.code.as_str(), e.message.as_str()),
+        ("57014", "canceling statement due to user request")
+    );
+    assert_eq!(r.status, b'I');
+    a.q("SELECT 1").ok("the session after the cancel");
+    // statement_timeout, which the final insert outlasts.
+    a.q("SET statement_timeout = 3000").ok("timeout");
+    let mut r = stream(&mut a);
+    a.read_into(&mut r, false);
+    let e = r.err("a timeout during the final insert");
+    assert_eq!(
+        (e.code.as_str(), e.message.as_str()),
+        ("57014", "canceling statement due to statement timeout")
+    );
+    assert_eq!(r.status, b'I');
+    a.q("RESET statement_timeout").ok("the session after the timeout");
+    assert_eq!(a.q("SELECT count(*) FROM a").single("count"), "0");
+}
+
 /// A lone COPY FROM STDIN holds no write lock while its client sends: another session's INSERT
 /// runs while the COPY waits for more rows, as in PostgreSQL 18.6 and before streaming (review
 /// wire-rev-copystdin2 M2, `hold-loaded`: PostgreSQL and 4b2f90346 INSERT 0 1 in 0.0 s; e85654d8c
