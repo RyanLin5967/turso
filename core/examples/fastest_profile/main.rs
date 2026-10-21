@@ -66,7 +66,9 @@
 //! p50/p90/p99/max/mean ns, window seconds, ops/s, and the engine's own sync counter delta over
 //! the window; each window's CLOCK_REALTIME bounds `t0_realtime_s`/`t1_realtime_s` and the measured span
 //! `tm0_realtime_s`/`tm1_realtime_s`, the competitors' names, so the shared tracer sweeper's cost is read over the
-//! measured windows: the MED 12 ruling). Under `--warmup OPS:S:MAX_S`, `warmup-live.json` is the live warm-up's own
+//! measured windows: the MED 12 ruling; scope, stated (t3cov-1a LOW 2): the span runs from the first window's open to
+//! the last window's close, the gaps between windows (counter reads, connection closes) included, where a competitor's
+//! is one window, so `sweeper_cpu_s` is read over a little more than the windows; it is reported, never in a ratio). Under `--warmup OPS:S:MAX_S`, `warmup-live.json` is the live warm-up's own
 //! record `{rule, claims_ns, stop_at, warm_ops, capped}`: every claim it judged, in ns since its start, in judging
 //! order, and the decision, which `warmup_conformance.py live` replays through `--warmup-replay` (review 5 MED 8). The
 //! warm-up's clock starts only after every client is ready (a ready barrier, then t0, then a go barrier, as bbload's
@@ -396,7 +398,10 @@ static WARM: Mutex<Warm> = Mutex::new(Warm { t0: None, claimed: 0, end: None, cl
 static READY: Mutex<Vec<Instant>> = Mutex::new(Vec::new());
 
 /// This process's TracerPid (/proc/self/status, read whole, as the shared sweeper reads each task's), or None where
-/// there is no /proc (macOS): recorded at the measured span's open and close, as bbload's tracerpid_tm0/tm1.
+/// there is no /proc (macOS): recorded at the measured span's open and close, as bbload's tracerpid_tm0/tm1. Scope,
+/// stated (t3cov-1a LOW 1): /proc/self/status is the thread-group leader's, and ptrace attaches per thread, so a tracer
+/// on a client thread is not seen here; the shared sweeper reads every task (gates/sweeper.sh), and bbload's field has
+/// the same scope, so the two drivers stay equal.
 fn tracer_pid() -> Option<u64> {
     let st = std::fs::read_to_string("/proc/self/status").ok()?;
     st.lines().find_map(|l| l.strip_prefix("TracerPid:")).and_then(|v| v.trim().parse().ok())
@@ -873,6 +878,17 @@ fn main() {
     let live = db.branch_ids().unwrap_or_else(|e| not_a_result(&format!("branch_ids: {e}")));
     if a.phases == 4 && live.len() != a.live {
         not_a_result(&format!("{} branches live after every delete, the prebranch's {}", live.len(), a.live));
+    }
+    // and they are the prebranch's own, by name (t3cov-1b LOW 8: a count alone passes a surviving cell branch beside a
+    // vanished prebranch one): each live-{i} is still named and is one of the live ids, so the sets are equal
+    if a.phases == 4 {
+        for i in 0..a.live {
+            let name = format!("live-{i}");
+            match db.branch_named(&name) {
+                Ok(Some(id)) if live.contains(&id) => {}
+                other => not_a_result(&format!("prebranch branch {name} is not live after every delete ({other:?})")),
+            }
+        }
     }
     if a.phases < 4 {
         eprintln!("note: --phases {}: {} branches left live by design; the delete check was skipped", a.phases, live.len());
