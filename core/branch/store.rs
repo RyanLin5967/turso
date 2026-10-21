@@ -3440,11 +3440,24 @@ fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU
             // Test builds (h1gap-rev-c HIGH-3): rows a checkpoint relinked around its own changes.
             #[cfg(test)]
             CKPT_RELINKED.fetch_add((rows.len() + parents.len()) as u64, Ordering::AcqRel);
-            for (p, f) in rows {
-                links.extend(catalog.relink(p, f)?);
+            // Mutant `l4_nonflip_no_relink` (test builds only; h1-rev-72bfb0127 HIGH-2, its plant
+            // rev_nonflip_no_relink): a non-flip checkpoint skips its relink and still carries the cursor.
+            if !(nonflip && fe_mutant("l4_nonflip_no_relink")) {
+                for (p, f) in rows {
+                    links.extend(catalog.relink(p, f)?);
+                }
+                for p in parents {
+                    links.extend(catalog.relink_id(p)?);
+                }
             }
-            for p in parents {
-                links.extend(catalog.relink_id(p)?);
+            // Mutant `l4_nonflip_fill_untagged` (test builds only; h1-rev-72bfb0127 MED-1, its plant
+            // rev_nonflip_fill_untagged): a non-flip checkpoint runs the whole fill in its own transaction
+            // by direct batches, outside `upgrade_links`.
+            if nonflip && fe_mutant("l4_nonflip_fill_untagged") {
+                let mut at = None;
+                while let Some(next) = catalog.upgrade_links_batch(at, super::catalog::UPGRADE_BATCH)? {
+                    at = Some(next);
+                }
             }
             if nonflip {
                 // The links are not valid yet: nothing of them is the store's to keep.
