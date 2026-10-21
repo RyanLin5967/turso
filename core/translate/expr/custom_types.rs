@@ -5038,4 +5038,48 @@ mod tests {
         }
         assert!(bad.is_empty(), "CLAIM: a plan shape answered a DML, CAST, join or compound comparison unlike PostgreSQL: {} divergences: {bad:#?}", bad.len());
     }
+
+    /// The lead's ruling on ac353f711 (2026-10-21): with a CAST yielding its type's value, the
+    /// manual's own `amount cents CHECK(amount < CAST(50 AS cents))` (cents ENCODEs value * 100)
+    /// compared the column's stored form, 4000 for 40, with the value 50, so it refused every row.
+    /// A table CHECK reads the column's value, as a domain's CHECK does. Expected: what PostgreSQL
+    /// 18.6 does with the equivalent domain over integer, whose CHECK sees the value (UW run
+    /// typesrev2bd-oracle13; artie raw frontier/fastest/lanes/engine/raw/pg18-types-rev2bd-10.txt
+    /// 07b2a26451), never ours: 40 and 49 are inserted, 60 and 50 refused, an UPDATE to 70 refused
+    /// and to 10 accepted; ADD COLUMN ... DEFAULT 60 with the CHECK is refused over a row and
+    /// DEFAULT 40 accepted. Refusals are asserted as refusals (the messages are the engine's).
+    #[test]
+    fn a_table_check_over_a_value_changing_type_reads_the_value() {
+        let conn = open();
+        for sql in [
+            "CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100",
+            "CREATE TABLE t1(id INTEGER PRIMARY KEY, amount cents CHECK (amount < CAST(50 AS cents))) STRICT",
+            "CREATE TABLE t2(id INTEGER PRIMARY KEY) STRICT",
+            "INSERT INTO t2 VALUES (1)",
+        ] {
+            conn.execute(sql).unwrap();
+        }
+        let mut bad = Vec::new();
+        for (sql, accepted) in [
+            ("INSERT INTO t1 VALUES (1, 40)", true),
+            ("INSERT INTO t1 VALUES (2, 60)", false),
+            ("INSERT INTO t1 VALUES (3, 49)", true),
+            ("INSERT INTO t1 VALUES (4, 50)", false),
+            ("UPDATE t1 SET amount = 70 WHERE id = 1", false),
+            ("UPDATE t1 SET amount = 10 WHERE id = 1", true),
+            ("ALTER TABLE t2 ADD COLUMN amount cents DEFAULT 60 CHECK (amount < CAST(50 AS cents))", false),
+            ("ALTER TABLE t2 ADD COLUMN amount cents DEFAULT 40 CHECK (amount < CAST(50 AS cents))", true),
+        ] {
+            let got = conn.execute(sql);
+            if got.is_ok() != accepted {
+                bad.push(format!("{sql} gave {got:?}; PostgreSQL 18 {}", if accepted { "accepts it" } else { "refuses it 23514" }));
+            }
+        }
+        bad.extend(diverging(
+            &conn,
+            &[("SELECT id, amount FROM t1 ORDER BY id", "1,10;3,49"), ("SELECT id, amount FROM t2 ORDER BY id", "1,40")],
+            "PostgreSQL 18",
+        ));
+        assert!(bad.is_empty(), "CLAIM: a table CHECK over a value-changing type did not read the value: {bad:#?}");
+    }
 }
