@@ -554,6 +554,7 @@ pub fn resolve_builtin_function(name: &str, arg_count: usize) -> crate::Result<O
         "timestamptz_offset" => Ok(Some(Func::Scalar(ScalarFunc::TimestamptzOffset))),
         "temporal_plus" => Ok(Some(Func::Scalar(ScalarFunc::TemporalPlus))),
         "temporal_minus" => Ok(Some(Func::Scalar(ScalarFunc::TemporalMinus))),
+        "interval_refuses" => Ok(Some(Func::Scalar(ScalarFunc::IntervalRefuses))),
         "numeric_sub" => Ok(Some(Func::Scalar(ScalarFunc::NumericSub))),
         "numeric_mul" => Ok(Some(Func::Scalar(ScalarFunc::NumericMul))),
         "numeric_div" => Ok(Some(Func::Scalar(ScalarFunc::NumericDiv))),

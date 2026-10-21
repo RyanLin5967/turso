@@ -294,6 +294,29 @@ pub(super) struct ResolvedOperator {
 ///
 /// Both arguments reach the function as user-facing values: the column decoded, the
 /// operand as given (`emit_custom_type_operator`).
+/// The INTERVAL stopgap: a comparison or arithmetic with an operand whose type refuses its values
+/// (order_by::type_refuses_its_values) is refused at translation, whatever the other operand, so it
+/// neither waits for a row nor falls through to the plain operator over the text (an interval
+/// against a timestamp column has no shared type operator). IS, IS NOT and `||` are allowed.
+pub(super) fn refuse_refusing_operands(
+    e1: &ast::Expr,
+    e2: &ast::Expr,
+    op: &ast::Operator,
+    referenced_tables: Option<&TableReferences>,
+    resolver: &Resolver,
+) -> crate::Result<()> {
+    if matches!(op, ast::Operator::Is | ast::Operator::IsNot | ast::Operator::Concat | ast::Operator::And | ast::Operator::Or) {
+        return Ok(());
+    }
+    let Some(tables) = referenced_tables else {
+        return Ok(());
+    };
+    for e in [e1, e2] {
+        crate::translate::order_by::refuse_refusing_type(e, tables, resolver.schema(), "an operator")?;
+    }
+    Ok(())
+}
+
 pub(super) fn find_custom_type_operator(
     e1: &ast::Expr,
     e2: &ast::Expr,

@@ -300,6 +300,9 @@ fn pg_offset_with_colon(s: &str) -> Option<String> {
     Some(format!("{head}{}{hh}:{}", &s[sign..sign + 1], if mm.is_empty() { "00" } else { mm }))
 }
 
+/// The INTERVAL stopgap's refusal (`interval_refuses`, order_by::refuse_refusing_type).
+pub(crate) const INTERVAL_UNSUPPORTED: &str = "interval values are not supported until the interval type exists";
+
 fn date_operand_kind(v: &Value) -> &'static str {
     match v {
         Value::Text(t) if chrono::NaiveDate::parse_from_str(t.as_str(), "%Y-%m-%d").is_ok() => "date",
@@ -10925,6 +10928,12 @@ pub fn op_function(
                     }
                 };
                 state.registers[*dest].set_value(result);
+            }
+            ScalarFunc::IntervalRefuses => {
+                // The INTERVAL stopgap's every operator (lead order 2026-10-21): no comparison or
+                // arithmetic over an interval's text, a NULL operand too.
+                check_arg_count!(arg_count, 2);
+                return Err(LimboError::FeatureNotSupported(INTERVAL_UNSUPPORTED.to_string()));
             }
             ScalarFunc::TemporalPlus | ScalarFunc::TemporalMinus => {
                 // timestamp's, timestamptz's and time's '+' and '-' (lead ruling 2026-10-19): every

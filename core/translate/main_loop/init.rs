@@ -7,6 +7,9 @@ pub fn init_distinct(
     plan: &SelectPlan,
     resolver: &Resolver,
 ) -> Result<DistinctCtx> {
+    for col in plan.result_columns.iter() {
+        crate::translate::order_by::refuse_refusing_type(&col.expr, &plan.table_references, resolver.schema(), "DISTINCT")?;
+    }
     let collations = plan
         .result_columns
         .iter()

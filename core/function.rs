@@ -902,6 +902,7 @@ pub enum ScalarFunc {
     TimestamptzOffset,
     TemporalPlus,
     TemporalMinus,
+    IntervalRefuses,
     NumericSub,
     NumericMul,
     NumericDiv,
@@ -1042,7 +1043,8 @@ impl Deterministic for ScalarFunc {
             | ScalarFunc::DateMinus
             | ScalarFunc::TimestamptzOffset
             | ScalarFunc::TemporalPlus
-            | ScalarFunc::TemporalMinus => true,
+            | ScalarFunc::TemporalMinus
+            | ScalarFunc::IntervalRefuses => true,
             ScalarFunc::Array
             | ScalarFunc::ArrayElement
             | ScalarFunc::ArraySetElement
@@ -1193,6 +1195,7 @@ impl Display for ScalarFunc {
             Self::TimestamptzOffset => "timestamptz_offset",
             Self::TemporalPlus => "temporal_plus",
             Self::TemporalMinus => "temporal_minus",
+            Self::IntervalRefuses => "interval_refuses",
             Self::NumericSub => "numeric_sub",
             Self::NumericMul => "numeric_mul",
             Self::NumericDiv => "numeric_div",
@@ -1352,7 +1355,8 @@ impl ScalarFunc {
             | Self::DatePlus
             | Self::DateMinus
             | Self::TemporalPlus
-            | Self::TemporalMinus => &[2],
+            | Self::TemporalMinus
+            | Self::IntervalRefuses => &[2],
             Self::NumericEncode => &[3],
             Self::VarcharEncode => &[2],
             Self::AlterColumnSql => &[7],

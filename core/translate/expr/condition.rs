@@ -442,6 +442,7 @@ pub fn translate_condition_expr(
             }
         }
         ast::Expr::Binary(e1, op, e2) => {
+            super::custom_types::refuse_refusing_operands(e1, e2, op, Some(referenced_tables), resolver)?;
             // Check if either operand has a custom type with a matching operator
             if let Some(resolved) =
                 find_custom_type_operator(e1, e2, op, Some(referenced_tables), resolver)

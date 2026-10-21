@@ -286,6 +286,16 @@ fn emit_compound_select(
         false,
     ));
     right_most_ctx.reg_result_cols_start = reg_result_cols_start;
+    // The INTERVAL stopgap: a compound that dedupes (UNION, INTERSECT, EXCEPT) compares its rows,
+    // and an interval's text compares wrong; UNION ALL keeps every row and is answered.
+    if left.last().is_some_and(|(_, op)| !matches!(op, CompoundOperator::UnionAll)) {
+        let arms = left.iter().map(|(p, _)| &*p).chain(std::iter::once(&*right_most));
+        for arm in arms {
+            for col in arm.result_columns.iter() {
+                super::order_by::refuse_refusing_type(&col.expr, &arm.table_references, resolver.schema(), "a compound's dedupe")?;
+            }
+        }
+    }
     match left.split_last_mut() {
         Some(((plan, operator), left)) => match operator {
             CompoundOperator::UnionAll => {

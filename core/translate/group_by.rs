@@ -179,6 +179,9 @@ impl EmitGroupBy {
                 })
                 .try_collect::<Result<crate::alloc::Vec<_>>>()??;
 
+            for expr in group_by.exprs.iter() {
+                super::order_by::refuse_refusing_type(expr, &plan.table_references, t_ctx.resolver.schema(), "GROUP BY")?;
+            }
             // Resolve custom type comparators for GROUP BY columns (e.g. array_lt).
             let comparators = group_by
                 .exprs

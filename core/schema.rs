@@ -902,6 +902,11 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
         "CREATE TYPE inet(value text) BASE text ENCODE validate_ipaddr(value) DECODE value",
         "CREATE TYPE cidr(value text) BASE text ENCODE value DECODE value",
         "CREATE TYPE macaddr(value text) BASE text ENCODE value DECODE value",
+        // The INTERVAL stopgap (lead order 2026-10-21): the value as written, under its own name,
+        // with every operator refusing (`interval_refuses`) and the translator refusing to sort,
+        // group, dedupe or aggregate it (order_by::refuse_refusing_type) until a real interval
+        // type exists: as text, '1 day' and '24 hours' are two values.
+        "CREATE TYPE interval(value text) BASE text ENCODE value DECODE value OPERATOR '<' interval_refuses OPERATOR '=' interval_refuses OPERATOR '+' interval_refuses OPERATOR '-' interval_refuses OPERATOR '*' interval_refuses OPERATOR '/' interval_refuses",
         "CREATE TYPE macaddr8(value text) BASE text ENCODE value DECODE value",
         "CREATE TYPE bytea(value blob) BASE blob OPERATOR '<'",
         "CREATE TYPE numeric(value any, precision integer, scale integer) BASE blob ENCODE numeric_encode(value, precision, scale) DECODE numeric_decode(value) OPERATOR '+' numeric_add OPERATOR '-' numeric_sub OPERATOR '*' numeric_mul OPERATOR '/' numeric_div OPERATOR '<' numeric_lt OPERATOR '=' numeric_eq",

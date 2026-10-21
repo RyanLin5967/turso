@@ -137,6 +137,37 @@ pub(crate) fn expr_custom_type(
     }
 }
 
+/// A type whose values are never compared or computed: its '<' is `interval_refuses` (the INTERVAL
+/// stopgap, lead order 2026-10-21).
+pub(crate) fn type_refuses_its_values(type_def: &crate::schema::TypeDef) -> bool {
+    type_def
+        .operators()
+        .iter()
+        .any(|o| o.op == "<" && o.func_name.as_deref() == Some("interval_refuses"))
+}
+
+/// Refuse `what` (ORDER BY, GROUP BY, DISTINCT, an aggregate, a comparison) over `expr` when its
+/// values are of a type that refuses them (`type_refuses_its_values`), at translation, so the
+/// refusal does not wait for a second row: as text, an interval would sort, group, dedupe and
+/// aggregate wrong. Mutant `interval_values_sorted` (test builds only): not refused.
+pub(crate) fn refuse_refusing_type(
+    expr: &ast::Expr,
+    referenced_tables: &TableReferences,
+    schema: &Schema,
+    what: &str,
+) -> crate::Result<()> {
+    if crate::branch::store::fe_mutant("interval_values_sorted") {
+        return Ok(());
+    }
+    match expr_custom_type(expr, referenced_tables, schema) {
+        Some((type_def, _)) if type_refuses_its_values(&type_def) => Err(crate::LimboError::FeatureNotSupported(format!(
+            "{what} over an interval: {}",
+            crate::vdbe::execute::INTERVAL_UNSUPPORTED
+        ))),
+        _ => Ok(()),
+    }
+}
+
 /// For an ORDER BY expression whose values are of a custom type (`expr_custom_type`: a STRICT
 /// column, a derived relation's typed column, an operator over one), the SortComparatorType of the
 /// type's `<` operator when the sorter knows it (its comparators read a stored encoding and a
@@ -402,6 +433,9 @@ impl EmitOrderBy {
 
             // Resolve custom type comparators for ORDER BY columns.
             // For types with a `<` operator, the comparator is used for correct sort ordering.
+            for (expr, _, _) in order_by.iter() {
+                refuse_refusing_type(expr, referenced_tables, t_ctx.resolver.schema(), "ORDER BY")?;
+            }
             let mut comparators: Vec<Option<SortComparatorType>> = order_by
                 .iter()
                 .map(|(expr, _, _)| {

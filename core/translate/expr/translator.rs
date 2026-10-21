@@ -408,6 +408,7 @@ pub fn translate_expr(
                 return Ok(target_register);
             }
 
+            super::custom_types::refuse_refusing_operands(e1, e2, op, referenced_tables, resolver)?;
             // Check if either operand has a custom type with a matching operator
             if let Some(resolved) =
                 find_custom_type_operator(e1, e2, op, referenced_tables, resolver)
@@ -1856,7 +1857,8 @@ pub fn translate_expr(
                         | ScalarFunc::DateMinus
                         | ScalarFunc::TimestamptzOffset
                         | ScalarFunc::TemporalPlus
-                        | ScalarFunc::TemporalMinus => translate_function(
+                        | ScalarFunc::TemporalMinus
+                        | ScalarFunc::IntervalRefuses => translate_function(
                             program,
                             args,
                             referenced_tables,

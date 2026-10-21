@@ -362,6 +362,12 @@ pub fn translate_aggregation_step(
 ) -> Result<usize> {
     let num_args = agg_arg_source.num_args();
     let func = agg_arg_source.agg_func();
+    // The INTERVAL stopgap: no aggregate over an interval's text but a plain count of its rows.
+    if !matches!(func, AggFunc::Count0) && (!matches!(func, AggFunc::Count) || agg_arg_source.distinctness().is_distinct()) {
+        for i in 0..num_args {
+            super::order_by::refuse_refusing_type(&agg_arg_source.arg_at(i), referenced_tables, resolver.schema(), "an aggregate")?;
+        }
+    }
     let dest = match func {
         AggFunc::Avg => {
             if num_args != 1 {
