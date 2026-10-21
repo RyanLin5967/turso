@@ -1944,9 +1944,17 @@ impl Session {
     }
 
     /// A connection the session opened stops its statement when the session's [`Interrupts`] ask.
-    fn arm(&self, conn: &Arc<turso_core::Connection>) {
+    /// The connection's progress handler: the session's interrupts stop a statement, never the
+    /// undo of one (turso_pg's undo_flag): an undo stopped by the cancel or the statement_timeout
+    /// that stopped its statement broke the connection, and the session ended with FATAL 08006
+    /// (review wire-rev-copystdin3 H1: a cancel or a timeout during COPY's final insert).
+    fn arm(&self, conn: &PgConnection) {
         let interrupts = self.interrupts.clone();
-        conn.set_progress_handler(PROGRESS_OPS, Some(Box::new(move || interrupts.should_stop())));
+        let undoing = conn.undo_flag();
+        conn.inner().set_progress_handler(
+            PROGRESS_OPS,
+            Some(Box::new(move || !undoing() && interrupts.should_stop())),
+        );
     }
 
     /// How long a statement waits for a lock: the session's SET lock_timeout, else (unset, or 0,
@@ -1976,7 +1984,7 @@ impl Session {
 
     fn open_trunk(&self) -> SqlResult<PgConnection> {
         let conn = PgConnection::new_server(self.shared.db.connect().map_err(|e| engine_info(&e))?, self.shared.server_files());
-        self.arm(conn.inner());
+        self.arm(&conn);
         attach_schema_files(&conn, &self.shared.db_file);
         Ok(conn)
     }
@@ -2254,7 +2262,7 @@ impl Session {
             }
         };
         let conn = PgConnection::new_server(conn, self.shared.server_files());
-        self.arm(conn.inner());
+        self.arm(&conn);
         self.state().branch = Some((branch.into(), conn));
         Ok(())
     }
@@ -3552,7 +3560,7 @@ impl Session {
                             .waiting(|| self.shared.db.connect_named(&name))
                             .map_err(|e| self.switch_error(&name, &e, "ERROR"))?;
                         let next = PgConnection::new_server(opened, self.shared.server_files());
-                        self.arm(next.inner());
+                        self.arm(&next);
                         next.adopt_session_of(conn);
                         st.branch = Some((name.as_ref().into(), next));
                     }
@@ -3577,7 +3585,7 @@ impl Session {
                         }
                     };
                     let next = PgConnection::new_server(opened, self.shared.server_files());
-                    self.arm(next.inner());
+                    self.arm(&next);
                     next.adopt_session_of(conn);
                     st.branch.replace((name.as_ref().into(), next))
                 };

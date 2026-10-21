@@ -35,6 +35,9 @@ pub(crate) struct PgConnectionInner {
     /// an unknown state, so the server must end the session (FATAL 08006) rather than serve more
     /// on it. A flag the server reads, not a sentinel in an error's text (wire review 5 item 4).
     broken: std::sync::atomic::AtomicBool,
+    /// An undo is running ([`Undoing`]): the server's progress handler lets it run whatever
+    /// interrupt is pending ([`PgConnection::undo_flag`]).
+    undoing: std::sync::atomic::AtomicBool,
     /// The parameter-type walk's views, read once per schema snapshot (wire review 14 item 10).
     view_cache: parking_lot::Mutex<crate::result_types::ViewCache>,
     /// SET lock_timeout, in milliseconds: 0 when unset or set to 0, PostgreSQL's "no timeout",
@@ -485,6 +488,7 @@ impl PgConnection {
                 conn,
                 session_state: parking_lot::Mutex::new(SessionState::default()),
                 broken: std::sync::atomic::AtomicBool::new(false),
+                undoing: std::sync::atomic::AtomicBool::new(false),
                 view_cache: parking_lot::Mutex::new(crate::result_types::ViewCache::default()),
                 lock_timeout_ms: std::sync::atomic::AtomicU64::new(0),
                 statement_timeout_ms: std::sync::atomic::AtomicU64::new(0),
@@ -508,6 +512,22 @@ impl PgConnection {
 
     pub fn inner(&self) -> &Arc<Connection> {
         &self.inner.conn
+    }
+
+    /// Set while this connection undoes a statement's own work (own_transaction's ROLLBACK or
+    /// ROLLBACK TO, roll_back_or_break): a progress handler must not stop it, or the cancel or
+    /// statement_timeout that stopped the statement stops its undo too, the connection is broken
+    /// and the session ends with FATAL 08006 (review wire-rev-copystdin3 H1: a cancel or a timeout
+    /// during COPY's final insert).
+    /// No allocation: the probe holds a Weak of the connection, so a handler the connection keeps
+    /// makes no cycle.
+    pub fn undo_flag(&self) -> impl Fn() -> bool + Send + Sync + 'static {
+        let inner = Arc::downgrade(&self.inner);
+        move || {
+            inner
+                .upgrade()
+                .is_some_and(|i| i.undoing.load(std::sync::atomic::Ordering::Acquire))
+        }
     }
 
     /// After a statement ran: Some(the number of columns) when it was a COPY FROM STDIN that
@@ -745,6 +765,7 @@ impl PgConnection {
         if conn.get_auto_commit() {
             return Ok(());
         }
+        let _undoing = Undoing::new(&self.inner);
         let r = undo_failpoint()
             .and_then(|()| run_tx(conn, TxStmt::Rollback))
             .and_then(|()| held_after_undo(conn, false))
@@ -3962,6 +3983,23 @@ fn run_tx(conn: &Arc<Connection>, tx: TxStmt) -> Result<()> {
 /// FATAL 08006): its work sits in a transaction nobody can name, and a statement after it would
 /// join it (a client's COMMIT kept the refused table). Inside a block the engine no longer holds
 /// (the error rolled the whole transaction back) there is nothing to undo.
+/// The span of an undo ([`PgConnection::undo_flag`]): set while it lives, cleared when it drops,
+/// whatever way the undo ends.
+struct Undoing<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl<'a> Undoing<'a> {
+    fn new(pg_conn: &'a PgConnectionInner) -> Self {
+        pg_conn.undoing.store(true, std::sync::atomic::Ordering::Release);
+        Undoing(&pg_conn.undoing)
+    }
+}
+
+impl Drop for Undoing<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 fn own_transaction<T>(
     pg_conn: &Arc<PgConnectionInner>,
     name: &'static str,
@@ -3993,6 +4031,8 @@ fn own_transaction<T>(
         Ok(done) => return Ok(done),
         Err(e) => e,
     };
+    // Run unstoppable: the interrupt that ended `f` must not end its undo.
+    let _undoing = Undoing::new(pg_conn);
     let undone = if conn.get_auto_commit() {
         Ok(())
     } else {
