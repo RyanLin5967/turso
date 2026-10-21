@@ -1730,6 +1730,7 @@ fn prepare_statement_parsed(
             .map_err(LimboError::InvalidArgument)?;
             types.params = walked.params;
             types.untyped = walked.untyped;
+            types.inconsistent = walked.inconsistent;
             types.assignments = walked.assignments;
             types.columns = crate::result_types::aggregate_types(&aggregates, &walked.columns);
         }

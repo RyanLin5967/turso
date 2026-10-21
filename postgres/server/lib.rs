@@ -5608,6 +5608,14 @@ fn parameter_types(types: &StatementTypes, declared: &[Option<Type>]) -> SqlResu
                     return Ok(t.clone());
                 }
             }
+            // Undeclared (or UNKNOWN) and assigned to columns of two types: 42P08, as PostgreSQL's
+            // parse analysis refuses it (wire-rev-cfdebc06d LOW-7).
+            if types.inconsistent.contains(&(n as u32)) {
+                return Err(error(
+                    SqlErrorKind::AmbiguousParameter,
+                    format!("inconsistent types deduced for parameter ${n}"),
+                ));
+            }
             // Undeclared (or UNKNOWN) and compared with something no context types: refused, never
             // compared as text (wire review 8 item 7). Here, where the declared types are read,
             // not at prepare (wire review 11 item 1).

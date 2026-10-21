@@ -33,6 +33,7 @@ pub fn sqlstate(kind: SqlErrorKind) -> &'static str {
         AmbiguousColumn => "42702",
         UndefinedFunction => "42883",
         AmbiguousFunction => "42725",
+        AmbiguousParameter => "42P08",
         DuplicateAlias => "42712",
         StatementTooComplex => "54001",
         InternalError => "XX000",

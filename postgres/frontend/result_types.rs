@@ -616,6 +616,8 @@ pub struct Walked {
     pub params: std::collections::BTreeMap<u32, u32>,
     /// The $n compared with an expression no context types ([`StatementTypes::untyped`]).
     pub untyped: std::collections::BTreeSet<u32>,
+    /// The $n assigned to columns of two types ([`StatementTypes::inconsistent`]).
+    pub inconsistent: std::collections::BTreeSet<u32>,
     /// A plain SELECT's result columns' types, in order, as the walk read them (empty for any other
     /// statement): [`aggregate_types`] takes the aggregates' from these.
     pub columns: Vec<Option<u32>>,
@@ -672,6 +674,11 @@ pub struct StatementTypes {
     /// declared its type, which the server reads from Parse (wire review 8 item 7, review 11 item
     /// 1: refused at prepare from the text alone, a declared one could never run).
     pub untyped: std::collections::BTreeSet<u32>,
+    /// Every $n assigned to columns of two different types (a numeric and a varchar column):
+    /// refused 42P08 'inconsistent types deduced for parameter $n' unless the client declared its
+    /// type, as PostgreSQL's parse analysis gives an undeclared parameter its first assignment's type
+    /// (wire-rev-cfdebc06d LOW-7).
+    pub inconsistent: std::collections::BTreeSet<u32>,
     /// The translated statement is a COMMIT (`commits`) or a ROLLBACK of the whole transaction
     /// (`rolls_back`), whatever its text: the server keys its COMMIT rules on this, never on its own
     /// reading of the text, which `COMMIT<NBSP>` and other spellings it did not know slipped past
@@ -794,6 +801,8 @@ fn parameter_types_with(
         types: std::collections::BTreeMap::new(),
         assignments: Vec::new(),
         compared_untyped: std::collections::BTreeSet::new(),
+        assigned: Default::default(),
+        inconsistent: Default::default(),
         ctes: Vec::new(),
         views: Vec::new(),
         subselects: Default::default(),
@@ -826,6 +835,7 @@ fn parameter_types_with(
     Ok(Walked {
         params: infer.types,
         untyped,
+        inconsistent: infer.inconsistent,
         columns,
         assignments: infer.assignments,
     })
@@ -887,6 +897,10 @@ struct Infer<'a> {
     assignments: Vec<(AssignSource, AssignTarget)>,
     /// Parameters compared with an expression no context types (see [`parameter_types`]).
     compared_untyped: std::collections::BTreeSet<u32>,
+    /// Each $n's first assigned column type, and the $n a later assignment gave another type
+    /// ([`StatementTypes::inconsistent`]).
+    assigned: std::collections::BTreeMap<u32, u32>,
+    inconsistent: std::collections::BTreeSet<u32>,
     /// The CTEs in scope, innermost last: name and columns.
     ctes: Vec<(String, Vec<(String, Option<u32>)>)>,
     /// The views being opened, outermost first ([`Infer::view_columns`]).
@@ -1080,6 +1094,23 @@ impl Infer<'_> {
         if let (Some(n), Some(ty)) = (param(node), ty) {
             self.types.entry(n).or_insert(ty);
         }
+    }
+
+    /// `node` is assigned to a column of type `ty`: typed by it as [`Infer::set`] types, and a bare
+    /// parameter a previous assignment gave another type is recorded as inconsistent.
+    fn assign_type(&mut self, node: &PgNode, ty: Option<u32>) {
+        if let (Some(n), Some(ty)) = (param(node), ty) {
+            match self.assigned.get(&n) {
+                Some(first) if *first != ty => {
+                    self.inconsistent.insert(n);
+                }
+                Some(_) => {}
+                None => {
+                    self.assigned.insert(n, ty);
+                }
+            }
+        }
+        self.set(node, ty);
     }
 
     /// `node`, if it is a bare parameter, is assigned to a column with `target`: recorded once per
@@ -1440,6 +1471,8 @@ impl Infer<'_> {
             types: std::collections::BTreeMap::new(),
             assignments: Vec::new(),
             compared_untyped: std::collections::BTreeSet::new(),
+            assigned: Default::default(),
+            inconsistent: Default::default(),
             ctes: Vec::new(),
             views,
             subselects: Default::default(),
@@ -1632,7 +1665,7 @@ impl Infer<'_> {
             for row in &s.values_lists {
                 if let Some(Node::List(l)) = row.node.as_ref() {
                     for (item, ty) in l.items.iter().zip(&columns) {
-                        self.set(item, *ty);
+                        self.assign_type(item, *ty);
                     }
                     for (item, len) in l.items.iter().zip(&lengths) {
                         self.assign_length(item, *len);
@@ -1705,14 +1738,14 @@ impl Infer<'_> {
                         .ok()
                         .and_then(|i| row.args.get(i))
                     {
-                        self.set(item, column);
+                        self.assign_type(item, column);
                         self.assign_length(item, length);
                         self.expr(item, scope);
                     }
                 }
                 continue;
             }
-            self.set(val, column);
+            self.assign_type(val, column);
             self.assign_length(val, length);
             self.expr(val, scope);
         }
@@ -2367,6 +2400,8 @@ impl Infer<'_> {
             types: std::collections::BTreeMap::new(),
             assignments: Vec::new(),
             compared_untyped: std::collections::BTreeSet::new(),
+            assigned: Default::default(),
+            inconsistent: Default::default(),
             ctes: self.ctes.clone(),
             views: self.views.clone(),
             subselects: self.subselects.clone(),

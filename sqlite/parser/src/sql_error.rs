@@ -27,6 +27,7 @@ pub enum SqlErrorKind {
     AmbiguousColumn,
     UndefinedFunction,
     AmbiguousFunction,
+    AmbiguousParameter,
     DuplicateAlias,
     StatementTooComplex,
     InternalError,
