@@ -1627,6 +1627,14 @@ fn under_sustained_creates_the_fill_completes() {
         assert!(cuts >= 2, "{rows} rows: premise: the log was cut {cuts} time(s) under {creates} creates");
         assert!(starts >= 2, "{rows} rows: premise: the fill was started {starts} time(s)");
         assert_eq!(prefilled, 1, "{rows} rows: under {creates} sustained creates the fill never completed ({batches} batches over {cuts} hard-limit cycles, K = {k} creates each)");
+        // The bound, from the fill's scheduling: at least one batch per hard-limit cycle, a cycle at most
+        // 3 x the threshold of log (to the hard limit, 2 x, plus the deferral's one), so at most
+        // 3 x 4 KiB / (bytes per create) creates; and the fill's rows are the store's at the horizon,
+        // rows + 50 children. So it completes within (ceil((rows + 50) / 64) + 1) cycles of such creates.
+        let n: u64 = rows.parse().unwrap();
+        let cycle = (3 * (4u64 << 10)) / per_create.max(1);
+        let bound = ((n + 50).div_ceil(64) + 1) * cycle;
+        assert!(creates <= bound, "{rows} rows: the fill took {creates} creates to complete, past its bound {bound} ({cycle} creates per cycle)");
         let l = readings(&text, "LS-LIVE-LINKS ");
         let (meta, all, wrong) = (l[0][0], l[0][1], l[0][2]);
         assert_eq!(meta, 21, "{rows} rows: the completed store did not flip (meta {meta})");
