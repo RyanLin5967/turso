@@ -867,3 +867,95 @@ fn a_fill_killed_between_batches_and_resumed_after_an_older_builds_checkpoint_li
         assert_eq!(wrong, 0, "k={k}: {wrong} of {rows} rows have wrong links after the resume (a cursor resumed across a checkpoint that changed rows behind it)");
     }
 }
+
+
+// ---- h1gap-rev-c HIGH-2 (ruling 62c11ec63d): a crash between a non-flip cut and the flip ----
+
+/// The process cut short: a 19 store of 1,000 rows past the hard limit with a slow fill, its log cut by a
+/// checkpoint that kept it at 19, then the process exits with no close (as a crash: no close-time flip).
+#[test]
+fn ls_nonflip_crash_child() {
+    let Ok(p) = std::env::var("FE_LS_NF_PATH") else {
+        return;
+    };
+    let path = std::path::PathBuf::from(p);
+    let dir = path.parent().unwrap().to_path_buf();
+    let _ = std::fs::create_dir_all(&dir);
+    older_store(&path, 1_000);
+    super::journal::set_compact_threshold(4 << 10);
+    super::store::LINKS_FILL_PAUSE_MS.store(1_000, Ordering::Release);
+    let db = open(&path);
+    db.branch_wait_name_filter();
+    let trunk = db.connect().unwrap();
+    let mut k = 0;
+    while !db.branches.past_hard_limit_for_test() && k < 20_000 {
+        let _ = trunk.fork_branch().unwrap().into_id();
+        k += 1;
+    }
+    let peak = log_bytes(&path);
+    for _ in 0..200 {
+        let _ = trunk.fork_branch().unwrap().into_id();
+    }
+    // The checkpoints the creates started, installed (a fuzzy one waited for; the fill is not joined).
+    let t = std::time::Instant::now();
+    while log_bytes(&path) >= peak && t.elapsed() < std::time::Duration::from_secs(30) {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    println!("LS-NFCUT past={} meta={} peak={peak} log={}", u64::from(db.branches.past_hard_limit_for_test()), meta_version(&path), log_bytes(&path));
+    std::process::exit(0);
+}
+
+/// h1gap-rev-c HIGH-2 (ruling 62c11ec63d): a process that crashes after a NON-FLIP cut (past the hard
+/// limit, the log cut, the store kept at 19 with its fill incomplete) and before the flip reopens with
+/// every row's links right (0 wrong by the independent oracle) at 21, under this build directly, and after
+/// an older build's sessions in between. Premises: the crashed process cut its log and stayed at 19.
+/// Mutant `l4_flip_without_fill` (a checkpoint flips with its fill incomplete) must fail it.
+#[test]
+fn a_crash_between_a_non_flip_cut_and_the_flip_reopens_with_every_link_right() {
+    if in_child() {
+        return;
+    }
+    for older in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("nf.db");
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["branch::links_sessions_tests::ls_nonflip_crash_child", "--exact", "--test-threads=1", "--nocapture"])
+            .env("FE_LS_NF_PATH", &path)
+            .env_remove("FE_LS_CHILD")
+            .output()
+            .unwrap();
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        let r = readings(&text, "LS-NFCUT ");
+        assert_eq!(r.len(), 1, "premise: the crashed process reported:\n{text}");
+        let (meta, peak, log) = (r[0][1], r[0][2], r[0][3]);
+        assert!(log < peak, "older={older}: premise: the crashed process's log was not cut ({log} B, peak {peak} B)");
+        assert_eq!(meta, 19, "older={older}: the store flipped before its fill was complete (meta {meta} at the crash)");
+        if older {
+            super::journal::CREATE_LEGACY.with(|c| c.set(true));
+            super::journal::LEGACY_FACTS.with(|c| c.set(true));
+            {
+                let db = open(&path);
+                db.branch_wait_name_filter();
+                let trunk = db.connect().unwrap();
+                for _ in 0..30 {
+                    let _ = trunk.fork_branch().unwrap().into_id();
+                }
+                db.branch_compact_now().unwrap();
+                db.branch_checkpoint_wait();
+            }
+            super::journal::CREATE_LEGACY.with(|c| c.set(false));
+            super::journal::LEGACY_FACTS.with(|c| c.set(false));
+        }
+        {
+            let db = open(&path);
+            db.branch_wait_name_filter();
+            db.branch_compact_now().unwrap();
+            db.branch_checkpoint_wait();
+        }
+        let (rows, wrong) = ls_wrong_links(&path).unwrap_or((0, 9999));
+        println!("LS non-flip crash: older={older} meta={} rows={rows} wrong={wrong}", meta_version(&path));
+        assert!(rows > 1_000, "older={older}: premise: the rows are there ({rows})");
+        assert_eq!(meta_version(&path), 21, "older={older}: the store did not upgrade after the crash");
+        assert_eq!(wrong, 0, "older={older}: {wrong} of {rows} rows have wrong links after a crash between a non-flip cut and the flip");
+    }
+}
