@@ -28,6 +28,10 @@ dolt_quiet_root() {
   export DOLT_ROOT_PATH="$1" DOLT_DISABLE_EVENT_FLUSH=1
 }
 
+# file_size FILE -> its size in bytes, on Linux and macOS alike (GNU stat -c %s is Linux-only: macOS's stat refused it,
+# so dolt.sh's and doltgres.sh's seeds failed there); a missing file prints nothing and returns non-zero
+file_size() { local n; n=$(wc -c <"$1") || return 1; echo "${n//[[:space:]]/}"; }
+
 require_noindex() {
   case "$1" in
     /*.noindex|/*.noindex/*) ;;

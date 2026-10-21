@@ -174,68 +174,25 @@ task_check() {
 }
 
 # ---- the untraced TIMED run and its tracer record (lead review 62430d8bf..b49fb656a MED 4; gate-6 review, item 2)
-# proc_tree PID -> appends PID and every live descendant to the array TREE, builtins only: each task's
-# /proc/PID/task/TID/children (no ps, no fork), so it can run every 0.05 s beside a timed run.
-proc_tree() {
-  local p=$1 t c
-  local -a kids
-  [ -d "/proc/$p" ] || return 0
-  TREE+=("$p")
-  for t in /proc/"$p"/task/*; do
-    kids=()
-    { read -r -a kids <"$t/children"; } 2>/dev/null || true
-    for c in ${kids[@]+"${kids[@]}"}; do proc_tree "$c"; done
-  done
-}
-# tracer_sweep PHASE CMDPID SRVPID -> one "TRACED PHASE ROLE pid tid tracerpid" line per traced task of the command's
-# tree (role cmd) and the server's (role srv; empty: none), then "SWEEP PHASE <EPOCHREALTIME> cmd=N:MAX srv=N:MAX"
-# (tasks read, largest TracerPid). Builtins only.
-tracer_sweep() {
-  local ph=$1 role pid p t k v n m out=""
-  for role in cmd srv; do
-    if [ "$role" = cmd ]; then pid=$2; else pid=$3; fi
-    n=0 m=0
-    TREE=()
-    [ -n "$pid" ] && proc_tree "$pid"
-    for p in ${TREE[@]+"${TREE[@]}"}; do
-      for t in /proc/"$p"/task/*; do
-        [ -e "$t" ] || continue
-        v=""
-        while read -r k v _; do [ "$k" = TracerPid: ] && break; v=""; done 2>/dev/null <"$t/status"
-        [ -n "$v" ] || continue  # the task exited between the listing and the read
-        n=$((n + 1))
-        if [ "$v" != 0 ]; then
-          echo "TRACED $ph $role $p ${t##*/} $v"
-          if [[ $v =~ ^[0-9]+$ ]]; then [ "$v" -gt "$m" ] && m=$v; else m=1; fi  # non-numeric still marks it
-        fi
-      done
-    done
-    out+=" $role=$n:$m"
-  done
-  echo "SWEEP $ph $EPOCHREALTIME$out"
-}
+# The sweeper is the shared one (the lead's ruling on comp review 1 MED 12: the same instrument in every timed run,
+# ours included): gates/sweeper.sh, sourced here; its record is read by gates/sweeper_record.py.
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../gates/sweeper.sh"
 # timed_run OUT SERVERPID -- CMD...: the UNTRACED timed run (PREREG :173). CMD runs with no strace anywhere; its whole
-# process tree and the server's (SERVERPID; empty for the embedded B1) are swept for TracerPid at the start, every
-# 0.05 s while CMD lives (a FIFO read with a timeout sleeps without a fork), and at the end, APPENDED to OUT.tracer.tsv
-# under a "roles" header (no sample ever replaces another); CMD's output goes to OUT.txt, its exit status to OUT.rc.
+# process tree and the server's (SERVERPID; empty for the embedded B1) are swept for TracerPid by gates/sweeper.sh
+# (at the start, every 0.1 s while CMD lives, and at the end, APPENDED to OUT.tracer.tsv under its "roles" and
+# "sweeper" headers: no sample ever replaces another); CMD's output goes to OUT.txt, its exit status to OUT.rc.
 # timedrun.py check refuses the cell on any TracerPid, a gap over 0.25 s, no sweep before the measured window or after
-# it, a role swept empty, or a kernel without /proc/*/task/*/children (tree=none: the trees could not be walked).
+# it, a role swept empty, a kernel without /proc/*/task/*/children (tree=none: the trees could not be walked), or a
+# sweeper record without its nice 19 and per-sweep CPU (comp review 1 MED 12: timed.json sweeper_cpu_s).
 timed_run() {
-  local out=$1 spid=$2 rc=0 pid slp="" tree=children
+  local out=$1 spid=$2 rc=0 pid
   shift 3
-  [ -r "/proc/$BASHPID/task/$BASHPID/children" ] || tree=none
   "$@" >"$out.txt" 2>&1 &
   pid=$!
   sleep 0.2  # let CMD's own process (under its `timeout` wrapper) start, so the start sweep sees it
-  if mkfifo "$out.slp" 2>/dev/null; then exec {slp}<>"$out.slp"; rm -f "$out.slp"; fi
-  { echo "roles cmd=$pid srv=${spid:-none} tree=$tree"; tracer_sweep start "$pid" "$spid"; } >"$out.tracer.tsv"
-  while kill -0 "$pid" 2>/dev/null; do
-    tracer_sweep mid "$pid" "$spid" >>"$out.tracer.tsv"
-    if [ -n "$slp" ]; then read -r -t 0.05 -u "$slp" _ 2>/dev/null || true; else sleep 0.05; fi
-  done
+  sweeper_start "$out" "$pid" "$spid"
   wait "$pid" || rc=$?
-  tracer_sweep end "" "$spid" >>"$out.tracer.tsv"
-  [ -n "$slp" ] && exec {slp}>&-
+  sweeper_wait
   echo "$rc" >"$out.rc"
   cat "$out.txt"
   return $rc
