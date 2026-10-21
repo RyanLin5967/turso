@@ -859,6 +859,9 @@ fn ls_kill_resume_child() {
         super::journal::CREATE_LEGACY.with(|c| c.set(false));
         super::journal::LEGACY_FACTS.with(|c| c.set(false));
         let gen1 = ls_cat(&path).meta().unwrap().map_or(9999, |m| m.generation);
+        // h1-rev-72bfb0127 HIGH-1 (observing here; asserted by its own test): the cursor's generation after the
+        // older build's checkpoint.
+        let cursor_gen1 = ls_first(&ls_cat(&path), "SELECT generation FROM link_fill");
         {
             let db = open(&path);
             db.branch_wait_name_filter();
@@ -867,7 +870,7 @@ fn ls_kill_resume_child() {
         }
         let (rows, wrong) = ls_wrong_links(&path).unwrap_or((0, 9999));
         println!(
-            "LS-KILL k={k} killed={} killed_meta={killed_meta} cursor_gen={cursor_gen} cursor_done={cursor_done} gen0={gen0} gen1={gen1} meta={} rows={rows} wrong={wrong}",
+            "LS-KILL k={k} killed={} killed_meta={killed_meta} cursor_gen={cursor_gen} cursor_done={cursor_done} gen0={gen0} gen1={gen1} meta={} rows={rows} wrong={wrong} cursor_gen1={cursor_gen1}",
             u64::from(killed),
             meta_version(&path)
         );
@@ -899,6 +902,28 @@ fn a_fill_killed_between_batches_and_resumed_after_an_older_builds_checkpoint_li
         assert!(rows > 1_000, "k={k}: premise: the rows are there ({rows})");
         assert_eq!(meta, 21, "k={k}: the store did not upgrade");
         assert_eq!(wrong, 0, "k={k}: {wrong} of {rows} rows have wrong links after the resume (a cursor resumed across a checkpoint that changed rows behind it)");
+    }
+}
+
+
+/// h1-rev-72bfb0127 HIGH-1: the older build stood in for (`CREATE_LEGACY` with `LEGACY_FACTS`: a 19 writer)
+/// must checkpoint as a real 19 build does, which knows nothing of the fill: its checkpoint neither relinks
+/// nor carries the fill's cursor to its new generation, so the cursor it leaves is of the generation before
+/// it, and this build refills (the MED-2 red's older session, read after it). At 72bfb0127 the stand-in ran
+/// this build's non-flip relink and carry, so MED-2's red no longer killed `l4_fill_generation_ignored`.
+#[test]
+fn an_older_builds_checkpoint_does_not_carry_the_fill_cursor() {
+    if in_child() {
+        return;
+    }
+    let text = child("ls_kill_resume_child", &[]);
+    let r = readings(&text, "LS-KILL ");
+    assert_eq!(r.len(), 3, "premise: three arms ran:\n{text}");
+    for v in &r {
+        let (k, cgen, gen0, gen1, cgen1) = (v[0], v[3], v[5], v[6], v[10]);
+        assert_eq!(cgen, gen0, "k={k}: premise: the cursor is of the killed store's generation");
+        assert!(gen1 > gen0, "k={k}: premise: the older build's checkpoint moved the generation ({gen0} -> {gen1})");
+        assert_eq!(cgen1, cgen, "k={k}: the older build's checkpoint carried the fill cursor to its generation ({cgen} -> {cgen1}, catalog {gen1})");
     }
 }
 
