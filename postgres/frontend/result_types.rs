@@ -3061,6 +3061,9 @@ fn folded_probe(node: &PgNode) -> Option<String> {
                     && c.arg.as_deref().is_some_and(|a| pure(a, params))
             }
             Node::CoalesceExpr(c) => all(&c.args, params),
+            // ARRAY[$1] folds too, so an element past a varchar(n)[] column's length is 22001 at
+            // Bind (wire-rev-4a1934c89-beb4 LOW-2: it was left to Execute).
+            Node::AArrayExpr(a) => all(&a.elements, params),
             // A CASE, a boolean combination and a NULL test over pure parts fold too
             // (wire-rev-351702a43 LOW-2: a CASE was left to Execute).
             Node::CaseExpr(c) => {

@@ -4637,7 +4637,16 @@ impl ExtendedQueryHandler for Session {
                 .map_err(PgWireError::UserError)?;
             if params.len() == portal.parameters.len() {
                 portal.statement.statement.check_fixed_params(&params).map_err(PgWireError::UserError)?;
-                decode_portal_parameters(&portal, &params)?;
+                // The values are read first, as PostgreSQL's input functions read them ('1e2147483647'
+                // overflows numeric's format before any typmod); a value the engine cannot hold
+                // (0A000: an array with a dimension decoration or nested braces) is refused only
+                // after the assignments are judged, as PostgreSQL reads those arrays and refuses a
+                // too-long element 22001 (wire-rev-4a1934c89-beb4 LOW-2).
+                let deferred = match decode_portal_parameters(&portal, &params) {
+                    Ok(_) => None,
+                    Err(PgWireError::UserError(info)) if info.code == kind_code(SqlErrorKind::FeatureNotSupported) => Some(PgWireError::UserError(info)),
+                    Err(e) => return Err(e),
+                };
                 // A custom plan coerces each assignment at Bind; PostgreSQL 18.6 plans a
                 // statement, the unnamed one included, custom for its first five plans, then
                 // generic, which coerces at Execute (wire-rev-629f4b926 MED-2, the probe's #50-#57;
@@ -4651,6 +4660,9 @@ impl ExtendedQueryHandler for Session {
                         let conn = self.current(&mut self.state()).map_err(PgWireError::UserError)?;
                         check_assignments(&conn, &portal, &params, &assignments)?;
                     }
+                }
+                if let Some(e) = deferred {
+                    return Err(e);
                 }
                 portal.statement.statement.count_plan();
             }
@@ -5864,7 +5876,17 @@ fn check_assignments(
 /// NULL element None; None for text this does not read: a dimension decoration (`[1:2]={...}`), an
 /// unbalanced brace or quote, or anything outside the braces.
 fn array_text_elements(text: &str) -> Option<Vec<Option<String>>> {
-    let t = text.trim();
+    let mut t = text.trim();
+    // A dimension decoration ('[1:1]={abcd}') is read past, as array_in reads it: the elements
+    // are judged alike (wire-rev-4a1934c89-beb4 LOW-2: it was left to Execute, 0A000).
+    if t.starts_with('[') {
+        let eq = t.find('=')?;
+        let dims = &t[..eq];
+        if !dims.bytes().all(|b| b.is_ascii_digit() || matches!(b, b'[' | b']' | b':' | b'-' | b' ')) {
+            return None;
+        }
+        t = t[eq + 1..].trim_start();
+    }
     if !t.starts_with('{') {
         return None;
     }
@@ -5898,17 +5920,37 @@ fn array_text_elements(text: &str) -> Option<Vec<Option<String>>> {
                 }
                 out.push(Some(e));
             }
+            // An unquoted element: a backslash takes the next character as it is, anywhere (array_in;
+            // wire-rev-4a1934c89-beb4 LOW-1: '{a\b\c}' is abc and '{ab\,c}' the one element
+            // 'ab,c'), its trailing blanks are dropped unless escaped, and a quote inside it is
+            // malformed (left to the engine's reading). NULL is a null only unescaped.
             c => {
-                let mut e = String::from(c);
-                while let Some(&n) = chars.peek() {
-                    if matches!(n, ',' | '}' | '{' | '"') {
-                        break;
+                let mut e = String::new();
+                let mut keep = 0usize;
+                let mut escaped = false;
+                let mut next = Some(c);
+                while let Some(ch) = next {
+                    match ch {
+                        '\\' => {
+                            e.push(chars.next()?);
+                            keep = e.len();
+                            escaped = true;
+                        }
+                        '"' => return None,
+                        ch => {
+                            e.push(ch);
+                            if !ch.is_whitespace() {
+                                keep = e.len();
+                            }
+                        }
                     }
-                    e.push(n);
-                    chars.next();
+                    next = match chars.peek() {
+                        Some(&n) if !matches!(n, ',' | '}' | '{') => chars.next(),
+                        _ => None,
+                    };
                 }
-                let e = e.trim_end().to_string();
-                out.push(if e.eq_ignore_ascii_case("null") { None } else { Some(e) });
+                e.truncate(keep);
+                out.push(if !escaped && e.eq_ignore_ascii_case("null") { None } else { Some(e) });
             }
         }
     }
