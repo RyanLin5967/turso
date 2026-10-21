@@ -392,8 +392,9 @@ fn ls_hard_limit_child() {
     super::store::LINKS_FILL_PAUSE_MS.store(0, Ordering::Release);
 }
 
-/// Past the hard log limit, a checkpoint does not wait for a fill that has not finished: it
-/// finishes the fill on the writer, so the store upgrades and the log is cut within the session.
+/// Past the hard log limit, a checkpoint does not wait for a fill that has not finished: the log is cut
+/// within the session. FLAGGED spec change, lead ruling 62c11ec63d (h1gap-rev-c HIGH-2, the non-flip cut), as authority: the cut keeps the store at its version (19) while the fill is incomplete,
+/// where it used to finish the fill and flip (an O(N) stall of every create); the flip waits for the fill.
 #[test]
 fn past_the_hard_log_limit_the_upgrade_does_not_wait_for_the_fill() {
     if in_child() {
@@ -403,7 +404,8 @@ fn past_the_hard_log_limit_the_upgrade_does_not_wait_for_the_fill() {
     let r = readings(&text, "LS-HARD ");
     let (meta, log, peak) = (r[0][0], r[0][1], r[0][2]);
     println!("LS hard limit: meta {meta}, log {log}, peak {peak}, busy WAL truncations {}", r[0][3]);
-    assert!(meta >= 21, "past the hard limit the store still waited for its stalled fill: meta {meta}, log peak {peak} B");
+    assert!(log < peak, "past the hard limit the log was not cut while the fill stalled: {log} B at the end, {peak} B at its peak");
+    assert_eq!(meta, 19, "the store flipped with its stalled fill incomplete (meta {meta})");
 }
 
 // ---- past the hard limit, a fill starved of the store mutex (links H1 reopened) ----
@@ -445,16 +447,18 @@ fn ls_fill_starved_child() {
     // the hold is let go can count): a checkpoint the operations started runs on a thread of its own,
     // so the meta row is polled for it (wall time only bounds the wait). Then the hold is let go, and
     // only then waited on: checkpoint_wait joins the fill thread, which a hold in place never ends.
+    // (Ruling 62c11ec63d: what is polled is the log's cut; the meta row is read once it is.)
     let t = std::time::Instant::now();
-    let mut meta = try_meta_version(&path).unwrap_or(0);
-    while meta < 21 && t.elapsed() < std::time::Duration::from_secs(60) {
+    let mut log_held = log_bytes(&path);
+    while log_held >= peak && t.elapsed() < std::time::Duration::from_secs(60) {
         std::thread::sleep(std::time::Duration::from_millis(20));
-        meta = try_meta_version(&path).unwrap_or(meta);
+        log_held = log_bytes(&path);
     }
+    let meta = try_meta_version(&path).unwrap_or(0);
     super::store::LINKS_FILL_HOLD_UNRECORDED.store(false, Ordering::Release);
     db.branch_checkpoint_wait();
     super::store::LINKS_FILL_COLUMNS_IN_BATCH.store(false, Ordering::Release);
-    println!("LS-STARVED past={} held={held} creates={k} meta={meta} log={} peak={peak}", u64::from(past), log_bytes(&path));
+    println!("LS-STARVED past={} held={held} creates={k} meta={meta} log={log_held} peak={peak}", u64::from(past));
 }
 
 /// Links H1 reopened (core-integrator, red alone 6/6 at 91c0ea8d2; diagnostic 3: 405 checks past the
@@ -473,7 +477,10 @@ fn past_the_hard_log_limit_a_fill_batch_starved_of_the_store_mutex_does_not_hold
     println!("LS starved: past {past}, held {held}, meta {meta}, peak {peak}");
     assert_eq!(past, 1, "premise: the log never passed the hard limit (peak {peak} B)");
     assert!(held >= 1, "premise: no fill batch committed and was held");
-    assert!(meta >= 21, "past the hard limit the upgrade waited for a fill batch it could not see: meta {meta}, log peak {peak} B");
+    // FLAGGED spec change, lead ruling 62c11ec63d (h1gap-rev-c HIGH-2, the non-flip cut), as authority: the claim is the log's cut while the batch is held, the store kept at 19.
+    let log_held = r[0][4];
+    assert!(log_held < peak, "past the hard limit the log was not cut while a fill batch was held: {log_held} B, peak {peak} B");
+    assert_eq!(meta, 19, "the store flipped with its fill incomplete (meta {meta})");
 }
 
 #[test]
@@ -508,15 +515,17 @@ fn ls_fill_entry_starved_child() {
     // Read before the hold is let go: what the 50 operations started with the fill held. A checkpoint
     // they started runs on a thread of its own, so the meta row is polled for it (wall time only bounds
     // the wait; a fill that held the upgrade never gets there).
+    // (Ruling 62c11ec63d: what is polled is the log's cut; the meta row is read once it is.)
     let t = std::time::Instant::now();
-    let mut meta_held = try_meta_version(&path).unwrap_or(0);
-    while meta_held < 21 && t.elapsed() < std::time::Duration::from_secs(60) {
+    let mut log_held = log_bytes(&path);
+    while log_held >= peak && t.elapsed() < std::time::Duration::from_secs(60) {
         std::thread::sleep(std::time::Duration::from_millis(20));
-        meta_held = try_meta_version(&path).unwrap_or(meta_held);
+        log_held = log_bytes(&path);
     }
+    let meta_held = try_meta_version(&path).unwrap_or(0);
     super::store::LINKS_FILL_HOLD_AT_ENTRY.store(false, Ordering::Release);
     db.branch_checkpoint_wait();
-    println!("LS-ENTRY past={} held={held} creates={k} meta_held={meta_held} meta={} peak={peak}", u64::from(past), meta_version(&path));
+    println!("LS-ENTRY past={} held={held} creates={k} meta_held={meta_held} meta={} peak={peak} log_held={log_held}", u64::from(past), meta_version(&path));
 }
 
 /// l4-rev-h1 MED-3: past the hard log limit, a fill held at its start, before it first takes the store
@@ -533,7 +542,10 @@ fn past_the_hard_log_limit_a_fill_starved_at_its_start_does_not_hold_the_upgrade
     println!("LS entry-starved: past {past}, held {held}, meta while held {meta_held}, peak {peak}");
     assert_eq!(past, 1, "premise: the log never passed the hard limit (peak {peak} B)");
     assert!(held >= 1, "premise: no fill thread reached its start and was held");
-    assert!(meta_held >= 21, "past the hard limit the upgrade waited for a fill held at its start: meta {meta_held}, log peak {peak} B");
+    // FLAGGED spec change, lead ruling 62c11ec63d (h1gap-rev-c HIGH-2, the non-flip cut), as authority: the claim is the log's cut while the fill is held, the store kept at 19.
+    let log_held = r[0][6];
+    assert!(log_held < peak, "past the hard limit the log was not cut while the fill was held at its start: {log_held} B, peak {peak} B");
+    assert_eq!(meta_held, 19, "the store flipped with its fill incomplete (meta {meta_held})");
 }
 
 // ---- lead ruling LOW 4: a stopped fill makes no columns ----
