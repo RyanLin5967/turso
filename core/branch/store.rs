@@ -6372,7 +6372,7 @@ impl BranchStore {
         let fill = self.links_fill.lock().take();
         if let Some(handle) = fill {
             if handle.join().is_err() {
-                tracing::warn!("the branch catalog's link fill thread panicked");
+                self.fill_panicked();
             }
         }
         // L1: another caller took the join handle: wait for the fill it joins to end (bounded
@@ -6391,11 +6391,25 @@ impl BranchStore {
         }
     }
 
+    /// h1gap-rev-c MED-1: the joined fill thread panicked, so nothing cleared `filling`: the joiner clears
+    /// it, so a panic is an exit like any other (L1's wait loop and every later checkpoint go on).
+    /// Mutant `l4_fill_panic_left_filling` (test builds only): left set, as before.
+    fn fill_panicked(&self) {
+        tracing::warn!("the branch catalog's link fill thread panicked");
+        if fe_mutant("l4_fill_panic_left_filling") {
+            return;
+        }
+        if let Some(cat) = self.inner.lock().cat.as_mut() {
+            cat.filling = false;
+            cat.links_fill_stop.store(true, Ordering::Release);
+        }
+    }
+
     fn join_flights(&self) {
         let fill = self.links_fill.lock().take();
         if let Some(handle) = fill {
             if handle.join().is_err() {
-                tracing::warn!("the branch catalog's link fill thread panicked");
+                self.fill_panicked();
             }
         }
         let handles = std::mem::take(&mut *self.flights.lock());
