@@ -3327,6 +3327,13 @@ impl ArmedHold {
         self.value.load(order)
     }
 
+    /// Store side: released (0) if it is set for the store `owner` opened.
+    fn release_for(&self, owner: u64) {
+        if self.by.load(std::sync::atomic::Ordering::Acquire) == owner {
+            self.value.store(0, std::sync::atomic::Ordering::Release);
+        }
+    }
+
     /// Store side: the stage set for the store `owner` opened (0 if set for another's).
     fn value_for(&self, owner: u64) -> u8 {
         if self.by.load(std::sync::atomic::Ordering::Acquire) == owner {
@@ -11617,6 +11624,17 @@ impl StoreCore {
         }
         // The name filter's build holds the store's files too: stopped, then joined.
         self.name_filter_stop.store(true, Ordering::Release);
+        // Test builds: a store closed by an unwind (a test whose claim failed while it held its
+        // name-filter thread at a hold) lets the thread go, or the join below waits for ever and
+        // the failure never reports (the mutant sweep's filter_lies_growing ran to its 7200 s
+        // timeout: its test's CLAIM failed with the growth paused). A close that is not unwinding
+        // keeps every hold, which some tests close across on purpose.
+        #[cfg(test)]
+        if std::thread::panicking() {
+            for hold in [&NAME_SCAN_HOLD, &BUILD_SEED_HOLD, &FILTER_PAUSE_AT] {
+                hold.release_for(self.inner.opened_by);
+            }
+        }
         self.wait_name_filter();
         // LEAP L1's threads (ASYNC-DESIGN §11 step 7, Drop item 3): stopped, then joined, a pass
         // in progress first finishing and letting the state go, except in a fork(2) child and on
