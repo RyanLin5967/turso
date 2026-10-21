@@ -613,8 +613,10 @@ mod tests {
     /// live bytes under its used ones; FLAGGED premise repair: it first read "live 0", which cannot hold once
     /// the fix moves the 8 kept names into each new filling chunk, measured at 7525131c7 on iccad6). A release
     /// never evacuates the filling chunk, so once filling moves on such a chunk was never freed: held bytes
-    /// grew with the cycles. Bound: at most twice the live bytes plus
-    /// two chunks, checked every 1,000 cycles and at the end of 10^5; the 8 long-lived names resolve.
+    /// grew with the cycles. Bound (`assert_bounded`; FLAGGED, restated per budgets-rev-nm-cb67 LOW-2 from
+    /// "twice the live bytes plus two chunks", which half-live chunks with tail slack exceed): dead bytes at
+    /// most the live bytes plus one chunk, and held bytes at most the derived worst case; checked every
+    /// 1,000 cycles and at the end of 10^5; the 8 long-lived names resolve.
     #[test]
     fn churn_at_a_constant_live_count_keeps_the_arena_bounded() {
         let mut m = NameMirror::default();
@@ -630,13 +632,11 @@ mod tests {
                 dead_while_filling |= m.live[c] < m.used[c];
             }
             if i % 1_000 == 999 {
-                let (held, live) = m.arena_bytes();
-                assert!(held <= 2 * live + 2 * CHUNK, "cycle {i}: the arena holds {held} B for {live} live B");
+                assert_bounded(&m, &format!("cycle {i}"));
             }
         }
         assert!(dead_while_filling, "premise: the filling chunk never held a dead name while filling");
-        let (held, live) = m.arena_bytes();
-        assert!(held <= 2 * live + 2 * CHUNK, "after 10^5 cycles the arena holds {held} B for {live} live B");
+        assert_bounded(&m, "after 10^5 cycles");
         for k in 0..8u64 {
             assert_eq!(m.get(&format!("kept-{k}")), Some(BranchId(k)), "kept-{k} lost");
         }
@@ -647,7 +647,8 @@ mod tests {
     /// evacuated, so the held bytes per live byte reach 2 x CHUNK / (CHUNK - 256), not 2. Built: 64
     /// chunks of 3,840 used bytes (one 255-byte name, one 126-byte, 27 of 127), then every chunk's
     /// 255- and 126-byte names and 12 of its 127-byte ones removed (premises asserted: 64 chunks, none
-    /// evacuated, each exactly half live). The bound is the one the churn test claims.
+    /// evacuated, each exactly half live). The bound is the one the churn test claims (`assert_bounded`;
+    /// FLAGGED: this test first asserted the old 2*live + 2 chunks, red at f820ad8ba).
     #[test]
     fn half_live_chunks_with_tail_slack_stay_within_the_bound() {
         let named = |tag: String, len: usize| format!("{tag}{}", "x".repeat(len - tag.len()));
@@ -672,8 +673,20 @@ mod tests {
         for &c in &held_chunks {
             assert_eq!((m.used[c], m.live[c]), (3_840, 1_920), "premise: chunk {c} is exactly half live");
         }
+        assert_bounded(&m, "64 half-live chunks");
+    }
+
+    /// The arena's bound, from the policy: a chunk other than the filling one is kept only while
+    /// 2 x live >= used, so the dead bytes are at most the live bytes plus the filling chunk; and it
+    /// stopped filling when a name of at most 257 encoded bytes (the store's 255-byte limit) did not
+    /// fit, so used >= CHUNK - 256, and each held chunk costs at most 2 x CHUNK / (CHUNK - 256) per
+    /// live byte (about 2.13), plus the filling chunk.
+    fn assert_bounded(m: &NameMirror, at: &str) {
         let (held, live) = m.arena_bytes();
-        assert!(held <= 2 * live + 2 * CHUNK, "the arena holds {held} B for {live} live B");
+        let dead = m.used.iter().map(|&u| usize::from(u)).sum::<usize>() - live;
+        assert!(dead <= live + CHUNK, "{at}: the arena keeps {dead} dead B for {live} live B");
+        let worst = 2 * live * CHUNK / (CHUNK - 256) + CHUNK;
+        assert!(held <= worst, "{at}: the arena holds {held} B for {live} live B (worst case {worst})");
     }
 
     #[test]
