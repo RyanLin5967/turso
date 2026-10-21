@@ -1583,6 +1583,14 @@ fn ls_fill_live_child() {
     let empty = super::store::LINKS_FILL_EMPTY_SPAWNS.load(Ordering::Acquire) - e0;
     let batches = super::store::LINKS_FILL_HELD_BATCHES.load(Ordering::Acquire) - b0;
     let per_create = grown / grown_creates.max(1);
+    // Completed, the flip and the links: the flip's checkpoint, then the independent oracle (FLAGGED stricter: a
+    // fill that completes early must still leave every row's links right).
+    db.branch_compact_now().unwrap();
+    db.branch_checkpoint_wait();
+    drop(trunk);
+    drop(db);
+    let (rows, wrong) = ls_wrong_links(&path).unwrap_or((0, 9999));
+    println!("LS-LIVE-LINKS meta={} rows={rows} wrong={wrong}", meta_version(&path));
     println!(
         "LS-LIVE-DEFER by_batches={} by_log={} b_sum={}",
         super::store::DEFER_RELEASES[0].load(Ordering::Acquire),
@@ -1619,6 +1627,10 @@ fn under_sustained_creates_the_fill_completes() {
         assert!(cuts >= 2, "{rows} rows: premise: the log was cut {cuts} time(s) under {creates} creates");
         assert!(starts >= 2, "{rows} rows: premise: the fill was started {starts} time(s)");
         assert_eq!(prefilled, 1, "{rows} rows: under {creates} sustained creates the fill never completed ({batches} batches over {cuts} hard-limit cycles, K = {k} creates each)");
+        let l = readings(&text, "LS-LIVE-LINKS ");
+        let (meta, all, wrong) = (l[0][0], l[0][1], l[0][2]);
+        assert_eq!(meta, 21, "{rows} rows: the completed store did not flip (meta {meta})");
+        assert_eq!(wrong, 0, "{rows} rows: {wrong} of {all} rows have wrong links after a fill completed under sustained creates");
     }
 }
 
