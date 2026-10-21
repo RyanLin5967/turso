@@ -272,6 +272,17 @@ impl Dialect for PostgresDialect {
         Ok(encode_pg_schema_sql(input))
     }
 
+    // A rewritten row (a RENAME's rebuilt CREATE) is canonical SQLite text, never the client's DDL:
+    // stored in the ALTERed form, which reads back as SQLite with its key NOT NULL. The default
+    // stored it through format_table_sql, marked as PostgreSQL text, and the next open could not
+    // parse its STRICT (core-integrator, integration base beb4d169f).
+    fn format_rewritten_table_sql(&self, stmt: &turso_parser::ast::Stmt) -> Result<String> {
+        if !matches!(stmt, turso_parser::ast::Stmt::CreateTable { .. }) {
+            return Err(LimboError::InternalError("format_rewritten_table_sql requires CREATE TABLE".to_string()));
+        }
+        Ok(format!("{STORED_PG_ALTERED_PREFIX}{stmt}"))
+    }
+
     fn format_altered_table_sql(&self, table: &BTreeTable) -> Result<String> {
         // Only this frontend's own tables carry the NOT NULL key (`parse_table_sql`); a table an
         // internal SQLite path wrote keeps its plain text.
