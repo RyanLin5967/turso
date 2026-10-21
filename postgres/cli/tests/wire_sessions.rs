@@ -17088,6 +17088,39 @@ fn and_and_or_are_simplified_as_postgresql_simplifies_them() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-1de981755-rest MED-5 (its PG 18.6 probe3 #2, #6, #9, #14-#16): a varchar(n) cast read through a view or a
+/// derived table is a string column: PG announces 1043 and writes 'abc' in text and binary. adafc938f's cut is a
+/// substr() call, whose view and derived-table column the engine typed bytea (17), refused in binary 0A000. The
+/// announced type of a varchar cast is the known text (25) divergence, so 25 or PG's 1043 is taken; never 17.
+#[test]
+fn a_varchar_cast_through_a_view_or_derived_table_is_a_string_column() {
+    let dir = Scratch::new("cut-view");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE VIEW v2 AS SELECT 'abcdef'::varchar(3) AS a",
+        "CREATE TABLE src(t text)",
+        "INSERT INTO src VALUES ('abcdef')",
+        "CREATE VIEW v5 AS SELECT t::varchar(3) AS a FROM src",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    for sql in ["SELECT a FROM v2", "SELECT a FROM (SELECT 'abcdef'::varchar(3) AS a) s", "SELECT a FROM v5"] {
+        let r = a.q(sql);
+        let typed = matches!(r.oids.as_deref(), Some([1043] | [25]));
+        if r.error.is_some() || !typed || r.rows != vec![vec![Some("abc".to_string())]] {
+            wrong.push(format!("{sql}: PG 1043 'abc'; got {:?} {:?} {:?}", r.oids, r.rows, r.error));
+        }
+    }
+    let r = a.x_binary("SELECT a FROM v2");
+    let typed = matches!(r.oids.as_deref(), Some([1043] | [25]));
+    if r.error.is_some() || !typed || r.rows != vec![vec![Some("abc".to_string())]] {
+        wrong.push(format!("binary SELECT a FROM v2: PG 1043 0x616263; got {:?} {:?} {:?}", r.oids, r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-351702a43 LOW-6 (its PG 18.6 probe3 #161): a CASE is typed by its results (an int4 constant and an int4
 /// function: 23); the walk never typed a CASE column, and the engine announced it text (25).
 #[test]
