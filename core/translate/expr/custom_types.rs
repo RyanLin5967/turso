@@ -1599,6 +1599,64 @@ mod tests {
         );
     }
 
+    /// Each `(sql, want, typed)` answers exactly `want` in its first row's first column, typed
+    /// numeric when `typed` (get_column_type_info's declared name).
+    fn exact_numeric_cases(conn: &Arc<crate::Connection>, cases: &[(String, &str, bool)]) -> Vec<String> {
+        let mut wrong = Vec::new();
+        for (sql, want, typed) in cases {
+            let stmt = conn.prepare(sql);
+            let ty = stmt
+                .as_ref()
+                .ok()
+                .and_then(|s| s.get_column_type_info(0).ok().flatten())
+                .map(|i| i.declared_name.to_ascii_lowercase());
+            let got = stmt.and_then(|mut s| s.run_collect_rows()).map(|r| r[0][0].to_string());
+            if got.as_ref().ok().map(String::as_str) != Some(*want) || (*typed && ty.as_deref() != Some("numeric")) {
+                wrong.push(format!("{sql}: {got:?} typed {ty:?}, PostgreSQL 18.6 {want}{}", if *typed { " numeric" } else { "" }));
+            }
+        }
+        wrong
+    }
+
+    /// The NUMERIC class (lead ruling DECISIONS 7ba23121db; wire-rev-1de981755-numeric HIGH 7-9,
+    /// artie c2525c7f45, PostgreSQL 18.6 recordings p8/p9): a numeric value stays exact through any
+    /// expression, not only as a direct column's operand. At c22c78009 a numeric that left its
+    /// operator was plain text and the next operator SQLite's REAL one: 0.30 became
+    /// 0.30000000000000004 through abs, coalesce, a scalar subquery, round and a CTE (p8#71-#76),
+    /// a numeric(30,2) column's sum compared with 0.3 was false (p8#82, #83), 10::numeric / 3 had
+    /// float digits (p8#68), round over a numeric was REAL (p8#88), a numeric's int cast truncated
+    /// (p9#3), and a float's cast to numeric kept 17 digits (p8#84). Literals here are the SQLite
+    /// dialect's (0.20 is REAL); each case writes the numeric operand as PostgreSQL would type it.
+    #[test]
+    fn a_numeric_value_stays_exact_through_any_expression() {
+        let conn = open();
+        conn.execute("CREATE TABLE n(id INTEGER PRIMARY KEY, x numeric(30, 2)) STRICT").unwrap();
+        conn.execute("INSERT INTO n VALUES (1, 0.1), (2, 0.2)").unwrap();
+        let c = "CAST(0.10 AS numeric(5, 2))";
+        let k = |s: &str| s.to_string();
+        let wrong = exact_numeric_cases(
+            &conn,
+            &[
+                (format!("SELECT abs({c}) + CAST(0.20 AS numeric)"), "0.30", true),
+                (format!("SELECT coalesce({c}, 0) + CAST(0.20 AS numeric)"), "0.30", true),
+                (format!("SELECT (SELECT {c}) + CAST(0.20 AS numeric)"), "0.30", true),
+                (format!("SELECT round({c}, 2) * 3"), "0.30", true),
+                (format!("WITH w AS (SELECT {c} AS v) SELECT v + CAST(0.20 AS numeric) FROM w"), "0.30", true),
+                (k("SELECT sum(x) FROM n"), "0.30", true),
+                (k("SELECT sum(x) = CAST(0.3 AS numeric) FROM n"), "1", false),
+                (k("SELECT avg(x) FROM n"), "0.15000000000000000000", true),
+                (k("SELECT count(*) FROM n WHERE x + CAST(0.2 AS numeric) = CAST(0.3 AS numeric)"), "1", false),
+                (k("SELECT CAST(10 AS numeric) / 3"), "3.3333333333333333", true),
+                (k("SELECT round(CAST(1.005 AS numeric), 2)"), "1.01", true),
+                (k("SELECT round(CAST(2.675 AS numeric), 2)"), "2.68", true),
+                (k("SELECT CAST(CAST(2.5 AS numeric) AS integer)"), "3", false),
+                (k("SELECT CAST(CAST(-2.5 AS numeric) AS integer)"), "-3", false),
+                (k("SELECT CAST(0.1e0 + 0.2e0 AS numeric)"), "0.3", true),
+            ],
+        );
+        assert!(wrong.is_empty(), "CLAIM: exact numeric through any expression, as PostgreSQL 18.6: {wrong:#?}");
+    }
+
     /// Engine review 20 LOW 27 (b): 150a70db0's arm, a type whose value input is `any` (numeric)
     /// takes any non-literal constant operand but a COLLATE one, had no test: `x = abs(-1.5)` and
     /// `x = 1 + 1` on numeric(10, 2) find 1.50 and 2.00, through the type's '=', as a scan.
