@@ -617,9 +617,16 @@ fn ls_fill_starved_child() {
     let past = db.branches.past_hard_limit_for_test();
     let held = super::store::LINKS_FILL_HELD_BATCHES.load(Ordering::Acquire);
     // Operations past the hard limit, with the batch still held: each may start the checkpoint.
-    for _ in 0..50 {
+    // FLAGGED spec change, lead ruling 2026-10-21 (option (a), MED-3 RESTATED: a fill starved BEYOND the bound
+    // does not hold the cut): past the hard limit the gate may defer the cut for the fill by at most one more
+    // threshold of log, so the operations go on past that bound (the log at the limit plus 4 KiB, plus 1 KiB of
+    // slack), where the 50 creates stopped inside it.
+    let bound = log_present(&path) + (4 << 10) + 1024;
+    let mut k2 = 0;
+    while log_present(&path) < bound && k2 < 20_000 {
         let _ = trunk.fork_branch().unwrap().into_id();
         peak = peak.max(log_bytes(&path));
+        k2 += 1;
     }
     // Read WHILE the batch is still held (l4-rev-h1's corrected variant: nothing the fill does after
     // the hold is let go can count): a checkpoint the operations started runs on a thread of its own,
@@ -686,9 +693,16 @@ fn ls_fill_entry_starved_child() {
     }
     let past = db.branches.past_hard_limit_for_test();
     let held = super::store::LINKS_FILL_ENTRY_HELD.load(Ordering::Acquire);
-    for _ in 0..50 {
+    // FLAGGED spec change, lead ruling 2026-10-21 (option (a), MED-3 RESTATED: a fill starved BEYOND the bound
+    // does not hold the cut): past the hard limit the gate may defer the cut for the fill by at most one more
+    // threshold of log, so the operations go on past that bound (the log at the limit plus 4 KiB, plus 1 KiB of
+    // slack), where the 50 creates stopped inside it.
+    let bound = log_present(&path) + (4 << 10) + 1024;
+    let mut k2 = 0;
+    while log_present(&path) < bound && k2 < 20_000 {
         let _ = trunk.fork_branch().unwrap().into_id();
         peak = peak.max(log_bytes(&path));
+        k2 += 1;
     }
     // Read before the hold is let go: what the 50 operations started with the fill held. A checkpoint
     // they started runs on a thread of its own, so the meta row is polled for it (wall time only bounds
@@ -1543,7 +1557,8 @@ fn ls_fill_live_child() {
     }
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("l.db");
-    older_store(&path, 1_000);
+    let n: usize = std::env::var("FE_LS_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(1_000);
+    older_store(&path, n);
     super::journal::set_compact_threshold(4 << 10);
     let (e0, b0) = (super::store::LINKS_FILL_EMPTY_SPAWNS.load(Ordering::Acquire), super::store::LINKS_FILL_HELD_BATCHES.load(Ordering::Acquire));
     let db = open(&path);
@@ -1551,8 +1566,8 @@ fn ls_fill_live_child() {
     let trunk = db.connect().unwrap();
     let (mut cuts, mut last, mut grown, mut grown_creates) = (0u64, log_present(&path), 0u64, 0u64);
     let mut creates = 0u64;
-    // Until the fill completes (cuts after it need no fill) or 3,000 creates.
-    while creates < 3_000 && !db.branches.links_fill_state_for_test().1 {
+    // Until the fill completes (cuts after it need no fill) or 60,000 creates.
+    while creates < 60_000 && !db.branches.links_fill_state_for_test().1 {
         let _ = trunk.fork_branch().unwrap().into_id();
         creates += 1;
         let now = log_present(&path);
@@ -1571,30 +1586,85 @@ fn ls_fill_live_child() {
     println!("LS-LIVE creates={creates} cuts={cuts} starts={starts} empty={empty} batches={batches} prefilled={} per_create={per_create}", u64::from(prefilled));
 }
 
-/// Lead ruling 2026-10-21T18:01:45Z (fill LIVENESS): under sustained create load the fill makes bounded
-/// progress. The bound, from the fill's scheduling: past the hard limit the gate stops the fill after the batch
-/// it is in and lets a checkpoint cut; a later threshold starts it again from its cursor. So progress needs
-/// every spawn that is stopped to have committed a batch: one committed batch per hard-limit cycle at least,
-/// a cycle being at most (2 x the threshold) / (log bytes per create) creates, so at least one batch per K such
-/// creates. CLAIM: no spawn is stopped with no batch committed (`LINKS_FILL_EMPTY_SPAWNS` 0), and the batches
-/// are at least the cuts less one, over 3,000 creates. Premises: the log was cut at least twice (the load
-/// crossed the hard limit), the fill was started more than once. Mutant `l4_fill_starved` (500 ms lost before
-/// each batch) must fail it.
+/// Lead ruling 2026-10-21T18:01:45Z (fill LIVENESS), fixed by its option (a) ruling (the bounded deferral). A
+/// cut stopped the fill at once, so it gained about one batch (64 rows) per hard-limit cycle while the catalog
+/// gained the cycle's creates, K = (2 x the threshold) / (log bytes per create), about 195: under sustained
+/// creates the store never upgraded (amendment 30, both kinds). The gate now defers each cut for at most
+/// B = ceil(K / 64) + 1 committed batches (or one more threshold of log), so the fill gains on the catalog
+/// every cycle. CLAIM (FLAGGED spec change of 3440b3aad's red, per that ruling): under sustained creates the fill
+/// completes (prefilled) within 60,000 creates, at 1,000 and at 4,000 rows. Premises: the log was cut at least
+/// twice and the fill started more than once. Mutant `l4_fill_defer_none` (B = 0) and `l4_fill_starved` must
+/// fail it.
 #[test]
-fn under_sustained_creates_every_fill_spawn_commits_a_batch() {
+fn under_sustained_creates_the_fill_completes() {
     if in_child() {
         return;
     }
-    let text = child("ls_fill_live_child", &[]);
-    let r = readings(&text, "LS-LIVE ");
+    for rows in ["1000", "4000"] {
+        let text = child("ls_fill_live_child", &[("FE_LS_ROWS", rows)]);
+        let r = readings(&text, "LS-LIVE ");
+        assert_eq!(r.len(), 1, "premise: the child reported:\n{text}");
+        let (creates, cuts, starts, empty, batches, prefilled, per_create) = (r[0][0], r[0][1], r[0][2], r[0][3], r[0][4], r[0][5], r[0][6]);
+        let k = (2 * (4u64 << 10)) / per_create.max(1);
+        println!("LS live: {rows} rows: creates {creates} cuts {cuts} starts {starts} empty spawns {empty} batches {batches} prefilled {prefilled}; {per_create} B per create, K = {k}");
+        assert!(cuts >= 2, "{rows} rows: premise: the log was cut {cuts} time(s) under {creates} creates");
+        assert!(starts >= 2, "{rows} rows: premise: the fill was started {starts} time(s)");
+        assert_eq!(prefilled, 1, "{rows} rows: under {creates} sustained creates the fill never completed ({batches} batches over {cuts} hard-limit cycles, K = {k} creates each)");
+    }
+}
+
+/// Lead ruling 2026-10-21 (option (a)): the deferral is BOUNDED. A fill that never commits a batch (held at its
+/// start) defers the cut past the hard limit by at most one more threshold of log: the largest log before the
+/// cut is at most the log at the limit plus 4 KiB plus 2 KiB of slack (the creates that land while the cut's
+/// flight runs). Premises: past the hard limit with the fill held, and a cut. Mutant
+/// `l4_fill_waits_past_hard_limit` (the gate waits for the fill, unbounded) must fail it.
+#[test]
+fn ls_defer_bound_child() {
+    if !in_child() {
+        return;
+    }
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("d.db");
+    older_store(&path, 1_000);
+    super::journal::set_compact_threshold(4 << 10);
+    super::store::LINKS_FILL_HOLD_AT_ENTRY.store(true, Ordering::Release);
+    let db = open(&path);
+    db.branch_wait_name_filter();
+    let trunk = db.connect().unwrap();
+    let mut k = 0;
+    while !(db.branches.past_hard_limit_for_test() && super::store::LINKS_FILL_ENTRY_HELD.load(Ordering::Acquire) >= 1) && k < 20_000 {
+        let _ = trunk.fork_branch().unwrap().into_id();
+        k += 1;
+    }
+    let past = db.branches.past_hard_limit_for_test();
+    let at_limit = log_present(&path);
+    let (mut max, mut last, mut cut, mut n) = (at_limit, at_limit, false, 0);
+    while !cut && n < 2_000 {
+        let _ = trunk.fork_branch().unwrap().into_id();
+        n += 1;
+        let now = log_present(&path);
+        cut = now < last;
+        max = max.max(now);
+        last = now;
+    }
+    super::store::LINKS_FILL_HOLD_AT_ENTRY.store(false, Ordering::Release);
+    db.branch_checkpoint_wait();
+    println!("LS-DEFER past={} at_limit={at_limit} max={max} cut={} creates={n}", u64::from(past), u64::from(cut));
+}
+
+#[test]
+fn past_the_hard_log_limit_a_starved_fill_defers_the_cut_by_at_most_one_threshold() {
+    if in_child() {
+        return;
+    }
+    let text = child("ls_defer_bound_child", &[]);
+    let r = readings(&text, "LS-DEFER ");
     assert_eq!(r.len(), 1, "premise: the child reported:\n{text}");
-    let (cuts, starts, empty, batches, prefilled, per_create) = (r[0][1], r[0][2], r[0][3], r[0][4], r[0][5], r[0][6]);
-    let k = (2 * (4u64 << 10)) / per_create.max(1);
-    println!("LS live: cuts {cuts} starts {starts} empty spawns {empty} batches {batches} prefilled {prefilled}; {per_create} B per create, K = {k} creates per cycle");
-    assert!(cuts >= 2, "premise: the log was cut {cuts} time(s) under {} creates", r[0][0]);
-    assert!(starts >= 2, "premise: the fill was started {starts} time(s)");
-    assert_eq!(empty, 0, "{empty} of {starts} fill spawns were stopped with no batch committed (cuts {cuts}, batches {batches})");
-    assert!(batches + 1 >= cuts, "the fill committed {batches} batches over {cuts} hard-limit cycles (K = {k} creates each)");
+    let (past, at_limit, max, cut, n) = (r[0][0], r[0][1], r[0][2], r[0][3], r[0][4]);
+    println!("LS defer bound: past {past} at the limit {at_limit} B, max {max} B, cut {cut} after {n} creates");
+    assert_eq!(past, 1, "premise: the store never passed the hard limit");
+    assert_eq!(cut, 1, "past the hard limit a starved fill held the cut through {n} creates (log {max} B, {at_limit} B at the limit)");
+    assert!(max <= at_limit + (4 << 10) + (2 << 10), "the cut was deferred past one threshold of log: {max} B, {at_limit} B at the limit");
 }
 
 
