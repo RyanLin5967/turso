@@ -124,12 +124,27 @@ fn ls_sessions_child() {
             }
             // A session shorter than the fill (about 3 of its 16 batches) that goes on working, as
             // the adversary's sessions did (2,000 creates and a hold): an operation after the fill
-            // ends is what can start the checkpoint that flips the meta row.
+            // ends is what can start the checkpoint that flips the meta row. FLAGGED harness repair
+            // (core-integrator, 72bfb0127 in the 5-module batch on eceubuntu1: "never upgraded in 14
+            // sessions"): the session's length is counted in the fill's committed batches, two, not
+            // in wall time, which a loaded host gives the fill thread less of (30 s at most); then
+            // 130 ms more of work, as before.
+            let b0 = super::store::LINKS_FILL_HELD_BATCHES.load(Ordering::Acquire);
+            let t = std::time::Instant::now();
+            while super::store::LINKS_FILL_HELD_BATCHES.load(Ordering::Acquire) < b0 + 2
+                && db.branches.links_fill_state_for_test().0
+                && t.elapsed() < std::time::Duration::from_secs(30)
+            {
+                let _ = trunk.fork_branch().unwrap().into_id();
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let batches = super::store::LINKS_FILL_HELD_BATCHES.load(Ordering::Acquire) - b0;
             let t = std::time::Instant::now();
             while t.elapsed() < std::time::Duration::from_millis(130) {
                 let _ = trunk.fork_branch().unwrap().into_id();
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
+            println!("LS-SESSION-BATCHES s={s} batches={batches}");
         }
         println!("LS-SESSION s={s} meta={} log={}", meta_version(&path), log_bytes(&path));
     }
