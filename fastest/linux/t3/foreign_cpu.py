@@ -778,6 +778,23 @@ def self_test():
          lo_(decide(evid_file("late-none", sut2))["verdict"], "VALID", two_sut, evid_file("late-none", sut2), {40, 41, 42},
              own_run="linux-this") == "PASS"),
     ]
+    # linux-rev-957573fc1 MED 1: late evidence must be LARGE ENOUGH to explain the VOID. Our own run's processes at 49% +
+    # 49% plus another uid's 5% VOID by rule 1 (the foreign total over 100%), and the other uid's 5% alone would not:
+    # the N/A rested on 5% of a core. decide() is re-run on the kept processes alone
+    ours49 = [(11, "cc1", 49.0, "foreign", 0, 20), (12, "cc1", 49.0, "foreign", 0, 20)]
+    own49 = [(11, me_uid, me_user, "linux-this"), (12, me_uid, me_user, "linux-this")]
+    small = evid_file("late-small", sut2 + ours49 + [(7, "java", 5.0, "foreign", 0, 20)], foreign_ticks=103.0,
+                      owners=own49 + [(7, other, "-", "-")])
+    big3 = evid_file("late-big3", sut2 + [(11, "cc1", 49.0, "foreign", 0, 20)] + [(p_, "java", 40.0, "foreign", 0, 20) for p_ in (7, 8, 9)],
+                     foreign_ticks=169.0, owners=own49[:1] + [(p_, other, "-", "-") for p_ in (7, 8, 9)])
+    synthetic_evid += [
+        ("rev957 MED 1: a VOID made by our own run (49% + 49%) is not explained by another uid's 5%: no late evidence",
+         lb_(small, exclude={40, 41, 42}, own_run="linux-this") == []),
+        ("rev957 MED 1: that case stays a FAIL, not N/A",
+         lo_(decide(small)["verdict"], "VALID", two_sut, small, {40, 41, 42}, own_run="linux-this") == "FAIL"),
+        ("rev957 MED 1: three processes of another uid at 40% each (120% by themselves) are late evidence",
+         lb_(big3, exclude={40, 41, 42}, own_run="linux-this") != []),
+    ]
     # linux-rev-uw5 L7: under root, pid 1 is our own uid, so the "another uid" case cannot run: N/A-on-root, not a pass
     if os.getuid() == 0:
         n_na += 1
