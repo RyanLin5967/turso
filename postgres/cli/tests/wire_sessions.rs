@@ -16994,6 +16994,45 @@ fn an_int8_overflow_that_rounds_to_its_minimum_is_22003() {
     assert_eq!((e.code.as_str(), e.message.as_str()), ("22003", "bigint out of range"), "rows {:?}", r.rows);
 }
 
+/// wire-rev-1de981755-rest MED-1 (its PG 18.6 probe #222-#232): a CASE over parameters assigned to a varchar(3)
+/// column is judged at Bind with each parameter as its type: $1 compared with 1 is an integer, so '1' <> 1 is false and
+/// 'x' goes in, and binary int4 2 = 2 is true and 'long value' is 22001 at Bind. 11b24ee50 bound every parameter as
+/// text, so '1' <> 1 and '3' > 5 were true in the engine (valid INSERTs refused 22001) and '1' = 1 false (22001 left to
+/// Execute as XX000).
+#[test]
+fn a_case_folded_at_bind_reads_each_parameter_as_its_type() {
+    let dir = Scratch::new("case-bind-typed");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE v3(c varchar(3))").ok("create");
+    let long = ("22001", "value too long for type character varying(3)");
+    let two = 2i32.to_be_bytes();
+    let cases: Vec<(&str, Vec<(u32, i16, &[u8])>, Result<(), (&str, &str)>)> = vec![
+        ("INSERT INTO v3 VALUES (CASE WHEN $1 <> 1 THEN 'long value' ELSE 'x' END)", vec![(0, 0, &b"1"[..])], Ok(())),
+        ("INSERT INTO v3 VALUES (CASE WHEN $1 = 1 THEN 'long value' ELSE 'x' END)", vec![(0, 0, &b"1"[..])], Err(long)),
+        ("INSERT INTO v3 VALUES (CASE WHEN $1 > 5 THEN 'long value' ELSE 'y' END)", vec![(0, 0, &b"3"[..])], Ok(())),
+        ("INSERT INTO v3 VALUES (CASE WHEN $1 > 5 THEN 'long value' ELSE 'y' END)", vec![(0, 0, &b"10"[..])], Err(long)),
+        ("INSERT INTO v3 VALUES (CASE WHEN $1::int > 5 THEN 'long value' ELSE 'y' END)", vec![(0, 0, &b"3"[..])], Ok(())),
+        ("INSERT INTO v3 VALUES (CASE WHEN $1 = 'a' THEN 'ok' ELSE 'long value' END)", vec![(0, 0, &b"a"[..])], Ok(())),
+        ("INSERT INTO v3 VALUES (CASE WHEN $1 THEN 'long value' ELSE 'w' END)", vec![(0, 0, &b"f"[..])], Ok(())),
+        ("INSERT INTO v3 VALUES (CASE WHEN $1 > 1.5 THEN 'long value' ELSE 'v' END)", vec![(1700, 0, &b"1"[..])], Ok(())),
+        ("INSERT INTO v3 VALUES (CASE WHEN $1 = 2 THEN 'long value' ELSE 'u' END)", vec![(23, 1, two.as_slice())], Err(long)),
+    ];
+    let mut wrong = Vec::new();
+    for (sql, params, want) in &cases {
+        let r = a.xt(sql, params);
+        let got = match &r.error {
+            Some(e) => Err((e.code.as_str(), e.message.as_str())),
+            None if r.tags.last().map(String::as_str) == Some("INSERT 0 1") => Ok(()),
+            None => Err(("no INSERT tag", "")),
+        };
+        if got != *want {
+            wrong.push(format!("{sql} {params:?}: PG {want:?}, got {got:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-351702a43 LOW-6 (its PG 18.6 probe3 #161): a CASE is typed by its results (an int4 constant and an int4
 /// function: 23); the walk never typed a CASE column, and the engine announced it text (25).
 #[test]
