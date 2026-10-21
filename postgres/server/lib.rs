@@ -5444,6 +5444,38 @@ fn bpchar_width(
     widths.all(|w| w == Some(first)).then_some(first)
 }
 
+/// PostgreSQL's 22003 message for `val` under an announced integer type it does not fit: an integer
+/// past int2 or int4, or a float (the engine's int8 overflow) under any of them. None when it fits.
+fn past_announced_integer(val: &Value, pg_type: &Type) -> Option<&'static str> {
+    use turso_core::Numeric;
+    let name = match *pg_type {
+        Type::INT2 => "smallint out of range",
+        Type::INT4 => "integer out of range",
+        Type::INT8 => "bigint out of range",
+        _ => return None,
+    };
+    match val {
+        Value::Numeric(Numeric::Integer(i)) => {
+            let fits = match *pg_type {
+                Type::INT2 => i16::try_from(*i).is_ok(),
+                Type::INT4 => i32::try_from(*i).is_ok(),
+                _ => true,
+            };
+            (!fits).then_some(name)
+        }
+        Value::Numeric(Numeric::Float(f)) => {
+            let f = f64::from(*f);
+            let (lo, hi) = match *pg_type {
+                Type::INT2 => (f64::from(i16::MIN), f64::from(i16::MAX)),
+                Type::INT4 => (f64::from(i32::MIN), f64::from(i32::MAX)),
+                _ => (-9.223372036854775808e18, 9.223372036854775807e18),
+            };
+            (!f.is_finite() || f < lo || f >= hi + if *pg_type == Type::INT8 { 0.0 } else { 1.0 }).then_some(name)
+        }
+        _ => None,
+    }
+}
+
 fn encode_row<'a>(
     header: &Arc<Vec<FieldInfo>>,
     pads: &[Option<usize>],
@@ -5463,6 +5495,12 @@ fn encode_row<'a>(
         {
             encode_binary(&mut encoder, val, &pg_type)?;
             continue;
+        }
+        // An integer column's value past its announced type is PostgreSQL's 22003, as the binary
+        // encoder refuses it: the engine computes int2 and int8 arithmetic as int8 or REAL, so
+        // 32767::int2 + 1::int2 was written '32768' under 21 (wire-rev-7128c6f73 L3).
+        if let Some(message) = past_announced_integer(val, &pg_type) {
+            return Err(PgWireError::UserError(error(SqlErrorKind::NumericValueOutOfRange, message.to_string())));
         }
         if let (Some(Some(width)), Value::Text(t)) = (pads.get(i), val) {
             let chars = t.as_str().chars().count();
