@@ -3556,4 +3556,46 @@ mod tests {
         );
         assert!(bad.is_empty(), "CLAIM: a derived column of a CAST to a text domain did not order as text: {bad:#?}");
     }
+
+    /// Lead ruling on HIGH 8 (323655cfe claimed ALTER; it was not covered): ALTER TABLE ADD COLUMN
+    /// of a domain over numeric(8, 2) with CHECK (VALUE > 0) checked the DEFAULT as given, not as
+    /// the domain's value: 0.001 passed `0.001 > 0` though it is stored as 0.00. Expected values are
+    /// PostgreSQL 18.6's for this exact SQL (UW run typesrev2bd-oracle10; artie raw
+    /// frontier/fastest/lanes/engine/raw/pg18-types-rev2bd-9.txt 46983b67fc), never ours: on an
+    /// empty table every ADD succeeds (no row takes the DEFAULT); on a table with rows the DEFAULTs
+    /// 0.001 and -1 are refused with the domain's 23514 message and 1.5 is stored as 1.50.
+    #[test]
+    fn alter_table_add_column_checks_a_domain_default_as_the_domains_value() {
+        let conn = open();
+        for sql in [
+            "CREATE DOMAIN dpos AS numeric(8, 2) CHECK (VALUE > 0)",
+            "CREATE TABLE te(id INTEGER PRIMARY KEY) STRICT",
+            "CREATE TABLE tr(id INTEGER PRIMARY KEY) STRICT",
+            "INSERT INTO tr VALUES (1), (2)",
+        ] {
+            conn.execute(sql).unwrap();
+        }
+        let refused = r#"value for domain dpos violates check constraint "dpos_check""#;
+        let mut bad = Vec::new();
+        for (sql, want) in [
+            ("ALTER TABLE te ADD COLUMN c dpos DEFAULT 0.001", Ok(())),
+            ("ALTER TABLE te ADD COLUMN c2 dpos DEFAULT -1", Ok(())),
+            ("ALTER TABLE te ADD COLUMN c3 dpos DEFAULT 1.5", Ok(())),
+            ("ALTER TABLE tr ADD COLUMN c dpos DEFAULT 0.001", Err(refused)),
+            ("ALTER TABLE tr ADD COLUMN c2 dpos DEFAULT -1", Err(refused)),
+            ("ALTER TABLE tr ADD COLUMN c3 dpos DEFAULT 1.5", Ok(())),
+        ] {
+            let got = conn.execute(sql).map_err(|e| e.to_string());
+            let ok = match (&got, want) {
+                (Ok(()), Ok(())) => true,
+                (Err(m), Err(w)) => m == w,
+                _ => false,
+            };
+            if !ok {
+                bad.push(format!("{sql} gave {got:?}, not PostgreSQL 18's {want:?}"));
+            }
+        }
+        bad.extend(diverging(&conn, &[("SELECT id, c3 FROM tr ORDER BY id", "1,1.50;2,1.50")], "PostgreSQL 18"));
+        assert!(bad.is_empty(), "CLAIM: ALTER TABLE ADD COLUMN checked a domain DEFAULT unlike PostgreSQL: {bad:#?}");
+    }
 }
