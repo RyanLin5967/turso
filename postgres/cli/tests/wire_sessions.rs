@@ -16356,6 +16356,35 @@ fn a_bound_nan_is_refused_never_stored_as_null() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-4a1934c89-beb4 MED-1 (its PG 18.6 probe #15, #17-#19): PG analyses a multi-row VALUES row by row and an ON
+/// CONFLICT SET after its VALUES, so one $1 assigned to a numeric column in one row and a varchar column in another, or
+/// in VALUES and again in the SET, runs (INSERT 0 2; the upsert); only a single row or a single SET list assigning two
+/// types is 42P08. e4e8bea44 refused all three shapes.
+#[test]
+fn one_parameter_in_two_rows_or_in_values_and_set_runs() {
+    let dir = Scratch::new("inconsistent-scopes");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE mix(id int PRIMARY KEY, x numeric(6,2), v varchar(3))").ok("create");
+    let mut wrong = Vec::new();
+    for (sql, values) in [
+        ("INSERT INTO mix VALUES (2, $1, 'b'), (3, 4, $1)", vec![&b"5"[..]]),
+        ("INSERT INTO mix VALUES ($1, 1, 'd') ON CONFLICT (id) DO UPDATE SET v = $1", vec![&b"2"[..]]),
+        ("INSERT INTO mix VALUES (4, $1, 'e') ON CONFLICT (id) DO UPDATE SET v = $1", vec![&b"7"[..]]),
+    ] {
+        let values: Vec<Option<&[u8]>> = values.into_iter().map(Some).collect();
+        let (types, error) = a.bind_round(sql, &[], &values, &[]);
+        if error.is_some() {
+            wrong.push(format!("{sql}: messages {:?} error {error:?}, PostgreSQL runs it", String::from_utf8_lossy(&types)));
+        }
+    }
+    let (types, error) = a.bind_round("UPDATE mix SET x = $1, v = $1 WHERE id = 2", &[], &[Some(b"1")], &[]);
+    if !error.as_ref().is_some_and(|e| e.code == "42P08") {
+        wrong.push(format!("one SET list, two types: messages {:?} error {error:?}, PostgreSQL 42P08", String::from_utf8_lossy(&types)));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-4a1934c89-beb4 MED-3, MED-4, MED-5 (its PG 18.6 probe #142-#158, probe2 #24-#45, #268, #270): a quoted
 /// "Public" on the search path names no schema (public is lower case), so v resolves past it to s1.v, and alone it
 /// leaves v unresolved (42P01); ours read and wrote public.v. An unqualified CREATE TABLE is made in the first schema of
