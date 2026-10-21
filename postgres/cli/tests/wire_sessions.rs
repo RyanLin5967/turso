@@ -17341,12 +17341,12 @@ fn a_qualified_name_names_its_schema_as_written() {
     let missing = Err(("42P01", "relation \"q1.u\" does not exist"));
     let mut wrong = Vec::new();
     for (sql, want) in [
-        ("SELECT a FROM q1.u", missing),
-        ("SELECT a FROM Q1.u", missing),
+        ("SELECT a FROM q1.u", missing.clone()),
+        ("SELECT a FROM Q1.u", missing.clone()),
         ("SELECT a FROM \"Q1\".u", Ok(vec!["7"])),
-        ("INSERT INTO q1.u VALUES (8)", missing),
-        ("UPDATE q1.u SET a = 9", missing),
-        ("DELETE FROM q1.u", missing),
+        ("INSERT INTO q1.u VALUES (8)", missing.clone()),
+        ("UPDATE q1.u SET a = 9", missing.clone()),
+        ("DELETE FROM q1.u", missing.clone()),
         ("SELECT count(*) FROM \"Q1\".u", Ok(vec!["1"])),
         ("SELECT a FROM \"Q1\".u", Ok(vec!["7"])),
         ("CREATE TABLE q1.v(a int)", Err(("3F000", "schema \"q1\" does not exist"))),
