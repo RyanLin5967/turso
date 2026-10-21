@@ -16436,6 +16436,34 @@ fn a_decimal_past_15_digits_is_refused_on_every_path() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-351702a43 LOW-3 (its PG 18.6 probe3 #168-#173): an oid is unsigned, so oidin reads a negative integer as its
+/// 32-bit two's complement ((-2147483648)::oid is 2147483648, '-1'::oid is 4294967295), a text past the range is 22003
+/// 'value "..." is out of range for type oid', and a decimal has no cast to oid (42846). Ours answered -2147483648 and -1,
+/// took '-2147483649', and called 1.5 an overflow.
+#[test]
+fn an_oid_literal_is_read_as_oidin_reads_it() {
+    let dir = Scratch::new("oid-literals");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    let r = a.q("SELECT (-2147483648)::oid, '-1'::oid, '4294967295'::oid");
+    let want = vec![["2147483648", "4294967295", "4294967295"].iter().map(|x| Some(x.to_string())).collect::<Vec<_>>()];
+    if r.error.is_some() || r.rows != want {
+        wrong.push(format!("negative oids: rows {:?} error {:?}, PostgreSQL {want:?}", r.rows, r.error));
+    }
+    for (sql, code, message) in [
+        ("SELECT '-2147483649'::oid", "22003", "value \"-2147483649\" is out of range for type oid"),
+        ("SELECT 1.5::oid", "42846", "cannot cast type numeric to oid"),
+        ("SELECT 1e3::oid", "42846", "cannot cast type numeric to oid"),
+    ] {
+        let r = a.q(sql);
+        if !r.error.as_ref().is_some_and(|e| e.code == code && e.message.ends_with(message)) {
+            wrong.push(format!("{sql}: rows {:?} error {:?}, PostgreSQL {code} {message}", r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-7128c6f73 L1 and L9 (its PG 18.6 probe4 #93-#100): numeric_in refuses an exponent at or past INT_MAX/2,
 /// 22003 'value overflows numeric format', and reads underscores between digits and a 0x/0o/0b integer (PG 16+); a bound
 /// '1e-2147483648' was stored 0.00, and '1_000' and '0x10' were 22P02.
