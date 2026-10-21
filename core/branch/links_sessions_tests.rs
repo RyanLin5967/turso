@@ -901,7 +901,14 @@ fn ls_nonflip_crash_child() {
     while log_bytes(&path) >= peak && t.elapsed() < std::time::Duration::from_secs(30) {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    println!("LS-NFCUT past={} meta={} peak={peak} log={}", u64::from(db.branches.past_hard_limit_for_test()), meta_version(&path), log_bytes(&path));
+    // The meta row read Busy-tolerant (FLAGGED harness repair of 86ae0869e, in this red column).
+    let t = std::time::Instant::now();
+    let mut meta = try_meta_version(&path);
+    while meta.is_none() && t.elapsed() < std::time::Duration::from_secs(30) {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        meta = try_meta_version(&path);
+    }
+    println!("LS-NFCUT past={} meta={} peak={peak} log={}", u64::from(db.branches.past_hard_limit_for_test()), meta.unwrap_or(0), log_bytes(&path));
     std::process::exit(0);
 }
 
