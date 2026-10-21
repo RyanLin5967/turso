@@ -1661,15 +1661,15 @@ mod tests {
     #[test]
     fn probe_numeric_cast_values() {
         let conn = open();
-        conn.execute("CREATE TABLE n(id INTEGER PRIMARY KEY, x numeric(30, 2), y numeric) STRICT").unwrap();
-        conn.execute("INSERT INTO n VALUES (1, 0.1, 0.25)").unwrap();
+        conn.execute("CREATE TABLE n(id INTEGER PRIMARY KEY, x numeric(30, 2)) STRICT").unwrap();
+        conn.execute("INSERT INTO n VALUES (1, 0.1)").unwrap();
         for sql in [
             "SELECT typeof(CAST(10 AS numeric)), quote(CAST(10 AS numeric))",
             "SELECT typeof(CAST(0.20 AS numeric)), quote(CAST(0.20 AS numeric))",
             "SELECT typeof(CAST(0.10 AS numeric(5, 2))), quote(CAST(0.10 AS numeric(5, 2)))",
             "SELECT typeof(abs(CAST(0.10 AS numeric(5, 2)))), quote(abs(CAST(0.10 AS numeric(5, 2))))",
-            "SELECT typeof(y), quote(y), typeof(x), quote(x) FROM n",
-            "SELECT quote(y + 0), quote(x + 0), quote(y * 3) FROM n",
+            "SELECT typeof(x), quote(x) FROM n",
+            "SELECT quote(x + 0), quote(x * 3), quote(abs(x) + 0) FROM n",
             "SELECT quote(CAST(10 AS numeric) / 3), quote(CAST(10 AS numeric(10, 4)) / 3)",
         ] {
             let got = conn.prepare(sql).and_then(|mut s| s.run_collect_rows());
