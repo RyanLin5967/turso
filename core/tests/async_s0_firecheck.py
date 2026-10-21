@@ -33,7 +33,7 @@ SYSCALLS = "pwrite64,write,writev,pwritev,pwritev2,fsync,fdatasync,fcntl,sync_fi
 FLUSH = re.compile(r"\b(fsync|fdatasync)\(|\bfcntl\(\d+<[^>]*>, F_FULLFSYNC")
 WRITE = re.compile(r"\b(pwrite64|write|writev|pwritev2?)\((\d+)<([^>]*)>")
 MARK = re.compile(r'AD-T5 WINDOW (OPEN|CLOSE) arm=(\S+)(?: run=(\d+))?')
-READING = re.compile(r"^AD-T5 READING (.*)$")
+READING = re.compile(r"AD-T5 READING (.*)$")
 RUNS_DECL = re.compile(r"^const RUNS: usize = (\d+);$", re.M)
 
 
@@ -50,7 +50,8 @@ def registered_runs(source):
 
 def parse_reading(line):
     """One stdout line's AD-T5 READING fields, or None."""
-    m = READING.match(line)
+    # Searched: a test's first reading follows the harness's "test NAME ... " on its line.
+    m = READING.search(line)
     if not m:
         return None
     return dict(p.split("=", 1) for p in m.group(1).split() if "=" in p)
