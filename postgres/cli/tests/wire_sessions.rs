@@ -16979,6 +16979,21 @@ fn a_text_literal_cast_to_oid_is_read_as_oidin_reads_it() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-1de981755-rest MED-7's int8 bound (its PG 18.6 recording pg18-c33-intrange.out #10): -v - 2 over int8's
+/// maximum overflows, 22003 'bigint out of range' in PG; the engine's REAL overflow rounds to exactly -2^63, which the
+/// int8 range guard let through (its lower bound was exclusive), so it answered '-9.223372036854776e+18' under int8.
+#[test]
+fn an_int8_overflow_that_rounds_to_its_minimum_is_22003() {
+    let dir = Scratch::new("int8-floor");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE big(v BIGINT, i INT)").ok("create");
+    a.q("INSERT INTO big VALUES (9223372036854775807, 2147483647), (1, 1)").ok("insert");
+    let r = a.q("SELECT -v - 2 FROM big WHERE v > 1");
+    let e = r.err("-v - 2");
+    assert_eq!((e.code.as_str(), e.message.as_str()), ("22003", "bigint out of range"), "rows {:?}", r.rows);
+}
+
 /// wire-rev-351702a43 LOW-6 (its PG 18.6 probe3 #161): a CASE is typed by its results (an int4 constant and an int4
 /// function: 23); the walk never typed a CASE column, and the engine announced it text (25).
 #[test]
