@@ -4656,4 +4656,21 @@ mod tests {
         }
         assert!(bad.is_empty(), "CLAIM: a plan shape answered a typed comparison unlike PostgreSQL: {} divergences: {bad:#?}", bad.len());
     }
+
+    /// Adopted verbatim from engine-rev-types-08caaec44 (artie 8319b0a45e,
+    /// frontier/fastest/reviews/REVIEW-engine-types-08caaec44.md and raw-engine-types-08caaec44/
+    /// zz_rev08c.rs.txt); its expected values are that review's PostgreSQL 18.6 recordings
+    /// (raw-engine-types-08caaec44/p*.pgout.txt), never ours.
+    /// MED: CAST(x AS du), du a domain over text, compares as text in a WHERE as it does through a
+    /// derived relation (control, 4444aa3ea's red).
+    #[test]
+    fn rev08c_a_direct_cast_to_a_text_domain_compares_as_text() {
+        let conn = open();
+        let bad = diverging_after(&conn, &["CREATE DOMAIN du AS text", "CREATE TABLE i(id INTEGER PRIMARY KEY, k INTEGER) STRICT", "INSERT INTO i VALUES (1, 1), (2, 10), (3, 2)"], &[
+            ("SELECT count(*) FROM (SELECT CAST(k AS du) AS x FROM i) s WHERE x < '9'", "3"),
+            ("SELECT count(*) FROM i WHERE CAST(k AS text) < '9'", "3"),
+            ("SELECT count(*) FROM i WHERE CAST(k AS du) < '9'", "3"),
+        ]);
+        assert!(bad.is_empty(), "CLAIM: a direct CAST to a text domain did not compare as text: {bad:#?}");
+    }
 }
