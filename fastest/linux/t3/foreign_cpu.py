@@ -27,7 +27,7 @@ foreign ran is on the record as a zero, not as a missing row.
 batch is read (amendment 7):
   VOID if foreign CPU exceeds 100% (one core) in more than 5% of ticks, or
   VOID if any single foreign process exceeds 50% for >= 5 consecutive seconds, or
-  VOID if the record is unusable (fewer than 3 ticks, a gap over 3 intervals, or the sampler ended
+  VOID if the record is unusable (fewer than 3 ticks, a gap over 1.5 intervals, or the sampler ended
   before the stop file appeared).
 Exit 0 VALID, 3 VOID, 2 usage. Load average is recorded and never voids.
 
@@ -169,6 +169,7 @@ def sample(path, cell, interval, stop_file, max_s):
     owned = {}
     with open(path, "w") as f:
         f.write(f"#start\t{time.time():.3f}\tcell={cell}\tinterval={interval}\tload={os.getloadavg()}\n")
+        f.flush()  # the #start line marks the first /proc snapshot (the self-test's windows open on it)
         while True:
             time.sleep(interval)
             now = time.monotonic()
@@ -378,9 +379,11 @@ def decide(path, interval_default=1.0):
         reasons.append(f"unusable record: {len(ticks)} ticks")
     if not stopped:
         reasons.append("unusable record: the sampler never stopped (killed or still running)")
+    # a gap over 1.5 intervals is the bound rule 2's run assumes below, so a record with one refuses as unusable rather
+    # than quietly turning rule 2 off (linux-rev-9d6de652f MED 1: at 1.55 s spacing a whole foreign core read VALID)
     gaps = [b[0] - a[0] for a, b in zip(ticks, ticks[1:])]
-    if gaps and max(gaps) > 3 * interval:
-        reasons.append(f"unusable record: a {max(gaps):.1f} s gap between ticks")
+    if gaps and max(gaps) > 1.5 * interval:
+        reasons.append(f"unusable record: a {max(gaps):.2f} s gap between ticks (over 1.5 intervals)")
     over = sum(1 for t in ticks if t[1] > 100.0)
     if ticks and over / len(ticks) > 0.05:
         reasons.append(f"foreign CPU > 100% in {over} of {len(ticks)} ticks ({over / len(ticks):.1%} > 5%)")
@@ -418,7 +421,9 @@ def self_test():
     d = tempfile.mkdtemp()
 
     launched = {}   # window label -> [(burner, pid)], so a case can read each burner's own rows
-    cpu_of = {}     # pid -> its CPU seconds (ru_utime + ru_stime) from os.wait4: the truth, from another instrument
+    cpu_of = {}     # pid -> its CPU seconds (ru_utime + ru_stime) from os.wait4: the kernel's own rusage, a second reader
+    #                 of the counter /proc/PID/stat shows (both thread_group_cputime_adjusted), so it checks the sampler's
+    #                 enumeration, differencing and arithmetic, not the kernel's accounting (linux-rev-9d6de652f LOW 2)
 
     def window(label, burners, secs=20):
         """burners: list of (sut?, start_s, dur_s[, duty[, kind]]); duty < 1 busy-loops that share of every 10 ms.
@@ -429,7 +434,7 @@ def self_test():
         out = os.path.join(d, f"{label}.tsv")
         stop = os.path.join(d, f"{label}.stop")
         s = subprocess.Popen([sys.executable, "-B", __file__, "sample", out, "--cell", "ST", "--stop-file", stop])
-        # the window opens at the sampler's first /proc read, which its #start line follows: a burner started before it
+        # the window opens at the sampler's first /proc read, which its #start line (flushed at once) follows: a burner started before it
         # would burn CPU the record rightly leaves out (it predates the window), and the calibration's rusage would not
         # match (measured on iccad7, load 27: 0.03-0.13 s short per burner). Bounded at 30 s; a sampler that never
         # starts is the record's own failure, which decide() reports
@@ -506,21 +511,26 @@ def self_test():
     own_run = (owner_of(os.getpid()) or (0, "-", "-"))[2]
     # CALIBRATION of the sampler itself (the lead's F6 order (2); linux-rev-957573fc1 HIGH 1; linux-rev-fc20226b9 HIGH 1,
     # HIGH 2, LOW 1). Run on every host whatever its load. Two kinds of check:
-    # (a) ACCOUNTING, against another instrument. Each calibration burner's CPU seconds as the sampler summed them
+    # (a) ACCOUNTING, against the kernel's rusage. Each calibration burner's CPU seconds as the sampler summed them
     #     (pct x its tick / 100, over every row of that pid) must equal its rusage from os.wait4 (ru_utime + ru_stime)
     #     within the sampler's own resolution: 3 clock ticks (utime and stime are each truncated to a tick, plus one for
     #     the burner's exit) plus 0.001 s per row (pct is written to 0.1). The loads split CPU the ways real load does:
-    #     user-mode at duty 1.0, 0.68 and 0.3, system time (a /dev/zero reader) and two threads in one pid. So a sampler
+    #     user-mode at duty 1.0, 0.68 and 0.3, system time (a /dev/zero reader) and two threads in one pid, as SUT and
+    #     as foreign processes (linux-rev-9d6de652f LOW 4). So a sampler
     #     that drops stime, reads one thread, offsets, quantises, scales, saturates or over-counts fails here.
     # (b) THE VERDICT RULES AT THEIR THRESHOLDS, on the record of the window's own burners alone (other load removed, as
-    #     late_busy does): rule 2 must name a foreign burner at duty 0.56 and must not name one at 0.44; rule 1 must void
+    #     late_busy does): rule 2 must name foreign burners at duty 0.56 and 0.62 and must not name one at 0.44; rule 1 must void
     #     three foreign burners at 0.37 each (111%) and must not void three at 0.30 (90%).
     # A burner whose rusage shows it got under 80% of the CPU it asked for was starved by the host: its window's checks
     # are then N/A-on-busy-host, judged by rusage, never by the sampler under test.
     # Blind spots, stated: (a) bounds each process's TOTAL over the window, not each sample, so an error that moves CPU
     # between one process's samples (totals kept) passes, and could carry a run of samples across 50%; (b) is exact only
     # outside the margins, so a foreign process within about 6 points of 50%, or three within about 11 points of 100% in
-    # total, can be misjudged by an error under those margins that (a) did not catch. Loads not covered: CPU of reaped
+    # total, can be misjudged by an error under those margins that (a) did not catch; an error that depends on the
+    # reading and is confined to a band no calibration load reaches passes (b), and passes (a) unless a burner's
+    # partial-tick sample happens to land in it (the steady readings are about 100, 68, 62, 56, 44, 37 and 30); the
+    # kernel's own accounting is shared by (a)'s two readers, so what it misattributes (IRQ or softirq time charged to
+    # the running task, steal time on a VM) is invisible here (linux-rev-9d6de652f LOW 2, LOW 5). Loads not covered: CPU of reaped
     # children (cutime), processes born and dead inside one tick, threads that exit between samples, and processes whose
     # /proc entries cannot be read.
     def own_record(path, pids, tag):
