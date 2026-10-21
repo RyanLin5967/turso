@@ -3825,4 +3825,32 @@ mod tests {
         ]);
         assert!(bad.is_empty(), "CLAIM: a DML-time numeric comparison did not compare as numeric: {bad:#?}");
     }
+
+    /// Adopted verbatim from engine-rev-types-08caaec44 (artie 8319b0a45e,
+    /// frontier/fastest/reviews/REVIEW-engine-types-08caaec44.md and raw-engine-types-08caaec44/
+    /// zz_rev08c.rs.txt); its expected values are that review's PostgreSQL 18.6 recordings
+    /// (raw-engine-types-08caaec44/p*.pgout.txt), never ours.
+    /// HIGH 4: an index created over rows whose numeric (or domain over numeric) column came from ALTER
+    /// TABLE ADD COLUMN ... DEFAULT holds the stored form of the DEFAULT, so a seek answers as a scan does.
+    #[test]
+    fn rev08c_an_index_over_an_added_numeric_default_answers_as_a_scan() {
+        let conn = open();
+        let bad = diverging_after(&conn, &[
+            "CREATE TABLE tc(id INTEGER PRIMARY KEY) STRICT",
+            "INSERT INTO tc VALUES (1), (2)",
+            "ALTER TABLE tc ADD COLUMN v numeric(8, 2) DEFAULT 1.5",
+            "CREATE INDEX tcv ON tc(v)",
+            "CREATE DOMAIN dplain AS numeric(8, 2)",
+            "CREATE TABLE td(id INTEGER PRIMARY KEY) STRICT",
+            "INSERT INTO td VALUES (1), (2)",
+            "ALTER TABLE td ADD COLUMN v dplain DEFAULT 1.5",
+            "CREATE INDEX tdv ON td(v)",
+        ], &[
+            ("SELECT count(*) FROM tc NOT INDEXED WHERE v = 1.5", "2"),
+            ("SELECT count(*) FROM tc WHERE v = 1.5", "2"),
+            ("SELECT count(*) FROM td NOT INDEXED WHERE v = 1.5", "2"),
+            ("SELECT count(*) FROM td WHERE v = 1.5", "2"),
+        ]);
+        assert!(bad.is_empty(), "CLAIM: an index over an added numeric DEFAULT did not answer as a scan: {bad:#?}");
+    }
 }
