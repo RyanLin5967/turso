@@ -1525,6 +1525,19 @@ def self_test():
     else:
         print(f"N/A-on-{sys.platform}: DATA_GIB fired by a real ENOSPC (/dev/full is Linux's)", flush=True)
         na_cases.append("DATA_GIB real ENOSPC")
+    # t3cov-2 MED 2: a refusal always removes credit. A REAL (dry=0) package whose block refuses on ENOSPC is not ok, so
+    # it is never creditable, and its credit refusals say why (creditable was derived from the credit list alone, which
+    # never read failed_blocks, the refusal lists or ok)
+    root = tempfile.mkdtemp(prefix="summarize-st-")
+    try:
+        s_, ok_ = summarize(make(root, mode_dry="0", enospc=("cells/ours-full-c1-r1/a1/adapter.txt",
+                                                             "fio: write: No space left on device\n")), "sha", "0", "m")
+        cases.append(("t3cov-2 MED 2: a real (dry=0) package refused on ENOSPC is not creditable, and says the refusal "
+                      "is why", not ok_ and s_.get("creditable") is False
+                      and any("not ok" in x for x in s_.get("credit_refusals") or []),
+                      [f"ok={ok_}", f"creditable={s_.get('creditable')!r}"] + list(s_.get("credit_refusals") or [])))
+    finally:
+        shutil.rmtree(root)
     # the owed ours fixture record: ONE parent for every system in a block (gen_seed's rows and digest), so ours at
     # fastest_profile's old default 1000 rows beside the competitors' 10000 fails (run 11 measured exactly that)
     for name, ofx, cfx, want in (
