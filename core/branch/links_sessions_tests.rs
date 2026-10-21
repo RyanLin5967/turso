@@ -198,7 +198,20 @@ fn ls_hard_whole_child() {
     let n: usize = std::env::var("FE_LS_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(1_000);
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("w.db");
-    older_store(&path, n);
+    // FE_LS_CONTROL (observing only): a store of this build (21, no fill), the same workload, to tell the
+    // fill's waits from the fuzzy checkpoint's own back-pressure.
+    if std::env::var_os("FE_LS_CONTROL").is_some() {
+        let db = open(&path);
+        let trunk = db.connect().unwrap();
+        trunk.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+        for _ in 0..n {
+            let _ = trunk.fork_branch().unwrap().into_id();
+        }
+        db.branch_compact_now().unwrap();
+        db.branch_checkpoint_wait();
+    } else {
+        older_store(&path, n);
+    }
     super::journal::set_compact_threshold(4 << 10);
     // A slow fill (1 s after each batch): the hard limit is passed long before it ends.
     super::store::LINKS_FILL_PAUSE_MS.store(1_000, Ordering::Release);
@@ -913,7 +926,15 @@ fn ls_nonflip_crash_child() {
     while log_bytes(&path) >= peak && t.elapsed() < std::time::Duration::from_secs(30) {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    println!("LS-NFCUT past={} meta={} peak={peak} log={}", u64::from(db.branches.past_hard_limit_for_test()), meta_version(&path), log_bytes(&path));
+    // The meta row read Busy-tolerant (a checkpoint may hold the catalog: FLAGGED harness repair, measured at
+    // 37917a0a6 on iccad6, "unwrap() on Err Busy" at meta_version).
+    let t = std::time::Instant::now();
+    let mut meta = try_meta_version(&path);
+    while meta.is_none() && t.elapsed() < std::time::Duration::from_secs(30) {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        meta = try_meta_version(&path);
+    }
+    println!("LS-NFCUT past={} meta={} peak={peak} log={}", u64::from(db.branches.past_hard_limit_for_test()), meta.unwrap_or(0), log_bytes(&path));
     std::process::exit(0);
 }
 
