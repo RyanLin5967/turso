@@ -21,7 +21,8 @@ fn open(path: &std::path::Path) -> Arc<Database> {
         OpenFlags::Create,
         crate::DatabaseOpts::new()
             .with_branch_durability(BranchDurability::Catalog { sync: SyncClass::Off })
-            .with_branch_checkpoint(BranchCheckpoint::Fuzzy),
+            // FE_LS_SHARP (a child's knob, h1-rev-72bfb0127 LOW-1): the sharp checkpoint mode.
+            .with_branch_checkpoint(if std::env::var_os("FE_LS_SHARP").is_some() { BranchCheckpoint::Sharp } else { BranchCheckpoint::Fuzzy }),
         None,
         Arc::new(SqliteDialect),
     )
@@ -254,6 +255,25 @@ fn ls_hard_whole_child() {
     let superseded = super::store::LINKS_FILL_SUPERSEDED_BATCHES.load(Ordering::Acquire) - sup0;
     super::store::LINKS_FILL_PAUSE_MS.store(0, Ordering::Release);
     println!("LS-WHOLE rows={n} past={} creates={k} whole_batches={whole} waits={waits} meta={meta} peak={peak} log={log} fill_waits={fill_waits} starts={starts} superseded={superseded}", u64::from(past));
+}
+
+/// h1-rev-72bfb0127 LOW-1: the whole-catalog red in the SHARP checkpoint mode (the capture and the writer are
+/// the fuzzy mode's; the tag is fuzzy-only, so it is not read here): past the hard limit, with a slow fill, no
+/// checkpoint links the whole catalog (`WHOLE_UPGRADE_BATCHES` 0), the store stays at 19 and the log is cut,
+/// at 1,000 rows. Mutant `l4_upgrade_unbatched` must fail it. Premise: the log passed the hard limit.
+#[test]
+fn past_the_hard_log_limit_no_sharp_checkpoint_links_the_whole_catalog() {
+    if in_child() {
+        return;
+    }
+    let text = child("ls_hard_whole_child", &[("FE_LS_ROWS", "1000"), ("FE_LS_SHARP", "1")]);
+    let r = readings(&text, "LS-WHOLE ");
+    assert_eq!(r.len(), 1, "premise: the child reported:\n{text}");
+    let (past, whole, meta, peak, log) = (r[0][1], r[0][3], r[0][5], r[0][6], r[0][7]);
+    assert_eq!(past, 1, "sharp: premise: the log never passed the hard limit");
+    assert_eq!(whole, 0, "sharp: past the hard limit a checkpoint linked the whole catalog ({whole} batches)");
+    assert_eq!(meta, 19, "sharp: the store flipped before its fill was complete (meta {meta})");
+    assert!(log < peak, "sharp: the log was not cut past the hard limit ({log} B at the end, {peak} B at the limit)");
 }
 
 /// h1-rev-72bfb0127 LOW-3: past the hard limit the gate stops the fill and a later checkpoint starts a new
