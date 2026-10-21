@@ -2741,9 +2741,12 @@ fn a_thread_table_read_without_descriptors_is_refused() {
         assert!(inj.contains(" table=refused ") && inj.contains(" blocked=refused "), "CLAIM: a table with a live task unreadable for want of a descriptor was not refused: {inj}");
         // REVIEW-budgets-port-fix5 LOW-1: a task gone (ENOENT) between its listing and its read is left out, and
         // the table is kept (a refusal here would refuse every window a thread exits in).
-        let gone = text.lines().find_map(|l| l.find("FD-ENOENT ").map(|i| l[i..].to_string())).unwrap_or_else(|| panic!("premise: no ENOENT reading:\n{text}"));
-        assert!(gone.contains(" tid_known=1 "), "premise: the injected thread's id was not read: {gone}");
-        assert!(gone.contains(" table=skipped "), "CLAIM: a table with a gone task was not kept with that task left out: {gone}");
+        for label in ["FD-ENOENT ", "FD-ESRCH "] {
+            let gone = text.lines().find_map(|l| l.find(label).map(|i| l[i..].to_string())).unwrap_or_else(|| panic!("premise: no {label}reading:\n{text}"));
+            assert!(gone.contains(" tid_known=1 "), "premise: the injected thread's id was not read: {gone}");
+            assert!(gone.contains(" table=skipped "), "CLAIM: a table with a gone task was not kept with exactly that task left out: {gone}");
+            assert!(!gone.contains(" blocked=refused "), "CLAIM: others_blocked refused for a gone task: {gone}");
+        }
         return;
     }
     let (tx, rx) = std::sync::mpsc::channel::<()>();
@@ -2827,22 +2830,33 @@ fn a_thread_table_read_without_descriptors_is_refused() {
         };
         println!("FD-INJECT tid_known={} table={table} n={n:?} blocked={blocked} ", u64::from(tid != 0));
     }
-    // REVIEW-budgets-port-fix5 LOW-1: the other direction. The same task's opens fail with ENOENT (gone): the
-    // table is read, lists the caller, and leaves that task out.
-    {
+    // REVIEW-budgets-port-fix5 LOW-1: the other direction. The same task's opens fail with ENOENT, then ESRCH
+    // (gone): the table is read, lists the caller, and leaves that task out. budgets-rev-nm-cb67 LOW-5/6
+    // (FLAGGED stricter): "left out" is exactly that task (the parked thread still listed, the count one under
+    // a clean read's), and others_blocked keeps its reading too (a gone task is not a refusal there either).
+    for (label, errno) in [("FD-ENOENT", libc::ENOENT), ("FD-ESRCH", libc::ESRCH)] {
         let tid = spinner_tid.load(Acquire);
-        probe::PROBE_INJECT_ERRNO.store(libc::ENOENT, Release);
+        let mut clean = [probe::ThreadCpu::EMPTY; 48];
+        let n_clean = probe::thread_table(&mut clean);
+        probe::PROBE_INJECT_ERRNO.store(errno, Release);
         probe::PROBE_EMFILE_TID.store(tid, Release);
         let mut t = [probe::ThreadCpu::EMPTY; 48];
         let n = probe::thread_table(&mut t);
+        let blocked = probe::others_blocked();
         probe::PROBE_EMFILE_TID.store(0, Release);
         probe::PROBE_INJECT_ERRNO.store(libc::EMFILE, Release);
-        let table = match n {
-            None => "refused",
-            Some(n) if t[..n.min(48)].iter().any(|x| x.me) && !t[..n.min(48)].iter().any(|x| x.id == tid) => "skipped",
-            Some(_) => "other",
+        let parked = |t: &[probe::ThreadCpu]| t.iter().any(|x| x.name.starts_with(b"fd-adv-parked\0"));
+        let table = match (n, n_clean) {
+            (None, _) => "refused",
+            (Some(n), Some(c)) if n + 1 == c && t[..n.min(48)].iter().any(|x| x.me) && !t[..n.min(48)].iter().any(|x| x.id == tid) && parked(&t[..n.min(48)]) && parked(&clean[..c.min(48)]) => "skipped",
+            (Some(_), _) => "other",
         };
-        println!("FD-ENOENT tid_known={} table={table} n={n:?} ", u64::from(tid != 0));
+        let blocked = match blocked {
+            None => "refused",
+            Some(true) => "all",
+            Some(false) => "some",
+        };
+        println!("{label} tid_known={} table={table} n={n:?} n_clean={n_clean:?} blocked={blocked} ", u64::from(tid != 0));
     }
     // SAFETY: the limit read above.
     unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &old) };
