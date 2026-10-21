@@ -17033,6 +17033,61 @@ fn a_case_folded_at_bind_reads_each_parameter_as_its_type() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-1de981755-rest MED-4 (its PG 18.6 probe #89-#99, #115-#119, #130-#133, probe2 #49-#51): AND and OR are
+/// reduced as PostgreSQL's simplify_and_arguments reduces them: their arguments (nested ANDs or ORs flattened) are
+/// simplified left to right, so an immutable constant argument before the first constant that decides (false for
+/// AND, true for OR; a literal, a cast of one, NOT of one, or a comparison of integer literals) is evaluated and
+/// raises, and nothing after it is. ef15b1c6b decided on a literal alone and dropped every other argument:
+/// encode('abc', 'nosuch') = '' AND false answered f (PG 22023), (1 = 0) AND bad raised where PG answers f, and
+/// nextval('sq') > 0 AND 1 = 0 called nextval.
+#[test]
+fn and_and_or_are_simplified_as_postgresql_simplifies_them() {
+    let dir = Scratch::new("bool-simplify");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in ["CREATE TABLE ft2(a int)", "INSERT INTO ft2 VALUES (1), (2)", "CREATE SEQUENCE sq"] {
+        a.q(sql).ok(sql);
+    }
+    let bad = Err(("22023", "unrecognized encoding: \"nosuch\""));
+    let cases: Vec<(&str, Result<Vec<Vec<&str>>, (&str, &str)>)> = vec![
+        ("SELECT (1 = 0) AND encode('abc', 'nosuch') = '' AS a", Ok(vec![vec!["f"]])),
+        ("SELECT NOT true AND encode('abc', 'nosuch') = '' AS a", Ok(vec![vec!["f"]])),
+        ("SELECT false::boolean AND encode('abc', 'nosuch') = '' AS a", Ok(vec![vec!["f"]])),
+        ("SELECT NULL AND false AND encode('abc', 'nosuch') = '' AS a", Ok(vec![vec!["f"]])),
+        ("SELECT encode('abc', 'nosuch') = '' AND false AS a", bad),
+        ("SELECT true OR encode('abc', 'nosuch') = '' AS a", Ok(vec![vec!["t"]])),
+        ("SELECT (1 = 1) OR encode('abc', 'nosuch') = '' AS a", Ok(vec![vec!["t"]])),
+        ("SELECT count(*) FROM ft2 WHERE a = 1 AND false", Ok(vec![vec!["0"]])),
+        ("SELECT a FROM ft2 WHERE (a = 1 AND false) IS NOT TRUE ORDER BY a", Ok(vec![vec!["1"], vec!["2"]])),
+        ("SELECT a FROM ft2 WHERE encode('abc', 'nosuch') = '' AND false", bad),
+        ("SELECT a FROM ft2 WHERE false AND encode('abc', 'nosuch') = ''", Ok(vec![])),
+        ("SELECT a FROM ft2 WHERE a > 0 AND (1 = 0) AND encode('abc', 'nosuch') = ''", Ok(vec![])),
+        ("SELECT nextval('sq') AS a", Ok(vec![vec!["1"]])),
+        ("SELECT nextval('sq') > 0 AND 1 = 0 AS a", Ok(vec![vec!["f"]])),
+        ("SELECT nextval('sq') AS a", Ok(vec![vec!["2"]])),
+        ("SELECT a FROM ft2 WHERE nextval('sq') > 0 AND false", Ok(vec![])),
+        ("SELECT x FROM (SELECT encode('abc', 'nosuch') = '' AND false AS x) s", bad),
+        ("SELECT a FROM ft2 WHERE (a = 1 OR encode('abc', 'nosuch') = '') OR true ORDER BY a", bad),
+    ];
+    let mut wrong = Vec::new();
+    for (sql, want) in &cases {
+        let r = a.q(sql);
+        let got = match &r.error {
+            Some(e) => Err((e.code.clone(), e.message.clone())),
+            None => Ok(r.rows.clone()),
+        };
+        let agrees = match (want, &got) {
+            (Ok(rows), Ok(g)) => *g == rows.iter().map(|row| row.iter().map(|v| Some(v.to_string())).collect::<Vec<_>>()).collect::<Vec<_>>(),
+            (Err((code, message)), Err((g_code, g_message))) => code == g_code && message == g_message,
+            _ => false,
+        };
+        if !agrees {
+            wrong.push(format!("{sql}: PG {want:?}, got {got:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-351702a43 LOW-6 (its PG 18.6 probe3 #161): a CASE is typed by its results (an int4 constant and an int4
 /// function: 23); the walk never typed a CASE column, and the engine announced it text (25).
 #[test]
