@@ -16102,6 +16102,34 @@ fn a_bound_exponent_or_infinity_overflows_numeric_at_bind() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-7128c6f73 MED-3 (its PG 18.6 probe4 #83, #103): a bound 'NaN' for a numeric column was read as a float
+/// NaN, which the engine stores as NULL: INSERT 0 1, and the row read null where PG stores NaN. The engine holds no NaN
+/// (PGDIV-NAN), so a bound NaN, for a numeric or a float parameter, is refused 0A000 at Bind as the literal is, and
+/// nothing is stored.
+#[test]
+fn a_bound_nan_is_refused_never_stored_as_null() {
+    let dir = Scratch::new("bound-nan");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE nb(id int PRIMARY KEY, n numeric(6,2), f float8)").ok("create");
+    let mut wrong = Vec::new();
+    for (sql, value) in [
+        ("INSERT INTO nb (id, n) VALUES (1, $1)", "NaN"),
+        ("INSERT INTO nb (id, n) VALUES (2, $1)", "nan"),
+        ("INSERT INTO nb (id, f) VALUES (3, $1)", "NaN"),
+    ] {
+        let (types, error) = a.bind_round(sql, &[], &[Some(value.as_bytes())], &[]);
+        if error.as_ref().map(|e| e.code.as_str()) != Some("0A000") {
+            wrong.push(format!("{sql} with '{value}': messages {:?} error {error:?}, refused 0A000 (PGDIV-NAN)", String::from_utf8_lossy(&types)));
+        }
+    }
+    let r = a.q("SELECT count(*) FROM nb");
+    if r.rows != vec![vec![Some("0".to_string())]] {
+        wrong.push(format!("nb holds {:?} rows after the refusals, want 0", r.rows));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-7128c6f73 HIGH-1, the lead's ruling (DECISIONS d2bf57effb; the review's PG 18.6 probe4 #3-#28, #47, probe5): a
 /// decimal of more than 15 significant digits reaches the engine as a REAL, which rounds it, so it is REFUSED 0A000 on
 /// every write path and in every comparison, never rounded and never stored as text. ef2141683 stored an INSERT VALUES
