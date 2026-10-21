@@ -3825,8 +3825,20 @@ impl BTreeTable {
             }
 
             if let Some(default) = &column.default {
+                // A DEFAULT that is not one of SQLite's bare forms (a PostgreSQL `serial` key's
+                // `nextval('k_id_seq')`, `1 + 2`, a CAST) prints in parentheses, or the rewritten
+                // row does not reparse (REVIEW-engine-2bdcd32c6 HIGH 3). Mutant
+                // `default_printed_bare` (test and fe-mutants builds only): always bare, as before.
                 sql.push_str(" DEFAULT ");
-                sql.push_str(&default.to_string());
+                if default.is_bare_default()
+                    || crate::branch::store::fe_mutant("default_printed_bare")
+                {
+                    sql.push_str(&default.to_string());
+                } else {
+                    sql.push('(');
+                    sql.push_str(&default.to_string());
+                    sql.push(')');
+                }
             }
 
             if let Some(collation) = column.collation_opt() {
