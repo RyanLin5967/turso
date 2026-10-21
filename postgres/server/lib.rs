@@ -4263,6 +4263,15 @@ fn engine_info(e: &LimboError) -> Box<ErrorInfo> {
         };
         return error(e.sql_error_kind(), message.to_string());
     }
+    // A 22P02 the translator wrote as PostgreSQL's own text ('invalid input syntax for type oid:
+    // "1.5"') goes out as that text, with no "Parse error: " prefix; it stays a parse error inside,
+    // so its condition survives a rewording (wire-rev-1de981755-rest MED-9; 3d31f21b9 moved it to
+    // another variant, and c44_rewording_a_parser_error_preserves_its_condition caught it).
+    if let LimboError::ParseError(message) = e {
+        if message.kind() == Some(SqlErrorKind::InvalidTextRepresentation) {
+            return error(e.sql_error_kind(), message.to_string());
+        }
+    }
     error(e.sql_error_kind(), e.to_string())
 }
 

@@ -2366,17 +2366,11 @@ pub(crate) fn session_translation(
 /// A translation's refusal as the engine error it is reported with: PostgreSQL's own message, with
 /// no "Parse error: " prefix, for the conditions whose text this frontend writes as PostgreSQL's
 /// (42704 'access method "x" does not exist', 42P16 'column "a" has pseudo-type x'; wire-rev-uw2
-/// LOW; 22P02 'invalid input syntax for type oid: "1.5"', wire-rev-1de981755-rest MED-9), and a
-/// parse error as before for every other.
+/// LOW), and a parse error as before for every other.
 fn translation_error(e: turso_pg_parser::ParseError) -> LimboError {
     let message: SqlErrorMessage = e.into();
     match message.kind() {
-        Some(
-            SqlErrorKind::UndefinedObject
-            | SqlErrorKind::InvalidTableDefinition
-            | SqlErrorKind::NumericValueOutOfRange
-            | SqlErrorKind::InvalidTextRepresentation,
-        ) => {
+        Some(SqlErrorKind::UndefinedObject | SqlErrorKind::InvalidTableDefinition | SqlErrorKind::NumericValueOutOfRange) => {
             LimboError::InvalidArgument(message)
         }
         _ => LimboError::ParseError(message),
