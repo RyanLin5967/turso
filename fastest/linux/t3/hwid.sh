@@ -36,11 +36,19 @@ run() { echo "\$ $*"; "$@" 2>&1; echo "[rc=$?]"; }
   run findmnt -o TARGET,SOURCE,FSTYPE,OPTIONS
   run losetup -l -O NAME,BACK-FILE,DIO
   # the sysfs layout devguard's rules read, recorded so the next box settles what the fakes assume (devguard round-2
-  # attack LOW 2 and LOW 3): each block device's controller link, holders, slaves and multipath paths (the kernel
+  # attack LOW 2 and LOW 3; review 5 LOW 17, 18): nvme_core's multipath parameter, every hidden NVMe path device, and
+  # per block device its sysfs node (a native-multipath head lives under devices/virtual/nvme-subsystem), its
+  # controller link (readlink -e: "-" when there is none, not a path that does not exist), holders, slaves, the
+  # multipath directory ("absent" when there is none, "[]" when it is empty) and the NVMe subsystem NQN (the kernel
   # release is uname -a's third field above)
-  run bash -c 'for b in /sys/block/*; do
-    printf "%s device=%s holders=[%s] slaves=[%s] multipath=[%s]\n" "${b##*/}" "$(readlink -f "$b/device" 2>/dev/null)" \
-      "$(ls "$b/holders" 2>/dev/null | xargs)" "$(ls "$b/slaves" 2>/dev/null | xargs)" "$(ls "$b/multipath" 2>/dev/null | xargs)"
+  run bash -c 'echo "nvme_core.multipath=$(cat /sys/module/nvme_core/parameters/multipath 2>/dev/null || echo absent)"
+  echo "nvme_paths=[$(ls -d /sys/class/nvme/nvme*/nvme*c*n* 2>/dev/null | xargs -n1 basename 2>/dev/null | xargs)]"
+  for b in /sys/block/*; do
+    if [ -d "$b/multipath" ]; then mp="[$(ls "$b/multipath" | xargs)]"; else mp=absent; fi
+    printf "%s node=%s device=%s holders=[%s] slaves=[%s] multipath=%s subsysnqn=%s\n" "${b##*/}" \
+      "$(readlink -e "$b" 2>/dev/null || echo -)" "$(readlink -e "$b/device" 2>/dev/null || echo -)" \
+      "$(ls "$b/holders" 2>/dev/null | xargs)" "$(ls "$b/slaves" 2>/dev/null | xargs)" "$mp" \
+      "$(cat "$b/device/subsysnqn" 2>/dev/null || echo -)"
   done'
 } > "$out/hwid.txt" 2>&1
 

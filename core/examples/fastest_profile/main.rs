@@ -6,6 +6,19 @@
 //!   fastest_profile --dir DIR [--class full|fsync|off|async] [--catalog] [--clients C]
 //!       [--ops N | --ops-total T] [--warmup W | --warmup OPS:S:MAX_S] [--rows R] [--mode phases|cycle] [--out DIR]
 //!       [--perf-ctl CTL_FIFO,ACK_FIFO [--perf-only WINDOW]] [--mark] [--phases K]
+//!       [--seed-sql FILE --age-sql FILE [--live L] [--dump-trunk FILE]]
+//!
+//! * `--seed-sql FILE --age-sql FILE` (the T3 runner's parent, the one every system times against: comp's
+//!   gen_seed.py `sql --rows R` and `age --rows R --updates K` streams): the trunk is built from FILE's statements,
+//!   each one autocommitted as the competitors' seeds feed them, then aged by the age stream's single-row UPDATEs, each
+//!   autocommitted; `--rows R` must equal the rows loaded. The first write is then the competitors' M1 op,
+//!   `UPDATE t SET v = v + 1 WHERE id = <random>`, and the trunk check is its count and sum(v) unchanged by the run.
+//!   `--live L` makes L live branches after the aging (prebranch: each created, connected and given one M1 write,
+//!   untimed) that every cell runs at; their MEASURED count is recorded, and they are the only branches left after
+//!   the deletes. `--dump-trunk FILE` writes the trunk's t as `id\tv\tpad` lines after the prebranch, for the read-back
+//!   (comp's fixture.py write --readback). summary.json's `fixture` records the stream lines applied, the measured
+//!   live count and the trunk's count and sum. Without these flags the trunk is the profiling job's own seed (R rows of
+//!   `v TEXT`) and the first write sets `v = 'w-<branch>'`, as before.
 //!
 //! One op per client is the cycle: `trunk.create_branch(name)` (create), `db.connect_named(name)`
 //! (connect), one autocommit UPDATE of a random existing row of `t` (first write: it copies a
@@ -51,7 +64,15 @@
 //!
 //! Output (`--out`): `ops.tsv` (client, op, phase, ns) and `summary.json` (per phase: ops,
 //! p50/p90/p99/max/mean ns, window seconds, ops/s, and the engine's own sync counter delta over
-//! the window). Any failed operation prints `NOT A RESULT` and exits 1; `--class async` exits 4
+//! the window; each window's CLOCK_REALTIME bounds `t0_realtime_s`/`t1_realtime_s` and the measured span
+//! `tm0_realtime_s`/`tm1_realtime_s`, the competitors' names, so the shared tracer sweeper's cost is read over the
+//! measured windows: the MED 12 ruling). Under `--warmup OPS:S:MAX_S`, `warmup-live.json` is the live warm-up's own
+//! record `{rule, claims_ns, stop_at, warm_ops, capped}`: every claim it judged, in ns since its start, in judging
+//! order, and the decision, which `warmup_conformance.py live` replays through `--warmup-replay` (review 5 MED 8). The
+//! warm-up's clock starts only after every client is ready (a ready barrier, then t0, then a go barrier, as bbload's
+//! g_t0), recorded as `warmup.t0_after_ready_ns` (t0 minus the last client's ready). Every window also records the
+//! engine's four branch exception counters at its open and close (`exception_counters {before, after}`, from
+//! `Database::branch_exception_counters()`; the lead's routing ruling, DECISIONS 2026-10-15T05:16:51Z). Any failed operation prints `NOT A RESULT` and exits 1; `--class async` exits 4
 //! with `NOT AVAILABLE` while the engine has no async-durable class (SyncClass is Off, Fsync,
 //! FullFsync at the time of writing), so a caller records the arm as not run instead of
 //! measuring something else.
@@ -60,7 +81,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use turso_core::branch::{sync_counts, BranchDurability, SyncClass};
 use turso_core::{
@@ -68,6 +89,11 @@ use turso_core::{
 };
 
 const PHASES: [&str; 4] = ["create", "connect", "write", "delete"];
+
+/// `Database::branch_exception_counters()`, in its order: the counted exceptions to "no operation waits on background
+/// work" (the lead's routing ruling, fastest DECISIONS 2026-10-15T05:16:51Z). Every window records them at its open
+/// and close (`exception_counters {before, after}`); a cell whose window moved one is labelled and not credited.
+const EXCEPTIONS: [&str; 4] = ["hardcap_upgrades", "header_raise_exclusive", "inline_compaction_syncs", "compaction_waits"];
 
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
@@ -95,7 +121,14 @@ struct Args {
     perf_only: Option<String>,
     mark: bool,
     phases: usize,
+    seed_sql: Option<PathBuf>,
+    age_sql: Option<PathBuf>,
+    live: usize,
+    dump_trunk: Option<PathBuf>,
 }
+
+/// Set when the trunk is gen_seed's parent (`--seed-sql`): the first write is then the competitors' M1 op.
+static GEN_SEED_PARENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// `--warmup OPS:S:MAX_S` that does not parse (a function, not a closure: one closure has one return type, so
 /// reusing it across the usize and f64 parses did not compile, E0308; fourth lane review HIGH 1).
@@ -140,6 +173,10 @@ fn parse_args() -> Args {
         perf_only: None,
         mark: false,
         phases: 4,
+        seed_sql: None,
+        age_sql: None,
+        live: 0,
+        dump_trunk: None,
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -203,6 +240,10 @@ fn parse_args() -> Args {
             "--perf-only" => a.perf_only = Some(val(&mut i)),
             "--mark" => a.mark = true,
             "--phases" => a.phases = num(val(&mut i), "--phases"),
+            "--seed-sql" => a.seed_sql = Some(PathBuf::from(val(&mut i))),
+            "--age-sql" => a.age_sql = Some(PathBuf::from(val(&mut i))),
+            "--live" => a.live = num(val(&mut i), "--live"),
+            "--dump-trunk" => a.dump_trunk = Some(PathBuf::from(val(&mut i))),
             x => not_a_result(&format!("unknown argument {x}")),
         }
         i += 1;
@@ -221,6 +262,12 @@ fn parse_args() -> Args {
     }
     if !(1..=4).contains(&a.phases) || (a.phases < 4 && a.mode == Mode::Cycle) {
         not_a_result("--phases is 1-4, and below 4 only in phases mode");
+    }
+    if a.seed_sql.is_some() != a.age_sql.is_some() {
+        not_a_result("--seed-sql and --age-sql go together (the parent and its aging)");
+    }
+    if a.seed_sql.is_none() && (a.live > 0 || a.dump_trunk.is_some()) {
+        not_a_result("--live and --dump-trunk need the gen_seed parent (--seed-sql, --age-sql)");
     }
     if ops_given && a.ops_total.is_some() {
         not_a_result("--ops (per client) and --ops-total (the run's total) are exclusive");
@@ -340,8 +387,28 @@ struct Warm {
     t0: Option<Instant>,
     claimed: usize,
     end: Option<(bool, usize, u64)>,
+    /// every claim judged, ns since t0, in judging order (the stop's claim last): the live record (review 5 MED 8)
+    claims: Vec<u64>,
 }
-static WARM: Mutex<Warm> = Mutex::new(Warm { t0: None, claimed: 0, end: None });
+static WARM: Mutex<Warm> = Mutex::new(Warm { t0: None, claimed: 0, end: None, claims: Vec::new() });
+
+/// Each client's ready instant, pushed just before the ready barrier: the warm-up's t0 follows the latest of them.
+static READY: Mutex<Vec<Instant>> = Mutex::new(Vec::new());
+
+/// This process's TracerPid (/proc/self/status, read whole, as the shared sweeper reads each task's), or None where
+/// there is no /proc (macOS): recorded at the measured span's open and close, as bbload's tracerpid_tm0/tm1.
+fn tracer_pid() -> Option<u64> {
+    let st = std::fs::read_to_string("/proc/self/status").ok()?;
+    st.lines().find_map(|l| l.strip_prefix("TracerPid:")).and_then(|v| v.trim().parse().ok())
+}
+
+/// CLOCK_REALTIME in seconds, as the shared sweeper's EPOCHREALTIME reads it.
+fn realtime_s() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| not_a_result("the realtime clock is before 1970"))
+        .as_secs_f64()
+}
 
 /// bbload's warm-up decision, the definition (artie frontier/fastest/tools/loadgen/bbload.c claim_op at ec9bba5552,
 /// factored there as warm_ends; the lead's ruling on fourth lane review LOW 14, PREREG annex A23), made at a claim:
@@ -373,6 +440,7 @@ fn warm_claim(rule: &(usize, f64, f64, String)) -> bool {
         .t0
         .map(|t| t.elapsed().as_nanos() as u64)
         .unwrap_or_else(|| not_a_result("a warm-up claim before its start"));
+    w.claims.push(el);
     match warm_ends(w.claimed, el, rule.0, secs_ns(rule.1), secs_ns(rule.2)) {
         None => {
             w.claimed += 1;
@@ -488,7 +556,11 @@ pub fn fastest_phase_connect(db: &Arc<Database>, name: &str) -> Arc<Connection> 
 #[inline(never)]
 pub fn fastest_phase_write(conn: &Arc<Connection>, id: i64, name: &str) {
     retry(2, &format!("first write on {name}"), || {
-        conn.execute(format!("UPDATE t SET v = 'w-{name}' WHERE id = {id}"))
+        if GEN_SEED_PARENT.load(Ordering::Relaxed) {
+            conn.execute(format!("UPDATE t SET v = v + 1 WHERE id = {id}"))
+        } else {
+            conn.execute(format!("UPDATE t SET v = 'w-{name}' WHERE id = {id}"))
+        }
     });
 }
 
@@ -533,7 +605,9 @@ fn client(id: usize, db: Arc<Database>, a: &Args, gate: &Barrier) -> [Vec<u64>; 
         }
     };
     let n = a.ops_of[id];
-    gate.wait(); // ready
+    READY.lock().unwrap_or_else(|e| e.into_inner()).push(Instant::now());
+    gate.wait(); // ready: every client connected and set up
+    gate.wait(); // go: the main thread has started the warm-up's clock
     if let Some(rule) = &a.warm_rule {
         let mut k = 0usize;
         while warm_claim(rule) {
@@ -591,6 +665,22 @@ fn seed(trunk: &Arc<Connection>, rows: i64) {
     }
 }
 
+/// The statements of a gen_seed.py stream, one per line, each executed (autocommitted) on the trunk; the count.
+fn feed(trunk: &Arc<Connection>, path: &Path) -> usize {
+    let text = std::fs::read_to_string(path).unwrap_or_else(|e| not_a_result(&format!("{}: {e}", path.display())));
+    let mut n = 0;
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        retry(0, &format!("{}: line {}", path.display(), n + 1), || trunk.execute(line));
+        n += 1;
+    }
+    n
+}
+
+/// The trunk's (count, sum(v)) of t, the parent's read-back halves the run must leave unchanged.
+fn count_sum(trunk: &Arc<Connection>) -> (i64, i64) {
+    (scalar(trunk, "SELECT count(*) FROM t"), scalar(trunk, "SELECT coalesce(sum(v), 0) FROM t"))
+}
+
 /// One integer from a one-row, one-column query.
 fn scalar(conn: &Arc<Connection>, sql: &str) -> i64 {
     let rows = conn
@@ -637,10 +727,63 @@ fn main() {
     std::fs::create_dir_all(&a.dir).unwrap_or_else(|e| not_a_result(&format!("mkdir: {e}")));
     let db = open_db(&a.dir.join("profile.db"), &a);
     let trunk = db.connect().unwrap_or_else(|e| not_a_result(&format!("connect: {e}")));
-    seed(&trunk, a.rows);
+    // (seed lines, age lines) applied, and the trunk's count and sum after them: the gen_seed parent, or none
+    let parent = match (&a.seed_sql, &a.age_sql) {
+        (Some(sq), Some(ag)) => {
+            GEN_SEED_PARENT.store(true, Ordering::Relaxed);
+            let (ns, na) = (feed(&trunk, sq), feed(&trunk, ag));
+            let (count, sum) = count_sum(&trunk);
+            if count != a.rows {
+                not_a_result(&format!("the parent holds {count} rows, --rows {}", a.rows));
+            }
+            Some((ns, na, count, sum))
+        }
+        _ => {
+            seed(&trunk, a.rows);
+            None
+        }
+    };
     // The store's files are made by the first fork: one unmeasured create and delete.
     fastest_phase_create(&trunk, "setup-0");
     fastest_phase_delete(&db, "setup-0");
+    // prebranch: the live branches every cell runs at, each with one private M1 write, untimed; then their MEASURED
+    // count (main excluded), and the trunk's t for the read-back
+    let mut prng = Rng(0x5EED_0000_0000_0001);
+    for i in 0..a.live {
+        let name = format!("live-{i}");
+        retry(0, &format!("prebranch create {name}"), || trunk.create_branch(&name));
+        let conn = retry(1, &format!("prebranch connect {name}"), || db.connect_named(&name));
+        let row = 1 + prng.below(a.rows as u64) as i64;
+        retry(2, &format!("prebranch write on {name}"), || conn.execute(format!("UPDATE t SET v = v + 1 WHERE id = {row}")));
+        drop(conn);
+    }
+    let live_measured = db.branch_ids().unwrap_or_else(|e| not_a_result(&format!("branch_ids: {e}"))).len();
+    if live_measured != a.live {
+        not_a_result(&format!("{live_measured} branches live after the prebranch of {}", a.live));
+    }
+    if let Some((_, _, count, sum)) = parent {
+        if count_sum(&trunk) != (count, sum) {
+            not_a_result("the prebranch's writes reached the trunk");
+        }
+    }
+    if let Some(path) = &a.dump_trunk {
+        let rows = trunk
+            .prepare("SELECT id, v, pad FROM t ORDER BY id")
+            .and_then(|mut s| s.run_collect_rows())
+            .unwrap_or_else(|e| not_a_result(&format!("dump the trunk: {e}")));
+        let mut text = String::with_capacity(rows.len() * 120);
+        for r in &rows {
+            let (Some(id), Some(v), Some(pad)) = (
+                r.first().and_then(|x| x.as_int()),
+                r.get(1).and_then(|x| x.as_int()),
+                r.get(2).and_then(|x| x.to_text()),
+            ) else {
+                not_a_result("dump the trunk: a row that is not (int, int, text)")
+            };
+            text.push_str(&format!("{id}\t{v}\t{pad}\n"));
+        }
+        std::fs::write(path, text).unwrap_or_else(|e| not_a_result(&format!("{}: {e}", path.display())));
+    }
     let mut fence = Fence::open(&a);
 
     let windows_wanted: Vec<&str> = match a.mode {
@@ -650,8 +793,14 @@ fn main() {
     let gate = Barrier::new(a.clients + 1);
     // seconds from the warm-up's start to every client done (under a rule, the claim that ended it is in WARM)
     let mut warm_secs = 0.0f64;
-    // (window, secs, engine sync counter deltas by field, busy retries in the window, all phases)
-    let mut windows: Vec<(String, f64, Vec<(String, u64)>, u64)> = Vec::new();
+    // the warm-up's start minus the last client's ready, ns (>= 0 by construction; recorded so a gate can see it)
+    let mut t0_after_ready_ns = 0i64;
+    // this process's TracerPid at the first window's open and the last one's close
+    let (mut tp0, mut tp1) = (None, None);
+    // (window, secs, engine sync counter deltas by field, busy retries in the window, realtime open and close, the
+    // engine's exception counters at open and close)
+    #[allow(clippy::type_complexity)]
+    let mut windows: Vec<(String, f64, Vec<(String, u64)>, u64, f64, f64, [u64; 4], [u64; 4])> = Vec::new();
     let retries = || RETRIES.iter().map(|r| r.load(Ordering::Relaxed)).sum::<u64>();
     let per_client: Vec<[Vec<u64>; 4]> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..a.clients)
@@ -660,11 +809,25 @@ fn main() {
                 s.spawn(move || client(id, db, a, gate))
             })
             .collect();
-        // the warm-up's clock starts before the clients are let go, so no claim precedes it; the clients decide its
-        // end at their claims (warm_claim), as bbload's do
+        // the warm-up's clock starts after every client is ready and before any is let go (review 5 MED 8: bbload's
+        // g_t0), so no connect or setup counts as warm-up and no claim precedes it; the clients decide its end at
+        // their claims (warm_claim), as bbload's do
+        gate.wait(); // ready
         let t = Instant::now();
         WARM.lock().unwrap_or_else(|e| e.into_inner()).t0 = Some(t);
-        gate.wait(); // ready
+        let last_ready = READY
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or_else(|| not_a_result("no client recorded its ready"));
+        t0_after_ready_ns = if t >= last_ready {
+            (t - last_ready).as_nanos() as i64
+        } else {
+            -((last_ready - t).as_nanos() as i64)
+        };
+        gate.wait(); // go
         fence.marker("FASTEST_PHASE warmup begin");
         gate.wait(); // warm-up done
         warm_secs = t.elapsed().as_secs_f64();
@@ -672,18 +835,30 @@ fn main() {
         for w in &windows_wanted {
             let s0 = engine_syncs();
             let r0 = retries();
+            let e0 = db.branch_exception_counters();
+            // the TracerPid reads sit outside every window's fences (no counted or marked syscall), the first before
+            // the first window opens and the last after the last one closes
+            if windows.is_empty() {
+                tp0 = Some(tracer_pid());
+            }
             fence.begin(w);
+            let rt0 = realtime_s();
             let t = Instant::now();
             gate.wait(); // every client starts the window
             gate.wait(); // every client has finished it
             let secs = t.elapsed().as_secs_f64();
+            let rt1 = realtime_s();
+            let e1 = db.branch_exception_counters();
             fence.end(w);
+            if windows.len() + 1 == windows_wanted.len() {
+                tp1 = Some(tracer_pid());
+            }
             let s1 = engine_syncs();
             if s1.is_empty() || s1.len() != s0.len() {
                 not_a_result(&format!("engine sync counters unreadable: {:?}", sync_counts()));
             }
             let delta = s1.iter().zip(&s0).map(|((k, b), (_, a))| (k.clone(), b - a)).collect();
-            windows.push((w.to_string(), secs, delta, retries() - r0));
+            windows.push((w.to_string(), secs, delta, retries() - r0, rt0, rt1, e0, e1));
         }
         handles
             .into_iter()
@@ -694,19 +869,25 @@ fn main() {
     // What the run must have left: every branch deleted, the trunk's rows all there and untouched
     // by any branch's first write.
     let live = db.branch_ids().unwrap_or_else(|e| not_a_result(&format!("branch_ids: {e}")));
-    if a.phases == 4 && !live.is_empty() {
-        not_a_result(&format!("{} branches still live after every delete", live.len()));
+    if a.phases == 4 && live.len() != a.live {
+        not_a_result(&format!("{} branches live after every delete, the prebranch's {}", live.len(), a.live));
     }
     if a.phases < 4 {
         eprintln!("note: --phases {}: {} branches left live by design; the delete check was skipped", a.phases, live.len());
     }
-    if scalar(&trunk, "SELECT count(*) FROM t") != a.rows
-        || scalar(&trunk, "SELECT count(*) FROM t WHERE v LIKE 'w-%'") != 0
-    {
+    let changed = match parent {
+        Some((_, _, count, sum)) => count_sum(&trunk) != (count, sum),
+        None => {
+            scalar(&trunk, "SELECT count(*) FROM t") != a.rows
+                || scalar(&trunk, "SELECT count(*) FROM t WHERE v LIKE 'w-%'") != 0
+        }
+    };
+    if changed {
         not_a_result("the trunk changed: a branch's write reached it, or rows were lost");
     }
 
     let ops_total: usize = a.ops_of.iter().sum();
+    let mut warm_live = None;
     let (rule_text, warm_rule) = match &a.warm_rule {
         // the claim that ended it (its cycles claimed, its time, capped), the cycles over the whole warm-up (read after
         // every client finished: the same count, as no claim after the end is counted), and the drain apart
@@ -714,10 +895,16 @@ fn main() {
             let w = WARM.lock().unwrap_or_else(|e| e.into_inner());
             let (capped, at_stop, stop_ns) = w.end.unwrap_or_else(|| not_a_result("the warm-up never ended"));
             let stop = stop_ns as f64 / 1e9;
+            let claims: Vec<String> = w.claims.iter().map(u64::to_string).collect();
+            warm_live = Some(format!(
+                "{{\"rule\":\"{text}\",\"claims_ns\":[{}],\"stop_at\":{at_stop},\"warm_ops\":{at_stop},\"capped\":{}}}\n",
+                claims.join(","),
+                u8::from(capped)
+            ));
             (
                 text.clone(),
                 format!(
-                    "{{\"rule\":\"{text}\",\"ops_at_stop\":{at_stop},\"ops\":{},\"stop_secs\":{stop:.3},\"drain_secs\":{:.3},\"secs\":{:.3},\"capped\":{capped}}}",
+                    "{{\"rule\":\"{text}\",\"ops_at_stop\":{at_stop},\"ops\":{},\"stop_secs\":{stop:.3},\"drain_secs\":{:.3},\"secs\":{:.3},\"capped\":{capped},\"t0_after_ready_ns\":{t0_after_ready_ns}}}",
                     w.claimed,
                     warm_secs - stop,
                     warm_secs
@@ -727,17 +914,23 @@ fn main() {
         None => (
             format!("cycles_per_client:{}", a.warmup),
             format!(
-                "{{\"rule\":\"cycles_per_client:{}\",\"ops\":{},\"secs\":{:.3}}}",
+                "{{\"rule\":\"cycles_per_client:{}\",\"ops\":{},\"secs\":{:.3},\"t0_after_ready_ns\":{t0_after_ready_ns}}}",
                 a.warmup,
                 a.clients * a.warmup,
                 warm_secs
             ),
         ),
     };
+    // the measured span's bounds are the first window's open and the last one's close: a run with no window has none
+    // (unreachable: --phases is 1-4 and cycle mode has one window), and is refused rather than printed as NaN
+    let (Some(first), Some(last)) = (windows.first(), windows.last()) else {
+        not_a_result("no measured window, so no measured span")
+    };
+    let (tm0, tm1) = (first.4, last.5);
     let even = a.ops_of.iter().all(|&n| n == a.ops_of[0]);
     let by_client: Vec<String> = a.ops_of.iter().map(|n| n.to_string()).collect();
     let mut json = format!(
-        "{{\"driver\":\"fastest_profile\",\"class\":\"{}\",\"catalog\":{},\"clients\":{},\"ops_per_client\":{},\"ops_by_client\":[{}],\"ops_total\":{ops_total},\"ops_total_asked\":{},\"warmup_per_client\":{},\"warmup_rule\":\"{rule_text}\",\"warmup\":{warm_rule},\"rows\":{},\"phases_run\":{},\"mode\":\"{}\",\"windows\":[",
+        "{{\"driver\":\"fastest_profile\",\"class\":\"{}\",\"catalog\":{},\"clients\":{},\"ops_per_client\":{},\"ops_by_client\":[{}],\"ops_total\":{ops_total},\"ops_total_asked\":{},\"warmup_per_client\":{},\"warmup_rule\":\"{rule_text}\",\"warmup\":{warm_rule},\"rows\":{},\"phases_run\":{},\"mode\":\"{}\",\"tm0_realtime_s\":{:.6},\"tm1_realtime_s\":{:.6},\"tracerpid_tm0\":{},\"tracerpid_tm1\":{},\"windows\":[",
         a.class_name,
         a.catalog,
         a.clients,
@@ -747,18 +940,34 @@ fn main() {
         if a.warm_rule.is_some() { "null".into() } else { a.warmup.to_string() },
         a.rows,
         a.phases,
-        if a.mode == Mode::Phases { "phases" } else { "cycle" }
+        if a.mode == Mode::Phases { "phases" } else { "cycle" },
+        tm0,
+        tm1,
+        tp0.flatten().map_or("null".to_string(), |v| v.to_string()),
+        tp1.flatten().map_or("null".to_string(), |v| v.to_string())
     );
-    for (k, (name, secs, syncs, busy)) in windows.iter().enumerate() {
+    for (k, (name, secs, syncs, busy, rt0, rt1, e0, e1)) in windows.iter().enumerate() {
         let fields: Vec<String> = syncs.iter().map(|(f, v)| format!("\"{f}\":{v}")).collect();
+        let exc = |c: &[u64; 4]| -> String {
+            EXCEPTIONS.iter().zip(c).map(|(n, v)| format!("\"{n}\":{v}")).collect::<Vec<_>>().join(",")
+        };
         let total: u64 = syncs.iter().map(|(_, v)| v).sum();
         json.push_str(&format!(
-            "{}{{\"window\":\"{name}\",\"secs\":{secs:.6},\"engine_syncs\":{{{}}},\"engine_syncs_total\":{total},\"busy_retries\":{busy},\"ops\":{ops_total}}}",
+            "{}{{\"window\":\"{name}\",\"secs\":{secs:.6},\"engine_syncs\":{{{}}},\"engine_syncs_total\":{total},\"busy_retries\":{busy},\"ops\":{ops_total},\"t0_realtime_s\":{rt0:.6},\"t1_realtime_s\":{rt1:.6},\"exception_counters\":{{\"before\":{{{}}},\"after\":{{{}}}}}}}",
             if k > 0 { "," } else { "" },
-            fields.join(",")
+            fields.join(","),
+            exc(e0),
+            exc(e1)
         ));
     }
-    json.push_str("],\"phases\":{");
+    json.push(']');
+    if let Some((ns, na, count, sum)) = parent {
+        json.push_str(&format!(
+            ",\"fixture\":{{\"seed_lines\":{ns},\"age_lines\":{na},\"prebranch\":{},\"live_branches\":{live_measured},\"trunk_count\":{count},\"trunk_sum\":{sum}}}",
+            a.live
+        ));
+    }
+    json.push_str(",\"phases\":{");
     let mut tsv = String::from("client\top\tphase\tns\n");
     let reported = if a.mode == Mode::Cycle { 4 } else { a.phases };
     for (p, name) in PHASES[..reported].iter().enumerate() {
@@ -790,5 +999,9 @@ fn main() {
         std::fs::create_dir_all(out).unwrap_or_else(|e| not_a_result(&format!("mkdir out: {e}")));
         std::fs::write(out.join("summary.json"), &json).unwrap_or_else(|e| not_a_result(&format!("write: {e}")));
         std::fs::write(out.join("ops.tsv"), &tsv).unwrap_or_else(|e| not_a_result(&format!("write: {e}")));
+        if let Some(live) = &warm_live {
+            std::fs::write(out.join("warmup-live.json"), live)
+                .unwrap_or_else(|e| not_a_result(&format!("write: {e}")));
+        }
     }
 }

@@ -133,6 +133,19 @@ fn foldable(node: &pg_query::protobuf::Node) -> bool {
     }
 }
 
+/// numerictypmodin's bounds on numeric(p, s): precision 1 to 1000, scale -1000 to 1000, each refused
+/// 22023 with PostgreSQL's message.
+fn numeric_typmod_bounds(params: &[i64]) -> Result<(), ParseError> {
+    let refuse = |message: String| Err(ParseError::ParseError(SqlErrorMessage::classified(SqlErrorKind::InvalidParameterValue, message)));
+    if let Some(p) = params.first().filter(|p| !(1..=1000).contains(*p)) {
+        return refuse(format!("NUMERIC precision {p} must be between 1 and 1000"));
+    }
+    if let Some(s) = params.get(1).filter(|s| !(-1000..=1000).contains(*s)) {
+        return refuse(format!("NUMERIC scale {s} must be between -1000 and 1000"));
+    }
+    Ok(())
+}
+
 /// PostgreSQL's oidin (uint32in_subr): strtoul with base 0 (leading spaces, a sign, 0x hexadecimal,
 /// a leading 0 octal), trailing spaces allowed, and a value that is neither a uint32 nor a negative
 /// int32 refused; 22P02 for no digits or other text, 22003 past the range, each naming the input as
@@ -232,6 +245,10 @@ pub struct PostgreSQLTranslator {
     /// lowercased ([`PostgreSQLTranslator::with_known_types`]): a cast to one is kept by name, so
     /// the engine runs its checks.
     known_types: Option<std::collections::HashSet<String>>,
+    /// The casts to an integer type (by their parse locations) whose operand is a column the caller
+    /// knows is declared text ([`PostgreSQLTranslator::with_text_integer_casts`]): read as int4in
+    /// reads text, where a numeric(p, s) column's decimal text rounds.
+    text_integer_casts: Option<std::collections::HashSet<i32>>,
     /// The cast targets this translation met that are neither built-in nor known, lowercased, for
     /// the caller to look up ([`PostgreSQLTranslator::unmapped_cast_types`]). A cast to a domain
     /// was dropped here, so `CAST(-5 AS dm)` skipped dm's CHECK and returned -5 (the domain CHECK
@@ -309,6 +326,15 @@ impl PostgreSQLTranslator {
     /// its name, so the engine runs the type's checks and coercion.
     pub fn with_known_types(mut self, names: std::collections::HashSet<String>) -> Self {
         self.known_types = Some(names);
+        self
+    }
+
+    /// The translator, told which casts to an integer type read a column declared text (by the
+    /// TypeCast's parse location): each reads its text as int2in/int4in/int8in do, 22P02 for '2.5'
+    /// (wire-rev-1de981755-numeric MED-1: the decimal-text arm rounded it to 3, being unable to
+    /// tell a text column from a numeric(p, s) column's decimal text).
+    pub fn with_text_integer_casts(mut self, locations: std::collections::HashSet<i32>) -> Self {
+        self.text_integer_casts = Some(locations);
         self
     }
 
@@ -944,6 +970,10 @@ impl PostgreSQLTranslator {
         let is_serial = is_serial_type(&pg_type) || is_identity;
 
         let user_type = column_type_checked(&name, &pg_type)?;
+        // numeric(p, s)'s bounds, as numerictypmodin reads them (wire-rev-4a1934c89-beb4 LOW-5).
+        if matches!(pg_type.to_ascii_uppercase().as_str(), "NUMERIC" | "DECIMAL") {
+            numeric_typmod_bounds(&typmods)?;
+        }
         let mapping = map_pg_type(&pg_type, &typmods).ok_or_else(|| {
             ParseError::ParseError(format!("unsupported PostgreSQL type: {pg_type}").into())
         })?;
@@ -1438,6 +1468,9 @@ impl PostgreSQLTranslator {
         let pg_type = extract_type_name(col_def)?;
         let typmods = extract_integer_typmods(col_def)?;
         let user_type = column_type_checked(&col_def.colname, &pg_type)?;
+        if matches!(pg_type.to_ascii_uppercase().as_str(), "NUMERIC" | "DECIMAL") {
+            numeric_typmod_bounds(&typmods)?;
+        }
         let mapping = map_pg_type(&pg_type, &typmods).ok_or_else(|| {
             ParseError::ParseError(format!("unsupported PostgreSQL type: {pg_type}").into())
         })?;
@@ -3951,6 +3984,27 @@ impl PostgreSQLTranslator {
                         arg.node.as_ref(),
                         Some(pg_query::protobuf::node::Node::ColumnRef(_) | pg_query::protobuf::node::Node::ParamRef(_))
                     );
+                    if integer && self.text_integer_casts.as_ref().is_some_and(|l| l.contains(&type_cast.location)) {
+                        let label = match t.names.last().and_then(|n| match &n.node {
+                            Some(pg_query::protobuf::node::Node::String(s)) => Some(s.sval.to_ascii_lowercase()),
+                            _ => None,
+                        }).as_deref() {
+                            Some("int2" | "smallint") => "smallint",
+                            Some("int8" | "bigint") => "bigint",
+                            _ => "integer",
+                        };
+                        return Ok(ast::Expr::Cast {
+                            expr: Box::new(ast::Expr::FunctionCall {
+                                name: pg_name("pg_text_int"),
+                                distinctness: None,
+                                args: vec![Box::new(self.translate_expr(arg)?), Box::new(ast::Expr::Literal(sql_string(label)))],
+                                order_by: vec![],
+                                within_group: vec![],
+                                filter_over: ast::FunctionTail { filter_clause: None, over_clause: None },
+                            }),
+                            type_name: pg_type_name_to_ast_type(t),
+                        });
+                    }
                     if integer && rereadable {
                         let x = || self.translate_expr(arg);
                         let ty = pg_type_name_to_ast_type(t);
@@ -6051,6 +6105,11 @@ impl PostgreSQLTranslator {
             .as_ref()
             .ok_or_else(|| ParseError::ParseError("CREATE DOMAIN missing base type".into()))?;
         let pg_type = extract_type_name_from_typename(type_name_node)?;
+        // A numeric base's precision and scale are bounded as numerictypmodin bounds them, 22023
+        // (wire-rev-4a1934c89-beb4 LOW-5: CREATE DOMAIN dnum AS numeric(1001,2) was made).
+        if matches!(pg_type.to_ascii_uppercase().as_str(), "NUMERIC" | "DECIMAL") {
+            numeric_typmod_bounds(&type_modifiers(type_name_node)?)?;
+        }
         let base_type = match map_pg_type(&pg_type, &[]) {
             // A domain's base stays the built-in REAL for the float types: on the engine's float4
             // / float8 types a domain refused a quoted value ("cannot store TEXT value in REAL

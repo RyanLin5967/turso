@@ -17396,6 +17396,160 @@ fn now_with_an_argument_names_no_function() {
     assert_eq!((e.code.as_str(), e.message.as_str()), ("42883", "function now(integer) does not exist"));
 }
 
+/// wire-rev-1de981755-numeric MED-1 (its PG 18.6 probe9 #1-#7): a text column cast to an integer is read as int4in
+/// reads text, 22P02 'invalid input syntax for type integer: "2.5"' for anything but an integer, while numeric,
+/// numeric(p, s) and float8 columns round. da5854802's decimal-text arm rounded the text '2.5' to 3 and the engine's
+/// cast read '1e3' as 1.
+#[test]
+fn a_text_column_cast_to_an_integer_is_read_as_int4in_reads_it() {
+    let dir = Scratch::new("text-int");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE TABLE cb(id int PRIMARY KEY, n numeric, p numeric(10,2), f float8, s text)",
+        "INSERT INTO cb VALUES (1, 2.5, 2.5, 2.5, '2.5'), (2, 3.5, 3.5, 3.5, '3.5'), (3, -2.5, -2.5, -2.5, '1e3'), (4, 0.5, 0.5, 0.5, ' 7 ')",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    // The bare numeric column n (PG rounds it half away from zero: 3, 4, -3, 1) is the engine's float8 here, the
+    // registered bare-NUMERIC class (a_numeric_column_orders_and_types_as_numeric_through_every_relation), so it is
+    // left out; numeric(p, s) and float8 are judged.
+    let r = a.q("SELECT id, p::int, f::int FROM cb ORDER BY id");
+    let want: Vec<Vec<Option<String>>> = [["1", "3", "2"], ["2", "4", "4"], ["3", "-3", "-2"], ["4", "1", "0"]]
+        .iter()
+        .map(|row| row.iter().map(|v| Some(v.to_string())).collect())
+        .collect();
+    if r.error.is_some() || r.rows != want {
+        wrong.push(format!("numeric and float casts: PG {want:?}; got {:?} {:?}", r.rows, r.error));
+    }
+    for (id, want) in [(1, Err("invalid input syntax for type integer: \"2.5\"")), (3, Err("invalid input syntax for type integer: \"1e3\"")), (4, Ok("7"))] {
+        let sql = format!("SELECT id, s::int FROM cb WHERE id = {id}");
+        let r = a.q(&sql);
+        let agrees = match want {
+            Ok(v) => r.error.is_none() && r.rows == vec![vec![Some(id.to_string()), Some(v.to_string())]],
+            Err(m) => r.error.as_ref().is_some_and(|e| e.code == "22P02" && e.message == m),
+        };
+        if !agrees {
+            wrong.push(format!("{sql}: PG {want:?}; got {:?} {:?}", r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-4a1934c89-beb4 LOW-6 (recorded on iccad2 PG 18.6, a_qualified_name_names_its_schema_as_written.out): a
+/// qualifier names its schema as written, folded to lower case unless quoted, so q1.u and Q1.u name no relation when
+/// the schema is "Q1": 42P01 'relation "q1.u" does not exist', and CREATE TABLE q1.v is 3F000 'schema "q1" does not
+/// exist'. The engine folds case, so q1.u read and wrote "Q1".u.
+#[test]
+fn a_qualified_name_names_its_schema_as_written() {
+    let dir = Scratch::new("qual-case");
+    cli_script(&dir, b"CREATE SCHEMA \"Q1\";\nCREATE TABLE \"Q1\".u(a INT);\nINSERT INTO \"Q1\".u VALUES (7);\n");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let missing = Err(("42P01", "relation \"q1.u\" does not exist"));
+    let mut wrong = Vec::new();
+    for (sql, want) in [
+        ("SELECT a FROM q1.u", missing.clone()),
+        ("SELECT a FROM Q1.u", missing.clone()),
+        ("SELECT a FROM \"Q1\".u", Ok(vec!["7"])),
+        ("INSERT INTO q1.u VALUES (8)", missing.clone()),
+        ("UPDATE q1.u SET a = 9", missing.clone()),
+        ("DELETE FROM q1.u", missing.clone()),
+        ("SELECT count(*) FROM \"Q1\".u", Ok(vec!["1"])),
+        ("SELECT a FROM \"Q1\".u", Ok(vec!["7"])),
+        ("CREATE TABLE q1.v(a int)", Err(("3F000", "schema \"q1\" does not exist"))),
+    ] {
+        let r = a.q(sql);
+        let agrees = match &want {
+            Ok(rows) => r.error.is_none() && r.rows == rows.iter().map(|v| vec![Some(v.to_string())]).collect::<Vec<_>>(),
+            Err((code, message)) => r.error.as_ref().is_some_and(|e| e.code == *code && e.message == *message),
+        };
+        if !agrees {
+            wrong.push(format!("{sql}: PG {want:?}; got {:?} {:?}", r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-4a1934c89-beb4 LOW-4 (its PG 18.6 probe #30): an UPDATE's WHERE is analysed before its SET, as
+/// transformUpdateStmt does, so `UPDATE mix SET v = $1 WHERE x = $1` describes $1 as x's numeric (1700), not v's
+/// varchar (1043), and the row x = 1 is updated.
+#[test]
+fn an_update_types_its_parameters_by_where_before_set() {
+    let dir = Scratch::new("upd-where-first");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in ["CREATE TABLE mix(id int PRIMARY KEY, x numeric(6,2), v varchar(3))", "INSERT INTO mix VALUES (1, 1, 'a')"] {
+        a.q(sql).ok(sql);
+    }
+    let sql = "UPDATE mix SET v = $1 WHERE x = $1";
+    let r = a.describe_statement(sql);
+    assert_eq!((r.params.clone(), r.error.clone()), (Some(vec![1700]), None), "Describe: PG params [1700]");
+    let r = a.x_undeclared(sql, &["1"]);
+    assert_eq!((r.tags.last().cloned(), r.error.clone()), (Some("UPDATE 1".to_string()), None), "PG updates the row x = 1");
+}
+
+/// wire-rev-4a1934c89-beb4 LOW-5 (its PG 18.6 probe #330-#337): numeric(p, s)'s precision is bounded 1 to 1000 wherever
+/// it is written, 22023 'NUMERIC precision 1001 must be between 1 and 1000' with no 'Parse error: ' prefix: CREATE
+/// DOMAIN dnum AS numeric(1001,2) was made, and CREATE TABLE and ADD COLUMN carried the prefix.
+#[test]
+fn a_numeric_precision_past_1000_is_22023_everywhere() {
+    let dir = Scratch::new("num-prec");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE nt2(n numeric(1000,2))").ok("numeric(1000,2) is allowed");
+    let mut wrong = Vec::new();
+    for sql in [
+        "CREATE TABLE nt(n numeric(1001,2))",
+        "ALTER TABLE nt2 ADD COLUMN m numeric(1001,0)",
+        "CREATE DOMAIN dnum AS numeric(1001,2)",
+    ] {
+        let r = a.q(sql);
+        if !r.error.as_ref().is_some_and(|e| e.code == "22023" && e.message == "NUMERIC precision 1001 must be between 1 and 1000") {
+            wrong.push(format!("{sql}: PG 22023 'NUMERIC precision 1001 must be between 1 and 1000'; got {:?}", r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-4a1934c89-beb4 LOW-1 and LOW-2 (its PG 18.6 probe #36, #41, #47, #55-#57, #67, #68): a bound array for a
+/// varchar(3)[] column is read as array_in reads it at Bind: a backslash escapes in an unquoted element too ('{a\b\c}'
+/// is abc, '{ab\,c}' the one element 'ab,c', 22001), an escaped trailing blank is kept and an unescaped one dropped,
+/// a dimension decoration is read past, and ARRAY[$1] is folded with the bound value: 22001 at Bind where PG refuses,
+/// never where PG binds. The elements PG then stores are the engine's to cut (a known red), so a bound one is judged
+/// by its Bind alone.
+#[test]
+fn a_bound_varchar_array_is_read_as_array_in_reads_it() {
+    let dir = Scratch::new("va-bind");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE va(id int PRIMARY KEY, a varchar(3)[])").ok("create");
+    let long = "value too long for type character varying(3)";
+    let mut wrong = Vec::new();
+    for (k, (sql, value, refused)) in [
+        ("INSERT INTO va VALUES ($2, $1)", r"{a\b\c}", false),
+        ("INSERT INTO va VALUES ($2, $1)", r"{ab\,c}", true),
+        ("INSERT INTO va VALUES ($2, $1)", r"{abc\ }", false),
+        ("INSERT INTO va VALUES ($2, $1)", r"{ab\ \ }", false),
+        ("INSERT INTO va VALUES ($2, $1)", "[1:1]={abcd}", true),
+        ("INSERT INTO va VALUES ($2, $1)", "{{abcd},{ef}}", true),
+        ("INSERT INTO va VALUES ($2, ARRAY[$1])", "abcd", true),
+        ("INSERT INTO va VALUES ($2, ARRAY[$1]::varchar[])", "abcd", true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let id = (k + 1).to_string();
+        let r = a.x_undeclared(sql, &[value, &id]);
+        let too_long = r.error.as_ref().is_some_and(|e| e.code == "22001" && e.message == long);
+        if too_long != refused {
+            wrong.push(format!("{sql} with {value}: PG {}; got {:?} {:?}", if refused { "22001 at Bind" } else { "bound" }, r.tags, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-351702a43 LOW-6 (its PG 18.6 probe3 #161): a CASE is typed by its results (an int4 constant and an int4
 /// function: 23); the walk never typed a CASE column, and the engine announced it text (25).
 #[test]

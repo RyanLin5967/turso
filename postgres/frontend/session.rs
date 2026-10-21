@@ -2350,6 +2350,14 @@ pub(crate) fn session_translation(
             PostgreSQLTranslator::new()
         }
     };
+    // Each cast to an integer type of a column declared text reads the text as int4in does
+    // (wire-rev-1de981755-numeric MED-1); judged from the parse and the schema alone, so the engine's
+    // re-prepare translates it alike.
+    let text_casts = text_integer_casts(pg_conn, sql, parse_result);
+    let translator = || {
+        let t = translator();
+        if text_casts.is_empty() { t } else { t.with_text_integer_casts(text_casts.clone()) }
+    };
     let first = translator();
     let mut translated = first
         .translate_with_prereqs(parse_result)
@@ -2406,6 +2414,84 @@ pub(crate) fn session_translation(
     }
     reject_catalog_dml(translated.cmd.stmt())?;
     Ok(translated)
+}
+
+/// The parse locations of the casts to an integer type (int2, int4, int8 and their names) whose
+/// operand is a column the statement's relations declare text, varchar, char or name: a bare name
+/// that every relation of the statement holding it declares so, or `alias.column` of one. Read from
+/// the parse and the schema alone (a statement's relations by name, its aliases with them). None
+/// for a statement that spells no cast (no "::" and no CAST). BLIND SPOT: a name that a subquery's
+/// relation and an outer one both hold, of different types, is not judged (the decimal-text arm).
+fn text_integer_casts(
+    pg_conn: &PgConnectionInner,
+    sql: &str,
+    parse: &turso_pg_parser::pg_query::ParseResult,
+) -> std::collections::HashSet<i32> {
+    use turso_pg_parser::pg_query::{protobuf::node::Node, NodeRef};
+    let mut out = std::collections::HashSet::new();
+    let lower = sql.as_bytes();
+    if !lower.windows(2).any(|w| w == b"::") && !lower.windows(4).any(|w| w.eq_ignore_ascii_case(b"cast")) {
+        return out;
+    }
+    let nodes = parse.protobuf.nodes();
+    let integer = |name: &str| matches!(name, "int2" | "int4" | "int8" | "int" | "integer" | "smallint" | "bigint");
+    let casts: Vec<_> = nodes
+        .iter()
+        .filter_map(|(n, ..)| match n {
+            NodeRef::TypeCast(c) => {
+                let to = c.type_name.as_ref().filter(|t| t.array_bounds.is_empty())?.names.last().and_then(|n| match &n.node {
+                    Some(Node::String(s)) => Some(s.sval.to_ascii_lowercase()),
+                    _ => None,
+                })?;
+                let Some(Node::ColumnRef(r)) = c.arg.as_deref().and_then(|a| a.node.as_ref()) else { return None };
+                let fields: Vec<String> = r
+                    .fields
+                    .iter()
+                    .filter_map(|f| match &f.node {
+                        Some(Node::String(s)) => Some(s.sval.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                (integer(&to) && fields.len() == r.fields.len()).then_some((c.location, fields))
+            }
+            _ => None,
+        })
+        .collect();
+    if casts.is_empty() {
+        return out;
+    }
+    let schema = pg_conn.conn.current_schema();
+    // The statement's relations: (the name it is known by, the table), unqualified ones only.
+    let relations: Vec<(String, std::sync::Arc<turso_core::schema::BTreeTable>)> = nodes
+        .iter()
+        .filter_map(|(n, ..)| match n {
+            NodeRef::RangeVar(rv) if rv.schemaname.is_empty() => {
+                let table = schema.get_btree_table(&rv.relname)?;
+                let known = rv.alias.as_ref().map(|a| a.aliasname.clone()).unwrap_or_else(|| rv.relname.clone());
+                Some((known, table))
+            }
+            _ => None,
+        })
+        .collect();
+    let text = |ty: &str| matches!(crate::catalog::sqlite_type_to_pg_oid(ty), 25 | 1043 | 1042 | 19);
+    for (location, fields) in casts {
+        let declared: Vec<bool> = match fields.as_slice() {
+            [column] => relations
+                .iter()
+                .filter_map(|(_, t)| t.get_column(column).map(|(_, c)| text(&c.ty_str)))
+                .collect(),
+            [relation, column] => relations
+                .iter()
+                .filter(|(known, _)| known.eq_ignore_ascii_case(relation))
+                .filter_map(|(_, t)| t.get_column(column).map(|(_, c)| text(&c.ty_str)))
+                .collect(),
+            _ => Vec::new(),
+        };
+        if !declared.is_empty() && declared.iter().all(|t| *t) {
+            out.insert(location);
+        }
+    }
+    out
 }
 
 /// A translation's refusal as the engine error it is reported with: PostgreSQL's own message, with

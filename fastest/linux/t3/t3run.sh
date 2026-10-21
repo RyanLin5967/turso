@@ -10,16 +10,25 @@
 #
 # Stages (each timed into <out>/stages.tsv; the whole run's wall time is the last row):
 #   preflight  Ubuntu, passwordless sudo, free disk, the out dir new, the mode's refusals (below)
-#   selftests  the harness's own self-tests and the devguard root fire, before anything is paid for
 #   deps       apt (build tools, fio, strace, nvme-cli, smartmontools, fs tools, PGDG postgresql-18 without a
 #              cluster, MariaDB client), rustup with the repo's pinned toolchain
+#   quiet      t3lib.sh host_quiet: every active systemd timer and clock adjuster stopped (recorded in quiet.tsv),
+#              then CLOCK_REALTIME - CLOCK_MONOTONIC watched for 30 s and refused if it steps; finish() restarts them.
+#              After deps (apt can add timers), before everything timed
+#   selftests  the harness's own self-tests and the devguard root fire, before the build is paid for
 #   build      the engine driver fastest_profile (release, debug symbols), bbload/clonebench/sqlite3
 #              (competitors/build.sh), Dolt + Doltgres release binaries (competitors/fetch_dolt.sh), v3floor and
 #              the fire-check's statfs shim
 #   envchecks  firecheck.sh's environment with t3run's V3ENV, positive and negative (needs the build), and the
 #              three drivers' warm-up decision against PREREG annex A23 (gates/warmup_conformance.py run on the
-#              built bbload, clonebench and fastest_profile: all three must match every case, rc 0; fourth lane
-#              review LOW 14: a run whose drivers disagree on the warm-up is not creditable for it)
+#              built bbload, clonebench and fastest_profile: each one's --warmup-replay path must match every case,
+#              rc 0; fourth lane review LOW 14). That is the replay path only: the live loops' warm-ups are compared
+#              by live_check once the drivers record them (review 5 MED 8, LOUD-OWED; review 6 LOW 17), so rc 0 here
+#              does not yet mean an equal warm-up in the credited runs
+#              Every timed run, ours and the competitors', runs under the ONE shared tracer sweeper (gates/sweeper.sh,
+#              read by gates/sweeper_record.py; the lead's MED 12 ruling): ours through t3lib.sh ours_timed_exec, its
+#              timed.json recording sweeper_cpu_s over fastest_profile's measured span (its summary.json
+#              tm0/tm1_realtime_s, as the competitors' timed runs record theirs)
 #   hwid       hwid.sh (machine, NVMe id-ctrl VWC, feature 0x06, smartctl text naming power loss, every mount)
 #   per filesystem in --fs (one block): make it, hw record with fio, hwid of that target, the V3 probe's
 #              fire-check on the block's explicit V3 cell, a V3 batch BEFORE, then the manifest's runs for that fs in
@@ -53,11 +62,11 @@
 # never credited; --plant NAME (dry runs only) breaks one thing on purpose so the run must fail:
 #   v3-verdict-missing  the BEFORE V3 batch is bound to a verdict file that does not exist (run.sh rc 2)
 #   v3l-fsync-half      the BEFORE V3L's fio syncs every 2nd write (V3L_PLANT=fsync2: V1L and fio must VOID it)
-#   v3l-cache-lie       a write-cache lie under V3L BEFORE, on a write-back drive (a write-through draw is NOT-RUN:
-#                       the kernel will not let its queue claim write back, T3 runner review item 10): the block's
-#                       loop is set to write through (fsyncs stop reaching the drive, and the drive's flush counter
-#                       gate must VOID it). The original is saved, restored right after under an EXIT trap, and read
-#                       back.
+#   v3l-cache-lie       a write-cache lie under V3L BEFORE (--block loop): the block's loop queue is set to write
+#                       through, so no fsync reaches its backing file. Behind a write-back drive the flush-counter rule
+#                       must VOID it; behind a write-through drive the sectors-written rule must ("did not reach the
+#                       drive"; review 5 MED 4, review 6 LOW 12). The original is saved, restored right after under an
+#                       EXIT trap, and read back. A leaf that is not a loop fails the block (review 6 LOW 11).
 # A plant applies to the FIRST block only, so the second block shows that a failed block does not stop the run.
 # Without --dry-run (a real T3 rental) it REFUSES unless: the manifest's sha256 is listed in
 # fastest/linux/t3/REGISTERED-MANIFESTS (append-only; empty until the T3 registration), --device and --destroy
@@ -65,10 +74,12 @@
 # on its controller, nothing mounted, held or claimed, no signature or partition table; review M4, devguard round-2
 # attack MED 2 and LOW 3), --plp is given, --fs is not (the manifest names the blocks; review M5), and every target
 # mounts with barriers. The device is resolved once at preflight (DEV_REAL) and the drive's identity recorded
-# (device-id.txt: wwid, MAJ:MIN, model, serial, firmware); every block re-checks, before its mkfs, its mount and the
-# cleanup's wipefs, that --device still resolves there to that same drive, still PLP-listed and registered, and
-# re-runs devguard before the mkfs; mkfs, mount and wipefs act on DEV_REAL only (devguard round-2 attack LOW 4,
-# review 5 MED 3). So a block starts from a disk that passes devguard:
+# (device-id.txt: wwid, MAJ:MIN, model, serial, firmware). Each block makes, mounts and wipes it only through
+# t3lib.sh's device_make and device_wipe (review 6 MED 1, tested by t3lib_test.sh): DEV_REAL held open throughout,
+# devguard, then the drive re-read (--device still resolves there, to that same drive, still registered), mkfs with
+# a UUID chosen here, the probe, the re-read, mount -t, the mount checked; the wipe re-reads the drive and the
+# probe first. mkfs, mount and wipefs act on DEV_REAL only (devguard round-2 attack LOW 4, review 5 MED 3, review 6
+# LOW 4 and 6). So a block starts from a disk that passes devguard:
 # block_cleanup wipes the filesystem its block made (after checking it is that one), and the operator wipes the
 # first by hand after reading what it holds.
 # Every file the run calls must be in the commit (preflight lists them; review 2 item 18). One warm-up rule for every
@@ -77,14 +88,30 @@
 # rulings cite, until PREREG-v1.md is registered (fourth lane review LOW 26).
 # Exit: 0 every stage ran and every cell has a verdict; 1 a stage failed; 2 refused before anything ran.
 set -uo pipefail
+# the virtio disk identity (t3lib.sh dev_identity) is a DRY-VIRT run's alone: never inherited, set below only by --dry-block
+unset T3_IDENTITY_MODE
+# host_quiet's test hooks (a faked systemctl or clock) and knobs never reach a run from the caller's environment
+unset T3_SYSTEMCTL T3_CLOCKDELTA T3_QUIET_WATCH_S T3_QUIET_MAX_S T3_CLOCK_ADJUSTERS T3_SUDO_BIN
+# linux-rev-uw1 LOW 4: t3run checks its OWN bash (hostbin.BASH_MIN, 5: gates/sweeper.sh and ours_timed_run read
+# $EPOCHREALTIME) and runs every `bash X` it calls under that same bash: a private dir holding only a `bash` link to
+# it goes first on PATH, so no step picks up an older bash from the box's PATH
+[ "${BASH_VERSINFO[0]:-0}" -ge 5 ] ||
+  { echo "t3run: REFUSED: running under bash ${BASH_VERSION:-?}; it needs bash 5+ (\$EPOCHREALTIME)" >&2; exit 2; }
+T3_BASHDIR=$(mktemp -d) && ln -s "$BASH" "$T3_BASHDIR/bash" && PATH=$T3_BASHDIR:$PATH ||
+  { echo "t3run: REFUSED: cannot pin bash ($BASH) first on PATH" >&2; exit 2; }
+# linux-rev-uw2 LOW 6: the pin's dir goes when t3run does (here for an early exit; finish() too, since a plant's own
+# EXIT trap replaces this one while it runs)
+trap 'rm -rf "$T3_BASHDIR"' EXIT
 REPO_URL=https://github.com/RyanLin5967/turso
 SHA="" OUT="" DRY=0 MANIFEST="" FSLIST="" DEVICE="" DESTROY="" SEED=20261005 BLOCK="" PLANT="" PLP="" DEV_REAL=""
+DRY_BLOCK="" DRYB_GIVEN="" STAMP=""
 DEV_NAME=""
 while [ $# -gt 0 ]; do
   case $1 in
     --sha) SHA=$2; shift ;;
     --out) OUT=$2; shift ;;
     --dry-run) DRY=1 ;;
+    --dry-block) DRY_BLOCK=$2; DRYB_GIVEN=1; shift ;;
     --manifest) MANIFEST=$2; shift ;;
     --fs) FSLIST=$2; shift ;;
     --device) DEVICE=$2; shift ;;
@@ -116,17 +143,35 @@ if [ -z "${T3RUN_INSIDE:-}" ]; then
   T3RUN_INSIDE=1 exec bash "$SRC/fastest/linux/t3/t3run.sh" --sha "$SHA" --out "$OUT" \
     $([ $DRY = 1 ] && echo --dry-run) ${MANIFEST:+--manifest "$MANIFEST"} ${FSLIST:+--fs "$FSLIST"} \
     ${DEVICE:+--device "$DEVICE"} ${DESTROY:+--destroy "$DESTROY"} --seed "$SEED" \
-    ${BLOCK:+--block "$BLOCK"} ${PLANT:+--plant "$PLANT"} ${PLP:+--plp "$PLP"}
+    ${BLOCK:+--block "$BLOCK"} ${PLANT:+--plant "$PLANT"} ${PLP:+--plp "$PLP"} ${DRYB_GIVEN:+--dry-block "$DRY_BLOCK"}
 fi
 
 SRC=$(git -C "$HERE" rev-parse --show-toplevel)
 L=$SRC/fastest/linux
 # settle_dev and settle (the quiet gap before every run); a missing file is caught by NEEDS before anything runs
 [ -f "$L/t3/settle.sh" ] && source "$L/t3/settle.sh"
-# drift_ok, fslist_ok, registered_ok, plp_listed: checks only a real run reaches, tested by t3lib_test.sh
+# drift_ok, fslist_ok, registered_ok, plp_listed, device_make, device_wipe: checks and the device branch only a real
+# run reaches, tested by t3lib_test.sh
 [ -f "$L/t3/t3lib.sh" ] && source "$L/t3/t3lib.sh"
+# the ONE tracer sweeper every timed run uses, ours and the competitors' alike (the lead's MED 12 ruling, DECISIONS
+# 2026-10-15T04:21:48Z: SAME INSTRUMENT FOR EVERY SYSTEM): sweeper_start / sweeper_wait, run by t3lib.sh
+# ours_timed_exec (which sources it again in the exec'd bash it runs ours under); NEEDS catches a missing file and
+# preflight refuses unless its functions are defined here
+[ -f "$L/gates/sweeper.sh" ] && source "$L/gates/sweeper.sh"
 SETTLE_DEV=""
-if [ $DRY = 1 ]; then
+# --dry-block DEV (the lead's gate item 6 amendment, 2026-10-15): a DRY run on a VM's real non-loop virtual disk, through
+# the device branch (devguard, the drive's identity, device_make and device_wipe), stamped DRY-VIRT in mode.txt and
+# OUT/STAMP, which summarize refuses for credit. The virtualized box is allowed here only (virt_ok dryblock); a real
+# run still refuses one (virt_ok real). No plant, no --block, no --device/--destroy, no --plp yes
+if [ -n "$DRYB_GIVEN" ]; then
+  [ -n "$DRY_BLOCK" ] || { echo "t3run: REFUSED: --dry-block needs a device (a VM's whole virtual disk)" >&2; exit 2; }
+  [ -z "$BLOCK" ] || { echo "t3run: REFUSED: --block and --dry-block are exclusive" >&2; exit 2; }
+  [ -z "$PLANT" ] || { echo "t3run: REFUSED: --plant is for --dry-run --block loop|brd, not --dry-block" >&2; exit 2; }
+  [ -z "$DEVICE$DESTROY" ] || { echo "t3run: REFUSED: --device/--destroy are a real run's; --dry-block names its own disk" >&2; exit 2; }
+  case ${PLP:=no} in no) ;; *) echo "t3run: REFUSED: --plp is for real runs (a virtual disk has no power-loss protection)" >&2; exit 2 ;; esac
+  DRY=1 BLOCK=device DEVICE=$DRY_BLOCK DESTROY=$DRY_BLOCK STAMP=DRY-VIRT
+  export T3_IDENTITY_MODE=virtio
+elif [ $DRY = 1 ]; then
   case ${BLOCK:=loop} in loop|brd) ;; *) echo "t3run: REFUSED: --block is loop or brd, not '$BLOCK'" >&2; exit 2 ;; esac
   case $PLANT in ''|v3-verdict-missing|v3l-fsync-half|v3l-cache-lie) ;; *) echo "t3run: REFUSED: unknown plant '$PLANT'" >&2; exit 2 ;; esac
   # brd batches are smoke (unbound) and brd has no loop, so these plants would plant nothing there
@@ -150,7 +195,15 @@ DIST=$OUT/dist
 mkdir -p "$DIST" "$OUT/cells"
 exec > >(tee -a "$OUT/t3run.log") 2>&1
 echo "# t3run sha=$SHA src=$SRC out=$OUT dry=$DRY block=$BLOCK plant=${PLANT:-none} manifest=$MANIFEST seed=$SEED start=$(date -u +%FT%TZ)"
-printf 'dry=%s\nblock=%s\nplant=%s\nplp=%s\n' "$DRY" "$BLOCK" "$PLANT" "$PLP" > "$OUT/mode.txt"
+printf 'dry=%s\nblock=%s\nplant=%s\nplp=%s\nstamp=%s\n' "$DRY" "$BLOCK" "$PLANT" "$PLP" "$STAMP" > "$OUT/mode.txt"
+[ -z "$STAMP" ] || echo "$STAMP" > "$OUT/STAMP"
+# the lead's DATA_GIB ruling (2026-10-16): a DRY-VIRT run discloses how it differs from the T3 box (summarize reads
+# dry-virt.txt into dry_virt_differences and refuses a DRY-VIRT package without it). Today: the data device's size
+if [ "$STAMP" = DRY-VIRT ]; then
+  b=$(lsblk -bdn -o SIZE "$DEVICE" 2>/dev/null | tr -d ' ')
+  printf 'data device: %s, %s bytes (%s GiB, the VM disk vm_dryblock.sh made, DATA_GIB); the T3 box runs on its NVMe at the drive'"'"'s full size\n' \
+    "$DEVICE" "${b:-unreadable}" "$([ -n "$b" ] && echo $((b / 1073741824)) || echo '?')" > "$OUT/dry-virt.txt"
+fi
 
 stage() { # stage <name> <function>: time it, record rc; a failed stage ends the run (rc 1)
   local name=$1 s e rc
@@ -171,6 +224,9 @@ stage() { # stage <name> <function>: time it, record rc; a failed stage ends the
 finish() {
   local rc=$1 t
   t=$(( $(date +%s) - T_ALL ))
+  if declare -F host_unquiet > /dev/null; then
+    host_unquiet "$OUT/quiet.tsv" || echo "t3run: host_unquiet could not start every unit in $OUT/quiet.tsv again"
+  fi
   printf '%s\t%s\t%s\t%s\t%s\n' TOTAL "$(date -u -d @"$T_ALL" +%FT%TZ)" "$(date -u +%FT%TZ)" "$t" "$rc" >> "$STAGES"
   python3 -B "$L/t3/summarize.py" "$OUT" "$SHA" "$DRY" "$MANIFEST" > "$OUT/summary.json" 2> "$OUT/summarize.stderr" ||
     { [ "$rc" = 0 ] && rc=1; }
@@ -180,13 +236,15 @@ finish() {
     echo "t3run: package failed (tar or sha256sum)"; rc=1  # gate-6 review 17
   fi
   echo "# t3run done rc=$rc wall_s=$t package=$OUT.tar.gz"
+  rm -rf "${T3_BASHDIR:-/nonexistent}"
   exit "$rc"
 }
 
 # Every file this run calls, by path in the commit (an allowlist: a missing one refuses here with its name,
 # not hours later; review 2 item 18 found the competitors absent from the runner's home branch).
-NEEDS="t3/hwid.sh t3/foreign_cpu.py t3/cells.py t3/summarize.py t3/v3l.py t3/blockgate.py t3/devguard.py t3/PLP-DRIVES t3/testdata
+NEEDS="t3/hwid.sh t3/foreign_cpu.py t3/ours_readback.py t3/cells.py t3/summarize.py t3/v3l.py t3/blockgate.py t3/devguard.py t3/PLP-DRIVES t3/testdata
   t3/settle.sh t3/settle_test.sh t3/t3lib.sh t3/t3lib_test.sh t3/v3l_mutants.py gates/warmup_conformance.py
+  gates/sweeper.sh gates/sweeper_record.py
   hw/record.sh fs/mkloop.sh
   competitors/build.sh competitors/fetch_dolt.sh competitors/firecheck_strace.sh competitors/run_system.sh
   competitors/common.sh competitors/pg18.sh competitors/dolt.sh competitors/doltgres.sh competitors/stracecount.py
@@ -202,11 +260,26 @@ preflight() {
   head=$(git -C "$SRC" rev-parse HEAD) || { echo "REFUSED: $SRC is not a git checkout"; return 2; }
   for f in $NEEDS; do git -C "$SRC" cat-file -e "${head}:fastest/linux/$f" 2>/dev/null || miss="$miss fastest/linux/$f"; done
   [ -z "$miss" ] || { echo "REFUSED: commit $head lacks files the run calls:$miss"; return 2; }
+  # the shared sweeper is loaded, not only committed (MED 12 ruling): every timed run, ours included, runs under it
+  declare -F ours_parent ours_fixture_record > /dev/null ||
+    { echo "REFUSED: t3lib.sh's ours_parent / ours_fixture_record is not defined: ours would run without the one parent"; return 2; }
+  declare -F host_quiet host_unquiet > /dev/null ||
+    { echo "REFUSED: t3lib.sh's host_quiet / host_unquiet is not defined: the quiet stage would not run"; return 2; }
+  declare -F sweeper_start sweeper_wait ours_timed_run ours_timed_exec ours_timed_record > /dev/null ||
+    { echo "REFUSED: the shared sweeper (gates/sweeper.sh: sweeper_start, sweeper_wait) or t3lib.sh's ours_timed_exec /"\
+           "ours_timed_record is not defined: ours' timed runs would go unswept (MED 12 ruling)"; return 2; }
+  # each driver's source has the --warmup-replay path envchecks runs, so a SHA without a port refuses here, not after
+  # deps and up to 2 h of build (review 6 LOW 18; envchecks stays the behavioural check)
+  for f in fastest/linux/competitors/loadgen/bbload.c fastest/linux/competitors/baselines/clonebench.c \
+           core/examples/fastest_profile/main.rs; do
+    git -C "$SRC" grep -q -F -e --warmup-replay "$head" -- "$f" ||
+      { echo "REFUSED: $f at $head has no --warmup-replay: envchecks' A23 conformance would fail after the build"; return 2; }
+  done
   # the WHOLE tree (lane review LOW 8: a modified core/ would be built and recorded as sha=$SHA)
   dirty=$(git -C "$SRC" status --porcelain --untracked-files=all)
   [ -z "$dirty" ] || { echo "REFUSED: the checkout differs from commit $head: $(echo "$dirty" | head -5)"; return 2; }
   grep -q 'Ubuntu 24' /etc/os-release || { echo "not Ubuntu 24.04"; return 2; }
-  sudo -n true || { echo "needs passwordless sudo"; return 2; }
+  t3_need_root || return 2
   # one warm-up rule for every system, from the competitors' own implementation (gate-6 review 3: PREREG :210's
   # min(max(1000 ops, 10 s), 10% of the cap) as OPS:S:MAX_S), passed verbatim to fastest_profile and run_system.sh
   WARMUP=$(python3 -B "$L/competitors/timedrun.py" rule "$RUN_CAP_S") &&
@@ -220,6 +293,12 @@ preflight() {
   if [ $DRY = 0 ]; then
     grep -qx "$msha" "$L/t3/REGISTERED-MANIFESTS" 2>/dev/null ||
       { echo "REFUSED: manifest $msha is not registered (fastest/linux/t3/REGISTERED-MANIFESTS)"; return 2; }
+    # V3L's floor-rule SLACK gates the billed run, so it must be registered first (review 5 LOW 29)
+    python3 -B "$L/t3/v3l.py" registration > "$OUT/v3l-registration.txt" 2>&1 ||
+      { cat "$OUT/v3l-registration.txt"; echo "REFUSED: V3L's SLACK has no PREREG annex row"; return 2; }
+  fi
+  # the device branch: a real run's --device, or a --dry-block run's virtual disk (stamped DRY-VIRT)
+  if [ $DRY = 0 ] || [ "$STAMP" = DRY-VIRT ]; then
     [ -n "$DEVICE" ] && [ "$DEVICE" = "$DESTROY" ] ||
       { echo "REFUSED: a real run needs --device D --destroy D naming the same device"; return 2; }
     [ -b "$DEVICE" ] || { echo "REFUSED: $DEVICE is not a block device"; return 2; }
@@ -233,25 +312,33 @@ preflight() {
     DEV_NAME=$(basename "$DEV_REAL")
     dev_identity /sys "$DEV_NAME" > "$OUT/device-id.txt" 2> "$OUT/device-id.err" ||
       { cat "$OUT/device-id.err"; echo "REFUSED: cannot record $DEV_NAME's identity"; return 2; }
+    # and the node itself is that drive: its st_rdev is the recorded dev= (review 6 LOW 5)
+    dev_unchanged "$DEVICE" "$DEV_REAL" /sys "$DEV_NAME" "$OUT/device-id.txt" || return 2
     # V3L's write rule reads the drive's sectors-written counter, which moves only with iostats on (review 5 MED 2)
     [ "$(cat "/sys/block/$DEV_NAME/queue/iostats" 2>/dev/null)" = 1 ] ||
       { echo "REFUSED: $DEV_NAME's queue/iostats is not 1: its sectors-written counter does not advance, so every V3L would VOID"; return 2; }
-    # a virtualized box cannot be T3 hardware: what a flush reaches behind a hypervisor is unknown (gate-6 review 8)
-    local virt; virt=$(systemd-detect-virt 2>/dev/null || true)
-    [ "$virt" = none ] || { echo "REFUSED: systemd-detect-virt says '${virt:-unknown}': a T3 box must be bare metal"; return 2; }
+    # a virtualized box cannot be T3 hardware: what a flush reaches behind a hypervisor is unknown (gate-6 review 8);
+    # only a --dry-block run, stamped DRY-VIRT, may run on one (t3lib.sh virt_ok, tested by t3lib_test.sh)
+    local virt VIRT_MODE=real; virt=$(systemd-detect-virt 2>/dev/null || true)
+    [ "$STAMP" = DRY-VIRT ] && VIRT_MODE=dryblock
+    echo "virt=${virt:-unknown} mode=$VIRT_MODE" > "$OUT/virt.txt"
+    virt_ok "$VIRT_MODE" "$virt" || return 2
     # --plp yes takes the drive out of the timing control (A14/A16), so it must name a registered drive: model and
     # firmware listed in fastest/linux/t3/PLP-DRIVES (append-only; lane review MED 1)
-    local dn=$DEV_NAME fsl
+    local fsl
+    # the rest is a real run's: PLP and the A17 registration (a dry-block run is never credited, so it asks neither)
+    if [ $DRY = 0 ]; then
     # --plp yes names a registered drive: model and firmware (NVMe firmware_rev, SCSI/SATA rev) in t3/PLP-DRIVES
     if [ "$PLP" = yes ]; then
-      plp_listed /sys "$dn" "$L/t3/PLP-DRIVES" ||
-        { echo "REFUSED: --plp yes but $dn ($(plp_drive_id /sys "$dn" 2>&1)) is not in fastest/linux/t3/PLP-DRIVES"; return 2; }
+      plp_listed /sys "$DEV_NAME" "$L/t3/PLP-DRIVES" ||
+        { echo "REFUSED: --plp yes but $DEV_NAME ($(plp_drive_id /sys "$DEV_NAME" 2>&1)) is not in fastest/linux/t3/PLP-DRIVES"; return 2; }
     fi
     # the A17 registration (frame arm; the D0 threshold of every block on a write-back drive without PLP), before
     # deps, build and fire-checks are paid for (t3lib.sh registered_ok, tested by t3lib_test.sh)
     fsl=$(python3 -B "$L/t3/cells.py" fslist "$MAN") && fslist_ok "$fsl" ||
       { echo "REFUSED: the manifest names no filesystem block (cells.py fslist: '$fsl')"; return 2; }
-    registered_ok /sys "$L/v3/REGISTERED.tsv" "$dn" "$PLP" "$fsl" || return 2
+    registered_ok /sys "$L/v3/REGISTERED.tsv" "$DEV_NAME" "$PLP" "$fsl" || return 2
+    fi
   fi
   df -h "$(dirname "$OUT")"
   return 0
@@ -408,18 +495,17 @@ v3l() { # v3l bK MNT
     # the lie is the LOOP's queue claiming write through, so no fsync reaches the backing file and its data stays in the
     # page cache: behind a write-back drive the flush counter rule fires, behind a write-through drive (the runner's
     # sda class) the sectors-written rule does ("did not reach the drive"; review 5 MED 4: the old NOT-RUN for a
-    # write-through drive read the drive's queue, not the loop's, which accepts write through either way). Only a
-    # leaf that is not a loop has no knob, and that draw is NOT-RUN.
+    # write-through drive read the drive's queue, not the loop's, which accepts write through either way). The plant
+    # is refused off --block loop (preflight), so a leaf that is not a loop here is a fault, and fails the block
+    # (review 6 LOW 11: a NOT-RUN let a plant job pass having planted nothing).
     local lo disk wc
     lo=$(basename "$(findmnt -n -o SOURCE "$mnt")")
     disk=$(python3 -B -c 'import json,sys; print(json.load(open(sys.argv[1]))["leaf"]["disk"])' "$o/v3-before/summary.json") || return 1
     wc=$(cat "/sys/block/$disk/queue/write_cache") || return 1
     case $wc:$lo in
       "write back:loop"*|"write through:loop"*) knob=/sys/block/$lo/queue/write_cache ;;
-      "write back:"*|"write through:"*)
-        echo "plant v3l-cache-lie: NOT-RUN: $lo is not a loop, so there is no loop queue to make lie" |
-          tee "$o/plant.txt" "$OUT/plant-notrun.txt" ;;
-      *) echo "plant v3l-cache-lie: no lie for $wc on $lo"; return 1 ;;
+      *) echo "plant v3l-cache-lie: no lie for $wc on $lo (not a loop under --block $BLOCK)" | tee "$o/plant.txt"
+        return 1 ;;
     esac
     if [ -n "$knob" ]; then
       orig=$(cat "$knob") || return 1
@@ -450,18 +536,11 @@ v3l() { # v3l bK MNT
 
 # One block: make the fs, record it, fire-check the V3 probe on the block's cell, V3 and V3L before, the
 # cells, V3L and V3 after.
-FS_NOW="" V3CELL="" PLANT_NOW="" MADE_FS="" MADE_UUID=""
-# the drive preflight recorded, unmoved and unchanged, still allowed by devguard, still listed for its --plp and still
-# registered for this block's filesystem (review 5 MED 3: those were read at preflight only); every mkfs and mount
-dev_recheck() { # dev_recheck OUTFILE
-  dev_unchanged "$DEVICE" "$DEV_REAL" /sys "$DEV_NAME" "$OUT/device-id.txt" >> "$1" 2>&1 || return 1
-  if [ "$PLP" = yes ]; then
-    plp_listed /sys "$DEV_NAME" "$L/t3/PLP-DRIVES" >> "$1" 2>&1 ||
-      { echo "REFUSED: $DEV_NAME is no longer a listed PLP drive" >> "$1"; return 1; }
-  fi
-  registered_ok /sys "$L/v3/REGISTERED.tsv" "$DEV_NAME" "$PLP" "$FS_NOW" >> "$1" 2>&1 || return 1
-}
+FS_NOW="" V3CELL="" PLANT_NOW=""
 RUN_CAP_S=1800  # the registered per-run cap (30 min); the warm-up is at most 10% of it
+# the parent's rows, ONE value for every system (gen_seed.py's table t; comp run_system.sh FT_ROWS, whose default it
+# is, and fastest_profile --rows with the gen_seed parent): run 11 ran ours at fastest_profile's own 1000 beside it
+ROWS=10000
 fs_block() {
   local fs=$FS_NOW mnt=/mnt/t3-$FS_NOW o=$OUT/fs-$FS_NOW
   mkdir -p "$o"
@@ -476,28 +555,14 @@ fs_block() {
     brd)
       bash "$L/v3/mkbrd.sh" "$fs" "$mnt" > "$o/mkfs.txt" 2>&1 || return 1 ;;
     device)
-      # immediately before the mkfs: --device still names the node preflight checked, and devguard still allows it
-      # (hours may have passed; devguard round-2 attack LOW 4). mkfs and mount act on that node, never on the name
-      : > "$o/devguard.txt"
-      dev_recheck "$o/devguard.txt" || { cat "$o/devguard.txt"; echo "fs-$fs: $DEV_REAL is not the drive preflight checked"; return 1; }
-      sudo -n python3 -B "$L/t3/devguard.py" check "$DEV_REAL" >> "$o/devguard.txt" 2>&1 ||
-        { cat "$o/devguard.txt"; echo "fs-$fs: devguard refuses $DEV_REAL before mkfs"; return 1; }
-      case $fs in
-        xfs) sudo mkfs.xfs -f -m reflink=1 "$DEV_REAL" ;;
-        btrfs) sudo mkfs.btrfs -f "$DEV_REAL" ;;
-        ext4) sudo mkfs.ext4 -F -E lazy_itable_init=0,lazy_journal_init=0 "$DEV_REAL" ;;
-        *) echo "unknown fs $fs"; false ;;
-      esac > "$o/mkfs.txt" 2>&1 || return 1
-      # from here block_cleanup must wipe what this block made, so the next block's devguard check passes; the UUID
-      # this mkfs gave it is what lets the wipe tell it from another drive's filesystem of the same type (MED 3)
-      MADE_FS=$fs
-      MADE_UUID=$(t3_blkid UUID "$DEV_REAL" 2>> "$o/mkfs.txt")
-      echo "fs_uuid=$MADE_UUID" >> "$o/mkfs.txt"
-      [ -n "$MADE_UUID" ] || { echo "fs-$fs: blkid reads no UUID on the $fs just made on $DEV_REAL"; return 1; }
-      dev_recheck "$o/devguard.txt" || { cat "$o/devguard.txt"; echo "fs-$fs: the drive changed before mount"; return 1; }
-      # btrfs defaults to discard=async on SSDs, which discards freed extents 10-120 s later, inside a later run
-      sudo mkdir -p "$mnt" && sudo mount $([ "$fs" = btrfs ] && echo "-o nodiscard") "$DEV_REAL" "$mnt" &&
-        sudo chown "$(id -u):$(id -g)" "$mnt" || return 1 ;;
+      # only through device_make (t3lib.sh, review 6 MED 1): DEV_REAL held open, devguard, the drive re-read, mkfs
+      # with this UUID (review 6 LOW 6: the UUID is chosen here, so the probe after mkfs checks it rather than
+      # reading it), the probe, the re-read, mount -t, the mount checked. o/made.txt names what block_cleanup wipes
+      device_make "$DEVICE" "$DEV_REAL" /sys "$DEV_NAME" "$OUT/device-id.txt" "$PLP" \
+        "$([ "$STAMP" = DRY-VIRT ] && echo DRY-VIRT || echo "$L/v3/REGISTERED.tsv")" \
+        "$fs" "$(cat /proc/sys/kernel/random/uuid)" "$mnt" "$o/made.txt" > "$o/mkfs.txt" 2>&1 ||
+        { cat "$o/mkfs.txt"; echo "fs-$fs: device_make refused or failed on $DEV_REAL"; return 1; }
+      sudo chown "$(id -u):$(id -g)" "$mnt" || return 1 ;;
   esac
   findmnt -n -o SOURCE,FSTYPE,OPTIONS -T "$mnt" | tee -a "$o/mkfs.txt"
   # no online discard on the filesystem under test (fourth lane review MED 5): settle.sh fstrims between runs instead
@@ -578,19 +643,19 @@ block_unmount() {
   return 0
 }
 # Unmount (even when the block failed after its mkfs and before or after its mount), then on a device block wipe the
-# filesystem the block made, so the next block's devguard check before its mkfs sees a blank disk (devguard round-2
-# attack MED 2). It wipes only DEV_REAL, only while --device still resolves there to the drive preflight recorded
-# (t3lib.sh dev_unchanged: wwid, MAJ:MIN, model, serial, firmware), and only when blkid finds exactly the filesystem
-# this block made, type and UUID (fs_is_ours; review 5 MED 3); anything else stops the run with the device untouched.
+# filesystem the block made (o/made.txt, written by device_make before its mkfs), so the next block's devguard check
+# before its mkfs sees a blank disk (devguard round-2 attack MED 2). Only through device_wipe (t3lib.sh, review 6 MED
+# 1): DEV_REAL held open, --device still resolving there to the drive preflight recorded (dev_unchanged: wwid,
+# MAJ:MIN, model, serial, firmware), and blkid finding exactly the filesystem this block made, type and UUID
+# (fs_is_ours; review 5 MED 3); anything else stops the run with the device untouched.
 block_cleanup() {
-  local w=$OUT/fs-$FS_NOW/wipe.txt
+  local o=$OUT/fs-$FS_NOW mfs muuid
   block_unmount || return 1
-  [ "$BLOCK" = device ] && [ -n "$MADE_FS" ] || return 0
-  dev_unchanged "$DEVICE" "$DEV_REAL" /sys "$DEV_NAME" "$OUT/device-id.txt" > "$w" 2>&1 &&
-    fs_is_ours "$DEVICE" "$DEV_REAL" "$MADE_FS" "$MADE_UUID" >> "$w" 2>&1 && sudo -n wipefs -a "$DEV_REAL" >> "$w" 2>&1 ||
-    { echo "cleanup: $DEV_REAL was not wiped: $(tail -2 "$w")"; return 1; }
-  MADE_FS="" MADE_UUID=""
-  return 0
+  [ "$BLOCK" = device ] && [ -s "$o/made.txt" ] || return 0
+  read -r mfs muuid < "$o/made.txt"
+  device_wipe "$DEVICE" "$DEV_REAL" /sys "$DEV_NAME" "$OUT/device-id.txt" "$mfs" "$muuid" > "$o/wipe.txt" 2>&1 ||
+    { echo "cleanup: $DEV_REAL was not wiped: $(tail -2 "$o/wipe.txt")"; return 1; }
+  mv "$o/made.txt" "$o/made-wiped.txt"
 }
 
 # The quiet gap before every run: settle.sh (sourced after L is set), called at the top of each attempt.
@@ -612,22 +677,46 @@ run_cell() {
     export FASTEST_CELL=$id
     case $system in
       ours)
-        # ops is the run's TOTAL and the warm-up is PREREG's rule for every system (gate-6 review 12 and 3)
-        timeout 7200 "$DIST/fastest_profile" --dir "$mnt/work-$id" --class "$class" --clients "$clients" \
-          --ops-total "$ops" --warmup "$WARMUP" --mode phases --out "$d/result" > "$d/adapter.txt" 2>&1 ;;
+        # ops is the run's TOTAL and the warm-up is PREREG's rule for every system (gate-6 review 12 and 3); the run
+        # goes under the shared sweeper, as every competitor timed run does (MED 12 ruling; t3lib.sh ours_timed_exec)
+        # the outer bound covers the wrapper, the start-sweep wait and the end sweep (as the competitors' run_system.sh
+        # runs under its own); timeout signals its own process group, which holds the wrapper and the sweeper. The
+        # inner timeout makes a group of its own, so it escalates to KILL (-k 30) rather than wait on a fastest_profile
+        # that ignores TERM
+        # ONE parent for every system (t3lib.sh ours_parent, ours_fixture_record): gen_seed's streams for the plan's
+        # age, fed by fastest_profile, its prebranch of the plan's live branches, and fixture.json through comp's
+        # fixture.py write over ours' own read-back of the trunk
+        if ours_parent "$d/parent" "$ROWS" "$age" > "$d/adapter.txt" 2>&1; then
+          timeout 7300 bash -c 'source "$1" || { echo "REFUSED: $1 failed to source"; exit 2; }
+            shift; ours_timed_exec "$@"' ours-exec "$L/t3/t3lib.sh" \
+            "$d" timeout -k 30 7200 "$DIST/fastest_profile" --dir "$mnt/work-$id" --class "$class" \
+            --clients "$clients" --ops-total "$ops" --warmup "$WARMUP" --mode phases --out "$d/result" \
+            --rows "$ROWS" --seed-sql "$d/parent/seed.sql" --age-sql "$d/parent/age.sql" --live "$live" \
+            --dump-trunk "$d/parent/trunk.tsv" >> "$d/adapter.txt" 2>&1
+          rc=$?
+          [ $rc = 0 ] && { ours_fixture_record "$d" "$ROWS" "$age" "$live" "$mnt/work-$id" >> "$d/adapter.txt" 2>&1 ||
+                           echo "ours_fixture_record rc $? (fixture.json written; summarize judges it)" >> "$d/adapter.txt"; }
+          (exit $rc)
+        else
+          echo "ours_parent failed: no gen_seed parent for this run" >> "$d/adapter.txt"; false
+        fi ;;
       pg18-d2|dolt|doltgres|b1)
         # Each attempt gets its own directory on the filesystem under test (run_system.sh keeps its
         # servers' data under MNT/<system>.noindex, which a replacement run must not find in place).
         mkdir -p "$mnt/work-$id"
         # the plan's run total, fixture (age, live branches) and mode: comp's run_system.sh refuses a real run
         # (FT_DRY=0, its default) given any of them by default (comp d8fef669b, 76242a76a)
-        FT_CLIENTS=$clients FT_OPS_TOTAL=$ops FT_AGE=$age FT_PREBRANCH=$live FT_DRY=$DRY FT_CAP_S=$RUN_CAP_S FT_WARMUP=$WARMUP \
+        FT_ROWS=$ROWS FT_CLIENTS=$clients FT_OPS_TOTAL=$ops FT_AGE=$age FT_PREBRANCH=$live FT_DRY=$DRY FT_CAP_S=$RUN_CAP_S FT_WARMUP=$WARMUP \
           FT_BBLOAD=$DIST/bbload FT_CLONEBENCH=$DIST/clonebench \
           FT_SQLITE3=$DIST/sqlite3 FT_FIRECHECK=$o/strace-firecheck/firecheck.txt FT_BIN=$DIST/dolt-bin \
           timeout 10800 bash "$L/competitors/run_system.sh" "$system" "$mnt/work-$id" "$d/result" > "$d/adapter.txt" 2>&1 ;;
       *) echo "unknown system $system" > "$d/adapter.txt"; false ;;
     esac
     rc=$?
+    # its timed.json: sweeper_cpu_s by the one reader (summarize re-derives it; a refused record fails the package
+    # there), while FASTEST_CELL is still exported, so foreign_cpu.py classes the reader as the run's own (sut), as the
+    # competitors' timedrun.py check inside run_system.sh is
+    [ "$system" = ours ] && { ours_timed_record "$d" "$L/gates/sweeper_record.py" >> "$d/adapter.txt" 2>&1 || true; }
     unset FASTEST_CELL
     touch "$d/.stop"
     wait "$sampler"
@@ -645,20 +734,41 @@ run_cell() {
   done
 }
 
-# The checks that need nothing built, BEFORE deps and build are paid for (T3 runner review LOW 17): the harness's own
-# self-tests and the devguard root fire on this box's real disks
+# The harness's own self-tests and the devguard root fire on this box's real disks, before the build is paid for (T3
+# runner review LOW 17). Not "nothing built" since 2026-10-18 (linux-rev-uw2 LOW 8): run_everywhere's
+# gates/cargo_all_targets_test.sh row runs a cold cargo check of every turso_core target
+# st NAME OUT CMD...: one self-test on the T3 box, judged by its own TALLY line and rc (gates/tally.py, linux-rev-uw2
+# MED 1: an allowlist of outcomes, not a wording match): every case must have run and passed, so an N/A, a missing
+# tally or a tally that disagrees with the rc refuses the stage
+st() {
+  local n=$1 o=$2 rc=0; shift 2
+  "$@" > "$o" 2>&1 || rc=$?
+  python3 -B "$L/gates/tally.py" check "$o" "$rc" --require-all >> "$o" 2>&1 ||
+    { tail -4 "$o"; echo "self-test $n FAILED (rc $rc; its TALLY must say every case ran and passed)"; return 1; }
+}
 selftests() {
   local t
   for t in foreign_cpu v3l summarize blockgate devguard; do
-    python3 -B "$L/t3/$t.py" self-test > "$OUT/$t-selftest.txt" 2>&1 || { echo "self-test $t FAILED"; return 1; }
+    st "$t" "$OUT/$t-selftest.txt" python3 -B "$L/t3/$t.py" self-test || return 1
   done
-  timeout 120 bash "$L/t3/settle_test.sh" > "$OUT/settle-selftest.txt" 2>&1 || { echo "self-test settle FAILED"; return 1; }
-  timeout 60 bash "$L/t3/t3lib_test.sh" > "$OUT/t3lib-selftest.txt" 2>&1 || { echo "self-test t3lib FAILED"; return 1; }
-  timeout 120 python3 -B "$L/gates/warmup_conformance.py" self-test > "$OUT/warmup-conformance-selftest.txt" 2>&1 ||
-    { echo "self-test warmup_conformance FAILED"; return 1; }
+  st settle "$OUT/settle-selftest.txt" timeout 120 bash "$L/t3/settle_test.sh" || return 1
+  st t3lib "$OUT/t3lib-selftest.txt" timeout 60 bash "$L/t3/t3lib_test.sh" || return 1
+  st warmup_conformance "$OUT/warmup-conformance-selftest.txt" timeout 120 python3 -B "$L/gates/warmup_conformance.py" self-test ||
+    return 1
+  # every self-test entry point, each on the platform it states (gates/platforms.tsv; the platform-inheritance class):
+  # one runner, the same one vm_dryblock.sh runs on the Mac first, and it refuses an entry point with no row
+  # rc 0 only: an N/A (rc 3, any case this box could not run) is never a pass on the T3 box (linux-rev-uw1 HIGH 1, the
+  # lead's rule: a T3 run has zero N/A on its gate cases); the self-tests above take rc 0 only for the same reason
+  local rer=0
+  timeout 3600 python3 -B "$L/gates/run_everywhere.py" "$L" > "$OUT/run-everywhere.txt" 2>&1 || rer=$?
+  [ $rer = 0 ] || { tail -5 "$OUT/run-everywhere.txt"
+    [ $rer = 3 ] && echo "self-test run_everywhere: N/A cases on the T3 box (rc 3): refused, an N/A is never a pass"
+    echo "self-test run_everywhere FAILED (rc $rer)"; return 1; }
+  # the shared sweeper's one reader, every refusal planted (MED 12 ruling; t3lib_test.sh runs ours_timed_run on /proc)
+  st sweeper_record "$OUT/sweeper-record-selftest.txt" timeout 60 python3 -B "$L/gates/sweeper_record.py" selftest ||
+    return 1
   # v3l.py's mutant table: its own guard, then every mutant, each of which must be KILLED (review 5 MED 5: nothing ran it)
-  timeout 120 python3 -B "$L/t3/v3l_mutants.py" self-test > "$OUT/v3l-mutants-selftest.txt" 2>&1 ||
-    { echo "self-test v3l_mutants FAILED"; return 1; }
+  st v3l_mutants "$OUT/v3l-mutants-selftest.txt" timeout 120 python3 -B "$L/t3/v3l_mutants.py" self-test || return 1
   timeout 1800 python3 -B "$L/t3/v3l_mutants.py" > "$OUT/v3l-mutants.txt" 2>&1 ||
     { tail -3 "$OUT/v3l-mutants.txt"; echo "v3l mutants: not every mutant KILLED"; return 1; }
   # devguard on this box's real lsblk: the root disk must be refused (a fire on real input, not a fixture)
@@ -680,7 +790,8 @@ selftests() {
   for d in $rd; do
     sudo -n python3 -B "$L/t3/devguard.py" check "/dev/$d" > "$OUT/devguard-root-$d.txt" 2>&1
     rc=$?
-    for t in "holds the root filesystem" "cannot be opened exclusively" "carries a signature"; do
+    # (the O_EXCL text with the kernel's EBUSY: an ENOENT from a wrong path also "cannot be opened"; review 6 LOW 8)
+    for t in "holds the root filesystem" "cannot be opened exclusively (Device or resource busy)" "carries a signature"; do
       want_text="REFUSED: $d $t"
       if [ $rc != 2 ] || ! grep -qF "$want_text" "$OUT/devguard-root-$d.txt"; then
         cat "$OUT/devguard-root-$d.txt"
@@ -692,23 +803,42 @@ selftests() {
     if grep -qF "cannot read" "$OUT/devguard-root-$d.txt"; then
       cat "$OUT/devguard-root-$d.txt"; echo "selftests: devguard could not read something on /dev/$d"; return 1
     fi
+    # the production pin on a real disk (review 6 LOW 4): it must hold and release, here, before any block needs it
+    t3_pin "/dev/$d" > "$OUT/pin-root-$d.txt" 2>&1 && t3_unpin ||
+      { cat "$OUT/pin-root-$d.txt"; echo "selftests: t3_pin cannot hold /dev/$d"; return 1; }
+    # this box's sysfs gives a whole identity (review 6 MED 1): on a T3 box a disk without one would refuse the spare
+    # at preflight too. Recorded on a dry run (a VM's virtual disk may carry no wwid or serial), required on a real one
+    dev_identity /sys "$d" > "$OUT/device-id-root-$d.txt" 2>&1; rc=$?
+    echo "dev_identity $d rc=$rc" >> "$OUT/device-id-root.txt"
+    [ $rc = 0 ] || [ $DRY = 1 ] ||
+      { cat "$OUT/device-id-root-$d.txt"; echo "selftests: dev_identity cannot read /dev/$d's identity"; return 1; }
   done
 }
+# The host acts on nothing from here to the end (t3lib host_quiet: every systemd timer and clock adjuster stopped,
+# then the clocks watched for a step; finish() starts them again). It follows deps, whose apt installs can add and
+# start timers, and precedes everything timed: the selftests too (dry run 9, 2026-10-16: settle's 2 s quiet case
+# read 1.97 s off date +%s%N while lima-guestagent stepped CLOCK_REALTIME, before the stage stood here)
+quiet() { host_quiet "$OUT/quiet.tsv"; }
 stage preflight preflight
-stage selftests selftests
 stage deps deps
 export PATH="$HOME/.cargo/bin:$PATH"
+stage quiet quiet
+stage selftests selftests
 stage build build
 stage hwid hwid
 stage v3fixtures v3fixtures
 # The checks that need the build (the V3 binaries): firecheck.sh's environment, positive and negative
 # the warm-up rule is one rule across the three drivers this run built (PREREG annex A23; fourth lane review LOW 14):
-# each replays its own live decision on the shared cases, and anything but rc 0 (all three, every case) fails the stage
+# each one's --warmup-replay path runs the shared cases, and anything but rc 0 (all three, every case) fails the
+# stage. The replay path only (review 6 LOW 17): the live loops are not compared here, and the record says so
 warmup_conformance() {
   local rc=0
   timeout 300 python3 -B "$L/gates/warmup_conformance.py" run --bbload "$DIST/bbload" --clonebench "$DIST/clonebench" \
     --fastest-profile "$DIST/fastest_profile" --record "$OUT/warmup-conformance.json" > "$OUT/warmup-conformance.txt" 2>&1 ||
     rc=$?
+  echo "LOUD-OWED: this compares each driver's --warmup-replay path only; the live loops' warm-ups are not compared" \
+    "until the drivers record them for live_check (review 5 MED 8: fastest_profile's ready/go barrier, the Linux ports'" \
+    "live records)" >> "$OUT/warmup-conformance.txt"
   [ $rc = 0 ] || { tail -5 "$OUT/warmup-conformance.txt"; echo "envchecks: warm-up conformance rc $rc, want 0"; return 1; }
 }
 envchecks() { fcenv_check && warmup_conformance; }
@@ -729,9 +859,19 @@ for FS_NOW in $FSLIST; do
   BLOCKNO=$((BLOCKNO + 1))
   PLANT_NOW=""; [ $BLOCKNO = 1 ] && PLANT_NOW=$PLANT
   s=$(date +%s)
+  BLOCK_T0=$s  # the kernel log's start; fs_block's own code may reuse s
   echo "== stage fs-$FS_NOW $(date -u +%FT%TZ)${PLANT_NOW:+ (plant $PLANT_NOW)}"
   fs_block
   rc=$?
+  # the kernel's log over the block, so a btrfs allocation failure or an ENOSPC the kernel reports is in the package
+  # (summarize's enospc_problems refuses the block on one: the lead's DATA_GIB ruling)
+  sudo -n journalctl -k -o short-iso --no-pager --since "@$BLOCK_T0" > "$OUT/fs-$FS_NOW/kernel-log.txt" 2>&1 ||
+    sudo -n dmesg > "$OUT/fs-$FS_NOW/kernel-log.txt" 2>&1
+  # the root's share of the run's disk (DECISIONS 18f492601b: run 14's root image grew 4.3 GiB over one block, which
+  # the data filesystem's space.txt cannot see): the root filesystem and this run's out dir at each block's end, so a
+  # package states its own disk cost beside the host trace vm_dryblock keeps
+  { printf 'utc=%s block=%s\n' "$(date -u +%FT%TZ)" "$FS_NOW"; df -k / | tail -1; du -sk "$OUT"; } \
+    > "$OUT/root-space-$FS_NOW.txt" 2>&1
   cleaned=1
   block_cleanup || { rc=1; cleaned=0; }
   e=$(date +%s)
