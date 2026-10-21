@@ -20,7 +20,7 @@ pub use session::{
     CONNECTION_BROKEN, DEFAULT_SEARCH_PATH, FIXED_SETTINGS,
 };
 #[cfg(feature = "failpoints")]
-pub use session::fail_next_undo;
+pub use session::{fail_next_undo, interrupt_next_undo, undos_begun};
 #[cfg(feature = "failpoints")]
 pub use session::pretend_deferred_violations;
 pub use turso_core::{

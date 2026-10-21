@@ -774,10 +774,7 @@ impl PgConnection {
         if conn.get_auto_commit() {
             return Ok(());
         }
-        let _undoing = Undoing::new(&self.inner);
-        let r = undo_failpoint()
-            .and_then(|()| run_tx(conn, TxStmt::Rollback))
-            .and_then(|()| held_after_undo(conn, false))
+        let r = undo_own_work(&self.inner, false, || run_tx(conn, TxStmt::Rollback))
             .map_err(|undo| break_connection(&self.inner, "the transaction's rollback", &undo));
         if conn.get_auto_commit() {
             self.tx_event(TxEvent::Ended { committed: false }, "");
@@ -3192,25 +3189,22 @@ fn handle_pg_drop_objects(pg_conn: &Arc<PgConnectionInner>, stmt: &PgDropObjects
             Err(e) => return Err(e),
         }
     }
-    // All or none: several drops run inside a savepoint of their own (in the session's
-    // transaction, or as one of their own).
+    // All or none: several drops run in a transaction of their own (a savepoint in the session's
+    // transaction), under the one undo rule (own_transaction): undone unstoppable, and an undo
+    // that fails breaks the connection. Its own SAVEPOINT and `let _ =` ROLLBACK TO and RELEASE
+    // were stopped by the statement_timeout that stopped a drop, so the session was left 'T' in a
+    // transaction it never opened, holding the first drop, which the client's COMMIT committed
+    // (review wire-rev-copystdin4 HIGH 1, runs rv4-3017-tip, -tr).
     if found.len() < 2 {
         return found
             .iter()
             .try_for_each(|sql| conn.prepare(sql)?.run_ignore_rows());
     }
-    execute_sqlite_internal(conn, catalog::sqlite_text("SAVEPOINT turso_pg_drop_objects"))?;
-    let dropped = found
-        .iter()
-        .try_for_each(|sql| conn.prepare(sql)?.run_ignore_rows());
-    match dropped {
-        Ok(()) => execute_sqlite_internal(conn, catalog::sqlite_text("RELEASE turso_pg_drop_objects")),
-        Err(e) => {
-            let _ = execute_sqlite_internal(conn, catalog::sqlite_text("ROLLBACK TO turso_pg_drop_objects"));
-            let _ = execute_sqlite_internal(conn, catalog::sqlite_text("RELEASE turso_pg_drop_objects"));
-            Err(e)
-        }
-    }
+    own_transaction(pg_conn, "turso_pg_drop_objects", "DROP", || {
+        found
+            .iter()
+            .try_for_each(|sql| conn.prepare(sql)?.run_ignore_rows())
+    })
 }
 
 /// Whether the engine refused a DROP of `kind` without IF EXISTS because the object is missing,
@@ -3913,6 +3907,41 @@ pub fn fail_next_undo() {
     UNDO_FAILS.with(|f| f.set(true));
 }
 
+#[cfg(feature = "failpoints")]
+thread_local! {
+    static UNDO_INTERRUPT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static UNDOS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Test failpoint (feature `failpoints`, never in a credited build): `interrupt` runs once, at the
+/// start of the next undo of this frontend's own work on this thread ([`undo_own_work`]), after
+/// its unstoppable span began. A test makes it request a cancel, as a CancelRequest that lands
+/// during the undo would, so each path's undo is shown to run to its end whatever the interrupt
+/// (review wire-rev-copystdin4 HIGH 1: a test per path).
+#[cfg(feature = "failpoints")]
+pub fn interrupt_next_undo(interrupt: Box<dyn FnOnce()>) {
+    UNDO_INTERRUPT.with(|f| *f.borrow_mut() = Some(interrupt));
+}
+
+/// Test failpoint: how many undos [`undo_own_work`] has begun on this thread, so a test can show
+/// that the statement it ran reached the shared undo.
+#[cfg(feature = "failpoints")]
+pub fn undos_begun() -> usize {
+    UNDOS.with(std::cell::Cell::get)
+}
+
+/// Where `interrupt_next_undo` strikes; nothing without the `failpoints` feature.
+#[inline]
+fn undo_interrupt_failpoint() {
+    #[cfg(feature = "failpoints")]
+    {
+        UNDOS.with(|n| n.set(n.get() + 1));
+        if let Some(interrupt) = UNDO_INTERRUPT.with(|f| f.borrow_mut().take()) {
+            interrupt();
+        }
+    }
+}
+
 /// Where `fail_next_undo` strikes, before every undo [`own_transaction`] and
 /// [`PgConnection::roll_back_or_break`] run: an error once after it, else Ok. Without the
 /// `failpoints` feature it is always Ok and compiles to nothing.
@@ -4040,12 +4069,10 @@ fn own_transaction<T>(
         Ok(done) => return Ok(done),
         Err(e) => e,
     };
-    // Run unstoppable: the interrupt that ended `f` must not end its undo.
-    let _undoing = Undoing::new(pg_conn);
     let undone = if conn.get_auto_commit() {
-        Ok(())
+        held_after_undo(conn, in_tx)
     } else {
-        undo_failpoint().and_then(|()| {
+        undo_own_work(pg_conn, in_tx, || {
             if in_tx {
                 run_tx(conn, TxStmt::RollbackTo(name))
                     .and_then(|()| run_tx(conn, TxStmt::Release(name)))
@@ -4053,8 +4080,7 @@ fn own_transaction<T>(
                 run_tx(conn, TxStmt::Rollback)
             }
         })
-    }
-    .and_then(|()| held_after_undo(conn, in_tx));
+    };
     match undone {
         Ok(()) => Err(e),
         Err(undo) => Err(break_connection(
@@ -4063,6 +4089,27 @@ fn own_transaction<T>(
             &undo,
         )),
     }
+}
+
+/// THE undo of work this frontend did on its own (own_transaction's ROLLBACK or ROLLBACK TO and
+/// RELEASE, which carry CREATE TABLE's prerequisites and keys, ALTER TABLE ADD CONSTRAINT's
+/// rebuild, COPY FROM's insert and a multi-object DROP; roll_back_or_break's ROLLBACK of an
+/// implicit block): `steps`, run unstoppable ([`Undoing`]: the server's progress handler stops no
+/// statement while it is set, so the cancel or statement_timeout that ended the work cannot end
+/// its undo), then the engine's state read again ([`held_after_undo`]). Its error is the undo's,
+/// which the caller turns into a broken connection. One helper, so no path undoes its work
+/// armed: the multi-object DROP ran its own `let _ =` ROLLBACK TO and RELEASE, which a timeout
+/// stopped, leaving the session 'T' in a transaction holding half the DROP (review
+/// wire-rev-copystdin4 HIGH 1).
+fn undo_own_work(
+    pg_conn: &Arc<PgConnectionInner>,
+    in_tx: bool,
+    steps: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let _undoing = Undoing::new(pg_conn);
+    undo_failpoint()?;
+    undo_interrupt_failpoint();
+    steps().and_then(|()| held_after_undo(&pg_conn.conn, in_tx))
 }
 
 /// After an undo, whether the engine still holds a transaction the undone work opened: with no

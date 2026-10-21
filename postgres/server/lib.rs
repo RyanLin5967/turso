@@ -7640,6 +7640,102 @@ mod tests {
         );
     }
 
+    /// Every undo of the frontend's own work runs to its end when a cancel lands during it (review
+    /// wire-rev-copystdin4 HIGH 1: a test per path). For each path a statement fails on its own
+    /// (no interrupt), and the failpoint requests a cancel at the start of its undo, as a
+    /// CancelRequest landing then would: the statement answers its own error, never FATAL 08006,
+    /// the session is left in no transaction and serves the next statement, and the failed work
+    /// is gone. The premise is that the statement reached the shared undo (turso_pg::undos_begun
+    /// rose), so a path with an undo of its own fails the test instead of passing it. Written with
+    /// the fix, not red first: the failpoint is new. Its firing is shown by the mutant run (the
+    /// helper's unstoppable span removed), raws copystdin-r6.
+    #[test]
+    fn a_cancel_during_any_undo_of_own_work_leaves_the_session_usable() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let files = dir.path().join("files");
+        std::fs::create_dir(&files).unwrap();
+        let dup = files.join("dup.txt");
+        std::fs::write(&dup, "1\n1\n").unwrap();
+        let bad = files.join("bad.txt");
+        let mut lines: String = (1..=1500).map(|i| format!("{i}\n")).collect();
+        lines.push_str("x\n");
+        std::fs::write(&bad, lines).unwrap();
+        let path = dir.path().join("w.db").to_string_lossy().into_owned();
+        let opts = database_opts(turso_core::branch::BranchDurability::Catalog {
+            sync: turso_core::branch::SyncClass::Off,
+        });
+        let (_io, db) =
+            turso_pg::open_database(&path, None, turso_core::OpenFlags::default(), opts).unwrap();
+        let mut shared = Shared::new(
+            db,
+            path,
+            1,
+            std::time::Duration::from_millis(DEFAULT_LOCK_WAIT_MS),
+        );
+        shared.copy_from_dir = Some(std::fs::canonicalize(&files).unwrap());
+        let s = Session::new(Arc::new(shared));
+        ok(&s, "CREATE TABLE p(id INT PRIMARY KEY)");
+        ok(&s, "INSERT INTO p VALUES (1)");
+        ok(&s, "CREATE TABLE b(id INT)");
+        ok(&s, "INSERT INTO b VALUES (1)");
+        ok(&s, "CREATE TABLE ca(id INT PRIMARY KEY)");
+        ok(&s, "CREATE TABLE cb(id INT)");
+        ok(&s, "CREATE TABLE d1(id INT)");
+        let count = |table: &str| -> Vec<Vec<Value>> {
+            s.shared
+                .db
+                .connect()
+                .unwrap()
+                .prepare(format!("SELECT count(*) FROM {table}"))
+                .unwrap()
+                .run_collect_rows()
+                .unwrap()
+        };
+        let cases: [(&str, String, &str); 7] = [
+            ("CREATE TABLE's keys", "CREATE TABLE c(id INT, x INT REFERENCES c(id))".into(), "42830"),
+            (
+                "CREATE TABLE's prerequisites",
+                "CREATE TABLE c2(id SERIAL, x INT REFERENCES c2(id))".into(),
+                "42830",
+            ),
+            ("ALTER TABLE ADD CONSTRAINT's rebuild", "ALTER TABLE b ADD CONSTRAINT bk CHECK (id > 5)".into(), "23514"),
+            ("COPY FROM's final insert", format!("COPY ca FROM '{}'", dup.display()), "23505"),
+            ("COPY FROM's insert before a bad line", format!("COPY cb FROM '{}'", bad.display()), "22P02"),
+            ("a multi-object DROP", "DROP TABLE d1, d1".into(), ""),
+            ("an implicit block's rollback", "CREATE TABLE kept(id INT); INSERT INTO p VALUES (1)".into(), "23505"),
+        ];
+        for (path, sql, code) in cases {
+            let before = turso_pg::undos_begun();
+            let interrupts = s.interrupts.clone();
+            turso_pg::interrupt_next_undo(Box::new(move || {
+                interrupts.cancel.store(true, Ordering::Relaxed)
+            }));
+            let got = errors(&s, &sql);
+            assert!(
+                turso_pg::undos_begun() > before,
+                "premise not met: {path}: `{sql}` reached no shared undo ({got:?})"
+            );
+            assert!(
+                !got.is_empty() && got.iter().all(|(c, severity)| severity == "ERROR" && c != "57014"),
+                "{path}: `{sql}` answered {got:?}, not its own error"
+            );
+            if !code.is_empty() {
+                assert!(got.iter().any(|(c, _)| c == code), "{path}: {got:?}, not {code}");
+            }
+            assert!(
+                s.current(&mut s.state()).unwrap().inner().get_auto_commit(),
+                "{path}: the session is left in a transaction"
+            );
+            assert!(errors(&s, "SELECT 1").is_empty(), "{path}: the session after its undo");
+        }
+        assert!(!committed_table(&s, "c") && !committed_table(&s, "c2") && !committed_table(&s, "kept"));
+        assert!(committed_table(&s, "d1"), "the failed DROP's first drop was kept");
+        assert_eq!(count("b"), vec![vec![Value::from_i64(1)]], "the rebuilt table");
+        assert_eq!(count("ca"), vec![vec![Value::from_i64(0)]]);
+        assert_eq!(count("cb"), vec![vec![Value::from_i64(0)]]);
+        assert_eq!(count("p"), vec![vec![Value::from_i64(1)]]);
+    }
+
     /// An extended-protocol statement is prepared once: Execute runs the statement its Describe
     /// prepared, instead of parsing, translating and compiling it a second time (wire review 1
     /// item 12). Two libpg_query calls before: Describe's and Execute's.

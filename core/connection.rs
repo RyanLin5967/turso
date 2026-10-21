@@ -385,6 +385,10 @@ pub struct Connection {
     /// was reset or dropped and there was no statement savepoint to undo only
     /// that statement. COMMIT must roll back the whole transaction.
     pub(crate) poisoned_tx: AtomicBool,
+    /// The fewest named savepoints that were open at any poisoning of the transaction
+    /// ([`Connection::mark_tx_poisoned`]); u64::MAX when it is not poisoned. A ROLLBACK TO one of
+    /// those savepoints undoes every poisoning statement, so it clears the poison.
+    pub(crate) poisoned_at_savepoints: AtomicU64,
     pub(super) last_insert_rowid: AtomicI64,
     pub(crate) changes: AtomicI64,
     pub(crate) total_changes: AtomicI64,
@@ -2893,6 +2897,8 @@ impl Connection {
     /// This is used when a write statement under BEGIN is abandoned before it
     /// reaches Halt/Done and that statement did not open a statement savepoint.
     pub(crate) fn mark_tx_poisoned(&self) {
+        let open = self.named_savepoints.read().len() as u64;
+        self.poisoned_at_savepoints.fetch_min(open, Ordering::SeqCst);
         self.poisoned_tx.store(true, Ordering::SeqCst);
     }
 
@@ -2904,6 +2910,7 @@ impl Connection {
     /// Clear the poison marker after BEGIN, COMMIT, or ROLLBACK.
     pub(crate) fn clear_tx_poison(&self) {
         self.poisoned_tx.store(false, Ordering::SeqCst);
+        self.poisoned_at_savepoints.store(u64::MAX, Ordering::SeqCst);
     }
 
     pub fn set_load_extension_enabled(&self, enabled: bool) {
@@ -5182,6 +5189,12 @@ impl Connection {
             return SavepointResult::Commit;
         }
         savepoints.truncate(target_idx);
+        // A poisoning inside the released savepoints now belongs to the one around them: a later
+        // savepoint at a released index did not exist when it happened.
+        if self.poisoned_tx.load(Ordering::SeqCst) {
+            self.poisoned_at_savepoints
+                .fetch_min(target_idx as u64, Ordering::SeqCst);
+        }
         SavepointResult::Release
     }
 
@@ -5190,6 +5203,15 @@ impl Connection {
         let target_idx = savepoints
             .iter()
             .rposition(|savepoint| savepoint.name == name)?;
+        // The savepoint was open at every poisoning of the transaction, so rolling back to it
+        // undid each abandoned statement's partial work: COMMIT is safe again. Without this, a
+        // statement stopped after a SAVEPOINT (a statement_timeout during DDL, which has no
+        // statement savepoint) made the block's COMMIT roll everything back, the work before
+        // the savepoint included, after ROLLBACK TO had answered ROLLBACK (review
+        // wire-rev-copystdin4 MED 1).
+        if (target_idx as u64) < self.poisoned_at_savepoints.load(Ordering::SeqCst) {
+            self.clear_tx_poison();
+        }
         let frame = &savepoints[target_idx];
         let info = RollbackFrameInfo {
             main_schema_snapshot: frame.main_schema_snapshot.clone(),
