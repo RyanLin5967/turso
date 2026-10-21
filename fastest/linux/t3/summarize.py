@@ -812,10 +812,14 @@ def summarize(out, sha, dry, manifest):
     if na:
         credit.append(f"the V3 fire-check judged {len(na)} rule(s) N/A, and a package holding an N/A rule is never "
                       f"credited: {', '.join(na)}")
-    summary["credit_refusals"], summary["creditable"] = credit, not credit
     ok = bool(planned) and not incomplete and not failed and not failed_blocks and not failed_checks \
         and summary["measured_runs"] > 0 and not parity and not fixture and not normaliser and not unquiet \
         and not mode_refusals
+    # a refusal always removes credit (t3cov-2 MED 2): a package that is not ok is never creditable, whatever else holds
+    if not ok:
+        credit.append("the package is not ok (a stage, block, check, parity, fixture, normaliser, quiet or mode refusal "
+                      "stands): a refused package is never credited")
+    summary["credit_refusals"], summary["creditable"] = credit, not credit
     summary["ok"] = ok  # the one verdict the workflow reads (fourth lane review LOW 23)
     return summary, ok
 
