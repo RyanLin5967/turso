@@ -777,7 +777,7 @@ impl PostgreSQLTranslator {
 
         let name = col_def.colname.clone();
         let pg_type = extract_type_name(col_def)?;
-        let typmods = extract_integer_typmods(col_def);
+        let typmods = extract_integer_typmods(col_def)?;
 
         // An identity column (GENERATED ALWAYS / BY DEFAULT AS IDENTITY) is numbered as a serial
         // one is, by its own sequence: the clause was dropped, so its rows had no id.
@@ -1280,7 +1280,7 @@ impl PostgreSQLTranslator {
         let col_name = pg_name(&col_def.colname);
 
         let pg_type = extract_type_name(col_def)?;
-        let typmods = extract_integer_typmods(col_def);
+        let typmods = extract_integer_typmods(col_def)?;
         let user_type = column_type_checked(&col_def.colname, &pg_type)?;
         let mapping = map_pg_type(&pg_type, &typmods).ok_or_else(|| {
             ParseError::ParseError(format!("unsupported PostgreSQL type: {pg_type}").into())
@@ -1957,25 +1957,6 @@ impl PostgreSQLTranslator {
     /// in VALUES — omitting the column achieves the same effect.
     /// Columns with DEFAULT in only SOME rows keep the DEFAULT as NULL.
     // The Box<Expr> is required by ast::OneSelect::Values(Vec<Vec<Box<Expr>>>)
-    /// A value assigned to a column (an INSERT VALUES item, an UPDATE SET source). A plain decimal
-    /// literal of more than 15 significant digits is handed to the column as its text: as a REAL
-    /// (the engine's reading of a decimal literal) it was rounded before a numeric column's
-    /// ENCODE, which reads text exactly (12345678901234567.89 stored 12345678901234568.00;
-    /// wire-rev-cfdebc06d MED-4). The column's affinity reads the text as a float or integer
-    /// column read the REAL, and a text column keeps PostgreSQL's digits. Only an assigned bare
-    /// literal: in an expression the text would compare and sort as text.
-    fn translate_assigned(&self, node: &pg_query::protobuf::Node) -> Result<ast::Expr, ParseError> {
-        use pg_query::protobuf::{a_const::Val, node::Node};
-        if let Some(Node::AConst(c)) = &node.node {
-            if let Some(Val::Fval(f)) = &c.val {
-                if long_plain_decimal(&f.fval) {
-                    return Ok(ast::Expr::Literal(sql_string(&f.fval)));
-                }
-            }
-        }
-        self.translate_expr(node)
-    }
-
     #[allow(clippy::vec_box, clippy::type_complexity)]
     fn translate_values(
         &self,
@@ -2017,7 +1998,7 @@ impl PostgreSQLTranslator {
                         .iter()
                         .enumerate()
                         .filter(|(i, _)| !default_mask.get(*i).copied().unwrap_or(false))
-                        .map(|(_, item)| Ok(Box::new(self.translate_assigned(item)?)))
+                        .map(|(_, item)| Ok(Box::new(self.translate_expr(item)?)))
                         .collect::<Result<Vec<_>, ParseError>>()?;
                     rows.push(row);
                 }
@@ -2121,7 +2102,7 @@ impl PostgreSQLTranslator {
                     }
                     sets.push(ast::Set {
                         col_names: vec![col_name],
-                        expr: Box::new(self.translate_assigned(val)?),
+                        expr: Box::new(self.translate_expr(val)?),
                     });
                 }
                 _ => {
@@ -3535,6 +3516,27 @@ impl PostgreSQLTranslator {
             Some(pg_query::protobuf::node::Node::AConst(a_const)) => self.translate_const(a_const),
             Some(pg_query::protobuf::node::Node::AExpr(a_expr)) => self.translate_a_expr(a_expr),
             Some(pg_query::protobuf::node::Node::BoolExpr(bool_expr)) => {
+                // AND with a constant false argument is false, OR with a constant true one is
+                // true, as PostgreSQL's eval_const_expressions reduces them before anything runs:
+                // the engine hoists constant arguments and evaluates them first, so a later
+                // bad constant (encode('abc', 'nosuch') = '') was raised where PG answers
+                // (wire-rev-351702a43 MED-4). The fold probe still runs the constant parts before
+                // the deciding constant, as PG simplifies those.
+                use pg_query::protobuf::{a_const::Val, BoolExprType};
+                let deciding = match BoolExprType::try_from(bool_expr.boolop) {
+                    Ok(BoolExprType::AndExpr) => Some(false),
+                    Ok(BoolExprType::OrExpr) => Some(true),
+                    _ => None,
+                };
+                if let Some(v) = deciding {
+                    let decided = bool_expr.args.iter().any(|a| {
+                        matches!(a.node.as_ref(), Some(pg_query::protobuf::node::Node::AConst(c))
+                            if matches!(&c.val, Some(Val::Boolval(b)) if b.boolval == v))
+                    });
+                    if decided {
+                        return Ok(ast::Expr::Literal(ast::Literal::Numeric(if v { "1" } else { "0" }.to_string())));
+                    }
+                }
                 self.translate_bool_expr(bool_expr)
             }
             Some(pg_query::protobuf::node::Node::FuncCall(func_call)) => {
@@ -3554,6 +3556,42 @@ impl PostgreSQLTranslator {
                 }
             }
             Some(pg_query::protobuf::node::Node::TypeCast(type_cast)) => {
+                // An explicit cast to varchar(n) cuts its value to n characters, as PostgreSQL's
+                // explicit-cast length coercion does: the cast without its length, then the cut
+                // (wire-rev-351702a43 MED-5: $1::varchar(10) stored the whole text).
+                if let Some(t) = type_cast.type_name.as_ref().filter(|t| t.array_bounds.is_empty() && !t.typmods.is_empty()) {
+                    let varchar = t.names.last().is_some_and(|n| {
+                        matches!(&n.node, Some(pg_query::protobuf::node::Node::String(s))
+                            if matches!(s.sval.to_ascii_lowercase().as_str(), "varchar" | "character varying"))
+                    });
+                    if varchar {
+                        let n = match type_modifiers(t)?.as_slice() {
+                            [n] => *n,
+                            _ => {
+                                return Err(ParseError::ParseError(SqlErrorMessage::classified(
+                                    SqlErrorKind::SyntaxError,
+                                    "invalid type modifier",
+                                )))
+                            }
+                        };
+                        let mut bare = (**type_cast).clone();
+                        if let Some(bt) = bare.type_name.as_mut() {
+                            bt.typmods.clear();
+                        }
+                        let inner = self.translate_expr(&pg_query::protobuf::Node {
+                            node: Some(pg_query::protobuf::node::Node::TypeCast(Box::new(bare))),
+                        })?;
+                        let lit = |v: i64| Box::new(ast::Expr::Literal(ast::Literal::Numeric(v.to_string())));
+                        return Ok(ast::Expr::FunctionCall {
+                            name: pg_name("substr"),
+                            distinctness: None,
+                            args: vec![Box::new(inner), lit(1), lit(n)],
+                            order_by: vec![],
+                            within_group: vec![],
+                            filter_over: ast::FunctionTail { filter_clause: None, over_clause: None },
+                        });
+                    }
+                }
                 let arg = type_cast.arg.as_ref().ok_or_else(|| {
                     ParseError::ParseError("TypeCast missing inner expression".into())
                 })?;
@@ -3616,6 +3654,102 @@ impl PostgreSQLTranslator {
                         ).into()));
                     }
                 }
+                // A decimal literal cast to an integer type is rounded half away from zero, as
+                // PostgreSQL's numeric-to-int conversion rounds it (1.5::int2 is 2); the engine's
+                // CAST truncates (wire-rev-7128c6f73 MED-4). Rounded here, where the literal is
+                // still a decimal. BLIND SPOT: a column or expression of a numeric or float type
+                // cast to an integer is the engine's CAST and truncates (PGDIV-INT-CAST-TRUNCATES).
+                if let (Some(pg_query::protobuf::node::Node::AConst(c)), Some(t)) =
+                    (arg.node.as_ref(), type_cast.type_name.as_ref())
+                {
+                    let integer = t.array_bounds.is_empty()
+                        && t.names.last().is_some_and(|n| {
+                            matches!(&n.node, Some(pg_query::protobuf::node::Node::String(s))
+                                if matches!(s.sval.to_ascii_lowercase().as_str(),
+                                    "int2" | "int4" | "int8" | "int" | "integer" | "smallint" | "bigint"))
+                        });
+                    if let (true, Some(pg_query::protobuf::a_const::Val::Fval(f))) = (integer, &c.val) {
+                        let text = f.fval.replace('_', "");
+                        let is_decimal = text.contains(['.', 'e', 'E']);
+                        if let (true, Ok(v)) = (is_decimal, text.parse::<f64>()) {
+                            let r = v.round();
+                            if r.is_finite() && r.abs() < 9.2e18 {
+                                return Ok(ast::Expr::Cast {
+                                    expr: Box::new(ast::Expr::Literal(ast::Literal::Numeric((r as i64).to_string()))),
+                                    type_name: pg_type_name_to_ast_type(t),
+                                });
+                            }
+                        }
+                    }
+                }
+                // A column or parameter cast to an integer type rounds as PostgreSQL's conversion
+                // does: a numeric (the engine's numeric decodes to text) half away from zero
+                // (numeric_int4), a float half to even (dtoi4's rint); the engine's CAST truncates
+                // (wire-rev-7128c6f73 MED-4). Integers and other text keep the engine's CAST. Only
+                // a column or a parameter, which can be read several times; BLIND SPOT: any other
+                // expression cast to an integer still truncates (PGDIV-INT-CAST-TRUNCATES).
+                if let Some(t) = type_cast.type_name.as_ref() {
+                    let integer = t.array_bounds.is_empty()
+                        && t.names.last().is_some_and(|n| {
+                            matches!(&n.node, Some(pg_query::protobuf::node::Node::String(s))
+                                if matches!(s.sval.to_ascii_lowercase().as_str(),
+                                    "int2" | "int4" | "int8" | "int" | "integer" | "smallint" | "bigint"))
+                        });
+                    let rereadable = matches!(
+                        arg.node.as_ref(),
+                        Some(pg_query::protobuf::node::Node::ColumnRef(_) | pg_query::protobuf::node::Node::ParamRef(_))
+                    );
+                    if integer && rereadable {
+                        let x = || self.translate_expr(arg);
+                        let ty = pg_type_name_to_ast_type(t);
+                        let func = |name: &str, args: Vec<ast::Expr>| ast::Expr::FunctionCall {
+                            name: pg_name(name),
+                            distinctness: None,
+                            args: args.into_iter().map(Box::new).collect(),
+                            order_by: vec![],
+                            within_group: vec![],
+                            filter_over: ast::FunctionTail { filter_clause: None, over_clause: None },
+                        };
+                        let text = |v: &str| ast::Expr::Literal(sql_string(v));
+                        let num = |v: &str| ast::Expr::Literal(ast::Literal::Numeric(v.to_string()));
+                        let cast = |e: ast::Expr| ast::Expr::Cast { expr: Box::new(e), type_name: ty.clone() };
+                        let bin = |a: ast::Expr, op: ast::Operator, b: ast::Expr| ast::Expr::Binary(Box::new(a), op, Box::new(b));
+                        // round(x) is half away from zero; a float's half-way case steps back to the
+                        // even neighbour.
+                        let away = || -> Result<ast::Expr, ParseError> { Ok(cast(func("round", vec![x()?]))) };
+                        let half_even = bin(
+                            away()?,
+                            ast::Operator::Subtract,
+                            ast::Expr::Case {
+                                base: None,
+                                when_then_pairs: vec![(
+                                    Box::new(bin(
+                                        bin(func("abs", vec![bin(x()?, ast::Operator::Subtract, func("trunc", vec![x()?]))]), ast::Operator::Equals, num("0.5")),
+                                        ast::Operator::And,
+                                        bin(bin(away()?, ast::Operator::Modulus, num("2")), ast::Operator::NotEquals, num("0")),
+                                    )),
+                                    Box::new(func("sign", vec![x()?])),
+                                )],
+                                else_expr: Some(Box::new(num("0"))),
+                            },
+                        );
+                        let decimal_text = bin(
+                            bin(func("typeof", vec![x()?]), ast::Operator::Equals, text("text")),
+                            ast::Operator::And,
+                            bin(func("instr", vec![x()?, text(".")]), ast::Operator::Greater, num("0")),
+                        );
+                        // The whole CASE is cast again, so the engine types the result as the cast's
+                        // integer (a bare CASE was typed text, 25).
+                        return Ok(cast(ast::Expr::Case {
+                            base: None,
+                            when_then_pairs: vec![
+                                (Box::new(bin(func("typeof", vec![x()?]), ast::Operator::Equals, text("real"))), Box::new(half_even)),
+                                (Box::new(decimal_text), Box::new(away()?)),
+                            ],
+                            else_expr: Some(Box::new(cast(x()?))),
+                        }));
+                    }
+                }
                 let expr = Box::new(self.translate_expr(arg)?);
                 // A regclass is the named relation's pg_class oid, resolved by the frontend's
                 // pg_regclass (recorded, pg18-rev-regclass.out); a cast to INTEGER made every
@@ -3643,7 +3777,7 @@ impl PostgreSQLTranslator {
                 // REAL, a float announced float8 and not rounded to the scale (wire-rev-uw3 MED-4;
                 // recorded, pg18/pg18-wirefuzz-a_cast_to_numeric_p_s_and_a_numeric_domain_column_are_numeric.out). A bare NUMERIC stays REAL (the
                 // bare-NUMERIC divergence, a known red).
-                if let Some((p, s)) = type_cast.type_name.as_ref().and_then(numeric_cast_size) {
+                if let Some((p, s)) = type_cast.type_name.as_ref().map(numeric_cast_typmods).transpose()?.flatten() {
                     // The REAL below holds every decimal of at most 15 significant digits exactly
                     // (DBL_DIG) and no wider one: past 15 it answered 9007199254740992 for
                     // 9007199254740993, so =, IN, GROUP BY and DISTINCT merged distinct values
@@ -3693,19 +3827,47 @@ impl PostgreSQLTranslator {
                     t.array_bounds.is_empty()
                         && t.names.last().is_some_and(|n| matches!(&n.node, Some(pg_query::protobuf::node::Node::String(s)) if s.sval == "oid"))
                 }) {
+                    use pg_query::protobuf::a_const::Val;
+                    let range = i64::from(i32::MIN)..=i64::from(u32::MAX);
+                    // oidin's value: a negative integer is its 32-bit two's complement
+                    // ((-1)::oid is 4294967295; wire-rev-351702a43 LOW-3).
+                    let unsigned = |v: i64| ast::Expr::Literal(ast::Literal::Numeric((if v < 0 { v + (1i64 << 32) } else { v }).to_string()));
                     let literal = match arg.node.as_ref() {
                         Some(pg_query::protobuf::node::Node::AConst(c)) => match &c.val {
-                            Some(pg_query::protobuf::a_const::Val::Ival(i)) => Some(i64::from(i.ival)),
-                            Some(pg_query::protobuf::a_const::Val::Fval(f)) => f.fval.parse::<i64>().ok().or(Some(i64::MAX)),
+                            Some(Val::Ival(i)) => Some(i64::from(i.ival)),
+                            Some(Val::Fval(f)) if f.fval.contains(['.', 'e', 'E']) => {
+                                return Err(ParseError::ParseError(SqlErrorMessage::classified(
+                                    SqlErrorKind::CannotCoerce,
+                                    "cannot cast type numeric to oid",
+                                )));
+                            }
+                            Some(Val::Fval(f)) => f.fval.parse::<i64>().ok().or(Some(i64::MAX)),
+                            Some(Val::Sval(sv)) => {
+                                let t = sv.sval.trim();
+                                match t.parse::<i64>() {
+                                    Ok(v) if range.contains(&v) => return Ok(unsigned(v)),
+                                    Ok(_) => {
+                                        return Err(ParseError::ParseError(SqlErrorMessage::classified(
+                                            SqlErrorKind::NumericValueOutOfRange,
+                                            format!("value \"{t}\" is out of range for type oid"),
+                                        )));
+                                    }
+                                    Err(_) => None,
+                                }
+                            }
                             _ => None,
                         },
                         _ => None,
                     };
-                    if literal.is_some_and(|v| !(i64::from(i32::MIN)..=i64::from(u32::MAX)).contains(&v)) {
-                        return Err(ParseError::ParseError(SqlErrorMessage::classified(
-                            SqlErrorKind::NumericValueOutOfRange,
-                            "OID out of range".to_string(),
-                        )));
+                    match literal {
+                        Some(v) if !range.contains(&v) => {
+                            return Err(ParseError::ParseError(SqlErrorMessage::classified(
+                                SqlErrorKind::NumericValueOutOfRange,
+                                "OID out of range".to_string(),
+                            )));
+                        }
+                        Some(v) => return Ok(unsigned(v)),
+                        None => {}
                     }
                 }
                 // A cast to date, timestamp or timestamptz goes through the engine's own type, whose
@@ -4254,6 +4416,42 @@ impl PostgreSQLTranslator {
             })
             .ok_or_else(|| ParseError::ParseError("Missing operator name".to_string().into()))?;
 
+        if matches!(op_name, "+" | "-" | "*" | "/" | "%")
+            && [a_expr.lexpr.as_deref(), a_expr.rexpr.as_deref()].into_iter().flatten().any(is_numeric_typmod_cast)
+        {
+            return Err(refuse_numeric_cast_arithmetic(op_name));
+        }
+        // The engine has no interval type (PGDIV-INTERVAL-TEXT): arithmetic with an interval
+        // operand is refused, never computed over its text (wire-rev-7128c6f73 L4: now() +
+        // interval '1 day' > now() answered f).
+        let interval = |e: Option<&pg_query::protobuf::Node>| {
+            matches!(e.and_then(|e| e.node.as_ref()), Some(pg_query::protobuf::node::Node::TypeCast(c))
+                if c.type_name.as_ref().is_some_and(|t| t.names.last().is_some_and(|n|
+                    matches!(&n.node, Some(pg_query::protobuf::node::Node::String(s)) if s.sval == "interval"))))
+        };
+        if matches!(op_name, "+" | "-" | "*" | "/") && (interval(a_expr.lexpr.as_deref()) || interval(a_expr.rexpr.as_deref())) {
+            return Err(ParseError::ParseError(SqlErrorMessage::classified(
+                SqlErrorKind::FeatureNotSupported,
+                "interval arithmetic is not supported",
+            )));
+        }
+        // Two unknowns (string literals or NULL) leave every candidate operator: 42725, as
+        // PostgreSQL refuses it wherever the operator stands (wire-rev-7128c6f73 L2: only the
+        // target list's walk refused it).
+        let unknown = |e: Option<&pg_query::protobuf::Node>| {
+            matches!(e.and_then(|e| e.node.as_ref()), Some(pg_query::protobuf::node::Node::AConst(c))
+                if c.isnull || matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))))
+        };
+        if matches!(op_name, "+" | "-" | "*" | "/" | "%")
+            && unknown(a_expr.lexpr.as_deref())
+            && unknown(a_expr.rexpr.as_deref())
+        {
+            return Err(ParseError::ParseError(SqlErrorMessage::classified(
+                SqlErrorKind::AmbiguousFunction,
+                format!("operator is not unique: unknown {op_name} unknown"),
+            )));
+        }
+
         // Handle unary operators (no left expression)
         if a_expr.lexpr.is_none() {
             let rhs = a_expr
@@ -4698,6 +4896,12 @@ impl PostgreSQLTranslator {
             })
             .next_back()
             .ok_or_else(|| ParseError::ParseError("Missing function name".to_string().into()))?;
+
+        if matches!(func_name.to_ascii_lowercase().as_str(), "sum" | "avg")
+            && func_call.args.iter().any(is_numeric_typmod_cast)
+        {
+            return Err(refuse_numeric_cast_arithmetic(&func_name));
+        }
 
         // Translate FILTER clause
         let filter_clause = if let Some(ref filter) = func_call.agg_filter {
@@ -6117,24 +6321,48 @@ fn float_literal(text: &str, type_name: &str) -> Result<ast::Expr, ParseError> {
     literal(format!("{v:e}"))
 }
 
+/// THE predicate for a decimal the engine would round (wire-rev-7128c6f73 HIGH-1, the lead's ruling
+/// DECISIONS d2bf57effb): `text`, a numeric literal's or a bound numeric value's text, holds more
+/// than 15 significant digits (DBL_DIG, the most a float8 holds exactly), so as the engine's REAL
+/// it would not be PostgreSQL's numeric. An integer that fits int8 is exact and is not one.
+/// Underscores and a leading sign are ignored; an exponent moves no digit; a radix literal (0x..)
+/// is one when it does not fit int8. Text that is no number is not one (its reader refuses it).
+pub fn decimal_past_float8(text: &str) -> bool {
+    let t = text.trim();
+    let negative = t.starts_with('-');
+    let t = t.strip_prefix(['-', '+']).unwrap_or(t);
+    let lower = t.to_ascii_lowercase();
+    let body: String = lower.chars().filter(|c| *c != '_').collect();
+    // An integer is exact when its value, sign included, fits int8 (-0x8000000000000000 does).
+    let fits_int8 = |magnitude: Option<u128>| {
+        magnitude.is_some_and(|m| if negative { m <= 1u128 << 63 } else { m < 1u128 << 63 })
+    };
+    if let Some(digits) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0o")).or_else(|| body.strip_prefix("0b")) {
+        let radix = match &body[..2] {
+            "0x" => 16,
+            "0o" => 8,
+            _ => 2,
+        };
+        return !fits_int8(u128::from_str_radix(digits, radix).ok());
+    }
+    if !body.is_empty() && body.bytes().all(|b| b.is_ascii_digit()) {
+        return !fits_int8(body.parse::<u128>().ok());
+    }
+    let mantissa = body.split(['e']).next().unwrap_or("");
+    if mantissa.is_empty() || !mantissa.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+        return false;
+    }
+    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+    digits.trim_start_matches('0').trim_end_matches('0').len() > 15
+}
+
 /// A numeric literal as libpg_query hands it (an integer past int4 arrives as text, not Ival), in
 /// the decimal form the engine's literal parser reads: PostgreSQL 16+'s base-2, -8 and -16 integers
 /// (`0b..`, `0o..`, `0x..`) and underscores between digits become decimal digits. The engine's
 /// parse_numeric_literal assumes SQLite's grammar checked the text, so `0b1000..0` (2^31) hit its
 /// unreachable!() and ended the session (the PostgreSQL regression corpus, numerology.sql). A
 /// non-decimal value past u128 is computed as a float. Any other text is passed on as it is.
-/// Whether `text` is a plain decimal (optional '-', digits with one '.', no exponent, no '_')
-/// holding more than 15 significant digits, more than a float8 holds exactly (DBL_DIG).
-fn long_plain_decimal(text: &str) -> bool {
-    let body = text.strip_prefix('-').unwrap_or(text);
-    if body.bytes().filter(|&b| b == b'.').count() != 1 || !body.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
-        return false;
-    }
-    let digits: String = body.chars().filter(|c| *c != '.').collect();
-    digits.trim_start_matches('0').trim_end_matches('0').len() > 15
-}
-
-fn decimal_numeric_literal(text: &str) -> String {
+pub fn decimal_numeric_literal(text: &str) -> String {
     let (negative, body) = match text.strip_prefix('-') {
         Some(rest) => (true, rest),
         None => (false, text),
@@ -6390,65 +6618,90 @@ fn extract_type_name(col_def: &pg_query::protobuf::ColumnDef) -> Result<String, 
     Ok(name)
 }
 
-/// Extract integer type modifiers from a column definition.
-/// For `varchar(50)` this returns `[50]`, for `numeric(10, 2)` returns `[10, 2]`.
-/// The precision and scale of a cast to NUMERIC(p, s) or NUMERIC(p) (DECIMAL alike, scale 0), as
-/// the column declaration's map_pg_type gives them; None for any other type or a bare NUMERIC.
-pub fn numeric_cast_size(type_name: &pg_query::protobuf::TypeName) -> Option<(i64, i64)> {
+/// A type name's modifiers, read in ONE place for every spelling (wire-rev-351702a43 HIGH-1): an
+/// integer constant, or a string constant holding an integer, as PostgreSQL's typenameTypeMod
+/// passes both to the type's typmodin (NUMERIC('20','0') is NUMERIC(20,0)). Any other modifier is
+/// refused, never dropped: a dropped one made NUMERIC('20','0') a bare NUMERIC.
+pub fn type_modifiers(type_name: &pg_query::protobuf::TypeName) -> Result<Vec<i64>, ParseError> {
     use pg_query::protobuf::a_const::Val;
     use pg_query::protobuf::node::Node;
-    if !type_name.array_bounds.is_empty() {
-        return None;
-    }
-    let name = type_name.names.last().and_then(|n| match &n.node {
-        Some(Node::String(s)) => Some(s.sval.to_ascii_lowercase()),
-        _ => None,
-    })?;
-    if name != "numeric" && name != "decimal" {
-        return None;
-    }
-    let mods: Vec<i64> = type_name
-        .typmods
-        .iter()
-        .filter_map(|node| match &node.node {
-            Some(Node::Integer(i)) => Some(i.ival as i64),
-            Some(Node::AConst(c)) => match &c.val {
-                Some(Val::Ival(i)) => Some(i.ival as i64),
-                _ => None,
-            },
-            _ => None,
-        })
-        .collect();
-    if mods.len() != type_name.typmods.len() {
-        return None;
-    }
-    let (p, s) = match mods.as_slice() {
-        [p, s] => (*p, *s),
-        [p] => (*p, 0),
-        _ => return None,
-    };
-    Some((p, s))
-}
-
-fn extract_integer_typmods(col_def: &pg_query::protobuf::ColumnDef) -> Vec<i64> {
-    use pg_query::protobuf::a_const::Val;
-    use pg_query::protobuf::node::Node;
-
-    let Some(type_name) = &col_def.type_name else {
-        return vec![];
-    };
     type_name
         .typmods
         .iter()
-        .filter_map(|node| match &node.node {
-            Some(Node::Integer(i)) => Some(i.ival as i64),
-            Some(Node::AConst(a_const)) => match &a_const.val {
-                Some(Val::Ival(i)) => Some(i.ival as i64),
+        .map(|node| {
+            let read = match &node.node {
+                Some(Node::Integer(i)) => Some(i64::from(i.ival)),
+                Some(Node::AConst(c)) => match &c.val {
+                    Some(Val::Ival(i)) => Some(i64::from(i.ival)),
+                    Some(Val::Sval(s)) => s.sval.trim().parse::<i64>().ok(),
+                    _ => None,
+                },
                 _ => None,
-            },
-            _ => None,
+            };
+            read.ok_or_else(|| {
+                ParseError::ParseError(SqlErrorMessage::classified(
+                    SqlErrorKind::FeatureNotSupported,
+                    "a type modifier that is not an integer constant is not supported",
+                ))
+            })
         })
         .collect()
+}
+
+/// The precision and scale of a cast to NUMERIC(p, s) or NUMERIC(p) (DECIMAL alike, scale 0), as
+/// the column declaration's map_pg_type gives them; Ok(None) for any other type or a bare
+/// NUMERIC; an error for a modifier [`type_modifiers`] cannot read.
+pub fn numeric_cast_typmods(type_name: &pg_query::protobuf::TypeName) -> Result<Option<(i64, i64)>, ParseError> {
+    use pg_query::protobuf::node::Node;
+    if !type_name.array_bounds.is_empty() {
+        return Ok(None);
+    }
+    let Some(name) = type_name.names.last().and_then(|n| match &n.node {
+        Some(Node::String(s)) => Some(s.sval.to_ascii_lowercase()),
+        _ => None,
+    }) else {
+        return Ok(None);
+    };
+    if name != "numeric" && name != "decimal" {
+        return Ok(None);
+    }
+    Ok(match type_modifiers(type_name)?.as_slice() {
+        [p, s] => Some((*p, *s)),
+        [p] => Some((*p, 0)),
+        _ => None,
+    })
+}
+
+/// Whether `node` is a cast to NUMERIC(p, s) or NUMERIC(p): the engine's REAL, exact for its own
+/// value (p <= 15) but not under arithmetic.
+fn is_numeric_typmod_cast(node: &pg_query::protobuf::Node) -> bool {
+    matches!(node.node.as_ref(), Some(pg_query::protobuf::node::Node::TypeCast(c))
+        if c.type_name.as_ref().is_some_and(|t| numeric_cast_size(t).is_some()))
+}
+
+/// Arithmetic or sum/avg over a CAST to NUMERIC(p, s) is refused 0A000: the cast is the engine's
+/// REAL, so 0.10 + 0.20 answered 0.30000000000000004 and = 0.3 answered f, where PG computes in
+/// numeric (wire-rev-351702a43 MED-2). BLIND SPOT: a cast reached through a CTE's, a view's or a
+/// derived table's column is not seen here (PGDIV-NUMERIC-CAST-FLOAT8).
+fn refuse_numeric_cast_arithmetic(what: &str) -> ParseError {
+    ParseError::ParseError(SqlErrorMessage::classified(
+        SqlErrorKind::FeatureNotSupported,
+        format!("{what} over a cast to numeric(p,s) is not supported: it would be computed inexactly as a float"),
+    ))
+}
+
+/// [`numeric_cast_typmods`] for a reader that only types (the walk): an unreadable modifier is no
+/// size here, and the translator refuses the statement.
+pub fn numeric_cast_size(type_name: &pg_query::protobuf::TypeName) -> Option<(i64, i64)> {
+    numeric_cast_typmods(type_name).ok().flatten()
+}
+
+
+fn extract_integer_typmods(col_def: &pg_query::protobuf::ColumnDef) -> Result<Vec<i64>, ParseError> {
+    match &col_def.type_name {
+        Some(type_name) => type_modifiers(type_name),
+        None => Ok(vec![]),
+    }
 }
 
 fn extract_key_columns(keys: &[pg_query::protobuf::Node]) -> Result<Vec<String>, ParseError> {

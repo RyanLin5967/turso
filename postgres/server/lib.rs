@@ -1492,6 +1492,23 @@ impl Parsed {
         }
     }
 
+    /// Refuse a Bind whose parameter types are not the ones this statement already fixed, before
+    /// any value is read by them (as PostgreSQL's GetCachedPlan refuses at Bind); fixes nothing.
+    /// A value read by the re-inferred type was refused for that type's reasons first (a binary
+    /// int4 read as text held NUL bytes: 22021 where PostgreSQL answers 0A000).
+    fn check_fixed_params(&self, params: &[Type]) -> SqlResult<()> {
+        match self.params.get() {
+            Some(fixed) if fixed.as_slice() != params => {
+                let i = fixed.iter().zip(params).take_while(|(a, b)| a == b).count();
+                Err(error(
+                    SqlErrorKind::FeatureNotSupported,
+                    format!("cached plan must not change the type of parameter ${}", i + 1),
+                ))
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Fix the statement's result columns, each its name and type, at the first call, and refuse
     /// any later call whose columns are others, in PostgreSQL's words: its equalRowTypes compares
     /// names with types, so the same types in another order under other names are another row
@@ -4616,6 +4633,7 @@ impl ExtendedQueryHandler for Session {
                 .described_parameters(&portal.statement.statement.sql, &portal.statement.parameter_types)
                 .map_err(PgWireError::UserError)?;
             if params.len() == portal.parameters.len() {
+                portal.statement.statement.check_fixed_params(&params).map_err(PgWireError::UserError)?;
                 decode_portal_parameters(&portal, &params)?;
                 // A custom plan coerces each assignment at Bind; PostgreSQL 18.6 plans a
                 // statement, the unnamed one included, custom for its first five plans, then
@@ -5433,6 +5451,38 @@ fn bpchar_width(
     widths.all(|w| w == Some(first)).then_some(first)
 }
 
+/// PostgreSQL's 22003 message for `val` under an announced integer type it does not fit: an integer
+/// past int2 or int4, or a float (the engine's int8 overflow) under any of them. None when it fits.
+fn past_announced_integer(val: &Value, pg_type: &Type) -> Option<&'static str> {
+    use turso_core::Numeric;
+    let name = match *pg_type {
+        Type::INT2 => "smallint out of range",
+        Type::INT4 => "integer out of range",
+        Type::INT8 => "bigint out of range",
+        _ => return None,
+    };
+    match val {
+        Value::Numeric(Numeric::Integer(i)) => {
+            let fits = match *pg_type {
+                Type::INT2 => i16::try_from(*i).is_ok(),
+                Type::INT4 => i32::try_from(*i).is_ok(),
+                _ => true,
+            };
+            (!fits).then_some(name)
+        }
+        Value::Numeric(Numeric::Float(f)) => {
+            let f = f64::from(*f);
+            let (lo, hi) = match *pg_type {
+                Type::INT2 => (f64::from(i16::MIN), f64::from(i16::MAX)),
+                Type::INT4 => (f64::from(i32::MIN), f64::from(i32::MAX)),
+                _ => (-9.223372036854775808e18, 9.223372036854775807e18),
+            };
+            (!f.is_finite() || f < lo || f >= hi + if *pg_type == Type::INT8 { 0.0 } else { 1.0 }).then_some(name)
+        }
+        _ => None,
+    }
+}
+
 fn encode_row<'a>(
     header: &Arc<Vec<FieldInfo>>,
     pads: &[Option<usize>],
@@ -5452,6 +5502,12 @@ fn encode_row<'a>(
         {
             encode_binary(&mut encoder, val, &pg_type)?;
             continue;
+        }
+        // An integer column's value past its announced type is PostgreSQL's 22003, as the binary
+        // encoder refuses it: the engine computes int2 and int8 arithmetic as int8 or REAL, so
+        // 32767::int2 + 1::int2 was written '32768' under 21 (wire-rev-7128c6f73 L3).
+        if let Some(message) = past_announced_integer(val, &pg_type) {
+            return Err(PgWireError::UserError(error(SqlErrorKind::NumericValueOutOfRange, message.to_string())));
         }
         if let (Some(Some(width)), Value::Text(t)) = (pads.get(i), val) {
             let chars = t.as_str().chars().count();
@@ -6011,6 +6067,7 @@ fn pg_binary_to_value(bytes: &[u8], pg_type: &Type, n: usize) -> PgWireResult<Va
         ))
     };
     let text = |b: &[u8]| -> PgWireResult<Value> {
+        refuse_nul(b)?;
         std::str::from_utf8(b)
             .map(|s| Value::from_text(s.to_owned()))
             .map_err(|e| {
@@ -6033,14 +6090,20 @@ fn pg_binary_to_value(bytes: &[u8], pg_type: &Type, n: usize) -> PgWireResult<Va
         Ok(Value::from_i64(i64::from_be_bytes(
             bytes.try_into().map_err(|_| bad())?,
         )))
-    } else if *t == Type::FLOAT4 {
-        Ok(Value::from_f64(
-            f32::from_be_bytes(bytes.try_into().map_err(|_| bad())?).into(),
-        ))
-    } else if *t == Type::FLOAT8 {
-        Ok(Value::from_f64(f64::from_be_bytes(
-            bytes.try_into().map_err(|_| bad())?,
-        )))
+    } else if *t == Type::FLOAT4 || *t == Type::FLOAT8 {
+        let f = if *t == Type::FLOAT4 {
+            f64::from(f32::from_be_bytes(bytes.try_into().map_err(|_| bad())?))
+        } else {
+            f64::from_be_bytes(bytes.try_into().map_err(|_| bad())?)
+        };
+        // The engine holds no NaN (stored as NULL): refused, as the text form is (PGDIV-NAN).
+        if f.is_nan() {
+            return Err(PgWireError::UserError(error(
+                SqlErrorKind::FeatureNotSupported,
+                "NaN is not supported: the engine holds no NaN".to_string(),
+            )));
+        }
+        Ok(Value::from_f64(f))
     } else if *t == Type::BOOL {
         match bytes {
             [b] => Ok(Value::from_i64((*b != 0) as i64)),
@@ -6076,11 +6139,25 @@ fn pg_binary_to_value(bytes: &[u8], pg_type: &Type, n: usize) -> PgWireResult<Va
 }
 
 /// Convert raw parameter bytes to a turso Value based on the PostgreSQL type.
+/// A NUL byte is no character of UTF8: PostgreSQL's input (pg_verify_mbstr) refuses a parameter
+/// holding one, 22021, in text format for every type and in binary for text, varchar and char.
+/// std::str::from_utf8 accepts NUL, so the value was stored with it (wire-rev-351702a43 MED-3).
+fn refuse_nul(bytes: &[u8]) -> PgWireResult<()> {
+    if bytes.contains(&0) {
+        return Err(PgWireError::UserError(error(
+            SqlErrorKind::CharacterNotInRepertoire,
+            "invalid byte sequence for encoding \"UTF8\": 0x00".to_string(),
+        )));
+    }
+    Ok(())
+}
+
 /// Assumes text format encoding (UTF-8 string representations). A value the type cannot read is
 /// refused as the type's input function refuses it: 22P02 for bad syntax, 22003 for a value outside
 /// the type, 22023 for bad bytea hex; they were XX000, and no integer's range below int8 was checked
 /// (wire review 13 item 8, review 14 item 28).
 fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
+    refuse_nul(bytes)?;
     let text = std::str::from_utf8(bytes).map_err(|e| {
         PgWireError::UserError(error(
             SqlErrorKind::CharacterNotInRepertoire,
@@ -6131,7 +6208,51 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
                 _ => "numeric",
             };
             let trimmed = text.trim_matches(|c: char| c.is_ascii() && pg_space(c as u8));
+            // numeric_in (PG 16+) reads underscores between digits and a 0x/0o/0b integer, and
+            // refuses an exponent at or past INT_MAX/2 (wire-rev-7128c6f73 L9, L1: '1_000' and
+            // '0x10' were 22P02, '1e-2147483648' was stored 0).
+            let normalized;
+            let trimmed = if *pg_type == Type::NUMERIC {
+                let body = trimmed.trim_start_matches(['+', '-']).to_ascii_lowercase();
+                if body.contains('_') || ["0x", "0o", "0b"].iter().any(|p| body.starts_with(p)) {
+                    normalized = turso_pg_parser::translator::decimal_numeric_literal(trimmed);
+                    normalized.as_str()
+                } else {
+                    trimmed
+                }
+            } else {
+                trimmed
+            };
+            if *pg_type == Type::NUMERIC {
+                if let Some(at) = trimmed.find(['e', 'E']) {
+                    let out_of_format = trimmed[at + 1..].parse::<i64>().map_or(true, |e| e.abs() >= i64::from(i32::MAX / 2));
+                    if out_of_format && trimmed[..at].bytes().any(|b| b.is_ascii_digit()) {
+                        return Err(PgWireError::UserError(error(
+                            SqlErrorKind::NumericValueOutOfRange,
+                            "value overflows numeric format".to_string(),
+                        )));
+                    }
+                }
+            }
+            // A bound numeric of more than 15 significant digits would be the engine's REAL,
+            // rounded: refused, as the same literal is (wire-rev-7128c6f73 HIGH-1, the lead's
+            // ruling DECISIONS d2bf57effb; turso_pg_parser's one predicate). A float parameter
+            // reads it as PostgreSQL's float8in does, so it is not refused there.
+            if *pg_type == Type::NUMERIC && turso_pg_parser::translator::decimal_past_float8(trimmed) {
+                return Err(PgWireError::UserError(error(
+                    SqlErrorKind::FeatureNotSupported,
+                    format!("numeric value {trimmed} is not supported: more than 15 significant digits would be rounded"),
+                )));
+            }
             let f: f64 = trimmed.parse().map_err(|_| syntax(name))?;
+            // The engine holds no NaN: a float NaN is stored as NULL, so a bound NaN is refused,
+            // as the literal is (PGDIV-NAN; wire-rev-7128c6f73 MED-3: 'NaN' read null).
+            if f.is_nan() {
+                return Err(PgWireError::UserError(error(
+                    SqlErrorKind::FeatureNotSupported,
+                    format!("NaN is not supported for type {name}: the engine holds no NaN"),
+                )));
+            }
             // A finite spelling past the type's range ('1e400'), which Rust reads as infinity.
             let infinite_spelled = trimmed
                 .trim_start_matches(['+', '-'])

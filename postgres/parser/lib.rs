@@ -273,6 +273,61 @@ impl Default for ParamScan {
     }
 }
 
+/// The first numeric literal of `sql` that [`translator::decimal_past_float8`] says the engine
+/// would round, read with libpg_query's own lexer (every numeric constant is one FCONST token;
+/// a parse tree walk missed VALUES lists, row-form SET, ON CONFLICT and DEFAULT expressions:
+/// wire-rev-7128c6f73 HIGH-1). A literal an explicit float cast reads is skipped: `L::float8`
+/// (float4, real, float, double precision) and `CAST(L AS <float type>)`, a float being what
+/// PostgreSQL reads it as there; and one whose byte offset is in `exempt` (the caller's: a literal
+/// assigned to a float column). None when the lexer refuses the text (the parse reports it).
+pub fn long_decimal_literal(sql: &str, exempt: &[usize]) -> Option<String> {
+    use pg_query::protobuf::Token;
+    count_libpg_query_call();
+    let tokens = pg_query::scan(sql).ok()?.tokens;
+    let kinds: Vec<Token> = tokens.iter().map(|t| t.token()).collect();
+    let text = |i: usize| -> &str {
+        tokens.get(i).and_then(|t| sql.get(t.start as usize..t.end as usize)).unwrap_or("")
+    };
+    // A float type's tokens starting at i.
+    let float_type = |i: usize| -> bool {
+        match kinds.get(i) {
+            Some(Token::Real | Token::FloatP) => true,
+            Some(Token::DoubleP) => kinds.get(i + 1) == Some(&Token::Precision),
+            Some(Token::Ident) => matches!(text(i).to_ascii_lowercase().as_str(), "float4" | "float8"),
+            _ => false,
+        }
+    };
+    // An operand ends with one of these, so a '-' after one is a subtraction, not a sign.
+    let ends_operand = |k: Token| {
+        matches!(k, Token::Iconst | Token::Fconst | Token::Sconst | Token::Ident | Token::Ascii41 | Token::Param)
+    };
+    for (i, kind) in kinds.iter().enumerate() {
+        if *kind != Token::Fconst {
+            continue;
+        }
+        // A unary minus is part of the literal's value (-0x8000000000000000 is int8's least).
+        let signed = i >= 1 && kinds[i - 1] == Token::Ascii45 && (i < 2 || !ends_operand(kinds[i - 2]));
+        let value = if signed { format!("-{}", text(i)) } else { text(i).to_string() };
+        if !translator::decimal_past_float8(&value) {
+            continue;
+        }
+        let start = |j: usize| tokens.get(j).map(|t| t.start as usize);
+        if exempt.iter().any(|e| Some(*e) == start(i) || (signed && Some(*e) == start(i - 1))) {
+            continue;
+        }
+        let cast_after = kinds.get(i + 1) == Some(&Token::Typecast) && float_type(i + 2);
+        let cast_around = i >= 2
+            && kinds[i - 1] == Token::Ascii40
+            && kinds[i - 2] == Token::Cast
+            && kinds.get(i + 1) == Some(&Token::As)
+            && float_type(i + 2);
+        if !cast_after && !cast_around {
+            return Some(text(i).to_string());
+        }
+    }
+    None
+}
+
 /// Read parameter tokens with the same libpg_query lexer that produces the parse tree used at
 /// Execute. In particular, continued strings retain their escape mode and identifier bytes never
 /// become parameter tokens. Bind keeps this result from Parse; it does not tokenize SQL itself.

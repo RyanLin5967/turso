@@ -12485,6 +12485,26 @@ replays_postgresql!(
     "pg18-wirefuzz-quoted_escaped_and_commented_names_are_judged_as_plain_ones.out",
     []
 );
+// wire-rev-7128c6f73 MED-4's stated blind spot: an expression other than a literal, a column or a parameter cast to an
+// integer is the engine's truncating CAST.
+replays_postgresql!(
+    pg18_wirefuzz_an_expression_cast_to_an_integer_rounds_replays_as_postgresql_answered,
+    "pg18-wirefuzz-an_expression_cast_to_an_integer_rounds.out",
+    [
+        (3, "PGDIV-INT-CAST-TRUNCATES value [wire]: SILENT: (f * 1)::int and (f + 0)::int8 over 1.5 and 2.75 answer 1, 1 and 2, 2 (the engine's CAST truncates) where PG rounds to 2, 2 and 3, 3; the int8 column is also announced 23 (PGDIV-INT8-CAST-TYPE)"),
+    ]
+);
+// wire-rev-7128c6f73 MED-4 and MED-5: a column cast to an integer is the engine's truncating CAST (a literal is rounded
+// as PG rounds it), and date arithmetic with a cast operand is the engine's (registered from the read diff).
+replays_postgresql!(
+    pg18_wirefuzz_casts_to_integers_and_date_arithmetic_over_casts_replays_as_postgresql_answered,
+    "pg18-wirefuzz-casts_to_integers_and_date_arithmetic_over_casts.out",
+    [
+        (3, "PGDIV-INT8-CAST-TYPE type [wire]: a column cast to int8 is announced int4 (23) where PG announces 20; the values agree (the engine's INTEGER is typed 23)"),
+        (5, "PGDIV-DATE-ARITHMETIC value [engine]: SILENT: a date column minus a date cast answers 0 for 19 (the engine's plain '-' over two texts; fixed in the engine at 771f44872, not yet on this line)"),
+        (6, "PGDIV-DATE-ARITHMETIC value [engine]: SILENT: a date cast plus 1 answers 2027 for 2026-10-21 (fixed in the engine at 771f44872, not yet on this line)"),
+    ]
+);
 // wire-rev-cfdebc06d LOW-4, LOW-5: unknown + unknown is 42725, and integers cast to int2 or int8 type an operator over
 // them; text + integer in WHERE is 42883 as in PG (#9).
 replays_postgresql!(
@@ -12492,12 +12512,19 @@ replays_postgresql!(
     "pg18-wirefuzz-operators_over_unknown_and_cast_integers_resolve_as_postgresql_resolves_them.out",
     []
 );
-// wire-rev-cfdebc06d MED-4: a decimal literal of more than 15 significant digits is stored with every digit, in a
-// numeric column and as text, on INSERT and UPDATE; a float8 column keeps the nearest double.
+// wire-rev-cfdebc06d MED-4, then wire-rev-7128c6f73 HIGH-1 (ruled d2bf57effb): a decimal literal of more than 15
+// significant digits is refused 0A000 on INSERT and UPDATE, never rounded and never stored as text.
 replays_postgresql!(
     pg18_wirefuzz_a_long_decimal_literal_is_stored_with_every_digit_replays_as_postgresql_answered,
     "pg18-wirefuzz-a_long_decimal_literal_is_stored_with_every_digit.out",
-    []
+    [
+        (2, "PGDIV-NUMERIC-LITERAL-WIDE refused [wire]: a numeric literal of more than 15 significant digits is refused 0A000 where PG stores its exact value; the engine's REAL would round it (wire-rev-7128c6f73 HIGH-1, ruled d2bf57effb)"),
+        (3, "PGDIV-NUMERIC-LITERAL-WIDE refused [wire]: a numeric literal of more than 15 significant digits is refused 0A000 where PG stores its exact value; the engine's REAL would round it (wire-rev-7128c6f73 HIGH-1, ruled d2bf57effb)"),
+        (4, "PGDIV-NUMERIC-LITERAL-WIDE value [wire]: a cascade of the refused INSERTs and UPDATE, the table is empty here"),
+        (5, "PGDIV-NUMERIC-LITERAL-WIDE value [wire]: a cascade of the refused INSERTs and UPDATE, the table is empty here"),
+        (6, "PGDIV-NUMERIC-LITERAL-WIDE refused [wire]: a numeric literal of more than 15 significant digits is refused 0A000 where PG stores its exact value; the engine's REAL would round it (wire-rev-7128c6f73 HIGH-1, ruled d2bf57effb)"),
+        (7, "PGDIV-NUMERIC-LITERAL-WIDE value [wire]: a cascade of the refused INSERTs and UPDATE, the table is empty here"),
+    ]
 );
 // wire-rev-cfdebc06d HIGH-1: a CAST to NUMERIC(p, s) keeps every digit to precision 15 and is refused above it, never
 // rounded through the engine's REAL; the bigint the refused UPDATE would have changed reads as PostgreSQL's (#14).
@@ -13295,19 +13322,17 @@ replays_postgresql!(
         (9, "PGDIV-INT-RANGE value [engine]: SILENT: v * 2 answers '1.8446744073709552e+19' typed 23; PG 20 then 22003"),
         (10, "PGDIV-INT-RANGE value [engine]: SILENT: abs(-9223372036854775808::int8) answers 9223372036854775807 typed 25; PG 22003"),
         (11, "PGDIV-INT-RANGE value [engine]: SILENT: abs(v - max - max - 2) answers '9.223372036854776e+18' typed 25; PG 20 then 22003"),
-        (14, "PGDIV-INT-RANGE value [engine]: SILENT: v + 1 overflow inside a block answers a float row and leaves the block open (Z T); PG 22003 aborts it (Z E)"),
-        (15, "PGDIV-INT-RANGE cascade [engine]: INSERT (3) succeeds; PG 25P02 because #14 aborted its block (cascade of #14)"),
-        (16, "PGDIV-INT-RANGE cascade [engine]: COMMIT commits rows 2 and 3; PG answers ROLLBACK (cascade of #14)"),
-        (17, "PGDIV-INT-RANGE cascade [engine]: count 2 vs 0: rows 2,3 committed because #14 did not abort (cascade of #14)"),
-        (19, "PGDIV-INT-RANGE cascade [engine]: INSERT (2) 23505 because #16 committed row 2 (cascade of #14)"),
-        (20, "PGDIV-INT-RANGE cascade [engine]: 25P02 because #19 aborted our block (cascade of #14); without it this would be the #10 silent abs"),
-        (23, "PGDIV-INT-RANGE cascade [engine]: count 2 vs 0 (cascade of #14)"),
-        (25, "PGDIV-INT-RANGE cascade [engine]: INSERT (2) 23505 duplicate (cascade of #14)"),
-        (26, "PGDIV-INT-RANGE cascade [engine]: SAVEPOINT s refused 25P02 because #25 aborted our block (cascade of #14)"),
-        (27, "PGDIV-INT-RANGE cascade [engine]: 25P02 in our aborted block (cascade of #14)"),
-        (28, "PGDIV-INT-RANGE cascade [engine]: ROLLBACK TO s: 3B001 no such savepoint since #26 made none (cascade of #14)"),
-        (29, "PGDIV-INT-RANGE cascade [engine]: SELECT 1: 25P02 in our still-aborted block (cascade of #14)"),
-        (30, "PGDIV-INT-RANGE cascade [engine]: COMMIT answers ROLLBACK where PG commits (cascade of #14)"),
+        (14, "PGDIV-INT-RANGE error-step [engine]: v + 1 past int8 inside a block is 22003 bigint out of range and aborts it, as PG; PG sends the RowDescription first, ours refuses at the first row before it (the wire's range guard, wire-rev-7128c6f73 L3)"),
+        (20, "PGDIV-INT-RANGE value [engine]: SILENT: abs(-9223372036854775808::int8) answers 9223372036854775807 typed 25 (the engine clamps) and leaves the block open; PG 22003 bigint out of range aborts it"),
+        (21, "PGDIV-INT-RANGE cascade [engine]: INSERT (3) succeeds; PG 25P02 because #20 aborted its block (cascade of #20)"),
+        (22, "PGDIV-INT-RANGE cascade [engine]: COMMIT commits rows 2 and 3; PG answers ROLLBACK (cascade of #20)"),
+        (23, "PGDIV-INT-RANGE cascade [engine]: count 2 vs 0 (cascade of #20)"),
+        (25, "PGDIV-INT-RANGE cascade [engine]: INSERT (2) 23505 duplicate (cascade of #20)"),
+        (26, "PGDIV-INT-RANGE cascade [engine]: SAVEPOINT s refused 25P02 because #25 aborted our block (cascade of #20)"),
+        (27, "PGDIV-INT-RANGE cascade [engine]: 25P02 in our aborted block (cascade of #20)"),
+        (28, "PGDIV-INT-RANGE cascade [engine]: ROLLBACK TO s: 3B001 no such savepoint since #26 made none (cascade of #20)"),
+        (29, "PGDIV-INT-RANGE cascade [engine]: SELECT 1: 25P02 in our still-aborted block (cascade of #20)"),
+        (30, "PGDIV-INT-RANGE cascade [engine]: COMMIT answers ROLLBACK where PG commits (cascade of #20)"),
     ]
 );
 replays_postgresql!(
@@ -13333,7 +13358,6 @@ replays_postgresql!(
     "pg18-colnames.out",
     [
         (4, "PGDIV-NAN ours-only [ours-only]: 'nan'::numeric refused 0A000 (engine holds no NaN); PG answers the whole row"),
-        (5, "PGDIV-EXPR-TYPE-TEXT value [wire]: CASE WHEN true THEN a ELSE a END typed 25 text; PG 23 int4 (values agree)"),
         (6, "PGDIV-ROW-CONSTRUCTOR value [wire]: SELECT ARRAY[1], ROW(1, 2), EXISTS ..., ...: ours errors 42601 'row value misused' where PG answers one row"),
         (7, "PGDIV-NUMERIC-OID-FLOAT8 value [wire]: numeric literal 1.5 typed 701 float8; PG 1700 numeric (text agrees)"),
         (8, "PGDIV-EXPR-TYPE-TEXT value [wire]: 'x'::varchar(3) typed 25 text; PG 1043 varchar"),
@@ -13530,13 +13554,10 @@ replays_postgresql!(
         (8, "PGDIV-INT-RANGE value [engine]: SILENT: bigint column v + 1 answers '9.223372036854776e+18' typed 23; PG RowDescription 20 then 22003"),
         (9, "PGDIV-INT-RANGE value [engine]: SILENT: v * 2 answers '1.8446744073709552e+19' typed 23; PG 20 then 22003"),
         (10, "PGDIV-INT-RANGE value [engine]: SILENT: -v - 2 answers '-9.223372036854776e+18' typed 23; PG 20 then 22003"),
-        (11, "PGDIV-INT-RANGE value [engine]: SILENT: 2147483647::int4 + 1 answers 2147483648 typed 23; PG 22003 integer out of range"),
         (12, "PGDIV-INT-RANGE value [engine]: SILENT: int column i + 1 answers 2147483648; PG RowDescription 23 then 22003"),
         (13, "PGDIV-INT-RANGE value [engine]: SILENT: i * 2 answers 4294967294; PG 23 then 22003"),
         (14, "PGDIV-INT-RANGE value [engine]: SILENT: '2147483648'::int4 answers 2147483648; PG 22003 out of range for type integer"),
-        (15, "PGDIV-INT-RANGE value [engine]: SILENT: 32767::int2 + 1::int2 answers 32768 typed 23; PG 22003 smallint out of range"),
         (16, "PGDIV-INT-RANGE value [engine]: SILENT: CAST(9.5e18 AS BIGINT) clamps to 9223372036854775807; PG 22003 bigint out of range"),
-        (17, "PGDIV-INT-RANGE value [engine]: SILENT: CAST(3e9 AS INT) answers 3000000000; PG 22003 integer out of range"),
         (18, "PGDIV-INT-RANGE value [engine]: SILENT: INSERT of 2147483648 into an INT column succeeds; PG 22003 integer out of range"),
         (19, "PGDIV-INT-RANGE cascade [engine]: sum(i) 4294967296 vs 2147483648 because #18 stored the out-of-range row (cascade of #18)"),
         (20, "PGDIV-SUM-INT8-NUMERIC value [engine]: sum(bigint) past int8: ours 22003 'integer overflow'; PG sum(int8) is numeric and answers 9223372036854775808 typed 1700"),
@@ -15792,6 +15813,46 @@ fn a_cast_to_numeric_p_s_and_a_numeric_domain_column_are_numeric() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-351702a43 HIGH-1 (its PG 18.6 probe3 #89): a type modifier written as a string constant is the same modifier
+/// to PostgreSQL (typenameTypeMod), so NUMERIC('20','0') is NUMERIC(20,0). The translator read only integer modifiers and
+/// took any other spelling as bare NUMERIC, the engine's REAL: CAST('9007199254740993' AS NUMERIC('20','0')) answered
+/// 9.007199254740992e+15 past the p > 15 refusal. Every spelling is read in one place: a cast to NUMERIC('20','0') is
+/// refused as one to NUMERIC(20,0) is, a cast or a column with NUMERIC('8','2') rounds as NUMERIC(8,2) does, and a
+/// modifier that is no integer is refused, never dropped.
+#[test]
+fn a_numeric_type_modifier_is_read_in_every_spelling() {
+    let dir = Scratch::new("numeric-typmod-spellings");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    for sql in [
+        "SELECT CAST('9007199254740993' AS NUMERIC('20','0'))",
+        "SELECT CAST('1' AS \"numeric\"('38','10'))",
+        "SELECT '1'::numeric('16')",
+    ] {
+        let r = a.q(sql);
+        if r.error.as_ref().map(|e| e.code.as_str()) != Some("0A000") {
+            wrong.push(format!("{sql}: rows {:?} error {:?}, refused 0A000 as its integer spelling is", r.rows, r.error));
+        }
+    }
+    let r = a.q("SELECT CAST(1.005 AS NUMERIC('8','2'))");
+    if r.error.is_some() || r.rows != vec![vec![Some("1.01".to_string())]] {
+        wrong.push(format!("CAST(1.005 AS NUMERIC('8','2')): rows {:?} error {:?}, rounded to 1.01 as NUMERIC(8,2) is", r.rows, r.error));
+    }
+    for sql in ["CREATE TABLE nt(id int, n numeric('8','2'))", "INSERT INTO nt VALUES (1, 1.005)"] {
+        a.q(sql).ok(sql);
+    }
+    let r = a.q("SELECT n FROM nt");
+    if r.rows != vec![vec![Some("1.01".to_string())]] {
+        wrong.push(format!("numeric('8','2') column: {:?} {:?}, PostgreSQL 1.01", r.rows, r.error));
+    }
+    let r = a.q("SELECT CAST(1 AS NUMERIC('x'))");
+    if r.error.is_none() {
+        wrong.push(format!("NUMERIC('x'): rows {:?}, refused (no integer modifier)", r.rows));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-cfdebc06d HIGH-1: a CAST to NUMERIC(p, s) is computed as the engine's REAL (96e5b7571), and
 /// a float8 holds every decimal of at most 15 significant digits exactly (DBL_DIG) but not more: past
 /// 15 the cast answered 9007199254740992 for 9007199254740993, so =, IN, GROUP BY and DISTINCT merged
@@ -16164,32 +16225,562 @@ fn a_bound_exponent_or_infinity_overflows_numeric_at_bind() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// wire-rev-cfdebc06d MED-4 (pre-existing): a decimal literal is the engine's REAL, so one of more than 15 significant
-/// digits was rounded before the column's ENCODE saw it: `INSERT INTO nm VALUES (1, 12345678901234567.89, ...)` stored
-/// 12345678901234568.00 in a numeric(20,2) column, and two distinct literals became one row value (a silent change on
-/// write). PG 18.6 stores every digit, in a numeric column and as text in a text column, and a float8 column keeps the
-/// nearest double as before. Recorded on iccad2,
-/// cli/tests/pg18/pg18-wirefuzz-a_long_decimal_literal_is_stored_with_every_digit.out (replayed).
+/// wire-rev-351702a43 MED-4 (its PG 18.6 probe3 #162-#165): the fold probe runs the constant parts PostgreSQL's
+/// eval_const_expressions simplifies, and only those: coalesce stops at its first non-null constant, AND at a constant
+/// false, OR at a constant true, so a later bad constant is never run (PG answers; ours refused 22023); and a CASE's
+/// results are simplified unless their WHEN is constant false, so a bad constant there is 22023 as in PG (ours NULL).
 #[test]
-fn a_long_decimal_literal_is_stored_with_every_digit() {
-    let dir = Scratch::new("long-decimal-literal");
+fn the_fold_probe_simplifies_as_postgresql_simplifies() {
+    let dir = Scratch::new("fold-shortcut");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    for (sql, want) in [
+        ("SELECT now() IS NULL AND false AND encode('abc', 'nosuch') = ''", "f"),
+        ("SELECT now() IS NOT NULL OR true OR encode('abc', 'nosuch') = ''", "t"),
+        ("SELECT coalesce(NULL, 'a', encode('abc', 'nosuch'))", "a"),
+    ] {
+        let r = a.q(sql);
+        if r.error.is_some() || r.rows != vec![vec![Some(want.to_string())]] {
+            wrong.push(format!("{sql}: rows {:?} error {:?}, PostgreSQL {want}", r.rows, r.error));
+        }
+    }
+    let r = a.q("SELECT coalesce(now()::text, 'a', encode('abc', 'nosuch'))");
+    if r.error.is_some() {
+        wrong.push(format!("coalesce(now()::text, 'a', bad): {:?}, PostgreSQL answers the timestamp", r.error));
+    }
+    let r = a.q("SELECT CASE WHEN now() IS NULL THEN encode('abc', 'nosuch') END");
+    if r.error.as_ref().map(|e| e.code.as_str()) != Some("22023") {
+        wrong.push(format!("CASE ... THEN bad: rows {:?} error {:?}, PostgreSQL 22023", r.rows, r.error));
+    }
+    let r = a.q("SELECT CASE WHEN false THEN encode('abc', 'nosuch') ELSE 'b' END");
+    if r.error.is_some() || r.rows != vec![vec![Some("b".to_string())]] {
+        wrong.push(format!("CASE WHEN false THEN bad: rows {:?} error {:?}, PostgreSQL b", r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-351702a43 MED-1 and LOW-4 (its PG 18.6 probe3 #183-#190): a three-part name naming another database is
+/// 0A000 'cross-database references are not implemented' in DROP, COMMENT ON and ALTER ... RENAME too. The RENAME
+/// renamed THIS database's table silently, COMMENT ON was accepted, and DROP answered XX000 'no such database'.
+#[test]
+fn a_three_part_name_in_rename_drop_and_comment_must_name_this_database() {
+    let dir = Scratch::new("xdb-ddl");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in ["CREATE TABLE n(id int)", "INSERT INTO n VALUES (1)", "CREATE VIEW vm AS SELECT id FROM n", "CREATE INDEX ix ON n(id)"] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    for (sql, name) in [
+        ("ALTER TABLE otherdb.public.n RENAME TO n2", "otherdb.public.n"),
+        ("COMMENT ON TABLE otherdb.public.n IS 'x'", "otherdb.public.n"),
+        ("DROP TABLE otherdb.public.n", "otherdb.public.n"),
+        ("DROP VIEW otherdb.public.vm", "otherdb.public.vm"),
+        ("DROP INDEX otherdb.public.ix", "otherdb.public.ix"),
+    ] {
+        let r = a.q(sql);
+        let message = format!("cross-database references are not implemented: \"{name}\"");
+        if !r.error.as_ref().is_some_and(|e| e.code == "0A000" && e.message.ends_with(&message)) {
+            wrong.push(format!("{sql}: tags {:?} error {:?}, PostgreSQL 0A000 {message}", r.tags, r.error));
+        }
+    }
+    let r = a.q("SELECT count(*) FROM n");
+    if r.rows != vec![vec![Some("1".to_string())]] {
+        wrong.push(format!("n after the refusals: {:?} {:?}, PostgreSQL 1", r.rows, r.error));
+    }
+    let r = a.q("SELECT count(*) FROM vm");
+    if r.error.is_some() {
+        wrong.push(format!("vm after the refusals: {:?}", r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-351702a43 MED-5 (its PG 18.6 probe3 #148, #157): an explicit cast to varchar(n) cuts its value to n characters
+/// (PG's explicit-cast length coercion), so $1::varchar(10) bound 'abcdefghijkl' is stored 'abcdefghij' in a varchar(20)
+/// column; the translator dropped the length and stored the whole text.
+#[test]
+fn an_explicit_cast_to_varchar_n_cuts_its_value() {
+    let dir = Scratch::new("varchar-cast-cut");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE v12(id int, v varchar(20))").ok("create");
+    let mut wrong = Vec::new();
+    let (types, error) = a.bind_round("INSERT INTO v12 VALUES (1, $1::varchar(10))", &[], &[Some(b"abcdefghijkl")], &[]);
+    if error.is_some() {
+        wrong.push(format!("bound insert: messages {:?} error {error:?}", String::from_utf8_lossy(&types)));
+    }
+    let r = a.q("SELECT v FROM v12 WHERE id = 1");
+    if r.rows != vec![vec![Some("abcdefghij".to_string())]] {
+        wrong.push(format!("stored {:?} {:?}, PostgreSQL 'abcdefghij'", r.rows, r.error));
+    }
+    for (sql, want) in [
+        ("SELECT 'abcdefghijkl'::varchar(10)", "abcdefghij"),
+        ("SELECT CAST('abc' AS varchar(5))", "abc"),
+        ("SELECT CAST('ééééé' AS character varying(2))", "éé"),
+    ] {
+        let r = a.q(sql);
+        if r.error.is_some() || r.rows != vec![vec![Some(want.to_string())]] {
+            wrong.push(format!("{sql}: rows {:?} error {:?}, PostgreSQL {want}", r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-351702a43 MED-3 (its PG 18.6 probe3 #110-#112, #119, #121, #122): a NUL byte is no character of UTF8, and PG
+/// refuses a parameter holding one at Bind, 22021 'invalid byte sequence for encoding "UTF8": 0x00', in text and in
+/// binary format; std::str::from_utf8 accepts NUL, so the value was stored with it.
+#[test]
+fn a_parameter_holding_a_nul_byte_is_22021_at_bind() {
+    let dir = Scratch::new("bind-nul");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE vb(id int, v varchar(3), t text)").ok("create");
+    let mut wrong = Vec::new();
+    for (sql, value, binary) in [
+        ("INSERT INTO vb (id, v) VALUES (1, $1)", &b"ab\0"[..], false),
+        ("INSERT INTO vb (id, v) VALUES (2, $1)", &b"ab\0"[..], true),
+        ("INSERT INTO vb (id, t) VALUES (3, $1)", &b"a\0b"[..], false),
+        ("INSERT INTO vb (id, t) VALUES (4, $1)", &b"a\0b"[..], true),
+    ] {
+        let codes: &[i16] = if binary { &[1] } else { &[] };
+        let (types, error) = a.bind_round(sql, codes, &[Some(value)], &[]);
+        let message = "invalid byte sequence for encoding \"UTF8\": 0x00";
+        if types.contains(&b'2') || !error.as_ref().is_some_and(|e| e.code == "22021" && e.message == message) {
+            wrong.push(format!("{sql} (binary {binary}): messages {:?} error {error:?}, PostgreSQL: no BindComplete, 22021 {message}", String::from_utf8_lossy(&types)));
+        }
+    }
+    let r = a.q("SELECT count(*) FROM vb");
+    if r.rows != vec![vec![Some("0".to_string())]] {
+        wrong.push(format!("vb holds {:?} rows, want 0", r.rows));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-351702a43 MED-2 (its PG 18.6 probe3 #77-#81): a CAST to NUMERIC(p, s) with p <= 15 holds its value
+/// exactly as the engine's REAL, but arithmetic and sum over it are REAL arithmetic: 0.10 + 0.20 answered
+/// 0.30000000000000004 and = 0.3 answered f, where PG answers 0.30 and t. Such arithmetic and sum/avg over the cast are
+/// refused 0A000, never answered inexactly; the cast's own value and comparisons with it are answered.
+#[test]
+fn arithmetic_over_a_numeric_cast_is_refused_not_inexact() {
+    let dir = Scratch::new("numeric-cast-arith");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    for sql in [
+        "SELECT CAST(0.1 AS NUMERIC(15,2)) + CAST(0.2 AS NUMERIC(15,2))",
+        "SELECT CAST(0.1 AS NUMERIC(15,2)) + CAST(0.2 AS NUMERIC(15,2)) = 0.3",
+        "SELECT CAST(0.1 AS NUMERIC(15,2)) * 3",
+        "SELECT CAST(1.1 AS NUMERIC(15,1)) * CAST(1.1 AS NUMERIC(15,1))",
+        "SELECT CAST('999999999999999' AS NUMERIC(15,0)) + 1",
+        "SELECT 1 - 0.5::numeric(4,1)",
+        "SELECT sum(CAST(0.1 AS NUMERIC(15,2))) FROM generate_series(1, 10)",
+    ] {
+        let r = a.q(sql);
+        if r.error.as_ref().map(|e| e.code.as_str()) != Some("0A000") {
+            wrong.push(format!("{sql}: rows {:?} error {:?}, refused 0A000 (REAL arithmetic is inexact)", r.rows, r.error));
+        }
+    }
+    for (sql, want) in [
+        ("SELECT CAST(0.3 AS NUMERIC(15,2)) = 0.3", "t"),
+        ("SELECT count(DISTINCT CAST(g * 0.1 AS NUMERIC(15,1))) FROM generate_series(1, 30) g", "30"),
+    ] {
+        let r = a.q(sql);
+        if r.error.is_some() || r.rows != vec![vec![Some(want.to_string())]] {
+            wrong.push(format!("{sql}: rows {:?} error {:?}, PostgreSQL {want}", r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-7128c6f73 MED-4, column half (recorded on iccad2, pg18-wirefuzz-casts_to_integers_and_date_arithmetic_over_
+/// casts.out #3): a numeric column cast to an integer rounds half away from zero (1.50 is 2, -2.50 is -3) and a float8
+/// column rounds half to even (2.5 is 2, 3.5 is 4), as numeric_int4 and dtoi4 (rint) round; the engine's CAST
+/// truncated (1, -2, 2, 3).
+#[test]
+fn a_column_cast_to_an_integer_rounds_as_postgresql_rounds() {
+    let dir = Scratch::new("column-int-cast");
     let server = Server::start(&dir.db(), &[]);
     let mut a = server.connect();
     for sql in [
-        "CREATE TABLE nm(id int, n numeric(20,2), w numeric(38,10), f float8, t text)",
-        "INSERT INTO nm VALUES (1, 12345678901234567.89, 1234567890123456789012345678.0123456789, 0.30000000000000004, 12345678901234567.89)",
-        "INSERT INTO nm VALUES (2, 12345678901234567.88, -1234567890123456789012345678.0123456789, 1.7976931348623157, -0.12345678901234567)",
-        "UPDATE nm SET n = 12345678901234567.87, t = 0.12345678901234567 WHERE id = 2",
+        "CREATE TABLE ci(id int, n numeric(6,2), f float8)",
+        "INSERT INTO ci VALUES (1, 1.50, 2.5), (2, -2.50, 3.5), (3, 7, -0.5)",
     ] {
         a.q(sql).ok(sql);
     }
-    let r = a.q("SELECT id, n, w, f, t FROM nm ORDER BY id");
-    let row = |v: [&str; 5]| v.iter().map(|x| Some(x.to_string())).collect::<Vec<_>>();
-    let want = vec![
-        row(["1", "12345678901234567.89", "1234567890123456789012345678.0123456789", "0.30000000000000004", "12345678901234567.89"]),
-        row(["2", "12345678901234567.87", "-1234567890123456789012345678.0123456789", "1.7976931348623157", "0.12345678901234567"]),
-    ];
-    assert_eq!((r.rows, r.error), (want, None), "PostgreSQL stores every digit of a decimal literal");
+    let r = a.q("SELECT n::int, f::int4, n::int2, f::int8 FROM ci ORDER BY id");
+    let row = |v: [&str; 4]| v.iter().map(|x| Some(x.to_string())).collect::<Vec<_>>();
+    let want = vec![row(["2", "2", "2", "2"]), row(["-3", "4", "-3", "4"]), row(["7", "0", "7", "0"])];
+    assert_eq!((r.rows, r.error), (want, None), "PostgreSQL rounds a numeric half away from zero and a float half to even");
+}
+
+/// wire-rev-7128c6f73 MED-4 (its PG 18.6 probe4 #144): a decimal literal cast to an integer type is rounded by PG's
+/// numeric-to-int conversion, half away from zero (1.5::int2 is 2, so 1.5::int2 + 1::int2 is 3), where the engine's CAST
+/// truncates (2), now announced with PG's type 21, so the wrong value looked right.
+#[test]
+fn a_decimal_literal_cast_to_an_integer_rounds_as_postgresql_rounds() {
+    let dir = Scratch::new("decimal-int-cast");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    for (sql, want) in [
+        ("SELECT 1.5::int2 + 1::int2", "3"),
+        ("SELECT CAST(2.5 AS integer)", "3"),
+        ("SELECT (-2.5)::int8", "-3"),
+        ("SELECT 2.4::int4", "2"),
+    ] {
+        let r = a.q(sql);
+        if r.error.is_some() || r.rows != vec![vec![Some(want.to_string())]] {
+            wrong.push(format!("{sql}: rows {:?} error {:?}, PostgreSQL {want}", r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-7128c6f73 MED-3 (its PG 18.6 probe4 #83, #103): a bound 'NaN' for a numeric column was read as a float
+/// NaN, which the engine stores as NULL: INSERT 0 1, and the row read null where PG stores NaN. The engine holds no NaN
+/// (PGDIV-NAN), so a bound NaN, for a numeric or a float parameter, is refused 0A000 at Bind as the literal is, and
+/// nothing is stored.
+#[test]
+fn a_bound_nan_is_refused_never_stored_as_null() {
+    let dir = Scratch::new("bound-nan");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE nb(id int PRIMARY KEY, n numeric(6,2), f float8)").ok("create");
+    let mut wrong = Vec::new();
+    for (sql, value) in [
+        ("INSERT INTO nb (id, n) VALUES (1, $1)", "NaN"),
+        ("INSERT INTO nb (id, n) VALUES (2, $1)", "nan"),
+        ("INSERT INTO nb (id, f) VALUES (3, $1)", "NaN"),
+    ] {
+        let (types, error) = a.bind_round(sql, &[], &[Some(value.as_bytes())], &[]);
+        if error.as_ref().map(|e| e.code.as_str()) != Some("0A000") {
+            wrong.push(format!("{sql} with '{value}': messages {:?} error {error:?}, refused 0A000 (PGDIV-NAN)", String::from_utf8_lossy(&types)));
+        }
+    }
+    let r = a.q("SELECT count(*) FROM nb");
+    if r.rows != vec![vec![Some("0".to_string())]] {
+        wrong.push(format!("nb holds {:?} rows after the refusals, want 0", r.rows));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-7128c6f73 HIGH-1, the lead's ruling (DECISIONS d2bf57effb; the review's PG 18.6 probe4 #3-#28, #47, probe5): a
+/// decimal of more than 15 significant digits reaches the engine as a REAL, which rounds it, so it is REFUSED 0A000 on
+/// every write path and in every comparison, never rounded and never stored as text. ef2141683 stored an INSERT VALUES
+/// literal as its text, so one literal was two values: comparisons missed the exact row, UPDATE hit the other one and
+/// UNIQUE admitted a duplicate. A decimal of at most 15 significant digits, an integer literal that fits int8, and a
+/// literal under an explicit float cast are answered as before (a float8 reads them as PG does).
+#[test]
+fn a_decimal_past_15_digits_is_refused_on_every_path() {
+    let dir = Scratch::new("long-decimal-refused");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE TABLE nm(id int PRIMARY KEY, n numeric(30,2), t text, b bigint, f float8)",
+        "INSERT INTO nm VALUES (1, 1.5, 'x', 1, 0.5)",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    for sql in [
+        "INSERT INTO nm VALUES (2, 12345678901234567.89, 'x', 1, 0.5)",
+        "INSERT INTO nm (id, n) SELECT 3, 12345678901234567.89",
+        "UPDATE nm SET n = 12345678901234567.88 WHERE id = 1",
+        "UPDATE nm SET (n, t) = (12345678901234567.88, 'y') WHERE id = 1",
+        "INSERT INTO nm (id, n) VALUES (1, 2) ON CONFLICT (id) DO UPDATE SET n = 12345678901234567.87",
+        "INSERT INTO nm (id, t) VALUES (4, 12345678901234567.89)",
+        "INSERT INTO nm (id, b) VALUES (5, 12345678901234567.00)",
+        "INSERT INTO nm (id, n) VALUES (6, 1234567890123456789012345678)",
+        "INSERT INTO nm (id, n) VALUES (7, 1.234567890123456789e10)",
+        "INSERT INTO nm (id, n) VALUES (8, 12_345_678_901_234_567.89)",
+        "SELECT id FROM nm WHERE n = 12345678901234567.89",
+        "SELECT n - 12345678901234567.00 FROM nm",
+        "SELECT 12345678901234567.89",
+        "CREATE TABLE nd(n numeric(30,2) DEFAULT 12345678901234567.89)",
+    ] {
+        let r = a.q(sql);
+        if r.error.as_ref().map(|e| e.code.as_str()) != Some("0A000") {
+            wrong.push(format!("{sql}: tags {:?} rows {:?} error {:?}, refused 0A000", r.tags, r.rows, r.error));
+        }
+    }
+    // Bound: as text, undeclared and declared numeric.
+    for declared in [false, true] {
+        let mut parse = vec![0u8];
+        parse.extend_from_slice(b"INSERT INTO nm (id, n) VALUES (9, $1)\0");
+        if declared {
+            parse.extend_from_slice(&1i16.to_be_bytes());
+            parse.extend_from_slice(&1700i32.to_be_bytes());
+        } else {
+            parse.extend_from_slice(&0i16.to_be_bytes());
+        }
+        a.send(b'P', &parse);
+        let value = b"12345678901234567.89";
+        let mut bind = vec![0u8, 0u8];
+        bind.extend_from_slice(&0i16.to_be_bytes());
+        bind.extend_from_slice(&1i16.to_be_bytes());
+        bind.extend_from_slice(&(value.len() as i32).to_be_bytes());
+        bind.extend_from_slice(value);
+        bind.extend_from_slice(&0i16.to_be_bytes());
+        a.send(b'B', &bind);
+        a.send(b'E', &[0, 0, 0, 0, 0]);
+        a.send(b'S', &[]);
+        let r = a.read_reply();
+        if r.error.as_ref().map(|e| e.code.as_str()) != Some("0A000") {
+            wrong.push(format!("bound '12345678901234567.89' (declared {declared}): tags {:?} error {:?}, refused 0A000", r.tags, r.error));
+        }
+    }
+    let r = a.q("SELECT count(*) FROM nm");
+    if r.rows != vec![vec![Some("1".to_string())]] {
+        wrong.push(format!("nm holds {:?} rows after the refusals, want 1", r.rows));
+    }
+    for (sql, want) in [
+        ("SELECT 1234567890123.45", "1234567890123.45"),
+        ("SELECT 9007199254740993", "9007199254740993"),
+        ("SELECT 0.30000000000000004::float8", "0.30000000000000004"),
+        ("SELECT 1e20 > 1", "t"),
+    ] {
+        let r = a.q(sql);
+        if r.error.is_some() || r.rows != vec![vec![Some(want.to_string())]] {
+            wrong.push(format!("{sql}: rows {:?} error {:?}, want {want}", r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-351702a43 LOW-2, CASE half (its PG 18.6 probe3 #151, #152): a CASE over parameters and constants is folded
+/// by PG's custom plan at Bind, so the value it assigns to a varchar(3) is checked there: 'a' picks 'long value', 22001
+/// before BindComplete; 'b' picks 'ok' and is stored. Ours left every CASE to Execute (BindComplete, then XX000).
+#[test]
+fn a_case_over_parameters_is_checked_at_bind() {
+    let dir = Scratch::new("bind-case");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE vb(id int, v varchar(3))").ok("create");
+    let sql = |id: i32| format!("INSERT INTO vb VALUES ({id}, CASE WHEN $1 = 'a' THEN 'long value' ELSE 'ok' END)");
+    let mut wrong = Vec::new();
+    let (types, error) = a.bind_round(&sql(32), &[], &[Some(b"b")], &[]);
+    if error.is_some() {
+        wrong.push(format!("'b': messages {:?} error {error:?}, PostgreSQL INSERT 0 1", String::from_utf8_lossy(&types)));
+    }
+    let (types, error) = a.bind_round(&sql(33), &[], &[Some(b"a")], &[]);
+    if types.contains(&b'2') || !error.as_ref().is_some_and(|e| e.code == "22001") {
+        wrong.push(format!("'a': messages {:?} error {error:?}, PostgreSQL: no BindComplete, 22001", String::from_utf8_lossy(&types)));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-7128c6f73 L4 (its PG 18.6 probe7 #3-#5, #10-#13): the engine has no interval type (PGDIV-INTERVAL-TEXT), so
+/// arithmetic with an interval operand or an interval result is refused 0A000 'interval arithmetic is not supported',
+/// never answered: now() + interval '1 day' > now() answered f (PG t), timestamptz - timestamptz answered '0', and
+/// interval '1 day' * 2 was refused with a type name PG never prints ('text * integer').
+#[test]
+fn interval_arithmetic_is_refused_not_answered() {
+    let dir = Scratch::new("interval-arith");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in ["CREATE TABLE tz(id int, ts timestamptz)", "INSERT INTO tz VALUES (1, '2026-10-20 10:00:00+00:00')"] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    for sql in [
+        "SELECT ts + interval '1 day' FROM tz",
+        "SELECT ts + '1 day'::interval FROM tz",
+        "SELECT ts - interval '1 hour' FROM tz",
+        "SELECT now() + interval '1 day' > now()",
+        "SELECT interval '1 day' * 2",
+        "SELECT '1 day'::interval + '1 hour'::interval",
+        "SELECT ts - '2026-01-01 00:00:00+00:00'::timestamptz FROM tz",
+    ] {
+        let r = a.q(sql);
+        if !r.error.as_ref().is_some_and(|e| e.code == "0A000" && e.message.ends_with("interval arithmetic is not supported")) {
+            wrong.push(format!("{sql}: rows {:?} error {:?}, refused 0A000 interval arithmetic is not supported", r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-351702a43 LOW-6 (its PG 18.6 probe3 #161): a CASE is typed by its results (an int4 constant and an int4
+/// function: 23); the walk never typed a CASE column, and the engine announced it text (25).
+#[test]
+fn a_case_column_is_typed_by_its_results() {
+    let dir = Scratch::new("case-type");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let r = a.q("SELECT CASE WHEN now() IS NULL THEN 1 WHEN false THEN length('x') END");
+    assert_eq!((r.oids, r.error), (Some(vec![23]), None), "PostgreSQL types the CASE int4");
+}
+
+/// wire-rev-7128c6f73 L3 (its PG 18.6 probe4 #140-#142): an int2 or int8 result past its type is 22003 in PG ('smallint
+/// out of range', 'bigint out of range'); ours announced 21 or 20 and wrote '32768' or '9.223372036854776e+18' in text
+/// format (binary already refused it).
+#[test]
+fn an_integer_result_past_its_announced_type_is_22003() {
+    let dir = Scratch::new("int-result-range");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    for (sql, message) in [
+        ("SELECT 32767::int2 + 1::int2", "smallint out of range"),
+        ("SELECT 9223372036854775807::int8 + 1::int2", "bigint out of range"),
+        ("SELECT (-32768)::int2 / (-1)::int2", "smallint out of range"),
+    ] {
+        let r = a.q(sql);
+        if !r.error.as_ref().is_some_and(|e| e.code == "22003" && e.message == message) {
+            wrong.push(format!("{sql}: rows {:?} error {:?}, PostgreSQL 22003 {message}", r.rows, r.error));
+        }
+    }
+    let r = a.q("SELECT 7::int2 / 2::int2");
+    if r.error.is_some() || r.rows != vec![vec![Some("3".to_string())]] {
+        wrong.push(format!("7::int2 / 2::int2: rows {:?} error {:?}, PostgreSQL 3", r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-351702a43 LOW-3 (its PG 18.6 probe3 #168-#173): an oid is unsigned, so oidin reads a negative integer as its
+/// 32-bit two's complement ((-2147483648)::oid is 2147483648, '-1'::oid is 4294967295), a text past the range is 22003
+/// 'value "..." is out of range for type oid', and a decimal has no cast to oid (42846). Ours answered -2147483648 and -1,
+/// took '-2147483649', and called 1.5 an overflow.
+#[test]
+fn an_oid_literal_is_read_as_oidin_reads_it() {
+    let dir = Scratch::new("oid-literals");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    let r = a.q("SELECT (-2147483648)::oid, '-1'::oid, '4294967295'::oid");
+    let want = vec![["2147483648", "4294967295", "4294967295"].iter().map(|x| Some(x.to_string())).collect::<Vec<_>>()];
+    if r.error.is_some() || r.rows != want {
+        wrong.push(format!("negative oids: rows {:?} error {:?}, PostgreSQL {want:?}", r.rows, r.error));
+    }
+    for (sql, code, message) in [
+        ("SELECT '-2147483649'::oid", "22003", "value \"-2147483649\" is out of range for type oid"),
+        ("SELECT 1.5::oid", "42846", "cannot cast type numeric to oid"),
+        ("SELECT 1e3::oid", "42846", "cannot cast type numeric to oid"),
+    ] {
+        let r = a.q(sql);
+        if !r.error.as_ref().is_some_and(|e| e.code == code && e.message.ends_with(message)) {
+            wrong.push(format!("{sql}: rows {:?} error {:?}, PostgreSQL {code} {message}", r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-7128c6f73 L1 and L9 (its PG 18.6 probe4 #93-#100): numeric_in refuses an exponent at or past INT_MAX/2,
+/// 22003 'value overflows numeric format', and reads underscores between digits and a 0x/0o/0b integer (PG 16+); a bound
+/// '1e-2147483648' was stored 0.00, and '1_000' and '0x10' were 22P02.
+#[test]
+fn a_bound_numeric_is_read_as_numeric_in_reads_it() {
+    let dir = Scratch::new("bind-numeric-input");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE nb(id int, n numeric(6,2))").ok("create");
+    let mut wrong = Vec::new();
+    for value in ["1e-2147483648", "1e2147483647"] {
+        let (types, error) = a.bind_round("INSERT INTO nb (id, n) VALUES (1, $1)", &[], &[Some(value.as_bytes())], &[]);
+        if !error.as_ref().is_some_and(|e| e.code == "22003" && e.message == "value overflows numeric format") {
+            wrong.push(format!("'{value}': messages {:?} error {error:?}, PostgreSQL 22003 value overflows numeric format", String::from_utf8_lossy(&types)));
+        }
+    }
+    for (id, value) in [(2, "1_000"), (3, "0x10")] {
+        let sql = format!("INSERT INTO nb (id, n) VALUES ({id}, $1)");
+        let (types, error) = a.bind_round(&sql, &[], &[Some(value.as_bytes())], &[]);
+        if error.is_some() {
+            wrong.push(format!("'{value}': messages {:?} error {error:?}, PostgreSQL INSERT 0 1", String::from_utf8_lossy(&types)));
+        }
+    }
+    let r = a.q("SELECT id, n FROM nb ORDER BY id");
+    let want = vec![vec![Some("2".to_string()), Some("1000.00".to_string())], vec![Some("3".to_string()), Some("16.00".to_string())]];
+    if r.rows != want {
+        wrong.push(format!("nb holds {:?}, PostgreSQL {want:?}", r.rows));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-7128c6f73 L2 and L10 (its PG 18.6 probe4 #130-#134; probe7 #28): an operator between two unknowns (string
+/// literals or NULL) is 42725 wherever it stands, in WHERE, inside a function and in VALUES as in the target list; and a
+/// NULL beside an int2 takes int2, so 1::int2 + NULL is typed 21 (ours 701).
+#[test]
+fn an_operator_between_unknowns_is_42725_wherever_it_stands() {
+    let dir = Scratch::new("unknown-operators");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    for (sql, op) in [
+        ("SELECT '1' + NULL", "+"),
+        ("SELECT NULL + NULL", "+"),
+        ("SELECT 1 WHERE '1' + '2' = 3", "+"),
+        ("SELECT abs('1' - '2')", "-"),
+        ("VALUES ('1' + '2')", "+"),
+    ] {
+        let r = a.q(sql);
+        let message = format!("operator is not unique: unknown {op} unknown");
+        if !r.error.as_ref().is_some_and(|e| e.code == "42725" && e.message.ends_with(&message)) {
+            wrong.push(format!("{sql}: rows {:?} error {:?}, PostgreSQL 42725 {message}", r.rows, r.error));
+        }
+    }
+    let r = a.q("SELECT 1::int2 + NULL");
+    if r.error.is_some() || r.oids != Some(vec![21]) {
+        wrong.push(format!("1::int2 + NULL: oids {:?} error {:?}, PostgreSQL [21]", r.oids, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-351702a43 LOW-8 and wire-rev-7128c6f73 L5 (probe3 #44, #48; probe4 #167, #168): a quoted "MAX" is not max
+/// (PG's names are case-sensitive once quoted) and public.max is no function, so PG refuses both 42883 and names them as
+/// written; the walk folded "MAX" to max, and public.max answered a row (null, typed 25).
+#[test]
+fn a_quoted_or_qualified_max_that_names_no_function_is_42883() {
+    let dir = Scratch::new("quoted-max");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in ["CREATE TABLE rb(id int, b boolean)", "INSERT INTO rb VALUES (1, true)"] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    for (sql, message) in [
+        ("SELECT \"MAX\"(id) FROM rb", "function MAX(integer) does not exist"),
+        ("SELECT public.max(b) FROM rb", "function public.max(boolean) does not exist"),
+        ("SELECT public.max(id) FROM rb", "function public.max(integer) does not exist"),
+    ] {
+        let r = a.q(sql);
+        if !r.error.as_ref().is_some_and(|e| e.code == "42883" && e.message == message) {
+            wrong.push(format!("{sql}: rows {:?} error {:?}, PostgreSQL 42883 {message}", r.rows, r.error));
+        }
+    }
+    let r = a.q("SELECT max(id), pg_catalog.max(id) FROM rb");
+    if r.error.is_some() || r.rows != vec![vec![Some("1".to_string()), Some("1".to_string())]] {
+        wrong.push(format!("max and pg_catalog.max: rows {:?} error {:?}, PostgreSQL 1, 1", r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-7128c6f73 L6 (its PG 18.6 probe4 #50, #62-#64): a type change whose stored form is the same is not one the
+/// engine would keep unconverted: numeric(10,2) to numeric(12,2) (the scale kept, the precision widened), float8 to double
+/// precision and boolean to boolean. They were refused 0A000 with "the engine would keep the column's values
+/// unconverted", which is false for them; they pass the wire and meet the engine's same-name refusal
+/// (PGDIV-ALTER-COLUMN-SAME-NAME). A scale change still changes the values and is still refused 0A000.
+#[test]
+fn an_alter_column_type_that_keeps_the_stored_form_is_not_refused_as_unconverted() {
+    let dir = Scratch::new("alter-same-form");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE sf(id int, n numeric(10,2), f float8, b boolean)").ok("create");
+    let mut wrong = Vec::new();
+    for sql in [
+        "ALTER TABLE sf ALTER COLUMN n TYPE numeric(12,2)",
+        "ALTER TABLE sf ALTER COLUMN f TYPE double precision",
+        "ALTER TABLE sf ALTER COLUMN b TYPE boolean",
+    ] {
+        let r = a.q(sql);
+        if r.error.as_ref().is_some_and(|e| e.code == "0A000") {
+            wrong.push(format!("{sql}: {:?}, not refused as unconverted (the stored form is the same)", r.error));
+        }
+    }
+    let r = a.q("ALTER TABLE sf ALTER COLUMN n TYPE numeric(10,3)");
+    if r.error.as_ref().map(|e| e.code.as_str()) != Some("0A000") {
+        wrong.push(format!("numeric(10,2) to numeric(10,3): {:?}, refused 0A000 (the scale changes the values)", r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
 /// wire-rev-cfdebc06d MED-3 (its PG 18.6 probe #109-#136): the engine's ALTER COLUMN keeps every stored value as it

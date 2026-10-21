@@ -378,6 +378,16 @@ fn expression_type(node: &PgNode) -> Option<u32> {
             return integer_literal_type(&f.fval);
         }
         Node::AConst(c) => matches!(c.val, Some(Val::Boolval(_))),
+        // A cast to oid is an oid (26): announced int4, its unsigned values past int4
+        // ((-1)::oid is 4294967295) were refused as integer out of range (wire-rev-351702a43 LOW-3).
+        Node::TypeCast(c)
+            if c.type_name.as_ref().is_some_and(|t| {
+                t.array_bounds.is_empty()
+                    && t.names.last().is_some_and(|n| matches!(&n.node, Some(Node::String(s)) if s.sval == "oid"))
+            }) =>
+        {
+            return Some(26);
+        }
         // The sequence functions and pg_database_size are bigint in PostgreSQL, whatever their
         // arguments; the engine gave them no type, so they were announced text (found by the E5'
         // differential, wire-e5-f312d1e13).
@@ -587,6 +597,14 @@ pub fn computed_targets(parse: &ParseResult) -> Vec<bool> {
                     && !call.agg_star
                     && func_name(call).is_some_and(|n| scalar_result(&n).is_some())
                     && call.args.iter().all(|a| plain(a, false))
+            }
+            // A CASE is typed by its results, each one the walk types (wire-rev-351702a43 LOW-6: the
+            // engine announced CASE WHEN .. THEN 1 .. END as text).
+            Some(Node::CaseExpr(c)) => {
+                c.args.iter().all(|w| match w.node.as_ref() {
+                    Some(Node::CaseWhen(w)) => w.result.as_deref().is_some_and(|r| plain(r, false)),
+                    _ => false,
+                }) && c.defresult.as_deref().is_none_or(|d| plain(d, false))
             }
             // An operand cast to a type the walk names (2::int2 in 2::int2 + 2::int2 is int2, where
             // the engine's INTEGER announced int4; wire-rev-cfdebc06d LOW-5).
@@ -964,8 +982,10 @@ fn func_name(call: &turso_pg_parser::pg_query::protobuf::FuncCall) -> Option<Str
             _ => None,
         })
         .collect();
+    // As written: libpg_query folds an unquoted name already, and a quoted one is case-sensitive
+    // in PostgreSQL ("MAX" is no function; wire-rev-351702a43 LOW-8).
     match names.as_slice() {
-        [name] | ["pg_catalog", name] => Some(name.to_ascii_lowercase()),
+        [name] | ["pg_catalog", name] => Some(name.to_string()),
         _ => None,
     }
 }
@@ -2211,6 +2231,35 @@ impl Infer<'_> {
                 found.flatten()
             }
             Node::FuncCall(call) => {
+                // min or max that names no function: quoted in another case ("MAX") or qualified
+                // by a schema other than pg_catalog (public.max), 42883 as PostgreSQL refuses it,
+                // named as written (wire-rev-351702a43 LOW-8, wire-rev-7128c6f73 L5).
+                let parts: Vec<&str> = call
+                    .funcname
+                    .iter()
+                    .filter_map(|n| match &n.node {
+                        Some(Node::String(s)) => Some(s.sval.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                let unknown_min_max = match parts.as_slice() {
+                    [name] | ["pg_catalog", name] => {
+                        (name.eq_ignore_ascii_case("min") || name.eq_ignore_ascii_case("max")) && !matches!(*name, "min" | "max")
+                    }
+                    [_, name] => matches!(*name, "min" | "max"),
+                    _ => false,
+                };
+                if unknown_min_max {
+                    if let Some(t) = call.args.first().and_then(|a| self.type_of(a, scope)).filter(|t| type_name(*t) != "unknown") {
+                        self.first_refusal.borrow_mut().get_or_insert_with(|| {
+                            Some(SqlErrorMessage::classified(
+                                SqlErrorKind::UndefinedFunction,
+                                format!("function {}({}) does not exist", parts.join("."), type_name(t)),
+                            ))
+                        });
+                    }
+                    return None;
+                }
                 let name = func_name(call)?;
                 if let Some(t) = scalar_result(&name) {
                     return Some(t);
@@ -2292,11 +2341,21 @@ impl Infer<'_> {
                 }
                 // An untyped string literal takes the other operand's type, as PostgreSQL resolves
                 // an unknown ('5' + i is int4; wire-rev-2a68496d0 M1: it was text).
+                // NULL is an unknown too (wire-rev-7128c6f73 L10: 1::int2 + NULL is int2).
                 let untyped = |x: Option<&PgNode>| {
-                    matches!(x.and_then(|x| x.node.as_ref()), Some(Node::AConst(c)) if matches!(c.val, Some(Val::Sval(_))))
+                    matches!(x.and_then(|x| x.node.as_ref()), Some(Node::AConst(c)) if c.isnull || matches!(c.val, Some(Val::Sval(_))))
                 };
                 let l = e.lexpr.as_deref().and_then(|l| self.type_of(l, scope));
                 let r = e.rexpr.as_deref().and_then(|r| self.type_of(r, scope));
+                if matches!(op, Some("+" | "-" | "*" | "/")) && (l == Some(1186) || r == Some(1186)) {
+                    self.first_refusal.borrow_mut().get_or_insert_with(|| {
+                        Some(SqlErrorMessage::classified(
+                            SqlErrorKind::FeatureNotSupported,
+                            "interval arithmetic is not supported",
+                        ))
+                    });
+                    return None;
+                }
                 // Two untyped literals leave every candidate operator, as PostgreSQL finds:
                 // 42725 'operator is not unique: unknown + unknown' (wire-rev-cfdebc06d LOW-4).
                 if matches!(op, Some("+" | "-" | "*" | "/" | "%"))
@@ -2312,8 +2371,8 @@ impl Infer<'_> {
                     return None;
                 }
                 let (l, r) = match (l, r) {
-                    (Some(_), Some(b)) if untyped(e.lexpr.as_deref()) && !untyped(e.rexpr.as_deref()) => (Some(b), Some(b)),
-                    (Some(a), Some(_)) if untyped(e.rexpr.as_deref()) && !untyped(e.lexpr.as_deref()) => (Some(a), Some(a)),
+                    (_, Some(b)) if untyped(e.lexpr.as_deref()) && !untyped(e.rexpr.as_deref()) => (Some(b), Some(b)),
+                    (Some(a), _) if untyped(e.rexpr.as_deref()) && !untyped(e.lexpr.as_deref()) => (Some(a), Some(a)),
                     other => other,
                 };
                 // A side with no type types the expression only when it is a parameter, which
@@ -2326,6 +2385,17 @@ impl Infer<'_> {
                 };
                 match (l, r) {
                     (Some(a), Some(b)) => match arithmetic(op.unwrap_or(""), a, b) {
+                        // An interval result (timestamp - timestamp): the engine has no interval
+                        // type and answered '0' (wire-rev-7128c6f73 L4), so it is refused.
+                        Arithmetic::Type(1186) => {
+                            self.first_refusal.borrow_mut().get_or_insert_with(|| {
+                                Some(SqlErrorMessage::classified(
+                                    SqlErrorKind::FeatureNotSupported,
+                                    "interval arithmetic is not supported",
+                                ))
+                            });
+                            None
+                        }
                         Arithmetic::Type(t) => Some(t),
                         Arithmetic::Unknown => None,
                         Arithmetic::NoOperator => {
@@ -2514,6 +2584,11 @@ fn cast_type(cast: &turso_pg_parser::pg_query::protobuf::TypeCast) -> Option<u32
         Node::String(s) => s.sval.as_str(),
         _ => return None,
     };
+    // An interval cast is an interval to the walk, so its arithmetic is refused as such
+    // (wire-rev-7128c6f73 L4), not typed as the text the engine stores.
+    if name == "interval" {
+        return Some(1186);
+    }
     u32::try_from(sqlite_type_to_pg_oid(name)).ok()
 }
 
@@ -2546,6 +2621,20 @@ fn folded_probe(node: &PgNode) -> Option<String> {
                     && c.arg.as_deref().is_some_and(|a| pure(a, params))
             }
             Node::CoalesceExpr(c) => all(&c.args, params),
+            // A CASE, a boolean combination and a NULL test over pure parts fold too
+            // (wire-rev-351702a43 LOW-2: a CASE was left to Execute).
+            Node::CaseExpr(c) => {
+                c.arg.as_deref().is_none_or(|a| pure(a, params))
+                    && c.args.iter().all(|w| match w.node.as_ref() {
+                        Some(Node::CaseWhen(w)) => {
+                            w.expr.as_deref().is_some_and(|e| pure(e, params)) && w.result.as_deref().is_some_and(|r| pure(r, params))
+                        }
+                        _ => false,
+                    })
+                    && c.defresult.as_deref().is_none_or(|d| pure(d, params))
+            }
+            Node::BoolExpr(b) => all(&b.args, params),
+            Node::NullTest(t) => t.arg.as_deref().is_some_and(|a| pure(a, params)),
             _ => false,
         }
     }

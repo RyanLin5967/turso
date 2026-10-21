@@ -409,24 +409,159 @@ fn refuse_cross_database(
     if sql.bytes().filter(|&b| b == b'.').nth(1).is_none() {
         return Ok(());
     }
+    use turso_pg_parser::pg_query::protobuf::node::Node;
     let mut this = None;
-    for (n, ..) in parse.protobuf.nodes() {
-        let NodeRef::RangeVar(rv) = n else { continue };
-        if rv.catalogname.is_empty() {
-            continue;
-        }
+    let mut check = |database: &str, schema: &str, name: &str| -> Result<()> {
         let this = this.get_or_insert_with(|| crate::catalog::database_name(pg_conn.conn.as_ref()));
-        if rv.catalogname != *this {
+        if database != this.as_str() {
             return Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
                 SqlErrorKind::FeatureNotSupported,
-                format!(
-                    "cross-database references are not implemented: \"{}.{}.{}\"",
-                    rv.catalogname, rv.schemaname, rv.relname
-                ),
+                format!("cross-database references are not implemented: \"{database}.{schema}.{name}\""),
             )));
+        }
+        Ok(())
+    };
+    for (n, ..) in parse.protobuf.nodes() {
+        let NodeRef::RangeVar(rv) = n else { continue };
+        if !rv.catalogname.is_empty() {
+            check(&rv.catalogname, &rv.schemaname, &rv.relname)?;
+        }
+    }
+    // The statements whose relation the node walk does not reach (wire-rev-351702a43 MED-1: an
+    // ALTER ... RENAME renamed this database's table; COMMENT ON and DROP name theirs as lists).
+    let names = |list: &turso_pg_parser::pg_query::protobuf::Node| -> Vec<String> {
+        match list.node.as_ref() {
+            Some(Node::List(l)) => l
+                .items
+                .iter()
+                .filter_map(|i| match i.node.as_ref() {
+                    Some(Node::String(s)) => Some(s.sval.clone()),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    };
+    for raw in &parse.protobuf.stmts {
+        match raw.stmt.as_ref().and_then(|s| s.node.as_ref()) {
+            Some(Node::RenameStmt(r)) => {
+                if let Some(rv) = r.relation.as_ref().filter(|rv| !rv.catalogname.is_empty()) {
+                    check(&rv.catalogname, &rv.schemaname, &rv.relname)?;
+                }
+            }
+            Some(Node::DropStmt(d)) => {
+                for object in &d.objects {
+                    if let [database, schema, name] = names(object).as_slice() {
+                        check(database, schema, name)?;
+                    }
+                }
+            }
+            Some(Node::CommentStmt(c)) => {
+                if let Some(object) = c.object.as_deref() {
+                    if let [database, schema, name] = names(object).as_slice() {
+                        check(database, schema, name)?;
+                    }
+                }
+            }
+            _ => {}
         }
     }
     Ok(())
+}
+
+/// A numeric literal of more than 15 significant digits is refused 0A000 before anything runs,
+/// wherever it stands (a VALUES item, an UPDATE or ON CONFLICT source, a DEFAULT, a comparison, an
+/// expression): the engine reads it as a REAL, which rounds it, and the rounded value would be
+/// stored or compared as if it were PostgreSQL's numeric (wire-rev-7128c6f73 HIGH-1, the lead's
+/// ruling DECISIONS d2bf57effb: never rounded, never stored as text). A literal under an explicit
+/// cast to float4 or float8 is answered, a float being what PostgreSQL reads it as there
+/// ([`turso_pg_parser::long_decimal_literal`], the lexer's tokens). The text bounds the scan, never
+/// decides it: such a literal is written with 16 or more digits, so a statement with fewer is not
+/// scanned (L5's write budget).
+fn refuse_long_decimals(
+    pg_conn: &PgConnectionInner,
+    sql: &str,
+    parse: &turso_pg_parser::pg_query::ParseResult,
+) -> Result<()> {
+    if sql.bytes().filter(u8::is_ascii_digit).nth(15).is_none() {
+        return Ok(());
+    }
+    let exempt = float_target_literals(pg_conn, parse);
+    match turso_pg_parser::long_decimal_literal(sql, &exempt) {
+        Some(literal) => Err(LimboError::ParseError(SqlErrorMessage::classified(
+            SqlErrorKind::FeatureNotSupported,
+            format!("numeric literal {literal} is not supported: more than 15 significant digits would be rounded"),
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// The byte offsets of the numeric literals an INSERT VALUES item or an UPDATE SET source assigns
+/// to a float4 or float8 column of a main table: PostgreSQL reads them as that float (float8in's
+/// nearest double), which the engine's REAL is, so a long one is not refused there (floats are
+/// dumped with 17 digits). Any other target, or a table this cannot read, exempts nothing.
+fn float_target_literals(pg_conn: &PgConnectionInner, parse: &turso_pg_parser::pg_query::ParseResult) -> Vec<usize> {
+    use turso_pg_parser::pg_query::protobuf::{a_const::Val, node::Node, Node as PgNode};
+    let mut out = Vec::new();
+    let [raw] = parse.protobuf.stmts.as_slice() else { return out };
+    let schema = pg_conn.conn.current_schema();
+    let float_column = |relname: &str, column: &str| {
+        schema.get_btree_table(relname).is_some_and(|t| {
+            t.get_column(column)
+                .is_some_and(|(_, c)| matches!(crate::catalog::sqlite_type_to_pg_oid(&c.ty_str), 700 | 701))
+        })
+    };
+    let literal = |node: &PgNode| match node.node.as_ref() {
+        Some(Node::AConst(c)) if matches!(c.val, Some(Val::Fval(_))) => usize::try_from(c.location).ok(),
+        _ => None,
+    };
+    match raw.stmt.as_ref().and_then(|s| s.node.as_ref()) {
+        Some(Node::InsertStmt(insert)) => {
+            let Some(rv) = insert.relation.as_ref().filter(|rv| rv.schemaname.is_empty() || rv.schemaname == "public") else {
+                return out;
+            };
+            let names: Vec<String> = if insert.cols.is_empty() {
+                match schema.get_btree_table(&rv.relname) {
+                    Some(t) => t.columns().iter().filter_map(|c| c.name.clone()).collect(),
+                    None => return out,
+                }
+            } else {
+                insert
+                    .cols
+                    .iter()
+                    .filter_map(|c| match c.node.as_ref() {
+                        Some(Node::ResTarget(r)) => Some(r.name.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            };
+            if let Some(Node::SelectStmt(s)) = insert.select_stmt.as_deref().and_then(|s| s.node.as_ref()) {
+                for row in &s.values_lists {
+                    if let Some(Node::List(l)) = row.node.as_ref() {
+                        for (item, name) in l.items.iter().zip(&names) {
+                            if let Some(at) = literal(item).filter(|_| float_column(&rv.relname, name)) {
+                                out.push(at);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Some(Node::UpdateStmt(update)) => {
+            let Some(rv) = update.relation.as_ref().filter(|rv| rv.schemaname.is_empty() || rv.schemaname == "public") else {
+                return out;
+            };
+            for target in &update.target_list {
+                if let Some(Node::ResTarget(r)) = target.node.as_ref() {
+                    if let Some(at) = r.val.as_deref().and_then(literal).filter(|_| float_column(&rv.relname, &r.name)) {
+                        out.push(at);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    out
 }
 
 /// An ALTER COLUMN TYPE the engine cannot do as PostgreSQL does is refused 0A000 before anything
@@ -488,10 +623,39 @@ fn refuse_alter_column_type_across_families(
                 _ => return None,
             })
         };
+        // The same type under another spelling (float8 and double precision, bool and boolean),
+        // and a numeric whose scale is kept and precision widened, keep the stored form too
+        // (wire-rev-7128c6f73 L6: they were refused as if their values would stay unconverted).
+        fn same(t: &str) -> &str {
+            match t {
+                "float8" | "double precision" | "double" | "float" => "float8",
+                "float4" | "real" => "float4",
+                "bool" | "boolean" => "boolean",
+                other => other,
+            }
+        }
+        let numeric_widened = || {
+            let old_mods: Option<Vec<i64>> = col
+                .ty_params
+                .iter()
+                .map(|e| match e.as_ref() {
+                    turso_parser::ast::Expr::Literal(turso_parser::ast::Literal::Numeric(n)) => n.parse().ok(),
+                    _ => None,
+                })
+                .collect();
+            let new_mods = def.type_name.as_ref().map(turso_pg_parser::translator::type_modifiers).and_then(|m| m.ok());
+            match (old_mods.as_deref(), new_mods.as_deref()) {
+                (Some([p0, s0]), Some([p1, s1])) => s0 == s1 && p1 >= p0,
+                (Some([p0]), Some([p1])) => p1 >= p0,
+                (Some([p0]), Some([p1, 0])) => p1 >= p0,
+                _ => false,
+            }
+        };
         let allowed = match (family(&old), family(&new)) {
             (Some((0, _)), Some((0, _))) => true,
             (Some((1, w_old)), Some((1, w_new))) => w_new >= w_old,
-            _ => false,
+            _ if old == "numeric" && matches!(new.as_str(), "numeric" | "decimal") => numeric_widened(),
+            _ => same(&old) == same(&new) && matches!(same(&old), "float8" | "float4" | "boolean"),
         };
         if !allowed {
             return Err(LimboError::ParseError(SqlErrorMessage::classified(
@@ -1639,6 +1803,7 @@ fn prepare_statement_parsed(
     refuse_dropped_schemas(pg_conn, &parse_result)?;
     refuse_alter_column_type_across_families(pg_conn, &parse_result)?;
     refuse_cross_database(pg_conn, sql, &parse_result)?;
+    refuse_long_decimals(pg_conn, sql, &parse_result)?;
     if !pg_conn.conn.get_auto_commit() {
         let relations = turso_pg_parser::translator::named_relations(&parse_result);
         if !relations.is_empty() {
@@ -4574,8 +4739,10 @@ fn fold_probe(parse: &turso_pg_parser::pg_query::ParseResult) -> Option<String> 
             Node::TypeCast(c) => {
                 !not_immutable(&turso_pg_parser::pg_query::NodeRef::TypeCast(c.as_ref())) && c.arg.as_deref().is_some_and(pure)
             }
-            Node::BoolExpr(b) => all(&b.args),
-            Node::CoalesceExpr(c) => all(&c.args),
+            // A form whose arguments PostgreSQL simplifies only up to a constant that decides it
+            // (AND false, OR true, coalesce's first non-null constant, a CASE's constant WHEN) is
+            // never probed whole: [`collect`] descends it by those rules (wire-rev-351702a43 MED-4).
+            Node::BoolExpr(_) | Node::CoalesceExpr(_) | Node::CaseExpr(_) => false,
             Node::MinMaxExpr(m) => all(&m.args),
             Node::NullTest(t) => t.arg.as_deref().is_some_and(pure),
             _ => false,
@@ -4590,12 +4757,67 @@ fn fold_probe(parse: &turso_pg_parser::pg_query::ParseResult) -> Option<String> 
             out.push(node.clone());
             return;
         }
+        use turso_pg_parser::pg_query::protobuf::{a_const::Val, BoolExprType};
+        let constant = |node: &PgNode, b: bool| {
+            matches!(node.node.as_ref(), Some(Node::AConst(c)) if matches!(&c.val, Some(Val::Boolval(v)) if v.boolval == b))
+        };
+        let non_null_constant = |node: &PgNode| matches!(node.node.as_ref(), Some(Node::AConst(c)) if !c.isnull);
+        match n {
+            // eval_const_expressions simplifies AND's arguments in order and stops at a constant
+            // false (OR at a constant true), coalesce's at its first non-null constant, and a
+            // CASE's results unless their WHEN is a constant false, up to a constant true WHEN.
+            Node::BoolExpr(b) => {
+                let stop = match BoolExprType::try_from(b.boolop) {
+                    Ok(BoolExprType::AndExpr) => Some(false),
+                    Ok(BoolExprType::OrExpr) => Some(true),
+                    _ => None,
+                };
+                for arg in &b.args {
+                    collect(arg, out);
+                    if stop.is_some_and(|v| constant(arg, v)) {
+                        break;
+                    }
+                }
+                return;
+            }
+            Node::CoalesceExpr(c) => {
+                for arg in &c.args {
+                    collect(arg, out);
+                    if non_null_constant(arg) {
+                        break;
+                    }
+                }
+                return;
+            }
+            Node::CaseExpr(c) => {
+                if let Some(arg) = c.arg.as_deref() {
+                    collect(arg, out);
+                }
+                for w in &c.args {
+                    let Some(Node::CaseWhen(w)) = w.node.as_ref() else { continue };
+                    let Some(cond) = w.expr.as_deref() else { continue };
+                    if constant(cond, false) {
+                        continue;
+                    }
+                    collect(cond, out);
+                    if let Some(result) = w.result.as_deref() {
+                        collect(result, out);
+                    }
+                    if constant(cond, true) {
+                        return;
+                    }
+                }
+                if let Some(d) = c.defresult.as_deref() {
+                    collect(d, out);
+                }
+                return;
+            }
+            _ => {}
+        }
         let children: Vec<&PgNode> = match n {
             Node::FuncCall(f) => f.args.iter().collect(),
             Node::AExpr(e) => e.lexpr.iter().chain(e.rexpr.iter()).map(|b| b.as_ref()).collect(),
             Node::TypeCast(c) => c.arg.iter().map(|b| b.as_ref()).collect(),
-            Node::BoolExpr(b) => b.args.iter().collect(),
-            Node::CoalesceExpr(c) => c.args.iter().collect(),
             Node::MinMaxExpr(m) => m.args.iter().collect(),
             Node::NullTest(t) => t.arg.iter().map(|b| b.as_ref()).collect(),
             _ => Vec::new(),
