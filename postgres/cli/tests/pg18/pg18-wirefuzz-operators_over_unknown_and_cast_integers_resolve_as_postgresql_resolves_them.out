@@ -1,0 +1,35 @@
+>> Q SELECT '1' + '2'
+   E S=ERROR C=42725 M=operator is not unique: unknown + unknown
+   Z I
+>> Q SELECT '1' * '2' AS p
+   E S=ERROR C=42725 M=operator is not unique: unknown * unknown
+   Z I
+>> Q SELECT 1 + '2'
+   T oids=[23]
+   D ['3']
+   C SELECT 1
+   Z I
+>> Q SELECT 9007199254740993::int8 + 1::int2
+   T oids=[20]
+   D ['9007199254740994']
+   C SELECT 1
+   Z I
+>> Q SELECT 2::int2 + 2::int2, 2::int2 * 3
+   T oids=[21, 23]
+   D ['4', '6']
+   C SELECT 1
+   Z I
+>> Q SELECT 2::int8 - 1, 7::int2 % 2::int2
+   T oids=[20, 21]
+   D ['1', '1']
+   C SELECT 1
+   Z I
+>> Q CREATE TABLE tt(id int, t text)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO tt VALUES (1, 'a')
+   C INSERT 0 1
+   Z I
+>> Q SELECT count(*) FROM tt WHERE t + 1 > 0
+   E S=ERROR C=42883 M=operator does not exist: text + integer
+   Z I

@@ -588,6 +588,12 @@ pub fn computed_targets(parse: &ParseResult) -> Vec<bool> {
                     && func_name(call).is_some_and(|n| scalar_result(&n).is_some())
                     && call.args.iter().all(|a| plain(a, false))
             }
+            // An operand cast to a type the walk names (2::int2 in 2::int2 + 2::int2 is int2, where
+            // the engine's INTEGER announced int4; wire-rev-cfdebc06d LOW-5).
+            Some(Node::TypeCast(c)) => {
+                !top && cast_type(c).is_some()
+                    && c.arg.as_deref().is_some_and(|a| matches!(a.node.as_ref(), Some(Node::AConst(_))) || plain(a, false))
+            }
             _ => false,
         }
     }
@@ -2243,6 +2249,20 @@ impl Infer<'_> {
                 };
                 let l = e.lexpr.as_deref().and_then(|l| self.type_of(l, scope));
                 let r = e.rexpr.as_deref().and_then(|r| self.type_of(r, scope));
+                // Two untyped literals leave every candidate operator, as PostgreSQL finds:
+                // 42725 'operator is not unique: unknown + unknown' (wire-rev-cfdebc06d LOW-4).
+                if matches!(op, Some("+" | "-" | "*" | "/" | "%"))
+                    && untyped(e.lexpr.as_deref())
+                    && untyped(e.rexpr.as_deref())
+                {
+                    self.first_refusal.borrow_mut().get_or_insert_with(|| {
+                        Some(SqlErrorMessage::classified(
+                            SqlErrorKind::AmbiguousFunction,
+                            format!("operator is not unique: unknown {} unknown", op.unwrap_or("")),
+                        ))
+                    });
+                    return None;
+                }
                 let (l, r) = match (l, r) {
                     (Some(_), Some(b)) if untyped(e.lexpr.as_deref()) && !untyped(e.rexpr.as_deref()) => (Some(b), Some(b)),
                     (Some(a), Some(_)) if untyped(e.rexpr.as_deref()) && !untyped(e.lexpr.as_deref()) => (Some(a), Some(a)),

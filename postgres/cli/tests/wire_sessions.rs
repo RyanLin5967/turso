@@ -12366,6 +12366,13 @@ replays_postgresql!(
     "pg18-wirefuzz-every_write_path_refuses_a_value_too_long_for_varchar.out",
     []
 );
+// wire-rev-cfdebc06d LOW-4, LOW-5: unknown + unknown is 42725, and integers cast to int2 or int8 type an operator over
+// them; text + integer in WHERE is 42883 as in PG (#9).
+replays_postgresql!(
+    pg18_wirefuzz_operators_over_unknown_and_cast_integers_resolve_as_postgresql_resolves_them_replays_as_postgresql_answered,
+    "pg18-wirefuzz-operators_over_unknown_and_cast_integers_resolve_as_postgresql_resolves_them.out",
+    []
+);
 // wire-rev-cfdebc06d MED-4: a decimal literal of more than 15 significant digits is stored with every digit, in a
 // numeric column and as text, on INSERT and UPDATE; a float8 column keeps the nearest double.
 replays_postgresql!(

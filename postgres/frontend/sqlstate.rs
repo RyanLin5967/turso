@@ -32,6 +32,7 @@ pub fn sqlstate(kind: SqlErrorKind) -> &'static str {
         InvalidSavepointSpecification => "3B001",
         AmbiguousColumn => "42702",
         UndefinedFunction => "42883",
+        AmbiguousFunction => "42725",
         DuplicateAlias => "42712",
         StatementTooComplex => "54001",
         InternalError => "XX000",

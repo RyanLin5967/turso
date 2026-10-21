@@ -26,6 +26,7 @@ pub enum SqlErrorKind {
     InvalidSavepointSpecification,
     AmbiguousColumn,
     UndefinedFunction,
+    AmbiguousFunction,
     DuplicateAlias,
     StatementTooComplex,
     InternalError,
