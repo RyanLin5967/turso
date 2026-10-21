@@ -16356,6 +16356,35 @@ fn a_bound_nan_is_refused_never_stored_as_null() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-4a1934c89-beb4 MED-7 and MED-2 (its PG 18.6 probe #284, #290): now() and transaction_timestamp() are the
+/// transaction's start, the same in every statement of a block; statement_timestamp() is the statement's start; and
+/// clock_timestamp() is read at each call. now() was read at each call (two statements of one block stored two values),
+/// and on the integration line clock_timestamp() became constant within a query.
+#[test]
+fn the_time_functions_keep_postgresqls_volatility() {
+    let dir = Scratch::new("time-functions");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE tn(id int, t text, s text)").ok("create");
+    for sql in ["BEGIN", "INSERT INTO tn SELECT 1, now()::text, statement_timestamp()::text"] {
+        a.q(sql).ok(sql);
+    }
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    for sql in ["INSERT INTO tn SELECT 2, transaction_timestamp()::text, statement_timestamp()::text", "COMMIT"] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    let r = a.q("SELECT count(DISTINCT t), count(DISTINCT s) FROM tn");
+    if r.rows != vec![vec![Some("1".to_string()), Some("2".to_string())]] {
+        wrong.push(format!("one block: distinct now() and statement_timestamp() {:?} {:?}, PostgreSQL 1 and 2", r.rows, r.error));
+    }
+    let r = a.q("SELECT count(DISTINCT clock_timestamp()::text) > 1 FROM generate_series(1, 300000)");
+    if r.rows != vec![vec![Some("t".to_string())]] {
+        wrong.push(format!("clock_timestamp() within a query: {:?} {:?}, PostgreSQL t", r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-1de981755-numeric HIGH-2, HIGH-4, HIGH-5, HIGH-6 (its PG 18.6 probe8 #22-#29, #48-#58): the literal
 /// refusal's own holes. A hex literal past int8 has fewer than 16 decimal digits, so the pre-filter skipped it
 /// (0xFFFFFFFFFFFFFFFF answered 1.8446744073709552e+19); a '-' after a keyword operand was read as a sign, so 2^63
