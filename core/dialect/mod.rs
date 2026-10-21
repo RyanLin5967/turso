@@ -47,6 +47,14 @@ pub trait Dialect: Send + Sync + 'static {
     /// engine-generated and AST-only statements use that representation.
     fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)>;
 
+    /// Whether an int64 result that does not fit is an error (`LimboError::IntegerOverflow`;
+    /// PostgreSQL's 22003 "bigint out of range") rather than SQLite's REAL. Default false:
+    /// SQLite's rule. Read once per connection (`Connection::integer_overflow_raises`) and applied
+    /// by + - * / and unary minus over two integers (numeric DESIGN addendum 3 (a)).
+    fn integer_overflow_raises(&self) -> bool {
+        false
+    }
+
     /// Parse `sql` again for a statement the engine re-prepares on `conn` (after a
     /// prepare-generation bump or another session's schema change), so a frontend whose
     /// translation needs the connection (its schema, for a column lookup: DELETE ... USING, a

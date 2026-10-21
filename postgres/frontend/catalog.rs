@@ -69,6 +69,12 @@ impl Dialect for PostgresDialect {
     fn name(&self) -> &'static str {
         "postgres"
     }
+
+    /// PostgreSQL raises 22003 on an int8 result past its range; SQLite makes it a REAL
+    /// (fastest-engine, numeric DESIGN addendum 3 (a)).
+    fn integer_overflow_raises(&self) -> bool {
+        true
+    }
     // This frontend's own rows are its two marked forms (dialect design REVISION 2 item 8).
     fn owns_stored_table_sql(&self, sql: &str) -> bool {
         sql.starts_with(STORED_PG_SCHEMA_PREFIX) || sql.starts_with(STORED_PG_ALTERED_PREFIX)

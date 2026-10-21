@@ -515,13 +515,31 @@ pub fn op_init(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// Under a dialect whose `integer_overflow_raises` (PostgreSQL), two integer operands whose
+/// result does not fit in an int64 are an error, as PostgreSQL's 22003, where SQLite's rule makes
+/// the result a REAL (`Numeric::checked_add` and its siblings fall back to f64). Only two INTEGER
+/// operands are checked: a REAL or a text operand keeps the dialect-independent rule. Mutant
+/// `int64_overflow_promotes` (test builds only): promoted, as before.
+fn int64_overflow_check(program: &Program, lhs: &Value, rhs: &Value, op: fn(i64, i64) -> Option<i64>) -> Result<()> {
+    if !program.connection.integer_overflow_raises || crate::branch::store::fe_mutant("int64_overflow_promotes") {
+        return Ok(());
+    }
+    if let (Value::Numeric(Numeric::Integer(a)), Value::Numeric(Numeric::Integer(b))) = (lhs, rhs) {
+        if op(*a, *b).is_none() {
+            return Err(LimboError::IntegerOverflow);
+        }
+    }
+    Ok(())
+}
+
 pub fn op_add(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Add { lhs, rhs, dest }, insn);
+    int64_overflow_check(program, state.registers[*lhs].get_value(), state.registers[*rhs].get_value(), i64::checked_add)?;
     state.registers[*dest].set_value(
         state.registers[*lhs]
             .get_value()
@@ -532,12 +550,13 @@ pub fn op_add(
 }
 
 pub fn op_subtract(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Subtract { lhs, rhs, dest }, insn);
+    int64_overflow_check(program, state.registers[*lhs].get_value(), state.registers[*rhs].get_value(), i64::checked_sub)?;
     state.registers[*dest].set_value(
         state.registers[*lhs]
             .get_value()
@@ -548,12 +567,13 @@ pub fn op_subtract(
 }
 
 pub fn op_multiply(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Multiply { lhs, rhs, dest }, insn);
+    int64_overflow_check(program, state.registers[*lhs].get_value(), state.registers[*rhs].get_value(), i64::checked_mul)?;
     state.registers[*dest].set_value(
         state.registers[*lhs]
             .get_value()

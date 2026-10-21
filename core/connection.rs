@@ -634,6 +634,8 @@ pub struct Connection {
     pub(super) busy_handler: RwLock<BusyHandler>,
     /// Step-based progress callback for SQLite-compatible cancellation hooks.
     pub(super) progress_handler: ProgressHandler,
+    /// The dialect's `integer_overflow_raises`, read at connect (the dialect is the database's).
+    pub(crate) integer_overflow_raises: bool,
     /// Maximum execution time for a single statement on this connection.
     /// `Duration::ZERO` means disabled.
     pub(super) query_timeout_ms: AtomicU64,
