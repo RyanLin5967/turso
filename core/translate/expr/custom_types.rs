@@ -4809,4 +4809,25 @@ mod tests {
         ]);
         assert!(bad.is_empty(), "CLAIM: a moving window max/min over numeric did not compare as numeric: {bad:#?}");
     }
+
+    /// Adopted verbatim from engine-rev-types-08caaec44 (artie 8319b0a45e,
+    /// frontier/fastest/reviews/REVIEW-engine-types-08caaec44.md and raw-engine-types-08caaec44/
+    /// zz_rev08c.rs.txt); its expected values are that review's PostgreSQL 18.6 recordings
+    /// (raw-engine-types-08caaec44/p*.pgout.txt), never ours.
+    /// MED: set operations, DISTINCT and GROUP BY over numerics of two scales dedupe by numeric
+    /// equality, and a join through a compound relation finds numeric's pairs.
+    #[test]
+    fn rev08c_set_operations_over_numeric_dedupe_by_numeric_equality() {
+        let conn = open();
+        let bad = diverging_after(&conn, &[REV08C_N[0], REV08C_N[1],
+            "CREATE TABLE m(id INTEGER PRIMARY KEY, c numeric(8, 3)) STRICT",
+            "INSERT INTO m VALUES (1, 1.000), (2, 2.500), (3, 10.000), (4, -3.250)"], &[
+            ("SELECT count(*) FROM (SELECT b FROM n UNION SELECT c FROM m) s", "7"),
+            ("SELECT count(*) FROM (SELECT b FROM n INTERSECT SELECT c FROM m) s", "3"),
+            ("SELECT count(*) FROM (SELECT b FROM n EXCEPT SELECT c FROM m) s", "3"),
+            ("SELECT count(DISTINCT x) FROM (SELECT b AS x FROM n UNION ALL SELECT c FROM m) s", "6"),
+            ("SELECT count(*) FROM n JOIN (SELECT c FROM m UNION ALL SELECT c FROM m WHERE id < 0) q ON n.b = q.c", "3"),
+        ]);
+        assert!(bad.is_empty(), "CLAIM: a set operation over numeric did not dedupe by numeric equality: {bad:#?}");
+    }
 }
