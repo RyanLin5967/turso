@@ -429,6 +429,13 @@ def self_test():
         out = os.path.join(d, f"{label}.tsv")
         stop = os.path.join(d, f"{label}.stop")
         s = subprocess.Popen([sys.executable, "-B", __file__, "sample", out, "--cell", "ST", "--stop-file", stop])
+        # the window opens at the sampler's first /proc read, which its #start line follows: a burner started before it
+        # would burn CPU the record rightly leaves out (it predates the window), and the calibration's rusage would not
+        # match (measured on iccad7, load 27: 0.03-0.13 s short per burner). Bounded at 30 s; a sampler that never
+        # starts is the record's own failure, which decide() reports
+        w0 = time.monotonic()
+        while time.monotonic() - w0 < 30 and s.poll() is None and not (os.path.exists(out) and os.path.getsize(out) > 0):
+            time.sleep(0.02)
         procs = []
         t0 = time.monotonic()
         pending = sorted(burners, key=lambda b: b[1])
