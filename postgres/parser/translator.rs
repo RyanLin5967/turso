@@ -4339,6 +4339,22 @@ impl PostgreSQLTranslator {
         {
             return Err(refuse_numeric_cast_arithmetic(op_name));
         }
+        // Two unknowns (string literals or NULL) leave every candidate operator: 42725, as
+        // PostgreSQL refuses it wherever the operator stands (wire-rev-7128c6f73 L2: only the
+        // target list's walk refused it).
+        let unknown = |e: Option<&pg_query::protobuf::Node>| {
+            matches!(e.and_then(|e| e.node.as_ref()), Some(pg_query::protobuf::node::Node::AConst(c))
+                if c.isnull || matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))))
+        };
+        if matches!(op_name, "+" | "-" | "*" | "/" | "%")
+            && unknown(a_expr.lexpr.as_deref())
+            && unknown(a_expr.rexpr.as_deref())
+        {
+            return Err(ParseError::ParseError(SqlErrorMessage::classified(
+                SqlErrorKind::AmbiguousFunction,
+                format!("operator is not unique: unknown {op_name} unknown"),
+            )));
+        }
 
         // Handle unary operators (no left expression)
         if a_expr.lexpr.is_none() {
@@ -6240,7 +6256,7 @@ pub fn decimal_past_float8(text: &str) -> bool {
 /// parse_numeric_literal assumes SQLite's grammar checked the text, so `0b1000..0` (2^31) hit its
 /// unreachable!() and ended the session (the PostgreSQL regression corpus, numerology.sql). A
 /// non-decimal value past u128 is computed as a float. Any other text is passed on as it is.
-fn decimal_numeric_literal(text: &str) -> String {
+pub fn decimal_numeric_literal(text: &str) -> String {
     let (negative, body) = match text.strip_prefix('-') {
         Some(rest) => (true, rest),
         None => (false, text),

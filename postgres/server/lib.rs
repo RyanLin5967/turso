@@ -6145,6 +6145,32 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
                 _ => "numeric",
             };
             let trimmed = text.trim_matches(|c: char| c.is_ascii() && pg_space(c as u8));
+            // numeric_in (PG 16+) reads underscores between digits and a 0x/0o/0b integer, and
+            // refuses an exponent at or past INT_MAX/2 (wire-rev-7128c6f73 L9, L1: '1_000' and
+            // '0x10' were 22P02, '1e-2147483648' was stored 0).
+            let normalized;
+            let trimmed = if *pg_type == Type::NUMERIC {
+                let body = trimmed.trim_start_matches(['+', '-']).to_ascii_lowercase();
+                if body.contains('_') || ["0x", "0o", "0b"].iter().any(|p| body.starts_with(p)) {
+                    normalized = turso_pg_parser::translator::decimal_numeric_literal(trimmed);
+                    normalized.as_str()
+                } else {
+                    trimmed
+                }
+            } else {
+                trimmed
+            };
+            if *pg_type == Type::NUMERIC {
+                if let Some(at) = trimmed.find(['e', 'E']) {
+                    let out_of_format = trimmed[at + 1..].parse::<i64>().map_or(true, |e| e.abs() >= i64::from(i32::MAX / 2));
+                    if out_of_format && trimmed[..at].bytes().any(|b| b.is_ascii_digit()) {
+                        return Err(PgWireError::UserError(error(
+                            SqlErrorKind::NumericValueOutOfRange,
+                            "value overflows numeric format".to_string(),
+                        )));
+                    }
+                }
+            }
             // A bound numeric of more than 15 significant digits would be the engine's REAL,
             // rounded: refused, as the same literal is (wire-rev-7128c6f73 HIGH-1, the lead's
             // ruling DECISIONS d2bf57effb; turso_pg_parser's one predicate). A float parameter
