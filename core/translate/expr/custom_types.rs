@@ -3734,4 +3734,69 @@ mod tests {
         ]);
         assert!(bad.is_empty(), "CLAIM: a numeric IN or scalar subquery did not compare as numeric: {bad:#?}");
     }
+
+    /// Adopted verbatim from engine-rev-types-08caaec44 (artie 8319b0a45e,
+    /// frontier/fastest/reviews/REVIEW-engine-types-08caaec44.md and raw-engine-types-08caaec44/
+    /// zz_rev08c.rs.txt); its expected values are that review's PostgreSQL 18.6 recordings
+    /// (raw-engine-types-08caaec44/p*.pgout.txt), never ours.
+    /// HIGH: a partial index whose predicate compares a numeric (or a domain over one) holds the rows
+    /// the predicate takes, so a query it serves answers as a scan does, and a UNIQUE one refuses the
+    /// duplicate PostgreSQL refuses (the NOT INDEXED cases are the controls).
+    #[test]
+    fn rev08c_a_partial_index_over_a_numeric_predicate_answers_as_a_scan() {
+        let conn = open();
+        let bad = diverging_after(&conn, &[
+            "CREATE TABLE p(id INTEGER PRIMARY KEY, b numeric(8, 2), tag INTEGER) STRICT",
+            "CREATE INDEX pl ON p(tag) WHERE b < 5",
+            "CREATE TABLE pg(id INTEGER PRIMARY KEY, b numeric(8, 2), tag INTEGER) STRICT",
+            "CREATE INDEX pgl ON pg(tag) WHERE b > 5",
+            "INSERT INTO p VALUES (1, 1.00, 1), (2, 2.00, 1), (4, 10.00, 1), (5, 9.50, 1), (6, -3.25, 1)",
+            "INSERT INTO pg SELECT * FROM p",
+            "CREATE DOMAIN dn AS numeric(8, 2)",
+            "CREATE TABLE pd(id INTEGER PRIMARY KEY, a dn, tag INTEGER) STRICT",
+            "CREATE INDEX pdl ON pd(tag) WHERE a < 5",
+            "INSERT INTO pd VALUES (1, 10, 1), (2, 9, 1), (3, 1.5, 1), (4, -2, 1)",
+            "CREATE TABLE pu(id INTEGER PRIMARY KEY, b numeric(8, 2), tag INTEGER) STRICT",
+            "CREATE UNIQUE INDEX pul ON pu(tag) WHERE b < 5",
+            "INSERT INTO pu VALUES (1, 1.00, 7)",
+        ], &[
+            ("SELECT id FROM p NOT INDEXED WHERE b < 5 AND tag = 1 ORDER BY id", "1;2;6"),
+            ("SELECT id FROM p WHERE b < 5 AND tag = 1 ORDER BY id", "1;2;6"),
+            ("SELECT id FROM pg NOT INDEXED WHERE b > 5 AND tag = 1 ORDER BY id", "4;5"),
+            ("SELECT id FROM pg WHERE b > 5 AND tag = 1 ORDER BY id", "4;5"),
+            ("SELECT id FROM pd NOT INDEXED WHERE a < 5 AND tag = 1 ORDER BY id", "3;4"),
+            ("SELECT id FROM pd WHERE a < 5 AND tag = 1 ORDER BY id", "3;4"),
+        ]);
+        let mut bad = bad;
+        if conn.execute("INSERT INTO pu VALUES (2, 2.00, 7)").is_ok() {
+            bad.push("INSERT INTO pu VALUES (2, 2.00, 7) succeeded; PostgreSQL 18.6 refuses it 23505".to_string());
+        }
+        assert!(bad.is_empty(), "CLAIM: a partial index over a numeric predicate did not answer as a scan: {bad:#?}");
+    }
+
+    /// Adopted verbatim from engine-rev-types-08caaec44 (artie 8319b0a45e,
+    /// frontier/fastest/reviews/REVIEW-engine-types-08caaec44.md and raw-engine-types-08caaec44/
+    /// zz_rev08c.rs.txt); its expected values are that review's PostgreSQL 18.6 recordings
+    /// (raw-engine-types-08caaec44/p*.pgout.txt), never ours.
+    /// HIGH (same root as the partial index): a trigger's WHEN over NEW's numeric, and a partial
+    /// index maintained by an UPDATE, compare as numeric (the NOT INDEXED case is the control).
+    #[test]
+    fn rev08c_a_dml_time_numeric_comparison_compares_as_numeric() {
+        let conn = open();
+        let bad = diverging_after(&conn, &[
+            "CREATE TABLE tg(id INTEGER PRIMARY KEY, b numeric(8, 2)) STRICT",
+            "CREATE TABLE tlog(id INTEGER) STRICT",
+            "CREATE TRIGGER trg AFTER INSERT ON tg WHEN NEW.b > 5 BEGIN INSERT INTO tlog VALUES (NEW.id); END",
+            "INSERT INTO tg VALUES (1, 1.00), (2, 10.00)",
+            "CREATE TABLE pu(id INTEGER PRIMARY KEY, b numeric(8, 2), tag INTEGER) STRICT",
+            "CREATE INDEX pul ON pu(tag) WHERE b < 5",
+            "INSERT INTO pu VALUES (1, 10.00, 1)",
+            "UPDATE pu SET b = 1.00 WHERE id = 1",
+        ], &[
+            ("SELECT id FROM tlog ORDER BY id", "2"),
+            ("SELECT id FROM pu NOT INDEXED WHERE b < 5 AND tag = 1", "1"),
+            ("SELECT id FROM pu WHERE b < 5 AND tag = 1", "1"),
+        ]);
+        assert!(bad.is_empty(), "CLAIM: a DML-time numeric comparison did not compare as numeric: {bad:#?}");
+    }
 }
