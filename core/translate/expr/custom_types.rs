@@ -366,9 +366,21 @@ pub(super) fn find_custom_type_operator(
     let scalars = Some(&program.scalar_subquery_types);
     // `value` in a domain CHECK translated outside any table (CAST to the domain) is a value of
     // that domain (`ProgramBuilder::id_value_type`).
+    // A user-facing value outside a scan: a trigger's NEW/OLD register, a SELF_TABLE column of an
+    // index expression or partial predicate at DML time (`ProgramBuilder::register_types`,
+    // `self_table_types`; engine-rev-types-08caaec44 HIGH 3). Mutant `dml_values_compare_plainly`
+    // (test builds only): untyped, as before.
+    let dml_values = !crate::branch::store::fe_mutant("dml_values_compare_plainly");
     let value_info = |e: &ast::Expr| {
-        let td = value_type?;
-        matches!(e, ast::Expr::Id(name) if name.as_str().eq_ignore_ascii_case("value")).then(|| ExprCustomTypeInfo {
+        let td = match e {
+            ast::Expr::Id(name) if name.as_str().eq_ignore_ascii_case("value") => value_type?,
+            ast::Expr::Register(reg) if dml_values => program.register_types.get(reg)?,
+            ast::Expr::Column { table, column, .. } if dml_values && table.is_self_table() => {
+                program.self_table_types.get(*column)?.as_ref()?
+            }
+            _ => return None,
+        };
+        Some(ExprCustomTypeInfo {
             type_name: td.name.to_lowercase(),
             column: None,
             type_def: td.clone(),
@@ -787,18 +799,29 @@ pub(crate) fn emit_dml_expr_index_value(
     crate::schema::resolve_gencol_expr_columns(&mut expr, columns)?;
 
     let is_strict = table.is_strict;
+    // Each column's custom type, for the expression's comparisons (engine-rev-types-08caaec44 HIGH
+    // 3: a partial predicate `b < 5` over numeric compared the decoded text with 5 plainly).
+    let mut types = Vec::with_capacity(columns.len());
     for (i, col) in columns.iter().enumerate() {
+        let type_def = resolver.schema().get_type_def(&col.ty_str, is_strict).cloned();
         if col.is_rowid_alias() {
+            types.push(None);
             continue;
         }
-        if let Some(type_def) = resolver.schema().get_type_def(&col.ty_str, is_strict) {
-            if type_def.decode().is_some() {
-                let src_reg = column_regs[i];
-                let tmp = program.alloc_register();
-                emit_user_facing_column_value(program, src_reg, tmp, col, is_strict, resolver)?;
-                column_regs[i] = tmp;
-            }
+        // DECODE through the whole chain: a domain over numeric has no DECODE of its own.
+        let decodes = resolver
+            .schema()
+            .resolve_type(&col.ty_str, is_strict)
+            .ok()
+            .flatten()
+            .is_some_and(|resolved| resolved.chain.iter().any(|td| td.decode().is_some()));
+        if decodes {
+            let src_reg = column_regs[i];
+            let tmp = program.alloc_register();
+            emit_user_facing_column_value(program, src_reg, tmp, col, is_strict, resolver)?;
+            column_regs[i] = tmp;
         }
+        types.push(type_def);
     }
 
     let pairs = columns.iter().zip(column_regs.iter().copied());
@@ -806,10 +829,13 @@ pub(crate) fn emit_dml_expr_index_value(
         dml_ctx: DmlColumnContext::from_column_reg_mapping(pairs),
         table: Arc::clone(table),
     };
-    resolver.with_self_table_context(program, Some(&ctx), |program, _| {
+    let outer_types = std::mem::replace(&mut program.self_table_types, types);
+    let translated = resolver.with_self_table_context(program, Some(&ctx), |program, _| {
         translate_expr(program, None, &expr, dest_reg, resolver)?;
         Ok(())
-    })?;
+    });
+    program.self_table_types = outer_types;
+    translated?;
     Ok(())
 }
 

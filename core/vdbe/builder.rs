@@ -355,6 +355,13 @@ pub struct ProgramBuilder {
     /// `scalar_subquery_types` by its result register), so the IN compares through the type's '='
     /// (engine-rev-types-08caaec44 HIGH 2).
     pub in_subquery_types: std::collections::HashMap<usize, String>,
+    /// While an expression over a row's user-facing values is translated outside a table scan (a
+    /// trigger's WHEN over NEW/OLD registers, an index's expression or partial predicate at DML
+    /// time over SELF_TABLE columns), the custom type of each value: by register, and by the self
+    /// table's column. `find_custom_type_operator` compares and computes them through the type's
+    /// operators (engine-rev-types-08caaec44 HIGH 3). Empty otherwise.
+    pub register_types: std::collections::HashMap<usize, Arc<crate::schema::TypeDef>>,
+    pub self_table_types: Vec<Option<Arc<crate::schema::TypeDef>>>,
     /// Current parsing nesting level
     nested_level: usize,
     init_label: BranchOffset,
@@ -767,6 +774,8 @@ impl ProgramBuilder {
             table_references: TableReferences::new(vec![], vec![]),
             scalar_subquery_types: std::collections::HashMap::new(),
             in_subquery_types: std::collections::HashMap::new(),
+            register_types: std::collections::HashMap::new(),
+            self_table_types: Vec::new(),
             collation: None,
             nested_level: 0,
             // These labels will be filled when `prologue()` is called

@@ -941,7 +941,23 @@ pub fn fire_trigger(
             }
 
             let when_reg = program.alloc_register();
-            translate_expr(program, None, &when_expr, when_reg, resolver)?;
+            // NEW and OLD hold the row's user-facing values: each of a custom-typed column is a
+            // value of its type, for the WHEN's comparisons (engine-rev-types-08caaec44 HIGH 3:
+            // `WHEN NEW.b > 5` over numeric fired for 1.00).
+            let mut typed = std::collections::HashMap::new();
+            for regs in [&ctx.new_registers, &ctx.old_registers].into_iter().flatten() {
+                for (i, col) in ctx.table.columns().iter().enumerate() {
+                    if let (Some(reg), Some(td)) = (regs.get(i), resolver.schema().get_type_def(&col.ty_str, ctx.table.is_strict)) {
+                        if !col.is_rowid_alias() {
+                            typed.insert(*reg, td.clone());
+                        }
+                    }
+                }
+            }
+            let outer_types = std::mem::replace(&mut program.register_types, typed);
+            let translated = translate_expr(program, None, &when_expr, when_reg, resolver);
+            program.register_types = outer_types;
+            translated?;
 
             let skip_label = program.allocate_label();
             program.emit_insn(Insn::IfNot {
