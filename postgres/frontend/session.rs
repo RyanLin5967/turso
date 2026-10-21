@@ -2113,7 +2113,16 @@ fn prepare_statement_parsed(
                                 .any(|(table, t)| mentions(&view.sql, table.as_bytes()) && temporal_table(t.as_ref())))
                 })
         };
-        if !used.is_empty() || aggregates.contains(&true) || min_max || unknown_call || temporal() {
+        // ... and for a statement calling a numeric function the walk resolves (ceil(text),
+        // round(float8, 2): numfuzz at e4882aaed, answered where PostgreSQL has no candidate),
+        // bounded by the text. BLIND SPOT: a CREATE VIEW is not walked for it (walking every view
+        // as it is made warms the view memo, which changes how a deep chain is read later).
+        let numeric_call = || {
+            [b"ceil(".as_slice(), b"ceiling(", b"floor(", b"round(", b"trunc(", b"abs(", b"sign(", b"sqrt(", b"exp(", b"ln(", b"log(", b"log10(", b"pow(", b"power("]
+                .iter()
+                .any(|w| may_name(w))
+        };
+        if !used.is_empty() || aggregates.contains(&true) || min_max || unknown_call || numeric_call() || temporal() {
             // A parameter compared with something no context types is refused (42P18) by the
             // server, which alone reads the types the client declared (wire review 8 item 7,
             // review 11 item 1).

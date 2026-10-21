@@ -1112,6 +1112,10 @@ fn arithmetic(op: &str, a: u32, b: u32) -> Arithmetic {
     if chars(a) || chars(b) {
         return Arithmetic::NoOperator;
     }
+    // % exists for the integers and numeric alone (no float8 % float8 in pg_operator).
+    if op == "%" && (matches!(a, FLOAT4 | FLOAT8) || matches!(b, FLOAT4 | FLOAT8)) {
+        return Arithmetic::NoOperator;
+    }
     if num(a) && num(b) {
         let rank = |t: u32| match t {
             INT2 => 1,
@@ -1239,6 +1243,13 @@ fn common_of(types: &[u32]) -> Common {
         }
     }
     Common::Type(common)
+}
+
+/// Whether `node` is an untyped literal (a string constant or NULL), which a function's candidates
+/// resolve.
+fn untyped_literal(node: Option<&PgNode>) -> bool {
+    use turso_pg_parser::pg_query::protobuf::a_const::Val;
+    matches!(node.and_then(|n| n.node.as_ref()), Some(Node::AConst(c)) if c.isnull || matches!(c.val, Some(Val::Sval(_))))
 }
 
 /// Whether a type is an interval, time or timestamp, whose arithmetic the engine cannot compute.
@@ -1973,6 +1984,11 @@ impl Infer<'_> {
             }
             self.assign_length(val, length);
             self.expr(val, scope);
+            // A SET value is typed as a target is, for its own refusals (round(float8, -2) has no
+            // candidate: numfuzz seed 40 at e4882aaed, answered).
+            if param(val).is_none() {
+                self.type_of(val, scope);
+            }
         }
     }
 
@@ -2732,10 +2748,31 @@ impl Infer<'_> {
                         });
                         None
                     }
+                    // The numeric functions over a string-typed argument, and round and trunc with
+                    // a scale over a float, have no PostgreSQL candidate: 42883 with the arguments'
+                    // types (numfuzz, seeds 40, 107, 155 at e4882aaed: answered over the text or
+                    // the float). An untyped literal resolves, so it is not judged.
+                    (
+                        "abs" | "sign" | "ceil" | "ceiling" | "floor" | "round" | "trunc" | "sqrt" | "exp" | "ln" | "log"
+                        | "log10" | "power" | "pow",
+                        t,
+                    ) if (matches!(category(t), Some(('S', _))) && !untyped_literal(call.args.first()))
+                        || (matches!(name.as_str(), "round" | "trunc") && call.args.len() == 2 && matches!(t, FLOAT4 | FLOAT8)) =>
+                    {
+                        let types: Vec<&str> = call
+                            .args
+                            .iter()
+                            .map(|a| if untyped_literal(Some(a)) { "unknown" } else { self.type_of(a, scope).map_or("unknown", type_name) })
+                            .collect();
+                        self.refusal(SqlErrorKind::UndefinedFunction, format!("function {}({}) does not exist", parts.join("."), types.join(", ")))
+                    }
                     ("min" | "max" | "abs" | "sign", t) => Some(t),
                     ("ceil" | "ceiling" | "floor" | "round" | "trunc", t @ (NUMERIC | FLOAT8)) => {
                         Some(t)
                     }
+                    // Over an integer or a float4 they resolve to the float8 candidate, float8 being
+                    // the numeric category's preferred type (so ceil(int) % 1.5 has no operator).
+                    ("ceil" | "ceiling" | "floor" | "round" | "trunc", INT2 | INT4 | INT8 | FLOAT4) if call.args.len() == 1 => Some(FLOAT8),
                     // PostgreSQL has these for float8 and numeric: an integer or float argument
                     // resolves to the float8 one (float8 is the numeric category's preferred type),
                     // a numeric one keeps numeric, left untyped here (the engine computes a float).
