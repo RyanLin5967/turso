@@ -2,9 +2,13 @@
 //! R1.4 restates it).
 //!
 //! Build and run it twice from one sha, both binaries' sha256 recorded before the first run:
-//! - the reading binary: `cargo test --release -p turso_core --test async_s0 -- --test-threads=1`;
-//! - the fire-check binary: the same with `--features turso_core/fe-mutants`, run once unmutated and
-//!   once per `FE_MUTANT` named below.
+//! - the reading binary: `cargo test --release -p turso_core --test async_s0 -- --test-threads=1`,
+//!   with neither switch below;
+//! - the fire-check binary: the same with `--features turso_core/fe-mutants` AND
+//!   `cargo --config 'target.<host>.rustflags=["--cfg=fe_ad_t5_firecheck"]'` (the flag lifts HIGH
+//!   F's refusal of async creates in this build alone; lead ruling, artie DECISIONS 66b4671687;
+//!   never as RUSTFLAGS, which replaces .cargo/config.toml's rustflags and is refused at compile
+//!   time), run once unmutated and once per `FE_MUTANT` named below.
 //!
 //! What this binary counts, and what it does not:
 //! - It counts the creating thread's heap allocations, through a counting `#[global_allocator]`

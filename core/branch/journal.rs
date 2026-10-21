@@ -153,8 +153,16 @@ pub(crate) struct LogBuffers {
     recycled: Vec<u8>,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test builds (engine-2bdcd32c6 LOW 6): the `LogBuffers` this thread made.
+    pub(crate) static LOG_BUFFERS_MADE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 impl LogBuffers {
     pub(crate) fn new() -> Self {
+        #[cfg(test)]
+        LOG_BUFFERS_MADE.with(|n| n.set(n.get() + 1));
         Self {
             pending: log_segment(),
             slots: Vec::with_capacity(LOG_SEGMENT_SLOTS),

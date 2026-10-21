@@ -16614,3 +16614,227 @@ fn every_call_shape_of_the_alter_rewrite_scalar_answers_as_an_unknown_function_d
         .collect();
     assert!(failed.is_empty(), "CLAIM: every call shape answers as an unknown function: {failed:#?}");
 }
+
+/// engine-2bdcd32c6 MED 1 and MED 2 (HIGH E's residual): the last handle's drop returned while the
+/// flusher's pass held the store, so `Drop`, and with it the close's flight and the release of the
+/// branch log's lock, ran later on the flusher. A process that exited then lost its creates (8 of
+/// 200 children on ecetesla4), and a reopen at once was refused, the log still held (241 of 300 on
+/// ecetesla2). Here the flusher is held inside the create's flight (`HOLD_FLIGHT_TAKEN`) while the
+/// caller drops every handle. Once that drop has returned, a reopen must succeed and find the
+/// create.
+#[test]
+fn a_close_with_the_flusher_mid_flight_releases_the_log_and_keeps_its_create() {
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+    let _s = serial();
+    let class = if cfg!(target_vendor = "apple") { SyncClass::FullFsync } else { SyncClass::Fsync };
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("close-mid-flight.db");
+    let db = open_at(&path, opts(true, class));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    let warm = trunk.create_branch_async("warm").unwrap();
+    db.branch_wait_durable(warm.token).unwrap();
+    let hold = db.branches.trunk_commit_hold.clone();
+    hold.store(super::store::HOLD_FLIGHT_TAKEN, Ordering::Release);
+    trunk.create_branch_async("mid-flight").unwrap();
+    let arrived = super::store::HOLD_FLIGHT_TAKEN | super::store::HOLD_ARRIVED;
+    let started = Instant::now();
+    while hold.load(Ordering::Acquire) != arrived {
+        if started.elapsed() > Duration::from_secs(10) {
+            hold.store(0, Ordering::Release);
+            panic!("premise: the flusher led the create's flight and was held in it");
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let dropper = std::thread::spawn(move || {
+        drop(trunk);
+        drop(db);
+        let _ = tx.send(());
+    });
+    let reopen = || try_open_at(&path, opts(true, class)).map(|db| db.branch_named("mid-flight").ok().flatten().is_some());
+    // A close that returns while the flight is held has left it, and the log, to the flusher.
+    let returned_while_held = rx.recv_timeout(Duration::from_millis(500)).is_ok();
+    let at_once = returned_while_held.then(&reopen);
+    hold.store(0, Ordering::Release);
+    if !returned_while_held {
+        rx.recv_timeout(Duration::from_secs(60)).expect("the close returned once the flight was let go");
+    }
+    dropper.join().unwrap();
+    let reopened = match at_once {
+        Some(r) => r,
+        None => reopen(),
+    };
+    // Whatever the outcome, a store the flusher may still hold is let go before the next test.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while try_open_at(&path, opts(true, class)).is_err() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        matches!(reopened, Ok(true)),
+        "CLAIM: once the close returned (it returned while the flight was held: {returned_while_held}), the \
+         log was released and the create kept: {reopened:?}"
+    );
+}
+
+/// engine-2bdcd32c6 MED 10 (engine-rev-qaf-fix2 MED 5's fix shipped without a killing test): an
+/// async create from the trunk does not wait out a trunk commit inside its commit gate (ASYNC-DESIGN
+/// §5 step 19); the branch's readers do, in `settle`. A trunk commit is held at
+/// `HOLD_TRUNK_DECIDED` while another connection creates async: the create must return while the
+/// commit is still held. Mutant `async_waits_trunk_commit`: it waits for the commit's publication,
+/// as a D2 create does.
+#[test]
+fn an_async_create_does_not_wait_out_a_trunk_commit_inside_its_gate() {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    let _s = serial();
+    let class = if cfg!(target_vendor = "apple") { SyncClass::FullFsync } else { SyncClass::Fsync };
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("async-gate.db"), opts(true, class));
+    let a = db.connect().unwrap();
+    seed(&a);
+    // A live child first: the trunk's first child is forked under the WAL write lock instead.
+    let warm = a.create_branch_async("warm").unwrap();
+    db.branch_wait_durable(warm.token).unwrap();
+    let hold = db.branches.trunk_commit_hold.clone();
+    hold.store(super::store::HOLD_TRUNK_DECIDED, Ordering::Release);
+    let writer = {
+        let a = a.clone();
+        std::thread::spawn(move || a.execute("UPDATE t SET v = 'held' WHERE id = 7").map(|_| ()))
+    };
+    wait_hold(&hold, super::store::HOLD_TRUNK_DECIDED);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let creator = {
+        let db = db.clone();
+        std::thread::spawn(move || {
+            let b = db.connect().unwrap();
+            let _ = tx.send(b.create_branch_async("behind").map(|c| c.id));
+        })
+    };
+    let while_held = rx.recv_timeout(Duration::from_secs(5));
+    let still_held = hold.load(Ordering::Acquire) == super::store::HOLD_TRUNK_DECIDED | super::store::HOLD_ARRIVED;
+    hold.store(0, Ordering::Release);
+    writer.join().unwrap().unwrap();
+    creator.join().unwrap();
+    assert!(still_held, "premise: the trunk commit was held throughout");
+    assert!(
+        matches!(while_held, Ok(Ok(_))),
+        "CLAIM: the async create returned while the trunk commit was held in its gate: {while_held:?}"
+    );
+}
+
+/// engine-2bdcd32c6 LOW 4: the close's flight of what async creates buffered (`Drop`) was not
+/// wrapped in catch_unwind, unlike the flusher's. A store dropped while its caller's thread unwinds
+/// whose flight panics then panics inside a panic, and the process aborts. A child process (this
+/// test, re-run with FE_LOW4_CHILD) holds the flusher, makes an async create, arms the
+/// `PANIC_NEXT_WAIT_FOR_TEST` failpoint and panics holding every handle; it must finish its test
+/// rather than abort.
+#[test]
+fn a_close_flight_that_panics_during_an_unwind_does_not_abort_the_process() {
+    let class = if cfg!(target_vendor = "apple") { SyncClass::FullFsync } else { SyncClass::Fsync };
+    if let Ok(path) = std::env::var("FE_LOW4_CHILD") {
+        let db = open_at(Path::new(&path), opts(true, class));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let warm = trunk.create_branch_async("warm").unwrap();
+        db.branch_wait_durable(warm.token).unwrap();
+        assert!(db.branch_flusher_hold(true), "premise: the flusher runs and is held");
+        db.branch_housekeeping_hold(true);
+        trunk.create_branch_async("unflown").unwrap();
+        super::store::PANIC_NEXT_WAIT_FOR_TEST.store(true, std::sync::atomic::Ordering::Release);
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _held = (trunk, db);
+            panic!("LOW4: the caller's own panic, with the store's last handles on its stack");
+        }));
+        assert!(caught.is_err(), "premise: the caller panicked");
+        // The close's flight took the failpoint: it panicked inside the unwind, not something else.
+        assert!(
+            !super::store::PANIC_NEXT_WAIT_FOR_TEST.load(std::sync::atomic::Ordering::Acquire),
+            "premise: the close's flight reached the failpoint and panicked"
+        );
+        println!("LOW4-CHILD-DONE");
+        return;
+    }
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("low4.db");
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "branch::fastest_tests::a_close_flight_that_panics_during_an_unwind_does_not_abort_the_process",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("FE_LOW4_CHILD", &path)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() && stdout.contains("LOW4-CHILD-DONE"),
+        "CLAIM: the child finished rather than aborting; status {:?}\nstdout, last lines first: {}\nstderr, last lines first: {}",
+        out.status,
+        stdout.lines().rev().take(15).collect::<Vec<_>>().join(" | "),
+        stderr.lines().rev().take(15).collect::<Vec<_>>().join(" | ")
+    );
+}
+
+/// engine-2bdcd32c6 LOW 5: once async had started, the close flew everything buffered, not only
+/// what async creates acknowledged: one extra sync per close, for records a store that never ran
+/// async would not fly at its close either. Two closes after every async create is durable, one
+/// with a record no create acknowledged left buffered: they issue the same syncs.
+#[test]
+fn a_close_flies_only_what_async_creates_acknowledged() {
+    let _s = serial();
+    let class = if cfg!(target_vendor = "apple") { SyncClass::FullFsync } else { SyncClass::Fsync };
+    let close_syncs = |extra: bool| {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = open_at(&dir.path().join("low5.db"), opts(true, class));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let warm = trunk.create_branch_async("warm").unwrap();
+        db.branch_wait_durable(warm.token).unwrap();
+        if extra {
+            db.branches.buffer_unacked_record_for_test();
+        }
+        drop(trunk);
+        syncs_of(|| drop(db))
+    };
+    let plain = close_syncs(false);
+    let extra = close_syncs(true);
+    assert_eq!(
+        extra, plain,
+        "CLAIM: the close synced only for what async creates acknowledged; (fsync, F_FULLFSYNC) with an \
+         unacknowledged record buffered {extra:?}, without {plain:?}"
+    );
+}
+
+/// engine-2bdcd32c6 LOW 6: d4d39bfeb makes a fresh store's log buffers (two touched 64 KiB log
+/// segments and 1,024 slots, `LogBuffers`) at EVERY open of a durable store, and an open that
+/// recovers a journal throws them away, after `fresh_again` has made another set. They are for the
+/// journal a fresh store's first create starts, so only an open that recovers none makes them: one
+/// set at a fresh open, none at a reopen that recovers a branch. Counted on this thread, which runs
+/// the open.
+#[test]
+fn only_an_open_that_recovers_no_journal_makes_log_buffers() {
+    let _s = serial();
+    let made = || super::journal::LOG_BUFFERS_MADE.with(std::cell::Cell::get);
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("low6.db");
+    let m0 = made();
+    let db = open_at(&path, opts(false, SyncClass::Off));
+    let fresh = made() - m0;
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    trunk.create_branch("kept").unwrap();
+    drop(trunk);
+    drop(db);
+    let m1 = made();
+    let db = open_at(&path, opts(false, SyncClass::Off));
+    let recovering = made() - m1;
+    assert!(db.branch_named("kept").unwrap().is_some(), "premise: the reopen recovered the branch from its journal");
+    assert_eq!(fresh, 1, "premise: a fresh open makes its first create's log buffers once");
+    assert_eq!(recovering, 0, "CLAIM: an open that recovered a journal made no log buffers; it made {recovering}");
+}
