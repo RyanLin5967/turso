@@ -2669,7 +2669,14 @@ pub fn translate_expr(
 
                         // Decode custom type columns (skipped when building ORDER BY sort keys
                         // for types without a `<` operator, so the sorter sorts on encoded values)
-                        if !program.flags.suppress_custom_type_decode() {
+                        let decode = !program.flags.suppress_custom_type_decode();
+                        // A short record's stored form, ENCODE(DEFAULT), is read for a sort key
+                        // too, where the decode is skipped: the Column default was suppressed
+                        // above either way, so the key was NULL (the plan-shape differential
+                        // 474e39596: ORDER BY v put tc's ALTER-added rows first). Mutant
+                        // `short_record_default_raw` (test builds only): only when decoding, as
+                        // before.
+                        if decode || !crate::branch::store::fe_mutant("short_record_default_raw") {
                             // For custom type columns with ENCODE and a DEFAULT,
                             // we suppressed the Column default so short records
                             // (ALTER TABLE ADD COLUMN) return NULL.  Use
@@ -2738,6 +2745,8 @@ pub fn translate_expr(
                                     }
                                 }
                             }
+                        }
+                        if decode {
                             emit_user_facing_column_value(
                                 program,
                                 target_register,
