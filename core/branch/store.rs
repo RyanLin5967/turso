@@ -1940,8 +1940,9 @@ struct CatState {
     /// batch's commit.
     links_cursor: Option<(u64, u64)>,
     /// Every row is linked and no checkpoint has committed since: the next checkpoint flips the meta
-    /// row, relinking only around its own changes. Not kept across opens: an older build may have
-    /// checkpointed in between, so every open fills again from the first row.
+    /// row, relinking only around its own changes. Not kept across opens: the next open's fill reads
+    /// the committed cursor (`link_fill`), resumes it when no checkpoint of any build has committed since
+    /// (its generation), and otherwise fills again from the first row (h1gap-rev-c LOW-1).
     links_prefilled: bool,
     /// Link fill threads this store started (observing only; links adversary 3 L2).
     links_fill_starts: u64,
@@ -3734,7 +3735,8 @@ impl Drop for CutGate<'_> {
 /// between them): link a 17-20 catalog's rows, `UPGRADE_BATCH` per transaction on the checkpoint
 /// writer, committed one by one (kill point `ckpt.upgrade.batch` after each commit), the meta row
 /// untouched: a kill between batches leaves the store at its version, with link columns its meta
-/// row says nothing about (L2: not read), which the next open fills again. The store mutex is taken
+/// row says nothing about (L2: not read), which the next open's fill resumes from the committed cursor
+/// (or starts again, when a checkpoint has committed since: h1gap-rev-c LOW-1). The store mutex is taken
 /// only to read and move the cursor. No checkpoint starts while it runs (`CatState::filling`), so
 /// no row changes under it; the next one flips the meta row (`checkpoint_write`). After the last
 /// batch the catalog's WAL, which holds every batch's pages, is backfilled and truncated here, on
@@ -6316,8 +6318,9 @@ impl BranchStore {
     fn links_fill_gate(&self, inner: &mut StoreInner) -> bool {
         let format = super::journal::format_version(inner.splice);
         // Links adversary 3: past the hard log limit no checkpoint waits for the fill. The fill
-        // stops after its batch, and the checkpoint fills the rest on the writer, in its own
-        // transaction (`checkpoint_write`). Mutant `l4_fill_waits_past_hard_limit` (test builds
+        // stops after its batch, and the checkpoint links EVERY row on the writer, in its own transaction
+        // (`checkpoint_write`'s `upgrade_links`, from the first row: h1gap-rev-c HIGH-2, an O(N) stall past
+        // the hard limit, OPEN pending a ruling; LOW-1). Mutant `l4_fill_waits_past_hard_limit` (test builds
         // only): it waits, as before.
         let past_hard = inner.journal.as_ref().is_some_and(Journal::past_hard_limit);
         let Some(cat) = inner.cat.as_mut() else {
@@ -9442,8 +9445,8 @@ impl Drop for BranchStore {
         self.flight_hold.store(0, Ordering::Release);
         #[cfg(test)]
         self.group.confirm_hold.store(0, Ordering::Release);
-        // The link fill stops after the batch it is in (links adversary L4): the next open fills
-        // again from the first row.
+        // The link fill stops after the batch it is in (links adversary L4): the next open resumes it
+        // from the committed cursor (h1gap-rev-c LOW-1).
         self.stop_links_fill();
         self.join_flights();
         // h1gap-rev-c HIGH-3: a fill that completed with no operation after it (a session that wrote in a
