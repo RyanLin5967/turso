@@ -3115,6 +3115,12 @@ impl Journal {
     /// threshold from the last cut, and the absolute limit would make every operation during its
     /// flight wait for its install. `compact_after` is 0 at open and after every cut, so otherwise
     /// nothing changes. Mutant `hard_limit_absolute` (test builds only): as before.
+    /// The log's length, and the compaction threshold it is judged against (the fill gate's bounded deferral
+    /// past the hard limit: lead ruling 2026-10-21, option (a)).
+    pub(crate) fn log_len_and_threshold(&self) -> (u64, u64) {
+        (self.len, compact_min_log_bytes().max(2 * self.snapshot_len))
+    }
+
     pub(crate) fn past_hard_limit(&self) -> bool {
         let threshold = compact_min_log_bytes().max(2 * self.snapshot_len);
         if super::store::fe_mutant("hard_limit_absolute") {
