@@ -452,6 +452,9 @@ def self_test():
         n_pass += ok
         print(f"self-test {'PASS' if ok else 'FAIL'}: {label}: want {want}, got {out}"
               + ("" if seen else " (its burners were NOT seen to run in the window record)"))
+        if not ok:
+            # the window's own VOID reasons and busy-host evidence, so a failure says what the sampler saw
+            print(f"    reasons: {decide(rec)['reasons']}; outside this self-test: {busy_evidence(rec, exclude=mine)[:4]}")
 
     # Synthetic: each rule alone, on records whose every number is chosen here (a live box's own
     # background cannot be held still: runs 37255216397 and 37255904818 voided a 3 s burner by the
