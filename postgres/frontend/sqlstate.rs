@@ -34,6 +34,7 @@ pub fn sqlstate(kind: SqlErrorKind) -> &'static str {
         UndefinedFunction => "42883",
         AmbiguousFunction => "42725",
         AmbiguousParameter => "42P08",
+        CannotCoerce => "42846",
         DuplicateAlias => "42712",
         StatementTooComplex => "54001",
         InternalError => "XX000",

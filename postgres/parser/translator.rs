@@ -3807,19 +3807,47 @@ impl PostgreSQLTranslator {
                     t.array_bounds.is_empty()
                         && t.names.last().is_some_and(|n| matches!(&n.node, Some(pg_query::protobuf::node::Node::String(s)) if s.sval == "oid"))
                 }) {
+                    use pg_query::protobuf::a_const::Val;
+                    let range = i64::from(i32::MIN)..=i64::from(u32::MAX);
+                    // oidin's value: a negative integer is its 32-bit two's complement
+                    // ((-1)::oid is 4294967295; wire-rev-351702a43 LOW-3).
+                    let unsigned = |v: i64| ast::Expr::Literal(ast::Literal::Numeric((if v < 0 { v + (1i64 << 32) } else { v }).to_string()));
                     let literal = match arg.node.as_ref() {
                         Some(pg_query::protobuf::node::Node::AConst(c)) => match &c.val {
-                            Some(pg_query::protobuf::a_const::Val::Ival(i)) => Some(i64::from(i.ival)),
-                            Some(pg_query::protobuf::a_const::Val::Fval(f)) => f.fval.parse::<i64>().ok().or(Some(i64::MAX)),
+                            Some(Val::Ival(i)) => Some(i64::from(i.ival)),
+                            Some(Val::Fval(f)) if f.fval.contains(['.', 'e', 'E']) => {
+                                return Err(ParseError::ParseError(SqlErrorMessage::classified(
+                                    SqlErrorKind::CannotCoerce,
+                                    "cannot cast type numeric to oid",
+                                )));
+                            }
+                            Some(Val::Fval(f)) => f.fval.parse::<i64>().ok().or(Some(i64::MAX)),
+                            Some(Val::Sval(sv)) => {
+                                let t = sv.sval.trim();
+                                match t.parse::<i64>() {
+                                    Ok(v) if range.contains(&v) => return Ok(unsigned(v)),
+                                    Ok(_) => {
+                                        return Err(ParseError::ParseError(SqlErrorMessage::classified(
+                                            SqlErrorKind::NumericValueOutOfRange,
+                                            format!("value \"{t}\" is out of range for type oid"),
+                                        )));
+                                    }
+                                    Err(_) => None,
+                                }
+                            }
                             _ => None,
                         },
                         _ => None,
                     };
-                    if literal.is_some_and(|v| !(i64::from(i32::MIN)..=i64::from(u32::MAX)).contains(&v)) {
-                        return Err(ParseError::ParseError(SqlErrorMessage::classified(
-                            SqlErrorKind::NumericValueOutOfRange,
-                            "OID out of range".to_string(),
-                        )));
+                    match literal {
+                        Some(v) if !range.contains(&v) => {
+                            return Err(ParseError::ParseError(SqlErrorMessage::classified(
+                                SqlErrorKind::NumericValueOutOfRange,
+                                "OID out of range".to_string(),
+                            )));
+                        }
+                        Some(v) => return Ok(unsigned(v)),
+                        None => {}
                     }
                 }
                 // A cast to date, timestamp or timestamptz goes through the engine's own type, whose
