@@ -1,0 +1,28 @@
+>> Q CREATE TABLE ci(id int, n numeric(6,2), f float8, d date)
+   C CREATE TABLE
+   Z I
+>> Q INSERT INTO ci VALUES (1, 1.50, 2.5, '2026-10-20'), (2, -2.50, 3.5, '2026-10-01')
+   C INSERT 0 2
+   Z I
+>> Q SELECT id, n::int, f::int4, n::int8 FROM ci ORDER BY id
+   T oids=[23, 23, 23, 20]
+   D ['1', '2', '2', '2']
+   D ['2', '-3', '4', '-3']
+   C SELECT 2
+   Z I
+>> Q SELECT 1.5::int2 + 1::int2, (-2.5)::int4
+   T oids=[21, 23]
+   D ['3', '-3']
+   C SELECT 1
+   Z I
+>> Q SELECT d - '2026-10-01'::date FROM ci ORDER BY id
+   T oids=[23]
+   D ['19']
+   D ['0']
+   C SELECT 2
+   Z I
+>> Q SELECT '2026-10-20'::date + 1
+   T oids=[1082]
+   D ['2026-10-21']
+   C SELECT 1
+   Z I

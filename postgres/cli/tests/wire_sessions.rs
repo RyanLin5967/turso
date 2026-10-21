@@ -12373,6 +12373,13 @@ replays_postgresql!(
     "pg18-wirefuzz-quoted_escaped_and_commented_names_are_judged_as_plain_ones.out",
     []
 );
+// wire-rev-7128c6f73 MED-4 and MED-5: a column cast to an integer is the engine's truncating CAST (a literal is rounded
+// as PG rounds it), and date arithmetic with a cast operand is the engine's (registered from the read diff).
+replays_postgresql!(
+    pg18_wirefuzz_casts_to_integers_and_date_arithmetic_over_casts_replays_as_postgresql_answered,
+    "pg18-wirefuzz-casts_to_integers_and_date_arithmetic_over_casts.out",
+    []
+);
 // wire-rev-cfdebc06d LOW-4, LOW-5: unknown + unknown is 42725, and integers cast to int2 or int8 type an operator over
 // them; text + integer in WHERE is 42883 as in PG (#9).
 replays_postgresql!(
@@ -16268,6 +16275,27 @@ fn arithmetic_over_a_numeric_cast_is_refused_not_inexact() {
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-7128c6f73 MED-4, column half (recorded on iccad2, pg18-wirefuzz-casts_to_integers_and_date_arithmetic_over_
+/// casts.out #3): a numeric column cast to an integer rounds half away from zero (1.50 is 2, -2.50 is -3) and a float8
+/// column rounds half to even (2.5 is 2, 3.5 is 4), as numeric_int4 and dtoi4 (rint) round; the engine's CAST
+/// truncated (1, -2, 2, 3).
+#[test]
+fn a_column_cast_to_an_integer_rounds_as_postgresql_rounds() {
+    let dir = Scratch::new("column-int-cast");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE TABLE ci(id int, n numeric(6,2), f float8)",
+        "INSERT INTO ci VALUES (1, 1.50, 2.5), (2, -2.50, 3.5), (3, 7, -0.5)",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    let r = a.q("SELECT n::int, f::int4, n::int2, f::int8 FROM ci ORDER BY id");
+    let row = |v: [&str; 4]| v.iter().map(|x| Some(x.to_string())).collect::<Vec<_>>();
+    let want = vec![row(["2", "2", "2", "2"]), row(["-3", "4", "-3", "4"]), row(["7", "0", "7", "0"])];
+    assert_eq!((r.rows, r.error), (want, None), "PostgreSQL rounds a numeric half away from zero and a float half to even");
 }
 
 /// wire-rev-7128c6f73 MED-4 (its PG 18.6 probe4 #144): a decimal literal cast to an integer type is rounded by PG's
