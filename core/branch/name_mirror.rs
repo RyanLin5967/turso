@@ -9,8 +9,9 @@
 //!   chunks; a name's place is `chunk << 12 | position`. A removal only counts the span as dead.
 //!   A chunk other than the one being filled whose live bytes fall below half its used bytes is
 //!   evacuated at once (its live names copied to the filling chunk, their entries re-pointed, the
-//!   chunk freed): at most 4 KiB of work, so no removal does O(N) work, and the dead bytes stay at
-//!   most the live bytes plus the filling chunk.
+//!   chunk freed), and the filling chunk is judged the same way once, when it stops filling (a name
+//!   that does not fit): at most 4 KiB of work each, so no operation does O(N) work, and the dead
+//!   bytes stay at most the live bytes plus the filling chunk.
 //! - **The table** is open addressing with linear probing over 12 B entries (the name's place, the
 //!   branch id) and a 1 B tag per bucket (0 empty, else `0x80` and the hash's top 7 bits), at a
 //!   load of at most 3/4, with backward-shift removal (no tombstones).
@@ -606,12 +607,13 @@ mod tests {
         }
     }
 
-    /// Ids above 2^32 survive the split into two halves.
     /// h1gap-rev-b HIGH 1: under create/delete churn at a constant live count, the arena stays bounded.
-    /// Each cycle inserts a name and removes it at once, so every name of the filling chunk dies WHILE that
-    /// chunk is still filling (the premise, asserted: the filling chunk observed holding dead names, its
-    /// live bytes under its used ones; FLAGGED premise repair: it first read "live 0", which cannot hold once
-    /// the fix moves the 8 kept names into each new filling chunk, measured at 7525131c7 on iccad6). A release
+    /// Each cycle inserts a name and removes it at once, so the churn names die WHILE their chunk is still
+    /// filling; the 8 kept names move into each new filling chunk, so no chunk is ever wholly dead. The
+    /// premise (FLAGGED, budgets-rev-nm-cb67 LOW-1; it first read "live 0", then "live < used", which holds
+    /// in every build after cycle 0): chunks were evacuated, and here only a retired filling chunk under
+    /// half live is (no release judges a churn name's chunk, nor a kept name's), so a retirement saw dead
+    /// spans and judged them. A release
     /// never evacuates the filling chunk, so once filling moves on such a chunk was never freed: held bytes
     /// grew with the cycles. Bound (`assert_bounded`; FLAGGED, restated per budgets-rev-nm-cb67 LOW-2 from
     /// "twice the live bytes plus two chunks", which half-live chunks with tail slack exceed): dead bytes at
@@ -623,19 +625,15 @@ mod tests {
         for k in 0..8u64 {
             m.insert(&format!("kept-{k}"), BranchId(k)).unwrap();
         }
-        let mut dead_while_filling = false;
         for i in 0..100_000u64 {
             let name = format!("churn-{i}");
             m.insert(&name, BranchId(1_000 + i)).unwrap();
             assert_eq!(m.remove(&name), Some(BranchId(1_000 + i)));
-            if let Some(c) = m.filling {
-                dead_while_filling |= m.live[c] < m.used[c];
-            }
             if i % 1_000 == 999 {
                 assert_bounded(&m, &format!("cycle {i}"));
             }
         }
-        assert!(dead_while_filling, "premise: the filling chunk never held a dead name while filling");
+        assert!(m.evacuations > 0, "premise: no retired chunk was judged under half live");
         assert_bounded(&m, "after 10^5 cycles");
         for k in 0..8u64 {
             assert_eq!(m.get(&format!("kept-{k}")), Some(BranchId(k)), "kept-{k} lost");
@@ -689,6 +687,7 @@ mod tests {
         assert!(held <= worst, "{at}: the arena holds {held} B for {live} live B (worst case {worst})");
     }
 
+    /// Ids above 2^32 survive the split into two halves.
     #[test]
     fn a_wide_id_round_trips() {
         let mut m = NameMirror::default();
