@@ -423,7 +423,13 @@ fn refuse_cross_database(
         }
     }
     // The statements whose relation the node walk does not reach (wire-rev-351702a43 MED-1: an
-    // ALTER ... RENAME renamed this database's table; COMMENT ON and DROP name theirs as lists).
+    // ALTER ... RENAME renamed this database's table; COMMENT ON and DROP name theirs as lists;
+    // wire-rev-1de981755-rest MED-3: REFERENCES, SELECT INTO, CREATE TABLE AS and CREATE or ALTER
+    // SEQUENCE acted on this database). A name list is a relation's by its object kind: a table,
+    // index, sequence, view or foreign table is its whole list; a column, or a constraint, trigger,
+    // rule or policy, is its list less the last name (MED-2: COMMENT ON COLUMN public.n.a and ON
+    // CONSTRAINT c ON public.n were read as database.schema.name and refused).
+    use turso_pg_parser::pg_query::protobuf::{ObjectType, RangeVar};
     let names = |list: &turso_pg_parser::pg_query::protobuf::Node| -> Vec<String> {
         match list.node.as_ref() {
             Some(Node::List(l)) => l
@@ -437,28 +443,88 @@ fn refuse_cross_database(
             _ => Vec::new(),
         }
     };
+    let relation_of = |kind: i32, list: Vec<String>| -> Option<Vec<String>> {
+        match ObjectType::try_from(kind).ok()? {
+            ObjectType::ObjectTable
+            | ObjectType::ObjectIndex
+            | ObjectType::ObjectSequence
+            | ObjectType::ObjectView
+            | ObjectType::ObjectMatview
+            | ObjectType::ObjectForeignTable => Some(list),
+            ObjectType::ObjectColumn
+            | ObjectType::ObjectTabconstraint
+            | ObjectType::ObjectTrigger
+            | ObjectType::ObjectRule
+            | ObjectType::ObjectPolicy => {
+                let mut list = list;
+                list.pop();
+                Some(list)
+            }
+            _ => None,
+        }
+    };
+    let mut check_list = |list: Option<Vec<String>>| -> Result<()> {
+        if let Some([database, schema, name]) = list.as_deref() {
+            check(database, schema, name)?;
+        }
+        Ok(())
+    };
+    let mut ranges: Vec<&RangeVar> = Vec::new();
+    // A REFERENCES clause: a column's or the table's constraint, or ALTER TABLE ... ADD.
+    fn constraint<'a>(n: &'a turso_pg_parser::pg_query::protobuf::Node, out: &mut Vec<&'a RangeVar>) {
+        if let Some(Node::Constraint(c)) = n.node.as_ref() {
+            if let Some(rv) = c.pktable.as_ref() {
+                out.push(rv);
+            }
+        }
+    }
     for raw in &parse.protobuf.stmts {
         match raw.stmt.as_ref().and_then(|s| s.node.as_ref()) {
-            Some(Node::RenameStmt(r)) => {
-                if let Some(rv) = r.relation.as_ref().filter(|rv| !rv.catalogname.is_empty()) {
-                    check(&rv.catalogname, &rv.schemaname, &rv.relname)?;
-                }
-            }
+            Some(Node::RenameStmt(r)) => ranges.extend(r.relation.as_ref()),
             Some(Node::DropStmt(d)) => {
                 for object in &d.objects {
-                    if let [database, schema, name] = names(object).as_slice() {
-                        check(database, schema, name)?;
-                    }
+                    check_list(relation_of(d.remove_type, names(object)))?;
                 }
             }
             Some(Node::CommentStmt(c)) => {
                 if let Some(object) = c.object.as_deref() {
-                    if let [database, schema, name] = names(object).as_slice() {
-                        check(database, schema, name)?;
+                    check_list(relation_of(c.objtype, names(object)))?;
+                }
+            }
+            Some(Node::CreateStmt(c)) => {
+                for element in &c.table_elts {
+                    match element.node.as_ref() {
+                        Some(Node::ColumnDef(d)) => d.constraints.iter().for_each(|k| constraint(k, &mut ranges)),
+                        _ => constraint(element, &mut ranges),
                     }
                 }
             }
+            Some(Node::AlterTableStmt(a)) => {
+                for cmd in &a.cmds {
+                    if let Some(Node::AlterTableCmd(c)) = cmd.node.as_ref() {
+                        if let Some(def) = c.def.as_deref() {
+                            match def.node.as_ref() {
+                                Some(Node::ColumnDef(d)) => d.constraints.iter().for_each(|k| constraint(k, &mut ranges)),
+                                _ => constraint(def, &mut ranges),
+                            }
+                        }
+                    }
+                }
+            }
+            Some(Node::SelectStmt(s)) => {
+                ranges.extend(s.into_clause.as_ref().and_then(|i| i.rel.as_ref()));
+            }
+            Some(Node::CreateTableAsStmt(c)) => {
+                ranges.extend(c.into.as_ref().and_then(|i| i.rel.as_ref()));
+            }
+            Some(Node::CreateSeqStmt(c)) => ranges.extend(c.sequence.as_ref()),
+            Some(Node::AlterSeqStmt(a)) => ranges.extend(a.sequence.as_ref()),
             _ => {}
+        }
+    }
+    for rv in ranges {
+        if !rv.catalogname.is_empty() {
+            check(&rv.catalogname, &rv.schemaname, &rv.relname)?;
         }
     }
     Ok(())
