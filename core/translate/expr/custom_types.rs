@@ -3598,4 +3598,25 @@ mod tests {
         bad.extend(diverging(&conn, &[("SELECT id, c3 FROM tr ORDER BY id", "1,1.50;2,1.50")], "PostgreSQL 18"));
         assert!(bad.is_empty(), "CLAIM: ALTER TABLE ADD COLUMN checked a domain DEFAULT unlike PostgreSQL: {bad:#?}");
     }
+
+    #[test]
+    fn probe_add_column_default_reads() {
+        let conn = open();
+        for sql in [
+            "CREATE DOMAIN dpos AS numeric(8, 2) CHECK (VALUE > 0)",
+            "CREATE TABLE tr(id INTEGER PRIMARY KEY) STRICT",
+            "INSERT INTO tr VALUES (1), (2)",
+            "ALTER TABLE tr ADD COLUMN n numeric(8, 2) DEFAULT 1.5",
+            "SELECT id, n, typeof(n) FROM tr ORDER BY id",
+            "ALTER TABLE tr ADD COLUMN d dpos DEFAULT 1.5",
+            "SELECT id, d, typeof(d) FROM tr ORDER BY id",
+            "ALTER TABLE tr ADD COLUMN v varchar(5) DEFAULT 'ab'",
+            "SELECT id, v FROM tr ORDER BY id",
+            "INSERT INTO tr(id) VALUES (3)",
+            "SELECT id, n, d, v FROM tr ORDER BY id",
+            "SELECT sql FROM sqlite_schema WHERE name = 'tr'",
+        ] {
+            println!("PROBE {sql} => {:?}", table_of(&conn, sql));
+        }
+    }
 }
