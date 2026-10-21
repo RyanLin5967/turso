@@ -1983,9 +1983,6 @@ struct CatState {
     links_prefilled: bool,
     /// Link fill threads this store started (observing only; links adversary 3 L2).
     links_fill_starts: u64,
-    /// The lead's fill-LIVENESS ruling (2026-10-21T18:01:45Z): batches the running fill spawn has recorded;
-    /// past the hard limit the gate stops a spawn only once it has one (see `links_fill_gate`).
-    links_spawn_batches: u64,
     /// A fill batch committed on this catalog, so its link columns and the cursor's table exist. Set
     /// by the fill thread the moment a batch commits, WITHOUT the store mutex (links H1 reopened: a
     /// committed batch recorded only under the mutex was starved of it by a foreground that takes it
@@ -2308,7 +2305,6 @@ impl CatState {
             links_cursor: None,
             links_prefilled: false,
             links_fill_starts: 0,
-            links_spawn_batches: 0,
             // l4-rev-h1 MED-3: a catalog reopened with its columns already made starts recorded.
             links_columns_made: Arc::new(AtomicBool::new(catalog.links())),
             links_fill_stop: Arc::new(AtomicBool::new(false)),
@@ -4059,7 +4055,6 @@ fn run_links_fill(shared: &StoreMutex, writer: &Mutex<Catalog>, group: &Group, m
         }
         if batch.is_ok() {
             cat.links_columns_made.store(true, Ordering::Release);
-            cat.links_spawn_batches += 1;
         }
         match batch {
             Ok(Some(next)) if cat.filling => {
@@ -6519,13 +6514,7 @@ impl BranchStore {
         // Only once a batch has made the link columns (and the cursor's table): the checkpoint then
         // changes no schema, which in a fuzzy flight would fail the store's pinned reads ("Database
         // schema changed", the oracle's in-flight check, raw ls-green2_131f8832a).
-        // The lead's fill-LIVENESS ruling: and only once the running spawn has recorded a batch (or no fill
-        // runs), so every spawn makes progress before a cut stops it; until then the checkpoint is deferred,
-        // as for the columns: one bounded batch of work, never a wait on the fill's whole (measured: iccad13,
-        // amendment 30, 1 of 14 spawns stopped with none). Mutant `l4_fill_stopped_before_its_batch` (test
-        // builds only): stopped at once, as before.
-        let progressed = !cat.filling || cat.links_spawn_batches > 0 || fe_mutant("l4_fill_stopped_before_its_batch");
-        if past_hard && progressed && cat.links_columns_made.load(Ordering::Acquire) && !fe_mutant("l4_fill_waits_past_hard_limit") {
+        if past_hard && cat.links_columns_made.load(Ordering::Acquire) && !fe_mutant("l4_fill_waits_past_hard_limit") {
             cat.filling = false;
             return false;
         }
@@ -6541,7 +6530,6 @@ impl BranchStore {
         }
         cat.filling = true;
         cat.links_cursor = None;
-        cat.links_spawn_batches = 0;
         // l4-rev-h1 LOW-3: a token per spawn, never one flag reset: a fill of an earlier spawn that is still
         // finishing keeps its own (stopped) token, and a stop reaches only the fill it was meant for.
         cat.links_fill_stop = Arc::new(AtomicBool::new(false));
