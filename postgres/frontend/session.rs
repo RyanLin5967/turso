@@ -709,8 +709,9 @@ impl PgConnection {
             Some(s) if s.eq_ignore_ascii_case("public") || s == "main" => vec!["main".to_string()],
             Some(s) => vec![s.to_string()],
             None => {
-                let path = self.search_path();
-                if path.is_empty() {
+                let set = !self.inner.session_state.lock().search_path.is_empty();
+                let path = effective_search_path(&self.inner);
+                if !set {
                     let mut all = vec!["main".to_string()];
                     let mut attached = self.inner.conn.attached_database_names();
                     attached.sort();
@@ -1723,7 +1724,7 @@ fn prepare_statement_parsed(
             // A parameter compared with something no context types is refused (42P18) by the
             // server, which alone reads the types the client declared (wire review 8 item 7,
             // review 11 item 1).
-            let search_path = pg_conn.session_state.lock().search_path.clone();
+            let search_path = effective_search_path(pg_conn);
             // Which attached schema holds a name, probed only when the walk resolves an
             // unqualified name through one, once per (schema, name) per statement (wire review 17
             // item 3).
@@ -1815,19 +1816,11 @@ fn prepare_statement_parsed(
 
     let options = {
         let state = pg_conn.session_state.lock();
-        let mut path = state.search_path.clone();
-        // A path entry is looked up as written, as PostgreSQL looks a schema up: one that names a
-        // schema only by folding case (a quoted 'S1' beside a schema s1) names none, and is
-        // skipped here, never handed to the engine, whose resolver folds case (seen on integration
-        // base beb4d169f: the_positional_insert_lookup_takes_the_engines_order_and_spelling
-        // inserted into s1.v). Every other entry (public, $user, a schema's exact name, a missing
-        // one) goes to the engine as written. A path all of whose entries were skipped stays a
-        // path (it names nothing), never None, which searches every schema.
-        let set = !path.is_empty();
-        if set {
-            let names = pg_conn.conn.attached_database_names();
-            path.retain(|e| names.iter().any(|n| n == e) || !names.iter().any(|n| n.eq_ignore_ascii_case(e)));
-        }
+        let set = !state.search_path.is_empty();
+        drop(state);
+        // A path all of whose entries were skipped stays a path (it names nothing), never None,
+        // which searches every schema.
+        let path = effective_search_path(pg_conn);
         PrepareOptions {
             unqualified_database_search_path: if set { Some(path) } else { None },
         }
@@ -4414,12 +4407,26 @@ fn same_relation_name(
 /// attached schema of its name, skipped when there is none ("$user", a schema not created), the
 /// first entry holding the table wins, and none holding it is 42P01. None with no path set, where
 /// the engine's default order (main, then the attached schemas) applies.
+/// The session's search path as the engine and every lookup here read it: an entry that names an
+/// attached schema only by folding case (a quoted 'S1' beside a schema s1) names none, as
+/// PostgreSQL looks a schema up as written, so it is skipped, never handed to the engine, whose
+/// resolver and column lookups fold case (seen on integration base beb4d169f:
+/// the_positional_insert_lookup_takes_the_engines_order_and_spelling inserted into s1.v). Every
+/// other entry (public, $user, a schema's exact name, a missing one) stays as written.
+pub(crate) fn effective_search_path(pg_conn: &PgConnectionInner) -> Vec<String> {
+    let mut path = pg_conn.session_state.lock().search_path.clone();
+    if !path.is_empty() {
+        let names = pg_conn.conn.attached_database_names();
+        path.retain(|e| names.iter().any(|n| n == e) || !names.iter().any(|n| n.eq_ignore_ascii_case(e)));
+    }
+    path
+}
+
 fn schema_on_search_path(pg_conn: &Arc<PgConnectionInner>, table: &str) -> Result<Option<String>> {
-    let path = pg_conn.session_state.lock().search_path.clone();
-    if path.is_empty() {
+    if pg_conn.session_state.lock().search_path.is_empty() {
         return Ok(None);
     }
-    for entry in &path {
+    for entry in &effective_search_path(pg_conn) {
         let database = if entry.eq_ignore_ascii_case("public") {
             "main"
         } else {
