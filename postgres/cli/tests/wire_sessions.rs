@@ -16102,6 +16102,36 @@ fn a_bound_exponent_or_infinity_overflows_numeric_at_bind() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-351702a43 MED-3 (its PG 18.6 probe3 #110-#112, #119, #121, #122): a NUL byte is no character of UTF8, and PG
+/// refuses a parameter holding one at Bind, 22021 'invalid byte sequence for encoding "UTF8": 0x00', in text and in
+/// binary format; std::str::from_utf8 accepts NUL, so the value was stored with it.
+#[test]
+fn a_parameter_holding_a_nul_byte_is_22021_at_bind() {
+    let dir = Scratch::new("bind-nul");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE vb(id int, v varchar(3), t text)").ok("create");
+    let mut wrong = Vec::new();
+    for (sql, value, binary) in [
+        ("INSERT INTO vb (id, v) VALUES (1, $1)", &b"ab\0"[..], false),
+        ("INSERT INTO vb (id, v) VALUES (2, $1)", &b"ab\0"[..], true),
+        ("INSERT INTO vb (id, t) VALUES (3, $1)", &b"a\0b"[..], false),
+        ("INSERT INTO vb (id, t) VALUES (4, $1)", &b"a\0b"[..], true),
+    ] {
+        let codes: &[i16] = if binary { &[1] } else { &[] };
+        let (types, error) = a.bind_round(sql, codes, &[Some(value)], &[]);
+        let message = "invalid byte sequence for encoding \"UTF8\": 0x00";
+        if types.contains(&b'2') || !error.as_ref().is_some_and(|e| e.code == "22021" && e.message == message) {
+            wrong.push(format!("{sql} (binary {binary}): messages {:?} error {error:?}, PostgreSQL: no BindComplete, 22021 {message}", String::from_utf8_lossy(&types)));
+        }
+    }
+    let r = a.q("SELECT count(*) FROM vb");
+    if r.rows != vec![vec![Some("0".to_string())]] {
+        wrong.push(format!("vb holds {:?} rows, want 0", r.rows));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-351702a43 MED-2 (its PG 18.6 probe3 #77-#81): a CAST to NUMERIC(p, s) with p <= 15 holds its value
 /// exactly as the engine's REAL, but arithmetic and sum over it are REAL arithmetic: 0.10 + 0.20 answered
 /// 0.30000000000000004 and = 0.3 answered f, where PG answers 0.30 and t. Such arithmetic and sum/avg over the cast are
