@@ -7103,6 +7103,8 @@ impl BranchStore {
         }
         let id = BranchId(inner.next_id);
         let (records, lease) = inner.fork_records(id, BranchId::TRUNK, now, name);
+        // The fill gate's B (the bounded deferral past the hard limit): the forks since the last cut.
+        self.forks_since_cut.fetch_add(1, Ordering::AcqRel);
         if let Some((_, stamped)) = lease {
             inner.lease.queued(stamped);
         }
@@ -7192,6 +7194,8 @@ impl BranchStore {
         }
         let id = BranchId(inner.next_id);
         let (records, lease) = inner.fork_records(id, parent, now, name);
+        // The fill gate's B (the bounded deferral past the hard limit): the forks since the last cut.
+        self.forks_since_cut.fetch_add(1, Ordering::AcqRel);
         if let Some((_, stamped)) = lease {
             inner.lease.queued(stamped);
         }
@@ -10027,8 +10031,6 @@ impl StoreInner {
         // Mutant M-d (PREREG v1 amendment 36): the fork record written without its parent (as the
         // trunk's child, whatever the parent was).
         let logged_parent = if fe_mutant("fork_without_parent") { 0 } else { parent.0 };
-        // The fill gate's B (the bounded deferral past the hard limit): the forks since the last cut.
-        self.forks_since_cut.fetch_add(1, Ordering::AcqRel);
         let mut records = vec![match name {
             None => Record::Fork {
                 child: child.0,
