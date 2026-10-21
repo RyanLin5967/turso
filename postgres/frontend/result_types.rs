@@ -588,6 +588,14 @@ pub fn computed_targets(parse: &ParseResult) -> Vec<bool> {
                     && func_name(call).is_some_and(|n| scalar_result(&n).is_some())
                     && call.args.iter().all(|a| plain(a, false))
             }
+            // A CASE is typed by its results, each one the walk types (wire-rev-351702a43 LOW-6: the
+            // engine announced CASE WHEN .. THEN 1 .. END as text).
+            Some(Node::CaseExpr(c)) => {
+                c.args.iter().all(|w| match w.node.as_ref() {
+                    Some(Node::CaseWhen(w)) => w.result.as_deref().is_some_and(|r| plain(r, false)),
+                    _ => false,
+                }) && c.defresult.as_deref().is_none_or(|d| plain(d, false))
+            }
             // An operand cast to a type the walk names (2::int2 in 2::int2 + 2::int2 is int2, where
             // the engine's INTEGER announced int4; wire-rev-cfdebc06d LOW-5).
             Some(Node::TypeCast(c)) => {
