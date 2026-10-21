@@ -16817,3 +16817,46 @@ fn a_failed_shutdown_wal_sync_fail_stops_a_store_with_an_undrained_release() {
         );
     }
 }
+
+/// fe-mutkill (survivor of the f4683e89d lib sweep): a trunk WAL sync that fails after the commit
+/// yielded on it aborts the statement without coming back to the commit, so the commit gate's
+/// close acts on the noted failure (engine review 9 #10, pager.rs `close_trunk_gate`). Its test,
+/// `every_trunk_wal_sync_failure_site_fail_stops_on_its_own`, runs on Apple only: in a D1 store off
+/// Apple, a commit's barrier has drained every branch record before its WAL sync, so nothing is at
+/// risk when that sync fails. Here nothing drains: a D0 store with an undrained fork, the trunk at
+/// synchronous=NORMAL (its barrier syncs nothing), the WAL emptied so the next commit writes and
+/// syncs its header first, and that header sync's completion failed before it is returned
+/// (FailWalSyncIo mode 2), so the commit yields on it. The commit fails, and a fork from a fresh
+/// connection is refused. Both stores. Mutant `wal_fail_stop_not_at_close`.
+#[test]
+fn a_yielded_wal_header_sync_failure_fail_stops_at_the_gates_close() {
+    use std::sync::atomic::Ordering as O;
+    let _s = serial();
+    for catalog in [false, true] {
+        let what = format!("catalog={catalog}");
+        let dir = tempfile::TempDir::new().unwrap();
+        let (db, armed) = open_failing_wal(&dir.path().join("gate-close.db"), opts(catalog, SyncClass::Off));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        let _b = trunk.fork_branch().unwrap().into_id();
+        trunk.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        trunk.execute("PRAGMA synchronous = NORMAL").unwrap();
+        trunk.execute("PRAGMA data_sync_retry = 1").unwrap();
+        assert!(
+            drained(&db) < db.branches.durable_for_test(SyncClass::Off),
+            "{what}: premise: the fork is written and not drained"
+        );
+        armed.store(2, O::Release);
+        let committed = trunk.execute("UPDATE t SET v = 'new' WHERE id = 7");
+        assert_eq!(armed.load(O::Acquire), 0, "{what}: premise: the WAL header's sync was reached");
+        assert!(committed.is_err(), "{what}: premise: the failed header sync failed the commit");
+        assert!(
+            drained(&db) < db.branches.durable_for_test(SyncClass::Off),
+            "{what}: premise: the fork was still undrained when the sync failed"
+        );
+        assert_fail_stopped(
+            db.connect().unwrap().fork_branch().map(|x| x.into_id()),
+            &format!("{what}: the next fork after a WAL header sync failed after its commit yielded"),
+        );
+    }
+}
