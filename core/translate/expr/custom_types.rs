@@ -4793,4 +4793,20 @@ mod tests {
         }
         assert!(bad.is_empty(), "CLAIM: ALTER COLUMN to a domain did not check or convert existing rows: {bad:#?}");
     }
+
+    /// Adopted verbatim from engine-rev-types-08caaec44 (artie 8319b0a45e,
+    /// frontier/fastest/reviews/REVIEW-engine-types-08caaec44.md and raw-engine-types-08caaec44/
+    /// zz_rev08c.rs.txt); its expected values are that review's PostgreSQL 18.6 recordings
+    /// (raw-engine-types-08caaec44/p*.pgout.txt), never ours.
+    /// MED: a window's max and min over numeric with a moving frame compare as numeric, as OVER () does.
+    #[test]
+    fn rev08c_a_moving_window_max_over_numeric_compares_as_numeric() {
+        let conn = open();
+        let bad = diverging_after(&conn, &REV08C_N, &[
+            ("SELECT id, max(b) OVER () FROM n WHERE id = 4", "4,10.00"),
+            ("SELECT id, max(b) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM n WHERE b IS NOT NULL ORDER BY id", "1,1.00;2,2.00;4,10.00;5,10.00;6,9.50"),
+            ("SELECT id, min(b) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM n WHERE b IS NOT NULL ORDER BY id", "1,1.00;2,1.00;4,2.00;5,9.50;6,-3.25"),
+        ]);
+        assert!(bad.is_empty(), "CLAIM: a moving window max/min over numeric did not compare as numeric: {bad:#?}");
+    }
 }
