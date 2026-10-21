@@ -6004,6 +6004,7 @@ fn pg_binary_to_value(bytes: &[u8], pg_type: &Type, n: usize) -> PgWireResult<Va
         ))
     };
     let text = |b: &[u8]| -> PgWireResult<Value> {
+        refuse_nul(b)?;
         std::str::from_utf8(b)
             .map(|s| Value::from_text(s.to_owned()))
             .map_err(|e| {
@@ -6075,11 +6076,25 @@ fn pg_binary_to_value(bytes: &[u8], pg_type: &Type, n: usize) -> PgWireResult<Va
 }
 
 /// Convert raw parameter bytes to a turso Value based on the PostgreSQL type.
+/// A NUL byte is no character of UTF8: PostgreSQL's input (pg_verify_mbstr) refuses a parameter
+/// holding one, 22021, in text format for every type and in binary for text, varchar and char.
+/// std::str::from_utf8 accepts NUL, so the value was stored with it (wire-rev-351702a43 MED-3).
+fn refuse_nul(bytes: &[u8]) -> PgWireResult<()> {
+    if bytes.contains(&0) {
+        return Err(PgWireError::UserError(error(
+            SqlErrorKind::CharacterNotInRepertoire,
+            "invalid byte sequence for encoding \"UTF8\": 0x00".to_string(),
+        )));
+    }
+    Ok(())
+}
+
 /// Assumes text format encoding (UTF-8 string representations). A value the type cannot read is
 /// refused as the type's input function refuses it: 22P02 for bad syntax, 22003 for a value outside
 /// the type, 22023 for bad bytea hex; they were XX000, and no integer's range below int8 was checked
 /// (wire review 13 item 8, review 14 item 28).
 fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
+    refuse_nul(bytes)?;
     let text = std::str::from_utf8(bytes).map_err(|e| {
         PgWireError::UserError(error(
             SqlErrorKind::CharacterNotInRepertoire,
