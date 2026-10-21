@@ -839,6 +839,63 @@ pub(crate) fn emit_dml_expr_index_value(
     Ok(())
 }
 
+/// The type chain whose ENCODEs make the stored form of `column`'s DEFAULT, for a raw (stored-form)
+/// read of the column: Some when the column has a DEFAULT and its STRICT type chain ENCODEs. A row
+/// from before ALTER TABLE ADD COLUMN has no field for the column, and the Column instruction's
+/// default is the DEFAULT as written, not what an INSERT stores (engine-rev-types-08caaec44 HIGH 4:
+/// CREATE INDEX over such rows held 1.5 where the rows read 1.50, so a seek missed them). The
+/// caller suppresses the Column default and calls `emit_short_record_stored_default`. Mutant
+/// `short_record_default_raw` (test builds only): None, as before.
+pub(crate) fn stored_default_chain(
+    resolver: &Resolver,
+    column: &Column,
+    is_strict: bool,
+) -> Option<Vec<Arc<TypeDef>>> {
+    if column.default.is_none()
+        || column.is_rowid_alias()
+        || column.is_array()
+        || crate::branch::store::fe_mutant("short_record_default_raw")
+    {
+        return None;
+    }
+    let resolved = resolver.schema().resolve_type(&column.ty_str, is_strict).ok().flatten()?;
+    resolved
+        .chain
+        .iter()
+        .any(|td| td.encode().is_some())
+        .then(|| resolved.chain.iter().cloned().collect())
+}
+
+/// After a raw read of `column` (index `column_idx` of `cursor_id`'s table) into `dest`, with the
+/// Column default suppressed: for a short record, ENCODE(DEFAULT) through `chain`
+/// (`stored_default_chain`), the stored form an INSERT would have written.
+pub(crate) fn emit_short_record_stored_default(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    cursor_id: usize,
+    column_idx: usize,
+    column: &Column,
+    chain: &[Arc<TypeDef>],
+    dest: usize,
+) -> Result<()> {
+    let Some(default_expr) = column.default.as_deref() else {
+        return Ok(());
+    };
+    let done = program.allocate_label();
+    program.emit_column_has_field(cursor_id, column_idx, done);
+    translate_expr_no_constant_opt(program, None, default_expr, dest, resolver, NoConstantOptReason::RegisterReuse)?;
+    let skip = program.allocate_label();
+    program.emit_insn(Insn::IsNull { reg: dest, target_pc: skip });
+    for td in chain {
+        if let Some(encode_expr) = td.encode() {
+            emit_type_expr(program, encode_expr, dest, dest, column, td, resolver)?;
+        }
+    }
+    program.preassign_label_to_next_insn(skip);
+    program.preassign_label_to_next_insn(done);
+    Ok(())
+}
+
 /// Emit bytecode that transforms a stored column value into its user-facing
 /// representation.
 ///

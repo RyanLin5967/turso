@@ -1163,7 +1163,25 @@ fn emit_index_column_value_from_cursor(
             }
         }
     } else {
+        // A row from before ADD COLUMN reads the stored form of the DEFAULT, as the table's
+        // values are stored (`stored_default_chain`; engine-rev-types-08caaec44 HIGH 4).
+        let column = table.columns().get(idx_col.pos_in_table);
+        let chain = column.and_then(|c| crate::translate::expr::stored_default_chain(resolver, c, table.is_strict));
+        if chain.is_some() {
+            program.flags.set_suppress_column_default(true);
+        }
         program.emit_column_or_rowid(table_cursor_id, idx_col.pos_in_table, dest_reg);
+        if let (Some(chain), Some(column)) = (chain, column) {
+            crate::translate::expr::emit_short_record_stored_default(
+                program,
+                resolver,
+                table_cursor_id,
+                idx_col.pos_in_table,
+                column,
+                &chain,
+                dest_reg,
+            )?;
+        }
     }
     Ok(())
 }
