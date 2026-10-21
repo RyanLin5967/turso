@@ -16705,18 +16705,16 @@ fn a_fuzzy_checkpoint_leaves_a_small_catalog_wal_untruncated() {
     assert!(after >= before, "CLAIM: the {before}-byte catalog WAL was truncated to {after} bytes by the checkpoint");
 }
 
-/// fe-mutkill (survivor of the f4683e89d lib sweep): LEAP L3's cohort gather holds for at most
+/// fe-mutkill (survivor of the f4683e89d lib sweep): LEAP L3's cohort gather is bounded by
 /// `GroupState::gather_bound`, a tenth of the p50 flight, not the fixed 50 us it held before
 /// (`COHORT_GATHER_FIXED`, which expired before nearly every cohort was back). Every syncing flight
-/// is held 500 ms in the air (`journal::FLIGHT_SYNC_DELAY_US`), so the bound is at least 50 ms;
-/// with a cohort of 8 owed and the creator alone, the next create's leader gathers and its hold
-/// expires at the bound: it is held at least 25 ms (a lower bound, which load only lengthens).
-/// Mutant `cohort_gather_fixed`.
-///
-/// FLAGGED TEST EDIT (own test, 2a8a50439, never ruled; strengthens, no claim changed): at 100 ms
-/// and a 5 ms threshold the mutant's 50 us hold read 1.10 ms on a loaded ecetesla1 (raw
-/// mutkill-a-ecetesla1 cgf-mut), a 4.5x margin against a false survival; the delay is raised five
-/// times so a descheduled mutant needs 25 ms, not 5, to pass.
+/// is held 100 ms in the air (`journal::FLIGHT_SYNC_DELAY_US`), so the p50 is at least 100 ms and the
+/// bound at least 10 ms; with a cohort of 8 owed and the creator alone, the next create's leader
+/// gathers and its hold expires at the bound. The claim reads the STATE of that gather, the bound it
+/// was held to (`last_gather_bound_ns`), against the test's own 100 ms (never the subject's p50
+/// function), and never its wall time: the lead ruled 0d556c8e7's
+/// widened timing threshold no discriminator (LEAD-RULINGS.md, 2026-10-21), and load only
+/// lengthens a hold. Mutant `cohort_gather_fixed` (the bound is 50 us whatever the flights).
 #[test]
 fn a_cohort_gather_holds_for_its_flight_derived_bound() {
     struct Delay;
@@ -16727,7 +16725,7 @@ fn a_cohort_gather_holds_for_its_flight_derived_bound() {
     }
     let _s = serial();
     let _delay = Delay;
-    super::journal::FLIGHT_SYNC_DELAY_US.store(500_000, std::sync::atomic::Ordering::Release);
+    super::journal::FLIGHT_SYNC_DELAY_US.store(100_000, std::sync::atomic::Ordering::Release);
     let dir = tempfile::TempDir::new().unwrap();
     let db = open_at(&dir.path().join("gather-bound.db"), opts(false, SyncClass::Fsync));
     let trunk = db.connect().unwrap();
@@ -16736,15 +16734,15 @@ fn a_cohort_gather_holds_for_its_flight_derived_bound() {
         trunk.create_branch(&format!("timed-{i}")).unwrap();
     }
     db.branches.set_cohort_for_test(8);
-    let (g0, ns0) = (db.branches.gather_counters(), db.branches.gather_and_flight_ns());
+    let g0 = db.branches.gather_counters();
     trunk.create_branch("gathered").unwrap();
-    let (g1, ns1) = (db.branches.gather_counters(), db.branches.gather_and_flight_ns());
+    let g1 = db.branches.gather_counters();
     assert_eq!(g1[0] - g0[0], 1, "premise: the create's leader held one cohort gather");
     assert_eq!(g1[1] - g0[1], 1, "premise: the gather expired at its bound (the cohort never came back)");
-    let held = std::time::Duration::from_nanos(ns1[0] - ns0[0]);
+    let bound = db.branches.last_gather_bound_ns();
     assert!(
-        held >= std::time::Duration::from_millis(25),
-        "CLAIM: the gather held {held:?}, under half the bound a 500 ms flight sets (at least 50 ms)"
+        bound >= 10_000_000,
+        "CLAIM: the gather was bounded at {bound} ns, under a tenth of the 100 ms every flight was held"
     );
 }
 

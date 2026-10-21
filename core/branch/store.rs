@@ -585,6 +585,9 @@ struct GroupState {
     /// flights (the pwrite and its sync), over every gather and flight.
     gather_ns: u64,
     flight_ns: u64,
+    /// Observation only: the bound the last gather was held to, ns (the state a test reads in
+    /// place of the hold's wall time, which load lengthens; lead ruling on 0d556c8e7).
+    last_gather_bound_ns: u64,
     /// The last `FLIGHT_TIMES` flights' durations, ns (the pwrite and its sync), and how many
     /// flights were timed: the device p50 the gather is bounded by.
     flight_times: [u64; FLIGHT_TIMES],
@@ -6719,6 +6722,7 @@ impl BranchStore {
                 {
                     g.gathering = true;
                     g.gathers += 1;
+                    g.last_gather_bound_ns = u64::try_from(bound.as_nanos()).unwrap_or(u64::MAX);
                     group.gather_cut.store(false, Ordering::Release);
                     drop(g);
                     let held_from = Instant::now();
@@ -7248,6 +7252,11 @@ impl BranchStore {
     pub(crate) fn gather_and_flight_ns(&self) -> [u64; 2] {
         let g = self.group.lock();
         [g.gather_ns, g.flight_ns]
+    }
+
+    /// Observation only: the bound the last cohort gather was held to, ns.
+    pub(crate) fn last_gather_bound_ns(&self) -> u64 {
+        self.group.lock().last_gather_bound_ns
     }
 
     /// Grant or extend `id`'s lease to `ttl` past the lease clock's now. A deadline only moves
