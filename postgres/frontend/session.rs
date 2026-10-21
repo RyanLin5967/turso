@@ -400,21 +400,61 @@ fn refuse_cross_database(
     if sql.bytes().filter(|&b| b == b'.').nth(1).is_none() {
         return Ok(());
     }
+    use turso_pg_parser::pg_query::protobuf::node::Node;
     let mut this = None;
-    for (n, ..) in parse.protobuf.nodes() {
-        let NodeRef::RangeVar(rv) = n else { continue };
-        if rv.catalogname.is_empty() {
-            continue;
-        }
+    let mut check = |database: &str, schema: &str, name: &str| -> Result<()> {
         let this = this.get_or_insert_with(|| crate::catalog::database_name(pg_conn.conn.as_ref()));
-        if rv.catalogname != *this {
+        if database != this.as_str() {
             return Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
                 SqlErrorKind::FeatureNotSupported,
-                format!(
-                    "cross-database references are not implemented: \"{}.{}.{}\"",
-                    rv.catalogname, rv.schemaname, rv.relname
-                ),
+                format!("cross-database references are not implemented: \"{database}.{schema}.{name}\""),
             )));
+        }
+        Ok(())
+    };
+    for (n, ..) in parse.protobuf.nodes() {
+        let NodeRef::RangeVar(rv) = n else { continue };
+        if !rv.catalogname.is_empty() {
+            check(&rv.catalogname, &rv.schemaname, &rv.relname)?;
+        }
+    }
+    // The statements whose relation the node walk does not reach (wire-rev-351702a43 MED-1: an
+    // ALTER ... RENAME renamed this database's table; COMMENT ON and DROP name theirs as lists).
+    let names = |list: &turso_pg_parser::pg_query::protobuf::Node| -> Vec<String> {
+        match list.node.as_ref() {
+            Some(Node::List(l)) => l
+                .items
+                .iter()
+                .filter_map(|i| match i.node.as_ref() {
+                    Some(Node::String(s)) => Some(s.sval.clone()),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    };
+    for raw in &parse.protobuf.stmts {
+        match raw.stmt.as_ref().and_then(|s| s.node.as_ref()) {
+            Some(Node::RenameStmt(r)) => {
+                if let Some(rv) = r.relation.as_ref().filter(|rv| !rv.catalogname.is_empty()) {
+                    check(&rv.catalogname, &rv.schemaname, &rv.relname)?;
+                }
+            }
+            Some(Node::DropStmt(d)) => {
+                for object in &d.objects {
+                    if let [database, schema, name] = names(object).as_slice() {
+                        check(database, schema, name)?;
+                    }
+                }
+            }
+            Some(Node::CommentStmt(c)) => {
+                if let Some(object) = c.object.as_deref() {
+                    if let [database, schema, name] = names(object).as_slice() {
+                        check(database, schema, name)?;
+                    }
+                }
+            }
+            _ => {}
         }
     }
     Ok(())
