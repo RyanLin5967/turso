@@ -16436,6 +16436,35 @@ fn a_decimal_past_15_digits_is_refused_on_every_path() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-351702a43 LOW-8 and wire-rev-7128c6f73 L5 (probe3 #44, #48; probe4 #167, #168): a quoted "MAX" is not max
+/// (PG's names are case-sensitive once quoted) and public.max is no function, so PG refuses both 42883 and names them as
+/// written; the walk folded "MAX" to max, and public.max answered a row (null, typed 25).
+#[test]
+fn a_quoted_or_qualified_max_that_names_no_function_is_42883() {
+    let dir = Scratch::new("quoted-max");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in ["CREATE TABLE rb(id int, b boolean)", "INSERT INTO rb VALUES (1, true)"] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    for (sql, message) in [
+        ("SELECT \"MAX\"(id) FROM rb", "function MAX(integer) does not exist"),
+        ("SELECT public.max(b) FROM rb", "function public.max(boolean) does not exist"),
+        ("SELECT public.max(id) FROM rb", "function public.max(integer) does not exist"),
+    ] {
+        let r = a.q(sql);
+        if !r.error.as_ref().is_some_and(|e| e.code == "42883" && e.message == message) {
+            wrong.push(format!("{sql}: rows {:?} error {:?}, PostgreSQL 42883 {message}", r.rows, r.error));
+        }
+    }
+    let r = a.q("SELECT max(id), pg_catalog.max(id) FROM rb");
+    if r.error.is_some() || r.rows != vec![vec![Some("1".to_string()), Some("1".to_string())]] {
+        wrong.push(format!("max and pg_catalog.max: rows {:?} error {:?}, PostgreSQL 1, 1", r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-7128c6f73 L6 (its PG 18.6 probe4 #50, #62-#64): a type change whose stored form is the same is not one the
 /// engine would keep unconverted: numeric(10,2) to numeric(12,2) (the scale kept, the precision widened), float8 to double
 /// precision and boolean to boolean. They were refused 0A000 with "the engine would keep the column's values
