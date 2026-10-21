@@ -6,8 +6,12 @@
 set -u
 SHA=${1:?sha}; SEEDS=${2:?seeds}; N=${3:-40}; H=$PWD; O=$H/out; mkdir -p "$O"
 PGBIN=${PGBIN:-/var/tmp/r226lin-wire/pg18/inst/bin}
-for t in 13 12 11; do [ -f /opt/rh/gcc-toolset-$t/enable ] && { source /opt/rh/gcc-toolset-$t/enable; break; }; done
-if [ -d /usr/lib64/llvm17/lib ]; then export LIBCLANG_PATH=/usr/lib64/llvm17/lib; else export LIBCLANG_PATH=/usr/lib/llvm-18/lib; fi
+# gcc-toolset only on RHEL: eceubuntu2 has an /opt/rh tree whose linker finds no crt files (uwtest.sh, 5fde7d497d).
+[ -f /etc/redhat-release ] && for t in 13 12 11; do [ -f /opt/rh/gcc-toolset-$t/enable ] && { source /opt/rh/gcc-toolset-$t/enable; break; }; done
+# The first directory holding a libclang (ecetesla4 has llvm-17 without one and llvm-21 with one).
+for d in /usr/lib64/llvm17/lib /usr/lib/llvm-18/lib /usr/lib/llvm-21/lib /usr/lib/llvm-17/lib /usr/lib/x86_64-linux-gnu; do
+  ls $d/libclang.so* $d/libclang-*.so* >/dev/null 2>&1 && { export LIBCLANG_PATH=$d; break; }
+done
 export BINDGEN_EXTRA_CLANG_ARGS="-I$(gcc -print-file-name=include)" PATH="$HOME/.cargo/bin:$PATH" CARGO_INCREMENTAL=0
 export CARGO_TARGET_DIR=${WF_TARGET:-/var/tmp/r226lin-wire/target}
 PY="uv run -p 3.12 --no-project python -B"
