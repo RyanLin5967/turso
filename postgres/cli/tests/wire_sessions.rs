@@ -12701,7 +12701,7 @@ replays_postgresql!(
     "pg18-audit1-lib-parameters_decode_at_postgresqls_edges.out",
     [
         (1, "PGDIV-PUBLIC-SCHEMA-NOOP cluster-state [cluster]: DROP SCHEMA IF EXISTS public CASCADE answers DROP SCHEMA without dropping, so CREATE SCHEMA public fails 42601 'schema \"public\" already exists'"),
-        (12, "PGDIV-NUMERIC-AS-FLOAT value [engine]: SILENT: numeric param 1e-400 answers '0' where PG answers the exact 0.(399 zeros)1; the numeric decode underflows"),
+        (12, "PGDIV-NUMERIC-LITERAL-WIDE refused [wire]: a numeric parameter 1e-400, outside a double's range, is refused 0A000 at Bind where PG answers its exact value (it answered 0; wire-rev-1de981755-numeric HIGH-6)"),
     ]
 );
 replays_postgresql!(
@@ -13339,8 +13339,8 @@ replays_postgresql!(
     pg18_c33_replays_as_postgresql_answered,
     "pg18-c33.out",
     [
-        (13, "PGDIV-NUMERIC-AS-FLOAT value [engine]: SILENT: 0x_7FFF_FFFF_FFFF_FFFF_F answers '1.4757395258967641e+20' typed 701; PG exact 147573952589676412927 typed 1700"),
-        (17, "PGDIV-NUMERIC-AS-FLOAT value [engine]: SILENT: SELECT 9223372036854775808 answers '9.223372036854776e+18' typed 701; PG exact numeric 9223372036854775808"),
+        (13, "PGDIV-NUMERIC-LITERAL-WIDE refused [wire]: 0x_7FFF_FFFF_FFFF_FFFF_F, past int8, is refused 0A000 where PG answers 147573952589676412927 (it answered 1.4757395258967641e+20; wire-rev-1de981755-numeric HIGH-4)"),
+        (17, "PGDIV-NUMERIC-LITERAL-WIDE refused [wire]: SELECT 9223372036854775808, past int8, is refused 0A000 where PG answers the exact numeric"),
         (19, "PGDIV-NEG-ZERO value [engine]: SILENT: SELECT -0.0 answers '-0' typed 701; PG numeric '0.0'"),
         (20, "PGDIV-NEG-ZERO value [engine]: SILENT: SELECT -0.0::float8 answers '0'; PG '-0' (cast binds before unary minus)"),
         (22, "PGDIV-NEG-ZERO value [engine]: SILENT: '-0'::numeric answers '-0' typed 701; PG '0' typed 1700"),
@@ -13479,7 +13479,7 @@ replays_postgresql!(
     pg18_num_replays_as_postgresql_answered,
     "pg18-num.out",
     [
-        (4, "PGDIV-NUMERIC-AS-FLOAT value [engine]: SILENT: SELECT 0x_7FFF_FFFF_FFFF_FFFF_F answers float '1.4757395258967641e+20' typed 701; PG exact 147573952589676412927 numeric"),
+        (4, "PGDIV-NUMERIC-LITERAL-WIDE refused [wire]: SELECT 0x_7FFF_FFFF_FFFF_FFFF_F, past int8, is refused 0A000 where PG answers 147573952589676412927"),
     ]
 );
 replays_postgresql!(
@@ -16461,6 +16461,189 @@ fn a_bound_nan_is_refused_never_stored_as_null() {
     let r = a.q("SELECT count(*) FROM nb");
     if r.rows != vec![vec![Some("0".to_string())]] {
         wrong.push(format!("nb holds {:?} rows after the refusals, want 0", r.rows));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-4a1934c89-beb4 MED-1 (its PG 18.6 probe #15, #17-#19): PG analyses a multi-row VALUES row by row and an ON
+/// CONFLICT SET after its VALUES, so one $1 assigned to a numeric column in one row and a varchar column in another, or
+/// in VALUES and again in the SET, runs (INSERT 0 2; the upsert); only a single row or a single SET list assigning two
+/// types is 42P08. e4e8bea44 refused all three shapes.
+#[test]
+fn one_parameter_in_two_rows_or_in_values_and_set_runs() {
+    let dir = Scratch::new("inconsistent-scopes");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE mix(id int PRIMARY KEY, x numeric(6,2), v varchar(3))").ok("create");
+    let mut wrong = Vec::new();
+    for (sql, values) in [
+        ("INSERT INTO mix VALUES (2, $1, 'b'), (3, 4, $1)", vec![&b"5"[..]]),
+        ("INSERT INTO mix VALUES ($1, 1, 'd') ON CONFLICT (id) DO UPDATE SET v = $1", vec![&b"2"[..]]),
+        ("INSERT INTO mix VALUES (4, $1, 'e') ON CONFLICT (id) DO UPDATE SET v = $1", vec![&b"7"[..]]),
+    ] {
+        let values: Vec<Option<&[u8]>> = values.into_iter().map(Some).collect();
+        let (types, error) = a.bind_round(sql, &[], &values, &[]);
+        if error.is_some() {
+            wrong.push(format!("{sql}: messages {:?} error {error:?}, PostgreSQL runs it", String::from_utf8_lossy(&types)));
+        }
+    }
+    let (types, error) = a.bind_round("UPDATE mix SET x = $1, v = $1 WHERE id = 2", &[], &[Some(b"1")], &[]);
+    if !error.as_ref().is_some_and(|e| e.code == "42P08") {
+        wrong.push(format!("one SET list, two types: messages {:?} error {error:?}, PostgreSQL 42P08", String::from_utf8_lossy(&types)));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-4a1934c89-beb4 MED-3, MED-4, MED-5 (its PG 18.6 probe #142-#158, probe2 #24-#45, #268, #270): a quoted
+/// "Public" on the search path names no schema (public is lower case), so v resolves past it to s1.v, and alone it
+/// leaves v unresolved (42P01); ours read and wrote public.v. An unqualified CREATE TABLE is made in the first schema of
+/// the path that exists, and with none it is 3F000; ours always made it in public. pg_catalog and information_schema
+/// are found whatever the path names; under a path naming nothing they vanished (42601 'no such object').
+#[test]
+fn the_search_path_is_read_as_written_for_public_create_and_the_catalog() {
+    let dir = Scratch::new("search-path-written");
+    // The branch server refuses CREATE SCHEMA: the schema is made by the CLI first.
+    cli_script(
+        &dir,
+        b"CREATE TABLE v(a int, d text);\n\
+          INSERT INTO v VALUES (1, 'pub');\n\
+          CREATE SCHEMA s1;\n\
+          CREATE TABLE s1.v(a int, d text);\n\
+          INSERT INTO s1.v VALUES (1, 'lower');\n",
+    );
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    a.q("SET search_path TO \"Public\", s1").ok("path");
+    let r = a.q("SELECT d FROM v");
+    if r.rows != vec![vec![Some("lower".to_string())]] {
+        wrong.push(format!("\"Public\", s1: v read {:?} {:?}, PostgreSQL s1.v ('lower')", r.rows, r.error));
+    }
+    a.q("INSERT INTO v VALUES (34, 'ins')").ok("insert");
+    a.q("SET search_path TO public").ok("reset");
+    let r = a.q("SELECT (SELECT count(*) FROM s1.v), (SELECT count(*) FROM public.v)");
+    if r.rows != vec![vec![Some("2".to_string()), Some("1".to_string())]] {
+        wrong.push(format!("the INSERT under \"Public\", s1 landed: s1.v, public.v counts {:?}, PostgreSQL 2, 1", r.rows));
+    }
+    a.q("SET search_path TO \"Public\"").ok("path");
+    let r = a.q("SELECT d FROM v");
+    if r.error.as_ref().map(|e| e.code.as_str()) != Some("42P01") {
+        wrong.push(format!("\"Public\" alone: rows {:?} error {:?}, PostgreSQL 42P01", r.rows, r.error));
+    }
+    a.q("SET search_path TO s1").ok("path");
+    a.q("CREATE TABLE made_in_s1(a int)").ok("create under s1");
+    a.q("SET search_path TO public").ok("reset");
+    if a.q("SELECT count(*) FROM s1.made_in_s1").error.is_some() {
+        wrong.push("CREATE TABLE under search_path s1 did not make s1.made_in_s1".to_string());
+    }
+    if a.q("SELECT count(*) FROM public.made_in_s1").error.is_none() {
+        wrong.push("CREATE TABLE under search_path s1 made public.made_in_s1".to_string());
+    }
+    a.q("SET search_path TO \"nosuch\"").ok("path");
+    let r = a.q("CREATE TABLE nowhere(a int)");
+    if !r.error.as_ref().is_some_and(|e| e.code == "3F000" && e.message == "no schema has been selected to create in") {
+        wrong.push(format!("CREATE TABLE under a path naming nothing: {:?}, PostgreSQL 3F000", r.error));
+    }
+    for sql in ["SELECT count(*) > 0 FROM pg_catalog.pg_class", "SELECT count(*) > 0 FROM information_schema.tables"] {
+        let r = a.q(sql);
+        if r.error.is_some() || r.rows != vec![vec![Some("t".to_string())]] {
+            wrong.push(format!("{sql} under \"nosuch\": rows {:?} error {:?}, PostgreSQL t", r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-4a1934c89-beb4 MED-7 and MED-2 (its PG 18.6 probe #284, #290): now() and transaction_timestamp() are the
+/// transaction's start, the same in every statement of a block; statement_timestamp() is the statement's start; and
+/// clock_timestamp() is read at each call. now() was read at each call (two statements of one block stored two values),
+/// and on the integration line clock_timestamp() became constant within a query.
+#[test]
+fn the_time_functions_keep_postgresqls_volatility() {
+    let dir = Scratch::new("time-functions");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE tn(id int, t text, s text)").ok("create");
+    for sql in ["BEGIN", "INSERT INTO tn SELECT 1, now()::text, statement_timestamp()::text"] {
+        a.q(sql).ok(sql);
+    }
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    for sql in ["INSERT INTO tn SELECT 2, transaction_timestamp()::text, statement_timestamp()::text", "COMMIT"] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    let r = a.q("SELECT count(DISTINCT t), count(DISTINCT s) FROM tn");
+    if r.rows != vec![vec![Some("1".to_string()), Some("2".to_string())]] {
+        wrong.push(format!("one block: distinct now() and statement_timestamp() {:?} {:?}, PostgreSQL 1 and 2", r.rows, r.error));
+    }
+    let r = a.q("SELECT count(DISTINCT clock_timestamp()::text) > 1 FROM generate_series(1, 300000)");
+    if r.rows != vec![vec![Some("t".to_string())]] {
+        wrong.push(format!("clock_timestamp() within a query: {:?} {:?}, PostgreSQL t", r.rows, r.error));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-1de981755-numeric HIGH-2, HIGH-4, HIGH-5, HIGH-6 (its PG 18.6 probe8 #22-#29, #48-#58): the literal
+/// refusal's own holes. A hex literal past int8 has fewer than 16 decimal digits, so the pre-filter skipped it
+/// (0xFFFFFFFFFFFFFFFF answered 1.8446744073709552e+19); a '-' after a keyword operand was read as a sign, so 2^63
+/// passed as int8's least; 1e400 and 1e-400 hold one digit yet are no double (Infinity, 0). Each is refused 0A000.
+/// And a bound integer-shaped numeric was decoded through f64: '9007199254740993' was stored ...992; it is the
+/// integer.
+#[test]
+fn the_long_numeric_refusal_has_no_spelling_holes() {
+    let dir = Scratch::new("numeric-holes");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in ["CREATE TABLE pz(id int, n numeric(30,0), b bigint)", "INSERT INTO pz VALUES (1, 1, 1)"] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    for sql in [
+        "SELECT 0xFFFFFFFFFFFFFFFF",
+        "SELECT 0x_7FFF_FFFF_FFFF_FFFF_F",
+        "INSERT INTO pz (id, n) VALUES (10, 0xFFFFFFFFFFFFFFFF)",
+        "SELECT b::bigint -9223372036854775808 FROM pz",
+        "SELECT CASE WHEN true THEN 1 END -9223372036854775808",
+        "SELECT 1e400",
+        "SELECT 1e-400",
+    ] {
+        let r = a.q(sql);
+        if r.error.as_ref().map(|e| e.code.as_str()) != Some("0A000") {
+            wrong.push(format!("{sql}: rows {:?} error {:?}, refused 0A000", r.rows, r.error));
+        }
+    }
+    let r = a.q("SELECT -9223372036854775808");
+    if r.error.is_some() || r.rows != vec![vec![Some("-9223372036854775808".to_string())]] {
+        wrong.push(format!("SELECT -9223372036854775808: rows {:?} error {:?}, PostgreSQL int8's least", r.rows, r.error));
+    }
+    for declared in [false, true] {
+        let mut parse = vec![0u8];
+        parse.extend_from_slice(b"INSERT INTO pz (id, n) VALUES (2, $1)\0");
+        if declared {
+            parse.extend_from_slice(&1i16.to_be_bytes());
+            parse.extend_from_slice(&1700i32.to_be_bytes());
+        } else {
+            parse.extend_from_slice(&0i16.to_be_bytes());
+        }
+        a.send(b'P', &parse);
+        let value = b"9007199254740993";
+        let mut bind = vec![0u8, 0u8];
+        bind.extend_from_slice(&0i16.to_be_bytes());
+        bind.extend_from_slice(&1i16.to_be_bytes());
+        bind.extend_from_slice(&(value.len() as i32).to_be_bytes());
+        bind.extend_from_slice(value);
+        bind.extend_from_slice(&0i16.to_be_bytes());
+        a.send(b'B', &bind);
+        a.send(b'E', &[0, 0, 0, 0, 0]);
+        a.send(b'S', &[]);
+        let r = a.read_reply();
+        if r.error.is_some() {
+            wrong.push(format!("bound 9007199254740993 (declared {declared}): {:?}", r.error));
+        }
+        let r = a.q("SELECT n FROM pz WHERE id = 2");
+        if r.rows != vec![vec![Some("9007199254740993".to_string())]] {
+            wrong.push(format!("stored (declared {declared}): {:?}, PostgreSQL 9007199254740993", r.rows));
+        }
+        a.q("DELETE FROM pz WHERE id = 2").ok("delete");
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }

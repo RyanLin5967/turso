@@ -1,3 +1,4 @@
+mod aliases;
 mod catalog;
 mod copy;
 mod functions;

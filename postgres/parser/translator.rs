@@ -407,10 +407,13 @@ impl PostgreSQLTranslator {
             name
         };
         let mut qn = match schema_qualifier(&range_var.schemaname) {
-            // pg_catalog's relations stay unqualified, as the engine finds its catalog tables.
-            SchemaQualifier::Unqualified
-            | SchemaQualifier::PgCatalog
-            | SchemaQualifier::InformationSchema => ast::QualifiedName::single(name),
+            SchemaQualifier::Unqualified => ast::QualifiedName::single(name),
+            // pg_catalog's and information_schema's relations are the main database's virtual
+            // tables, named there whatever the search path: unqualified, a path naming no existing
+            // schema hid them (wire-rev-4a1934c89-beb4 MED-3).
+            SchemaQualifier::PgCatalog | SchemaQualifier::InformationSchema => {
+                ast::QualifiedName::fullname(pg_name("main"), name)
+            }
             // An explicit public is the main database's relation whatever the search path: read
             // as unqualified, `INSERT INTO public.t` under `search_path TO s, public` wrote into
             // s.t (wire review 17 item 1).
@@ -6353,7 +6356,16 @@ pub fn decimal_past_float8(text: &str) -> bool {
         return false;
     }
     let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
-    digits.trim_start_matches('0').trim_end_matches('0').len() > 15
+    let significant = digits.trim_start_matches('0').trim_end_matches('0');
+    if significant.len() > 15 {
+        return true;
+    }
+    // At most 15 digits round-trip through a double only inside its normal range: 1e400 is
+    // Infinity and 1e-400 is 0 as a REAL (wire-rev-1de981755-numeric HIGH-6).
+    match body.parse::<f64>() {
+        Ok(v) => !significant.is_empty() && (!v.is_finite() || v.abs() < f64::MIN_POSITIVE),
+        Err(_) => false,
+    }
 }
 
 /// A numeric literal as libpg_query hands it (an integer past int4 arrives as text, not Ival), in
