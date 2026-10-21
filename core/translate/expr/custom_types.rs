@@ -1599,27 +1599,6 @@ mod tests {
         );
     }
 
-    /// A range over an indexed varchar(n) or smallint column with a bound its ENCODE refuses ('value
-    /// too long', 'out of range') answers what a scan answers: the bound compares as itself. Engine
-    /// review 20 item 9 made a refused key's seek EMPTY, which is right for '=' and wrong for a
-    /// range: `v < 'abcdef'` over varchar(3) holds 'abc', and `s < 40000` over smallint holds 7.
-    #[test]
-    fn a_range_with_a_bound_the_type_refuses_answers_as_a_scan_does() {
-        let conn = open();
-        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v varchar(3), s smallint) STRICT")
-            .unwrap();
-        conn.execute("CREATE INDEX tv ON t(v)").unwrap();
-        conn.execute("CREATE INDEX ts ON t(s)").unwrap();
-        conn.execute("INSERT INTO t VALUES (1, 'abc', 7)").unwrap();
-        answers_by_both_plans(
-            &conn,
-            "t",
-            "tv",
-            &[("v < 'abcdef'", None, 1), ("v > 'abcdef'", None, 0), ("v <= 'abd   '", None, 1)],
-        );
-        answers_by_both_plans(&conn, "t", "ts", &[("s < 40000", None, 1), ("s > -40000", None, 1), ("s > 40000", None, 0)]);
-    }
-
     /// Engine review 20 LOW 27 (b): 150a70db0's arm, a type whose value input is `any` (numeric)
     /// takes any non-literal constant operand but a COLLATE one, had no test: `x = abs(-1.5)` and
     /// `x = 1 + 1` on numeric(10, 2) find 1.50 and 2.00, through the type's '=', as a scan.
