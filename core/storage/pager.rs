@@ -3992,6 +3992,11 @@ impl Pager {
     pub(crate) fn note_trunk_wal_sync(&self, c: &Completion) {
         if self.branch_store.get().is_some() {
             let previous = self.trunk_wal_sync.lock().replace(c.clone());
+            eprintln!(
+                "PROBE note_trunk_wal_sync: new finished={}; previous {:?}",
+                c.finished(),
+                previous.as_ref().map(|p| (p.finished(), p.succeeded()))
+            );
             if previous.is_some_and(|p| p.finished() && !p.succeeded()) {
                 self.trunk_wal_sync_failed();
             }
@@ -4007,6 +4012,20 @@ impl Pager {
     pub(crate) fn check_noted_syncs(&self) {
         let failed = {
             let mut noted = self.trunk_wal_sync.lock();
+            eprintln!(
+                "PROBE check_noted_syncs: {}\n{}",
+                match noted.as_ref() {
+                    None => "none".to_string(),
+                    Some(c) => format!("finished={} succeeded={}", c.finished(), c.succeeded()),
+                },
+                std::backtrace::Backtrace::force_capture()
+                    .to_string()
+                    .lines()
+                    .filter(|l| l.contains("turso_core::") && !l.contains("backtrace"))
+                    .take(8)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
             match noted.as_ref() {
                 Some(c) if c.finished() => noted.take().is_some_and(|c| !c.succeeded()),
                 _ => false,
