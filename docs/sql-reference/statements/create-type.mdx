@@ -198,7 +198,7 @@ When the type's input is a primitive (`varchar`'s is text), the operand is conve
 
 ## CHECK Constraints with Custom Types
 
-In STRICT tables with custom types, a table CHECK constraint reads the column's **stored** form, and a CAST yields the type's value (see CAST Support), so for a type whose ENCODE changes the value (as `cents` below) the two sides are not on the same scale. A domain's CHECK reads the domain's value. The CHECK type check requires a CAST when a column of a custom type is compared with a literal:
+In STRICT tables with custom types, CHECK constraints operate on the **decoded** (presentation) values, and a CAST yields the type's value (see CAST Support), so both sides of a comparison are values. When comparing a column of a custom type against a literal, use CAST to give the literal the column's type:
 
 ```sql
 CREATE TYPE cents BASE integer

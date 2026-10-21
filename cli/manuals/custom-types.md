@@ -333,13 +333,13 @@ In STRICT tables, CHECK constraint comparisons are type-checked at table creatio
 -- ERROR: type mismatch in CHECK constraint (cents vs INTEGER)
 CREATE TABLE t1(amount cents CHECK(amount < 50)) STRICT;
 
--- Accepted: CAST converts the literal to cents, both sides have the same type
+-- OK: CAST converts the literal to cents, both sides have the same type
 CREATE TABLE t1(amount cents CHECK(amount < CAST(50 AS cents))) STRICT;
 ```
 
-Note: a table CHECK reads the column's stored form, while a CAST yields the type's value (see CAST
-Support). For a type whose ENCODE changes the value (as `cents` multiplies by 100), the two sides of
-such a CHECK are not on the same scale. A domain's CHECK reads the domain's value.
+A CHECK reads the column's value, not its stored form, and a CAST yields the type's value (see CAST
+Support), so both sides are values: with `cents` storing 4000 for 40, `INSERT INTO t1 VALUES (40)`
+passes and `VALUES (60)` fails. A domain's CHECK reads the domain's value the same way.
 
 This rule applies to all comparisons in STRICT tables, not just custom types:
 
