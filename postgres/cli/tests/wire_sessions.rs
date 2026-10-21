@@ -17328,6 +17328,41 @@ fn a_text_column_cast_to_an_integer_is_read_as_int4in_reads_it() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-4a1934c89-beb4 LOW-6 (recorded on iccad2 PG 18.6, a_qualified_name_names_its_schema_as_written.out): a
+/// qualifier names its schema as written, folded to lower case unless quoted, so q1.u and Q1.u name no relation when
+/// the schema is "Q1": 42P01 'relation "q1.u" does not exist', and CREATE TABLE q1.v is 3F000 'schema "q1" does not
+/// exist'. The engine folds case, so q1.u read and wrote "Q1".u.
+#[test]
+fn a_qualified_name_names_its_schema_as_written() {
+    let dir = Scratch::new("qual-case");
+    cli_script(&dir, b"CREATE SCHEMA \"Q1\";\nCREATE TABLE \"Q1\".u(a INT);\nINSERT INTO \"Q1\".u VALUES (7);\n");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let missing = Err(("42P01", "relation \"q1.u\" does not exist"));
+    let mut wrong = Vec::new();
+    for (sql, want) in [
+        ("SELECT a FROM q1.u", missing),
+        ("SELECT a FROM Q1.u", missing),
+        ("SELECT a FROM \"Q1\".u", Ok(vec!["7"])),
+        ("INSERT INTO q1.u VALUES (8)", missing),
+        ("UPDATE q1.u SET a = 9", missing),
+        ("DELETE FROM q1.u", missing),
+        ("SELECT count(*) FROM \"Q1\".u", Ok(vec!["1"])),
+        ("SELECT a FROM \"Q1\".u", Ok(vec!["7"])),
+        ("CREATE TABLE q1.v(a int)", Err(("3F000", "schema \"q1\" does not exist"))),
+    ] {
+        let r = a.q(sql);
+        let agrees = match want {
+            Ok(rows) => r.error.is_none() && r.rows == rows.iter().map(|v| vec![Some(v.to_string())]).collect::<Vec<_>>(),
+            Err((code, message)) => r.error.as_ref().is_some_and(|e| e.code == code && e.message == message),
+        };
+        if !agrees {
+            wrong.push(format!("{sql}: PG {want:?}; got {:?} {:?}", r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-351702a43 LOW-6 (its PG 18.6 probe3 #161): a CASE is typed by its results (an int4 constant and an int4
 /// function: 23); the walk never typed a CASE column, and the engine announced it text (25).
 #[test]
