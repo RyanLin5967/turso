@@ -3762,13 +3762,18 @@ impl PostgreSQLTranslator {
                         } else {
                             inner
                         };
-                        return Ok(ast::Expr::FunctionCall {
-                            name: pg_name("substr"),
-                            distinctness: None,
-                            args: vec![Box::new(inner), lit(1), lit(n)],
-                            order_by: vec![],
-                            within_group: vec![],
-                            filter_over: ast::FunctionTail { filter_clause: None, over_clause: None },
+                        // The cut is a TEXT, so a view's or derived table's column over it is a string
+                        // column: a bare substr() call's was typed bytea (wire-rev-1de981755-rest MED-5).
+                        return Ok(ast::Expr::Cast {
+                            expr: Box::new(ast::Expr::FunctionCall {
+                                name: pg_name("substr"),
+                                distinctness: None,
+                                args: vec![Box::new(inner), lit(1), lit(n)],
+                                order_by: vec![],
+                                within_group: vec![],
+                                filter_over: ast::FunctionTail { filter_clause: None, over_clause: None },
+                            }),
+                            type_name: Some(ast::Type { name: "TEXT".to_string(), size: None, array_dimensions: 0 }),
                         });
                     }
                 }
