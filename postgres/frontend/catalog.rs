@@ -4466,6 +4466,24 @@ mod dialect_switch_tests {
         );
     }
 
+    /// core-integrator on integration base beb4d169f: the engine now stores a rewritten row of this
+    /// frontend's own (a RENAME's rebuilt CREATE) through `format_rewritten_table_sql`, whose default
+    /// passes the canonical SQLite text to `format_table_sql` as if it were the client's DDL; it was
+    /// marked as PostgreSQL text, so the next open parsed `... STRICT` with libpg_query and the
+    /// server did not start ("syntax error at or near STRICT"). The row a rewrite stores reads back.
+    #[test]
+    fn a_rewritten_table_row_reads_back() {
+        let created = "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT) STRICT";
+        let (Some(turso_parser::ast::Cmd::Stmt(stmt)), _) = turso_core::dialect::sqlite::parse(created).unwrap() else {
+            panic!("premise: SQLite parses the rebuilt CREATE");
+        };
+        assert!(turso_pg_parser::parse(created).is_err(), "premise: libpg_query refuses STRICT");
+        let stored = PostgresDialect.format_rewritten_table_sql(&stmt).unwrap();
+        let table = PostgresDialect.parse_table_sql(&stored, 2);
+        assert!(table.is_ok(), "the stored row {stored:?} does not read back: {:?}", table.err());
+        assert!(PostgresDialect.parse_table_sql_ast(&stored).is_ok(), "parse_table_sql_ast refuses {stored:?}");
+    }
+
     /// Review wire-line3 LOW-2: a table created before the marker refusal (f8f0d4b13) may be
     /// stored as client text that starts with the SQLite marker. Its replay text (VACUUM) must not
     /// start with the marker, or the replay reads the client's PostgreSQL DDL as SQLite.
