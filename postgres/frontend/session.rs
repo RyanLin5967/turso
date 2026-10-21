@@ -3,7 +3,6 @@ use std::num::NonZero;
 use std::str;
 use std::sync::Arc;
 
-use crate::aliases;
 use crate::catalog::{self, PostgresDialect};
 use crate::result_types::StatementTypes;
 use turso_core::{Connection, LimboError, PrepareOptions, Result, Statement, Value};
