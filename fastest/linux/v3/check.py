@@ -28,17 +28,18 @@ import v3cell  # noqa: E402
 
 
 def current_f3_sync_record(sy):
-    """Shared acceptance predicate for banked F3 fixtures and their regenerator."""
+    """Shared acceptance predicate for banked F3 fixtures and their regenerator (codex C05), on V3 review 13 item 19's
+    schema (DECISIONS d9c7b1dc85): unattributed is exactly {"foreign_fd": 0} (an int 0), the nosync25 arm carries no
+    syncs_inside_any_fd key, and every arm's windows_over is 0. real_selftest and regen_f3.py both call this one."""
     if not isinstance(sy, dict):
         return False
     ua = sy.get("unattributed")
     arms = sy.get("arms")
-    return (isinstance(ua, dict)
-            and sorted(ua) == ["foreign_fd", "inside_foreign_fd", "inside_no_fd", "no_fd"]
-            and all(v == 0 for v in ua.values())
+    return (isinstance(ua, dict) and list(ua) == ["foreign_fd"]
+            and type(ua["foreign_fd"]) is int and ua["foreign_fd"] == 0
             and isinstance(arms, dict) and bool(arms)
             and isinstance(arms.get("nosync25"), dict)
-            and arms["nosync25"].get("syncs_inside_any_fd") == 0
+            and "syncs_inside_any_fd" not in arms["nosync25"]
             and all(isinstance(v, dict) and v.get("windows_over") == 0 for v in arms.values()))
 
 # ---- the spec -----------------------------------------------------------------------------------------------
@@ -141,6 +142,10 @@ REFUSALS = {
     # and unknown-key rules had no plant
     "R_reg_dupkey": "is given twice",
     "R_reg_unknownkey": "is not frame_arm or a d0_threshold",
+    # V3 review 13 item 12: the d0-threshold value rule's own text (it had no plant; e454c84bd printed the generic
+    # byte/shape text for both)
+    "R_reg_d0bad": "is not a plain decimal threshold above 1",
+    "R_reg_d0edge": "is not a plain decimal threshold above 1",
 }
 # run.sh refusals: tag -> the refusing rule's own reason PREFIX (rc 2, no out dir, no probe run). Every planted
 # verdict also carries "planted", so a bare word ("plan", "cell", "arch") would match whatever rule fired (fresh
@@ -187,8 +192,9 @@ POST_COND = {"R_post_layerflush": lambda cell, leaf: v3cell.is_loop(cell) or lea
 # the fire-check harness a verdict vouches for (fourth review L9: the fixtures' and plants' sources, the banked test
 # data, the loop maker and the workflow too); a missing file is a mismatch
 HARNESS = ["run.sh", "batchgate.py", "check.py", "blkflush.py", "stamp.py", "v3cell.py", "firecheck.sh", "crash.sh",
-           "mkfixtures.sh", "nestloops.sh", "mkbrd.sh", "red.py", "postplant.py", "nsfake.sh", "build.sh", "REGISTERED.tsv",
+           "mkfixtures.sh", "mkbrd.sh", "red.py", "postplant.py", "nsfake.sh", "build.sh", "REGISTERED.tsv",
            "statfs_shim.c", "noop_shim.c",
+           "nestloops.sh",  # V3 review 13 item 9: the one nest matcher, sourced by firecheck.sh and mkfixtures.sh
            "../fs/mkloop.sh",
            "../../../.github/workflows/fastest-v3.yml"]
 
@@ -1190,18 +1196,26 @@ def self_test():
     # fdatasync4k only (the frame arm runs with fsync and is not a candidate, even when registered), on raw nanosecond
     # p50s (two arms within 0.1 us must not split), and the frame variant label for the registered frame arm
 
-    def frp(sj, p50ns):
-        try:
-            return floor_reference_problems(sj, p50ns)
-        except TypeError as e:  # the base takes no raw p50s
-            return [("the floor rule reads no raw p50s", repr(e))]
+    def frp_run(fn, cases):
+        """[(name, ok, passed, got)] of the floor-reference cases with fn as floor_reference_problems, called directly.
+        V3 review 13 item 14: the a8b6e5d89 `except TypeError` shim that stood here turned a TypeError raised INSIDE
+        the rule into a problem list, so every ok=False case passed on a crash; now any exception fails its case, ok
+        or not (it is recorded, never read as a refusal), and the registered mutant below must fail every case."""
+        out = []
+        for name, sj, ns, ok in cases:
+            try:
+                got, exc = fn(sj, ns), None
+            except Exception as e:  # noqa: BLE001 -- a crash is a FAIL of the case, whatever it expected
+                got, exc = None, repr(e)
+            out.append((name, ok, exc is None and (got == []) is ok, exc or got))
+        return out
 
     def fsj(p50us, fr, frame="ow4k", variant="fdatasync4k (ow4k + fdatasync)"):
         return {"arms": {a: {"p50_us": v} for a, v in p50us.items()}, "frame_arm": frame, "floor_frame_variant": variant,
                 "floor_reference": fr}
     cheap_ow4k = {"append25": 875.1, "fdatasync4k": 900.0, "ow4k": 800.3}
     cheap_ns = {"append25": 875100, "fdatasync4k": 900000, "ow4k": 800300}
-    for name, sj, ns, ok in (
+    frp_cases = (
             ("frame_arm ow4k registered and cheapest, the reference append25 (the probe's pick)",
              fsj(cheap_ow4k, {"arm": "append25", "barrier": "fsync", "p50_us": 875.1}), cheap_ns, True),
             ("frame_arm ow4k registered and cheapest, the reference ow4k (fsync, not a candidate)",
@@ -1221,9 +1235,15 @@ def self_test():
              cheap_ns, False),
             ("no frame arm registered, the variant label missing",
              fsj({"append25": 400.0, "fdatasync4k": 200.0}, {"arm": "fdatasync4k", "barrier": "fdatasync", "p50_us": 200.0},
-                 None, None), {"append25": 400000, "fdatasync4k": 200000}, False)):
-        got = frp(sj, ns)
-        chk("floor reference: %s -> %s" % (name, "pass" if ok else "refused"), (got == []) is ok, got)
+                 None, None), {"append25": 400000, "fdatasync4k": 200000}, False))
+    for name, ok, passed, got in frp_run(floor_reference_problems, frp_cases):
+        chk("floor reference: %s -> %s" % (name, "pass" if ok else "refused"), passed, got)
+
+    def frp_mutant(sj, p50ns):  # V3 review 13 item 14's registered mutant: a TypeError raised inside the rule
+        raise TypeError("planted inside floor_reference_problems")
+    survived = [name for name, ok, passed, got in frp_run(frp_mutant, frp_cases) if passed]
+    chk("floor reference (review 13 item 14): a rule that raises TypeError inside fails EVERY case (none passes as "
+        "'refused')", not survived, survived)
     chk("MODE SENSE bytes: a sub-page (SPF) page is not a caching page",
         wce_from_hex(hexs.replace("page at 8 08", "page at 8 48"))[0] is None)
     # sixth review H1: the box and the plan it selects
@@ -1304,28 +1324,121 @@ def self_test():
              False),
             ("a block cell whose rebuild ignored V3_NEST_DIR", "/mnt/fastest-v3-xfs", "/mnt/fastest-v3-xfs/v3fx-n1.img",
              "/v3fx-n1.img", False),
+            # V3 review 13 item 6: the first build off the cell's directory, the rebuild on it (the suite had only the
+            # reverse); item 2's ext4 case (cell dir on '/') belongs to codex card C06, which changes the judge to
+            # "same filesystem"
+            ("a block cell whose FIRST build ignored V3_NEST_DIR, its rebuild on the cell dir", "/mnt/fastest-v3-xfs",
+             "/v3fx-n1.img", "/mnt/fastest-v3-xfs/v3fx-n1.img", False),
             ("no cell dir derived", "", "/v3fx-n1.img", "/v3fx-n1.img", False),
             ("no first-build n1 recorded", "/", "", "/v3fx-n1.img", False)):
         with patch.object(os, "stat", side_effect=nest_fixture_stat):
             got = nnp(cdir, first, rebuilt) if nnp else ["(no nest_n1_problems in check.py)"]
-        chk("nest n1 (review 12 item 5): %s -> %s" % (name, "pass" if ok else "fail"), (got == []) is ok, got)
+        # [V3 review 13 item 6, disclosed STRENGTHENING: with the function absent, got was a one-element placeholder,
+        # so `(got == []) is ok` passed every ok=False case at 167dd51be; an absent function now fails every case]
+        chk("nest n1 (review 12 item 5): %s -> %s" % (name, "pass" if ok else "fail"), nnp is not None and ((got == []) is ok),
+            got)
+    # V3 review 13 item 7: P_nest_modes' unrelated mounted loop (and nbx) must come through --teardown-nest untouched,
+    # and on a MOUNTED loop `losetup -d` changes neither the device, the backing file nor the mount: it only sets
+    # AUTOCLEAR. So the record is `losetup -n -O NAME,BACK-FILE,AUTOCLEAR` (xargs-joined) before and after, which must
+    # be equal with AUTOCLEAR 0, and the mount still there (expectations by hand)
+    npp = globals().get("nest_plant_problems")
+    b0 = "/dev/loop20 /mnt/v3fx/nb/teardown-plant.img 0"
+    for name, before, after, mounted, ok in (
+            ("untouched: same device, backing, AUTOCLEAR 0, still mounted", b0, b0, "yes", True),
+            ("`losetup -d` on the mounted loop (AUTOCLEAR set, all else the same)", b0,
+             "/dev/loop20 /mnt/v3fx/nb/teardown-plant.img 1", "yes", False),
+            ("detached (no line after)", b0, "", "yes", False),
+            ("unmounted", b0, b0, "", False),
+            ("no plant recorded before", "", b0, "yes", False),
+            ("AUTOCLEAR already set before", "/dev/loop20 /mnt/v3fx/nb/teardown-plant.img 1",
+             "/dev/loop20 /mnt/v3fx/nb/teardown-plant.img 1", "yes", False),
+            ("a record without the AUTOCLEAR field (the NAME,BACK-FILE form)", "/dev/loop20 /mnt/v3fx/nb/teardown-plant.img",
+             "/dev/loop20 /mnt/v3fx/nb/teardown-plant.img", "yes", False),
+            ("re-attached to another device", b0, "/dev/loop21 /mnt/v3fx/nb/teardown-plant.img 0", "yes", False)):
+        got = npp(before, after, mounted) if npp else ["(no nest_plant_problems in check.py)"]
+        chk("nest plant (review 13 item 7): %s -> %s" % (name, "pass" if ok else "fail"),
+            npp is not None and ((got == []) is ok), got)
     # V3 review 12 item 1 (HIGH): ONE anchored nest-chain matcher, nestloops.sh, sourced by mkfixtures.sh and
     # firecheck.sh. Its own self-test runs canned `losetup --list -n -O NAME,BACK-FILE` listings (/mnt/v3fx/nb/x.img,
-    # nbx's backing, is NOT the chain; n1..n4's images and v3fx-n1.img are) and a losetup that fails (which must
-    # never read as "nothing attached"); and neither script may keep a copy of the old prefix matcher
+    # nbx's backing, is NOT the chain; n1..n4's images and v3fx-n1.img are; a level's files, nest_level_match) and a
+    # losetup that fails (which must never read as "nothing attached")
+    # [V3 review 13 item 20, disclosed: the source-text check that followed ("one matcher": no `awk -v b="$base/n"`
+    # in either script) is DELETED as the review directs: it read text, and could not see the per-level sweep's own
+    # `awk -v b="$mp/"`; that sweep now calls nestloops.sh's nest_level_match, pinned by its canned cases above]
     import subprocess as _sp12
     nl = os.path.join(HERE, "nestloops.sh")
     r12 = _sp12.run(["bash", nl, "--self-test"], capture_output=True, text=True, timeout=120) if os.path.exists(nl) else None
     chk("nestloops.sh --self-test: the one anchored nest-chain matcher on canned listings (nb/x.img is not the chain; a "
         "failing losetup is an error)", r12 is not None and r12.returncode == 0 and "NESTLOOPS SELF-TEST" in r12.stdout
         and " PASS" in r12.stdout, (r12.returncode, r12.stdout[-300:], r12.stderr[-200:]) if r12 else "nestloops.sh absent")
-    copies = []
-    for nm12 in ("mkfixtures.sh", "firecheck.sh"):
-        t12 = rd(os.path.join(HERE, nm12))
-        if t12 is None or 'awk -v b="$base/n"' in t12 or 'awk -v b="$FX/n"' in t12 or '/nestloops.sh"' not in t12:
-            copies.append(nm12)
-    chk("one matcher: mkfixtures.sh and firecheck.sh source nestloops.sh and keep no copy of the old prefix matcher",
-        not copies, copies)
+    # V3 review 13 item 8: teardown_nest's OUTCOME check (no loop still backed by the chain at the end) had never fired
+    # alone, and item 13's red was not isolating. mkfixtures.sh --teardown-nest runs here on a temp BASE with PATH
+    # shims (nestloops.sh's technique): sudo runs its command, mountpoint and findmnt say nothing is mounted, and
+    # losetup lists FAKE_LOOPS and, with FAKE_DETACH=1, `-d DEV` removes DEV's line. The one loop is
+    # /dev/loopfake9 backed by /elsewhere/v3fx-n1.img: no level's sweep matches it, only the final chain_loops sweep
+    # does, and /sys/block/loopfake9 cannot exist, so detach_loop's wait passes. Expectations by hand:
+    #   T1 FAKE_DETACH=0: every step reports success, the loop stays listed -> rc 1, "loops still backed by the chain"
+    #   T2 FAKE_DETACH=1 (control): the final sweep detaches it -> rc 0, no such line
+    #   T3 item 13's mutant (the final sweep deleted from a copy), FAKE_DETACH=1 -> rc 1, the outcome check names it
+    import tempfile as _tf8, shutil as _sh8
+    mk8 = os.path.join(HERE, "mkfixtures.sh")
+    sweep8 = '''  # n1's image held by a loop that is not n1's mount (a failed mount, a second attach): detach it too
+  strays=$(chain_loops) || { echo "teardown: cannot list the loops (losetup failed)"; rc=1; strays=""; }
+  for stray in $strays; do
+    found=1
+    detach_loop "$stray" "n1's image" && echo "teardown: detached $stray, still backed by the chain" || rc=1
+  done
+'''
+    td8 = _tf8.mkdtemp(prefix="check-teardown8-")
+    try:
+        sh8 = os.path.join(td8, "shim")
+        os.makedirs(sh8)
+        for nm8, body8 in (("sudo", 'exec "$@"\n'), ("mountpoint", "exit 1\n"), ("findmnt", "exit 1\n"),
+                           ("losetup", 'case "$1" in\n  --list) cat "$FAKE_LOOPS"; exit 0 ;;\n'
+                                       '  -d) if [ "${FAKE_DETACH:-1}" = 1 ]; then grep -v "^$2 " "$FAKE_LOOPS" > '
+                                       '"$FAKE_LOOPS.new"; mv "$FAKE_LOOPS.new" "$FAKE_LOOPS"; fi; exit 0 ;;\nesac\n'
+                                       'exit 1\n')):
+            open(os.path.join(sh8, nm8), "w").write("#!/bin/sh\n" + body8)
+            os.chmod(os.path.join(sh8, nm8), 0o755)
+        mut8 = os.path.join(td8, "mut")
+        os.makedirs(mut8)
+        src8 = rd(mk8) or ""
+        open(os.path.join(mut8, "mkfixtures.sh"), "w").write(src8.replace(sweep8, "") if src8.count(sweep8) == 1 else "")
+        _sh8.copy(os.path.join(HERE, "nestloops.sh"), os.path.join(mut8, "nestloops.sh"))
+
+        def td_run(script, detach, tag):
+            base8 = os.path.join(td8, "base-" + tag)
+            loops8 = os.path.join(td8, "loops-" + tag)
+            open(loops8, "w").write("/dev/loopfake9 /elsewhere/v3fx-n1.img\n")
+            env8 = dict(os.environ, PATH=sh8 + os.pathsep + os.environ.get("PATH", ""), FAKE_LOOPS=loops8,
+                        FAKE_DETACH=detach)
+            r8 = _sp12.run(["bash", script, "--teardown-nest", base8], capture_output=True, text=True, env=env8,
+                           timeout=120)
+            return r8.returncode, r8.stdout + r8.stderr
+        t1 = td_run(mk8, "0", "t1")
+        t2 = td_run(mk8, "1", "t2")
+        t3 = td_run(os.path.join(mut8, "mkfixtures.sh"), "1", "t3")
+    finally:
+        _sh8.rmtree(td8)
+    chk("teardown outcome (review 13 item 8) T1: steps report success, the loop stays -> rc 1, 'loops still backed by "
+        "the chain'", t1[0] == 1 and "loops still backed by the chain" in t1[1], t1)
+    chk("teardown outcome (review 13 item 8) T2 control: the final sweep detaches it -> rc 0, the check silent",
+        t2[0] == 0 and "loops still backed by the chain" not in t2[1], t2)
+    chk("teardown outcome (review 13 item 8) T3: item 13's mutant (final sweep deleted) is killed -> rc 1, named",
+        src8.count(sweep8) == 1 and t3[0] == 1 and "loops still backed by the chain: /dev/loopfake9" in t3[1],
+        (src8.count(sweep8), t3))
+    # V3 review 13 item 9: the harness a verdict vouches for (harness_sha256: batchgate's bind check, harness:stable)
+    # must hold every file firecheck.sh reaches through "$HERE/..." and every file mkfixtures.sh sources from its own
+    # directory (nestloops.sh was missing, so a matcher change did not change harness_sha256); a reference to a
+    # directory is covered by the files under it (testdata/ is walked)
+    hf9 = set(harness_files())
+    fsrc9, msrc9 = rd(os.path.join(HERE, "firecheck.sh")) or "", rd(os.path.join(HERE, "mkfixtures.sh")) or ""
+    refs9 = set(re.findall(r'\$HERE/([A-Za-z0-9_.][A-Za-z0-9_./-]*)', fsrc9)) | \
+        set(re.findall(r'pwd\)/([A-Za-z0-9_.][A-Za-z0-9_./-]*)', msrc9))
+    miss9 = sorted(r for r in refs9 if r not in hf9 and not any(h.startswith(r.rstrip("/") + "/") for h in hf9))
+    chk("harness (review 13 item 9): every file firecheck.sh calls through $HERE and mkfixtures.sh sources from its "
+        "directory is in HARNESS", bool(fsrc9) and bool(msrc9) and "nestloops.sh" in refs9 and not miss9,
+        (miss9, sorted(refs9)))
     # sixth review M3: the call paths themselves -- check_real and cell_leaf_check on planted copies of a banked
     # write-back batch (run 37528595878, x86 ext4loop on NVMe, a VM)
     real_selftest(chk)
@@ -1408,8 +1521,11 @@ def real_selftest(chk):
             sy0 = (rj(os.path.join(HERE, "testdata", fx, "F3", "blkflush", "report.json")) or {}).get("syscalls") or {}
             ua0 = sy0.get("unattributed") if isinstance(sy0.get("unattributed"), dict) else {}
             n00 = (sy0.get("arms") or {}).get("nosync25") or {}
-            chk("real: %s's report has the current sync record (nosync25 syncs_inside_any_fd 0; unattributed foreign_fd, "
-                "no_fd, inside_foreign_fd, inside_no_fd present and 0; every arm's windows_over 0, review 12 item 8)" % fx,
+            # [V3 review 13 item 19, disclosed: the shape is now unattributed exactly {foreign_fd: 0} and no
+            # syncs_inside_any_fd key. The one shared predicate, codex C05's current_f3_sync_record(), carries that
+            # schema (DECISIONS d9c7b1dc85); no second, hand-written predicate here]
+            chk("real: %s's report has the current sync record (unattributed exactly {foreign_fd: 0}, no "
+                "syncs_inside_any_fd key, review 13 item 19; every arm's windows_over 0, review 12 item 8)" % fx,
                 current_f3_sync_record(sy0),
                 (n00, ua0, {a: (v or {}).get("windows_over") for a, v in (sy0.get("arms") or {}).items()}))
 
@@ -1455,6 +1571,16 @@ def real_selftest(chk):
             ls, c0 = f1b_lines(t)
             m = re.match(r"^(\d+)\s", ls[c0])
             return "\n".join(ls[:c0 + 1] + ["%s  fsync(3) = 0" % m.group(1)] + ls[c0 + 1:])
+
+        def f1b_insync(path_of):  # V3 review 13 item 18: an in-window fsync of path_of(W) right after the first
+            # in-loop pwrite64, on fd 99; W is the work directory of the trace's own setup (cfr2b.src's directory)
+            def f(t):
+                ls, c0 = f1b_lines(t)
+                m = next(mm for mm in (re.match(r"^(\d+)\s+fsync\((\d+)<([^>]*/cfr2b\.src)>\)", l) for l in ls[:c0]) if mm)
+                j = next(k for k in range(c0, len(ls)) if re.match(r"^\d+\s+pwrite64\(", ls[k]))
+                return "\n".join(ls[:j + 1] + ["%s  fsync(99<%s>) = 0" % (m.group(1), path_of(os.path.dirname(m.group(3))))]
+                                 + ls[j + 1:])
+            return f
 
         def f1b_srcsync(t):  # V3 review 12 item 11: an fsync of <work>/cfr2b.src (its setup fd) right after the first
             # in-loop pwrite64, inside a timed window: a file that is no arm's own
@@ -1538,6 +1664,12 @@ def real_selftest(chk):
             ("a cfr2b window short of its directory fsync", {"report": lambda j: j["syscalls"]["arms"]["cfr2b"].update(windows_short=1)},
              "F3:devflush", ["a flush-gated op's window lacks one of its own syncs"]),
             # V3 review 12 item 8: an extra own-fd sync in a floor-reference arm's window (append25)
+            # V3 review 13 item 17: windows_over on EVERY arm of the sync record, not only the flush-gated ones: an
+            # extra sync on clean's fd 14 within 500 ns of the edge it shares with a nosync25 window is attributed to
+            # clean, raising clean's windows_over, which nothing read
+            ("a clean window over its own syncs (an ungated arm)",
+             {"report": lambda j: j["syscalls"]["arms"]["clean"].update(windows_over=1)},
+             "F3:devflush", ["an arm's window holds more than its own syncs"]),
             ("an append25 window over its own syncs", {"report": lambda j: j["syscalls"]["arms"]["append25"].update(windows_over=1)},
              "F3:devflush", ["a flush-gated op's window holds more than its own syncs"]),
             # ninth review L15: fdatasync4k's own windows, for the flush-carrying gate and the sync gate
@@ -1552,20 +1684,20 @@ def real_selftest(chk):
             # fsync on fd 7 inside a nosync25 window, which the fd rule alone gives to no window)
             # [amended at V3 review 12 item 6, disclosed: such a sync is counted in foreign_fd too (a wholly-inside
             # event on an fd its window's arm does not own has no owning candidate), so the plant is made consistent
-            # (foreign_fd 1) and the one gate is foreign_fd/no_fd == 0; the "wholly inside" counts are descriptive]
+            # (foreign_fd 1) and the one gate is foreign_fd == 0]
+            # [V3 review 13 item 19, disclosed: the descriptive keys this plant also set (syncs_inside_any_fd,
+            # inside_foreign_fd) are deleted, and the gate's text no longer says "or on none" (no_fd cannot fire)]
             ("an fsync on fd 7 wholly inside a nosync25 window",
-             {"report": lambda j: (j["syscalls"]["arms"]["nosync25"].update(syncs_inside_any_fd=1),
-                                   j["syscalls"].setdefault("unattributed", {}).update(foreign_fd=1, inside_foreign_fd=1))},
-             "F3:devflush", ["a sync by the probe on an fd no overlapping window's arm owns, or on none"]),
+             {"report": lambda j: j["syscalls"].setdefault("unattributed", {}).update(foreign_fd=1)},
+             "F3:devflush", ["a sync by the probe on an fd no overlapping window's arm owns"]),
             # V3 review 12 item 6: a sync on an fd no arm owns at a nosync25 window's EDGE (t0 + 200 ns: its +-500 ns
-            # interval is not wholly inside, so every "inside" count stays 0 and only foreign_fd sees it), a sync
-            # naming no fd, and a report without foreign_fd (a missing count is not a zero)
-            ("a foreign-fd sync at a nosync25 window's edge (foreign_fd 1, inside counts 0)",
-             {"report": lambda j: j["syscalls"].setdefault("unattributed", {}).update(foreign_fd=1)}, "F3:devflush", ["a sync by the probe on an fd no overlapping window's arm owns, or on none"]),
-            ("a sync naming no fd (no_fd 1)",
-             {"report": lambda j: j["syscalls"].setdefault("unattributed", {}).update(no_fd=1)}, "F3:devflush", ["a sync by the probe on an fd no overlapping window's arm owns, or on none"]),
+            # interval is not wholly inside any window, and foreign_fd counts it all the same), and a report without
+            # foreign_fd (a missing count is not a zero). [V3 review 13 item 19: the no_fd plant is deleted with the
+            # count; it could not fire, since every sync event carries a parsed fd]
+            ("a foreign-fd sync at a nosync25 window's edge (foreign_fd 1)",
+             {"report": lambda j: j["syscalls"].setdefault("unattributed", {}).update(foreign_fd=1)}, "F3:devflush", ["a sync by the probe on an fd no overlapping window's arm owns"]),
             ("a report whose unattributed lacks foreign_fd",
-             {"report": lambda j: j["syscalls"].setdefault("unattributed", {}).pop("foreign_fd", None)}, "F3:devflush", ["a sync by the probe on an fd no overlapping window's arm owns, or on none"]),
+             {"report": lambda j: j["syscalls"].setdefault("unattributed", {}).pop("foreign_fd", None)}, "F3:devflush", ["a sync by the probe on an fd no overlapping window's arm owns"]),
             # eleventh review MED 2: the F1b cross-check refuses without its trace, and compares the probe's sync_fds
             # with the fds strace saw synced INSIDE each arm's timed windows, as sets (setup syncs excluded)
             ("no F1b real-all trace", {"f1b": "absent"}, "F3:devflush",
@@ -1578,11 +1710,23 @@ def real_selftest(chk):
             # "cfr2b.src" and never compared (the loop ran over rows only)
             ("an F1b trace with an in-window fsync of <work>/cfr2b.src", {"f1b": f1b_srcsync}, "F3:devflush",
              ["an F1b in-window sync on a file that is no arm's own"]),
+            # V3 review 13 item 18: the arm is judged against the arms that RAN (rows) and the work directory W: an
+            # arm of ALL that did not run here (clone2b, on this ext4 fixture) was keyed and dropped, and a path off W
+            # named like an arm's clone was keyed as that arm
+            ("an F1b trace with an in-window fsync of <work>/clone2b.clones (clone2b did not run on ext4)",
+             {"f1b": f1b_insync(lambda w: w + "/clone2b.clones")}, "F3:devflush",
+             ["an F1b in-window sync on a file that is no arm's own"]),
+            ("an F1b trace with an in-window fsync of /tmp/q/cfr2b.clones/c7 (off the work directory)",
+             {"f1b": f1b_insync(lambda w: "/tmp/q/cfr2b.clones/c7")}, "F3:devflush",
+             ["an F1b in-window sync on a file that is no arm's own"]),
             # V3 review 12 item 12: the refusal paths that had no plant, each with its own reason (both fail closed;
             # the risk was a wrong reason): a truncated gzip reads as missing (rd's EOFError/zlib catch), a deleted
             # clock read and an undecorated in-window fsync make the windows unreadable
+            # [V3 review 13 item 21, disclosed EXPECTATION CHANGE: this guard wanted the wrong reason, "no F1b real-all
+            # trace" (rd() returns None for a missing file and a corrupt one alike); a trace that is THERE but cannot be
+            # read whole is its own refusal]
             ("a truncated F1b gzip", {"f1b": "truncated"}, "F3:devflush",
-             ["no F1b real-all trace: sync_fds cannot be cross-checked"]),
+             ["the F1b real-all trace cannot be read whole"]),
             ("an F1b trace with one clock read deleted", {"f1b": f1b_noclock}, "F3:devflush",
              ["the F1b trace's timed windows cannot be read"]),
             ("an F1b trace with an in-window fsync without fd<path>", {"f1b": f1b_nodecor}, "F3:devflush",
@@ -2005,10 +2149,16 @@ def main(argv):
                                     ("cell_nest_dev.txt", "first_n1_dev.txt", "rebuilt_n1_dev.txt")])
     ast = rd(os.path.join(nm, "after_stray.txt"))
     # V3 review 12 item 1's plant: an unrelated loop under $FX/nb/, mounted, survives --teardown-nest untouched (the
-    # old prefix matcher took nbx's /mnt/v3fx/nb/x.img for the chain and failed every teardown)
+    # old prefix matcher took nbx's /mnt/v3fx/nb/x.img for the chain and failed every teardown); V3 review 13 item 7:
+    # judged on NAME,BACK-FILE,AUTOCLEAR (a `losetup -d` on a mounted loop changed nothing the old record held), and
+    # nbx itself the same way (firecheck writes "absent" when this cell built no nbx; a missing record fails)
     pb = (rd(os.path.join(nm, "plant_before.txt")) or "").strip()
     pa = (rd(os.path.join(nm, "plant_after.txt")) or "").strip()
-    plant_ok = bool(pb) and pa == pb and (rd(os.path.join(nm, "plant_mounted.txt")) or "").strip() == "yes"
+    plant_p = nest_plant_problems(pb, pa, rd(os.path.join(nm, "plant_mounted.txt")))
+    nbb = (rd(os.path.join(nm, "nbx_before.txt")) or "").strip()
+    nbx_p = [] if nbb == "absent" else nest_plant_problems(nbb, rd(os.path.join(nm, "nbx_after.txt")),
+                                                            rd(os.path.join(nm, "nbx_mounted.txt")))
+    plant_ok = not plant_p and not nbx_p
     check("F4:P_nest_modes", rc_of(os.path.join(nm, "teardown.rc")) == 0 and at is not None and at.strip() == ""
           and plant_ok
           and rc_of(os.path.join(nm, "rebuild.rc")) == 0 and ar is not None
@@ -2025,6 +2175,7 @@ def main(argv):
           {"teardown_rc": rc_of(os.path.join(nm, "teardown.rc")), "after_teardown": at, "rebuild_rc": rc_of(os.path.join(nm, "rebuild.rc")),
            "rebuilt_n1_backing": rb1, "n1_problems": n1p, "after_stray": ast,
            "plant_before": pb, "plant_after": pa, "plant_mounted": (rd(os.path.join(nm, "plant_mounted.txt")) or "").strip(),
+           "plant_problems": plant_p, "nbx_before": nbb, "nbx_problems": nbx_p,
            "stray_teardown_rc": rc_of(os.path.join(nm, "stray_teardown.rc")),
            "n1extra": (rd(os.path.join(nm, "n1extra.dev")) or "").strip(),
            "after_rebuild": ar, "probe_rc": rc_of(os.path.join(nm, "probe.rc")), "layers": pj.get("layers"),
@@ -2477,18 +2628,24 @@ def check_real(o3, rc, kv, leaf):
                 # append25 or fdatasync4k, would otherwise pass); a missing count is not a zero
                 if a in rows and (sy["arms"].get(a) or {}).get("windows_over") != 0:
                     dbad.append(("a flush-gated op's window holds more than its own syncs", a, sy["arms"].get(a)))
+            # V3 review 13 item 17: and on every OTHER arm of the sync record (clean, clone1b, nosync25): an extra sync
+            # attributed to an ungated arm's window (clean's fd 14 within 500 ns of a nosync25 edge) is over its own
+            # as well; a missing count is not a zero
+            for a, r in sorted(sy["arms"].items()):
+                if a not in GATED and (not isinstance(r, dict) or r.get("windows_over") != 0):
+                    dbad.append(("an arm's window holds more than its own syncs", a, r))
             if (sy["arms"].get("nosync25") or {}).get("syncs") != 0:
                 dbad.append(("nosync25's windows hold a sync by the probe", sy["arms"].get("nosync25")))
             # eleventh review MED 1, V3 review 12 item 6: nosync25 owns no fd, so the fd rule can never give it a sync;
             # every sync of the probe's that no overlapping window's arm owns (foreign_fd: a nosync25 window's
-            # included, wholly inside or at its edge) or that names no fd (no_fd) must be 0 (a missing count is not a
-            # zero). The "wholly inside" counts (syncs_inside_any_fd, inside_*) are strictly weaker and stay
-            # descriptive: an edge or sub-us-window sync shows only in foreign_fd
+            # included, wholly inside or at its edge) must be 0 (a missing count is not a zero). V3 review 13 item 19:
+            # the one gate; no_fd could not fire (every sync event carries a parsed fd) and is deleted with the
+            # descriptive "wholly inside" counts
             ua = sy.get("unattributed") if isinstance(sy.get("unattributed"), dict) else {}
-            if ua.get("foreign_fd") != 0 or ua.get("no_fd") != 0:
-                dbad.append(("a sync by the probe on an fd no overlapping window's arm owns, or on none",
+            if ua.get("foreign_fd") != 0:
+                dbad.append(("a sync by the probe on an fd no overlapping window's arm owns",
                              sy.get("unattributed")))
-        dbad += sync_fds_problems(sj, rows, n, rd(os.path.join(OUT, "F1b", "real-all.trace.gz")))
+        dbad += sync_fds_problems(sj, rows, n, os.path.join(OUT, "F1b", "real-all.trace.gz"), kv.get("work", ""))
         rec["device_flushes_per_op"] = dfp
         rec["layer_device_flushes_per_op"] = (merged or {}).get("layer_device_flushes_per_op")
         rec["shared_devices"] = shared
@@ -2582,18 +2739,48 @@ def nest_n1_problems(cell_dir, first_n1, rebuilt_n1, devices=None):
             for what, dev in (("first-built", first_dev), ("rebuilt", rebuilt_dev)) if dev != cell_dev]
 
 
-def f1b_window_syncs(text):
+def nest_plant_problems(before, after, mounted):
+    """V3 review 13 item 7: a loop --teardown-nest must leave alone (P_nest_modes' plant under $FX/nb/, and nbx), from
+    its `losetup -n -O NAME,BACK-FILE,AUTOCLEAR` line (xargs-joined) before and after the teardown and its mount after.
+    On a MOUNTED loop `losetup -d` changes neither the device, the backing file nor the mount; it only sets AUTOCLEAR
+    (the last field). So the line must be the same before and after, with AUTOCLEAR 0, and the mount still there; a
+    line without the AUTOCLEAR field cannot be judged. [] when untouched."""
+    b, a = (before or "").strip(), (after or "").strip()
+    if not b:
+        return ["no record of the loop before the teardown"]
+    if len(b.split()) < 3 or b.split()[-1] not in ("0", "1"):
+        return ["the record %r has no AUTOCLEAR field (want NAME BACK-FILE AUTOCLEAR)" % b]
+    probs = []
+    if b.split()[-1] != "0":
+        probs.append("AUTOCLEAR was already set before the teardown: %r" % b)
+    if a != b:
+        probs.append("the loop changed across the teardown (a `losetup -d` on a mounted loop sets AUTOCLEAR): %r, then %r"
+                     % (b, a))
+    if (mounted or "").strip() != "yes":
+        probs.append("the loop's mount is gone after the teardown")
+    return probs
+
+
+def f1b_window_syncs(text, rows, work):
     """eleventh review MED 2: the fsync and fdatasync calls INSIDE the timed windows of an F1b strace -f -y trace, read
     through parse_trace and sliced as sequence_problems slices them (V3 review 12 item 15: this was a second strace
     parser, whose split-line and parity branches no trace F1b:real-all accepts can reach): a window is the calls
     between its opening and closing clock_gettime, the only clock reads the loop makes. Setup and teardown syncs are
     outside every window. A split (<unfinished ...>) line is not a call (parse_trace keeps it in `other`, which
-    F1b:real-all refuses). The arm is the synced path's: <work>/<arm>, <work>/<arm>.clones or <work>/<arm>.clones/c<i>,
-    for an arm this probe has; any other in-window sync path (<work>/cfr2b.src, the work directory) is returned in odd
-    (review 12 item 11). An odd number of clock reads, or an in-window sync whose first argument is not fd<path>, is a
-    problem. -> (seen {arm: fds}, problems, odd paths)"""
+    F1b:real-all refuses). The arm is the synced path's: exactly <work>/<arm>, <work>/<arm>.clones or
+    <work>/<arm>.clones/c<i>, for an arm in ROWS (the arms that ran) and <work> the run's work directory; any other
+    in-window sync path (<work>/cfr2b.src, the work directory, an arm that did not run here, a path off <work>) is
+    returned in odd (review 12 item 11; V3 review 13 item 18: it keyed by ALL and by basename, so clone2b's syncs on an
+    ext4 cell were dropped and /tmp/q/cfr2b.clones/c7 keyed as cfr2b). An odd number of clock reads, an in-window sync
+    whose first argument is not fd<path>, or no work directory, is a problem. -> (seen {arm: fds}, problems, odd)
+    Stated limit: strace -y prints the kernel's path for each fd, so <work> (info.txt's work=, firecheck's W, a path on
+    the cell's mount) must be written canonically; one reached through a symlink would put every sync in odd, a false
+    red, never a pass."""
     seen, probs, odd, fdmap = {}, [], [], {}
-    known = set(ALL.split(","))
+    known = set(rows)
+    wd = os.path.normpath(work) if work else ""
+    if not wd.startswith("/"):
+        return {}, ["no work directory (info.txt work=%r): the F1b syncs cannot be placed" % (work,)], []
     calls, _other, _pids = parse_trace(text, fdmap)
     clocks = [k for k, (name, _) in enumerate(calls) if name == "clock_gettime"]
     if not clocks or len(clocks) % 2:
@@ -2607,13 +2794,17 @@ def f1b_window_syncs(text):
             if fdmap.get(k) is None or not pm:
                 probs.append("an in-window sync without fd<path>: " + t[:120])
                 continue
-            path, base = pm.group(1), os.path.basename(pm.group(1))
-            if re.fullmatch(r"c\d+", base):
-                par = os.path.basename(os.path.dirname(path))
-                arm = par[:-len(".clones")] if par.endswith(".clones") else None
-            else:
-                arm = base[:-len(".clones")] if base.endswith(".clones") else base
-            if arm not in known:
+            path = pm.group(1)
+            d, base = os.path.split(os.path.normpath(path))
+            arm = None
+            if d == wd:  # <work>/<arm> or <work>/<arm>.clones
+                a = base[:-len(".clones")] if base.endswith(".clones") else base
+                arm = a if a in known else None
+            elif os.path.dirname(d) == wd and re.fullmatch(r"c\d+", base):  # <work>/<arm>.clones/c<i>
+                par = os.path.basename(d)
+                a = par[:-len(".clones")] if par.endswith(".clones") else None
+                arm = a if a in known else None
+            if arm is None:
                 odd.append(path)
                 continue
             seen.setdefault(arm, set()).add(fdmap[k])
@@ -2624,7 +2815,11 @@ def sync_fds_def_problems(sj, rows, n):
     """The arm-definitions half of sync_fds_problems, on its own so batchgate's post runs it too (V3 review 11 LOW 2,
     review 12 item 7: post trusted the probe's sync_fds): per arm in rows, one fd per synced file (the clone and the
     directory for clone2b and cfr2b, the directory for clone1b, the arm's own file otherwise, none for nosync25), each
-    synced n times; a missing or overflowed record is one problem. -> [(tag, arm, recorded, fds, syncs)]."""
+    synced n times; a missing or overflowed record is one problem, and so is an n that is not a positive int (V3 review
+    13 item 22: `None * per_op` raised inside batchgate post, which then wrote no gate.json). -> [(tag, arm, recorded,
+    fds, syncs)], or the one-problem forms [(tag, "missing or overflowed", overflow)] and [(tag, "n", n)]."""
+    if not isinstance(n, int) or isinstance(n, bool) or n <= 0:
+        return [("the probe summary's n is not a positive int: sync_fds cannot be judged", "n", n)]
     sf = sj.get("sync_fds")
     if sj.get("sync_fds_overflow") is not False or not isinstance(sf, dict):
         return [("sync_fds disagrees with the arm definitions", "missing or overflowed", sj.get("sync_fds_overflow"))]
@@ -2640,22 +2835,26 @@ def sync_fds_def_problems(sj, rows, n):
     return bad
 
 
-def sync_fds_problems(sj, rows, n, f1b_trace):
+def sync_fds_problems(sj, rows, n, f1b_path, work):
     """tenth review HIGH 1: the probe's sync_fds (the fds each arm's ops synced, the key blkflush attributes by) must
     match the arm definitions (check.OP: the syncs per op, one fd per synced file: the clone and the directory for
     clone2b and cfr2b, the directory for clone1b, the arm's own file otherwise, none for nosync25) and EQUAL, per arm,
     the set of fds F1b's real-all strace saw synced inside that arm's timed windows (strace -y prints each sync as
     fd<path>). Eleventh review MED 2: F1b:real-all is planned on every cell, so a missing or unreadable trace refuses
     (it skipped the check silently), and only in-window syncs count (setup syncs every arm's file, nosync25's
-    included); equality, not a subset, so an in-window sync the probe did not record (nosync25's, say) shows."""
+    included); equality, not a subset, so an in-window sync the probe did not record (nosync25's, say) shows. V3 review
+    13 item 21: it takes the trace's PATH, so a trace that is there but cannot be read whole (a truncated gzip) refuses
+    as such, not as a missing one."""
     bad = sync_fds_def_problems(sj, rows, n)
-    if bad and bad[0][1] == "missing or overflowed":
+    if bad and bad[0][1] in ("missing or overflowed", "n"):
         return bad
     sf = sj.get("sync_fds")
+    f1b_trace = rd(f1b_path) if f1b_path else None
     if f1b_trace is None:
-        bad.append(("no F1b real-all trace: sync_fds cannot be cross-checked", os.path.join("F1b", "real-all.trace.gz")))
+        bad.append(("the F1b real-all trace cannot be read whole" if f1b_path and os.path.lexists(f1b_path)
+                    else "no F1b real-all trace: sync_fds cannot be cross-checked", os.path.join("F1b", "real-all.trace.gz")))
         return bad
-    seen, probs, odd = f1b_window_syncs(f1b_trace)
+    seen, probs, odd = f1b_window_syncs(f1b_trace, rows, work)
     if probs:
         bad.append(("the F1b trace's timed windows cannot be read", probs[:3]))
         return bad

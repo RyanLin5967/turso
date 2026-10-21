@@ -308,12 +308,16 @@ printf 'frame_arm\tow4k\tDECISIONS \xe2\x80\xa6 (PREREG \xc2\xa74)\n' > "$OUT/F4
 # V3 review 12 item 2: the duplicate-key and unknown-key rules, each with its own refusal text
 printf 'frame_arm\tow4k\tplanted\nframe_arm\tow64k\tplanted again\n' > "$OUT/F4/reg_dupkey.tsv"
 printf 'frame_arms\tow4k\tplanted\n' > "$OUT/F4/reg_unknownkey.tsv"
+# V3 review 13 item 12: the d0-threshold value rule (reg_value_ok, the only guard since main's re-check was deleted)
+# had no plant: an exponent form and a bare trailing dot (strtod reads 1.0, not above 1)
+printf 'd0_threshold/ext4/wb/vm\t1e1\tplanted\n' > "$OUT/F4/reg_d0bad.tsv"
+printf 'd0_threshold/ext4/wb/vm\t1.\tplanted\n' > "$OUT/F4/reg_d0edge.tsv"
 refuse R_rental_noreg "$V3" --dir "$W" --out "$(o R_rental_noreg)" --n 5 --arms append25,nosync25 --plp no --require-registered
 for t in noframe:reg_noframe novariant:reg_ow64k; do
   refuse "R_rental_${t%%:*}" "$V3" --dir "$W" --out "$(o "R_rental_${t%%:*}")" --n 5 --arms append25,nosync25 --plp no \
     --registered "$OUT/F4/${t#*:}.tsv" --require-registered
 done
-for t in frame25 nonascii longline dupkey unknownkey; do
+for t in frame25 nonascii longline dupkey unknownkey d0bad d0edge; do
   refuse "R_reg_$t" "$V3" --dir "$W" --out "$(o "R_reg_$t")" --n 5 --arms append25,nosync25 --plp no --registered "$OUT/F4/reg_$t.tsv"
 done
 # items 9, 10, 12, 15, 1(a): fixtures
@@ -737,13 +741,27 @@ if [ -f "$FX/n1.ok" ] && mountpoint -q "$FX/n1" 2>/dev/null; then
   # (V3 review 12 item 1: a matcher copied verbatim cannot catch its own error): n1's image as built, and the level
   # images $FX/n1..n3/x.img, each " (deleted)" or not; a losetup that fails is reported, never "nothing attached"
   FXC=$(readlink -m "$FX")
+  # V3 review 13 item 10: returns 2 when the loops cannot be listed OR the filter fails (awk's status was discarded,
+  # so a failing filter read as nothing attached), its output captured apart from its status; each caller writes
+  # "cannot list the loops" for a 2, never a "loop still attached" line
   chainloops() {
-    local l w1
+    local l w1 f
     w1=$first1
-    l=$(loop_list) || { echo "losetup --list failed: the loops cannot be listed"; return 0; }
-    [ -z "$l" ] || printf '%s\n' "$l" | awk -v w1="$w1" -v w1b="${rbimg:-}" -v f="$FXC" '{ d = $1; $1 = ""; sub(/^ +/, "")
+    l=$(loop_list) || return 2
+    [ -z "$l" ] && return 0
+    f=$(printf '%s\n' "$l" | awk -v w1="$w1" -v w1b="${rbimg:-}" -v f="$FXC" '{ d = $1; $1 = ""; sub(/^ +/, "")
       p = $0; sub(/ \(deleted\)$/, "", p)
-      if (p == w1 || (w1b != "" && p == w1b) || p == f "/n1/x.img" || p == f "/n2/x.img" || p == f "/n3/x.img") print d " " $0 }'
+      if (p == w1 || (w1b != "" && p == w1b) || p == f "/n1/x.img" || p == f "/n2/x.img" || p == f "/n3/x.img") print d " " $0 }') ||
+      return 2
+    [ -z "$f" ] || printf '%s\n' "$f"
+  }
+  chainloops_lines() {  # the after_* lines: one per loop still attached, or the one failure line
+    local cl
+    if cl=$(chainloops); then
+      [ -z "$cl" ] || printf '%s\n' "$cl" | sed 's/^/loop still attached: /'
+    else
+      echo "cannot list the loops (losetup --list or its filter failed)"
+    fi
   }
   rbimg=""
   # V3 review 12 item 1's plant: an unrelated loop under $FX/nb/ (as nbx's backing /mnt/v3fx/nb/x.img is), mounted,
@@ -752,14 +770,27 @@ if [ -f "$FX/n1.ok" ] && mountpoint -q "$FX/n1" 2>/dev/null; then
   sudo mkdir -p "$FX/nb" "$FX/nbplant"
   sudo truncate -s 64M "$FX/nb/teardown-plant.img" && pl=$(sudo losetup --find --show "$FX/nb/teardown-plant.img") \
     && sudo mkfs.ext4 -q -F "$pl" && sudo mount "$pl" "$FX/nbplant" \
-    && echo "$pl $(losetup -n -O BACK-FILE "$pl" | xargs)" > "$NM/plant_before.txt"
+    && losetup -n -O NAME,BACK-FILE,AUTOCLEAR "$pl" | xargs > "$NM/plant_before.txt"
+  # V3 review 13 item 7: NAME,BACK-FILE,AUTOCLEAR, since on a MOUNTED loop `losetup -d` only sets AUTOCLEAR (device,
+  # backing file and mount unchanged); and nbx, the real loop backed under $FX/nb/, recorded the same way
+  nbxd=""
+  if [ -f "$FX/nbx.ok" ] && mountpoint -q "$FX/nbx" 2>/dev/null; then
+    nbxd=$(findmnt -n -o SOURCE "$FX/nbx" | tail -1)
+    losetup -n -O NAME,BACK-FILE,AUTOCLEAR "$nbxd" | xargs > "$NM/nbx_before.txt"
+  else
+    echo absent > "$NM/nbx_before.txt"
+  fi
   timeout 300 bash "$HERE/mkfixtures.sh" --teardown-nest "$FX" > "$NM/teardown.txt" 2>&1; echo $? > "$NM/teardown.rc"
-  if [ -n "$pl" ]; then echo "$pl $(losetup -n -O BACK-FILE "$pl" 2>/dev/null | xargs)" > "$NM/plant_after.txt"; fi
+  if [ -n "$pl" ]; then losetup -n -O NAME,BACK-FILE,AUTOCLEAR "$pl" 2>/dev/null | xargs > "$NM/plant_after.txt"; fi
   mountpoint -q "$FX/nbplant" 2>/dev/null && echo yes > "$NM/plant_mounted.txt"
+  if [ -n "$nbxd" ]; then
+    losetup -n -O NAME,BACK-FILE,AUTOCLEAR "$nbxd" 2>/dev/null | xargs > "$NM/nbx_after.txt"
+    mountpoint -q "$FX/nbx" 2>/dev/null && echo yes > "$NM/nbx_mounted.txt"
+  fi
   # the plant is removed now, whatever the teardown did to it
   sudo umount "$FX/nbplant" 2>/dev/null; [ -n "$pl" ] && sudo losetup -d "$pl" 2>/dev/null; sudo rm -f "$FX/nb/teardown-plant.img"
   { for k in 1 2 3 4; do mountpoint -q "$FX/n$k" 2>/dev/null && echo "n$k mounted"; [ -f "$FX/n$k.ok" ] && echo "n$k.ok present"; done
-    [ -e "$nd/v3fx-n1.img" ] && echo "n1 image present"; chainloops | sed 's/^/loop still attached: /'; } > "$NM/after_teardown.txt"
+    [ -e "$nd/v3fx-n1.img" ] && echo "n1 image present"; chainloops_lines; } > "$NM/after_teardown.txt"
   timeout 600 env V3_FIXTURES=nest V3_NEST_DIR="$cdir" bash "$HERE/mkfixtures.sh" "$FX" > "$NM/rebuild.txt" 2>&1; echo $? > "$NM/rebuild.rc"
   { for k in 1 2 3 4; do mountpoint -q "$FX/n$k" 2>/dev/null && [ -f "$FX/n$k.ok" ] && echo "n$k mounted ok"; done; } > "$NM/after_rebuild.txt"
   # the rebuilt n1's image is on the nest dir given, not anywhere else (tenth review MED 1)
@@ -776,7 +807,7 @@ if [ -f "$FX/n1.ok" ] && mountpoint -q "$FX/n1" 2>/dev/null; then
   rbimg=$(cat "$NM/rebuilt_n1_backing.txt" 2>/dev/null)
   if [ -n "$rbimg" ]; then x1=$(sudo losetup --find --show "$rbimg") && echo "$x1 $rbimg" > "$NM/n1extra.dev"; fi
   timeout 300 bash "$HERE/mkfixtures.sh" --teardown-nest "$FX" > "$NM/stray_teardown.txt" 2>&1; echo $? > "$NM/stray_teardown.rc"
-  { chainloops | sed 's/^/loop still attached: /'; for k in 1 2 3 4; do mountpoint -q "$FX/n$k" 2>/dev/null && echo "n$k mounted"; done
+  { chainloops_lines; for k in 1 2 3 4; do mountpoint -q "$FX/n$k" 2>/dev/null && echo "n$k mounted"; done
     [ -n "$rbimg" ] && [ -e "$rbimg" ] && echo "n1 image still present: $rbimg"; } > "$NM/after_stray.txt"
 else
   echo "no proved nest chain to tear down (n1.ok absent or n1 not mounted)" > "$NM/na.txt"
