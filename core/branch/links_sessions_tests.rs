@@ -248,6 +248,9 @@ fn ls_hard_whole_child() {
     let whole = super::catalog::WHOLE_UPGRADE_BATCHES.load(Ordering::Acquire) - w0;
     // The asserted readings, taken before the LOW-3 observation below.
     let (meta, log) = (meta_version(&path), log_present(&path));
+    // Observing only (the H1 no-cut diagnostic): what the threshold-crossing calls came to, this run.
+    let outcomes: Vec<String> = super::store::CKPT_OUTCOMES.iter().map(|c| c.load(Ordering::Acquire).to_string()).collect();
+    println!("LS-WHOLE-OUTCOMES {}", outcomes.join(","));
     // h1-rev-72bfb0127 LOW-3 (observing here; asserted by its own test): fill threads started, and batches a
     // superseded fill started, through the end of the run.
     std::thread::sleep(std::time::Duration::from_millis(2_500));
@@ -319,6 +322,9 @@ fn past_the_hard_log_limit_no_checkpoint_links_the_whole_catalog() {
         assert_eq!(r.len(), 1, "premise: the child reported:\n{text}");
         let (n, past, whole, waits, meta, peak, log, fill_waits) = (r[0][0], r[0][1], r[0][3], r[0][4], r[0][5], r[0][6], r[0][7], r[0][8]);
         println!("LS whole: {n} rows: waits {waits} (F-FZ back-pressure, reported only), on fill work {fill_waits}, whole batches {whole}");
+        for l in text.lines().filter(|l| l.contains("LS-WHOLE-OUTCOMES ")) {
+            println!("{l}");
+        }
         assert_eq!(past, 1, "{n} rows: premise: the log never passed the hard limit");
         assert_eq!(fill_waits, 0, "{n} rows: creates past the hard limit waited {fill_waits} times on the install of a checkpoint carrying fill or upgrade work");
         assert_eq!(whole, 0, "{n} rows: past the hard limit a checkpoint linked the whole catalog ({whole} batches of {})", super::catalog::UPGRADE_BATCH);

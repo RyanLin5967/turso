@@ -1580,6 +1580,19 @@ pub(crate) fn thread_fill_waits() -> u64 {
     THREAD_FILL_WAITS.with(std::cell::Cell::get)
 }
 
+/// Test builds (H1 no-cut diagnostic, observing only): per outcome, the fuzzy `maybe_compact` calls that
+/// wanted a compaction: 0 the fill gate held them past the hard limit, 1 held them below it, then 2 + each
+/// `FlightStart` (Started, NotCatalog, InFlight, Parked, Truncating, Poisoned, Refused, Filling, Failed).
+#[cfg(test)]
+pub(crate) static CKPT_OUTCOMES: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+
+#[cfg(test)]
+fn note_ckpt_outcome(at: usize) {
+    if let Some(c) = CKPT_OUTCOMES.get(at) {
+        c.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
 /// One wait (`THREAD_WAITS`).
 #[cfg(test)]
 fn note_wait() {
@@ -3222,6 +3235,7 @@ struct ReleaseInAir {
 
 /// What `BranchStore::start_flight` did (review 4 #2): only `Failed` backs the next attempt off.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 enum FlightStart {
     /// A fuzzy checkpoint is in flight now, on a thread of its own.
     Started,
@@ -6193,6 +6207,8 @@ impl BranchStore {
         // thread of its own fills in bounded batches (this operation only starts it). Meanwhile no
         // checkpoint runs and the log grows, past the hard limit too: the fill is bounded work.
         if self.links_fill_gate(inner) {
+            #[cfg(test)]
+            note_ckpt_outcome(if inner.journal.as_ref().is_some_and(Journal::past_hard_limit) { 0 } else { 1 });
             return;
         }
         if inner.cat.is_none() || !self.fuzzy {
@@ -6236,7 +6252,11 @@ impl BranchStore {
         // cleared by the install under the same mutex, so it is never left set with no flight.
         // (During a WAL truncation no checkpoint starts and none waits: the log can pass twice the
         // threshold by what that truncation's time appends.)
-        match self.start_flight(inner) {
+        let started = self.start_flight(inner);
+        // Test builds (H1 no-cut diagnostic): what each threshold-crossing call came to.
+        #[cfg(test)]
+        note_ckpt_outcome(2 + started as usize);
+        match started {
             // A start that failed (settle, capture or spawn) backs off as a failed write does
             // (review 4 #2): not retried, under this mutex, by every operation until another
             // threshold's worth of log. Mutant `start_failure_retried` (test builds only).
