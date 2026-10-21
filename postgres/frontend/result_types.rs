@@ -619,7 +619,9 @@ pub fn computed_targets(parse: &ParseResult) -> Vec<bool> {
             // An operand cast to a type the walk names (2::int2 in 2::int2 + 2::int2 is int2, where
             // the engine's INTEGER announced int4; wire-rev-cfdebc06d LOW-5).
             Some(Node::TypeCast(c)) => {
-                !top && cast_type(c).is_some()
+                // A cast to bytea is bytea at the top too: an integer cast to bytea was announced
+                // text (wire-rev-4a1934c89-beb4 LOW-7).
+                (!top || cast_type(c) == Some(17)) && cast_type(c).is_some()
                     && c.arg.as_deref().is_some_and(|a| matches!(a.node.as_ref(), Some(Node::AConst(_))) || plain(a, false))
             }
             _ => false,
@@ -1038,6 +1040,9 @@ fn scalar_result(name: &str) -> Option<u32> {
         "percent_rank" | "cume_dist" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan"
         | "atan2" | "degrees" | "radians" | "pi" | "random" => FLOAT8,
         "now" | "statement_timestamp" | "transaction_timestamp" | "clock_timestamp" => 1184,
+        // bytea in PostgreSQL 18, a driver decoding by type reads its bytes (wire-rev-4a1934c89-beb4
+        // LOW-7: announced text).
+        "int2send" | "int4send" | "int8send" => 17,
         _ => return None,
     })
 }
@@ -2618,6 +2623,29 @@ impl Infer<'_> {
                     return None;
                 }
                 let name = func_name(call)?;
+                // A function PostgreSQL has only without arguments, called with some: 42883 named
+                // with their types (wire-rev-4a1934c89-beb4 LOW-8: now(1) was 'no such function').
+                if !call.args.is_empty()
+                    && matches!(
+                        name.as_str(),
+                        "now" | "statement_timestamp" | "transaction_timestamp" | "clock_timestamp" | "pi" | "current_database" | "version" | "timeofday"
+                    )
+                {
+                    let types: Option<Vec<&str>> = call
+                        .args
+                        .iter()
+                        .map(|a| match a.node.as_ref() {
+                            Some(Node::AConst(c)) if c.isnull || matches!(c.val, Some(turso_pg_parser::pg_query::protobuf::a_const::Val::Sval(_))) => Some("unknown"),
+                            _ => self.type_of(a, scope).map(type_name).filter(|n| *n != "unknown"),
+                        })
+                        .collect();
+                    if let Some(types) = types {
+                        return self.refusal(
+                            SqlErrorKind::UndefinedFunction,
+                            format!("function {}({}) does not exist", parts.join("."), types.join(", ")),
+                        );
+                    }
+                }
                 if let Some(t) = scalar_result(&name) {
                     return Some(t);
                 }
