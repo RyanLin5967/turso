@@ -17275,6 +17275,18 @@ fn an_integer_as_bytea_is_announced_bytea() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-4a1934c89-beb4 LOW-8 (its PG 18.6 probe #280): now() has no argument, so now(1) names no function: 42883
+/// 'function now(integer) does not exist'; it was 'Parse error: no such function: now'.
+#[test]
+fn now_with_an_argument_names_no_function() {
+    let dir = Scratch::new("now-arg");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let r = a.q("SELECT now(1)");
+    let e = r.err("now(1)");
+    assert_eq!((e.code.as_str(), e.message.as_str()), ("42883", "function now(integer) does not exist"));
+}
+
 /// wire-rev-351702a43 LOW-6 (its PG 18.6 probe3 #161): a CASE is typed by its results (an int4 constant and an int4
 /// function: 23); the walk never typed a CASE column, and the engine announced it text (25).
 #[test]
