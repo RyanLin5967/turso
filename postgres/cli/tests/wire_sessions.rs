@@ -16102,6 +16102,29 @@ fn a_bound_exponent_or_infinity_overflows_numeric_at_bind() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-7128c6f73 MED-4 (its PG 18.6 probe4 #144): a decimal literal cast to an integer type is rounded by PG's
+/// numeric-to-int conversion, half away from zero (1.5::int2 is 2, so 1.5::int2 + 1::int2 is 3), where the engine's CAST
+/// truncates (2), now announced with PG's type 21, so the wrong value looked right.
+#[test]
+fn a_decimal_literal_cast_to_an_integer_rounds_as_postgresql_rounds() {
+    let dir = Scratch::new("decimal-int-cast");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    for (sql, want) in [
+        ("SELECT 1.5::int2 + 1::int2", "3"),
+        ("SELECT CAST(2.5 AS integer)", "3"),
+        ("SELECT (-2.5)::int8", "-3"),
+        ("SELECT 2.4::int4", "2"),
+    ] {
+        let r = a.q(sql);
+        if r.error.is_some() || r.rows != vec![vec![Some(want.to_string())]] {
+            wrong.push(format!("{sql}: rows {:?} error {:?}, PostgreSQL {want}", r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-7128c6f73 MED-3 (its PG 18.6 probe4 #83, #103): a bound 'NaN' for a numeric column was read as a float
 /// NaN, which the engine stores as NULL: INSERT 0 1, and the row read null where PG stores NaN. The engine holds no NaN
 /// (PGDIV-NAN), so a bound NaN, for a numeric or a float parameter, is refused 0A000 at Bind as the literal is, and
