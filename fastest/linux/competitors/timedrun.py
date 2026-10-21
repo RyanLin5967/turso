@@ -290,7 +290,7 @@ PAIR_KEYS = ("loop", "mode", "rate", "clients", "seed")  # one command line: bot
 # comp-rev-89ec-b3c3 LOW 3: and the keys that define each producer's command, which both runs must RECORD (None ==
 # None had passed): bbload (mode closed/open) runs one spec at one seed and rate; clonebench (b1/b0) has no seed or
 # rate, and its command is its op and sync
-PAIR_KEYS_BY_PRODUCER = {"bbload": ("loop", "mode", "rate", "clients", "seed", "spec"),
+PAIR_KEYS_BY_PRODUCER = {"bbload": ("loop", "mode", "rate", "clients", "seed", "spec", "home_per_cycle"),
                          "clonebench": ("loop", "mode", "clients", "op", "sync")}
 # comp-rev-89ec-b3c3 LOW 1: PREREG M3's open-loop lateness bound; a run is judged against it, not against the bound it
 # carries (bbload accepts --max-send-late-us up to 1e9)
@@ -433,6 +433,32 @@ def raw_problems(nm, d, sm, require_ok=True):
                        f"<= end)")
         if bad_lat:
             why.append(f"{nm} run's raw.tsv has {bad_lat} row(s) whose lat_ns is not end_ns - intended_ns")
+    # comp-rev-9bc7d894a final LOW A: a `home per-cycle` run's connect (bbload, the lead's Doltgres b-m1 ruling) must
+    # sit OUTSIDE the timed window. The timed run is the latency file, so there: every row records home_connect_ns, and
+    # each claim comes at or after the same client's previous row's after-steps end (end_ns + after_ns) plus this row's
+    # connect. A connect moved after the claim would put it into every op's latency, handicapping the competitor.
+    if nm == "timed" and sm.get("home_per_cycle") is True:
+        need = ("client", "seq", "claim_ns", "end_ns", "after_ns", "home_connect_ns")
+        if "home_connect_ns" not in cols:
+            why.append(f"{nm} run is home per-cycle but its raw.tsv has no home_connect_ns column")
+        elif any(c not in cols for c in need):
+            why.append(f"{nm} run is home per-cycle but its raw.tsv lacks {[c for c in need if c not in cols]}")
+        else:
+            try:
+                by = {}
+                for r in rows:
+                    by.setdefault(r["client"], []).append(
+                        (int(r["seq"]), int(r["claim_ns"]), int(r["end_ns"]), int(r["after_ns"]), int(r["home_connect_ns"])))
+            except (ValueError, TypeError):
+                return why + [f"{nm} run's raw.tsv has a home per-cycle column that is not a count"]
+            early = 0
+            for ops in by.values():
+                ops.sort()
+                for (_, _, pe, pa, _), (_, c, _, _, hc) in zip(ops, ops[1:]):
+                    early += c < pe + pa + hc
+            if early:
+                why.append(f"{nm} run has {early} claim(s) earlier than the client's previous after-steps end plus "
+                           f"this cycle's home_connect_ns: the connect cannot have preceded the claim")
     tm1 = sm.get("tm1_ns")
     if not _count(tm1) or not tm1:
         why.append(f"{nm} run has no tm1_ns: its window's end in intended time is unknown")
