@@ -9,9 +9,11 @@ name: fastest-t3-dryrun
 # that must FAIL the FIRST block for exactly the planted reason, pinned by its own text (gate-6 review M2), while
 # the second block passes (review H1: a failed block does not stop the run): a V3 batch bound to a missing verdict
 # (run.sh's refusal names the planted file), a V3L whose fio syncs every 2nd write (V1L reads 5,000 and v3l.json
-# records the plant), and a write-cache lie under V3L on whichever drive the runner draws (write back: the loop set to
-# write through, so the drive's flush counter gate fires; write through: the drive's queue set to write back, so the
-# kernel/drive cross-check fires). EXPECT is "alt||alt", each alternative "part&&part".
+# records the plant), and a write-cache lie under V3L: the block's loop queue set to write through on whichever drive
+# the runner draws, so no fsync reaches the backing file; behind a write-back drive the flush-counter rule fires, behind
+# a write-through drive the sectors-written rule does ("did not reach the drive"). EXPECT is "alt||alt", each
+# alternative "part&&part", every part matched within ONE of the first block's reasons; the cache-lie row is keyed to
+# the drawn drive's class instead (EXPECT_WB, EXPECT_WT), matched within one V3L void reason of b0 (review 6 LOW 9, 12).
 # The A16 plants (blockgate.py) and the V3L counter plants (v3l.py plants) run inside every block of every job, on
 # copies of the real records, so both drive classes' gates fire on every run whatever drive is drawn.
 
@@ -32,6 +34,10 @@ on:
       - "fastest/linux/t3/**"
       - "fastest/linux/v3/**"
       - "fastest/linux/competitors/**"
+      # t3run calls these too (NEEDS: gates/warmup_conformance.py, hw/record.sh, fs/mkloop.sh; review 6 LOW 16)
+      - "fastest/linux/gates/**"
+      - "fastest/linux/hw/**"
+      - "fastest/linux/fs/**"
       - ".github/workflows/fastest-t3-dryrun.yml"
 
 concurrency:
@@ -54,10 +60,12 @@ jobs:
           - {block: brd, plant: ""}
           - {block: loop, plant: v3-verdict-missing, expect: "V3 before: rc 2&&planted-missing-verdict.json does not bind"}
           - {block: loop, plant: v3l-fsync-half, expect: "V3L VOID (block 1): &&V1L fsync: 5000 fsync of the data file, registered 10000", v3lplant: fsync2}
-          - {block: loop, plant: v3l-cache-lie, v3lplant: cache-lie, expect: "V3L VOID (block 1): &&write-back drive &&: its flush counter rose||V3L VOID (block 1): &&did not reach the drive"}
+          - {block: loop, plant: v3l-cache-lie, v3lplant: cache-lie, expect_wb: "write-back drive &&: its flush counter rose", expect_wt: "did not reach the drive"}
     env:
       PLANT: ${{ matrix.plant }}
       EXPECT: ${{ matrix.expect }}
+      EXPECT_WB: ${{ matrix.expect_wb }}
+      EXPECT_WT: ${{ matrix.expect_wt }}
       V3LPLANT: ${{ matrix.v3lplant }}
     steps:
       - name: The one command, as on a rented box
@@ -72,9 +80,9 @@ jobs:
                 ${PLANT:+--plant "$PLANT"} --manifest "${{ inputs.manifest || 'fastest/linux/t3/cells-smoke.tsv' }}" || rc=$?
           echo "one-command wall seconds: $(( $(date +%s) - start )) rc=$rc block=${{ matrix.block }} plant=${PLANT:-none}" | tee "$HOME/t3-wall.txt"
           echo "$rc" > "$HOME/t3-rc.txt"
-          # a planted run must fail (rc 1); the Summary step checks it failed for the planted reason. A draw the plant
-          # cannot reach (plant-notrun.txt) runs unplanted, and the Summary step requires every block to pass
-          if [ -n "$PLANT" ]; then [ "$rc" = 1 ] || [ -f "$HOME/t3-out/plant-notrun.txt" ]; else exit $rc; fi
+          # a planted run must fail (rc 1); the Summary step checks it failed for the planted reason (a plant that
+          # cannot be planted fails the block that asked for it, never passes unplanted: review 6 LOW 11)
+          if [ -n "$PLANT" ]; then [ "$rc" = 1 ]; else exit $rc; fi
       - name: Summary
         if: always()
         run: |
@@ -98,29 +106,35 @@ jobs:
                                    "outcome": (b.get("v3_drift") or {}).get("outcome")},
                    "v3l": b.get("v3l", {}).get("published"),
                    "v3l_verdict": b.get("v3l", {}).get("verdict")}))
-          plant, expect = os.environ.get("PLANT"), os.environ.get("EXPECT")
-          notrun = os.path.join(os.path.dirname(sys.argv[1]), "plant-notrun.txt")
-          if plant and os.path.exists(notrun):
-              # a draw the plant cannot reach (v3l-cache-lie on a leaf that is not a loop; review 5 MED 4) is
-              # NOT-RUN, said so, and passes only if every block then passed with nothing planted
-              print("PLANT", plant, open(notrun).read().strip())
-              blocks = s.get("blocks") or []
-              sys.exit(0 if blocks and all(b.get("ok") for b in blocks) and not s["failed_stages"] else 1)
+          plant, expect = os.environ.get("PLANT"), os.environ.get("EXPECT") or ""
           if plant:
               # the plant must be the reason, at the first block; the second block must pass (review H1)
               blocks = s.get("blocks") or [{}]
               first, rest = blocks[0], blocks[1:]
-              why = " | ".join(first.get("why", []))
+              whys = first.get("why", [])
+              why = " | ".join(whys)
               v3lp = os.environ.get("V3LPLANT")
+              b0 = (first.get("v3l") or {}).get("before") or {}
+              wc = (b0.get("leaf") or {}).get("write_cache")
+              by_class = {"write back": os.environ.get("EXPECT_WB"), "write through": os.environ.get("EXPECT_WT")}
+              if any(by_class.values()):
+                  # keyed to the drawn drive's class, within one of b0's V3L void reasons (review 6 LOW 9: an
+                  # unconditional "||" let the write rule's text alone pass a write-back draw)
+                  parts = by_class.get(wc)
+                  text = (bool(parts) and any(w.startswith("V3L VOID (block 1): ") for w in whys)
+                          and any(all(p in r for p in parts.split("&&")) for r in b0.get("void_reasons") or []))
+              else:
+                  text = any(all(p in w for p in alt.split("&&")) for alt in expect.split("||") for w in whys)
               checks = {
                   "plant recorded": s.get("plant") == plant,
                   "only the first block failed": s["failed_stages"] == ["fs-" + first.get("fs", "?")],
-                  "the planted text": any(all(part in why for part in alt.split("&&")) for alt in expect.split("||")),
+                  "the planted text": text,
                   "a later block ran and passed": bool(rest) and all(b.get("ok") for b in rest),
                   "v3l.json names the plant": not v3lp or (first.get("v3l", {}).get("before") or {}).get("plant") == v3lp,
               }
               ok = all(checks.values())
-              print("PLANT", plant, "fired as planted" if ok else "DID NOT FIRE AS PLANTED", checks, "-", why)
+              print("PLANT", plant, "fired as planted" if ok else "DID NOT FIRE AS PLANTED", checks, "- drive class",
+                    wc, "-", why)
               sys.exit(0 if ok else 1)
           # summarize's own verdict, not a hand copy of its terms (fourth lane review LOW 23)
           print("summarize ok:", s.get("ok"), "fixture_refusals", s.get("fixture_refusals"))

@@ -1439,6 +1439,23 @@ fn vacuum_completion_error(completion: &Completion, context: &'static str) -> Li
     )
 }
 
+/// A sync of the source's WAL that in-place VACUUM issues itself (its header's after a truncation,
+/// its image's before it is published). With a branch store it can be a drain of the branch files'
+/// device, so a failure goes to the pager's at-risk decision as the WAL's own syncs do
+/// (`WalFile::watched`; engine review 21 LOW 19): at issue (`Pager::trunk_wal_sync_failed`), or,
+/// noted (`Pager::note_trunk_wal_sync`), where its completion is found failed
+/// (`Pager::check_noted_syncs`). Mutant `vacuum_sync_unwatched` (test builds only): neither, as
+/// before.
+fn watched_vacuum_sync(pager: &Pager, issued: Result<Completion>) -> Result<Completion> {
+    if !crate::branch::store::fe_mutant("vacuum_sync_unwatched") {
+        match &issued {
+            Err(_) => pager.trunk_wal_sync_failed(),
+            Ok(c) => pager.note_trunk_wal_sync(c),
+        }
+    }
+    issued
+}
+
 /// Coalesce `(page_ref, frame_id)` pairs into contiguous-frame-id runs.
 ///
 /// Plain `VACUUM` relies on the temp-WAL-only invariant: every temp page
@@ -1977,6 +1994,9 @@ fn vacuum_in_place_step(
                     return Ok(IOResult::IO(IOCompletions(completion.clone())));
                 }
                 if !completion.succeeded() {
+                    if *fsync_phase {
+                        source_pager.check_noted_syncs();
+                    }
                     return Err(vacuum_completion_error(completion, "WAL header init"));
                 }
 
@@ -1984,7 +2004,10 @@ fn vacuum_in_place_step(
                     // Header write done — issue the fsync via prepare_wal_finish
                     // to set WAL `initialized = true`.
                     let wal = source_pager.wal.as_ref().unwrap();
-                    let sync_c = wal.prepare_wal_finish(source_pager.get_sync_type())?;
+                    let sync_c = watched_vacuum_sync(
+                        &source_pager,
+                        wal.prepare_wal_finish(source_pager.get_sync_type()),
+                    )?;
                     *completion = sync_c;
                     *fsync_phase = true;
                     continue;
@@ -2179,7 +2202,8 @@ fn vacuum_in_place_step(
                 // pager commit path in Pager::commit_tx / CommitState.
                 let sync_mode = connection.get_sync_mode();
                 if sync_mode == SyncMode::Full {
-                    let sync_c = wal.sync(source_pager.get_sync_type())?;
+                    let sync_c =
+                        watched_vacuum_sync(&source_pager, wal.sync(source_pager.get_sync_type()))?;
                     *phase = VacuumInPlacePhase::SyncSourceWal {
                         sync_completion: sync_c,
                     };
@@ -2196,6 +2220,7 @@ fn vacuum_in_place_step(
                     return Ok(IOResult::IO(IOCompletions(sync_completion.clone())));
                 }
                 if !sync_completion.succeeded() {
+                    source_pager.check_noted_syncs();
                     return Err(vacuum_completion_error(sync_completion, "WAL fsync"));
                 }
                 *phase = VacuumInPlacePhase::PublishWalCommit;

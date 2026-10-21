@@ -120,6 +120,7 @@ nestloops_self_test() {
   t "a failing losetup's own stderr reaches loop_list's stderr" \
     "$(PATH="$td:$PATH" loop_list 2>&1 > /dev/null | grep -q 'losetup: cannot open /dev/loop-control' && echo seen)" seen
   rm -rf "$td"
+  echo "TALLY ran=$((pass + fail)) pass=$pass na=0 fail=$fail"  # gates/tally.py
   echo "NESTLOOPS SELF-TEST $pass/$((pass + fail)) $([ "$fail" = 0 ] && [ "$pass" -gt 0 ] && echo PASS || echo FAIL)"
   [ "$fail" = 0 ] && [ "$pass" -gt 0 ]
 }

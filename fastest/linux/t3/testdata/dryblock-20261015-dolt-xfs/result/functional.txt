@@ -1,0 +1,15 @@
+PASS server binary: ok: dolt arm64 binary /home/idide.guest/t3-out/dist/dolt-bin/dolt is the registered one
+PASS seed GC settings record (fthelp.py gcsettings): ok
+prebranch: 20 branches at C=4 in 0.033572 s (bound 1800 s, capped False)
+PASS live branches before the cells (LIVE0, read back): 21
+PASS parent read back by the engine (count|sum|row hash) and its piped streams are the generator's: 10000|89963830|84362189621
+PASS server version: ok: dolt 2.4.1
+PASS no test plant ran on MNT before the measured cells (LOW 25): none
+## functional checks (dolt on xfs)
+PASS branch count after every cell (every create deleted: LIVE0): 21
+PASS isolation: parent/main count|sum(v): 10000|89963830
+PASS isolation: dolt-a-m1 designated branch b_r6ad113ee51555_0_0 count|sum(v) after one UPDATE: 10000|89963831
+PASS isolation: dolt-b-m1 designated branch b_r6ad113ee5970d_0_0 count|sum(v) after one UPDATE: 10000|89963831
+PASS isolation: dolt-c-m1 designated branch b_r6ad113ee6160a_0_0 count|sum(v) after one UPDATE: 10000|89963831
+PASS branch count after 3 designated create(s) with no delete (the N counter sees a kept create): 24
+VERDICT PASS (dolt)
