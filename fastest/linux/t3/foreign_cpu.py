@@ -776,6 +776,12 @@ def self_test():
         ("uw4 E4: a process of ours that exited before the stop keeps its uid and login, its run unknown (?)",
          len(burn_owner) == 1 and burn_owner[0][2] == str(me_uid) and burn_owner[0][4] == "?"),
     ]
+    # UNEXPLAINED (the lead's ruling, 2026-10-21): the eceubuntu4 FAIL that started the late-load rule (linux-f6gate and
+    # linux-f6cal: a VALID baseline at load1 0.14, then BOTH cases that start SUT processes VOIDed; no VOID reasons were
+    # printed, as that predates 8c400fdf3) has no verified cause. 25 reruns there all had a busy baseline, and Ubuntu
+    # hosts refuse the private PID namespace that let iccad11 run the branch live. Blind spot, stated: if the load was
+    # triggered BY the self-test's own processes (the uid-0 s1-agent reacting to them, say), it is another uid's, so it
+    # reads N/A here, not FAIL. On T3 that changes nothing: --require-all refuses any N/A.
     # LATE LOAD (found 2026-10-21 on eceubuntu4, raws linux-f6gate/linux-f6cal): the quiet baseline passed, then load
     # that arrived later VOIDed a VALID-wanting live case, which read FAIL ("SUT burners only: want VALID, got VOID")
     # where the host, not the sampler, was at fault. Such a case is N/A-on-busy-host only on evidence that cannot be
