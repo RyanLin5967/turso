@@ -611,7 +611,6 @@ impl PgConnection {
         server_files: ServerFiles,
         database_name: Option<Arc<str>>,
     ) -> Self {
-        aliases::install(&conn);
         // PostgreSQL enforces every foreign key; the engine only under PRAGMA foreign_keys.
         conn.set_foreign_keys_enabled(true);
         let pg = Self {

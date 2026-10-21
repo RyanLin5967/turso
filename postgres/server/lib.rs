@@ -7731,7 +7731,6 @@ mod tests {
             ("frontend/catalog.rs", include_str!("../frontend/catalog.rs")),
             ("frontend/functions.rs", include_str!("../frontend/functions.rs")),
             ("frontend/lib.rs", include_str!("../frontend/lib.rs")),
-            ("frontend/aliases.rs", include_str!("../frontend/aliases.rs")),
             ("frontend/copy.rs", include_str!("../frontend/copy.rs")),
             ("frontend/information_schema.rs", include_str!("../frontend/information_schema.rs")),
             ("frontend/pg_settings.rs", include_str!("../frontend/pg_settings.rs")),
