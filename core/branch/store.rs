@@ -3419,6 +3419,9 @@ fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU
                 rows.extend(catalog.children_below(p, f, 1)?.first().map(|&e| (p, e)));
                 rows.extend(catalog.children_above(p, f, 1)?.first().map(|&e| (p, e)));
             }
+            // Test builds (h1gap-rev-c HIGH-3): rows a checkpoint relinked around its own changes.
+            #[cfg(test)]
+            CKPT_RELINKED.fetch_add((rows.len() + parents.len()) as u64, Ordering::AcqRel);
             for (p, f) in rows {
                 links.extend(catalog.relink(p, f)?);
             }
@@ -3988,6 +3991,9 @@ pub(crate) static LINKS_FILL_HOLD_AT_ENTRY: AtomicBool = AtomicBool::new(false);
 pub(crate) static LINKS_FILL_COLUMNS_IN_BATCH: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 pub(crate) static LINKS_FILL_ENTRY_HELD: AtomicU64 = AtomicU64::new(0);
+/// Test builds (h1gap-rev-c HIGH-3): rows (and parents) checkpoints relinked around their own changes.
+#[cfg(test)]
+pub(crate) static CKPT_RELINKED: AtomicU64 = AtomicU64::new(0);
 /// Test builds (h1gap-rev-c MED-1): while set, a fill thread panics at its start.
 #[cfg(test)]
 pub(crate) static LINKS_FILL_PANICS: AtomicBool = AtomicBool::new(false);

@@ -971,3 +971,70 @@ fn a_crash_between_a_non_flip_cut_and_the_flip_reopens_with_every_link_right() {
         assert_eq!(wrong, 0, "older={older}: {wrong} of {rows} rows have wrong links after a crash between a non-flip cut and the flip");
     }
 }
+
+
+// ---- h1gap-rev-c HIGH-3 (ruling 62c11ec63d): the close-time flip relinks O(changes), not O(N) ----
+
+#[test]
+fn ls_close_flip_child() {
+    if !in_child() {
+        return;
+    }
+    let n: usize = std::env::var("FE_LS_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(300);
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("c.db");
+    older_store(&path, n);
+    super::journal::set_compact_threshold(4 << 10);
+    {
+        let db = open(&path);
+        db.branch_wait_name_filter();
+        let trunk = db.connect().unwrap();
+        while log_bytes(&path) < 6 << 10 {
+            let _ = trunk.fork_branch().unwrap().into_id();
+        }
+    }
+    // Sessions of one create and an idle until the fill completes; the session whose fill completed is
+    // the one whose close flips, measured alone.
+    for _ in 0..20 {
+        let (w0, r0) = (super::catalog::WHOLE_UPGRADE_BATCHES.load(Ordering::Acquire), super::store::CKPT_RELINKED.load(Ordering::Acquire));
+        let prefilled = {
+            let db = open(&path);
+            db.branch_wait_name_filter();
+            let trunk = db.connect().unwrap();
+            let _ = trunk.fork_branch().unwrap().into_id();
+            let t = std::time::Instant::now();
+            while !db.branches.links_fill_state_for_test().1 && t.elapsed() < std::time::Duration::from_secs(30) {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            db.branches.links_fill_state_for_test().1
+        };
+        if prefilled {
+            let whole = super::catalog::WHOLE_UPGRADE_BATCHES.load(Ordering::Acquire) - w0;
+            let relinked = super::store::CKPT_RELINKED.load(Ordering::Acquire) - r0;
+            println!("LS-CLOSEFLIP rows={n} meta={} whole={whole} relinked={relinked}", meta_version(&path));
+            return;
+        }
+    }
+    println!("LS-CLOSEFLIP rows={n} meta={} whole=9999 relinked=9999", meta_version(&path));
+}
+
+/// h1gap-rev-c HIGH-3 (ruling 62c11ec63d's counter): the close-time flip of a store whose fill completed
+/// in an idle session links no row by the whole-catalog upgrade, and relinks as many rows around its own
+/// changes at 3,000 rows as at 300 (one create's: not O(N)). Premise: the flip happened (meta 21).
+#[test]
+fn the_close_time_flip_relinks_its_own_changes_not_the_catalog() {
+    if in_child() {
+        return;
+    }
+    let mut got = Vec::new();
+    for rows in ["300", "3000"] {
+        let text = child("ls_close_flip_child", &[("FE_LS_ROWS", rows)]);
+        let r = readings(&text, "LS-CLOSEFLIP ");
+        assert_eq!(r.len(), 1, "premise: the child reported:\n{text}");
+        let (n, meta, whole, relinked) = (r[0][0], r[0][1], r[0][2], r[0][3]);
+        assert_eq!(meta, 21, "{n} rows: premise: the close flipped the store");
+        assert_eq!(whole, 0, "{n} rows: the close-time flip ran the whole-catalog upgrade ({whole} batches)");
+        got.push(relinked);
+    }
+    assert_eq!(got[0], got[1], "the close-time flip relinked {} rows at 300 and {} at 3,000: it grows with the catalog", got[0], got[1]);
+}
