@@ -93,11 +93,14 @@ HOME = {"pg18-": "connect host=127.0.0.1 port={port} user=postgres dbname=postgr
 PER_CYCLE = {"doltgres-b-m1.spec": "after admin-sql SELECT dolt_branch('-d', '{branch}')"}
 
 
-def statements_problems(text):
+def statements_problems(text, spec_dir=SPECS):
     """comp-rev-9bc7d894a LOW 5: REG's variant (b) switch rows against STATEMENTS.md's Statements table TEXT (artie
     frontier/fastest/tools/loadgen/specs/STATEMENTS.md). Each row '| system | b | m1c-switch or m1-switch | conninfo |
     steps | after |' gives the timed steps and the first after-step, '<br>'-separated, as 'sql X' / 'write X'; REG must
     hold exactly those for {system}-b-m1c.spec / {system}-b-m1.spec. Returns the disagreements ([] = none)."""
+    # comp-rev-9bc7d894a final LOW B: and the WHOLE after list and the home line, read from the specs themselves. A row
+    # registers `home per-cycle` by naming it in any of its cells; the one registered Linux difference is Dolt's delete
+    # as sql-serial (Codex C04, DECISIONS 4317e92c2b), which STATEMENTS.md writes as plain sql
     want = {}
     for ln in text.splitlines():
         cells = [c.strip() for c in ln.strip().strip("|").split("|")]
@@ -105,17 +108,25 @@ def statements_problems(text):
             continue
         f = f"{cells[0]}-b-{'m1c' if cells[2] == 'm1c-switch' else 'm1'}.spec"
         want[f] = (["step " + s.strip() for s in cells[4].split("<br>")],
-                   "after " + cells[5].split("<br>")[0].strip())
+                   ["after " + s.strip() for s in cells[5].split("<br>")],
+                   "home per-cycle" in ln)
     why = []
     for f in ("dolt-b-m1c.spec", "dolt-b-m1.spec", "doltgres-b-m1c.spec", "doltgres-b-m1.spec"):
         if f not in want:
             why.append(f"{f}: no (b) {f.split('-b-')[1][:-5]}-switch row in STATEMENTS.md")
             continue
-        steps, back = want[f]
+        steps, after, per_cycle = want[f]
         if REG[f][2] != steps:
             why.append(f"{f}: REG times {REG[f][2]}, STATEMENTS.md {steps}")
-        if REG[f][4] != back:
-            why.append(f"{f}: REG switches back with {REG[f][4]!r}, STATEMENTS.md {back!r}")
+        lines = [ln.rstrip("\n") for ln in open(os.path.join(spec_dir, f)) if ln.strip() and not ln.startswith("#")]
+        got_after = [ln for ln in lines if ln.startswith("after ")]
+        if f.startswith("dolt-"):
+            got_after = [ln.replace("after sql-serial ", "after sql ", 1) for ln in got_after]
+        if got_after != after:
+            why.append(f"{f}: the spec's after-steps {got_after}, STATEMENTS.md {after}")
+        if per_cycle != ("home per-cycle" in lines):
+            why.append(f"{f}: the spec {'runs' if 'home per-cycle' in lines else 'does not run'} home per-cycle, "
+                       f"STATEMENTS.md {'names' if per_cycle else 'does not name'} it")
     return why
 
 
