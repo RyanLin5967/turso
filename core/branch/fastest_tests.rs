@@ -16614,3 +16614,57 @@ fn every_call_shape_of_the_alter_rewrite_scalar_answers_as_an_unknown_function_d
         .collect();
     assert!(failed.is_empty(), "CLAIM: every call shape answers as an unknown function: {failed:#?}");
 }
+
+/// fe-mutkill (survivor of the f4683e89d lib sweep): the class an open decides from a kept flight's
+/// tags, stronger than the store's own and the header's raised field, is noted as a raise so the
+/// next rewrite writes it into the header (journal.rs `finish`, engine review 18 MED 2). A log
+/// created by a D0 run (an anchor fork) has an Off header; a D1 run then writes x into it and
+/// never rewrites the header (premise: its raised field still reads Off), so only x's flight tags
+/// say Fsync. A D0 process opens it and compacts; a second D0 process opens the compacted log (no
+/// flight left) and reaps x: a new branch reuses none of x's slots. Both stores. Mutant
+/// `synced_open_unpersisted`.
+#[test]
+fn a_tag_decided_class_outlives_the_compaction_into_a_second_d0_process() {
+    let _s = serial();
+    for catalog in [false, true] {
+        let what = format!("catalog={catalog}");
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("tag-class.db");
+        let first = {
+            let db = open_at(&path, opts(catalog, SyncClass::Off));
+            let trunk = db.connect().unwrap();
+            seed(&trunk);
+            // The branch files, created by a D0 run: the log's header says Off.
+            let _anchor = trunk.fork_branch().unwrap().into_id();
+            db.incarnation
+        };
+        let (id, slots, second) = {
+            let db = reopen(&path, opts(catalog, SyncClass::Fsync), first);
+            let trunk = db.connect().unwrap();
+            let x = trunk.fork_branch().unwrap();
+            write_v(&x.connect().unwrap(), 3, "x");
+            let slots = x.owned_slots();
+            assert!(!slots.is_empty(), "{what}: premise: x's write took a slot");
+            (x.into_id(), slots, db.incarnation)
+        };
+        let log = std::fs::read(format!("{}-branch-log", path.display())).unwrap();
+        assert_eq!(
+            log.get(32..36),
+            Some(&[0u8, 0, 0, 0][..]),
+            "{what}: premise: the D1 run left the log header's raised-class field (byte 32) at Off"
+        );
+        let third = {
+            let db = reopen(&path, opts(catalog, SyncClass::Off), second);
+            db.branch_compact_now().unwrap();
+            db.incarnation
+        };
+        let db = reopen(&path, opts(catalog, SyncClass::Off), third);
+        let trunk = db.connect().unwrap();
+        db.branch(id).unwrap().reap().unwrap();
+        let took = reused_by_a_new_branch(&trunk, &slots);
+        assert!(
+            took.is_empty(),
+            "{what}: slots {took:?} were reused before a sync covered the Release, over records a D1 run made durable (its class known only from its flights' tags)"
+        );
+    }
+}
