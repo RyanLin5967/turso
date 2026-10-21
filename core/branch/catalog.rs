@@ -95,6 +95,10 @@ const LEGACY_BRANCH_TABLE: &str = "CREATE TABLE IF NOT EXISTS branch(id INTEGER 
 /// catalog rows touched per row, so a batch's transaction is bounded whatever the store holds (as
 /// `SETTLE_BATCH` bounds a settle).
 pub(crate) const UPGRADE_BATCH: usize = 64;
+/// Test builds (h1gap-rev-c HIGH-2): batches run by `upgrade_links`, the whole-catalog upgrade a checkpoint
+/// runs when no fill linked the rows before it.
+#[cfg(test)]
+pub(crate) static WHOLE_UPGRADE_BATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Links adversary 3 H1: the upgrade fill's progress, one row (k 0), committed with each batch, so a
 /// later open resumes where the last left off while no checkpoint (of any build) has committed
@@ -858,10 +862,15 @@ impl Catalog {
     /// fallback, for a first checkpoint no bounded prefill preceded (links adversary L4).
     pub(crate) fn upgrade_links(&mut self) -> Result<()> {
         let mut at = None;
-        while let Some(next) = self.upgrade_links_batch(at, UPGRADE_BATCH)? {
-            at = Some(next);
+        loop {
+            // Test builds (h1gap-rev-c HIGH-2): the batches a whole-catalog upgrade ran (inside a checkpoint).
+            #[cfg(test)]
+            WHOLE_UPGRADE_BATCHES.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            match self.upgrade_links_batch(at, UPGRADE_BATCH)? {
+                Some(next) => at = Some(next),
+                None => return Ok(()),
+            }
         }
-        Ok(())
     }
 
     /// One bounded batch of the upgrade's fill (links adversary L4, lead ruling: mutex work must not

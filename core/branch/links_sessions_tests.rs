@@ -188,6 +188,60 @@ fn a_fill_thread_that_panics_does_not_hang_an_explicit_checkpoint() {
     assert_eq!(filling, 0, "the store still reads as filling after its fill thread panicked");
 }
 
+// ---- h1gap-rev-c HIGH-2: past the hard limit, no checkpoint links the whole catalog ----
+
+#[test]
+fn ls_hard_whole_child() {
+    if !in_child() {
+        return;
+    }
+    let n: usize = std::env::var("FE_LS_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(1_000);
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("w.db");
+    older_store(&path, n);
+    super::journal::set_compact_threshold(4 << 10);
+    // A slow fill (1 s after each batch): the hard limit is passed long before it ends.
+    super::store::LINKS_FILL_PAUSE_MS.store(1_000, Ordering::Release);
+    let db = open(&path);
+    db.branch_wait_name_filter();
+    let trunk = db.connect().unwrap();
+    let w0 = super::catalog::WHOLE_UPGRADE_BATCHES.load(Ordering::Acquire);
+    let mut k = 0;
+    while !db.branches.past_hard_limit_for_test() && k < 20_000 {
+        let _ = trunk.fork_branch().unwrap().into_id();
+        k += 1;
+    }
+    let past = db.branches.past_hard_limit_for_test();
+    // Operations past the hard limit, then the checkpoints they started are waited for.
+    for _ in 0..200 {
+        let _ = trunk.fork_branch().unwrap().into_id();
+    }
+    db.branch_checkpoint_wait();
+    let whole = super::catalog::WHOLE_UPGRADE_BATCHES.load(Ordering::Acquire) - w0;
+    super::store::LINKS_FILL_PAUSE_MS.store(0, Ordering::Release);
+    println!("LS-WHOLE rows={n} past={} creates={k} whole_batches={whole} log={}", u64::from(past), log_bytes(&path));
+}
+
+/// h1gap-rev-c HIGH-2: past the hard log limit, with a slow fill, no checkpoint links the whole catalog
+/// inside its capture (an O(N) stall of every create: under the store mutex in the sharp mode, and
+/// behind the install every operation waits for in the fuzzy one; the reviewer measured 1.2-4.7 s at
+/// N=1000-4000). Counted, not timed: the batches a whole-catalog upgrade ran (`WHOLE_UPGRADE_BATCHES`)
+/// are at most one, at 1,000 and at 4,000 rows. Premise: the log passed the hard limit.
+#[test]
+fn past_the_hard_log_limit_no_checkpoint_links_the_whole_catalog() {
+    if in_child() {
+        return;
+    }
+    for rows in ["1000", "4000"] {
+        let text = child("ls_hard_whole_child", &[("FE_LS_ROWS", rows)]);
+        let r = readings(&text, "LS-WHOLE ");
+        assert_eq!(r.len(), 1, "premise: the child reported:\n{text}");
+        let (n, past, whole) = (r[0][0], r[0][1], r[0][3]);
+        assert_eq!(past, 1, "{n} rows: premise: the log never passed the hard limit");
+        assert!(whole <= 1, "{n} rows: past the hard limit a checkpoint linked the whole catalog ({whole} batches of {})", super::catalog::UPGRADE_BATCH);
+    }
+}
+
 // ---- h1gap-rev-c HIGH-1: the fill resumes from its cursor, below the hard limit ----
 
 #[test]
