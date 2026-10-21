@@ -596,9 +596,11 @@ def self_test():
     for args in (
         ("cal-user", [(True, 0, 6, 1.0, "user"), (True, 0, 6, 0.68, "user"), (True, 0, 6, 0.3, "user")]),
         ("cal-sys-mt", [(True, 0, 6, 1.0, "sys"), (True, 0, 6, 1.0, "mt2")]),
-        ("cal-rule2", [(False, 0, 8, 0.56, "user"), (False, 0, 8, 0.44, "user")],
+        ("cal-rule2", [(False, 0, 8, 0.56, "user"), (False, 0, 8, 0.44, "user"), (False, 0, 8, 0.62, "user")],
          [("rule 2 names a foreign burner at duty 0.56", [0], lambda v_, p_: names(v_, p_)),
-          ("rule 2 does not name a foreign burner at duty 0.44", [1], lambda v_, p_: not names(v_, p_))]),
+          ("rule 2 does not name a foreign burner at duty 0.44", [1], lambda v_, p_: not names(v_, p_)),
+          ("rule 2 names a foreign burner at duty 0.62", [2], lambda v_, p_: names(v_, p_))]),
+        ("cal-foreign-sys-mt", [(False, 0, 6, 1.0, "sys"), (False, 0, 6, 1.0, "mt2")]),
         ("cal-rule1", [(False, 0, 8, 0.37, "user")] * 3,
          [("rule 1 voids three foreign burners at duty 0.37 (111%)", [0, 1, 2], lambda v_, p_: rule1(v_))]),
         ("cal-rule1-not", [(False, 0, 8, 0.30, "user")] * 3,
@@ -647,13 +649,13 @@ def self_test():
     # Synthetic: each rule alone, on records whose every number is chosen here (a live box's own
     # background cannot be held still: runs 37255216397 and 37255904818 voided a 3 s burner by the
     # one-core rule once the runner's background was added to it).
-    def synth(label, ticks, procs=(), stopped=True, gap_at=None):
+    def synth(label, ticks, procs=(), stopped=True, gap_at=None, step=1.0):
         f = os.path.join(d, f"synth-{label}.tsv")
         with open(f, "w") as o:
             o.write("#start\t0\tcell=ST\tinterval=1.0\tload=()\n")
             t = 0.0
             for i, foreign in enumerate(ticks):
-                t += 4.0 if gap_at == i else 1.0
+                t += 4.0 if gap_at == i else step
                 for pid, start, n, pct in procs:
                     if start <= i < start + n:
                         o.write(f"{t:.3f}\t{pid}\tburn\t{pct}\tforeign\n")
@@ -956,6 +958,12 @@ def self_test():
         ("unusable: the sampler never stopped", synth("nostop", [10] * 20, stopped=False), "VOID"),
         ("unusable: 2 ticks", synth("short", [10, 10]), "VOID"),
         ("unusable: a 4 s gap", synth("gap", [10] * 20, gap_at=10), "VOID"),
+        # linux-rev-9d6de652f MED 1: ticks 1.55 s apart broke rule 2's run (it assumes at most 1.5 intervals), so one
+        # foreign process at 100% in every tick read VALID; such a record must refuse
+        ("MED 1: one foreign process at 100% in 30 ticks 1.55 s apart is not VALID",
+         synth("gap155", [100] * 30, [(7, 0, 30, 100.0)], step=1.55), "VOID"),
+        ("MED 1: the same at 1.45 s apart is VOID (rule 2 still fires)",
+         synth("gap145", [100] * 30, [(7, 0, 30, 100.0)], step=1.45), "VOID"),
     ]
     for label, got, want in synthetic:
         ok = got == want
