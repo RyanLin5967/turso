@@ -98,8 +98,12 @@ def build(features):
         cmd += ["--config", f'target.{host_triple()}.rustflags=["{FIRECHECK_CFG}"]']
     cmd += ["test", "--release", "-p", "turso_core", "--test", "async_s0", "--no-run", "--message-format=json"]
     env = dict(os.environ)
-    # Neither binary takes RUSTFLAGS from the caller: it would replace the workspace's rustflags.
+    # Neither binary takes rustflags from the caller: RUSTFLAGS would replace the workspace's, and
+    # CARGO_ENCODED_RUSTFLAGS (which cargo exports to whatever it spawns) overrides both RUSTFLAGS and
+    # `--config` (engine-rev-async-20200c00a L4: with it set, the fire-check build lost the gate and
+    # a reading build could gain it).
     env.pop("RUSTFLAGS", None)
+    env.pop("CARGO_ENCODED_RUSTFLAGS", None)
     if features:
         cmd += ["--features", features]
     out = subprocess.run(cmd, check=True, capture_output=True, text=True, env=env).stdout
@@ -111,6 +115,21 @@ def build(features):
         if m.get("reason") == "compiler-artifact" and m.get("target", {}).get("name") == "async_s0" and m.get("executable"):
             return m["executable"]
     sys.exit("REFUSED: no async_s0 executable in cargo's output")
+
+
+def gate(binary, want):
+    """The binary's own report of its build (async_s0.rs `ad_t5_gate`), checked before any arm runs:
+    the fire-check binary must carry the gate and fe-mutants, the reading binary neither."""
+    env = dict(os.environ)
+    env.pop("FE_MUTANT", None)
+    out = subprocess.run([binary, "ad_t5_gate", "--exact", "--nocapture", "--test-threads=1"],
+                         check=True, capture_output=True, text=True, env=env).stdout
+    lines = [l for l in out.splitlines() if l.startswith("AD-T5 GATE ")]
+    if len(lines) != 1:
+        sys.exit(f"REFUSED: {binary} printed {len(lines)} AD-T5 GATE lines, not 1")
+    got = dict(kv.split("=", 1) for kv in lines[0][len("AD-T5 GATE "):].split())
+    if got != want:
+        sys.exit(f"REFUSED: {binary} reports {got}, the driver built it to be {want}")
 
 
 def sha256(path):
@@ -183,6 +202,8 @@ def main():
     os.makedirs(outdir, exist_ok=True)
     reading_bin = build(None)
     fire_bin = build("turso_core/fe-mutants")
+    gate(reading_bin, {"fe_ad_t5_firecheck": "false", "fe_mutants": "false"})
+    gate(fire_bin, {"fe_ad_t5_firecheck": "true", "fe_mutants": "true"})
     print(f"reading binary {reading_bin} sha256={sha256(reading_bin)}")
     print(f"fire-check binary {fire_bin} sha256={sha256(fire_bin)}")
     base_r, base_c = run(fire_bin, None, outdir, "fire-unmutated")
