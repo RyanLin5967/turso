@@ -302,8 +302,19 @@ def selftest():
         "bench<br>sql CALL DOLT_BRANCH('-d', '{branch}') |\n"
         "| dolt | b | m1-switch | `h` | sql CALL DOLT_BRANCH('{branch}', 'main')<br>sql USE `bench/{branch}`<br>write "
         "UPDATE t SET v = v + 1 WHERE id = {rand:1:rows} | sql USE bench<br>sql CALL DOLT_BRANCH('-d', '{branch}') |\n")
+    # comp-rev-9bc7d894a final LOW B: the WHOLE after list and the home line are compared too, so the rows above (STATEMENTS.md
+    # as it stands, before it registers the lead's 2026-10-19 Doltgres b-m1 ruling) must be named as lagging, and the
+    # ruled form -- the row marked "home per-cycle", its delete an admin-sql step -- agrees. Dolt's sql-serial delete is
+    # the one registered Linux difference (Codex C04, DECISIONS 4317e92c2b): STATEMENTS.md writes it as plain sql.
     got = sp(rows)
-    ok(f"STATEMENTS.md's (b) rows as they stand agree with REG (got {got!r})", got == [])
+    ok(f"STATEMENTS.md as it stands (pre-ruling doltgres m1-switch row) is named as lagging the ruling (got {got!r})",
+       bool(got) and all("doltgres-b-m1.spec" in w for w in got))
+    rows = rows.replace(
+        "| doltgres | b | m1-switch | `h` |", "| doltgres | b | m1-switch | `h` (home per-cycle) |").replace(
+        "rows} | sql USE postgres<br>sql SELECT dolt_branch('-d', '{branch}') |",
+        "rows} | sql USE postgres<br>admin-sql SELECT dolt_branch('-d', '{branch}') |")
+    got = sp(rows)
+    ok(f"STATEMENTS.md's (b) rows in the ruled form agree with the specs (got {got!r})", got == [])
     drift = rows.replace("sql USE `bench/{branch}` | sql USE bench", "sql SET @@bench_head_ref = '{branch}' | sql USE bench")
     got = sp(drift)
     ok(f"a drifted STATEMENTS.md (b) row is named (got {got!r})", bool(got) and any("dolt-b-m1c.spec" in w for w in got))
