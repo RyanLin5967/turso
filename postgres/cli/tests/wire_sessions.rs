@@ -16445,6 +16445,28 @@ fn a_decimal_past_15_digits_is_refused_on_every_path() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-351702a43 LOW-2, CASE half (its PG 18.6 probe3 #151, #152): a CASE over parameters and constants is folded
+/// by PG's custom plan at Bind, so the value it assigns to a varchar(3) is checked there: 'a' picks 'long value', 22001
+/// before BindComplete; 'b' picks 'ok' and is stored. Ours left every CASE to Execute (BindComplete, then XX000).
+#[test]
+fn a_case_over_parameters_is_checked_at_bind() {
+    let dir = Scratch::new("bind-case");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE vb(id int, v varchar(3))").ok("create");
+    let sql = |id: i32| format!("INSERT INTO vb VALUES ({id}, CASE WHEN $1 = 'a' THEN 'long value' ELSE 'ok' END)");
+    let mut wrong = Vec::new();
+    let (types, error) = a.bind_round(&sql(32), &[], &[Some(b"b")], &[]);
+    if error.is_some() {
+        wrong.push(format!("'b': messages {:?} error {error:?}, PostgreSQL INSERT 0 1", String::from_utf8_lossy(&types)));
+    }
+    let (types, error) = a.bind_round(&sql(33), &[], &[Some(b"a")], &[]);
+    if types.contains(&b'2') || !error.as_ref().is_some_and(|e| e.code == "22001") {
+        wrong.push(format!("'a': messages {:?} error {error:?}, PostgreSQL: no BindComplete, 22001", String::from_utf8_lossy(&types)));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-7128c6f73 L4 (its PG 18.6 probe7 #3-#5, #10-#13): the engine has no interval type (PGDIV-INTERVAL-TEXT), so
 /// arithmetic with an interval operand or an interval result is refused 0A000 'interval arithmetic is not supported',
 /// never answered: now() + interval '1 day' > now() answered f (PG t), timestamptz - timestamptz answered '0', and
