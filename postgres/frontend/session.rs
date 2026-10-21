@@ -420,6 +420,28 @@ fn refuse_cross_database(
     Ok(())
 }
 
+/// A numeric literal of more than 15 significant digits is refused 0A000 before anything runs,
+/// wherever it stands (a VALUES item, an UPDATE or ON CONFLICT source, a DEFAULT, a comparison, an
+/// expression): the engine reads it as a REAL, which rounds it, and the rounded value would be
+/// stored or compared as if it were PostgreSQL's numeric (wire-rev-7128c6f73 HIGH-1, the lead's
+/// ruling DECISIONS d2bf57effb: never rounded, never stored as text). A literal under an explicit
+/// cast to float4 or float8 is answered, a float being what PostgreSQL reads it as there
+/// ([`turso_pg_parser::long_decimal_literal`], the lexer's tokens). The text bounds the scan, never
+/// decides it: such a literal is written with 16 or more digits, so a statement with fewer is not
+/// scanned (L5's write budget).
+fn refuse_long_decimals(sql: &str) -> Result<()> {
+    if sql.bytes().filter(u8::is_ascii_digit).nth(15).is_none() {
+        return Ok(());
+    }
+    match turso_pg_parser::long_decimal_literal(sql) {
+        Some(literal) => Err(LimboError::ParseError(SqlErrorMessage::classified(
+            SqlErrorKind::FeatureNotSupported,
+            format!("numeric literal {literal} is not supported: more than 15 significant digits would be rounded"),
+        ))),
+        None => Ok(()),
+    }
+}
+
 /// An ALTER COLUMN TYPE the engine cannot do as PostgreSQL does is refused 0A000 before anything
 /// runs. The engine changes the column's declaration and keeps every stored value as it was, so
 /// only a change whose stored form is the same is allowed: text and varchar to text or varchar,
@@ -1614,6 +1636,7 @@ fn prepare_statement_parsed(
     refuse_dropped_schemas(pg_conn, &parse_result)?;
     refuse_alter_column_type_across_families(pg_conn, &parse_result)?;
     refuse_cross_database(pg_conn, sql, &parse_result)?;
+    refuse_long_decimals(sql)?;
     if !pg_conn.conn.get_auto_commit() {
         let relations = turso_pg_parser::translator::named_relations(&parse_result);
         if !relations.is_empty() {

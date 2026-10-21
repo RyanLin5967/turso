@@ -6124,6 +6124,16 @@ fn pg_bytes_to_value(bytes: &[u8], pg_type: &Type) -> PgWireResult<Value> {
                 _ => "numeric",
             };
             let trimmed = text.trim_matches(|c: char| c.is_ascii() && pg_space(c as u8));
+            // A bound numeric of more than 15 significant digits would be the engine's REAL,
+            // rounded: refused, as the same literal is (wire-rev-7128c6f73 HIGH-1, the lead's
+            // ruling DECISIONS d2bf57effb; turso_pg_parser's one predicate). A float parameter
+            // reads it as PostgreSQL's float8in does, so it is not refused there.
+            if *pg_type == Type::NUMERIC && turso_pg_parser::translator::decimal_past_float8(trimmed) {
+                return Err(PgWireError::UserError(error(
+                    SqlErrorKind::FeatureNotSupported,
+                    format!("numeric value {trimmed} is not supported: more than 15 significant digits would be rounded"),
+                )));
+            }
             let f: f64 = trimmed.parse().map_err(|_| syntax(name))?;
             // A finite spelling past the type's range ('1e400'), which Rust reads as infinity.
             let infinite_spelled = trimmed

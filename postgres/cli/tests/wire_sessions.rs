@@ -12380,12 +12380,19 @@ replays_postgresql!(
     "pg18-wirefuzz-operators_over_unknown_and_cast_integers_resolve_as_postgresql_resolves_them.out",
     []
 );
-// wire-rev-cfdebc06d MED-4: a decimal literal of more than 15 significant digits is stored with every digit, in a
-// numeric column and as text, on INSERT and UPDATE; a float8 column keeps the nearest double.
+// wire-rev-cfdebc06d MED-4, then wire-rev-7128c6f73 HIGH-1 (ruled d2bf57effb): a decimal literal of more than 15
+// significant digits is refused 0A000 on INSERT and UPDATE, never rounded and never stored as text.
 replays_postgresql!(
     pg18_wirefuzz_a_long_decimal_literal_is_stored_with_every_digit_replays_as_postgresql_answered,
     "pg18-wirefuzz-a_long_decimal_literal_is_stored_with_every_digit.out",
-    []
+    [
+        (2, "PGDIV-NUMERIC-LITERAL-WIDE refused [wire]: a numeric literal of more than 15 significant digits is refused 0A000 where PG stores its exact value; the engine's REAL would round it (wire-rev-7128c6f73 HIGH-1, ruled d2bf57effb)"),
+        (3, "PGDIV-NUMERIC-LITERAL-WIDE refused [wire]: a numeric literal of more than 15 significant digits is refused 0A000 where PG stores its exact value; the engine's REAL would round it (wire-rev-7128c6f73 HIGH-1, ruled d2bf57effb)"),
+        (4, "PGDIV-NUMERIC-LITERAL-WIDE value [wire]: a cascade of the refused INSERTs and UPDATE, the table is empty here"),
+        (5, "PGDIV-NUMERIC-LITERAL-WIDE value [wire]: a cascade of the refused INSERTs and UPDATE, the table is empty here"),
+        (6, "PGDIV-NUMERIC-LITERAL-WIDE refused [wire]: a numeric literal of more than 15 significant digits is refused 0A000 where PG stores its exact value; the engine's REAL would round it (wire-rev-7128c6f73 HIGH-1, ruled d2bf57effb)"),
+        (7, "PGDIV-NUMERIC-LITERAL-WIDE value [wire]: a cascade of the refused INSERTs and UPDATE, the table is empty here"),
+    ]
 );
 // wire-rev-cfdebc06d HIGH-1: a CAST to NUMERIC(p, s) keeps every digit to precision 15 and is refused above it, never
 // rounded through the engine's REAL; the bigint the refused UPDATE would have changed reads as PostgreSQL's (#14).
