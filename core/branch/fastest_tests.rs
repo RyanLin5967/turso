@@ -16704,3 +16704,41 @@ fn a_fuzzy_checkpoint_leaves_a_small_catalog_wal_untruncated() {
     );
     assert!(after >= before, "CLAIM: the {before}-byte catalog WAL was truncated to {after} bytes by the checkpoint");
 }
+
+/// fe-mutkill (survivor of the f4683e89d lib sweep): LEAP L3's cohort gather holds for at most
+/// `GroupState::gather_bound`, a tenth of the p50 flight, not the fixed 50 us it held before
+/// (`COHORT_GATHER_FIXED`, which expired before nearly every cohort was back). Every syncing flight
+/// is held 100 ms in the air (`journal::FLIGHT_SYNC_DELAY_US`), so the bound is at least 10 ms;
+/// with a cohort of 8 owed and the creator alone, the next create's leader gathers and its hold
+/// expires at the bound: it is held at least 5 ms (a lower bound, which load only lengthens).
+/// Mutant `cohort_gather_fixed`.
+#[test]
+fn a_cohort_gather_holds_for_its_flight_derived_bound() {
+    struct Delay;
+    impl Drop for Delay {
+        fn drop(&mut self) {
+            super::journal::FLIGHT_SYNC_DELAY_US.store(0, std::sync::atomic::Ordering::Release);
+        }
+    }
+    let _s = serial();
+    let _delay = Delay;
+    super::journal::FLIGHT_SYNC_DELAY_US.store(100_000, std::sync::atomic::Ordering::Release);
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("gather-bound.db"), opts(false, SyncClass::Fsync));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    for i in 0..6 {
+        trunk.create_branch(&format!("timed-{i}")).unwrap();
+    }
+    db.branches.set_cohort_for_test(8);
+    let (g0, ns0) = (db.branches.gather_counters(), db.branches.gather_and_flight_ns());
+    trunk.create_branch("gathered").unwrap();
+    let (g1, ns1) = (db.branches.gather_counters(), db.branches.gather_and_flight_ns());
+    assert_eq!(g1[0] - g0[0], 1, "premise: the create's leader held one cohort gather");
+    assert_eq!(g1[1] - g0[1], 1, "premise: the gather expired at its bound (the cohort never came back)");
+    let held = std::time::Duration::from_nanos(ns1[0] - ns0[0]);
+    assert!(
+        held >= std::time::Duration::from_millis(5),
+        "CLAIM: the gather held {held:?}, under half the bound a 100 ms flight sets (at least 10 ms)"
+    );
+}
