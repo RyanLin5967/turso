@@ -76,6 +76,9 @@ case_ "pg18-defaults (dropped on Linux, item 18)" 2 "REFUSED: pg18-defaults is d
 # LOW 13: a non-count ops total refuses before the first cell (it used to cost each cell its conncheck and idle window)
 case_ "an ops total that is not a count (FT_OPS_TOTAL=x)" 2 "REFUSED: the ops total" FT_DRY=1 FT_OPS_TOTAL=x -- pg18-d2
 case_ "an N1 that is not a count (FT_N1=0x10)" 2 "REFUSED: the ops total" FT_DRY=1 FT_N1=0x10 -- b1
+# comp review 1 LOW 16: C is validated even when the total is given (FT_CLIENTS=0 with FT_OPS_TOTAL passed)
+case_ "a client count of 0 with an explicit ops total (FT_CLIENTS=0)" 2 "REFUSED: the ops total" \
+  FT_DRY=1 FT_CLIENTS=0 FT_OPS_TOTAL=5000 -- pg18-d2
 # LOW 26: gen_seed.py sum fails on FT_ROWS=x (int('x')), which left PSUM empty; the guard on PSUM itself must refuse
 case_ "a parent sum(v) that is not a count (gen_seed.py sum fails on FT_ROWS=x)" 2 \
   "REFUSED: the parent's sum(v) from gen_seed.py [] is not a count" FT_DRY=1 FT_ROWS=x -- doltgres

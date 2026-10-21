@@ -10,8 +10,10 @@ per_op.flushes), with
   !  the idle-subtracted estimate went below zero (read the raw count)
   #  some creates in the window waited on the template (CountOtherDBBackends; see the cell's template_waits)
   FAIL  the cell's verdict was not ok;  MISSING  no cell.json (or no such job)
-Then the PG deferred table (the CHECKPOINT after each cell: flushes the creates left for later, per op) and the
-per-role split of the load windows (raw flushes per op by role, no subtraction).
+Then the PG deferred table (the CHECKPOINT after each cell, per op: about 0 at C=1, since every cycle's DROP discards
+its branch's dirty pages before any checkpoint writes them; comp review 1 MED 8), at C=1 the kept-arm table (deferred
+flushes per KEPT create: K creates with no DROP, then one CHECKPOINT), and the per-role split of the load windows (raw
+flushes per op by role, no subtraction).
 
 The PostgreSQL, Dolt and Doltgres labels name the version EVERY job of that system ran (LOW 25), read from the first
 line of each job's run/version.txt in the version command's own form (pins.FIRST_LINE). The tables are refused
@@ -80,15 +82,20 @@ ROWS = [
     # pg18-defaults is dropped on Linux (lead ruling, artie 6b0bef481b); its copy control runs on pg18-d2
     (PG, "FILE_COPY, file_copy_method=copy (clone-proof control)", "pg18-d2", "pg18-create-copy", None),
     (PG, "SELECT 1 floor", "pg18-d2", "pg18-select1", None),
-    (DOLT, "(a) DOLT_CHECKOUT(main) + DOLT_CHECKOUT('-b', b)", "dolt", "dolt-a-m1c", "dolt-a-m1"),
-    (DOLT, "(b) DOLT_BRANCH(b, main) + DOLT_CHECKOUT(b)", "dolt", "dolt-b-m1c", "dolt-b-m1"),
+    # (a) times only the create since comp review 1 MED 6 (it timed a no-op checkout of main before): rows of runs
+    # before that commit measured different work under this label (SMOKE.md errata)
+    (DOLT, "(a) DOLT_CHECKOUT('-b', b) on a session at main", "dolt", "dolt-a-m1c", "dolt-a-m1"),
+    # (b) times PREREG N7's USE switch since 35f8a4130 (comp-rev-89ec-b3c3 MED 1; it timed DOLT_CHECKOUT(b) /
+    # dolt_checkout(b) before): rows of runs before that commit measured a different switch under the old label
+    # (SMOKE.md errata), and doltgres-b-m1 opens a fresh home connection per cycle since 943a7b9db
+    (DOLT, "(b) DOLT_BRANCH(b, main) + USE `bench/b`", "dolt", "dolt-b-m1c", "dolt-b-m1"),
     (DOLT, "(c) DOLT_BRANCH(b, main) + connect bench/b + SELECT 1", "dolt", "dolt-c-m1c",
      "dolt-c-m1"),
     (DOLT, "DOLT_BRANCH(b, main) alone", "dolt", "dolt-create", None),
     (DOLT, "SELECT 1 floor", "dolt", "dolt-select1", None),
-    (DOLTGRES, "(a) dolt_checkout(main) + dolt_checkout('-b', b)", "doltgres", "doltgres-a-m1c",
+    (DOLTGRES, "(a) dolt_checkout('-b', b) on a session at main", "doltgres", "doltgres-a-m1c",
      "doltgres-a-m1"),
-    (DOLTGRES, "(b) dolt_branch(b, main) + dolt_checkout(b)", "doltgres", "doltgres-b-m1c", "doltgres-b-m1"),
+    (DOLTGRES, "(b) dolt_branch(b, main) + USE \"postgres/b\"", "doltgres", "doltgres-b-m1c", "doltgres-b-m1"),
     (DOLTGRES, "(c) dolt_branch(b, main) + connect postgres/b + SELECT 1", "doltgres", "doltgres-c-m1c",
      "doltgres-c-m1"),
     (DOLTGRES, "dolt_branch(b, main) alone", "doltgres", "doltgres-create", None),
@@ -99,12 +106,16 @@ ROWS = [
 ]
 
 
-def load(rundir, system, runner, fs, spec, c):
-    p = os.path.join(rundir, f"competitors-{system}-{runner}-{fs}", "run", "cells", f"{spec}-c{c}", "cell.json")
+def load_json(p):
     try:
         return json.load(open(p))
     except (OSError, ValueError):
         return None
+
+
+def load(rundir, system, runner, fs, spec, c):
+    return load_json(os.path.join(rundir, f"competitors-{system}-{runner}-{fs}", "run", "cells", f"{spec}-c{c}",
+                                  "cell.json"))
 
 
 def short(role):
@@ -170,10 +181,10 @@ def main(rundir, c, table=pins.TABLE):
     vals = []
     for runner, fs, _ in COLS:
         p = os.path.join(rundir, f"competitors-pg18-d2-{runner}-{fs}", "run", "pg_settings.tsv")
-        try:
-            row = next(ln.rstrip("\n").split("\t") for ln in open(p) if ln.startswith("shared_buffers\t"))
-            vals.append(f"{row[1]} x 8 kB = {int(row[1]) * 8 // 1024} MB")
-        except (OSError, StopIteration, ValueError, IndexError):
+        try:  # comp review 1 LOW 34: pins.shared_buffers_bytes, the one reader (a unit other than 8kB is printed)
+            got, why = pins.shared_buffers_bytes(open(p).read())
+            vals.append(f"{got >> 20} MB" if why is None else f"unit ... ({why})")
+        except OSError:
             vals.append("MISSING")
     print("| pg18-d2 | " + " | ".join(vals) + " |")
     print(f"\n#### PostgreSQL 18 deferred flushes per cycle at C={c} (one CHECKPOINT after each cell, divided by its ops)\n")
@@ -189,6 +200,23 @@ def main(rundir, c, table=pins.TABLE):
                 vals.append("MISSING" if cj is None else (f"{d['per_op']:.2f}" if d else "—"))
             if any(v != "MISSING" for v in vals):
                 print(f"| {system} | {spec} | " + " | ".join(vals) + " |")
+    if str(c) == "1":
+        # comp review 1 MED 8: the cells' per-cycle DROP discards each branch's dirty pages before any checkpoint, so
+        # the deferred column above reads about 0; the KEPT arm (run_system.sh kept_arm, C=1) is what a kept branch pays
+        print("\n#### PostgreSQL 18 deferred flushes per KEPT create at C=1 (kept arm: K creates, no DROP, one CHECKPOINT)\n")
+        print("| Job | Spec | " + " | ".join(h for _, _, h in COLS) + " |")
+        print("|---|---|" + "---|" * len(COLS))
+        for spec in ("pg18-create", "pg18-m1c", "pg18-m1", "pg18-create-wal", "pg18-m1c-wal", "pg18-m1-wal",
+                     "pg18-create-copy"):
+            vals = []
+            for runner, fs, _ in COLS:
+                p = os.path.join(rundir, f"competitors-pg18-d2-{runner}-{fs}", "run", "cells", f"{spec}-c1", "kept.json")
+                kj = load_json(p)
+                pc = (kj or {}).get("per_create")
+                vals.append("MISSING" if kj is None else (f"{pc:.2f}" if isinstance(pc, (int, float)) else
+                                                          f"FAIL ({(kj or {}).get('verdict')})"))
+            if any(v != "MISSING" for v in vals):
+                print(f"| pg18-d2 | {spec} | " + " | ".join(vals) + " |")
     print(f"\n#### Load-window flushes per op by process role at C={c} (raw, no subtraction; x86_64 XFS / arm64 btrfs)\n")
     print("| Job | Spec | x86_64 XFS | arm64 btrfs |")
     print("|---|---|---|---|")
@@ -221,6 +249,18 @@ def selftest():
         bad += not cond
         n += 1
 
+    # comp-rev-9bc7d894a LOW 4: a row's label names the statements its specs time. Variant (b) times PREREG N7's USE
+    # switch since 35f8a4130, so its label must say USE, never the checkout it timed before (read from the specs
+    # themselves: each (b) spec's second timed step)
+    here = os.path.dirname(os.path.abspath(__file__))
+    for row in ROWS:
+        if not str(row[1]).startswith("(b) "):
+            continue
+        for spec in (s for s in row[3:5] if s):
+            steps = [ln for ln in open(os.path.join(here, "loadgen", "specs", spec + ".spec")) if ln.startswith("step ")]
+            sw = steps[1].split(None, 2)[2].strip() if len(steps) > 1 else ""
+            ok(f"(b) label {row[1]!r} names {spec}'s switch {sw!r}",
+               sw.startswith("USE ") and "USE" in row[1] and "checkout" not in row[1].lower())
     reg = {"pg18-d2": "18.6", "dolt": "2.4.1", "doltgres": "1.4.0"}
     first = {"pg18-d2": "postgres (PostgreSQL) {} (Ubuntu 18.6-1.pgdg24.04+2)", "dolt": "dolt version {}",
              "doltgres": "Doltgres version {}"}
@@ -288,6 +328,7 @@ def selftest():
             ok(f"main exits with REFUSED, printing no table: {name}", refused and buf.getvalue() == "")
         vers, why = run_versions(good, tsv2)
         ok("refused: versions.tsv registers two Dolt versions", any("no single dolt" in w for w in why))
+    print(f"TALLY ran={n} pass={n - bad} na=0 fail={bad}")  # gates/tally.py (linux-rev-uw2 MED 1)
     print(f"smoke_table selftest: {n - bad}/{n}")
     return 1 if bad else 0
 
