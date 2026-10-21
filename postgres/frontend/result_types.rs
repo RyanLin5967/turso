@@ -1365,8 +1365,10 @@ impl Infer<'_> {
                     level.extend(self.from_items(&u.from_clause, &scope));
                     let inner = vec![level];
                     let relname = self.main_relname(&rel.schemaname, &rel.relname);
-                    self.set_targets(&u.target_list, relname.as_deref(), &inner);
+                    // WHERE before SET, as transformUpdateStmt analyses them: a $n in both takes
+                    // WHERE's type (wire-rev-4a1934c89-beb4 LOW-4: SET's varchar typed it).
                     self.qual(u.where_clause.as_deref(), &inner);
+                    self.set_targets(&u.target_list, relname.as_deref(), &inner);
                     self.targets(&u.returning_list, &inner);
                 }
                 self.ctes.truncate(ctes);

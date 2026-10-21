@@ -133,6 +133,19 @@ fn foldable(node: &pg_query::protobuf::Node) -> bool {
     }
 }
 
+/// numerictypmodin's bounds on numeric(p, s): precision 1 to 1000, scale -1000 to 1000, each refused
+/// 22023 with PostgreSQL's message.
+fn numeric_typmod_bounds(params: &[i64]) -> Result<(), ParseError> {
+    let refuse = |message: String| Err(ParseError::ParseError(SqlErrorMessage::classified(SqlErrorKind::InvalidParameterValue, message)));
+    if let Some(p) = params.first().filter(|p| !(1..=1000).contains(*p)) {
+        return refuse(format!("NUMERIC precision {p} must be between 1 and 1000"));
+    }
+    if let Some(s) = params.get(1).filter(|s| !(-1000..=1000).contains(*s)) {
+        return refuse(format!("NUMERIC scale {s} must be between -1000 and 1000"));
+    }
+    Ok(())
+}
+
 /// PostgreSQL's oidin (uint32in_subr): strtoul with base 0 (leading spaces, a sign, 0x hexadecimal,
 /// a leading 0 octal), trailing spaces allowed, and a value that is neither a uint32 nor a negative
 /// int32 refused; 22P02 for no digits or other text, 22003 past the range, each naming the input as
@@ -955,6 +968,10 @@ impl PostgreSQLTranslator {
         let is_serial = is_serial_type(&pg_type) || is_identity;
 
         let user_type = column_type_checked(&name, &pg_type)?;
+        // numeric(p, s)'s bounds, as numerictypmodin reads them (wire-rev-4a1934c89-beb4 LOW-5).
+        if matches!(pg_type.to_ascii_uppercase().as_str(), "NUMERIC" | "DECIMAL") {
+            numeric_typmod_bounds(&typmods)?;
+        }
         let mapping = map_pg_type(&pg_type, &typmods).ok_or_else(|| {
             ParseError::ParseError(format!("unsupported PostgreSQL type: {pg_type}").into())
         })?;
@@ -1449,6 +1466,9 @@ impl PostgreSQLTranslator {
         let pg_type = extract_type_name(col_def)?;
         let typmods = extract_integer_typmods(col_def)?;
         let user_type = column_type_checked(&col_def.colname, &pg_type)?;
+        if matches!(pg_type.to_ascii_uppercase().as_str(), "NUMERIC" | "DECIMAL") {
+            numeric_typmod_bounds(&typmods)?;
+        }
         let mapping = map_pg_type(&pg_type, &typmods).ok_or_else(|| {
             ParseError::ParseError(format!("unsupported PostgreSQL type: {pg_type}").into())
         })?;
@@ -6021,6 +6041,11 @@ impl PostgreSQLTranslator {
             .as_ref()
             .ok_or_else(|| ParseError::ParseError("CREATE DOMAIN missing base type".into()))?;
         let pg_type = extract_type_name_from_typename(type_name_node)?;
+        // A numeric base's precision and scale are bounded as numerictypmodin bounds them, 22023
+        // (wire-rev-4a1934c89-beb4 LOW-5: CREATE DOMAIN dnum AS numeric(1001,2) was made).
+        if matches!(pg_type.to_ascii_uppercase().as_str(), "NUMERIC" | "DECIMAL") {
+            numeric_typmod_bounds(&type_modifiers(type_name_node)?)?;
+        }
         let base_type = match map_pg_type(&pg_type, &[]) {
             // A domain's base stays the built-in REAL for the float types: on the engine's float4
             // / float8 types a domain refused a quoted value ("cannot store TEXT value in REAL
