@@ -621,6 +621,25 @@ pub fn translate_expr(
                         None => Vec::new(),
                     };
 
+                    // The CAST's operand is first converted to the type's input (`value`) when
+                    // that is a primitive: CAST(50 AS varchar(3)) is the text '50', whose ENCODE
+                    // keeps its storage class (engine-rev-types-08caaec44 MED 3: it stayed the
+                    // integer and ordered as one). `any` (numeric) takes the operand as given.
+                    // Mutant `cast_input_uncast` (test builds only): as given, as before.
+                    if let Some(first) = resolved.chain.first() {
+                        let input = resolver.schema().operator_type_of(first);
+                        let input = input.value_input_type();
+                        if ["text", "integer", "real", "blob"].iter().any(|p| p.eq_ignore_ascii_case(input))
+                            && resolved.chain.iter().any(|td| td.encode().is_some())
+                            && !crate::branch::store::fe_mutant("cast_input_uncast")
+                        {
+                            program.emit_insn(Insn::Cast {
+                                reg: target_register,
+                                affinity: Affinity::affinity(input),
+                            });
+                        }
+                    }
+
                     // Domains: apply parent encode chain, then validate constraints
                     // on the encoded value (domain CHECK sees the stored representation).
                     if resolved.is_domain() {
