@@ -15901,6 +15901,41 @@ fn a_parameter_assigned_to_a_varchar_column_is_refused_at_bind_when_too_long() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-cfdebc06d LOW-7 (its PG 18.6 probe #42, #43): one undeclared $1 assigned to a numeric(6,2) column and to a
+/// varchar(3) column is refused 42P08 'inconsistent types deduced for parameter $1' by PG, whose parse analysis gives a
+/// parameter the first assignment's type; ours prepared it and refused the value at Bind (22003 or 22001). The same $1
+/// assigned to two varchar columns of different lengths is one type, and is not refused.
+#[test]
+fn one_parameter_assigned_to_two_column_types_is_42p08() {
+    let dir = Scratch::new("inconsistent-param");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    for sql in [
+        "CREATE TABLE mix(id int PRIMARY KEY, x numeric(6,2), v varchar(3))",
+        "CREATE TABLE two(id int PRIMARY KEY, a varchar(3), b varchar(10))",
+    ] {
+        a.q(sql).ok(sql);
+    }
+    let mut wrong = Vec::new();
+    for (sql, value) in [
+        ("INSERT INTO mix VALUES (1, $1, $1)", "12345"),
+        ("INSERT INTO mix (id, v, x) VALUES (2, $1, $1)", "123456"),
+        ("UPDATE mix SET x = $1, v = $1 WHERE id = 1", "1"),
+    ] {
+        // Parse with no declared type, Bind, Execute, Sync.
+        let (types, error) = a.bind_round(sql, &[], &[Some(value.as_bytes())], &[]);
+        let message = "inconsistent types deduced for parameter $1";
+        if !error.as_ref().is_some_and(|e| e.code == "42P08" && e.message == message) {
+            wrong.push(format!("{sql}: messages {:?} error {error:?}, PostgreSQL 42P08 {message}", String::from_utf8_lossy(&types)));
+        }
+    }
+    let (types, error) = a.bind_round("INSERT INTO two VALUES (1, $1, $1)", &[], &[Some(b"ab")], &[]);
+    if error.is_some() {
+        wrong.push(format!("INSERT INTO two VALUES (1, $1, $1): messages {:?} error {error:?}, PostgreSQL INSERT 0 1 (both columns are varchar)", String::from_utf8_lossy(&types)));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-cfdebc06d LOW-4, LOW-5: an operator between two untyped string literals is 42725 'operator is not unique:
 /// unknown + unknown' in PG 18.6 (ours said 42883 text + text); and an operator over integers cast to int2 or int8 is
 /// typed by those casts (int8 + int2 is 20, int2 + int2 is 21), where the walk did not reach a cast and the engine's
