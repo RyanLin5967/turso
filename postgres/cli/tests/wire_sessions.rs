@@ -16102,6 +16102,42 @@ fn a_bound_exponent_or_infinity_overflows_numeric_at_bind() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-351702a43 MED-2 (its PG 18.6 probe3 #77-#81): a CAST to NUMERIC(p, s) with p <= 15 holds its value
+/// exactly as the engine's REAL, but arithmetic and sum over it are REAL arithmetic: 0.10 + 0.20 answered
+/// 0.30000000000000004 and = 0.3 answered f, where PG answers 0.30 and t. Such arithmetic and sum/avg over the cast are
+/// refused 0A000, never answered inexactly; the cast's own value and comparisons with it are answered.
+#[test]
+fn arithmetic_over_a_numeric_cast_is_refused_not_inexact() {
+    let dir = Scratch::new("numeric-cast-arith");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    for sql in [
+        "SELECT CAST(0.1 AS NUMERIC(15,2)) + CAST(0.2 AS NUMERIC(15,2))",
+        "SELECT CAST(0.1 AS NUMERIC(15,2)) + CAST(0.2 AS NUMERIC(15,2)) = 0.3",
+        "SELECT CAST(0.1 AS NUMERIC(15,2)) * 3",
+        "SELECT CAST(1.1 AS NUMERIC(15,1)) * CAST(1.1 AS NUMERIC(15,1))",
+        "SELECT CAST('999999999999999' AS NUMERIC(15,0)) + 1",
+        "SELECT 1 - 0.5::numeric(4,1)",
+        "SELECT sum(CAST(0.1 AS NUMERIC(15,2))) FROM generate_series(1, 10)",
+    ] {
+        let r = a.q(sql);
+        if r.error.as_ref().map(|e| e.code.as_str()) != Some("0A000") {
+            wrong.push(format!("{sql}: rows {:?} error {:?}, refused 0A000 (REAL arithmetic is inexact)", r.rows, r.error));
+        }
+    }
+    for (sql, want) in [
+        ("SELECT CAST(0.3 AS NUMERIC(15,2)) = 0.3", "t"),
+        ("SELECT count(DISTINCT CAST(g * 0.1 AS NUMERIC(15,1))) FROM generate_series(1, 30) g", "30"),
+    ] {
+        let r = a.q(sql);
+        if r.error.is_some() || r.rows != vec![vec![Some(want.to_string())]] {
+            wrong.push(format!("{sql}: rows {:?} error {:?}, PostgreSQL {want}", r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-7128c6f73 MED-4 (its PG 18.6 probe4 #144): a decimal literal cast to an integer type is rounded by PG's
 /// numeric-to-int conversion, half away from zero (1.5::int2 is 2, so 1.5::int2 + 1::int2 is 3), where the engine's CAST
 /// truncates (2), now announced with PG's type 21, so the wrong value looked right.
