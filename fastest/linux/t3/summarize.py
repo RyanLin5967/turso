@@ -1005,7 +1005,7 @@ def self_test():
              ours_fixture="plan", comp_info="plan", expected=("c1-create", "c1-m1"), verdict_text=None,
              boundary_bins=None, garbage_v3l=None, v3l_plants_record=None, conformance="match", backsteps=0,
              loop="closed", v3l_mode="dry", ours_sweeper="ok", comp_sweeper=0.04, ours_counters="ok", ours_tm="ok", ours_tp="ok",
-             stamp=None, mode_dry="1", fire_na=None, enospc=None, dryvirt="auto"):
+             stamp=None, mode_dry="1", fire_na=None, enospc=None, dryvirt="auto", klog="ok", ours_warm="ok", fifo=False):
         out = os.path.join(root, "out")
         conformance_files(out, conformance)
         w(f"{out}/stages.tsv", "stage\tstart_utc\tend_utc\tseconds\trc\nfs-xfs\ta\tb\t5\t0\nTOTAL\ta\tb\t9\t0\n")
@@ -1059,7 +1059,18 @@ def self_test():
                     # the competitors' load generator records it (the checks summarize used to drop for ours)
                     | ({} if ours_tp == "absent" else {"tracerpid_tm0": 0,
                                                        "tracerpid_tm1": 4321 if ours_tp == "traced" else 0})
+                    # TEST EDIT, flagged (t3cov-1a MED 1): ours' own warm-up record, as fastest_profile writes it, and
+                    # its live record (warmup-live.json), tied as driver_contract.tie ties them. OURS_WARM: "ok",
+                    # "nolive", "liveshort" (the live record missing a claim), "capped" (the summary capped where the
+                    # live record is not), "noready" (no t0_after_ready_ns)
+                    | {"warmup": {"ops_at_stop": 3, "ops": 3, "stop_secs": 1.5, "capped": ours_warm == "capped",
+                                  "rule": ours_rule} | ({} if ours_warm == "noready" else {"t0_after_ready_ns": 1000})}
                     ))
+                if ours_warm != "nolive":
+                    claims = [100000000, 500000000, 900000000, 1500000000]
+                    w(f"{a1}/result/warmup-live.json", json.dumps(
+                        {"claims_ns": claims[:-2] + claims[-1:] if ours_warm == "liveshort" else claims, "stop_at": 3,
+                         "warm_ops": 3, "capped": 0, "rule": ours_rule}))
                 w(f"{a1}/adapter.txt", "NOT AVAILABLE: no async class\n" if cell == "na" else "")
                 # TEST EDIT, flagged (the lead's MED 12 ruling, DECISIONS 2026-10-15T04:21:48Z): ours' timed run now
                 # leaves the shared sweeper's record and timed.json; a new required record at its passing value
@@ -1146,6 +1157,15 @@ def self_test():
             os.unlink(f"{f}/{drop}")
         if garbage_v3l:  # an unreadable measurement, written after its plants record
             w(f"{f}/{garbage_v3l}/v3l.json", "{not json")
+        # TEST EDIT, flagged (t3cov-2 MED 3): each block's kernel log, as t3run writes it: a "#kernel-log source=" first
+        # line naming the reader that succeeded (journalctl or dmesg), then its output. KLOG: "ok", "absent", "none" (no
+        # reader succeeded), or "sudo" (the old capture's failed sudo, its message as the whole file)
+        if klog != "absent":
+            w(f"{f}/kernel-log.txt", {"ok": "#kernel-log source=journalctl\n-- No entries --\n",
+                                      "none": "#kernel-log source=none\nsudo: a password is required\n",
+                                      "sudo": "sudo: a password is required\n"}[klog])
+        if fifo:  # t3cov-2 LOW 5: a FIFO left in the block (trace.sh's $out.slp, after a kill) must not hang the scan
+            os.mkfifo(f"{f}/left.slp")
         # ENOSPC (the same ruling): ENOSPC=(relative path under fs-xfs, text) plants an out-of-space line in the block,
         # last, so no record written above overwrites it
         if enospc is not None:
@@ -1383,13 +1403,46 @@ def self_test():
          {"enospc": ("cells/ours-full-c1-r1/a1/adapter.txt", "fio: write: No space left on device\n")}, False,
          lambda s: any("ENOSPC" in x and "adapter.txt" in x for x in s["failed_blocks"])),
         ("DATA_GIB: a block kernel log with a btrfs allocation failure (errno=-28) refuses the block",
-         {"enospc": ("kernel-log.txt", "BTRFS: error (device vdb state A) in btrfs_alloc_chunk: errno=-28 No space left\n")},
+         {"enospc": ("kernel-log.txt", "#kernel-log source=journalctl\n"  # TEST EDIT, flagged (MED 3): the header
+                                       "BTRFS: error (device vdb state A) in btrfs_alloc_chunk: errno=-28 No space left\n")},
          False, lambda s: any("ENOSPC" in x and "kernel-log.txt" in x for x in s["failed_blocks"])),
         ("DATA_GIB: a strace line returning ENOSPC refuses the block",
          {"enospc": ("cells/ours-full-c1-r1/a1/load.strace", "4100 pwrite64(3, \"\"..., 4096, 0) = -1 ENOSPC (No space left on device)\n")},
          False, lambda s: any("ENOSPC" in x for x in s["failed_blocks"])),
         ("DATA_GIB control: words that only name the condition (a count of 0, 'enospc_count') do not refuse",
          {"enospc": ("cells/ours-full-c1-r1/a1/notes.txt", "enospc_count=0 retries_on_space=0\n")}, True, None),
+        # t3cov-2 MED 1 and LOW 3: Go's errno text is lower case (Dolt and Doltgres are Go servers, and their timed runs
+        # are not under strace), SQLite says the disk is full, and btrfs aborts a transaction with error -28
+        ("t3cov-2 MED 1: a Dolt server log's lower-case Go ENOSPC text refuses the block",
+         {"enospc": ("cells/ours-full-c1-r1/a1/server_log.txt", "Error 1105: write failed: no space left on device\n")},
+         False, lambda s: any("ENOSPC" in x and "server_log.txt" in x for x in s["failed_blocks"])),
+        ("t3cov-2 MED 1: a Go journal write's 'no space left on device' refuses the block",
+         {"enospc": ("cells/ours-full-c1-r1/a1/server_log_load.txt", "open .dolt/noms/journal.idx: no space left on device\n")},
+         False, lambda s: any("ENOSPC" in x for x in s["failed_blocks"])),
+        ("t3cov-2 MED 1: SQLite's 'database or disk is full' refuses the block",
+         {"enospc": ("cells/ours-full-c1-r1/a1/adapter.txt", "Error: database or disk is full\n")},
+         False, lambda s: any("ENOSPC" in x for x in s["failed_blocks"])),
+        ("t3cov-2 LOW 3: btrfs's 'Transaction aborted (error -28)' refuses the block",
+         {"enospc": ("kernel-log.txt", "#kernel-log source=journalctl\nBTRFS: Transaction aborted (error -28)\n")},
+         False, lambda s: any("ENOSPC" in x and "kernel-log.txt" in x for x in s["failed_blocks"])),
+        # t3cov-2 MED 3: the btrfs half of the guard reads only the block's kernel log, so a block without a readable one
+        # refuses: missing, written by no reader, or the old capture's bare sudo failure
+        ("t3cov-2 MED 3: a block with no kernel-log.txt refuses, naming it", {"klog": "absent"}, False,
+         lambda s: any("kernel log" in x for x in s["failed_blocks"])),
+        ("t3cov-2 MED 3: a kernel log no reader wrote (source=none) refuses", {"klog": "none"}, False,
+         lambda s: any("kernel log" in x for x in s["failed_blocks"])),
+        ("t3cov-2 MED 3: a kernel log holding only sudo's failure refuses", {"klog": "sudo"}, False,
+         lambda s: any("kernel log" in x for x in s["failed_blocks"])),
+        # t3cov-1a MED 1: ours' per-run warm-up, as the competitors' is judged per run: its live record tied to the
+        # summary (driver_contract.tie) and its start after the last client was ready
+        ("t3cov-1a MED 1: ours with no live warm-up record fails, naming it", {"ours_warm": "nolive"}, False,
+         lambda s: any("warmup-live.json" in x for x in s["parity_refusals"])),
+        ("t3cov-1a MED 1: ours whose live record is missing a claim fails", {"ours_warm": "liveshort"}, False,
+         lambda s: any("live claims" in x for x in s["parity_refusals"])),
+        ("t3cov-1a MED 1: ours whose summary says capped where the live record does not fails", {"ours_warm": "capped"},
+         False, lambda s: any("capped" in x for x in s["parity_refusals"])),
+        ("t3cov-1a MED 1: ours whose warm-up has no t0_after_ready_ns fails", {"ours_warm": "noready"}, False,
+         lambda s: any("t0_after_ready_ns" in x for x in s["parity_refusals"])),
         ("DATA_GIB: a DRY-VIRT run discloses its data device size (dry_virt_differences)", {"stamp": "DRY-VIRT"}, True,
          lambda s: any("16 GiB" in x for x in s.get("dry_virt_differences") or [])),
         ("DATA_GIB: a DRY-VIRT run with no dry-virt.txt fails, its differences undisclosed",
@@ -1529,6 +1582,31 @@ def self_test():
     else:
         print(f"N/A-on-{sys.platform}: DATA_GIB fired by a real ENOSPC (/dev/full is Linux's)", flush=True)
         na_cases.append("DATA_GIB real ENOSPC")
+    # t3cov-2 LOW 5: a FIFO left in the block (trace.sh's $out.slp after a kill) must not hang the ENOSPC scan. Bounded by
+    # an alarm, so a scan that blocks on it FAILS here instead of hanging the self-test
+    import signal
+
+    class Hung(Exception):
+        pass
+
+    def _alarm(_sig, _frm):
+        raise Hung()
+    root = tempfile.mkdtemp(prefix="summarize-st-")
+    old_h = signal.signal(signal.SIGALRM, _alarm)
+    try:
+        signal.alarm(30)
+        try:
+            s_, ok_ = summarize(make(root, fifo=True), "sha", "1", "m")
+            cases.append(("t3cov-2 LOW 5: a FIFO left in the block does not hang the ENOSPC scan; the package passes",
+                          ok_, s_["failed_blocks"]))
+        except Hung:
+            cases.append(("t3cov-2 LOW 5: a FIFO left in the block does not hang the ENOSPC scan; the package passes",
+                          False, ["the scan blocked on the FIFO for 30 s"]))
+        finally:
+            signal.alarm(0)
+    finally:
+        signal.signal(signal.SIGALRM, old_h)
+        shutil.rmtree(root)
     # t3cov-2 MED 2: a refusal always removes credit. A REAL (dry=0) package whose block refuses on ENOSPC is not ok, so
     # it is never creditable, and its credit refusals say why (creditable was derived from the credit list alone, which
     # never read failed_blocks, the refusal lists or ok)
