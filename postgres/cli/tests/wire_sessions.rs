@@ -15901,6 +15901,32 @@ fn a_parameter_assigned_to_a_varchar_column_is_refused_at_bind_when_too_long() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-cfdebc06d LOW-7, array half (its PG 18.6 probe #50, #51): a bound array assigned to a varchar(3)[] column is
+/// coerced element by element at Bind under a custom plan, so '{abcdef}' is 22001 before BindComplete; ours answered
+/// BindComplete, then XX000 at Execute (the Bind check skipped array columns). '{ab}' is stored.
+#[test]
+fn a_bound_array_element_too_long_for_varchar_is_22001_at_bind() {
+    let dir = Scratch::new("bind-array-varchar");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE av(id int PRIMARY KEY, a varchar(3)[])").ok("create");
+    let mut wrong = Vec::new();
+    let (types, error) = a.bind_round("INSERT INTO av VALUES (1, $1)", &[], &[Some(b"{abcdef}")], &[]);
+    let message = "value too long for type character varying(3)";
+    if types.contains(&b'2') || !error.as_ref().is_some_and(|e| e.code == "22001" && e.message == message) {
+        wrong.push(format!("'{{abcdef}}': messages {:?} error {error:?}, PostgreSQL: no BindComplete, 22001 {message}", String::from_utf8_lossy(&types)));
+    }
+    let (types, error) = a.bind_round("INSERT INTO av VALUES (2, $1)", &[], &[Some(b"{ab}")], &[]);
+    if error.is_some() {
+        wrong.push(format!("'{{ab}}': messages {:?} error {error:?}, PostgreSQL INSERT 0 1", String::from_utf8_lossy(&types)));
+    }
+    let r = a.q("SELECT id FROM av ORDER BY id");
+    if r.rows != vec![vec![Some("2".to_string())]] {
+        wrong.push(format!("av holds {:?}, PostgreSQL [2]", r.rows));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-cfdebc06d LOW-7 (its PG 18.6 probe #42, #43): one undeclared $1 assigned to a numeric(6,2) column and to a
 /// varchar(3) column is refused 42P08 'inconsistent types deduced for parameter $1' by PG, whose parse analysis gives a
 /// parameter the first assignment's type; ours prepared it and refused the value at Bind (22003 or 22001). The same $1
