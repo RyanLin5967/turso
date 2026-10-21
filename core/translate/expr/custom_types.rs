@@ -1657,6 +1657,26 @@ mod tests {
         assert!(wrong.is_empty(), "CLAIM: exact numeric through any expression, as PostgreSQL 18.6: {wrong:#?}");
     }
 
+    /// PROBE (not for delivery): what a cast to numeric and the red's operands hold.
+    #[test]
+    fn probe_numeric_cast_values() {
+        let conn = open();
+        conn.execute("CREATE TABLE n(id INTEGER PRIMARY KEY, x numeric(30, 2), y numeric) STRICT").unwrap();
+        conn.execute("INSERT INTO n VALUES (1, 0.1, 0.25)").unwrap();
+        for sql in [
+            "SELECT typeof(CAST(10 AS numeric)), quote(CAST(10 AS numeric))",
+            "SELECT typeof(CAST(0.20 AS numeric)), quote(CAST(0.20 AS numeric))",
+            "SELECT typeof(CAST(0.10 AS numeric(5, 2))), quote(CAST(0.10 AS numeric(5, 2)))",
+            "SELECT typeof(abs(CAST(0.10 AS numeric(5, 2)))), quote(abs(CAST(0.10 AS numeric(5, 2))))",
+            "SELECT typeof(y), quote(y), typeof(x), quote(x) FROM n",
+            "SELECT quote(y + 0), quote(x + 0), quote(y * 3) FROM n",
+            "SELECT quote(CAST(10 AS numeric) / 3), quote(CAST(10 AS numeric(10, 4)) / 3)",
+        ] {
+            let got = conn.prepare(sql).and_then(|mut s| s.run_collect_rows());
+            println!("PROBE {sql} => {got:?}");
+        }
+    }
+
     /// Engine review 20 LOW 27 (b): 150a70db0's arm, a type whose value input is `any` (numeric)
     /// takes any non-literal constant operand but a COLLATE one, had no test: `x = abs(-1.5)` and
     /// `x = 1 + 1` on numeric(10, 2) find 1.50 and 2.00, through the type's '=', as a scan.
