@@ -378,6 +378,16 @@ fn expression_type(node: &PgNode) -> Option<u32> {
             return integer_literal_type(&f.fval);
         }
         Node::AConst(c) => matches!(c.val, Some(Val::Boolval(_))),
+        // A cast to oid is an oid (26): announced int4, its unsigned values past int4
+        // ((-1)::oid is 4294967295) were refused as integer out of range (wire-rev-351702a43 LOW-3).
+        Node::TypeCast(c)
+            if c.type_name.as_ref().is_some_and(|t| {
+                t.array_bounds.is_empty()
+                    && t.names.last().is_some_and(|n| matches!(&n.node, Some(Node::String(s)) if s.sval == "oid"))
+            }) =>
+        {
+            return Some(26);
+        }
         // The sequence functions and pg_database_size are bigint in PostgreSQL, whatever their
         // arguments; the engine gave them no type, so they were announced text (found by the E5'
         // differential, wire-e5-f312d1e13).
