@@ -17319,6 +17319,83 @@ fn an_integer_expression_cast_to_oid_is_unsigned() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// numfuzz (its first shard at 1f632d0b7, seed 17; recorded on iccad2 PG 18.6, numeric_text_past_float8_is_judged_as_a_
+/// literal_is.out): a numeric written as text and cast or typed numeric ('...'::numeric, NUMERIC '...', CAST('...' AS
+/// numeric), '...'::decimal(p,s)) of more than 15 significant digits is judged as the same digits written as a
+/// literal: the engine's float8 would round it, so it is refused 0A000 or answered exactly, never rounded.
+/// '6234213084550261446.181833849240796'::numeric + 0 answered 6.234213084550262e+18.
+#[test]
+fn numeric_text_past_float8_is_judged_as_a_literal_is() {
+    let dir = Scratch::new("numeric-text");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    for (sql, value) in [
+        ("SELECT '6234213084550261446.181833849240796'::numeric + 0 AS v", "6234213084550261446.181833849240796"),
+        ("SELECT NUMERIC '3.14159265358979323846' AS v", "3.14159265358979323846"),
+        ("SELECT CAST('12345678901234567890.123456789' AS numeric) AS v", "12345678901234567890.123456789"),
+        ("SELECT '12345678901234567890.123456789'::decimal(40,9) AS v", "12345678901234567890.123456789"),
+        ("SELECT '1.5'::numeric + 0 AS v", "1.5"),
+    ] {
+        let r = a.q(sql);
+        let exact = r.error.is_none() && r.rows == vec![vec![Some(value.to_string())]];
+        let refused = r.error.as_ref().is_some_and(|e| e.code == "0A000");
+        if !(exact || refused) {
+            wrong.push(format!("{sql}: PG {value}; got {:?} {:?} {:?}", r.oids, r.rows, r.error));
+        }
+    }
+    for value in ["6234213084550261446.181833849240796", "1.5"] {
+        let r = a.x_undeclared("SELECT $1::numeric + 0 AS v", &[value]);
+        let exact = r.error.is_none() && r.rows == vec![vec![Some(value.to_string())]];
+        let refused = r.error.as_ref().is_some_and(|e| e.code == "0A000");
+        if !(exact || refused) {
+            wrong.push(format!("$1::numeric + 0 with {value}: PG {value}; got {:?} {:?} {:?}", r.oids, r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-4a1934c89-beb4 LOW-7 (its PG 18.6 probe #312-#316): an integer cast to bytea and int2send/int4send/
+/// int8send are bytea (17) in PG 18, so a driver decoding by type reads four bytes, not the text '\x00000102'; they
+/// were announced text (25). Where the line has no integer-to-bytea cast it refuses; it never announces text.
+#[test]
+fn an_integer_as_bytea_is_announced_bytea() {
+    let dir = Scratch::new("int-bytea");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let mut wrong = Vec::new();
+    for (sql, rows) in [
+        (
+            "SELECT 258::int4::bytea, (-1)::int2::bytea, 5::int8::bytea, 5::bytea, 1::smallint::bytea",
+            vec!["\\x00000102", "\\xffff", "\\x0000000000000005", "\\x00000005", "\\x0001"],
+        ),
+        ("SELECT int4send(258), int2send(1::int2), int8send(1)", vec!["\\x00000102", "\\x0001", "\\x0000000000000001"]),
+        ("SELECT INT4SEND(258)", vec!["\\x00000102"]),
+    ] {
+        let r = a.q(sql);
+        if r.error.is_some() {
+            continue;
+        }
+        let want: Vec<Vec<Option<String>>> = vec![rows.iter().map(|v| Some(v.to_string())).collect()];
+        if r.oids != Some(vec![17; rows.len()]) || r.rows != want {
+            wrong.push(format!("{sql}: PG 17 {rows:?}; got {:?} {:?}", r.oids, r.rows));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// wire-rev-4a1934c89-beb4 LOW-8 (its PG 18.6 probe #280): now() has no argument, so now(1) names no function: 42883
+/// 'function now(integer) does not exist'; it was 'Parse error: no such function: now'.
+#[test]
+fn now_with_an_argument_names_no_function() {
+    let dir = Scratch::new("now-arg");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    let r = a.q("SELECT now(1)");
+    let e = r.err("now(1)");
+    assert_eq!((e.code.as_str(), e.message.as_str()), ("42883", "function now(integer) does not exist"));
+}
+
 /// wire-rev-351702a43 LOW-6 (its PG 18.6 probe3 #161): a CASE is typed by its results (an int4 constant and an int4
 /// function: 23); the walk never typed a CASE column, and the engine announced it text (25).
 #[test]

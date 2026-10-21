@@ -314,7 +314,32 @@ pub fn long_decimal_literal(sql: &str, exempt: &[usize]) -> Option<String> {
                 | Token::By | Token::Between | Token::Returning
         )
     };
+    // A numeric type's tokens starting at i: NUMERIC, DECIMAL, or the name numeric or decimal.
+    let numeric_type = |i: usize| -> bool {
+        match kinds.get(i) {
+            Some(Token::Numeric | Token::DecimalP) => true,
+            Some(Token::Ident) => matches!(text(i).to_ascii_lowercase().as_str(), "numeric" | "decimal"),
+            _ => false,
+        }
+    };
     for (i, kind) in kinds.iter().enumerate() {
+        // A numeric written as text and read as a numeric ('…'::numeric, NUMERIC '…', CAST('…' AS
+        // numeric)) is judged as the same digits written as a literal (numfuzz, first shard at
+        // 1f632d0b7: '6234213084550261446.181833849240796'::numeric + 0 answered a float). Only a
+        // plain quoted string; an E'' or $$ one is left to the bound-value check.
+        if *kind == Token::Sconst {
+            let numeric = (kinds.get(i + 1) == Some(&Token::Typecast) && numeric_type(i + 2))
+                || (i >= 1 && numeric_type(i - 1))
+                || (i >= 2 && kinds[i - 1] == Token::Ascii40 && kinds[i - 2] == Token::Cast
+                    && kinds.get(i + 1) == Some(&Token::As) && numeric_type(i + 2));
+            let quoted = text(i).strip_prefix('\'').and_then(|t| t.strip_suffix('\''));
+            if let Some(inner) = quoted.filter(|_| numeric) {
+                if !inner.contains('\'') && translator::decimal_past_float8(inner) {
+                    return Some(text(i).to_string());
+                }
+            }
+            continue;
+        }
         if *kind != Token::Fconst {
             continue;
         }
