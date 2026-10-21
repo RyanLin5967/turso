@@ -16102,6 +16102,37 @@ fn a_bound_exponent_or_infinity_overflows_numeric_at_bind() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// wire-rev-351702a43 MED-5 (its PG 18.6 probe3 #148, #157): an explicit cast to varchar(n) cuts its value to n characters
+/// (PG's explicit-cast length coercion), so $1::varchar(10) bound 'abcdefghijkl' is stored 'abcdefghij' in a varchar(20)
+/// column; the translator dropped the length and stored the whole text.
+#[test]
+fn an_explicit_cast_to_varchar_n_cuts_its_value() {
+    let dir = Scratch::new("varchar-cast-cut");
+    let server = Server::start(&dir.db(), &[]);
+    let mut a = server.connect();
+    a.q("CREATE TABLE v12(id int, v varchar(20))").ok("create");
+    let mut wrong = Vec::new();
+    let (types, error) = a.bind_round("INSERT INTO v12 VALUES (1, $1::varchar(10))", &[], &[Some(b"abcdefghijkl")], &[]);
+    if error.is_some() {
+        wrong.push(format!("bound insert: messages {:?} error {error:?}", String::from_utf8_lossy(&types)));
+    }
+    let r = a.q("SELECT v FROM v12 WHERE id = 1");
+    if r.rows != vec![vec![Some("abcdefghij".to_string())]] {
+        wrong.push(format!("stored {:?} {:?}, PostgreSQL 'abcdefghij'", r.rows, r.error));
+    }
+    for (sql, want) in [
+        ("SELECT 'abcdefghijkl'::varchar(10)", "abcdefghij"),
+        ("SELECT CAST('abc' AS varchar(5))", "abc"),
+        ("SELECT CAST('ééééé' AS character varying(2))", "éé"),
+    ] {
+        let r = a.q(sql);
+        if r.error.is_some() || r.rows != vec![vec![Some(want.to_string())]] {
+            wrong.push(format!("{sql}: rows {:?} error {:?}, PostgreSQL {want}", r.rows, r.error));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// wire-rev-351702a43 MED-3 (its PG 18.6 probe3 #110-#112, #119, #121, #122): a NUL byte is no character of UTF8, and PG
 /// refuses a parameter holding one at Bind, 22021 'invalid byte sequence for encoding "UTF8": 0x00', in text and in
 /// binary format; std::str::from_utf8 accepts NUL, so the value was stored with it.
