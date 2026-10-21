@@ -106,9 +106,10 @@ class Conn:
         self.s.sendall(_msg(b"Q", sql.encode() + b"\0"))
         return self._reply(copy_data)
 
-    def extended(self, sql, params=()):
+    def extended(self, sql, params=(), oids=()):
+        """Parse (declaring `oids`, none by default), Bind the text values, Describe, Execute, Sync."""
         q = sql.encode() + b"\0"
-        m = _msg(b"P", b"\0" + q + struct.pack("!h", 0))
+        m = _msg(b"P", b"\0" + q + struct.pack("!h", len(oids)) + b"".join(struct.pack("!I", o) for o in oids))
         bind = b"\0\0" + struct.pack("!h", 0) + struct.pack("!h", len(params))
         for v in params:
             if v is None:
