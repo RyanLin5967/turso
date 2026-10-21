@@ -16775,3 +16775,40 @@ fn a_close_frees_nothing_once_the_store_has_fail_stopped() {
     let freed: Vec<u32> = owned.iter().copied().filter(|s| db.branch_slot_is_free(*s)).collect();
     assert!(freed.is_empty(), "CLAIM: slots {freed:?} were freed by a close after the store fail-stopped");
 }
+
+/// fe-mutkill (survivor of the f4683e89d lib sweep): the last connection's shutdown sync of the
+/// trunk WAL is a drain of the branch files' device (any sync off Apple; under `fullfsync`, an
+/// F_FULLFSYNC on Apple), and one that fails is acted on at once (engine review 10 #5). Its test,
+/// `a_wal_internal_sync_failure_fail_stops`, runs on Apple only (its D1 fork is drained off Apple).
+/// A D0 store, whose Release is written and never drained on every target: x reaped, the
+/// shutdown's WAL sync failing at its issue, the close fails, and a fork from a fresh connection is
+/// refused. Both stores. Mutant `shutdown_sync_unwatched`.
+#[test]
+fn a_failed_shutdown_wal_sync_fail_stops_a_store_with_an_undrained_release() {
+    use std::sync::atomic::Ordering as O;
+    let _s = serial();
+    for catalog in [false, true] {
+        let what = format!("catalog={catalog}");
+        let dir = tempfile::TempDir::new().unwrap();
+        let (db, armed) = open_failing_wal(&dir.path().join("shutdown-d0.db"), opts(catalog, SyncClass::Off));
+        let trunk = db.connect().unwrap();
+        seed(&trunk);
+        trunk.execute("PRAGMA synchronous = FULL").unwrap();
+        trunk.execute("PRAGMA fullfsync = ON").unwrap();
+        trunk.fork_branch().unwrap().reap().unwrap();
+        assert!(drained(&db) < db.branches.durable_for_test(SyncClass::Off), "{what}: premise: x's Release is undrained");
+        crate::storage::wal::WAL_SYNC_SITE.with(|s| s.set(""));
+        armed.store(1, O::Release);
+        assert!(trunk.close().is_err(), "{what}: premise: the failed shutdown sync failed the close");
+        assert_eq!(armed.load(O::Acquire), 0, "{what}: premise: the armed sync was reached");
+        assert_eq!(
+            crate::storage::wal::WAL_SYNC_SITE.with(|s| s.get()),
+            "shutdown",
+            "{what}: premise: the failure reached the shutdown's sync"
+        );
+        assert_fail_stopped(
+            db.connect().unwrap().fork_branch().map(|x| x.into_id()),
+            &format!("{what}: the next fork after a failed shutdown drain with an undrained Release"),
+        );
+    }
+}
