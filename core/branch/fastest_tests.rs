@@ -16668,3 +16668,39 @@ fn a_tag_decided_class_outlives_the_compaction_into_a_second_d0_process() {
         );
     }
 }
+
+/// fe-mutkill (survivor of the f4683e89d lib sweep): a fuzzy checkpoint runs its phase 4, the
+/// catalog WAL's PASSIVE backfill and TRUNCATE, only once that WAL has reached
+/// `CATALOG_WAL_TRUNCATE_AT` (4 MiB; checkpoint FIX). A checkpoint of a catalog whose WAL is far
+/// below that records no `passive` phase (`store::CKPT_PHASES`, observation only) and leaves the
+/// WAL's length as it was. The budget a_fuzzy_checkpoint_issues_at_most_three_full_flushes counts
+/// F_FULLFSYNC, which is never issued off Apple, so it cannot see the extra phase there. Mutant
+/// `catalog_wal_truncated_every_checkpoint`.
+#[test]
+fn a_fuzzy_checkpoint_leaves_a_small_catalog_wal_untruncated() {
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("small-cat-wal.db");
+    let db = open_at(&path, opts(true, SyncClass::Fsync));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    for _ in 0..30 {
+        let _ = trunk.fork_branch().unwrap().into_id();
+    }
+    let wal = std::path::PathBuf::from(format!("{}-branch-cat-wal", path.display()));
+    let before = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+    assert!(before > 0 && before < 4 << 20, "premise: the catalog WAL holds frames, under 4 MiB ({before} bytes)");
+    super::store::CKPT_PHASES.lock().unwrap().clear();
+    assert!(db.branch_checkpoint_fuzzy_now().unwrap(), "premise: a fuzzy checkpoint started");
+    db.branch_checkpoint_wait();
+    eventually("premise: the checkpoint thread reached the end of its phase 4", || {
+        super::store::CKPT_PHASES.lock().unwrap().iter().any(|(p, ..)| *p == "truncated")
+    });
+    let phases: Vec<&str> = super::store::CKPT_PHASES.lock().unwrap().iter().map(|(p, ..)| *p).collect();
+    let after = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+    assert!(
+        !phases.contains(&"passive"),
+        "CLAIM: a checkpoint of a {before}-byte catalog WAL ran phase 4's backfill and truncation: {phases:?}"
+    );
+    assert!(after >= before, "CLAIM: the {before}-byte catalog WAL was truncated to {after} bytes by the checkpoint");
+}
