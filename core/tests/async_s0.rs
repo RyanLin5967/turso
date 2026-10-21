@@ -46,7 +46,7 @@ use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use turso_core::branch::async_api::{BranchStatus, fe_mutants_compiled};
+use turso_core::branch::async_api::{BranchStatus, ad_t5_firecheck_compiled, fe_mutants_compiled};
 use turso_core::branch::{BranchDurability, BranchId, SyncClass};
 use turso_core::{Database, DatabaseOpts, OpenFlags, PlatformIO, SqliteDialect, IO};
 
@@ -193,10 +193,19 @@ fn creating_tid() -> u64 {
 
 fn feature_line() -> String {
     format!(
-        "features=[{}] FE_MUTANT={}",
+        "features=[{}] cfg=[{}] FE_MUTANT={}",
         if fe_mutants_compiled() { "fe-mutants" } else { "" },
+        if ad_t5_firecheck_compiled() { "fe_ad_t5_firecheck" } else { "" },
         std::env::var("FE_MUTANT").unwrap_or_default()
     )
+}
+
+/// What this binary was built with, one line, for the fire-check driver's build check
+/// (engine-rev-async addendum 2 L4): it refuses a reading binary carrying the cfg, and a fire-check
+/// binary without it.
+#[test]
+fn ad_t5_build_flags() {
+    println!("AD-T5 BUILD {}", feature_line());
 }
 
 /// One run of `arm`, in a fresh trace root: warm-up creates, the window of N creates, then the

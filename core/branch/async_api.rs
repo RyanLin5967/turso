@@ -195,3 +195,11 @@ impl Database {
 pub fn fe_mutants_compiled() -> bool {
     cfg!(feature = "fe-mutants")
 }
+
+/// Whether turso_core was compiled with `--cfg fe_ad_t5_firecheck` (AD-T5's fire-check binary only;
+/// engine-rev-async addendum 2 L4): printed by async_s0, so the driver can refuse a reading binary
+/// that carries it and a fire-check binary that does not.
+#[doc(hidden)]
+pub fn ad_t5_firecheck_compiled() -> bool {
+    cfg!(fe_ad_t5_firecheck)
+}

@@ -98,8 +98,12 @@ def build(features):
         cmd += ["--config", f'target.{host_triple()}.rustflags=["{FIRECHECK_CFG}"]']
     cmd += ["test", "--release", "-p", "turso_core", "--test", "async_s0", "--no-run", "--message-format=json"]
     env = dict(os.environ)
-    # Neither binary takes RUSTFLAGS from the caller: it would replace the workspace's rustflags.
+    # Neither binary takes RUSTFLAGS or CARGO_ENCODED_RUSTFLAGS from the caller: either replaces the
+    # workspace's rustflags, and the encoded one overrides both (engine-rev-async addendum 2 L4).
+    # Other channels (CARGO_TARGET_*_RUSTFLAGS, CARGO_BUILD_RUSTFLAGS, a config file) are not
+    # cleared here; check_build reads what each binary actually carries.
     env.pop("RUSTFLAGS", None)
+    env.pop("CARGO_ENCODED_RUSTFLAGS", None)
     if features:
         cmd += ["--features", features]
     out = subprocess.run(cmd, check=True, capture_output=True, text=True, env=env).stdout
@@ -111,6 +115,38 @@ def build(features):
         if m.get("reason") == "compiler-artifact" and m.get("target", {}).get("name") == "async_s0" and m.get("executable"):
             return m["executable"]
     sys.exit("REFUSED: no async_s0 executable in cargo's output")
+
+
+BUILD = re.compile(r"^AD-T5 BUILD features=\[([^\]]*)\] cfg=\[([^\]]*)\]")
+
+
+def check_build(binary, fire_check):
+    """The binary's own report of its build (async_s0's ad_t5_build_flags): a reading binary must
+    carry neither fe-mutants nor cfg fe_ad_t5_firecheck, a fire-check binary both. Refused (exit 2)
+    otherwise, or if the binary prints no BUILD line."""
+    env = dict(os.environ)
+    env.pop("FE_MUTANT", None)
+    proc = subprocess.run([binary, "ad_t5_build_flags", "--exact", "--nocapture", "--test-threads=1"],
+                          env=env, capture_output=True, text=True)
+    found = [BUILD.match(l) for l in proc.stdout.splitlines()]
+    found = [m for m in found if m]
+    if len(found) != 1:
+        sys.exit(f"REFUSED: {binary} printed {len(found)} AD-T5 BUILD lines, not one")
+    features, cfg = found[0].group(1), found[0].group(2)
+    want = ("fe-mutants", "fe_ad_t5_firecheck") if fire_check else ("", "")
+    kind = "fire-check" if fire_check else "reading"
+    if (features, cfg) != want:
+        sys.exit(f"REFUSED: the {kind} binary {binary} carries features=[{features}] cfg=[{cfg}], want features=[{want[0]}] cfg=[{want[1]}]")
+    print(f"{kind} binary build checked: features=[{features}] cfg=[{cfg}]")
+
+
+def build_both():
+    """Both binaries, each checked against its own report of its build."""
+    reading_bin = build(None)
+    fire_bin = build("turso_core/fe-mutants")
+    check_build(reading_bin, False)
+    check_build(fire_bin, True)
+    return reading_bin, fire_bin
 
 
 def sha256(path):
@@ -181,8 +217,7 @@ def main():
     print(f"registered runs per arm (async_s0.rs RUNS): {RUNS}")
     outdir = sys.argv[1]
     os.makedirs(outdir, exist_ok=True)
-    reading_bin = build(None)
-    fire_bin = build("turso_core/fe-mutants")
+    reading_bin, fire_bin = build_both()
     print(f"reading binary {reading_bin} sha256={sha256(reading_bin)}")
     print(f"fire-check binary {fire_bin} sha256={sha256(fire_bin)}")
     base_r, base_c = run(fire_bin, None, outdir, "fire-unmutated")
