@@ -16902,3 +16902,47 @@ fn a_shared_progress_handler_is_installed_with_no_allocation() {
     assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1, "premise: the installed handler was consulted on its interval");
     assert!(allocs.iter().all(|&n| n == 0), "CLAIM: installing a shared progress handler allocated {allocs:?} times per connection");
 }
+
+/// Mutant `filter_shrink_overflows` (the sweep at f4683e89d: no test failed on a claim under it;
+/// a_named_create_after_a_building_answer_refuses_asks_the_catalog_nothing's burst never met a
+/// refusal and ran to its timeout, rc 124, which the lead's ruling does not count as a kill). A
+/// natural shrink keeps the shrunk table answering (`Stale`, then `Building` with it as the old
+/// answer) until its rebuild lands; the mutant overflows instead, with no answer, so every create
+/// until the rebuild asks the catalog. The claim: with the shrink's rebuild held at its scan, a
+/// fresh name runs no catalog statement. Bounded: the shrink must begin within 30 s.
+#[test]
+fn a_fresh_name_during_a_shrinks_rebuild_asks_the_catalog_nothing() {
+    use super::store::{HOLD_ARRIVED, NAME_SCAN_HOLD};
+    use std::sync::atomic::Ordering::{Acquire, Release};
+    let _s = serial();
+    let dir = tempfile::TempDir::new().unwrap();
+    let db = open_at(&dir.path().join("shrink-asks-nothing.db"), opts(true, SyncClass::Off));
+    let trunk = db.connect().unwrap();
+    seed(&trunk);
+    trunk.create_branch("held").unwrap();
+    db.branch_wait_name_filter();
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            NAME_SCAN_HOLD.store(0, Release);
+        }
+    }
+    let _r = Reset;
+    NAME_SCAN_HOLD.store(1, Release);
+    let t = std::time::Instant::now();
+    let mut n = 0u32;
+    while NAME_SCAN_HOLD.load(Acquire) != 1 | HOLD_ARRIVED {
+        let name = format!("cycle-{n:05}");
+        trunk.create_branch(&name).unwrap();
+        db.drop_branch(&name).unwrap();
+        n += 1;
+        assert!(t.elapsed() < std::time::Duration::from_secs(30), "premise: no natural shrink's rebuild reached its scan ({n} cycles)");
+    }
+    let s0 = super::budget_probe::thread_cat_stmts();
+    trunk.create_branch("fresh-during-rebuild").unwrap();
+    let asked = super::budget_probe::thread_cat_stmts() - s0;
+    let state = db.branches.name_filter_state_for_test().0;
+    NAME_SCAN_HOLD.store(0, Release);
+    db.branch_wait_name_filter();
+    assert_eq!(asked, 0, "CLAIM: a fresh name ran {asked} catalog statements while a shrink's rebuild was held (filter {state})");
+}
