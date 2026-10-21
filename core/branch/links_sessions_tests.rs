@@ -1128,20 +1128,10 @@ fn ls_nonflip_behind_child() {
     let db = open(&path);
     db.branch_wait_name_filter();
     let trunk = db.connect().unwrap();
-    // A first checkpoint starts the fill; then wait for its cursor to pass fork 130.
-    let _ = db.branch_compact_now();
-    let t = std::time::Instant::now();
-    while t.elapsed() < std::time::Duration::from_secs(60) {
-        if try_cursor(&path).is_some_and(|(_, p, f, _, _)| (p, f) > (mark_par, mark_fe)) {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    let mut k = 0;
-    while !db.branches.past_hard_limit_for_test() && k < 20_000 {
-        let _ = trunk.fork_branch().unwrap().into_id();
-        k += 1;
-    }
+    start_fill_past(&db, &trunk, &path, (mark_par, mark_fe));
+    // Past the hard limit, and its first cut done (below the hard limit again: no checkpoint in flight, and
+    // none starts before the next pass, the fill being waited for).
+    let (past, _) = fork_past_hard_and_cut(&db, &trunk, &path);
     for id in ids.iter().skip(60).take(40).step_by(3) {
         db.branch(*id).unwrap().reap().unwrap();
     }
@@ -1150,22 +1140,53 @@ fn ls_nonflip_behind_child() {
         let _ = b.fork().unwrap().into_id();
         let _ = b.into_id();
     }
-    let peak = log_bytes(&path);
-    for _ in 0..200 {
-        let _ = trunk.fork_branch().unwrap().into_id();
-    }
-    let t = std::time::Instant::now();
-    while log_present(&path) >= peak && t.elapsed() < std::time::Duration::from_secs(30) {
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    // The cut that covers the changes: every checkpoint after them starts after them.
+    let (past2, peak) = fork_past_hard_and_cut(&db, &trunk, &path);
     let (cgen, cpar, cfe, cdone, mgen) = poll_cursor(&path).unwrap_or((0, 0, 0, 9, 9999));
     let meta = try_meta_version(&path).unwrap_or(0);
     println!(
         "LS-NFBEHIND past={} meta={meta} peak={peak} log={} cgen={cgen} mgen={mgen} cpar={cpar} cfe={cfe} cdone={cdone} markpar={mark_par} markfe={mark_fe}",
-        u64::from(db.branches.past_hard_limit_for_test()),
+        u64::from(past && past2),
         log_present(&path)
     );
     std::process::exit(0);
+}
+
+/// Fork from trunk until a checkpoint has started the fill (the gate spawns it), then wait (60 s at most)
+/// for its cursor to pass `mark`, a (parent, fork_epoch) key.
+fn start_fill_past(db: &Arc<Database>, trunk: &Arc<crate::Connection>, path: &std::path::Path, mark: (u64, u64)) {
+    let mut k = 0;
+    while db.branches.links_fill_state_for_test().2 == 0 && k < 20_000 {
+        let _ = trunk.fork_branch().unwrap().into_id();
+        k += 1;
+    }
+    let t = std::time::Instant::now();
+    while t.elapsed() < std::time::Duration::from_secs(60) {
+        if try_cursor(path).is_some_and(|(_, p, f, _, _)| (p, f) > mark) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// Fork from trunk until the log passes the hard limit (`past`, read then), then 200 more, then wait (30 s at
+/// most) for a checkpoint to cut the log under `peak`, its size at the limit. `(past, peak)`.
+fn fork_past_hard_and_cut(db: &Arc<Database>, trunk: &Arc<crate::Connection>, path: &std::path::Path) -> (bool, u64) {
+    let mut k = 0;
+    while !db.branches.past_hard_limit_for_test() && k < 20_000 {
+        let _ = trunk.fork_branch().unwrap().into_id();
+        k += 1;
+    }
+    let past = db.branches.past_hard_limit_for_test();
+    let peak = log_present(path);
+    for _ in 0..200 {
+        let _ = trunk.fork_branch().unwrap().into_id();
+    }
+    let t = std::time::Instant::now();
+    while log_present(path) >= peak && t.elapsed() < std::time::Duration::from_secs(30) {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    (past, peak)
 }
 
 /// h1-rev-72bfb0127 HIGH-2: the non-flip cut's relink is what keeps a crash's reopen right. Past the hard
@@ -1224,29 +1245,21 @@ fn ls_xbuild_cut_child() {
     let path = std::path::PathBuf::from(p);
     super::journal::set_compact_threshold(4 << 10);
     super::store::LINKS_FILL_PAUSE_MS.store(1_000, Ordering::Release);
+    let mark: (u64, u64) = (
+        std::env::var("FE_LS_XB_MARKPAR").unwrap().parse().unwrap(),
+        std::env::var("FE_LS_XB_MARKFE").unwrap().parse().unwrap(),
+    );
     let db = open(&path);
     db.branch_wait_name_filter();
     let trunk = db.connect().unwrap();
-    let mut k = 0;
-    while !db.branches.past_hard_limit_for_test() && k < 20_000 {
-        let _ = trunk.fork_branch().unwrap().into_id();
-        k += 1;
-    }
-    // Let the fill's cursor pass fork 130 (the rows the older build changes), then cut.
-    std::thread::sleep(std::time::Duration::from_secs(4));
-    let peak = log_bytes(&path);
-    for _ in 0..200 {
-        let _ = trunk.fork_branch().unwrap().into_id();
-    }
-    let t = std::time::Instant::now();
-    while log_present(&path) >= peak && t.elapsed() < std::time::Duration::from_secs(30) {
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    // The fill's cursor past the rows the older build changes, then past the hard limit and cut.
+    start_fill_past(&db, &trunk, &path, mark);
+    let (past, peak) = fork_past_hard_and_cut(&db, &trunk, &path);
     let (cgen, cpar, cfe, cdone, mgen) = poll_cursor(&path).unwrap_or((0, 0, 0, 9, 9999));
     let meta = try_meta_version(&path).unwrap_or(0);
     println!(
         "LS-XBCUT past={} meta={meta} peak={peak} log={} cgen={cgen} mgen={mgen} cpar={cpar} cfe={cfe} cdone={cdone}",
-        u64::from(db.branches.past_hard_limit_for_test()),
+        u64::from(past),
         log_present(&path)
     );
     std::process::exit(0);
@@ -1298,6 +1311,8 @@ fn a_crash_after_a_non_flip_cut_then_a_real_older_builds_session_reopens_with_ev
     let out = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["branch::links_sessions_tests::ls_xbuild_cut_child", "--exact", "--test-threads=1", "--nocapture"])
         .env("FE_LS_XB_PATH", &path)
+        .env("FE_LS_XB_MARKPAR", mpar.to_string())
+        .env("FE_LS_XB_MARKFE", mfe.to_string())
         .env_remove("FE_LS_CHILD")
         .output()
         .unwrap();
