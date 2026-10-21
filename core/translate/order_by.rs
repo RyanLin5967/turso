@@ -73,15 +73,16 @@ pub(crate) fn expr_custom_type(
 /// is its type only when the CAST yields the type's values, every DECODE in its type's chain being
 /// the value itself (date's, varchar's, a BASE-only type's); a CAST to numeric(8, 2) yields the
 /// encoded blob and is not numeric here (engine review 2bdcd32c6 MED 9: it was announced numeric
-/// over that blob, and CREATE TABLE AS re-ENCODEd it). Mutant `cast_typed_by_its_encoding` (test
-/// builds only): as `expr_custom_type`, as before.
+/// over that blob, and CREATE TABLE AS re-ENCODEd it). Since ac353f711 every CAST yields its type's
+/// values (`cast_yields_values`), so this is the CAST's type; MED 9's mutant
+/// `cast_typed_by_its_encoding` now lives where the CAST is made (`translate_expr`: the ENCODE alone,
+/// announced as the type here, the defect MED 9 fixed).
 pub(crate) fn expr_value_type(
     expr: &ast::Expr,
     referenced_tables: &TableReferences,
     schema: &Schema,
 ) -> Option<(std::sync::Arc<crate::schema::TypeDef>, std::vec::Vec<Box<ast::Expr>>)> {
-    let values = !crate::branch::store::fe_mutant("cast_typed_by_its_encoding");
-    custom_type_of(expr, referenced_tables, schema, values)
+    custom_type_of(expr, referenced_tables, schema, true)
 }
 
 /// Whether CAST(x AS `type_name`) yields the type's values: every type in its chain has no DECODE
@@ -115,15 +116,12 @@ fn cast_yields_values(schema: &Schema, type_name: &str) -> bool {
 /// and yields its ENCODE rather than its values (`cast_yields_values`), the primitive that ENCODE
 /// stores, uppercase: what a result column or a derived relation's column holding it is (engine
 /// review 2bdcd32c6 MED 9: CAST(1.5 AS numeric(8, 2)) is a blob, announced numeric). None
-/// otherwise. Mutant `cast_typed_by_its_encoding` (test builds only): None, as before.
+/// otherwise; since ac353f711 only under mutant `cast_yields_encoding`.
 pub(crate) fn cast_encoding_primitive(expr: &ast::Expr, schema: &Schema) -> Option<String> {
     let ast::Expr::Cast { type_name: Some(ty), .. } = expr else {
         return None;
     };
-    if ty.array_dimensions != 0
-        || cast_yields_values(schema, &ty.name)
-        || crate::branch::store::fe_mutant("cast_typed_by_its_encoding")
-    {
+    if ty.array_dimensions != 0 || cast_yields_values(schema, &ty.name) {
         return None;
     }
     if !cast_applies_type(schema, ty) {

@@ -691,7 +691,12 @@ pub fn translate_expr(
                         )?;
                         // The CAST yields the domain's VALUE, its chain's DECODE of what it
                         // stores, as PostgreSQL's CAST does (engine-rev-types-08caaec44 HIGH 1).
-                        if !crate::branch::store::fe_mutant("cast_yields_encoding") {
+                        // Mutant `cast_typed_by_its_encoding` (test builds only; engine review
+                        // 2bdcd32c6 MED 9's, re-pointed here): the ENCODE alone while the CAST is
+                        // still announced as the type (`order_by::expr_value_type`).
+                        if !crate::branch::store::fe_mutant("cast_yields_encoding")
+                            && !crate::branch::store::fe_mutant("cast_typed_by_its_encoding")
+                        {
                             let skip = program.allocate_label();
                             program.emit_insn(Insn::IsNull {
                                 reg: target_register,
@@ -751,7 +756,10 @@ pub fn translate_expr(
                             )?;
                             if let Some(decode_expr) = type_def
                                 .decode()
-                                .filter(|_| !crate::branch::store::fe_mutant("cast_yields_encoding"))
+                                .filter(|_| {
+                                    !crate::branch::store::fe_mutant("cast_yields_encoding")
+                                        && !crate::branch::store::fe_mutant("cast_typed_by_its_encoding")
+                                })
                             {
                                 let skip = program.allocate_label();
                                 program.emit_insn(Insn::IsNull {
