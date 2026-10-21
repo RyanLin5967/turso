@@ -413,6 +413,19 @@ def self_test():
     # case still runs, as a busy host cannot excuse a missed burner. On the T3 box (quiet by its own preflight) all run.
     busy = None
     n_pass = n_na = 0
+    # the lead's F6 order (2): a CALIBRATION of the sampler itself, run on every host whatever its load. One SUT burner
+    # of one core burns for 6 s; no per-sample reading of it may exceed 120% of a core. A sampler that over-counts
+    # (mutant F6, 10x) fails this live, on a quiet or a busy host alike: load can starve a burner, never inflate its
+    # own reading. Blind spot, stated: a burner starved below ~12% of a core would hide a 10x over-count; the reading
+    # floor is not checked here (burners_ran's 80% floor covers the live cases on a quiet host).
+    cverdict, crec, cmine = window("calibration", [(True, 0, 6)], secs=8)
+    csut = [float(r[3]) for r in (ln.rstrip("\n").split("\t") for ln in open(crec))
+            if not r[0].startswith("#") and len(r) == 5 and r[4] == "sut"]
+    cok = bool(csut) and max(csut) <= 120.0
+    bad += not cok
+    n_pass += cok
+    print(f"self-test {'PASS' if cok else 'FAIL'}: F6 calibration: one SUT burner of one core reads at most 120% per sample "
+          f"(max {max(csut) if csut else 'none'}% over {len(csut)} samples)")
     for label, burners, want in live:
         # linux-rev-uw2 LOW 4: on a busy host the VOID-wanting case is N/A too: its window would VOID with or without
         # the burner, so it cannot tell a working sampler from one that voids everything
