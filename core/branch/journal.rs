@@ -123,9 +123,14 @@ const SNAP_MAGIC: &[u8; 8] = b"TFBRSNP1";
 /// 21 and 22 (LEAP L4, the MCTS deletes, DECISIONS e977c1d010): a catalog's branch rows carry
 /// their nearest catalog siblings (`sib_lo`, `sib_hi`) and newest catalog child (`child_max`), kept
 /// by the checkpoint writer, so a delete asks the catalog nothing for its neighbours. ONE WRITE
-/// PATH (the same ruling's class fix): this build reads 17-20 only to upgrade them, at the store's
-/// first checkpoint, in the checkpoint's own transaction (the catalog's columns and every row's
-/// links, and the meta row at this version). ONE AUTHORITY for the version (links adversary H1,
+/// PATH (the same ruling's class fix, amended by 62c11ec63d): this build reads 17-20 only to upgrade
+/// them: a background fill links the rows in bounded batches, and the flip to this version happens in
+/// the first checkpoint whose fill is complete, in its own transaction (the meta row at this version,
+/// and the rows around its own changes relinked); until then every checkpoint writes the store's
+/// current 17-20 (the non-flip cut), never an older format. A store need not ever flip
+/// (h1-rev-72bfb0127 LOW-6): sessions each shorter than a fill between older-build checkpoints (which
+/// reset its cursor), a log under the compaction threshold, or a fill that cannot spawn keep it at
+/// 17-20, read as unfilled links, and a 17 store keeps the older open path for as long. ONE AUTHORITY for the version (links adversary H1,
 /// DECISIONS 7e77068514): the catalog's meta row. Every file is written at the version it records;
 /// it advances only in the checkpoint transaction that upgrades the catalog, and the log is cut
 /// after that commit, at it (`Journal::advance_format`). A recovery's rewrite before then stays at

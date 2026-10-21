@@ -3410,8 +3410,10 @@ fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU
         // relinked (the oracle's plant).
         // Links adversary L4: the fill thread linked every row in bounded batches before this
         // capture (`links_prefilled`), so this transaction only flips the meta row and relinks
-        // around its own changes (kill point `ckpt.upgrade.flip`). With no prefill (a checkpoint
-        // that did not wait for one), the whole fill is done here, as before.
+        // around its own changes (kill point `ckpt.upgrade.flip`). The capture writes this build's
+        // version only then (or over valid links), so the whole-catalog `upgrade_links` branch below is
+        // reached only under mutants (`l4_upgrade_unbatched`, `l4_flip_without_fill`'s neighbour): kept as
+        // the mutants' path, never a production one (h1-rev-72bfb0127 LOW-2).
         let mut links = Vec::new();
         let flip = super::journal::carries_links(cap.meta.format) && !catalog.links_valid();
         let upgraded = flip;
@@ -6431,15 +6433,15 @@ impl BranchStore {
     /// mutex: a thread in flight takes it for its install.
     /// Links adversary L4: whether a 17-20 catalog's first checkpoint must wait for the link fill
     /// (it runs, or is started here). Under the store mutex; a failed start is logged and the
-    /// checkpoint then fills every row in its own transaction, as before. Mutant
+    /// checkpoint then cuts at the store's current 17-20 with no flip (ruling 62c11ec63d; LOW-2). Mutant
     /// `l4_upgrade_unbatched` (test builds only): never waits, the whole fill under the mutex.
     fn links_fill_gate(&self, inner: &mut StoreInner) -> bool {
         let format = super::journal::format_version(inner.splice);
         // Links adversary 3: past the hard log limit no checkpoint waits for the fill. The fill
-        // stops after its batch, and the checkpoint links EVERY row on the writer, in its own transaction
-        // (`checkpoint_write`'s `upgrade_links`, from the first row: h1gap-rev-c HIGH-2, an O(N) stall past
-        // the hard limit, OPEN pending a ruling; LOW-1). Mutant `l4_fill_waits_past_hard_limit` (test builds
-        // only): it waits, as before.
+        // stops after its batch, and the checkpoint cuts the log at the store's current 17-20 with no flip,
+        // relinking only around its own changes (h1gap-rev-c HIGH-2, ruling 62c11ec63d: the non-flip cut); a
+        // later checkpoint starts the fill again from its carried cursor. Mutant
+        // `l4_fill_waits_past_hard_limit` (test builds only): it waits, as before.
         let past_hard = inner.journal.as_ref().is_some_and(Journal::past_hard_limit);
         let Some(cat) = inner.cat.as_mut() else {
             return false;
