@@ -333,9 +333,13 @@ In STRICT tables, CHECK constraint comparisons are type-checked at table creatio
 -- ERROR: type mismatch in CHECK constraint (cents vs INTEGER)
 CREATE TABLE t1(amount cents CHECK(amount < 50)) STRICT;
 
--- OK: CAST converts the literal to cents, both sides have the same type
+-- Accepted: CAST converts the literal to cents, both sides have the same type
 CREATE TABLE t1(amount cents CHECK(amount < CAST(50 AS cents))) STRICT;
 ```
+
+Note: a table CHECK reads the column's stored form, while a CAST yields the type's value (see CAST
+Support). For a type whose ENCODE changes the value (as `cents` multiplies by 100), the two sides of
+such a CHECK are not on the same scale. A domain's CHECK reads the domain's value.
 
 This rule applies to all comparisons in STRICT tables, not just custom types:
 
@@ -373,15 +377,25 @@ SELECT COALESCE(val, 'IS_NULL') FROM t1;
 
 ## CAST Support
 
-You can cast values to a custom type, which applies the encode function:
+You can cast a value to a custom type. The CAST yields a value of the type, as PostgreSQL's does:
+the type's ENCODE is applied (which validates the value and applies the type's parameters), then its
+DECODE, so the result is the value a column of the type would read back, not its stored form:
 
 ```sql
+SELECT CAST(1.5 AS numeric(8, 2));
+-- 1.50
+
 CREATE TYPE reversed BASE text
     ENCODE string_reverse(value)
     DECODE string_reverse(value);
 SELECT CAST('hello' AS reversed);
--- olleh
+-- hello (stored as 'olleh', read back as 'hello')
 ```
+
+When the type's input is a primitive (`varchar`'s is text), the operand is converted to it first:
+`CAST(50 AS varchar(3))` is the text `'50'`. A CAST to a domain applies its base type's ENCODE and
+DECODE and checks the domain's NOT NULL and CHECK constraints against the value. `CAST(x AS NUMERIC)`
+without parameters is SQLite's CAST, by NUMERIC affinity.
 
 ## Inspecting Types
 

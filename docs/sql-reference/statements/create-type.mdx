@@ -187,22 +187,18 @@ CREATE TYPE email BASE text
 
 ## CAST Support
 
-The CAST expression applies a custom type's ENCODE logic:
+A CAST to a custom type yields a value of the type, as PostgreSQL's does: the type's ENCODE is applied (validating the value and applying the type's parameters), then its DECODE, so the result is what a column of the type reads back, not its stored form:
 
 ```sql
-CREATE TYPE cents BASE integer
-    ENCODE value * 100
-    DECODE value / 100;
-
-SELECT CAST(42.5 AS cents);
--- 4250
+SELECT CAST(1.5 AS numeric(8, 2));
+-- 1.50
 ```
 
-This is useful for converting values to the encoded form outside of INSERT/UPDATE, such as in WHERE clauses and CHECK constraints.
+When the type's input is a primitive (`varchar`'s is text), the operand is converted to it first. A CAST to a domain also checks the domain's constraints. `CAST(x AS NUMERIC)` without parameters is SQLite's CAST.
 
 ## CHECK Constraints with Custom Types
 
-In STRICT tables with custom types, CHECK constraints operate on the **decoded** (presentation) values. When comparing a column of a custom type against a literal, use CAST to encode the literal:
+In STRICT tables with custom types, a table CHECK constraint reads the column's **stored** form, and a CAST yields the type's value (see CAST Support), so for a type whose ENCODE changes the value (as `cents` below) the two sides are not on the same scale. A domain's CHECK reads the domain's value. The CHECK type check requires a CAST when a column of a custom type is compared with a literal:
 
 ```sql
 CREATE TYPE cents BASE integer

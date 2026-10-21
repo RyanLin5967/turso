@@ -161,7 +161,7 @@ SELECT CAST(NULL AS INTEGER);    -- NULL
 ```
 
 <Info>
-**Turso Extension**: In STRICT tables with custom types, `CAST(value AS custom_type)` applies the custom type's ENCODE function. See [CREATE TYPE](/docs/sql-reference/statements/create-type) for details.
+**Turso Extension**: With custom types, `CAST(value AS custom_type)` yields a value of the custom type: its ENCODE, then its DECODE (`CAST(1.5 AS numeric(8, 2))` is `1.50`). See [CREATE TYPE](/docs/sql-reference/statements/create-type) for details.
 </Info>
 
 ## COLLATE Expression
