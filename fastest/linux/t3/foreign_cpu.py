@@ -385,6 +385,8 @@ def self_test():
     import tempfile
     d = tempfile.mkdtemp()
 
+    launched = {}   # window label -> [(burner, pid)], so a case can read each burner's own rows
+
     def window(label, burners, secs=20):
         """burners: list of (sut?, start_s, dur_s[, duty]); duty < 1 busy-loops that share of every 10 ms.
         Returns the verdict."""
@@ -414,6 +416,7 @@ def self_test():
                     code = ("import subprocess, sys\n"
                             f"sys.exit(subprocess.call([sys.executable, '-c', {code!r}], env={{'PATH': '/usr/bin:/bin'}}))\n")
                 procs.append(subprocess.Popen([sys.executable, "-c", code], env=env))
+                launched.setdefault(label, []).append((b, procs[-1].pid))
             time.sleep(0.05)
         for p in procs:
             p.wait()
@@ -440,19 +443,46 @@ def self_test():
     n_pass = n_na = 0
     # this self-test's own uwrun run, for late_busy: a process of ours in it may be the test's own
     own_run = (owner_of(os.getpid()) or (0, "-", "-"))[2]
-    # the lead's F6 order (2): a CALIBRATION of the sampler itself, run on every host whatever its load. One SUT burner
-    # of one core burns for 6 s; no per-sample reading of it may exceed 120% of a core. A sampler that over-counts
-    # (mutant F6, 10x) fails this live, on a quiet or a busy host alike: load can starve a burner, never inflate its
-    # own reading. Blind spot, stated: a burner starved below ~12% of a core would hide a 10x over-count; the reading
-    # floor is not checked here (burners_ran's 80% floor covers the live cases on a quiet host).
-    cverdict, crec, cmine = window("calibration", [(True, 0, 6)], secs=8)
-    csut = [float(r[3]) for r in (ln.rstrip("\n").split("\t") for ln in open(crec))
-            if not r[0].startswith("#") and len(r) == 5 and r[4] == "sut"]
-    cok = bool(csut) and max(csut) <= 120.0
-    bad += not cok
-    n_pass += cok
-    print(f"self-test {'PASS' if cok else 'FAIL'}: F6 calibration: one SUT burner of one core reads at most 120% per sample "
-          f"(max {max(csut) if csut else 'none'}% over {len(csut)} samples)")
+    # CALIBRATION of the sampler itself (the lead's F6 order (2); linux-rev-957573fc1 HIGH 1: one point at saturation let
+    # a capped over-count (CLAMP) and a convex under-count (SQUARE: a 68% foreign process read 45%, under rule 2) pass,
+    # because every live burner runs at about 0% or 100%). One window, run on every host whatever its load, holds
+    # known loads: SUT burners at duty 1.0, 0.68 and 0.3, and foreign burners at duty 0.68 and 0.3. Each SUT burner's
+    # median per-sample reading must land within 15 points of its duty; rule 2 must name the foreign 0.68 burner and must
+    # not name the foreign 0.3 one. Load can starve a burner but never inflate its reading, so a full-core burner read
+    # under 80% means the host starved it: the calibration is then N/A-on-busy-host, never a pass. Blind spot, stated:
+    # an error that is exact at 30%, 68% and 100% but wrong between them passes.
+    cal = [(True, 0, 8, 1.0), (True, 0, 8, 0.68), (True, 0, 8, 0.3), (False, 0, 8, 0.68), (False, 0, 8, 0.3)]
+    _cv, crec, _cm = window("calibration", cal, secs=10)
+    rows_by_pid = {}
+    for r in (ln.rstrip("\n").split("\t") for ln in open(crec)):
+        if not r[0].startswith("#") and len(r) == 5:
+            rows_by_pid.setdefault(int(r[1]), []).append(float(r[3]))
+    named = {int(m.group(1)) for m in (re.match(r"foreign process (\d+) ", x) for x in decide(crec)["reasons"]) if m}
+
+    def med(pid):
+        v = sorted(rows_by_pid.get(pid, []))
+        return v[len(v) // 2] if v else None
+    cpids = launched["calibration"]
+    full = med(next(pid for b, pid in cpids if b[0] is True and b[3] == 1.0))
+    if full is not None and full < 80.0:
+        n_na += 1
+        print(f"N/A-on-busy-host: self-test F6 calibration: the full-core SUT burner read a median {full}%, "
+              f"under 80%: the host starved it, so no load point can be checked", flush=True)
+    else:
+        for b, pid in cpids:
+            m_ = med(pid)
+            if b[0] is True:
+                ok_ = m_ is not None and abs(m_ - 100.0 * b[3]) <= 15.0
+                what = f"a SUT burner at duty {b[3]} reads a median within 15 points of {100.0 * b[3]:.0f}% (median {m_})"
+            elif b[3] >= 0.5:
+                ok_ = pid in named
+                what = f"rule 2 names a foreign burner at duty {b[3]} (median {m_})"
+            else:
+                ok_ = pid not in named
+                what = f"rule 2 does not name a foreign burner at duty {b[3]} (median {m_})"
+            bad += not ok_
+            n_pass += ok_
+            print(f"self-test {'PASS' if ok_ else 'FAIL'}: F6 calibration: {what}")
     for label, burners, want in live:
         # linux-rev-uw2 LOW 4: on a busy host the VOID-wanting case is N/A too: its window would VOID with or without
         # the burner, so it cannot tell a working sampler from one that voids everything
