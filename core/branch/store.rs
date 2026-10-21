@@ -241,6 +241,9 @@ pub(crate) struct BranchStore {
     flights: Mutex<Vec<crate::thread::JoinHandle<()>>>,
     /// Links adversary L4: the upgrade's fill thread (`run_links_fill`), joined with the flights.
     links_fill: Mutex<Option<crate::thread::JoinHandle<()>>>,
+    /// h1-rev-72bfb0127 LOW-3: fill threads a later spawn superseded (each ends before its next batch),
+    /// joined with the flights too, so none outlives the store.
+    links_fill_old: Mutex<Vec<crate::thread::JoinHandle<()>>>,
     /// The confirmation writer (`run_confirm_writer`; review 6 #1) and the process that started it
     /// (a fork(2) child has no such thread to join): `None` for a volatile or trunk-only store, and
     /// if it could not be started (the close then writes the last word).
@@ -3936,6 +3939,11 @@ fn run_links_fill(shared: &StoreMutex, writer: &Mutex<Catalog>, group: &Group, m
                 _ => return,
             }
         };
+        // The fix: a superseded fill ends here, before its next batch. Mutant `l4_fill_superseded_runs` (test
+        // builds only): it carries on, as before.
+        if superseded && !fe_mutant("l4_fill_superseded_runs") {
+            return;
+        }
         // Test builds: the batches started by a superseded fill.
         #[cfg(test)]
         if superseded {
@@ -4410,6 +4418,7 @@ impl BranchStore {
             prewarm: PrewarmStats::default(),
             flights: Mutex::new(Vec::new()),
             links_fill: Mutex::new(None),
+            links_fill_old: Mutex::new(Vec::new()),
             confirm_writer: Mutex::new(None),
             name_filter_build: Mutex::new(None),
             name_filter_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -4718,6 +4727,7 @@ impl BranchStore {
             prewarm: warmed,
             flights: Mutex::new(Vec::new()),
             links_fill: Mutex::new(None),
+            links_fill_old: Mutex::new(Vec::new()),
             confirm_writer: Mutex::new(None),
             name_filter_build: Mutex::new(None),
             name_filter_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -6463,7 +6473,9 @@ impl BranchStore {
             .spawn(move || run_links_fill(&shared, &writer, &group, &made, &stop));
         match spawned {
             Ok(handle) => {
-                *self.links_fill.lock() = Some(handle);
+                if let Some(old) = self.links_fill.lock().replace(handle) {
+                    self.links_fill_old.lock().push(old);
+                }
                 cat.links_fill_starts += 1;
                 true
             }
@@ -6523,6 +6535,12 @@ impl BranchStore {
         if let Some(handle) = fill {
             if handle.join().is_err() {
                 self.fill_panicked();
+            }
+        }
+        let old = std::mem::take(&mut *self.links_fill_old.lock());
+        for handle in old {
+            if handle.join().is_err() {
+                tracing::warn!("a superseded branch catalog link fill thread panicked");
             }
         }
         let handles = std::mem::take(&mut *self.flights.lock());
