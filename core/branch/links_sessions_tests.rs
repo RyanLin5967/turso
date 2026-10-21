@@ -144,6 +144,63 @@ fn a_store_whose_sessions_are_shorter_than_its_fill_still_upgrades_and_cuts_its_
     assert!(last < peak, "the log was never cut: {last} B at the end, {peak} B at its peak");
 }
 
+// ---- h1gap-rev-c HIGH-1: the fill resumes from its cursor, below the hard limit ----
+
+#[test]
+fn ls_resume_child() {
+    if !in_child() {
+        return;
+    }
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("r.db");
+    older_store(&path, 1_000);
+    super::journal::set_compact_threshold(4 << 10);
+    super::store::LINKS_FILL_PAUSE_MS.store(40, Ordering::Release);
+    {
+        let db = open(&path);
+        db.branch_wait_name_filter();
+        let trunk = db.connect().unwrap();
+        // Up to the threshold only: the warm session starts no fill.
+        while log_bytes(&path) < 4 << 10 {
+            let _ = trunk.fork_branch().unwrap().into_id();
+        }
+    }
+    for s in 0..14u64 {
+        let past = {
+            let db = open(&path);
+            db.branch_wait_name_filter();
+            let trunk = db.connect().unwrap();
+            let _ = trunk.fork_branch().unwrap().into_id();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            let _ = trunk.fork_branch().unwrap().into_id();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            db.branches.past_hard_limit_for_test()
+        };
+        println!("LS-RESUME s={s} meta={} log={} past={}", meta_version(&path), log_bytes(&path), u64::from(past));
+    }
+    super::store::LINKS_FILL_PAUSE_MS.store(0, Ordering::Release);
+}
+
+/// h1gap-rev-c HIGH-1 (its rev_resume_progress_child): sessions of a create, a 200 ms idle and one more
+/// create, each far shorter than the fill (40 ms per batch, 1,000 rows), and the log kept UNDER the hard
+/// limit, so only the fill's resumed cursor can finish the upgrade (the hard-limit bypass cannot). The
+/// store upgrades within 14 sessions. Premise: no session reached the hard limit before the upgrade.
+/// Mutant `l4_fill_cursor_forgotten` (every open fills again from the first row) must fail it.
+#[test]
+fn a_fill_resumed_across_short_sessions_completes_below_the_hard_limit() {
+    if in_child() {
+        return;
+    }
+    let text = child("ls_resume_child", &[]);
+    let r = readings(&text, "LS-RESUME ");
+    assert_eq!(r.len(), 14, "premise: 14 sessions ran:\n{text}");
+    let first21 = r.iter().position(|v| v[1] >= 21);
+    println!("LS resume: first upgraded session {first21:?}; metas {:?}", r.iter().map(|v| v[1]).collect::<Vec<_>>());
+    let upto = first21.unwrap_or(r.len() - 1);
+    assert!(r[..=upto].iter().all(|v| v[3] == 0), "premise: a session reached the hard limit before the upgrade, so the bypass could have finished it:\n{text}");
+    assert!(first21.is_some(), "the fill never completed across 14 short sessions below the hard limit (its cursor was not resumed)");
+}
+
 // ---- h1gap-rev-c HIGH-3: a session that writes in a burst and goes idle ----
 
 #[test]
