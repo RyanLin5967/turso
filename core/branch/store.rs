@@ -3391,9 +3391,16 @@ fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU
         let mut links = Vec::new();
         let flip = super::journal::carries_links(cap.meta.format) && !catalog.links_valid();
         let upgraded = flip;
-        if flip && !(cap.links_prefilled && catalog.links()) {
+        // h1gap-rev-c HIGH-2 (lead ruling 62c11ec63d, the NON-FLIP CUT): a checkpoint whose fill is not
+        // complete keeps the store at its version (the capture chose it), and where the fill has made the
+        // link columns it relinks around its own changes as an upgraded store does, so the rows the fill
+        // already linked stay right and its cursor stays usable (carried to this generation below).
+        let nonflip = !super::journal::carries_links(cap.meta.format) && catalog.links();
+        // Mutant `l4_flip_without_fill` (test builds only): the capture flips with its fill incomplete and
+        // nothing links the rest (the crash red's plant).
+        if flip && !(cap.links_prefilled && catalog.links()) && !fe_mutant("l4_flip_without_fill") {
             catalog.upgrade_links()?;
-        } else if (catalog.links_valid() || flip) && !fe_mutant("l4_stale_sibling_link") {
+        } else if (catalog.links_valid() || flip || nonflip) && !fe_mutant("l4_stale_sibling_link") {
             if flip {
                 kill_point("ckpt.upgrade.flip");
             }
@@ -3417,6 +3424,18 @@ fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU
             }
             for p in parents {
                 links.extend(catalog.relink_id(p)?);
+            }
+            if nonflip {
+                // The links are not valid yet: nothing of them is the store's to keep.
+                links.clear();
+                // The fill's cursor, if this catalog's (its generation the one this checkpoint replaces),
+                // carried to this checkpoint's generation: the rows it covers are right as of this commit.
+                let current = catalog.meta()?.map(|m| m.generation);
+                if let Some((g, at, done)) = catalog.fill_cursor()? {
+                    if Some(g) == current {
+                        catalog.put_fill_cursor(cap.meta.generation, at, done)?;
+                    }
+                }
             }
         }
         for &(page, born) in &cap.trunk_gone {
@@ -3453,10 +3472,9 @@ fn checkpoint_write(catalog: &mut Catalog, cap: &Captured, hold: Option<&AtomicU
         // One write path (DECISIONS e977c1d010): the meta row is at this build's format, which
         // carries the facts. Only a test's legacy store (CREATE_LEGACY, an older build's stand-in)
         // writes one without them.
-        #[cfg(test)]
+        // h1gap-rev-c HIGH-2: a non-flip cut of a 17 store (an older build's, no facts) writes it at 17, so
+        // the facts follow the format written, in every build (before, only a test's legacy store wrote one).
         let legacy = !super::journal::meta_carries_facts(meta.format);
-        #[cfg(not(test))]
-        let legacy = false;
         if !legacy {
             meta.lease_min = Some(if fe_mutant("l4_stale_meta_facts") { None } else { lease_min });
             meta.held_released = Some(if fe_mutant("l4_stale_meta_facts") { 0 } else { catalog.released_ids()?.len() as u64 });
@@ -10876,9 +10894,20 @@ impl StoreInner {
                 - reserved.len()
                 - if fe_mutant("in_use_keeps_deferred") { 0 } else { deferred.len() }) as u64,
             states: self.n_states,
-            // One write path (DECISIONS e977c1d010): this build's version of the store's arm, whatever
-            // version it was opened at; the writer upgrades a 17-20 catalog in this checkpoint.
-            format: super::journal::format_version(self.splice),
+            // One write path per on-disk format (DECISIONS e977c1d010, amended by 62c11ec63d): this build's
+            // version of the store's arm once the fill is complete (or the catalog already is), the flip in
+            // this checkpoint; else the store's CURRENT version, never an older one (h1gap-rev-c HIGH-2:
+            // past the hard limit the log is cut without the flip). Mutant `l4_upgrade_unbatched`: the
+            // whole fill in the checkpoint, as before the bounded fill.
+            format: {
+                let ours = super::journal::format_version(self.splice);
+                let complete = cat.links_prefilled || cat.catalog.links_valid() || !super::journal::carries_links(ours);
+                if complete || fe_mutant("l4_upgrade_unbatched") || fe_mutant("l4_flip_without_fill") {
+                    ours
+                } else {
+                    journal.format()
+                }
+            },
             // Filled by the writer in the transaction that commits (`checkpoint_write`).
             lease_min: None,
             held_released: None,
