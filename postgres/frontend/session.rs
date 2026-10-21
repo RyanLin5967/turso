@@ -38,6 +38,10 @@ pub(crate) struct PgConnectionInner {
     /// An undo is running ([`Undoing`]): the server's progress handler lets it run whatever
     /// interrupt is pending ([`PgConnection::undo_flag`]).
     undoing: std::sync::atomic::AtomicBool,
+    /// The running statement's work is done ([`noop_statement`]): what is left of it is a no-op,
+    /// which no interrupt may stop, so a statement that committed is never answered 57014. Cleared
+    /// when the server begins the next statement ([`PgConnection::begin_statement`]).
+    settled: std::sync::atomic::AtomicBool,
     /// The parameter-type walk's views, read once per schema snapshot (wire review 14 item 10).
     view_cache: parking_lot::Mutex<crate::result_types::ViewCache>,
     /// SET lock_timeout, in milliseconds: 0 when unset or set to 0, PostgreSQL's "no timeout",
@@ -483,12 +487,18 @@ impl PgConnection {
         aliases::install(&conn);
         // PostgreSQL enforces every foreign key; the engine only under PRAGMA foreign_keys.
         conn.set_foreign_keys_enabled(true);
+        // A statement stopped after a SAVEPOINT is undone by ROLLBACK TO it, after which COMMIT
+        // keeps the block's earlier work, as in PostgreSQL (review wire-rev-copystdin4 MED 1). The
+        // engine's own default keeps such a transaction rollback-only (review wire-rev-copystdin5
+        // HIGH 2), so this session opts in.
+        conn.set_rollback_to_clears_poison(true);
         let pg = Self {
             inner: Arc::new(PgConnectionInner {
                 conn,
                 session_state: parking_lot::Mutex::new(SessionState::default()),
                 broken: std::sync::atomic::AtomicBool::new(false),
                 undoing: std::sync::atomic::AtomicBool::new(false),
+                settled: std::sync::atomic::AtomicBool::new(false),
                 view_cache: parking_lot::Mutex::new(crate::result_types::ViewCache::default()),
                 lock_timeout_ms: std::sync::atomic::AtomicU64::new(0),
                 statement_timeout_ms: std::sync::atomic::AtomicU64::new(0),
@@ -521,13 +531,27 @@ impl PgConnection {
     /// during COPY's final insert).
     /// No allocation: the probe holds a Weak of the connection, so a handler the connection keeps
     /// makes no cycle.
+    ///
+    /// Also set once the running statement's work is done ([`noop_statement`]): the no-op left of
+    /// it is not to be stopped, or a DROP, ALTER or COPY that had committed was answered 57014
+    /// (review wire-rev-copystdin5 HIGH 1: 6 of 68 rounds at efe74caf5; PostgreSQL disables the
+    /// timeout before its commit and never reports 57014 for committed work).
     pub fn undo_flag(&self) -> impl Fn() -> bool + Send + Sync + 'static {
         let inner = Arc::downgrade(&self.inner);
         move || {
-            inner
-                .upgrade()
-                .is_some_and(|i| i.undoing.load(std::sync::atomic::Ordering::Acquire))
+            inner.upgrade().is_some_and(|i| {
+                i.undoing.load(std::sync::atomic::Ordering::Acquire)
+                    || i.settled.load(std::sync::atomic::Ordering::Acquire)
+            })
         }
+    }
+
+    /// The server begins a statement: the last one's settled mark ([`noop_statement`]) is
+    /// cleared, so this one can be stopped until its own work is done.
+    pub fn begin_statement(&self) {
+        self.inner
+            .settled
+            .store(false, std::sync::atomic::Ordering::Release);
     }
 
     /// After a statement ran: Some(the number of columns) when it was a COPY FROM STDIN that
@@ -1753,7 +1777,7 @@ fn prepare_statement_parsed(
             None => Ok(()),
         }
     })?;
-    noop_statement(&pg_conn.conn).map(Some)
+    noop_statement(pg_conn).map(Some)
 }
 
 /// THE translation of a statement, for the session's prepare and for the engine's re-prepare of it
@@ -1968,20 +1992,20 @@ fn try_prepare_special(
         Special::CreateSchema(stmt) => {
             refuse_schema_ddl(pg_conn, &stmt.name)?;
             handle_pg_create_schema(pg_conn, &stmt)?;
-            noop_statement(&pg_conn.conn)?
+            noop_statement(pg_conn)?
         }
         Special::DropSchema(stmt) => {
             for name in &stmt.names {
                 refuse_schema_ddl(pg_conn, name)?;
             }
             handle_pg_drop_schema(pg_conn, &stmt)?;
-            noop_statement(&pg_conn.conn)?
+            noop_statement(pg_conn)?
         }
         Special::DropObjects(stmt) => {
             handle_pg_drop_objects(pg_conn, &stmt)?;
-            noop_statement(&pg_conn.conn)?
+            noop_statement(pg_conn)?
         }
-        Special::RefreshMatview | Special::CommentOn => noop_statement(&pg_conn.conn)?,
+        Special::RefreshMatview | Special::CommentOn => noop_statement(pg_conn)?,
         // PostgreSQL's CHECKPOINT writes every dirty page to the data files; a WAL checkpoint that
         // copies every frame back into the database file and truncates the log is the same act
         // here.
@@ -1990,17 +2014,17 @@ fn try_prepare_special(
             .prepare(catalog::sqlite_text("PRAGMA wal_checkpoint(TRUNCATE)"))?,
         Special::AddConstraints(add) => {
             handle_pg_add_constraints(pg_conn, &add)?;
-            noop_statement(&pg_conn.conn)?
+            noop_statement(pg_conn)?
         }
         Special::CopyFrom(stmt) => {
             let rows_inserted = handle_pg_copy_from(pg_conn, &stmt)?;
-            let stmt = noop_statement(&pg_conn.conn)?;
+            let stmt = noop_statement(pg_conn)?;
             stmt.set_n_change(rows_inserted as i64);
             stmt
         }
         Special::CopyFromStdin(stmt) => {
             let rows_inserted = handle_pg_copy_from_stdin(pg_conn, &stmt)?;
-            let stmt = noop_statement(&pg_conn.conn)?;
+            let stmt = noop_statement(pg_conn)?;
             stmt.set_n_change(rows_inserted as i64);
             stmt
         }
@@ -2008,8 +2032,18 @@ fn try_prepare_special(
     Ok(Some(stmt))
 }
 
-fn noop_statement(conn: &Arc<Connection>) -> Result<Statement> {
-    conn.prepare(catalog::sqlite_text("SELECT 0 WHERE 0"))
+/// The no-op a statement whose work is done here returns for the server to step: the special
+/// statements (DROP, ALTER TABLE ADD CONSTRAINT, COPY, SET, CREATE TABLE's own transaction, ...)
+/// do their work, and commit it, before it is made. Made, it marks the session settled
+/// ([`PgConnection::undo_flag`]): no interrupt stops the rest of the statement, so committed work
+/// is never answered 57014 (review wire-rev-copystdin5 HIGH 1).
+fn noop_statement(pg_conn: &Arc<PgConnectionInner>) -> Result<Statement> {
+    let stmt = pg_conn.conn.prepare(catalog::sqlite_text("SELECT 0 WHERE 0"))?;
+    pg_conn
+        .settled
+        .store(true, std::sync::atomic::Ordering::Release);
+    settled_interrupt_failpoint();
+    Ok(stmt)
 }
 
 fn execute_sqlite_internal(conn: &Arc<Connection>, sql: impl AsRef<str>) -> Result<()> {
@@ -2166,7 +2200,7 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
                     _ => to_default!(min_messages, min_messages),
                 }
             })?;
-            return noop_statement(&pg_conn.conn);
+            return noop_statement(pg_conn);
         }
         if name.contains('.') {
             return Err(LimboError::InvalidArgument(SqlErrorMessage::classified(
@@ -2184,7 +2218,7 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
                 format!("unrecognized configuration parameter \"{name}\""),
             )));
         }
-        return noop_statement(&pg_conn.conn);
+        return noop_statement(pg_conn);
     }
     if name == "search_path" {
         let path = set_stmt
@@ -2201,7 +2235,7 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
                 local.search_path = None;
             }
         })?;
-        return noop_statement(&pg_conn.conn);
+        return noop_statement(pg_conn);
     }
     let value = set_stmt.values.first().ok_or_else(|| {
         LimboError::ParseError(format!("SET {}: no value provided", set_stmt.name).into())
@@ -2504,7 +2538,7 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
         }
     };
     if accepted {
-        noop_statement(&pg_conn.conn)
+        noop_statement(pg_conn)
     } else {
         unsupported("this server answers only by its own setting of it")
     }
@@ -3928,6 +3962,29 @@ pub fn interrupt_next_undo(interrupt: Box<dyn FnOnce()>) {
 #[cfg(feature = "failpoints")]
 pub fn undos_begun() -> usize {
     UNDOS.with(std::cell::Cell::get)
+}
+
+#[cfg(feature = "failpoints")]
+thread_local! {
+    static SETTLED_INTERRUPT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Test failpoint (feature `failpoints`, never in a credited build): `interrupt` runs once, when
+/// the next statement on this thread has done its work and made its no-op ([`noop_statement`]),
+/// as a CancelRequest or a deadline landing between the commit and the no-op's first step would
+/// (review wire-rev-copystdin5 HIGH 1).
+#[cfg(feature = "failpoints")]
+pub fn interrupt_when_settled(interrupt: Box<dyn FnOnce()>) {
+    SETTLED_INTERRUPT.with(|f| *f.borrow_mut() = Some(interrupt));
+}
+
+/// Where `interrupt_when_settled` strikes; nothing without the `failpoints` feature.
+#[inline]
+fn settled_interrupt_failpoint() {
+    #[cfg(feature = "failpoints")]
+    if let Some(interrupt) = SETTLED_INTERRUPT.with(|f| f.borrow_mut().take()) {
+        interrupt();
+    }
 }
 
 /// Where `interrupt_next_undo` strikes; nothing without the `failpoints` feature.

@@ -1864,6 +1864,10 @@ fn rv5c_env(name: &str, mvcc: bool, attach: bool) -> (Arc<Connection>, Arc<Conne
     )
     .unwrap();
     let conn = db.connect().unwrap();
+    // The clear is the PostgreSQL frontend's opt-in since the fix for review wire-rev-copystdin5
+    // HIGH 2 (FLAGGED TEST EDIT, the reviewer's env: this line only); the engine's default keeps a
+    // poisoned transaction rollback-only, as upstream's abandoned_statement_pager pins.
+    conn.set_rollback_to_clears_poison(true);
     if mvcc {
         conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
     }
@@ -2090,7 +2094,9 @@ fn rv5c_h_a_poisoning_after_the_clear_counts() {
 /// write of that database: the poison is cleared only once every database's rollback succeeded.
 /// It was cleared before the attached and temp pagers were rolled back, so a failure there left
 /// the attached partial write in the transaction, unpoisoned, for COMMIT to commit (review
-/// wire-rev-copystdin5 LOW 4, unverified there: this test is its check).
+/// wire-rev-copystdin5 LOW 4, unverified there: this test is its check). It PASSES at its red
+/// commit 9f90b91df too (run copy-red13): LOW 4 did not reproduce, and the clear's move after
+/// the mirror is defensive; this test is kept as a guard, not as a red (doc edit only).
 #[test]
 fn rv5c_i_a_failed_attached_rollback_commits_no_partial_write() {
     let (conn, observer, schema) = rv5c_env(&format!("i-{}", std::process::id()), false, true);

@@ -4248,10 +4248,13 @@ enum SavepointMirror<'a> {
     Rollback(&'a str),
 }
 
+/// Ok(true) when every database's part succeeded; Ok(false) when an attached MVCC database's
+/// ROLLBACK TO failed, which is not propagated (as before) but must not count as done.
 fn mirror_named_savepoint_to_active_non_main_databases(
     conn: &Connection,
     op: SavepointMirror<'_>,
-) -> Result<()> {
+) -> Result<bool> {
+    let mut all_done = true;
     conn.with_all_attached_pagers_with_index(|pagers| {
         for (db_id, pager) in pagers {
             let db_id = *db_id;
@@ -4272,7 +4275,9 @@ fn mirror_named_savepoint_to_active_non_main_databases(
                         let _ = mv_store.release_named_savepoint(tx_id, name);
                     }
                     SavepointMirror::Rollback(name) => {
-                        let _ = mv_store.rollback_to_named_savepoint(tx_id, name);
+                        if mv_store.rollback_to_named_savepoint(tx_id, name).is_err() {
+                            all_done = false;
+                        }
                     }
                 }
                 continue;
@@ -4322,7 +4327,8 @@ fn mirror_named_savepoint_to_active_non_main_databases(
             }
         }
         Ok(())
-    })
+    })?;
+    Ok(all_done)
 }
 
 #[cfg(test)]
@@ -5371,10 +5377,15 @@ pub fn op_savepoint(
                 return Err(LimboError::TxError(SqlErrorMessage::classified(SqlErrorKind::InvalidSavepointSpecification, format!("no such savepoint: {name}"))));
             };
             let frame_info = conn.rollback_named_savepoint_frame(name);
-            mirror_named_savepoint_to_active_non_main_databases(
+            let every_database_rolled_back = mirror_named_savepoint_to_active_non_main_databases(
                 &conn,
                 SavepointMirror::Rollback(name),
             )?;
+            // The poison is cleared only now that every database's part is rolled back
+            // (review wire-rev-copystdin5 LOW 4).
+            if let (true, Some(info)) = (every_database_rolled_back, frame_info.as_ref()) {
+                conn.clear_tx_poison_rolled_back_to(info.target_idx);
+            }
             conn.fk_deferred_violations
                 .store(deferred_fk_snapshot, Ordering::Release);
 

@@ -2804,6 +2804,7 @@ impl Session {
             .store(conn.lock_timeout_ms(), Ordering::Relaxed);
         // A CancelRequest or statement_timeout stops this statement (dropped at its end).
         let armed = self.interrupts.begin(conn.statement_timeout_ms());
+        conn.begin_statement();
         self.min_messages
             .store(conn.min_messages_rank(), Ordering::Relaxed);
         let in_tx = !conn.inner().get_auto_commit();
@@ -7640,26 +7641,16 @@ mod tests {
         );
     }
 
-    /// Every undo of the frontend's own work runs to its end when a cancel lands during it (review
-    /// wire-rev-copystdin4 HIGH 1: a test per path). For each path a statement fails on its own
-    /// (no interrupt), and the failpoint requests a cancel at the start of its undo, as a
-    /// CancelRequest landing then would: the statement answers its own error, never FATAL 08006,
-    /// the session is left in no transaction and serves the next statement, and the failed work
-    /// is gone. The premise is that the statement reached the shared undo (turso_pg::undos_begun
-    /// rose), so a path with an undo of its own fails the test instead of passing it. Written with
-    /// the fix, not red first: the failpoint is new. Its firing is shown by the mutant run (the
-    /// helper's unstoppable span removed), raws copystdin-r6.
-    #[test]
-    fn a_cancel_during_any_undo_of_own_work_leaves_the_session_usable() {
-        let dir = tempfile::TempDir::new().unwrap();
+    /// A session on a fresh database whose COPY FROM 'file' reads `dir`/files, with the fixtures
+    /// the own-work tests use: p(id PK) holding 1, b(id) holding 1, ca(id PK), cb(id), d1, d2, and
+    /// the files dup.txt (1, 1), bad.txt (1..=1500 then x) and ok.txt (1..=1500).
+    fn own_work_session(dir: &tempfile::TempDir) -> (Session, std::path::PathBuf) {
         let files = dir.path().join("files");
         std::fs::create_dir(&files).unwrap();
-        let dup = files.join("dup.txt");
-        std::fs::write(&dup, "1\n1\n").unwrap();
-        let bad = files.join("bad.txt");
-        let mut lines: String = (1..=1500).map(|i| format!("{i}\n")).collect();
-        lines.push_str("x\n");
-        std::fs::write(&bad, lines).unwrap();
+        std::fs::write(files.join("dup.txt"), "1\n1\n").unwrap();
+        let rows: String = (1..=1500).map(|i| format!("{i}\n")).collect();
+        std::fs::write(files.join("ok.txt"), &rows).unwrap();
+        std::fs::write(files.join("bad.txt"), format!("{rows}x\n")).unwrap();
         let path = dir.path().join("w.db").to_string_lossy().into_owned();
         let opts = database_opts(turso_core::branch::BranchDurability::Catalog {
             sync: turso_core::branch::SyncClass::Off,
@@ -7672,39 +7663,74 @@ mod tests {
             1,
             std::time::Duration::from_millis(DEFAULT_LOCK_WAIT_MS),
         );
-        shared.copy_from_dir = Some(std::fs::canonicalize(&files).unwrap());
+        let files = std::fs::canonicalize(&files).unwrap();
+        shared.copy_from_dir = Some(files.clone());
         let s = Session::new(Arc::new(shared));
-        ok(&s, "CREATE TABLE p(id INT PRIMARY KEY)");
-        ok(&s, "INSERT INTO p VALUES (1)");
-        ok(&s, "CREATE TABLE b(id INT)");
-        ok(&s, "INSERT INTO b VALUES (1)");
-        ok(&s, "CREATE TABLE ca(id INT PRIMARY KEY)");
-        ok(&s, "CREATE TABLE cb(id INT)");
-        ok(&s, "CREATE TABLE d1(id INT)");
-        let count = |table: &str| -> Vec<Vec<Value>> {
-            s.shared
-                .db
-                .connect()
-                .unwrap()
-                .prepare(format!("SELECT count(*) FROM {table}"))
-                .unwrap()
-                .run_collect_rows()
-                .unwrap()
-        };
-        let cases: [(&str, String, &str); 7] = [
-            ("CREATE TABLE's keys", "CREATE TABLE c(id INT, x INT REFERENCES c(id))".into(), "42830"),
+        for sql in [
+            "CREATE TABLE p(id INT PRIMARY KEY)",
+            "INSERT INTO p VALUES (1)",
+            "CREATE TABLE b(id INT)",
+            "INSERT INTO b VALUES (1)",
+            "CREATE TABLE ca(id INT PRIMARY KEY)",
+            "CREATE TABLE cb(id INT)",
+            "CREATE TABLE d1(id INT)",
+            "CREATE TABLE d2(id INT)",
+        ] {
+            ok(&s, sql);
+        }
+        (s, files)
+    }
+
+    /// `SELECT count(*) FROM table` on a fresh connection of the session's database.
+    fn own_work_count(s: &Session, table: &str) -> i64 {
+        let rows = s
+            .shared
+            .db
+            .connect()
+            .unwrap()
+            .prepare(format!("SELECT count(*) FROM {table}"))
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        rows.first()
+            .and_then(|r| r.first())
+            .and_then(Value::as_int)
+            .unwrap_or_else(|| panic!("count(*) FROM {table}: {rows:?}"))
+    }
+
+    /// Every undo of the frontend's own work runs to its end when a cancel lands during it (review
+    /// wire-rev-copystdin4 HIGH 1: a test per path). For each path, on a session and database of
+    /// its own, a statement fails on its own (no interrupt), and the failpoint requests a cancel at
+    /// the start of its undo, as a CancelRequest landing then would: the statement answers its own
+    /// error, never FATAL 08006, the session is left in no transaction and serves the next
+    /// statement, and the failed work is gone. The premise is that the statement reached the shared
+    /// undo (turso_pg::undos_begun rose), so a path with an undo of its own fails the test instead
+    /// of passing it. Each path's failure is collected, and each has its own session, so a run
+    /// without the guard shows every path failing, not the first alone (review wire-rev-copystdin5
+    /// LOW 2; FLAGGED TEST EDIT of this branch's own unlanded test: the same checks, per path).
+    /// Written with the fix, not red first: the failpoint is new; its firing is shown by the
+    /// mutant runs (the helper's unstoppable span removed).
+    #[test]
+    fn a_cancel_during_any_undo_of_own_work_leaves_the_session_usable() {
+        let cases: [(&str, &str, &str, &[(&str, i64)]); 7] = [
+            ("CREATE TABLE's keys", "CREATE TABLE c(id INT, x INT REFERENCES c(id))", "42830", &[]),
             (
                 "CREATE TABLE's prerequisites",
-                "CREATE TABLE c2(id SERIAL, x INT REFERENCES c2(id))".into(),
+                "CREATE TABLE c2(id SERIAL, x INT REFERENCES c2(id))",
                 "42830",
+                &[],
             ),
-            ("ALTER TABLE ADD CONSTRAINT's rebuild", "ALTER TABLE b ADD CONSTRAINT bk CHECK (id > 5)".into(), "23514"),
-            ("COPY FROM's final insert", format!("COPY ca FROM '{}'", dup.display()), "23505"),
-            ("COPY FROM's insert before a bad line", format!("COPY cb FROM '{}'", bad.display()), "22P02"),
-            ("a multi-object DROP", "DROP TABLE d1, d1".into(), ""),
-            ("an implicit block's rollback", "CREATE TABLE kept(id INT); INSERT INTO p VALUES (1)".into(), "23505"),
+            ("ALTER TABLE ADD CONSTRAINT's rebuild", "ALTER TABLE b ADD CONSTRAINT bk CHECK (id > 5)", "23514", &[("b", 1)]),
+            ("COPY FROM's final insert", "COPY ca FROM '{files}/dup.txt'", "23505", &[("ca", 0)]),
+            ("COPY FROM's insert before a bad line", "COPY cb FROM '{files}/bad.txt'", "22P02", &[("cb", 0)]),
+            ("a multi-object DROP", "DROP TABLE d1, d1", "", &[("d1", 0)]),
+            ("an implicit block's rollback", "CREATE TABLE kept(id INT); INSERT INTO p VALUES (1)", "23505", &[("p", 1)]),
         ];
-        for (path, sql, code) in cases {
+        let mut wrong: Vec<String> = Vec::new();
+        for (path, sql, code, counts) in cases {
+            let dir = tempfile::TempDir::new().unwrap();
+            let (s, files) = own_work_session(&dir);
+            let sql = sql.replace("{files}", &files.display().to_string());
             let before = turso_pg::undos_begun();
             let interrupts = s.interrupts.clone();
             turso_pg::interrupt_next_undo(Box::new(move || {
@@ -7715,25 +7741,91 @@ mod tests {
                 turso_pg::undos_begun() > before,
                 "premise not met: {path}: `{sql}` reached no shared undo ({got:?})"
             );
-            assert!(
-                !got.is_empty() && got.iter().all(|(c, severity)| severity == "ERROR" && c != "57014"),
-                "{path}: `{sql}` answered {got:?}, not its own error"
-            );
-            if !code.is_empty() {
-                assert!(got.iter().any(|(c, _)| c == code), "{path}: {got:?}, not {code}");
+            if got.is_empty() || !got.iter().all(|(c, severity)| severity == "ERROR" && c != "57014") {
+                wrong.push(format!("{path}: `{sql}` answered {got:?}, not its own error"));
+                continue;
             }
-            assert!(
-                s.current(&mut s.state()).unwrap().inner().get_auto_commit(),
-                "{path}: the session is left in a transaction"
-            );
-            assert!(errors(&s, "SELECT 1").is_empty(), "{path}: the session after its undo");
+            if !code.is_empty() && !got.iter().any(|(c, _)| c == code) {
+                wrong.push(format!("{path}: {got:?}, not {code}"));
+            }
+            if !s.current(&mut s.state()).unwrap().inner().get_auto_commit() {
+                wrong.push(format!("{path}: the session is left in a transaction"));
+            }
+            let after = errors(&s, "SELECT 1");
+            if !after.is_empty() {
+                wrong.push(format!("{path}: the session after its undo answered {after:?}"));
+            }
+            for (table, n) in counts {
+                let have = own_work_count(&s, table);
+                if have != *n {
+                    wrong.push(format!("{path}: {table} holds {have} rows, not {n}"));
+                }
+            }
+            for table in ["c", "c2", "kept"] {
+                if committed_table(&s, table) {
+                    wrong.push(format!("{path}: the failed work's table {table} was committed"));
+                }
+            }
         }
-        assert!(!committed_table(&s, "c") && !committed_table(&s, "c2") && !committed_table(&s, "kept"));
-        assert!(committed_table(&s, "d1"), "the failed DROP's first drop was kept");
-        assert_eq!(count("b"), vec![vec![Value::from_i64(1)]], "the rebuilt table");
-        assert_eq!(count("ca"), vec![vec![Value::from_i64(0)]]);
-        assert_eq!(count("cb"), vec![vec![Value::from_i64(0)]]);
-        assert_eq!(count("p"), vec![vec![Value::from_i64(1)]]);
+        assert!(wrong.is_empty(), "{} failures over 7 paths: {wrong:#?}", wrong.len());
+    }
+
+    /// A statement whose work is done and committed answers its success whatever interrupt lands
+    /// after: a cancel requested between the commit and the no-op statement the frontend then
+    /// returns (the failpoint, at the no-op's making) leaves DROP TABLE d1, d2, ALTER TABLE ADD
+    /// CONSTRAINT, COPY FROM 'file' and CREATE TABLE with a serial column answered as done, their
+    /// work visible. The no-op was stepped armed, so its first step was stopped: 57014 after the
+    /// work was durable (review wire-rev-copystdin5 HIGH 1: the DROP at 6 of 68 rounds; ALTER and
+    /// COPY were not seen there but return the same no-op, and this test answers whether they share
+    /// it). PostgreSQL disables the timeout before its commit and never reports 57014 for committed
+    /// work. One session per case, failures collected. Written with the fix (the failpoint is new);
+    /// the wire red a_timeout_during_a_multi_object_drop_drops_nothing is the red, and the mutant
+    /// run (the settled mark ignored) shows each case's firing.
+    #[test]
+    fn a_cancel_after_a_statements_work_is_committed_is_not_its_answer() {
+        let cases: [(&str, &str, &[(&str, i64)]); 4] = [
+            ("a multi-object DROP", "DROP TABLE d1, d2", &[]),
+            ("ALTER TABLE ADD CONSTRAINT", "ALTER TABLE b ADD CONSTRAINT bk CHECK (id > 0)", &[("b", 1)]),
+            ("COPY FROM a file", "COPY cb FROM '{files}/ok.txt'", &[("cb", 1500)]),
+            ("CREATE TABLE's own transaction", "CREATE TABLE c3(id SERIAL, x INT)", &[("c3", 0)]),
+        ];
+        let mut wrong: Vec<String> = Vec::new();
+        for (what, sql, counts) in cases {
+            let dir = tempfile::TempDir::new().unwrap();
+            let (s, files) = own_work_session(&dir);
+            let sql = sql.replace("{files}", &files.display().to_string());
+            let interrupts = s.interrupts.clone();
+            let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let f = fired.clone();
+            turso_pg::interrupt_when_settled(Box::new(move || {
+                f.store(true, Ordering::Relaxed);
+                interrupts.cancel.store(true, Ordering::Relaxed)
+            }));
+            let got = errors(&s, &sql);
+            assert!(
+                fired.load(Ordering::Relaxed),
+                "premise not met: {what}: `{sql}` made no no-op after its work ({got:?})"
+            );
+            if !got.is_empty() {
+                wrong.push(format!("{what}: `{sql}` answered {got:?} after its work was committed"));
+            }
+            for (table, n) in counts {
+                let have = own_work_count(&s, table);
+                if have != *n {
+                    wrong.push(format!("{what}: {table} holds {have} rows, not {n}"));
+                }
+            }
+            if what == "a multi-object DROP" && (committed_table(&s, "d1") || committed_table(&s, "d2")) {
+                wrong.push(format!("{what}: a dropped table is still there"));
+            }
+            if what == "ALTER TABLE ADD CONSTRAINT" && errors(&s, "INSERT INTO b VALUES (-1)").is_empty() {
+                wrong.push(format!("{what}: the constraint was not added"));
+            }
+            if !s.current(&mut s.state()).unwrap().inner().get_auto_commit() {
+                wrong.push(format!("{what}: the session is left in a transaction"));
+            }
+        }
+        assert!(wrong.is_empty(), "{} failures over 4 statements: {wrong:#?}", wrong.len());
     }
 
     /// An extended-protocol statement is prepared once: Execute runs the statement its Describe

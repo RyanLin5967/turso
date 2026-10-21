@@ -153,6 +153,8 @@ pub(crate) struct RollbackFrameInfo {
     pub(crate) main_schema_snapshot: Arc<Schema>,
     pub(crate) temp_schema_snapshot: Option<Arc<Schema>>,
     pub(crate) staged_schema_snapshot: HashMap<usize, Arc<Schema>>,
+    /// The savepoint's place in the stack, for [`Connection::clear_tx_poison_rolled_back_to`].
+    pub(crate) target_idx: usize,
 }
 
 struct SchemaReparseGuard {
@@ -389,6 +391,11 @@ pub struct Connection {
     /// ([`Connection::mark_tx_poisoned`]); u64::MAX when it is not poisoned. A ROLLBACK TO one of
     /// those savepoints undoes every poisoning statement, so it clears the poison.
     pub(crate) poisoned_at_savepoints: AtomicU64,
+    /// Whether a ROLLBACK TO a savepoint open at every poisoning clears the poison
+    /// ([`Connection::set_rollback_to_clears_poison`]). Off by default: the engine's contract is
+    /// that a poisoned transaction is rollback-only even after ROLLBACK TO (upstream's
+    /// tests/integration/abandoned_statement_pager.rs).
+    pub(crate) rollback_to_clears_poison: AtomicBool,
     pub(super) last_insert_rowid: AtomicI64,
     pub(crate) changes: AtomicI64,
     pub(crate) total_changes: AtomicI64,
@@ -5203,25 +5210,42 @@ impl Connection {
         let target_idx = savepoints
             .iter()
             .rposition(|savepoint| savepoint.name == name)?;
-        // The savepoint was open at every poisoning of the transaction, so rolling back to it
-        // undid each abandoned statement's partial work: COMMIT is safe again. Without this, a
-        // statement stopped after a SAVEPOINT (a statement_timeout during DDL, which has no
-        // statement savepoint) made the block's COMMIT roll everything back, the work before
-        // the savepoint included, after ROLLBACK TO had answered ROLLBACK (review
-        // wire-rev-copystdin4 MED 1).
-        if (target_idx as u64) < self.poisoned_at_savepoints.load(Ordering::SeqCst) {
-            self.clear_tx_poison();
-        }
         let frame = &savepoints[target_idx];
         let info = RollbackFrameInfo {
             main_schema_snapshot: frame.main_schema_snapshot.clone(),
             temp_schema_snapshot: frame.temp_schema_snapshot.clone(),
             staged_schema_snapshot: frame.staged_schema_snapshot.clone(),
+            target_idx,
         };
         // ROLLBACK TO keeps the target savepoint itself on the stack;
         // only nested savepoints above it are discarded.
         savepoints.truncate(target_idx + 1);
         Some(info)
+    }
+
+    /// After a ROLLBACK TO the savepoint at `target_idx` has rolled back every database: when the
+    /// connection opted in ([`Connection::set_rollback_to_clears_poison`]) and that savepoint was
+    /// open at every poisoning of the transaction, the rollback undid each abandoned statement's
+    /// partial work, so COMMIT is safe again and the poison is cleared. A statement stopped after
+    /// a SAVEPOINT (a statement_timeout during DDL, which has no statement savepoint) otherwise
+    /// made the block's COMMIT roll everything back, the work before the savepoint included,
+    /// after ROLLBACK TO had answered ROLLBACK (review wire-rev-copystdin4 MED 1). Called only
+    /// once the attached and temp databases are rolled back too: cleared before them, a failure
+    /// there left their partial writes committable (review wire-rev-copystdin5 LOW 4).
+    pub(crate) fn clear_tx_poison_rolled_back_to(&self, target_idx: usize) {
+        if self.rollback_to_clears_poison.load(Ordering::SeqCst)
+            && (target_idx as u64) < self.poisoned_at_savepoints.load(Ordering::SeqCst)
+        {
+            self.clear_tx_poison();
+        }
+    }
+
+    /// Opt in (or out) to clearing a transaction's poison at a ROLLBACK TO a savepoint that was
+    /// open at every poisoning, as PostgreSQL and SQLite let a statement-level undo be followed by
+    /// COMMIT. The PostgreSQL frontend's session opts in; the engine's default is off (review
+    /// wire-rev-copystdin5 HIGH 2, lead ruling c932bf7572).
+    pub fn set_rollback_to_clears_poison(&self, on: bool) {
+        self.rollback_to_clears_poison.store(on, Ordering::SeqCst);
     }
 
     pub(crate) fn clear_named_savepoints(&self) {
