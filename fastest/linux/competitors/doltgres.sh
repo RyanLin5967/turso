@@ -30,11 +30,15 @@ init)
   [ -e "$DATA" ] && die "REFUSED: $DATA exists"
   mkdir -p "$DATA/databases" "$DATA/doltcfg"
   dolt_quiet_root "$DATA/root"
+  # comp-rev-89ec-b3c3 LOW 13: FT_AUTOGC_ENABLE (true, the registered default, or false: only run_system.sh's
+  # autogc_plant sets it), so a plant can show the key takes effect
+  AUTOGC=${FT_AUTOGC_ENABLE:-true}
+  case $AUTOGC in true|false) ;; *) die "REFUSED: FT_AUTOGC_ENABLE [$AUTOGC] is not true or false" ;; esac
   cat >"$CONF" <<EOF
 log_level: warning
 behavior:
   auto_gc_behavior:
-    enable: true
+    enable: $AUTOGC
 user:
   name: postgres
   password: password

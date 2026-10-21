@@ -161,7 +161,49 @@ def expected_jobs(d, repo):
     return sha, axes, names
 
 
+def delete_check_problem(cell, record):
+    """comp-rev-89ec-b3c3 LOW 5: why cell CELL's delete durability does not stand (None = it does). stracecount.py can
+    check a delete only where flushes split by op phase, at C=1; a C>1 cell's delete is not checked, which is sound only
+    because its C=1 sibling's is (PINNED_CLIENTS holds 1). So a C=1 cell whose delete-durable is d2 or d0 must say it
+    was checked."""
+    if not str(cell).endswith("-c1"):
+        return None
+    if (record or {}).get("delete_durable", "none") in ("none", None):
+        return None
+    chk = (record or {}).get("delete_check")
+    if not (isinstance(chk, str) and chk.startswith("checked at C=1")):
+        return f"a C=1 cell whose {record.get('delete_durable')} delete was not checked ({chk!r}): the C>1 cells rest on it"
+    return None
+
+
+def timed_line(name, cell, tv, dry):
+    """One cell's TIMED judgement: (the TIMED line to print or None, whether it counts against the run). A smoke job
+    (run-info dry=1) stands only with timed verdict 'ok-smoke', a real job (dry=0) only with 'ok'."""
+    want_tv = {"1": "ok-smoke", "0": "ok"}.get(dry)
+    if tv == "ok-exploratory-n" and want_tv == "ok":
+        # the lead's LOW 21 ruling: a prebranch other than the registered 1 and 1,000 is exploratory, never credited,
+        # and so it fails the run (comp-rev-89ec-b3c3 MED 3: it had been a printed line only, and the run exited 0)
+        return f"TIMED\t{name}\t{cell}\t{tv} (exploratory: N not a registered tier (1 or 1,000), NOT CREDITED)", True
+    if tv != want_tv:
+        return f"TIMED\t{name}\t{cell}\t{tv} (want {want_tv!r} for run-info dry={dry!r})", True
+    return None, False
+
+
+def selftest():
+    """test_reduce_concurrency.py's cases (comp-rev-89ec-b3c3 MED 3 and LOW 5), with a TALLY line for gates/tally.py, so
+    CI runs them through gates/run_selftest.sh (they had never run in CI)."""
+    import unittest
+    sys.path.insert(0, HERE)
+    import test_reduce_concurrency as t
+    r = unittest.TextTestRunner(verbosity=2, stream=sys.stdout).run(unittest.defaultTestLoader.loadTestsFromModule(t))
+    n, bad = r.testsRun, len(r.failures) + len(r.errors)
+    print(f"TALLY ran={n} pass={n - bad} na=0 fail={bad}")
+    return 1 if bad or not n else 0
+
+
 def main(argv):
+    if argv == ["selftest"]:
+        sys.exit(selftest())
     if not argv or argv[0].startswith("-"):
         sys.exit(__doc__)
     d = argv[0]
@@ -232,13 +274,10 @@ def main(argv):
             # MED 7 and comp review 1 LOW 15: a smoke job (run-info dry=1) stands only with 'ok-smoke' (timedrun.py
             # gives a clean smoke cell that verdict whatever its rule, so it can never read 'ok'), a real job (dry=0)
             # only with 'ok'
-            want_tv = {"1": "ok-smoke", "0": "ok"}.get(run_param(a, "dry"))
-            if tv == "ok-exploratory-n" and want_tv == "ok":
-                # the lead's LOW 21 ruling: a prebranch beyond the registered 1,000 is exploratory, never credited
-                print(f"TIMED\t{name}\t{cell}\t{tv} (exploratory: N beyond the registered 1,000, NOT CREDITED)")
-            elif tv != want_tv:
-                print(f"TIMED\t{name}\t{cell}\t{tv} (want {want_tv!r} for run-info dry={run_param(a, 'dry')!r})")
-                bad += 1
+            line, is_bad = timed_line(name, cell, tv, run_param(a, "dry"))
+            if line:
+                print(line)
+            bad += is_bad
     # MED 7: one cap, one warm-up rule and (comp review 1 LOW 15) one dry value for every job of the run (each job's
     # run/run-info.txt): a run mixing smoke and real jobs is no run
     params = {}
@@ -306,6 +345,10 @@ def main(argv):
             continue
         print("CELLS\t" + "\t".join([name, label] + [str(x) for x in row]))
         if c.get("verdict") != "ok":
+            bad += 1
+        dwhy = delete_check_problem(cell, c)
+        if dwhy:
+            print(f"DELETE\t{name}\t{cell}\t{dwhy}")
             bad += 1
     if missing or bad:
         print(f"# {missing} expected job(s) or cell(s) MISSING; {bad} job verdict(s) not PASS or cell verdict(s) not ok",

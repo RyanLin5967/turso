@@ -82,14 +82,14 @@ def selftest():
     ok("a header without phase is refused", "phase" in header_problems([c for c in CORE if c != "phase"]))
     ok("control: CORE plus a producer's own columns passes", header_problems(list(CORE) + ["ticket"]) == [])
     plant = 'fprintf(f, "client\\tseq\\tphase\\tok\\tstart_ns");\nfor (;;) fprintf(f, "\\tstep%d_ns", s);\nfprintf(f, "\\terr\\n");\n'
-    p = os.path.join(HERE, ".raw_schema_plant.c")
-    try:
+    # (comp-rev-89ec-b3c3 LOW 16: written in a temporary directory, never the source directory)
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        p = os.path.join(td, "raw_schema_plant.c")
         with open(p, "w") as f:
             f.write(plant)
         ok("source_header reads a split header literal", source_header(p) == ["client", "seq", "phase", "ok", "start_ns",
                                                                          "step1_ns", "err"], source_header(p))
-    finally:
-        os.remove(p)
     print(f"TALLY ran={n} pass={n - bad} na=0 fail={bad}")  # gates/tally.py (linux-rev-uw2 MED 1)
     print(f"raw_schema selftest: {n - bad}/{n}")
     return 1 if bad else 0

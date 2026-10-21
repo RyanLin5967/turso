@@ -122,7 +122,7 @@ GC_OK = ("0", "{0}")  # DOLT_GC's status with -N (Dolt) / -At (Doltgres): an all
 
 def gc_verdict(rc, out, log):
     """Why the seed's GC did not succeed ([] = it did): the client's rc must be 0, its whole output exactly one GC_OK
-    status (no carve-out for a lost connection: in Dolt 2.4.1 DOLT_GC does not end the calling session, and a lost
+    status (no carve-out for a lost connection: in Dolt 2.4.1 and 2.5.0 DOLT_GC does not end the calling session, and a lost
     connection is what a recovered panic or a failed handshake looks like), and the server log written since the CALL
     must hold no panic."""
     why = []
@@ -149,7 +149,8 @@ def gc_settings_problem(text):
     kv = {re.split(r"[\t|]", ln, 1)[0].strip().lower(): (re.split(r"[\t|]", ln, 1) + [""])[1].strip() for ln in rows}
     if not any("gc" in nm for nm in kv):
         return f"no GC setting among {list(kv)[:8]}"
-    # the probe (artie runs/loud-20261015/probe-dolt-gc): Dolt 2.4.1 and Doltgres 1.4.0 default it on, and dolt.sh /
+    # the probes (artie runs/loud-20261015/probe-dolt-gc, artie runs/uw-20261018-dolt250-4078bf83b): Dolt 2.4.1, Dolt 2.5.0
+    # and Doltgres 1.4.0 default it on, and dolt.sh /
     # doltgres.sh now pin it on in config.yaml; the record must show that setting at that value
     if kv.get("dolt_auto_gc_enabled", "").upper() not in ("ON", "1"):
         return f"dolt_auto_gc_enabled is {kv.get('dolt_auto_gc_enabled')!r}, not on (the pinned vendor default)"
@@ -167,8 +168,11 @@ def pg_waits(log, template="p"):
     database and error after 5 s if another backend stays; the template's are 'source database "p" ...' and
     terminations on p, the delete's are 'database "b_..." ...' and terminations on a branch. A termination's database
     is its log_line_prefix %d (pg18.sh sets '%m [%p] %d '), else the CONTEXT line its worker logs next ('automatic
-    vacuum of table "db.schema.t"'); one naming no database is unattributed (UNVERIFIED here whether PG 18 fills %d for
-    an autovacuum worker, which has no client port) and the caller keeps it in the template flag."""
+    vacuum of table "db.schema.t"'); one naming no database is unattributed and the caller keeps it in the template flag.
+    MEASURED (comp-rev-89ec-b3c3 LOW 15; PG 18.6 PGDG, artie runs/uw-20261019-pgw-rh, 60 terminations by CREATE DATABASE
+    TEMPLATE p): an autovacuum worker's %d is EMPTY ("[pid]  FATAL:"), and its CONTEXT is "while scanning block N of
+    relation "public.t"", which names no database. So every such termination is unattributed: it stays in the template
+    flag (a cell is flagged, never credited, for it), and a delete-side one (a DROP DATABASE's) flags the template too."""
     out = {"template_autovacuum_terminated": 0, "template_busy_errors": 0, "delete_autovacuum_terminated": 0,
            "delete_busy_errors": 0, "unattributed_autovacuum_terminated": 0}
     pending = {}  # pid -> True while a termination with no %d waits for its CONTEXT line
@@ -292,6 +296,15 @@ def selftest():
     ok(f"pg_waits: template 2+1, delete 2+1, unattributed 1 (got {got})", got == want)
     got = pw("") if pw else None
     ok(f"pg_waits: an empty log is all zeros (got {got})", got == {k: 0 for k in want})
+    # comp-rev-89ec-b3c3 LOW 15: lines copied from a REAL PG 18.6 log (artie runs/uw-20261019-pgw-rh, data/log), not
+    # planted: CREATE DATABASE TEMPLATE p terminating a worker vacuuming p's t. %d is empty and the CONTEXT names no
+    # database, so it is unattributed (kept in the template flag)
+    real = ('2026-10-19 04:07:04.697 EDT [137288]  FATAL:  terminating autovacuum process due to administrator command\n'
+            '2026-10-19 04:07:04.697 EDT [137288]  CONTEXT:  while scanning block 4 of relation "public.t"\n'
+            '2026-10-19 04:07:04.995 EDT [136794]  LOG:  automatic analyze of table "template1.pg_catalog.pg_type"\n')
+    got = pw(real) if pw else "no pg_waits() in fthelp.py"
+    ok(f"pg_waits on real PG 18.6 lines: 1 unattributed, nothing attributed (got {got})",
+       got == dict({k: 0 for k in want}, unattributed_autovacuum_terminated=1))
     # comp review 1 LOW 28: the seed's GC settings record (dolt.sh SHOW VARIABLES LIKE '%gc%'; doltgres.sh pg_settings
     # LIKE '%gc%') is refused when empty, when its query failed, or when no row is a GC setting
     gs = globals().get("gc_settings_problem")

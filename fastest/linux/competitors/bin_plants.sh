@@ -43,6 +43,34 @@ case_ "open loop refuses after-steps (dolt-create.spec: after sql-serial)" 2 "RE
   -- "$BB" --spec "$SP/dolt-create.spec" --out "$(OUT a)" --clients 1 --mode open --rate 10 --duration-s 1 --set port=1
 case_ "open loop refuses a connect/close step (pg18-m1c.spec)" 2 "REFUSED: open loop with after-steps" \
   -- "$BB" --spec "$SP/pg18-m1c.spec" --out "$(OUT b)" --clients 1 --mode open --rate 10 --duration-s 1 --set port=1
+# comp-rev-89ec-b3c3 LOW 6: pg18-m1c.spec has after-steps too, and both clauses printed one message, so the case above
+# passed whether or not a connect/close step was checked (a mutant dropping it passed every case), and a step-level
+# sql-serial was never planted. Specs with NO after-steps, each with one of the two, written here (plants, never a
+# registered spec): each is refused for its own reason.
+printf 'protocol pg\nconnect host=127.0.0.1 port={port} user=postgres dbname=postgres\nvar branch = b_{run}_{c}_{i}\nstep sql SELECT 1\nstep connect dbname=postgres\nstep sql SELECT 1\nstep close\n' >"$S/open-connect.spec"
+printf 'protocol pg\nconnect host=127.0.0.1 port={port} user=postgres dbname=postgres\nstep sql-serial SELECT 1\n' >"$S/open-serial.spec"
+case_ "open loop refuses a connect/close step in a spec with no after-steps (LOW 6)" 2 \
+  "REFUSED: open loop with a connect or close step" \
+  -- "$BB" --spec "$S/open-connect.spec" --out "$(OUT bc)" --clients 1 --mode open --rate 10 --duration-s 1 --set port=1
+case_ "open loop refuses a step-level sql-serial in a spec with no after-steps (LOW 6)" 2 \
+  "REFUSED: open loop with a sql-serial step" \
+  -- "$BB" --spec "$S/open-serial.spec" --out "$(OUT bs)" --clients 1 --mode open --rate 10 --duration-s 1 --set port=1
+# the lead's ruling on Doltgres b-m1 (DECISIONS, 2026-10-19): `home per-cycle` opens a fresh home connection for each
+# cycle outside the timed window, and `after admin-sql` runs on a separate per-client admin connection after the home
+# one is closed. Grammar plants: an admin step may not be timed, per-cycle has no teardown, and a per-cycle spec is
+# accepted (it then stops at the connect)
+printf 'protocol pg\nconnect host=127.0.0.1 port={port} user=postgres dbname=postgres\nhome per-cycle\nvar branch = b_{run}_{c}_{i}\nstep sql SELECT 1\nafter sql SELECT 2\nafter admin-sql SELECT 3\n' >"$S/per-cycle.spec"
+printf 'protocol pg\nconnect host=127.0.0.1 port={port} user=postgres dbname=postgres\nstep admin-sql SELECT 1\n' >"$S/timed-admin.spec"
+printf 'protocol pg\nconnect host=127.0.0.1 port={port} user=postgres dbname=postgres\nhome per-cycle\nstep sql SELECT 1\nteardown SELECT 1\n' >"$S/per-cycle-teardown.spec"
+printf 'protocol pg\nconnect host=127.0.0.1 port={port} user=postgres dbname=postgres\nhome sometimes\nstep sql SELECT 1\n' >"$S/home-bad.spec"
+case_ "an admin-sql step may not be timed (Doltgres b-m1 ruling)" 2 "admin-sql is an after-step only" \
+  -- "$BB" --spec "$S/timed-admin.spec" --out "$(OUT ta)" --clients 1 --max-ops 1 --set port=1
+case_ "home per-cycle with a teardown is refused (the home is closed each cycle)" 2 "home per-cycle has no teardown" \
+  -- "$BB" --spec "$S/per-cycle-teardown.spec" --out "$(OUT pt)" --clients 1 --max-ops 1 --set port=1
+case_ "home takes only per-cycle" 2 "home needs 'per-cycle'" \
+  -- "$BB" --spec "$S/home-bad.spec" --out "$(OUT hb)" --clients 1 --max-ops 1 --set port=1
+case_ "control: a per-cycle spec with an admin-sql after-step passes the checks and stops at the connect" 2 "$CONN" \
+  -- "$BB" --spec "$S/per-cycle.spec" --out "$(OUT pc)" --clients 1 --max-ops 1 --set port=1
 case_ "control: open loop on pg18-select1 passes the checks and stops at the connect" 2 "$CONN" \
   -- "$BB" --spec "$SP/pg18-select1.spec" --out "$(OUT c)" --clients 1 --mode open --rate 10 --duration-s 1 --set port=1
 case_ "control: closed loop on dolt-create.spec is not refused for its after-steps" 2 "failed to connect" \
@@ -64,6 +92,37 @@ case_ "--duration-s nan is refused" 2 "--duration-s needs a number" \
   -- "$BB" --spec "$SP/pg18-select1.spec" --out "$(OUT du)" --clients 1 --duration-s nan --set port=1
 case_ "--max-window-s 1e9 is refused (its ns would overflow the window clock)" 2 "--max-window-s needs a number" \
   -- "$BB" --spec "$SP/pg18-select1.spec" --out "$(OUT mw)" --clients 1 --max-ops 1 --max-window-s 1e9 --set port=1
+# comp-rev-89ec-b3c3 LOW 7: "every numeric flag" (bbload.c:39) -- --clients was atoi ("4x" ran 4 clients), and
+# --max-window-s 0 was accepted where clonebench reads 0 as "no bound"; clonebench's own numeric flags were not checked
+# at all (--max-ops -1 became 2^64-1, which with no window bound ran until the outer timeout)
+for cv in 4x 0 -1 ""; do
+  case_ "bbload --clients '$cv' is refused" 2 "--clients needs a whole number" \
+    -- "$BB" --spec "$SP/pg18-select1.spec" --out "$(OUT cl)" --clients "$cv" --max-ops 1 --set port=1
+done
+case_ "bbload --max-window-s 0 is refused (a bound, never 'none')" 2 "--max-window-s needs a number" \
+  -- "$BB" --spec "$SP/pg18-select1.spec" --out "$(OUT mw0)" --clients 1 --max-ops 1 --max-window-s 0 --set port=1
+# comp-rev-9bc7d894a LOW 6: the numeric parses LOW 7's fix left loose -- bbload's MySQL port (atoi: port=1x connected
+# to 1), --v1-mark-base (strtoull base 0: "0x1g" read 1), a spec's c1b step index, and clonebench par's --procs/--n
+case_ "bbload: a MySQL port that is not a whole number is refused (LOW 6)" 2 "mysql conninfo: port needs a whole number" \
+  -- "$BB" --spec "$SP/dolt-select1.spec" --out "$(OUT mp)" --clients 1 --max-ops 1 --set port=1x
+case_ "bbload --v1-mark-base 0x1g is refused (LOW 6)" 2 "--v1-mark-base needs a whole number" \
+  -- "$BB" --spec "$SP/pg18-select1.spec" --out "$(OUT mb)" --clients 1 --max-ops 1 --v1-mark-base 0x1g --set port=1
+printf 'protocol pg\nconnect host=127.0.0.1 port={port} user=postgres dbname=postgres\nstep sql SELECT 1\nc1b 1x lab\n' >"$S/c1b-bad.spec"
+case_ "a c1b step index that is not a whole number is refused (LOW 6)" 2 "c1b needs '<step 1.." \
+  -- "$BB" --spec "$S/c1b-bad.spec" --out "$(OUT cb1)" --clients 1 --max-ops 1 --set port=1
+for fl in "--procs 2x" "--n 10x" "--procs -1"; do
+  fk=${fl%% *} fv=${fl#* }
+  case_ "clonebench par $fl is refused (LOW 6)" 2 "clonebench par: $fk needs a whole number" \
+    -- "$CB" par --src "$S/b1.noindex/no-src.db" --dir "$S/b1.noindex" --out "$(OUT par)" --procs 1 --n 2 "$fk" "$fv"
+done
+for fl in "--clients 4x" "--clients 0" "--max-ops -1" "--max-ops 1x" "--min-ops x" "--duration-s nan" \
+          "--max-window-s 0" "--max-window-s 1e9" "--warmup-ops -1" "--hold-us 1.5" "--rows 10x" "--seed x" \
+          "--v1-mark-base x"; do
+  fk=${fl%% *} fv=${fl#* }
+  case_ "clonebench $fl is refused (LOW 7)" 2 "clonebench run: $fk needs a" \
+    -- "$CB" run --mode b1 --op m1c --parent "$S/b1.noindex/no-parent.db" --dir "$S/b1.noindex" --out "$(OUT cb)" \
+    --clients 1 --max-ops 1 "$fk" "$fv"
+done
 # --- the live decision, replayed with backsteps (review 2 item 4): both binaries, the same answers
 printf '0\n5\n3\n' >"$S/trace-back"           # a claim judged with an older time than the one before it
 printf '0\n1\n2\n' >"$S/trace-sorted"
@@ -81,7 +140,20 @@ done
 # and stops at the missing parent (its sq_open refusal)
 case_ "clonebench --memstatus 2 is refused" 2 "--memstatus needs 0 or 1" \
   -- "$CB" run --mode b1 --op m1c --parent "$S/no-parent.db" --dir "$S" --clients 1 --max-ops 1 --out "$(OUT ms)" --memstatus 2
-case_ "control: clonebench --memstatus 1 passes the flag checks and stops at the missing parent" 2 "no-parent.db" \
-  -- "$CB" run --mode b1 --op m1c --parent "$S/no-parent.db" --dir "$S" --clients 1 --max-ops 1 --out "$(OUT ms1)" --memstatus 1
+# comp-rev-89ec-b3c3 HIGH 1: the control's --dir used to be SCRATCH itself ($RUNNER_TEMP/bin-plants on CI), which
+# clonebench's directory guard (clonebench.c guard_dir: XFS or btrfs, and a *.noindex component; it runs after the flag
+# checks, before the parent's open) refused, so the control could never print no-parent.db and the build job failed.
+# It now runs in SCRATCH/b1.noindex. Where that directory is XFS or btrfs, the control must reach the parent's open
+# (no-parent.db); elsewhere (a CI build runner's ext4) it must stop at the guard's filesystem refusal. Either way
+# --memstatus 1 got past every flag check, which is all the control proves; which of the two is expected comes from
+# the directory's own filesystem type, stated in the case name.
+MS=$S/b1.noindex
+mkdir -p "$MS" || exit 2
+case "$(stat -f -c %T "$MS" 2>/dev/null)" in
+  xfs|btrfs) ms_want="no-parent.db" ms_why="XFS/btrfs: stops at the missing parent" ;;
+  *) ms_want="not xfs or btrfs (FICLONE)" ms_why="$(stat -f -c %T "$MS" 2>/dev/null): stops at the directory guard" ;;
+esac
+case_ "control: clonebench --memstatus 1 passes the flag checks ($ms_why)" 2 "$ms_want" \
+  -- "$CB" run --mode b1 --op m1c --parent "$MS/no-parent.db" --dir "$MS" --clients 1 --max-ops 1 --out "$(OUT ms1)" --memstatus 1
 if [ $bad = 0 ]; then echo "VERDICT PASS $n/$n"; else echo "VERDICT FAIL $((n - bad))/$n"; fi
 [ $bad = 0 ]

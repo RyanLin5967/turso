@@ -315,10 +315,18 @@ cb_args() { # cb_args OP SYNC BDIR C N OUT -> CBA: the one clonebench command li
 # --skip-after: no close, no DROP), then one CHECKPOINT inside the same attach after a tsplit stamp. That "post" part is
 # the deferred writes a kept branch pays, which the cells' per-cycle DROP throws away (dropdb's DropDatabaseBuffers and
 # ForgetDatabaseSyncRequests run before its forced checkpoint, so the cells' deferred window reads about 0 at C=1).
-# CELLDIR/kept.json: K, the deferred flushes, per create, by class, and the count's verdict. Then the K branches are
-# dropped and checkpointed, untraced, and the live-branch count must be back at LIVE0.
+# CELLDIR/kept.json: K, the kept branches' oids, the deferred flushes, per create, by class, and the count's verdict.
+# comp-rev-89ec-b3c3 MED 2: deferred_flushes and per_create count ONLY the flushes under the K kept branches' own
+# directories, DATA/base/<oid> (stracecount by_base_db). A forced CHECKPOINT writes its record, fsyncs pg_control,
+# pg_logical, pg_xact and the rest whether or not anything is dirty, so the whole post part was above 0 even for a
+# FILE_COPY create, which defers nothing (12-14 flushes at K=3, 0 under base/, T3 dry run x-pg18-d2); those are kept
+# apart as checkpoint_other_flushes. CORRECTED (comp-rev-9bc7d894a LOW 3): not all of them are fixed. At K=3 a WAL_LOG
+# spec's checkpoint_other_flushes is 18 against FILE_COPY's 12 (global/* 3: pg_database's heap and indexes; pg_wal 3),
+# so a kept WAL_LOG create also defers a few flushes OUTSIDE base/<oid>, which per_create leaves out: an undercount of
+# the competitor's kept cost (about 2 of 304 per create), in the direction that never flatters us. Then the K branches are dropped and checkpointed, untraced, and the live-branch
+# count must be back at LIVE0.
 kept_arm() {
-  local spec=$1 d=$2 k=$KEPT_K kd="$2/kept" tag i rc=0
+  local spec=$1 d=$2 k=$KEPT_K kd="$2/kept" tag i rc=0 oid
   template_idle || { fail "$spec kept arm: a backend stayed on template p for 30 s"; return; }
   strace_attach "$kd" "$(server_pid)" || { fail "$spec kept arm attach"; return; }
   bb_args "$spec" 1 "$k" "$d/kept-bb" nowarm
@@ -328,13 +336,27 @@ kept_arm() {
   strace_detach "$kd"
   [ $rc -eq 0 ] || fail "$spec kept arm bbload rc=$rc ($(tail -1 "$d/kept-bb.txt"))"
   count "$kd" "$d/kept-bb/backends.tsv" post "$d/kept-deferred.json"
-  python3 -B -c 'import json, sys
-c = json.load(open(sys.argv[1])); k = int(sys.argv[2]); ok = c.get("verdict") == "ok" and isinstance(c.get("flushes"), int)
-json.dump({"spec": sys.argv[3], "k": k, "verdict": c.get("verdict"), "deferred_flushes": c.get("flushes"),
-           "per_create": c["flushes"] / k if ok else None, "by_class": c.get("by_class")}, open(sys.argv[4], "w"))' \
-    "$d/kept-deferred.json" "$k" "$spec" "$d/kept.json" || fail "$spec kept arm: kept.json"
   tag=$(jf "$d/kept-bb/summary.json" run_tag)
   [[ $tag =~ ^[a-z0-9]+$ ]] || { fail "$spec kept arm: run tag [$tag]"; return; }
+  : >"$d/kept.oids.txt"
+  for ((i = 0; i < k; i++)); do
+    oid=$(sqlq "SELECT oid FROM pg_database WHERE datname = 'b_${tag}_0_${i}'" 2>&1)
+    [[ $oid =~ ^[0-9]+$ ]] || { fail "$spec kept arm: no oid for b_${tag}_0_${i} [$oid]"; oid=none; }
+    echo "$oid" >>"$d/kept.oids.txt"
+  done
+  python3 -B -c 'import json, sys
+c = json.load(open(sys.argv[1])); k = int(sys.argv[2]); oids = open(sys.argv[5]).read().split()
+bb = c.get("by_base_db")
+ok = (c.get("verdict") == "ok" and isinstance(c.get("flushes"), int) and isinstance(bb, dict) and len(oids) == k
+      and len(set(oids)) == k and all(o.isdigit() for o in oids))
+mine = sum(bb.get(o, 0) for o in oids) if ok else None
+json.dump({"spec": sys.argv[3], "k": k, "kept_oids": oids, "verdict": c.get("verdict") if ok else "REFUSED: " + str(
+               c.get("verdict")) + " (or no by_base_db, or not K distinct oids)",
+           "deferred_flushes": mine, "per_create": mine / k if ok else None,
+           "checkpoint_other_flushes": c["flushes"] - mine if ok else None,
+           "other_base_db": {o: n for o, n in (bb or {}).items() if o not in oids}, "by_class": c.get("by_class")},
+          open(sys.argv[4], "w"))' \
+    "$d/kept-deferred.json" "$k" "$spec" "$d/kept.json" "$d/kept.oids.txt" || fail "$spec kept arm: kept.json"
   for ((i = 0; i < k; i++)); do
     sqlq "DROP DATABASE b_${tag}_0_${i}" >>"$d/kept.drops.txt" 2>&1 || fail "$spec kept arm: DROP DATABASE b_${tag}_0_${i}"
   done
@@ -390,8 +412,8 @@ no_plant_before_cells() {
   expect "no test plant ran on MNT before the measured cells (LOW 25)" "$ran" none
 }
 timedrun_check() {
-  # the lead's LOW 21 ruling: the cell's prebranch (N, clients, bound) goes into timed.json; beyond 1,000 it is
-  # exploratory, never credited
+  # the lead's LOW 21 ruling: the cell's prebranch (N, clients, bound) goes into timed.json; at any N other than
+  # the registered 1 and 1,000 it is exploratory, never credited, and reduce.py fails the run (comp-rev-89ec-b3c3 MED 3)
   echo "prebranch=$PREBRANCH prebranch_c=$PREBRANCH_C prebranch_s=$PREBRANCH_S" >"$1/prebranch.txt"
   # the one raw.tsv schema (raw_schema.py; VM --dry-block defect 2), checked on what each run actually wrote
   local rs
@@ -502,6 +524,15 @@ run_server_cell() { # run_server_cell SPEC C
         "$(python3 -B -c 'import json, sys; k = json.load(open(sys.argv[1])); print(k.get("verdict") == "ok" and (k.get("per_create") or 0) > 0)' "$d/kept.json" 2>&1 | tail -1)" \
         True
     fi
+    # comp-rev-89ec-b3c3 MED 2: the arm's negative control. A FILE_COPY create copies and fsyncs the template's files
+    # inside CREATE DATABASE and touches nothing after (these specs only create), so its kept branch leaves NO
+    # deferred write. A count that is above 0 here is counting the forced CHECKPOINT's own fixed flushes (its record,
+    # pg_control, pg_logical, pg_xact ...), which it does whether or not a kept branch left anything.
+    if [ "$spec" = pg18-create ] || [ "$spec" = pg18-create-copy ]; then
+      expect "kept arm $spec-c1: deferred flushes per kept create == 0 (FILE_COPY flushed at create: the negative control)" \
+        "$(python3 -B -c 'import json, sys; k = json.load(open(sys.argv[1])); print(k.get("verdict") == "ok" and k.get("per_create") == 0)' "$d/kept.json" 2>&1 | tail -1)" \
+        True
+    fi
   fi
   timedrun_check "$d" "$n" "$spec-c$c"
   count "$d/idle"
@@ -533,10 +564,17 @@ du_total() { du -sB1 -c "$@" 2>/dev/null | awk '$2 == "total" {print $1}'; }
 # parent_du_paths / store_du_paths -- comp review 1 LOW 26: the parent's own files (what server_fixture's --du names:
 # PG the template p's directory, Dolt and Doltgres their whole store, which BEFORE the prebranch is the parent alone)
 # and the whole store (PG the cluster's data directory), each into the array DUP
+# pg_parent_dir OID -> DATA/base/OID, the template p's directory (comp-rev-89ec-b3c3 LOW 9: an empty oid named
+# DATA/base/, all of it, as the parent)
+pg_parent_dir() {
+  [[ $1 =~ ^[1-9][0-9]*$ ]] || { echo "REFUSED: template p's oid [$1] is not a count" >&2; return 1; }
+  echo "$DATA/base/$1"
+}
 parent_du_paths() {
-  local oid
+  local oid dir
   case $KIND in
-    pg) oid=$(sqlq "SELECT oid FROM pg_database WHERE datname = 'p'"); DUP=("$DATA/base/$oid") ;;
+    pg) oid=$(sqlq "SELECT oid FROM pg_database WHERE datname = 'p'")
+        if dir=$(pg_parent_dir "$oid"); then DUP=("$dir"); else fail "parent du paths: template p's oid [$oid] is not a count"; DUP=(); fi ;;
     dolt) DUP=("$DATA/dbs/bench") ;;
     doltgres) DUP=("$DATA/databases") ;;
     b1) DUP=("$ROOT/parent.db") ;;
@@ -553,8 +591,16 @@ store_du_paths() {
 # parent_du_before_prebranch -> PARENT_DU0 (LOW 26), or the job fails
 parent_du_before_prebranch() {
   local -a DUP
+  if [ "$KIND" = pg ]; then  # comp-rev-89ec-b3c3 LOW 9: the oid guard, planted (no server needed)
+    local o got=""
+    for o in "" "x" "16384 1" "-1"; do
+      pg_parent_dir "$o" >/dev/null 2>&1 && got="$got [$o] accepted"
+    done
+    expect "pg_parent_dir refuses an empty or non-count oid (LOW 9)" "${got:-every planted oid refused}" "every planted oid refused"
+  fi
   parent_du_paths
-  PARENT_DU0=$(du_total "${DUP[@]}")
+  # (an empty path list would make du measure the working directory)
+  if [ ${#DUP[@]} -eq 0 ]; then PARENT_DU0=""; else PARENT_DU0=$(du_total "${DUP[@]}"); fi
   [[ $PARENT_DU0 =~ ^[1-9][0-9]*$ ]] || fail "parent du before the prebranch [$PARENT_DU0] of ${DUP[*]} is not a count"
 }
 # server_fixture -- RAW/fixture.json for the parent this server just seeded (gate-6 review, t3run item 4): du of the
@@ -798,6 +844,14 @@ server_main() {
     { fail "server binary: $(cat "$RAW/binary-check.txt")"; return; }
   pass "server binary: $(cat "$RAW/binary-check.txt")"
   srv start "$DATA" 2>&1 | tee "$RAW/server-start.txt" || { fail "server start: $(tail -1 "$RAW/server-start.txt")"; return; }
+  # The server log every log-reading check slices (DATA.log: pg_waits, the delete and template waits, the panic greps)
+  # must be the server's log. Found by the LOW 15 probe (artie runs/uw-20261019-pgw-rh): a PG build whose
+  # postgresql.conf.sample turns logging_collector on (PGDG's RHEL 8 package) writes only "redirecting log output to
+  # logging collector process" there, so every such check reads nothing and the template waits read as 0.
+  if [ "$KIND" = pg ]; then
+    expect "the server log is the server's (it names the start: database system is ready to accept connections)" \
+      "$(grep -c 'database system is ready to accept connections' "$DATA.log" 2>/dev/null)" 1
+  fi
   srv seed "$DATA" "$ROWS" "$AGE" | tee "$RAW/seed.txt" || { cp "$DATA".gc.* "$RAW/" 2>/dev/null; fail "seed"; return; }
   # the GC's own record, banked with the job (MED 9: gc.txt was never banked): client output, log slice, verdict
   for f in "$DATA".gc.txt "$DATA".gc.log "$DATA".gc.verdict "$DATA".gc-settings.txt "$DATA".gc-settings.verdict; do
@@ -882,6 +936,38 @@ server_main() {
     "$(count_branches)" "$((LIVE0 + NDES))"
   srv stop "$DATA" | tee -a "$RAW/server-stop.txt" || fail "server stop by recorded pid"
   cp "$DATA.log" "$RAW/server_log.txt" 2>/dev/null
+  if [ "$KIND" = dolt ] || [ "$KIND" = doltgres ]; then autogc_plant; fi
+}
+
+# autogc_plant -- comp-rev-89ec-b3c3 LOW 13 (after the cells and the job's own server, LOW 25): the pinned auto-GC
+# setting (config.yaml behavior.auto_gc_behavior enable: true) is the binaries' own default, so a record reading ON
+# cannot show the config took effect. Two small stores on the job's port, one after the other: FT_AUTOGC_ENABLE=false
+# must read off and its GC settings record be REFUSED by fthelp.py gcsettings; =true must read on and be ok.
+autogc_plant() {
+  local en d v f
+  mkdir -p "$RAW/plants"
+  for en in false true; do
+    d="$ROOT/plant-autogc-$en"
+    if FT_AUTOGC_ENABLE=$en srv init "$d" "$PORT" >"$RAW/plants/autogc-$en-init.txt" 2>&1 &&
+       FT_AUTOGC_ENABLE=$en srv start "$d" >"$RAW/plants/autogc-$en-start.txt" 2>&1 &&
+       srv seed "$d" 10 0 >"$RAW/plants/autogc-$en-seed.txt" 2>&1; then
+      v=$(head -1 "$d.gc-settings.verdict" 2>/dev/null)
+    else
+      v="plant store did not start or seed: $(tail -1 "$RAW/plants/autogc-$en-seed.txt" "$RAW/plants/autogc-$en-start.txt" 2>/dev/null | tr '\n' ' ' | cut -c1-200)"
+    fi
+    for f in "$d.gc-settings.txt" "$d.gc-settings.verdict" "$d/config.yaml"; do
+      [ -e "$f" ] && cp "$f" "$RAW/plants/autogc-$en-$(basename "$f")"
+    done
+    srv stop "$d" >>"$RAW/plants/autogc-$en-stop.txt" 2>&1 || fail "autogc plant ($en): stop by recorded pid"
+    if [ "$en" = false ]; then
+      case $v in
+        "REFUSED: dolt_auto_gc_enabled is "*", not on"*) pass "autogc plant: enable false reads off and is refused ($v)" ;;
+        *) fail "autogc plant: enable false must read off and be REFUSED by fthelp.py gcsettings; got [$v]" ;;
+      esac
+    else
+      expect "autogc plant: enable true reads on (fthelp.py gcsettings)" "$v" ok
+    fi
+  done
 }
 
 pg_clone_proof() {

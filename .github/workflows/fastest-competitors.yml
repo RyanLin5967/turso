@@ -3,7 +3,7 @@ name: fastest-competitors
 # file_copy_method=clone and STRATEGY=WAL_LOG at D2 = pg18-d2, amendment 14, plus the clone proof's copy control
 # pg18-create-copy; pg18-defaults is DROPPED on Linux by the lead's ruling, artie DECISIONS 6b0bef481b: on Linux it
 # configures the same server as pg18-d2, and PREREG-CORE v2's OUT list excludes PG18 at its defaults),
-# Dolt and Doltgres at the registered versions of versions.tsv (2.4.1, 1.4.0: release binaries, sha256-checked, telemetry off; amendment 14
+# Dolt and Doltgres at the registered versions of versions.tsv (2.5.0, 1.4.0: release binaries, sha256-checked, telemetry off; amendment 14
 # variants (a), (b), (c)), and the B1 file-copy baseline (FICLONE of a stock-SQLite db + fsync(clone) + fsync(dir),
 # and its D0 no-flush row) -- on ubuntu x86_64 and arm64, each on XFS and btrfs loop filesystems.
 # Every job records its hardware (fastest/linux/hw/record.sh) and fire-checks the flush counter before using it.
@@ -90,6 +90,8 @@ jobs:
           timeout 120 bash fastest/linux/gates/run_selftest.sh python3 -B fastest/linux/competitors/spec_lint.py selftest    # comp review 1 MED 6
           timeout 120 bash fastest/linux/gates/run_selftest.sh python3 -B fastest/linux/gates/sweeper_record.py selftest  # MED 12: the shared reader
           timeout 120 bash fastest/linux/gates/run_selftest.sh python3 -B fastest/linux/competitors/raw_schema.py selftest  # the one raw.tsv schema
+          timeout 120 bash fastest/linux/gates/run_selftest.sh python3 -B fastest/linux/competitors/reduce.py selftest  # comp-rev-89ec-b3c3 MED 3, LOW 5
+          timeout 60 bash fastest/linux/gates/run_selftest.sh bash fastest/linux/gates/test_sweeper_cpu.sh  # comp-rev-89ec-b3c3 LOW 19
           timeout 600 bash fastest/linux/competitors/plant_real.sh "$RUNNER_TEMP/plant-real"
           # the drive class (SMOKE erratum E3): known answers, then drive.py live on this runner's own disk, kept with
           # the build's hardware record. Not a gate: the cells' disk is each run job's, recorded and refused there.
@@ -134,6 +136,8 @@ jobs:
         run: |
           timeout 120 bash fastest/linux/gates/run_selftest.sh python3 -B fastest/linux/competitors/sched_check.py selftest
           timeout 600 bash fastest/linux/competitors/bin_plants.sh dist "$RUNNER_TEMP/bin-plants"
+          # comp-rev-2404: bbload's end-of-run home probe against fake PG/MySQL servers (no real server needed)
+          timeout 300 bash fastest/linux/gates/run_selftest.sh python3 -B fastest/linux/competitors/loadgen/test_probe_shapes.py --binary dist/bbload
           timeout 300 bash fastest/linux/competitors/fetch_dolt_plant.sh "$RUNNER_TEMP/fetch-dolt-plant"  # comp review 1 LOW 38
       - uses: actions/upload-artifact@v4
         with:
@@ -179,7 +183,8 @@ jobs:
       FT_WARMUP: ${{ inputs.warmup || '1000:10:2' }}
       FT_DRY: "1"
       # SMOKE: a small aging and a few live branches, so both fixture paths run on every system (gate-6 item 4);
-      # the registered T3 values are 1e5 UPDATEs and N in {1, 1e4}.
+      # the registered T3 values are 1e5 UPDATEs and N in {1, 1000} (the lead's LOW 21 ruling; timedrun.py
+      # REGISTERED_PREBRANCH: any other N reads ok-exploratory-n and fails reduce; comp-rev-9bc7d894a LOW 7).
       FT_AGE: ${{ inputs.age || '200' }}
       FT_PREBRANCH: ${{ inputs.prebranch || '20' }}
     steps:
@@ -271,15 +276,13 @@ jobs:
           FT_SQLITE3: ${{ github.workspace }}/dist/sqlite3
           FT_FIRECHECK: ${{ github.workspace }}/fastest-raw/firecheck/firecheck.txt
         run: |
-          mkdir -p "$MNT/init-plant" "$RUNNER_TEMP/init-plant-bin"
-          stub="$RUNNER_TEMP/init-plant-bin/py"
-          printf '#!/bin/sh\ncase "$*" in *pins.py\\ shared-buffers*) echo "planted shared-buffers failure" >&2; exit 1 ;; esac\nexec python3 "$@"\n' >"$stub"
-          chmod +x "$stub"
+          # comp-rev-89ec-b3c3 LOW 10: the plant and its check are init_plant.sh (runnable off CI); its wrong-reason
+          # control (init failing for another reason) must make the check refuse, exit 1
+          timeout 1900 bash fastest/linux/competitors/init_plant.sh "$MNT/init-plant" "$RAW/init-plant"
           rc=0
-          FT_PY="$stub" timeout 1800 bash fastest/linux/competitors/run_system.sh pg18-d2 "$MNT/init-plant" \
-            "$RAW/init-plant" >"$RAW/init-plant.txt" 2>&1 || rc=$?
-          echo "init plant: rc $rc; $(grep -c 'FAIL server init' "$RAW/init-plant/functional.txt" 2>/dev/null) server-init FAIL line(s)"
-          [ "$rc" != 0 ] && grep -q '^FAIL server init' "$RAW/init-plant/functional.txt"
+          timeout 1900 bash fastest/linux/competitors/init_plant.sh "$MNT/init-plant-wrong" "$RAW/init-plant-wrong" \
+            wrong-reason || rc=$?
+          [ "$rc" = 1 ] || { echo "init plant control: an init that failed for another reason gave rc $rc, not 1"; exit 1; }
       # Comp review 1 LOW 32's plant: a budget of 1 s must leave every B1 cell "NOT RUN: budget" and fail the run (the
       # budget path had never run). Its own directory on the same filesystem, so the measured run above is untouched.
       - name: Budget plant (b1, FT_BUDGET_S=1)

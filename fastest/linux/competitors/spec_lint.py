@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
-"""spec_lint.py [--dir DIR] | selftest -- the Linux specs' timed steps against the registered statements (lane
+"""spec_lint.py [--dir DIR] | selftest | statements STATEMENTS.md -- the Linux specs' timed steps against the registered statements (lane
 fastest-linux-comp; comp review 1 MED 6).
 
 REG below transcribes the PREREG's §6 Statements table (artie frontier/fastest/tools/loadgen/specs/STATEMENTS.md,
 printed by the macOS lint_specs.py from its REG data) for the forms each Linux spec runs: the TIMED steps, in order,
 as bbload spec lines. The Linux specs keep their own home connect lines (the SSL/GSS forcing is bbload's, Codex card
 C02) and after-steps (the delete and its serialisation are the lead's re-ruling, Codex card C04), so only the timed
-steps, the protocol and the branch var are compared here. Every *.spec in the directory must be either in REG or in
+steps, the protocol and the branch var are compared here, plus, for variant (b)'s switch forms, the FIRST after-step:
+the registered switch-back (USE bench / USE postgres), without which the delete would run on the branch it deletes.
+Variant (b)'s switch is the PREREG N7 ruling as STATEMENTS.md rows dolt/doltgres b m1c-switch and m1-switch carry it
+(artie 5cab0ae50c): Dolt USE `bench/{branch}` (DECISIONS 2026-10-15T11:04:04Z), Doltgres USE "postgres/{branch}"
+(DECISIONS 2026-10-15T11:32:50Z). The old CALL DOLT_CHECKOUT / SELECT dolt_checkout switch is refused (comp-rev-89ec-b3c3
+MED 1: this table had been copied from the old Linux specs, so the lint passed them). Every *.spec in the directory must be either in REG or in
 UNREGISTERED (plants and helpers that are never a credited cell): a new spec cannot escape the check.
 
   m1c-create   [create]                     (Dolt/Doltgres (a): the create also switches, so m1c-create and m1c-switch
@@ -44,9 +49,16 @@ def _dolt(a, b, sw, con):
             "c-m1c": [b, con, PROBE], "c-m1": [b, con, PROBE, WRITE]}
 
 
+# variant (b)'s registered switch and its switch-back (STATEMENTS.md, artie 5cab0ae50c), and the old forms MED 1 found
+DOLT_SW, DOLT_BACK = "step sql USE `bench/{branch}`", "after sql USE bench"
+DOLTGRES_SW, DOLTGRES_BACK = 'step sql USE "postgres/{branch}"', "after sql USE postgres"
+OLD_SW = {"dolt": ("step sql CALL DOLT_CHECKOUT('{branch}')", "after sql CALL DOLT_CHECKOUT('main')"),
+          "doltgres": ("step sql SELECT dolt_checkout('{branch}')", "after sql SELECT dolt_checkout('main')")}
+
+
 FC, FCC, FCM = _pg("FILE_COPY")
 WC, WCC, WCM = _pg("WAL_LOG")
-# spec file -> (protocol, branch var?, timed steps, setup lines allowed)
+# spec file -> (protocol, branch var?, timed steps, setup lines allowed[, first after-step])
 REG = {
     "pg18-create.spec": ("pg", True, FC, []),          # filecopy m1c-create
     "pg18-m1c.spec": ("pg", True, FCC, []),            # filecopy m1c-connect
@@ -60,13 +72,58 @@ REG = {
     "dolt-select1.spec": ("mysql", False, [PROBE], []),
     "doltgres-select1.spec": ("pg", False, [PROBE], []),
 }
-for _sys, _proto, _steps4 in (
-        ("dolt", "mysql", ("step sql CALL DOLT_CHECKOUT('-b', '{branch}')", "step sql CALL DOLT_BRANCH('{branch}', 'main')",
-                           "step sql CALL DOLT_CHECKOUT('{branch}')", "step connect db=bench/{branch}")),
-        ("doltgres", "pg", ("step sql SELECT dolt_checkout('-b', '{branch}')", "step sql SELECT dolt_branch('{branch}', 'main')",
-                            "step sql SELECT dolt_checkout('{branch}')", "step connect dbname=postgres/{branch}"))):
+for _sys, _proto, _back, _steps4 in (
+        ("dolt", "mysql", DOLT_BACK, ("step sql CALL DOLT_CHECKOUT('-b', '{branch}')",
+                                      "step sql CALL DOLT_BRANCH('{branch}', 'main')", DOLT_SW,
+                                      "step connect db=bench/{branch}")),
+        ("doltgres", "pg", DOLTGRES_BACK, ("step sql SELECT dolt_checkout('-b', '{branch}')",
+                                           "step sql SELECT dolt_branch('{branch}', 'main')", DOLTGRES_SW,
+                                           "step connect dbname=postgres/{branch}"))):
     for _form, _steps in _dolt(*_steps4).items():
-        REG[f"{_sys}-{_form}.spec"] = (_proto, True, _steps, [])
+        REG[f"{_sys}-{_form}.spec"] = (_proto, True, _steps, []) + ((_back,) if _form in ("b-m1c", "b-m1") else ())
+# comp-rev-89ec-b3c3 LOW 20: each system's ONE home connect line, as every Linux spec of it carries it (a connect string
+# can change durability as a setup line can: options=-csynchronous_commit=off), by spec file prefix
+HOME = {"pg18-": "connect host=127.0.0.1 port={port} user=postgres dbname=postgres",
+        "doltgres-": "connect host=127.0.0.1 port={port} user=postgres password=password dbname=postgres",
+        "dolt-": "connect host=127.0.0.1 port={port} user=root db=bench"}
+
+
+# the lead's Doltgres b-m1 ruling (DECISIONS 2026-10-19): the specs that run `home per-cycle`, each with its delete as
+# its LAST after-step, on the admin connection (Doltgres 1.4.0 poisons a connection that wrote on a deleted branch)
+PER_CYCLE = {"doltgres-b-m1.spec": "after admin-sql SELECT dolt_branch('-d', '{branch}')"}
+
+
+def statements_problems(text):
+    """comp-rev-9bc7d894a LOW 5: REG's variant (b) switch rows against STATEMENTS.md's Statements table TEXT (artie
+    frontier/fastest/tools/loadgen/specs/STATEMENTS.md). Each row '| system | b | m1c-switch or m1-switch | conninfo |
+    steps | after |' gives the timed steps and the first after-step, '<br>'-separated, as 'sql X' / 'write X'; REG must
+    hold exactly those for {system}-b-m1c.spec / {system}-b-m1.spec. Returns the disagreements ([] = none)."""
+    want = {}
+    for ln in text.splitlines():
+        cells = [c.strip() for c in ln.strip().strip("|").split("|")]
+        if len(cells) < 6 or cells[1] != "b" or cells[2] not in ("m1c-switch", "m1-switch"):
+            continue
+        f = f"{cells[0]}-b-{'m1c' if cells[2] == 'm1c-switch' else 'm1'}.spec"
+        want[f] = (["step " + s.strip() for s in cells[4].split("<br>")],
+                   "after " + cells[5].split("<br>")[0].strip())
+    why = []
+    for f in ("dolt-b-m1c.spec", "dolt-b-m1.spec", "doltgres-b-m1c.spec", "doltgres-b-m1.spec"):
+        if f not in want:
+            why.append(f"{f}: no (b) {f.split('-b-')[1][:-5]}-switch row in STATEMENTS.md")
+            continue
+        steps, back = want[f]
+        if REG[f][2] != steps:
+            why.append(f"{f}: REG times {REG[f][2]}, STATEMENTS.md {steps}")
+        if REG[f][4] != back:
+            why.append(f"{f}: REG switches back with {REG[f][4]!r}, STATEMENTS.md {back!r}")
+    return why
+
+
+def home_of(f):
+    """The registered home connect line for spec file F (the longest matching prefix: doltgres- before dolt-)."""
+    return next((HOME[p] for p in sorted(HOME, key=len, reverse=True) if f.startswith(p)), None)
+
+
 # never a credited cell: the cap and warm-up plants' fixed-cost ops, the C1b-traced helper, the drop helper
 UNREGISTERED = {"pg18-sleep5.spec", "pg18-sleep20.spec", "pg18-m1-c1b.spec", "pg18-m1-drop.spec"}
 
@@ -80,7 +137,8 @@ def lint(d):
         if f not in REG:
             why.append(f"{f}: neither a registered form nor an UNREGISTERED helper")
             continue
-        proto, branch, timed, setups = REG[f]
+        proto, branch, timed, setups = REG[f][:4]
+        back = REG[f][4] if len(REG[f]) > 4 else None
         lines = [ln.rstrip("\n") for ln in open(os.path.join(d, f)) if ln.strip() and not ln.startswith("#")]
         got_proto = [ln for ln in lines if ln.startswith("protocol ")]
         if got_proto != [f"protocol {proto}"]:
@@ -94,6 +152,20 @@ def lint(d):
         got_setup = [ln for ln in lines if ln.startswith("setup ")]
         if got_setup != setups:
             why.append(f"{f}: setup lines {got_setup}, registered {setups} (a setup can change the session's durability)")
+        got_conn = [ln for ln in lines if ln.startswith("connect ")]
+        if got_conn != [home_of(f)]:
+            why.append(f"{f}: connect lines {got_conn}, registered [{home_of(f)!r}] (a connect string can change the "
+                       f"session's durability)")
+        got_after = [ln for ln in lines if ln.startswith("after ")]
+        got_home = [ln for ln in lines if ln.startswith("home ")]
+        want_home = ["home per-cycle"] if f in PER_CYCLE else []
+        if got_home != want_home:
+            why.append(f"{f}: home lines {got_home}, registered {want_home} (the Doltgres b-m1 ruling)")
+        if f in PER_CYCLE and got_after[-1:] != [PER_CYCLE[f]]:
+            why.append(f"{f}: last after-step {got_after[-1:]}, registered {PER_CYCLE[f]!r} (the delete on the admin "
+                       f"connection)")
+        if back is not None and got_after[:1] != [back]:
+            why.append(f"{f}: first after-step {got_after[:1]}, registered switch-back {back}")
     for f in sorted(REG):
         if f not in files:
             why.append(f"{f}: registered but missing")
@@ -112,13 +184,18 @@ def selftest():
     real = lint(SPECS)
     ok("the real specs match the registered statements", real == [], "; ".join(real))
 
-    def planted(name, edit, want):
+    def planted(name, edit, want, clean_file=None):
+        """want: a problem holding this text must be printed; clean_file (a control): no problem may name that file."""
         with tempfile.TemporaryDirectory() as t:
             dd = os.path.join(t, "specs")
             shutil.copytree(SPECS, dd)
             edit(dd)
             why = lint(dd)
-            ok(f"plant: {name}", any(want in w for w in why), "; ".join(why) or "accepted")
+            if clean_file is not None:
+                mine = [w for w in why if w.startswith(clean_file + ":")]
+                ok(name, mine == [], "; ".join(mine))
+            else:
+                ok(f"plant: {name}", any(want in w for w in why), "; ".join(why) or "accepted")
 
     def prepend_step(f, line):
         def ed(dd):
@@ -132,7 +209,21 @@ def selftest():
     def drop_line(f, line):
         def ed(dd):
             p = os.path.join(dd, f)
-            open(p, "w").write("\n".join(ln for ln in open(p).read().split("\n") if ln != line))
+            # (read BEFORE opening for write: the one-line form truncated the file first and planted an EMPTY spec, so
+            # every drop_line plant was refused for "protocol []", not for the line it dropped)
+            txt = open(p).read().split("\n")
+            if line not in txt:
+                raise AssertionError(f"drop_line: {line!r} is not in {f}: the plant would plant nothing")
+            open(p, "w").write("\n".join(ln for ln in txt if ln != line))
+        return ed
+
+    def replace_text(f, old, new):
+        def ed(dd):
+            p = os.path.join(dd, f)
+            txt = open(p).read()
+            if old not in txt:
+                raise AssertionError(f"replace_text: {old!r} is not in {f}: the plant would plant nothing")
+            open(p, "w").write(txt.replace(old, new))
         return ed
 
     def swap_steps(f):
@@ -148,6 +239,76 @@ def selftest():
             prepend_step("dolt-a-m1c.spec", "step sql CALL DOLT_CHECKOUT('main')"), "dolt-a-m1c.spec: timed steps")
     planted("Doltgres variant (a) times a no-op dolt_checkout('main')",
             prepend_step("doltgres-a-m1.spec", "step sql SELECT dolt_checkout('main')"), "doltgres-a-m1.spec: timed steps")
+    # comp-rev-89ec-b3c3 MED 1: the old (b) switch, CALL DOLT_CHECKOUT / SELECT dolt_checkout, is refused, timed or as
+    # the switch-back. Each plant writes the whole file, so it holds whatever the real spec says. (Its home connect is
+    # the system's registered one, home_of: LOW 20 checks it, and the control below must be the registered form whole.)
+    def write_spec(sysname, form, steps, back):
+        def ed(dd):
+            f = f"{sysname}-{form}.spec"
+            # (and, for a PER_CYCLE spec, the Doltgres b-m1 ruling's lines, so the control is the registered form whole)
+            pc = f in PER_CYCLE
+            open(os.path.join(dd, f), "w").write(
+                "\n".join([f"protocol {REG[f][0]}", home_of(f)] + (["home per-cycle"] if pc else []) + [BRANCH]
+                          + steps + [back] + ([PER_CYCLE[f]] if pc else [])) + "\n")
+        return ed
+
+    for _s, _f in (("dolt", "b-m1c"), ("dolt", "b-m1"), ("doltgres", "b-m1c"), ("doltgres", "b-m1")):
+        _timed, _back = REG[f"{_s}-{_f}.spec"][2], REG[f"{_s}-{_f}.spec"][4]
+        _old = [OLD_SW[_s][0] if ln in (DOLT_SW, DOLTGRES_SW) else ln for ln in _timed]
+        planted(f"{_s}-{_f} times the old checkout switch (MED 1)", write_spec(_s, _f, _old, OLD_SW[_s][1]),
+                f"{_s}-{_f}.spec: timed steps")
+        planted(f"{_s}-{_f} switches back with the old checkout (MED 1)", write_spec(_s, _f, _timed, OLD_SW[_s][1]),
+                f"{_s}-{_f}.spec: first after-step")
+        planted(f"control: {_s}-{_f} written in the registered form is accepted",
+                write_spec(_s, _f, _timed, _back), None, clean_file=f"{_s}-{_f}.spec")
+    # comp-rev-89ec-b3c3 LOW 20: the home connect line can change durability as a setup line can (a libpq options=
+    # string sets synchronous_commit for the session), so it is checked against the system's one registered line
+    def edit_connect(f, new):
+        def ed(dd):
+            p = os.path.join(dd, f)
+            txt = [new if ln.startswith("connect ") else ln for ln in open(p).read().split("\n")]
+            open(p, "w").write("\n".join(txt))
+        return ed
+
+    planted("a home connect carrying options=-csynchronous_commit=off (LOW 20)",
+            edit_connect("pg18-create.spec",
+                         "connect host=127.0.0.1 port={port} user=postgres dbname=postgres options=-csynchronous_commit=off"),
+            "pg18-create.spec: connect")
+    planted("a Dolt home connect to another database (LOW 20)",
+            edit_connect("dolt-b-m1c.spec", "connect host=127.0.0.1 port={port} user=root db=other"),
+            "dolt-b-m1c.spec: connect")
+    planted("a spec with two home connect lines (LOW 20)",
+            prepend_step("doltgres-c-m1.spec",
+                         "connect host=127.0.0.1 port={port} user=postgres password=password dbname=postgres"),
+            "doltgres-c-m1.spec: connect")
+    # the lead's Doltgres b-m1 ruling (DECISIONS 2026-10-19): doltgres-b-m1 runs `home per-cycle` and deletes its branch
+    # with an admin-sql after-step; no other spec does either
+    planted("doltgres-b-m1 without home per-cycle (Doltgres b-m1 ruling)",
+            drop_line("doltgres-b-m1.spec", "home per-cycle"), "doltgres-b-m1.spec: home lines")
+    planted("doltgres-b-m1 deleting on the home connection (Doltgres b-m1 ruling)",
+            replace_text("doltgres-b-m1.spec", "after admin-sql ", "after sql "), "doltgres-b-m1.spec: last after-step")
+    planted("home per-cycle in another spec", prepend_step("dolt-b-m1.spec", "home per-cycle"), "dolt-b-m1.spec: home lines")
+    # comp-rev-9bc7d894a LOW 5: REG's (b) rows are a hand copy of STATEMENTS.md; statements_problems(TEXT) reads the
+    # Statements table itself and names every (b) switch row REG disagrees with. Excerpt: STATEMENTS.md's four rows as
+    # they stand (artie tools/loadgen/specs/STATEMENTS.md:21-22, 30-31), and the same with one row drifted
+    sp = globals().get("statements_problems", lambda text: None)
+    rows = (
+        "| doltgres | b | m1c-switch | `h` | sql SELECT dolt_branch('{branch}', 'main')<br>sql USE \"postgres/{branch}\" "
+        "| sql USE postgres<br>sql SELECT dolt_branch('-d', '{branch}') |\n"
+        "| doltgres | b | m1-switch | `h` | sql SELECT dolt_branch('{branch}', 'main')<br>sql USE \"postgres/{branch}\"<br>"
+        "write UPDATE t SET v = v + 1 WHERE id = {rand:1:rows} | sql USE postgres<br>sql SELECT dolt_branch('-d', "
+        "'{branch}') |\n"
+        "| dolt | b | m1c-switch | `h` | sql CALL DOLT_BRANCH('{branch}', 'main')<br>sql USE `bench/{branch}` | sql USE "
+        "bench<br>sql CALL DOLT_BRANCH('-d', '{branch}') |\n"
+        "| dolt | b | m1-switch | `h` | sql CALL DOLT_BRANCH('{branch}', 'main')<br>sql USE `bench/{branch}`<br>write "
+        "UPDATE t SET v = v + 1 WHERE id = {rand:1:rows} | sql USE bench<br>sql CALL DOLT_BRANCH('-d', '{branch}') |\n")
+    got = sp(rows)
+    ok(f"STATEMENTS.md's (b) rows as they stand agree with REG (got {got!r})", got == [])
+    drift = rows.replace("sql USE `bench/{branch}` | sql USE bench", "sql SET @@bench_head_ref = '{branch}' | sql USE bench")
+    got = sp(drift)
+    ok(f"a drifted STATEMENTS.md (b) row is named (got {got!r})", bool(got) and any("dolt-b-m1c.spec" in w for w in got))
+    got = sp(rows.replace("| dolt | b | m1-switch |", "| dolt | b | m1-gone |"))
+    ok(f"a STATEMENTS.md missing a (b) row is named (got {got!r})", bool(got) and any("dolt-b-m1.spec" in w for w in got))
     planted("an M1 connect form without its probe", drop_line("pg18-m1.spec", PROBE), "pg18-m1.spec: timed steps")
     planted("two timed steps reordered", swap_steps("dolt-b-m1.spec"), "dolt-b-m1.spec: timed steps")
     planted("an unknown spec file", lambda dd: open(os.path.join(dd, "pg18-new.spec"), "w").write("protocol pg\n"),
@@ -164,6 +325,16 @@ def selftest():
 def main(a):
     if a == ["selftest"]:
         return selftest()
+    if len(a) == 2 and a[0] == "statements":  # comp-rev-9bc7d894a LOW 5: REG's (b) rows against STATEMENTS.md itself
+        try:
+            why = statements_problems(open(a[1], errors="replace").read())
+        except OSError as e:
+            print(f"spec_lint statements: REFUSED: {e}")
+            return 2
+        for w in why:
+            print("FAIL", w)
+        print("spec_lint statements: " + ("REG's (b) rows match STATEMENTS.md" if not why else f"{len(why)} problem(s)"))
+        return 0 if not why else 1
     d = SPECS
     if a[:1] == ["--dir"] and len(a) == 2:
         d = a[1]

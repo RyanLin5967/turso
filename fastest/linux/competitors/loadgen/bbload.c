@@ -79,7 +79,20 @@
  *   after sql|write|connect|close untimed, after every op (also after a failed one); recorded as after_ns (all of
  *                                 them and the closing of a branch connection) and each apart as after<k>_ns
  *   after sql-serial <sql>        as after sql, but no two clients run a sql-serial statement at the same time (Dolt's
- *                                 branch deletes: 2.4.1 panics on concurrent DOLT_BRANCH('-d'))
+ *                                 branch deletes: concurrent DOLT_BRANCH('-d') can panic or kill the server, a fatal
+ *                                 concurrent map read and map write, in 2.4.1 and the registered 2.5.0). It NARROWS
+ *                                 that race and does not close it: a serialized delete still reads other sessions'
+ *                                 state unlocked while they CHECKOUT (comp-rev-dolt250 HIGH-1)
+ *   home per-cycle                (the lead's Doltgres b-m1 ruling, DECISIONS 2026-10-19) a FRESH home connection for
+ *                                 every cycle, opened with its setup BEFORE the cycle's claim (outside the timed window
+ *                                 and the op's latency; raw.tsv home_connect_ns, untimed) and closed before the cycle's
+ *                                 first admin-sql after-step, or at its end. No teardown. Doltgres 1.4.0 poisons a
+ *                                 connection that wrote on a branch once that branch is deleted, wherever the delete runs
+ *                                 (tools/doltgres_use_probe.sh, artie 44b1e4dd86), so a write-then-delete cycle cannot
+ *                                 reuse one home connection there.
+ *   after admin-sql <sql>         as after sql, on the client's ADMIN connection (home per-cycle only; opened once per
+ *                                 client with the home conninfo), after the home connection is closed; admin-sql steps
+ *                                 come last
  *   teardown <sql>                once per connection at the end, untimed
  *   c1b <step> <label>            with --c1b-run RUN: an OPSTART "<label>" before the op's first byte and an ACK
  *                                 "<label>" right after step <step> (1-based) is acknowledged, into the C1b trace
@@ -164,7 +177,7 @@ enum { P_PG = 0, P_MYSQL = 1 };
 enum { K_SQL, K_WRITE, K_CONNECT, K_CLOSE };
 enum { PH_INIT = 0, PH_WARM = 1, PH_MEAS = 2, PH_DRAIN = 3, PH_ABORT = 4 };
 
-typedef struct { int k; char *t; int serial; } step_t;
+typedef struct { int k; char *t; int serial; int admin; } step_t; /* admin: run on the client's admin connection */
 typedef struct {
     int proto;
     char *connect;
@@ -174,6 +187,7 @@ typedef struct {
     int nafter; step_t after[MAXAFTER];
     int nteardown; char *teardown[MAXLIST];
     char *c1blab[MAXSTEPS];
+    int home_per_cycle; /* `home per-cycle`: a fresh home connection each cycle (the lead's Doltgres b-m1 ruling) */
 } spec_t;
 
 typedef struct { int proto; PGconn *pg; MYSQL *my; } conn_t;
@@ -189,12 +203,14 @@ typedef struct {
     struct { uint64_t lo, hi; } serial_waits[MAXSTEPS + MAXAFTER];
     uint64_t step_end[MAXSTEPS];
     uint64_t aft_start, aft_end[MAXAFTER]; /* comp review 1 MED 9: the after-steps' start and each one's end */
+    uint64_t home_connect_ns; /* home per-cycle: this cycle's home connect (and setup), before its claim, untimed */
 } oprec;
 
 typedef struct {
     int id;
     pthread_t th;
     conn_t home;
+    conn_t admin; /* home per-cycle: the per-client admin connection the admin-sql after-steps run on */
     uint64_t rng;
     oprec *rec;
     size_t nrec, cap;
@@ -249,6 +265,9 @@ static char *g_errs[MAXERR];
 static uint64_t g_errn[MAXERR];
 static int g_nerr;
 static uint64_t g_reconnects;
+/* comp-rev-failcount MED-1: failures outside an op -- a teardown statement, a reconnect, a setup statement re-run on a
+ * reconnected home connection -- counted (summary other_err) and named in errors.txt; they used to be dropped */
+static uint64_t g_other_err;
 
 #ifdef __APPLE__
 #define BB_CLOCK_NAME "CLOCK_UPTIME_RAW"
@@ -313,8 +332,17 @@ static int err_index(const char *msg) {
     pthread_mutex_unlock(&g_mu);
     return i < MAXERR ? i : MAXERR - 1;
 }
+/* MED-1: one failure outside an op, counted in g_other_err and named in errors.txt as "WHAT: WHY" */
+static void other_fail(const char *what, const char *why) {
+    char m[512];
+    snprintf(m, sizeof m, "%s: %s", what, why);
+    (void)err_index(m);
+    __atomic_fetch_add(&g_other_err, 1, __ATOMIC_RELAXED);
+}
 
 /* ---------- spec ---------- */
+static int parse_u64(const char *v, uint64_t lo, uint64_t hi, uint64_t *out); /* below, with num_u (the c1b index and
+                                                                                 the MySQL port use it first) */
 static char *trim(char *s) {
     while (*s == ' ' || *s == '\t') s++;
     char *e = s + strlen(s);
@@ -327,7 +355,9 @@ static int parse_step(char *rest, step_t *st, char *why) {
     if (*arg) *arg++ = 0;
     arg = trim(arg);
     st->serial = 0;
+    st->admin = 0;
     if (!strcmp(kw, "sql")) st->k = K_SQL;
+    else if (!strcmp(kw, "admin-sql")) { st->k = K_SQL; st->admin = 1; }
     else if (!strcmp(kw, "sql-serial")) { st->k = K_SQL; st->serial = 1; }
     else if (!strcmp(kw, "write")) st->k = K_WRITE;
     else if (!strcmp(kw, "connect")) st->k = K_CONNECT;
@@ -364,6 +394,10 @@ static int load_spec(const char *path, char **text) {
             else sprintf(why, "protocol must be pg or mysql");
             have_proto = 1;
         } else if (!strcmp(kw, "connect")) S.connect = strdup(rest);
+        else if (!strcmp(kw, "home")) {
+            if (!strcmp(rest, "per-cycle")) S.home_per_cycle = 1;
+            else sprintf(why, "home needs 'per-cycle'");
+        }
         else if (!strcmp(kw, "var")) {
             char *eq = strchr(rest, '=');
             if (!eq || S.nvar >= MAXLIST) sprintf(why, "var needs 'name = template'");
@@ -372,12 +406,16 @@ static int load_spec(const char *path, char **text) {
         else if (!strcmp(kw, "teardown") && S.nteardown < MAXLIST) S.teardown[S.nteardown++] = strdup(rest);
         else if (!strcmp(kw, "step")) {
             if (S.nstep >= MAXSTEPS) sprintf(why, "more than %d steps", MAXSTEPS);
-            else if (parse_step(rest, &S.step[S.nstep], why) == 0) S.nstep++;
+            else if (parse_step(rest, &S.step[S.nstep], why) == 0) {
+                if (S.step[S.nstep].admin) sprintf(why, "admin-sql is an after-step only (an admin connection is never timed)");
+                else S.nstep++;
+            }
         } else if (!strcmp(kw, "c1b")) {
             char *sp = rest;
             while (*sp && *sp != ' ' && *sp != '\t') sp++;
             if (*sp) *sp++ = 0;
-            int k = atoi(rest);
+            uint64_t kv64 = 0; /* comp-rev-9bc7d894a LOW 6: the whole index (atoi read "1x" as 1) */
+            int k = parse_u64(rest, 1, MAXSTEPS, &kv64) ? 0 : (int)kv64;
             sp = trim(sp);
             if (k < 1 || k > MAXSTEPS || !*sp) sprintf(why, "c1b needs '<step 1..%d> <label>'", MAXSTEPS);
             else S.c1blab[k - 1] = strdup(sp);
@@ -392,6 +430,22 @@ static int load_spec(const char *path, char **text) {
         fprintf(stderr, "bbload: spec needs protocol, connect and at least one step\n");
         return -1;
     }
+    int nadmin = 0;
+    for (int k = 0; k < S.nafter; k++) nadmin += S.after[k].admin;
+    if (S.home_per_cycle && S.nteardown) {
+        fprintf(stderr, "bbload: home per-cycle has no teardown (the home connection is closed each cycle)\n");
+        return -1;
+    }
+    if (nadmin && !S.home_per_cycle) {
+        fprintf(stderr, "bbload: admin-sql after-steps need home per-cycle\n");
+        return -1;
+    }
+    for (int k = 1; k < S.nafter; k++)
+        if (S.after[k - 1].admin && !S.after[k].admin) {
+            fprintf(stderr, "bbload: an after-step on the home connection after an admin-sql one (the home is closed "
+                            "before the first admin-sql)\n");
+            return -1;
+        }
     return 0;
 }
 
@@ -561,7 +615,14 @@ static int conn_open(conn_t *x, const char *base, const char *over, char *why, s
     unsigned port = 3306;
     for (int i = 0; i < kv.n; i++) {
         if (!strcmp(kv.k[i], "host")) host = kv.v[i];
-        else if (!strcmp(kv.k[i], "port")) port = (unsigned)atoi(kv.v[i]);
+        else if (!strcmp(kv.k[i], "port")) { /* comp-rev-9bc7d894a LOW 6: it was atoi (port=3306x connected to 3306) */
+            uint64_t pv;
+            if (parse_u64(kv.v[i], 1, 65535, &pv)) {
+                snprintf(why, wsz, "mysql conninfo: port needs a whole number in [1, 65535], got '%s'", kv.v[i]);
+                return -1;
+            }
+            port = (unsigned)pv;
+        }
         else if (!strcmp(kv.k[i], "user")) user = kv.v[i];
         else if (!strcmp(kv.k[i], "password")) pass = kv.v[i];
         else if (!strcmp(kv.k[i], "db") || !strcmp(kv.k[i], "dbname")) db = kv.v[i];
@@ -578,7 +639,14 @@ static int conn_open(conn_t *x, const char *base, const char *over, char *why, s
 }
 
 /* Verbatim from artie 4010ff3b06: wait for backend exit before a following DROP. */
+/* conn_close_sync with the wait for the peer's EOF bounded by an absolute deadline DL (now_ns) instead of
+ * CLOSE_TIMEOUT_S from now (comp-rev-a145 LOW-4: the end-of-run home probe and the home's final close share one
+ * deadline). A deadline already passed closes without waiting. */
+static int conn_close_until(conn_t *x, uint64_t dl, char *why, size_t wsz);
 static int conn_close_sync(conn_t *x, char *why, size_t wsz) {
+    return conn_close_until(x, now_ns() + (uint64_t)(CLOSE_TIMEOUT_S * 1e9), why, wsz);
+}
+static int conn_close_until(conn_t *x, uint64_t dl, char *why, size_t wsz) {
     int s = -1, rc = 0, dup_errno = 0;
     if (x->pg) {
         int fd = PQsocket(x->pg);
@@ -598,11 +666,10 @@ static int conn_close_sync(conn_t *x, char *why, size_t wsz) {
         return -1;
     }
     if (s < 0) return 0;
-    uint64_t dl = now_ns() + (uint64_t)(CLOSE_TIMEOUT_S * 1e9);
     char b[512];
     for (;;) {
         uint64_t n = now_ns();
-        if (n >= dl) { snprintf(why, wsz, "close: the server did not close the connection within %.1f s", CLOSE_TIMEOUT_S); rc = -1; break; }
+        if (n >= dl) { snprintf(why, wsz, "close: the server did not close the connection by the close deadline"); rc = -1; break; } /* comp-rev-acd4 LOW-3: a shared deadline may have left less than CLOSE_TIMEOUT_S */
         struct pollfd pf = {s, POLLIN, 0};
         int pr = poll(&pf, 1, (int)((dl - n) / 1000000 + 1));
         if (pr < 0) { if (errno == EINTR) continue; snprintf(why, wsz, "close: poll: %s", strerror(errno)); rc = -1; break; }
@@ -628,9 +695,124 @@ static int conn_alive(conn_t *x) {
     return x->my != NULL;
 }
 
+/* A failed MySQL call: the error text into WHY; a lost connection (2006, 2013) closes and NULLs the handle (MED-2). */
+static int my_fail(conn_t *x, char *why, size_t wsz) {
+    unsigned e = mysql_errno(x->my);
+    snprintf(why, wsz, "%s", mysql_error(x->my));
+    if (e == 2006 || e == 2013) {
+        mysql_close(x->my);
+        x->my = NULL;
+    }
+    return -1;
+}
+
+static int conn_exec(conn_t *x, const char *sql, int need_rows, char *why, size_t wsz);
+
+/* A watchdog over one blocking call on a socket (comp-rev-2404 LOW-1): unless disarmed before its deadline, it shuts
+ * the socket down, so every read the call is blocked in -- the first byte or any later one, in libpq or in
+ * Connector/C -- returns at once with an error. One deadline bounds the WHOLE reply.
+ * comp-rev-a145 LOW-1: the deadline is on CLOCK_MONOTONIC (pthread_condattr_setclock) wherever the platform has it;
+ * macOS has no condattr clock, so there it is a RELATIVE wait (pthread_cond_timedwait_relative_np), which no
+ * wall-clock step moves either. LOW-2: it shuts down its own dup() of the socket, so a number that libpq or my_fail
+ * has already closed and the kernel has handed to another socket can never be the one shut down. */
+typedef struct {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    int fd, done, fired;
+    struct timespec dl; /* absolute CLOCK_MONOTONIC deadline; on macOS the relative bound */
+} watch_t;
+static void *watch_main(void *p) {
+    watch_t *wd = p;
+    pthread_mutex_lock(&wd->mu);
+#ifdef __APPLE__
+    uint64_t end = now_ns() + (uint64_t)wd->dl.tv_sec * 1000000000u + (uint64_t)wd->dl.tv_nsec;
+#endif
+    while (!wd->done) {
+#ifdef __APPLE__
+        uint64_t n = now_ns();
+        struct timespec rel = {0, 0};
+        if (n < end) { rel.tv_sec = (time_t)((end - n) / 1000000000u); rel.tv_nsec = (long)((end - n) % 1000000000u); }
+        int r = n >= end ? ETIMEDOUT : pthread_cond_timedwait_relative_np(&wd->cv, &wd->mu, &rel);
+#else
+        int r = pthread_cond_timedwait(&wd->cv, &wd->mu, &wd->dl);
+#endif
+        if (r == ETIMEDOUT && !wd->done) {
+            wd->fired = 1;
+            shutdown(wd->fd, SHUT_RDWR);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&wd->mu);
+    return NULL;
+}
+
+/* One SELECT 1 on X, the whole reply bounded by SECS: 0 when the server answered it, -1 (WHY) when the connection
+ * is gone, the query failed, the reply broke off (comp-rev-2404 MED-1: conn_exec fails a NULL result whenever
+ * mysql_errno is set), or no complete answer came in time (comp-rev-b15 LOW-1, comp-rev-67b2 LOW-B,
+ * comp-rev-2404 LOW-1). It runs the same conn_exec every op uses, under the watchdog. */
+static int conn_probe(conn_t *x, double secs, char *why, size_t wsz) {
+    int fd = x->proto == P_PG ? (x->pg ? PQsocket(x->pg) : -1) : (x->my ? (int)mysql_get_socket(x->my) : -1);
+    if (fd < 0) { snprintf(why, wsz, "connection not open"); return -1; }
+    int dfd = dup(fd); /* LOW-2: the watchdog's own reference to this socket */
+    if (dfd < 0) { snprintf(why, wsz, "probe watchdog: dup: %s", strerror(errno)); return -1; } /* never unbounded */
+    watch_t wd = {.fd = dfd};
+    pthread_mutex_init(&wd.mu, NULL);
+    pthread_condattr_t ca;
+    pthread_condattr_init(&ca);
+#ifdef __APPLE__
+    wd.dl.tv_sec = (time_t)secs;
+    wd.dl.tv_nsec = (long)((secs - (double)(time_t)secs) * 1e9);
+#else
+    pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
+    clock_gettime(CLOCK_MONOTONIC, &wd.dl);
+    uint64_t ns = (uint64_t)wd.dl.tv_nsec + (uint64_t)(secs * 1e9);
+    wd.dl.tv_sec += (time_t)(ns / 1000000000u);
+    wd.dl.tv_nsec = (long)(ns % 1000000000u);
+#endif
+    pthread_cond_init(&wd.cv, &ca);
+    pthread_condattr_destroy(&ca);
+    pthread_t th;
+    int armed = pthread_create(&th, NULL, watch_main, &wd) == 0;
+    if (!armed) { /* never unbounded */
+        snprintf(why, wsz, "probe watchdog: pthread_create failed");
+        close(dfd);
+        pthread_cond_destroy(&wd.cv);
+        pthread_mutex_destroy(&wd.mu);
+        return -1;
+    }
+    int rc = conn_exec(x, "SELECT 1", 0, why, wsz);
+    pthread_mutex_lock(&wd.mu);
+    wd.done = 1;
+    pthread_cond_signal(&wd.cv);
+    pthread_mutex_unlock(&wd.mu);
+    pthread_join(th, NULL);
+    close(dfd);
+    if (wd.fired) { snprintf(why, wsz, "the server did not answer within %.1f s", secs); rc = -1; }
+    if (rc == 0 && x->proto == P_PG && (!x->pg || PQstatus(x->pg) != CONNECTION_OK)) {
+        snprintf(why, wsz, "connection not OK after the probe");
+        rc = -1;
+    }
+    pthread_cond_destroy(&wd.cv);
+    pthread_mutex_destroy(&wd.mu);
+    return rc;
+}
+
+/* Drop X without waiting on its peer (comp-rev-2404 LOW-2): shut the socket down, then free the handle. The
+ * graceful close (conn_close_sync) waits up to CLOSE_TIMEOUT_S more for a hung peer, which pushed a hung home past
+ * --stall-s <= 10 into an rc 4 stall; the probe's one deadline is now the only wait. */
+static void conn_abandon(conn_t *x) {
+    int fd = x->proto == P_PG ? (x->pg ? PQsocket(x->pg) : -1) : (x->my ? (int)mysql_get_socket(x->my) : -1);
+    if (fd >= 0) shutdown(fd, SHUT_RDWR);
+    if (x->pg) PQfinish(x->pg);
+    if (x->my) mysql_close(x->my);
+    x->pg = NULL;
+    x->my = NULL;
+}
+
 /* Run one statement; need_rows: it must affect >= 1 row. */
 static int conn_exec(conn_t *x, const char *sql, int need_rows, char *why, size_t wsz) {
     if (x->proto == P_PG) {
+        if (!x->pg) { snprintf(why, wsz, "connection closed earlier (lost or hung)"); return -1; }
         PGresult *r = PQexec(x->pg, sql);
         ExecStatusType st = PQresultStatus(r);
         int rc = 0;
@@ -644,16 +826,26 @@ static int conn_exec(conn_t *x, const char *sql, int need_rows, char *why, size_
         PQclear(r);
         return rc;
     }
-    if (mysql_real_query(x->my, sql, (unsigned long)strlen(sql)) != 0) { snprintf(why, wsz, "%s", mysql_error(x->my)); return -1; }
+    /* comp-rev-failcount MED-2: a MySQL connection that reported it is gone (CR_SERVER_GONE_ERROR 2006, CR_SERVER_LOST
+     * 2013) is closed and NULLed here, so conn_alive sees it and reconnect_home reopens and COUNTS it (g_reconnects);
+     * conn_alive used to read x->my != NULL, true for a dead handle, so a lost MySQL home connection was never
+     * counted and every later op on it failed with "server has gone away" instead. */
+    if (!x->my) { snprintf(why, wsz, "connection lost earlier (closed after a lost-connection error)"); return -1; }
+    if (mysql_real_query(x->my, sql, (unsigned long)strlen(sql)) != 0) return my_fail(x, why, wsz);
     my_ulonglong affected = 0;
     int status;
     do {
         MYSQL_RES *res = mysql_store_result(x->my);
         if (res) mysql_free_result(res);
+        /* comp-rev-2404 MED-1, measured: a NULL result is an error whenever mysql_errno says so. The field-count
+         * check alone failed open: when the connection dies after the metadata (count, definition, EOF), Connector/C
+         * clears field_count while it tears the connection down, so field_count == 0 read as "no result set" (rc 0;
+         * test_probe_shapes mysql metaclose at 268e769d5, artie 7dc85006a4) */
+        else if (mysql_errno(x->my) != 0) return my_fail(x, why, wsz);
         else if (mysql_field_count(x->my) == 0) affected += mysql_affected_rows(x->my);
-        else { snprintf(why, wsz, "%s", mysql_error(x->my)); return -1; }
+        else return my_fail(x, why, wsz);
         status = mysql_next_result(x->my);
-        if (status > 0) { snprintf(why, wsz, "%s", mysql_error(x->my)); return -1; }
+        if (status > 0) return my_fail(x, why, wsz);
     } while (status == 0);
     if (need_rows && affected < 1) { snprintf(why, wsz, "write affected 0 rows: %.120s", sql); return -1; }
     return 0;
@@ -693,10 +885,17 @@ static int run_step(client_t *c, conn_t *cur, int *have_branch, const step_t *st
         *have_branch = 1;
         return 0;
     }
-    conn_t *target = *have_branch ? cur : &c->home;
+    conn_t *target = st->admin ? &c->admin : *have_branch ? cur : &c->home;
     if (!st->serial) return conn_exec(target, text, st->k == K_WRITE, why, wsz);
-    /* sql-serial: no two clients run one at the same time (Dolt 2.4.1's DOLT_BRANCH('-d') from concurrent sessions
-     * panics the server; lead review 62430d8bf..b49fb656a HIGH 1). Used in untimed after-steps only. */
+    /* sql-serial: no two clients run one at the same time (Dolt's DOLT_BRANCH('-d') from concurrent sessions races
+     * validateBranchNotActiveInAnySession: in 2.4.1 AND the registered 2.5.0 it can recover a nil-pointer panic or kill
+     * the server with a fatal concurrent map read and map write; artie runs/uw-20261018-pc241 (2.4.1 dies without
+     * churn) and runs/uw-20261018-dolt250churn4-b29acc86b (2.5.0); lead review 62430d8bf..b49fb656a HIGH 1). This
+     * NARROWS the race and does not close it (comp-rev-dolt250 HIGH-1: serialized, 2.5.0 still recovered panics at
+     * session.go:1752 <- dolt_branch.go:345). The delete reads every other session's dbState (lookupDbState,
+     * session.go:276) without that session's lock, and the conflicting writer can be another session's CHECKOUT,
+     * which no lock here orders. So a failed op in a serialized Dolt cell is a failure the cell reports, never
+     * something serialization rules out. Used in untimed after-steps only. */
     uint64_t wait_start = now_ns();
     pthread_mutex_lock(&g_serial_mu);
     uint64_t wait_end = now_ns();
@@ -730,8 +929,17 @@ static void reconnect_home(client_t *c) {
         note_backend(c, 0, 0, &c->home);
         for (int k = 0; k < S.nsetup; k++) {
             char t[8192];
-            if (expand(S.setup[k], &x, t, sizeof t, w) == 0) conn_exec(&c->home, t, 0, w, sizeof w);
+            /* MED-1: a setup statement that fails on the new connection (pg18-create-copy's SET file_copy_method)
+             * is a failure, not a silently different session */
+            if (expand(S.setup[k], &x, t, sizeof t, w) != 0 || conn_exec(&c->home, t, 0, w, sizeof w) != 0)
+                other_fail("setup on a reconnected home connection", w);
         }
+    } else {
+        other_fail("reconnect", w);
+        /* comp-rev-failcount LOW-4: a dead server made the clients spin through failed ops (967 in about 1 s); a
+         * failed reconnect waits 10 ms. Failure path only: such a run is refused anyway. */
+        struct timespec ts = {0, 10 * 1000 * 1000};
+        nanosleep(&ts, NULL);
     }
     __atomic_fetch_add(&g_reconnects, 1, __ATOMIC_RELAXED);
 }
@@ -938,11 +1146,20 @@ static void *client_main(void *arg) {
     if (S.proto == P_MYSQL) mysql_thread_init();
     char ci[4096], w[512];
     ctx_t x0 = {.c = c->id, .i = 0, .rng = &c->rng};
+    uint64_t hc0 = now_ns();
     int fail = expand(S.connect, &x0, ci, sizeof ci, w) != 0 || conn_open(&c->home, ci, NULL, w, sizeof w) != 0;
     if (!fail) note_backend(c, 0, 0, &c->home);
     for (int k = 0; !fail && k < S.nsetup; k++) {
         char t[8192];
         fail = expand(S.setup[k], &x0, t, sizeof t, w) != 0 || conn_exec(&c->home, t, 0, w, sizeof w) != 0;
+    }
+    uint64_t hc_ns = now_ns() - hc0; /* home per-cycle: the first cycle's home connect is this one */
+    /* home per-cycle (the lead's Doltgres b-m1 ruling): the admin connection the admin-sql after-steps (the deletes)
+     * run on, opened once per client with the home conninfo; a branch delete never runs on a connection that wrote
+     * on that branch (Doltgres 1.4.0 poisons it: tools/doltgres_use_probe.sh, artie 44b1e4dd86) */
+    if (!fail && S.home_per_cycle) {
+        fail = conn_open(&c->admin, ci, NULL, w, sizeof w) != 0;
+        if (!fail) note_backend(c, 0, 2, &c->admin);
     }
     pthread_mutex_lock(&g_mu);
     if (fail) { snprintf(c->err, sizeof c->err, "%s", w); c->state = -1; g_nfailed++; }
@@ -965,8 +1182,29 @@ static void *client_main(void *arg) {
     for (uint32_t seq = 0;; seq++) {
         oprec r;
         memset(&r, 0, sizeof r);
+        /* home per-cycle: this cycle's home connection, opened (and set up) BEFORE the claim, so it is outside the
+         * timed window and outside the op's latency; its cost is home_connect_ns. The first cycle uses the one opened
+         * at start. A failed connect is this op's failure. */
+        char hcw[512] = "";
+        if (S.home_per_cycle && seq > 0) {
+            char hci[4096];
+            ctx_t xh = {.c = c->id, .i = seq, .rng = &c->rng};
+            uint64_t h0 = now_ns();
+            if (expand(S.connect, &xh, hci, sizeof hci, hcw) != 0 || conn_open(&c->home, hci, NULL, hcw, sizeof hcw) != 0) {
+                if (!hcw[0]) snprintf(hcw, sizeof hcw, "per-cycle home connect failed");
+            } else {
+                note_backend(c, seq, 0, &c->home);
+                for (int k = 0; k < S.nsetup && !hcw[0]; k++) {
+                    char t[8192];
+                    if (expand(S.setup[k], &xh, t, sizeof t, hcw) != 0 || conn_exec(&c->home, t, 0, hcw, sizeof hcw) != 0)
+                        if (!hcw[0]) snprintf(hcw, sizeof hcw, "per-cycle home setup failed");
+                }
+            }
+            hc_ns = now_ns() - h0;
+        }
         /* every phase decision at the claim (claim_op); open loop: the claim is the next arrival, sent at its time */
         claim_t kc = claim_op(c->id);
+        if (kc.stop && S.home_per_cycle && seq > 0) (void)conn_close_sync(&c->home, w, sizeof w);
         if (kc.stop) goto done;
         int ph = kc.ph;
         if (OPEN_LOOP) {
@@ -1005,9 +1243,11 @@ static void *client_main(void *arg) {
             if (bad || expand(S.c1blab[k], &x, c1bl[k], sizeof c1bl[k], w) != 0) { c1bl[k][0] = 0; continue; }
             c1b_opstart(&C1B, ((uint64_t)c->id << 40) | ((uint64_t)seq << 8) | (uint64_t)k, c1bl[k]);
         }
+        r.home_connect_ns = S.home_per_cycle ? hc_ns : 0;
         r.start = now_ns();
         r.intended = OPEN_LOOP ? kc.intended : r.start;
-        if (bad) { r.ok = 0; r.err = (int16_t)err_index(w); }
+        if (hcw[0]) { r.ok = 0; r.err = (int16_t)err_index(hcw); }
+        else if (bad) { r.ok = 0; r.err = (int16_t)err_index(w); }
         for (int k = 0; k < S.nstep && r.ok; k++) {
             if (run_step(c, &cur, &have_branch, &S.step[k], &x, w, sizeof w) != 0) { r.ok = 0; r.err = (int16_t)err_index(w); }
             else if (HAVE_C1B && S.c1blab[k] && c1bl[k][0]) c1b_ack(&C1B, ((uint64_t)c->id << 40) | ((uint64_t)seq << 8) | (uint64_t)k, c1bl[k]);
@@ -1019,27 +1259,66 @@ static void *client_main(void *arg) {
         /* comp review 1 MED 9: each after-step timed apart, as the macOS bbload does (4010ff3b06:1027-1035): it ends at
          * aft_end[k], after<k+1>_ns in raw.tsv, hdr_after<k+1>.txt and summary after_us; nafter: the after-steps run */
         r.aft_start = now_ns();
-        for (int k = 0; !SKIP_AFTER && k < S.nafter; r.aft_end[k] = now_ns(), r.nafter = (uint8_t)++k)
+        for (int k = 0; !SKIP_AFTER && k < S.nafter; r.aft_end[k] = now_ns(), r.nafter = (uint8_t)++k) {
+            /* home per-cycle: the home connection is closed before the first admin-sql step (the delete), inside
+             * that step's after time */
+            if (S.after[k].admin && (c->home.pg || c->home.my) && conn_close_sync(&c->home, w, sizeof w) != 0) {
+                int e = err_index(w);
+                if (r.ok) { r.ok = 0; r.err = (int16_t)(1000 + e); }
+            }
             if (run_step(c, &cur, &have_branch, &S.after[k], &x, w, sizeof w) != 0) {
                 int e = err_index(w);
                 if (r.ok) { r.ok = 0; r.err = (int16_t)(1000 + e); } /* the op succeeded; its after-step did not */
             }
+        }
         if (have_branch && conn_close_sync(&cur, w, sizeof w) != 0) {
             int e = err_index(w);
             if (r.ok) { r.ok = 0; r.err = (int16_t)(1000 + e); }
         }
+        if (S.home_per_cycle && (c->home.pg || c->home.my)) (void)conn_close_sync(&c->home, w, sizeof w);
         r.after_end = now_ns();
-        if (!conn_alive(&c->home)) reconnect_home(c);
+        if (!S.home_per_cycle && !conn_alive(&c->home)) reconnect_home(c);
         record(c, &r);
         op_done(ph);
         free_since = r.after_end;
     }
-done:
+done:; /* an empty statement: the declaration of hdl below may not follow a label in C17 (-Wc23-extensions) */
+    /* comp-rev-b15 LOW-1: a home connection that died while idle (every op on branch connections, no teardown) was
+     * never noticed: libpq's status and a MySQL handle change only when used. One untimed SELECT 1 on the home
+     * connection after the last op: a failure is counted (other_err) and refuses the run. A handle already closed
+     * after a lost-connection error was counted when it was lost. */
+    /* comp-rev-67b2 LOW-B, comp-rev-2404 LOW-1/LOW-2: the check is BOUNDED, the whole reply by one deadline
+     * (conn_probe's watchdog, CLOSE_TIMEOUT_S): a dead or hung home is blamed on the home connection (other_err,
+     * rc 3), never reported as an ops stall (rc 4). A failed handle is then ABANDONED (conn_abandon: no further
+     * wait on the peer), so teardown fails at once. comp-rev-a145 LOW-4: on the SUCCESS path too, the home's final
+     * close waits only for what is left of the same deadline (conn_close_until HDL), so probe plus final close never
+     * exceed CLOSE_TIMEOUT_S together. --stall-s must be above CLOSE_TIMEOUT_S (main refuses it otherwise:
+     * LOW-3; run_system.sh uses 600 s, test_probe_shapes.py 8 s). Teardown statements, when a spec has them, run
+     * between the two and are NOT under this deadline (no registered spec has one). A final close that runs out of
+     * the deadline is not counted, as before: the server answered the probe, so the home was alive.
+     * LOW-C, stated: this SELECT 1 runs after this client's last op, untimed and recorded nowhere, but with
+     * --no-drain at C > 1 it can overlap other clients' measured ops, and it falls inside a labelling run's strace
+     * window. It writes nothing (no flush expected; not straced to prove it) and --no-drain cells are refused. */
+    uint64_t hdl = now_ns() + (uint64_t)(CLOSE_TIMEOUT_S * 1e9);
+    if (S.home_per_cycle && (c->admin.pg || c->admin.my)) { /* the home is closed each cycle: probe the admin one */
+        if (conn_probe(&c->admin, CLOSE_TIMEOUT_S, w, sizeof w) != 0) {
+            other_fail("admin connection lost (found after the last op)", w);
+            conn_abandon(&c->admin);
+        }
+        (void)conn_close_until(&c->admin, hdl, w, sizeof w);
+    }
+    if (c->home.pg || c->home.my) {
+        if (conn_probe(&c->home, CLOSE_TIMEOUT_S, w, sizeof w) != 0) {
+            other_fail("home connection lost (found after the last op)", w);
+            conn_abandon(&c->home);
+        }
+    }
     for (int k = 0; k < S.nteardown; k++) {
         char t[8192];
-        if (expand(S.teardown[k], &x0, t, sizeof t, w) == 0) conn_exec(&c->home, t, 0, w, sizeof w);
+        if (expand(S.teardown[k], &x0, t, sizeof t, w) != 0 || conn_exec(&c->home, t, 0, w, sizeof w) != 0)
+            other_fail("teardown", w); /* MED-1: a failed teardown is a failure */
     }
-    conn_close(&c->home);
+    (void)conn_close_until(&c->home, hdl, w, sizeof w); /* LOW-4: the rest of the probe's deadline, not 5 s more */
     if (S.proto == P_MYSQL) mysql_thread_end();
     __atomic_fetch_add(&g_exited, 1, __ATOMIC_RELEASE); /* the main thread waits for every client to exit */
     return NULL;
@@ -1131,7 +1410,12 @@ int main(int argc, char **argv) {
 #define NUMU(flag, var, lo, hi) else if (!strcmp(a, flag) && v) { if (num_u(flag, v, lo, hi, &var)) return 2; i++; }
         if (!strcmp(a, "--spec") && v) specp = argv[++i];
         else if (!strcmp(a, "--out") && v) out = argv[++i];
-        else if (!strcmp(a, "--clients") && v) C = atoi(argv[++i]);
+        else if (!strcmp(a, "--clients") && v) { /* comp-rev-89ec-b3c3 LOW 7: it was atoi ("4x" ran 4 clients) */
+            uint64_t cv;
+            if (num_u(a, v, 1, 100000, &cv)) return 2;
+            C = (int)cv;
+            i++;
+        }
         else if (!strcmp(a, "--mode") && v) { OPEN_LOOP = !strcmp(v, "open"); if (strcmp(v, "open") && strcmp(v, "closed")) { fprintf(stderr, "bbload: --mode closed|open\n"); return 2; } i++; }
         NUMD("--rate", RATE, 1e-6, 1e9)
         else if (!strcmp(a, "--warmup-s") && v) { if (num_d(a, v, 0, 1e7, &WARM_S)) return 2; warm_legacy = 1; i++; }
@@ -1153,7 +1437,15 @@ int main(int argc, char **argv) {
         NUMD("--duration-s", DUR_S, 0, 1e7)
         NUMU("--min-ops", MIN_OPS, 0, UINT64_MAX)
         NUMU("--max-ops", MAX_OPS, 0, UINT64_MAX)
-        NUMD("--max-window-s", MAXWIN_S, 0, 1e8)
+        /* comp-rev-89ec-b3c3 LOW 7: a bound, never "none" -- 0 was accepted (clonebench read 0 as no bound) */
+        else if (!strcmp(a, "--max-window-s") && v) {
+            if (num_d(a, v, 0, 1e8, &MAXWIN_S)) return 2;
+            if (!(MAXWIN_S > 0)) {
+                fprintf(stderr, "bbload: --max-window-s needs a number in (0, 1e+08] (a bound, never 'none'), got '%s'\n", v);
+                return 2;
+            }
+            i++;
+        }
         NUMD("--stall-s", STALL_S, 0, 1e7)
         NUMD("--max-send-late-us", MAX_SEND_LATE_US, 0, 1e9)
         else if (!strcmp(a, "--run-tag") && v) snprintf(RUNTAG, sizeof RUNTAG, "%s", argv[++i]);
@@ -1165,7 +1457,7 @@ int main(int argc, char **argv) {
             return 2;
 #endif
         }
-        else if (!strcmp(a, "--v1-mark-base") && v) MARKB = strtoull(argv[++i], NULL, 0);
+        NUMU("--v1-mark-base", MARKB, 0, UINT64_MAX) /* comp-rev-9bc7d894a LOW 6: base 0 read "0x1g" as 1 */
         else if (!strcmp(a, "--c1b-run") && v) {
 #if BB_HOOKS
             const char *why = "?";
@@ -1190,6 +1482,12 @@ int main(int argc, char **argv) {
 #undef NUMU
     }
     if (!specp || !out || C < 1) { fprintf(stderr, "usage: bbload --spec FILE --out DIR --clients C ...\n"); return 2; }
+    /* comp-rev-a145 LOW-3: the end-of-run home probe and the final home close share one CLOSE_TIMEOUT_S deadline,
+     * so a --stall-s at or below it would report a slow or hung home as an ops stall (rc 4): refused */
+    if (STALL_S <= CLOSE_TIMEOUT_S) {
+        fprintf(stderr, "bbload: --stall-s %.3f must be above the home probe's %.1f s bound\n", STALL_S, CLOSE_TIMEOUT_S);
+        return 2;
+    }
     if (warm_rule_flag && warm_legacy) {  /* lead review 62430d8bf..b49fb656a MED 7 */
         fprintf(stderr, "bbload: REFUSED: --warmup OPS:S:MAX_S together with --warmup-ops/--warmup-s (the effective "
                         "warm-up and the recorded rule would differ)\n");
@@ -1215,11 +1513,17 @@ int main(int argc, char **argv) {
     char *spectext = NULL;
     if (load_spec(specp, &spectext) != 0) return 2;
     if (OPEN_LOOP) { /* the macOS bbload's review 4 M6 (comp review 1 LOW 23, review 2 item 5) */
-        int branch = 0;
-        for (int k = 0; k < S.nstep; k++) branch |= S.step[k].k == K_CONNECT || S.step[k].k == K_CLOSE || S.step[k].serial;
-        if (S.nafter || branch) {
-            fprintf(stderr, "bbload: REFUSED: open loop with after-steps, a branch connection or sql-serial would charge "
-                            "their time to the server as queueing; run it closed loop\n");
+        /* comp-rev-89ec-b3c3 LOW 6: each clause its own reason (one message for all three let a case pass whichever
+         * clause fired, so a mutant dropping one passed every case) */
+        int conn = 0, serial = 0;
+        for (int k = 0; k < S.nstep; k++) {
+            conn |= S.step[k].k == K_CONNECT || S.step[k].k == K_CLOSE;
+            serial |= S.step[k].serial;
+        }
+        const char *what = S.nafter ? "after-steps" : conn ? "a connect or close step" : serial ? "a sql-serial step" : NULL;
+        if (what) {
+            fprintf(stderr, "bbload: REFUSED: open loop with %s: its time would be charged to the server as queueing; "
+                            "run it closed loop\n", what);
             return 2;
         }
     }
@@ -1312,7 +1616,8 @@ int main(int argc, char **argv) {
     fprintf(f, "client\tseq\tphase\tok\tarrival\tfree_ns\tclaim_ns\tintended_ns\tstart_ns\tend_ns\tlat_ns\tsend_late_ns");
     for (int s = 0; s < S.nstep; s++) fprintf(f, "\tstep%d_ns", s + 1);
     for (int s = 0; s < NA; s++) fprintf(f, "\tafter%d_ns", s + 1); /* the macOS columns (4010ff3b06:1183) */
-    fprintf(f, "\tafter_ns\tserial_wait_ns\tserial_waits\terr\n"); /* serial_wait*: Codex C04 */
+    /* serial_wait*: Codex C04; home_connect_ns: home per-cycle only, the cycle's untimed home connect */
+    fprintf(f, "\tafter_ns\tserial_wait_ns\tserial_waits%s\terr\n", S.home_per_cycle ? "\thome_connect_ns" : "");
     for (size_t r = 0; r < total; r++) {
         oprec *o = &all[r];
         uint64_t base = o->intended > o->free ? o->intended : o->free;
@@ -1336,6 +1641,7 @@ int main(int argc, char **argv) {
         for (unsigned w = 0; w < o->nserial_waits; w++)
             fprintf(f, "%s%llu-%llu", w ? ";" : "", (unsigned long long)o->serial_waits[w].lo,
                     (unsigned long long)o->serial_waits[w].hi);
+        if (S.home_per_cycle) fprintf(f, "\t%llu", (unsigned long long)o->home_connect_ns);
         fprintf(f, "\t%d\n", o->err);
     }
     if (fclose(f) != 0) { fprintf(stderr, "bbload: raw.tsv close failed\n"); return 2; }
@@ -1350,7 +1656,10 @@ int main(int argc, char **argv) {
     fprintf(f, "client\tseq\tkind\t%s\n", S.proto == P_PG ? "backend_pid" : "connection_id");
     for (int i = 0; i < C; i++)
         for (size_t b = 0; b < CL[i].nbk; b++) {
-            if (CL[i].bk[b].kind == 0) fprintf(f, "%d\t-\thome\t%ld\n", i, CL[i].bk[b].id);
+            /* home per-cycle: a cycle's fresh home is "home" with its op seq; the admin connection is "admin" */
+            if (CL[i].bk[b].kind == 0 && S.home_per_cycle) fprintf(f, "%d\t%u\thome\t%ld\n", i, CL[i].bk[b].seq, CL[i].bk[b].id);
+            else if (CL[i].bk[b].kind == 0) fprintf(f, "%d\t-\thome\t%ld\n", i, CL[i].bk[b].id);
+            else if (CL[i].bk[b].kind == 2) fprintf(f, "%d\t-\tadmin\t%ld\n", i, CL[i].bk[b].id);
             else fprintf(f, "%d\t%u\tstep\t%ld\n", i, CL[i].bk[b].seq, CL[i].bk[b].id);
         }
     if (fclose(f) != 0) { fprintf(stderr, "bbload: backends.tsv close failed\n"); return 2; }
@@ -1361,6 +1670,12 @@ int main(int argc, char **argv) {
     for (int s = 0; s < S.nstep; s++) hdr_init(1, INT64_C(3600000000000), 3, &hs[s]);
     for (int s = 0; s < NA; s++) hdr_init(1, INT64_C(3600000000000), 3, &ha[s]);
     uint64_t meas = 0, meas_ok = 0, meas_err = 0, in_window_done = 0, drain = 0;
+    /* comp-rev-dolt250 HIGH-1: a failed op is a failure in EVERY phase. Only measured failures used to count, so a
+     * warm-up or drain op lost to a recovered server panic (sql-serial narrows Dolt's delete race, it does not close
+     * it) left the run rc 0 and appeared nowhere. */
+    /* other_err: failures outside any op (teardown, reconnect, reconnect setup: MED-1), plus a recorded op in no
+     * phase above, which claim_op never makes today (comp-rev-failcount LOW-1) */
+    uint64_t warm_err = 0, drain_err = 0, other_err = __atomic_load_n(&g_other_err, __ATOMIC_ACQUIRE);
     double sum = 0;
     uint64_t *late = malloc((total ? total : 1) * sizeof *late);
     size_t nlate = 0;
@@ -1380,6 +1695,11 @@ int main(int argc, char **argv) {
         }
         if (o->end >= g_tm0 && o->end <= g_tm1 && o->ok) in_window_done++;
         if (o->phase == PH_DRAIN) drain++;
+        if (!o->ok && o->phase != PH_MEAS) {
+            if (o->phase == PH_WARM) warm_err++;
+            else if (o->phase == PH_DRAIN) drain_err++;
+            else other_err++;
+        }
         if (o->phase != PH_MEAS) continue;
         meas++;
         uint64_t base = o->intended > o->free ? o->intended : o->free;
@@ -1430,7 +1750,11 @@ int main(int argc, char **argv) {
         pool_p50 = pct(pl, npl, 50) / 1e3;
         pool_p99 = pct(pl, npl, 99) / 1e3;
         pool_max = npl ? pl[npl - 1] / 1e3 : 0;
-        /* FIFO: a measured arrival that waited > 50 us although some LATER arrival had been claimed before it was */
+        /* FIFO: a measured arrival that waited > 50 us although some LATER arrival had been claimed before it was.
+         * comp-rev-89ec-b3c3 LOW 8: claim_op takes the arrival's index and its claim time in ONE critical section
+         * (g_claim_mu), so with this claim path the count is 0 by construction: it shows that nothing claimed out of
+         * arrival order, not that a scheduler kept FIFO. timedrun.py record_problems refuses a non-zero (or missing)
+         * count, so a change that splits that section is caught there; the macOS bbload records the same field. */
         uint64_t *csuf = malloc((na + 1) * sizeof *csuf);
         csuf[na] = UINT64_MAX;
         for (size_t i = na; i-- > 0;) csuf[i] = byarr[i]->claim < csuf[i + 1] ? byarr[i]->claim : csuf[i + 1];
@@ -1462,6 +1786,14 @@ int main(int argc, char **argv) {
      * registered per-run cap, and a run it ended is reported, not judged: rc 0, verdict "capped", capped: true and its
      * counts; timedrun.py alone applies PREREG's tiers (>= 1000 ok complete, 100-999 p50 only, fewer failed). */
     else if (meas_err && !ALLOW_ERR) { rc = 3; verdict = "REFUSED: measured operations failed (see errors.txt; --allow-errors to accept)"; }
+    else if ((warm_err || drain_err || other_err || g_reconnects) && !ALLOW_ERR) {
+        /* comp-rev-dolt250 HIGH-1: a lost home connection is a failure too, even when the next op succeeds on the new one */
+        rc = 3;
+        snprintf(vbuf, sizeof vbuf, "REFUSED: %llu warm-up, %llu drain and %llu other op(s) failed, %llu home "
+                 "reconnect(s) (see errors.txt; --allow-errors to accept)", (unsigned long long)warm_err,
+                 (unsigned long long)drain_err, (unsigned long long)other_err, (unsigned long long)g_reconnects);
+        verdict = vbuf;
+    }
     else if (OPEN_LOOP && (late_p99 > MAX_SEND_LATE_US || pool_p99 > MAX_SEND_LATE_US)) {
         rc = 3; /* the macOS bbload's amendment 48 rule (competitors review 2 item 3) */
         snprintf(vbuf, sizeof vbuf, "VOID: p99 send lateness %.1f us (pool-wide %.1f us) > %.0f us", late_p99, pool_p99, MAX_SEND_LATE_US);
@@ -1481,8 +1813,12 @@ int main(int argc, char **argv) {
             (unsigned long long)g_warm.claimed, total, (unsigned long long)g_reconnects,
             win > 0 ? meas_ok / win : 0, win > 0 ? in_window_done / win : 0, cpu, win > 0 ? cpu / win : 0,
             v1run ? v1run : "", (unsigned long long)MARKB);
+    fprintf(f, "\"warmup_err\":%llu,\"drain_err\":%llu,\"other_err\":%llu,\"failed_ops\":%llu,", /* HIGH-1: every phase */
+            (unsigned long long)warm_err, (unsigned long long)drain_err, (unsigned long long)other_err,
+            (unsigned long long)(meas_err + warm_err + drain_err + other_err));
     fprintf(f, "\"clock\":\"%s\",\"hooks\":%d,", BB_CLOCK_NAME, BB_HOOKS); /* Linux port: which clock stamped the ops */
     fprintf(f, "\"capped\":%s,\"max_window_s\":%.3f,", g_cap_hit ? "true" : "false", MAXWIN_S);
+    fprintf(f, "\"home_per_cycle\":%s,", S.home_per_cycle ? "true" : "false");
     fprintf(f, "\"after_steps\":%d,\"skip_after\":%s,\"no_drain\":%s,", S.nafter, SKIP_AFTER ? "true" : "false",
             NO_DRAIN ? "true" : "false");
     /* comp review 1 MED 9: what tput_* count. A client claims its next op only after this op's untimed after-steps,
@@ -1512,7 +1848,7 @@ int main(int argc, char **argv) {
             mean_inflight, mean_serial_waiters, effective_c,
             sql_serial ? "true" : "false", reduced_concurrency ? "REDUCED-CONCURRENCY" : "registered",
             reduced_concurrency ? "false" : "true",
-            sql_serial && C > 1 ? "Dolt 2.4.1 concurrent-delete panic: deletes serialized; see DECISIONS 2026-10-09T18:51:35Z" : "");
+            sql_serial && C > 1 ? "Dolt 2.4.1/2.5.0 concurrent-delete panic and server crash: deletes serialized, which narrows the race and does not close it; see DECISIONS 2026-10-09T18:51:35Z" : "");
     {   /* MED 4: the measured window on CLOCK_REALTIME (the tracer sweeps' clock), mapped through one offset read now,
          * and the load generator's own TracerPid at its start and end */
         struct timespec rt;

@@ -85,14 +85,17 @@ ROWS = [
     # (a) times only the create since comp review 1 MED 6 (it timed a no-op checkout of main before): rows of runs
     # before that commit measured different work under this label (SMOKE.md errata)
     (DOLT, "(a) DOLT_CHECKOUT('-b', b) on a session at main", "dolt", "dolt-a-m1c", "dolt-a-m1"),
-    (DOLT, "(b) DOLT_BRANCH(b, main) + DOLT_CHECKOUT(b)", "dolt", "dolt-b-m1c", "dolt-b-m1"),
+    # (b) times PREREG N7's USE switch since 35f8a4130 (comp-rev-89ec-b3c3 MED 1; it timed DOLT_CHECKOUT(b) /
+    # dolt_checkout(b) before): rows of runs before that commit measured a different switch under the old label
+    # (SMOKE.md errata), and doltgres-b-m1 opens a fresh home connection per cycle since 943a7b9db
+    (DOLT, "(b) DOLT_BRANCH(b, main) + USE `bench/b`", "dolt", "dolt-b-m1c", "dolt-b-m1"),
     (DOLT, "(c) DOLT_BRANCH(b, main) + connect bench/b + SELECT 1", "dolt", "dolt-c-m1c",
      "dolt-c-m1"),
     (DOLT, "DOLT_BRANCH(b, main) alone", "dolt", "dolt-create", None),
     (DOLT, "SELECT 1 floor", "dolt", "dolt-select1", None),
     (DOLTGRES, "(a) dolt_checkout('-b', b) on a session at main", "doltgres", "doltgres-a-m1c",
      "doltgres-a-m1"),
-    (DOLTGRES, "(b) dolt_branch(b, main) + dolt_checkout(b)", "doltgres", "doltgres-b-m1c", "doltgres-b-m1"),
+    (DOLTGRES, "(b) dolt_branch(b, main) + USE \"postgres/b\"", "doltgres", "doltgres-b-m1c", "doltgres-b-m1"),
     (DOLTGRES, "(c) dolt_branch(b, main) + connect postgres/b + SELECT 1", "doltgres", "doltgres-c-m1c",
      "doltgres-c-m1"),
     (DOLTGRES, "dolt_branch(b, main) alone", "doltgres", "doltgres-create", None),
@@ -246,6 +249,18 @@ def selftest():
         bad += not cond
         n += 1
 
+    # comp-rev-9bc7d894a LOW 4: a row's label names the statements its specs time. Variant (b) times PREREG N7's USE
+    # switch since 35f8a4130, so its label must say USE, never the checkout it timed before (read from the specs
+    # themselves: each (b) spec's second timed step)
+    here = os.path.dirname(os.path.abspath(__file__))
+    for row in ROWS:
+        if not str(row[1]).startswith("(b) "):
+            continue
+        for spec in (s for s in row[3:5] if s):
+            steps = [ln for ln in open(os.path.join(here, "loadgen", "specs", spec + ".spec")) if ln.startswith("step ")]
+            sw = steps[1].split(None, 2)[2].strip() if len(steps) > 1 else ""
+            ok(f"(b) label {row[1]!r} names {spec}'s switch {sw!r}",
+               sw.startswith("USE ") and "USE" in row[1] and "checkout" not in row[1].lower())
     reg = {"pg18-d2": "18.6", "dolt": "2.4.1", "doltgres": "1.4.0"}
     first = {"pg18-d2": "postgres (PostgreSQL) {} (Ubuntu 18.6-1.pgdg24.04+2)", "dolt": "dolt version {}",
              "doltgres": "Doltgres version {}"}

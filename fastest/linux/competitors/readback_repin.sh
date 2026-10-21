@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # readback_repin.sh PG18_BIN DOLT DOLTGRES MARIADB SCRATCH -- comp review 1 LOW 27's owed re-pin: each engine loads
 # gen_seed.py's parent (2500 rows aged 300, and 10000 rows aged 200; seed 1) and reads it back with readback_sql (the
-# OFFSET 0 subquery form for PG and Doltgres, the mysql form for Dolt); every triple must equal gen_seed.facts' and the
-# pinned engine answers (2500|131727070|21429546430; 10000|89963830 for count|sum). Prints one line per engine and size.
+# OFFSET 0 subquery form for PG and Doltgres, the mysql form for Dolt); every triple must equal gen_seed.facts'. (The
+# pinned engine answers, 2500|131727070|21429546430 and 10000|89963830 for count|sum, are not compared here: they are
+# gen_seed.py selftest's and fixture.py selftest's, taken from the engines' own output, artie 6907c80154; comp-rev-89ec-b3c3
+# LOW 22 found this header claiming a comparison the code never made.) Prints one line per engine and size.
 # Servers on 127.0.0.1:55495-55497, stopped at the end. Exit 0 only when every read-back matched.
 set -uo pipefail
 PGB=$1 DOLT=$2 DG=$3 MY=$4 S=$5

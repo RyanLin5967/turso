@@ -102,6 +102,8 @@ def measured(d):
 
 def check_same(a, b):
     ma, mb = measured(a), measured(b)
+    if not ma or not mb:  # comp-rev-89ec-b3c3 LOW 4: two empty runs are not the same arrivals, they are no run
+        return [f"a run with no measured row ({len(ma)} and {len(mb)} measured): nothing was compared"]
     if ma == mb:
         return []
     return [f"the runs measured different arrivals: {len(ma)} and {len(mb)} measured, first difference at "
@@ -116,6 +118,8 @@ def check_after_tm1(d):
     # the lead's claim_ns ruling, timedrun.py raw_problems' rule: the field tm1 was stamped with -- the claim (claim_ns)
     # in closed loop, the claimed arrival's intended time in open loop and without claim_ns
     key, word = ("claim_ns", "claimed") if sm.get("loop") == "closed" and rows and "claim_ns" in rows[0] else ("intended_ns", "intended")
+    if not any(r["phase"] == "measure" for r in rows):  # comp-rev-89ec-b3c3 LOW 4: a zero-collected pass
+        return [f"no measured row in {d}/raw.tsv: nothing was checked against tm1"]
     late = [r for r in rows if r["phase"] == "measure" and int(r[key]) >= tm1]
     return [f"{len(late)} measured row(s) {word} at or after tm1 {tm1}"] if late else []
 
@@ -199,6 +203,16 @@ def selftest():
            check_after_tm1(run_c("c_late", [(0, 0, "measure", 1, 0, tm1c, tm1c + 900)], closed)) != [])
         ok("after-tm1, open loop: a row intended at tm1 but claimed before it is refused",
            check_after_tm1(run_c("o_late", [(0, 0, "measure", 1, 0, tm1c - 900, tm1c)], dict(closed, loop="open"))) != [])
+        # comp-rev-89ec-b3c3 LOW 4: c_late is refused by an intended-time rule too (intended tm1 + 900); this row is
+        # claimed at tm1 and intended before it, so only the claim rule refuses it
+        ok("after-tm1, closed loop: a row claimed at tm1 but intended before it is refused (only the claim rule can)",
+           check_after_tm1(run_c("c_late2", [(0, 0, "measure", 1, 0, tm1c, tm1c - 1)], closed)) != [])
+        # ... and a run that measured nothing passes neither check (a zero-collected pass)
+        ok("after-tm1: a run with no measured row is refused",
+           check_after_tm1(run_c("c_empty", [(0, 0, "warmup", 1, 0, t0 + 1, t0 + 2)], closed)) != [])
+        ok("same: two runs with no measured row are refused",
+           check_same(run_c("e1", [(0, 0, "warmup", 1, 0, t0 + 1, t0 + 2)], closed),
+                      run_c("e2", [(0, 0, "warmup", 1, 0, t0 + 1, t0 + 2)], closed)) != [])
     print(f"TALLY ran={n} pass={n - bad} na=0 fail={bad}")  # gates/tally.py (linux-rev-uw2 MED 1)
     print(f"sched_check selftest: {n - bad}/{n}")
     return 1 if bad else 0

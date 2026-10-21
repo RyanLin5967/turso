@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# fetch_dolt.sh BIN_DIR OUT_TXT -- the REGISTERED Dolt and Doltgres release binaries (PREREG §6(6): Dolt 2.4.1,
+# fetch_dolt.sh BIN_DIR OUT_TXT -- the REGISTERED Dolt and Doltgres release binaries (PREREG §6(6), Annex 3: Dolt 2.5.0,
 # Doltgres 1.4.0; gate-6 review, t3run item 13) for this machine's arch, into BIN_DIR/dolt and BIN_DIR/doltgres.
 #
 # Versions and tarball sha256s come from versions.tsv (pins.py; GitHub's release-asset digests), the one table the
