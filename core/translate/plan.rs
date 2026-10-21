@@ -2559,9 +2559,25 @@ fn query_output_columns(
             column.set_array_dimensions(1);
         }
         column.set_collation(get_collseq_from_expr(result_expr, table_references)?);
-        // A compound's column takes no single arm's type.
-        if compound_arms.is_none() {
-            inherit_custom_type(column, result_expr, table_references, schema);
+        // A compound's column takes no single arm's type, unless every arm's column is of the
+        // same type and parameters (numerics coerced to one, `select::coerce_numeric_compound_columns`;
+        // engine-rev-types-08caaec44 MED 1).
+        match &compound_arms {
+            None => inherit_custom_type(column, result_expr, table_references, schema),
+            Some(arms) if !crate::branch::store::fe_mutant("compound_arms_uncoerced") => {
+                let shape = |arm: &SelectPlan| {
+                    arm.result_columns.get(column_index).and_then(|rc| {
+                        super::order_by::expr_value_type(&rc.expr, &arm.table_references, schema).map(|(t, p)| {
+                            (t.name.to_lowercase(), p.iter().map(|e| e.to_string()).collect::<std::vec::Vec<_>>())
+                        })
+                    })
+                };
+                let first = arms.first().and_then(|arm| shape(arm));
+                if first.is_some() && arms.iter().all(|arm| shape(arm) == first) {
+                    inherit_custom_type(column, result_expr, table_references, schema);
+                }
+            }
+            Some(_) => {}
         }
     }
     Ok(columns)

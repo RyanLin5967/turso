@@ -190,6 +190,99 @@ pub fn prepare_select_plan(
 ///
 /// Accepting the arms directly lets recursive CTE planning divide a stored
 /// SELECT without allocating temporary compound-arm vectors.
+/// A compound's column whose arms are numerics of different typmods (numeric(8, 2) UNION
+/// numeric(8, 3)) deduplicates, intersects and orders by the arms' texts ('2.00' and '2.000' are two
+/// rows), where PostgreSQL compares numerics (engine-rev-types-08caaec44 MED 1). Each arm's column
+/// is CAST to numeric(1000, S), S the arms' largest scale, so equal values have one text and the
+/// compound column is one numeric type (`plan::query_output_columns`). The column keeps its name.
+/// Only when every arm's column is a numeric with a known scale; values of the lower-scale arms
+/// then show S places. Mutant `compound_arms_uncoerced` (test builds only): as before.
+fn coerce_numeric_compound_columns(
+    left: &mut [(SelectPlan, ast::CompoundOperator)],
+    last: &mut SelectPlan,
+    resolver: &Resolver,
+) {
+    if crate::branch::store::fe_mutant("compound_arms_uncoerced") {
+        return;
+    }
+    let schema = resolver.schema();
+    fn literal(e: &ast::Expr) -> Option<i64> {
+        match e {
+            ast::Expr::Literal(ast::Literal::Numeric(n)) => n.parse().ok(),
+            ast::Expr::Unary(ast::UnaryOperator::Negative, inner) => literal(inner).and_then(i64::checked_neg),
+            _ => None,
+        }
+    }
+    // The numeric scale `arm`'s column `i` carries, with its type's identity, or None.
+    let typed = |arm: &SelectPlan, i: usize| -> Option<(String, i64)> {
+        let rc = arm.result_columns.get(i)?;
+        let (type_def, params) = super::order_by::expr_value_type(&rc.expr, &arm.table_references, schema)?;
+        let op = schema.operator_type_of(&type_def);
+        if !crate::translate::expr::type_takes_no_typmod(&op) {
+            return None;
+        }
+        let scale = match params.as_slice() {
+            [_, s] => literal(s)?,
+            [] if type_def.is_domain => {
+                let mut current = Some(type_def.clone());
+                let mut found = None;
+                for _ in 0..64 {
+                    let Some(td) = current else { break };
+                    if !td.is_domain {
+                        break;
+                    }
+                    if let [_, s] = td.domain_base_params.as_slice() {
+                        found = literal(s);
+                        break;
+                    }
+                    current = schema.get_type_def_unchecked(td.base()).cloned();
+                }
+                found?
+            }
+            _ => return None,
+        };
+        let shape = format!("{}({})", type_def.name, params.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(","));
+        Some((shape, scale))
+    };
+    for i in 0..last.result_columns.len() {
+        let mut shapes = Vec::with_capacity(left.len() + 1);
+        for (arm, _) in left.iter() {
+            shapes.push(typed(arm, i));
+        }
+        shapes.push(typed(last, i));
+        if shapes.iter().any(Option::is_none) {
+            continue;
+        }
+        let shapes: Vec<(String, i64)> = shapes.into_iter().flatten().collect();
+        if shapes.iter().all(|(s, _)| *s == shapes[0].0) {
+            continue;
+        }
+        let scale = shapes.iter().map(|(_, s)| *s).max().unwrap_or(0).max(0);
+        let coerce = |arm: &mut SelectPlan| {
+            let rc = &mut arm.result_columns[i];
+            if rc.alias.is_none() {
+                rc.alias = rc.name(&arm.table_references).map(|n| n.to_string());
+            }
+            let inner = std::mem::replace(&mut rc.expr, ast::Expr::Literal(ast::Literal::Null));
+            rc.expr = ast::Expr::Cast {
+                expr: Box::new(inner),
+                type_name: Some(ast::Type {
+                    name: "numeric".to_string(),
+                    size: Some(ast::TypeSize::TypeSize(
+                        Box::new(ast::Expr::Literal(ast::Literal::Numeric("1000".to_string()))),
+                        Box::new(ast::Expr::Literal(ast::Literal::Numeric(scale.to_string()))),
+                    )),
+                    array_dimensions: 0,
+                }),
+            };
+        };
+        for (arm, _) in left.iter_mut() {
+            coerce(arm);
+        }
+        coerce(last);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 #[turso_macros::trace_stack]
 pub(crate) fn prepare_select_plan_from_arms(
@@ -271,6 +364,8 @@ pub(crate) fn prepare_select_plan_from_arms(
         .chain(std::iter::once(&last))
         .collect();
     let order_by = resolve_compound_order_by(&order_by, &all_plans, resolver)?;
+    drop(all_plans);
+    coerce_numeric_compound_columns(&mut left, &mut last, resolver);
 
     Ok(Plan::CompoundSelect {
         left,
